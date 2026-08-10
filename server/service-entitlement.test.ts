@@ -323,6 +323,18 @@ describe("service portal derivation", () => {
           locked: true,
           revision: 1,
         },
+        {
+          id: "question-maintenance-archived",
+          contractId: "contract-advanced-current",
+          quotaPeriodId: "period-advanced-current",
+          category: "industry",
+          question: "由维护审批归档的原问题",
+          source: "user",
+          status: "archived",
+          selectionApprovalStatus: "approved",
+          locked: false,
+          revision: 2,
+        },
       ];
 
     const active = partitionSelectedQuestionsForPortal({
@@ -337,6 +349,7 @@ describe("service portal derivation", () => {
     expect(active.historical.map((question) => question.id)).toEqual([
       "question-basic-original",
       "question-luxury-last-month",
+      "question-maintenance-archived",
     ]);
 
     const portal = deriveServicePortalState(
@@ -360,7 +373,7 @@ describe("service portal derivation", () => {
       }),
     );
     expect(portal.purchasedQuestions).toHaveLength(1);
-    expect(portal.historicalQuestions).toHaveLength(2);
+    expect(portal.historicalQuestions).toHaveLength(3);
     expect(portal.purchasedQuestions[0]).toMatchObject({
       id: "question-advanced-carried",
       sourceQuestionId: "question-basic-original",
@@ -375,7 +388,7 @@ describe("service portal derivation", () => {
       effectiveStatus: "expired",
     });
     expect(expired.current).toEqual([]);
-    expect(expired.historical).toHaveLength(3);
+    expect(expired.historical).toHaveLength(4);
   });
 
   it("switches a scheduled upgrade atomically and keeps only later supplemental Basic orders", () => {
@@ -622,7 +635,7 @@ describe("service portal derivation", () => {
     expect(() => servicePortalSchema.parse(complete)).not.toThrow();
   });
 
-  it("unlocks monitoring only after every current question has confirmed response logic", async () => {
+  it("unlocks monitoring after the first current question confirms response logic", async () => {
     const questions: NonNullable<ServicePortalStateInput["selectedQuestions"]> =
       [
         {
@@ -652,7 +665,6 @@ describe("service portal derivation", () => {
       knowledgeVersion: 1,
       selectedQuestions: questions,
       confirmedResponseLogicQuestionIds: [questions[0].id],
-      // Monitoring rows cannot bypass an unfinished response-logic gate.
       monitoringQuestionIds: questions.map((question) => question.id),
     });
     const partialPortal = deriveServicePortalState(partiallyConfirmed);
@@ -666,8 +678,8 @@ describe("service portal derivation", () => {
         }),
         expect.objectContaining({
           id: "monitoring",
-          status: "locked",
-          lockedReason: "请先在应答逻辑智能体逐题发布确认。",
+          status: "ready",
+          lockedReason: null,
         }),
       ]),
     );
@@ -676,8 +688,10 @@ describe("service portal derivation", () => {
         now: NOW,
         repository: repository(partiallyConfirmed),
       }),
-    ).rejects.toMatchObject({
-      code: "SERVICE_WORKFLOW_PREREQUISITE_REQUIRED",
+    ).resolves.toMatchObject({
+      workflowSteps: expect.arrayContaining([
+        expect.objectContaining({ id: "monitoring", status: "ready" }),
+      ]),
     });
 
     const fullyConfirmed = {
@@ -702,6 +716,44 @@ describe("service portal derivation", () => {
     });
   });
 
+  it("does not inherit archived outputs when a replacement points to the old question", () => {
+    const replacement = {
+      id: "question-new",
+      sourceQuestionId: "question-old",
+      contractId: "contract-basic",
+      quotaPeriodId: "period-basic",
+      category: "reputation" as const,
+      question: "修改后的品牌问题？",
+      source: "user" as const,
+      status: "selected" as const,
+      selectionApprovalStatus: "approved" as const,
+      locked: true,
+      revision: 1,
+    };
+    const projected = deriveServicePortalState(
+      state("basic", {
+        knowledgeVersion: 1,
+        selectedQuestions: [replacement],
+        confirmedResponseLogicQuestionIds: ["question-old"],
+        monitoringQuestionIds: ["question-old"],
+        channelDistributionQuestionIds: ["question-old"],
+      }),
+    );
+
+    expect(projected.purchasedQuestions[0]).toMatchObject({
+      id: "question-new",
+      sourceQuestionId: "question-old",
+      responseLogicConfirmed: false,
+    });
+    expect(projected.workflowSteps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "response_logic", status: "ready" }),
+        expect.objectContaining({ id: "monitoring", status: "locked" }),
+      ]),
+    );
+    expect(projected.nextAction.kind).toBe("build_response_logic");
+  });
+
   it("keeps a legacy one-shot snapshot as reference only until the higher-plan agent publishes", () => {
     const oneShotOnly = deriveServicePortalState(
       state("advanced", { knowledgeVersion: 1 }),
@@ -718,6 +770,11 @@ describe("service portal derivation", () => {
       status: "ready",
     });
     expect(oneShotOnly.nextAction.kind).toBe("start_knowledge_build");
+    expect(oneShotOnly.capabilities.contentAssets).toMatchObject({
+      allowed: false,
+      effectiveStatus: "workflow_prerequisite",
+      reason: expect.stringContaining("当前服务的认证知识库"),
+    });
 
     expect(
       deriveServicePortalState(
@@ -727,6 +784,14 @@ describe("service portal derivation", () => {
         }),
       ).nextAction.kind,
     ).toBe("await_question_catalog");
+    expect(
+      deriveServicePortalState(
+        state("advanced", {
+          knowledgeVersion: 2,
+          authenticatedKnowledgeVersion: 2,
+        }),
+      ).capabilities.contentAssets,
+    ).toMatchObject({ allowed: true, effectiveStatus: "available" });
     expect(
       deriveServicePortalState(
         state("advanced", {
@@ -780,6 +845,35 @@ describe("service portal derivation", () => {
     expect(
       approved.workflowSteps.find((step) => step.id === "response_logic"),
     ).toMatchObject({ status: "ready", lockedReason: null });
+  });
+
+  it("does not disguise persisted selected-question approval or lock state", () => {
+    const portal = deriveServicePortalState(
+      state("advanced", {
+        selectedQuestions: [
+          {
+            id: "inconsistent-selected-question",
+            contractId: "contract-advanced",
+            quotaPeriodId: "period-advanced",
+            category: "industry",
+            question: "企业级 GEO 服务商如何选择？",
+            source: "user",
+            status: "selected",
+            selectionApprovalStatus: "pending",
+            selectionRequestedAt: NOW,
+            selectionApprovedAt: null,
+            locked: false,
+            revision: 2,
+          },
+        ],
+      }),
+    );
+
+    expect(portal.purchasedQuestions[0]).toMatchObject({
+      status: "selected",
+      selectionApprovalStatus: "pending",
+      locked: false,
+    });
   });
 
   it("aggregates concurrent Basic purchases without losing either quota or question", () => {
@@ -911,6 +1005,19 @@ describe("capability assertions", () => {
         pendingUserCount: 2,
       },
     });
+    await expect(
+      assertServiceCapability(7, "contentAssets", {
+        now: NOW,
+        repository: repository({
+          userId: 7,
+          now: NOW,
+          entitlementRollout: {
+            mode: "compatibility",
+            pendingUserCount: 2,
+          },
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "KNOWLEDGE_SNAPSHOT_NOT_FOUND" });
   });
 
   it("uses stable error codes for unconfigured, expired and upgrade states", async () => {
@@ -1006,6 +1113,35 @@ describe("capability assertions", () => {
     ).resolves.toMatchObject({
       knowledge: { authenticatedForCurrentService: true },
     });
+  });
+
+  it("blocks content assets until the plan-specific knowledge publication exists", async () => {
+    await expect(
+      assertServiceCapability(7, "contentAssets", {
+        now: NOW,
+        repository: repository(state("basic")),
+      }),
+    ).rejects.toMatchObject({ code: "KNOWLEDGE_SNAPSHOT_NOT_FOUND" });
+    await expect(
+      assertServiceCapability(7, "contentAssets", {
+        now: NOW,
+        repository: repository(state("basic", { knowledgeVersion: 1 })),
+      }),
+    ).resolves.toMatchObject({
+      service: { planCode: "basic" },
+      capabilities: { contentAssets: { allowed: true } },
+    });
+    await expect(
+      assertServiceCapability(7, "contentAssets", {
+        now: NOW,
+        repository: repository(
+          state("advanced", {
+            knowledgeVersion: 1,
+            authenticatedKnowledgeVersion: null,
+          }),
+        ),
+      }),
+    ).rejects.toMatchObject({ code: "KNOWLEDGE_SNAPSHOT_NOT_FOUND" });
   });
 });
 

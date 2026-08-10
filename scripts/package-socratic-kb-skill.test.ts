@@ -70,11 +70,20 @@ describe("socratic knowledge-base Skill packaging", () => {
     const validator = await archive
       .file("scripts/validate_archive.py")!
       .async("string");
+    const normalizedSkill = skill.replace(/\s+/g, " ");
+    const normalizedOutputContract = outputContract.replace(/\s+/g, " ");
+    const normalizedQuestioningStrategy = questioningStrategy.replace(
+      /\s+/g,
+      " ",
+    );
 
     expect(skill).toContain("`schemaVersion: 4`");
     expect(skill).toContain("sourceUploadSha256");
     for (const instructions of [skill, outputContract, questioningStrategy]) {
       const normalizedInstructions = instructions.replace(/\s+/g, " ");
+      expect(normalizedInstructions).toContain(
+        "application-managed workflow input",
+      );
       expect(normalizedInstructions).toContain("image-free");
       expect(normalizedInstructions).toContain(
         "actually attach exactly one `application/zip` typed `output_file`",
@@ -84,6 +93,8 @@ describe("socratic knowledge-base Skill packaging", () => {
         "will be generated now, soon or later",
       );
       expect(normalizedInstructions).not.toContain("text-only");
+      expect(normalizedInstructions).not.toContain("server-owned system input");
+      expect(normalizedInstructions).not.toContain("are system inputs");
     }
     expect(outputContract).toContain('"schemaVersion": 4');
     expect(outputContract).toContain('"sourceKind": "user_upload"');
@@ -100,6 +111,29 @@ describe("socratic knowledge-base Skill packaging", () => {
     expect(outputContract).toContain(
       "`FINALIZATION_INPUT.json.assets[].requiredManifest` field-for-field",
     );
+    expect(normalizedSkill).toContain(
+      "source URLs are provenance rather than a byte identity",
+    );
+    expect(skill).toContain(
+      "`official_logo_upload` remains an exact-byte contract",
+    );
+    expect(skill).not.toContain("exact provenance for those same bytes");
+    expect(outputContract).toContain(
+      '"sourceAssetUrl": "https://official.example/media/logo.svg"',
+    );
+    expect(outputContract).toContain(
+      "Do not require raw-byte equality with the URL payload",
+    );
+    expect(normalizedOutputContract).toContain(
+      "Dashboard-bound raster to copy byte-for-byte",
+    );
+    expect(normalizedQuestioningStrategy).toContain(
+      "the source URLs remain provenance",
+    );
+    expect(normalizedQuestioningStrategy).toContain(
+      "retained byte-identically only for the final archive",
+    );
+    expect(validator).toContain("Dashboard-bound raster input Logo");
     expect(outputContract).toContain("不同来源模型");
     expect(outputContract).toContain("same header-based rule");
     expect(validator).not.toContain("CUSTOMER_FORMAL_LEAKAGE");

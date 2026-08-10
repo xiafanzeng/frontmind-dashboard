@@ -8,12 +8,22 @@ import {
 } from "../shared/service-portal";
 
 const mocks = vi.hoisted(() => ({
+  getDashboardWorkspace: vi.fn(),
   getServicePortal: vi.fn(),
   listWorkspaceQuestions: vi.fn(),
   requestWorkspaceQuestionSelection: vi.fn(),
+  confirmWorkspaceBrandKeywordSelection: vi.fn(),
   confirmWorkspaceQuestionIntent: vi.fn(),
   assertServiceCapability: vi.fn(),
 }));
+
+vi.mock("./dashboard-service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./dashboard-service")>();
+  return {
+    ...actual,
+    getDashboardWorkspace: mocks.getDashboardWorkspace,
+  };
+});
 
 vi.mock("./service-entitlement", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./service-entitlement")>();
@@ -22,6 +32,8 @@ vi.mock("./service-entitlement", async (importOriginal) => {
     getServicePortal: mocks.getServicePortal,
     listWorkspaceQuestions: mocks.listWorkspaceQuestions,
     requestWorkspaceQuestionSelection: mocks.requestWorkspaceQuestionSelection,
+    confirmWorkspaceBrandKeywordSelection:
+      mocks.confirmWorkspaceBrandKeywordSelection,
     confirmWorkspaceQuestionIntent: mocks.confirmWorkspaceQuestionIntent,
     assertServiceCapability: mocks.assertServiceCapability,
   };
@@ -88,8 +100,33 @@ describe("user workspace question DTO boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getServicePortal.mockResolvedValue(portal);
+    mocks.getDashboardWorkspace.mockResolvedValue({
+      revision: 5,
+      payload: {
+        brandName: "测试品牌",
+        headline: "测试品牌看板",
+        summary: "",
+        metrics: [],
+        sections: [],
+        keywordTables: [
+          {
+            id: "global-keywords",
+            title: "品牌全域词库",
+            columns: ["问题", "分类"],
+            rows: [["测试品牌与竞品相比有什么优势？", "竞品对比词"]],
+          },
+        ],
+        questions: [],
+        monitoringAnswers: [],
+        citations: [],
+        contentAssets: [],
+        optimizationReport: null,
+        progressReports: [],
+      },
+    });
     mocks.listWorkspaceQuestions.mockResolvedValue([question]);
     mocks.requestWorkspaceQuestionSelection.mockResolvedValue(question);
+    mocks.confirmWorkspaceBrandKeywordSelection.mockResolvedValue(question);
     mocks.confirmWorkspaceQuestionIntent.mockResolvedValue(question);
     mocks.assertServiceCapability.mockResolvedValue(undefined);
   });
@@ -130,7 +167,7 @@ describe("user workspace question DTO boundary", () => {
     const requested = await caller.requestQuestionSelection({
       mode: "direct",
       question: "如何选择适合企业的产品方案？",
-      category: "product_scenario",
+      classificationVersion: 2,
     });
     const confirmed = await caller.confirmQuestionIntent({
       questionId: question.id,
@@ -146,5 +183,94 @@ describe("user workspace question DTO boundary", () => {
       expect(value).not.toHaveProperty("contractId");
       expect(value).not.toHaveProperty("quotaPeriodId");
     }
+    expect(mocks.requestWorkspaceQuestionSelection).toHaveBeenCalledWith(
+      {
+        userId: 7,
+        actorUserId: 7,
+        question: "如何选择适合企业的产品方案？",
+        classificationVersion: 2,
+      },
+      { afterWrite: expect.any(Function) },
+    );
+  });
+
+  it("resolves a brand keyword row on the server before confirming it", async () => {
+    const caller = workspaceRouter.createCaller(userContext());
+
+    await caller.requestQuestionSelection({
+      mode: "brand_keyword_library",
+      dashboardRevision: 5,
+      tableId: "global-keywords",
+      rowIndex: 0,
+    });
+
+    expect(mocks.getDashboardWorkspace).toHaveBeenCalledWith(7);
+    expect(mocks.confirmWorkspaceBrandKeywordSelection).toHaveBeenCalledWith({
+      userId: 7,
+      actorUserId: 7,
+      dashboardRevision: 5,
+      tableId: "global-keywords",
+      rowIndex: 0,
+      expectedQuestion: "测试品牌与竞品相比有什么优势？",
+      expectedCategory: "competitor_comparison",
+    });
+  });
+
+  it("keeps the legacy direct-question payload compatible during deployment", async () => {
+    const caller = workspaceRouter.createCaller(userContext());
+
+    await caller.requestQuestionSelection({
+      mode: "direct",
+      question: "如何选择适合企业的产品方案？",
+      category: "product_scenario",
+    });
+
+    expect(mocks.requestWorkspaceQuestionSelection).toHaveBeenCalledWith(
+      {
+        userId: 7,
+        actorUserId: 7,
+        question: "如何选择适合企业的产品方案？",
+        category: "product_scenario",
+      },
+      { afterWrite: expect.any(Function) },
+    );
+  });
+
+  it("routes v2 direct questions for engineer classification", async () => {
+    const caller = workspaceRouter.createCaller(userContext());
+
+    await caller.requestQuestionSelection({
+      mode: "direct",
+      question: "如何选择适合企业的产品方案？",
+      classificationVersion: 2,
+    });
+
+    expect(mocks.assertServiceCapability).toHaveBeenCalledWith(
+      7,
+      "questionSelection",
+    );
+    expect(mocks.requestWorkspaceQuestionSelection).toHaveBeenCalledWith(
+      {
+        userId: 7,
+        actorUserId: 7,
+        question: "如何选择适合企业的产品方案？",
+        classificationVersion: 2,
+      },
+      { afterWrite: expect.any(Function) },
+    );
+  });
+
+  it("does not let the v2 customer path assign its own category", async () => {
+    const caller = workspaceRouter.createCaller(userContext());
+
+    await expect(
+      caller.requestQuestionSelection({
+        mode: "direct",
+        question: "如何选择适合企业的产品方案？",
+        category: "product_scenario",
+        classificationVersion: 2,
+      } as never),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(mocks.requestWorkspaceQuestionSelection).not.toHaveBeenCalled();
   });
 });

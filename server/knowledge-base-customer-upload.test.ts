@@ -465,6 +465,76 @@ describe("knowledge-base customer upload provenance", () => {
     expect(dependencies.readStoredPresalesFile).not.toHaveBeenCalled();
   });
 
+  it("selects the latest completed replacement ledger matching the current Logo hash", async () => {
+    const logoTurn = (id: string, fileId: string, sourceSha256: string) => ({
+      ...capturedImageTurn({
+        recovery: {
+          capturedClientAttachments: true,
+          attachments: [{ file_id: fileId, filename: `${id}.png` }],
+          attachmentManifest: [
+            {
+              filename: `${id}.png`,
+              mimeType: "image/png",
+              sizeBytes: 1234,
+              sha256: sourceSha256,
+            },
+          ],
+          officialLogoUpload: {
+            verified: true,
+            index: 0,
+            fileId,
+            filename: `${id}.png`,
+            mimeType: "image/png",
+            sizeBytes: 1234,
+            sourceSha256,
+          },
+        },
+        preparedDispatch: {
+          requestBody: {
+            attachments: [{ file_id: fileId, filename: `${id}.png` }],
+          },
+        },
+      }),
+      id,
+      attachmentFileIds: [fileId],
+    });
+    const superseded = logoTurn("logo-old", "file-logo-old", "a".repeat(64));
+    const current = logoTurn("logo-new", "file-logo-new", "b".repeat(64));
+    dependencies.getDb.mockResolvedValue({
+      select() {
+        return {
+          from() {
+            return {
+              where() {
+                return {
+                  async orderBy() {
+                    return [superseded, current];
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await expect(
+      verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+        userId: 7,
+        buildId: "build-1",
+        generation: 1,
+        officialLogoSha256: "b".repeat(64),
+      }),
+    ).resolves.toEqual({
+      expectedCustomerUploads: [],
+      expectedOfficialLogoUpload: expect.objectContaining({
+        fileId: "file-logo-new",
+        sourceSha256: "b".repeat(64),
+      }),
+      expectedOfficialLogoProvenance: undefined,
+    });
+  });
+
   it("loads one customer-upload Logo ledger for reconcile, publish and download without duplicating it as customer media", async () => {
     const turn = capturedImageTurn({
       recovery: {

@@ -23,6 +23,7 @@ import {
   selectPortalContract,
   type ServicePortalContractRecord,
 } from "./service-entitlement";
+import { isUserQuestionPendingClassification } from "./question-selection-policy";
 
 const QUESTION_QUOTA_ROLE = "monitoring_optimization_engineer" as const;
 
@@ -35,7 +36,10 @@ type QuestionQuotaUsageRow = {
     | "industry"
     | "competitor_comparison"
     | "reputation"
-    | "product_scenario";
+    | "product_scenario"
+    | null;
+  source?: "model" | "website" | "offline" | "admin" | "user";
+  candidateKey?: string | null;
   status: "candidate" | "selected" | "archived";
   selectionApprovalStatus: "not_requested" | "pending" | "approved";
 };
@@ -70,7 +74,7 @@ function addQuestionUsage(
     usage.competitorComparison += 1;
   } else if (category === "product_scenario") {
     usage.productScenario += 1;
-  } else {
+  } else if (category === "industry" || category === "reputation") {
     usage[category] += 1;
   }
 }
@@ -85,7 +89,20 @@ export function countQuestionQuotaUsage(rows: QuestionQuotaUsageRow[]) {
       addQuestionUsage(selectedUsage, row.category);
       addQuestionUsage(reservedUsage, row.category);
     } else if (row.selectionApprovalStatus === "pending") {
-      addQuestionUsage(reservedUsage, row.category);
+      if (
+        row.category === null ||
+        (row.source !== undefined &&
+          isUserQuestionPendingClassification({
+            candidateKey: row.candidateKey,
+            source: row.source,
+            status: row.status,
+            selectionApprovalStatus: row.selectionApprovalStatus,
+          }))
+      ) {
+        reservedUsage.total += 1;
+      } else {
+        addQuestionUsage(reservedUsage, row.category);
+      }
     }
   }
   return { selectedUsage, reservedUsage };
@@ -202,6 +219,8 @@ function questionUsageRows(executor: any, userId: number, periodId: string) {
   return executor
     .select({
       category: workspaceQuestions.category,
+      candidateKey: workspaceQuestions.candidateKey,
+      source: workspaceQuestions.source,
       status: workspaceQuestions.status,
       selectionApprovalStatus: workspaceQuestions.selectionApprovalStatus,
     })

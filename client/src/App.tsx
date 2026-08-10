@@ -179,7 +179,11 @@ function Router() {
           if (!Number.isInteger(userId) || userId <= 0) return <NotFound />;
           const allowedTabs: readonly WorkspaceTab[] = ADMIN_WORKSPACE_TAB_IDS;
           if (!allowedTabs.includes(params.tab as WorkspaceTab)) {
-            return <Redirect to={`/admin/customers/${userId}/service`} />;
+            const query =
+              typeof window === "undefined" ? "" : window.location.search;
+            return (
+              <Redirect to={`/admin/customers/${userId}/workspace${query}`} />
+            );
           }
           const initialTab = params.tab as WorkspaceTab;
           return (

@@ -30,6 +30,9 @@ import {
   getKnowledgeBaseSkillDescriptor,
   isApprovedKnowledgeBaseAwaitingInputObservation,
   knowledgeBaseArtifactFailureNotice,
+  knowledgeBaseTurnReplayHttpStatus,
+  knowledgeBaseTurnReservationErrorStatus,
+  knowledgeBaseRecoveryLogoPreparationError,
   loadKnowledgeBaseTurnAuthority,
   logKnowledgeBaseRuntimeFailure,
   normalizeRecoveredTaskOutput,
@@ -44,6 +47,7 @@ import {
   uploadKnowledgeBaseSkillArchive,
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
+import { KnowledgeBaseTurnReservationError } from "./knowledge-base-turn-service";
 import { KnowledgeBaseArtifactBindingError } from "./knowledge-base-artifact-binding-service";
 import { knowledgeBaseLogoRepairFileIsOwned } from "./knowledge-base-logo-provenance-api";
 import { applyKnowledgeBaseFinalLogoProvenanceObservation } from "./knowledge-base-logo-provenance-repair";
@@ -60,6 +64,51 @@ function expectEnterpriseIdentityError(
     expect((error as KnowledgeBaseEnterpriseIdentityError).code).toBe(code);
   }
 }
+
+describe("knowledge-base turn HTTP outcomes", () => {
+  it("keeps all in-flight receipts on 202 and terminal receipts on 409", () => {
+    expect(knowledgeBaseTurnReplayHttpStatus("pending")).toBe(202);
+    expect(knowledgeBaseTurnReplayHttpStatus("bound")).toBe(202);
+    expect(knowledgeBaseTurnReplayHttpStatus("awaiting_attachments")).toBe(200);
+    expect(knowledgeBaseTurnReplayHttpStatus("completed")).toBe(200);
+    expect(knowledgeBaseTurnReplayHttpStatus("terminal")).toBe(409);
+  });
+
+  it("exposes stable stale/replay/Logo status mappings", () => {
+    expect(
+      knowledgeBaseTurnReservationErrorStatus(
+        new KnowledgeBaseTurnReservationError(
+          "STALE_KNOWLEDGE_BASE_PRESENTATION",
+          "stale",
+        ),
+      ),
+    ).toBe(409);
+    expect(
+      knowledgeBaseTurnReservationErrorStatus(
+        new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+          "mismatch",
+        ),
+      ),
+    ).toBe(409);
+    expect(
+      knowledgeBaseTurnReservationErrorStatus(
+        new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
+          "conflict",
+        ),
+      ),
+    ).toBe(409);
+    expect(
+      knowledgeBaseTurnReservationErrorStatus(
+        new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+          "invalid",
+        ),
+      ),
+    ).toBe(422);
+  });
+});
 
 describe("knowledge base execution contract", () => {
   afterEach(() => {
@@ -115,7 +164,7 @@ describe("knowledge base execution contract", () => {
     expect(KNOWLEDGE_BASE_AGENT_PROFILE).toBe("frontmind-pro");
   });
 
-  it("projects missing final Logo provenance as a dedicated non-retryable repair notice", () => {
+  it("does not let optional Logo provenance replace the authoritative observation", () => {
     const progress = {
       build: {
         id: "build-final",
@@ -160,15 +209,16 @@ describe("knowledge base execution contract", () => {
         },
       },
     });
-    expect(projected.notice).toMatchObject({
-      code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
-      retryable: false,
+    expect(projected.notice).toEqual({
+      key: "old",
+      code: "FINAL_PACKAGE_INVALID",
+      severity: "error",
+      message: "旧错误",
+      retryable: true,
+      turnId: null,
+      createdAt: 1,
     });
-    expect(projected.interaction).toMatchObject({
-      interactionState: "failed",
-      canReply: false,
-      canPublish: false,
-    });
+    expect(projected.interaction).toEqual(ordinary);
   });
 
   it("authorizes a newly owned repair upload without comparing its credential to the historical task", () => {
@@ -518,6 +568,13 @@ describe("knowledge base execution contract", () => {
     );
     expect(prompt).toContain(KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME);
     expect(prompt).toContain("先解压 ZIP 并完整读取根目录 SKILL.md");
+    expect(prompt).toContain(
+      "用户已在 FrontMind Dashboard 发起并授权本轮企业知识库构建",
+    );
+    expect(prompt).toContain("不要求环境预装同名 Skill");
+    expect(prompt).toContain(
+      "只有 customerAttachments 中明确列出的文件属于客户事实资料",
+    );
     expect(prompt).toContain("8-115");
     expect(prompt).toContain("不得为数量、字数或图片数填充内容");
     expect(prompt).toContain("一级分支数量不设固定值");
@@ -544,7 +601,11 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("仍没有合格真实 Logo");
     expect(prompt).toContain("完整 Manifest 和第一个叶子正文，但返回零张图片");
     expect(prompt).toContain("等待用户上传企业主 Logo");
-    expect(prompt).toContain("Dashboard 绑定原始字节");
+    expect(prompt).toContain("sourceAssetUrl 可指向 SVG");
+    expect(prompt).toContain("该 URL 只记录官方来源");
+    expect(prompt).toContain("不要求源文件与返回栅格原字节相同");
+    expect(prompt).toContain("Dashboard 将绑定该返回字节");
+    expect(prompt).toContain("official_logo_upload 原样保留");
     expect(prompt).toContain("official_logo_upload");
     expect(prompt).toContain("资料采集状态只由 Dashboard 展示");
     expect(prompt).toContain("不得复述、输出或以“正在采集”“处理中”");
@@ -561,6 +622,19 @@ describe("knowledge base execution contract", () => {
     expect(prompt).not.toContain("def validate_archive");
     expect(prompt).not.toContain("360–480");
     expect(prompt).not.toContain("300,000");
+    for (const forbiddenPhrase of [
+      "系统附件",
+      "服务端系统附件",
+      "系统输入",
+      "优先级",
+      "最高优先级",
+      "覆盖任务历史",
+      "旧 Skill、旧回复或旧协议示例",
+      "pasted_content",
+      "严格执行",
+    ]) {
+      expect(prompt).not.toContain(forbiddenPhrase);
+    }
 
     const archive = await readKnowledgeBaseSkillArchiveAttachment();
     expect(archive.filename).toBe("socratic-kb-builder.skill.zip");
@@ -710,8 +784,21 @@ describe("knowledge base execution contract", () => {
           '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":1,"revision":5,"leafId":"1.3","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
         ),
     ).toBe(true);
-    expect(prompt).toContain("旧 Skill、旧回复或旧协议示例");
-    expect(prompt).toContain("最终输出锁（最高优先级");
+    expect(prompt).toContain("用户已授权继续完成 FrontMind Dashboard");
+    expect(prompt).toContain("不要求环境预装同名 Skill");
+    expect(prompt).toContain("# 本轮回复结尾要求");
+    for (const forbiddenPhrase of [
+      "系统附件",
+      "系统输入",
+      "优先级",
+      "最高优先级",
+      "覆盖任务历史",
+      "旧 Skill、旧回复或旧协议示例",
+      "pasted_content",
+      "严格执行",
+    ]) {
+      expect(prompt).not.toContain(forbiddenPhrase);
+    }
   });
 
   it("forces the last confirmation to attach one scoped ZIP before ending", async () => {
@@ -750,9 +837,11 @@ describe("knowledge base execution contract", () => {
     expect(prompt.length).toBeLessThanOrEqual(3_000);
     expect(prompt).not.toContain("极长节点标题");
     expect(prompt).not.toContain("极长分支标题");
-    expect(prompt).toContain("最终交付专用短指令");
-    expect(prompt).toContain("系统附件，不是客户补料");
-    expect(prompt).toContain("不得据此把动作改为 revise/needs_verification");
+    expect(prompt).toContain("完成最终交付");
+    expect(prompt).toContain("用户已授权继续完成 FrontMind Dashboard");
+    expect(prompt).toContain("应用管理的工作流输入");
+    expect(prompt).toContain("不属于 customerAttachments");
+    expect(prompt).toContain("当前状态坐标记录的动作是 confirm");
     expect(prompt).toContain("application/zip");
     expect(prompt).toContain(
       "frontmind-kb-finalization-input-aaaaaaaaaaaaaaaa.zip",
@@ -771,6 +860,10 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("--expected-turn-id final-package-turn");
     expect(prompt).toContain("requiredManifest 必须逐字段原样复制");
     expect(prompt).toContain("不得从任务历史生成 sourceUpload*");
+    expect(prompt).toContain("Dashboard 已绑定的栅格字节");
+    expect(prompt).toContain("未提供来源字段时保持省略");
+    expect(prompt).toContain("不得猜测或补造");
+    expect(prompt).toContain("official_logo_upload 必须与客户原始上传字节一致");
     expect(prompt).not.toContain("内部证据工作区");
     expect(prompt).toContain("VALID dashboard-enterprise-v1 archive");
     expect(prompt).toContain("README/TXT 素材占位");
@@ -779,6 +872,18 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("turnId=final-package-turn");
     expect(prompt).toContain("成品 buildRevision=47");
     expect(prompt).toContain("资源进入 output 前不得结束");
+    for (const forbiddenPhrase of [
+      "系统附件",
+      "系统输入",
+      "优先级",
+      "最高优先级",
+      "覆盖任务历史",
+      "旧 Skill、旧回复和旧协议示例",
+      "pasted_content",
+      "严格执行",
+    ]) {
+      expect(prompt).not.toContain(forbiddenPhrase);
+    }
     expect(prompt.match(/<!-- FRONTMIND_KB_PROGRESS/gu)).toHaveLength(1);
     expect(prompt.match(/<!-- FRONTMIND_KB_PRESENTATION/gu)).toHaveLength(1);
     expect(prompt).not.toContain("# 本轮上传资料");
@@ -804,6 +909,41 @@ describe("knowledge base execution contract", () => {
       message:
         "最终知识库 ZIP 不符合 Dashboard v4 归档合同：新版知识库 ZIP 包含不支持的文件类型：assets/official_logo_README.txt。本轮未推进；请重试本轮，系统会重新提供权威正文与全部素材，并要求生成端通过同一校验器后再交付。",
     });
+  });
+
+  it("classifies every pre-upstream recovery Logo failure as deterministic local preparation", () => {
+    const invalid = knowledgeBaseRecoveryLogoPreparationError(
+      new KnowledgeBaseArtifactBindingError(
+        "LOGO_UPLOAD_INVALID",
+        "上传的 Logo 原始字节校验失败，请重新上传",
+      ),
+    );
+    expect(invalid).toMatchObject({
+      name: "KnowledgeBaseLocalPreparationError",
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+      message: "上传的 Logo 原始字节校验失败，请重新上传",
+    });
+
+    const stale = knowledgeBaseRecoveryLogoPreparationError(
+      new KnowledgeBaseArtifactBindingError(
+        "BUILD_CHANGED",
+        "当前首个知识节点状态已变化，请刷新后重新上传 Logo",
+      ),
+    );
+    expect(stale).toMatchObject({
+      name: "KnowledgeBaseLocalPreparationError",
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+    });
+
+    const unreadable = knowledgeBaseRecoveryLogoPreparationError(
+      new Error("sensitive storage detail"),
+    );
+    expect(unreadable).toMatchObject({
+      name: "KnowledgeBaseLocalPreparationError",
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+      message: "企业官方主 Logo 无法从本轮受管上传恢复，请重新上传",
+    });
+    expect(unreadable.message).not.toContain("sensitive storage detail");
   });
 
   it("formats a retry with only the new operation and turn envelope identity", async () => {
@@ -1189,6 +1329,114 @@ describe("knowledge base execution contract", () => {
       "register:original-task",
       "reconcile:original-task",
     ]);
+  });
+
+  it("runs manual Logo promotion only after the real task is created, bound, and registered", async () => {
+    const calls: string[] = [];
+    const result = await recoverKnowledgeBaseTurnClaimTask({
+      claim: {
+        turn: { upstreamTaskId: null },
+        upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo",
+      } as any,
+      ensureDispatch: async () => {
+        calls.push("prepare");
+        return {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "manual Logo",
+            agentProfile: "manus-1.6-max",
+            taskMode: "agent",
+            attachments: [],
+          },
+          bodySha256: "b".repeat(64),
+          preparedAt: "2026-08-10T00:00:00.000Z",
+        };
+      },
+      createTask: async () => {
+        calls.push("create:manus-task-logo");
+        return { taskId: "manus-task-logo" };
+      },
+      bindTask: async (taskId) => calls.push(`bind:${taskId}`),
+      registerTask: async (taskId) => calls.push(`register:${taskId}`),
+      afterTaskAcknowledged: async (taskId) => calls.push(`promote:${taskId}`),
+      reconcileTask: async (taskId) => {
+        calls.push(`reconcile:${taskId}`);
+        return false;
+      },
+    });
+
+    expect(result.taskId).toBe("manus-task-logo");
+    expect(calls).toEqual([
+      "prepare",
+      "create:manus-task-logo",
+      "bind:manus-task-logo",
+      "register:manus-task-logo",
+      "promote:manus-task-logo",
+      "reconcile:manus-task-logo",
+    ]);
+  });
+
+  it("reuses an already-bound Manus task while retrying post-ack Logo promotion", async () => {
+    const calls: string[] = [];
+    const createTask = vi.fn();
+    const result = await recoverKnowledgeBaseTurnClaimTask({
+      claim: {
+        turn: { upstreamTaskId: "manus-task-existing" },
+        upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo",
+      } as any,
+      ensureDispatch: vi.fn(),
+      createTask,
+      bindTask: vi.fn(),
+      registerTask: async (taskId) => calls.push(`register:${taskId}`),
+      afterTaskAcknowledged: async (taskId) => calls.push(`promote:${taskId}`),
+      reconcileTask: async (taskId) => {
+        calls.push(`reconcile:${taskId}`);
+        return false;
+      },
+    });
+
+    expect(result).toMatchObject({
+      taskId: "manus-task-existing",
+      rebound: false,
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(calls).toEqual([
+      "register:manus-task-existing",
+      "promote:manus-task-existing",
+      "reconcile:manus-task-existing",
+    ]);
+  });
+
+  it("stops recovery before upstream create when Logo preparation is deterministically rejected", async () => {
+    const createTask = vi.fn();
+    const bindTask = vi.fn();
+    const registerTask = vi.fn();
+    const reconcileTask = vi.fn();
+    const preparationError = knowledgeBaseRecoveryLogoPreparationError(
+      new KnowledgeBaseArtifactBindingError(
+        "LOGO_UPLOAD_INVALID",
+        "上传的 Logo 原始文件已丢失，请重新上传",
+      ),
+    );
+
+    await expect(
+      recoverKnowledgeBaseTurnClaimTask({
+        claim: {
+          turn: { upstreamTaskId: null },
+          upstreamIdempotencyKey: "frontmind-kb-v2:logo-recovery",
+        } as any,
+        ensureDispatch: vi.fn().mockRejectedValue(preparationError),
+        createTask,
+        bindTask,
+        registerTask,
+        reconcileTask,
+      }),
+    ).rejects.toBe(preparationError);
+    expect(createTask).not.toHaveBeenCalled();
+    expect(bindTask).not.toHaveBeenCalled();
+    expect(registerTask).not.toHaveBeenCalled();
+    expect(reconcileTask).not.toHaveBeenCalled();
   });
 
   it("repairs a missing task resource ledger after bind without POSTing again", async () => {

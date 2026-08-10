@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { renderHook, act } from "@testing-library/react";
+import { renderHook, act, waitFor } from "@testing-library/react";
 import { toast } from "sonner";
 import {
   useSendMessage,
@@ -429,6 +429,113 @@ describe("useSendMessage", () => {
     });
   });
 
+  it("keeps the Logo gate local until a real upstream task is acknowledged", async () => {
+    const logo = new File(["logo"], "logo.png", { type: "image/png" });
+    mockPreparedFiles([logo]);
+    let resolveTurn!: (value: any) => void;
+    mocks.createKnowledgeBaseTurnTask.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveTurn = resolve;
+      }),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submission!: Promise<boolean>;
+    act(() => {
+      submission = result.current.sendMessage("", [logo], {
+        syncKnowledgeBaseSnapshot: true,
+        submissionKind: "logo",
+        knowledgeBaseExpectedGeneration: 1,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+    await waitFor(() =>
+      expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledTimes(1),
+    );
+
+    expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        submissionKind: "logo",
+      }),
+    );
+    expect(
+      mocks.createKnowledgeBaseTurnTask.mock.calls[0]![1],
+    ).not.toHaveProperty("attachmentManifest");
+    expect(mocks.sha256UploadFile).not.toHaveBeenCalled();
+    expect(mocks.updateStatus).not.toHaveBeenCalledWith(
+      "test-conv-id",
+      "running",
+      expect.anything(),
+    );
+    expect(mocks.wakeKnowledgeBaseConversation).not.toHaveBeenCalled();
+
+    resolveTurn({ id: "manus-logo-task", status: "running", output: [] });
+    await act(async () => {
+      await submission;
+    });
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "running",
+      expect.objectContaining({ taskId: "manus-logo-task" }),
+    );
+    expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledWith(
+      "test-conv-id",
+    );
+  });
+
+  it("rolls back an unacknowledged Logo error even when it carries a stale active-turn observation", async () => {
+    const logo = new File(["logo"], "logo.png", { type: "image/png" });
+    mockPreparedFiles([logo]);
+    mocks.createKnowledgeBaseTurnTask.mockImplementationOnce(
+      async (_input: unknown, context: any) => {
+        throw Object.assign(new Error("Logo 提交未获 Manus 任务确认"), {
+          status: 425,
+          code: "IDEMPOTENCY_PENDING",
+          knowledgeObservation: {
+            authoritativeTaskId: "previous-parent-task",
+            activeTurn: { clientRequestId: context.clientRequestId },
+            approvedPresentation: null,
+            completedTurn: null,
+          },
+        });
+      },
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = true;
+    await act(async () => {
+      submitted = await result.current.sendMessage("", [logo], {
+        syncKnowledgeBaseSnapshot: true,
+        submissionKind: "logo",
+        knowledgeBaseExpectedGeneration: 1,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+      });
+    });
+
+    expect(submitted).toBe(false);
+    expect(mocks.rollbackPendingKnowledgeBaseTurn).toHaveBeenCalledWith(
+      "test-conv-id",
+      expect.any(String),
+    );
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "awaiting_input",
+    );
+    expect(toast.success).not.toHaveBeenCalledWith(
+      "本轮已提交",
+      expect.anything(),
+    );
+    expect(toast.error).toHaveBeenCalledWith(
+      "本轮未能提交",
+      expect.objectContaining({
+        description: "Logo 提交未获 Manus 任务确认",
+      }),
+    );
+  });
+
   it("rolls back a deterministically rejected knowledge confirmation instead of pretending to recover it", async () => {
     mocks.createKnowledgeBaseTurnTask.mockRejectedValueOnce(
       Object.assign(new Error("当前知识节点版本无效"), {
@@ -451,6 +558,153 @@ describe("useSendMessage", () => {
       expect.any(String),
     );
     expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["activeTurn", "approvedPresentation", "completedTurn"] as const)(
+    "treats a deterministic HTTP error as success when %s acknowledges the request",
+    async (acknowledgementField) => {
+      mocks.createKnowledgeBaseTurnTask.mockImplementationOnce(
+        async (_input: unknown, context: any) => {
+          throw Object.assign(new Error("代理响应失败"), {
+            status: 422,
+            code: "KNOWLEDGE_BASE_TURN_FAILED",
+            knowledgeObservation: {
+              [acknowledgementField]: {
+                clientRequestId: context.clientRequestId,
+              },
+            },
+          });
+        },
+      );
+
+      const { result } = renderHook(() => useSendMessage());
+      let submitted = false;
+      await act(async () => {
+        submitted = await result.current.sendMessage("确认", [], {
+          syncKnowledgeBaseSnapshot: true,
+          knowledgeBaseExpectedGeneration: 1,
+          knowledgeBaseExpectedRevision: 0,
+          knowledgeBaseExpectedLeafId: "1.1",
+          knowledgeBaseExpectedPresentationKey: "presentation-1",
+        });
+      });
+
+      expect(submitted).toBe(true);
+      expect(mocks.rollbackPendingKnowledgeBaseTurn).not.toHaveBeenCalled();
+      expect(mocks.commitKnowledgeBaseObservation).toHaveBeenCalledWith(
+        "test-conv-id",
+        expect.objectContaining({
+          [acknowledgementField]: expect.objectContaining({
+            clientRequestId: expect.any(String),
+          }),
+        }),
+      );
+      expect(toast.success).toHaveBeenCalledWith(
+        "本轮已提交",
+        expect.objectContaining({
+          description: "FrontMind 正在生成并校验当前知识节点。",
+        }),
+      );
+    },
+  );
+
+  it("does not mistake a legacy takeover's old active turn for deterministic-error acknowledgement", async () => {
+    const file = new File(["a"], "a.txt", {
+      type: "text/plain",
+      lastModified: 10,
+    });
+    mockPreparedFiles([file]);
+    mocks.useConversation.mockReturnValue(
+      mockConversationContext({
+        activeConversation: {
+          id: "conversation-resume",
+          title: "企业知识库构建",
+          status: "running",
+          messages: [
+            {
+              id: "existing-pending",
+              role: "user",
+              content: "请结合原附件修订",
+              timestamp: 1,
+              knowledgeBase: {
+                kind: "pending_user",
+                clientRequestId: "original-request",
+                turnId: "reserved-turn",
+              },
+            },
+          ],
+          knowledgeBase: {
+            activeClientRequestId: "original-request",
+            notice: { code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED" },
+          },
+          lastKnownOutputLength: 0,
+        },
+      }),
+    );
+    const oldObservation = {
+      activeTurn: { clientRequestId: "original-request" },
+      approvedPresentation: null,
+      completedTurn: null,
+    };
+    mocks.createKnowledgeBaseTurnTask.mockRejectedValueOnce(
+      Object.assign(new Error("上传的 Logo 不符合要求"), {
+        status: 422,
+        code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+        knowledgeObservation: oldObservation,
+      }),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = true;
+    await act(async () => {
+      submitted = await result.current.sendMessage("", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(submitted).toBe(false);
+    expect(mocks.rollbackPendingKnowledgeBaseTurn).toHaveBeenCalledWith(
+      "conversation-resume",
+      "original-request",
+    );
+    expect(mocks.commitKnowledgeBaseObservation).toHaveBeenCalledWith(
+      "conversation-resume",
+      oldObservation,
+    );
+    expect(toast.success).not.toHaveBeenCalledWith(
+      "本轮已提交",
+      expect.anything(),
+    );
+    expect(toast.error).toHaveBeenCalledWith(
+      "本轮未能提交",
+      expect.objectContaining({ description: "上传的 Logo 不符合要求" }),
+    );
+  });
+
+  it("removes a remounted tab's optimistic alias when the operation winner is adopted", async () => {
+    mocks.createKnowledgeBaseTurnTask.mockResolvedValueOnce({
+      id: "winner-task",
+      status: "running",
+      output: [],
+      adoptedClientRequestId: "winner-request",
+    });
+    const { result } = renderHook(() => useSendMessage());
+    await act(async () => {
+      await result.current.sendMessage("确认", [], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 1,
+        knowledgeBaseExpectedRevision: 0,
+        knowledgeBaseExpectedLeafId: "1.1",
+        knowledgeBaseExpectedPresentationKey: "presentation-1",
+      });
+    });
+    expect(mocks.rollbackPendingKnowledgeBaseTurn).toHaveBeenCalledWith(
+      "test-conv-id",
+      expect.any(String),
+    );
   });
 
   it("keeps a disconnected accepted confirmation on the normal processing path", async () => {

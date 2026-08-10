@@ -1,4 +1,5 @@
 import {
+  ArrowLeft,
   BarChart3,
   Building2,
   Eye,
@@ -71,6 +72,11 @@ type DashboardSkeletonEditorProps = {
   userId: number;
   workspace?: DashboardWorkspaceSnapshot;
   loading?: boolean;
+  dashboardLayout?: "embedded" | "workspace";
+  initialSection?: CustomerDashboardMirrorSection;
+  marketEdition?: "domestic" | "overseas";
+  brandTrackingManagement?: ReactNode;
+  onExitDashboard?: () => void;
   knowledgePreview?: CustomerKnowledgePreview | null;
   servicePortal?: unknown;
   servicePortalLoading?: boolean;
@@ -559,6 +565,11 @@ export default function DashboardSkeletonEditor({
   userId,
   workspace,
   loading = false,
+  dashboardLayout = "embedded",
+  initialSection,
+  marketEdition = "domestic",
+  brandTrackingManagement,
+  onExitDashboard,
   knowledgePreview = null,
   servicePortal,
   servicePortalLoading = false,
@@ -1024,35 +1035,74 @@ export default function DashboardSkeletonEditor({
 
   if (loading || !draft) {
     return (
-      <PortalCard className="grid min-h-[420px] place-items-center p-8 text-sm text-[#716a80]">
-        <div className="flex items-center gap-2">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          正在载入交付内容…
-        </div>
-      </PortalCard>
+      <div
+        className={
+          dashboardLayout === "workspace"
+            ? "flex h-full min-h-0 flex-col gap-4 p-4 sm:p-6"
+            : ""
+        }
+      >
+        {onExitDashboard && (
+          <Button
+            type="button"
+            className="w-fit"
+            size="sm"
+            variant="operatorOutline"
+            onClick={onExitDashboard}
+          >
+            <ArrowLeft className="h-4 w-4" />
+            返回工作台
+          </Button>
+        )}
+        <PortalCard className="grid min-h-[420px] flex-1 place-items-center p-8 text-sm text-[#716a80]">
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            正在载入交付内容…
+          </div>
+        </PortalCard>
+      </div>
     );
   }
 
   return (
-    <div className="space-y-5">
+    <div className={dashboardLayout === "workspace" ? "h-full" : "space-y-5"}>
       <CustomerDashboardMirror
         payload={draft}
+        layout={dashboardLayout}
+        initialSection={initialSection}
+        marketEdition={marketEdition}
+        allowBrandTrackingManagement={Boolean(brandTrackingManagement)}
+        brandTrackingManagement={brandTrackingManagement}
         knowledgePreview={knowledgePreview}
         servicePortal={servicePortal}
         servicePortalLoading={servicePortalLoading}
         servicePortalError={servicePortalError}
         onRefreshServicePortal={onRefreshServicePortal}
         websiteWorkspace={websiteWorkspace}
+        responseLogicRecords={responseLogicQuery.data?.records ?? []}
         editActions={
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={() => void onWorkspaceChanged?.()}
-          >
-            <RefreshCw className="h-4 w-4" />
-            刷新
-          </Button>
+          <>
+            {onExitDashboard && (
+              <Button
+                type="button"
+                size="sm"
+                variant="operatorOutline"
+                onClick={onExitDashboard}
+              >
+                <ArrowLeft className="h-4 w-4" />
+                返回工作台
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => void onWorkspaceChanged?.()}
+            >
+              <RefreshCw className="h-4 w-4" />
+              刷新
+            </Button>
+          </>
         }
         renderSectionActions={(section) => {
           if (

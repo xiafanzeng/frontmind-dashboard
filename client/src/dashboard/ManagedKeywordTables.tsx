@@ -6,6 +6,8 @@ import {
   keywordCategoryColumnIndex,
   keywordCategoryKey,
   keywordCategoryLabel,
+  keywordTableDisplayText as safeText,
+  type KeywordCategoryKey,
 } from "@shared/keyword-categories";
 
 export type ManagedKeywordTable = {
@@ -20,25 +22,69 @@ type ManagedKeywordTablesProps = {
   tables: ManagedKeywordTable[];
   loading?: boolean;
   error?: unknown;
-  embedded?: boolean;
+  onUseQuestion?: (question: {
+    question: string;
+    category: KeywordCategoryKey;
+    tableId: string;
+    rowIndex: number;
+  }) => void;
 };
 
-function safeText(value: unknown) {
-  if (value === null || value === undefined) return "";
-  return String(value)
-    .replace(/\[\]\(@[^)]*\)/g, "")
-    .replace(/\[citation:\d+\]/g, "")
-    .replace(/@replace=\d+/g, "")
-    .replace(/\p{Extended_Pictographic}/gu, "")
-    .replace(/[\uFFFD]/g, "")
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+const KEYWORD_SOURCE_DESCRIPTION =
+  "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合反馈的真实热度呈现 GEO 优化问题。";
+
+function normalizedColumnName(value: unknown) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .replace(/\s+/g, "");
+}
+
+function isHiddenCustomerColumn(value: unknown) {
+  const column = normalizedColumnName(value);
+  return column === "序号" || column === "核心词" || column === "创建日期";
+}
+
+function questionColumnIndex(columns: readonly unknown[]) {
+  return columns.findIndex((column) => normalizedColumnName(column) === "问题");
 }
 
 function formatNumber(value: unknown) {
-  return Number(value || 0).toLocaleString("zh-CN");
+  const parsed = Number(String(value ?? 0).replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed.toLocaleString("zh-CN") : "";
+}
+
+function questionSubdivisionColumnIndex(columns: readonly unknown[]) {
+  return columns.findIndex(
+    (column) => normalizedColumnName(column) === "问题细分",
+  );
+}
+
+function heatColumnIndex(columns: readonly unknown[]) {
+  return columns.findIndex((column) => normalizedColumnName(column) === "热度");
+}
+
+function keywordDisplayColumns(columns: readonly string[]) {
+  const visibleColumns = columns
+    .map((column, columnIndex) => ({ column, columnIndex }))
+    .filter(({ column }) => !isHiddenCustomerColumn(column));
+  const subdivisionIndex = visibleColumns.findIndex(
+    ({ column }) => normalizedColumnName(column) === "问题细分",
+  );
+  const visibleHeatIndex = visibleColumns.findIndex(
+    ({ column }) => normalizedColumnName(column) === "热度",
+  );
+  if (subdivisionIndex > visibleHeatIndex && visibleHeatIndex >= 0) {
+    const [subdivisionColumn] = visibleColumns.splice(subdivisionIndex, 1);
+    if (subdivisionColumn) {
+      visibleColumns.splice(visibleHeatIndex, 0, subdivisionColumn);
+    }
+  }
+  return visibleColumns;
+}
+
+function numericHeat(value: unknown) {
+  const parsed = Number(String(value ?? "").replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function KeywordPageHeader({
@@ -59,7 +105,7 @@ function KeywordPageHeader({
   );
 }
 
-function KeywordModuleEmpty({
+function KeywordEmptyPanel({
   title,
   description,
 }: {
@@ -67,21 +113,14 @@ function KeywordModuleEmpty({
   description: string;
 }) {
   return (
-    <section className="page-shell">
-      <KeywordPageHeader
-        eyebrow="MindPromise智诺"
-        title={title}
-        desc={description}
-      />
-      <section className="panel">
-        <div className="panel-head">
-          <h3>暂无已发布内容</h3>
-        </div>
-        <div className="empty-state">
-          <Database size={24} />
-          <p>{safeText(description)}</p>
-        </div>
-      </section>
+    <section className="panel">
+      <div className="panel-head">
+        <h3>{safeText(title)}</h3>
+      </div>
+      <div className="empty-state">
+        <Database size={24} />
+        <p>{safeText(description)}</p>
+      </div>
     </section>
   );
 }
@@ -110,11 +149,13 @@ export default function ManagedKeywordTables({
   tables,
   loading = false,
   error,
-  embedded = false,
+  onUseQuestion,
 }: ManagedKeywordTablesProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const [tableFilter, setTableFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
+  const [subdivisionFilter, setSubdivisionFilter] = useState("all");
+  const [sortBy, setSortBy] = useState("heat-desc");
   const keyword = searchTerm.trim().toLowerCase();
   const hasKeywordCategories = useMemo(
     () =>
@@ -129,6 +170,28 @@ export default function ManagedKeywordTables({
       }),
     [tables],
   );
+  const subdivisionOptions = useMemo(
+    () =>
+      [
+        ...new Set(
+          tables.flatMap((table) => {
+            const subdivisionIndex = questionSubdivisionColumnIndex(
+              table.columns,
+            );
+            return subdivisionIndex < 0
+              ? []
+              : table.rows
+                  .map((row) => safeText(row[subdivisionIndex]))
+                  .filter(Boolean);
+          }),
+        ),
+      ].sort((left, right) => left.localeCompare(right, "zh-CN")),
+    [tables],
+  );
+  const hasHeat = useMemo(
+    () => tables.some((table) => heatColumnIndex(table.columns) >= 0),
+    [tables],
+  );
   const visibleTables = useMemo(() => {
     const selectedTables =
       tableFilter === "all"
@@ -137,34 +200,62 @@ export default function ManagedKeywordTables({
     return selectedTables
       .map((table) => {
         const categoryColumnIndex = keywordCategoryColumnIndex(table.columns);
-        const rows = table.rows.filter((row) => {
-          if (
-            categoryFilter !== "all" &&
-            (categoryColumnIndex < 0 ||
-              keywordCategoryKey(row[categoryColumnIndex]) !== categoryFilter)
-          ) {
-            return false;
-          }
-          if (!keyword) return true;
-          return row.some((cell, cellIndex) => {
-            const text = String(cell).toLowerCase();
-            const mappedCategory =
-              cellIndex === categoryColumnIndex
-                ? keywordCategoryLabel(cell)?.toLowerCase()
-                : null;
-            return (
-              text.includes(keyword) ||
-              Boolean(mappedCategory?.includes(keyword))
-            );
+        const subdivisionColumnIndex = questionSubdivisionColumnIndex(
+          table.columns,
+        );
+        const tableHeatColumnIndex = heatColumnIndex(table.columns);
+        const displayColumns = keywordDisplayColumns(table.columns);
+        let rows = table.rows
+          .map((row, rowIndex) => ({ row, rowIndex }))
+          .filter(({ row }) => {
+            if (
+              categoryFilter !== "all" &&
+              (categoryColumnIndex < 0 ||
+                keywordCategoryKey(row[categoryColumnIndex]) !== categoryFilter)
+            ) {
+              return false;
+            }
+            if (
+              subdivisionFilter !== "all" &&
+              (subdivisionColumnIndex < 0 ||
+                safeText(row[subdivisionColumnIndex]) !== subdivisionFilter)
+            ) {
+              return false;
+            }
+            if (!keyword) return true;
+            return displayColumns.some(({ columnIndex }) => {
+              const cell = row[columnIndex];
+              const text = String(cell).toLowerCase();
+              const mappedCategory =
+                columnIndex === categoryColumnIndex
+                  ? keywordCategoryLabel(cell)?.toLowerCase()
+                  : null;
+              return (
+                text.includes(keyword) ||
+                Boolean(mappedCategory?.includes(keyword))
+              );
+            });
           });
-        });
-        return { ...table, rows };
+        if (tableHeatColumnIndex >= 0 && sortBy.startsWith("heat-")) {
+          const direction = sortBy === "heat-asc" ? 1 : -1;
+          rows = [...rows].sort((left, right) => {
+            const leftHeat = numericHeat(left.row[tableHeatColumnIndex]);
+            const rightHeat = numericHeat(right.row[tableHeatColumnIndex]);
+            if (leftHeat === null) return rightHeat === null ? 0 : 1;
+            if (rightHeat === null) return -1;
+            return direction * (leftHeat - rightHeat);
+          });
+        }
+        return { ...table, rows, displayColumns };
       })
       .filter(
         (table) =>
-          (!keyword && categoryFilter === "all") || table.rows.length > 0,
+          (!keyword &&
+            categoryFilter === "all" &&
+            subdivisionFilter === "all") ||
+          table.rows.length > 0,
       );
-  }, [categoryFilter, keyword, tableFilter, tables]);
+  }, [categoryFilter, keyword, sortBy, subdivisionFilter, tableFilter, tables]);
   const totalRows = useMemo(
     () => tables.reduce((total, table) => total + table.rows.length, 0),
     [tables],
@@ -174,193 +265,273 @@ export default function ManagedKeywordTables({
     [visibleTables],
   );
 
-  if (loading) {
-    return (
-      <KeywordModuleEmpty
-        title="品牌全域词库"
-        description="正在载入当前企业已发布的词库数据。"
-      />
-    );
-  }
-  if (error) {
-    return (
-      <KeywordModuleEmpty
-        title="品牌全域词库"
-        description="当前企业词库暂时无法载入，请稍后刷新。"
-      />
-    );
-  }
-
   return (
     <section className="page-shell brand-deep-page">
-      {embedded ? (
-        <div className="managed-keyword-heading">
-          <span>品牌全域词库 / 正式词表</span>
-          <h2>AI 监控与优化工程师发布的正式词表</h2>
-          <p>品牌词、场景词、问题词与平台反馈数据会按交付工单持续同步。</p>
-        </div>
-      ) : (
-        <KeywordPageHeader
-          eyebrow="MindPromise智诺 / 品牌建设"
-          title="品牌全域词库"
-          desc="展示由管理员发布的品牌词、场景词、问题词与平台反馈数据。"
+      <KeywordPageHeader
+        eyebrow="MindPromise智诺 / 品牌建设"
+        title="品牌全域词库"
+        desc={KEYWORD_SOURCE_DESCRIPTION}
+      />
+      {loading ? (
+        <KeywordEmptyPanel
+          title="正在载入品牌全域词库"
+          description="正在载入当前企业的词库数据。"
         />
-      )}
-      <div className="saas-toolbar keyword-toolbar-saas">
-        <div className="saas-search">
-          <Search size={16} />
-          <input
-            type="search"
-            placeholder="搜索词库内容..."
-            value={searchTerm}
-            onChange={(event) => setSearchTerm(event.target.value)}
-          />
-          {searchTerm && (
-            <button
-              type="button"
-              className="clear-btn"
-              aria-label="清空搜索"
-              onClick={() => setSearchTerm("")}
-            >
-              <X size={14} />
-            </button>
-          )}
-        </div>
-        {(tables.length > 1 || hasKeywordCategories) && (
-          <div className="filter-group">
-            {hasKeywordCategories && (
-              <div className="filter-item">
-                <label htmlFor="managed-keyword-category">分类</label>
-                <select
-                  id="managed-keyword-category"
-                  value={categoryFilter}
-                  onChange={(event) => setCategoryFilter(event.target.value)}
+      ) : error ? (
+        <KeywordEmptyPanel
+          title="品牌全域词库暂时无法载入"
+          description="请稍后刷新页面重试。"
+        />
+      ) : tables.length === 0 ? (
+        <KeywordEmptyPanel
+          title="品牌全域词库正在准备中"
+          description="内容发布后会自动显示在这里。"
+        />
+      ) : (
+        <>
+          <div className="saas-toolbar keyword-toolbar-saas">
+            <div className="saas-search">
+              <Search size={16} />
+              <input
+                type="search"
+                placeholder="搜索问题、主分类或问题细分..."
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+              />
+              {searchTerm && (
+                <button
+                  type="button"
+                  className="clear-btn"
+                  aria-label="清空搜索"
+                  onClick={() => setSearchTerm("")}
                 >
-                  <option value="all">全部分类</option>
-                  {KEYWORD_CATEGORY_OPTIONS.map((category) => (
-                    <option key={category.key} value={category.key}>
-                      {category.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-            {tables.length > 1 && (
-              <div className="filter-item">
-                <label htmlFor="managed-keyword-table">词表</label>
-                <select
-                  id="managed-keyword-table"
-                  value={tableFilter}
-                  onChange={(event) => setTableFilter(event.target.value)}
-                >
-                  <option value="all">全部词表</option>
-                  {tables.map((table) => (
-                    <option key={table.id} value={table.id}>
-                      {safeText(table.title)}
-                    </option>
-                  ))}
-                </select>
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+            {(tables.length > 1 ||
+              hasKeywordCategories ||
+              subdivisionOptions.length > 0 ||
+              hasHeat) && (
+              <div className="filter-group">
+                {hasKeywordCategories && (
+                  <div className="filter-item">
+                    <label htmlFor="managed-keyword-category">主分类</label>
+                    <select
+                      id="managed-keyword-category"
+                      value={categoryFilter}
+                      onChange={(event) =>
+                        setCategoryFilter(event.target.value)
+                      }
+                    >
+                      <option value="all">全部主分类</option>
+                      {KEYWORD_CATEGORY_OPTIONS.map((category) => (
+                        <option key={category.key} value={category.key}>
+                          {category.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {subdivisionOptions.length > 0 && (
+                  <div className="filter-item">
+                    <label htmlFor="managed-keyword-subdivision">
+                      问题细分
+                    </label>
+                    <select
+                      id="managed-keyword-subdivision"
+                      value={subdivisionFilter}
+                      onChange={(event) =>
+                        setSubdivisionFilter(event.target.value)
+                      }
+                    >
+                      <option value="all">全部问题细分</option>
+                      {subdivisionOptions.map((subdivision) => (
+                        <option key={subdivision} value={subdivision}>
+                          {subdivision}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {hasHeat && (
+                  <div className="filter-item">
+                    <label htmlFor="managed-keyword-sort">排序</label>
+                    <select
+                      id="managed-keyword-sort"
+                      value={sortBy}
+                      onChange={(event) => setSortBy(event.target.value)}
+                    >
+                      <option value="heat-desc">热度从高到低</option>
+                      <option value="heat-asc">热度从低到高</option>
+                    </select>
+                  </div>
+                )}
+                {tables.length > 1 && (
+                  <div className="filter-item">
+                    <label htmlFor="managed-keyword-table">词表</label>
+                    <select
+                      id="managed-keyword-table"
+                      value={tableFilter}
+                      onChange={(event) => setTableFilter(event.target.value)}
+                    >
+                      <option value="all">全部词表</option>
+                      {tables.map((table) => (
+                        <option key={table.id} value={table.id}>
+                          {safeText(table.title)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </div>
             )}
           </div>
-        )}
-      </div>
-      <div className="keyword-stats-bar">
-        <span>
-          共 <strong>{formatNumber(totalRows)}</strong> 条词库记录
-        </span>
-        <span>
-          当前显示 <strong>{formatNumber(visibleRows)}</strong> 条
-        </span>
-      </div>
-      <div className="saas-content-area">
-        {visibleTables.map((table) => (
-          <KeywordPanel
-            title={table.title}
-            key={table.id}
-            actions={
-              <span className="entity-count">
-                {formatNumber(table.rows.length)} 条
-              </span>
-            }
-          >
-            {table.description && (
-              <p className="panel-subtitle">{safeText(table.description)}</p>
+          <div className="keyword-stats-bar">
+            <span>
+              共 <strong>{formatNumber(totalRows)}</strong> 条词库记录
+            </span>
+            <span>
+              当前显示 <strong>{formatNumber(visibleRows)}</strong> 条
+            </span>
+          </div>
+          <div className="saas-content-area">
+            {visibleTables.map((table) => {
+              const tableQuestionColumnIndex = questionColumnIndex(
+                table.columns,
+              );
+              const tableCategoryColumnIndex = keywordCategoryColumnIndex(
+                table.columns,
+              );
+              return (
+                <KeywordPanel
+                  title={tables.length === 1 ? "全域词库" : table.title}
+                  key={table.id}
+                  actions={
+                    <span className="entity-count">
+                      {formatNumber(table.rows.length)} 条
+                    </span>
+                  }
+                >
+                  <div className="keyword-table-wrap">
+                    <table className="keyword-table">
+                      <thead>
+                        <tr>
+                          {table.displayColumns.map(
+                            ({ column, columnIndex }) => (
+                              <th key={`${column}-${columnIndex}`}>
+                                {isKeywordCategoryColumn(column)
+                                  ? "主分类"
+                                  : safeText(column)}
+                              </th>
+                            ),
+                          )}
+                          {onUseQuestion && <th>问题优化</th>}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {table.rows.map(({ row, rowIndex }) => {
+                          const question = safeText(
+                            row[tableQuestionColumnIndex],
+                          );
+                          const category = keywordCategoryKey(
+                            row[tableCategoryColumnIndex],
+                          );
+                          return (
+                            <tr key={`${table.id}-${rowIndex}`}>
+                              {table.displayColumns.map(
+                                ({ column, columnIndex }) => {
+                                  const normalizedColumn =
+                                    normalizedColumnName(column);
+                                  const value = safeText(row[columnIndex]);
+                                  const isCategory =
+                                    isKeywordCategoryColumn(column);
+                                  const displayValue = isKeywordCategoryColumn(
+                                    column,
+                                  )
+                                    ? keywordCategoryLabel(value) || value
+                                    : value;
+                                  const isPriority =
+                                    normalizedColumn.includes("优先级");
+                                  const isHeat =
+                                    normalizedColumn.includes("热度");
+                                  const priorityTone = value.includes("高")
+                                    ? "high"
+                                    : value.includes("重点") ||
+                                        value.includes("中")
+                                      ? "mid"
+                                      : "low";
+                                  return (
+                                    <td
+                                      key={`${table.id}-${rowIndex}-${columnIndex}`}
+                                      className={
+                                        normalizedColumn === "问题"
+                                          ? "keyword-question-cell"
+                                          : undefined
+                                      }
+                                    >
+                                      {isCategory ? (
+                                        <span
+                                          className="keyword-pill fm-question-category-pill"
+                                          data-category={category || undefined}
+                                        >
+                                          {displayValue}
+                                        </span>
+                                      ) : isPriority ? (
+                                        <span
+                                          className={`priority-pill priority-${priorityTone}`}
+                                        >
+                                          {displayValue}
+                                        </span>
+                                      ) : isHeat ? (
+                                        <strong>
+                                          {formatNumber(row[columnIndex])}
+                                        </strong>
+                                      ) : (
+                                        displayValue
+                                      )}
+                                    </td>
+                                  );
+                                },
+                              )}
+                              {onUseQuestion && (
+                                <td>
+                                  <button
+                                    type="button"
+                                    className="keyword-optimize-button disabled:cursor-not-allowed disabled:opacity-50"
+                                    disabled={!question || !category}
+                                    onClick={() =>
+                                      category &&
+                                      onUseQuestion({
+                                        question,
+                                        category,
+                                        tableId: table.id,
+                                        rowIndex,
+                                      })
+                                    }
+                                  >
+                                    选择并进入问题优化
+                                  </button>
+                                </td>
+                              )}
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </KeywordPanel>
+              );
+            })}
+            {visibleTables.length === 0 && (
+              <KeywordEmptyPanel
+                title="没有匹配的词库内容"
+                description="请调整搜索词或筛选条件后重试。"
+              />
             )}
-            <div className="keyword-table-wrap">
-              <table className="keyword-table">
-                <thead>
-                  <tr>
-                    {table.columns.map((column) => (
-                      <th key={column}>{safeText(column)}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {table.rows.map((row, rowIndex) => (
-                    <tr key={`${table.id}-${rowIndex}`}>
-                      {row.map((cell, cellIndex) => {
-                        const column = String(table.columns[cellIndex] || "");
-                        const normalizedColumn = column.replace(/\s+/g, "");
-                        const value = safeText(cell);
-                        const isCategory =
-                          isKeywordCategoryColumn(column) ||
-                          normalizedColumn.includes("分类");
-                        const displayValue = isKeywordCategoryColumn(column)
-                          ? keywordCategoryLabel(value) || value
-                          : value;
-                        const isPriority = normalizedColumn.includes("优先级");
-                        const isHeat = normalizedColumn.includes("热度");
-                        const priorityTone = value.includes("高")
-                          ? "high"
-                          : value.includes("重点") || value.includes("中")
-                            ? "mid"
-                            : "low";
-                        return (
-                          <td
-                            key={`${table.id}-${rowIndex}-${cellIndex}`}
-                            className={
-                              normalizedColumn.includes("问题")
-                                ? "keyword-question-cell"
-                                : undefined
-                            }
-                          >
-                            {isCategory ? (
-                              <span className="keyword-pill">
-                                {displayValue}
-                              </span>
-                            ) : isPriority ? (
-                              <span
-                                className={`priority-pill priority-${priorityTone}`}
-                              >
-                                {displayValue}
-                              </span>
-                            ) : isHeat ? (
-                              <strong>{displayValue}</strong>
-                            ) : (
-                              displayValue
-                            )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </KeywordPanel>
-        ))}
-        {visibleTables.length === 0 && (
-          <KeywordModuleEmpty
-            title="品牌全域词库"
-            description={
-              keyword
-                ? "没有找到匹配的词库内容。"
-                : "当前账号尚无已发布词库。管理员上传词库表格后会在这里展示。"
-            }
-          />
-        )}
-      </div>
+          </div>
+        </>
+      )}
     </section>
   );
 }

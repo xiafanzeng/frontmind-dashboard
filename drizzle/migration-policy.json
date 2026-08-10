@@ -7,6 +7,11 @@
     "0051_delivery_ticket_retention": "contract",
     "0052_delivery_ticket_retention_guards": "contract",
     "0053_low_dorian_gray": "expand",
-    "0054_file_content_retention": "expand"
+    "0054_file_content_retention": "expand",
+    "0055_provisioning_market_edition": "expand",
+    "0056_project_order_deletion_tombstones": "expand",
+    "0057_productive_kang": "expand",
+    "0058_jenova_brand_tracking": "expand",
+    "0059_delivery_ticket_workflow_contracts": "contract"
   }
 }

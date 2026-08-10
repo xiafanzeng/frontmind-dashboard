@@ -8,6 +8,7 @@ import {
   eq,
   gt,
   inArray,
+  isNull,
   like,
   lt,
   max,
@@ -21,6 +22,7 @@ import {
   deliveryProjectAssignments,
   deliveryTicketEvents,
   deliveryTickets,
+  deliveryWorkflowMilestones,
   knowledgeBaseBuilds,
   knowledgeBaseSnapshots,
   serviceContracts,
@@ -35,12 +37,12 @@ import {
   websiteStyleWorkflows,
 } from "../drizzle/schema";
 import {
+  QUESTION_MANAGEMENT_HISTORY_CATEGORIES,
+  WEBSITE_MANAGEMENT_HISTORY_CATEGORIES,
   DELIVERY_TICKET_PUBLIC_STATUS_LABELS,
-  DELIVERY_TICKET_PUBLIC_STAGE_LABELS,
   DELIVERY_TICKET_STATUS_LABELS,
   deliveryOperationResultSchema,
   deliveryTicketPublicStatus,
-  deliveryTicketPublicStage,
   icpNonSensitiveDeclarationsSchema,
   publicContentAssetTicketDetailSchema,
   publicKnowledgeBaseTicketDetailSchema,
@@ -69,32 +71,167 @@ import {
   WEBSITE_CONTENT_CATALOG,
   contentAssetMediaOptionsForMarketEdition,
 } from "../shared/delivery-catalog";
-import type { DeliveryRoleType } from "../shared/delivery-roles";
+import {
+  deliveryWorkflowOperationSchema,
+  type DeliveryRoleType,
+} from "../shared/delivery-roles";
+import {
+  deliveryActorRoleLabel,
+  deliveryCategoryLabel,
+  deliveryEventDisplayMessage,
+} from "../shared/delivery-ticket-presentation";
+import { deliverySummaryLooksLikeCredentialSecret } from "../shared/delivery-ticket-security";
 import type { AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
 import { assertWorkspaceAccess, isSystemAdmin } from "./dashboard-service";
-import { getServicePortal } from "./service-entitlement";
+import {
+  getServicePortal,
+  servicePortalHasRequiredKnowledge,
+} from "./service-entitlement";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { DeliveryTicketError } from "./delivery-ticket-error";
+import {
+  deleteDeliveryTicketImmediately,
+  DeliveryTicketImmediateDeleteConflictError,
+} from "./delivery-ticket-retention";
 export { DeliveryTicketError } from "./delivery-ticket-error";
 
 export function assertManagedTicketCanBeExecutedByAdmin(input: {
   actor: Pick<AuthenticatedUser, "role" | "username" | "adminAccessLevel">;
-  ticket: { workflowDomain?: DeliveryRoleType | null };
+  ticket: {
+    isWorkflowContainer?: boolean | null;
+    workflowDomain?: DeliveryRoleType | null;
+    operation?: string | null;
+    category?: string | null;
+    credentialTargetUserId?: number | null;
+  };
 }) {
   if (!isSystemAdmin(input.actor)) {
     throw new DeliveryTicketError(
       "DELIVERY_ADMIN_TICKET_EXECUTION_FORBIDDEN",
-      "只有系统管理员或对应岗位工程师可以处理工单；交付管理员仅负责查看、沟通与协调。",
+      "只有系统管理员或对应岗位工程师可以处理需求；交付管理员仅负责查看、沟通与协调。",
       403,
     );
   }
-  if (!input.ticket.workflowDomain) return;
+  if (input.ticket.credentialTargetUserId) {
+    throw new DeliveryTicketError(
+      "CREDENTIAL_TICKET_REQUIRES_UNIFIED_MANAGEMENT",
+      "凭据异常需求只能在统一 API Key 管理入口配置并验证成功后自动关闭。",
+      409,
+    );
+  }
+  if (input.ticket.isWorkflowContainer) {
+    throw new DeliveryTicketError(
+      "WORKFLOW_CONTAINER_REQUIRES_AUTOMATIC_AGGREGATION",
+      "客户根需求只能由内部子步骤自动汇总状态，不能人工提前完成。",
+      409,
+    );
+  }
+  if (input.ticket.operation === "knowledge_delivery") {
+    throw new DeliveryTicketError(
+      "SYSTEM_DELIVERY_RECORD_READ_ONLY",
+      "知识库交付记录由系统发布流程生成和关闭，不能人工处理。",
+      409,
+    );
+  }
+  const formalWorkflow =
+    Boolean(input.ticket.workflowDomain) ||
+    deliveryWorkflowOperationSchema.safeParse(input.ticket.operation).success ||
+    ["domain_application", "icp_filing"].includes(input.ticket.category ?? "");
+  if (!formalWorkflow) return;
   throw new DeliveryTicketError(
     "ROLE_OWNED_TICKET_REQUIRES_WORKBENCH",
-    "岗位工单必须在系统管理员完整处理工作台中按对应岗位规则执行。",
+    "正式交付需求必须在系统管理员完整处理工作台中按对应岗位规则执行。",
     409,
   );
+}
+
+export function assertManagedLegacySummaryClose(input: {
+  publicSummary: string;
+  publicMessage?: string | null;
+  deliveryLinks?: Array<{ label: string; url: string }> | null;
+  verifiedDomain?: string | null;
+  internalNote?: string | null;
+}) {
+  if (
+    nonEmpty(input.publicMessage) ||
+    (input.deliveryLinks?.length ?? 0) > 0 ||
+    nonEmpty(input.verifiedDomain) ||
+    nonEmpty(input.internalNote)
+  ) {
+    throw new DeliveryTicketError(
+      "LEGACY_TICKET_SUMMARY_ONLY",
+      "历史需求只能填写非敏感处理摘要后关闭，不能提交链接、交付消息或专用字段。",
+      409,
+    );
+  }
+  if (deliverySummaryLooksLikeCredentialSecret(input.publicSummary)) {
+    throw new DeliveryTicketError(
+      "DELIVERY_SUMMARY_CONTAINS_CREDENTIAL",
+      "结果摘要疑似包含密钥或令牌，请仅填写已配置、已验证等非敏感结论。",
+      409,
+    );
+  }
+}
+
+export async function deleteManagedDeliveryTicket(input: {
+  actor: AuthenticatedUser;
+  userId: number;
+  ticketId: string;
+  expectedRevision: number;
+}) {
+  if (!isSystemAdmin(input.actor)) {
+    throw new DeliveryTicketError(
+      "DELIVERY_TICKET_DELETE_FORBIDDEN",
+      "只有系统管理员可以永久删除需求。",
+      403,
+    );
+  }
+  let result: Awaited<ReturnType<typeof deleteDeliveryTicketImmediately>>;
+  try {
+    result = await deleteDeliveryTicketImmediately({
+      userId: input.userId,
+      ticketId: input.ticketId,
+      expectedRevision: input.expectedRevision,
+    });
+  } catch (error) {
+    if (error instanceof DeliveryTicketImmediateDeleteConflictError) {
+      throw new DeliveryTicketError(
+        "DELIVERY_TICKET_REVISION_CONFLICT",
+        "需求已更新，请刷新后再删除。",
+        409,
+      );
+    }
+    throw error;
+  }
+  if (result.outcome === "not_found") {
+    throw new DeliveryTicketError("TICKET_NOT_FOUND", "需求不存在。", 404);
+  }
+  if (result.outcome === "revision_conflict") {
+    throw new DeliveryTicketError(
+      "DELIVERY_TICKET_REVISION_CONFLICT",
+      "需求已更新，请刷新后再删除。",
+      409,
+    );
+  }
+  if (result.outcome === "workflow_child_forbidden") {
+    throw new DeliveryTicketError(
+      "DELIVERY_TICKET_WORKFLOW_CHILD_DELETE_FORBIDDEN",
+      "内部工作流子步骤不能单独永久删除；如需移除整条业务流程，请删除客户根需求。",
+      409,
+    );
+  }
+  if (result.outcome !== "deleted" || result.tickets !== 1) {
+    throw new DeliveryTicketError(
+      "DELIVERY_TICKET_DELETE_FAILED",
+      "需求删除失败，请刷新后重试。",
+      409,
+    );
+  }
+  return {
+    success: true as const,
+    ticketId: input.ticketId,
+  };
 }
 
 async function requireDb() {
@@ -176,7 +313,7 @@ export function decodeDeliveryTicketCursor(
   } catch {
     throw new DeliveryTicketError(
       "DELIVERY_TICKET_CURSOR_INVALID",
-      "工单列表游标无效，请刷新后重试。",
+      "需求列表游标无效，请刷新后重试。",
       400,
     );
   }
@@ -222,6 +359,30 @@ function normalizeDomain(value: string | null | undefined) {
   }
 }
 
+function domainServiceCodeFromPublicSummary(value: string | null | undefined) {
+  const match = value?.trim().match(/^备案服务码：\s*([^\r\n]+)$/u);
+  const code = match?.[1]?.trim() || null;
+  return code && code.length <= 512 ? code : null;
+}
+
+export function resolveManagedDomainApplicationCompletion(input: {
+  marketEdition: "domestic" | "overseas";
+  publicSummary: string | null | undefined;
+}) {
+  const overseas = input.marketEdition === "overseas";
+  const icpServiceCode = domainServiceCodeFromPublicSummary(
+    input.publicSummary,
+  );
+  if (!overseas && !icpServiceCode) {
+    throw new DeliveryTicketError(
+      "ICP_SERVICE_CODE_REQUIRED",
+      "完成国内域名需求前必须按“备案服务码：...”格式填写要返回给客户的备案服务码。",
+      400,
+    );
+  }
+  return { overseas, icpServiceCode };
+}
+
 const WEBSITE_CONTENT_CATEGORIES = new Set<string>(
   WEBSITE_CONTENT_CATALOG.map((item) => item.value),
 );
@@ -240,6 +401,218 @@ export function deliveryTicketStatusAfterCustomerMessage(input: {
     input.currentStatus === "needs_information"
     ? ("submitted" as const)
     : input.currentStatus;
+}
+
+type WorkflowCustomerSupplementChild = Pick<
+  typeof deliveryTickets.$inferSelect,
+  | "id"
+  | "status"
+  | "scheduledAt"
+  | "assignedProjectAssignmentId"
+  | "assignedMemberId"
+  | "workflowDomain"
+>;
+
+/**
+ * A workflow container can expose only one customer conversation while one
+ * internal execution step is waiting for that customer's reply. Never infer
+ * the destination from operation names or from another merely-active step.
+ */
+export function selectWorkflowCustomerSupplementChild(
+  children: readonly WorkflowCustomerSupplementChild[],
+) {
+  const waiting = children.filter(
+    (child) => child.status === "needs_information",
+  );
+  if (!waiting.length) {
+    throw new DeliveryTicketError(
+      "WORKFLOW_SUPPLEMENT_TARGET_NOT_FOUND",
+      "当前需求的待补充执行步骤不存在，请刷新后重试或联系交付管理员。",
+      409,
+    );
+  }
+  if (waiting.length > 1) {
+    throw new DeliveryTicketError(
+      "WORKFLOW_SUPPLEMENT_TARGET_AMBIGUOUS",
+      "当前需求存在多个待补充执行步骤，系统无法安全判断回复目标，请联系交付管理员处理。",
+      409,
+    );
+  }
+  const child = waiting[0]!;
+  if (
+    !child.assignedProjectAssignmentId ||
+    !child.assignedMemberId ||
+    !child.workflowDomain
+  ) {
+    throw new DeliveryTicketError(
+      "WORKFLOW_SUPPLEMENT_TARGET_UNASSIGNED",
+      "当前待补充执行步骤尚未完整分配负责人，请联系交付管理员后重试。",
+      409,
+    );
+  }
+  return child;
+}
+
+export function workflowCustomerSupplementInternalMessage(input: {
+  message: string;
+  attachments: readonly Pick<
+    DeliveryTicketAttachmentInput,
+    "filename" | "purpose"
+  >[];
+}) {
+  const attachmentContext = input.attachments.length
+    ? `\n\n客户新增附件：\n${input.attachments
+        .map(
+          (attachment, index) =>
+            `${index + 1}. ${attachment.filename}${
+              attachment.purpose?.trim()
+                ? `（${attachment.purpose.trim()}）`
+                : ""
+            }`,
+        )
+        .join("\n")}`
+    : "\n\n客户本次未新增附件。";
+  return `客户已在原始需求中补充资料：\n${input.message.trim()}${attachmentContext}`;
+}
+
+export function planWorkflowCustomerSupplement(input: {
+  rootScheduledAt: Date | null;
+  rootQuotaState: "reserved" | "consumed" | "released";
+  children: readonly WorkflowCustomerSupplementChild[];
+  message: string;
+  attachments: readonly Pick<
+    DeliveryTicketAttachmentInput,
+    "filename" | "purpose"
+  >[];
+}) {
+  const child = selectWorkflowCustomerSupplementChild(input.children);
+  const rootStatus = input.rootScheduledAt
+    ? ("in_progress" as const)
+    : ("scheduled" as const);
+  return {
+    child,
+    childStatus: "scheduled" as const,
+    rootStatus,
+    rootQuotaState: deriveTicketQuotaTransition({
+      currentState: input.rootQuotaState,
+      scheduledAt: input.rootScheduledAt,
+      nextStatus: rootStatus,
+    }),
+    internalMessage: workflowCustomerSupplementInternalMessage({
+      message: input.message,
+      attachments: input.attachments,
+    }),
+  };
+}
+export type WebsiteBuildStatus = "locked" | "pending" | "completed";
+
+const WEBSITE_BUILD_LEGACY_EVIDENCE_OPERATIONS = [
+  "site_check",
+  "company_facts",
+  "product_case_docs",
+  "industry_news",
+  "company_news",
+  "faq_content",
+] as const;
+
+/**
+ * A newly confirmed style always has a website-build ticket and only an
+ * explicit completion can open content submission. Historical confirmed
+ * states with no website-build ticket are accepted only when an
+ * already-completed site/content operation proves that a real website was
+ * delivered. Once any website-build ticket exists, that explicit workflow is
+ * authoritative. Retained completion milestones survive ticket cleanup and
+ * are equivalent to completed tickets.
+ */
+export function resolveWebsiteBuildStatus(input: {
+  styleState:
+    | "locked"
+    | "waiting_samples"
+    | "awaiting_selection"
+    | "revision_requested"
+    | "confirmed"
+    | "legacy_confirmed";
+  ticketStatuses: string[];
+  hasCompletionMilestone: boolean;
+  hasLegacyCompletionEvidence?: boolean;
+}): WebsiteBuildStatus {
+  if (
+    input.styleState !== "confirmed" &&
+    input.styleState !== "legacy_confirmed"
+  ) {
+    return "locked";
+  }
+  if (
+    input.hasCompletionMilestone ||
+    input.ticketStatuses.includes("completed")
+  ) {
+    return "completed";
+  }
+  if (input.ticketStatuses.length > 0) return "pending";
+  if (input.hasLegacyCompletionEvidence === true) return "completed";
+  return "pending";
+}
+
+async function loadWebsiteBuildStatus(
+  executor: any,
+  userId: number,
+  styleState: Parameters<typeof resolveWebsiteBuildStatus>[0]["styleState"],
+) {
+  const [ticketRows, milestoneRows, evidenceTicketRows, evidenceMilestoneRows] =
+    await Promise.all([
+      executor
+        .select({ status: deliveryTickets.status })
+        .from(deliveryTickets)
+        .where(
+          and(
+            eq(deliveryTickets.userId, userId),
+            eq(deliveryTickets.operation, "website_build"),
+          ),
+        ),
+      executor
+        .select({ id: deliveryWorkflowMilestones.id })
+        .from(deliveryWorkflowMilestones)
+        .where(
+          and(
+            eq(deliveryWorkflowMilestones.userId, userId),
+            eq(deliveryWorkflowMilestones.operation, "website_build"),
+          ),
+        )
+        .limit(1),
+      executor
+        .select({ id: deliveryTickets.id })
+        .from(deliveryTickets)
+        .where(
+          and(
+            eq(deliveryTickets.userId, userId),
+            eq(deliveryTickets.status, "completed"),
+            inArray(deliveryTickets.operation, [
+              ...WEBSITE_BUILD_LEGACY_EVIDENCE_OPERATIONS,
+            ]),
+          ),
+        )
+        .limit(1),
+      executor
+        .select({ id: deliveryWorkflowMilestones.id })
+        .from(deliveryWorkflowMilestones)
+        .where(
+          and(
+            eq(deliveryWorkflowMilestones.userId, userId),
+            inArray(deliveryWorkflowMilestones.operation, [
+              ...WEBSITE_BUILD_LEGACY_EVIDENCE_OPERATIONS,
+            ]),
+          ),
+        )
+        .limit(1),
+    ]);
+  return resolveWebsiteBuildStatus({
+    styleState,
+    ticketStatuses: ticketRows.map((row: { status: string }) => row.status),
+    hasCompletionMilestone: Boolean(milestoneRows[0]),
+    hasLegacyCompletionEvidence: Boolean(
+      evidenceTicketRows[0] || evidenceMilestoneRows[0],
+    ),
+  });
 }
 
 export async function assertWebsiteTicketWorkflow(
@@ -279,27 +652,46 @@ export async function assertWebsiteTicketWorkflow(
     return { profile, domain };
   }
   if (category === "icp_filing") {
-    const domain =
-      profile?.domainStatus === "completed"
-        ? profile.domain
-        : normalizeDomain(value.topic || value.title);
-    if (!domain) {
+    if (profile?.domainStatus !== "completed") {
       throw new DeliveryTicketError(
-        "DOMAIN_REQUIRED",
-        "请填写本次需要申请或核验的域名。",
-        400,
+        "DOMAIN_PREREQUISITE_REQUIRED",
+        "必须先完成域名需求并核验域名，才能提交 ICP 备案结果。",
+        409,
+      );
+    }
+    const verifiedDomain = normalizeDomain(profile.domain);
+    if (!verifiedDomain) {
+      throw new DeliveryTicketError(
+        "DOMAIN_PREREQUISITE_REQUIRED",
+        "必须先完成域名需求并核验域名，才能提交 ICP 备案结果。",
+        409,
       );
     }
     if (
-      profile?.icpStatus === "approved" ||
-      profile?.icpStatus === "not_required"
+      profile.icpStatus === "approved" ||
+      profile.icpStatus === "not_required"
     ) {
       throw new DeliveryTicketError(
         "ICP_ALREADY_VERIFIED",
         "当前企业 ICP 前置阶段已完成，无需重复提交。",
       );
     }
-    return { profile, domain };
+    const submittedDomain = normalizeDomain(value.topic || value.title);
+    if (!submittedDomain) {
+      throw new DeliveryTicketError(
+        "DOMAIN_REQUIRED",
+        "请填写本次已完成备案的域名。",
+        400,
+      );
+    }
+    if (submittedDomain !== verifiedDomain) {
+      throw new DeliveryTicketError(
+        "ICP_DOMAIN_MISMATCH",
+        "已备案域名必须与域名需求核验通过的域名一致。",
+        400,
+      );
+    }
+    return { profile, domain: verifiedDomain };
   }
   if (WEBSITE_CONTENT_CATEGORIES.has(category)) {
     if (
@@ -328,11 +720,23 @@ export async function assertWebsiteTicketWorkflow(
         403,
       );
     }
+    const websiteBuildStatus = await loadWebsiteBuildStatus(
+      executor,
+      userId,
+      styleRows[0].status,
+    );
+    if (websiteBuildStatus !== "completed") {
+      throw new DeliveryTicketError(
+        "WEBSITE_BUILD_REQUIRED",
+        "官网风格已确认，正在等待 AI 运维工程师或系统管理员完成官网构建并登记公开链接。",
+        403,
+      );
+    }
     return { profile, domain: null };
   }
   throw new DeliveryTicketError(
     "WEBSITE_CATEGORY_DISABLED",
-    "该官网技术类别已停止接受新工单。",
+    "该官网技术类别已停止接受新需求。",
     400,
   );
 }
@@ -358,8 +762,8 @@ export function assertDeliveryTicketServiceEligibility(
       "SERVICE_NOT_WRITABLE",
       portal.service.status === "expired" ||
       portal.service.status === "cancelled"
-        ? "当前服务已到期，仅可查看历史工单。"
-        : "当前服务尚不可提交新工单。",
+        ? "当前服务已到期，仅可查看历史需求。"
+        : "当前服务尚不可提交新需求。",
       403,
     );
   }
@@ -374,8 +778,21 @@ export function assertDeliveryTicketServiceEligibility(
       "DELIVERY_TICKET_UPGRADE_REQUIRED",
       ticketType === "website_operation"
         ? "普通版不包含 AI 友好官网管理，请升级进阶版或豪华版。"
-        : "当前套餐不包含此工单服务，请升级进阶版或豪华版。",
+        : "当前套餐不包含此需求服务，请升级进阶版或豪华版。",
       403,
+    );
+  }
+  if (
+    category !== "knowledge_base_maintenance" &&
+    (ticketType === "content_asset" || ticketType === "website_operation") &&
+    !servicePortalHasRequiredKnowledge(portal)
+  ) {
+    throw new DeliveryTicketError(
+      "KNOWLEDGE_DISPLAY_REQUIRED",
+      portal.service.planCode === "basic"
+        ? "请先等待 Website 流程自动同步或服务团队补录知识库；知识库展示完成后解锁 AI 友好内容资产。"
+        : "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+      409,
     );
   }
   if (!portal.quotas || !portal.service.contractId) {
@@ -588,6 +1005,18 @@ async function assertIcpTicketReadyForCompletion(input: {
   }
 }
 
+export function isCustomerVisibleDeliveryTicket(
+  ticket: Pick<
+    typeof deliveryTickets.$inferSelect,
+    "parentTicketId" | "rootTicketId" | "isWorkflowContainer"
+  >,
+) {
+  return (
+    ticket.isWorkflowContainer ||
+    (!ticket.parentTicketId && !ticket.rootTicketId)
+  );
+}
+
 function ticketDto(
   row: typeof deliveryTickets.$inferSelect,
   extra?: {
@@ -601,6 +1030,9 @@ function ticketDto(
   const assignedAdmins = extra?.assignedAdmins ?? [];
   return {
     id: row.id,
+    parentTicketId: row.parentTicketId,
+    rootTicketId: row.rootTicketId,
+    isWorkflowContainer: row.isWorkflowContainer,
     userId: row.userId,
     contractId: row.contractId,
     quotaPeriodId: row.quotaPeriodId,
@@ -612,8 +1044,11 @@ function ticketDto(
     category: row.category,
     workflowDomain: row.workflowDomain,
     operation: row.operation,
+    sourceQuestionId: row.sourceQuestionId,
     assignedProjectAssignmentId: row.assignedProjectAssignmentId,
     assignedMemberId: row.assignedMemberId,
+    credentialTargetUserId: row.credentialTargetUserId,
+    credentialRequestKind: row.credentialRequestKind,
     assignedMemberName: extra?.assignedMemberName ?? null,
     priority: row.priority,
     topic: row.topic,
@@ -631,11 +1066,6 @@ function ticketDto(
     publicStatusLabel:
       DELIVERY_TICKET_PUBLIC_STATUS_LABELS[
         deliveryTicketPublicStatus(row.status)
-      ],
-    publicStage: deliveryTicketPublicStage(row.status),
-    publicStageLabel:
-      DELIVERY_TICKET_PUBLIC_STAGE_LABELS[
-        deliveryTicketPublicStage(row.status)
       ],
     publicSummary: row.publicSummary,
     deliveryLinks: row.deliveryLinks,
@@ -690,27 +1120,10 @@ export function deliveryLinksFromOperationResults(values: unknown[]) {
 }
 
 function publicDeliveryCategoryLabel(ticket: InternalDeliveryTicketDto) {
-  const category = nonEmpty(ticket.category);
-  if (!category) return null;
-  if (ticket.type === "knowledge_base") {
-    if (category === "knowledge_reset") return "知识库重置";
-    if (category === "knowledge_delivery") return "品牌全域知识库";
-    return category;
-  }
-  if (ticket.type === "content_asset") {
-    return (
-      CONTENT_ASSET_CATALOG.find((item) => item.id === category)?.label ??
-      category
-    );
-  }
-  if (category === "domain_application") return "域名申请";
-  if (category === "icp_filing") return "域名注册与 ICP 备案结果";
-  if (category === "knowledge_base_maintenance") return "知识库维护";
-  if (category === "question_catalog") return "品牌词库与问题目录";
-  return (
-    WEBSITE_CONTENT_CATALOG.find((item) => item.value === category)?.label ??
-    category
-  );
+  return deliveryCategoryLabel({
+    type: ticket.type,
+    category: ticket.category,
+  });
 }
 
 /**
@@ -722,7 +1135,11 @@ export function toPublicDeliveryTicketSummary(
   ticket: InternalDeliveryTicketDto,
 ): PublicDeliveryTicketSummary {
   const publicStatus = deliveryTicketPublicStatus(ticket.status);
-  const publicStage = deliveryTicketPublicStage(ticket.status);
+  const isQuestionWorkflowTicket = [
+    "question_review",
+    "question_modify",
+    "question_delete",
+  ].includes(ticket.category ?? ticket.operation ?? "");
   const base = {
     id: ticket.id,
     type: ticket.type,
@@ -732,15 +1149,18 @@ export function toPublicDeliveryTicketSummary(
       nonEmpty(ticket.topic) ??
       nonEmpty(ticket.title) ??
       nonEmpty(ticket.category),
+    sourceQuestionId: nonEmpty(ticket.sourceQuestionId),
     publicStatus,
     publicStatusLabel: DELIVERY_TICKET_PUBLIC_STATUS_LABELS[publicStatus],
-    publicStage,
-    publicStageLabel: DELIVERY_TICKET_PUBLIC_STAGE_LABELS[publicStage],
     publicSummary:
-      publicStatus === "completed" || publicStage === "action_required"
+      publicStatus === "completed" ||
+      ticket.status === "needs_information" ||
+      isQuestionWorkflowTicket
         ? nonEmpty(ticket.publicSummary)
         : null,
-    knowledgeSnapshotId: ticket.knowledgeSnapshotId,
+    ...(ticket.knowledgeSnapshotId
+      ? { knowledgeSnapshotId: ticket.knowledgeSnapshotId }
+      : {}),
   };
   return publicDeliveryTicketSummarySchema.parse(
     ticket.type === "content_asset"
@@ -1006,7 +1426,9 @@ async function currentQuota(
       portal.service.planCode === "advanced" ||
       portal.service.planCode === "luxury" ||
       (portal.service.planCode === "basic" && pool === "content_asset_publish");
-    const active = portal.service.status === "active" && planAllowsPool;
+    const knowledgeReady = servicePortalHasRequiredKnowledge(portal);
+    const active =
+      portal.service.status === "active" && planAllowsPool && knowledgeReady;
     return {
       type: pool,
       allowed: active && capacity.limit > 0,
@@ -1024,13 +1446,19 @@ async function currentQuota(
           ? null
           : "当前套餐不包含此发布额度。"
         : portal.service.status === "active" &&
-            portal.service.planCode === "basic" &&
-            pool === "website_content_publish"
-          ? "普通版不包含 AI 友好官网管理。"
-          : portal.service.status === "expired" ||
-              portal.service.status === "cancelled"
-            ? "当前服务已到期，仅可查看历史工单。"
-            : "当前服务尚不可提交新工单。",
+            planAllowsPool &&
+            !knowledgeReady
+          ? portal.service.planCode === "basic"
+            ? "请先等待 Website 流程自动同步或服务团队补录知识库；知识库展示完成后解锁 AI 友好内容资产。"
+            : "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。"
+          : portal.service.status === "active" &&
+              portal.service.planCode === "basic" &&
+              pool === "website_content_publish"
+            ? "普通版不包含 AI 友好官网管理。"
+            : portal.service.status === "expired" ||
+                portal.service.status === "cancelled"
+              ? "当前服务已到期，仅可查看历史需求。"
+              : "当前服务尚不可提交新需求。",
     };
   };
   return {
@@ -1153,11 +1581,13 @@ type TicketSummaryPageInput = {
   type?: AdminDeliveryTicketListInput["type"];
   status?: AdminDeliveryTicketListInput["status"];
   publicStatus?: AdminDeliveryTicketListInput["publicStatus"];
+  surface?: DeliveryTicketListInput["surface"];
   quotaPeriodId?: string;
   query?: string;
   limit: number;
   cursor?: string;
   order?: AdminDeliveryTicketListInput["order"];
+  hideWorkflowChildren?: boolean;
 };
 
 async function loadTicketSummaryPage(db: any, input: TicketSummaryPageInput) {
@@ -1173,7 +1603,7 @@ async function loadTicketSummaryPage(db: any, input: TicketSummaryPageInput) {
   if (cursor && (cursor.order ?? "updated_desc") !== order) {
     throw new DeliveryTicketError(
       "DELIVERY_TICKET_CURSOR_INVALID",
-      "工单列表排序已变化，请刷新后重试。",
+      "需求列表排序已变化，请刷新后重试。",
       400,
     );
   }
@@ -1186,7 +1616,59 @@ async function loadTicketSummaryPage(db: any, input: TicketSummaryPageInput) {
         : null;
   const conditions = [
     inArray(deliveryTickets.userId, input.userIds),
+    ...(input.hideWorkflowChildren
+      ? [
+          or(
+            eq(deliveryTickets.isWorkflowContainer, true),
+            and(
+              isNull(deliveryTickets.parentTicketId),
+              isNull(deliveryTickets.rootTicketId),
+            ),
+          )!,
+        ]
+      : []),
     ...(input.type ? [eq(deliveryTickets.type, input.type)] : []),
+    ...(input.surface === "website_management"
+      ? [
+          or(
+            inArray(deliveryTickets.operation, [
+              ...WEBSITE_MANAGEMENT_HISTORY_CATEGORIES,
+            ]),
+            and(
+              isNull(deliveryTickets.operation),
+              inArray(deliveryTickets.category, [
+                ...WEBSITE_MANAGEMENT_HISTORY_CATEGORIES,
+              ]),
+            ),
+          )!,
+        ]
+      : input.surface === "question_management"
+        ? [
+            inArray(deliveryTickets.category, [
+              ...QUESTION_MANAGEMENT_HISTORY_CATEGORIES,
+            ]),
+          ]
+        : input.surface === "knowledge_management"
+          ? [
+              or(
+                and(
+                  eq(deliveryTickets.type, "knowledge_base"),
+                  eq(deliveryTickets.category, "knowledge_reset"),
+                ),
+                and(
+                  eq(deliveryTickets.type, "website_operation"),
+                  eq(deliveryTickets.category, "knowledge_base_maintenance"),
+                ),
+              )!,
+            ]
+          : input.surface === "response_logic_management"
+            ? [
+                and(
+                  eq(deliveryTickets.type, "knowledge_base"),
+                  eq(deliveryTickets.category, "response_logic_reset"),
+                )!,
+              ]
+            : []),
     ...(input.status ? [eq(deliveryTickets.status, input.status)] : []),
     ...(publicStatuses
       ? [inArray(deliveryTickets.status, publicStatuses)]
@@ -1271,7 +1753,9 @@ export async function listWorkspaceDeliveryTickets(input: {
   const limit = Math.min(100, Math.max(1, input.value?.limit ?? 20));
   const page = await loadTicketSummaryPage(db, {
     userIds: [input.userId],
+    hideWorkflowChildren: true,
     type: input.value?.type,
+    surface: input.value?.surface,
     publicStatus: input.value?.publicStatus,
     limit,
     cursor: input.value?.cursor,
@@ -1287,6 +1771,7 @@ export async function getDeliveryTicketWorkspace(userId: number) {
   const [page, metadata] = await Promise.all([
     loadTicketSummaryPage(db, {
       userIds: [userId],
+      hideWorkflowChildren: true,
       limit: 20,
     }),
     getPublicDeliveryTicketWorkspaceMetadata(userId),
@@ -1308,6 +1793,10 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
     quotas,
     pendingRows,
     ownerRows,
+    websiteBuildTicketRows,
+    websiteBuildMilestoneRows,
+    websiteLegacyEvidenceTicketRows,
+    websiteLegacyEvidenceMilestoneRows,
   ] = await Promise.all([
     db
       .select({ marketEdition: users.marketEdition })
@@ -1323,6 +1812,13 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
       .where(
         and(
           eq(deliveryTickets.userId, userId),
+          or(
+            eq(deliveryTickets.isWorkflowContainer, true),
+            and(
+              isNull(deliveryTickets.parentTicketId),
+              isNull(deliveryTickets.rootTicketId),
+            ),
+          ),
           inArray(deliveryTickets.status, [
             "submitted",
             "needs_information",
@@ -1343,6 +1839,50 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
           eq(users.isActive, true),
         ),
       ),
+    db
+      .select({ status: deliveryTickets.status })
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(deliveryTickets.userId, userId),
+          eq(deliveryTickets.operation, "website_build"),
+        ),
+      ),
+    db
+      .select({ id: deliveryWorkflowMilestones.id })
+      .from(deliveryWorkflowMilestones)
+      .where(
+        and(
+          eq(deliveryWorkflowMilestones.userId, userId),
+          eq(deliveryWorkflowMilestones.operation, "website_build"),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: deliveryTickets.id })
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(deliveryTickets.userId, userId),
+          eq(deliveryTickets.status, "completed"),
+          inArray(deliveryTickets.operation, [
+            ...WEBSITE_BUILD_LEGACY_EVIDENCE_OPERATIONS,
+          ]),
+        ),
+      )
+      .limit(1),
+    db
+      .select({ id: deliveryWorkflowMilestones.id })
+      .from(deliveryWorkflowMilestones)
+      .where(
+        and(
+          eq(deliveryWorkflowMilestones.userId, userId),
+          inArray(deliveryWorkflowMilestones.operation, [
+            ...WEBSITE_BUILD_LEGACY_EVIDENCE_OPERATIONS,
+          ]),
+        ),
+      )
+      .limit(1),
   ]);
   const ownerTypes = new Set(ownerRows.map((row) => row.roleType));
   const domainCompleted = siteProfile?.domainStatus === "completed";
@@ -1353,6 +1893,15 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
     styleWorkflow?.status ?? (icpCompleted ? "waiting_samples" : "locked");
   const styleConfirmed =
     styleState === "confirmed" || styleState === "legacy_confirmed";
+  const websiteBuildStatus = resolveWebsiteBuildStatus({
+    styleState,
+    ticketStatuses: websiteBuildTicketRows.map((row) => row.status),
+    hasCompletionMilestone: Boolean(websiteBuildMilestoneRows[0]),
+    hasLegacyCompletionEvidence: Boolean(
+      websiteLegacyEvidenceTicketRows[0] ||
+        websiteLegacyEvidenceMilestoneRows[0],
+    ),
+  });
   const marketEdition = accountRows[0]?.marketEdition ?? "domestic";
   return {
     siteProfile,
@@ -1380,25 +1929,37 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
       styleBatch: styleWorkflow?.currentBatch ?? null,
       selectedStyleSampleId: styleWorkflow?.selectedSampleId ?? null,
       styleConfirmed,
+      websiteBuildStatus,
       canSelectStyle: styleState === "awaiting_selection",
       canRequestStyleRevision: styleState === "awaiting_selection",
       canSubmitDomain: !domainCompleted,
-      canSubmitIcp: !icpCompleted,
-      canSubmitContent: domainCompleted && icpCompleted && styleConfirmed,
+      canSubmitIcp:
+        marketEdition !== "overseas" && domainCompleted && !icpCompleted,
+      canSubmitContent:
+        domainCompleted &&
+        icpCompleted &&
+        styleConfirmed &&
+        websiteBuildStatus === "completed",
       icpProvince: siteProfile?.icpProvince ?? null,
       icpProvinceOptions: ICP_PROVINCES,
       icpLockReason: null,
       contentLockReason: !domainCompleted
-        ? "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
+        ? marketEdition === "overseas"
+          ? "请先完成企业域名注册与确认。"
+          : "请先在阿里云完成域名注册与 ICP 备案，并提交备案结果。"
         : !icpCompleted
-          ? "请先提交并确认域名与 ICP 主体备案号。"
+          ? marketEdition === "overseas"
+            ? "请先完成企业域名确认。"
+            : "请先提交并确认域名与 ICP 主体备案号。"
           : !styleConfirmed
             ? styleState === "awaiting_selection"
               ? "请先选择一种官网图片风格，或填写原因退回工程师重做。"
               : styleState === "revision_requested"
                 ? "已退回工程师重做，正在等待新一批图片风格样例。"
                 : "正在等待工程师提供三张官网图片风格样例。"
-            : null,
+            : websiteBuildStatus !== "completed"
+              ? "官网风格已确认，正在等待 AI 运维工程师或系统管理员完成官网构建并登记公开链接。"
+              : null,
     },
   };
 }
@@ -1406,6 +1967,7 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
 export function toPublicDeliveryTicketWorkspaceMetadata(
   metadata: Awaited<ReturnType<typeof getDeliveryTicketWorkspaceMetadata>>,
 ): PublicDeliveryTicketWorkspaceMetadata {
+  const overseasAccount = metadata.marketEdition === "overseas";
   const deliveryOwners = metadata.deliveryOwners ?? {
     aiOperations: true,
     monitoringOptimization: true,
@@ -1418,6 +1980,10 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
   const domainCompleted = metadata.websiteWorkflow.domainCompleted;
   const icpCompleted = metadata.websiteWorkflow.icpCompleted;
   const styleConfirmed = metadata.websiteWorkflow.styleConfirmed;
+  const websiteBuildStatus = metadata.websiteWorkflow.websiteBuildStatus;
+  const websiteServiceAllowed =
+    deliveryOwners.aiOperations &&
+    metadata.quotas.website_content_publish.allowed;
   const aiOperationsUnavailableReason =
     metadata.quotas.website_content_publish.reason ||
     "尚未分配 AI 运维工程师，请联系交付管理员。";
@@ -1451,50 +2017,59 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
       domainCompleted,
       icpCompleted,
       canSubmitDomain:
-        deliveryOwners.aiOperations && !domainCompleted && !domainPending,
+        websiteServiceAllowed && !domainCompleted && !domainPending,
       canSubmitIcp:
-        deliveryOwners.aiOperations &&
+        websiteServiceAllowed &&
+        !overseasAccount &&
         domainCompleted &&
         !icpCompleted &&
         !domainPending &&
         !icpPending,
       canSubmitContent:
-        deliveryOwners.aiOperations &&
+        websiteServiceAllowed &&
         domainCompleted &&
         icpCompleted &&
-        styleConfirmed,
+        styleConfirmed &&
+        websiteBuildStatus === "completed",
       styleState: metadata.websiteWorkflow.styleState,
       styleRevision: metadata.websiteWorkflow.styleRevision,
       styleBatch: metadata.websiteWorkflow.styleBatch,
       selectedStyleSampleId: metadata.websiteWorkflow.selectedStyleSampleId,
       styleConfirmed,
+      websiteBuildStatus,
       canSelectStyle:
-        deliveryOwners.aiOperations && metadata.websiteWorkflow.canSelectStyle,
+        websiteServiceAllowed && metadata.websiteWorkflow.canSelectStyle,
       canRequestStyleRevision:
-        deliveryOwners.aiOperations &&
+        websiteServiceAllowed &&
         metadata.websiteWorkflow.canRequestStyleRevision,
       domainLockReason: domainPending
-        ? "域名申请工单正在等待 AI 运维工程师处理。"
-        : !deliveryOwners.aiOperations
+        ? "域名核验需求正在等待 AI 运维工程师处理。"
+        : !websiteServiceAllowed
           ? aiOperationsUnavailableReason
           : domainCompleted
             ? null
             : null,
-      icpLockReason: !deliveryOwners.aiOperations
+      icpLockReason: overseasAccount
+        ? null
+        : !websiteServiceAllowed
+          ? aiOperationsUnavailableReason
+          : !domainCompleted
+            ? domainPending
+              ? "域名需求正在处理；需求完成后才可提交 ICP 备案结果。"
+              : "请先购买域名并提交 AI 运维需求，需求完成后再提交 ICP 备案结果。"
+            : icpPending
+              ? "ICP 备案结果待 AI 运维工程师核验。"
+              : null,
+      contentLockReason: !websiteServiceAllowed
         ? aiOperationsUnavailableReason
         : !domainCompleted
-          ? domainPending
-            ? "域名工单正在处理；工单完成并返回备案服务码后，才可提交 ICP 备案结果。"
-            : "请先购买域名并提交 AI 运维工单，领取备案服务码后再进行 ICP 备案。"
-          : icpPending
-            ? "ICP 备案结果待 AI 运维工程师核验。"
-            : null,
-      contentLockReason: !deliveryOwners.aiOperations
-        ? aiOperationsUnavailableReason
-        : !domainCompleted
-          ? "请先购买域名并提交 AI 运维工单，领取备案服务码后完成 ICP 备案。"
+          ? overseasAccount
+            ? "请先完成企业域名注册与确认。"
+            : "请先完成域名需求与 ICP 备案。"
           : !icpCompleted
-            ? "请先提交并确认域名与 ICP 主体备案号。"
+            ? overseasAccount
+              ? "请先完成企业域名确认。"
+              : "请先提交并确认域名与 ICP 主体备案号。"
             : metadata.websiteWorkflow.contentLockReason,
       icpProvinceOptions: metadata.websiteWorkflow.icpProvinceOptions,
     },
@@ -1505,6 +2080,106 @@ export async function getPublicDeliveryTicketWorkspaceMetadata(userId: number) {
   return toPublicDeliveryTicketWorkspaceMetadata(
     await getDeliveryTicketWorkspaceMetadata(userId),
   );
+}
+
+async function ensureWebsiteBuildTicket(input: {
+  executor: any;
+  sourceTicket: typeof deliveryTickets.$inferSelect;
+  actorUserId: number;
+}) {
+  const existingRows = await input.executor
+    .select({ id: deliveryTickets.id })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.userId, input.sourceTicket.userId),
+        eq(deliveryTickets.operation, "website_build"),
+        inArray(deliveryTickets.status, [
+          "submitted",
+          "needs_information",
+          "scheduled",
+          "in_progress",
+          "completed",
+        ]),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  if (existingRows[0]) {
+    return { id: existingRows[0].id, created: false as const };
+  }
+
+  const ownerRows = await input.executor
+    .select({
+      projectAssignmentId: deliveryProjectAssignments.id,
+      memberId: deliveryProjectAssignments.engineerUserId,
+    })
+    .from(deliveryProjectAssignments)
+    .innerJoin(users, eq(users.id, deliveryProjectAssignments.engineerUserId))
+    .where(
+      and(
+        eq(
+          deliveryProjectAssignments.customerUserId,
+          input.sourceTicket.userId,
+        ),
+        eq(deliveryProjectAssignments.roleType, "ai_operations_engineer"),
+        eq(users.role, "delivery_member"),
+        eq(users.engineerRoleType, "ai_operations_engineer"),
+        eq(users.isActive, true),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const owner = ownerRows[0];
+  if (!owner) {
+    throw new DeliveryTicketError(
+      "DELIVERY_OWNER_NOT_ASSIGNED",
+      "尚未分配 AI 运维工程师，无法创建官网构建工单。",
+      409,
+    );
+  }
+
+  const now = new Date();
+  const ticketId = randomUUID();
+  await input.executor.insert(deliveryTickets).values({
+    id: ticketId,
+    userId: input.sourceTicket.userId,
+    contractId: input.sourceTicket.contractId,
+    quotaPeriodId: input.sourceTicket.quotaPeriodId,
+    type: "website_operation",
+    quotaPool: null,
+    ordinal: 0,
+    clientRequestId: randomUUID(),
+    category: "website_build",
+    title: "构建 AI 专用官网",
+    description:
+      "客户已确认官网图片风格，请完成官网构建、发布并登记公开链接；完成后系统才开放后续内容提交。",
+    workflowDomain: "ai_operations_engineer",
+    operation: "website_build",
+    assignedProjectAssignmentId: owner.projectAssignmentId,
+    assignedMemberId: owner.memberId,
+    technicalDedupeKey: `website-build:${input.sourceTicket.userId}`,
+    quotaState: "consumed",
+    status: "submitted",
+    createdByUserId: input.actorUserId,
+    updatedByUserId: input.actorUserId,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await input.executor.insert(deliveryTicketEvents).values({
+    id: randomUUID(),
+    ticketId,
+    userId: input.sourceTicket.userId,
+    actorUserId: input.actorUserId,
+    actorRole: "system",
+    kind: "created",
+    visibility: "customer",
+    message:
+      "官网图片风格已确认，官网构建工单已创建；工程师完成构建并登记公开链接后开放内容运营。",
+    toStatus: "submitted",
+    createdAt: now,
+  });
+  return { id: ticketId, created: true as const };
 }
 
 export async function selectWebsiteStyleSample(input: {
@@ -1519,6 +2194,10 @@ export async function selectWebsiteStyleSample(input: {
       403,
     );
   }
+  assertDeliveryTicketServiceEligibility(
+    await getServicePortal(input.actor.id),
+    "website_operation",
+  );
   const db = await requireDb();
   return db.transaction(async (tx) => {
     const workflowRows = await tx
@@ -1581,6 +2260,11 @@ export async function selectWebsiteStyleSample(input: {
       );
     }
     const now = new Date();
+    const websiteBuildTicket = await ensureWebsiteBuildTicket({
+      executor: tx,
+      sourceTicket: ticket,
+      actorUserId: input.actor.id,
+    });
     await tx
       .update(websiteStyleWorkflows)
       .set({
@@ -1615,7 +2299,7 @@ export async function selectWebsiteStyleSample(input: {
       actorRole: "user",
       kind: "status_change",
       visibility: "customer",
-      message: `客户已确认官网图片风格：${selected.sample.label}。官网构建与内容运营现已解锁。`,
+      message: `客户已确认官网图片风格：${selected.sample.label}。官网构建工单已创建，完成构建并登记公开链接后开放内容运营。`,
       fromStatus: ticket.status,
       toStatus: "completed",
       createdAt: now,
@@ -1624,6 +2308,7 @@ export async function selectWebsiteStyleSample(input: {
       success: true as const,
       selectedSampleId: selected.sample.id,
       workflowRevision: workflow.revision + 1,
+      websiteBuildTicketId: websiteBuildTicket.id,
     };
   });
 }
@@ -1648,6 +2333,10 @@ export async function requestWebsiteStyleRevision(input: {
       400,
     );
   }
+  assertDeliveryTicketServiceEligibility(
+    await getServicePortal(input.actor.id),
+    "website_operation",
+  );
   const db = await requireDb();
   return db.transaction(async (tx) => {
     const workflowRows = await tx
@@ -1800,7 +2489,7 @@ export async function createDeliveryTicket(input: {
   } catch (error) {
     throw new DeliveryTicketError(
       "QUOTA_POOL_MISMATCH",
-      error instanceof Error ? error.message : "工单类别与服务类型不一致。",
+      error instanceof Error ? error.message : "需求类别与服务类型不一致。",
       400,
     );
   }
@@ -1875,7 +2564,7 @@ export async function createDeliveryTicket(input: {
         ) {
           throw new DeliveryTicketError(
             "PREFERRED_MEDIA_SCOPE_INVALID",
-            "意向媒体只能用于内容资产工单。",
+            "意向媒体只能用于内容资产需求。",
             400,
           );
         }
@@ -1900,7 +2589,7 @@ export async function createDeliveryTicket(input: {
           if (!snapshots[0]) {
             throw new DeliveryTicketError(
               "KNOWLEDGE_SNAPSHOT_NOT_CURRENT",
-              "关联知识库已变化，请刷新后重新提交维护工单。",
+              "关联知识库已变化，请刷新后重新提交维护需求。",
               409,
             );
           }
@@ -1979,19 +2668,20 @@ export async function createDeliveryTicket(input: {
           if (open[0]) {
             throw new DeliveryTicketError(
               "TECHNICAL_TICKET_ALREADY_OPEN",
-              "该页面已有同类技术工单，请在原工单中继续补充。",
+              "该页面已有同类技术需求，请在原需求中继续补充。",
             );
           }
         }
         const now = new Date();
         const ticketId = randomUUID();
         const eventId = randomUUID();
+        const isWorkflowContainer = quotaPool !== null;
         const workflowDomain =
-          input.value.type === "content_asset"
+          isWorkflowContainer || input.value.type === "content_asset"
             ? ("content_distribution_engineer" as const)
             : ("ai_operations_engineer" as const);
         const operation =
-          input.value.type === "content_asset"
+          isWorkflowContainer || input.value.type === "content_asset"
             ? "content_asset_publish"
             : input.value.category === "knowledge_base_maintenance"
               ? "knowledge_maintenance"
@@ -2027,6 +2717,7 @@ export async function createDeliveryTicket(input: {
         }
         await tx.insert(deliveryTickets).values({
           id: ticketId,
+          isWorkflowContainer,
           userId: input.userId,
           contractId: period.contractId,
           quotaPeriodId: period.id,
@@ -2044,10 +2735,12 @@ export async function createDeliveryTicket(input: {
           icpDeclarations: input.value.icpDeclarations ?? null,
           targetPage: nonEmpty(input.value.targetPage),
           knowledgeSnapshotId: input.value.knowledgeSnapshotId ?? null,
-          workflowDomain,
-          operation,
-          assignedProjectAssignmentId: owner.projectAssignmentId,
-          assignedMemberId: owner.memberId,
+          workflowDomain: isWorkflowContainer ? null : workflowDomain,
+          operation: isWorkflowContainer ? null : operation,
+          assignedProjectAssignmentId: isWorkflowContainer
+            ? null
+            : owner.projectAssignmentId,
+          assignedMemberId: isWorkflowContainer ? null : owner.memberId,
           technicalDedupeKey: technicalDedupe,
           materialUrls: input.value.materialUrls,
           status: "submitted",
@@ -2069,6 +2762,72 @@ export async function createDeliveryTicket(input: {
           toStatus: "submitted",
           createdAt: now,
         });
+        let workflowChildTicketId: string | null = null;
+        let workflowChildEventId: string | null = null;
+        if (isWorkflowContainer) {
+          const childTicketId = randomUUID();
+          const childEventId = randomUUID();
+          workflowChildTicketId = childTicketId;
+          workflowChildEventId = childEventId;
+          const websiteDirect = input.value.type === "website_operation";
+          await tx.insert(deliveryTickets).values({
+            id: childTicketId,
+            parentTicketId: ticketId,
+            rootTicketId: ticketId,
+            workflowStageKey: "content_asset_publish:initial",
+            isWorkflowContainer: false,
+            userId: input.userId,
+            contractId: period.contractId,
+            quotaPeriodId: period.id,
+            type: "content_asset",
+            quotaPool: null,
+            quotaState: "consumed",
+            ordinal: 0,
+            clientRequestId: randomUUID(),
+            category: "content_asset_publish",
+            topic: nonEmpty(input.value.topic),
+            title: websiteDirect
+              ? "制作官网发布所需内容资产"
+              : "制作并发布 AI 友好内容资产",
+            description: websiteDirect
+              ? "客户已提交官网内容需求，请先制作、校验并发布对应内容资产；完成后系统将创建官网发布子任务。"
+              : "客户已提交内容资产需求，请制作、校验并发布正式内容资产；完成后系统将创建渠道分发子任务。",
+            preferredMedia: input.value.preferredMedia ?? null,
+            targetPage: nonEmpty(input.value.targetPage),
+            workflowDomain,
+            operation,
+            assignedProjectAssignmentId: owner.projectAssignmentId,
+            assignedMemberId: owner.memberId,
+            materialUrls: input.value.materialUrls,
+            status: "submitted",
+            createdByUserId: input.userId,
+            updatedByUserId: input.userId,
+            createdAt: now,
+            updatedAt: now,
+          });
+          await tx.insert(deliveryTicketEvents).values({
+            id: childEventId,
+            ticketId: childTicketId,
+            userId: input.userId,
+            actorUserId: input.userId,
+            actorRole: "system",
+            kind: "created",
+            visibility: "internal",
+            message: websiteDirect
+              ? "客户官网内容根需求已受理，系统创建内容资产发布子任务。"
+              : "客户内容资产根需求已受理，系统创建内容资产发布子任务。",
+            toStatus: "submitted",
+            actorContext: {
+              projectAssignmentId: owner.projectAssignmentId,
+              customerUserId: input.userId,
+              roleType: workflowDomain,
+              sourceTicketId: ticketId,
+              assignedProjectAssignmentId: owner.projectAssignmentId,
+              ...(owner.memberId ? { assignedMemberId: owner.memberId } : {}),
+            },
+            createdAt: now,
+          });
+        }
         const files = attachmentRows({
           ticketId,
           eventId,
@@ -2080,6 +2839,23 @@ export async function createDeliveryTicket(input: {
         });
         if (files.length)
           await tx.insert(deliveryTicketAttachments).values(files);
+        if (
+          workflowChildTicketId &&
+          workflowChildEventId &&
+          input.value.attachments.length
+        ) {
+          await tx.insert(deliveryTicketAttachments).values(
+            attachmentRows({
+              ticketId: workflowChildTicketId,
+              eventId: workflowChildEventId,
+              workspaceUserId: input.userId,
+              ownerUserId: input.userId,
+              kind: "input",
+              attachments: input.value.attachments,
+              now,
+            }),
+          );
+        }
         if (input.value.type === "website_operation") {
           const category = input.value.category?.trim();
           if (category === "domain_application") {
@@ -2181,14 +2957,14 @@ export async function assertKnowledgeMaintenanceTicketForUpload(input: {
   ) {
     throw new DeliveryTicketError(
       "KNOWLEDGE_MAINTENANCE_TICKET_INVALID",
-      "该工单不是当前客户的知识库维护工单。",
+      "该需求不是当前客户的知识库维护需求。",
       400,
     );
   }
   if (TERMINAL_STATUSES.has(ticket.status)) {
     throw new DeliveryTicketError(
       "TICKET_CLOSED",
-      "已结束的维护工单不能再上传知识库。",
+      "已结束的维护需求不能再上传知识库。",
       409,
     );
   }
@@ -2211,7 +2987,7 @@ async function requireOwnedTicket(
   if (lock) query = query.for("update");
   const rows = await query;
   if (!rows[0]) {
-    throw new DeliveryTicketError("TICKET_NOT_FOUND", "工单不存在。", 404);
+    throw new DeliveryTicketError("TICKET_NOT_FOUND", "需求不存在。", 404);
   }
   return rows[0];
 }
@@ -2231,7 +3007,7 @@ export async function assertExistingDeliveryTicketSettlementScope(input: {
   >;
 }) {
   if (input.ticket.userId !== input.userId) {
-    throw new DeliveryTicketError("TICKET_NOT_FOUND", "工单不存在。", 404);
+    throw new DeliveryTicketError("TICKET_NOT_FOUND", "需求不存在。", 404);
   }
   const periods = await input.executor
     .select({
@@ -2252,14 +3028,14 @@ export async function assertExistingDeliveryTicketSettlementScope(input: {
   if (!periods[0]) {
     throw new DeliveryTicketError(
       "TICKET_QUOTA_SCOPE_INVALID",
-      "工单绑定的历史服务周期不属于当前企业，不能结算。",
+      "需求绑定的历史服务周期不属于当前企业，不能结算。",
       409,
     );
   }
   if (input.ticket.quotaPool && input.ticket.quotaState === "released") {
     throw new DeliveryTicketError(
       "TICKET_QUOTA_ALREADY_RELEASED",
-      "该工单预留的发布额度已经释放，不能再完成。",
+      "该需求预留的发布额度已经释放，不能再完成。",
       409,
     );
   }
@@ -2273,46 +3049,117 @@ export async function getDeliveryTicketDetail(input: {
 }) {
   const db = await requireDb();
   const ticket = await requireOwnedTicket(db, input.userId, input.ticketId);
-  const [events, attachmentRows, assignedMemberRows] = await Promise.all([
-    db
-      .select()
-      .from(deliveryTicketEvents)
-      .where(
-        and(
-          eq(deliveryTicketEvents.ticketId, ticket.id),
-          ...(input.includeInternal
-            ? []
-            : [eq(deliveryTicketEvents.visibility, "customer")]),
-        ),
-      )
-      .orderBy(asc(deliveryTicketEvents.createdAt)),
-    db
-      .select({
-        attachment: deliveryTicketAttachments,
-        eventVisibility: deliveryTicketEvents.visibility,
-      })
-      .from(deliveryTicketAttachments)
-      .leftJoin(
-        deliveryTicketEvents,
-        and(
-          eq(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
-          eq(deliveryTicketEvents.ticketId, deliveryTicketAttachments.ticketId),
-        ),
-      )
-      .where(eq(deliveryTicketAttachments.ticketId, ticket.id))
-      .orderBy(asc(deliveryTicketAttachments.createdAt)),
-    input.includeInternal && ticket.assignedMemberId
-      ? db
-          .select({
-            id: users.id,
-            displayName: users.displayName,
-            username: users.username,
-          })
-          .from(users)
-          .where(eq(users.id, ticket.assignedMemberId))
-          .limit(1)
-      : [],
-  ]);
+  const workflowRootId = ticket.isWorkflowContainer
+    ? ticket.id
+    : ticket.rootTicketId;
+  const [events, attachmentRows, assignedMemberRows, workflowRelationRows] =
+    await Promise.all([
+      db
+        .select()
+        .from(deliveryTicketEvents)
+        .where(
+          and(
+            eq(deliveryTicketEvents.ticketId, ticket.id),
+            ...(input.includeInternal
+              ? []
+              : [eq(deliveryTicketEvents.visibility, "customer")]),
+          ),
+        )
+        .orderBy(asc(deliveryTicketEvents.createdAt)),
+      db
+        .select({
+          attachment: deliveryTicketAttachments,
+          eventVisibility: deliveryTicketEvents.visibility,
+        })
+        .from(deliveryTicketAttachments)
+        .leftJoin(
+          deliveryTicketEvents,
+          and(
+            eq(deliveryTicketEvents.id, deliveryTicketAttachments.eventId),
+            eq(
+              deliveryTicketEvents.ticketId,
+              deliveryTicketAttachments.ticketId,
+            ),
+          ),
+        )
+        .where(eq(deliveryTicketAttachments.ticketId, ticket.id))
+        .orderBy(asc(deliveryTicketAttachments.createdAt)),
+      input.includeInternal && ticket.assignedMemberId
+        ? db
+            .select({
+              id: users.id,
+              displayName: users.displayName,
+              username: users.username,
+            })
+            .from(users)
+            .where(eq(users.id, ticket.assignedMemberId))
+            .limit(1)
+        : [],
+      input.includeInternal && workflowRootId
+        ? db
+            .select({
+              id: deliveryTickets.id,
+              parentTicketId: deliveryTickets.parentTicketId,
+              rootTicketId: deliveryTickets.rootTicketId,
+              isWorkflowContainer: deliveryTickets.isWorkflowContainer,
+              operation: deliveryTickets.operation,
+              status: deliveryTickets.status,
+              workflowDomain: deliveryTickets.workflowDomain,
+              assignedMemberId: deliveryTickets.assignedMemberId,
+              createdAt: deliveryTickets.createdAt,
+            })
+            .from(deliveryTickets)
+            .where(
+              and(
+                eq(deliveryTickets.userId, ticket.userId),
+                or(
+                  eq(deliveryTickets.id, workflowRootId),
+                  eq(deliveryTickets.rootTicketId, workflowRootId),
+                ),
+              ),
+            )
+            .orderBy(asc(deliveryTickets.createdAt), asc(deliveryTickets.id))
+        : [],
+    ]);
+  const workflowMemberIds = Array.from(
+    new Set(
+      workflowRelationRows.flatMap((relation) =>
+        relation.assignedMemberId ? [relation.assignedMemberId] : [],
+      ),
+    ),
+  );
+  const workflowMemberRows = workflowMemberIds.length
+    ? await db
+        .select({
+          id: users.id,
+          displayName: users.displayName,
+          username: users.username,
+        })
+        .from(users)
+        .where(inArray(users.id, workflowMemberIds))
+    : [];
+  const workflowMemberNames = new Map(
+    workflowMemberRows.map((member) => [
+      member.id,
+      member.displayName?.trim() ||
+        member.username?.trim() ||
+        `工程师 ${member.id}`,
+    ]),
+  );
+  const workflowRelationDto = (
+    relation: (typeof workflowRelationRows)[number],
+  ) => ({
+    id: relation.id,
+    parentTicketId: relation.parentTicketId,
+    rootTicketId: relation.rootTicketId,
+    operation: relation.operation,
+    status: relation.status,
+    workflowDomain: relation.workflowDomain,
+    assignedMemberId: relation.assignedMemberId,
+    assignedMemberName: relation.assignedMemberId
+      ? (workflowMemberNames.get(relation.assignedMemberId) ?? null)
+      : null,
+  });
   const attachments = attachmentRows
     .filter((row) =>
       isDeliveryTicketAttachmentVisible(
@@ -2335,16 +3182,11 @@ export async function getDeliveryTicketDetail(input: {
       eventType: event.kind,
       visibility: event.visibility,
       actorRole: event.actorRole,
-      actorLabel:
-        event.actorRole === "user"
-          ? "用户"
-          : event.actorRole === "delivery_member"
-            ? "交付成员"
-            : "管理员",
+      actorLabel: deliveryActorRoleLabel(event.actorRole, "internal"),
       ...(input.includeInternal
         ? { actorContext: event.actorContext ?? null }
         : {}),
-      message: event.message,
+      message: deliveryEventDisplayMessage(event, "internal"),
       fromStatus: event.fromStatus,
       toStatus: event.toStatus,
       operationResult: event.operationResult,
@@ -2364,6 +3206,24 @@ export async function getDeliveryTicketDetail(input: {
       createdAt: epoch(attachment.createdAt),
       downloadUrl: `/api/delivery-ticket-attachments/${attachment.id}/content`,
     })),
+    ...(input.includeInternal
+      ? {
+          workflowRelations: {
+            root: workflowRelationRows.find(
+              (relation) => relation.id === workflowRootId,
+            )
+              ? workflowRelationDto(
+                  workflowRelationRows.find(
+                    (relation) => relation.id === workflowRootId,
+                  )!,
+                )
+              : null,
+            children: workflowRelationRows
+              .filter((relation) => !relation.isWorkflowContainer)
+              .map(workflowRelationDto),
+          },
+        }
+      : {}),
   };
 }
 
@@ -2373,6 +3233,9 @@ export async function getPublicDeliveryTicketDetail(input: {
 }) {
   const db = await requireDb();
   const ticket = await requireOwnedTicket(db, input.userId, input.ticketId);
+  if (!isCustomerVisibleDeliveryTicket(ticket)) {
+    throw new DeliveryTicketError("TICKET_NOT_FOUND", "需求不存在。", 404);
+  }
   const summary = toPublicDeliveryTicketSummary(ticketDto(ticket));
   if (summary.type === "website_operation") {
     const [events, attachments] = await Promise.all([
@@ -2380,7 +3243,10 @@ export async function getPublicDeliveryTicketDetail(input: {
         .select({
           id: deliveryTicketEvents.id,
           actorRole: deliveryTicketEvents.actorRole,
+          kind: deliveryTicketEvents.kind,
           message: deliveryTicketEvents.message,
+          fromStatus: deliveryTicketEvents.fromStatus,
+          toStatus: deliveryTicketEvents.toStatus,
           createdAt: deliveryTicketEvents.createdAt,
         })
         .from(deliveryTicketEvents)
@@ -2426,8 +3292,8 @@ export async function getPublicDeliveryTicketDetail(input: {
       events: events.map((event) => ({
         id: event.id,
         actorRole: event.actorRole,
-        actorLabel: event.actorRole === "user" ? "用户" : "服务团队",
-        message: event.message,
+        actorLabel: deliveryActorRoleLabel(event.actorRole, "customer"),
+        message: deliveryEventDisplayMessage(event, "customer"),
         createdAt: epoch(event.createdAt),
       })),
       attachments: attachments.map((attachment) => ({
@@ -2448,7 +3314,10 @@ export async function getPublicDeliveryTicketDetail(input: {
       .select({
         id: deliveryTicketEvents.id,
         actorRole: deliveryTicketEvents.actorRole,
+        kind: deliveryTicketEvents.kind,
         message: deliveryTicketEvents.message,
+        fromStatus: deliveryTicketEvents.fromStatus,
+        toStatus: deliveryTicketEvents.toStatus,
         createdAt: deliveryTicketEvents.createdAt,
       })
       .from(deliveryTicketEvents)
@@ -2464,8 +3333,8 @@ export async function getPublicDeliveryTicketDetail(input: {
       events: events.map((event) => ({
         id: event.id,
         actorRole: event.actorRole,
-        actorLabel: event.actorRole === "user" ? "用户" : "服务团队",
-        message: event.message,
+        actorLabel: deliveryActorRoleLabel(event.actorRole, "customer"),
+        message: deliveryEventDisplayMessage(event, "customer"),
         createdAt: epoch(event.createdAt),
       })),
     });
@@ -2476,7 +3345,10 @@ export async function getPublicDeliveryTicketDetail(input: {
       .select({
         id: deliveryTicketEvents.id,
         actorRole: deliveryTicketEvents.actorRole,
+        kind: deliveryTicketEvents.kind,
         message: deliveryTicketEvents.message,
+        fromStatus: deliveryTicketEvents.fromStatus,
+        toStatus: deliveryTicketEvents.toStatus,
         createdAt: deliveryTicketEvents.createdAt,
       })
       .from(deliveryTicketEvents)
@@ -2526,8 +3398,8 @@ export async function getPublicDeliveryTicketDetail(input: {
     events: events.map((event) => ({
       id: event.id,
       actorRole: event.actorRole,
-      actorLabel: event.actorRole === "user" ? "用户" : "服务团队",
-      message: event.message,
+      actorLabel: deliveryActorRoleLabel(event.actorRole, "customer"),
+      message: deliveryEventDisplayMessage(event, "customer"),
       createdAt: epoch(event.createdAt),
     })),
     attachments: attachments.map((attachment) => ({
@@ -2565,7 +3437,7 @@ export function assertDeliveryTicketMessagePolicy(input: {
   ) {
     throw new DeliveryTicketError(
       "WEBSITE_PUBLIC_ATTACHMENTS_NOT_ALLOWED",
-      "该官网工单只接收文字补充；请勿上传证件、密码、负责人照片或其他备案材料。",
+      "该官网需求只接收文字补充；请勿上传证件、密码、负责人照片或其他备案材料。",
       400,
     );
   }
@@ -2575,7 +3447,7 @@ export function assertDeliveryOperationPolicy(ticketType: DeliveryTicketType) {
   if (ticketType === "website_operation") {
     throw new DeliveryTicketError(
       "WEBSITE_DELIVERY_OPERATION_NOT_ALLOWED",
-      "官网工单不回传发布页面、外部链接或交付文件。",
+      "官网需求不回传发布页面、外部链接或交付文件。",
       400,
     );
   }
@@ -2598,7 +3470,7 @@ export async function addDeliveryTicketMessage(input: {
   const portal = await getServicePortal(input.workspaceUserId);
   if (input.actor.role === "user") {
     if (input.actor.id !== input.workspaceUserId) {
-      throw new DeliveryTicketError("TICKET_NOT_FOUND", "工单不存在。", 404);
+      throw new DeliveryTicketError("TICKET_NOT_FOUND", "需求不存在。", 404);
     }
     assertDeliveryTicketServiceEligibility(portal);
   } else {
@@ -2606,17 +3478,23 @@ export async function addDeliveryTicketMessage(input: {
     assertDeliveryTicketServiceEligibility(portal);
   }
   return db.transaction(async (tx) => {
-    const ticket = await requireOwnedTicket(
+    const initialTicket = await requireOwnedTicket(
       tx,
       input.workspaceUserId,
       input.value.ticketId,
-      true,
+      false,
     );
-    assertDeliveryTicketServiceEligibility(portal, ticket.type);
+    if (
+      input.actor.role === "user" &&
+      !isCustomerVisibleDeliveryTicket(initialTicket)
+    ) {
+      throw new DeliveryTicketError("TICKET_NOT_FOUND", "需求不存在。", 404);
+    }
+    assertDeliveryTicketServiceEligibility(portal, initialTicket.type);
     const visibility = input.visibility ?? "customer";
     assertDeliveryTicketMessagePolicy({
-      ticketType: ticket.type,
-      ticketCategory: ticket.category,
+      ticketType: initialTicket.type,
+      ticketCategory: initialTicket.category,
       actorRole: input.actor.role,
       visibility,
       attachmentCount: input.value.attachments.length,
@@ -2632,19 +3510,90 @@ export async function addDeliveryTicketMessage(input: {
       )
       .limit(1);
     if (existing[0]) return { eventId: existing[0].id, idempotent: true };
+
+    const initiallyNeedsWorkflowPropagation =
+      input.actor.role === "user" &&
+      initialTicket.isWorkflowContainer &&
+      initialTicket.status === "needs_information";
+    const workflowChildRows = initiallyNeedsWorkflowPropagation
+      ? await tx
+          .select()
+          .from(deliveryTickets)
+          .where(
+            and(
+              eq(deliveryTickets.userId, input.workspaceUserId),
+              eq(deliveryTickets.rootTicketId, initialTicket.id),
+              eq(deliveryTickets.isWorkflowContainer, false),
+              eq(deliveryTickets.status, "needs_information"),
+            ),
+          )
+          .orderBy(asc(deliveryTickets.createdAt), asc(deliveryTickets.id))
+          .limit(2)
+          .for("update")
+      : [];
+    const workflowChild = initiallyNeedsWorkflowPropagation
+      ? selectWorkflowCustomerSupplementChild(workflowChildRows)
+      : null;
+
+    // Execution transitions lock child -> root. Preserve the same lock order
+    // for customer supplements, then re-read the root under lock.
+    const ticket = await requireOwnedTicket(
+      tx,
+      input.workspaceUserId,
+      input.value.ticketId,
+      true,
+    );
+    const existingAfterLock = await tx
+      .select()
+      .from(deliveryTicketEvents)
+      .where(
+        and(
+          eq(deliveryTicketEvents.actorUserId, input.actor.id),
+          eq(deliveryTicketEvents.clientRequestId, input.value.clientRequestId),
+        ),
+      )
+      .limit(1);
+    if (existingAfterLock[0]) {
+      return { eventId: existingAfterLock[0].id, idempotent: true };
+    }
+    const lockedNeedsWorkflowPropagation =
+      input.actor.role === "user" &&
+      ticket.isWorkflowContainer &&
+      ticket.status === "needs_information";
+    if (
+      lockedNeedsWorkflowPropagation !== initiallyNeedsWorkflowPropagation ||
+      lockedNeedsWorkflowPropagation !== Boolean(workflowChild)
+    ) {
+      throw new DeliveryTicketError(
+        "WORKFLOW_SUPPLEMENT_STATE_CHANGED",
+        "需求处理状态刚刚发生变化，请刷新后重新提交补充资料。",
+        409,
+      );
+    }
     if (TERMINAL_STATUSES.has(ticket.status)) {
       throw new DeliveryTicketError(
         "TICKET_CLOSED",
-        "该工单已结束，不能继续补充消息。",
+        "该需求已结束，不能继续补充消息。",
       );
     }
     await verifyOwnedAttachments(tx, input.actor.id, input.value.attachments);
     const now = new Date();
     const eventId = randomUUID();
-    const nextStatus = deliveryTicketStatusAfterCustomerMessage({
-      actorRole: input.actor.role,
-      currentStatus: ticket.status,
-    });
+    const workflowPlan = workflowChild
+      ? planWorkflowCustomerSupplement({
+          rootScheduledAt: ticket.scheduledAt,
+          rootQuotaState: ticket.quotaState,
+          children: [workflowChild],
+          message: input.value.message,
+          attachments: input.value.attachments,
+        })
+      : null;
+    const nextStatus =
+      workflowPlan?.rootStatus ??
+      deliveryTicketStatusAfterCustomerMessage({
+        actorRole: input.actor.role,
+        currentStatus: ticket.status,
+      });
     const returnsToServiceQueue = nextStatus !== ticket.status;
     await tx.insert(deliveryTicketEvents).values({
       id: eventId,
@@ -2672,12 +3621,73 @@ export async function addDeliveryTicketMessage(input: {
       now,
     });
     if (files.length) await tx.insert(deliveryTicketAttachments).values(files);
+    if (workflowPlan) {
+      const childEventId = randomUUID();
+      const child = workflowPlan.child;
+      await tx.insert(deliveryTicketEvents).values({
+        id: childEventId,
+        ticketId: child.id,
+        userId: input.workspaceUserId,
+        actorUserId: input.actor.id,
+        actorRole: "user",
+        kind: "message",
+        visibility: "internal",
+        message: workflowPlan.internalMessage,
+        fromStatus: "needs_information",
+        toStatus: workflowPlan.childStatus,
+        actorContext: {
+          projectAssignmentId: child.assignedProjectAssignmentId!,
+          customerUserId: input.workspaceUserId,
+          roleType: child.workflowDomain!,
+          sourceTicketId: ticket.id,
+          assignedProjectAssignmentId: child.assignedProjectAssignmentId!,
+          assignedMemberId: child.assignedMemberId!,
+        },
+        createdAt: now,
+      });
+      const childAttachmentReferences = attachmentRows({
+        ticketId: child.id,
+        eventId: childEventId,
+        workspaceUserId: input.workspaceUserId,
+        ownerUserId: input.actor.id,
+        kind: "input",
+        attachments: input.value.attachments,
+        now,
+      });
+      // These are ticket-scoped metadata references to the same upstream file
+      // ids; no file bytes or upstream blobs are copied.
+      if (childAttachmentReferences.length) {
+        await tx
+          .insert(deliveryTicketAttachments)
+          .values(childAttachmentReferences);
+      }
+      await tx
+        .update(deliveryTickets)
+        .set({
+          status: workflowPlan.childStatus,
+          publicSummary: null,
+          scheduledAt: child.scheduledAt ?? now,
+          resolvedAt: null,
+          revision: sql`${deliveryTickets.revision} + 1`,
+          updatedByUserId: input.actor.id,
+          updatedAt: now,
+        })
+        .where(eq(deliveryTickets.id, child.id));
+    }
     await tx
       .update(deliveryTickets)
       .set({
         ...(returnsToServiceQueue
           ? {
               status: nextStatus,
+              ...(workflowPlan
+                ? {
+                    quotaState: workflowPlan.rootQuotaState,
+                    publicSummary: null,
+                    scheduledAt: ticket.scheduledAt ?? now,
+                    resolvedAt: null,
+                  }
+                : {}),
               revision: sql`${deliveryTickets.revision} + 1`,
             }
           : {}),
@@ -2898,19 +3908,19 @@ export async function updateManagedDeliveryTicket(input: {
     if (ticket.revision !== input.value.expectedRevision) {
       throw new DeliveryTicketError(
         "TICKET_REVISION_CONFLICT",
-        "工单已被其他管理员更新，请刷新后重试。",
+        "需求已被其他管理员更新，请刷新后重试。",
       );
     }
     if (TERMINAL_STATUSES.has(ticket.status)) {
       throw new DeliveryTicketError(
         "TICKET_CLOSED",
-        "已结束工单不能再次变更。",
+        "已结束需求不能再次变更。",
       );
     }
     if (input.value.status !== "completed") {
       throw new DeliveryTicketError(
         "PUBLIC_STATUS_TRANSITION_INVALID",
-        "新工单只支持从待受理直接更新为已完成；过程沟通请写入工单详情。",
+        "需求只支持从待处理直接更新为已完成；过程沟通请写入需求详情。",
         400,
       );
     }
@@ -2918,17 +3928,24 @@ export async function updateManagedDeliveryTicket(input: {
     if (!publicSummary) {
       throw new DeliveryTicketError(
         "PUBLIC_SUMMARY_REQUIRED",
-        "完成工单前必须填写用户可见的内容总结。",
+        "完成需求前必须填写用户可见的内容总结。",
         400,
       );
     }
+    assertManagedLegacySummaryClose({
+      publicSummary,
+      publicMessage: input.value.publicMessage,
+      deliveryLinks: input.value.deliveryLinks,
+      verifiedDomain: input.value.verifiedDomain,
+      internalNote: input.value.internalNote,
+    });
     if (
       ticket.type === "website_operation" &&
       (input.value.deliveryLinks?.length ?? 0) > 0
     ) {
       throw new DeliveryTicketError(
         "WEBSITE_DELIVERY_LINKS_NOT_ALLOWED",
-        "官网工单完成结果直接体现在网站中，不在看板回传发布链接。",
+        "官网需求完成结果直接体现在网站中，不在看板回传发布链接。",
         400,
       );
     }
@@ -2938,22 +3955,36 @@ export async function updateManagedDeliveryTicket(input: {
     ) {
       throw new DeliveryTicketError(
         "WEBSITE_PUBLIC_MESSAGE_NOT_ALLOWED",
-        "官网工单的完成结果请写入内容总结，无需额外添加完成消息。",
+        "官网需求的完成结果请写入内容总结，无需额外添加完成消息。",
         400,
       );
     }
     let verifiedDomain: string | null = null;
+    let domainApplicationOverseas = false;
     if (
       ticket.type === "website_operation" &&
       ticket.category === "domain_application"
     ) {
+      const accountRows = await tx
+        .select({ marketEdition: users.marketEdition })
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .limit(1);
+      const domainCompletion = resolveManagedDomainApplicationCompletion({
+        marketEdition:
+          accountRows[0]?.marketEdition === "overseas"
+            ? "overseas"
+            : "domestic",
+        publicSummary,
+      });
+      domainApplicationOverseas = domainCompletion.overseas;
       verifiedDomain = normalizeDomain(
         input.value.verifiedDomain || ticket.topic || ticket.title,
       );
       if (!verifiedDomain) {
         throw new DeliveryTicketError(
           "VERIFIED_DOMAIN_REQUIRED",
-          "完成域名申请前必须填写并核验实际域名。",
+          "完成域名核验前必须填写并核验实际域名。",
           400,
         );
       }
@@ -2988,7 +4019,7 @@ export async function updateManagedDeliveryTicket(input: {
       if (!replacementSnapshots[0]) {
         throw new DeliveryTicketError(
           "KNOWLEDGE_MAINTENANCE_NOT_PUBLISHED",
-          "完成维护工单前，必须先上传并发布通过校验的新知识库版本。",
+          "完成维护需求前，必须先上传并发布通过校验的新知识库版本。",
           409,
         );
       }
@@ -3036,6 +4067,11 @@ export async function updateManagedDeliveryTicket(input: {
           input.value.internalNote === undefined
             ? ticket.internalNote
             : nonEmpty(input.value.internalNote),
+        topic:
+          ticket.type === "website_operation" &&
+          ticket.category === "domain_application"
+            ? verifiedDomain
+            : ticket.topic,
         publicSummary,
         deliveryLinks:
           ticket.type === "content_asset" ? contentDeliveryLinks : [],
@@ -3075,6 +4111,13 @@ export async function updateManagedDeliveryTicket(input: {
           domain: verifiedDomain,
           domainStatus: "completed",
           domainVerifiedAt: now,
+          ...(domainApplicationOverseas
+            ? {
+                icpNumber: null,
+                icpStatus: "not_required" as const,
+                icpVerifiedAt: profile.icpVerifiedAt ?? now,
+              }
+            : {}),
           revision: profile.revision + 1,
           updatedByUserId: input.actor.id,
           updatedAt: now,
@@ -3107,7 +4150,7 @@ export async function updateManagedDeliveryTicket(input: {
       if (!resolvedDomain) {
         throw new DeliveryTicketError(
           "VERIFIED_DOMAIN_REQUIRED",
-          "完成工单前必须填写并核验实际域名。",
+          "完成需求前必须填写并核验实际域名。",
           400,
         );
       }
@@ -3222,13 +4265,13 @@ export async function recordManagedDeliveryOperation(input: {
     if (ticket.revision !== input.expectedRevision) {
       throw new DeliveryTicketError(
         "TICKET_REVISION_CONFLICT",
-        "工单已被其他管理员更新，请刷新后重试。",
+        "需求已被其他管理员更新，请刷新后重试。",
       );
     }
     if (TERMINAL_STATUSES.has(ticket.status)) {
       throw new DeliveryTicketError(
         "TICKET_CLOSED",
-        "已结束工单不能新增交付记录。",
+        "已结束需求不能新增交付记录。",
       );
     }
     assertDeliveryOperationPolicy(ticket.type);

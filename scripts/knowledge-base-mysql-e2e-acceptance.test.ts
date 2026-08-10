@@ -1341,8 +1341,7 @@ mysqlDescribe(
           pathname === "/turn" &&
           (response.status === 202 ||
             payload.task?.status === "running" ||
-            payload.observation?.interaction?.interactionState ===
-              "executing");
+            payload.observation?.interaction?.interactionState === "executing");
         if (!projectionPending()) return payload;
 
         // Model one disconnected/lost accepted response exactly as the real
@@ -1505,10 +1504,11 @@ mysqlDescribe(
       expect(
         initialNodes.slice(1).every((node) => node.status === "pending"),
       ).toBe(true);
-      // v4 intentionally reads the Logo once as the returned image descriptor
-      // and once more from the declared official-web source to prove that the
-      // provenance URL resolves to the exact same bytes.
-      expect(logoDownloads).toBe(2);
+      // The first turn downloads only the provider-returned raster Logo. The
+      // official-web URL proves first-party provenance but may point to a
+      // different source representation such as SVG, so it is not fetched for
+      // byte equality here. Finalization reuses the durable bound bytes.
+      expect(logoDownloads).toBe(1);
 
       const startTurn = (
         await executor
@@ -1665,7 +1665,7 @@ mysqlDescribe(
       });
       expect(authoritativeTaskReads).toBe(readsBeforeImmutableReconcile);
 
-      expect(logoDownloads).toBe(2);
+      expect(logoDownloads).toBe(1);
       expect(packageDownloads).toBe(1);
       // Every operation projects the provider's create-task response directly.
       // Later focus/online reconcile calls are immutable local reads.

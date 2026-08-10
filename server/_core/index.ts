@@ -22,6 +22,8 @@ import dashboardApi, {
   assertDashboardAssetStorageConfigured,
 } from "../dashboard-api";
 import brandQuestionPortfolioApi from "../brand-question-portfolio-api";
+import brandTrackingApi from "../brand-tracking-api";
+import { startJenovaBrandTrackingRecoveryScheduler } from "../jenova-brand-tracking-service";
 import { getBrandQuestionPortfolioSkillDescriptor } from "../brand-question-portfolio-runtime";
 import preparedFileRouter from "../prepared-file-router";
 import presalesProxy, {
@@ -423,6 +425,9 @@ async function startServer() {
     attachOptionalActiveCredential,
     brandQuestionPortfolioApi,
   );
+  // Jenova Brand Tracker conversations use an authenticated SSE transport.
+  // Its credential is resolved from the dedicated server-side assignment pool.
+  app.use("/api/brand-tracking", requireExpressAuth, brandTrackingApi);
   // Durable user dashboard content and final knowledge-base snapshot imports.
   app.use("/api/dashboard", dashboardApi);
   // Revision-bound, preview-first bulk completion for the five formal website
@@ -493,6 +498,7 @@ async function startServer() {
     if (process.env.NODE_ENV === "production") {
       startDeliveryTicketRetentionScheduler();
       startConversationRetentionScheduler();
+      startJenovaBrandTrackingRecoveryScheduler();
       startFileContentRetentionScheduler({
         // Let the conversation transaction finish its initial pass before the
         // file worker reconciles newly orphaned resources.

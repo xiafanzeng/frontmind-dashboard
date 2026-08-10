@@ -3,10 +3,7 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  ADMIN_WORKSPACE_TAB_IDS,
-  ADMIN_WORKSPACE_TABS,
-} from "./AdminWorkspace";
+import { ADMIN_WORKSPACE_TAB_IDS } from "./AdminWorkspace";
 
 describe("admin customer workspace", () => {
   it("keeps customer account creation exclusively in accounts and permissions", () => {
@@ -23,15 +20,19 @@ describe("admin customer workspace", () => {
     );
   });
 
-  it("keeps knowledge-base work inside the unified user-flow tab", () => {
-    expect(ADMIN_WORKSPACE_TAB_IDS).toEqual(["service", "tickets"]);
-    expect(ADMIN_WORKSPACE_TABS.map((item) => item.label)).toEqual([
-      "用户流程",
-      "工单",
-    ]);
+  it("keeps the canonical workspace route without a redundant visible tab", () => {
+    expect(ADMIN_WORKSPACE_TAB_IDS).toEqual(["workspace"]);
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+    expect(source).not.toContain("ADMIN_WORKSPACE_TABS");
+    expect(source).not.toContain("adminWorkspaceTabsForAccess");
+    expect(source).toContain("进入客户看板");
+    expect(source).toContain('variant="operatorOutline"');
   });
 
-  it("removes per-customer Key and credit management for every administrator", () => {
+  it("removes the obsolete global customer Key and credit panel", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
       "utf8",
@@ -44,22 +45,32 @@ describe("admin customer workspace", () => {
     expect(source).not.toContain("replaceCredential.useMutation");
   });
 
-  it("folds delivery content into service and removes the workspace audit tab", () => {
+  it("combines service and demand work without embedding the customer dashboard", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
       "utf8",
     );
 
-    expect(source).toContain('{tab === "service" &&');
+    expect(source).not.toContain('{tab === "workspace" &&');
+    expect(source).not.toContain("setTab(");
+    expect(source).not.toContain('{tab === "service" &&');
+    expect(source).not.toContain('{tab === "tickets" &&');
+    expect(source).toContain("<AdminDeliveryTicketWorkspace");
+    expect(source).toContain("<DashboardVersionHistory");
+    expect(source).not.toContain("onOpenCustomerDashboard=");
+    expect(source).toContain('mode="fullscreen"');
     expect(source).toContain("<DashboardSkeletonEditor");
+    expect(source).toContain('dashboardLayout="workspace"');
+    expect(source).toContain("onExitDashboard={() => setDashboardOpen(false)}");
     expect(source).toContain("<CustomerDashboardMirror");
+    expect(source).toContain('layout="workspace"');
     expect(source).toContain("servicePortal={serviceQuery.data}");
     expect(source).toContain("servicePortalLoading={serviceQuery.isLoading}");
     expect(source).not.toContain('heading="客户实际页面"');
     expect(source).not.toContain("这里与客户账号看到的完整看板一致。");
     expect(source).not.toContain("正式版本 R");
     expect(source).toContain("websiteWorkspace={websiteWorkspacePreview}");
-    expect(source).toContain("knowledgePreview={{");
+    expect(source).toContain("knowledgePreview={customerKnowledgePreview}");
     expect(source).toContain("activity: knowledgeActivityQuery.data");
     expect(source).not.toContain('{tab === "knowledge"');
     expect(source).not.toContain('label: "知识库流程"');
@@ -126,5 +137,17 @@ describe("admin customer workspace", () => {
     expect(source).toContain(
       'className="mt-2 truncate text-sm text-[#716a80]"',
     );
+  });
+
+  it("uses the canonical Jenova manager scoped to the selected customer", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
+      "utf8",
+    );
+
+    expect(source).toContain("<AdminJenovaBrandTrackingKeyManager");
+    expect(source).toContain("restrictedUserId={selectedUser.id}");
+    expect(source).not.toContain("JenovaSentimentManagementPanel");
+    expect(source).not.toContain("jenovaSentiment");
   });
 });

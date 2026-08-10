@@ -866,7 +866,7 @@ describe("knowledge-base production final-package acceptance", () => {
     if (assetRoot) await rm(assetRoot, { recursive: true, force: true });
   });
 
-  it("initializes a completed v4 zero-image Manifest as a first-leaf Logo upload gate without accepting the same running output", async () => {
+  it("recovers a completed v4 zero-image Manifest from the same source task without creating another turn", async () => {
     const fixture = await createFinalPackageFixture();
     const state = initialState();
     const buildId = "12121212-1212-4121-8121-121212121212";
@@ -1047,6 +1047,101 @@ describe("knowledge-base production final-package acceptance", () => {
       upstreamTaskId: taskId,
       errorCode: null,
     });
+
+    const recoveredOutput = [
+      {
+        id: "recovered-v4-initial-logo",
+        type: "output_image",
+        file_id: "file-recovered-v4-initial-logo",
+        filename: "company-logo.png",
+        mime_type: "image/png",
+      },
+      ...output,
+    ];
+    const recoveryUpstream = express();
+    recoveryUpstream.use(express.json());
+    let sourceTaskReads = 0;
+    let sourceLogoDownloads = 0;
+    recoveryUpstream.get("/v1/tasks/:taskId", (req, res) => {
+      sourceTaskReads += 1;
+      expect(req.params.taskId).toBe(taskId);
+      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      res.json({ id: taskId, status: "completed", output: recoveredOutput });
+    });
+    recoveryUpstream.get(
+      "/v1/files/file-recovered-v4-initial-logo/content",
+      (req, res) => {
+        sourceLogoDownloads += 1;
+        expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+        res.setHeader("Content-Type", "image/png");
+        res.setHeader("Content-Length", String(fixture.logo.length));
+        res.send(fixture.logo);
+      },
+    );
+    const recoveryUpstreamListener = await listen(recoveryUpstream);
+    dependencies.upstreamBaseUrl = recoveryUpstreamListener.baseUrl;
+    const { default: knowledgeBaseRouter } = await import(
+      "./knowledge-base-api"
+    );
+    const { requireExpressAuth } = await import("./_core/express-auth");
+    const recoveryDashboard = express();
+    recoveryDashboard.use(express.json());
+    recoveryDashboard.use(
+      "/api/knowledge-base",
+      requireExpressAuth,
+      knowledgeBaseRouter,
+    );
+    const recoveryDashboardListener = await listen(recoveryDashboard);
+    const turnCountBeforeRecovery = state.turns.length;
+    try {
+      const response = await fetch(
+        `${recoveryDashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({
+            conversationId: PUBLIC_CONVERSATION_ID,
+            taskId,
+          }),
+        },
+      );
+      expect(response.status).toBe(200);
+      const recovered = (await response.json()) as any;
+      expect(recovered.observation.interaction.progress.build).toMatchObject({
+        status: "confirming",
+        revision: 0,
+        currentLeafId: fixture.leaves[0]!.id,
+        logoRequired: false,
+      });
+      expect(state.builds[0]).toMatchObject({
+        activeTurnId: null,
+        upstreamTaskId: taskId,
+        logoSha256: fixture.logoSha256,
+        logoBytes: fixture.logo.length,
+      });
+      expect(state.turns).toHaveLength(turnCountBeforeRecovery);
+      expect(sourceTaskReads).toBe(1);
+      expect(sourceLogoDownloads).toBe(1);
+    } finally {
+      await Promise.all([
+        close(recoveryDashboardListener.server),
+        close(recoveryUpstreamListener.server),
+      ]);
+      const recoveredLogoStorageKey = state.builds[0]?.logoStorageKey;
+      if (recoveredLogoStorageKey) {
+        const artifactStore = await import("./knowledge-build-artifact-store");
+        await artifactStore.removeKnowledgeBuildArtifact({
+          userId: USER_ID,
+          buildId,
+          generation: 1,
+          kind: "logo",
+          storageKey: recoveredLogoStorageKey,
+        });
+      }
+    }
   });
 
   it("runs all 8 leaves from manifest and Logo through publish, Viewer and immutable ZIP download", async () => {
@@ -1059,7 +1154,7 @@ describe("knowledge-base production final-package acceptance", () => {
     const fixture = await createFinalPackageFixture({
       schemaVersion: 4,
       officialLogoSourcePageUrl: "https://www.frontmind.net/",
-      officialLogoSourceAssetUrl: `${upstreamBaseUrl}/v1/files/file-official-logo/content`,
+      officialLogoSourceAssetUrl: "https://www.frontmind.net/logo-new.svg",
     });
     const countMismatchZip = await JSZip.loadAsync(fixture.archive);
     const countMismatchManifestEntry = Object.values(
@@ -1108,7 +1203,7 @@ describe("knowledge-base production final-package acceptance", () => {
       compression: "STORE",
     });
     expect(rejectedArchive.equals(fixture.archive)).toBe(false);
-    const rejectedLogo = await sharp({
+    const firstAttemptLogo = await sharp({
       create: {
         width: 24,
         height: 24,
@@ -1124,9 +1219,10 @@ describe("knowledge-base production final-package acceptance", () => {
     >();
     let uploadedFileSequence = 0;
     let authoritativeTaskReads = 0;
+    let unusableLogoDownloads = 0;
     let logoDownloads = 0;
     let packageDownloads = 0;
-    let currentLogoBytes = rejectedLogo;
+    let currentLogoBytes = firstAttemptLogo;
     let currentPackageBytes = rejectedArchive;
     let includeFinalPackage = true;
     const uploadedFileBytes = new Map<string, Buffer>();
@@ -1240,11 +1336,6 @@ describe("knowledge-base production final-package acceptance", () => {
           schemaVersion: 2,
           operationId: operationId!,
           turnId: turnId!,
-          officialLogo: {
-            sourceKind: "official_web",
-            sourcePageUrl: "https://www.frontmind.net/",
-            sourceAssetUrl: `${upstreamBaseUrl}/v1/files/file-official-logo/content`,
-          },
           leaves: fixture.leaves.map((leaf) => ({
             id: leaf.id,
             title: leaf.title,
@@ -1265,6 +1356,22 @@ describe("knowledge-base production final-package acceptance", () => {
                 },
               },
             ],
+          },
+          {
+            id: "malformed-logo-output",
+            type: "output_image",
+            file_id: "file-malformed-logo-a",
+            file_url:
+              "https://api.example/v1/files/file-malformed-logo-b/content",
+            file_name: "malformed-logo.png",
+            mime_type: "image/png",
+          },
+          {
+            id: "unusable-logo-output",
+            type: "output_image",
+            file_id: "file-unusable-logo",
+            file_name: "broken-logo.png",
+            mime_type: "image/png",
           },
           {
             id: "official-logo-output",
@@ -1401,6 +1508,12 @@ describe("knowledge-base production final-package acceptance", () => {
             : result.output,
       });
     });
+    upstream.get("/v1/files/file-unusable-logo/content", (req, res) => {
+      unusableLogoDownloads += 1;
+      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      res.setHeader("Content-Type", "image/png");
+      res.send(Buffer.from("not-an-image", "utf8"));
+    });
     upstream.get("/v1/files/file-official-logo/content", (req, res) => {
       logoDownloads += 1;
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
@@ -1518,7 +1631,8 @@ describe("knowledge-base production final-package acceptance", () => {
       logoStorageKey: null,
       logoSha256: null,
     });
-    expect(logoDownloads).toBe(2);
+    expect(logoDownloads).toBe(1);
+    expect(unusableLogoDownloads).toBe(1);
 
     // The provider replaces the same file ID with corrected bytes and a valid
     // first-node body. The rejected candidate must not poison this generation.
@@ -1589,7 +1703,8 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(
       state.nodes.slice(1).every((node) => node.status === "pending"),
     ).toBe(true);
-    expect(logoDownloads).toBe(4);
+    expect(logoDownloads).toBe(2);
+    expect(unusableLogoDownloads).toBe(2);
     expect(startTurn).toMatchObject({
       status: "completed",
       upstreamTaskId: initialTaskId,
@@ -1715,6 +1830,39 @@ describe("knowledge-base production final-package acceptance", () => {
           (candidate) =>
             candidate.clientRequestId === turnRequest.clientRequestId,
         )!;
+        for (
+          let completionPoll = 0;
+          turn.status !== "completed" && completionPoll < 100;
+          completionPoll += 1
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          turn = state.turns.find(
+            (candidate) =>
+              candidate.clientRequestId === turnRequest.clientRequestId,
+          )!;
+        }
+        if (
+          turn.status === "completed" &&
+          result.observation?.interaction?.interactionState !==
+            "ready_to_publish"
+        ) {
+          const completedObservationResponse = await fetch(
+            `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-test-auth": "user",
+              },
+              body: JSON.stringify({
+                conversationId: PUBLIC_CONVERSATION_ID,
+                taskId: TASK_ID,
+              }),
+            },
+          );
+          expect(completedObservationResponse.status).toBe(200);
+          result = await completedObservationResponse.json();
+        }
       }
       expect(turn).toMatchObject({
         operationType: "confirm",
@@ -1882,7 +2030,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
 
     expect(authoritativeTaskReads).toBe(2);
-    expect(logoDownloads).toBe(4);
+    expect(logoDownloads).toBe(2);
     expect(packageDownloads).toBe(1);
     // The Skill is build-scoped and reused once. Every operation gets one
     // operation-bound server input file; the last uses finalization ZIP.

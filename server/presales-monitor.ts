@@ -1,12 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import axios from "axios";
-import { and, eq, isNull } from "drizzle-orm";
+import {
+  and,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 import { json, Router, type Response } from "express";
 import { z } from "zod";
 
 import {
   presalesMonitorRuns,
+  users,
+  websiteProjectDeletionTombstones,
   type InsertPresalesMonitorRun,
   type PresalesMonitorRun,
 } from "../drizzle/schema";
@@ -16,6 +30,11 @@ import {
   getPresalesCredentialById,
   type DecryptedPresalesCredential,
 } from "./presales-service";
+import {
+  assertWebsiteProjectPhysicalDeleteEnabled,
+  lockActiveWebsiteProjectLifecycle,
+  WebsiteProjectInactiveError,
+} from "./website-project-lifecycle";
 
 export const MONITOR_PLATFORMS = [
   "doubao",
@@ -24,8 +43,28 @@ export const MONITOR_PLATFORMS = [
   "baiduai",
   "qianwen",
   "kimi",
+  "chatgpt",
 ] as const;
 export type MonitorPlatform = (typeof MONITOR_PLATFORMS)[number];
+
+const WORKSPACE_MONITOR_PROJECT_PREFIX = "dashboard-brand-tracking-user:";
+
+export function workspaceMonitorProjectId(userId: number) {
+  if (!Number.isInteger(userId) || userId <= 0) {
+    throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+  }
+  return `${WORKSPACE_MONITOR_PROJECT_PREFIX}${userId}`;
+}
+
+function isWorkspaceMonitorProjectId(projectId: string | null | undefined) {
+  return Boolean(projectId?.startsWith(WORKSPACE_MONITOR_PROJECT_PREFIX));
+}
+
+function isWebsiteMonitorProjectId(
+  projectId: string | null | undefined,
+): projectId is string {
+  return Boolean(projectId) && !isWorkspaceMonitorProjectId(projectId);
+}
 
 const UPSTREAM_MONITOR_PLATFORM_IDS: Record<MonitorPlatform, string> = {
   doubao: "doubao",
@@ -34,6 +73,7 @@ const UPSTREAM_MONITOR_PLATFORM_IDS: Record<MonitorPlatform, string> = {
   baiduai: "baiduai",
   qianwen: "qianwen",
   kimi: "kimi",
+  chatgpt: "chatgpt",
 };
 const PUBLIC_MONITOR_PLATFORM_IDS = new Map(
   Object.entries(UPSTREAM_MONITOR_PLATFORM_IDS).map(
@@ -81,6 +121,16 @@ const POLLABLE_LOCAL_STATUSES = new Set<PresalesMonitorRun["status"]>([
   "submitted",
   "polling",
 ]);
+const TERMINAL_LOCAL_STATUSES = new Set<PresalesMonitorRun["status"]>([
+  "completed",
+  "partial_review_required",
+  "remote_failed",
+  "shape_mismatch",
+]);
+// Provider submission is bounded by MONITOR_HTTP_TIMEOUT_MS. Keep the local
+// reservation for an additional full timeout so project deletion never drops
+// the only retry target while a normal submit request can still return.
+const MONITOR_SUBMISSION_DELETE_GRACE_MS = MONITOR_HTTP_TIMEOUT_MS * 2;
 
 const monitorCreateSchema = z
   .object({
@@ -93,6 +143,13 @@ const monitorCreateSchema = z
         message: "platforms must not contain duplicates",
       }),
     idempotencyKey: z.string().trim().min(16).max(512),
+    projectId: z
+      .string()
+      .trim()
+      .min(8)
+      .max(80)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/)
+      .optional(),
   })
   .strict();
 
@@ -154,6 +211,7 @@ export type PublicMonitorRecord = {
 export type PublicMonitorRun = {
   runId: string;
   status: PresalesMonitorRun["status"];
+  createdAt: string;
   question: string;
   platforms: MonitorPlatform[];
   repeatPerPlatform: 5;
@@ -201,6 +259,10 @@ export interface MonitorTransport {
     taskId: string,
     credential: DecryptedPresalesCredential,
   ): Promise<unknown>;
+  stop(
+    taskId: string,
+    credential: DecryptedPresalesCredential,
+  ): Promise<unknown>;
 }
 
 export type MonitorReservation =
@@ -212,19 +274,43 @@ export type MonitorPollLease = {
   leaseId: string;
 };
 
+export type WorkspaceMonitorQuotaWindow = {
+  userId: number;
+  windowStartedAt: Date;
+  windowEndsAt: Date;
+};
+
+export type WorkspaceMonitorQuotaUsage = {
+  limit: number | null;
+  used: number;
+};
+
 export interface MonitorRepository {
   reserve(input: {
+    projectId?: string;
     idempotencyKeyHash: string;
     requestHash: string;
+    compatibleRequestHashes?: readonly string[];
     credential: DecryptedPresalesCredential;
     question: string;
     platforms: MonitorPlatform[];
     expectedItems: number;
     now: Date;
+    workspaceQuota?: WorkspaceMonitorQuotaWindow;
   }): Promise<MonitorReservation>;
   get(runId: string): Promise<PresalesMonitorRun | null>;
+  getLatestByProject(projectId: string): Promise<PresalesMonitorRun | null>;
+  getWorkspaceQuota(
+    input: WorkspaceMonitorQuotaWindow,
+  ): Promise<WorkspaceMonitorQuotaUsage | null>;
   markSubmissionUnknown(
     runId: string,
+    error: string,
+    now: Date,
+  ): Promise<PresalesMonitorRun>;
+  markSubmissionCleanupPending(
+    runId: string,
+    upstreamTaskId: string,
     error: string,
     now: Date,
   ): Promise<PresalesMonitorRun>;
@@ -622,12 +708,14 @@ export function buildMonitorSubmitPayload(input: {
 }
 
 function requestHash(input: {
+  projectId?: string;
   question: string;
   platforms: readonly MonitorPlatform[];
 }) {
   return sha256(
     canonicalJson({
       schema: "frontmind-presales-monitor-v1",
+      projectId: input.projectId ?? null,
       payload: buildMonitorSubmitPayload(input),
     }),
   );
@@ -1869,6 +1957,7 @@ function publicMonitorRun(
   return {
     runId: run.id,
     status: run.status,
+    createdAt: run.createdAt.toISOString(),
     question: run.question,
     platforms,
     repeatPerPlatform: MONITOR_REPEAT_PER_PLATFORM,
@@ -1931,6 +2020,142 @@ async function requireDb() {
   return db;
 }
 
+async function assertMonitorProjectActive(tx: any, projectId: string) {
+  try {
+    await lockActiveWebsiteProjectLifecycle(tx, projectId);
+  } catch (error) {
+    if (!(error instanceof WebsiteProjectInactiveError)) throw error;
+    throw new PresalesMonitorError(
+      "PROJECT_DELETED",
+      410,
+      "项目已进入永久删除流程，不能再创建监控任务",
+    );
+  }
+}
+
+type WorkspaceQuotaAccount = {
+  id: number;
+  limit: number | null;
+};
+
+async function loadWorkspaceQuotaAccount(
+  executor: any,
+  userId: number,
+  lock: boolean,
+): Promise<WorkspaceQuotaAccount | null> {
+  const query = executor
+    .select({
+      id: users.id,
+      role: users.role,
+      marketEdition: users.marketEdition,
+      isActive: users.isActive,
+      limit: users.brandTrackingMonthlyLimit,
+    })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  const rows = lock ? await query.for("update") : await query;
+  const row = rows[0] as
+    | {
+        id: number;
+        role: string;
+        marketEdition: string;
+        isActive: boolean;
+        limit: number | null;
+      }
+    | undefined;
+  if (
+    !row ||
+    row.role !== "user" ||
+    row.marketEdition !== "overseas" ||
+    row.isActive !== true
+  ) {
+    return null;
+  }
+  const limit = row.limit === null ? null : Number(row.limit);
+  if (limit !== null && (!Number.isInteger(limit) || limit < 0)) {
+    throw new PresalesMonitorError(
+      "DATABASE_UNAVAILABLE",
+      503,
+      "品牌追踪额度配置无效",
+    );
+  }
+  return { id: Number(row.id), limit };
+}
+
+function billedWorkspaceRunWhere(
+  projectId: string,
+  window: Pick<WorkspaceMonitorQuotaWindow, "windowStartedAt" | "windowEndsAt">,
+) {
+  return and(
+    eq(presalesMonitorRuns.projectId, projectId),
+    gte(presalesMonitorRuns.createdAt, window.windowStartedAt),
+    lt(presalesMonitorRuns.createdAt, window.windowEndsAt),
+    // An explicit provider rejection with no task identity is not billable.
+    // Ambiguous submissions remain reserved because the provider may have
+    // accepted them before the response was lost.
+    or(
+      ne(presalesMonitorRuns.status, "remote_failed"),
+      isNotNull(presalesMonitorRuns.upstreamTaskId),
+    ),
+  );
+}
+
+async function readWorkspaceMonitorUsed(
+  executor: any,
+  projectId: string,
+  window: Pick<WorkspaceMonitorQuotaWindow, "windowStartedAt" | "windowEndsAt">,
+  lock = false,
+) {
+  let used: number;
+  if (lock) {
+    // This is deliberately a locking row read rather than an aggregate
+    // consistent-snapshot read. The users row is locked first, so every
+    // workspace reservation observes the preceding committed reservation even
+    // under MySQL REPEATABLE READ.
+    const rows = await executor
+      .select({ expectedItems: presalesMonitorRuns.expectedItems })
+      .from(presalesMonitorRuns)
+      .where(billedWorkspaceRunWhere(projectId, window))
+      .for("update");
+    used = rows.reduce(
+      (sum: number, row: { expectedItems: number }) =>
+        sum + Number(row.expectedItems),
+      0,
+    );
+  } else {
+    const rows = await executor
+      .select({
+        used: sql<number>`coalesce(sum(${presalesMonitorRuns.expectedItems}), 0)`,
+      })
+      .from(presalesMonitorRuns)
+      .where(billedWorkspaceRunWhere(projectId, window));
+    used = Number(rows[0]?.used ?? 0);
+  }
+  if (!Number.isSafeInteger(used) || used < 0) {
+    throw new PresalesMonitorError(
+      "DATABASE_UNAVAILABLE",
+      503,
+      "品牌追踪额度使用量无效",
+    );
+  }
+  return used;
+}
+
+export function assertWorkspaceMonitorQuotaAvailable(input: {
+  limit: number | null;
+  used: number;
+  expectedItems: number;
+}) {
+  if (input.limit !== null && input.used + input.expectedItems > input.limit) {
+    throw new PresalesMonitorError(
+      "MONITOR_QUOTA_EXCEEDED",
+      429,
+      `本月品牌追踪额度不足，本次需要 ${input.expectedItems} 次，当前剩余 ${Math.max(0, input.limit - input.used)} 次`,
+    );
+  }
+}
+
 export class DrizzleMonitorRepository implements MonitorRepository {
   async reserve(
     input: Parameters<MonitorRepository["reserve"]>[0],
@@ -1938,6 +2163,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
     const db = await requireDb();
     const run: InsertPresalesMonitorRun = {
       id: randomUUID(),
+      projectId: input.projectId ?? null,
       idempotencyKeyHash: input.idempotencyKeyHash,
       requestHash: input.requestHash,
       apiCredentialId: input.credential.id,
@@ -1953,8 +2179,18 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       createdAt: input.now,
       updatedAt: input.now,
     };
+    if (input.workspaceQuota) {
+      return this.reserveWorkspace(db, input, run);
+    }
     try {
-      await db.insert(presalesMonitorRuns).values(run);
+      if (input.projectId) {
+        await db.transaction(async (tx: any) => {
+          await assertMonitorProjectActive(tx, input.projectId!);
+          await tx.insert(presalesMonitorRuns).values(run);
+        });
+      } else {
+        await db.insert(presalesMonitorRuns).values(run);
+      }
       const inserted = await this.get(run.id);
       if (!inserted) throw new Error("Inserted monitor run was not found");
       return { state: "acquired", run: inserted };
@@ -1962,6 +2198,9 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       if (!isMonitorDuplicateReservationError(error)) throw error;
     }
     return db.transaction(async (tx: any) => {
+      if (input.projectId) {
+        await assertMonitorProjectActive(tx, input.projectId);
+      }
       const existing = await tx
         .select()
         .from(presalesMonitorRuns)
@@ -1979,12 +2218,35 @@ export class DrizzleMonitorRepository implements MonitorRepository {
           1_000,
         );
       }
-      if (row.requestHash !== input.requestHash) {
+      const legacyProjectBinding =
+        row.projectId === null &&
+        Boolean(input.projectId) &&
+        row.requestHash !== input.requestHash &&
+        (input.compatibleRequestHashes ?? []).includes(row.requestHash);
+      if (row.requestHash !== input.requestHash && !legacyProjectBinding) {
         throw new PresalesMonitorError(
           "IDEMPOTENCY_CONFLICT",
           409,
           "该幂等键已绑定另一组监控问题或平台",
         );
+      }
+      if (
+        row.projectId &&
+        input.projectId &&
+        row.projectId !== input.projectId
+      ) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_CONFLICT",
+          409,
+          "该幂等键已绑定另一项目",
+        );
+      }
+      if (legacyProjectBinding) {
+        await tx
+          .update(presalesMonitorRuns)
+          .set({ projectId: input.projectId, updatedAt: input.now })
+          .where(eq(presalesMonitorRuns.id, row.id));
+        row.projectId = input.projectId ?? null;
       }
       if (row.deletedAt) {
         throw new PresalesMonitorError(
@@ -2029,6 +2291,176 @@ export class DrizzleMonitorRepository implements MonitorRepository {
     });
   }
 
+  private async reserveWorkspace(
+    db: any,
+    input: Parameters<MonitorRepository["reserve"]>[0],
+    run: InsertPresalesMonitorRun,
+  ): Promise<MonitorReservation> {
+    const quota = input.workspaceQuota!;
+    const projectId = workspaceMonitorProjectId(quota.userId);
+    if (input.projectId !== projectId) {
+      throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+    }
+
+    const reserve = () =>
+      db.transaction(async (tx: any): Promise<MonitorReservation> => {
+        // The account row is the per-workspace quota mutex and must be the
+        // transaction's first database read. This prevents a prior transaction
+        // from becoming invisible through a REPEATABLE READ snapshot.
+        const account = await loadWorkspaceQuotaAccount(tx, quota.userId, true);
+        if (!account) {
+          throw new PresalesMonitorError(
+            "NOT_FOUND",
+            404,
+            "当前账号无法使用品牌追踪",
+          );
+        }
+        const existingRows = await tx
+          .select()
+          .from(presalesMonitorRuns)
+          .where(
+            eq(
+              presalesMonitorRuns.idempotencyKeyHash,
+              input.idempotencyKeyHash,
+            ),
+          )
+          .limit(1)
+          .for("update");
+        const existing = existingRows[0] as PresalesMonitorRun | undefined;
+        if (existing) {
+          return this.resolveWorkspaceReservationReplay(
+            tx,
+            input,
+            existing,
+            account,
+          );
+        }
+        const used = await readWorkspaceMonitorUsed(tx, projectId, quota, true);
+        assertWorkspaceMonitorQuotaAvailable({
+          limit: account.limit,
+          used,
+          expectedItems: input.expectedItems,
+        });
+        await tx.insert(presalesMonitorRuns).values(run);
+        return {
+          state: "acquired",
+          run: run as PresalesMonitorRun,
+        };
+      });
+
+    try {
+      return await reserve();
+    } catch (error) {
+      if (!isMonitorDuplicateReservationError(error)) throw error;
+      // A same-key concurrent transaction won the unique insert. Re-enter the
+      // transaction and resolve it as a replay; no second quota reservation or
+      // provider POST is allowed.
+      return db.transaction(async (tx: any): Promise<MonitorReservation> => {
+        const account = await loadWorkspaceQuotaAccount(tx, quota.userId, true);
+        if (!account) {
+          throw new PresalesMonitorError(
+            "NOT_FOUND",
+            404,
+            "当前账号无法使用品牌追踪",
+          );
+        }
+        const rows = await tx
+          .select()
+          .from(presalesMonitorRuns)
+          .where(
+            eq(
+              presalesMonitorRuns.idempotencyKeyHash,
+              input.idempotencyKeyHash,
+            ),
+          )
+          .limit(1)
+          .for("update");
+        const existing = rows[0] as PresalesMonitorRun | undefined;
+        if (!existing) {
+          throw new PresalesMonitorError(
+            "IDEMPOTENCY_PENDING",
+            425,
+            "监控幂等预留正在建立，请稍后重试",
+            1_000,
+          );
+        }
+        return this.resolveWorkspaceReservationReplay(
+          tx,
+          input,
+          existing,
+          account,
+        );
+      });
+    }
+  }
+
+  private async resolveWorkspaceReservationReplay(
+    tx: any,
+    input: Parameters<MonitorRepository["reserve"]>[0],
+    row: PresalesMonitorRun,
+    account: WorkspaceQuotaAccount,
+  ): Promise<MonitorReservation> {
+    const quota = input.workspaceQuota!;
+    const projectId = workspaceMonitorProjectId(quota.userId);
+    if (row.projectId !== projectId) {
+      throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+    }
+    if (row.requestHash !== input.requestHash) {
+      throw new PresalesMonitorError(
+        "IDEMPOTENCY_CONFLICT",
+        409,
+        "该幂等键已绑定另一组监控问题或平台",
+      );
+    }
+    if (row.deletedAt) {
+      throw new PresalesMonitorError(
+        "IDEMPOTENCY_RETIRED",
+        409,
+        "该幂等键对应的监控任务已删除，不能再次用于付费提交",
+      );
+    }
+    const credentialChanged =
+      row.apiCredentialId !== input.credential.id ||
+      row.credentialVersion !== input.credential.version;
+    if (
+      credentialChanged &&
+      row.status === "remote_failed" &&
+      !row.upstreamTaskId
+    ) {
+      const used = await readWorkspaceMonitorUsed(tx, projectId, quota, true);
+      assertWorkspaceMonitorQuotaAvailable({
+        limit: account.limit,
+        used,
+        expectedItems: input.expectedItems,
+      });
+      const retryPatch: Partial<InsertPresalesMonitorRun> = {
+        apiCredentialId: input.credential.id,
+        credentialVersion: input.credential.version,
+        status: "submission_in_progress",
+        lastError: null,
+        completedAt: null,
+        createdAt: input.now,
+        updatedAt: input.now,
+      };
+      await tx
+        .update(presalesMonitorRuns)
+        .set(retryPatch)
+        .where(eq(presalesMonitorRuns.id, row.id));
+      return {
+        state: "acquired",
+        run: { ...row, ...retryPatch } as PresalesMonitorRun,
+      };
+    }
+    if (credentialChanged) {
+      throw new PresalesMonitorError(
+        "IDEMPOTENCY_CONFLICT",
+        409,
+        "该幂等键已绑定另一监控凭据版本",
+      );
+    }
+    return { state: "replay", run: row };
+  }
+
   async get(runId: string) {
     const db = await requireDb();
     const rows = await db
@@ -2044,12 +2476,63 @@ export class DrizzleMonitorRepository implements MonitorRepository {
     return rows[0] ?? null;
   }
 
+  async getLatestByProject(projectId: string) {
+    const db = await requireDb();
+    const rows = await db
+      .select()
+      .from(presalesMonitorRuns)
+      .where(
+        and(
+          eq(presalesMonitorRuns.projectId, projectId),
+          isNull(presalesMonitorRuns.deletedAt),
+        ),
+      )
+      .orderBy(
+        desc(presalesMonitorRuns.createdAt),
+        desc(presalesMonitorRuns.id),
+      )
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async getWorkspaceQuota(input: WorkspaceMonitorQuotaWindow) {
+    const db = await requireDb();
+    const account = await loadWorkspaceQuotaAccount(db, input.userId, false);
+    if (!account) return null;
+    return {
+      limit: account.limit,
+      used: await readWorkspaceMonitorUsed(
+        db,
+        workspaceMonitorProjectId(input.userId),
+        input,
+      ),
+    };
+  }
+
   async markSubmissionUnknown(runId: string, error: string, now: Date) {
     return this.updateAndRead(runId, {
       status: "submission_unknown",
       lastError: error,
       updatedAt: now,
     });
+  }
+
+  async markSubmissionCleanupPending(
+    runId: string,
+    upstreamTaskId: string,
+    error: string,
+    now: Date,
+  ) {
+    return this.updateAndRead(
+      runId,
+      {
+        status: "submission_unknown",
+        upstreamTaskId,
+        lastError: error,
+        updatedAt: now,
+      },
+      true,
+    );
   }
 
   async markSubmissionRejected(runId: string, error: string, now: Date) {
@@ -2080,7 +2563,15 @@ export class DrizzleMonitorRepository implements MonitorRepository {
 
   async acquirePoll(runId: string, now: Date) {
     const db = await requireDb();
+    const binding = await db
+      .select({ projectId: presalesMonitorRuns.projectId })
+      .from(presalesMonitorRuns)
+      .where(eq(presalesMonitorRuns.id, runId))
+      .limit(1);
     return db.transaction(async (tx: any) => {
+      if (isWebsiteMonitorProjectId(binding[0]?.projectId)) {
+        await assertMonitorProjectActive(tx, binding[0].projectId);
+      }
       const rows = await tx
         .select()
         .from(presalesMonitorRuns)
@@ -2093,6 +2584,14 @@ export class DrizzleMonitorRepository implements MonitorRepository {
         .limit(1)
         .for("update");
       const run = rows[0] as PresalesMonitorRun | undefined;
+      if (run?.projectId && run.projectId !== binding[0]?.projectId) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_PENDING",
+          425,
+          "监控项目归属刚刚更新，请稍后重试",
+          1_000,
+        );
+      }
       if (
         !run ||
         !POLLABLE_LOCAL_STATUSES.has(run.status) ||
@@ -2141,59 +2640,166 @@ export class DrizzleMonitorRepository implements MonitorRepository {
     patch: Partial<InsertPresalesMonitorRun>,
   ) {
     const db = await requireDb();
-    await db
-      .update(presalesMonitorRuns)
-      .set({
-        ...patch,
-        pollLeaseId: null,
-        pollLeaseExpiresAt: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(presalesMonitorRuns.id, runId),
-          eq(presalesMonitorRuns.pollLeaseId, leaseId),
-          isNull(presalesMonitorRuns.deletedAt),
-        ),
-      );
-    const run = await this.get(runId);
-    if (!run)
-      throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
-    return run;
+    const binding = await db
+      .select({ projectId: presalesMonitorRuns.projectId })
+      .from(presalesMonitorRuns)
+      .where(eq(presalesMonitorRuns.id, runId))
+      .limit(1);
+    return db.transaction(async (tx: any) => {
+      if (isWebsiteMonitorProjectId(binding[0]?.projectId)) {
+        await assertMonitorProjectActive(tx, binding[0].projectId);
+      }
+      const rows = await tx
+        .select()
+        .from(presalesMonitorRuns)
+        .where(eq(presalesMonitorRuns.id, runId))
+        .limit(1)
+        .for("update");
+      const current = rows[0] as PresalesMonitorRun | undefined;
+      if (!current) {
+        throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+      }
+      if (current.projectId && current.projectId !== binding[0]?.projectId) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_PENDING",
+          425,
+          "监控项目归属刚刚更新，请稍后重试",
+          1_000,
+        );
+      }
+      await tx
+        .update(presalesMonitorRuns)
+        .set({
+          ...patch,
+          pollLeaseId: null,
+          pollLeaseExpiresAt: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(presalesMonitorRuns.id, runId),
+            eq(presalesMonitorRuns.pollLeaseId, leaseId),
+            isNull(presalesMonitorRuns.deletedAt),
+          ),
+        );
+      const updated = await tx
+        .select()
+        .from(presalesMonitorRuns)
+        .where(eq(presalesMonitorRuns.id, runId))
+        .limit(1);
+      return updated[0]!;
+    });
   }
 
   async remove(runId: string) {
     const db = await requireDb();
-    await db
-      .update(presalesMonitorRuns)
-      .set({
-        deletedAt: new Date(),
-        pollLeaseId: null,
-        pollLeaseExpiresAt: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(presalesMonitorRuns.id, runId),
-          isNull(presalesMonitorRuns.deletedAt),
-        ),
-      );
-    return true;
+    const binding = await db
+      .select({ projectId: presalesMonitorRuns.projectId })
+      .from(presalesMonitorRuns)
+      .where(eq(presalesMonitorRuns.id, runId))
+      .limit(1);
+    return db.transaction(async (tx: any) => {
+      if (isWebsiteMonitorProjectId(binding[0]?.projectId)) {
+        await assertMonitorProjectActive(tx, binding[0].projectId);
+      }
+      const rows = await tx
+        .select({ projectId: presalesMonitorRuns.projectId })
+        .from(presalesMonitorRuns)
+        .where(eq(presalesMonitorRuns.id, runId))
+        .limit(1)
+        .for("update");
+      if (rows[0]?.projectId && rows[0].projectId !== binding[0]?.projectId) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_PENDING",
+          425,
+          "监控项目归属刚刚更新，请稍后重试",
+          1_000,
+        );
+      }
+      await tx
+        .update(presalesMonitorRuns)
+        .set({
+          deletedAt: new Date(),
+          pollLeaseId: null,
+          pollLeaseExpiresAt: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(presalesMonitorRuns.id, runId),
+            isNull(presalesMonitorRuns.deletedAt),
+          ),
+        );
+      return true;
+    });
   }
 
   private async updateAndRead(
     runId: string,
     patch: Partial<InsertPresalesMonitorRun>,
+    allowInactiveCleanup = false,
   ) {
     const db = await requireDb();
-    await db
-      .update(presalesMonitorRuns)
-      .set(patch)
-      .where(eq(presalesMonitorRuns.id, runId));
-    const run = await this.get(runId);
-    if (!run)
-      throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
-    return run;
+    const binding = await db
+      .select({ projectId: presalesMonitorRuns.projectId })
+      .from(presalesMonitorRuns)
+      .where(eq(presalesMonitorRuns.id, runId))
+      .limit(1);
+    return db.transaction(async (tx: any) => {
+      if (isWebsiteMonitorProjectId(binding[0]?.projectId)) {
+        if (allowInactiveCleanup) {
+          const lifecycle = await tx
+            .select({ status: websiteProjectDeletionTombstones.status })
+            .from(websiteProjectDeletionTombstones)
+            .where(
+              eq(
+                websiteProjectDeletionTombstones.projectId,
+                binding[0].projectId,
+              ),
+            )
+            .limit(1)
+            .for("update");
+          if (!lifecycle[0]) {
+            await assertMonitorProjectActive(tx, binding[0].projectId);
+          }
+        } else {
+          await assertMonitorProjectActive(tx, binding[0].projectId);
+        }
+      }
+      const rows = await tx
+        .select()
+        .from(presalesMonitorRuns)
+        .where(
+          and(
+            eq(presalesMonitorRuns.id, runId),
+            isNull(presalesMonitorRuns.deletedAt),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const current = rows[0] as PresalesMonitorRun | undefined;
+      if (!current) {
+        throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+      }
+      if (current.projectId && current.projectId !== binding[0]?.projectId) {
+        throw new PresalesMonitorError(
+          "IDEMPOTENCY_PENDING",
+          425,
+          "监控项目归属刚刚更新，请稍后重试",
+          1_000,
+        );
+      }
+      await tx
+        .update(presalesMonitorRuns)
+        .set(patch)
+        .where(
+          and(
+            eq(presalesMonitorRuns.id, runId),
+            isNull(presalesMonitorRuns.deletedAt),
+          ),
+        );
+      return { ...current, ...patch } as PresalesMonitorRun;
+    });
   }
 }
 
@@ -2247,7 +2853,7 @@ export function buildMonitorRequestUrl(
 
 export class AxiosMonitorTransport implements MonitorTransport {
   private async request(
-    method: "POST" | "GET",
+    method: "POST" | "GET" | "PUT",
     path: string,
     credential: DecryptedPresalesCredential,
     payload?: unknown,
@@ -2261,7 +2867,7 @@ export class AxiosMonitorTransport implements MonitorTransport {
         headers: {
           Authorization: `Bearer ${credential.apiKey}`,
           Accept: "application/json",
-          ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+          ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
         },
         timeout: MONITOR_HTTP_TIMEOUT_MS,
         maxRedirects: 0,
@@ -2284,13 +2890,21 @@ export class AxiosMonitorTransport implements MonitorTransport {
       credential.apiKey,
       `监控接口返回 HTTP ${response.status}`,
     );
+    const stopAlreadyTerminal =
+      method === "PUT" &&
+      (response.status === 404 ||
+        /(?:completed|finished|stopped|not found|已完成|已结束|已停止|不存在)/iu.test(
+          message,
+        ));
     if (response.status < 200 || response.status >= 300) {
+      if (stopAlreadyTerminal) return { success: true, alreadyTerminal: true };
       throw new MonitorRemoteError(
         message,
         [408, 425, 429, 500, 502, 503, 504].includes(response.status),
       );
     }
     if (!isRecord(response.data) || response.data.success !== true) {
+      if (stopAlreadyTerminal) return { success: true, alreadyTerminal: true };
       // A malformed/empty or generic failure response does not prove that a
       // POST was rejected: the provider may have accepted it before losing
       // the response envelope. Only a credential rejection with no task
@@ -2325,6 +2939,181 @@ export class AxiosMonitorTransport implements MonitorTransport {
       credential,
     );
   }
+
+  stop(taskId: string, credential: DecryptedPresalesCredential) {
+    return this.request(
+      "PUT",
+      `/task/${encodeURIComponent(taskId)}/stop`,
+      credential,
+    );
+  }
+}
+
+type MonitorPurgeTarget = Pick<
+  PresalesMonitorRun,
+  | "id"
+  | "projectId"
+  | "apiCredentialId"
+  | "credentialVersion"
+  | "status"
+  | "upstreamTaskId"
+  | "createdAt"
+>;
+
+function monitorPurgeWhere(projectId: string, runIds: readonly string[]) {
+  return runIds.length > 0
+    ? inArray(presalesMonitorRuns.id, [...runIds])
+    : eq(presalesMonitorRuns.projectId, projectId);
+}
+
+async function lockMonitorProjectDeletion(tx: any, projectId: string) {
+  const lifecycle = await tx
+    .select({ status: websiteProjectDeletionTombstones.status })
+    .from(websiteProjectDeletionTombstones)
+    .where(eq(websiteProjectDeletionTombstones.projectId, projectId))
+    .limit(1)
+    .for("update");
+  if (!lifecycle[0] || lifecycle[0].status === "active") {
+    throw new PresalesMonitorError(
+      "PROJECT_NOT_DELETING",
+      409,
+      "项目尚未进入永久删除流程",
+    );
+  }
+}
+
+function assertMonitorPurgeOwnership(
+  projectId: string,
+  rows: readonly MonitorPurgeTarget[],
+) {
+  if (rows.some((row) => row.projectId && row.projectId !== projectId)) {
+    throw new PresalesMonitorError(
+      "MONITOR_PROJECT_CONFLICT",
+      409,
+      "监控任务属于另一个项目",
+    );
+  }
+}
+
+function monitorSubmissionStillInFlight(row: MonitorPurgeTarget, now: Date) {
+  return (
+    !row.upstreamTaskId &&
+    !TERMINAL_LOCAL_STATUSES.has(row.status) &&
+    row.createdAt.getTime() + MONITOR_SUBMISSION_DELETE_GRACE_MS > now.getTime()
+  );
+}
+
+/**
+ * Stops every known non-terminal provider task before physically deleting its
+ * local project row. Explicit run IDs cover legacy rows created before the
+ * projectId lineage column existed; a row already owned by another project is
+ * never accepted. A fresh submission with no provider ID remains retryable
+ * until its bounded HTTP request window has elapsed.
+ */
+export async function purgePresalesProjectMonitorRuns(
+  input: { projectId: string; runIds?: readonly string[] },
+  options: {
+    executor?: any;
+    transport?: MonitorTransport;
+    credentialById?: (
+      id: string,
+    ) => Promise<DecryptedPresalesCredential | null>;
+    now?: () => Date;
+  } = {},
+) {
+  assertWebsiteProjectPhysicalDeleteEnabled();
+  const db = options.executor ?? (await requireDb());
+  const transport = options.transport ?? new AxiosMonitorTransport();
+  const credentialById = options.credentialById ?? getMonitorCredentialById;
+  const now = options.now ?? (() => new Date());
+  const runIds = [...new Set(input.runIds ?? [])];
+  const snapshot = await db.transaction(async (tx: any) => {
+    await lockMonitorProjectDeletion(tx, input.projectId);
+    const rows = (await tx
+      .select({
+        id: presalesMonitorRuns.id,
+        projectId: presalesMonitorRuns.projectId,
+        apiCredentialId: presalesMonitorRuns.apiCredentialId,
+        credentialVersion: presalesMonitorRuns.credentialVersion,
+        status: presalesMonitorRuns.status,
+        upstreamTaskId: presalesMonitorRuns.upstreamTaskId,
+        createdAt: presalesMonitorRuns.createdAt,
+      })
+      .from(presalesMonitorRuns)
+      .where(monitorPurgeWhere(input.projectId, runIds))
+      .for("update")) as MonitorPurgeTarget[];
+    assertMonitorPurgeOwnership(input.projectId, rows);
+    return rows;
+  });
+
+  const stopped = new Set<string>();
+  for (const row of snapshot) {
+    if (!row.upstreamTaskId) continue;
+    const credential = await credentialById(row.apiCredentialId);
+    if (!credential || credential.version !== row.credentialVersion) {
+      throw new PresalesMonitorError(
+        "MONITOR_CREDENTIAL_UNAVAILABLE",
+        503,
+        "监控任务的 API Key 版本不可用，无法停止上游任务",
+      );
+    }
+    try {
+      await transport.stop(row.upstreamTaskId, credential);
+    } catch (error) {
+      throw new PresalesMonitorError(
+        "MONITOR_STOP_FAILED",
+        502,
+        error instanceof Error
+          ? safeError(error.message, "上游监控任务停止失败")
+          : "上游监控任务停止失败",
+      );
+    }
+    stopped.add(`${row.id}:${row.upstreamTaskId}`);
+  }
+
+  return db.transaction(async (tx: any) => {
+    await lockMonitorProjectDeletion(tx, input.projectId);
+    const current = (await tx
+      .select({
+        id: presalesMonitorRuns.id,
+        projectId: presalesMonitorRuns.projectId,
+        apiCredentialId: presalesMonitorRuns.apiCredentialId,
+        credentialVersion: presalesMonitorRuns.credentialVersion,
+        status: presalesMonitorRuns.status,
+        upstreamTaskId: presalesMonitorRuns.upstreamTaskId,
+        createdAt: presalesMonitorRuns.createdAt,
+      })
+      .from(presalesMonitorRuns)
+      .where(monitorPurgeWhere(input.projectId, runIds))
+      .for("update")) as MonitorPurgeTarget[];
+    assertMonitorPurgeOwnership(input.projectId, current);
+
+    const deleteIds: string[] = [];
+    let pendingRuns = 0;
+    const currentTime = now();
+    for (const row of current) {
+      if (monitorSubmissionStillInFlight(row, currentTime)) {
+        pendingRuns += 1;
+        continue;
+      }
+      if (
+        row.upstreamTaskId &&
+        !stopped.has(`${row.id}:${row.upstreamTaskId}`)
+      ) {
+        // The provider ID arrived after the initial snapshot. Keep it so the
+        // next idempotent project-delete attempt can stop that exact task.
+        pendingRuns += 1;
+        continue;
+      }
+      deleteIds.push(row.id);
+    }
+    if (deleteIds.length > 0) {
+      await tx
+        .delete(presalesMonitorRuns)
+        .where(inArray(presalesMonitorRuns.id, deleteIds));
+    }
+    return { deletedRuns: deleteIds.length, pendingRuns };
+  });
 }
 
 function redactExactSecret(value: unknown, secret: string, depth = 0): unknown {
@@ -2358,7 +3147,86 @@ export class PresalesMonitorService {
   ) {}
 
   async create(rawInput: unknown) {
-    const input = monitorCreateSchema.parse(rawInput);
+    return this.createMonitor(monitorCreateSchema.parse(rawInput));
+  }
+
+  async createForWorkspace(input: {
+    userId: number;
+    question: string;
+    idempotencyKey: string;
+    reservationAt: Date;
+    windowStartedAt: Date;
+    windowEndsAt: Date;
+  }) {
+    const projectId = workspaceMonitorProjectId(input.userId);
+    const parsed = monitorCreateSchema.parse({
+      question: input.question,
+      platforms: ["chatgpt"],
+      idempotencyKey: input.idempotencyKey,
+      projectId,
+    });
+    const reservationAt = new Date(input.reservationAt.getTime());
+    const windowStartedAt = new Date(input.windowStartedAt.getTime());
+    const windowEndsAt = new Date(input.windowEndsAt.getTime());
+    if (
+      !Number.isFinite(reservationAt.getTime()) ||
+      !Number.isFinite(windowStartedAt.getTime()) ||
+      !Number.isFinite(windowEndsAt.getTime()) ||
+      windowStartedAt.getTime() >= windowEndsAt.getTime() ||
+      reservationAt.getTime() < windowStartedAt.getTime() ||
+      reservationAt.getTime() >= windowEndsAt.getTime()
+    ) {
+      throw new PresalesMonitorError(
+        "INVALID_REQUEST",
+        400,
+        "品牌追踪额度周期或预留时间无效",
+      );
+    }
+    return this.createMonitor(parsed, {
+      reservationAt,
+      workspaceQuota: {
+        userId: input.userId,
+        windowStartedAt,
+        windowEndsAt,
+      },
+    });
+  }
+
+  async getWorkspaceQuota(input: WorkspaceMonitorQuotaWindow) {
+    return this.repository.getWorkspaceQuota(input);
+  }
+
+  async latestForWorkspace(userId: number) {
+    const projectId = workspaceMonitorProjectId(userId);
+    const run = await this.repository.getLatestByProject(projectId);
+    if (!run) return null;
+    if (run.projectId !== projectId) {
+      throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+    }
+    return publicMonitorRun(await this.refreshIfDue(run), true);
+  }
+
+  async getForWorkspace(userId: number, runId: string) {
+    const run = await this.refreshIfDue(
+      await this.requireWorkspaceRun(userId, runId),
+    );
+    return publicMonitorRun(run, false);
+  }
+
+  async resultForWorkspace(userId: number, runId: string) {
+    const run = await this.refreshIfDue(
+      await this.requireWorkspaceRun(userId, runId),
+    );
+    return publicMonitorRun(run, true);
+  }
+
+  private async createMonitor(
+    input: MonitorCreateInput,
+    workspaceContext?: {
+      reservationAt: Date;
+      workspaceQuota: WorkspaceMonitorQuotaWindow;
+    },
+  ) {
     const credential = await this.activeCredential();
     if (!credential) {
       throw new PresalesMonitorError(
@@ -2370,13 +3238,23 @@ export class PresalesMonitorService {
     const platforms = [...input.platforms];
     const expectedItems = platforms.length * MONITOR_REPEAT_PER_PLATFORM;
     const reservation = await this.repository.reserve({
+      projectId: input.projectId,
       idempotencyKeyHash: sha256(input.idempotencyKey),
-      requestHash: requestHash({ question: input.question, platforms }),
+      requestHash: requestHash({
+        projectId: input.projectId,
+        question: input.question,
+        platforms,
+      }),
+      compatibleRequestHashes:
+        input.projectId && !workspaceContext
+          ? [requestHash({ question: input.question, platforms })]
+          : [],
       credential,
       question: input.question,
       platforms,
       expectedItems,
-      now: this.now(),
+      now: workspaceContext?.reservationAt ?? this.now(),
+      workspaceQuota: workspaceContext?.workspaceQuota,
     });
     if (reservation.state === "replay") {
       if (
@@ -2396,21 +3274,14 @@ export class PresalesMonitorService {
       question: input.question,
       platforms,
     });
+    let validated: ReturnType<typeof validateMonitorSubmitResponse>;
     try {
       const response = await this.transport.submit(payload, credential);
-      const validated = validateMonitorSubmitResponse(response, {
+      validated = validateMonitorSubmitResponse(response, {
         question: input.question,
         platforms,
         expectedItems,
       });
-      const run = await this.repository.markSubmitted(reservation.run.id, {
-        upstreamTaskId: validated.taskId,
-        submitTotalItems: validated.totalTask,
-        initialSubtaskIds: validated.initialSubtaskIds,
-        subtaskScopes: validated.subtaskScopes,
-        now: this.now(),
-      });
-      return { replayed: false, run: publicMonitorRun(run, false) };
     } catch (error) {
       const message =
         error instanceof Error
@@ -2439,6 +3310,63 @@ export class PresalesMonitorService {
         "监控任务可能已提交，但无法确认任务 ID；为避免重复计费，系统不会自动重发",
       );
     }
+
+    try {
+      const run = await this.repository.markSubmitted(reservation.run.id, {
+        upstreamTaskId: validated.taskId,
+        submitTotalItems: validated.totalTask,
+        initialSubtaskIds: validated.initialSubtaskIds,
+        subtaskScopes: validated.subtaskScopes,
+        now: this.now(),
+      });
+      return { replayed: false, run: publicMonitorRun(run, false) };
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? safeError(error.message, "监控任务本地登记失败")
+          : "监控任务本地登记失败";
+      try {
+        await this.transport.stop(validated.taskId, credential);
+        try {
+          await this.repository.markSubmissionRejected(
+            reservation.run.id,
+            message,
+            this.now(),
+          );
+        } catch {
+          // A concurrent project purge may already have physically removed
+          // the reservation. The known provider task has still been stopped.
+        }
+        throw new PresalesMonitorError(
+          "PROJECT_DELETED",
+          410,
+          "项目已进入永久删除流程，监控任务已停止",
+        );
+      } catch (stopError) {
+        if (
+          stopError instanceof PresalesMonitorError &&
+          stopError.code === "PROJECT_DELETED"
+        ) {
+          throw stopError;
+        }
+        try {
+          await this.repository.markSubmissionCleanupPending(
+            reservation.run.id,
+            validated.taskId,
+            message,
+            this.now(),
+          );
+        } catch {
+          // The project fence still prevents replay even when the row was
+          // concurrently removed after its bounded submission grace window.
+        }
+        throw new PresalesMonitorError(
+          "MONITOR_STOP_FAILED",
+          502,
+          "监控任务已创建但停止失败，请稍后重试项目删除",
+        );
+      }
+    }
   }
 
   async get(runId: string) {
@@ -2463,6 +3391,14 @@ export class PresalesMonitorService {
     const run = await this.repository.get(runId);
     if (!run)
       throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+    return run;
+  }
+
+  private async requireWorkspaceRun(userId: number, runId: string) {
+    const run = await this.requireRun(runId);
+    if (run.projectId !== workspaceMonitorProjectId(userId)) {
+      throw new PresalesMonitorError("NOT_FOUND", 404, "监控任务不存在");
+    }
     return run;
   }
 

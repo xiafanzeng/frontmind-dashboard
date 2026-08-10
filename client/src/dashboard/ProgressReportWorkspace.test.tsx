@@ -169,6 +169,38 @@ const report = dashboardOptimizationReportSchema.parse({
 });
 
 describe("ProgressReportWorkspace", () => {
+  it("lists confirmed workflow questions while their progress records are still syncing", () => {
+    render(
+      <ProgressReportWorkspace
+        report={null}
+        questionGroups={[
+          {
+            id: "ranking",
+            title: "行业排名词",
+            subtitle: "行业入口与品牌优胜问题",
+            tone: "amber",
+            questions: [
+              {
+                id: "question-pending",
+                question: "企业级 GEO 服务商如何选择？",
+                intent: "说明选择标准",
+                summary: "",
+              },
+            ],
+          },
+        ]}
+      />,
+    );
+
+    expect(
+      screen.getByRole("complementary", { name: "报告问题" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("企业级 GEO 服务商如何选择？")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "尚未发布问题进度报告" }),
+    ).toBeInTheDocument();
+  });
+
   it("switches between the baseline and progress report without inventing shared question data", () => {
     render(<ProgressReportWorkspace report={report} />);
 

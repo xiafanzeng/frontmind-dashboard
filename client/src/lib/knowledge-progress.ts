@@ -98,6 +98,7 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
     generation: Number(source.generation ?? 0),
     authoritativeTaskId,
     activeTurn: source.activeTurn ?? null,
+    completedTurn: source.completedTurn ?? null,
     interaction: { ...interaction, progress },
     approvedPresentation: source.approvedPresentation ?? null,
     package: source.package ?? null,
@@ -238,7 +239,7 @@ export async function getKnowledgeBaseTurnProtocolReminder(
       return [
         "[知识库状态协议]",
         `当前知识库已完成，服务端 revision=${progress.build.revision}。不得重开节点、复用旧 ZIP 或重建知识树。`,
-        "发布后的修改统一进入维护工单，本对话不再生成状态协议信封。",
+        "发布后的修改统一进入维护需求，本对话不再生成状态协议信封。",
       ].join("\n");
     }
     return [

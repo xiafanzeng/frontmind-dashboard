@@ -281,14 +281,26 @@ describe("control-plane overview aggregation", () => {
     expect(
       overview.todos.find((todo) => todo.kind === "customer_configuration")
         ?.href,
-    ).toBe("/admin/customers/10/service");
+    ).toBe("/admin/customers/10/workspace");
+    expect(
+      overview.todos.find(
+        (todo) => todo.kind === "service" && todo.userId === 10,
+      )?.href,
+    ).toBe("/admin/customers/10/workspace");
     expect(
       overview.todos.find(
         (todo) => todo.kind === "credential" && todo.userId === 11,
       )?.href,
-    ).toBe("/admin/customers/11/credential");
+    ).toBe(
+      "/?credentialType=managed_api&credentialUserId=11&credentialKind=customer",
+    );
+    expect(
+      overview.todos.find(
+        (todo) => todo.kind === "knowledge" && todo.userId === 11,
+      )?.href,
+    ).toBe("/admin/customers/11/workspace");
     expect(overview.todos.find((todo) => todo.kind === "task")?.href).toBe(
-      "/admin/customers/10/knowledge",
+      "/admin/customers/10/workspace",
     );
   });
 

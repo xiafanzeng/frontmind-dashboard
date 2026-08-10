@@ -39,7 +39,7 @@ export const MODEL_OPTIONS = [
 export function getModelDisplayName(modelValue: string | undefined): string {
   if (!modelValue) return "FrontMind-Base";
   const found = MODEL_OPTIONS.find((m) => m.value === modelValue);
-  return found ? found.label : modelValue;
+  return found ? found.label : sanitizeBrandText(modelValue);
 }
 
 // Non-sensitive, device-local display preference. API credentials are stored
@@ -117,26 +117,23 @@ export function sanitizeBrandText(text: string): string {
   }
 
   try {
-    const source = ["ma", "nus"].join("");
-    return stripKnowledgeBaseProtocolPayloads(text)
-      .replace(
-        new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"),
-        "https://api.frontmind.",
-      )
-      .replace(
-        new RegExp(`https?:\\/\\/www\\.${source}\\.`, "gi"),
-        "https://www.frontmind.",
-      )
-      .replace(
-        new RegExp(`https?:\\/\\/${source}\\.`, "gi"),
-        "https://frontmind.",
-      )
-      .replace(new RegExp(`\\b${source.toUpperCase()}\\b`, "g"), "FrontMind")
-      .replace(
-        new RegExp(`\\b${source[0].toUpperCase()}${source.slice(1)}\\b`, "g"),
-        "FrontMind",
-      )
-      .replace(new RegExp(`\\b${source}\\b`, "g"), "frontmind");
+    const sourceBrands = [["ma", "nus"].join(""), ["jeno", "va"].join("")];
+    return sourceBrands.reduce((visibleText, source) => {
+      return visibleText
+        .replace(
+          new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"),
+          "https://api.frontmind.",
+        )
+        .replace(
+          new RegExp(`https?:\\/\\/www\\.${source}\\.`, "gi"),
+          "https://www.frontmind.",
+        )
+        .replace(
+          new RegExp(`https?:\\/\\/${source}\\.`, "gi"),
+          "https://frontmind.",
+        )
+        .replace(new RegExp(`\\b${source}\\b`, "gi"), "FrontMind");
+    }, stripKnowledgeBaseProtocolPayloads(text));
   } catch (e) {
     console.error("[sanitizeBrandText] Error:", e);
     return text;
@@ -213,6 +210,8 @@ export interface TaskResponse {
   };
   knowledgeInteraction?: KnowledgeBaseInteractionDto;
   knowledgeObservation?: KnowledgeBaseObservationDto;
+  /** Existing operation adopted after a tab remounted with a new request id. */
+  adoptedClientRequestId?: string;
 }
 
 export interface ResponseLogicTaskContext {
@@ -705,6 +704,7 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
     expectedGeneration: number;
     expectedRevision: number;
     expectedLeafId: string;
+    expectedPresentationKey?: string;
     attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
     resumeExisting?: boolean;
   },
@@ -722,6 +722,7 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
       expectedGeneration: context.expectedGeneration,
       expectedRevision: context.expectedRevision,
       expectedLeafId: context.expectedLeafId,
+      expectedPresentationKey: context.expectedPresentationKey,
       userMessage: buildPromptText(input),
       attachmentManifest: context.attachmentManifest,
       resumeExisting: context.resumeExisting === true,
@@ -811,9 +812,11 @@ export async function createKnowledgeBaseTurnTask(
   context: {
     conversationId: string;
     clientRequestId: string;
+    submissionKind?: "message" | "logo";
     expectedGeneration?: number;
     expectedRevision?: number;
     expectedLeafId?: string;
+    expectedPresentationKey?: string;
     /** Exact browser bytes for upload-first knowledge-base attachments. */
     attachmentManifest?: KnowledgeBaseAttachmentManifestItem[];
     attachmentReservation?: {
@@ -855,6 +858,8 @@ export async function createKnowledgeBaseTurnTask(
             expectedGeneration: context.expectedGeneration,
             expectedRevision: context.expectedRevision,
             expectedLeafId: context.expectedLeafId,
+            expectedPresentationKey: context.expectedPresentationKey,
+            submissionKind: context.submissionKind ?? "message",
             userMessage: buildPromptText(input),
             attachments: extractAttachments(input),
             ...(context.attachmentManifest
@@ -918,9 +923,18 @@ export async function createKnowledgeBaseTurnTask(
       const observation = payload?.observation
         ? knowledgeBaseObservationFromPayload(payload)
         : undefined;
+      const returnedTaskId = data?.id || data?.task_id || "";
+      if (context.submissionKind === "logo" && !returnedTaskId) {
+        throw Object.assign(
+          new Error("Logo 已上传，但服务端尚未返回 Manus 真实任务编号"),
+          {
+            status: 502,
+            code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+          },
+        );
+      }
       const taskId =
-        data?.id ||
-        data?.task_id ||
+        returnedTaskId ||
         observation?.authoritativeTaskId ||
         observation?.activeTurn?.id ||
         (observation
@@ -950,6 +964,8 @@ export async function createKnowledgeBaseTurnTask(
         knowledgeInteraction:
           payload?.observation?.interaction ?? payload?.interaction,
         knowledgeObservation: observation,
+        adoptedClientRequestId:
+          String(payload?.adoptedClientRequestId || "").trim() || undefined,
       };
     }
 
@@ -1297,9 +1313,7 @@ async function uploadFileToUrlViaProxy(
           });
         } catch (error) {
           reject(
-            error instanceof Error
-              ? error
-              : new Error("文件保留期限响应无效"),
+            error instanceof Error ? error : new Error("文件保留期限响应无效"),
           );
         }
       } else {

@@ -513,7 +513,7 @@ export const adminDeliveryTicketPreviewFixtures: AdminDeliveryTicketPreviewFixtu
         id: "event-2",
         visibility: "customer",
         eventType: "status_change",
-        actorLabel: "交付成员",
+        actorLabel: "工程师",
         statusTo: "completed",
         message: "知识库重置已批准并完成清理，可以重新开始首次构建。",
         createdAt: "2026-07-30T22:43:00+08:00",

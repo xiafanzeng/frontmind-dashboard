@@ -7,7 +7,9 @@ export async function recordKnowledgeBaseOutputFiles(input: {
   apiCredentialId: string;
   output: unknown;
 }) {
-  for (const fileId of collectUpstreamOutputFileIds(input.output)) {
+  for (const fileId of collectUpstreamOutputFileIds(input.output, {
+    ignoreInvalidImageResources: true,
+  })) {
     const registration = {
       userId: input.userId,
       apiCredentialId: input.apiCredentialId,

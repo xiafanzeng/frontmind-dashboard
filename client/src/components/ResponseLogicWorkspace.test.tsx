@@ -7,13 +7,28 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("@/components/QuestionMaintenanceRequestDialog", () => ({
+  default: ({ disabled }: { disabled?: boolean }) => (
+    <button type="button" disabled={disabled}>
+      提交应答逻辑修改需求
+    </button>
+  ),
+}));
+
 import ResponseLogicWorkspace, {
   ResponseLogicConfirmationBoard,
   ResponseLogicConfirmationPanel,
   fetchResponseLogicStructuredDraft,
+  isAuthoritativeResponseLogicAssistantMessage,
   isResponseLogicAttachmentExpired,
   mergeResponseLogicAttachmentsIntoDraft,
   parseResponseLogicReply,
+  projectResponseLogicConversationMessage,
+  ResponseLogicTaskStatusError,
+  reconcileResponseLogicDrafts,
+  responseLogicPersistenceAvailability,
+  shouldHydrateResponseLogicTask,
+  shouldUseResponseLogicInitialPrompt,
   useResponseLogicWorkspaceState,
   type IntentQuestionGroup,
 } from "./ResponseLogicWorkspace";
@@ -98,6 +113,8 @@ describe("ResponseLogicWorkspace", () => {
     expect(
       screen.getByRole("heading", { name: "当前周期尚无服务问题" }),
     ).toBeInTheDocument();
+    expect(screen.queryByText("企业资料.pdf")).toBeNull();
+    expect(screen.queryByText("现场 图.png")).toBeNull();
     expect(
       screen.queryByText("FrontMind 超前智能是一家什么样的公司？"),
     ).toBeNull();
@@ -140,7 +157,8 @@ describe("ResponseLogicWorkspace", () => {
         name: "现场照片.png",
         url: "/api/frontmind/v1/files/file%2Fimage%201",
         source: "企业交流上传：现场照片.png",
-        authorization: "待确认",
+        section: "图文依据",
+        authorization: "本次应答可用",
       }),
     ]);
   });
@@ -255,7 +273,7 @@ describe("ResponseLogicWorkspace", () => {
       expect.objectContaining({ credentials: "include" }),
     );
     expect(
-      screen.getByText("企业资料.pdf").closest('[role="button"]'),
+      screen.getByText("用户上传资料").closest('[role="button"]'),
     ).toBeInTheDocument();
     expect(
       document.querySelector('a[href*="/api/frontmind/v1/files/"]'),
@@ -267,10 +285,10 @@ describe("ResponseLogicWorkspace", () => {
     expect(
       screen.getByText("文件已超过 30 天，请重新上传"),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("img", { name: "现场图" })).toBeNull();
+    expect(screen.queryByRole("img", { name: "用户上传图片" })).toBeNull();
   });
 
-  it("maps the dedicated Skill output into the editable response fields", () => {
+  it("maps the four-section Skill output into the editable response fields", () => {
     expect(
       parseResponseLogicReply(`## 用户真实关心
 采购方需要判断方案是否可信。
@@ -279,26 +297,69 @@ describe("ResponseLogicWorkspace", () => {
 先给出结论，再按证据解释。
 
 ## 企业材料/官方依据
-- 企业知识库 V3
-
-## 待补充/待确认
-- 客户案例公开授权
+- 企业定位（来源路径：knowledge_base/company.md）来自已核验资料。
 
 ## 回答边界/禁止表达
-- 不使用绝对化排名
-
-## 引用与核验规则
-- 企业事实确认表.pdf
-
-## 本轮确认
-请确认案例是否可公开。`),
+- 不使用绝对化排名`),
     ).toEqual({
       concern: "采购方需要判断方案是否可信。",
       conclusion: "先给出结论，再按证据解释。",
-      facts: "- 企业知识库 V3",
-      pending: "- 客户案例公开授权",
+      facts: "- 企业定位（引自知识库文档）来自已核验资料。",
+      pending: "",
       boundaries: "- 不使用绝对化排名",
-      references: "- 企业事实确认表.pdf",
+      references: "",
+    });
+  });
+
+  it("accepts an exact legacy five-section reply without retaining references", () => {
+    expect(
+      parseResponseLogicReply(`## 用户真实关心
+采购方需要判断方案是否可信。
+
+## 核心结论/执行口径
+先给出结论。
+
+## 企业材料/官方依据
+- 企业知识库
+
+## 回答边界/禁止表达
+- 不使用绝对化表达
+
+## 引用与核验规则
+- 企业事实表.pdf`),
+    ).toMatchObject({
+      concern: "采购方需要判断方案是否可信。",
+      pending: "",
+      references: "",
+    });
+  });
+
+  it("accepts an exact legacy seven-section reply without retaining confirmation prompts", () => {
+    expect(
+      parseResponseLogicReply(`## 用户真实关心
+采购方需要判断方案是否可信。
+
+## 核心结论/执行口径
+先给出结论。
+
+## 企业材料/官方依据
+- 企业知识库
+
+## 待补充/待确认
+- 授权范围
+
+## 回答边界/禁止表达
+- 不使用绝对化表达
+
+## 引用与核验规则
+- 企业事实表.pdf
+
+## 本轮确认
+请确认。`),
+    ).toMatchObject({
+      concern: "采购方需要判断方案是否可信。",
+      pending: "",
+      references: "",
     });
   });
 
@@ -335,15 +396,224 @@ describe("ResponseLogicWorkspace", () => {
     ).toThrow();
   });
 
+  it("accepts provider-owned file-only outputs and rejects local error bubbles", () => {
+    expect(
+      isAuthoritativeResponseLogicAssistantMessage({
+        id: "output-file",
+        upstreamOutputId: "provider-output-file",
+        role: "assistant",
+        content: "",
+        timestamp: 1,
+        outputFiles: [
+          {
+            fileUrl: "/api/frontmind/v1/files/output-md",
+            fileName: "用户真实关心.md",
+            mimeType: "text/markdown",
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      isAuthoritativeResponseLogicAssistantMessage({
+        id: "provider-text-without-output-id",
+        role: "assistant",
+        content: "服务端返回的应答正文",
+        responseStartedAt: 1,
+        timestamp: 2,
+      }),
+    ).toBe(true);
+    expect(
+      isAuthoritativeResponseLogicAssistantMessage({
+        id: "local-error",
+        role: "assistant",
+        content: "错误：请求未完成，请稍后手动重试。",
+        timestamp: 2,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the live editor mounted while records refresh in the background", () => {
+    expect(
+      responseLogicPersistenceAvailability({
+        isLoading: false,
+        isFetching: true,
+        isSuccess: true,
+        isError: false,
+        hasData: true,
+      }),
+    ).toEqual({ loading: false, ready: true, error: undefined });
+    expect(
+      responseLogicPersistenceAvailability({
+        isLoading: false,
+        isFetching: false,
+        isSuccess: false,
+        isError: true,
+        hasData: true,
+        errorMessage: "后台刷新失败",
+      }),
+    ).toEqual({ loading: false, ready: true, error: undefined });
+  });
+
+  it("projects legacy assistant bubbles without mutating the stored message", () => {
+    const message = {
+      id: "legacy-response",
+      role: "assistant" as const,
+      content: `## 用户真实关心
+查看 FINAL.zip 中的产品信息。
+
+## 核心结论/执行口径
+核心产品见 knowledge_base/products/3.2.md。
+
+## 企业材料/官方依据
+来源文件：FINAL.zip；平台支持 200 个模型。
+
+## 待补充/待确认
+请确认图片权限。
+
+## 回答边界/禁止表达
+不使用绝对排名。
+
+## 引用与核验规则
+引用文档：products/3.2.md
+
+## 本轮确认
+是否公开图片？`,
+      outputFiles: [
+        {
+          fileUrl: "/api/files/internal-products.md",
+          fileName: "internal-products.md",
+          mimeType: "text/markdown",
+        },
+      ],
+      stepGroups: [
+        {
+          id: "step-group",
+          title: "读取 knowledge_base/products/3.2.md",
+          description: "核验 FINAL.zip",
+          steps: [
+            {
+              id: "step",
+              type: "reasoning",
+              label: "分析 sources/private.json",
+              details: "保留 AI/ML 事实",
+            },
+          ],
+        },
+      ],
+      timestamp: 1,
+    };
+
+    const projected = projectResponseLogicConversationMessage(message);
+
+    expect(projected).not.toBe(message);
+    expect(projected.content).toContain("平台支持 200 个模型");
+    expect(projected.content).toContain("引自知识库文档");
+    expect(projected.content).not.toContain("引用与核验规则");
+    expect(projected.content).not.toMatch(
+      /FINAL\.zip|knowledge_base|待补充\/待确认|本轮确认/u,
+    );
+    expect(projected.outputFiles?.[0]?.fileName).toBe("模型输出资料.md");
+    expect(projected.stepGroups?.[0]?.title).toBe("读取 知识库文档");
+    expect(projected.stepGroups?.[0]?.description).toBe("核验 知识库文档");
+    expect(projected.stepGroups?.[0]?.steps[0]?.label).toBe("分析 知识库文档");
+    expect(projected.stepGroups?.[0]?.steps[0]?.details).toBe(
+      "保留 AI/ML 事实",
+    );
+    expect(message.content).toContain("FINAL.zip");
+  });
+
+  it("preserves an unsaved draft on refresh and removes it after an external reset", () => {
+    const serverDraft = {
+      concern: "服务端原始内容",
+      conclusion: "结论",
+      facts: "事实",
+      pending: "待补充",
+      boundaries: "边界",
+      references: "引用",
+      images: [],
+      attachments: [],
+    };
+    const localDraft = { ...serverDraft, concern: "尚未保存的本地修改" };
+    const record = {
+      id: "record-1",
+      questionId: "question-1",
+      groupId: "group-1",
+      groupTitle: "产品场景",
+      question: "硅基流动有什么核心产品？",
+      intent: "了解产品线",
+      summary: "基于企业事实回答",
+      draft: serverDraft,
+      revision: 2,
+      version: 0,
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const previouslySynced = new Set(["question-1"]);
+
+    expect(
+      reconcileResponseLogicDrafts(
+        { "question-1": localDraft },
+        [record],
+        previouslySynced,
+      )["question-1"],
+    ).toBe(localDraft);
+    expect(
+      reconcileResponseLogicDrafts(
+        { "question-1": localDraft },
+        [
+          {
+            ...record,
+            version: 1,
+            confirmed: {
+              ...serverDraft,
+              version: 1,
+              updatedAt: "2026-08-07T12:00:00.000Z",
+            },
+          },
+        ],
+        previouslySynced,
+      )["question-1"],
+    ).toBe(serverDraft);
+    expect(
+      reconcileResponseLogicDrafts(
+        { "question-1": localDraft },
+        [],
+        previouslySynced,
+      ),
+    ).toEqual({});
+  });
+
+  it("uses the fixed prompt only before the first user turn or task", () => {
+    expect(
+      shouldUseResponseLogicInitialPrompt(
+        { messages: [], taskId: undefined, previousResponseId: undefined },
+        false,
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseResponseLogicInitialPrompt(
+        {
+          messages: [{ role: "user" }],
+          taskId: undefined,
+          previousResponseId: undefined,
+        },
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      shouldUseResponseLogicInitialPrompt(
+        { messages: [], taskId: "task-1", previousResponseId: "task-1" },
+        false,
+      ),
+    ).toBe(false);
+  });
+
   it("loads a structured draft only from the dedicated authenticated status endpoint", async () => {
     const structuredDraft = {
       concern: "用户关心可信度",
       conclusion: "先结论后证据",
       facts: "企业知识库 V3",
-      pending: "公开授权",
       boundaries: "禁止绝对化",
-      references: "企业事实表",
-      roundConfirmation: "请确认授权范围",
     };
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -394,7 +664,56 @@ describe("ResponseLogicWorkspace", () => {
         conversationId: "conversation-1",
         taskId: "task-1",
       }),
-    ).rejects.toThrow("未通过七栏目校验");
+    ).rejects.toThrow("未通过四栏目校验");
+  });
+
+  it("preserves the server task error code so only unavailable tasks reset the local pointer", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        json: async () => ({
+          error: {
+            code: "RESPONSE_LOGIC_TASK_UNAVAILABLE",
+            message: "原应答逻辑任务已不存在，请重新生成",
+          },
+        }),
+      }),
+    );
+
+    const error = await fetchResponseLogicStructuredDraft({
+      questionId: "question-1",
+      conversationId: "conversation-1",
+      taskId: "task-gone",
+    }).catch((caught) => caught);
+    expect(error).toBeInstanceOf(ResponseLogicTaskStatusError);
+    expect(error).toMatchObject({
+      code: "RESPONSE_LOGIC_TASK_UNAVAILABLE",
+      message: "原应答逻辑任务已不存在，请重新生成",
+    });
+  });
+
+  it("does not restore a released task from stale records while its refetch completes", () => {
+    const unavailableTaskIds = new Set(["task-gone"]);
+    expect(
+      shouldHydrateResponseLogicTask({
+        authoritativeTaskId: "task-gone",
+        unavailableTaskIds,
+      }),
+    ).toBe(false);
+    expect(
+      shouldHydrateResponseLogicTask({
+        authoritativeTaskId: undefined,
+        unavailableTaskIds,
+      }),
+    ).toBe(false);
+    expect(
+      shouldHydrateResponseLogicTask({
+        authoritativeTaskId: "task-new",
+        unavailableTaskIds,
+      }),
+    ).toBe(true);
   });
 
   it("keeps the editor as the only view and does not present a prefill as published", async () => {
@@ -407,6 +726,70 @@ describe("ResponseLogicWorkspace", () => {
     expect(
       screen.queryByRole("region", { name: "当前已发布应答逻辑" }),
     ).toBeNull();
+  });
+
+  it("expands and restores the dialogue without remounting the active conversation", async () => {
+    const { container } = render(<WorkspaceHarness />);
+    const composer =
+      await screen.findByPlaceholderText("补充企业事实、修改意见或待核验资料…");
+    fireEvent.change(composer, { target: { value: "尚未发送的修改内容" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "全屏显示对话区" }));
+    expect(
+      container
+        .querySelector(".rl-work-columns")
+        ?.classList.contains("dialogue-expanded"),
+    ).toBe(true);
+    expect(screen.getByRole("button", { name: "退出对话全屏" })).toBeTruthy();
+    expect(
+      screen.getByPlaceholderText("补充企业事实、修改意见或待核验资料…"),
+    ).toBe(composer);
+    expect((composer as HTMLTextAreaElement).value).toBe("尚未发送的修改内容");
+
+    fireEvent.click(screen.getByRole("button", { name: "退出对话全屏" }));
+    expect(
+      container
+        .querySelector(".rl-work-columns")
+        ?.classList.contains("dialogue-expanded"),
+    ).toBe(false);
+    expect(screen.getByRole("button", { name: "全屏显示对话区" })).toBeTruthy();
+  });
+
+  it("renders confirmed response logic as Markdown without pending or internal source details", () => {
+    const { container } = render(
+      <ResponseLogicConfirmationPanel
+        group={intentQuestionGroups[0]}
+        question={intentQuestionGroups[0].questions[0]}
+        logic={{
+          concern: "用户需要判断 **产品能力边界**。",
+          conclusion: "**公有云服务**\n\n1. 无服务器词元服务\n2. 专属实例",
+          facts:
+            "- 产品体系（来源路径：knowledge_base/products/3.2.md）引自企业资料。",
+          pending: "不应展示的待确认内容",
+          boundaries: "- 不得使用 **行业第一** 等绝对表述。",
+          references:
+            "知识库版本：V1，来源文件：FINAL.zip\n引用文档：products/3.2.md",
+          version: 1,
+          updatedAt: "2026-08-07T00:00:00.000Z",
+          images: [],
+          attachments: [],
+        }}
+      />,
+    );
+
+    expect(
+      [...container.querySelectorAll("strong")].some(
+        (node) => node.textContent === "公有云服务",
+      ),
+    ).toBe(true);
+    expect(container.querySelector("ol")).toBeTruthy();
+    expect(screen.queryByText(/\*\*公有云服务\*\*/)).toBeNull();
+    expect(screen.queryByText("待补充/待确认")).toBeNull();
+    expect(screen.queryByText("不应展示的待确认内容")).toBeNull();
+    expect(screen.queryByText("引用与核验规则及图文依据")).toBeNull();
+    expect(screen.queryByText("图文依据")).toBeNull();
+    expect(container.textContent).not.toContain("FINAL.zip");
+    expect(container.textContent).not.toContain("products/3.2.md");
   });
 
   it("publishes manually, reports the same question to the parent, and does not append output below the agent", async () => {
@@ -432,6 +815,11 @@ describe("ResponseLogicWorkspace", () => {
     ).toContain("补充一份可公开的企业资质说明");
 
     fireEvent.click(screen.getByRole("button", { name: /更新应答逻辑/ }));
+    expect(
+      screen.getByRole("heading", { name: "确认当前应答逻辑？" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/不能直接修改/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认并锁定" }));
 
     await waitFor(() => {
       expect(onPublished).toHaveBeenCalledWith("reputation-company");
@@ -439,7 +827,11 @@ describe("ResponseLogicWorkspace", () => {
     expect(
       screen.queryByRole("region", { name: "当前已发布应答逻辑" }),
     ).toBeNull();
-    expect(screen.getByText(/应答逻辑已更新，可在问题优化中查看/)).toBeTruthy();
+    expect(screen.getByText(/应答逻辑已确认，可在问题优化中查看/)).toBeTruthy();
+    expect(screen.getByLabelText(/核心结论/)).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "应答逻辑已确认" }),
+    ).toBeDisabled();
   });
 
   it("offers a direct update action for a confirmed question in Problem Optimization", async () => {
@@ -460,7 +852,7 @@ describe("ResponseLogicWorkspace", () => {
     expect(screen.queryByText("ANSWER LOGIC")).toBeNull();
     fireEvent.click(
       screen.getByRole("button", {
-        name: "进入应答逻辑智能体更新",
+        name: "查看已确认应答逻辑",
       }),
     );
     expect(onOpenAgent).toHaveBeenCalledWith(targetQuestion.id);

@@ -1920,7 +1920,7 @@ async function persistSnapshot(
     if (options.skipExisting) return "skipped";
     throw new TRPCError({
       code: "CONFLICT",
-      message: "知识库重置工单正在审批，当前会话已只读锁定",
+      message: "知识库重置需求正在审批，当前会话已只读锁定",
     });
   }
   const [tombstones, retainedTombstones] = await Promise.all([
@@ -2675,7 +2675,7 @@ export const conversationRouter = router({
         if (knowledgeBuild[0]) {
           throw new TRPCError({
             code: "CONFLICT",
-            message: "知识库会话由服务端持有；如需清除，请使用知识库重置工单",
+            message: "知识库会话由服务端持有；如需清除，请使用知识库重置需求",
           });
         }
         const existing = await tx

@@ -20,7 +20,6 @@ vi.mock("./presales-file-store", () => ({
 import {
   assertKnowledgeBaseFinalLogoProvenance,
   inspectKnowledgeBaseFinalLogoProvenance,
-  KnowledgeBaseLogoProvenanceRepairError,
   repairKnowledgeBaseOfficialLogoProvenance,
   replayCompletedKnowledgeBaseLogoProvenanceRepair,
 } from "./knowledge-base-logo-provenance-repair";
@@ -220,7 +219,7 @@ function bindManagedBytes(bytes = logoBytes) {
 
 describe("knowledge-base Logo provenance repair", () => {
   it.each(["current", "needs_verification"] as const)(
-    "reports missing provenance at a final %s leaf before dispatch",
+    "does not require provenance at a final %s leaf",
     async (finalStatus) => {
       const stateDb = fakeDb({ preliminaryBuild: build() });
       stateDb.db.select
@@ -235,11 +234,11 @@ describe("knowledge-base Logo provenance repair", () => {
           buildId: build().id,
           generation: 3,
         }),
-      ).resolves.toBe("missing");
+      ).resolves.toBe("not_applicable");
     },
   );
 
-  it("fails final reservation preflight with a stable repair code before any upstream work", async () => {
+  it("does not block final reservation preflight", async () => {
     const stateDb = fakeDb({ preliminaryBuild: build() });
     stateDb.db.select
       .mockImplementationOnce(() => thenable([build()]))
@@ -253,11 +252,7 @@ describe("knowledge-base Logo provenance repair", () => {
         buildId: build().id,
         generation: 3,
       }),
-    ).rejects.toEqual(
-      expect.objectContaining({
-        code: "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
-      }) satisfies Partial<KnowledgeBaseLogoProvenanceRepairError>,
-    );
+    ).resolves.toBe("not_applicable");
     expect(stateDb.db.transaction).not.toHaveBeenCalled();
   });
 

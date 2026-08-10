@@ -12,6 +12,7 @@ import {
   LockKeyhole,
   Menu,
   Newspaper,
+  Radar,
   Shield,
   Target,
   X,
@@ -25,6 +26,10 @@ import MarkdownRenderer from "@/components/MarkdownRenderer";
 import AiWebsiteManagementWorkspace from "@/dashboard/AiWebsiteManagementWorkspace";
 import ProgressReportWorkspace from "@/dashboard/ProgressReportWorkspace";
 import QuestionMonitoringWorkspace from "@/dashboard/QuestionMonitoringWorkspace";
+import {
+  ResponseLogicReadOnlyConfirmationBoard,
+  type IntentQuestionGroup,
+} from "@/components/ResponseLogicWorkspace";
 import { ServiceHome, ServiceLockedPage } from "@/dashboard/service-portal-ui";
 import {
   getCapability,
@@ -33,16 +38,19 @@ import {
   type ServicePortalView,
 } from "@/dashboard/service-portal";
 import {
+  buildServiceQuestionGroups,
   ManagedDashboardSection,
   ManagedKeywordTables,
   PublishedContentAssets,
 } from "@/dashboard/UserBrandDashboard";
 import type { DashboardPayload } from "@shared/dashboard";
+import type { ResponseLogicRecordDto } from "@shared/response-logic";
 import type {
   PublicDeliveryTicketSummary,
   PublicDeliveryTicketWorkspaceMetadata,
 } from "@shared/delivery-ticket";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
+import { keywordCategoryKey } from "@shared/keyword-categories";
 
 import "@/dashboard/dashboard-styles.css";
 import "./customer-dashboard-mirror.css";
@@ -50,12 +58,14 @@ import "./customer-dashboard-mirror.css";
 export type CustomerDashboardMirrorSection =
   | "home"
   | "knowledge-build"
+  | "brand-tracking"
   | "knowledge"
   | "keywords"
   | "questions"
   | "response-logic"
   | "monitoring"
   | "report"
+  | "public-opinion"
   | "content"
   | "website";
 
@@ -84,6 +94,11 @@ const CUSTOMER_DASHBOARD_GROUPS: ReadonlyArray<{
         label: "知识库智能体",
         icon: Database,
       },
+      {
+        value: "brand-tracking",
+        label: "品牌追踪智能体",
+        icon: Target,
+      },
       { value: "knowledge", label: "知识库展示", icon: Database },
       { value: "keywords", label: "品牌全域词库", icon: LibraryBig },
     ],
@@ -105,6 +120,11 @@ const CUSTOMER_DASHBOARD_GROUPS: ReadonlyArray<{
     ],
   },
   {
+    label: "舆情监控",
+    icon: Radar,
+    items: [{ value: "public-opinion", label: "舆情监控", icon: Radar }],
+  },
+  {
     label: "AI 友好内容资产",
     icon: Database,
     items: [
@@ -124,6 +144,8 @@ function mirrorSectionCapability(
   switch (section) {
     case "knowledge-build":
       return "knowledgeBuild";
+    case "brand-tracking":
+      return null;
     case "knowledge":
       return "knowledgeDisplay";
     case "keywords":
@@ -159,6 +181,7 @@ function mirrorSectionForCustomerRoute(
   if (section === "knowledge-agent") {
     return sub === "display" ? "knowledge" : "knowledge-build";
   }
+  if (section === "brand-tracking") return "brand-tracking";
   if (section === "brand") return "keywords";
   if (section === "intent") return "questions";
   if (section === "response-logic") return "response-logic";
@@ -170,6 +193,7 @@ function mirrorSectionForCustomerRoute(
   if (section === "semantic") {
     return sub === "website-management" ? "website" : "content";
   }
+  if (section === "public-opinion") return "public-opinion";
   return "home";
 }
 
@@ -215,6 +239,7 @@ function CustomerMirrorNavButton({
 
 type CustomerDashboardMirrorProps = {
   payload: DashboardPayload;
+  layout?: "embedded" | "workspace";
   websiteWorkspace?:
     | (PublicDeliveryTicketWorkspaceMetadata & {
         tickets: PublicDeliveryTicketSummary[];
@@ -225,12 +250,19 @@ type CustomerDashboardMirrorProps = {
   servicePortalLoading?: boolean;
   servicePortalError?: boolean;
   onRefreshServicePortal?: () => void;
+  marketEdition?: "domestic" | "overseas";
+  allowBrandTrackingManagement?: boolean;
+  brandTrackingManagement?: ReactNode;
   initialSection?: CustomerDashboardMirrorSection;
   allowedSections?: readonly CustomerDashboardMirrorSection[];
   heading?: string;
   description?: string;
   editActions?: ReactNode;
   renderSectionActions?: (section: CustomerDashboardMirrorSection) => ReactNode;
+  renderSectionWorkspace?: (
+    section: CustomerDashboardMirrorSection,
+  ) => ReactNode;
+  responseLogicRecords?: ResponseLogicRecordDto[];
   statusLabel?: string;
 };
 
@@ -270,26 +302,34 @@ export type CustomerKnowledgePreview = {
 
 export default function CustomerDashboardMirror({
   payload,
+  layout = "embedded",
   websiteWorkspace = null,
   knowledgePreview = null,
   servicePortal,
   servicePortalLoading = false,
   servicePortalError = false,
   onRefreshServicePortal,
+  marketEdition = "domestic",
+  allowBrandTrackingManagement = false,
+  brandTrackingManagement,
   initialSection = "home",
   allowedSections,
   heading,
   description,
   editActions,
   renderSectionActions,
+  renderSectionWorkspace,
+  responseLogicRecords,
   statusLabel,
 }: CustomerDashboardMirrorProps) {
   const visibleSections = useMemo(
     () =>
       ALL_CUSTOMER_DASHBOARD_SECTIONS.filter(
-        (section) => !allowedSections || allowedSections.includes(section),
+        (section) =>
+          (section !== "public-opinion" || marketEdition === "overseas") &&
+          (!allowedSections || allowedSections.includes(section)),
       ),
-    [allowedSections],
+    [allowedSections, marketEdition],
   );
   const [activeSection, setActiveSection] =
     useState<CustomerDashboardMirrorSection>(
@@ -325,14 +365,18 @@ export default function CustomerDashboardMirror({
     selectSection(mirrorSectionForCustomerRoute(section, sub));
   };
   const sectionActions = renderSectionActions?.(activeSection);
+  const sectionWorkspace = renderSectionWorkspace?.(activeSection);
   const showEditorBar = Boolean(
     heading || description || editActions || sectionActions || statusLabel,
   );
 
   return (
     <section
-      className="user-brand-dashboard customer-dashboard-mirror"
+      className={`user-brand-dashboard customer-dashboard-mirror ${
+        layout === "workspace" ? "customer-dashboard-mirror--workspace" : ""
+      }`}
       aria-label={heading || "客户看板"}
+      data-layout={layout}
     >
       <div
         className={`app-shell customer-dashboard-mirror-shell ${
@@ -444,6 +488,8 @@ export default function CustomerDashboardMirror({
             </div>
           )}
 
+          {sectionWorkspace}
+
           <CustomerDashboardSection
             section={activeSection}
             payload={payload}
@@ -452,6 +498,10 @@ export default function CustomerDashboardMirror({
             servicePortal={usesServicePortal ? normalizedServicePortal : null}
             servicePortalLoading={servicePortalLoading}
             servicePortalError={servicePortalError}
+            responseLogicRecords={responseLogicRecords}
+            marketEdition={marketEdition}
+            allowBrandTrackingManagement={allowBrandTrackingManagement}
+            brandTrackingManagement={brandTrackingManagement}
             onRefreshServicePortal={onRefreshServicePortal}
             onNavigate={navigateCustomerRoute}
           />
@@ -469,6 +519,10 @@ function CustomerDashboardSection({
   servicePortal,
   servicePortalLoading,
   servicePortalError,
+  responseLogicRecords,
+  marketEdition,
+  allowBrandTrackingManagement,
+  brandTrackingManagement,
   onRefreshServicePortal,
   onNavigate,
 }: {
@@ -479,10 +533,14 @@ function CustomerDashboardSection({
   servicePortal: ServicePortalView | null;
   servicePortalLoading: boolean;
   servicePortalError: boolean;
+  responseLogicRecords?: ResponseLogicRecordDto[];
+  marketEdition: "domestic" | "overseas";
+  allowBrandTrackingManagement: boolean;
+  brandTrackingManagement?: ReactNode;
   onRefreshServicePortal?: () => void;
   onNavigate: (section: string, sub?: string | null) => void;
 }) {
-  const questionGroups = useMemo(() => {
+  const managedQuestionGroups = useMemo(() => {
     const groups = new Map<
       string,
       {
@@ -516,12 +574,25 @@ function CustomerDashboardSection({
     }
     return [...groups.values()];
   }, [payload.questions]);
+  const questionGroups = useMemo<IntentQuestionGroup[]>(
+    () =>
+      servicePortal?.purchasedQuestions.length
+        ? (buildServiceQuestionGroups(
+            servicePortal.purchasedQuestions,
+            managedQuestionGroups,
+          ) as IntentQuestionGroup[])
+        : (managedQuestionGroups as IntentQuestionGroup[]),
+    [managedQuestionGroups, servicePortal?.purchasedQuestions],
+  );
 
   if (section === "home") {
     return servicePortal ? (
       <ServiceHome
         portal={servicePortal}
         companyName={payload.brandName}
+        marketEdition={marketEdition}
+        allowBrandTrackingManagement={allowBrandTrackingManagement}
+        showPublicOpinionJourneyItem={false}
         loading={servicePortalLoading}
         error={servicePortalError}
         onNavigate={onNavigate}
@@ -546,6 +617,14 @@ function CustomerDashboardSection({
         onRefresh={onRefreshServicePortal}
         onNavigate={onNavigate}
       />
+    );
+  }
+
+  if (section === "public-opinion") {
+    return brandTrackingManagement ? (
+      <section className="page-shell">{brandTrackingManagement}</section>
+    ) : (
+      <MirrorEmpty title="舆情监控" />
     );
   }
 
@@ -599,6 +678,11 @@ function CustomerDashboardSection({
     );
   }
 
+  // The delivery mirror deliberately receives only a usage/limit workspace
+  // for this section. Jenova credentials and conversation transcripts remain
+  // outside the engineer/system-administrator response boundary.
+  if (section === "brand-tracking") return null;
+
   if (section === "knowledge") {
     return knowledgePreview?.snapshotError ? (
       <section className="page-shell">
@@ -632,7 +716,7 @@ function CustomerDashboardSection({
   }
 
   if (section === "questions" || section === "response-logic") {
-    return payload.questions.length ? (
+    return questionGroups.length ? (
       <section className="page-shell">
         <header className="page-header">
           <span className="eyebrow">MindPromise智诺 / 意图优化</span>
@@ -645,16 +729,32 @@ function CustomerDashboardSection({
               : "查看客户问题目录与每个问题对应的真实用户意图。"}
           </p>
         </header>
-        <div className="customer-dashboard-question-grid">
-          {payload.questions.map((question) => (
-            <article key={question.id}>
-              <span>{question.groupTitle}</span>
-              <h4>{question.question}</h4>
-              {question.intent && <p>{question.intent}</p>}
-              {question.summary && <small>{question.summary}</small>}
-            </article>
-          ))}
-        </div>
+        {responseLogicRecords !== undefined ? (
+          <ResponseLogicReadOnlyConfirmationBoard
+            questionGroups={questionGroups}
+            records={responseLogicRecords}
+          />
+        ) : (
+          <div className="customer-dashboard-question-grid">
+            {questionGroups.flatMap((group) =>
+              group.questions.map((question) => (
+                <article
+                  key={question.id}
+                  data-category={
+                    keywordCategoryKey(group.id) ||
+                    keywordCategoryKey(group.title) ||
+                    undefined
+                  }
+                >
+                  <span>{group.title}</span>
+                  <h4>{question.question}</h4>
+                  {question.intent && <p>{question.intent}</p>}
+                  {question.summary && <small>{question.summary}</small>}
+                </article>
+              )),
+            )}
+          </div>
+        )}
       </section>
     ) : (
       <MirrorEmpty

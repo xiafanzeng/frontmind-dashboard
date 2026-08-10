@@ -4,7 +4,13 @@
  * Features: Message display, file/image attachments, status indicators,
  *           local PDF.js reader, inline Markdown reader, HTML file preview.
  */
-import React, { useRef, useEffect, useState, useCallback } from "react";
+import React, {
+  useRef,
+  useEffect,
+  useState,
+  useCallback,
+  useMemo,
+} from "react";
 import {
   useConversation,
   type Attachment,
@@ -377,6 +383,7 @@ export default function ChatArea({
   syncKnowledgeBaseSnapshot = false,
   composerPrefill,
   responseLogicContext,
+  messageProjection,
   showKnowledgeBaseStarter = true,
   standardWelcomeVariant = "simple",
   reserveOuterMobileNav = false,
@@ -386,6 +393,7 @@ export default function ChatArea({
   syncKnowledgeBaseSnapshot?: boolean;
   composerPrefill?: string;
   responseLogicContext?: ResponseLogicTaskContext;
+  messageProjection?: (message: LocalMessage) => LocalMessage;
   showKnowledgeBaseStarter?: boolean;
   standardWelcomeVariant?: "simple" | "workflow";
   reserveOuterMobileNav?: boolean;
@@ -686,7 +694,13 @@ export default function ChatArea({
     return <EmptyState />;
   }
 
-  const { messages } = activeConversation;
+  const messages = useMemo(
+    () =>
+      messageProjection
+        ? activeConversation.messages.map(messageProjection)
+        : activeConversation.messages,
+    [activeConversation.messages, messageProjection],
+  );
 
   const sanitizedTitle = activeConversation.title
     ? sanitizeBrandText(activeConversation.title)

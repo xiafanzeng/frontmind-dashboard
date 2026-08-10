@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { KnowledgeBaseObservationDto } from "@/lib/knowledge-progress";
-import { KnowledgeBasePollingCoordinator } from "./knowledge-base-coordinator";
-import { observationNeedsPolling } from "./knowledge-base-coordinator";
+import {
+  KnowledgeBasePollingCoordinator,
+  knowledgeBaseObservationAcknowledgesClientRequest,
+  observationNeedsPolling,
+} from "./knowledge-base-coordinator";
 
 function executingObservation(): KnowledgeBaseObservationDto {
   return {
@@ -76,6 +79,49 @@ function awaitingInputObservation(
 }
 
 describe("KnowledgeBasePollingCoordinator", () => {
+  it.each(["activeTurn", "approvedPresentation", "completedTurn"] as const)(
+    "accepts an ordinary reply acknowledged by %s",
+    (field) => {
+      const observation = {
+        ...executingObservation(),
+        [field]: { clientRequestId: "request-direct" },
+      } as unknown as KnowledgeBaseObservationDto;
+
+      expect(
+        knowledgeBaseObservationAcknowledgesClientRequest(
+          observation,
+          "request-direct",
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("does not treat a legacy takeover's pre-existing active turn as acknowledgement", () => {
+    const oldActive = {
+      ...executingObservation(),
+      activeTurn: { clientRequestId: "request-legacy" },
+    } as unknown as KnowledgeBaseObservationDto;
+    const completed = {
+      ...oldActive,
+      completedTurn: { clientRequestId: "request-legacy" },
+    } as unknown as KnowledgeBaseObservationDto;
+
+    expect(
+      knowledgeBaseObservationAcknowledgesClientRequest(
+        oldActive,
+        "request-legacy",
+        { allowActiveTurn: false },
+      ),
+    ).toBe(false);
+    expect(
+      knowledgeBaseObservationAcknowledgesClientRequest(
+        completed,
+        "request-legacy",
+        { allowActiveTurn: false },
+      ),
+    ).toBe(true);
+  });
+
   it("stops polling once a released turn has a server-approved current presentation", () => {
     expect(observationNeedsPolling(awaitingInputObservation())).toBe(false);
   });
@@ -142,6 +188,36 @@ describe("KnowledgeBasePollingCoordinator", () => {
 
     expect(observe).toHaveBeenCalledTimes(2);
     expect(setTimer).toHaveBeenCalledTimes(1);
+    coordinator.dispose();
+  });
+
+  it("stops pending-request polling when a fast final turn is acknowledged without a presentation", async () => {
+    const acknowledged = {
+      ...executingObservation(),
+      interaction: {
+        ...executingObservation().interaction,
+        interactionState: "ready_to_publish" as const,
+      },
+      completedTurn: {
+        turnId: "final-turn",
+        clientRequestId: "request-final",
+        messageSequence: 9,
+      },
+    };
+    const setTimer = vi.fn();
+    const observe = vi.fn().mockResolvedValue(acknowledged);
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe,
+      apply: vi.fn(),
+      setTimer: setTimer as unknown as typeof setTimeout,
+    });
+
+    coordinator.wake("conversation", "request-final");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(setTimer).not.toHaveBeenCalled();
     coordinator.dispose();
   });
 

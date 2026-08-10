@@ -327,6 +327,7 @@ type Action =
         taskId?: string;
         taskUrl?: string;
         previousResponseId?: string;
+        clearTaskPointer?: boolean;
         startedAt?: number;
         completedAt?: number;
         lastKnownOutputLength?: number;
@@ -404,10 +405,15 @@ function conversationReducer(
             ? {
                 ...c,
                 status: action.payload.status,
-                taskId: action.payload.taskId ?? c.taskId,
-                taskUrl: action.payload.taskUrl ?? c.taskUrl,
-                previousResponseId:
-                  action.payload.previousResponseId ?? c.previousResponseId,
+                taskId: action.payload.clearTaskPointer
+                  ? undefined
+                  : (action.payload.taskId ?? c.taskId),
+                taskUrl: action.payload.clearTaskPointer
+                  ? undefined
+                  : (action.payload.taskUrl ?? c.taskUrl),
+                previousResponseId: action.payload.clearTaskPointer
+                  ? undefined
+                  : (action.payload.previousResponseId ?? c.previousResponseId),
                 startedAt: action.payload.startedAt ?? c.startedAt,
                 completedAt:
                   action.payload.completedAt !== undefined
@@ -817,6 +823,7 @@ export function applyKnowledgeBaseObservation(
   const activeClientRequestId = observation.activeTurn?.clientRequestId ?? null;
   const presentationClientRequestId =
     observation.approvedPresentation?.clientRequestId ?? null;
+  const completedTurn = observation.completedTurn ?? null;
   const presentation = knowledgeBasePresentationMessage(observation);
   const presentationMatches = Boolean(presentation);
   const interactionState = observation.interaction.interactionState;
@@ -872,6 +879,31 @@ export function applyKnowledgeBaseObservation(
           message.knowledgeBase?.turnId === activeTurnId,
       );
     }
+  }
+  if (completedTurn) {
+    messages = messages.map((message) => {
+      if (
+        message.role !== "user" ||
+        message.knowledgeBase?.kind !== "pending_user" ||
+        message.knowledgeBase.clientRequestId !== completedTurn.clientRequestId
+      ) {
+        return message;
+      }
+      return {
+        ...message,
+        id: knowledgeBaseUserMessagePublicId(completedTurn.turnId),
+        serverSequence: completedTurn.messageSequence,
+        knowledgeBase: {
+          ...message.knowledgeBase,
+          schemaVersion: 1,
+          buildId: (observation.progress ?? observation.interaction.progress)
+            ?.build.id,
+          turnId: completedTurn.turnId,
+          generation: observation.generation,
+          serverOwned: true,
+        },
+      };
+    });
   }
   if (presentation && !activeClientRequestId && presentationClientRequestId) {
     const pendingIndex = messages.findIndex(
@@ -974,9 +1006,14 @@ export function applyKnowledgeBaseObservation(
     ...conversation,
     messages,
     status: nextStatus,
-    taskId: observation.authoritativeTaskId ?? conversation.taskId,
+    taskId:
+      observation.authoritativeTaskId === null
+        ? undefined
+        : (observation.authoritativeTaskId ?? conversation.taskId),
     previousResponseId:
-      observation.authoritativeTaskId ?? conversation.previousResponseId,
+      observation.authoritativeTaskId === null
+        ? undefined
+        : (observation.authoritativeTaskId ?? conversation.previousResponseId),
     deletedMessageIds: conversation.deletedMessageIds?.filter(
       (messageId) => !protectedMessageIds.has(messageId),
     ),
@@ -1015,32 +1052,66 @@ export function applyKnowledgeBaseObservation(
   };
 }
 
-export function currentKnowledgeBasePresentationReady(
+export interface KnowledgeBaseReplySnapshot {
+  generation: number;
+  stateEpoch: number;
+  revision: number;
+  leafId: string;
+  presentationKey: string;
+  presentationTurnId: string;
+}
+
+/**
+ * Return one internally consistent reply coordinate from the approved message
+ * the browser is actually rendering. Callers must not mix these fields with a
+ * separately refreshed progress object.
+ */
+export function currentKnowledgeBaseReplySnapshot(
   conversation: Conversation | null | undefined,
-  revision: number | undefined,
-  leafId: string | null | undefined,
-) {
+): KnowledgeBaseReplySnapshot | null {
   const knowledgeBase = conversation?.knowledgeBase;
   if (
     !conversation ||
     conversation.status !== "awaiting_input" ||
     !knowledgeBase?.canReply ||
-    knowledgeBase.revision !== revision ||
-    knowledgeBase.leafId !== leafId ||
+    knowledgeBase.revision === null ||
+    !knowledgeBase.leafId ||
     !knowledgeBase.presentationKey ||
     !knowledgeBase.presentationTurnId
   ) {
-    return false;
+    return null;
   }
-  return conversation.messages.some(
-    (message) =>
-      message.role === "assistant" &&
-      message.content.trim() &&
-      message.knowledgeBase?.kind === "presentation" &&
-      message.knowledgeBase.turnId === knowledgeBase.presentationTurnId &&
-      message.knowledgeBase.presentationKey === knowledgeBase.presentationKey &&
-      message.knowledgeBase.revision === revision &&
-      message.knowledgeBase.leafId === leafId,
+  const message = conversation.messages.find(
+    (candidate) =>
+      candidate.role === "assistant" &&
+      candidate.content.trim() &&
+      candidate.knowledgeBase?.kind === "presentation" &&
+      candidate.knowledgeBase.turnId === knowledgeBase.presentationTurnId &&
+      candidate.knowledgeBase.presentationKey ===
+        knowledgeBase.presentationKey &&
+      candidate.knowledgeBase.generation === knowledgeBase.generation &&
+      candidate.knowledgeBase.revision === knowledgeBase.revision &&
+      candidate.knowledgeBase.leafId === knowledgeBase.leafId,
+  );
+  if (!message) return null;
+  return {
+    generation: knowledgeBase.generation,
+    stateEpoch: knowledgeBase.stateEpoch,
+    revision: knowledgeBase.revision,
+    leafId: knowledgeBase.leafId,
+    presentationKey: knowledgeBase.presentationKey,
+    presentationTurnId: knowledgeBase.presentationTurnId,
+  };
+}
+
+export function currentKnowledgeBasePresentationReady(
+  conversation: Conversation | null | undefined,
+  revision: number | undefined,
+  leafId: string | null | undefined,
+) {
+  const snapshot = currentKnowledgeBaseReplySnapshot(conversation);
+  return Boolean(
+    snapshot && snapshot.revision === revision && snapshot.leafId === leafId,
   );
 }
 
@@ -1502,6 +1573,7 @@ interface ConversationContextType {
       taskId?: string;
       taskUrl?: string;
       previousResponseId?: string;
+      clearTaskPointer?: boolean;
       startedAt?: number;
       completedAt?: number;
       lastKnownOutputLength?: number;
@@ -2072,6 +2144,7 @@ export function ConversationProvider({
         taskId?: string;
         taskUrl?: string;
         previousResponseId?: string;
+        clearTaskPointer?: boolean;
         startedAt?: number;
         completedAt?: number;
         lastKnownOutputLength?: number;

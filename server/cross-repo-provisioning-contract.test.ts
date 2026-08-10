@@ -39,6 +39,9 @@ describe("Agent ↔ Website provisioning v2 shared contract", () => {
   it("parses the shared purchase, categories, and knowledge artifact contract", async () => {
     const value = await fixture(localFixturePath);
     const request = value.purchaseRequest as Record<string, any>;
+    expect(websitePurchaseRequestV2Schema.parse(request).marketEdition).toBe(
+      "overseas",
+    );
     for (const category of value.questionCategories as string[]) {
       expect(
         websitePurchaseRequestV2Schema.parse({

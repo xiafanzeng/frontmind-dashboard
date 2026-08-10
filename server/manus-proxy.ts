@@ -275,13 +275,12 @@ function isPdfMagicBytes(data: Buffer): boolean {
   return data.length >= 5 && data.subarray(0, 5).toString("ascii") === "%PDF-";
 }
 
-function getSourceBrandLower() {
-  return ["ma", "nus"].join("");
+function getSourceBrandLowers() {
+  return [["ma", "nus"].join(""), ["jeno", "va"].join("")];
 }
 
-function getSourceBrandTitle() {
-  const lower = getSourceBrandLower();
-  return lower[0].toUpperCase() + lower.slice(1);
+function getSourceBrandTitle(lower: string) {
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
 function escapeRegExp(value: string) {
@@ -296,34 +295,27 @@ function sanitizeText(text: string): string {
   if (!text || typeof text !== "string") return text || "";
 
   try {
-    const sourceLower = getSourceBrandLower();
-    const sourceTitle = getSourceBrandTitle();
-    const sourceUpper = sourceLower.toUpperCase();
-    const sanitized = text
-      .replace(
-        new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
-        "https://api.frontmind.",
-      )
-      .replace(
-        new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"),
-        "https://www.frontmind.",
-      )
-      .replace(
-        new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"),
-        "https://frontmind.",
-      )
-      .replace(
-        new RegExp(`\\b${escapeRegExp(sourceUpper)}\\b`, "g"),
-        "FrontMind",
-      )
-      .replace(
-        new RegExp(`\\b${escapeRegExp(sourceTitle)}\\b`, "g"),
-        "FrontMind",
-      )
-      .replace(
-        new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "g"),
-        "frontmind",
-      );
+    const sanitized = getSourceBrandLowers().reduce(
+      (visibleText, sourceLower) =>
+        visibleText
+          .replace(
+            new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
+            "https://api.frontmind.",
+          )
+          .replace(
+            new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"),
+            "https://www.frontmind.",
+          )
+          .replace(
+            new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"),
+            "https://frontmind.",
+          )
+          .replace(
+            new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "gi"),
+            "FrontMind",
+          ),
+      text,
+    );
     return normalizeKnowledgeCollectionCopy(sanitized);
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
@@ -1288,17 +1280,18 @@ async function sanitizePdfBuffer(
     });
 
     // ── Step 2: Build glyph patterns for target strings ──────────────
-    const sourceLower = getSourceBrandLower();
-    const sourceTitle = getSourceBrandTitle();
-    const sourceUpper = sourceLower.toUpperCase();
-    const targetStrings = [
-      `${sourceTitle} AI`,
-      `${sourceUpper} AI`,
-      `${sourceLower} AI`,
-      sourceTitle,
-      sourceUpper,
-      sourceLower,
-    ];
+    const targetStrings = getSourceBrandLowers().flatMap((sourceLower) => {
+      const sourceTitle = getSourceBrandTitle(sourceLower);
+      const sourceUpper = sourceLower.toUpperCase();
+      return [
+        `${sourceTitle} AI`,
+        `${sourceUpper} AI`,
+        `${sourceLower} AI`,
+        sourceTitle,
+        sourceUpper,
+        sourceLower,
+      ];
+    });
     const replaceSimpleBrandEncodings = (content: string) => {
       let sanitized = content;
       const replacements = [...new Set(targetStrings)].sort(

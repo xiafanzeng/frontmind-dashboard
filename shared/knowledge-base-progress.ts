@@ -109,6 +109,8 @@ export interface KnowledgeBaseProgressDto {
     currentLeafId: string | null;
     /** True while the first knowledge leaf is waiting for an official Logo upload. */
     logoRequired?: boolean;
+    /** True while the managed Logo can still be replaced on the first leaf. */
+    logoAvailable?: boolean;
     protocolError: string | null;
     awaitingResponseSince?: number | null;
     updatedAt: number;
@@ -154,6 +156,17 @@ export interface KnowledgeBaseActiveTurnDto {
   expectedAttachmentCount?: number;
   /** Canonical position of the persisted user message in this conversation. */
   messageSequence?: number;
+}
+
+/**
+ * Durable acknowledgement for the most recently completed logical turn.
+ * Unlike activeTurn/presentation this remains available when a fast finalizer
+ * has already released the turn and there is no next presentation.
+ */
+export interface KnowledgeBaseCompletedTurnDto {
+  turnId: string;
+  clientRequestId: string;
+  messageSequence: number;
 }
 
 /** A server-owned resource that is safe for the customer UI to render. */
@@ -226,6 +239,8 @@ export interface KnowledgeBaseObservationDto {
   generation: number;
   authoritativeTaskId: string | null;
   activeTurn: KnowledgeBaseActiveTurnDto | null;
+  /** Optional while old servers/fixtures roll forward; new projections return null or a value. */
+  completedTurn?: KnowledgeBaseCompletedTurnDto | null;
   interaction: KnowledgeBaseInteractionDto;
   approvedPresentation: KnowledgeBaseApprovedPresentationDto | null;
   package: KnowledgeBasePackageDto | null;

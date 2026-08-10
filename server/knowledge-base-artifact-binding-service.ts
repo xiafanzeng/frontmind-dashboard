@@ -1,7 +1,7 @@
-import axios from "axios";
-import { and, eq, inArray } from "drizzle-orm";
-import path from "node:path";
+import axios, { type AxiosResponse } from "axios";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 
 import {
   conversationTurns,
@@ -68,7 +68,6 @@ import {
   canPackageKnowledgeBase,
   parseKnowledgeBaseManifestEnvelope,
   parseKnowledgeBaseProgressEnvelope,
-  type KnowledgeBaseOfficialLogoProvenance,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import {
@@ -78,7 +77,6 @@ import {
   knowledgeBaseOutputImageDescriptorHash,
   selectKnowledgeBaseProtocolOperationOutput,
 } from "./knowledge-base-progress-service";
-import { getKnowledgeBaseSkillDescriptor } from "./knowledge-base-skill-runtime";
 import {
   knowledgeBaseArchiveRequiresV4UploadEvidence,
   knowledgeBaseArchiveReadContractVersions,
@@ -87,6 +85,7 @@ import {
 import { runKnowledgePackageLiveShadow } from "./knowledge-base-package-shadow-live";
 
 const MAX_LOGO_DOWNLOAD_BYTES = 15 * 1024 * 1024;
+const MAX_OFFICIAL_LOGO_UPLOAD_BYTES = 100 * 1024 * 1024;
 const OFFICIAL_LOGO_UPLOAD_MIME_TYPES = new Set([
   "image/avif",
   "image/gif",
@@ -315,7 +314,88 @@ export interface KnowledgeBaseStagedArtifactCandidate {
   packageRevision?: number;
   outputItemId?: string;
   fileId?: string;
-  officialLogoProvenance?: KnowledgeBaseOfficialLogoProvenance;
+}
+
+export type KnowledgeBaseRejectedInitialLogoDisposition = {
+  rejected: true;
+  kind: "logo";
+  userId: number;
+  buildId: string;
+  generation: number;
+  turnId: string;
+  operationKey: string;
+  taskId: string;
+  expectedStateEpoch: number;
+  expectedRevision: number;
+  descriptorHashes: string[];
+  rejectionCode:
+    | "LOGO_NOT_READY"
+    | "LOGO_AMBIGUOUS"
+    | "LOGO_UPLOAD_INVALID"
+    | "ARTIFACT_DOWNLOAD_FAILED";
+};
+
+export type KnowledgeBaseInitialLogoDisposition =
+  | KnowledgeBaseStagedArtifactCandidate
+  | KnowledgeBaseRejectedInitialLogoDisposition;
+
+export function knowledgeBaseInitialLogoRejectionCode(error: unknown) {
+  if (
+    error instanceof KnowledgeBuildArtifactError &&
+    error.code === "ARTIFACT_INVALID"
+  ) {
+    return "LOGO_UPLOAD_INVALID" as const;
+  }
+  if (!(error instanceof KnowledgeBaseArtifactBindingError)) return null;
+  return [
+    "LOGO_NOT_READY",
+    "LOGO_AMBIGUOUS",
+    "LOGO_UPLOAD_INVALID",
+    "ARTIFACT_DOWNLOAD_FAILED",
+  ].includes(error.code)
+    ? (error.code as KnowledgeBaseRejectedInitialLogoDisposition["rejectionCode"])
+    : null;
+}
+
+function rejectedInitialLogoDisposition(input: {
+  error: unknown;
+  descriptors: readonly KnowledgeBaseLogoDescriptor[];
+  userId: number;
+  build: typeof knowledgeBaseBuilds.$inferSelect;
+  activeTurn?: typeof conversationTurns.$inferSelect;
+  taskId: string;
+}): KnowledgeBaseRejectedInitialLogoDisposition {
+  const rejectionCode = knowledgeBaseInitialLogoRejectionCode(input.error);
+  if (!rejectionCode) throw input.error;
+  if (!input.activeTurn?.operationKey) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "BUILD_CHANGED",
+      "当前 v4 首轮没有有效操作 reservation",
+    );
+  }
+  return {
+    rejected: true,
+    kind: "logo",
+    userId: input.userId,
+    buildId: input.build.id,
+    generation: input.build.generation,
+    turnId: input.activeTurn.id,
+    operationKey: input.activeTurn.operationKey,
+    taskId: input.taskId,
+    expectedStateEpoch: input.build.stateEpoch,
+    expectedRevision: input.build.revision,
+    descriptorHashes: input.descriptors
+      .map((descriptor) =>
+        knowledgeBaseOutputImageDescriptorHash({
+          fileId: descriptor.fileId || "",
+          url: descriptor.url || "",
+          filename: descriptor.filename,
+          mimeType: descriptor.mimeType,
+        }),
+      )
+      .sort(),
+    rejectionCode,
+  };
 }
 
 type ReadyPackageIdentity = Pick<
@@ -617,7 +697,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Nested/top-level provider projections often repeat one physical file. */
 export function collectKnowledgeBaseLogoDescriptors(value: unknown) {
   const descriptors = new Map<string, KnowledgeBaseLogoDescriptor>();
-  for (const raw of collectTrustedKnowledgeBaseOutputImageDescriptors(value)) {
+  for (const raw of collectTrustedKnowledgeBaseOutputImageDescriptors(value, {
+    ignoreInvalidDescriptors: true,
+  })) {
     const descriptor: KnowledgeBaseLogoDescriptor = {
       ...(raw.fileId ? { fileId: raw.fileId } : {}),
       ...(raw.url ? { url: raw.url } : {}),
@@ -668,20 +750,29 @@ async function downloadLogoBytes(input: {
     (input.descriptor.url
       ? knowledgeArchiveFileIdFromUrl(input.descriptor.url)
       : undefined);
-  const downloadUrl = fileId
-    ? `${input.baseUrl.replace(/\/$/u, "")}/v1/files/${encodeURIComponent(fileId)}/content`
-    : assertSafeExternalUrl(input.descriptor.url || "");
-  const response = await axios.get<ArrayBuffer>(downloadUrl, {
-    ...(fileId
-      ? { proxy: false as const, maxRedirects: 0 }
-      : safeExternalRequestOptions),
-    ...(fileId ? { headers: upstreamHeaders(input.apiKey) } : {}),
-    responseType: "arraybuffer",
-    timeout: 120_000,
-    maxContentLength: MAX_LOGO_DOWNLOAD_BYTES,
-    maxBodyLength: MAX_LOGO_DOWNLOAD_BYTES,
-    validateStatus: () => true,
-  });
+  let response: AxiosResponse<ArrayBuffer>;
+  try {
+    const downloadUrl = fileId
+      ? `${input.baseUrl.replace(/\/$/u, "")}/v1/files/${encodeURIComponent(fileId)}/content`
+      : assertSafeExternalUrl(input.descriptor.url || "");
+    response = await axios.get<ArrayBuffer>(downloadUrl, {
+      ...(fileId
+        ? { proxy: false as const, maxRedirects: 0 }
+        : safeExternalRequestOptions),
+      ...(fileId ? { headers: upstreamHeaders(input.apiKey) } : {}),
+      responseType: "arraybuffer",
+      timeout: 120_000,
+      maxContentLength: MAX_LOGO_DOWNLOAD_BYTES,
+      maxBodyLength: MAX_LOGO_DOWNLOAD_BYTES,
+      validateStatus: () => true,
+    });
+  } catch (error) {
+    if (error instanceof KnowledgeBaseArtifactBindingError) throw error;
+    throw new KnowledgeBaseArtifactBindingError(
+      "ARTIFACT_DOWNLOAD_FAILED",
+      "下载企业官方主 Logo 失败",
+    );
+  }
   if (response.status < 200 || response.status >= 300) {
     throw new KnowledgeBaseArtifactBindingError(
       "ARTIFACT_DOWNLOAD_FAILED",
@@ -696,87 +787,6 @@ async function downloadLogoBytes(input: {
     );
   }
   return buffer;
-}
-
-async function assertInitialLogoProvenanceMatchesBytes(input: {
-  provenance: KnowledgeBaseOfficialLogoProvenance;
-  logoBytes: Buffer;
-  companyWebsite: string | null;
-  activeTurnMetadata: unknown;
-  apiKey: string;
-  baseUrl: string;
-}) {
-  if (input.provenance.sourceKind === "official_web") {
-    const officialHosts = String(input.companyWebsite || "")
-      .split(/[\s,，;；]+/u)
-      .flatMap((candidate) => {
-        try {
-          return [new URL(candidate).hostname.toLowerCase()];
-        } catch {
-          return [];
-        }
-      });
-    const pageHost = new URL(
-      input.provenance.sourcePageUrl,
-    ).hostname.toLowerCase();
-    if (
-      officialHosts.length === 0 ||
-      !officialHosts.some(
-        (host) =>
-          pageHost === host ||
-          pageHost.endsWith(`.${host}`) ||
-          host.endsWith(`.${pageHost}`),
-      )
-    ) {
-      throw new KnowledgeBaseArtifactBindingError(
-        "LOGO_UPLOAD_INVALID",
-        "首轮 Logo 来源页不属于账号绑定的企业官网",
-      );
-    }
-    const sourceBytes = await downloadLogoBytes({
-      descriptor: {
-        url: input.provenance.sourceAssetUrl,
-        filename: "official-logo-source",
-        mimeType: "application/octet-stream",
-      },
-      apiKey: input.apiKey,
-      baseUrl: input.baseUrl,
-    });
-    if (!sourceBytes.equals(input.logoBytes)) {
-      throw new KnowledgeBaseArtifactBindingError(
-        "LOGO_UPLOAD_INVALID",
-        "首轮 Logo 来源 URL 的字节与实际返回 Logo 不一致",
-      );
-    }
-    return;
-  }
-
-  const metadata = isRecord(input.activeTurnMetadata)
-    ? input.activeTurnMetadata
-    : {};
-  const recovery = isRecord(metadata.recovery) ? metadata.recovery : {};
-  const attachments = Array.isArray(recovery.attachments)
-    ? recovery.attachments
-    : [];
-  const sourceBasename = path
-    .basename(input.provenance.sourceDocumentPath)
-    .normalize("NFKC")
-    .toLowerCase();
-  const matchesInitialUpload = attachments.some((attachment) => {
-    const value = isRecord(attachment) ? attachment : {};
-    return (
-      path
-        .basename(String(value.filename || ""))
-        .normalize("NFKC")
-        .toLowerCase() === sourceBasename
-    );
-  });
-  if (!matchesInitialUpload) {
-    throw new KnowledgeBaseArtifactBindingError(
-      "LOGO_UPLOAD_INVALID",
-      "首轮 Logo 的 sourceDocumentPath 未匹配本轮初始上传资料",
-    );
-  }
 }
 
 async function requiredDb() {
@@ -892,20 +902,22 @@ export function knowledgeBaseExistingLogoUploadBindingDecision(input: {
   stagedMimeType: string;
   existingUpload: Record<string, unknown> | null;
   verifiedUpload: KnowledgeBaseOfficialLogoUpload;
+  allowReplacement?: boolean;
 }) {
-  const sameExistingUpload = input.existingUpload
-    ? (
-        Object.keys(input.verifiedUpload) as Array<
-          keyof KnowledgeBaseOfficialLogoUpload
-        >
-      ).every(
+  const immutableUploadKeys = [
+    "index",
+    "fileId",
+    "filename",
+    "mimeType",
+    "sizeBytes",
+    "sourceSha256",
+  ] as const satisfies ReadonlyArray<keyof KnowledgeBaseOfficialLogoUpload>;
+  const sameImmutableUpload = input.existingUpload
+    ? immutableUploadKeys.every(
         (key) => input.existingUpload?.[key] === input.verifiedUpload[key],
-      ) &&
-      Object.keys(input.existingUpload).every((key) =>
-        Object.prototype.hasOwnProperty.call(input.verifiedUpload, key),
       )
     : false;
-  if (input.existingUpload && !sameExistingUpload) {
+  if (input.existingUpload && !sameImmutableUpload) {
     throw new KnowledgeBaseArtifactBindingError(
       "BUILD_CHANGED",
       "当前轮次已绑定另一份企业官方主 Logo 上传账本",
@@ -917,12 +929,13 @@ export function knowledgeBaseExistingLogoUploadBindingDecision(input: {
     input.buildLogoBytes !== input.stagedBytes ||
     input.buildLogoMimeType !== input.stagedMimeType
   ) {
+    if (input.allowReplacement === true) return "replace_artifact" as const;
     throw new KnowledgeBaseArtifactBindingError(
       "BUILD_CHANGED",
       "企业官方主 Logo 已由另一轮操作绑定，请刷新后继续",
     );
   }
-  return input.existingUpload
+  return input.existingUpload?.verified === true
     ? ("already_complete" as const)
     : ("repair_provenance" as const);
 }
@@ -940,7 +953,7 @@ async function readOfficialLogoUploadBytes(input: {
     stored.sizeBytes !== input.sizeBytes ||
     stored.sha256?.toLowerCase() !== input.sourceSha256 ||
     input.sizeBytes < 1 ||
-    input.sizeBytes > MAX_LOGO_DOWNLOAD_BYTES
+    input.sizeBytes > MAX_OFFICIAL_LOGO_UPLOAD_BYTES
   ) {
     throw new KnowledgeBaseArtifactBindingError(
       "LOGO_UPLOAD_INVALID",
@@ -952,10 +965,10 @@ async function readOfficialLogoUploadBytes(input: {
   for await (const chunk of stored.createReadStream()) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     bytes += buffer.length;
-    if (bytes > MAX_LOGO_DOWNLOAD_BYTES) {
+    if (bytes > MAX_OFFICIAL_LOGO_UPLOAD_BYTES) {
       throw new KnowledgeBaseArtifactBindingError(
         "LOGO_UPLOAD_INVALID",
-        "上传的 Logo 超过 15 MB，请压缩后重新上传",
+        "上传的 Logo 超过 100 MB，请压缩后重新上传",
       );
     }
     chunks.push(buffer);
@@ -988,6 +1001,7 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
   expectedRevision: number;
   expectedLeafId: string;
   upload: Omit<KnowledgeBaseOfficialLogoUpload, "verified">;
+  allowFirstLeafReplacement?: boolean;
 }) {
   const uploadFileId = assertKnowledgeBaseBindingIdentity(
     input.upload.fileId,
@@ -1065,18 +1079,6 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
       kind: "logo",
       storageKey: staged.storageKey,
     }).catch(() => undefined);
-  if (
-    !staged.width ||
-    !staged.height ||
-    staged.width < 256 ||
-    staged.height < 256
-  ) {
-    await removeStaged();
-    throw new KnowledgeBaseArtifactBindingError(
-      "LOGO_UPLOAD_INVALID",
-      `企业主 Logo 位图宽高均需至少 256 像素；当前为 ${staged.width || 0}×${staged.height || 0}`,
-    );
-  }
   let stagedMimeType: string;
   try {
     stagedMimeType = assertKnowledgeBaseOfficialLogoMimeMatches({
@@ -1094,6 +1096,7 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
     ...upload,
   };
   let duplicateBuildArtifact = false;
+  let replacedBuildArtifactStorageKey: string | null = null;
   try {
     const result = await db.transaction(async (tx) => {
       const build = (
@@ -1172,6 +1175,11 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
         stagedMimeType,
         existingUpload,
         verifiedUpload,
+        allowReplacement:
+          input.allowFirstLeafReplacement === true &&
+          build.skillVersion === "4" &&
+          build.confirmedCount === 0 &&
+          build.directPrefilledCount === 0,
       });
       const nextMetadata = {
         ...metadata,
@@ -1180,7 +1188,7 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
           officialLogoUpload: verifiedUpload,
         },
       };
-      if (build.logoSha256) {
+      if (build.logoSha256 && bindingDecision !== "replace_artifact") {
         // A crash/replay may have committed the immutable artifact before the
         // turn provenance marker. Same bytes are not enough: repair the exact
         // active turn ledger before reporting success.
@@ -1192,6 +1200,9 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
         }
         duplicateBuildArtifact = staged.storageKey !== build.logoStorageKey;
         return verifiedUpload;
+      }
+      if (bindingDecision === "replace_artifact") {
+        replacedBuildArtifactStorageKey = build.logoStorageKey;
       }
       await tx
         .update(knowledgeBaseBuilds)
@@ -1220,6 +1231,18 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
       return verifiedUpload;
     });
     if (duplicateBuildArtifact) await removeStaged();
+    if (
+      replacedBuildArtifactStorageKey &&
+      replacedBuildArtifactStorageKey !== staged.storageKey
+    ) {
+      await removeKnowledgeBuildArtifact({
+        userId: input.userId,
+        buildId: input.buildId,
+        generation: input.generation,
+        kind: "logo",
+        storageKey: replacedBuildArtifactStorageKey,
+      }).catch(() => undefined);
+    }
     return result;
   } catch (error) {
     await removeStaged();
@@ -1256,29 +1279,45 @@ export async function bindKnowledgeBaseInitialLogo(input: {
     activeTurn,
     envelope: manifest,
   });
-  let descriptors: KnowledgeBaseLogoDescriptor[];
+  let descriptors: KnowledgeBaseLogoDescriptor[] = [];
   try {
     descriptors = collectKnowledgeBaseLogoDescriptors(operationOutput);
   } catch (error) {
     if (error instanceof KnowledgeBaseArtifactIdentityError) {
-      throw new KnowledgeBaseArtifactBindingError(
+      const bindingError = new KnowledgeBaseArtifactBindingError(
         "LOGO_UPLOAD_INVALID",
         error.message,
       );
+      if (build.skillVersion === "4") {
+        return rejectedInitialLogoDisposition({
+          error: bindingError,
+          descriptors,
+          userId: input.userId,
+          build,
+          activeTurn,
+          taskId: input.taskId,
+        });
+      }
+      throw bindingError;
     }
     throw error;
   }
+  const rejectInitialLogo = (error: unknown) =>
+    rejectedInitialLogoDisposition({
+      error,
+      descriptors,
+      userId: input.userId,
+      build,
+      activeTurn,
+      taskId: input.taskId,
+    });
   if (descriptors.length === 0) {
-    throw new KnowledgeBaseArtifactBindingError(
+    const error = new KnowledgeBaseArtifactBindingError(
       "LOGO_NOT_READY",
       "首轮官方主 Logo 尚未随完整输出到达",
     );
-  }
-  if (descriptors.length !== 1) {
-    throw new KnowledgeBaseArtifactBindingError(
-      "LOGO_AMBIGUOUS",
-      `首轮必须恰好绑定一张官方主 Logo，实际检测到 ${descriptors.length} 张`,
-    );
+    if (build.skillVersion === "4") return rejectInitialLogo(error);
+    throw error;
   }
   if (build.skillVersion === "4") {
     if (!activeTurn?.operationKey) {
@@ -1287,77 +1326,66 @@ export async function bindKnowledgeBaseInitialLogo(input: {
         "当前 v4 首轮没有有效操作 reservation",
       );
     }
-    const descriptor = descriptors[0]!;
-    const latestV4Skill = await getKnowledgeBaseSkillDescriptor({
-      version: "4",
-    });
-    if (
-      !manifest.officialLogo &&
-      build.skillContentHash === latestV4Skill.contentHash
-    ) {
-      throw new KnowledgeBaseArtifactBindingError(
-        "LOGO_UPLOAD_INVALID",
-        "首轮官方主 Logo 缺少精确来源账本",
-      );
+    let lastRejectedError: unknown;
+    for (const descriptor of descriptors) {
+      try {
+        const buffer = await downloadLogoBytes({
+          descriptor,
+          apiKey: input.apiKey,
+          baseUrl: input.baseUrl,
+        });
+        const descriptorHash = knowledgeBaseOutputImageDescriptorHash({
+          fileId: descriptor.fileId || "",
+          url: descriptor.url || "",
+          filename: descriptor.filename,
+          mimeType: descriptor.mimeType,
+        });
+        const staged = await stageKnowledgeBuildArtifact({
+          userId: input.userId,
+          buildId: input.buildId,
+          generation: input.generation,
+          turnId: activeTurn.id,
+          operationKey: activeTurn.operationKey,
+          descriptorHash,
+          kind: "logo",
+          buffer,
+        });
+        const mimeType =
+          staged.format === "jpeg"
+            ? "image/jpeg"
+            : staged.format
+              ? `image/${staged.format}`
+              : "application/octet-stream";
+        return await assertStagedCandidateStillAuthoritative({
+          staged: true,
+          kind: "logo",
+          userId: input.userId,
+          buildId: input.buildId,
+          generation: input.generation,
+          turnId: activeTurn.id,
+          operationKey: activeTurn.operationKey,
+          taskId: input.taskId,
+          expectedStateEpoch: build.stateEpoch,
+          expectedRevision: build.revision,
+          descriptorHash,
+          storageKey: staged.storageKey,
+          sha256: staged.sha256,
+          bytes: staged.bytes,
+          filename: descriptor.filename.slice(0, 512),
+          mimeType: mimeType.slice(0, 255),
+        });
+      } catch (error) {
+        if (!knowledgeBaseInitialLogoRejectionCode(error)) throw error;
+        lastRejectedError = error;
+      }
     }
-    const buffer = await downloadLogoBytes({
-      descriptor,
-      apiKey: input.apiKey,
-      baseUrl: input.baseUrl,
-    });
-    if (manifest.officialLogo) {
-      await assertInitialLogoProvenanceMatchesBytes({
-        provenance: manifest.officialLogo,
-        logoBytes: buffer,
-        companyWebsite: build.companyWebsite,
-        activeTurnMetadata: activeTurn.metadata,
-        apiKey: input.apiKey,
-        baseUrl: input.baseUrl,
-      });
-    }
-    const descriptorHash = knowledgeBaseOutputImageDescriptorHash({
-      fileId: descriptor.fileId || "",
-      url: descriptor.url || "",
-      filename: descriptor.filename,
-      mimeType: descriptor.mimeType,
-    });
-    const staged = await stageKnowledgeBuildArtifact({
-      userId: input.userId,
-      buildId: input.buildId,
-      generation: input.generation,
-      turnId: activeTurn.id,
-      operationKey: activeTurn.operationKey,
-      descriptorHash,
-      kind: "logo",
-      buffer,
-    });
-    const mimeType =
-      staged.format === "jpeg"
-        ? "image/jpeg"
-        : staged.format
-          ? `image/${staged.format}`
-          : "application/octet-stream";
-    return assertStagedCandidateStillAuthoritative({
-      staged: true,
-      kind: "logo",
-      userId: input.userId,
-      buildId: input.buildId,
-      generation: input.generation,
-      turnId: activeTurn.id,
-      operationKey: activeTurn.operationKey,
-      taskId: input.taskId,
-      expectedStateEpoch: build.stateEpoch,
-      expectedRevision: build.revision,
-      descriptorHash,
-      storageKey: staged.storageKey,
-      sha256: staged.sha256,
-      bytes: staged.bytes,
-      filename: descriptor.filename.slice(0, 512),
-      mimeType: mimeType.slice(0, 255),
-      ...(manifest.officialLogo
-        ? { officialLogoProvenance: manifest.officialLogo }
-        : {}),
-    });
+    return rejectInitialLogo(
+      lastRejectedError ||
+        new KnowledgeBaseArtifactBindingError(
+          "LOGO_NOT_READY",
+          "首轮没有可下载并解码的 Logo 图片",
+        ),
+    );
   }
   if (build.logoStorageKey && build.logoSha256 && build.logoBytes) {
     return {
@@ -1421,6 +1449,246 @@ export async function bindKnowledgeBaseInitialLogo(input: {
     mimeType: rebound.logoMimeType!,
     idempotent: false,
   };
+}
+
+/**
+ * Repair a first-node build that previously committed its text while dropping
+ * a usable provider image. This reuses only the exact completed start turn and
+ * its already-billed upstream task; it never creates or reopens a model turn.
+ */
+export async function recoverKnowledgeBaseInitialLogoFromCompletedTurn(input: {
+  userId: number;
+  buildId: string;
+  generation: number;
+  taskId: string;
+  output: unknown;
+  apiKey: string;
+  baseUrl: string;
+}) {
+  assertKnowledgeBaseBindingIdentity(input.taskId, "上游任务标识");
+  const db = await requiredDb();
+  const build = (
+    await db
+      .select()
+      .from(knowledgeBaseBuilds)
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, input.buildId),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, input.generation),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (
+    !build ||
+    build.skillVersion !== "4" ||
+    build.status !== "confirming" ||
+    build.revision !== 0 ||
+    build.logoSha256 ||
+    build.activeTurnId ||
+    build.upstreamTaskId !== input.taskId ||
+    !build.currentLeafId ||
+    !build.lastAppliedOperationKey
+  ) {
+    return false;
+  }
+  const firstNode = (
+    await db
+      .select()
+      .from(knowledgeBaseBuildNodes)
+      .where(
+        and(
+          eq(knowledgeBaseBuildNodes.buildId, build.id),
+          eq(knowledgeBaseBuildNodes.ordinal, 0),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (!firstNode?.sourceTurnId || firstNode.leafId !== build.currentLeafId) {
+    return false;
+  }
+  const completedTurn = (
+    await db
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, firstNode.sourceTurnId),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          eq(conversationTurns.status, "completed"),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (
+    !completedTurn?.operationKey ||
+    completedTurn.operationType !== "start" ||
+    completedTurn.upstreamTaskId !== input.taskId ||
+    completedTurn.operationKey !== build.lastAppliedOperationKey ||
+    completedTurn.expectedRevision !== 0 ||
+    completedTurn.expectedLeafId !== null
+  ) {
+    return false;
+  }
+
+  const operationOutput = selectKnowledgeBaseProtocolOperationOutput(
+    input.output,
+    {
+      operationId: completedTurn.operationKey,
+      turnId: completedTurn.id,
+      taskId: input.taskId,
+      generation: input.generation,
+      stateKind: "frontmind.knowledge-base.manifest",
+    },
+  );
+  try {
+    const manifest = parseKnowledgeBaseManifestEnvelope(
+      extractFinalKnowledgeBaseAssistantText(operationOutput),
+    );
+    assertArtifactEnvelopeBelongsToActiveTurn({
+      build,
+      activeTurn: completedTurn,
+      envelope: manifest,
+    });
+  } catch {
+    return false;
+  }
+  const descriptors = collectKnowledgeBaseLogoDescriptors(operationOutput);
+  for (const descriptor of descriptors) {
+    let staged: Awaited<ReturnType<typeof stageKnowledgeBuildArtifact>>;
+    const descriptorHash = knowledgeBaseOutputImageDescriptorHash({
+      fileId: descriptor.fileId || "",
+      url: descriptor.url || "",
+      filename: descriptor.filename,
+      mimeType: descriptor.mimeType,
+    });
+    try {
+      const buffer = await downloadLogoBytes({
+        descriptor,
+        apiKey: input.apiKey,
+        baseUrl: input.baseUrl,
+      });
+      staged = await stageKnowledgeBuildArtifact({
+        userId: input.userId,
+        buildId: input.buildId,
+        generation: input.generation,
+        turnId: completedTurn.id,
+        operationKey: completedTurn.operationKey,
+        descriptorHash,
+        kind: "logo",
+        buffer,
+      });
+    } catch (error) {
+      if (knowledgeBaseInitialLogoRejectionCode(error)) continue;
+      throw error;
+    }
+    const mimeType =
+      staged.format === "jpeg"
+        ? "image/jpeg"
+        : staged.format
+          ? `image/${staged.format}`
+          : "application/octet-stream";
+    try {
+      const recovered = await db.transaction(async (tx) => {
+        const lockedBuild = (
+          await tx
+            .select()
+            .from(knowledgeBaseBuilds)
+            .where(
+              and(
+                eq(knowledgeBaseBuilds.id, build.id),
+                eq(knowledgeBaseBuilds.userId, input.userId),
+                eq(knowledgeBaseBuilds.generation, input.generation),
+              ),
+            )
+            .limit(1)
+            .for("update")
+        )[0];
+        const lockedNode = (
+          await tx
+            .select()
+            .from(knowledgeBaseBuildNodes)
+            .where(
+              and(
+                eq(knowledgeBaseBuildNodes.buildId, build.id),
+                eq(knowledgeBaseBuildNodes.ordinal, 0),
+              ),
+            )
+            .limit(1)
+            .for("update")
+        )[0];
+        const lockedTurn = (
+          await tx
+            .select()
+            .from(conversationTurns)
+            .where(eq(conversationTurns.id, completedTurn.id))
+            .limit(1)
+            .for("update")
+        )[0];
+        if (
+          !lockedBuild ||
+          lockedBuild.stateEpoch !== build.stateEpoch ||
+          lockedBuild.status !== "confirming" ||
+          lockedBuild.revision !== 0 ||
+          lockedBuild.logoSha256 ||
+          lockedBuild.activeTurnId ||
+          lockedBuild.currentLeafId !== firstNode.leafId ||
+          lockedBuild.upstreamTaskId !== input.taskId ||
+          lockedBuild.lastAppliedOperationKey !== completedTurn.operationKey ||
+          lockedNode?.sourceTurnId !== completedTurn.id ||
+          lockedTurn?.status !== "completed" ||
+          lockedTurn.operationKey !== completedTurn.operationKey ||
+          lockedTurn.upstreamTaskId !== input.taskId
+        ) {
+          return false;
+        }
+        const updated = await tx
+          .update(knowledgeBaseBuilds)
+          .set({
+            stateEpoch: lockedBuild.stateEpoch + 1,
+            logoStorageKey: staged.storageKey,
+            logoSha256: staged.sha256,
+            logoBytes: staged.bytes,
+            logoFilename: descriptor.filename.slice(0, 512),
+            logoMimeType: mimeType.slice(0, 255),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(knowledgeBaseBuilds.id, lockedBuild.id),
+              eq(knowledgeBaseBuilds.userId, input.userId),
+              eq(knowledgeBaseBuilds.generation, input.generation),
+              eq(knowledgeBaseBuilds.stateEpoch, lockedBuild.stateEpoch),
+              isNull(knowledgeBaseBuilds.logoSha256),
+              isNull(knowledgeBaseBuilds.activeTurnId),
+            ),
+          );
+        return Boolean(updated[0]?.affectedRows);
+      });
+      if (recovered) return true;
+      await removeStagedKnowledgeBuildArtifact({
+        userId: input.userId,
+        buildId: input.buildId,
+        generation: input.generation,
+        kind: "logo",
+        storageKey: staged.storageKey,
+      }).catch(() => undefined);
+      return false;
+    } catch (error) {
+      await removeStagedKnowledgeBuildArtifact({
+        userId: input.userId,
+        buildId: input.buildId,
+        generation: input.generation,
+        kind: "logo",
+        storageKey: staged.storageKey,
+      }).catch(() => undefined);
+      throw error;
+    }
+  }
+  return false;
 }
 
 export async function bindKnowledgeBaseFinalPackage(input: {

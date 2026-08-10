@@ -252,16 +252,12 @@ export async function inspectKnowledgeBaseFinalLogoProvenance(input: {
   buildId: string;
   generation: number;
 }): Promise<KnowledgeBaseFinalLogoProvenanceState> {
-  const coordinate = await loadFinalCoordinate(input);
-  if (
-    !coordinate ||
-    !isFinalLeafCoordinate(coordinate.build, coordinate.nodes)
-  ) {
-    return "not_applicable";
-  }
-  const ledgers = inspectCompletedTurns(await completedLogoLedgerTurns(input));
-  if (ledgers.conflict) return "conflict";
-  return ledgers.upload || ledgers.provenance ? "present" : "missing";
+  void input;
+  // A model-returned Logo is authoritative once its managed bytes have been
+  // downloaded, decoded and bound to the build. External website/document
+  // provenance is optional metadata and must never lock the final customer
+  // turn or force a duplicate upload of the same image.
+  return "not_applicable";
 }
 
 /** Ensure a v4 final reservation never reaches an upstream create without provenance. */
@@ -270,20 +266,7 @@ export async function assertKnowledgeBaseFinalLogoProvenance(input: {
   buildId: string;
   generation: number;
 }) {
-  const state = await inspectKnowledgeBaseFinalLogoProvenance(input);
-  if (state === "conflict") {
-    throw new KnowledgeBaseLogoProvenanceRepairError(
-      "KNOWLEDGE_BASE_LOGO_PROVENANCE_CONFLICT",
-      "企业官方主 Logo 来源账本冲突，请联系管理员核验；系统未提交本轮。",
-    );
-  }
-  if (state === "missing") {
-    throw new KnowledgeBaseLogoProvenanceRepairError(
-      "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED",
-      "已绑定的企业主 Logo 缺少可验证来源。请重新上传同一张 Logo 原图完成字节级来源绑定，再重试本轮。",
-    );
-  }
-  return state;
+  return inspectKnowledgeBaseFinalLogoProvenance(input);
 }
 
 export function applyKnowledgeBaseFinalLogoProvenanceObservation(input: {
@@ -295,36 +278,10 @@ export function applyKnowledgeBaseFinalLogoProvenanceObservation(input: {
   >;
   interaction: KnowledgeBaseInteractionDto;
 }) {
-  if (input.state !== "missing" && input.state !== "conflict") {
-    return {
-      interaction: input.interaction,
-      notice: input.observation.notice,
-    };
-  }
-  const conflict = input.state === "conflict";
-  const code = conflict
-    ? "KNOWLEDGE_BASE_LOGO_PROVENANCE_CONFLICT"
-    : "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED";
-  const message = conflict
-    ? "企业官方主 Logo 来源账本存在冲突，请联系管理员核验；系统不会提交最终确认。"
-    : "已绑定的企业主 Logo 缺少可验证来源。请重新上传同一张 Logo 原图完成字节级来源绑定，再重试本轮。";
+  void input.state;
   return {
-    interaction: {
-      progress: input.progress,
-      interactionState: "failed" as const,
-      canReply: false,
-      canPublish: false,
-      lockReason: message,
-    },
-    notice: {
-      key: `${input.progress.build.id}:${input.observation.generation}:${code}`,
-      code,
-      severity: "error" as const,
-      message,
-      retryable: false,
-      turnId: input.observation.activeTurn?.id || null,
-      createdAt: input.progress.build.updatedAt,
-    },
+    interaction: input.interaction,
+    notice: input.observation.notice,
   };
 }
 

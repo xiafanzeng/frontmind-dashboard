@@ -263,7 +263,7 @@ export async function getKnowledgeResetStatus(userId: number) {
       : !owner
         ? "尚未分配 AI 运维工程师，请联系交付管理员"
         : pending
-          ? "已有一张知识库重置工单正在处理"
+          ? "已有一张知识库重置需求正在处理"
           : !counts.hasKnowledge
             ? "当前没有可重置的知识库记录"
             : null,
@@ -312,7 +312,7 @@ export async function assertKnowledgeBaseWritable(userId: number) {
   if (rows[0]) {
     throw new AuthServiceError(
       "CONFLICT",
-      "知识库重置工单正在审批，当前知识库已只读锁定",
+      "知识库重置需求正在审批，当前知识库已只读锁定",
     );
   }
 }
@@ -372,7 +372,7 @@ export async function submitKnowledgeReset(input: {
         );
       }
       if (existing[0]) {
-        throw new AuthServiceError("CONFLICT", "已有一张重置工单正在处理");
+        throw new AuthServiceError("CONFLICT", "已有一张重置需求正在处理");
       }
       const period = periodRows[0];
       if (!period) {
@@ -436,7 +436,7 @@ export async function submitKnowledgeReset(input: {
     });
   } catch (error) {
     if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
-      throw new AuthServiceError("CONFLICT", "已有一张重置工单正在处理");
+      throw new AuthServiceError("CONFLICT", "已有一张重置需求正在处理");
     }
     throw error;
   }
@@ -484,7 +484,7 @@ async function requirePendingRequestForMember(input: {
       (row.request.assignedMemberId !== input.actor.id ||
         row.ticket.assignedMemberId !== input.actor.id))
   ) {
-    throw new AuthServiceError("NOT_FOUND", "待审批重置工单不存在");
+    throw new AuthServiceError("NOT_FOUND", "待审批重置需求不存在");
   }
   const role = await assertDeliveryProjectContext({
     actor: input.actor,
@@ -494,7 +494,7 @@ async function requirePendingRequestForMember(input: {
     executor: input.executor,
   });
   if (role.projectAssignmentId !== row.request.assignedProjectAssignmentId) {
-    throw new AuthServiceError("NOT_FOUND", "工单不属于当前客户项目岗位");
+    throw new AuthServiceError("NOT_FOUND", "需求不属于当前客户项目岗位");
   }
   return {
     ...row,
@@ -591,11 +591,12 @@ export async function decideKnowledgeReset(input: {
     if (row.ticketRevision !== input.expectedRevision) {
       throw new AuthServiceError(
         "CONFLICT",
-        "工单已被更新，请刷新清理预览后重试",
+        "需求已被更新，请刷新清理预览后重试",
       );
     }
     const now = new Date();
     if (input.decision === "reject") {
+      const publicSummary = `知识库重置申请未通过：${input.decisionNote!.trim()}`;
       await tx
         .update(knowledgeBaseResetRequests)
         .set({
@@ -611,7 +612,7 @@ export async function decideKnowledgeReset(input: {
         .update(deliveryTickets)
         .set({
           status: "rejected",
-          publicSummary: input.decisionNote!.trim(),
+          publicSummary,
           resolvedAt: now,
           revision: sql`${deliveryTickets.revision} + 1`,
           updatedByUserId: input.actor.id,
@@ -626,7 +627,7 @@ export async function decideKnowledgeReset(input: {
         actorRole: row.eventActorRole,
         kind: "status_change",
         visibility: "customer",
-        message: input.decisionNote!.trim(),
+        message: publicSummary,
         fromStatus: "submitted",
         toStatus: "rejected",
         actorContext: {
@@ -866,7 +867,8 @@ export async function decideKnowledgeReset(input: {
       .update(deliveryTickets)
       .set({
         status: "completed",
-        publicSummary: "知识库已清空，可以重新开始首次构建。",
+        publicSummary:
+          "知识库重置申请已通过，知识库已清空，可以重新开始首次构建。",
         resolvedAt: now,
         revision: sql`${deliveryTickets.revision} + 1`,
         updatedByUserId: input.actor.id,

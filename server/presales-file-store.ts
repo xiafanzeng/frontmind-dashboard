@@ -28,6 +28,7 @@ type PresalesFileCreateReservation = {
   schemaVersion: 1;
   keyHash: string;
   requestHash: string;
+  projectId?: string | null;
   apiCredentialId: string;
   credentialVersion: number;
   status: "pending" | "completed" | "deleted";
@@ -69,7 +70,9 @@ export type PresalesFileCreateReservationResult =
   | { state: "conflict" }
   | { state: "pending"; retryAfterMs: number };
 
-const FILE_CREATE_RESERVATION_LEASE_MS = 60_000;
+// Must outlive the 120-second upstream file-create timeout so project purge
+// cannot retire a reservation while its HTTP request can still succeed.
+const FILE_CREATE_RESERVATION_LEASE_MS = 3 * 60_000;
 const FILE_CREATE_LOCK_STALE_MS = 30_000;
 const DEFAULT_STALE_UPLOAD_TEMP_MS = 6 * 60 * 60 * 1_000;
 const DEFAULT_STALE_MANIFEST_TEMP_MS = 6 * 60 * 60 * 1_000;
@@ -225,6 +228,7 @@ export function hashPresalesFileIdempotencyKey(value: string) {
 
 export function hashPresalesFileCreatePayload(input: {
   filename: string;
+  projectId?: string;
   mimeType?: string;
   sizeBytes?: number;
 }) {
@@ -232,6 +236,7 @@ export function hashPresalesFileCreatePayload(input: {
     .update(
       JSON.stringify({
         filename: input.filename,
+        projectId: input.projectId ?? null,
         mimeType: input.mimeType ?? null,
         sizeBytes: input.sizeBytes ?? null,
       }),
@@ -289,6 +294,9 @@ function parseReservation(
     record.schemaVersion !== 1 ||
     record.keyHash !== expectedKeyHash ||
     typeof record.requestHash !== "string" ||
+    (record.projectId !== undefined &&
+      record.projectId !== null &&
+      typeof record.projectId !== "string") ||
     typeof record.apiCredentialId !== "string" ||
     !Number.isSafeInteger(record.credentialVersion) ||
     (record.status !== "pending" &&
@@ -378,6 +386,8 @@ function completedReservationResult(
 export async function acquirePresalesFileCreateReservation(input: {
   idempotencyKey: string;
   requestHash: string;
+  compatibleRequestHashes?: readonly string[];
+  projectId?: string;
   apiCredentialId: string;
   credentialVersion: number;
   now?: Date;
@@ -398,6 +408,7 @@ export async function acquirePresalesFileCreateReservation(input: {
         schemaVersion: 1 as const,
         keyHash,
         requestHash: input.requestHash,
+        projectId: input.projectId ?? null,
         apiCredentialId: input.apiCredentialId,
         credentialVersion: input.credentialVersion,
         status: "pending" as const,
@@ -435,14 +446,28 @@ export async function acquirePresalesFileCreateReservation(input: {
   }
 
   return withReservationLock(keyHash, async () => {
-    const current = await readReservation(keyHash);
+    let current = await readReservation(keyHash);
     if (!current) {
       const replacement = createPendingReservation();
       await writeJsonAtomic(paths.reservation, replacement.reservation);
       return replacement.result;
     }
-    if (current.requestHash !== input.requestHash) {
+    if (
+      current.requestHash !== input.requestHash &&
+      !(input.compatibleRequestHashes ?? []).includes(current.requestHash)
+    ) {
       return { state: "conflict" };
+    }
+    if (
+      current.projectId &&
+      input.projectId &&
+      current.projectId !== input.projectId
+    ) {
+      return { state: "conflict" };
+    }
+    if (!current.projectId && input.projectId) {
+      current = { ...current, projectId: input.projectId };
+      await writeJsonAtomic(paths.reservation, current);
     }
     // A completed operation is immutable. If its HTTP response was lost, a
     // retry after API-key rotation must return the one file already created,
@@ -590,6 +615,122 @@ export async function removePresalesFileCreateReservation(fileId: string) {
     }
     await fs.rm(indexPath, { force: true });
   });
+}
+
+/** Project deletion uses the project-level tombstone, so no per-file reuse
+ * barrier is retained after the file and its upstream copy are gone. */
+export async function purgePresalesFileCreateReservation(fileId: string) {
+  const indexPath = reservationIndexPath(fileId);
+  let keyHash: string | null = null;
+  try {
+    const parsed = JSON.parse(
+      await fs.readFile(indexPath, "utf8"),
+    ) as Partial<PresalesFileCreateIndex>;
+    if (
+      parsed.schemaVersion === 1 &&
+      parsed.upstreamFileId === fileId &&
+      typeof parsed.keyHash === "string" &&
+      /^[a-f0-9]{64}$/.test(parsed.keyHash)
+    ) {
+      keyHash = parsed.keyHash;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (!keyHash) {
+    await fs.rm(indexPath, { force: true });
+    return;
+  }
+  await withReservationLock(keyHash, async () => {
+    const current = await readReservation(keyHash!);
+    if (current?.upstreamFileId === fileId) {
+      await fs.rm(reservationPaths(keyHash!).reservation, { force: true });
+    }
+    await fs.rm(indexPath, { force: true });
+  });
+}
+
+export type PresalesProjectFileCreateReservationSnapshot = {
+  pendingReservations: number;
+  files: Array<{ fileId: string; apiCredentialId: string }>;
+};
+
+/**
+ * Enumerates project-bound file creations after the project lifecycle fence is
+ * closed. Expired pending reservations without an upstream file id are
+ * physically removed; the permanent project tombstone alone prevents replay.
+ */
+export async function readPresalesProjectFileCreateReservations(
+  projectId: string,
+  now = new Date(),
+): Promise<PresalesProjectFileCreateReservationSnapshot> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(reservationRoot());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { pendingReservations: 0, files: [] };
+    }
+    throw error;
+  }
+  let pendingReservations = 0;
+  const files = new Map<string, { fileId: string; apiCredentialId: string }>();
+  for (const entry of entries) {
+    const match = /^([a-f0-9]{64})\.json$/.exec(entry);
+    if (!match) continue;
+    const keyHash = match[1]!;
+    await withReservationLock(keyHash, async () => {
+      const reservation = await readReservation(keyHash);
+      if (!reservation || reservation.projectId !== projectId) return;
+      if (reservation.status === "deleted") {
+        await fs.rm(reservationPaths(keyHash).reservation, { force: true });
+        return;
+      }
+      if (reservation.status === "completed" && reservation.upstreamFileId) {
+        files.set(reservation.upstreamFileId, {
+          fileId: reservation.upstreamFileId,
+          apiCredentialId: reservation.apiCredentialId,
+        });
+        return;
+      }
+      if (reservation.status !== "pending") return;
+      if (Date.parse(reservation.leaseExpiresAt) > now.getTime()) {
+        pendingReservations += 1;
+        return;
+      }
+      await fs.rm(reservationPaths(keyHash).reservation, { force: true });
+    });
+  }
+  return {
+    pendingReservations,
+    files: [...files.values()],
+  };
+}
+
+export async function hasPresalesFileCreateReservationsForCredentials(
+  credentialIds: ReadonlySet<string>,
+) {
+  if (credentialIds.size === 0) return false;
+  let entries: string[];
+  try {
+    entries = await fs.readdir(reservationRoot());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  for (const entry of entries) {
+    const match = /^([a-f0-9]{64})\.json$/.exec(entry);
+    if (!match) continue;
+    const reservation = await readReservation(match[1]!);
+    if (
+      reservation &&
+      reservation.status !== "deleted" &&
+      credentialIds.has(reservation.apiCredentialId)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function pathsFor(fileId: string) {
@@ -850,10 +991,7 @@ export async function stagePresalesFileContent(input: {
         const manifest: PresalesFileManifest = {
           schemaVersion: 1,
           fileId: input.fileId,
-          filename: cleanFilename(
-            filename ?? previous?.filename,
-            input.fileId,
-          ),
+          filename: cleanFilename(filename ?? previous?.filename, input.fileId),
           mimeType: cleanMimeType(mimeType ?? previous?.mimeType),
           sizeBytes,
           sha256,

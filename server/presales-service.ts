@@ -7,6 +7,7 @@ import {
   presalesMonitorRuns,
   presalesTaskRequests,
   presalesUpstreamResources,
+  websiteProjectDeletionTombstones,
   type PresalesApiCredential,
   type PresalesTaskRequest,
   type PresalesUpstreamResource,
@@ -40,6 +41,12 @@ import {
 } from "./upstream-task-usage";
 import { getManusRollingCreditUsage } from "./manus-usage-service";
 import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
+import { hasPresalesFileCreateReservationsForCredentials } from "./presales-file-store";
+import {
+  assertWebsiteProjectPhysicalDeleteEnabled,
+  lockActiveWebsiteProjectLifecycle,
+  WebsiteProjectInactiveError,
+} from "./website-project-lifecycle";
 
 const PRESALES_CREDENTIAL_SLOT = "website";
 export const PRESALES_REVOKABLE_STATUSES = ["active"] as const;
@@ -47,6 +54,31 @@ const CREDIT_USAGE_LOOKBACK_DAYS = 30;
 const CREDIT_USAGE_PAGE_LIMIT = 100;
 const CREDIT_USAGE_MAX_PAGES = 100;
 const PRESALES_TASK_LEASE_MS = 3 * 60 * 1000;
+
+/**
+ * Drizzle wraps mysql2 failures in DrizzleQueryError and keeps the native
+ * driver error under `cause`. Idempotent reservations must recognize the
+ * bounded cause chain so a normal duplicate-key replay reaches the existing
+ * row instead of being reported as an upstream failure.
+ */
+export function isPresalesDuplicateEntryError(error: unknown) {
+  const visited = new Set<unknown>();
+  let current = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (!current || typeof current !== "object" || visited.has(current)) break;
+    visited.add(current);
+    const candidate = current as {
+      code?: unknown;
+      errno?: unknown;
+      cause?: unknown;
+    };
+    if (candidate.code === "ER_DUP_ENTRY" || candidate.errno === 1062) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
 
 export type PresalesFileContentSource = "user_upload" | "assistant_output";
 
@@ -132,7 +164,6 @@ export type PresalesTaskReservation =
   | {
       state: "completed";
       upstreamTaskId: string;
-      task: Record<string, unknown>;
     };
 
 async function requireDb() {
@@ -350,7 +381,14 @@ export async function deletePresalesApiCredential(executor?: any) {
         .limit(1)
         .for("update"),
     ]);
-    if (resources[0] || taskRequests[0] || monitorRuns[0]) {
+    const fileCreateReservations =
+      await hasPresalesFileCreateReservationsForCredentials(new Set(activeIds));
+    if (
+      resources[0] ||
+      taskRequests[0] ||
+      monitorRuns[0] ||
+      fileCreateReservations
+    ) {
       throw new AuthServiceError(
         "CONFLICT",
         "当前官网 API Key 仍绑定任务、文件或监控运行，无法安全撤销；请改用替换，系统会保留旧版本供恢复和历史用量追踪。",
@@ -582,17 +620,26 @@ export async function reservePresalesFileUploadRetention(
     eq(presalesUpstreamResources.upstreamId, input.fileId),
     eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
   );
-  await db
-    .update(presalesUpstreamResources)
-    .set({
-      uploadReservedAt: sql`COALESCE(${presalesUpstreamResources.uploadReservedAt}, ${now})`,
-    })
-    .where(
-      and(
-        locator,
-        eq(presalesUpstreamResources.contentSource, "user_upload"),
-        sql`${presalesUpstreamResources.contentDeletedAt} IS NULL`,
-        sql`(
+  const binding = await db
+    .select({ projectId: presalesUpstreamResources.projectId })
+    .from(presalesUpstreamResources)
+    .where(locator)
+    .limit(1);
+  const write = async (tx: any) => {
+    if (binding[0]?.projectId) {
+      await assertPresalesProjectActive(tx, binding[0].projectId);
+    }
+    await tx
+      .update(presalesUpstreamResources)
+      .set({
+        uploadReservedAt: sql`COALESCE(${presalesUpstreamResources.uploadReservedAt}, ${now})`,
+      })
+      .where(
+        and(
+          locator,
+          eq(presalesUpstreamResources.contentSource, "user_upload"),
+          sql`${presalesUpstreamResources.contentDeletedAt} IS NULL`,
+          sql`(
           (
             ${presalesUpstreamResources.uploadReservedAt} IS NULL
             AND ${presalesUpstreamResources.uploadedAt} IS NULL
@@ -611,18 +658,27 @@ export async function reservePresalesFileUploadRetention(
             AND ${presalesUpstreamResources.contentExpiresAt} = DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY)
             AND ${presalesUpstreamResources.contentExpiresAt} > ${now}
           )
-        )`,
-      ),
+          )`,
+        ),
+      );
+    const rows = await tx
+      .select()
+      .from(presalesUpstreamResources)
+      .where(locator)
+      .limit(1);
+    if (rows[0]?.projectId && rows[0].projectId !== binding[0]?.projectId) {
+      throw new AuthServiceError(
+        "IDEMPOTENCY_PENDING",
+        "文件项目归属刚刚更新，请重试上传",
+        1_000,
+      );
+    }
+    return assertReservedPresalesFileUpload(
+      rows[0] as PresalesUpstreamResource | undefined,
+      now,
     );
-  const rows = await db
-    .select()
-    .from(presalesUpstreamResources)
-    .where(locator)
-    .limit(1);
-  return assertReservedPresalesFileUpload(
-    rows[0] as PresalesUpstreamResource | undefined,
-    now,
-  );
+  };
+  return executor ? write(db) : db.transaction(write);
 }
 
 /**
@@ -644,45 +700,63 @@ export async function finalizePresalesFileUploadRetention(
     eq(presalesUpstreamResources.upstreamId, input.fileId),
     eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
   );
-  await db
-    .update(presalesUpstreamResources)
-    .set({
-      uploadedAt: sql`COALESCE(${presalesUpstreamResources.uploadedAt}, ${presalesUpstreamResources.uploadReservedAt})`,
-      contentExpiresAt: sql`COALESCE(${presalesUpstreamResources.contentExpiresAt}, DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY))`,
-    })
-    .where(
-      and(
-        locator,
-        eq(presalesUpstreamResources.contentSource, "user_upload"),
-        sql`${presalesUpstreamResources.contentDeletedAt} IS NULL`,
-        sql`${presalesUpstreamResources.uploadReservedAt} IS NOT NULL`,
-        sql`DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY) > ${now}`,
-        sql`(
+  const binding = await db
+    .select({ projectId: presalesUpstreamResources.projectId })
+    .from(presalesUpstreamResources)
+    .where(locator)
+    .limit(1);
+  const write = async (tx: any) => {
+    if (binding[0]?.projectId) {
+      await assertPresalesProjectActive(tx, binding[0].projectId);
+    }
+    await tx
+      .update(presalesUpstreamResources)
+      .set({
+        uploadedAt: sql`COALESCE(${presalesUpstreamResources.uploadedAt}, ${presalesUpstreamResources.uploadReservedAt})`,
+        contentExpiresAt: sql`COALESCE(${presalesUpstreamResources.contentExpiresAt}, DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY))`,
+      })
+      .where(
+        and(
+          locator,
+          eq(presalesUpstreamResources.contentSource, "user_upload"),
+          sql`${presalesUpstreamResources.contentDeletedAt} IS NULL`,
+          sql`${presalesUpstreamResources.uploadReservedAt} IS NOT NULL`,
+          sql`DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY) > ${now}`,
+          sql`(
           (${presalesUpstreamResources.uploadedAt} IS NULL AND ${presalesUpstreamResources.contentExpiresAt} IS NULL)
           OR
           (
             ${presalesUpstreamResources.uploadedAt} = ${presalesUpstreamResources.uploadReservedAt}
             AND ${presalesUpstreamResources.contentExpiresAt} = DATE_ADD(${presalesUpstreamResources.uploadReservedAt}, INTERVAL 30 DAY)
           )
-        )`,
-      ),
+          )`,
+        ),
+      );
+    const rows = await tx
+      .select()
+      .from(presalesUpstreamResources)
+      .where(locator)
+      .limit(1);
+    if (rows[0]?.projectId && rows[0].projectId !== binding[0]?.projectId) {
+      throw new AuthServiceError(
+        "IDEMPOTENCY_PENDING",
+        "文件项目归属刚刚更新，请重试上传确认",
+        1_000,
+      );
+    }
+    const resource = assertReservedPresalesFileUpload(
+      rows[0] as PresalesUpstreamResource | undefined,
+      now,
     );
-  const rows = await db
-    .select()
-    .from(presalesUpstreamResources)
-    .where(locator)
-    .limit(1);
-  const resource = assertReservedPresalesFileUpload(
-    rows[0] as PresalesUpstreamResource | undefined,
-    now,
-  );
-  if (!resource.uploadedAt || !resource.contentExpiresAt) {
-    throw new AuthServiceError(
-      "DATABASE_UNAVAILABLE",
-      "Presales file upload was not finalized",
-    );
-  }
-  return resource as CompletedPresalesFileUpload;
+    if (!resource.uploadedAt || !resource.contentExpiresAt) {
+      throw new AuthServiceError(
+        "DATABASE_UNAVAILABLE",
+        "Presales file upload was not finalized",
+      );
+    }
+    return resource as CompletedPresalesFileUpload;
+  };
+  return executor ? write(db) : db.transaction(write);
 }
 
 /** Records physical removal without ever moving the first deletion time. */
@@ -806,6 +880,55 @@ export function hashPresalesTaskPayload(payload: unknown) {
     .digest("hex");
 }
 
+function isPresalesProjectDeletionSignal(error: unknown) {
+  return (
+    error instanceof WebsiteProjectInactiveError ||
+    (error instanceof AuthServiceError && error.code === "PROJECT_DELETED")
+  );
+}
+
+async function assertPresalesProjectActive(tx: any, projectId: string) {
+  try {
+    await lockActiveWebsiteProjectLifecycle(tx, projectId);
+  } catch (error) {
+    if (!(error instanceof WebsiteProjectInactiveError)) throw error;
+    throw new AuthServiceError(
+      "PROJECT_DELETED",
+      "项目已进入永久删除流程，不能再创建任务",
+    );
+  }
+}
+
+export async function withPresalesProjectFileCreateGuard<T>(
+  projectId: string,
+  apiCredentialId: string,
+  operation: (tx: any) => Promise<T>,
+  executor?: any,
+): Promise<T> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    await assertPresalesProjectActive(tx, projectId);
+    const credential = await tx
+      .select({ id: presalesApiCredentials.id })
+      .from(presalesApiCredentials)
+      .where(
+        and(
+          eq(presalesApiCredentials.id, apiCredentialId),
+          ne(presalesApiCredentials.status, "deleted"),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!credential[0]) {
+      throw new AuthServiceError(
+        "NOT_FOUND",
+        "Presales API credential not found",
+      );
+    }
+    return operation(tx);
+  });
+}
+
 type PresalesTaskReservationDecision =
   | { state: "conflict" }
   | { state: "completed" }
@@ -823,15 +946,26 @@ export function evaluatePresalesTaskReservation(
   > & { projectId?: string | null },
   input: {
     requestHash: string;
+    compatibleRequestHashes?: readonly string[];
     projectId?: string;
     apiCredentialId: string;
     credentialVersion: number;
   },
   now = new Date(),
 ): PresalesTaskReservationDecision {
+  const compatibleHashes = new Set([
+    input.requestHash,
+    ...(input.compatibleRequestHashes ?? []),
+  ]);
+  const upgradesLegacyProjectBinding =
+    row.projectId === null &&
+    Boolean(input.projectId) &&
+    row.requestHash !== input.requestHash &&
+    compatibleHashes.has(row.requestHash);
   if (
-    row.requestHash !== input.requestHash ||
-    (row.projectId ?? null) !== (input.projectId ?? null) ||
+    !compatibleHashes.has(row.requestHash) ||
+    ((row.projectId ?? null) !== (input.projectId ?? null) &&
+      !upgradesLegacyProjectBinding) ||
     row.apiCredentialId !== input.apiCredentialId ||
     row.credentialVersion !== input.credentialVersion
   ) {
@@ -860,7 +994,6 @@ function completedReservation(
   return {
     state: "completed",
     upstreamTaskId,
-    task: { id: upstreamTaskId, status: "queued" },
   };
 }
 
@@ -868,6 +1001,7 @@ export async function acquirePresalesTaskReservation(
   input: {
     idempotencyKey: string;
     requestHash: string;
+    compatibleRequestHashes?: readonly string[];
     projectId?: string;
     apiCredentialId: string;
     credentialVersion: number;
@@ -901,7 +1035,14 @@ export async function acquirePresalesTaskReservation(
       updatedAt: now,
     };
     try {
-      await db.insert(presalesTaskRequests).values(row);
+      if (input.projectId) {
+        await db.transaction(async (tx: any) => {
+          await assertPresalesProjectActive(tx, input.projectId!);
+          await tx.insert(presalesTaskRequests).values(row);
+        });
+      } else {
+        await db.insert(presalesTaskRequests).values(row);
+      }
       return {
         state: "acquired",
         reservationId,
@@ -910,18 +1051,26 @@ export async function acquirePresalesTaskReservation(
         leaseExpiresAt,
       };
     } catch (error) {
-      const mysqlError = error as { code?: string };
-      if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
+      if (isPresalesProjectDeletionSignal(error)) {
+        throw new AuthServiceError(
+          "PROJECT_DELETED",
+          "项目已进入永久删除流程，不能再创建任务",
+        );
+      }
+      if (!isPresalesDuplicateEntryError(error)) throw error;
     }
 
     const existing = await db.transaction(async (tx: any) => {
+      if (input.projectId) {
+        await assertPresalesProjectActive(tx, input.projectId);
+      }
       const rows = await tx
         .select()
         .from(presalesTaskRequests)
         .where(eq(presalesTaskRequests.keyHash, keyHash))
         .limit(1)
         .for("update");
-      const current = rows[0] as PresalesTaskRequest | undefined;
+      let current = rows[0] as PresalesTaskRequest | undefined;
       if (!current) return null;
       const decision = evaluatePresalesTaskReservation(current, input, now);
       if (decision.state === "conflict") {
@@ -929,6 +1078,56 @@ export async function acquirePresalesTaskReservation(
           "CONFLICT",
           "该幂等键已用于不同的任务请求或 API Key 版本",
         );
+      }
+      if (
+        current.projectId === null &&
+        input.projectId &&
+        current.requestHash !== input.requestHash &&
+        (input.compatibleRequestHashes ?? []).includes(current.requestHash)
+      ) {
+        await tx
+          .update(presalesTaskRequests)
+          .set({ projectId: input.projectId, updatedAt: now })
+          .where(eq(presalesTaskRequests.id, current.id));
+        if (current.upstreamTaskId) {
+          const taskResources = await tx
+            .select({
+              id: presalesUpstreamResources.id,
+              projectId: presalesUpstreamResources.projectId,
+            })
+            .from(presalesUpstreamResources)
+            .where(
+              and(
+                eq(presalesUpstreamResources.kind, "task"),
+                eq(
+                  presalesUpstreamResources.upstreamId,
+                  current.upstreamTaskId,
+                ),
+                eq(
+                  presalesUpstreamResources.apiCredentialId,
+                  current.apiCredentialId,
+                ),
+              ),
+            )
+            .limit(1)
+            .for("update");
+          if (
+            taskResources[0]?.projectId &&
+            taskResources[0].projectId !== input.projectId
+          ) {
+            throw new AuthServiceError(
+              "CONFLICT",
+              "Upstream task belongs to a different project",
+            );
+          }
+          if (taskResources[0] && !taskResources[0].projectId) {
+            await tx
+              .update(presalesUpstreamResources)
+              .set({ projectId: input.projectId })
+              .where(eq(presalesUpstreamResources.id, taskResources[0].id));
+          }
+        }
+        current = { ...current, projectId: input.projectId, updatedAt: now };
       }
       if (decision.state === "completed") return completedReservation(current);
       if (decision.state === "pending") {
@@ -999,6 +1198,418 @@ export async function getPresalesTaskProjectBinding(
   };
 }
 
+export type DeletedPresalesTaskEvidence = {
+  deleted: boolean;
+  fileIds: string[];
+};
+
+export async function readPresalesTaskEvidenceFileIds(
+  input: { taskId: string; apiCredentialId: string },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const rows = await db
+    .select({ fileId: presalesUpstreamResources.upstreamId })
+    .from(presalesUpstreamResources)
+    .where(
+      and(
+        eq(presalesUpstreamResources.kind, "file"),
+        eq(presalesUpstreamResources.parentTaskId, input.taskId),
+        eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+      ),
+    );
+  return rows.map((row: { fileId: string }) => row.fileId);
+}
+
+export async function readPresalesProjectFileTargets(
+  projectId: string,
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  return db
+    .select({
+      fileId: presalesUpstreamResources.upstreamId,
+      apiCredentialId: presalesUpstreamResources.apiCredentialId,
+    })
+    .from(presalesUpstreamResources)
+    .where(
+      and(
+        eq(presalesUpstreamResources.projectId, projectId),
+        eq(presalesUpstreamResources.kind, "file"),
+      ),
+    );
+}
+
+export async function countPresalesProjectPendingFileUploads(
+  projectId: string,
+  input: { now?: Date; graceMs: number },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const now = input.now ?? new Date();
+  const rows = await db
+    .select({
+      uploadReservedAt: presalesUpstreamResources.uploadReservedAt,
+      uploadedAt: presalesUpstreamResources.uploadedAt,
+    })
+    .from(presalesUpstreamResources)
+    .where(
+      and(
+        eq(presalesUpstreamResources.projectId, projectId),
+        eq(presalesUpstreamResources.kind, "file"),
+        eq(presalesUpstreamResources.contentSource, "user_upload"),
+      ),
+    );
+  return rows.filter(
+    (row: { uploadReservedAt: Date | null; uploadedAt: Date | null }) =>
+      row.uploadReservedAt &&
+      !row.uploadedAt &&
+      row.uploadReservedAt.getTime() + input.graceMs > now.getTime(),
+  ).length;
+}
+
+export async function deletePresalesFileEvidence(
+  input: { fileId: string; apiCredentialId: string },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  await db
+    .delete(presalesUpstreamResources)
+    .where(
+      and(
+        eq(presalesUpstreamResources.kind, "file"),
+        eq(presalesUpstreamResources.upstreamId, input.fileId),
+        eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+      ),
+    );
+}
+
+/**
+ * Persists a known assistant-output file as a project purge target before an
+ * immediate best-effort DELETE. This is used only after the project fence has
+ * closed and the parent task can no longer accept ordinary output evidence.
+ */
+export async function retainPresalesProjectFilePurgeTarget(
+  input: {
+    projectId: string;
+    fileId: string;
+    apiCredentialId: string;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  await db.transaction(async (tx: any) => {
+    const lifecycle = await tx
+      .select({ status: websiteProjectDeletionTombstones.status })
+      .from(websiteProjectDeletionTombstones)
+      .where(eq(websiteProjectDeletionTombstones.projectId, input.projectId))
+      .limit(1)
+      .for("update");
+    if (!lifecycle[0] || lifecycle[0].status === "active") {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Project output cleanup target requires a closed deletion fence",
+      );
+    }
+    const existing = await tx
+      .select()
+      .from(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "file"),
+          eq(presalesUpstreamResources.upstreamId, input.fileId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (existing[0]) {
+      if (
+        existing[0].apiCredentialId !== input.apiCredentialId ||
+        (existing[0].projectId && existing[0].projectId !== input.projectId)
+      ) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "Output cleanup target belongs to another project or credential",
+        );
+      }
+      if (!existing[0].projectId) {
+        await tx
+          .update(presalesUpstreamResources)
+          .set({ projectId: input.projectId })
+          .where(eq(presalesUpstreamResources.id, existing[0].id));
+      }
+      return;
+    }
+    await tx.insert(presalesUpstreamResources).values({
+      id: randomUUID(),
+      projectId: input.projectId,
+      apiCredentialId: input.apiCredentialId,
+      kind: "file",
+      upstreamId: input.fileId,
+      parentTaskId: null,
+      contentSource: "assistant_output",
+      uploadReservedAt: null,
+      uploadedAt: null,
+      contentExpiresAt: null,
+      contentDeletedAt: null,
+      createdAt: new Date(),
+    });
+  });
+}
+
+/**
+ * Physically removes every local ownership/idempotency/evidence mapping for a
+ * task after the upstream task has been deleted (or confirmed absent). The
+ * credential row is intentionally retained because other resources can share
+ * it, and payment/provisioning ledgers live outside the presales tables.
+ */
+export async function deletePresalesTaskEvidence(
+  input: {
+    taskId: string;
+    apiCredentialId: string;
+    deletedFileIds?: readonly string[];
+  },
+  executor?: any,
+): Promise<DeletedPresalesTaskEvidence> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const taskRows = await tx
+      .select({ id: presalesUpstreamResources.id })
+      .from(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "task"),
+          eq(presalesUpstreamResources.upstreamId, input.taskId),
+          eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+
+    const fileRows = await tx
+      .select({ fileId: presalesUpstreamResources.upstreamId })
+      .from(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "file"),
+          eq(presalesUpstreamResources.parentTaskId, input.taskId),
+          eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+        ),
+      );
+
+    if (input.deletedFileIds) {
+      const deletedFileIds = new Set(input.deletedFileIds);
+      if (
+        fileRows.some(
+          (row: { fileId: string }) => !deletedFileIds.has(row.fileId),
+        )
+      ) {
+        throw new AuthServiceError(
+          "IDEMPOTENCY_PENDING",
+          "任务删除期间发现新的输出文件，请重试项目删除",
+          1_000,
+        );
+      }
+    }
+
+    await tx
+      .delete(presalesOutputUrls)
+      .where(
+        and(
+          eq(presalesOutputUrls.parentTaskId, input.taskId),
+          eq(presalesOutputUrls.apiCredentialId, input.apiCredentialId),
+        ),
+      );
+    await tx
+      .delete(presalesTaskRequests)
+      .where(
+        and(
+          eq(presalesTaskRequests.upstreamTaskId, input.taskId),
+          eq(presalesTaskRequests.apiCredentialId, input.apiCredentialId),
+        ),
+      );
+    await tx
+      .delete(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "file"),
+          eq(presalesUpstreamResources.parentTaskId, input.taskId),
+          eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+        ),
+      );
+    await tx
+      .delete(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "task"),
+          eq(presalesUpstreamResources.upstreamId, input.taskId),
+          eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+        ),
+      );
+
+    return {
+      deleted: Boolean(taskRows[0]),
+      fileIds: fileRows.map((row: { fileId: string }) => row.fileId),
+    };
+  });
+}
+
+export type PresalesProjectTaskPurgeSnapshot = {
+  projectId: string;
+  pendingReservations: number;
+  tasks: Array<{ taskId: string; apiCredentialId: string }>;
+};
+
+/** Enumerates every durable project task target after deletion has begun. */
+export async function readPresalesProjectTaskPurgeSnapshot(
+  projectId: string,
+  executor?: any,
+  now = new Date(),
+): Promise<PresalesProjectTaskPurgeSnapshot> {
+  assertWebsiteProjectPhysicalDeleteEnabled();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const tombstones = await tx
+      .select({ status: websiteProjectDeletionTombstones.status })
+      .from(websiteProjectDeletionTombstones)
+      .where(eq(websiteProjectDeletionTombstones.projectId, projectId))
+      .limit(1)
+      .for("update");
+    if (!tombstones[0] || tombstones[0].status === "active") {
+      throw new AuthServiceError("CONFLICT", "项目尚未进入永久删除流程");
+    }
+    const rows = await tx
+      .select({
+        id: presalesTaskRequests.id,
+        status: presalesTaskRequests.status,
+        leaseExpiresAt: presalesTaskRequests.leaseExpiresAt,
+        upstreamTaskId: presalesTaskRequests.upstreamTaskId,
+        apiCredentialId: presalesTaskRequests.apiCredentialId,
+      })
+      .from(presalesTaskRequests)
+      .where(eq(presalesTaskRequests.projectId, projectId))
+      .for("update");
+    const expiredReservations = rows.filter(
+      (row: {
+        status: string;
+        upstreamTaskId: string | null;
+        leaseExpiresAt: Date;
+      }) =>
+        (row.status !== "completed" || !row.upstreamTaskId) &&
+        row.leaseExpiresAt.getTime() <= now.getTime(),
+    );
+    if (expiredReservations.length > 0) {
+      await tx.delete(presalesTaskRequests).where(
+        inArray(
+          presalesTaskRequests.id,
+          expiredReservations.map((row: { id: string }) => row.id),
+        ),
+      );
+    }
+    const expiredIds = new Set(
+      expiredReservations.map((row: { id: string }) => row.id),
+    );
+    const tasks = new Map<
+      string,
+      { taskId: string; apiCredentialId: string }
+    >();
+    let pendingReservations = 0;
+    for (const row of rows) {
+      if (expiredIds.has(row.id)) continue;
+      const taskId = String(row.upstreamTaskId ?? "");
+      if (row.status !== "completed" || !taskId) {
+        pendingReservations += 1;
+        continue;
+      }
+      tasks.set(taskId, { taskId, apiCredentialId: row.apiCredentialId });
+    }
+    return {
+      projectId,
+      pendingReservations,
+      tasks: [...tasks.values()],
+    };
+  });
+}
+
+/** Marks the compact tombstone complete only when no local task can reappear. */
+export async function completePresalesProjectTaskPurge(
+  projectId: string,
+  executor?: any,
+) {
+  assertWebsiteProjectPhysicalDeleteEnabled();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const tombstones = await tx
+      .select({
+        projectId: websiteProjectDeletionTombstones.projectId,
+        status: websiteProjectDeletionTombstones.status,
+      })
+      .from(websiteProjectDeletionTombstones)
+      .where(eq(websiteProjectDeletionTombstones.projectId, projectId))
+      .limit(1)
+      .for("update");
+    if (!tombstones[0] || tombstones[0].status === "active") {
+      throw new AuthServiceError("CONFLICT", "项目尚未进入永久删除流程");
+    }
+    const remaining = await tx
+      .select({
+        status: presalesTaskRequests.status,
+        upstreamTaskId: presalesTaskRequests.upstreamTaskId,
+      })
+      .from(presalesTaskRequests)
+      .where(eq(presalesTaskRequests.projectId, projectId));
+    if (remaining.length > 0) {
+      return {
+        completed: false as const,
+        pendingReservations: remaining.filter(
+          (row: { status: string; upstreamTaskId: string | null }) =>
+            row.status !== "completed" || !row.upstreamTaskId,
+        ).length,
+        remainingTasks: remaining.filter(
+          (row: { status: string; upstreamTaskId: string | null }) =>
+            row.status === "completed" && Boolean(row.upstreamTaskId),
+        ).length,
+      };
+    }
+    const remainingResources = await tx
+      .select({ id: presalesUpstreamResources.id })
+      .from(presalesUpstreamResources)
+      .where(eq(presalesUpstreamResources.projectId, projectId));
+    if (remainingResources.length > 0) {
+      return {
+        completed: false as const,
+        pendingReservations: 0,
+        remainingTasks: remainingResources.length,
+      };
+    }
+    const remainingMonitors = await tx
+      .select({ id: presalesMonitorRuns.id })
+      .from(presalesMonitorRuns)
+      .where(eq(presalesMonitorRuns.projectId, projectId));
+    if (remainingMonitors.length > 0) {
+      return {
+        completed: false as const,
+        pendingReservations: remainingMonitors.length,
+        remainingTasks: 0,
+      };
+    }
+    if (tombstones[0].status !== "deleted") {
+      await tx
+        .update(websiteProjectDeletionTombstones)
+        .set({
+          status: "deleted",
+          completedAt: new Date(),
+        })
+        .where(eq(websiteProjectDeletionTombstones.projectId, projectId));
+    }
+    return {
+      completed: true as const,
+      pendingReservations: 0,
+      remainingTasks: 0,
+    };
+  });
+}
+
 export async function releasePresalesTaskReservation(
   input: { reservationId: string; attemptId: string },
   executor?: any,
@@ -1027,11 +1638,23 @@ export async function completePresalesTaskReservation(
     attemptId: string;
     apiCredentialId: string;
     upstreamTaskId: string;
+    attachmentFileIds?: readonly string[];
   },
   executor?: any,
 ) {
   const db = executor ?? (await requireDb());
+  const bindings = await db
+    .select({ projectId: presalesTaskRequests.projectId })
+    .from(presalesTaskRequests)
+    .where(eq(presalesTaskRequests.id, input.reservationId))
+    .limit(1);
+  if (!bindings[0]) {
+    throw new AuthServiceError("NOT_FOUND", "Task reservation not found");
+  }
   await db.transaction(async (tx: any) => {
+    if (bindings[0].projectId) {
+      await assertPresalesProjectActive(tx, bindings[0].projectId);
+    }
     const requests = await tx
       .select()
       .from(presalesTaskRequests)
@@ -1042,20 +1665,32 @@ export async function completePresalesTaskReservation(
     if (!request) {
       throw new AuthServiceError("NOT_FOUND", "Task reservation not found");
     }
+    if ((request.projectId ?? null) !== (bindings[0].projectId ?? null)) {
+      throw new AuthServiceError(
+        "IDEMPOTENCY_PENDING",
+        "任务项目归属刚刚更新，请重试完成确认",
+        1_000,
+      );
+    }
     if (request.apiCredentialId !== input.apiCredentialId) {
       throw new AuthServiceError(
         "CONFLICT",
         "Task reservation belongs to a different presales credential version",
       );
     }
-    if (request.status === "completed") {
-      if (request.upstreamTaskId === input.upstreamTaskId) return;
+    if (
+      request.status === "completed" &&
+      request.upstreamTaskId !== input.upstreamTaskId
+    ) {
       throw new AuthServiceError(
         "CONFLICT",
         "Task reservation already completed",
       );
     }
-    if (request.attemptId !== input.attemptId) {
+    if (
+      request.status !== "completed" &&
+      request.attemptId !== input.attemptId
+    ) {
       throw new AuthServiceError(
         "IDEMPOTENCY_PENDING",
         "Task reservation lease is owned by another request",
@@ -1072,7 +1707,8 @@ export async function completePresalesTaskReservation(
           eq(presalesUpstreamResources.upstreamId, input.upstreamTaskId),
         ),
       )
-      .limit(1);
+      .limit(1)
+      .for("update");
     const resource = resources[0] as PresalesUpstreamResource | undefined;
     if (resource && resource.apiCredentialId !== input.apiCredentialId) {
       throw new AuthServiceError(
@@ -1083,13 +1719,74 @@ export async function completePresalesTaskReservation(
     if (!resource) {
       await tx.insert(presalesUpstreamResources).values({
         id: randomUUID(),
+        projectId: request.projectId,
         apiCredentialId: input.apiCredentialId,
         kind: "task",
         upstreamId: input.upstreamTaskId,
         parentTaskId: null,
         createdAt: new Date(),
       });
+    } else if (
+      resource.projectId &&
+      request.projectId &&
+      resource.projectId !== request.projectId
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Upstream task belongs to a different project",
+      );
+    } else if (!resource.projectId && request.projectId) {
+      await tx
+        .update(presalesUpstreamResources)
+        .set({ projectId: request.projectId })
+        .where(eq(presalesUpstreamResources.id, resource.id));
     }
+
+    for (const fileId of new Set(input.attachmentFileIds ?? [])) {
+      const fileRows = await tx
+        .select({
+          id: presalesUpstreamResources.id,
+          projectId: presalesUpstreamResources.projectId,
+        })
+        .from(presalesUpstreamResources)
+        .where(
+          and(
+            eq(presalesUpstreamResources.kind, "file"),
+            eq(presalesUpstreamResources.upstreamId, fileId),
+            eq(
+              presalesUpstreamResources.apiCredentialId,
+              input.apiCredentialId,
+            ),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const file = fileRows[0];
+      if (!file) {
+        throw new AuthServiceError(
+          "NOT_FOUND",
+          "Task attachment is no longer available",
+        );
+      }
+      if (
+        file.projectId &&
+        request.projectId &&
+        file.projectId !== request.projectId
+      ) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "Task attachment belongs to a different project",
+        );
+      }
+      if (!file.projectId && request.projectId) {
+        await tx
+          .update(presalesUpstreamResources)
+          .set({ projectId: request.projectId })
+          .where(eq(presalesUpstreamResources.id, file.id));
+      }
+    }
+
+    if (request.status === "completed") return;
 
     const completedAt = new Date();
     await tx
@@ -1105,22 +1802,118 @@ export async function completePresalesTaskReservation(
   });
 }
 
-export async function recordPresalesUpstreamResource(
+/**
+ * Keeps a known upstream task discoverable when task creation won a race with
+ * project deletion but immediate upstream compensation failed. Unlike normal
+ * completion this does not bind attachment rows or create output evidence; the
+ * project purge enumerates the completed request and retries DELETE by ID.
+ */
+export async function retainPresalesTaskPurgeTarget(
   input: {
+    reservationId: string;
+    attemptId: string;
     apiCredentialId: string;
-    kind: "task" | "file";
-    upstreamId: string;
-    parentTaskId?: string | null;
-    contentSource?: PresalesFileContentSource | null;
-    verifiedAssistantOutput?: boolean;
+    upstreamTaskId: string;
   },
   executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const bindings = await db
+    .select({ projectId: presalesTaskRequests.projectId })
+    .from(presalesTaskRequests)
+    .where(eq(presalesTaskRequests.id, input.reservationId))
+    .limit(1);
+  if (!bindings[0]) {
+    throw new AuthServiceError("NOT_FOUND", "Task reservation not found");
+  }
+  if (!bindings[0].projectId) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "Task cleanup target requires a project deletion fence",
+    );
+  }
+  await db.transaction(async (tx: any) => {
+    const lifecycle = await tx
+      .select({ status: websiteProjectDeletionTombstones.status })
+      .from(websiteProjectDeletionTombstones)
+      .where(
+        eq(websiteProjectDeletionTombstones.projectId, bindings[0].projectId),
+      )
+      .limit(1)
+      .for("update");
+    if (!lifecycle[0] || lifecycle[0].status === "active") {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Task cleanup target requires a closed deletion fence",
+      );
+    }
+    const rows = await tx
+      .select()
+      .from(presalesTaskRequests)
+      .where(eq(presalesTaskRequests.id, input.reservationId))
+      .limit(1)
+      .for("update");
+    const request = rows[0] as PresalesTaskRequest | undefined;
+    if (!request) {
+      throw new AuthServiceError("NOT_FOUND", "Task reservation not found");
+    }
+    if (request.projectId !== bindings[0].projectId) {
+      throw new AuthServiceError(
+        "IDEMPOTENCY_PENDING",
+        "任务项目归属刚刚更新，请重试清理登记",
+        1_000,
+      );
+    }
+    if (
+      request.apiCredentialId !== input.apiCredentialId ||
+      (request.status !== "completed" && request.attemptId !== input.attemptId)
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Task reservation belongs to another task creation attempt",
+      );
+    }
+    if (
+      request.upstreamTaskId &&
+      request.upstreamTaskId !== input.upstreamTaskId
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Task reservation already tracks another upstream task",
+      );
+    }
+    const completedAt = new Date();
+    await tx
+      .update(presalesTaskRequests)
+      .set({
+        status: "completed",
+        upstreamTaskId: input.upstreamTaskId,
+        completedAt,
+        leaseExpiresAt: completedAt,
+        updatedAt: completedAt,
+      })
+      .where(eq(presalesTaskRequests.id, request.id));
+  });
+}
+
+type PresalesUpstreamResourceInput = {
+  projectId?: string | null;
+  apiCredentialId: string;
+  kind: "task" | "file";
+  upstreamId: string;
+  parentTaskId?: string | null;
+  contentSource?: PresalesFileContentSource | null;
+  verifiedAssistantOutput?: boolean;
+};
+
+async function recordPresalesUpstreamResourceUnlocked(
+  input: PresalesUpstreamResourceInput,
+  db: any,
 ) {
   const contentSource = validatePresalesResourceContentSource(
     input.kind,
     input.contentSource,
   );
-  const db = executor ?? (await requireDb());
   const existing = await db
     .select()
     .from(presalesUpstreamResources)
@@ -1132,6 +1925,16 @@ export async function recordPresalesUpstreamResource(
     )
     .limit(1);
   if (existing[0]) {
+    if (
+      input.projectId &&
+      existing[0].projectId &&
+      existing[0].projectId !== input.projectId
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Upstream resource belongs to a different project",
+      );
+    }
     if (existing[0].apiCredentialId !== input.apiCredentialId) {
       throw new AuthServiceError(
         "CONFLICT",
@@ -1180,6 +1983,9 @@ export async function recordPresalesUpstreamResource(
       contentSource === "assistant_output" &&
       existing[0].contentSource === null &&
       existing[0].parentTaskId === null;
+    if (!existing[0].projectId && input.projectId) {
+      updates.projectId = input.projectId;
+    }
     if (
       !existing[0].parentTaskId &&
       input.parentTaskId &&
@@ -1224,6 +2030,7 @@ export async function recordPresalesUpstreamResource(
 
   const resource: PresalesUpstreamResource = {
     id: randomUUID(),
+    projectId: input.projectId ?? null,
     apiCredentialId: input.apiCredentialId,
     kind: input.kind,
     upstreamId: input.upstreamId,
@@ -1239,8 +2046,7 @@ export async function recordPresalesUpstreamResource(
     await db.insert(presalesUpstreamResources).values(resource);
     return resource;
   } catch (error) {
-    const mysqlError = error as { code?: string };
-    if (mysqlError.code !== "ER_DUP_ENTRY") throw error;
+    if (!isPresalesDuplicateEntryError(error)) throw error;
     const raced = await db
       .select()
       .from(presalesUpstreamResources)
@@ -1252,35 +2058,85 @@ export async function recordPresalesUpstreamResource(
         ),
       )
       .limit(1);
-    if (raced[0]) {
-      if (
-        input.parentTaskId &&
-        raced[0].parentTaskId &&
-        raced[0].parentTaskId !== input.parentTaskId
-      ) {
-        throw new AuthServiceError(
-          "CONFLICT",
-          "Upstream file is already bound to a different presales task",
-        );
-      }
-      if (
-        contentSource &&
-        raced[0].contentSource &&
-        raced[0].contentSource !== contentSource &&
-        !(
-          raced[0].contentSource === "user_upload" &&
-          contentSource === "assistant_output"
-        )
-      ) {
-        throw new AuthServiceError(
-          "CONFLICT",
-          "Upstream file already has a different content source",
-        );
-      }
-      return raced[0];
-    }
+    if (raced[0]) return recordPresalesUpstreamResourceUnlocked(input, db);
     throw new AuthServiceError("CONFLICT", "Upstream resource already exists");
   }
+}
+
+export async function recordPresalesUpstreamResource(
+  input: PresalesUpstreamResourceInput,
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  if (!input.parentTaskId && !input.projectId) {
+    return recordPresalesUpstreamResourceUnlocked(input, db);
+  }
+  let guardedProjectId = input.projectId ?? null;
+  if (input.parentTaskId && !guardedProjectId) {
+    const parentBinding = await db
+      .select({ projectId: presalesUpstreamResources.projectId })
+      .from(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "task"),
+          eq(presalesUpstreamResources.upstreamId, input.parentTaskId),
+          eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+        ),
+      )
+      .limit(1);
+    guardedProjectId = parentBinding[0]?.projectId ?? null;
+  }
+  return db.transaction(async (tx: any) => {
+    if (guardedProjectId) {
+      await assertPresalesProjectActive(tx, guardedProjectId);
+    }
+    if (!input.parentTaskId) {
+      return recordPresalesUpstreamResourceUnlocked(input, tx);
+    }
+    const parent = await tx
+      .select({
+        id: presalesUpstreamResources.id,
+        projectId: presalesUpstreamResources.projectId,
+      })
+      .from(presalesUpstreamResources)
+      .where(
+        and(
+          eq(presalesUpstreamResources.kind, "task"),
+          eq(presalesUpstreamResources.upstreamId, input.parentTaskId!),
+          eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!parent[0]) {
+      throw new AuthServiceError(
+        "PROJECT_DELETED",
+        "任务已进入永久删除流程，不能再登记输出文件",
+      );
+    }
+    if (
+      input.projectId &&
+      parent[0].projectId &&
+      input.projectId !== parent[0].projectId
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "Output file belongs to a different project",
+      );
+    }
+    const currentProjectId = input.projectId ?? parent[0].projectId;
+    if (currentProjectId && currentProjectId !== guardedProjectId) {
+      throw new AuthServiceError(
+        "IDEMPOTENCY_PENDING",
+        "任务项目归属刚刚更新，请重试输出登记",
+        1_000,
+      );
+    }
+    return recordPresalesUpstreamResourceUnlocked(
+      { ...input, projectId: currentProjectId },
+      tx,
+    );
+  });
 }
 
 export function hashPresalesOutputUrl(url: string) {
@@ -1299,9 +2155,27 @@ export async function syncPresalesOutputUrlGrants(
   const uniqueUrls = [
     ...new Map(input.urls.map((item) => [item.url, item])).values(),
   ];
+  const taskBinding = await db
+    .select({ projectId: presalesUpstreamResources.projectId })
+    .from(presalesUpstreamResources)
+    .where(
+      and(
+        eq(presalesUpstreamResources.kind, "task"),
+        eq(presalesUpstreamResources.upstreamId, input.parentTaskId),
+        eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
+      ),
+    )
+    .limit(1);
+  const guardedProjectId = taskBinding[0]?.projectId ?? null;
   await db.transaction(async (tx: any) => {
+    if (guardedProjectId) {
+      await assertPresalesProjectActive(tx, guardedProjectId);
+    }
     const task = await tx
-      .select({ id: presalesUpstreamResources.id })
+      .select({
+        id: presalesUpstreamResources.id,
+        projectId: presalesUpstreamResources.projectId,
+      })
       .from(presalesUpstreamResources)
       .where(
         and(
@@ -1310,11 +2184,19 @@ export async function syncPresalesOutputUrlGrants(
           eq(presalesUpstreamResources.apiCredentialId, input.apiCredentialId),
         ),
       )
-      .limit(1);
+      .limit(1)
+      .for("update");
     if (!task[0]) {
       throw new AuthServiceError(
-        "NOT_FOUND",
-        "Presales task ownership could not be verified",
+        "PROJECT_DELETED",
+        "任务已进入永久删除流程，不能再登记输出地址",
+      );
+    }
+    if (task[0].projectId && task[0].projectId !== guardedProjectId) {
+      throw new AuthServiceError(
+        "IDEMPOTENCY_PENDING",
+        "任务项目归属刚刚更新，请重试输出地址登记",
+        1_000,
       );
     }
 

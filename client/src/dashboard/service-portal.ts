@@ -1,3 +1,5 @@
+import { SERVICE_PLAN_CATALOG } from "@shared/service-portal";
+
 export type ServicePlanCode = "basic" | "advanced" | "luxury" | "unknown";
 
 export type ServiceCapabilityKey =
@@ -57,6 +59,7 @@ export type PurchasedServiceQuestion = {
   intentConfirmedRevision: number | null;
   intentConfirmedAt: number | null;
   intentConfirmed: boolean;
+  responseLogicConfirmed?: boolean;
 };
 
 export type ServiceWorkflowStep = {
@@ -351,6 +354,7 @@ function normalizeCapability(value: unknown): ServiceCapability {
           "preparing",
           "importing",
           "processing",
+          "workflow_prerequisite",
           "service_pending_confirmation",
           "service_scheduled",
         ].includes(rawStatus)
@@ -663,6 +667,12 @@ function normalizeQuestions(
           boolValue(
             firstValue(record, ["intentConfirmed", "intent_confirmed"]),
           ) ?? false,
+        responseLogicConfirmed: boolValue(
+          firstValue(record, [
+            "responseLogicConfirmed",
+            "response_logic_confirmed",
+          ]),
+        ),
       } satisfies PurchasedServiceQuestion,
     ];
   });
@@ -870,7 +880,7 @@ export function normalizeServicePortal(raw: unknown): ServicePortalView {
       allowed: false,
       effectiveStatus: "locked",
       reason:
-        "普通版已包含官网生成的初步知识库展示，不包含对话式知识库构建。升级进阶版或豪华版后可解锁。",
+        "普通版不包含知识库智能体；知识库由 Website 流程自动同步至本账号，服务团队可补录。升级进阶版或豪华版后可解锁知识库智能体。",
       nextAction: {
         kind: "upgrade",
         label: "查看升级方案",
@@ -1000,7 +1010,7 @@ export function normalizeServicePortal(raw: unknown): ServicePortalView {
           "source_kind",
         ]),
         firstValue(planRecord, ["source"]) === "website"
-          ? "官网初步知识库"
+          ? "Website 流程同步知识库"
           : "",
       ),
       updatedAt: textValue(
@@ -1051,6 +1061,16 @@ export function getRouteCapability(
   return null;
 }
 
+export function isCapabilityIncludedInPlan(
+  planCode: ServicePlanCode,
+  key: ServiceCapabilityKey,
+): boolean {
+  // A sidebar lock describes the purchased plan, not a temporary workflow or
+  // service lifecycle gate. Avoid claiming exclusion until the plan is known.
+  if (planCode === "unknown") return true;
+  return SERVICE_PLAN_CATALOG[planCode].includedCapabilities[key];
+}
+
 export function getCapability(
   portal: ServicePortalView,
   key: ServiceCapabilityKey,
@@ -1074,6 +1094,23 @@ export function getCapability(
   const step = stepId
     ? portal.workflowSteps.find((candidate) => candidate.id === stepId)
     : undefined;
+  const knowledgeStep = portal.workflowSteps.find(
+    (candidate) => candidate.id === "knowledge",
+  );
+  const knowledgeReady = knowledgeStep
+    ? knowledgeStep.status === "complete"
+    : portal.knowledgeBase.status === "ready";
+  if (key === "contentAssets" && explicit.allowed && !knowledgeReady) {
+    return {
+      allowed: false,
+      effectiveStatus: "pending",
+      reason:
+        portal.plan.code === "basic"
+          ? "请先等待 Website 流程自动同步或服务团队补录知识库；知识库展示完成后解锁 AI 友好内容资产。"
+          : "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+      nextAction: knowledgeStep?.nextAction ?? portal.primaryNextAction,
+    } satisfies ServiceCapability;
+  }
   if (
     key === "knowledgeDisplay" &&
     explicit.allowed &&

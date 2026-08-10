@@ -12,11 +12,15 @@ import {
   apiCredentials,
   responseLogicEntries,
   upstreamResources,
+  workspaceQuestions,
 } from "../drizzle/schema";
 import {
+  ResponseLogicConfirmedError,
+  ResponseLogicRevisionConflictError,
   ResponseLogicTaskActiveError,
   assertResponseLogicTaskSlotAvailable,
   recordResponseLogicTaskStart,
+  saveResponseLogicEntry,
 } from "./response-logic-service";
 
 function awaitedRows(rows: unknown[]) {
@@ -193,6 +197,82 @@ describe("response logic task persistence", () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
+  it("rejects a new task for a confirmed response logic before claiming its resource", async () => {
+    const insert = vi.fn();
+    const existingEntries = [
+      {
+        userId: 42,
+        questionId: "question-1",
+        lastTaskId: null,
+        confirmed: {
+          concern: "已确认",
+          conclusion: "已确认",
+          facts: "已确认",
+          pending: "",
+          boundaries: "已确认",
+          references: "已确认",
+          images: [],
+          attachments: [],
+          version: 1,
+          updatedAt: "2026-08-07T00:00:00.000Z",
+        },
+      },
+    ];
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === apiCredentials
+                  ? [{ id: "credential-1" }]
+                  : table === responseLogicEntries
+                    ? existingEntries
+                    : [],
+              ),
+          }),
+        }),
+      }),
+      insert,
+    };
+    mocks.getDb.mockResolvedValue({
+      transaction: async (callback: (tx: typeof executor) => unknown) =>
+        callback(executor),
+    });
+
+    await expect(
+      recordResponseLogicTaskStart({
+        userId: 42,
+        apiCredentialId: "credential-1",
+        value: {
+          questionId: "question-1",
+          groupId: "basic",
+          groupTitle: "产品场景",
+          question: "企业有什么核心产品？",
+          intent: "核验产品事实",
+          summary: "给出可核验的产品口径",
+          conversationId: "conversation-1",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+        },
+        taskId: "task-after-confirmation",
+        skillName: "response-logic-builder",
+        skillVersion: "1",
+        skillContentHash: "b".repeat(64),
+        verifiedAttachments: [],
+      }),
+    ).rejects.toBeInstanceOf(ResponseLogicConfirmedError);
+    expect(insert).not.toHaveBeenCalled();
+  });
+
   it("allows only the already-bound task to continue using the slot", () => {
     expect(() =>
       assertResponseLogicTaskSlotAvailable({
@@ -206,6 +286,195 @@ describe("response logic task persistence", () => {
         incomingTaskId: "task-second",
       }),
     ).toThrow(ResponseLogicTaskActiveError);
+  });
+
+  it("rejects a stale interactive save before writing the locked row", async () => {
+    const update = vi.fn();
+    const existingEntry = {
+      id: "entry-1",
+      userId: 42,
+      questionId: "question-1",
+      revision: 4,
+      confirmed: null,
+      draft: {
+        concern: "旧内容",
+        conclusion: "旧内容",
+        facts: "旧内容",
+        pending: "",
+        boundaries: "旧内容",
+        references: "旧内容",
+        images: [],
+        attachments: [],
+      },
+    };
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === responseLogicEntries ? [existingEntry] : [],
+              ),
+          }),
+        }),
+      }),
+      update,
+    };
+    mocks.getDb.mockResolvedValue({
+      ...executor,
+      transaction: async (callback: (tx: typeof executor) => unknown) =>
+        callback(executor),
+    });
+
+    await expect(
+      saveResponseLogicEntry({
+        userId: 42,
+        value: {
+          questionId: "question-1",
+          groupId: "basic",
+          groupTitle: "产品场景",
+          question: "企业有什么核心产品？",
+          intent: "核验产品事实",
+          summary: "给出可核验的产品口径",
+          expectedRevision: 3,
+          draft: {
+            concern: "新内容",
+            conclusion: "新内容",
+            facts: "新内容",
+            pending: "",
+            boundaries: "新内容",
+            references: "新内容",
+            images: [],
+            attachments: [],
+          },
+          publish: false,
+        },
+      }),
+    ).rejects.toBeInstanceOf(ResponseLogicRevisionConflictError);
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("does not recreate response logic after maintenance archived the question", async () => {
+    const insert = vi.fn();
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === apiCredentials
+                  ? [{ id: "credential-1" }]
+                  : table === workspaceQuestions
+                    ? [
+                        {
+                          id: "question-1",
+                          userId: 42,
+                          status: "archived",
+                          selectionApprovalStatus: "approved",
+                          locked: false,
+                        },
+                      ]
+                    : [],
+              ),
+          }),
+        }),
+      }),
+      insert,
+    };
+    mocks.getDb.mockResolvedValue({
+      transaction: async (callback: (tx: typeof executor) => unknown) =>
+        callback(executor),
+    });
+
+    await expect(
+      recordResponseLogicTaskStart({
+        userId: 42,
+        apiCredentialId: "credential-1",
+        value: {
+          questionId: "question-1",
+          groupId: "basic",
+          groupTitle: "产品场景",
+          question: "企业有什么核心产品？",
+          intent: "核验产品事实",
+          summary: "给出可核验的产品口径",
+          conversationId: "conversation-1",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+        },
+        taskId: "task-after-archive",
+        skillName: "response-logic-builder",
+        skillVersion: "1",
+        skillContentHash: "c".repeat(64),
+        verifiedAttachments: [],
+      }),
+    ).rejects.toThrow("不再可编辑");
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a scoped question was deleted before task persistence", async () => {
+    const insert = vi.fn();
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === apiCredentials ? [{ id: "credential-1" }] : [],
+              ),
+          }),
+        }),
+      }),
+      insert,
+    };
+    mocks.getDb.mockResolvedValue({
+      transaction: async (callback: (tx: typeof executor) => unknown) =>
+        callback(executor),
+    });
+
+    await expect(
+      recordResponseLogicTaskStart({
+        userId: 42,
+        apiCredentialId: "credential-1",
+        expectedQuestionScope: {
+          revision: 3,
+          contractId: "contract-1",
+          quotaPeriodId: "period-1",
+        },
+        value: {
+          questionId: "question-1",
+          groupId: "basic",
+          groupTitle: "产品场景",
+          question: "企业有什么核心产品？",
+          intent: "核验产品事实",
+          summary: "给出可核验的产品口径",
+          conversationId: "conversation-1",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+        },
+        taskId: "task-after-delete",
+        skillName: "response-logic-builder",
+        skillVersion: "1",
+        skillContentHash: "d".repeat(64),
+        verifiedAttachments: [],
+      }),
+    ).rejects.toThrow("已不存在");
+    expect(insert).not.toHaveBeenCalled();
   });
 
   it("does not relabel an existing task with a newer Skill during continuation", async () => {

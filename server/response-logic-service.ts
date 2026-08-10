@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, or } from "drizzle-orm";
 
-import { responseLogicEntries, upstreamResources } from "../drizzle/schema";
+import {
+  conversations,
+  responseLogicEntries,
+  upstreamResources,
+  workspaceQuestions,
+} from "../drizzle/schema";
 import type {
   ConfirmedResponseLogic,
   ResponseLogicAttachment,
@@ -21,6 +26,92 @@ async function requireDb() {
     );
   }
   return db;
+}
+
+export type ResponseLogicQuestionWriteScope = {
+  revision: number;
+  contractId: string | null;
+  quotaPeriodId: string;
+};
+
+async function lockResponseLogicQuestionForWrite(input: {
+  executor: any;
+  userId: number;
+  questionId: string;
+  expectedScope?: ResponseLogicQuestionWriteScope;
+}) {
+  const rows = await input.executor
+    .select()
+    .from(workspaceQuestions)
+    .where(
+      and(
+        eq(workspaceQuestions.id, input.questionId),
+        eq(workspaceQuestions.userId, input.userId),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const question = rows[0];
+  // Managed legacy templates can predate workspace_questions. When a row does
+  // exist, it is the authoritative lifecycle lock for every write path.
+  if (!question) {
+    if (input.expectedScope) {
+      throw new AuthServiceError("CONFLICT", "当前问题已不存在，请刷新后重试");
+    }
+    return;
+  }
+  if (
+    question.status !== "selected" ||
+    question.selectionApprovalStatus !== "approved" ||
+    !question.locked ||
+    (input.expectedScope &&
+      (question.revision !== input.expectedScope.revision ||
+        question.contractId !== input.expectedScope.contractId ||
+        question.quotaPeriodId !== input.expectedScope.quotaPeriodId))
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前问题已变更或不再可编辑，请刷新后重试",
+    );
+  }
+}
+
+async function lockResponseLogicQuestionsForBatch(input: {
+  executor: any;
+  userId: number;
+  questionIds: string[];
+}) {
+  const rows = await input.executor
+    .select()
+    .from(workspaceQuestions)
+    .where(
+      and(
+        eq(workspaceQuestions.userId, input.userId),
+        inArray(workspaceQuestions.id, input.questionIds),
+      ),
+    )
+    .for("update");
+  const foundQuestionIds = new Set(rows.map((question: any) => question.id));
+  if (
+    input.questionIds.some((questionId) => !foundQuestionIds.has(questionId))
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "应答逻辑模板包含已删除或不属于当前目录的问题",
+    );
+  }
+  for (const question of rows) {
+    if (
+      question.status !== "selected" ||
+      question.selectionApprovalStatus !== "approved" ||
+      !question.locked
+    ) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "应答逻辑模板包含已变更或不可编辑的问题",
+      );
+    }
+  }
 }
 
 function attachmentsFromDraft(
@@ -89,7 +180,7 @@ function sameDraftContent(
 
 function sameResponseLogicQuestion(
   current: typeof responseLogicEntries.$inferSelect,
-  incoming: SaveResponseLogicInput,
+  incoming: Omit<SaveResponseLogicInput, "expectedRevision">,
 ) {
   return (
     current.groupId === incoming.groupId &&
@@ -106,7 +197,6 @@ export function assertResponseLogicDraftPublishable(draft: ResponseLogicDraft) {
     ["核心结论 / 执行口径", draft.conclusion],
     ["企业材料 / 官方依据", draft.facts],
     ["表达边界", draft.boundaries],
-    ["参考资料", draft.references],
   ];
   const missing = required
     .filter(([, value]) => !value.trim())
@@ -148,12 +238,13 @@ function toDto(
   };
 }
 
-export class ResponseLogicRevisionConflictError extends Error {
-  readonly code = "RESPONSE_LOGIC_REVISION_CONFLICT";
+export class ResponseLogicRevisionConflictError extends AuthServiceError {
+  readonly responseLogicCode = "RESPONSE_LOGIC_REVISION_CONFLICT";
   readonly statusCode = 409;
 
   constructor(questionId: string, expected: number, actual: number) {
     super(
+      "CONFLICT",
       `应答逻辑 ${questionId} 已更新到 R${actual}，当前模板为 R${expected}；请重新下载当前内容模板。`,
     );
     this.name = "ResponseLogicRevisionConflictError";
@@ -170,6 +261,28 @@ export class ResponseLogicTaskActiveError extends Error {
   }
 }
 
+export class ResponseLogicConfirmedError extends AuthServiceError {
+  readonly responseLogicCode = "RESPONSE_LOGIC_ALREADY_CONFIRMED";
+  readonly statusCode = 409;
+
+  constructor() {
+    super("CONFLICT", "当前应答逻辑已经确认；如需修改，请先提交修改需求");
+    this.name = "ResponseLogicConfirmedError";
+  }
+}
+
+export function assertResponseLogicRecordEditable(
+  record:
+    | Pick<typeof responseLogicEntries.$inferSelect, "confirmed">
+    | Pick<ResponseLogicRecordDto, "confirmed">
+    | null
+    | undefined,
+) {
+  if (record?.confirmed) {
+    throw new ResponseLogicConfirmedError();
+  }
+}
+
 export function assertResponseLogicTaskSlotAvailable(input: {
   currentTaskId?: string | null;
   incomingTaskId: string;
@@ -181,7 +294,7 @@ export function assertResponseLogicTaskSlotAvailable(input: {
 
 export type VersionedResponseLogicSave = {
   expectedRevision: number;
-  value: SaveResponseLogicInput;
+  value: Omit<SaveResponseLogicInput, "expectedRevision">;
 };
 
 type ResponseLogicBatchTransactionHook = (
@@ -245,15 +358,58 @@ export async function getResponseLogicEntry(
   return rows[0] ? toDto(rows[0]) : null;
 }
 
+/**
+ * Legacy format failures cleared response_logic_entries.lastTaskId. Recover
+ * that one continuation only when the same account's persisted conversation
+ * still points at the requested upstream task; task ownership alone is not a
+ * question/conversation binding.
+ */
+export async function responseLogicReleasedContinuationMatches(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+}) {
+  const db = await requireDb();
+  // Conversation snapshots normally use the user-prefixed persistence key,
+  // while response_logic_entries intentionally stores the public browser id.
+  // Keep the public id in the lookup for one-time legacy imports.
+  const persistedConversationIds = [
+    input.conversationId,
+    `u${input.userId}:${input.conversationId}`,
+  ];
+  const rows = await db
+    .select({ id: conversations.id })
+    .from(conversations)
+    .where(
+      and(
+        inArray(conversations.id, persistedConversationIds),
+        eq(conversations.userId, input.userId),
+        or(
+          eq(conversations.upstreamTaskId, input.taskId),
+          eq(conversations.previousResponseId, input.taskId),
+        ),
+      ),
+    )
+    .limit(1);
+  return Boolean(rows[0]);
+}
+
 export async function saveResponseLogicEntry(input: {
   userId: number;
   value: SaveResponseLogicInput;
+  expectedQuestionScope?: ResponseLogicQuestionWriteScope;
   verifiedAttachments?: ResponseLogicAttachment[];
 }): Promise<ResponseLogicRecordDto> {
   const db = await requireDb();
   const now = new Date();
 
   await db.transaction(async (tx) => {
+    await lockResponseLogicQuestionForWrite({
+      executor: tx,
+      userId: input.userId,
+      questionId: input.value.questionId,
+      expectedScope: input.expectedQuestionScope,
+    });
     const rows = await tx
       .select()
       .from(responseLogicEntries)
@@ -266,6 +422,15 @@ export async function saveResponseLogicEntry(input: {
       .limit(1)
       .for("update");
     const existing = rows[0];
+    const actualRevision = existing?.revision ?? 0;
+    if (input.value.expectedRevision !== actualRevision) {
+      throw new ResponseLogicRevisionConflictError(
+        input.value.questionId,
+        input.value.expectedRevision,
+        actualRevision,
+      );
+    }
+    assertResponseLogicRecordEditable(existing);
     const draft = withAuthoritativeAttachments({
       draft: input.value.draft,
       existingDraft: existing?.draft,
@@ -309,7 +474,12 @@ export async function saveResponseLogicEntry(input: {
       await tx
         .update(responseLogicEntries)
         .set(values)
-        .where(eq(responseLogicEntries.id, existing.id));
+        .where(
+          and(
+            eq(responseLogicEntries.id, existing.id),
+            eq(responseLogicEntries.revision, input.value.expectedRevision),
+          ),
+        );
       return;
     }
 
@@ -365,6 +535,12 @@ export async function saveResponseLogicEntriesBatch(input: {
   return db.transaction(async (tx) => {
     await input.beforeWrite?.(tx);
 
+    await lockResponseLogicQuestionsForBatch({
+      executor: tx,
+      userId: input.userId,
+      questionIds,
+    });
+
     const currentRows = await tx
       .select()
       .from(responseLogicEntries)
@@ -389,6 +565,7 @@ export async function saveResponseLogicEntriesBatch(input: {
           actualRevision,
         );
       }
+      assertResponseLogicRecordEditable(current);
     }
 
     const changedEntries = input.entries.filter((entry) => {
@@ -493,12 +670,13 @@ export async function saveResponseLogicEntriesBatch(input: {
 export async function recordResponseLogicTaskStart(input: {
   userId: number;
   apiCredentialId: string;
-  value: Omit<SaveResponseLogicInput, "publish">;
+  value: Omit<SaveResponseLogicInput, "publish" | "expectedRevision">;
   taskId: string;
   skillName: string;
   skillVersion: string;
   skillContentHash: string;
   preserveExistingSkillBinding?: boolean;
+  expectedQuestionScope?: ResponseLogicQuestionWriteScope;
   verifiedAttachments: ResponseLogicAttachment[];
 }) {
   const db = await requireDb();
@@ -513,6 +691,13 @@ export async function recordResponseLogicTaskStart(input: {
     ) {
       throw new AuthServiceError("NOT_FOUND", "API credential not found");
     }
+
+    await lockResponseLogicQuestionForWrite({
+      executor: tx,
+      userId: input.userId,
+      questionId: input.value.questionId,
+      expectedScope: input.expectedQuestionScope,
+    });
 
     // Lock the question slot before claiming the upstream task. This makes a
     // second browser tab lose deterministically instead of replacing the
@@ -529,6 +714,7 @@ export async function recordResponseLogicTaskStart(input: {
       .limit(1)
       .for("update");
     const existing = rows[0];
+    assertResponseLogicRecordEditable(existing);
     assertResponseLogicTaskSlotAvailable({
       currentTaskId: existing?.lastTaskId,
       incomingTaskId: input.taskId,

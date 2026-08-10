@@ -150,9 +150,10 @@ export async function buildKnowledgeBaseFinalizationInput(input: {
     throw new Error("FINALIZATION_INPUT_LOGO_BINDING_INVALID");
   }
   if (
-    !["official_web", "official_document", "official_logo_upload"].includes(
-      String(officialLogo.sourceKind || ""),
-    ) ||
+    (officialLogo.sourceKind !== undefined &&
+      !["official_web", "official_document", "official_logo_upload"].includes(
+        officialLogo.sourceKind,
+      )) ||
     (officialLogo.sourceKind === "official_web" &&
       (!validHttpUrl(officialLogo.sourcePageUrl) ||
         !validHttpUrl(officialLogo.sourceAssetUrl))) ||
@@ -215,7 +216,7 @@ export async function buildKnowledgeBaseFinalizationInput(input: {
         requiredManifest: {
           branchId: nodeById.get(documentIds[0]!)!.branchId,
           documentIds,
-          sourceKind: asset.sourceKind || asset.kind,
+          ...(asset.sourceKind ? { sourceKind: asset.sourceKind } : {}),
           ownership: "first_party",
           assetType:
             asset.kind === "official_logo"

@@ -78,6 +78,7 @@ export type AuthServiceErrorCode =
   | "INVALID_PASSWORD"
   | "LAST_ADMIN"
   | "NOT_FOUND"
+  | "PROJECT_DELETED"
   | "RATE_LIMITED"
   | "UPSTREAM_UNAVAILABLE";
 
@@ -1038,7 +1039,7 @@ export async function setManagedUserActive(userId: number, isActive: boolean) {
       if (assignmentRows[0] || ticketRows[0]) {
         throw new AuthServiceError(
           "CONFLICT",
-          "该工程师仍负责客户项目或未结束工单，请先完成转交",
+          "该工程师仍负责客户项目或未结束需求，请先完成转交",
         );
       }
     }
@@ -1183,7 +1184,7 @@ export async function deleteManagedUser(
       if (assignmentRows[0] || ticketRows[0]) {
         throw new AuthServiceError(
           "CONFLICT",
-          "该工程师仍负责客户项目或未结束工单，请先完成转交",
+          "该工程师仍负责客户项目或未结束需求，请先完成转交",
         );
       }
       if (projectResourceRows[0] || projectConversationRows[0]) {

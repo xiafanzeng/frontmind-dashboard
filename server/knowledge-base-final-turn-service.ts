@@ -9,7 +9,6 @@ import {
   MAX_KNOWLEDGE_BASE_CUSTOMER_UPLOAD_BYTES,
   MAX_KNOWLEDGE_BASE_CUSTOMER_UPLOAD_IMAGES,
   declaredKnowledgeBaseCustomerUploadsForBuild,
-  persistedKnowledgeBaseOfficialLogoProvenanceForBuild,
   verifiedKnowledgeBaseCustomerUploadBytesForBuild,
   verifiedKnowledgeBaseOfficialLogoUploadForBuild,
 } from "./knowledge-base-customer-upload";
@@ -217,31 +216,20 @@ export async function buildFinalizationInputForTurn(input: {
     expectedBytes: build.logoBytes,
     storageKey: build.logoStorageKey,
   });
-  const [officialLogoUpload, customerUploads, initialLogoProvenance] =
-    await Promise.all([
-      verifiedKnowledgeBaseOfficialLogoUploadForBuild({
-        userId: input.userId,
-        buildId: build.id,
-        generation: input.generation,
-      }),
-      verifiedKnowledgeBaseCustomerUploadBytesForBuild({
-        userId: input.userId,
-        buildId: build.id,
-        generation: input.generation,
-        officialLogoSha256: build.logoSha256,
-      }),
-      persistedKnowledgeBaseOfficialLogoProvenanceForBuild({
-        userId: input.userId,
-        buildId: build.id,
-        generation: input.generation,
-      }),
-    ]);
-  if (!officialLogoUpload && !initialLogoProvenance) {
-    throw new Error("KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED");
-  }
-  if (officialLogoUpload && initialLogoProvenance) {
-    throw new Error("企业官方主 Logo 同时存在上传与外部来源账本");
-  }
+  const [officialLogoUpload, customerUploads] = await Promise.all([
+    verifiedKnowledgeBaseOfficialLogoUploadForBuild({
+      userId: input.userId,
+      buildId: build.id,
+      generation: input.generation,
+      expectedLogoSha256: build.logoSha256,
+    }),
+    verifiedKnowledgeBaseCustomerUploadBytesForBuild({
+      userId: input.userId,
+      buildId: build.id,
+      generation: input.generation,
+      officialLogoSha256: build.logoSha256,
+    }),
+  ]);
   return buildKnowledgeBaseFinalizationInput({
     companyName: build.companyName,
     operationId: input.operationId,
@@ -286,21 +274,8 @@ export async function buildFinalizationInputForTurn(input: {
         // administrative ledger must never move the asset's document binding.
         documentIds: [nodes[0]!.leafId],
         sourceFileIds: officialLogoUpload ? [officialLogoUpload.fileId] : [],
-        sourceKind: officialLogoUpload
-          ? "official_logo_upload"
-          : initialLogoProvenance!.sourceKind,
-        ...(!officialLogoUpload &&
-        initialLogoProvenance?.sourceKind === "official_web"
-          ? {
-              sourcePageUrl: initialLogoProvenance.sourcePageUrl,
-              sourceAssetUrl: initialLogoProvenance.sourceAssetUrl,
-            }
-          : {}),
-        ...(!officialLogoUpload &&
-        initialLogoProvenance?.sourceKind === "official_document"
-          ? {
-              sourceDocumentPath: initialLogoProvenance.sourceDocumentPath,
-            }
+        ...(officialLogoUpload
+          ? { sourceKind: "official_logo_upload" as const }
           : {}),
         ...(officialLogoUpload
           ? {

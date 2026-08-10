@@ -14,6 +14,7 @@ import {
   getQuestionQuotaState,
   validateQuestionQuotaAdjustment,
 } from "./question-quota-service";
+import { UNCLASSIFIED_QUESTION_CANDIDATE_KEY } from "./question-selection-policy";
 
 const NOW = new Date("2026-08-05T08:00:00.000Z");
 const PROJECT_ID = "5fd64890-0ba5-4bdf-b9bb-b6a102a97421";
@@ -270,6 +271,55 @@ describe("question quota input and usage", () => {
         productScenario: 1,
         total: 2,
       },
+    });
+  });
+
+  it("reserves only the total slot for an unclassified direct submission", () => {
+    expect(
+      countQuestionQuotaUsage([
+        {
+          category: "product_scenario",
+          candidateKey: UNCLASSIFIED_QUESTION_CANDIDATE_KEY,
+          source: "user",
+          status: "candidate",
+          selectionApprovalStatus: "pending",
+        },
+      ]),
+    ).toEqual({
+      selectedUsage: {
+        industry: 0,
+        competitorComparison: 0,
+        reputation: 0,
+        productScenario: 0,
+        total: 0,
+      },
+      reservedUsage: {
+        industry: 0,
+        competitorComparison: 0,
+        reputation: 0,
+        productScenario: 0,
+        total: 1,
+      },
+    });
+  });
+
+  it("does not reinterpret a legacy pending product-scenario question", () => {
+    expect(
+      countQuestionQuotaUsage([
+        {
+          category: "product_scenario",
+          candidateKey: null,
+          source: "user",
+          status: "candidate",
+          selectionApprovalStatus: "pending",
+        },
+      ]).reservedUsage,
+    ).toEqual({
+      industry: 0,
+      competitorComparison: 0,
+      reputation: 0,
+      productScenario: 1,
+      total: 1,
     });
   });
 

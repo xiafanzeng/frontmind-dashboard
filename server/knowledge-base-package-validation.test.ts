@@ -280,6 +280,21 @@ describe("knowledge-base final package binding", () => {
     ).toMatchObject({ customerUploadCount: 1 });
   });
 
+  it("accepts a schema v4 auto-bound Logo without external provenance", () => {
+    const input = fixture();
+
+    expect(
+      assertKnowledgeBasePackageMatchesBuild({
+        ...input,
+        packageSchemaVersion: 4,
+        expectedCustomerUploads: [],
+      }),
+    ).toMatchObject({
+      logoSha256,
+      customerUploadCount: 0,
+    });
+  });
+
   it.each([
     [
       "official web page",

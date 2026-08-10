@@ -61,6 +61,10 @@ describe("preview service portal fixtures", () => {
   it("moves selected questions directly into response logic", () => {
     const basic = getPreviewServicePortal("basic");
 
+    expect(basic.knowledgeBase.sourceLabel).toBe("Website 流程同步知识库");
+    expect(basic.capabilities.knowledgeBuild.reason).toBe(
+      "普通版不包含知识库智能体；知识库由 Website 流程自动同步至本账号，服务团队可补录。升级进阶版或豪华版后可解锁知识库智能体。",
+    );
     expect(basic.workflowSteps.map((step) => step.id)).toEqual([
       "knowledge",
       "question",
@@ -84,6 +88,19 @@ describe("preview service portal fixtures", () => {
       label: "进入应答逻辑智能体",
       href: "/response-logic",
     });
+  });
+
+  it("keeps Advanced content assets locked until the knowledge agent publishes", () => {
+    expect(
+      getPreviewServicePortal("advanced").capabilities.contentAssets,
+    ).toEqual(
+      expect.objectContaining({
+        allowed: false,
+        effectiveStatus: "pending",
+        reason:
+          "请先在知识库智能体中完成全部节点并发布当前服务的认证知识库；知识库展示完成后解锁 AI 友好内容资产。",
+      }),
+    );
   });
 
   it("keeps the acceptance knowledge snapshot anonymous", () => {
