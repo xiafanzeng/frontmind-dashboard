@@ -405,11 +405,12 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
     expect(embeddedKnowledgeBasePanel).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
     expect(
-      screen.getByRole("dialog", { name: "知识库需求记录" }),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      screen.queryByRole("button", { name: "需求记录" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "知识库需求记录" }),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "知识库展示" }));
     expect(
@@ -441,6 +442,66 @@ describe("UserBrandDashboard service experience", () => {
     expect(
       screen.getByRole("dialog", { name: "应答逻辑需求记录" }),
     ).toBeInTheDocument();
+  });
+
+  it("removes an open request-history dialog when its route becomes locked", () => {
+    setPreviewPlan("luxury");
+    let portal = {
+      ...luxuryPreviewPortal,
+      purchasedQuestions: [],
+    };
+    const fixtures = {
+      ...userPreviewFixtures,
+      getServicePortal: () => portal,
+    };
+    const { rerender } = render(
+      <PreviewUserBrandDashboard fixtures={fixtures} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "应答逻辑智能体" }));
+    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
+    expect(
+      screen.getByRole("dialog", { name: "应答逻辑需求记录" }),
+    ).toBeInTheDocument();
+
+    portal = {
+      ...portal,
+      capabilities: {
+        ...portal.capabilities,
+        responseLogic: {
+          allowed: false,
+          effectiveStatus: "pending",
+          reason: "服务端正在准备应答逻辑。",
+          nextAction: {
+            kind: "view_progress_report",
+            label: "查看服务进度",
+            href: "/progress-report",
+          },
+        },
+      },
+    };
+    rerender(<PreviewUserBrandDashboard fixtures={fixtures} />);
+
+    expect(
+      screen.queryByRole("dialog", { name: "应答逻辑需求记录" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "需求记录" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("服务端正在准备应答逻辑。")).toBeInTheDocument();
+
+    portal = {
+      ...portal,
+      capabilities: luxuryPreviewPortal.capabilities,
+    };
+    rerender(<PreviewUserBrandDashboard fixtures={fixtures} />);
+
+    expect(
+      screen.getByRole("button", { name: "需求记录" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "应答逻辑需求记录" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the user knowledge builder on one conversation without a switcher", () => {

@@ -519,34 +519,49 @@ describe("service workflow UI gates", () => {
     expect(within(accountDialog).queryByText("0 / 5")).not.toBeInTheDocument();
   });
 
-  it("keeps a neutral history action beside the locked route's server action", () => {
-    const portal = workflowPortal();
-    const onNavigate = vi.fn();
-    const onOpenHistory = vi.fn();
-    const access = getCapability(portal, "responseLogic");
+  it.each([
+    ["pending", "先完成问题优化"],
+    ["locked", "升级豪华版"],
+    ["unavailable", "先完成问题优化"],
+  ] as const)(
+    "removes request history from a %s route while keeping its server action",
+    (effectiveStatus, actionLabel) => {
+      const portal = workflowPortal();
+      const onNavigate = vi.fn();
+      const onOpenAccount = vi.fn();
+      const access = {
+        ...getCapability(portal, "responseLogic"),
+        allowed: false,
+        effectiveStatus,
+      };
 
-    render(
-      <ServiceLockedPage
-        title="应答逻辑智能体"
-        access={access}
-        portal={portal}
-        historyAction={{ onClick: onOpenHistory }}
-        onNavigate={onNavigate}
-        onOpenAccount={vi.fn()}
-      />,
-    );
+      render(
+        <ServiceLockedPage
+          title="应答逻辑智能体"
+          access={access}
+          portal={portal}
+          onNavigate={onNavigate}
+          onOpenAccount={onOpenAccount}
+        />,
+      );
 
-    expect(
-      screen.getByText("请先完成服务端记录的问题优化。"),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "账号与服务" }),
-    ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
-    expect(onOpenHistory).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole("button", { name: "先完成问题优化" }));
-    expect(onNavigate).toHaveBeenCalledWith("intent", "question-optimization");
-  });
+      expect(
+        screen.getByText("请先完成服务端记录的问题优化。"),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "需求记录" }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: actionLabel }));
+      if (effectiveStatus === "locked") {
+        expect(onOpenAccount).toHaveBeenCalledTimes(1);
+      } else {
+        expect(onNavigate).toHaveBeenCalledWith(
+          "intent",
+          "question-optimization",
+        );
+      }
+    },
+  );
 
   it("keeps historical questions out of the compact service-home summary", () => {
     const portal = workflowPortal();

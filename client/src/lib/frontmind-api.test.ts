@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import {
   createKnowledgeBaseTurnTask,
   reserveKnowledgeBaseTurnWithAttachments,
@@ -75,6 +77,37 @@ describe("sanitizeBrandText", () => {
     expect(visible).not.toContain("frontmind.knowledge-base.manifest");
     expect(visible).not.toContain("frontmind.workflow-state");
     expect(visible).not.toContain("frontmind.knowledge-base.presentation");
+  });
+
+  it("keeps the source provider name out of production client source", () => {
+    const sourceBrand = ["ma", "nus"].join("");
+    const sourceRoot = resolve(process.cwd(), "client/src");
+    const offenders: string[] = [];
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const pathname = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          visit(pathname);
+          continue;
+        }
+        if (
+          !/\.(?:ts|tsx)$/.test(entry.name) ||
+          /\.(?:test|spec)\.(?:ts|tsx)$/.test(entry.name)
+        ) {
+          continue;
+        }
+        if (
+          readFileSync(pathname, "utf8")
+            .toLowerCase()
+            .includes(sourceBrand.toLowerCase())
+        ) {
+          offenders.push(pathname.slice(sourceRoot.length + 1));
+        }
+      }
+    };
+
+    visit(sourceRoot);
+    expect(offenders).toEqual([]);
   });
 });
 
@@ -314,6 +347,90 @@ describe("createKnowledgeBaseTurnTask", () => {
       );
     },
   );
+
+  it("replays repeated pending Logo responses with one stable request body", async () => {
+    vi.useFakeTimers();
+    const pendingResponse = () => ({
+      ok: false,
+      status: 425,
+      headers: { get: () => "0" },
+      json: async () => ({
+        error: {
+          code: "IDEMPOTENCY_PENDING",
+          message: "Logo 任务仍在绑定",
+        },
+        observation: {
+          stateEpoch: 2,
+          generation: 1,
+          activeTurn: { clientRequestId: "request-logo-replay" },
+          interaction: {
+            progress: null,
+            interactionState: "executing",
+            canReply: false,
+            canPublish: false,
+            lockReason: "Logo 正在处理中",
+          },
+        },
+      }),
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(pendingResponse())
+      .mockResolvedValueOnce(pendingResponse())
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          task: { id: "frontmind-logo-task", status: "running" },
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const created = createKnowledgeBaseTurnTask([], {
+      conversationId: "conv-kb",
+      clientRequestId: "request-logo-replay",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      submissionKind: "logo",
+    });
+    await vi.advanceTimersByTimeAsync(500 + 1_000);
+
+    await expect(created).resolves.toMatchObject({
+      id: "frontmind-logo-task",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(new Set(fetchMock.mock.calls.map((call) => call[1].body))).toEqual(
+      new Set([fetchMock.mock.calls[0][1].body]),
+    );
+  });
+
+  it("sanitizes a knowledge-base rejection before exposing its message", async () => {
+    const sourceBrand = ["Ma", "nus"].join("");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 422,
+      headers: { get: () => null },
+      json: async () => ({
+        error: {
+          code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+          message: `${sourceBrand} 拒绝了无效 Logo`,
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createKnowledgeBaseTurnTask([], {
+        conversationId: "conv-kb",
+        clientRequestId: "request-invalid-logo",
+        submissionKind: "logo",
+      }),
+    ).rejects.toMatchObject({
+      message: "FrontMind 拒绝了无效 Logo",
+      status: 422,
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 
   it("waits for Retry-After before replaying the same turn request", async () => {
     vi.useFakeTimers();

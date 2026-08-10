@@ -36,6 +36,8 @@ import {
   inspectKnowledgeBaseRetryAuthority,
   knowledgeBaseRetryRequiresFreshFinalDelivery,
   prepareKnowledgeBaseTurnDispatch,
+  rejectAcknowledgedKnowledgeBaseManualLogoTurn,
+  rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   reserveKnowledgeBaseGeneratedAttachment,
   reserveKnowledgeBaseRetryTurn,
   reserveKnowledgeBaseStartBuild,
@@ -429,6 +431,34 @@ describe("knowledge-base turn identity", () => {
       createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
     ).not.toContain("FrontMind 超前智能");
   });
+
+  it("allocates a distinct provider operation for each manual Logo request", () => {
+    const base = {
+      buildId: "00000000-0000-4000-8000-000000000002",
+      buildGeneration: 3,
+      operationType: "revise" as const,
+      expectedRevision: 7,
+      expectedLeafId: "1.8",
+    };
+    const first = createKnowledgeBaseOperationKey({
+      ...base,
+      operationInstanceId: "manual-logo-request-a",
+    });
+    const replay = createKnowledgeBaseOperationKey({
+      ...base,
+      operationInstanceId: "manual-logo-request-a",
+    });
+    const replacement = createKnowledgeBaseOperationKey({
+      ...base,
+      operationInstanceId: "manual-logo-request-b",
+    });
+
+    expect(replay).toBe(first);
+    expect(replacement).not.toBe(first);
+    expect(createKnowledgeBaseUpstreamIdempotencyKey(replacement)).not.toBe(
+      createKnowledgeBaseUpstreamIdempotencyKey(first),
+    );
+  });
 });
 
 describe("knowledge-base turn replay decisions", () => {
@@ -583,32 +613,39 @@ describe("knowledge-base HTTP replay receipts", () => {
     });
   });
 
-  it("never lets coordinate fallback adopt an unprepared cancellation tombstone", async () => {
-    const receipt = await inspectKnowledgeBaseTurnReplay(
-      {
-        userId: 1,
-        conversationId: "conversation-1",
-        clientRequestId: "replacement-request",
-        clientIntent: intent,
-        expectedGeneration: 3,
-        expectedRevision: 7,
-        expectedLeafId: "1.8",
-      },
-      replayExecutor([
-        [],
-        [
-          replayTurn({
-            status: "cancelled",
-            metadata: {
-              clientIntentHash: hashKnowledgeBaseTurnRequest(intent),
-              unpreparedCancellation: true,
-            },
-          }),
-        ],
-      ]),
-    );
-    expect(receipt).toBeNull();
-  });
+  it.each([
+    "unpreparedCancellation",
+    "acknowledgedManualLogoCancellation",
+    "unacknowledgedManualLogoCancellation",
+  ] as const)(
+    "never lets coordinate fallback adopt a %s tombstone",
+    async (tombstoneFlag) => {
+      const receipt = await inspectKnowledgeBaseTurnReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          clientRequestId: "replacement-request",
+          clientIntent: intent,
+          expectedGeneration: 3,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+        },
+        replayExecutor([
+          [],
+          [
+            replayTurn({
+              status: "cancelled",
+              metadata: {
+                clientIntentHash: hashKnowledgeBaseTurnRequest(intent),
+                [tombstoneFlag]: true,
+              },
+            }),
+          ],
+        ]),
+      );
+      expect(receipt).toBeNull();
+    },
+  );
 
   it("replays an already staged file without consulting current Logo state", async () => {
     const manifest = [{ filename: "logo.png", sha256: "a".repeat(64) }];
@@ -2711,6 +2748,476 @@ describe("knowledge-base attachment-first turn reservation", () => {
     await expect(
       claimKnowledgeBaseTurnForRecovery({ turnId: waiting.id }, executor),
     ).resolves.toBeNull();
+  });
+});
+
+describe("acknowledged manual Logo rejection", () => {
+  const leaseToken = "manual-logo-lease";
+  const rejectedAt = new Date("2026-08-01T00:00:30.000Z");
+
+  function fixture(overrides: { presentationKey?: string } = {}) {
+    const buildId = "00000000-0000-4000-8000-000000000040";
+    const clientRequestId = "manual-logo-request-invalid";
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId,
+      buildGeneration: 2,
+      operationType: "revise",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      operationInstanceId: clientRequestId,
+    });
+    const presentationKey = overrides.presentationKey ?? "presentation-first";
+    const requestBody = {
+      prompt: "replace official logo",
+      agentProfile: "manus-1.6-max",
+      taskMode: "agent" as const,
+      taskId: "parent-task",
+      attachments: [
+        { file_id: "skill-file", filename: "skill.zip" },
+        { file_id: "instructions-file", filename: "instructions.md" },
+        { file_id: "invalid-logo-file", filename: "invalid-logo.png" },
+      ],
+    };
+    const acknowledgedTurn = turn({
+      id: "00000000-0000-4000-8000-000000000041",
+      conversationId: "u1:conversation-manual-logo",
+      clientRequestId,
+      buildId,
+      buildGeneration: 2,
+      operationKey,
+      operationType: "revise",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      attachmentFileIds: [
+        "skill-file",
+        "instructions-file",
+        "invalid-logo-file",
+      ],
+      status: "running",
+      upstreamTaskId: "child-logo-task",
+      startedAt: new Date("2026-08-01T00:00:20.000Z"),
+      leaseExpiresAt: new Date("2026-08-01T00:05:00.000Z"),
+      metadata: {
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 3,
+        userAttachmentCount: 1,
+        expectedPresentationKey: "presentation-first",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-manual-logo",
+          parentTaskId: "parent-task",
+          manualLogoSubmission: true,
+          userMessage: "请使用新 Logo 重新呈现",
+          attachments: [
+            { file_id: "invalid-logo-file", filename: "invalid-logo.png" },
+          ],
+          officialLogoUpload: {
+            index: 0,
+            fileId: "invalid-logo-file",
+            filename: "invalid-logo.png",
+            mimeType: "image/png",
+            sizeBytes: 32,
+            sourceSha256: "a".repeat(64),
+            verified: false,
+          },
+          skillVersion: "4",
+          skillContentHash: "c".repeat(64),
+        },
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.test",
+          requestBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const build = {
+      id: buildId,
+      userId: 1,
+      conversationId: "conversation-manual-logo",
+      companyName: "FrontMind 超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      status: "confirming",
+      generation: 2,
+      stateEpoch: 9,
+      activeTurnId: acknowledgedTurn.id,
+      upstreamTaskId: acknowledgedTurn.upstreamTaskId,
+      lastAppliedOperationKey: "last-applied-operation",
+      currentPresentationKey: presentationKey,
+      revision: 0,
+      currentLeafId: "1.1",
+      totalNodeCount: 10,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      awaitingResponseSince: new Date("2026-08-01T00:00:20.000Z"),
+      protocolErrorCode: null,
+      protocolError: null,
+      logoStorageKey: "logos/existing.png",
+      logoSha256: "e".repeat(64),
+      logoBytes: 256,
+      logoFilename: "existing.png",
+      logoMimeType: "image/png",
+    };
+    const conversation = {
+      id: acknowledgedTurn.conversationId,
+      userId: 1,
+      projectAssignmentId: null,
+      deletedAt: null,
+      deletedMessageIds: [],
+      version: 4,
+      status: "running",
+      upstreamTaskId: acknowledgedTurn.upstreamTaskId,
+      previousResponseId: "parent-task",
+      completedAt: null,
+    };
+    return { acknowledgedTurn, build, conversation };
+  }
+
+  it("restores the exact parent state, is idempotent, and lets new Logo bytes reserve a distinct provider operation", async () => {
+    const { acknowledgedTurn, build, conversation } = fixture();
+    const oldTurn = (current: TurnServiceStore) =>
+      current.turns.filter((candidate) => candidate.id === acknowledgedTurn.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [acknowledgedTurn],
+      turnSelections: [[oldTurn], [oldTurn], [oldTurn], [[], []]],
+    });
+    const input = {
+      userId: 1,
+      buildId: build.id,
+      buildGeneration: build.generation,
+      turnId: acknowledgedTurn.id,
+      clientRequestId: acknowledgedTurn.clientRequestId,
+      leaseToken,
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID" as const,
+      message: "Logo 原始文件无法安全解码，请重新上传",
+      now: rejectedAt,
+    };
+
+    const rejected = await rejectAcknowledgedKnowledgeBaseManualLogoTurn(
+      input,
+      executor,
+    );
+    expect(rejected).toMatchObject({
+      id: acknowledgedTurn.id,
+      status: "cancelled",
+      upstreamTaskId: "child-logo-task",
+      completedAt: rejectedAt,
+      leaseExpiresAt: null,
+    });
+    expect(store.build).toMatchObject({
+      upstreamTaskId: "parent-task",
+      status: "confirming",
+      stateEpoch: build.stateEpoch + 1,
+      activeTurnId: null,
+      awaitingResponseSince: null,
+      protocolErrorCode: null,
+      protocolError: null,
+      revision: build.revision,
+      currentLeafId: build.currentLeafId,
+      currentPresentationKey: build.currentPresentationKey,
+      lastAppliedOperationKey: build.lastAppliedOperationKey,
+      logoStorageKey: build.logoStorageKey,
+      logoSha256: build.logoSha256,
+      logoBytes: build.logoBytes,
+      logoFilename: build.logoFilename,
+      logoMimeType: build.logoMimeType,
+    });
+    expect(store.turns[0]).toMatchObject({
+      status: "cancelled",
+      upstreamTaskId: "child-logo-task",
+      startedAt: acknowledgedTurn.startedAt,
+      attachmentFileIds: acknowledgedTurn.attachmentFileIds,
+      errorCode: input.code,
+      completedAt: rejectedAt,
+      leaseExpiresAt: null,
+      metadata: {
+        acknowledgedManualLogoCancellation: true,
+        cancelledOperationKey: acknowledgedTurn.operationKey,
+        attachmentsFrozen: true,
+        recovery: {
+          officialLogoUpload: {
+            fileId: "invalid-logo-file",
+            verified: false,
+          },
+        },
+        preparedDispatch: { requestBody: { taskId: "parent-task" } },
+      },
+    });
+    expect(store.turns[0]!.operationKey).not.toBe(
+      acknowledgedTurn.operationKey,
+    );
+    expect((store.turns[0]!.metadata as any).leaseOwnerHash).toBeUndefined();
+    expect(store.conversation).toMatchObject({
+      status: "awaiting_input",
+      upstreamTaskId: "parent-task",
+      previousResponseId: "parent-task",
+      version: conversation.version + 1,
+      completedAt: null,
+    });
+
+    const settledState = structuredClone(store);
+    await expect(
+      rejectAcknowledgedKnowledgeBaseManualLogoTurn(
+        { ...input, now: new Date("2026-08-01T00:00:31.000Z") },
+        executor,
+      ),
+    ).resolves.toMatchObject({ status: "cancelled", completedAt: rejectedAt });
+    expect(store).toEqual(settledState);
+
+    await expect(
+      rejectAcknowledgedKnowledgeBaseManualLogoTurn(
+        { ...input, leaseToken: "wrong-manual-logo-lease" },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toEqual(settledState);
+
+    const replacementRequestId = "manual-logo-request-replacement";
+    const replacement = await reserveKnowledgeBaseTurn(
+      {
+        userId: 1,
+        buildId: build.id,
+        clientRequestId: replacementRequestId,
+        operationInstanceId: replacementRequestId,
+        operationType: "revise",
+        expectedGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: build.currentLeafId,
+        expectedPresentationKey: build.currentPresentationKey,
+        requestPayload: {
+          submissionKind: "logo",
+          attachments: [
+            { file_id: "valid-logo-file", filename: "valid-logo.png" },
+          ],
+        },
+        apiCredentialId: "credential-1",
+        userText: "请使用新 Logo 重新呈现",
+        userAttachmentCount: 1,
+        expectedAttachmentCount: 3,
+        recoveryMetadata: {
+          kind: "turn",
+          conversationId: build.conversationId,
+          parentTaskId: "parent-task",
+          manualLogoSubmission: true,
+          attachments: [
+            { file_id: "valid-logo-file", filename: "valid-logo.png" },
+          ],
+          officialLogoUpload: {
+            index: 0,
+            fileId: "valid-logo-file",
+            filename: "valid-logo.png",
+            mimeType: "image/png",
+            sizeBytes: 64,
+            sourceSha256: "f".repeat(64),
+            verified: false,
+          },
+          skillVersion: "4",
+          skillContentHash: "c".repeat(64),
+        },
+        now: new Date("2026-08-01T00:01:00.000Z"),
+      },
+      executor,
+    );
+    expect(replacement).toMatchObject({
+      state: "acquired",
+      turn: {
+        clientRequestId: replacementRequestId,
+        upstreamTaskId: null,
+      },
+    });
+    expect(replacement.turn.operationKey).not.toBe(
+      acknowledgedTurn.operationKey,
+    );
+    expect(store.turns[1]).toMatchObject({
+      metadata: {
+        recovery: {
+          attachments: [
+            { file_id: "valid-logo-file", filename: "valid-logo.png" },
+          ],
+          officialLogoUpload: { fileId: "valid-logo-file", verified: false },
+        },
+      },
+    });
+    expect(
+      createKnowledgeBaseUpstreamIdempotencyKey(replacement.turn.operationKey),
+    ).not.toBe(
+      createKnowledgeBaseUpstreamIdempotencyKey(acknowledgedTurn.operationKey),
+    );
+  });
+
+  it("fails closed when the authoritative presentation changed", async () => {
+    const { acknowledgedTurn, build, conversation } = fixture({
+      presentationKey: "newer-presentation",
+    });
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [acknowledgedTurn],
+      turnSelections: [[(current) => current.turns]],
+    });
+    const before = structuredClone(store);
+
+    await expect(
+      rejectAcknowledgedKnowledgeBaseManualLogoTurn(
+        {
+          userId: 1,
+          buildId: build.id,
+          buildGeneration: build.generation,
+          turnId: acknowledgedTurn.id,
+          clientRequestId: acknowledgedTurn.clientRequestId,
+          leaseToken,
+          code: "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
+          message: "当前知识节点已变化",
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toEqual(before);
+  });
+
+  it("releases a prepared Logo turn after a deterministic pre-ack rejection and accepts new bytes", async () => {
+    const source = fixture();
+    const unacknowledgedTurn = {
+      ...source.acknowledgedTurn,
+      upstreamTaskId: null,
+    };
+    const build = {
+      ...source.build,
+      upstreamTaskId: "parent-task",
+    };
+    const conversation = {
+      ...source.conversation,
+      upstreamTaskId: "parent-task",
+      previousResponseId: "parent-task",
+    };
+    const oldTurn = (current: TurnServiceStore) =>
+      current.turns.filter(
+        (candidate) => candidate.id === unacknowledgedTurn.id,
+      );
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [unacknowledgedTurn],
+      turnSelections: [[oldTurn], [[], []]],
+    });
+    const input = {
+      userId: 1,
+      buildId: build.id,
+      buildGeneration: build.generation,
+      turnId: unacknowledgedTurn.id,
+      clientRequestId: unacknowledgedTurn.clientRequestId,
+      leaseToken,
+      code: "UPSTREAM_CREATE_HTTP_422",
+      message: "上游已明确拒绝创建本轮任务，请重新选择 Logo",
+      now: rejectedAt,
+    };
+
+    await expect(
+      rejectUnacknowledgedKnowledgeBaseManualLogoTurn(input, executor),
+    ).resolves.toMatchObject({
+      id: unacknowledgedTurn.id,
+      status: "cancelled",
+      upstreamTaskId: null,
+      completedAt: rejectedAt,
+    });
+    expect(store.build).toMatchObject({
+      upstreamTaskId: "parent-task",
+      status: "confirming",
+      activeTurnId: null,
+      awaitingResponseSince: null,
+      protocolErrorCode: null,
+      protocolError: null,
+      revision: build.revision,
+      currentLeafId: build.currentLeafId,
+      currentPresentationKey: build.currentPresentationKey,
+    });
+    expect(store.turns[0]).toMatchObject({
+      status: "cancelled",
+      upstreamTaskId: null,
+      errorCode: input.code,
+      leaseExpiresAt: null,
+      metadata: {
+        unacknowledgedManualLogoCancellation: true,
+        cancelledOperationKey: unacknowledgedTurn.operationKey,
+        attachmentsFrozen: true,
+        preparedDispatch: { requestBody: { taskId: "parent-task" } },
+      },
+    });
+    expect((store.turns[0]!.metadata as any).leaseOwnerHash).toBeUndefined();
+    expect(store.conversation).toMatchObject({
+      status: "awaiting_input",
+      upstreamTaskId: "parent-task",
+      previousResponseId: "parent-task",
+      completedAt: null,
+    });
+
+    const replacementRequestId = "manual-logo-after-create-rejection";
+    const replacement = await reserveKnowledgeBaseTurn(
+      {
+        userId: 1,
+        buildId: build.id,
+        clientRequestId: replacementRequestId,
+        operationInstanceId: replacementRequestId,
+        operationType: "revise",
+        expectedGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: build.currentLeafId,
+        expectedPresentationKey: build.currentPresentationKey,
+        requestPayload: {
+          submissionKind: "logo",
+          attachments: [
+            { file_id: "replacement-logo", filename: "replacement.png" },
+          ],
+        },
+        apiCredentialId: "credential-1",
+        userText: "请使用新 Logo 重新呈现",
+        userAttachmentCount: 1,
+        expectedAttachmentCount: 3,
+        recoveryMetadata: {
+          kind: "turn",
+          conversationId: build.conversationId,
+          parentTaskId: "parent-task",
+          manualLogoSubmission: true,
+          attachments: [
+            { file_id: "replacement-logo", filename: "replacement.png" },
+          ],
+          officialLogoUpload: {
+            index: 0,
+            fileId: "replacement-logo",
+            filename: "replacement.png",
+            mimeType: "image/png",
+            sizeBytes: 64,
+            sourceSha256: "f".repeat(64),
+            verified: false,
+          },
+          skillVersion: "4",
+          skillContentHash: "c".repeat(64),
+        },
+      },
+      executor,
+    );
+    expect(replacement).toMatchObject({
+      state: "acquired",
+      turn: {
+        clientRequestId: replacementRequestId,
+        upstreamTaskId: null,
+      },
+    });
+    expect(replacement.turn.operationKey).not.toBe(
+      unacknowledgedTurn.operationKey,
+    );
   });
 });
 

@@ -12,7 +12,9 @@ import {
 import {
   KnowledgeBaseEnterpriseIdentityError,
   KnowledgeBaseOpenRecoveryLeaseError,
+  KnowledgeBaseUpstreamCreateError,
   KNOWLEDGE_BASE_AGENT_PROFILE,
+  KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE,
   KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
   KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
   KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
@@ -23,6 +25,7 @@ import {
   canonicalKnowledgeBaseUpstreamTask,
   assertKnowledgeBaseAttachmentManifestPresent,
   assertKnowledgeBaseExpectedGeneration,
+  assertManualKnowledgeBaseLogoUploadCandidate,
   classifyKnowledgeBaseUpstreamCreateFailure,
   classifyKnowledgeBaseOpenRecoveryFailure,
   createFrontMindTask,
@@ -30,6 +33,10 @@ import {
   getKnowledgeBaseSkillDescriptor,
   isApprovedKnowledgeBaseAwaitingInputObservation,
   knowledgeBaseArtifactFailureNotice,
+  knowledgeBaseManualLogoCreateFailureForPersistence,
+  knowledgeBaseManualLogoPendingResponse,
+  knowledgeBaseManualLogoDeterministicCreateFailureStatus,
+  knowledgeBaseManualLogoTerminalFailure,
   knowledgeBaseTurnReplayHttpStatus,
   knowledgeBaseTurnReservationErrorStatus,
   knowledgeBaseRecoveryLogoPreparationError,
@@ -107,6 +114,181 @@ describe("knowledge-base turn HTTP outcomes", () => {
         ),
       ),
     ).toBe(422);
+    expect(
+      knowledgeBaseTurnReservationErrorStatus(
+        new KnowledgeBaseTurnReservationError(
+          "IDEMPOTENCY_PENDING",
+          "pending",
+          1_000,
+        ),
+      ),
+    ).toBe(425);
+  });
+
+  it("returns a branded 425 contract while a manual Logo reservation is recoverable", () => {
+    const observation = { stateEpoch: 7 } as any;
+    const response = knowledgeBaseManualLogoPendingResponse({
+      observation,
+      retryAfterMs: 1_250,
+    });
+
+    expect(response).toEqual({
+      status: 425,
+      retryAfterSeconds: "2",
+      body: {
+        error: {
+          code: "IDEMPOTENCY_PENDING",
+          message: "FrontMind 已接收 Logo，正在重新呈现当前知识节点",
+        },
+        observation,
+      },
+    });
+    expect(response.body.error.message).toBe(
+      KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE,
+    );
+    expect(JSON.stringify(response.body)).not.toMatch(/manus/iu);
+  });
+
+  it("keeps deterministic manual Logo validation and coordinate failures terminal", () => {
+    expect(
+      knowledgeBaseManualLogoTerminalFailure(
+        new KnowledgeBaseArtifactBindingError(
+          "LOGO_UPLOAD_INVALID",
+          "Logo 原始字节无效",
+        ),
+      ),
+    ).toEqual({
+      status: 422,
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+      message: "Logo 原始字节无效",
+    });
+    expect(
+      knowledgeBaseManualLogoTerminalFailure(
+        new KnowledgeBaseArtifactBindingError(
+          "BUILD_CHANGED",
+          "当前节点坐标已变化",
+        ),
+      ),
+    ).toEqual({
+      status: 409,
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
+      message: "当前节点坐标已变化",
+    });
+    expect(
+      knowledgeBaseManualLogoTerminalFailure(
+        new KnowledgeBaseArtifactBindingError(
+          "ARTIFACT_DOWNLOAD_FAILED",
+          "临时读取失败",
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    [400, 400],
+    [401, 403],
+    [403, 403],
+    [404, 422],
+    [409, 409],
+    [413, 413],
+    [422, 422],
+    [502, 422],
+  ])(
+    "maps deterministic manual Logo provider status %i to public status %i",
+    (providerStatus, publicStatus) => {
+      expect(
+        knowledgeBaseManualLogoDeterministicCreateFailureStatus(
+          new KnowledgeBaseUpstreamCreateError(
+            "deterministic",
+            `UPSTREAM_CREATE_HTTP_${providerStatus}`,
+            providerStatus,
+          ),
+        ),
+      ).toBe(publicStatus);
+    },
+  );
+
+  it("does not map recoverable manual Logo provider failures to terminal statuses", () => {
+    expect(
+      knowledgeBaseManualLogoDeterministicCreateFailureStatus(
+        new KnowledgeBaseUpstreamCreateError(
+          "retriable",
+          "UPSTREAM_CREATE_HTTP_503",
+          503,
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it("keeps a successful create response without a task id pending for manual Logo reconciliation", () => {
+    const missingTaskId = new KnowledgeBaseUpstreamCreateError(
+      "deterministic",
+      "UPSTREAM_TASK_ID_MISSING",
+      502,
+    );
+
+    expect(
+      knowledgeBaseManualLogoDeterministicCreateFailureStatus(missingTaskId),
+    ).toBeNull();
+    expect(
+      knowledgeBaseManualLogoCreateFailureForPersistence(missingTaskId),
+    ).toMatchObject({
+      failureClass: "unknown",
+      failureCode: "UPSTREAM_TASK_ID_MISSING",
+      status: 502,
+    });
+  });
+
+  it("validates a managed manual Logo before a turn can be reserved", async () => {
+    const candidate = {
+      index: 0,
+      fileId: "managed-logo-file",
+      filename: "official-logo.png",
+      mimeType: "image/png",
+      sizeBytes: 128,
+      sourceSha256: "a".repeat(64),
+    };
+    const validateCapturedImage = vi.fn().mockResolvedValue({
+      width: 100,
+      height: 100,
+      aspectRatio: 1,
+      pixels: Buffer.alloc(0),
+    });
+
+    await expect(
+      assertManualKnowledgeBaseLogoUploadCandidate(
+        candidate,
+        validateCapturedImage,
+      ),
+    ).resolves.toBeUndefined();
+    expect(validateCapturedImage).toHaveBeenCalledWith({
+      fileId: candidate.fileId,
+      filename: candidate.filename,
+      mimeType: candidate.mimeType,
+      sizeBytes: candidate.sizeBytes,
+      sourceSha256: candidate.sourceSha256,
+    });
+
+    validateCapturedImage.mockClear();
+    await expect(
+      assertManualKnowledgeBaseLogoUploadCandidate(
+        { ...candidate, mimeType: "image/bmp" },
+        validateCapturedImage,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+    });
+    expect(validateCapturedImage).not.toHaveBeenCalled();
+
+    validateCapturedImage.mockRejectedValueOnce(new Error("decode failed"));
+    await expect(
+      assertManualKnowledgeBaseLogoUploadCandidate(
+        candidate,
+        validateCapturedImage,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+    });
   });
 });
 

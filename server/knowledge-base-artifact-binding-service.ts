@@ -94,6 +94,34 @@ const OFFICIAL_LOGO_UPLOAD_MIME_TYPES = new Set([
   "image/webp",
 ]);
 
+export function assertKnowledgeBaseOfficialLogoUploadCandidate(
+  upload: Omit<KnowledgeBaseOfficialLogoUpload, "verified">,
+) {
+  if (
+    upload.index !== 0 ||
+    !upload.fileId ||
+    !String(upload.filename || "").trim() ||
+    !OFFICIAL_LOGO_UPLOAD_MIME_TYPES.has(
+      String(upload.mimeType || "")
+        .trim()
+        .toLowerCase(),
+    ) ||
+    !Number.isSafeInteger(upload.sizeBytes) ||
+    upload.sizeBytes < 1 ||
+    upload.sizeBytes > MAX_OFFICIAL_LOGO_UPLOAD_BYTES ||
+    !/^[a-f0-9]{64}$/u.test(
+      String(upload.sourceSha256 || "")
+        .trim()
+        .toLowerCase(),
+    )
+  ) {
+    throw new KnowledgeBaseArtifactBindingError(
+      "LOGO_UPLOAD_INVALID",
+      "请只上传一张不超过 100 MB 的 PNG、JPEG、WebP、AVIF 或 GIF 格式企业主 Logo 原图",
+    );
+  }
+}
+
 export {
   knowledgeBaseArchiveRequiresV4UploadEvidence,
   knowledgeBaseArchiveReadContractVersions,
@@ -1018,20 +1046,7 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
       .trim()
       .toLowerCase(),
   };
-  if (
-    upload.index !== 0 ||
-    !upload.fileId ||
-    !upload.filename ||
-    !OFFICIAL_LOGO_UPLOAD_MIME_TYPES.has(upload.mimeType) ||
-    !Number.isSafeInteger(upload.sizeBytes) ||
-    upload.sizeBytes < 1 ||
-    !/^[a-f0-9]{64}$/u.test(upload.sourceSha256)
-  ) {
-    throw new KnowledgeBaseArtifactBindingError(
-      "LOGO_UPLOAD_INVALID",
-      "请只上传一张 PNG、JPEG、WebP、AVIF 或 GIF 格式的企业主 Logo 原图",
-    );
-  }
+  assertKnowledgeBaseOfficialLogoUploadCandidate(upload);
   const buffer = await readOfficialLogoUploadBytes(upload);
   const descriptorHash = createHash("sha256")
     .update(

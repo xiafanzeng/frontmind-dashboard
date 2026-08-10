@@ -51,12 +51,16 @@ export function brandTrackingCreditsToAmount(value: string | null | undefined) {
   return `${whole}.${fraction}`;
 }
 
-export function formatBrandTrackingCredits(value: string | null | undefined) {
+export function formatBrandTrackingCredits(
+  value: string | null | undefined,
+  options: { includeUnit?: boolean } = {},
+) {
   const credits = brandTrackingAmountToCredits(value);
   if (credits === null) return "—";
   const [whole = "0", fraction = ""] = credits.split(".");
   const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/gu, ",");
-  return `${grouped}${fraction ? `.${fraction}` : ""}积分`;
+  const unit = options.includeUnit === false ? "" : "积分";
+  return `${grouped}${fraction ? `.${fraction}` : ""}${unit}`;
 }
 
 export function isPositiveBrandTrackingAmount(

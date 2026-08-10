@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
@@ -410,6 +416,56 @@ describe("knowledge-base ChatInput actions", () => {
       screen.getByRole("button", { name: "使用此图并继续" }),
     ).toBeEnabled();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("uses only FrontMind copy while an accepted Logo is being sent", async () => {
+    showLogoRequiredPresentation();
+    const presentation = mocks.activeConversation.messages[1]!.knowledgeBase;
+    presentation.revision = 1;
+    mocks.activeConversation.knowledgeBase.revision = 1;
+    let resolveSend!: (sent: boolean) => void;
+    mocks.sendMessage.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveSend = resolve;
+      }),
+    );
+
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={logoAvailableProgress}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "更换 Logo" }));
+    expect(
+      screen.getByText(
+        "Logo 提交轮不会推进节点；FrontMind 接收后会重新呈现当前节点。",
+      ),
+    ).toBeInTheDocument();
+
+    const replacement = new File(["replacement"], "replacement.png", {
+      type: "image/png",
+    });
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [replacement] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "使用此图并继续" }));
+
+    expect(
+      await screen.findByRole("button", {
+        name: "正在发送至 FrontMind",
+      }),
+    ).toBeDisabled();
+    expect(screen.queryByText(/Manus/i)).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveSend(true);
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "更换 Logo" })).toBeEnabled(),
+    );
   });
 
   it("does not allow another confirmation until the current presentation renders", () => {

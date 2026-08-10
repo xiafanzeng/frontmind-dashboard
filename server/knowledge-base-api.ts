@@ -78,6 +78,7 @@ import {
   bindKnowledgeBaseInitialLogo,
   bindKnowledgeBaseOfficialLogoUpload,
   bindKnowledgeBaseReadyPackage,
+  assertKnowledgeBaseOfficialLogoUploadCandidate,
   cleanupKnowledgeBaseStagedArtifactCandidate,
   collectKnowledgeBaseLogoDescriptors,
   KnowledgeBaseArtifactBindingError,
@@ -109,6 +110,8 @@ import {
   reserveKnowledgeBaseRetryTurn,
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
+  rejectAcknowledgedKnowledgeBaseManualLogoTurn,
+  rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   renewKnowledgeBaseTurnLease,
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
@@ -262,6 +265,117 @@ function knowledgeBaseReservationReceipt(
   };
 }
 
+export const KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE =
+  "FrontMind 已接收 Logo，正在重新呈现当前知识节点";
+
+export function knowledgeBaseManualLogoPendingResponse(input: {
+  observation?: KnowledgeBaseObservationDto | null;
+  retryAfterMs?: number;
+}) {
+  return {
+    status: 425 as const,
+    retryAfterSeconds: String(
+      Math.max(1, Math.ceil((input.retryAfterMs ?? 1_000) / 1_000)),
+    ),
+    body: {
+      error: {
+        code: "IDEMPOTENCY_PENDING" as const,
+        message: KNOWLEDGE_BASE_MANUAL_LOGO_PENDING_MESSAGE,
+      },
+      ...(input.observation ? { observation: input.observation } : {}),
+    },
+  };
+}
+
+export function knowledgeBaseManualLogoTerminalFailure(error: unknown) {
+  if (!(error instanceof KnowledgeBaseArtifactBindingError)) return null;
+  if (error.code === "LOGO_UPLOAD_INVALID") {
+    return {
+      status: 422 as const,
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID" as const,
+      message: error.message,
+    };
+  }
+  if (error.code === "BUILD_CHANGED") {
+    return {
+      status: 409 as const,
+      code: "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT" as const,
+      message: error.message,
+    };
+  }
+  return null;
+}
+
+export async function assertManualKnowledgeBaseLogoUploadCandidate(
+  upload: Omit<KnowledgeBaseOfficialLogoUpload, "verified">,
+  validateCapturedImage: typeof assertCapturedKnowledgeBaseCustomerImage = assertCapturedKnowledgeBaseCustomerImage,
+) {
+  try {
+    assertKnowledgeBaseOfficialLogoUploadCandidate(upload);
+    await validateCapturedImage({
+      fileId: upload.fileId,
+      filename: upload.filename,
+      mimeType: upload.mimeType,
+      sizeBytes: upload.sizeBytes,
+      sourceSha256: upload.sourceSha256,
+    });
+  } catch (error) {
+    throw new KnowledgeBaseTurnReservationError(
+      "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+      error instanceof KnowledgeBaseArtifactBindingError
+        ? error.message
+        : "上传的 Logo 原始文件无法安全解码或完整性校验失败，请重新选择原文件",
+    );
+  }
+}
+
+export function knowledgeBaseManualLogoDeterministicCreateFailureStatus(
+  error: unknown,
+) {
+  if (
+    !(error instanceof KnowledgeBaseUpstreamCreateError) ||
+    error.failureClass !== "deterministic"
+  ) {
+    return null;
+  }
+  // A successful provider response without a task id does not prove that the
+  // provider rejected the create. Manual Logo submission must reconcile the
+  // same reservation instead of reporting a terminal validation failure.
+  if (error.failureCode === "UPSTREAM_TASK_ID_MISSING") return null;
+  if (error.status === 400) return 400 as const;
+  if (error.status === 401 || error.status === 403) return 403 as const;
+  if (error.status === 409) return 409 as const;
+  if (error.status === 413) return 413 as const;
+  if (error.status === 422) return 422 as const;
+  return 422 as const;
+}
+
+export function knowledgeBaseManualLogoCreateFailureForPersistence(
+  error: unknown,
+) {
+  if (
+    error instanceof KnowledgeBaseUpstreamCreateError &&
+    error.failureCode === "UPSTREAM_TASK_ID_MISSING"
+  ) {
+    return new KnowledgeBaseUpstreamCreateError(
+      "unknown",
+      error.failureCode,
+      error.status,
+    );
+  }
+  return error;
+}
+
+function respondKnowledgeBaseManualLogoPending(input: {
+  observation?: KnowledgeBaseObservationDto | null;
+  retryAfterMs?: number;
+  res: import("express").Response;
+}) {
+  const response = knowledgeBaseManualLogoPendingResponse(input);
+  input.res.setHeader("Retry-After", response.retryAfterSeconds);
+  input.res.status(response.status).json(response.body);
+}
+
 export function knowledgeBaseTurnReservationErrorStatus(
   error: KnowledgeBaseTurnReservationError,
 ) {
@@ -327,16 +441,10 @@ async function respondKnowledgeBaseTurnReplayReceipt(input: {
     upstreamStatus: receipt.state === "completed" ? "completed" : "running",
   }).catch(() => null);
   if (input.requireUpstreamTaskId && receipt.state === "pending") {
-    res.setHeader(
-      "Retry-After",
-      String(Math.ceil(reservationRetryAfterMs(receipt) / 1_000)),
-    );
-    res.status(425).json({
-      error: {
-        code: "IDEMPOTENCY_PENDING",
-        message: "Logo 已提交，正在等待 Manus 返回真实任务编号",
-      },
-      ...(observation ? { observation } : {}),
+    respondKnowledgeBaseManualLogoPending({
+      observation,
+      retryAfterMs: reservationRetryAfterMs(receipt),
+      res,
     });
     return;
   }
@@ -2387,7 +2495,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         upstreamId: taskId,
       });
     },
-    // Manual Logo bytes become the build Logo only after Manus has returned
+    // Manual Logo bytes become the build Logo only after the provider returned
     // and the exact upstream task id is durably bound to this turn.
     afterTaskAcknowledged: () =>
       promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(claim),
@@ -2506,14 +2614,103 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
         if (recovered.reconciled) result.reconciled += 1;
       } catch (error) {
         result.failed += 1;
+        let manualLogoFailureSettled = false;
+        let failureToPersist = error;
         if (claim) {
-          await persistKnowledgeBaseCreateFailure({
-            userId: claim.turn.userId,
-            turnId: claim.turn.id,
-            leaseToken: claim.leaseToken,
-            error,
-            outcomeUnknownCode: "RECOVERY_DEFERRED",
-          }).catch(() => undefined);
+          const terminalLogoFailure =
+            claim.recoveryMetadata.manualLogoSubmission === true
+              ? knowledgeBaseManualLogoTerminalFailure(error)
+              : null;
+          if (terminalLogoFailure) {
+            try {
+              await rejectAcknowledgedKnowledgeBaseManualLogoTurn({
+                userId: claim.turn.userId,
+                buildId: claim.turn.buildId,
+                buildGeneration: claim.turn.buildGeneration,
+                turnId: claim.turn.id,
+                clientRequestId: claim.turn.clientRequestId,
+                leaseToken: claim.leaseToken,
+                code: terminalLogoFailure.code,
+                message: terminalLogoFailure.message,
+              });
+              manualLogoFailureSettled = true;
+            } catch (persistenceError) {
+              // The child task may already exist. Never fall through to the
+              // generic invalid-upload cancellation, which only accepts an
+              // unbound turn and would leave this recovery poisoned forever.
+              manualLogoFailureSettled = true;
+              await markKnowledgeBaseTurnOutcomeUnknown({
+                userId: claim.turn.userId,
+                turnId: claim.turn.id,
+                leaseToken: claim.leaseToken,
+                code: "MANUAL_LOGO_REJECTION_DEFERRED",
+                recoveryDelayMs: 1_000,
+              }).catch(() => undefined);
+              logKnowledgeBaseRuntimeFailure({
+                level: "warn",
+                event:
+                  "[KnowledgeBaseTurnRecovery] manual_logo_rejection_persistence_deferred",
+                userId: claim.turn.userId,
+                buildId: claim.turn.buildId,
+                turnId: claim.turn.id,
+                error: persistenceError,
+                additionalSecrets: [recoveryApiKey],
+              });
+            }
+          } else if (claim.recoveryMetadata.manualLogoSubmission === true) {
+            const deterministicCreateStatus =
+              knowledgeBaseManualLogoDeterministicCreateFailureStatus(error);
+            if (
+              deterministicCreateStatus &&
+              error instanceof KnowledgeBaseUpstreamCreateError
+            ) {
+              try {
+                await rejectUnacknowledgedKnowledgeBaseManualLogoTurn({
+                  userId: claim.turn.userId,
+                  buildId: claim.turn.buildId,
+                  buildGeneration: claim.turn.buildGeneration,
+                  turnId: claim.turn.id,
+                  clientRequestId: claim.turn.clientRequestId,
+                  leaseToken: claim.leaseToken,
+                  code: error.failureCode,
+                  message:
+                    deterministicKnowledgeBaseCreateFailureMessage(error),
+                });
+                manualLogoFailureSettled = true;
+              } catch (persistenceError) {
+                manualLogoFailureSettled = true;
+                await markKnowledgeBaseTurnOutcomeUnknown({
+                  userId: claim.turn.userId,
+                  turnId: claim.turn.id,
+                  leaseToken: claim.leaseToken,
+                  code: "MANUAL_LOGO_REJECTION_DEFERRED",
+                  recoveryDelayMs: 1_000,
+                }).catch(() => undefined);
+                logKnowledgeBaseRuntimeFailure({
+                  level: "warn",
+                  event:
+                    "[KnowledgeBaseTurnRecovery] manual_logo_create_rejection_persistence_deferred",
+                  userId: claim.turn.userId,
+                  buildId: claim.turn.buildId,
+                  turnId: claim.turn.id,
+                  error: persistenceError,
+                  additionalSecrets: [recoveryApiKey],
+                });
+              }
+            } else {
+              failureToPersist =
+                knowledgeBaseManualLogoCreateFailureForPersistence(error);
+            }
+          }
+          if (!manualLogoFailureSettled) {
+            await persistKnowledgeBaseCreateFailure({
+              userId: claim.turn.userId,
+              turnId: claim.turn.id,
+              leaseToken: claim.leaseToken,
+              error: failureToPersist,
+              outcomeUnknownCode: "RECOVERY_DEFERRED",
+            }).catch(() => undefined);
+          }
         }
         logKnowledgeBaseRuntimeFailure({
           level: "warn",
@@ -4834,6 +5031,11 @@ router.post("/turn", async (req, res) => {
         "请先上传一张合格的企业官方主 Logo，再继续确认第一个知识节点",
       );
     }
+    if (manualLogoSubmission && officialLogoUploadCandidate) {
+      await assertManualKnowledgeBaseLogoUploadCandidate(
+        officialLogoUploadCandidate,
+      );
+    }
 
     const finalPackageRequired = knowledgeBaseTurnRequiresFinalPackage({
       skillVersion: boundBuild.skillVersion,
@@ -4904,6 +5106,7 @@ router.post("/turn", async (req, res) => {
         skillContentHash: currentSkillDescriptor.contentHash,
       },
       clientIntent: resumeLegacyAttachments ? undefined : clientIntent,
+      operationInstanceId: manualLogoSubmission ? clientRequestId : undefined,
       apiCredentialId: taskCredential.id,
       userText: turnUserMessage,
       userAttachmentCount: attachments.length,
@@ -5019,7 +5222,68 @@ router.post("/turn", async (req, res) => {
           credential: taskCredential,
         });
       } catch (error) {
-        // If Manus acknowledged the task but the post-ack Logo promotion was
+        const terminalLogoFailure =
+          knowledgeBaseManualLogoTerminalFailure(error);
+        if (terminalLogoFailure) {
+          let rejectionPersisted = false;
+          try {
+            await rejectAcknowledgedKnowledgeBaseManualLogoTurn({
+              userId: acceptedClaim.turn.userId,
+              buildId: acceptedClaim.turn.buildId,
+              buildGeneration: acceptedClaim.turn.buildGeneration,
+              turnId: acceptedClaim.turn.id,
+              clientRequestId,
+              leaseToken: acceptedClaim.leaseToken,
+              code: terminalLogoFailure.code,
+              message: terminalLogoFailure.message,
+            });
+            rejectionPersisted = true;
+          } catch (persistenceError) {
+            logKnowledgeBaseRuntimeFailure({
+              level: "warn",
+              event: "[KnowledgeBaseManualLogo] rejection_persistence_deferred",
+              userId: acceptedClaim.turn.userId,
+              buildId: acceptedClaim.turn.buildId,
+              turnId: acceptedClaim.turn.id,
+              error: persistenceError,
+              additionalSecrets: [taskCredential.apiKey],
+            });
+            await markKnowledgeBaseTurnOutcomeUnknown({
+              userId: acceptedClaim.turn.userId,
+              turnId: acceptedClaim.turn.id,
+              leaseToken: acceptedClaim.leaseToken,
+              code: "MANUAL_LOGO_REJECTION_DEFERRED",
+              recoveryDelayMs: 1_000,
+            }).catch(() => undefined);
+          }
+          if (!rejectionPersisted) {
+            const observation = await getKnowledgeBaseObservation({
+              userId: req.frontmindUser!.id,
+              conversationId,
+              upstreamStatus: "running",
+            }).catch(() => null);
+            respondKnowledgeBaseManualLogoPending({
+              observation,
+              retryAfterMs: 1_000,
+              res,
+            });
+            return;
+          }
+          const observation = await getKnowledgeBaseObservation({
+            userId: req.frontmindUser!.id,
+            conversationId,
+            upstreamStatus: "awaiting_input",
+          }).catch(() => null);
+          res.status(terminalLogoFailure.status).json({
+            error: {
+              code: terminalLogoFailure.code,
+              message: terminalLogoFailure.message,
+            },
+            ...(observation ? { observation } : {}),
+          });
+          return;
+        }
+        // If the provider acknowledged the task but post-ack Logo promotion was
         // interrupted, that real task remains the winner. Return it instead of
         // inviting a second logical submission.
         const receipt = await inspectKnowledgeBaseTurnReplay({
@@ -5042,14 +5306,151 @@ router.post("/turn", async (req, res) => {
           });
           return;
         }
-        await persistKnowledgeBaseCreateFailure({
-          userId: acceptedClaim.turn.userId,
-          turnId: acceptedClaim.turn.id,
-          leaseToken: acceptedClaim.leaseToken,
-          error,
-          outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
-          recoveryDelayMs: 1_000,
-        }).catch(() => undefined);
+        const deterministicCreateStatus =
+          knowledgeBaseManualLogoDeterministicCreateFailureStatus(error);
+        if (
+          deterministicCreateStatus &&
+          error instanceof KnowledgeBaseUpstreamCreateError
+        ) {
+          let rejectionPersisted = false;
+          try {
+            await rejectUnacknowledgedKnowledgeBaseManualLogoTurn({
+              userId: acceptedClaim.turn.userId,
+              buildId: acceptedClaim.turn.buildId,
+              buildGeneration: acceptedClaim.turn.buildGeneration,
+              turnId: acceptedClaim.turn.id,
+              clientRequestId,
+              leaseToken: acceptedClaim.leaseToken,
+              code: error.failureCode,
+              message: deterministicKnowledgeBaseCreateFailureMessage(error),
+            });
+            rejectionPersisted = true;
+          } catch (persistenceError) {
+            logKnowledgeBaseRuntimeFailure({
+              level: "warn",
+              event:
+                "[KnowledgeBaseManualLogo] create_rejection_persistence_deferred",
+              userId: acceptedClaim.turn.userId,
+              buildId: acceptedClaim.turn.buildId,
+              turnId: acceptedClaim.turn.id,
+              error: persistenceError,
+              additionalSecrets: [taskCredential.apiKey],
+            });
+            await markKnowledgeBaseTurnOutcomeUnknown({
+              userId: acceptedClaim.turn.userId,
+              turnId: acceptedClaim.turn.id,
+              leaseToken: acceptedClaim.leaseToken,
+              code: "MANUAL_LOGO_REJECTION_DEFERRED",
+              recoveryDelayMs: 1_000,
+            }).catch(() => undefined);
+          }
+          if (!rejectionPersisted) {
+            const observation = await getKnowledgeBaseObservation({
+              userId: req.frontmindUser!.id,
+              conversationId,
+              upstreamStatus: "running",
+            }).catch(() => null);
+            respondKnowledgeBaseManualLogoPending({
+              observation,
+              retryAfterMs: 1_000,
+              res,
+            });
+            return;
+          }
+          const observation = await getKnowledgeBaseObservation({
+            userId: req.frontmindUser!.id,
+            conversationId,
+            upstreamStatus: "awaiting_input",
+          }).catch(() => null);
+          res.status(deterministicCreateStatus).json({
+            error: {
+              code: error.failureCode,
+              message: deterministicKnowledgeBaseCreateFailureMessage(error),
+            },
+            reservationCreated: true,
+            ...(observation ? { observation } : {}),
+          });
+          return;
+        }
+        let failureClass: KnowledgeBaseUpstreamCreateFailureClass = "unknown";
+        const failureToPersist =
+          knowledgeBaseManualLogoCreateFailureForPersistence(error);
+        try {
+          failureClass = await persistKnowledgeBaseCreateFailure({
+            userId: acceptedClaim.turn.userId,
+            turnId: acceptedClaim.turn.id,
+            leaseToken: acceptedClaim.leaseToken,
+            error: failureToPersist,
+            outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
+            recoveryDelayMs: 1_000,
+          });
+        } catch (persistenceError) {
+          logKnowledgeBaseRuntimeFailure({
+            level: "warn",
+            event: "[KnowledgeBaseManualLogo] failure_persistence_deferred",
+            userId: acceptedClaim.turn.userId,
+            buildId: acceptedClaim.turn.buildId,
+            turnId: acceptedClaim.turn.id,
+            error: persistenceError,
+            additionalSecrets: [taskCredential.apiKey],
+          });
+        }
+        const persistedDeterministicCreateStatus =
+          failureClass === "deterministic"
+            ? knowledgeBaseManualLogoDeterministicCreateFailureStatus(error)
+            : null;
+        if (
+          persistedDeterministicCreateStatus &&
+          error instanceof KnowledgeBaseUpstreamCreateError
+        ) {
+          const observation = await getKnowledgeBaseObservation({
+            userId: req.frontmindUser!.id,
+            conversationId,
+            upstreamStatus: "failed",
+          }).catch(() => null);
+          res.status(persistedDeterministicCreateStatus).json({
+            error: {
+              code: error.failureCode,
+              message: deterministicKnowledgeBaseCreateFailureMessage(error),
+            },
+            reservationCreated: true,
+            ...(observation ? { observation } : {}),
+          });
+          return;
+        }
+        if (failureClass !== "deterministic") {
+          const pendingReceipt = await inspectKnowledgeBaseTurnReplay({
+            userId: req.frontmindUser!.id,
+            conversationId,
+            clientRequestId,
+            clientIntent,
+            expectedGeneration,
+            expectedRevision,
+            expectedLeafId: expectedLeafId || undefined,
+          }).catch(() => null);
+          if (pendingReceipt) {
+            await respondKnowledgeBaseTurnReplayReceipt({
+              userId: req.frontmindUser!.id,
+              conversationId,
+              requestedClientRequestId: clientRequestId,
+              receipt: pendingReceipt,
+              requireUpstreamTaskId: true,
+              res,
+            });
+            return;
+          }
+          const observation = await getKnowledgeBaseObservation({
+            userId: req.frontmindUser!.id,
+            conversationId,
+            upstreamStatus: "running",
+          }).catch(() => null);
+          respondKnowledgeBaseManualLogoPending({
+            observation,
+            retryAfterMs: 1_000,
+            res,
+          });
+          return;
+        }
         throw error;
       }
       const observation = await getKnowledgeBaseObservation({
@@ -5115,6 +5516,12 @@ router.post("/turn", async (req, res) => {
             upstreamStatus: "running",
           }).catch(() => null)
         : null;
+      if (error.retryAfterMs) {
+        res.setHeader(
+          "Retry-After",
+          String(Math.max(1, Math.ceil(error.retryAfterMs / 1_000))),
+        );
+      }
       res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
         error: { code: error.code, message: error.message },
         ...(observation ? { observation } : {}),

@@ -1246,6 +1246,9 @@ function UserBrandDashboardContent({
     ? getCapability(servicePortal, capabilityKey)
     : null;
   const routeLocked = Boolean(routeAccess && !routeAccess.allowed);
+  useEffect(() => {
+    if (routeLocked) setRouteHistoryOpen(false);
+  }, [routeLocked]);
   const routeRequestHistory = getRouteRequestHistoryConfig(
     route.section,
     route.sub,
@@ -1354,14 +1357,6 @@ function UserBrandDashboardContent({
               title={routeTitle}
               access={routeAccess}
               portal={servicePortal}
-              historyAction={
-                routeRequestHistory
-                  ? {
-                      label: "需求记录",
-                      onClick: () => setRouteHistoryOpen(true),
-                    }
-                  : undefined
-              }
               onRefresh={onRefreshServicePortal}
               onOpenAccount={() => setAccountOpen(true)}
               onNavigate={navigate}
@@ -1577,7 +1572,7 @@ function UserBrandDashboardContent({
           )}
         </main>
       </div>
-      {routeRequestHistory && (
+      {!routeLocked && routeRequestHistory && (
         <CustomerRequestHistoryDialog
           open={routeHistoryOpen}
           onOpenChange={setRouteHistoryOpen}

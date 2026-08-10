@@ -680,9 +680,11 @@ async function knowledgeBaseRequestError(
   const retryAfter =
     response.headers?.get?.("Retry-After")?.trim() || undefined;
   const error = new Error(
-    userFacingErrorMessage(
-      Object.assign(new Error(message), { status: response.status }),
-      fallback,
+    sanitizeBrandText(
+      userFacingErrorMessage(
+        Object.assign(new Error(message), { status: response.status }),
+        fallback,
+      ),
     ),
   ) as KnowledgeBaseRequestError;
   error.status = response.status;
@@ -926,7 +928,7 @@ export async function createKnowledgeBaseTurnTask(
       const returnedTaskId = data?.id || data?.task_id || "";
       if (context.submissionKind === "logo" && !returnedTaskId) {
         throw Object.assign(
-          new Error("Logo 已上传，但服务端尚未返回 Manus 真实任务编号"),
+          new Error("Logo 已上传，但服务端尚未返回 FrontMind 真实任务编号"),
           {
             status: 502,
             code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
