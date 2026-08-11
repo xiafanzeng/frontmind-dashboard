@@ -148,7 +148,19 @@ function rowsFor(table: unknown, state: MemoryState) {
   if (table === apiCredentials) return state.credentials;
   if (table === users) return state.users;
   if (table === userDashboardContents) return state.dashboardContents;
-  if (table === knowledgeBaseBuilds) return state.builds;
+  if (table === knowledgeBaseBuilds) {
+    for (const build of state.builds) {
+      if (!Object.prototype.hasOwnProperty.call(build, "treePolicyVersion")) {
+        build.treePolicyVersion = 1;
+      }
+      if (
+        !Object.prototype.hasOwnProperty.call(build, "initialResearchCoverage")
+      ) {
+        build.initialResearchCoverage = null;
+      }
+    }
+    return state.builds;
+  }
   if (table === knowledgeBaseBuildNodes) return state.nodes;
   if (table === conversationTurns) return state.turns;
   if (table === conversations) return state.conversations;
@@ -274,6 +286,8 @@ function memoryDatabase(
         );
         if (duplicate) continue;
         state.builds.push({
+          treePolicyVersion: 1,
+          initialResearchCoverage: null,
           upstreamTaskId: null,
           generation: 1,
           stateEpoch: 0,
@@ -476,6 +490,43 @@ ${narrative}
 
 <!-- FRONTMIND_FORMAL_CONTENT_END -->
 `;
+}
+
+function completeResearchCoverage(leafIds: string[]) {
+  const dimensionIds = [
+    "enterprise_identity",
+    "team_and_organization",
+    "products_and_services",
+    "capabilities_and_delivery",
+    "industries_scenarios_and_cases",
+    "differentiation_and_evidence",
+    "cooperation_delivery_and_support",
+  ] as const;
+  return {
+    officialPages: {
+      discovered: 12,
+      attempted: 12,
+      succeeded: 12,
+      failed: 0,
+    },
+    publicQueries: 6,
+    officialDocuments: 0,
+    uploadsRead: 0,
+    sourceCount: 12,
+    productFamilies: [
+      {
+        id: "frontmind-enterprise-ai",
+        name: "FrontMind 企业智能产品族",
+        leafIds,
+      },
+    ],
+    dimensions: dimensionIds.map((id, index) => ({
+      id,
+      status: "gap" as const,
+      leafIds: [leafIds[index]!],
+    })),
+    stopReason: "coverage_complete" as const,
+  };
 }
 
 async function createFinalPackageFixture(
@@ -1144,14 +1195,16 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   });
 
-  it("runs all 8 leaves from manifest and Logo through publish, Viewer and immutable ZIP download", async () => {
+  it("runs a 30-leaf deep-policy Manifest and Logo through publish, Viewer and immutable ZIP download", async () => {
     const upstream = express();
     upstream.use(express.json({ limit: "5mb" }));
     const upstreamListener = await listen(upstream);
     upstreamServer = upstreamListener.server;
     const upstreamBaseUrl = upstreamListener.baseUrl;
     dependencies.upstreamBaseUrl = upstreamBaseUrl;
+    const deepRevision = 30;
     const fixture = await createFinalPackageFixture({
+      leafCount: deepRevision,
       schemaVersion: 4,
       officialLogoSourcePageUrl: "https://www.frontmind.net/",
       officialLogoSourceAssetUrl: "https://www.frontmind.net/logo-new.svg",
@@ -1342,6 +1395,9 @@ describe("knowledge-base production final-package acceptance", () => {
             branchId: "products",
             branchTitle: "产品与服务",
           })),
+          researchCoverage: completeResearchCoverage(
+            fixture.leaves.map((leaf) => leaf.id),
+          ),
         });
         output = [
           {
@@ -1563,14 +1619,19 @@ describe("knowledge-base production final-package acceptance", () => {
           body: JSON.stringify(body),
         },
       );
-      if (pathname === "/turn") {
-        expect([200, 202]).toContain(response.status);
-      } else {
-        expect(response.status).toBe(200);
-      }
+      expect([200, 202]).toContain(response.status);
       const payload = (await response.json()) as any;
-      if (pathname !== "/turn" || payload.idempotent) return payload;
+      if (payload.idempotent || response.status === 200) return payload;
       expect(response.status).toBe(202);
+      expect(payload.reservation).toMatchObject({
+        state: "pending",
+        dispatchState: "recovering",
+        upstreamTaskId: null,
+      });
+      expect(payload.reservation.turnId).toBeTruthy();
+      expect(payload.reservation.upstreamTaskId).not.toBe(
+        payload.reservation.turnId,
+      );
 
       const clientRequestId = String(body.clientRequestId || "");
       const deadline = Date.now() + 5_000;
@@ -1694,7 +1755,7 @@ describe("knowledge-base production final-package acceptance", () => {
         ],
       },
     });
-    expect(state.nodes).toHaveLength(8);
+    expect(state.nodes).toHaveLength(deepRevision);
     expect(state.nodes[0]).toMatchObject({
       leafId: "1.1",
       status: "current",
@@ -1724,14 +1785,20 @@ describe("knowledge-base production final-package acceptance", () => {
     );
     expect(uploadedFileSequence).toBe(uploadedCountAfterStart);
 
-    for (const conflictingStart of [
+    for (const { request: conflictingStart, expectedCode } of [
       {
-        ...startRequest,
-        operatorNotes: "与首次启动不同的输入",
+        request: {
+          ...startRequest,
+          operatorNotes: "与首次启动不同的输入",
+        },
+        expectedCode: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
       },
       {
-        ...startRequest,
-        clientRequestId: "request-conflicting-start",
+        request: {
+          ...startRequest,
+          clientRequestId: "request-conflicting-start",
+        },
+        expectedCode: "CONFLICT",
       },
     ]) {
       const response = await fetch(
@@ -1748,7 +1815,7 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(response.status).toBe(409);
       const conflict = (await response.json()) as any;
       expect(conflict).toMatchObject({
-        error: { code: "CONFLICT" },
+        error: { code: expectedCode },
         observation: {
           authoritativeTaskId: initialTaskId,
           interaction: {
@@ -1891,13 +1958,13 @@ describe("knowledge-base production final-package acceptance", () => {
             progress: {
               build: {
                 status: "ready_to_publish",
-                revision: FINAL_REVISION,
+                revision: deepRevision,
                 currentLeafId: null,
               },
             },
           },
           package: {
-            revision: FINAL_REVISION,
+            revision: deepRevision,
             sha256: archiveSha256,
             sizeBytes: fixture.archive.length,
           },
@@ -2034,8 +2101,8 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(packageDownloads).toBe(1);
     // The Skill is build-scoped and reused once. Every operation gets one
     // operation-bound server input file; the last uses finalization ZIP.
-    expect(uploadedFileSequence).toBe(10);
-    expect(uploadedFileBytes.size).toBe(10);
+    expect(uploadedFileSequence).toBe(deepRevision + 2);
+    expect(uploadedFileBytes.size).toBe(deepRevision + 2);
     expect(
       [...uploadedFileNames.values()].filter(
         (filename) => filename === "socratic-kb-builder.skill.zip",
@@ -2045,7 +2112,7 @@ describe("knowledge-base production final-package acceptance", () => {
       [...uploadedFileNames.values()].filter(
         (filename) => filename === "frontmind-kb-server-instructions.txt",
       ),
-    ).toHaveLength(8);
+    ).toHaveLength(deepRevision);
     expect(
       [...uploadedFileNames.values()].filter((filename) =>
         /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(filename),
@@ -2058,13 +2125,15 @@ describe("knowledge-base production final-package acceptance", () => {
           .filter((fileId) => /^uploaded-skill-/u.test(fileId)),
       ),
     ).toEqual(new Set(["uploaded-skill-1"]));
-    expect(operationTaskPosts.size).toBe(9);
-    expect([...operationTaskPosts.values()]).toEqual(Array(9).fill(1));
-    expect(rawTaskPosts).toBe(10);
+    expect(operationTaskPosts.size).toBe(deepRevision + 1);
+    expect([...operationTaskPosts.values()]).toEqual(
+      Array(deepRevision + 1).fill(1),
+    );
+    expect(rawTaskPosts).toBe(deepRevision + 2);
     expect(state.builds[0]).toMatchObject({
       id: buildId,
       // reservation + upstream binding + authoritative reconcile per operation
-      stateEpoch: 27,
+      stateEpoch: 3 * (deepRevision + 1),
       lastAppliedOperationKey: finalOperationKey,
       protocolError: null,
       protocolErrorCode: null,
@@ -2095,7 +2164,7 @@ describe("knowledge-base production final-package acceptance", () => {
     );
     expect(
       new Set(presentationMessages.map((message) => message.turnId)).size,
-    ).toBe(8);
+    ).toBe(deepRevision);
     expect(state.nodes.every((node) => node.status === "confirmed")).toBe(true);
     expect(
       state.nodes.map((node) => ({
@@ -2112,10 +2181,10 @@ describe("knowledge-base production final-package acceptance", () => {
     );
     expect(state.builds[0]).toMatchObject({
       status: "ready_to_publish",
-      revision: FINAL_REVISION,
+      revision: deepRevision,
       currentLeafId: null,
-      confirmedCount: 8,
-      packageRevision: FINAL_REVISION,
+      confirmedCount: deepRevision,
+      packageRevision: deepRevision,
       packageArchiveSha256: archiveSha256,
       logoSha256: fixture.logoSha256,
     });
@@ -2179,7 +2248,7 @@ describe("knowledge-base production final-package acceptance", () => {
       packageDescriptorHash: state.builds[0]!.packageDescriptorHash,
     };
     expect(persistedPackageIdentity).toMatchObject({
-      packageRevision: FINAL_REVISION,
+      packageRevision: deepRevision,
       packageTaskId: TASK_ID,
       packageOutputItemId: expect.any(String),
       packageFileId: "file-final-package",
@@ -2298,7 +2367,7 @@ describe("knowledge-base production final-package acceptance", () => {
         canPublish: true,
       },
       package: {
-        revision: FINAL_REVISION,
+        revision: deepRevision,
         sha256: canonicalRebindArchiveSha256,
         sizeBytes: canonicalRebindArchive.buffer.length,
       },
@@ -2308,7 +2377,7 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(state.builds[0]).toMatchObject({
       status: "ready_to_publish",
       stateEpoch: rebindStateEpoch + 1,
-      packageRevision: FINAL_REVISION,
+      packageRevision: deepRevision,
       packageTaskId: TASK_ID,
       packageArchiveSha256: canonicalRebindArchiveSha256,
       protocolError: null,
@@ -2481,7 +2550,7 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(published.kind).toBe("knowledge");
     expect(published.snapshot).toMatchObject({
       sourceBuildId: buildId,
-      sourceBuildRevision: FINAL_REVISION,
+      sourceBuildRevision: deepRevision,
       sourceTaskId: TASK_ID,
       sourceArtifactHash: canonicalRebindArchiveSha256,
       archiveHash: canonicalRebindArchiveSha256,
@@ -2490,7 +2559,7 @@ describe("knowledge-base production final-package acceptance", () => {
     });
     expect(state.builds[0]).toMatchObject({
       status: "published",
-      revision: FINAL_REVISION,
+      revision: deepRevision,
       publishedSnapshotId: published.snapshot.id,
     });
     const { isAuthenticatedAdvancedKnowledgePublication } = await import(
@@ -2509,14 +2578,14 @@ describe("knowledge-base production final-package acceptance", () => {
     expect(viewerSnapshot).toMatchObject({
       id: published.snapshot.id,
       sourceBuildId: buildId,
-      sourceBuildRevision: FINAL_REVISION,
+      sourceBuildRevision: deepRevision,
       archiveHash: canonicalRebindArchiveSha256,
       archiveAvailable: true,
     });
     const viewerLeaves = viewerSnapshot!.documents
       .filter((document: any) => document.kind === "leaf")
       .sort((left: any, right: any) => left.order - right.order);
-    expect(viewerLeaves).toHaveLength(8);
+    expect(viewerLeaves).toHaveLength(deepRevision);
     expect(
       viewerLeaves.map((document: any) => ({
         id: document.id,
@@ -2576,7 +2645,7 @@ describe("knowledge-base production final-package acceptance", () => {
         archiveContractVersions: [4],
       },
     );
-    expect(unpacked.packageBuildRevision).toBe(FINAL_REVISION);
+    expect(unpacked.packageBuildRevision).toBe(deepRevision);
     expect(unpacked.assets).toEqual([
       expect.objectContaining({
         id: "official-logo",
@@ -3799,13 +3868,32 @@ describe("knowledge-base production final-package acceptance", () => {
           }),
         },
       );
-      const retried = (await retryResponse.json()) as any;
-      expect({ status: retryResponse.status, retried }).toMatchObject({
-        status: 200,
+      const acceptedRetry = (await retryResponse.json()) as any;
+      expect({ status: retryResponse.status, acceptedRetry }).toMatchObject({
+        status: 202,
+        acceptedRetry: {
+          accepted: true,
+          reservation: {
+            dispatchState: "recovering",
+            upstreamTaskId: null,
+            canRegenerate: false,
+          },
+        },
       });
+      const retryDeadline = Date.now() + 5_000;
+      while (
+        Date.now() < retryDeadline &&
+        state.builds[0]?.status !== "ready_to_publish"
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const retryProgressResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/progress/${encodeURIComponent(PUBLIC_CONVERSATION_ID)}`,
+        { headers: { "x-test-auth": "user" } },
+      );
+      expect(retryProgressResponse.status).toBe(200);
+      const retried = (await retryProgressResponse.json()) as any;
       expect(retried).toMatchObject({
-        task: { id: newTaskId },
-        retried: true,
         observation: {
           authoritativeTaskId: newTaskId,
           activeTurn: null,
@@ -4033,7 +4121,7 @@ describe("knowledge-base production final-package acceptance", () => {
       apiKey: "sk-e2e-only",
     });
 
-    const getTask = vi.spyOn(axios, "get").mockResolvedValueOnce({
+    const getTask = vi.spyOn(axios, "get").mockResolvedValue({
       status: 200,
       data: {
         id: taskId,
@@ -4060,20 +4148,37 @@ describe("knowledge-base production final-package acceptance", () => {
       knowledgeBaseRouter,
     );
     const listener = await listen(dashboard);
+    vi.useFakeTimers({ toFake: ["Date"] });
     try {
-      const response = await fetch(
-        `${listener.baseUrl}/api/knowledge-base/progress/reconcile`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-test-auth": "user",
+      let payload: any;
+      for (const [index, seconds] of [0, 5, 10].entries()) {
+        vi.setSystemTime(new Date(now.getTime() + seconds * 1_000));
+        const response = await fetch(
+          `${listener.baseUrl}/api/knowledge-base/progress/reconcile`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-test-auth": "user",
+            },
+            body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
           },
-          body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-        },
-      );
-      expect(response.status).toBe(200);
-      expect((await response.json()) as any).toMatchObject({
+        );
+        expect(response.status).toBe(200);
+        payload = (await response.json()) as any;
+        if (index < 2) {
+          expect(payload).toMatchObject({
+            observation: {
+              interaction: {
+                interactionState: "executing",
+                progress: { build: { status: "researching" } },
+              },
+              notice: null,
+            },
+          });
+        }
+      }
+      expect(payload).toMatchObject({
         observation: {
           interaction: {
             interactionState: "failed",
@@ -4091,7 +4196,7 @@ describe("knowledge-base production final-package acceptance", () => {
           },
         },
       });
-      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(getTask).toHaveBeenCalledTimes(3);
       expect(state.builds[0]).toMatchObject({
         status: "protocol_error",
         stateEpoch: 3,
@@ -4107,6 +4212,7 @@ describe("knowledge-base production final-package acceptance", () => {
         leaseExpiresAt: null,
       });
     } finally {
+      vi.useRealTimers();
       getTask.mockRestore();
       await close(listener.server);
     }

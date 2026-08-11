@@ -766,9 +766,6 @@ export default function BrandTrackingAgentPanel({
           <h2 className="m-0 truncate text-base font-semibold text-[#171321]">
             品牌追踪智能体
           </h2>
-          <p className="mt-1 truncate text-xs text-[#82758f]">
-            持久化多轮品牌追踪与用量归因
-          </p>
         </div>
         <div className="flex min-w-0 items-center gap-2">
           {sessions.length > 0 && (

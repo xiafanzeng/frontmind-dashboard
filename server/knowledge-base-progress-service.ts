@@ -18,12 +18,15 @@ import type {
   KnowledgeBaseActiveTurnDto,
   KnowledgeBaseApprovedPresentationDto,
   KnowledgeBaseCompletedTurnDto,
+  KnowledgeBaseDispatchState,
+  KnowledgeBaseFailureClass,
   KnowledgeBaseNoticeDto,
   KnowledgeBaseObservationDto,
   KnowledgeBasePackageDto,
   KnowledgeBaseProgressDto,
   KnowledgeBaseProgressLeafDto,
   KnowledgeBaseOperationType,
+  KnowledgeBaseRecoveryAction,
 } from "../shared/knowledge-base-progress";
 import {
   extractKnowledgeBaseProtocolObjects,
@@ -45,6 +48,7 @@ import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
+import { normalizeKnowledgeBaseCustomerMarkdownImages } from "./knowledge-base-markdown-normalization";
 import {
   createKnowledgeBaseAuthoritativeFinalOutput,
   deriveKnowledgeBaseAuthoritativeFinalizationPlan,
@@ -70,13 +74,17 @@ import {
   classifyKnowledgeBaseUpstreamTaskStatus,
   createKnowledgeBaseProgressState,
   getKnowledgeBaseProgressSummary,
+  knowledgeBaseTreePolicy,
   parseKnowledgeBaseManifestEnvelope,
   parseKnowledgeBaseProgressEnvelope,
   parseKnowledgeBaseReopenEnvelope,
+  validateKnowledgeBaseManifestForTreePolicy,
+  validateStoredKnowledgeBaseResearchCoverage,
   type KnowledgeBaseLeafStatus,
   type KnowledgeBasePresentationEnvelope,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
+import { knowledgeBaseNewBuildPolicyBinding } from "./knowledge-base-tree-policy-rollout";
 import type {
   KnowledgeBaseInitialLogoDisposition,
   KnowledgeBaseRejectedInitialLogoDisposition,
@@ -342,7 +350,10 @@ export function knowledgeBaseOutputImageDescriptorHash(
     .digest("hex");
 }
 
-function trustedKnowledgeBaseImageDescriptor(value: unknown) {
+function trustedKnowledgeBaseImageDescriptor(
+  value: unknown,
+  options: { includeUndeclaredOutputFiles?: boolean } = {},
+) {
   if (!isRecord(value)) return null;
   const type = stringValue(value.type).toLowerCase();
   const mimeType = stringValue(
@@ -381,7 +392,8 @@ function trustedKnowledgeBaseImageDescriptor(value: unknown) {
     type === "output_image" ||
     type === "image" ||
     ((type === "output_file" || type === "file") &&
-      (mimeType.startsWith("image/") ||
+      (options.includeUndeclaredOutputFiles === true ||
+        mimeType.startsWith("image/") ||
         /\.(?:avif|gif|jpe?g|png|webp)$/i.test(fileName)));
   if (!isImage || (!resourceId && !resourceUrl)) return null;
   return {
@@ -400,7 +412,10 @@ function trustedKnowledgeBaseImageDescriptor(value: unknown) {
  */
 export function collectTrustedKnowledgeBaseOutputImageDescriptors(
   output: unknown,
-  options: { ignoreInvalidDescriptors?: boolean } = {},
+  options: {
+    ignoreInvalidDescriptors?: boolean;
+    includeUndeclaredOutputFiles?: boolean;
+  } = {},
 ) {
   const items = Array.isArray(output)
     ? output
@@ -425,7 +440,7 @@ export function collectTrustedKnowledgeBaseOutputImageDescriptors(
     }
     let topLevel: KnowledgeBaseOutputImageDescriptor | null = null;
     try {
-      topLevel = trustedKnowledgeBaseImageDescriptor(rawItem);
+      topLevel = trustedKnowledgeBaseImageDescriptor(rawItem, options);
     } catch (error) {
       if (
         !options.ignoreInvalidDescriptors ||
@@ -446,7 +461,7 @@ export function collectTrustedKnowledgeBaseOutputImageDescriptors(
     for (const content of rawItem.content) {
       let descriptor: KnowledgeBaseOutputImageDescriptor | null = null;
       try {
-        descriptor = trustedKnowledgeBaseImageDescriptor(content);
+        descriptor = trustedKnowledgeBaseImageDescriptor(content, options);
       } catch (error) {
         if (
           !options.ignoreInvalidDescriptors ||
@@ -493,7 +508,10 @@ export function collectTrustedKnowledgeBaseOutputImageDescriptors(
 export function collectKnowledgeBaseOutputImageKeys(
   value: unknown,
   result = new Set<string>(),
-  options: { ignoreInvalidDescriptors?: boolean } = {},
+  options: {
+    ignoreInvalidDescriptors?: boolean;
+    includeUndeclaredOutputFiles?: boolean;
+  } = {},
 ) {
   const descriptors = collectTrustedKnowledgeBaseOutputImageDescriptors(
     value,
@@ -596,7 +614,6 @@ export function assertKnowledgeBaseNodeImageDelivery(input: {
           turnId: presentation.turnId,
         })
       : latestKnowledgeBasePresentationOutput(input.output);
-  assertKnowledgeBaseOutputHasNoInlineImages(protocolScopedOutput);
   if (
     presentation.imageState === undefined ||
     presentation.assetIds === undefined ||
@@ -664,13 +681,15 @@ export function assertKnowledgeBaseInitialImageDelivery(
         stateKind: "frontmind.knowledge-base.manifest",
       })
     : latestKnowledgeBasePresentationOutput(output);
-  assertKnowledgeBaseOutputHasNoInlineImages(scopedOutput);
   if (options.discardRejectedImages === true) return 0;
   const imageCount = options.allowMultiple
     ? collectTrustedKnowledgeBaseOutputImageDescriptors(scopedOutput, {
         ignoreInvalidDescriptors: true,
+        includeUndeclaredOutputFiles: true,
       }).length
-    : collectKnowledgeBaseOutputImageKeys(scopedOutput).size;
+    : collectKnowledgeBaseOutputImageKeys(scopedOutput, new Set<string>(), {
+        includeUndeclaredOutputFiles: true,
+      }).size;
   if (imageCount === 0 && options.allowMissing === true) return imageCount;
   if (imageCount > 0 && options.allowMultiple === true) return imageCount;
   if (imageCount !== 1) {
@@ -688,7 +707,10 @@ export function collectKnowledgeBaseInitialOutputImageDescriptors(
   options: { ignoreInvalidDescriptors?: boolean } = {},
 ) {
   try {
-    return collectTrustedKnowledgeBaseOutputImageDescriptors(output, options);
+    return collectTrustedKnowledgeBaseOutputImageDescriptors(output, {
+      ...options,
+      includeUndeclaredOutputFiles: true,
+    });
   } catch (error) {
     if (
       !rejectedLogo ||
@@ -701,16 +723,6 @@ export function collectKnowledgeBaseInitialOutputImageDescriptors(
     // A conflicting typed resource identity is itself the reason this Logo
     // was rejected. It must not prevent a valid Manifest/body from advancing.
     return [];
-  }
-}
-
-function assertKnowledgeBaseOutputHasNoInlineImages(output: unknown) {
-  const text = extractFinalKnowledgeBaseAssistantText(output);
-  if (/!\[[^\r\n]*\]\([^\r\n)]*\)|<img\b|data:image\//i.test(text)) {
-    throw new KnowledgeBaseBuildError(
-      "PROGRESS_PROTOCOL_INVALID",
-      "知识库正文不得包含 Markdown、HTML 或 data URL 图片；图片必须使用服务端绑定资源",
-    );
   }
 }
 
@@ -1147,8 +1159,9 @@ function modelOutputAudit(text: string) {
   const auditMarkdown = stripKnowledgeBaseProtocolPayloads(text)
     .trim()
     .slice(-2_000_000);
-  const contentMarkdown =
-    stripKnowledgeBaseReferenceAppendix(auditMarkdown).slice(-2_000_000);
+  const contentMarkdown = normalizeKnowledgeBaseCustomerMarkdownImages(
+    stripKnowledgeBaseReferenceAppendix(auditMarkdown).slice(-2_000_000),
+  ).markdown;
   const sourceUrls = Array.from(
     new Set(auditMarkdown.match(/https?:\/\/[^\s<>)\]"']+/gi) || []),
   ).slice(0, 500);
@@ -1249,9 +1262,11 @@ export function projectKnowledgeBasePresentationMarkdown(input: {
   leafTitle: string;
   leafIds: readonly string[];
 }) {
-  const withoutAcknowledgements = stripLeadingKnowledgeBaseAcknowledgements(
+  const imageFreeMarkdown = normalizeKnowledgeBaseCustomerMarkdownImages(
     input.markdown,
-  );
+  ).markdown;
+  const withoutAcknowledgements =
+    stripLeadingKnowledgeBaseAcknowledgements(imageFreeMarkdown);
   if (!withoutAcknowledgements) return "";
   const leafIds = Array.from(
     new Set(
@@ -1393,6 +1408,39 @@ function stateFromRows(
   };
 }
 
+function buildResearchSummary(
+  build: KnowledgeBaseBuild,
+  rows?: readonly KnowledgeBaseBuildNode[],
+) {
+  let coverage: ReturnType<typeof validateStoredKnowledgeBaseResearchCoverage>;
+  try {
+    coverage = validateStoredKnowledgeBaseResearchCoverage(
+      build.initialResearchCoverage,
+      {
+        ...(rows ? { knownLeafIds: rows.map((row) => row.leafId) } : {}),
+        totalLeafCount: build.totalNodeCount,
+      },
+    );
+  } catch {
+    return null;
+  }
+  return {
+    officialPages: { ...coverage.officialPages },
+    publicQueries: coverage.publicQueries,
+    officialDocuments: coverage.officialDocuments,
+    uploadsRead: coverage.uploadsRead,
+    sourceCount: coverage.sourceCount,
+    productFamilyCount: coverage.productFamilies.length,
+    coveredDimensionCount: coverage.dimensions.filter(
+      (dimension) => dimension.status === "covered",
+    ).length,
+    gapDimensionCount: coverage.dimensions.filter(
+      (dimension) => dimension.status === "gap",
+    ).length,
+    stopReason: coverage.stopReason,
+  };
+}
+
 function buildDto(
   build: KnowledgeBaseBuild,
   rows: KnowledgeBaseBuildNode[],
@@ -1456,6 +1504,8 @@ function buildDto(
   ).length;
   const handled = confirmed + directPrefilled;
   const total = leaves.length;
+  const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
+  const researchSummary = buildResearchSummary(build, rows);
   const logoCanChange =
     build.skillVersion === "4" &&
     build.status === "confirming" &&
@@ -1468,6 +1518,8 @@ function buildDto(
       conversationId: build.conversationId,
       companyName: build.companyName,
       skillVersion: build.skillVersion,
+      depthPolicy,
+      researchSummary,
       status: build.status as KnowledgeBaseBuildStatus,
       revision: build.revision,
       currentLeafId: build.currentLeafId,
@@ -1489,7 +1541,10 @@ function buildDto(
     },
     branches: [...branchMap.values()],
     packageAllowed:
-      total > 0 &&
+      total >= depthPolicy.minLeaves &&
+      total <= depthPolicy.maxLeaves &&
+      build.totalNodeCount === total &&
+      (depthPolicy.version === 1 || researchSummary !== null) &&
       handled === total &&
       build.currentLeafId === null &&
       build.status === "ready_to_publish" &&
@@ -1586,6 +1641,18 @@ export async function createKnowledgeBaseBuild(input: {
       // reset/restart is owned by the audited reset workflow.
       return existing;
     }
+    const policyBinding = knowledgeBaseNewBuildPolicyBinding();
+    if (
+      (input.skillVersion !== undefined &&
+        input.skillVersion !== policyBinding.skillVersion) ||
+      (input.skillContentHash !== undefined &&
+        input.skillContentHash !== policyBinding.skillContentHash)
+    ) {
+      throw new KnowledgeBaseBuildError(
+        "PROGRESS_PROTOCOL_INVALID",
+        "知识库深度策略与固定 Skill 归档不匹配",
+      );
+    }
     const id = randomUUID();
     await tx.insert(knowledgeBaseBuilds).values({
       id,
@@ -1594,8 +1661,9 @@ export async function createKnowledgeBaseBuild(input: {
       companyName,
       companyWebsite: input.companyWebsite?.trim() || null,
       skillName: input.skillName || "socratic-kb-builder",
-      skillVersion: input.skillVersion || "1",
-      skillContentHash: input.skillContentHash || null,
+      skillVersion: policyBinding.skillVersion,
+      skillContentHash: policyBinding.skillContentHash,
+      treePolicyVersion: policyBinding.treePolicyVersion,
       status: "researching",
       awaitingResponseSince: new Date(),
     });
@@ -1780,7 +1848,14 @@ export async function getKnowledgeBaseProgress(input: {
         .select()
         .from(knowledgeBaseBuilds)
         .where(eq(knowledgeBaseBuilds.userId, input.userId))
-        .orderBy(desc(knowledgeBaseBuilds.updatedAt))
+        // Background reconciliation can touch an older build long after a
+        // newer conversation was created. Creation time is the stable notion
+        // of "current" when the caller has no conversation id; id breaks the
+        // sub-second timestamp tie deterministically.
+        .orderBy(
+          desc(knowledgeBaseBuilds.createdAt),
+          desc(knowledgeBaseBuilds.id),
+        )
         .limit(1);
   const build = buildRows[0];
   if (!build) return null;
@@ -2101,6 +2176,57 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   );
   const requiresAttachmentReselection =
     activeTurnMetadata.awaitingClientAttachments === true;
+  const dispatchState: KnowledgeBaseDispatchState = activeTurnRow
+    ? activeTurnRow.status === "completed"
+      ? "completed"
+      : activeTurnRow.status === "failed" ||
+          activeTurnRow.status === "cancelled"
+        ? "failed"
+        : activeTurnRow.upstreamTaskId
+          ? "bound"
+          : activeTurnMetadata.dispatchState === "recovering" ||
+              activeTurnMetadata.preparedDispatch ||
+              activeTurnMetadata.dispatchingAt ||
+              activeTurnMetadata.outcomeUnknownAt
+            ? "recovering"
+            : "reserved"
+    : "completed";
+  const storedFailureClass = String(activeTurnMetadata.failureClass || "");
+  const activeFailureClass: KnowledgeBaseFailureClass | null = [
+    "recoverable_same_turn",
+    "requires_user_fix",
+    "terminal_requires_regeneration",
+    "terminal_nonregenerable",
+  ].includes(storedFailureClass)
+    ? (storedFailureClass as KnowledgeBaseFailureClass)
+    : dispatchState === "recovering"
+      ? "recoverable_same_turn"
+      : dispatchState === "failed"
+        ? activeTurnRow?.upstreamTaskId
+          ? "terminal_requires_regeneration"
+          : "requires_user_fix"
+        : null;
+  const storedRecoveryAction = String(activeTurnMetadata.recoveryAction || "");
+  const activeRecoveryAction: KnowledgeBaseRecoveryAction | null = [
+    "wait",
+    "reconcile",
+    "top_up",
+    "update_credential",
+    "fix_attachments",
+    "reupload_logo",
+    "regenerate_turn",
+    "contact_support",
+  ].includes(storedRecoveryAction)
+    ? (storedRecoveryAction as KnowledgeBaseRecoveryAction)
+    : dispatchState === "recovering"
+      ? "reconcile"
+      : dispatchState === "reserved" || dispatchState === "bound"
+        ? "wait"
+        : activeFailureClass === "terminal_requires_regeneration"
+          ? "regenerate_turn"
+          : activeFailureClass
+            ? "contact_support"
+            : null;
   if (
     activeTurnRow?.operationKey &&
     activeTurnRow.clientRequestId &&
@@ -2119,6 +2245,13 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       startedAt: activeTurnRow.startedAt?.getTime() ?? null,
       completedAt: activeTurnRow.completedAt?.getTime() ?? null,
       updatedAt: activeTurnRow.updatedAt.getTime(),
+      dispatchState,
+      upstreamTaskId: activeTurnRow.upstreamTaskId,
+      failureClass: activeFailureClass,
+      recoveryAction: activeRecoveryAction,
+      canRegenerate:
+        activeFailureClass === "terminal_requires_regeneration" &&
+        activeTurnMetadata.canRegenerate !== false,
       requiresAttachmentReselection,
       stagedAttachmentCount: stagedClientAttachments,
       expectedAttachmentCount:
@@ -2179,12 +2312,17 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       : [];
   const resources = [...logoResources, ...customerUploadResources];
   let approvedPresentation: KnowledgeBaseApprovedPresentationDto | null = null;
-  const visibleMarkdown = canonicalKnowledgeBaseMarkdown(
+  const storedMarkdown = canonicalKnowledgeBaseMarkdown(
     currentRow?.contentMarkdown || "",
+  );
+  const visibleMarkdown = canonicalKnowledgeBaseMarkdown(
+    normalizeKnowledgeBaseCustomerMarkdownImages(storedMarkdown).markdown,
   );
   if (currentRow && visibleMarkdown && (!build.activeTurnId || activeTurnRow)) {
     const contentSha256 =
-      currentRow.contentSha256 || knowledgeBaseMarkdownSha256(visibleMarkdown);
+      storedMarkdown === visibleMarkdown && currentRow.contentSha256
+        ? currentRow.contentSha256
+        : knowledgeBaseMarkdownSha256(visibleMarkdown);
     approvedPresentation = {
       turnId:
         currentRow.sourceTurnId ||
@@ -2248,6 +2386,9 @@ function projectKnowledgeBaseObservationSnapshot(input: {
           ? `正在校验并暂存本轮附件（${stagedClientAttachments}/${expectedClientAttachments}）；完成后会直接提交本轮。`
           : "附件已上传，正在完成完整性校验；校验通过后会直接提交本轮。",
       retryable: false,
+      failureClass: "requires_user_fix",
+      recoveryAction: "fix_attachments",
+      canRegenerate: false,
       turnId: activeTurnRow.id,
       createdAt: activeTurnRow.updatedAt.getTime(),
     };
@@ -2263,11 +2404,35 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       message:
         "本轮未能绑定可下载并解码的企业主 Logo 图片。请上传一张 Logo 原图后继续；推荐透明 PNG。",
       retryable: false,
+      failureClass: "requires_user_fix",
+      recoveryAction: "reupload_logo",
+      canRegenerate: false,
       turnId: null,
       createdAt: build.updatedAt.getTime(),
     };
   } else if (build.protocolError) {
     const code = build.protocolErrorCode || "PROGRESS_PROTOCOL_INVALID";
+    const sameTaskRecovery =
+      knowledgeBaseProtocolErrorAllowsSameTaskRecovery(code);
+    const protocolCanRegenerate =
+      !sameTaskRecovery &&
+      !KNOWLEDGE_BASE_MAINTENANCE_ONLY_ERROR_CODES.has(code) &&
+      (Boolean(activeTurnRow?.upstreamTaskId) ||
+        code === "MANIFEST_LEAF_COUNT_BELOW_MIN" ||
+        code === "MANIFEST_RESEARCH_COVERAGE_INCOMPLETE");
+    const failureClass =
+      (sameTaskRecovery ? "recoverable_same_turn" : activeFailureClass) ||
+      (protocolCanRegenerate
+        ? "terminal_requires_regeneration"
+        : "recoverable_same_turn");
+    const recoveryAction =
+      (sameTaskRecovery ? "reconcile" : activeRecoveryAction) ||
+      (protocolCanRegenerate ? "regenerate_turn" : "reconcile");
+    const canRegenerate = sameTaskRecovery
+      ? false
+      : activeTurn
+        ? activeTurn.canRegenerate === true
+        : protocolCanRegenerate;
     notice = {
       key: `${build.id}:${build.generation}:${build.stateEpoch}:${code}`,
       code,
@@ -2278,6 +2443,9 @@ function projectKnowledgeBaseObservationSnapshot(input: {
         code,
         activeTurnId: activeTurnRow?.id || null,
       }),
+      failureClass,
+      recoveryAction,
+      canRegenerate,
       turnId: activeTurnRow?.id || null,
       createdAt: build.updatedAt.getTime(),
     };
@@ -2350,6 +2518,12 @@ function assertActionMatchesTransition(
 function friendlyProtocolError(error: unknown) {
   if (error instanceof KnowledgeBaseBuildError) return error.message;
   if (error instanceof KnowledgeBaseProgressError) {
+    if (error.code === "MANIFEST_LEAF_COUNT_BELOW_MIN") {
+      return "知识树少于 Dashboard 深度库要求的 30 个真实节点，请继续研究并补齐业务维度后重试";
+    }
+    if (error.code === "MANIFEST_RESEARCH_COVERAGE_INCOMPLETE") {
+      return "首轮研究覆盖账本不完整，请继续完成官网、公开检索、上传资料和七维覆盖后重试";
+    }
     if (error.code === "INVALID_MANIFEST") {
       return "知识树信息尚不完整，请在对话中继续补充或重试本轮";
     }
@@ -2448,6 +2622,159 @@ export function advanceKnowledgeBaseProtocolFailureObservation(input: {
 }
 
 /**
+ * Persist operational recovery authority without misclassifying task-read or
+ * credential failures as model-output corruption. Transient reads never move
+ * the build into a terminal state; credential failures pause the same bound
+ * turn until the user fixes access and reconciles it again.
+ */
+export function knowledgeBaseOperationalFailureAuthority(input: {
+  turnStatus: ConversationTurn["status"];
+  failureClass: "recoverable_same_turn" | "requires_user_fix";
+  recoveryAction: "reconcile" | "update_credential";
+}) {
+  return {
+    // Operational pauses never complete or fail the logical turn. Once the
+    // credential/quota or transient read issue clears, reconcile continues
+    // this exact bound task and reservation.
+    turnStatus: input.turnStatus,
+    dispatchState:
+      input.failureClass === "requires_user_fix" ? "bound" : "recovering",
+    failureClass: input.failureClass,
+    recoveryAction: input.recoveryAction,
+    canRegenerate: false,
+    buildStatus:
+      input.failureClass === "requires_user_fix" ? "protocol_error" : null,
+  } as const;
+}
+
+export function knowledgeBaseProtocolFailureShouldBecomeTerminal(input: {
+  providerFailed: boolean;
+  debounceSatisfied: boolean;
+}) {
+  return input.providerFailed || input.debounceSatisfied;
+}
+
+export async function observeKnowledgeBaseOperationalFailure(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+  code: string;
+  message: string;
+  failureClass: "recoverable_same_turn" | "requires_user_fix";
+  recoveryAction: "reconcile" | "update_credential";
+  observedAt?: Date;
+}) {
+  const db = await requireDb();
+  const conversationId = normalizeConversationId(input.conversationId);
+  const observedAt = input.observedAt ?? new Date();
+  const code = String(input.code || "KNOWLEDGE_BASE_OPERATIONAL_FAILURE").slice(
+    0,
+    128,
+  );
+  const message = String(input.message || "知识库任务暂时不可用")
+    .trim()
+    .slice(0, 10_000);
+  return db.transaction(async (tx) => {
+    const build = await loadBuild(tx, input.userId, conversationId, true);
+    if (
+      !build?.activeTurnId ||
+      build.status === "ready_to_publish" ||
+      build.status === "published"
+    ) {
+      return false;
+    }
+    const turn = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, build.activeTurnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, build.id),
+            eq(conversationTurns.buildGeneration, build.generation),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    if (
+      !turn ||
+      turn.upstreamTaskId !== input.taskId ||
+      build.upstreamTaskId !== input.taskId
+    ) {
+      return false;
+    }
+    const authority = knowledgeBaseOperationalFailureAuthority({
+      turnStatus: turn.status,
+      failureClass: input.failureClass,
+      recoveryAction: input.recoveryAction,
+    });
+    const requiresUserFix = authority.buildStatus === "protocol_error";
+    const metadata = isRecord(turn.metadata) ? turn.metadata : {};
+    const nextMetadata = {
+      ...metadata,
+      dispatchState: authority.dispatchState,
+      failureClass: authority.failureClass,
+      recoveryAction: authority.recoveryAction,
+      canRegenerate: authority.canRegenerate,
+    };
+    if (!requiresUserFix) {
+      await tx
+        .update(conversationTurns)
+        .set({
+          metadata: nextMetadata,
+          errorCode: code,
+          errorMessage: message || null,
+          updatedAt: observedAt,
+        })
+        .where(eq(conversationTurns.id, turn.id));
+      return true;
+    }
+    if (
+      build.status === "protocol_error" &&
+      build.protocolErrorCode === code &&
+      metadata.failureClass === input.failureClass &&
+      metadata.recoveryAction === input.recoveryAction
+    ) {
+      return true;
+    }
+
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "protocol_error",
+        stateEpoch: build.stateEpoch + 1,
+        protocolErrorCode: code,
+        protocolError: message,
+        awaitingResponseSince: null,
+        updatedAt: observedAt,
+      })
+      .where(eq(knowledgeBaseBuilds.id, build.id));
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: nextMetadata,
+        errorCode: code,
+        errorMessage: message || null,
+        updatedAt: observedAt,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    await markKnowledgeBaseConversationFailedInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: knowledgeBaseObservationConversationStorageId(
+        input.userId,
+        conversationId,
+      ),
+      authoritativeTaskId: input.taskId,
+      failedAt: observedAt,
+    });
+    return true;
+  });
+}
+
+/**
  * Observe one settled protocol/artifact failure. A single partial or replaced
  * snapshot cannot poison a build: only three identical observations spanning
  * at least ten seconds become one durable notice. The counter lives on the
@@ -2464,10 +2791,9 @@ export async function observeKnowledgeBaseProtocolFailure(input: {
   taskId?: string;
   observedAt?: Date;
   /**
-   * Use only for an immutable, settled provider result whose protocol failure
-   * is already conclusive (for example, an acknowledgement-only response).
-   * Ordinary resource/protocol snapshots must retain the multi-observation
-   * debounce because providers can replace an incomplete settled snapshot.
+   * Use only when the provider explicitly marks the task failed/cancelled.
+   * Acknowledgement-only and incomplete settled snapshots still retain the
+   * multi-observation debounce because providers can replace them in place.
    */
   definitive?: boolean;
 }): Promise<boolean> {
@@ -2529,17 +2855,26 @@ export async function observeKnowledgeBaseProtocolFailure(input: {
       observationKey: input.observationKey,
       observedAt,
     });
-    const nextMetadata = {
+    const recoveryMetadata = {
       ...metadata,
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
       recovery: {
         ...recovery,
         protocolFailureObservation: advanced.observation,
       },
     };
-    if (!input.definitive && !advanced.shouldPersist) {
+    if (
+      !knowledgeBaseProtocolFailureShouldBecomeTerminal({
+        providerFailed: input.definitive === true,
+        debounceSatisfied: advanced.shouldPersist,
+      })
+    ) {
       await tx
         .update(conversationTurns)
-        .set({ metadata: nextMetadata, updatedAt: observedAt })
+        .set({ metadata: recoveryMetadata, updatedAt: observedAt })
         .where(eq(conversationTurns.id, turn.id));
       return false;
     }
@@ -2563,7 +2898,13 @@ export async function observeKnowledgeBaseProtocolFailure(input: {
     await tx
       .update(conversationTurns)
       .set({
-        metadata: nextMetadata,
+        metadata: {
+          ...recoveryMetadata,
+          dispatchState: "failed",
+          failureClass: "terminal_requires_regeneration",
+          recoveryAction: "regenerate_turn",
+          canRegenerate: true,
+        },
         status: "failed",
         errorCode: failureCode,
         errorMessage: message || null,
@@ -3027,9 +3368,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
     ),
     lastOutputItemIds: (input.outputState?.itemIds || []).slice(-5_000),
   };
+  let committedDepthObservation:
+    | { event: string; payload: Record<string, unknown> }
+    | undefined;
 
   try {
-    return await db.transaction(async (tx) => {
+    const result = await db.transaction(async (tx) => {
       let build = await loadBuild(tx, input.userId, conversationId, true);
       if (!build) {
         throw new KnowledgeBaseBuildError(
@@ -3267,7 +3611,11 @@ export async function reconcileKnowledgeBaseProgress(input: {
         // details, so it is intentionally non-empty. A valid signed manifest
         // is authoritative for initialization and makes a failed first parse
         // recoverable on the next server-side task check.
-        const manifest = parseKnowledgeBaseManifestEnvelope(text);
+        const manifest = validateKnowledgeBaseManifestForTreePolicy(
+          parseKnowledgeBaseManifestEnvelope(text),
+          build.treePolicyVersion,
+          { expectedUploadsRead: build.lastTurnAttachmentCount },
+        );
         assertEnvelopeBelongsToActiveTurn({
           build,
           activeTurn,
@@ -3417,6 +3765,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
             revision: state.revision,
             currentLeafId: state.currentLeafId,
             totalNodeCount: state.leaves.length,
+            initialResearchCoverage: manifest.researchCoverage
+              ? (manifest.researchCoverage as unknown as Record<
+                  string,
+                  unknown
+                >)
+              : null,
             confirmedCount: 0,
             directPrefilledCount: 0,
             needsVerificationCount: 0,
@@ -3460,6 +3814,31 @@ export async function reconcileKnowledgeBaseProgress(input: {
             "首轮操作已被新的权威状态替换",
           );
         }
+        const acceptedResearch = manifest.researchCoverage;
+        committedDepthObservation = {
+          event: "initial_manifest_accepted",
+          payload: {
+            buildId: build.id,
+            generation: build.generation,
+            skillVersion: build.skillVersion,
+            skillContentHash: build.skillContentHash,
+            treePolicyVersion: build.treePolicyVersion,
+            createdAt: build.createdAt.toISOString(),
+            acceptedAt: new Date().toISOString(),
+            leafCount: state.leaves.length,
+            ...(acceptedResearch
+              ? {
+                  officialPages: acceptedResearch.officialPages,
+                  publicQueries: acceptedResearch.publicQueries,
+                  officialDocuments: acceptedResearch.officialDocuments,
+                  uploadsRead: acceptedResearch.uploadsRead,
+                  sourceCount: acceptedResearch.sourceCount,
+                  productFamilyCount: acceptedResearch.productFamilies.length,
+                  stopReason: acceptedResearch.stopReason,
+                }
+              : {}),
+          },
+        };
         if (activeTurn) {
           const activeTurnMetadata = isRecord(activeTurn.metadata)
             ? activeTurn.metadata
@@ -3963,8 +4342,32 @@ export async function reconcileKnowledgeBaseProgress(input: {
           "最终知识库 ZIP 未与当前任务、版本和描述原子绑定",
         );
       }
+      if (packageAllowed) {
+        const researchSummary = buildResearchSummary(build, rows);
+        committedDepthObservation = {
+          event: "final_package_accepted",
+          payload: {
+            buildId: build.id,
+            generation: build.generation,
+            skillVersion: build.skillVersion,
+            skillContentHash: build.skillContentHash,
+            treePolicyVersion: build.treePolicyVersion,
+            createdAt: build.createdAt.toISOString(),
+            finishedAt: (build.completedAt || new Date()).toISOString(),
+            leafCount: rows.length,
+            ...(researchSummary || {}),
+          },
+        };
+      }
       return buildDto(build, rows);
     });
+    if (committedDepthObservation) {
+      console.info(
+        `[KnowledgeBaseDepth] ${committedDepthObservation.event}`,
+        JSON.stringify(committedDepthObservation.payload),
+      );
+    }
+    return result;
   } catch (error) {
     if (
       error instanceof KnowledgeBaseBuildError &&
@@ -4020,13 +4423,15 @@ export async function reconcileKnowledgeBaseProgress(input: {
         error,
       }),
       message,
-      code: acknowledgementOnly
-        ? "UPSTREAM_ACKNOWLEDGEMENT_ONLY"
-        : error instanceof KnowledgeBaseBuildError &&
-            error.code === "FINAL_PACKAGE_MISSING"
-          ? error.code
-          : undefined,
-      definitive: acknowledgementOnly,
+      code: upstream.failed
+        ? "UPSTREAM_TASK_FAILED"
+        : acknowledgementOnly
+          ? "UPSTREAM_ACKNOWLEDGEMENT_ONLY"
+          : error instanceof KnowledgeBaseBuildError
+            ? error.code
+            : undefined,
+      status: upstream.failed ? "failed" : "protocol_error",
+      definitive: upstream.failed,
     });
     const progress = await getKnowledgeBaseProgress({
       userId: input.userId,
@@ -4051,6 +4456,18 @@ export async function assertKnowledgeBasePublishable(input: {
     );
   }
   const rows = await loadNodes(db, build.id);
+  const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
+  if (
+    rows.length < depthPolicy.minLeaves ||
+    rows.length > depthPolicy.maxLeaves ||
+    build.totalNodeCount !== rows.length ||
+    (depthPolicy.version === 2 && !buildResearchSummary(build, rows))
+  ) {
+    throw new KnowledgeBaseBuildError(
+      "PUBLISH_BLOCKED",
+      `知识库不符合深度策略 v${depthPolicy.version}（要求 ${depthPolicy.minLeaves}–${depthPolicy.maxLeaves} 个节点）`,
+    );
+  }
   if (build.status === "published" && build.publishedSnapshotId) {
     return build;
   }

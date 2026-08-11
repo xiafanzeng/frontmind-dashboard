@@ -81,6 +81,8 @@ describe("ordinary-user FrontMind proxy policy", () => {
     ["POST", "/api/frontmind/v1/files"],
     ["PUT", "/api/frontmind/proxy-upload?target=https%3A%2F%2Fexample.com"],
     ["POST", "/api/frontmind/download-token"],
+    ["DELETE", "/api/frontmind/v1/files/file-1/discard"],
+    ["POST", "/api/frontmind/v1/files/file-1/upload-recovery"],
   ])("allows support transport %s %s", (method, originalUrl) => {
     expect(ordinaryUserMayUseFrontMindProxy({ method, originalUrl })).toBe(
       true,
@@ -90,6 +92,7 @@ describe("ordinary-user FrontMind proxy policy", () => {
   it.each([
     ["POST", "/api/frontmind/v1/files"],
     ["PUT", "/api/frontmind/proxy-upload?target=https%3A%2F%2Fexample.com"],
+    ["POST", "/api/frontmind/v1/files/file-1/upload-recovery"],
   ])(
     "marks upload transport %s %s as requiring an active service",
     (method, originalUrl) => {
@@ -143,6 +146,26 @@ describe("ordinary-user FrontMind proxy policy", () => {
 
     expect(assertWriteAccess).not.toHaveBeenCalled();
     expect(next).toHaveBeenCalledOnce();
+  });
+
+  it("allows an expired customer to discard an owned unbound upload", async () => {
+    const assertWriteAccess = vi.fn();
+    const middleware = createFrontMindProxyAccessMiddleware({
+      assertWriteAccess,
+    });
+    const req = {
+      method: "DELETE",
+      originalUrl: "/api/frontmind/v1/files/file-1/discard",
+      frontmindUser: actor("user"),
+    } as FrontMindRequest;
+    const res = response();
+    const next = vi.fn();
+
+    await middleware(req, res as never, next);
+
+    expect(assertWriteAccess).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledOnce();
+    expect(res.status).not.toHaveBeenCalled();
   });
 
   it.each([

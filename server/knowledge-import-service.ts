@@ -84,7 +84,7 @@ const websiteKnowledgeImportFinalArtifactSchema = z
     fileId: opaqueImportIdentitySchema,
     filename: z.string().trim().min(1).max(512),
     sha256: sha256Schema,
-    archiveContractVersion: z.literal(3),
+    archiveContractVersion: z.union([z.literal(3), z.literal(4)]),
     validationProfile: z.literal("website-lead-v1"),
     packageManifestSha256: sha256Schema,
     finalizerVersion: z.literal("website-kb-finalizer-v1"),
@@ -102,7 +102,12 @@ export const websiteKnowledgeImportSchema = z.discriminatedUnion(
     websiteKnowledgeImportBaseSchema
       .extend({
         schemaVersion: z.literal(3),
-        archiveContractVersion: z.union([z.literal(1), z.literal(2)]),
+        archiveContractVersion: z.union([
+          z.literal(1),
+          z.literal(2),
+          z.literal(3),
+          z.literal(4),
+        ]),
         validationProfile: z.literal("website-lead-v1"),
         packageManifestSha256: sha256Schema,
       })

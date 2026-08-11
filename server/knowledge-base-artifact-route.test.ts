@@ -47,6 +47,8 @@ beforeEach(() => {
                   generation: 2,
                   status: "ready_to_publish",
                   skillVersion: "4",
+                  treePolicyVersion: 1,
+                  initialResearchCoverage: null,
                   revision: 8,
                   logoStorageKey: `knowledge-builds/42/${buildId}/generation-2/official-logo.bin`,
                   logoSha256: "a".repeat(64),

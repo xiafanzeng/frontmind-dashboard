@@ -62,7 +62,7 @@ describe("website knowledge import v2/v3 contract", () => {
     expect(value).not.toHaveProperty("packageManifestSha256");
   });
 
-  it("accepts v3 with Website archive contract v1 or v2", () => {
+  it("accepts v3 with Website archive contracts v1 through v4", () => {
     const value = websiteKnowledgeImportSchema.parse(knowledgeImportRequest(3));
     expect(value).toMatchObject({
       schemaVersion: 3,
@@ -73,11 +73,11 @@ describe("website knowledge import v2/v3 contract", () => {
     expect(
       websiteKnowledgeImportSchema.parse({
         ...knowledgeImportRequest(3),
-        archiveContractVersion: 2,
+        archiveContractVersion: 4,
       }),
     ).toMatchObject({
       schemaVersion: 3,
-      archiveContractVersion: 2,
+      archiveContractVersion: 4,
       validationProfile: "website-lead-v1",
     });
   });
@@ -100,6 +100,24 @@ describe("website knowledge import v2/v3 contract", () => {
         validationProfile: "website-lead-v1",
         packageManifestSha256: "d".repeat(64),
         finalizerVersion: "website-kb-finalizer-v1",
+      },
+    });
+  });
+
+  it("accepts a Website v4 light archive without treating its leaf depth as Dashboard depth", () => {
+    const request = knowledgeImportRequest(4) as any;
+    const value = websiteKnowledgeImportSchema.parse({
+      ...request,
+      finalArtifact: {
+        ...request.finalArtifact,
+        archiveContractVersion: 4,
+      },
+    });
+    expect(value).toMatchObject({
+      schemaVersion: 4,
+      finalArtifact: {
+        archiveContractVersion: 4,
+        validationProfile: "website-lead-v1",
       },
     });
   });

@@ -42,10 +42,16 @@ import {
   reserveKnowledgeBaseRetryTurn,
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
+  replaceKnowledgeBaseTurnAttachmentsAfterUserFix,
+  resumeKnowledgeBaseTurnAfterUserFix,
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseDeferredTurnAttachment,
   sanitizeKnowledgeBaseRecoveryMetadata,
 } from "./knowledge-base-turn-service";
+import {
+  KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
+  KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
+} from "./knowledge-base-tree-policy-rollout";
 
 function turn(overrides: Partial<ConversationTurn> = {}): ConversationTurn {
   const now = new Date("2026-08-01T00:00:00.000Z");
@@ -137,6 +143,7 @@ function createTurnServiceExecutor(input: {
     resources: [...(input.resources || [])],
     usageOwnerId: input.usageOwnerId ?? null,
   };
+  const events: string[] = [];
   let transactionIndex = 0;
   const executor = {
     transaction: async (run: (tx: any) => Promise<unknown>) => {
@@ -146,7 +153,11 @@ function createTurnServiceExecutor(input: {
       let lastSelectedTurn: ConversationTurn | undefined;
       let messageSelectionIndex = 0;
       const turnSelections = input.turnSelections[currentTransaction] || [];
-      const selected = (table: unknown, condition?: unknown) => {
+      const selected = (
+        table: unknown,
+        condition?: unknown,
+        options: { peekTurn?: boolean } = {},
+      ) => {
         if (table === knowledgeBaseBuilds) {
           return store.build ? [store.build] : [];
         }
@@ -157,10 +168,13 @@ function createTurnServiceExecutor(input: {
           return store.credentials;
         }
         if (table === conversationTurns) {
-          const selection = turnSelections[turnSelectionIndex++] || [];
+          const selection =
+            turnSelections[
+              options.peekTurn ? turnSelectionIndex : turnSelectionIndex++
+            ] || [];
           const rows =
             typeof selection === "function" ? selection(store) : selection;
-          lastSelectedTurn = rows[0];
+          if (!options.peekTurn) lastSelectedTurn = rows[0];
           return rows;
         }
         if (table === knowledgeBaseConversationTombstones) {
@@ -188,14 +202,26 @@ function createTurnServiceExecutor(input: {
         }
         return [];
       };
-      const selectionBuilder = (table: unknown, condition?: unknown) => ({
+      const selectionBuilder = (
+        table: unknown,
+        condition?: unknown,
+        options: { peekTurn?: boolean } = {},
+      ) => ({
         limit: () => ({
-          for: async () => selected(table, condition),
+          for: async () => {
+            if (table === upstreamResources) {
+              events.push("start-attachments:lock");
+            }
+            return selected(table, condition, options);
+          },
           then: (
             resolve: (value: unknown) => unknown,
             reject: (reason: unknown) => unknown,
           ) =>
-            Promise.resolve(selected(table, condition)).then(resolve, reject),
+            Promise.resolve(selected(table, condition, options)).then(
+              resolve,
+              reject,
+            ),
         }),
         orderBy: () => ({
           limit: async () =>
@@ -205,9 +231,13 @@ function createTurnServiceExecutor(input: {
         }),
       });
       const tx = {
-        select: () => ({
+        select: (projection?: unknown) => ({
           from: (table: unknown) => ({
-            where: (condition: unknown) => selectionBuilder(table, condition),
+            where: (condition: unknown) =>
+              selectionBuilder(table, condition, {
+                peekTurn:
+                  table === conversationTurns && projection !== undefined,
+              }),
           }),
         }),
         insert: (table: unknown) => ({
@@ -233,6 +263,7 @@ function createTurnServiceExecutor(input: {
               };
             } else if (table === conversationTurns) {
               store.turns.push(values as ConversationTurn);
+              events.push("turn:insert");
             } else if (table === messages) {
               store.messages.push(values);
             } else if (table === upstreamResources) {
@@ -261,13 +292,21 @@ function createTurnServiceExecutor(input: {
                   } as ConversationTurn;
                   lastSelectedTurn = store.turns[index];
                 }
+              } else if (table === upstreamResources) {
+                store.resources = store.resources.map((resource) => ({
+                  ...resource,
+                  ...values,
+                }));
+                events.push("start-attachments:bind");
               }
             },
           }),
         }),
       };
       try {
-        return await run(tx);
+        const result = await run(tx);
+        events.push("transaction:commit");
+        return result;
       } catch (error) {
         store.build = snapshot.build;
         store.conversation = snapshot.conversation;
@@ -282,7 +321,7 @@ function createTurnServiceExecutor(input: {
       }
     },
   };
-  return { executor, store };
+  return { executor, store, events };
 }
 
 function retryableFailedTurn(overrides: Partial<ConversationTurn> = {}) {
@@ -910,10 +949,26 @@ describe("knowledge-base recovery metadata", () => {
       generation: storedTurn.buildGeneration,
       activeTurnId: storedTurn.id,
     };
-    const selected = (rows: unknown[]) => ({
+    const lockTrace: string[] = [];
+    const selected = (table: unknown, rows: unknown[]) => ({
       where: () => ({
         limit: () => ({
-          for: async () => rows,
+          for: async (mode: string) => {
+            if (mode === "update") {
+              lockTrace.push(
+                table === knowledgeBaseBuilds
+                  ? "build"
+                  : table === conversationTurns
+                    ? "turn"
+                    : "other",
+              );
+            }
+            return rows;
+          },
+          then: (
+            resolve: (value: unknown[]) => unknown,
+            reject: (reason: unknown) => unknown,
+          ) => Promise.resolve(rows).then(resolve, reject),
         }),
       }),
     });
@@ -921,6 +976,7 @@ describe("knowledge-base recovery metadata", () => {
       select: () => ({
         from: (table: unknown) =>
           selected(
+            table,
             table === conversationTurns
               ? [storedTurn]
               : table === knowledgeBaseBuilds
@@ -978,6 +1034,250 @@ describe("knowledge-base recovery metadata", () => {
       /API_KEY|Authorization|credential-value/,
     );
     expect((storedTurn.metadata as any).preparedDispatch).toEqual(prepared);
+    expect(lockTrace).toEqual(["build", "turn"]);
+  });
+
+  it("resumes one pre-create user-fix failure on the same logical turn exactly once", async () => {
+    const preparedDispatch = {
+      schemaVersion: 1 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "exact prompt",
+        agentProfile: "manus-1.6-max",
+        taskMode: "agent" as const,
+        attachments: [{ file_id: "skill-file", filename: "skill.zip" }],
+      },
+      bodySha256: "d".repeat(64),
+      preparedAt: "2026-08-01T00:00:00.000Z",
+    };
+    const failed = turn({
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "UPSTREAM_CREATE_HTTP_402",
+      errorMessage: "余额不足",
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      leaseExpiresAt: null,
+      attachmentFileIds: ["skill-file"],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 1,
+        userAttachmentCount: 0,
+        preparedDispatch,
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          skillVersion: "4",
+          skillContentHash: "a".repeat(64),
+        },
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "top_up",
+        canRegenerate: false,
+      },
+    });
+    const build = {
+      id: failed.buildId,
+      userId: 1,
+      conversationId: "conversation-1",
+      generation: failed.buildGeneration,
+      stateEpoch: 8,
+      status: "protocol_error",
+      activeTurnId: failed.id,
+      protocolErrorCode: failed.errorCode,
+      protocolError: failed.errorMessage,
+    };
+    const conversation = {
+      id: failed.conversationId,
+      userId: 1,
+      version: 3,
+      status: "failed",
+      completedAt: failed.completedAt,
+    };
+    const currentFailed = (current: TurnServiceStore) =>
+      current.turns.filter((candidate) => candidate.id === failed.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [failed],
+      credentials: [{ id: "credential-repaired", userId: 1, status: "active" }],
+      turnSelections: [[currentFailed], [currentFailed]],
+    });
+
+    const first = await resumeKnowledgeBaseTurnAfterUserFix(
+      {
+        userId: 1,
+        turnId: failed.id,
+        apiCredentialId: "credential-repaired",
+        now: new Date("2026-08-01T00:01:00.000Z"),
+      },
+      executor,
+    );
+    const replay = await resumeKnowledgeBaseTurnAfterUserFix(
+      {
+        userId: 1,
+        turnId: failed.id,
+        apiCredentialId: "credential-repaired",
+        now: new Date("2026-08-01T00:01:01.000Z"),
+      },
+      executor,
+    );
+
+    expect(first).toMatchObject({
+      turn: {
+        id: failed.id,
+        operationKey: failed.operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        apiCredentialId: "credential-repaired",
+        dispatchState: "recovering",
+        canRegenerate: false,
+      },
+      preparedDispatch,
+    });
+    expect(first?.upstreamIdempotencyKey).toBe(
+      createKnowledgeBaseUpstreamIdempotencyKey(failed.operationKey!),
+    );
+    expect(replay).toBeNull();
+    expect(store.turns).toHaveLength(1);
+    expect(store.build).toMatchObject({
+      status: "confirming",
+      activeTurnId: failed.id,
+      protocolErrorCode: null,
+      protocolError: null,
+    });
+    expect(store.conversation).toMatchObject({
+      status: "running",
+      version: 4,
+      apiCredentialId: "credential-repaired",
+    });
+  });
+
+  it("replaces a 413 attachment set on the same turn and grants only one new create claim", async () => {
+    const failed = turn({
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "UPSTREAM_CREATE_HTTP_413",
+      errorMessage: "附件过大",
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      leaseExpiresAt: null,
+      attachmentFileIds: ["old-skill", "old-instructions", "old-large-file"],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 3,
+        userAttachmentCount: 1,
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "old prompt",
+            agentProfile: "manus-1.6-max",
+            taskMode: "agent",
+            attachments: [
+              { file_id: "old-skill", filename: "skill.zip" },
+              { file_id: "old-instructions", filename: "instructions.md" },
+              { file_id: "old-large-file", filename: "large.pdf" },
+            ],
+          },
+          bodySha256: "d".repeat(64),
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+        generatedAttachmentReservations: {
+          "skill:0": { status: "completed" },
+          "instructions:1": { status: "completed" },
+        } as any,
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          parentTaskId: "parent-task",
+          userMessage: "请结合附件修订",
+          attachments: [{ file_id: "old-large-file", filename: "large.pdf" }],
+          skillVersion: "4",
+          skillContentHash: "a".repeat(64),
+        },
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "fix_attachments",
+        canRegenerate: false,
+      },
+    });
+    const build = {
+      id: failed.buildId,
+      userId: 1,
+      conversationId: "conversation-1",
+      generation: failed.buildGeneration,
+      stateEpoch: 8,
+      status: "protocol_error",
+      activeTurnId: failed.id,
+      protocolErrorCode: failed.errorCode,
+      protocolError: failed.errorMessage,
+    };
+    const conversation = {
+      id: failed.conversationId,
+      userId: 1,
+      version: 3,
+      status: "failed",
+      completedAt: failed.completedAt,
+    };
+    const current = (state: TurnServiceStore) =>
+      state.turns.filter((candidate) => candidate.id === failed.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [failed],
+      credentials: [{ id: "credential-repaired", userId: 1, status: "active" }],
+      turnSelections: [[current], [current]],
+    });
+    const repair = {
+      userId: 1,
+      turnId: failed.id,
+      apiCredentialId: "credential-repaired",
+      clientRequestId: "attachment-repair-1",
+      attachments: [{ file_id: "smaller-file", filename: "smaller.pdf" }],
+      attachmentManifest: [
+        {
+          filename: "smaller.pdf",
+          sizeBytes: 100,
+          mimeType: "application/pdf",
+          lastModified: 1,
+          sha256: "f".repeat(64),
+        },
+      ],
+      now: new Date("2026-08-01T00:01:00.000Z"),
+    };
+
+    const first = await replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
+      repair,
+      executor,
+    );
+    const replay = await replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
+      { ...repair, now: new Date("2026-08-01T00:01:01.000Z") },
+      executor,
+    );
+
+    expect(first).toMatchObject({
+      turn: {
+        id: failed.id,
+        operationKey: failed.operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        attachmentFileIds: [],
+        dispatchState: "recovering",
+        canRegenerate: false,
+      },
+      preparedDispatch: null,
+      recoveryMetadata: {
+        attachments: [{ file_id: "smaller-file", filename: "smaller.pdf" }],
+      },
+    });
+    expect(replay).toBeNull();
+    expect(store.turns).toHaveLength(1);
+    expect(store.turns[0]?.metadata).toMatchObject({
+      attachmentsFrozen: false,
+      expectedAttachmentCount: 3,
+      userAttachmentCount: 1,
+      generatedAttachmentReservations: {},
+      attachmentRepair: { clientRequestId: "attachment-repair-1" },
+    });
   });
 });
 
@@ -1288,7 +1588,7 @@ describe("knowledge-base atomic start reservation", () => {
     companyWebsite: "https://www.frontmind.net/",
     skillName: "socratic-kb-builder",
     skillVersion: "4",
-    skillContentHash: "a".repeat(64),
+    skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
     apiCredentialId: "credential-1",
     userText: "开始构建企业知识库",
     expectedAttachmentCount: 1,
@@ -1300,6 +1600,47 @@ describe("knowledge-base atomic start reservation", () => {
     },
     now: new Date("2026-08-01T00:00:00.000Z"),
   };
+  const attachmentStartInput = {
+    ...startInput,
+    userAttachmentCount: 2,
+    expectedAttachmentCount: 3,
+    requestPayload: {
+      attachments: [
+        { file_id: "file-second", filename: "second.pdf" },
+        { file_id: "file-first", filename: "first.pdf" },
+      ],
+      operatorNotes: "",
+    },
+    recoveryMetadata: {
+      ...startInput.recoveryMetadata,
+      attachments: [
+        { file_id: "file-second", filename: "second.pdf" },
+        { file_id: "file-first", filename: "first.pdf" },
+      ],
+    },
+  };
+  const attachmentResources = () => [
+    {
+      id: "resource-first",
+      userId: 1,
+      apiCredentialId: "credential-1",
+      projectAssignmentId: null,
+      kind: "file",
+      upstreamId: "file-first",
+      conversationId: null,
+      contentDeletedAt: null,
+    },
+    {
+      id: "resource-second",
+      userId: 1,
+      apiCredentialId: "credential-1",
+      projectAssignmentId: null,
+      kind: "file",
+      upstreamId: "file-second",
+      conversationId: null,
+      contentDeletedAt: null,
+    },
+  ];
 
   it("rejects a tombstoned conversation before reserving a build", async () => {
     const { executor, store } = createTurnServiceExecutor({
@@ -1367,6 +1708,8 @@ describe("knowledge-base atomic start reservation", () => {
     expect(second.reservation.state).toBe("pending");
     expect(second.reservation.turn.id).toBe(first.reservation.turn.id);
     expect(store.build?.activeTurnId).toBe(first.reservation.turn.id);
+    expect(store.build?.treePolicyVersion).toBe(2);
+    expect(first.build.treePolicyVersion).toBe(2);
     expect(store.turns).toHaveLength(1);
     expect(store.messages).toHaveLength(1);
     expect(store.messages[0]).toMatchObject({
@@ -1384,6 +1727,180 @@ describe("knowledge-base atomic start reservation", () => {
       },
     });
     expect(store.conversation?.version).toBe(2);
+  });
+
+  it("locks exact upload ownership and binds it in the reservation transaction", async () => {
+    const { executor, store, events } = createTurnServiceExecutor({
+      resources: attachmentResources(),
+      turnSelections: [
+        [[], []],
+        [[], (current) => current.turns],
+      ],
+    });
+
+    const first = await reserveKnowledgeBaseStartBuild(
+      attachmentStartInput,
+      executor,
+    );
+    const replay = await reserveKnowledgeBaseStartBuild(
+      {
+        ...attachmentStartInput,
+        now: new Date("2026-08-01T00:00:01.000Z"),
+      },
+      executor,
+    );
+
+    expect(first.reservation.turn.attachmentFileIds).toEqual([]);
+    expect(
+      (store.turns[0]!.metadata as any).recovery.attachments.map(
+        (attachment: any) => attachment.file_id,
+      ),
+    ).toEqual(["file-second", "file-first"]);
+    expect(store.resources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          upstreamId: "file-first",
+          conversationId: "u1:conversation-atomic",
+        }),
+        expect.objectContaining({
+          upstreamId: "file-second",
+          conversationId: "u1:conversation-atomic",
+        }),
+      ]),
+    );
+    expect(replay.reservation.turn.id).toBe(first.reservation.turn.id);
+    expect(store.turns).toHaveLength(1);
+    expect(events.indexOf("start-attachments:lock")).toBeLessThan(
+      events.indexOf("turn:insert"),
+    );
+    expect(events.indexOf("start-attachments:bind")).toBeLessThan(
+      events.indexOf("transaction:commit"),
+    );
+  });
+
+  it("fails atomically when discard wins and removes ownership before the row lock", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      resources: [attachmentResources()[0]],
+      turnSelections: [[[], []]],
+    });
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(attachmentStartInput, executor),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.build).toBeNull();
+    expect(store.conversation).toBeNull();
+    expect(store.turns).toHaveLength(0);
+    expect(store.resources[0]?.conversationId).toBeNull();
+  });
+
+  it.each([
+    ["another user", { userId: 2 }],
+    ["a delivery project", { projectAssignmentId: "project-1" }],
+    ["another credential", { apiCredentialId: "credential-2" }],
+    ["a task row", { kind: "task" }],
+    ["deleted content", { contentDeletedAt: new Date("2026-08-01") }],
+    ["another conversation", { conversationId: "u1:another-conversation" }],
+  ])("rejects a start attachment owned by %s", async (_label, override) => {
+    const resources = attachmentResources();
+    resources[1] = { ...resources[1], ...override };
+    const initialResources = structuredClone(resources);
+    const { executor, store } = createTurnServiceExecutor({
+      resources,
+      turnSelections: [[[], []]],
+    });
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(attachmentStartInput, executor),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.build).toBeNull();
+    expect(store.turns).toHaveLength(0);
+    expect(store.resources).toEqual(initialResources);
+  });
+
+  it("rejects an attachment reorder under the same start request identity", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      resources: attachmentResources(),
+      turnSelections: [
+        [[], []],
+        [[], (current) => current.turns],
+      ],
+    });
+    await reserveKnowledgeBaseStartBuild(attachmentStartInput, executor);
+    const reversedAttachments = [
+      { file_id: "file-first", filename: "first.pdf" },
+      { file_id: "file-second", filename: "second.pdf" },
+    ];
+
+    await expect(
+      reserveKnowledgeBaseStartBuild(
+        {
+          ...attachmentStartInput,
+          requestPayload: {
+            ...attachmentStartInput.requestPayload,
+            attachments: reversedAttachments,
+          },
+          recoveryMetadata: {
+            ...attachmentStartInput.recoveryMetadata,
+            attachments: reversedAttachments,
+          },
+          now: new Date("2026-08-01T00:00:01.000Z"),
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+    });
+    expect(store.turns).toHaveLength(1);
+    expect(
+      store.resources.every(
+        (resource) => resource.conversationId === "u1:conversation-atomic",
+      ),
+    ).toBe(true);
+  });
+
+  it("can roll back only the new-build writer to legacy policy v1", async () => {
+    const previous = process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
+    process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = "false";
+    try {
+      const { executor, store } = createTurnServiceExecutor({
+        turnSelections: [[[], []]],
+      });
+      const result = await reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
+          treePolicyVersion: 1,
+        },
+        executor,
+      );
+      expect(result.createdBuild).toBe(true);
+      expect(result.build.treePolicyVersion).toBe(1);
+      expect(store.build?.treePolicyVersion).toBe(1);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
+      } else {
+        process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = previous;
+      }
+    }
+  });
+
+  it("rejects a policy/Skill mismatch before inserting any start state", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      turnSelections: [[[], []]],
+    });
+    await expect(
+      reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          treePolicyVersion: 1,
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    expect(store.build).toBeNull();
+    expect(store.conversation).toBeNull();
+    expect(store.turns).toHaveLength(0);
   });
 
   it("rejects another client request id even when it targets the same start slot", async () => {
@@ -1449,16 +1966,20 @@ describe("knowledge-base atomic start reservation", () => {
 
   it("rolls the build back when the first reservation cannot commit", async () => {
     const { executor, store } = createTurnServiceExecutor({
+      resources: attachmentResources(),
       turnSelections: [[[], []]],
       failConversationInsertAtTransaction: 0,
     });
     await expect(
-      reserveKnowledgeBaseStartBuild(startInput, executor),
+      reserveKnowledgeBaseStartBuild(attachmentStartInput, executor),
     ).rejects.toThrow("simulated conversation insert failure");
     expect(store.build).toBeNull();
     expect(store.conversation).toBeNull();
     expect(store.turns).toHaveLength(0);
     expect(store.messages).toHaveLength(0);
+    expect(store.resources.every((resource) => !resource.conversationId)).toBe(
+      true,
+    );
   });
 });
 

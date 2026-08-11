@@ -26,6 +26,7 @@ import {
   parseKnowledgeBasePresentationEnvelope,
   parseKnowledgeBaseProgressEnvelope,
   parseKnowledgeBaseReopenEnvelope,
+  validateKnowledgeBaseManifestForTreePolicy,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -132,6 +133,7 @@ type LivePreviewSession = {
   progressState: KnowledgeBaseProgressState | null;
   confirmationCount: number;
   skillVersion: string;
+  treePolicyVersion: 1 | 2;
   skillContentHash: string | null;
   skillAttachment: { file_id: string; filename: string } | null;
   attachmentCleanup: ReturnType<
@@ -273,7 +275,17 @@ export function analyzeKnowledgeBaseLiveTask(
     assistantText,
     "FRONTMIND_KB_MANIFEST",
     "frontmind.knowledge-base.manifest",
-    parseKnowledgeBaseManifestEnvelope,
+    (value) => {
+      const manifest = parseKnowledgeBaseManifestEnvelope(value);
+      if (runMode === "protocol_probe") return manifest;
+      return validateKnowledgeBaseManifestForTreePolicy(
+        manifest,
+        manifest.schemaVersion === 2 && manifest.researchCoverage ? 2 : 1,
+        manifest.schemaVersion === 2 && manifest.researchCoverage
+          ? { expectedUploadsRead: 0 }
+          : {},
+      );
+    },
   );
   const progressDiagnostic = protocolDiagnostic(
     assistantText,
@@ -843,6 +855,7 @@ router.post("/start", async (req, res) => {
               "本地真实 API 与渲染回归。严格输出完整客户正文及规定的机器信封。",
             attachments: [],
             prefillKnowledgeSnapshot: null,
+            treePolicyVersion: 2,
             protocolOperation: {
               skillVersion: descriptor.version,
               operationId: initialOperationId,
@@ -853,6 +866,7 @@ router.post("/start", async (req, res) => {
       ? buildKnowledgeBaseInstructionDelivery({
           instructions: fullInstructions,
           skillVersion: descriptor.version,
+          treePolicyVersion: 2,
           operationId: initialOperationId,
           turnId: sessionId,
         })
@@ -926,6 +940,7 @@ router.post("/start", async (req, res) => {
       progressState,
       confirmationCount: 0,
       skillVersion: descriptor.version,
+      treePolicyVersion: mode === "protocol_probe" ? 1 : 2,
       skillContentHash: descriptor.contentHash,
       skillAttachment: skill.attachment,
       attachmentCleanup,
@@ -1042,6 +1057,11 @@ router.post("/recover", async (req, res) => {
       progressState,
       confirmationCount: 0,
       skillVersion: recoveredSkill.version,
+      treePolicyVersion:
+        recoveredManifest.schemaVersion === 2 &&
+        recoveredManifest.researchCoverage
+          ? 2
+          : 1,
       skillContentHash: recoveredSkill.contentHash,
       skillAttachment: null,
       attachmentCleanup: createKnowledgeBaseLivePreviewAttachmentCleanup(),
@@ -1119,6 +1139,11 @@ router.post("/confirm", async (req, res) => {
             .schemaVersion === 2
             ? "4"
             : "3",
+        treePolicyVersion: parseKnowledgeBaseManifestEnvelope(
+          sourceRawAssistantText,
+        ).researchCoverage
+          ? 2
+          : 1,
         skillContentHash: null,
         skillAttachment: null,
         attachmentCleanup: createKnowledgeBaseLivePreviewAttachmentCleanup(),
@@ -1206,6 +1231,7 @@ router.post("/confirm", async (req, res) => {
     const instructionDelivery = buildKnowledgeBaseInstructionDelivery({
       instructions: fullInstructions,
       skillVersion: session.skillVersion,
+      treePolicyVersion: session.treePolicyVersion,
       operationId,
       turnId,
     });

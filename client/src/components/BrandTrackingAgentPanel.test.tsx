@@ -246,6 +246,9 @@ describe("BrandTrackingAgentPanel", () => {
     expect(screen.getByText("趋势分析")).toBeInTheDocument();
     expect(screen.getByText("信源核验")).toBeInTheDocument();
     expect(screen.getByText("10,000")).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(
+      "持久化多轮品牌追踪与用量归因",
+    );
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("近期的品牌评价");
   });

@@ -35,17 +35,32 @@ export function ordinaryUserMayUseFrontMindProxy(
   req: Pick<FrontMindRequest, "method" | "originalUrl">,
 ) {
   const method = req.method.toUpperCase();
+  const pathname = proxyPath(req);
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
     return true;
   }
-  return ORDINARY_USER_SUPPORT_OPERATIONS.has(`${method} ${proxyPath(req)}`);
+  if (method === "DELETE" && /^\/v1\/files\/[^/]+\/discard$/u.test(pathname)) {
+    return true;
+  }
+  if (
+    method === "POST" &&
+    /^\/v1\/files\/[^/]+\/upload-recovery$/u.test(pathname)
+  ) {
+    return true;
+  }
+  return ORDINARY_USER_SUPPORT_OPERATIONS.has(`${method} ${pathname}`);
 }
 
 export function ordinaryUserProxyWriteRequiresActiveService(
   req: Pick<FrontMindRequest, "method" | "originalUrl">,
 ) {
   const operation = `${req.method.toUpperCase()} ${proxyPath(req)}`;
-  return operation === "POST /v1/files" || operation === "PUT /proxy-upload";
+  return (
+    operation === "POST /v1/files" ||
+    operation === "PUT /proxy-upload" ||
+    (req.method.toUpperCase() === "POST" &&
+      /^\/v1\/files\/[^/]+\/upload-recovery$/u.test(proxyPath(req)))
+  );
 }
 
 export function createFrontMindProxyAccessMiddleware(

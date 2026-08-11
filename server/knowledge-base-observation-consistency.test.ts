@@ -95,6 +95,8 @@ function build(overrides: Record<string, unknown> = {}) {
     skillName: "socratic-kb-builder",
     skillVersion: "4",
     skillContentHash: "a".repeat(64),
+    treePolicyVersion: 1,
+    initialResearchCoverage: null,
     status: "confirming",
     generation: 1,
     stateEpoch: 1,

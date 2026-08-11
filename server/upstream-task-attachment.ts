@@ -15,7 +15,12 @@ const REPLAYABLE_PRE_UPLOAD_STATUSES = new Set([
   "awaiting_upload",
 ]);
 
-type CanonicalProviderFile = {
+type ProviderReplayMetadata = Pick<
+  CanonicalProviderFile,
+  "id" | "filename" | "status"
+>;
+
+export type CanonicalProviderFile = {
   id: string;
   filename: string;
   sizeBytes: number | null;
@@ -88,7 +93,9 @@ function canonicalSizeAlias(
   return { valid: true, value: present[0] } as const;
 }
 
-function canonicalProviderFile(value: unknown): CanonicalProviderFile | null {
+export function canonicalProviderFile(
+  value: unknown,
+): CanonicalProviderFile | null {
   const source = providerRecord(value);
   if (!source) return null;
   const id = canonicalStringAlias(source, ["id", "file_id"]);
@@ -144,51 +151,117 @@ function canonicalProviderFile(value: unknown): CanonicalProviderFile | null {
   };
 }
 
-function canonicalMimeType(value: string) {
+export function canonicalMimeType(value: string) {
   return value.trim().toLowerCase().split(";", 1)[0] || "";
 }
 
-function hasMatchingProviderFileIdentity(input: {
-  providerFile: CanonicalProviderFile;
+function canonicalProviderReplayMetadata(
+  value: unknown,
+): ProviderReplayMetadata | null {
+  const source = providerRecord(value);
+  if (!source) return null;
+  const id = canonicalStringAlias(source, ["id", "file_id"]);
+  const filename = canonicalStringAlias(source, ["filename", "file_name"]);
+  const status = canonicalStringAlias(
+    source,
+    ["status", "upload_status", "uploadStatus"],
+    (item) => item.trim().toLowerCase().replace(/[ -]+/gu, "_"),
+  );
+  if (!id.valid || !filename.valid || !status.valid) return null;
+  return {
+    id: id.value || "",
+    filename: filename.value || "",
+    status: status.value || "",
+  };
+}
+
+function destroyProviderContent(value: unknown) {
+  if (
+    value &&
+    typeof value === "object" &&
+    "destroy" in value &&
+    typeof value.destroy === "function"
+  ) {
+    value.destroy();
+  }
+}
+
+async function assertProviderContentMatches(input: {
+  baseUrl: string;
   fileId: string;
   filename: string;
   bytes: Buffer;
-  mimeType: string;
-  requireUploadedSize: boolean;
+  authHeaders: Record<string, string>;
 }) {
-  const { providerFile } = input;
+  const content = await axios.get(
+    `${input.baseUrl}/v1/files/${encodeURIComponent(input.fileId)}/content`,
+    {
+      headers: input.authHeaders,
+      responseType: "stream",
+      timeout: 120_000,
+      maxRedirects: 0,
+      maxContentLength: input.bytes.length + 1,
+      decompress: false,
+      validateStatus: () => true,
+    },
+  );
+  if (content.status < 200 || content.status >= 300) {
+    destroyProviderContent(content.data);
+    throw new Error(`Task attachment content lookup failed: ${input.filename}`);
+  }
+
+  const stream = content.data as
+    | (AsyncIterable<unknown> & { destroy?: () => void })
+    | null
+    | undefined;
+  if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
+    destroyProviderContent(content.data);
+    throw new Error(
+      `Task attachment content response is invalid: ${input.filename}`,
+    );
+  }
+
+  const expectedSha256 = createHash("sha256").update(input.bytes).digest("hex");
+  const actualSha256 = createHash("sha256");
+  let actualSize = 0;
+  const iterator = stream[Symbol.asyncIterator]();
+  while (true) {
+    let next: IteratorResult<unknown>;
+    try {
+      next = await iterator.next();
+    } catch {
+      destroyProviderContent(stream);
+      throw new Error(
+        `Task attachment content lookup failed: ${input.filename}`,
+      );
+    }
+    if (next.done) break;
+    const chunk = Buffer.isBuffer(next.value)
+      ? next.value
+      : next.value instanceof Uint8Array
+        ? Buffer.from(next.value)
+        : typeof next.value === "string"
+          ? Buffer.from(next.value)
+          : null;
+    if (!chunk) {
+      destroyProviderContent(stream);
+      throw new Error(
+        `Task attachment content response is invalid: ${input.filename}`,
+      );
+    }
+    actualSize += chunk.length;
+    if (actualSize > input.bytes.length) {
+      destroyProviderContent(stream);
+      throw new Error(`Task attachment content mismatch: ${input.filename}`);
+    }
+    actualSha256.update(chunk);
+  }
   if (
-    providerFile.id !== input.fileId ||
-    providerFile.filename !== input.filename
+    actualSize !== input.bytes.length ||
+    actualSha256.digest("hex") !== expectedSha256
   ) {
-    return false;
+    throw new Error(`Task attachment content mismatch: ${input.filename}`);
   }
-  if (input.requireUploadedSize) {
-    if (providerFile.sizeBytes !== input.bytes.length) return false;
-  } else if (
-    providerFile.sizeBytes !== null &&
-    providerFile.sizeBytes !== 0 &&
-    providerFile.sizeBytes !== input.bytes.length
-  ) {
-    return false;
-  }
-  if (
-    providerFile.mimeType !== null &&
-    providerFile.mimeType !== canonicalMimeType(input.mimeType) &&
-    // The provider stores query-signed uploads as generic binary objects even
-    // when the PUT carried application/zip. The durable provider file id,
-    // exact filename and exact uploaded byte count remain the frozen identity.
-    providerFile.mimeType !== "application/octet-stream"
-  ) {
-    return false;
-  }
-  if (providerFile.sha256 !== null) {
-    const expectedSha256 = createHash("sha256")
-      .update(input.bytes)
-      .digest("hex");
-    if (providerFile.sha256 !== expectedSha256) return false;
-  }
-  return true;
 }
 
 export async function uploadUpstreamTaskAttachment(input: {
@@ -210,8 +283,10 @@ export async function uploadUpstreamTaskAttachment(input: {
     Authorization: `Bearer ${input.apiKey}`,
   };
   let createdData: Record<string, unknown> = {};
-  let fileId = String(input.existingFileId || "").trim();
-  if (!fileId) {
+  const suppliedFileId = String(input.existingFileId || "");
+  const usesExistingFile = Boolean(suppliedFileId.trim());
+  let fileId = suppliedFileId;
+  if (!usesExistingFile) {
     const created = await axios.post(
       `${input.baseUrl}/v1/files`,
       { filename: input.filename },
@@ -230,7 +305,7 @@ export async function uploadUpstreamTaskAttachment(input: {
     createdData =
       created.data && typeof created.data === "object" ? created.data : {};
     fileId = String(createdData.id || createdData.file_id || "");
-    if (created.status < 200 || created.status >= 300 || !fileId) {
+    if (created.status < 200 || created.status >= 300 || !fileId.trim()) {
       throw new Error(`Task attachment creation failed: ${input.filename}`);
     }
   }
@@ -250,9 +325,9 @@ export async function uploadUpstreamTaskAttachment(input: {
     // ownership are durable. Never delete the file on later upload failures;
     // recovery must inspect and reuse the same file id.
     await input.onFileResolved?.(fileId);
-    let uploadUrl =
+    const uploadUrl =
       typeof createdData.upload_url === "string" ? createdData.upload_url : "";
-    if (!uploadUrl) {
+    if (usesExistingFile) {
       const metadata = await axios.get(
         `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
         {
@@ -263,27 +338,29 @@ export async function uploadUpstreamTaskAttachment(input: {
       );
       if (metadata.status < 200 || metadata.status >= 300) {
         throw new Error(
-          `Task attachment upload URL lookup failed: ${input.filename}`,
+          `Task attachment metadata lookup failed: ${input.filename}`,
         );
       }
-      const providerFile = canonicalProviderFile(metadata.data);
+      const providerFile = canonicalProviderReplayMetadata(metadata.data);
       if (!providerFile) {
         throw new Error(
           `Task attachment metadata is invalid: ${input.filename}`,
         );
       }
-      const matchingIdentity = hasMatchingProviderFileIdentity({
-        providerFile,
-        fileId,
-        filename: input.filename,
-        bytes: input.bytes,
-        mimeType,
-        requireUploadedSize: providerFile.status === "uploaded",
-      });
-      if (!matchingIdentity) {
+      if (
+        providerFile.id !== fileId ||
+        providerFile.filename !== input.filename
+      ) {
         throw new Error(`Task attachment metadata mismatch: ${input.filename}`);
       }
       if (providerFile.status === "uploaded") {
+        await assertProviderContentMatches({
+          baseUrl: input.baseUrl,
+          fileId,
+          filename: input.filename,
+          bytes: input.bytes,
+          authHeaders,
+        });
         return {
           attachment: { file_id: fileId, filename: input.filename },
           fileId,
@@ -295,12 +372,14 @@ export async function uploadUpstreamTaskAttachment(input: {
           `Task attachment state is not safely replayable: ${input.filename}`,
         );
       }
-      uploadUrl = providerFile.uploadUrl;
-      if (!uploadUrl) {
-        throw new Error(
-          `Task attachment upload URL is unavailable: ${input.filename}`,
-        );
-      }
+      throw new Error(
+        `Task attachment upload capability is unavailable for existing file: ${input.filename}`,
+      );
+    }
+    if (!uploadUrl) {
+      throw new Error(
+        `Task attachment upload URL is unavailable: ${input.filename}`,
+      );
     }
     const target = assertSafeExternalUrl(uploadUrl);
     const uploaded = await axios.put(target, input.bytes, {
@@ -325,7 +404,7 @@ export async function uploadUpstreamTaskAttachment(input: {
       removeOrphan,
     };
   } catch (error) {
-    if (!input.onFileResolved) await removeOrphan();
+    if (!usesExistingFile && !input.onFileResolved) await removeOrphan();
     throw error;
   }
 }

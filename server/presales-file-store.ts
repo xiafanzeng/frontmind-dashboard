@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, type ReadStream } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  type ReadStream,
+  type WriteStream,
+} from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { Transform, type Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
 
 type PresalesFileManifest = {
   schemaVersion: 1;
@@ -81,6 +85,7 @@ const DEFAULT_STORAGE_SWEEP_MAX_BATCHES = 20;
 const DEFAULT_STORED_UPLOAD_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const STORAGE_SWEEP_CURSOR_FILENAME = ".retention-sweep-cursor.json";
 const PRESALES_FILE_STORAGE_RESERVE_BYTES = 64 * 1024 * 1024;
+export const PRESALES_FILE_STAGE_IO_TIMEOUT_MS = 120_000;
 
 export type StagedPresalesFile = {
   sizeBytes: number;
@@ -92,6 +97,16 @@ export type StagedPresalesFile = {
     uploadedAt?: Date | string | number;
     contentExpiresAt?: Date | string | number;
   }) => Promise<void>;
+  discard: () => Promise<void>;
+};
+
+/**
+ * Incremental staging lets a caller apply backpressure to each durable write
+ * while the same incoming bytes are concurrently forwarded elsewhere.
+ */
+export type IncrementalPresalesFileStage = {
+  append: (chunk: Buffer | Uint8Array | string) => Promise<void>;
+  finalize: () => Promise<StagedPresalesFile>;
   discard: () => Promise<void>;
 };
 
@@ -929,57 +944,24 @@ export async function recordPresalesFileDescriptor(input: {
   });
 }
 
-export async function stagePresalesFileContent(input: {
+function stagedPresalesFileFromTemporary(input: {
   fileId: string;
-  stream: Readable;
-  maxBytes: number;
-}): Promise<StagedPresalesFile> {
-  await assertPresalesFileStorageWritable({ requiredBytes: input.maxBytes });
+  temporary: string;
+  sizeBytes: number;
+  sha256: string;
+}): StagedPresalesFile {
   const paths = pathsFor(input.fileId);
-  await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
-  await fs.chmod(paths.root, 0o700).catch(() => undefined);
-  const temporary = path.join(
-    paths.root,
-    `${storageKey(input.fileId)}.${randomUUID()}.upload.tmp`,
-  );
-  let sizeBytes = 0;
-  const hash = createHash("sha256");
-  const limiter = new Transform({
-    transform(chunk, _encoding, callback) {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      sizeBytes += bytes.length;
-      if (sizeBytes > input.maxBytes) {
-        callback(new Error("FILE_TOO_LARGE"));
-        return;
-      }
-      hash.update(bytes);
-      callback(null, bytes);
-    },
-  });
-
-  try {
-    await pipeline(
-      input.stream,
-      limiter,
-      createWriteStream(temporary, { flags: "wx", mode: 0o600 }),
-    );
-  } catch (error) {
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
-    throw error;
-  }
-
-  const sha256 = hash.digest("hex");
   let consumed = false;
   const discard = async () => {
     if (consumed) return;
     consumed = true;
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    await fs.rm(input.temporary, { force: true }).catch(() => undefined);
   };
 
   return {
-    sizeBytes,
-    sha256,
-    createReadStream: () => createReadStream(temporary),
+    sizeBytes: input.sizeBytes,
+    sha256: input.sha256,
+    createReadStream: () => createReadStream(input.temporary),
     discard,
     commit: async (commitInput) => {
       if (consumed) throw new Error("STAGED_FILE_ALREADY_CONSUMED");
@@ -993,20 +975,20 @@ export async function stagePresalesFileContent(input: {
           fileId: input.fileId,
           filename: cleanFilename(filename ?? previous?.filename, input.fileId),
           mimeType: cleanMimeType(mimeType ?? previous?.mimeType),
-          sizeBytes,
-          sha256,
+          sizeBytes: input.sizeBytes,
+          sha256: input.sha256,
           state: "stored",
           ...retention,
           updatedAt: new Date().toISOString(),
         };
-        await fs.rename(temporary, paths.content);
+        await fs.rename(input.temporary, paths.content);
         renamed = true;
         consumed = true;
         await writeManifest(input.fileId, manifest);
       } catch (error) {
         consumed = true;
         await Promise.all([
-          fs.rm(temporary, { force: true }).catch(() => undefined),
+          fs.rm(input.temporary, { force: true }).catch(() => undefined),
           renamed
             ? fs.rm(paths.content, { force: true }).catch(() => undefined)
             : Promise.resolve(),
@@ -1015,6 +997,280 @@ export async function stagePresalesFileContent(input: {
       }
     },
   };
+}
+
+function presalesStageAbortError(signal: AbortSignal) {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : Object.assign(new Error("Presales file stage cancelled"), {
+        code: "ERR_CANCELED",
+      });
+}
+
+async function awaitPresalesStageOperation<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+) {
+  if (!signal) return operation;
+  if (signal.aborted) {
+    void operation.catch(() => undefined);
+    throw presalesStageAbortError(signal);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(presalesStageAbortError(signal)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
+export async function createIncrementalPresalesFileStage(input: {
+  fileId: string;
+  maxBytes: number;
+  ioTimeoutMs?: number;
+  writeStreamFactory?: typeof createWriteStream;
+  storagePreflight?: typeof assertPresalesFileStorageWritable;
+  signal?: AbortSignal;
+}): Promise<IncrementalPresalesFileStage> {
+  const preflight = (
+    input.storagePreflight ?? assertPresalesFileStorageWritable
+  )({ requiredBytes: input.maxBytes });
+  await awaitPresalesStageOperation(preflight, input.signal);
+  const paths = pathsFor(input.fileId);
+  await awaitPresalesStageOperation(
+    fs.mkdir(paths.root, { recursive: true, mode: 0o700 }),
+    input.signal,
+  );
+  await awaitPresalesStageOperation(
+    fs.chmod(paths.root, 0o700).catch(() => undefined),
+    input.signal,
+  );
+  const temporary = path.join(
+    paths.root,
+    `${storageKey(input.fileId)}.${randomUUID()}.upload.tmp`,
+  );
+  let sizeBytes = 0;
+  const hash = createHash("sha256");
+  const output: WriteStream = (input.writeStreamFactory ?? createWriteStream)(
+    temporary,
+    { flags: "wx", mode: 0o600, autoClose: true },
+  );
+  let closed = false;
+  let finalized = false;
+  let failure: unknown;
+  let pending = Promise.resolve();
+  const ioTimeoutMs = input.ioTimeoutMs ?? PRESALES_FILE_STAGE_IO_TIMEOUT_MS;
+  output.on("error", (error) => {
+    failure ??= error;
+  });
+  const abortStage = () => {
+    const reason = input.signal?.reason;
+    const error =
+      reason instanceof Error
+        ? reason
+        : Object.assign(new Error("Presales file stage cancelled"), {
+            code: "ERR_CANCELED",
+          });
+    failure ??= error;
+    output.destroy(error);
+  };
+  input.signal?.addEventListener("abort", abortStage, { once: true });
+  if (input.signal?.aborted) abortStage();
+
+  const waitForOpen = async () => {
+    if (typeof (output as WriteStream & { fd?: unknown }).fd === "number") {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeout);
+        output.off("open", onOpen);
+        output.off("error", onError);
+      };
+      const onOpen = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const timeout = setTimeout(() => {
+        const error = Object.assign(
+          new Error("PRESALES_FILE_STAGE_OPEN_TIMEOUT"),
+          { code: "PRESALES_FILE_STAGE_OPEN_TIMEOUT" },
+        );
+        cleanup();
+        output.destroy(error);
+        reject(error);
+      }, ioTimeoutMs);
+      timeout.unref?.();
+      output.once("open", onOpen);
+      output.once("error", onError);
+    });
+  };
+  try {
+    await waitForOpen();
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+
+  const destroyAndWaitForClose = async () => {
+    if (closed) return;
+    if (!output.destroyed) output.destroy();
+    await new Promise<void>((resolve) => {
+      if (output.closed) {
+        closed = true;
+        resolve();
+        return;
+      }
+      const timeout = setTimeout(() => {
+        output.off("close", onClose);
+        resolve();
+      }, ioTimeoutMs);
+      timeout.unref?.();
+      const onClose = () => {
+        clearTimeout(timeout);
+        closed = true;
+        resolve();
+      };
+      output.once("close", onClose);
+    });
+  };
+  const discard = async () => {
+    finalized = true;
+    input.signal?.removeEventListener("abort", abortStage);
+    if (!output.destroyed) output.destroy();
+    await pending.catch(() => undefined);
+    await destroyAndWaitForClose();
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  };
+  const append = async (chunk: Buffer | Uint8Array | string) => {
+    if (finalized) throw new Error("STAGED_FILE_ALREADY_CONSUMED");
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const operation = pending.then(async () => {
+      if (failure) throw failure;
+      if (sizeBytes + bytes.length > input.maxBytes) {
+        throw new Error("FILE_TOO_LARGE");
+      }
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error | null) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          if (error) reject(error);
+          else resolve();
+        };
+        const timeout = setTimeout(() => {
+          const error = Object.assign(
+            new Error("PRESALES_FILE_STAGE_WRITE_TIMEOUT"),
+            { code: "PRESALES_FILE_STAGE_WRITE_TIMEOUT" },
+          );
+          output.destroy(error);
+          finish(error);
+        }, ioTimeoutMs);
+        timeout.unref?.();
+        output.write(bytes, finish);
+      });
+      sizeBytes += bytes.length;
+      hash.update(bytes);
+    });
+    pending = operation.catch((error) => {
+      failure = error;
+    });
+    await operation;
+  };
+
+  return {
+    append,
+    discard,
+    finalize: async () => {
+      if (finalized) throw new Error("STAGED_FILE_ALREADY_CONSUMED");
+      finalized = true;
+      await pending;
+      if (failure) {
+        await discard();
+        throw failure;
+      }
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const finish = (error?: Error | null) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            output.off("close", onClose);
+            if (error) reject(error);
+            else if (failure) reject(failure);
+            else resolve();
+          };
+          const onClose = () => {
+            closed = true;
+            finish();
+          };
+          const timeout = setTimeout(() => {
+            const error = Object.assign(
+              new Error("PRESALES_FILE_STAGE_CLOSE_TIMEOUT"),
+              { code: "PRESALES_FILE_STAGE_CLOSE_TIMEOUT" },
+            );
+            output.destroy(error);
+            finish(error);
+          }, ioTimeoutMs);
+          timeout.unref?.();
+          output.once("close", onClose);
+          output.end((error?: Error | null) => {
+            if (error) finish(error);
+          });
+        });
+      } catch (error) {
+        input.signal?.removeEventListener("abort", abortStage);
+        await destroyAndWaitForClose();
+        await fs.rm(temporary, { force: true }).catch(() => undefined);
+        throw error;
+      }
+      input.signal?.removeEventListener("abort", abortStage);
+      return stagedPresalesFileFromTemporary({
+        fileId: input.fileId,
+        temporary,
+        sizeBytes,
+        sha256: hash.digest("hex"),
+      });
+    },
+  };
+}
+
+export async function stagePresalesFileContent(input: {
+  fileId: string;
+  stream: Readable;
+  maxBytes: number;
+}): Promise<StagedPresalesFile> {
+  const incremental = await createIncrementalPresalesFileStage({
+    fileId: input.fileId,
+    maxBytes: input.maxBytes,
+  });
+  try {
+    for await (const chunk of input.stream) {
+      await incremental.append(
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+      );
+    }
+    return await incremental.finalize();
+  } catch (error) {
+    await incremental.discard();
+    throw error;
+  }
 }
 
 export async function readStoredPresalesFile(

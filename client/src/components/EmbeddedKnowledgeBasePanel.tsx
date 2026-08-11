@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Download,
   FileClock,
@@ -38,6 +38,10 @@ import {
   type Conversation,
 } from "@/contexts/ConversationContext";
 import { syncKnowledgeBaseArchiveFromOutput } from "@/lib/knowledge-snapshot";
+import {
+  isKnowledgeBaseProgressCoordinateOlder,
+  readKnowledgeBaseProgressEventDetail,
+} from "@/lib/knowledge-progress";
 import { trpc } from "@/lib/trpc";
 import Home from "@/pages/Home";
 import type {
@@ -54,6 +58,20 @@ function isKnowledgeBaseConversationCandidate(
         conversation.title === "企业知识库构建" ||
         conversation.messages.some((message) => message.knowledgeBase)),
   );
+}
+
+export function isKnowledgeBaseProgressProjectionOlder(
+  candidate: KnowledgeBaseProgressDto,
+  current: KnowledgeBaseProgressDto | null,
+) {
+  if (!current) return false;
+  if (candidate.build.id !== current.build.id) {
+    return candidate.build.updatedAt < current.build.updatedAt;
+  }
+  if (candidate.build.revision !== current.build.revision) {
+    return candidate.build.revision < current.build.revision;
+  }
+  return candidate.build.updatedAt < current.build.updatedAt;
 }
 
 export function shouldDiscardConversationAfterKnowledgeReset(input: {
@@ -770,31 +788,69 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
   );
   const [liveProgress, setLiveProgress] =
     useState<KnowledgeBaseProgressDto | null>(null);
+  const liveProgressCoordinateRef = useRef({
+    generation: -1,
+    stateEpoch: -1,
+  });
 
   useEffect(() => {
     setLiveProgress(null);
+    liveProgressCoordinateRef.current = { generation: -1, stateEpoch: -1 };
   }, [conversationId]);
 
   useEffect(() => {
-    if (progressQuery.data?.progress !== undefined) {
-      setLiveProgress(progressQuery.data.progress);
+    const candidate = progressQuery.data?.progress;
+    if (candidate !== undefined) {
+      setLiveProgress((current) => {
+        if (candidate === null) return null;
+        if (isKnowledgeBaseProgressProjectionOlder(candidate, current)) {
+          return current;
+        }
+        return candidate;
+      });
     }
   }, [progressQuery.data?.progress]);
 
   useEffect(() => {
     const refresh = (event: Event) => {
-      const detail = (event as CustomEvent<KnowledgeBaseProgressDto | null>)
-        .detail;
+      const detail = readKnowledgeBaseProgressEventDetail(
+        (event as CustomEvent<unknown>).detail,
+      );
       if (
         detail &&
-        (!conversationId || detail.build.conversationId === conversationId)
+        (!conversationId ||
+          detail.progress.build.conversationId === conversationId)
       ) {
-        setLiveProgress(detail);
-        if (conversationId) {
-          trpcUtils.workspace.knowledgeProgress.setData(
-            { conversationId },
-            (current) => (current ? { ...current, progress: detail } : current),
+        const currentCoordinate = liveProgressCoordinateRef.current;
+        const hasCoordinate = detail.generation >= 0 && detail.stateEpoch >= 0;
+        const coordinateIsOlder =
+          hasCoordinate &&
+          isKnowledgeBaseProgressCoordinateOlder(detail, currentCoordinate);
+        if (!coordinateIsOlder) {
+          if (hasCoordinate) {
+            liveProgressCoordinateRef.current = {
+              generation: detail.generation,
+              stateEpoch: detail.stateEpoch,
+            };
+          }
+          setLiveProgress((current) =>
+            isKnowledgeBaseProgressProjectionOlder(detail.progress, current)
+              ? current
+              : detail.progress,
           );
+          if (conversationId) {
+            trpcUtils.workspace.knowledgeProgress.setData(
+              { conversationId },
+              (current) =>
+                current &&
+                !isKnowledgeBaseProgressProjectionOlder(
+                  detail.progress,
+                  current.progress ?? null,
+                )
+                  ? { ...current, progress: detail.progress }
+                  : current,
+            );
+          }
         }
       }
       void progressQuery.refetch();

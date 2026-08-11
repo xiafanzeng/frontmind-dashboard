@@ -99,6 +99,13 @@ describe("socratic knowledge-base Skill packaging", () => {
     expect(outputContract).toContain('"schemaVersion": 4');
     expect(outputContract).toContain('"sourceKind": "user_upload"');
     expect(validator).toContain("MAX_USER_UPLOAD_IMAGES = 99");
+    expect(validator).toContain("MIN_LEAVES = 30");
+    expect(validator).toContain("MAX_OFFICIAL_PAGES = 120");
+    expect(validator).toContain("MAX_PARSED_DOCUMENTS = 130");
+    expect(validator).toContain("MAX_PUBLIC_QUERIES = 30");
+    expect(validator).not.toContain(
+      "required_formal_characters in {0, expected_required}",
+    );
     expect(validator).toContain("duplicate original customer upload hash");
     expect(validator).toContain("table_is_source_inventory");
     expect(validator).toContain("--finalization-input");
@@ -140,6 +147,19 @@ describe("socratic knowledge-base Skill packaging", () => {
     expect(validator).not.toContain("CUSTOMER_OR_PROCUREMENT_ADVICE");
     expect(skill).toContain("not a vocabulary-based runtime gate");
     expect(outputContract).toContain("does not screen formal prose");
+    expect(skill).toContain(
+      "Before creating the first `FRONTMIND_KB_MANIFEST`",
+    );
+    expect(skill).toContain("Create an adaptive 30–115 leaf tree");
+    expect(skill).toContain("should contain 40–55 leaves");
+    expect(skill).toContain("Website knowledge-base prefill is evidence only");
+    expect(skill).toContain("researchCoverage");
+    expect(skill).toContain("parse every generated protocol");
+    expect(normalizedSkill).toContain("exact operationId and turnId scope");
+    expect(skill).toContain("service-side validator remains authoritative");
+    expect(normalizedOutputContract).toContain(
+      "Zero is not a valid bypass for a new schema-v4 Dashboard archive",
+    );
   });
 
   it("pins reference-only changes and preserves canonical plus legacy aliases", async () => {

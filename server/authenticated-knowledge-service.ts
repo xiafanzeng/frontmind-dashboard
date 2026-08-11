@@ -7,8 +7,8 @@ import {
   type KnowledgeBaseSnapshot,
 } from "../drizzle/schema";
 import {
-  KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES,
-  KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES,
+  knowledgeBaseTreePolicy,
+  validateStoredKnowledgeBaseResearchCoverage,
 } from "./knowledge-base-progress";
 import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
 import { getDb } from "./db";
@@ -45,11 +45,26 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     | "publishedSnapshotId"
     | "publishedAt"
     | "createdAt"
+    | "treePolicyVersion"
+    | "initialResearchCoverage"
   >;
   notBefore: Date;
 }) {
   const { snapshot, build } = input;
   const handled = build.confirmedCount + build.directPrefilledCount;
+  const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
+  let researchCoverageValid = depthPolicy.version === 1;
+  if (depthPolicy.version === 2) {
+    try {
+      validateStoredKnowledgeBaseResearchCoverage(
+        build.initialResearchCoverage,
+        { totalLeafCount: build.totalNodeCount },
+      );
+      researchCoverageValid = true;
+    } catch {
+      researchCoverageValid = false;
+    }
+  }
   const publicationBindingHash = knowledgeBasePublicationBindingHash(build);
   return (
     snapshot.status === "active" &&
@@ -70,8 +85,9 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     build.publishedSnapshotId === snapshot.id &&
     Boolean(build.publishedAt) &&
     build.currentLeafId === null &&
-    build.totalNodeCount >= KNOWLEDGE_BASE_MANIFEST_MIN_LEAVES &&
-    build.totalNodeCount <= KNOWLEDGE_BASE_MANIFEST_MAX_LEAVES &&
+    build.totalNodeCount >= depthPolicy.minLeaves &&
+    build.totalNodeCount <= depthPolicy.maxLeaves &&
+    researchCoverageValid &&
     handled === build.totalNodeCount &&
     build.needsVerificationCount === 0
   );

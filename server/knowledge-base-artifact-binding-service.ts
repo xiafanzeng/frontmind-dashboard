@@ -66,8 +66,10 @@ import {
   assertKnowledgeBasePresentationMatchesState,
   assertKnowledgeBaseProtocolOperation,
   canPackageKnowledgeBase,
+  knowledgeBaseTreePolicy,
   parseKnowledgeBaseManifestEnvelope,
   parseKnowledgeBaseProgressEnvelope,
+  validateKnowledgeBaseManifestForTreePolicy,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import {
@@ -128,7 +130,7 @@ export {
   knowledgeBaseArchiveWriteContractVersions,
 } from "./knowledge-base-archive-contract";
 
-type KnowledgeBaseLogoDescriptor = {
+export type KnowledgeBaseLogoDescriptor = {
   fileId?: string;
   url?: string;
   filename: string;
@@ -215,6 +217,7 @@ async function readKnowledgeArchiveForBinding(
 async function observeValidatedV4PackageShadow(input: {
   buildId: string;
   generation: number;
+  treePolicyVersion: number;
   archiveBytes: Buffer;
   parsed: Awaited<ReturnType<typeof readKnowledgeArchive>>;
   nodes: ReadonlyArray<{
@@ -245,6 +248,10 @@ async function observeValidatedV4PackageShadow(input: {
           {
             validationProfile: "dashboard-enterprise-v1",
             archiveContractVersions: [4],
+            dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+              input.treePolicyVersion,
+            ).minLeaves,
+            requireDashboardAdaptiveFormalGate: input.treePolicyVersion === 2,
           },
         );
         try {
@@ -727,6 +734,12 @@ export function collectKnowledgeBaseLogoDescriptors(value: unknown) {
   const descriptors = new Map<string, KnowledgeBaseLogoDescriptor>();
   for (const raw of collectTrustedKnowledgeBaseOutputImageDescriptors(value, {
     ignoreInvalidDescriptors: true,
+    // Initial-Logo binding is byte-authoritative. Providers sometimes emit a
+    // real PNG as a typed output_file with application/octet-stream and a
+    // meaningless extension. Keep every assistant output_file in the
+    // operation scope long enough to download and decode it; non-images are
+    // rejected locally by the staged Logo byte validator.
+    includeUndeclaredOutputFiles: true,
   })) {
     const descriptor: KnowledgeBaseLogoDescriptor = {
       ...(raw.fileId ? { fileId: raw.fileId } : {}),
@@ -1265,6 +1278,63 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
   }
 }
 
+/**
+ * Collapse provider aliases by immutable bytes and identify every staging key
+ * which must be removed before returning. Ambiguity cleanup deliberately
+ * includes same-SHA aliases as well as each distinct physical candidate.
+ */
+export function selectKnowledgeBaseInitialLogoPhysicalCandidate(
+  candidates: readonly KnowledgeBaseStagedArtifactCandidate[],
+) {
+  const bySha256 = new Map<string, KnowledgeBaseStagedArtifactCandidate>();
+  for (const candidate of candidates) {
+    if (!bySha256.has(candidate.sha256)) {
+      bySha256.set(candidate.sha256, candidate);
+    }
+  }
+  const uniqueByStorageKey = [
+    ...new Map(
+      candidates.map((candidate) => [candidate.storageKey, candidate]),
+    ).values(),
+  ];
+  if (bySha256.size === 1) {
+    const selected = bySha256.values().next().value!;
+    return {
+      selected,
+      physicalCount: 1,
+      cleanup: uniqueByStorageKey.filter(
+        (candidate) => candidate.storageKey !== selected.storageKey,
+      ),
+    } as const;
+  }
+  return {
+    selected: null,
+    physicalCount: bySha256.size,
+    cleanup: bySha256.size > 1 ? uniqueByStorageKey : [],
+  } as const;
+}
+
+/**
+ * Decode every typed file candidate independently. One unrelated PDF/ZIP must
+ * never hide a valid Logo returned by the same provider operation.
+ */
+export async function probeKnowledgeBaseInitialLogoCandidates<T>(input: {
+  descriptors: readonly KnowledgeBaseLogoDescriptor[];
+  probe: (descriptor: KnowledgeBaseLogoDescriptor) => Promise<T>;
+}) {
+  const validCandidates: T[] = [];
+  let lastRejectedError: unknown;
+  for (const descriptor of input.descriptors) {
+    try {
+      validCandidates.push(await input.probe(descriptor));
+    } catch (error) {
+      if (!knowledgeBaseInitialLogoRejectionCode(error)) throw error;
+      lastRejectedError = error;
+    }
+  }
+  return { validCandidates, lastRejectedError };
+}
+
 export async function bindKnowledgeBaseInitialLogo(input: {
   userId: number;
   buildId: string;
@@ -1286,8 +1356,12 @@ export async function bindKnowledgeBaseInitialLogo(input: {
           stateKind: "frontmind.knowledge-base.manifest",
         })
       : input.output;
-  const manifest = parseKnowledgeBaseManifestEnvelope(
-    extractFinalKnowledgeBaseAssistantText(operationOutput),
+  const manifest = validateKnowledgeBaseManifestForTreePolicy(
+    parseKnowledgeBaseManifestEnvelope(
+      extractFinalKnowledgeBaseAssistantText(operationOutput),
+    ),
+    build.treePolicyVersion,
+    { expectedUploadsRead: build.lastTurnAttachmentCount },
   );
   assertArtifactEnvelopeBelongsToActiveTurn({
     build,
@@ -1341,58 +1415,87 @@ export async function bindKnowledgeBaseInitialLogo(input: {
         "当前 v4 首轮没有有效操作 reservation",
       );
     }
-    let lastRejectedError: unknown;
-    for (const descriptor of descriptors) {
-      try {
-        const buffer = await downloadLogoBytes({
-          descriptor,
-          apiKey: input.apiKey,
-          baseUrl: input.baseUrl,
-        });
-        const descriptorHash = knowledgeBaseOutputImageDescriptorHash({
-          fileId: descriptor.fileId || "",
-          url: descriptor.url || "",
-          filename: descriptor.filename,
-          mimeType: descriptor.mimeType,
-        });
-        const staged = await stageKnowledgeBuildArtifact({
-          userId: input.userId,
-          buildId: input.buildId,
-          generation: input.generation,
-          turnId: activeTurn.id,
-          operationKey: activeTurn.operationKey,
-          descriptorHash,
-          kind: "logo",
-          buffer,
-        });
-        const mimeType =
-          staged.format === "jpeg"
-            ? "image/jpeg"
-            : staged.format
-              ? `image/${staged.format}`
-              : "application/octet-stream";
-        return await assertStagedCandidateStillAuthoritative({
-          staged: true,
-          kind: "logo",
-          userId: input.userId,
-          buildId: input.buildId,
-          generation: input.generation,
-          turnId: activeTurn.id,
-          operationKey: activeTurn.operationKey,
-          taskId: input.taskId,
-          expectedStateEpoch: build.stateEpoch,
-          expectedRevision: build.revision,
-          descriptorHash,
-          storageKey: staged.storageKey,
-          sha256: staged.sha256,
-          bytes: staged.bytes,
-          filename: descriptor.filename.slice(0, 512),
-          mimeType: mimeType.slice(0, 255),
-        });
-      } catch (error) {
-        if (!knowledgeBaseInitialLogoRejectionCode(error)) throw error;
-        lastRejectedError = error;
-      }
+    const operationKey = activeTurn.operationKey;
+    const { validCandidates, lastRejectedError } =
+      await probeKnowledgeBaseInitialLogoCandidates({
+        descriptors,
+        probe: async (descriptor) => {
+          const buffer = await downloadLogoBytes({
+            descriptor,
+            apiKey: input.apiKey,
+            baseUrl: input.baseUrl,
+          });
+          const descriptorHash = knowledgeBaseOutputImageDescriptorHash({
+            fileId: descriptor.fileId || "",
+            url: descriptor.url || "",
+            filename: descriptor.filename,
+            mimeType: descriptor.mimeType,
+          });
+          const staged = await stageKnowledgeBuildArtifact({
+            userId: input.userId,
+            buildId: input.buildId,
+            generation: input.generation,
+            turnId: activeTurn.id,
+            operationKey,
+            descriptorHash,
+            kind: "logo",
+            buffer,
+          });
+          const mimeType =
+            staged.format === "jpeg"
+              ? "image/jpeg"
+              : staged.format
+                ? `image/${staged.format}`
+                : "application/octet-stream";
+          return assertStagedCandidateStillAuthoritative({
+            staged: true,
+            kind: "logo",
+            userId: input.userId,
+            buildId: input.buildId,
+            generation: input.generation,
+            turnId: activeTurn.id,
+            operationKey,
+            taskId: input.taskId,
+            expectedStateEpoch: build.stateEpoch,
+            expectedRevision: build.revision,
+            descriptorHash,
+            storageKey: staged.storageKey,
+            sha256: staged.sha256,
+            bytes: staged.bytes,
+            filename: descriptor.filename.slice(0, 512),
+            mimeType: mimeType.slice(0, 255),
+          });
+        },
+      });
+    const selection =
+      selectKnowledgeBaseInitialLogoPhysicalCandidate(validCandidates);
+    if (selection.selected) {
+      await Promise.all(
+        selection.cleanup.map((candidate) =>
+          removeKnowledgeBaseStagedArtifactCandidate(candidate).catch(
+            () => undefined,
+          ),
+        ),
+      );
+      return selection.selected;
+    }
+    if (selection.physicalCount > 1) {
+      // Multiple independently valid bytes are an editorial choice, not a
+      // research failure. Leave the tree usable and ask the customer to pick
+      // or upload the official Logo; never guess or recreate the model task.
+      await Promise.all(
+        selection.cleanup.map((candidate) =>
+          removeKnowledgeBaseStagedArtifactCandidate(candidate).catch(
+            () => undefined,
+          ),
+        ),
+      );
+      return rejectInitialLogo(
+        new KnowledgeBaseArtifactBindingError(
+          "LOGO_AMBIGUOUS",
+          `首轮返回了 ${selection.physicalCount} 张不同的有效图片，请选择或上传企业官方主 Logo`,
+        ),
+      );
     }
     return rejectInitialLogo(
       lastRejectedError ||
@@ -1560,8 +1663,12 @@ export async function recoverKnowledgeBaseInitialLogoFromCompletedTurn(input: {
     },
   );
   try {
-    const manifest = parseKnowledgeBaseManifestEnvelope(
-      extractFinalKnowledgeBaseAssistantText(operationOutput),
+    const manifest = validateKnowledgeBaseManifestForTreePolicy(
+      parseKnowledgeBaseManifestEnvelope(
+        extractFinalKnowledgeBaseAssistantText(operationOutput),
+      ),
+      build.treePolicyVersion,
+      { expectedUploadsRead: build.lastTurnAttachmentCount },
     );
     assertArtifactEnvelopeBelongsToActiveTurn({
       build,
@@ -1911,6 +2018,10 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       archiveContractVersions: knowledgeBaseArchiveWriteContractVersions(
         build.skillVersion,
       ),
+      dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+        build.treePolicyVersion,
+      ).minLeaves,
+      requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
       // v4 customerVisibleCharacters is derived entirely from the packaged
       // formal bytes. Let the binder reach its canonicalizer for this field
       // only; canonicalization is followed by another strict read below.
@@ -1972,6 +2083,10 @@ export async function bindKnowledgeBaseFinalPackage(input: {
           {
             validationProfile: "dashboard-enterprise-v1",
             archiveContractVersions: [4],
+            dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+              build.treePolicyVersion,
+            ).minLeaves,
+            requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
           },
         );
         storedAssetKeys.push(...parsed.storedAssetKeys);
@@ -2082,6 +2197,7 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       await observeValidatedV4PackageShadow({
         buildId: build.id,
         generation: build.generation,
+        treePolicyVersion: build.treePolicyVersion,
         archiveBytes: authoritativeArchiveBuffer,
         parsed,
         nodes,
@@ -2416,6 +2532,10 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
         build.skillVersion,
       ),
+      dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+        build.treePolicyVersion,
+      ).minLeaves,
+      requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
       // Match the final-turn binder: this derived v4 manifest field is
       // repaired from validated formal bytes, then the canonical archive is
       // immediately read again without this allowance below.
@@ -2461,6 +2581,10 @@ export async function bindKnowledgeBaseReadyPackage(input: {
           {
             validationProfile: "dashboard-enterprise-v1",
             archiveContractVersions: [4],
+            dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+              build.treePolicyVersion,
+            ).minLeaves,
+            requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
           },
         );
         storedAssetKeys.push(...parsed.storedAssetKeys);
@@ -2566,6 +2690,7 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       await observeValidatedV4PackageShadow({
         buildId: build.id,
         generation: build.generation,
+        treePolicyVersion: build.treePolicyVersion,
         archiveBytes: authoritativeArchiveBuffer,
         parsed,
         nodes,

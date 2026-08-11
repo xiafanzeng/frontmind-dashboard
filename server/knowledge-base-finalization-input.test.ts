@@ -12,8 +12,8 @@ function sha256(bytes: Buffer | string) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function approvedNodes() {
-  return Array.from({ length: 8 }, (_, order) => {
+function approvedNodes(count = 8) {
+  return Array.from({ length: count }, (_, order) => {
     const id = order === 7 ? "7.5" : `1.${order + 1}`;
     const contentMarkdown =
       order === 7
@@ -93,6 +93,9 @@ describe("knowledge-base finalization input", () => {
       schemaVersion: 4,
       profile: "dashboard-enterprise-v1",
       buildRevision: 51,
+      treePolicyVersion: 1,
+      minLeaves: 8,
+      maxLeaves: 115,
     });
     expect(ledger.nodes[7]).toMatchObject({
       id: "7.5",
@@ -146,6 +149,89 @@ describe("knowledge-base finalization input", () => {
     expect(await zip.file("README.md")!.async("string")).toContain(
       "Never invent sourceUpload*",
     );
+  });
+
+  it("pins deep finalization input to 30–115 approved nodes", async () => {
+    const logo = Buffer.from("deep-policy-logo");
+    await expect(
+      buildKnowledgeBaseFinalizationInput({
+        companyName: "企业",
+        operationId: "operation",
+        turnId: "turn",
+        buildRevision: 30,
+        treePolicyVersion: 2,
+        nodes: approvedNodes(29),
+        assets: [],
+      }),
+    ).rejects.toThrow("FINALIZATION_INPUT_COORDINATES_INVALID");
+
+    const result = await buildKnowledgeBaseFinalizationInput({
+      companyName: "企业",
+      operationId: "operation",
+      turnId: "turn",
+      buildRevision: 30,
+      treePolicyVersion: 2,
+      nodes: approvedNodes(30),
+      assets: [
+        {
+          kind: "official_logo",
+          filename: "logo.png",
+          mimeType: "image/png",
+          sha256: sha256(logo),
+          bytes: logo,
+          documentIds: ["1.1"],
+        },
+      ],
+    });
+    const zip = await JSZip.loadAsync(result.bytes, { checkCRC32: true });
+    const ledger = JSON.parse(
+      await zip.file("FINALIZATION_INPUT.json")!.async("string"),
+    );
+    expect(ledger.requiredPackage).toMatchObject({
+      treePolicyVersion: 2,
+      minLeaves: 30,
+      maxLeaves: 115,
+    });
+    expect(ledger.nodes).toHaveLength(30);
+
+    const maximum = await buildKnowledgeBaseFinalizationInput({
+      companyName: "企业",
+      operationId: "operation-max",
+      turnId: "turn-max",
+      buildRevision: 115,
+      treePolicyVersion: 2,
+      nodes: approvedNodes(115),
+      assets: [
+        {
+          kind: "official_logo",
+          filename: "logo.png",
+          mimeType: "image/png",
+          sha256: sha256(logo),
+          bytes: logo,
+          documentIds: ["1.1"],
+        },
+      ],
+    });
+    const maximumZip = await JSZip.loadAsync(maximum.bytes, {
+      checkCRC32: true,
+    });
+    expect(
+      JSON.parse(
+        await maximumZip.file("FINALIZATION_INPUT.json")!.async("string"),
+      ).nodes,
+    ).toHaveLength(115);
+
+    await expect(
+      buildKnowledgeBaseFinalizationInput({
+        companyName: "企业",
+        operationId: "operation-over-max",
+        turnId: "turn-over-max",
+        buildRevision: 116,
+        treePolicyVersion: 2,
+        nodes: approvedNodes(116),
+        assets: [],
+      }),
+    ).rejects.toThrow("FINALIZATION_INPUT_COORDINATES_INVALID");
   });
 
   it("rejects placeholder-only finalization input", async () => {

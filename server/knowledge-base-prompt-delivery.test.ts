@@ -15,6 +15,7 @@ describe("upstream prompt delivery", () => {
     const delivery = buildKnowledgeBaseInstructionDelivery({
       instructions,
       skillVersion: "4",
+      treePolicyVersion: 2,
       operationId: "operation-1",
       turnId: "turn-1",
     });
@@ -31,6 +32,9 @@ describe("upstream prompt delivery", () => {
     expect(delivery.prompt).toContain(
       "只有 customerAttachments 中明确列出的文件属于客户事实资料",
     );
+    expect(delivery.prompt).toContain(
+      "Dashboard 深度知识库必须为 30–115 个真实叶子，普通企业目标 40–55",
+    );
     expect(delivery.prompt).toContain("operationId=operation-1");
     expect(delivery.prompt).toContain("turnId=turn-1");
     for (const forbiddenPhrase of [
@@ -46,6 +50,18 @@ describe("upstream prompt delivery", () => {
     ]) {
       expect(delivery.prompt).not.toContain(forbiddenPhrase);
     }
+  });
+
+  it("does not impose the deep-tree bootstrap on a legacy v4 build", () => {
+    const delivery = buildKnowledgeBaseInstructionDelivery({
+      instructions: "历史 v4 构建规则",
+      skillVersion: "4",
+      treePolicyVersion: 1,
+      operationId: "operation-legacy",
+      turnId: "turn-legacy",
+    });
+    expect(delivery.prompt).not.toContain("30–115 个真实叶子");
+    expect(delivery.prompt).not.toContain("普通企业目标 40–55");
   });
 
   it("fails closed instead of allowing an oversized main prompt", () => {
