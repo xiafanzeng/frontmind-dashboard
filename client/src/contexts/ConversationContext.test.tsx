@@ -266,6 +266,99 @@ describe("knowledge-base reply snapshots", () => {
     expect(next.taskId).toBeUndefined();
     expect(next.previousResponseId).toBeUndefined();
   });
+
+  it("applies an equivalent observation to repair optimistic running state", () => {
+    const progress = {
+      build: {
+        id: "build-1",
+        revision: 1,
+        currentLeafId: "1.2",
+      },
+    } as any;
+    const next = applyKnowledgeBaseObservation(
+      {
+        ...conversation("equivalent-observation"),
+        status: "running",
+        messages: [
+          {
+            id: "optimistic-confirmation",
+            role: "user",
+            content: "确认",
+            timestamp: 1,
+            knowledgeBase: {
+              kind: "pending_user",
+              clientRequestId: "request-confirm",
+              serverOwned: false,
+            },
+          },
+        ],
+        knowledgeBase: {
+          initialized: true,
+          generation: 2,
+          stateEpoch: 9,
+          activeTurnId: null,
+          activeClientRequestId: null,
+          interactionState: "executing",
+          canReply: false,
+          presentationKey: "a".repeat(64),
+          presentationTurnId: null,
+          revision: 1,
+          leafId: "1.2",
+          notice: null,
+        },
+      },
+      {
+        generation: 2,
+        stateEpoch: 9,
+        authoritativeTaskId: "task-completed",
+        activeTurn: null,
+        completedTurn: null,
+        progress,
+        approvedPresentation: {
+          turnId: "turn-confirm",
+          clientRequestId: "request-confirm",
+          presentationKey: "a".repeat(64),
+          revision: 1,
+          leafId: "1.2",
+          visibleMarkdown: "## 当前节点\n已批准正文",
+          contentSha256: "a".repeat(64),
+          imageState: "attached",
+          resources: [],
+        },
+        notice: null,
+        interaction: {
+          interactionState: "awaiting_input",
+          canReply: true,
+          canPublish: false,
+          lockReason: null,
+          progress,
+        },
+      } as any,
+    );
+
+    expect(next.status).toBe("awaiting_input");
+    expect(next.knowledgeBase).toMatchObject({
+      generation: 2,
+      stateEpoch: 9,
+      interactionState: "awaiting_input",
+      canReply: true,
+    });
+    expect(next.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: expect.stringContaining("turn-confirm"),
+          knowledgeBase: expect.objectContaining({
+            turnId: "turn-confirm",
+            serverOwned: true,
+          }),
+        }),
+        expect.objectContaining({
+          role: "assistant",
+          content: "## 当前节点\n已批准正文",
+        }),
+      ]),
+    );
+  });
 });
 
 describe("ConversationProvider cloud hydration", () => {
@@ -904,7 +997,7 @@ describe("prepareConversationForCloud", () => {
     ]);
   });
 
-  it("keeps KB provenance and removes tombstones targeting server-owned messages", () => {
+  it("omits server-owned KB messages and pending ghosts from browser snapshots", () => {
     const clean = prepareConversationForCloud({
       ...conversation("knowledge-base-metadata"),
       deletedMessageIds: ["presentation-1", "ordinary-deleted"],
@@ -924,13 +1017,29 @@ describe("prepareConversationForCloud", () => {
             serverOwned: true,
           },
         },
+        {
+          id: "pending-without-turn",
+          role: "user",
+          content: "确认",
+          timestamp: 11,
+          knowledgeBase: {
+            kind: "pending_user",
+            clientRequestId: "request-without-turn",
+            serverOwned: false,
+          },
+        },
+        {
+          id: "ordinary-browser-message",
+          role: "user",
+          content: "普通消息",
+          timestamp: 12,
+        },
       ],
     });
 
-    expect(clean.messages[0]?.knowledgeBase).toMatchObject({
-      presentationKey: "presentation-1",
-      serverOwned: true,
-    });
+    expect(clean.messages.map((message) => message.id)).toEqual([
+      "ordinary-browser-message",
+    ]);
     expect(clean.deletedMessageIds).toEqual(["ordinary-deleted"]);
   });
 });

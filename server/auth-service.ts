@@ -19,6 +19,7 @@ import {
   isNull,
   ne,
   or,
+  sql,
 } from "drizzle-orm";
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
@@ -29,6 +30,7 @@ import {
 import {
   apiCredentials,
   apiKeyOwnership,
+  attachments,
   conversations,
   conversationTurns,
   deliveryProjectAssignments,
@@ -2263,6 +2265,152 @@ export async function getCredentialForUpstreamResource(
     verifiedAt: row.credential.verifiedAt,
     resource: row.resource,
   };
+}
+
+export type UnboundUpstreamFileDiscardContext = {
+  fileId: string;
+  userId: number;
+  projectAssignmentId: string | null;
+  apiCredentialId: string;
+  apiKey: string;
+};
+
+/**
+ * Locks an owned file record, proves that no durable conversation surface has
+ * bound it, performs the caller's idempotent provider/filesystem cleanup, and
+ * only then removes the ownership row in the same transaction. Holding the
+ * resource row lock is intentional: conversation persistence takes the same
+ * lock before setting conversationId, so cancellation cannot delete a file
+ * while a turn is binding it.
+ */
+export async function discardUnboundUpstreamFileInTransaction(input: {
+  executor: any;
+  userId: number;
+  fileId: string;
+  projectAssignmentId?: string | null;
+  discard: (context: UnboundUpstreamFileDiscardContext) => Promise<void>;
+}) {
+  const projectAssignmentId = input.projectAssignmentId ?? null;
+  const rows = await input.executor
+    .select({ resource: upstreamResources, credential: apiCredentials })
+    .from(upstreamResources)
+    .innerJoin(
+      apiCredentials,
+      eq(upstreamResources.apiCredentialId, apiCredentials.id),
+    )
+    .where(
+      and(
+        eq(upstreamResources.kind, "file"),
+        eq(upstreamResources.upstreamId, input.fileId),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const row = rows[0];
+  const owned = projectAssignmentId
+    ? row?.resource.projectAssignmentId === projectAssignmentId
+    : row?.resource.userId === input.userId &&
+      row?.resource.projectAssignmentId == null;
+  if (!row || !owned || row.credential.status === "deleted") {
+    return { discarded: false as const };
+  }
+  if (row.resource.conversationId) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "UPLOAD_ALREADY_BOUND: file is already bound to a conversation",
+    );
+  }
+
+  const liveAttachments = await input.executor
+    .select({ id: attachments.id })
+    .from(attachments)
+    .where(
+      and(
+        eq(attachments.upstreamFileId, input.fileId),
+        isNull(attachments.deletedAt),
+      ),
+    )
+    .limit(1);
+  if (liveAttachments[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "UPLOAD_ALREADY_BOUND: file has a live attachment reference",
+    );
+  }
+
+  const turnReferences = await input.executor
+    .select({ id: conversationTurns.id })
+    .from(conversationTurns)
+    .where(
+      sql`JSON_CONTAINS(${conversationTurns.attachmentFileIds}, JSON_QUOTE(${input.fileId}), '$')`,
+    )
+    .limit(1);
+  if (turnReferences[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "UPLOAD_ALREADY_BOUND: file has a knowledge turn reference",
+    );
+  }
+
+  const deliveryAttachmentReferences = await input.executor
+    .select({ id: deliveryTicketAttachments.id })
+    .from(deliveryTicketAttachments)
+    .where(eq(deliveryTicketAttachments.upstreamFileId, input.fileId))
+    .limit(1);
+  const redirectPreviewReferences = deliveryAttachmentReferences[0]
+    ? []
+    : await input.executor
+        .select({ id: deliveryRedirectPreviews.id })
+        .from(deliveryRedirectPreviews)
+        .where(eq(deliveryRedirectPreviews.upstreamFileId, input.fileId))
+        .limit(1);
+  const knowledgeBuildReferences =
+    deliveryAttachmentReferences[0] || redirectPreviewReferences[0]
+      ? []
+      : await input.executor
+          .select({ id: knowledgeBaseBuilds.id })
+          .from(knowledgeBaseBuilds)
+          .where(eq(knowledgeBaseBuilds.packageFileId, input.fileId))
+          .limit(1);
+  if (
+    deliveryAttachmentReferences[0] ||
+    redirectPreviewReferences[0] ||
+    knowledgeBuildReferences[0]
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "UPLOAD_ALREADY_BOUND: file has a durable workspace reference",
+    );
+  }
+
+  await input.discard({
+    fileId: input.fileId,
+    userId: row.resource.userId,
+    projectAssignmentId: row.resource.projectAssignmentId,
+    apiCredentialId: row.resource.apiCredentialId,
+    apiKey: decryptApiKey(row.credential),
+  });
+  await input.executor
+    .delete(upstreamResources)
+    .where(
+      and(
+        eq(upstreamResources.id, row.resource.id),
+        isNull(upstreamResources.conversationId),
+      ),
+    );
+  return { discarded: true as const };
+}
+
+export async function discardUnboundUpstreamFile(input: {
+  userId: number;
+  fileId: string;
+  projectAssignmentId?: string | null;
+  discard: (context: UnboundUpstreamFileDiscardContext) => Promise<void>;
+}) {
+  const db = await requireDb();
+  return db.transaction((executor) =>
+    discardUnboundUpstreamFileInTransaction({ ...input, executor }),
+  );
 }
 
 export async function getOwnedUpstreamResourceIds(

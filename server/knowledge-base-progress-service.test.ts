@@ -17,6 +17,8 @@ import {
   isAmbiguousKnowledgeBaseAdvance,
   isKnowledgeBaseAcknowledgementOnlyOutput,
   knowledgeBaseObservationConversationStorageId,
+  knowledgeBaseOperationalFailureAuthority,
+  knowledgeBaseProtocolFailureShouldBecomeTerminal,
   knowledgeBaseProtocolErrorAllowsSameTaskRecovery,
   knowledgeBaseProtocolErrorIsRetryable,
   knowledgeBaseRejectedInitialLogoMatchesAuthority,
@@ -530,6 +532,55 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).not.toThrow();
   });
 
+  it("accepts the Furuili 46-leaf typed Logo bundle despite a redundant Markdown Logo", () => {
+    const leaves = Array.from({ length: 46 }, (_, index) => ({
+      id: `${Math.floor(index / 7) + 1}.${(index % 7) + 1}`,
+      title: `孚锐利业务节点 ${index + 1}`,
+      branchId: `branch-${Math.floor(index / 7) + 1}`,
+      branchTitle: `业务维度 ${Math.floor(index / 7) + 1}`,
+    }));
+    const customerMarkdown = [
+      "## 企业身份 / 一句话定位",
+      "孚锐利面向乳制品企业提供设备、软件与服务。",
+      "![孚锐利官方 Logo](furuili_official_logo.png)",
+    ].join("\n\n");
+    const output = [
+      {
+        type: "output_image",
+        file_id: "furuili-official-logo",
+        file_name: "furuili_official_logo.png",
+        // The binding layer trusts decoded bytes, not this model declaration.
+        mime_type: "application/octet-stream",
+      },
+      {
+        role: "assistant",
+        type: "output_message",
+        content: `${customerMarkdown}\n<!-- FRONTMIND_KB_MANIFEST\n${JSON.stringify(
+          {
+            kind: "frontmind.knowledge-base.manifest",
+            schemaVersion: 2,
+            operationId: operation.operationId,
+            turnId: operation.turnId,
+            leaves,
+          },
+        )}\n-->`,
+      },
+    ];
+
+    expect(() =>
+      assertKnowledgeBaseInitialImageDelivery(output, operation),
+    ).not.toThrow();
+    const visible = projectKnowledgeBasePresentationMarkdown({
+      markdown: customerMarkdown,
+      leafId: leaves[0]!.id,
+      leafTitle: leaves[0]!.title,
+      leafIds: leaves.map((leaf) => leaf.id),
+    });
+    expect(visible).toContain("孚锐利面向乳制品企业提供设备、软件与服务");
+    expect(visible).not.toContain("![孚锐利官方 Logo]");
+    expect(leaves).toHaveLength(46);
+  });
+
   it("deduplicates nested and top-level projections within the active Manifest operation", () => {
     const assistant: any = manifestMessage(
       operation.operationId,
@@ -1008,7 +1059,7 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).toThrow("缺少图片交付声明");
   });
 
-  it("rejects inline Markdown, HTML and data URL images", () => {
+  it("does not let redundant inline image syntax invalidate a typed delivery", () => {
     for (const content of [
       "![diagram](https://cdn.example.test/diagram.png)",
       '<img src="https://cdn.example.test/diagram.png">',
@@ -1024,7 +1075,7 @@ describe("knowledge-base first-leaf-only image delivery", () => {
           },
           output: [{ role: "assistant", type: "message", content }],
         }),
-      ).toThrow("不得包含 Markdown、HTML 或 data URL 图片");
+      ).not.toThrow();
     }
   });
 
@@ -1072,7 +1123,32 @@ describe("knowledge-base first-leaf-only image delivery", () => {
     ).toThrow("必须只展示一张企业官方主 Logo");
   });
 
-  it("discards only a server-rejected typed Logo while retaining text safety checks", () => {
+  it("keeps a typed output_file with wrong declaration in the v4 first-turn Logo authority", () => {
+    const output = [
+      { role: "assistant", type: "message", content: "1.1 正文" },
+      {
+        type: "output_file",
+        file_id: "logo-with-png-bytes",
+        file_name: "artifact.bin",
+        mime_type: "application/octet-stream",
+      },
+    ];
+
+    expect(
+      assertKnowledgeBaseInitialImageDelivery(output, undefined, {
+        allowMultiple: true,
+      }),
+    ).toBe(1);
+    expect(collectKnowledgeBaseInitialOutputImageDescriptors(output)).toEqual([
+      expect.objectContaining({
+        fileId: "logo-with-png-bytes",
+        filename: "artifact.bin",
+        mimeType: "application/octet-stream",
+      }),
+    ]);
+  });
+
+  it("discards only a server-rejected typed Logo and ignores redundant inline syntax", () => {
     const rejectedImage = {
       type: "output_image",
       file_id: "invalid-logo",
@@ -1101,7 +1177,7 @@ describe("knowledge-base first-leaf-only image delivery", () => {
         undefined,
         { allowMissing: true, discardRejectedImages: true },
       ),
-    ).toThrow("不得包含 Markdown、HTML 或 data URL 图片");
+    ).not.toThrow();
   });
 
   it("discards a conflicting typed Logo identity only with its explicit rejection", () => {
@@ -1252,6 +1328,57 @@ describe("knowledge-base settled failure debounce", () => {
       "2026-08-01T00:00:20.000Z",
     );
   });
+
+  it.each([
+    ["acknowledgement-only first observation", false, false, false],
+    ["settled malformed output before debounce", false, false, false],
+    ["third stable observation after ten seconds", false, true, true],
+    ["provider explicitly failed or cancelled", true, false, true],
+  ])("%s terminal=%s", (_case, providerFailed, debounceSatisfied, expected) => {
+    expect(
+      knowledgeBaseProtocolFailureShouldBecomeTerminal({
+        providerFailed,
+        debounceSatisfied,
+      }),
+    ).toBe(expected);
+  });
+});
+
+describe("knowledge-base operational failure authority", () => {
+  it.each([
+    [
+      "running" as const,
+      "requires_user_fix" as const,
+      "update_credential" as const,
+      "bound",
+      "protocol_error",
+    ],
+    [
+      "queued" as const,
+      "recoverable_same_turn" as const,
+      "reconcile" as const,
+      "recovering",
+      null,
+    ],
+  ])(
+    "keeps a %s logical turn resumable for %s",
+    (turnStatus, failureClass, recoveryAction, dispatchState, buildStatus) => {
+      expect(
+        knowledgeBaseOperationalFailureAuthority({
+          turnStatus,
+          failureClass,
+          recoveryAction,
+        }),
+      ).toEqual({
+        turnStatus,
+        dispatchState,
+        failureClass,
+        recoveryAction,
+        canRegenerate: false,
+        buildStatus,
+      });
+    },
+  );
 });
 
 describe("knowledge-base staged artifact authority", () => {

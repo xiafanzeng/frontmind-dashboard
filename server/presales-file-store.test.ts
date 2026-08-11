@@ -9,12 +9,13 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   acquirePresalesFileCreateReservation,
   completePresalesFileCreateReservation,
+  createIncrementalPresalesFileStage,
   hashPresalesFileCreatePayload,
   hashPresalesFileIdempotencyKey,
   markStoredPresalesFileRetention,
@@ -385,6 +386,137 @@ describe("presales file content retention manifest", () => {
       contentExpiresAt: input.contentExpiresAt,
     });
   }
+
+  it("incrementally stages exact bytes with caller-controlled backpressure", async () => {
+    const stage = await createIncrementalPresalesFileStage({
+      fileId: "incremental-upload",
+      maxBytes: 1_024,
+    });
+    await stage.append(Buffer.from("first-"));
+    await stage.append(new Uint8Array(Buffer.from("second")));
+    const staged = await stage.finalize();
+
+    expect(staged.sizeBytes).toBe(12);
+    expect(staged.sha256).toBe(
+      "79be082f29fd48f6922ef9e7c161190ba1e076790e82e9fa490b58205b5e9a44",
+    );
+    const chunks: Buffer[] = [];
+    for await (const chunk of staged.createReadStream()) {
+      chunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(chunks).toString("utf8")).toBe("first-second");
+    await staged.discard();
+  });
+
+  it("stops awaiting a stalled storage preflight on abort without creating a temporary", async () => {
+    const controller = new AbortController();
+    let finishPreflight!: () => void;
+    const staged = createIncrementalPresalesFileStage({
+      fileId: "incremental-preflight-abort",
+      maxBytes: 1_024,
+      signal: controller.signal,
+      storagePreflight: async () =>
+        new Promise((resolve) => {
+          finishPreflight = () =>
+            resolve({
+              root: path.join(assetDir, "presales-files"),
+              availableBytes: 10_000,
+              requiredBytes: 1_024,
+            });
+        }),
+    });
+    await vi.waitFor(() => expect(finishPreflight).toBeTypeOf("function"));
+    controller.abort(
+      Object.assign(new Error("absolute deadline"), {
+        code: "UPLOAD_SOURCE_DEADLINE_EXCEEDED",
+      }),
+    );
+
+    await expect(staged).rejects.toMatchObject({
+      code: "UPLOAD_SOURCE_DEADLINE_EXCEEDED",
+    });
+    finishPreflight();
+    await Promise.resolve();
+    expect(
+      await readdir(path.join(assetDir, "presales-files")).catch(() => []),
+    ).toEqual([]);
+  });
+
+  it("removes an incremental temporary file when the actual byte cap is crossed", async () => {
+    const stage = await createIncrementalPresalesFileStage({
+      fileId: "incremental-too-large",
+      maxBytes: 5,
+    });
+    await stage.append("12345");
+    await expect(stage.append("6")).rejects.toThrow("FILE_TOO_LARGE");
+    await stage.discard();
+
+    const root = path.join(assetDir, "presales-files");
+    expect(
+      (await readdir(root)).filter((name) => name.endsWith(".upload.tmp")),
+    ).toEqual([]);
+  });
+
+  it("bounds a stalled write, destroys the stream, and leaves no temporary file", async () => {
+    class HangingWriteStream extends Writable {
+      fd = 99;
+      _write(
+        _chunk: Buffer,
+        _encoding: BufferEncoding,
+        _callback: (error?: Error | null) => void,
+      ) {
+        // Deliberately never completes; the stage deadline must wake the call.
+      }
+    }
+    const output = new HangingWriteStream();
+    const stage = await createIncrementalPresalesFileStage({
+      fileId: "incremental-write-stall",
+      maxBytes: 1_024,
+      ioTimeoutMs: 10,
+      writeStreamFactory: (() => output) as never,
+    });
+
+    await expect(stage.append("stalled")).rejects.toMatchObject({
+      code: "PRESALES_FILE_STAGE_WRITE_TIMEOUT",
+    });
+    await stage.discard();
+
+    expect(output.destroyed).toBe(true);
+    expect(
+      (await readdir(path.join(assetDir, "presales-files"))).filter((name) =>
+        name.endsWith(".upload.tmp"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("propagates a stalled close instead of returning a usable stage", async () => {
+    class HangingCloseStream extends Writable {
+      fd = 99;
+      _write(
+        _chunk: Buffer,
+        _encoding: BufferEncoding,
+        callback: (error?: Error | null) => void,
+      ) {
+        callback();
+      }
+      _final(_callback: (error?: Error | null) => void) {
+        // Deliberately never closes; finalize must fail and destroy it.
+      }
+    }
+    const output = new HangingCloseStream();
+    const stage = await createIncrementalPresalesFileStage({
+      fileId: "incremental-close-stall",
+      maxBytes: 1_024,
+      ioTimeoutMs: 10,
+      writeStreamFactory: (() => output) as never,
+    });
+    await stage.append("complete bytes");
+
+    await expect(stage.finalize()).rejects.toMatchObject({
+      code: "PRESALES_FILE_STAGE_CLOSE_TIMEOUT",
+    });
+    expect(output.destroyed).toBe(true);
+  });
 
   it("persists an immutable upload deadline across later commits", async () => {
     const uploadedAt = new Date("2026-01-01T00:00:00.000Z");

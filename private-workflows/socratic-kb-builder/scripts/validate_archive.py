@@ -28,15 +28,16 @@ MAX_FILES = 1_500
 REQUIRED_LOGO_IMAGES = 1
 MAX_USER_UPLOAD_IMAGES = 99
 MAX_IMAGES = REQUIRED_LOGO_IMAGES + MAX_USER_UPLOAD_IMAGES
-MIN_LEAVES = 8
+MIN_LEAVES = 30
 MAX_LEAVES = 115
 TARGET_FORMAL_CHARACTERS_MIN = 80_000
 TARGET_FORMAL_CHARACTERS_MAX = 120_000
 MAX_FORMAL_CHARACTERS = 180_000
 MAX_EVIDENCE_CHARACTERS = 3_000_000
-MAX_PARSED_DOCUMENTS = 220
-MAX_PUBLIC_QUERIES = 120
-MAX_OFFICIAL_PAGES = 1_200
+# 30 official documents plus as many as 100 customer uploads.
+MAX_PARSED_DOCUMENTS = 130
+MAX_PUBLIC_QUERIES = 30
+MAX_OFFICIAL_PAGES = 120
 CONTENT_STATUSES = {"complete", "limited_evidence", "needs_verification"}
 IMAGE_SELECTION_STATUSES = {"target_met", "source_limited", "budget_limited"}
 REQUIRED_IMAGE_DISCOVERY_METHODS = {
@@ -1066,10 +1067,9 @@ def validate_archive(path: Path) -> list[str]:
                         evidence_characters=evidence_characters,
                     )
                     validation.require(
-                        required_formal_characters in {0, expected_required},
+                        required_formal_characters == expected_required,
                         f"{where}.requiredFormalCharacters must be "
-                        f"0 or legacy value {expected_required}, got "
-                        f"{required_formal_characters!r}",
+                        f"{expected_required}, got {required_formal_characters!r}",
                     )
                     validation.require(
                         content_status == expected_status,

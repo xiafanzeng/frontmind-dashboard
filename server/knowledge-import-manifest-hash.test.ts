@@ -627,7 +627,7 @@ describe("website knowledge import v3 manifest binding", () => {
             fileId: "final-file-v4",
             filename: "示例企业_knowledge_base.zip",
             sha256: finalSha256,
-            archiveContractVersion: 3,
+            archiveContractVersion: 4,
             validationProfile: "website-lead-v1",
             packageManifestSha256: "d".repeat(64),
             finalizerVersion: "website-kb-finalizer-v1",
@@ -656,7 +656,7 @@ describe("website knowledge import v3 manifest binding", () => {
       expect.any(String),
       {
         validationProfile: "website-lead-v1",
-        archiveContractVersion: 3,
+        archiveContractVersion: 4,
       },
     );
     expect(mocks.createKnowledgeSnapshot).toHaveBeenCalledWith(

@@ -12,6 +12,7 @@
     "0056_project_order_deletion_tombstones": "expand",
     "0057_productive_kang": "expand",
     "0058_jenova_brand_tracking": "expand",
-    "0059_delivery_ticket_workflow_contracts": "contract"
+    "0059_delivery_ticket_workflow_contracts": "contract",
+    "0060_knowledge_base_tree_policy": "expand"
   }
 }

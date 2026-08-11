@@ -274,7 +274,7 @@ organization.
 `evidenceCharacters` must equal the validator-recomputed total effective
 characters from the unique referenced evidence documents. Allowed content
 statuses are `complete`, `limited_evidence`, and `needs_verification`.
-`00_completeness.json` counts the evidence states of the 8–115 true leaf
+`00_completeness.json` counts the evidence states of the 30–115 true leaf
 documents. `customerVisible` is true only for polished overviews and leaves.
 Document and asset IDs are stable and unique. Every `assetIds` and
 `documentIds` relationship must resolve in both directions.
@@ -327,6 +327,8 @@ For schema version 2, compute `requiredFormalCharacters` exactly:
 - Use `complete` only when the computed target is reached by the available
   evidence; otherwise use `limited_evidence`. Formal content must meet the
   computed requirement, but must not be padded to reach the target.
+- `requiredFormalCharacters` must equal the computed value. Zero is not a
+  valid bypass for a new schema-v4 Dashboard archive.
 
 `imageSelection` is an auditable Logo-only acquisition funnel. Generic
 `sourceKind: user_upload` inline node images never enter this object or any
@@ -468,6 +470,11 @@ selected/rejected source, conflict, and unresolved gap. The media-gap report
 explains any Logo discovery or inspection gap. It does not request
 product-family or business imagery.
 
+The recorded totals must respect the current deep-knowledge-base research
+ceilings: 120 successfully parsed official pages, 200 visited links, 30
+official documents and 30 public queries. Never truncate a real counter to make
+the archive pass.
+
 ## `00_completeness.json`
 
 Keep the established object shape unchanged and use no extra fields:
@@ -495,7 +502,7 @@ Keep the established object shape unchanged and use no extra fields:
 ```
 
 Replace every uppercase token with the current run's actual value.
-`totalLeaves` is the 8–115 true leaf count,
+`totalLeaves` is the 30–115 true leaf count,
 not the overview count. The six evidence-state counts must be non-negative,
 sum to `totalLeaves`, and match the leaf manifests. `images.completed` must
 equal 1 for a valid new archive and records the one official Logo, whether it

@@ -15,6 +15,8 @@ import {
   knowledgeBaseExistingLogoUploadBindingDecision,
   knowledgeBaseInitialLogoRejectionCode,
   knowledgeBaseStagedArtifactCleanupDecision,
+  probeKnowledgeBaseInitialLogoCandidates,
+  selectKnowledgeBaseInitialLogoPhysicalCandidate,
   selectKnowledgeBaseRecoveryLogoAsset,
   selectKnowledgeBaseReadyPackageDescriptor,
   type KnowledgeBaseStagedArtifactCandidate,
@@ -245,7 +247,7 @@ describe("knowledge-base Logo descriptor normalization", () => {
     ]);
   });
 
-  it("does not classify ZIP or ordinary files as images", () => {
+  it("retains typed files for byte-authoritative Logo decoding", () => {
     expect(
       collectKnowledgeBaseLogoDescriptors([
         {
@@ -261,7 +263,84 @@ describe("knowledge-base Logo descriptor normalization", () => {
           mime_type: "application/pdf",
         },
       ]),
-    ).toEqual([]);
+    ).toEqual([
+      expect.objectContaining({ fileId: "file-zip" }),
+      expect.objectContaining({ fileId: "file-pdf" }),
+    ]);
+  });
+
+  it("keeps a typed image as a Logo candidate even when its MIME and extension are wrong", () => {
+    expect(
+      collectKnowledgeBaseLogoDescriptors([
+        {
+          type: "output_image",
+          file_id: "file-logo-wrong-declaration",
+          file_name: "logo.bin",
+          mime_type: "application/octet-stream",
+        },
+      ]),
+    ).toEqual([
+      expect.objectContaining({
+        fileId: "file-logo-wrong-declaration",
+        filename: "logo.bin",
+        mimeType: "application/octet-stream",
+      }),
+    ]);
+  });
+
+  it("keeps a typed output_file with wrong MIME and extension until its PNG bytes are decoded", () => {
+    expect(
+      collectKnowledgeBaseLogoDescriptors([
+        {
+          type: "output_file",
+          file_id: "file-logo-png-bytes",
+          file_name: "artifact.bin",
+          mime_type: "application/octet-stream",
+        },
+      ]),
+    ).toEqual([
+      expect.objectContaining({
+        fileId: "file-logo-png-bytes",
+        filename: "artifact.bin",
+        mimeType: "application/octet-stream",
+      }),
+    ]);
+  });
+
+  it("skips a non-image typed file without hiding the one valid Logo candidate", async () => {
+    const descriptors = collectKnowledgeBaseLogoDescriptors([
+      {
+        type: "output_file",
+        file_id: "file-document",
+        file_name: "facts.pdf",
+        mime_type: "application/pdf",
+      },
+      {
+        type: "output_file",
+        file_id: "file-logo",
+        file_name: "artifact.bin",
+        mime_type: "application/octet-stream",
+      },
+    ]);
+    const result = await probeKnowledgeBaseInitialLogoCandidates({
+      descriptors,
+      probe: async (descriptor) => {
+        if (descriptor.fileId === "file-document") {
+          throw new KnowledgeBaseArtifactBindingError(
+            "LOGO_UPLOAD_INVALID",
+            "not an image",
+          );
+        }
+        return { fileId: descriptor.fileId, decodedFormat: "png" };
+      },
+    });
+
+    expect(result.validCandidates).toEqual([
+      { fileId: "file-logo", decodedFormat: "png" },
+    ]);
+    expect(result.lastRejectedError).toBeInstanceOf(
+      KnowledgeBaseArtifactBindingError,
+    );
   });
 
   it("recognizes provider image URL aliases without rendering the hotlink", () => {
@@ -292,6 +371,92 @@ describe("knowledge-base Logo descriptor normalization", () => {
         },
       ]),
     ).toHaveLength(1);
+  });
+
+  it("keeps one physical Logo and cleans every extra same-byte staging alias", () => {
+    const candidate = (
+      storageKey: string,
+      sha256: string,
+    ): KnowledgeBaseStagedArtifactCandidate => ({
+      staged: true,
+      kind: "logo",
+      userId: 7,
+      buildId: "10000000-0000-4000-8000-000000000001",
+      generation: 1,
+      turnId: "turn-current",
+      operationKey: "operation-current",
+      taskId: "task-current",
+      expectedStateEpoch: 2,
+      expectedRevision: 0,
+      descriptorHash: createHash("sha256").update(storageKey).digest("hex"),
+      sourceDescriptorHash: createHash("sha256")
+        .update(`source:${storageKey}`)
+        .digest("hex"),
+      storageKey,
+      sha256,
+      bytes: 100,
+      filename: "logo.png",
+      mimeType: "image/png",
+    });
+    const kept = candidate("logo/primary.png", "a".repeat(64));
+    const alias = candidate("logo/alias.png", "a".repeat(64));
+
+    expect(
+      selectKnowledgeBaseInitialLogoPhysicalCandidate([kept, alias]),
+    ).toEqual({
+      selected: kept,
+      physicalCount: 1,
+      cleanup: [alias],
+    });
+  });
+
+  it("cleans every staged alias when multiple physical Logo bytes are ambiguous", () => {
+    const base = {
+      staged: true as const,
+      kind: "logo" as const,
+      userId: 7,
+      buildId: "10000000-0000-4000-8000-000000000001",
+      generation: 1,
+      turnId: "turn-current",
+      operationKey: "operation-current",
+      taskId: "task-current",
+      expectedStateEpoch: 2,
+      expectedRevision: 0,
+      bytes: 100,
+      filename: "logo.png",
+      mimeType: "image/png",
+    };
+    const candidates: KnowledgeBaseStagedArtifactCandidate[] = [
+      {
+        ...base,
+        descriptorHash: "1".repeat(64),
+        sourceDescriptorHash: "2".repeat(64),
+        storageKey: "logo/a-primary.png",
+        sha256: "a".repeat(64),
+      },
+      {
+        ...base,
+        descriptorHash: "3".repeat(64),
+        sourceDescriptorHash: "4".repeat(64),
+        storageKey: "logo/a-alias.png",
+        sha256: "a".repeat(64),
+      },
+      {
+        ...base,
+        descriptorHash: "5".repeat(64),
+        sourceDescriptorHash: "6".repeat(64),
+        storageKey: "logo/b.png",
+        sha256: "b".repeat(64),
+      },
+    ];
+
+    expect(selectKnowledgeBaseInitialLogoPhysicalCandidate(candidates)).toEqual(
+      {
+        selected: null,
+        physicalCount: 2,
+        cleanup: candidates,
+      },
+    );
   });
 });
 

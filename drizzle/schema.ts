@@ -2604,6 +2604,19 @@ export const knowledgeBaseBuilds = mysqlTable(
       .default("1")
       .notNull(),
     skillContentHash: varchar("skillContentHash", { length: 64 }),
+    /**
+     * Immutable depth contract pinned when the build is created. Historical
+     * rows default to v1 (8–115); new Dashboard builds explicitly use v2
+     * (30–115).
+     */
+    treePolicyVersion: int("treePolicyVersion", { unsigned: true })
+      .default(1)
+      .notNull(),
+    /** Validated first-turn research ledger; required by tree policy v2. */
+    initialResearchCoverage: json("initialResearchCoverage").$type<Record<
+      string,
+      unknown
+    > | null>(),
     status: mysqlEnum("status", [
       "researching",
       "confirming",

@@ -13,9 +13,13 @@ import {
   userUsageOwners,
   type ConversationTurn,
   type KnowledgeBaseBuild,
+  type UpstreamResource,
 } from "../drizzle/schema";
 import type {
+  KnowledgeBaseDispatchState,
+  KnowledgeBaseFailureClass,
   KnowledgeBaseOperationType,
+  KnowledgeBaseRecoveryAction,
   KnowledgeBaseTurnStatus,
 } from "../shared/knowledge-base-progress";
 import { knowledgeBaseOperationTypes } from "../shared/knowledge-base-progress";
@@ -26,6 +30,11 @@ import {
   persistKnowledgeBaseUserMessageInTransaction,
 } from "./knowledge-base-conversation-messages";
 import { getDb } from "./db";
+import type { KnowledgeBaseTreePolicyVersion } from "./knowledge-base-progress";
+import {
+  knowledgeBaseNewBuildPolicyBinding,
+  knowledgeBaseSkillContentHashForTreePolicy,
+} from "./knowledge-base-tree-policy-rollout";
 
 /** Longer than every configured 120s upstream create/upload timeout. */
 const DEFAULT_LEASE_MS = 300_000;
@@ -71,6 +80,16 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   outcomeUnknownAt?: string;
   outcomeUnknownCode?: string;
   preparedDispatch?: KnowledgeBasePreparedDispatch;
+  dispatchState?: KnowledgeBaseDispatchState;
+  failureClass?: KnowledgeBaseFailureClass | null;
+  recoveryAction?: KnowledgeBaseRecoveryAction | null;
+  canRegenerate?: boolean;
+  attachmentRepair?: {
+    clientRequestId: string;
+    requestHash: string;
+    sourceErrorCode: string | null;
+    replacedAt: string;
+  };
   generatedAttachmentReservations?: Record<
     string,
     KnowledgeBaseGeneratedAttachmentReservation
@@ -171,6 +190,10 @@ export interface KnowledgeBaseTurnRecord {
   requestHash: string;
   status: KnowledgeBaseTurnStatus;
   upstreamTaskId: string | null;
+  dispatchState: KnowledgeBaseDispatchState;
+  failureClass: KnowledgeBaseFailureClass | null;
+  recoveryAction: KnowledgeBaseRecoveryAction | null;
+  canRegenerate: boolean;
   attachmentFileIds: string[];
   attachmentsFrozen: boolean;
   awaitingClientAttachments: boolean;
@@ -288,6 +311,8 @@ export interface ReserveKnowledgeBaseStartBuildInput {
   skillName: string;
   skillVersion: string;
   skillContentHash?: string | null;
+  /** Policy selected together with the immutable Skill before `/start`. */
+  treePolicyVersion?: KnowledgeBaseTreePolicyVersion;
   apiCredentialId?: string | null;
   userText?: string;
   userAttachmentCount?: number;
@@ -315,8 +340,6 @@ export interface ReserveKnowledgeBaseRetryTurnInput {
   expectedGeneration: number;
   expectedRevision: number;
   expectedLeafId: string | null;
-  /** Exact logical hash of the currently packaged v4 Skill. */
-  latestV4SkillContentHash?: string;
   now?: Date;
   leaseMs?: number;
 }
@@ -1046,6 +1069,7 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     );
   }
   const metadata = metadataOf(row);
+  const dispatchAuthority = knowledgeBaseTurnDispatchAuthority(row);
   return {
     id: row.id,
     userId: row.userId,
@@ -1061,6 +1085,7 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     requestHash: row.requestHash,
     status: row.status,
     upstreamTaskId: row.upstreamTaskId,
+    ...dispatchAuthority,
     attachmentFileIds: [...(row.attachmentFileIds ?? [])],
     attachmentsFrozen: metadata.attachmentsFrozen === true,
     awaitingClientAttachments: metadata.awaitingClientAttachments === true,
@@ -1073,6 +1098,100 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     completedAt: row.completedAt,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+function isKnowledgeBaseFailureClass(
+  value: unknown,
+): value is KnowledgeBaseFailureClass {
+  return [
+    "recoverable_same_turn",
+    "requires_user_fix",
+    "terminal_requires_regeneration",
+    "terminal_nonregenerable",
+  ].includes(String(value));
+}
+
+function isKnowledgeBaseRecoveryAction(
+  value: unknown,
+): value is KnowledgeBaseRecoveryAction {
+  return [
+    "wait",
+    "reconcile",
+    "top_up",
+    "update_credential",
+    "fix_attachments",
+    "reupload_logo",
+    "regenerate_turn",
+    "contact_support",
+  ].includes(String(value));
+}
+
+/** Derive a complete public receipt from durable row state and metadata. */
+export function knowledgeBaseTurnDispatchAuthority(
+  row: Pick<
+    ConversationTurn,
+    "status" | "upstreamTaskId" | "metadata" | "errorCode"
+  >,
+): {
+  dispatchState: KnowledgeBaseDispatchState;
+  failureClass: KnowledgeBaseFailureClass | null;
+  recoveryAction: KnowledgeBaseRecoveryAction | null;
+  canRegenerate: boolean;
+} {
+  const metadata = metadataOf(row as ConversationTurn);
+  if (row.status === "completed") {
+    return {
+      dispatchState: "completed",
+      failureClass: null,
+      recoveryAction: null,
+      canRegenerate: false,
+    };
+  }
+  if (row.status === "failed" || row.status === "cancelled") {
+    const storedFailureClass = isKnowledgeBaseFailureClass(
+      metadata.failureClass,
+    )
+      ? metadata.failureClass
+      : row.status === "cancelled"
+        ? "terminal_nonregenerable"
+        : row.upstreamTaskId
+          ? "terminal_requires_regeneration"
+          : "requires_user_fix";
+    const storedAction = isKnowledgeBaseRecoveryAction(metadata.recoveryAction)
+      ? metadata.recoveryAction
+      : storedFailureClass === "terminal_requires_regeneration"
+        ? "regenerate_turn"
+        : storedFailureClass === "terminal_nonregenerable"
+          ? "contact_support"
+          : "contact_support";
+    return {
+      dispatchState: "failed",
+      failureClass: storedFailureClass,
+      recoveryAction: storedAction,
+      canRegenerate:
+        storedFailureClass === "terminal_requires_regeneration" &&
+        metadata.canRegenerate !== false,
+    };
+  }
+  if (row.upstreamTaskId) {
+    return {
+      dispatchState: "bound",
+      failureClass: null,
+      recoveryAction: "wait",
+      canRegenerate: false,
+    };
+  }
+  const recovering =
+    metadata.dispatchState === "recovering" ||
+    Boolean(metadata.dispatchingAt) ||
+    Boolean(metadata.outcomeUnknownAt) ||
+    Boolean(metadata.preparedDispatch);
+  return {
+    dispatchState: recovering ? "recovering" : "reserved",
+    failureClass: recovering ? "recoverable_same_turn" : null,
+    recoveryAction: recovering ? "reconcile" : "wait",
+    canRegenerate: false,
   };
 }
 
@@ -2314,7 +2433,10 @@ async function reserveKnowledgeBaseTurnInTransaction(
     const decision = evaluateKnowledgeBaseTurnReplay(existing, identity, now);
     if (decision.state === "conflict") {
       throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
+        input.operationType === "start" &&
+        existing.clientRequestId === clientRequestId
+          ? "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH"
+          : "CONFLICT",
         "The request id or knowledge-base operation slot was already used for different content",
       );
     }
@@ -2455,6 +2577,10 @@ async function reserveKnowledgeBaseTurnInTransaction(
     ...(clientIntentHash ? { clientIntentHash } : {}),
     ...(expectedPresentationKey ? { expectedPresentationKey } : {}),
     recovery: sanitizeKnowledgeBaseRecoveryMetadata(input.recoveryMetadata),
+    dispatchState: "reserved",
+    failureClass: null,
+    recoveryAction: "wait",
+    canRegenerate: false,
   };
   const row: ConversationTurn = {
     id,
@@ -2550,6 +2676,193 @@ function pinnedStartPayload(
   };
 }
 
+function normalizeKnowledgeBaseStartAttachmentIdentities(
+  value: unknown,
+  name: string,
+) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      `${name} is invalid`,
+    );
+  }
+  const attachments = value.map((entry) => {
+    const record = retryAuthorityRecord(entry);
+    if (!record) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        `${name} is invalid`,
+      );
+    }
+    const rawFileId = String(record.file_id || "");
+    const fileId = normalizeRequiredId(
+      rawFileId,
+      "attachmentFileId",
+      MAX_ATTACHMENT_ID_LENGTH,
+    );
+    if (fileId !== rawFileId) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        `${name} contains a non-canonical attachment file id`,
+      );
+    }
+    return {
+      file_id: fileId,
+      filename: String(record.filename || ""),
+    };
+  });
+  normalizeAttachmentFileIds(
+    attachments.map((attachment) => attachment.file_id),
+  );
+  return attachments;
+}
+
+function knowledgeBaseStartAttachmentFileIds(
+  input: ReserveKnowledgeBaseStartBuildInput,
+) {
+  const requestAttachments = normalizeKnowledgeBaseStartAttachmentIdentities(
+    input.requestPayload.attachments,
+    "requestPayload.attachments",
+  );
+  const recoveryAttachments = normalizeKnowledgeBaseStartAttachmentIdentities(
+    input.recoveryMetadata.attachments,
+    "recoveryMetadata.attachments",
+  );
+  if (
+    hashKnowledgeBaseTurnRequest(requestAttachments) !==
+    hashKnowledgeBaseTurnRequest(recoveryAttachments)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Knowledge-base start attachment metadata is inconsistent",
+    );
+  }
+  const userAttachmentCount =
+    input.userAttachmentCount ?? requestAttachments.length;
+  assertInteger(userAttachmentCount, "userAttachmentCount", 0);
+  if (userAttachmentCount !== requestAttachments.length) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Knowledge-base start attachment count is inconsistent",
+    );
+  }
+  return requestAttachments.map((attachment) => attachment.file_id);
+}
+
+async function lockKnowledgeBaseStartAttachments(input: {
+  tx: any;
+  userId: number;
+  apiCredentialId: string | null;
+  conversationId: string;
+  attachmentFileIds: readonly string[];
+}) {
+  if (input.attachmentFileIds.length === 0) return [];
+  if (!input.apiCredentialId) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Knowledge-base start attachments require an available API credential",
+    );
+  }
+  const rows = (await input.tx
+    .select()
+    .from(upstreamResources)
+    .where(
+      and(
+        eq(upstreamResources.kind, "file"),
+        inArray(upstreamResources.upstreamId, input.attachmentFileIds),
+      ),
+    )
+    .limit(input.attachmentFileIds.length)
+    .for("update")) as UpstreamResource[];
+  const byFileId = new Map(
+    rows.map((resource) => [resource.upstreamId, resource] as const),
+  );
+  const orderedResources = input.attachmentFileIds.map((fileId) =>
+    byFileId.get(fileId),
+  );
+  const invalid = orderedResources.some(
+    (resource) =>
+      !resource ||
+      resource.userId !== input.userId ||
+      (resource.projectAssignmentId ?? null) !== null ||
+      resource.apiCredentialId !== input.apiCredentialId ||
+      resource.kind !== "file" ||
+      Boolean(resource.contentDeletedAt) ||
+      !(
+        resource.conversationId === null ||
+        resource.conversationId === input.conversationId
+      ),
+  );
+  if (invalid) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "One or more knowledge-base start attachments are unavailable, owned by another workspace, or already bound",
+    );
+  }
+  return orderedResources as UpstreamResource[];
+}
+
+async function bindKnowledgeBaseStartAttachments(input: {
+  tx: any;
+  userId: number;
+  apiCredentialId: string | null;
+  conversationId: string;
+  resources: readonly UpstreamResource[];
+}) {
+  if (input.resources.length === 0) return;
+  if (!input.apiCredentialId) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Knowledge-base start attachment credential was lost",
+    );
+  }
+  await input.tx
+    .update(upstreamResources)
+    .set({ conversationId: input.conversationId })
+    .where(
+      and(
+        inArray(
+          upstreamResources.id,
+          input.resources.map((resource) => resource.id),
+        ),
+        eq(upstreamResources.userId, input.userId),
+        isNull(upstreamResources.projectAssignmentId),
+        eq(upstreamResources.apiCredentialId, input.apiCredentialId),
+        eq(upstreamResources.kind, "file"),
+        isNull(upstreamResources.contentDeletedAt),
+        or(
+          isNull(upstreamResources.conversationId),
+          eq(upstreamResources.conversationId, input.conversationId),
+        ),
+      ),
+    );
+  const reboundRows = (await input.tx
+    .select()
+    .from(upstreamResources)
+    .where(
+      inArray(
+        upstreamResources.id,
+        input.resources.map((resource) => resource.id),
+      ),
+    )
+    .limit(input.resources.length)) as UpstreamResource[];
+  const reboundById = new Map(
+    reboundRows.map((resource) => [resource.id, resource] as const),
+  );
+  if (
+    input.resources.some(
+      (resource) =>
+        reboundById.get(resource.id)?.conversationId !== input.conversationId,
+    )
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Knowledge-base start attachments could not be bound atomically",
+    );
+  }
+}
+
 /**
  * The only entry point for a new build. The build, internal conversation and
  * first start turn commit together; any failure rolls all three back.
@@ -2578,15 +2891,39 @@ export async function reserveKnowledgeBaseStartBuild(
   const skillContentHash = input.skillContentHash
     ? normalizeRequiredId(input.skillContentHash, "skillContentHash", 64)
     : null;
+  const policyBinding =
+    input.treePolicyVersion === undefined
+      ? knowledgeBaseNewBuildPolicyBinding()
+      : {
+          treePolicyVersion: input.treePolicyVersion,
+          skillVersion: "4" as const,
+          skillContentHash: knowledgeBaseSkillContentHashForTreePolicy(
+            input.treePolicyVersion,
+          ),
+        };
+  if (
+    skillVersion !== policyBinding.skillVersion ||
+    skillContentHash !== policyBinding.skillContentHash
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "The new knowledge-base policy and immutable Skill binding do not match",
+    );
+  }
   const companyWebsite = String(input.companyWebsite || "").trim() || null;
   const now = input.now ?? new Date();
+  const startAttachmentFileIds = knowledgeBaseStartAttachmentFileIds(input);
+  const storedConversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    conversationId,
+  );
   const db = executor ?? (await requireDb());
 
   return db.transaction(async (tx: any) => {
-    // Global mutation lock order is credential -> current owner slot -> active
-    // reset tombstone -> retained reset tombstone -> build -> turn. Do this
-    // before the build insert so an old browser tab can never resurrect a
-    // conversation after an approved reset.
+    // Global mutation lock order is credential -> current owner slot -> start
+    // attachment ownership -> active reset tombstone -> retained reset
+    // tombstone -> build -> turn. Locking every requested upload here closes
+    // the discard/start race across processes and database replicas.
     const pinnedCredential = await lockKnowledgeBaseReservationCredential(
       tx,
       input.apiCredentialId ?? null,
@@ -2605,6 +2942,13 @@ export async function reserveKnowledgeBaseStartBuild(
         );
       }
     }
+    const startAttachmentResources = await lockKnowledgeBaseStartAttachments({
+      tx,
+      userId: input.userId,
+      apiCredentialId: input.apiCredentialId ?? null,
+      conversationId: storedConversationId,
+      attachmentFileIds: startAttachmentFileIds,
+    });
     const resetTombstone = (
       await tx
         .select({ id: knowledgeBaseConversationTombstones.id })
@@ -2660,6 +3004,7 @@ export async function reserveKnowledgeBaseStartBuild(
         skillName,
         skillVersion,
         skillContentHash,
+        treePolicyVersion: policyBinding.treePolicyVersion,
         status: "researching",
         generation: 1,
         stateEpoch: 0,
@@ -2751,6 +3096,19 @@ export async function reserveKnowledgeBaseStartBuild(
       },
       tx,
     );
+    if (reservation.turn.conversationId !== storedConversationId) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Knowledge-base start reservation belongs to another conversation",
+      );
+    }
+    await bindKnowledgeBaseStartAttachments({
+      tx,
+      userId: input.userId,
+      apiCredentialId: input.apiCredentialId ?? null,
+      conversationId: storedConversationId,
+      resources: startAttachmentResources,
+    });
     const committedBuild = (
       await tx
         .select()
@@ -2861,18 +3219,6 @@ export async function reserveKnowledgeBaseRetryTurn(
     128,
   );
   const expectedLeafId = normalizeOptionalLeafId(input.expectedLeafId);
-  const latestV4SkillContentHash = String(input.latestV4SkillContentHash || "")
-    .trim()
-    .toLowerCase();
-  if (
-    latestV4SkillContentHash &&
-    !/^[a-f0-9]{64}$/u.test(latestV4SkillContentHash)
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "INVALID_REQUEST",
-      "Current v4 Skill hash is invalid",
-    );
-  }
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
     // Discover the candidate historical credential without taking row locks,
@@ -2992,10 +3338,17 @@ export async function reserveKnowledgeBaseRetryTurn(
       operationType: source.operationType as KnowledgeBaseOperationType,
       finalPackageRequired: sourceState.recovery.finalPackageRequired === true,
     });
-    if (refreshFinalDelivery && !latestV4SkillContentHash) {
+    const buildSkillContentHash = String(build.skillContentHash || "")
+      .trim()
+      .toLowerCase();
+    if (
+      refreshFinalDelivery &&
+      (build.skillVersion !== "4" ||
+        !/^[a-f0-9]{64}$/u.test(buildSkillContentHash))
+    ) {
       throw new KnowledgeBaseTurnReservationError(
         "INVALID_REQUEST",
-        "Current v4 Skill hash is required for final-delivery retry",
+        "The build-bound v4 Skill hash is required for final-delivery retry",
       );
     }
     const sourceUserAttachmentCount = Array.isArray(
@@ -3012,11 +3365,10 @@ export async function reserveKnowledgeBaseRetryTurn(
       ...sourceState.recovery,
       ...(refreshFinalDelivery
         ? {
-            // A failed final delivery must pick up the current complete v4
-            // contract and a fresh server-owned finalization input bundle.
-            // Reusing the historical Skill/output attachment list would
-            // deterministically reproduce the same malformed ZIP.
-            skillContentHash: latestV4SkillContentHash,
+            // Rebuild the server-owned finalization input bundle, but retain
+            // the immutable Skill selected when this build was created. A
+            // policy-v1 retry must never be upgraded to the v2 depth contract.
+            skillContentHash: buildSkillContentHash,
             finalPackageRequired: true,
           }
         : {}),
@@ -3075,20 +3427,63 @@ export async function reserveKnowledgeBaseRetryTurn(
   });
 }
 
-async function lockedOwnedTurn(
+/**
+ * Lock one active turn using the global knowledge-base mutation order.
+ *
+ * The first read is deliberately non-locking: it only discovers the immutable
+ * build id. Authority is established after taking the build lock and then the
+ * turn lock. This prevents the former turn -> build inversion from deadlocking
+ * against conversation snapshot sync (build -> turn through the message FK).
+ */
+async function lockedOwnedTurnAndBuild(
   tx: any,
-  input: { userId: number; turnId: string },
+  input: { userId?: number; turnId: string },
+  options: { allowInactiveTurn?: boolean } = {},
 ) {
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const preliminaryRows = await tx
+    .select({
+      id: conversationTurns.id,
+      userId: conversationTurns.userId,
+      buildId: conversationTurns.buildId,
+    })
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.id, turnId),
+        ...(input.userId === undefined
+          ? []
+          : [eq(conversationTurns.userId, input.userId)]),
+      ),
+    )
+    .limit(1);
+  const preliminary = preliminaryRows[0] as
+    | { id: string; userId: number; buildId: string | null }
+    | undefined;
+  if (!preliminary?.buildId) {
+    throw new KnowledgeBaseTurnReservationError(
+      "RESERVATION_NOT_FOUND",
+      "Knowledge-base turn reservation was not found",
+    );
+  }
+
+  const buildRows = await tx
+    .select()
+    .from(knowledgeBaseBuilds)
+    .where(eq(knowledgeBaseBuilds.id, preliminary.buildId))
+    .limit(1)
+    .for("update");
+  const build = buildRows[0] as KnowledgeBaseBuild | undefined;
+
   const rows = await tx
     .select()
     .from(conversationTurns)
     .where(
       and(
-        eq(
-          conversationTurns.id,
-          normalizeRequiredId(input.turnId, "turnId", 36),
-        ),
-        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.id, turnId),
+        ...(input.userId === undefined
+          ? []
+          : [eq(conversationTurns.userId, input.userId)]),
       ),
     )
     .limit(1)
@@ -3100,7 +3495,19 @@ async function lockedOwnedTurn(
       "Knowledge-base turn reservation was not found",
     );
   }
-  return turn;
+  if (
+    !build ||
+    build.id !== turn.buildId ||
+    build.userId !== turn.userId ||
+    build.generation !== turn.buildGeneration ||
+    (!options.allowInactiveTurn && build.activeTurnId !== turn.id)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Knowledge-base turn is no longer authoritative",
+    );
+  }
+  return { turn, build };
 }
 
 function normalizeDeferredUserAttachments(
@@ -3164,8 +3571,7 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     input.clientAttachmentManifest,
   );
   const attachment = normalizeDeferredUserAttachments([input.attachment])[0]!;
-  const turn = await lockedOwnedTurn(tx, input);
-  await assertActiveBuild(tx, turn);
+  const { turn } = await lockedOwnedTurnAndBuild(tx, input);
   if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -3294,8 +3700,7 @@ async function claimKnowledgeBaseDeferredTurnDispatchInTransaction(
   const now = input.now ?? new Date();
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   assertInteger(leaseMs, "leaseMs", 1_000);
-  const turn = await lockedOwnedTurn(tx, input);
-  await assertActiveBuild(tx, turn);
+  const { turn } = await lockedOwnedTurnAndBuild(tx, input);
   if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -3478,34 +3883,6 @@ function assertLease(turn: ConversationTurn, leaseToken: string) {
   }
 }
 
-async function assertActiveBuild(tx: any, turn: ConversationTurn) {
-  if (!turn.buildId || turn.buildGeneration === null) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      "Knowledge-base turn is not bound to a build generation",
-    );
-  }
-  const rows = await tx
-    .select()
-    .from(knowledgeBaseBuilds)
-    .where(eq(knowledgeBaseBuilds.id, turn.buildId))
-    .limit(1)
-    .for("update");
-  const build = rows[0] as KnowledgeBaseBuild | undefined;
-  if (
-    !build ||
-    build.userId !== turn.userId ||
-    build.generation !== turn.buildGeneration ||
-    build.activeTurnId !== turn.id
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      "Knowledge-base turn is no longer authoritative",
-    );
-  }
-  return build;
-}
-
 /**
  * Persist the generated-file operation before the first provider POST. The
  * actual provider key is deterministically re-derived and only its hash is
@@ -3530,9 +3907,8 @@ export async function reserveKnowledgeBaseGeneratedAttachment(
   const normalized = normalizeGeneratedAttachmentInput(input);
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const metadata = metadataOf(turn);
     const expectedCount = Number(metadata.expectedAttachmentCount ?? 0);
     if (
@@ -3632,8 +4008,9 @@ export async function reserveKnowledgeBaseGeneratedAttachment(
 
 /**
  * Bind the provider file id, ordered attachment ledger and cleanup ownership in
- * one transaction before uploading bytes. A crash after this commit is safely
- * recoverable by looking up a fresh signed upload URL for the same file id.
+ * one transaction before uploading bytes. A crash after this commit is
+ * reconciled against the same provider file id and its authenticated content;
+ * the provider does not promise a refreshed upload URL from file metadata.
  */
 export async function completeKnowledgeBaseGeneratedAttachment(
   input: {
@@ -3673,9 +4050,8 @@ export async function completeKnowledgeBaseGeneratedAttachment(
   }
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     if (!turn.apiCredentialId) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
@@ -3988,9 +4364,8 @@ export async function stageKnowledgeBaseTurnAttachments(
   const db = executor ?? (await requireDb());
   const nextIds = normalizeAttachmentFileIds(input.attachmentFileIds);
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const metadata = metadataOf(turn);
     const existing = [...(turn.attachmentFileIds ?? [])];
     assertAttachmentPrefix(existing, nextIds);
@@ -4033,9 +4408,8 @@ export async function freezeKnowledgeBaseTurnAttachments(
   const db = executor ?? (await requireDb());
   const nextIds = normalizeAttachmentFileIds(input.attachmentFileIds);
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const metadata = metadataOf(turn);
     const existing = [...(turn.attachmentFileIds ?? [])];
     assertAttachmentPrefix(existing, nextIds);
@@ -4158,9 +4532,8 @@ export async function prepareKnowledgeBaseTurnDispatch(
     : undefined;
 
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const metadata = metadataOf(turn);
     if (metadata.attachmentsFrozen !== true) {
       throw new KnowledgeBaseTurnReservationError(
@@ -4237,9 +4610,8 @@ export async function markKnowledgeBaseTurnDispatching(
 ) {
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const metadata = metadataOf(turn);
     if (metadata.attachmentsFrozen !== true) {
       throw new KnowledgeBaseTurnReservationError(
@@ -4254,6 +4626,10 @@ export async function markKnowledgeBaseTurnDispatching(
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadata,
       dispatchingAt: now.toISOString(),
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
     };
     await tx
       .update(conversationTurns)
@@ -4300,9 +4676,8 @@ export async function bindKnowledgeBaseTurnUpstreamTask(
     255,
   );
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    const build = await assertActiveBuild(tx, turn);
     if (metadataOf(turn).attachmentsFrozen !== true) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
@@ -4316,6 +4691,13 @@ export async function bindKnowledgeBaseTurnUpstreamTask(
       );
     }
     const now = input.now ?? new Date();
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadataOf(turn),
+      dispatchState: "bound",
+      failureClass: null,
+      recoveryAction: "wait",
+      canRegenerate: false,
+    };
     await tx
       .update(conversationTurns)
       .set({
@@ -4324,6 +4706,7 @@ export async function bindKnowledgeBaseTurnUpstreamTask(
         startedAt: turn.startedAt ?? now,
         errorCode: null,
         errorMessage: null,
+        metadata: nextMetadata,
         updatedAt: now,
       })
       .where(eq(conversationTurns.id, turn.id));
@@ -4350,6 +4733,7 @@ export async function bindKnowledgeBaseTurnUpstreamTask(
       startedAt: turn.startedAt ?? now,
       errorCode: null,
       errorMessage: null,
+      metadata: nextMetadata,
       updatedAt: now,
     });
   });
@@ -4372,9 +4756,8 @@ export async function markKnowledgeBaseTurnOutcomeUnknown(
 ) {
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const now = input.now ?? new Date();
     const recoveryDelayMs = input.recoveryDelayMs ?? 30_000;
     assertInteger(recoveryDelayMs, "recoveryDelayMs", 1_000);
@@ -4385,6 +4768,10 @@ export async function markKnowledgeBaseTurnOutcomeUnknown(
       outcomeUnknownCode: String(
         input.code || "UPSTREAM_OUTCOME_UNKNOWN",
       ).slice(0, 128),
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
     };
     await tx
       .update(conversationTurns)
@@ -4435,7 +4822,9 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
     );
   }
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input, {
+      allowInactiveTurn: true,
+    });
     const metadata = metadataOf(turn);
     if (
       turn.status === "cancelled" &&
@@ -4454,7 +4843,6 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
         "The upload turn was already cancelled by another request",
       );
     }
-    const build = await assertActiveBuild(tx, turn);
     if (
       (input.clientRequestId &&
         turn.clientRequestId !== input.clientRequestId) ||
@@ -4490,6 +4878,12 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
       awaitingClientAttachments: false,
       unpreparedCancellation: true,
       cancelledOperationKey,
+      dispatchState: "failed",
+      failureClass: "requires_user_fix",
+      recoveryAction: code.includes("LOGO")
+        ? "reupload_logo"
+        : "fix_attachments",
+      canRegenerate: false,
     };
     await tx
       .update(knowledgeBaseBuilds)
@@ -4985,11 +5379,11 @@ export async function rejectAcknowledgedKnowledgeBaseManualLogoTurn(
 /**
  * Settles a provider rejection which proves that no usable task was created.
  *
- * Unlike an ambiguous timeout, a deterministic HTTP rejection (or a 2xx
- * response without a task id) must not keep an active reservation recoverable
- * forever. The failed turn remains the authoritative retry source, including
- * its frozen attachments and prepared request body, while the build exposes
- * one stable retryable notice.
+ * Unlike an ambiguous timeout or a 2xx response without a task id, a proven
+ * provider rejection must not keep an active reservation recoverable forever.
+ * The failed turn remains the authoritative recovery source, including its
+ * frozen attachments and prepared request body, while the build exposes one
+ * stable action-specific notice.
  */
 export async function failKnowledgeBaseTurnDeterministically(
   input: {
@@ -4998,6 +5392,9 @@ export async function failKnowledgeBaseTurnDeterministically(
     leaseToken: string;
     code: string;
     message: string;
+    failureClass?: KnowledgeBaseFailureClass;
+    recoveryAction?: KnowledgeBaseRecoveryAction;
+    canRegenerate?: boolean;
     now?: Date;
   },
   executor?: any,
@@ -5014,7 +5411,7 @@ export async function failKnowledgeBaseTurnDeterministically(
     );
   }
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
     const metadata = metadataOf(turn);
     if (metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken)) {
       throw new KnowledgeBaseTurnReservationError(
@@ -5023,7 +5420,6 @@ export async function failKnowledgeBaseTurnDeterministically(
         1_000,
       );
     }
-    const build = await assertActiveBuild(tx, turn);
 
     // A lost HTTP response from this persistence call may cause its exact
     // handler to run twice. Do not advance stateEpoch or conversation.version
@@ -5050,6 +5446,27 @@ export async function failKnowledgeBaseTurnDeterministically(
       outcomeUnknownCode: _outcomeUnknownCode,
       ...settledMetadata
     } = metadata;
+    const failureClass =
+      input.failureClass ??
+      (turn.upstreamTaskId
+        ? "terminal_requires_regeneration"
+        : "requires_user_fix");
+    const recoveryAction =
+      input.recoveryAction ??
+      (failureClass === "terminal_requires_regeneration"
+        ? "regenerate_turn"
+        : failureClass === "requires_user_fix"
+          ? "contact_support"
+          : "contact_support");
+    const failedMetadata: KnowledgeBaseTurnMetadata = {
+      ...settledMetadata,
+      dispatchState: "failed",
+      failureClass,
+      recoveryAction,
+      canRegenerate:
+        failureClass === "terminal_requires_regeneration" &&
+        input.canRegenerate !== false,
+    };
     await tx
       .update(knowledgeBaseBuilds)
       .set({
@@ -5076,7 +5493,7 @@ export async function failKnowledgeBaseTurnDeterministically(
         errorMessage: message,
         completedAt: now,
         leaseExpiresAt: null,
-        metadata: settledMetadata,
+        metadata: failedMetadata,
         updatedAt: now,
       })
       .where(eq(conversationTurns.id, turn.id));
@@ -5095,7 +5512,7 @@ export async function failKnowledgeBaseTurnDeterministically(
         errorMessage: message,
         completedAt: now,
         leaseExpiresAt: null,
-        metadata: settledMetadata,
+        metadata: failedMetadata,
         updatedAt: now,
       }),
       deduplicated: false,
@@ -5115,9 +5532,8 @@ export async function renewKnowledgeBaseTurnLease(
 ) {
   const db = executor ?? (await requireDb());
   return db.transaction(async (tx: any) => {
-    const turn = await lockedOwnedTurn(tx, input);
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
-    await assertActiveBuild(tx, turn);
     const now = input.now ?? new Date();
     const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
     assertInteger(leaseMs, "leaseMs", 1_000);
@@ -5189,22 +5605,25 @@ export async function claimKnowledgeBaseTurnForRecovery(
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   assertInteger(leaseMs, "leaseMs", 1_000);
   return db.transaction(async (tx: any) => {
-    const rows = await tx
-      .select()
-      .from(conversationTurns)
-      .where(eq(conversationTurns.id, turnId))
-      .limit(1)
-      .for("update");
-    const turn = rows[0] as ConversationTurn | undefined;
+    let turn: ConversationTurn;
+    try {
+      ({ turn } = await lockedOwnedTurnAndBuild(tx, { turnId }));
+    } catch (error) {
+      if (
+        error instanceof KnowledgeBaseTurnReservationError &&
+        (error.code === "RESERVATION_NOT_FOUND" || error.code === "CONFLICT")
+      ) {
+        return null;
+      }
+      throw error;
+    }
     if (
-      !turn ||
       (turn.status !== "queued" && turn.status !== "running") ||
       metadataOf(turn).awaitingClientAttachments === true ||
       (turn.leaseExpiresAt && turn.leaseExpiresAt.getTime() > now.getTime())
     ) {
       return null;
     }
-    await assertActiveBuild(tx, turn);
     const leaseToken = randomUUID();
     const leaseExpiresAt = new Date(now.getTime() + leaseMs);
     const metadata: KnowledgeBaseTurnMetadata = {
@@ -5231,6 +5650,419 @@ export async function claimKnowledgeBaseTurnForRecovery(
         metadata.recovery,
       ),
       preparedDispatch: metadata.preparedDispatch ?? null,
+    };
+  });
+}
+
+/**
+ * Continue the exact logical reservation after a pre-create user-fix failure.
+ * No new turn, operation key, request hash, prepared body, or idempotency key
+ * is created. The repaired credential may replace the retired credential row,
+ * but every other request coordinate remains immutable.
+ */
+export async function resumeKnowledgeBaseTurnAfterUserFix(
+  input: {
+    userId: number;
+    turnId: string;
+    apiCredentialId: string;
+    now?: Date;
+    leaseMs?: number;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseRecoveryClaim | null> {
+  const db = executor ?? (await requireDb());
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const apiCredentialId = normalizeRequiredId(
+    input.apiCredentialId,
+    "apiCredentialId",
+    36,
+  );
+  const now = input.now ?? new Date();
+  const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
+  assertInteger(leaseMs, "leaseMs", 1_000);
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, {
+      userId: input.userId,
+      turnId,
+    });
+    const metadata = metadataOf(turn);
+    const recoveryAction = metadata.recoveryAction;
+    if (
+      turn.status !== "failed" ||
+      turn.upstreamTaskId ||
+      build.status !== "protocol_error" ||
+      build.activeTurnId !== turn.id ||
+      metadata.failureClass !== "requires_user_fix" ||
+      (recoveryAction !== "top_up" && recoveryAction !== "update_credential") ||
+      metadata.attachmentsFrozen !== true ||
+      !metadata.preparedDispatch ||
+      !metadata.recovery
+    ) {
+      return null;
+    }
+    const credential = (
+      await tx
+        .select({ id: apiCredentials.id })
+        .from(apiCredentials)
+        .where(
+          and(
+            eq(apiCredentials.id, apiCredentialId),
+            eq(apiCredentials.userId, input.userId),
+            eq(apiCredentials.status, "active"),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (!credential) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "修复后的 API 凭证不可用",
+      );
+    }
+
+    const leaseToken = randomUUID();
+    const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      leaseOwnerHash: leaseOwnerHash(leaseToken),
+      dispatchingAt: now.toISOString(),
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
+    };
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status:
+          turn.operationType === "start" ||
+          (turn.operationType === "retry" &&
+            metadata.recovery !== null &&
+            typeof metadata.recovery === "object" &&
+            !Array.isArray(metadata.recovery) &&
+            metadata.recovery.kind === "start")
+            ? "researching"
+            : "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        protocolErrorCode: null,
+        protocolError: null,
+        awaitingResponseSince: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        apiCredentialId,
+        status: "running",
+        errorCode: null,
+        errorMessage: null,
+        completedAt: null,
+        startedAt: turn.startedAt ?? now,
+        leaseExpiresAt,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    const conversation = (
+      await tx
+        .select()
+        .from(conversations)
+        .where(
+          and(
+            eq(conversations.id, turn.conversationId),
+            eq(conversations.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (conversation) {
+      await tx
+        .update(conversations)
+        .set({
+          apiCredentialId,
+          status: "running",
+          version: conversation.version + 1,
+          completedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(conversations.id, turn.conversationId),
+            eq(conversations.userId, input.userId),
+            eq(conversations.version, conversation.version),
+          ),
+        );
+    }
+    return {
+      turn: turnRecord({
+        ...turn,
+        apiCredentialId,
+        status: "running",
+        errorCode: null,
+        errorMessage: null,
+        completedAt: null,
+        startedAt: turn.startedAt ?? now,
+        leaseExpiresAt,
+        metadata: nextMetadata,
+        updatedAt: now,
+      }),
+      leaseToken,
+      leaseExpiresAt,
+      upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
+        String(turn.operationKey),
+      ),
+      recoveryMetadata: sanitizeKnowledgeBaseRecoveryMetadata(
+        metadata.recovery,
+      ),
+      preparedDispatch: metadata.preparedDispatch,
+    };
+  });
+}
+
+/**
+ * Replace a provider-rejected attachment set without generating a new logical
+ * turn. The provider proved that no task was created (for example HTTP 413),
+ * so the same operation can safely rebuild its local files and make exactly
+ * one new create attempt. A replay with the same repair request is a no-op.
+ */
+export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
+  input: {
+    userId: number;
+    turnId: string;
+    apiCredentialId: string;
+    clientRequestId: string;
+    attachments: Array<{ file_id: string; filename: string }>;
+    attachmentManifest: unknown[];
+    now?: Date;
+    leaseMs?: number;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseRecoveryClaim | null> {
+  const db = executor ?? (await requireDb());
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const apiCredentialId = normalizeRequiredId(
+    input.apiCredentialId,
+    "apiCredentialId",
+    36,
+  );
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const attachments = input.attachments.map((attachment) => ({
+    file_id: normalizeRequiredId(
+      attachment.file_id,
+      "replacement attachment file id",
+      MAX_ATTACHMENT_ID_LENGTH,
+    ),
+    filename: normalizeRequiredId(
+      String(attachment.filename || "").replace(/[\\/\0]/gu, "_"),
+      "replacement attachment filename",
+      512,
+    ),
+  }));
+  if (
+    attachments.length === 0 ||
+    attachments.length > MAX_USER_ATTACHMENT_COUNT
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Replacement attachments are required",
+    );
+  }
+  const requestHash = hashKnowledgeBaseTurnRequest({
+    attachments,
+    attachmentManifest: input.attachmentManifest,
+  });
+  const now = input.now ?? new Date();
+  const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
+  assertInteger(leaseMs, "leaseMs", 1_000);
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, {
+      userId: input.userId,
+      turnId,
+    });
+    const metadata = metadataOf(turn);
+    if (
+      metadata.attachmentRepair?.clientRequestId === clientRequestId &&
+      metadata.attachmentRepair.requestHash === requestHash
+    ) {
+      return null;
+    }
+    if (
+      turn.status !== "failed" ||
+      turn.upstreamTaskId ||
+      build.status !== "protocol_error" ||
+      build.activeTurnId !== turn.id ||
+      metadata.failureClass !== "requires_user_fix" ||
+      metadata.recoveryAction !== "fix_attachments" ||
+      !metadata.recovery
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "当前失败轮次不接受附件替换",
+      );
+    }
+    const credential = (
+      await tx
+        .select({ id: apiCredentials.id })
+        .from(apiCredentials)
+        .where(
+          and(
+            eq(apiCredentials.id, apiCredentialId),
+            eq(apiCredentials.userId, input.userId),
+            eq(apiCredentials.status, "active"),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (!credential) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "当前 API 凭证不可用于附件替换",
+      );
+    }
+    const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
+      ...metadata.recovery,
+      attachments,
+      attachmentManifest: input.attachmentManifest,
+    });
+    const deferredClientAttachments =
+      recovery.deferredClientAttachments === true;
+    const generatedAttachmentCount =
+      recovery.kind === "start" && recovery.includePrefill === true ? 3 : 2;
+    const expectedAttachmentCount =
+      attachments.length + generatedAttachmentCount;
+    const leaseToken = randomUUID();
+    const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      attachmentsFrozen: false,
+      expectedAttachmentCount,
+      userAttachmentCount: attachments.length,
+      awaitingClientAttachments: false,
+      clientStagedAttachments: deferredClientAttachments
+        ? attachments.map((attachment, index) => ({ index, ...attachment }))
+        : undefined,
+      clientAttachmentManifestHash: deferredClientAttachments
+        ? hashKnowledgeBaseTurnRequest(input.attachmentManifest)
+        : metadata.clientAttachmentManifestHash,
+      recovery,
+      preparedDispatch: undefined,
+      generatedAttachmentReservations: {},
+      outcomeUnknownAt: undefined,
+      outcomeUnknownCode: undefined,
+      leaseOwnerHash: leaseOwnerHash(leaseToken),
+      dispatchingAt: now.toISOString(),
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
+      attachmentRepair: {
+        clientRequestId,
+        requestHash,
+        sourceErrorCode: turn.errorCode,
+        replacedAt: now.toISOString(),
+      },
+    };
+    const stagedReplacementIds = deferredClientAttachments
+      ? attachments.map((attachment) => attachment.file_id)
+      : [];
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: recovery.kind === "start" ? "researching" : "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        protocolErrorCode: null,
+        protocolError: null,
+        awaitingResponseSince: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        apiCredentialId,
+        attachmentFileIds: stagedReplacementIds,
+        status: "running",
+        errorCode: null,
+        errorMessage: null,
+        completedAt: null,
+        startedAt: turn.startedAt ?? now,
+        leaseExpiresAt,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    const conversation = (
+      await tx
+        .select()
+        .from(conversations)
+        .where(
+          and(
+            eq(conversations.id, turn.conversationId),
+            eq(conversations.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (conversation) {
+      await tx
+        .update(conversations)
+        .set({
+          apiCredentialId,
+          status: "running",
+          version: conversation.version + 1,
+          completedAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(conversations.id, turn.conversationId),
+            eq(conversations.userId, input.userId),
+            eq(conversations.version, conversation.version),
+          ),
+        );
+    }
+    return {
+      turn: turnRecord({
+        ...turn,
+        apiCredentialId,
+        attachmentFileIds: stagedReplacementIds,
+        status: "running",
+        errorCode: null,
+        errorMessage: null,
+        completedAt: null,
+        startedAt: turn.startedAt ?? now,
+        leaseExpiresAt,
+        metadata: nextMetadata,
+        updatedAt: now,
+      }),
+      leaseToken,
+      leaseExpiresAt,
+      upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
+        String(turn.operationKey),
+      ),
+      recoveryMetadata: recovery,
+      preparedDispatch: null,
     };
   });
 }

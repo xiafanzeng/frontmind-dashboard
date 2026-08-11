@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   apiCredentials,
   apiKeyOwnership,
+  attachments,
   conversationTurns,
   deliveryRedirectPreviews,
   deliveryTicketAttachments,
@@ -19,6 +20,7 @@ import {
   assertAdminHasNoHistoricalCredentialResources,
   assertAdminHasNoUsageOwnedUsers,
   credentialsUseSameUpstreamApiKey,
+  discardUnboundUpstreamFileInTransaction,
   deleteActiveApiCredentialInTransaction,
   deleteManagedUser,
   decryptApiKey,
@@ -784,6 +786,193 @@ describe("API credential encryption", () => {
     expect(inserted).toHaveLength(1);
     expect(inserted[0]).toMatchObject({ version: 5, status: "deleted" });
   });
+
+  it("transactionally discards only an owned unbound file and uses its frozen credential", async () => {
+    const credentialId = randomUUID();
+    const apiKey = "sk-bound-file-discard";
+    const encrypted = encryptApiKey(42, credentialId, apiKey);
+    const row = {
+      resource: {
+        id: randomUUID(),
+        userId: 42,
+        apiCredentialId: credentialId,
+        projectAssignmentId: null,
+        kind: "file",
+        upstreamId: "file-unbound",
+        conversationId: null,
+      },
+      credential: {
+        id: credentialId,
+        userId: 42,
+        version: 3,
+        status: "active",
+        ...encrypted,
+      },
+    };
+    const deleteWhere = vi.fn().mockResolvedValue(undefined);
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === upstreamResources) {
+            return {
+              innerJoin: vi.fn(() => ({
+                where: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([row]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === attachments || table === conversationTurns) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn().mockResolvedValue([]),
+              })),
+            };
+          }
+          if (
+            table === deliveryTicketAttachments ||
+            table === deliveryRedirectPreviews ||
+            table === knowledgeBaseBuilds
+          ) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn().mockResolvedValue([]),
+              })),
+            };
+          }
+          throw new Error("unexpected table");
+        }),
+      })),
+      delete: vi.fn((table) => {
+        expect(table).toBe(upstreamResources);
+        return { where: deleteWhere };
+      }),
+    };
+    const discard = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      discardUnboundUpstreamFileInTransaction({
+        executor,
+        userId: 42,
+        fileId: "file-unbound",
+        discard,
+      }),
+    ).resolves.toEqual({ discarded: true });
+    expect(discard).toHaveBeenCalledWith({
+      fileId: "file-unbound",
+      userId: 42,
+      projectAssignmentId: null,
+      apiCredentialId: credentialId,
+      apiKey,
+    });
+    expect(deleteWhere).toHaveBeenCalledTimes(1);
+    expect(executor.select).toHaveBeenCalledTimes(6);
+  });
+
+  it.each([
+    ["conversation binding", "conversation-1", [], [], []],
+    ["live attachment", null, [{ id: "attachment-1" }], [], []],
+    ["knowledge turn", null, [], [{ id: "turn-1" }], []],
+    ["knowledge package", null, [], [], [{ id: "build-1" }]],
+  ])(
+    "refuses discard when an owned file has a %s",
+    async (
+      _label,
+      conversationId,
+      attachmentRows,
+      turnRows,
+      knowledgeBuildRows,
+    ) => {
+      const credentialId = randomUUID();
+      const encrypted = encryptApiKey(
+        42,
+        credentialId,
+        "sk-bound-file-reference",
+      );
+      const row = {
+        resource: {
+          id: randomUUID(),
+          userId: 42,
+          apiCredentialId: credentialId,
+          projectAssignmentId: null,
+          kind: "file",
+          upstreamId: "file-referenced",
+          conversationId,
+        },
+        credential: {
+          id: credentialId,
+          userId: 42,
+          version: 1,
+          status: "active",
+          ...encrypted,
+        },
+      };
+      const executor = {
+        select: vi.fn(() => ({
+          from: vi.fn((table) => {
+            if (table === upstreamResources) {
+              return {
+                innerJoin: vi.fn(() => ({
+                  where: vi.fn(() => ({
+                    limit: vi.fn(() => ({
+                      for: vi.fn().mockResolvedValue([row]),
+                    })),
+                  })),
+                })),
+              };
+            }
+            if (table === attachments) {
+              return {
+                where: vi.fn(() => ({
+                  limit: vi.fn().mockResolvedValue(attachmentRows),
+                })),
+              };
+            }
+            if (table === conversationTurns) {
+              return {
+                where: vi.fn(() => ({
+                  limit: vi.fn().mockResolvedValue(turnRows),
+                })),
+              };
+            }
+            if (
+              table === deliveryTicketAttachments ||
+              table === deliveryRedirectPreviews
+            ) {
+              return {
+                where: vi.fn(() => ({
+                  limit: vi.fn().mockResolvedValue([]),
+                })),
+              };
+            }
+            if (table === knowledgeBaseBuilds) {
+              return {
+                where: vi.fn(() => ({
+                  limit: vi.fn().mockResolvedValue(knowledgeBuildRows),
+                })),
+              };
+            }
+            throw new Error("unexpected table");
+          }),
+        })),
+        delete: vi.fn(),
+      };
+      const discard = vi.fn();
+
+      await expect(
+        discardUnboundUpstreamFileInTransaction({
+          executor,
+          userId: 42,
+          fileId: "file-referenced",
+          discard,
+        }),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(discard).not.toHaveBeenCalled();
+      expect(executor.delete).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed when the encryption key is missing or malformed", () => {
     delete process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;

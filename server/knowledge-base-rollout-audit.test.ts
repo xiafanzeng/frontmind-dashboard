@@ -35,6 +35,8 @@ function buildFixture(
     skillName: "socratic-kb-builder",
     skillVersion: "4",
     skillContentHash: "c".repeat(64),
+    treePolicyVersion: 1,
+    initialResearchCoverage: null,
     status: "confirming",
     generation: 1,
     stateEpoch: 2,

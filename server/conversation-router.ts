@@ -1,5 +1,5 @@
 import { TRPCError } from "@trpc/server";
-import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -1638,6 +1638,26 @@ export function isServerOwnedKnowledgeBaseMessage(
   return message.knowledgeBase?.serverOwned === true;
 }
 
+export function assignBrowserOwnedSnapshotMessageSequences(
+  snapshotMessages: readonly SnapshotMessage[],
+  persistedSequenceByPublicMessageId: ReadonlyMap<string, number>,
+) {
+  let nextSequence = Math.max(
+    0,
+    ...[...persistedSequenceByPublicMessageId.values()].map(
+      (sequence) => sequence + 1,
+    ),
+  );
+  return snapshotMessages.flatMap((message) => {
+    if (isServerOwnedKnowledgeBaseMessage(message)) return [];
+    const persistedSequence = persistedSequenceByPublicMessageId.get(
+      message.id,
+    );
+    const sequence = persistedSequence ?? nextSequence++;
+    return [{ message, sequence }];
+  });
+}
+
 /**
  * Browser snapshots may echo server messages, but they can never originate
  * them. Echoes are recovered from the locked database copy during merge; a
@@ -1855,7 +1875,7 @@ export function mergeConversationMessages(
   ];
 }
 
-async function persistSnapshot(
+export async function persistSnapshot(
   executor: any,
   userId: number,
   snapshot: ConversationSnapshot,
@@ -1994,6 +2014,8 @@ async function persistSnapshot(
   }
   if (existing && options.skipExisting) return "skipped";
 
+  let preservedServerOwnedMessageIds: string[] = [];
+  const persistedSequenceByPublicMessageId = new Map<string, number>();
   if (existing) {
     const persistedMessages = await loadPersistedMessages(
       executor,
@@ -2001,6 +2023,18 @@ async function persistSnapshot(
       persistedConversationId,
       projectAssignmentId,
     );
+    for (const message of persistedMessages) {
+      if (
+        Number.isSafeInteger(message.serverSequence) &&
+        Number(message.serverSequence) >= 0
+      ) {
+        const sequence = Number(message.serverSequence);
+        persistedSequenceByPublicMessageId.set(message.id, sequence);
+      }
+    }
+    preservedServerOwnedMessageIds = persistedMessages
+      .filter(isServerOwnedKnowledgeBaseMessage)
+      .map((message) => storageId(userId, message.id, projectAssignmentId));
     const deletedMessageIds = sanitizeKnowledgeBaseDeletionTombstones(
       persistedMessages,
       snapshot.messages,
@@ -2166,15 +2200,28 @@ async function persistSnapshot(
         ).map((turn: { id: string }) => turn.id),
   );
 
-  // A snapshot is authoritative for this conversation. Replacing children also
-  // removes stale polling placeholders and preserves manual-delete tombstones on
-  // the parent conversation.
+  // Browser snapshots own only ordinary browser messages. Knowledge-base user
+  // turns and presentations are written by the server state machine and may
+  // carry a turn FK; deleting/reinserting them here used to invert the
+  // build -> turn lock order and could deadlock an accepted dispatch.
   await executor
     .delete(messages)
-    .where(eq(messages.conversationId, persistedConversationId));
+    .where(
+      and(
+        eq(messages.conversationId, persistedConversationId),
+        ...(preservedServerOwnedMessageIds.length > 0
+          ? [notInArray(messages.id, preservedServerOwnedMessageIds)]
+          : []),
+      ),
+    );
 
-  for (let sequence = 0; sequence < snapshot.messages.length; sequence += 1) {
-    const message = snapshot.messages[sequence];
+  for (const {
+    message,
+    sequence,
+  } of assignBrowserOwnedSnapshotMessageSequences(
+    snapshot.messages,
+    persistedSequenceByPublicMessageId,
+  )) {
     const sentAt = asDate(message.timestamp) ?? new Date();
     await executor.insert(messages).values({
       id: storageId(userId, message.id, projectAssignmentId),

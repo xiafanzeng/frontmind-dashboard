@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
+import {
+  parseExactJson,
+  repairStructuredJsonCandidate,
+} from "./model-output-repair";
+
 const supplementRecordSchema = z
   .object({
     kind: z.enum(["overview", "evidence", "report", "index"]),
@@ -63,7 +68,7 @@ function scanJsonValue(text: string, start: number, depth = 0): number {
         throw new Error("FINALIZATION_SUPPLEMENT_JSON_INVALID");
       const keyStart = index;
       index = scanJsonValue(text, index);
-      const key = JSON.parse(text.slice(keyStart, index)) as string;
+      const key = parseExactJson(text.slice(keyStart, index)) as string;
       if (keys.has(key))
         throw new Error(`FINALIZATION_SUPPLEMENT_DUPLICATE_KEY:${key}`);
       keys.add(key);
@@ -82,11 +87,31 @@ function scanJsonValue(text: string, start: number, depth = 0): number {
   return index;
 }
 
-function parseStrictJsonLine(line: string) {
+function assertOneBoundedJsonValue(line: string) {
   const end = scanJsonValue(line, 0);
-  if (line.slice(end).trim())
+  if (line.slice(end).trim()) {
     throw new Error("FINALIZATION_SUPPLEMENT_JSON_TRAILING_DATA");
-  return JSON.parse(line) as unknown;
+  }
+}
+
+function parseStrictJsonLine(line: string) {
+  try {
+    assertOneBoundedJsonValue(line);
+    return parseExactJson(line) as unknown;
+  } catch (exactError) {
+    try {
+      const repaired = repairStructuredJsonCandidate(line, {
+        fenceLanguages: ["", "json"],
+        // These values are checked again against the package projection. No
+        // syntax repair may normalize, alias or coerce their identity.
+        identityKeys: ["kind", "id", "branchId", "sourceIds", "assetIds"],
+      });
+      assertOneBoundedJsonValue(repaired.normalizedText);
+      return repaired.value;
+    } catch {
+      throw exactError;
+    }
+  }
 }
 
 function stableRecord(record: FinalizationSupplementRecord) {

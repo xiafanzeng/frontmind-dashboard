@@ -19,6 +19,10 @@ import {
   type OutputMessage,
 } from "@/lib/frontmind-api";
 import { normalizeKnowledgeCollectionCopy } from "@shared/knowledge-base-copy";
+import type {
+  KnowledgeBaseFailureClass,
+  KnowledgeBaseRecoveryAction,
+} from "@shared/knowledge-base-progress";
 import {
   knowledgeBasePresentationMessagePublicId,
   knowledgeBaseUserMessagePublicId,
@@ -29,6 +33,7 @@ import {
 } from "@shared/knowledge-base-output";
 import { uniquifyOrderedIds } from "@shared/ordered-id";
 import {
+  dispatchKnowledgeBaseProgressUpdated,
   reconcileKnowledgeBaseObservation,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
@@ -121,6 +126,9 @@ export interface KnowledgeBaseClientNotice {
   message: string;
   severity: "info" | "warning" | "error";
   retryable: boolean;
+  failureClass?: KnowledgeBaseFailureClass | null;
+  recoveryAction?: KnowledgeBaseRecoveryAction | null;
+  canRegenerate?: boolean;
   turnId?: string | null;
 }
 
@@ -704,23 +712,11 @@ function knowledgeObservationIsStale(
   if (observation.generation < current.generation) return true;
   if (observation.generation > current.generation) return false;
   if (observation.stateEpoch < current.stateEpoch) return true;
-  if (observation.stateEpoch > current.stateEpoch) return false;
-
-  const incomingTurnId = observationActiveTurnId(observation);
-  if (
-    current.activeTurnId &&
-    incomingTurnId &&
-    current.activeTurnId !== incomingTurnId
-  ) {
-    return true;
-  }
-  return (
-    current.activeTurnId === incomingTurnId &&
-    current.interactionState === observation.interaction.interactionState &&
-    current.presentationKey ===
-      (observation.approvedPresentation?.presentationKey ?? null) &&
-    current.notice?.errorKey === (observation.notice?.key ?? undefined)
-  );
+  // A same-coordinate observation is still authoritative. It must be allowed
+  // to repair optimistic browser-only state (for example running ->
+  // awaiting_input after a 422) even when the durable build itself did not
+  // advance stateEpoch. Only a strictly older monotonic coordinate is stale.
+  return false;
 }
 
 function observationPrecedesPersistedKnowledgeBaseHistory(
@@ -959,7 +955,19 @@ export function applyKnowledgeBaseObservation(
     );
     if (existingPresentationIndex >= 0) {
       messages = messages.map((message, index) =>
-        index === existingPresentationIndex ? presentation : message,
+        index === existingPresentationIndex
+          ? {
+              ...presentation,
+              // Re-observing the same immutable presentation must not assign
+              // it a fresh Date.now() and move it below a newer optimistic
+              // request while the provider outcome is still unknown. A later
+              // durable sequence may refine ordering; otherwise retain the
+              // first-render position.
+              timestamp: message.timestamp,
+              serverSequence:
+                presentation.serverSequence ?? message.serverSequence,
+            }
+          : message,
       );
     } else if (presentationUserIndex >= 0) {
       messages = [
@@ -998,6 +1006,11 @@ export function applyKnowledgeBaseObservation(
           message: sanitizeBrandText(rawNotice.message),
           severity: rawNotice.severity ?? ("error" as const),
           retryable: rawNotice.retryable === true,
+          failureClass: rawNotice.failureClass ?? null,
+          recoveryAction: rawNotice.recoveryAction ?? null,
+          // Missing means an old server, never implicit permission to create
+          // another paid model task.
+          canRegenerate: rawNotice.canRegenerate === true,
           turnId: rawNotice.turnId,
         }
       : null;
@@ -1142,13 +1155,26 @@ export function prepareConversationForCloud(
       .filter(isServerOwnedKnowledgeBaseMessage)
       .map((message) => message.id),
   );
+  const browserOwnedMessages = repairedMessages.filter(
+    (message) =>
+      !isServerOwnedKnowledgeBaseMessage(message) &&
+      !(
+        message.knowledgeBase?.kind === "pending_user" &&
+        message.knowledgeBase.serverOwned !== true
+      ),
+  );
 
   return {
     ...cloudConversation,
     deletedMessageIds: conversation.deletedMessageIds?.filter(
       (messageId) => !protectedMessageIds.has(messageId),
     ),
-    messages: repairedMessages.map((message) => ({
+    // Knowledge-base request/presentation messages are server-owned. An
+    // optimistic confirmation without a reserved turn is browser-only and
+    // must not survive refresh as a ghost; accepted KB messages already live
+    // in the authoritative messages table and are never rewritten by a client
+    // snapshot.
+    messages: browserOwnedMessages.map((message) => ({
       ...message,
       attachments: message.attachments?.map((attachment) => {
         const {
@@ -1315,26 +1341,15 @@ function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
     return left.serverSequence - right.serverSequence;
   }
 
-  // A server projection is read after its immutable database message has been
-  // assigned a sequence. If a newer browser-only request is already visible,
-  // Date.now() would otherwise make the older approved presentation appear
-  // below that request until the next cloud hydration reorders the history.
-  // An accepted request is promoted to server-owned before this comparison;
-  // therefore a remaining optimistic KB message is necessarily after the
-  // durable history represented by the projection.
-  if (
-    leftIsServerOwned &&
-    left.serverSequence !== undefined &&
-    rightIsOptimisticKnowledgeBase
-  ) {
-    return -1;
+  // A durable sequence proves the server row predates the unbound browser
+  // request. Legacy/equivalent observations may omit that sequence; in that
+  // case preserve the already-rendered array order instead of comparing a
+  // projection-time Date.now() with the optimistic message timestamp.
+  if (leftIsServerOwned && rightIsOptimisticKnowledgeBase) {
+    return left.serverSequence !== undefined ? -1 : 0;
   }
-  if (
-    rightIsServerOwned &&
-    right.serverSequence !== undefined &&
-    leftIsOptimisticKnowledgeBase
-  ) {
-    return 1;
+  if (rightIsServerOwned && leftIsOptimisticKnowledgeBase) {
+    return right.serverSequence !== undefined ? 1 : 0;
   }
   if (leftIsServerOwned && rightIsServerOwned) {
     const leftGeneration = left.knowledgeBase?.generation ?? -1;
@@ -1751,14 +1766,7 @@ export function ConversationProvider({
           prepareConversationForCloud(after),
         );
       }
-      const progress = observation.progress ?? observation.interaction.progress;
-      if (progress) {
-        window.dispatchEvent(
-          new CustomEvent("frontmind:knowledge-progress-updated", {
-            detail: progress,
-          }),
-        );
-      }
+      dispatchKnowledgeBaseProgressUpdated(observation);
     },
     [replaceState],
   );

@@ -50,7 +50,16 @@ describe("FINALIZATION_SUPPLEMENT.ndjson", () => {
         }),
       ),
     ).toThrow(/FINALIZATION_SUPPLEMENT_RECORD_INVALID/u);
-    for (const forbidden of ["tenantId", "taskId", "turnId", "hash", "count"]) {
+    for (const forbidden of [
+      "tenantId",
+      "projectId",
+      "buildId",
+      "taskId",
+      "turnId",
+      "leafId",
+      "hash",
+      "count",
+    ]) {
       const value = JSON.parse(record("overview", 0));
       value[forbidden] = "forbidden";
       expect(() =>
@@ -62,6 +71,35 @@ describe("FINALIZATION_SUPPLEMENT.ndjson", () => {
         '{"kind":"overview","kind":"report","id":"x","title":"x","branchId":"b","bodyMarkdown":"body"}',
       ),
     ).toThrow(/FINALIZATION_SUPPLEMENT_DUPLICATE_KEY/u);
+  });
+
+  it("repairs bounded quote, control-character and trailing-comma syntax only", () => {
+    const parsed = parseFinalizationSupplementNdjson(
+      '{"kind":"overview","id":"overview-0","title":"关于"孚锐利"的概览","branchId":"branch-a","sourceIds":["source-a",],"bodyMarkdown":"第一行\t第二行",}',
+    );
+
+    expect(parsed.records).toEqual([
+      {
+        kind: "overview",
+        id: "overview-0",
+        title: '关于"孚锐利"的概览',
+        branchId: "branch-a",
+        sourceIds: ["source-a"],
+        assetIds: [],
+        bodyMarkdown: "第一行\t第二行",
+      },
+    ]);
+  });
+
+  it("fails closed for conflicting records with the same scoped identity", () => {
+    const first = record("overview", 0);
+    const second = JSON.stringify({
+      ...JSON.parse(first),
+      title: "conflicting title",
+    });
+    expect(() =>
+      parseFinalizationSupplementNdjson([first, second].join("\n")),
+    ).toThrow(/FINALIZATION_SUPPLEMENT_ID_DUPLICATED/u);
   });
 
   it("reports incomplete supplemental coverage", () => {

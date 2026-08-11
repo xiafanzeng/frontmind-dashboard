@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  parseExactJson as parseExactJsonFromSharedCore,
+  repairStructuredJsonCandidate as repairStructuredJsonCandidateFromSharedCore,
+} from "../shared/model-output-repair";
+
+import {
   DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS,
   ModelOutputRepairError,
   configuredModelOutputRepairMode,
@@ -11,6 +16,13 @@ import {
 } from "./model-output-repair";
 
 describe("compatibility-first model output repair", () => {
+  it("keeps the server entry point as the exact shared browser-safe implementation", () => {
+    expect(parseExactJson).toBe(parseExactJsonFromSharedCore);
+    expect(repairStructuredJsonCandidate).toBe(
+      repairStructuredJsonCandidateFromSharedCore,
+    );
+  });
+
   it("returns the exact parser result unchanged and never evaluates recovery", () => {
     const exactValue = {
       taskId: "task-unchanged",
@@ -87,9 +99,9 @@ describe("compatibility-first model output repair", () => {
     expect(() =>
       parseWithModelOutputRepair({ ...input, mode: "shadow" }),
     ).toThrow(originalError);
-    expect(
-      parseWithModelOutputRepair({ ...input, mode: "active" }),
-    ).toEqual({ repaired: true });
+    expect(parseWithModelOutputRepair({ ...input, mode: "active" })).toEqual({
+      repaired: true,
+    });
   });
 
   it("never treats a no-op candidate as a repair", () => {
@@ -192,6 +204,28 @@ describe("compatibility-first model output repair", () => {
     );
     expect(repaired.value).toEqual({ body: "line 1\nline 2\tend" });
     expect(repaired.ruleCodes).toContain("raw_control_character_escaped");
+  });
+
+  it("repairs only quotes that cannot close the current JSON string", () => {
+    const repaired = repairStructuredJsonCandidate(
+      '{"decision":"accept","reason":"问题明确以"硅基流动"为主语，知识库证据可以支持判定。","enterpriseAnchor":"硅基流动","evidenceRefs":["evidence/S001.md"]}',
+    );
+
+    expect(repaired.value).toEqual({
+      decision: "accept",
+      reason: '问题明确以"硅基流动"为主语，知识库证据可以支持判定。',
+      enterpriseAnchor: "硅基流动",
+      evidenceRefs: ["evidence/S001.md"],
+    });
+    expect(repaired.ruleCodes).toContain("unescaped_string_quote_escaped");
+  });
+
+  it("fails closed when quote repair would still leave ambiguous JSON", () => {
+    expect(() =>
+      repairStructuredJsonCandidate(
+        '{"reason":"前文 "引号", "looksLikeAKey": 但仍是正文","decision":"accept"}',
+      ),
+    ).toThrow();
   });
 
   it("extracts only one complete balanced value and rejects ambiguity", () => {

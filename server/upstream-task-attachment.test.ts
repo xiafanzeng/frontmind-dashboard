@@ -1,17 +1,48 @@
+import { Readable } from "node:stream";
+
 import axios from "axios";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
+
+const baseInput = {
+  baseUrl: "https://api.example.test",
+  apiKey: "secret-test-key",
+  filename: "socratic-kb-builder.skill.zip",
+  bytes: Buffer.from("immutable-skill-archive"),
+  mimeType: "application/zip",
+};
+
+function uploadedMetadata(fileId: string, filename = baseInput.filename) {
+  return {
+    status: 200,
+    data: {
+      id: fileId,
+      filename,
+      status: "uploaded",
+    },
+  };
+}
+
+function contentResponse(
+  chunks: Array<Buffer | Uint8Array | string>,
+  status = 200,
+) {
+  return {
+    status,
+    data: Readable.from(chunks),
+  };
+}
 
 describe("durable upstream task attachments", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("creates with the stable idempotency key and persists the file id before uploading bytes", async () => {
+  it("uses only the upload URL returned by file creation and binds ownership before uploading", async () => {
     const events: string[] = [];
     const uploadUrl =
-      "https://uploads.example.test/generated.skill?X-Amz-Signature=stable";
+      "https://uploads.example.test/generated.skill?X-Amz-Signature=initial";
     const post = vi.spyOn(axios, "post").mockImplementation(async () => {
       events.push("create");
       return {
@@ -19,16 +50,14 @@ describe("durable upstream task attachments", () => {
         data: { id: "provider-file-1", upload_url: uploadUrl },
       };
     });
+    const get = vi.spyOn(axios, "get");
     const put = vi.spyOn(axios, "put").mockImplementation(async () => {
       events.push("upload");
       return { status: 200, data: "" };
     });
 
     const result = await uploadUpstreamTaskAttachment({
-      baseUrl: "https://api.example.test",
-      apiKey: "secret-test-key",
-      filename: "socratic-kb-builder-v4.skill",
-      bytes: Buffer.from("immutable-skill"),
+      ...baseInput,
       idempotencyKey: "frontmind-kb-file-v1:stable-operation",
       onFileResolved: async (fileId) => {
         events.push(`persist:${fileId}`);
@@ -39,336 +68,241 @@ describe("durable upstream task attachments", () => {
     expect(result.fileId).toBe("provider-file-1");
     expect(post).toHaveBeenCalledWith(
       "https://api.example.test/v1/files",
-      { filename: "socratic-kb-builder-v4.skill" },
+      { filename: baseInput.filename },
       expect.objectContaining({
         headers: expect.objectContaining({
           "Idempotency-Key": "frontmind-kb-file-v1:stable-operation",
         }),
       }),
     );
+    expect(get).not.toHaveBeenCalled();
     expect(put.mock.calls[0]?.[0]).toBe(uploadUrl);
     expect(put.mock.calls[0]?.[2]?.headers).not.toHaveProperty("API_KEY");
     expect(put.mock.calls[0]?.[2]?.headers).not.toHaveProperty("Authorization");
   });
 
-  it("skips creation on completed replay and refreshes the signed upload URL for the same file", async () => {
-    const bytes = Buffer.from("immutable-skill");
+  it("fails a newly created file without its initial upload URL without consulting metadata", async () => {
+    vi.spyOn(axios, "post").mockResolvedValue({
+      status: 201,
+      data: { id: "provider-file-no-capability" },
+    });
+    const get = vi.spyOn(axios, "get");
+    const put = vi.spyOn(axios, "put");
+
+    await expect(
+      uploadUpstreamTaskAttachment({
+        ...baseInput,
+        onFileResolved: async () => undefined,
+      }),
+    ).rejects.toThrow("upload URL is unavailable");
+    expect(get).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("recovers an uploaded existing file by streaming authenticated content and matching size and SHA-256", async () => {
+    const fileId = "provider-file-uploaded";
     const post = vi.spyOn(axios, "post");
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: "provider-file-1",
-        filename: "socratic-kb-builder-v4.skill",
-        status: "pending",
-        upload_url:
-          "https://uploads.example.test/replayed.skill?X-Amz-Signature=fresh",
-      },
-    });
-    const put = vi.spyOn(axios, "put").mockResolvedValue({
-      status: 200,
-      data: "",
-    });
-    const onFileResolved = vi.fn().mockResolvedValue(undefined);
+    const put = vi.spyOn(axios, "put");
+    const get = vi
+      .spyOn(axios, "get")
+      .mockResolvedValueOnce(uploadedMetadata(fileId))
+      .mockResolvedValueOnce(
+        contentResponse([
+          baseInput.bytes.subarray(0, 7),
+          baseInput.bytes.subarray(7),
+        ]),
+      );
 
     const result = await uploadUpstreamTaskAttachment({
-      baseUrl: "https://api.example.test",
-      apiKey: "secret-test-key",
-      filename: "socratic-kb-builder-v4.skill",
-      bytes,
-      existingFileId: "provider-file-1",
-      idempotencyKey: "frontmind-kb-file-v1:stable-operation",
-      onFileResolved,
+      ...baseInput,
+      existingFileId: fileId,
+      onFileResolved: async () => undefined,
     });
 
+    expect(result).toMatchObject({
+      attachment: { file_id: fileId, filename: baseInput.filename },
+      fileId,
+    });
     expect(post).not.toHaveBeenCalled();
-    expect(get).toHaveBeenCalledWith(
-      "https://api.example.test/v1/files/provider-file-1",
+    expect(put).not.toHaveBeenCalled();
+    expect(get).toHaveBeenNthCalledWith(
+      1,
+      `https://api.example.test/v1/files/${fileId}`,
       expect.objectContaining({
         headers: expect.objectContaining({ API_KEY: "secret-test-key" }),
       }),
     );
-    expect(onFileResolved).toHaveBeenCalledWith("provider-file-1");
-    expect(put).toHaveBeenCalledTimes(1);
-    expect(result.attachment.file_id).toBe("provider-file-1");
+    expect(get).toHaveBeenNthCalledWith(
+      2,
+      `https://api.example.test/v1/files/${fileId}/content`,
+      expect.objectContaining({
+        responseType: "stream",
+        maxRedirects: 0,
+        headers: expect.objectContaining({ API_KEY: "secret-test-key" }),
+      }),
+    );
   });
 
-  it("treats an exactly matching uploaded provider file as a completed crash-after-PUT replay", async () => {
-    const filename = "socratic-kb-builder.skill.zip";
-    const bytes = Buffer.from("immutable-skill-archive");
-    const post = vi.spyOn(axios, "post");
-    const put = vi.spyOn(axios, "put");
-    const remove = vi.spyOn(axios, "delete");
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: "provider-file-uploaded",
-        filename,
-        status: "uploaded",
-        bytes: bytes.length,
-        upload_url: null,
-        mime_type: null,
-      },
-    });
-    const onFileResolved = vi.fn().mockResolvedValue(undefined);
+  it("preserves every byte of an opaque existing file id", async () => {
+    const fileId = " provider/file id ";
+    const get = vi
+      .spyOn(axios, "get")
+      .mockResolvedValueOnce(uploadedMetadata(fileId))
+      .mockResolvedValueOnce(contentResponse([baseInput.bytes]));
 
     const result = await uploadUpstreamTaskAttachment({
-      baseUrl: "https://api.example.test",
-      apiKey: "secret-test-key",
-      filename,
-      bytes,
-      existingFileId: "provider-file-uploaded",
-      idempotencyKey: "frontmind-kb-file-v1:stable-operation",
-      onFileResolved,
+      ...baseInput,
+      existingFileId: fileId,
+      onFileResolved: async () => undefined,
     });
 
-    expect(result).toMatchObject({
-      attachment: { file_id: "provider-file-uploaded", filename },
-      fileId: "provider-file-uploaded",
-    });
-    expect(onFileResolved).toHaveBeenCalledWith("provider-file-uploaded");
-    expect(post).not.toHaveBeenCalled();
-    expect(put).not.toHaveBeenCalled();
-    expect(remove).not.toHaveBeenCalled();
+    expect(result.fileId).toBe(fileId);
+    expect(get.mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/v1/files/%20provider%2Ffile%20id%20",
+    );
+    expect(get.mock.calls[1]?.[0]).toBe(
+      "https://api.example.test/v1/files/%20provider%2Ffile%20id%20/content",
+    );
   });
 
-  it("continues a final-delivery recovery after the Skill PUT crash and uploads only the missing finalization input", async () => {
-    const skillFilename = "socratic-kb-builder.skill.zip";
-    const skillBytes = Buffer.from("immutable-skill-archive");
-    const finalizationFilename = "frontmind-kb-finalization-input.zip";
-    const finalizationBytes = Buffer.from("immutable-finalization-input");
-    const finalizationUploadUrl =
-      "https://uploads.example.test/finalization?X-Amz-Signature=fresh";
+  it("rejects uploaded content with the same size but a different SHA-256", async () => {
+    const get = vi
+      .spyOn(axios, "get")
+      .mockResolvedValueOnce(uploadedMetadata("provider-file-mismatch"))
+      .mockResolvedValueOnce(
+        contentResponse([Buffer.alloc(baseInput.bytes.length, 0x78)]),
+      );
+    const put = vi.spyOn(axios, "put");
+
+    await expect(
+      uploadUpstreamTaskAttachment({
+        ...baseInput,
+        existingFileId: "provider-file-mismatch",
+        onFileResolved: async () => undefined,
+      }),
+    ).rejects.toThrow("content mismatch");
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("stops an oversized uploaded-content stream as soon as it exceeds the expected size", async () => {
+    const stream = Readable.from([baseInput.bytes, Buffer.from("overflow")]);
+    const destroy = vi.spyOn(stream, "destroy");
+    vi.spyOn(axios, "get")
+      .mockResolvedValueOnce(uploadedMetadata("provider-file-oversize"))
+      .mockResolvedValueOnce({ status: 200, data: stream });
+    const put = vi.spyOn(axios, "put");
+
+    await expect(
+      uploadUpstreamTaskAttachment({
+        ...baseInput,
+        existingFileId: "provider-file-oversize",
+        onFileResolved: async () => undefined,
+      }),
+    ).rejects.toThrow("content mismatch");
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the authenticated content endpoint is non-successful", async () => {
+    const unavailable = contentResponse([Buffer.from("not found")], 404);
+    const destroy = vi.spyOn(unavailable.data, "destroy");
+    vi.spyOn(axios, "get")
+      .mockResolvedValueOnce(uploadedMetadata("provider-file-missing-content"))
+      .mockResolvedValueOnce(unavailable);
+    const put = vi.spyOn(axios, "put");
+
+    await expect(
+      uploadUpstreamTaskAttachment({
+        ...baseInput,
+        existingFileId: "provider-file-missing-content",
+        onFileResolved: async () => undefined,
+      }),
+    ).rejects.toThrow("content lookup failed");
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for official pending metadata because no same-id upload capability exists", async () => {
     const get = vi.spyOn(axios, "get").mockResolvedValue({
       status: 200,
       data: {
-        id: "provider-file-skill",
-        filename: skillFilename,
-        status: "uploaded",
-        size_bytes: skillBytes.length,
+        id: "provider-file-pending",
+        filename: baseInput.filename,
+        status: "pending",
       },
     });
-    const post = vi.spyOn(axios, "post").mockResolvedValue({
-      status: 201,
-      data: {
-        id: "provider-file-finalization",
-        filename: finalizationFilename,
-        upload_url: finalizationUploadUrl,
-      },
-    });
-    const put = vi.spyOn(axios, "put").mockResolvedValue({
-      status: 200,
-      data: "",
-    });
+    const post = vi.spyOn(axios, "post");
+    const put = vi.spyOn(axios, "put");
 
-    const recoveredSkill = await uploadUpstreamTaskAttachment({
-      baseUrl: "https://api.example.test",
-      apiKey: "secret-test-key",
-      filename: skillFilename,
-      bytes: skillBytes,
-      existingFileId: "provider-file-skill",
-      onFileResolved: async () => undefined,
-    });
-    const uploadedFinalization = await uploadUpstreamTaskAttachment({
-      baseUrl: "https://api.example.test",
-      apiKey: "secret-test-key",
-      filename: finalizationFilename,
-      bytes: finalizationBytes,
-      idempotencyKey: "frontmind-kb-file-v1:finalization",
-      onFileResolved: async () => undefined,
-    });
-
-    expect(recoveredSkill.fileId).toBe("provider-file-skill");
-    expect(uploadedFinalization.fileId).toBe("provider-file-finalization");
+    await expect(
+      uploadUpstreamTaskAttachment({
+        ...baseInput,
+        existingFileId: "provider-file-pending",
+        onFileResolved: async () => undefined,
+      }),
+    ).rejects.toThrow("upload capability is unavailable for existing file");
     expect(get).toHaveBeenCalledTimes(1);
-    expect(post).toHaveBeenCalledTimes(1);
-    expect(post.mock.calls[0]?.[1]).toEqual({
-      filename: finalizationFilename,
-    });
-    expect(put).toHaveBeenCalledTimes(1);
-    expect(put.mock.calls[0]?.[0]).toBe(finalizationUploadUrl);
-  });
-
-  it("accepts canonical provider aliases only when every frozen value agrees", async () => {
-    const filename = "frontmind-kb-finalization-input.zip";
-    const bytes = Buffer.from("immutable-finalization-input");
-    const put = vi.spyOn(axios, "put");
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: "provider-file-finalization",
-        file_id: "provider-file-finalization",
-        filename,
-        status: "UPLOADED",
-        upload_status: "uploaded",
-        size: String(bytes.length),
-        size_bytes: bytes.length,
-        mime_type: "application/zip",
-      },
-    });
-
-    await expect(
-      uploadUpstreamTaskAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "secret-test-key",
-        filename,
-        bytes,
-        mimeType: "application/zip",
-        existingFileId: "provider-file-finalization",
-        onFileResolved: async () => undefined,
-      }),
-    ).resolves.toMatchObject({ fileId: "provider-file-finalization" });
-    expect(put).not.toHaveBeenCalled();
-  });
-
-  it("accepts the provider's generic binary MIME normalization for an exact uploaded ZIP", async () => {
-    const filename = "socratic-kb-builder.skill.zip";
-    const bytes = Buffer.from("immutable-skill-archive");
-    const put = vi.spyOn(axios, "put");
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: "provider-file-skill",
-        filename,
-        status: "uploaded",
-        bytes: String(bytes.length),
-        content_type: "application/octet-stream",
-      },
-    });
-
-    await expect(
-      uploadUpstreamTaskAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "secret-test-key",
-        filename,
-        bytes,
-        mimeType: "application/zip",
-        existingFileId: "provider-file-skill",
-        onFileResolved: async () => undefined,
-      }),
-    ).resolves.toMatchObject({ fileId: "provider-file-skill" });
+    expect(post).not.toHaveBeenCalled();
     expect(put).not.toHaveBeenCalled();
   });
 
   it.each([
     [
-      "a different id",
+      "identity mismatch",
       {
         id: "provider-file-other",
-        filename: "socratic-kb-builder.skill.zip",
+        filename: baseInput.filename,
         status: "uploaded",
-        bytes: 7,
       },
       "metadata mismatch",
     ],
     [
-      "a different filename",
+      "filename mismatch",
       {
         id: "provider-file-frozen",
         filename: "other.skill.zip",
         status: "uploaded",
-        bytes: 7,
       },
       "metadata mismatch",
     ],
     [
-      "a different uploaded size",
+      "unknown state",
       {
         id: "provider-file-frozen",
-        filename: "socratic-kb-builder.skill.zip",
-        status: "uploaded",
-        bytes: 8,
-      },
-      "metadata mismatch",
-    ],
-    [
-      "an incompatible uploaded MIME type",
-      {
-        id: "provider-file-frozen",
-        filename: "socratic-kb-builder.skill.zip",
-        status: "uploaded",
-        bytes: 7,
-        content_type: "image/png",
-      },
-      "metadata mismatch",
-    ],
-    [
-      "conflicting size aliases",
-      {
-        id: "provider-file-frozen",
-        filename: "socratic-kb-builder.skill.zip",
-        status: "uploaded",
-        bytes: 7,
-        size_bytes: 8,
-      },
-      "metadata is invalid",
-    ],
-    [
-      "an unknown state with an upload URL",
-      {
-        id: "provider-file-frozen",
-        filename: "socratic-kb-builder.skill.zip",
+        filename: baseInput.filename,
         status: "processing",
-        bytes: 7,
-        upload_url:
-          "https://uploads.example.test/unsafe-replay?X-Amz-Signature=fresh",
       },
       "state is not safely replayable",
     ],
-  ])(
-    "fails closed when provider metadata has %s",
-    async (_label, data, error) => {
-      const put = vi.spyOn(axios, "put");
-      const remove = vi.spyOn(axios, "delete");
-      vi.spyOn(axios, "get").mockResolvedValue({ status: 200, data });
-
-      await expect(
-        uploadUpstreamTaskAttachment({
-          baseUrl: "https://api.example.test",
-          apiKey: "secret-test-key",
-          filename: "socratic-kb-builder.skill.zip",
-          bytes: Buffer.from("1234567"),
-          existingFileId: "provider-file-frozen",
-          onFileResolved: async () => undefined,
-        }),
-      ).rejects.toThrow(error);
-      expect(put).not.toHaveBeenCalled();
-      expect(remove).not.toHaveBeenCalled();
-    },
-  );
-
-  it("does not PUT an explicitly pending replay without a fresh upload URL", async () => {
-    const put = vi.spyOn(axios, "put");
-    vi.spyOn(axios, "get").mockResolvedValue({
+  ])("fails closed for existing-file %s", async (_label, data, error) => {
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
       status: 200,
-      data: {
-        id: "provider-file-pending",
-        filename: "socratic-kb-builder.skill.zip",
-        status: "pending",
-      },
+      data,
     });
+    const put = vi.spyOn(axios, "put");
 
     await expect(
       uploadUpstreamTaskAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "secret-test-key",
-        filename: "socratic-kb-builder.skill.zip",
-        bytes: Buffer.from("immutable-skill"),
-        existingFileId: "provider-file-pending",
+        ...baseInput,
+        existingFileId: "provider-file-frozen",
         onFileResolved: async () => undefined,
       }),
-    ).rejects.toThrow("upload URL is unavailable");
+    ).rejects.toThrow(error);
+    expect(get).toHaveBeenCalledTimes(1);
     expect(put).not.toHaveBeenCalled();
   });
 
-  it("does not delete an idempotently recoverable file when binding or upload fails", async () => {
+  it("does not delete a bound file when attachment upload later fails", async () => {
     vi.spyOn(axios, "post").mockResolvedValue({
       status: 201,
       data: {
         id: "provider-file-uncertain",
         upload_url:
-          "https://uploads.example.test/uncertain.skill?X-Amz-Signature=one",
+          "https://uploads.example.test/uncertain.skill?X-Amz-Signature=initial",
       },
     });
+    vi.spyOn(axios, "put").mockResolvedValue({ status: 503, data: "retry" });
     const remove = vi.spyOn(axios, "delete").mockResolvedValue({
       status: 204,
       data: "",
@@ -376,36 +310,7 @@ describe("durable upstream task attachments", () => {
 
     await expect(
       uploadUpstreamTaskAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "secret-test-key",
-        filename: "socratic-kb-builder-v4.skill",
-        bytes: Buffer.from("immutable-skill"),
-        idempotencyKey: "frontmind-kb-file-v1:stable-operation",
-        onFileResolved: async () => {
-          throw new Error("simulated database interruption");
-        },
-      }),
-    ).rejects.toThrow("simulated database interruption");
-    expect(remove).not.toHaveBeenCalled();
-
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: "provider-file-uncertain",
-        filename: "socratic-kb-builder-v4.skill",
-        status: "pending",
-        upload_url:
-          "https://uploads.example.test/uncertain.skill?X-Amz-Signature=two",
-      },
-    });
-    vi.spyOn(axios, "put").mockResolvedValue({ status: 503, data: "retry" });
-    await expect(
-      uploadUpstreamTaskAttachment({
-        baseUrl: "https://api.example.test",
-        apiKey: "secret-test-key",
-        filename: "socratic-kb-builder-v4.skill",
-        bytes: Buffer.from("immutable-skill"),
-        existingFileId: "provider-file-uncertain",
+        ...baseInput,
         onFileResolved: async () => undefined,
       }),
     ).rejects.toThrow("Task attachment upload failed");

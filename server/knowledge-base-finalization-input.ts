@@ -3,6 +3,10 @@ import path from "node:path";
 import JSZip from "jszip";
 
 import { knowledgeBaseMarkdownSha256 } from "./knowledge-base-package-validation";
+import {
+  KNOWLEDGE_BASE_TREE_POLICY_VERSION_LEGACY,
+  knowledgeBaseTreePolicy,
+} from "./knowledge-base-progress";
 
 export const KNOWLEDGE_BASE_FINALIZATION_INPUT_FILENAME_PREFIX =
   "frontmind-kb-finalization-input";
@@ -84,17 +88,21 @@ export async function buildKnowledgeBaseFinalizationInput(input: {
   operationId: string;
   turnId: string;
   buildRevision: number;
+  treePolicyVersion?: number;
   nodes: FinalizationNode[];
   assets: FinalizationAsset[];
 }) {
+  const depthPolicy = knowledgeBaseTreePolicy(
+    input.treePolicyVersion ?? KNOWLEDGE_BASE_TREE_POLICY_VERSION_LEGACY,
+  );
   if (
     !input.companyName.trim() ||
     !input.operationId.trim() ||
     !input.turnId.trim() ||
     !Number.isSafeInteger(input.buildRevision) ||
     input.buildRevision < 1 ||
-    input.nodes.length < 8 ||
-    input.nodes.length > 115
+    input.nodes.length < depthPolicy.minLeaves ||
+    input.nodes.length > depthPolicy.maxLeaves
   ) {
     throw new Error("FINALIZATION_INPUT_COORDINATES_INVALID");
   }
@@ -274,6 +282,9 @@ export async function buildKnowledgeBaseFinalizationInput(input: {
       schemaVersion: 4,
       profile: "dashboard-enterprise-v1",
       buildRevision: input.buildRevision,
+      treePolicyVersion: depthPolicy.version,
+      minLeaves: depthPolicy.minLeaves,
+      maxLeaves: depthPolicy.maxLeaves,
     },
     nodes: nodes.map((node) => ({
       ...node,

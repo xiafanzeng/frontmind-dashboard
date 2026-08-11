@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { getTableConfig, MySqlDialect } from "drizzle-orm/mysql-core";
 import { createHash } from "node:crypto";
 import {
   apiCredentials,
@@ -14,6 +14,7 @@ import {
   users,
 } from "../drizzle/schema";
 import {
+  assignBrowserOwnedSnapshotMessageSequences,
   buildMessageMetadata,
   collectSnapshotResourceRefs,
   conversationSyncMysqlErrorCode,
@@ -1294,6 +1295,136 @@ describe("conversation server sequence projection", () => {
     expect(projected).toHaveLength(1);
     expect(projected[0]?.messages.map((item) => item.serverSequence)).toEqual([
       4, 5,
+    ]);
+  });
+});
+
+describe("conversation snapshot sequence allocation", () => {
+  it("preserves ordinary and KB slots while appending new browser messages above the full maximum", () => {
+    const ordinary = message("ordinary-existing", "user", 100);
+    const knowledgeUser = {
+      ...serverOwnedMessage("kb-user", "user", 110, "pending_user"),
+      serverSequence: 1,
+    };
+    const knowledgePresentation = {
+      ...serverOwnedMessage(
+        "kb-presentation",
+        "assistant",
+        120,
+        "presentation",
+      ),
+      serverSequence: 2,
+    };
+    const appended = message("ordinary-new", "user", 130);
+    const persistedSequences = new Map([
+      [ordinary.id, 0],
+      [knowledgeUser.id, 1],
+      [knowledgePresentation.id, 2],
+    ]);
+
+    expect(
+      assignBrowserOwnedSnapshotMessageSequences(
+        [ordinary, knowledgeUser, knowledgePresentation, appended],
+        persistedSequences,
+      ).map(({ message: item, sequence }) => [item.id, sequence]),
+    ).toEqual([
+      ["ordinary-existing", 0],
+      ["ordinary-new", 3],
+    ]);
+
+    expect(
+      assignBrowserOwnedSnapshotMessageSequences(
+        [appended],
+        persistedSequences,
+      ).map(({ message: item, sequence }) => [item.id, sequence]),
+    ).toEqual([["ordinary-new", 3]]);
+  });
+
+  it("commits without colliding with the real conversation-sequence unique index", async () => {
+    const index = getTableConfig(messages).indexes.find(
+      (candidate) =>
+        candidate.config.name === "messages_conversation_sequence_uq",
+    );
+    expect(index?.config.unique).toBe(true);
+
+    const conversationId = "u7:conversation-1";
+    const initialRows = [
+      {
+        id: "ordinary-existing",
+        sequence: 0,
+        turnId: null as string | null,
+        serverOwned: false,
+      },
+      {
+        id: "kb-user",
+        sequence: 1,
+        turnId: "turn-1",
+        serverOwned: true,
+      },
+      {
+        id: "kb-presentation",
+        sequence: 2,
+        turnId: "turn-1",
+        serverOwned: true,
+      },
+    ];
+    let rows = structuredClone(initialRows);
+    const transact = async (incoming: SnapshotMessage[]) => {
+      const before = structuredClone(rows);
+      try {
+        const persisted = new Map(
+          rows.map((row) => [row.id, row.sequence] as const),
+        );
+        rows = rows.filter((row) => row.serverOwned);
+        for (const assigned of assignBrowserOwnedSnapshotMessageSequences(
+          incoming,
+          persisted,
+        )) {
+          if (
+            rows.some(
+              (row) =>
+                row.sequence === assigned.sequence &&
+                conversationId === "u7:conversation-1",
+            )
+          ) {
+            throw Object.assign(new Error("duplicate sequence"), {
+              code: "ER_DUP_ENTRY",
+            });
+          }
+          rows.push({
+            id: assigned.message.id,
+            sequence: assigned.sequence,
+            turnId: assigned.message.knowledgeBase?.turnId ?? null,
+            serverOwned: false,
+          });
+        }
+      } catch (error) {
+        rows = before;
+        throw error;
+      }
+    };
+
+    await expect(
+      transact([
+        message("ordinary-existing", "user", 100),
+        message("ordinary-new", "user", 130),
+      ]),
+    ).resolves.toBeUndefined();
+    expect(rows).toEqual([
+      initialRows[1],
+      initialRows[2],
+      expect.objectContaining({ id: "ordinary-existing", sequence: 0 }),
+      expect.objectContaining({ id: "ordinary-new", sequence: 3 }),
+    ]);
+    expect(rows.filter((row) => row.serverOwned)).toEqual(initialRows.slice(1));
+
+    await expect(
+      transact([message("ordinary-new", "user", 140)]),
+    ).resolves.toBeUndefined();
+    expect(rows.map((row) => [row.id, row.sequence])).toEqual([
+      ["kb-user", 1],
+      ["kb-presentation", 2],
+      ["ordinary-new", 3],
     ]);
   });
 });

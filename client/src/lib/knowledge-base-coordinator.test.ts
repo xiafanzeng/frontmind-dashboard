@@ -231,9 +231,10 @@ describe("KnowledgeBasePollingCoordinator", () => {
       scheduled = callback;
       return 1 as unknown as ReturnType<typeof setTimeout>;
     });
+    const apply = vi.fn();
     const coordinator = new KnowledgeBasePollingCoordinator({
       observe,
-      apply: vi.fn(),
+      apply,
       now: () => now,
       pendingRequestGraceMs: 6_000,
       setTimer: setTimer as unknown as typeof setTimeout,
@@ -243,6 +244,14 @@ describe("KnowledgeBasePollingCoordinator", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(setTimer).toHaveBeenCalledTimes(1);
+    expect(apply).toHaveBeenLastCalledWith(
+      "conversation",
+      expect.objectContaining({
+        interaction: expect.objectContaining({
+          interactionState: "awaiting_input",
+        }),
+      }),
+    );
 
     now += 6_001;
     scheduled?.();
@@ -255,6 +264,10 @@ describe("KnowledgeBasePollingCoordinator", () => {
     await Promise.resolve();
     expect(observe).toHaveBeenCalledTimes(3);
     expect(setTimer).toHaveBeenCalledTimes(1);
+    // Polling may stop after the six-minute request grace only after the last
+    // authoritative observation was applied, so optimistic `running` cannot
+    // remain as the visible terminal state.
+    expect(apply).toHaveBeenCalledTimes(3);
     coordinator.dispose();
   });
 

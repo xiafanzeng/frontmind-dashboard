@@ -80,6 +80,7 @@ import {
   type KnowledgeArchiveDescriptor,
 } from "./knowledge-base-artifact";
 import { assertKnowledgeBasePublishable } from "./knowledge-base-progress-service";
+import { knowledgeBaseTreePolicy } from "./knowledge-base-progress";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import {
   knowledgeBaseArchiveReadContractVersions,
@@ -1844,7 +1845,7 @@ function parsePackageJson<T>(
     );
   }
   try {
-    return schema.parse(JSON.parse(raw));
+    return schema.parse(JSON.parse(raw.replace(/^\uFEFF/u, "")));
   } catch (error) {
     throw new KnowledgeArchiveValidationError(
       "structure",
@@ -1865,6 +1866,8 @@ function validateProfilePackage(input: {
    * validator again on the rewritten archive. No other validation is relaxed.
    */
   allowV4CustomerVisibleCharacterCountRepair?: boolean;
+  dashboardEnterpriseMinLeaves?: number;
+  requireDashboardAdaptiveFormalGate?: boolean;
   packagePaths: string[];
   unpackedBytes: number;
   rawTextByRelativePath: Map<string, string>;
@@ -1917,20 +1920,36 @@ function validateProfilePackage(input: {
           maxCharacters: manifest.schemaVersion !== 1 ? 40_000 : 18_000,
           maxEvidenceCharacters: 300_000,
           maxOfficialPages: 120,
+          maxOfficialPageAttempts: 120,
           maxDocuments: 22,
           maxWebQueries: 12,
         }
-      : {
-          files: 1_500,
-          images: 480,
-          targetImages: 360,
-          minCharacters: 80_000,
-          maxCharacters: 180_000,
-          maxEvidenceCharacters: 3_000_000,
-          maxOfficialPages: 1_200,
-          maxDocuments: 220,
-          maxWebQueries: 120,
-        };
+      : manifest.schemaVersion === 4
+        ? {
+            files: 1_500,
+            images: 480,
+            targetImages: 360,
+            minCharacters: 80_000,
+            maxCharacters: 180_000,
+            maxEvidenceCharacters: 3_000_000,
+            maxOfficialPages: 120,
+            maxOfficialPageAttempts: 200,
+            // Up to 30 official documents plus 100 customer uploads.
+            maxDocuments: 130,
+            maxWebQueries: 30,
+          }
+        : {
+            files: 1_500,
+            images: 480,
+            targetImages: 360,
+            minCharacters: 80_000,
+            maxCharacters: 180_000,
+            maxEvidenceCharacters: 3_000_000,
+            maxOfficialPages: 1_200,
+            maxOfficialPageAttempts: 1_200,
+            maxDocuments: 220,
+            maxWebQueries: 120,
+          };
   const isSingleLogoDashboardV3 =
     input.profile === "dashboard-enterprise-v1" && manifest.schemaVersion === 3;
   const isCustomerUploadDashboardV4 =
@@ -2820,10 +2839,11 @@ function validateProfilePackage(input: {
     const leafDocuments = customerDocuments.filter(
       (document) => document.kind === "leaf",
     );
-    if (leafDocuments.length < 8 || leafDocuments.length > 115) {
+    const minimumLeaves = input.dashboardEnterpriseMinLeaves ?? 8;
+    if (leafDocuments.length < minimumLeaves || leafDocuments.length > 115) {
       throw new KnowledgeArchiveValidationError(
         "content",
-        "企业深度知识库必须包含 8–115 个知识叶子",
+        `企业深度知识库必须包含 ${minimumLeaves}–115 个知识叶子`,
       );
     }
     const leafBranches = new Set(
@@ -3108,9 +3128,11 @@ function validateProfilePackage(input: {
       }
       if (
         input.profile === "dashboard-enterprise-v1" &&
-        (!new Set([0, expected.required]).has(
-          document.requiredFormalCharacters!,
-        ) ||
+        ((input.requireDashboardAdaptiveFormalGate
+          ? document.requiredFormalCharacters !== expected.required
+          : !new Set([0, expected.required]).has(
+              document.requiredFormalCharacters!,
+            )) ||
           document.contentStatus !== expected.status)
       ) {
         throw new KnowledgeArchiveValidationError(
@@ -3200,6 +3222,15 @@ function validateProfilePackage(input: {
     throw new KnowledgeArchiveValidationError(
       "structure",
       `成功采集官网页面超过 ${limits.maxOfficialPages} 页档位上限`,
+    );
+  }
+  if (
+    (completeness.acquisition.officialPages?.total ?? 0) >
+    limits.maxOfficialPageAttempts
+  ) {
+    throw new KnowledgeArchiveValidationError(
+      "structure",
+      `尝试访问官网链接超过 ${limits.maxOfficialPageAttempts} 条档位上限`,
     );
   }
   if (
@@ -5905,6 +5936,8 @@ export async function readKnowledgeArchive(
     archiveContractVersion?: 1 | 2 | 3 | 4;
     archiveContractVersions?: readonly (1 | 2 | 3 | 4)[];
     allowV4CustomerVisibleCharacterCountRepair?: boolean;
+    dashboardEnterpriseMinLeaves?: number;
+    requireDashboardAdaptiveFormalGate?: boolean;
   } = {},
 ) {
   const validationProfile = options.validationProfile ?? "historical";
@@ -6158,6 +6191,9 @@ export async function readKnowledgeArchive(
             archiveContractVersions: options.archiveContractVersions,
             allowV4CustomerVisibleCharacterCountRepair:
               options.allowV4CustomerVisibleCharacterCountRepair,
+            dashboardEnterpriseMinLeaves: options.dashboardEnterpriseMinLeaves,
+            requireDashboardAdaptiveFormalGate:
+              options.requireDashboardAdaptiveFormalGate,
             packagePaths,
             unpackedBytes,
             rawTextByRelativePath,
@@ -6265,6 +6301,8 @@ export async function validateKnowledgeArchiveForDownload(input: {
   expectedBytes: number;
   validationProfile?: KnowledgeBaseValidationProfile;
   archiveContractVersions?: readonly (1 | 2 | 3 | 4)[];
+  dashboardEnterpriseMinLeaves?: number;
+  requireDashboardAdaptiveFormalGate?: boolean;
   validateParsed?: (
     parsed: Awaited<ReturnType<typeof readKnowledgeArchive>>,
   ) => void | Promise<void>;
@@ -6279,6 +6317,9 @@ export async function validateKnowledgeArchiveForDownload(input: {
       {
         validationProfile: input.validationProfile,
         archiveContractVersions: input.archiveContractVersions,
+        dashboardEnterpriseMinLeaves: input.dashboardEnterpriseMinLeaves,
+        requireDashboardAdaptiveFormalGate:
+          input.requireDashboardAdaptiveFormalGate,
       },
     );
   } catch (error) {
@@ -6845,6 +6886,10 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
         archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
           build.skillVersion,
         ),
+        dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+          build.treePolicyVersion,
+        ).minLeaves,
+        requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
       },
     );
     storedAssetKeys = parsed.storedAssetKeys;

@@ -80,4 +80,19 @@ describe("runtime health route contract", () => {
       "monitorCredentialAuthenticated: monitorCredential.authenticated",
     );
   });
+
+  it("exposes the non-secret knowledge-base tree writer policy in readiness", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+    const listener = source.indexOf("server.listen(", readinessStart);
+
+    expect(source).toContain("knowledgeBaseNewBuildPolicyBinding()");
+    expect(source.slice(readinessStart, listener)).toContain(
+      "knowledgeBaseTreePolicyWriter",
+    );
+    expect(source).toContain('"[KnowledgeBase] tree_policy_writer"');
+  });
 });

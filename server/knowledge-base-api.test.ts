@@ -1,4 +1,5 @@
 import axios from "axios";
+import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -33,20 +34,27 @@ import {
   createFrontMindTask,
   deriveKnowledgeBaseInteraction,
   getKnowledgeBaseSkillDescriptor,
+  knowledgeBasePinnedV4SkillSelection,
   isApprovedKnowledgeBaseAwaitingInputObservation,
   knowledgeBaseArtifactFailureNotice,
   knowledgeBaseManualLogoCreateFailureForPersistence,
   knowledgeBaseManualLogoUnclassifiedFailureResponse,
+  knowledgeBaseNoticeAllowsSameTaskReconcile,
   knowledgeBaseManualLogoPendingResponse,
   knowledgeBaseManualLogoDeterministicCreateFailureStatus,
   knowledgeBaseManualLogoTerminalFailure,
   knowledgeBaseTurnReplayHttpStatus,
   knowledgeBaseTurnReservationErrorStatus,
+  knowledgeBaseUpstreamReadFailureAuthority,
   knowledgeBaseRecoveryLogoPreparationError,
+  knowledgeBaseReconcileFailureStatus,
+  knowledgeBaseAcceptedReservationReceipt,
+  knowledgeBaseReservationReceipt,
   loadKnowledgeBaseTurnAuthority,
   logKnowledgeBaseRuntimeFailure,
   normalizeRecoveredTaskOutput,
   normalizeKnowledgeBaseClientAttachmentManifest,
+  persistKnowledgeBaseCreateFailure,
   readKnowledgeBaseSkillArchiveAttachment,
   recoverKnowledgeBaseTurnClaimTask,
   resolveKnowledgeBaseEnterpriseIdentity,
@@ -57,8 +65,10 @@ import {
   uploadKnowledgeBaseSkillArchive,
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
+import { KnowledgeBaseLocalPreparationError } from "./knowledge-base-api-errors";
 import { KnowledgeBaseTurnReservationError } from "./knowledge-base-turn-service";
 import { KnowledgeBaseArtifactBindingError } from "./knowledge-base-artifact-binding-service";
+import { KnowledgeBaseBuildError } from "./knowledge-base-progress-service";
 import { knowledgeBaseLogoRepairFileIsOwned } from "./knowledge-base-logo-provenance-api";
 import { applyKnowledgeBaseFinalLogoProvenanceObservation } from "./knowledge-base-logo-provenance-repair";
 
@@ -82,6 +92,176 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(knowledgeBaseTurnReplayHttpStatus("awaiting_attachments")).toBe(200);
     expect(knowledgeBaseTurnReplayHttpStatus("completed")).toBe(200);
     expect(knowledgeBaseTurnReplayHttpStatus("terminal")).toBe(409);
+  });
+
+  it("returns one authoritative reservation receipt without inventing a task id", () => {
+    const turn = {
+      id: "turn-reserved",
+      clientRequestId: "request-reserved",
+      buildGeneration: 4,
+      expectedRevision: 8,
+      expectedLeafId: "1.4",
+      upstreamTaskId: null,
+      dispatchState: "reserved",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
+      stagedUserAttachmentCount: 0,
+      expectedUserAttachmentCount: 0,
+    } as any;
+
+    expect(
+      knowledgeBaseReservationReceipt(
+        {
+          state: "pending",
+          turn,
+          retryAfterMs: 1_000,
+        } as any,
+        11,
+      ),
+    ).toMatchObject({
+      state: "pending",
+      dispatchState: "recovering",
+      turnId: "turn-reserved",
+      upstreamTaskId: null,
+      stateEpoch: 11,
+      canRegenerate: false,
+    });
+    expect(
+      knowledgeBaseAcceptedReservationReceipt({ turn, stateEpoch: 11 }),
+    ).toMatchObject({
+      state: "pending",
+      dispatchState: "recovering",
+      turnId: "turn-reserved",
+      upstreamTaskId: null,
+      stateEpoch: 11,
+      canRegenerate: false,
+    });
+    expect(
+      knowledgeBaseAcceptedReservationReceipt({
+        turn: {
+          ...turn,
+          id: "turn-bound",
+          upstreamTaskId: "provider-task-bound",
+          dispatchState: "reserved",
+        },
+      }),
+    ).toMatchObject({
+      dispatchState: "bound",
+      turnId: "turn-bound",
+      upstreamTaskId: "provider-task-bound",
+    });
+  });
+
+  it("persists pre-create attachment rejection as a same-turn repair receipt", async () => {
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const cancelUnprepared = vi.fn().mockResolvedValue(undefined);
+    const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const common = {
+      userId: 7,
+      turnId: "turn-attachment-repair",
+      leaseToken: "lease-attachment-repair",
+      outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+    };
+
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        {
+          ...common,
+          error: new KnowledgeBaseUpstreamCreateError(
+            "deterministic",
+            "UPSTREAM_CREATE_HTTP_413",
+            413,
+          ),
+        },
+        { failDeterministically, cancelUnprepared, markOutcomeUnknown },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(failDeterministically).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: common.turnId,
+        failureClass: "requires_user_fix",
+        recoveryAction: "fix_attachments",
+        canRegenerate: false,
+      }),
+    );
+    expect(cancelUnprepared).not.toHaveBeenCalled();
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
+
+    failDeterministically.mockClear();
+    await persistKnowledgeBaseCreateFailure(
+      {
+        ...common,
+        error: new KnowledgeBaseLocalPreparationError(
+          "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+          "受管附件完整性校验失败",
+        ),
+      },
+      { failDeterministically, cancelUnprepared, markOutcomeUnknown },
+    );
+    expect(failDeterministically).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: common.turnId,
+        failureClass: "requires_user_fix",
+        recoveryAction: "fix_attachments",
+        canRegenerate: false,
+      }),
+    );
+  });
+
+  it("keeps Logo re-upload separate and never labels server finalization as attachment repair", async () => {
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const cancelUnprepared = vi.fn().mockResolvedValue(undefined);
+    const dependencies = {
+      failDeterministically,
+      cancelUnprepared,
+      markOutcomeUnknown: vi.fn().mockResolvedValue(undefined),
+    };
+    const common = {
+      userId: 7,
+      turnId: "turn-local-preparation",
+      leaseToken: "lease-local-preparation",
+      outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+    };
+
+    await persistKnowledgeBaseCreateFailure(
+      {
+        ...common,
+        error: new KnowledgeBaseLocalPreparationError(
+          "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+          "Logo 字节不可解码",
+        ),
+      },
+      dependencies,
+    );
+    expect(cancelUnprepared).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: common.turnId,
+        code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
+      }),
+    );
+    expect(failDeterministically).not.toHaveBeenCalled();
+
+    cancelUnprepared.mockClear();
+    await persistKnowledgeBaseCreateFailure(
+      {
+        ...common,
+        error: new KnowledgeBaseLocalPreparationError(
+          "KNOWLEDGE_BASE_FINALIZATION_INPUT_INVALID",
+          "最终交付输入损坏",
+        ),
+      },
+      dependencies,
+    );
+    expect(failDeterministically).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: common.turnId,
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      }),
+    );
+    expect(cancelUnprepared).not.toHaveBeenCalled();
   });
 
   it("exposes stable stale/replay/Logo status mappings", () => {
@@ -345,6 +525,95 @@ describe("knowledge-base turn HTTP outcomes", () => {
     ).rejects.toMatchObject({
       code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
     });
+  });
+});
+
+describe("knowledge-base upstream read failure authority", () => {
+  it.each([
+    [
+      { kind: "credential_unavailable" as const },
+      "requires_user_fix",
+      "update_credential",
+      "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+    ],
+    [
+      { kind: "http" as const, status: 401 },
+      "requires_user_fix",
+      "update_credential",
+      "UPSTREAM_CREDENTIAL_REJECTED",
+    ],
+    [
+      { kind: "http" as const, status: 403 },
+      "requires_user_fix",
+      "update_credential",
+      "UPSTREAM_CREDENTIAL_REJECTED",
+    ],
+    [
+      { kind: "transport" as const },
+      "recoverable_same_turn",
+      "reconcile",
+      "UPSTREAM_TASK_READ_FAILED",
+    ],
+    [
+      { kind: "http" as const, status: 429 },
+      "recoverable_same_turn",
+      "reconcile",
+      "UPSTREAM_TASK_READ_FAILED",
+    ],
+    [
+      { kind: "http" as const, status: 503 },
+      "recoverable_same_turn",
+      "reconcile",
+      "UPSTREAM_TASK_READ_FAILED",
+    ],
+  ])(
+    "classifies $0 without granting regeneration",
+    (input, failureClass, recoveryAction, code) => {
+      expect(knowledgeBaseUpstreamReadFailureAuthority(input)).toEqual({
+        code,
+        failureClass,
+        recoveryAction,
+        canRegenerate: false,
+      });
+    },
+  );
+
+  it("reopens the exact bound task after credentials are updated", () => {
+    expect(
+      knowledgeBaseNoticeAllowsSameTaskReconcile({
+        recoveryAction: "update_credential",
+        canRegenerate: false,
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseNoticeAllowsSameTaskReconcile({
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("reserves 422 for semantic protocol failures and reports runtime/database failures as 503", () => {
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        new KnowledgeBaseBuildError("PROGRESS_PROTOCOL_INVALID", "invalid"),
+      ),
+    ).toBe(422);
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        new KnowledgeBaseBuildError("BUILD_NOT_FOUND", "missing"),
+      ),
+    ).toBe(404);
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        Object.assign(new Error("deadlock"), { code: "ER_LOCK_DEADLOCK" }),
+      ),
+    ).toBe(503);
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }),
+      ),
+    ).toBe(503);
   });
 });
 
@@ -796,7 +1065,7 @@ describe("knowledge base execution contract", () => {
         status: 200,
         missingTaskId: true,
       }),
-    ).toBe("deterministic");
+    ).toBe("unknown");
   });
 
   it("keeps the Pro prompt compact while preserving depth and one-by-one traversal", async () => {
@@ -811,6 +1080,7 @@ describe("knowledge base execution contract", () => {
         operationId: "operation-1",
         turnId: "turn-1",
       },
+      treePolicyVersion: 2,
     });
 
     expect(prompt).toContain(
@@ -825,7 +1095,11 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain(
       "只有 customerAttachments 中明确列出的文件属于客户事实资料",
     );
-    expect(prompt).toContain("8-115");
+    expect(prompt).toContain("30-115");
+    expect(prompt).toContain("普通企业目标 40-55");
+    expect(prompt).toContain("references/knowledge-tree.md");
+    expect(prompt).toContain("至少成功解析 12 个官网页面并执行 6 次公开查询");
+    expect(prompt).toContain("120 个成功官网页、200 个访问链接");
     expect(prompt).toContain("不得为数量、字数或图片数填充内容");
     expect(prompt).toContain("一级分支数量不设固定值");
     expect(prompt).not.toContain("恰好 7 个一级分支");
@@ -838,6 +1112,11 @@ describe("knowledge base execution contract", () => {
     expect(prompt).toContain("FRONTMIND_KB_MANIFEST");
     expect(prompt).toContain("FRONTMIND_KB_PROGRESS");
     expect(prompt).toContain("FRONTMIND_KB_PRESENTATION");
+    expect(prompt).toContain(
+      "输出前先自行解析每个机器信封，并按给定 schema、operationId 与 turnId 范围完成校验",
+    );
+    expect(prompt).toContain("只输出一次唯一合法结构");
+    expect(prompt).toContain("服务端严格校验仍为最终权威");
     expect(prompt).not.toContain("FRONTMIND_KB_REOPEN");
     expect(prompt).toContain("禁止输出 SOCRATIC_KB_STATE");
     expect(prompt).toContain("补充、修订、问题或上传资料");
@@ -864,7 +1143,7 @@ describe("knowledge base execution contract", () => {
       "FrontMind 正在按业务分支进行资料采集。此阶段无需逐项确认，完成后将直接生成可核验知识库。",
     );
     expect(prompt).toContain("imageState=no_eligible_asset");
-    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(10_000);
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(20_000);
     expect(prompt).not.toContain("# Skill");
     expect(prompt).not.toContain("current Pro Agent");
     expect(prompt).not.toContain("# FILE: references/");
@@ -886,15 +1165,44 @@ describe("knowledge base execution contract", () => {
       expect(prompt).not.toContain(forbiddenPhrase);
     }
 
+    const manifestMatch = prompt.match(
+      /<!-- FRONTMIND_KB_MANIFEST\n([^\n]+)\n-->/u,
+    );
+    expect(manifestMatch).not.toBeNull();
+    const manifestExample = JSON.parse(manifestMatch![1]!);
+    expect(manifestExample.leaves).toHaveLength(40);
+    expect(
+      new Set(manifestExample.leaves.map((leaf: any) => leaf.branchId)).size,
+    ).toBe(7);
+    expect(manifestExample.researchCoverage).toMatchObject({
+      officialPages: {
+        discovered: 18,
+        attempted: 16,
+        succeeded: 14,
+        failed: 2,
+      },
+      publicQueries: 6,
+      officialDocuments: 4,
+      uploadsRead: 1,
+      stopReason: "coverage_complete",
+    });
+    expect(manifestExample.researchCoverage.dimensions).toHaveLength(7);
+
     const archive = await readKnowledgeBaseSkillArchiveAttachment();
     expect(archive.filename).toBe("socratic-kb-builder.skill.zip");
     expect(archive.bytes.subarray(0, 4).toString("hex")).toBe("504b0304");
     const zip = await JSZip.loadAsync(archive.bytes);
     const skill = await zip.file("SKILL.md")?.async("string");
+    const normalizedSkill = String(skill || "").replace(/\s+/gu, " ");
     for (const invariant of [
       "current Pro Agent",
-      "1,200 official HTML attempts",
-      "1,800 visited links",
+      "120 successfully parsed official pages",
+      "200 visited links",
+      "30 useful official documents",
+      "30 public queries",
+      "30–115 leaf tree",
+      "40–55 leaves",
+      "researchCoverage",
       "3,000,000",
       "limited_evidence",
       "evidenceDocumentIds",
@@ -919,8 +1227,33 @@ describe("knowledge base execution contract", () => {
       "VALID dashboard-enterprise-v1 archive",
       "README/TXT marker",
     ]) {
-      expect(skill).toContain(invariant);
+      expect(normalizedSkill).toContain(invariant);
     }
+  });
+
+  it("keeps historical v4 builds on the legacy tree contract", async () => {
+    const prompt = await buildKnowledgeBasePrompt({
+      companyName: "历史企业",
+      companyWebsite: "",
+      operatorNotes: "",
+      attachments: [],
+      protocolOperation: {
+        skillVersion: "4",
+        operationId: "operation-legacy",
+        turnId: "turn-legacy",
+      },
+      treePolicyVersion: 1,
+    });
+    const manifestMatch = prompt.match(
+      /<!-- FRONTMIND_KB_MANIFEST\n([^\n]+)\n-->/u,
+    );
+    expect(manifestMatch).not.toBeNull();
+    const manifestExample = JSON.parse(manifestMatch![1]!);
+    expect(manifestExample.leaves).toHaveLength(8);
+    expect(manifestExample.researchCoverage).toBeUndefined();
+    expect(prompt).toContain("8-115");
+    expect(prompt).not.toContain("普通企业目标 40-55");
+    expect(prompt).not.toContain("researchCoverage 必须记录真实研究账本");
   });
 
   it("keeps an uploaded official Logo on the first leaf with exact provenance", async () => {
@@ -1308,6 +1641,9 @@ describe("knowledge base execution contract", () => {
       prefillKnowledgeSnapshot: snapshot,
     });
     expect(prompt).toContain(KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME);
+    expect(prompt).toContain("这些内容只作为事实证据");
+    expect(prompt).toContain("不得继承 Website 的浅层树");
+    expect(prompt).toContain("10–20 节点深度");
     expect(prompt).not.toContain("只应存在于证据包内的企业事实");
 
     const archive = await buildKnowledgeBasePrefillEvidenceArchive(snapshot);
@@ -1323,7 +1659,34 @@ describe("knowledge base execution contract", () => {
   });
 
   it("pins new builds to v4 while preserving immutable prior archives", async () => {
+    expect(
+      knowledgeBasePinnedV4SkillSelection({
+        skillVersion: "4",
+        skillContentHash:
+          "A619A6EB2D21147EBCCECBF023171834BAB34D46E26D40AC44E8FC98785F8472",
+      }),
+    ).toEqual({
+      version: "4",
+      contentHash:
+        "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
+    });
+    expect(() =>
+      knowledgeBasePinnedV4SkillSelection({
+        skillVersion: "4",
+        skillContentHash: null,
+      }),
+    ).toThrow("immutable Skill content hash");
     const active = await getKnowledgeBaseSkillDescriptor();
+    const immutableA619 = await getKnowledgeBaseSkillDescriptor({
+      version: "4",
+      contentHash:
+        "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
+    });
+    const immutableA619Archive = await readKnowledgeBaseSkillArchiveAttachment({
+      version: "4",
+      contentHash:
+        "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
+    });
     const activeArchive = await readKnowledgeBaseSkillArchiveAttachment();
     const legacyActiveHash = await legacyKnowledgeBaseSkillInstructionHash(
       activeArchive.bytes,
@@ -1349,8 +1712,18 @@ describe("knowledge base execution contract", () => {
     expect(active).toMatchObject({
       name: "socratic-kb-builder",
       version: "4",
-      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      contentHash:
+        "5e0487004c604c0b95feae0c19ee9544a7e82b10ca923ca6c779ed240f333f56",
     });
+    expect(immutableA619.contentHash).toBe(
+      "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
+    );
+    expect(
+      await canonicalKnowledgeBaseSkillArchiveHash(immutableA619Archive.bytes),
+    ).toBe("a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472");
+    expect(
+      createHash("sha256").update(immutableA619Archive.bytes).digest("hex"),
+    ).toBe("5d106aa5905c2db2dd3f0c81e74934fdc98fc171d1d264b68c168bb6f7f9d05a");
     expect(active.contentHash).toBe(
       await canonicalKnowledgeBaseSkillArchiveHash(activeArchive.bytes),
     );
@@ -1525,7 +1898,7 @@ describe("knowledge base execution contract", () => {
       }),
     ).resolves.toMatchObject({
       ok: false,
-      failureClass: "deterministic",
+      failureClass: "unknown",
       failureCode: "UPSTREAM_TASK_ID_MISSING",
     });
     expect(post).toHaveBeenCalledTimes(2);
@@ -1573,7 +1946,7 @@ describe("knowledge base execution contract", () => {
         ok: false,
         status,
         failureClass: expectedFailureClass,
-        failureCode: `UPSTREAM_CREATE_HTTP_${status}`,
+        failureCode: `UPSTREAM_CREATE_${data.error.code}`,
       });
     },
   );

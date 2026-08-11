@@ -3,14 +3,18 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   createKnowledgeBaseTurnTask,
+  discardUnboundUpload,
   reserveKnowledgeBaseTurnWithAttachments,
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   FILE_UPLOAD_STALL_TIMEOUT_MS,
   getModelDisplayName,
+  MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS,
+  recoverManagedUpload,
   retrieveTask,
   sanitizeBrandText,
+  type ManagedUploadHandle,
   uploadFile,
   uploadFileToUrl,
 } from "./frontmind-api";
@@ -785,7 +789,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     });
   });
 
-  it("rejects a successful Logo response that has no real upstream task id", async () => {
+  it("rejects a successful response only when it has neither a task nor an authoritative observation", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -800,13 +804,10 @@ describe("createKnowledgeBaseTurnTask", () => {
         clientRequestId: "request-logo-missing-task",
         submissionKind: "logo",
       }),
-    ).rejects.toMatchObject({
-      status: 502,
-      code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
-    });
+    ).rejects.toThrow("任务创建失败：未返回权威任务状态");
   });
 
-  it("preserves the authoritative observation when a Logo response is missing its task id", async () => {
+  it("accepts a recovering Logo observation without inventing a task id", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -844,9 +845,9 @@ describe("createKnowledgeBaseTurnTask", () => {
         clientRequestId: "request-logo-pending-task-id",
         submissionKind: "logo",
       }),
-    ).rejects.toMatchObject({
-      status: 502,
-      code: "KNOWLEDGE_BASE_LOGO_TASK_ID_MISSING",
+    ).resolves.toMatchObject({
+      id: "",
+      status: "running",
       knowledgeObservation: {
         stateEpoch: 4,
         generation: 1,
@@ -892,7 +893,7 @@ describe("createKnowledgeBaseTurnTask", () => {
         },
       ),
     ).resolves.toMatchObject({
-      id: "kb-observation-2-8",
+      id: "",
       knowledgeObservation: { stateEpoch: 8, generation: 2 },
     });
   });
@@ -991,6 +992,47 @@ describe("uploadFile", () => {
   const uploadedAt = Date.parse("2026-08-04T00:00:00.000Z");
   const expiresAt = Date.parse("2026-09-03T00:00:00.000Z");
 
+  const receipt = (
+    fileId: string,
+    sizeBytes: number,
+    overrides: Partial<{
+      fileId: string;
+      sizeBytes: number;
+      uploadedAt: number;
+      expiresAt: number;
+      replayed: boolean;
+      recovered: boolean;
+    }> = {},
+  ) => ({
+    fileId,
+    sizeBytes,
+    uploadedAt,
+    expiresAt,
+    replayed: false,
+    recovered: false,
+    ...overrides,
+  });
+
+  const stubFileRecord = (
+    fileId: string,
+    filename: string,
+    uploadUrl = "https://uploads.example/signed?X-Amz-Signature=secret",
+  ) => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: fileId,
+        filename,
+        upload_url: uploadUrl,
+        proxy_upload_ticket: `ticket:${fileId}`,
+        proxy_upload_expires_at: "2099-01-01T00:00:00.000Z",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
   it("aborts a half-open upload only after a long no-progress watchdog", async () => {
     vi.useFakeTimers();
     class MockXMLHttpRequest {
@@ -1030,22 +1072,23 @@ describe("uploadFile", () => {
     await expect(upload).rejects.toThrow("长时间没有进度");
   });
 
-  it("encodes a Chinese and Emoji capture filename as an ASCII-safe header", async () => {
+  it("keeps the signed URL out of a captured request and preserves both filenames", async () => {
     const signedUrl =
       "https://uploads.example/signed-unicode?X-Amz-Signature=unicode";
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        id: "file-unicode",
-        filename: "客户补充图😀.png",
-        upload_url: signedUrl,
-      }),
+    const providerFilename = "供应商原名😀.pdf";
+    const captureFilename = "知识库规范名.pdf";
+    const fetchMock = stubFileRecord(
+      "file-unicode",
+      providerFilename,
+      signedUrl,
+    );
+    const file = new File(["pdf"], providerFilename, {
+      type: "application/pdf",
     });
-    vi.stubGlobal("fetch", fetchMock);
 
     const headers = new Map<string, string>();
     let requestUrl = "";
+    let requestBody: unknown;
     class MockXMLHttpRequest {
       status = 0;
       statusText = "";
@@ -1062,9 +1105,10 @@ describe("uploadFile", () => {
       addEventListener(event: string, listener: () => void) {
         this.listeners.set(event, listener);
       }
-      send() {
+      send(body: unknown) {
+        requestBody = body;
         this.status = 200;
-        this.responseText = JSON.stringify({ uploadedAt, expiresAt });
+        this.responseText = JSON.stringify(receipt("file-unicode", file.size));
         queueMicrotask(() => this.listeners.get("load")?.());
       }
     }
@@ -1072,106 +1116,1029 @@ describe("uploadFile", () => {
 
     await expect(
       uploadFile(
-        new File(["png"], "客户补充图😀.png", { type: "image/png" }),
+        file,
         undefined,
         { maxRetries: 0, initialDelay: 0, maxDelay: 0 },
         {
           captureLocalCopy: true,
-          captureFilename: "客户补充图😀.png",
+          captureFilename,
+          batchId: "kb-batch-123",
+          batchOrdinal: 2,
+          batchTotal: 5,
         },
       ),
-    ).resolves.toMatchObject({ fileId: "file-unicode" });
-
-    expect(requestUrl).toContain("capture_file_id=file-unicode");
-    expect(headers.get("X-FrontMind-Capture-Filename-UTF8")).toBe(
-      encodeURIComponent("客户补充图😀.png"),
-    );
-    expect(headers.get("X-FrontMind-Capture-Filename-UTF8")).toMatch(
-      /^[\x20-\x7e]+$/u,
-    );
-  });
-
-  it("creates one file record and reuses the durable proxy across transient PUT retries", async () => {
-    const signedUrl =
-      "https://uploads.example/signed-one?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Signature=abcdef0123456789";
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        id: "file-one",
-        filename: "report.pdf",
-        upload_url: signedUrl,
-      }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const requests: Array<{ method: string; url: string }> = [];
-    const outcomes = ["error", "error", "load"] as const;
-    let nextOutcome = 0;
-
-    class MockXMLHttpRequest {
-      status = 0;
-      statusText = "";
-      responseText = "";
-      upload = { addEventListener: vi.fn() };
-      private method = "";
-      private url = "";
-      private listeners = new Map<string, () => void>();
-
-      open(method: string, url: string) {
-        this.method = method;
-        this.url = url;
-      }
-
-      setRequestHeader() {}
-
-      addEventListener(event: string, listener: () => void) {
-        this.listeners.set(event, listener);
-      }
-
-      send() {
-        requests.push({ method: this.method, url: this.url });
-        const outcome = outcomes[nextOutcome++];
-        if (outcome === "load") {
-          this.status = 200;
-          this.responseText = JSON.stringify({ uploadedAt, expiresAt });
-        }
-        queueMicrotask(() => this.listeners.get(outcome)?.());
-      }
-    }
-
-    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
-
-    await expect(
-      uploadFile(
-        new File(["pdf"], "report.pdf", { type: "application/pdf" }),
-        undefined,
-        {
-          maxRetries: 1,
-          initialDelay: 0,
-          maxDelay: 0,
-        },
-      ),
-    ).resolves.toEqual({
-      fileId: "file-one",
-      filename: "report.pdf",
+    ).resolves.toMatchObject({
+      fileId: "file-unicode",
+      sizeBytes: file.size,
       uploadedAt,
       expiresAt,
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/frontmind/v1/files",
-      expect.objectContaining({ method: "POST" }),
+    expect(requestUrl).toBe(
+      "/api/frontmind/proxy-upload?capture_file_id=file-unicode",
     );
-    const durableProxyUrl = `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}&capture_file_id=file-one`;
-    expect(requests).toEqual(
-      Array.from({ length: 3 }, () => ({
-        method: "PUT",
-        url: durableProxyUrl,
-      })),
+    expect(requestUrl).not.toContain("target=");
+    expect(requestUrl).not.toContain(signedUrl);
+    expect(requestBody).toBe(file);
+    expect(headers.get("X-FrontMind-Provider-Filename-UTF8")).toBe(
+      encodeURIComponent(providerFilename),
+    );
+    expect(headers.get("X-FrontMind-Capture-Filename-UTF8")).toBe(
+      encodeURIComponent(captureFilename),
+    );
+    expect(headers.get("X-FrontMind-Upload-Batch-Id")).toBe("kb-batch-123");
+    expect(headers.get("X-FrontMind-Upload-Ordinal")).toBe("2");
+    expect(headers.get("X-FrontMind-Upload-Total")).toBe("5");
+    expect(headers.get("X-FrontMind-Upload-Ticket")).toBe(
+      "ticket:file-unicode",
+    );
+    expect(headers.get("X-FrontMind-Capture-Filename-UTF8")).toMatch(
+      /^[\x20-\x7e]+$/u,
+    );
+    expect(fetchMock.mock.calls[0][1].body).toBe(
+      JSON.stringify({ filename: providerFilename }),
     );
   });
+
+  it("keeps the original requested filename in recovery when the public record display name is sanitized", async () => {
+    const providerFilename = `${["M", "a", "n", "u", "s"].join("")}-资料.pdf`;
+    const displayFilename = "FrontMind-资料.pdf";
+    const fileId = "file-brand-filename";
+    const file = new File(["brand"], providerFilename, {
+      type: "application/pdf",
+    });
+    const recoveryBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === "/api/frontmind/v1/files") {
+          return {
+            ok: true,
+            status: 201,
+            json: async () => ({
+              id: fileId,
+              filename: displayFilename,
+              upload_url: "https://uploads.example/legacy",
+              proxy_upload_ticket: "ticket-brand-filename",
+              proxy_upload_expires_at: "2099-01-01T00:00:00.000Z",
+            }),
+          };
+        }
+        if (url.endsWith(`/${fileId}/upload-recovery`)) {
+          recoveryBodies.push(JSON.parse(String(init?.body)));
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              fileId,
+              state: "uploaded",
+              recreateRequired: false,
+              receipt: receipt(fileId, file.size, { recovered: true }),
+            }),
+          };
+        }
+        throw new Error(`unexpected request ${url}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    let sentBodies = 0;
+    class MockXMLHttpRequest {
+      status = 503;
+      responseText = JSON.stringify({
+        error: {
+          code: "UPSTREAM_UPLOAD_UNAVAILABLE",
+          message: "上游暂时不可用",
+          retryable: true,
+          recoveryAction: "retry_same_file",
+          fileId,
+        },
+      });
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        sentBodies += 1;
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    let uploadHandle: ManagedUploadHandle | undefined;
+
+    await expect(
+      uploadFile(file, undefined, undefined, {
+        onFileRecord: (event) => {
+          uploadHandle = event.uploadHandle;
+        },
+      }),
+    ).rejects.toMatchObject({ code: "UPSTREAM_UPLOAD_UNAVAILABLE" });
+    expect(uploadHandle).toMatchObject({
+      fileId,
+      filename: providerFilename,
+      ticket: "ticket-brand-filename",
+    });
+
+    await expect(
+      uploadFile(file, undefined, undefined, {
+        existingUploadHandle: uploadHandle!,
+      }),
+    ).resolves.toMatchObject({ fileId, recovered: true });
+    expect(recoveryBodies).toEqual([
+      {
+        filename: providerFilename,
+        sizeBytes: file.size,
+        mimeType: "application/pdf",
+      },
+    ]);
+    expect(sentBodies).toBe(1);
+  });
+
+  it("sends only one captured browser body on 403 and preserves the server code", async () => {
+    stubFileRecord("file-forbidden", "private.pdf");
+    const sentBodies: unknown[] = [];
+    class MockXMLHttpRequest {
+      status = 403;
+      statusText = "";
+      responseText = JSON.stringify({
+        error: {
+          code: "UPLOAD_CAPTURE_FORBIDDEN",
+          message: "上传文件不属于当前账号",
+        },
+      });
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send(body: unknown) {
+        sentBodies.push(body);
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const error = await uploadFile(
+      new File(["private"], "private.pdf", { type: "application/pdf" }),
+      undefined,
+      { maxRetries: 9, initialDelay: 0, maxDelay: 0 },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      message: "上传文件不属于当前账号",
+      code: "UPLOAD_CAPTURE_FORBIDDEN",
+      status: 403,
+      fileId: "file-forbidden",
+      retryable: false,
+    });
+    expect((error as Error).message).not.toContain("失效");
+    expect(sentBodies).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      status: 409,
+      code: "UPLOAD_IN_PROGRESS",
+      retryable: true,
+    },
+    {
+      status: 503,
+      code: "UPSTREAM_UPLOAD_UNAVAILABLE",
+      retryable: false,
+    },
+  ])(
+    "honors server retryable=$retryable for a $status captured response",
+    async ({ status, code, retryable }) => {
+      const fileId = `file-server-retryable-${status}`;
+      stubFileRecord(fileId, "server-retryable.pdf");
+      class MockXMLHttpRequest {
+        status = 0;
+        responseText = "";
+        upload = { addEventListener: vi.fn() };
+        private listeners = new Map<string, () => void>();
+        open() {}
+        setRequestHeader() {}
+        addEventListener(event: string, listener: () => void) {
+          this.listeners.set(event, listener);
+        }
+        send() {
+          this.status = status;
+          this.responseText = JSON.stringify({
+            error: {
+              code,
+              message: "服务端上传状态需要由显式合同判断",
+              retryable,
+            },
+          });
+          queueMicrotask(() => this.listeners.get("load")?.());
+        }
+      }
+      vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+      await expect(
+        uploadFile(
+          new File(["retry"], "server-retryable.pdf", {
+            type: "application/pdf",
+          }),
+        ),
+      ).rejects.toMatchObject({
+        code,
+        status,
+        fileId,
+        retryable,
+      });
+    },
+  );
+
+  it("cancels the active captured XHR through AbortSignal", async () => {
+    stubFileRecord("file-cancel", "cancel.pdf");
+    const controller = new AbortController();
+    const sentBodies: unknown[] = [];
+    class MockXMLHttpRequest {
+      status = 0;
+      responseText = "";
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send(body: unknown) {
+        sentBodies.push(body);
+        controller.abort();
+      }
+      abort() {
+        this.listeners.get("abort")?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const error = await uploadFile(
+      new File(["cancel"], "cancel.pdf", { type: "application/pdf" }),
+      undefined,
+      undefined,
+      { signal: controller.signal },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "UPLOAD_CANCELLED",
+      fileId: "file-cancel",
+      retryable: false,
+      cancelled: true,
+    });
+    expect(sentBodies).toHaveLength(1);
+  });
+
+  it("reuses an existing file id without creating another provider record", async () => {
+    const existingFileId = "opaque/file+existing";
+    const existingHandle = {
+      fileId: existingFileId,
+      filename: " manual-retry.pdf ",
+      ticket: "opaque-retry-ticket",
+      expiresAt: Date.parse("2099-01-01T00:00:00.000Z"),
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        fileId: existingFileId,
+        state: "ready",
+        recreateRequired: false,
+        traceId: "trace-recovery-ready",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const file = new File(["retry"], existingHandle.filename, {
+      type: "application/pdf",
+    });
+    const requestUrls: string[] = [];
+    class MockXMLHttpRequest {
+      status = 0;
+      responseText = "";
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open(_method: string, url: string) {
+        requestUrls.push(url);
+      }
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        this.status = 200;
+        this.responseText = JSON.stringify(receipt(existingFileId, file.size));
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const onFileRecord = vi.fn();
+
+    await expect(
+      uploadFile(file, undefined, undefined, {
+        existingUploadHandle: existingHandle,
+        onFileRecord,
+      }),
+    ).resolves.toMatchObject({ fileId: existingFileId, sizeBytes: file.size });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/frontmind/v1/files/${encodeURIComponent(existingFileId)}/upload-recovery`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "X-FrontMind-Upload-Ticket": existingHandle.ticket,
+        }),
+      }),
+    );
+    expect(
+      JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)),
+    ).toMatchObject({
+      filename: existingHandle.filename,
+      sizeBytes: file.size,
+      mimeType: "application/pdf",
+    });
+    expect(requestUrls).toEqual([
+      `/api/frontmind/proxy-upload?capture_file_id=${encodeURIComponent(existingFileId)}`,
+    ]);
+    expect(onFileRecord).toHaveBeenCalledWith({
+      fileId: existingFileId,
+      filename: existingHandle.filename,
+      uploadHandle: existingHandle,
+      reusedExistingFileId: true,
+    });
+  });
+
+  it("recovers a confirmed receipt without sending another browser body", async () => {
+    const file = new File(["already uploaded"], "recovered.pdf", {
+      type: "application/pdf",
+    });
+    const handle = {
+      fileId: "file-recovered",
+      filename: file.name,
+      ticket: "ticket-recovered",
+      expiresAt: Date.parse("2099-01-01T00:00:00.000Z"),
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        fileId: handle.fileId,
+        state: "uploaded",
+        recreateRequired: false,
+        traceId: "trace-recovered",
+        receipt: receipt(handle.fileId, file.size, {
+          recovered: true,
+        }),
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let xhrCount = 0;
+    class MockXMLHttpRequest {
+      constructor() {
+        xhrCount += 1;
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const stages: string[] = [];
+
+    await expect(
+      uploadFile(file, undefined, undefined, {
+        existingUploadHandle: handle,
+        onStage: (event) => stages.push(event.stage),
+      }),
+    ).resolves.toMatchObject({
+      fileId: handle.fileId,
+      recovered: true,
+      traceId: "trace-recovered",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(xhrCount).toBe(0);
+    expect(stages).toEqual(["creating_record", "recovering", "uploaded"]);
+  });
+
+  it("bounds managed recovery and keeps the action at check_status", async () => {
+    vi.useFakeTimers();
+    let requestSignal: AbortSignal | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestSignal = init?.signal as AbortSignal;
+        return new Promise((_resolve, reject) => {
+          requestSignal.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      }),
+    );
+    const recovery = recoverManagedUpload(
+      { fileId: "file-timeout", ticket: "ticket-timeout" },
+      new File(["timeout"], "timeout.pdf"),
+    );
+    const settled = recovery.catch((error: unknown) => error);
+
+    await vi.advanceTimersByTimeAsync(MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS);
+
+    await expect(settled).resolves.toMatchObject({
+      code: "UPLOAD_RECOVERY_UNAVAILABLE",
+      recoveryAction: "check_status",
+      retryable: true,
+    });
+    expect(requestSignal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never discards when recreateRequired lacks the explicit discard action", async () => {
+    const file = new File(["mismatch"], "mismatch.pdf", {
+      type: "application/pdf",
+    });
+    const handle: ManagedUploadHandle = {
+      fileId: "file-mismatched-directive",
+      filename: file.name,
+      ticket: "ticket-mismatched-directive",
+      expiresAt: Date.parse("2099-01-01T00:00:00.000Z"),
+    };
+    const requestUrls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestUrls.push(url);
+      if (!url.endsWith("/upload-recovery")) {
+        throw new Error(`unsafe follow-up request ${url}`);
+      }
+      return {
+        ok: false,
+        status: 409,
+        json: async () => ({
+          error: {
+            code: "UPLOAD_RECOVERY_UNVERIFIED",
+            message: "恢复元数据互相矛盾",
+            retryable: false,
+            recoveryAction: "retry_same_file",
+            recreateRequired: true,
+            fileId: handle.fileId,
+            traceId: "trace-mismatched-directive",
+          },
+        }),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let xhrCount = 0;
+    class MockXMLHttpRequest {
+      constructor() {
+        xhrCount += 1;
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadFile(file, undefined, undefined, {
+        existingUploadHandle: handle,
+      }),
+    ).rejects.toMatchObject({
+      code: "UPLOAD_RECOVERY_UNVERIFIED",
+      recoveryAction: "check_status",
+      recreateRequired: false,
+      fileId: handle.fileId,
+      traceId: "trace-mismatched-directive",
+    });
+    expect(requestUrls).toEqual([
+      `/api/frontmind/v1/files/${handle.fileId}/upload-recovery`,
+    ]);
+    expect(xhrCount).toBe(0);
+  });
+
+  it("keeps the expected id when a recovery error names another record", async () => {
+    const expectedFileId = "file-expected-recovery";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          error: {
+            code: "UPLOAD_CAPABILITY_EXPIRED_RECREATE_REQUIRED",
+            message: "需要重建上传记录",
+            retryable: false,
+            recoveryAction: "discard_and_recreate",
+            recreateRequired: true,
+            fileId: "file-unrelated-recovery",
+            traceId: "trace-wrong-recovery-id",
+          },
+        }),
+      }),
+    );
+
+    await expect(
+      recoverManagedUpload(
+        { fileId: expectedFileId, ticket: "ticket-expected-recovery" },
+        new File(["recovery"], "recovery-id.pdf"),
+      ),
+    ).rejects.toMatchObject({
+      code: "UPLOAD_RECOVERY_INVALID",
+      fileId: expectedFileId,
+      retryable: true,
+      recoveryAction: "check_status",
+      recreateRequired: false,
+      traceId: "trace-wrong-recovery-id",
+    });
+  });
+
+  it.each([
+    {
+      label: "restage_required even with a valid ticket",
+      state: "restage_required" as const,
+      existingUploadHandle: {
+        fileId: "file-restage-unverified",
+        filename: "recovery-guard.pdf",
+        ticket: "ticket-restage-unverified",
+        expiresAt: Date.parse("2099-01-01T00:00:00.000Z"),
+      },
+      existingFileId: undefined,
+      expectedCode: "UPLOAD_RECOVERY_UNVERIFIED",
+    },
+    {
+      label: "ready without a ticket",
+      state: "ready" as const,
+      existingUploadHandle: undefined,
+      existingFileId: "file-ready-ticketless",
+      expectedCode: "UPLOAD_CAPABILITY_REQUIRED",
+    },
+    {
+      label: "ready with an expired ticket",
+      state: "ready" as const,
+      existingUploadHandle: {
+        fileId: "file-ready-expired",
+        filename: "recovery-guard.pdf",
+        ticket: "ticket-ready-expired",
+        expiresAt: Date.parse("2020-01-01T00:00:00.000Z"),
+      },
+      existingFileId: undefined,
+      expectedCode: "UPLOAD_CAPABILITY_EXPIRED",
+    },
+    {
+      label: "ready with less than fifteen seconds left on its ticket",
+      state: "ready" as const,
+      existingUploadHandle: {
+        fileId: "file-ready-near-expiry",
+        filename: "recovery-guard.pdf",
+        ticket: "ticket-ready-near-expiry",
+        expiresAt: Date.now() + 5_000,
+      },
+      existingFileId: undefined,
+      expectedCode: "UPLOAD_CAPABILITY_EXPIRED",
+    },
+  ])(
+    "fails closed for $label without sending a browser body",
+    async (input) => {
+      const file = new File(["guard"], "recovery-guard.pdf", {
+        type: "application/pdf",
+      });
+      const fileId =
+        input.existingUploadHandle?.fileId || input.existingFileId || "";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            fileId,
+            state: input.state,
+            recreateRequired: false,
+            traceId: "trace-recovery-guard",
+          }),
+        }),
+      );
+      let xhrCount = 0;
+      class MockXMLHttpRequest {
+        constructor() {
+          xhrCount += 1;
+        }
+      }
+      vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+      await expect(
+        uploadFile(file, undefined, undefined, {
+          ...(input.existingUploadHandle
+            ? { existingUploadHandle: input.existingUploadHandle }
+            : { existingFileId: input.existingFileId }),
+        }),
+      ).rejects.toMatchObject({
+        code: input.expectedCode,
+        recoveryAction: "check_status",
+        recreateRequired: false,
+        fileId,
+        traceId: "trace-recovery-guard",
+      });
+      expect(xhrCount).toBe(0);
+    },
+  );
+
+  it("reconciles, discards, and only then creates a replacement managed record", async () => {
+    const file = new File(["replacement"], "replacement.pdf", {
+      type: "application/pdf",
+    });
+    const oldHandle = {
+      fileId: "file-old",
+      filename: file.name,
+      ticket: "ticket-old",
+      expiresAt: Date.parse("2026-01-01T00:00:00.000Z"),
+    };
+    const order: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/file-old/upload-recovery")) {
+        order.push("recover");
+        return {
+          ok: false,
+          status: 410,
+          json: async () => ({
+            error: {
+              code: "UPLOAD_CAPABILITY_EXPIRED",
+              message: "上传凭证已过期",
+              retryable: false,
+              recoveryAction: "discard_and_recreate",
+              recreateRequired: true,
+              fileId: oldHandle.fileId,
+              traceId: "trace-expired",
+            },
+          }),
+        };
+      }
+      if (url.endsWith("/file-old/discard")) {
+        order.push("discard");
+        return { status: 204 };
+      }
+      if (url === "/api/frontmind/v1/files") {
+        order.push("create");
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({
+            id: "file-new",
+            filename: file.name,
+            upload_url: "https://uploads.example/new",
+            proxy_upload_ticket: "ticket-new",
+            proxy_upload_expires_at: "2099-01-01T00:00:00.000Z",
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    class MockXMLHttpRequest {
+      status = 0;
+      responseText = "";
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        order.push("xhr");
+        this.status = 200;
+        this.responseText = JSON.stringify(receipt("file-new", file.size));
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const onFileRecordDiscarded = vi.fn();
+    const onFileRecord = vi.fn();
+
+    await expect(
+      uploadFile(file, undefined, undefined, {
+        existingUploadHandle: oldHandle,
+        onFileRecordDiscarded,
+        onFileRecord,
+      }),
+    ).resolves.toMatchObject({ fileId: "file-new" });
+
+    expect(order).toEqual(["recover", "discard", "create", "xhr"]);
+    expect(onFileRecordDiscarded).toHaveBeenCalledWith("file-old");
+    expect(onFileRecord).toHaveBeenLastCalledWith({
+      fileId: "file-new",
+      filename: file.name,
+      uploadHandle: expect.objectContaining({
+        fileId: "file-new",
+        ticket: "ticket-new",
+      }),
+      reusedExistingFileId: false,
+    });
+  });
+
+  it("parses managed recovery action and trace id without retrying the body", async () => {
+    stubFileRecord("file-traced", "traced.pdf");
+    let sentBodies = 0;
+    class MockXMLHttpRequest {
+      status = 409;
+      responseText = JSON.stringify({
+        error: {
+          code: "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+          message: "文件身份不匹配",
+          retryable: false,
+          recoveryAction: "discard_and_recreate",
+          recreateRequired: true,
+          fileId: "file-traced",
+          traceId: "trace-identity",
+        },
+      });
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        sentBodies += 1;
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const stages: string[] = [];
+    const progress: number[] = [];
+
+    await expect(
+      uploadFile(
+        new File(["trace"], "traced.pdf"),
+        (percent) => progress.push(percent),
+        undefined,
+        { onStage: (event) => stages.push(event.stage) },
+      ),
+    ).rejects.toMatchObject({
+      code: "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+      recoveryAction: "discard_and_recreate",
+      recreateRequired: true,
+      traceId: "trace-identity",
+    });
+    expect(sentBodies).toBe(1);
+    expect(progress).toEqual([0]);
+    expect(stages).toEqual(["creating_record", "uploading"]);
+  });
+
+  it("keeps the expected file id and fails closed when an upload error names another record", async () => {
+    const expectedFileId = "file-expected-error";
+    stubFileRecord(expectedFileId, "identity-error.pdf");
+    class MockXMLHttpRequest {
+      status = 409;
+      responseText = JSON.stringify({
+        error: {
+          code: "UPLOAD_CAPABILITY_EXPIRED_RECREATE_REQUIRED",
+          message: "需要重建上传记录",
+          retryable: false,
+          recoveryAction: "discard_and_recreate",
+          recreateRequired: true,
+          fileId: "file-unrelated-error",
+          traceId: "trace-wrong-error-id",
+        },
+      });
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadFile(new File(["identity"], "identity-error.pdf")),
+    ).rejects.toMatchObject({
+      code: "UPLOAD_RECOVERY_INVALID",
+      fileId: expectedFileId,
+      retryable: true,
+      recoveryAction: "check_status",
+      recreateRequired: false,
+      traceId: "trace-wrong-error-id",
+    });
+  });
+
+  it("returns the file id and sends no bytes when the record callback fails", async () => {
+    stubFileRecord("file-callback", "callback.pdf");
+    let xhrCount = 0;
+    class MockXMLHttpRequest {
+      constructor() {
+        xhrCount += 1;
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadFile(
+        new File(["callback"], "callback.pdf", { type: "application/pdf" }),
+        undefined,
+        undefined,
+        {
+          onFileRecord: async () => {
+            throw new Error("local persistence unavailable");
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "FILE_RECORD_CALLBACK_FAILED",
+      fileId: "file-callback",
+      retryable: true,
+    });
+    expect(xhrCount).toBe(0);
+  });
+
+  it("returns the created id and sends no bytes when a managed ticket is missing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: "file-ticket-missing",
+        filename: "missing-ticket.pdf",
+        upload_url: "https://uploads.example/legacy-only",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let xhrCount = 0;
+    class MockXMLHttpRequest {
+      constructor() {
+        xhrCount += 1;
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const onFileRecord = vi.fn();
+
+    await expect(
+      uploadFile(
+        new File(["missing"], "missing-ticket.pdf", {
+          type: "application/pdf",
+        }),
+        undefined,
+        undefined,
+        { onFileRecord },
+      ),
+    ).rejects.toMatchObject({
+      code: "FILE_RECORD_INVALID",
+      fileId: "file-ticket-missing",
+      recoveryAction: "retry_same_file",
+    });
+    expect(onFileRecord).not.toHaveBeenCalled();
+    expect(xhrCount).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports ordered stages, numeric progress, and the validated receipt", async () => {
+    stubFileRecord("file-progress", "progress.pdf");
+    const file = new File(["abcdef"], "progress.pdf", {
+      type: "application/pdf",
+    });
+    const lifecycleOrder: string[] = [];
+    type Listener = (event?: {
+      lengthComputable: boolean;
+      loaded: number;
+      total: number;
+    }) => void;
+    class MockXMLHttpRequest {
+      status = 0;
+      responseText = "";
+      private listeners = new Map<string, Listener>();
+      private uploadListeners = new Map<string, Listener>();
+      upload = {
+        addEventListener: (event: string, listener: Listener) => {
+          this.uploadListeners.set(event, listener);
+        },
+      };
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: Listener) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        lifecycleOrder.push("body");
+        this.uploadListeners.get("progress")?.({
+          lengthComputable: true,
+          loaded: file.size / 2,
+          total: file.size,
+        });
+        this.uploadListeners.get("load")?.();
+        this.status = 200;
+        this.responseText = JSON.stringify(
+          receipt("file-progress", file.size, {
+            replayed: true,
+            recovered: true,
+          }),
+        );
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const progress: number[] = [];
+    const stages: Array<{
+      stage: string;
+      fileId?: string;
+      loadedBytes?: number;
+      totalBytes?: number;
+      receipt?: unknown;
+    }> = [];
+    const onFileRecord = vi.fn(() => lifecycleOrder.push("record"));
+
+    const result = await uploadFile(
+      file,
+      (percent) => progress.push(percent),
+      undefined,
+      {
+        onStage: (event) => stages.push(event),
+        onFileRecord,
+      },
+    );
+
+    expect(progress).toEqual([0, 50, 100]);
+    expect(
+      stages
+        .map((event) => event.stage)
+        .filter((stage, index, all) => index === 0 || stage !== all[index - 1]),
+    ).toEqual([
+      "creating_record",
+      "uploading",
+      "server_processing",
+      "uploaded",
+    ]);
+    expect(stages[stages.length - 1]).toMatchObject({
+      stage: "uploaded",
+      fileId: "file-progress",
+      loadedBytes: file.size,
+      totalBytes: file.size,
+      receipt: {
+        fileId: "file-progress",
+        sizeBytes: file.size,
+        uploadedAt,
+        expiresAt,
+        replayed: true,
+        recovered: true,
+      },
+    });
+    expect(lifecycleOrder).toEqual(["record", "body"]);
+    expect(result).toEqual({
+      fileId: "file-progress",
+      filename: "progress.pdf",
+      sizeBytes: file.size,
+      uploadedAt,
+      expiresAt,
+      replayed: true,
+      recovered: true,
+    });
+  });
+
+  it.each([
+    {
+      label: "file id",
+      makeReceipt: (sizeBytes: number) => receipt("file-other", sizeBytes),
+      code: "UPLOAD_RECEIPT_FILE_MISMATCH",
+    },
+    {
+      label: "file size",
+      makeReceipt: (sizeBytes: number) =>
+        receipt("file-validation", sizeBytes, { sizeBytes: sizeBytes + 1 }),
+      code: "UPLOAD_RECEIPT_INVALID",
+    },
+  ])(
+    "rejects a receipt with the wrong $label",
+    async ({ makeReceipt, code }) => {
+      stubFileRecord("file-validation", "validation.pdf");
+      const file = new File(["validate"], "validation.pdf", {
+        type: "application/pdf",
+      });
+      class MockXMLHttpRequest {
+        status = 0;
+        responseText = "";
+        upload = { addEventListener: vi.fn() };
+        private listeners = new Map<string, () => void>();
+        open() {}
+        setRequestHeader() {}
+        addEventListener(event: string, listener: () => void) {
+          this.listeners.set(event, listener);
+        }
+        send() {
+          this.status = 200;
+          this.responseText = JSON.stringify(makeReceipt(file.size));
+          queueMicrotask(() => this.listeners.get("load")?.());
+        }
+      }
+      vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+      await expect(uploadFile(file)).rejects.toMatchObject({
+        code,
+        fileId: "file-validation",
+        retryable: true,
+      });
+    },
+  );
 
   it("rejects a file over 100 MB before creating an upstream record", async () => {
     const fetchMock = vi.fn();
@@ -1190,52 +2157,108 @@ describe("uploadFile", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not retry or expose raw storage XML after a permanent proxy rejection", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        id: "file-two",
-        filename: "Logo.png",
-        upload_url:
-          "https://uploads.example/logo.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abcdef",
-      }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    let requestCount = 0;
+  it("keeps the legacy direct-to-generic-proxy retry path for non-captured uploads", async () => {
+    const signedUrl =
+      "https://uploads.example/legacy?X-Amz-Signature=legacy-secret";
+    const fetchMock = stubFileRecord("file-legacy", "legacy.pdf", signedUrl);
+    const requests: Array<{ url: string; body: unknown }> = [];
     class MockXMLHttpRequest {
       status = 0;
       statusText = "";
       responseText = "";
       upload = { addEventListener: vi.fn() };
+      private url = "";
       private listeners = new Map<string, () => void>();
 
-      open() {}
+      open(_method: string, url: string) {
+        this.url = url;
+      }
       setRequestHeader() {}
       addEventListener(event: string, listener: () => void) {
         this.listeners.set(event, listener);
       }
-      send() {
-        requestCount += 1;
-        if (requestCount === 1) {
+      send(body: unknown) {
+        requests.push({ url: this.url, body });
+        if (requests.length === 1) {
           queueMicrotask(() => this.listeners.get("error")?.());
           return;
         }
-        this.status = 400;
-        this.responseText = JSON.stringify({
-          error: {
-            message: "上传地址无效或已失效，请重新选择文件后重试",
-          },
-        });
+        this.status = requests.length === 2 ? 503 : 204;
+        if (this.status === 503) {
+          this.responseText = JSON.stringify({
+            error: {
+              code: "UPLOAD_PROXY_UNAVAILABLE",
+              message: "上传服务暂时不可用",
+            },
+          });
+        }
         queueMicrotask(() => this.listeners.get("load")?.());
       }
     }
     vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const file = new File(["legacy"], "legacy.pdf", {
+      type: "application/pdf",
+    });
 
     await expect(
-      uploadFile(new File(["png"], "Logo.png", { type: "image/png" })),
-    ).rejects.toThrow("上传地址无效或已失效");
-    expect(requestCount).toBe(2);
+      uploadFile(
+        file,
+        undefined,
+        { maxRetries: 1, initialDelay: 0, maxDelay: 0 },
+        { captureLocalCopy: false },
+      ),
+    ).resolves.toEqual({ fileId: "file-legacy", filename: "legacy.pdf" });
+
+    const genericProxyUrl = `/api/frontmind/proxy-upload?target=${encodeURIComponent(signedUrl)}`;
+    expect(requests.map((request) => request.url)).toEqual([
+      signedUrl,
+      genericProxyUrl,
+      genericProxyUrl,
+    ]);
+    expect(requests.every((request) => request.body === file)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards an explicitly removed unbound upload through the authorized route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ status: 204 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      discardUnboundUpload(" file/unused "),
+    ).resolves.toBeUndefined();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/frontmind/v1/files/%20file%2Funused%20/discard",
+      expect.objectContaining({
+        method: "DELETE",
+        credentials: "include",
+      }),
+    );
+  });
+
+  it("preserves a structured conflict when a discard target is already bound", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 409,
+      json: async () => ({
+        error: {
+          code: "UPLOAD_ALREADY_BOUND",
+          message: "文件已经绑定到任务",
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const opaqueFileId = " file-bound ";
+    await expect(discardUnboundUpload(opaqueFileId)).rejects.toMatchObject({
+      message: "文件已经绑定到任务",
+      code: "UPLOAD_ALREADY_BOUND",
+      status: 409,
+      fileId: opaqueFileId,
+      retryable: false,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/frontmind/v1/files/%20file-bound%20/discard",
+      expect.any(Object),
+    );
   });
 });

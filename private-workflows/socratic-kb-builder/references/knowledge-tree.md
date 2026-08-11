@@ -22,7 +22,7 @@ report.
 
 ## Leaf inventory
 
-Build 8–115 stable leaves before confirmation:
+Build 30–115 stable leaves before confirmation:
 
 | Enterprise scope                      | Typical leaves |
 | ------------------------------------- | -------------: |
@@ -33,11 +33,29 @@ Build 8–115 stable leaves before confirmation:
 Keep every real product/service family represented. Consolidate large SKU,
 news, pagination, and language-version inventories into family leaves. Give
 core families deeper leaves for positioning, capabilities/parameters,
-applications, proof/cases, and FAQs. Do not create artificial leaves merely to
-reach 40; instead audit missing business questions and documented evidence.
+applications, proof/cases, and FAQs. A typical enterprise with one to three
+families should use 40–55 leaves. A sparse enterprise must still reach 30 by
+auditing applicable unanswered business questions and creating distinct
+`needs_verification` gap leaves. Never invent facts, duplicate prose, split one
+fact mechanically, or repeat a generic disclaimer to meet the floor.
 
 Use stable `id`, `title`, `branchId`, and `branchTitle` values. Never rename an
 ID after the first `FRONTMIND_KB_MANIFEST`.
+
+## Research coverage gate
+
+Before fixing the inventory, read every initial upload and audit all seven
+business questions above. A normal complete run executes at least six public
+queries and successfully parses at least 12 official pages. A genuinely small
+official site may finish with fewer successful pages only after its discovered
+official queue is exhausted and the exact limitation is recorded.
+
+Hard ceilings are 120 successfully parsed official pages, 200 visited links,
+30 public queries and 30 useful official documents. The production manifest's
+`researchCoverage` must use actual counters, list every product/service family
+with real leaf IDs, and represent all seven dimensions as evidence-backed
+coverage or a specific gap. A Website prefill contributes evidence but never
+supplies the Dashboard branch/leaf structure, IDs, depth or traversal state.
 
 ## Required formal layer
 
