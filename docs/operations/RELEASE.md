@@ -127,6 +127,50 @@ workflow 的 `push / workflow_dispatch / repository_dispatch` run 中选择最�
 回到最新精确 PR run + artifact 路径。只有成功激活证据可在旧 PR artifact 到期后支持同源恢复；
 否则 artifact 缺失或到期仍失败关闭。整个恢复路径不新增数据库、账本或状态桥。
 
+### 2.1 Knowledge Base Manus v2 同 digest 分阶段开关
+
+Knowledge Base v2 writer 与 active legacy migration 是两个独立的生产运行期开关。新产品
+镜像首次发布保持 `FRONTMIND_KB_MANUS_V2_WRITER=false`、
+`FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=false`。完成真实隔离 canary 后，才从 Actions
+选择 `workflow_dispatch` 并提供当前生产 `/readyz` 所显示的精确 source SHA 与
+`sha256:` digest：
+
+- `dual-read`：writer=`false`，active migration=`false`；
+- `canary`：writer=`true`，active migration=`false`；
+- `migration`：writer=`true`，active migration=`true`；
+- `pause`：writer=`true`，active migration=`false`；
+- `complete`：writer=`true`，active migration=`false`，只允许从 `migration` 收口。
+
+五个 phase 只调用固定 Dashboard capability。prebuild gate 必须先证明当前生产 source 是已
+激活的同一 `main`，CI 随后独立验签 digest 与 OCI revision。服务器 controller 再以原子 state、
+实际运行容器、只读 `release-db plan` 的 exact journal/schema，以及 local/public `/readyz`
+作为 fence；只更新 root-owned `/etc/frontmind/dashboard.env` 并对同一 digest 执行
+`--force-recreate`。成功不改变 state 的 current/previous digest，也不写数据库。
+
+`pause` 是紧急停止新扫描，不是迁移完成证据。`complete` 调用前，workflow 与服务器 controller
+分别要求当前 flags 为 true/true，并要求 public 及 local `/readyz` 的
+`lastSweepInfrastructureStatus=ok`、`migrationConverged=true`、`activeLegacyTotal=0`、
+`inFlightHandoffs=0`；任一字段 null、缺失或非零都拒绝收口。
+
+开关变更前，controller 会持久写入旧 env 与严格绑定 source/digest/journal 的 recovery sentinel。
+普通错误、TERM 或 INT 在退出时恢复；SIGKILL 或主机中断由下一次相同 rollout 调用先恢复旧值，
+再决定是否执行新 phase。恢复尚未被 local/public readiness 同时证明时失败关闭并保留 sentinel，
+不能越过。`pause`/`complete` 都不撤销已绑定 canonical task，但只有 `complete` 能证明迁移已收口。
+
+首次安装 production-owned v2 controller 必须从已经合并并经过 CI 的精确生产源码执行：
+
+```bash
+sudo deploy/production/update-release-controllers.sh --apply-version=2
+```
+
+updater 同时持有 Dashboard、Website 发布锁，原子替换 controller 与 forced command，验证版本、
+生产路径与 phase allowlist；安装失败会恢复旧文件。它不修改服务 env、state、数据库或容器。
+updater 必须直接从这份精确源码 checkout 执行，以便同时校验并安装相邻的两个模板；它不是常驻
+发布入口，installer 不会把它复制到 `/usr/local/sbin`。
+旧的 root-owned Dashboard service config 可以省略三个非敏感 rollout 路径，controller 会使用固定
+生产默认值。首次执行 updater 前必须先把两个 Manus v2 flag 作为一对明确的 false/false 原子写入
+root-owned runtime env；缺失、只出现一个、重复或非布尔值一律拒绝，避免半配置状态。
+
 PDF runtime 仅在 `deploy/1panel-node-pdf/**`、其
 [workflow](../../.github/workflows/pdf-runtime.yml)、revision gate 或晋级脚本变化
 （或手工触发）时重建。它签名后以

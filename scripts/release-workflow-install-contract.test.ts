@@ -17,6 +17,9 @@ const productionKnownHosts = path.resolve(
 const pdfWorkflow = path.resolve(".github/workflows/pdf-runtime.yml");
 const pdfDockerfile = path.resolve("deploy/1panel-node-pdf/Dockerfile");
 const installer = path.resolve("deploy/production/install.sh");
+const controllerUpdater = path.resolve(
+  "deploy/production/update-release-controllers.sh",
+);
 const websiteRuntimeEnvExample = path.resolve(
   "deploy/production/website/runtime.env.example",
 );
@@ -37,6 +40,49 @@ afterEach(async () => {
 });
 
 describe("release workflow source-ordering contracts", () => {
+  it("wires the five production same-digest Manus v2 phases without rebuilding", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    const updater = await readFile(controllerUpdater, "utf8");
+    const installerSource = await readFile(installer, "utf8");
+    const phaseJob = workflow.slice(workflow.indexOf("  kb-manus-v2-rollout:"));
+
+    for (const phase of [
+      "dual-read",
+      "canary",
+      "migration",
+      "pause",
+      "complete",
+    ]) {
+      expect(workflow).toContain(`          - ${phase}`);
+      expect(phaseJob).toContain(phase);
+    }
+    expect(workflow).toContain(
+      "(github.event_name != 'workflow_dispatch' || inputs.kb_manus_v2_rollout_phase == 'deploy')",
+    );
+    expect(phaseJob).toContain("needs.promotion-gate.result == 'success'");
+    expect(phaseJob).toContain("Verify exact signed production digest");
+    expect(phaseJob).toContain("Preflight public current production identity");
+    expect(phaseJob).toContain("--kb-manus-v2-rollout $PHASE");
+    expect(phaseJob).toContain(
+      "Independently prove public exact production phase",
+    );
+    expect(phaseJob).toContain(
+      "Require converged migration diagnostics before complete",
+    );
+    expect(phaseJob).toContain("lastSweepInfrastructureStatus");
+    expect(phaseJob).toContain("migrationConverged");
+    expect(phaseJob).toContain("activeLegacyTotal == 0");
+    expect(phaseJob).toContain("inFlightHandoffs == 0");
+    expect(phaseJob).not.toContain("docker/build-push-action");
+    expect(updater).toContain(
+      'VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"',
+    );
+    expect(updater).toContain("PRODUCTION_CONTROLLER_UPDATE_ROLLED_BACK");
+    expect(installerSource).not.toContain(
+      "frontmind-update-release-controllers",
+    );
+    expect(installerSource).not.toContain("update-release-controllers.sh");
+  });
   it("takes the pnpm version only from package.json", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);
