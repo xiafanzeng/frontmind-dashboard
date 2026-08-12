@@ -59,6 +59,36 @@ describe("fixed-service deploy SSH command", () => {
     );
   });
 
+  it("allows only five Dashboard same-digest Manus v2 rollout phases", () => {
+    for (const phase of [
+      "dual-read",
+      "canary",
+      "migration",
+      "pause",
+      "complete",
+    ]) {
+      const result = run(
+        "dashboard",
+        `--kb-manus-v2-rollout ${phase} ${digest} ${sourceSha}`,
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        `-n /usr/local/sbin/frontmind-deploy-controller --kb-manus-v2-rollout ${phase} dashboard ${digest} ${sourceSha}`,
+      );
+    }
+  });
+
+  it("rejects rollout phase injection and Website rollout", () => {
+    for (const [service, command] of [
+      ["dashboard", `--kb-manus-v2-rollout deploy ${digest} ${sourceSha}`],
+      ["dashboard", `--kb-manus-v2-rollout canary;id ${digest} ${sourceSha}`],
+      ["website", `--kb-manus-v2-rollout canary ${digest} ${sourceSha}`],
+    ] as const) {
+      const result = run(service, command);
+      expect(result.status).toBe(64);
+    }
+  });
+
   it("passes the registry auth envelope through sudo without logging the token", async () => {
     const token = `ghs_${"t".repeat(40)}`;
     const result = run(

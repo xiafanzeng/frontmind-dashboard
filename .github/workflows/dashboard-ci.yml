@@ -6,6 +6,27 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      kb_manus_v2_rollout_phase:
+        description: Same-digest Knowledge Base Manus v2 runtime phase
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - dual-read
+          - canary
+          - migration
+          - pause
+          - complete
+      kb_manus_v2_expected_source_sha:
+        description: Required current 40-character production source SHA for a rollout phase
+        required: false
+        type: string
+      kb_manus_v2_expected_image_digest:
+        description: Required current production sha256 digest for a rollout phase
+        required: false
+        type: string
   repository_dispatch:
     types:
       - pdf-runtime-updated
@@ -230,6 +251,7 @@ jobs:
       needs.mysql-acceptance.result == 'success' &&
       needs.promotion-gate.result == 'success' &&
       github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_dispatch' || inputs.kb_manus_v2_rollout_phase == 'deploy') &&
       (
         github.event_name == 'repository_dispatch' ||
         github.event_name == 'workflow_dispatch' ||
@@ -391,3 +413,147 @@ jobs:
           IMAGE: ${{ steps.image.outputs.repository }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: node scripts/mark-ghcr-promoted.mjs --marker-prefix deployed
+
+  kb-manus-v2-rollout:
+    name: Apply same-digest Knowledge Base Manus v2 phase
+    needs:
+      - promotion-gate
+      - quality
+      - mysql-acceptance
+    if: >-
+      needs.promotion-gate.result == 'success' &&
+      needs.quality.result == 'success' &&
+      needs.mysql-acceptance.result == 'success' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.kb_manus_v2_rollout_phase != 'deploy' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.promotion-gate.outputs.source_sha }}
+      - name: Validate immutable production rollout coordinates
+        shell: bash
+        env:
+          PHASE: ${{ inputs.kb_manus_v2_rollout_phase }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.kb_manus_v2_expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.kb_manus_v2_expected_image_digest }}
+          VERIFIED_SOURCE_SHA: ${{ needs.promotion-gate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PHASE" =~ ^(dual-read|canary|migration|pause|complete)$ ]]
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$EXPECTED_SOURCE_SHA" = "$VERIFIED_SOURCE_SHA"
+          test "$EXPECTED_SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify exact signed production digest before host mutation
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.kb_manus_v2_expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.kb_manus_v2_expected_image_digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/xiafanzeng/frontmind-dashboard@$EXPECTED_IMAGE_DIGEST"
+          cosign verify \
+            --certificate-identity "https://github.com/xiafanzeng/frontmind-dashboard/.github/workflows/dashboard-ci.yml@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$image" >/dev/null
+          test "$(docker buildx imagetools inspect "$image" --format '{{json .Image.Labels}}' | jq -r '."org.opencontainers.image.revision"')" = "$EXPECTED_SOURCE_SHA"
+      - name: Preflight public current production identity
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.kb_manus_v2_expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.kb_manus_v2_expected_image_digest }}
+        run: |
+          set -euo pipefail
+          payload="$(curl --fail --silent --show-error --max-time 15 https://dashboard.frontmind.net/readyz)"
+          jq -e --arg sha "$EXPECTED_SOURCE_SHA" --arg digest "$EXPECTED_IMAGE_DIGEST" '
+            .status == "ok" and .build.sha == $sha and .build.imageDigest == $digest and
+            .migration.status == "exact" and .migration.schema.status == "exact" and
+            (.migration.journalHash | type == "string" and test("^[a-f0-9]{64}$")) and
+            (.configuration.knowledgeBaseManusV2Writer.enabled | type == "boolean") and
+            (.configuration.knowledgeBaseManusV2ActiveMigration.enabled | type == "boolean")
+          ' <<<"$payload" >/dev/null
+      - name: Require converged migration diagnostics before complete
+        if: inputs.kb_manus_v2_rollout_phase == 'complete'
+        shell: bash
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.kb_manus_v2_expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.kb_manus_v2_expected_image_digest }}
+        run: |
+          set -euo pipefail
+          payload="$(curl --fail --silent --show-error --max-time 15 https://dashboard.frontmind.net/readyz)"
+          jq -e --arg sha "$EXPECTED_SOURCE_SHA" --arg digest "$EXPECTED_IMAGE_DIGEST" '
+            .status == "ok" and .build.sha == $sha and .build.imageDigest == $digest and
+            .migration.status == "exact" and .migration.schema.status == "exact" and
+            .configuration.knowledgeBaseManusV2Writer.enabled == true and
+            .configuration.knowledgeBaseManusV2ActiveMigration.enabled == true and
+            .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.lastSweepInfrastructureStatus == "ok" and
+            .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.migrationConverged == true and
+            .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.activeLegacyTotal == 0 and
+            .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.inFlightHandoffs == 0
+          ' <<<"$payload" >/dev/null
+      - name: Install restricted production deploy key
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.DASHBOARD_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_KEY:?DASHBOARD_DEPLOY_SSH_KEY is required}"
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" >~/.ssh/dashboard_deploy
+          install -m 0644 .github/deploy/production_known_hosts ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/dashboard_deploy
+          ssh-keygen -y -f ~/.ssh/dashboard_deploy >/dev/null
+      - name: Apply phase through fixed production Dashboard capability
+        shell: bash
+        env:
+          PHASE: ${{ inputs.kb_manus_v2_rollout_phase }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.kb_manus_v2_expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.kb_manus_v2_expected_image_digest }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s\n%s\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |
+            ssh -T -i ~/.ssh/dashboard_deploy -p 22 \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              frontmind-deploy@149.88.85.148 \
+              "--kb-manus-v2-rollout $PHASE ghcr.io/xiafanzeng/frontmind-dashboard@$EXPECTED_IMAGE_DIGEST $EXPECTED_SOURCE_SHA"
+      - name: Independently prove public exact production phase
+        shell: bash
+        env:
+          PHASE: ${{ inputs.kb_manus_v2_rollout_phase }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.kb_manus_v2_expected_source_sha }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.kb_manus_v2_expected_image_digest }}
+        run: |
+          set -euo pipefail
+          case "$PHASE" in
+            dual-read) writer=false; migration=false ;;
+            canary|pause|complete) writer=true; migration=false ;;
+            migration) writer=true; migration=true ;;
+          esac
+          payload="$(curl --fail --silent --show-error --max-time 15 https://dashboard.frontmind.net/readyz)"
+          jq -e --arg sha "$EXPECTED_SOURCE_SHA" --arg digest "$EXPECTED_IMAGE_DIGEST" \
+            --argjson writer "$writer" --argjson migration "$migration" '
+              .status == "ok" and
+              .build.sha == $sha and .build.imageDigest == $digest and
+              .migration.status == "exact" and .migration.schema.status == "exact" and
+              .configuration.knowledgeBaseManusV2Writer.enabled == $writer and
+              .configuration.knowledgeBaseManusV2ActiveMigration.enabled == $migration
+            ' <<<"$payload" >/dev/null

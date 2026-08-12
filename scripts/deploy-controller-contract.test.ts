@@ -57,6 +57,20 @@ type HarnessOptions = {
     | "temporary-ledger-query-fail";
   localImageDigests?: string[];
   bootstrapped?: boolean;
+  kbWriter?: boolean;
+  kbActiveMigration?: boolean;
+  omitKbRuntimeFlags?: boolean;
+  readyKbWriter?: boolean;
+  readyKbActiveMigration?: boolean;
+  currentDigest?: string;
+  rolloutReadinessFailFirst?: boolean;
+  composeUpFailureAt?: number;
+  migrationDiagnostics?: {
+    lastSweepInfrastructureStatus: "ok" | "failed" | "pending";
+    migrationConverged: boolean | null;
+    activeLegacyTotal: number | null;
+    inFlightHandoffs: number | null;
+  };
 };
 
 async function executable(file: string, content: string) {
@@ -121,6 +135,20 @@ async function harness(options: HarnessOptions = {}) {
     restoreMode = "success",
     localImageDigests = [],
     bootstrapped = true,
+    kbWriter = false,
+    kbActiveMigration = false,
+    omitKbRuntimeFlags = false,
+    readyKbWriter = kbWriter,
+    readyKbActiveMigration = kbActiveMigration,
+    currentDigest = baselineDigest,
+    rolloutReadinessFailFirst = false,
+    composeUpFailureAt = 0,
+    migrationDiagnostics = {
+      lastSweepInfrastructureStatus: "ok",
+      migrationConverged: true,
+      activeLegacyTotal: 0,
+      inFlightHandoffs: 0,
+    },
   } = options;
   const repository = `ghcr.io/xiafanzeng/frontmind-${service}`;
   const candidateImage = `${repository}@${digest}`;
@@ -141,6 +169,9 @@ async function harness(options: HarnessOptions = {}) {
   const rolloutCounter = path.join(root, "rollout-counter");
   const backupCnf = path.join(root, "backup.cnf");
   const restoreCnf = path.join(root, "restore.cnf");
+  const runtimeEnv = path.join(root, "dashboard-runtime.env");
+  const rolloutRecovery = path.join(stateDir, "kb-rollout-recovery.json");
+  const rolloutRollbackEnv = path.join(stateDir, "kb-rollout-rollback.env");
   await Promise.all([
     mkdir(bin, { recursive: true }),
     mkdir(configRoot, { recursive: true }),
@@ -152,6 +183,13 @@ async function harness(options: HarnessOptions = {}) {
   await Promise.all([
     writeFile(backupCnf, "[client]\nuser=backup\n", { mode: 0o600 }),
     writeFile(restoreCnf, "[client]\nuser=restore\n", { mode: 0o600 }),
+    writeFile(
+      runtimeEnv,
+      omitKbRuntimeFlags
+        ? "NODE_ENV=production\n"
+        : `NODE_ENV=production\nFRONTMIND_KB_MANUS_V2_WRITER=${kbWriter}\nFRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=${kbActiveMigration}\n`,
+      { mode: 0o600 },
+    ),
   ]);
   await writeFile(path.join(composeDir, "compose.yaml"), "services: {}\n");
   await writeFile(
@@ -180,6 +218,9 @@ async function harness(options: HarnessOptions = {}) {
       `PUBLIC_READY_URL=https://${service}.invalid/readyz`,
       `READY_SHA_SHAPE=${service}`,
       `STATE_DIR=${stateDir}`,
+      `KB_MANUS_V2_RUNTIME_ENV_FILE=${runtimeEnv}`,
+      `KB_MANUS_V2_ROLLOUT_RECOVERY_FILE=${rolloutRecovery}`,
+      `KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV=${rolloutRollbackEnv}`,
       `BACKUP_DIR=${backupDir}`,
       "BACKUP_DATABASE=frontmind_acceptance",
       `BACKUP_MYSQL_CNF=${backupCnf}`,
@@ -206,6 +247,10 @@ async function harness(options: HarnessOptions = {}) {
       "config_is_root_only() { return 0;\n}",
     )
     .replace(
+      'install -o root -g root -m 0600 "$source" "$temporary"',
+      'install -m 0600 "$source" "$temporary"',
+    )
+    .replace(
       'lock_file="/run/lock/frontmind-deploy-${service}.lock"',
       `lock_file="${path.join(root, "deploy.lock")}"`,
     )
@@ -216,6 +261,14 @@ async function harness(options: HarnessOptions = {}) {
     .replace(
       "readonly CANDIDATE_READY_BUDGET_SECONDS=90",
       "readonly CANDIDATE_READY_BUDGET_SECONDS=2",
+    )
+    .replace(
+      "readonly RELEASE_DB_READ_TIMEOUT_SECONDS=90",
+      "readonly RELEASE_DB_READ_TIMEOUT_SECONDS=2",
+    )
+    .replace(
+      "readonly RELEASE_DB_MIGRATE_TIMEOUT_SECONDS=1800",
+      "readonly RELEASE_DB_MIGRATE_TIMEOUT_SECONDS=5",
     );
   const controllerFile = path.join(root, "controller");
   await executable(controllerFile, controller);
@@ -241,7 +294,7 @@ if [[ " $* " == *" release-db-migrate migrate "* && "\${TEST_MIGRATION_MODE:-suc
   exit 124
 fi
 while [[ \${1:-} == --* ]]; do shift; done
-shift
+if [[ \${1:-} =~ ^[0-9]+s$ ]]; then shift; fi
 exec "$@"
 `,
   );
@@ -256,9 +309,21 @@ if [[ "$TEST_FORCED_INITIAL_TAKEOVER" == 1 && ( $rollout_count -eq 0 || $rollout
   ready_source="$TEST_ACTIVE_SOURCE_SHA"
   ready_digest="$TEST_ACTIVE_READY_IMAGE_DIGEST"
 fi
-if [[ "$TEST_SERVICE" == dashboard ]]; then
-  printf '{"status":"ok","build":{"sha":"%s","imageDigest":"%s"},"migration":{"journalHash":"%s"}}\\n' \
-    "$ready_source" "$ready_digest" "${"c".repeat(64)}"
+  if [[ "$TEST_SERVICE" == dashboard ]]; then
+  writer="$TEST_READY_KB_WRITER"
+  migration="$TEST_READY_KB_ACTIVE_MIGRATION"
+  if [[ -f "$TEST_RUNTIME_ENV" ]]; then
+    runtime_writer="$(sed -n 's/^FRONTMIND_KB_MANUS_V2_WRITER=//p' "$TEST_RUNTIME_ENV")"
+    runtime_migration="$(sed -n 's/^FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=//p' "$TEST_RUNTIME_ENV")"
+    [[ -z "$runtime_writer" ]] || writer="$runtime_writer"
+    [[ -z "$runtime_migration" ]] || migration="$runtime_migration"
+  fi
+  if [[ "$TEST_ROLLOUT_FAIL_FIRST" == 1 && $rollout_count -eq 1 ]]; then
+    writer=false
+    migration=false
+  fi
+  printf '{"status":"ok","build":{"sha":"%s","imageDigest":"%s"},"migration":{"status":"exact","journalHash":"%s","schema":{"status":"exact"}},"configuration":{"knowledgeBaseManusV2Writer":{"enabled":%s},"knowledgeBaseManusV2ActiveMigration":{"enabled":%s,"diagnostics":%s}}}\\n' \
+    "$ready_source" "$ready_digest" "${"c".repeat(64)}" "$writer" "$migration" "$TEST_MIGRATION_DIAGNOSTICS"
 else
   printf '{"status":"ok","buildSha":"%s","imageDigest":"%s","dependencies":{"status":"ok"}}\\n' \
     "$ready_source" "$ready_digest"
@@ -296,6 +361,10 @@ if [[ "$args" == *" up -d "* ]]; then
   rollout_count=0
   [[ ! -f "$TEST_ROLLOUT_COUNTER" ]] || read -r rollout_count <"$TEST_ROLLOUT_COUNTER"
   printf '%s\\n' "$((rollout_count + 1))" >"$TEST_ROLLOUT_COUNTER"
+  if [[ "$TEST_COMPOSE_UP_FAILURE_AT" =~ ^[0-9]+$ && "$TEST_COMPOSE_UP_FAILURE_AT" -gt 0 \
+     && "$((rollout_count + 1))" -eq "$TEST_COMPOSE_UP_FAILURE_AT" ]]; then
+    exit 79
+  fi
 fi
 if [[ "$args" == *" release-db-plan plan --json "* ]]; then
   printf '%s\n' "plan-config \${DOCKER_CONFIG:-unset}" >>"$TEST_LOG"
@@ -398,10 +467,20 @@ fi
 
   if (bootstrapped) {
     await writeFile(
+      path.join(composeDir, ".env"),
+      [
+        `${imageEnvKey}=${repository}@${currentDigest}`,
+        `FRONTMIND_IMAGE_DIGEST=${currentDigest}`,
+        `FRONTMIND_SOURCE_SHA=${sourceSha}`,
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    await writeFile(
       path.join(stateDir, "state.json"),
       JSON.stringify({
         schemaVersion: 1,
-        currentDigest: baselineDigest,
+        currentDigest,
         previousDigest: "",
         sourceSha,
         journalHash: "c".repeat(64),
@@ -442,6 +521,12 @@ fi
         TEST_BACKUP_MODE: backupMode,
         TEST_RESTORE_MODE: restoreMode,
         TEST_LOCAL_IMAGE_DIGESTS: localImageDigests.join(","),
+        TEST_RUNTIME_ENV: runtimeEnv,
+        TEST_READY_KB_WRITER: String(readyKbWriter),
+        TEST_READY_KB_ACTIVE_MIGRATION: String(readyKbActiveMigration),
+        TEST_ROLLOUT_FAIL_FIRST: rolloutReadinessFailFirst ? "1" : "0",
+        TEST_COMPOSE_UP_FAILURE_AT: String(composeUpFailureAt),
+        TEST_MIGRATION_DIAGNOSTICS: JSON.stringify(migrationDiagnostics),
       },
     });
   const run = (candidate = candidateImage) =>
@@ -452,6 +537,16 @@ fi
     runWithArgs(["--bootstrap-state", service, candidate, sourceSha]);
   const acknowledge = (candidate = candidateImage) =>
     runWithArgs(["--acknowledge-incident", service, candidate, sourceSha]);
+  const rollout = (
+    phase: "dual-read" | "canary" | "migration" | "pause" | "complete",
+  ) =>
+    runWithArgs([
+      "--kb-manus-v2-rollout",
+      phase,
+      service,
+      candidateImage,
+      sourceSha,
+    ]);
   return {
     root,
     backupDir,
@@ -464,6 +559,11 @@ fi
     runForced,
     bootstrap,
     acknowledge,
+    rollout,
+    runtimeEnv,
+    controllerFile,
+    rolloutRecovery,
+    rolloutRollbackEnv,
   };
 }
 
@@ -476,6 +576,254 @@ afterEach(async () => {
 });
 
 describe("deploy controller shell contract", () => {
+  it.each([
+    ["dual-read", false, false],
+    ["canary", true, false],
+    ["migration", true, true],
+    ["pause", true, false],
+  ] as const)(
+    "applies the %s Manus v2 phase on the exact current digest without rotating release state",
+    async (phase, writer, migration) => {
+      const test = await harness({
+        currentDigest: digest,
+        activeImageReference: image,
+      });
+      const before = await readFile(test.state, "utf8");
+      const result = test.rollout(phase);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toMatch(
+        /PRODUCTION_KB_MANUS_V2_ROLLOUT_(OK|ALREADY_CURRENT)/u,
+      );
+      expect(await readFile(test.state, "utf8")).toBe(before);
+      const runtime = await readFile(test.runtimeEnv, "utf8");
+      expect(runtime).toContain(`FRONTMIND_KB_MANUS_V2_WRITER=${writer}`);
+      expect(runtime).toContain(
+        `FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=${migration}`,
+      );
+      const commands = await readFile(test.log, "utf8");
+      expect(commands).toContain("cosign verify");
+      expect(commands).toContain("release-db-plan plan --json");
+      expect((commands.match(/^docker .* up -d /gmu) || []).length).toBe(
+        phase === "dual-read" ? 0 : 1,
+      );
+      expect(commands).not.toContain("release-db-migrate migrate");
+      expect(commands).not.toContain("mysqldump");
+      await expect(
+        readFile(test.rolloutRecovery, "utf8"),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
+  it("restores old flags when same-digest phase readiness fails", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+      rolloutReadinessFailFirst: true,
+    });
+    const before = await readFile(test.state, "utf8");
+    const result = test.rollout("migration");
+    expect(result.status).toBe(75);
+    expect(result.stderr).toContain(
+      "PRODUCTION_KB_MANUS_V2_ROLLOUT_READINESS_FAILED",
+    );
+    expect(result.stderr).toContain("PRODUCTION_KB_MANUS_V2_ROLLOUT_RESTORED");
+    expect(await readFile(test.state, "utf8")).toBe(before);
+    const runtime = await readFile(test.runtimeEnv, "utf8");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_WRITER=false");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=false");
+  });
+
+  it("rejects a pre-v2 runtime until root bootstrap installs both flags", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+      omitKbRuntimeFlags: true,
+    });
+    const result = test.rollout("dual-read");
+    expect(result.status).toBe(73);
+    expect(result.stderr).toContain(
+      "PRODUCTION_KB_MANUS_V2_ROLLOUT_RUNTIME_ENV_REJECTED",
+    );
+    expect(await readFile(test.runtimeEnv, "utf8")).toBe(
+      "NODE_ENV=production\n",
+    );
+    expect(await readFile(test.log, "utf8")).not.toContain(" up -d ");
+  });
+
+  it("restores old flags when same-digest force-recreate fails", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+      composeUpFailureAt: 1,
+    });
+    const before = await readFile(test.state, "utf8");
+    const result = test.rollout("migration");
+    expect(result.status).toBe(75);
+    expect(result.stderr).toContain(
+      "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECREATE_FAILED",
+    );
+    expect(result.stderr).toContain("PRODUCTION_KB_MANUS_V2_ROLLOUT_RESTORED");
+    expect(await readFile(test.state, "utf8")).toBe(before);
+    const runtime = await readFile(test.runtimeEnv, "utf8");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_WRITER=false");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=false");
+  });
+
+  it("recovers an interrupted same-digest phase before applying the requested phase", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+    });
+    const runtimeBefore = await readFile(test.runtimeEnv, "utf8");
+    await writeFile(test.rolloutRollbackEnv, runtimeBefore, { mode: 0o600 });
+    await writeFile(
+      test.runtimeEnv,
+      runtimeBefore
+        .replace(
+          "FRONTMIND_KB_MANUS_V2_WRITER=false",
+          "FRONTMIND_KB_MANUS_V2_WRITER=true",
+        )
+        .replace(
+          "FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=false",
+          "FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=true",
+        ),
+      { mode: 0o600 },
+    );
+    await writeFile(
+      test.rolloutRecovery,
+      JSON.stringify({
+        schemaVersion: 1,
+        phase: "migration",
+        image,
+        digest,
+        sourceSha,
+        journalHash: "c".repeat(64),
+        previous: { writer: false, activeMigration: false },
+        target: { writer: true, activeMigration: true },
+      }),
+      { mode: 0o600 },
+    );
+
+    const result = test.rollout("canary");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("PRODUCTION_KB_MANUS_V2_ROLLOUT_RESTORED");
+    expect(result.stderr).toContain("PRODUCTION_KB_MANUS_V2_ROLLOUT_OK");
+    const runtime = await readFile(test.runtimeEnv, "utf8");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_WRITER=true");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=false");
+  });
+
+  it("cleans only a post-commit stale rollback env before the next same-digest phase", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+    });
+    await writeFile(test.rolloutRollbackEnv, await readFile(test.runtimeEnv), {
+      mode: 0o600,
+    });
+    const result = test.rollout("canary");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain(
+      "PRODUCTION_KB_MANUS_V2_ROLLOUT_STALE_ROLLBACK_ENV_CLEANED",
+    );
+    await expect(
+      readFile(test.rolloutRollbackEnv, "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("blocks an ordinary release while a same-digest rollout recovery is unresolved", async () => {
+    const test = await harness();
+    await writeFile(test.rolloutRecovery, "{}\n", { mode: 0o600 });
+    expect(await readFile(test.rolloutRecovery, "utf8")).toBe("{}\n");
+    expect(await readFile(test.controllerFile, "utf8")).toContain(
+      "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECOVERY_BLOCKS_RELEASE",
+    );
+    const result = test.run();
+    expect(result.status).toBe(73);
+    expect(result.stderr).toContain(
+      "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECOVERY_BLOCKS_RELEASE",
+    );
+    const commands = await readFile(test.log, "utf8");
+    expect(commands).not.toContain("cosign verify");
+    expect(commands).not.toContain(" up -d ");
+  });
+
+  it("completes migration only from true/true with exact local and public convergence", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+      kbWriter: true,
+      kbActiveMigration: true,
+    });
+    const result = test.rollout("complete");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("PRODUCTION_KB_MANUS_V2_ROLLOUT_OK");
+    const runtime = await readFile(test.runtimeEnv, "utf8");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_WRITER=true");
+    expect(runtime).toContain("FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=false");
+  });
+
+  it("rejects complete outside migration phase before service mutation", async () => {
+    const test = await harness({
+      currentDigest: digest,
+      activeImageReference: image,
+      kbWriter: true,
+      kbActiveMigration: false,
+    });
+    const result = test.rollout("complete");
+    expect(result.status).toBe(73);
+    expect(result.stderr).toContain(
+      "PRODUCTION_KB_MANUS_V2_COMPLETE_REQUIRES_MIGRATION_PHASE",
+    );
+    expect(await readFile(test.log, "utf8")).not.toContain(" up -d ");
+  });
+
+  it.each([
+    {
+      lastSweepInfrastructureStatus: "failed" as const,
+      migrationConverged: true,
+      activeLegacyTotal: 0,
+      inFlightHandoffs: 0,
+    },
+    {
+      lastSweepInfrastructureStatus: "ok" as const,
+      migrationConverged: false,
+      activeLegacyTotal: 0,
+      inFlightHandoffs: 0,
+    },
+    {
+      lastSweepInfrastructureStatus: "ok" as const,
+      migrationConverged: true,
+      activeLegacyTotal: 1,
+      inFlightHandoffs: 0,
+    },
+    {
+      lastSweepInfrastructureStatus: "ok" as const,
+      migrationConverged: true,
+      activeLegacyTotal: 0,
+      inFlightHandoffs: null,
+    },
+  ])(
+    "rejects non-converged or unknown complete diagnostics %#",
+    async (diagnostics) => {
+      const test = await harness({
+        currentDigest: digest,
+        activeImageReference: image,
+        kbWriter: true,
+        kbActiveMigration: true,
+        migrationDiagnostics: diagnostics,
+      });
+      const result = test.rollout("complete");
+      expect(result.status).toBe(75);
+      expect(result.stderr).toContain(
+        "PRODUCTION_KB_MANUS_V2_COMPLETE_DIAGNOSTICS_NOT_CONVERGED",
+      );
+      expect(await readFile(test.log, "utf8")).not.toContain(" up -d ");
+    },
+  );
+
   it("uses the forced deploy stdin token only in a temporary registry config", async () => {
     const test = await harness();
     const result = test.runForced();
@@ -998,6 +1346,9 @@ describe("deploy controller shell contract", () => {
   });
 
   it("times out an unknown migration, reconciles read-only and never reruns it", async () => {
+    expect(await readFile(productionController, "utf8")).toContain(
+      "readonly RELEASE_DB_MIGRATE_TIMEOUT_SECONDS=1800",
+    );
     const currentDigest = `sha256:${"e".repeat(64)}`;
     const test = await harness({
       planSequence: ["pending-expand", "pending-expand"],
@@ -1030,7 +1381,7 @@ describe("deploy controller shell contract", () => {
       (commands.match(/^docker .*release-db-plan plan --json/gmu) || []).length,
     ).toBe(3);
     expect(commands).toContain(
-      "timeout --foreground --signal=TERM --kill-after=10s 1800s",
+      "timeout --foreground --signal=TERM --kill-after=10s 5s",
     );
     expect(commands).toContain("mysqldump");
     expect(commands).toContain("DROP DATABASE IF EXISTS");

@@ -154,6 +154,9 @@ Before the first deployment:
 4. Configure the GitHub repository variables/secrets listed in
    docs/operations/RELEASE.md.
 5. Add the generated frontmind-deploy user's SSH public endpoint to GitHub.
+6. Keep both Knowledge Base Manus v2 flags false in the initial Dashboard
+   runtime env. Apply later phases only through the exact signed same-digest
+   workflow described by docs/operations/RELEASE.md.
 
 The installer never imports production data, runs migrations, changes the
 1Panel reverse proxy, or starts either application. Re-running it refreshes

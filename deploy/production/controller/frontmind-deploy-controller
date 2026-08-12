@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# frontmind-production-controller-version: 2
 set -Eeuo pipefail
 umask 077
 
@@ -46,6 +47,10 @@ config_is_root_only() {
 registry_auth_dir=""
 candidate_env=""
 initial_runtime_env=""
+kb_manus_v2_staged_runtime=""
+kb_manus_v2_rollout_compose_env=""
+kb_manus_v2_restore_compose_env=""
+kb_manus_v2_rollout_restore_armed=0
 
 cleanup_ephemeral_registry_auth() {
   local expected_prefix
@@ -66,11 +71,25 @@ cleanup_ephemeral_registry_auth() {
 }
 
 cleanup_on_exit() {
+  if (( kb_manus_v2_rollout_restore_armed == 1 )) \
+    && declare -F restore_kb_manus_v2_rollout >/dev/null; then
+    restore_kb_manus_v2_rollout \
+      || log "PRODUCTION_KB_MANUS_V2_ROLLOUT_RESTORE_PENDING"
+  fi
   if [[ -n $candidate_env ]]; then
     rm -f -- "$candidate_env" || true
   fi
   if [[ -n $initial_runtime_env ]]; then
     rm -f -- "$initial_runtime_env" || true
+  fi
+  if [[ -n $kb_manus_v2_staged_runtime ]]; then
+    rm -f -- "$kb_manus_v2_staged_runtime" || true
+  fi
+  if [[ -n $kb_manus_v2_rollout_compose_env ]]; then
+    rm -f -- "$kb_manus_v2_rollout_compose_env" || true
+  fi
+  if [[ -n $kb_manus_v2_restore_compose_env ]]; then
+    rm -f -- "$kb_manus_v2_restore_compose_env" || true
   fi
   cleanup_ephemeral_registry_auth || true
 }
@@ -113,9 +132,20 @@ read_ephemeral_registry_auth() {
   registry_token=""
 }
 
+operation="deploy"
 mode="deploy"
 allow_contract=0
 case "${1:-}" in
+  --kb-manus-v2-rollout)
+    operation="kb-manus-v2-rollout"
+    rollout_phase="${2:-}"
+    service="${3:-}"
+    image="${4:-}"
+    source_sha="${5:-}"
+    [[ $# -eq 5 ]] \
+      || die "USAGE:frontmind-deploy-controller --kb-manus-v2-rollout phase dashboard image@sha256 source-sha" 64
+    shift 5
+    ;;
   --allow-contract)
     allow_contract=1
     shift
@@ -130,17 +160,39 @@ case "${1:-}" in
     ;;
 esac
 
-service="${1:-}"
-image="${2:-}"
-source_sha="${3:-}"
+if [[ $operation == "deploy" ]]; then
+  service="${1:-}"
+  image="${2:-}"
+  source_sha="${3:-}"
+fi
 
 [[ $EUID -eq 0 ]] || die "DEPLOY_CONTROLLER_REQUIRES_ROOT"
-[[ $# -eq 3 ]] || die "USAGE:frontmind-deploy-controller [--allow-contract|--bootstrap-state|--acknowledge-incident] service image@sha256 source-sha" 64
+if [[ $operation == "deploy" ]]; then
+  [[ $# -eq 3 ]] || die "USAGE:frontmind-deploy-controller [--allow-contract|--bootstrap-state|--acknowledge-incident] service image@sha256 source-sha" 64
+fi
 case "$service" in
   dashboard | website) ;;
   *) die "DEPLOY_SERVICE_REJECTED" 64 ;;
 esac
 trap cleanup_on_exit EXIT
+handle_kb_manus_v2_rollout_signal() {
+  local signal="$1" exit_code="$2"
+  if (( kb_manus_v2_rollout_restore_armed == 1 )); then
+    restore_kb_manus_v2_rollout \
+      || log "PRODUCTION_KB_MANUS_V2_ROLLOUT_SIGNAL_RESTORE_PENDING signal=${signal}"
+  fi
+  trap - "$signal"
+  exit "$exit_code"
+}
+trap 'handle_kb_manus_v2_rollout_signal TERM 143' TERM
+trap 'handle_kb_manus_v2_rollout_signal INT 130' INT
+if [[ $operation == "kb-manus-v2-rollout" ]]; then
+  [[ $service == "dashboard" ]] || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_DASHBOARD_ONLY" 64
+  [[ $rollout_phase =~ ^(dual-read|canary|migration|pause|complete)$ ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_PHASE_REJECTED" 64
+  [[ ${SUDO_USER:-root} == "frontmind-deploy" || ${SUDO_USER:-root} == "root" ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_CALLER_REJECTED" 77
+fi
 if (( allow_contract == 1 )) && [[ $service != "dashboard" ]]; then
   die "CONTRACT_MODE_DASHBOARD_ONLY" 64
 fi
@@ -166,6 +218,15 @@ for name in \
   LOCAL_READY_URL PUBLIC_READY_URL READY_SHA_SHAPE STATE_DIR; do
   require_value "$name"
 done
+if [[ $service == "dashboard" ]]; then
+  # These paths are production controller policy, not secrets. Defaults keep
+  # an already-installed root-owned service config compatible with the v2
+  # controller; an explicit root-owned override remains available for tests or
+  # a deliberately relocated production filesystem.
+  KB_MANUS_V2_RUNTIME_ENV_FILE="${KB_MANUS_V2_RUNTIME_ENV_FILE:-/etc/frontmind/dashboard.env}"
+  KB_MANUS_V2_ROLLOUT_RECOVERY_FILE="${KB_MANUS_V2_ROLLOUT_RECOVERY_FILE:-/var/lib/frontmind-deploy/dashboard/kb-manus-v2-rollout-recovery.json}"
+  KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV="${KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV:-/var/lib/frontmind-deploy/dashboard/kb-manus-v2-rollout-rollback.env}"
+fi
 
 [[ $COMPOSE_SERVICE == "$service" ]] || die "DEPLOY_SERVICE_CONFIG_MISMATCH"
 case "$service" in
@@ -203,7 +264,7 @@ if [[ $mode != "bootstrap-state" && ! -f $state_file ]]; then
   if [[ -e $state_file || -L $state_file ]]; then
     die "DEPLOY_STATE_INVALID"
   fi
-  if [[ $mode == "deploy" && ${SUDO_USER:-} == "frontmind-deploy" ]]; then
+  if [[ $operation == "deploy" && $mode == "deploy" && ${SUDO_USER:-} == "frontmind-deploy" ]]; then
     # A restricted GitHub Actions deployment may establish the first signed
     # state only by replacing an already-running, internally consistent
     # service. The dedicated path below is deliberately unable to migrate,
@@ -246,13 +307,13 @@ if [[ -f $state_file ]]; then
   unfinished_backup_file="$(jq -r '.lastResult.backupFile // ""' "$state_file")"
 fi
 
-if [[ $unfinished_status == "in_progress" && $unfinished_attempted_digest != "$digest" ]]; then
+if [[ $operation == "deploy" && $unfinished_status == "in_progress" && $unfinished_attempted_digest != "$digest" ]]; then
   die "UNFINISHED_RELEASE_REQUIRES_SAME_DIGEST_RECONCILIATION" 75
 fi
-if [[ $unfinished_status == "quarantined" && $mode != "acknowledge-incident" ]]; then
+if [[ $operation == "deploy" && $unfinished_status == "quarantined" && $mode != "acknowledge-incident" ]]; then
   die "DEPLOY_INCIDENT_QUARANTINED_REQUIRES_ROOT_ACKNOWLEDGEMENT" 75
 fi
-if [[ $mode == "acknowledge-incident" && $unfinished_status != "quarantined" ]]; then
+if [[ $operation == "deploy" && $mode == "acknowledge-incident" && $unfinished_status != "quarantined" ]]; then
   die "NO_QUARANTINED_INCIDENT_TO_ACKNOWLEDGE" 73
 fi
 if [[ $mode != "acknowledge-incident" && $current_digest == "$digest" && -n $current_source_sha && $current_source_sha != "$source_sha" ]]; then
@@ -264,6 +325,166 @@ if [[ $current_digest == "$digest" ]]; then
   rollback_digest="$previous_digest"
   rollback_source_sha=""
 fi
+
+kb_manus_v2_phase_values() {
+  case "$1" in
+    dual-read) printf '%s\n' "false false" ;;
+    canary | pause | complete) printf '%s\n' "true false" ;;
+    migration) printf '%s\n' "true true" ;;
+    *) return 1 ;;
+  esac
+}
+
+read_unique_env_value() {
+  local file="$1" key="$2" count value
+  [[ -f $file && ! -L $file ]] || return 1
+  count="$(grep -Ec "^${key}=" "$file" || true)"
+  [[ $count == "1" ]] || return 1
+  value="$(sed -n "s/^${key}=//p" "$file")"
+  [[ $value == "true" || $value == "false" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+read_kb_manus_v2_env_pair() {
+  local file="$1" writer_count migration_count writer migration
+  [[ -f $file && ! -L $file ]] || return 1
+  writer_count="$(grep -Ec '^FRONTMIND_KB_MANUS_V2_WRITER=' "$file" || true)"
+  migration_count="$(grep -Ec '^FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=' "$file" || true)"
+  [[ $writer_count == "1" && $migration_count == "1" ]] || return 1
+  writer="$(read_unique_env_value "$file" FRONTMIND_KB_MANUS_V2_WRITER)" || return 1
+  migration="$(read_unique_env_value "$file" FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION)" || return 1
+  printf '%s %s\n' "$writer" "$migration"
+}
+
+render_kb_manus_v2_runtime_env() {
+  local source="$1" target="$2" writer="$3" migration="$4"
+  [[ $writer == "true" || $writer == "false" ]] || return 1
+  [[ $migration == "true" || $migration == "false" ]] || return 1
+  read_kb_manus_v2_env_pair "$source" >/dev/null || return 1
+  awk -v writer="$writer" -v migration="$migration" '
+    BEGIN { writer_seen = 0; migration_seen = 0 }
+    /^FRONTMIND_KB_MANUS_V2_WRITER=/ {
+      print "FRONTMIND_KB_MANUS_V2_WRITER=" writer; writer_seen = 1; next
+    }
+    /^FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=/ {
+      print "FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=" migration; migration_seen = 1; next
+    }
+    { print }
+    END {
+      if (!writer_seen) print "FRONTMIND_KB_MANUS_V2_WRITER=" writer
+      if (!migration_seen) print "FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION=" migration
+    }
+  ' "$source" >"$target" || return 1
+  chmod 0600 "$target" || return 1
+  [[ $(read_unique_env_value "$target" FRONTMIND_KB_MANUS_V2_WRITER) == "$writer" ]] \
+    && [[ $(read_unique_env_value "$target" FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION) == "$migration" ]]
+}
+
+install_kb_manus_v2_runtime_env() {
+  local source="$1" target="$2" temporary
+  temporary="$(mktemp "${target}.tmp.XXXXXX")" || return 1
+  if ! install -o root -g root -m 0600 "$source" "$temporary" \
+    || ! mv -f -- "$temporary" "$target"; then
+    rm -f -- "$temporary" || true
+    return 1
+  fi
+  config_is_root_only "$target"
+}
+
+ready_payload_matches_kb_manus_v2_rollout() {
+  local payload="$1" expected_sha="$2" expected_digest="$3" writer="$4" migration="$5"
+  ready_payload_matches_identity "$payload" "$expected_sha" "$expected_digest" \
+    && jq -e --arg journalHash "$current_journal_hash" \
+      --argjson writer "$writer" --argjson migration "$migration" '
+      .migration.status == "exact" and .migration.schema.status == "exact" and
+      .migration.journalHash == $journalHash and
+      .configuration.knowledgeBaseManusV2Writer.enabled == $writer and
+      .configuration.knowledgeBaseManusV2ActiveMigration.enabled == $migration
+    ' <<<"$payload" >/dev/null
+}
+
+wait_until_kb_manus_v2_rollout_ready() {
+  local expected_sha="$1" expected_digest="$2" writer="$3" migration="$4" deadline="$5"
+  local local_payload public_payload
+  while (( SECONDS < deadline )); do
+    local_payload="$(curl --fail --silent --show-error --max-time 4 "$LOCAL_READY_URL" 2>/dev/null || true)"
+    if ready_payload_matches_kb_manus_v2_rollout \
+      "$local_payload" "$expected_sha" "$expected_digest" "$writer" "$migration" 2>/dev/null; then
+      public_payload="$(curl --fail --silent --show-error --max-time 6 "$PUBLIC_READY_URL" 2>/dev/null || true)"
+      if ready_payload_matches_kb_manus_v2_rollout \
+        "$public_payload" "$expected_sha" "$expected_digest" "$writer" "$migration" 2>/dev/null; then
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+kb_manus_v2_migration_diagnostics_converged() {
+  local payload="$1"
+  jq -e '
+    .configuration.knowledgeBaseManusV2ActiveMigration.enabled == true and
+    .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.lastSweepInfrastructureStatus == "ok" and
+    .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.migrationConverged == true and
+    .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.activeLegacyTotal == 0 and
+    .configuration.knowledgeBaseManusV2ActiveMigration.diagnostics.inFlightHandoffs == 0
+  ' <<<"$payload" >/dev/null
+}
+
+require_kb_manus_v2_migration_convergence() {
+  local local_payload public_payload
+  local_payload="$(curl --fail --silent --show-error --max-time 6 "$LOCAL_READY_URL")" \
+    || return 1
+  public_payload="$(curl --fail --silent --show-error --max-time 10 "$PUBLIC_READY_URL")" \
+    || return 1
+  ready_payload_matches_kb_manus_v2_rollout \
+    "$local_payload" "$source_sha" "$digest" true true \
+    && ready_payload_matches_kb_manus_v2_rollout \
+      "$public_payload" "$source_sha" "$digest" true true \
+    && kb_manus_v2_migration_diagnostics_converged "$local_payload" \
+    && kb_manus_v2_migration_diagnostics_converged "$public_payload"
+}
+
+write_kb_manus_v2_rollout_recovery() {
+  local phase="$1" old_writer="$2" old_migration="$3" target_writer="$4" target_migration="$5" temporary
+  temporary="$(mktemp "${KB_MANUS_V2_ROLLOUT_RECOVERY_FILE}.tmp.XXXXXX")" || return 1
+  jq -n --arg phase "$phase" --arg image "$image" --arg sourceSha "$source_sha" \
+    --arg digest "$digest" --arg journalHash "$current_journal_hash" \
+    --argjson oldWriter "$old_writer" --argjson oldMigration "$old_migration" \
+    --argjson targetWriter "$target_writer" --argjson targetMigration "$target_migration" '
+      {
+        schemaVersion: 1,
+        phase: $phase,
+        image: $image,
+        digest: $digest,
+        sourceSha: $sourceSha,
+        journalHash: $journalHash,
+        previous: {writer: $oldWriter, activeMigration: $oldMigration},
+        target: {writer: $targetWriter, activeMigration: $targetMigration}
+      }
+    ' >"$temporary" || { rm -f -- "$temporary"; return 1; }
+  chmod 0600 "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE" || return 1
+  config_is_root_only "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE"
+}
+
+kb_manus_v2_rollout_recovery_is_exact() {
+  config_is_root_only "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE" \
+    && config_is_root_only "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" \
+    && jq -e --arg image "${IMAGE_REPOSITORY}@${current_digest}" \
+      --arg digest "$current_digest" --arg sourceSha "$current_source_sha" \
+      --arg journalHash "$current_journal_hash" '
+        .schemaVersion == 1 and
+        (.phase | IN("dual-read", "canary", "migration", "pause", "complete")) and
+        .image == $image and .digest == $digest and .sourceSha == $sourceSha and
+        .journalHash == $journalHash and
+        (.previous.writer | type == "boolean") and
+        (.previous.activeMigration | type == "boolean") and
+        (.target.writer | type == "boolean") and
+        (.target.activeMigration | type == "boolean")
+      ' "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE" >/dev/null
+}
 
 write_state() {
   local next_current="$1" next_previous="$2" next_source="$3"
@@ -612,6 +833,133 @@ restore_previous_application() {
   rm -f -- "$previous_environment" || return 1
 }
 
+restore_kb_manus_v2_rollout() {
+  local old_writer old_migration rollback_pair rollback_writer rollback_migration
+  local restore_deadline
+  kb_manus_v2_rollout_recovery_is_exact || return 1
+  old_writer="$(jq -r '.previous.writer' "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE")"
+  old_migration="$(jq -r '.previous.activeMigration' "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE")"
+  rollback_pair="$(read_kb_manus_v2_env_pair "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV")" \
+    || return 1
+  read -r rollback_writer rollback_migration <<<"$rollback_pair"
+  [[ $rollback_writer == "$old_writer" && $rollback_migration == "$old_migration" ]] \
+    || return 1
+  install_kb_manus_v2_runtime_env \
+    "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" "$KB_MANUS_V2_RUNTIME_ENV_FILE" || return 1
+  kb_manus_v2_restore_compose_env="$(mktemp)" || return 1
+  make_compose_env "$kb_manus_v2_restore_compose_env" "${IMAGE_REPOSITORY}@${current_digest}" \
+    || return 1
+  restore_deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
+  if ! compose_before_deadline "$restore_deadline" "$kb_manus_v2_restore_compose_env" \
+      up -d --no-deps --force-recreate "$COMPOSE_SERVICE" >/dev/null \
+    || ! wait_until_kb_manus_v2_rollout_ready \
+      "$current_source_sha" "$current_digest" "$old_writer" "$old_migration" \
+      "$restore_deadline"; then
+    return 1
+  fi
+  rm -f -- "$kb_manus_v2_restore_compose_env" \
+    "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE" "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" \
+    || return 1
+  kb_manus_v2_restore_compose_env=""
+  kb_manus_v2_rollout_restore_armed=0
+  log "PRODUCTION_KB_MANUS_V2_ROLLOUT_RESTORED source=${current_source_sha} digest=${current_digest} writer=${old_writer} migration=${old_migration}"
+}
+
+run_kb_manus_v2_rollout() {
+  local target_values target_writer target_migration old_writer old_migration
+  local old_values plan_json container_id container_image container_running rollout_deadline
+  [[ $current_digest == "$digest" && $current_source_sha == "$source_sha" ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_CURRENT_RELEASE_MISMATCH" 73
+  [[ $current_journal_hash =~ ^[a-f0-9]{64}$ ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_STATE_JOURNAL_INVALID" 73
+  [[ -f $IMAGE_ENV_FILE && ! -L $IMAGE_ENV_FILE ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_IMAGE_ENV_REJECTED" 73
+  [[ $(grep -Fxc -- "${IMAGE_ENV_KEY}=${image}" "$IMAGE_ENV_FILE" || true) == 1 ]] \
+    && [[ $(grep -Fxc -- "FRONTMIND_IMAGE_DIGEST=${digest}" "$IMAGE_ENV_FILE" || true) == 1 ]] \
+    && [[ $(grep -Fxc -- "FRONTMIND_SOURCE_SHA=${source_sha}" "$IMAGE_ENV_FILE" || true) == 1 ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_IMAGE_ENV_IDENTITY_MISMATCH" 73
+  [[ $unfinished_status == "success" || $unfinished_status == "failed" ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RELEASE_STATE_REJECTED:${unfinished_status}" 73
+  config_is_root_only "$KB_MANUS_V2_RUNTIME_ENV_FILE" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RUNTIME_ENV_REJECTED" 73
+  target_values="$(kb_manus_v2_phase_values "$rollout_phase")" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_PHASE_REJECTED" 64
+  read -r target_writer target_migration <<<"$target_values"
+  old_values="$(read_kb_manus_v2_env_pair "$KB_MANUS_V2_RUNTIME_ENV_FILE")" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RUNTIME_ENV_REJECTED" 73
+  read -r old_writer old_migration <<<"$old_values"
+  if [[ $rollout_phase == "complete" ]]; then
+    [[ $old_writer == "true" && $old_migration == "true" ]] \
+      || die "PRODUCTION_KB_MANUS_V2_COMPLETE_REQUIRES_MIGRATION_PHASE" 73
+    require_kb_manus_v2_migration_convergence \
+      || die "PRODUCTION_KB_MANUS_V2_COMPLETE_DIAGNOSTICS_NOT_CONVERGED" 75
+  fi
+
+  container_id="$(compose "$candidate_env" ps -q "$COMPOSE_SERVICE")"
+  [[ -n $container_id && $container_id != *$'\n'* ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_CONTAINER_NOT_UNIQUE" 73
+  container_running="$(docker inspect --format '{{.State.Running}}' "$container_id")"
+  [[ $container_running == "true" ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_CONTAINER_NOT_RUNNING" 73
+  container_image="$(docker inspect --format '{{.Config.Image}}' "$container_id")"
+  [[ $container_image == "$image" ]] \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_CONTAINER_IDENTITY_MISMATCH" 73
+  plan_json="$(run_release_db_json "$candidate_env" plan --json)" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_DATABASE_PLAN_FAILED" 78
+  jq -e --arg journalHash "$current_journal_hash" '
+    .status == "exact" and .schema.status == "exact" and .journalHash == $journalHash
+  ' <<<"$plan_json" >/dev/null \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_DATABASE_IDENTITY_MISMATCH" 78
+  wait_until_kb_manus_v2_rollout_ready \
+    "$source_sha" "$digest" "$old_writer" "$old_migration" \
+    "$((SECONDS + CANDIDATE_READY_BUDGET_SECONDS))" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_CURRENT_READINESS_MISMATCH" 75
+
+  if [[ $old_writer == "$target_writer" && $old_migration == "$target_migration" ]]; then
+    log "PRODUCTION_KB_MANUS_V2_ROLLOUT_ALREADY_CURRENT phase=${rollout_phase} source=${source_sha} digest=${digest} writer=${target_writer} migration=${target_migration}"
+    return 0
+  fi
+
+  if [[ -e $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE || -L $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE \
+     || -e $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV || -L $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV ]]; then
+    die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECOVERY_PENDING" 73
+  fi
+  kb_manus_v2_staged_runtime="$(mktemp)"
+  render_kb_manus_v2_runtime_env \
+    "$KB_MANUS_V2_RUNTIME_ENV_FILE" "$kb_manus_v2_staged_runtime" "$target_writer" "$target_migration" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RUNTIME_RENDER_FAILED" 70
+  install_kb_manus_v2_runtime_env \
+    "$KB_MANUS_V2_RUNTIME_ENV_FILE" "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV_FAILED" 70
+  write_kb_manus_v2_rollout_recovery \
+    "$rollout_phase" "$old_writer" "$old_migration" "$target_writer" "$target_migration" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECOVERY_WRITE_FAILED" 70
+  kb_manus_v2_rollout_restore_armed=1
+  install_kb_manus_v2_runtime_env "$kb_manus_v2_staged_runtime" "$KB_MANUS_V2_RUNTIME_ENV_FILE" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RUNTIME_INSTALL_FAILED" 70
+  rm -f -- "$kb_manus_v2_staged_runtime"
+  kb_manus_v2_staged_runtime=""
+  kb_manus_v2_rollout_compose_env="$(mktemp)"
+  make_compose_env "$kb_manus_v2_rollout_compose_env" "$image" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_COMPOSE_ENV_FAILED" 70
+  rollout_deadline=$((SECONDS + DEPLOY_TIMEOUT_SECONDS))
+  compose_before_deadline "$rollout_deadline" "$kb_manus_v2_rollout_compose_env" \
+    up -d --no-deps --force-recreate "$COMPOSE_SERVICE" >/dev/null \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECREATE_FAILED" 75
+  rm -f -- "$kb_manus_v2_rollout_compose_env"
+  kb_manus_v2_rollout_compose_env=""
+  wait_until_kb_manus_v2_rollout_ready \
+    "$source_sha" "$digest" "$target_writer" "$target_migration" \
+    "$rollout_deadline" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_READINESS_FAILED" 75
+  rm -f -- "$KB_MANUS_V2_ROLLOUT_RECOVERY_FILE" \
+    || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_COMMIT_FAILED" 70
+  kb_manus_v2_rollout_restore_armed=0
+  rm -f -- "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" \
+    || log "PRODUCTION_KB_MANUS_V2_ROLLOUT_STALE_ROLLBACK_ENV_WARNING"
+  log "PRODUCTION_KB_MANUS_V2_ROLLOUT_OK phase=${rollout_phase} source=${source_sha} digest=${digest} writer=${target_writer} migration=${target_migration}"
+}
+
 verify_candidate() {
   log "VERIFY_SIGNATURE service=${service} image=${image}"
   cosign verify \
@@ -860,7 +1208,7 @@ rotate_backups() {
   done
 }
 
-if [[ $mode == "acknowledge-incident" ]]; then
+if [[ $operation == "deploy" && $mode == "acknowledge-incident" ]]; then
   [[ $unfinished_attempted_digest == "$digest" ]] \
     || die "INCIDENT_ACKNOWLEDGEMENT_DIGEST_MISMATCH" 64
   [[ -n $unfinished_release_id && $unfinished_release_id == "${source_sha}-"* ]] \
@@ -876,6 +1224,27 @@ if [[ $mode == "acknowledge-incident" ]]; then
   exit 0
 fi
 
+if [[ $operation == "kb-manus-v2-rollout" ]]; then
+  if [[ ! -e $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE && ! -L $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE \
+     && ( -e $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV || -L $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV ) ]]; then
+    config_is_root_only "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" \
+      || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_STALE_ROLLBACK_ENV_REJECTED" 73
+    rm -f -- "$KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV" \
+      || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_STALE_ROLLBACK_ENV_CLEANUP_FAILED" 70
+    log "PRODUCTION_KB_MANUS_V2_ROLLOUT_STALE_ROLLBACK_ENV_CLEANED"
+  elif [[ -e $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE || -L $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE \
+     || -e $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV || -L $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV ]]; then
+    kb_manus_v2_rollout_restore_armed=1
+    restore_kb_manus_v2_rollout \
+      || die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECOVERY_FAILED" 73
+  fi
+fi
+if [[ $operation == "deploy" && $service == "dashboard" \
+   && ( -e $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE || -L $KB_MANUS_V2_ROLLOUT_RECOVERY_FILE \
+     || -e $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV || -L $KB_MANUS_V2_ROLLOUT_ROLLBACK_ENV ) ]]; then
+  die "PRODUCTION_KB_MANUS_V2_ROLLOUT_RECOVERY_BLOCKS_RELEASE" 73
+fi
+
 if [[ $mode == "deploy" && ${SUDO_USER:-} == "frontmind-deploy" ]]; then
   read_ephemeral_registry_auth
 fi
@@ -886,6 +1255,11 @@ fi
 
 candidate_env="$(mktemp)"
 make_compose_env "$candidate_env" "$image"
+
+if [[ $operation == "kb-manus-v2-rollout" ]]; then
+  run_kb_manus_v2_rollout
+  exit 0
+fi
 
 if [[ $mode == "bootstrap-state" ]]; then
   # Bootstrap only records an already-running, signed release. It never starts
