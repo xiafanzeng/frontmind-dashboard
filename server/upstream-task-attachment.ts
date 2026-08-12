@@ -6,19 +6,7 @@ import {
   assertSafeExternalUrl,
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
-
-const REPLAYABLE_PRE_UPLOAD_STATUSES = new Set([
-  "created",
-  "not_uploaded",
-  "pending",
-  "upload_pending",
-  "awaiting_upload",
-]);
-
-type ProviderReplayMetadata = Pick<
-  CanonicalProviderFile,
-  "id" | "filename" | "status"
->;
+import { waitForUpstreamFilesReady } from "./upstream-file-readiness";
 
 export type CanonicalProviderFile = {
   id: string;
@@ -155,26 +143,6 @@ export function canonicalMimeType(value: string) {
   return value.trim().toLowerCase().split(";", 1)[0] || "";
 }
 
-function canonicalProviderReplayMetadata(
-  value: unknown,
-): ProviderReplayMetadata | null {
-  const source = providerRecord(value);
-  if (!source) return null;
-  const id = canonicalStringAlias(source, ["id", "file_id"]);
-  const filename = canonicalStringAlias(source, ["filename", "file_name"]);
-  const status = canonicalStringAlias(
-    source,
-    ["status", "upload_status", "uploadStatus"],
-    (item) => item.trim().toLowerCase().replace(/[ -]+/gu, "_"),
-  );
-  if (!id.valid || !filename.valid || !status.valid) return null;
-  return {
-    id: id.value || "",
-    filename: filename.value || "",
-    status: status.value || "",
-  };
-}
-
 function destroyProviderContent(value: unknown) {
   if (
     value &&
@@ -186,6 +154,64 @@ function destroyProviderContent(value: unknown) {
   }
 }
 
+export class UpstreamTaskAttachmentPendingError extends Error {
+  readonly code = "UPSTREAM_FILE_PENDING";
+
+  constructor(readonly fileId: string) {
+    super("Task attachment is still processing upstream");
+    this.name = "UpstreamTaskAttachmentPendingError";
+  }
+}
+
+export type UpstreamTaskAttachmentContentProofFailureClass =
+  | "transient"
+  | "deterministic";
+
+export type UpstreamTaskAttachmentContentProofReason =
+  | "network"
+  | "http_status"
+  | "invalid_stream"
+  | "stream_interrupted"
+  | "invalid_chunk"
+  | "size_mismatch"
+  | "sha256_mismatch";
+
+/**
+ * Safe, credential-free classification for an existing generated file whose
+ * authenticated /content proof could not be completed. The message never
+ * contains a provider file id, filename, URL, response body, or API key.
+ */
+export class UpstreamTaskAttachmentContentProofError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+
+  constructor(
+    readonly failureClass: UpstreamTaskAttachmentContentProofFailureClass,
+    readonly reason: UpstreamTaskAttachmentContentProofReason,
+    readonly httpStatus?: number,
+  ) {
+    super(
+      failureClass === "transient"
+        ? "Provider attachment content proof is temporarily unavailable"
+        : "Provider attachment content proof failed integrity validation",
+    );
+    this.name = "UpstreamTaskAttachmentContentProofError";
+    this.code =
+      failureClass === "transient"
+        ? "UPSTREAM_FILE_CONTENT_PROOF_UNAVAILABLE"
+        : "UPSTREAM_FILE_CONTENT_PROOF_INVALID";
+    this.retryable = failureClass === "transient";
+  }
+}
+
+function contentProofHttpFailureClass(
+  status: number,
+): UpstreamTaskAttachmentContentProofFailureClass {
+  return status === 408 || status === 425 || status === 429 || status >= 500
+    ? "transient"
+    : "deterministic";
+}
+
 async function assertProviderContentMatches(input: {
   baseUrl: string;
   fileId: string;
@@ -193,21 +219,30 @@ async function assertProviderContentMatches(input: {
   bytes: Buffer;
   authHeaders: Record<string, string>;
 }) {
-  const content = await axios.get(
-    `${input.baseUrl}/v1/files/${encodeURIComponent(input.fileId)}/content`,
-    {
-      headers: input.authHeaders,
-      responseType: "stream",
-      timeout: 120_000,
-      maxRedirects: 0,
-      maxContentLength: input.bytes.length + 1,
-      decompress: false,
-      validateStatus: () => true,
-    },
-  );
+  let content;
+  try {
+    content = await axios.get(
+      `${input.baseUrl}/v1/files/${encodeURIComponent(input.fileId)}/content`,
+      {
+        headers: input.authHeaders,
+        responseType: "stream",
+        timeout: 120_000,
+        maxRedirects: 0,
+        maxContentLength: input.bytes.length + 1,
+        decompress: false,
+        validateStatus: () => true,
+      },
+    );
+  } catch {
+    throw new UpstreamTaskAttachmentContentProofError("transient", "network");
+  }
   if (content.status < 200 || content.status >= 300) {
     destroyProviderContent(content.data);
-    throw new Error(`Task attachment content lookup failed: ${input.filename}`);
+    throw new UpstreamTaskAttachmentContentProofError(
+      contentProofHttpFailureClass(content.status),
+      "http_status",
+      content.status,
+    );
   }
 
   const stream = content.data as
@@ -216,8 +251,9 @@ async function assertProviderContentMatches(input: {
     | undefined;
   if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
     destroyProviderContent(content.data);
-    throw new Error(
-      `Task attachment content response is invalid: ${input.filename}`,
+    throw new UpstreamTaskAttachmentContentProofError(
+      "deterministic",
+      "invalid_stream",
     );
   }
 
@@ -231,8 +267,9 @@ async function assertProviderContentMatches(input: {
       next = await iterator.next();
     } catch {
       destroyProviderContent(stream);
-      throw new Error(
-        `Task attachment content lookup failed: ${input.filename}`,
+      throw new UpstreamTaskAttachmentContentProofError(
+        "transient",
+        "stream_interrupted",
       );
     }
     if (next.done) break;
@@ -245,22 +282,32 @@ async function assertProviderContentMatches(input: {
           : null;
     if (!chunk) {
       destroyProviderContent(stream);
-      throw new Error(
-        `Task attachment content response is invalid: ${input.filename}`,
+      throw new UpstreamTaskAttachmentContentProofError(
+        "deterministic",
+        "invalid_chunk",
       );
     }
     actualSize += chunk.length;
     if (actualSize > input.bytes.length) {
       destroyProviderContent(stream);
-      throw new Error(`Task attachment content mismatch: ${input.filename}`);
+      throw new UpstreamTaskAttachmentContentProofError(
+        "deterministic",
+        "size_mismatch",
+      );
     }
     actualSha256.update(chunk);
   }
-  if (
-    actualSize !== input.bytes.length ||
-    actualSha256.digest("hex") !== expectedSha256
-  ) {
-    throw new Error(`Task attachment content mismatch: ${input.filename}`);
+  if (actualSize !== input.bytes.length) {
+    throw new UpstreamTaskAttachmentContentProofError(
+      "deterministic",
+      "size_mismatch",
+    );
+  }
+  if (actualSha256.digest("hex") !== expectedSha256) {
+    throw new UpstreamTaskAttachmentContentProofError(
+      "deterministic",
+      "sha256_mismatch",
+    );
   }
 }
 
@@ -276,11 +323,14 @@ export async function uploadUpstreamTaskAttachment(input: {
   existingFileId?: string;
   /** Persist file ownership before any byte upload can begin. */
   onFileResolved?: (fileId: string) => Promise<void>;
+  /** Bounded provider readiness wait; production defaults to five minutes. */
+  readinessDeadlineMs?: number;
+  /** Test seam for readiness backoff without changing production timing. */
+  readinessSleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }) {
   const mimeType = input.mimeType || "application/zip";
   const authHeaders = {
     API_KEY: input.apiKey,
-    Authorization: `Bearer ${input.apiKey}`,
   };
   let createdData: Record<string, unknown> = {};
   const suppliedFileId = String(input.existingFileId || "");
@@ -328,53 +378,28 @@ export async function uploadUpstreamTaskAttachment(input: {
     const uploadUrl =
       typeof createdData.upload_url === "string" ? createdData.upload_url : "";
     if (usesExistingFile) {
-      const metadata = await axios.get(
-        `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-        {
-          headers: authHeaders,
-          timeout: 30_000,
-          validateStatus: () => true,
-        },
-      );
-      if (metadata.status < 200 || metadata.status >= 300) {
-        throw new Error(
-          `Task attachment metadata lookup failed: ${input.filename}`,
-        );
+      const readiness = await waitForUpstreamFilesReady({
+        baseUrl: input.baseUrl,
+        apiKey: input.apiKey,
+        files: [{ fileId, filename: input.filename }],
+        deadlineMs: input.readinessDeadlineMs,
+        sleep: input.readinessSleep,
+      });
+      if (readiness.pending.length > 0) {
+        throw new UpstreamTaskAttachmentPendingError(fileId);
       }
-      const providerFile = canonicalProviderReplayMetadata(metadata.data);
-      if (!providerFile) {
-        throw new Error(
-          `Task attachment metadata is invalid: ${input.filename}`,
-        );
-      }
-      if (
-        providerFile.id !== fileId ||
-        providerFile.filename !== input.filename
-      ) {
-        throw new Error(`Task attachment metadata mismatch: ${input.filename}`);
-      }
-      if (providerFile.status === "uploaded") {
-        await assertProviderContentMatches({
-          baseUrl: input.baseUrl,
-          fileId,
-          filename: input.filename,
-          bytes: input.bytes,
-          authHeaders,
-        });
-        return {
-          attachment: { file_id: fileId, filename: input.filename },
-          fileId,
-          removeOrphan,
-        };
-      }
-      if (!REPLAYABLE_PRE_UPLOAD_STATUSES.has(providerFile.status)) {
-        throw new Error(
-          `Task attachment state is not safely replayable: ${input.filename}`,
-        );
-      }
-      throw new Error(
-        `Task attachment upload capability is unavailable for existing file: ${input.filename}`,
-      );
+      await assertProviderContentMatches({
+        baseUrl: input.baseUrl,
+        fileId,
+        filename: input.filename,
+        bytes: input.bytes,
+        authHeaders,
+      });
+      return {
+        attachment: { file_id: fileId, filename: input.filename },
+        fileId,
+        removeOrphan,
+      };
     }
     if (!uploadUrl) {
       throw new Error(
@@ -397,6 +422,16 @@ export async function uploadUpstreamTaskAttachment(input: {
     });
     if (uploaded.status < 200 || uploaded.status >= 300) {
       throw new Error(`Task attachment upload failed: ${input.filename}`);
+    }
+    const readiness = await waitForUpstreamFilesReady({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      files: [{ fileId, filename: input.filename }],
+      deadlineMs: input.readinessDeadlineMs,
+      sleep: input.readinessSleep,
+    });
+    if (readiness.pending.length > 0) {
+      throw new UpstreamTaskAttachmentPendingError(fileId);
     }
     return {
       attachment: { file_id: fileId, filename: input.filename },

@@ -83,6 +83,9 @@ describe("ordinary-user FrontMind proxy policy", () => {
     ["POST", "/api/frontmind/download-token"],
     ["DELETE", "/api/frontmind/v1/files/file-1/discard"],
     ["POST", "/api/frontmind/v1/files/file-1/upload-recovery"],
+    ["POST", "/api/frontmind/v1/managed-uploads"],
+    ["POST", "/api/frontmind/v1/managed-uploads/recovery"],
+    ["DELETE", "/api/frontmind/v1/managed-uploads"],
   ])("allows support transport %s %s", (method, originalUrl) => {
     expect(ordinaryUserMayUseFrontMindProxy({ method, originalUrl })).toBe(
       true,
@@ -93,6 +96,8 @@ describe("ordinary-user FrontMind proxy policy", () => {
     ["POST", "/api/frontmind/v1/files"],
     ["PUT", "/api/frontmind/proxy-upload?target=https%3A%2F%2Fexample.com"],
     ["POST", "/api/frontmind/v1/files/file-1/upload-recovery"],
+    ["POST", "/api/frontmind/v1/managed-uploads"],
+    ["POST", "/api/frontmind/v1/managed-uploads/recovery"],
   ])(
     "marks upload transport %s %s as requiring an active service",
     (method, originalUrl) => {
@@ -174,6 +179,8 @@ describe("ordinary-user FrontMind proxy policy", () => {
     ["POST", "/api/frontmind/v1/tasks/task-1"],
     ["PATCH", "/api/frontmind/v1/tasks/task-1"],
     ["DELETE", "/api/frontmind/v1/tasks/task-1"],
+    ["POST", "/api/frontmind/v1/managed-uploads/secret-intent/recovery"],
+    ["DELETE", "/api/frontmind/v1/managed-uploads/secret-intent"],
   ])("blocks model or resource mutation %s %s", (method, originalUrl) => {
     expect(ordinaryUserMayUseFrontMindProxy({ method, originalUrl })).toBe(
       false,

@@ -47,6 +47,7 @@ import {
   redactSensitiveText,
   safeErrorForLog,
 } from "./_core/sensitive-data";
+import { runtimeErrorForLog } from "./_core/runtime-error-log";
 import { preparedFileService } from "./prepared-file-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
@@ -73,6 +74,11 @@ import {
   type CanonicalProviderFile,
 } from "./upstream-task-attachment";
 import {
+  checkUpstreamFileReadiness,
+  UPSTREAM_FILE_READINESS_RETRY_AFTER_MS,
+  UpstreamFileReadinessError,
+} from "./upstream-file-readiness";
+import {
   bindDownloadUrlToProject,
   createSignedDownloadToken,
   resolveDownloadProjectContext,
@@ -91,6 +97,17 @@ import {
   stageAndUploadManagedBody,
   type ManagedProviderAttempt,
 } from "./managed-upload-provider";
+import {
+  createManagedUploadIntent,
+  createManagedUploadIntentTicket,
+  deleteManagedUploadIntent,
+  ManagedUploadIntentError,
+  MANAGED_UPLOAD_INTENT_MAX_BYTES,
+  processManagedUploadIntent,
+  readManagedUploadIntent,
+  receiveManagedUploadIntentBody,
+  recoverManagedUploadIntent,
+} from "./managed-upload-intent";
 
 const router = Router();
 
@@ -98,7 +115,7 @@ const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
 export const MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_CAPTURED_UPLOAD_BYTES = 100 * 1024 * 1024;
 export const CAPTURED_UPLOAD_MAX_ATTEMPTS = 2;
-export const CAPTURED_UPLOAD_METADATA_TIMEOUT_MS = 30_000;
+export const CAPTURED_UPLOAD_METADATA_TIMEOUT_MS = 10_000;
 export const CAPTURED_UPLOAD_PROVIDER_PUT_TIMEOUT_MS = 120_000;
 const activeCapturedUploadIds = new Set<string>();
 const REPLAYABLE_CAPTURED_UPLOAD_STATUSES = new Set([
@@ -111,6 +128,7 @@ const REPLAYABLE_CAPTURED_UPLOAD_STATUSES = new Set([
 
 type CapturedUploadErrorCode =
   | "UPLOAD_PROVIDER_IDENTITY_MISMATCH"
+  | "UPLOAD_PROVIDER_RECORD_UNUSABLE"
   | "UPLOAD_CAPABILITY_REQUIRED"
   | "UPLOAD_CAPABILITY_INVALID"
   | "UPLOAD_CAPABILITY_EXPIRED"
@@ -257,6 +275,20 @@ function capturedFileKey(fileId: string) {
   return createHash("sha256").update(fileId).digest("hex").slice(0, 12);
 }
 
+function managedUploadRuntimeErrorMetadata(
+  error: unknown,
+  additionalSecrets: Iterable<unknown> = [],
+) {
+  const safe = runtimeErrorForLog(error, { additionalSecrets });
+  return {
+    // Managed upload logs already carry a fixed stage and safe correlation
+    // fields. Do not retain any exception text, path, code, or request id: fs
+    // errors and database wrappers may embed customer identifiers in them.
+    errorCode: "MANAGED_UPLOAD_RUNTIME_ERROR",
+    ...(typeof safe.status === "number" ? { status: safe.status } : {}),
+  };
+}
+
 function capturedBatchKey(value: unknown) {
   const batchId = String(value || "").trim();
   if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(batchId)) return undefined;
@@ -343,7 +375,6 @@ function assertManagedUploadCapabilityCanStart(
 function assertCapturedProviderIdentity(input: {
   providerFile: CanonicalProviderFile;
   fileId: string;
-  providerFilename: string;
   sizeBytes: number;
   sha256?: string;
   mimeType: string;
@@ -368,9 +399,18 @@ function assertCapturedProviderIdentity(input: {
     providerFile.sha256 === input.sha256;
   const uploaded = providerFile.status === "uploaded";
 
+  if (providerFile.id !== input.fileId) {
+    throw new CapturedUploadError(
+      409,
+      "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+      "云端返回的文件身份与当前记录不一致，请联系管理员",
+      false,
+      "metadata_identity",
+      "contact_admin",
+    );
+  }
+
   if (
-    providerFile.id !== input.fileId ||
-    providerFile.filename !== input.providerFilename ||
     !mimeTypeMatches ||
     !sha256Matches ||
     (uploaded ? !sizeMatchesUploaded : !sizeMatchesPending)
@@ -467,30 +507,78 @@ async function readCapturedProviderMetadata(input: {
   sha256?: string;
   signal: AbortSignal;
 }) {
-  const authHeaders = {
-    API_KEY: input.apiKey,
-    Authorization: `Bearer ${input.apiKey}`,
-  };
   const reconciliationStartedAt = Date.now();
   let metadata;
   try {
-    metadata = await axios.get(
-      `${input.baseUrl}/v1/files/${encodeURIComponent(input.fileId)}`,
-      {
-        headers: authHeaders,
-        timeout: CAPTURED_UPLOAD_METADATA_TIMEOUT_MS,
-        maxRedirects: 0,
-        maxContentLength: 1024 * 1024,
-        signal: input.signal,
-        validateStatus: () => true,
+    const readiness = await checkUpstreamFileReadiness({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      file: {
+        fileId: input.fileId,
+        filename: input.providerFilename,
       },
-    );
+      signal: input.signal,
+      timeoutMs: CAPTURED_UPLOAD_METADATA_TIMEOUT_MS,
+      // The provider owns its canonical filename after file creation. The
+      // immutable security identity is the owned fileId plus the signed upload
+      // ticket and staged bytes; filename normalization must not turn a valid
+      // upload into a different file.
+      filenamePolicy: "provider_authoritative",
+    });
+    metadata = {
+      status: 200,
+      data: {
+        id: readiness.fileId,
+        filename: readiness.filename,
+        status: readiness.status,
+      },
+    };
   } catch (error) {
     if (
       (input.signal.reason as { code?: unknown } | null)?.code ===
       "UPLOAD_SOURCE_DEADLINE_EXCEEDED"
     ) {
       throw input.signal.reason;
+    }
+    if (error instanceof UpstreamFileReadinessError) {
+      if (error.code === "UPSTREAM_FILE_METADATA_UNAVAILABLE") {
+        throw new CapturedUploadError(
+          503,
+          "UPSTREAM_UPLOAD_UNAVAILABLE",
+          "暂时无法确认文件上传状态，请稍后再检查",
+          true,
+          "metadata_reconciliation",
+          "check_status",
+        );
+      }
+      if (error.code === "UPSTREAM_FILE_IDENTITY_MISMATCH") {
+        throw new CapturedUploadError(
+          409,
+          "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+          "云端返回的文件身份与当前记录不一致，请联系管理员",
+          false,
+          "metadata_identity",
+          "contact_admin",
+        );
+      }
+      if (error.code === "UPSTREAM_FILE_UNUSABLE") {
+        throw new CapturedUploadError(
+          409,
+          "UPLOAD_PROVIDER_RECORD_UNUSABLE",
+          "云端文件记录已不可用，请移除后重新选择",
+          false,
+          "metadata_status",
+          "discard_and_recreate",
+        );
+      }
+      throw new CapturedUploadError(
+        502,
+        "UPLOAD_RECOVERY_INVALID",
+        "文件上传记录响应无效，请联系管理员",
+        false,
+        "metadata_reconciliation",
+        "contact_admin",
+      );
     }
     throw capturedUploadAttemptError(error);
   }
@@ -534,12 +622,11 @@ async function readCapturedProviderMetadata(input: {
   assertCapturedProviderIdentity({
     providerFile,
     fileId: input.fileId,
-    providerFilename: input.providerFilename,
     sizeBytes: input.sizeBytes,
     sha256: input.sha256,
     mimeType: input.mimeType,
   });
-  return { providerFile, reconciliationMs };
+  return { providerFile, reconciliationMs, checkedAt: Date.now() };
 }
 
 function capturedProviderAttemptError(
@@ -600,7 +687,6 @@ async function assertCapturedProviderContent(input: {
       {
         headers: {
           API_KEY: input.apiKey,
-          Authorization: `Bearer ${input.apiKey}`,
         },
         responseType: "stream",
         timeout: CAPTURED_UPLOAD_PROVIDER_PUT_TIMEOUT_MS,
@@ -3015,6 +3101,255 @@ async function sanitizeFileBuffer(
 // End sanitization helpers
 // ============================================================
 
+function managedIntentErrorResponse(
+  res: Response,
+  error: unknown,
+  traceId: string,
+) {
+  const managed =
+    error instanceof ManagedUploadIntentError
+      ? error
+      : new ManagedUploadIntentError(
+          503,
+          "UPLOAD_INTERNAL_ERROR",
+          "文件上传服务暂时不可用，请稍后重试",
+          true,
+          "check_status",
+        );
+  return res
+    .status(managed.statusCode)
+    .set(managed.statusCode === 409 ? { "Retry-After": "3" } : {})
+    .json({
+      error: {
+        message: managed.message,
+        code: managed.code,
+        retryable: managed.retryable,
+        recoveryAction: managed.recoveryAction,
+        traceId,
+      },
+    });
+}
+
+function preventManagedIntentCapabilityCaching(res: Response) {
+  res.set({
+    "Cache-Control": "private, no-store",
+    Pragma: "no-cache",
+  });
+}
+
+router.post("/v1/managed-uploads", async (req: Request, res: Response) => {
+  preventManagedIntentCapabilityCaching(res);
+  const traceId = randomUUID();
+  if (!req.frontmindUser || !req.frontmindCredential) {
+    return res.status(401).json({
+      error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
+    });
+  }
+  const body =
+    req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? (req.body as Record<string, unknown>)
+      : {};
+  try {
+    const manifest = await createManagedUploadIntent({
+      operationId: typeof body.operationId === "string" ? body.operationId : "",
+      batchId: typeof body.batchId === "string" ? body.batchId : "",
+      ordinal: Number(body.ordinal),
+      total: Number(body.total),
+      filename: typeof body.filename === "string" ? body.filename : "",
+      mimeType:
+        typeof body.mimeType === "string"
+          ? body.mimeType
+          : "application/octet-stream",
+      sizeBytes: Number(body.sizeBytes),
+      userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      credentialId: req.frontmindCredential.id,
+      credentialOwnerUserId: req.frontmindCredential.userId,
+      credentialVersion: req.frontmindCredential.version,
+    });
+    const ticket = createManagedUploadIntentTicket(manifest);
+    return res.status(201).json({
+      state: "awaiting_browser",
+      intentId: manifest.intentId,
+      intentTicket: ticket.ticket,
+      expiresAt: ticket.expiresAt,
+      sizeBytes: manifest.declaredSizeBytes,
+      traceId,
+    });
+  } catch (error) {
+    return managedIntentErrorResponse(res, error, traceId);
+  }
+});
+
+// The intent protocol owns only requests carrying upload_intent_id. Legacy
+// capture_file_id and target= transports continue into the existing handler.
+router.put("/proxy-upload", async (req: Request, res: Response, next) => {
+  const intentId =
+    typeof req.query.upload_intent_id === "string"
+      ? req.query.upload_intent_id
+      : "";
+  if (!intentId) return next();
+  preventManagedIntentCapabilityCaching(res);
+  const traceId = randomUUID();
+  if (!req.frontmindUser) {
+    return res.status(401).json({
+      error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
+    });
+  }
+  const rawLength = req.headers["content-length"];
+  if (typeof rawLength !== "string" || !/^\d+$/u.test(rawLength)) {
+    return res.status(411).json({
+      error: {
+        message: "文件上传必须提供 Content-Length",
+        code: "UPLOAD_CONTENT_LENGTH_REQUIRED",
+        retryable: false,
+        recoveryAction: "refresh_page",
+        traceId,
+      },
+    });
+  }
+  const contentLength = Number(rawLength);
+  if (
+    !Number.isSafeInteger(contentLength) ||
+    contentLength < 1 ||
+    contentLength > MANAGED_UPLOAD_INTENT_MAX_BYTES
+  ) {
+    return res
+      .status(contentLength > MANAGED_UPLOAD_INTENT_MAX_BYTES ? 413 : 400)
+      .json({
+        error: {
+          message:
+            contentLength > MANAGED_UPLOAD_INTENT_MAX_BYTES
+              ? "文件超过 100 MiB 限制"
+              : "文件大小无效",
+          code:
+            contentLength > MANAGED_UPLOAD_INTENT_MAX_BYTES
+              ? "UPLOAD_TOO_LARGE"
+              : "UPLOAD_CONTENT_LENGTH_MISMATCH",
+          retryable: false,
+          recoveryAction: "refresh_page",
+          traceId,
+        },
+      });
+  }
+  const ticket = req.headers["x-frontmind-upload-intent-ticket"];
+  if (typeof ticket !== "string" || !ticket) {
+    return res.status(403).json({
+      error: {
+        message: "缺少本地上传凭证",
+        code: "UPLOAD_INTENT_INVALID",
+        retryable: false,
+        recoveryAction: "refresh_page",
+        traceId,
+      },
+    });
+  }
+  try {
+    await receiveManagedUploadIntentBody({
+      intentId,
+      ticket,
+      userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      contentLength,
+      request: req,
+    });
+    // From this point onward the browser connection is not the durability
+    // boundary. Provider processing may continue from the sealed local copy.
+    const status = await processManagedUploadIntent({
+      intentId,
+      userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      traceId,
+    });
+    return res.status(status.state === "uploaded" ? 200 : 202).json(status);
+  } catch (error) {
+    return managedIntentErrorResponse(res, error, traceId);
+  }
+});
+
+router.post(
+  "/v1/managed-uploads/recovery",
+  async (req: Request, res: Response) => {
+    preventManagedIntentCapabilityCaching(res);
+    const traceId = randomUUID();
+    const intentId =
+      typeof req.headers["x-frontmind-upload-intent-id"] === "string"
+        ? req.headers["x-frontmind-upload-intent-id"]
+        : "";
+    if (!req.frontmindUser) {
+      return res.status(401).json({
+        error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
+      });
+    }
+    const ticket = req.headers["x-frontmind-upload-intent-ticket"];
+    if (typeof ticket !== "string" || !ticket) {
+      return res.status(403).json({
+        error: {
+          message: "缺少本地上传凭证",
+          code: "UPLOAD_INTENT_INVALID",
+          retryable: false,
+          recoveryAction: "refresh_page",
+          traceId,
+        },
+      });
+    }
+    try {
+      const status = await recoverManagedUploadIntent({
+        intentId,
+        ticket,
+        userId: req.frontmindUser.id,
+        projectAssignmentId:
+          req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+        traceId,
+      });
+      return res.status(status.state === "uploaded" ? 200 : 202).json(status);
+    } catch (error) {
+      return managedIntentErrorResponse(res, error, traceId);
+    }
+  },
+);
+
+router.delete("/v1/managed-uploads", async (req: Request, res: Response) => {
+  preventManagedIntentCapabilityCaching(res);
+  const traceId = randomUUID();
+  const intentId =
+    typeof req.headers["x-frontmind-upload-intent-id"] === "string"
+      ? req.headers["x-frontmind-upload-intent-id"]
+      : "";
+  if (!req.frontmindUser) {
+    return res.status(401).json({
+      error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
+    });
+  }
+  const ticket = req.headers["x-frontmind-upload-intent-ticket"];
+  if (typeof ticket !== "string" || !ticket) {
+    return res.status(403).json({
+      error: {
+        message: "缺少本地上传凭证",
+        code: "UPLOAD_INTENT_INVALID",
+        retryable: false,
+        recoveryAction: "refresh_page",
+        traceId,
+      },
+    });
+  }
+  try {
+    await deleteManagedUploadIntent({
+      intentId,
+      ticket,
+      userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+    });
+    return res.status(204).send("");
+  } catch (error) {
+    return managedIntentErrorResponse(res, error, traceId);
+  }
+});
+
 router.delete(
   "/v1/files/:fileId/discard",
   async (req: Request, res: Response) => {
@@ -3022,6 +3357,10 @@ router.delete(
       typeof req.params.fileId === "string" ? req.params.fileId : "";
     const traceId = randomUUID();
     const fileKey = fileId ? capturedFileKey(fileId) : undefined;
+    const discardLogSecrets: unknown[] = [
+      fileId,
+      req.frontmindCredential?.apiKey,
+    ];
     if (!req.frontmindUser || !req.frontmindCredential) {
       return res.status(401).json({
         error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
@@ -3056,6 +3395,7 @@ router.delete(
         projectAssignmentId:
           req.frontmindDeliveryProjectContext?.projectAssignmentId,
         discard: async (context) => {
+          discardLogSecrets.push(context.apiKey);
           const providerResponse = await axios.delete(
             `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
             {
@@ -3114,7 +3454,7 @@ router.delete(
         traceId,
         fileKey,
         stage: "discard",
-        error: safeErrorForLog(error),
+        error: managedUploadRuntimeErrorMetadata(error, discardLogSecrets),
       });
       return res.status(503).json({
         error: {
@@ -3205,17 +3545,21 @@ router.post(
     }
     if (activeCapturedUploadIds.has(fileId)) {
       res.off("close", abortOnClose);
-      return res.status(409).json({
-        error: {
-          message: "该文件仍在上传处理中，请稍后重试",
-          code: "UPLOAD_IN_PROGRESS",
-          retryable: true,
-          recoveryAction: "retry_same_file",
-          fileId,
-          traceId,
-          recreateRequired: false,
-        },
-      });
+      return res
+        .status(409)
+        .set("Retry-After", "3")
+        .json({
+          error: {
+            message: "该文件仍在上传处理中，请稍后重试",
+            code: "UPLOAD_IN_PROGRESS",
+            retryable: true,
+            recoveryAction: "check_status",
+            fileId,
+            traceId,
+            recreateRequired: false,
+            retryAfterMs: 3_000,
+          },
+        });
     }
 
     activeCapturedUploadIds.add(fileId);
@@ -3238,8 +3582,9 @@ router.post(
       }
       const existingStored = await readStoredPresalesFile(fileId);
       // The local manifest intentionally uses the capture/display filename,
-      // while recovery.filename is the provider's exact filename. They may
-      // differ for knowledge-base normalization and are not interchangeable.
+      // while recovery.filename is the create-time provider filename. The
+      // provider may later canonicalize its filename, so neither value is an
+      // immutable identity key and they are not interchangeable.
       if (
         existingStored &&
         (existingStored.sizeBytes !== sizeBytes ||
@@ -3255,6 +3600,59 @@ router.post(
           "local_identity",
           "discard_and_recreate",
         );
+      }
+      const rawTicket = req.headers["x-frontmind-upload-ticket"];
+      let authoritativeProviderFilename = providerFilename;
+      if (rawTicket !== undefined) {
+        if (typeof rawTicket !== "string" || !rawTicket) {
+          throw capturedTicketError(
+            new ManagedUploadTicketError(
+              "UPLOAD_CAPABILITY_INVALID",
+              "Invalid managed upload capability",
+            ),
+          );
+        }
+        try {
+          const claims = openManagedUploadTicket(
+            rawTicket,
+            {
+              fileId,
+              ownerUserId: req.frontmindUser.id,
+              credentialId: credential.id,
+              projectAssignmentId:
+                credential.resource.projectAssignmentId ?? null,
+            },
+            { allowExpired: true },
+          );
+          authoritativeProviderFilename = claims.providerFilename;
+        } catch (error) {
+          throw capturedTicketError(error);
+        }
+      }
+
+      const { baseUrl } = getFrontMindCredentials(req);
+      let metadata:
+        | Awaited<ReturnType<typeof readCapturedProviderMetadata>>
+        | undefined;
+      try {
+        metadata = await readCapturedProviderMetadata({
+          baseUrl,
+          apiKey: credential.apiKey,
+          fileId,
+          providerFilename: authoritativeProviderFilename,
+          mimeType,
+          sizeBytes,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (
+          !existingStored?.uploadedAt ||
+          !existingStored.contentExpiresAt ||
+          !(error instanceof CapturedUploadError) ||
+          error.code !== "UPSTREAM_UPLOAD_UNAVAILABLE"
+        ) {
+          throw error;
+        }
       }
       if (existingStored?.uploadedAt && existingStored.contentExpiresAt) {
         let retentionLifecycle;
@@ -3287,61 +3685,39 @@ router.post(
             "check_status",
           );
         }
-        return res.status(200).json({
-          fileId,
-          state: "uploaded",
-          recreateRequired: false,
-          receipt: {
+        if (!metadata || metadata.providerFile.status === "pending") {
+          return res.status(202).json({
+            state: "processing",
             fileId,
             sizeBytes: existingStored.sizeBytes,
             uploadedAt: retentionLifecycle.uploadedAt.getTime(),
             expiresAt: retentionLifecycle.contentExpiresAt.getTime(),
-            replayed: false,
-            recovered: true,
-          },
+            retryAfterMs: UPSTREAM_FILE_READINESS_RETRY_AFTER_MS,
+            traceId,
+          });
+        }
+        return res.status(200).json({
+          state: "uploaded",
+          fileId,
+          sizeBytes: existingStored.sizeBytes,
+          uploadedAt: retentionLifecycle.uploadedAt.getTime(),
+          providerReadyAt: metadata.checkedAt,
+          expiresAt: retentionLifecycle.contentExpiresAt.getTime(),
+          replayed: false,
+          recovered: true,
           traceId,
         });
       }
-
-      const rawTicket = req.headers["x-frontmind-upload-ticket"];
-      let authoritativeProviderFilename = providerFilename;
-      if (rawTicket !== undefined) {
-        if (typeof rawTicket !== "string" || !rawTicket) {
-          throw capturedTicketError(
-            new ManagedUploadTicketError(
-              "UPLOAD_CAPABILITY_INVALID",
-              "Invalid managed upload capability",
-            ),
-          );
-        }
-        try {
-          const claims = openManagedUploadTicket(
-            rawTicket,
-            {
-              fileId,
-              ownerUserId: req.frontmindUser.id,
-              credentialId: credential.id,
-              projectAssignmentId:
-                credential.resource.projectAssignmentId ?? null,
-            },
-            { allowExpired: true },
-          );
-          authoritativeProviderFilename = claims.providerFilename;
-        } catch (error) {
-          throw capturedTicketError(error);
-        }
+      if (!metadata) {
+        throw new CapturedUploadError(
+          503,
+          "UPSTREAM_UPLOAD_UNAVAILABLE",
+          "暂时无法确认文件上传状态，请稍后再检查",
+          true,
+          "recovery_status",
+          "check_status",
+        );
       }
-
-      const { baseUrl } = getFrontMindCredentials(req);
-      const metadata = await readCapturedProviderMetadata({
-        baseUrl,
-        apiKey: credential.apiKey,
-        fileId,
-        providerFilename: authoritativeProviderFilename,
-        mimeType,
-        sizeBytes,
-        signal: controller.signal,
-      });
       if (metadata.providerFile.status === "uploaded") {
         throw new CapturedUploadError(
           409,
@@ -3417,6 +3793,7 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
   let stagedCapture: StagedPresalesFile | null = null;
   let captureFileId = "";
   let activeCaptureRegistered = false;
+  const managedUploadLogSecrets: unknown[] = [];
   const traceId = randomUUID();
   const batchKey = capturedBatchKey(req.headers["x-frontmind-upload-batch-id"]);
   const batchSequence = capturedBatchSequence(
@@ -3469,6 +3846,13 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
         ? req.query.capture_file_id
         : "";
     const rawTarget = String(req.query.target || "").trim();
+    if (captureFileId) {
+      managedUploadLogSecrets.push(
+        captureFileId,
+        rawTarget,
+        req.frontmindCredential?.apiKey,
+      );
+    }
     if (!captureFileId && !rawTarget) {
       return res.status(400).json({ error: { message: "Missing target URL" } });
     }
@@ -3497,15 +3881,23 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
           },
         });
       }
+      managedUploadLogSecrets.push(credential.apiKey);
       if (activeCapturedUploadIds.has(captureFileId)) {
-        return res.status(409).json({
-          error: {
-            message: "该文件仍在上传处理中，请稍后重试",
-            code: "UPLOAD_IN_PROGRESS",
-            retryable: true,
-            traceId,
-          },
-        });
+        return res
+          .status(409)
+          .set("Retry-After", "3")
+          .json({
+            error: {
+              message: "该文件仍在上传处理中，请稍后重试",
+              code: "UPLOAD_IN_PROGRESS",
+              retryable: true,
+              recoveryAction: "check_status",
+              fileId: captureFileId,
+              traceId,
+              recreateRequired: false,
+              retryAfterMs: 3_000,
+            },
+          });
       }
       activeCapturedUploadIds.add(captureFileId);
       activeCaptureRegistered = true;
@@ -3564,6 +3956,7 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
           },
         });
       }
+      managedUploadLogSecrets.push(captureFilename, providerFilename);
       const contentLengthHeader = req.headers["content-length"];
       if (
         typeof contentLengthHeader !== "string" ||
@@ -3620,6 +4013,7 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
           "discard_and_recreate",
         );
       }
+      managedUploadLogSecrets.push(rawTicket);
       let ticketClaims: ManagedUploadTicketClaims;
       try {
         ticketClaims = openManagedUploadTicket(rawTicket, {
@@ -3632,6 +4026,11 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
         throw capturedTicketError(error);
       }
       providerFilename = ticketClaims.providerFilename;
+      managedUploadLogSecrets.push(
+        providerFilename,
+        ticketClaims.target,
+        ticketClaims.credentialId,
+      );
       const { baseUrl } = getFrontMindCredentials(req);
       const existingStored = await readStoredPresalesFile(captureFileId);
       if (
@@ -3700,9 +4099,11 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
             );
           }
           return res.status(200).json({
+            state: "uploaded",
             fileId: captureFileId,
             sizeBytes: existingStored.sizeBytes,
             uploadedAt: retentionLifecycle.uploadedAt.getTime(),
+            providerReadyAt: Date.now(),
             expiresAt: retentionLifecycle.contentExpiresAt.getTime(),
             replayed: false,
             recovered: true,
@@ -3874,7 +4275,10 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
             sequence: batchSequence,
             fileKey: capturedFileKey(captureFileId),
             stage: "retention_registration",
-            error: safeErrorForLog(error),
+            error: managedUploadRuntimeErrorMetadata(
+              error,
+              managedUploadLogSecrets,
+            ),
           },
         );
         return res.status(503).json({
@@ -3898,7 +4302,10 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
             sequence: batchSequence,
             fileKey: capturedFileKey(captureFileId),
             stage: "local_commit",
-            error: safeErrorForLog(localCommitError),
+            error: managedUploadRuntimeErrorMetadata(
+              localCommitError,
+              managedUploadLogSecrets,
+            ),
           },
         );
         throw new CapturedUploadError(
@@ -3919,10 +4326,47 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
       if (managedUploadSignal.aborted) {
         throw managedUploadAbortError(managedUploadSignal);
       }
+      let providerReadiness:
+        | Awaited<ReturnType<typeof readCapturedProviderMetadata>>
+        | undefined;
+      try {
+        providerReadiness = await readCapturedProviderMetadata({
+          baseUrl,
+          apiKey: credential.apiKey,
+          fileId: captureFileId,
+          providerFilename,
+          mimeType: realContentType,
+          sizeBytes: capturedSizeBytes,
+          signal: managedUploadSignal,
+        });
+      } catch (error) {
+        if (
+          !(error instanceof CapturedUploadError) ||
+          error.code !== "UPSTREAM_UPLOAD_UNAVAILABLE"
+        ) {
+          throw error;
+        }
+      }
+      if (
+        !providerReadiness ||
+        providerReadiness.providerFile.status === "pending"
+      ) {
+        return res.status(202).json({
+          state: "processing",
+          fileId: captureFileId,
+          sizeBytes: capturedSizeBytes,
+          uploadedAt: retentionLifecycle.uploadedAt.getTime(),
+          expiresAt: retentionLifecycle.contentExpiresAt.getTime(),
+          retryAfterMs: UPSTREAM_FILE_READINESS_RETRY_AFTER_MS,
+          traceId,
+        });
+      }
       return res.status(200).json({
+        state: "uploaded",
         fileId: captureFileId,
         sizeBytes: capturedSizeBytes,
         uploadedAt: retentionLifecycle.uploadedAt.getTime(),
+        providerReadyAt: providerReadiness.checkedAt,
         expiresAt: retentionLifecycle.contentExpiresAt.getTime(),
         replayed: uploadResult.replayed,
         recovered: uploadResult.recovered,
@@ -4103,7 +4547,9 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
           sequence: batchSequence,
           fileKey: captureFileId ? capturedFileKey(captureFileId) : undefined,
           stage: "ingress_storage",
-          error: safeErrorForLog(error),
+          error: captureFileId
+            ? managedUploadRuntimeErrorMetadata(error, managedUploadLogSecrets)
+            : safeErrorForLog(error),
         },
       );
       return res.status(507).json({
@@ -4124,7 +4570,9 @@ router.put("/proxy-upload", async (req: Request, res: Response) => {
     }
     console.error(
       "[FrontMind Proxy] Proxy-upload error:",
-      safeErrorForLog(error),
+      captureFileId
+        ? managedUploadRuntimeErrorMetadata(error, managedUploadLogSecrets)
+        : safeErrorForLog(error),
     );
     res.status(500).json({
       error: {

@@ -90,6 +90,10 @@ import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
 import knowledgeBaseArtifactApi from "../knowledge-base-artifact-api";
 import { auditKnowledgeBaseStateInvariants } from "../knowledge-base-invariant-audit";
 import { runtimeErrorForLog } from "./runtime-error-log";
+import {
+  ensureManagedUploadIntentWorker,
+  getManagedUploadIntentWorkerReadiness,
+} from "../managed-upload-intent";
 import { knowledgeBaseNewBuildPolicyBinding } from "../knowledge-base-tree-policy-rollout";
 import {
   evaluateKnowledgeBaseReadiness,
@@ -294,6 +298,7 @@ async function startServer() {
         migrationManifest,
       );
       const fileRetention = fileRetentionPreflightEvidence.read();
+      const managedUploads = getManagedUploadIntentWorkerReadiness();
       const [
         preparedFiles,
         skills,
@@ -318,6 +323,8 @@ async function startServer() {
       ]);
       const ready =
         fileRetention?.ready === true &&
+        managedUploads.started === true &&
+        managedUploads.storageReady === true &&
         knowledgeBaseReadinessHttpStatus(knowledgeBase) === 200 &&
         migrationState.journal.status === "exact" &&
         migrationState.schema.status === "exact";
@@ -361,6 +368,7 @@ async function startServer() {
           activeWorkers: preparedFiles.activeWorkers,
         },
         fileRetention,
+        managedUploads,
         internalLedgers: {
           paymentReceipts,
           projectOrders,
@@ -378,6 +386,8 @@ async function startServer() {
           migrationStatus: migrationState.journal.status,
           schemaStatus: migrationState.schema.status,
           fileRetentionReady: fileRetention?.ready ?? false,
+          managedUploadsStarted: managedUploads.started,
+          managedUploadsStorageReady: managedUploads.storageReady,
         });
         res.status(status).json({
           ...response,
@@ -514,6 +524,10 @@ async function startServer() {
 
   await startApiUsageSnapshotScheduler();
   startDashboardImportPreflightCleanupScheduler();
+  // Start only after configuration, durable storage and database startup
+  // checks have completed. Importing a route module must never trigger
+  // provider side effects or hide a preflight failure.
+  await ensureManagedUploadIntentWorker();
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
     if (process.env.NODE_ENV === "production") {

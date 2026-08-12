@@ -81,6 +81,24 @@ export async function resolveUpstreamCredential(
     // user, so requiring a currently active key here would break downloads for
     // historical conversations after key rotation.
     const requestPath = pathWithoutQuery(req);
+    // Existing managed-upload intents freeze the exact credential version in
+    // their durable manifest. Requiring a *currently active* credential here
+    // would strand a sealed local copy after A -> B rotation followed by
+    // deletion of B. These three operations authenticate the actor/project and
+    // the mi1 ticket at the intent service, which then resolves frozen A. Only
+    // creation of a new intent continues to require the active credential.
+    const isExistingManagedUploadIntentOperation =
+      (req.method === "PUT" &&
+        requestPath === "/proxy-upload" &&
+        typeof req.query.upload_intent_id === "string" &&
+        req.query.upload_intent_id.length > 0) ||
+      (req.method === "POST" &&
+        requestPath === "/v1/managed-uploads/recovery") ||
+      (req.method === "DELETE" && requestPath === "/v1/managed-uploads");
+    if (isExistingManagedUploadIntentOperation) {
+      next();
+      return;
+    }
     if (
       requestPath === "/proxy-download" ||
       /^\/download\/[^/]+$/.test(requestPath)

@@ -129,6 +129,8 @@ export interface KnowledgeBaseClientNotice {
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
   canRegenerate?: boolean;
+  traceId?: string;
+  attachmentCount?: number;
   turnId?: string | null;
 }
 
@@ -998,11 +1000,24 @@ export function applyKnowledgeBaseObservation(
 
   const rawNotice = observation.notice;
   const noticeKey = rawNotice?.key;
+  const noticeCode =
+    typeof rawNotice?.code === "string" &&
+    /^[A-Z0-9_:-]{1,128}$/u.test(rawNotice.code)
+      ? rawNotice.code
+      : undefined;
+  const noticeTraceId =
+    typeof rawNotice?.traceId === "string" &&
+    /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
+      rawNotice.traceId,
+    )
+      ? rawNotice.traceId
+      : undefined;
+  const noticeAttachmentCount = Number(rawNotice?.attachmentCount);
   const notice =
     rawNotice?.message && noticeKey
       ? {
           errorKey: noticeKey,
-          code: rawNotice.code,
+          ...(noticeCode ? { code: noticeCode } : {}),
           message: sanitizeBrandText(rawNotice.message),
           severity: rawNotice.severity ?? ("error" as const),
           retryable: rawNotice.retryable === true,
@@ -1011,6 +1026,12 @@ export function applyKnowledgeBaseObservation(
           // Missing means an old server, never implicit permission to create
           // another paid model task.
           canRegenerate: rawNotice.canRegenerate === true,
+          ...(noticeTraceId ? { traceId: noticeTraceId } : {}),
+          ...(Number.isSafeInteger(noticeAttachmentCount) &&
+          noticeAttachmentCount >= 0 &&
+          noticeAttachmentCount <= 1_000
+            ? { attachmentCount: noticeAttachmentCount }
+            : {}),
           turnId: rawNotice.turnId,
         }
       : null;

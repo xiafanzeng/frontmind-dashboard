@@ -11,7 +11,7 @@ import {
   or,
 } from "drizzle-orm";
 import { Router } from "express";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   getFrontMindCredentials,
   getUpstreamBaseUrl,
@@ -63,7 +63,11 @@ import {
   knowledgeBaseBuilds,
 } from "../drizzle/schema";
 import { getDb } from "./db";
-import { uploadUpstreamTaskAttachment } from "./upstream-task-attachment";
+import {
+  uploadUpstreamTaskAttachment,
+  UpstreamTaskAttachmentContentProofError,
+  UpstreamTaskAttachmentPendingError,
+} from "./upstream-task-attachment";
 import { recordKnowledgeBaseOutputFiles } from "./knowledge-base-output-resource-service";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
@@ -95,6 +99,7 @@ import {
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseTurnForRecovery,
   completeKnowledgeBaseGeneratedAttachment,
+  deferKnowledgeBaseTurnBeforeCreate,
   findRecoverableKnowledgeBaseTurnIds,
   failKnowledgeBaseTurnDeterministically,
   findReusableKnowledgeBaseSkillFileId,
@@ -119,6 +124,7 @@ import {
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
   KnowledgeBaseTurnReservationError,
+  type KnowledgeBaseCreateAttemptState,
   type KnowledgeBasePreparedDispatch,
   type KnowledgeBaseRecoveryClaim,
   type KnowledgeBaseDeferredDispatchClaim,
@@ -189,12 +195,20 @@ import {
   classifyKnowledgeBaseUpstreamCreateFailure,
   knowledgeBaseArtifactFailureNotice,
   KNOWLEDGE_BASE_AGENT_PROFILE,
+  KnowledgeBaseAttachmentsProcessingError,
   KnowledgeBaseLocalPreparationError,
   KnowledgeBaseOpenRecoveryLeaseError,
   KnowledgeBaseUpstreamCreateError,
   KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
   type KnowledgeBaseUpstreamCreateFailureClass,
+  type KnowledgeBaseProviderReasonCategory,
 } from "./knowledge-base-api-errors";
+import {
+  checkUpstreamFilesReadiness,
+  waitForUpstreamFilesReady,
+  UpstreamFileReadinessError,
+  type UpstreamFilesReadiness,
+} from "./upstream-file-readiness";
 import {
   assertExpectedUpstreamTaskId,
   canonicalUpstreamTask,
@@ -278,6 +292,8 @@ export function knowledgeBaseReservationReceipt(
     failureClass: reservation.turn.failureClass,
     recoveryAction: reservation.turn.recoveryAction,
     canRegenerate: reservation.turn.canRegenerate,
+    createAttemptState: reservation.turn.createAttemptState,
+    traceId: reservation.turn.traceId,
     stagedAttachmentCount: reservation.turn.stagedUserAttachmentCount,
     expectedAttachmentCount: reservation.turn.expectedUserAttachmentCount,
     requiresUpload: reservation.state === "awaiting_attachments",
@@ -305,6 +321,8 @@ export function knowledgeBaseAcceptedReservationReceipt(input: {
     failureClass: input.turn.failureClass,
     recoveryAction: input.turn.recoveryAction,
     canRegenerate: input.turn.canRegenerate,
+    createAttemptState: input.turn.createAttemptState,
+    traceId: input.turn.traceId,
     stagedAttachmentCount: input.turn.stagedUserAttachmentCount,
     expectedAttachmentCount: input.turn.expectedUserAttachmentCount,
     requiresUpload: false,
@@ -1846,6 +1864,247 @@ type RecoveryCredential = NonNullable<
   Awaited<ReturnType<typeof getDecryptedCredentialForKnowledgeBaseReservation>>
 >;
 
+const KNOWLEDGE_BASE_READINESS_WAIT_MS = 5_000;
+const knowledgeBaseClaimReadinessTimings = new WeakMap<
+  KnowledgeBaseRecoveryClaim,
+  { startedAt: number; maxDelayMs: number }
+>();
+
+function beginKnowledgeBaseClaimReadinessTiming(
+  claim: KnowledgeBaseRecoveryClaim,
+) {
+  const existing = knowledgeBaseClaimReadinessTimings.get(claim);
+  if (existing) return existing;
+  const timing = { startedAt: Date.now(), maxDelayMs: 0 };
+  knowledgeBaseClaimReadinessTimings.set(claim, timing);
+  return timing;
+}
+
+function knowledgeBaseClaimReadinessDelayMs(claim: KnowledgeBaseRecoveryClaim) {
+  const timing = beginKnowledgeBaseClaimReadinessTiming(claim);
+  timing.maxDelayMs = Math.max(
+    timing.maxDelayMs,
+    Math.max(0, Date.now() - timing.startedAt),
+  );
+  return timing.maxDelayMs;
+}
+
+export function knowledgeBaseClaimTraceId(claim: KnowledgeBaseRecoveryClaim) {
+  const value = String(
+    claim.turn.traceId || claim.recoveryMetadata?.traceId || "",
+  ).trim();
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
+    value,
+  )
+    ? value
+    : undefined;
+}
+
+function knowledgeBaseUserAttachmentIds(claim: KnowledgeBaseRecoveryClaim) {
+  const attachments = Array.isArray(claim.recoveryMetadata.attachments)
+    ? (claim.recoveryMetadata.attachments as unknown[])
+    : [];
+  return new Set(
+    attachments.flatMap((value) => {
+      const record = knowledgeBaseUpstreamRecord(value);
+      const fileId = String(record?.file_id || "").trim();
+      return fileId ? [fileId] : [];
+    }),
+  );
+}
+
+function knowledgeBaseReadinessFailure(
+  error: unknown,
+  input: {
+    attachmentKind: "generated" | "user";
+    traceId?: string;
+    attachmentCount: number;
+  },
+) {
+  if (error instanceof UpstreamFileReadinessError && error.retryable) {
+    return new KnowledgeBaseAttachmentsProcessingError(
+      0,
+      input.attachmentCount,
+      5_000,
+      input.traceId,
+      { cause: error },
+    );
+  }
+  if (error instanceof UpstreamFileReadinessError) {
+    return new KnowledgeBaseLocalPreparationError(
+      input.attachmentKind === "user"
+        ? "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID"
+        : "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
+      input.attachmentKind === "user"
+        ? "用户附件尚未通过上游可用性校验"
+        : "系统生成附件尚未通过上游可用性校验",
+      { cause: error },
+    );
+  }
+  return error;
+}
+
+function assertKnowledgeBaseReadinessComplete(
+  result: UpstreamFilesReadiness,
+  traceId?: string,
+) {
+  if (result.pending.length > 0) {
+    throw new KnowledgeBaseAttachmentsProcessingError(
+      result.ready.length,
+      result.pending.length,
+      5_000,
+      traceId,
+    );
+  }
+  return result.files.map((file) => ({
+    file_id: file.fileId,
+    filename: file.filename,
+  }));
+}
+
+async function waitForKnowledgeBaseAttachmentGroup(input: {
+  baseUrl: string;
+  apiKey: string;
+  attachments: Array<{ file_id: string; filename: string }>;
+  attachmentKind: "generated" | "user";
+  filenamePolicy?: "exact" | "provider_authoritative";
+  traceId?: string;
+  deadlineMs?: number;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}) {
+  if (input.attachments.length === 0) return [];
+  try {
+    const result = await waitForUpstreamFilesReady({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      files: input.attachments.map((attachment) => ({
+        fileId: attachment.file_id,
+        filename: attachment.filename,
+      })),
+      filenamePolicy: input.filenamePolicy,
+      deadlineMs: input.deadlineMs ?? KNOWLEDGE_BASE_READINESS_WAIT_MS,
+      sleep: input.sleep,
+    });
+    return assertKnowledgeBaseReadinessComplete(result, input.traceId);
+  } catch (error) {
+    throw knowledgeBaseReadinessFailure(error, {
+      attachmentKind: input.attachmentKind,
+      traceId: input.traceId,
+      attachmentCount: input.attachments.length,
+    });
+  }
+}
+
+async function checkKnowledgeBaseAttachmentGroup(input: {
+  baseUrl: string;
+  apiKey: string;
+  attachments: Array<{ file_id: string; filename: string }>;
+  attachmentKind: "generated" | "user";
+  traceId?: string;
+}) {
+  if (input.attachments.length === 0) return [];
+  try {
+    const result = await checkUpstreamFilesReadiness({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      files: input.attachments.map((attachment) => ({
+        fileId: attachment.file_id,
+        filename: attachment.filename,
+      })),
+      filenamePolicy: "exact",
+    });
+    return assertKnowledgeBaseReadinessComplete(result, input.traceId);
+  } catch (error) {
+    throw knowledgeBaseReadinessFailure(error, {
+      attachmentKind: input.attachmentKind,
+      traceId: input.traceId,
+      attachmentCount: input.attachments.length,
+    });
+  }
+}
+
+export async function waitForKnowledgeBaseDispatchAttachments(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  credential: RecoveryCredential;
+  baseUrl: string;
+  attachments: Array<{ file_id: string; filename: string }>;
+  readinessDeadlineMs?: number;
+  readinessSleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}) {
+  beginKnowledgeBaseClaimReadinessTiming(input.claim);
+  const userIds = knowledgeBaseUserAttachmentIds(input.claim);
+  const generated = input.attachments.filter(
+    (attachment) => !userIds.has(attachment.file_id),
+  );
+  const user = input.attachments.filter((attachment) =>
+    userIds.has(attachment.file_id),
+  );
+  const traceId = knowledgeBaseClaimTraceId(input.claim);
+  const [readyGenerated, readyUser] = await Promise.all([
+    waitForKnowledgeBaseAttachmentGroup({
+      baseUrl: input.baseUrl,
+      apiKey: input.credential.apiKey,
+      attachments: generated,
+      attachmentKind: "generated",
+      filenamePolicy: "exact",
+      traceId,
+      deadlineMs: input.readinessDeadlineMs,
+      sleep: input.readinessSleep,
+    }),
+    waitForKnowledgeBaseAttachmentGroup({
+      baseUrl: input.baseUrl,
+      apiKey: input.credential.apiKey,
+      attachments: user,
+      attachmentKind: "user",
+      filenamePolicy: "provider_authoritative",
+      traceId,
+      deadlineMs: input.readinessDeadlineMs,
+      sleep: input.readinessSleep,
+    }),
+  ]);
+  knowledgeBaseClaimReadinessDelayMs(input.claim);
+  const canonicalById = new Map(
+    [...readyGenerated, ...readyUser].map((attachment) => [
+      attachment.file_id,
+      attachment,
+    ]),
+  );
+  return input.attachments.map(
+    (attachment) => canonicalById.get(attachment.file_id) || attachment,
+  );
+}
+
+export async function checkKnowledgeBasePreparedAttachments(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  credential: RecoveryCredential;
+  dispatch: KnowledgeBasePreparedDispatch;
+}) {
+  beginKnowledgeBaseClaimReadinessTiming(input.claim);
+  const userIds = knowledgeBaseUserAttachmentIds(input.claim);
+  const generated = input.dispatch.requestBody.attachments.filter(
+    (attachment) => !userIds.has(attachment.file_id),
+  );
+  const user = input.dispatch.requestBody.attachments.filter((attachment) =>
+    userIds.has(attachment.file_id),
+  );
+  const traceId = knowledgeBaseClaimTraceId(input.claim);
+  await checkKnowledgeBaseAttachmentGroup({
+    baseUrl: input.dispatch.baseUrl,
+    apiKey: input.credential.apiKey,
+    attachments: generated,
+    attachmentKind: "generated",
+    traceId,
+  });
+  await checkKnowledgeBaseAttachmentGroup({
+    baseUrl: input.dispatch.baseUrl,
+    apiKey: input.credential.apiKey,
+    attachments: user,
+    attachmentKind: "user",
+    traceId,
+  });
+  knowledgeBaseClaimReadinessDelayMs(input.claim);
+}
+
 async function uploadRecoverySkill(input: {
   claim: KnowledgeBaseRecoveryClaim;
   credential: RecoveryCredential;
@@ -2260,11 +2519,19 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       : deferredClientAttachments
         ? [...userAttachments, ...generatedAttachments]
         : [...generatedAttachments, ...userAttachments];
+    const readyAttachments = await waitForKnowledgeBaseDispatchAttachments({
+      claim,
+      credential,
+      baseUrl,
+      attachments,
+    });
     await freezeKnowledgeBaseTurnAttachments({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
       leaseToken: claim.leaseToken,
-      attachmentFileIds: attachments.map((attachment) => attachment.file_id),
+      attachmentFileIds: readyAttachments.map(
+        (attachment) => attachment.file_id,
+      ),
     });
     const prepared = await prepareKnowledgeBaseTurnDispatch({
       userId: claim.turn.userId,
@@ -2273,7 +2540,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       baseUrl,
       prompt,
       agentProfile,
-      attachments,
+      attachments: readyAttachments,
       parentTaskId,
     });
     // Short accepted-path retries must reuse the exact prepared POST instead
@@ -2431,11 +2698,17 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     filename: KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
   });
   const attachments = [...generatedAttachments, ...userAttachments];
+  const readyAttachments = await waitForKnowledgeBaseDispatchAttachments({
+    claim,
+    credential,
+    baseUrl,
+    attachments,
+  });
   await freezeKnowledgeBaseTurnAttachments({
     userId: claim.turn.userId,
     turnId: claim.turn.id,
     leaseToken: claim.leaseToken,
-    attachmentFileIds: attachments.map((attachment) => attachment.file_id),
+    attachmentFileIds: readyAttachments.map((attachment) => attachment.file_id),
   });
   const prepared = await prepareKnowledgeBaseTurnDispatch({
     userId: claim.turn.userId,
@@ -2444,7 +2717,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     baseUrl,
     prompt: instructionDelivery.prompt,
     agentProfile,
-    attachments,
+    attachments: readyAttachments,
   });
   claim.preparedDispatch = prepared;
   return prepared;
@@ -2531,6 +2804,17 @@ export async function recoverKnowledgeBaseTurnClaimTask(input: {
   let taskData: Record<string, unknown> | undefined;
   let rebound = false;
   if (!taskId) {
+    const createAttemptState = input.claim.turn.createAttemptState;
+    if (createAttemptState && createAttemptState !== "not_sent") {
+      throw new KnowledgeBaseUpstreamCreateError(
+        "unknown",
+        "UPSTREAM_CREATE_ATTEMPT_ALREADY_CONSUMED",
+        undefined,
+        "TRANSPORT_UNKNOWN",
+        undefined,
+        knowledgeBaseClaimTraceId(input.claim),
+      );
+    }
     const dispatch = await input.ensureDispatch();
     const created = await input.createTask(
       dispatch,
@@ -2589,25 +2873,46 @@ async function dispatchKnowledgeBaseRecoveryClaim(
   claim: KnowledgeBaseRecoveryClaim,
   credential: RecoveryCredential,
 ) {
+  beginKnowledgeBaseClaimReadinessTiming(claim);
   return recoverKnowledgeBaseTurnClaimTask({
     claim,
     ensureDispatch: () =>
       ensureKnowledgeBaseRecoveryDispatch({ claim, credential }),
     createTask: async (prepared, idempotencyKey) => {
+      // Final, zero-wait barrier: the exact frozen names and ids must still be
+      // task-usable immediately before consuming the one create permission.
+      await checkKnowledgeBasePreparedAttachments({
+        claim,
+        credential,
+        dispatch: prepared,
+      });
       await markKnowledgeBaseTurnDispatching({
         userId: claim.turn.userId,
         turnId: claim.turn.id,
         leaseToken: claim.leaseToken,
         leaseMs: 300_000,
       });
+      claim.turn.createAttemptState = "sending";
       const created = await createFrontMindTask({
         baseUrl: prepared.baseUrl,
         apiKey: credential.apiKey,
         requestBody: prepared.requestBody,
         idempotencyKey,
+        traceId: knowledgeBaseClaimTraceId(claim),
+      });
+      logKnowledgeBaseTaskCreateDiagnostic({
+        claim,
+        dispatch: prepared,
+        result: created,
       });
       if (!created.ok) {
-        throw knowledgeBaseUpstreamCreateError(created);
+        const createError = knowledgeBaseUpstreamCreateError(created);
+        if (created.failureClass === "deterministic") {
+          claim.turn.createAttemptState = "rejected";
+        } else {
+          claim.turn.createAttemptState = "unknown";
+        }
+        throw createError;
       }
       return {
         taskId: String(created.task.id),
@@ -2621,6 +2926,8 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         leaseToken: claim.leaseToken,
         upstreamTaskId: taskId,
       });
+      claim.turn.createAttemptState = "acknowledged";
+      claim.turn.upstreamTaskId = taskId;
     },
     registerTask: async (taskId) => {
       await recordUpstreamResource({
@@ -2872,6 +3179,32 @@ type DurableKnowledgeBaseGeneratedAttachment = {
   role: "skill" | "prefill" | "instructions" | "finalization";
 };
 
+export function knowledgeBaseGeneratedAttachmentFailureForPersistence(
+  error: unknown,
+) {
+  if (
+    error instanceof UpstreamTaskAttachmentPendingError ||
+    (error instanceof UpstreamFileReadinessError && error.retryable) ||
+    (error instanceof UpstreamTaskAttachmentContentProofError &&
+      error.retryable)
+  ) {
+    return new KnowledgeBaseAttachmentsProcessingError(0, 1, 5_000, undefined, {
+      cause: error,
+    });
+  }
+  if (
+    error instanceof UpstreamFileReadinessError ||
+    error instanceof UpstreamTaskAttachmentContentProofError
+  ) {
+    return new KnowledgeBaseLocalPreparationError(
+      "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
+      "系统生成附件无法通过上游内容完整性校验，请联系支持处理",
+      { cause: error },
+    );
+  }
+  return error;
+}
+
 async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
   baseUrl: string;
   apiKey: string;
@@ -2912,6 +3245,15 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
         upstreamFileId: reusableUpstreamFileId,
       });
     }
+    await waitForKnowledgeBaseAttachmentGroup({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      attachments: [
+        { file_id: reusableUpstreamFileId, filename: input.filename },
+      ],
+      attachmentKind: "generated",
+      filenamePolicy: "exact",
+    });
     return {
       attachment: {
         file_id: reusableUpstreamFileId,
@@ -2923,28 +3265,33 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
       removeOrphan: async () => undefined,
     };
   }
-  return uploadUpstreamTaskAttachment({
-    baseUrl: input.baseUrl,
-    apiKey: input.apiKey,
-    filename: input.filename,
-    bytes: input.bytes,
-    mimeType,
-    idempotencyKey: reservation.idempotencyKey,
-    ...(reservation.upstreamFileId
-      ? { existingFileId: reservation.upstreamFileId }
-      : {}),
-    onFileResolved: async (upstreamFileId) => {
-      await completeKnowledgeBaseGeneratedAttachment({
-        userId: input.durable.userId,
-        turnId: input.durable.turnId,
-        leaseToken: input.durable.leaseToken,
-        role: input.durable.role,
-        attachmentIndex: input.durable.attachmentIndex,
-        requestHash: reservation.requestHash,
-        upstreamFileId,
-      });
-    },
-  });
+  try {
+    return await uploadUpstreamTaskAttachment({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      filename: input.filename,
+      bytes: input.bytes,
+      mimeType,
+      idempotencyKey: reservation.idempotencyKey,
+      readinessDeadlineMs: KNOWLEDGE_BASE_READINESS_WAIT_MS,
+      ...(reservation.upstreamFileId
+        ? { existingFileId: reservation.upstreamFileId }
+        : {}),
+      onFileResolved: async (upstreamFileId) => {
+        await completeKnowledgeBaseGeneratedAttachment({
+          userId: input.durable.userId,
+          turnId: input.durable.turnId,
+          leaseToken: input.durable.leaseToken,
+          role: input.durable.role,
+          attachmentIndex: input.durable.attachmentIndex,
+          requestHash: reservation.requestHash,
+          upstreamFileId,
+        });
+      },
+    });
+  } catch (error) {
+    throw knowledgeBaseGeneratedAttachmentFailureForPersistence(error);
+  }
 }
 
 export async function uploadKnowledgeBaseSkillArchive({
@@ -2992,6 +3339,7 @@ export async function createFrontMindTask({
   taskId: existingTaskId,
   idempotencyKey,
   requestBody,
+  traceId,
 }: {
   baseUrl: string;
   apiKey: string;
@@ -3001,67 +3349,132 @@ export async function createFrontMindTask({
   idempotencyKey?: string;
   /** Exact credential-free body persisted before the first POST. */
   requestBody?: KnowledgeBasePreparedDispatch["requestBody"];
+  traceId?: string;
 }) {
   const body =
     requestBody ||
     ({
       prompt: String(prompt || ""),
       agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
-      taskMode: "agent",
       attachments: attachments || [],
-      ...(existingTaskId ? { taskId: existingTaskId } : {}),
     } satisfies KnowledgeBasePreparedDispatch["requestBody"]);
+  void existingTaskId;
   assertUpstreamPromptBudget(body.prompt);
-  const taskResponse = await axios.post(`${baseUrl}/v1/tasks`, body, {
-    headers: {
-      "Content-Type": "application/json",
-      API_KEY: apiKey,
-      Authorization: `Bearer ${apiKey}`,
-      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
-    },
-    timeout: KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
-    validateStatus: () => true,
-  });
+  // Kept as an accepted argument for old callers and frozen operations only.
+  // Manus v1 does not document Idempotency-Key for task.create, so it must not
+  // be sent or used as permission to repeat a POST.
+  void idempotencyKey;
+  let taskResponse;
+  try {
+    taskResponse = await axios.post(`${baseUrl}/v1/tasks`, body, {
+      headers: {
+        "Content-Type": "application/json",
+        API_KEY: apiKey,
+      },
+      timeout: KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
+      validateStatus: () => true,
+    });
+  } catch {
+    return {
+      ok: false as const,
+      status: 503,
+      detail: "Upstream task creation result is unknown",
+      failureClass: classifyKnowledgeBaseUpstreamCreateFailure({
+        transportError: true,
+      }),
+      failureCode: "UPSTREAM_CREATE_TRANSPORT_UNKNOWN" as const,
+      reasonCategory: "TRANSPORT_UNKNOWN" as const,
+      traceId,
+    };
+  }
+
+  const rawProviderRequestRef =
+    taskResponse.headers?.["x-request-id"] ??
+    taskResponse.headers?.["request-id"] ??
+    taskResponse.headers?.["x-amzn-requestid"] ??
+    taskResponse.data?.request_id ??
+    taskResponse.data?.error?.request_id;
+  const normalizedProviderRequestRef = String(rawProviderRequestRef || "")
+    .trim()
+    .slice(0, 512);
+  const providerRequestRef = normalizedProviderRequestRef
+    ? `sha256:${createHash("sha256")
+        .update(normalizedProviderRequestRef)
+        .digest("hex")
+        .slice(0, 24)}`
+    : undefined;
 
   if (taskResponse.status < 200 || taskResponse.status >= 300) {
     const upstreamErrorCode =
       taskResponse.data?.error?.code || taskResponse.data?.code;
-    const normalizedUpstreamErrorCode = knowledgeBaseUpstreamString(
+    const providerCodeCandidate = knowledgeBaseUpstreamString(
       upstreamErrorCode,
-      64,
-    )
-      ?.toUpperCase()
-      .replace(/[^A-Z0-9_]+/gu, "_")
-      .replace(/^_+|_+$/gu, "");
-    const detail =
-      taskResponse.data?.error?.message ||
-      taskResponse.data?.message ||
-      `Create task failed (${taskResponse.status})`;
+      7,
+    );
+    const safeNumericProviderCode =
+      providerCodeCandidate && /^[0-9]{1,6}$/u.test(providerCodeCandidate)
+        ? providerCodeCandidate
+        : undefined;
+    const providerText = String(
+      taskResponse.data?.error?.message || taskResponse.data?.message || "",
+    ).toUpperCase();
+    const providerCode = String(upstreamErrorCode || "").toUpperCase();
+    const reasonCategory: KnowledgeBaseProviderReasonCategory =
+      taskResponse.status === 401 || taskResponse.status === 403
+        ? "CREDENTIAL_REJECTED"
+        : taskResponse.status === 402 ||
+            /(?:QUOTA|CREDIT|BALANCE)/u.test(providerCode + providerText)
+          ? "QUOTA_REJECTED"
+          : /(?:ATTACHMENT|FILE)/u.test(providerCode + providerText)
+            ? "ATTACHMENT_INVALID"
+            : /(?:PROFILE|AGENT_PROFILE)/u.test(providerCode + providerText)
+              ? "PROFILE_INVALID"
+              : taskResponse.status === 400 || taskResponse.status === 422
+                ? providerCode === "3" ||
+                  /(?:INVALID_ARGUMENT)/u.test(providerCode + providerText)
+                  ? "UNKNOWN_INVALID_ARGUMENT"
+                  : "PAYLOAD_INVALID"
+                : taskResponse.status >= 500
+                  ? "UPSTREAM_UNAVAILABLE"
+                  : "UNKNOWN_PROVIDER_REJECTION";
     return {
       ok: false as const,
       status: taskResponse.status,
-      detail,
+      detail: "Upstream task creation was rejected",
       failureClass: classifyKnowledgeBaseUpstreamCreateFailure({
         status: taskResponse.status,
         code: upstreamErrorCode,
       }),
-      failureCode: normalizedUpstreamErrorCode
-        ? `UPSTREAM_CREATE_${normalizedUpstreamErrorCode}`.slice(0, 128)
+      failureCode: safeNumericProviderCode
+        ? `UPSTREAM_CREATE_${safeNumericProviderCode}`
         : `UPSTREAM_CREATE_HTTP_${taskResponse.status}`,
+      reasonCategory,
+      providerRequestRef,
+      traceId,
     };
   }
 
-  const taskData = canonicalKnowledgeBaseUpstreamTask(taskResponse.data);
-  const taskId = upstreamTaskId(taskData, false);
+  let taskData: Record<string, unknown>;
+  let taskId: string | null;
+  try {
+    taskData = canonicalKnowledgeBaseUpstreamTask(taskResponse.data);
+    taskId = upstreamTaskId(taskData, false);
+  } catch {
+    taskData = {};
+    taskId = null;
+  }
   if (!taskId) {
     return {
       ok: false as const,
       status: 502,
-      detail: "Create task failed: missing task id",
+      detail: "Upstream task creation result is missing its task id",
       failureClass: classifyKnowledgeBaseUpstreamCreateFailure({
         missingTaskId: true,
       }),
       failureCode: "UPSTREAM_TASK_ID_MISSING" as const,
+      reasonCategory: "TASK_ID_MISSING" as const,
+      providerRequestRef,
+      traceId,
     };
   }
 
@@ -3069,6 +3482,7 @@ export async function createFrontMindTask({
   const rawStatus = knowledgeBaseUpstreamString(taskData.status, 64);
   return {
     ok: true as const,
+    status: taskResponse.status,
     task: {
       id: taskId,
       status: rawStatus === "failed" ? "error" : rawStatus || "running",
@@ -3082,7 +3496,49 @@ export async function createFrontMindTask({
       ),
       output: normalizeRecoveredTaskOutput(taskData),
     },
+    providerRequestRef,
+    traceId,
   };
+}
+
+function logKnowledgeBaseTaskCreateDiagnostic(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  dispatch: KnowledgeBasePreparedDispatch;
+  result: Awaited<ReturnType<typeof createFrontMindTask>>;
+}) {
+  const safeIdentifier = (value: unknown) => {
+    const normalized = String(value || "");
+    return normalized.length <= 255 && /^[A-Za-z0-9._:-]+$/u.test(normalized)
+      ? normalized
+      : undefined;
+  };
+  const traceId = safeIdentifier(knowledgeBaseClaimTraceId(input.claim));
+  const reasonCategory = safeIdentifier(
+    input.result.ok ? "ACKNOWLEDGED" : input.result.reasonCategory,
+  );
+  const failureCode = input.result.ok
+    ? undefined
+    : safeIdentifier(input.result.failureCode);
+  const providerRequestRef = safeIdentifier(input.result.providerRequestRef);
+  console[input.result.ok ? "info" : "warn"](
+    "[KnowledgeBaseTaskCreate] result",
+    JSON.stringify({
+      buildId: safeIdentifier(input.claim.turn.buildId),
+      turnId: safeIdentifier(input.claim.turn.id),
+      ...(traceId ? { traceId } : {}),
+      schemaVersion: input.dispatch.schemaVersion,
+      bodySha256: input.dispatch.bodySha256,
+      attachmentCount: input.dispatch.requestBody.attachments.length,
+      readyCount: input.dispatch.requestBody.attachments.length,
+      pendingCount: 0,
+      errorCount: 0,
+      maxReadinessDelayMs: knowledgeBaseClaimReadinessDelayMs(input.claim),
+      status: input.result.status,
+      ...(reasonCategory ? { reasonCategory } : {}),
+      ...(failureCode ? { failureCode } : {}),
+      ...(providerRequestRef ? { providerRequestRef } : {}),
+    }),
+  );
 }
 
 function knowledgeBaseUpstreamCreateError(
@@ -3095,6 +3551,9 @@ function knowledgeBaseUpstreamCreateError(
     failure.failureClass,
     failure.failureCode,
     failure.status,
+    failure.reasonCategory,
+    failure.providerRequestRef,
+    failure.traceId,
   );
 }
 
@@ -3105,32 +3564,18 @@ function deterministicKnowledgeBaseCreateFailureMessage(
     return "上游任务编号暂不可读，系统正在使用同一请求标识核对本轮结果";
   }
   if (error.status === 401 || error.status === 403) {
-    return "上游拒绝了当前 API 凭证，请更新凭证后继续本轮";
+    return "上游已明确拒绝使用当前 API 凭证创建任务；本轮不会再次提交，请更新凭证后新建知识库构建";
   }
   if (error.status === 413) {
-    return "本轮附件超过上游限制，请减少或压缩附件后继续本轮";
+    return "上游已明确拒绝本轮附件合同；本轮不会再次提交，请调整资料后新建知识库构建";
   }
-  return "上游已明确拒绝创建本轮任务，当前内容和附件均已保留；请按提示修复后继续本轮";
+  return "上游已明确拒绝创建本轮任务，当前内容和附件均已保留；本轮不会再次提交，请新建知识库构建";
 }
 
-function knowledgeBaseCreateUserRecoveryAction(
-  error: KnowledgeBaseUpstreamCreateError,
-) {
-  const code = error.failureCode.toUpperCase();
-  if (
-    error.status === 402 ||
-    code.includes("QUOTA") ||
-    code.includes("CREDIT") ||
-    code.includes("BALANCE")
-  ) {
-    return "top_up" as const;
-  }
-  if (error.status === 401 || error.status === 403) {
-    return "update_credential" as const;
-  }
-  if (error.status === 413 || code.includes("ATTACHMENT")) {
-    return "fix_attachments" as const;
-  }
+function knowledgeBaseCreateUserRecoveryAction() {
+  // A deterministic provider rejection has already consumed the one allowed
+  // Task Create attempt. Same-turn actions are reserved for failures that
+  // occurred while createAttemptState was still exactly `not_sent`.
   return "contact_support" as const;
 }
 
@@ -3142,11 +3587,13 @@ export async function persistKnowledgeBaseCreateFailure(
     error: unknown;
     outcomeUnknownCode: string;
     recoveryDelayMs?: number;
+    traceId?: string;
   },
   dependencies: {
     cancelUnprepared?: typeof cancelUnpreparedKnowledgeBaseTurn;
     failDeterministically?: typeof failKnowledgeBaseTurnDeterministically;
     markOutcomeUnknown?: typeof markKnowledgeBaseTurnOutcomeUnknown;
+    deferBeforeCreate?: typeof deferKnowledgeBaseTurnBeforeCreate;
   } = {},
 ) {
   const cancelUnprepared =
@@ -3156,6 +3603,19 @@ export async function persistKnowledgeBaseCreateFailure(
     failKnowledgeBaseTurnDeterministically;
   const markOutcomeUnknown =
     dependencies.markOutcomeUnknown ?? markKnowledgeBaseTurnOutcomeUnknown;
+  const deferBeforeCreate =
+    dependencies.deferBeforeCreate ?? deferKnowledgeBaseTurnBeforeCreate;
+  if (input.error instanceof KnowledgeBaseAttachmentsProcessingError) {
+    await deferBeforeCreate({
+      userId: input.userId,
+      turnId: input.turnId,
+      leaseToken: input.leaseToken,
+      code: input.error.code,
+      recoveryDelayMs: input.error.retryAfterMs,
+      traceId: input.error.traceId || input.traceId,
+    });
+    return "retriable" as const;
+  }
   if (input.error instanceof KnowledgeBaseLocalPreparationError) {
     if (input.error.code === "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID") {
       // Logo has its own first-node re-upload flow. Releasing this unbound
@@ -3241,9 +3701,12 @@ export async function persistKnowledgeBaseCreateFailure(
       leaseToken: input.leaseToken,
       code: createError.failureCode,
       message: deterministicKnowledgeBaseCreateFailureMessage(createError),
-      failureClass: "requires_user_fix",
-      recoveryAction: knowledgeBaseCreateUserRecoveryAction(createError),
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: knowledgeBaseCreateUserRecoveryAction(),
       canRegenerate: false,
+      createAttemptRejected: true,
+      reasonCategory: createError.reasonCategory,
+      providerRequestRef: createError.providerRequestRef,
     });
     return "deterministic" as const;
   }
@@ -3255,6 +3718,9 @@ export async function persistKnowledgeBaseCreateFailure(
       createError.failureClass === "retriable"
         ? createError.failureCode
         : input.outcomeUnknownCode,
+    traceId: createError.traceId || input.traceId,
+    reasonCategory: createError.reasonCategory,
+    providerRequestRef: createError.providerRequestRef,
     ...(input.recoveryDelayMs
       ? { recoveryDelayMs: input.recoveryDelayMs }
       : {}),
@@ -3275,8 +3741,11 @@ function knowledgeBaseDispatchRetryable(error: unknown) {
     return false;
   }
   if (error instanceof KnowledgeBaseUpstreamCreateError) {
-    return error.failureClass !== "deterministic";
+    // Once task.create begins, no automatic retry is safe: the provider does
+    // not document Idempotency-Key for this endpoint.
+    return false;
   }
+  if (error instanceof KnowledgeBaseAttachmentsProcessingError) return false;
   if (axios.isAxiosError(error)) return true;
   return (
     error instanceof Error &&
@@ -3331,14 +3800,52 @@ function launchAcceptedKnowledgeBaseClaim(input: {
   outcomeUnknownCode: string;
 }) {
   void dispatchAcceptedKnowledgeBaseClaim(input).catch(async (error) => {
-    await persistKnowledgeBaseCreateFailure({
+    const persisted = await persistKnowledgeBaseCreateFailure({
       userId: input.claim.turn.userId,
       turnId: input.claim.turn.id,
       leaseToken: input.claim.leaseToken,
       error,
       outcomeUnknownCode: input.outcomeUnknownCode,
       recoveryDelayMs: 1_000,
+      traceId: knowledgeBaseClaimTraceId(input.claim),
     }).catch(() => undefined);
+    if (
+      persisted === "retriable" &&
+      error instanceof KnowledgeBaseAttachmentsProcessingError
+    ) {
+      console.info(
+        "[KnowledgeBaseAttachmentReadiness] deferred",
+        JSON.stringify({
+          buildId: input.claim.turn.buildId,
+          turnId: input.claim.turn.id,
+          ...(knowledgeBaseClaimTraceId(input.claim)
+            ? { traceId: knowledgeBaseClaimTraceId(input.claim) }
+            : {}),
+          readyCount: error.readyCount,
+          pendingCount: error.pendingCount,
+          errorCount: 0,
+          maxReadinessDelayMs: knowledgeBaseClaimReadinessDelayMs(input.claim),
+          retryAfterMs: error.retryAfterMs,
+          createAttemptState: "not_sent",
+        }),
+      );
+      const timer = setTimeout(() => {
+        void claimKnowledgeBaseTurnForRecovery({
+          turnId: input.claim.turn.id,
+          leaseMs: 300_000,
+        })
+          .then((claim) => {
+            if (!claim) return;
+            launchAcceptedKnowledgeBaseClaim({
+              claim,
+              credential: input.credential,
+              outcomeUnknownCode: input.outcomeUnknownCode,
+            });
+          })
+          .catch(() => undefined);
+      }, error.retryAfterMs + 50);
+      timer.unref();
+    }
     logKnowledgeBaseRuntimeFailure({
       level: "warn",
       event: "[KnowledgeBaseAcceptedDispatch] deferred",
@@ -3384,6 +3891,7 @@ router.post("/start", async (req, res) => {
     res.status(401).json({ error: "当前账号尚未配置可用的 API Key" });
     return;
   }
+  const requestTraceId = randomUUID();
 
   let reservationCreated = false;
   try {
@@ -3394,10 +3902,13 @@ router.post("/start", async (req, res) => {
     });
     if (existingBuild?.build.status === "published") {
       res.status(409).json({
+        traceId: requestTraceId,
         error: {
           code: "KNOWLEDGE_BASE_LOCKED",
           message: "知识库已发布；后续修改请提交维护需求",
+          traceId: requestTraceId,
         },
+        reservationCreated: false,
       });
       return;
     }
@@ -3432,7 +3943,13 @@ router.post("/start", async (req, res) => {
         )
       ) {
         res.status(403).json({
-          error: "上传资料与当前账号不匹配，请重新上传",
+          traceId: requestTraceId,
+          error: {
+            code: "KNOWLEDGE_BASE_ATTACHMENT_OWNERSHIP_MISMATCH",
+            message: "上传资料与当前账号不匹配，请重新上传",
+            traceId: requestTraceId,
+          },
+          reservationCreated: false,
         });
         return;
       }
@@ -3462,6 +3979,7 @@ router.post("/start", async (req, res) => {
       expectedAttachmentCount:
         2 + userAttachments.length + (prefillKnowledgeSnapshot ? 1 : 0),
       recoveryMetadata: {
+        traceId: requestTraceId,
         kind: "start",
         conversationId,
         companyName,
@@ -3502,6 +4020,7 @@ router.post("/start", async (req, res) => {
           String(Math.ceil(reservationRetryAfterMs(reservation) / 1_000)),
         )
         .json({
+          traceId: reservation.turn.traceId || requestTraceId,
           reservation: knowledgeBaseReservationReceipt(
             reservation,
             observation?.stateEpoch,
@@ -3535,6 +4054,7 @@ router.post("/start", async (req, res) => {
         recoveryMetadata:
           reservation.recoveryMetadata ||
           ({
+            traceId: requestTraceId,
             kind: "start",
             conversationId,
             companyName: build.companyName,
@@ -3555,6 +4075,7 @@ router.post("/start", async (req, res) => {
         upstreamStatus: "running",
       }).catch(() => null);
       res.status(202).json({
+        traceId: acceptedStartClaim.turn.traceId || requestTraceId,
         visibleMessage: "开始构建企业知识库",
         reservation: knowledgeBaseAcceptedReservationReceipt({
           turn: acceptedStartClaim.turn,
@@ -3593,6 +4114,7 @@ router.post("/start", async (req, res) => {
             }).catch(() => null)
           : null;
       res.status(status).json({
+        traceId: requestTraceId,
         error: { code: error.code, message: error.message },
         reservationCreated: false,
         ...(observation
@@ -3607,6 +4129,7 @@ router.post("/start", async (req, res) => {
     }
     if (error instanceof KnowledgeBaseEnterpriseIdentityError) {
       res.status(error.code === "ENTERPRISE_NOT_CONFIGURED" ? 422 : 409).json({
+        traceId: requestTraceId,
         error: error.message,
         code: error.code,
         reservationCreated,
@@ -3615,9 +4138,11 @@ router.post("/start", async (req, res) => {
     }
     if (error instanceof KnowledgeBaseBuildError) {
       res.status(422).json({
+        traceId: requestTraceId,
         error: {
           code: error.code,
           message: error.message,
+          traceId: requestTraceId,
         },
         reservationCreated,
       });
@@ -3630,9 +4155,11 @@ router.post("/start", async (req, res) => {
       additionalSecrets: [apiKey, req.frontmindCredential?.apiKey],
     });
     res.status(503).json({
+      traceId: requestTraceId,
       error: {
         code: "KNOWLEDGE_BASE_START_FAILED",
         message: "启动企业知识库任务失败，请稍后重试",
+        traceId: requestTraceId,
       },
       reservationCreated,
     });
@@ -5634,6 +6161,47 @@ router.post("/turn", async (req, res) => {
   }
 });
 
+const KNOWLEDGE_BASE_PRECREATE_ATTACHMENT_REPAIR_CODES = new Set([
+  "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+  "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID",
+]);
+
+export function knowledgeBaseAttachmentRepairObservationAllowsReplacement(input: {
+  observation: KnowledgeBaseObservationDto | null;
+  conversationId: string;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+}) {
+  const observation = input.observation;
+  const progress = observation?.interaction.progress;
+  const activeTurn = observation?.activeTurn;
+  const notice = observation?.notice;
+  return Boolean(
+    observation &&
+      progress &&
+      activeTurn &&
+      notice &&
+      progress.build.conversationId === input.conversationId &&
+      observation.generation === input.expectedGeneration &&
+      progress.build.revision === input.expectedRevision &&
+      (progress.build.currentLeafId ?? null) === input.expectedLeafId &&
+      notice.turnId === activeTurn.id &&
+      activeTurn.status === "failed" &&
+      activeTurn.buildGeneration === input.expectedGeneration &&
+      activeTurn.expectedRevision === input.expectedRevision &&
+      (activeTurn.expectedLeafId ?? null) === input.expectedLeafId &&
+      activeTurn.failureClass === "requires_user_fix" &&
+      activeTurn.recoveryAction === "fix_attachments" &&
+      activeTurn.canRegenerate === false &&
+      activeTurn.createAttemptState === "not_sent" &&
+      notice.failureClass === "requires_user_fix" &&
+      notice.recoveryAction === "fix_attachments" &&
+      notice.canRegenerate === false &&
+      KNOWLEDGE_BASE_PRECREATE_ATTACHMENT_REPAIR_CODES.has(notice.code),
+  );
+}
+
 router.post("/turn/replace-attachments", async (req, res) => {
   const body = (req.body || {}) as {
     conversationId?: string;
@@ -5691,15 +6259,13 @@ router.post("/turn/replace-attachments", async (req, res) => {
       upstreamStatus: "failed",
     });
     if (
-      !observation ||
-      observation.generation !== Number(body.expectedGeneration) ||
-      observation.interaction.progress?.build.revision !==
-        Number(body.expectedRevision) ||
-      (observation.interaction.progress?.build.currentLeafId ?? null) !==
-        expectedLeafId ||
-      observation.notice?.recoveryAction !== "fix_attachments" ||
-      observation.notice.canRegenerate === true ||
-      !observation.notice.turnId
+      !knowledgeBaseAttachmentRepairObservationAllowsReplacement({
+        observation,
+        conversationId,
+        expectedGeneration: Number(body.expectedGeneration),
+        expectedRevision: Number(body.expectedRevision),
+        expectedLeafId,
+      })
     ) {
       res.status(409).json({
         error: {
@@ -5761,7 +6327,7 @@ router.post("/turn/replace-attachments", async (req, res) => {
     }
     const claim = await replaceKnowledgeBaseTurnAttachmentsAfterUserFix({
       userId: req.frontmindUser.id,
-      turnId: observation.notice.turnId,
+      turnId: observation!.notice!.turnId!,
       apiCredentialId: req.frontmindCredential.id,
       clientRequestId,
       attachments,
@@ -5832,6 +6398,43 @@ router.post("/turn/replace-attachments", async (req, res) => {
   }
 });
 
+export function knowledgeBaseRetryObservationAllowsRegeneration(input: {
+  observation: KnowledgeBaseObservationDto | null;
+  buildId: string;
+  activeTurnId: string | null;
+  expectedGeneration: number;
+  expectedRevision: number;
+  expectedLeafId: string | null;
+}) {
+  const observation = input.observation;
+  const progress = observation?.interaction.progress;
+  const activeTurn = observation?.activeTurn;
+  const notice = observation?.notice;
+  return Boolean(
+    observation &&
+      progress &&
+      activeTurn &&
+      notice &&
+      progress.build.id === input.buildId &&
+      observation.generation === input.expectedGeneration &&
+      progress.build.revision === input.expectedRevision &&
+      (progress.build.currentLeafId ?? null) === input.expectedLeafId &&
+      input.activeTurnId === activeTurn.id &&
+      notice.turnId === activeTurn.id &&
+      activeTurn.status === "failed" &&
+      activeTurn.buildGeneration === input.expectedGeneration &&
+      activeTurn.expectedRevision === input.expectedRevision &&
+      (activeTurn.expectedLeafId ?? null) === input.expectedLeafId &&
+      activeTurn.failureClass === "terminal_requires_regeneration" &&
+      activeTurn.recoveryAction === "regenerate_turn" &&
+      activeTurn.canRegenerate === true &&
+      activeTurn.createAttemptState !== "rejected" &&
+      notice.failureClass === "terminal_requires_regeneration" &&
+      notice.recoveryAction === "regenerate_turn" &&
+      notice.canRegenerate === true,
+  );
+}
+
 router.post("/retry", async (req, res) => {
   const body = (req.body || {}) as {
     conversationId?: string;
@@ -5890,6 +6493,26 @@ router.post("/retry", async (req, res) => {
       retryBuild.revision === Number(expectedRevision) &&
       (retryBuild.currentLeafId ?? null) === expectedLeafId
     ) {
+      const retryObservation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "failed",
+      });
+      if (
+        !knowledgeBaseRetryObservationAllowsRegeneration({
+          observation: retryObservation,
+          buildId: retryBuild.id,
+          activeTurnId: retryBuild.activeTurnId,
+          expectedGeneration: Number(expectedGeneration),
+          expectedRevision: Number(expectedRevision),
+          expectedLeafId,
+        })
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "当前失败轮次没有服务端授权的重新生成操作",
+        );
+      }
       await assertKnowledgeBaseFinalLogoProvenanceForBuild(
         req.frontmindUser.id,
         retryBuild,
@@ -6230,16 +6853,26 @@ router.post("/progress/reconcile", async (req, res) => {
     }
     const taskId = currentObservation?.authoritativeTaskId || requestedTaskId;
     if (!taskId) {
+      const activeTurn = currentObservation?.activeTurn;
+      const notice = currentObservation?.notice;
       const canResumePreCreateFailure =
-        currentObservation?.notice?.canRegenerate !== true &&
-        (currentObservation?.notice?.recoveryAction === "top_up" ||
-          currentObservation?.notice?.recoveryAction === "update_credential") &&
-        Boolean(currentObservation.notice.turnId) &&
+        Boolean(activeTurn) &&
+        Boolean(notice) &&
+        notice!.turnId === activeTurn!.id &&
+        activeTurn!.status === "failed" &&
+        activeTurn!.failureClass === "requires_user_fix" &&
+        activeTurn!.canRegenerate === false &&
+        activeTurn!.createAttemptState === "not_sent" &&
+        notice!.failureClass === "requires_user_fix" &&
+        notice!.canRegenerate === false &&
+        notice!.recoveryAction === activeTurn!.recoveryAction &&
+        (notice!.recoveryAction === "top_up" ||
+          notice!.recoveryAction === "update_credential") &&
         Boolean(req.frontmindCredential);
       if (canResumePreCreateFailure) {
         const claim = await resumeKnowledgeBaseTurnAfterUserFix({
           userId: req.frontmindUser.id,
-          turnId: currentObservation!.notice!.turnId!,
+          turnId: activeTurn!.id,
           apiCredentialId: req.frontmindCredential!.id,
         });
         if (claim) {

@@ -18,10 +18,14 @@ import {
 import { runtimeErrorForLog } from "./_core/runtime-error-log";
 import { usageCoverageSupportsReplacement } from "./api-usage-ledger";
 import {
+  acquireActiveApiCredentialDeletionFence,
   AuthServiceError,
+  completeActiveApiCredentialDeletionFence,
   deleteActiveApiCredentialInTransaction,
   getApiKeyFingerprint,
   replaceApiCredentialInTransaction,
+  rollbackActiveApiCredentialDeletionFence,
+  startActiveApiCredentialDeletionFenceHeartbeat,
   validateUpstreamApiKey,
   type AuthenticatedUser,
 } from "./auth-service";
@@ -1154,61 +1158,83 @@ export async function revokeManagedApiKeyTarget(input: {
       "只有系统管理员可以撤销账号 API Key。",
     );
   }
+  const fence = await acquireActiveApiCredentialDeletionFence(input.userId);
+  if (!fence) {
+    throw new AuthServiceError("CONFLICT", "API Key 尚未配置或已被撤销");
+  }
   const db = await requireDb();
-  return db.transaction(async (tx) => {
-    const targetRows = await tx
-      .select({
-        id: users.id,
-        role: users.role,
-        adminAccessLevel: users.adminAccessLevel,
-      })
-      .from(users)
-      .where(eq(users.id, input.userId))
-      .limit(1)
-      .for("update");
-    const credentialRows = await tx
-      .select()
-      .from(apiCredentials)
-      .where(eq(apiCredentials.userId, input.userId))
-      .orderBy(desc(apiCredentials.version))
-      .limit(1)
-      .for("update");
-    const latest = credentialRows[0];
-    const actualVersion = latest?.version ?? 0;
-    assertManagedApiKeyTarget({
-      kind: input.kind,
-      target: targetRows[0],
-      actualVersion,
-      expectedVersion: input.expectedVersion,
-    });
-    if (latest?.status !== "active") {
-      throw new AuthServiceError("CONFLICT", "API Key 尚未配置或已被撤销");
-    }
-    // This keeps the credential lock and all in-flight/recovery dependency
-    // checks in the same transaction as the CAS decision.
-    const deletion = await deleteActiveApiCredentialInTransaction({
-      executor: tx,
-      userId: input.userId,
-    });
-    await writeWorkspaceAuditEvent(
-      {
-        actor: input.actor,
-        action: "admin.api_credential.revoked",
-        targetType: input.kind,
-        targetId: input.userId,
-        workspaceUserId: input.kind === "customer" ? input.userId : null,
-        reason: input.reason,
-        metadata: {
-          targetKind: input.kind,
-          previousVersion: actualVersion,
-          credentialVersion: deletion.version,
-          configured: false,
+  const stopFenceHeartbeat =
+    startActiveApiCredentialDeletionFenceHeartbeat(fence);
+  let transactionCommitted = false;
+  try {
+    const result = await db.transaction(async (tx) => {
+      const targetRows = await tx
+        .select({
+          id: users.id,
+          role: users.role,
+          adminAccessLevel: users.adminAccessLevel,
+        })
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .limit(1)
+        .for("update");
+      const credentialRows = await tx
+        .select()
+        .from(apiCredentials)
+        .where(eq(apiCredentials.userId, input.userId))
+        .orderBy(desc(apiCredentials.version))
+        .limit(1)
+        .for("update");
+      const latest = credentialRows[0];
+      const actualVersion = latest?.version ?? 0;
+      assertManagedApiKeyTarget({
+        kind: input.kind,
+        target: targetRows[0],
+        actualVersion,
+        expectedVersion: input.expectedVersion,
+      });
+      if (latest?.status !== "active") {
+        throw new AuthServiceError("CONFLICT", "API Key 尚未配置或已被撤销");
+      }
+      // This keeps the credential lock and all in-flight/recovery dependency
+      // checks in the same transaction as the CAS decision.
+      const deletion = await deleteActiveApiCredentialInTransaction({
+        executor: tx,
+        userId: input.userId,
+        fenceToken: fence,
+      });
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "admin.api_credential.revoked",
+          targetType: input.kind,
+          targetId: input.userId,
+          workspaceUserId: input.kind === "customer" ? input.userId : null,
+          reason: input.reason,
+          metadata: {
+            targetKind: input.kind,
+            previousVersion: actualVersion,
+            credentialVersion: deletion.version,
+            configured: false,
+          },
         },
-      },
-      tx,
-    );
-    return { success: true as const, version: deletion.version };
-  });
+        tx,
+      );
+      return { success: true as const, version: deletion.version };
+    });
+    transactionCommitted = true;
+    await stopFenceHeartbeat();
+    await completeActiveApiCredentialDeletionFence(fence);
+    return result;
+  } catch (error) {
+    await stopFenceHeartbeat().catch(() => undefined);
+    if (!transactionCommitted) {
+      await rollbackActiveApiCredentialDeletionFence(fence).catch(
+        () => undefined,
+      );
+    }
+    throw error;
+  }
 }
 
 function policyKey(scope: ApiUsageScope, userId?: number | null) {

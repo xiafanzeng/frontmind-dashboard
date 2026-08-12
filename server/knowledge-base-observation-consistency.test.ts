@@ -172,6 +172,288 @@ function node(overrides: Record<string, unknown> = {}) {
 }
 
 describe("knowledge-base observation consistency", () => {
+  it("projects attachment readiness processing as a same-turn recovery notice", async () => {
+    const now = new Date("2026-08-11T05:32:59.000Z");
+    const activeTurn = {
+      id: "turn-attachments-processing",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-attachments-processing",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-attachments-processing",
+      operationType: "start",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: Array.from(
+        { length: 7 },
+        (_, index) => `opaque-file-${index + 1}`,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        createAttemptState: "not_sent",
+        traceId: "4b8be659-2b38-43f5-b89d-1697e3e77655",
+      },
+      status: "queued",
+      errorCode: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+      errorMessage: "generated attachment is still pending",
+      upstreamTaskId: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "running",
+              activeTurnId: activeTurn.id,
+              upstreamTaskId: null,
+            }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [activeTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.notice).toMatchObject({
+      code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+      severity: "info",
+      retryable: true,
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      traceId: "4b8be659-2b38-43f5-b89d-1697e3e77655",
+      attachmentCount: 7,
+      turnId: activeTurn.id,
+    });
+  });
+
+  it("projects an unknown create outcome as contact-support and never as retry", async () => {
+    const now = new Date("2026-08-11T05:32:59.000Z");
+    const activeTurn = {
+      id: "turn-create-outcome-unknown",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-create-outcome-unknown",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-create-outcome-unknown",
+      operationType: "start",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: Array.from(
+        { length: 7 },
+        (_, index) => `opaque-file-${index + 1}`,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        createAttemptState: "unknown",
+        traceId: "e948069c-b6e1-4c8f-b829-a3ee6a3495b4",
+      },
+      status: "running",
+      errorCode: "KNOWLEDGE_BASE_CREATE_OUTCOME_UNKNOWN",
+      errorMessage: "provider task create outcome unknown",
+      upstreamTaskId: null,
+      startedAt: now,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "running",
+              activeTurnId: activeTurn.id,
+              upstreamTaskId: null,
+            }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [activeTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.notice).toMatchObject({
+      code: "KNOWLEDGE_BASE_CREATE_OUTCOME_UNKNOWN",
+      severity: "warning",
+      retryable: false,
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+      traceId: "e948069c-b6e1-4c8f-b829-a3ee6a3495b4",
+      attachmentCount: 7,
+      turnId: activeTurn.id,
+    });
+  });
+
+  it("projects safe trace and attachment count for an UPSTREAM_CREATE_3 failure", async () => {
+    const now = new Date("2026-08-11T05:32:59.000Z");
+    const activeTurn = {
+      id: "turn-upstream-create-3",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-upstream-create-3",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-upstream-create-3",
+      operationType: "start",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: Array.from(
+        { length: 7 },
+        (_, index) => `opaque-file-${index + 1}`,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        createAttemptState: "rejected",
+        traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+      status: "failed",
+      upstreamTaskId: null,
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "protocol_error",
+              activeTurnId: activeTurn.id,
+              upstreamTaskId: null,
+              protocolErrorCode: "UPSTREAM_CREATE_3",
+              protocolError: "上游已明确拒绝创建本轮任务",
+            }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [activeTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation.notice).toMatchObject({
+      code: "UPSTREAM_CREATE_3",
+      traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      attachmentCount: 7,
+      turnId: activeTurn.id,
+    });
+  });
+
+  it("keeps a legacy UPSTREAM_CREATE_3 code and attachment count without inventing a trace", async () => {
+    const now = new Date("2026-08-11T05:32:59.000Z");
+    const activeTurn = {
+      id: "turn-legacy-upstream-create-3",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-legacy-upstream-create-3",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-legacy-upstream-create-3",
+      operationType: "start",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: Array.from(
+        { length: 7 },
+        (_, index) => `opaque-file-${index + 1}`,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+      status: "failed",
+      upstreamTaskId: null,
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "protocol_error",
+              activeTurnId: activeTurn.id,
+              upstreamTaskId: null,
+              protocolErrorCode: "UPSTREAM_CREATE_3",
+              protocolError: "上游已明确拒绝创建本轮任务",
+            }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [activeTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.notice).toMatchObject({
+      code: "UPSTREAM_CREATE_3",
+      attachmentCount: 7,
+      turnId: activeTurn.id,
+    });
+    expect(observation?.notice?.traceId).toBeNull();
+  });
+
   it("shows the official logo only on the initial revision-zero first node", async () => {
     const now = new Date("2026-08-01T00:00:05.000Z");
     const initialTurn = {

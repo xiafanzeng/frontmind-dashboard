@@ -126,7 +126,28 @@ describe("KnowledgeBasePollingCoordinator", () => {
     expect(observationNeedsPolling(awaitingInputObservation())).toBe(false);
   });
 
-  it("keeps polling the same task when its final ZIP can still arrive late", () => {
+  it("does not poll an executing task earlier than three seconds", async () => {
+    const setTimer = vi.fn(
+      (_callback: () => void, _delayMs?: number) =>
+        1 as unknown as ReturnType<typeof setTimeout>,
+    );
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe: vi.fn().mockResolvedValue(executingObservation()),
+      apply: vi.fn(),
+      now: () => 1_000,
+      setTimer: setTimer as unknown as typeof setTimeout,
+    });
+
+    coordinator.wake("conversation");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(setTimer).toHaveBeenCalledTimes(1);
+    expect(setTimer).toHaveBeenCalledWith(expect.any(Function), 3_000);
+    coordinator.dispose();
+  });
+
+  it("does not schedule polling for a failed task even when its final ZIP is late", () => {
     const now = Date.now();
     const observation = {
       ...executingObservation(),
@@ -145,7 +166,7 @@ describe("KnowledgeBasePollingCoordinator", () => {
       },
     };
 
-    expect(observationNeedsPolling(observation, now)).toBe(true);
+    expect(observationNeedsPolling(observation, now)).toBe(false);
     expect(observationNeedsPolling(observation, now + 5 * 60 * 1000)).toBe(
       false,
     );
@@ -305,8 +326,9 @@ describe("KnowledgeBasePollingCoordinator", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    // All duplicate triggers collapse into at most one follow-up request.
-    expect(observe).toHaveBeenCalledTimes(2);
+    // Duplicate triggers during an in-flight request do not force a follow-up
+    // unless they carry a genuinely new pending request identity.
+    expect(observe).toHaveBeenCalledTimes(1);
     expect(maxConcurrent).toBe(1);
     coordinator.dispose();
   });

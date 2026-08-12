@@ -92,6 +92,30 @@ describe("knowledge-base starter", () => {
       reservationCreated: false,
     });
   });
+
+  it("drops unsafe diagnostic fields from a start error", async () => {
+    const error = await readKnowledgeBaseStartRequestError(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: "UPSTREAM_CREATE_3 sk-secret",
+            traceId: "<provider-raw>",
+            message: "启动失败",
+            attachmentCount: 1001,
+          },
+          reservationCreated: false,
+        }),
+        {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    expect(error.code).toBeUndefined();
+    expect(error.traceId).toBeUndefined();
+    expect(error.attachmentCount).toBeUndefined();
+  });
 });
 
 describe("knowledge-base notice recovery", () => {
@@ -262,8 +286,9 @@ describe("knowledge-base notice recovery", () => {
     expect(knowledgeBaseNoticeRetryLabel(notice)).toBe("补充额度后继续本轮");
   });
 
-  it("routes a 413 failure to the dedicated attachment replacement entrance", () => {
+  it("routes only a pre-create attachment failure to the replacement entrance", () => {
     const notice = {
+      code: "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID",
       recoveryAction: "fix_attachments" as const,
       canRegenerate: false,
     };
@@ -274,6 +299,12 @@ describe("knowledge-base notice recovery", () => {
     expect(
       knowledgeBaseNoticeRetryLabel({ code: "HTTP_413", ...notice }),
     ).not.toContain("重新生成");
+    expect(
+      knowledgeBaseNoticeRequiresAttachmentRepair({
+        code: "UPSTREAM_CREATE_HTTP_413",
+        recoveryAction: "fix_attachments",
+      }),
+    ).toBe(false);
   });
 
   it("routes missing Logo provenance to the dedicated upload repair instead of retry", () => {

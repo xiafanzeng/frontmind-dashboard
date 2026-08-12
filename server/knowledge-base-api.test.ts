@@ -32,11 +32,15 @@ import {
   classifyKnowledgeBaseUpstreamCreateFailure,
   classifyKnowledgeBaseOpenRecoveryFailure,
   createFrontMindTask,
+  checkKnowledgeBasePreparedAttachments,
   deriveKnowledgeBaseInteraction,
   getKnowledgeBaseSkillDescriptor,
   knowledgeBasePinnedV4SkillSelection,
   isApprovedKnowledgeBaseAwaitingInputObservation,
   knowledgeBaseArtifactFailureNotice,
+  knowledgeBaseAttachmentRepairObservationAllowsReplacement,
+  knowledgeBaseClaimTraceId,
+  knowledgeBaseGeneratedAttachmentFailureForPersistence,
   knowledgeBaseManualLogoCreateFailureForPersistence,
   knowledgeBaseManualLogoUnclassifiedFailureResponse,
   knowledgeBaseNoticeAllowsSameTaskReconcile,
@@ -48,6 +52,7 @@ import {
   knowledgeBaseUpstreamReadFailureAuthority,
   knowledgeBaseRecoveryLogoPreparationError,
   knowledgeBaseReconcileFailureStatus,
+  knowledgeBaseRetryObservationAllowsRegeneration,
   knowledgeBaseAcceptedReservationReceipt,
   knowledgeBaseReservationReceipt,
   loadKnowledgeBaseTurnAuthority,
@@ -63,14 +68,19 @@ import {
   shouldBindKnowledgeBaseInitialLogo,
   shouldReconcileKnowledgeOutput,
   uploadKnowledgeBaseSkillArchive,
+  waitForKnowledgeBaseDispatchAttachments,
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
-import { KnowledgeBaseLocalPreparationError } from "./knowledge-base-api-errors";
+import {
+  KnowledgeBaseAttachmentsProcessingError,
+  KnowledgeBaseLocalPreparationError,
+} from "./knowledge-base-api-errors";
 import { KnowledgeBaseTurnReservationError } from "./knowledge-base-turn-service";
 import { KnowledgeBaseArtifactBindingError } from "./knowledge-base-artifact-binding-service";
 import { KnowledgeBaseBuildError } from "./knowledge-base-progress-service";
 import { knowledgeBaseLogoRepairFileIsOwned } from "./knowledge-base-logo-provenance-api";
 import { applyKnowledgeBaseFinalLogoProvenanceObservation } from "./knowledge-base-logo-provenance-repair";
+import { UpstreamTaskAttachmentContentProofError } from "./upstream-task-attachment";
 
 function expectEnterpriseIdentityError(
   action: () => unknown,
@@ -92,6 +102,178 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(knowledgeBaseTurnReplayHttpStatus("awaiting_attachments")).toBe(200);
     expect(knowledgeBaseTurnReplayHttpStatus("completed")).toBe(200);
     expect(knowledgeBaseTurnReplayHttpStatus("terminal")).toBe(409);
+  });
+
+  it("allows retry only for one coordinate-matched authoritative regeneration notice", () => {
+    const observation = {
+      generation: 3,
+      activeTurn: {
+        id: "turn-regeneration-authority",
+        status: "failed",
+        buildGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+      },
+      notice: {
+        turnId: "turn-regeneration-authority",
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+      },
+      interaction: {
+        progress: {
+          build: {
+            id: "build-regeneration-authority",
+            revision: 7,
+            currentLeafId: "1.8",
+          },
+        },
+      },
+    } as any;
+    const authority = {
+      observation,
+      buildId: "build-regeneration-authority",
+      activeTurnId: "turn-regeneration-authority",
+      expectedGeneration: 3,
+      expectedRevision: 7,
+      expectedLeafId: "1.8",
+    };
+
+    expect(knowledgeBaseRetryObservationAllowsRegeneration(authority)).toBe(
+      true,
+    );
+    expect(
+      knowledgeBaseRetryObservationAllowsRegeneration({
+        ...authority,
+        observation: {
+          ...observation,
+          activeTurn: {
+            ...observation.activeTurn,
+            failureClass: "requires_user_fix",
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+          },
+          notice: {
+            ...observation.notice,
+            failureClass: "requires_user_fix",
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseRetryObservationAllowsRegeneration({
+        ...authority,
+        observation: {
+          ...observation,
+          activeTurn: {
+            ...observation.activeTurn,
+            createAttemptState: "rejected",
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseRetryObservationAllowsRegeneration({
+        ...authority,
+        expectedRevision: 8,
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseRetryObservationAllowsRegeneration({
+        ...authority,
+        activeTurnId: "another-turn",
+      }),
+    ).toBe(false);
+  });
+
+  it("allows attachment replacement only for an authoritative pre-create attachment failure", () => {
+    const observation = {
+      generation: 3,
+      activeTurn: {
+        id: "turn-precreate-attachment-failure",
+        status: "failed",
+        buildGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        failureClass: "requires_user_fix",
+        recoveryAction: "fix_attachments",
+        canRegenerate: false,
+        createAttemptState: "not_sent",
+      },
+      notice: {
+        turnId: "turn-precreate-attachment-failure",
+        code: "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID",
+        failureClass: "requires_user_fix",
+        recoveryAction: "fix_attachments",
+        canRegenerate: false,
+      },
+      interaction: {
+        progress: {
+          build: {
+            conversationId: "conversation-1",
+            revision: 7,
+            currentLeafId: "1.8",
+          },
+        },
+      },
+    } as any;
+    const authority = {
+      observation,
+      conversationId: "conversation-1",
+      expectedGeneration: 3,
+      expectedRevision: 7,
+      expectedLeafId: "1.8",
+    };
+
+    expect(
+      knowledgeBaseAttachmentRepairObservationAllowsReplacement(authority),
+    ).toBe(true);
+    expect(
+      knowledgeBaseAttachmentRepairObservationAllowsReplacement({
+        ...authority,
+        observation: {
+          ...observation,
+          activeTurn: {
+            ...observation.activeTurn,
+            createAttemptState: "rejected",
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseAttachmentRepairObservationAllowsReplacement({
+        ...authority,
+        observation: {
+          ...observation,
+          notice: {
+            ...observation.notice,
+            code: "UPSTREAM_CREATE_3",
+          },
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts only strict RFC4122 trace ids from durable turn authority", () => {
+    const claim = (traceId: string) =>
+      ({
+        turn: { traceId },
+        recoveryMetadata: {},
+      }) as any;
+    expect(
+      knowledgeBaseClaimTraceId(claim("a0c7502e-4c1f-4d06-8ab6-407e8a82c138")),
+    ).toBe("a0c7502e-4c1f-4d06-8ab6-407e8a82c138");
+    expect(
+      knowledgeBaseClaimTraceId(claim("a0c7502e-4c1f-0d06-8ab6-407e8a82c138")),
+    ).toBeUndefined();
+    expect(
+      knowledgeBaseClaimTraceId(claim("a0c7502e-4c1f-4d06-7ab6-407e8a82c138")),
+    ).toBeUndefined();
   });
 
   it("returns one authoritative reservation receipt without inventing a task id", () => {
@@ -153,7 +335,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
     });
   });
 
-  it("persists pre-create attachment rejection as a same-turn repair receipt", async () => {
+  it("never grants same-turn recovery after a deterministic Task Create rejection", async () => {
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
     const cancelUnprepared = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
@@ -164,27 +346,47 @@ describe("knowledge-base turn HTTP outcomes", () => {
       outcomeUnknownCode: "SHOULD_NOT_BE_USED",
     };
 
-    await expect(
-      persistKnowledgeBaseCreateFailure(
-        {
-          ...common,
-          error: new KnowledgeBaseUpstreamCreateError(
-            "deterministic",
-            "UPSTREAM_CREATE_HTTP_413",
-            413,
+    for (const [status, code] of [
+      [401, "UPSTREAM_CREATE_HTTP_401"],
+      [402, "UPSTREAM_CREATE_HTTP_402"],
+      [403, "UPSTREAM_CREATE_HTTP_403"],
+      [413, "UPSTREAM_CREATE_HTTP_413"],
+    ] as const) {
+      failDeterministically.mockClear();
+      await expect(
+        persistKnowledgeBaseCreateFailure(
+          {
+            ...common,
+            error: new KnowledgeBaseUpstreamCreateError(
+              "deterministic",
+              code,
+              status,
+            ),
+          },
+          {
+            failDeterministically,
+            cancelUnprepared,
+            markOutcomeUnknown,
+          },
+        ),
+      ).resolves.toBe("deterministic");
+      expect(failDeterministically).toHaveBeenCalledWith(
+        expect.objectContaining({
+          turnId: common.turnId,
+          failureClass: "terminal_nonregenerable",
+          recoveryAction: "contact_support",
+          canRegenerate: false,
+          createAttemptRejected: true,
+        }),
+      );
+      expect(failDeterministically).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          recoveryAction: expect.stringMatching(
+            /^(?:top_up|update_credential|fix_attachments)$/u,
           ),
-        },
-        { failDeterministically, cancelUnprepared, markOutcomeUnknown },
-      ),
-    ).resolves.toBe("deterministic");
-    expect(failDeterministically).toHaveBeenCalledWith(
-      expect.objectContaining({
-        turnId: common.turnId,
-        failureClass: "requires_user_fix",
-        recoveryAction: "fix_attachments",
-        canRegenerate: false,
-      }),
-    );
+        }),
+      );
+    }
     expect(cancelUnprepared).not.toHaveBeenCalled();
     expect(markOutcomeUnknown).not.toHaveBeenCalled();
 
@@ -197,7 +399,11 @@ describe("knowledge-base turn HTTP outcomes", () => {
           "受管附件完整性校验失败",
         ),
       },
-      { failDeterministically, cancelUnprepared, markOutcomeUnknown },
+      {
+        failDeterministically,
+        cancelUnprepared,
+        markOutcomeUnknown,
+      },
     );
     expect(failDeterministically).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -207,6 +413,113 @@ describe("knowledge-base turn HTTP outcomes", () => {
         canRegenerate: false,
       }),
     );
+  });
+
+  it("defers pending attachments for five seconds without marking task-create unknown", async () => {
+    const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
+    const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        {
+          userId: 7,
+          turnId: "turn-attachments-processing",
+          leaseToken: "lease-attachments-processing",
+          outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+          error: new KnowledgeBaseAttachmentsProcessingError(
+            6,
+            1,
+            5_000,
+            "a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
+          ),
+        },
+        {
+          deferBeforeCreate,
+          markOutcomeUnknown,
+          failDeterministically,
+        },
+      ),
+    ).resolves.toBe("retriable");
+    expect(deferBeforeCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+        recoveryDelayMs: 5_000,
+      }),
+    );
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
+    expect(failDeterministically).not.toHaveBeenCalled();
+  });
+
+  it("keeps generated-file content proof failures before task create and never asks users to repair PDFs", async () => {
+    const taskPost = vi.spyOn(axios, "post");
+    const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
+    const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const common = {
+      userId: 7,
+      turnId: "turn-generated-content-proof",
+      leaseToken: "lease-generated-content-proof",
+      outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+    };
+
+    const transient = knowledgeBaseGeneratedAttachmentFailureForPersistence(
+      new UpstreamTaskAttachmentContentProofError(
+        "transient",
+        "http_status",
+        503,
+      ),
+    );
+    expect(transient).toBeInstanceOf(KnowledgeBaseAttachmentsProcessingError);
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        { ...common, error: transient },
+        { deferBeforeCreate, markOutcomeUnknown, failDeterministically },
+      ),
+    ).resolves.toBe("retriable");
+    expect(deferBeforeCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: common.turnId,
+        code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+        recoveryDelayMs: 5_000,
+      }),
+    );
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
+    expect(failDeterministically).not.toHaveBeenCalled();
+    expect(taskPost).not.toHaveBeenCalled();
+
+    deferBeforeCreate.mockClear();
+    const deterministic = knowledgeBaseGeneratedAttachmentFailureForPersistence(
+      new UpstreamTaskAttachmentContentProofError(
+        "deterministic",
+        "sha256_mismatch",
+      ),
+    );
+    expect(deterministic).toMatchObject({
+      code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
+    });
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        { ...common, error: deterministic },
+        { deferBeforeCreate, markOutcomeUnknown, failDeterministically },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(failDeterministically).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: common.turnId,
+        code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      }),
+    );
+    expect(failDeterministically).not.toHaveBeenCalledWith(
+      expect.objectContaining({ recoveryAction: "fix_attachments" }),
+    );
+    expect(deferBeforeCreate).not.toHaveBeenCalled();
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
+    expect(taskPost).not.toHaveBeenCalled();
+    taskPost.mockRestore();
   });
 
   it("keeps Logo re-upload separate and never labels server finalization as attachment repair", async () => {
@@ -1034,7 +1347,7 @@ describe("knowledge base execution contract", () => {
     ]);
   });
 
-  it("classifies only ambiguous create outcomes for idempotent recovery", () => {
+  it("treats every ambiguous create outcome as unknown without replay authority", () => {
     for (const status of [400, 401, 403, 404, 409, 413, 422]) {
       expect(classifyKnowledgeBaseUpstreamCreateFailure({ status })).toBe(
         "deterministic",
@@ -1042,7 +1355,7 @@ describe("knowledge base execution contract", () => {
     }
     for (const status of [408, 425, 429, 500, 502, 503]) {
       expect(classifyKnowledgeBaseUpstreamCreateFailure({ status })).toBe(
-        "retriable",
+        "unknown",
       );
     }
     expect(
@@ -1050,13 +1363,13 @@ describe("knowledge base execution contract", () => {
         status: 409,
         code: "idempotency_pending",
       }),
-    ).toBe("retriable");
+    ).toBe("unknown");
     expect(
       classifyKnowledgeBaseUpstreamCreateFailure({
         status: 422,
         code: "IDEMPOTENCY_PENDING",
       }),
-    ).toBe("retriable");
+    ).toBe("unknown");
     expect(
       classifyKnowledgeBaseUpstreamCreateFailure({ transportError: true }),
     ).toBe("unknown");
@@ -1793,6 +2106,14 @@ describe("knowledge base execution contract", () => {
       status: 200,
       data: "",
     });
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        id: "skill-file-1",
+        filename: "socratic-kb-builder.skill.zip",
+        status: "uploaded",
+      },
+    });
 
     const uploaded = await uploadKnowledgeBaseSkillArchive({
       baseUrl: "https://api.example.test",
@@ -1815,7 +2136,7 @@ describe("knowledge base execution contract", () => {
     expect(put.mock.calls[0]?.[2]?.headers).not.toHaveProperty("API_KEY");
   });
 
-  it("replays the exact prepared task body with one stable idempotency key", async () => {
+  it("replays a legacy frozen task body without undocumented auth or idempotency headers", async () => {
     const requestBody = {
       prompt: "固定的恢复提示词",
       agentProfile: "manus-1.6-max",
@@ -1850,12 +2171,179 @@ describe("knowledge base execution contract", () => {
     expect(post.mock.calls[0]?.[2]).toMatchObject({
       timeout: KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
       headers: {
-        "Idempotency-Key": "frontmind-kb-v2:operation-one",
+        API_KEY: "credential-value",
       },
     });
+    expect(post.mock.calls[0]?.[2]?.headers).not.toHaveProperty(
+      "Idempotency-Key",
+    );
+    expect(post.mock.calls[0]?.[2]?.headers).not.toHaveProperty(
+      "Authorization",
+    );
   });
 
-  it("accepts wrapped create responses and rejects a 2xx response without a task id deterministically", async () => {
+  it("keeps seven or eight attachments behind both readiness barriers and preserves five-user order", async () => {
+    const userAttachments = Array.from({ length: 5 }, (_, index) => ({
+      file_id: `user-file-${index + 1}`,
+      filename: `client-${index + 1}.pdf`,
+    }));
+    const generatedAttachments = [
+      { file_id: "skill-file", filename: "skill.zip" },
+      { file_id: "instructions-file", filename: "instructions.txt" },
+      { file_id: "prefill-file", filename: "prefill.txt" },
+    ];
+    const attachments = [
+      generatedAttachments[0]!,
+      generatedAttachments[1]!,
+      ...userAttachments,
+    ];
+    let userThreePending = true;
+    const get = vi.spyOn(axios, "get").mockImplementation(async (url) => {
+      const fileId = decodeURIComponent(
+        new URL(String(url)).pathname.split("/").pop()!,
+      );
+      const userIndex = userAttachments.findIndex(
+        (attachment) => attachment.file_id === fileId,
+      );
+      const generated = generatedAttachments.find(
+        (attachment) => attachment.file_id === fileId,
+      );
+      return {
+        status: 200,
+        data: {
+          id: fileId,
+          filename:
+            userIndex >= 0
+              ? `provider-${userIndex + 1}.pdf`
+              : generated?.filename,
+          status:
+            fileId === "user-file-3" && userThreePending
+              ? "pending"
+              : "uploaded",
+        },
+      } as any;
+    });
+    const post = vi.spyOn(axios, "post");
+    const claim = {
+      turn: {
+        id: "turn-seven-attachments",
+        buildId: "build-seven-attachments",
+        traceId: "a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
+      },
+      recoveryMetadata: { attachments: userAttachments },
+    } as any;
+    const credential = { apiKey: "credential-value" } as any;
+
+    await expect(
+      waitForKnowledgeBaseDispatchAttachments({
+        claim,
+        credential,
+        baseUrl: "https://api.example.test",
+        attachments,
+        readinessDeadlineMs: 0,
+      }),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+      pendingCount: 1,
+    });
+    expect(post).not.toHaveBeenCalled();
+
+    userThreePending = false;
+    const canonical = await waitForKnowledgeBaseDispatchAttachments({
+      claim,
+      credential,
+      baseUrl: "https://api.example.test",
+      attachments,
+      readinessDeadlineMs: 0,
+    });
+    expect(canonical.map((attachment) => attachment.file_id)).toEqual(
+      attachments.map((attachment) => attachment.file_id),
+    );
+    expect(canonical.slice(2).map((attachment) => attachment.filename)).toEqual(
+      Array.from({ length: 5 }, (_, index) => `provider-${index + 1}.pdf`),
+    );
+    const dispatch = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "documented task body",
+        agentProfile: "manus-1.6-max",
+        attachments: canonical,
+      },
+      bodySha256: "d".repeat(64),
+      preparedAt: "2026-08-11T00:00:00.000Z",
+    };
+    await checkKnowledgeBasePreparedAttachments({
+      claim,
+      credential,
+      dispatch,
+    });
+    post.mockResolvedValue({
+      status: 201,
+      data: { id: "task-seven-attachments", status: "running" },
+    });
+    await expect(
+      createFrontMindTask({
+        baseUrl: dispatch.baseUrl,
+        apiKey: credential.apiKey,
+        requestBody: dispatch.requestBody,
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]?.[1]).toEqual(dispatch.requestBody);
+    expect(Object.keys(post.mock.calls[0]?.[1] as object).sort()).toEqual([
+      "agentProfile",
+      "attachments",
+      "prompt",
+    ]);
+
+    post.mockClear();
+    const eightAttachments = [
+      generatedAttachments[0]!,
+      generatedAttachments[2]!,
+      generatedAttachments[1]!,
+      ...userAttachments,
+    ];
+    const canonicalWithPrefill = await waitForKnowledgeBaseDispatchAttachments({
+      claim,
+      credential,
+      baseUrl: "https://api.example.test",
+      attachments: eightAttachments,
+      readinessDeadlineMs: 0,
+    });
+    expect(
+      canonicalWithPrefill.map((attachment) => attachment.file_id),
+    ).toEqual(eightAttachments.map((attachment) => attachment.file_id));
+    expect(
+      canonicalWithPrefill.slice(3).map((attachment) => attachment.filename),
+    ).toEqual(
+      Array.from({ length: 5 }, (_, index) => `provider-${index + 1}.pdf`),
+    );
+    const prefillDispatch = {
+      ...dispatch,
+      requestBody: {
+        ...dispatch.requestBody,
+        attachments: canonicalWithPrefill,
+      },
+    };
+    await checkKnowledgeBasePreparedAttachments({
+      claim,
+      credential,
+      dispatch: prefillDispatch,
+    });
+    await expect(
+      createFrontMindTask({
+        baseUrl: prefillDispatch.baseUrl,
+        apiKey: credential.apiKey,
+        requestBody: prefillDispatch.requestBody,
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]?.[1]).toEqual(prefillDispatch.requestBody);
+    expect(get).toHaveBeenCalled();
+  });
+
+  it("accepts wrapped create responses and fails closed on a 2xx response without a task id", async () => {
     const post = vi
       .spyOn(axios, "post")
       .mockResolvedValueOnce({
@@ -1908,31 +2396,36 @@ describe("knowledge base execution contract", () => {
     {
       status: 425,
       data: { error: { code: "IDEMPOTENCY_PENDING" } },
-      expectedFailureClass: "retriable",
+      expectedFailureClass: "unknown",
+      expectedFailureCode: "UPSTREAM_CREATE_HTTP_425",
     },
     {
       status: 409,
       data: { error: { code: "IDEMPOTENCY_PENDING" } },
-      expectedFailureClass: "retriable",
+      expectedFailureClass: "unknown",
+      expectedFailureCode: "UPSTREAM_CREATE_HTTP_409",
     },
     {
       status: 409,
       data: { error: { code: "TASK_STATE_CONFLICT" } },
       expectedFailureClass: "deterministic",
+      expectedFailureCode: "UPSTREAM_CREATE_HTTP_409",
     },
     {
       status: 422,
       data: { error: { code: "IDEMPOTENCY_PENDING" } },
-      expectedFailureClass: "retriable",
+      expectedFailureClass: "unknown",
+      expectedFailureCode: "UPSTREAM_CREATE_HTTP_422",
     },
     {
       status: 422,
       data: { error: { code: "INVALID_ATTACHMENT" } },
       expectedFailureClass: "deterministic",
+      expectedFailureCode: "UPSTREAM_CREATE_HTTP_422",
     },
   ] as const)(
     "classifies upstream HTTP $status as $expectedFailureClass only from its explicit contract",
-    async ({ status, data, expectedFailureClass }) => {
+    async ({ status, data, expectedFailureClass, expectedFailureCode }) => {
       vi.spyOn(axios, "post").mockResolvedValue({ status, data });
 
       await expect(
@@ -1946,10 +2439,82 @@ describe("knowledge base execution contract", () => {
         ok: false,
         status,
         failureClass: expectedFailureClass,
-        failureCode: `UPSTREAM_CREATE_${data.error.code}`,
+        failureCode: expectedFailureCode,
       });
     },
   );
+
+  it("keeps numeric provider code 3 but never persists an arbitrary provider code", async () => {
+    const post = vi
+      .spyOn(axios, "post")
+      .mockResolvedValueOnce({
+        status: 400,
+        data: { error: { code: 3, message: "invalid argument" } },
+      })
+      .mockResolvedValueOnce({
+        status: 422,
+        data: {
+          error: {
+            code: "FILE_ID_CUSTOMER_SECRET_ABC123",
+            message: "attachment rejected",
+          },
+        },
+      });
+
+    const numeric = await createFrontMindTask({
+      baseUrl: "https://api.example.test",
+      apiKey: "credential-value",
+      prompt: "numeric provider code",
+    });
+    expect(numeric).toMatchObject({
+      ok: false,
+      failureCode: "UPSTREAM_CREATE_3",
+      reasonCategory: "UNKNOWN_INVALID_ARGUMENT",
+    });
+
+    const malicious = await createFrontMindTask({
+      baseUrl: "https://api.example.test",
+      apiKey: "credential-value",
+      prompt: "untrusted provider code",
+    });
+    expect(malicious).toMatchObject({
+      ok: false,
+      failureCode: "UPSTREAM_CREATE_HTTP_422",
+      reasonCategory: "ATTACHMENT_INVALID",
+    });
+    expect(JSON.stringify(malicious)).not.toContain(
+      "FILE_ID_CUSTOMER_SECRET_ABC123",
+    );
+
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    await persistKnowledgeBaseCreateFailure(
+      {
+        userId: 7,
+        turnId: "turn-provider-code-safety",
+        leaseToken: "lease-provider-code-safety",
+        outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+        error: new KnowledgeBaseUpstreamCreateError(
+          (malicious as any).failureClass,
+          (malicious as any).failureCode,
+          (malicious as any).status,
+          (malicious as any).reasonCategory,
+        ),
+      },
+      { failDeterministically, markOutcomeUnknown },
+    );
+    expect(failDeterministically).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "UPSTREAM_CREATE_HTTP_422",
+        recoveryAction: "contact_support",
+      }),
+    );
+    expect(JSON.stringify(failDeterministically.mock.calls)).not.toContain(
+      "FILE_ID_CUSTOMER_SECRET_ABC123",
+    );
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
+    expect(post).toHaveBeenCalledTimes(2);
+  });
 
   it("recovers a POST accepted before bind without creating a second logical task", async () => {
     const calls: string[] = [];
@@ -2001,7 +2566,7 @@ describe("knowledge base execution contract", () => {
     ]);
   });
 
-  it("retries an upstream 425 with the same manual Logo reservation and provider idempotency key", async () => {
+  it("never retries a task create after its outcome becomes unknown", async () => {
     const dispatch = {
       schemaVersion: 1 as const,
       baseUrl: "https://api.example.test",
@@ -2018,16 +2583,14 @@ describe("knowledge base execution contract", () => {
       turn: { upstreamTaskId: null },
       upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo-stable-request",
     } as any;
-    const createTask = vi
-      .fn()
-      .mockRejectedValueOnce(
-        new KnowledgeBaseUpstreamCreateError(
-          "retriable",
-          "UPSTREAM_CREATE_HTTP_425",
-          425,
-        ),
-      )
-      .mockResolvedValueOnce({ taskId: "manual-logo-task" });
+    const createTask = vi.fn().mockImplementationOnce(async () => {
+      claim.turn.createAttemptState = "unknown";
+      throw new KnowledgeBaseUpstreamCreateError(
+        "unknown",
+        "UPSTREAM_CREATE_HTTP_425",
+        425,
+      );
+    });
     const bindTask = vi.fn().mockImplementation(async (taskId: string) => {
       claim.turn.upstreamTaskId = taskId;
     });
@@ -2044,24 +2607,21 @@ describe("knowledge base execution contract", () => {
       });
 
     await expect(recover()).rejects.toMatchObject({
-      failureClass: "retriable",
+      failureClass: "unknown",
       failureCode: "UPSTREAM_CREATE_HTTP_425",
       status: 425,
     });
-    await expect(recover()).resolves.toEqual({
-      taskId: "manual-logo-task",
-      rebound: true,
-      reconciled: false,
+    await expect(recover()).rejects.toMatchObject({
+      failureClass: "unknown",
+      failureCode: "UPSTREAM_CREATE_ATTEMPT_ALREADY_CONSUMED",
     });
-    expect(createTask).toHaveBeenCalledTimes(2);
+    expect(createTask).toHaveBeenCalledTimes(1);
     expect(createTask.mock.calls.map((call) => call[1])).toEqual([
-      claim.upstreamIdempotencyKey,
       claim.upstreamIdempotencyKey,
     ]);
     expect(createTask.mock.calls[0]?.[0]).toBe(dispatch);
-    expect(createTask.mock.calls[1]?.[0]).toBe(dispatch);
-    expect(bindTask).toHaveBeenCalledOnce();
-    expect(registerTask).toHaveBeenCalledWith("manual-logo-task");
+    expect(bindTask).not.toHaveBeenCalled();
+    expect(registerTask).not.toHaveBeenCalled();
   });
 
   it("runs manual Logo promotion only after the real task is created, bound, and registered", async () => {
@@ -2158,6 +2718,32 @@ describe("knowledge base execution contract", () => {
         claim: {
           turn: { upstreamTaskId: null },
           upstreamIdempotencyKey: "frontmind-kb-v2:logo-recovery",
+        } as any,
+        ensureDispatch: vi.fn().mockRejectedValue(preparationError),
+        createTask,
+        bindTask,
+        registerTask,
+        reconcileTask,
+      }),
+    ).rejects.toBe(preparationError);
+    expect(createTask).not.toHaveBeenCalled();
+    expect(bindTask).not.toHaveBeenCalled();
+    expect(registerTask).not.toHaveBeenCalled();
+    expect(reconcileTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unclassified ensure-dispatch failure before task create", async () => {
+    const preparationError = new Error("pre-create dependency unavailable");
+    const createTask = vi.fn();
+    const bindTask = vi.fn();
+    const registerTask = vi.fn();
+    const reconcileTask = vi.fn();
+
+    await expect(
+      recoverKnowledgeBaseTurnClaimTask({
+        claim: {
+          turn: { upstreamTaskId: null, createAttemptState: "not_sent" },
+          upstreamIdempotencyKey: "frontmind-kb-v2:pre-create-generic",
         } as any,
         ensureDispatch: vi.fn().mockRejectedValue(preparationError),
         createTask,

@@ -62,10 +62,14 @@ import { deliveryTicketPresentationTitle } from "../shared/delivery-ticket-prese
 import { deliverySummaryLooksLikeCredentialSecret } from "../shared/delivery-ticket-security";
 import type { WorkspaceQuestionCategory } from "../shared/service-portal";
 import {
+  acquireActiveApiCredentialDeletionFence,
   AuthServiceError,
+  completeActiveApiCredentialDeletionFence,
   createManagedUser,
   deleteActiveApiCredentialInTransaction,
   replaceApiCredentialInTransaction,
+  rollbackActiveApiCredentialDeletionFence,
+  startActiveApiCredentialDeletionFenceHeartbeat,
   validateUpstreamApiKey,
   type AuthenticatedUser,
 } from "./auth-service";
@@ -5902,54 +5906,78 @@ export async function revokeDeliveryMemberCredential(input: {
 }) {
   requireDeliveryManager(input.actor);
   requireSystemAdminCredentialManagement(input.actor);
+  const fence = await acquireActiveApiCredentialDeletionFence(
+    input.memberUserId,
+  );
+  if (!fence) {
+    throw new AuthServiceError("CONFLICT", "工程师 API Key 尚未配置");
+  }
   const db = await requireDb();
-  return db.transaction(async (tx) => {
-    const scope = await requireEngineerCredentialManagement({
-      executor: tx,
-      actor: input.actor,
-      engineerUserId: input.memberUserId,
-    });
-    const credentialRows = await tx
-      .select()
-      .from(apiCredentials)
-      .where(eq(apiCredentials.userId, input.memberUserId))
-      .orderBy(desc(apiCredentials.version))
-      .limit(1)
-      .for("update");
-    const latest = credentialRows[0];
-    const previous = latest?.status === "active" ? latest : undefined;
-    const actualVersion = latest?.version ?? 0;
-    assertDeliveryMemberCredentialVersion({
-      actualVersion,
-      expectedVersion: input.expectedVersion,
-    });
-    if (!previous) {
-      throw new AuthServiceError("CONFLICT", "工程师 API Key 尚未配置");
-    }
-    const deletion = await deleteActiveApiCredentialInTransaction({
-      executor: tx,
-      userId: input.memberUserId,
-    });
-    await writeWorkspaceAuditEvent(
-      {
+  const stopFenceHeartbeat =
+    startActiveApiCredentialDeletionFenceHeartbeat(fence);
+  let transactionCommitted = false;
+  try {
+    const result = await db.transaction(async (tx) => {
+      const scope = await requireEngineerCredentialManagement({
+        executor: tx,
         actor: input.actor,
-        action: "delivery.engineer_credential.revoked",
-        targetType: "user",
-        targetId: input.memberUserId,
-        workspaceUserId: null,
-        metadata: {
-          previouslyConfigured: Boolean(previous),
-          previousVersion: actualVersion,
-          credentialVersion: deletion.version,
-          configured: false,
-          managerAdminIds: scope.managerAdminIds,
-          affectedCustomerUserIds: scope.customerUserIds,
+        engineerUserId: input.memberUserId,
+      });
+      const credentialRows = await tx
+        .select()
+        .from(apiCredentials)
+        .where(eq(apiCredentials.userId, input.memberUserId))
+        .orderBy(desc(apiCredentials.version))
+        .limit(1)
+        .for("update");
+      const latest = credentialRows[0];
+      const previous = latest?.status === "active" ? latest : undefined;
+      const actualVersion = latest?.version ?? 0;
+      assertDeliveryMemberCredentialVersion({
+        actualVersion,
+        expectedVersion: input.expectedVersion,
+      });
+      if (!previous) {
+        throw new AuthServiceError("CONFLICT", "工程师 API Key 尚未配置");
+      }
+      const deletion = await deleteActiveApiCredentialInTransaction({
+        executor: tx,
+        userId: input.memberUserId,
+        fenceToken: fence,
+      });
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery.engineer_credential.revoked",
+          targetType: "user",
+          targetId: input.memberUserId,
+          workspaceUserId: null,
+          metadata: {
+            previouslyConfigured: Boolean(previous),
+            previousVersion: actualVersion,
+            credentialVersion: deletion.version,
+            configured: false,
+            managerAdminIds: scope.managerAdminIds,
+            affectedCustomerUserIds: scope.customerUserIds,
+          },
         },
-      },
-      tx,
-    );
-    return { success: true as const };
-  });
+        tx,
+      );
+      return { success: true as const };
+    });
+    transactionCommitted = true;
+    await stopFenceHeartbeat();
+    await completeActiveApiCredentialDeletionFence(fence);
+    return result;
+  } catch (error) {
+    await stopFenceHeartbeat().catch(() => undefined);
+    if (!transactionCommitted) {
+      await rollbackActiveApiCredentialDeletionFence(fence).catch(
+        () => undefined,
+      );
+    }
+    throw error;
+  }
 }
 
 async function requireDeliveryAdminCredentialTarget(input: {
@@ -6039,50 +6067,74 @@ export async function revokeDeliveryAdminCredential(input: {
 }) {
   requireDeliveryManager(input.actor);
   requireSystemAdminCredentialManagement(input.actor);
+  const fence = await acquireActiveApiCredentialDeletionFence(
+    input.adminUserId,
+  );
+  if (!fence) {
+    throw new AuthServiceError("CONFLICT", "交付管理员 API Key 尚未配置");
+  }
   const db = await requireDb();
-  return db.transaction(async (tx) => {
-    await requireDeliveryAdminCredentialTarget({
-      executor: tx,
-      adminUserId: input.adminUserId,
+  const stopFenceHeartbeat =
+    startActiveApiCredentialDeletionFenceHeartbeat(fence);
+  let transactionCommitted = false;
+  try {
+    const result = await db.transaction(async (tx) => {
+      await requireDeliveryAdminCredentialTarget({
+        executor: tx,
+        adminUserId: input.adminUserId,
+      });
+      const credentialRows = await tx
+        .select()
+        .from(apiCredentials)
+        .where(eq(apiCredentials.userId, input.adminUserId))
+        .orderBy(desc(apiCredentials.version))
+        .limit(1)
+        .for("update");
+      const latest = credentialRows[0];
+      const actualVersion = latest?.version ?? 0;
+      if (actualVersion !== input.expectedVersion) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "交付管理员 API Key 状态已变化，请刷新后重试",
+        );
+      }
+      if (latest?.status !== "active") {
+        throw new AuthServiceError("CONFLICT", "交付管理员 API Key 尚未配置");
+      }
+      const deletion = await deleteActiveApiCredentialInTransaction({
+        executor: tx,
+        userId: input.adminUserId,
+        fenceToken: fence,
+      });
+      await writeWorkspaceAuditEvent(
+        {
+          actor: input.actor,
+          action: "delivery.admin_credential.revoked",
+          targetType: "user",
+          targetId: input.adminUserId,
+          workspaceUserId: null,
+          metadata: {
+            previouslyConfigured: true,
+            previousVersion: actualVersion,
+            credentialVersion: deletion.version,
+            configured: false,
+          },
+        },
+        tx,
+      );
+      return { success: true as const };
     });
-    const credentialRows = await tx
-      .select()
-      .from(apiCredentials)
-      .where(eq(apiCredentials.userId, input.adminUserId))
-      .orderBy(desc(apiCredentials.version))
-      .limit(1)
-      .for("update");
-    const latest = credentialRows[0];
-    const actualVersion = latest?.version ?? 0;
-    if (actualVersion !== input.expectedVersion) {
-      throw new AuthServiceError(
-        "CONFLICT",
-        "交付管理员 API Key 状态已变化，请刷新后重试",
+    transactionCommitted = true;
+    await stopFenceHeartbeat();
+    await completeActiveApiCredentialDeletionFence(fence);
+    return result;
+  } catch (error) {
+    await stopFenceHeartbeat().catch(() => undefined);
+    if (!transactionCommitted) {
+      await rollbackActiveApiCredentialDeletionFence(fence).catch(
+        () => undefined,
       );
     }
-    if (latest?.status !== "active") {
-      throw new AuthServiceError("CONFLICT", "交付管理员 API Key 尚未配置");
-    }
-    const deletion = await deleteActiveApiCredentialInTransaction({
-      executor: tx,
-      userId: input.adminUserId,
-    });
-    await writeWorkspaceAuditEvent(
-      {
-        actor: input.actor,
-        action: "delivery.admin_credential.revoked",
-        targetType: "user",
-        targetId: input.adminUserId,
-        workspaceUserId: null,
-        metadata: {
-          previouslyConfigured: true,
-          previousVersion: actualVersion,
-          credentialVersion: deletion.version,
-          configured: false,
-        },
-      },
-      tx,
-    );
-    return { success: true as const };
-  });
+    throw error;
+  }
 }

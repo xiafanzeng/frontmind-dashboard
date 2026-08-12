@@ -63,6 +63,21 @@ export class KnowledgeBaseOpenRecoveryLeaseError extends Error {
 export const KNOWLEDGE_BASE_AGENT_PROFILE = "frontmind-pro" as const;
 export const KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS = 120_000;
 
+export class KnowledgeBaseAttachmentsProcessingError extends Error {
+  readonly code = "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING";
+
+  constructor(
+    public readonly readyCount: number,
+    public readonly pendingCount: number,
+    public readonly retryAfterMs = 5_000,
+    public readonly traceId?: string,
+    options?: ErrorOptions,
+  ) {
+    super("Knowledge-base attachments are still processing upstream", options);
+    this.name = "KnowledgeBaseAttachmentsProcessingError";
+  }
+}
+
 export type KnowledgeBaseUpstreamCreateFailureClass =
   | "deterministic"
   | "retriable"
@@ -76,8 +91,9 @@ export function classifyKnowledgeBaseUpstreamCreateFailure(input: {
   transportError?: boolean;
 }): KnowledgeBaseUpstreamCreateFailureClass {
   // A successful HTTP response without a readable id may have created the
-  // task while returning a partial body. Preserve the same idempotency key and
-  // let recovery reconcile it; never invite a second logical turn.
+  // task while returning a partial body. There is no documented provider
+  // idempotency or lookup authority, so fail closed as unknown and never POST
+  // this logical turn again.
   if (input.missingTaskId) return "unknown";
   if (input.transportError) return "unknown";
   const status = Number(input.status);
@@ -85,20 +101,39 @@ export function classifyKnowledgeBaseUpstreamCreateFailure(input: {
   const code = String(input.code || "")
     .trim()
     .toUpperCase();
+  // The provider task-create endpoint has no documented idempotency contract.
+  // A timeout, throttle, or 5xx response may therefore hide an accepted task;
+  // retaining the same logical turn is safe, but issuing another POST is not.
   return code === "IDEMPOTENCY_PENDING" ||
     status === 408 ||
     status === 425 ||
     status === 429 ||
     status >= 500
-    ? "retriable"
+    ? "unknown"
     : "deterministic";
 }
+
+export type KnowledgeBaseProviderReasonCategory =
+  | "ATTACHMENT_NOT_READY"
+  | "ATTACHMENT_INVALID"
+  | "PAYLOAD_INVALID"
+  | "PROFILE_INVALID"
+  | "CREDENTIAL_REJECTED"
+  | "QUOTA_REJECTED"
+  | "UPSTREAM_UNAVAILABLE"
+  | "UNKNOWN_INVALID_ARGUMENT"
+  | "UNKNOWN_PROVIDER_REJECTION"
+  | "TASK_ID_MISSING"
+  | "TRANSPORT_UNKNOWN";
 
 export class KnowledgeBaseUpstreamCreateError extends Error {
   constructor(
     public readonly failureClass: KnowledgeBaseUpstreamCreateFailureClass,
     public readonly failureCode: string,
     public readonly status?: number,
+    public readonly reasonCategory?: KnowledgeBaseProviderReasonCategory,
+    public readonly providerRequestRef?: string,
+    public readonly traceId?: string,
   ) {
     super("Knowledge-base upstream task creation failed");
     this.name = "KnowledgeBaseUpstreamCreateError";

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   deliveryProjectAssignments,
@@ -10,6 +10,7 @@ import {
   jenovaBrandTrackingAssignments,
   jenovaBrandTrackingPolicies,
   jenovaBrandTrackingTurns,
+  users,
 } from "../drizzle/schema";
 import type { AuthenticatedUser } from "./auth-service";
 import { JenovaClientError } from "./jenova-brand-tracking-client";
@@ -21,6 +22,7 @@ import {
   assertCanManageJenovaBrandTrackingLimit,
   assertJenovaCredentialPoolCapacity,
   assertJenovaBrandTrackingSystemAdmin,
+  buildJenovaBrandTrackingKickoff,
   buildJenovaBrandTrackingUsageDto,
   classifyJenovaTurnCompletion,
   findRecoveredJenovaMessage,
@@ -30,14 +32,61 @@ import {
   jenovaErrorIdentity,
   jenovaCredentialFingerprint,
   jenovaRejectedUsageCost,
+  normalizeJenovaBrandTrackingIdentity,
   projectedJenovaActiveCredentialCount,
   recoverJenovaBrandTrackingTurns,
   resolveJenovaCredentialTicketsToComplete,
+  startJenovaBrandTrackingSession,
   toJenovaBrandTrackingAuthError,
   updateJenovaBrandTrackingLimit,
 } from "./jenova-brand-tracking-service";
 
 const now = new Date("2026-08-09T12:00:00.000Z");
+
+function newSessionReplayDatabase(replayRow?: Record<string, unknown>) {
+  const insert = vi.fn(() => {
+    throw new Error("unexpected brand-tracking insert");
+  });
+  const update = vi.fn(() => {
+    throw new Error("unexpected brand-tracking update");
+  });
+  const database: any = {
+    insert,
+    update,
+    transaction: async (callback: (tx: unknown) => unknown) =>
+      callback(database),
+    select: () => {
+      let table: unknown;
+      const chain: any = {
+        from: (value: unknown) => {
+          table = value;
+          return chain;
+        },
+        innerJoin: () => chain,
+        where: () => chain,
+        limit: () => chain,
+        for: async () => {
+          if (table === users) {
+            return [
+              {
+                id: 7,
+                role: "user",
+                isActive: true,
+                marketEdition: "overseas",
+              },
+            ];
+          }
+          if (table === jenovaBrandTrackingTurns) {
+            return replayRow ? [replayRow] : [];
+          }
+          throw new Error("unexpected brand-tracking select");
+        },
+      };
+      return chain;
+    },
+  };
+  return { database, insert, update };
+}
 
 function actor(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
   return {
@@ -82,6 +131,119 @@ function usageNumbers(
 }
 
 describe("Jenova Brand Tracker service invariants", () => {
+  it("normalizes the dashboard brand and builds the exact hidden kickoff", () => {
+    expect(
+      normalizeJenovaBrandTrackingIdentity("  Ｆｒｏｎｔ\n\u0000  Mind  "),
+    ).toBe("Front Mind");
+    expect(buildJenovaBrandTrackingKickoff("  示例\t品牌  ")).toBe(
+      [
+        "请按以下设置直接启动品牌追踪：",
+        "1. 要追踪的品牌、产品或公司名称：示例 品牌",
+        "2. 名称变体：不确定",
+        "3. 平台：全部",
+        "4. 时间范围：过去7天",
+      ].join("\n"),
+    );
+    expect(() => buildJenovaBrandTrackingKickoff("\n\u0000\t")).toThrowError(
+      expect.objectContaining({
+        code: "BRAND_IDENTITY_REQUIRED",
+        statusCode: 422,
+      }),
+    );
+    expect(() =>
+      buildJenovaBrandTrackingKickoff("品".repeat(161)),
+    ).toThrowError(
+      expect.objectContaining({ code: "BRAND_IDENTITY_REQUIRED" }),
+    );
+  });
+
+  it("fails closed on a missing dashboard brand before turns, spend, or upstream work", async () => {
+    const { database, insert, update } = newSessionReplayDatabase();
+    const getDashboardWorkspace = vi.fn(async () => ({
+      payload: { brandName: "\n\u0000\t" },
+    }));
+    const streamMessage = vi.fn();
+
+    await expect(
+      startJenovaBrandTrackingSession({
+        actor: actor(),
+        clientRequestId: "11111111-1111-4111-8111-111111111111",
+        emit: vi.fn(),
+        dependencies: {
+          getDatabase: async () => database as never,
+          getDashboardWorkspace: getDashboardWorkspace as never,
+          client: {
+            validateKey: vi.fn(),
+            getBalance: vi.fn(),
+            streamMessage,
+            getSessionRun: vi.fn(),
+            listSessionMessages: vi.fn(),
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "BRAND_IDENTITY_REQUIRED",
+      statusCode: 422,
+    });
+
+    expect(getDashboardWorkspace).toHaveBeenCalledWith(7);
+    expect(insert).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(streamMessage).not.toHaveBeenCalled();
+  });
+
+  it("replays a frozen legacy kickoff without rereading a changed dashboard brand", async () => {
+    const replayRow = {
+      turn: {
+        id: "turn-legacy",
+        sessionId: "session-legacy",
+        userId: 7,
+        hiddenKickoff: true,
+        userContent: "开始品牌追踪",
+        assistantContent: "已恢复旧会话",
+        status: "completed",
+        costState: "confirmed",
+        usageCost: "0.02000000",
+        sessionFee: "0.01000000",
+        createdAt: now,
+      },
+      session: {
+        id: "session-legacy",
+        title: "品牌追踪会话",
+        status: "active",
+      },
+      credential: { id: "credential-legacy" },
+    };
+    const { database, insert, update } = newSessionReplayDatabase(replayRow);
+    const getDashboardWorkspace = vi.fn();
+    const emit = vi.fn();
+
+    await startJenovaBrandTrackingSession({
+      actor: actor(),
+      clientRequestId: "11111111-1111-4111-8111-111111111111",
+      emit,
+      dependencies: {
+        getDatabase: async () => database as never,
+        getDashboardWorkspace: getDashboardWorkspace as never,
+      },
+    });
+
+    expect(getDashboardWorkspace).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "delta" }),
+    );
+    expect(emit).toHaveBeenLastCalledWith({
+      event: "end",
+      data: {
+        sessionId: "session-legacy",
+        messageId: "turn-legacy:assistant",
+        status: "completed",
+      },
+    });
+  });
+
   it("allows only active system administrators to configure Jenova keys", () => {
     expect(() =>
       assertJenovaBrandTrackingSystemAdmin(

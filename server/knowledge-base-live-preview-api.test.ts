@@ -487,6 +487,17 @@ describe("knowledge-base live preview prompt delivery", () => {
         return { status: 200, data: "" } as any;
       },
     );
+    const get = vi.spyOn(axios, "get").mockImplementation(async (url) => {
+      const fileId = new URL(String(url)).pathname.split("/").pop()!;
+      return {
+        status: 200,
+        data: {
+          id: fileId,
+          filename: filenameByFileId.get(fileId),
+          status: "uploaded",
+        },
+      } as any;
+    });
     vi.spyOn(axios, "delete").mockResolvedValue({
       status: 204,
       data: "",
@@ -537,11 +548,19 @@ describe("knowledge-base live preview prompt delivery", () => {
     expect(instructionTexts[0]).toContain("超长规则仍只进入系统附件的测试企业");
     expect(instructionTexts[1]).toContain("当前 revision=0");
     expect(instructionTexts[1]).toContain("FRONTMIND_KB_PROGRESS");
+    expect(get).toHaveBeenCalled();
+    for (const [, config] of get.mock.calls) {
+      expect(config?.headers).toMatchObject({
+        API_KEY: "live-preview-test-key",
+      });
+      expect(config?.headers).not.toHaveProperty("Authorization");
+    }
   });
 
   it("deletes both generated files when start task creation is rejected", async () => {
     process.env.NODE_ENV = "development";
     let fileSequence = 0;
+    const filenameByFileId = new Map<string, string>();
     const taskBodies: Array<Record<string, any>> = [];
     const remove = vi.spyOn(axios, "delete").mockResolvedValue({
       status: 204,
@@ -551,6 +570,10 @@ describe("knowledge-base live preview prompt delivery", () => {
       async (url: string, body: Record<string, any>) => {
         if (url.endsWith("/v1/files")) {
           fileSequence += 1;
+          filenameByFileId.set(
+            `rejected-file-${fileSequence}`,
+            String(body.filename || ""),
+          );
           return {
             status: 201,
             data: {
@@ -567,6 +590,17 @@ describe("knowledge-base live preview prompt delivery", () => {
       },
     );
     vi.spyOn(axios, "put").mockResolvedValue({ status: 200, data: "" });
+    vi.spyOn(axios, "get").mockImplementation(async (url) => {
+      const fileId = new URL(String(url)).pathname.split("/").pop()!;
+      return {
+        status: 200,
+        data: {
+          id: fileId,
+          filename: filenameByFileId.get(fileId),
+          status: "uploaded",
+        },
+      } as any;
+    });
 
     await withLivePreviewServer(async (baseUrl) => {
       const response = await fetch(`${baseUrl}/start`, {

@@ -285,10 +285,16 @@ export interface FileRecord {
  * open starter dialog; the signed provider URL never enters the proxy query.
  */
 export type ManagedUploadHandle = {
-  fileId: string;
+  /** Stable dialog item identity. New intent uploads use their operation id. */
+  itemId?: string;
+  /** Local durable identity; it is never an upstream attachment id. */
+  intentId?: string;
+  /** Provider identity. Absent until a new intent returns an uploaded receipt. */
+  fileId?: string;
   filename: string;
   ticket: string;
   expiresAt: number;
+  operationId?: string;
 };
 
 export type UploadRecoveryAction =
@@ -299,6 +305,12 @@ export type UploadRecoveryAction =
   | "contact_admin";
 
 export type FileUploadStage =
+  | "creating_intent"
+  | "uploading_to_dashboard"
+  | "sealed"
+  | "creating_cloud_record"
+  | "uploading_to_cloud"
+  | "waiting_cloud_ready"
   | "creating_record"
   | "recovering"
   | "uploading"
@@ -309,38 +321,67 @@ export type UploadRetentionReceipt = {
   fileId: string;
   sizeBytes: number;
   uploadedAt: number;
+  providerReadyAt: number;
   expiresAt: number;
   replayed: boolean;
   recovered: boolean;
+  recreated?: boolean;
   traceId?: string;
 };
 
+export type ManagedUploadProcessing = {
+  state: "processing";
+  fileId?: string;
+  intentId?: string;
+  phase?:
+    | "receiving"
+    | "sealed"
+    | "creating_provider"
+    | "uploading_provider"
+    | "waiting_provider"
+    | "finalizing"
+    | "cleanup_pending";
+  sizeBytes: number;
+  uploadedAt?: number;
+  expiresAt?: number;
+  retryAfterMs: number;
+  traceId?: string;
+};
+
+export type ManagedUploadStatus =
+  | ManagedUploadProcessing
+  | ({ state: "uploaded" } & UploadRetentionReceipt);
+
 export type ManagedUploadRecovery =
+  | ManagedUploadProcessing
   | {
-      fileId: string;
-      state: "ready" | "restage_required";
-      recreateRequired: false;
+      state: "needs_browser_body";
+      intentId: string;
+      retryable: true;
       traceId?: string;
     }
-  | {
-      fileId: string;
+  | ({
       state: "uploaded";
-      recreateRequired: false;
       receipt: UploadRetentionReceipt;
-      traceId?: string;
-    };
+    } & UploadRetentionReceipt);
 
 export type FileUploadStageEvent = {
   stage: FileUploadStage;
+  itemId?: string;
+  intentId?: string;
   fileId?: string;
   loadedBytes?: number;
+  /** Bytes fsync-sealed by Dashboard; never inferred from browser XHR progress. */
+  dashboardReceivedBytes?: number;
   totalBytes?: number;
   receipt?: UploadRetentionReceipt;
   traceId?: string;
 };
 
 export type FileUploadRecordEvent = {
-  fileId: string;
+  itemId?: string;
+  intentId?: string;
+  fileId?: string;
   filename: string;
   uploadHandle?: ManagedUploadHandle;
   reusedExistingFileId: boolean;
@@ -354,6 +395,8 @@ export type UploadFileOptions = {
   /** One-based ephemeral batch position for safe server-side correlation. */
   batchOrdinal?: number;
   batchTotal?: number;
+  /** Stable dialog item identity. It is not a provider file id. */
+  itemId?: string;
   signal?: AbortSignal;
   /** Reuses an already-created provider file after an unknown client outcome. */
   existingFileId?: string;
@@ -388,6 +431,7 @@ export class FileUploadError extends Error {
   readonly code: FileUploadErrorCode | string;
   readonly status?: number;
   readonly fileId?: string;
+  readonly intentId?: string;
   readonly retryable: boolean;
   readonly cancelled: boolean;
   readonly traceId?: string;
@@ -400,6 +444,7 @@ export class FileUploadError extends Error {
       code: FileUploadErrorCode | string;
       status?: number;
       fileId?: string;
+      intentId?: string;
       retryable?: boolean;
       cancelled?: boolean;
       traceId?: string;
@@ -416,6 +461,7 @@ export class FileUploadError extends Error {
     this.code = input.code;
     this.status = input.status;
     this.fileId = input.fileId;
+    this.intentId = input.intentId;
     this.retryable = input.retryable ?? false;
     this.cancelled = input.cancelled ?? false;
     this.traceId = input.traceId;
@@ -1196,6 +1242,298 @@ export async function createFileRecord(
   return response.json();
 }
 
+type ManagedIntentCreateResponse = {
+  state: "awaiting_browser";
+  intentId: string;
+  intentTicket: string;
+  expiresAt: number;
+  sizeBytes: number;
+  traceId?: string;
+};
+
+function managedIntentOperationId(file: File, options: UploadFileOptions) {
+  const itemId = String(options.itemId || "").trim();
+  if (itemId) return itemId.slice(0, 255);
+  const batch = String(options.batchId || "").trim();
+  if (
+    batch &&
+    Number.isSafeInteger(options.batchOrdinal) &&
+    Number(options.batchOrdinal) >= 1
+  ) {
+    return `${batch}:${options.batchOrdinal}`.slice(0, 255);
+  }
+  const random =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `upload:${random}:${file.size}`.slice(0, 255);
+}
+
+async function createManagedIntent(
+  file: File,
+  options: UploadFileOptions,
+): Promise<ManagedUploadHandle> {
+  const operationId = managedIntentOperationId(file, options);
+  const response = await fetch("/api/frontmind/v1/managed-uploads", {
+    method: "POST",
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
+    signal: options.signal,
+    body: JSON.stringify({
+      operationId,
+      batchId: String(options.batchId || operationId),
+      ordinal: options.batchOrdinal ?? 1,
+      total: options.batchTotal ?? 1,
+      filename: options.captureFilename || file.name,
+      mimeType: file.type || "application/octet-stream",
+      sizeBytes: file.size,
+    }),
+  });
+  if (!response.ok) {
+    if (response.status === 404 || response.status === 501) {
+      let explicitlyUnsupported =
+        response.headers?.get?.("X-FrontMind-Managed-Upload-Intent") ===
+        "unsupported";
+      try {
+        const payload = (await response.clone().json()) as {
+          error?: { code?: unknown };
+        };
+        explicitlyUnsupported ||=
+          payload.error?.code === "MANAGED_UPLOAD_INTENT_UNSUPPORTED";
+      } catch {
+        // A bare 404 is not enough to switch protocols.
+      }
+      if (explicitlyUnsupported) {
+        throw new FileUploadError("服务端暂不支持本地上传记录", {
+          code: "MANAGED_UPLOAD_INTENT_UNSUPPORTED",
+          status: response.status,
+          retryable: false,
+        });
+      }
+    }
+    throw await managedUploadResponseError(
+      response,
+      "无法创建 Dashboard 本地上传记录，请稍后重试",
+      undefined,
+      true,
+    );
+  }
+  const value = (await response.json()) as Partial<ManagedIntentCreateResponse>;
+  if (
+    value.state !== "awaiting_browser" ||
+    typeof value.intentId !== "string" ||
+    !value.intentId ||
+    typeof value.intentTicket !== "string" ||
+    !value.intentTicket ||
+    value.intentTicket !== value.intentTicket.trim() ||
+    typeof value.expiresAt !== "number" ||
+    !Number.isFinite(value.expiresAt) ||
+    value.sizeBytes !== file.size
+  ) {
+    throw new FileUploadError("Dashboard 本地上传记录响应无效", {
+      code: "UPLOAD_INTENT_INVALID",
+      retryable: true,
+      recoveryAction: "refresh_page",
+    });
+  }
+  return {
+    intentId: value.intentId,
+    itemId: operationId,
+    filename: options.captureFilename || file.name,
+    ticket: value.intentTicket,
+    expiresAt: value.expiresAt,
+    operationId,
+  };
+}
+
+function managedUploadHandleIdentity(handle: ManagedUploadHandle) {
+  return handle.intentId || handle.fileId || handle.itemId || "";
+}
+
+function managedUploadErrorIdentity(handle: ManagedUploadHandle) {
+  return handle.intentId
+    ? { intentId: handle.intentId }
+    : handle.fileId
+      ? { fileId: handle.fileId }
+      : {};
+}
+
+function managedIntentPhaseStage(
+  phase: ManagedUploadProcessing["phase"],
+): FileUploadStage {
+  switch (phase) {
+    case "sealed":
+      return "sealed";
+    case "creating_provider":
+      return "creating_cloud_record";
+    case "uploading_provider":
+      return "uploading_to_cloud";
+    case "waiting_provider":
+    case "finalizing":
+    case "cleanup_pending":
+      return "waiting_cloud_ready";
+    case "receiving":
+      return "uploading_to_dashboard";
+    default:
+      return "waiting_cloud_ready";
+  }
+}
+
+function managedIntentPhaseProvesLocalSeal(
+  phase: ManagedUploadProcessing["phase"],
+) {
+  return Boolean(phase && phase !== "receiving");
+}
+
+function parseManagedIntentStatus(
+  input: unknown,
+  handle: ManagedUploadHandle,
+  file: File,
+): ManagedUploadRecovery {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new FileUploadError("本地上传状态响应无效", {
+      code: "UPLOAD_RECOVERY_INVALID",
+      ...managedUploadErrorIdentity(handle),
+      retryable: true,
+      recoveryAction: "check_status",
+    });
+  }
+  const value = input as Record<string, unknown>;
+  const traceId =
+    typeof value.traceId === "string" && value.traceId.trim()
+      ? value.traceId.trim()
+      : undefined;
+  if (value.intentId !== handle.intentId || !handle.intentId) {
+    throw new FileUploadError("本地上传身份与当前文件不匹配", {
+      code: "UPLOAD_RECOVERY_INVALID",
+      ...managedUploadErrorIdentity(handle),
+      retryable: false,
+      traceId,
+      recoveryAction: "refresh_page",
+    });
+  }
+  if (value.state === "needs_browser_body") {
+    return {
+      state: "needs_browser_body",
+      intentId: handle.intentId,
+      retryable: true,
+      ...(traceId ? { traceId } : {}),
+    };
+  }
+  if (value.state === "processing") {
+    const phase = String(value.phase || "") as ManagedUploadProcessing["phase"];
+    if (
+      ![
+        "receiving",
+        "sealed",
+        "creating_provider",
+        "uploading_provider",
+        "waiting_provider",
+        "finalizing",
+        "cleanup_pending",
+      ].includes(String(phase)) ||
+      value.sizeBytes !== file.size ||
+      typeof value.retryAfterMs !== "number" ||
+      !Number.isFinite(value.retryAfterMs)
+    ) {
+      throw new FileUploadError("本地上传状态响应无效", {
+        code: "UPLOAD_RECOVERY_INVALID",
+        ...managedUploadErrorIdentity(handle),
+        retryable: true,
+        traceId,
+        recoveryAction: "check_status",
+      });
+    }
+    return {
+      state: "processing",
+      intentId: handle.intentId,
+      phase,
+      sizeBytes: file.size,
+      retryAfterMs: Math.min(
+        MANAGED_UPLOAD_RETRY_MAX_MS,
+        Math.max(MANAGED_UPLOAD_RETRY_MIN_MS, value.retryAfterMs),
+      ),
+      ...(traceId ? { traceId } : {}),
+    };
+  }
+  if (value.state !== "uploaded") {
+    throw new FileUploadError("本地上传状态响应无效", {
+      code: "UPLOAD_RECOVERY_INVALID",
+      ...managedUploadErrorIdentity(handle),
+      retryable: true,
+      traceId,
+      recoveryAction: "check_status",
+    });
+  }
+  const fileId = typeof value.fileId === "string" ? value.fileId : "";
+  if (
+    !fileId ||
+    value.sizeBytes !== file.size ||
+    typeof value.uploadedAt !== "number" ||
+    typeof value.providerReadyAt !== "number" ||
+    typeof value.expiresAt !== "number" ||
+    typeof value.replayed !== "boolean" ||
+    typeof value.recreated !== "boolean"
+  ) {
+    throw new FileUploadError("云端上传回执无效", {
+      code: "UPLOAD_RECEIPT_INVALID",
+      ...managedUploadErrorIdentity(handle),
+      retryable: true,
+      traceId,
+      recoveryAction: "check_status",
+    });
+  }
+  const receipt: UploadRetentionReceipt = {
+    fileId,
+    sizeBytes: file.size,
+    uploadedAt: value.uploadedAt,
+    providerReadyAt: value.providerReadyAt,
+    expiresAt: value.expiresAt,
+    replayed: value.replayed,
+    recovered: value.recreated,
+    recreated: value.recreated,
+    ...(traceId ? { traceId } : {}),
+  };
+  return { state: "uploaded", ...receipt, receipt };
+}
+
+async function recoverManagedIntent(
+  handle: ManagedUploadHandle,
+  file: File,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  options.signal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(
+    () => controller.abort(),
+    options.timeoutMs ?? MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch("/api/frontmind/v1/managed-uploads/recovery", {
+      method: "POST",
+      headers: deliveryProjectHeaders({
+        "Content-Type": "application/json",
+        "X-FrontMind-Upload-Intent-Id": handle.intentId!,
+        "X-FrontMind-Upload-Intent-Ticket": handle.ticket,
+      }),
+      credentials: "include",
+      signal: controller.signal,
+      body: "{}",
+    });
+    if (!response.ok) {
+      throw await managedUploadResponseError(
+        response,
+        "暂时无法确认 Dashboard 上传状态",
+        managedUploadErrorIdentity(handle),
+      );
+    }
+    return parseManagedIntentStatus(await response.json(), handle, file);
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", abort);
+  }
+}
+
 function managedUploadHandleFromRecord(
   record: FileRecord,
   requestedFilename: string,
@@ -1220,7 +1558,7 @@ function managedUploadHandleFromRecord(
   ) {
     return undefined;
   }
-  return { fileId, filename, ticket, expiresAt };
+  return { itemId: fileId, fileId, filename, ticket, expiresAt };
 }
 
 function uploadRecoveryAction(
@@ -1253,10 +1591,104 @@ function normalizedManagedRecoveryDirective(
   return { recoveryAction, recreateRequired };
 }
 
+const MANAGED_UPLOAD_INTENT_ERROR_COPY: Readonly<Record<string, string>> = {
+  INVALID_MANAGED_UPLOAD_REQUEST: "上传请求无效，请检查文件后重试",
+  UPLOAD_REJECTED: "文件上传失败，请稍后重试",
+  UPLOAD_CONTENT_LENGTH_REQUIRED: "文件上传必须提供完整大小，请重新选择文件",
+  UPLOAD_CONTENT_LENGTH_MISMATCH: "浏览器尚未完整发送文件，请重新发送该文件",
+  UPLOAD_TOO_LARGE: "文件超过 100 MB 限制，请缩减后重试",
+  UPLOAD_BODY_ALREADY_RECEIVED: "Dashboard 已完整接收文件，请检查云端状态",
+  UPLOAD_IN_PROGRESS: "该文件仍在上传处理中，请稍后检查状态",
+  UPLOAD_INTENT_NOT_FOUND: "Dashboard 上传记录不存在，请重新选择文件",
+  UPLOAD_INTENT_CANCELLED: "Dashboard 上传记录已取消，请重新选择文件",
+  UPLOAD_INTENT_EXPIRED: "Dashboard 上传凭证已过期，请刷新页面后重试",
+  UPLOAD_INTENT_FORBIDDEN: "当前账号无权访问该上传记录",
+  UPLOAD_INTENT_INVALID: "Dashboard 上传凭证无效，请刷新页面后重试",
+  UPLOAD_INTENT_CONFLICT: "上传状态已变化，请重新检查云端状态",
+  UPLOAD_INTENT_LEASE_LOST: "上传状态已由恢复任务接管，请重新检查",
+  UPLOAD_INTENT_NOT_SEALED: "Dashboard 尚未完整接收该文件",
+  UPLOAD_INTENT_SECRET_UNAVAILABLE: "文件上传服务配置不可用，请联系管理员",
+  UPLOAD_LOCAL_COPY_EXPIRED_RECREATE_REQUIRED:
+    "Dashboard 本地副本已过期，请移除记录后重新选择文件",
+  UPLOAD_OPERATION_CONFLICT: "同一上传操作已绑定其他文件",
+  UPLOAD_OPERATION_LEDGER_AMBIGUOUS: "上传操作账本异常，请联系管理员",
+  UPLOAD_OPERATION_RETIRED: "该上传操作已结束，请重新选择文件",
+  UPLOAD_IDENTITY_DELETION_IN_PROGRESS:
+    "账号、项目或上传凭证正在删除，云端上传已暂停",
+  UPLOAD_STORAGE_UNAVAILABLE: "Dashboard 本地暂存不可用，请联系管理员",
+  UPLOAD_CREDENTIAL_UNAVAILABLE:
+    "该上传绑定的原 API Key 已不可用，请联系管理员",
+  UPLOAD_PROVIDER_CREATE_RETRYABLE: "云端暂未接受文件记录，系统将稍后重试",
+  UPLOAD_PROVIDER_TEMPORARY: "云端上传暂时不可用，请稍后检查状态",
+  UPLOAD_PROVIDER_CREATE_UNKNOWN: "云端文件记录创建结果未知，系统正在安全恢复",
+  UPLOAD_PROVIDER_CREATE_UNKNOWN_FINAL:
+    "云端文件记录创建结果仍未知，请联系管理员",
+  UPLOAD_PROVIDER_CREATE_REJECTED: "云端拒绝创建文件记录，请联系管理员",
+  UPLOAD_PROVIDER_PUT_FORBIDDEN: "云端拒绝文件内容上传，请联系管理员",
+  UPLOAD_PROVIDER_PUT_REJECTED: "云端拒绝文件内容上传，请联系管理员",
+  UPLOAD_PROVIDER_CAPABILITY_EXPIRED: "云端上传地址已过期，系统正在安全恢复",
+  UPLOAD_PROVIDER_CAPABILITY_LOST: "云端上传地址不可用，请联系管理员",
+  UPLOAD_PROVIDER_RECORD_UNUSABLE: "云端文件记录不可用，系统正在安全替换",
+  UPLOAD_PROVIDER_RECREATE_EXHAUSTED: "替代云端文件记录仍不可用，请联系管理员",
+  UPLOAD_PROVIDER_RESULT_UNKNOWN_FINAL: "云端上传结果仍未知，请联系管理员",
+  UPLOAD_PROVIDER_RESPONSE_INVALID: "云端文件记录响应无效，请联系管理员",
+  UPLOAD_PROVIDER_DISCARD_FAILED: "旧云端文件记录暂时无法安全移除",
+  UPLOAD_PROVIDER_DISCARD_PROOF_UNAVAILABLE: "暂时无法确认旧云端文件记录已移除",
+  UPLOAD_PROVIDER_PROOF_UNAVAILABLE: "暂时无法核验云端文件内容",
+  UPLOAD_PROVIDER_IDENTITY_MISMATCH: "云端文件内容与 Dashboard 本地副本不一致",
+  UPLOAD_PROVIDER_CREDENTIAL_IDENTITY_MISMATCH:
+    "云端文件记录与上传凭证身份不一致",
+  UPLOAD_PROVIDER_OWNERSHIP_MISSING: "文件所有权证明缺失，不能安全移除",
+  UPLOAD_ALREADY_BOUND: "文件已经绑定到任务，不能移除",
+  UPLOAD_RECOVERY_INVALID: "服务端文件身份与当前上传不匹配，请重新检查",
+  UPLOAD_INTERNAL_ERROR: "文件上传服务暂时不可用，请稍后重试",
+};
+
+function managedUploadIntentSafeCode(code: string) {
+  return Object.prototype.hasOwnProperty.call(
+    MANAGED_UPLOAD_INTENT_ERROR_COPY,
+    code,
+  )
+    ? code
+    : "UPLOAD_REJECTED";
+}
+
+function managedUploadIntentErrorMessage(
+  code: string,
+  status: number,
+  fallback: string,
+) {
+  return (
+    MANAGED_UPLOAD_INTENT_ERROR_COPY[code] ??
+    (status === 400 || status === 422
+      ? "上传请求无效，请检查文件后重试"
+      : status === 401
+        ? "登录状态无效，请重新登录"
+        : status === 403
+          ? "当前账号无权处理该上传记录"
+          : status === 404
+            ? "Dashboard 上传记录不存在，请重新选择文件"
+            : status === 409
+              ? "文件上传状态已变化，请重新检查"
+              : status === 410
+                ? "文件上传记录已失效，请重新选择文件"
+                : status === 413
+                  ? "文件超过 100 MB 限制，请缩减后重试"
+                  : status === 429
+                    ? "上传请求过于频繁，请稍后重试"
+                    : status === 408 || status === 504
+                      ? "文件上传超时，请稍后重试"
+                      : status >= 500
+                        ? "文件上传服务暂时不可用，请稍后重试"
+                        : fallback)
+  );
+}
+
 async function managedUploadResponseError(
   response: Response,
   fallback: string,
-  fallbackFileId?: string,
+  fallbackIdentity?: string | { intentId?: string; fileId?: string },
+  managedIntentProtocol = false,
 ): Promise<FileUploadError> {
   let message = "";
   let code = "UPLOAD_REJECTED";
@@ -1264,7 +1696,14 @@ async function managedUploadResponseError(
   let traceId: string | undefined;
   let recoveryAction: UploadRecoveryAction | undefined;
   let recreateRequired = false;
-  let fileId = fallbackFileId;
+  let fileId =
+    typeof fallbackIdentity === "string"
+      ? fallbackIdentity
+      : fallbackIdentity?.fileId;
+  const intentId =
+    typeof fallbackIdentity === "object"
+      ? fallbackIdentity.intentId
+      : undefined;
   let fileIdMismatch = false;
   try {
     const payload = (await response.json()) as {
@@ -1294,7 +1733,7 @@ async function managedUploadResponseError(
     recoveryAction = directive.recoveryAction;
     recreateRequired = directive.recreateRequired;
     if (typeof error?.fileId === "string" && error.fileId.trim()) {
-      if (fileId !== undefined && error.fileId !== fileId) {
+      if (intentId || (fileId !== undefined && error.fileId !== fileId)) {
         fileIdMismatch = true;
       } else {
         fileId = error.fileId;
@@ -1310,21 +1749,26 @@ async function managedUploadResponseError(
     recoveryAction = "check_status";
     recreateRequired = false;
   }
-  return new FileUploadError(
-    userFacingErrorMessage(
-      Object.assign(new Error(message), { status: response.status }),
-      fallback,
-    ),
-    {
-      code,
-      status: response.status,
-      fileId,
-      retryable: retryable ?? isRetryableUploadStatus(response.status),
-      traceId,
-      recoveryAction,
-      recreateRequired,
-    },
-  );
+  const safeIntentProtocol = managedIntentProtocol || Boolean(intentId);
+  const visibleCode = safeIntentProtocol
+    ? managedUploadIntentSafeCode(code)
+    : code;
+  const visibleMessage = safeIntentProtocol
+    ? managedUploadIntentErrorMessage(visibleCode, response.status, fallback)
+    : userFacingErrorMessage(
+        Object.assign(new Error(message), { status: response.status }),
+        fallback,
+      );
+  return new FileUploadError(visibleMessage, {
+    code: visibleCode,
+    status: response.status,
+    fileId,
+    intentId,
+    retryable: retryable ?? isRetryableUploadStatus(response.status),
+    traceId,
+    recoveryAction,
+    recreateRequired,
+  });
 }
 
 /**
@@ -1333,12 +1777,28 @@ async function managedUploadResponseError(
  * record, otherwise an unknown successful upload could be deleted or orphaned.
  */
 export async function recoverManagedUpload(
-  handle: Pick<ManagedUploadHandle, "fileId" | "ticket"> & {
+  handle: Pick<
+    ManagedUploadHandle,
+    "fileId" | "ticket" | "intentId" | "itemId"
+  > & {
     filename?: string;
   },
   file: File,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<ManagedUploadRecovery> {
+  if (handle.intentId) {
+    return recoverManagedIntent(
+      {
+        intentId: handle.intentId,
+        itemId: handle.itemId,
+        filename: handle.filename || file.name,
+        ticket: handle.ticket,
+        expiresAt: Date.now() + MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS,
+      },
+      file,
+      options,
+    );
+  }
   const fileId = typeof handle.fileId === "string" ? handle.fileId : "";
   const ticket = typeof handle.ticket === "string" ? handle.ticket : "";
   const filename =
@@ -1363,10 +1823,13 @@ export async function recoverManagedUpload(
   let timedOut = false;
   const abortFromCaller = () => controller.abort();
   options.signal?.addEventListener("abort", abortFromCaller, { once: true });
-  const timeoutId = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS);
+  const timeoutId = setTimeout(
+    () => {
+      timedOut = true;
+      controller.abort();
+    },
+    Math.max(1, options.timeoutMs ?? MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS),
+  );
   let response: Response;
   try {
     response = await fetch(
@@ -1427,44 +1890,124 @@ export async function recoverManagedUpload(
       cause: error,
     });
   }
-  const traceId =
-    typeof value.traceId === "string" && value.traceId.trim()
-      ? value.traceId.trim()
-      : undefined;
-  if (
-    value.fileId !== fileId ||
-    value.recreateRequired !== false ||
-    !["ready", "restage_required", "uploaded"].includes(String(value.state))
-  ) {
-    throw new FileUploadError("文件恢复响应与当前文件不匹配，请稍后重试", {
-      code: "UPLOAD_RECOVERY_INVALID",
-      fileId,
-      retryable: true,
-      traceId,
-      recoveryAction: "check_status",
+  const status = parseManagedUploadStatusValue(value, fileId, file.size);
+  if (status.state === "processing") return status;
+  return { ...status, receipt: status };
+}
+
+async function waitForManagedUploadReady(
+  handle: ManagedUploadHandle,
+  file: File,
+  initial:
+    | ManagedUploadProcessing
+    | {
+        state: "busy";
+        retryAfterMs: number;
+        traceId?: string;
+      },
+  options: {
+    signal?: AbortSignal;
+    onStage?: (event: FileUploadStageEvent) => void;
+  } = {},
+): Promise<UploadRetentionReceipt> {
+  const localIdentity = managedUploadHandleIdentity(handle);
+  // A collision can be returned immediately while the original server route
+  // is still inside its 330-second post-ingress budget. Give only that busy
+  // path one fixed six-minute wall-clock budget; normal provider processing
+  // remains capped at five minutes and a later state transition never resets
+  // either deadline.
+  const deadline =
+    Date.now() +
+    (initial.state === "busy"
+      ? MANAGED_UPLOAD_BUSY_RECOVERY_TIMEOUT_MS
+      : MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS);
+  let waitState = initial;
+  let lastTraceId = initial.traceId;
+
+  for (;;) {
+    options.onStage?.({
+      stage: "server_processing",
+      fileId: handle.fileId,
+      totalBytes: file.size,
+      ...(waitState.state === "processing" ? { loadedBytes: file.size } : {}),
+      ...(lastTraceId ? { traceId: lastTraceId } : {}),
     });
-  }
-  if (value.state === "uploaded") {
-    const receipt = parseUploadRetentionReceiptValue(
-      value.receipt,
-      fileId,
-      file.size,
-      traceId,
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new FileUploadError(
+        "文件已接收，但等待云端就绪超时；请重新检查云端状态",
+        {
+          code: "UPLOAD_PROVIDER_PROCESSING_TIMEOUT",
+          fileId: localIdentity,
+          retryable: true,
+          traceId: lastTraceId,
+          recoveryAction: "check_status",
+        },
+      );
+    }
+
+    await waitForUploadRetry(
+      Math.min(waitState.retryAfterMs, remainingMs),
+      options.signal,
+      localIdentity,
     );
-    return {
-      fileId,
-      state: "uploaded",
-      recreateRequired: false,
-      receipt,
-      traceId,
-    };
+    try {
+      const recovery = await recoverManagedUpload(handle, file, {
+        signal: options.signal,
+        timeoutMs: Math.max(
+          1,
+          Math.min(MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS, deadline - Date.now()),
+        ),
+      });
+      if (recovery.traceId) lastTraceId = recovery.traceId;
+      if (recovery.state === "uploaded") return recovery.receipt;
+      if (recovery.state === "needs_browser_body") {
+        throw new FileUploadError("Dashboard 尚未完整接收文件，请重新发送", {
+          code: "UPLOAD_BROWSER_BODY_REQUIRED",
+          fileId: localIdentity,
+          retryable: true,
+          traceId: recovery.traceId,
+          recoveryAction: "retry_same_file",
+        });
+      }
+      waitState = recovery;
+    } catch (error) {
+      if (
+        options.signal?.aborted ||
+        (error as { cancelled?: unknown } | null)?.cancelled === true
+      ) {
+        throw error;
+      }
+      const busy = managedUploadBusyWaitState(error, localIdentity);
+      if (busy) {
+        if (busy.traceId) lastTraceId = busy.traceId;
+        waitState = {
+          ...busy,
+          ...(lastTraceId ? { traceId: lastTraceId } : {}),
+        };
+        continue;
+      }
+      const structured = error as {
+        retryable?: unknown;
+        recoveryAction?: unknown;
+        traceId?: unknown;
+      };
+      if (
+        structured.retryable !== true ||
+        structured.recoveryAction !== "check_status"
+      ) {
+        throw error;
+      }
+      if (typeof structured.traceId === "string" && structured.traceId.trim()) {
+        lastTraceId = structured.traceId.trim();
+      }
+      waitState = {
+        state: "busy",
+        retryAfterMs: MANAGED_UPLOAD_RETRY_MAX_MS,
+        ...(lastTraceId ? { traceId: lastTraceId } : {}),
+      };
+    }
   }
-  return {
-    fileId,
-    state: value.state as "ready" | "restage_required",
-    recreateRequired: false,
-    traceId,
-  };
 }
 
 /**
@@ -1559,10 +2102,86 @@ export async function discardUnboundUpload(
   );
 }
 
+export async function discardManagedUploadIntent(
+  handle: ManagedUploadHandle,
+  options: { signal?: AbortSignal } = {},
+) {
+  if (!handle.intentId || !handle.ticket) {
+    if (!handle.fileId) {
+      throw new FileUploadError("缺少待清理的文件 ID", {
+        code: "INVALID_UPLOAD_OPTIONS",
+        retryable: false,
+      });
+    }
+    return discardUnboundUpload(handle.fileId, options);
+  }
+  const response = await fetch("/api/frontmind/v1/managed-uploads", {
+    method: "DELETE",
+    headers: deliveryProjectHeaders({
+      "X-FrontMind-Upload-Intent-Id": handle.intentId,
+      "X-FrontMind-Upload-Intent-Ticket": handle.ticket,
+    }),
+    credentials: "include",
+    signal: options.signal,
+  });
+  if (response.status === 204) return;
+  throw await managedUploadResponseError(
+    response,
+    "文件暂时无法清理，请稍后重试",
+    managedUploadErrorIdentity(handle),
+  );
+}
+
 export const FILE_UPLOAD_STALL_TIMEOUT_MS = 2 * 60 * 1000;
 export const FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS = 6 * 60 * 1000;
 export const MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS = 30_000;
-const MANAGED_UPLOAD_TICKET_MIN_REMAINING_MS = 15_000;
+// Covers the 195-second unknown-create fence plus one fresh provider
+// capability, PUT and readiness reconciliation without asking for the PDF.
+export const MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS = 8 * 60 * 1000;
+export const MANAGED_UPLOAD_BUSY_RECOVERY_TIMEOUT_MS = 6 * 60 * 1000;
+const MANAGED_UPLOAD_RETRY_MIN_MS = 500;
+const MANAGED_UPLOAD_RETRY_MAX_MS = 5_000;
+const MANAGED_UPLOAD_BUSY_RETRY_MS = 3_000;
+
+function managedUploadBusyWaitState(
+  error: unknown,
+  expectedFileId: string,
+):
+  | {
+      state: "busy";
+      retryAfterMs: number;
+      traceId?: string;
+    }
+  | undefined {
+  const structured = error as {
+    code?: unknown;
+    fileId?: unknown;
+    retryable?: unknown;
+    recoveryAction?: unknown;
+    traceId?: unknown;
+  } | null;
+  const recoveryAction = uploadRecoveryAction(structured?.recoveryAction);
+  if (
+    structured?.code !== "UPLOAD_IN_PROGRESS" ||
+    structured.retryable !== true ||
+    (typeof structured.fileId === "string" &&
+      structured.fileId !== expectedFileId) ||
+    (recoveryAction !== undefined &&
+      recoveryAction !== "retry_same_file" &&
+      recoveryAction !== "check_status")
+  ) {
+    return undefined;
+  }
+  const traceId =
+    typeof structured.traceId === "string" && structured.traceId.trim()
+      ? structured.traceId.trim()
+      : undefined;
+  return {
+    state: "busy",
+    retryAfterMs: MANAGED_UPLOAD_BUSY_RETRY_MS,
+    ...(traceId ? { traceId } : {}),
+  };
+}
 
 function installFileUploadWatchdog(
   xhr: XMLHttpRequest,
@@ -1692,6 +2311,272 @@ export async function uploadFileToUrl(
   });
 }
 
+function uploadManagedIntentBody(input: {
+  handle: ManagedUploadHandle;
+  file: File;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+  onStage?: (event: FileUploadStageEvent) => void;
+}): Promise<ManagedUploadRecovery> {
+  return new Promise((resolve, reject) => {
+    const errorIdentity = managedUploadErrorIdentity(input.handle);
+    if (!input.handle.intentId || input.signal?.aborted) {
+      reject(cancelledFileUploadError(errorIdentity));
+      return;
+    }
+    const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    input.signal?.addEventListener("abort", abort, { once: true });
+    xhr.open(
+      "PUT",
+      `/api/frontmind/proxy-upload?${new URLSearchParams({
+        upload_intent_id: input.handle.intentId,
+      }).toString()}`,
+      true,
+    );
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader(
+      "X-FrontMind-Upload-Intent-Ticket",
+      input.handle.ticket,
+    );
+    const projectAssignmentId = sessionStorage
+      .getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY)
+      ?.trim();
+    if (projectAssignmentId) {
+      xhr.setRequestHeader(
+        "x-delivery-project-assignment-id",
+        projectAssignmentId,
+      );
+    }
+    input.onStage?.({
+      stage: "uploading_to_dashboard",
+      itemId: input.handle.itemId,
+      intentId: input.handle.intentId,
+      loadedBytes: 0,
+      totalBytes: input.file.size,
+    });
+    const watchdog = installFileUploadWatchdog(xhr, input.onProgress, {
+      totalBytes: input.file.size,
+      onTransfer: (loadedBytes, totalBytes) =>
+        input.onStage?.({
+          stage: "uploading_to_dashboard",
+          itemId: input.handle.itemId,
+          intentId: input.handle.intentId,
+          loadedBytes,
+          totalBytes,
+        }),
+      onUploadComplete: () =>
+        input.onStage?.({
+          // Browser bytes reaching the socket is not the durability boundary.
+          // Keep the ingress phase until the HTTP response/recovery proves
+          // server fsync + rename + manifest CAS.
+          stage: "uploading_to_dashboard",
+          itemId: input.handle.itemId,
+          intentId: input.handle.intentId,
+          loadedBytes: input.file.size,
+          totalBytes: input.file.size,
+        }),
+    });
+    const cleanup = () => {
+      watchdog.clear();
+      input.signal?.removeEventListener("abort", abort);
+    };
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        watchdog.markUploadComplete();
+      }
+      cleanup();
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(proxyUploadError(xhr, errorIdentity));
+        return;
+      }
+      try {
+        resolve(
+          parseManagedIntentStatus(
+            JSON.parse(xhr.responseText || "{}"),
+            input.handle,
+            input.file,
+          ),
+        );
+      } catch (error) {
+        reject(error);
+      }
+    });
+    xhr.addEventListener("error", () => {
+      cleanup();
+      reject(
+        new FileUploadError("Dashboard 本地上传网络异常", {
+          code: "UPLOAD_NETWORK_ERROR",
+          ...errorIdentity,
+          retryable: true,
+          recoveryAction: "check_status",
+        }),
+      );
+    });
+    xhr.addEventListener("abort", () => {
+      const timedOut = watchdog.timedOut();
+      cleanup();
+      reject(
+        timedOut
+          ? timedOutFileUploadError(errorIdentity)
+          : cancelledFileUploadError(errorIdentity),
+      );
+    });
+    watchdog.start();
+    xhr.send(input.file);
+  });
+}
+
+async function waitForManagedIntentReady(
+  handle: ManagedUploadHandle,
+  file: File,
+  initial: ManagedUploadProcessing,
+  options: UploadFileOptions,
+) {
+  const errorIdentity = managedUploadErrorIdentity(handle);
+  const deadline = Date.now() + MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS;
+  let current = initial;
+  for (;;) {
+    options.onStage?.({
+      stage: managedIntentPhaseStage(current.phase),
+      itemId: handle.itemId,
+      intentId: handle.intentId,
+      ...(managedIntentPhaseProvesLocalSeal(current.phase)
+        ? { dashboardReceivedBytes: file.size }
+        : {}),
+      totalBytes: file.size,
+      traceId: current.traceId,
+    });
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new FileUploadError(
+        "Dashboard 已完整接收文件，但等待云端就绪超时；请重新检查云端状态",
+        {
+          code: "UPLOAD_PROVIDER_PROCESSING_TIMEOUT",
+          ...errorIdentity,
+          retryable: true,
+          traceId: current.traceId,
+          recoveryAction: "check_status",
+        },
+      );
+    }
+    await waitForUploadRetry(
+      Math.min(current.retryAfterMs, remaining),
+      options.signal,
+      errorIdentity,
+    );
+    const recovered = await recoverManagedIntent(handle, file, {
+      signal: options.signal,
+      timeoutMs: Math.min(MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS, remaining),
+    });
+    if (recovered.state === "uploaded") return recovered.receipt;
+    if (recovered.state === "needs_browser_body") {
+      throw new FileUploadError(
+        "Dashboard 尚未完整接收文件，请重新发送该文件",
+        {
+          code: "UPLOAD_BROWSER_BODY_REQUIRED",
+          ...errorIdentity,
+          retryable: true,
+          traceId: recovered.traceId,
+          recoveryAction: "retry_same_file",
+        },
+      );
+    }
+    current = recovered;
+  }
+}
+
+async function uploadFileWithManagedIntent(
+  file: File,
+  onProgress: ((percent: number) => void) | undefined,
+  options: UploadFileOptions,
+) {
+  let handle = options.existingUploadHandle;
+  let status: ManagedUploadRecovery | undefined;
+  if (handle) {
+    if (!handle.intentId || !handle.ticket) {
+      throw new FileUploadError("待恢复的 Dashboard 上传凭证无效", {
+        code: "INVALID_UPLOAD_OPTIONS",
+        retryable: false,
+      });
+    }
+    options.onStage?.({
+      stage: "recovering",
+      itemId: handle.itemId,
+      intentId: handle.intentId,
+      totalBytes: file.size,
+    });
+    status = await recoverManagedIntent(handle, file, {
+      signal: options.signal,
+    });
+    if (status.state === "uploaded") return status.receipt;
+    if (status.state === "processing") {
+      return waitForManagedIntentReady(handle, file, status, options);
+    }
+    // Only the server's explicit unsealed state permits another browser body.
+  } else {
+    handle = await createManagedIntent(file, options);
+    options.onStage?.({
+      stage: "creating_intent",
+      itemId: handle.itemId,
+      intentId: handle.intentId,
+      loadedBytes: 0,
+      totalBytes: file.size,
+    });
+    await options.onFileRecord?.({
+      itemId: handle.itemId,
+      intentId: handle.intentId,
+      filename: handle.filename,
+      uploadHandle: handle,
+      reusedExistingFileId: false,
+    });
+  }
+  status = await uploadManagedIntentBody({
+    handle,
+    file,
+    onProgress,
+    signal: options.signal,
+    onStage: options.onStage,
+  });
+  if (status.state === "uploaded") {
+    options.onStage?.({
+      stage: "uploaded",
+      fileId: status.receipt.fileId,
+      loadedBytes: file.size,
+      dashboardReceivedBytes: file.size,
+      totalBytes: file.size,
+      receipt: status.receipt,
+      traceId: status.traceId,
+    });
+    return status.receipt;
+  }
+  if (status.state === "needs_browser_body") {
+    throw new FileUploadError("Dashboard 未能完整接收文件，请重新发送", {
+      code: "UPLOAD_BROWSER_BODY_REQUIRED",
+      ...managedUploadErrorIdentity(handle),
+      retryable: true,
+      traceId: status.traceId,
+      recoveryAction: "retry_same_file",
+    });
+  }
+  const receipt = await waitForManagedIntentReady(
+    handle,
+    file,
+    status,
+    options,
+  );
+  options.onStage?.({
+    stage: "uploaded",
+    fileId: receipt.fileId,
+    loadedBytes: file.size,
+    dashboardReceivedBytes: file.size,
+    totalBytes: file.size,
+    receipt,
+    traceId: receipt.traceId,
+  });
+  return receipt;
+}
+
 /**
  * Full file upload flow with progress tracking.
  */
@@ -1713,6 +2598,7 @@ export async function uploadFile(
   filename: string;
   sizeBytes?: number;
   uploadedAt?: number;
+  providerReadyAt?: number;
   expiresAt?: number;
   replayed?: boolean;
   recovered?: boolean;
@@ -1723,6 +2609,42 @@ export async function uploadFile(
   // selection cannot leave an upstream-only orphan.
   assertChatAttachmentSizes([file]);
   const captureLocalCopy = options.captureLocalCopy ?? true;
+  if (
+    captureLocalCopy &&
+    (Boolean(options.existingUploadHandle?.intentId) ||
+      (!options.existingUploadHandle && !options.existingFileId))
+  ) {
+    try {
+      const receipt = await uploadFileWithManagedIntent(
+        file,
+        onProgress,
+        options,
+      );
+      return {
+        ...receipt,
+        filename: file.name,
+      };
+    } catch (error) {
+      if (
+        (error as { code?: unknown } | null)?.code !==
+        "MANAGED_UPLOAD_INTENT_UNSUPPORTED"
+      ) {
+        throw error;
+      }
+      // Compatibility is allowed only before an intent exists and before the
+      // browser body is sent. All other failures remain sticky to intent v1.
+    }
+  }
+  let managedProgressCompleted = false;
+  const managedOnProgress = onProgress
+    ? (percent: number) => {
+        if (percent >= 100) {
+          if (managedProgressCompleted) return;
+          managedProgressCompleted = true;
+        }
+        onProgress(percent);
+      }
+    : undefined;
   if (options.signal?.aborted) throw cancelledFileUploadError();
   const handleFileId = options.existingUploadHandle?.fileId;
   const optionFileId = options.existingFileId;
@@ -1753,12 +2675,14 @@ export async function uploadFile(
       retryable: false,
     });
   }
-  if (onProgress) onProgress(0);
+  // A manual retry starts with a bodyless recovery check. Do not reset the
+  // browser bytes already retained by the dialog while that check is busy.
+  if (managedOnProgress && !existingFileId) managedOnProgress(0);
   options.onStage?.({
     stage: "creating_record",
     ...(existingFileId ? { fileId: existingFileId } : {}),
-    loadedBytes: 0,
     totalBytes: file.size,
+    ...(!existingFileId ? { loadedBytes: 0 } : {}),
   });
   let fileRecord: FileRecord | undefined;
   let uploadHandle = options.existingUploadHandle;
@@ -1769,48 +2693,54 @@ export async function uploadFile(
     options.onStage?.({
       stage: "recovering",
       fileId: existingFileId,
-      loadedBytes: 0,
       totalBytes: file.size,
     });
     try {
-      const recovery = await recoverManagedUpload(
-        {
+      const recoveryHandle =
+        uploadHandle ||
+        ({
           fileId: existingFileId,
-          ticket: uploadHandle?.ticket || "",
-          filename: uploadHandle ? uploadHandle.filename : file.name,
-        },
-        file,
-        { signal: options.signal },
-      );
-      if (recovery.state === "uploaded") {
-        retentionReceipt = recovery.receipt;
-      } else if (recovery.state === "restage_required") {
-        throw new FileUploadError(
-          "服务端尚未提供可验证的上传回执，请稍后确认状态",
-          {
-            code: "UPLOAD_RECOVERY_UNVERIFIED",
-            fileId: existingFileId,
+          filename: file.name,
+          ticket: "",
+          expiresAt: Date.now() + MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS,
+        } satisfies ManagedUploadHandle);
+      try {
+        const recovery = await recoverManagedUpload(recoveryHandle, file, {
+          signal: options.signal,
+        });
+        if (recovery.state === "uploaded") {
+          retentionReceipt = recovery.receipt;
+        } else if (recovery.state === "needs_browser_body") {
+          throw new FileUploadError("Dashboard 尚未完整接收文件，请重新发送", {
+            code: "UPLOAD_BROWSER_BODY_REQUIRED",
+            fileId: recoveryHandle.fileId,
             retryable: true,
             traceId: recovery.traceId,
-            recoveryAction: "check_status",
+            recoveryAction: "retry_same_file",
+          });
+        } else {
+          retentionReceipt = await waitForManagedUploadReady(
+            recoveryHandle,
+            file,
+            recovery,
+            {
+              signal: options.signal,
+              onStage: options.onStage,
+            },
+          );
+        }
+      } catch (error) {
+        const busy = managedUploadBusyWaitState(error, existingFileId);
+        if (!busy) throw error;
+        retentionReceipt = await waitForManagedUploadReady(
+          recoveryHandle,
+          file,
+          busy,
+          {
+            signal: options.signal,
+            onStage: options.onStage,
           },
         );
-      } else if (
-        !uploadHandle?.ticket ||
-        !Number.isFinite(uploadHandle.expiresAt) ||
-        uploadHandle.expiresAt - Date.now() <
-          MANAGED_UPLOAD_TICKET_MIN_REMAINING_MS
-      ) {
-        throw new FileUploadError("安全上传凭证已失效，请重新确认文件状态", {
-          code:
-            uploadHandle && Number.isFinite(uploadHandle.expiresAt)
-              ? "UPLOAD_CAPABILITY_EXPIRED"
-              : "UPLOAD_CAPABILITY_REQUIRED",
-          fileId: existingFileId,
-          retryable: true,
-          traceId: recovery.traceId,
-          recoveryAction: "check_status",
-        });
       }
       fileRecord = { id: existingFileId, filename: file.name };
     } catch (error) {
@@ -1898,20 +2828,75 @@ export async function uploadFile(
   if (captureLocalCopy && !retentionReceipt) {
     // A managed call sends exactly one browser body. Explicit retries first
     // reconcile above; there is no client-side XHR retry loop.
-    retentionReceipt = await uploadFileToUrlViaProxy({
-      file,
-      onProgress,
-      captureFileId: fileId,
-      uploadTicket: uploadHandle?.ticket,
-      captureFilename: options.captureFilename,
-      batchId: options.batchId,
-      batchOrdinal: options.batchOrdinal,
-      batchTotal: options.batchTotal,
-      signal: options.signal,
-      onStage: options.onStage,
-    });
+    const recoveryHandle =
+      uploadHandle ||
+      ({
+        fileId,
+        filename: file.name,
+        ticket: "",
+        expiresAt: Date.now() + MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS,
+      } satisfies ManagedUploadHandle);
+    let uploadStatus: ManagedUploadStatus | undefined;
+    try {
+      uploadStatus = await uploadFileToUrlViaProxy({
+        file,
+        onProgress: managedOnProgress,
+        captureFileId: fileId,
+        uploadTicket: uploadHandle?.ticket,
+        captureFilename: options.captureFilename,
+        batchId: options.batchId,
+        batchOrdinal: options.batchOrdinal,
+        batchTotal: options.batchTotal,
+        signal: options.signal,
+        onStage: options.onStage,
+      });
+    } catch (error) {
+      const busy = managedUploadBusyWaitState(error, fileId);
+      if (!busy) throw error;
+      retentionReceipt = await waitForManagedUploadReady(
+        recoveryHandle,
+        file,
+        busy,
+        {
+          signal: options.signal,
+          onStage: options.onStage,
+        },
+      );
+    }
+    if (!retentionReceipt) {
+      if (!uploadStatus) {
+        throw new FileUploadError("文件上传确认响应无效，请重试", {
+          code: "UPLOAD_RECEIPT_INVALID",
+          fileId,
+          retryable: true,
+          recoveryAction: "check_status",
+        });
+      }
+      if (uploadStatus.state === "uploaded") {
+        retentionReceipt = uploadStatus;
+      } else {
+        retentionReceipt = await waitForManagedUploadReady(
+          recoveryHandle,
+          file,
+          uploadStatus,
+          {
+            signal: options.signal,
+            onStage: options.onStage,
+          },
+        );
+      }
+    }
+    if (uploadStatus?.state !== "uploaded") {
+      options.onStage?.({
+        stage: "uploaded",
+        fileId,
+        loadedBytes: file.size,
+        totalBytes: file.size,
+        receipt: retentionReceipt,
+        traceId: retentionReceipt.traceId,
+      });
+    }
   } else if (captureLocalCopy && retentionReceipt) {
-    if (onProgress) onProgress(100);
     options.onStage?.({
       stage: "uploaded",
       fileId,
@@ -1988,6 +2973,8 @@ export async function uploadFile(
     });
   }
 
+  if (captureLocalCopy && retentionReceipt) managedOnProgress?.(100);
+
   return {
     fileId,
     filename: file.name,
@@ -1995,10 +2982,13 @@ export async function uploadFile(
       ? {
           sizeBytes: retentionReceipt.sizeBytes,
           uploadedAt: retentionReceipt.uploadedAt,
+          providerReadyAt: retentionReceipt.providerReadyAt,
           expiresAt: retentionReceipt.expiresAt,
           replayed: retentionReceipt.replayed,
           recovered: retentionReceipt.recovered,
-          traceId: retentionReceipt.traceId,
+          ...(retentionReceipt.traceId
+            ? { traceId: retentionReceipt.traceId }
+            : {}),
         }
       : {}),
   };
@@ -2016,20 +3006,32 @@ function isRetryableUploadStatus(status: number) {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-function cancelledFileUploadError(fileId?: string, cause?: unknown) {
+type FileUploadErrorIdentity =
+  | string
+  | { fileId?: string; intentId?: string }
+  | undefined;
+
+function fileUploadErrorIdentityFields(identity: FileUploadErrorIdentity) {
+  return typeof identity === "string" ? { fileId: identity } : (identity ?? {});
+}
+
+function cancelledFileUploadError(
+  identity?: FileUploadErrorIdentity,
+  cause?: unknown,
+) {
   return new FileUploadError("文件上传已取消", {
     code: "UPLOAD_CANCELLED",
-    fileId,
+    ...fileUploadErrorIdentityFields(identity),
     retryable: false,
     cancelled: true,
     cause,
   });
 }
 
-function timedOutFileUploadError(fileId?: string) {
+function timedOutFileUploadError(identity?: FileUploadErrorIdentity) {
   return new FileUploadError("文件上传长时间没有进度，请检查网络后重试", {
     code: "UPLOAD_TIMEOUT",
-    fileId,
+    ...fileUploadErrorIdentityFields(identity),
     retryable: true,
   });
 }
@@ -2037,18 +3039,18 @@ function timedOutFileUploadError(fileId?: string) {
 function waitForUploadRetry(
   delayMs: number,
   signal: AbortSignal | undefined,
-  fileId: string,
+  identity: FileUploadErrorIdentity,
 ) {
   return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
-      reject(cancelledFileUploadError(fileId));
+      reject(cancelledFileUploadError(identity));
       return;
     }
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const abort = () => {
       clearTimeout(timeoutId);
       signal?.removeEventListener("abort", abort);
-      reject(cancelledFileUploadError(fileId));
+      reject(cancelledFileUploadError(identity));
     };
     timeoutId = setTimeout(() => {
       signal?.removeEventListener("abort", abort);
@@ -2072,7 +3074,12 @@ function proxyUploadFallback(status: number) {
   return `文件上传失败（${status}）`;
 }
 
-function proxyUploadError(xhr: XMLHttpRequest, fileId: string | undefined) {
+function proxyUploadError(
+  xhr: XMLHttpRequest,
+  identity: FileUploadErrorIdentity,
+) {
+  let fileId = typeof identity === "string" ? identity : identity?.fileId;
+  const intentId = typeof identity === "object" ? identity.intentId : undefined;
   let upstreamMessage = "";
   let serverCode = "";
   let serverRetryable: boolean | undefined;
@@ -2115,7 +3122,10 @@ function proxyUploadError(xhr: XMLHttpRequest, fileId: string | undefined) {
       typeof payload.error?.fileId === "string" &&
       payload.error.fileId.trim()
     ) {
-      if (fileId !== undefined && payload.error.fileId !== fileId) {
+      if (
+        intentId ||
+        (fileId !== undefined && payload.error.fileId !== fileId)
+      ) {
         fileIdMismatch = true;
       } else {
         fileId = payload.error.fileId;
@@ -2131,28 +3141,35 @@ function proxyUploadError(xhr: XMLHttpRequest, fileId: string | undefined) {
     recoveryAction = "check_status";
     recreateRequired = false;
   }
-  return new FileUploadError(
-    userFacingErrorMessage(
-      Object.assign(new Error(upstreamMessage), { status: xhr.status }),
-      proxyUploadFallback(xhr.status),
-    ),
-    {
-      code: serverCode || "UPLOAD_REJECTED",
-      status: xhr.status,
-      fileId,
-      retryable: serverRetryable ?? isRetryableUploadStatus(xhr.status),
-      traceId,
-      recoveryAction,
-      recreateRequired,
-    },
-  );
+  const rawCode = serverCode || "UPLOAD_REJECTED";
+  const code = intentId ? managedUploadIntentSafeCode(rawCode) : rawCode;
+  const visibleMessage = intentId
+    ? managedUploadIntentErrorMessage(
+        code,
+        xhr.status,
+        proxyUploadFallback(xhr.status),
+      )
+    : userFacingErrorMessage(
+        Object.assign(new Error(upstreamMessage), { status: xhr.status }),
+        proxyUploadFallback(xhr.status),
+      );
+  return new FileUploadError(visibleMessage, {
+    code,
+    status: xhr.status,
+    fileId,
+    intentId,
+    retryable: serverRetryable ?? isRetryableUploadStatus(xhr.status),
+    traceId,
+    recoveryAction,
+    recreateRequired,
+  });
 }
 
-function parseUploadRetentionReceipt(
+function parseManagedUploadStatus(
   responseText: string,
   expectedFileId: string,
   expectedSizeBytes: number,
-): UploadRetentionReceipt {
+): ManagedUploadStatus {
   let value: Record<string, unknown>;
   try {
     const parsed = JSON.parse(responseText || "{}");
@@ -2168,11 +3185,95 @@ function parseUploadRetentionReceipt(
       cause: error,
     });
   }
-  return parseUploadRetentionReceiptValue(
+  return parseManagedUploadStatusValue(
     value,
     expectedFileId,
     expectedSizeBytes,
   );
+}
+
+function parseManagedUploadStatusValue(
+  input: unknown,
+  expectedFileId: string,
+  expectedSizeBytes: number,
+): ManagedUploadStatus {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new FileUploadError("文件上传确认响应无效，请重试", {
+      code: "UPLOAD_RECEIPT_INVALID",
+      fileId: expectedFileId,
+      retryable: true,
+      recoveryAction: "check_status",
+    });
+  }
+  const value = input as Record<string, unknown>;
+  const state = String(value.state || "");
+  if (state === "processing") {
+    const traceId =
+      typeof value.traceId === "string" && value.traceId.trim()
+        ? value.traceId.trim()
+        : undefined;
+    if (
+      value.fileId !== expectedFileId ||
+      typeof value.sizeBytes !== "number" ||
+      !Number.isSafeInteger(value.sizeBytes) ||
+      value.sizeBytes !== expectedSizeBytes ||
+      typeof value.uploadedAt !== "number" ||
+      !Number.isFinite(value.uploadedAt) ||
+      typeof value.expiresAt !== "number" ||
+      !Number.isFinite(value.expiresAt) ||
+      value.expiresAt <= value.uploadedAt ||
+      typeof value.retryAfterMs !== "number" ||
+      !Number.isFinite(value.retryAfterMs)
+    ) {
+      throw new FileUploadError("文件云端状态响应无效，请稍后重试", {
+        code: "UPLOAD_RECOVERY_INVALID",
+        fileId: expectedFileId,
+        retryable: true,
+        traceId,
+        recoveryAction: "check_status",
+      });
+    }
+    return {
+      state: "processing",
+      fileId: expectedFileId,
+      sizeBytes: value.sizeBytes,
+      uploadedAt: value.uploadedAt,
+      expiresAt: value.expiresAt,
+      retryAfterMs: Math.min(
+        MANAGED_UPLOAD_RETRY_MAX_MS,
+        Math.max(MANAGED_UPLOAD_RETRY_MIN_MS, value.retryAfterMs),
+      ),
+      ...(traceId ? { traceId } : {}),
+    };
+  }
+
+  if (state && state !== "uploaded") {
+    const traceId =
+      typeof value.traceId === "string" && value.traceId.trim()
+        ? value.traceId.trim()
+        : undefined;
+    throw new FileUploadError("文件云端状态响应无效，请稍后重试", {
+      code: "UPLOAD_RECOVERY_INVALID",
+      fileId: expectedFileId,
+      retryable: true,
+      traceId,
+      recoveryAction: "check_status",
+    });
+  }
+
+  const receiptInput =
+    state === "uploaded" && value.receipt !== undefined ? value.receipt : value;
+  const fallbackTraceId =
+    typeof value.traceId === "string" && value.traceId.trim()
+      ? value.traceId.trim()
+      : undefined;
+  const receipt = parseUploadRetentionReceiptValue(
+    receiptInput,
+    expectedFileId,
+    expectedSizeBytes,
+    fallbackTraceId,
+  );
+  return { state: "uploaded", ...receipt };
 }
 
 function parseUploadRetentionReceiptValue(
@@ -2208,6 +3309,8 @@ function parseUploadRetentionReceiptValue(
     value.sizeBytes !== expectedSizeBytes ||
     typeof value.uploadedAt !== "number" ||
     !Number.isFinite(value.uploadedAt) ||
+    typeof value.providerReadyAt !== "number" ||
+    !Number.isFinite(value.providerReadyAt) ||
     typeof value.expiresAt !== "number" ||
     !Number.isFinite(value.expiresAt) ||
     value.expiresAt <= value.uploadedAt ||
@@ -2225,6 +3328,7 @@ function parseUploadRetentionReceiptValue(
     fileId: expectedFileId,
     sizeBytes: value.sizeBytes,
     uploadedAt: value.uploadedAt,
+    providerReadyAt: value.providerReadyAt,
     expiresAt: value.expiresAt,
     replayed: value.replayed,
     recovered: value.recovered,
@@ -2250,7 +3354,7 @@ type ProxyUploadInput = {
 /** Uploads one browser body. Captured uploads are retried only by the server. */
 async function uploadFileToUrlViaProxy(
   input: ProxyUploadInput,
-): Promise<UploadRetentionReceipt | undefined> {
+): Promise<ManagedUploadStatus | undefined> {
   const {
     uploadUrl,
     file,
@@ -2381,20 +3485,30 @@ async function uploadFileToUrlViaProxy(
           return;
         }
         try {
-          const receipt = parseUploadRetentionReceipt(
+          const uploadStatus = parseManagedUploadStatus(
             xhr.responseText,
             captureFileId,
             file.size,
           );
-          onStage?.({
-            stage: "uploaded",
-            fileId: captureFileId,
-            loadedBytes: file.size,
-            totalBytes: file.size,
-            receipt,
-            traceId: receipt.traceId,
-          });
-          resolve(receipt);
+          if (uploadStatus.state === "uploaded") {
+            onStage?.({
+              stage: "uploaded",
+              fileId: captureFileId,
+              loadedBytes: file.size,
+              totalBytes: file.size,
+              receipt: uploadStatus,
+              traceId: uploadStatus.traceId,
+            });
+          } else {
+            onStage?.({
+              stage: "server_processing",
+              fileId: captureFileId,
+              loadedBytes: file.size,
+              totalBytes: file.size,
+              traceId: uploadStatus.traceId,
+            });
+          }
+          resolve(uploadStatus);
         } catch (error) {
           reject(error);
         }

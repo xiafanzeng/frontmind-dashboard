@@ -79,6 +79,12 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   dispatchingAt?: string;
   outcomeUnknownAt?: string;
   outcomeUnknownCode?: string;
+  /** Durable at-most-once authority for the undocumented provider create API. */
+  createAttemptState?: KnowledgeBaseCreateAttemptState;
+  createAttemptUpdatedAt?: string;
+  traceId?: string;
+  providerReasonCategory?: string;
+  providerRequestRef?: string;
   preparedDispatch?: KnowledgeBasePreparedDispatch;
   dispatchState?: KnowledgeBaseDispatchState;
   failureClass?: KnowledgeBaseFailureClass | null;
@@ -125,13 +131,21 @@ export interface KnowledgeBaseGeneratedAttachmentClaim {
   upstreamFileId: string | null;
 }
 
+export type KnowledgeBaseCreateAttemptState =
+  | "not_sent"
+  | "sending"
+  | "acknowledged"
+  | "rejected"
+  | "unknown";
+
 export interface KnowledgeBasePreparedDispatch {
-  schemaVersion: 1;
+  /** Schema 1 bodies retain deprecated taskMode for exact replay compatibility. */
+  schemaVersion: 1 | 2;
   baseUrl: string;
   requestBody: {
     prompt: string;
     agentProfile: string;
-    taskMode: "agent";
+    taskMode?: "agent";
     attachments: Array<{ file_id: string; filename: string }>;
     taskId?: string;
   };
@@ -194,6 +208,8 @@ export interface KnowledgeBaseTurnRecord {
   failureClass: KnowledgeBaseFailureClass | null;
   recoveryAction: KnowledgeBaseRecoveryAction | null;
   canRegenerate: boolean;
+  createAttemptState?: KnowledgeBaseCreateAttemptState;
+  traceId?: string | null;
   attachmentFileIds: string[];
   attachmentsFrozen: boolean;
   awaitingClientAttachments: boolean;
@@ -780,21 +796,63 @@ export type KnowledgeBaseRetryAuthority = {
   preparedDispatch: KnowledgeBasePreparedDispatch;
 };
 
+type KnowledgeBaseFailedTurnAuthorityPolicy = "retry" | "terminal_rejected";
+
+function isDeterministicTaskCreateRejectionCode(value: unknown) {
+  const code = String(value || "");
+  if (/^UPSTREAM_CREATE_[0-9]{1,6}$/u.test(code)) return true;
+  const statusMatch = /^UPSTREAM_CREATE_HTTP_(4[0-9]{2})$/u.exec(code);
+  if (!statusMatch) return false;
+  const status = Number(statusMatch[1]);
+  return status !== 408 && status !== 425 && status !== 429;
+}
+
 /**
  * Performs the complete, credential-free integrity check shared by retry and
  * the production invariant audit. A failed row is retry authority only when
  * its logical request, operation slot, frozen upload ledger and exact POST
  * body can all be recomputed from durable state.
  */
-export function inspectKnowledgeBaseRetryAuthority(
+function inspectKnowledgeBaseFailedTurnAuthority(
   source: ConversationTurn,
   build: KnowledgeBaseBuild,
+  policy: KnowledgeBaseFailedTurnAuthorityPolicy,
 ): KnowledgeBaseRetryAuthority | null {
   try {
     const metadata = metadataOf(source);
     const recovery = retryAuthorityRecord(metadata.recovery);
     const preparedDispatch = metadata.preparedDispatch;
     const operationType = source.operationType as KnowledgeBaseOperationType;
+    const createAttemptState = knowledgeBaseCreateAttemptState(
+      source,
+      metadata,
+    );
+    const storedCreateAttemptState =
+      storedKnowledgeBaseCreateAttemptState(metadata);
+    const retryPolicyValid =
+      policy === "retry" &&
+      metadata.failureClass === "terminal_requires_regeneration" &&
+      metadata.recoveryAction === "regenerate_turn" &&
+      metadata.canRegenerate === true &&
+      (createAttemptState === "not_sent" ||
+        createAttemptState === "acknowledged");
+    const legacyTerminalRejection =
+      storedCreateAttemptState === null &&
+      typeof metadata.dispatchingAt === "string" &&
+      metadata.dispatchingAt.length > 0 &&
+      isDeterministicTaskCreateRejectionCode(source.errorCode);
+    const terminalPolicyValid =
+      policy === "terminal_rejected" &&
+      !source.upstreamTaskId &&
+      metadata.dispatchState === "failed" &&
+      (metadata.failureClass === "terminal_nonregenerable" ||
+        (legacyTerminalRejection &&
+          metadata.failureClass === "requires_user_fix")) &&
+      metadata.recoveryAction === "contact_support" &&
+      metadata.canRegenerate === false &&
+      metadata.awaitingClientAttachments !== true &&
+      isDeterministicTaskCreateRejectionCode(source.errorCode) &&
+      (storedCreateAttemptState === "rejected" || legacyTerminalRejection);
     if (
       source.status !== "failed" ||
       source.userId !== build.userId ||
@@ -813,12 +871,14 @@ export function inspectKnowledgeBaseRetryAuthority(
       operationType === "legacy_reconcile" ||
       !source.requestHash ||
       !source.upstreamIdempotencyKeyHash ||
+      (!retryPolicyValid && !terminalPolicyValid) ||
       metadata.attachmentsFrozen !== true ||
       !Array.isArray(source.attachmentFileIds) ||
       !recovery ||
       recovery.conversationId !== build.conversationId ||
       !preparedDispatch ||
-      preparedDispatch.schemaVersion !== 1
+      (preparedDispatch.schemaVersion !== 1 &&
+        preparedDispatch.schemaVersion !== 2)
     ) {
       return null;
     }
@@ -881,7 +941,9 @@ export function inspectKnowledgeBaseRetryAuthority(
       : null;
     if (
       !requestBody ||
-      requestBody.taskMode !== "agent" ||
+      (preparedDispatch.schemaVersion === 1
+        ? requestBody.taskMode !== "agent"
+        : requestBody.taskMode !== undefined) ||
       typeof requestBody.prompt !== "string" ||
       !requestBody.prompt ||
       typeof requestBody.agentProfile !== "string" ||
@@ -927,7 +989,9 @@ export function inspectKnowledgeBaseRetryAuthority(
       (recoveryKind === "turn" &&
         (typeof expectedParentTaskId !== "string" ||
           !expectedParentTaskId ||
-          requestBody.taskId !== expectedParentTaskId))
+          (preparedDispatch.schemaVersion === 1
+            ? requestBody.taskId !== expectedParentTaskId
+            : requestBody.taskId !== undefined)))
     ) {
       return null;
     }
@@ -986,6 +1050,30 @@ export function inspectKnowledgeBaseRetryAuthority(
   }
 }
 
+export function inspectKnowledgeBaseRetryAuthority(
+  source: ConversationTurn,
+  build: KnowledgeBaseBuild,
+) {
+  return inspectKnowledgeBaseFailedTurnAuthority(source, build, "retry");
+}
+
+/**
+ * Validates the same frozen request, attachment ledger and body hashes as
+ * retry authority without granting a retry. This is solely structural
+ * authority for retaining a terminal Task Create rejection as the failed
+ * build's active history.
+ */
+export function inspectKnowledgeBaseTerminalTaskCreateRejectionAuthority(
+  source: ConversationTurn,
+  build: KnowledgeBaseBuild,
+) {
+  return inspectKnowledgeBaseFailedTurnAuthority(
+    source,
+    build,
+    "terminal_rejected",
+  );
+}
+
 export function knowledgeBaseConversationStorageId(
   userId: number,
   publicConversationId: string,
@@ -1042,6 +1130,47 @@ function metadataOf(row: Pick<ConversationTurn, "metadata">) {
   ) as KnowledgeBaseTurnMetadata;
 }
 
+function safeKnowledgeBaseTraceId(value: unknown) {
+  const normalized = String(value || "").trim();
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
+    normalized,
+  )
+    ? normalized
+    : null;
+}
+
+function storedKnowledgeBaseCreateAttemptState(
+  metadata: KnowledgeBaseTurnMetadata,
+): KnowledgeBaseCreateAttemptState | null {
+  const value = String(metadata.createAttemptState || "");
+  return [
+    "not_sent",
+    "sending",
+    "acknowledged",
+    "rejected",
+    "unknown",
+  ].includes(value)
+    ? (value as KnowledgeBaseCreateAttemptState)
+    : null;
+}
+
+/**
+ * Legacy rows did not persist an explicit create state. Once dispatchingAt or
+ * outcomeUnknownAt exists, fail closed: a request may already have crossed
+ * the provider boundary and must never be POSTed again based on an
+ * undocumented Idempotency-Key header.
+ */
+function knowledgeBaseCreateAttemptState(
+  row: Pick<ConversationTurn, "upstreamTaskId">,
+  metadata: KnowledgeBaseTurnMetadata,
+): KnowledgeBaseCreateAttemptState {
+  if (row.upstreamTaskId) return "acknowledged";
+  const stored = storedKnowledgeBaseCreateAttemptState(metadata);
+  if (stored) return stored;
+  if (metadata.outcomeUnknownAt || metadata.dispatchingAt) return "unknown";
+  return "not_sent";
+}
+
 function releasedOperationTombstone(metadata: KnowledgeBaseTurnMetadata) {
   return (
     metadata.unpreparedCancellation === true ||
@@ -1086,6 +1215,8 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     status: row.status,
     upstreamTaskId: row.upstreamTaskId,
     ...dispatchAuthority,
+    createAttemptState: knowledgeBaseCreateAttemptState(row, metadata),
+    traceId: safeKnowledgeBaseTraceId(metadata.traceId),
     attachmentFileIds: [...(row.attachmentFileIds ?? [])],
     attachmentsFrozen: metadata.attachmentsFrozen === true,
     awaitingClientAttachments: metadata.awaitingClientAttachments === true,
@@ -2558,6 +2689,10 @@ async function reserveKnowledgeBaseTurnInTransaction(
   const leaseToken = randomUUID();
   const attachmentsFrozen =
     input.attachmentFileIds !== undefined || expectedAttachmentCount === 0;
+  const sanitizedRecovery = sanitizeKnowledgeBaseRecoveryMetadata(
+    input.recoveryMetadata,
+  );
+  const traceId = safeKnowledgeBaseTraceId(sanitizedRecovery.traceId);
   const metadata: KnowledgeBaseTurnMetadata = {
     ...(deferredClientAttachments
       ? {}
@@ -2576,7 +2711,10 @@ async function reserveKnowledgeBaseTurnInTransaction(
         : {}),
     ...(clientIntentHash ? { clientIntentHash } : {}),
     ...(expectedPresentationKey ? { expectedPresentationKey } : {}),
-    recovery: sanitizeKnowledgeBaseRecoveryMetadata(input.recoveryMetadata),
+    recovery: sanitizedRecovery,
+    ...(traceId ? { traceId } : {}),
+    createAttemptState: "not_sent",
+    createAttemptUpdatedAt: now.toISOString(),
     dispatchState: "reserved",
     failureClass: null,
     recoveryAction: "wait",
@@ -4554,15 +4692,24 @@ export async function prepareKnowledgeBaseTurnDispatch(
     const requestBody: KnowledgeBasePreparedDispatch["requestBody"] = {
       prompt,
       agentProfile,
-      taskMode: "agent",
       attachments,
-      ...(parentTaskId ? { taskId: parentTaskId } : {}),
     };
     const bodySha256 = hashKnowledgeBaseTurnRequest(requestBody);
     if (metadata.preparedDispatch) {
+      const existingBody = metadata.preparedDispatch.requestBody;
       if (
-        metadata.preparedDispatch.bodySha256 !== bodySha256 ||
-        metadata.preparedDispatch.baseUrl !== normalizedBaseUrl
+        metadata.preparedDispatch.baseUrl !== normalizedBaseUrl ||
+        existingBody.prompt !== prompt ||
+        existingBody.agentProfile !== agentProfile ||
+        (metadata.preparedDispatch.schemaVersion === 1
+          ? (existingBody.taskId ?? undefined) !== parentTaskId
+          : existingBody.taskId !== undefined) ||
+        existingBody.attachments.length !== attachments.length ||
+        existingBody.attachments.some(
+          (attachment, index) =>
+            attachment.file_id !== attachments[index]?.file_id ||
+            attachment.filename !== attachments[index]?.filename,
+        )
       ) {
         throw new KnowledgeBaseTurnReservationError(
           "CONFLICT",
@@ -4575,7 +4722,7 @@ export async function prepareKnowledgeBaseTurnDispatch(
     const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
     assertInteger(leaseMs, "leaseMs", 1_000);
     const preparedDispatch: KnowledgeBasePreparedDispatch = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       baseUrl: normalizedBaseUrl,
       requestBody,
       bodySha256,
@@ -4584,6 +4731,12 @@ export async function prepareKnowledgeBaseTurnDispatch(
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadata,
       preparedDispatch,
+      createAttemptState:
+        knowledgeBaseCreateAttemptState(turn, metadata) === "not_sent"
+          ? "not_sent"
+          : knowledgeBaseCreateAttemptState(turn, metadata),
+      createAttemptUpdatedAt:
+        metadata.createAttemptUpdatedAt || now.toISOString(),
     };
     await tx
       .update(conversationTurns)
@@ -4597,7 +4750,11 @@ export async function prepareKnowledgeBaseTurnDispatch(
   });
 }
 
-/** Mark the reservation running immediately before the idempotent HTTP POST. */
+/**
+ * Atomically consumes the one provider-create permission for this turn.
+ * Provider task creation has no documented idempotency contract, so any
+ * state other than not_sent fails closed and can never produce another POST.
+ */
 export async function markKnowledgeBaseTurnDispatching(
   input: {
     userId: number;
@@ -4619,6 +4776,14 @@ export async function markKnowledgeBaseTurnDispatching(
         "Attachments must be frozen before task dispatch",
       );
     }
+    const createAttemptState = knowledgeBaseCreateAttemptState(turn, metadata);
+    if (createAttemptState !== "not_sent") {
+      throw new KnowledgeBaseTurnReservationError(
+        "IDEMPOTENCY_PENDING",
+        `Provider task create is already ${createAttemptState}`,
+        30_000,
+      );
+    }
     const now = input.now ?? new Date();
     const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
     assertInteger(leaseMs, "leaseMs", 1_000);
@@ -4626,6 +4791,8 @@ export async function markKnowledgeBaseTurnDispatching(
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadata,
       dispatchingAt: now.toISOString(),
+      createAttemptState: "sending",
+      createAttemptUpdatedAt: now.toISOString(),
       dispatchState: "recovering",
       failureClass: "recoverable_same_turn",
       recoveryAction: "reconcile",
@@ -4693,6 +4860,8 @@ export async function bindKnowledgeBaseTurnUpstreamTask(
     const now = input.now ?? new Date();
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadataOf(turn),
+      createAttemptState: "acknowledged",
+      createAttemptUpdatedAt: now.toISOString(),
       dispatchState: "bound",
       failureClass: null,
       recoveryAction: "wait",
@@ -4739,6 +4908,87 @@ export async function bindKnowledgeBaseTurnUpstreamTask(
   });
 }
 
+function safeProviderDiagnostic(value: unknown, maxLength = 128) {
+  const normalized = String(value || "").trim();
+  return normalized &&
+    normalized.length <= maxLength &&
+    /^[A-Z0-9._:-]+$/iu.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+/**
+ * Defer a pre-create reservation while provider files are still processing.
+ * The create permission remains not_sent, so the recovery worker may safely
+ * re-check the same frozen attachment ledger after the short lease expires.
+ */
+export async function deferKnowledgeBaseTurnBeforeCreate(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    code?: string;
+    recoveryDelayMs?: number;
+    traceId?: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const currentMetadata = metadataOf(turn);
+    if (knowledgeBaseCreateAttemptState(turn, currentMetadata) !== "not_sent") {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Attachments can only defer a task before provider create",
+      );
+    }
+    const now = input.now ?? new Date();
+    const recoveryDelayMs = input.recoveryDelayMs ?? 5_000;
+    assertInteger(recoveryDelayMs, "recoveryDelayMs", 1_000);
+    const leaseExpiresAt = new Date(now.getTime() + recoveryDelayMs);
+    const code = String(
+      input.code || "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+    ).slice(0, 128);
+    const traceId = safeKnowledgeBaseTraceId(
+      input.traceId || currentMetadata.traceId,
+    );
+    const metadata: KnowledgeBaseTurnMetadata = {
+      ...currentMetadata,
+      createAttemptState: "not_sent",
+      createAttemptUpdatedAt:
+        currentMetadata.createAttemptUpdatedAt || now.toISOString(),
+      ...(traceId ? { traceId } : {}),
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        status: "running",
+        errorCode: code,
+        errorMessage: null,
+        leaseExpiresAt,
+        metadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    return turnRecord({
+      ...turn,
+      status: "running",
+      errorCode: code,
+      errorMessage: null,
+      leaseExpiresAt,
+      metadata,
+      updatedAt: now,
+    });
+  });
+}
+
 /**
  * Records only a coarse error code. It intentionally keeps the row active and
  * leased; callers must never release/delete a reservation on timeout.
@@ -4749,6 +4999,9 @@ export async function markKnowledgeBaseTurnOutcomeUnknown(
     turnId: string;
     leaseToken: string;
     code?: string;
+    traceId?: string;
+    reasonCategory?: string;
+    providerRequestRef?: string;
     now?: Date;
     recoveryDelayMs?: number;
   },
@@ -4762,12 +5015,28 @@ export async function markKnowledgeBaseTurnOutcomeUnknown(
     const recoveryDelayMs = input.recoveryDelayMs ?? 30_000;
     assertInteger(recoveryDelayMs, "recoveryDelayMs", 1_000);
     const leaseExpiresAt = new Date(now.getTime() + recoveryDelayMs);
+    const currentMetadata = metadataOf(turn);
+    const currentAttempt = knowledgeBaseCreateAttemptState(
+      turn,
+      currentMetadata,
+    );
+    const traceId = safeKnowledgeBaseTraceId(
+      input.traceId || currentMetadata.traceId,
+    );
+    const reasonCategory = safeProviderDiagnostic(input.reasonCategory);
+    const providerRequestRef = safeProviderDiagnostic(input.providerRequestRef);
     const metadata: KnowledgeBaseTurnMetadata = {
-      ...metadataOf(turn),
+      ...currentMetadata,
       outcomeUnknownAt: now.toISOString(),
       outcomeUnknownCode: String(
         input.code || "UPSTREAM_OUTCOME_UNKNOWN",
       ).slice(0, 128),
+      createAttemptState:
+        currentAttempt === "sending" ? "unknown" : currentAttempt,
+      createAttemptUpdatedAt: now.toISOString(),
+      ...(traceId ? { traceId } : {}),
+      ...(reasonCategory ? { providerReasonCategory: reasonCategory } : {}),
+      ...(providerRequestRef ? { providerRequestRef } : {}),
       dispatchState: "recovering",
       failureClass: "recoverable_same_turn",
       recoveryAction: "reconcile",
@@ -5052,7 +5321,9 @@ export async function rejectUnacknowledgedKnowledgeBaseManualLogoTurn(
       stagedUpload.verified !== false ||
       metadata.attachmentsFrozen !== true ||
       !preparedDispatch ||
-      preparedDispatch.requestBody.taskId !== parentTaskId ||
+      (preparedDispatch.schemaVersion === 1
+        ? preparedDispatch.requestBody.taskId !== parentTaskId
+        : preparedDispatch.requestBody.taskId !== undefined) ||
       (turn.status !== "queued" && turn.status !== "running") ||
       Boolean(turn.upstreamTaskId) ||
       build.upstreamTaskId !== parentTaskId ||
@@ -5092,6 +5363,8 @@ export async function rejectUnacknowledgedKnowledgeBaseManualLogoTurn(
       .digest("hex");
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadataWithoutLease,
+      createAttemptState: "rejected",
+      createAttemptUpdatedAt: now.toISOString(),
       unacknowledgedManualLogoCancellation: true,
       unacknowledgedManualLogoCancellationAuthorityHash:
         metadata.leaseOwnerHash,
@@ -5395,6 +5668,9 @@ export async function failKnowledgeBaseTurnDeterministically(
     failureClass?: KnowledgeBaseFailureClass;
     recoveryAction?: KnowledgeBaseRecoveryAction;
     canRegenerate?: boolean;
+    createAttemptRejected?: boolean;
+    reasonCategory?: string;
+    providerRequestRef?: string;
     now?: Date;
   },
   executor?: any,
@@ -5458,8 +5734,29 @@ export async function failKnowledgeBaseTurnDeterministically(
         : failureClass === "requires_user_fix"
           ? "contact_support"
           : "contact_support");
+    const currentAttempt = knowledgeBaseCreateAttemptState(turn, metadata);
+    if (
+      input.createAttemptRejected === true &&
+      currentAttempt !== "sending" &&
+      currentAttempt !== "rejected"
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Provider rejection does not match the durable create attempt",
+      );
+    }
+    const reasonCategory = safeProviderDiagnostic(input.reasonCategory);
+    const providerRequestRef = safeProviderDiagnostic(input.providerRequestRef);
     const failedMetadata: KnowledgeBaseTurnMetadata = {
       ...settledMetadata,
+      ...(input.createAttemptRejected === true
+        ? {
+            createAttemptState: "rejected" as const,
+            createAttemptUpdatedAt: now.toISOString(),
+          }
+        : {}),
+      ...(reasonCategory ? { providerReasonCategory: reasonCategory } : {}),
+      ...(providerRequestRef ? { providerRequestRef } : {}),
       dispatchState: "failed",
       failureClass,
       recoveryAction,
@@ -5580,6 +5877,15 @@ export async function findRecoverableKnowledgeBaseTurnIds(
           lte(conversationTurns.leaseExpiresAt, now),
         ),
         sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.awaitingClientAttachments')), 'false') <> 'true'`,
+        sql`COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')),
+          CASE
+            WHEN JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NOT NULL
+              OR JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NOT NULL
+            THEN 'unknown'
+            ELSE 'not_sent'
+          END
+        ) <> 'unknown'`,
         inArray(knowledgeBaseBuilds.status, [
           "researching",
           "confirming",
@@ -5617,9 +5923,15 @@ export async function claimKnowledgeBaseTurnForRecovery(
       }
       throw error;
     }
+    const currentMetadata = metadataOf(turn);
+    const createAttemptState = knowledgeBaseCreateAttemptState(
+      turn,
+      currentMetadata,
+    );
     if (
       (turn.status !== "queued" && turn.status !== "running") ||
-      metadataOf(turn).awaitingClientAttachments === true ||
+      currentMetadata.awaitingClientAttachments === true ||
+      createAttemptState === "unknown" ||
       (turn.leaseExpiresAt && turn.leaseExpiresAt.getTime() > now.getTime())
     ) {
       return null;
@@ -5627,7 +5939,7 @@ export async function claimKnowledgeBaseTurnForRecovery(
     const leaseToken = randomUUID();
     const leaseExpiresAt = new Date(now.getTime() + leaseMs);
     const metadata: KnowledgeBaseTurnMetadata = {
-      ...metadataOf(turn),
+      ...currentMetadata,
       leaseOwnerHash: leaseOwnerHash(leaseToken),
     };
     await tx
@@ -5687,6 +5999,8 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
     });
     const metadata = metadataOf(turn);
     const recoveryAction = metadata.recoveryAction;
+    const storedCreateAttemptState =
+      storedKnowledgeBaseCreateAttemptState(metadata);
     if (
       turn.status !== "failed" ||
       turn.upstreamTaskId ||
@@ -5694,6 +6008,7 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       build.activeTurnId !== turn.id ||
       metadata.failureClass !== "requires_user_fix" ||
       (recoveryAction !== "top_up" && recoveryAction !== "update_credential") ||
+      storedCreateAttemptState !== "not_sent" ||
       metadata.attachmentsFrozen !== true ||
       !metadata.preparedDispatch ||
       !metadata.recovery
@@ -5722,10 +6037,19 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
 
     const leaseToken = randomUUID();
     const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+    const {
+      dispatchingAt: _dispatchingAt,
+      outcomeUnknownAt: _outcomeUnknownAt,
+      outcomeUnknownCode: _outcomeUnknownCode,
+      providerReasonCategory: _providerReasonCategory,
+      providerRequestRef: _providerRequestRef,
+      ...metadataBeforeExplicitRetry
+    } = metadata;
     const nextMetadata: KnowledgeBaseTurnMetadata = {
-      ...metadata,
+      ...metadataBeforeExplicitRetry,
       leaseOwnerHash: leaseOwnerHash(leaseToken),
-      dispatchingAt: now.toISOString(),
+      createAttemptState: "not_sent",
+      createAttemptUpdatedAt: now.toISOString(),
       dispatchState: "recovering",
       failureClass: "recoverable_same_turn",
       recoveryAction: "reconcile",
@@ -5893,6 +6217,12 @@ export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
       turnId,
     });
     const metadata = metadataOf(turn);
+    const storedCreateAttemptState =
+      storedKnowledgeBaseCreateAttemptState(metadata);
+    const preCreateAttachmentFailure = new Set([
+      "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+      "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID",
+    ]).has(String(turn.errorCode || ""));
     if (
       metadata.attachmentRepair?.clientRequestId === clientRequestId &&
       metadata.attachmentRepair.requestHash === requestHash
@@ -5906,6 +6236,8 @@ export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
       build.activeTurnId !== turn.id ||
       metadata.failureClass !== "requires_user_fix" ||
       metadata.recoveryAction !== "fix_attachments" ||
+      storedCreateAttemptState !== "not_sent" ||
+      !preCreateAttachmentFailure ||
       !metadata.recovery
     ) {
       throw new KnowledgeBaseTurnReservationError(
@@ -5945,8 +6277,14 @@ export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
       attachments.length + generatedAttachmentCount;
     const leaseToken = randomUUID();
     const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+    const {
+      dispatchingAt: _dispatchingAt,
+      providerReasonCategory: _providerReasonCategory,
+      providerRequestRef: _providerRequestRef,
+      ...metadataBeforeAttachmentRepair
+    } = metadata;
     const nextMetadata: KnowledgeBaseTurnMetadata = {
-      ...metadata,
+      ...metadataBeforeAttachmentRepair,
       attachmentsFrozen: false,
       expectedAttachmentCount,
       userAttachmentCount: attachments.length,
@@ -5962,8 +6300,9 @@ export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
       generatedAttachmentReservations: {},
       outcomeUnknownAt: undefined,
       outcomeUnknownCode: undefined,
+      createAttemptState: "not_sent",
+      createAttemptUpdatedAt: now.toISOString(),
       leaseOwnerHash: leaseOwnerHash(leaseToken),
-      dispatchingAt: now.toISOString(),
       dispatchState: "recovering",
       failureClass: "recoverable_same_turn",
       recoveryAction: "reconcile",

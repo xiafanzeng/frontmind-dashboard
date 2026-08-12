@@ -48,6 +48,13 @@ export function observationNeedsPolling(
   observation: KnowledgeBaseObservationDto,
   now = Date.now(),
 ): boolean {
+  const state = observation.interaction?.interactionState;
+  if (state !== "queued" && state !== "executing") {
+    // Failed, published, ready-to-publish and stable awaiting-input states are
+    // terminal from the coordinator's perspective. Focus/online may perform a
+    // single explicit refresh, but no timer may keep them in a feedback loop.
+    if (state !== "awaiting_input") return false;
+  }
   if (
     observation.notice?.code ===
     KNOWLEDGE_BASE_FINAL_PACKAGE_MISSING_NOTICE_CODE
@@ -61,7 +68,6 @@ export function observationNeedsPolling(
       KNOWLEDGE_BASE_LATE_PACKAGE_POLL_GRACE_MS
     );
   }
-  const state = observation.interaction?.interactionState;
   if (state === "queued" || state === "executing") return true;
   if (state !== "awaiting_input") return false;
 
@@ -144,9 +150,11 @@ export class KnowledgeBasePollingCoordinator {
     if (!conversationId || this.disposed) return;
     this.register(conversationId);
     const slot = this.slots.get(conversationId)!;
+    let pendingRequestChanged = false;
     if (pendingClientRequestId !== undefined) {
       const normalizedRequestId = pendingClientRequestId?.trim() || null;
       if (normalizedRequestId !== slot.pendingClientRequestId) {
+        pendingRequestChanged = true;
         const now = (this.options.now ?? Date.now)();
         slot.pendingClientRequestId = normalizedRequestId;
         slot.pendingRequestStartedAt = normalizedRequestId ? now : null;
@@ -158,7 +166,10 @@ export class KnowledgeBasePollingCoordinator {
       slot.timer = null;
     }
     if (slot.running) {
-      slot.rerunRequested = true;
+      // Progress events and query-cache updates can wake the same coordinator
+      // while its authoritative reconcile is still running. Only a genuinely
+      // new pending request warrants one follow-up observation.
+      if (pendingRequestChanged) slot.rerunRequested = true;
       return;
     }
     void this.run(conversationId, slot);

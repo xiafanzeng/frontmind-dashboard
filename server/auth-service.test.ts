@@ -25,6 +25,7 @@ import {
   deleteManagedUser,
   decryptApiKey,
   encryptApiKey,
+  getDecryptedCredentialForManagedUploadIntent,
   getDecryptedCredentialForKnowledgeBaseReservation,
   getApiKeyFingerprint,
   hashPassword,
@@ -49,6 +50,13 @@ function mockLockedRows<T>(rows: T[]) {
     ) {
       return Promise.resolve(rows).then(resolve, reject);
     },
+  };
+}
+
+function credentialFenceToken(userId: number, credentialId: string) {
+  return {
+    scope: { kind: "credential" as const, userId, credentialId },
+    nonce: "test-fence-token",
   };
 }
 
@@ -353,6 +361,64 @@ describe("API credential encryption", () => {
     ).resolves.toBeNull();
   });
 
+  it("resolves a frozen managed-upload credential after the account usage owner changes", async () => {
+    const credentialId = randomUUID();
+    const apiKey = "sk-frozen-managed-upload-owner-a";
+    const encrypted = encryptApiKey(7, credentialId, apiKey);
+    const credential = {
+      id: credentialId,
+      userId: 7,
+      version: 3,
+      ...encrypted,
+      fingerprint: getApiKeyFingerprint(apiKey),
+      status: "retired",
+      validationStatus: "verified",
+      verifiedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      retiredAt: new Date(),
+      deletedAt: null,
+    };
+    const select = vi.fn(() => ({
+      from: () => ({
+        where: () => ({
+          limit: async () => [credential],
+        }),
+      }),
+    }));
+    const executor = { select };
+
+    await expect(
+      getDecryptedCredentialForManagedUploadIntent(
+        {
+          credentialId,
+          credentialOwnerUserId: 7,
+          credentialVersion: 3,
+        },
+        executor,
+      ),
+    ).resolves.toMatchObject({
+      id: credentialId,
+      userId: 7,
+      version: 3,
+      apiKey,
+      status: "retired",
+    });
+    expect(select).toHaveBeenCalledTimes(1);
+
+    credential.userId = 8;
+    await expect(
+      getDecryptedCredentialForManagedUploadIntent(
+        {
+          credentialId,
+          credentialOwnerUserId: 7,
+          credentialVersion: 3,
+        },
+        executor,
+      ),
+    ).resolves.toBeNull();
+  });
+
   it("allows an account credential to independently store the website's raw Key", () => {
     const apiKey = "sk-shared-between-account-and-website";
     const accountCredentialId = randomUUID();
@@ -446,6 +512,7 @@ describe("API credential encryption", () => {
       deleteActiveApiCredentialInTransaction({
         executor,
         userId: 42,
+        fenceToken: credentialFenceToken(42, active.id),
         now: new Date("2026-07-30T12:00:00.000Z"),
       }),
     ).resolves.toEqual({ version: 4, deleted: true });
@@ -504,6 +571,7 @@ describe("API credential encryption", () => {
       deleteActiveApiCredentialInTransaction({
         executor,
         userId: 42,
+        fenceToken: credentialFenceToken(42, active.id),
         now: new Date("2026-07-30T12:00:00.000Z"),
       }),
     ).rejects.toMatchObject({
@@ -600,6 +668,7 @@ describe("API credential encryption", () => {
       deleteActiveApiCredentialInTransaction({
         executor,
         userId: 42,
+        fenceToken: credentialFenceToken(42, active.id),
         now: new Date("2026-08-02T00:00:00.000Z"),
       }),
     ).rejects.toMatchObject({
@@ -688,6 +757,7 @@ describe("API credential encryption", () => {
       deleteActiveApiCredentialInTransaction({
         executor,
         userId: 42,
+        fenceToken: credentialFenceToken(42, active.id),
         now: new Date("2026-08-02T00:01:00.000Z"),
       }),
     ).resolves.toEqual({ version: 4, deleted: true });
@@ -779,6 +849,7 @@ describe("API credential encryption", () => {
       deleteActiveApiCredentialInTransaction({
         executor,
         userId: 42,
+        fenceToken: credentialFenceToken(42, activeReplacement.id),
         now: new Date("2026-08-02T00:02:00.000Z"),
       }),
     ).resolves.toEqual({ version: 5, deleted: true });

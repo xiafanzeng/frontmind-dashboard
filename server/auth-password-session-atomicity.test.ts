@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const databaseMock = vi.hoisted(() => ({ getDb: vi.fn() }));
 
@@ -94,8 +97,19 @@ function transactionDatabase(
 }
 
 describe("password/session atomicity", () => {
-  beforeEach(() => {
+  let assetDirectory: string;
+
+  beforeEach(async () => {
     databaseMock.getDb.mockReset();
+    assetDirectory = await fs.mkdtemp(
+      path.join(os.tmpdir(), "auth-atomicity-"),
+    );
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetDirectory;
+  });
+
+  afterEach(async () => {
+    delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    await fs.rm(assetDirectory, { recursive: true, force: true });
   });
 
   it("updates the password and revokes every session in one transaction", async () => {
@@ -171,9 +185,19 @@ describe("password/session atomicity", () => {
     ]);
     databaseMock.getDb.mockResolvedValue(fake.db);
 
-    await expect(deleteManagedUser(1, 29)).resolves.toEqual({
+    const auditInTransaction = vi.fn().mockResolvedValue(undefined);
+    await expect(
+      deleteManagedUser(1, 29, {
+        onResultInTransaction: auditInTransaction,
+      }),
+    ).resolves.toEqual({
       disposition: "permanently_deleted",
     });
+
+    expect(auditInTransaction).toHaveBeenCalledWith(
+      { disposition: "permanently_deleted" },
+      expect.anything(),
+    );
 
     expect(fake.updateTables).toEqual([
       userPasswordSetupTokens,

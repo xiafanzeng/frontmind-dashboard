@@ -430,8 +430,13 @@ export default function BrandTrackingAgentPanel({
     sessionQuery.data?.session.sessionId === selectedSessionId
       ? sessionQuery.data.session
       : selectedSummary;
+  const visibleBrandName = sanitizeBrandText(brandName.trim());
   const blockingMessage = messageForBlockedOverview(overview);
   const canUseAgent = Boolean(overview && !blockingMessage);
+  const startBlockingMessage =
+    blockingMessage ||
+    (!visibleBrandName ? "请先在看板绑定有效的品牌名称。" : null);
+  const canStartNewSession = canUseAgent && Boolean(visibleBrandName);
   const isArchived = selectedSession?.status === "archived";
   const hasFirstAnswer = messages.some(
     (message) =>
@@ -668,7 +673,7 @@ export default function BrandTrackingAgentPanel({
   };
 
   const startNewSession = async () => {
-    if (!canUseAgent || streamActive.current) return;
+    if (!canStartNewSession || streamActive.current) return;
     streamActive.current = true;
     setIsStreaming(true);
     setStreamError(null);
@@ -739,11 +744,10 @@ export default function BrandTrackingAgentPanel({
   };
 
   const emptyStateDescription = useMemo(() => {
-    const visibleName = sanitizeBrandText(brandName.trim());
-    return visibleName
-      ? `围绕 ${visibleName} 持续追踪品牌提及、舆情趋势与潜在风险，并通过多轮对话逐步补充追踪范围。`
+    return visibleBrandName
+      ? `围绕 ${visibleBrandName} 持续追踪品牌提及、舆情趋势与潜在风险，并通过多轮对话逐步补充追踪范围。`
       : "持续追踪品牌提及、舆情趋势与潜在风险，并通过多轮对话逐步补充追踪范围。";
-  }, [brandName]);
+  }, [visibleBrandName]);
 
   const selectSession = (sessionId: string) => {
     if (streamActive.current) return;
@@ -846,19 +850,19 @@ export default function BrandTrackingAgentPanel({
                     </p>
                     <Button
                       type="button"
-                      disabled={!canUseAgent}
+                      disabled={!canStartNewSession}
                       onClick={() => setConfirmOpen(true)}
                       className="mt-6 h-11 gap-2 rounded-xl bg-[#245a4d] px-5 shadow-sm hover:bg-[#1c493e]"
                     >
                       <Radar className="h-4 w-4" />
                       启动品牌追踪
                     </Button>
-                    {blockingMessage && (
+                    {startBlockingMessage && (
                       <p
                         className="mt-3 max-w-md text-xs leading-5 text-amber-700"
                         role="alert"
                       >
-                        {blockingMessage}
+                        {startBlockingMessage}
                       </p>
                     )}
                     {streamError && (
@@ -931,7 +935,7 @@ export default function BrandTrackingAgentPanel({
                         type="button"
                         size="sm"
                         variant="outline"
-                        disabled={!canUseAgent || isStreaming}
+                        disabled={!canStartNewSession || isStreaming}
                         onClick={() => setConfirmOpen(true)}
                         className="rounded-lg"
                       >
@@ -1115,7 +1119,7 @@ export default function BrandTrackingAgentPanel({
                 size="icon-sm"
                 variant="ghost"
                 aria-label="新建品牌追踪"
-                disabled={!canUseAgent || isStreaming}
+                disabled={!canStartNewSession || isStreaming}
                 onClick={() => setConfirmOpen(true)}
               >
                 <Plus className="h-4 w-4" />
@@ -1161,13 +1165,35 @@ export default function BrandTrackingAgentPanel({
           <AlertDialogHeader>
             <AlertDialogTitle>确认启动新的品牌追踪？</AlertDialogTitle>
             <AlertDialogDescription>
-              确认后，智能体会直接返回第一条引导。当前活动会话将归档，历史内容仍可随时查看。
+              确认后，智能体会按以下固定设置直接开始追踪。当前活动会话将归档，历史内容仍可随时查看。
             </AlertDialogDescription>
+            <dl className="grid gap-2 rounded-xl border border-[#e4dbe9] bg-[#faf8fc] p-3 text-sm">
+              <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-2">
+                <dt className="text-[#82758f]">品牌</dt>
+                <dd className="break-words font-medium text-[#30273a]">
+                  {visibleBrandName || "未绑定"}
+                </dd>
+              </div>
+              <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-2">
+                <dt className="text-[#82758f]">名称变体</dt>
+                <dd className="font-medium text-[#30273a]">
+                  不确定，由 API 建议
+                </dd>
+              </div>
+              <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-2">
+                <dt className="text-[#82758f]">平台</dt>
+                <dd className="font-medium text-[#30273a]">全部</dd>
+              </div>
+              <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-2">
+                <dt className="text-[#82758f]">时间</dt>
+                <dd className="font-medium text-[#30273a]">过去 7 天</dd>
+              </div>
+            </dl>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isStreaming}>取消</AlertDialogCancel>
             <AlertDialogAction
-              disabled={!canUseAgent || isStreaming}
+              disabled={!canStartNewSession || isStreaming}
               onClick={() => {
                 setConfirmOpen(false);
                 void startNewSession();

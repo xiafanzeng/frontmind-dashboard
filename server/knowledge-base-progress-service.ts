@@ -1884,6 +1884,9 @@ export function knowledgeBaseProtocolErrorIsRetryable(input: {
   if (KNOWLEDGE_BASE_MAINTENANCE_ONLY_ERROR_CODES.has(input.code)) {
     return false;
   }
+  if (/^UPSTREAM_CREATE_(?:[0-9]{1,6}|HTTP_[0-9]{3})$/u.test(input.code)) {
+    return false;
+  }
   return Boolean(input.activeTurnId);
 }
 
@@ -2227,6 +2230,20 @@ function projectKnowledgeBaseObservationSnapshot(input: {
           : activeFailureClass
             ? "contact_support"
             : null;
+  const storedCreateAttemptState = String(
+    activeTurnMetadata.createAttemptState || "",
+  );
+  const activeCreateAttemptState = [
+    "not_sent",
+    "sending",
+    "acknowledged",
+    "rejected",
+    "unknown",
+  ].includes(storedCreateAttemptState)
+    ? (storedCreateAttemptState as NonNullable<
+        KnowledgeBaseActiveTurnDto["createAttemptState"]
+      >)
+    : undefined;
   if (
     activeTurnRow?.operationKey &&
     activeTurnRow.clientRequestId &&
@@ -2246,6 +2263,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       completedAt: activeTurnRow.completedAt?.getTime() ?? null,
       updatedAt: activeTurnRow.updatedAt.getTime(),
       dispatchState,
+      createAttemptState: activeCreateAttemptState,
       upstreamTaskId: activeTurnRow.upstreamTaskId,
       failureClass: activeFailureClass,
       recoveryAction: activeRecoveryAction,
@@ -2376,7 +2394,55 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   }
 
   let notice: KnowledgeBaseNoticeDto | null = null;
-  if (requiresAttachmentReselection && activeTurnRow) {
+  const activeTraceId = String(activeTurnMetadata.traceId || "").trim();
+  const safeActiveTraceId =
+    /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
+      activeTraceId,
+    )
+      ? activeTraceId
+      : null;
+  const activeAttachmentCount = Number(
+    activeTurnMetadata.expectedAttachmentCount ?? 0,
+  );
+  if (activeTurnRow?.errorCode === "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING") {
+    notice = {
+      key: `${build.id}:${build.generation}:${activeTurnRow.id}:attachments-processing`,
+      code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
+      severity: "info",
+      message: `${Number.isSafeInteger(activeAttachmentCount) ? activeAttachmentCount : 0} 个附件已保留，正在等待云端完成登记；期间不会重复上传或创建任务。`,
+      retryable: true,
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
+      traceId: safeActiveTraceId,
+      attachmentCount: Number.isSafeInteger(activeAttachmentCount)
+        ? activeAttachmentCount
+        : 0,
+      turnId: activeTurnRow.id,
+      createdAt: activeTurnRow.updatedAt.getTime(),
+    };
+  } else if (
+    activeTurnRow &&
+    activeTurnMetadata.createAttemptState === "unknown"
+  ) {
+    notice = {
+      key: `${build.id}:${build.generation}:${activeTurnRow.id}:create-outcome-unknown`,
+      code: "KNOWLEDGE_BASE_CREATE_OUTCOME_UNKNOWN",
+      severity: "warning",
+      message:
+        "上游任务创建结果无法安全确认。系统不会重复创建任务；请携带追踪编号联系支持核验。",
+      retryable: false,
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+      canRegenerate: false,
+      traceId: safeActiveTraceId,
+      attachmentCount: Number.isSafeInteger(activeAttachmentCount)
+        ? activeAttachmentCount
+        : 0,
+      turnId: activeTurnRow.id,
+      createdAt: activeTurnRow.updatedAt.getTime(),
+    };
+  } else if (requiresAttachmentReselection && activeTurnRow) {
     notice = {
       key: `${build.id}:${build.generation}:${activeTurnRow.id}:attachments-required`,
       code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
@@ -2446,6 +2512,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       failureClass,
       recoveryAction,
       canRegenerate,
+      traceId: safeActiveTraceId,
+      attachmentCount: Number.isSafeInteger(activeAttachmentCount)
+        ? activeAttachmentCount
+        : 0,
       turnId: activeTurnRow?.id || null,
       createdAt: build.updatedAt.getTime(),
     };

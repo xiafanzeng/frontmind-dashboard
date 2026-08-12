@@ -43,6 +43,7 @@ import { cn, copyToClipboard } from "@/lib/utils";
 import {
   creditEventBus,
   deliveryProjectHeaders,
+  discardManagedUploadIntent,
   discardUnboundUpload,
   getModelDisplayName,
   sanitizeBrandText,
@@ -92,6 +93,7 @@ import {
   normalizedKnowledgeBaseUploadFilename,
 } from "@/lib/attachment-files";
 import { isAttachmentExpired } from "@/lib/attachment-expiry";
+import { knowledgeBaseObservationAcknowledgesClientRequest } from "@/lib/knowledge-base-coordinator";
 
 export const KNOWLEDGE_BASE_FOUNDATION_COPY =
   "企业知识库是品牌事实与产品信息的统一底稿，也是构建 AI 专用友好官网、生成内容与准确回答客户问题的基础。";
@@ -115,6 +117,22 @@ export const KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE =
   "PACKAGE_REBIND_REQUIRED";
 export const KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE =
   "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED";
+export const KNOWLEDGE_BASE_REBUILD_REQUIRED_NOTICE_CODE = "UPSTREAM_CREATE_3";
+export const KNOWLEDGE_BASE_NEW_BUILD_EVENT =
+  "frontmind:new-knowledge-base-build";
+const KNOWLEDGE_BASE_TRACE_ID_PATTERN =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu;
+const KNOWLEDGE_BASE_PRECREATE_ATTACHMENT_REPAIR_CODES = new Set([
+  "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+  "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID",
+]);
+
+function safeKnowledgeBaseTraceId(value: unknown) {
+  const normalized = String(value || "").trim();
+  return KNOWLEDGE_BASE_TRACE_ID_PATTERN.test(normalized)
+    ? normalized
+    : undefined;
+}
 
 export function shouldRenderKnowledgeBaseNotice(
   notice: Pick<KnowledgeBaseClientNotice, "code">,
@@ -187,9 +205,12 @@ export function knowledgeBaseNoticeRequiresLogoProvenanceRepair(
 }
 
 export function knowledgeBaseNoticeRequiresAttachmentRepair(
-  notice: Pick<KnowledgeBaseClientNotice, "recoveryAction">,
+  notice: Pick<KnowledgeBaseClientNotice, "code" | "recoveryAction">,
 ) {
-  return notice.recoveryAction === "fix_attachments";
+  return (
+    notice.recoveryAction === "fix_attachments" &&
+    KNOWLEDGE_BASE_PRECREATE_ATTACHMENT_REPAIR_CODES.has(notice.code || "")
+  );
 }
 
 export function knowledgeBasePackageRebindResolved(
@@ -259,6 +280,9 @@ type ReportTaskStatus =
 interface OneClickTaskStartResponse {
   visibleMessage?: string;
   startedAt?: number;
+  reservationCreated?: boolean;
+  traceId?: string;
+  attachmentCount?: number;
   progress?: KnowledgeBaseProgressDto;
   interaction?: KnowledgeBaseInteractionDto;
   observation?: KnowledgeBaseObservationDto;
@@ -281,6 +305,12 @@ interface DeepReportStartInput {
 
 type KnowledgeBaseStarterUploadStage =
   | "queued"
+  | "creating_intent"
+  | "uploading_to_dashboard"
+  | "sealed"
+  | "creating_cloud_record"
+  | "uploading_to_cloud"
+  | "waiting_cloud_ready"
   | "creating_record"
   | "recovering"
   | "uploading"
@@ -301,14 +331,18 @@ type KnowledgeBaseStarterUploadReceipt = {
   fileId: string;
   filename: string;
   uploadedAt?: number;
+  providerReadyAt?: number;
   expiresAt?: number;
   traceId?: string;
 };
 
 type KnowledgeBaseStarterFileUpdate = {
   stage: KnowledgeBaseStarterUploadStage;
+  itemId?: string;
+  intentId?: string;
   fileId?: string;
   loadedBytes?: number;
+  dashboardReceivedBytes?: number;
   totalBytes?: number;
   receipt?: KnowledgeBaseStarterUploadReceipt;
   uploadHandle?: ManagedUploadHandle;
@@ -330,15 +364,22 @@ export type KnowledgeBaseStarterLifecycle = {
   signal: AbortSignal;
   clientRequestId: string;
   startedAt: number;
-  uploadedReceipts: ReadonlyMap<File, KnowledgeBaseStarterUploadReceipt>;
-  fileRecordIds: ReadonlyMap<File, string>;
-  uploadHandles: ReadonlyMap<File, ManagedUploadHandle>;
-  fileAttempts: ReadonlyMap<File, number>;
-  transferredBytes: ReadonlyMap<File, number>;
+  uploadedReceipts: ReadonlyMap<string, KnowledgeBaseStarterUploadReceipt>;
+  fileRecordIds: ReadonlyMap<string, string>;
+  uploadHandles: ReadonlyMap<string, ManagedUploadHandle>;
+  fileAttempts: ReadonlyMap<string, number>;
+  transferredBytes: ReadonlyMap<string, number>;
+  dashboardReceivedBytes?: ReadonlyMap<string, number>;
+  /** Stable row identities aligned with the `files` payload array. */
+  fileItemIds?: readonly string[];
   startPrepared: boolean;
   onStartPrepared: (prepared: boolean) => void;
   onBatchPhase: (phase: KnowledgeBaseStarterBatchPhase) => void;
-  onFileUpdate: (file: File, update: KnowledgeBaseStarterFileUpdate) => void;
+  onFileUpdate: (
+    itemId: string,
+    file: File,
+    update: KnowledgeBaseStarterFileUpdate,
+  ) => void;
 };
 
 function uploadErrorMessage(error: unknown) {
@@ -373,20 +414,33 @@ export async function uploadKnowledgeBaseStarterFiles(
   const messageAttachments: Attachment[] = [];
 
   for (const [fileIndex, file] of files.entries()) {
-    let receipt = receipts.get(file);
+    const itemId =
+      lifecycle.fileItemIds?.[fileIndex] ||
+      `${lifecycle.clientRequestId}:${fileIndex + 1}`;
+    let receipt = receipts.get(itemId);
     if (!receipt) {
       if (lifecycle.signal.aborted) {
         throw new DOMException("上传已停止", "AbortError");
       }
 
-      const existingFileId = lifecycle.fileRecordIds.get(file);
-      const existingUploadHandle = lifecycle.uploadHandles.get(file);
+      const existingFileId = lifecycle.fileRecordIds.get(itemId);
+      const existingUploadHandle = lifecycle.uploadHandles.get(itemId);
       const recoveryFileId = existingUploadHandle?.fileId || existingFileId;
       let currentFileId = recoveryFileId;
-      const attempt = (lifecycle.fileAttempts.get(file) ?? 0) + 1;
-      let transferredBytes = lifecycle.transferredBytes.get(file) ?? 0;
-      lifecycle.onFileUpdate(file, {
-        stage: recoveryFileId ? "recovering" : "creating_record",
+      let currentUploadHandle = existingUploadHandle;
+      const attempt = (lifecycle.fileAttempts.get(itemId) ?? 0) + 1;
+      let transferredBytes = lifecycle.transferredBytes.get(itemId) ?? 0;
+      lifecycle.onFileUpdate(itemId, file, {
+        stage:
+          existingUploadHandle || recoveryFileId
+            ? "recovering"
+            : "creating_intent",
+        ...(existingUploadHandle?.itemId
+          ? { itemId: existingUploadHandle.itemId }
+          : {}),
+        ...(existingUploadHandle?.intentId
+          ? { intentId: existingUploadHandle.intentId }
+          : {}),
         ...(recoveryFileId ? { fileId: recoveryFileId } : {}),
         ...(existingUploadHandle ? { uploadHandle: existingUploadHandle } : {}),
         loadedBytes: transferredBytes,
@@ -401,6 +455,7 @@ export async function uploadKnowledgeBaseStarterFiles(
           batchId: lifecycle.clientRequestId,
           batchOrdinal: fileIndex + 1,
           batchTotal: files.length,
+          itemId,
           signal: lifecycle.signal,
           ...(existingUploadHandle
             ? { existingUploadHandle }
@@ -409,11 +464,13 @@ export async function uploadKnowledgeBaseStarterFiles(
               : {}),
           onFileRecord: (event) => {
             const fileId = uploadFileRecordId(event);
-            if (!fileId) return;
-            currentFileId = fileId;
-            lifecycle.onFileUpdate(file, {
-              stage: "creating_record",
-              fileId,
+            if (fileId) currentFileId = fileId;
+            if (event.uploadHandle) currentUploadHandle = event.uploadHandle;
+            lifecycle.onFileUpdate(itemId, file, {
+              stage: event.intentId ? "creating_intent" : "creating_record",
+              ...(event.itemId ? { itemId: event.itemId } : {}),
+              ...(event.intentId ? { intentId: event.intentId } : {}),
+              ...(fileId ? { fileId } : {}),
               ...(event.uploadHandle
                 ? { uploadHandle: event.uploadHandle }
                 : {}),
@@ -424,7 +481,7 @@ export async function uploadKnowledgeBaseStarterFiles(
           },
           onFileRecordDiscarded: () => {
             currentFileId = undefined;
-            lifecycle.onFileUpdate(file, {
+            lifecycle.onFileUpdate(itemId, file, {
               stage: "creating_record",
               clearFileRecord: true,
               loadedBytes: transferredBytes,
@@ -439,15 +496,26 @@ export async function uploadKnowledgeBaseStarterFiles(
                 Math.min(file.size, Math.max(0, event.loadedBytes)),
               );
             }
-            lifecycle.onFileUpdate(file, {
+            const traceId = safeKnowledgeBaseTraceId(event.traceId);
+            lifecycle.onFileUpdate(itemId, file, {
               stage: event.stage,
+              ...(event.itemId ? { itemId: event.itemId } : {}),
+              ...(event.intentId ? { intentId: event.intentId } : {}),
               ...(event.fileId ? { fileId: event.fileId } : {}),
               loadedBytes: transferredBytes,
+              ...(typeof event.dashboardReceivedBytes === "number"
+                ? {
+                    dashboardReceivedBytes: Math.min(
+                      file.size,
+                      Math.max(0, event.dashboardReceivedBytes),
+                    ),
+                  }
+                : {}),
               totalBytes:
                 typeof event.totalBytes === "number"
                   ? event.totalBytes
                   : file.size,
-              ...(event.traceId ? { traceId: event.traceId } : {}),
+              ...(traceId ? { traceId } : {}),
               attempt,
             });
           },
@@ -462,14 +530,16 @@ export async function uploadKnowledgeBaseStarterFiles(
           fileId: uploaded.fileId,
           filename: uploaded.filename,
           uploadedAt: uploaded.uploadedAt,
+          providerReadyAt: uploaded.providerReadyAt,
           expiresAt: uploaded.expiresAt,
-          traceId: uploaded.traceId,
+          traceId: safeKnowledgeBaseTraceId(uploaded.traceId),
         };
-        receipts.set(file, receipt);
-        lifecycle.onFileUpdate(file, {
+        receipts.set(itemId, receipt);
+        lifecycle.onFileUpdate(itemId, file, {
           stage: "uploaded",
           fileId: receipt.fileId,
           loadedBytes: file.size,
+          dashboardReceivedBytes: file.size,
           totalBytes: file.size,
           receipt,
           traceId: receipt.traceId,
@@ -478,8 +548,10 @@ export async function uploadKnowledgeBaseStarterFiles(
       } catch (error) {
         const rawStructuredFileId = (error as { fileId?: unknown } | null)
           ?.fileId;
-        const structuredFileId =
-          typeof rawStructuredFileId === "string" && rawStructuredFileId.trim()
+        const structuredFileId = currentUploadHandle?.intentId
+          ? undefined
+          : typeof rawStructuredFileId === "string" &&
+              rawStructuredFileId.trim()
             ? rawStructuredFileId
             : undefined;
         const structuredRetryable = (error as { retryable?: unknown } | null)
@@ -495,7 +567,7 @@ export async function uploadKnowledgeBaseStarterFiles(
           structuredRecoveryAction !== "discard_and_recreate"
             ? "check_status"
             : structuredRecoveryAction;
-        lifecycle.onFileUpdate(file, {
+        lifecycle.onFileUpdate(itemId, file, {
           stage: uploadWasCancelled(error, lifecycle.signal)
             ? "cancelled"
             : "failed",
@@ -518,10 +590,9 @@ export async function uploadKnowledgeBaseStarterFiles(
           recreateRequired:
             structuredRecreateRequired &&
             structuredRecoveryAction === "discard_and_recreate",
-          traceId:
-            String(
-              (error as { traceId?: unknown } | null)?.traceId || "",
-            ).trim() || undefined,
+          traceId: safeKnowledgeBaseTraceId(
+            (error as { traceId?: unknown } | null)?.traceId,
+          ),
           attempt,
         });
         throw error;
@@ -582,6 +653,8 @@ export function projectKnowledgeBaseStarterRequest(input: {
 type KnowledgeBaseStartRequestError = Error & {
   status?: number;
   code?: string;
+  traceId?: string;
+  attachmentCount?: number;
   reservationCreated?: boolean;
   observation?: KnowledgeBaseObservationDto;
 };
@@ -653,8 +726,20 @@ export async function readKnowledgeBaseStartRequestError(
       `请求失败 (${response.status})`;
     const error = new Error(message) as KnowledgeBaseStartRequestError;
     error.status = response.status;
-    error.code =
-      String(errorNode?.code || data?.code || "").trim() || undefined;
+    const code = String(errorNode?.code || data?.code || "").trim();
+    const traceId = String(errorNode?.traceId || data?.traceId || "").trim();
+    error.code = /^[A-Z0-9_:-]{1,128}$/u.test(code) ? code : undefined;
+    error.traceId = safeKnowledgeBaseTraceId(traceId);
+    const attachmentCount = Number(
+      errorNode?.attachmentCount ?? data?.attachmentCount,
+    );
+    if (
+      Number.isSafeInteger(attachmentCount) &&
+      attachmentCount >= 0 &&
+      attachmentCount <= 1_000
+    ) {
+      error.attachmentCount = attachmentCount;
+    }
     if (typeof data?.reservationCreated === "boolean") {
       error.reservationCreated = data.reservationCreated;
     }
@@ -810,6 +895,8 @@ export default function ChatArea({
 }) {
   const {
     activeConversation,
+    createConversation,
+    setActive,
     deleteConversation,
     deleteMessage,
     addMessage,
@@ -831,20 +918,37 @@ export default function ChatArea({
   const [, setTick] = useState(0);
   const [retryingKnowledgeBase, setRetryingKnowledgeBase] = useState(false);
 
+  const startFreshKnowledgeBaseBuild = useCallback(() => {
+    const conversationId = createConversation({
+      title: "企业知识库构建",
+      reuseEmpty: false,
+    });
+    setActive(conversationId);
+    window.dispatchEvent(
+      new CustomEvent(KNOWLEDGE_BASE_NEW_BUILD_EVENT, {
+        detail: { conversationId },
+      }),
+    );
+    toast.info("已新建知识库构建", {
+      description: "上一轮及其附件保持只读；请为新一轮重新选择资料。",
+    });
+  }, [createConversation, setActive]);
+
   const status = activeConversation?.status;
   const startedAt = activeConversation?.startedAt;
   const completedAt = activeConversation?.completedAt;
+  const hasKnowledgeBaseProgress = Boolean(knowledgeBaseProgress);
 
   useEffect(() => {
     if (!syncKnowledgeBaseSnapshot || !activeConversation?.id) return;
     registerKnowledgeBaseConversation(activeConversation.id);
-    if (activeConversation.taskId || knowledgeBaseProgress) {
+    if (activeConversation.taskId || hasKnowledgeBaseProgress) {
       wakeKnowledgeBaseConversation(activeConversation.id);
     }
   }, [
     activeConversation?.id,
     activeConversation?.taskId,
-    knowledgeBaseProgress,
+    hasKnowledgeBaseProgress,
     registerKnowledgeBaseConversation,
     syncKnowledgeBaseSnapshot,
     wakeKnowledgeBaseConversation,
@@ -887,6 +991,7 @@ export default function ChatArea({
       const responseStartedAt = lifecycle.startedAt;
       const clientRequestId = lifecycle.clientRequestId;
       let requestDispatched = false;
+      let preparedMessageAttachments: Attachment[] = [];
 
       try {
         assertChatAttachmentSizes(files);
@@ -896,17 +1001,8 @@ export default function ChatArea({
             lifecycle,
             responseStartedAt,
           );
+        preparedMessageAttachments = messageAttachments;
         lifecycle.onBatchPhase("starting");
-
-        projectKnowledgeBaseStarterRequest({
-          lifecycle,
-          conversationId,
-          responseStartedAt,
-          messageAttachments,
-          registerConversation: registerKnowledgeBaseConversation,
-          addConversationMessage: addMessage,
-          updateConversationTitle: updateTitle,
-        });
 
         requestDispatched = true;
         const response = await fetchKnowledgeBaseStartRequest(
@@ -936,25 +1032,56 @@ export default function ChatArea({
         }
 
         const data = (await response.json()) as OneClickTaskStartResponse;
-        if (!data.observation && !data.task?.id) {
-          throw new Error("任务创建失败：未返回任务 ID");
+        const observation = data.observation
+          ? knowledgeBaseObservationFromPayload(data)
+          : undefined;
+        const observationAcknowledged =
+          knowledgeBaseObservationAcknowledgesClientRequest(
+            observation,
+            clientRequestId,
+          );
+        if (
+          data.reservationCreated === false ||
+          (data.reservationCreated !== true && !observationAcknowledged)
+        ) {
+          const contractError = new Error(
+            "启动响应未确认当前知识库任务已受理",
+          ) as KnowledgeBaseStartRequestError;
+          contractError.code = "KNOWLEDGE_BASE_START_UNACKNOWLEDGED";
+          contractError.reservationCreated = false;
+          throw contractError;
         }
 
+        projectKnowledgeBaseStarterRequest({
+          lifecycle,
+          conversationId,
+          responseStartedAt,
+          messageAttachments,
+          registerConversation: registerKnowledgeBaseConversation,
+          addConversationMessage: addMessage,
+          updateConversationTitle: updateTitle,
+        });
+
         const taskStartedAt = data.startedAt || responseStartedAt;
-        if (data.observation) {
-          commitKnowledgeBaseObservation(
-            conversationId,
-            knowledgeBaseObservationFromPayload(data),
-          );
+        if (observation) {
+          commitKnowledgeBaseObservation(conversationId, observation);
         } else {
           // Compatibility while the server fleet rolls forward. Never project
-          // data.task.output for KB; the coordinator will obtain the approved DTO.
-          updateStatus(conversationId, "running", {
-            taskId: data.task!.id,
-            taskUrl: data.task!.taskUrl,
-            previousResponseId: data.task!.id,
-            startedAt: taskStartedAt,
-          });
+          // data.task.output for KB; the coordinator will obtain the approved
+          // DTO. A durable reservation may be acknowledged before a provider
+          // task id exists, so the task fields are optional in this window.
+          updateStatus(
+            conversationId,
+            "running",
+            data.task?.id
+              ? {
+                  taskId: data.task.id,
+                  taskUrl: data.task.taskUrl,
+                  previousResponseId: data.task.id,
+                  startedAt: taskStartedAt,
+                }
+              : { startedAt: taskStartedAt },
+          );
         }
         wakeKnowledgeBaseConversation(conversationId);
 
@@ -979,11 +1106,36 @@ export default function ChatArea({
           lifecycle.onBatchPhase("failed");
           toast.error("文件过大", { description: errorMessage });
           throw error;
-        } else if (error?.observation) {
-          settleKnowledgeBaseStartFailure(conversationId, clientRequestId);
+        } else if (
+          error?.reservationCreated !== false &&
+          error?.observation &&
+          knowledgeBaseObservationAcknowledgesClientRequest(
+            error.observation,
+            clientRequestId,
+          )
+        ) {
+          projectKnowledgeBaseStarterRequest({
+            lifecycle,
+            conversationId,
+            responseStartedAt,
+            messageAttachments: preparedMessageAttachments,
+            registerConversation: registerKnowledgeBaseConversation,
+            addConversationMessage: addMessage,
+            updateConversationTitle: updateTitle,
+          });
           commitKnowledgeBaseObservation(conversationId, error.observation);
           wakeKnowledgeBaseConversation(conversationId);
-          toast.error("启动结果已确认", { description: errorMessage });
+          const attachmentCount = Number(error.attachmentCount || 0);
+          const diagnostic = [error.code, error.traceId]
+            .filter(Boolean)
+            .join(" · ");
+          toast.error("知识库任务未创建", {
+            description: `${
+              attachmentCount > 0
+                ? `${attachmentCount}/${attachmentCount} 个附件已保留。`
+                : "附件已保留。"
+            }${errorMessage}${diagnostic ? `（${diagnostic}）` : ""}`,
+          });
           lifecycle.onBatchPhase("completed");
           return { status: "accepted" };
         } else if (
@@ -998,6 +1150,15 @@ export default function ChatArea({
           lifecycle.onBatchPhase("failed");
           throw error;
         } else {
+          projectKnowledgeBaseStarterRequest({
+            lifecycle,
+            conversationId,
+            responseStartedAt,
+            messageAttachments: preparedMessageAttachments,
+            registerConversation: registerKnowledgeBaseConversation,
+            addConversationMessage: addMessage,
+            updateConversationTitle: updateTitle,
+          });
           updateStatus(conversationId, "running", {
             startedAt: responseStartedAt,
           });
@@ -1100,17 +1261,19 @@ export default function ChatArea({
     wakeKnowledgeBaseConversation,
   ]);
 
+  const messages = useMemo(
+    () =>
+      activeConversation
+        ? messageProjection
+          ? activeConversation.messages.map(messageProjection)
+          : activeConversation.messages
+        : [],
+    [activeConversation, messageProjection],
+  );
+
   if (!activeConversation) {
     return <EmptyState />;
   }
-
-  const messages = useMemo(
-    () =>
-      messageProjection
-        ? activeConversation.messages.map(messageProjection)
-        : activeConversation.messages,
-    [activeConversation.messages, messageProjection],
-  );
 
   const sanitizedTitle = activeConversation.title
     ? sanitizeBrandText(activeConversation.title)
@@ -1265,12 +1428,66 @@ export default function ChatArea({
                 }
               >
                 <div className="flex flex-wrap items-start justify-between gap-3">
-                  <span className="min-w-0 flex-1">
-                    {activeConversation.knowledgeBase.notice.message}
-                  </span>
-                  {knowledgeBaseNoticeRequiresLogoProvenanceRepair(
-                    activeConversation.knowledgeBase.notice,
-                  ) ? (
+                  <div className="min-w-0 flex-1">
+                    <span>
+                      {activeConversation.knowledgeBase.notice.message}
+                    </span>
+                    {activeConversation.knowledgeBase.notice.severity ===
+                      "error" &&
+                      typeof activeConversation.knowledgeBase.notice
+                        .attachmentCount === "number" &&
+                      activeConversation.knowledgeBase.notice.attachmentCount >
+                        0 && (
+                        <p
+                          className="mt-1 text-xs"
+                          data-testid="knowledge-base-attachment-retention"
+                        >
+                          {
+                            activeConversation.knowledgeBase.notice
+                              .attachmentCount
+                          }
+                          /
+                          {
+                            activeConversation.knowledgeBase.notice
+                              .attachmentCount
+                          }{" "}
+                          个附件已保留，知识库任务未创建。
+                        </p>
+                      )}
+                    {activeConversation.knowledgeBase.notice.severity ===
+                      "error" &&
+                      (activeConversation.knowledgeBase.notice.code ||
+                        activeConversation.knowledgeBase.notice.traceId) && (
+                        <p
+                          className="mt-1 break-all text-[11px] opacity-75"
+                          data-testid="knowledge-base-safe-diagnostic"
+                        >
+                          {activeConversation.knowledgeBase.notice.code
+                            ? `错误码：${activeConversation.knowledgeBase.notice.code}`
+                            : ""}
+                          {activeConversation.knowledgeBase.notice.code &&
+                          activeConversation.knowledgeBase.notice.traceId
+                            ? " · "
+                            : ""}
+                          {activeConversation.knowledgeBase.notice.traceId
+                            ? `排查编号：${activeConversation.knowledgeBase.notice.traceId}`
+                            : ""}
+                        </p>
+                      )}
+                  </div>
+                  {activeConversation.knowledgeBase.notice.code ===
+                  KNOWLEDGE_BASE_REBUILD_REQUIRED_NOTICE_CODE ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={startFreshKnowledgeBaseBuild}
+                    >
+                      新建知识库构建
+                    </Button>
+                  ) : knowledgeBaseNoticeRequiresLogoProvenanceRepair(
+                      activeConversation.knowledgeBase.notice,
+                    ) ? (
                     activeConversation.knowledgeBase.revision !== null ? (
                       <KnowledgeBaseLogoProvenanceRepair
                         conversationId={activeConversation.id}
@@ -1494,8 +1711,11 @@ function StandardConversationHint({
 
 type KnowledgeBaseStarterFileState = {
   stage: KnowledgeBaseStarterUploadStage;
+  itemId?: string;
+  intentId?: string;
   fileId?: string;
   loadedBytes: number;
+  dashboardReceivedBytes?: number;
   totalBytes: number;
   error?: string;
   errorCode?: string;
@@ -1512,6 +1732,14 @@ function createKnowledgeBaseStarterClientRequestId(startedAt: number) {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : `kb-start-${startedAt}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createKnowledgeBaseStarterItemId(file: File) {
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return `kb-file-${suffix}-${file.size}`.slice(0, 255);
 }
 
 function formatKnowledgeBaseStarterBytes(bytes: number) {
@@ -1532,6 +1760,25 @@ function formatKnowledgeBaseStarterElapsed(milliseconds: number) {
 
 function knowledgeBaseStarterStageCopy(state: KnowledgeBaseStarterFileState) {
   switch (state.stage) {
+    case "creating_intent":
+      return "正在创建 Dashboard 本地上传记录";
+    case "uploading_to_dashboard": {
+      const percent = state.totalBytes
+        ? Math.min(
+            100,
+            Math.round((state.loadedBytes / state.totalBytes) * 100),
+          )
+        : 0;
+      return `正在上传到 Dashboard ${percent}%`;
+    }
+    case "sealed":
+      return "Dashboard 已完整接收，正在准备云端上传";
+    case "creating_cloud_record":
+      return "正在创建云端文件记录";
+    case "uploading_to_cloud":
+      return "Dashboard 正在从本地副本上传云端";
+    case "waiting_cloud_ready":
+      return "文件已接收，正在等待云端就绪";
     case "creating_record":
       return "正在准备安全上传";
     case "recovering":
@@ -1546,9 +1793,9 @@ function knowledgeBaseStarterStageCopy(state: KnowledgeBaseStarterFileState) {
       return `正在上传 ${percent}%`;
     }
     case "server_processing":
-      return "文件已接收，正在云端校验并登记";
+      return "文件已接收，正在等待云端就绪";
     case "uploaded":
-      return "上传完成";
+      return "云端已确认";
     case "failed":
       return state.error || "上传失败";
     case "cancelled":
@@ -1563,7 +1810,7 @@ function knowledgeBaseStarterBatchCopy(phase: KnowledgeBaseStarterBatchPhase) {
     case "uploading":
       return "资料上传中，尚未启动知识库构建";
     case "starting":
-      return "资料已上传，正在启动知识库构建";
+      return "资料已由云端确认，正在启动知识库构建";
     case "recovering":
       return "请求结果暂时未知，正在确认是否已启动";
     case "completed":
@@ -1620,21 +1867,24 @@ export function EmptyConversationHint({
   const [dialogOpen, setDialogOpen] = useState(false);
   const [companyWebsite, setCompanyWebsite] = useState("");
   const [operatorNotes, setOperatorNotes] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
+  const [fileItems, setFileItems] = useState<
+    Array<{ itemId: string; file: File }>
+  >([]);
+  const files = useMemo(() => fileItems.map((item) => item.file), [fileItems]);
   const [isDragging, setIsDragging] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isDiscarding, setIsDiscarding] = useState(false);
   const [fileStates, setFileStates] = useState<
-    Map<File, KnowledgeBaseStarterFileState>
+    Map<string, KnowledgeBaseStarterFileState>
   >(() => new Map());
   const [uploadedReceipts, setUploadedReceipts] = useState<
-    Map<File, KnowledgeBaseStarterUploadReceipt>
+    Map<string, KnowledgeBaseStarterUploadReceipt>
   >(() => new Map());
-  const [fileRecordIds, setFileRecordIds] = useState<Map<File, string>>(
+  const [fileRecordIds, setFileRecordIds] = useState<Map<string, string>>(
     () => new Map(),
   );
   const [uploadHandles, setUploadHandles] = useState<
-    Map<File, ManagedUploadHandle>
+    Map<string, ManagedUploadHandle>
   >(() => new Map());
   const [batchStartedAt, setBatchStartedAt] = useState<number | null>(null);
   const [elapsedAt, setElapsedAt] = useState(() => Date.now());
@@ -1653,25 +1903,32 @@ export function EmptyConversationHint({
       toast.error("文件过大", { description: sizeError });
       return false;
     });
-    setFiles((current) => {
+    const candidates = incoming.map((file) => ({
+      itemId: createKnowledgeBaseStarterItemId(file),
+      file,
+    }));
+    setFileItems((current) => {
       const seen = new Set(
-        current.map((file) => `${file.name}:${file.size}:${file.lastModified}`),
+        current.map(
+          ({ file }) => `${file.name}:${file.size}:${file.lastModified}`,
+        ),
       );
       const next = [...current];
-      for (const file of incoming) {
+      for (const candidate of candidates) {
+        const { file } = candidate;
         const key = `${file.name}:${file.size}:${file.lastModified}`;
         if (!seen.has(key)) {
           seen.add(key);
-          next.push(file);
+          next.push(candidate);
         }
       }
       return next;
     });
     setFileStates((current) => {
       const next = new Map(current);
-      for (const file of incoming) {
-        if (!next.has(file)) {
-          next.set(file, {
+      for (const { itemId, file } of candidates) {
+        if (!next.has(itemId)) {
+          next.set(itemId, {
             stage: "queued",
             loadedBytes: 0,
             totalBytes: file.size,
@@ -1685,7 +1942,7 @@ export function EmptyConversationHint({
   const resetDialog = useCallback(() => {
     setCompanyWebsite("");
     setOperatorNotes("");
-    setFiles([]);
+    setFileItems([]);
     setIsDragging(false);
     setIsStarting(false);
     setIsDiscarding(false);
@@ -1708,15 +1965,26 @@ export function EmptyConversationHint({
   const removeFile = useCallback(
     async (index: number) => {
       const removed = files[index];
+      const removedItem = fileItems[index];
       // Once /knowledge-base/start has been projected, retries must keep the
       // exact attachment payload bound to the same clientRequestId. Cancelling
       // the whole batch remains available for an intentional new request.
-      if (!removed || isStarting || isDiscarding || startPrepared) return;
-      const fileId = fileRecordIds.get(removed);
-      if (fileId) {
+      if (
+        !removed ||
+        !removedItem ||
+        isStarting ||
+        isDiscarding ||
+        startPrepared
+      )
+        return;
+      const { itemId } = removedItem;
+      const fileId = fileRecordIds.get(itemId);
+      const uploadHandle = uploadHandles.get(itemId);
+      if (fileId || uploadHandle) {
         setIsDiscarding(true);
         try {
-          await discardUnboundUpload(fileId);
+          if (uploadHandle) await discardManagedUploadIntent(uploadHandle);
+          else await discardUnboundUpload(fileId!);
         } catch (error) {
           const code = String((error as { code?: unknown } | null)?.code || "");
           toast.warning(
@@ -1736,34 +2004,57 @@ export function EmptyConversationHint({
         }
       }
 
-      setFiles((current) => current.filter((file) => file !== removed));
+      setFileItems((current) =>
+        current.filter((item) => item.itemId !== itemId),
+      );
       setFileStates((states) => {
         const next = new Map(states);
-        next.delete(removed);
+        next.delete(itemId);
         return next;
       });
       setUploadedReceipts((receipts) => {
         const next = new Map(receipts);
-        next.delete(removed);
+        next.delete(itemId);
         return next;
       });
       setFileRecordIds((records) => {
         const next = new Map(records);
-        next.delete(removed);
+        next.delete(itemId);
         return next;
       });
       setUploadHandles((handles) => {
         const next = new Map(handles);
-        next.delete(removed);
+        next.delete(itemId);
         return next;
       });
     },
-    [fileRecordIds, files, isDiscarding, isStarting, startPrepared],
+    [
+      fileItems,
+      fileRecordIds,
+      files,
+      isDiscarding,
+      isStarting,
+      startPrepared,
+      uploadHandles,
+    ],
   );
 
   const discardBatchAndClose = useCallback(async () => {
     if (isStarting || isDiscarding) return;
-    const records = Array.from(fileRecordIds.entries());
+    const targets = new Map<
+      string,
+      { fileId?: string; handle?: ManagedUploadHandle }
+    >();
+    for (const [itemId, fileId] of fileRecordIds) {
+      targets.set(itemId, { fileId });
+    }
+    // A sealed/processing intent intentionally has no provider fileId yet.
+    // Include it independently so closing the dialog cannot orphan local
+    // bytes or bypass the intent DELETE contract.
+    for (const [itemId, handle] of uploadHandles) {
+      targets.set(itemId, { ...targets.get(itemId), handle });
+    }
+    const records = Array.from(targets.entries());
     if (records.length === 0) {
       setDialogOpen(false);
       resetDialog();
@@ -1772,37 +2063,42 @@ export function EmptyConversationHint({
 
     setIsDiscarding(true);
     const results = await Promise.allSettled(
-      records.map(([, fileId]) => discardUnboundUpload(fileId)),
+      records.map(([, target]) => {
+        if (target.handle) return discardManagedUploadIntent(target.handle);
+        return discardUnboundUpload(target.fileId!);
+      }),
     );
-    const failed: Array<{ file: File; error: unknown }> = [];
-    const discardedFiles: File[] = [];
+    const failed: Array<{ itemId: string; error: unknown }> = [];
+    const discardedItemIds: string[] = [];
     results.forEach((result, index) => {
-      const file = records[index][0];
-      if (result.status === "fulfilled") discardedFiles.push(file);
-      else failed.push({ file, error: result.reason });
+      const itemId = records[index][0];
+      if (result.status === "fulfilled") discardedItemIds.push(itemId);
+      else failed.push({ itemId, error: result.reason });
     });
 
     if (failed.length > 0) {
-      const discarded = new Set(discardedFiles);
+      const discarded = new Set(discardedItemIds);
       setFileRecordIds((current) => {
         const next = new Map(current);
-        for (const file of discarded) next.delete(file);
+        for (const itemId of discarded) next.delete(itemId);
         return next;
       });
       setUploadHandles((current) => {
         const next = new Map(current);
-        for (const file of discarded) next.delete(file);
+        for (const itemId of discarded) next.delete(itemId);
         return next;
       });
       setUploadedReceipts((current) => {
         const next = new Map(current);
-        for (const file of discarded) next.delete(file);
+        for (const itemId of discarded) next.delete(itemId);
         return next;
       });
       setFileStates((current) => {
         const next = new Map(current);
-        for (const file of discarded) {
-          next.set(file, {
+        for (const itemId of discarded) {
+          const file = fileItems.find((item) => item.itemId === itemId)?.file;
+          if (!file) continue;
+          next.set(itemId, {
             stage: "queued",
             loadedBytes: 0,
             totalBytes: file.size,
@@ -1832,7 +2128,14 @@ export function EmptyConversationHint({
     setIsDiscarding(false);
     setDialogOpen(false);
     resetDialog();
-  }, [fileRecordIds, isDiscarding, isStarting, resetDialog]);
+  }, [
+    fileItems,
+    fileRecordIds,
+    isDiscarding,
+    isStarting,
+    resetDialog,
+    uploadHandles,
+  ]);
 
   useEffect(() => {
     if (!isStarting || batchStartedAt === null) return;
@@ -1842,48 +2145,54 @@ export function EmptyConversationHint({
   }, [batchStartedAt, isStarting]);
 
   const updateFileState = useCallback(
-    (file: File, update: KnowledgeBaseStarterFileUpdate) => {
+    (itemId: string, file: File, update: KnowledgeBaseStarterFileUpdate) => {
       if (update.clearFileRecord) {
         setFileRecordIds((current) => {
           const next = new Map(current);
-          next.delete(file);
+          next.delete(itemId);
           return next;
         });
         setUploadHandles((current) => {
           const next = new Map(current);
-          next.delete(file);
+          next.delete(itemId);
           return next;
         });
       }
       if (update.fileId) {
         setFileRecordIds((current) => {
           const next = new Map(current);
-          next.set(file, update.fileId!);
+          next.set(itemId, update.fileId!);
           return next;
         });
       }
       if (update.uploadHandle) {
         setUploadHandles((current) => {
           const next = new Map(current);
-          next.set(file, update.uploadHandle!);
+          next.set(itemId, update.uploadHandle!);
           return next;
         });
       }
       if (update.receipt) {
         setUploadedReceipts((current) => {
           const next = new Map(current);
-          next.set(file, update.receipt!);
+          next.set(itemId, update.receipt!);
           return next;
         });
       }
       setFileStates((current) => {
-        const previous = current.get(file) || {
+        const previous = current.get(itemId) || {
           stage: "queued" as const,
           loadedBytes: 0,
           totalBytes: file.size,
         };
         const now = Date.now();
         const isActive = [
+          "creating_intent",
+          "uploading_to_dashboard",
+          "sealed",
+          "creating_cloud_record",
+          "uploading_to_cloud",
+          "waiting_cloud_ready",
           "creating_record",
           "recovering",
           "uploading",
@@ -1895,7 +2204,7 @@ export function EmptyConversationHint({
         const startedAt =
           previous.startedAt ?? (isActive || isTerminal ? now : undefined);
         const next = new Map(current);
-        next.set(file, {
+        next.set(itemId, {
           ...previous,
           ...update,
           ...(update.clearFileRecord ? { fileId: undefined } : {}),
@@ -1903,6 +2212,13 @@ export function EmptyConversationHint({
             typeof update.loadedBytes === "number"
               ? Math.max(previous.loadedBytes, 0, update.loadedBytes)
               : previous.loadedBytes,
+          dashboardReceivedBytes:
+            typeof update.dashboardReceivedBytes === "number"
+              ? Math.max(
+                  previous.dashboardReceivedBytes ?? 0,
+                  update.dashboardReceivedBytes,
+                )
+              : previous.dashboardReceivedBytes,
           totalBytes:
             typeof update.totalBytes === "number" && update.totalBytes > 0
               ? update.totalBytes
@@ -1920,19 +2236,29 @@ export function EmptyConversationHint({
   );
 
   const uploadSummary = useMemo(() => {
-    const totalBytes = files.reduce((total, file) => total + file.size, 0);
+    const totalBytes = fileItems.reduce(
+      (total, { file }) => total + file.size,
+      0,
+    );
     let transferredBytes = 0;
+    let dashboardReceivedBytes = 0;
     let confirmedBytes = 0;
     let confirmedCount = 0;
-    for (const file of files) {
-      const state = fileStates.get(file);
-      if (uploadedReceipts.has(file) || state?.stage === "uploaded") {
+    for (const { itemId, file } of fileItems) {
+      const state = fileStates.get(itemId);
+      // Browser transfer and even a provider PUT success are not a confirmed
+      // attachment until the managed upload returns its final receipt.
+      if (uploadedReceipts.has(itemId)) {
         confirmedCount += 1;
         confirmedBytes += file.size;
       }
       transferredBytes += Math.min(
         file.size,
         Math.max(0, state?.loadedBytes ?? 0),
+      );
+      dashboardReceivedBytes += Math.min(
+        file.size,
+        Math.max(0, state?.dashboardReceivedBytes ?? 0),
       );
     }
     const rawPercent = totalBytes
@@ -1941,6 +2267,7 @@ export function EmptyConversationHint({
     return {
       totalBytes,
       transferredBytes,
+      dashboardReceivedBytes,
       confirmedBytes,
       uploadedCount: confirmedCount,
       percent:
@@ -1948,12 +2275,12 @@ export function EmptyConversationHint({
           ? 100
           : Math.min(99, rawPercent),
     };
-  }, [fileStates, files, uploadedReceipts]);
+  }, [fileItems, fileStates, files.length, uploadedReceipts]);
 
   const nonRetryableFailedFile = useMemo(
     () =>
-      files.find((file) => {
-        const state = fileStates.get(file);
+      fileItems.find(({ itemId }) => {
+        const state = fileStates.get(itemId);
         return (
           state?.stage === "failed" &&
           state.retryable === false &&
@@ -1962,8 +2289,18 @@ export function EmptyConversationHint({
             String(state.recoveryAction),
           )
         );
+      })?.file,
+    [fileItems, fileStates],
+  );
+  const hasCloudStatusCheckFailure = useMemo(
+    () =>
+      fileItems.some(({ itemId }) => {
+        const state = fileStates.get(itemId);
+        return (
+          state?.stage === "failed" && state.recoveryAction === "check_status"
+        );
       }),
-    [fileStates, files],
+    [fileItems, fileStates],
   );
 
   const handleStart = useCallback(async () => {
@@ -1986,16 +2323,16 @@ export function EmptyConversationHint({
     );
     setFileStates((current) => {
       const next = new Map(current);
-      for (const file of files) {
-        const state = next.get(file);
+      for (const { itemId, file } of fileItems) {
+        const state = next.get(itemId);
         if (!state) {
-          next.set(file, {
+          next.set(itemId, {
             stage: "queued",
             loadedBytes: 0,
             totalBytes: file.size,
           });
         } else if (state.stage === "failed" || state.stage === "cancelled") {
-          next.set(file, {
+          next.set(itemId, {
             ...state,
             stage: "queued",
             error: undefined,
@@ -2031,11 +2368,24 @@ export function EmptyConversationHint({
         fileRecordIds: new Map(fileRecordIds),
         uploadHandles: new Map(uploadHandles),
         fileAttempts: new Map(
-          files.map((file) => [file, fileStates.get(file)?.attempt ?? 0]),
+          fileItems.map(({ itemId }) => [
+            itemId,
+            fileStates.get(itemId)?.attempt ?? 0,
+          ]),
         ),
         transferredBytes: new Map(
-          files.map((file) => [file, fileStates.get(file)?.loadedBytes ?? 0]),
+          fileItems.map(({ itemId }) => [
+            itemId,
+            fileStates.get(itemId)?.loadedBytes ?? 0,
+          ]),
         ),
+        dashboardReceivedBytes: new Map(
+          fileItems.map(({ itemId }) => [
+            itemId,
+            fileStates.get(itemId)?.dashboardReceivedBytes ?? 0,
+          ]),
+        ),
+        fileItemIds: fileItems.map(({ itemId }) => itemId),
         startPrepared,
         onStartPrepared: setStartPrepared,
         onBatchPhase: setBatchPhase,
@@ -2068,6 +2418,7 @@ export function EmptyConversationHint({
     companyConfigured,
     companyWebsite,
     fileRecordIds,
+    fileItems,
     fileStates,
     files,
     onStartKnowledgeBase,
@@ -2262,9 +2613,9 @@ export function EmptyConversationHint({
 
               {files.length > 0 && (
                 <div className="space-y-2 rounded-xl border border-border/70 bg-muted/20 p-3">
-                  {files.map((file, index) => (
+                  {fileItems.map(({ itemId, file }, index) => (
                     <div
-                      key={`${file.name}-${file.size}-${file.lastModified}`}
+                      key={itemId}
                       className="flex items-center justify-between gap-3 rounded-lg bg-background/80 px-3 py-2 text-sm"
                     >
                       <div className="min-w-0 flex-1">
@@ -2276,7 +2627,7 @@ export function EmptyConversationHint({
                         </div>
                         {batchStartedAt !== null &&
                           (() => {
-                            const state = fileStates.get(file) || {
+                            const state = fileStates.get(itemId) || {
                               stage: "queued" as const,
                               loadedBytes: 0,
                               totalBytes: file.size,
@@ -2395,6 +2746,16 @@ export function EmptyConversationHint({
                       )}
                     </span>
                     <span>
+                      Dashboard 已接收
+                      {formatKnowledgeBaseStarterBytes(
+                        uploadSummary.dashboardReceivedBytes,
+                      )}
+                      /
+                      {formatKnowledgeBaseStarterBytes(
+                        uploadSummary.totalBytes,
+                      )}
+                    </span>
+                    <span>
                       已用时{" "}
                       {formatKnowledgeBaseStarterElapsed(
                         elapsedAt - batchStartedAt,
@@ -2463,9 +2824,11 @@ export function EmptyConversationHint({
                 : batchStartedAt !== null
                   ? nonRetryableFailedFile
                     ? "请先移除失败文件"
-                    : uploadSummary.uploadedCount === files.length
-                      ? "重试启动"
-                      : "重试并继续"
+                    : hasCloudStatusCheckFailure
+                      ? "重新检查云端状态"
+                      : uploadSummary.uploadedCount === files.length
+                        ? "重试启动"
+                        : "重试并继续"
                   : "开始构建"}
             </Button>
           </DialogFooter>

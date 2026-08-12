@@ -57,6 +57,8 @@ describe("knowledge-base notice recovery contract", () => {
     for (const code of [
       "LEGACY_TASK_REBIND_REQUIRED",
       "LEGACY_CREDENTIAL_REBIND_REQUIRED",
+      "UPSTREAM_CREATE_3",
+      "UPSTREAM_CREATE_HTTP_400",
     ]) {
       expect(
         knowledgeBaseProtocolErrorIsRetryable({
