@@ -18,15 +18,12 @@ import type {
   KnowledgeBaseActiveTurnDto,
   KnowledgeBaseApprovedPresentationDto,
   KnowledgeBaseCompletedTurnDto,
-  KnowledgeBaseDispatchState,
-  KnowledgeBaseFailureClass,
   KnowledgeBaseNoticeDto,
   KnowledgeBaseObservationDto,
   KnowledgeBasePackageDto,
   KnowledgeBaseProgressDto,
   KnowledgeBaseProgressLeafDto,
   KnowledgeBaseOperationType,
-  KnowledgeBaseRecoveryAction,
 } from "../shared/knowledge-base-progress";
 import {
   extractKnowledgeBaseProtocolObjects,
@@ -85,6 +82,7 @@ import {
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
 import { knowledgeBaseNewBuildPolicyBinding } from "./knowledge-base-tree-policy-rollout";
+import { knowledgeBaseTurnDispatchAuthority } from "./knowledge-base-turn-service";
 import type {
   KnowledgeBaseInitialLogoDisposition,
   KnowledgeBaseRejectedInitialLogoDisposition,
@@ -2166,7 +2164,9 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       : undefined;
   let activeTurn: KnowledgeBaseActiveTurnDto | null = null;
   const activeTurnMetadata =
-    activeTurnRow?.metadata && typeof activeTurnRow.metadata === "object"
+    activeTurnRow?.metadata &&
+    typeof activeTurnRow.metadata === "object" &&
+    !Array.isArray(activeTurnRow.metadata)
       ? (activeTurnRow.metadata as Record<string, unknown>)
       : {};
   const stagedClientAttachments = Array.isArray(
@@ -2174,72 +2174,32 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   )
     ? activeTurnMetadata.clientStagedAttachments.length
     : 0;
-  const expectedClientAttachments = Number(
-    activeTurnMetadata.userAttachmentCount ?? 0,
-  );
+  const expectedClientAttachments =
+    typeof activeTurnMetadata.userAttachmentCount === "number"
+      ? activeTurnMetadata.userAttachmentCount
+      : 0;
   const requiresAttachmentReselection =
     activeTurnMetadata.awaitingClientAttachments === true;
-  const dispatchState: KnowledgeBaseDispatchState = activeTurnRow
-    ? activeTurnRow.status === "completed"
-      ? "completed"
-      : activeTurnRow.status === "failed" ||
-          activeTurnRow.status === "cancelled"
-        ? "failed"
-        : activeTurnRow.upstreamTaskId
-          ? "bound"
-          : activeTurnMetadata.dispatchState === "recovering" ||
-              activeTurnMetadata.preparedDispatch ||
-              activeTurnMetadata.dispatchingAt ||
-              activeTurnMetadata.outcomeUnknownAt
-            ? "recovering"
-            : "reserved"
-    : "completed";
-  const storedFailureClass = String(activeTurnMetadata.failureClass || "");
-  const activeFailureClass: KnowledgeBaseFailureClass | null = [
-    "recoverable_same_turn",
-    "requires_user_fix",
-    "terminal_requires_regeneration",
-    "terminal_nonregenerable",
-  ].includes(storedFailureClass)
-    ? (storedFailureClass as KnowledgeBaseFailureClass)
-    : dispatchState === "recovering"
-      ? "recoverable_same_turn"
-      : dispatchState === "failed"
-        ? activeTurnRow?.upstreamTaskId
-          ? "terminal_requires_regeneration"
-          : "requires_user_fix"
-        : null;
-  const storedRecoveryAction = String(activeTurnMetadata.recoveryAction || "");
-  const activeRecoveryAction: KnowledgeBaseRecoveryAction | null = [
-    "wait",
-    "reconcile",
-    "top_up",
-    "update_credential",
-    "fix_attachments",
-    "reupload_logo",
-    "regenerate_turn",
-    "contact_support",
-  ].includes(storedRecoveryAction)
-    ? (storedRecoveryAction as KnowledgeBaseRecoveryAction)
-    : dispatchState === "recovering"
-      ? "reconcile"
-      : dispatchState === "reserved" || dispatchState === "bound"
-        ? "wait"
-        : activeFailureClass === "terminal_requires_regeneration"
-          ? "regenerate_turn"
-          : activeFailureClass
-            ? "contact_support"
-            : null;
-  const storedCreateAttemptState = String(
-    activeTurnMetadata.createAttemptState || "",
-  );
+  const activeDispatchAuthority = activeTurnRow
+    ? knowledgeBaseTurnDispatchAuthority(activeTurnRow)
+    : {
+        dispatchState: "completed" as const,
+        failureClass: null,
+        recoveryAction: null,
+        canRegenerate: false,
+      };
+  const storedCreateAttemptState = activeTurnMetadata.createAttemptState;
   const activeCreateAttemptState = [
     "not_sent",
     "sending",
     "acknowledged",
     "rejected",
     "unknown",
-  ].includes(storedCreateAttemptState)
+  ].includes(
+    typeof storedCreateAttemptState === "string"
+      ? storedCreateAttemptState
+      : "",
+  )
     ? (storedCreateAttemptState as NonNullable<
         KnowledgeBaseActiveTurnDto["createAttemptState"]
       >)
@@ -2262,14 +2222,12 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       startedAt: activeTurnRow.startedAt?.getTime() ?? null,
       completedAt: activeTurnRow.completedAt?.getTime() ?? null,
       updatedAt: activeTurnRow.updatedAt.getTime(),
-      dispatchState,
+      dispatchState: activeDispatchAuthority.dispatchState,
       createAttemptState: activeCreateAttemptState,
       upstreamTaskId: activeTurnRow.upstreamTaskId,
-      failureClass: activeFailureClass,
-      recoveryAction: activeRecoveryAction,
-      canRegenerate:
-        activeFailureClass === "terminal_requires_regeneration" &&
-        activeTurnMetadata.canRegenerate !== false,
+      failureClass: activeDispatchAuthority.failureClass,
+      recoveryAction: activeDispatchAuthority.recoveryAction,
+      canRegenerate: activeDispatchAuthority.canRegenerate,
       requiresAttachmentReselection,
       stagedAttachmentCount: stagedClientAttachments,
       expectedAttachmentCount:
@@ -2394,16 +2352,20 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   }
 
   let notice: KnowledgeBaseNoticeDto | null = null;
-  const activeTraceId = String(activeTurnMetadata.traceId || "").trim();
+  const activeTraceId =
+    typeof activeTurnMetadata.traceId === "string"
+      ? activeTurnMetadata.traceId.trim()
+      : "";
   const safeActiveTraceId =
     /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
       activeTraceId,
     )
       ? activeTraceId
       : null;
-  const activeAttachmentCount = Number(
-    activeTurnMetadata.expectedAttachmentCount ?? 0,
-  );
+  const activeAttachmentCount =
+    typeof activeTurnMetadata.expectedAttachmentCount === "number"
+      ? activeTurnMetadata.expectedAttachmentCount
+      : 0;
   if (activeTurnRow?.errorCode === "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING") {
     notice = {
       key: `${build.id}:${build.generation}:${activeTurnRow.id}:attachments-processing`,
@@ -2487,12 +2449,16 @@ function projectKnowledgeBaseObservationSnapshot(input: {
         code === "MANIFEST_LEAF_COUNT_BELOW_MIN" ||
         code === "MANIFEST_RESEARCH_COVERAGE_INCOMPLETE");
     const failureClass =
-      (sameTaskRecovery ? "recoverable_same_turn" : activeFailureClass) ||
+      (sameTaskRecovery
+        ? "recoverable_same_turn"
+        : activeDispatchAuthority.failureClass) ||
       (protocolCanRegenerate
         ? "terminal_requires_regeneration"
         : "recoverable_same_turn");
     const recoveryAction =
-      (sameTaskRecovery ? "reconcile" : activeRecoveryAction) ||
+      (sameTaskRecovery
+        ? "reconcile"
+        : activeDispatchAuthority.recoveryAction) ||
       (protocolCanRegenerate ? "regenerate_turn" : "reconcile");
     const canRegenerate = sameTaskRecovery
       ? false
@@ -2504,11 +2470,13 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       code,
       severity: "error",
       message: build.protocolError,
-      retryable: knowledgeBaseProtocolErrorIsRetryable({
-        status: build.status,
-        code,
-        activeTurnId: activeTurnRow?.id || null,
-      }),
+      retryable:
+        (sameTaskRecovery || activeDispatchAuthority.canRegenerate) &&
+        knowledgeBaseProtocolErrorIsRetryable({
+          status: build.status,
+          code,
+          activeTurnId: activeTurnRow?.id || null,
+        }),
       failureClass,
       recoveryAction,
       canRegenerate,

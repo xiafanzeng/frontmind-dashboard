@@ -12,6 +12,7 @@ import { getDb } from "./db";
 import { readKnowledgeBuildArtifact } from "./knowledge-build-artifact-store";
 import { activateKnowledgeBaseInvariantWriteBlock } from "./knowledge-base-runtime-guard";
 import {
+  inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority,
   inspectKnowledgeBaseRetryAuthority,
   inspectKnowledgeBaseTerminalTaskCreateRejectionAuthority,
 } from "./knowledge-base-turn-service";
@@ -76,6 +77,16 @@ function isValidReadOnlyFailedActiveTurn(
   );
 }
 
+function isValidReadOnlyLegacyProtocolFailedActiveTurn(
+  build: KnowledgeBaseBuild,
+  turn: ConversationTurn,
+) {
+  return Boolean(
+    inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority(turn, build) &&
+      !inspectKnowledgeBaseRetryAuthority(turn, build),
+  );
+}
+
 export function findKnowledgeBaseInvariantViolations(input: {
   builds: readonly KnowledgeBaseBuild[];
   turns: readonly ConversationTurn[];
@@ -120,7 +131,8 @@ export function findKnowledgeBaseInvariantViolations(input: {
           active.status === "queued" ||
           active.status === "running" ||
           isValidRetryableFailedActiveTurn(build, active) ||
-          isValidReadOnlyFailedActiveTurn(build, active)
+          isValidReadOnlyFailedActiveTurn(build, active) ||
+          isValidReadOnlyLegacyProtocolFailedActiveTurn(build, active)
         )
       ) {
         violations.push({

@@ -454,6 +454,163 @@ describe("knowledge-base observation consistency", () => {
     expect(observation?.notice?.traceId).toBeNull();
   });
 
+  it("projects exact legacy protocol-terminal history as read-only support history", async () => {
+    const now = new Date("2026-08-01T00:00:10.000Z");
+    const userAttachment = {
+      file_id: "customer-file",
+      filename: "company-profile.pdf",
+    };
+    const requestBody = {
+      prompt: "Pinned prompt",
+      agentProfile: "FrontMind-Pro",
+      taskMode: "agent" as const,
+      attachments: [
+        { file_id: "skill-file", filename: "skill.zip" },
+        userAttachment,
+      ],
+    };
+    const {
+      createKnowledgeBaseOperationKey,
+      createKnowledgeBaseUpstreamIdempotencyKey,
+      hashKnowledgeBaseTurnRequest,
+      hashKnowledgeBaseUpstreamIdempotencyKey,
+    } = await import("./knowledge-base-turn-service");
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+    });
+    const recovery = {
+      kind: "start",
+      conversationId: "conversation-snapshot",
+      companyName: "FrontMind超前智能",
+      companyWebsite: "",
+      operatorNotes: "",
+      attachments: [userAttachment],
+      skillVersion: "4",
+      skillContentHash: "a".repeat(64),
+      includePrefill: false,
+      prefillSnapshotId: null,
+      protocolFailureObservation: {
+        observationKeyHash: "c".repeat(64),
+        count: 3,
+        firstObservedAt: "2026-08-01T00:00:00.000Z",
+        lastObservedAt: now.toISOString(),
+      },
+    };
+    const activeTurn = {
+      id: "turn-legacy-protocol-terminal",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      apiCredentialId: "credential-legacy",
+      clientRequestId: "request-legacy-protocol-terminal",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "start",
+        generation: 1,
+        revision: 0,
+        leafId: null,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 1,
+        payload: {
+          companyName: recovery.companyName,
+          companyWebsite: recovery.companyWebsite,
+          operatorNotes: recovery.operatorNotes,
+          attachments: recovery.attachments,
+          skillVersion: recovery.skillVersion,
+          skillContentHash: recovery.skillContentHash,
+          prefillSnapshotId: recovery.prefillSnapshotId,
+        },
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      attachmentFileIds: ["skill-file", "customer-file"],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 1,
+        dispatchingAt: "2026-07-31T23:59:59.000Z",
+        recovery,
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.invalid",
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          requestBody,
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+      },
+      status: "failed",
+      upstreamTaskId: "task-legacy-protocol-terminal",
+      errorCode: "PROGRESS_PROTOCOL_INVALID",
+      errorMessage: "历史知识库协议输出无效",
+      leaseExpiresAt: null,
+      startedAt: new Date("2026-07-31T23:59:59.000Z"),
+      completedAt: now,
+      createdAt: new Date("2026-07-31T23:59:58.000Z"),
+      updatedAt: now,
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "protocol_error",
+              stateEpoch: 2,
+              revision: 0,
+              currentLeafId: null,
+              totalNodeCount: 0,
+              activeTurnId: activeTurn.id,
+              upstreamTaskId: activeTurn.upstreamTaskId,
+              lastAppliedOperationKey: null,
+              currentPresentationKey: null,
+              awaitingResponseSince: null,
+              protocolErrorCode: "PROGRESS_PROTOCOL_INVALID",
+              protocolError: "历史知识库协议输出无效",
+            }),
+            nodes: [],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [activeTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation).toMatchObject({
+      activeTurn: {
+        id: activeTurn.id,
+        dispatchState: "failed",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+      notice: {
+        code: "PROGRESS_PROTOCOL_INVALID",
+        retryable: false,
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+        turnId: activeTurn.id,
+      },
+    });
+  });
+
   it("shows the official logo only on the initial revision-zero first node", async () => {
     const now = new Date("2026-08-01T00:00:05.000Z");
     const initialTurn = {
