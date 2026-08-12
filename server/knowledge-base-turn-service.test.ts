@@ -35,6 +35,7 @@ import {
   inspectKnowledgeBaseTurnReplay,
   inspectKnowledgeBaseRetryAuthority,
   knowledgeBaseRetryRequiresFreshFinalDelivery,
+  markKnowledgeBaseTurnOutcomeUnknown,
   prepareKnowledgeBaseTurnDispatch,
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
@@ -379,6 +380,9 @@ function retryableFailedTurn(overrides: Partial<ConversationTurn> = {}) {
       attachmentsFrozen: true,
       expectedAttachmentCount: 2,
       userAttachmentCount: 1,
+      failureClass: "terminal_requires_regeneration",
+      recoveryAction: "regenerate_turn",
+      canRegenerate: true,
       recovery,
       preparedDispatch: {
         schemaVersion: 1,
@@ -1017,12 +1021,10 @@ describe("knowledge-base recovery metadata", () => {
     );
 
     expect(prepared).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       baseUrl: "https://api.example.test",
       requestBody: {
         prompt: "exact prompt",
-        taskMode: "agent",
-        taskId: "parent-task",
         attachments: [
           { file_id: "skill-file", filename: "skill.zip" },
           { file_id: "facts-file", filename: "facts.pdf" },
@@ -1030,6 +1032,8 @@ describe("knowledge-base recovery metadata", () => {
       },
       bodySha256: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
+    expect(prepared.requestBody).not.toHaveProperty("taskMode");
+    expect(prepared.requestBody).not.toHaveProperty("taskId");
     expect(JSON.stringify(prepared)).not.toMatch(
       /API_KEY|Authorization|credential-value/,
     );
@@ -1037,7 +1041,7 @@ describe("knowledge-base recovery metadata", () => {
     expect(lockTrace).toEqual(["build", "turn"]);
   });
 
-  it("resumes one pre-create user-fix failure on the same logical turn exactly once", async () => {
+  it("resumes one not-sent pre-create credential failure on the same logical turn exactly once", async () => {
     const preparedDispatch = {
       schemaVersion: 1 as const,
       baseUrl: "https://api.example.test",
@@ -1053,13 +1057,14 @@ describe("knowledge-base recovery metadata", () => {
     const failed = turn({
       status: "failed",
       upstreamTaskId: null,
-      errorCode: "UPSTREAM_CREATE_HTTP_402",
-      errorMessage: "余额不足",
+      errorCode: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+      errorMessage: "凭证暂不可用",
       completedAt: new Date("2026-08-01T00:00:10.000Z"),
       leaseExpiresAt: null,
       attachmentFileIds: ["skill-file"],
       metadata: {
         attachmentsFrozen: true,
+        createAttemptState: "not_sent",
         expectedAttachmentCount: 1,
         userAttachmentCount: 0,
         preparedDispatch,
@@ -1131,6 +1136,7 @@ describe("knowledge-base recovery metadata", () => {
         apiCredentialId: "credential-repaired",
         dispatchState: "recovering",
         canRegenerate: false,
+        createAttemptState: "not_sent",
       },
       preparedDispatch,
     });
@@ -1139,6 +1145,9 @@ describe("knowledge-base recovery metadata", () => {
     );
     expect(replay).toBeNull();
     expect(store.turns).toHaveLength(1);
+    expect(store.turns[0]?.metadata).toMatchObject({
+      createAttemptState: "not_sent",
+    });
     expect(store.build).toMatchObject({
       status: "confirming",
       activeTurnId: failed.id,
@@ -1152,17 +1161,108 @@ describe("knowledge-base recovery metadata", () => {
     });
   });
 
-  it("replaces a 413 attachment set on the same turn and grants only one new create claim", async () => {
+  it.each([
+    ["rejected", "top_up"],
+    ["sending", "update_credential"],
+    ["unknown", "top_up"],
+    ["acknowledged", "update_credential"],
+  ] as const)(
+    "never resets provider create state %s through %s recovery",
+    async (createAttemptState, recoveryAction) => {
+      const failed = turn({
+        status: "failed",
+        upstreamTaskId: null,
+        errorCode: "UPSTREAM_CREATE_HTTP_402",
+        errorMessage: "上游任务创建已越过发送边界",
+        completedAt: new Date("2026-08-01T00:00:10.000Z"),
+        leaseExpiresAt: null,
+        attachmentFileIds: ["skill-file"],
+        metadata: {
+          attachmentsFrozen: true,
+          createAttemptState,
+          expectedAttachmentCount: 1,
+          userAttachmentCount: 0,
+          preparedDispatch: {
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "exact prompt",
+              agentProfile: "manus-1.6-max",
+              attachments: [{ file_id: "skill-file", filename: "skill.zip" }],
+            },
+            bodySha256: "d".repeat(64),
+            preparedAt: "2026-08-01T00:00:00.000Z",
+          },
+          recovery: {
+            kind: "turn",
+            conversationId: "conversation-1",
+            skillVersion: "4",
+            skillContentHash: "a".repeat(64),
+          },
+          dispatchState: "failed",
+          failureClass: "requires_user_fix",
+          recoveryAction,
+          canRegenerate: false,
+        },
+      });
+      const build = {
+        id: failed.buildId,
+        userId: 1,
+        conversationId: "conversation-1",
+        generation: failed.buildGeneration,
+        stateEpoch: 8,
+        status: "protocol_error",
+        activeTurnId: failed.id,
+        protocolErrorCode: failed.errorCode,
+        protocolError: failed.errorMessage,
+      };
+      const conversation = {
+        id: failed.conversationId,
+        userId: 1,
+        version: 3,
+        status: "failed",
+        completedAt: failed.completedAt,
+      };
+      const current = (state: TurnServiceStore) =>
+        state.turns.filter((candidate) => candidate.id === failed.id);
+      const { executor, store } = createTurnServiceExecutor({
+        build,
+        conversation,
+        turns: [failed],
+        credentials: [
+          { id: "credential-repaired", userId: 1, status: "active" },
+        ],
+        turnSelections: [[current]],
+      });
+      const before = structuredClone(store);
+
+      await expect(
+        resumeKnowledgeBaseTurnAfterUserFix(
+          {
+            userId: 1,
+            turnId: failed.id,
+            apiCredentialId: "credential-repaired",
+            now: new Date("2026-08-01T00:01:00.000Z"),
+          },
+          executor,
+        ),
+      ).resolves.toBeNull();
+      expect(store).toStrictEqual(before);
+    },
+  );
+
+  it("replaces a not-sent pre-create attachment failure on the same turn exactly once", async () => {
     const failed = turn({
       status: "failed",
       upstreamTaskId: null,
-      errorCode: "UPSTREAM_CREATE_HTTP_413",
-      errorMessage: "附件过大",
+      errorCode: "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+      errorMessage: "附件完整性校验失败",
       completedAt: new Date("2026-08-01T00:00:10.000Z"),
       leaseExpiresAt: null,
       attachmentFileIds: ["old-skill", "old-instructions", "old-large-file"],
       metadata: {
         attachmentsFrozen: true,
+        createAttemptState: "not_sent",
         expectedAttachmentCount: 3,
         userAttachmentCount: 1,
         preparedDispatch: {
@@ -1278,6 +1378,109 @@ describe("knowledge-base recovery metadata", () => {
       generatedAttachmentReservations: {},
       attachmentRepair: { clientRequestId: "attachment-repair-1" },
     });
+  });
+
+  it("keeps a rejected task-create turn and its seven frozen attachments immutable", async () => {
+    const frozenAttachments = [
+      { file_id: "skill-file", filename: "skill.zip" },
+      { file_id: "instructions-file", filename: "instructions.txt" },
+      ...Array.from({ length: 5 }, (_, index) => ({
+        file_id: `user-file-${index + 1}`,
+        filename: `user-${index + 1}.pdf`,
+      })),
+    ];
+    const preparedDispatch = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "exact prompt",
+        agentProfile: "manus-1.6-max",
+        attachments: frozenAttachments,
+      },
+      bodySha256: "d".repeat(64),
+      preparedAt: "2026-08-01T00:00:00.000Z",
+    };
+    const rejected = turn({
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "UPSTREAM_CREATE_3",
+      errorMessage: "上游已明确拒绝创建本轮任务",
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      leaseExpiresAt: null,
+      attachmentFileIds: frozenAttachments.map(
+        (attachment) => attachment.file_id,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        createAttemptState: "rejected",
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        preparedDispatch,
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          attachments: frozenAttachments.slice(2),
+          skillVersion: "4",
+          skillContentHash: "a".repeat(64),
+        },
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "fix_attachments",
+        canRegenerate: false,
+      },
+    });
+    const current = (state: TurnServiceStore) =>
+      state.turns.filter((candidate) => candidate.id === rejected.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build: {
+        id: rejected.buildId,
+        userId: 1,
+        conversationId: "conversation-1",
+        generation: rejected.buildGeneration,
+        stateEpoch: 8,
+        status: "protocol_error",
+        activeTurnId: rejected.id,
+        protocolErrorCode: rejected.errorCode,
+        protocolError: rejected.errorMessage,
+      },
+      conversation: {
+        id: rejected.conversationId,
+        userId: 1,
+        version: 3,
+        status: "failed",
+        completedAt: rejected.completedAt,
+      },
+      turns: [rejected],
+      credentials: [{ id: "credential-repaired", userId: 1, status: "active" }],
+      turnSelections: [[current]],
+    });
+    const before = structuredClone(store);
+
+    await expect(
+      replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
+        {
+          userId: 1,
+          turnId: rejected.id,
+          apiCredentialId: "credential-repaired",
+          clientRequestId: "rejected-attachment-repair",
+          attachments: [
+            { file_id: "replacement-file", filename: "replacement.pdf" },
+          ],
+          attachmentManifest: [
+            {
+              filename: "replacement.pdf",
+              sizeBytes: 100,
+              mimeType: "application/pdf",
+              lastModified: 1,
+              sha256: "f".repeat(64),
+            },
+          ],
+          now: new Date("2026-08-01T00:01:00.000Z"),
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toStrictEqual(before);
   });
 });
 
@@ -1727,6 +1930,59 @@ describe("knowledge-base atomic start reservation", () => {
       },
     });
     expect(store.conversation?.version).toBe(2);
+  });
+
+  it("starts a new conversation without mutating a rejected historical build turn", async () => {
+    const rejectedHistoricalTurn = turn({
+      id: "00000000-0000-4000-8000-000000000091",
+      conversationId: "u1:conversation-failed-historical",
+      buildId: "00000000-0000-4000-8000-000000000092",
+      buildGeneration: 1,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "UPSTREAM_CREATE_3",
+      errorMessage: "上游已明确拒绝创建本轮任务",
+      completedAt: new Date("2026-07-31T23:00:00.000Z"),
+      leaseExpiresAt: null,
+      metadata: {
+        attachmentsFrozen: true,
+        createAttemptState: "rejected",
+        failureClass: "requires_user_fix",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+    });
+    const historicalSnapshot = structuredClone(rejectedHistoricalTurn);
+    const { executor, store } = createTurnServiceExecutor({
+      turns: [rejectedHistoricalTurn],
+      turnSelections: [[[], []]],
+    });
+
+    const started = await reserveKnowledgeBaseStartBuild(
+      {
+        ...startInput,
+        conversationId: "conversation-new-after-rejection",
+        clientRequestId: "start-request-new-after-rejection",
+        recoveryMetadata: {
+          ...startInput.recoveryMetadata,
+          conversationId: "conversation-new-after-rejection",
+        },
+      },
+      executor,
+    );
+
+    expect(started.createdBuild).toBe(true);
+    expect(started.reservation.state).toBe("acquired");
+    expect(started.reservation.turn.id).not.toBe(rejectedHistoricalTurn.id);
+    expect(
+      store.turns.find(
+        (candidate) => candidate.id === rejectedHistoricalTurn.id,
+      ),
+    ).toEqual(historicalSnapshot);
+    expect(store.turns).toHaveLength(2);
   });
 
   it("locks exact upload ownership and binds it in the reservation transaction", async () => {
@@ -3270,6 +3526,110 @@ describe("knowledge-base attachment-first turn reservation", () => {
       claimKnowledgeBaseTurnForRecovery({ turnId: waiting.id }, executor),
     ).resolves.toBeNull();
   });
+
+  it("claims stale sending once for unknown projection but never reclaims unknown", async () => {
+    for (const createAttemptState of ["sending", "unknown"] as const) {
+      const unresolved = turn({
+        id:
+          createAttemptState === "sending"
+            ? "00000000-0000-4000-8000-000000000032"
+            : "00000000-0000-4000-8000-000000000033",
+        buildId: build.id,
+        buildGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: build.currentLeafId,
+        status: "running",
+        leaseExpiresAt: new Date("2026-07-31T23:59:00.000Z"),
+        metadata: {
+          attachmentsFrozen: true,
+          createAttemptState,
+          recovery: { kind: "turn" },
+        },
+      });
+      const { executor, store } = createTurnServiceExecutor({
+        build: { ...build, activeTurnId: unresolved.id },
+        conversation: { ...conversation },
+        turns: [unresolved],
+        turnSelections: [[[unresolved]]],
+      });
+      const claimed = await claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: unresolved.id,
+          now: new Date("2026-08-01T00:00:00.000Z"),
+        },
+        executor,
+      );
+      if (createAttemptState === "sending") {
+        expect(claimed).toMatchObject({
+          turn: { createAttemptState: "sending" },
+        });
+      } else {
+        expect(claimed).toBeNull();
+      }
+      expect(store.turns[0]?.metadata).toMatchObject({ createAttemptState });
+    }
+  });
+
+  it("keeps a generic pre-create failure not_sent and recoverable", async () => {
+    const leaseToken = "pre-create-generic-lease";
+    const unresolved = turn({
+      id: "00000000-0000-4000-8000-000000000034",
+      buildId: build.id,
+      buildGeneration: build.generation,
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+      status: "running",
+      leaseExpiresAt: new Date("2026-08-01T00:00:30.000Z"),
+      metadata: {
+        attachmentsFrozen: true,
+        createAttemptState: "not_sent",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        recovery: { kind: "turn" },
+      },
+    });
+    const dynamicActive = (current: TurnServiceStore) =>
+      current.turns.filter((candidate) => candidate.id === unresolved.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build, activeTurnId: unresolved.id },
+      conversation: { ...conversation },
+      turns: [unresolved],
+      turnSelections: [[dynamicActive], [dynamicActive]],
+    });
+
+    const persisted = await markKnowledgeBaseTurnOutcomeUnknown(
+      {
+        userId: unresolved.userId,
+        turnId: unresolved.id,
+        leaseToken,
+        code: "PRECREATE_GENERIC_FAILURE",
+        now: new Date("2026-08-01T00:00:00.000Z"),
+        recoveryDelayMs: 1_000,
+      },
+      executor,
+    );
+    expect(persisted).toMatchObject({
+      createAttemptState: "not_sent",
+      status: "running",
+    });
+    expect(store.turns[0]?.metadata).toMatchObject({
+      createAttemptState: "not_sent",
+      outcomeUnknownCode: "PRECREATE_GENERIC_FAILURE",
+    });
+
+    await expect(
+      claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: unresolved.id,
+          now: new Date("2026-08-01T00:00:02.000Z"),
+        },
+        executor,
+      ),
+    ).resolves.toMatchObject({
+      turn: { createAttemptState: "not_sent" },
+    });
+  });
 });
 
 describe("acknowledged manual Logo rejection", () => {
@@ -3757,8 +4117,8 @@ describe("knowledge-base deterministic dispatch failure", () => {
         leaseOwnerHash: createHash("sha256")
           .update(leaseToken, "utf8")
           .digest("hex"),
-        outcomeUnknownAt: "2026-08-01T00:00:05.000Z",
-        outcomeUnknownCode: "PREVIOUS_AMBIGUOUS_ATTEMPT",
+        dispatchingAt: "2026-08-01T00:00:05.000Z",
+        createAttemptState: "sending",
       },
     });
     const build = {
@@ -3799,6 +4159,9 @@ describe("knowledge-base deterministic dispatch failure", () => {
       leaseToken,
       code: "UPSTREAM_CREATE_HTTP_422",
       message: "上游已明确拒绝创建本轮任务，当前内容和附件均已保留；请重试本轮",
+      createAttemptRejected: true,
+      reasonCategory: "ATTACHMENT_INVALID",
+      providerRequestRef: "sha256:1234567890abcdef12345678",
       now: new Date("2026-08-01T00:00:20.000Z"),
     };
 
@@ -3826,11 +4189,135 @@ describe("knowledge-base deterministic dispatch failure", () => {
     });
     expect(store.turns[0]!.metadata).not.toHaveProperty("outcomeUnknownAt");
     expect(store.turns[0]!.metadata).not.toHaveProperty("outcomeUnknownCode");
+    expect(store.turns[0]!.metadata).toMatchObject({
+      createAttemptState: "rejected",
+      providerReasonCategory: "ATTACHMENT_INVALID",
+      providerRequestRef: "sha256:1234567890abcdef12345678",
+    });
     expect(store.conversation).toMatchObject({ status: "failed", version: 5 });
   });
 });
 
 describe("knowledge-base safe retry reservation", () => {
+  it("requires explicit regeneration metadata and rejects a forged rejected start", () => {
+    const source = retryableFailedTurn();
+    const build = {
+      id: source.buildId,
+      userId: source.userId,
+      conversationId: "conversation-1",
+      companyName: "FrontMind 超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      generation: 3,
+      revision: 7,
+      currentLeafId: "1.8",
+      totalNodeCount: 8,
+      confirmedCount: 7,
+      directPrefilledCount: 0,
+    } as any;
+
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).not.toBeNull();
+    for (const metadataPatch of [
+      { failureClass: "requires_user_fix" },
+      { recoveryAction: "contact_support" },
+      { canRegenerate: false },
+    ]) {
+      const candidate = {
+        ...source,
+        metadata: { ...(source.metadata as object), ...metadataPatch },
+      } as ConversationTurn;
+      expect(inspectKnowledgeBaseRetryAuthority(candidate, build)).toBeNull();
+    }
+
+    const startRecovery = {
+      kind: "start",
+      conversationId: "conversation-1",
+      companyName: build.companyName,
+      companyWebsite: build.companyWebsite,
+      operatorNotes: "",
+      attachments: [] as Array<{ file_id: string; filename: string }>,
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      prefillSnapshotId: null,
+    };
+    const startBody = {
+      prompt: "documented rejected start prompt",
+      agentProfile: "manus-1.6-max",
+      attachments: [
+        { file_id: "start-skill", filename: "skill.zip" },
+        { file_id: "start-instructions", filename: "instructions.txt" },
+      ],
+    };
+    const startOperationKey = createKnowledgeBaseOperationKey({
+      buildId: build.id,
+      buildGeneration: build.generation,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+    });
+    const rejectedStart = turn({
+      status: "failed",
+      operationType: "start",
+      operationKey: startOperationKey,
+      buildId: build.id,
+      buildGeneration: build.generation,
+      expectedRevision: 0,
+      expectedLeafId: null,
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "start",
+        generation: build.generation,
+        revision: 0,
+        leafId: null,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 0,
+        payload: {
+          companyName: startRecovery.companyName,
+          companyWebsite: startRecovery.companyWebsite,
+          operatorNotes: startRecovery.operatorNotes,
+          attachments: startRecovery.attachments,
+          skillVersion: startRecovery.skillVersion,
+          skillContentHash: startRecovery.skillContentHash,
+          prefillSnapshotId: startRecovery.prefillSnapshotId,
+        },
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(startOperationKey),
+      ),
+      upstreamTaskId: null,
+      attachmentFileIds: startBody.attachments.map(
+        (attachment) => attachment.file_id,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 0,
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+        createAttemptState: "rejected",
+        recovery: startRecovery,
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: startBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(startBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+      completedAt: new Date("2026-08-01T00:00:20.000Z"),
+      leaseExpiresAt: null,
+    });
+    const startBuild = {
+      ...build,
+      revision: 0,
+      currentLeafId: null,
+    };
+    expect(
+      inspectKnowledgeBaseRetryAuthority(rejectedStart, startBuild),
+    ).toBeNull();
+  });
+
   it("refreshes the Skill and finalization bundle only at the failed v4 last leaf", () => {
     expect(
       knowledgeBaseRetryRequiresFreshFinalDelivery({
@@ -3892,6 +4379,9 @@ describe("knowledge-base safe retry reservation", () => {
       attachmentsFrozen: true,
       expectedAttachmentCount: 2,
       userAttachmentCount: 0,
+      failureClass: "terminal_requires_regeneration",
+      recoveryAction: "regenerate_turn",
+      canRegenerate: true,
       recovery,
       preparedDispatch: {
         schemaVersion: 1,
@@ -4093,6 +4583,9 @@ describe("knowledge-base safe retry reservation", () => {
     failedRetry.metadata = {
       ...(failedRetry.metadata || {}),
       attachmentsFrozen: true,
+      failureClass: "terminal_requires_regeneration",
+      recoveryAction: "regenerate_turn",
+      canRegenerate: true,
       preparedDispatch: {
         schemaVersion: 1,
         baseUrl: "https://api.example.test",

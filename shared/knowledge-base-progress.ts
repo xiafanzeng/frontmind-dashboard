@@ -214,6 +214,16 @@ export interface KnowledgeBaseActiveTurnDto {
   updatedAt: number;
   /** Durable dispatch/recovery authority. Optional only during fleet rollout. */
   dispatchState?: KnowledgeBaseDispatchState;
+  /**
+   * Durable provider-create boundary. User-fix routes must require `not_sent`
+   * exactly before they may make the same logical turn dispatchable again.
+   */
+  createAttemptState?:
+    | "not_sent"
+    | "sending"
+    | "acknowledged"
+    | "rejected"
+    | "unknown";
   upstreamTaskId?: string | null;
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
@@ -297,6 +307,10 @@ export interface KnowledgeBaseNoticeDto {
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
   canRegenerate?: boolean;
+  /** Safe correlation id; never a provider id or credential-bearing value. */
+  traceId?: string | null;
+  /** Total frozen attachment count relevant to this notice. */
+  attachmentCount?: number;
   turnId: string | null;
   createdAt: number;
 }

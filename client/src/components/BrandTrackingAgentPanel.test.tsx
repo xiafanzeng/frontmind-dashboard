@@ -246,9 +246,7 @@ describe("BrandTrackingAgentPanel", () => {
     expect(screen.getByText("趋势分析")).toBeInTheDocument();
     expect(screen.getByText("信源核验")).toBeInTheDocument();
     expect(screen.getByText("10,000")).toBeInTheDocument();
-    expect(document.body).not.toHaveTextContent(
-      "持久化多轮品牌追踪与用量归因",
-    );
+    expect(document.body).not.toHaveTextContent("持久化多轮品牌追踪与用量归因");
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("近期的品牌评价");
   });
@@ -292,6 +290,10 @@ describe("BrandTrackingAgentPanel", () => {
       within(dialog).getByText("确认启动新的品牌追踪？"),
     ).toBeInTheDocument();
     expect(within(dialog).queryByRole("textbox")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("示例品牌")).toBeInTheDocument();
+    expect(within(dialog).getByText("不确定，由 API 建议")).toBeInTheDocument();
+    expect(within(dialog).getByText("全部")).toBeInTheDocument();
+    expect(within(dialog).getByText("过去 7 天")).toBeInTheDocument();
 
     const confirm = within(dialog).getByRole("button", { name: "确认启动" });
     fireEvent.click(confirm);
@@ -314,7 +316,10 @@ describe("BrandTrackingAgentPanel", () => {
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
       ),
     });
+    expect(Object.keys(body)).toEqual(["clientRequestId"]);
     expect(String(init.body)).not.toContain("开始品牌追踪");
+    expect(String(init.body)).not.toContain("示例品牌");
+    expect(String(init.body)).not.toContain("过去 7 天");
 
     await waitFor(() =>
       expect(
@@ -326,6 +331,16 @@ describe("BrandTrackingAgentPanel", () => {
     );
     expect(screen.getByLabelText("品牌追踪消息")).toBeEnabled();
     expect(screen.getByText("本轮 10积分")).toBeInTheDocument();
+  });
+
+  it("blocks a new session locally when the dashboard brand is missing", () => {
+    render(<BrandTrackingAgentPanel brandName="  " />);
+
+    expect(screen.getByRole("button", { name: "启动品牌追踪" })).toBeDisabled();
+    expect(
+      screen.getByText("请先在看板绑定有效的品牌名称。"),
+    ).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("keeps the SSE lifecycle mounted across the StrictMode effect replay", async () => {

@@ -1013,14 +1013,6 @@ mysqlDescribe(
         { status: "awaiting_input" | "completed"; output: unknown[] }
       >();
       const operationTaskPosts = new Map<string, number>();
-      const idempotentTaskResponses = new Map<
-        string,
-        {
-          id: string;
-          status: "awaiting_input" | "completed";
-          output: unknown[];
-        }
-      >();
       const uploadedFileBytes = new Map<string, number>();
       const uploadedFileNames = new Map<string, string>();
       let uploadedFileSequence = 0;
@@ -1030,7 +1022,8 @@ mysqlDescribe(
       let initialOperationId = "";
       let initialTurnId = "";
       upstream.post("/v1/files", (req, res) => {
-        expect(req.header("authorization")).toBe(`Bearer ${upstreamApiKey}`);
+        expect(req.header("api_key")).toBe(upstreamApiKey);
+        expect(req.header("authorization")).toBeUndefined();
         const filename = String(req.body.filename || "");
         expect(
           filename === "socratic-kb-builder.skill.zip" ||
@@ -1060,9 +1053,35 @@ mysqlDescribe(
           res.status(200).end();
         },
       );
+      upstream.get("/v1/files/:fileId", (req, res) => {
+        expect(req.header("api_key")).toBe(upstreamApiKey);
+        expect(req.header("authorization")).toBeUndefined();
+        const filename = uploadedFileNames.get(req.params.fileId);
+        if (!filename) {
+          res.status(404).json({ error: "fixture file missing" });
+          return;
+        }
+        res.json({
+          id: req.params.fileId,
+          filename,
+          status: uploadedFileBytes.has(req.params.fileId)
+            ? "uploaded"
+            : "pending",
+        });
+      });
       upstream.post("/v1/tasks", async (req, res, next) => {
         try {
-          expect(req.header("authorization")).toBe(`Bearer ${upstreamApiKey}`);
+          expect(req.header("api_key")).toBe(upstreamApiKey);
+          expect(req.header("authorization")).toBeUndefined();
+          expect(req.header("idempotency-key")).toBeUndefined();
+          expect(Object.keys(req.body).sort()).toEqual([
+            "agentProfile",
+            "attachments",
+            "prompt",
+          ]);
+          expect(req.body.agentProfile).toBe("manus-1.6-max");
+          expect(req.body.taskId).toBeUndefined();
+          expect(req.body.taskMode).toBeUndefined();
           const prompt = String(req.body.prompt || "");
           expect(Array.from(prompt).length).toBeLessThanOrEqual(3_000);
           const operationId =
@@ -1097,14 +1116,6 @@ mysqlDescribe(
           expect(
             uploadedFileBytes.get(systemInputAttachment.file_id),
           ).toBeGreaterThan(0);
-
-          const idempotencyKey = String(req.header("idempotency-key") || "");
-          expect(idempotencyKey).toBe(`frontmind-kb-v2:${operationId}`);
-          const replay = idempotentTaskResponses.get(idempotencyKey);
-          if (replay) {
-            res.json(replay);
-            return;
-          }
           operationTaskPosts.set(
             operationId!,
             (operationTaskPosts.get(operationId!) || 0) + 1,
@@ -1113,18 +1124,6 @@ mysqlDescribe(
           const revision = Number(turn.expectedRevision);
           const isStart = turn.operationType === "start";
           const isFinal = !isStart && revision === FINAL_REVISION - 1;
-          if (isStart) {
-            expect(req.body.taskId).toBeUndefined();
-          } else {
-            const build = (
-              await executor
-                .select()
-                .from(knowledgeBaseBuilds)
-                .where(eq(knowledgeBaseBuilds.id, turn.buildId!))
-                .limit(1)
-            )[0];
-            expect(req.body.taskId).toBe(build.upstreamTaskId);
-          }
 
           const taskId = isStart
             ? `task-initial-manifest-${runId}`
@@ -1257,7 +1256,6 @@ mysqlDescribe(
               | "awaiting_input",
             output,
           };
-          idempotentTaskResponses.set(idempotencyKey, result);
           taskResults.set(taskId, { status: result.status, output });
           res.json(result);
         } catch (error) {

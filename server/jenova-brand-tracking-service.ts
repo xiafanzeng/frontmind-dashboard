@@ -35,6 +35,7 @@ import {
   type AuthenticatedUser,
 } from "./auth-service";
 import { getDb } from "./db";
+import { getDashboardWorkspace } from "./dashboard-service";
 import {
   JenovaBrandTrackingClient,
   JenovaClientError,
@@ -46,7 +47,6 @@ import {
 export const JENOVA_DEFAULT_ROLLING_LIMIT = "10.00000000";
 export const JENOVA_SESSION_CREATION_FEE = "0.01000000";
 export const JENOVA_ROLLING_WINDOW_MS = 30 * 24 * 60 * 60 * 1_000;
-export const JENOVA_HIDDEN_KICKOFF = "开始品牌追踪";
 const ZERO = "0.00000000";
 const ACTIVE_CREDENTIAL_TICKET_STATUSES = [
   "submitted",
@@ -67,6 +67,7 @@ export type JenovaBrandTrackingErrorCode =
   | "CONFLICT"
   | "IDEMPOTENCY_PENDING"
   | "IDEMPOTENCY_CONFLICT"
+  | "BRAND_IDENTITY_REQUIRED"
   | "INVALID_INPUT"
   | "UPSTREAM_UNAVAILABLE"
   | "USAGE_UNKNOWN"
@@ -242,6 +243,7 @@ type ServiceClient = Pick<
 
 export type JenovaBrandTrackingDependencies = {
   getDatabase?: typeof getDb;
+  getDashboardWorkspace?: typeof getDashboardWorkspace;
   client?: ServiceClient;
   now?: () => Date;
   randomId?: () => string;
@@ -259,10 +261,46 @@ const limitSchema = z
 function deps(input: JenovaBrandTrackingDependencies = {}) {
   return {
     getDatabase: input.getDatabase ?? getDb,
+    getDashboardWorkspace: input.getDashboardWorkspace ?? getDashboardWorkspace,
     client: input.client ?? jenovaBrandTrackingClient,
     now: input.now ?? (() => new Date()),
     randomId: input.randomId ?? randomUUID,
   };
+}
+
+export function normalizeJenovaBrandTrackingIdentity(value: unknown) {
+  if (typeof value !== "string") {
+    throw new JenovaBrandTrackingError(
+      "BRAND_IDENTITY_REQUIRED",
+      "请先在看板绑定有效的品牌名称",
+      422,
+    );
+  }
+  const normalized = value
+    .normalize("NFKC")
+    .replace(/\p{Cc}+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const length = Array.from(normalized).length;
+  if (length < 1 || length > 160) {
+    throw new JenovaBrandTrackingError(
+      "BRAND_IDENTITY_REQUIRED",
+      "请先在看板绑定有效的品牌名称",
+      422,
+    );
+  }
+  return normalized;
+}
+
+export function buildJenovaBrandTrackingKickoff(brandName: unknown) {
+  const brand = normalizeJenovaBrandTrackingIdentity(brandName);
+  return [
+    "请按以下设置直接启动品牌追踪：",
+    `1. 要追踪的品牌、产品或公司名称：${brand}`,
+    "2. 名称变体：不确定",
+    "3. 平台：全部",
+    "4. 时间范围：过去7天",
+  ].join("\n");
 }
 
 async function requireDatabase(getDatabase: typeof getDb) {
@@ -1497,7 +1535,7 @@ async function loadReplay(
   executor: any,
   userId: number,
   clientRequestId: string,
-  expected: { sessionId?: string; content: string; hiddenKickoff: boolean },
+  expected: { sessionId?: string; content?: string; hiddenKickoff: boolean },
 ): Promise<ReservedTurn | null> {
   const rows = await executor
     .select({
@@ -1528,7 +1566,8 @@ async function loadReplay(
   const row = rows[0];
   if (!row) return null;
   if (
-    row.turn.userContent !== expected.content ||
+    (expected.content !== undefined &&
+      row.turn.userContent !== expected.content) ||
     row.turn.hiddenKickoff !== expected.hiddenKickoff ||
     (expected.sessionId && row.session.id !== expected.sessionId)
   ) {
@@ -1549,9 +1588,24 @@ async function loadReplay(
   return { ...row, replayed: true } as ReservedTurn;
 }
 
+async function loadExistingNewSessionReplay(input: {
+  actor: AuthenticatedUser;
+  clientRequestId: string;
+  dependencies: ReturnType<typeof deps>;
+}) {
+  const db = await requireDatabase(input.dependencies.getDatabase);
+  return db.transaction(async (tx: any) => {
+    await loadLockedEligibleUser(tx, input.actor);
+    return loadReplay(tx, input.actor.id, input.clientRequestId, {
+      hiddenKickoff: true,
+    });
+  });
+}
+
 async function reserveNewSession(input: {
   actor: AuthenticatedUser;
   clientRequestId: string;
+  kickoff: string;
   dependencies: ReturnType<typeof deps>;
 }): Promise<ReservedTurn> {
   const db = await requireDatabase(input.dependencies.getDatabase);
@@ -1559,7 +1613,6 @@ async function reserveNewSession(input: {
   return db.transaction(async (tx: any) => {
     await loadLockedEligibleUser(tx, input.actor);
     const replay = await loadReplay(tx, input.actor.id, input.clientRequestId, {
-      content: JENOVA_HIDDEN_KICKOFF,
       hiddenKickoff: true,
     });
     if (replay) return replay;
@@ -1605,7 +1658,7 @@ async function reserveNewSession(input: {
       idempotencyKey,
       upstreamRunId: null,
       hiddenKickoff: true,
-      userContent: JENOVA_HIDDEN_KICKOFF,
+      userContent: input.kickoff,
       assistantContent: "",
       status: "pending" as const,
       costState: "pending" as const,
@@ -2238,9 +2291,44 @@ export async function startJenovaBrandTrackingSession(input: {
     throw mapClientError(error);
   }
   const resolved = deps(input.dependencies);
+  const replay = await loadExistingNewSessionReplay({
+    actor: input.actor,
+    clientRequestId,
+    dependencies: resolved,
+  });
+  if (replay) {
+    return streamReservedTurn({
+      actor: input.actor,
+      reservation: replay,
+      emit: input.emit,
+      dependencies: resolved,
+    });
+  }
+  let kickoff: string;
+  try {
+    const workspace = await resolved.getDashboardWorkspace(input.actor.id);
+    kickoff = buildJenovaBrandTrackingKickoff(workspace.payload.brandName);
+  } catch (error) {
+    if (error instanceof JenovaBrandTrackingError) throw error;
+    if (error instanceof AuthServiceError) {
+      throw new JenovaBrandTrackingError(
+        error.code === "DATABASE_UNAVAILABLE"
+          ? "DATABASE_UNAVAILABLE"
+          : "UPSTREAM_UNAVAILABLE",
+        "暂时无法读取看板品牌信息",
+        503,
+      );
+    }
+    throw new JenovaBrandTrackingError(
+      "UPSTREAM_UNAVAILABLE",
+      "暂时无法读取看板品牌信息",
+      503,
+    );
+  }
   const reservation = await reserveNewSession({
     actor: input.actor,
     clientRequestId,
+    kickoff,
     dependencies: resolved,
   });
   return streamReservedTurn({

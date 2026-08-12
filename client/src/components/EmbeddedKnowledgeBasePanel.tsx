@@ -49,6 +49,8 @@ import type {
   KnowledgeBaseProgressDto,
 } from "@shared/knowledge-base-progress";
 
+const KNOWLEDGE_BASE_NEW_BUILD_EVENT = "frontmind:new-knowledge-base-build";
+
 function isKnowledgeBaseConversationCandidate(
   conversation: Conversation | null,
 ) {
@@ -729,6 +731,24 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
     : undefined;
 
   useEffect(() => {
+    const selectFreshBuild = (event: Event) => {
+      const nextConversationId = String(
+        (event as CustomEvent<{ conversationId?: unknown }>).detail
+          ?.conversationId || "",
+      ).trim();
+      if (!nextConversationId) return;
+      setConversationId(nextConversationId);
+      setActive(nextConversationId);
+    };
+    window.addEventListener(KNOWLEDGE_BASE_NEW_BUILD_EVENT, selectFreshBuild);
+    return () =>
+      window.removeEventListener(
+        KNOWLEDGE_BASE_NEW_BUILD_EVENT,
+        selectFreshBuild,
+      );
+  }, [setActive]);
+
+  useEffect(() => {
     if (
       !hydrated ||
       latestProgressQuery.isLoading ||
@@ -816,11 +836,13 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
       const detail = readKnowledgeBaseProgressEventDetail(
         (event as CustomEvent<unknown>).detail,
       );
-      if (
-        detail &&
-        (!conversationId ||
-          detail.progress.build.conversationId === conversationId)
-      ) {
+      if (detail) {
+        if (
+          conversationId &&
+          detail.progress.build.conversationId !== conversationId
+        ) {
+          return;
+        }
         const currentCoordinate = liveProgressCoordinateRef.current;
         const hasCoordinate = detail.generation >= 0 && detail.stateEpoch >= 0;
         const coordinateIsOlder =
@@ -852,6 +874,11 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
             );
           }
         }
+        // The event carries the complete authoritative progress projection.
+        // Updating local state and the query cache is sufficient; refetching it
+        // here feeds the same progress back into ChatArea and used to trigger a
+        // reconcile storm.
+        return;
       }
       void progressQuery.refetch();
     };

@@ -282,6 +282,15 @@ async function ensurePrivateDirectory(directory: string) {
   await fs.chmod(directory, 0o700).catch(() => undefined);
 }
 
+async function fsyncPresalesDirectory(directory: string) {
+  const handle = await fs.open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 async function writeJsonAtomic(target: string, value: unknown) {
   await ensurePrivateDirectory(path.dirname(target));
   const temporary = `${target}.${randomUUID()}.tmp`;
@@ -895,12 +904,15 @@ async function writeManifest(fileId: string, value: PresalesFileManifest) {
   await fs.chmod(root, 0o700).catch(() => undefined);
   const temporary = `${manifest}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
+    const handle = await fs.open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await fs.rename(temporary, manifest);
+    await fsyncPresalesDirectory(root);
   } finally {
     await fs.rm(temporary, { force: true }).catch(() => undefined);
   }
@@ -1273,6 +1285,74 @@ export async function stagePresalesFileContent(input: {
   }
 }
 
+/**
+ * Installs a sealed managed-upload intent without copying its bytes. The
+ * no-replace hard link makes a crash between linking and manifest commit
+ * recoverable, while the size/hash check prevents an existing destination
+ * from being mistaken for the same upload.
+ */
+export async function installStoredPresalesFileFromPath(input: {
+  fileId: string;
+  sourcePath: string;
+  filename: string;
+  mimeType?: string;
+  sizeBytes: number;
+  sha256: string;
+  uploadedAt: Date | string | number;
+  contentExpiresAt: Date | string | number;
+}) {
+  const paths = pathsFor(input.fileId);
+  await ensurePrivateDirectory(paths.root);
+  let linked = false;
+  try {
+    await fs.link(input.sourcePath, paths.content);
+    linked = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const existing = await fs.stat(paths.content);
+    if (existing.size !== input.sizeBytes) {
+      throw new Error("PRESALES_FILE_EXISTING_CONTENT_MISMATCH");
+    }
+    const hash = createHash("sha256");
+    const stream = createReadStream(paths.content);
+    for await (const raw of stream) {
+      hash.update(Buffer.isBuffer(raw) ? raw : Buffer.from(raw));
+    }
+    if (hash.digest("hex") !== input.sha256) {
+      throw new Error("PRESALES_FILE_EXISTING_CONTENT_MISMATCH");
+    }
+  }
+  // The intent source was already fsynced. Persist the new hard-link inode and
+  // directory entry before writing the stored descriptor/DB retention.
+  const contentHandle = await fs.open(paths.content, "r");
+  try {
+    await contentHandle.sync();
+  } finally {
+    await contentHandle.close();
+  }
+  await fsyncPresalesDirectory(paths.root);
+  try {
+    const previous = await readManifest(input.fileId);
+    const retention = immutableManifestRetention(previous, input);
+    await writeManifest(input.fileId, {
+      schemaVersion: 1,
+      fileId: input.fileId,
+      filename: cleanFilename(input.filename, input.fileId),
+      mimeType: cleanMimeType(input.mimeType),
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      state: "stored",
+      ...retention,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    if (linked) {
+      await fs.rm(paths.content, { force: true }).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
 export async function readStoredPresalesFile(
   fileId: string,
 ): Promise<StoredPresalesFile | null> {
@@ -1410,6 +1490,9 @@ export async function removeStoredPresalesFile(fileId: string) {
     fs.rm(paths.content, { force: true }),
     fs.rm(paths.manifest, { force: true }),
   ]);
+  await fsyncPresalesDirectory(paths.root).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  });
 }
 
 /** Remove damaged bytes while retaining their immutable lifecycle ledger. */

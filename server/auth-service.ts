@@ -56,6 +56,18 @@ import {
 import { getDb } from "./db";
 import { isFileResourceContentExpired } from "./file-content-retention";
 import { getUpstreamBaseUrl } from "./upstream-config";
+import {
+  acquireManagedUploadDeletionFence,
+  assertManagedUploadScopesAvailable,
+  assertCredentialDeletionFenceToken,
+  completeManagedUploadDeletionFence,
+  listManagedUploadCredentialDeletionFenceScopes,
+  ManagedUploadDeletionFenceError,
+  reconcileStaleManagedUploadDeletionFence,
+  rollbackManagedUploadDeletionFence,
+  startManagedUploadDeletionFenceHeartbeat,
+  type ManagedUploadDeletionFenceToken,
+} from "./managed-upload-intent-fence";
 
 export const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 export const MANAGED_ACCOUNT_SETUP_DURATION_MS = 48 * 60 * 60 * 1000;
@@ -1110,6 +1122,14 @@ export async function permanentlyDeleteManagedUserRows(
 export async function deleteManagedUser(
   actorUserId: number,
   targetUserId: number,
+  options: {
+    onResultInTransaction?: (
+      result: {
+        disposition: "deactivated_for_history" | "permanently_deleted";
+      },
+      executor: any,
+    ) => Promise<void>;
+  } = {},
 ) {
   if (actorUserId === targetUserId) {
     throw new AuthServiceError(
@@ -1119,228 +1139,304 @@ export async function deleteManagedUser(
   }
 
   const db = await requireDb();
-  const result = await db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(users)
-      .where(eq(users.id, targetUserId))
-      .limit(1)
-      .for("update");
-    const user = rows[0];
-    if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
-    if (isProtectedBuiltinAdminUsername(user.username)) {
-      throw new AuthServiceError("CONFLICT", "内置 admin 系统管理员不能被删除");
-    }
-    if (user.role === "delivery_member") {
-      const [
-        assignmentRows,
-        ticketRows,
-        projectResourceRows,
-        projectConversationRows,
-      ] = await Promise.all([
-        tx
-          .select({ id: deliveryProjectAssignments.id })
-          .from(deliveryProjectAssignments)
-          .where(eq(deliveryProjectAssignments.engineerUserId, targetUserId))
-          .limit(1)
-          .for("update"),
-        tx
-          .select({ id: deliveryTickets.id })
-          .from(deliveryTickets)
-          .where(
-            and(
-              eq(deliveryTickets.assignedMemberId, targetUserId),
-              inArray(deliveryTickets.status, [
-                "submitted",
-                "needs_information",
-                "scheduled",
-                "in_progress",
-              ]),
-            ),
-          )
-          .limit(1)
-          .for("update"),
-        tx
-          .select({ id: upstreamResources.id })
-          .from(upstreamResources)
-          .where(
-            and(
-              eq(upstreamResources.userId, targetUserId),
-              isNotNull(upstreamResources.projectAssignmentId),
-            ),
-          )
-          .limit(1)
-          .for("update"),
-        tx
-          .select({ id: conversations.id })
-          .from(conversations)
-          .where(
-            and(
-              eq(conversations.userId, targetUserId),
-              isNotNull(conversations.projectAssignmentId),
-            ),
-          )
-          .limit(1)
-          .for("update"),
-      ]);
-      if (assignmentRows[0] || ticketRows[0]) {
-        throw new AuthServiceError(
-          "CONFLICT",
-          "该工程师仍负责客户项目或未结束需求，请先完成转交",
-        );
-      }
-      if (projectResourceRows[0] || projectConversationRows[0]) {
-        const now = new Date();
-        await tx
-          .update(users)
-          .set({ isActive: false, updatedAt: now })
-          .where(eq(users.id, targetUserId));
-        await consumeAllUserPasswordSetupTokensInExecutor(
-          tx,
-          targetUserId,
-          now,
-        );
-        await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
-        return { disposition: "deactivated_for_history" as const };
-      }
-    }
-
-    if (user.role === "admin") {
-      const protectedAdminRows = await tx
-        .select({
-          id: users.id,
-          adminAccessLevel: users.adminAccessLevel,
-          isActive: users.isActive,
-        })
-        .from(users)
-        .where(eq(users.username, "admin"))
-        .limit(1)
-        .for("update");
-      const protectedAdmin = protectedAdminRows[0];
-      if (
-        !protectedAdmin ||
-        protectedAdmin.adminAccessLevel !== "system_admin" ||
-        !protectedAdmin.isActive
-      ) {
-        throw new AuthServiceError(
-          "CONFLICT",
-          "内置 admin 未保持启用的系统管理员状态，无法安全交接客户",
-        );
-      }
-      const ownedUsers = await tx
-        .select({
-          userId: userUsageOwners.userId,
-          revision: userUsageOwners.revision,
-        })
-        .from(userUsageOwners)
-        .where(eq(userUsageOwners.deliveryAdminId, targetUserId))
-        .for("update");
-      const assignedUsers = await tx
-        .select({ userId: userAdminAssignments.userId })
-        .from(userAdminAssignments)
-        .where(eq(userAdminAssignments.adminId, targetUserId))
-        .for("update");
-      const historicalResources = await tx
-        .select({ id: upstreamResources.id })
-        .from(upstreamResources)
-        .innerJoin(
-          apiCredentials,
-          eq(upstreamResources.apiCredentialId, apiCredentials.id),
-        )
-        .where(
-          and(
-            eq(apiCredentials.userId, targetUserId),
-            ne(upstreamResources.userId, targetUserId),
-          ),
-        )
-        .limit(1)
-        .for("update");
-      const retainHistoricalAccount = historicalResources.length > 0;
-
-      if (user.isActive) {
-        const administrators = await tx
-          .select({
-            id: users.id,
-            adminAccessLevel: users.adminAccessLevel,
-            isActive: users.isActive,
-          })
+  const scope = { kind: "user" as const, userId: targetUserId };
+  let fence: ManagedUploadDeletionFenceToken;
+  try {
+    fence = await acquireManagedUploadDeletionFence(scope);
+  } catch (error) {
+    if (error instanceof ManagedUploadDeletionFenceError) {
+      const existing = await db.transaction(async (tx) => {
+        const rows = await tx
+          .select({ id: users.id })
           .from(users)
-          .where(eq(users.role, "admin"))
-          .orderBy(asc(users.id))
+          .where(eq(users.id, targetUserId))
+          .limit(1)
           .for("update");
-        const deletingLastActiveSystemAdmin =
-          user.adminAccessLevel === "system_admin" &&
-          administrators.every(
-            (administrator) =>
-              administrator.id === user.id ||
-              !administrator.isActive ||
-              administrator.adminAccessLevel !== "system_admin",
-          );
-        if (deletingLastActiveSystemAdmin) {
+        await reconcileStaleManagedUploadDeletionFence(
+          scope,
+          rows[0] ? "active" : "deleted",
+        ).catch((reconcileError) => {
+          if (
+            reconcileError instanceof ManagedUploadDeletionFenceError &&
+            reconcileError.code === "DELETION_IN_PROGRESS" &&
+            rows[0]
+          ) {
+            return;
+          }
+          throw reconcileError;
+        });
+        return rows[0];
+      });
+      if (!existing) {
+        return {
+          disposition: "permanently_deleted" as const,
+          replayed: true as const,
+        };
+      }
+      if (error.code === "STALE_DELETION_FENCE") {
+        fence = await acquireManagedUploadDeletionFence(scope);
+      } else {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "该账号仍有本地上传记录正在接收、恢复或清理，暂时不能永久删除",
+        );
+      }
+    } else {
+      throw error;
+    }
+  }
+  const stopFenceHeartbeat = startManagedUploadDeletionFenceHeartbeat(fence);
+  let transactionCommitted = false;
+  try {
+    const result = await db.transaction(async (tx) => {
+      const transactionResult = await (async () => {
+        const rows = await tx
+          .select()
+          .from(users)
+          .where(eq(users.id, targetUserId))
+          .limit(1)
+          .for("update");
+        const user = rows[0];
+        if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+        if (isProtectedBuiltinAdminUsername(user.username)) {
           throw new AuthServiceError(
-            "LAST_ADMIN",
-            "至少需要保留一个已启用的系统管理员",
+            "CONFLICT",
+            "内置 admin 系统管理员不能被删除",
           );
         }
-      }
+        if (user.role === "delivery_member") {
+          const [
+            assignmentRows,
+            ticketRows,
+            projectResourceRows,
+            projectConversationRows,
+          ] = await Promise.all([
+            tx
+              .select({ id: deliveryProjectAssignments.id })
+              .from(deliveryProjectAssignments)
+              .where(
+                eq(deliveryProjectAssignments.engineerUserId, targetUserId),
+              )
+              .limit(1)
+              .for("update"),
+            tx
+              .select({ id: deliveryTickets.id })
+              .from(deliveryTickets)
+              .where(
+                and(
+                  eq(deliveryTickets.assignedMemberId, targetUserId),
+                  inArray(deliveryTickets.status, [
+                    "submitted",
+                    "needs_information",
+                    "scheduled",
+                    "in_progress",
+                  ]),
+                ),
+              )
+              .limit(1)
+              .for("update"),
+            tx
+              .select({ id: upstreamResources.id })
+              .from(upstreamResources)
+              .where(
+                and(
+                  eq(upstreamResources.userId, targetUserId),
+                  isNotNull(upstreamResources.projectAssignmentId),
+                ),
+              )
+              .limit(1)
+              .for("update"),
+            tx
+              .select({ id: conversations.id })
+              .from(conversations)
+              .where(
+                and(
+                  eq(conversations.userId, targetUserId),
+                  isNotNull(conversations.projectAssignmentId),
+                ),
+              )
+              .limit(1)
+              .for("update"),
+          ]);
+          if (assignmentRows[0] || ticketRows[0]) {
+            throw new AuthServiceError(
+              "CONFLICT",
+              "该工程师仍负责客户项目或未结束需求，请先完成转交",
+            );
+          }
+          if (projectResourceRows[0] || projectConversationRows[0]) {
+            const now = new Date();
+            await tx
+              .update(users)
+              .set({ isActive: false, updatedAt: now })
+              .where(eq(users.id, targetUserId));
+            await consumeAllUserPasswordSetupTokensInExecutor(
+              tx,
+              targetUserId,
+              now,
+            );
+            await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
+            return { disposition: "deactivated_for_history" as const };
+          }
+        }
 
-      for (const owner of ownedUsers) {
-        await tx
-          .update(userUsageOwners)
-          .set({
-            deliveryAdminId: protectedAdmin.id,
-            revision: owner.revision + 1,
-            updatedAt: new Date(),
-          })
-          .where(eq(userUsageOwners.userId, owner.userId));
-      }
-      const reassignedUserIds = [
-        ...new Set([
-          ...ownedUsers.map((owner) => owner.userId),
-          ...assignedUsers.map((assignment) => assignment.userId),
-        ]),
-      ];
-      if (reassignedUserIds.length > 0) {
-        await tx
-          .insert(userAdminAssignments)
-          .values(
-            reassignedUserIds.map((userId) => ({
-              userId,
-              adminId: protectedAdmin.id,
-              assignedByUserId: actorUserId,
-            })),
-          )
-          .onDuplicateKeyUpdate({
-            set: { assignedByUserId: actorUserId },
-          });
-      }
+        if (user.role === "admin") {
+          const protectedAdminRows = await tx
+            .select({
+              id: users.id,
+              adminAccessLevel: users.adminAccessLevel,
+              isActive: users.isActive,
+            })
+            .from(users)
+            .where(eq(users.username, "admin"))
+            .limit(1)
+            .for("update");
+          const protectedAdmin = protectedAdminRows[0];
+          if (
+            !protectedAdmin ||
+            protectedAdmin.adminAccessLevel !== "system_admin" ||
+            !protectedAdmin.isActive
+          ) {
+            throw new AuthServiceError(
+              "CONFLICT",
+              "内置 admin 未保持启用的系统管理员状态，无法安全交接客户",
+            );
+          }
+          const ownedUsers = await tx
+            .select({
+              userId: userUsageOwners.userId,
+              revision: userUsageOwners.revision,
+            })
+            .from(userUsageOwners)
+            .where(eq(userUsageOwners.deliveryAdminId, targetUserId))
+            .for("update");
+          const assignedUsers = await tx
+            .select({ userId: userAdminAssignments.userId })
+            .from(userAdminAssignments)
+            .where(eq(userAdminAssignments.adminId, targetUserId))
+            .for("update");
+          const historicalResources = await tx
+            .select({ id: upstreamResources.id })
+            .from(upstreamResources)
+            .innerJoin(
+              apiCredentials,
+              eq(upstreamResources.apiCredentialId, apiCredentials.id),
+            )
+            .where(
+              and(
+                eq(apiCredentials.userId, targetUserId),
+                ne(upstreamResources.userId, targetUserId),
+              ),
+            )
+            .limit(1)
+            .for("update");
+          const retainHistoricalAccount = historicalResources.length > 0;
 
-      if (retainHistoricalAccount) {
+          if (user.isActive) {
+            const administrators = await tx
+              .select({
+                id: users.id,
+                adminAccessLevel: users.adminAccessLevel,
+                isActive: users.isActive,
+              })
+              .from(users)
+              .where(eq(users.role, "admin"))
+              .orderBy(asc(users.id))
+              .for("update");
+            const deletingLastActiveSystemAdmin =
+              user.adminAccessLevel === "system_admin" &&
+              administrators.every(
+                (administrator) =>
+                  administrator.id === user.id ||
+                  !administrator.isActive ||
+                  administrator.adminAccessLevel !== "system_admin",
+              );
+            if (deletingLastActiveSystemAdmin) {
+              throw new AuthServiceError(
+                "LAST_ADMIN",
+                "至少需要保留一个已启用的系统管理员",
+              );
+            }
+          }
+
+          for (const owner of ownedUsers) {
+            await tx
+              .update(userUsageOwners)
+              .set({
+                deliveryAdminId: protectedAdmin.id,
+                revision: owner.revision + 1,
+                updatedAt: new Date(),
+              })
+              .where(eq(userUsageOwners.userId, owner.userId));
+          }
+          const reassignedUserIds = [
+            ...new Set([
+              ...ownedUsers.map((owner) => owner.userId),
+              ...assignedUsers.map((assignment) => assignment.userId),
+            ]),
+          ];
+          if (reassignedUserIds.length > 0) {
+            await tx
+              .insert(userAdminAssignments)
+              .values(
+                reassignedUserIds.map((userId) => ({
+                  userId,
+                  adminId: protectedAdmin.id,
+                  assignedByUserId: actorUserId,
+                })),
+              )
+              .onDuplicateKeyUpdate({
+                set: { assignedByUserId: actorUserId },
+              });
+          }
+
+          if (retainHistoricalAccount) {
+            const now = new Date();
+            await tx
+              .update(users)
+              .set({ isActive: false, updatedAt: now })
+              .where(eq(users.id, targetUserId));
+            await consumeAllUserPasswordSetupTokensInExecutor(
+              tx,
+              targetUserId,
+              now,
+            );
+            await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
+            return { disposition: "deactivated_for_history" as const };
+          }
+        }
+
+        // Website provisions retain their audit row with ON DELETE SET NULL. Mark
+        // both setup-token protocols consumed before deleting the account so the
+        // durable ledger does not preserve a misleading live capability.
         const now = new Date();
-        await tx
-          .update(users)
-          .set({ isActive: false, updatedAt: now })
-          .where(eq(users.id, targetUserId));
         await consumeAllUserPasswordSetupTokensInExecutor(
           tx,
           targetUserId,
           now,
         );
         await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
-        return { disposition: "deactivated_for_history" as const };
-      }
+        await permanentlyDeleteManagedUserRows(tx, targetUserId);
+        return { disposition: "permanently_deleted" as const };
+      })();
+      await options.onResultInTransaction?.(transactionResult, tx);
+      return transactionResult;
+    });
+    transactionCommitted = true;
+    await stopFenceHeartbeat();
+    if (result.disposition === "permanently_deleted") {
+      await completeManagedUploadDeletionFence(fence);
+    } else {
+      await rollbackManagedUploadDeletionFence(fence);
     }
-
-    // Website provisions retain their audit row with ON DELETE SET NULL. Mark
-    // both setup-token protocols consumed before deleting the account so the
-    // durable ledger does not preserve a misleading live capability.
-    const now = new Date();
-    await consumeAllUserPasswordSetupTokensInExecutor(tx, targetUserId, now);
-    await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
-    await permanentlyDeleteManagedUserRows(tx, targetUserId);
-    return { disposition: "permanently_deleted" as const };
-  });
-  return result;
+    return result;
+  } catch (error) {
+    await stopFenceHeartbeat().catch(() => undefined);
+    if (!transactionCommitted) {
+      await rollbackManagedUploadDeletionFence(fence).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 function decodeMasterKey(value: string): Buffer {
@@ -1585,6 +1681,21 @@ export async function replaceApiCredentialInTransaction(input: {
   now?: Date;
   credentialId?: string;
 }): Promise<CredentialStatus> {
+  // Permanent account deletion fences the credential owner before enumerating
+  // all key generations. Check inside every transactional rotation path so a
+  // new generation cannot appear outside that frozen set. Ordinary rotation
+  // remains unaffected when no deletion fence exists.
+  await assertManagedUploadScopesAvailable([
+    { kind: "user", userId: input.userId },
+  ]).catch((error) => {
+    if (error instanceof ManagedUploadDeletionFenceError) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "账号正在永久删除，不能轮换 API Key",
+      );
+    }
+    throw error;
+  });
   const fingerprint = getApiKeyFingerprint(input.apiKey);
   const credentialId = input.credentialId ?? randomUUID();
   const encrypted = encryptApiKey(input.userId, credentialId, input.apiKey);
@@ -1653,18 +1764,137 @@ export async function replaceApiCredential(
 }
 
 export async function deleteActiveApiCredential(userId: number) {
+  const fence = await acquireActiveApiCredentialDeletionFence(userId);
+  if (!fence) return;
   const db = await requireDb();
-  await db.transaction((tx) =>
-    deleteActiveApiCredentialInTransaction({
-      executor: tx,
-      userId,
-    }),
-  );
+  const stopFenceHeartbeat = startManagedUploadDeletionFenceHeartbeat(fence);
+  let transactionCommitted = false;
+  try {
+    await db.transaction((tx) =>
+      deleteActiveApiCredentialInTransaction({
+        executor: tx,
+        userId,
+        fenceToken: fence,
+      }),
+    );
+    transactionCommitted = true;
+    await stopFenceHeartbeat();
+    await completeManagedUploadDeletionFence(fence);
+  } catch (error) {
+    await stopFenceHeartbeat().catch(() => undefined);
+    if (!transactionCommitted) {
+      await rollbackManagedUploadDeletionFence(fence).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+export async function acquireActiveApiCredentialDeletionFence(userId: number) {
+  const db = await requireDb();
+  const pendingScopes =
+    await listManagedUploadCredentialDeletionFenceScopes(userId);
+  for (const pendingScope of pendingScopes) {
+    await db.transaction(async (tx) => {
+      const rows = await tx
+        .select({ status: apiCredentials.status })
+        .from(apiCredentials)
+        .where(
+          and(
+            eq(apiCredentials.userId, userId),
+            eq(apiCredentials.id, pendingScope.credentialId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      await reconcileStaleManagedUploadDeletionFence(
+        pendingScope,
+        !rows[0] || rows[0].status === "deleted" ? "deleted" : "active",
+      ).catch((error) => {
+        if (
+          error instanceof ManagedUploadDeletionFenceError &&
+          error.code === "DELETION_IN_PROGRESS"
+        ) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            "API Key 删除正在进行，请稍后重试",
+          );
+        }
+        throw error;
+      });
+    });
+  }
+  const rows = await db
+    .select({ id: apiCredentials.id, status: apiCredentials.status })
+    .from(apiCredentials)
+    .where(eq(apiCredentials.userId, userId))
+    .orderBy(desc(apiCredentials.version))
+    .limit(1);
+  const latest = rows[0];
+  if (!latest) return null;
+  const scope = {
+    kind: "credential" as const,
+    userId,
+    credentialId: latest.id,
+  };
+  if (latest.status !== "active") {
+    await reconcileStaleManagedUploadDeletionFence(scope, "deleted").catch(
+      (error) => {
+        if (
+          error instanceof ManagedUploadDeletionFenceError &&
+          error.code === "DELETION_IN_PROGRESS"
+        ) {
+          throw new AuthServiceError(
+            "CONFLICT",
+            "API Key 删除正在收口，请稍后重试",
+          );
+        }
+        throw error;
+      },
+    );
+    return null;
+  }
+  try {
+    return await acquireManagedUploadDeletionFence(scope);
+  } catch (error) {
+    if (
+      error instanceof ManagedUploadDeletionFenceError &&
+      error.code === "STALE_DELETION_FENCE"
+    ) {
+      await reconcileStaleManagedUploadDeletionFence(scope, "active");
+      return acquireManagedUploadDeletionFence(scope);
+    }
+    if (error instanceof ManagedUploadDeletionFenceError) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "当前 API Key 仍有本地上传记录正在接收、恢复或清理；请先完成或取消上传，普通 Key 轮换不受影响",
+      );
+    }
+    throw error;
+  }
+}
+
+export async function completeActiveApiCredentialDeletionFence(
+  token: ManagedUploadDeletionFenceToken,
+) {
+  await completeManagedUploadDeletionFence(token);
+}
+
+export async function rollbackActiveApiCredentialDeletionFence(
+  token: ManagedUploadDeletionFenceToken,
+) {
+  await rollbackManagedUploadDeletionFence(token);
+}
+
+export function startActiveApiCredentialDeletionFenceHeartbeat(
+  token: ManagedUploadDeletionFenceToken,
+) {
+  return startManagedUploadDeletionFenceHeartbeat(token);
 }
 
 export async function deleteActiveApiCredentialInTransaction(input: {
   executor: any;
   userId: number;
+  fenceToken: ManagedUploadDeletionFenceToken;
   now?: Date;
 }) {
   const now = input.now ?? new Date();
@@ -1679,6 +1909,10 @@ export async function deleteActiveApiCredentialInTransaction(input: {
   if (!latest || latest.status !== "active") {
     return { version: latest?.version ?? 0, deleted: false as const };
   }
+  assertCredentialDeletionFenceToken(input.fenceToken, {
+    userId: input.userId,
+    credentialId: latest.id,
+  });
   // Reservation creation locks the exact credential before the build. Keep the
   // same credential -> build lock order here so deletion cannot race a new
   // active turn into existence after this check.
@@ -2050,6 +2284,57 @@ export async function getDecryptedCredentialForAccountById(
     .limit(1);
   const credential = rows[0];
   if (!credential || credential.status === "deleted") return null;
+  return {
+    id: credential.id,
+    userId: credential.userId,
+    version: credential.version,
+    apiKey: decryptApiKey(credential),
+    fingerprint: credential.fingerprint,
+    status: credential.status,
+    verifiedAt: credential.verifiedAt,
+  };
+}
+
+/**
+ * Resolve the immutable credential identity captured by one sealed managed
+ * upload intent. Unlike the ordinary account resolver this intentionally does
+ * not consult the account's current usage-owner assignment: that relationship
+ * may change after Dashboard has durably accepted the browser body. The
+ * intent's authenticated actor/project/ticket checks and deletion fences are
+ * the authorization boundary; this lookup only proves that the exact owner,
+ * credential and version still exist and remain decryptable.
+ */
+export async function getDecryptedCredentialForManagedUploadIntent(
+  input: {
+    credentialId: string;
+    credentialOwnerUserId: number;
+    credentialVersion: number;
+  },
+  executor?: any,
+): Promise<DecryptedCredential | null> {
+  const db = executor ?? (await requireDb());
+  const rows = await db
+    .select()
+    .from(apiCredentials)
+    .where(
+      and(
+        eq(apiCredentials.id, input.credentialId),
+        eq(apiCredentials.userId, input.credentialOwnerUserId),
+        eq(apiCredentials.version, input.credentialVersion),
+        inArray(apiCredentials.status, ["active", "retired"]),
+      ),
+    )
+    .limit(1);
+  const credential = rows[0];
+  if (
+    !credential ||
+    credential.id !== input.credentialId ||
+    credential.userId !== input.credentialOwnerUserId ||
+    credential.version !== input.credentialVersion ||
+    (credential.status !== "active" && credential.status !== "retired")
+  ) {
+    return null;
+  }
   return {
     id: credential.id,
     userId: credential.userId,

@@ -1280,16 +1280,22 @@ describe("knowledge-base production final-package acceptance", () => {
     let includeFinalPackage = true;
     const uploadedFileBytes = new Map<string, Buffer>();
     const uploadedFileNames = new Map<string, string>();
+    const readinessReads = new Map<string, number>();
+    const providerReadyFiles = new Set<string>();
+    let taskPostsBeforeAttachmentsReady = 0;
     const operationTaskPosts = new Map<string, number>();
     let rawTaskPosts = 0;
-    let transientConfirmationFailuresRemaining = 1;
+    // Task Create has no documented replay authority; this acceptance path
+    // must never depend on retrying a transient create response.
+    let transientConfirmationFailuresRemaining = 0;
     const idempotentTaskResponses = new Map<
       string,
       { id: string; status: "awaiting_input" | "completed"; output: unknown[] }
     >();
 
     upstream.post("/v1/files", (req, res) => {
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      expect(req.header("api_key")).toBe("sk-e2e-only");
+      expect(req.header("authorization")).toBeUndefined();
       const filename = String(req.body.filename || "");
       expect(
         filename === "socratic-kb-builder.skill.zip" ||
@@ -1319,9 +1325,42 @@ describe("knowledge-base production final-package acceptance", () => {
         res.status(200).end();
       },
     );
+    upstream.get("/v1/files/:fileId", (req, res) => {
+      expect(req.header("api_key")).toBe("sk-e2e-only");
+      expect(req.header("authorization")).toBeUndefined();
+      const filename = uploadedFileNames.get(req.params.fileId);
+      if (!filename || !uploadedFileBytes.has(req.params.fileId)) {
+        res.status(404).json({ error: { code: "FILE_NOT_FOUND" } });
+        return;
+      }
+      const reads = (readinessReads.get(req.params.fileId) || 0) + 1;
+      readinessReads.set(req.params.fileId, reads);
+      const initialInstructionsStillPending =
+        req.params.fileId === "uploaded-instructions-2" && reads <= 2;
+      if (initialInstructionsStillPending) {
+        expect(rawTaskPosts).toBe(0);
+        res.json({ id: req.params.fileId, filename, status: "pending" });
+        return;
+      }
+      providerReadyFiles.add(req.params.fileId);
+      res.json({ id: req.params.fileId, filename, status: "uploaded" });
+    });
     upstream.post("/v1/tasks", (req, res) => {
       rawTaskPosts += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      expect(req.header("api_key")).toBe("sk-e2e-only");
+      expect(req.header("authorization")).toBeUndefined();
+      expect(req.header("idempotency-key")).toBeUndefined();
+      expect(req.body.taskMode).toBeUndefined();
+      expect(req.body.taskId).toBeUndefined();
+      if (
+        req.body.attachments.some(
+          (attachment: any) => !providerReadyFiles.has(attachment.file_id),
+        )
+      ) {
+        taskPostsBeforeAttachmentsReady += 1;
+        res.status(400).json({ error: { code: "ATTACHMENT_NOT_READY" } });
+        return;
+      }
       const prompt = String(req.body.prompt || "");
       expect(Array.from(prompt).length).toBeLessThanOrEqual(3_000);
       const operationId =
@@ -1352,9 +1391,7 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(
         uploadedFileBytes.get(systemInputAttachment.file_id)?.length,
       ).toBeGreaterThan(0);
-      const idempotencyKey = String(req.header("idempotency-key") || "");
-      expect(idempotencyKey).toBe(`frontmind-kb-v2:${operationId}`);
-      const replay = idempotentTaskResponses.get(idempotencyKey);
+      const replay = idempotentTaskResponses.get(operationId!);
       if (replay) {
         res.json(replay);
         return;
@@ -1371,11 +1408,6 @@ describe("knowledge-base production final-package acceptance", () => {
         (operationTaskPosts.get(operationId!) || 0) + 1,
       );
       const revision = Number(turn!.expectedRevision);
-      if (isStart) {
-        expect(req.body.taskId).toBeUndefined();
-      } else {
-        expect(req.body.taskId).toBe(state.builds[0]!.upstreamTaskId);
-      }
       const isFinal = !isStart && revision === fixture.leaves.length - 1;
       const taskId = isStart
         ? "task-initial-manifest-e2e"
@@ -1529,7 +1561,7 @@ describe("knowledge-base production final-package acceptance", () => {
           | "awaiting_input",
         output,
       };
-      idempotentTaskResponses.set(idempotencyKey, taskResult);
+      idempotentTaskResponses.set(operationId!, taskResult);
       taskResults.set(taskId, {
         status: taskResult.status,
         output,
@@ -2129,7 +2161,11 @@ describe("knowledge-base production final-package acceptance", () => {
     expect([...operationTaskPosts.values()]).toEqual(
       Array(deepRevision + 1).fill(1),
     );
-    expect(rawTaskPosts).toBe(deepRevision + 2);
+    expect(rawTaskPosts).toBe(deepRevision + 1);
+    expect(
+      readinessReads.get("uploaded-instructions-2"),
+    ).toBeGreaterThanOrEqual(3);
+    expect(taskPostsBeforeAttachmentsReady).toBe(0);
     expect(state.builds[0]).toMatchObject({
       id: buildId,
       // reservation + upstream binding + authoritative reconcile per operation
@@ -3511,7 +3547,8 @@ describe("knowledge-base production final-package acceptance", () => {
     upstream.use(express.json({ limit: "5mb" }));
     let upstreamBaseUrl = "";
     upstream.post("/v1/files", (req, res) => {
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      expect(req.header("api_key")).toBe("sk-e2e-only");
+      expect(req.header("authorization")).toBeUndefined();
       const filename = String(req.body.filename || "");
       expect(
         filename === "socratic-kb-builder.skill.zip" ||
@@ -3536,11 +3573,23 @@ describe("knowledge-base production final-package acceptance", () => {
         res.status(200).end();
       },
     );
+    upstream.get("/v1/files/:fileId", (req, res) => {
+      expect(req.header("api_key")).toBe("sk-e2e-only");
+      expect(req.header("authorization")).toBeUndefined();
+      const filename = uploadedFileNames.get(req.params.fileId);
+      if (!filename || !uploadedFileBytes.has(req.params.fileId)) {
+        res.status(404).json({ error: { code: "FILE_NOT_FOUND" } });
+        return;
+      }
+      res.json({ id: req.params.fileId, filename, status: "uploaded" });
+    });
     upstream.post("/v1/tasks", (req, res) => {
       providerTaskPosts += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
-      expect(req.body.taskId).toBe(parentTaskId);
-      expect(req.body.taskId).not.toBe(oldTaskId);
+      expect(req.header("api_key")).toBe("sk-e2e-only");
+      expect(req.header("authorization")).toBeUndefined();
+      expect(req.header("idempotency-key")).toBeUndefined();
+      expect(req.body.taskMode).toBeUndefined();
+      expect(req.body.taskId).toBeUndefined();
       const attachmentFilenames = req.body.attachments.map(
         (attachment: any) => attachment.filename,
       );
@@ -3568,9 +3617,6 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(retryOperationKey).not.toBe(sourceOperationKey);
       expect(retryTurnId).toBeTruthy();
       expect(retryTurnId).not.toBe(sourceTurnId);
-      expect(req.header("idempotency-key")).toBe(
-        createKnowledgeBaseUpstreamIdempotencyKey(retryOperationKey),
-      );
       retryTaskOutput = [
         {
           id: "assistant-final-package-retry",
@@ -3700,8 +3746,8 @@ describe("knowledge-base production final-package acceptance", () => {
       logoFilename: "frontmind-logo.png",
       logoMimeType: "image/png",
       protocolError:
-        "上游已确认最后节点，但未返回当前操作唯一的最终知识库 ZIP；本轮未提交，仍停留在最后节点",
-      protocolErrorCode: "FINAL_PACKAGE_MISSING",
+        "最终知识库 ZIP 未通过当前操作的完整性校验；本轮未提交，仍停留在最后节点",
+      protocolErrorCode: "FINAL_PACKAGE_INVALID",
       publishedSnapshotId: null,
       completedAt: null,
       publishedAt: null,
@@ -3771,6 +3817,9 @@ describe("knowledge-base production final-package acceptance", () => {
         attachmentsFrozen: true,
         expectedAttachmentCount: 1,
         userAttachmentCount: 0,
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
         recovery: sourceRecovery,
         preparedDispatch: {
           schemaVersion: 1,
@@ -3783,8 +3832,8 @@ describe("knowledge-base production final-package acceptance", () => {
       leaseExpiresAt: null,
       status: "failed",
       upstreamTaskId: oldTaskId,
-      errorCode: "FINAL_PACKAGE_MISSING",
-      errorMessage: "上游已确认最后节点，但未返回最终 ZIP",
+      errorCode: "FINAL_PACKAGE_INVALID",
+      errorMessage: "最终 ZIP 未通过完整性校验",
       startedAt: now,
       completedAt: now,
       createdAt: now,
@@ -3827,8 +3876,11 @@ describe("knowledge-base production final-package acceptance", () => {
           authoritativeTaskId: oldTaskId,
           activeTurn: { id: sourceTurnId, status: "failed" },
           notice: {
-            code: "FINAL_PACKAGE_MISSING",
+            code: "FINAL_PACKAGE_INVALID",
             retryable: true,
+            failureClass: "terminal_requires_regeneration",
+            recoveryAction: "regenerate_turn",
+            canRegenerate: true,
             turnId: sourceTurnId,
           },
           interaction: {
@@ -3850,6 +3902,192 @@ describe("knowledge-base production final-package acceptance", () => {
           package: null,
         },
       });
+
+      const sourceBeforeRejectedRetry = state.turns.find(
+        (turn) => turn.id === sourceTurnId,
+      )!;
+      const legalSourceMetadata = sourceBeforeRejectedRetry.metadata;
+      const legalSourceUpstreamTaskId =
+        sourceBeforeRejectedRetry.upstreamTaskId;
+      const legalBuildUpstreamTaskId = state.builds[0]!.upstreamTaskId;
+      const legalProtocolErrorCode = state.builds[0]!.protocolErrorCode;
+      const legalProtocolError = state.builds[0]!.protocolError;
+      const turnsBeforeRejectedRetry = state.turns.length;
+      const taskPostsBeforeRejectedRetry = providerTaskPosts;
+
+      sourceBeforeRejectedRetry.metadata = {
+        ...(legalSourceMetadata as Record<string, unknown>),
+        failureClass: "requires_user_fix",
+        recoveryAction: "update_credential",
+        canRegenerate: false,
+        createAttemptState: "rejected",
+      };
+      sourceBeforeRejectedRetry.upstreamTaskId = null;
+      sourceBeforeRejectedRetry.errorCode = "UPSTREAM_CREATE_HTTP_401";
+      sourceBeforeRejectedRetry.errorMessage = "上游已明确拒绝当前任务创建凭证";
+      state.builds[0]!.upstreamTaskId = null;
+      state.builds[0]!.protocolErrorCode = "UPSTREAM_CREATE_HTTP_401";
+      state.builds[0]!.protocolError = "上游已明确拒绝当前任务创建凭证";
+      const rejectedCredentialTurnSnapshot = structuredClone(
+        sourceBeforeRejectedRetry,
+      );
+      const rejectedCredentialBuildSnapshot = structuredClone(state.builds[0]);
+
+      const rejectedCredentialReconcileResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
+        },
+      );
+      expect({
+        status: rejectedCredentialReconcileResponse.status,
+        body: await rejectedCredentialReconcileResponse.json(),
+      }).toMatchObject({
+        status: 200,
+        body: {
+          observation: {
+            authoritativeTaskId: null,
+            activeTurn: {
+              id: sourceTurnId,
+              createAttemptState: "rejected",
+              recoveryAction: "update_credential",
+            },
+            notice: {
+              code: "UPSTREAM_CREATE_HTTP_401",
+              recoveryAction: "update_credential",
+              canRegenerate: false,
+              turnId: sourceTurnId,
+            },
+          },
+        },
+      });
+      expect(sourceBeforeRejectedRetry).toStrictEqual(
+        rejectedCredentialTurnSnapshot,
+      );
+      expect(state.builds[0]).toStrictEqual(rejectedCredentialBuildSnapshot);
+      expect(providerTaskPosts).toBe(taskPostsBeforeRejectedRetry);
+
+      sourceBeforeRejectedRetry.metadata = {
+        ...(legalSourceMetadata as Record<string, unknown>),
+        failureClass: "requires_user_fix",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+        createAttemptState: "rejected",
+      };
+      sourceBeforeRejectedRetry.errorCode = "UPSTREAM_CREATE_3";
+      sourceBeforeRejectedRetry.errorMessage = "上游已明确拒绝创建本轮任务";
+      state.builds[0]!.protocolErrorCode = "UPSTREAM_CREATE_3";
+      state.builds[0]!.protocolError = "上游已明确拒绝创建本轮任务";
+
+      const rejectedRetryResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/retry`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({
+            conversationId: PUBLIC_CONVERSATION_ID,
+            clientRequestId: "request-rejected-create-must-not-retry",
+            expectedGeneration: 1,
+            expectedRevision: priorRevision,
+            expectedLeafId: `1.${finalRevision}`,
+          }),
+        },
+      );
+      expect({
+        status: rejectedRetryResponse.status,
+        body: await rejectedRetryResponse.json(),
+      }).toMatchObject({
+        status: 409,
+        body: {
+          error: { code: "CONFLICT" },
+          observation: {
+            notice: {
+              code: "UPSTREAM_CREATE_3",
+              recoveryAction: "contact_support",
+              canRegenerate: false,
+              turnId: sourceTurnId,
+            },
+          },
+        },
+      });
+      expect(state.turns).toHaveLength(turnsBeforeRejectedRetry);
+      expect(providerTaskPosts).toBe(taskPostsBeforeRejectedRetry);
+      expect(
+        state.turns.find((turn) => turn.id === sourceTurnId),
+      ).toMatchObject({
+        status: "failed",
+        errorCode: "UPSTREAM_CREATE_3",
+        metadata: {
+          createAttemptState: "rejected",
+          recoveryAction: "contact_support",
+        },
+      });
+      const rejectedCreateSnapshot = structuredClone(sourceBeforeRejectedRetry);
+      const rejectedBuildSnapshot = structuredClone(state.builds[0]);
+      const rejectedAttachmentRepairResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/turn/replace-attachments`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({
+            conversationId: PUBLIC_CONVERSATION_ID,
+            clientRequestId: "rejected-create-attachment-repair",
+            expectedGeneration: 1,
+            expectedRevision: priorRevision,
+            expectedLeafId: `1.${finalRevision}`,
+            attachments: [
+              { file_id: "replacement-file", filename: "replacement.pdf" },
+            ],
+            attachmentManifest: [
+              {
+                filename: "replacement.pdf",
+                sizeBytes: 100,
+                mimeType: "application/pdf",
+                lastModified: 1,
+                sha256: "f".repeat(64),
+              },
+            ],
+          }),
+        },
+      );
+      expect({
+        status: rejectedAttachmentRepairResponse.status,
+        body: await rejectedAttachmentRepairResponse.json(),
+      }).toMatchObject({
+        status: 409,
+        body: {
+          error: { code: "KNOWLEDGE_BASE_ATTACHMENT_REPAIR_CONFLICT" },
+          observation: {
+            notice: {
+              code: "UPSTREAM_CREATE_3",
+              turnId: sourceTurnId,
+            },
+          },
+        },
+      });
+      expect(sourceBeforeRejectedRetry).toStrictEqual(rejectedCreateSnapshot);
+      expect(state.builds[0]).toStrictEqual(rejectedBuildSnapshot);
+      expect(state.turns).toHaveLength(turnsBeforeRejectedRetry);
+      expect(providerTaskPosts).toBe(taskPostsBeforeRejectedRetry);
+
+      sourceBeforeRejectedRetry.metadata = legalSourceMetadata;
+      sourceBeforeRejectedRetry.upstreamTaskId = legalSourceUpstreamTaskId;
+      sourceBeforeRejectedRetry.errorCode = "FINAL_PACKAGE_INVALID";
+      sourceBeforeRejectedRetry.errorMessage = "最终 ZIP 未通过完整性校验";
+      state.builds[0]!.upstreamTaskId = legalBuildUpstreamTaskId;
+      state.builds[0]!.protocolErrorCode = legalProtocolErrorCode;
+      state.builds[0]!.protocolError = legalProtocolError;
 
       const retryResponse = await fetch(
         `${dashboardListener.baseUrl}/api/knowledge-base/retry`,
@@ -3946,7 +4184,7 @@ describe("knowledge-base production final-package acceptance", () => {
       ).toMatchObject({
         status: "failed",
         upstreamTaskId: oldTaskId,
-        errorCode: "FINAL_PACKAGE_MISSING",
+        errorCode: "FINAL_PACKAGE_INVALID",
       });
       const retryTurn = state.turns.find((turn) => turn.id === retryTurnId);
       expect(retryTurn).toMatchObject({

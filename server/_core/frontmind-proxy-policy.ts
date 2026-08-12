@@ -11,7 +11,10 @@ import { assertDeliveryProjectContext } from "../delivery-role-service";
 const ORDINARY_USER_SUPPORT_OPERATIONS = new Set([
   "POST /download-token",
   "POST /v1/files",
+  "POST /v1/managed-uploads",
+  "POST /v1/managed-uploads/recovery",
   "PUT /proxy-upload",
+  "DELETE /v1/managed-uploads",
 ]);
 
 function proxyPath(req: Pick<FrontMindRequest, "originalUrl">) {
@@ -57,6 +60,8 @@ export function ordinaryUserProxyWriteRequiresActiveService(
   const operation = `${req.method.toUpperCase()} ${proxyPath(req)}`;
   return (
     operation === "POST /v1/files" ||
+    operation === "POST /v1/managed-uploads" ||
+    operation === "POST /v1/managed-uploads/recovery" ||
     operation === "PUT /proxy-upload" ||
     (req.method.toUpperCase() === "POST" &&
       /^\/v1\/files\/[^/]+\/upload-recovery$/u.test(proxyPath(req)))

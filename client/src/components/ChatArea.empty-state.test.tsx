@@ -222,10 +222,11 @@ describe("EmptyConversationHint", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "重试并继续" })).toBeEnabled();
     });
-    expect(screen.getAllByText("上传完成")).toHaveLength(3);
+    expect(screen.getAllByText("云端已确认")).toHaveLength(3);
     expect(screen.getAllByText("第4个文件上传失败")).toHaveLength(2);
     expect(screen.getByText("等待上传")).toBeInTheDocument();
     expect(screen.getByText("已传输100 B/150 B")).toBeInTheDocument();
+    expect(screen.getByText("Dashboard 已接收60 B/150 B")).toBeInTheDocument();
     expect(screen.getByText("已确认60 B/150 B")).toBeInTheDocument();
     expect(startRequests).not.toHaveBeenCalled();
     expect(files.every((file) => screen.getByText(file.name))).toBe(true);
@@ -263,6 +264,18 @@ describe("EmptyConversationHint", () => {
     const requestOrder: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url === "/api/frontmind/v1/managed-uploads") {
+        return {
+          ok: false,
+          status: 404,
+          headers: { get: () => "unsupported" },
+          clone: () => ({
+            json: async () => ({
+              error: { code: "MANAGED_UPLOAD_INTENT_UNSUPPORTED" },
+            }),
+          }),
+        };
+      }
       if (url === "/api/frontmind/v1/files") {
         requestOrder.push("create");
         return {
@@ -289,6 +302,7 @@ describe("EmptyConversationHint", () => {
               fileId: "file-ticketless",
               sizeBytes: file.size,
               uploadedAt: 10_000,
+              providerReadyAt: 10_001,
               expiresAt: 20_000,
               replayed: false,
               recovered: true,
@@ -349,6 +363,180 @@ describe("EmptyConversationHint", () => {
     expect(acceptedCount).toBe(1);
   });
 
+  it("retains an intent handle without a provider id and retries that row only", async () => {
+    const file = sizedFile("本地已暂存.pdf", 48);
+    const handle: frontmindApi.ManagedUploadHandle = {
+      itemId: "stable-row-item",
+      intentId: "mui-chat-stage-first",
+      filename: file.name,
+      ticket: "mi1.chat.signature",
+      expiresAt: Date.now() + 60_000,
+    };
+    const uploadOptions: frontmindApi.UploadFileOptions[] = [];
+    const attachments: Array<Array<{ file_id: string; filename: string }>> = [];
+    const uploadImplementation = vi.fn(
+      async (
+        _file: File,
+        _progress?: (percent: number) => void,
+        _retry?: unknown,
+        options: frontmindApi.UploadFileOptions = {},
+      ) => {
+        uploadOptions.push(options);
+        if (uploadOptions.length === 1) {
+          await options.onFileRecord?.({
+            itemId: handle.itemId,
+            intentId: handle.intentId,
+            filename: file.name,
+            uploadHandle: handle,
+            reusedExistingFileId: false,
+          });
+          options.onStage?.({
+            stage: "sealed",
+            itemId: handle.itemId,
+            intentId: handle.intentId,
+            loadedBytes: file.size,
+            totalBytes: file.size,
+          });
+          throw new frontmindApi.FileUploadError("云端暂时不可用", {
+            code: "UPLOAD_PROVIDER_TEMPORARY",
+            retryable: true,
+            recoveryAction: "check_status",
+          });
+        }
+        expect(options.existingUploadHandle).toEqual(handle);
+        return {
+          fileId: "provider-chat-stage-first",
+          filename: file.name,
+          uploadedAt: 10_000,
+          providerReadyAt: 10_001,
+          expiresAt: 20_000,
+          replayed: false,
+          recovered: true,
+        };
+      },
+    );
+    const onStartKnowledgeBase = vi.fn(
+      async (input, lifecycle): Promise<KnowledgeBaseStarterStartOutcome> => {
+        const uploaded = await uploadKnowledgeBaseStarterFiles(
+          input.files,
+          lifecycle,
+          lifecycle.startedAt,
+          uploadImplementation as unknown as typeof frontmindApi.uploadFile,
+        );
+        attachments.push(uploaded.uploadedAttachments);
+        return { status: "accepted" };
+      },
+    );
+
+    render(
+      <EmptyConversationHint
+        onStartKnowledgeBase={onStartKnowledgeBase}
+        companyName="验收企业"
+        companyConfigured
+        companyLoading={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "构建企业知识库" }));
+    addStarterFiles([file]);
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", {
+          name: /重新检查云端状态|重试并继续/u,
+        }),
+      ).toBeEnabled();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /重新检查云端状态|重试并继续/u,
+      }),
+    );
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "构建企业知识库" }),
+      ).not.toBeInTheDocument();
+    });
+
+    expect(uploadImplementation).toHaveBeenCalledTimes(2);
+    expect(uploadOptions[1].existingFileId).toBeUndefined();
+    expect(uploadOptions[1].existingUploadHandle).toEqual(handle);
+    expect(attachments).toEqual([
+      [
+        {
+          file_id: "provider-chat-stage-first",
+          filename: file.name,
+        },
+      ],
+    ]);
+  });
+
+  it("cancels a pre-receipt intent through intent DELETE", async () => {
+    const file = sizedFile("待取消暂存.pdf", 32);
+    const handle: frontmindApi.ManagedUploadHandle = {
+      itemId: "cancel-row-item",
+      intentId: "mui-chat-cancel",
+      filename: file.name,
+      ticket: "mi1.cancel.signature",
+      expiresAt: Date.now() + 60_000,
+    };
+    const discard = vi
+      .spyOn(frontmindApi, "discardManagedUploadIntent")
+      .mockResolvedValue(undefined);
+    const uploadImplementation = vi.fn(
+      async (
+        _file: File,
+        _progress?: (percent: number) => void,
+        _retry?: unknown,
+        options: frontmindApi.UploadFileOptions = {},
+      ) => {
+        await options.onFileRecord?.({
+          itemId: handle.itemId,
+          intentId: handle.intentId,
+          filename: file.name,
+          uploadHandle: handle,
+          reusedExistingFileId: false,
+        });
+        throw new frontmindApi.FileUploadError("云端暂时不可用", {
+          code: "UPLOAD_PROVIDER_TEMPORARY",
+          retryable: true,
+          recoveryAction: "check_status",
+        });
+      },
+    );
+    const onStartKnowledgeBase = vi.fn(
+      async (input, lifecycle): Promise<KnowledgeBaseStarterStartOutcome> => {
+        await uploadKnowledgeBaseStarterFiles(
+          input.files,
+          lifecycle,
+          lifecycle.startedAt,
+          uploadImplementation as unknown as typeof frontmindApi.uploadFile,
+        );
+        return { status: "accepted" };
+      },
+    );
+
+    render(
+      <EmptyConversationHint
+        onStartKnowledgeBase={onStartKnowledgeBase}
+        companyName="验收企业"
+        companyConfigured
+        companyLoading={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "构建企业知识库" }));
+    addStarterFiles([file]);
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "取消" })).toBeEnabled();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(discard).toHaveBeenCalledWith(handle));
+    expect(
+      screen.queryByRole("dialog", { name: "构建企业知识库" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows byte-weighted progress and aborts without losing the batch", async () => {
     const files = [sizedFile("小册.pdf", 100), sizedFile("目录.pdf", 300)];
     let lifecycle!: KnowledgeBaseStarterLifecycle;
@@ -358,7 +546,7 @@ describe("EmptyConversationHint", () => {
       nextLifecycle.signal.addEventListener(
         "abort",
         () => {
-          nextLifecycle.onFileUpdate(files[0], {
+          nextLifecycle.onFileUpdate(nextLifecycle.fileItemIds![0], files[0], {
             stage: "cancelled",
             loadedBytes: 0,
             totalBytes: files[0].size,
@@ -384,7 +572,7 @@ describe("EmptyConversationHint", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
 
     act(() => {
-      lifecycle.onFileUpdate(files[0], {
+      lifecycle.onFileUpdate(lifecycle.fileItemIds![0], files[0], {
         stage: "uploading",
         loadedBytes: 50,
         totalBytes: 100,
@@ -392,6 +580,7 @@ describe("EmptyConversationHint", () => {
     });
     expect(screen.getByText("13%")).toBeInTheDocument();
     expect(screen.getByText("已传输50 B/400 B")).toBeInTheDocument();
+    expect(screen.getByText("Dashboard 已接收0 B/400 B")).toBeInTheDocument();
     expect(screen.getByText("已确认0 B/400 B")).toBeInTheDocument();
     expect(screen.getByText("正在上传 50%")).toBeInTheDocument();
     expect(
@@ -399,17 +588,19 @@ describe("EmptyConversationHint", () => {
     ).toBeInTheDocument();
 
     act(() => {
-      lifecycle.onFileUpdate(files[0], {
+      lifecycle.onFileUpdate(lifecycle.fileItemIds![0], files[0], {
         stage: "server_processing",
         loadedBytes: 100,
+        dashboardReceivedBytes: 100,
         totalBytes: 100,
       });
     });
     expect(screen.getByText("25%")).toBeInTheDocument();
     expect(screen.getByText("已传输100 B/400 B")).toBeInTheDocument();
+    expect(screen.getByText("Dashboard 已接收100 B/400 B")).toBeInTheDocument();
     expect(screen.getByText("已确认0 B/400 B")).toBeInTheDocument();
     expect(
-      screen.getByText("文件已接收，正在云端校验并登记"),
+      screen.getByText("文件已接收，正在等待云端就绪"),
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "停止上传" }));
@@ -433,7 +624,7 @@ describe("EmptyConversationHint", () => {
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
     const onStartKnowledgeBase = vi.fn((_input, nextLifecycle) => {
       lifecycle = nextLifecycle;
-      nextLifecycle.onFileUpdate(file, {
+      nextLifecycle.onFileUpdate(nextLifecycle.fileItemIds![0], file, {
         stage: "recovering",
         fileId: "file-recovering",
         loadedBytes: file.size,
@@ -460,7 +651,7 @@ describe("EmptyConversationHint", () => {
     });
     nowSpy.mockReturnValue(now + 5_000);
     await act(async () => {
-      lifecycle.onFileUpdate(file, {
+      lifecycle.onFileUpdate(lifecycle.fileItemIds![0], file, {
         stage: "failed",
         fileId: "file-recovering",
         loadedBytes: file.size,
@@ -474,6 +665,9 @@ describe("EmptyConversationHint", () => {
     });
 
     expect(screen.getByText("本次耗时 5秒")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重新检查云端状态" }),
+    ).toBeEnabled();
     nowSpy.mockRestore();
   });
 
@@ -544,7 +738,7 @@ describe("EmptyConversationHint", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "重试启动" })).toBeEnabled();
     });
-    expect(screen.getByText("上传完成")).toBeInTheDocument();
+    expect(screen.getByText("云端已确认")).toBeInTheDocument();
     expect(screen.getByText("品牌手册.pdf")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "移除 品牌手册.pdf" }),
@@ -572,7 +766,7 @@ describe("EmptyConversationHint", () => {
   it("blocks a misleading retry when a file failure is deterministic", async () => {
     const file = sizedFile("身份冲突.pdf", 48);
     const onStartKnowledgeBase = vi.fn(async (_input, lifecycle) => {
-      lifecycle.onFileUpdate(file, {
+      lifecycle.onFileUpdate(lifecycle.fileItemIds![0], file, {
         stage: "failed",
         fileId: "file-conflict",
         loadedBytes: 0,
@@ -580,7 +774,7 @@ describe("EmptyConversationHint", () => {
         error: "该文件记录已绑定其他内容",
         errorCode: "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
         retryable: false,
-        traceId: "trace-conflict",
+        traceId: "22222222-2222-4222-8222-222222222222",
         attempt: 1,
       });
       throw Object.assign(new Error("该文件记录已绑定其他内容"), {
@@ -618,13 +812,100 @@ describe("EmptyConversationHint", () => {
     expect(
       screen.getByText("错误码：UPLOAD_PROVIDER_IDENTITY_MISMATCH"),
     ).toBeInTheDocument();
-    expect(screen.getByText("排查编号：trace-conflict")).toBeInTheDocument();
+    expect(
+      screen.getByText("排查编号：22222222-2222-4222-8222-222222222222"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render provider secrets from a managed-upload failure", async () => {
+    const file = sizedFile("公开资料.pdf", 48);
+    const secrets = [
+      "sk-secret-managed-upload-key",
+      "董事会机密.pdf",
+      "provider-secret-file-id",
+      "https://uploads.example/private.pdf?X-Amz-Signature=signed-secret",
+    ];
+    const hostileMessage = `云端失败：${secrets.join(" ")}`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          state: "awaiting_browser",
+          intentId: "mui-secret-redaction",
+          intentTicket: "mi1.secret.signature",
+          expiresAt: Date.now() + 60_000,
+          sizeBytes: file.size,
+        }),
+      }),
+    );
+    class MockXMLHttpRequest {
+      status = 503;
+      responseText = JSON.stringify({
+        error: {
+          code: "UNTRUSTED_PROVIDER_RAW_MESSAGE",
+          message: hostileMessage,
+          retryable: true,
+          recoveryAction: "check_status",
+          traceId: "11111111-1111-4111-8111-111111111111",
+        },
+      });
+      upload = { addEventListener: vi.fn() };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        queueMicrotask(() => this.listeners.get("load")?.());
+      }
+      abort() {
+        this.listeners.get("abort")?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const onStartKnowledgeBase = vi.fn(async (input, lifecycle) => {
+      await uploadKnowledgeBaseStarterFiles(
+        input.files,
+        lifecycle,
+        lifecycle.startedAt,
+        frontmindApi.uploadFile,
+      );
+      return { status: "accepted" as const };
+    });
+
+    const rendered = render(
+      <EmptyConversationHint
+        onStartKnowledgeBase={onStartKnowledgeBase}
+        companyName="验收企业"
+        companyConfigured
+        companyLoading={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "构建企业知识库" }));
+    addStarterFiles([file]);
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("文件上传失败，请稍后重试").length,
+      ).toBeGreaterThan(0);
+    });
+    expect(screen.getByText("错误码：UPLOAD_REJECTED")).toBeInTheDocument();
+    expect(
+      screen.getByText("排查编号：11111111-1111-4111-8111-111111111111"),
+    ).toBeInTheDocument();
+    for (const secret of secrets) {
+      expect(rendered.container.textContent).not.toContain(secret);
+    }
   });
 
   it("allows an explicit recreate recovery and shows its attempt and trace", async () => {
     const file = sizedFile("凭证过期.pdf", 48);
     const onStartKnowledgeBase = vi.fn(async (_input, lifecycle) => {
-      lifecycle.onFileUpdate(file, {
+      lifecycle.onFileUpdate(lifecycle.fileItemIds![0], file, {
         stage: "failed",
         fileId: "file-expired",
         loadedBytes: file.size,
@@ -634,7 +915,7 @@ describe("EmptyConversationHint", () => {
         retryable: false,
         recoveryAction: "discard_and_recreate",
         recreateRequired: true,
-        traceId: "trace-expired",
+        traceId: "33333333-3333-4333-8333-333333333333",
         attempt: 1,
       });
       throw Object.assign(new Error("上传凭证已过期"), {
@@ -643,7 +924,7 @@ describe("EmptyConversationHint", () => {
         retryable: false,
         recoveryAction: "discard_and_recreate",
         recreateRequired: true,
-        traceId: "trace-expired",
+        traceId: "33333333-3333-4333-8333-333333333333",
       });
     });
 
@@ -669,8 +950,11 @@ describe("EmptyConversationHint", () => {
     expect(
       screen.getByText("错误码：UPLOAD_CAPABILITY_EXPIRED"),
     ).toBeInTheDocument();
-    expect(screen.getByText("排查编号：trace-expired")).toBeInTheDocument();
+    expect(
+      screen.getByText("排查编号：33333333-3333-4333-8333-333333333333"),
+    ).toBeInTheDocument();
     expect(screen.getByText("已传输48 B/48 B")).toBeInTheDocument();
+    expect(screen.getByText("Dashboard 已接收0 B/48 B")).toBeInTheDocument();
     expect(screen.getByText("已确认0 B/48 B")).toBeInTheDocument();
   });
 
@@ -685,7 +969,7 @@ describe("EmptyConversationHint", () => {
       .mockRejectedValueOnce(cleanupError)
       .mockResolvedValueOnce(undefined);
     const onStartKnowledgeBase = vi.fn(async (_input, lifecycle) => {
-      lifecycle.onFileUpdate(file, {
+      lifecycle.onFileUpdate(lifecycle.fileItemIds![0], file, {
         stage: "failed",
         fileId: "file-pending",
         loadedBytes: 0,

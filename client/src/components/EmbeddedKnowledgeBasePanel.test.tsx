@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   progressRefetch: vi.fn(),
   setProgressData: vi.fn(),
   createConversation: vi.fn(),
+  setActive: vi.fn(),
   discardConversationLocally: vi.fn(),
   activeConversation: null as any,
   resetIsError: false,
@@ -35,7 +36,7 @@ vi.mock("@/contexts/ConversationContext", () => ({
     activeConversation: mocks.activeConversation,
     hydrated: true,
     createConversation: mocks.createConversation,
-    setActive: vi.fn(),
+    setActive: mocks.setActive,
     discardConversationLocally: mocks.discardConversationLocally,
   }),
 }));
@@ -112,6 +113,7 @@ beforeEach(() => {
   mocks.createConversation
     .mockReset()
     .mockReturnValue("knowledge-conversation");
+  mocks.setActive.mockReset();
   mocks.discardConversationLocally.mockReset();
   mocks.resetIsError = false;
   mocks.progressIsError = false;
@@ -302,6 +304,118 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     expect(
       screen.getByRole("button", { name: "申请重置知识库" }),
     ).toBeInTheDocument();
+  });
+
+  it("uses a complete progress event without refetching the same projection", async () => {
+    const progress = {
+      build: {
+        id: "build-1",
+        conversationId: "knowledge-conversation",
+        companyName: "FrontMind",
+        status: "executing",
+        revision: 0,
+        currentLeafId: null,
+        protocolError: null,
+        updatedAt: 1,
+      },
+      summary: {
+        total: 0,
+        handled: 0,
+        confirmed: 0,
+        directPrefilled: 0,
+        pending: 0,
+        current: 0,
+        needsVerification: 0,
+        overallPercent: 0,
+      },
+      branches: [],
+      packageAllowed: false,
+    };
+    mocks.activeConversation = {
+      id: "knowledge-conversation",
+      title: "企业知识库构建",
+      messages: [],
+      status: "running",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    mocks.progressData = { progress };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(mocks.setActive).toHaveBeenCalledWith("knowledge-conversation"),
+    );
+    const nextProgress = {
+      ...progress,
+      build: { ...progress.build, updatedAt: 2 },
+    };
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent("frontmind:knowledge-progress-updated", {
+          detail: {
+            progress: nextProgress,
+            generation: 1,
+            stateEpoch: 2,
+          },
+        }),
+      );
+    });
+
+    expect(mocks.setProgressData).toHaveBeenCalledWith(
+      { conversationId: "knowledge-conversation" },
+      expect.any(Function),
+    );
+    expect(mocks.progressRefetch).not.toHaveBeenCalled();
+  });
+
+  it("selects the fresh conversation requested by a failed-build rebuild action", async () => {
+    mocks.activeConversation = {
+      id: "knowledge-conversation",
+      title: "企业知识库构建",
+      messages: [],
+      status: "error",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    mocks.progressData = {
+      progress: {
+        build: {
+          id: "failed-build",
+          conversationId: "knowledge-conversation",
+          revision: 0,
+          updatedAt: 1,
+        },
+      },
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+    await waitFor(() =>
+      expect(mocks.setActive).toHaveBeenCalledWith("knowledge-conversation"),
+    );
+    mocks.setActive.mockClear();
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent("frontmind:new-knowledge-base-build", {
+          detail: { conversationId: "fresh-knowledge-conversation" },
+        }),
+      );
+    });
+
+    expect(mocks.setActive).toHaveBeenCalledWith(
+      "fresh-knowledge-conversation",
+    );
   });
 
   it("keeps the 100 percent update notice on one line", () => {

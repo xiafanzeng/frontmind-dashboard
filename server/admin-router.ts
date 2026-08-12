@@ -1941,19 +1941,27 @@ export const adminRouter = router({
       .mutation(async ({ ctx, input }) => {
         requireSystemAdmin(ctx.user);
         try {
-          const result = await deleteManagedUser(ctx.user.id, input.userId);
-          const retainedForHistory =
-            result.disposition === "deactivated_for_history";
-          await writeWorkspaceAuditEvent({
-            actor: ctx.user,
-            action: retainedForHistory
-              ? "account.deactivated_for_history"
-              : "account.deleted",
-            targetType: "user",
-            targetId: input.userId,
-            workspaceUserId: input.userId,
-            reason: input.reason,
-            metadata: { disposition: result.disposition },
+          const result = await deleteManagedUser(ctx.user.id, input.userId, {
+            onResultInTransaction: async (transactionResult, tx) => {
+              const retainedForHistory =
+                transactionResult.disposition === "deactivated_for_history";
+              await writeWorkspaceAuditEvent(
+                {
+                  actor: ctx.user,
+                  action: retainedForHistory
+                    ? "account.deactivated_for_history"
+                    : "account.deleted",
+                  targetType: "user",
+                  targetId: input.userId,
+                  workspaceUserId: input.userId,
+                  reason: input.reason,
+                  metadata: {
+                    disposition: transactionResult.disposition,
+                  },
+                },
+                tx,
+              );
+            },
           });
           return {
             success: true,

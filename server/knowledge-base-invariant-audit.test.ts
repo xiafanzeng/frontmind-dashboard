@@ -11,6 +11,8 @@ import {
   createKnowledgeBaseUpstreamIdempotencyKey,
   hashKnowledgeBaseTurnRequest,
   hashKnowledgeBaseUpstreamIdempotencyKey,
+  inspectKnowledgeBaseRetryAuthority,
+  inspectKnowledgeBaseTerminalTaskCreateRejectionAuthority,
   knowledgeBaseConversationStorageId,
 } from "./knowledge-base-turn-service";
 
@@ -88,7 +90,7 @@ describe("knowledge-base P0 invariant audit", () => {
       activeTurnId: "turn-failed",
       currentLeafId: "1.2",
       revision: 1,
-      protocolErrorCode: "UPSTREAM_REJECTED",
+      protocolErrorCode: "UPSTREAM_CREATE_3",
       packageRevision: null,
     } as KnowledgeBaseBuild;
     const operationKey = createKnowledgeBaseOperationKey({
@@ -146,7 +148,7 @@ describe("knowledge-base P0 invariant audit", () => {
       upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
         createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
       ),
-      errorCode: "UPSTREAM_REJECTED",
+      errorCode: "UPSTREAM_CREATE_3",
       completedAt: new Date(),
       leaseExpiresAt: null,
       attachmentFileIds: ["skill-file"],
@@ -154,6 +156,10 @@ describe("knowledge-base P0 invariant audit", () => {
         attachmentsFrozen: true,
         expectedAttachmentCount: 1,
         userAttachmentCount: 0,
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+        createAttemptState: "not_sent",
         recovery,
         preparedDispatch: {
           schemaVersion: 1,
@@ -168,6 +174,42 @@ describe("knowledge-base P0 invariant audit", () => {
       findKnowledgeBaseInvariantViolations({
         builds: [build],
         turns: [valid],
+        nodes: [],
+      }).map((item) => item.code),
+    ).not.toContain("INVALID_ACTIVE_TURN");
+
+    const terminal = {
+      ...valid,
+      metadata: {
+        ...(valid.metadata as Record<string, unknown>),
+        dispatchState: "failed",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+        createAttemptState: "rejected",
+      },
+    } as ConversationTurn;
+    expect(
+      findKnowledgeBaseInvariantViolations({
+        builds: [build],
+        turns: [terminal],
+        nodes: [],
+      }).map((item) => item.code),
+    ).not.toContain("INVALID_ACTIVE_TURN");
+
+    const legacyTerminal = {
+      ...terminal,
+      metadata: {
+        ...(terminal.metadata as Record<string, unknown>),
+        createAttemptState: undefined,
+        dispatchingAt: "2026-08-11T05:32:58.000Z",
+        failureClass: "requires_user_fix",
+      },
+    } as ConversationTurn;
+    expect(
+      findKnowledgeBaseInvariantViolations({
+        builds: [build],
+        turns: [legacyTerminal],
         nodes: [],
       }).map((item) => item.code),
     ).not.toContain("INVALID_ACTIVE_TURN");
@@ -196,6 +238,49 @@ describe("knowledge-base P0 invariant audit", () => {
           recovery: { ...recovery, conversationId: "other-conversation" },
         },
       } as ConversationTurn,
+      {
+        ...valid,
+        metadata: {
+          ...(valid.metadata as Record<string, unknown>),
+          createAttemptState: "rejected",
+        },
+      } as ConversationTurn,
+      {
+        ...valid,
+        metadata: {
+          ...(valid.metadata as Record<string, unknown>),
+          createAttemptState: "sending",
+        },
+      } as ConversationTurn,
+      {
+        ...valid,
+        metadata: {
+          ...(valid.metadata as Record<string, unknown>),
+          createAttemptState: "unknown",
+        },
+      } as ConversationTurn,
+      {
+        ...terminal,
+        metadata: {
+          ...(terminal.metadata as Record<string, unknown>),
+          createAttemptState: "unknown",
+        },
+      } as ConversationTurn,
+      {
+        ...terminal,
+        metadata: {
+          ...(terminal.metadata as Record<string, unknown>),
+          recoveryAction: "regenerate_turn",
+        },
+      } as ConversationTurn,
+      {
+        ...terminal,
+        metadata: {
+          ...(terminal.metadata as Record<string, unknown>),
+          canRegenerate: true,
+        },
+      } as ConversationTurn,
+      { ...terminal, upstreamTaskId: "unexpected-task" },
     ];
     for (const corrupted of corruptions) {
       expect(
@@ -206,5 +291,145 @@ describe("knowledge-base P0 invariant audit", () => {
         }).map((item) => item.code),
       ).toContain("INVALID_ACTIVE_TURN");
     }
+
+    for (const errorCode of [
+      "UPSTREAM_CREATE_HTTP_408",
+      "UPSTREAM_CREATE_HTTP_425",
+      "UPSTREAM_CREATE_HTTP_429",
+      "UPSTREAM_CREATE_HTTP_500",
+    ]) {
+      expect(
+        findKnowledgeBaseInvariantViolations({
+          builds: [{ ...build, protocolErrorCode: errorCode }],
+          turns: [{ ...terminal, errorCode }],
+          nodes: [],
+        }).map((item) => item.code),
+      ).toContain("INVALID_ACTIVE_TURN");
+    }
+  });
+
+  it("accepts the exact legacy start rejection as read-only seven-file history", () => {
+    const ids = Array.from({ length: 7 }, (_, index) => `file-${index + 1}`);
+    const userAttachments = ids.slice(0, 5).map((file_id, index) => ({
+      file_id,
+      filename: `user-${index + 1}.pdf`,
+    }));
+    const build = {
+      id: "build-live",
+      userId: 7,
+      conversationId: "conversation-live",
+      companyName: "Acme",
+      companyWebsite: "",
+      skillVersion: "4",
+      skillContentHash: "skill-hash",
+      generation: 1,
+      status: "protocol_error",
+      activeTurnId: "turn-live",
+      currentLeafId: null,
+      revision: 0,
+      protocolErrorCode: "UPSTREAM_CREATE_3",
+      packageRevision: null,
+    } as KnowledgeBaseBuild;
+    const recovery = {
+      kind: "start",
+      conversationId: build.conversationId,
+      companyName: build.companyName,
+      companyWebsite: "",
+      operatorNotes: "",
+      attachments: userAttachments,
+      skillVersion: build.skillVersion,
+      skillContentHash: build.skillContentHash,
+      includePrefill: false,
+      prefillSnapshotId: null,
+      instructionsAttachmentRequired: true,
+    };
+    const requestBody = {
+      prompt: "Pinned prompt",
+      agentProfile: "FrontMind-Pro",
+      taskMode: "agent" as const,
+      attachments: ids.map((file_id, index) => ({
+        file_id,
+        filename: `provider-${index + 1}`,
+      })),
+    };
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId: build.id,
+      buildGeneration: 1,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+    });
+    const requestPayload = {
+      companyName: recovery.companyName,
+      companyWebsite: recovery.companyWebsite,
+      operatorNotes: recovery.operatorNotes,
+      attachments: recovery.attachments,
+      skillVersion: recovery.skillVersion,
+      skillContentHash: recovery.skillContentHash,
+      prefillSnapshotId: recovery.prefillSnapshotId,
+    };
+    const turn = {
+      id: "turn-live",
+      userId: 7,
+      conversationId: knowledgeBaseConversationStorageId(
+        7,
+        build.conversationId,
+      ),
+      apiCredentialId: "credential-1",
+      buildId: build.id,
+      buildGeneration: 1,
+      status: "failed",
+      upstreamTaskId: null,
+      operationKey,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "start",
+        generation: 1,
+        revision: 0,
+        leafId: null,
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        payload: requestPayload,
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      errorCode: "UPSTREAM_CREATE_3",
+      completedAt: new Date(),
+      leaseExpiresAt: null,
+      attachmentFileIds: ids,
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 7,
+        userAttachmentCount: 5,
+        dispatchingAt: "2026-08-11T05:32:58.000Z",
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+        recovery,
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.invalid",
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          requestBody,
+          preparedAt: "2026-08-11T05:32:57.000Z",
+        },
+      },
+    } as ConversationTurn;
+
+    expect(
+      findKnowledgeBaseInvariantViolations({
+        builds: [build],
+        turns: [turn],
+        nodes: [],
+      }).map((item) => item.code),
+    ).not.toContain("INVALID_ACTIVE_TURN");
+    expect(inspectKnowledgeBaseRetryAuthority(turn, build)).toBeNull();
+    expect(
+      inspectKnowledgeBaseTerminalTaskCreateRejectionAuthority(turn, build),
+    ).not.toBeNull();
   });
 });

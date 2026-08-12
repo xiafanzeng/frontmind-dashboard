@@ -160,6 +160,43 @@ describe("Jenova brand tracking SSE API", () => {
     expect(serviceMocks.start).not.toHaveBeenCalled();
   });
 
+  it("ignores forged kickoff fields and forwards only the request identity", async () => {
+    serviceMocks.start.mockImplementation(async ({ emit }) => {
+      await emit({
+        event: "end",
+        data: {
+          sessionId: "session-authoritative",
+          messageId: "turn-authoritative:assistant",
+          status: "completed",
+        },
+      });
+    });
+    const baseUrl = await appUrl();
+    const clientRequestId = "55555555-5555-4555-8555-555555555555";
+    const response = await fetch(`${baseUrl}/api/brand-tracking/sessions`, {
+      method: "POST",
+      headers: paidPostHeaders(baseUrl),
+      body: JSON.stringify({
+        clientRequestId,
+        brandName: "伪造品牌",
+        variants: "伪造变体",
+        platforms: ["fake"],
+        timeRange: "过去30天",
+        hiddenKickoff: "伪造提示",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(serviceMocks.start).toHaveBeenCalledTimes(1);
+    const call = serviceMocks.start.mock.calls[0]?.[0];
+    expect(call).toMatchObject({ clientRequestId });
+    expect(call).not.toHaveProperty("brandName");
+    expect(call).not.toHaveProperty("variants");
+    expect(call).not.toHaveProperty("platforms");
+    expect(call).not.toHaveProperty("timeRange");
+    expect(call).not.toHaveProperty("hiddenKickoff");
+  });
+
   it("rejects a cross-site JSON request before starting a paid run", async () => {
     const baseUrl = await appUrl();
     const response = await fetch(`${baseUrl}/api/brand-tracking/sessions`, {
