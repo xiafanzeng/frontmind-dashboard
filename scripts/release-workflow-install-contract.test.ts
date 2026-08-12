@@ -16,6 +16,18 @@ const productionKnownHosts = path.resolve(
 );
 const pdfWorkflow = path.resolve(".github/workflows/pdf-runtime.yml");
 const pdfDockerfile = path.resolve("deploy/1panel-node-pdf/Dockerfile");
+const dashboardDockerfile = path.resolve(
+  "deploy/production/dashboard/Dockerfile",
+);
+const productionBundleBuilder = path.resolve(
+  "scripts/build-unsealed-artifact.mjs",
+);
+const productionArtifactIdentity = path.resolve(
+  "scripts/build-artifact-identity.mjs",
+);
+const productionBundleAudit = path.resolve(
+  "scripts/audit-production-bundle.mjs",
+);
 const installer = path.resolve("deploy/production/install.sh");
 const controllerUpdater = path.resolve(
   "deploy/production/update-release-controllers.sh",
@@ -40,6 +52,28 @@ afterEach(async () => {
 });
 
 describe("release workflow source-ordering contracts", () => {
+  it("conditionally closes the production incident-repair CLI artifact chain", async () => {
+    const [builder, artifactIdentity, audit, dockerfile] = await Promise.all([
+      readFile(productionBundleBuilder, "utf8"),
+      readFile(productionArtifactIdentity, "utf8"),
+      readFile(productionBundleAudit, "utf8"),
+      readFile(dashboardDockerfile, "utf8"),
+    ]);
+    const source = "server/knowledge-base-incident-repair-cli.ts";
+    const output = "knowledge-base-incident-repair-cli.js";
+
+    for (const contract of [builder, artifactIdentity, audit]) {
+      expect(contract).toContain(source);
+      expect(contract).toContain(output);
+    }
+    expect(builder).toContain("knowledgeBaseIncidentRepairCliRequired");
+    expect(audit).toContain("knowledgeBaseIncidentRepairCliRequired");
+    expect(dockerfile).toContain(`test -e ${source}`);
+    expect(dockerfile).toContain(`test -s dist/${output}`);
+    expect(dockerfile).toContain("/app/dist/artifact-manifest.json");
+    expect(dockerfile).toContain(`/app/dist/${output}`);
+  });
+
   it("wires the five production same-digest Manus v2 phases without rebuilding", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const updater = await readFile(controllerUpdater, "utf8");
