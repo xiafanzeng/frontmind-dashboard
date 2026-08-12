@@ -29,6 +29,12 @@ RUN test "${#SOURCE_SHA}" -eq 40 \
     && pnpm install --frozen-lockfile \
     && NODE_ENV=production pnpm build \
     && test -f dist/index.js \
+    && if test -e server/knowledge-base-incident-repair-cli.ts; then \
+         test -f server/knowledge-base-incident-repair-cli.ts \
+           && test -s dist/knowledge-base-incident-repair-cli.js; \
+       else \
+         test ! -e dist/knowledge-base-incident-repair-cli.js; \
+       fi \
     && test -f dist/release-db.js \
     && test -f dist/migration-manifest.json \
     && test -f dist/drizzle/meta/_journal.json \
@@ -72,6 +78,7 @@ COPY --from=build --chown=10001:10001 /app/scripts/validate-production-runtime.m
 COPY --chown=0:0 deploy/production/dashboard/entrypoint.sh /usr/local/bin/frontmind-dashboard-entrypoint
 
 RUN chmod 0755 /usr/local/bin/frontmind-dashboard-entrypoint \
+    && node -e 'const fs=require("node:fs");const p="/app/dist/knowledge-base-incident-repair-cli.js";const m=JSON.parse(fs.readFileSync("/app/dist/artifact-manifest.json","utf8"));const expected=m.files.some((f)=>f.path==="knowledge-base-incident-repair-cli.js");const present=fs.existsSync(p);if(expected!==present||(present&&(!fs.statSync(p).isFile()||fs.statSync(p).size===0)))process.exit(1)' \
     && test -f /app/dist/release-db.js \
     && test -f /app/dist/migration-manifest.json \
     && test -f /app/dist/drizzle/meta/_journal.json

@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
 import JSZip from "jszip";
 import {
@@ -15,6 +15,10 @@ import { withoutValidatedProductionBundleBuildSourceSha } from "./production-bun
 
 const projectRoot = resolve(import.meta.dirname, "..");
 const buildRoot = resolve(projectRoot, process.argv[2] || "dist");
+const knowledgeBaseIncidentRepairCliSource = join(
+  projectRoot,
+  "server/knowledge-base-incident-repair-cli.ts",
+);
 const textExtensions = new Set([
   ".csv",
   ".css",
@@ -143,8 +147,27 @@ const requiredSkillFiles = [
   "private-workflows/response-logic-builder.skill/SKILL.md",
   "private-workflows/response-logic-builder.skill/references/output-contract.md",
 ];
+
+async function requiresKnowledgeBaseIncidentRepairCli() {
+  try {
+    const source = await lstat(knowledgeBaseIncidentRepairCliSource);
+    if (!source.isFile()) {
+      throw new Error("BUILD_INCIDENT_REPAIR_CLI_SOURCE_INVALID");
+    }
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+const knowledgeBaseIncidentRepairCliRequired =
+  await requiresKnowledgeBaseIncidentRepairCli();
 const requiredRuntimeFiles = [
   "index.js",
+  ...(knowledgeBaseIncidentRepairCliRequired
+    ? ["knowledge-base-incident-repair-cli.js"]
+    : []),
   "pdf-prepare-worker.js",
   "release-db.js",
   "migration-manifest.json",

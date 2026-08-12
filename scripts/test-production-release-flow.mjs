@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   readlink,
   rm,
   symlink,
@@ -122,6 +123,12 @@ try {
   );
   git(["config", "user.email", "release@example.invalid"]);
   git(["config", "user.name", "FrontMind Release Test"]);
+  // Exercise the future exact-product projection without adding product bytes
+  // to this production-owned prerequisite commit.
+  await writeFile(
+    path.join(gitRepository, "server", "knowledge-base-incident-repair-cli.ts"),
+    "export const signedIncidentRepairFixture = true;\n",
+  );
   git(["add", "-A"]);
   git(["commit", "-qm", "single immutable release source"]);
   const sourceSha = git(["rev-parse", "HEAD"]);
@@ -143,6 +150,43 @@ try {
 
   run("pnpm", ["build"], environment, archiveRepository);
   run("pnpm", ["audit:production"], environment, archiveRepository);
+  const incidentRepairCli = await lstat(
+    path.join(
+      archiveRepository,
+      "dist",
+      "knowledge-base-incident-repair-cli.js",
+    ),
+  );
+  const artifactManifest = JSON.parse(
+    await readFile(
+      path.join(archiveRepository, "dist", "artifact-manifest.json"),
+      "utf8",
+    ),
+  );
+  if (
+    !incidentRepairCli.isFile() ||
+    incidentRepairCli.size === 0 ||
+    !artifactManifest.files?.some(
+      (file) => file.path === "knowledge-base-incident-repair-cli.js",
+    )
+  ) {
+    throw new Error("RELEASE_INCIDENT_REPAIR_CLI_CHAIN_INCOMPLETE");
+  }
+  const incidentRepairCliPath = path.join(
+    archiveRepository,
+    "dist",
+    "knowledge-base-incident-repair-cli.js",
+  );
+  const incidentRepairCliBytes = await readFile(incidentRepairCliPath);
+  await rm(incidentRepairCliPath);
+  expectFailure(
+    "pnpm",
+    ["audit:production"],
+    environment,
+    /BUILD_ARTIFACT_REQUIRED_COVERAGE_MISSING/u,
+    archiveRepository,
+  );
+  await writeFile(incidentRepairCliPath, incidentRepairCliBytes);
   const statusAfterBuild = git([
     `--git-dir=${path.join(gitRepository, ".git")}`,
     `--work-tree=${archiveRepository}`,
