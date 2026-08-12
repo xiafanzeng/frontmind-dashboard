@@ -102,6 +102,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(knowledgeBaseTurnReplayHttpStatus("awaiting_attachments")).toBe(200);
     expect(knowledgeBaseTurnReplayHttpStatus("completed")).toBe(200);
     expect(knowledgeBaseTurnReplayHttpStatus("terminal")).toBe(409);
+    expect(knowledgeBaseTurnReplayHttpStatus("terminal", 200)).toBe(200);
   });
 
   it("allows retry only for one coordinate-matched authoritative regeneration notice", () => {
@@ -187,6 +188,50 @@ describe("knowledge-base turn HTTP outcomes", () => {
       knowledgeBaseRetryObservationAllowsRegeneration({
         ...authority,
         activeTurnId: "another-turn",
+      }),
+    ).toBe(false);
+  });
+
+  it("never treats legacy protocol-terminal support history as retry authority", () => {
+    const observation = {
+      generation: 1,
+      activeTurn: {
+        id: "turn-legacy-protocol-terminal",
+        status: "failed",
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+      notice: {
+        turnId: "turn-legacy-protocol-terminal",
+        code: "PROGRESS_PROTOCOL_INVALID",
+        retryable: false,
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+      interaction: {
+        progress: {
+          build: {
+            id: "build-legacy-protocol-terminal",
+            revision: 0,
+            currentLeafId: null,
+          },
+        },
+      },
+    } as any;
+
+    expect(
+      knowledgeBaseRetryObservationAllowsRegeneration({
+        observation,
+        buildId: "build-legacy-protocol-terminal",
+        activeTurnId: "turn-legacy-protocol-terminal",
+        expectedGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
       }),
     ).toBe(false);
   });
@@ -332,6 +377,28 @@ describe("knowledge-base turn HTTP outcomes", () => {
       dispatchState: "bound",
       turnId: "turn-bound",
       upstreamTaskId: "provider-task-bound",
+    });
+
+    expect(
+      knowledgeBaseReservationReceipt({
+        state: "terminal",
+        turn: {
+          ...turn,
+          id: "turn-legacy-terminal",
+          upstreamTaskId: "provider-task-legacy-terminal",
+          dispatchState: "failed",
+          failureClass: "terminal_nonregenerable",
+          recoveryAction: "contact_support",
+          canRegenerate: false,
+        },
+      } as any),
+    ).toMatchObject({
+      state: "terminal",
+      dispatchState: "failed",
+      upstreamTaskId: "provider-task-legacy-terminal",
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+      canRegenerate: false,
     });
   });
 

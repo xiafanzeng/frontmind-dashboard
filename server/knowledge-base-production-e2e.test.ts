@@ -34,6 +34,15 @@ import {
   formatKnowledgeBasePresentationEnvelope,
   formatKnowledgeBaseProgressEnvelope,
 } from "./knowledge-base-progress";
+import {
+  createKnowledgeBaseOperationKey,
+  createKnowledgeBaseUpstreamIdempotencyKey,
+  hashKnowledgeBaseTurnRequest,
+  hashKnowledgeBaseUpstreamIdempotencyKey,
+  inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority,
+  inspectKnowledgeBaseRetryAuthority,
+} from "./knowledge-base-turn-service";
+import { KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
 
 const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
@@ -4606,5 +4615,427 @@ describe("knowledge-base production final-package acceptance", () => {
       errorCode: "PROGRESS_PROTOCOL_INVALID",
       leaseExpiresAt: null,
     });
+  });
+
+  it("keeps the exact legacy protocol-terminal start incident read-only across every HTTP recovery route", async () => {
+    const state = initialState();
+    const buildId = "77777777-7777-4777-8777-777777777777";
+    const turnId = "88888888-8888-4888-8888-888888888888";
+    const taskId = "task-legacy-protocol-start";
+    const clientRequestId = "request-legacy-protocol-start";
+    const completedAt = new Date("2026-08-01T00:00:10.000Z");
+    const userAttachment = {
+      file_id: "customer-file-legacy-start",
+      filename: "company-profile.pdf",
+    };
+    const recovery = {
+      kind: "start",
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      operatorNotes: "",
+      attachments: [userAttachment],
+      skillVersion: "4",
+      skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
+      includePrefill: false,
+      prefillSnapshotId: null,
+      instructionsAttachmentRequired: true,
+      protocolFailureObservation: {
+        observationKeyHash: "a".repeat(64),
+        count: 3,
+        firstObservedAt: "2026-08-01T00:00:00.000Z",
+        lastObservedAt: "2026-08-01T00:00:10.000Z",
+      },
+    };
+    const preparedBody = {
+      prompt: "Pinned legacy start prompt",
+      agentProfile: "FrontMind-Pro",
+      taskMode: "agent" as const,
+      attachments: [
+        {
+          file_id: "skill-file-legacy-start",
+          filename: "socratic-kb-builder.skill.zip",
+        },
+        userAttachment,
+      ],
+    };
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId,
+      buildGeneration: 1,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+    });
+    const requestPayload = {
+      companyName: recovery.companyName,
+      companyWebsite: recovery.companyWebsite,
+      operatorNotes: recovery.operatorNotes,
+      attachments: recovery.attachments,
+      skillVersion: recovery.skillVersion,
+      skillContentHash: recovery.skillContentHash,
+      prefillSnapshotId: recovery.prefillSnapshotId,
+    };
+    const build = {
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: recovery.companyName,
+      companyWebsite: recovery.companyWebsite,
+      skillName: "socratic-kb-builder",
+      skillVersion: recovery.skillVersion,
+      skillContentHash: recovery.skillContentHash,
+      treePolicyVersion: 2,
+      status: "protocol_error",
+      generation: 1,
+      stateEpoch: 3,
+      revision: 0,
+      currentLeafId: null,
+      totalNodeCount: 0,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      activeTurnId: turnId,
+      upstreamTaskId: taskId,
+      lastAppliedOperationKey: null,
+      currentPresentationKey: null,
+      initialResearchCoverage: null,
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      lastTurnUserText: "开始构建企业知识库",
+      lastTurnAttachmentCount: 1,
+      awaitingResponseSince: null,
+      packageRevision: null,
+      packageTaskId: null,
+      packageOutputItemId: null,
+      packageFileId: null,
+      packageFilename: null,
+      packageDescriptorHash: null,
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
+      protocolErrorCode: "PROGRESS_PROTOCOL_INVALID",
+      protocolError: "知识库任务返回了无法识别的进度协议",
+      publishedSnapshotId: null,
+      completedAt: null,
+      publishedAt: null,
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+      updatedAt: completedAt,
+    };
+    const turn = {
+      id: turnId,
+      conversationId: STORED_CONVERSATION_ID,
+      userId: USER_ID,
+      apiCredentialId: "credential-e2e",
+      clientRequestId,
+      buildId,
+      buildGeneration: 1,
+      operationKey,
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "start",
+        generation: 1,
+        revision: 0,
+        leafId: null,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 1,
+        payload: requestPayload,
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      attachmentFileIds: ["skill-file-legacy-start", userAttachment.file_id],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 1,
+        dispatchingAt: "2026-07-31T23:59:59.000Z",
+        recovery,
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.invalid",
+          bodySha256: hashKnowledgeBaseTurnRequest(preparedBody),
+          requestBody: preparedBody,
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+      },
+      leaseExpiresAt: null,
+      status: "failed",
+      upstreamTaskId: taskId,
+      errorCode: "PROGRESS_PROTOCOL_INVALID",
+      errorMessage: "知识库任务返回了无法识别的进度协议",
+      startedAt: new Date("2026-08-01T00:00:00.000Z"),
+      completedAt,
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+      updatedAt: completedAt,
+    };
+    state.builds.push(build);
+    state.turns.push(turn);
+    dependencies.getDb.mockResolvedValue(memoryDatabase(state));
+
+    expect(
+      inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority(
+        turn as any,
+        build as any,
+      ),
+    ).toBe(true);
+    expect(inspectKnowledgeBaseRetryAuthority(turn as any, build as any)).toBe(
+      null,
+    );
+
+    const frozenState = structuredClone(state);
+    const providerGet = vi.spyOn(axios, "get");
+    const providerPost = vi.spyOn(axios, "post");
+    const providerPut = vi.spyOn(axios, "put");
+    const providerDelete = vi.spyOn(axios, "delete");
+    const { default: knowledgeBaseRouter } = await import(
+      "./knowledge-base-api"
+    );
+    const { requireExpressAuth } = await import("./_core/express-auth");
+    const dashboard = express();
+    dashboard.use(express.json());
+    dashboard.use(
+      "/api/knowledge-base",
+      requireExpressAuth,
+      knowledgeBaseRouter,
+    );
+    const listener = await listen(dashboard);
+    const assertFrozen = () => {
+      expect(state).toStrictEqual(frozenState);
+      expect(providerGet).not.toHaveBeenCalled();
+      expect(providerPost).not.toHaveBeenCalled();
+      expect(providerPut).not.toHaveBeenCalled();
+      expect(providerDelete).not.toHaveBeenCalled();
+    };
+    const postJson = (route: string, body: unknown) =>
+      fetch(`${listener.baseUrl}/api/knowledge-base${route}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-test-auth": "user",
+        },
+        body: JSON.stringify(body),
+      });
+    try {
+      const getResponse = await fetch(
+        `${listener.baseUrl}/api/knowledge-base/progress/${encodeURIComponent(PUBLIC_CONVERSATION_ID)}`,
+        { headers: { "x-test-auth": "user" } },
+      );
+      expect(getResponse.status).toBe(200);
+      expect((await getResponse.json()) as any).toMatchObject({
+        observation: {
+          activeTurn: {
+            id: turnId,
+            status: "failed",
+            dispatchState: "failed",
+            failureClass: "terminal_nonregenerable",
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+          },
+          notice: {
+            code: "PROGRESS_PROTOCOL_INVALID",
+            retryable: false,
+            failureClass: "terminal_nonregenerable",
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+            turnId,
+          },
+        },
+      });
+      assertFrozen();
+
+      dependencies.assertKnowledgeBaseWritable.mockClear();
+      dependencies.assertKnowledgeBaseWritable.mockRejectedValueOnce(
+        new Error("legacy replay must precede the write gate"),
+      );
+      dependencies.getCredentialForUpstreamResource.mockClear();
+      dependencies.getCredentialForUpstreamResource.mockRejectedValueOnce(
+        new Error("legacy replay must precede attachment ownership lookup"),
+      );
+      const startResponse = await postJson("/start", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        clientRequestId,
+        companyName: recovery.companyName,
+        companyWebsite: recovery.companyWebsite,
+        operatorNotes: recovery.operatorNotes,
+        attachments: recovery.attachments,
+      });
+      expect(startResponse.status).toBe(200);
+      const startPayload = (await startResponse.json()) as any;
+      expect(startPayload).not.toHaveProperty("error");
+      expect(startPayload).toMatchObject({
+        reservation: {
+          state: "terminal",
+          dispatchState: "failed",
+          turnId,
+          clientRequestId,
+          generation: 1,
+          revision: 0,
+          leafId: null,
+          upstreamTaskId: taskId,
+          failureClass: "terminal_nonregenerable",
+          recoveryAction: "contact_support",
+          canRegenerate: false,
+        },
+        idempotent: true,
+        resumed: true,
+        observation: {
+          notice: {
+            code: "PROGRESS_PROTOCOL_INVALID",
+            retryable: false,
+          },
+        },
+      });
+      expect(dependencies.assertKnowledgeBaseWritable).not.toHaveBeenCalled();
+      expect(
+        dependencies.getCredentialForUpstreamResource,
+      ).not.toHaveBeenCalled();
+      assertFrozen();
+
+      const mismatchedStartResponse = await postJson("/start", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        clientRequestId,
+        companyName: recovery.companyName,
+        companyWebsite: recovery.companyWebsite,
+        operatorNotes: "different operator notes",
+        attachments: recovery.attachments,
+      });
+      expect(mismatchedStartResponse.status).toBe(409);
+      expect((await mismatchedStartResponse.json()) as any).toMatchObject({
+        error: { code: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH" },
+        reservationCreated: false,
+      });
+      expect(dependencies.assertKnowledgeBaseWritable).not.toHaveBeenCalled();
+      expect(
+        dependencies.getCredentialForUpstreamResource,
+      ).not.toHaveBeenCalled();
+      assertFrozen();
+
+      dependencies.assertKnowledgeBaseWritable
+        .mockReset()
+        .mockResolvedValue(undefined);
+      dependencies.getCredentialForUpstreamResource
+        .mockReset()
+        .mockResolvedValue({
+          id: "credential-e2e",
+          apiKey: "sk-e2e-only",
+        });
+      const retryResponse = await postJson("/retry", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        clientRequestId: "legacy-start-must-not-retry",
+        expectedGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+      });
+      expect(retryResponse.status).toBe(409);
+      expect((await retryResponse.json()) as any).toMatchObject({
+        error: { code: "CONFLICT" },
+        observation: {
+          notice: {
+            code: "PROGRESS_PROTOCOL_INVALID",
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+          },
+        },
+      });
+      assertFrozen();
+
+      const reconcileResponse = await postJson("/progress/reconcile", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        taskId,
+      });
+      expect(reconcileResponse.status).toBe(200);
+      expect((await reconcileResponse.json()) as any).toMatchObject({
+        observation: {
+          notice: {
+            code: "PROGRESS_PROTOCOL_INVALID",
+            retryable: false,
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+          },
+        },
+      });
+      assertFrozen();
+
+      const replacementResponse = await postJson("/turn/replace-attachments", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        clientRequestId: "legacy-start-must-not-replace",
+        expectedGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        attachments: [
+          { file_id: "replacement-must-not-bind", filename: "safe.pdf" },
+        ],
+        attachmentManifest: [
+          {
+            filename: "safe.pdf",
+            sizeBytes: 100,
+            mimeType: "application/pdf",
+            lastModified: 1,
+            sha256: "f".repeat(64),
+          },
+        ],
+      });
+      expect(replacementResponse.status).toBe(409);
+      expect((await replacementResponse.json()) as any).toMatchObject({
+        error: { code: "KNOWLEDGE_BASE_ATTACHMENT_REPAIR_CONFLICT" },
+        observation: {
+          notice: {
+            code: "PROGRESS_PROTOCOL_INVALID",
+            recoveryAction: "contact_support",
+            canRegenerate: false,
+          },
+        },
+      });
+      assertFrozen();
+
+      const { claimKnowledgeBaseTurnForRecovery } = await import(
+        "./knowledge-base-turn-service"
+      );
+      const { claimKnowledgeBaseOpenRecoveryBuild } = await import(
+        "./knowledge-base-open-recovery-lease"
+      );
+      await expect(
+        claimKnowledgeBaseTurnForRecovery(
+          { turnId, now: new Date("2026-08-02T00:00:00.000Z") },
+          memoryDatabase(state),
+        ),
+      ).resolves.toBeNull();
+      await expect(
+        claimKnowledgeBaseOpenRecoveryBuild(
+          {
+            buildId,
+            expectedGeneration: 1,
+            expectedStateEpoch: build.stateEpoch,
+            expectedTaskId: taskId,
+            now: new Date("2026-08-02T00:00:00.000Z"),
+          },
+          memoryDatabase(state),
+        ),
+      ).resolves.toBeNull();
+      assertFrozen();
+    } finally {
+      dependencies.assertKnowledgeBaseWritable
+        .mockReset()
+        .mockResolvedValue(undefined);
+      dependencies.getCredentialForUpstreamResource
+        .mockReset()
+        .mockResolvedValue({
+          id: "credential-e2e",
+          apiKey: "sk-e2e-only",
+        });
+      providerGet.mockRestore();
+      providerPost.mockRestore();
+      providerPut.mockRestore();
+      providerDelete.mockRestore();
+      await close(listener.server);
+    }
   });
 });

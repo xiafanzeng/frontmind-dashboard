@@ -32,6 +32,7 @@ import {
   inspectKnowledgeBaseDeferredDispatchReplay,
   inspectKnowledgeBaseLegacyAttachmentTakeoverReplay,
   inspectKnowledgeBaseLegacyDeferredReservationReplay,
+  inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
   inspectKnowledgeBaseRetryAuthority,
   knowledgeBaseRetryRequiresFreshFinalDelivery,
@@ -619,6 +620,295 @@ describe("knowledge-base HTTP replay receipts", () => {
         replayExecutor([[replayTurn()]]),
       ),
     ).resolves.toMatchObject({ state: "pending", turn: { id: turn().id } });
+  });
+
+  it.each([
+    {
+      label: "native values",
+      traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      userAttachmentCount: 3,
+      expectedTraceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      expectedUserAttachmentCount: 3,
+    },
+    {
+      label: "array coercion",
+      traceId: ["b150314c-3c10-4073-8ebc-241e16f53600"],
+      userAttachmentCount: [3],
+      expectedTraceId: null,
+      expectedUserAttachmentCount: 0,
+    },
+    {
+      label: "object trace coercion",
+      traceId: {
+        toString: () => "b150314c-3c10-4073-8ebc-241e16f53600",
+      },
+      userAttachmentCount: 3,
+      expectedTraceId: null,
+      expectedUserAttachmentCount: 3,
+    },
+    {
+      label: "string count coercion",
+      traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      userAttachmentCount: "3",
+      expectedTraceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      expectedUserAttachmentCount: 0,
+    },
+    {
+      label: "NaN count",
+      traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      userAttachmentCount: Number.NaN,
+      expectedTraceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      expectedUserAttachmentCount: 0,
+    },
+    {
+      label: "negative count",
+      traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      userAttachmentCount: -1,
+      expectedTraceId: "b150314c-3c10-4073-8ebc-241e16f53600",
+      expectedUserAttachmentCount: 0,
+    },
+  ])(
+    "projects strict replay receipt metadata for $label",
+    async ({
+      traceId,
+      userAttachmentCount,
+      expectedTraceId,
+      expectedUserAttachmentCount,
+    }) => {
+      const receipt = await inspectKnowledgeBaseTurnReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          clientRequestId: "request-1",
+          clientIntent: intent,
+        },
+        replayExecutor([
+          [
+            replayTurn({
+              metadata: {
+                clientIntentHash: hashKnowledgeBaseTurnRequest(intent),
+                expectedPresentationKey: "presentation-7",
+                traceId,
+                userAttachmentCount,
+              },
+            }),
+          ],
+        ]),
+      );
+
+      expect(receipt?.turn).toMatchObject({
+        traceId: expectedTraceId,
+        expectedUserAttachmentCount,
+      });
+    },
+  );
+
+  it("replays an old protocol-terminal incident without exposing mutation authority", async () => {
+    const incident = replayTurn({
+      status: "failed",
+      upstreamTaskId: "provider-task-legacy-protocol",
+      errorCode: "PROGRESS_PROTOCOL_INVALID",
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      leaseExpiresAt: null,
+      metadata: {
+        clientIntentHash: hashKnowledgeBaseTurnRequest(intent),
+        expectedPresentationKey: "presentation-7",
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        dispatchingAt: "2026-07-31T23:59:59.000Z",
+      },
+    });
+
+    await expect(
+      inspectKnowledgeBaseTurnReplay(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          clientRequestId: "request-1",
+          clientIntent: intent,
+        },
+        replayExecutor([[incident]]),
+      ),
+    ).resolves.toMatchObject({
+      state: "terminal",
+      turn: {
+        id: incident.id,
+        upstreamTaskId: "provider-task-legacy-protocol",
+        dispatchState: "failed",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+    });
+  });
+
+  it("replays only an exact fully verified legacy start browser intent", async () => {
+    const completedAt = new Date("2026-08-01T00:00:10.000Z");
+    const attachment = {
+      file_id: "customer-file-legacy-start",
+      filename: "company-profile.pdf",
+    };
+    const build = {
+      id: turn().buildId,
+      userId: 1,
+      conversationId: "conversation-1",
+      companyName: "FrontMind",
+      companyWebsite: "https://www.frontmind.net/",
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      generation: 3,
+      status: "protocol_error",
+      activeTurnId: turn().id,
+      upstreamTaskId: "provider-task-legacy-start",
+      currentLeafId: "1.8",
+      revision: 7,
+      protocolErrorCode: "PROGRESS_PROTOCOL_INVALID",
+    };
+    const recovery = {
+      kind: "start",
+      conversationId: "conversation-1",
+      companyName: build.companyName,
+      companyWebsite: build.companyWebsite,
+      operatorNotes: "",
+      attachments: [attachment],
+      skillVersion: build.skillVersion,
+      skillContentHash: build.skillContentHash,
+      includePrefill: false,
+      prefillSnapshotId: null,
+      protocolFailureObservation: {
+        observationKeyHash: "d".repeat(64),
+        count: 3,
+        firstObservedAt: "2026-08-01T00:00:00.000Z",
+        lastObservedAt: completedAt.toISOString(),
+      },
+    };
+    const requestBody = {
+      prompt: "Pinned legacy start prompt",
+      agentProfile: "frontmind-pro",
+      taskMode: "agent" as const,
+      attachments: [
+        { file_id: "skill-file-legacy-start", filename: "skill.zip" },
+        attachment,
+      ],
+    };
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId: build.id,
+      buildGeneration: build.generation,
+      operationType: "start",
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+    });
+    const incident = turn({
+      operationKey,
+      operationType: "start",
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "start",
+        generation: build.generation,
+        revision: build.revision,
+        leafId: build.currentLeafId,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 1,
+        payload: {
+          companyName: recovery.companyName,
+          companyWebsite: recovery.companyWebsite,
+          operatorNotes: recovery.operatorNotes,
+          attachments: recovery.attachments,
+          skillVersion: recovery.skillVersion,
+          skillContentHash: recovery.skillContentHash,
+          prefillSnapshotId: recovery.prefillSnapshotId,
+        },
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      status: "failed",
+      upstreamTaskId: build.upstreamTaskId,
+      errorCode: "PROGRESS_PROTOCOL_INVALID",
+      completedAt,
+      leaseExpiresAt: null,
+      attachmentFileIds: ["skill-file-legacy-start", attachment.file_id],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 1,
+        dispatchingAt: "2026-07-31T23:59:59.000Z",
+        recovery,
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.test",
+          requestBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+      },
+    });
+    const exactInput = {
+      userId: 1,
+      conversationId: "conversation-1",
+      clientRequestId: incident.clientRequestId,
+      companyName: build.companyName,
+      companyWebsite: ` ${build.companyWebsite} `,
+      operatorNotes: "  ",
+      attachments: [attachment],
+    };
+
+    await expect(
+      inspectKnowledgeBaseLegacyStartReplay(
+        exactInput,
+        replayExecutor([[incident], [build as any]]),
+      ),
+    ).resolves.toMatchObject({
+      state: "terminal",
+      turn: {
+        id: incident.id,
+        dispatchState: "failed",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      },
+    });
+
+    for (const changed of [
+      { companyName: "Other Brand" },
+      { companyWebsite: "https://other.example/" },
+      { operatorNotes: "changed" },
+      { attachments: [{ ...attachment, filename: "other.pdf" }] },
+      { attachments: [] },
+    ]) {
+      await expect(
+        inspectKnowledgeBaseLegacyStartReplay(
+          { ...exactInput, ...changed },
+          replayExecutor([[incident], [build as any]]),
+        ),
+      ).rejects.toMatchObject({
+        code: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+      });
+    }
+
+    await expect(
+      inspectKnowledgeBaseLegacyStartReplay(
+        exactInput,
+        replayExecutor([
+          [
+            {
+              ...incident,
+              metadata: {
+                ...(incident.metadata as Record<string, unknown>),
+                recovery: {
+                  ...recovery,
+                  protocolFailureObservation: {
+                    ...recovery.protocolFailureObservation,
+                    count: "3",
+                  },
+                },
+              },
+            },
+          ],
+          [build as any],
+        ]),
+      ),
+    ).resolves.toBeNull();
   });
 
   it("rejects different content under the same request id with a stable code", async () => {

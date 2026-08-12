@@ -406,6 +406,19 @@ export interface InspectKnowledgeBaseTurnReplayInput {
   now?: Date;
 }
 
+export interface InspectKnowledgeBaseLegacyStartReplayInput {
+  userId: number;
+  /** Public Dashboard conversation id. */
+  conversationId: string;
+  clientRequestId: string;
+  /** Enterprise identity already resolved from the current workspace. */
+  companyName: string;
+  companyWebsite: string;
+  operatorNotes: string;
+  attachments: ReadonlyArray<{ file_id: string; filename: string }>;
+  now?: Date;
+}
+
 export interface InspectKnowledgeBaseDeferredAttachmentReplayInput {
   userId: number;
   /** Public Dashboard conversation id. */
@@ -796,7 +809,10 @@ export type KnowledgeBaseRetryAuthority = {
   preparedDispatch: KnowledgeBasePreparedDispatch;
 };
 
-type KnowledgeBaseFailedTurnAuthorityPolicy = "retry" | "terminal_rejected";
+type KnowledgeBaseFailedTurnAuthorityPolicy =
+  | "retry"
+  | "terminal_rejected"
+  | "legacy_protocol_terminal";
 
 function isDeterministicTaskCreateRejectionCode(value: unknown) {
   const code = String(value || "");
@@ -805,6 +821,49 @@ function isDeterministicTaskCreateRejectionCode(value: unknown) {
   if (!statusMatch) return false;
   const status = Number(statusMatch[1]);
   return status !== 408 && status !== 425 && status !== 429;
+}
+
+function isLegacyProtocolFailureObservation(
+  value: unknown,
+  completedAt: Date | null,
+  dispatchingAt: unknown,
+) {
+  const observation = retryAuthorityRecord(value);
+  if (!observation || !(completedAt instanceof Date)) return false;
+  if (
+    typeof dispatchingAt !== "string" ||
+    typeof observation.observationKeyHash !== "string" ||
+    typeof observation.count !== "number" ||
+    !Number.isSafeInteger(observation.count) ||
+    typeof observation.firstObservedAt !== "string" ||
+    typeof observation.lastObservedAt !== "string"
+  ) {
+    return false;
+  }
+  const completedAtMs = completedAt.getTime();
+  const dispatchingAtValue = dispatchingAt;
+  const dispatchingAtMs = Date.parse(dispatchingAtValue);
+  const observationKeyHash = observation.observationKeyHash;
+  const count = observation.count;
+  const firstObservedAt = observation.firstObservedAt;
+  const lastObservedAt = observation.lastObservedAt;
+  const firstObservedAtMs = Date.parse(firstObservedAt);
+  const lastObservedAtMs = Date.parse(lastObservedAt);
+  return Boolean(
+    Number.isFinite(completedAtMs) &&
+      Number.isFinite(dispatchingAtMs) &&
+      new Date(dispatchingAtMs).toISOString() === dispatchingAtValue &&
+      /^[a-f0-9]{64}$/u.test(observationKeyHash) &&
+      count === 3 &&
+      Number.isFinite(firstObservedAtMs) &&
+      Number.isFinite(lastObservedAtMs) &&
+      new Date(firstObservedAtMs).toISOString() === firstObservedAt &&
+      new Date(lastObservedAtMs).toISOString() === lastObservedAt &&
+      dispatchingAtMs <= firstObservedAtMs &&
+      lastObservedAtMs - firstObservedAtMs >= 10_000 &&
+      lastObservedAtMs <= completedAtMs &&
+      completedAtMs - lastObservedAtMs <= 1_000,
+  );
 }
 
 /**
@@ -853,6 +912,29 @@ function inspectKnowledgeBaseFailedTurnAuthority(
       metadata.awaitingClientAttachments !== true &&
       isDeterministicTaskCreateRejectionCode(source.errorCode) &&
       (storedCreateAttemptState === "rejected" || legacyTerminalRejection);
+    const legacyProtocolTerminalPolicyValid =
+      policy === "legacy_protocol_terminal" &&
+      build.status === "protocol_error" &&
+      build.protocolErrorCode === "PROGRESS_PROTOCOL_INVALID" &&
+      source.errorCode === "PROGRESS_PROTOCOL_INVALID" &&
+      source.id === build.activeTurnId &&
+      typeof source.upstreamTaskId === "string" &&
+      source.upstreamTaskId.length > 0 &&
+      source.upstreamTaskId === build.upstreamTaskId &&
+      source.completedAt instanceof Date &&
+      Number.isFinite(source.completedAt.getTime()) &&
+      source.leaseExpiresAt === null &&
+      metadata.dispatchState === undefined &&
+      metadata.failureClass === undefined &&
+      metadata.recoveryAction === undefined &&
+      metadata.canRegenerate === undefined &&
+      metadata.createAttemptState === undefined &&
+      metadata.awaitingClientAttachments !== true &&
+      isLegacyProtocolFailureObservation(
+        recovery?.protocolFailureObservation,
+        source.completedAt,
+        metadata.dispatchingAt,
+      );
     if (
       source.status !== "failed" ||
       source.userId !== build.userId ||
@@ -871,14 +953,18 @@ function inspectKnowledgeBaseFailedTurnAuthority(
       operationType === "legacy_reconcile" ||
       !source.requestHash ||
       !source.upstreamIdempotencyKeyHash ||
-      (!retryPolicyValid && !terminalPolicyValid) ||
+      (!retryPolicyValid &&
+        !terminalPolicyValid &&
+        !legacyProtocolTerminalPolicyValid) ||
       metadata.attachmentsFrozen !== true ||
       !Array.isArray(source.attachmentFileIds) ||
       !recovery ||
       recovery.conversationId !== build.conversationId ||
       !preparedDispatch ||
-      (preparedDispatch.schemaVersion !== 1 &&
-        preparedDispatch.schemaVersion !== 2)
+      (legacyProtocolTerminalPolicyValid
+        ? preparedDispatch.schemaVersion !== 1
+        : preparedDispatch.schemaVersion !== 1 &&
+          preparedDispatch.schemaVersion !== 2)
     ) {
       return null;
     }
@@ -922,11 +1008,13 @@ function inspectKnowledgeBaseFailedTurnAuthority(
       return null;
     }
 
-    const expectedAttachmentCount = Number(metadata.expectedAttachmentCount);
-    const userAttachmentCount = Number(metadata.userAttachmentCount);
+    const expectedAttachmentCount = metadata.expectedAttachmentCount;
+    const userAttachmentCount = metadata.userAttachmentCount;
     if (
+      typeof expectedAttachmentCount !== "number" ||
       !Number.isSafeInteger(expectedAttachmentCount) ||
       expectedAttachmentCount < 0 ||
+      typeof userAttachmentCount !== "number" ||
       !Number.isSafeInteger(userAttachmentCount) ||
       userAttachmentCount < 0 ||
       userAttachmentCount > expectedAttachmentCount ||
@@ -1074,6 +1162,25 @@ export function inspectKnowledgeBaseTerminalTaskCreateRejectionAuthority(
   );
 }
 
+/**
+ * Recognizes the exact terminal protocol-failure history written before
+ * dispatch failure metadata existed. This deliberately returns only a
+ * boolean: it is authority to retain read-only history, never authority to
+ * replay a provider request or mutate the failed build.
+ */
+export function inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority(
+  source: ConversationTurn,
+  build: KnowledgeBaseBuild,
+) {
+  return Boolean(
+    inspectKnowledgeBaseFailedTurnAuthority(
+      source,
+      build,
+      "legacy_protocol_terminal",
+    ),
+  );
+}
+
 export function knowledgeBaseConversationStorageId(
   userId: number,
   publicConversationId: string,
@@ -1126,12 +1233,17 @@ export function sanitizeKnowledgeBaseRecoveryMetadata(
 
 function metadataOf(row: Pick<ConversationTurn, "metadata">) {
   return (
-    row.metadata && typeof row.metadata === "object" ? row.metadata : {}
+    row.metadata &&
+    typeof row.metadata === "object" &&
+    !Array.isArray(row.metadata)
+      ? row.metadata
+      : {}
   ) as KnowledgeBaseTurnMetadata;
 }
 
 function safeKnowledgeBaseTraceId(value: unknown) {
-  const normalized = String(value || "").trim();
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
   return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
     normalized,
   )
@@ -1142,7 +1254,8 @@ function safeKnowledgeBaseTraceId(value: unknown) {
 function storedKnowledgeBaseCreateAttemptState(
   metadata: KnowledgeBaseTurnMetadata,
 ): KnowledgeBaseCreateAttemptState | null {
-  const value = String(metadata.createAttemptState || "");
+  const value = metadata.createAttemptState;
+  if (typeof value !== "string") return null;
   return [
     "not_sent",
     "sending",
@@ -1199,6 +1312,12 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
   }
   const metadata = metadataOf(row);
   const dispatchAuthority = knowledgeBaseTurnDispatchAuthority(row);
+  const expectedUserAttachmentCount =
+    typeof metadata.userAttachmentCount === "number" &&
+    Number.isSafeInteger(metadata.userAttachmentCount) &&
+    metadata.userAttachmentCount >= 0
+      ? metadata.userAttachmentCount
+      : 0;
   return {
     id: row.id,
     userId: row.userId,
@@ -1220,7 +1339,7 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     attachmentFileIds: [...(row.attachmentFileIds ?? [])],
     attachmentsFrozen: metadata.attachmentsFrozen === true,
     awaitingClientAttachments: metadata.awaitingClientAttachments === true,
-    expectedUserAttachmentCount: Number(metadata.userAttachmentCount ?? 0),
+    expectedUserAttachmentCount,
     stagedUserAttachmentCount: Array.isArray(metadata.clientStagedAttachments)
       ? metadata.clientStagedAttachments.length
       : 0,
@@ -1235,27 +1354,33 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
 function isKnowledgeBaseFailureClass(
   value: unknown,
 ): value is KnowledgeBaseFailureClass {
-  return [
-    "recoverable_same_turn",
-    "requires_user_fix",
-    "terminal_requires_regeneration",
-    "terminal_nonregenerable",
-  ].includes(String(value));
+  return (
+    typeof value === "string" &&
+    [
+      "recoverable_same_turn",
+      "requires_user_fix",
+      "terminal_requires_regeneration",
+      "terminal_nonregenerable",
+    ].includes(value)
+  );
 }
 
 function isKnowledgeBaseRecoveryAction(
   value: unknown,
 ): value is KnowledgeBaseRecoveryAction {
-  return [
-    "wait",
-    "reconcile",
-    "top_up",
-    "update_credential",
-    "fix_attachments",
-    "reupload_logo",
-    "regenerate_turn",
-    "contact_support",
-  ].includes(String(value));
+  return (
+    typeof value === "string" &&
+    [
+      "wait",
+      "reconcile",
+      "top_up",
+      "update_credential",
+      "fix_attachments",
+      "reupload_logo",
+      "regenerate_turn",
+      "contact_support",
+    ].includes(value)
+  );
 }
 
 /** Derive a complete public receipt from durable row state and metadata. */
@@ -1284,25 +1409,42 @@ export function knowledgeBaseTurnDispatchAuthority(
       metadata.failureClass,
     )
       ? metadata.failureClass
-      : row.status === "cancelled"
-        ? "terminal_nonregenerable"
-        : row.upstreamTaskId
-          ? "terminal_requires_regeneration"
-          : "requires_user_fix";
+      : null;
     const storedAction = isKnowledgeBaseRecoveryAction(metadata.recoveryAction)
       ? metadata.recoveryAction
-      : storedFailureClass === "terminal_requires_regeneration"
-        ? "regenerate_turn"
-        : storedFailureClass === "terminal_nonregenerable"
-          ? "contact_support"
-          : "contact_support";
+      : null;
+    const storedCanRegenerate = metadata.canRegenerate;
+    const regenerativeAuthorityIsExact =
+      storedFailureClass === "terminal_requires_regeneration" &&
+      storedAction === "regenerate_turn" &&
+      storedCanRegenerate === true;
+    const nonRegenerativeAuthorityIsExact =
+      storedCanRegenerate === false &&
+      ((storedFailureClass === "recoverable_same_turn" &&
+        (storedAction === "reconcile" || storedAction === "wait")) ||
+        (storedFailureClass === "requires_user_fix" &&
+          [
+            "top_up",
+            "update_credential",
+            "fix_attachments",
+            "reupload_logo",
+            "contact_support",
+          ].includes(storedAction || "")) ||
+        (storedFailureClass === "terminal_nonregenerable" &&
+          storedAction === "contact_support"));
+    if (!regenerativeAuthorityIsExact && !nonRegenerativeAuthorityIsExact) {
+      return {
+        dispatchState: "failed",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+      };
+    }
     return {
       dispatchState: "failed",
       failureClass: storedFailureClass,
       recoveryAction: storedAction,
-      canRegenerate:
-        storedFailureClass === "terminal_requires_regeneration" &&
-        metadata.canRegenerate !== false,
+      canRegenerate: regenerativeAuthorityIsExact,
     };
   }
   if (row.upstreamTaskId) {
@@ -1669,6 +1811,127 @@ export async function inspectKnowledgeBaseTurnReplay(
       !releasedOperationTombstone(metadataOf(operationWinner))
       ? passiveExistingResult(operationWinner, now)
       : null;
+  });
+}
+
+/**
+ * Read-only compatibility lookup for a pre-clientIntentHash `/start` receipt.
+ *
+ * Historical schema-v1 starts can have fewer generated attachments than the
+ * current start contract, so their requestHash cannot be recomputed from the
+ * current expected attachment count. They are replayable only when the full
+ * legacy protocol-terminal history is structurally valid and every
+ * browser-authoritative start field still matches the frozen recovery body.
+ */
+export async function inspectKnowledgeBaseLegacyStartReplay(
+  input: InspectKnowledgeBaseLegacyStartReplayInput,
+  executor?: any,
+): Promise<KnowledgeBaseTurnReplayReceipt | null> {
+  assertInteger(input.userId, "userId", 1);
+  const publicConversationId = normalizeRequiredId(
+    input.conversationId,
+    "conversationId",
+    191,
+  );
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    publicConversationId,
+  );
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const companyName = normalizeRequiredId(
+    input.companyName,
+    "companyName",
+    255,
+  );
+  const companyWebsite = String(input.companyWebsite || "").trim();
+  const operatorNotes = String(input.operatorNotes || "").trim();
+  const attachments = input.attachments.map((attachment) => ({
+    file_id: normalizeRequiredId(
+      attachment.file_id,
+      "attachmentFileId",
+      MAX_ATTACHMENT_ID_LENGTH,
+    ),
+    filename: normalizeRequiredId(
+      attachment.filename,
+      "attachment filename",
+      512,
+    ),
+  }));
+  if (
+    attachments.length > MAX_USER_ATTACHMENT_COUNT ||
+    new Set(attachments.map((attachment) => attachment.file_id)).size !==
+      attachments.length
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Knowledge-base start attachments are invalid",
+    );
+  }
+  const now = input.now ?? new Date();
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const row = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.conversationId, conversationId),
+            eq(conversationTurns.clientRequestId, clientRequestId),
+          ),
+        )
+        .limit(1)
+    )[0] as ConversationTurn | undefined;
+    if (!row || row.operationType !== "start" || !row.buildId) return null;
+    const build = (
+      await tx
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, row.buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+          ),
+        )
+        .limit(1)
+    )[0] as KnowledgeBaseBuild | undefined;
+    if (
+      !build ||
+      !inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority(row, build) ||
+      inspectKnowledgeBaseRetryAuthority(row, build) !== null
+    ) {
+      return null;
+    }
+    const recovery = retryAuthorityRecord(metadataOf(row).recovery);
+    const recoveredAttachments = Array.isArray(recovery?.attachments)
+      ? recovery.attachments
+      : null;
+    const browserFieldsMatch =
+      recovery?.kind === "start" &&
+      recovery.conversationId === publicConversationId &&
+      recovery.companyName === companyName &&
+      recovery.companyWebsite === companyWebsite &&
+      recovery.operatorNotes === operatorNotes &&
+      recoveredAttachments?.length === attachments.length &&
+      recoveredAttachments.every((value, index) => {
+        const recovered = retryAuthorityRecord(value);
+        return (
+          recovered?.file_id === attachments[index]?.file_id &&
+          recovered?.filename === attachments[index]?.filename
+        );
+      });
+    if (!browserFieldsMatch) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+        "The client request id was already used for different content",
+      );
+    }
+    return passiveExistingResult(row, now);
   });
 }
 

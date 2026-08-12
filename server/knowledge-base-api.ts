@@ -108,6 +108,7 @@ import {
   inspectKnowledgeBaseDeferredDispatchReplay,
   inspectKnowledgeBaseLegacyAttachmentTakeoverReplay,
   inspectKnowledgeBaseLegacyDeferredReservationReplay,
+  inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
   markKnowledgeBaseTurnDispatching,
   markKnowledgeBaseTurnOutcomeUnknown,
@@ -274,7 +275,7 @@ export function knowledgeBaseReservationReceipt(
   stateEpoch?: number | null,
 ) {
   const dispatchState =
-    reservation.state === "bound" || reservation.turn.upstreamTaskId
+    reservation.state === "bound"
       ? "bound"
       : reservation.state === "pending"
         ? "recovering"
@@ -508,9 +509,10 @@ export function knowledgeBaseTurnReservationErrorStatus(
 
 export function knowledgeBaseTurnReplayHttpStatus(
   state: Exclude<KnowledgeBaseTurnReservation, { state: "acquired" }>["state"],
+  terminalStatus = 409,
 ) {
   if (state === "pending" || state === "bound") return 202;
-  if (state === "terminal") return 409;
+  if (state === "terminal") return terminalStatus;
   return 200;
 }
 
@@ -521,6 +523,9 @@ async function respondKnowledgeBaseTurnReplayReceipt(input: {
   receipt: Exclude<KnowledgeBaseTurnReservation, { state: "acquired" }>;
   replayHit?: boolean;
   requireUpstreamTaskId?: boolean;
+  terminalStatus?: number;
+  suppressTerminalError?: boolean;
+  resumed?: boolean;
   res: import("express").Response;
 }) {
   const { receipt, res } = input;
@@ -561,38 +566,43 @@ async function respondKnowledgeBaseTurnReplayReceipt(input: {
     receipt.state === "bound" || receipt.state === "completed"
       ? receipt.upstreamTaskId
       : null;
-  res.status(knowledgeBaseTurnReplayHttpStatus(receipt.state)).json({
-    ...(receipt.state === "terminal"
-      ? {
-          error: {
-            code: "KNOWLEDGE_BASE_TURN_TERMINAL",
-            message: "本轮提交已结束，请按当前知识库状态重试",
-          },
-        }
-      : {}),
-    reservation: knowledgeBaseReservationReceipt(
-      receipt,
-      observation?.stateEpoch,
-    ),
-    ...(receipt.turn.clientRequestId !== input.requestedClientRequestId
-      ? { adoptedClientRequestId: receipt.turn.clientRequestId }
-      : {}),
-    ...(taskId
-      ? {
-          task: {
-            id: taskId,
-            status: receipt.state === "completed" ? "completed" : "running",
-          },
-        }
-      : {}),
-    observation,
-    progress: observation?.interaction.progress || null,
-    interaction:
-      observation?.interaction ||
-      deriveKnowledgeBaseInteraction(null, "running"),
-    idempotent: true,
-    startedAt: receipt.turn.startedAt?.getTime() || Date.now(),
-  });
+  res
+    .status(
+      knowledgeBaseTurnReplayHttpStatus(receipt.state, input.terminalStatus),
+    )
+    .json({
+      ...(receipt.state === "terminal" && input.suppressTerminalError !== true
+        ? {
+            error: {
+              code: "KNOWLEDGE_BASE_TURN_TERMINAL",
+              message: "本轮提交已结束，请按当前知识库状态重试",
+            },
+          }
+        : {}),
+      reservation: knowledgeBaseReservationReceipt(
+        receipt,
+        observation?.stateEpoch,
+      ),
+      ...(receipt.turn.clientRequestId !== input.requestedClientRequestId
+        ? { adoptedClientRequestId: receipt.turn.clientRequestId }
+        : {}),
+      ...(taskId
+        ? {
+            task: {
+              id: taskId,
+              status: receipt.state === "completed" ? "completed" : "running",
+            },
+          }
+        : {}),
+      observation,
+      progress: observation?.interaction.progress || null,
+      interaction:
+        observation?.interaction ||
+        deriveKnowledgeBaseInteraction(null, "running"),
+      idempotent: true,
+      ...(input.resumed === true ? { resumed: true } : {}),
+      startedAt: receipt.turn.startedAt?.getTime() || Date.now(),
+    });
 }
 
 async function respondIfKnowledgeBaseTurnReplay(input: {
@@ -3895,6 +3905,38 @@ router.post("/start", async (req, res) => {
 
   let reservationCreated = false;
   try {
+    const workspace = await getDashboardWorkspace(req.frontmindUser.id);
+    const companyName = resolveKnowledgeBaseEnterpriseIdentity({
+      sourceName: workspace.sourceName,
+      brandName: workspace.payload.brandName,
+      requestedCompanyName,
+    });
+    const userAttachments = normalizeKnowledgeBaseUserAttachments(
+      body.attachments,
+    );
+    const legacyStartReceipt = await inspectKnowledgeBaseLegacyStartReplay({
+      userId: req.frontmindUser.id,
+      conversationId,
+      clientRequestId,
+      companyName,
+      companyWebsite,
+      operatorNotes,
+      attachments: userAttachments,
+    });
+    if (legacyStartReceipt) {
+      await respondKnowledgeBaseTurnReplayReceipt({
+        userId: req.frontmindUser.id,
+        conversationId,
+        requestedClientRequestId: clientRequestId,
+        receipt: legacyStartReceipt,
+        replayHit: true,
+        terminalStatus: 200,
+        suppressTerminalError: true,
+        resumed: true,
+        res,
+      });
+      return;
+    }
     await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const existingBuild = await getKnowledgeBaseProgress({
       userId: req.frontmindUser.id,
@@ -3912,23 +3954,6 @@ router.post("/start", async (req, res) => {
       });
       return;
     }
-    const [workspace, prefillKnowledgeSnapshot] = await Promise.all([
-      getDashboardWorkspace(req.frontmindUser.id),
-      getLatestKnowledgeSnapshot(req.frontmindUser.id),
-    ]);
-    const companyName = resolveKnowledgeBaseEnterpriseIdentity({
-      sourceName: workspace.sourceName,
-      brandName: workspace.payload.brandName,
-      requestedCompanyName,
-    });
-    const newBuildPolicy = knowledgeBaseNewBuildPolicyBinding();
-    const latestSkillDescriptor = await getKnowledgeBaseSkillDescriptor({
-      version: newBuildPolicy.skillVersion,
-      contentHash: newBuildPolicy.skillContentHash,
-    });
-    const userAttachments = normalizeKnowledgeBaseUserAttachments(
-      body.attachments,
-    );
     for (const attachment of userAttachments) {
       const fileCredential = await getCredentialForUpstreamResource(
         req.frontmindUser.id,
@@ -3954,6 +3979,16 @@ router.post("/start", async (req, res) => {
         return;
       }
     }
+    const newBuildPolicy = knowledgeBaseNewBuildPolicyBinding();
+    const [prefillKnowledgeSnapshot, latestSkillDescriptor] = await Promise.all(
+      [
+        getLatestKnowledgeSnapshot(req.frontmindUser.id),
+        getKnowledgeBaseSkillDescriptor({
+          version: newBuildPolicy.skillVersion,
+          contentHash: newBuildPolicy.skillContentHash,
+        }),
+      ],
+    );
     const startReservation = await reserveKnowledgeBaseStartBuild({
       userId: req.frontmindUser.id,
       conversationId,
