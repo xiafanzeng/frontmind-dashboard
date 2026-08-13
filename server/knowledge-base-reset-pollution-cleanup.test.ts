@@ -204,7 +204,7 @@ function facts(): ResetPollutionCleanupFacts {
     acceptedReceiptCount: 0,
     pendingUserMessageCount: 1,
     messageCount: 1,
-    attachmentCount: 1,
+    attachmentCount: 0,
     upstreamResourceCount: 1,
     upstreamFileCleanup: {
       upstreamId: staged.file_id,
@@ -295,7 +295,7 @@ describe("reset-pollution strict cleanup facts", () => {
     });
     expect(planResetPollutionCleanupTransaction(input, facts())).toEqual({
       tombstone: true,
-      deleteAttachments: 1,
+      deleteAttachments: 0,
       deleteMessages: 1,
       deleteTurns: 1,
       deleteConversation: 1,
@@ -328,6 +328,10 @@ describe("reset-pollution strict cleanup facts", () => {
       "uploaded intent receipt mismatch",
       (value: ResetPollutionCleanupFacts) =>
         (value.uploadProof.items[0]!.fileIdSha256 = "a".repeat(64)),
+    ],
+    [
+      "unexpected attachment row",
+      (value: ResetPollutionCleanupFacts) => (value.attachmentCount = 1),
     ],
     ["node", (value: ResetPollutionCleanupFacts) => (value.nodeCount = 1)],
     [

@@ -511,7 +511,7 @@ function validateFacts(
     facts.acceptedReceiptCount !== 0 ||
     facts.pendingUserMessageCount !== 1 ||
     facts.messageCount !== 1 ||
-    facts.attachmentCount > localLedger.staged.length ||
+    facts.attachmentCount !== 0 ||
     facts.upstreamResourceCount !== 1 ||
     !facts.upstreamFileCleanup ||
     createHash("sha256")
@@ -790,12 +790,7 @@ async function loadFacts(
   ) {
     throw new Error("KB_RESET_POLLUTION_PREDICATE_NOT_MET");
   }
-  if (
-    !upstreamFileCleanup ||
-    attachmentRows.length !== 1 ||
-    attachmentRows[0]!.upstreamFileId !== upstreamFileCleanup.upstreamId ||
-    attachmentRows[0]!.deletedAt !== null
-  ) {
+  if (!upstreamFileCleanup || attachmentRows.length !== 0) {
     throw new Error("KB_RESET_POLLUTION_PREDICATE_NOT_MET");
   }
   return {
