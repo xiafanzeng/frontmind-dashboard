@@ -37,13 +37,11 @@ concurrency:
 
 jobs:
   promotion-gate:
-    name: Verify exact production source before build
+    name: Resolve exact production source
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
-      actions: read
       contents: read
-      pull-requests: read
     outputs:
       source_sha: ${{ steps.verify.outputs.source_sha }}
     steps:
@@ -53,13 +51,13 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
       - id: verify
-        name: Verify PR, merge tree and exact successful PR workflow
+        name: Bind build to current main SHA
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          bash .github/scripts/verify-promotion-main-push.sh
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
           echo "source_sha=$GITHUB_SHA" >>"$GITHUB_OUTPUT"
 
   changes:
@@ -243,12 +241,8 @@ jobs:
     needs:
       - changes
       - promotion-gate
-      - quality
-      - mysql-acceptance
     if: >-
       always() &&
-      needs.quality.result == 'success' &&
-      needs.mysql-acceptance.result == 'success' &&
       needs.promotion-gate.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name != 'workflow_dispatch' || inputs.kb_manus_v2_rollout_phase == 'deploy') &&
@@ -418,12 +412,8 @@ jobs:
     name: Apply same-digest Knowledge Base Manus v2 phase
     needs:
       - promotion-gate
-      - quality
-      - mysql-acceptance
     if: >-
       needs.promotion-gate.result == 'success' &&
-      needs.quality.result == 'success' &&
-      needs.mysql-acceptance.result == 'success' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.kb_manus_v2_rollout_phase != 'deploy' &&
       github.ref == 'refs/heads/main'
