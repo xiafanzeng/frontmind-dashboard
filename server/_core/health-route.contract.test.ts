@@ -95,4 +95,65 @@ describe("runtime health route contract", () => {
     );
     expect(source).toContain('"[KnowledgeBase] tree_policy_writer"');
   });
+
+  it("reports new-build and active-legacy Manus v2 authorities separately", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+    const listener = source.indexOf("server.listen(", readinessStart);
+    const readiness = source.slice(readinessStart, listener);
+
+    expect(source).toContain("knowledgeBaseManusV2WriterEnabled()");
+    expect(source).toContain("knowledgeBaseManusV2ActiveMigrationEnabled()");
+    expect(readiness).toContain("knowledgeBaseManusV2Writer");
+    expect(readiness).toContain("knowledgeBaseManusV2ActiveMigration");
+    expect(source).toContain('"[KnowledgeBase] manus_v2_writer"');
+    expect(source).toContain('"[KnowledgeBase] manus_v2_active_migration"');
+    expect(source).toMatch(
+      /knowledgeBaseManusV2ActiveMigration[\s\S]*\? \{[\s\S]*migrateActiveLegacyBuilds/u,
+    );
+  });
+
+  it("exposes active-migration convergence diagnostics without gating readiness", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+    const readyStart = source.indexOf("const ready =", readinessStart);
+    const statusStart = source.indexOf("const status =", readyStart);
+    const responseStart = source.indexOf("const response =", statusStart);
+    const listener = source.indexOf("server.listen(", responseStart);
+
+    expect(source.slice(readyStart, statusStart)).not.toContain(
+      "knowledgeBaseMigrationDiagnostics",
+    );
+    expect(source.slice(responseStart, listener)).toContain(
+      "knowledgeBaseMigrationDiagnostics.snapshot",
+    );
+    expect(source.slice(listener)).toContain(
+      "knowledgeBaseMigrationDiagnostics.recordSweep",
+    );
+  });
+
+  it("exposes build-local degradation without using it in the readiness decision", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/_core/index.ts"),
+      "utf8",
+    );
+    const readinessStart = source.indexOf('app.get("/readyz"');
+    const readyStart = source.indexOf("const ready =", readinessStart);
+    const statusStart = source.indexOf("const status =", readyStart);
+    const responseStart = source.indexOf("const response =", statusStart);
+    const listener = source.indexOf("server.listen(", responseStart);
+
+    expect(source.slice(readyStart, statusStart)).not.toContain(
+      "degradedBuildCount",
+    );
+    expect(source.slice(responseStart, listener)).toContain(
+      "getKnowledgeBaseInvariantAuditSnapshot()",
+    );
+  });
 });

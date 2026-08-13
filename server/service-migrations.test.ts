@@ -118,6 +118,7 @@ describe("service portal migration chain", () => {
       "0058_jenova_brand_tracking",
       "0059_delivery_ticket_workflow_contracts",
       "0060_knowledge_base_tree_policy",
+      "0061_knowledge_base_resilient_manus_v2",
     ]);
   });
 
@@ -129,6 +130,46 @@ describe("service portal migration chain", () => {
     expect(migrationSql).not.toMatch(
       /\b(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/iu,
     );
+  });
+
+  it("adds Manus v2 resilience fields as a data-preserving expand migration", async () => {
+    const migrationSql = await migration(
+      "0061_knowledge_base_resilient_manus_v2.sql",
+    );
+    for (const column of [
+      "providerProtocol",
+      "canonicalTaskId",
+      "canonicalCredentialId",
+      "handoffProvenance",
+      "skillArchiveSha256",
+      "contentCompletedAt",
+      "packageStatus",
+    ]) {
+      expect(migrationSql).toContain(
+        `ALTER TABLE \`knowledge_base_builds\` ADD \`${column}\``,
+      );
+    }
+    expect(migrationSql).toContain(
+      "CREATE UNIQUE INDEX `knowledge_base_builds_canonical_task_idx`",
+    );
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+    expect(migrationSql).not.toMatch(/\bFOREIGN KEY\b/iu);
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0061_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      snapshot.tables.knowledge_base_builds.indexes
+        .knowledge_base_builds_canonical_task_idx,
+    ).toMatchObject({ isUnique: true, columns: ["canonicalTaskId"] });
+    expect(
+      snapshot.tables.knowledge_base_builds.foreignKeys
+        .kb_builds_canonical_credential_fk,
+    ).toBeUndefined();
   });
 
   it("adds an independent fixed-point Jenova tracking ledger without migrating Monitor data", async () => {

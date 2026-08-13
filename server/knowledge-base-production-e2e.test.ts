@@ -33,6 +33,7 @@ import {
   formatKnowledgeBaseManifestEnvelope,
   formatKnowledgeBasePresentationEnvelope,
   formatKnowledgeBaseProgressEnvelope,
+  formatKnowledgeBaseReopenEnvelope,
 } from "./knowledge-base-progress";
 import {
   createKnowledgeBaseOperationKey,
@@ -281,7 +282,14 @@ function queryRows(
 
 function memoryDatabase(
   state: MemoryState,
-  options: { cloneSelectedRows?: boolean } = {},
+  options: {
+    cloneSelectedRows?: boolean;
+    transactional?: boolean;
+    failUpdate?: (
+      table: unknown,
+      values: Record<string, unknown>,
+    ) => Error | undefined;
+  } = {},
 ) {
   const insertRows = (table: unknown, values: Array<Record<string, any>>) => {
     const now = new Date();
@@ -434,6 +442,8 @@ function memoryDatabase(
         set(values: Record<string, unknown>) {
           return {
             async where(condition: unknown) {
+              const failure = options.failUpdate?.(table, values);
+              if (failure) throw failure;
               const targets = matchingRows(rowsFor(table, state), condition);
               targets.forEach((target) => Object.assign(target, values));
               return [{ affectedRows: targets.length }];
@@ -471,7 +481,14 @@ function memoryDatabase(
       };
     },
     async transaction<T>(operation: (tx: any) => Promise<T>) {
-      return operation(db);
+      if (!options.transactional) return operation(db);
+      const snapshot = structuredClone(state);
+      try {
+        return await operation(db);
+      } catch (error) {
+        Object.assign(state, snapshot);
+        throw error;
+      }
     },
   };
   return db;
@@ -1002,6 +1019,12 @@ describe("knowledge-base production final-package acceptance", () => {
       metadata: {
         attachmentsFrozen: true,
         userAttachmentCount: 0,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "output_pending",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-initial-result"],
+        manusV2Lifecycle: { waitingEventId: "event-waiting" },
         recovery: {},
       },
       leaseExpiresAt: new Date("2026-08-04T00:05:00.000Z"),
@@ -1106,6 +1129,17 @@ describe("knowledge-base production final-package acceptance", () => {
       status: "completed",
       upstreamTaskId: taskId,
       errorCode: null,
+      metadata: {
+        attachmentsFrozen: true,
+        userAttachmentCount: 0,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "accepted",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-initial-result"],
+        manusV2Lifecycle: { waitingEventId: "event-waiting" },
+        recovery: {},
+      },
     });
 
     const recoveredOutput = [
@@ -1204,1514 +1238,398 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   });
 
-  it("runs a 30-leaf deep-policy Manifest and Logo through publish, Viewer and immutable ZIP download", async () => {
-    const upstream = express();
-    upstream.use(express.json({ limit: "5mb" }));
-    const upstreamListener = await listen(upstream);
-    upstreamServer = upstreamListener.server;
-    const upstreamBaseUrl = upstreamListener.baseUrl;
-    dependencies.upstreamBaseUrl = upstreamBaseUrl;
-    const deepRevision = 30;
-    const fixture = await createFinalPackageFixture({
-      leafCount: deepRevision,
-      schemaVersion: 4,
-      officialLogoSourcePageUrl: "https://www.frontmind.net/",
-      officialLogoSourceAssetUrl: "https://www.frontmind.net/logo-new.svg",
-    });
-    const countMismatchZip = await JSZip.loadAsync(fixture.archive);
-    const countMismatchManifestEntry = Object.values(
-      countMismatchZip.files,
-    ).find((entry) => entry.name.endsWith("/00_package_manifest.json"));
-    expect(countMismatchManifestEntry).toBeTruthy();
-    const countMismatchManifest = JSON.parse(
-      await countMismatchManifestEntry!.async("string"),
-    );
-    countMismatchManifest.counts.customerVisibleCharacters += 615;
-    countMismatchZip.file(
-      countMismatchManifestEntry!.name,
-      JSON.stringify(countMismatchManifest),
-    );
-    const countMismatchedArchive = await countMismatchZip.generateAsync({
-      type: "nodebuffer",
-    });
-    expect(countMismatchedArchive.equals(fixture.archive)).toBe(false);
-    const canonicalRebindArchive = await canonicalizeKnowledgeBaseFinalArchive({
-      buffer: countMismatchedArchive,
-      nodes: fixture.leaves.map((leaf, ordinal) => ({
-        leafId: leaf.id,
-        title: leaf.title,
-        branchId: "products",
-        branchTitle: "产品与服务",
-        ordinal,
-        status: "confirmed",
-        contentMarkdown: leaf.contentMarkdown,
-        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
-      })),
-      buildRevision: fixture.leaves.length,
-    });
-    expect(canonicalRebindArchive.changed).toBe(true);
-    const canonicalRebindArchiveSha256 = createHash("sha256")
-      .update(canonicalRebindArchive.buffer)
-      .digest("hex");
+  it("rolls back an accepted transition when the atomic turn completion write fails", async () => {
+    const fixture = await createFinalPackageFixture();
     const state = initialState();
-    dependencies.getDb.mockResolvedValue(memoryDatabase(state));
-    const archiveSha256 = createHash("sha256")
-      .update(fixture.archive)
-      .digest("hex");
-    const rejectedZip = await JSZip.loadAsync(fixture.archive);
-    rejectedZip.comment = "semantically-valid-but-rejected-operation";
-    const rejectedArchive = await rejectedZip.generateAsync({
-      type: "nodebuffer",
-      compression: "STORE",
-    });
-    expect(rejectedArchive.equals(fixture.archive)).toBe(false);
-    const firstAttemptLogo = await sharp({
-      create: {
-        width: 24,
-        height: 24,
-        channels: 4,
-        background: "#bb2200",
-      },
-    })
-      .png()
-      .toBuffer();
-    const taskResults = new Map<
-      string,
-      { status: "awaiting_input" | "completed"; output: unknown[] }
-    >();
-    let uploadedFileSequence = 0;
-    let authoritativeTaskReads = 0;
-    let unusableLogoDownloads = 0;
-    let logoDownloads = 0;
-    let packageDownloads = 0;
-    let currentLogoBytes = firstAttemptLogo;
-    let currentPackageBytes = rejectedArchive;
-    let includeFinalPackage = true;
-    const uploadedFileBytes = new Map<string, Buffer>();
-    const uploadedFileNames = new Map<string, string>();
-    const readinessReads = new Map<string, number>();
-    const providerReadyFiles = new Set<string>();
-    let taskPostsBeforeAttachmentsReady = 0;
-    const operationTaskPosts = new Map<string, number>();
-    let rawTaskPosts = 0;
-    // Task Create has no documented replay authority; this acceptance path
-    // must never depend on retrying a transient create response.
-    let transientConfirmationFailuresRemaining = 0;
-    const idempotentTaskResponses = new Map<
-      string,
-      { id: string; status: "awaiting_input" | "completed"; output: unknown[] }
-    >();
-
-    upstream.post("/v1/files", (req, res) => {
-      expect(req.header("api_key")).toBe("sk-e2e-only");
-      expect(req.header("authorization")).toBeUndefined();
-      const filename = String(req.body.filename || "");
-      expect(
-        filename === "socratic-kb-builder.skill.zip" ||
-          filename === "frontmind-kb-server-instructions.txt" ||
-          /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(filename),
-      ).toBe(true);
-      const kind = filename.startsWith("socratic-")
-        ? "skill"
-        : filename.includes("finalization")
-          ? "finalization"
-          : "instructions";
-      const fileId = `uploaded-${kind}-${++uploadedFileSequence}`;
-      uploadedFileNames.set(fileId, filename);
-      res.json({
-        id: fileId,
-        upload_url: `${upstreamBaseUrl}/uploads/${fileId}`,
-      });
-    });
-    upstream.put(
-      "/uploads/:fileId",
-      express.raw({ type: "*/*", limit: "50mb" }),
-      (req, res) => {
-        expect(req.header("authorization")).toBeUndefined();
-        const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-        expect(bytes.length).toBeGreaterThan(0);
-        uploadedFileBytes.set(req.params.fileId, Buffer.from(bytes));
-        res.status(200).end();
-      },
-    );
-    upstream.get("/v1/files/:fileId", (req, res) => {
-      expect(req.header("api_key")).toBe("sk-e2e-only");
-      expect(req.header("authorization")).toBeUndefined();
-      const filename = uploadedFileNames.get(req.params.fileId);
-      if (!filename || !uploadedFileBytes.has(req.params.fileId)) {
-        res.status(404).json({ error: { code: "FILE_NOT_FOUND" } });
-        return;
-      }
-      const reads = (readinessReads.get(req.params.fileId) || 0) + 1;
-      readinessReads.set(req.params.fileId, reads);
-      const initialInstructionsStillPending =
-        req.params.fileId === "uploaded-instructions-2" && reads <= 2;
-      if (initialInstructionsStillPending) {
-        expect(rawTaskPosts).toBe(0);
-        res.json({ id: req.params.fileId, filename, status: "pending" });
-        return;
-      }
-      providerReadyFiles.add(req.params.fileId);
-      res.json({ id: req.params.fileId, filename, status: "uploaded" });
-    });
-    upstream.post("/v1/tasks", (req, res) => {
-      rawTaskPosts += 1;
-      expect(req.header("api_key")).toBe("sk-e2e-only");
-      expect(req.header("authorization")).toBeUndefined();
-      expect(req.header("idempotency-key")).toBeUndefined();
-      expect(req.body.taskMode).toBeUndefined();
-      expect(req.body.taskId).toBeUndefined();
-      if (
-        req.body.attachments.some(
-          (attachment: any) => !providerReadyFiles.has(attachment.file_id),
-        )
-      ) {
-        taskPostsBeforeAttachmentsReady += 1;
-        res.status(400).json({ error: { code: "ATTACHMENT_NOT_READY" } });
-        return;
-      }
-      const prompt = String(req.body.prompt || "");
-      expect(Array.from(prompt).length).toBeLessThanOrEqual(3_000);
-      const operationId =
-        prompt.match(/"operationId":"([^"]+)"/u)?.[1] ||
-        prompt.match(/operationId=([^；;\s]+)/u)?.[1];
-      const turnId =
-        prompt.match(/"turnId":"([^"]+)"/u)?.[1] ||
-        prompt.match(/turnId=([^。；;\s]+)/u)?.[1];
-      expect(operationId).toBeTruthy();
-      expect(turnId).toBeTruthy();
-      const turn = state.turns.find((candidate) => candidate.id === turnId);
-      expect(turn).toMatchObject({
-        operationKey: operationId,
-        status: "running",
-      });
-      expect(turn?.metadata?.attachmentsFrozen).toBe(true);
-      expect(turn?.attachmentFileIds).toEqual(
-        req.body.attachments.map((attachment: any) => attachment.file_id),
-      );
-      const systemInputAttachment = req.body.attachments.find(
-        (attachment: any) =>
-          attachment.filename === "frontmind-kb-server-instructions.txt" ||
-          /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(
-            attachment.filename,
-          ),
-      );
-      expect(systemInputAttachment).toBeTruthy();
-      expect(
-        uploadedFileBytes.get(systemInputAttachment.file_id)?.length,
-      ).toBeGreaterThan(0);
-      const replay = idempotentTaskResponses.get(operationId!);
-      if (replay) {
-        res.json(replay);
-        return;
-      }
-
-      const isStart = turn!.operationType === "start";
-      if (!isStart && transientConfirmationFailuresRemaining > 0) {
-        transientConfirmationFailuresRemaining -= 1;
-        res.status(503).json({ error: { message: "temporary overload" } });
-        return;
-      }
-      operationTaskPosts.set(
-        operationId!,
-        (operationTaskPosts.get(operationId!) || 0) + 1,
-      );
-      const revision = Number(turn!.expectedRevision);
-      const isFinal = !isStart && revision === fixture.leaves.length - 1;
-      const taskId = isStart
-        ? "task-initial-manifest-e2e"
-        : isFinal
-          ? TASK_ID
-          : `task-confirm-leaf-${revision + 1}`;
-      let output: unknown[];
-      if (isStart) {
-        const manifest = formatKnowledgeBaseManifestEnvelope({
-          kind: "frontmind.knowledge-base.manifest",
-          schemaVersion: 2,
-          operationId: operationId!,
-          turnId: turnId!,
-          leaves: fixture.leaves.map((leaf) => ({
-            id: leaf.id,
-            title: leaf.title,
-            branchId: "products",
-            branchTitle: "产品与服务",
-          })),
-          researchCoverage: completeResearchCoverage(
-            fixture.leaves.map((leaf) => leaf.id),
-          ),
-        });
-        output = [
-          {
-            id: "assistant-initial",
-            role: "assistant",
-            type: "output_message",
-            content: [
-              {
-                type: "output_text",
-                text: {
-                  value: `## 9.9 错误节点\n\n该正文不能写入首节点。\n${manifest}`,
-                },
-              },
-            ],
-          },
-          {
-            id: "malformed-logo-output",
-            type: "output_image",
-            file_id: "file-malformed-logo-a",
-            file_url:
-              "https://api.example/v1/files/file-malformed-logo-b/content",
-            file_name: "malformed-logo.png",
-            mime_type: "image/png",
-          },
-          {
-            id: "unusable-logo-output",
-            type: "output_image",
-            file_id: "file-unusable-logo",
-            file_name: "broken-logo.png",
-            mime_type: "image/png",
-          },
-          {
-            id: "official-logo-output",
-            type: "output_image",
-            file_id: "file-official-logo",
-            file_name: "frontmind-logo.png",
-            mime_type: "image/png",
-          },
-        ];
-      } else {
-        const leaf = fixture.leaves[revision]!;
-        const progressText = formatKnowledgeBaseProgressEnvelope({
-          kind: "frontmind.knowledge-base.progress",
-          schemaVersion: 2,
-          operationId: operationId!,
-          turnId: turnId!,
-          revision,
-          transition: {
-            leafId: leaf.id,
-            from: "current",
-            // The first final observation is deliberately inconsistent with
-            // the user's confirm action. Its ZIP may be staged, but neither
-            // the transition nor those bytes may be promoted.
-            to: isFinal ? "direct_prefilled" : "confirmed",
-            reason: `用户明确确认节点 ${leaf.id}`,
-          },
-        });
-        const presentationText = formatKnowledgeBasePresentationEnvelope({
-          kind: "frontmind.knowledge-base.presentation",
-          schemaVersion: 2,
-          operationId: operationId!,
-          turnId: turnId!,
-          revision: revision + 1,
-          leafId: isFinal ? null : fixture.leaves[revision + 1]!.id,
-          imageState: isFinal ? "not_applicable" : "no_eligible_asset",
-          assetIds: [],
-          imageCount: 0,
-        });
-        const currentOperationOutput = [
-          {
-            id: `assistant-confirm-${revision + 1}`,
-            role: "assistant",
-            type: "output_message",
-            content: [
-              {
-                type: "output_text",
-                text: {
-                  value: [
-                    isFinal
-                      ? `${leaf.id} 已确认。`
-                      : fixture.leaves[revision + 1]!.contentMarkdown,
-                    progressText,
-                    presentationText,
-                  ].join("\n"),
-                },
-              },
-              ...(isFinal
-                ? [
-                    {
-                      type: "output_file",
-                      file_id: "file-final-package",
-                      file_name: "frontmind-knowledge-base.zip",
-                      mime_type: "application/zip",
-                    },
-                    {
-                      type: "output_image",
-                      file_id: "forbidden-final-image",
-                      file_name: "forbidden.png",
-                      mime_type: "image/png",
-                    },
-                  ]
-                : []),
-            ],
-          },
-        ];
-        output = isFinal
-          ? [
-              {
-                id: "stale-package-from-cumulative-history",
-                type: "output_file",
-                file_id: "file-stale-package",
-                file_name: "stale-knowledge-base.zip",
-                mime_type: "application/zip",
-                operationId: state.turns.find(
-                  (candidate) => candidate.operationType === "start",
-                )!.operationKey,
-                turnId: state.turns.find(
-                  (candidate) => candidate.operationType === "start",
-                )!.id,
-              },
-              ...currentOperationOutput,
-            ]
-          : currentOperationOutput;
-      }
-      const taskResult = {
-        id: taskId,
-        status: (isFinal ? "completed" : "awaiting_input") as
-          | "completed"
-          | "awaiting_input",
-        output,
-      };
-      idempotentTaskResponses.set(operationId!, taskResult);
-      taskResults.set(taskId, {
-        status: taskResult.status,
-        output,
-      });
-      res.json(taskResult);
-    });
-    upstream.get("/v1/tasks/:taskId", (req, res) => {
-      authoritativeTaskReads += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
-      const result = taskResults.get(req.params.taskId);
-      if (!result) {
-        res.status(404).json({ error: "fixture task missing" });
-        return;
-      }
-      res.json({
-        id: req.params.taskId,
-        status: result.status,
-        output:
-          req.params.taskId === TASK_ID && !includeFinalPackage
-            ? result.output.flatMap((item: any) =>
-                item.role === "assistant" && Array.isArray(item.content)
-                  ? [
-                      {
-                        ...item,
-                        content: item.content.filter(
-                          (content: any) => content.type === "output_text",
-                        ),
-                      },
-                    ]
-                  : [],
-              )
-            : result.output,
-      });
-    });
-    upstream.get("/v1/files/file-unusable-logo/content", (req, res) => {
-      unusableLogoDownloads += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
-      res.setHeader("Content-Type", "image/png");
-      res.send(Buffer.from("not-an-image", "utf8"));
-    });
-    upstream.get("/v1/files/file-official-logo/content", (req, res) => {
-      logoDownloads += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
-      res.setHeader("Content-Type", "image/png");
-      res.setHeader("Content-Length", String(currentLogoBytes.length));
-      res.send(currentLogoBytes);
-    });
-    upstream.get("/v1/files/file-final-package/content", (req, res) => {
-      packageDownloads += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
-      res.setHeader("Content-Type", "application/zip");
-      res.setHeader("Content-Length", String(currentPackageBytes.length));
-      res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="frontmind-knowledge-base.zip"',
-      );
-      res.send(currentPackageBytes);
-    });
-    const { default: dashboardRouter } = await import("./dashboard-api");
-    const { default: knowledgeBaseRouter } = await import(
-      "./knowledge-base-api"
-    );
-    const { requireExpressAuth } = await import("./_core/express-auth");
-    const dashboard = express();
-    dashboard.use(express.json());
-    dashboard.use(
-      "/api/knowledge-base",
-      requireExpressAuth,
-      knowledgeBaseRouter,
-    );
-    dashboard.use("/api/dashboard", dashboardRouter);
-    const dashboardListener = await listen(dashboard);
-    dashboardServer = dashboardListener.server;
-
-    const postKnowledgeBase = async (
-      pathname: "/start" | "/turn",
-      body: Record<string, unknown>,
-    ) => {
-      const response = await fetch(
-        `${dashboardListener.baseUrl}/api/knowledge-base${pathname}`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-test-auth": "user",
-          },
-          body: JSON.stringify(body),
-        },
-      );
-      expect([200, 202]).toContain(response.status);
-      const payload = (await response.json()) as any;
-      if (payload.idempotent || response.status === 200) return payload;
-      expect(response.status).toBe(202);
-      expect(payload.reservation).toMatchObject({
-        state: "pending",
-        dispatchState: "recovering",
-        upstreamTaskId: null,
-      });
-      expect(payload.reservation.turnId).toBeTruthy();
-      expect(payload.reservation.upstreamTaskId).not.toBe(
-        payload.reservation.turnId,
-      );
-
-      const clientRequestId = String(body.clientRequestId || "");
-      const deadline = Date.now() + 5_000;
-      let acceptedTurn: (typeof state.turns)[number] | undefined;
-      while (Date.now() < deadline) {
-        acceptedTurn = state.turns.find(
-          (candidate) => candidate.clientRequestId === clientRequestId,
-        );
-        const build = state.builds.find(
-          (candidate) => candidate.id === acceptedTurn?.buildId,
-        );
-        const isDeliberatelyRejectedFinalTurn =
-          acceptedTurn?.expectedRevision === fixture.leaves.length - 1;
-        const dispatchSettled = Boolean(
-          acceptedTurn?.upstreamTaskId &&
-            ((build && build.revision > acceptedTurn.expectedRevision) ||
-              (isDeliberatelyRejectedFinalTurn && packageDownloads > 0) ||
-              acceptedTurn.status === "completed" ||
-              acceptedTurn.status === "failed" ||
-              acceptedTurn.status === "cancelled" ||
-              build?.activeTurnId !== acceptedTurn.id ||
-              build?.status === "protocol_error"),
-        );
-        if (dispatchSettled) break;
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      expect(acceptedTurn?.upstreamTaskId).toBeTruthy();
-      const observationResponse = await fetch(
-        `${dashboardListener.baseUrl}/api/knowledge-base/progress/${encodeURIComponent(String(body.conversationId || ""))}`,
-        { headers: { "x-test-auth": "user" } },
-      );
-      expect(observationResponse.status).toBe(200);
-      const observed = (await observationResponse.json()) as any;
-      return {
-        ...payload,
-        task: { id: acceptedTurn!.upstreamTaskId, status: "running" },
-        observation: observed.observation,
-        progress: observed.progress,
-        interaction: observed.interaction,
-      };
-    };
-
-    const startRequest = {
-      conversationId: PUBLIC_CONVERSATION_ID,
-      clientRequestId: "request-initial-manifest",
-      companyName: "FrontMind超前智能",
-      companyWebsite: "https://www.frontmind.net/",
-    };
-    const rejectedInitialObservation = await postKnowledgeBase(
-      "/start",
-      startRequest,
-    );
-    const buildId = state.builds[0]!.id;
-    const initialTaskId = rejectedInitialObservation.task.id as string;
-    expect(state.nodes).toHaveLength(0);
-    expect(state.builds[0]).toMatchObject({
-      status: "researching",
-      logoStorageKey: null,
-      logoSha256: null,
-    });
-    expect(logoDownloads).toBe(1);
-    expect(unusableLogoDownloads).toBe(1);
-
-    // The provider replaces the same file ID with corrected bytes and a valid
-    // first-node body. The rejected candidate must not poison this generation.
-    const correctedInitialOutput = taskResults.get(initialTaskId)!.output;
-    const correctedAssistant = correctedInitialOutput.find(
-      (item: any) => item.id === "assistant-initial",
-    ) as any;
-    const manifestText = String(correctedAssistant.content[0].text.value).match(
-      /<!--\s*FRONTMIND_KB_MANIFEST[\s\S]*?-->/u,
-    )?.[0];
-    correctedAssistant.content[0].text.value = `${fixture.leaves[0]!.contentMarkdown}\n${manifestText}`;
-    currentLogoBytes = fixture.logo;
-    const reconcileResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
-        },
-        body: JSON.stringify({
-          conversationId: PUBLIC_CONVERSATION_ID,
-          taskId: initialTaskId,
-        }),
-      },
-    );
-    expect(reconcileResponse.status).toBe(200);
-    const initialObservation = (await reconcileResponse.json()) as any;
-    const startTurn = state.turns.find(
-      (turn) => turn.operationType === "start",
-    )!;
-    expect(initialObservation.observation).toMatchObject({
-      generation: 1,
-      authoritativeTaskId: initialTaskId,
-      notice: null,
-      interaction: {
-        interactionState: "awaiting_input",
-        canReply: true,
-        progress: {
-          build: {
-            status: "confirming",
-            revision: 0,
-            currentLeafId: "1.1",
-          },
-        },
-      },
-      approvedPresentation: {
-        clientRequestId: startRequest.clientRequestId,
-        revision: 0,
-        leafId: "1.1",
-        visibleMarkdown: fixture.leaves[0]!.contentMarkdown,
-        imageState: "attached",
-        resources: [
-          expect.objectContaining({
-            kind: "logo",
-            sameOriginUrl: `/api/knowledge-base/artifacts/${buildId}/logo`,
-            sha256: fixture.logoSha256,
-          }),
-        ],
-      },
-    });
-    expect(state.nodes).toHaveLength(deepRevision);
-    expect(state.nodes[0]).toMatchObject({
-      leafId: "1.1",
-      status: "current",
-      contentMarkdown: fixture.leaves[0]!.contentMarkdown,
-    });
-    expect(
-      state.nodes.slice(1).every((node) => node.status === "pending"),
-    ).toBe(true);
-    expect(logoDownloads).toBe(2);
-    expect(unusableLogoDownloads).toBe(2);
-    expect(startTurn).toMatchObject({
-      status: "completed",
-      upstreamTaskId: initialTaskId,
-      attachmentFileIds: expect.arrayContaining([
-        expect.stringMatching(/^uploaded-skill-/u),
-        expect.stringMatching(/^uploaded-instructions-/u),
-      ]),
-      metadata: expect.objectContaining({ attachmentsFrozen: true }),
-    });
-    expect(startTurn.attachmentFileIds).toHaveLength(2);
-    const startTaskPostCount = operationTaskPosts.get(startTurn.operationKey);
-    const uploadedCountAfterStart = uploadedFileSequence;
-    const repeatedStart = await postKnowledgeBase("/start", startRequest);
-    expect(repeatedStart).toMatchObject({ idempotent: true, resumed: true });
-    expect(operationTaskPosts.get(startTurn.operationKey)).toBe(
-      startTaskPostCount,
-    );
-    expect(uploadedFileSequence).toBe(uploadedCountAfterStart);
-
-    for (const { request: conflictingStart, expectedCode } of [
-      {
-        request: {
-          ...startRequest,
-          operatorNotes: "与首次启动不同的输入",
-        },
-        expectedCode: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
-      },
-      {
-        request: {
-          ...startRequest,
-          clientRequestId: "request-conflicting-start",
-        },
-        expectedCode: "CONFLICT",
-      },
-    ]) {
-      const response = await fetch(
-        `${dashboardListener.baseUrl}/api/knowledge-base/start`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-test-auth": "user",
-          },
-          body: JSON.stringify(conflictingStart),
-        },
-      );
-      expect(response.status).toBe(409);
-      const conflict = (await response.json()) as any;
-      expect(conflict).toMatchObject({
-        error: { code: expectedCode },
-        observation: {
-          authoritativeTaskId: initialTaskId,
-          interaction: {
-            progress: {
-              build: { revision: 0, currentLeafId: "1.1" },
-            },
-          },
-        },
-      });
-    }
-    expect(operationTaskPosts.get(startTurn.operationKey)).toBe(
-      startTaskPostCount,
-    );
-    expect(uploadedFileSequence).toBe(uploadedCountAfterStart);
-
-    let finalOperationKey = "";
-    for (let index = 0; index < fixture.leaves.length; index += 1) {
-      const leaf = fixture.leaves[index]!;
-      const isFinal = index === fixture.leaves.length - 1;
-      const turnRequest = {
-        conversationId: PUBLIC_CONVERSATION_ID,
-        clientRequestId: `request-confirm-${index + 1}`,
-        userMessage: "确认",
-        expectedRevision: index,
-        expectedLeafId: leaf.id,
-      };
-      let result = await postKnowledgeBase("/turn", turnRequest);
-      const expectedRevision = index + 1;
-      let turn = state.turns.find(
-        (candidate) =>
-          candidate.clientRequestId === turnRequest.clientRequestId,
-      )!;
-      finalOperationKey = turn.operationKey;
-      const turnTaskId = result.task.id;
-      if (isFinal) {
-        expect(state.builds[0]).toMatchObject({
-          status: "confirming",
-          revision: fixture.leaves.length - 1,
-          currentLeafId: leaf.id,
-          packageStorageKey: null,
-        });
-        // The malformed final output also carries a forbidden image. The v4
-        // resource gate must reject that shape before downloading any ZIP.
-        expect(packageDownloads).toBe(0);
-        const finalTask = taskResults.get(TASK_ID)!;
-        const finalAssistant = finalTask.output.find(
-          (item: any) => item.id === `assistant-confirm-${index + 1}`,
-        ) as any;
-        const finalText = finalAssistant.content.find(
-          (content: any) => content.type === "output_text",
-        );
-        const rejectedFinalText = String(finalText.text.value);
-        finalText.text.value = rejectedFinalText.replace(
-          '"to":"direct_prefilled"',
-          '"to":"confirmed"',
-        );
-        expect(finalText.text.value).not.toBe(rejectedFinalText);
-        finalAssistant.content = finalAssistant.content.filter(
-          (content: any) => content.type !== "output_image",
-        );
-        currentPackageBytes = fixture.archive;
-        const response = await fetch(
-          `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-test-auth": "user",
-            },
-            body: JSON.stringify({
-              conversationId: PUBLIC_CONVERSATION_ID,
-              taskId: TASK_ID,
-            }),
-          },
-        );
-        expect(response.status).toBe(200);
-        result = await response.json();
-        turn = state.turns.find(
-          (candidate) =>
-            candidate.clientRequestId === turnRequest.clientRequestId,
-        )!;
-        for (
-          let completionPoll = 0;
-          turn.status !== "completed" && completionPoll < 100;
-          completionPoll += 1
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          turn = state.turns.find(
-            (candidate) =>
-              candidate.clientRequestId === turnRequest.clientRequestId,
-          )!;
-        }
-        if (
-          turn.status === "completed" &&
-          result.observation?.interaction?.interactionState !==
-            "ready_to_publish"
-        ) {
-          const completedObservationResponse = await fetch(
-            `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                "x-test-auth": "user",
-              },
-              body: JSON.stringify({
-                conversationId: PUBLIC_CONVERSATION_ID,
-                taskId: TASK_ID,
-              }),
-            },
-          );
-          expect(completedObservationResponse.status).toBe(200);
-          result = await completedObservationResponse.json();
-        }
-      }
-      expect(turn).toMatchObject({
-        operationType: "confirm",
-        expectedRevision: index,
-        expectedLeafId: leaf.id,
-        status: "completed",
-        upstreamTaskId: turnTaskId,
-        attachmentFileIds: expect.arrayContaining([
-          expect.stringMatching(/^uploaded-skill-/u),
-          expect.stringMatching(
-            isFinal ? /^uploaded-finalization-/u : /^uploaded-instructions-/u,
-          ),
-        ]),
-        metadata: expect.objectContaining({ attachmentsFrozen: true }),
-      });
-      expect(turn.attachmentFileIds).toHaveLength(2);
-      if (isFinal) {
-        expect(result.observation).toMatchObject({
-          authoritativeTaskId: TASK_ID,
-          approvedPresentation: null,
-          notice: null,
-          interaction: {
-            interactionState: "ready_to_publish",
-            canReply: false,
-            canPublish: true,
-            progress: {
-              build: {
-                status: "ready_to_publish",
-                revision: deepRevision,
-                currentLeafId: null,
-              },
-            },
-          },
-          package: {
-            revision: deepRevision,
-            sha256: archiveSha256,
-            sizeBytes: fixture.archive.length,
-          },
-        });
-        // Keep the stale ZIP in the cumulative task. Historical package
-        // recovery must select the persisted file identity rather than assume
-        // a settled task contains only one ZIP descriptor.
-        expect(taskResults.get(TASK_ID)!.output).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              id: "stale-package-from-cumulative-history",
-            }),
-          ]),
-        );
-      } else {
-        const nextLeaf = fixture.leaves[index + 1]!;
-        expect(result.observation).toMatchObject({
-          authoritativeTaskId: turnTaskId,
-          notice: null,
-          interaction: {
-            interactionState: "awaiting_input",
-            canReply: true,
-            progress: {
-              build: {
-                status: "confirming",
-                revision: expectedRevision,
-                currentLeafId: nextLeaf.id,
-              },
-            },
-          },
-          approvedPresentation: {
-            clientRequestId: turnRequest.clientRequestId,
-            revision: expectedRevision,
-            leafId: nextLeaf.id,
-            visibleMarkdown: nextLeaf.contentMarkdown,
-            imageState: "no_eligible_asset",
-            resources: [],
-          },
-        });
-      }
-      expect(state.builds[0]!.confirmedCount).toBe(expectedRevision);
-      const output = taskResults.get(turnTaskId)!.output;
-      expect(
-        output.some((item: any) =>
-          JSON.stringify(item).match(/output_image|image\//u),
-        ),
-      ).toBe(false);
-      const taskPostCount = operationTaskPosts.get(turn.operationKey);
-      const uploadedCount = uploadedFileSequence;
-      const repeated = await postKnowledgeBase("/turn", turnRequest);
-      expect(repeated).toMatchObject({
-        idempotent: true,
-        task: { id: turnTaskId },
-      });
-      expect(operationTaskPosts.get(turn.operationKey)).toBe(taskPostCount);
-      expect(uploadedFileSequence).toBe(uploadedCount);
-
-      if (index === 0) {
-        // The first application above used the operation tail. A later poll
-        // of the very same task now expands to the provider's cumulative
-        // snapshot, including the old Manifest and Logo. Replaying it several
-        // times must be an immutable noop: no stale/protocol notice, no second
-        // transition and no loss of the approved 1.2 presentation.
-        const currentTask = taskResults.get(turnTaskId)!;
-        currentTask.output = [
-          ...taskResults.get(initialTaskId)!.output,
-          ...currentTask.output,
-        ];
-        const epochAfterTail = state.builds[0]!.stateEpoch;
-        const approvedContentAfterTail = state.nodes[1]!.contentMarkdown;
-        const credentialReadsAfterTail =
-          dependencies.getCredentialForUpstreamResource.mock.calls.length;
-        const upstreamReadsAfterTail = authoritativeTaskReads;
-        for (let replay = 0; replay < 3; replay += 1) {
-          const response = await fetch(
-            `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                "x-test-auth": "user",
-              },
-              body: JSON.stringify({
-                conversationId: PUBLIC_CONVERSATION_ID,
-              }),
-            },
-          );
-          expect(response.status).toBe(200);
-          expect((await response.json()) as any).toMatchObject({
-            observation: {
-              notice: null,
-              interaction: {
-                interactionState: "awaiting_input",
-                progress: {
-                  build: {
-                    status: "confirming",
-                    revision: 1,
-                    currentLeafId: "1.2",
-                  },
-                },
-              },
-              approvedPresentation: {
-                revision: 1,
-                leafId: "1.2",
-                visibleMarkdown: fixture.leaves[1]!.contentMarkdown,
-                resources: [],
-              },
-            },
-          });
-          expect(state.builds[0]).toMatchObject({
-            stateEpoch: epochAfterTail,
-            revision: 1,
-            currentLeafId: "1.2",
-            protocolError: null,
-            protocolErrorCode: null,
-          });
-          expect(state.nodes[1]!.contentMarkdown).toBe(
-            approvedContentAfterTail,
-          );
-        }
-        // These three requests model focus/online wakes spanning the failure
-        // debounce window. Even if the completed task's Key were deleted, its
-        // reads timed out, or it returned 401, no credential/task access is
-        // attempted after the approved 1.2 projection released activeTurnId.
-        expect(
-          dependencies.getCredentialForUpstreamResource.mock.calls.length,
-        ).toBe(credentialReadsAfterTail);
-        expect(authoritativeTaskReads).toBe(upstreamReadsAfterTail);
-      }
-    }
-
-    expect(authoritativeTaskReads).toBe(2);
-    expect(logoDownloads).toBe(2);
-    expect(packageDownloads).toBe(1);
-    // The Skill is build-scoped and reused once. Every operation gets one
-    // operation-bound server input file; the last uses finalization ZIP.
-    expect(uploadedFileSequence).toBe(deepRevision + 2);
-    expect(uploadedFileBytes.size).toBe(deepRevision + 2);
-    expect(
-      [...uploadedFileNames.values()].filter(
-        (filename) => filename === "socratic-kb-builder.skill.zip",
-      ),
-    ).toHaveLength(1);
-    expect(
-      [...uploadedFileNames.values()].filter(
-        (filename) => filename === "frontmind-kb-server-instructions.txt",
-      ),
-    ).toHaveLength(deepRevision);
-    expect(
-      [...uploadedFileNames.values()].filter((filename) =>
-        /^frontmind-kb-finalization-input-[a-f0-9]{16}\.zip$/u.test(filename),
-      ),
-    ).toHaveLength(1);
-    expect(
-      new Set(
-        state.turns
-          .flatMap((turn) => turn.attachmentFileIds || [])
-          .filter((fileId) => /^uploaded-skill-/u.test(fileId)),
-      ),
-    ).toEqual(new Set(["uploaded-skill-1"]));
-    expect(operationTaskPosts.size).toBe(deepRevision + 1);
-    expect([...operationTaskPosts.values()]).toEqual(
-      Array(deepRevision + 1).fill(1),
-    );
-    expect(rawTaskPosts).toBe(deepRevision + 1);
-    expect(
-      readinessReads.get("uploaded-instructions-2"),
-    ).toBeGreaterThanOrEqual(3);
-    expect(taskPostsBeforeAttachmentsReady).toBe(0);
-    expect(state.builds[0]).toMatchObject({
+    const buildId = "24242424-2424-4242-8242-242424242424";
+    const turnId = "25252525-2525-4252-8252-252525252525";
+    const taskId = "task-v4-atomic-transition";
+    const operationKey = "operation-v4-atomic-transition";
+    const now = new Date("2026-08-04T01:00:00.000Z");
+    state.builds.push({
       id: buildId,
-      // reservation + upstream binding + authoritative reconcile per operation
-      stateEpoch: 3 * (deepRevision + 1),
-      lastAppliedOperationKey: finalOperationKey,
-      protocolError: null,
-      protocolErrorCode: null,
-    });
-    expect(
-      state.turns
-        .filter(
-          (turn) =>
-            turn.operationType === "start" || turn.operationType === "confirm",
-        )
-        .every((turn) => turn.status === "completed"),
-    ).toBe(true);
-    const presentationMessages = state.messages.filter(
-      (message) => message.metadata?.knowledgeBase?.kind === "presentation",
-    );
-    expect(
-      presentationMessages.map((message) => ({
-        leafId: message.metadata.knowledgeBase.leafId,
-        revision: message.metadata.knowledgeBase.revision,
-        content: message.content,
-      })),
-    ).toEqual(
-      fixture.leaves.map((leaf, revision) => ({
-        leafId: leaf.id,
-        revision,
-        content: leaf.contentMarkdown,
-      })),
-    );
-    expect(
-      new Set(presentationMessages.map((message) => message.turnId)).size,
-    ).toBe(deepRevision);
-    expect(state.nodes.every((node) => node.status === "confirmed")).toBe(true);
-    expect(
-      state.nodes.map((node) => ({
-        id: node.leafId,
-        revisionContent: node.contentMarkdown,
-        hash: node.contentSha256,
-      })),
-    ).toEqual(
-      fixture.leaves.map((leaf) => ({
-        id: leaf.id,
-        revisionContent: leaf.contentMarkdown,
-        hash: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
-      })),
-    );
-    expect(state.builds[0]).toMatchObject({
-      status: "ready_to_publish",
-      revision: deepRevision,
-      currentLeafId: null,
-      confirmedCount: deepRevision,
-      packageRevision: deepRevision,
-      packageArchiveSha256: archiveSha256,
-      logoSha256: fixture.logoSha256,
-    });
-    const artifactStore = await import("./knowledge-build-artifact-store");
-    const artifactBinding = await import(
-      "./knowledge-base-artifact-binding-service"
-    );
-    const orphanCleanup =
-      await artifactBinding.cleanupOrphanedKnowledgeBuildArtifactCandidates({
-        olderThan: new Date(Date.now() + 1_000),
-        limit: 100,
-      });
-    expect(orphanCleanup).toEqual({
-      scanned: 3,
-      deleted: 1,
-      retained: 2,
-      failed: 0,
-    });
-    expect(
-      await artifactStore.readKnowledgeBuildArtifact({
-        userId: USER_ID,
-        buildId,
-        generation: 1,
-        kind: "logo",
-        expectedSha256: fixture.logoSha256,
-        expectedBytes: fixture.logo.length,
-        storageKey: state.builds[0]!.logoStorageKey!,
-      }),
-    ).toEqual(fixture.logo);
-    expect(
-      await artifactStore.readKnowledgeBuildArtifact({
-        userId: USER_ID,
-        buildId,
-        generation: 1,
-        kind: "package",
-        expectedSha256: archiveSha256,
-        expectedBytes: fixture.archive.length,
-        storageKey: state.builds[0]!.packageStorageKey!,
-      }),
-    ).toEqual(fixture.archive);
-    const { getKnowledgeBaseObservationProjection } = await import(
-      "./knowledge-base-progress-service"
-    );
-
-    // Backfill deliberately revoked publication eligibility because this
-    // historical ready build had no Dashboard-owned package bytes. Recovery
-    // must reread the same settled task; it must not reserve a new turn.
-    await artifactStore.removeKnowledgeBuildArtifact({
       userId: USER_ID,
-      buildId,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "",
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "2".repeat(64),
+      treePolicyVersion: 1,
+      initialResearchCoverage: null,
+      status: "confirming",
       generation: 1,
-      kind: "package",
-      storageKey: state.builds[0]!.packageStorageKey!,
-    });
-    const persistedPackageIdentity = {
-      packageRevision: state.builds[0]!.packageRevision,
-      packageTaskId: state.builds[0]!.packageTaskId,
-      packageOutputItemId: state.builds[0]!.packageOutputItemId,
-      packageFileId: state.builds[0]!.packageFileId,
-      packageFilename: state.builds[0]!.packageFilename,
-      packageDescriptorHash: state.builds[0]!.packageDescriptorHash,
-    };
-    expect(persistedPackageIdentity).toMatchObject({
-      packageRevision: deepRevision,
-      packageTaskId: TASK_ID,
-      packageOutputItemId: expect.any(String),
-      packageFileId: "file-final-package",
-      packageDescriptorHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
-    });
-    Object.assign(state.builds[0]!, {
-      status: "protocol_error",
-      stateEpoch: state.builds[0]!.stateEpoch + 1,
-      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
-      protocolError:
-        "历史知识库成品未能固化，请重新绑定通过校验的最终 ZIP 后再发布",
-      ...persistedPackageIdentity,
-      packageStorageKey: null,
-      packageArchiveSha256: null,
-      packageSizeBytes: null,
-      updatedAt: new Date("2026-08-01T00:01:00.000Z"),
-    });
-    const rebindStateEpoch = state.builds[0]!.stateEpoch;
-    await expect(
-      getKnowledgeBaseObservationProjection({
-        userId: USER_ID,
-        conversationId: PUBLIC_CONVERSATION_ID,
-      }),
-    ).resolves.toMatchObject({
-      notice: {
-        code: "PACKAGE_REBIND_REQUIRED",
-        retryable: true,
-      },
-      package: null,
-    });
-
-    const turnCountBeforeRebind = state.turns.length;
-    const readsBeforeRebind = authoritativeTaskReads;
-    dependencies.getCredentialForUpstreamResource.mockResolvedValueOnce(null);
-    const unavailableCredentialResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
-        },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
-    );
-    expect(unavailableCredentialResponse.status).toBe(200);
-    expect((await unavailableCredentialResponse.json()) as any).toMatchObject({
-      observation: {
-        notice: {
-          code: "PACKAGE_REBIND_REQUIRED",
-          retryable: true,
-        },
-      },
-    });
-    expect(authoritativeTaskReads).toBe(readsBeforeRebind);
-    expect(state.builds[0]).toMatchObject({
-      status: "protocol_error",
-      stateEpoch: rebindStateEpoch,
-      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
-    });
-    expect(state.turns).toHaveLength(turnCountBeforeRebind);
-
-    includeFinalPackage = false;
-    const partialRebindResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
-        },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
-    );
-    expect(partialRebindResponse.status).toBe(200);
-    expect((await partialRebindResponse.json()) as any).toMatchObject({
-      observation: {
-        notice: {
-          code: "PACKAGE_REBIND_REQUIRED",
-          retryable: true,
-        },
-        package: null,
-      },
-    });
-    expect(state.builds[0]).toMatchObject({
-      status: "protocol_error",
-      stateEpoch: rebindStateEpoch,
-      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
-    });
-    expect(state.turns).toHaveLength(turnCountBeforeRebind);
-
-    includeFinalPackage = true;
-    // A historical provider may return the same authoritative formal bytes
-    // with only a stale derived manifest count. Ready-package recovery must
-    // canonicalize that field and then pass the strict reread without creating
-    // a new upstream turn.
-    currentPackageBytes = countMismatchedArchive;
-    const rebindResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
-        },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
-    );
-    expect(rebindResponse.status).toBe(200);
-    const rebound = (await rebindResponse.json()) as any;
-    expect(rebound.observation).toMatchObject({
-      authoritativeTaskId: TASK_ID,
-      notice: null,
-      interaction: {
-        interactionState: "ready_to_publish",
-        canPublish: true,
-      },
-      package: {
-        revision: deepRevision,
-        sha256: canonicalRebindArchiveSha256,
-        sizeBytes: canonicalRebindArchive.buffer.length,
-      },
-    });
-    expect(authoritativeTaskReads).toBe(readsBeforeRebind + 2);
-    expect(state.turns).toHaveLength(turnCountBeforeRebind);
-    expect(state.builds[0]).toMatchObject({
-      status: "ready_to_publish",
-      stateEpoch: rebindStateEpoch + 1,
-      packageRevision: deepRevision,
-      packageTaskId: TASK_ID,
-      packageArchiveSha256: canonicalRebindArchiveSha256,
-      protocolError: null,
-      protocolErrorCode: null,
-    });
-
-    // Historical incremental deployments could already have the authoritative
-    // ZIP while the first-node Logo was never copied into Dashboard storage.
-    // The dedicated rebind must recover the Logo from that same ZIP; merely
-    // seeing durable package bytes is not enough to clear the notice.
-    await artifactStore.removeKnowledgeBuildArtifact({
-      userId: USER_ID,
-      buildId,
-      generation: 1,
-      kind: "logo",
-      storageKey: state.builds[0]!.logoStorageKey!,
-    });
-    const missingLogoRecoveryEpoch = state.builds[0]!.stateEpoch + 1;
-    Object.assign(state.builds[0]!, {
-      status: "protocol_error",
-      stateEpoch: missingLogoRecoveryEpoch,
-      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
-      protocolError: "历史 Logo 尚未完成固化",
+      stateEpoch: 2,
+      revision: 0,
+      currentLeafId: fixture.leaves[0]!.id,
+      totalNodeCount: fixture.leaves.length,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      activeTurnId: turnId,
+      upstreamTaskId: taskId,
+      lastAppliedOperationKey: null,
+      currentPresentationKey: "presentation-current-1",
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      lastTurnUserText: "确认",
+      lastTurnAttachmentCount: 0,
+      awaitingResponseSince: now,
+      packageRevision: null,
+      packageTaskId: null,
+      packageOutputItemId: null,
+      packageFileId: null,
+      packageFilename: null,
+      packageDescriptorHash: null,
       logoStorageKey: null,
       logoSha256: null,
       logoBytes: null,
       logoFilename: null,
       logoMimeType: null,
-    });
-    const readsBeforeLogoRecovery = authoritativeTaskReads;
-    const downloadsBeforeLogoRecovery = packageDownloads;
-    const missingLogoRebindRequests = await Promise.all(
-      [0, 1].map(() =>
-        fetch(
-          `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-test-auth": "user",
-            },
-            body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-          },
-        ),
-      ),
-    );
-    for (const response of missingLogoRebindRequests) {
-      expect(response.status).toBe(200);
-      expect((await response.json()) as any).toMatchObject({
-        observation: {
-          notice: null,
-          interaction: { interactionState: "ready_to_publish" },
-        },
-      });
-    }
-    expect(state.builds[0]).toMatchObject({
-      status: "ready_to_publish",
-      stateEpoch: missingLogoRecoveryEpoch + 1,
-      logoStorageKey: expect.any(String),
-      logoSha256: fixture.logoSha256,
-      logoBytes: fixture.logo.length,
-      protocolError: null,
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
       protocolErrorCode: null,
+      protocolError: null,
+      publishedSnapshotId: null,
+      completedAt: null,
+      publishedAt: null,
+      createdAt: now,
+      updatedAt: now,
     });
-    expect(authoritativeTaskReads).toBeGreaterThanOrEqual(
-      readsBeforeLogoRecovery + 1,
-    );
-    expect(authoritativeTaskReads).toBeLessThanOrEqual(
-      readsBeforeLogoRecovery + 2,
-    );
-    expect(packageDownloads).toBe(downloadsBeforeLogoRecovery + 1);
-    await expect(
-      artifactStore.readKnowledgeBuildArtifact({
-        userId: USER_ID,
+    state.nodes.push(
+      ...fixture.leaves.map((leaf, ordinal) => ({
+        id: `25252525-2525-4252-8252-${String(ordinal + 1).padStart(12, "0")}`,
         buildId,
-        generation: 1,
-        kind: "logo",
-        storageKey: state.builds[0]!.logoStorageKey!,
-        expectedSha256: fixture.logoSha256,
-        expectedBytes: fixture.logo.length,
-      }),
-    ).resolves.toEqual(fixture.logo);
-
-    // A legacy/inconsistent row may already point at verified immutable bytes
-    // while retaining the rebind notice. Reconcile verifies those bytes and
-    // clears only the recovery state without downloading or creating a turn.
-    const durableRecoveryEpoch = state.builds[0]!.stateEpoch + 1;
-    Object.assign(state.builds[0]!, {
-      status: "protocol_error",
-      stateEpoch: durableRecoveryEpoch,
-      protocolErrorCode: "PACKAGE_REBIND_REQUIRED",
-      protocolError: "历史成品状态等待重新绑定",
-    });
-    const readsBeforeDurableRebind = authoritativeTaskReads;
-    const downloadsBeforeDurableRebind = packageDownloads;
-    const durableRebindResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
-        },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
+        leafId: leaf.id,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        title: leaf.title,
+        ordinal,
+        status: ordinal === 0 ? "current" : "pending",
+        transitionReason: null,
+        contentMarkdown: ordinal === 0 ? leaf.contentMarkdown : null,
+        contentSha256:
+          ordinal === 0
+            ? knowledgeBaseMarkdownSha256(leaf.contentMarkdown)
+            : null,
+        lastUserInput: null,
+        sourceUrls: [],
+        imageUrls: [],
+        lastTaskId: ordinal === 0 ? taskId : null,
+        sourceTurnId: ordinal === 0 ? "turn-initial" : null,
+        presentationKey: ordinal === 0 ? "presentation-current-1" : null,
+        lastResponseAt: ordinal === 0 ? now : null,
+        confirmedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      })),
     );
-    expect(durableRebindResponse.status).toBe(200);
-    expect((await durableRebindResponse.json()) as any).toMatchObject({
-      observation: {
-        notice: null,
-        interaction: { interactionState: "ready_to_publish" },
-        package: { sha256: canonicalRebindArchiveSha256 },
+    state.turns.push({
+      id: turnId,
+      conversationId: STORED_CONVERSATION_ID,
+      userId: USER_ID,
+      apiCredentialId: "credential-e2e",
+      clientRequestId: "request-v4-atomic-transition",
+      buildId,
+      buildGeneration: 1,
+      operationKey,
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: fixture.leaves[0]!.id,
+      requestHash: "3".repeat(64),
+      upstreamIdempotencyKeyHash: "4".repeat(64),
+      attachmentFileIds: [],
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "output_pending",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-transition-result"],
+        recovery: { outputCursor: 1 },
+      },
+      leaseExpiresAt: new Date("2026-08-04T01:05:00.000Z"),
+      status: "running",
+      upstreamTaskId: taskId,
+      errorCode: null,
+      errorMessage: null,
+      startedAt: now,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const frozenState = structuredClone(state);
+    let rejectedCompletionWrites = 0;
+    dependencies.getDb.mockResolvedValue(
+      memoryDatabase(state, {
+        transactional: true,
+        failUpdate(table, values) {
+          if (table === conversationTurns && values.status === "completed") {
+            rejectedCompletionWrites += 1;
+            return new Error("injected turn completion write failure");
+          }
+          return undefined;
+        },
+      }),
+    );
+
+    const progressText = formatKnowledgeBaseProgressEnvelope({
+      kind: "frontmind.knowledge-base.progress",
+      schemaVersion: 2,
+      operationId: operationKey,
+      turnId,
+      revision: 0,
+      transition: {
+        leafId: fixture.leaves[0]!.id,
+        from: "current",
+        to: "confirmed",
+        reason: "用户明确确认当前节点",
       },
     });
-    expect(state.builds[0]).toMatchObject({
-      status: "ready_to_publish",
-      stateEpoch: durableRecoveryEpoch + 1,
-      protocolError: null,
+    const presentationText = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 2,
+      operationId: operationKey,
+      turnId,
+      revision: 1,
+      leafId: fixture.leaves[1]!.id,
+      imageState: "no_eligible_asset",
+      assetIds: [],
+      imageCount: 0,
+    });
+    const { reconcileKnowledgeBaseProgress } = await import(
+      "./knowledge-base-progress-service"
+    );
+    const progress = await reconcileKnowledgeBaseProgress({
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      taskId,
+      userText: "确认",
+      attachmentCount: 0,
+      output: [
+        {
+          id: "assistant-v4-atomic-transition",
+          role: "assistant",
+          type: "output_message",
+          content: [
+            {
+              type: "output_text",
+              text: {
+                value: `${fixture.leaves[1]!.contentMarkdown}\n${progressText}\n${presentationText}`,
+              },
+            },
+          ],
+        },
+      ],
+      upstreamStatus: "running",
+    });
+
+    expect(rejectedCompletionWrites).toBe(1);
+    expect(progress.build).toMatchObject({
+      status: "confirming",
+      revision: 0,
+      currentLeafId: fixture.leaves[0]!.id,
+    });
+    expect(state).toEqual(frozenState);
+    expect(state.turns[0]!.metadata).toMatchObject({
+      providerAttemptState: "output_pending",
+      lastSeenEventIds: ["event-transition-result"],
+      recovery: { outputCursor: 1 },
+    });
+  });
+
+  it("accepts a Manus v2 migrated reopen result without dropping its ledger", async () => {
+    const fixture = await createFinalPackageFixture();
+    const state = initialState();
+    const buildId = "26262626-2626-4262-8262-262626262626";
+    const turnId = "27272727-2727-4272-8272-272727272727";
+    const taskId = "task-v2-migrated-reopen";
+    const operationKey = "operation-v2-migrated-reopen";
+    const revision = fixture.leaves.length;
+    const reopenedLeaf = fixture.leaves[2]!;
+    const now = new Date("2026-08-04T02:00:00.000Z");
+    state.builds.push({
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "",
+      skillName: "socratic-kb-builder",
+      skillVersion: "3",
+      skillContentHash: "6".repeat(64),
+      treePolicyVersion: 1,
+      initialResearchCoverage: null,
+      providerProtocol: "manus_v2",
+      status: "confirming",
+      generation: 1,
+      stateEpoch: 5,
+      revision,
+      currentLeafId: null,
+      totalNodeCount: revision,
+      confirmedCount: revision,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      activeTurnId: turnId,
+      upstreamTaskId: taskId,
+      lastAppliedOperationKey: "operation-before-reopen",
+      currentPresentationKey: null,
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      lastTurnUserText: "请重新核验第三个节点",
+      lastTurnAttachmentCount: 0,
+      awaitingResponseSince: now,
+      packageStatus: "ready",
+      packageAttemptCount: 1,
+      packageRevision: revision,
+      packageTaskId: "task-before-reopen",
+      packageOutputItemId: "output-before-reopen",
+      packageFileId: "file-before-reopen",
+      packageFilename: "before-reopen.zip",
+      packageDescriptorHash: "7".repeat(64),
+      packageStorageKey: "knowledge-builds/before-reopen.zip",
+      packageArchiveSha256: "8".repeat(64),
+      packageSizeBytes: 1234,
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
       protocolErrorCode: null,
+      protocolError: null,
+      publishedSnapshotId: null,
+      completedAt: now,
+      contentCompletedAt: now,
+      publishedAt: null,
+      createdAt: now,
+      updatedAt: now,
     });
-    expect(authoritativeTaskReads).toBe(readsBeforeDurableRebind + 1);
-    expect(packageDownloads).toBe(downloadsBeforeDurableRebind);
-    expect(state.turns).toHaveLength(turnCountBeforeRebind);
-
-    const repeatedRebindResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/knowledge-base/progress/reconcile`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
+    state.nodes.push(
+      ...fixture.leaves.map((leaf, ordinal) => ({
+        id: `27272727-2727-4272-8272-${String(ordinal + 1).padStart(12, "0")}`,
+        buildId,
+        leafId: leaf.id,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        title: leaf.title,
+        ordinal,
+        status: "confirmed",
+        transitionReason: "历史节点已确认",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+        lastUserInput: null,
+        sourceUrls: [],
+        imageUrls: [],
+        lastTaskId: "task-before-reopen",
+        sourceTurnId: `turn-before-reopen-${ordinal + 1}`,
+        presentationKey: `presentation-before-reopen-${ordinal + 1}`,
+        lastResponseAt: now,
+        confirmedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    );
+    state.turns.push({
+      id: turnId,
+      conversationId: STORED_CONVERSATION_ID,
+      userId: USER_ID,
+      apiCredentialId: "credential-e2e",
+      clientRequestId: "request-v2-migrated-reopen",
+      buildId,
+      buildGeneration: 1,
+      operationKey,
+      operationType: "revise",
+      expectedRevision: revision,
+      expectedLeafId: null,
+      requestHash: "9".repeat(64),
+      upstreamIdempotencyKeyHash: "a".repeat(64),
+      attachmentFileIds: [],
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "output_pending",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-reopen-result"],
+        recovery: { migratedFrom: "legacy_v1" },
+      },
+      leaseExpiresAt: new Date("2026-08-04T02:05:00.000Z"),
+      status: "running",
+      upstreamTaskId: taskId,
+      errorCode: null,
+      errorMessage: null,
+      startedAt: now,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    dependencies.getDb.mockResolvedValue(memoryDatabase(state));
+    const reopenEnvelope = formatKnowledgeBaseReopenEnvelope({
+      kind: "frontmind.knowledge-base.reopen",
+      schemaVersion: 1,
+      revision,
+      leafId: reopenedLeaf.id,
+      reason: "客户要求重新核验该节点",
+    });
+    const presentationEnvelope = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 1,
+      revision: revision + 1,
+      leafId: reopenedLeaf.id,
+      imageState: "no_eligible_asset",
+      assetIds: [],
+      imageCount: 0,
+    });
+    const { reconcileKnowledgeBaseProgress } = await import(
+      "./knowledge-base-progress-service"
+    );
+    const progress = await reconcileKnowledgeBaseProgress({
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      taskId,
+      userText: "请重新核验第三个节点",
+      attachmentCount: 0,
+      output: [
+        {
+          id: "assistant-v2-migrated-reopen",
+          role: "assistant",
+          type: "output_message",
+          content: [
+            {
+              type: "output_text",
+              text: {
+                value: `${reopenedLeaf.contentMarkdown}\n${reopenEnvelope}\n${presentationEnvelope}`,
+              },
+            },
+          ],
         },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
-    );
-    expect(repeatedRebindResponse.status).toBe(200);
-    expect((await repeatedRebindResponse.json()) as any).toMatchObject({
-      observation: {
-        notice: null,
-        interaction: { interactionState: "ready_to_publish" },
+      ],
+      upstreamStatus: "completed",
+    });
+
+    expect(progress.build).toMatchObject({
+      status: "confirming",
+      revision: revision + 1,
+      currentLeafId: reopenedLeaf.id,
+    });
+    expect(state.nodes[2]).toMatchObject({
+      status: "needs_verification",
+      sourceTurnId: turnId,
+      transitionReason: "客户要求重新核验该节点",
+    });
+    expect(state.turns[0]).toMatchObject({
+      status: "completed",
+      completedAt: expect.any(Date),
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "accepted",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-reopen-result"],
+        recovery: { migratedFrom: "legacy_v1" },
       },
     });
-    expect(authoritativeTaskReads).toBe(readsBeforeDurableRebind + 1);
-    expect(packageDownloads).toBe(downloadsBeforeDurableRebind);
-    expect(state.turns).toHaveLength(turnCountBeforeRebind);
-
-    const unauthenticatedPublish = await fetch(
-      `${dashboardListener.baseUrl}/api/dashboard/knowledge/publish`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
-    );
-    expect(unauthenticatedPublish.status).toBe(401);
-
-    const publishResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/dashboard/knowledge/publish`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-test-auth": "user",
-        },
-        body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
-      },
-    );
-    expect(publishResponse.status).toBe(200);
-    const published = (await publishResponse.json()) as any;
-    expect(published.kind).toBe("knowledge");
-    expect(published.snapshot).toMatchObject({
-      sourceBuildId: buildId,
-      sourceBuildRevision: deepRevision,
-      sourceTaskId: TASK_ID,
-      sourceArtifactHash: canonicalRebindArchiveSha256,
-      archiveHash: canonicalRebindArchiveSha256,
-      archiveAvailable: true,
-      imageCount: 1,
-    });
-    expect(state.builds[0]).toMatchObject({
-      status: "published",
-      revision: deepRevision,
-      publishedSnapshotId: published.snapshot.id,
-    });
-    const { isAuthenticatedAdvancedKnowledgePublication } = await import(
-      "./authenticated-knowledge-service"
-    );
-    expect(
-      isAuthenticatedAdvancedKnowledgePublication({
-        snapshot: state.snapshots[0] as any,
-        build: state.builds[0] as any,
-        notBefore: new Date("2026-08-01T00:00:00.000Z"),
-      }),
-    ).toBe(true);
-
-    const { getLatestKnowledgeSnapshot } = await import("./dashboard-service");
-    const viewerSnapshot = await getLatestKnowledgeSnapshot(USER_ID);
-    expect(viewerSnapshot).toMatchObject({
-      id: published.snapshot.id,
-      sourceBuildId: buildId,
-      sourceBuildRevision: deepRevision,
-      archiveHash: canonicalRebindArchiveSha256,
-      archiveAvailable: true,
-    });
-    const viewerLeaves = viewerSnapshot!.documents
-      .filter((document: any) => document.kind === "leaf")
-      .sort((left: any, right: any) => left.order - right.order);
-    expect(viewerLeaves).toHaveLength(deepRevision);
-    expect(
-      viewerLeaves.map((document: any) => ({
-        id: document.id,
-        title: document.title,
-        branchId: document.branchId,
-        branchTitle: document.branchTitle,
-        order: document.order,
-        content: document.content,
-      })),
-    ).toEqual(
-      state.nodes.map((node) => ({
-        id: node.leafId,
-        title: node.title,
-        branchId: node.branchId,
-        branchTitle: node.branchTitle,
-        order: node.ordinal,
-        content: node.contentMarkdown,
-      })),
-    );
-    expect(
-      viewerLeaves.every(
-        (document: any) =>
-          !document.content.includes("FRONTMIND_FORMAL_CONTENT") &&
-          knowledgeBaseMarkdownSha256(document.content) ===
-            state.nodes[document.order]!.contentSha256,
-      ),
-    ).toBe(true);
-    expect(viewerSnapshot!.assets).toEqual([
-      expect.objectContaining({
-        id: "official-logo",
-        sha256: fixture.logoSha256,
-        url: `/api/dashboard/knowledge/assets/${published.snapshot.id}/by-id/official-logo`,
-      }),
-    ]);
-
-    const downloadResponse = await fetch(
-      `${dashboardListener.baseUrl}/api/dashboard/knowledge/snapshots/${published.snapshot.id}/archive`,
-      { headers: { "x-test-auth": "user" } },
-    );
-    expect(downloadResponse.status).toBe(200);
-    expect(downloadResponse.headers.get("cache-control")).toBe(
-      "private, no-store",
-    );
-    const downloaded = Buffer.from(await downloadResponse.arrayBuffer());
-    expect(downloaded).toEqual(canonicalRebindArchive.buffer);
-    expect(createHash("sha256").update(downloaded).digest("hex")).toBe(
-      canonicalRebindArchiveSha256,
-    );
-
-    const { readKnowledgeArchive } = await import("./dashboard-api");
-    const unpacked = await readKnowledgeArchive(
-      downloaded,
-      "frontmind-knowledge-base.zip",
-      "33333333-3333-4333-8333-333333333333",
-      {
-        validationProfile: "dashboard-enterprise-v1",
-        archiveContractVersions: [4],
-      },
-    );
-    expect(unpacked.packageBuildRevision).toBe(deepRevision);
-    expect(unpacked.assets).toEqual([
-      expect.objectContaining({
-        id: "official-logo",
-        sha256: fixture.logoSha256,
-      }),
-    ]);
-    const unpackedLeaves = unpacked.documents
-      .filter((document) => document.kind === "leaf")
-      .sort((left, right) => left.order! - right.order!);
-    expect(
-      unpackedLeaves.map((document) => ({
-        id: document.id,
-        hash: knowledgeBaseMarkdownSha256(document.content),
-      })),
-    ).toEqual(
-      state.nodes.map((node) => ({
-        id: node.leafId,
-        hash: node.contentSha256,
-      })),
-    );
-  }, 120_000);
+  });
 
   it("rebinds, downloads and publishes a real historical Skill-v4/schema-v3 archive without v4 upload evidence", async () => {
     const buildId = "13131313-1313-4131-8131-131313131313";
@@ -2940,7 +1858,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   }, 60_000);
 
-  it("recovers the original final turn when the same settled task appends its ZIP", async () => {
+  it("completes content immediately and builds a local package when the provider ZIP is missing", async () => {
     const finalRevision = 45;
     const priorRevision = finalRevision - 1;
     const buildId = "99999999-9999-4999-8999-999999999999";
@@ -2954,25 +1872,6 @@ describe("knowledge-base production final-package acceptance", () => {
       schemaVersion: 4,
       driftLastPackagedLeaf: true,
     });
-    const sealedArchive = await canonicalizeKnowledgeBaseFinalArchive({
-      buffer: fixture.archive,
-      nodes: fixture.leaves.map((leaf, ordinal) => ({
-        leafId: leaf.id,
-        title: leaf.title,
-        branchId: "products",
-        branchTitle: "产品与服务",
-        ordinal,
-        status: "confirmed",
-        contentMarkdown: leaf.contentMarkdown,
-        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
-      })),
-      buildRevision: finalRevision,
-    });
-    expect(sealedArchive.changed).toBe(true);
-    expect(sealedArchive.buffer.equals(fixture.archive)).toBe(false);
-    const archiveSha256 = createHash("sha256")
-      .update(sealedArchive.buffer)
-      .digest("hex");
     const artifactStore = await import("./knowledge-build-artifact-store");
     const persistedLogo = await artifactStore.persistKnowledgeBuildArtifact({
       userId: USER_ID,
@@ -3077,7 +1976,16 @@ describe("knowledge-base production final-package acceptance", () => {
       requestHash: "5".repeat(64),
       upstreamIdempotencyKeyHash: "6".repeat(64),
       attachmentFileIds: [],
-      metadata: { attachmentsFrozen: true, recovery: {} },
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "sending",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-final-result"],
+        providerRejectionCount: 0,
+        recovery: { outputCursor: 45 },
+      },
       leaseExpiresAt: new Date("2026-08-03T00:05:00.000Z"),
       status: "running",
       upstreamTaskId: taskId,
@@ -3149,194 +2057,455 @@ describe("knowledge-base production final-package acceptance", () => {
     const { reconcileKnowledgeBaseProgress } = await import(
       "./knowledge-base-progress-service"
     );
-    vi.useFakeTimers();
-    try {
-      for (const second of [0, 5, 10]) {
-        vi.setSystemTime(
-          new Date(`2026-08-03T00:00:${String(second).padStart(2, "0")}.000Z`),
-        );
-        const progress = await reconcileKnowledgeBaseProgress({
-          userId: USER_ID,
-          conversationId: PUBLIC_CONVERSATION_ID,
-          taskId,
-          userText: "确认",
-          attachmentCount: 0,
-          output: textOnlyOutput,
-          upstreamStatus: "completed",
-        });
-        expect(progress.build).toMatchObject({
-          status: second === 10 ? "protocol_error" : "confirming",
-          revision: priorRevision,
-          currentLeafId: `1.${finalRevision}`,
-        });
-        expect(progress.summary).toMatchObject({
-          total: finalRevision,
-          handled: priorRevision,
-          confirmed: priorRevision,
-          current: 1,
-          overallPercent: 98,
-        });
-      }
-    } finally {
-      vi.useRealTimers();
-    }
-
-    expect(state.builds[0]).toMatchObject({
-      status: "protocol_error",
-      stateEpoch: 11,
-      revision: priorRevision,
-      currentLeafId: `1.${finalRevision}`,
-      confirmedCount: priorRevision,
-      activeTurnId: turnId,
-      upstreamTaskId: taskId,
-      lastOutputLength: 0,
-      lastOutputItemIds: [],
-      protocolErrorCode: "FINAL_PACKAGE_MISSING",
-      packageRevision: null,
-      packageTaskId: null,
-      packageOutputItemId: null,
-      packageStorageKey: null,
-      packageArchiveSha256: null,
-      packageSizeBytes: null,
+    const completedProgress = await reconcileKnowledgeBaseProgress({
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      taskId,
+      userText: "确认",
+      attachmentCount: 0,
+      output: textOnlyOutput,
+      upstreamStatus: "completed",
     });
-    expect(state.turns).toHaveLength(2);
+    expect(completedProgress.build).toMatchObject({
+      status: "ready_to_publish",
+      revision: finalRevision,
+      currentLeafId: null,
+    });
+    expect(completedProgress.summary).toMatchObject({
+      total: finalRevision,
+      handled: finalRevision,
+      confirmed: finalRevision,
+      current: 0,
+      overallPercent: 100,
+    });
+    expect(completedProgress.packageAllowed).toBe(false);
+    expect(state.builds[0]).toMatchObject({
+      status: "ready_to_publish",
+      revision: finalRevision,
+      currentLeafId: null,
+      confirmedCount: finalRevision,
+      activeTurnId: null,
+      contentCompletedAt: expect.any(Date),
+      packageStatus: "preparing",
+      packageStorageKey: null,
+      protocolError: null,
+      protocolErrorCode: null,
+    });
     expect(state.turns[0]).toMatchObject({
       id: turnId,
       operationKey,
+      status: "completed",
+      errorCode: null,
+      completedAt: expect.any(Date),
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "accepted",
+        operationToken: operationKey,
+        lastSeenEventIds: ["event-final-result"],
+        providerRejectionCount: 0,
+        recovery: { outputCursor: 45 },
+      },
+    });
+    expect(state.nodes.every((node) => node.status === "confirmed")).toBe(true);
+    expect(
+      state.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          message.metadata?.knowledgeBase?.kind === "completion" &&
+          message.metadata?.knowledgeBase?.revision === finalRevision,
+      ),
+    ).toBe(true);
+
+    const { runKnowledgeBasePackageSweep } = await import(
+      "./knowledge-base-local-package"
+    );
+    await expect(runKnowledgeBasePackageSweep(1)).resolves.toEqual({
+      scanned: 1,
+      ready: 1,
+      failed: 0,
+    });
+    expect(state.builds[0]).toMatchObject({
+      status: "ready_to_publish",
+      revision: finalRevision,
+      packageStatus: "ready",
+      packageRevision: finalRevision,
+      packageTaskId: taskId,
+      packageOutputItemId: `dashboard-local:${buildId}:${finalRevision}`,
+      packageStorageKey: expect.any(String),
+      packageArchiveSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      packageSizeBytes: expect.any(Number),
+    });
+    const locallyPackagedProgress = await reconcileKnowledgeBaseProgress({
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      taskId,
+      userText: "确认",
+      attachmentCount: 0,
+      output: textOnlyOutput,
+      upstreamStatus: "completed",
+    });
+    expect(locallyPackagedProgress).toMatchObject({
+      build: { status: "ready_to_publish", revision: finalRevision },
+      summary: { handled: finalRevision, total: finalRevision },
+      packageAllowed: true,
+    });
+  }, 60_000);
+
+  it("recovers a settled legacy task's late ZIP once and keeps the published snapshot immutable", async () => {
+    // Tree policy v1 is the smallest production archive contract (8 leaves).
+    // Keep this fixture compact without reviving the deleted 30/45-leaf flow.
+    const finalRevision = 8;
+    const priorRevision = finalRevision - 1;
+    const buildId = "15151515-1515-4151-8151-151515151515";
+    const turnId = "16161616-1616-4161-8161-161616161616";
+    const taskId = "task-settled-legacy-late-zip";
+    const operationKey = "operation-settled-legacy-late-zip";
+    const fileId = "file-settled-legacy-late-zip";
+    const now = new Date("2026-08-06T00:00:00.000Z");
+    const fixture = await createFinalPackageFixture({
+      leafCount: finalRevision,
+      buildRevision: finalRevision,
+      schemaVersion: 4,
+      driftLastPackagedLeaf: true,
+    });
+    const sealedArchive = await canonicalizeKnowledgeBaseFinalArchive({
+      buffer: fixture.archive,
+      nodes: fixture.leaves.map((leaf, ordinal) => ({
+        leafId: leaf.id,
+        title: leaf.title,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        ordinal,
+        status: "confirmed",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+      })),
+      buildRevision: finalRevision,
+    });
+    expect(sealedArchive.changed).toBe(true);
+    const archiveSha256 = createHash("sha256")
+      .update(sealedArchive.buffer)
+      .digest("hex");
+
+    const artifactStore = await import("./knowledge-build-artifact-store");
+    const persistedLogo = await artifactStore.persistKnowledgeBuildArtifact({
+      userId: USER_ID,
+      buildId,
+      generation: 1,
+      kind: "logo",
+      buffer: fixture.logo,
+      expectedSha256: fixture.logoSha256,
+    });
+    const state = initialState();
+    Object.assign(state.conversations[0]!, {
+      status: "failed",
+      upstreamTaskId: taskId,
+      previousResponseId: taskId,
+      version: 1,
+      completedAt: now,
+      updatedAt: now,
+    });
+    state.builds.push({
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      upstreamTaskId: taskId,
+      providerProtocol: "legacy_v1",
+      canonicalTaskId: null,
+      canonicalTaskGeneration: null,
+      canonicalCredentialId: null,
+      canonicalTaskState: "unbound",
+      canonicalTaskUrl: null,
+      canonicalTaskCreatedAt: null,
+      handoffProvenance: null,
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "4".repeat(64),
+      treePolicyVersion: 1,
+      initialResearchCoverage: null,
+      status: "protocol_error",
+      generation: 1,
+      stateEpoch: 11,
+      activeTurnId: turnId,
+      lastAppliedOperationKey: null,
+      currentPresentationKey: "presentation-settled-legacy-final-leaf",
+      revision: priorRevision,
+      currentLeafId: `1.${finalRevision}`,
+      totalNodeCount: finalRevision,
+      confirmedCount: priorRevision,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      lastTurnUserText: "确认",
+      lastTurnAttachmentCount: 0,
+      awaitingResponseSince: null,
+      packageRevision: null,
+      packageTaskId: null,
+      packageOutputItemId: null,
+      packageFileId: null,
+      packageFilename: null,
+      packageDescriptorHash: null,
+      skillArchiveSha256: null,
+      skillArchiveBytes: null,
+      skillArchiveStorageKey: null,
+      contentCompletedAt: null,
+      packageStatus: "not_started",
+      packageAttemptCount: 0,
+      packageNextRetryAt: null,
+      packageLastErrorCode: "FINAL_PACKAGE_MISSING",
+      logoStorageKey: persistedLogo.storageKey,
+      logoSha256: persistedLogo.sha256,
+      logoBytes: persistedLogo.bytes,
+      logoFilename: "frontmind-logo.png",
+      logoMimeType: "image/png",
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
+      protocolErrorCode: "FINAL_PACKAGE_MISSING",
+      protocolError: "最终知识库 ZIP 尚未随同一已结束任务到达",
+      publishedSnapshotId: null,
+      completedAt: null,
+      publishedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.nodes.push(
+      ...fixture.leaves.map((leaf, ordinal) => ({
+        id: `15151515-1515-4151-8151-${String(ordinal + 1).padStart(12, "0")}`,
+        buildId,
+        leafId: leaf.id,
+        branchId: "products",
+        branchTitle: "产品与服务",
+        title: leaf.title,
+        ordinal,
+        status: ordinal < priorRevision ? "confirmed" : "current",
+        transitionReason:
+          ordinal < priorRevision ? "历史节点已确认" : "等待最终确认结算",
+        contentMarkdown: leaf.contentMarkdown,
+        contentSha256: knowledgeBaseMarkdownSha256(leaf.contentMarkdown),
+        lastUserInput: null,
+        sourceUrls: [],
+        imageUrls: [],
+        lastTaskId: taskId,
+        sourceTurnId: null,
+        presentationKey:
+          ordinal === priorRevision
+            ? "presentation-settled-legacy-final-leaf"
+            : `presentation-settled-legacy-${ordinal + 1}`,
+        lastResponseAt: now,
+        confirmedAt: ordinal < priorRevision ? now : null,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    );
+    state.turns.push({
+      id: turnId,
+      conversationId: STORED_CONVERSATION_ID,
+      userId: USER_ID,
+      apiCredentialId: "credential-e2e",
+      clientRequestId: "request-settled-legacy-late-zip",
+      buildId,
+      buildGeneration: 1,
+      operationKey,
+      operationType: "confirm",
+      expectedRevision: priorRevision,
+      expectedLeafId: `1.${finalRevision}`,
+      requestHash: "5".repeat(64),
+      upstreamIdempotencyKeyHash: "6".repeat(64),
+      attachmentFileIds: [],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        providerProtocol: "legacy_v1",
+        dispatchState: "failed",
+        failureClass: "recoverable_same_turn",
+        recoveryAction: "reconcile",
+        canRegenerate: false,
+        recovery: {
+          protocolFailureObservation: {
+            observationKeyHash: "7".repeat(64),
+            count: 3,
+            firstObservedAt: "2026-08-05T23:59:50.000Z",
+            lastObservedAt: now.toISOString(),
+          },
+        },
+      },
+      leaseExpiresAt: null,
       status: "failed",
       upstreamTaskId: taskId,
       errorCode: "FINAL_PACKAGE_MISSING",
-      leaseExpiresAt: null,
+      errorMessage: "最终知识库 ZIP 尚未随同一已结束任务到达",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
     });
-    expect(
-      state.nodes.filter((node) => node.status === "confirmed"),
-    ).toHaveLength(priorRevision);
-    expect(state.nodes[priorRevision]).toMatchObject({
-      leafId: `1.${finalRevision}`,
-      status: "current",
-    });
+    dependencies.getDb.mockResolvedValue(
+      memoryDatabase(state, { cloneSelectedRows: true }),
+    );
 
-    const outputWithLatePackage = [
+    const progressText = formatKnowledgeBaseProgressEnvelope({
+      kind: "frontmind.knowledge-base.progress",
+      schemaVersion: 2,
+      operationId: operationKey,
+      turnId,
+      revision: priorRevision,
+      transition: {
+        leafId: `1.${finalRevision}`,
+        from: "current",
+        to: "confirmed",
+        reason: "用户明确确认最后节点",
+      },
+    });
+    const presentationText = formatKnowledgeBasePresentationEnvelope({
+      kind: "frontmind.knowledge-base.presentation",
+      schemaVersion: 2,
+      operationId: operationKey,
+      turnId,
+      revision: finalRevision,
+      leafId: null,
+      imageState: "not_applicable",
+      assetIds: [],
+      imageCount: 0,
+    });
+    const finalText = `${progressText}\n${presentationText}`;
+    let providerOutput: unknown[] = [
       {
-        ...textOnlyOutput[0],
+        id: "assistant-settled-legacy-final",
+        role: "assistant",
+        type: "output_message",
+        operationId: operationKey,
+        turnId,
+        taskId,
+        generation: 1,
         content: [
-          finalTextContent,
+          { type: "output_text", text: { value: finalText } },
           {
             type: "output_file",
-            file_id: "file-late-final-package",
+            file_id: fileId,
             file_name: "frontmind-knowledge-base.zip",
             mime_type: "application/zip",
           },
         ],
       },
     ];
+    let providerPackageBytes = fixture.archive;
     let taskReads = 0;
+    let taskCreates = 0;
     let packageDownloads = 0;
     const upstream = express();
+    upstream.use(express.json());
+    upstream.post("/v1/tasks", (_req, res) => {
+      taskCreates += 1;
+      res.status(500).json({ error: { code: "UNEXPECTED_TASK_CREATE" } });
+    });
     upstream.get("/v1/tasks/:taskId", (req, res) => {
       taskReads += 1;
-      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
       expect(req.params.taskId).toBe(taskId);
-      res.json({
-        id: taskId,
-        status: "completed",
-        output: outputWithLatePackage,
-      });
+      expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
+      res.json({ id: taskId, status: "completed", output: providerOutput });
     });
-    upstream.get("/v1/files/file-late-final-package/content", (req, res) => {
+    upstream.get(`/v1/files/${fileId}/content`, (req, res) => {
       packageDownloads += 1;
       expect(req.header("authorization")).toBe("Bearer sk-e2e-only");
       res.setHeader("Content-Type", "application/zip");
-      res.setHeader("Content-Length", String(fixture.archive.length));
+      res.setHeader("Content-Length", String(providerPackageBytes.length));
       res.setHeader(
         "Content-Disposition",
         'attachment; filename="frontmind-knowledge-base.zip"',
       );
-      res.send(fixture.archive);
+      res.send(providerPackageBytes);
     });
     const upstreamListener = await listen(upstream);
     dependencies.upstreamBaseUrl = upstreamListener.baseUrl;
-    dependencies.getCredentialForUpstreamResource.mockResolvedValue({
-      id: "credential-e2e",
-      apiKey: "sk-e2e-only",
-    });
 
     let dashboardListener: Awaited<ReturnType<typeof listen>> | undefined;
     try {
       const { default: knowledgeBaseRouter } = await import(
         "./knowledge-base-api"
       );
+      const { default: artifactRouter } = await import(
+        "./knowledge-base-artifact-api"
+      );
+      const { default: dashboardRouter } = await import("./dashboard-api");
       const { requireExpressAuth } = await import("./_core/express-auth");
       const dashboard = express();
       dashboard.use(express.json());
+      dashboard.use(
+        "/api/knowledge-base/artifacts",
+        requireExpressAuth,
+        artifactRouter,
+      );
       dashboard.use(
         "/api/knowledge-base",
         requireExpressAuth,
         knowledgeBaseRouter,
       );
+      dashboard.use("/api/dashboard", dashboardRouter);
       dashboardListener = await listen(dashboard);
 
-      const failedObservationResponse = await fetch(
-        `${dashboardListener.baseUrl}/api/knowledge-base/progress/${encodeURIComponent(PUBLIC_CONVERSATION_ID)}`,
-        { headers: { "x-test-auth": "user" } },
-      );
-      expect(failedObservationResponse.status).toBe(200);
-      expect((await failedObservationResponse.json()) as any).toMatchObject({
-        observation: {
-          authoritativeTaskId: taskId,
-          activeTurn: { id: turnId, status: "failed" },
-          notice: {
-            code: "FINAL_PACKAGE_MISSING",
-            retryable: true,
-            turnId,
+      const postKnowledgeBase = (pathSuffix: string, body: unknown) =>
+        fetch(`${dashboardListener!.baseUrl}/api/knowledge-base${pathSuffix}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
           },
-          interaction: {
-            interactionState: "failed",
-            progress: {
-              build: {
-                status: "protocol_error",
-                revision: priorRevision,
-                currentLeafId: `1.${finalRevision}`,
-              },
-              summary: {
-                total: finalRevision,
-                handled: priorRevision,
-                confirmed: priorRevision,
-                current: 1,
-                overallPercent: 98,
-              },
+          body: JSON.stringify(body),
+        });
+      const retryResponse = await postKnowledgeBase("/retry", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        clientRequestId: "must-not-create-a-retry-turn",
+        expectedGeneration: 1,
+        expectedRevision: priorRevision,
+        expectedLeafId: `1.${finalRevision}`,
+      });
+      expect({
+        status: retryResponse.status,
+        body: await retryResponse.json(),
+      }).toMatchObject({
+        status: 409,
+        body: {
+          error: { code: "CONFLICT" },
+          observation: {
+            authoritativeTaskId: taskId,
+            notice: {
+              code: "FINAL_PACKAGE_MISSING",
+              recoveryAction: "reconcile",
+              canRegenerate: false,
+              turnId,
             },
           },
-          package: null,
         },
       });
+      expect(state.turns).toHaveLength(1);
+      expect(taskCreates).toBe(0);
+      expect(taskReads).toBe(0);
 
       const reconcile = () =>
-        fetch(
-          `${dashboardListener!.baseUrl}/api/knowledge-base/progress/reconcile`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-test-auth": "user",
-            },
-            body: JSON.stringify({
-              conversationId: PUBLIC_CONVERSATION_ID,
-              taskId,
-            }),
-          },
-        );
+        postKnowledgeBase("/progress/reconcile", {
+          conversationId: PUBLIC_CONVERSATION_ID,
+          taskId,
+        });
       const recoveredResponse = await reconcile();
       expect(recoveredResponse.status).toBe(200);
       const recovered = (await recoveredResponse.json()) as any;
       expect(recovered.observation).toMatchObject({
         authoritativeTaskId: taskId,
         activeTurn: null,
-        approvedPresentation: null,
         notice: null,
+        contentState: "completed",
+        packageState: "ready",
+        publicationState: "draft",
         interaction: {
           interactionState: "ready_to_publish",
-          canReply: false,
           canPublish: true,
           progress: {
             build: {
@@ -3356,14 +2525,15 @@ describe("knowledge-base production final-package acceptance", () => {
         },
         package: {
           revision: finalRevision,
-          fileId: "file-late-final-package",
+          fileId,
           sha256: archiveSha256,
           sizeBytes: sealedArchive.buffer.length,
         },
       });
+      expect(taskCreates).toBe(0);
       expect(taskReads).toBe(1);
       expect(packageDownloads).toBe(1);
-      expect(state.turns).toHaveLength(2);
+      expect(state.turns).toHaveLength(1);
       expect(state.turns[0]).toMatchObject({
         id: turnId,
         operationKey,
@@ -3371,7 +2541,6 @@ describe("knowledge-base production final-package acceptance", () => {
         upstreamTaskId: taskId,
         errorCode: null,
         errorMessage: null,
-        completedAt: expect.any(Date),
       });
       expect(
         state.turns[0]!.metadata?.recovery?.protocolFailureObservation,
@@ -3381,16 +2550,16 @@ describe("knowledge-base production final-package acceptance", () => {
         stateEpoch: 13,
         revision: finalRevision,
         currentLeafId: null,
-        totalNodeCount: finalRevision,
         confirmedCount: finalRevision,
         activeTurnId: null,
         upstreamTaskId: taskId,
+        canonicalTaskId: null,
         lastAppliedOperationKey: operationKey,
+        contentCompletedAt: expect.any(Date),
+        packageStatus: "ready",
         packageRevision: finalRevision,
         packageTaskId: taskId,
-        packageOutputItemId: expect.any(String),
-        packageFileId: "file-late-final-package",
-        packageDescriptorHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        packageFileId: fileId,
         packageStorageKey: expect.any(String),
         packageArchiveSha256: archiveSha256,
         packageSizeBytes: sealedArchive.buffer.length,
@@ -3400,11 +2569,27 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(state.nodes.every((node) => node.status === "confirmed")).toBe(
         true,
       );
-      expect(state.conversations[0]).toMatchObject({
-        status: "completed",
-        upstreamTaskId: taskId,
-        previousResponseId: taskId,
+      const completionReceipt = state.messages.find(
+        (message) => message.metadata?.knowledgeBase?.kind === "completion",
+      );
+      expect(completionReceipt).toMatchObject({
+        role: "assistant",
+        turnId,
+        sequence: expect.any(Number),
+        metadata: {
+          knowledgeBase: {
+            serverOwned: true,
+            buildId,
+            generation: 1,
+            operationKey,
+            revision: finalRevision,
+            leafId: null,
+          },
+        },
       });
+      expect(recovered.observation.displaySequence).toBe(
+        completionReceipt!.sequence,
+      );
       await expect(
         artifactStore.readKnowledgeBuildArtifact({
           userId: USER_ID,
@@ -3418,24 +2603,132 @@ describe("knowledge-base production final-package acceptance", () => {
       ).resolves.toEqual(sealedArchive.buffer);
 
       const stableEpoch = state.builds[0]!.stateEpoch;
-      const repeatedResponse = await reconcile();
-      expect(repeatedResponse.status).toBe(200);
-      expect((await repeatedResponse.json()) as any).toMatchObject({
+      const repeatedReconcile = await reconcile();
+      expect(repeatedReconcile.status).toBe(200);
+      expect((await repeatedReconcile.json()) as any).toMatchObject({
         observation: {
-          notice: null,
-          interaction: {
-            interactionState: "ready_to_publish",
-            progress: {
-              build: { status: "ready_to_publish", revision: finalRevision },
-              summary: { handled: finalRevision, total: finalRevision },
-              packageAllowed: true,
-            },
-          },
+          authoritativeTaskId: taskId,
+          displaySequence: completionReceipt!.sequence,
           package: { sha256: archiveSha256 },
         },
       });
       expect(state.builds[0]!.stateEpoch).toBe(stableEpoch);
-      expect(state.turns).toHaveLength(2);
+      expect(state.turns).toHaveLength(1);
+      expect(taskCreates).toBe(0);
+      expect(taskReads).toBe(1);
+      expect(packageDownloads).toBe(1);
+
+      const publishResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/dashboard/knowledge/publish`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
+        },
+      );
+      expect(publishResponse.status).toBe(200);
+      const published = (await publishResponse.json()) as any;
+      expect(published.snapshot).toMatchObject({
+        sourceBuildId: buildId,
+        sourceBuildRevision: finalRevision,
+        sourceTaskId: taskId,
+        sourceArtifactHash: archiveSha256,
+        archiveHash: archiveSha256,
+        archiveAvailable: true,
+      });
+      expect(state.builds[0]).toMatchObject({
+        status: "published",
+        publishedSnapshotId: published.snapshot.id,
+        packageArchiveSha256: archiveSha256,
+      });
+      expect(state.snapshots).toHaveLength(1);
+      const publishedSnapshotRow = structuredClone(state.snapshots[0]);
+      const publishedReceipt = structuredClone(completionReceipt);
+
+      const downloadPublishedArchive = () =>
+        fetch(
+          `${dashboardListener!.baseUrl}/api/dashboard/knowledge/snapshots/${published.snapshot.id}/archive`,
+          { headers: { "x-test-auth": "user" } },
+        );
+      const firstDownload = await downloadPublishedArchive();
+      expect(firstDownload.status).toBe(200);
+      expect(Buffer.from(await firstDownload.arrayBuffer())).toEqual(
+        sealedArchive.buffer,
+      );
+
+      // Simulate a provider mutating both output and bytes behind the same
+      // settled task/file IDs after publication. Published projection and
+      // download authority must remain entirely Dashboard-owned.
+      providerOutput = [
+        {
+          id: "assistant-settled-legacy-final",
+          role: "assistant",
+          type: "output_message",
+          content: [
+            {
+              type: "output_text",
+              text: { value: "late untrusted replacement output" },
+            },
+            {
+              type: "output_file",
+              file_id: fileId,
+              file_name: "frontmind-knowledge-base.zip",
+              mime_type: "application/zip",
+            },
+          ],
+        },
+      ];
+      providerPackageBytes = Buffer.from("late untrusted replacement bytes");
+
+      const immutableReconcile = await reconcile();
+      expect(immutableReconcile.status).toBe(200);
+      expect((await immutableReconcile.json()) as any).toMatchObject({
+        observation: {
+          displaySequence: completionReceipt!.sequence,
+          contentState: "completed",
+          packageState: "ready",
+          publicationState: "published",
+          package: { sha256: archiveSha256 },
+        },
+      });
+      const repeatedPublish = await fetch(
+        `${dashboardListener.baseUrl}/api/dashboard/knowledge/publish`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
+        },
+      );
+      expect(repeatedPublish.status).toBe(200);
+      expect((await repeatedPublish.json()) as any).toMatchObject({
+        idempotent: true,
+        snapshot: { id: published.snapshot.id, archiveHash: archiveSha256 },
+      });
+      const secondDownload = await downloadPublishedArchive();
+      expect(secondDownload.status).toBe(200);
+      expect(Buffer.from(await secondDownload.arrayBuffer())).toEqual(
+        sealedArchive.buffer,
+      );
+      expect(state.snapshots).toHaveLength(1);
+      expect(state.snapshots[0]).toStrictEqual(publishedSnapshotRow);
+      expect(
+        state.messages.find(
+          (message) => message.metadata?.knowledgeBase?.kind === "completion",
+        ),
+      ).toStrictEqual(publishedReceipt);
+      expect(state.builds[0]).toMatchObject({
+        status: "published",
+        publishedSnapshotId: published.snapshot.id,
+        packageArchiveSha256: archiveSha256,
+        packageSizeBytes: sealedArchive.buffer.length,
+      });
+      expect(taskCreates).toBe(0);
       expect(taskReads).toBe(1);
       expect(packageDownloads).toBe(1);
     } finally {
@@ -4910,6 +4203,25 @@ describe("knowledge-base production final-package acceptance", () => {
       expect(mismatchedStartResponse.status).toBe(409);
       expect((await mismatchedStartResponse.json()) as any).toMatchObject({
         error: { code: "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH" },
+        reservationCreated: false,
+      });
+      expect(dependencies.assertKnowledgeBaseWritable).not.toHaveBeenCalled();
+      expect(
+        dependencies.getCredentialForUpstreamResource,
+      ).not.toHaveBeenCalled();
+      assertFrozen();
+
+      const freshClientRequestResponse = await postJson("/start", {
+        conversationId: PUBLIC_CONVERSATION_ID,
+        clientRequestId: "fresh-legacy-client-request",
+        companyName: recovery.companyName,
+        companyWebsite: recovery.companyWebsite,
+        operatorNotes: recovery.operatorNotes,
+        attachments: recovery.attachments,
+      });
+      expect(freshClientRequestResponse.status).toBe(410);
+      expect((await freshClientRequestResponse.json()) as any).toMatchObject({
+        error: { code: "KNOWLEDGE_BASE_START_RESERVATION_REQUIRED" },
         reservationCreated: false,
       });
       expect(dependencies.assertKnowledgeBaseWritable).not.toHaveBeenCalled();

@@ -314,6 +314,7 @@ export function shouldBindKnowledgeBaseInitialLogo(
 }
 
 export function knowledgeBaseBuildRequiresOfficialLogo(build: {
+  providerProtocol?: string | null;
   skillVersion: string;
   status: string;
   revision: number;
@@ -324,6 +325,7 @@ export function knowledgeBaseBuildRequiresOfficialLogo(build: {
   logoSha256: string | null;
 }) {
   return (
+    build.providerProtocol !== "manus_v2" &&
     build.skillVersion === "4" &&
     build.status === "confirming" &&
     build.revision === 0 &&

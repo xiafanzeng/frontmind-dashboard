@@ -46,7 +46,9 @@ import {
   discardManagedUploadIntent,
   discardUnboundUpload,
   getModelDisplayName,
+  reserveKnowledgeBaseStart,
   sanitizeBrandText,
+  stageKnowledgeBaseTurnAttachment,
   uploadFile,
   type FileUploadRecordEvent,
   type ManagedUploadHandle,
@@ -87,10 +89,13 @@ import {
 } from "@/lib/knowledge-progress";
 import KnowledgeBaseLogoProvenanceRepair from "./KnowledgeBaseLogoProvenanceRepair";
 import KnowledgeBaseAttachmentRepair from "./KnowledgeBaseAttachmentRepair";
+import KnowledgeBaseManagedUploadRecovery from "./KnowledgeBaseManagedUploadRecovery";
 import {
   assertChatAttachmentSizes,
   chatAttachmentSizeError,
   normalizedKnowledgeBaseUploadFilename,
+  normalizedKnowledgeBaseUploadMimeType,
+  sha256UploadFile,
 } from "@/lib/attachment-files";
 import { isAttachmentExpired } from "@/lib/attachment-expiry";
 import { knowledgeBaseObservationAcknowledgesClientRequest } from "@/lib/knowledge-base-coordinator";
@@ -372,6 +377,13 @@ export type KnowledgeBaseStarterLifecycle = {
   dashboardReceivedBytes?: ReadonlyMap<string, number>;
   /** Stable row identities aligned with the `files` payload array. */
   fileItemIds?: readonly string[];
+  /** Durable start coordinate created before the first browser upload. */
+  reservation?: {
+    conversationId: string;
+    turnId: string;
+    clientRequestId: string;
+  };
+  attachmentManifest?: import("@/lib/frontmind-api").KnowledgeBaseAttachmentManifestItem[];
   startPrepared: boolean;
   onStartPrepared: (prepared: boolean) => void;
   onBatchPhase: (phase: KnowledgeBaseStarterBatchPhase) => void;
@@ -456,6 +468,14 @@ export async function uploadKnowledgeBaseStarterFiles(
           batchOrdinal: fileIndex + 1,
           batchTotal: files.length,
           itemId,
+          ...(lifecycle.reservation
+            ? {
+                resumeScope: {
+                  kind: "knowledge_base" as const,
+                  ...lifecycle.reservation,
+                },
+              }
+            : {}),
           signal: lifecycle.signal,
           ...(existingUploadHandle
             ? { existingUploadHandle }
@@ -599,6 +619,18 @@ export async function uploadKnowledgeBaseStarterFiles(
       }
     }
 
+    if (lifecycle.reservation && lifecycle.attachmentManifest) {
+      await stageKnowledgeBaseTurnAttachment({
+        ...lifecycle.reservation,
+        attachmentManifest: lifecycle.attachmentManifest,
+        index: fileIndex,
+        attachment: {
+          file_id: receipt.fileId,
+          filename: receipt.filename,
+        },
+      });
+    }
+
     uploadedAttachments.push({
       file_id: receipt.fileId,
       filename: receipt.filename,
@@ -676,6 +708,7 @@ export async function fetchKnowledgeBaseStartRequest(
     signal: AbortSignal;
     timeoutMs?: number;
     fetchImplementation?: typeof fetch;
+    endpoint?: string;
   },
 ) {
   if (options.signal.aborted) {
@@ -698,10 +731,13 @@ export async function fetchKnowledgeBaseStartRequest(
 
   try {
     return await Promise.race([
-      (options.fetchImplementation ?? fetch)("/api/knowledge-base/start", {
-        ...init,
-        signal: controller.signal,
-      }),
+      (options.fetchImplementation ?? fetch)(
+        options.endpoint ?? "/api/knowledge-base/start/reserve",
+        {
+          ...init,
+          signal: controller.signal,
+        },
+      ),
       timeout,
     ]);
   } catch (error) {
@@ -985,8 +1021,6 @@ export default function ChatArea({
         throw new Error("当前知识库会话不可用，请刷新后重试");
       }
 
-      const selectedAgentProfile = "frontmind-pro";
-
       const conversationId = activeConversation.id;
       const responseStartedAt = lifecycle.startedAt;
       const clientRequestId = lifecycle.clientRequestId;
@@ -995,16 +1029,48 @@ export default function ChatArea({
 
       try {
         assertChatAttachmentSizes(files);
-        const { uploadedAttachments, messageAttachments } =
-          await uploadKnowledgeBaseStarterFiles(
-            files,
-            lifecycle,
-            responseStartedAt,
-          );
+        const itemIds = files.map(
+          (_file, index) =>
+            lifecycle.fileItemIds?.[index] || `${clientRequestId}:${index + 1}`,
+        );
+        const attachmentManifest = await Promise.all(
+          files.map(async (file, index) => ({
+            itemId: itemIds[index],
+            ordinal: index + 1,
+            total: files.length,
+            filename: normalizedKnowledgeBaseUploadFilename(file.name),
+            sizeBytes: file.size,
+            mimeType: normalizedKnowledgeBaseUploadMimeType(file),
+            lastModified: Math.max(0, Number(file.lastModified || 0)),
+            sha256: await sha256UploadFile(file),
+          })),
+        );
+        requestDispatched = true;
+        const reserved = await reserveKnowledgeBaseStart({
+          conversationId,
+          clientRequestId,
+          companyName,
+          companyWebsite,
+          operatorNotes,
+          attachmentManifest,
+        });
+        const reservation = {
+          conversationId,
+          turnId: reserved.reservation.turnId,
+          clientRequestId,
+        };
+        const { messageAttachments } = await uploadKnowledgeBaseStarterFiles(
+          files,
+          {
+            ...lifecycle,
+            reservation,
+            attachmentManifest,
+          },
+          responseStartedAt,
+        );
         preparedMessageAttachments = messageAttachments;
         lifecycle.onBatchPhase("starting");
 
-        requestDispatched = true;
         const response = await fetchKnowledgeBaseStartRequest(
           {
             method: "POST",
@@ -1015,15 +1081,13 @@ export default function ChatArea({
             body: JSON.stringify({
               conversationId,
               clientRequestId,
-              companyName,
-              companyWebsite,
-              operatorNotes,
-              agentProfile: selectedAgentProfile,
-              attachments: uploadedAttachments,
+              turnId: reservation.turnId,
+              attachmentManifest,
             }),
           },
           {
             signal: lifecycle.signal,
+            endpoint: "/api/knowledge-base/turn/dispatch",
           },
         );
 
@@ -1035,22 +1099,11 @@ export default function ChatArea({
         const observation = data.observation
           ? knowledgeBaseObservationFromPayload(data)
           : undefined;
-        const observationAcknowledged =
-          knowledgeBaseObservationAcknowledgesClientRequest(
-            observation,
-            clientRequestId,
-          );
-        if (
-          data.reservationCreated === false ||
-          (data.reservationCreated !== true && !observationAcknowledged)
-        ) {
-          const contractError = new Error(
-            "启动响应未确认当前知识库任务已受理",
-          ) as KnowledgeBaseStartRequestError;
-          contractError.code = "KNOWLEDGE_BASE_START_UNACKNOWLEDGED";
-          contractError.reservationCreated = false;
-          throw contractError;
-        }
+        // `/start/reserve` already supplied the durable acknowledgement. The
+        // dispatch endpoint need not echo the legacy reservationCreated flag
+        // or a provider task id; its 2xx only releases the existing turn.
+        const acceptedObservation =
+          observation ?? reserved.knowledgeObservation;
 
         projectKnowledgeBaseStarterRequest({
           lifecycle,
@@ -1063,8 +1116,8 @@ export default function ChatArea({
         });
 
         const taskStartedAt = data.startedAt || responseStartedAt;
-        if (observation) {
-          commitKnowledgeBaseObservation(conversationId, observation);
+        if (acceptedObservation) {
+          commitKnowledgeBaseObservation(conversationId, acceptedObservation);
         } else {
           // Compatibility while the server fleet rolls forward. Never project
           // data.task.output for KB; the coordinator will obtain the approved
@@ -1406,6 +1459,25 @@ export default function ChatArea({
               />
             ))}
           </AnimatePresence>
+
+          {syncKnowledgeBaseSnapshot &&
+            activeConversation.knowledgeBase?.notice?.code ===
+              KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE &&
+            activeConversation.knowledgeBase.notice.turnId && (
+              <KnowledgeBaseManagedUploadRecovery
+                conversationId={activeConversation.id}
+                turnId={activeConversation.knowledgeBase.notice.turnId}
+                onObservation={(observation) => {
+                  commitKnowledgeBaseObservation(
+                    activeConversation.id,
+                    observation,
+                  );
+                }}
+                onRecovered={() => {
+                  wakeKnowledgeBaseConversation(activeConversation.id);
+                }}
+              />
+            )}
 
           {syncKnowledgeBaseSnapshot &&
             activeConversation.knowledgeBase?.notice &&

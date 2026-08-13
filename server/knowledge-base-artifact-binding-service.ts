@@ -2315,6 +2315,10 @@ export async function bindKnowledgeBaseFinalPackage(input: {
       packageStorageKey: persisted.storageKey,
       packageArchiveSha256: persisted.sha256,
       packageSizeBytes: persisted.bytes,
+      packageStatus: "ready",
+      packageAttemptCount: Math.max(1, build.packageAttemptCount),
+      packageNextRetryAt: null,
+      packageLastErrorCode: null,
       ...(persistedLogo && recoveredLogo
         ? {
             logoStorageKey: persistedLogo.storageKey,
@@ -2773,6 +2777,10 @@ export async function bindKnowledgeBaseReadyPackage(input: {
       packageStorageKey: persisted.storageKey,
       packageArchiveSha256: persisted.sha256,
       packageSizeBytes: persisted.bytes,
+      packageStatus: "ready",
+      packageAttemptCount: Math.max(1, build.packageAttemptCount),
+      packageNextRetryAt: null,
+      packageLastErrorCode: null,
       ...(persistedLogo && recoveredLogo
         ? {
             logoStorageKey: persistedLogo.storageKey,

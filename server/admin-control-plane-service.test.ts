@@ -11,6 +11,7 @@ import {
   hasSystemAdminAccess,
   sanitizeAuditMetadata,
   workspaceAuditEventsForActor,
+  writeSystemMaintenanceWorkspaceAuditEvent,
 } from "./admin-control-plane-service";
 
 function admin(overrides: Partial<AuthenticatedUser> = {}): AuthenticatedUser {
@@ -94,6 +95,39 @@ describe("administrator access levels", () => {
 });
 
 describe("workspace audit metadata", () => {
+  it("records signed-image maintenance without impersonating an administrator", async () => {
+    const inserted: Array<Record<string, unknown>> = [];
+    const executor = {
+      insert: () => ({
+        values: async (event: Record<string, unknown>) => inserted.push(event),
+      }),
+    };
+    const event = await writeSystemMaintenanceWorkspaceAuditEvent(
+      {
+        action: "knowledge_base.incident_repair_applied",
+        targetType: "knowledge_base_repair",
+        targetId: "kb-repair:proof",
+        workspaceUserId: 7,
+        reasonCode: "authorized_incident_recovery",
+        metadata: { operationToken: "must-not-persist", outcome: "applied" },
+      },
+      executor,
+    );
+
+    expect(event).toMatchObject({
+      actorUserId: null,
+      actorUsername: "signed-image-maintenance",
+      actorAccessLevel: null,
+      reason: "authorized_incident_recovery",
+      metadata: {
+        operationToken: "[REDACTED]",
+        outcome: "applied",
+        executionChannel: "signed_image_maintenance",
+      },
+    });
+    expect(inserted).toEqual([event]);
+  });
+
   it("redacts credentials recursively while retaining safe evidence", () => {
     const metadata = sanitizeAuditMetadata({
       fingerprint: "fp_1234",

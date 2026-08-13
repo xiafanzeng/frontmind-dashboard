@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createDeliveryProjectContextMiddleware,
   createFrontMindProxyAccessMiddleware,
   enforceFrontMindProxyAccess,
   ordinaryUserMayUseFrontMindProxy,
   ordinaryUserProxyWriteRequiresActiveService,
+  rejectDeliveryMemberKnowledgeBaseProjectScope,
 } from "./_core/frontmind-proxy-policy";
 import type { FrontMindRequest } from "./_core/express-auth";
 import type { AuthenticatedUser } from "./auth-service";
@@ -241,4 +243,117 @@ describe("ordinary-user FrontMind proxy policy", () => {
       }),
     });
   });
+});
+
+describe("knowledge-base delivery project boundary", () => {
+  it.each([
+    ["/api/knowledge-base/start/reserve"],
+    ["/api/knowledge-base/artifacts/build-1/package"],
+  ])(
+    "validates %s project context before returning the stable unsupported code",
+    async (originalUrl) => {
+      const assertProjectContext = vi.fn(async () => ({
+        projectAssignmentId: "assignment-1",
+        customerUserId: 42,
+        roleType: "ai_operations_engineer" as const,
+        customerName: "示例客户",
+      }));
+      const projectMiddleware = createDeliveryProjectContextMiddleware({
+        assertProjectContext,
+      });
+      const req = {
+        method: "POST",
+        originalUrl,
+        frontmindUser: actor("delivery_member"),
+        headers: { "x-delivery-project-assignment-id": "assignment-1" },
+      } as FrontMindRequest;
+      const res = response();
+      const downstream = vi.fn();
+
+      await projectMiddleware(req, res as never, () =>
+        rejectDeliveryMemberKnowledgeBaseProjectScope(
+          req,
+          res as never,
+          downstream,
+        ),
+      );
+
+      expect(assertProjectContext).toHaveBeenCalledOnce();
+      expect(downstream).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith({
+        error: expect.objectContaining({
+          code: "KNOWLEDGE_BASE_PROJECT_SCOPE_UNSUPPORTED",
+        }),
+      });
+    },
+  );
+
+  it("rejects a missing delivery project before the unsupported-scope fence", async () => {
+    const assertProjectContext = vi.fn();
+    const middleware = createDeliveryProjectContextMiddleware({
+      assertProjectContext,
+    });
+    const req = {
+      method: "POST",
+      originalUrl: "/api/knowledge-base/start/reserve",
+      frontmindUser: actor("delivery_member"),
+      headers: {},
+    } as FrontMindRequest;
+    const res = response();
+    const next = vi.fn();
+
+    await middleware(req, res as never, next);
+
+    expect(assertProjectContext).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: expect.objectContaining({
+        code: "DELIVERY_PROJECT_CONTEXT_REQUIRED",
+      }),
+    });
+  });
+
+  it("rejects a forged delivery project before the unsupported-scope fence", async () => {
+    const middleware = createDeliveryProjectContextMiddleware({
+      assertProjectContext: vi.fn(async () => {
+        throw new Error("not assigned");
+      }),
+    });
+    const req = {
+      method: "GET",
+      originalUrl: "/api/knowledge-base/artifacts/build-1/package",
+      frontmindUser: actor("delivery_member"),
+      headers: { "x-delivery-project-assignment-id": "assignment-forged" },
+    } as FrontMindRequest;
+    const res = response();
+    const next = vi.fn();
+
+    await middleware(req, res as never, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({
+      error: expect.objectContaining({
+        code: "DELIVERY_PROJECT_CONTEXT_FORBIDDEN",
+      }),
+    });
+  });
+
+  it.each(["user", "admin"] as const)(
+    "keeps the %s knowledge-base route unchanged",
+    (role) => {
+      const req = {
+        frontmindUser: actor(role),
+      } as FrontMindRequest;
+      const res = response();
+      const next = vi.fn();
+
+      rejectDeliveryMemberKnowledgeBaseProjectScope(req, res as never, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      expect(res.status).not.toHaveBeenCalled();
+    },
+  );
 });

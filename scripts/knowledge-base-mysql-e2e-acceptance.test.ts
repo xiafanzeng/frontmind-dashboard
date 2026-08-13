@@ -68,6 +68,7 @@ const dependencies = vi.hoisted(() => ({
   assertKnowledgeBaseWritable: vi.fn(),
   createKnowledgeMonitoringHandoff: vi.fn(),
   getCredentialForUpstreamResource: vi.fn(),
+  getDecryptedCredentialForKnowledgeBaseUploadReservation: vi.fn(),
   recordUpstreamResource: vi.fn(),
   upstreamBaseUrl: "",
   userId: 0,
@@ -158,6 +159,8 @@ vi.mock("../server/auth-service", async (importOriginal) => {
     ...actual,
     getCredentialForUpstreamResource:
       dependencies.getCredentialForUpstreamResource,
+    getDecryptedCredentialForKnowledgeBaseUploadReservation:
+      dependencies.getDecryptedCredentialForKnowledgeBaseUploadReservation,
     recordUpstreamResource: dependencies.recordUpstreamResource,
   };
 });
@@ -606,6 +609,7 @@ mysqlDescribe(
     const previousRolloutPercent = process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
     const previousTreePolicyWriter =
       process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
+    const previousManusV2Writer = process.env.FRONTMIND_KB_MANUS_V2_WRITER;
     const previousAxiosAdapter = axios.defaults.adapter;
     const stagedImportAssets = new Map<string, string>();
 
@@ -883,12 +887,18 @@ mysqlDescribe(
       dependencies.getCredentialForUpstreamResource.mockResolvedValue(
         decryptedCredential,
       );
+      dependencies.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockResolvedValue(
+        decryptedCredential,
+      );
       dependencies.recordUpstreamResource.mockResolvedValue(undefined);
 
       assetRoot = await mkdtemp(path.join(tmpdir(), "frontmind-kb-mysql-e2e-"));
       process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
       process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = "100";
       process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = "false";
+      // This fixture deliberately preserves legacy transport coverage. The
+      // separate v2 acceptance owns the create-once/send-many contract.
+      process.env.FRONTMIND_KB_MANUS_V2_WRITER = "false";
       axios.defaults.adapter = "http";
     }, 300_000);
 
@@ -988,6 +998,11 @@ mysqlDescribe(
       } else {
         process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER =
           previousTreePolicyWriter;
+      }
+      if (previousManusV2Writer === undefined) {
+        delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
+      } else {
+        process.env.FRONTMIND_KB_MANUS_V2_WRITER = previousManusV2Writer;
       }
       if (cleanupError) throw cleanupError;
       if (acceptancePassed) {
@@ -1332,7 +1347,7 @@ mysqlDescribe(
       dashboardServer = dashboardListener.server;
 
       const postKnowledgeBase = async (
-        pathname: "/start" | "/turn",
+        pathname: "/start/reserve" | "/turn/dispatch" | "/turn",
         body: Record<string, unknown>,
       ) => {
         const requestBody = JSON.stringify(body);
@@ -1385,7 +1400,15 @@ mysqlDescribe(
             } else {
               expect(payload.reservation.upstreamTaskId).toBeNull();
             }
-          } else if (response.status !== 200) {
+          } else if (
+            response.status !== 200 &&
+            !(
+              pathname === "/start/reserve" &&
+              response.status === 201 &&
+              payload.accepted === true &&
+              payload.reservation?.state === "awaiting_attachments"
+            )
+          ) {
             throw new Error(
               `${pathname} returned ${response.status}: ${JSON.stringify(payload)}`,
             );
@@ -1394,6 +1417,12 @@ mysqlDescribe(
         };
 
         let { response, payload } = await send();
+        // Reservation is intentionally a pure Dashboard commit. A 201 receipt
+        // is complete even though its observation is still "executing"; only
+        // the following explicit dispatch owns Provider progress polling.
+        if (pathname === "/start/reserve" && response.status === 201) {
+          return payload;
+        }
         const projectionPending = () =>
           response.status === 202 ||
           payload.task?.status === "running" ||
@@ -1478,8 +1507,22 @@ mysqlDescribe(
         clientRequestId: `request-initial-${runId}`,
         companyName: "FrontMind超前智能",
         companyWebsite: "https://www.frontmind.net/",
+        attachmentManifest: [],
       };
-      const initial = await postKnowledgeBase("/start", startRequest);
+      const reservedStart = await postKnowledgeBase(
+        "/start/reserve",
+        startRequest,
+      );
+      expect(reservedStart.reservation).toMatchObject({
+        turnId: expect.any(String),
+        requiresUpload: false,
+      });
+      const initial = await postKnowledgeBase("/turn/dispatch", {
+        conversationId: publicConversationId,
+        turnId: reservedStart.reservation.turnId,
+        clientRequestId: startRequest.clientRequestId,
+        attachmentManifest: [],
+      });
       const build = (
         await executor
           .select()
@@ -1591,8 +1634,16 @@ mysqlDescribe(
       expect(startTurn.attachmentFileIds).toHaveLength(2);
       const startPostCount = operationTaskPosts.get(startTurn.operationKey!);
       const uploadCountAfterStart = uploadedFileSequence;
-      const repeatedStart = await postKnowledgeBase("/start", startRequest);
-      expect(repeatedStart).toMatchObject({ idempotent: true, resumed: true });
+      const repeatedStart = await postKnowledgeBase("/turn/dispatch", {
+        conversationId: publicConversationId,
+        turnId: reservedStart.reservation.turnId,
+        clientRequestId: startRequest.clientRequestId,
+        attachmentManifest: [],
+      });
+      // A repeated explicit dispatch is an idempotent receipt replay. The
+      // `resumed` hint is reserved for recovery endpoints and is not part of
+      // the dispatch replay contract.
+      expect(repeatedStart).toMatchObject({ idempotent: true });
       expect(operationTaskPosts.get(startTurn.operationKey!)).toBe(
         startPostCount,
       );
@@ -1640,7 +1691,11 @@ mysqlDescribe(
         if (isFinal) {
           expect(result.observation).toMatchObject({
             authoritativeTaskId: finalTaskId,
-            approvedPresentation: null,
+            approvedPresentation: {
+              revision: FINAL_REVISION - 1,
+              leafId: leaf.id,
+              visibleMarkdown: leaf.contentMarkdown,
+            },
             notice: null,
             interaction: {
               interactionState: "ready_to_publish",
@@ -1730,15 +1785,17 @@ mysqlDescribe(
       // Every operation projects the provider's create-task response directly.
       // Later focus/online reconcile calls are immutable local reads.
       expect(authoritativeTaskReads).toBe(0);
-      // The Skill is build-scoped and reused once. Every operation gets one
-      // operation-bound server input file; the last uses finalization ZIP.
-      expect(uploadedFileSequence).toBe(FINAL_REVISION + 2);
-      expect(uploadedFileBytes.size).toBe(FINAL_REVISION + 2);
+      // The Skill bytes are build-pinned, but every operation gets a freshly
+      // verified short-lived provider file capability. Each operation also
+      // gets one operation-bound server input file; the last uses the
+      // finalization ZIP.
+      expect(uploadedFileSequence).toBe((FINAL_REVISION + 1) * 2);
+      expect(uploadedFileBytes.size).toBe((FINAL_REVISION + 1) * 2);
       expect(
         [...uploadedFileNames.values()].filter(
           (filename) => filename === "socratic-kb-builder.skill.zip",
         ),
-      ).toHaveLength(1);
+      ).toHaveLength(FINAL_REVISION + 1);
       expect(
         [...uploadedFileNames.values()].filter(
           (filename) => filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
@@ -1754,8 +1811,8 @@ mysqlDescribe(
           (await executor.select().from(conversationTurns))
             .flatMap((turn) => turn.attachmentFileIds || [])
             .filter((fileId) => /^uploaded-skill-/u.test(fileId)),
-        ),
-      ).toEqual(new Set(["uploaded-skill-1"]));
+        ).size,
+      ).toBe(FINAL_REVISION + 1);
       expect(operationTaskPosts.size).toBe(FINAL_REVISION + 1);
       expect([...operationTaskPosts.values()]).toEqual(
         Array(FINAL_REVISION + 1).fill(1),
@@ -1770,10 +1827,10 @@ mysqlDescribe(
         [userId],
       );
       expect(Number(resourceLedgerRows[0]?.resourceCount || 0)).toBe(
-        FINAL_REVISION + 2,
+        (FINAL_REVISION + 1) * 2,
       );
       expect(Number(resourceLedgerRows[0]?.fileResourceCount || 0)).toBe(
-        FINAL_REVISION + 2,
+        (FINAL_REVISION + 1) * 2,
       );
       expect(Number(resourceLedgerRows[0]?.credentialCount || 0)).toBe(1);
 

@@ -68,9 +68,12 @@ import {
   MANAGED_UPLOAD_CREATE_UNKNOWN_WAIT_MS,
   managedUploadProviderPutDeadlineMs,
   managedUploadIntentStorageRoot,
+  listManagedUploadIntentsByResumeScope,
   openManagedUploadIntentTicket,
   parseManagedUploadSignedUrlExpiry,
+  proveKnowledgeBaseManagedUploadForStage,
   processManagedUploadIntent,
+  readKnowledgeBaseManagedUploadIntentByOperation,
   readManagedUploadIntent,
   receiveManagedUploadIntentBody,
   stopManagedUploadIntentWorkerForTests,
@@ -165,6 +168,62 @@ async function finalizeIntentForDelete(fileId: string) {
   return sealed;
 }
 
+async function finalizeKnowledgeBaseIntentForStage(input: {
+  fileId: string;
+  content: Buffer;
+  sha256: string;
+}) {
+  const create = {
+    ...createInput(input.content.length),
+    operationId: "kb-stage-batch:1",
+    batchId: "kb-stage-batch",
+    resumeScope: {
+      kind: "knowledge_base" as const,
+      conversationId: "kb-stage-conversation",
+      turnId: "00000000-0000-4000-8000-000000000055",
+      clientRequestId: "kb-stage-client-request",
+    },
+  };
+  const manifest = await createManagedUploadIntent(create);
+  const { ticket } = createManagedUploadIntentTicket(manifest);
+  const request = Readable.from([input.content]) as Readable & {
+    complete: boolean;
+  };
+  request.complete = true;
+  await receiveManagedUploadIntentBody({
+    intentId: manifest.intentId,
+    ticket,
+    userId: 42,
+    projectAssignmentId: null,
+    contentLength: input.content.length,
+    request,
+  });
+  mocks.axiosPost.mockResolvedValue({
+    status: 201,
+    data: {
+      id: input.fileId,
+      filename: "document.pdf",
+      status: "pending",
+      upload_url: `https://storage.example.com/${input.fileId}`,
+      upload_expires_at: Date.now() + 180_000,
+    },
+  });
+  mocks.axiosPut.mockImplementation(consumeSuccessfulPut);
+  mocks.readiness.mockResolvedValue({
+    fileId: input.fileId,
+    filename: "document.pdf",
+    state: "uploaded",
+    status: "uploaded",
+    checkedAt: Date.now(),
+  });
+  await processManagedUploadIntent({
+    intentId: manifest.intentId,
+    userId: 42,
+    traceId: `trace-${input.fileId}`,
+  });
+  return { create, manifest, sha256: input.sha256 };
+}
+
 describe("stage-first managed upload intents", () => {
   let assetDirectory: string;
 
@@ -229,6 +288,183 @@ describe("stage-first managed upload intents", () => {
     expect(managedUploadIntentStorageRoot()).toContain(
       "managed-upload-intents",
     );
+  });
+
+  it("discovers a knowledge-base upload on another session and reissues its ticket", async () => {
+    const first = await createManagedUploadIntent({
+      ...createInput(),
+      resumeScope: {
+        kind: "knowledge_base",
+        conversationId: "conversation-cross-device",
+        turnId: "00000000-0000-4000-8000-000000000042",
+        clientRequestId: "client-request-cross-device",
+      },
+    });
+    const originalTicket = createManagedUploadIntentTicket(first, {
+      now: 1_000,
+    });
+    const discovered = await listManagedUploadIntentsByResumeScope({
+      userId: 42,
+      projectAssignmentId: null,
+      conversationId: "conversation-cross-device",
+      turnId: "00000000-0000-4000-8000-000000000042",
+    });
+
+    expect(first.schemaVersion).toBe(2);
+    expect(discovered).toHaveLength(1);
+    expect(discovered[0]).toMatchObject({
+      intentId: first.intentId,
+      ordinal: 1,
+      total: 1,
+      state: "awaiting_browser",
+      clientRequestId: "client-request-cross-device",
+      intentTicket: expect.stringMatching(/^mi1\./u),
+    });
+    expect(discovered[0]!.ticketExpiresAt).toBeGreaterThan(
+      originalTicket.expiresAt,
+    );
+
+    await expect(
+      listManagedUploadIntentsByResumeScope({
+        userId: 43,
+        projectAssignmentId: null,
+        conversationId: "conversation-cross-device",
+        turnId: "00000000-0000-4000-8000-000000000042",
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      code: "UPLOAD_INTENT_FORBIDDEN",
+    });
+
+    await expect(
+      listManagedUploadIntentsByResumeScope({
+        userId: 42,
+        projectAssignmentId: "00000000-0000-4000-8000-000000000099",
+        conversationId: "conversation-cross-device",
+        turnId: "00000000-0000-4000-8000-000000000042",
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      code: "UPLOAD_INTENT_FORBIDDEN",
+    });
+  });
+
+  it("proves an uploaded KB operation through the exact index and rehashes retained EOF bytes", async () => {
+    const content = Buffer.from("knowledge-base-stage-proof");
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    const uploaded = await finalizeKnowledgeBaseIntentForStage({
+      fileId: "provider-kb-stage-proof",
+      content,
+      sha256,
+    });
+
+    await expect(
+      readKnowledgeBaseManagedUploadIntentByOperation({
+        userId: 42,
+        projectAssignmentId: null,
+        operationId: uploaded.create.operationId,
+      }),
+    ).resolves.toMatchObject({
+      intentId: uploaded.manifest.intentId,
+      state: "uploaded",
+      schemaVersion: 2,
+    });
+
+    const proof = await proveKnowledgeBaseManagedUploadForStage({
+      userId: 42,
+      projectAssignmentId: null,
+      conversationId: uploaded.create.resumeScope.conversationId,
+      turnId: uploaded.create.resumeScope.turnId,
+      clientRequestId: uploaded.create.resumeScope.clientRequestId,
+      credential: { id: "credential-1", userId: 42, version: 3 },
+      manifestItem: {
+        itemId: uploaded.create.operationId,
+        filename: uploaded.create.filename,
+        mimeType: uploaded.create.mimeType,
+        sizeBytes: content.length,
+        sha256,
+        ordinal: 1,
+        total: 1,
+      },
+      index: 0,
+      total: 1,
+      fileId: "provider-kb-stage-proof",
+    });
+    expect(proof).toMatchObject({
+      intentId: uploaded.manifest.intentId,
+      operationId: uploaded.create.operationId,
+      fileId: "provider-kb-stage-proof",
+      filename: "document.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: content.length,
+      sha256,
+      storageDescriptor: {
+        kind: "presales_file",
+        fileId: "provider-kb-stage-proof",
+        sizeBytes: content.length,
+        sha256,
+      },
+    });
+    expect(proof.bytes).toEqual(content);
+
+    const retainedContentPath = path.join(
+      assetDirectory,
+      "presales-files",
+      `${createHash("sha256")
+        .update("provider-kb-stage-proof")
+        .digest("hex")}.content`,
+    );
+    await fs.writeFile(
+      retainedContentPath,
+      Buffer.concat([content.subarray(0, -1), Buffer.from("x")]),
+    );
+    await expect(
+      proveKnowledgeBaseManagedUploadForStage({
+        userId: 42,
+        projectAssignmentId: null,
+        conversationId: uploaded.create.resumeScope.conversationId,
+        turnId: uploaded.create.resumeScope.turnId,
+        clientRequestId: uploaded.create.resumeScope.clientRequestId,
+        credential: { id: "credential-1", userId: 42, version: 3 },
+        manifestItem: {
+          itemId: uploaded.create.operationId,
+          filename: uploaded.create.filename,
+          mimeType: uploaded.create.mimeType,
+          sizeBytes: content.length,
+          sha256,
+          ordinal: 1,
+          total: 1,
+        },
+        index: 0,
+        total: 1,
+        fileId: "provider-kb-stage-proof",
+      }),
+    ).rejects.toMatchObject({
+      code: "UPLOAD_STAGE_RETAINED_BYTES_MISMATCH",
+    });
+
+    await expect(
+      proveKnowledgeBaseManagedUploadForStage({
+        userId: 42,
+        projectAssignmentId: null,
+        conversationId: uploaded.create.resumeScope.conversationId,
+        turnId: uploaded.create.resumeScope.turnId,
+        clientRequestId: uploaded.create.resumeScope.clientRequestId,
+        credential: { id: "credential-1", userId: 42, version: 3 },
+        manifestItem: {
+          itemId: uploaded.create.operationId,
+          filename: uploaded.create.filename,
+          mimeType: uploaded.create.mimeType,
+          sizeBytes: content.length,
+          sha256: "0".repeat(64),
+          ordinal: 1,
+          total: 1,
+        },
+        index: 0,
+        total: 1,
+        fileId: "provider-kb-stage-proof",
+      }),
+    ).rejects.toMatchObject({ code: "UPLOAD_STAGE_PROOF_MISMATCH" });
   });
 
   it("parses the six SigV4 UTC fields exactly and bounds PUT before expiry", () => {

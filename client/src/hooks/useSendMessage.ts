@@ -11,7 +11,9 @@ import {
   createTask,
   createResponseLogicTask,
   createKnowledgeBaseTurnTask,
+  reserveKnowledgeBaseTurnWithAttachments,
   retrieveTask,
+  stageKnowledgeBaseTurnAttachment,
   uploadFile,
   fileToBase64,
   creditEventBus,
@@ -604,6 +606,15 @@ export function useSendMessage() {
           });
         }
 
+        const reservingKnowledgeBaseAttachmentTurn = Boolean(
+          options?.syncKnowledgeBaseSnapshot &&
+            options.submissionKind !== "logo" &&
+            preparedUploads.files.length > 0 &&
+            !resumingLegacyKnowledgeBaseAttachmentTurn,
+        );
+        const knowledgeBaseUploadBatchId = reservingKnowledgeBaseAttachmentTurn
+          ? knowledgeBaseClientRequestId
+          : undefined;
         let knowledgeBaseAttachmentManifest:
           | KnowledgeBaseAttachmentManifestItem[]
           | undefined;
@@ -617,12 +628,19 @@ export function useSendMessage() {
             // by the Dashboard during the same proxy upload, so the server can
             // compare this manifest without a timed remote read-back window.
             knowledgeBaseAttachmentManifest = await Promise.all(
-              preparedUploads.files.map(async ({ file }) => ({
+              preparedUploads.files.map(async ({ file }, index) => ({
                 filename: normalizedKnowledgeBaseUploadFilename(file.name),
                 sizeBytes: file.size,
                 mimeType: normalizedKnowledgeBaseUploadMimeType(file),
                 lastModified: Math.max(0, Number(file.lastModified || 0)),
                 sha256: await sha256UploadFile(file),
+                ...(knowledgeBaseUploadBatchId
+                  ? {
+                      itemId: `${knowledgeBaseUploadBatchId}:${index + 1}`,
+                      ordinal: index + 1,
+                      total: preparedUploads.files.length,
+                    }
+                  : {}),
               })),
             );
           } catch (error) {
@@ -631,6 +649,64 @@ export function useSendMessage() {
                 error instanceof Error
                   ? error.message
                   : "请重新选择文件后重试。",
+            });
+            return false;
+          }
+        }
+
+        let knowledgeBaseAttachmentReservation:
+          | {
+              turnId: string;
+              attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+            }
+          | undefined;
+        if (
+          reservingKnowledgeBaseAttachmentTurn &&
+          knowledgeBaseAttachmentManifest
+        ) {
+          try {
+            const reserved = await reserveKnowledgeBaseTurnWithAttachments(
+              [
+                {
+                  role: "user",
+                  // Freeze the pre-upload prompt. Later input_file additions
+                  // belong only to the local pending bubble and dispatch log.
+                  content: [...contentItems],
+                },
+              ],
+              {
+                conversationId: convId,
+                clientRequestId: knowledgeBaseClientRequestId!,
+                expectedGeneration: options!.knowledgeBaseExpectedGeneration!,
+                expectedRevision: options!.knowledgeBaseExpectedRevision!,
+                expectedLeafId: options!.knowledgeBaseExpectedLeafId!,
+                expectedPresentationKey:
+                  options?.knowledgeBaseExpectedPresentationKey,
+                attachmentManifest: knowledgeBaseAttachmentManifest,
+              },
+            );
+            knowledgeBaseAttachmentReservation = {
+              turnId: reserved.reservation.turnId,
+              attachmentManifest: knowledgeBaseAttachmentManifest,
+            };
+            if (reserved.knowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                reserved.knowledgeObservation,
+              );
+            }
+          } catch (reservationError: any) {
+            if (reservationError?.knowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                reservationError.knowledgeObservation,
+              );
+              wakeKnowledgeBaseConversation(convId);
+            }
+            toast.error("本轮附件预约失败", {
+              description: sanitizeBrandText(
+                reservationError?.message || "请同步知识库状态后重试。",
+              ),
             });
             return false;
           }
@@ -712,6 +788,22 @@ export function useSendMessage() {
                 ...(options?.syncKnowledgeBaseSnapshot
                   ? {
                       captureFilename: knowledgeBaseFilename!,
+                      ...(knowledgeBaseAttachmentReservation &&
+                      knowledgeBaseUploadBatchId
+                        ? {
+                            batchId: knowledgeBaseUploadBatchId,
+                            batchOrdinal: i + 1,
+                            batchTotal: totalFiles,
+                            itemId:
+                              knowledgeBaseAttachmentManifest?.[i]?.itemId,
+                            resumeScope: {
+                              kind: "knowledge_base" as const,
+                              conversationId: convId,
+                              turnId: knowledgeBaseAttachmentReservation.turnId,
+                              clientRequestId: knowledgeBaseClientRequestId!,
+                            },
+                          }
+                        : {}),
                     }
                   : {}),
               },
@@ -721,6 +813,23 @@ export function useSendMessage() {
               filename: result.filename,
               fileId: result.fileId,
             });
+
+            if (
+              knowledgeBaseAttachmentReservation &&
+              knowledgeBaseAttachmentManifest
+            ) {
+              await stageKnowledgeBaseTurnAttachment({
+                conversationId: convId,
+                turnId: knowledgeBaseAttachmentReservation.turnId,
+                clientRequestId: knowledgeBaseClientRequestId!,
+                attachmentManifest: knowledgeBaseAttachmentManifest,
+                index: i,
+                attachment: {
+                  file_id: result.fileId,
+                  filename: knowledgeBaseFilename!,
+                },
+              });
+            }
 
             contentItems.push({
               type: "input_file",
@@ -761,6 +870,10 @@ export function useSendMessage() {
                 convId,
                 uploadErr.knowledgeObservation,
               );
+              wakeKnowledgeBaseConversation(convId);
+            } else if (knowledgeBaseAttachmentReservation) {
+              // The server-owned reservation remains recoverable even though
+              // this browser could not finish its current upload or stage.
               wakeKnowledgeBaseConversation(convId);
             }
             toast.error(`文件 "${file.name}" 上传失败`, {
@@ -879,18 +992,23 @@ export function useSendMessage() {
               expectedPresentationKey:
                 options?.knowledgeBaseExpectedPresentationKey,
               submissionKind: options?.submissionKind ?? "message",
-              ...(knowledgeBaseAttachmentManifest
+              ...(knowledgeBaseAttachmentReservation
                 ? {
-                    attachmentManifest: knowledgeBaseAttachmentManifest,
-                    ...(resumingLegacyKnowledgeBaseAttachmentTurn
-                      ? {
-                          legacyAttachmentTakeover: {
-                            attachmentManifest: knowledgeBaseAttachmentManifest,
-                          },
-                        }
-                      : {}),
+                    attachmentReservation: knowledgeBaseAttachmentReservation,
                   }
-                : {}),
+                : knowledgeBaseAttachmentManifest
+                  ? {
+                      attachmentManifest: knowledgeBaseAttachmentManifest,
+                      ...(resumingLegacyKnowledgeBaseAttachmentTurn
+                        ? {
+                            legacyAttachmentTakeover: {
+                              attachmentManifest:
+                                knowledgeBaseAttachmentManifest,
+                            },
+                          }
+                        : {}),
+                    }
+                  : {}),
             });
             if (!waitForAcknowledgedLogoTask) {
               wakeKnowledgeBaseConversation(convId);

@@ -23,6 +23,15 @@ import {
   knowledgeBaseObservationFromPayload,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
+import {
+  DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+  deliveryProjectHeaders,
+} from "@/lib/delivery-project";
+
+export {
+  DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+  deliveryProjectHeaders,
+} from "@/lib/delivery-project";
 
 /**
  * Model display mapping: public model id -> display name.
@@ -52,23 +61,6 @@ const DEFAULT_CONFIG = {
 const DEVICE_PREFERENCES_STORAGE_KEY = "frontmind-client-preferences";
 
 export const CREATE_TASK_TIMEOUT_MS = 300_000;
-export const DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY =
-  "frontmind.delivery.projectAssignmentId";
-
-export function deliveryProjectHeaders(
-  headers: Record<string, string> = {},
-): Record<string, string> {
-  const projectAssignmentId = sessionStorage
-    .getItem(DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY)
-    ?.trim();
-  return {
-    ...headers,
-    ...(projectAssignmentId
-      ? { "x-delivery-project-assignment-id": projectAssignmentId }
-      : {}),
-  };
-}
-
 function normalizePublicAgentProfile(value: string | undefined): string {
   if (value === "frontmind-lite") return "frontmind-lite";
   if (value === "frontmind-base") return "frontmind-base";
@@ -397,6 +389,13 @@ export type UploadFileOptions = {
   batchTotal?: number;
   /** Stable dialog item identity. It is not a provider file id. */
   itemId?: string;
+  /** Durable server-side coordinate used to rediscover this upload elsewhere. */
+  resumeScope?: {
+    kind: "knowledge_base";
+    conversationId: string;
+    turnId: string;
+    clientRequestId: string;
+  };
   signal?: AbortSignal;
   /** Reuses an already-created provider file after an unknown client outcome. */
   existingFileId?: string;
@@ -794,6 +793,9 @@ export interface KnowledgeBaseAttachmentManifestItem {
   mimeType: string;
   lastModified: number;
   sha256: string;
+  itemId?: string;
+  ordinal?: number;
+  total?: number;
 }
 
 export interface KnowledgeBaseAttachmentTurnReservation {
@@ -823,6 +825,38 @@ export type KnowledgeBaseRequestError = Error & {
 
 const KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS = 4;
 const KNOWLEDGE_BASE_REQUEST_MAX_RETRY_DELAY_MS = 10_000;
+
+export async function reserveKnowledgeBaseStart(input: {
+  conversationId: string;
+  clientRequestId: string;
+  companyName: string;
+  companyWebsite?: string;
+  operatorNotes?: string;
+  attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+}) {
+  const response = await fetch("/api/knowledge-base/start/reserve", {
+    method: "POST",
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    throw await knowledgeBaseRequestError(
+      response,
+      `启动预约失败（${response.status}）`,
+    );
+  }
+  const payload = await response.json();
+  if (!payload?.reservation?.turnId || !payload.reservation.clientRequestId) {
+    throw new Error("启动预约失败：服务端未返回逻辑轮次");
+  }
+  return {
+    reservation: payload.reservation as KnowledgeBaseAttachmentTurnReservation,
+    knowledgeObservation: payload?.observation
+      ? knowledgeBaseObservationFromPayload(payload)
+      : undefined,
+  };
+}
 
 function isTransientKnowledgeBaseRequestError(error: unknown) {
   const status = Number((error as { status?: unknown })?.status || 0);
@@ -925,7 +959,7 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
 }> {
   const response = await fetch("/api/knowledge-base/turn/reserve", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     credentials: "include",
     body: JSON.stringify({
       conversationId: context.conversationId,
@@ -977,7 +1011,9 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
         "/api/knowledge-base/turn/attachments/stage",
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: deliveryProjectHeaders({
+            "Content-Type": "application/json",
+          }),
           credentials: "include",
           body: requestBody,
         },
@@ -1096,7 +1132,9 @@ export async function createKnowledgeBaseTurnTask(
       try {
         response = await fetch(endpoint, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: deliveryProjectHeaders({
+            "Content-Type": "application/json",
+          }),
           credentials: "include",
           signal: controller.signal,
           body: requestBody,
@@ -1286,6 +1324,7 @@ async function createManagedIntent(
       filename: options.captureFilename || file.name,
       mimeType: file.type || "application/octet-stream",
       sizeBytes: file.size,
+      ...(options.resumeScope ? { resumeScope: options.resumeScope } : {}),
     }),
   });
   if (!response.ok) {
@@ -1345,6 +1384,308 @@ async function createManagedIntent(
   };
 }
 
+export type ManagedUploadDiscoveryItem = {
+  intentId: string;
+  intentTicket: string;
+  ticketExpiresAt: number;
+  batchId: string;
+  ordinal: number;
+  total: number;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  state: string;
+  phase?: string | null;
+  receipt?: UploadRetentionReceipt | null;
+  clientRequestId: string;
+};
+
+export type ManagedUploadDiscovery = {
+  uploads: ManagedUploadDiscoveryItem[];
+  reservation: {
+    clientRequestId: string;
+    attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+    stagedAttachmentCount: number;
+  };
+};
+
+const MANAGED_UPLOAD_DISCOVERY_STATES = new Set([
+  "awaiting_browser",
+  "receiving",
+  "sealed",
+  "processing",
+  "uploaded",
+  "cleanup_pending",
+  "cancelled",
+  "expired",
+  "failed",
+]);
+
+const MANAGED_UPLOAD_DISCOVERY_PHASES = new Set([
+  "receiving",
+  "sealed",
+  "creating_provider",
+  "uploading_provider",
+  "waiting_provider",
+  "finalizing",
+  "cleanup_pending",
+]);
+
+function invalidManagedUploadDiscovery(): never {
+  throw new Error("Dashboard 上传恢复预约响应无效");
+}
+
+function parseManagedUploadDiscoveryManifest(
+  input: unknown,
+): KnowledgeBaseAttachmentManifestItem[] {
+  if (!Array.isArray(input) || input.length < 1) {
+    return invalidManagedUploadDiscovery();
+  }
+  return input.map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return invalidManagedUploadDiscovery();
+    }
+    const value = raw as Record<string, unknown>;
+    const filename = typeof value.filename === "string" ? value.filename : "";
+    const mimeType = typeof value.mimeType === "string" ? value.mimeType : "";
+    const sha256 = typeof value.sha256 === "string" ? value.sha256 : "";
+    const sizeBytes = value.sizeBytes;
+    const lastModified = value.lastModified;
+    const itemId = value.itemId;
+    const hasItemCoordinate = itemId !== undefined;
+    if (
+      !filename ||
+      filename !== filename.trim() ||
+      !mimeType ||
+      mimeType !== mimeType.trim() ||
+      typeof sizeBytes !== "number" ||
+      !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 0 ||
+      typeof lastModified !== "number" ||
+      !Number.isSafeInteger(lastModified) ||
+      lastModified < 0 ||
+      !/^[a-f0-9]{64}$/u.test(sha256) ||
+      (hasItemCoordinate &&
+        (typeof itemId !== "string" ||
+          !itemId ||
+          itemId !== itemId.trim() ||
+          value.ordinal !== index + 1 ||
+          value.total !== input.length))
+    ) {
+      return invalidManagedUploadDiscovery();
+    }
+    return {
+      filename,
+      mimeType,
+      sizeBytes,
+      lastModified,
+      sha256,
+      ...(hasItemCoordinate
+        ? { itemId: itemId as string, ordinal: index + 1, total: input.length }
+        : {}),
+    };
+  });
+}
+
+function parseManagedUploadDiscoveryReceipt(
+  input: unknown,
+  expectedSizeBytes: number,
+): UploadRetentionReceipt {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return invalidManagedUploadDiscovery();
+  }
+  const value = input as Record<string, unknown>;
+  const fileId = typeof value.fileId === "string" ? value.fileId : "";
+  const traceId =
+    typeof value.traceId === "string" && value.traceId.trim()
+      ? value.traceId.trim()
+      : undefined;
+  const recovered =
+    typeof value.recovered === "boolean" ? value.recovered : value.recreated;
+  if (
+    !fileId ||
+    fileId !== fileId.trim() ||
+    value.sizeBytes !== expectedSizeBytes ||
+    typeof value.uploadedAt !== "number" ||
+    !Number.isFinite(value.uploadedAt) ||
+    typeof value.providerReadyAt !== "number" ||
+    !Number.isFinite(value.providerReadyAt) ||
+    typeof value.expiresAt !== "number" ||
+    !Number.isFinite(value.expiresAt) ||
+    value.expiresAt <= value.uploadedAt ||
+    typeof value.replayed !== "boolean" ||
+    typeof recovered !== "boolean" ||
+    (value.recreated !== undefined && typeof value.recreated !== "boolean")
+  ) {
+    return invalidManagedUploadDiscovery();
+  }
+  return {
+    fileId,
+    sizeBytes: expectedSizeBytes,
+    uploadedAt: value.uploadedAt,
+    providerReadyAt: value.providerReadyAt,
+    expiresAt: value.expiresAt,
+    replayed: value.replayed,
+    recovered,
+    ...(typeof value.recreated === "boolean"
+      ? { recreated: value.recreated }
+      : {}),
+    ...(traceId ? { traceId } : {}),
+  };
+}
+
+function parseManagedUploadDiscoveryPayload(input: {
+  uploads?: unknown;
+  reservation?: unknown;
+}): ManagedUploadDiscovery {
+  const reservation =
+    input.reservation &&
+    typeof input.reservation === "object" &&
+    !Array.isArray(input.reservation)
+      ? (input.reservation as Record<string, unknown>)
+      : null;
+  if (
+    !reservation ||
+    typeof reservation.clientRequestId !== "string" ||
+    !reservation.clientRequestId ||
+    reservation.clientRequestId !== reservation.clientRequestId.trim() ||
+    typeof reservation.stagedAttachmentCount !== "number" ||
+    !Number.isSafeInteger(reservation.stagedAttachmentCount) ||
+    reservation.stagedAttachmentCount < 0 ||
+    !Array.isArray(input.uploads)
+  ) {
+    return invalidManagedUploadDiscovery();
+  }
+  const attachmentManifest = parseManagedUploadDiscoveryManifest(
+    reservation.attachmentManifest,
+  );
+  if (reservation.stagedAttachmentCount > attachmentManifest.length) {
+    return invalidManagedUploadDiscovery();
+  }
+  const clientRequestId = reservation.clientRequestId;
+
+  const ordinals = new Set<number>();
+  const intentIds = new Set<string>();
+  const tickets = new Set<string>();
+  let frozenBatchId: string | null = null;
+  const uploads = input.uploads.map((raw): ManagedUploadDiscoveryItem => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return invalidManagedUploadDiscovery();
+    }
+    const value = raw as Record<string, unknown>;
+    const intentId = typeof value.intentId === "string" ? value.intentId : "";
+    const intentTicket =
+      typeof value.intentTicket === "string" ? value.intentTicket : "";
+    const batchId = typeof value.batchId === "string" ? value.batchId : "";
+    const ordinal = value.ordinal;
+    const item =
+      typeof ordinal === "number" && Number.isSafeInteger(ordinal)
+        ? attachmentManifest[ordinal - 1]
+        : undefined;
+    const state = typeof value.state === "string" ? value.state : "";
+    const phase = value.phase;
+    if (
+      !intentId ||
+      intentId !== intentId.trim() ||
+      intentIds.has(intentId) ||
+      !intentTicket ||
+      intentTicket !== intentTicket.trim() ||
+      tickets.has(intentTicket) ||
+      typeof value.ticketExpiresAt !== "number" ||
+      !Number.isFinite(value.ticketExpiresAt) ||
+      value.ticketExpiresAt <= 0 ||
+      !batchId ||
+      batchId !== batchId.trim() ||
+      (frozenBatchId !== null && batchId !== frozenBatchId) ||
+      !item ||
+      ordinals.has(ordinal as number) ||
+      value.total !== attachmentManifest.length ||
+      value.filename !== item.filename ||
+      value.mimeType !== item.mimeType ||
+      value.sizeBytes !== item.sizeBytes ||
+      value.clientRequestId !== clientRequestId ||
+      !MANAGED_UPLOAD_DISCOVERY_STATES.has(state) ||
+      !(
+        phase === null ||
+        phase === undefined ||
+        (typeof phase === "string" &&
+          MANAGED_UPLOAD_DISCOVERY_PHASES.has(phase))
+      ) ||
+      (state === "uploaded" && value.receipt == null) ||
+      (state !== "uploaded" &&
+        value.receipt != null &&
+        !(state === "processing" && phase === "finalizing"))
+    ) {
+      return invalidManagedUploadDiscovery();
+    }
+    frozenBatchId ??= batchId;
+    intentIds.add(intentId);
+    tickets.add(intentTicket);
+    ordinals.add(ordinal as number);
+    return {
+      intentId,
+      intentTicket,
+      ticketExpiresAt: value.ticketExpiresAt,
+      batchId,
+      ordinal: ordinal as number,
+      total: attachmentManifest.length,
+      filename: item.filename,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+      state,
+      phase: phase == null ? null : (phase as string),
+      receipt:
+        value.receipt != null
+          ? parseManagedUploadDiscoveryReceipt(value.receipt, item.sizeBytes)
+          : null,
+      clientRequestId,
+    };
+  });
+  if (uploads.length > attachmentManifest.length) {
+    return invalidManagedUploadDiscovery();
+  }
+  return {
+    uploads,
+    reservation: {
+      clientRequestId,
+      attachmentManifest,
+      stagedAttachmentCount: reservation.stagedAttachmentCount,
+    },
+  };
+}
+
+/** Rediscover server-owned upload state after a page/device/session change. */
+export async function listManagedUploadsForKnowledgeBase(input: {
+  conversationId: string;
+  turnId: string;
+  signal?: AbortSignal;
+}): Promise<ManagedUploadDiscovery> {
+  const query = new URLSearchParams({
+    conversationId: input.conversationId,
+    turnId: input.turnId,
+  });
+  const response = await fetch(
+    `/api/frontmind/v1/managed-uploads?${query.toString()}`,
+    {
+      method: "GET",
+      headers: deliveryProjectHeaders(),
+      credentials: "include",
+      signal: input.signal,
+    },
+  );
+  if (!response.ok) {
+    throw await managedUploadResponseError(
+      response,
+      "无法恢复 Dashboard 上传记录，请稍后重试",
+    );
+  }
+  const payload = (await response.json()) as {
+    uploads?: unknown;
+    reservation?: unknown;
+  };
+  return parseManagedUploadDiscoveryPayload(payload);
+}
+
 function managedUploadHandleIdentity(handle: ManagedUploadHandle) {
   return handle.intentId || handle.fileId || handle.itemId || "";
 }
@@ -1384,10 +1725,12 @@ function managedIntentPhaseProvesLocalSeal(
   return Boolean(phase && phase !== "receiving");
 }
 
+type ManagedUploadFileIdentity = Pick<File, "name" | "size" | "type">;
+
 function parseManagedIntentStatus(
   input: unknown,
   handle: ManagedUploadHandle,
-  file: File,
+  file: ManagedUploadFileIdentity,
 ): ManagedUploadRecovery {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new FileUploadError("本地上传状态响应无效", {
@@ -1498,7 +1841,7 @@ function parseManagedIntentStatus(
 
 async function recoverManagedIntent(
   handle: ManagedUploadHandle,
-  file: File,
+  file: ManagedUploadFileIdentity,
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ) {
   const controller = new AbortController();
@@ -1532,6 +1875,33 @@ async function recoverManagedIntent(
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", abort);
   }
+}
+
+/**
+ * Reconciles a server-discovered upload without constructing or reading a
+ * browser File. Only an explicit needs_browser_body result may ask the user
+ * to select bytes again.
+ */
+export async function recoverDiscoveredManagedUpload(
+  upload: ManagedUploadDiscoveryItem,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+) {
+  return recoverManagedIntent(
+    {
+      intentId: upload.intentId,
+      itemId: upload.batchId,
+      filename: upload.filename,
+      ticket: upload.intentTicket,
+      expiresAt: upload.ticketExpiresAt,
+      operationId: upload.batchId,
+    },
+    {
+      name: upload.filename,
+      size: upload.sizeBytes,
+      type: upload.mimeType,
+    },
+    options,
+  );
 }
 
 function managedUploadHandleFromRecord(

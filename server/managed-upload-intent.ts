@@ -24,6 +24,7 @@ import {
 import { markUploadedFileRetention } from "./file-content-retention";
 import {
   installStoredPresalesFileFromPath,
+  readStoredPresalesFile,
   removeStoredPresalesFile,
 } from "./presales-file-store";
 import { getUpstreamBaseUrl } from "./upstream-config";
@@ -117,14 +118,22 @@ export type ManagedUploadIntentReceipt = {
   traceId: string;
 };
 
+export type ManagedUploadResumeScope = {
+  kind: "knowledge_base";
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+};
+
 export type ManagedUploadIntentManifest = {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   intentId: string;
   operationId: string;
   requestHash: string;
   batchId: string;
   ordinal: number;
   total: number;
+  resumeScope: ManagedUploadResumeScope | null;
   userId: number;
   projectAssignmentId: string | null;
   credentialId: string;
@@ -222,6 +231,7 @@ type CreateManagedUploadIntentInput = {
   credentialId: string;
   credentialOwnerUserId: number;
   credentialVersion: number;
+  resumeScope?: ManagedUploadResumeScope | null;
 };
 
 type ProviderCreateResult = {
@@ -277,6 +287,27 @@ function operationIndexPath(input: {
   return path.join(
     managedUploadIntentStorageRoot(),
     "by-operation",
+    `${key}.json`,
+  );
+}
+
+function resumeScopeIndexPath(input: {
+  userId: number;
+  projectAssignmentId: string | null;
+  resumeScope: ManagedUploadResumeScope;
+}) {
+  const key = storageKey(
+    JSON.stringify([
+      input.userId,
+      input.projectAssignmentId,
+      input.resumeScope.kind,
+      input.resumeScope.conversationId,
+      input.resumeScope.turnId,
+    ]),
+  );
+  return path.join(
+    managedUploadIntentStorageRoot(),
+    "by-resume-scope",
     `${key}.json`,
   );
 }
@@ -343,7 +374,16 @@ function assertManifest(value: unknown, expectedIntentId?: string) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("MANAGED_UPLOAD_INTENT_MANIFEST_INVALID");
   }
-  const manifest = value as Partial<ManagedUploadIntentManifest>;
+  const rawManifest = value as Partial<ManagedUploadIntentManifest>;
+  // Schema 1 predates cross-device discovery. Normalize it in memory while
+  // preserving its on-disk version so old durable intents remain readable.
+  const manifest = {
+    ...rawManifest,
+    ...(rawManifest.schemaVersion === 1 &&
+    !Object.prototype.hasOwnProperty.call(rawManifest, "resumeScope")
+      ? { resumeScope: null }
+      : {}),
+  } as Partial<ManagedUploadIntentManifest>;
   const manifestKeys = [
     "batchId",
     "completedAt",
@@ -366,6 +406,7 @@ function assertManifest(value: unknown, expectedIntentId?: string) {
     "providerGeneration",
     "receipt",
     "requestHash",
+    "resumeScope",
     "revision",
     "safeErrorCode",
     "schemaVersion",
@@ -505,7 +546,7 @@ function assertManifest(value: unknown, expectedIntentId?: string) {
       typeof manifest.receipt.recreated === "boolean");
   if (
     Object.keys(manifest).sort().join("\0") !== manifestKeys.join("\0") ||
-    manifest.schemaVersion !== 1 ||
+    ![1, 2].includes(Number(manifest.schemaVersion)) ||
     !validIdentifier(manifest.intentId) ||
     (expectedIntentId !== undefined &&
       manifest.intentId !== expectedIntentId) ||
@@ -516,6 +557,14 @@ function assertManifest(value: unknown, expectedIntentId?: string) {
     !Number.isSafeInteger(manifest.userId) ||
     manifest.userId < 1 ||
     !validIdentifier(manifest.batchId) ||
+    !(
+      manifest.resumeScope === null ||
+      (manifest.schemaVersion === 2 &&
+        manifest.resumeScope?.kind === "knowledge_base" &&
+        validIdentifier(manifest.resumeScope.conversationId, 191) &&
+        validIdentifier(manifest.resumeScope.turnId, 36) &&
+        validIdentifier(manifest.resumeScope.clientRequestId, 191))
+    ) ||
     !Number.isSafeInteger(manifest.ordinal) ||
     !Number.isSafeInteger(manifest.total) ||
     Number(manifest.ordinal) < 1 ||
@@ -731,6 +780,7 @@ function requestHash(input: CreateManagedUploadIntentInput) {
         sizeBytes: input.sizeBytes,
         userId: input.userId,
         projectAssignmentId: input.projectAssignmentId ?? null,
+        resumeScope: input.resumeScope ?? null,
       }),
       "utf8",
     )
@@ -939,7 +989,15 @@ function validateCreateInput(input: CreateManagedUploadIntentInput) {
     !validIdentifier(input.credentialId) ||
     !Number.isSafeInteger(input.credentialOwnerUserId) ||
     input.credentialOwnerUserId < 1 ||
-    !Number.isSafeInteger(input.credentialVersion)
+    !Number.isSafeInteger(input.credentialVersion) ||
+    !(
+      input.resumeScope === undefined ||
+      input.resumeScope === null ||
+      (input.resumeScope.kind === "knowledge_base" &&
+        validIdentifier(input.resumeScope.conversationId, 191) &&
+        validIdentifier(input.resumeScope.turnId, 36) &&
+        validIdentifier(input.resumeScope.clientRequestId, 191))
+    )
   ) {
     throw new ManagedUploadIntentError(
       400,
@@ -1014,6 +1072,7 @@ async function findManagedUploadIntentsByOperation(input: {
     if (
       !entry.isDirectory() ||
       entry.name === "by-operation" ||
+      entry.name === "by-resume-scope" ||
       entry.name === "deletion-fences"
     ) {
       continue;
@@ -1156,6 +1215,9 @@ async function createManagedUploadIntentUnderOperationLock(
         intentId: unindexed[0].intentId,
         requestHash: hash,
       });
+      if (unindexed[0].resumeScope) {
+        await appendManagedUploadResumeScopeIndex(unindexed[0]);
+      }
       return unindexed[0];
     }
     // Only a genuinely new allocation needs current credential/deletion
@@ -1180,13 +1242,14 @@ async function createManagedUploadIntentUnderOperationLock(
       const timestamp = nowIso();
       const intentId = `mui_${randomUUID()}`;
       const manifest: ManagedUploadIntentManifest = {
-        schemaVersion: 1,
+        schemaVersion: input.resumeScope ? 2 : 1,
         intentId,
         operationId: input.operationId,
         requestHash: hash,
         batchId: input.batchId,
         ordinal: input.ordinal,
         total: input.total,
+        resumeScope: input.resumeScope ?? null,
         userId: input.userId,
         projectAssignmentId,
         credentialId: input.credentialId,
@@ -1219,6 +1282,9 @@ async function createManagedUploadIntentUnderOperationLock(
         intentId,
         requestHash: hash,
       });
+      if (manifest.resumeScope) {
+        await appendManagedUploadResumeScopeIndex(manifest);
+      }
       return manifest;
     } finally {
       await releaseScopes();
@@ -1228,11 +1294,471 @@ async function createManagedUploadIntentUnderOperationLock(
   }
 }
 
+async function appendManagedUploadResumeScopeIndex(
+  manifest: ManagedUploadIntentManifest,
+) {
+  if (!manifest.resumeScope) return;
+  const resumeIndex = resumeScopeIndexPath({
+    userId: manifest.userId,
+    projectAssignmentId: manifest.projectAssignmentId,
+    resumeScope: manifest.resumeScope,
+  });
+  const lock = `${resumeIndex}.lock`;
+  const release = await acquireOwnedFilesystemLock(
+    lock,
+    MANAGED_UPLOAD_OPERATION_LOCK_STALE_MS,
+    40,
+  );
+  try {
+    const current = await fs
+      .readFile(resumeIndex, "utf8")
+      .then((raw) => JSON.parse(raw) as { intentIds?: unknown })
+      .catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      });
+    const intentIds = Array.isArray(current?.intentIds)
+      ? current.intentIds.filter((id): id is string => validIdentifier(id))
+      : [];
+    await writeJsonAtomic(resumeIndex, {
+      schemaVersion: 1,
+      intentIds: [...new Set([...intentIds, manifest.intentId])],
+      updatedAt: nowIso(),
+    });
+  } finally {
+    await release();
+  }
+}
+
 export async function createManagedUploadIntent(
   input: CreateManagedUploadIntentInput,
 ) {
   validateCreateInput(input);
   return createManagedUploadIntentUnderOperationLock(input);
+}
+
+/**
+ * Resolve a KB upload proof only through its exact durable operation index.
+ * This deliberately does not use the directory reconciliation scan: callers
+ * validating stage/dispatch authority must never adopt a fuzzy match.
+ */
+export async function readKnowledgeBaseManagedUploadIntentByOperation(input: {
+  userId: number;
+  projectAssignmentId?: string | null;
+  operationId: string;
+}): Promise<ManagedUploadIntentManifest | null> {
+  if (
+    !Number.isSafeInteger(input.userId) ||
+    input.userId < 1 ||
+    !validIdentifier(input.operationId)
+  ) {
+    throw new ManagedUploadIntentError(
+      400,
+      "INVALID_MANAGED_UPLOAD_REQUEST",
+      "上传凭据查询参数无效",
+      false,
+      "refresh_page",
+    );
+  }
+  const projectAssignmentId = input.projectAssignmentId ?? null;
+  const indexPath = operationIndexPath({
+    userId: input.userId,
+    projectAssignmentId,
+    operationId: input.operationId,
+  });
+  const index = await fs
+    .readFile(indexPath, "utf8")
+    .then(
+      (raw) =>
+        JSON.parse(raw) as {
+          state?: unknown;
+          intentId?: unknown;
+          requestHash?: unknown;
+        },
+    )
+    .catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+  if (!index) return null;
+  if (index.state === "retired") {
+    throw new ManagedUploadIntentError(
+      410,
+      "UPLOAD_OPERATION_RETIRED",
+      "该上传操作已结束",
+      false,
+      "refresh_page",
+    );
+  }
+  if (
+    typeof index.intentId !== "string" ||
+    !validIdentifier(index.intentId) ||
+    typeof index.requestHash !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(index.requestHash)
+  ) {
+    throw new Error("MANAGED_UPLOAD_INTENT_INDEX_INVALID");
+  }
+  const manifest = await readManagedUploadIntent(index.intentId);
+  if (!manifest) throw new Error("MANAGED_UPLOAD_INTENT_INDEX_DANGLING");
+  if (
+    manifest.requestHash !== index.requestHash ||
+    manifest.userId !== input.userId ||
+    manifest.projectAssignmentId !== projectAssignmentId ||
+    manifest.operationId !== input.operationId ||
+    manifest.schemaVersion !== 2 ||
+    manifest.resumeScope?.kind !== "knowledge_base"
+  ) {
+    throw new Error("MANAGED_UPLOAD_INTENT_INDEX_MISMATCH");
+  }
+  return manifest;
+}
+
+export type KnowledgeBaseManagedUploadStageProof = {
+  intentId: string;
+  operationId: string;
+  fileId: string;
+  filename: string;
+  mimeType: string;
+  bytes: Buffer;
+  sizeBytes: number;
+  sha256: string;
+  storageDescriptor: {
+    kind: "presales_file";
+    fileId: string;
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+    sha256: string;
+    contentExpiresAt: Date | null;
+  };
+};
+
+/**
+ * Re-proves the complete browser-to-provider-to-retained-byte chain before a
+ * KB attachment can be staged. The provider receipt is necessary but not
+ * sufficient: the retained stream is read to EOF and rehashed on every proof.
+ */
+export async function proveKnowledgeBaseManagedUploadForStage(input: {
+  userId: number;
+  projectAssignmentId?: string | null;
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  credential: { id: string; userId: number; version: number };
+  manifestItem: {
+    itemId: string;
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+    sha256: string;
+    ordinal?: number;
+    total?: number;
+  };
+  index: number;
+  total: number;
+  fileId: string;
+}): Promise<KnowledgeBaseManagedUploadStageProof> {
+  const expectedOrdinal = input.index + 1;
+  const expectedSha256 = input.manifestItem.sha256.toLowerCase();
+  if (
+    !Number.isSafeInteger(input.index) ||
+    input.index < 0 ||
+    !Number.isSafeInteger(input.total) ||
+    input.total < 1 ||
+    expectedOrdinal > input.total ||
+    !validIdentifier(input.conversationId, 191) ||
+    !validIdentifier(input.turnId, 36) ||
+    !validIdentifier(input.clientRequestId, 191) ||
+    !validIdentifier(input.credential.id) ||
+    !Number.isSafeInteger(input.credential.userId) ||
+    input.credential.userId < 1 ||
+    !Number.isSafeInteger(input.credential.version) ||
+    input.credential.version < 1 ||
+    !validIdentifier(input.manifestItem.itemId) ||
+    !validIdentifier(input.manifestItem.filename, 512) ||
+    input.manifestItem.filename !== input.manifestItem.filename.trim() ||
+    !validIdentifier(input.manifestItem.mimeType, 255) ||
+    input.manifestItem.mimeType !== input.manifestItem.mimeType.trim() ||
+    !Number.isSafeInteger(input.manifestItem.sizeBytes) ||
+    input.manifestItem.sizeBytes < 1 ||
+    !/^[a-f0-9]{64}$/u.test(expectedSha256) ||
+    (input.manifestItem.ordinal !== undefined &&
+      input.manifestItem.ordinal !== expectedOrdinal) ||
+    (input.manifestItem.total !== undefined &&
+      input.manifestItem.total !== input.total) ||
+    !validIdentifier(input.fileId)
+  ) {
+    throw new ManagedUploadIntentError(
+      400,
+      "INVALID_MANAGED_UPLOAD_REQUEST",
+      "知识库附件证明参数无效",
+      false,
+      "refresh_page",
+    );
+  }
+  const manifest = await readKnowledgeBaseManagedUploadIntentByOperation({
+    userId: input.userId,
+    projectAssignmentId: input.projectAssignmentId,
+    operationId: input.manifestItem.itemId,
+  });
+  const receipt = manifest?.receipt;
+  const provider = manifest?.provider.find(
+    (generation) => generation.generation === manifest.providerGeneration,
+  );
+  if (
+    !manifest ||
+    manifest.resumeScope?.conversationId !== input.conversationId ||
+    manifest.resumeScope.turnId !== input.turnId ||
+    manifest.resumeScope.clientRequestId !== input.clientRequestId ||
+    manifest.credentialId !== input.credential.id ||
+    manifest.credentialOwnerUserId !== input.credential.userId ||
+    manifest.credentialVersion !== input.credential.version ||
+    manifest.ordinal !== expectedOrdinal ||
+    manifest.total !== input.total ||
+    manifest.filename !== input.manifestItem.filename ||
+    manifest.mimeType !== input.manifestItem.mimeType ||
+    manifest.declaredSizeBytes !== input.manifestItem.sizeBytes ||
+    manifest.sizeBytes !== input.manifestItem.sizeBytes ||
+    manifest.sha256 !== expectedSha256 ||
+    manifest.state !== "uploaded" ||
+    !receipt ||
+    receipt.fileId !== input.fileId ||
+    receipt.sizeBytes !== input.manifestItem.sizeBytes ||
+    !provider ||
+    provider.state !== "uploaded" ||
+    provider.fileId !== input.fileId ||
+    !provider.filename ||
+    provider.providerStatus !== "uploaded" ||
+    provider.ownershipRecorded !== true ||
+    provider.putResponse2xx !== true
+  ) {
+    throw new ManagedUploadIntentError(
+      409,
+      "UPLOAD_STAGE_PROOF_MISMATCH",
+      "知识库附件与上传预约证明不一致",
+      false,
+      "refresh_page",
+    );
+  }
+  const stored = await readStoredPresalesFile(input.fileId);
+  if (
+    !stored ||
+    stored.filename !== provider.filename ||
+    stored.mimeType !== input.manifestItem.mimeType ||
+    stored.recordedSizeBytes !== input.manifestItem.sizeBytes ||
+    stored.sizeBytes !== input.manifestItem.sizeBytes ||
+    stored.sha256 !== expectedSha256
+  ) {
+    throw new ManagedUploadIntentError(
+      409,
+      "UPLOAD_STAGE_RETAINED_BYTES_MISMATCH",
+      "Dashboard 留存文件与上传预约不一致",
+      false,
+      "refresh_page",
+    );
+  }
+  const chunks: Buffer[] = [];
+  const hash = createHash("sha256");
+  let sizeBytes = 0;
+  const stream = stored.createReadStream();
+  try {
+    for await (const rawChunk of stream) {
+      const chunk = Buffer.isBuffer(rawChunk)
+        ? rawChunk
+        : Buffer.from(rawChunk as Uint8Array);
+      sizeBytes += chunk.length;
+      if (sizeBytes > input.manifestItem.sizeBytes) {
+        throw new Error("MANAGED_UPLOAD_RETAINED_STREAM_OVERSIZE");
+      }
+      hash.update(chunk);
+      chunks.push(chunk);
+    }
+  } catch (error) {
+    stream.destroy();
+    if (error instanceof ManagedUploadIntentError) throw error;
+    throw new ManagedUploadIntentError(
+      409,
+      "UPLOAD_STAGE_RETAINED_BYTES_MISMATCH",
+      "Dashboard 留存文件无法完成校验",
+      false,
+      "refresh_page",
+    );
+  }
+  const sha256 = hash.digest("hex");
+  if (sizeBytes !== input.manifestItem.sizeBytes || sha256 !== expectedSha256) {
+    throw new ManagedUploadIntentError(
+      409,
+      "UPLOAD_STAGE_RETAINED_BYTES_MISMATCH",
+      "Dashboard 留存文件字节校验失败",
+      false,
+      "refresh_page",
+    );
+  }
+  const bytes = Buffer.concat(chunks, sizeBytes);
+  return {
+    intentId: manifest.intentId,
+    operationId: manifest.operationId,
+    fileId: input.fileId,
+    filename: input.manifestItem.filename,
+    mimeType: input.manifestItem.mimeType,
+    bytes,
+    sizeBytes,
+    sha256,
+    storageDescriptor: {
+      kind: "presales_file",
+      fileId: input.fileId,
+      filename: input.manifestItem.filename,
+      mimeType: input.manifestItem.mimeType,
+      sizeBytes,
+      sha256,
+      contentExpiresAt: stored.contentExpiresAt,
+    },
+  };
+}
+
+export async function listManagedUploadIntentsByResumeScope(input: {
+  userId: number;
+  projectAssignmentId?: string | null;
+  conversationId: string;
+  turnId: string;
+  credentialId?: string;
+  credentialOwnerUserId?: number;
+  credentialVersion?: number;
+}) {
+  const resumeScope: ManagedUploadResumeScope = {
+    kind: "knowledge_base",
+    conversationId: input.conversationId,
+    turnId: input.turnId,
+    // Not part of the index coordinate; each manifest carries the exact value.
+    clientRequestId: "lookup",
+  };
+  if (
+    !Number.isSafeInteger(input.userId) ||
+    !validIdentifier(input.conversationId, 191) ||
+    !validIdentifier(input.turnId, 36)
+  ) {
+    throw new ManagedUploadIntentError(
+      400,
+      "INVALID_MANAGED_UPLOAD_REQUEST",
+      "上传恢复参数无效",
+      false,
+      "refresh_page",
+    );
+  }
+  const indexPath = resumeScopeIndexPath({
+    userId: input.userId,
+    projectAssignmentId: input.projectAssignmentId ?? null,
+    resumeScope,
+  });
+  const index = await fs
+    .readFile(indexPath, "utf8")
+    .then((raw) => JSON.parse(raw) as { intentIds?: unknown })
+    .catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+  const intentIds = Array.isArray(index?.intentIds)
+    ? index.intentIds.filter((id): id is string => validIdentifier(id))
+    : [];
+  if (!index || intentIds.length === 0) {
+    // An existing scope under a different owner/project must be reported as
+    // forbidden, not disguised as an empty successful discovery. Hashing the
+    // owner into the normal index remains the fast path; this bounded scan is
+    // used only for a miss and never returns another scope's metadata.
+    const directory = path.join(
+      managedUploadIntentStorageRoot(),
+      "by-resume-scope",
+    );
+    const entries = await fs.readdir(directory).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const foreign = await fs
+        .readFile(path.join(directory, entry), "utf8")
+        .then((raw) => JSON.parse(raw) as { intentIds?: unknown })
+        .catch(() => null);
+      const foreignIds = Array.isArray(foreign?.intentIds)
+        ? foreign.intentIds.filter((id): id is string => validIdentifier(id))
+        : [];
+      for (const intentId of foreignIds) {
+        const manifest = await readManagedUploadIntent(intentId);
+        if (
+          manifest?.resumeScope?.kind === "knowledge_base" &&
+          manifest.resumeScope.conversationId === input.conversationId &&
+          manifest.resumeScope.turnId === input.turnId &&
+          (manifest.userId !== input.userId ||
+            manifest.projectAssignmentId !==
+              (input.projectAssignmentId ?? null))
+        ) {
+          throw new ManagedUploadIntentError(
+            403,
+            "UPLOAD_INTENT_FORBIDDEN",
+            "上传记录不属于当前账号或项目",
+            false,
+            "refresh_page",
+          );
+        }
+      }
+    }
+  }
+  const manifests = (
+    await Promise.all(
+      intentIds.map((intentId) => readManagedUploadIntent(intentId)),
+    )
+  ).filter((manifest): manifest is ManagedUploadIntentManifest =>
+    Boolean(manifest),
+  );
+  if (
+    input.credentialId &&
+    manifests.some(
+      (manifest) =>
+        manifest.credentialId !== input.credentialId ||
+        manifest.credentialOwnerUserId !== input.credentialOwnerUserId ||
+        manifest.credentialVersion !== input.credentialVersion,
+    )
+  ) {
+    throw new ManagedUploadIntentError(
+      403,
+      "UPLOAD_INTENT_FORBIDDEN",
+      "上传预约的固定凭证与当前知识库轮次不匹配",
+      false,
+      "refresh_page",
+    );
+  }
+  return manifests
+    .filter(
+      (manifest) =>
+        manifest.userId === input.userId &&
+        manifest.projectAssignmentId === (input.projectAssignmentId ?? null) &&
+        manifest.resumeScope?.kind === "knowledge_base" &&
+        manifest.resumeScope.conversationId === input.conversationId &&
+        manifest.resumeScope.turnId === input.turnId,
+    )
+    .sort((left, right) => left.ordinal - right.ordinal)
+    .map((manifest) => {
+      const resumeScope = manifest.resumeScope;
+      if (!resumeScope) {
+        throw new Error("MANAGED_UPLOAD_RESUME_SCOPE_MISSING");
+      }
+      const ticket = createManagedUploadIntentTicket(manifest);
+      return {
+        intentId: manifest.intentId,
+        intentTicket: ticket.ticket,
+        ticketExpiresAt: ticket.expiresAt,
+        batchId: manifest.batchId,
+        ordinal: manifest.ordinal,
+        total: manifest.total,
+        filename: manifest.filename,
+        mimeType: manifest.mimeType,
+        sizeBytes: manifest.declaredSizeBytes,
+        state: manifest.state,
+        phase: manifest.phase,
+        receipt: manifest.receipt,
+        clientRequestId: resumeScope.clientRequestId,
+      };
+    });
 }
 
 function assertIntentOwner(
@@ -3579,6 +4105,7 @@ export async function sweepManagedUploadIntents(now = Date.now()) {
       (entry) =>
         entry.isDirectory() &&
         entry.name !== "by-operation" &&
+        entry.name !== "by-resume-scope" &&
         entry.name !== "deletion-fences",
     )
     .sort((left, right) => left.name.localeCompare(right.name));
@@ -3591,7 +4118,13 @@ export async function sweepManagedUploadIntents(now = Date.now()) {
     sweeperCursor = (start + selected.length) % candidates.length;
   }
   for (const entry of selected) {
-    if (!entry.isDirectory() || entry.name === "by-operation") continue;
+    if (
+      !entry.isDirectory() ||
+      entry.name === "by-operation" ||
+      entry.name === "by-resume-scope" ||
+      entry.name === "deletion-fences"
+    )
+      continue;
     const manifestPath = path.join(root, entry.name, "manifest.json");
     let manifest = await fs
       .readFile(manifestPath, "utf8")
@@ -3823,6 +4356,7 @@ async function prepareManagedUploadIntentWorkerStorage() {
   const root = managedUploadIntentStorageRoot();
   await ensurePrivateDirectory(root);
   await ensurePrivateDirectory(path.join(root, "by-operation"));
+  await ensurePrivateDirectory(path.join(root, "by-resume-scope"));
   // Prove that the configured durable volume is writable before the listener
   // advertises readiness. The probe follows the same create/fsync/remove rules
   // as intent state without leaving a reusable capability behind.
@@ -3853,6 +4387,7 @@ async function runManagedUploadIntentWorkerTick() {
           (entry) =>
             entry.isDirectory() &&
             entry.name !== "by-operation" &&
+            entry.name !== "by-resume-scope" &&
             entry.name !== "deletion-fences",
         )
         .sort((left, right) => left.name.localeCompare(right.name));

@@ -83,6 +83,48 @@ function response() {
 }
 
 describe("resolveUpstreamCredential attachment API Key policy", () => {
+  it("defers only knowledge-base scoped managed-upload creation to its frozen reservation", async () => {
+    const req = {
+      method: "POST",
+      originalUrl: "/api/frontmind/v1/managed-uploads",
+      body: {
+        resumeScope: {
+          kind: "knowledge_base",
+          conversationId: "conversation-1",
+          turnId: "turn-1",
+          clientRequestId: "request-1",
+        },
+      },
+      frontmindUser: { id: 42, role: "user" },
+      query: {},
+    } as never;
+    const res = response();
+    const next = vi.fn();
+
+    await resolveUpstreamCredential(req, res as never, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it("still requires an active credential for unscoped managed-upload creation", async () => {
+    authMocks.getEffectiveDecryptedCredentialForAccount.mockResolvedValue(null);
+    const req = {
+      method: "POST",
+      originalUrl: "/api/frontmind/v1/managed-uploads",
+      body: {},
+      frontmindUser: { id: 42, role: "user" },
+      query: {},
+    } as never;
+    const res = response();
+    const next = vi.fn();
+
+    await resolveUpstreamCredential(req, res as never, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(428);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });

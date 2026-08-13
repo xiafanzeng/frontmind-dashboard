@@ -33,13 +33,38 @@ describe("knowledge-base production recovery sweep", () => {
       retained: 2,
       failed: 1,
     });
+    const migrateActiveLegacyBuilds = vi
+      .fn()
+      .mockResolvedValueOnce({
+        failed: 1,
+        scanned: 100,
+        hasMore: true,
+        nextCursor: "legacy-100",
+        rebindHasMore: true,
+        rebindNextCursor: "rebind-100",
+      })
+      .mockResolvedValueOnce({
+        failed: 0,
+        scanned: 1,
+        hasMore: false,
+        nextCursor: "legacy-101",
+        rebindHasMore: false,
+        rebindNextCursor: "rebind-101",
+      })
+      .mockResolvedValueOnce({
+        failed: 0,
+        scanned: 0,
+        hasMore: false,
+        nextCursor: null,
+      });
     const sweep = createKnowledgeBaseRecoverySweep({
       recoverExpiredTurns,
       recoverOpenBuilds,
+      migrateActiveLegacyBuilds,
       cleanupArtifactCandidates,
     });
 
-    await expect(sweep()).resolves.toMatchObject({ failed: 4 });
+    await expect(sweep()).resolves.toMatchObject({ failed: 5 });
     await expect(sweep()).resolves.toMatchObject({ failed: 2 });
     await expect(sweep()).resolves.toMatchObject({ failed: 2 });
     expect(recoverExpiredTurns).toHaveBeenCalledTimes(3);
@@ -49,6 +74,18 @@ describe("knowledge-base production recovery sweep", () => {
       [{ limit: 100, concurrency: 3 }],
     ]);
     expect(cleanupArtifactCandidates).toHaveBeenCalledTimes(3);
+    expect(migrateActiveLegacyBuilds.mock.calls).toEqual([
+      [{ limit: 100, concurrency: 3 }],
+      [
+        {
+          limit: 100,
+          concurrency: 3,
+          afterBuildId: "legacy-100",
+          afterRebindBuildId: "rebind-100",
+        },
+      ],
+      [{ limit: 100, concurrency: 3 }],
+    ]);
   });
 
   it("does not advance its cursor when an open-build scan throws", async () => {

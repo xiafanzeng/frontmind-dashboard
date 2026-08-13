@@ -38,6 +38,10 @@ import {
   knowledgeBaseArchiveRequiresV4UploadEvidence,
 } from "./knowledge-base-archive-contract";
 import { knowledgeBaseTreePolicy } from "./knowledge-base-progress";
+import {
+  isDashboardOwnedKnowledgePackageBuild,
+  readDashboardOwnedKnowledgePackage,
+} from "./knowledge-base-local-package";
 
 const router = Router();
 const MAX_CUSTOMER_UPLOAD_SOURCE_BYTES = 100 * 1024 * 1024;
@@ -83,6 +87,7 @@ type ArtifactBuild = Pick<
   | "logoFilename"
   | "logoMimeType"
   | "packageStorageKey"
+  | "packageStatus"
   | "packageArchiveSha256"
   | "packageSizeBytes"
   | "packageFilename"
@@ -160,8 +165,18 @@ export function resolveKnowledgeBaseArtifactDescriptor(
     };
   }
 
+  // The additive rollout gives pre-0061 rows `not_started` before the data
+  // backfill can classify their already-persisted package. Keep those durable
+  // legacy packages downloadable during a rolling deploy. New finalization
+  // clears the package columns before setting `preparing`, so this fallback
+  // cannot expose a stale package from a newer revision.
+  const packageStateAllowsDurableLegacyBytes =
+    build.packageStatus === "ready" ||
+    build.packageStatus === "not_started" ||
+    build.packageStatus == null;
   if (
     (build.status !== "ready_to_publish" && build.status !== "published") ||
+    !packageStateAllowsDurableLegacyBytes ||
     !build.packageStorageKey ||
     !knowledgeBuildArtifactStorageKeyBelongsTo({
       storageKey: build.packageStorageKey,
@@ -283,84 +298,99 @@ async function serveBuildArtifact(
         .select()
         .from(knowledgeBaseBuildNodes)
         .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
-      await validateKnowledgeArchiveForDownload({
-        buffer,
-        sourceFileName: descriptor.filename,
-        expectedSha256: descriptor.sha256,
-        expectedBytes: descriptor.bytes,
-        validationProfile:
-          build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-        archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
-          build.skillVersion,
-        ),
-        dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
-          build.treePolicyVersion,
-        ).minLeaves,
-        requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
-        ...(build.skillVersion === "3" || build.skillVersion === "4"
-          ? {
-              validateParsed: async (parsed) => {
-                if (
-                  build.skillVersion === "4" &&
-                  parsed.packageBuildRevision !== build.revision
-                ) {
-                  throw new KnowledgeBuildArtifactError(
-                    "ARTIFACT_INTEGRITY_MISMATCH",
-                    "知识库最终 ZIP buildRevision 与已绑定版本不一致",
-                  );
-                }
-                const {
-                  expectedCustomerUploads,
-                  expectedOfficialLogoUpload,
-                  expectedOfficialLogoProvenance,
-                } = knowledgeBaseArchiveRequiresV4UploadEvidence(
-                  build.skillVersion,
-                  parsed.packageSchemaVersion,
-                )
-                  ? await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
-                      userId,
-                      buildId: build.id,
-                      generation: build.generation,
-                      officialLogoSha256: build.logoSha256,
-                      packageArchiveSha256: build.packageArchiveSha256,
-                    })
-                  : {
-                      expectedCustomerUploads: [],
-                      expectedOfficialLogoUpload: undefined,
-                      expectedOfficialLogoProvenance: undefined,
-                    };
-                assertKnowledgeBasePackageMatchesBuild({
-                  nodes: nodes.map((node) => ({
-                    leafId: node.leafId,
-                    title: node.title,
-                    branchId: node.branchId,
-                    branchTitle: node.branchTitle,
-                    ordinal: node.ordinal,
-                    status: node.status,
-                    contentMarkdown: node.contentMarkdown,
-                    contentSha256: node.contentSha256,
-                  })),
-                  documents: parsed.documents,
-                  assets: parsed.assets,
-                  expectedLogoSha256: String(build.logoSha256 || ""),
-                  packageSchemaVersion: parsed.packageSchemaVersion,
-                  expectedCustomerUploads,
-                  expectedOfficialLogoUpload,
-                  expectedOfficialLogoProvenance,
-                  legacyV3Compatibility: build.skillVersion === "3",
-                  legacyV4ReadCompatibility: build.skillVersion === "4",
-                });
-                if (parsed.packageSchemaVersion === 4) {
-                  await assertKnowledgeBaseCustomerUploadVisualBindings({
+      if (isDashboardOwnedKnowledgePackageBuild(build)) {
+        await readDashboardOwnedKnowledgePackage({
+          buffer,
+          expected: {
+            buildId: build.id,
+            generation: build.generation,
+            revision: build.revision,
+            companyName: build.companyName,
+          },
+          nodes,
+        });
+      } else {
+        await validateKnowledgeArchiveForDownload({
+          buffer,
+          sourceFileName: descriptor.filename,
+          expectedSha256: descriptor.sha256,
+          expectedBytes: descriptor.bytes,
+          validationProfile:
+            build.skillVersion === "1"
+              ? "historical"
+              : "dashboard-enterprise-v1",
+          archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
+            build.skillVersion,
+          ),
+          dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+            build.treePolicyVersion,
+          ).minLeaves,
+          requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
+          ...(build.skillVersion === "3" || build.skillVersion === "4"
+            ? {
+                validateParsed: async (parsed) => {
+                  if (
+                    build.skillVersion === "4" &&
+                    parsed.packageBuildRevision !== build.revision
+                  ) {
+                    throw new KnowledgeBuildArtifactError(
+                      "ARTIFACT_INTEGRITY_MISMATCH",
+                      "知识库最终 ZIP buildRevision 与已绑定版本不一致",
+                    );
+                  }
+                  const {
+                    expectedCustomerUploads,
+                    expectedOfficialLogoUpload,
+                    expectedOfficialLogoProvenance,
+                  } = knowledgeBaseArchiveRequiresV4UploadEvidence(
+                    build.skillVersion,
+                    parsed.packageSchemaVersion,
+                  )
+                    ? await verifiedKnowledgeBasePackageUploadEvidenceForBuild({
+                        userId,
+                        buildId: build.id,
+                        generation: build.generation,
+                        officialLogoSha256: build.logoSha256,
+                        packageArchiveSha256: build.packageArchiveSha256,
+                      })
+                    : {
+                        expectedCustomerUploads: [],
+                        expectedOfficialLogoUpload: undefined,
+                        expectedOfficialLogoProvenance: undefined,
+                      };
+                  assertKnowledgeBasePackageMatchesBuild({
+                    nodes: nodes.map((node) => ({
+                      leafId: node.leafId,
+                      title: node.title,
+                      branchId: node.branchId,
+                      branchTitle: node.branchTitle,
+                      ordinal: node.ordinal,
+                      status: node.status,
+                      contentMarkdown: node.contentMarkdown,
+                      contentSha256: node.contentSha256,
+                    })),
+                    documents: parsed.documents,
                     assets: parsed.assets,
-                    expectedUploads: expectedCustomerUploads,
-                    readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
+                    expectedLogoSha256: String(build.logoSha256 || ""),
+                    packageSchemaVersion: parsed.packageSchemaVersion,
+                    expectedCustomerUploads,
+                    expectedOfficialLogoUpload,
+                    expectedOfficialLogoProvenance,
+                    legacyV3Compatibility: build.skillVersion === "3",
+                    legacyV4ReadCompatibility: build.skillVersion === "4",
                   });
-                }
-              },
-            }
-          : {}),
-      });
+                  if (parsed.packageSchemaVersion === 4) {
+                    await assertKnowledgeBaseCustomerUploadVisualBindings({
+                      assets: parsed.assets,
+                      expectedUploads: expectedCustomerUploads,
+                      readPackagedAssetBytes: readStoredKnowledgeAssetBytes,
+                    });
+                  }
+                },
+              }
+            : {}),
+        });
+      }
     }
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.setHeader("Pragma", "no-cache");

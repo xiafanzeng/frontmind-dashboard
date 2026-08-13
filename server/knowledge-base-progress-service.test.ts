@@ -17,7 +17,9 @@ import {
   isAmbiguousKnowledgeBaseAdvance,
   isKnowledgeBaseAcknowledgementOnlyOutput,
   knowledgeBaseObservationConversationStorageId,
+  knowledgeBaseAcceptedProviderAttemptMetadata,
   knowledgeBaseOperationalFailureAuthority,
+  knowledgeBasePackageProjectionCompatibility,
   knowledgeBaseProtocolFailureShouldBecomeTerminal,
   knowledgeBaseProtocolErrorAllowsSameTaskRecovery,
   knowledgeBaseProtocolErrorIsRetryable,
@@ -37,6 +39,133 @@ import {
   KnowledgeBaseProgressError,
 } from "./knowledge-base-progress";
 import { stripKnowledgeBaseReferenceAppendix } from "../shared/knowledge-base-output";
+
+describe("knowledge-base structured-result acceptance metadata", () => {
+  it.each(["sending", "output_pending"])(
+    "accepts a Manus v2 %s ledger without dropping sibling fields",
+    (providerAttemptState) => {
+      const metadata = {
+        providerProtocol: "manus_v2",
+        providerAttemptState,
+        providerMethod: "task.sendMessage",
+        operationToken: "operation-1",
+        lastSeenEventIds: ["event-1", "event-2"],
+        manusV2Lifecycle: { waitingEventId: "event-waiting" },
+        recovery: { outputCursor: 7 },
+      };
+
+      expect(knowledgeBaseAcceptedProviderAttemptMetadata(metadata)).toEqual({
+        ...metadata,
+        providerAttemptState: "accepted",
+      });
+      expect(metadata.providerAttemptState).toBe(providerAttemptState);
+    },
+  );
+
+  it.each([
+    { recovery: { legacy: true } },
+    { providerProtocol: "legacy_v1", providerAttemptState: "sending" },
+    { providerProtocol: "manus_v2", providerAttemptState: "not_sent" },
+    { providerProtocol: "manus_v2", providerAttemptState: "acknowledged" },
+    { providerProtocol: "manus_v2", providerAttemptState: "accepted" },
+    { providerProtocol: "manus_v2", providerAttemptState: "rejected" },
+    { providerProtocol: "manus_v2", providerAttemptState: "outcome_unknown" },
+    { providerProtocol: "manus_v2", providerAttemptState: "unknown" },
+  ])("does not rewrite legacy or non-pending metadata %#", (metadata) => {
+    expect(knowledgeBaseAcceptedProviderAttemptMetadata(metadata)).toBe(
+      undefined,
+    );
+  });
+});
+
+describe("knowledge-base 0061 package/content dual-read", () => {
+  const completedAt = new Date("2026-07-31T12:00:00.000Z");
+  const updatedAt = new Date("2026-08-01T12:00:00.000Z");
+  const legacyPackage = {
+    id: "build-legacy-package",
+    status: "ready_to_publish" as const,
+    revision: 41,
+    canonicalTaskId: null,
+    upstreamTaskId: "task-legacy",
+    packageStatus: "not_started",
+    packageRevision: 41,
+    packageTaskId: "task-legacy",
+    packageOutputItemId: "output-legacy",
+    packageFileId: "file-legacy",
+    packageFilename: "legacy.zip",
+    packageDescriptorHash: "d".repeat(64),
+    packageStorageKey: "knowledge-builds/legacy/package.zip",
+    packageArchiveSha256: "a".repeat(64),
+    packageSizeBytes: 123_456,
+    contentCompletedAt: null,
+    completedAt,
+    updatedAt,
+  };
+
+  it("keeps a complete pre-0061 durable package visible without a data backfill", () => {
+    const projected =
+      knowledgeBasePackageProjectionCompatibility(legacyPackage);
+
+    expect(projected).toMatchObject({
+      contentCompleted: true,
+      contentCompletedAt: completedAt,
+      packageAllowed: true,
+      packageState: "ready",
+      package: {
+        revision: 41,
+        outputItemId: "output-legacy",
+        fileId: "file-legacy",
+        filename: "legacy.zip",
+        mimeType: "application/zip",
+        sha256: "a".repeat(64),
+        sizeBytes: 123_456,
+        downloadPath:
+          "/api/knowledge-base/artifacts/build-legacy-package/package",
+      },
+    });
+  });
+
+  it("uses updatedAt only as the final completion fallback for a terminal legacy build", () => {
+    const projected = knowledgeBasePackageProjectionCompatibility({
+      ...legacyPackage,
+      status: "published",
+      packageStatus: null as never,
+      completedAt: null,
+    });
+
+    expect(projected.contentCompleted).toBe(true);
+    expect(projected.contentCompletedAt).toEqual(updatedAt);
+    expect(projected.packageAllowed).toBe(true);
+    expect(projected.packageState).toBe("ready");
+  });
+
+  it("never exposes a current preparing package, even if stale package fields remain", () => {
+    const projected = knowledgeBasePackageProjectionCompatibility({
+      ...legacyPackage,
+      packageStatus: "preparing",
+      contentCompletedAt: updatedAt,
+    });
+
+    expect(projected.contentCompleted).toBe(true);
+    expect(projected.packageAllowed).toBe(false);
+    expect(projected.packageState).toBe("preparing");
+    expect(projected.package).toBeNull();
+  });
+
+  it("does not treat an incomplete not_started tuple as a legacy package", () => {
+    const projected = knowledgeBasePackageProjectionCompatibility({
+      ...legacyPackage,
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
+    });
+
+    expect(projected.contentCompleted).toBe(true);
+    expect(projected.packageAllowed).toBe(false);
+    expect(projected.packageState).toBe("not_started");
+    expect(projected.package).toBeNull();
+  });
+});
 
 describe("knowledge-base notice recovery contract", () => {
   it("offers a direct retry only when a valid recovery path exists", () => {

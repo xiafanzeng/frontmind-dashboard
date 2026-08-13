@@ -17,7 +17,7 @@ import {
   knowledgeBaseConversationStorageId,
 } from "./knowledge-base-turn-service";
 
-describe("knowledge-base P0 invariant audit", () => {
+describe("knowledge-base build-local invariant audit", () => {
   it("detects the exact waiting-without-body production failure", () => {
     const build = {
       id: "build-1",
@@ -43,7 +43,7 @@ describe("knowledge-base P0 invariant audit", () => {
     ).toContain("AWAITING_INPUT_WITHOUT_PRESENTATION");
   });
 
-  it("detects multiple live turns and invalid ready artifacts", () => {
+  it("detects multiple live turns without treating package assets as content gates", () => {
     const build = {
       id: "build-1",
       generation: 1,
@@ -63,18 +63,14 @@ describe("knowledge-base P0 invariant audit", () => {
           status: "running",
         }) as ConversationTurn,
     );
-    expect(
+    const codes =
       findKnowledgeBaseInvariantViolations({
         builds: [build],
         turns,
         nodes: [],
-      }).map((item) => item.code),
-    ).toEqual(
-      expect.arrayContaining([
-        "MULTIPLE_ACTIVE_TURNS",
-        "READY_ARTIFACT_BINDING_INVALID",
-      ]),
-    );
+      }).map((item) => item.code);
+    expect(codes).toContain("MULTIPLE_ACTIVE_TURNS");
+    expect(codes).not.toContain("READY_ARTIFACT_BINDING_INVALID");
   });
 
   it("allows only a fully pinned failed turn as the retry authority", () => {

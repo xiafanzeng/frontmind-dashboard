@@ -100,6 +100,26 @@ export const knowledgeBaseNoticeSeverities = [
 export type KnowledgeBaseNoticeSeverity =
   (typeof knowledgeBaseNoticeSeverities)[number];
 
+export type KnowledgeBaseContentState = "building" | "completed";
+export type KnowledgeBasePackageState =
+  | "not_started"
+  | "preparing"
+  | "retrying"
+  | "ready"
+  | "attention_required";
+export type KnowledgeBasePublicationState = "draft" | "published";
+export type KnowledgeBaseSyncState =
+  | "synced"
+  | "repairing"
+  | "attention_required";
+export type KnowledgeBaseProcessingPhase =
+  | "uploading"
+  | "restoring_files"
+  | "migrating_task"
+  | "waiting_provider"
+  | "accepting"
+  | "package_preparing";
+
 export interface KnowledgeBaseProgressLeafDto {
   id: string;
   title: string;
@@ -180,6 +200,8 @@ export interface KnowledgeBaseProgressDto {
   summary: KnowledgeBaseProgressSummaryDto;
   branches: KnowledgeBaseProgressBranchDto[];
   packageAllowed: boolean;
+  /** Additive package phase; older projections may omit it. */
+  packageState?: KnowledgeBasePackageState;
 }
 
 /**
@@ -322,6 +344,16 @@ export interface KnowledgeBaseNoticeDto {
 export interface KnowledgeBaseObservationDto {
   stateEpoch: number;
   generation: number;
+  /** Monotonic display authority backed by messages.sequence. */
+  displaySequence?: number;
+  syncState?: KnowledgeBaseSyncState;
+  processingPhase?: KnowledgeBaseProcessingPhase | null;
+  contentState?: KnowledgeBaseContentState;
+  packageState?: KnowledgeBasePackageState;
+  publicationState?: KnowledgeBasePublicationState;
+  contentCompletedAt?: number | null;
+  canonicalTaskUrl?: string | null;
+  localRestrictions?: string[];
   authoritativeTaskId: string | null;
   activeTurn: KnowledgeBaseActiveTurnDto | null;
   /** Optional while old servers/fixtures roll forward; new projections return null or a value. */

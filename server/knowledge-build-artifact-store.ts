@@ -74,6 +74,36 @@ export function knowledgeBuildArtifactStorageKey(input: {
   );
 }
 
+/**
+ * A Dashboard-owned package is immutable for a completed revision, not for an
+ * entire build generation.  Legacy generations can legitimately reopen and
+ * complete a later revision; reusing the compatibility package path in that
+ * case would make the immutable-file install reject the new, correct ZIP.
+ */
+export function knowledgeBuildArtifactLocalPackageStorageKey(input: {
+  userId: number;
+  buildId: string;
+  generation: number;
+  revision: number;
+}) {
+  assertIdentity(input.userId, input.buildId, input.generation);
+  if (!Number.isSafeInteger(input.revision) || input.revision < 0) {
+    throw new KnowledgeBuildArtifactError(
+      "ARTIFACT_INVALID",
+      "知识库本地成品版本无效",
+    );
+  }
+  return path.join(
+    "knowledge-builds",
+    String(input.userId),
+    input.buildId,
+    `generation-${input.generation}`,
+    "dashboard-local-packages",
+    `revision-${input.revision}`,
+    "knowledge-base.zip",
+  );
+}
+
 function identityDigest(value: string, label: string) {
   const normalized = String(value || "").trim();
   if (!normalized || normalized.length > 512) {
@@ -147,7 +177,25 @@ export function knowledgeBuildArtifactStorageKeyBelongsTo(input: {
     );
     const relative = path.relative(prefix, normalized);
     const segments = relative.split(path.sep);
+    const localPackagePrefix = path.join(
+      "knowledge-builds",
+      String(input.userId),
+      input.buildId,
+      `generation-${input.generation}`,
+      "dashboard-local-packages",
+    );
+    const localPackageRelative = path.relative(localPackagePrefix, normalized);
+    const localPackageSegments = localPackageRelative.split(path.sep);
+    const isDashboardLocalPackage =
+      input.kind === "package" &&
+      localPackageRelative !== "" &&
+      !localPackageRelative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(localPackageRelative) &&
+      localPackageSegments.length === 2 &&
+      /^revision-[0-9]+$/u.test(localPackageSegments[0] || "") &&
+      localPackageSegments[1] === "knowledge-base.zip";
     return (
+      isDashboardLocalPackage ||
       relative !== "" &&
       !relative.startsWith(`..${path.sep}`) &&
       !path.isAbsolute(relative) &&
@@ -274,6 +322,7 @@ export async function persistKnowledgeBuildArtifact(input: {
   kind: KnowledgeBuildArtifactKind;
   buffer: Buffer;
   expectedSha256?: string;
+  storageKey?: string;
 }) {
   const image = await validateArtifactBytes(input.kind, input.buffer);
   const digest = sha256(input.buffer);
@@ -291,7 +340,7 @@ export async function persistKnowledgeBuildArtifact(input: {
     assertExpectedHash(digest, sha256(existing));
   }
   return {
-    storageKey: knowledgeBuildArtifactStorageKey(input),
+    storageKey: input.storageKey || knowledgeBuildArtifactStorageKey(input),
     sha256: digest,
     bytes: input.buffer.length,
     ...image,

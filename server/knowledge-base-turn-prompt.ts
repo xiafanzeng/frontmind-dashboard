@@ -12,10 +12,7 @@ import {
   KNOWLEDGE_BASE_PROGRESS_KIND,
   KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
 } from "./knowledge-base-progress";
-import {
-  KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
-  loadKnowledgeBaseSkillArchive,
-} from "./knowledge-base-skill-runtime";
+import { KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME } from "./knowledge-base-skill-runtime";
 import { assertUpstreamPromptBudget } from "./upstream-prompt-budget";
 
 export async function buildKnowledgeBaseTurnPrompt(input: {
@@ -32,6 +29,11 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     sha256: string;
     assetCount: number;
   };
+  /**
+   * Manus v2 accepts the final semantic transition before Dashboard builds
+   * the durable package. Legacy v1 keeps the provider-ZIP contract.
+   */
+  contentCompletionOnly?: boolean;
   protocolOperation?: {
     operationId: string;
     turnId: string;
@@ -56,10 +58,6 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     }>;
   };
 }) {
-  await loadKnowledgeBaseSkillArchive({
-    version: input.skillVersion || "3",
-    contentHash: input.skillContentHash,
-  });
   const progress =
     input.progressOverride ||
     (await getKnowledgeBaseProgress({
@@ -113,7 +111,9 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
       !nextPending &&
       (action === "confirm" || action === "direct_prefill"),
   );
-  if (isV4 && finalPackageRequired && !input.finalizationInput) {
+  const providerPackageRequired =
+    finalPackageRequired && input.contentCompletionOnly !== true;
+  if (isV4 && providerPackageRequired && !input.finalizationInput) {
     throw new KnowledgeBaseBuildError(
       "PROGRESS_PROTOCOL_INVALID",
       "最终交付轮缺少服务端权威正文与素材输入包",
@@ -154,7 +154,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         imageCount: 0,
       })
     : "";
-  if (isV4 && finalPackageRequired) {
+  if (isV4 && providerPackageRequired) {
     const finalizationInput = input.finalizationInput!;
     const compactFinalPrompt = [
       `用户已授权继续完成 FrontMind Dashboard 企业知识库构建。请使用本轮随附的 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME}（socratic-kb-builder v4）完成最终交付；它提供工作流说明、参考文件和校验器，不要求环境预装同名 Skill。不得启用 Wide Research / Deep Research。`,
@@ -197,7 +197,9 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         action === "confirm" || action === "direct_prefill"
           ? nextPending
             ? `先简短确认已处理 ${current.id}，正文主体随后完整展示下一节点 ${nextPending.id}｜${nextPending.branchTitle} / ${nextPending.title}。不得再次把 ${current.id} 作为主体。`
-            : `这是最后一个节点。简短确认 ${current.id} 后必须在本轮实际创建并返回唯一最终 ZIP，不再展示节点正文；不得只说“即将生成”“稍后生成”或“进入交付阶段”。`
+            : input.contentCompletionOnly === true
+              ? `这是最后一个节点。简短确认 ${current.id} 并返回内容完成状态；不得生成、上传或等待 ZIP。Dashboard 将在正文完成事务提交后异步生成本地下载包。`
+              : `这是最后一个节点。简短确认 ${current.id} 后必须在本轮实际创建并返回唯一最终 ZIP，不再展示节点正文；不得只说“即将生成”“稍后生成”或“进入交付阶段”。`
           : `更新并完整重新展示当前节点 ${current.id}；不得展示或推进到后续节点。`,
         requiresPresentation
           ? `回复末尾还必须附且只能附一个 FRONTMIND_KB_PRESENTATION 信封：revision=${postRevision}，leafId=${
@@ -225,11 +227,13 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     "客户可见回复不得主动提供“直接预填”或“跳过”选项；用户正常操作只有确认当前内容，或者提交修改/附件后确认修订稿。",
     "客户可见回复只输出实际展示节点的完整正文，不得输出参考资料、参考来源、References、Sources、编号引用、外部引用链接、未决事项、核验备注、操作提示或确认问题。所有来源只进入内部证据文件；可见正文结束后直接附机器信封。",
     "机器信封必须保留完整的 `<!-- FRONTMIND_KB_...` 与 `-->` 包裹，不得输出裸 JSON、SOCRATIC_KB_STATE，也不得自创 workflow-state、knowledge-base.message 或其他状态对象。",
-    finalPackageRequired
+    providerPackageRequired
       ? "这是最终交付轮，不是纯文字轮次：不得返回图片，但必须实际创建并返回恰好一个 application/zip 的 typed output_file；该 ZIP 是本轮唯一允许的非文本资源。恰好一张企业官方主 Logo 必须使用 Dashboard 已绑定栅格字节；自动返回的 Logo 不要求外部来源字段，official_logo_upload 则必须保持客户原始上传字节。客户上传图片必须按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。"
-      : isOfficialLogoUpload
-        ? "这是首节点 Logo 补料轮。Dashboard 已自行保存并展示受管 Logo 原始字节；上游回复必须纯文字，不得返回或重复附加任何图片资源。必须完整修订并重新展示同一个首节点，等待用户下一轮明确确认。最终 schema v4 ZIP 中该 Logo 必须使用 sourceKind=official_logo_upload、ownership=first_party、assetType=brand_identity、displayRole=badge，并逐字段保留本轮 sourceUploadIndex/FileId/Filename/MimeType/SizeBytes/Sha256；imageSelection.method 必须为 customer_upload。该 Logo 不属于普通 user_upload 节点配图。"
-        : "这是非首轮知识节点回复，客户可见正文必须纯文字且不得附资源：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。恰好一张企业官方主 Logo 只允许在首轮第一个叶子展示；客户主动上传的节点图片由 Dashboard 从受管原始字节自行回显，你只负责把它按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。",
+      : input.contentCompletionOnly === true
+        ? "这是 Manus v2 内容完成轮：只提交最终语义状态，不生成、不上传、不等待任何 ZIP、Logo 或补充报告。Dashboard 会在核心内容原子接受后，依据全部 accepted nodes 异步生成本地确定性下载包；可选资源缺失不得阻止内容完成。"
+        : isOfficialLogoUpload
+          ? "这是首节点 Logo 补料轮。Dashboard 已自行保存并展示受管 Logo 原始字节；上游回复必须纯文字，不得返回或重复附加任何图片资源。必须完整修订并重新展示同一个首节点，等待用户下一轮明确确认。最终 schema v4 ZIP 中该 Logo 必须使用 sourceKind=official_logo_upload、ownership=first_party、assetType=brand_identity、displayRole=badge，并逐字段保留本轮 sourceUploadIndex/FileId/Filename/MimeType/SizeBytes/Sha256；imageSelection.method 必须为 customer_upload。该 Logo 不属于普通 user_upload 节点配图。"
+          : "这是非首轮知识节点回复，客户可见正文必须纯文字且不得附资源：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。恰好一张企业官方主 Logo 只允许在首轮第一个叶子展示；客户主动上传的节点图片由 Dashboard 从受管原始字节自行回显，你只负责把它按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。",
     "",
     "# 当前知识库状态",
     stateReminder,
@@ -278,7 +282,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
               ? `可见正文主体必须是 ${nextPending.id}｜${nextPending.title}，不得再次把 ${current.id} 作为主体。`
               : `只简短确认 ${current.id} 并完成最终交付，不得再次输出 ${current.id} 正文。`
             : `可见正文主体必须继续是 ${current.id}｜${current.title}。`,
-          ...(finalPackageRequired
+          ...(providerPackageRequired
             ? [
                 "# 本轮最终 ZIP 要求",
                 "必须在结束本轮前，把恰好一个 type=output_file、MIME=application/zip 的最终知识库 ZIP 实际加入任务 output；不得只输出文件名、路径、下载承诺或“即将生成/稍后生成”的文字。",
@@ -288,7 +292,13 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
                 "schemaVersion=4 只属于 ZIP 内 00_package_manifest.json；本轮 FRONTMIND_KB_PROGRESS 与 FRONTMIND_KB_PRESENTATION 仍必须保留下面服务端给定的 schemaVersion=2、operationId、turnId 和字段层级。不得用 action=final_package、packageSha256、packageBytes 或 VALID 摘要替代这两个信封。",
                 "在 ZIP 文件资源已经进入任务 output 之前不得结束任务；Progress 和 Presentation 文本信封不能替代 ZIP 文件。",
               ]
-            : []),
+            : input.contentCompletionOnly === true
+              ? [
+                  "# 本轮内容完成要求",
+                  "只完成最后节点的语义转换并返回服务端要求的结构化完成结果；不得创建或返回 ZIP、Logo、图片、补充报告或其他文件资源。",
+                  "下载包由 Dashboard 在内容接受后异步生成，资源准备失败不得改变本轮内容完成结果。",
+                ]
+              : []),
           "可见正文结束后，FRONTMIND_KB_PROGRESS 必须逐字采用下面的字段层级和值；旧版顶层 action、leafId、status 一律无效：",
           progressEnvelopeExample,
           ...(requiresPresentation

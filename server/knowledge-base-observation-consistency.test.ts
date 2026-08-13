@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 import {
   conversationTurns,
@@ -35,8 +36,10 @@ function query(values: Record<string, unknown>[]) {
       return chain;
     },
     orderBy() {
-      selected.sort(
-        (left, right) => Number(left.ordinal || 0) - Number(right.ordinal || 0),
+      selected.sort((left, right) =>
+        left.ordinal !== undefined || right.ordinal !== undefined
+          ? Number(left.ordinal || 0) - Number(right.ordinal || 0)
+          : Number(right.sequence || 0) - Number(left.sequence || 0),
       );
       return chain;
     },
@@ -172,6 +175,56 @@ function node(overrides: Record<string, unknown> = {}) {
 }
 
 describe("knowledge-base observation consistency", () => {
+  it("keeps completed content stable and reports package exhaustion as a local warning", async () => {
+    const completedAt = new Date("2026-08-01T00:00:10.000Z");
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              status: "ready_to_publish",
+              currentLeafId: null,
+              contentCompletedAt: completedAt,
+              completedAt,
+              packageStatus: "attention_required",
+              packageAttemptCount: 8,
+              packageLastErrorCode: "LOCAL_PACKAGE_CORE_NODES_INCOMPLETE",
+            }),
+            nodes: [node({ status: "confirmed" })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation).toMatchObject({
+      syncState: "attention_required",
+      processingPhase: null,
+      contentState: "completed",
+      packageState: "attention_required",
+      contentCompletedAt: completedAt.getTime(),
+      localRestrictions: ["package_attention_required"],
+      notice: {
+        code: "KNOWLEDGE_BASE_PACKAGE_ATTENTION_REQUIRED",
+        severity: "warning",
+        message:
+          "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响，系统不会重复推进内容。",
+        retryable: false,
+        canRegenerate: false,
+      },
+    });
+    expect(observation?.progress.build.status).toBe("ready_to_publish");
+  });
+
   it("projects attachment readiness processing as a same-turn recovery notice", async () => {
     const now = new Date("2026-08-11T05:32:59.000Z");
     const activeTurn = {
@@ -1095,6 +1148,544 @@ describe("knowledge-base observation consistency", () => {
       clientRequestId: presentationTurn.clientRequestId,
       messageSequence: 2,
     });
+  });
+
+  it("keeps the accepted presentation visible when activeTurnId is invalid but its historical turn is valid", async () => {
+    const presentationTurn = {
+      id: "turn-persisted-presentation",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-persisted-presentation",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-persisted-presentation",
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      status: "completed",
+      upstreamTaskId: "task-old",
+      metadata: {},
+      startedAt: new Date("2026-08-01T00:00:05.000Z"),
+      completedAt: new Date("2026-08-01T00:00:06.000Z"),
+      createdAt: new Date("2026-08-01T00:00:05.000Z"),
+      updatedAt: new Date("2026-08-01T00:00:06.000Z"),
+    };
+    const persistedNode = node({ sourceTurnId: presentationTurn.id });
+    const persistedContentSha256 = createHash("sha256")
+      .update(persistedNode.contentMarkdown as string)
+      .digest("hex");
+    const persistedPresentationKey = createHash("sha256")
+      .update(["build-snapshot", 1, 1, "1.1", persistedContentSha256].join(":"))
+      .digest("hex");
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              activeTurnId: "turn-missing",
+              currentPresentationKey: persistedPresentationKey,
+              canonicalTaskState: "attention_required",
+              protocolErrorCode: "MANUS_V2_TASK_ERROR",
+              protocolError: null,
+            }),
+            nodes: [persistedNode],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            // The current active-turn projection is deliberately unavailable.
+            // Authority comes from the immutable receipt plus its independently
+            // loaded historical source turn, never from activeTurnId.
+            turns: [presentationTurn],
+            messages: [
+              {
+                turnId: presentationTurn.id,
+                role: "user",
+                sequence: 6,
+              },
+              {
+                id: `u7:msg-kb-presentation-${persistedPresentationKey}`,
+                conversationId: "u7:conversation-snapshot",
+                userId: 7,
+                turnId: presentationTurn.id,
+                role: "assistant",
+                content: persistedNode.contentMarkdown,
+                sequence: 7,
+                metadata: {
+                  knowledgeBase: {
+                    schemaVersion: 1,
+                    serverOwned: true,
+                    kind: "presentation",
+                    buildId: "build-snapshot",
+                    generation: 1,
+                    turnId: presentationTurn.id,
+                    operationKey: presentationTurn.operationKey,
+                    presentationKey: persistedPresentationKey,
+                    // Legacy accepted receipts did not carry an explicit
+                    // content hash. The deterministic presentation key still
+                    // authenticates the exact content and coordinate.
+                    revision: 1,
+                    leafId: "1.1",
+                  },
+                },
+              },
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    // The simplified executor cannot evaluate SQL WHERE clauses and therefore
+    // returns the historical row for the active-turn lookup too. The assertion
+    // below is the important contract: receipt display does not depend on the
+    // build's invalid activeTurnId coordinate.
+    expect(observation?.approvedPresentation).toMatchObject({
+      turnId: presentationTurn.id,
+      revision: 1,
+      leafId: "1.1",
+      visibleMarkdown: persistedNode.contentMarkdown,
+      messageSequence: 7,
+    });
+    expect(observation?.displaySequence).toBe(7);
+    expect(observation).toMatchObject({
+      syncState: "attention_required",
+      notice: {
+        code: "MANUS_V2_TASK_ERROR",
+        severity: "warning",
+        message: "系统正在恢复当前操作。已完成内容不受影响。",
+        retryable: true,
+        failureClass: "recoverable_same_turn",
+        recoveryAction: "reconcile",
+        canRegenerate: false,
+      },
+    });
+  });
+
+  it("uses a newer completion receipt as displaySequence while retaining the last presentation", async () => {
+    const persistedNode = node();
+    const contentSha256 = createHash("sha256")
+      .update(persistedNode.contentMarkdown as string)
+      .digest("hex");
+    const acceptedKey = createHash("sha256")
+      .update(["build-snapshot", 1, 1, "1.1", contentSha256].join(":"))
+      .digest("hex");
+    const presentationTurn = {
+      id: "turn-presentation",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-presentation",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-presentation",
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      status: "completed",
+      metadata: {},
+      startedAt: new Date("2026-08-01T00:00:00.000Z"),
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-01T00:00:10.000Z"),
+    };
+    const completionTurn = {
+      id: "turn-completion",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-completion",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-completion",
+      operationType: "confirm",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      status: "completed",
+      metadata: {},
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build(),
+            nodes: [persistedNode],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 13,
+            },
+            turns: [presentationTurn, completionTurn],
+            messages: [
+              {
+                id: `u7:msg-kb-presentation-${acceptedKey}`,
+                conversationId: "u7:conversation-snapshot",
+                userId: 7,
+                turnId: presentationTurn.id,
+                role: "assistant",
+                content: persistedNode.contentMarkdown,
+                sequence: 7,
+                metadata: {
+                  knowledgeBase: {
+                    schemaVersion: 1,
+                    serverOwned: true,
+                    kind: "presentation",
+                    buildId: "build-snapshot",
+                    generation: 1,
+                    turnId: "turn-presentation",
+                    operationKey: "operation-presentation",
+                    presentationKey: acceptedKey,
+                    contentSha256,
+                    revision: 1,
+                    leafId: "1.1",
+                  },
+                },
+              },
+              {
+                id: "u7:msg-kb-completion-build-snapshot-1-2",
+                conversationId: "u7:conversation-snapshot",
+                userId: 7,
+                turnId: completionTurn.id,
+                role: "assistant",
+                content: "知识库内容已完成。下载包正在准备中。",
+                sequence: 9,
+                metadata: {
+                  knowledgeBase: {
+                    schemaVersion: 1,
+                    serverOwned: true,
+                    kind: "completion",
+                    buildId: "build-snapshot",
+                    generation: 1,
+                    turnId: "turn-completion",
+                    operationKey: "operation-completion",
+                    revision: 2,
+                    leafId: null,
+                  },
+                },
+              },
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.displaySequence).toBe(9);
+    expect(observation?.approvedPresentation).toMatchObject({
+      presentationKey: acceptedKey,
+      messageSequence: 7,
+      visibleMarkdown: persistedNode.contentMarkdown,
+    });
+  });
+
+  it("rejects a serverOwned marker that has no historical source turn", async () => {
+    const persistedNode = node({
+      contentMarkdown: null,
+      contentSha256: null,
+      sourceTurnId: null,
+      presentationKey: null,
+    });
+    const forgedContent = "## 1.1 一句话定位\n\n伪造正文";
+    const contentSha256 = createHash("sha256")
+      .update(forgedContent)
+      .digest("hex");
+    const presentationKey = createHash("sha256")
+      .update(["build-snapshot", 1, 1, "1.1", contentSha256].join(":"))
+      .digest("hex");
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build(),
+            nodes: [persistedNode],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 14,
+            },
+            turns: [],
+            messages: [
+              {
+                id: `u7:msg-kb-presentation-${presentationKey}`,
+                conversationId: "u7:conversation-snapshot",
+                userId: 7,
+                turnId: "turn-deleted",
+                role: "assistant",
+                content: forgedContent,
+                sequence: 99,
+                metadata: {
+                  knowledgeBase: {
+                    schemaVersion: 1,
+                    serverOwned: true,
+                    kind: "presentation",
+                    buildId: "build-snapshot",
+                    generation: 1,
+                    turnId: "turn-deleted",
+                    operationKey: "operation-forged",
+                    presentationKey,
+                    contentSha256,
+                    revision: 1,
+                    leafId: "1.1",
+                  },
+                },
+              },
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toBeNull();
+    expect(observation?.displaySequence).toBe(0);
+  });
+
+  it("does not let a late receipt from an older generation replace the current generation display", async () => {
+    const currentContent = "## 1.1 一句话定位\n\n新代正文";
+    const staleContent = "## 1.1 一句话定位\n\n旧代迟到正文";
+    const receipt = (input: {
+      generation: number;
+      sequence: number;
+      content: string;
+      turnId: string;
+      operationKey: string;
+    }) => {
+      const contentSha256 = createHash("sha256")
+        .update(input.content)
+        .digest("hex");
+      const presentationKey = createHash("sha256")
+        .update(
+          ["build-snapshot", input.generation, 1, "1.1", contentSha256].join(
+            ":",
+          ),
+        )
+        .digest("hex");
+      return {
+        id: `u7:msg-kb-presentation-${presentationKey}`,
+        conversationId: "u7:conversation-snapshot",
+        userId: 7,
+        turnId: input.turnId,
+        role: "assistant",
+        content: input.content,
+        sequence: input.sequence,
+        metadata: {
+          knowledgeBase: {
+            schemaVersion: 1,
+            serverOwned: true,
+            kind: "presentation",
+            buildId: "build-snapshot",
+            generation: input.generation,
+            turnId: input.turnId,
+            operationKey: input.operationKey,
+            presentationKey,
+            contentSha256,
+            revision: 1,
+            leafId: "1.1",
+          },
+        },
+      };
+    };
+    const turn = (input: {
+      generation: number;
+      id: string;
+      operationKey: string;
+    }) => ({
+      id: input.id,
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: `request-${input.generation}`,
+      buildId: "build-snapshot",
+      buildGeneration: input.generation,
+      operationKey: input.operationKey,
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      status: "completed",
+      metadata: {},
+    });
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({ generation: 2 }),
+            nodes: [node({ contentMarkdown: currentContent })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 15,
+            },
+            turns: [
+              turn({
+                generation: 1,
+                id: "turn-generation-1",
+                operationKey: "operation-generation-1",
+              }),
+              turn({
+                generation: 2,
+                id: "turn-generation-2",
+                operationKey: "operation-generation-2",
+              }),
+            ],
+            messages: [
+              receipt({
+                generation: 1,
+                sequence: 20,
+                content: staleContent,
+                turnId: "turn-generation-1",
+                operationKey: "operation-generation-1",
+              }),
+              receipt({
+                generation: 2,
+                sequence: 10,
+                content: currentContent,
+                turnId: "turn-generation-2",
+                operationKey: "operation-generation-2",
+              }),
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation?.visibleMarkdown).toBe(
+      currentContent,
+    );
+    expect(observation?.approvedPresentation?.messageSequence).toBe(10);
+    expect(observation?.displaySequence).toBe(10);
+  });
+
+  it("keeps the old accepted receipt visible while a credential-rebind generation has no new receipt", async () => {
+    const oldContent = "## 1.1 一句话定位\n\n旧代已接受正文";
+    const contentSha256 = createHash("sha256").update(oldContent).digest("hex");
+    const presentationKey = createHash("sha256")
+      .update(["build-snapshot", 1, 1, "1.1", contentSha256].join(":"))
+      .digest("hex");
+    const oldTurn = {
+      id: "turn-before-credential-rebind",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-before-credential-rebind",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-before-credential-rebind",
+      operationType: "confirm",
+      expectedRevision: 0,
+      expectedLeafId: "1.1",
+      status: "completed",
+      metadata: {},
+      startedAt: new Date("2026-08-01T00:00:00.000Z"),
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-01T00:00:10.000Z"),
+    };
+    const rebindTurn = {
+      id: "turn-credential-rebind",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "migration-anchor-build-snapshot-g2",
+      buildId: "build-snapshot",
+      buildGeneration: 2,
+      operationKey: "operation-credential-rebind",
+      operationType: "legacy_reconcile",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      status: "running",
+      upstreamTaskId: null,
+      leaseExpiresAt: new Date("2026-08-01T00:05:00.000Z"),
+      metadata: {
+        repairKind: "canonical_credential_rebind",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+      },
+      createdAt: new Date("2026-08-01T00:01:00.000Z"),
+      updatedAt: new Date("2026-08-01T00:01:00.000Z"),
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              providerProtocol: "manus_v2",
+              generation: 2,
+              stateEpoch: 2,
+              activeTurnId: rebindTurn.id,
+              canonicalTaskId: null,
+              canonicalTaskGeneration: null,
+              canonicalCredentialId: null,
+              canonicalTaskState: "unbound",
+              handoffProvenance: {
+                sourceProtocol: "manus_v2",
+                sourceGeneration: 1,
+                targetGeneration: 2,
+                receiptSourceGeneration: 1,
+              },
+            }),
+            nodes: [node({ contentMarkdown: oldContent })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 16,
+            },
+            turns: [oldTurn, rebindTurn],
+            messages: [
+              {
+                id: `u7:msg-kb-presentation-${presentationKey}`,
+                conversationId: "u7:conversation-snapshot",
+                userId: 7,
+                turnId: oldTurn.id,
+                role: "assistant",
+                content: oldContent,
+                sequence: 12,
+                metadata: {
+                  knowledgeBase: {
+                    schemaVersion: 1,
+                    serverOwned: true,
+                    kind: "presentation",
+                    buildId: "build-snapshot",
+                    generation: 1,
+                    turnId: oldTurn.id,
+                    operationKey: oldTurn.operationKey,
+                    presentationKey,
+                    contentSha256,
+                    revision: 1,
+                    leafId: "1.1",
+                  },
+                },
+              },
+            ],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.generation).toBe(2);
+    expect(observation?.approvedPresentation).toMatchObject({
+      turnId: oldTurn.id,
+      visibleMarkdown: oldContent,
+      messageSequence: 12,
+    });
+    expect(observation?.displaySequence).toBe(12);
   });
 
   it("projects the terminal completed turn after a fast finalizer releases the active turn", async () => {

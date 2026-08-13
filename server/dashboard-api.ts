@@ -142,6 +142,15 @@ import {
 } from "./knowledge-base-customer-upload";
 import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
 import {
+  isDashboardOwnedKnowledgePackageBuild,
+  readDashboardOwnedKnowledgePackage,
+} from "./knowledge-base-local-package";
+import {
+  KnowledgeSnapshotDownloadBindingError,
+  loadKnowledgeSnapshotDownloadValidation,
+  validateDashboardOwnedSnapshotArchiveForDownload,
+} from "./knowledge-snapshot-download-validation";
+import {
   basicRasterImageDimensions,
   decodedRasterImageDimensions,
   hasSupportedImageSignature,
@@ -6377,6 +6386,37 @@ export function assertKnowledgeArchiveEnterpriseIdentity(input: {
 }
 
 /**
+ * Dashboard-owned archives bind enterprise identity through two independent
+ * durable facts: the build row frozen before Provider work and the manifest
+ * embedded in the exact locally persisted ZIP. Accepted node prose is not an
+ * identity ledger and may legitimately use a product name or abbreviation.
+ */
+export function assertDashboardOwnedKnowledgePackageEnterpriseIdentity(input: {
+  brandName: string;
+  buildCompanyName: string;
+  manifestCompanyName: string;
+}) {
+  const brandName = normalizedEnterpriseEvidence(input.brandName);
+  const buildCompanyName = normalizedEnterpriseEvidence(input.buildCompanyName);
+  const manifestCompanyName = normalizedEnterpriseEvidence(
+    input.manifestCompanyName,
+  );
+  if (!brandName) {
+    throw new Error("请先由管理员配置当前账号的企业名称");
+  }
+  if (
+    !buildCompanyName ||
+    !manifestCompanyName ||
+    buildCompanyName !== brandName ||
+    manifestCompanyName !== brandName
+  ) {
+    throw new Error(
+      `知识库包绑定企业与当前账号“${input.brandName}”不一致，请核对目标用户后重新生成`,
+    );
+  }
+}
+
+/**
  * A knowledge snapshot authenticated for the current service is durable proof
  * of the same enterprise identity: every snapshot passes
  * assertKnowledgeArchiveEnterpriseIdentity before it becomes active. Older
@@ -6778,7 +6818,12 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       res.json({ kind: "knowledge", snapshot, idempotent: true });
       return;
     }
-    const taskId = String(build.packageTaskId || build.upstreamTaskId || "");
+    const taskId = String(
+      build.packageTaskId ||
+        build.canonicalTaskId ||
+        build.upstreamTaskId ||
+        "",
+    );
     const hasDurablePackage = Boolean(
       build.packageStorageKey &&
         build.packageArchiveSha256 &&
@@ -6876,24 +6921,62 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       .update(downloaded.buffer)
       .digest("hex");
     const snapshotId = randomUUID();
-    const parsed = await readKnowledgeArchive(
-      downloaded.buffer,
-      downloaded.filename,
-      snapshotId,
-      {
-        validationProfile:
-          build.skillVersion === "1" ? "historical" : "dashboard-enterprise-v1",
-        archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
-          build.skillVersion,
-        ),
-        dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
-          build.treePolicyVersion,
-        ).minLeaves,
-        requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
-      },
-    );
+    const dashboardOwnedPackage = isDashboardOwnedKnowledgePackageBuild(build);
+    const packageNodes = dashboardOwnedPackage
+      ? await getDb().then(async (db) => {
+          if (!db) throw new Error("数据库暂不可用，无法校验本地知识库包");
+          return db
+            .select()
+            .from(knowledgeBaseBuildNodes)
+            .where(eq(knowledgeBaseBuildNodes.buildId, build.id));
+        })
+      : undefined;
+    const parsed = dashboardOwnedPackage
+      ? await readDashboardOwnedKnowledgePackage({
+          buffer: downloaded.buffer,
+          expected: {
+            buildId: build.id,
+            generation: build.generation,
+            revision: build.revision,
+            companyName: build.companyName,
+          },
+          nodes: packageNodes,
+          storeAsset: async ({ path: assetPath, buffer }) => {
+            const extension = path.extname(assetPath).toLowerCase();
+            if (!imageMimeByExtension[extension]) {
+              throw new Error("本地知识库包包含不支持的资源格式");
+            }
+            const key = `${randomUUID()}${extension}`;
+            await mkdir(storageRoot, { recursive: true });
+            await writeFile(path.join(storageRoot, key), buffer, {
+              flag: "wx",
+            });
+            return key;
+          },
+        })
+      : await readKnowledgeArchive(
+          downloaded.buffer,
+          downloaded.filename,
+          snapshotId,
+          {
+            validationProfile:
+              build.skillVersion === "1"
+                ? "historical"
+                : "dashboard-enterprise-v1",
+            archiveContractVersions: knowledgeBaseArchiveReadContractVersions(
+              build.skillVersion,
+            ),
+            dashboardEnterpriseMinLeaves: knowledgeBaseTreePolicy(
+              build.treePolicyVersion,
+            ).minLeaves,
+            requireDashboardAdaptiveFormalGate: build.treePolicyVersion === 2,
+          },
+        );
     storedAssetKeys = parsed.storedAssetKeys;
-    if (build.skillVersion === "3" || build.skillVersion === "4") {
+    if (
+      !dashboardOwnedPackage &&
+      (build.skillVersion === "3" || build.skillVersion === "4")
+    ) {
       if (
         build.skillVersion === "4" &&
         parsed.packageBuildRevision !== build.revision
@@ -6958,11 +7041,25 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       }
     }
     const workspace = await getDashboardWorkspace(targetUserId);
-    assertKnowledgeArchiveEnterpriseIdentity({
-      enterpriseIdentityConfirmed: Boolean(workspace.enterpriseIdentityBoundAt),
-      brandName: workspace.payload.brandName,
-      documents: parsed.documents,
-    });
+    if (dashboardOwnedPackage) {
+      assertDashboardOwnedKnowledgePackageEnterpriseIdentity({
+        brandName: workspace.payload.brandName,
+        buildCompanyName: build.companyName,
+        manifestCompanyName: (
+          parsed as Awaited<
+            ReturnType<typeof readDashboardOwnedKnowledgePackage>
+          >
+        ).manifest.companyName,
+      });
+    } else {
+      assertKnowledgeArchiveEnterpriseIdentity({
+        enterpriseIdentityConfirmed: Boolean(
+          workspace.enterpriseIdentityBoundAt,
+        ),
+        brandName: workspace.payload.brandName,
+        documents: parsed.documents,
+      });
+    }
     await persistKnowledgeSnapshotArchive({
       userId: targetUserId,
       snapshotId,
@@ -8078,17 +8175,26 @@ router.get(
         expectedSha256: snapshot.archiveHash,
         expectedBytes: snapshot.totalBytes,
       });
-      await validateKnowledgeArchiveForDownload({
-        buffer: bytes,
-        sourceFileName: snapshot.sourceFileName,
-        expectedSha256: snapshot.archiveHash,
-        expectedBytes: snapshot.totalBytes,
-        // Historical is the compatibility superset for snapshots created
-        // before profile/version metadata was persisted. It still executes
-        // the shared CRC, path traversal, symlink, entry-count, expansion and
-        // required-root structure checks before any bytes leave the server.
-        validationProfile: "historical",
-      });
+      const validation =
+        await loadKnowledgeSnapshotDownloadValidation(snapshot);
+      if (validation.kind === "dashboard_owned") {
+        await validateDashboardOwnedSnapshotArchiveForDownload({
+          buffer: bytes,
+          validation,
+        });
+      } else {
+        await validateKnowledgeArchiveForDownload({
+          buffer: bytes,
+          sourceFileName: snapshot.sourceFileName,
+          expectedSha256: snapshot.archiveHash,
+          expectedBytes: snapshot.totalBytes,
+          // Historical is the compatibility superset for snapshots created
+          // before profile/version metadata was persisted. It still executes
+          // the shared CRC, path traversal, symlink, entry-count, expansion and
+          // required-root structure checks before any bytes leave the server.
+          validationProfile: "historical",
+        });
+      }
       res.setHeader("Cache-Control", "private, no-store");
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Length", String(bytes.length));
@@ -8102,9 +8208,12 @@ router.get(
         error instanceof KnowledgeSnapshotArchiveError ? error : null;
       const validationError =
         error instanceof KnowledgeArchiveValidationError ? error : null;
+      const bindingError =
+        error instanceof KnowledgeSnapshotDownloadBindingError ? error : null;
       res
         .status(
           validationError ||
+            bindingError ||
             (archiveError && archiveError.code !== "ARCHIVE_NOT_FOUND")
             ? 409
             : 404,
@@ -8113,10 +8222,12 @@ router.get(
           error: {
             message:
               validationError?.message ||
+              bindingError?.message ||
               archiveError?.message ||
               "知识库 ZIP 不存在",
             code:
               knowledgeArchiveErrorCode(validationError) ||
+              (bindingError ? "KNOWLEDGE_ARCHIVE_BINDING_INVALID" : null) ||
               archiveError?.code ||
               "NOT_FOUND",
           },

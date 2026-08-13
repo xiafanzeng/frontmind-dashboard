@@ -6,6 +6,7 @@ import {
   apiCredentials,
   conversations,
   conversationTurns,
+  knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
@@ -15,14 +16,19 @@ import {
   type ConversationTurn,
 } from "../drizzle/schema";
 import {
+  activateKnowledgeBaseManusV2Handoff,
   KnowledgeBaseTurnReservationError,
+  beginKnowledgeBaseManusV2Dispatch,
+  bindKnowledgeBaseManusV2Submission,
   cancelUnpreparedKnowledgeBaseTurn,
   completeKnowledgeBaseGeneratedAttachment,
+  completeKnowledgeBaseManusV2AnchorHandoff,
   createKnowledgeBaseGeneratedAttachmentIdempotencyKey,
   createKnowledgeBaseOperationKey,
   createKnowledgeBaseUpstreamIdempotencyKey,
   evaluateKnowledgeBaseTurnReplay,
   failKnowledgeBaseTurnDeterministically,
+  finalizeKnowledgeBaseManusV2AttachmentMappings,
   findReusableKnowledgeBaseSkillFileId,
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseTurnForRecovery,
@@ -35,13 +41,25 @@ import {
   inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
   inspectKnowledgeBaseRetryAuthority,
+  inspectKnowledgeBaseFailedNotSentLegacyHandoffAuthority,
   knowledgeBaseRetryRequiresFreshFinalDelivery,
   markKnowledgeBaseTurnOutcomeUnknown,
+  markKnowledgeBaseManusV2OutcomeUnknown,
+  markKnowledgeBaseManusV2AttentionRequired,
+  markKnowledgeBaseManusV2CredentialRebindAttention,
+  markLegacyKnowledgeBaseCreateAttentionRequired,
+  mutateKnowledgeBaseManusV2Lifecycle,
+  persistKnowledgeBaseManusV2AttachmentAttempt,
+  persistKnowledgeBaseManusV2AttachmentOutcomeUnknown,
+  persistKnowledgeBaseManusV2AttachmentMapping,
   prepareKnowledgeBaseTurnDispatch,
+  promoteKnowledgeBaseGeneratedAttachmentReady,
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   reserveKnowledgeBaseGeneratedAttachment,
+  reserveKnowledgeBaseFailedNotSentLegacyHandoff,
   reserveKnowledgeBaseRetryTurn,
+  reserveKnowledgeBaseManusV2AnchorHandoff,
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
   replaceKnowledgeBaseTurnAttachmentsAfterUserFix,
@@ -49,11 +67,13 @@ import {
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseDeferredTurnAttachment,
   sanitizeKnowledgeBaseRecoveryMetadata,
+  settleKnowledgeBaseManusV2ExplicitRejection,
 } from "./knowledge-base-turn-service";
 import {
   KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
   KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
 } from "./knowledge-base-tree-policy-rollout";
+import { KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV } from "./knowledge-base-manus-v2-rollout";
 
 function turn(overrides: Partial<ConversationTurn> = {}): ConversationTurn {
   const now = new Date("2026-08-01T00:00:00.000Z");
@@ -111,6 +131,7 @@ interface TurnServiceStore {
   tombstones: any[];
   retainedTombstones: any[];
   resources: any[];
+  nodes: any[];
   usageOwnerId: number | null;
 }
 
@@ -118,11 +139,14 @@ function createTurnServiceExecutor(input: {
   build?: any;
   conversation?: any;
   turns?: ConversationTurn[];
+  messages?: any[];
   credentials?: any[];
   tombstones?: any[];
   retainedTombstones?: any[];
   resources?: any[];
+  nodes?: any[];
   usageOwnerId?: number | null;
+  selectAllMessages?: boolean;
   turnSelections: TurnSelection[][];
   failConversationInsertAtTransaction?: number;
 }) {
@@ -130,7 +154,7 @@ function createTurnServiceExecutor(input: {
     build: input.build || null,
     conversation: input.conversation || null,
     turns: [...(input.turns || [])],
-    messages: [],
+    messages: structuredClone(input.messages || []),
     credentials: [
       ...(input.credentials || [
         {
@@ -143,6 +167,7 @@ function createTurnServiceExecutor(input: {
     tombstones: [...(input.tombstones || [])],
     retainedTombstones: [...(input.retainedTombstones || [])],
     resources: [...(input.resources || [])],
+    nodes: structuredClone(input.nodes || []),
     usageOwnerId: input.usageOwnerId ?? null,
   };
   const events: string[] = [];
@@ -186,6 +211,7 @@ function createTurnServiceExecutor(input: {
           return store.retainedTombstones;
         }
         if (table === messages) {
+          if (input.selectAllMessages) return store.messages;
           const isIdentityLookup = messageSelectionIndex++ % 2 === 0;
           if (!isIdentityLookup) return store.messages;
           const latestTurn = store.turns.at(-1);
@@ -193,6 +219,9 @@ function createTurnServiceExecutor(input: {
             ? `u${latestTurn.userId}:msg-kb-user-${latestTurn.id}`
             : "";
           return store.messages.filter((message) => message.id === expectedId);
+        }
+        if (table === knowledgeBaseBuildNodes) {
+          return store.nodes;
         }
         if (table === upstreamResources) {
           return store.resources;
@@ -209,6 +238,14 @@ function createTurnServiceExecutor(input: {
         condition?: unknown,
         options: { peekTurn?: boolean } = {},
       ) => ({
+        then: (
+          resolve: (value: unknown) => unknown,
+          reject: (reason: unknown) => unknown,
+        ) =>
+          Promise.resolve(selected(table, condition, options)).then(
+            resolve,
+            reject,
+          ),
         limit: () => ({
           for: async () => {
             if (table === upstreamResources) {
@@ -225,12 +262,22 @@ function createTurnServiceExecutor(input: {
               reject,
             ),
         }),
-        orderBy: () => ({
-          limit: async () =>
-            [...selected(table)].sort(
-              (left: any, right: any) => right.sequence - left.sequence,
-            ),
-        }),
+        orderBy: () => {
+          const ordered = () =>
+            [...selected(table)].sort((left: any, right: any) => {
+              if (typeof left.ordinal === "number") {
+                return left.ordinal - right.ordinal;
+              }
+              return right.sequence - left.sequence;
+            });
+          return {
+            limit: async () => ordered(),
+            then: (
+              resolve: (value: unknown) => unknown,
+              reject: (reason: unknown) => unknown,
+            ) => Promise.resolve(ordered()).then(resolve, reject),
+          };
+        },
       });
       const tx = {
         select: (projection?: unknown) => ({
@@ -301,6 +348,7 @@ function createTurnServiceExecutor(input: {
                 }));
                 events.push("start-attachments:bind");
               }
+              return [{ affectedRows: 1 }];
             },
           }),
         }),
@@ -318,6 +366,7 @@ function createTurnServiceExecutor(input: {
         store.tombstones = snapshot.tombstones;
         store.retainedTombstones = snapshot.retainedTombstones;
         store.resources = snapshot.resources;
+        store.nodes = snapshot.nodes;
         store.usageOwnerId = snapshot.usageOwnerId;
         throw error;
       }
@@ -397,6 +446,2402 @@ function retryableFailedTurn(overrides: Partial<ConversationTurn> = {}) {
   });
   return failed;
 }
+
+function failedNotSentLegacyHandoffTurn(
+  overrides: Partial<ConversationTurn> = {},
+) {
+  const operationKey = createKnowledgeBaseOperationKey({
+    buildId: identity.buildId,
+    buildGeneration: 3,
+    operationType: "confirm",
+    expectedRevision: 7,
+    expectedLeafId: "1.8",
+  });
+  const recovery = {
+    kind: "turn",
+    conversationId: "conversation-1",
+    parentTaskId: "legacy-main-task",
+    userMessage: "确认",
+    attachments: [] as Array<{ file_id: string; filename: string }>,
+    attachmentManifest: [] as unknown[],
+    skillVersion: "4",
+    skillContentHash: "c".repeat(64),
+  };
+  const requestBody = {
+    prompt: "historical prompt that was never sent",
+    agentProfile: "frontmind-pro",
+    taskMode: "agent" as const,
+    taskId: "legacy-main-task",
+    attachments: [
+      { file_id: "stale-skill-file", filename: "skill.zip" },
+      {
+        file_id: "stale-instructions-file",
+        filename: "instructions.txt",
+      },
+    ],
+  };
+  return turn({
+    operationKey,
+    requestHash: hashKnowledgeBaseTurnRequest({
+      operationType: "confirm",
+      generation: 3,
+      revision: 7,
+      leafId: "1.8",
+      expectedAttachmentCount: 2,
+      userAttachmentCount: 0,
+      payload: {
+        userMessage: recovery.userMessage,
+        attachments: recovery.attachments,
+        skillVersion: recovery.skillVersion,
+        skillContentHash: recovery.skillContentHash,
+      },
+    }),
+    upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+      createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+    ),
+    status: "failed",
+    upstreamTaskId: null,
+    leaseExpiresAt: null,
+    completedAt: new Date("2026-08-01T00:00:20.000Z"),
+    attachmentFileIds: requestBody.attachments.map((item) => item.file_id),
+    metadata: {
+      attachmentsFrozen: true,
+      expectedAttachmentCount: 2,
+      userAttachmentCount: 0,
+      createAttemptState: "not_sent",
+      providerProtocol: "legacy_v1",
+      providerAttemptState: "not_sent",
+      dispatchState: "failed",
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+      canRegenerate: false,
+      recovery,
+      preparedDispatch: {
+        schemaVersion: 1,
+        baseUrl: "https://api.example.test",
+        requestBody,
+        bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+        preparedAt: "2026-08-01T00:00:10.000Z",
+      },
+    },
+    ...overrides,
+  });
+}
+
+describe("failed not-sent legacy business handoff", () => {
+  function legacyBuild(source: ConversationTurn) {
+    return {
+      id: identity.buildId,
+      userId: 1,
+      conversationId: "conversation-1",
+      companyName: "Example",
+      companyWebsite: null,
+      upstreamTaskId: "legacy-main-task",
+      providerProtocol: "legacy_v1",
+      canonicalTaskId: null,
+      canonicalTaskGeneration: null,
+      canonicalCredentialId: null,
+      canonicalTaskState: "unbound",
+      canonicalTaskUrl: null,
+      canonicalTaskCreatedAt: null,
+      handoffProvenance: null,
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      skillArchiveSha256: null,
+      skillArchiveBytes: null,
+      skillArchiveStorageKey: null,
+      treePolicyVersion: 2,
+      status: "protocol_error",
+      generation: 3,
+      stateEpoch: 7,
+      revision: 7,
+      currentLeafId: "1.8",
+      activeTurnId: source.id,
+      protocolErrorCode: "SKILL_FILE_404",
+      protocolError: "historical local failure",
+      recoveryLeaseOwnerHash: null,
+      recoveryLeaseExpiresAt: null,
+      totalNodeCount: 40,
+      confirmedCount: 7,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      lastTurnUserText: "确认",
+      lastTurnAttachmentCount: 0,
+      awaitingResponseSince: null,
+      createdAt: new Date("2026-08-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-08-01T00:00:20.000Z"),
+      completedAt: null,
+      publishedAt: null,
+    } as any;
+  }
+
+  const localProof = async () => [];
+
+  it("proves only exact never-sent history and rejects sending/unknown state", () => {
+    const source = failedNotSentLegacyHandoffTurn();
+    const build = legacyBuild(source);
+    expect(
+      inspectKnowledgeBaseFailedNotSentLegacyHandoffAuthority(source, build),
+    ).not.toBeNull();
+    for (const metadataPatch of [
+      { createAttemptState: "sending", providerAttemptState: "sending" },
+      {
+        createAttemptState: "unknown",
+        providerAttemptState: "outcome_unknown",
+        outcomeUnknownAt: "2026-08-01T00:00:10.000Z",
+      },
+      {
+        failureClass: "requires_user_fix",
+        recoveryAction: "update_credential",
+      },
+    ]) {
+      const candidate = {
+        ...source,
+        metadata: { ...(source.metadata as object), ...metadataPatch },
+      } as ConversationTurn;
+      expect(
+        inspectKnowledgeBaseFailedNotSentLegacyHandoffAuthority(
+          candidate,
+          build,
+        ),
+      ).toBeNull();
+    }
+  });
+
+  it("creates one hidden replacement with no second customer message or charge", async () => {
+    const source = failedNotSentLegacyHandoffTurn();
+    const build = legacyBuild(source);
+    const conversation = {
+      id: source.conversationId,
+      userId: source.userId,
+      apiCredentialId: source.apiCredentialId,
+      projectAssignmentId: null,
+      status: "failed",
+      version: 9,
+      deletedAt: null,
+      deletedMessageIds: [],
+    };
+    const sourceSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === source.id);
+    const harness = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [source],
+      turnSelections: [[sourceSelection, sourceSelection]],
+    });
+    const serviceDb = {
+      ...harness.executor,
+      select: (...args: any[]) => {
+        const projection = args[0];
+        return {
+          from: (table: unknown) => ({
+            where: () => ({
+              limit: async () =>
+                table === knowledgeBaseBuilds
+                  ? [harness.store.build]
+                  : projection === undefined
+                    ? [harness.store.turns[0]]
+                    : [],
+            }),
+          }),
+        };
+      },
+    };
+    const result = await reserveKnowledgeBaseFailedNotSentLegacyHandoff(
+      {
+        userId: 1,
+        buildId: build.id,
+        sourceTurnId: source.id,
+        expectedGeneration: 3,
+        expectedStateEpoch: 7,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        now: new Date("2026-08-01T00:01:00.000Z"),
+      },
+      serviceDb,
+      { proveLocalSources: localProof as any },
+    );
+
+    expect(result.state).toBe("reserved");
+    expect(harness.store.turns).toHaveLength(2);
+    expect(harness.store.messages).toEqual([]);
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "cancelled",
+      metadata: { supersededReason: "legacy_failed_not_sent_handoff" },
+    });
+    expect(harness.store.turns[1]).toMatchObject({
+      operationType: "confirm",
+      status: "queued",
+      upstreamTaskId: null,
+      attachmentFileIds: [],
+      metadata: {
+        repairKind: "legacy_failed_not_sent_handoff",
+        hiddenReplacement: true,
+        chargeDisposition: "reuse_original_no_charge",
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: result.replacementTurnId,
+      providerProtocol: "legacy_v1",
+      status: "confirming",
+    });
+
+    const replay = await reserveKnowledgeBaseFailedNotSentLegacyHandoff(
+      {
+        userId: 1,
+        buildId: build.id,
+        sourceTurnId: source.id,
+        expectedGeneration: 3,
+        expectedStateEpoch: 7,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+      },
+      serviceDb,
+      {
+        proveLocalSources: async () => {
+          throw new Error("a duplicate worker must not repeat local proof");
+        },
+      },
+    );
+    expect(replay).toEqual({
+      state: "already_reserved",
+      sourceTurnId: source.id,
+      replacementTurnId: result.replacementTurnId,
+      buildId: build.id,
+    });
+    expect(harness.store.turns).toHaveLength(2);
+    expect(harness.store.messages).toEqual([]);
+  });
+
+  it("uses one current credential and generation+1 when the never-sent pinned credential was deleted", async () => {
+    const source = failedNotSentLegacyHandoffTurn();
+    const build = legacyBuild(source);
+    const sourceSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === source.id);
+    const harness = createTurnServiceExecutor({
+      build,
+      conversation: {
+        id: source.conversationId,
+        userId: source.userId,
+        apiCredentialId: source.apiCredentialId,
+        projectAssignmentId: null,
+        status: "failed",
+        version: 9,
+        deletedAt: null,
+        deletedMessageIds: [],
+      },
+      turns: [source],
+      credentials: [
+        { id: "credential-1", userId: 1, status: "deleted" },
+        { id: "credential-current", userId: 1, status: "active" },
+      ],
+      turnSelections: [[sourceSelection, sourceSelection]],
+    });
+    const serviceDb = {
+      ...harness.executor,
+      select: (...args: any[]) => {
+        const projection = args[0];
+        return {
+          from: (table: unknown) => ({
+            where: () => ({
+              limit: async () =>
+                table === knowledgeBaseBuilds
+                  ? [harness.store.build]
+                  : projection === undefined
+                    ? [harness.store.turns[0]]
+                    : [],
+            }),
+          }),
+        };
+      },
+    };
+
+    const result = await reserveKnowledgeBaseFailedNotSentLegacyHandoff(
+      {
+        userId: 1,
+        buildId: build.id,
+        sourceTurnId: source.id,
+        expectedGeneration: 3,
+        expectedStateEpoch: 7,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        replacementCredentialId: "credential-current",
+        now: new Date("2026-08-01T00:01:00.000Z"),
+      },
+      serviceDb,
+      { proveLocalSources: localProof as any },
+    );
+
+    expect(result.state).toBe("reserved");
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "cancelled",
+      buildGeneration: 3,
+    });
+    expect(harness.store.turns[1]).toMatchObject({
+      apiCredentialId: "credential-current",
+      buildGeneration: 4,
+      upstreamTaskId: null,
+      metadata: {
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+        receiptSourceGeneration: 3,
+        credentialRebound: true,
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      generation: 4,
+      activeTurnId: result.replacementTurnId,
+      providerProtocol: "legacy_v1",
+      handoffProvenance: {
+        sourceGeneration: 3,
+        targetGeneration: 4,
+        receiptSourceGeneration: 3,
+      },
+    });
+    expect(harness.store.conversation).toMatchObject({
+      apiCredentialId: "credential-current",
+      status: "running",
+    });
+  });
+});
+
+describe("Manus v2 canonical task writer fence", () => {
+  const build = (overrides: Record<string, unknown> = {}) => ({
+    id: identity.buildId,
+    userId: 1,
+    conversationId: "conversation-1",
+    companyName: "Example",
+    companyWebsite: null,
+    upstreamTaskId: null,
+    providerProtocol: "manus_v2",
+    canonicalTaskId: null,
+    canonicalTaskGeneration: null,
+    canonicalCredentialId: null,
+    canonicalTaskState: "unbound",
+    canonicalTaskUrl: null,
+    canonicalTaskCreatedAt: null,
+    handoffProvenance: null,
+    skillName: "socratic-kb-builder",
+    skillVersion: "4",
+    skillContentHash: "c".repeat(64),
+    treePolicyVersion: 2,
+    initialResearchCoverage: null,
+    status: "confirming",
+    generation: 3,
+    stateEpoch: 7,
+    activeTurnId: "00000000-0000-4000-8000-000000000001",
+    recoveryLeaseOwnerHash: null,
+    recoveryLeaseExpiresAt: null,
+    lastAppliedOperationKey: null,
+    currentPresentationKey: "presentation-7",
+    revision: 7,
+    currentLeafId: "1.8",
+    totalNodeCount: 30,
+    confirmedCount: 7,
+    directPrefilledCount: 0,
+    needsVerificationCount: 0,
+    lastReconciledHash: null,
+    lastOutputLength: 0,
+    lastOutputItemIds: [],
+    lastTurnUserText: null,
+    lastTurnAttachmentCount: 0,
+    awaitingResponseSince: null,
+    packageRevision: null,
+    packageTaskId: null,
+    packageOutputItemId: null,
+    packageFileId: null,
+    packageFilename: null,
+    packageDescriptorHash: null,
+    skillArchiveSha256: null,
+    skillArchiveBytes: null,
+    skillArchiveStorageKey: null,
+    contentCompletedAt: null,
+    packageStatus: "not_started",
+    packageAttemptCount: 0,
+    packageNextRetryAt: null,
+    packageLastErrorCode: null,
+    logoStorageKey: null,
+    logoSha256: null,
+    logoBytes: null,
+    logoFilename: null,
+    logoMimeType: null,
+    packageStorageKey: null,
+    packageArchiveSha256: null,
+    packageSizeBytes: null,
+    protocolErrorCode: null,
+    protocolError: null,
+    publishedSnapshotId: null,
+    createdAt: new Date("2026-08-01T00:00:00.000Z"),
+    updatedAt: new Date("2026-08-01T00:00:00.000Z"),
+    completedAt: null,
+    publishedAt: null,
+    ...overrides,
+  });
+
+  it("reserves an idle legacy anchor without changing accepted nodes or messages", async () => {
+    const acceptedNodes = [
+      {
+        leafId: "1.8",
+        branchId: "1",
+        branchTitle: "Facts",
+        title: "Accepted fact",
+        ordinal: 8,
+        status: "confirmed",
+        contentMarkdown: "durable accepted content",
+        contentSha256: "d".repeat(64),
+        lastUserInput: "确认",
+        sourceUrls: ["https://example.test/source"],
+        imageUrls: [],
+      },
+    ];
+    const harness = createTurnServiceExecutor({
+      build: build({
+        providerProtocol: "legacy_v1",
+        upstreamTaskId: "legacy-task",
+        activeTurnId: null,
+      }),
+      conversation: {
+        id: "u1:conversation-1",
+        userId: 1,
+        apiCredentialId: "credential-1",
+        projectAssignmentId: null,
+        status: "awaiting_input",
+        version: 4,
+        deletedAt: null,
+      },
+      credentials: [{ id: "credential-1", userId: 1, status: "retired" }],
+      resources: [
+        {
+          id: "resource-legacy",
+          userId: 1,
+          projectAssignmentId: null,
+          kind: "task",
+          upstreamId: "legacy-task",
+          apiCredentialId: "credential-1",
+        },
+      ],
+      nodes: acceptedNodes,
+      turnSelections: [[]],
+    });
+    const beforeNodes = structuredClone(harness.store.nodes);
+    const beforeMessages = structuredClone(harness.store.messages);
+
+    const reservation = await reserveKnowledgeBaseManusV2AnchorHandoff(
+      {
+        userId: 1,
+        buildId: identity.buildId,
+        expectedGeneration: 3,
+        expectedStateEpoch: 7,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        expectedLegacyTaskId: "legacy-task",
+        apiCredentialId: "credential-1",
+        credentialMode: "legacy_task_owner",
+        baseUrl: "https://api.example.test",
+        agentProfile: "frontmind-pro",
+        now: new Date("2026-08-01T00:00:30.000Z"),
+        leaseMs: 300_000,
+      },
+      harness.executor,
+    );
+
+    expect(reservation.recoveryMetadata).toMatchObject({
+      kind: "legacy_anchor_handoff",
+      sourceGeneration: 3,
+      targetGeneration: 3,
+      credentialMode: "legacy_task_owner",
+    });
+    expect(reservation.turn).toMatchObject({
+      providerProtocol: "manus_v2",
+      providerAttemptState: "not_sent",
+    });
+    expect(reservation.turn.attachmentFileIds).toEqual([]);
+    expect(reservation.snapshot.nodes).toEqual(acceptedNodes);
+    expect(reservation.snapshot.acceptedReceipts).toEqual([]);
+    expect(harness.store.nodes).toEqual(beforeNodes);
+    expect(harness.store.messages).toEqual(beforeMessages);
+    expect(harness.store.turns).toHaveLength(1);
+    expect(harness.store.build).toMatchObject({
+      providerProtocol: "manus_v2",
+      activeTurnId: reservation.turn.id,
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+      revision: 7,
+      currentLeafId: "1.8",
+      totalNodeCount: 30,
+      confirmedCount: 7,
+    });
+  });
+
+  it.each([null, "project-1"])(
+    "rebinds one idle v2 build from a deleted canonical credential in project scope %s",
+    async (projectAssignmentId) => {
+      const oldTaskId = "old-canonical-task";
+      const oldCredentialId = "old-credential";
+      const replacementCredentialId = "replacement-credential";
+      const sourceTurn = turn({
+        id: "00000000-0000-4000-8000-000000000099",
+        apiCredentialId: oldCredentialId,
+        clientRequestId: "accepted-request",
+        buildGeneration: 3,
+        operationKey: "accepted-operation",
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        status: "completed",
+        upstreamTaskId: oldTaskId,
+        completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      });
+      const content = "## 1.8 Accepted fact\n\nDurable accepted content.";
+      const contentSha256 = createHash("sha256")
+        .update(content, "utf8")
+        .digest("hex");
+      const presentationKey = createHash("sha256")
+        .update(
+          [identity.buildId, 3, 7, "1.8", contentSha256].join(":"),
+          "utf8",
+        )
+        .digest("hex");
+      const acceptedMessage = {
+        id: `u1:msg-kb-presentation-${presentationKey}`,
+        conversationId: "u1:conversation-1",
+        userId: 1,
+        turnId: sourceTurn.id,
+        role: "assistant",
+        content,
+        sequence: 18,
+        deletedAt: null,
+        metadata: {
+          knowledgeBase: {
+            schemaVersion: 1,
+            kind: "presentation",
+            buildId: identity.buildId,
+            operationKey: sourceTurn.operationKey,
+            turnId: sourceTurn.id,
+            presentationKey,
+            contentSha256,
+            generation: 3,
+            revision: 7,
+            leafId: "1.8",
+            serverOwned: true,
+          },
+        },
+      };
+      const acceptedNodes = [
+        {
+          leafId: "1.8",
+          branchId: "1",
+          branchTitle: "Facts",
+          title: "Accepted fact",
+          ordinal: 8,
+          status: "confirmed",
+          contentMarkdown: content,
+          contentSha256,
+          lastUserInput: "确认",
+          sourceUrls: [],
+          imageUrls: [],
+        },
+      ];
+      const harness = createTurnServiceExecutor({
+        build: build({
+          upstreamTaskId: oldTaskId,
+          canonicalTaskId: oldTaskId,
+          canonicalTaskGeneration: 3,
+          canonicalCredentialId: oldCredentialId,
+          canonicalTaskState: "active",
+          canonicalTaskUrl: `https://manus.example/${oldTaskId}`,
+          activeTurnId: null,
+        }),
+        conversation: {
+          id: "u1:conversation-1",
+          userId: 1,
+          apiCredentialId: oldCredentialId,
+          projectAssignmentId,
+          status: "awaiting_input",
+          version: 4,
+          deletedAt: null,
+        },
+        turns: [sourceTurn],
+        messages: [acceptedMessage],
+        selectAllMessages: true,
+        credentials: [
+          { id: oldCredentialId, userId: 1, status: "deleted" },
+          { id: replacementCredentialId, userId: 1, status: "active" },
+        ],
+        resources: [
+          {
+            id: "old-task-resource",
+            userId: 1,
+            projectAssignmentId,
+            kind: "task",
+            upstreamId: oldTaskId,
+            apiCredentialId: oldCredentialId,
+          },
+        ],
+        nodes: acceptedNodes,
+        turnSelections: [[() => [sourceTurn]]],
+      });
+      const beforeMessage = structuredClone(acceptedMessage);
+      const beforeNode = structuredClone(acceptedNodes[0]);
+
+      const reservation = await reserveKnowledgeBaseManusV2AnchorHandoff(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          expectedGeneration: 3,
+          expectedStateEpoch: 7,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+          expectedLegacyTaskId: null,
+          sourceProtocol: "manus_v2",
+          expectedCanonicalTaskId: oldTaskId,
+          expectedCanonicalCredentialId: oldCredentialId,
+          apiCredentialId: replacementCredentialId,
+          credentialMode: "current_rebind",
+          baseUrl: "https://api.example.test",
+          agentProfile: "frontmind-pro",
+          now: new Date("2026-08-01T00:00:30.000Z"),
+        },
+        harness.executor,
+      );
+
+      expect(reservation).toMatchObject({
+        sourceGeneration: 3,
+        targetGeneration: 4,
+        turn: {
+          buildGeneration: 4,
+          providerProtocol: "manus_v2",
+          providerAttemptState: "not_sent",
+        },
+        recoveryMetadata: {
+          kind: "canonical_credential_rebind",
+          sourceProtocol: "manus_v2",
+          sourceGeneration: 3,
+          targetGeneration: 4,
+          credentialMode: "current_rebind",
+        },
+        snapshot: {
+          purpose: "manus_v2_credential_rebind_anchor_handoff",
+          source: {
+            providerProtocol: "manus_v2",
+            generation: 3,
+            targetGeneration: 4,
+          },
+          acceptedReceipts: [
+            expect.objectContaining({
+              sequence: 18,
+              turnId: sourceTurn.id,
+              content,
+            }),
+          ],
+        },
+      });
+      expect(harness.store.build).toMatchObject({
+        providerProtocol: "manus_v2",
+        generation: 4,
+        activeTurnId: reservation.turn.id,
+        canonicalTaskId: null,
+        canonicalTaskGeneration: null,
+        canonicalCredentialId: null,
+        canonicalTaskState: "unbound",
+        upstreamTaskId: oldTaskId,
+        handoffProvenance: {
+          sourceProtocol: "manus_v2",
+          sourceGeneration: 3,
+          targetGeneration: 4,
+          receiptSourceGeneration: 3,
+        },
+      });
+      expect(harness.store.resources).toEqual([
+        expect.objectContaining({
+          upstreamId: oldTaskId,
+          apiCredentialId: oldCredentialId,
+        }),
+      ]);
+      expect(harness.store.messages).toEqual([beforeMessage]);
+      expect(harness.store.nodes).toEqual([beforeNode]);
+    },
+  );
+
+  it("rejects a v2 credential rebind when the task resource belongs to another project", async () => {
+    const oldTaskId = "old-canonical-task";
+    const oldCredentialId = "old-credential";
+    const harness = createTurnServiceExecutor({
+      build: build({
+        upstreamTaskId: oldTaskId,
+        canonicalTaskId: oldTaskId,
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: oldCredentialId,
+        canonicalTaskState: "active",
+        activeTurnId: null,
+      }),
+      conversation: {
+        id: "u1:conversation-1",
+        userId: 1,
+        projectAssignmentId: "project-1",
+        status: "awaiting_input",
+        deletedAt: null,
+      },
+      credentials: [
+        { id: oldCredentialId, userId: 1, status: "deleted" },
+        { id: "replacement-credential", userId: 1, status: "active" },
+      ],
+      resources: [
+        {
+          id: "old-task-resource",
+          userId: 1,
+          projectAssignmentId: "project-other",
+          kind: "task",
+          upstreamId: oldTaskId,
+          apiCredentialId: oldCredentialId,
+        },
+      ],
+      turnSelections: [[]],
+    });
+
+    await expect(
+      reserveKnowledgeBaseManusV2AnchorHandoff(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          expectedGeneration: 3,
+          expectedStateEpoch: 7,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+          expectedLegacyTaskId: null,
+          sourceProtocol: "manus_v2",
+          expectedCanonicalTaskId: oldTaskId,
+          expectedCanonicalCredentialId: oldCredentialId,
+          apiCredentialId: "replacement-credential",
+          credentialMode: "current_rebind",
+          baseUrl: "https://api.example.test",
+          agentProfile: "frontmind-pro",
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(harness.store.build).toMatchObject({
+      generation: 3,
+      canonicalTaskId: oldTaskId,
+      activeTurnId: null,
+    });
+    expect(harness.store.turns).toEqual([]);
+  });
+
+  it.each(["active", "retired"])(
+    "does not rebind an otherwise idle v2 anchor while its credential is %s",
+    async (status) => {
+      const oldTaskId = "old-canonical-task";
+      const oldCredentialId = "old-credential";
+      const harness = createTurnServiceExecutor({
+        build: build({
+          upstreamTaskId: oldTaskId,
+          canonicalTaskId: oldTaskId,
+          canonicalTaskGeneration: 3,
+          canonicalCredentialId: oldCredentialId,
+          canonicalTaskState: "active",
+          activeTurnId: null,
+        }),
+        conversation: {
+          id: "u1:conversation-1",
+          userId: 1,
+          projectAssignmentId: null,
+          status: "awaiting_input",
+          deletedAt: null,
+        },
+        credentials: [
+          { id: oldCredentialId, userId: 1, status },
+          { id: "replacement-credential", userId: 1, status: "active" },
+        ],
+        resources: [
+          {
+            id: "old-task-resource",
+            userId: 1,
+            projectAssignmentId: null,
+            kind: "task",
+            upstreamId: oldTaskId,
+            apiCredentialId: oldCredentialId,
+          },
+        ],
+        turnSelections: [[]],
+      });
+
+      await expect(
+        reserveKnowledgeBaseManusV2AnchorHandoff(
+          {
+            userId: 1,
+            buildId: identity.buildId,
+            expectedGeneration: 3,
+            expectedStateEpoch: 7,
+            expectedRevision: 7,
+            expectedLeafId: "1.8",
+            expectedLegacyTaskId: null,
+            sourceProtocol: "manus_v2",
+            expectedCanonicalTaskId: oldTaskId,
+            expectedCanonicalCredentialId: oldCredentialId,
+            apiCredentialId: "replacement-credential",
+            credentialMode: "current_rebind",
+            baseUrl: "https://api.example.test",
+            agentProfile: "frontmind-pro",
+          },
+          harness.executor,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(harness.store.build).toMatchObject({
+        generation: 3,
+        canonicalTaskId: oldTaskId,
+        activeTurnId: null,
+      });
+      expect(harness.store.turns).toEqual([]);
+    },
+  );
+
+  it("marks only the build local when no replacement credential exists", async () => {
+    const oldTaskId = "old-canonical-task";
+    const oldCredentialId = "old-credential";
+    const acceptedMessage = { id: "accepted-receipt", content: "accepted" };
+    const harness = createTurnServiceExecutor({
+      build: build({
+        upstreamTaskId: oldTaskId,
+        canonicalTaskId: oldTaskId,
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: oldCredentialId,
+        canonicalTaskState: "active",
+        activeTurnId: null,
+      }),
+      conversation: {
+        id: "u1:conversation-1",
+        userId: 1,
+        projectAssignmentId: null,
+        status: "awaiting_input",
+        deletedAt: null,
+      },
+      messages: [acceptedMessage],
+      credentials: [{ id: oldCredentialId, userId: 1, status: "deleted" }],
+      resources: [
+        {
+          id: "old-task-resource",
+          userId: 1,
+          projectAssignmentId: null,
+          kind: "task",
+          upstreamId: oldTaskId,
+          apiCredentialId: oldCredentialId,
+        },
+      ],
+      turnSelections: [[]],
+    });
+
+    await expect(
+      markKnowledgeBaseManusV2CredentialRebindAttention(
+        {
+          userId: 1,
+          buildId: identity.buildId,
+          expectedGeneration: 3,
+          expectedStateEpoch: 7,
+          expectedCanonicalTaskId: oldTaskId,
+          expectedCanonicalCredentialId: oldCredentialId,
+        },
+        harness.executor,
+      ),
+    ).resolves.toBe(true);
+    expect(harness.store.build).toMatchObject({
+      generation: 3,
+      activeTurnId: null,
+      canonicalTaskId: oldTaskId,
+      canonicalCredentialId: oldCredentialId,
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_CANONICAL_CREDENTIAL_UNAVAILABLE",
+    });
+    expect(harness.store.turns).toEqual([]);
+    expect(harness.store.messages).toEqual([acceptedMessage]);
+  });
+
+  it("keeps source ids frozen until every ready v2 mapping commits atomically", async () => {
+    const leaseToken = "v2-attachment-ledger-lease";
+    const sourceAttachments = [
+      { file_id: "source-skill", filename: "skill.zip" },
+      { file_id: "source-facts", filename: "facts.pdf" },
+    ];
+    const preparedBody = {
+      prompt: "continue",
+      agentProfile: "frontmind-pro",
+      attachments: sourceAttachments,
+    };
+    const activeTurn = turn({
+      attachmentFileIds: sourceAttachments.map((item) => item.file_id),
+      metadata: {
+        providerProtocol: "manus_v2",
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        createAttemptState: "not_sent",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: preparedBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(preparedBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build(),
+      turns: [activeTurn],
+      turnSelections: Array.from({ length: 40 }, () => [
+        (store) => store.turns,
+      ]),
+    });
+    const expiresAt = Math.floor(Date.parse("2026-08-01T01:00:00Z") / 1_000);
+    const mapping = (
+      attachmentIndex: number,
+      sourceFileId: string,
+      filename: string,
+      upstreamFileId: string,
+    ) => ({
+      schemaVersion: 1 as const,
+      providerProtocol: "manus_v2" as const,
+      mappingKey: `g3:${attachmentIndex}:${"d".repeat(64)}:123`,
+      buildGeneration: 3,
+      attachmentIndex,
+      sourceFileId,
+      localStorageKey: `knowledge-base/build-sources/1/${identity.buildId}/g3/${"d".repeat(64)}.bin`,
+      contentSha256: "d".repeat(64),
+      sizeBytes: 123,
+      filename,
+      mimeType: "application/octet-stream",
+      upstreamFileId,
+      status: "ready" as const,
+      expiresAt,
+      providerGeneration: 1,
+      verifiedAt: "2026-08-01T00:00:20.000Z",
+    });
+    const first = mapping(0, "source-skill", "skill.zip", "v2-skill");
+    const second = mapping(1, "source-facts", "facts.pdf", "v2-facts");
+    const persistAcceptedAttempt = async (target: typeof first) => {
+      const base = {
+        schemaVersion: 1 as const,
+        mappingKey: target.mappingKey,
+        buildGeneration: target.buildGeneration,
+        attachmentIndex: target.attachmentIndex,
+        sourceFileId: target.sourceFileId,
+        localStorageKey: target.localStorageKey,
+        contentSha256: target.contentSha256,
+        sizeBytes: target.sizeBytes,
+        filename: target.filename,
+        mimeType: target.mimeType,
+        providerGeneration: target.providerGeneration,
+        code: null,
+        recordedAt: "2026-08-01T00:00:15.000Z",
+      };
+      const persist = (attempt: any) =>
+        persistKnowledgeBaseManusV2AttachmentAttempt(
+          { userId: 1, turnId: activeTurn.id, leaseToken, attempt },
+          harness.executor,
+        );
+      await persist({
+        ...base,
+        state: "creating",
+        upstreamFileId: null,
+        uploadExpiresAt: null,
+      });
+      await persist({
+        ...base,
+        state: "candidate_created",
+        upstreamFileId: target.upstreamFileId,
+        uploadExpiresAt: expiresAt,
+      });
+      await persist({
+        ...base,
+        state: "put_sending",
+        upstreamFileId: target.upstreamFileId,
+        uploadExpiresAt: expiresAt,
+      });
+      await persist({
+        ...base,
+        state: "put_accepted",
+        upstreamFileId: target.upstreamFileId,
+        uploadExpiresAt: expiresAt,
+      });
+    };
+
+    await persistAcceptedAttempt(first);
+    await persistKnowledgeBaseManusV2AttachmentMapping(
+      { userId: 1, turnId: activeTurn.id, leaseToken, mapping: first },
+      harness.executor,
+    );
+    expect(harness.store.turns[0]!.attachmentFileIds).toEqual([
+      "source-skill",
+      "source-facts",
+    ]);
+    await expect(
+      finalizeKnowledgeBaseManusV2AttachmentMappings(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          mappings: [first],
+          now: new Date("2026-08-01T00:00:30.000Z"),
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(harness.store.turns[0]!.attachmentFileIds).toEqual([
+      "source-skill",
+      "source-facts",
+    ]);
+
+    await persistAcceptedAttempt(second);
+    await persistKnowledgeBaseManusV2AttachmentMapping(
+      { userId: 1, turnId: activeTurn.id, leaseToken, mapping: second },
+      harness.executor,
+    );
+    await finalizeKnowledgeBaseManusV2AttachmentMappings(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        mappings: [first, second],
+        now: new Date("2026-08-01T00:00:30.000Z"),
+      },
+      harness.executor,
+    );
+    expect(harness.store.turns[0]!.attachmentFileIds).toEqual([
+      "v2-skill",
+      "v2-facts",
+    ]);
+    expect(
+      (harness.store.turns[0]!.metadata as any).manusV2AttachmentMappings,
+    ).toMatchObject({
+      [first.mappingKey]: first,
+      [second.mappingKey]: second,
+    });
+  });
+
+  it("freezes an ambiguous v2 file side effect without promoting or retrying its slot", async () => {
+    const leaseToken = "v2-file-outcome-unknown-lease";
+    const preparedBody = {
+      prompt: "continue",
+      agentProfile: "frontmind-pro",
+      attachments: [{ file_id: "source-facts", filename: "facts.pdf" }],
+    };
+    const activeTurn = turn({
+      attachmentFileIds: ["source-facts"],
+      metadata: {
+        providerProtocol: "manus_v2",
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 1,
+        createAttemptState: "not_sent",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: preparedBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(preparedBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build(),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+    const attempt = {
+      schemaVersion: 1 as const,
+      mappingKey: `g3:0:${"e".repeat(64)}:123`,
+      buildGeneration: 3,
+      attachmentIndex: 0,
+      sourceFileId: "source-facts",
+      localStorageKey: `knowledge-base/build-sources/1/${identity.buildId}/g3/${"e".repeat(64)}.bin`,
+      contentSha256: "e".repeat(64),
+      sizeBytes: 123,
+      filename: "facts.pdf",
+      mimeType: "application/pdf",
+      providerGeneration: 1,
+      state: "outcome_unknown" as const,
+      code: "KNOWLEDGE_BASE_MANUS_V2_FILE_OUTCOME_UNKNOWN",
+      recordedAt: "2026-08-01T00:00:20.000Z",
+    };
+
+    await expect(
+      persistKnowledgeBaseManusV2AttachmentOutcomeUnknown(
+        { userId: 1, turnId: activeTurn.id, leaseToken, attempt },
+        harness.executor,
+      ),
+    ).resolves.toEqual(attempt);
+    expect(harness.store.turns[0]!.attachmentFileIds).toEqual(["source-facts"]);
+    expect(harness.store.turns[0]!.metadata).toMatchObject({
+      manusV2AttachmentUnknownAttempts: {
+        [attempt.mappingKey]: attempt,
+      },
+      dispatchState: "recovering",
+    });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "KNOWLEDGE_BASE_MANUS_V2_FILE_OUTCOME_UNKNOWN",
+    });
+  });
+
+  it("fences a v2 file before create, pins its id before PUT, and caps replacement at two generations", async () => {
+    const leaseToken = "v2-file-candidate-lease";
+    const preparedBody = {
+      prompt: "continue",
+      agentProfile: "frontmind-pro",
+      attachments: [{ file_id: "source-facts", filename: "facts.pdf" }],
+    };
+    const activeTurn = turn({
+      attachmentFileIds: ["source-facts"],
+      metadata: {
+        providerProtocol: "manus_v2",
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 1,
+        createAttemptState: "not_sent",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: preparedBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(preparedBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build(),
+      turns: [activeTurn],
+      turnSelections: Array.from({ length: 16 }, () => [
+        (store) => store.turns,
+      ]),
+    });
+    const base = {
+      schemaVersion: 1 as const,
+      mappingKey: `g3:0:${"f".repeat(64)}:123`,
+      buildGeneration: 3,
+      attachmentIndex: 0,
+      sourceFileId: "source-facts",
+      localStorageKey: `knowledge-base/build-sources/1/${identity.buildId}/g3/${"f".repeat(64)}.bin`,
+      contentSha256: "f".repeat(64),
+      sizeBytes: 123,
+      filename: "facts.pdf",
+      mimeType: "application/pdf",
+      code: null,
+      recordedAt: "2026-08-01T00:00:20.000Z",
+    };
+    const persist = (attempt: any) =>
+      persistKnowledgeBaseManusV2AttachmentAttempt(
+        { userId: 1, turnId: activeTurn.id, leaseToken, attempt },
+        harness.executor,
+      );
+    await persist({
+      ...base,
+      providerGeneration: 1,
+      state: "creating",
+      upstreamFileId: null,
+      uploadExpiresAt: null,
+    });
+    await expect(
+      persist({
+        ...base,
+        providerGeneration: 1,
+        state: "candidate_created",
+        upstreamFileId: "candidate-one",
+        uploadExpiresAt: 2_000_000_000,
+      }),
+    ).resolves.toMatchObject({ upstreamFileId: "candidate-one" });
+    expect(harness.store.turns[0]!.attachmentFileIds).toEqual(["source-facts"]);
+    expect(harness.store.resources).toEqual([
+      expect.objectContaining({
+        kind: "file",
+        upstreamId: "candidate-one",
+        apiCredentialId: "credential-1",
+      }),
+    ]);
+    await expect(
+      persist({
+        ...base,
+        providerGeneration: 1,
+        state: "candidate_created",
+        upstreamFileId: "different-candidate",
+        uploadExpiresAt: 2_000_000_000,
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await persist({
+      ...base,
+      providerGeneration: 1,
+      state: "unusable",
+      upstreamFileId: "candidate-one",
+      uploadExpiresAt: 2_000_000_000,
+      code: "MANUS_V2_FILE_NOT_FOUND",
+    });
+    await persist({
+      ...base,
+      providerGeneration: 2,
+      state: "creating",
+      upstreamFileId: null,
+      uploadExpiresAt: null,
+    });
+    await persist({
+      ...base,
+      providerGeneration: 2,
+      state: "create_rejected",
+      upstreamFileId: null,
+      uploadExpiresAt: null,
+      code: "MANUS_V2_FILE_CREATE_HTTP_429",
+    });
+    await expect(
+      persist({
+        ...base,
+        providerGeneration: 3,
+        state: "creating",
+        upstreamFileId: null,
+        uploadExpiresAt: null,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+  });
+
+  it("allows exactly one replacement after file.create outcome loss", async () => {
+    const leaseToken = "v2-file-create-loss-lease";
+    const preparedBody = {
+      prompt: "continue",
+      agentProfile: "frontmind-pro",
+      attachments: [{ file_id: "source-facts", filename: "facts.pdf" }],
+    };
+    const activeTurn = turn({
+      attachmentFileIds: ["source-facts"],
+      metadata: {
+        providerProtocol: "manus_v2",
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 1,
+        createAttemptState: "not_sent",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: preparedBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(preparedBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build(),
+      turns: [activeTurn],
+      turnSelections: Array.from({ length: 12 }, () => [
+        (store) => store.turns,
+      ]),
+    });
+    const base = {
+      schemaVersion: 1 as const,
+      mappingKey: `g3:0:${"9".repeat(64)}:123`,
+      buildGeneration: 3,
+      attachmentIndex: 0,
+      sourceFileId: "source-facts",
+      localStorageKey: `knowledge-base/build-sources/1/${identity.buildId}/g3/${"9".repeat(64)}.bin`,
+      contentSha256: "9".repeat(64),
+      sizeBytes: 123,
+      filename: "facts.pdf",
+      mimeType: "application/pdf",
+      upstreamFileId: null,
+      uploadExpiresAt: null,
+      recordedAt: "2026-08-01T00:00:20.000Z",
+    };
+    const persist = (attempt: any) =>
+      persistKnowledgeBaseManusV2AttachmentAttempt(
+        { userId: 1, turnId: activeTurn.id, leaseToken, attempt },
+        harness.executor,
+      );
+    await persist({
+      ...base,
+      providerGeneration: 1,
+      state: "creating",
+      code: null,
+    });
+    await persist({
+      ...base,
+      providerGeneration: 1,
+      state: "create_outcome_unknown",
+      code: "MANUS_V2_FILE_CREATE_TRANSPORT_UNKNOWN",
+    });
+    await expect(
+      persist({
+        ...base,
+        providerGeneration: 2,
+        state: "creating",
+        code: null,
+      }),
+    ).resolves.toMatchObject({ providerGeneration: 2, state: "creating" });
+    await persist({
+      ...base,
+      providerGeneration: 2,
+      state: "create_outcome_unknown",
+      code: "MANUS_V2_FILE_CREATE_TRANSPORT_UNKNOWN",
+    });
+    await expect(
+      persist({
+        ...base,
+        providerGeneration: 3,
+        state: "creating",
+        code: null,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+  });
+
+  it("grants create once, binds it, then grants sendMessage for the same task", async () => {
+    const activeTurn = turn({
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update("lease-one", "utf8")
+          .digest("hex"),
+        createAttemptState: "not_sent",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build(),
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+      },
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns], [(store) => store.turns]],
+    });
+    const first = await beginKnowledgeBaseManusV2Dispatch(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken: "lease-one",
+        frozenProviderRequestHash: "d".repeat(64),
+      },
+      harness.executor,
+    );
+    expect(first).toMatchObject({
+      method: "task.create",
+      canonicalTaskId: null,
+      operationToken: "operation-1",
+    });
+    const storedFirstTurn = harness.store.turns[0]!;
+    await bindKnowledgeBaseManusV2Submission(
+      {
+        userId: 1,
+        turnId: storedFirstTurn.id,
+        leaseToken: "lease-one",
+        method: "task.create",
+        taskId: "canonical-task",
+        taskUrl: "https://manus.im/app/canonical-task",
+      },
+      harness.executor,
+    );
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "active",
+      upstreamTaskId: "canonical-task",
+    });
+    expect(harness.store.resources).toEqual([
+      expect.objectContaining({
+        userId: 1,
+        apiCredentialId: "credential-1",
+        projectAssignmentId: null,
+        kind: "task",
+        upstreamId: "canonical-task",
+        conversationId: activeTurn.conversationId,
+      }),
+    ]);
+
+    const nextTurn = turn({
+      id: "00000000-0000-4000-8000-000000000003",
+      operationKey: "operation-2",
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update("lease-two", "utf8")
+          .digest("hex"),
+        createAttemptState: "not_sent",
+      },
+    });
+    harness.store.turns.push(nextTurn);
+    harness.store.build.activeTurnId = nextTurn.id;
+    const secondHarness = createTurnServiceExecutor({
+      build: harness.store.build,
+      turns: [nextTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+    const second = await beginKnowledgeBaseManusV2Dispatch(
+      {
+        userId: 1,
+        turnId: nextTurn.id,
+        leaseToken: "lease-two",
+        frozenProviderRequestHash: "e".repeat(64),
+      },
+      secondHarness.executor,
+    );
+    expect(second).toMatchObject({
+      method: "task.sendMessage",
+      canonicalTaskId: "canonical-task",
+      operationToken: "operation-2",
+    });
+  });
+
+  it("reclaims a post-2xx bind failure only for v2 reconciliation and never grants another POST", async () => {
+    const leaseToken = "post-ack-bind-failure-lease";
+    const activeTurn = turn({
+      status: "running",
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        createAttemptState: "sending",
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "sending",
+        operationToken: "operation-1",
+        frozenProviderRequestHash: "d".repeat(64),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskState: "creating",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+      }),
+      turns: [activeTurn],
+      turnSelections: [
+        [(store) => store.turns],
+        [(store) => store.turns],
+        [(store) => store.turns],
+      ],
+    });
+    const markedAt = new Date("2026-08-01T00:00:30.000Z");
+    const providerPost = async () => "provider-accepted-task";
+    let providerPostCount = 0;
+    const postOnce = async () => {
+      providerPostCount += 1;
+      return providerPost();
+    };
+    await expect(postOnce()).resolves.toBe("provider-accepted-task");
+
+    await markKnowledgeBaseManusV2OutcomeUnknown(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        code: "MANUS_V2_BIND_PERSISTENCE_UNKNOWN",
+        recoveryDelayMs: 1_000,
+        now: markedAt,
+      },
+      harness.executor,
+    );
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      createAttemptState: "unknown",
+      providerAttemptState: "outcome_unknown",
+      operationToken: "operation-1",
+    });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: null,
+      canonicalTaskState: "reconciling",
+    });
+
+    const recovered = await claimKnowledgeBaseTurnForRecovery(
+      {
+        turnId: activeTurn.id,
+        now: new Date("2026-08-01T00:00:31.001Z"),
+      },
+      harness.executor,
+    );
+    expect(recovered?.turn).toMatchObject({
+      createAttemptState: "acknowledged",
+      providerProtocol: "manus_v2",
+      providerMethod: "task.create",
+      providerAttemptState: "output_pending",
+      operationToken: "operation-1",
+    });
+
+    await expect(
+      beginKnowledgeBaseManusV2Dispatch(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken: recovered!.leaseToken,
+          frozenProviderRequestHash: "d".repeat(64),
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_PENDING" });
+    expect(providerPostCount).toBe(1);
+  });
+
+  it("keeps an anchor-only create reconciling until its exact acknowledgement commits", async () => {
+    const leaseToken = "anchor-ack-lease";
+    const activeTurn = turn({
+      operationType: "legacy_reconcile",
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        createAttemptState: "not_sent",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+        operationToken: "operation-1",
+        repairKind: "legacy_anchor_handoff",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalCredentialId: "credential-1",
+        canonicalTaskGeneration: 3,
+      }),
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+      },
+      turns: [activeTurn],
+      turnSelections: [
+        [(store) => store.turns],
+        [(store) => store.turns],
+        [(store) => store.turns],
+      ],
+    });
+    await beginKnowledgeBaseManusV2Dispatch(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        frozenProviderRequestHash: "a".repeat(64),
+      },
+      harness.executor,
+    );
+    await bindKnowledgeBaseManusV2Submission(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        method: "task.create",
+        taskId: "anchor-task",
+      },
+      harness.executor,
+    );
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "anchor-task",
+      canonicalTaskState: "reconciling",
+      activeTurnId: activeTurn.id,
+    });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "running",
+      upstreamTaskId: "anchor-task",
+      metadata: { providerAttemptState: "output_pending" },
+    });
+
+    await completeKnowledgeBaseManusV2AnchorHandoff(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        taskId: "anchor-task",
+        acknowledgement: {
+          eventId: "ack-1",
+          schemaVersion: 1,
+          operationToken: "operation-1",
+          turnId: activeTurn.id,
+          generation: 3,
+          baseRevision: 7,
+          handoffAccepted: true,
+        },
+      },
+      harness.executor,
+    );
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "anchor-task",
+      canonicalTaskState: "active",
+      activeTurnId: null,
+    });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "completed",
+      metadata: {
+        providerAttemptState: "accepted",
+        anchorAcknowledgement: { eventId: "ack-1" },
+      },
+    });
+  });
+
+  it("restores a migrated no-active protocol error to an actionable confirming build after the exact anchor acknowledgement", async () => {
+    const leaseToken = "protocol-error-anchor-lease";
+    const activeTurn = turn({
+      operationType: "legacy_reconcile",
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        createAttemptState: "acknowledged",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        operationToken: "operation-1",
+        repairKind: "legacy_anchor_handoff",
+      },
+      status: "running",
+      upstreamTaskId: "anchor-task",
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        status: "protocol_error",
+        canonicalTaskId: "anchor-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "reconciling",
+        handoffProvenance: {
+          schemaVersion: 1,
+          sourceStatus: "protocol_error",
+        },
+        protocolErrorCode: "LEGACY_PROTOCOL_ERROR",
+        protocolError: "historical failure",
+      }),
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+      },
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await completeKnowledgeBaseManusV2AnchorHandoff(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        taskId: "anchor-task",
+        acknowledgement: {
+          eventId: "protocol-error-ack",
+          schemaVersion: 1,
+          operationToken: "operation-1",
+          turnId: activeTurn.id,
+          generation: 3,
+          baseRevision: 7,
+          handoffAccepted: true,
+        },
+      },
+      harness.executor,
+    );
+
+    expect(harness.store.build).toMatchObject({
+      providerProtocol: "manus_v2",
+      status: "confirming",
+      currentLeafId: "1.8",
+      canonicalTaskId: "anchor-task",
+      canonicalTaskState: "active",
+      activeTurnId: null,
+      protocolErrorCode: null,
+      protocolError: null,
+    });
+    expect(harness.store.conversation).toMatchObject({
+      status: "awaiting_input",
+      upstreamTaskId: "anchor-task",
+    });
+  });
+
+  it("writer-fences an unprovable failed legacy attempt into read-only quarantine", async () => {
+    const activeTurn = turn({
+      status: "failed",
+      leaseExpiresAt: null,
+      completedAt: new Date("2026-08-01T00:00:30.000Z"),
+      metadata: {
+        attachmentsFrozen: true,
+        createAttemptState: "unknown",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        providerProtocol: "legacy_v1",
+        status: "protocol_error",
+        canonicalTaskState: "unbound",
+      }),
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+      },
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      markLegacyKnowledgeBaseCreateAttentionRequired(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          expectedGeneration: 3,
+        },
+        harness.executor,
+      ),
+    ).resolves.toBe(true);
+    expect(harness.store.build).toMatchObject({
+      providerProtocol: "legacy_v1",
+      status: "failed",
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "LEGACY_CREATE_OUTCOME_UNKNOWN",
+    });
+    expect(harness.store.conversation).toMatchObject({ status: "failed" });
+  });
+
+  it("rolls canonical binding back when the provider task id is already owned", async () => {
+    const activeTurn = turn({
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update("lease-conflict", "utf8")
+          .digest("hex"),
+        createAttemptState: "not_sent",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build(),
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+      },
+      turns: [activeTurn],
+      resources: [
+        {
+          id: "existing-task-owner",
+          userId: 2,
+          apiCredentialId: "other-credential",
+          projectAssignmentId: null,
+          kind: "task",
+          upstreamId: "duplicate-provider-task",
+          conversationId: "u2:other-conversation",
+        },
+      ],
+      turnSelections: [[(store) => store.turns], [(store) => store.turns]],
+    });
+    await beginKnowledgeBaseManusV2Dispatch(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken: "lease-conflict",
+        frozenProviderRequestHash: "a".repeat(64),
+      },
+      harness.executor,
+    );
+
+    await expect(
+      bindKnowledgeBaseManusV2Submission(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken: "lease-conflict",
+          method: "task.create",
+          taskId: "duplicate-provider-task",
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: null,
+      canonicalTaskState: "creating",
+    });
+    expect(harness.store.resources).toHaveLength(1);
+  });
+
+  it("commits one crash-safe legacy handoff digest and resumes it idempotently", async () => {
+    const leaseToken = "handoff-lease";
+    const snapshotSha256 = "f".repeat(64);
+    const activeTurn = turn({
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "legacy_v1",
+        createAttemptState: "not_sent",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({ providerProtocol: "legacy_v1" }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns], [(store) => store.turns]],
+    });
+
+    await expect(
+      activateKnowledgeBaseManusV2Handoff(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          expectedGeneration: 3,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+          snapshotSha256,
+          legacyTaskIdSha256: "e".repeat(64),
+          now: new Date("2026-08-01T00:00:30.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ migrated: true, snapshotSha256 });
+    expect(harness.store.build).toMatchObject({
+      providerProtocol: "manus_v2",
+      canonicalTaskState: "unbound",
+      canonicalTaskId: null,
+      handoffProvenance: {
+        schemaVersion: 1,
+        sourceProtocol: "legacy_v1",
+        snapshotSha256,
+        pendingTurnId: activeTurn.id,
+      },
+    });
+    expect(harness.store.turns[0]!.metadata).toMatchObject({
+      providerProtocol: "manus_v2",
+      providerAttemptState: "not_sent",
+      operationToken: activeTurn.operationKey,
+      repairKind: "legacy_handoff",
+    });
+
+    await expect(
+      activateKnowledgeBaseManusV2Handoff(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          expectedGeneration: 3,
+          expectedRevision: 7,
+          expectedLeafId: "1.8",
+          snapshotSha256,
+        },
+        harness.executor,
+      ),
+    ).resolves.toEqual({ migrated: false, snapshotSha256 });
+  });
+
+  it("persists one lifecycle side effect and never grants a resend", async () => {
+    const leaseToken = "lifecycle-lease";
+    const activeTurn = turn({
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+      }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns], [(store) => store.turns]],
+    });
+    const mutation = {
+      kind: "format_repair" as const,
+      repairToken: "repair-token",
+      requestHash: "f".repeat(64),
+      state: "sending" as const,
+    };
+    await expect(
+      mutateKnowledgeBaseManusV2Lifecycle(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          mutation,
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      formatRepairAttempt: 1,
+      formatRepairAttemptState: "sending",
+    });
+    await expect(
+      mutateKnowledgeBaseManusV2Lifecycle(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          mutation,
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_PENDING" });
+  });
+
+  it("retries the identical task-error recovery only after durable explicit-rejection backoff", async () => {
+    const leaseToken = "error-recovery-retry-lease";
+    const now = new Date("2026-08-13T00:00:00.000Z");
+    const activeTurn = turn({
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+      }),
+      turns: [activeTurn],
+      turnSelections: Array.from({ length: 4 }, () => [
+        (store: any) => store.turns,
+      ]),
+    });
+    const frozen = {
+      kind: "error_recovery" as const,
+      recoveryToken: "recovery-token",
+      requestHash: "e".repeat(64),
+    };
+    await mutateKnowledgeBaseManusV2Lifecycle(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        now,
+        mutation: { ...frozen, state: "sending" },
+      },
+      harness.executor,
+    );
+    await mutateKnowledgeBaseManusV2Lifecycle(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        now,
+        mutation: { ...frozen, state: "retry_wait", retryAfterMs: 7_000 },
+      },
+      harness.executor,
+    );
+    await expect(
+      mutateKnowledgeBaseManusV2Lifecycle(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          now: new Date(now.getTime() + 6_999),
+          mutation: { ...frozen, state: "sending" },
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_PENDING" });
+    await expect(
+      mutateKnowledgeBaseManusV2Lifecycle(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          now: new Date(now.getTime() + 7_000),
+          mutation: { ...frozen, state: "sending" },
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      errorRecoveryToken: "recovery-token",
+      errorRecoveryRequestHash: "e".repeat(64),
+      errorRecoveryAttemptState: "sending",
+      errorRecoveryRejectionCount: 1,
+    });
+  });
+
+  it("never replaces an outcome-unknown waiting side effect with a newer event", async () => {
+    const leaseToken = "waiting-outcome-unknown-lease";
+    const activeTurn = turn({
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+      }),
+      turns: [activeTurn],
+      turnSelections: [
+        [(store) => store.turns],
+        [(store) => store.turns],
+        [(store) => store.turns],
+      ],
+    });
+    const frozen = {
+      kind: "waiting" as const,
+      eventId: "evt-A",
+      eventType: "messageAskUser",
+      statusEventId: "status-A",
+      action: "ask_user_continue" as const,
+      requestHash: "a".repeat(64),
+      continuationToken: "continue-A",
+      state: "sending" as const,
+    };
+    await mutateKnowledgeBaseManusV2Lifecycle(
+      { userId: 1, turnId: activeTurn.id, leaseToken, mutation: frozen },
+      harness.executor,
+    );
+    await mutateKnowledgeBaseManusV2Lifecycle(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        mutation: { ...frozen, state: "outcome_unknown" },
+      },
+      harness.executor,
+    );
+
+    await expect(
+      mutateKnowledgeBaseManusV2Lifecycle(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          mutation: {
+            ...frozen,
+            eventId: "evt-B",
+            requestHash: "b".repeat(64),
+          },
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(
+      (harness.store.turns[0]!.metadata as any).manusV2Lifecycle,
+    ).toMatchObject({
+      waitingEventId: "evt-A",
+      waitingRequestHash: "a".repeat(64),
+      waitingAttemptState: "outcome_unknown",
+    });
+  });
+
+  it("allows only a strictly superseding waiting event after the old one is acknowledged", async () => {
+    const leaseToken = "waiting-successor-lease";
+    const activeTurn = turn({
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+      }),
+      turns: [activeTurn],
+      turnSelections: Array.from({ length: 3 }, () => [
+        (store: any) => store.turns,
+      ]),
+    });
+    const oldWaiting = {
+      kind: "waiting" as const,
+      eventId: "evt-A",
+      eventType: "messageAskUser",
+      statusEventId: "status-A",
+      action: "ask_user_continue" as const,
+      requestHash: "a".repeat(64),
+      continuationToken: "continue-A",
+    };
+    await mutateKnowledgeBaseManusV2Lifecycle(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        mutation: { ...oldWaiting, state: "sending" },
+      },
+      harness.executor,
+    );
+    await mutateKnowledgeBaseManusV2Lifecycle(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        mutation: { ...oldWaiting, state: "acknowledged" },
+      },
+      harness.executor,
+    );
+    await expect(
+      mutateKnowledgeBaseManusV2Lifecycle(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          mutation: {
+            ...oldWaiting,
+            eventId: "evt-B",
+            statusEventId: "status-B",
+            requestHash: "b".repeat(64),
+            continuationToken: "continue-B",
+            supersedesEventId: "evt-A",
+            state: "sending",
+          },
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      waitingEventId: "evt-B",
+      waitingStatusEventId: "status-B",
+      waitingAttemptState: "sending",
+    });
+  });
+
+  it("marks unsafe waiting build-local without changing its canonical anchor", async () => {
+    const leaseToken = "attention-lease";
+    const activeTurn = turn({
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+      }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+    await markKnowledgeBaseManusV2AttentionRequired(
+      {
+        userId: 1,
+        turnId: activeTurn.id,
+        leaseToken,
+        code: "MANUS_V2_EXTERNAL_CONFIRMATION_REQUIRED",
+        waitingEventId: "evt-deploy",
+        waitingEventType: "deployAction",
+      },
+      harness.executor,
+    );
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_EXTERNAL_CONFIRMATION_REQUIRED",
+    });
+    expect(harness.store.turns[0]?.status).toBe("running");
+  });
+
+  it("retries only an explicit v2 rejection against the same frozen create request", async () => {
+    const leaseToken = "explicit-create-rejection";
+    const activeTurn = turn({
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "sending",
+        createAttemptState: "sending",
+        operationToken: "operation-1",
+        frozenProviderRequestHash: "f".repeat(64),
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskState: "creating",
+        canonicalCredentialId: "credential-1",
+        canonicalTaskGeneration: 3,
+      }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+    await expect(
+      settleKnowledgeBaseManusV2ExplicitRejection(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          code: "MANUS_V2_CREATE_REJECTED",
+          retryable: true,
+          // This mirrors a real, provider-supplied Retry-After value.
+          recoveryDelayMs: 7_000,
+          now: new Date("2026-08-01T00:00:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      retryScheduled: true,
+      attempt: 1,
+      delayMs: 7_000,
+    });
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      createAttemptState: "not_sent",
+      providerAttemptState: "not_sent",
+      providerRejectionCount: 1,
+      frozenProviderRequestHash: "f".repeat(64),
+      operationToken: "operation-1",
+    });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+    });
+  });
+
+  it("puts an exhausted v2 rejection in local attention without revoking the anchor", async () => {
+    const leaseToken = "explicit-send-rejection";
+    const activeTurn = turn({
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "sending",
+        createAttemptState: "sending",
+        operationToken: "operation-1",
+        frozenProviderRequestHash: "f".repeat(64),
+        providerRejectionCount: 3,
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+      }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+    await expect(
+      settleKnowledgeBaseManusV2ExplicitRejection(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          code: "MANUS_V2_SEND_REJECTED",
+          retryable: true,
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ retryScheduled: false, attempt: 4 });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_SEND_REJECTED",
+    });
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      createAttemptState: "rejected",
+      providerAttemptState: "rejected",
+      providerRejectionCount: 4,
+    });
+    harness.store.turns[0]!.leaseExpiresAt = new Date(
+      "2026-08-01T00:00:00.000Z",
+    );
+    await expect(
+      claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: activeTurn.id,
+          now: new Date("2026-08-01T00:10:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toBeNull();
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_SEND_REJECTED",
+    });
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      createAttemptState: "rejected",
+      providerAttemptState: "rejected",
+    });
+  });
+
+  it("never reclaims a nonretryable rejected v2 create after its lease expires", async () => {
+    const rejectedTurn = turn({
+      status: "running",
+      leaseExpiresAt: new Date("2026-08-01T00:00:00.000Z"),
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        operationToken: "operation-1",
+        frozenProviderRequestHash: "f".repeat(64),
+        providerRejectionCount: 1,
+        attachmentsFrozen: true,
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: null,
+        canonicalTaskState: "attention_required",
+        canonicalCredentialId: "credential-1",
+        canonicalTaskGeneration: 3,
+        protocolErrorCode: "MANUS_V2_CREATE_REJECTED",
+      }),
+      turns: [rejectedTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+    await expect(
+      claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: rejectedTurn.id,
+          now: new Date("2026-08-01T00:10:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toBeNull();
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      providerAttemptState: "rejected",
+      createAttemptState: "rejected",
+    });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: null,
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_CREATE_REJECTED",
+    });
+  });
+});
 
 describe("knowledge-base turn identity", () => {
   it("canonicalizes object keys but preserves attachment order", () => {
@@ -1848,7 +4293,8 @@ describe("knowledge-base generated attachment reservations", () => {
       },
       executor,
     );
-    expect(completed.attachmentFileIds).toEqual(["provider-file-1"]);
+    // A provider identity is only a candidate until readiness/content proof.
+    expect(completed.attachmentFileIds).toEqual([]);
     expect(store.resources).toHaveLength(1);
     expect(store.resources[0]).toMatchObject({
       userId: 1,
@@ -1864,10 +4310,24 @@ describe("knowledge-base generated attachment reservations", () => {
       executor,
     );
     expect(completedReplay).toMatchObject({
-      state: "completed",
+      state: "candidate_created",
       idempotencyKey: first.idempotencyKey,
       upstreamFileId: "provider-file-1",
     });
+
+    const ready = await promoteKnowledgeBaseGeneratedAttachmentReady(
+      {
+        userId: 1,
+        turnId: active.id,
+        leaseToken,
+        role: "skill",
+        attachmentIndex: 0,
+        requestHash: first.requestHash,
+        upstreamFileId: "provider-file-1",
+      },
+      executor,
+    );
+    expect(ready.attachmentFileIds).toEqual(["provider-file-1"]);
 
     await expect(
       completeKnowledgeBaseGeneratedAttachment(
@@ -1882,7 +4342,9 @@ describe("knowledge-base generated attachment reservations", () => {
         },
         executor,
       ),
-    ).rejects.toMatchObject({ code: "CONFLICT" });
+    ).rejects.toMatchObject({
+      code: expect.stringMatching(/^(?:CONFLICT|RESERVATION_NOT_FOUND)$/u),
+    });
     expect(store.resources).toHaveLength(1);
     expect(store.turns[0]!.attachmentFileIds).toEqual(["provider-file-1"]);
   });
@@ -2202,6 +4664,16 @@ describe("knowledge-base atomic start reservation", () => {
     expect(second.reservation.turn.id).toBe(first.reservation.turn.id);
     expect(store.build?.activeTurnId).toBe(first.reservation.turn.id);
     expect(store.build?.treePolicyVersion).toBe(2);
+    expect(store.build?.skillArchiveStorageKey).toMatch(
+      /^knowledge-base\/skill-archives\/[a-f0-9]{64}\.skill\.zip$/u,
+    );
+    expect(store.build?.skillArchiveSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(store.build?.skillArchiveBytes).toBeGreaterThan(0);
+    expect((store.turns[0]!.metadata as any).recovery).toMatchObject({
+      skillArchiveSha256: store.build?.skillArchiveSha256,
+      skillArchiveBytes: store.build?.skillArchiveBytes,
+      skillArchiveStorageKey: store.build?.skillArchiveStorageKey,
+    });
     expect(first.build.treePolicyVersion).toBe(2);
     expect(store.turns).toHaveLength(1);
     expect(store.messages).toHaveLength(1);
@@ -2220,6 +4692,113 @@ describe("knowledge-base atomic start reservation", () => {
       },
     });
     expect(store.conversation?.version).toBe(2);
+  });
+
+  it("commits a start-before-upload build and turn without granting a provider lease", async () => {
+    const previous = process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+    process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = "true";
+    const attachmentManifest = [
+      {
+        itemId: "starter-item-1",
+        ordinal: 1,
+        total: 1,
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 1,
+        sha256: "a".repeat(64),
+      },
+    ];
+    const { executor, store } = createTurnServiceExecutor({
+      turnSelections: [[[], []]],
+    });
+    try {
+      const result = await reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          userAttachmentCount: 1,
+          expectedAttachmentCount: 3,
+          deferDispatchUntilAttachments: true,
+          clientAttachmentManifest: attachmentManifest,
+          requestPayload: {
+            ...startInput.requestPayload,
+            attachments: [],
+            attachmentManifest,
+          },
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            attachments: [],
+            attachmentManifest,
+            deferredClientAttachments: true,
+          },
+        },
+        executor,
+      );
+
+      expect(result).toMatchObject({
+        createdBuild: true,
+        reservation: {
+          state: "awaiting_attachments",
+          turn: {
+            attachmentFileIds: [],
+            awaitingClientAttachments: true,
+            providerProtocol: "manus_v2",
+            providerAttemptState: "not_sent",
+            expectedUserAttachmentCount: 1,
+            stagedUserAttachmentCount: 0,
+            upstreamTaskId: null,
+            leaseExpiresAt: null,
+          },
+        },
+      });
+      expect(store.build).toMatchObject({
+        providerProtocol: "manus_v2",
+        canonicalTaskState: "unbound",
+        upstreamTaskId: null,
+        activeTurnId: result.reservation.turn.id,
+      });
+      expect(store.turns).toHaveLength(1);
+      expect(store.messages).toHaveLength(1);
+      expect(store.resources).toHaveLength(0);
+    } finally {
+      if (previous === undefined) {
+        delete process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+      } else {
+        process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = previous;
+      }
+    }
+  });
+
+  it("pins a new build and its first turn to legacy only while the Manus v2 writer is explicitly disabled", async () => {
+    const previous = process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+    process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = "false";
+    try {
+      const { executor, store } = createTurnServiceExecutor({
+        turnSelections: [[[], []]],
+      });
+      const result = await reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          conversationId: "conversation-legacy-writer",
+          clientRequestId: "start-request-legacy-writer",
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            conversationId: "conversation-legacy-writer",
+          },
+        },
+        executor,
+      );
+
+      expect(result.build.providerProtocol).toBe("legacy_v1");
+      expect(result.reservation.turn.providerProtocol).toBe("legacy_v1");
+      expect(store.build?.providerProtocol).toBe("legacy_v1");
+    } finally {
+      if (previous === undefined) {
+        delete process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+      } else {
+        process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = previous;
+      }
+    }
   });
 
   it("starts a new conversation without mutating a rejected historical build turn", async () => {
@@ -2793,6 +5372,169 @@ describe("knowledge-base server-owned turn messages", () => {
       turn: { apiCredentialId: "credential-b" },
     });
   });
+
+  it.each([
+    ["confirm", false],
+    ["revise", true],
+  ] as const)(
+    "continues an existing v2 canonical %s turn with its retired pinned credential",
+    async (operationType, deferred) => {
+      const canonicalBuild = {
+        id: "00000000-0000-4000-8000-000000000023",
+        userId: 1,
+        conversationId: "conversation-retired-v2-canonical",
+        companyName: "FrontMind 超前智能",
+        companyWebsite: "https://www.frontmind.net/",
+        skillName: "socratic-kb-builder",
+        skillVersion: "4",
+        skillContentHash: "a".repeat(64),
+        providerProtocol: "manus_v2",
+        canonicalTaskId: "canonical-task-a",
+        canonicalTaskGeneration: 2,
+        canonicalCredentialId: "credential-a",
+        canonicalTaskState: "active",
+        status: "confirming",
+        generation: 2,
+        stateEpoch: 5,
+        revision: 3,
+        currentLeafId: "1.4",
+        currentPresentationKey: null,
+        activeTurnId: null,
+        upstreamTaskId: "canonical-task-a",
+        recoveryLeaseExpiresAt: null,
+        protocolErrorCode: null,
+        protocolError: null,
+      };
+      const frozenManifest = deferred
+        ? [
+            {
+              itemId: "batch-retired:1",
+              ordinal: 1,
+              total: 1,
+              filename: "facts.pdf",
+              mimeType: "application/pdf",
+              sizeBytes: 12,
+              sha256: "f".repeat(64),
+              lastModified: 1,
+            },
+          ]
+        : undefined;
+      const harness = createTurnServiceExecutor({
+        build: canonicalBuild,
+        conversation: {
+          id: "u1:conversation-retired-v2-canonical",
+          userId: 1,
+          apiCredentialId: "credential-a",
+          projectAssignmentId: null,
+          deletedAt: null,
+          deletedMessageIds: [],
+          version: 1,
+          status: "awaiting_input",
+        },
+        credentials: [
+          { id: "credential-a", userId: 7, status: "retired" },
+          { id: "credential-b", userId: 8, status: "active" },
+        ],
+        usageOwnerId: 8,
+        turnSelections: [[[], []]],
+      });
+      await expect(
+        reserveKnowledgeBaseTurn(
+          {
+            userId: 1,
+            buildId: canonicalBuild.id,
+            clientRequestId: `retired-canonical-${operationType}`,
+            operationType,
+            expectedGeneration: 2,
+            expectedRevision: 3,
+            expectedLeafId: "1.4",
+            requestPayload: { userMessage: "确认", frozenManifest },
+            apiCredentialId: "credential-a",
+            userText: "确认",
+            userAttachmentCount: deferred ? 1 : 0,
+            expectedAttachmentCount: deferred ? 1 : 0,
+            deferDispatchUntilAttachments: deferred,
+            clientAttachmentManifest: frozenManifest,
+            recoveryMetadata: {
+              kind: "turn",
+              conversationId: canonicalBuild.conversationId,
+              parentTaskId: canonicalBuild.canonicalTaskId,
+              attachments: [],
+              ...(frozenManifest ? { attachmentManifest: frozenManifest } : {}),
+            },
+          },
+          harness.executor,
+        ),
+      ).resolves.toMatchObject({
+        state: deferred ? "awaiting_attachments" : "acquired",
+        turn: { apiCredentialId: "credential-a" },
+      });
+      expect(harness.store.turns).toHaveLength(1);
+    },
+  );
+
+  it("rejects a deleted v2 canonical credential instead of silently using the replacement key", async () => {
+    const canonicalBuild = {
+      id: "00000000-0000-4000-8000-000000000024",
+      userId: 1,
+      conversationId: "conversation-deleted-v2-canonical",
+      companyName: "FrontMind 超前智能",
+      companyWebsite: null,
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "a".repeat(64),
+      providerProtocol: "manus_v2",
+      canonicalTaskId: "canonical-task-deleted",
+      canonicalTaskGeneration: 2,
+      canonicalCredentialId: "credential-deleted",
+      canonicalTaskState: "active",
+      status: "confirming",
+      generation: 2,
+      stateEpoch: 5,
+      revision: 3,
+      currentLeafId: "1.4",
+      currentPresentationKey: null,
+      activeTurnId: null,
+      upstreamTaskId: "canonical-task-deleted",
+      recoveryLeaseExpiresAt: null,
+      protocolErrorCode: null,
+      protocolError: null,
+    };
+    const harness = createTurnServiceExecutor({
+      build: canonicalBuild,
+      conversation: {
+        id: "u1:conversation-deleted-v2-canonical",
+        userId: 1,
+        projectAssignmentId: null,
+        deletedAt: null,
+      },
+      credentials: [
+        { id: "credential-deleted", userId: 7, status: "deleted" },
+        { id: "credential-current", userId: 8, status: "active" },
+      ],
+      usageOwnerId: 8,
+      turnSelections: [[[], []]],
+    });
+    await expect(
+      reserveKnowledgeBaseTurn(
+        {
+          userId: 1,
+          buildId: canonicalBuild.id,
+          clientRequestId: "deleted-canonical-confirm",
+          operationType: "confirm",
+          expectedGeneration: 2,
+          expectedRevision: 3,
+          expectedLeafId: "1.4",
+          requestPayload: { userMessage: "确认" },
+          apiCredentialId: "credential-deleted",
+          userText: "确认",
+          expectedAttachmentCount: 0,
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(harness.store.turns).toHaveLength(0);
+  });
 });
 
 describe("knowledge-base attachment-first turn reservation", () => {
@@ -2840,6 +5582,23 @@ describe("knowledge-base attachment-first turn reservation", () => {
     version: 3,
     status: "awaiting_input",
   };
+  const deferredUploadResources = () =>
+    [
+      "file-facts",
+      "file-logo-notes",
+      "old-staged-facts",
+      "replacement-facts",
+      "replacement-logo-notes",
+    ].map((upstreamId) => ({
+      id: `resource-${upstreamId}`,
+      userId: 1,
+      apiCredentialId: "credential-1",
+      projectAssignmentId: null,
+      kind: "file",
+      upstreamId,
+      conversationId: null,
+      contentDeletedAt: null,
+    }));
 
   function reserveInput() {
     return {
@@ -2940,6 +5699,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
     const { executor, store } = createTurnServiceExecutor({
       build: { ...build },
       conversation: { ...conversation },
+      resources: deferredUploadResources(),
       turnSelections: [
         [[], []],
         [(current) => current.turns],
@@ -3121,10 +5881,101 @@ describe("knowledge-base attachment-first turn reservation", () => {
     });
   });
 
+  it("keeps a start turn lease-free after N/N stage until explicit dispatch", async () => {
+    const startBuild = {
+      ...build,
+      status: "researching",
+      generation: 1,
+      revision: 0,
+      currentLeafId: null,
+      upstreamTaskId: null,
+    };
+    const startConversation = {
+      ...conversation,
+      status: "running",
+    };
+    const { executor, store } = createTurnServiceExecutor({
+      build: startBuild,
+      conversation: startConversation,
+      resources: deferredUploadResources(),
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns],
+        [(current) => current.turns],
+        [(current) => current.turns, (current) => current.turns],
+      ],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(
+      {
+        ...reserveInput(),
+        buildId: startBuild.id,
+        operationType: "start",
+        expectedGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        requestPayload: {
+          companyName: startBuild.companyName,
+          attachments: [],
+          attachmentManifest: manifest,
+          skillVersion: "4",
+        },
+        userText: "开始构建企业知识库",
+        recoveryMetadata: {
+          ...reserveInput().recoveryMetadata,
+          kind: "start",
+          attachments: [],
+        },
+      },
+      executor,
+    );
+    store.build!.activeTurnId = reserved.turn.id;
+
+    for (const [index, attachment] of [
+      { file_id: "file-facts", filename: "facts.pdf" },
+      { file_id: "file-logo-notes", filename: "logo-notes.txt" },
+    ].entries()) {
+      await stageKnowledgeBaseDeferredTurnAttachment(
+        {
+          userId: 1,
+          buildId: startBuild.id,
+          turnId: reserved.turn.id,
+          clientRequestId: reserved.turn.clientRequestId,
+          clientAttachmentManifest: manifest,
+          index,
+          attachment,
+        },
+        executor,
+      );
+    }
+    expect(store.turns[0]).toMatchObject({
+      status: "queued",
+      leaseExpiresAt: null,
+      upstreamTaskId: null,
+      metadata: { awaitingClientAttachments: true },
+    });
+
+    const dispatched = await claimKnowledgeBaseDeferredTurnDispatch(
+      {
+        userId: 1,
+        buildId: startBuild.id,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        clientAttachmentManifest: manifest,
+      },
+      executor,
+    );
+    expect(dispatched).toMatchObject({
+      state: "acquired",
+      turn: { awaitingClientAttachments: false, upstreamTaskId: null },
+    });
+    expect(store.messages).toHaveLength(1);
+  });
+
   it("atomically claims the deferred turn when the final customer attachment is staged", async () => {
     const { executor, store } = createTurnServiceExecutor({
       build: { ...build },
       conversation: { ...conversation },
+      resources: deferredUploadResources(),
       turnSelections: [
         [[], []],
         [(current) => current.turns],
@@ -3555,6 +6406,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
     const { executor, store } = createTurnServiceExecutor({
       build: { ...build },
       conversation: { ...conversation },
+      resources: deferredUploadResources(),
       turnSelections: [
         [[], []],
         [(current) => current.turns],
@@ -3815,6 +6667,52 @@ describe("knowledge-base attachment-first turn reservation", () => {
     await expect(
       claimKnowledgeBaseTurnForRecovery({ turnId: waiting.id }, executor),
     ).resolves.toBeNull();
+  });
+
+  it("keeps the exact 15:52 replacement inert until migration grants recovery", async () => {
+    const replacement = turn({
+      id: "00000000-0000-4000-8000-000000000035",
+      buildId: build.id,
+      buildGeneration: build.generation,
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+      status: "queued",
+      leaseExpiresAt: null,
+      metadata: {
+        attachmentsFrozen: false,
+        awaitingClientAttachments: false,
+        createAttemptState: "not_sent",
+        providerProtocol: "legacy_v1",
+        providerAttemptState: "not_sent",
+        repairKind: "legacy_skill_404_confirm",
+        recovery: { kind: "turn" },
+      },
+    });
+    const selection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === replacement.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build, activeTurnId: replacement.id },
+      conversation: { ...conversation },
+      turns: [replacement],
+      turnSelections: [[selection], [selection]],
+    });
+
+    await expect(
+      claimKnowledgeBaseTurnForRecovery({ turnId: replacement.id }, executor),
+    ).resolves.toBeNull();
+    expect(store.turns[0]?.leaseExpiresAt).toBeNull();
+
+    await expect(
+      claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: replacement.id,
+          allowLegacySkill404IncidentRepair: true,
+        },
+        executor,
+      ),
+    ).resolves.toMatchObject({
+      turn: { id: replacement.id, createAttemptState: "not_sent" },
+    });
   });
 
   it("claims stale sending once for unknown projection but never reclaims unknown", async () => {

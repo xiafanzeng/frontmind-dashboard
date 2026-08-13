@@ -32,6 +32,7 @@ import {
   parseKnowledgeBaseUploadEvidenceStorageKey,
   removeKnowledgeBaseUploadEvidenceIfOrphaned,
 } from "./knowledge-base-upload-evidence-lifecycle";
+import { markKnowledgeBaseBuildSourcesTerminal } from "./knowledge-base-local-source-lifecycle";
 import {
   assertDeliveryProjectContext,
   deliveryExecutionActorRole,
@@ -580,6 +581,13 @@ export async function decideKnowledgeReset(input: {
     throw new AuthServiceError("CONFLICT", "驳回时必须填写原因");
   }
   const db = await requireDb();
+  // Populated only by the transaction that actually deletes these builds.
+  // Marker failures are fail-closed (retained bytes leak rather than delete).
+  let resetBuildSourceScopes: Array<{
+    userId: number;
+    buildId: string;
+    terminalAt: Date;
+  }> = [];
   const result = await db.transaction(async (tx) => {
     const row = await requirePendingRequestForMember({
       ...input,
@@ -663,6 +671,11 @@ export async function decideKnowledgeReset(input: {
     }
 
     const counts = await getKnowledgeCounts(tx, row.request.userId);
+    resetBuildSourceScopes = counts.builds.map((build) => ({
+      userId: row.request.userId,
+      buildId: build.id,
+      terminalAt: now,
+    }));
     const publicConversationIds = Array.from(
       new Set(
         [
@@ -918,6 +931,14 @@ export async function decideKnowledgeReset(input: {
     return { decision: "approved" as const, cleanup };
   });
   if (result.decision === "approved") {
+    await Promise.allSettled(
+      resetBuildSourceScopes.map((scope) =>
+        markKnowledgeBaseBuildSourcesTerminal({
+          ...scope,
+          reason: "reset",
+        }),
+      ),
+    );
     void processKnowledgeResetCleanupJobs();
   }
   return result;

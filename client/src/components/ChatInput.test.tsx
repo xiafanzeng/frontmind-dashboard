@@ -698,7 +698,7 @@ describe("knowledge-base ChatInput actions", () => {
     await waitFor(() => expect(mocks.sendMessage).not.toHaveBeenCalled());
   });
 
-  it("unlocks file selection only for an attachment-resume reservation", () => {
+  it("locks the generic composer for a managed attachment-resume reservation", () => {
     mocks.activeConversation.status = "running";
     mocks.activeConversation.knowledgeBase.canReply = false;
     mocks.activeConversation.knowledgeBase.notice = {
@@ -717,23 +717,12 @@ describe("knowledge-base ChatInput actions", () => {
       />,
     );
 
-    expect(screen.getByRole("textbox")).not.toBeDisabled();
+    expect(screen.getByRole("textbox")).toBeDisabled();
     const fileInput = container.querySelector('input[type="file"]')!;
-    expect(fileInput).not.toBeDisabled();
+    expect(fileInput).toBeDisabled();
     expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
-    expect(container.querySelector("svg.animate-spin")).not.toBeInTheDocument();
-    expect(container.querySelector("svg.lucide-send")).toBeInTheDocument();
-
-    fireEvent.change(fileInput, {
-      target: {
-        files: [new File(["image"], "补充图片.jpg", { type: "image/jpeg" })],
-      },
-    });
-
-    expect(screen.getByText("补充图片.jpg")).toBeInTheDocument();
-    const sendIcon = container.querySelector("svg.lucide-send")!;
-    expect(sendIcon).toBeInTheDocument();
-    expect(sendIcon.closest("button")).not.toBeDisabled();
+    expect(container.querySelector("svg.animate-spin")).toBeInTheDocument();
+    expect(container.querySelector("svg.lucide-send")).not.toBeInTheDocument();
   });
 
   it("locks the ordinary composer while dedicated Logo provenance repair is required", () => {

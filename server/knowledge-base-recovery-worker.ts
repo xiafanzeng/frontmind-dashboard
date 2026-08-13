@@ -16,6 +16,15 @@ type ArtifactCleanupResult = {
   [key: string]: unknown;
 };
 
+type ActiveLegacyMigrationResult = {
+  failed: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  rebindHasMore?: boolean;
+  rebindNextCursor?: string | null;
+  [key: string]: unknown;
+};
+
 /**
  * One production recovery sweep covers both durable reservations and legacy
  * open builds which no longer have an active turn. The cursor is retained
@@ -30,6 +39,12 @@ export function createKnowledgeBaseRecoverySweep(input: {
     afterBuildId?: string;
   }) => Promise<OpenBuildRecoveryResult>;
   cleanupArtifactCandidates?: () => Promise<ArtifactCleanupResult>;
+  migrateActiveLegacyBuilds?: (options: {
+    limit: number;
+    concurrency: number;
+    afterBuildId?: string;
+    afterRebindBuildId?: string;
+  }) => Promise<ActiveLegacyMigrationResult>;
   openBuildLimit?: number;
   openBuildConcurrency?: number;
 }) {
@@ -42,6 +57,8 @@ export function createKnowledgeBaseRecoverySweep(input: {
     Math.max(1, Math.trunc(input.openBuildConcurrency ?? 3)),
   );
   let afterBuildId: string | undefined;
+  let afterLegacyBuildId: string | undefined;
+  let afterRebindBuildId: string | undefined;
 
   return async () => {
     const turns = await input.recoverExpiredTurns();
@@ -52,13 +69,34 @@ export function createKnowledgeBaseRecoverySweep(input: {
     });
     afterBuildId =
       builds.hasMore && builds.nextCursor ? builds.nextCursor : undefined;
+    const migrations = input.migrateActiveLegacyBuilds
+      ? await input.migrateActiveLegacyBuilds({
+          limit,
+          concurrency,
+          ...(afterLegacyBuildId ? { afterBuildId: afterLegacyBuildId } : {}),
+          ...(afterRebindBuildId ? { afterRebindBuildId } : {}),
+        })
+      : null;
+    afterLegacyBuildId =
+      migrations?.hasMore && migrations.nextCursor
+        ? migrations.nextCursor
+        : undefined;
+    afterRebindBuildId =
+      migrations?.rebindHasMore && migrations.rebindNextCursor
+        ? migrations.rebindNextCursor
+        : undefined;
     const artifacts = input.cleanupArtifactCandidates
       ? await input.cleanupArtifactCandidates()
       : null;
     return {
-      failed: turns.failed + builds.failed + (artifacts?.failed ?? 0),
+      failed:
+        turns.failed +
+        builds.failed +
+        (migrations?.failed ?? 0) +
+        (artifacts?.failed ?? 0),
       turns,
       builds,
+      migrations,
       artifacts,
     };
   };

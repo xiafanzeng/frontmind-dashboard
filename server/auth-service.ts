@@ -181,6 +181,23 @@ export type DecryptedCredential = {
   verifiedAt: Date | null;
 };
 
+export type KnowledgeBaseUploadReservationCredential = DecryptedCredential & {
+  reservation: {
+    clientRequestId: string;
+    attachmentManifest: Array<{
+      filename: string;
+      sizeBytes: number;
+      mimeType: string;
+      lastModified: number;
+      sha256: string;
+      itemId?: string;
+      ordinal?: number;
+      total?: number;
+    }>;
+    stagedAttachmentCount: number;
+  };
+};
+
 export type CredentialStatus = {
   configured: boolean;
   version: number;
@@ -2446,6 +2463,220 @@ export async function getDecryptedCredentialForKnowledgeBaseReservation(
       fingerprint: credential.fingerprint,
       status: credential.status,
       verifiedAt: credential.verifiedAt,
+    };
+  });
+}
+
+/**
+ * Resolve the exact credential frozen by a knowledge-base upload reservation.
+ * Unlike the dispatch resolver, this permits the active turn to still be in
+ * `awaitingClientAttachments`; no provider operation has started yet. It is
+ * intentionally scoped by owner + public conversation + turn and accepts a
+ * retired credential so key rotation cannot strand a reserved upload batch.
+ */
+export async function getDecryptedCredentialForKnowledgeBaseUploadReservation(
+  input: {
+    userId: number;
+    conversationId: string;
+    turnId: string;
+    projectAssignmentId?: string | null;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseUploadReservationCredential | null> {
+  const db = executor ?? (await requireDb());
+  const storedConversationId = `u${input.userId}:${input.conversationId}`;
+  return db.transaction(async (tx: any) => {
+    const turn = (
+      await tx
+        .select({
+          id: conversationTurns.id,
+          clientRequestId: conversationTurns.clientRequestId,
+          userId: conversationTurns.userId,
+          conversationId: conversationTurns.conversationId,
+          buildId: conversationTurns.buildId,
+          buildGeneration: conversationTurns.buildGeneration,
+          apiCredentialId: conversationTurns.apiCredentialId,
+          status: conversationTurns.status,
+          metadata: conversationTurns.metadata,
+        })
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, input.turnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.conversationId, storedConversationId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    const metadata =
+      turn?.metadata &&
+      typeof turn.metadata === "object" &&
+      !Array.isArray(turn.metadata)
+        ? turn.metadata
+        : {};
+    const recovery =
+      metadata.recovery &&
+      typeof metadata.recovery === "object" &&
+      !Array.isArray(metadata.recovery)
+        ? (metadata.recovery as Record<string, unknown>)
+        : {};
+    const rawAttachmentManifest = Array.isArray(recovery.attachmentManifest)
+      ? recovery.attachmentManifest
+      : [];
+    const attachmentManifest = rawAttachmentManifest
+      .map((value, index) => {
+        const item =
+          value && typeof value === "object" && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : {};
+        const filename = String(item.filename || "").trim();
+        const sizeBytes = Number(item.sizeBytes);
+        const mimeType = String(item.mimeType || "").trim();
+        const lastModified = Number(item.lastModified);
+        const sha256 = String(item.sha256 || "")
+          .trim()
+          .toLowerCase();
+        const itemId = String(item.itemId || "").trim();
+        const ordinal = Number(item.ordinal);
+        const total = Number(item.total);
+        const hasStarterCoordinate = Boolean(itemId);
+        if (
+          !filename ||
+          !Number.isSafeInteger(sizeBytes) ||
+          sizeBytes < 0 ||
+          !mimeType ||
+          !Number.isSafeInteger(lastModified) ||
+          lastModified < 0 ||
+          !/^[a-f0-9]{64}$/u.test(sha256) ||
+          (hasStarterCoordinate &&
+            (!Number.isSafeInteger(ordinal) ||
+              ordinal !== index + 1 ||
+              !Number.isSafeInteger(total) ||
+              total !== rawAttachmentManifest.length))
+        ) {
+          return null;
+        }
+        return {
+          filename,
+          sizeBytes,
+          mimeType,
+          lastModified,
+          sha256,
+          ...(hasStarterCoordinate ? { itemId, ordinal, total } : {}),
+        };
+      })
+      .filter(
+        (
+          item,
+        ): item is KnowledgeBaseUploadReservationCredential["reservation"]["attachmentManifest"][number] =>
+          Boolean(item),
+      );
+    if (
+      !turn?.buildId ||
+      !turn.buildGeneration ||
+      !turn.clientRequestId ||
+      !turn.apiCredentialId ||
+      (turn.status !== "queued" && turn.status !== "running") ||
+      metadata.awaitingClientAttachments !== true
+    ) {
+      return null;
+    }
+    const declaredUserAttachmentCount = Number(metadata.userAttachmentCount);
+    if (
+      !Number.isSafeInteger(declaredUserAttachmentCount) ||
+      declaredUserAttachmentCount < 0 ||
+      attachmentManifest.length !== declaredUserAttachmentCount
+    ) {
+      return null;
+    }
+    const build = (
+      await tx
+        .select({
+          id: knowledgeBaseBuilds.id,
+          userId: knowledgeBaseBuilds.userId,
+          conversationId: knowledgeBaseBuilds.conversationId,
+          generation: knowledgeBaseBuilds.generation,
+          activeTurnId: knowledgeBaseBuilds.activeTurnId,
+          status: knowledgeBaseBuilds.status,
+        })
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, turn.buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.conversationId, input.conversationId),
+            eq(knowledgeBaseBuilds.generation, turn.buildGeneration),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (
+      !build ||
+      build.activeTurnId !== turn.id ||
+      !["researching", "confirming", "protocol_error"].includes(
+        String(build.status),
+      )
+    ) {
+      return null;
+    }
+    const conversation = (
+      await tx
+        .select({
+          id: conversations.id,
+          userId: conversations.userId,
+          projectAssignmentId: conversations.projectAssignmentId,
+          deletedAt: conversations.deletedAt,
+        })
+        .from(conversations)
+        .where(
+          and(
+            eq(conversations.id, storedConversationId),
+            eq(conversations.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0];
+    if (
+      !conversation ||
+      conversation.deletedAt ||
+      (conversation.projectAssignmentId ?? null) !==
+        (input.projectAssignmentId ?? null)
+    ) {
+      return null;
+    }
+    const credential = (
+      await tx
+        .select()
+        .from(apiCredentials)
+        .where(eq(apiCredentials.id, turn.apiCredentialId))
+        .limit(1)
+        .for("update")
+    )[0] as ApiCredential | undefined;
+    if (
+      !credential ||
+      (credential.status !== "active" && credential.status !== "retired")
+    ) {
+      return null;
+    }
+    return {
+      id: credential.id,
+      userId: credential.userId,
+      version: credential.version,
+      apiKey: decryptApiKey(credential),
+      fingerprint: credential.fingerprint,
+      status: credential.status,
+      verifiedAt: credential.verifiedAt,
+      reservation: {
+        clientRequestId: turn.clientRequestId,
+        attachmentManifest,
+        stagedAttachmentCount: Array.isArray(metadata.clientStagedAttachments)
+          ? metadata.clientStagedAttachments.length
+          : 0,
+      },
     };
   });
 }

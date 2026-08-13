@@ -78,6 +78,20 @@ export class KnowledgeBaseAttachmentsProcessingError extends Error {
   }
 }
 
+/**
+ * Local rollout pause before the first Manus v2 task.create. No provider
+ * request has been attempted, so the durable turn may be retried only after an
+ * operator explicitly enables the relevant writer or migration authority.
+ */
+export class KnowledgeBaseManusV2RolloutDeferredError extends Error {
+  readonly code = "KNOWLEDGE_BASE_MANUS_V2_ROLLOUT_DISABLED";
+
+  constructor() {
+    super("The first Manus v2 task create is disabled by rollout policy");
+    this.name = "KnowledgeBaseManusV2RolloutDeferredError";
+  }
+}
+
 export type KnowledgeBaseUpstreamCreateFailureClass =
   | "deterministic"
   | "retriable"

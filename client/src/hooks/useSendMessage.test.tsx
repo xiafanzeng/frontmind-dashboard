@@ -1036,7 +1036,7 @@ describe("useSendMessage", () => {
     });
   });
 
-  it("uploads the file completely before submitting the knowledge turn", async () => {
+  it("reserves, uploads, stages and dispatches one knowledge attachment in order", async () => {
     const file = new File(["facts"], "facts.pdf", {
       type: "application/pdf",
       lastModified: 1_700_000_000_000,
@@ -1052,11 +1052,80 @@ describe("useSendMessage", () => {
       });
     });
 
+    expect(mocks.reserveKnowledgeBaseTurnWithAttachments).toHaveBeenCalledTimes(
+      1,
+    );
+    const reservationManifest =
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.calls[0]![1]
+        .attachmentManifest;
+    expect(mocks.reserveKnowledgeBaseTurnWithAttachments).toHaveBeenCalledWith(
+      [
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "请结合附件修订" }],
+        },
+      ],
+      expect.objectContaining({
+        conversationId: "test-conv-id",
+        clientRequestId: expect.any(String),
+        expectedGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "2.1",
+        attachmentManifest: [
+          {
+            filename: "facts.pdf",
+            sizeBytes: 5,
+            mimeType: "application/pdf",
+            lastModified: 1_700_000_000_000,
+            sha256: "a".repeat(64),
+            itemId: expect.any(String),
+            ordinal: 1,
+            total: 1,
+          },
+        ],
+      }),
+    );
+    const uploadOptions = mocks.uploadFile.mock.calls[0]![3];
+    expect(uploadOptions).toEqual(
+      expect.objectContaining({
+        captureLocalCopy: true,
+        captureFilename: "facts.pdf",
+        batchId: expect.any(String),
+        batchOrdinal: 1,
+        batchTotal: 1,
+        itemId: reservationManifest[0].itemId,
+        resumeScope: {
+          kind: "knowledge_base",
+          conversationId: "test-conv-id",
+          turnId: "reserved-turn-1",
+          clientRequestId:
+            mocks.reserveKnowledgeBaseTurnWithAttachments.mock.calls[0]![1]
+              .clientRequestId,
+        },
+      }),
+    );
+    expect(uploadOptions.batchId).toBe(
+      String(reservationManifest[0].itemId).split(":1")[0],
+    );
+    expect(mocks.stageKnowledgeBaseTurnAttachment).toHaveBeenCalledWith({
+      conversationId: "test-conv-id",
+      turnId: "reserved-turn-1",
+      clientRequestId:
+        mocks.reserveKnowledgeBaseTurnWithAttachments.mock.calls[0]![1]
+          .clientRequestId,
+      attachmentManifest: reservationManifest,
+      index: 0,
+      attachment: { file_id: "file-facts.pdf", filename: "facts.pdf" },
+    });
     expect(
-      mocks.reserveKnowledgeBaseTurnWithAttachments,
-    ).not.toHaveBeenCalled();
-    expect(mocks.stageKnowledgeBaseTurnAttachment).not.toHaveBeenCalled();
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.uploadFile.mock.invocationCallOrder[0]);
     expect(mocks.uploadFile.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
+    );
+    expect(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
+    ).toBeLessThan(
       mocks.createKnowledgeBaseTurnTask.mock.invocationCallOrder[0],
     );
     expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
@@ -1073,7 +1142,12 @@ describe("useSendMessage", () => {
           ]),
         },
       ],
-      expect.not.objectContaining({ attachmentReservation: expect.anything() }),
+      expect.objectContaining({
+        attachmentReservation: {
+          turnId: "reserved-turn-1",
+          attachmentManifest: reservationManifest,
+        },
+      }),
     );
     const pendingMessages = mocks.addMessage.mock.calls.filter(
       ([, message]) => message.knowledgeBase?.kind === "pending_user",
@@ -1089,7 +1163,7 @@ describe("useSendMessage", () => {
     );
   });
 
-  it("uploads every attachment and submits them together exactly once", async () => {
+  it("uses one frozen reservation and stages every attachment before one dispatch", async () => {
     const first = new File(["a"], "a.txt", {
       type: "text/plain",
       lastModified: 10,
@@ -1110,10 +1184,83 @@ describe("useSendMessage", () => {
     });
 
     expect(mocks.uploadFile).toHaveBeenCalledTimes(2);
+    expect(mocks.reserveKnowledgeBaseTurnWithAttachments).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(mocks.stageKnowledgeBaseTurnAttachment).toHaveBeenCalledTimes(2);
+    const reservationContext =
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.calls[0]![1];
+    const reservationManifest = reservationContext.attachmentManifest;
+    expect(reservationManifest).toEqual([
+      expect.objectContaining({
+        filename: "a.txt",
+        ordinal: 1,
+        total: 2,
+        itemId: expect.any(String),
+      }),
+      expect.objectContaining({
+        filename: "b.txt",
+        ordinal: 2,
+        total: 2,
+        itemId: expect.any(String),
+      }),
+    ]);
+    const firstUploadOptions = mocks.uploadFile.mock.calls[0]![3];
+    const secondUploadOptions = mocks.uploadFile.mock.calls[1]![3];
+    expect(firstUploadOptions).toEqual(
+      expect.objectContaining({
+        batchId: expect.any(String),
+        batchOrdinal: 1,
+        batchTotal: 2,
+        itemId: reservationManifest[0].itemId,
+        resumeScope: expect.objectContaining({
+          turnId: "reserved-turn-1",
+          clientRequestId: reservationContext.clientRequestId,
+        }),
+      }),
+    );
+    expect(secondUploadOptions).toEqual(
+      expect.objectContaining({
+        batchId: firstUploadOptions.batchId,
+        batchOrdinal: 2,
+        batchTotal: 2,
+        itemId: reservationManifest[1].itemId,
+        resumeScope: firstUploadOptions.resumeScope,
+      }),
+    );
+    expect(mocks.stageKnowledgeBaseTurnAttachment.mock.calls).toEqual([
+      [
+        expect.objectContaining({
+          attachmentManifest: reservationManifest,
+          index: 0,
+          attachment: { file_id: "file-a.txt", filename: "a.txt" },
+        }),
+      ],
+      [
+        expect.objectContaining({
+          attachmentManifest: reservationManifest,
+          index: 1,
+          attachment: { file_id: "file-b.txt", filename: "b.txt" },
+        }),
+      ],
+    ]);
     expect(
-      mocks.reserveKnowledgeBaseTurnWithAttachments,
-    ).not.toHaveBeenCalled();
-    expect(mocks.stageKnowledgeBaseTurnAttachment).not.toHaveBeenCalled();
+      mocks.reserveKnowledgeBaseTurnWithAttachments.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.uploadFile.mock.invocationCallOrder[0]);
+    expect(mocks.uploadFile.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
+    );
+    expect(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
+    ).toBeLessThan(mocks.uploadFile.mock.invocationCallOrder[1]);
+    expect(mocks.uploadFile.mock.invocationCallOrder[1]).toBeLessThan(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[1],
+    );
+    expect(
+      mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[1],
+    ).toBeLessThan(
+      mocks.createKnowledgeBaseTurnTask.mock.invocationCallOrder[0],
+    );
     expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
       [
         {
@@ -1124,7 +1271,12 @@ describe("useSendMessage", () => {
           ],
         },
       ],
-      expect.not.objectContaining({ attachmentReservation: expect.anything() }),
+      expect.objectContaining({
+        attachmentReservation: {
+          turnId: "reserved-turn-1",
+          attachmentManifest: reservationManifest,
+        },
+      }),
     );
     expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledTimes(1);
   });
@@ -1152,7 +1304,19 @@ describe("useSendMessage", () => {
       file,
       expect.any(Function),
       expect.any(Object),
-      { captureLocalCopy: true, captureFilename: normalized },
+      expect.objectContaining({
+        captureLocalCopy: true,
+        captureFilename: normalized,
+        batchId: expect.any(String),
+        batchOrdinal: 1,
+        batchTotal: 1,
+        itemId: expect.any(String),
+        resumeScope: expect.objectContaining({
+          kind: "knowledge_base",
+          conversationId: "test-conv-id",
+          turnId: "reserved-turn-1",
+        }),
+      }),
     );
     expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
       [
@@ -1167,9 +1331,78 @@ describe("useSendMessage", () => {
         },
       ],
       expect.objectContaining({
-        expectedGeneration: 3,
-        attachmentManifest: [expect.objectContaining({ filename: normalized })],
+        attachmentReservation: {
+          turnId: "reserved-turn-1",
+          attachmentManifest: [
+            expect.objectContaining({ filename: normalized }),
+          ],
+        },
       }),
+    );
+  });
+
+  it("does not send browser bytes or add a user bubble when attachment reservation fails", async () => {
+    const file = new File(["facts"], "facts.pdf", {
+      type: "application/pdf",
+      lastModified: 40,
+    });
+    mockPreparedFiles([file]);
+    mocks.reserveKnowledgeBaseTurnWithAttachments.mockRejectedValueOnce(
+      new Error("reservation unavailable"),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = true;
+    await act(async () => {
+      submitted = await result.current.sendMessage("请结合附件修订", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(submitted).toBe(false);
+    expect(mocks.reserveKnowledgeBaseTurnWithAttachments).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
+    expect(mocks.stageKnowledgeBaseTurnAttachment).not.toHaveBeenCalled();
+    expect(mocks.createKnowledgeBaseTurnTask).not.toHaveBeenCalled();
+    expect(mocks.addMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch or duplicate the user bubble when staging fails", async () => {
+    const file = new File(["facts"], "facts.pdf", {
+      type: "application/pdf",
+      lastModified: 50,
+    });
+    mockPreparedFiles([file]);
+    mocks.stageKnowledgeBaseTurnAttachment.mockRejectedValueOnce(
+      new Error("stage unavailable"),
+    );
+
+    const { result } = renderHook(() => useSendMessage());
+    let submitted = true;
+    await act(async () => {
+      submitted = await result.current.sendMessage("请结合附件修订", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(submitted).toBe(false);
+    expect(mocks.reserveKnowledgeBaseTurnWithAttachments).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(mocks.uploadFile).toHaveBeenCalledTimes(1);
+    expect(mocks.stageKnowledgeBaseTurnAttachment).toHaveBeenCalledTimes(1);
+    expect(mocks.createKnowledgeBaseTurnTask).not.toHaveBeenCalled();
+    expect(mocks.addMessage).not.toHaveBeenCalled();
+    expect(mocks.wakeKnowledgeBaseConversation).toHaveBeenCalledWith(
+      "test-conv-id",
     );
   });
 

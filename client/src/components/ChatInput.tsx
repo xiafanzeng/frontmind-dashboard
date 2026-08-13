@@ -261,6 +261,7 @@ export default function ChatInput({
     activeConversation?.status !== "awaiting_input";
   const inputLocked =
     knowledgeBaseLogoProvenanceRepairRequired ||
+    knowledgeBaseAttachmentResumeRequired ||
     ((isRunning || knowledgeInteractionLocked) &&
       !knowledgeBaseAttachmentResumeRequired);
   const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
@@ -968,9 +969,7 @@ export default function ChatInput({
                       : "bg-muted text-muted-foreground",
                   )}
                 >
-                  {isSending ||
-                  isUploading ||
-                  (isRunning && !knowledgeBaseAttachmentResumeRequired) ? (
+                  {isSending || isUploading || isRunning ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
                     <Send className="w-4 h-4" />

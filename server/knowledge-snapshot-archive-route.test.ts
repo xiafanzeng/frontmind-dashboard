@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   getKnowledgeSnapshotForWorkspace: vi.fn(),
   readKnowledgeSnapshotArchive: vi.fn(),
+  loadKnowledgeSnapshotDownloadValidation: vi.fn(),
 }));
 
 vi.mock("./_core/express-auth", () => ({
@@ -48,12 +49,76 @@ vi.mock("./knowledge-snapshot-archive-store", async (importOriginal) => {
   };
 });
 
+vi.mock("./knowledge-snapshot-download-validation", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("./knowledge-snapshot-download-validation")
+    >();
+  return {
+    ...actual,
+    loadKnowledgeSnapshotDownloadValidation:
+      mocks.loadKnowledgeSnapshotDownloadValidation,
+  };
+});
+
 import dashboardRouter from "./dashboard-api";
+import type { KnowledgeBaseBuildNode } from "../drizzle/schema";
+import { buildDashboardOwnedKnowledgePackage } from "./knowledge-base-local-package";
+import {
+  KnowledgeSnapshotDownloadBindingError,
+  type KnowledgeSnapshotDownloadValidation,
+} from "./knowledge-snapshot-download-validation";
 
 const servers: Server[] = [];
 const snapshotId = "00000000-0000-4000-8000-000000000123";
+const buildId = "123e4567-e89b-42d3-a456-426614174000";
 let archive: Buffer;
 let archiveHash: string;
+
+function localPackageNodes() {
+  return [
+    {
+      leafId: "1.1",
+      title: "企业定位",
+      branchId: "identity",
+      branchTitle: "企业身份",
+      ordinal: 0,
+      status: "confirmed",
+      contentMarkdown: "## 1.1 企业定位\n\nFrontMind 是企业 AI 工作流平台。",
+      contentSha256: null,
+      sourceUrls: ["https://frontmind.net/"],
+      imageUrls: [],
+    },
+  ] as KnowledgeBaseBuildNode[];
+}
+
+async function dashboardOwnedArchive() {
+  const nodes = localPackageNodes();
+  const built = await buildDashboardOwnedKnowledgePackage({
+    build: {
+      id: buildId,
+      generation: 2,
+      revision: 7,
+      companyName: "FrontMind",
+      logoStorageKey: null,
+    },
+    nodes,
+  });
+  const validation: KnowledgeSnapshotDownloadValidation = {
+    kind: "dashboard_owned",
+    buildId,
+    archiveSha256: built.sha256,
+    archiveBytes: built.buffer.length,
+    expected: {
+      buildId,
+      generation: 2,
+      revision: 7,
+      companyName: "FrontMind",
+    },
+    nodes,
+  };
+  return { ...built, validation };
+}
 
 async function downloadableArchive(extraFiles: Record<string, string> = {}) {
   const zip = new JSZip();
@@ -86,6 +151,9 @@ beforeEach(async () => {
     totalBytes: archive.length,
   });
   mocks.readKnowledgeSnapshotArchive.mockReset().mockResolvedValue(archive);
+  mocks.loadKnowledgeSnapshotDownloadValidation
+    .mockReset()
+    .mockResolvedValue({ kind: "historical" });
 });
 
 afterEach(async () => {
@@ -144,6 +212,75 @@ describe("knowledge snapshot ZIP endpoint", () => {
       snapshotId,
       expectedSha256: archiveHash,
       expectedBytes: archive.length,
+    });
+  });
+
+  it("serves an exactly bound Dashboard-owned local package", async () => {
+    const local = await dashboardOwnedArchive();
+    mocks.getKnowledgeSnapshotForWorkspace.mockResolvedValueOnce({
+      id: snapshotId,
+      userId: 42,
+      sourceFileName: "FrontMind-knowledge-base.zip",
+      archiveHash: local.sha256,
+      totalBytes: local.buffer.length,
+    });
+    mocks.readKnowledgeSnapshotArchive.mockResolvedValueOnce(local.buffer);
+    mocks.loadKnowledgeSnapshotDownloadValidation.mockResolvedValueOnce(
+      local.validation,
+    );
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(local.buffer);
+  });
+
+  it("refuses tampered Dashboard-owned bytes before sending the archive", async () => {
+    const local = await dashboardOwnedArchive();
+    const tampered = Buffer.from(local.buffer);
+    tampered[tampered.length - 1] = tampered[tampered.length - 1]! ^ 0xff;
+    mocks.getKnowledgeSnapshotForWorkspace.mockResolvedValueOnce({
+      id: snapshotId,
+      userId: 42,
+      sourceFileName: "FrontMind-knowledge-base.zip",
+      archiveHash: local.sha256,
+      totalBytes: local.buffer.length,
+    });
+    mocks.readKnowledgeSnapshotArchive.mockResolvedValueOnce(tampered);
+    mocks.loadKnowledgeSnapshotDownloadValidation.mockResolvedValueOnce(
+      local.validation,
+    );
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("content-type")).not.toContain(
+      "application/zip",
+    );
+    expect(await response.json()).toMatchObject({
+      error: { code: "KNOWLEDGE_ARCHIVE_BINDING_INVALID" },
+    });
+  });
+
+  it("refuses a Dashboard-owned snapshot whose DB binding no longer matches", async () => {
+    mocks.loadKnowledgeSnapshotDownloadValidation.mockRejectedValueOnce(
+      new KnowledgeSnapshotDownloadBindingError(),
+    );
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("content-type")).not.toContain(
+      "application/zip",
+    );
+    expect(await response.json()).toMatchObject({
+      error: { code: "KNOWLEDGE_ARCHIVE_BINDING_INVALID" },
     });
   });
 

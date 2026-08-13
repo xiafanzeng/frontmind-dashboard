@@ -32,6 +32,7 @@ import {
 } from "../shared/knowledge-base-output";
 import { AuthServiceError } from "./auth-service";
 import { getDb } from "./db";
+import { markKnowledgeBaseBuildSourceGenerationTerminal } from "./knowledge-base-local-source-lifecycle";
 import {
   collectKnowledgeArchiveDescriptors,
   collectKnowledgeBaseOutputResourceProjections,
@@ -59,8 +60,13 @@ import {
 import {
   markKnowledgeBaseConversationCompletedInTransaction,
   markKnowledgeBaseConversationFailedInTransaction,
+  persistKnowledgeBaseCompletionInTransaction,
   persistKnowledgeBasePresentationInTransaction,
 } from "./knowledge-base-conversation-messages";
+import {
+  matchesAuthoritativeKnowledgeBaseMessageTuple,
+  parsedKnowledgeBaseMessageMetadata,
+} from "./knowledge-base-authoritative-message";
 import {
   KnowledgeBaseProgressError,
   applyKnowledgeBaseProgressEnvelope,
@@ -275,6 +281,45 @@ export function knowledgeBaseObservationConversationStorageId(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function knowledgeBaseAcceptedProviderAttemptMetadata(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (!isRecord(value) || value.providerProtocol !== "manus_v2") {
+    return undefined;
+  }
+  // `acknowledged` proves only that the provider accepted/bound the request.
+  // Reconcile may accept the ledger only after a structured result has moved
+  // the durable attempt to `sending` or (normally) `output_pending`.
+  if (
+    value.providerAttemptState !== "output_pending" &&
+    value.providerAttemptState !== "sending"
+  ) {
+    return undefined;
+  }
+  return { ...value, providerAttemptState: "accepted" };
+}
+
+async function completeKnowledgeBaseStructuredResultTurnInTransaction(input: {
+  tx: any;
+  turn: ConversationTurn;
+  completedAt?: Date;
+}) {
+  const acceptedMetadata = knowledgeBaseAcceptedProviderAttemptMetadata(
+    input.turn.metadata,
+  );
+  await input.tx
+    .update(conversationTurns)
+    .set({
+      status: "completed",
+      completedAt: input.completedAt ?? new Date(),
+      leaseExpiresAt: null,
+      errorCode: null,
+      errorMessage: null,
+      ...(acceptedMetadata ? { metadata: acceptedMetadata } : {}),
+    })
+    .where(eq(conversationTurns.id, input.turn.id));
 }
 
 function assertEnvelopeBelongsToActiveTurn(input: {
@@ -1439,6 +1484,98 @@ function buildResearchSummary(
   };
 }
 
+type KnowledgeBasePackageProjectionBuild = Pick<
+  KnowledgeBaseBuild,
+  | "id"
+  | "status"
+  | "revision"
+  | "canonicalTaskId"
+  | "upstreamTaskId"
+  | "packageStatus"
+  | "packageRevision"
+  | "packageTaskId"
+  | "packageOutputItemId"
+  | "packageFileId"
+  | "packageFilename"
+  | "packageDescriptorHash"
+  | "packageStorageKey"
+  | "packageArchiveSha256"
+  | "packageSizeBytes"
+  | "contentCompletedAt"
+  | "completedAt"
+  | "updatedAt"
+>;
+
+/**
+ * Dual-read the package/content state introduced by migration 0061.
+ *
+ * Rows completed before 0061 already own immutable package bytes but receive
+ * the additive column default `not_started`. Treat that exact legacy shape as
+ * ready only when the complete revision/task/descriptor/physical-byte tuple
+ * still proves the package belongs to this terminal build. A current
+ * finalization in `preparing`/`retrying` never takes this fallback, even if a
+ * partially-cleared stale column survived an interrupted write.
+ */
+export function knowledgeBasePackageProjectionCompatibility(
+  build: KnowledgeBasePackageProjectionBuild,
+) {
+  const terminal =
+    build.status === "ready_to_publish" || build.status === "published";
+  const packageTupleComplete = Boolean(
+    terminal &&
+      build.packageRevision === build.revision &&
+      build.packageTaskId === (build.canonicalTaskId || build.upstreamTaskId) &&
+      build.packageOutputItemId &&
+      /^[a-f0-9]{64}$/u.test(String(build.packageDescriptorHash || "")) &&
+      build.packageStorageKey &&
+      /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || "")) &&
+      Number.isSafeInteger(build.packageSizeBytes) &&
+      Number(build.packageSizeBytes) > 0,
+  );
+  const packageAllowed =
+    packageTupleComplete &&
+    (build.packageStatus === "ready" ||
+      build.packageStatus === "not_started" ||
+      build.packageStatus == null);
+  const storedPackageState = [
+    "not_started",
+    "preparing",
+    "retrying",
+    "ready",
+    "attention_required",
+  ].includes(String(build.packageStatus || ""))
+    ? (build.packageStatus as KnowledgeBaseObservationDto["packageState"])
+    : "not_started";
+  const packageState = packageAllowed
+    ? ("ready" as const)
+    : storedPackageState === "ready"
+      ? ("attention_required" as const)
+      : storedPackageState;
+  const contentCompletedAt =
+    build.contentCompletedAt ||
+    (terminal ? build.completedAt || build.updatedAt : null);
+  const packageDto: KnowledgeBasePackageDto | null = packageAllowed
+    ? {
+        revision: build.revision,
+        outputItemId: build.packageOutputItemId,
+        fileId: build.packageFileId,
+        filename: build.packageFilename || "knowledge-base.zip",
+        mimeType: "application/zip",
+        sha256: build.packageArchiveSha256!,
+        sizeBytes: build.packageSizeBytes!,
+        downloadPath: `/api/knowledge-base/artifacts/${encodeURIComponent(build.id)}/package`,
+      }
+    : null;
+
+  return {
+    contentCompletedAt,
+    contentCompleted: Boolean(contentCompletedAt),
+    packageAllowed,
+    packageState,
+    package: packageDto,
+  };
+}
+
 function buildDto(
   build: KnowledgeBaseBuild,
   rows: KnowledgeBaseBuildNode[],
@@ -1505,11 +1642,14 @@ function buildDto(
   const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
   const researchSummary = buildResearchSummary(build, rows);
   const logoCanChange =
+    build.providerProtocol !== "manus_v2" &&
     build.skillVersion === "4" &&
     build.status === "confirming" &&
     build.confirmedCount === 0 &&
     build.directPrefilledCount === 0 &&
     currentBuildRow?.ordinal === 0;
+  const packageCompatibility =
+    knowledgeBasePackageProjectionCompatibility(build);
   return {
     build: {
       id: build.id,
@@ -1538,22 +1678,8 @@ function buildDto(
       overallPercent: total === 0 ? 0 : Math.round((handled / total) * 100),
     },
     branches: [...branchMap.values()],
-    packageAllowed:
-      total >= depthPolicy.minLeaves &&
-      total <= depthPolicy.maxLeaves &&
-      build.totalNodeCount === total &&
-      (depthPolicy.version === 1 || researchSummary !== null) &&
-      handled === total &&
-      build.currentLeafId === null &&
-      build.status === "ready_to_publish" &&
-      build.packageRevision === build.revision &&
-      build.packageTaskId === build.upstreamTaskId &&
-      Boolean(build.packageOutputItemId) &&
-      Boolean(build.packageDescriptorHash) &&
-      Boolean(build.packageStorageKey) &&
-      /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || "")) &&
-      Number.isSafeInteger(build.packageSizeBytes) &&
-      Number(build.packageSizeBytes) > 0,
+    packageAllowed: packageCompatibility.packageAllowed,
+    packageState: packageCompatibility.packageState,
   };
 }
 
@@ -1867,6 +1993,32 @@ export type KnowledgeBaseObservationProjection = Omit<
   progress: KnowledgeBaseProgressDto;
 };
 
+type KnowledgeBaseAcceptedMessageRow = Pick<
+  typeof messages.$inferSelect,
+  | "id"
+  | "conversationId"
+  | "userId"
+  | "turnId"
+  | "role"
+  | "content"
+  | "sequence"
+  | "metadata"
+>;
+
+type KnowledgeBaseAcceptedReceiptTurnRow = Pick<
+  typeof conversationTurns.$inferSelect,
+  | "id"
+  | "conversationId"
+  | "userId"
+  | "clientRequestId"
+  | "buildId"
+  | "buildGeneration"
+  | "operationKey"
+  | "expectedRevision"
+  | "expectedLeafId"
+  | "status"
+>;
+
 const KNOWLEDGE_BASE_MAINTENANCE_ONLY_ERROR_CODES = new Set([
   "LEGACY_TASK_REBIND_REQUIRED",
   "LEGACY_CREDENTIAL_REBIND_REQUIRED",
@@ -1997,73 +2149,138 @@ async function readKnowledgeBaseObservationProjection(
       ].filter((turnId): turnId is string => Boolean(turnId)),
     ),
   ];
-  const [activeTurnRow, presentationTurnRow, conversationRow, messageRows] =
-    await Promise.all([
-      build.activeTurnId
-        ? db
-            .select()
-            .from(conversationTurns)
-            .where(
-              and(
-                eq(conversationTurns.id, build.activeTurnId),
-                eq(conversationTurns.userId, input.userId),
-                eq(conversationTurns.buildId, build.id),
-                eq(conversationTurns.buildGeneration, build.generation),
-              ),
-            )
-            .limit(1)
-            .then(
-              (values: Array<typeof conversationTurns.$inferSelect>) =>
-                values[0] || null,
-            )
-        : Promise.resolve(null),
-      currentRow?.sourceTurnId
-        ? db
-            .select()
-            .from(conversationTurns)
-            .where(
-              and(
-                eq(conversationTurns.id, currentRow.sourceTurnId),
-                eq(conversationTurns.userId, input.userId),
-                eq(conversationTurns.buildId, build.id),
-                eq(conversationTurns.buildGeneration, build.generation),
-              ),
-            )
-            .limit(1)
-            .then(
-              (values: Array<typeof conversationTurns.$inferSelect>) =>
-                values[0] || null,
-            )
-        : Promise.resolve(null),
-      db
-        .select({ version: conversations.version })
-        .from(conversations)
-        .where(
-          and(
-            eq(conversations.id, persistedConversationId),
-            eq(conversations.userId, input.userId),
-          ),
-        )
-        .limit(1)
-        .then((values: Array<{ version: number }>) => values[0] || null),
-      relevantTurnIds.length > 0
-        ? db
-            .select({
-              turnId: messages.turnId,
-              role: messages.role,
-              sequence: messages.sequence,
-            })
-            .from(messages)
-            .where(
-              and(
-                eq(messages.userId, input.userId),
-                eq(messages.conversationId, persistedConversationId),
-                inArray(messages.turnId, relevantTurnIds),
-                isNull(messages.deletedAt),
-              ),
-            )
-        : Promise.resolve([]),
-    ]);
+  const [
+    activeTurnRow,
+    presentationTurnRow,
+    conversationRow,
+    messageRows,
+    acceptedMessageRows,
+  ] = await Promise.all([
+    build.activeTurnId
+      ? db
+          .select()
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.id, build.activeTurnId),
+              eq(conversationTurns.userId, input.userId),
+              eq(conversationTurns.buildId, build.id),
+              eq(conversationTurns.buildGeneration, build.generation),
+            ),
+          )
+          .limit(1)
+          .then(
+            (values: Array<typeof conversationTurns.$inferSelect>) =>
+              values[0] || null,
+          )
+      : Promise.resolve(null),
+    currentRow?.sourceTurnId
+      ? db
+          .select()
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.id, currentRow.sourceTurnId),
+              eq(conversationTurns.userId, input.userId),
+              eq(conversationTurns.buildId, build.id),
+              eq(conversationTurns.buildGeneration, build.generation),
+            ),
+          )
+          .limit(1)
+          .then(
+            (values: Array<typeof conversationTurns.$inferSelect>) =>
+              values[0] || null,
+          )
+      : Promise.resolve(null),
+    db
+      .select({ version: conversations.version })
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, persistedConversationId),
+          eq(conversations.userId, input.userId),
+        ),
+      )
+      .limit(1)
+      .then((values: Array<{ version: number }>) => values[0] || null),
+    relevantTurnIds.length > 0
+      ? db
+          .select({
+            turnId: messages.turnId,
+            role: messages.role,
+            sequence: messages.sequence,
+          })
+          .from(messages)
+          .where(
+            and(
+              eq(messages.userId, input.userId),
+              eq(messages.conversationId, persistedConversationId),
+              inArray(messages.turnId, relevantTurnIds),
+              isNull(messages.deletedAt),
+            ),
+          )
+      : Promise.resolve([]),
+    db
+      .select({
+        id: messages.id,
+        conversationId: messages.conversationId,
+        userId: messages.userId,
+        turnId: messages.turnId,
+        role: messages.role,
+        content: messages.content,
+        sequence: messages.sequence,
+        metadata: messages.metadata,
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.userId, input.userId),
+          eq(messages.conversationId, persistedConversationId),
+          eq(messages.role, "assistant"),
+          isNull(messages.deletedAt),
+        ),
+      )
+      .orderBy(desc(messages.sequence)),
+  ]);
+
+  const typedAcceptedMessageRows =
+    acceptedMessageRows as KnowledgeBaseAcceptedMessageRow[];
+  const acceptedReceiptTurnIds: string[] = [
+    ...new Set<string>(
+      typedAcceptedMessageRows.flatMap((message) => {
+        const metadata = parsedKnowledgeBaseMessageMetadata(
+          message.metadata as (typeof messages.$inferSelect)["metadata"],
+        );
+        return metadata?.serverOwned === true && message.turnId
+          ? [message.turnId]
+          : [];
+      }),
+    ),
+  ];
+  const acceptedReceiptTurnRows =
+    acceptedReceiptTurnIds.length > 0
+      ? await db
+          .select({
+            id: conversationTurns.id,
+            conversationId: conversationTurns.conversationId,
+            userId: conversationTurns.userId,
+            clientRequestId: conversationTurns.clientRequestId,
+            buildId: conversationTurns.buildId,
+            buildGeneration: conversationTurns.buildGeneration,
+            operationKey: conversationTurns.operationKey,
+            expectedRevision: conversationTurns.expectedRevision,
+            expectedLeafId: conversationTurns.expectedLeafId,
+            status: conversationTurns.status,
+          })
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.userId, input.userId),
+              eq(conversationTurns.buildId, build.id),
+              inArray(conversationTurns.id, acceptedReceiptTurnIds),
+            ),
+          )
+      : [];
 
   const verifiedBuild = await loadBuild(db, input.userId, conversationId);
   if (
@@ -2113,6 +2330,8 @@ async function readKnowledgeBaseObservationProjection(
     customerUploadResources,
     conversationRow,
     messageRows,
+    acceptedMessageRows: typedAcceptedMessageRows,
+    acceptedReceiptTurnRows,
   });
 }
 
@@ -2141,6 +2360,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     role: string;
     sequence: number;
   }>;
+  acceptedMessageRows: KnowledgeBaseAcceptedMessageRow[];
+  acceptedReceiptTurnRows: KnowledgeBaseAcceptedReceiptTurnRow[];
 }): KnowledgeBaseObservationProjection {
   const {
     build,
@@ -2152,6 +2373,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     customerUploadResources,
     conversationRow,
     messageRows,
+    acceptedMessageRows,
+    acceptedReceiptTurnRows,
   } = input;
   const messageSequence = (
     turnId: string | null | undefined,
@@ -2288,68 +2511,185 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       : [];
   const resources = [...logoResources, ...customerUploadResources];
   let approvedPresentation: KnowledgeBaseApprovedPresentationDto | null = null;
-  const storedMarkdown = canonicalKnowledgeBaseMarkdown(
-    currentRow?.contentMarkdown || "",
+  const acceptedReceiptTurnsById = new Map(
+    acceptedReceiptTurnRows.map((turn) => [turn.id, turn]),
   );
-  const visibleMarkdown = canonicalKnowledgeBaseMarkdown(
-    normalizeKnowledgeBaseCustomerMarkdownImages(storedMarkdown).markdown,
-  );
-  if (currentRow && visibleMarkdown && (!build.activeTurnId || activeTurnRow)) {
-    const contentSha256 =
-      storedMarkdown === visibleMarkdown && currentRow.contentSha256
-        ? currentRow.contentSha256
-        : knowledgeBaseMarkdownSha256(visibleMarkdown);
-    approvedPresentation = {
-      turnId:
-        currentRow.sourceTurnId ||
-        activeTurnRow?.id ||
-        `legacy:${build.id}:${build.revision}`,
-      clientRequestId:
-        presentationTurnRow?.clientRequestId ||
-        (!currentRow.sourceTurnId ||
-        activeTurnRow?.id === currentRow.sourceTurnId
-          ? activeTurnRow?.clientRequestId || null
-          : null),
-      presentationKey:
-        currentRow.presentationKey ||
-        build.currentPresentationKey ||
+  const acceptedReceiptCoordinate = (
+    message: (typeof acceptedMessageRows)[number],
+  ) => {
+    if (message.role !== "assistant" || !message.turnId) return null;
+    const metadata = parsedKnowledgeBaseMessageMetadata(
+      message.metadata as (typeof messages.$inferSelect)["metadata"],
+    );
+    if (
+      !metadata ||
+      metadata.buildId !== build.id ||
+      typeof metadata.generation !== "number" ||
+      metadata.generation > build.generation ||
+      !matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message,
+        knowledgeBase: metadata,
+        turn: acceptedReceiptTurnsById.get(message.turnId),
+        build,
+        publicConversationId: build.conversationId,
+      })
+    ) {
+      return null;
+    }
+    if (metadata.kind === "completion") {
+      return {
+        kind: "completion" as const,
+        metadata,
+      };
+    }
+    if (
+      metadata.kind !== "presentation" ||
+      typeof metadata.leafId !== "string" ||
+      !metadata.leafId.trim() ||
+      typeof metadata.presentationKey !== "string" ||
+      typeof metadata.revision !== "number"
+    ) {
+      return null;
+    }
+    const visibleMarkdown = canonicalKnowledgeBaseMarkdown(
+      normalizeKnowledgeBaseCustomerMarkdownImages(message.content).markdown,
+    );
+    if (!visibleMarkdown) return null;
+    const contentSha256 = knowledgeBaseMarkdownSha256(visibleMarkdown);
+    if (
+      (metadata.contentSha256 !== undefined &&
+        metadata.contentSha256 !== contentSha256) ||
+      metadata.presentationKey !==
         knowledgePresentationKey({
           buildId: build.id,
-          generation: build.generation,
-          revision: build.revision,
-          leafId: currentRow.leafId,
+          generation: metadata.generation,
+          revision: metadata.revision,
+          leafId: metadata.leafId,
           contentSha256,
-        }),
-      revision: build.revision,
-      leafId: currentRow.leafId,
+        })
+    ) {
+      return null;
+    }
+    return {
+      kind: "presentation" as const,
+      metadata,
       visibleMarkdown,
       contentSha256,
+    };
+  };
+  // The immutable server-owned message ledger is the display authority. A
+  // corrupt currentLeaf/activeTurn projection may lock further writes, but it
+  // can never make a previously accepted customer presentation disappear as
+  // long as its independently loaded historical source turn still proves the
+  // complete receipt tuple. Rows are ordered by messages.sequence DESC.
+  const verifiedAcceptedReceipts = acceptedMessageRows.flatMap((message) => {
+    const coordinate = acceptedReceiptCoordinate(message);
+    return coordinate ? [{ message, coordinate }] : [];
+  });
+  // Preserve the latest already-accepted generation until the new generation
+  // has its own receipt. Once it does, no later event from an older provider
+  // generation may become the display authority merely by having a larger
+  // message sequence.
+  const latestAcceptedGeneration = verifiedAcceptedReceipts.reduce(
+    (latest, receipt) =>
+      Math.max(latest, receipt.coordinate.metadata.generation!),
+    -1,
+  );
+  const displayReceipt = verifiedAcceptedReceipts.find(
+    (receipt) =>
+      receipt.coordinate.metadata.generation === latestAcceptedGeneration,
+  );
+  const latestPresentationGeneration = verifiedAcceptedReceipts.reduce(
+    (latest, receipt) =>
+      receipt.coordinate.kind === "presentation"
+        ? Math.max(latest, receipt.coordinate.metadata.generation!)
+        : latest,
+    -1,
+  );
+  const acceptedReceipt = verifiedAcceptedReceipts.find(
+    (receipt) =>
+      receipt.coordinate.kind === "presentation" &&
+      receipt.coordinate.metadata.generation === latestPresentationGeneration,
+  );
+  if (acceptedReceipt) {
+    const receipt = acceptedReceipt.coordinate;
+    if (receipt.kind !== "presentation") {
+      throw new Error(
+        "Accepted presentation receipt changed during projection",
+      );
+    }
+    const receiptCoordinate = receipt.metadata;
+    const receiptTurn =
+      acceptedReceiptTurnsById.get(acceptedReceipt.message.turnId!) ??
+      (presentationTurnRow?.id === acceptedReceipt.message.turnId
+        ? presentationTurnRow
+        : activeTurnRow?.id === acceptedReceipt.message.turnId
+          ? activeTurnRow
+          : null);
+    approvedPresentation = {
+      turnId: acceptedReceipt.message.turnId!,
+      clientRequestId: receiptTurn?.clientRequestId || null,
+      presentationKey: receiptCoordinate.presentationKey as string,
+      revision: receiptCoordinate.revision as number,
+      leafId: receiptCoordinate.leafId as string,
+      visibleMarkdown: receipt.visibleMarkdown,
+      contentSha256: receipt.contentSha256,
       imageState: resources.length > 0 ? "attached" : "no_eligible_asset",
       resources,
-      requestMessageSequence: messageSequence(currentRow.sourceTurnId, "user"),
-      messageSequence: messageSequence(currentRow.sourceTurnId, "assistant"),
+      requestMessageSequence: messageSequence(
+        acceptedReceipt.message.turnId,
+        "user",
+      ),
+      messageSequence: acceptedReceipt.message.sequence,
     };
+  } else {
+    // Compatibility for builds accepted before immutable presentation
+    // messages were introduced. This path is intentionally node-backed;
+    // every new acceptance is receipt-backed and remains renderable even when
+    // currentLeaf/activeTurn projections later need repair.
+    const storedMarkdown = canonicalKnowledgeBaseMarkdown(
+      currentRow?.contentMarkdown || "",
+    );
+    const visibleMarkdown = canonicalKnowledgeBaseMarkdown(
+      normalizeKnowledgeBaseCustomerMarkdownImages(storedMarkdown).markdown,
+    );
+    if (currentRow && visibleMarkdown) {
+      const contentSha256 =
+        storedMarkdown === visibleMarkdown && currentRow.contentSha256
+          ? currentRow.contentSha256
+          : knowledgeBaseMarkdownSha256(visibleMarkdown);
+      approvedPresentation = {
+        turnId:
+          currentRow.sourceTurnId || `legacy:${build.id}:${build.revision}`,
+        clientRequestId: presentationTurnRow?.clientRequestId || null,
+        presentationKey:
+          currentRow.presentationKey ||
+          build.currentPresentationKey ||
+          knowledgePresentationKey({
+            buildId: build.id,
+            generation: build.generation,
+            revision: build.revision,
+            leafId: currentRow.leafId,
+            contentSha256,
+          }),
+        revision: build.revision,
+        leafId: currentRow.leafId,
+        visibleMarkdown,
+        contentSha256,
+        imageState: resources.length > 0 ? "attached" : "no_eligible_asset",
+        resources,
+        requestMessageSequence: messageSequence(
+          currentRow.sourceTurnId,
+          "user",
+        ),
+        messageSequence: messageSequence(currentRow.sourceTurnId, "assistant"),
+      };
+    }
   }
 
-  let packageDto: KnowledgeBasePackageDto | null = null;
-  if (
-    build.status === "ready_to_publish" &&
-    build.packageRevision === build.revision &&
-    build.packageArchiveSha256 &&
-    build.packageSizeBytes &&
-    build.packageStorageKey
-  ) {
-    packageDto = {
-      revision: build.revision,
-      outputItemId: build.packageOutputItemId,
-      fileId: build.packageFileId,
-      filename: build.packageFilename || "knowledge-base.zip",
-      mimeType: "application/zip",
-      sha256: build.packageArchiveSha256,
-      sizeBytes: build.packageSizeBytes,
-      downloadPath: `/api/knowledge-base/artifacts/${encodeURIComponent(build.id)}/package`,
-    };
-  }
+  const packageCompatibility =
+    knowledgeBasePackageProjectionCompatibility(build);
+  const packageDto = packageCompatibility.package;
 
   let notice: KnowledgeBaseNoticeDto | null = null;
   const activeTraceId =
@@ -2438,6 +2778,46 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       turnId: null,
       createdAt: build.updatedAt.getTime(),
     };
+  } else if (
+    packageCompatibility.packageState === "attention_required" &&
+    packageCompatibility.contentCompleted
+  ) {
+    notice = {
+      key: `${build.id}:${build.generation}:${build.stateEpoch}:package-attention`,
+      code: "KNOWLEDGE_BASE_PACKAGE_ATTENTION_REQUIRED",
+      severity: "warning",
+      message:
+        "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响，系统不会重复推进内容。",
+      retryable: false,
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+      canRegenerate: false,
+      turnId: null,
+      createdAt: build.updatedAt.getTime(),
+    };
+  } else if (
+    build.canonicalTaskState === "attention_required" &&
+    build.protocolErrorCode
+  ) {
+    const code = build.protocolErrorCode;
+    notice = {
+      key: `${build.id}:${build.generation}:${build.stateEpoch}:${code}`,
+      code,
+      severity: "warning",
+      message: approvedPresentation
+        ? "系统正在恢复当前操作。已完成内容不受影响。"
+        : "系统正在恢复当前操作，当前构建状态已安全保留。",
+      retryable: true,
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "reconcile",
+      canRegenerate: false,
+      traceId: safeActiveTraceId,
+      attachmentCount: Number.isSafeInteger(activeAttachmentCount)
+        ? activeAttachmentCount
+        : 0,
+      turnId: activeTurnRow?.id || null,
+      createdAt: build.updatedAt.getTime(),
+    };
   } else if (build.protocolError) {
     const code = build.protocolErrorCode || "PROGRESS_PROTOCOL_INVALID";
     const sameTaskRecovery =
@@ -2468,8 +2848,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     notice = {
       key: `${build.id}:${build.generation}:${build.stateEpoch}:${code}`,
       code,
-      severity: "error",
-      message: build.protocolError,
+      severity: approvedPresentation ? "warning" : "error",
+      message: approvedPresentation
+        ? `系统正在修复当前操作：${build.protocolError}。已完成内容不受影响。`
+        : build.protocolError,
       retryable:
         (sameTaskRecovery || activeDispatchAuthority.canRegenerate) &&
         knowledgeBaseProtocolErrorIsRetryable({
@@ -2493,6 +2875,43 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     progress,
     stateEpoch: build.stateEpoch,
     generation: build.generation,
+    // The latest accepted presentation/completion receipt is the monotonic
+    // display coordinate. A newer pending request must not make already
+    // accepted content appear newer or disappear.
+    displaySequence: displayReceipt?.message.sequence ?? 0,
+    syncState:
+      build.canonicalTaskState === "attention_required" ||
+      packageCompatibility.packageState === "attention_required"
+        ? "attention_required"
+        : build.canonicalTaskState === "reconciling" ||
+            build.packageStatus === "retrying"
+          ? "repairing"
+          : "synced",
+    processingPhase:
+      build.status === "ready_to_publish" &&
+      !packageCompatibility.packageAllowed &&
+      packageCompatibility.packageState !== "attention_required"
+        ? "package_preparing"
+        : activeTurnRow
+          ? build.canonicalTaskState === "creating"
+            ? "migrating_task"
+            : "waiting_provider"
+          : null,
+    contentState: packageCompatibility.contentCompleted
+      ? "completed"
+      : "building",
+    packageState: packageCompatibility.packageState,
+    publicationState: build.status === "published" ? "published" : "draft",
+    contentCompletedAt:
+      packageCompatibility.contentCompletedAt?.getTime() ?? null,
+    canonicalTaskUrl: build.canonicalTaskUrl,
+    localRestrictions:
+      packageCompatibility.packageState === "attention_required"
+        ? ["package_attention_required"]
+        : !packageCompatibility.packageAllowed &&
+            packageCompatibility.contentCompleted
+          ? ["package_preparing"]
+          : [],
     // While a newly accepted turn is still preparing its Skill/attachments,
     // build.upstreamTaskId is the completed parent task. Exposing that stale
     // id would make the coordinator reconcile old output during the short
@@ -2500,7 +2919,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     // until it releases the build.
     authoritativeTaskId: activeTurnRow
       ? activeTurnRow.upstreamTaskId
-      : build.upstreamTaskId,
+      : build.canonicalTaskId || build.upstreamTaskId,
     activeTurn,
     completedTurn,
     approvedPresentation,
@@ -3878,20 +4297,10 @@ export async function reconcileKnowledgeBaseProgress(input: {
           },
         };
         if (activeTurn) {
-          const activeTurnMetadata = isRecord(activeTurn.metadata)
-            ? activeTurn.metadata
-            : {};
-          await tx
-            .update(conversationTurns)
-            .set({
-              status: "completed",
-              completedAt: new Date(),
-              leaseExpiresAt: null,
-              errorCode: null,
-              errorMessage: null,
-              metadata: activeTurnMetadata,
-            })
-            .where(eq(conversationTurns.id, activeTurn.id));
+          await completeKnowledgeBaseStructuredResultTurnInTransaction({
+            tx,
+            turn: activeTurn,
+          });
         }
         recordKnowledgeInputUnlock(build);
         build = (await loadBuild(tx, input.userId, conversationId))!;
@@ -4047,25 +4456,27 @@ export async function reconcileKnowledgeBaseProgress(input: {
             protocolErrorCode: null,
             awaitingResponseSince: null,
             completedAt: null,
+            contentCompletedAt: null,
+            packageStatus: "not_started",
+            packageAttemptCount: 0,
+            packageNextRetryAt: null,
+            packageLastErrorCode: null,
             packageRevision: null,
             packageTaskId: null,
             packageOutputItemId: null,
             packageFileId: null,
             packageFilename: null,
             packageDescriptorHash: null,
+            packageStorageKey: null,
+            packageArchiveSha256: null,
+            packageSizeBytes: null,
           })
           .where(eq(knowledgeBaseBuilds.id, build.id));
         if (activeTurn) {
-          await tx
-            .update(conversationTurns)
-            .set({
-              status: "completed",
-              completedAt: new Date(),
-              leaseExpiresAt: null,
-              errorCode: null,
-              errorMessage: null,
-            })
-            .where(eq(conversationTurns.id, activeTurn.id));
+          await completeKnowledgeBaseStructuredResultTurnInTransaction({
+            tx,
+            turn: activeTurn,
+          });
         }
         recordKnowledgeInputUnlock(build);
         build = (await loadBuild(tx, input.userId, conversationId))!;
@@ -4106,52 +4517,50 @@ export async function reconcileKnowledgeBaseProgress(input: {
         });
       }
       const summary = getKnowledgeBaseProgressSummary(nextState);
-      const packageAllowed = canPackageKnowledgeBase(nextState);
-      const packageDescriptors = packageAllowed
+      const contentCompleted = canPackageKnowledgeBase(nextState);
+      const packageDescriptors = contentCompleted
         ? collectKnowledgeArchiveDescriptors(
             Array.isArray(authoritativeOutput) ? authoritativeOutput : [],
           )
         : [];
-      if (packageAllowed && packageDescriptors.length !== 1) {
-        throw new KnowledgeBaseBuildError(
-          packageDescriptors.length === 0
-            ? "FINAL_PACKAGE_MISSING"
-            : "PROGRESS_PROTOCOL_INVALID",
-          packageDescriptors.length === 0
-            ? build.skillVersion === "4"
-              ? "上游已确认最后节点，但未返回当前操作唯一的最终知识库 ZIP；本轮未提交，仍停留在最后节点"
-              : "所有节点已完成，但本轮尚未生成唯一的最终知识库 ZIP"
-            : "本轮返回了多个知识库 ZIP，无法确认唯一发布版本",
-        );
-      }
-      const packageDescriptor = packageDescriptors[0];
+      const packageDescriptor =
+        packageDescriptors.length === 1 ? packageDescriptors[0] : undefined;
       const stagedPackage = input.stagedArtifacts?.package;
-      if (
-        packageAllowed &&
-        build.skillVersion === "4" &&
-        (!stagedPackage ||
-          !packageDescriptor ||
-          stagedPackage.sourceDescriptorHash !==
-            knowledgeArchivePhysicalDescriptorHash(packageDescriptor) ||
-          stagedPackage.packageRevision !== nextState.revision ||
-          stagedPackage.outputItemId !== packageDescriptor.outputItemId ||
-          (stagedPackage.fileId || null) !==
-            (packageDescriptor.fileId || null) ||
-          !/^[a-f0-9]{64}$/u.test(stagedPackage.sha256) ||
-          !Number.isSafeInteger(stagedPackage.bytes) ||
-          stagedPackage.bytes <= 0)
-      ) {
-        throw new KnowledgeBaseBuildError(
-          "PROGRESS_PROTOCOL_INVALID",
-          "最终知识库 ZIP 尚未通过当前操作、版本、描述与不可变字节校验",
-        );
-      }
+      // Content completion and package readiness are deliberately separate.
+      // A missing, duplicate or not-yet-staged provider archive is a package
+      // worker concern; it must never roll back the final semantic transition
+      // or make the last accepted node disappear from the customer UI.
+      const packageReady = Boolean(
+        contentCompleted &&
+          stagedPackage &&
+          packageDescriptor &&
+          stagedPackage.sourceDescriptorHash ===
+            knowledgeArchivePhysicalDescriptorHash(packageDescriptor) &&
+          stagedPackage.packageRevision === nextState.revision &&
+          stagedPackage.outputItemId === packageDescriptor.outputItemId &&
+          (stagedPackage.fileId || null) ===
+            (packageDescriptor.fileId || null) &&
+          /^[a-f0-9]{64}$/u.test(stagedPackage.sha256) &&
+          Number.isSafeInteger(stagedPackage.bytes) &&
+          stagedPackage.bytes > 0,
+      );
+      const packageLastErrorCode = !contentCompleted
+        ? null
+        : packageDescriptors.length > 1
+          ? "MULTIPLE_PROVIDER_PACKAGES"
+          : !packageDescriptor
+            ? "PROVIDER_PACKAGE_MISSING"
+            : !stagedPackage
+              ? "PACKAGE_NOT_STAGED"
+              : packageReady
+                ? null
+                : "PACKAGE_VALIDATION_PENDING";
       const presentationLeaf = nextState.currentLeafId
         ? nextState.leaves.find(
             (leaf) => leaf.id === nextState.currentLeafId,
           ) || null
         : null;
-      const visibleContent = packageAllowed
+      const visibleContent = contentCompleted
         ? ""
         : projectKnowledgeBasePresentationMarkdown({
             markdown: audit.contentMarkdown,
@@ -4159,17 +4568,17 @@ export async function reconcileKnowledgeBaseProgress(input: {
             leafTitle: presentationLeaf!.title,
             leafIds: nextState.leaves.map((leaf) => leaf.id),
           });
-      if (!packageAllowed && !visibleContent) {
+      if (!contentCompleted && !visibleContent) {
         throw new KnowledgeBaseBuildError(
           "PROGRESS_PROTOCOL_INVALID",
           "当前知识节点缺少可展示正文，本轮未推进",
         );
       }
-      const visibleContentSha256 = packageAllowed
+      const visibleContentSha256 = contentCompleted
         ? null
         : knowledgeBaseMarkdownSha256(visibleContent);
       const acceptedPresentationKey =
-        packageAllowed || !nextState.currentLeafId || !visibleContentSha256
+        contentCompleted || !nextState.currentLeafId || !visibleContentSha256
           ? null
           : knowledgePresentationKey({
               buildId: build.id,
@@ -4246,7 +4655,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
             conversationId,
           );
         if (
-          !packageAllowed &&
+          !contentCompleted &&
           acceptedPresentationKey &&
           nextState.currentLeafId
         ) {
@@ -4265,13 +4674,18 @@ export async function reconcileKnowledgeBaseProgress(input: {
             authoritativeTaskId,
             sentAt: new Date(),
           });
-        } else if (packageAllowed) {
-          await markKnowledgeBaseConversationCompletedInTransaction({
+        } else if (contentCompleted) {
+          await persistKnowledgeBaseCompletionInTransaction({
             tx,
             userId: input.userId,
             conversationId: persistedConversationId,
+            turnId: activeTurn.id,
+            buildId: build.id,
+            generation: build.generation,
+            operationKey: activeTurn.operationKey,
+            revision: nextState.revision,
             authoritativeTaskId,
-            completedAt: new Date(),
+            sentAt: new Date(),
           });
         }
       }
@@ -4280,7 +4694,7 @@ export async function reconcileKnowledgeBaseProgress(input: {
         .update(knowledgeBaseBuilds)
         .set({
           upstreamTaskId: authoritativeTaskId,
-          status: packageAllowed ? "ready_to_publish" : "confirming",
+          status: contentCompleted ? "ready_to_publish" : "confirming",
           stateEpoch: build.stateEpoch + 1,
           activeTurnId: successfulTurnIdentity.activeTurnId,
           currentPresentationKey: acceptedPresentationKey,
@@ -4297,31 +4711,55 @@ export async function reconcileKnowledgeBaseProgress(input: {
           protocolError: null,
           protocolErrorCode: null,
           awaitingResponseSince: null,
-          completedAt: packageAllowed ? new Date() : null,
-          packageRevision: packageAllowed ? nextState.revision : null,
-          packageTaskId: packageAllowed ? taskId || build.upstreamTaskId : null,
-          packageOutputItemId: packageAllowed
+          completedAt: contentCompleted ? new Date() : null,
+          contentCompletedAt: contentCompleted ? new Date() : null,
+          packageStatus: contentCompleted
+            ? packageReady
+              ? "ready"
+              : "preparing"
+            : "not_started",
+          packageAttemptCount: contentCompleted
+            ? packageReady
+              ? Math.max(1, build.packageAttemptCount)
+              : 0
+            : 0,
+          packageNextRetryAt:
+            contentCompleted && !packageReady ? new Date() : null,
+          packageLastErrorCode,
+          packageRevision: packageReady ? nextState.revision : null,
+          packageTaskId: packageReady
+            ? build.canonicalTaskId || taskId || build.upstreamTaskId
+            : null,
+          packageOutputItemId: packageReady
             ? stagedPackage?.outputItemId ||
               packageDescriptor?.outputItemId ||
               null
             : null,
-          packageFileId: packageAllowed
+          packageFileId: packageReady
             ? stagedPackage?.fileId || packageDescriptor?.fileId || null
             : null,
-          packageFilename: packageAllowed
+          packageFilename: packageReady
             ? stagedPackage?.filename || packageDescriptor?.filename || null
             : null,
-          packageDescriptorHash: packageAllowed
+          packageDescriptorHash: packageReady
             ? stagedPackage?.descriptorHash ||
               (packageDescriptor
                 ? knowledgeArchiveDescriptorHash(packageDescriptor)
                 : null)
             : null,
-          ...(packageAllowed && stagedPackage
+          // A completed content revision starts a fresh package projection.
+          // Never let a ZIP retained for an older revision masquerade as the
+          // package for the newly accepted receipt while the local worker is
+          // still rebuilding it.
+          packageStorageKey:
+            packageReady && stagedPackage ? stagedPackage.storageKey : null,
+          packageArchiveSha256:
+            packageReady && stagedPackage ? stagedPackage.sha256 : null,
+          packageSizeBytes:
+            packageReady && stagedPackage ? stagedPackage.bytes : null,
+          ...(packageReady && stagedPackage
             ? {
                 packageStorageKey: stagedPackage.storageKey,
-                packageArchiveSha256: stagedPackage.sha256,
-                packageSizeBytes: stagedPackage.bytes,
               }
             : {}),
         })
@@ -4349,23 +4787,17 @@ export async function reconcileKnowledgeBaseProgress(input: {
       }
 
       if (activeTurn) {
-        await tx
-          .update(conversationTurns)
-          .set({
-            status: "completed",
-            completedAt: new Date(),
-            leaseExpiresAt: null,
-            errorCode: null,
-            errorMessage: null,
-          })
-          .where(eq(conversationTurns.id, activeTurn.id));
+        await completeKnowledgeBaseStructuredResultTurnInTransaction({
+          tx,
+          turn: activeTurn,
+        });
       }
 
       recordKnowledgeInputUnlock(build);
       build = (await loadBuild(tx, input.userId, conversationId))!;
       rows = await loadNodes(tx, build.id);
       if (
-        packageAllowed &&
+        packageReady &&
         build.skillVersion === "4" &&
         stagedPackage &&
         (build.packageStorageKey !== stagedPackage.storageKey ||
@@ -4380,10 +4812,12 @@ export async function reconcileKnowledgeBaseProgress(input: {
           "最终知识库 ZIP 未与当前任务、版本和描述原子绑定",
         );
       }
-      if (packageAllowed) {
+      if (contentCompleted) {
         const researchSummary = buildResearchSummary(build, rows);
         committedDepthObservation = {
-          event: "final_package_accepted",
+          event: packageReady
+            ? "final_package_accepted"
+            : "content_completed_package_pending",
           payload: {
             buildId: build.id,
             generation: build.generation,
@@ -4494,18 +4928,6 @@ export async function assertKnowledgeBasePublishable(input: {
     );
   }
   const rows = await loadNodes(db, build.id);
-  const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
-  if (
-    rows.length < depthPolicy.minLeaves ||
-    rows.length > depthPolicy.maxLeaves ||
-    build.totalNodeCount !== rows.length ||
-    (depthPolicy.version === 2 && !buildResearchSummary(build, rows))
-  ) {
-    throw new KnowledgeBaseBuildError(
-      "PUBLISH_BLOCKED",
-      `知识库不符合深度策略 v${depthPolicy.version}（要求 ${depthPolicy.minLeaves}–${depthPolicy.maxLeaves} 个节点）`,
-    );
-  }
   if (build.status === "published" && build.publishedSnapshotId) {
     return build;
   }
@@ -4518,22 +4940,20 @@ export async function assertKnowledgeBasePublishable(input: {
   try {
     assertKnowledgeBaseReadyForPackage(stateFromRows(build, rows));
   } catch {
-    const handled = build.confirmedCount + build.directPrefilledCount;
+    const handled = rows.filter(
+      (row) => row.status === "confirmed" || row.status === "direct_prefilled",
+    ).length;
     throw new KnowledgeBaseBuildError(
       "PUBLISH_BLOCKED",
-      `知识库尚未逐项走完，当前完成进度为 ${handled}/${build.totalNodeCount}`,
+      `知识库尚未逐项走完，当前完成进度为 ${handled}/${rows.length}`,
     );
   }
-  if (
-    build.packageRevision !== build.revision ||
-    build.packageTaskId !== build.upstreamTaskId ||
-    !build.packageOutputItemId ||
-    !build.packageDescriptorHash ||
-    !build.packageStorageKey ||
-    !/^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || "")) ||
-    !Number.isSafeInteger(build.packageSizeBytes) ||
-    Number(build.packageSizeBytes) <= 0
-  ) {
+  // Keep the publish mutation on the same dual-read contract as progress and
+  // artifact download. Migration 0061 gives an already-complete legacy row
+  // `packageStatus=not_started`; the immutable package tuple remains the
+  // authority until that additive field is backfilled. A genuinely new
+  // preparing/retrying package never passes this compatibility projection.
+  if (!knowledgeBasePackageProjectionCompatibility(build).packageAllowed) {
     throw new KnowledgeBaseBuildError(
       "PUBLISH_BLOCKED",
       "最终知识库文件尚未与当前完成版本绑定",
@@ -4548,12 +4968,13 @@ export async function markKnowledgeBasePublished(input: {
   snapshotId: string;
 }) {
   const db = await requireDb();
+  const publishedAt = new Date();
   await db
     .update(knowledgeBaseBuilds)
     .set({
       status: "published",
       publishedSnapshotId: input.snapshotId,
-      publishedAt: new Date(),
+      publishedAt,
       protocolError: null,
     })
     .where(
@@ -4565,4 +4986,33 @@ export async function markKnowledgeBasePublished(input: {
         ),
       ),
     );
+  const rows = await db
+    .select({
+      id: knowledgeBaseBuilds.id,
+      generation: knowledgeBaseBuilds.generation,
+    })
+    .from(knowledgeBaseBuilds)
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(
+          knowledgeBaseBuilds.conversationId,
+          normalizeConversationId(input.conversationId),
+        ),
+        eq(knowledgeBaseBuilds.status, "published"),
+        eq(knowledgeBaseBuilds.publishedSnapshotId, input.snapshotId),
+      ),
+    )
+    .limit(1);
+  if (rows[0]) {
+    // This marker is an additional retention proof. Its failure deliberately
+    // leaves bytes behind; DB publishedAt remains the deletion authority.
+    await markKnowledgeBaseBuildSourceGenerationTerminal({
+      userId: input.userId,
+      buildId: rows[0].id,
+      generation: rows[0].generation,
+      reason: "published",
+      terminalAt: publishedAt,
+    }).catch(() => undefined);
+  }
 }

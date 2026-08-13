@@ -4,15 +4,18 @@ import { join, resolve } from "node:path";
 import {
   createKnowledgeBaseTurnTask,
   discardUnboundUpload,
+  reserveKnowledgeBaseStart,
   reserveKnowledgeBaseTurnWithAttachments,
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   FILE_UPLOAD_STALL_TIMEOUT_MS,
   getModelDisplayName,
+  listManagedUploadsForKnowledgeBase,
   MANAGED_UPLOAD_BUSY_RECOVERY_TIMEOUT_MS,
   MANAGED_UPLOAD_PROCESSING_TIMEOUT_MS,
   MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS,
+  recoverDiscoveredManagedUpload,
   recoverManagedUpload,
   retrieveTask,
   sanitizeBrandText,
@@ -24,6 +27,7 @@ import {
 
 afterEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -561,6 +565,131 @@ describe("createKnowledgeBaseTurnTask", () => {
     });
   });
 
+  it("carries one selected delivery project through the entire KB write sequence", async () => {
+    sessionStorage.setItem(
+      DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+      "project-assignment-kb",
+    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          reservation: {
+            state: "awaiting_attachments",
+            turnId: "turn-project",
+            clientRequestId: "request-project",
+            generation: 2,
+            revision: 5,
+            leafId: "1.6",
+            stagedAttachmentCount: 0,
+            expectedAttachmentCount: 1,
+            requiresUpload: true,
+          },
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ task: { id: "task-project", status: "running" } }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const attachmentManifest = [
+      {
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 10,
+        sha256: "a".repeat(64),
+      },
+    ];
+
+    const { reservation } = await reserveKnowledgeBaseTurnWithAttachments(
+      [{ role: "user", content: [{ type: "input_text", text: "修订" }] }],
+      {
+        conversationId: "conv-project",
+        clientRequestId: "request-project",
+        expectedGeneration: 2,
+        expectedRevision: 5,
+        expectedLeafId: "1.6",
+        attachmentManifest,
+      },
+    );
+    await stageKnowledgeBaseTurnAttachment({
+      conversationId: "conv-project",
+      turnId: reservation.turnId,
+      clientRequestId: "request-project",
+      attachmentManifest,
+      index: 0,
+      attachment: { file_id: "file-project", filename: "facts.pdf" },
+    });
+    await createKnowledgeBaseTurnTask([], {
+      conversationId: "conv-project",
+      clientRequestId: "request-project",
+      attachmentReservation: { turnId: reservation.turnId, attachmentManifest },
+    });
+
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init.headers).toMatchObject({
+        "x-delivery-project-assignment-id": "project-assignment-kb",
+      });
+    }
+  });
+
+  it("reserves a starter build before upload with only the byte manifest", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        reservation: {
+          state: "awaiting_attachments",
+          turnId: "turn-start",
+          clientRequestId: "request-start",
+          generation: 1,
+          revision: 0,
+          leafId: null,
+          stagedAttachmentCount: 0,
+          expectedAttachmentCount: 1,
+          requiresUpload: true,
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const attachmentManifest = [
+      {
+        itemId: "starter-item-1",
+        ordinal: 1,
+        total: 1,
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 10,
+        sha256: "a".repeat(64),
+      },
+    ];
+
+    await reserveKnowledgeBaseStart({
+      conversationId: "conv-kb",
+      clientRequestId: "request-start",
+      companyName: "FrontMind",
+      companyWebsite: "https://example.com",
+      operatorNotes: "notes",
+      attachmentManifest,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/knowledge-base/start/reserve",
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      conversationId: "conv-kb",
+      clientRequestId: "request-start",
+      companyName: "FrontMind",
+      companyWebsite: "https://example.com",
+      operatorNotes: "notes",
+      attachmentManifest,
+    });
+  });
+
   it("stages one stable file id and dispatches without resending file ids", async () => {
     const fetchMock = vi
       .fn()
@@ -988,6 +1117,203 @@ describe("retrieveTask", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "/api/frontmind/v1/responses/task-legacy",
     );
+  });
+});
+
+describe("managed knowledge-base upload discovery", () => {
+  const conversationId = "conversation-managed-discovery";
+  const turnId = "00000000-0000-4000-8000-000000000042";
+  const clientRequestId = "client-managed-discovery";
+  const attachmentManifest = [
+    {
+      itemId: "managed-item-1",
+      ordinal: 1,
+      total: 2,
+      filename: "managed-one.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 11,
+      lastModified: 1_700_000_000_001,
+      sha256: "a".repeat(64),
+    },
+    {
+      itemId: "managed-item-2",
+      ordinal: 2,
+      total: 2,
+      filename: "managed-two.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 22,
+      lastModified: 1_700_000_000_002,
+      sha256: "b".repeat(64),
+    },
+  ];
+
+  function discoveryPayload() {
+    return {
+      uploads: attachmentManifest.map((item) => ({
+        intentId: `intent-${item.ordinal}`,
+        intentTicket: `mi1.ticket-${item.ordinal}`,
+        ticketExpiresAt: Date.parse("2099-01-01T00:00:00.000Z"),
+        batchId: "managed-batch",
+        ordinal: item.ordinal,
+        total: item.total,
+        filename: item.filename,
+        mimeType: item.mimeType,
+        sizeBytes: item.sizeBytes,
+        state: "awaiting_browser",
+        phase: null,
+        receipt: null,
+        clientRequestId,
+      })),
+      reservation: {
+        clientRequestId,
+        attachmentManifest,
+        stagedAttachmentCount: 1,
+      },
+      traceId: "trace-managed-discovery",
+    };
+  }
+
+  it("strictly parses the complete frozen reservation and reissued upload capabilities", async () => {
+    sessionStorage.setItem(
+      DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+      "project-managed-discovery",
+    );
+    const payload = discoveryPayload();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      listManagedUploadsForKnowledgeBase({ conversationId, turnId }),
+    ).resolves.toEqual({
+      uploads: payload.uploads,
+      reservation: payload.reservation,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `/api/frontmind/v1/managed-uploads?conversationId=${conversationId}&turnId=${turnId}`,
+    );
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: "GET",
+      credentials: "include",
+    });
+    expect(
+      new Headers(fetchMock.mock.calls[0][1].headers).get(
+        "x-delivery-project-assignment-id",
+      ),
+    ).toBe("project-managed-discovery");
+  });
+
+  it.each([
+    {
+      label: "uploads is not an array",
+      mutate: (payload: ReturnType<typeof discoveryPayload>) => {
+        (payload as unknown as { uploads: unknown }).uploads = {};
+      },
+    },
+    {
+      label: "an upload capability is missing a required field",
+      mutate: (payload: ReturnType<typeof discoveryPayload>) => {
+        delete (payload.uploads[0] as Partial<(typeof payload.uploads)[0]>)
+          .intentTicket;
+      },
+    },
+    {
+      label: "two uploads claim the same ordinal",
+      mutate: (payload: ReturnType<typeof discoveryPayload>) => {
+        payload.uploads[1].ordinal = 1;
+      },
+    },
+    {
+      label: "an upload drifts from its frozen manifest coordinate",
+      mutate: (payload: ReturnType<typeof discoveryPayload>) => {
+        payload.uploads[1].filename = "different-file.pdf";
+      },
+    },
+  ])("rejects discovery when $label", async ({ mutate }) => {
+    const payload = discoveryPayload();
+    mutate(payload);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => payload,
+      }),
+    );
+
+    await expect(
+      listManagedUploadsForKnowledgeBase({ conversationId, turnId }),
+    ).rejects.toThrow(/Dashboard.*恢复.*无效/u);
+  });
+
+  it("recovers a discovered upload with no File construction, XHR, or browser body", async () => {
+    const upload = discoveryPayload().uploads[0];
+    const uploadedAt = Date.parse("2026-08-12T00:00:00.000Z");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        state: "uploaded",
+        intentId: upload.intentId,
+        fileId: "provider-managed-one",
+        sizeBytes: upload.sizeBytes,
+        uploadedAt,
+        providerReadyAt: uploadedAt + 1_000,
+        expiresAt: Date.parse("2026-08-14T00:00:00.000Z"),
+        replayed: true,
+        recreated: false,
+        traceId: "trace-bodyless-recovery",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal(
+      "File",
+      class ForbiddenFileConstruction {
+        constructor() {
+          throw new Error("discovery recovery must not construct File");
+        }
+      },
+    );
+    let xhrCount = 0;
+    vi.stubGlobal(
+      "XMLHttpRequest",
+      class ForbiddenXMLHttpRequest {
+        constructor() {
+          xhrCount += 1;
+          throw new Error("discovery recovery must not send XHR bytes");
+        }
+      },
+    );
+
+    await expect(recoverDiscoveredManagedUpload(upload)).resolves.toMatchObject(
+      {
+        state: "uploaded",
+        fileId: "provider-managed-one",
+        sizeBytes: upload.sizeBytes,
+        replayed: true,
+        recovered: false,
+        traceId: "trace-bodyless-recovery",
+      },
+    );
+    expect(xhrCount).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/frontmind/v1/managed-uploads/recovery",
+    );
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: "POST",
+      credentials: "include",
+      body: "{}",
+    });
+    expect(
+      new Headers(fetchMock.mock.calls[0][1].headers).get(
+        "X-FrontMind-Upload-Intent-Id",
+      ),
+    ).toBe(upload.intentId);
   });
 });
 

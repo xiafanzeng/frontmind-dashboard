@@ -123,6 +123,26 @@ describe("system administrator boundary", () => {
         }),
     ],
     [
+      "preview an exact knowledge-base incident repair",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.workspace.knowledgeBaseIncidentRepair.preview({
+          userId: 7,
+          conversationId: "conversation-incident",
+          repairKind: "legacy_skill_404_confirm",
+        }),
+    ],
+    [
+      "execute an exact knowledge-base incident repair",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.workspace.knowledgeBaseIncidentRepair.execute({
+          userId: 7,
+          conversationId: "conversation-incident",
+          repairKind: "legacy_skill_404_confirm",
+          expectedStateHash: "a".repeat(64),
+          reason: "boundary test",
+        }),
+    ],
+    [
       "complete a customer delivery ticket",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.deliveryTickets.update({

@@ -36,6 +36,10 @@ import {
   validateUpstreamResourceAccess,
   type ConversationSnapshot,
 } from "./conversation-router";
+import {
+  KNOWLEDGE_BASE_COMPLETION_MESSAGE_CONTENT,
+  knowledgeBaseCompletionMessagePublicId,
+} from "../shared/knowledge-base-message";
 
 type SnapshotMessage = ConversationSnapshot["messages"][number];
 
@@ -1039,6 +1043,7 @@ describe("conversation multi-device merge", () => {
       operationKey: "operation-1",
       expectedRevision: 0,
       expectedLeafId: "1.1",
+      status: "completed",
     };
     const build = {
       id: "build-1",
@@ -1072,7 +1077,6 @@ describe("conversation multi-device merge", () => {
     expect(
       matchesAuthoritativeKnowledgeBaseMessageTuple({
         message: authoritativeMessage,
-        publicMessageId: `msg-kb-presentation-${presentationKey}`,
         knowledgeBase: authoritativeKnowledgeBase,
         turn,
         build,
@@ -1082,7 +1086,18 @@ describe("conversation multi-device merge", () => {
     expect(
       matchesAuthoritativeKnowledgeBaseMessageTuple({
         message: { ...authoritativeMessage, content: "伪造覆盖正文" },
-        publicMessageId: `msg-kb-presentation-${presentationKey}`,
+        knowledgeBase: authoritativeKnowledgeBase,
+        turn,
+        build,
+        publicConversationId: "conversation-1",
+      }),
+    ).toBe(false);
+    expect(
+      matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message: {
+          ...authoritativeMessage,
+          id: `u8:msg-kb-presentation-${presentationKey}`,
+        },
         knowledgeBase: authoritativeKnowledgeBase,
         turn,
         build,
@@ -1112,6 +1127,69 @@ describe("conversation multi-device merge", () => {
     const merged = mergeConversationMessages(persisted, stale, []);
     expect(merged.map((item) => item.id)).toEqual(["turn-1", "presentation-1"]);
     expect(merged[1]?.content).toBe("已批准正文");
+  });
+
+  it("verifies an immutable completion receipt and rejects changed content", () => {
+    const turn = {
+      id: "turn-final",
+      conversationId: "u7:conversation-1",
+      userId: 7,
+      clientRequestId: "request-final",
+      buildId: "build-1",
+      buildGeneration: 1,
+      operationKey: "operation-final",
+      expectedRevision: 8,
+      expectedLeafId: "8.5",
+      status: "completed",
+    };
+    const build = {
+      id: "build-1",
+      userId: 7,
+      conversationId: "conversation-1",
+    };
+    const knowledgeBase = {
+      schemaVersion: 1 as const,
+      serverOwned: true,
+      kind: "completion" as const,
+      buildId: build.id,
+      generation: 1,
+      operationKey: turn.operationKey,
+      turnId: turn.id,
+      revision: 9,
+      leafId: null,
+    };
+    const publicMessageId = knowledgeBaseCompletionMessagePublicId({
+      buildId: build.id,
+      generation: 1,
+      revision: 9,
+    });
+    const message = {
+      id: `u7:${publicMessageId}`,
+      conversationId: turn.conversationId,
+      turnId: turn.id,
+      userId: 7,
+      role: "assistant",
+      content: KNOWLEDGE_BASE_COMPLETION_MESSAGE_CONTENT,
+    };
+
+    expect(
+      matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message,
+        knowledgeBase,
+        turn,
+        build,
+        publicConversationId: "conversation-1",
+      }),
+    ).toBe(true);
+    expect(
+      matchesAuthoritativeKnowledgeBaseMessageTuple({
+        message: { ...message, content: "伪造完成" },
+        knowledgeBase,
+        turn,
+        build,
+        publicConversationId: "conversation-1",
+      }),
+    ).toBe(false);
   });
 
   it("converges an optimistic KB user id to the server turn id by clientRequestId", () => {

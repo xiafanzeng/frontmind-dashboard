@@ -148,6 +148,9 @@ export default function KnowledgeBaseProgressPanel({
   );
   const pending = clampCount(progress.summary.pending, total);
   const overallPercent = normalizedOverallPercent(progress);
+  const contentCompleted =
+    progress.build.status === "ready_to_publish" ||
+    progress.build.status === "published";
   const currentLeaf = progress.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === progress.build.currentLeafId);
@@ -216,11 +219,12 @@ export default function KnowledgeBaseProgressPanel({
       </header>
 
       {progress.build.protocolError && (
-        <div className="mx-5 mt-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3.5 py-3 text-xs leading-5 text-red-800 sm:mx-6">
+        <div className="mx-5 mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900 sm:mx-6">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
-            <strong className="block">当前节点需要继续确认</strong>
+            <strong className="block">系统正在恢复当前操作</strong>
             <span>{progress.build.protocolError}</span>
+            <span className="mt-1 block">已完成内容不受影响。</span>
           </div>
         </div>
       )}
@@ -257,7 +261,7 @@ export default function KnowledgeBaseProgressPanel({
 
       <footer
         className={`flex items-start gap-2 border-t px-5 py-4 text-xs leading-5 sm:px-6 ${
-          progress.packageAllowed
+          contentCompleted
             ? "border-emerald-100 bg-emerald-50/60 text-emerald-800"
             : "border-[#ece5f0] bg-[#fbfafc] text-[#716a80]"
         }`}
@@ -265,8 +269,12 @@ export default function KnowledgeBaseProgressPanel({
         <Archive className="mt-0.5 h-4 w-4 shrink-0" />
         <span>
           {progress.packageAllowed
-            ? "所有知识节点均已逐项处理，已满足知识库更新条件。"
-            : "知识库必须逐项走完；“企业已确认”和“直接预填”都会计入已处理，但只有企业明确确认的节点显示对号。"}
+            ? "知识库内容与下载包均已完成，可以直接更新。"
+            : progress.packageState === "attention_required"
+              ? "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响。"
+              : contentCompleted
+                ? "知识库内容已完成，下载包正在后台准备；已完成正文不会回退。"
+                : "知识库必须逐项走完；“企业已确认”和“直接预填”都会计入已处理，但只有企业明确确认的节点显示对号。"}
         </span>
       </footer>
     </section>

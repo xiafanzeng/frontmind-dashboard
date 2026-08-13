@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   uploadFile: vi.fn(),
   startRequests: [] as Array<{ body: Record<string, unknown> }>,
+  reserveRequests: [] as Array<{ body: Record<string, unknown> }>,
+  stageRequests: [] as Array<{ body: Record<string, unknown> }>,
   firstStartResolve: null as null | ((response: Response) => void),
   secondStartResolve: null as null | ((response: Response) => void),
   reconcileCalls: 0,
@@ -255,6 +257,8 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       value: vi.fn(),
     });
     mocks.startRequests = [];
+    mocks.reserveRequests = [];
+    mocks.stageRequests = [];
     mocks.firstStartResolve = null;
     mocks.secondStartResolve = null;
     mocks.reconcileCalls = 0;
@@ -319,7 +323,43 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
-        if (url === "/api/knowledge-base/start") {
+        if (url === "/api/knowledge-base/start/reserve") {
+          const body = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          mocks.reserveRequests.push({ body });
+          const clientRequestId = String(body.clientRequestId);
+          return new Response(
+            JSON.stringify({
+              reservation: {
+                state: "awaiting_attachments",
+                turnId: "turn-start-1",
+                clientRequestId,
+                generation: 1,
+                revision: 0,
+                leafId: null,
+                stagedAttachmentCount: 0,
+                expectedAttachmentCount: 5,
+                requiresUpload: true,
+              },
+              observation: acceptedObservation(clientRequestId),
+            }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/knowledge-base/turn/attachments/stage") {
+          const body = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          mocks.stageRequests.push({ body });
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/knowledge-base/turn/dispatch") {
           const body = JSON.parse(String(init?.body || "{}")) as Record<
             string,
             unknown
@@ -348,7 +388,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     vi.unstubAllGlobals();
   });
 
-  it("keeps five receipts and no optimistic message until the same request is acknowledged", async () => {
+  it("reserves before upload, scopes and stages N/N files, then dispatches one user request", async () => {
     renderIntegratedChat();
     await waitFor(() =>
       expect(
@@ -367,45 +407,33 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
       '"messageCount":0',
     );
+    expect(mocks.reserveRequests).toHaveLength(1);
+    expect(mocks.stageRequests).toHaveLength(5);
+    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
+    const clientRequestId = String(
+      mocks.startRequests[0]?.body.clientRequestId,
+    );
+    const manifest = mocks.reserveRequests[0]!.body.attachmentManifest as Array<
+      Record<string, unknown>
+    >;
+    expect(manifest).toHaveLength(5);
+    expect(manifest.map((item) => item.ordinal)).toEqual([1, 2, 3, 4, 5]);
+    expect(manifest.every((item) => item.total === 5)).toBe(true);
+    for (const call of mocks.uploadFile.mock.calls) {
+      expect(call[3]?.resumeScope).toEqual({
+        kind: "knowledge_base",
+        conversationId: "knowledge-conversation",
+        turnId: "turn-start-1",
+        clientRequestId,
+      });
+    }
+    expect(mocks.stageRequests.map(({ body }) => body.index)).toEqual([
+      0, 1, 2, 3, 4,
+    ]);
 
     mocks.firstStartResolve?.(
       new Response(
         JSON.stringify({
-          error: { code: "START_REJECTED", message: "构建入口明确拒绝" },
-          reservationCreated: false,
-          observation: acceptedObservation(
-            String(mocks.startRequests[0]?.body.clientRequestId),
-          ),
-        }),
-        { status: 409, headers: { "content-type": "application/json" } },
-      ),
-    );
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "重试启动" })).toBeEnabled(),
-    );
-    expect(screen.getAllByText("云端已确认")).toHaveLength(5);
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
-    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
-      '"messageCount":0',
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "重试启动" }));
-    await waitFor(() => expect(mocks.startRequests).toHaveLength(2));
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
-    expect(mocks.startRequests[1]?.body.clientRequestId).toBe(
-      mocks.startRequests[0]?.body.clientRequestId,
-    );
-    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
-      '"messageCount":0',
-    );
-
-    const clientRequestId = String(
-      mocks.startRequests[1]?.body.clientRequestId,
-    );
-    mocks.secondStartResolve?.(
-      new Response(
-        JSON.stringify({
-          reservationCreated: true,
           observation: acceptedObservation(clientRequestId),
         }),
         { status: 202, headers: { "content-type": "application/json" } },
@@ -417,7 +445,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
         screen.queryByRole("dialog", { name: "构建企业知识库" }),
       ).not.toBeInTheDocument(),
     );
-    expect(mocks.startRequests).toHaveLength(2);
+    expect(mocks.startRequests).toHaveLength(1);
     expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
       '"messageCount":1',
@@ -436,7 +464,31 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
-        if (url === "/api/knowledge-base/start") {
+        if (url === "/api/knowledge-base/start/reserve") {
+          const body = JSON.parse(String(init?.body || "{}")) as Record<
+            string,
+            unknown
+          >;
+          const clientRequestId = String(body.clientRequestId);
+          return new Response(
+            JSON.stringify({
+              reservation: {
+                state: "awaiting_attachments",
+                turnId: "turn-start-1",
+                clientRequestId,
+              },
+              observation: acceptedObservation(clientRequestId),
+            }),
+            { status: 201, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (url === "/api/knowledge-base/turn/attachments/stage") {
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url === "/api/knowledge-base/turn/dispatch") {
           startCalls += 1;
           const body = JSON.parse(String(init?.body || "{}")) as Record<
             string,
@@ -491,7 +543,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     );
   });
 
-  it("does not accept a bare task id without this request's reservation or observation", async () => {
+  it("accepts a bare dispatch task because the request was already reserved", async () => {
     renderIntegratedChat();
     await waitFor(() =>
       expect(
@@ -514,15 +566,16 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "重试启动" })).toBeEnabled(),
+      expect(
+        screen.queryByRole("dialog", { name: "构建企业知识库" }),
+      ).not.toBeInTheDocument(),
     );
-    expect(
-      screen.getByRole("dialog", { name: "构建企业知识库" }),
-    ).toBeVisible();
-    expect(screen.getAllByText("云端已确认")).toHaveLength(5);
     expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
-      '"messageCount":0',
+      '"messageCount":1',
+    );
+    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
+      '"serverOwned":1',
     );
   });
 

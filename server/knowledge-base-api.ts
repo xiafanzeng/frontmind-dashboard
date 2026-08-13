@@ -9,6 +9,7 @@ import {
   isNull,
   lte,
   or,
+  sql,
 } from "drizzle-orm";
 import { Router } from "express";
 import { createHash, randomUUID } from "node:crypto";
@@ -20,6 +21,8 @@ import {
 import {
   credentialsUseSameUpstreamApiKey,
   getDecryptedCredentialForKnowledgeBaseReservation,
+  getDecryptedCredentialForKnowledgeBaseUploadReservation,
+  getEffectiveDecryptedCredentialForAccount,
   getCredentialForUpstreamResource,
   recordUpstreamResource,
 } from "./auth-service";
@@ -58,9 +61,13 @@ import type {
 } from "../shared/knowledge-base-progress";
 import { normalizeKnowledgeBaseAttachmentMimeType } from "../shared/knowledge-base-attachment";
 import {
+  apiCredentials,
   conversationTurns,
+  conversations,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  messages,
+  upstreamResources,
 } from "../drizzle/schema";
 import { getDb } from "./db";
 import {
@@ -71,10 +78,18 @@ import {
 import { recordKnowledgeBaseOutputFiles } from "./knowledge-base-output-resource-service";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
 import { extractKnowledgeBaseProtocolObjects } from "../shared/knowledge-base-output";
+import { parseExactJson } from "../shared/model-output-repair";
 import {
   classifyKnowledgeBaseUpstreamTaskStatus,
   formatKnowledgeBaseManifestEnvelope,
+  formatKnowledgeBasePresentationEnvelope,
+  formatKnowledgeBaseProgressEnvelope,
   KNOWLEDGE_BASE_MANIFEST_KIND,
+  KNOWLEDGE_BASE_PRESENTATION_KIND,
+  KNOWLEDGE_BASE_PROGRESS_KIND,
+  KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
+  parseKnowledgeBaseManifestEnvelope,
+  validateKnowledgeBaseManifestForTreePolicy,
 } from "./knowledge-base-progress";
 import { knowledgeBaseInteractionTelemetryEvents } from "./knowledge-base-interaction-telemetry";
 import { logKnowledgeBaseOperationTelemetry } from "./knowledge-base-operation-telemetry";
@@ -94,16 +109,26 @@ import {
 } from "./knowledge-base-artifact-binding-service";
 import { collectKnowledgeArchiveDescriptors } from "./knowledge-base-artifact";
 import {
+  activateKnowledgeBaseManusV2Handoff,
   bindKnowledgeBaseTurnUpstreamTask,
+  beginKnowledgeBaseManusV2Dispatch,
+  bindKnowledgeBaseManusV2Submission,
   cancelUnpreparedKnowledgeBaseTurn,
   claimKnowledgeBaseDeferredTurnDispatch,
+  claimKnowledgeBaseManusV2AnchorHandoff,
   claimKnowledgeBaseTurnForRecovery,
   completeKnowledgeBaseGeneratedAttachment,
+  completeKnowledgeBaseManusV2AnchorHandoff,
+  deferKnowledgeBaseManusV2AnchorHandoffOutputPending,
+  deferKnowledgeBaseManusV2AnchorHandoffAfterRejection,
+  settleKnowledgeBaseManusV2ExplicitRejection,
   deferKnowledgeBaseTurnBeforeCreate,
+  ensureKnowledgeBaseBuildSkillArchivePin,
   findRecoverableKnowledgeBaseTurnIds,
+  findRecoverableKnowledgeBaseAnchorHandoffTurnIds,
   failKnowledgeBaseTurnDeterministically,
-  findReusableKnowledgeBaseSkillFileId,
   freezeKnowledgeBaseTurnAttachments,
+  hashKnowledgeBaseTurnRequest,
   inspectKnowledgeBaseDeferredAttachmentReplay,
   inspectKnowledgeBaseDeferredDispatchReplay,
   inspectKnowledgeBaseLegacyAttachmentTakeoverReplay,
@@ -111,10 +136,20 @@ import {
   inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
   markKnowledgeBaseTurnDispatching,
+  markLegacyKnowledgeBaseCreateAttentionRequired,
   markKnowledgeBaseTurnOutcomeUnknown,
+  markKnowledgeBaseManusV2OutcomeUnknown,
+  markKnowledgeBaseManusV2AttentionRequired,
+  markKnowledgeBaseManusV2AnchorHandoffAttentionRequired,
+  markKnowledgeBaseManusV2CredentialRebindAttention,
+  mutateKnowledgeBaseManusV2Lifecycle,
   prepareKnowledgeBaseTurnDispatch,
+  promoteKnowledgeBaseGeneratedAttachmentReady,
+  replaceUnusableKnowledgeBaseGeneratedAttachment,
   reserveKnowledgeBaseGeneratedAttachment,
+  reserveKnowledgeBaseFailedNotSentLegacyHandoff,
   reserveKnowledgeBaseRetryTurn,
+  reserveKnowledgeBaseManusV2AnchorHandoff,
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
   replaceKnowledgeBaseTurnAttachmentsAfterUserFix,
@@ -123,14 +158,50 @@ import {
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   renewKnowledgeBaseTurnLease,
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
+  stageKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
   KnowledgeBaseTurnReservationError,
   type KnowledgeBaseCreateAttemptState,
   type KnowledgeBasePreparedDispatch,
   type KnowledgeBaseRecoveryClaim,
+  type KnowledgeBaseAnchorHandoffCredentialMode,
   type KnowledgeBaseDeferredDispatchClaim,
   type KnowledgeBaseTurnReservation,
 } from "./knowledge-base-turn-service";
+import {
+  appendManusV2KnowledgeBaseOperationContract,
+  buildManusV2KnowledgeBaseStructuredOutputSchema,
+  latestManusV2TaskState,
+  ManusV2ApiError,
+  ManusV2Client,
+  manusV2EventsContainOperationToken,
+  manusV2KnowledgeBaseStructuredResultForOperation,
+  normalizeManusV2Output,
+  type ManusV2KnowledgeBaseOperationContract,
+} from "./manus-v2-client";
+import {
+  buildKnowledgeBaseManusV2FormatRepair,
+  buildKnowledgeBaseManusV2ErrorRecovery,
+  buildKnowledgeBaseManusV2AnchorErrorRecovery,
+  classifyKnowledgeBaseManusV2ErrorRecoveryAttempt,
+  classifyKnowledgeBaseManusV2FormatRepairAttempt,
+  classifyKnowledgeBaseManusV2Lifecycle,
+  classifyKnowledgeBaseManusV2WaitingAttempt,
+  isRepairableKnowledgeBaseManusV2FormatCode,
+  knowledgeBaseManusV2ErrorRecoveryRejection,
+  manusV2WaitingEventIsStrictSuccessor,
+} from "./knowledge-base-manus-v2-lifecycle";
+import {
+  knowledgeBaseManusV2ActiveMigrationEnabled,
+  knowledgeBaseManusV2RecoveryAuthority,
+} from "./knowledge-base-manus-v2-rollout";
+import {
+  classifyKnowledgeBaseAnchorAcknowledgementSettlement,
+  classifyKnowledgeBaseCanonicalCredentialRebind,
+  executeKnowledgeBaseAnchorHandoff,
+  inspectKnowledgeBaseAnchorAcknowledgement,
+} from "./knowledge-base-active-v2-migration-core";
+import { ensureKnowledgeBaseManusV2Attachments } from "./knowledge-base-manus-v2-attachments";
 import {
   claimKnowledgeBaseOpenRecoveryBuild,
   releaseKnowledgeBaseOpenRecoveryLease,
@@ -140,6 +211,14 @@ import {
 import { assertCapturedKnowledgeBaseCustomerImage } from "./knowledge-base-customer-upload";
 import { readStoredPresalesFile } from "./presales-file-store";
 import {
+  persistKnowledgeBaseBuildSource,
+  persistKnowledgeBaseGeneratedSource,
+} from "./knowledge-base-local-source-store";
+import {
+  ManagedUploadIntentError,
+  proveKnowledgeBaseManagedUploadForStage,
+} from "./managed-upload-intent";
+import {
   assertKnowledgeBaseAttachmentManifestPresent,
   normalizeKnowledgeBaseClientAttachmentManifest,
   normalizeKnowledgeBaseUserAttachments,
@@ -148,6 +227,10 @@ import {
 } from "./knowledge-base-client-attachment-manifest";
 import { assertKnowledgeBaseExpectedGeneration } from "./knowledge-base-turn-coordinates";
 import { logKnowledgeBaseRuntimeFailure } from "./knowledge-base-runtime-log";
+import {
+  matchesAuthoritativeKnowledgeBaseMessageTuple,
+  parsedKnowledgeBaseMessageMetadata,
+} from "./knowledge-base-authoritative-message";
 import {
   getKnowledgeBaseSkillDescriptor,
   KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
@@ -198,6 +281,7 @@ import {
   KNOWLEDGE_BASE_AGENT_PROFILE,
   KnowledgeBaseAttachmentsProcessingError,
   KnowledgeBaseLocalPreparationError,
+  KnowledgeBaseManusV2RolloutDeferredError,
   KnowledgeBaseOpenRecoveryLeaseError,
   KnowledgeBaseUpstreamCreateError,
   KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
@@ -297,7 +381,10 @@ export function knowledgeBaseReservationReceipt(
     traceId: reservation.turn.traceId,
     stagedAttachmentCount: reservation.turn.stagedUserAttachmentCount,
     expectedAttachmentCount: reservation.turn.expectedUserAttachmentCount,
-    requiresUpload: reservation.state === "awaiting_attachments",
+    requiresUpload:
+      reservation.state === "awaiting_attachments" &&
+      reservation.turn.stagedUserAttachmentCount <
+        reservation.turn.expectedUserAttachmentCount,
   };
 }
 
@@ -336,6 +423,49 @@ export const KNOWLEDGE_BASE_MANUAL_LOGO_USER_INSTRUCTION =
   "用户已明确提交一张企业官方主 Logo。请只更新并重新展示当前首节点，不得确认或推进节点。";
 export const KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE =
   "已提交新的企业官方主 Logo，正在重新呈现当前知识节点。";
+
+/**
+ * Logo is a legacy-v1 correctness contract and a Manus-v2 optional resource.
+ * The only v2 operation allowed to validate or bind Logo bytes is an explicit
+ * manual Logo submission. Ordinary images must remain ordinary attachments.
+ */
+export function knowledgeBaseTurnLogoPolicy(input: {
+  providerProtocol?: string | null;
+  manualLogoSubmission?: boolean;
+  legacyLogoRequired?: boolean;
+}) {
+  const manusV2 = input.providerProtocol === "manus_v2";
+  const manualLogoSubmission = input.manualLogoSubmission === true;
+  const requiresOfficialLogo = !manusV2 && input.legacyLogoRequired === true;
+  return {
+    requiresOfficialLogo,
+    inferOrdinaryAttachmentAsLogo:
+      requiresOfficialLogo && !manualLogoSubmission,
+    validateManualLogoSubmission: manualLogoSubmission,
+    readPersistedLogoSubmission: !manusV2 || manualLogoSubmission,
+    acceptProviderDiscoveredLogo: !manusV2,
+    assertFinalLogoProvenance: !manusV2,
+    // A byte-identical copy of an already-bound Logo is always a duplicate,
+    // even though v2 never requires the customer to provide Logo bytes.
+    rejectRepeatedOfficialLogo: true,
+  } as const;
+}
+
+export function knowledgeBasePresentationRequiresBoundLogo(input: {
+  skillVersion?: string;
+  revision: number;
+  handled: number;
+  logoRequired?: boolean;
+  logoAvailable?: boolean;
+}) {
+  return (
+    input.logoAvailable === true &&
+    input.skillVersion === "4" &&
+    input.revision === 0 &&
+    input.handled === 0 &&
+    input.logoRequired !== true
+  );
+}
 
 export function knowledgeBaseManualLogoPendingResponse(input: {
   observation?: KnowledgeBaseObservationDto | null;
@@ -648,7 +778,7 @@ export async function loadKnowledgeBaseTurnAuthority(
   taskId: string;
 } | null> {
   const build = await loadBuild(input.userId, input.conversationId);
-  const taskId = String(build?.upstreamTaskId || "");
+  const taskId = String(build?.canonicalTaskId || build?.upstreamTaskId || "");
   return build && taskId ? { build, taskId } : null;
 }
 
@@ -815,16 +945,15 @@ export function deriveKnowledgeBaseInteraction(
       lockReason: "知识库已发布；后续修改请提交维护需求",
     };
   }
-  if (
-    progress?.packageAllowed &&
-    progress.build.status === "ready_to_publish"
-  ) {
+  if (progress?.build.status === "ready_to_publish") {
     return {
       progress,
       interactionState: "ready_to_publish",
       canReply: false,
-      canPublish: true,
-      lockReason: "知识库已完成，请执行唯一一次直接更新",
+      canPublish: progress.packageAllowed,
+      lockReason: progress.packageAllowed
+        ? "知识库内容与下载包已完成，请执行唯一一次直接更新"
+        : "知识库内容已完成，下载包正在后台准备；已完成正文不受影响",
     };
   }
   if (
@@ -894,6 +1023,90 @@ export function isApprovedKnowledgeBaseAwaitingInputObservation(
   );
 }
 
+/**
+ * Keep an immutable accepted presentation independent from optional Logo and
+ * current-node resource projections. Those projections may be repaired
+ * locally, but they are not writer authority and must never relock a turn that
+ * the build has already made replyable.
+ */
+export function applyKnowledgeBasePresentationProjectionGuard(input: {
+  progress: KnowledgeBaseProgressDto;
+  observation: Pick<
+    KnowledgeBaseObservationDto,
+    "approvedPresentation" | "localRestrictions" | "notice"
+  >;
+  interaction: KnowledgeBaseInteractionDto;
+}) {
+  if (input.interaction.interactionState !== "awaiting_input") {
+    return {
+      interaction: input.interaction,
+      localRestrictions: input.observation.localRestrictions,
+      notice: input.observation.notice,
+    };
+  }
+
+  const presentation = input.observation.approvedPresentation;
+  const hasDisplayableAcceptedPresentation = Boolean(
+    presentation?.visibleMarkdown.trim() && presentation.leafId.trim(),
+  );
+  if (!hasDisplayableAcceptedPresentation) {
+    return {
+      interaction: {
+        progress: input.progress,
+        interactionState: "executing" as const,
+        canReply: false,
+        canPublish: false,
+        lockReason: "当前知识节点正在完成服务端展示校验",
+      },
+      localRestrictions: input.observation.localRestrictions,
+      notice: input.observation.notice,
+    };
+  }
+
+  const logoProjectionIncomplete =
+    knowledgeBasePresentationRequiresBoundLogo({
+      skillVersion: input.progress.build.skillVersion,
+      revision: input.progress.build.revision,
+      handled: input.progress.summary.handled,
+      logoRequired: input.progress.build.logoRequired,
+      logoAvailable: input.progress.build.logoAvailable,
+    }) &&
+    (presentation!.imageState !== "attached" ||
+      presentation!.resources.filter((resource) => resource.kind === "logo")
+        .length !== 1);
+  if (!logoProjectionIncomplete) {
+    return {
+      interaction: input.interaction,
+      localRestrictions: input.observation.localRestrictions,
+      notice: input.observation.notice,
+    };
+  }
+
+  return {
+    interaction: input.interaction,
+    localRestrictions: Array.from(
+      new Set([
+        ...(input.observation.localRestrictions || []),
+        "logo_projection_repairing",
+      ]),
+    ),
+    // The observation DTO has one notice slot. Never displace an existing
+    // operational notice with this optional-resource projection warning.
+    notice:
+      input.observation.notice ||
+      ({
+        key: `${input.progress.build.id}:${input.progress.build.revision}:logo-projection-repairing`,
+        code: "KNOWLEDGE_BASE_LOGO_PROJECTION_REPAIRING",
+        severity: "warning" as const,
+        message:
+          "企业 Logo 展示资源正在局部恢复；已完成正文与本轮确认不受影响。",
+        retryable: false,
+        turnId: null,
+        createdAt: input.progress.build.updatedAt,
+      } satisfies NonNullable<KnowledgeBaseObservationDto["notice"]>),
+  };
+}
+
 export async function getKnowledgeBaseObservation(input: {
   userId: number;
   conversationId: string;
@@ -906,29 +1119,14 @@ export async function getKnowledgeBaseObservation(input: {
     progress,
     input.upstreamStatus,
   );
-  if (
-    interaction.interactionState === "awaiting_input" &&
-    (!observation.approvedPresentation ||
-      observation.approvedPresentation.revision !== progress.build.revision ||
-      observation.approvedPresentation.leafId !==
-        progress.build.currentLeafId ||
-      (progress.build.skillVersion === "4" &&
-        progress.build.revision === 0 &&
-        progress.summary.handled === 0 &&
-        progress.build.logoRequired !== true &&
-        (observation.approvedPresentation.imageState !== "attached" ||
-          observation.approvedPresentation.resources.filter(
-            (resource) => resource.kind === "logo",
-          ).length !== 1)))
-  ) {
-    interaction = {
-      progress,
-      interactionState: "executing",
-      canReply: false,
-      canPublish: false,
-      lockReason: "当前知识节点正在完成服务端展示校验",
-    };
-  }
+  const presentationProjection = applyKnowledgeBasePresentationProjectionGuard({
+    progress,
+    observation,
+    interaction,
+  });
+  interaction = presentationProjection.interaction;
+  observation.localRestrictions = presentationProjection.localRestrictions;
+  observation.notice = presentationProjection.notice;
   const finalLogoProvenance = await inspectKnowledgeBaseFinalLogoProvenance({
     userId: input.userId,
     buildId: progress.build.id,
@@ -1165,12 +1363,15 @@ async function reconcileAvailableKnowledgeOutput(input: {
         }
         try {
           const bindInitialLogo =
-            boundBuild.skillVersion === "4"
+            knowledgeBaseTurnLogoPolicy({
+              providerProtocol: boundBuild.providerProtocol,
+            }).acceptProviderDiscoveredLogo &&
+            (boundBuild.skillVersion === "4"
               ? boundBuild.totalNodeCount === 0
               : shouldBindKnowledgeBaseInitialLogo(
                   boundBuild.skillVersion,
                   collectKnowledgeBaseLogoDescriptors(unreconciled).length,
-                );
+                ));
           if (bindInitialLogo) {
             const logoBinding = await bindKnowledgeBaseInitialLogo({
               userId: input.userId,
@@ -1461,13 +1662,18 @@ export async function recoverOpenKnowledgeBaseTasks(options?: {
       stateEpoch: knowledgeBaseBuilds.stateEpoch,
       protocolErrorCode: knowledgeBaseBuilds.protocolErrorCode,
       upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+      providerProtocol: knowledgeBaseBuilds.providerProtocol,
+      canonicalTaskId: knowledgeBaseBuilds.canonicalTaskId,
       lastOutputLength: knowledgeBaseBuilds.lastOutputLength,
       lastOutputItemIds: knowledgeBaseBuilds.lastOutputItemIds,
     })
     .from(knowledgeBaseBuilds)
     .where(
       and(
-        isNotNull(knowledgeBaseBuilds.upstreamTaskId),
+        or(
+          isNotNull(knowledgeBaseBuilds.canonicalTaskId),
+          isNotNull(knowledgeBaseBuilds.upstreamTaskId),
+        ),
         isNull(knowledgeBaseBuilds.activeTurnId),
         or(
           isNull(knowledgeBaseBuilds.recoveryLeaseExpiresAt),
@@ -1518,7 +1724,9 @@ export async function recoverOpenKnowledgeBaseTasks(options?: {
     while (cursor < builds.length) {
       const candidate = builds[cursor++];
       let claim: KnowledgeBaseOpenRecoveryClaim | null = null;
-      let taskId = String(candidate.upstreamTaskId || "");
+      let taskId = String(
+        candidate.canonicalTaskId || candidate.upstreamTaskId || "",
+      );
       let deferToPackageRebind = false;
       let recoveryApiKey: string | undefined;
       try {
@@ -1535,7 +1743,7 @@ export async function recoverOpenKnowledgeBaseTasks(options?: {
         }
         result.claimed += 1;
         const build = claim.build;
-        taskId = String(build.upstreamTaskId || "");
+        taskId = String(build.canonicalTaskId || build.upstreamTaskId || "");
         deferToPackageRebind = claim.kind === "package_rebind";
         await withKnowledgeBaseOpenRecoveryLeaseHeartbeat({
           claim,
@@ -1562,6 +1770,42 @@ export async function recoverOpenKnowledgeBaseTasks(options?: {
               return;
             }
             recoveryApiKey = credential.apiKey;
+            if (build.providerProtocol === "manus_v2") {
+              const client = new ManusV2Client({
+                baseUrl,
+                apiKey: credential.apiKey,
+              });
+              const events = await client.listAllMessages({
+                taskId,
+                order: "asc",
+              });
+              const output = normalizeManusV2Output(events);
+              const taskStatus = latestManusV2TaskState(events) || "running";
+              if (!shouldReconcileKnowledgeOutput(output, taskStatus)) {
+                observeKnowledgeInteraction(
+                  await getKnowledgeBaseProgress({
+                    userId: build.userId,
+                    conversationId: build.conversationId,
+                  }),
+                  taskStatus,
+                );
+                return;
+              }
+              await reconcileAvailableKnowledgeOutput({
+                userId: build.userId,
+                conversationId: build.conversationId,
+                taskId,
+                output,
+                upstreamStatus: taskStatus,
+                ledger: {
+                  lastOutputLength: build.lastOutputLength,
+                  lastOutputItemIds: build.lastOutputItemIds,
+                },
+                artifactAccess: { apiKey: credential.apiKey, baseUrl },
+              });
+              result.reconciled += 1;
+              return;
+            }
             const taskResponse = await axios.get(
               `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
               {
@@ -2121,6 +2365,9 @@ async function uploadRecoverySkill(input: {
   baseUrl: string;
   skillVersion: string;
   skillContentHash: string | null;
+  skillArchive: Awaited<
+    ReturnType<typeof ensureKnowledgeBaseBuildSkillArchivePin>
+  >;
   stagedPrefix?: string[];
   boundUpstreamFileId?: string;
 }) {
@@ -2129,26 +2376,18 @@ async function uploadRecoverySkill(input: {
     turnId: input.claim.turn.id,
     leaseToken: input.claim.leaseToken,
   });
-  const skillArchive = await readKnowledgeBaseSkillArchiveAttachment({
-    version: input.skillVersion,
-    contentHash: input.skillContentHash,
-  });
-  const reusableUpstreamFileId = input.boundUpstreamFileId
-    ? null
-    : await findReusableKnowledgeBaseSkillFileId({
-        userId: input.claim.turn.userId,
-        buildId: input.claim.turn.buildId!,
-        apiCredentialId: input.credential.id,
-        contentSha256: createHash("sha256")
-          .update(skillArchive.bytes)
-          .digest("hex"),
-      }).catch(() => null);
+  // Provider file ids are short-lived capabilities, not a durable Skill pin.
+  // A fresh operation must upload from the locally pinned bytes. The only
+  // reusable id is a candidate already reserved by this exact turn/slot.
+  const reusableUpstreamFileId = null;
   const uploaded = await uploadKnowledgeBaseSkillArchive({
     baseUrl: input.baseUrl,
     apiKey: input.credential.apiKey,
     skillVersion: input.skillVersion,
     skillContentHash: input.skillContentHash,
+    archive: input.skillArchive,
     reusableUpstreamFileId,
+    providerProtocol: input.claim.turn.providerProtocol,
     durable: {
       userId: input.claim.turn.userId,
       turnId: input.claim.turn.id,
@@ -2158,7 +2397,8 @@ async function uploadRecoverySkill(input: {
   });
   if (
     input.boundUpstreamFileId &&
-    uploaded.fileId !== input.boundUpstreamFileId
+    uploaded.fileId !== input.boundUpstreamFileId &&
+    input.claim.turn.providerProtocol !== "manus_v2"
   ) {
     throw new Error("Recovered Skill file id changed during byte upload");
   }
@@ -2173,12 +2413,14 @@ async function uploadRecoverySkill(input: {
     leaseToken: input.claim.leaseToken,
     attachmentFileIds: [...(input.stagedPrefix || []), uploaded.fileId],
   });
-  await recordUpstreamResource({
-    userId: input.claim.turn.userId,
-    apiCredentialId: input.credential.id,
-    kind: "file",
-    upstreamId: uploaded.fileId,
-  });
+  if (input.claim.turn.providerProtocol !== "manus_v2") {
+    await recordUpstreamResource({
+      userId: input.claim.turn.userId,
+      apiCredentialId: input.credential.id,
+      kind: "file",
+      upstreamId: uploaded.fileId,
+    });
+  }
   return uploaded;
 }
 
@@ -2191,14 +2433,58 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
   claim: KnowledgeBaseRecoveryClaim;
   credential: RecoveryCredential;
 }) {
-  if (input.claim.preparedDispatch) return input.claim.preparedDispatch;
   const { claim, credential } = input;
+  const buildId = claim.turn.buildId;
+  if (!buildId) {
+    throw new Error("Recovery turn is not bound to a knowledge-base build");
+  }
+  const skillArchive = await ensureKnowledgeBaseBuildSkillArchivePin({
+    userId: claim.turn.userId,
+    buildId,
+    generation: claim.turn.buildGeneration,
+  });
+  const pinnedBuild = await loadKnowledgeBaseBuildRecordById(
+    claim.turn.userId,
+    buildId,
+  );
+  if (!pinnedBuild || pinnedBuild.generation !== claim.turn.buildGeneration) {
+    throw new Error("Recovery build identity changed");
+  }
+  const recordedSkillVersion = recoveryString(
+    claim.recoveryMetadata,
+    "skillVersion",
+    pinnedBuild.skillVersion,
+  );
+  const recordedSkillContentHash =
+    recoveryString(
+      claim.recoveryMetadata,
+      "skillContentHash",
+      pinnedBuild.skillContentHash || "",
+    ) || null;
+  if (
+    recordedSkillVersion !== pinnedBuild.skillVersion ||
+    recordedSkillContentHash !== (pinnedBuild.skillContentHash || null) ||
+    skillArchive.contentHash !== (pinnedBuild.skillContentHash || "")
+  ) {
+    throw new Error("Recovery Skill logical pin does not match the build");
+  }
+  claim.recoveryMetadata = {
+    ...claim.recoveryMetadata,
+    skillVersion: pinnedBuild.skillVersion,
+    skillContentHash: pinnedBuild.skillContentHash,
+    skillArchiveSha256: skillArchive.physicalSha256,
+    skillArchiveBytes: skillArchive.archiveBytes,
+    skillArchiveStorageKey: skillArchive.storageKey,
+  };
+  if (claim.preparedDispatch) return claim.preparedDispatch;
   const recovery = claim.recoveryMetadata;
   const kind = recoveryString(recovery, "kind");
   const conversationId = recoveryString(recovery, "conversationId");
-  const skillVersion = recoveryString(recovery, "skillVersion", "4");
-  const skillContentHash = recoveryString(recovery, "skillContentHash") || null;
+  const skillVersion = pinnedBuild.skillVersion;
+  const skillContentHash = pinnedBuild.skillContentHash || null;
   const finalPackageRequired = recovery.finalPackageRequired === true;
+  const providerPackageRequired =
+    finalPackageRequired && claim.turn.providerProtocol !== "manus_v2";
   const userAttachments = normalizeKnowledgeBaseUserAttachments(
     Array.isArray(recovery.attachments)
       ? (recovery.attachments as KnowledgeBaseAttachment[])
@@ -2210,17 +2496,6 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     recoveryString(recovery, "retryAgentProfile") ||
     toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE);
   const stagedIds = [...claim.turn.attachmentFileIds];
-  if (!claim.turn.buildId) {
-    throw new Error("Recovery turn is not bound to a knowledge-base build");
-  }
-  const pinnedBuild = await loadKnowledgeBaseBuildRecordById(
-    claim.turn.userId,
-    claim.turn.buildId,
-  );
-  if (!pinnedBuild || pinnedBuild.generation !== claim.turn.buildGeneration) {
-    throw new Error("Recovery build identity changed");
-  }
-
   if (kind === "turn") {
     const parentTaskId =
       recoveryString(recovery, "retryParentTaskId") ||
@@ -2231,7 +2506,14 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
           recovery.attachmentManifest,
         )
       : undefined;
-    let officialLogoUpload = recoveryOfficialLogoUpload(recovery);
+    const recoveryLogoPolicy = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: claim.turn.providerProtocol,
+      manualLogoSubmission: recovery.manualLogoSubmission === true,
+      legacyLogoRequired: knowledgeBaseBuildRequiresOfficialLogo(pinnedBuild),
+    });
+    let officialLogoUpload = recoveryLogoPolicy.readPersistedLogoSubmission
+      ? recoveryOfficialLogoUpload(recovery)
+      : undefined;
     const pendingManualLogoUpload =
       recovery.manualLogoSubmission === true
         ? recoveryPendingOfficialLogoUpload(recovery)
@@ -2242,7 +2524,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     if (!officialLogoUpload && !pendingManualLogoUpload) {
       if (
         pinnedBuild.id === claim.turn.buildId &&
-        knowledgeBaseBuildRequiresOfficialLogo(pinnedBuild)
+        recoveryLogoPolicy.inferOrdinaryAttachmentAsLogo
       ) {
         const manifestItem = attachmentManifest?.[0];
         const attachment = userAttachments[0];
@@ -2332,6 +2614,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       baseUrl,
       skillVersion,
       skillContentHash,
+      skillArchive,
       stagedPrefix: deferredClientAttachments ? stagedUserIds : [],
       ...(boundSkillId ? { boundUpstreamFileId: boundSkillId } : {}),
     });
@@ -2352,7 +2635,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
           assetCount: number;
         }
       | undefined;
-    if (finalPackageRequired) {
+    if (providerPackageRequired) {
       if (skillVersion !== "4" || deferredClientAttachments) {
         throw new Error(
           "Finalization input is only valid for a complete v4 turn",
@@ -2397,6 +2680,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         apiKey: credential.apiKey,
         filename: archive.filename,
         bytes: archive.bytes,
+        providerProtocol: claim.turn.providerProtocol,
         durable: {
           userId: claim.turn.userId,
           turnId: claim.turn.id,
@@ -2416,12 +2700,14 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         leaseToken: claim.leaseToken,
         attachmentFileIds: [skillId, uploaded.fileId],
       });
-      await recordUpstreamResource({
-        userId: claim.turn.userId,
-        apiCredentialId: credential.id,
-        kind: "file",
-        upstreamId: uploaded.fileId,
-      });
+      if (claim.turn.providerProtocol !== "manus_v2") {
+        await recordUpstreamResource({
+          userId: claim.turn.userId,
+          apiCredentialId: credential.id,
+          kind: "file",
+          upstreamId: uploaded.fileId,
+        });
+      }
       generatedAttachments.push({
         file_id: uploaded.fileId,
         filename: archive.filename,
@@ -2433,7 +2719,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       };
     }
     let prompt: string;
-    if (finalPackageRequired) {
+    if (providerPackageRequired) {
       prompt = await buildKnowledgeBaseTurnPrompt({
         userId: claim.turn.userId,
         conversationId,
@@ -2459,6 +2745,8 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         skillVersion,
         skillContentHash,
         officialLogoUpload: officialLogoUploadForPrompt,
+        contentCompletionOnly:
+          finalPackageRequired && claim.turn.providerProtocol === "manus_v2",
         protocolOperation: {
           operationId: claim.turn.operationKey,
           turnId: claim.turn.id,
@@ -2482,6 +2770,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
           filename: instructionDelivery.filename,
           bytes: instructionDelivery.bytes,
           mimeType: instructionDelivery.mimeType,
+          providerProtocol: claim.turn.providerProtocol,
           durable: {
             userId: claim.turn.userId,
             turnId: claim.turn.id,
@@ -2493,7 +2782,8 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       const instructionFileId = uploadedInstruction.fileId;
       if (
         boundInstructionFileId &&
-        instructionFileId !== boundInstructionFileId
+        instructionFileId !== boundInstructionFileId &&
+        claim.turn.providerProtocol !== "manus_v2"
       ) {
         throw new Error(
           "Recovered instructions file id changed during byte upload",
@@ -2512,29 +2802,37 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
           ? [...stagedUserIds, skillId, instructionFileId]
           : [skillId, instructionFileId],
       });
-      await recordUpstreamResource({
-        userId: claim.turn.userId,
-        apiCredentialId: credential.id,
-        kind: "file",
-        upstreamId: instructionFileId,
-      });
+      if (claim.turn.providerProtocol !== "manus_v2") {
+        await recordUpstreamResource({
+          userId: claim.turn.userId,
+          apiCredentialId: credential.id,
+          kind: "file",
+          upstreamId: instructionFileId,
+        });
+      }
       generatedAttachments.push({
         file_id: instructionFileId,
         filename: KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
       });
       prompt = instructionDelivery.prompt;
     }
-    const attachments = finalPackageRequired
+    const attachments = providerPackageRequired
       ? [...generatedAttachments, ...userAttachments]
       : deferredClientAttachments
         ? [...userAttachments, ...generatedAttachments]
         : [...generatedAttachments, ...userAttachments];
-    const readyAttachments = await waitForKnowledgeBaseDispatchAttachments({
-      claim,
-      credential,
-      baseUrl,
-      attachments,
-    });
+    // A v2 operation freezes this ordered source ledger, then the v2
+    // attachment mapper uploads exclusively from Dashboard-retained bytes.
+    // Historical v1 ids may be 404 and are not a v2 correctness dependency.
+    const readyAttachments =
+      claim.turn.providerProtocol === "manus_v2"
+        ? attachments
+        : await waitForKnowledgeBaseDispatchAttachments({
+            claim,
+            credential,
+            baseUrl,
+            attachments,
+          });
     await freezeKnowledgeBaseTurnAttachments({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
@@ -2583,6 +2881,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     baseUrl,
     skillVersion,
     skillContentHash,
+    skillArchive,
     ...(stagedIds[0] ? { boundUpstreamFileId: stagedIds[0] } : {}),
   });
   const skillId = recoveredSkill.fileId;
@@ -2603,6 +2902,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       apiKey: credential.apiKey,
       filename: KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
       bytes: archive.bytes,
+      providerProtocol: claim.turn.providerProtocol,
       durable: {
         userId: claim.turn.userId,
         turnId: claim.turn.id,
@@ -2612,7 +2912,11 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       },
     });
     const prefillFileId = uploaded.fileId;
-    if (stagedIds[1] && prefillFileId !== stagedIds[1]) {
+    if (
+      stagedIds[1] &&
+      prefillFileId !== stagedIds[1] &&
+      claim.turn.providerProtocol !== "manus_v2"
+    ) {
       throw new Error("Recovered prefill file id changed during byte upload");
     }
     await renewKnowledgeBaseTurnLease({
@@ -2626,12 +2930,14 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       leaseToken: claim.leaseToken,
       attachmentFileIds: [skillId, prefillFileId],
     });
-    await recordUpstreamResource({
-      userId: claim.turn.userId,
-      apiCredentialId: credential.id,
-      kind: "file",
-      upstreamId: prefillFileId,
-    });
+    if (claim.turn.providerProtocol !== "manus_v2") {
+      await recordUpstreamResource({
+        userId: claim.turn.userId,
+        apiCredentialId: credential.id,
+        kind: "file",
+        upstreamId: prefillFileId,
+      });
+    }
     generatedAttachments.push({
       file_id: prefillFileId,
       filename: KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
@@ -2666,6 +2972,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       filename: instructionDelivery.filename,
       bytes: instructionDelivery.bytes,
       mimeType: instructionDelivery.mimeType,
+      providerProtocol: claim.turn.providerProtocol,
       durable: {
         userId: claim.turn.userId,
         turnId: claim.turn.id,
@@ -2677,7 +2984,8 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
   const instructionFileId = uploadedInstruction.fileId;
   if (
     stagedIds[instructionIndex] &&
-    instructionFileId !== stagedIds[instructionIndex]
+    instructionFileId !== stagedIds[instructionIndex] &&
+    claim.turn.providerProtocol !== "manus_v2"
   ) {
     throw new Error(
       "Recovered instructions file id changed during byte upload",
@@ -2697,23 +3005,28 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       instructionFileId,
     ],
   });
-  await recordUpstreamResource({
-    userId: claim.turn.userId,
-    apiCredentialId: credential.id,
-    kind: "file",
-    upstreamId: instructionFileId,
-  });
+  if (claim.turn.providerProtocol !== "manus_v2") {
+    await recordUpstreamResource({
+      userId: claim.turn.userId,
+      apiCredentialId: credential.id,
+      kind: "file",
+      upstreamId: instructionFileId,
+    });
+  }
   generatedAttachments.push({
     file_id: instructionFileId,
     filename: KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
   });
   const attachments = [...generatedAttachments, ...userAttachments];
-  const readyAttachments = await waitForKnowledgeBaseDispatchAttachments({
-    claim,
-    credential,
-    baseUrl,
-    attachments,
-  });
+  const readyAttachments =
+    claim.turn.providerProtocol === "manus_v2"
+      ? attachments
+      : await waitForKnowledgeBaseDispatchAttachments({
+          claim,
+          credential,
+          baseUrl,
+          attachments,
+        });
   await freezeKnowledgeBaseTurnAttachments({
     userId: claim.turn.userId,
     turnId: claim.turn.id,
@@ -2747,6 +3060,86 @@ async function reconcileRecoveredKnowledgeBaseTask(input: {
     upstreamId: taskId,
   });
   const baseUrl = claim.preparedDispatch?.baseUrl || getUpstreamBaseUrl();
+  if (claim.turn.providerProtocol === "manus_v2") {
+    const client = new ManusV2Client({
+      baseUrl,
+      apiKey: credential.apiKey,
+    });
+    const events = await client.listAllMessages({ taskId, order: "asc" });
+    const status = latestManusV2TaskState(events) || "running";
+    const build = await loadKnowledgeBaseBuildRecordById(
+      claim.turn.userId,
+      claim.turn.buildId,
+    );
+    if (!build || build.generation !== claim.turn.buildGeneration) return false;
+    const contract = manusV2ContractForTurn({ claim, build });
+    const lifecycle = await reconcileKnowledgeBaseManusV2Lifecycle({
+      claim,
+      build,
+      client,
+      taskId,
+      events,
+      contract,
+    });
+    if (lifecycle.kind !== "stopped") return false;
+    let output: Awaited<
+      ReturnType<typeof normalizeManusV2KnowledgeBaseOperationOutput>
+    >;
+    try {
+      output = await normalizeManusV2KnowledgeBaseOperationOutput({
+        events,
+        contract,
+        build,
+        expectedUploadsRead: build.lastTurnAttachmentCount,
+      });
+    } catch (error) {
+      if (
+        !(
+          error instanceof ManusV2ApiError &&
+          isRepairableKnowledgeBaseManusV2FormatCode(error.code)
+        )
+      ) {
+        throw error;
+      }
+      await repairStoppedManusV2KnowledgeBaseFormat({
+        claim,
+        client,
+        taskId,
+        events,
+        contract,
+      });
+      return false;
+    }
+    // A stopped v2 task without the exact structured result is not a valid
+    // business result. Keep polling/repairing this build locally instead of
+    // handing an empty terminal payload to the legacy protocol-error path.
+    if (
+      output.length === 0 ||
+      !shouldReconcileKnowledgeOutput(output, status)
+    ) {
+      await repairStoppedManusV2KnowledgeBaseFormat({
+        claim,
+        client,
+        taskId,
+        events,
+        contract,
+      });
+      return false;
+    }
+    await reconcileAvailableKnowledgeOutput({
+      userId: claim.turn.userId,
+      conversationId: build.conversationId,
+      taskId,
+      output,
+      upstreamStatus: status,
+      ledger: {
+        lastOutputLength: build.lastOutputLength,
+        lastOutputItemIds: build.lastOutputItemIds,
+      },
+      artifactAccess: { apiKey: credential.apiKey, baseUrl },
+    });
+    return true;
+  }
   let taskData = input.taskData;
   if (!taskData) {
     const response = await axios.get(
@@ -2879,11 +3272,1473 @@ async function promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(
   });
 }
 
+function manusV2ContractForTurn(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  build: NonNullable<
+    Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
+  >;
+}): ManusV2KnowledgeBaseOperationContract {
+  const { claim, build } = input;
+  const action = claim.turn.operationType;
+  const expectContentCompleted =
+    claim.recoveryMetadata.finalPackageRequired === true ||
+    knowledgeBaseTurnRequiresFinalPackage({
+      skillVersion: build.skillVersion,
+      currentLeafId: build.currentLeafId,
+      totalNodeCount: build.totalNodeCount,
+      confirmedCount: build.confirmedCount,
+      directPrefilledCount: build.directPrefilledCount,
+      action:
+        action === "start" ||
+        action === "retry" ||
+        action === "legacy_reconcile"
+          ? "initial"
+          : action,
+    });
+  return {
+    operationToken: claim.turn.operationToken,
+    turnId: claim.turn.id,
+    generation: claim.turn.buildGeneration,
+    baseRevision: claim.turn.expectedRevision,
+    action,
+    fromLeafId: claim.turn.expectedLeafId,
+    expectContentCompleted,
+    requiresManifest: build.totalNodeCount === 0,
+  };
+}
+
+async function reconcileKnowledgeBaseManusV2Lifecycle(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  build: NonNullable<
+    Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
+  >;
+  client: ManusV2Client;
+  taskId: string;
+  events: Parameters<typeof classifyKnowledgeBaseManusV2Lifecycle>[0]["events"];
+  contract: ManusV2KnowledgeBaseOperationContract;
+  dependencies?: {
+    mutateLifecycle?: typeof mutateKnowledgeBaseManusV2Lifecycle;
+    markAttention?: typeof markKnowledgeBaseManusV2AttentionRequired;
+  };
+}) {
+  const mutateLifecycle =
+    input.dependencies?.mutateLifecycle ?? mutateKnowledgeBaseManusV2Lifecycle;
+  const markAttention =
+    input.dependencies?.markAttention ??
+    markKnowledgeBaseManusV2AttentionRequired;
+  let lifecycleLedger = input.claim.turn.manusV2Lifecycle;
+  if (
+    (lifecycleLedger.waitingAttemptState === "sending" ||
+      lifecycleLedger.waitingAttemptState === "outcome_unknown") &&
+    lifecycleLedger.waitingEventId &&
+    lifecycleLedger.waitingEventType &&
+    lifecycleLedger.waitingRequestHash &&
+    (lifecycleLedger.waitingAction === "ask_user_continue" ||
+      lifecycleLedger.waitingAction === "confirm_safe")
+  ) {
+    const priorAttempt = classifyKnowledgeBaseManusV2WaitingAttempt({
+      attemptState: lifecycleLedger.waitingAttemptState,
+      action: lifecycleLedger.waitingAction,
+      eventId: lifecycleLedger.waitingEventId,
+      statusEventId: lifecycleLedger.waitingStatusEventId,
+      continuationToken: lifecycleLedger.waitingContinuationToken,
+      events: input.events,
+    });
+    if (priorAttempt === "adopt") {
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "waiting",
+          eventId: lifecycleLedger.waitingEventId,
+          eventType: lifecycleLedger.waitingEventType,
+          statusEventId: lifecycleLedger.waitingStatusEventId,
+          action: lifecycleLedger.waitingAction,
+          requestHash: lifecycleLedger.waitingRequestHash,
+          continuationToken: lifecycleLedger.waitingContinuationToken,
+          state: "acknowledged",
+        },
+      });
+      lifecycleLedger = {
+        ...lifecycleLedger,
+        waitingAttemptState: "acknowledged",
+      };
+    } else if (priorAttempt === "attention_required") {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_WAITING_RESPONSE_UNPROVEN",
+        waitingEventId: lifecycleLedger.waitingEventId,
+        waitingEventType: lifecycleLedger.waitingEventType,
+      });
+      return {
+        kind: "attention_required" as const,
+        taskStatus: "waiting" as const,
+        code: "MANUS_V2_WAITING_RESPONSE_UNPROVEN",
+        eventId: lifecycleLedger.waitingEventId,
+        eventType: lifecycleLedger.waitingEventType,
+      };
+    }
+  }
+  const decision = classifyKnowledgeBaseManusV2Lifecycle({
+    events: input.events,
+    contract: input.contract,
+  });
+  if (decision.kind === "poll" || decision.kind === "stopped") {
+    return decision;
+  }
+  if (decision.kind === "attention_required") {
+    if (
+      input.claim.turn.manusV2Lifecycle.attentionCode === decision.code &&
+      (!decision.eventId ||
+        input.claim.turn.manusV2Lifecycle.waitingEventId === decision.eventId)
+    ) {
+      return decision;
+    }
+    await markAttention({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: decision.code,
+      waitingEventId: decision.eventId,
+      waitingEventType: decision.eventType,
+    });
+    return decision;
+  }
+  if (decision.kind === "recover_error") {
+    const existing = input.claim.turn.manusV2Lifecycle;
+    if (
+      existing.errorRecoveryToken &&
+      (existing.errorRecoveryToken !== decision.recoveryToken ||
+        existing.errorRecoveryRequestHash !== decision.requestHash)
+    ) {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_ERROR_RECOVERY_CONFLICT",
+      });
+      return {
+        kind: "attention_required" as const,
+        taskStatus: "error" as const,
+        code: "MANUS_V2_ERROR_RECOVERY_CONFLICT",
+      };
+    }
+    const attempt = classifyKnowledgeBaseManusV2ErrorRecoveryAttempt({
+      attemptState: existing.errorRecoveryAttemptState,
+      recoveryToken: decision.recoveryToken,
+      events: input.events,
+      nextRetryAt: existing.errorRecoveryNextRetryAt,
+    });
+    if (attempt === "adopt") {
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "error_recovery",
+          recoveryToken: decision.recoveryToken,
+          requestHash: decision.requestHash,
+          state: "acknowledged",
+        },
+      });
+      return decision;
+    }
+    if (attempt === "wait") return decision;
+    if (attempt === "attention_required") {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_ERROR_RECOVERY_REJECTED",
+      });
+      return {
+        kind: "attention_required" as const,
+        taskStatus: "error" as const,
+        code: "MANUS_V2_ERROR_RECOVERY_REJECTED",
+      };
+    }
+    await mutateLifecycle({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      mutation: {
+        kind: "error_recovery",
+        recoveryToken: decision.recoveryToken,
+        requestHash: decision.requestHash,
+        state: "sending",
+      },
+    });
+    try {
+      const sent = await input.client.sendMessage({
+        taskId: input.taskId,
+        prompt: decision.prompt,
+        structuredOutputSchema: buildManusV2KnowledgeBaseStructuredOutputSchema(
+          input.contract,
+        ),
+      });
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "error_recovery",
+          recoveryToken: decision.recoveryToken,
+          requestHash: decision.requestHash,
+          state: "acknowledged",
+          requestId: sent.requestId,
+        },
+      });
+      return decision;
+    } catch (error) {
+      if (error instanceof ManusV2ApiError) {
+        const rejection = error.outcomeUnknown
+          ? null
+          : knowledgeBaseManusV2ErrorRecoveryRejection({
+              previousCount: existing.errorRecoveryRejectionCount,
+              retryable: error.retryable,
+              retryAfterMs: error.retryAfterMs,
+              recoveryToken: decision.recoveryToken,
+            });
+        const state = error.outcomeUnknown
+          ? "outcome_unknown"
+          : rejection?.retry
+            ? "retry_wait"
+            : "rejected";
+        await mutateLifecycle({
+          userId: input.claim.turn.userId,
+          turnId: input.claim.turn.id,
+          leaseToken: input.claim.leaseToken,
+          mutation: {
+            kind: "error_recovery",
+            recoveryToken: decision.recoveryToken,
+            requestHash: decision.requestHash,
+            state,
+            requestId: error.providerRequestId,
+            ...(rejection?.retry ? { retryAfterMs: rejection.delayMs } : {}),
+          },
+        });
+        if (rejection?.retry) return decision;
+        if (!error.outcomeUnknown) {
+          await markAttention({
+            userId: input.claim.turn.userId,
+            turnId: input.claim.turn.id,
+            leaseToken: input.claim.leaseToken,
+            code: "MANUS_V2_ERROR_RECOVERY_REJECTED",
+          });
+          return {
+            kind: "attention_required" as const,
+            taskStatus: "error" as const,
+            code: "MANUS_V2_ERROR_RECOVERY_REJECTED",
+          };
+        }
+        // The POST may have succeeded. Keep this operation read-only until
+        // task history exposes the exact recovery token; never route the lost
+        // response through the ordinary business-send retry path.
+        return decision;
+      }
+      throw error;
+    }
+  }
+  const existing = lifecycleLedger;
+  const sameWaitingEvent = existing.waitingEventId === decision.eventId;
+  if (existing.waitingEventId && !sameWaitingEvent) {
+    if (
+      existing.waitingAttemptState !== "acknowledged" ||
+      !manusV2WaitingEventIsStrictSuccessor({
+        events: input.events,
+        previousEventId: existing.waitingEventId,
+        previousStatusEventId: existing.waitingStatusEventId,
+        nextEventId: decision.eventId,
+        nextStatusEventId: decision.statusEventId,
+      })
+    ) {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_WAITING_EVENT_CONFLICT",
+        waitingEventId: decision.eventId,
+        waitingEventType: decision.eventType,
+      });
+      return {
+        kind: "attention_required" as const,
+        taskStatus: "waiting" as const,
+        code: "MANUS_V2_WAITING_EVENT_CONFLICT",
+        eventId: decision.eventId,
+        eventType: decision.eventType,
+      };
+    }
+  }
+  if (sameWaitingEvent) {
+    const attempt = classifyKnowledgeBaseManusV2WaitingAttempt({
+      attemptState: existing.waitingAttemptState,
+      action: decision.kind,
+      eventId: decision.eventId,
+      statusEventId: existing.waitingStatusEventId || decision.statusEventId,
+      continuationToken:
+        existing.waitingContinuationToken ||
+        (decision.kind === "ask_user_continue"
+          ? decision.continuationToken
+          : undefined),
+      events: input.events,
+    });
+    if (attempt === "settled") return decision;
+    if (attempt === "adopt") {
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "waiting",
+          eventId: decision.eventId,
+          eventType: decision.eventType,
+          statusEventId: decision.statusEventId,
+          action: decision.kind,
+          requestHash: decision.requestHash,
+          continuationToken:
+            decision.kind === "ask_user_continue"
+              ? decision.continuationToken
+              : undefined,
+          state: "acknowledged",
+        },
+      });
+      return decision;
+    }
+    if (attempt === "wait") return decision;
+    await markAttention({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: "MANUS_V2_WAITING_RESPONSE_UNPROVEN",
+      waitingEventId: decision.eventId,
+      waitingEventType: decision.eventType,
+    });
+    return {
+      kind: "attention_required" as const,
+      taskStatus: "waiting" as const,
+      code: "MANUS_V2_WAITING_RESPONSE_UNPROVEN",
+      eventId: decision.eventId,
+      eventType: decision.eventType,
+    };
+  }
+  await mutateLifecycle({
+    userId: input.claim.turn.userId,
+    turnId: input.claim.turn.id,
+    leaseToken: input.claim.leaseToken,
+    mutation: {
+      kind: "waiting",
+      eventId: decision.eventId,
+      eventType: decision.eventType,
+      statusEventId: decision.statusEventId,
+      action: decision.kind,
+      requestHash: decision.requestHash,
+      continuationToken:
+        decision.kind === "ask_user_continue"
+          ? decision.continuationToken
+          : undefined,
+      supersedesEventId:
+        existing.waitingAttemptState === "acknowledged"
+          ? existing.waitingEventId
+          : undefined,
+      state: "sending",
+    },
+  });
+  try {
+    const result =
+      decision.kind === "ask_user_continue"
+        ? await input.client.sendMessage({
+            taskId: input.taskId,
+            prompt: decision.prompt,
+            structuredOutputSchema:
+              buildManusV2KnowledgeBaseStructuredOutputSchema(input.contract),
+          })
+        : await input.client.confirmAction({
+            taskId: input.taskId,
+            eventId: decision.eventId,
+            confirmationInput: decision.confirmationInput,
+          });
+    await mutateLifecycle({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      mutation: {
+        kind: "waiting",
+        eventId: decision.eventId,
+        eventType: decision.eventType,
+        statusEventId: decision.statusEventId,
+        action: decision.kind,
+        requestHash: decision.requestHash,
+        continuationToken:
+          decision.kind === "ask_user_continue"
+            ? decision.continuationToken
+            : undefined,
+        state: "acknowledged",
+        requestId: result.requestId,
+      },
+    });
+  } catch (error) {
+    if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "waiting",
+          eventId: decision.eventId,
+          eventType: decision.eventType,
+          statusEventId: decision.statusEventId,
+          action: decision.kind,
+          requestHash: decision.requestHash,
+          continuationToken:
+            decision.kind === "ask_user_continue"
+              ? decision.continuationToken
+              : undefined,
+          state: "outcome_unknown",
+        },
+      });
+    }
+    throw error;
+  }
+  return decision;
+}
+
+async function repairStoppedManusV2KnowledgeBaseFormat(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  client: ManusV2Client;
+  taskId: string;
+  events: Parameters<typeof buildKnowledgeBaseManusV2FormatRepair>[0]["events"];
+  contract: ManusV2KnowledgeBaseOperationContract;
+  dependencies?: {
+    mutateLifecycle?: typeof mutateKnowledgeBaseManusV2Lifecycle;
+    markAttention?: typeof markKnowledgeBaseManusV2AttentionRequired;
+  };
+}) {
+  const mutateLifecycle =
+    input.dependencies?.mutateLifecycle ?? mutateKnowledgeBaseManusV2Lifecycle;
+  const markAttention =
+    input.dependencies?.markAttention ??
+    markKnowledgeBaseManusV2AttentionRequired;
+  const existing = input.claim.turn.manusV2Lifecycle;
+  if (existing.formatRepairAttemptState) {
+    const repair = buildKnowledgeBaseManusV2FormatRepair({
+      contract: input.contract,
+      events: input.events,
+    });
+    if (
+      !repair ||
+      existing.formatRepairToken !== repair.repairToken ||
+      existing.formatRepairRequestHash !== repair.requestHash
+    ) {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_FORMAT_REPAIR_CONFLICT",
+      });
+      return false;
+    }
+    const attempt = classifyKnowledgeBaseManusV2FormatRepairAttempt({
+      attemptState: existing.formatRepairAttemptState,
+      repairToken: repair.repairToken,
+      events: input.events,
+    });
+    if (attempt === "adopt") {
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "format_repair",
+          repairToken: repair.repairToken,
+          requestHash: repair.requestHash,
+          state: "acknowledged",
+        },
+      });
+    }
+    if (attempt === "attention_required") {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_FORMAT_REPAIR_UNPROVEN",
+      });
+      return false;
+    }
+    // This helper is reached only after the currently visible structured
+    // result was rejected. Once the exact repair message is acknowledged (or
+    // adopted from history), another invalid result exhausts the one repair.
+    await markAttention({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: "MANUS_V2_FORMAT_REPAIR_EXHAUSTED",
+    });
+    return false;
+  }
+  const repair = buildKnowledgeBaseManusV2FormatRepair({
+    contract: input.contract,
+    events: input.events,
+  });
+  if (!repair) return false;
+  await mutateLifecycle({
+    userId: input.claim.turn.userId,
+    turnId: input.claim.turn.id,
+    leaseToken: input.claim.leaseToken,
+    mutation: {
+      kind: "format_repair",
+      repairToken: repair.repairToken,
+      requestHash: repair.requestHash,
+      state: "sending",
+    },
+  });
+  try {
+    const sent = await input.client.sendMessage({
+      taskId: input.taskId,
+      prompt: repair.prompt,
+      structuredOutputSchema: buildManusV2KnowledgeBaseStructuredOutputSchema(
+        input.contract,
+      ),
+    });
+    await mutateLifecycle({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      mutation: {
+        kind: "format_repair",
+        repairToken: repair.repairToken,
+        requestHash: repair.requestHash,
+        state: "acknowledged",
+        requestId: sent.requestId,
+      },
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+      await mutateLifecycle({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        mutation: {
+          kind: "format_repair",
+          repairToken: repair.repairToken,
+          requestHash: repair.requestHash,
+          state: "outcome_unknown",
+        },
+      });
+    }
+    throw error;
+  }
+}
+
+export const knowledgeBaseManusV2LifecycleTestHooks = {
+  reconcile: reconcileKnowledgeBaseManusV2Lifecycle,
+  repairFormat: repairStoppedManusV2KnowledgeBaseFormat,
+};
+
+export async function normalizeManusV2KnowledgeBaseOperationOutput(input: {
+  events: Parameters<typeof normalizeManusV2Output>[0];
+  contract: ManusV2KnowledgeBaseOperationContract;
+  build: NonNullable<
+    Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
+  >;
+  expectedUploadsRead: number;
+}) {
+  const result = manusV2KnowledgeBaseStructuredResultForOperation(
+    input.events,
+    input.contract,
+  );
+  if (!result) return [];
+  if (
+    !input.contract.requiresManifest &&
+    !input.contract.expectContentCompleted
+  ) {
+    const visibleMarkdown = result.value.visibleMarkdown.trim();
+    if (!visibleMarkdown) {
+      throw new ManusV2ApiError(
+        "structured_output",
+        502,
+        "EMPTY_CORE_CONTENT",
+        false,
+        false,
+      );
+    }
+  }
+  const coreOutput = normalizeManusV2Output(input.events, input.contract);
+  const value = result.value;
+  let machinePayload: string;
+  if (input.contract.requiresManifest) {
+    let manifestValue: unknown;
+    try {
+      manifestValue = parseExactJson(value.manifestJson!);
+    } catch {
+      throw new ManusV2ApiError(
+        "structured_output",
+        502,
+        "INVALID_MANIFEST_JSON",
+        false,
+        false,
+      );
+    }
+    const raw =
+      manifestValue &&
+      typeof manifestValue === "object" &&
+      !Array.isArray(manifestValue)
+        ? (manifestValue as Record<string, unknown>)
+        : {};
+    const manifest = validateKnowledgeBaseManifestForTreePolicy(
+      parseKnowledgeBaseManifestEnvelope({
+        kind: KNOWLEDGE_BASE_MANIFEST_KIND,
+        schemaVersion: KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
+        operationId: input.contract.operationToken,
+        turnId: input.contract.turnId,
+        leaves: raw.leaves,
+        ...(raw.officialLogo === undefined
+          ? {}
+          : { officialLogo: raw.officialLogo }),
+        ...(raw.researchCoverage === undefined
+          ? {}
+          : { researchCoverage: raw.researchCoverage }),
+      }),
+      input.build.treePolicyVersion,
+      { expectedUploadsRead: input.expectedUploadsRead },
+    );
+    if (value.nextLeafId !== manifest.leaves[0]?.id) {
+      throw new ManusV2ApiError(
+        "structured_output",
+        409,
+        "NEXT_LEAF_CONFLICT",
+        false,
+        false,
+      );
+    }
+    machinePayload = [
+      formatKnowledgeBaseManifestEnvelope(manifest),
+      formatKnowledgeBasePresentationEnvelope({
+        kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
+        schemaVersion: KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
+        operationId: input.contract.operationToken,
+        turnId: input.contract.turnId,
+        revision: 0,
+        leafId: value.nextLeafId,
+        imageState: "no_eligible_asset",
+        assetIds: [],
+        imageCount: 0,
+      }),
+    ].join("\n\n");
+  } else {
+    const db = await getDb();
+    if (!db) throw new Error("Database is unavailable for Manus v2 reconcile");
+    const nodes = await db
+      .select({
+        leafId: knowledgeBaseBuildNodes.leafId,
+        ordinal: knowledgeBaseBuildNodes.ordinal,
+        status: knowledgeBaseBuildNodes.status,
+      })
+      .from(knowledgeBaseBuildNodes)
+      .where(eq(knowledgeBaseBuildNodes.buildId, input.build.id))
+      .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
+    const currentIndex = nodes.findIndex(
+      (node) => node.leafId === input.contract.fromLeafId,
+    );
+    const currentNode = currentIndex >= 0 ? nodes[currentIndex] : null;
+    if (!currentNode) {
+      throw new ManusV2ApiError(
+        "structured_output",
+        409,
+        "FROM_LEAF_CONFLICT",
+        false,
+        false,
+      );
+    }
+    const transitionTarget =
+      input.contract.action === "confirm"
+        ? "confirmed"
+        : input.contract.action === "direct_prefill"
+          ? "direct_prefilled"
+          : "needs_verification";
+    const serverNextLeafId =
+      transitionTarget === "needs_verification"
+        ? currentNode.leafId
+        : nodes
+            .slice(currentIndex + 1)
+            .find((node) => node.status === "pending")?.leafId || null;
+    if (value.nextLeafId !== serverNextLeafId) {
+      throw new ManusV2ApiError(
+        "structured_output",
+        409,
+        "NEXT_LEAF_CONFLICT",
+        false,
+        false,
+      );
+    }
+    if (input.contract.expectContentCompleted !== (serverNextLeafId === null)) {
+      throw new ManusV2ApiError(
+        "structured_output",
+        409,
+        "COMPLETION_COORDINATE_CONFLICT",
+        false,
+        false,
+      );
+    }
+    machinePayload = [
+      formatKnowledgeBaseProgressEnvelope({
+        kind: KNOWLEDGE_BASE_PROGRESS_KIND,
+        schemaVersion: KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
+        operationId: input.contract.operationToken,
+        turnId: input.contract.turnId,
+        revision: input.contract.baseRevision,
+        transition: {
+          leafId: input.contract.fromLeafId!,
+          from:
+            currentNode.status === "needs_verification"
+              ? "needs_verification"
+              : "current",
+          to: transitionTarget,
+          reason: "Dashboard accepted core Manus v2 result",
+        },
+      }),
+      formatKnowledgeBasePresentationEnvelope({
+        kind: KNOWLEDGE_BASE_PRESENTATION_KIND,
+        schemaVersion: KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
+        operationId: input.contract.operationToken,
+        turnId: input.contract.turnId,
+        revision: input.contract.baseRevision + 1,
+        leafId: serverNextLeafId,
+        imageState:
+          serverNextLeafId === null ? "not_applicable" : "no_eligible_asset",
+        assetIds: [],
+        imageCount: 0,
+      }),
+    ].join("\n\n");
+  }
+  return coreOutput.map((entry) => {
+    const record = entry as Record<string, unknown>;
+    const text = [value.visibleMarkdown, machinePayload]
+      .filter(Boolean)
+      .join("\n\n");
+    return { ...record, text, content: text };
+  });
+}
+
+async function reconcilePolledManusV2KnowledgeBaseTask(input: {
+  userId: number;
+  conversationId: string;
+  taskId: string;
+  apiKey: string;
+  baseUrl: string;
+  build: NonNullable<
+    Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
+  >;
+}) {
+  const client = new ManusV2Client({
+    baseUrl: input.baseUrl,
+    apiKey: input.apiKey,
+  });
+  const events = await client.listAllMessages({
+    taskId: input.taskId,
+    order: "asc",
+  });
+  const taskStatus = latestManusV2TaskState(events) || "running";
+  if (!input.build.activeTurnId) {
+    return { taskStatus, progress: null };
+  }
+  const db = await getDb();
+  if (!db) throw new Error("Database is unavailable for Manus v2 reconcile");
+  const activeTurn = (
+    await db
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, input.build.activeTurnId),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, input.build.id),
+          eq(conversationTurns.buildGeneration, input.build.generation),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (
+    !activeTurn?.operationKey ||
+    !activeTurn.operationType ||
+    activeTurn.buildGeneration === null ||
+    activeTurn.expectedRevision === null
+  ) {
+    return { taskStatus, progress: null };
+  }
+  const allowedActions = new Set<
+    ManusV2KnowledgeBaseOperationContract["action"]
+  >([
+    "start",
+    "confirm",
+    "direct_prefill",
+    "revise",
+    "retry",
+    "legacy_reconcile",
+  ]);
+  const action = activeTurn.operationType as
+    | ManusV2KnowledgeBaseOperationContract["action"]
+    | undefined;
+  if (!action || !allowedActions.has(action)) {
+    return { taskStatus, progress: null };
+  }
+  const metadata =
+    activeTurn.metadata &&
+    typeof activeTurn.metadata === "object" &&
+    !Array.isArray(activeTurn.metadata)
+      ? (activeTurn.metadata as Record<string, unknown>)
+      : {};
+  if (metadata.repairKind === "legacy_anchor_handoff") {
+    // The migration reservation owns only task anchoring. Provider output from
+    // it is never a business transition and must not enter progress reconcile.
+    return { taskStatus, progress: null };
+  }
+  const recovery =
+    metadata.recovery &&
+    typeof metadata.recovery === "object" &&
+    !Array.isArray(metadata.recovery)
+      ? (metadata.recovery as Record<string, unknown>)
+      : {};
+  const operationToken =
+    typeof metadata.operationToken === "string" && metadata.operationToken
+      ? metadata.operationToken
+      : activeTurn.operationKey;
+  const contract: ManusV2KnowledgeBaseOperationContract = {
+    operationToken,
+    turnId: activeTurn.id,
+    generation: activeTurn.buildGeneration,
+    baseRevision: activeTurn.expectedRevision,
+    action,
+    fromLeafId: activeTurn.expectedLeafId,
+    expectContentCompleted:
+      recovery.finalPackageRequired === true ||
+      knowledgeBaseTurnRequiresFinalPackage({
+        skillVersion: input.build.skillVersion,
+        currentLeafId: input.build.currentLeafId,
+        totalNodeCount: input.build.totalNodeCount,
+        confirmedCount: input.build.confirmedCount,
+        directPrefilledCount: input.build.directPrefilledCount,
+        action:
+          action === "start" ||
+          action === "retry" ||
+          action === "legacy_reconcile"
+            ? "initial"
+            : action,
+      }),
+    requiresManifest: input.build.totalNodeCount === 0,
+  };
+  const claim = await claimKnowledgeBaseTurnForRecovery({
+    turnId: activeTurn.id,
+    allowLegacySkill404IncidentRepair:
+      knowledgeBaseManusV2ActiveMigrationEnabled(),
+  });
+  if (claim) {
+    const lifecycle = await reconcileKnowledgeBaseManusV2Lifecycle({
+      claim,
+      build: input.build,
+      client,
+      taskId: input.taskId,
+      events,
+      contract,
+    });
+    if (lifecycle.kind !== "stopped") {
+      return { taskStatus, progress: null };
+    }
+  } else if (taskStatus !== "stopped") {
+    return { taskStatus, progress: null };
+  }
+  let output: Awaited<
+    ReturnType<typeof normalizeManusV2KnowledgeBaseOperationOutput>
+  >;
+  try {
+    output = await normalizeManusV2KnowledgeBaseOperationOutput({
+      events,
+      contract,
+      build: input.build,
+      expectedUploadsRead: input.build.lastTurnAttachmentCount,
+    });
+  } catch (error) {
+    if (
+      !(
+        claim &&
+        taskStatus === "stopped" &&
+        error instanceof ManusV2ApiError &&
+        isRepairableKnowledgeBaseManusV2FormatCode(error.code)
+      )
+    ) {
+      throw error;
+    }
+    await repairStoppedManusV2KnowledgeBaseFormat({
+      claim,
+      client,
+      taskId: input.taskId,
+      events,
+      contract,
+    });
+    return { taskStatus, progress: null };
+  }
+  if (
+    output.length === 0 ||
+    !shouldReconcileKnowledgeOutput(output, taskStatus)
+  ) {
+    if (claim && taskStatus === "stopped") {
+      await repairStoppedManusV2KnowledgeBaseFormat({
+        claim,
+        client,
+        taskId: input.taskId,
+        events,
+        contract,
+      });
+    }
+    return { taskStatus, progress: null };
+  }
+  const progress = await reconcileAvailableKnowledgeOutput({
+    userId: input.userId,
+    conversationId: input.conversationId,
+    taskId: input.taskId,
+    output,
+    upstreamStatus: taskStatus,
+    ledger: {
+      lastOutputLength: input.build.lastOutputLength,
+      lastOutputItemIds: input.build.lastOutputItemIds,
+    },
+    artifactAccess: { apiKey: input.apiKey, baseUrl: input.baseUrl },
+  });
+  return { taskStatus, progress };
+}
+
+type KnowledgeBaseManusV2HandoffSnapshot = {
+  schemaVersion: 1;
+  purpose: "legacy_to_manus_v2_handoff";
+  build: {
+    id: string;
+    generation: number;
+    revision: number;
+    currentLeafId: string | null;
+    skillName: string;
+    skillVersion: string;
+    skillContentHash: string | null;
+    skillArchiveSha256: string | null;
+    treePolicyVersion: number;
+  };
+  nodes: Array<{
+    leafId: string;
+    branchId: string;
+    branchTitle: string;
+    title: string;
+    ordinal: number;
+    status: string;
+    contentMarkdown: string | null;
+    contentSha256: string | null;
+    lastUserInput: string | null;
+  }>;
+  acceptedReceipts: Array<{
+    sequence: number;
+    turnId: string | null;
+    kind: string;
+    generation: number;
+    revision: number | null;
+    leafId: string | null;
+    content: string;
+    contentSha256: string;
+  }>;
+  pendingOperation: {
+    turnId: string;
+    operationToken: string;
+    action: string;
+    baseRevision: number;
+    fromLeafId: string | null;
+    userInput: string;
+    attachmentManifest: unknown[];
+  };
+};
+
+async function buildKnowledgeBaseManusV2HandoffSnapshot(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  build: NonNullable<
+    Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
+  >;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is unavailable for Manus v2 handoff");
+  const persistedConversationId = input.claim.turn.conversationId;
+  const nodes = await db
+    .select({
+      leafId: knowledgeBaseBuildNodes.leafId,
+      branchId: knowledgeBaseBuildNodes.branchId,
+      branchTitle: knowledgeBaseBuildNodes.branchTitle,
+      title: knowledgeBaseBuildNodes.title,
+      ordinal: knowledgeBaseBuildNodes.ordinal,
+      status: knowledgeBaseBuildNodes.status,
+      contentMarkdown: knowledgeBaseBuildNodes.contentMarkdown,
+      contentSha256: knowledgeBaseBuildNodes.contentSha256,
+      lastUserInput: knowledgeBaseBuildNodes.lastUserInput,
+    })
+    .from(knowledgeBaseBuildNodes)
+    .where(eq(knowledgeBaseBuildNodes.buildId, input.build.id))
+    .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
+  const acceptedReceipts = await db
+    .select({
+      id: messages.id,
+      conversationId: messages.conversationId,
+      userId: messages.userId,
+      role: messages.role,
+      sequence: messages.sequence,
+      turnId: messages.turnId,
+      content: messages.content,
+      metadata: messages.metadata,
+    })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.userId, input.claim.turn.userId),
+        eq(messages.conversationId, persistedConversationId),
+        eq(messages.role, "assistant"),
+        isNull(messages.deletedAt),
+      ),
+    )
+    .orderBy(asc(messages.sequence));
+  const receiptTurnIds = [
+    ...new Set(
+      acceptedReceipts.flatMap((message) =>
+        message.turnId ? [message.turnId] : [],
+      ),
+    ),
+  ];
+  const receiptTurns =
+    receiptTurnIds.length > 0
+      ? await db
+          .select({
+            id: conversationTurns.id,
+            conversationId: conversationTurns.conversationId,
+            userId: conversationTurns.userId,
+            clientRequestId: conversationTurns.clientRequestId,
+            buildId: conversationTurns.buildId,
+            buildGeneration: conversationTurns.buildGeneration,
+            operationKey: conversationTurns.operationKey,
+            expectedRevision: conversationTurns.expectedRevision,
+            expectedLeafId: conversationTurns.expectedLeafId,
+            status: conversationTurns.status,
+          })
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.userId, input.claim.turn.userId),
+              eq(conversationTurns.buildId, input.build.id),
+              inArray(conversationTurns.id, receiptTurnIds),
+            ),
+          )
+      : [];
+  const receiptTurnsById = new Map(receiptTurns.map((turn) => [turn.id, turn]));
+  const snapshot: KnowledgeBaseManusV2HandoffSnapshot = {
+    schemaVersion: 1,
+    purpose: "legacy_to_manus_v2_handoff",
+    build: {
+      id: input.build.id,
+      generation: input.build.generation,
+      revision: input.build.revision,
+      currentLeafId: input.build.currentLeafId,
+      skillName: input.build.skillName,
+      skillVersion: input.build.skillVersion,
+      skillContentHash: input.build.skillContentHash,
+      skillArchiveSha256: input.build.skillArchiveSha256,
+      treePolicyVersion: input.build.treePolicyVersion,
+    },
+    nodes: nodes.map((node) => ({ ...node })),
+    acceptedReceipts: acceptedReceipts.flatMap((message) => {
+      const metadata = parsedKnowledgeBaseMessageMetadata(message.metadata);
+      if (
+        !metadata ||
+        metadata.buildId !== input.build.id ||
+        typeof metadata.generation !== "number" ||
+        metadata.generation > input.build.generation ||
+        (metadata.kind !== "presentation" && metadata.kind !== "completion") ||
+        !message.turnId ||
+        !matchesAuthoritativeKnowledgeBaseMessageTuple({
+          message,
+          knowledgeBase: metadata,
+          turn: receiptTurnsById.get(message.turnId),
+          build: input.build,
+          publicConversationId: input.build.conversationId,
+        })
+      ) {
+        return [];
+      }
+      const content = String(message.content || "").trim();
+      return [
+        {
+          sequence: message.sequence,
+          turnId: message.turnId,
+          kind: String(metadata.kind),
+          generation: metadata.generation,
+          revision:
+            typeof metadata.revision === "number" ? metadata.revision : null,
+          leafId: typeof metadata.leafId === "string" ? metadata.leafId : null,
+          content,
+          contentSha256: createHash("sha256").update(content).digest("hex"),
+        },
+      ];
+    }),
+    pendingOperation: {
+      turnId: input.claim.turn.id,
+      operationToken: input.claim.turn.operationToken,
+      action: input.claim.turn.operationType,
+      baseRevision: input.claim.turn.expectedRevision,
+      fromLeafId: input.claim.turn.expectedLeafId,
+      userInput: String(input.build.lastTurnUserText || ""),
+      attachmentManifest: Array.isArray(
+        input.claim.recoveryMetadata.attachmentManifest,
+      )
+        ? input.claim.recoveryMetadata.attachmentManifest
+        : [],
+    },
+  };
+  const json = JSON.stringify(snapshot);
+  return {
+    snapshot,
+    json,
+    sha256: createHash("sha256").update(json).digest("hex"),
+  };
+}
+
+function appendKnowledgeBaseManusV2HandoffSnapshot(
+  prompt: string,
+  handoff: Awaited<ReturnType<typeof buildKnowledgeBaseManusV2HandoffSnapshot>>,
+) {
+  return [
+    "# FrontMind legacy build handoff",
+    "This is the only self-contained authority for the prior build. Continue the pending operation in this same task; do not require access to or repeat content from an old task.",
+    `snapshotSha256=${handoff.sha256}`,
+    "```json",
+    handoff.json,
+    "```",
+    "",
+    prompt,
+  ].join("\n");
+}
+
 async function dispatchKnowledgeBaseRecoveryClaim(
   claim: KnowledgeBaseRecoveryClaim,
   credential: RecoveryCredential,
 ) {
   beginKnowledgeBaseClaimReadinessTiming(claim);
+  let existingBuild = await loadKnowledgeBaseBuildRecordById(
+    claim.turn.userId,
+    claim.turn.buildId,
+  );
+  let handoff: Awaited<
+    ReturnType<typeof buildKnowledgeBaseManusV2HandoffSnapshot>
+  > | null = null;
+  if (
+    knowledgeBaseManusV2ActiveMigrationEnabled() &&
+    existingBuild?.providerProtocol === "legacy_v1" &&
+    claim.turn.createAttemptState === "not_sent" &&
+    !claim.turn.upstreamTaskId &&
+    ["researching", "confirming", "protocol_error"].includes(
+      existingBuild.status,
+    )
+  ) {
+    handoff = await buildKnowledgeBaseManusV2HandoffSnapshot({
+      claim,
+      build: existingBuild,
+    });
+    await activateKnowledgeBaseManusV2Handoff({
+      userId: claim.turn.userId,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      expectedGeneration: claim.turn.buildGeneration,
+      expectedRevision: claim.turn.expectedRevision,
+      expectedLeafId: claim.turn.expectedLeafId,
+      snapshotSha256: handoff.sha256,
+      legacyTaskIdSha256: existingBuild.upstreamTaskId
+        ? createHash("sha256")
+            .update(existingBuild.upstreamTaskId)
+            .digest("hex")
+        : null,
+    });
+    claim.turn.providerProtocol = "manus_v2";
+    claim.turn.providerAttemptState = "not_sent";
+    existingBuild = await loadKnowledgeBaseBuildRecordById(
+      claim.turn.userId,
+      claim.turn.buildId,
+    );
+  }
+  if (
+    existingBuild?.providerProtocol === "manus_v2" &&
+    !existingBuild.canonicalTaskId &&
+    claim.turn.createAttemptState === "not_sent" &&
+    claim.turn.providerAttemptState === "not_sent" &&
+    existingBuild.handoffProvenance &&
+    typeof existingBuild.handoffProvenance === "object" &&
+    !Array.isArray(existingBuild.handoffProvenance)
+  ) {
+    // Crash-safe continuation of a cutover committed before task.create. The
+    // snapshot is deterministically rebuilt from durable receipts/nodes and
+    // must match the digest committed by the cutover transaction.
+    const rebuilt = await buildKnowledgeBaseManusV2HandoffSnapshot({
+      claim,
+      build: existingBuild,
+    });
+    if (existingBuild.handoffProvenance.snapshotSha256 !== rebuilt.sha256) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The durable Manus v2 handoff snapshot changed before task creation",
+      );
+    }
+    handoff = rebuilt;
+  }
+  if (existingBuild?.providerProtocol === "manus_v2") {
+    const recoveryAuthority = knowledgeBaseManusV2RecoveryAuthority({
+      canonicalTaskId: existingBuild.canonicalTaskId,
+      createAttemptState: claim.turn.createAttemptState,
+      providerAttemptState: claim.turn.providerAttemptState,
+    });
+    if (recoveryAuthority === "deferred_disabled") {
+      throw new KnowledgeBaseManusV2RolloutDeferredError();
+    }
+    if (recoveryAuthority === "reconcile_only") {
+      const client = new ManusV2Client({
+        baseUrl: claim.preparedDispatch?.baseUrl || getUpstreamBaseUrl(),
+        apiKey: credential.apiKey,
+      });
+      let taskId = existingBuild.canonicalTaskId;
+      if (!taskId && claim.turn.providerMethod === "task.create") {
+        const preparedAtSeconds = claim.preparedDispatch?.preparedAt
+          ? Math.floor(Date.parse(claim.preparedDispatch.preparedAt) / 1_000)
+          : undefined;
+        const reconciled = await client.findCreatedTask({
+          title: `FrontMind KB ${existingBuild.id} g${existingBuild.generation}`,
+          operationToken: claim.turn.operationToken,
+          ...(preparedAtSeconds
+            ? {
+                createdAfterSeconds: preparedAtSeconds - 300,
+                createdBeforeSeconds: preparedAtSeconds + 3_600,
+              }
+            : {}),
+        });
+        if (!reconciled.unique) {
+          throw new ManusV2ApiError(
+            "task.create.reconcile",
+            null,
+            reconciled.matches.length > 1
+              ? "AMBIGUOUS_CREATE"
+              : "CREATE_NOT_OBSERVED",
+            true,
+            true,
+          );
+        }
+        taskId = reconciled.unique.id;
+        await bindKnowledgeBaseManusV2Submission({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          method: "task.create",
+          taskId,
+          taskUrl: reconciled.unique.taskUrl,
+        });
+        claim.turn.upstreamTaskId = taskId;
+      }
+      if (!taskId) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The Manus v2 operation has no canonical task to reconcile",
+        );
+      }
+      const events = await client.listAllMessages({
+        taskId,
+        order: "asc",
+      });
+      if (
+        !manusV2EventsContainOperationToken(events, claim.turn.operationToken)
+      ) {
+        throw new ManusV2ApiError(
+          "task.sendMessage.reconcile",
+          null,
+          "OPERATION_NOT_OBSERVED",
+          true,
+          true,
+        );
+      }
+      if (
+        claim.turn.providerMethod === "task.sendMessage" &&
+        !claim.turn.upstreamTaskId
+      ) {
+        await bindKnowledgeBaseManusV2Submission({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          method: "task.sendMessage",
+          taskId,
+        });
+        claim.turn.upstreamTaskId = taskId;
+      }
+      const contract = manusV2ContractForTurn({ claim, build: existingBuild });
+      const output = await normalizeManusV2KnowledgeBaseOperationOutput({
+        events,
+        contract,
+        build: existingBuild,
+        expectedUploadsRead: existingBuild.lastTurnAttachmentCount,
+      });
+      const status = latestManusV2TaskState(events) || "running";
+      const reconciled =
+        output.length > 0 && shouldReconcileKnowledgeOutput(output, status)
+          ? await reconcileRecoveredKnowledgeBaseTask({
+              claim,
+              credential,
+              taskId,
+            })
+          : false;
+      return { taskId, rebound: false, reconciled };
+    }
+    const prepared = await ensureKnowledgeBaseRecoveryDispatch({
+      claim,
+      credential,
+    });
+    const v2Attachments = await ensureKnowledgeBaseManusV2Attachments({
+      claim,
+      credential,
+      baseUrl: prepared.baseUrl,
+    });
+    if (
+      v2Attachments.length !== prepared.requestBody.attachments.length ||
+      v2Attachments.some(
+        (attachment, index) =>
+          !attachment.file_id ||
+          attachment.filename !==
+            prepared.requestBody.attachments[index]?.filename,
+      )
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The complete Manus v2 ready attachment ledger is required",
+      );
+    }
+    const contract = manusV2ContractForTurn({ claim, build: existingBuild });
+    const structuredOutputSchema =
+      buildManusV2KnowledgeBaseStructuredOutputSchema(contract);
+    const businessPrompt = handoff
+      ? appendKnowledgeBaseManusV2HandoffSnapshot(
+          prepared.requestBody.prompt,
+          handoff,
+        )
+      : prepared.requestBody.prompt;
+    const v2Prompt = appendManusV2KnowledgeBaseOperationContract(
+      businessPrompt,
+      contract,
+    );
+    const v2BodyHash = createHash("sha256")
+      .update(
+        JSON.stringify({
+          prompt: v2Prompt,
+          attachments: v2Attachments,
+          agentProfile: prepared.requestBody.agentProfile,
+          operationToken: claim.turn.operationKey,
+          structuredOutputSchema,
+        }),
+      )
+      .digest("hex");
+    const authority = await beginKnowledgeBaseManusV2Dispatch({
+      userId: claim.turn.userId,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      frozenProviderRequestHash: v2BodyHash,
+      leaseMs: 300_000,
+    });
+    claim.turn.providerProtocol = "manus_v2";
+    claim.turn.providerMethod = authority.method;
+    claim.turn.providerAttemptState = "sending";
+    claim.turn.operationToken = authority.operationToken;
+    const client = new ManusV2Client({
+      baseUrl: prepared.baseUrl,
+      apiKey: credential.apiKey,
+    });
+    let taskId = authority.canonicalTaskId;
+    let taskUrl: string | null = existingBuild.canonicalTaskUrl;
+    let requestId: string | null = null;
+    try {
+      if (authority.method === "task.create") {
+        const created = await client.createTask({
+          prompt: v2Prompt,
+          attachments: v2Attachments,
+          title: authority.title,
+          agentProfile: prepared.requestBody.agentProfile,
+          structuredOutputSchema,
+          hideInTaskList: true,
+        });
+        taskId = created.taskId;
+        taskUrl = created.taskUrl;
+        requestId = created.requestId;
+      } else {
+        if (!taskId) {
+          throw new KnowledgeBaseTurnReservationError(
+            "CONFLICT",
+            "The canonical Manus task is missing",
+          );
+        }
+        const sent = await client.sendMessage({
+          taskId,
+          prompt: v2Prompt,
+          attachments: v2Attachments,
+          structuredOutputSchema,
+        });
+        requestId = sent.requestId;
+      }
+    } catch (error) {
+      if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+        await markKnowledgeBaseManusV2OutcomeUnknown({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          code:
+            authority.method === "task.create"
+              ? "MANUS_V2_CREATE_OUTCOME_UNKNOWN"
+              : "MANUS_V2_SEND_OUTCOME_UNKNOWN",
+        });
+      }
+      throw error;
+    }
+    // The provider has acknowledged the side effect, but its local binding is
+    // still fallible. Reflect that boundary on the in-memory claim so an error
+    // from the following transaction is persisted as outcome-unknown and can
+    // only be reconciled; it must never be treated as a pre-POST failure.
+    claim.turn.providerAttemptState = "output_pending";
+    if (!taskId) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The Manus v2 task acknowledgement is missing its task id",
+      );
+    }
+    await bindKnowledgeBaseManusV2Submission({
+      userId: claim.turn.userId,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      method: authority.method,
+      taskId,
+      taskUrl,
+      manusRequestId: requestId,
+    });
+    claim.turn.createAttemptState = "acknowledged";
+    claim.turn.providerAttemptState = "output_pending";
+    claim.turn.upstreamTaskId = taskId;
+    // task.create ownership is committed atomically with the canonical anchor
+    // by bindKnowledgeBaseManusV2Submission. A second best-effort registration
+    // here would reintroduce the bind/ownership crash window and, for project
+    // scoped historical rows, could attempt to rewrite the exact scope.
+    await promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(claim);
+    // task.create/sendMessage are asynchronous. The first read frequently has
+    // only running status; the normal recovery worker will keep polling the
+    // same canonical task until an accepted output appears.
+    const reconciled = await reconcileRecoveredKnowledgeBaseTask({
+      claim,
+      credential,
+      taskId,
+    });
+    void client.updateTaskVisibility(taskId, true).catch(() => undefined);
+    return { taskId, rebound: authority.method === "task.create", reconciled };
+  }
   return recoverKnowledgeBaseTurnClaimTask({
     claim,
     ensureDispatch: () =>
@@ -2961,6 +4816,1164 @@ async function dispatchKnowledgeBaseRecoveryClaim(
   });
 }
 
+type KnowledgeBaseActiveLegacyMigrationCandidate = {
+  id: string;
+  userId: number;
+  generation: number;
+  stateEpoch: number;
+  revision: number;
+  currentLeafId: string | null;
+  status: string;
+  activeTurnId: string | null;
+  activeTurnStatus: string | null;
+  upstreamTaskId: string | null;
+  createAttemptState: string | null;
+};
+
+export type KnowledgeBaseActiveLegacyMigrationDisposition =
+  | "migrate_anchor"
+  | "existing_not_sent_turn"
+  | "legacy_outcome_unknown"
+  | "excluded";
+
+/** Pure policy used by both the sweep and its fault-matrix tests. */
+export function classifyKnowledgeBaseActiveLegacyMigration(
+  candidate: Pick<
+    KnowledgeBaseActiveLegacyMigrationCandidate,
+    "status" | "activeTurnId" | "createAttemptState"
+  >,
+): KnowledgeBaseActiveLegacyMigrationDisposition {
+  if (!candidate.status) {
+    return "excluded";
+  }
+  if (!candidate.activeTurnId) {
+    // `confirming` with no active turn is the durable awaiting-input state.
+    // `researching` still represents an unsettled legacy provider operation;
+    // the open-recovery worker must first accept or definitively reconcile its
+    // output. Creating an anchor here could race that output and would let the
+    // generic recovery path misinterpret the handoff acknowledgement.
+    if (candidate.status === "confirming") return "migrate_anchor";
+    if (candidate.status === "researching") return "legacy_outcome_unknown";
+    // A build-local protocol error with no active writer still has a complete
+    // self-contained Dashboard state. Migrate that state to one v2 anchor;
+    // keeping it as an eternally "active legacy" row would make rollout
+    // convergence impossible without improving customer recovery.
+    if (candidate.status === "protocol_error") return "migrate_anchor";
+    return "excluded";
+  }
+  // A failed pre-dispatch confirmation repair is still a provably not-sent
+  // operation. In particular, protocol_error must not strand the 15:52-style
+  // replacement turn merely because the build-local status was downgraded.
+  if (
+    !["researching", "confirming", "protocol_error"].includes(candidate.status)
+  ) {
+    return "excluded";
+  }
+  if ((candidate.createAttemptState || "not_sent") === "not_sent") {
+    return "existing_not_sent_turn";
+  }
+  return ["sending", "unknown", "acknowledged"].includes(
+    String(candidate.createAttemptState),
+  )
+    ? "legacy_outcome_unknown"
+    : "excluded";
+}
+
+type KnowledgeBaseCanonicalCredentialRebindCandidate = {
+  id: string;
+  userId: number;
+  generation: number;
+  stateEpoch: number;
+  revision: number;
+  currentLeafId: string | null;
+  status: string;
+  activeTurnId: string | null;
+  canonicalTaskId: string | null;
+  canonicalTaskGeneration: number | null;
+  canonicalCredentialId: string | null;
+  canonicalTaskState: string;
+  protocolErrorCode: string | null;
+  credentialStatus: string | null;
+  resourceTaskId: string | null;
+  resourceCredentialId: string | null;
+  resourceUserId: number | null;
+  resourceProjectAssignmentId: string | null;
+  conversationUserId: number | null;
+  conversationProjectAssignmentId: string | null;
+  conversationStatus: string | null;
+  conversationDeletedAt: Date | null;
+};
+
+export function classifyKnowledgeBaseManusV2CredentialRebind(
+  candidate: KnowledgeBaseCanonicalCredentialRebindCandidate,
+) {
+  if (
+    candidate.conversationUserId !== candidate.userId ||
+    candidate.conversationStatus !== "awaiting_input" ||
+    candidate.conversationDeletedAt !== null
+  ) {
+    return "excluded";
+  }
+  return classifyKnowledgeBaseCanonicalCredentialRebind({
+    providerProtocol: "manus_v2",
+    status: candidate.status,
+    activeTurnId: candidate.activeTurnId,
+    canonicalTaskId: candidate.canonicalTaskId,
+    canonicalTaskGeneration: candidate.canonicalTaskGeneration,
+    canonicalCredentialId: candidate.canonicalCredentialId,
+    canonicalTaskState: candidate.canonicalTaskState,
+    protocolErrorCode: candidate.protocolErrorCode,
+    generation: candidate.generation,
+    credentialStatus: candidate.credentialStatus,
+    resourceTaskId: candidate.resourceTaskId,
+    resourceCredentialId: candidate.resourceCredentialId,
+    resourceUserId: candidate.resourceUserId,
+    userId: candidate.userId,
+    resourceProjectAssignmentId: candidate.resourceProjectAssignmentId,
+    conversationProjectAssignmentId: candidate.conversationProjectAssignmentId,
+  });
+}
+
+function anchorHandoffStructuredOutputSchema(input: {
+  operationToken: string;
+  turnId: string;
+  generation: number;
+  baseRevision: number;
+}) {
+  return {
+    type: "object",
+    properties: {
+      schemaVersion: { type: "integer", enum: [1] },
+      operationToken: { type: "string", enum: [input.operationToken] },
+      turnId: { type: "string", enum: [input.turnId] },
+      generation: { type: "integer", enum: [input.generation] },
+      baseRevision: { type: "integer", enum: [input.baseRevision] },
+      handoffAccepted: { type: "boolean", enum: [true] },
+    },
+    required: [
+      "schemaVersion",
+      "operationToken",
+      "turnId",
+      "generation",
+      "baseRevision",
+      "handoffAccepted",
+    ],
+    additionalProperties: false,
+  };
+}
+
+async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  credential: NonNullable<
+    Awaited<ReturnType<typeof getEffectiveDecryptedCredentialForAccount>>
+  >;
+}) {
+  const { claim, credential } = input;
+  const prepared = claim.preparedDispatch;
+  if (!prepared || prepared.requestBody.attachments.length !== 0) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The hidden anchor handoff does not have its frozen request",
+    );
+  }
+  let build = await loadKnowledgeBaseBuildRecordById(
+    claim.turn.userId,
+    claim.turn.buildId,
+  );
+  if (
+    !build ||
+    build.generation !== claim.turn.buildGeneration ||
+    build.providerProtocol !== "manus_v2" ||
+    build.activeTurnId !== claim.turn.id
+  ) {
+    return { bound: false, reconciled: false };
+  }
+  // The handoff snapshot is self-contained, but the build must still prove
+  // its exact physical Skill archive before creating a new canonical writer.
+  // Historical rows are durably backfilled here while the operation remains
+  // strictly before its first provider side effect.
+  await ensureKnowledgeBaseBuildSkillArchivePin({
+    userId: claim.turn.userId,
+    buildId: build.id,
+    generation: build.generation,
+  });
+  build = await loadKnowledgeBaseBuildRecordById(
+    claim.turn.userId,
+    claim.turn.buildId,
+  );
+  if (
+    !build ||
+    build.generation !== claim.turn.buildGeneration ||
+    build.providerProtocol !== "manus_v2" ||
+    build.activeTurnId !== claim.turn.id
+  ) {
+    return { bound: false, reconciled: false };
+  }
+  const client = new ManusV2Client({
+    baseUrl: prepared.baseUrl,
+    apiKey: credential.apiKey,
+  });
+  const title = `FrontMind KB ${build.id} g${build.generation}`;
+  const structuredOutputSchema = anchorHandoffStructuredOutputSchema({
+    operationToken: claim.turn.operationToken,
+    turnId: claim.turn.id,
+    generation: claim.turn.buildGeneration,
+    baseRevision: claim.turn.expectedRevision,
+  });
+  const attempt = (claim.turn.providerAttemptState || "not_sent") as
+    | "not_sent"
+    | "sending"
+    | "outcome_unknown"
+    | "output_pending";
+  let authorityTitle = title;
+  let reconciledMatchCount = 0;
+  const settled = await executeKnowledgeBaseAnchorHandoff({
+    attempt,
+    canonicalTask: build.canonicalTaskId
+      ? {
+          id: build.canonicalTaskId,
+          taskUrl: build.canonicalTaskUrl,
+        }
+      : null,
+    beginCreate: async () => {
+      const bodyHash = createHash("sha256")
+        .update(
+          JSON.stringify({
+            prompt: prepared.requestBody.prompt,
+            attachments: [],
+            agentProfile: prepared.requestBody.agentProfile,
+            operationToken: claim.turn.operationToken,
+            structuredOutputSchema,
+          }),
+        )
+        .digest("hex");
+      const authority = await beginKnowledgeBaseManusV2Dispatch({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        frozenProviderRequestHash: bodyHash,
+        leaseMs: 300_000,
+      });
+      if (authority.method !== "task.create" || authority.canonicalTaskId) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The anchor handoff unexpectedly selected a continuation",
+        );
+      }
+      authorityTitle = authority.title;
+    },
+    createTask: async () => {
+      const created = await client.createTask({
+        prompt: prepared.requestBody.prompt,
+        attachments: [],
+        title: authorityTitle,
+        agentProfile: prepared.requestBody.agentProfile,
+        structuredOutputSchema,
+        hideInTaskList: true,
+      });
+      return {
+        id: created.taskId,
+        taskUrl: created.taskUrl,
+        requestId: created.requestId,
+      };
+    },
+    reconcileCreate: async () => {
+      // `sending`, `outcome_unknown` and `output_pending` all mean the POST
+      // may have crossed the boundary. This callback is read-only.
+      const preparedAtSeconds = Math.floor(
+        Date.parse(prepared.preparedAt) / 1_000,
+      );
+      const matched = await client.findCreatedTask({
+        title,
+        operationToken: claim.turn.operationToken,
+        createdAfterSeconds: preparedAtSeconds - 300,
+        createdBeforeSeconds: preparedAtSeconds + 3_600,
+      });
+      reconciledMatchCount = matched.matches.length;
+      return matched.matches;
+    },
+    bindTask: (task) =>
+      bindKnowledgeBaseManusV2Submission({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        method: "task.create",
+        taskId: task.id,
+        taskUrl: task.taskUrl,
+        manusRequestId: task.requestId,
+      }).then(() => undefined),
+    settleAcknowledgement: async (task) => {
+      // Binding proves only one canonical writer. Never release this hidden
+      // turn until task.listMessages proves the exact asynchronous handoff
+      // acknowledgement for its immutable operation coordinates.
+      const events = await client.listAllMessages({
+        taskId: task.id,
+        order: "asc",
+      });
+      const expected = {
+        operationToken: claim.turn.operationToken,
+        turnId: claim.turn.id,
+        generation: claim.turn.buildGeneration,
+        baseRevision: claim.turn.expectedRevision,
+      };
+      const acknowledgement = inspectKnowledgeBaseAnchorAcknowledgement({
+        events,
+        expected,
+      });
+      const status = latestManusV2TaskState(events) || "running";
+      if (acknowledgement.kind === "missing" && status === "error") {
+        const recoveryCoordinates = {
+          operationToken: claim.turn.operationToken,
+          turnId: claim.turn.id,
+          generation: claim.turn.buildGeneration,
+          baseRevision: claim.turn.expectedRevision,
+        };
+        const recovery =
+          buildKnowledgeBaseManusV2AnchorErrorRecovery(recoveryCoordinates);
+        const existing = claim.turn.manusV2Lifecycle;
+        if (
+          existing.errorRecoveryToken &&
+          (existing.errorRecoveryToken !== recovery.recoveryToken ||
+            existing.errorRecoveryRequestHash !== recovery.requestHash)
+        ) {
+          await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            code: "MANUS_V2_ANCHOR_ERROR_RECOVERY_CONFLICT",
+          });
+          return "attention_required";
+        }
+        const recoveryAttempt =
+          classifyKnowledgeBaseManusV2ErrorRecoveryAttempt({
+            attemptState: existing.errorRecoveryAttemptState,
+            recoveryToken: recovery.recoveryToken,
+            events,
+            nextRetryAt: existing.errorRecoveryNextRetryAt,
+          });
+        if (recoveryAttempt === "adopt") {
+          await mutateKnowledgeBaseManusV2Lifecycle({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            mutation: {
+              kind: "error_recovery",
+              recoveryToken: recovery.recoveryToken,
+              requestHash: recovery.requestHash,
+              state: "acknowledged",
+            },
+          });
+          await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            taskId: task.id,
+          });
+          return "output_pending";
+        }
+        if (recoveryAttempt === "wait") {
+          await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            taskId: task.id,
+          });
+          return "output_pending";
+        }
+        if (recoveryAttempt === "attention_required") {
+          await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            code: "MANUS_V2_ANCHOR_ERROR_RECOVERY_REJECTED",
+          });
+          return "attention_required";
+        }
+        await mutateKnowledgeBaseManusV2Lifecycle({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          mutation: {
+            kind: "error_recovery",
+            recoveryToken: recovery.recoveryToken,
+            requestHash: recovery.requestHash,
+            state: "sending",
+          },
+        });
+        try {
+          const sent = await client.sendMessage({
+            taskId: task.id,
+            prompt: recovery.prompt,
+            structuredOutputSchema,
+          });
+          await mutateKnowledgeBaseManusV2Lifecycle({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            mutation: {
+              kind: "error_recovery",
+              recoveryToken: recovery.recoveryToken,
+              requestHash: recovery.requestHash,
+              state: "acknowledged",
+              requestId: sent.requestId,
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof ManusV2ApiError)) throw error;
+          const rejection = error.outcomeUnknown
+            ? null
+            : knowledgeBaseManusV2ErrorRecoveryRejection({
+                previousCount: existing.errorRecoveryRejectionCount,
+                retryable: error.retryable,
+                retryAfterMs: error.retryAfterMs,
+                recoveryToken: recovery.recoveryToken,
+              });
+          await mutateKnowledgeBaseManusV2Lifecycle({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            mutation: {
+              kind: "error_recovery",
+              recoveryToken: recovery.recoveryToken,
+              requestHash: recovery.requestHash,
+              state: error.outcomeUnknown
+                ? "outcome_unknown"
+                : rejection?.retry
+                  ? "retry_wait"
+                  : "rejected",
+              requestId: error.providerRequestId,
+              ...(rejection?.retry ? { retryAfterMs: rejection.delayMs } : {}),
+            },
+          });
+          if (!error.outcomeUnknown && !rejection?.retry) {
+            await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+              userId: claim.turn.userId,
+              turnId: claim.turn.id,
+              leaseToken: claim.leaseToken,
+              code: "MANUS_V2_ANCHOR_ERROR_RECOVERY_REJECTED",
+            });
+            return "attention_required";
+          }
+        }
+        await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          taskId: task.id,
+        });
+        return "output_pending";
+      }
+      if (acknowledgement.kind === "accepted") {
+        if (
+          !manusV2EventsContainOperationToken(events, claim.turn.operationToken)
+        ) {
+          await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            code: "MANUS_V2_ANCHOR_ACK_NOT_ATTRIBUTED",
+          });
+          return "attention_required";
+        }
+        await completeKnowledgeBaseManusV2AnchorHandoff({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          taskId: task.id,
+          acknowledgement: acknowledgement.acknowledgement,
+        });
+        void client.updateTaskVisibility(task.id, true).catch(() => undefined);
+        return "completed";
+      }
+      const settlement = classifyKnowledgeBaseAnchorAcknowledgementSettlement({
+        inspection: acknowledgement,
+        taskStatus: status,
+      });
+      if (settlement.state === "attention_required") {
+        await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          code: settlement.code,
+        });
+        return "attention_required";
+      }
+      if (settlement.state === "output_pending") {
+        await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          taskId: task.id,
+        });
+        return "output_pending";
+      }
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The anchor acknowledgement settlement was inconsistent",
+      );
+    },
+    classifyCreateFailure: (error) => {
+      if (!(error instanceof ManusV2ApiError)) return "other";
+      if (error.outcomeUnknown) return "outcome_unknown";
+      return error.retryable ? "retryable_rejection" : "terminal_rejection";
+    },
+    markOutcomeUnknown: () =>
+      markKnowledgeBaseManusV2OutcomeUnknown({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        code: "MANUS_V2_CREATE_OUTCOME_UNKNOWN",
+      }),
+    markRetryableRejection: (error?: unknown) =>
+      deferKnowledgeBaseManusV2AnchorHandoffAfterRejection({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        code: "MANUS_V2_ANCHOR_CREATE_RETRYABLE",
+        ...(error instanceof ManusV2ApiError && error.retryAfterMs !== null
+          ? { recoveryDelayMs: error.retryAfterMs }
+          : {}),
+      }),
+    markTerminalRejection: () =>
+      markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        code: "MANUS_V2_ANCHOR_CREATE_REJECTED",
+      }),
+  });
+  return settled.state === "completed"
+    ? {
+        bound: true,
+        reconciled: settled.source === "adopted",
+        taskId: settled.task.id,
+      }
+    : settled.state === "output_pending" ||
+        settled.state === "attention_required"
+      ? {
+          bound: true,
+          reconciled: settled.source === "adopted",
+          taskId: settled.task.id,
+          settlement: settled.state,
+        }
+      : {
+          bound: false,
+          reconciled: true,
+          matchCount: reconciledMatchCount,
+        };
+}
+
+/**
+ * Migrates active legacy builds one-by-one. Attempted operations settle first;
+ * idle builds receive an anchor-only handoff, while a failed operation may
+ * receive one hidden business replacement only after a full not-sent proof.
+ */
+export async function migrateActiveLegacyKnowledgeBaseBuilds(options?: {
+  limit?: number;
+  concurrency?: number;
+  afterBuildId?: string;
+  afterRebindBuildId?: string;
+  leaseMs?: number;
+}) {
+  if (!knowledgeBaseManusV2ActiveMigrationEnabled()) {
+    return {
+      enabled: false,
+      scanned: 0,
+      reserved: 0,
+      bound: 0,
+      reconciled: 0,
+      credentialRebindReserved: 0,
+      credentialRebindSkipped: 0,
+      existingNotSent: 0,
+      awaitingLegacySettlement: 0,
+      attentionRequired: 0,
+      skipped: 0,
+      failed: 0,
+      nextCursor: null,
+      hasMore: false,
+      rebindNextCursor: null,
+      rebindHasMore: false,
+    };
+  }
+  const db = await getDb();
+  if (!db) {
+    return {
+      enabled: true,
+      scanned: 0,
+      reserved: 0,
+      bound: 0,
+      reconciled: 0,
+      credentialRebindReserved: 0,
+      credentialRebindSkipped: 0,
+      existingNotSent: 0,
+      awaitingLegacySettlement: 0,
+      attentionRequired: 0,
+      skipped: 0,
+      failed: 0,
+      nextCursor: null,
+      hasMore: false,
+      rebindNextCursor: null,
+      rebindHasMore: false,
+    };
+  }
+  const limit = Math.min(200, Math.max(1, Math.trunc(options?.limit ?? 50)));
+  const concurrency = Math.min(
+    8,
+    Math.max(1, Math.trunc(options?.concurrency ?? 3)),
+  );
+  const candidates = (await db
+    .select({
+      id: knowledgeBaseBuilds.id,
+      userId: knowledgeBaseBuilds.userId,
+      generation: knowledgeBaseBuilds.generation,
+      stateEpoch: knowledgeBaseBuilds.stateEpoch,
+      revision: knowledgeBaseBuilds.revision,
+      currentLeafId: knowledgeBaseBuilds.currentLeafId,
+      status: knowledgeBaseBuilds.status,
+      activeTurnId: knowledgeBaseBuilds.activeTurnId,
+      activeTurnStatus: conversationTurns.status,
+      upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+      createAttemptState: sql<string | null>`COALESCE(
+        JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')),
+        CASE
+          WHEN ${conversationTurns.upstreamTaskId} IS NOT NULL THEN 'acknowledged'
+          WHEN JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NOT NULL
+            OR JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NOT NULL
+          THEN 'unknown'
+          ELSE 'not_sent'
+        END
+      )`,
+    })
+    .from(knowledgeBaseBuilds)
+    .leftJoin(
+      conversationTurns,
+      eq(conversationTurns.id, knowledgeBaseBuilds.activeTurnId),
+    )
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.providerProtocol, "legacy_v1"),
+        isNull(knowledgeBaseBuilds.canonicalTaskId),
+        inArray(knowledgeBaseBuilds.status, [
+          "researching",
+          "confirming",
+          "protocol_error",
+        ]),
+        options?.afterBuildId
+          ? gt(knowledgeBaseBuilds.id, options.afterBuildId)
+          : undefined,
+      ),
+    )
+    .orderBy(asc(knowledgeBaseBuilds.id))
+    .limit(limit)) as KnowledgeBaseActiveLegacyMigrationCandidate[];
+  const result = {
+    enabled: true,
+    scanned: candidates.length,
+    reserved: 0,
+    bound: 0,
+    reconciled: 0,
+    credentialRebindReserved: 0,
+    credentialRebindSkipped: 0,
+    existingNotSent: 0,
+    awaitingLegacySettlement: 0,
+    attentionRequired: 0,
+    skipped: 0,
+    failed: 0,
+    nextCursor: candidates.length
+      ? candidates[candidates.length - 1]!.id
+      : null,
+    hasMore: candidates.length === limit,
+    rebindNextCursor: null as string | null,
+    rebindHasMore: false,
+  };
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor++]!;
+      const disposition = classifyKnowledgeBaseActiveLegacyMigration(candidate);
+      try {
+        if (disposition === "existing_not_sent_turn") {
+          result.existingNotSent += 1;
+          // Queued/running work is already owned by ordinary recovery, whose
+          // lazy cutover is independently fenced by active-migration. A
+          // failed operation needs a new hidden ledger only after the service
+          // proves its provider boundary was never crossed and all immutable
+          // local source bytes remain available.
+          if (candidate.activeTurnStatus !== "failed") continue;
+          await assertKnowledgeBaseWritable(candidate.userId);
+          const replacementCredential =
+            await getEffectiveDecryptedCredentialForAccount(candidate.userId);
+          const replacement =
+            await reserveKnowledgeBaseFailedNotSentLegacyHandoff({
+              userId: candidate.userId,
+              buildId: candidate.id,
+              sourceTurnId: candidate.activeTurnId!,
+              expectedGeneration: candidate.generation,
+              expectedStateEpoch: candidate.stateEpoch,
+              expectedRevision: candidate.revision,
+              expectedLeafId: candidate.currentLeafId,
+              replacementCredentialId: replacementCredential?.id ?? null,
+            });
+          if (replacement.state === "attention_required") {
+            result.attentionRequired += 1;
+            continue;
+          }
+          if (replacement.state !== "reserved") {
+            result.skipped += 1;
+            continue;
+          }
+          result.reserved += 1;
+          const claim = await claimKnowledgeBaseTurnForRecovery({
+            turnId: replacement.replacementTurnId,
+            leaseMs: options?.leaseMs ?? 300_000,
+            allowLegacySkill404IncidentRepair: true,
+          });
+          if (!claim) {
+            // Another recovery worker may have claimed the just-installed
+            // replacement. Its lease is authoritative; this sweep must not
+            // report a false customer-attention condition or compete with it.
+            result.skipped += 1;
+            continue;
+          }
+          if (!claim.turn.apiCredentialId) {
+            result.attentionRequired += 1;
+            continue;
+          }
+          const credential =
+            await getDecryptedCredentialForKnowledgeBaseReservation({
+              userId: claim.turn.userId,
+              turnId: claim.turn.id,
+              buildId: claim.turn.buildId,
+              buildGeneration: claim.turn.buildGeneration,
+              apiCredentialId: claim.turn.apiCredentialId,
+            });
+          if (!credential) {
+            result.attentionRequired += 1;
+            continue;
+          }
+          let dispatched: Awaited<
+            ReturnType<typeof dispatchKnowledgeBaseRecoveryClaim>
+          >;
+          try {
+            dispatched = await withKnowledgeBaseRecoveryLeaseHeartbeat({
+              claim,
+              operation: () =>
+                dispatchKnowledgeBaseRecoveryClaim(claim, credential),
+            });
+          } catch (error) {
+            await persistKnowledgeBaseDispatchFailure({
+              claim,
+              error,
+              outcomeUnknownCode: "LEGACY_FAILED_NOT_SENT_HANDOFF_DEFERRED",
+            }).catch(() => undefined);
+            throw error;
+          }
+          if (dispatched.rebound) result.bound += 1;
+          if (dispatched.reconciled) result.reconciled += 1;
+          continue;
+        }
+        if (disposition === "legacy_outcome_unknown") {
+          // The legacy reconciliation path owns settlement of an already
+          // attempted v1 create/send. This sweep must neither resend it nor
+          // manufacture a v2 anchor. Failed turns are outside ordinary
+          // recovery, so isolate them explicitly instead of leaving the
+          // active legacy build permanently undiscoverable.
+          if (candidate.activeTurnStatus === "failed") {
+            await markLegacyKnowledgeBaseCreateAttentionRequired({
+              userId: candidate.userId,
+              turnId: candidate.activeTurnId!,
+              expectedGeneration: candidate.generation,
+            });
+            result.attentionRequired += 1;
+          } else {
+            result.awaitingLegacySettlement += 1;
+          }
+          continue;
+        }
+        if (disposition !== "migrate_anchor") {
+          result.skipped += 1;
+          continue;
+        }
+        await assertKnowledgeBaseWritable(candidate.userId);
+        let credential: Awaited<
+          ReturnType<typeof getEffectiveDecryptedCredentialForAccount>
+        > = candidate.upstreamTaskId
+          ? await getCredentialForUpstreamResource(
+              candidate.userId,
+              "task",
+              candidate.upstreamTaskId,
+            )
+          : null;
+        let credentialMode: KnowledgeBaseAnchorHandoffCredentialMode =
+          candidate.upstreamTaskId ? "legacy_task_owner" : "current_unbound";
+        if (!credential) {
+          credential = await getEffectiveDecryptedCredentialForAccount(
+            candidate.userId,
+          );
+          credentialMode = candidate.upstreamTaskId
+            ? "current_rebind"
+            : "current_unbound";
+        }
+        if (!credential) {
+          result.attentionRequired += 1;
+          continue;
+        }
+        const reservation = await reserveKnowledgeBaseManusV2AnchorHandoff({
+          userId: candidate.userId,
+          buildId: candidate.id,
+          expectedGeneration: candidate.generation,
+          expectedStateEpoch: candidate.stateEpoch,
+          expectedRevision: candidate.revision,
+          expectedLeafId: candidate.currentLeafId,
+          expectedLegacyTaskId: candidate.upstreamTaskId,
+          apiCredentialId: credential.id,
+          credentialMode,
+          baseUrl: getUpstreamBaseUrl(),
+          agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
+          leaseMs: options?.leaseMs,
+        });
+        result.reserved += 1;
+        const dispatched = await dispatchKnowledgeBaseAnchorHandoffClaim({
+          claim: reservation,
+          credential,
+        });
+        if (dispatched.bound) result.bound += 1;
+        if (dispatched.reconciled) result.reconciled += 1;
+      } catch (error) {
+        if (
+          error instanceof KnowledgeBaseTurnReservationError &&
+          ["CONFLICT", "IDEMPOTENCY_PENDING", "LEASE_LOST"].includes(error.code)
+        ) {
+          result.skipped += 1;
+        } else {
+          result.failed += 1;
+          logKnowledgeBaseRuntimeFailure({
+            level: "warn",
+            event: "[KnowledgeBaseMigration] anchor_handoff_deferred",
+            userId: candidate.userId,
+            buildId: candidate.id,
+            turnId: candidate.activeTurnId || undefined,
+            error,
+          });
+        }
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, candidates.length) }, worker),
+  );
+
+  // A deleted canonical credential is different from ordinary key rotation:
+  // the old task is permanently unreadable. Only an idle, fully owned v2
+  // anchor is eligible for a single self-contained generation+1 handoff.
+  const rebindCandidates = (await db
+    .select({
+      id: knowledgeBaseBuilds.id,
+      userId: knowledgeBaseBuilds.userId,
+      generation: knowledgeBaseBuilds.generation,
+      stateEpoch: knowledgeBaseBuilds.stateEpoch,
+      revision: knowledgeBaseBuilds.revision,
+      currentLeafId: knowledgeBaseBuilds.currentLeafId,
+      status: knowledgeBaseBuilds.status,
+      activeTurnId: knowledgeBaseBuilds.activeTurnId,
+      canonicalTaskId: knowledgeBaseBuilds.canonicalTaskId,
+      canonicalTaskGeneration: knowledgeBaseBuilds.canonicalTaskGeneration,
+      canonicalCredentialId: knowledgeBaseBuilds.canonicalCredentialId,
+      canonicalTaskState: knowledgeBaseBuilds.canonicalTaskState,
+      protocolErrorCode: knowledgeBaseBuilds.protocolErrorCode,
+      credentialStatus: apiCredentials.status,
+      resourceTaskId: upstreamResources.upstreamId,
+      resourceCredentialId: upstreamResources.apiCredentialId,
+      resourceUserId: upstreamResources.userId,
+      resourceProjectAssignmentId: upstreamResources.projectAssignmentId,
+      conversationUserId: conversations.userId,
+      conversationProjectAssignmentId: conversations.projectAssignmentId,
+      conversationStatus: conversations.status,
+      conversationDeletedAt: conversations.deletedAt,
+    })
+    .from(knowledgeBaseBuilds)
+    .leftJoin(
+      apiCredentials,
+      eq(apiCredentials.id, knowledgeBaseBuilds.canonicalCredentialId),
+    )
+    .leftJoin(
+      upstreamResources,
+      and(
+        eq(upstreamResources.kind, "task"),
+        eq(upstreamResources.upstreamId, knowledgeBaseBuilds.canonicalTaskId),
+        eq(
+          upstreamResources.apiCredentialId,
+          knowledgeBaseBuilds.canonicalCredentialId,
+        ),
+      ),
+    )
+    .leftJoin(
+      conversations,
+      and(
+        eq(
+          conversations.id,
+          sql`CONCAT('u', ${knowledgeBaseBuilds.userId}, ':', ${knowledgeBaseBuilds.conversationId})`,
+        ),
+        eq(conversations.userId, knowledgeBaseBuilds.userId),
+      ),
+    )
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.providerProtocol, "manus_v2"),
+        eq(knowledgeBaseBuilds.status, "confirming"),
+        isNotNull(knowledgeBaseBuilds.canonicalTaskId),
+        isNotNull(knowledgeBaseBuilds.canonicalCredentialId),
+        // Filter before LIMIT. Otherwise ordinary active/retired credentials
+        // can fill every page and permanently starve a deleted canonical
+        // credential that needs the generation+1 handoff below. This scan is
+        // intentionally independent from the legacy migration cursor: a v2
+        // build is never ordered in the legacy candidate result set that
+        // advances `afterBuildId`.
+        eq(apiCredentials.status, "deleted"),
+        options?.afterRebindBuildId
+          ? gt(knowledgeBaseBuilds.id, options.afterRebindBuildId)
+          : undefined,
+      ),
+    )
+    .orderBy(asc(knowledgeBaseBuilds.id))
+    .limit(limit)) as KnowledgeBaseCanonicalCredentialRebindCandidate[];
+
+  result.rebindNextCursor = rebindCandidates.length
+    ? rebindCandidates[rebindCandidates.length - 1]!.id
+    : null;
+  result.rebindHasMore = rebindCandidates.length === limit;
+
+  for (const candidate of rebindCandidates) {
+    if (
+      classifyKnowledgeBaseManusV2CredentialRebind(candidate) !==
+      "rebind_anchor"
+    ) {
+      result.credentialRebindSkipped += 1;
+      continue;
+    }
+    try {
+      const credential = await getEffectiveDecryptedCredentialForAccount(
+        candidate.userId,
+      );
+      if (
+        !credential ||
+        !candidate.canonicalCredentialId ||
+        credential.id === candidate.canonicalCredentialId
+      ) {
+        if (candidate.canonicalTaskId && candidate.canonicalCredentialId) {
+          await markKnowledgeBaseManusV2CredentialRebindAttention({
+            userId: candidate.userId,
+            buildId: candidate.id,
+            expectedGeneration: candidate.generation,
+            expectedStateEpoch: candidate.stateEpoch,
+            expectedCanonicalTaskId: candidate.canonicalTaskId,
+            expectedCanonicalCredentialId: candidate.canonicalCredentialId,
+          });
+        }
+        result.attentionRequired += 1;
+        result.credentialRebindSkipped += 1;
+        continue;
+      }
+      await assertKnowledgeBaseWritable(candidate.userId);
+      const reservation = await reserveKnowledgeBaseManusV2AnchorHandoff({
+        userId: candidate.userId,
+        buildId: candidate.id,
+        expectedGeneration: candidate.generation,
+        expectedStateEpoch: candidate.stateEpoch,
+        expectedRevision: candidate.revision,
+        expectedLeafId: candidate.currentLeafId,
+        expectedLegacyTaskId: null,
+        sourceProtocol: "manus_v2",
+        expectedCanonicalTaskId: candidate.canonicalTaskId,
+        expectedCanonicalCredentialId: candidate.canonicalCredentialId,
+        apiCredentialId: credential.id,
+        credentialMode: "current_rebind",
+        baseUrl: getUpstreamBaseUrl(),
+        agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
+        leaseMs: options?.leaseMs,
+      });
+      result.reserved += 1;
+      result.credentialRebindReserved += 1;
+      const dispatched = await dispatchKnowledgeBaseAnchorHandoffClaim({
+        claim: reservation,
+        credential,
+      });
+      if (dispatched.bound) result.bound += 1;
+      if (dispatched.reconciled) result.reconciled += 1;
+    } catch (error) {
+      if (
+        error instanceof KnowledgeBaseTurnReservationError &&
+        ["CONFLICT", "IDEMPOTENCY_PENDING", "LEASE_LOST"].includes(error.code)
+      ) {
+        result.credentialRebindSkipped += 1;
+      } else {
+        result.failed += 1;
+        logKnowledgeBaseRuntimeFailure({
+          level: "warn",
+          event:
+            "[KnowledgeBaseMigration] canonical_credential_rebind_deferred",
+          userId: candidate.userId,
+          buildId: candidate.id,
+          error,
+        });
+      }
+    }
+  }
+
+  // Complete crash-recovered reservations even when the legacy scan page no
+  // longer contains them because the reservation already flipped protocol.
+  const pending = await findRecoverableKnowledgeBaseAnchorHandoffTurnIds({
+    limit,
+  });
+  for (const candidate of pending) {
+    let claim: KnowledgeBaseRecoveryClaim | null = null;
+    try {
+      claim = await claimKnowledgeBaseManusV2AnchorHandoff({
+        turnId: candidate.turnId,
+        leaseMs: options?.leaseMs,
+      });
+      if (!claim?.turn.apiCredentialId) continue;
+      const credential =
+        await getDecryptedCredentialForKnowledgeBaseReservation({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          buildId: claim.turn.buildId,
+          buildGeneration: claim.turn.buildGeneration,
+          apiCredentialId: claim.turn.apiCredentialId,
+        });
+      if (!credential) {
+        result.attentionRequired += 1;
+        continue;
+      }
+      const dispatched = await dispatchKnowledgeBaseAnchorHandoffClaim({
+        claim,
+        credential,
+      });
+      if (dispatched.bound) result.bound += 1;
+      if (dispatched.reconciled) result.reconciled += 1;
+    } catch (error) {
+      result.failed += 1;
+      logKnowledgeBaseRuntimeFailure({
+        level: "warn",
+        event: "[KnowledgeBaseMigration] reserved_anchor_deferred",
+        userId: candidate.userId,
+        buildId: candidate.buildId,
+        turnId: candidate.turnId,
+        error,
+      });
+    }
+  }
+  return result;
+}
+
+export async function persistKnowledgeBaseDispatchFailure(
+  input: {
+    claim: KnowledgeBaseRecoveryClaim;
+    error: unknown;
+    outcomeUnknownCode: string;
+    recoveryDelayMs?: number;
+    traceId?: string;
+  },
+  dependencies: {
+    markManusV2OutcomeUnknown?: typeof markKnowledgeBaseManusV2OutcomeUnknown;
+    persistCreateFailure?: typeof persistKnowledgeBaseCreateFailure;
+  } = {},
+) {
+  const markManusV2OutcomeUnknown =
+    dependencies.markManusV2OutcomeUnknown ??
+    markKnowledgeBaseManusV2OutcomeUnknown;
+  const persistCreateFailure =
+    dependencies.persistCreateFailure ?? persistKnowledgeBaseCreateFailure;
+  if (input.error instanceof KnowledgeBaseManusV2RolloutDeferredError) {
+    await deferKnowledgeBaseTurnBeforeCreate({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: input.error.code,
+      recoveryDelayMs: input.recoveryDelayMs ?? 30_000,
+      ...(input.traceId ? { traceId: input.traceId } : {}),
+    });
+    return "retriable" as const;
+  }
+  const v2Error = input.error instanceof ManusV2ApiError ? input.error : null;
+  const isCurrentExplicitV2Rejection =
+    input.claim.turn.providerProtocol === "manus_v2" &&
+    v2Error !== null &&
+    !v2Error.outcomeUnknown &&
+    (v2Error.operation === "task.create" ||
+      v2Error.operation === "task.sendMessage") &&
+    input.claim.turn.providerAttemptState === "sending";
+  if (isCurrentExplicitV2Rejection && v2Error) {
+    const settled = await settleKnowledgeBaseManusV2ExplicitRejection({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code:
+        v2Error.operation === "task.create"
+          ? "MANUS_V2_CREATE_REJECTED"
+          : "MANUS_V2_SEND_REJECTED",
+      retryable: v2Error.retryable,
+      ...(v2Error.retryAfterMs !== null
+        ? { recoveryDelayMs: v2Error.retryAfterMs }
+        : {}),
+    });
+    return settled.retryScheduled
+      ? ("retriable" as const)
+      : ("deterministic" as const);
+  }
+  if (
+    input.claim.turn.providerProtocol === "manus_v2" &&
+    input.error instanceof ManusV2ApiError &&
+    input.error.outcomeUnknown
+  ) {
+    await markManusV2OutcomeUnknown({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: input.outcomeUnknownCode,
+      ...(input.recoveryDelayMs
+        ? { recoveryDelayMs: input.recoveryDelayMs }
+        : {}),
+    });
+    return "retriable" as const;
+  }
+  if (
+    input.claim.turn.providerProtocol === "manus_v2" &&
+    (input.claim.turn.providerAttemptState === "output_pending" ||
+      input.claim.turn.providerAttemptState === "outcome_unknown")
+  ) {
+    // The provider POST may already have returned 2xx before a local binding,
+    // ownership, or follow-up persistence transaction failed. Once the v2
+    // in-memory ledger has crossed to `output_pending`, every non-explicit
+    // failure is ambiguous:
+    // using the legacy marker would persist createAttemptState=unknown while
+    // leaving providerAttemptState=sending, a combination excluded from the
+    // recovery scan. Keep it on the v2 read/reconcile-only path instead; task
+    // create is adopted by title+operation token and sendMessage by the exact
+    // token on the existing canonical anchor, with no second provider POST.
+    await markManusV2OutcomeUnknown({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: input.outcomeUnknownCode,
+      ...(input.recoveryDelayMs
+        ? { recoveryDelayMs: input.recoveryDelayMs }
+        : {}),
+    });
+    return "retriable" as const;
+  }
+  return persistCreateFailure({
+    userId: input.claim.turn.userId,
+    turnId: input.claim.turn.id,
+    leaseToken: input.claim.leaseToken,
+    error: input.error,
+    outcomeUnknownCode: input.outcomeUnknownCode,
+    ...(input.recoveryDelayMs
+      ? { recoveryDelayMs: input.recoveryDelayMs }
+      : {}),
+    ...(input.traceId ? { traceId: input.traceId } : {}),
+  });
+}
+
 async function withKnowledgeBaseRecoveryLeaseHeartbeat<T>(input: {
   claim: KnowledgeBaseRecoveryClaim;
   operation: () => Promise<T>;
@@ -3011,7 +6024,12 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
     8,
     Math.max(1, Math.trunc(options?.concurrency ?? 3)),
   );
-  const candidates = await findRecoverableKnowledgeBaseTurnIds({ limit });
+  const allowLegacySkill404IncidentRepair =
+    knowledgeBaseManusV2ActiveMigrationEnabled();
+  const candidates = await findRecoverableKnowledgeBaseTurnIds({
+    limit,
+    allowLegacySkill404IncidentRepair,
+  });
   const result = {
     scanned: candidates.length,
     claimed: 0,
@@ -3031,6 +6049,7 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
         claim = await claimKnowledgeBaseTurnForRecovery({
           turnId: candidate.turnId,
           leaseMs: 300_000,
+          allowLegacySkill404IncidentRepair,
         });
         if (!claim) {
           result.skipped += 1;
@@ -3155,10 +6174,8 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
             }
           }
           if (!manualLogoFailureSettled) {
-            await persistKnowledgeBaseCreateFailure({
-              userId: claim.turn.userId,
-              turnId: claim.turn.id,
-              leaseToken: claim.leaseToken,
+            await persistKnowledgeBaseDispatchFailure({
+              claim,
               error: failureToPersist,
               outcomeUnknownCode: "RECOVERY_DEFERRED",
             }).catch(() => undefined);
@@ -3223,8 +6240,13 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
   mimeType?: string;
   reusableUpstreamFileId?: string | null;
   durable: DurableKnowledgeBaseGeneratedAttachment;
+  providerProtocol?: "legacy_v1" | "manus_v2";
+  replacementAttempted?: boolean;
 }) {
   const mimeType = input.mimeType || "application/zip";
+  // Install the exact generated bytes before the first provider file POST.
+  // Provider file ids can expire; this immutable source is the recovery fact.
+  const localSource = await persistKnowledgeBaseGeneratedSource(input.bytes);
   const reservation = await reserveKnowledgeBaseGeneratedAttachment({
     userId: input.durable.userId,
     turnId: input.durable.turnId,
@@ -3234,27 +6256,30 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
     filename: input.filename,
     mimeType,
     sizeBytes: input.bytes.length,
-    contentSha256: createHash("sha256").update(input.bytes).digest("hex"),
+    contentSha256: localSource.contentSha256,
+    localStorageKey: localSource.storageKey,
   });
+  if (input.providerProtocol === "manus_v2") {
+    // v2 task files must originate in /v2. This source id is only an ordered
+    // Dashboard ledger coordinate and is never sent to Manus. If a legacy
+    // migration already staged a v1 id in this exact slot, retain it solely
+    // as the frozen source coordinate so recovery does not rewrite history.
+    const localSourceId =
+      reservation.upstreamFileId ||
+      `kb-local-${reservation.requestHash.slice(0, 48)}`;
+    return {
+      attachment: { file_id: localSourceId, filename: input.filename },
+      fileId: localSourceId,
+      removeOrphan: async () => undefined,
+    };
+  }
   const reusableUpstreamFileId = String(
     input.reusableUpstreamFileId || "",
   ).trim();
   if (
     reusableUpstreamFileId &&
-    (!reservation.upstreamFileId ||
-      reservation.upstreamFileId === reusableUpstreamFileId)
+    reservation.upstreamFileId === reusableUpstreamFileId
   ) {
-    if (!reservation.upstreamFileId) {
-      await completeKnowledgeBaseGeneratedAttachment({
-        userId: input.durable.userId,
-        turnId: input.durable.turnId,
-        leaseToken: input.durable.leaseToken,
-        role: input.durable.role,
-        attachmentIndex: input.durable.attachmentIndex,
-        requestHash: reservation.requestHash,
-        upstreamFileId: reusableUpstreamFileId,
-      });
-    }
     await waitForKnowledgeBaseAttachmentGroup({
       baseUrl: input.baseUrl,
       apiKey: input.apiKey,
@@ -3263,6 +6288,15 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
       ],
       attachmentKind: "generated",
       filenamePolicy: "exact",
+    });
+    await promoteKnowledgeBaseGeneratedAttachmentReady({
+      userId: input.durable.userId,
+      turnId: input.durable.turnId,
+      leaseToken: input.durable.leaseToken,
+      role: input.durable.role,
+      attachmentIndex: input.durable.attachmentIndex,
+      requestHash: reservation.requestHash,
+      upstreamFileId: reusableUpstreamFileId,
     });
     return {
       attachment: {
@@ -3276,7 +6310,10 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
     };
   }
   try {
-    return await uploadUpstreamTaskAttachment({
+    // `uploadUpstreamTaskAttachment` resolves only after readiness (and, for
+    // recovered candidates, byte-for-byte content proof). Promote after it
+    // returns so a candidate can never leak into a task body prematurely.
+    const uploaded = await uploadUpstreamTaskAttachment({
       baseUrl: input.baseUrl,
       apiKey: input.apiKey,
       filename: input.filename,
@@ -3299,7 +6336,41 @@ async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {
         });
       },
     });
+    await promoteKnowledgeBaseGeneratedAttachmentReady({
+      userId: input.durable.userId,
+      turnId: input.durable.turnId,
+      leaseToken: input.durable.leaseToken,
+      role: input.durable.role,
+      attachmentIndex: input.durable.attachmentIndex,
+      requestHash: reservation.requestHash,
+      upstreamFileId: uploaded.fileId,
+    });
+    return uploaded;
   } catch (error) {
+    const definitelyUnusableCandidate =
+      reservation.upstreamFileId &&
+      ((error instanceof UpstreamFileReadinessError &&
+        !error.retryable &&
+        error.code === "UPSTREAM_FILE_UNUSABLE") ||
+        (error instanceof UpstreamTaskAttachmentContentProofError &&
+          !error.retryable &&
+          error.httpStatus === 404));
+    if (definitelyUnusableCandidate && !input.replacementAttempted) {
+      await replaceUnusableKnowledgeBaseGeneratedAttachment({
+        userId: input.durable.userId,
+        turnId: input.durable.turnId,
+        leaseToken: input.durable.leaseToken,
+        role: input.durable.role,
+        attachmentIndex: input.durable.attachmentIndex,
+        requestHash: reservation.requestHash,
+        upstreamFileId: reservation.upstreamFileId!,
+      });
+      return uploadDurableKnowledgeBaseGeneratedAttachment({
+        ...input,
+        reusableUpstreamFileId: null,
+        replacementAttempted: true,
+      });
+    }
     throw knowledgeBaseGeneratedAttachmentFailureForPersistence(error);
   }
 }
@@ -3309,20 +6380,34 @@ export async function uploadKnowledgeBaseSkillArchive({
   apiKey,
   skillVersion = "4",
   skillContentHash,
+  archive: pinnedArchive,
   reusableUpstreamFileId,
   durable,
+  providerProtocol,
 }: {
   baseUrl: string;
   apiKey: string;
   skillVersion?: string;
   skillContentHash?: string | null;
+  archive?: Awaited<ReturnType<typeof ensureKnowledgeBaseBuildSkillArchivePin>>;
   reusableUpstreamFileId?: string | null;
   durable?: Omit<DurableKnowledgeBaseGeneratedAttachment, "role">;
+  providerProtocol?: "legacy_v1" | "manus_v2";
 }) {
-  const archive = await readKnowledgeBaseSkillArchiveAttachment({
-    version: skillVersion,
-    contentHash: skillContentHash,
-  });
+  const archive =
+    pinnedArchive ||
+    (await readKnowledgeBaseSkillArchiveAttachment({
+      version: skillVersion,
+      contentHash: skillContentHash,
+    }));
+  if (
+    pinnedArchive &&
+    String(skillContentHash || "") !== pinnedArchive.contentHash
+  ) {
+    throw new Error(
+      "Pinned Skill archive does not match the logical build pin",
+    );
+  }
   const uploaded = durable
     ? await uploadDurableKnowledgeBaseGeneratedAttachment({
         baseUrl,
@@ -3330,6 +6415,7 @@ export async function uploadKnowledgeBaseSkillArchive({
         filename: archive.filename,
         bytes: archive.bytes,
         reusableUpstreamFileId,
+        providerProtocol,
         durable: { ...durable, role: "skill" },
       })
     : await uploadUpstreamTaskAttachment({
@@ -3810,10 +6896,8 @@ function launchAcceptedKnowledgeBaseClaim(input: {
   outcomeUnknownCode: string;
 }) {
   void dispatchAcceptedKnowledgeBaseClaim(input).catch(async (error) => {
-    const persisted = await persistKnowledgeBaseCreateFailure({
-      userId: input.claim.turn.userId,
-      turnId: input.claim.turn.id,
-      leaseToken: input.claim.leaseToken,
+    const persisted = await persistKnowledgeBaseDispatchFailure({
+      claim: input.claim,
       error,
       outcomeUnknownCode: input.outcomeUnknownCode,
       recoveryDelayMs: 1_000,
@@ -3843,6 +6927,8 @@ function launchAcceptedKnowledgeBaseClaim(input: {
         void claimKnowledgeBaseTurnForRecovery({
           turnId: input.claim.turn.id,
           leaseMs: 300_000,
+          allowLegacySkill404IncidentRepair:
+            knowledgeBaseManusV2ActiveMigrationEnabled(),
         })
           .then((claim) => {
             if (!claim) return;
@@ -3868,6 +6954,208 @@ function launchAcceptedKnowledgeBaseClaim(input: {
   });
 }
 
+/**
+ * Commits the Dashboard build and logical start turn before the browser sends
+ * file bytes. This endpoint deliberately performs no provider file/task call;
+ * `/turn/dispatch` is the only route that may acquire a worker lease.
+ */
+router.post("/start/reserve", async (req, res) => {
+  const body = (req.body || {}) as KnowledgeBaseStartRequest & {
+    attachmentManifest?: unknown;
+  };
+  const conversationId = String(body.conversationId || "").trim();
+  const clientRequestId = String(body.clientRequestId || "").trim();
+  const requestedCompanyName = String(body.companyName || "").trim();
+  const companyWebsite = String(body.companyWebsite || "").trim();
+  const operatorNotes = String(body.operatorNotes || "").trim();
+  if (
+    !conversationId ||
+    conversationId.length > 191 ||
+    !clientRequestId ||
+    clientRequestId.length > 128
+  ) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_KNOWLEDGE_BASE_START_RESERVATION",
+        message: "知识库启动预约参数无效",
+      },
+      reservationCreated: false,
+    });
+    return;
+  }
+  if (
+    !req.frontmindUser ||
+    !(await requireKnowledgeBuildCapability(req.frontmindUser.id, res))
+  ) {
+    return;
+  }
+  if (!req.frontmindCredential) {
+    res.status(401).json({
+      error: {
+        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        message: "请先配置 API Key",
+      },
+      reservationCreated: false,
+    });
+    return;
+  }
+
+  const requestTraceId = randomUUID();
+  let reservationCreated = false;
+  try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
+    const attachmentManifest =
+      Array.isArray(body.attachmentManifest) &&
+      body.attachmentManifest.length === 0
+        ? []
+        : normalizeKnowledgeBaseClientAttachmentManifest(
+            body.attachmentManifest,
+          );
+    const workspace = await getDashboardWorkspace(req.frontmindUser.id);
+    const companyName = resolveKnowledgeBaseEnterpriseIdentity({
+      sourceName: workspace.sourceName,
+      brandName: workspace.payload.brandName,
+      requestedCompanyName,
+    });
+    const existingBuild = await getKnowledgeBaseProgress({
+      userId: req.frontmindUser.id,
+      conversationId,
+    });
+    if (existingBuild?.build.status === "published") {
+      res.status(409).json({
+        traceId: requestTraceId,
+        error: {
+          code: "KNOWLEDGE_BASE_LOCKED",
+          message: "知识库已发布；后续修改请提交维护需求",
+        },
+        reservationCreated: false,
+      });
+      return;
+    }
+    const newBuildPolicy = knowledgeBaseNewBuildPolicyBinding();
+    const [prefillKnowledgeSnapshot, latestSkillDescriptor] = await Promise.all(
+      [
+        getLatestKnowledgeSnapshot(req.frontmindUser.id),
+        getKnowledgeBaseSkillDescriptor({
+          version: newBuildPolicy.skillVersion,
+          contentHash: newBuildPolicy.skillContentHash,
+        }),
+      ],
+    );
+    const start = await reserveKnowledgeBaseStartBuild({
+      userId: req.frontmindUser.id,
+      conversationId,
+      clientRequestId,
+      companyName,
+      companyWebsite,
+      skillName: latestSkillDescriptor.name,
+      skillVersion: latestSkillDescriptor.version,
+      skillContentHash: latestSkillDescriptor.contentHash,
+      skillArchiveSha256: latestSkillDescriptor.physicalSha256,
+      skillArchiveBytes: latestSkillDescriptor.archiveBytes,
+      skillArchiveStorageKey: latestSkillDescriptor.storageKey,
+      treePolicyVersion: newBuildPolicy.treePolicyVersion,
+      apiCredentialId: req.frontmindCredential.id,
+      userText: "开始构建企业知识库",
+      userAttachmentCount: attachmentManifest.length,
+      expectedAttachmentCount:
+        attachmentManifest.length + 2 + (prefillKnowledgeSnapshot ? 1 : 0),
+      deferDispatchUntilAttachments: true,
+      clientAttachmentManifest: attachmentManifest,
+      requestPayload: {
+        companyName,
+        companyWebsite,
+        operatorNotes,
+        attachments: [],
+        attachmentManifest,
+        skillVersion: latestSkillDescriptor.version,
+        skillContentHash: latestSkillDescriptor.contentHash,
+        prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
+      },
+      recoveryMetadata: {
+        traceId: requestTraceId,
+        kind: "start",
+        conversationId,
+        companyName,
+        companyWebsite,
+        operatorNotes,
+        attachments: [],
+        attachmentManifest,
+        capturedClientAttachments: true,
+        deferredClientAttachments: true,
+        skillVersion: latestSkillDescriptor.version,
+        skillContentHash: latestSkillDescriptor.contentHash,
+        skillArchiveSha256: latestSkillDescriptor.physicalSha256,
+        skillArchiveBytes: latestSkillDescriptor.archiveBytes,
+        skillArchiveStorageKey: latestSkillDescriptor.storageKey,
+        includePrefill: Boolean(prefillKnowledgeSnapshot),
+        prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
+        instructionsAttachmentRequired: true,
+      },
+    });
+    reservationCreated = true;
+    const progress = await getKnowledgeBaseProgress({
+      userId: req.frontmindUser.id,
+      conversationId,
+    });
+    const observation = await getKnowledgeBaseObservation({
+      userId: req.frontmindUser.id,
+      conversationId,
+      upstreamStatus: "running",
+    });
+    res.status(start.createdBuild ? 201 : 200).json({
+      traceId: start.reservation.turn.traceId || requestTraceId,
+      reservation: knowledgeBaseReservationReceipt(
+        start.reservation as Exclude<
+          KnowledgeBaseTurnReservation,
+          { state: "acquired" }
+        >,
+        observation?.stateEpoch,
+      ),
+      observation,
+      progress: observation?.interaction.progress || progress,
+      interaction:
+        observation?.interaction ||
+        deriveKnowledgeBaseInteraction(progress, "running"),
+      accepted: true,
+      reservationCreated: true,
+      idempotent: !start.createdBuild,
+      startedAt: start.reservation.turn.createdAt.getTime(),
+    });
+  } catch (error) {
+    if (error instanceof KnowledgeBaseTurnReservationError) {
+      res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
+        traceId: requestTraceId,
+        error: { code: error.code, message: error.message },
+        reservationCreated,
+      });
+      return;
+    }
+    if (error instanceof KnowledgeBaseEnterpriseIdentityError) {
+      res.status(error.code === "ENTERPRISE_NOT_CONFIGURED" ? 422 : 409).json({
+        traceId: requestTraceId,
+        error: { code: error.code, message: error.message },
+        reservationCreated,
+      });
+      return;
+    }
+    logKnowledgeBaseRuntimeFailure({
+      level: "error",
+      event: "[KnowledgeBaseStartReserve] failed",
+      error,
+      additionalSecrets: [req.frontmindCredential?.apiKey],
+    });
+    res.status(503).json({
+      traceId: requestTraceId,
+      error: {
+        code: "KNOWLEDGE_BASE_START_RESERVATION_FAILED",
+        message: "启动预约失败，请稍后重试同一请求",
+      },
+      reservationCreated: false,
+    });
+  }
+});
+
 router.post("/start", async (req, res) => {
   const body = (req.body || {}) as KnowledgeBaseStartRequest;
   const conversationId = String(body.conversationId || "").trim();
@@ -3891,19 +7179,11 @@ router.post("/start", async (req, res) => {
   ) {
     return;
   }
-  if (!req.frontmindUser || !req.frontmindCredential) {
-    res.status(401).json({ error: "请先登录并配置 API Key" });
-    return;
-  }
-
-  const { apiKey, baseUrl } = getFrontMindCredentials(req);
-  if (!apiKey) {
-    res.status(401).json({ error: "当前账号尚未配置可用的 API Key" });
+  if (!req.frontmindUser) {
+    res.status(401).json({ error: "请先登录" });
     return;
   }
   const requestTraceId = randomUUID();
-
-  let reservationCreated = false;
   try {
     const workspace = await getDashboardWorkspace(req.frontmindUser.id);
     const companyName = resolveKnowledgeBaseEnterpriseIdentity({
@@ -3937,228 +7217,25 @@ router.post("/start", async (req, res) => {
       });
       return;
     }
-    await assertKnowledgeBaseWritable(req.frontmindUser.id);
-    const existingBuild = await getKnowledgeBaseProgress({
-      userId: req.frontmindUser.id,
-      conversationId,
-    });
-    if (existingBuild?.build.status === "published") {
-      res.status(409).json({
+    // Compatibility is intentionally read-only: exact requests which were
+    // already reserved by an older Dashboard build can still recover their
+    // receipt. Every new start must establish Dashboard ownership before any
+    // browser byte or provider file/task call.
+    res.status(410).json({
+      traceId: requestTraceId,
+      error: {
+        code: "KNOWLEDGE_BASE_START_RESERVATION_REQUIRED",
+        message: "客户端版本已更新，请刷新页面后重新开始上传",
         traceId: requestTraceId,
-        error: {
-          code: "KNOWLEDGE_BASE_LOCKED",
-          message: "知识库已发布；后续修改请提交维护需求",
-          traceId: requestTraceId,
-        },
-        reservationCreated: false,
-      });
-      return;
-    }
-    for (const attachment of userAttachments) {
-      const fileCredential = await getCredentialForUpstreamResource(
-        req.frontmindUser.id,
-        "file",
-        attachment.file_id,
-      );
-      if (
-        !fileCredential ||
-        !credentialsUseSameUpstreamApiKey(
-          fileCredential,
-          req.frontmindCredential,
-        )
-      ) {
-        res.status(403).json({
-          traceId: requestTraceId,
-          error: {
-            code: "KNOWLEDGE_BASE_ATTACHMENT_OWNERSHIP_MISMATCH",
-            message: "上传资料与当前账号不匹配，请重新上传",
-            traceId: requestTraceId,
-          },
-          reservationCreated: false,
-        });
-        return;
-      }
-    }
-    const newBuildPolicy = knowledgeBaseNewBuildPolicyBinding();
-    const [prefillKnowledgeSnapshot, latestSkillDescriptor] = await Promise.all(
-      [
-        getLatestKnowledgeSnapshot(req.frontmindUser.id),
-        getKnowledgeBaseSkillDescriptor({
-          version: newBuildPolicy.skillVersion,
-          contentHash: newBuildPolicy.skillContentHash,
-        }),
-      ],
-    );
-    const startReservation = await reserveKnowledgeBaseStartBuild({
-      userId: req.frontmindUser.id,
-      conversationId,
-      clientRequestId,
-      companyName,
-      companyWebsite,
-      skillName: latestSkillDescriptor.name,
-      skillVersion: latestSkillDescriptor.version,
-      skillContentHash: latestSkillDescriptor.contentHash,
-      treePolicyVersion: newBuildPolicy.treePolicyVersion,
-      requestPayload: {
-        companyName,
-        companyWebsite,
-        operatorNotes,
-        attachments: userAttachments,
-        skillVersion: latestSkillDescriptor.version,
-        skillContentHash: latestSkillDescriptor.contentHash,
-        prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
       },
-      apiCredentialId: req.frontmindCredential.id,
-      userText: "开始构建企业知识库",
-      userAttachmentCount: userAttachments.length,
-      expectedAttachmentCount:
-        2 + userAttachments.length + (prefillKnowledgeSnapshot ? 1 : 0),
-      recoveryMetadata: {
-        traceId: requestTraceId,
-        kind: "start",
-        conversationId,
-        companyName,
-        companyWebsite,
-        operatorNotes,
-        attachments: userAttachments,
-        skillVersion: latestSkillDescriptor.version,
-        skillContentHash: latestSkillDescriptor.contentHash,
-        includePrefill: Boolean(prefillKnowledgeSnapshot),
-        prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
-        instructionsAttachmentRequired: true,
-      },
+      reservationCreated: false,
     });
-    reservationCreated = true;
-    const { build, reservation } = startReservation;
-    // The build and first turn commit together; legacy builds keep their pinned Skill contract.
-    const skillDescriptor = {
-      name: build.skillName,
-      version: build.skillVersion,
-      contentHash: build.skillContentHash,
-    };
-    let progress = await getKnowledgeBaseProgress({
-      userId: req.frontmindUser.id,
-      conversationId,
-    });
-    if (!progress) throw new Error("知识库构建 reservation 创建失败");
-    if (reservation.state !== "acquired") {
-      const observation = await getKnowledgeBaseObservation({
-        userId: req.frontmindUser!.id,
-        conversationId,
-        upstreamStatus:
-          reservation.state === "completed" ? "completed" : "running",
-      });
-      res
-        .status(reservation.state === "pending" ? 202 : 200)
-        .setHeader(
-          "Retry-After",
-          String(Math.ceil(reservationRetryAfterMs(reservation) / 1_000)),
-        )
-        .json({
-          traceId: reservation.turn.traceId || requestTraceId,
-          reservation: knowledgeBaseReservationReceipt(
-            reservation,
-            observation?.stateEpoch,
-          ),
-          ...(observation?.authoritativeTaskId
-            ? {
-                task: {
-                  id: observation.authoritativeTaskId,
-                  status:
-                    reservation.state === "completed" ? "completed" : "running",
-                },
-              }
-            : {}),
-          progress: observation?.interaction.progress || progress,
-          interaction:
-            observation?.interaction ||
-            deriveKnowledgeBaseInteraction(progress, "running"),
-          observation,
-          idempotent: true,
-          resumed: true,
-          startedAt: reservation.turn.startedAt?.getTime() || Date.now(),
-        });
-      return;
-    }
-    {
-      const acceptedStartClaim: KnowledgeBaseRecoveryClaim = {
-        turn: reservation.turn,
-        leaseToken: reservation.leaseToken,
-        leaseExpiresAt: reservation.leaseExpiresAt,
-        upstreamIdempotencyKey: reservation.upstreamIdempotencyKey,
-        recoveryMetadata:
-          reservation.recoveryMetadata ||
-          ({
-            traceId: requestTraceId,
-            kind: "start",
-            conversationId,
-            companyName: build.companyName,
-            companyWebsite: build.companyWebsite || "",
-            operatorNotes,
-            attachments: userAttachments,
-            skillVersion: build.skillVersion,
-            skillContentHash: build.skillContentHash,
-            includePrefill: Boolean(prefillKnowledgeSnapshot),
-            prefillSnapshotId: prefillKnowledgeSnapshot?.id || null,
-            instructionsAttachmentRequired: true,
-          } satisfies Record<string, unknown>),
-        preparedDispatch: null,
-      };
-      const acceptedObservation = await getKnowledgeBaseObservation({
-        userId: req.frontmindUser.id,
-        conversationId,
-        upstreamStatus: "running",
-      }).catch(() => null);
-      res.status(202).json({
-        traceId: acceptedStartClaim.turn.traceId || requestTraceId,
-        visibleMessage: "开始构建企业知识库",
-        reservation: knowledgeBaseAcceptedReservationReceipt({
-          turn: acceptedStartClaim.turn,
-          stateEpoch: acceptedObservation?.stateEpoch,
-        }),
-        observation: acceptedObservation,
-        progress: acceptedObservation?.interaction.progress || progress || null,
-        interaction:
-          acceptedObservation?.interaction ||
-          deriveKnowledgeBaseInteraction(progress, "running"),
-        accepted: true,
-        reservationCreated: true,
-        startedAt: reservation.turn.createdAt.getTime(),
-      });
-      launchAcceptedKnowledgeBaseClaim({
-        claim: acceptedStartClaim,
-        credential: req.frontmindCredential,
-        outcomeUnknownCode: "START_DISPATCH_OUTCOME_UNKNOWN",
-      });
-      return;
-    }
   } catch (error: any) {
     if (error instanceof KnowledgeBaseTurnReservationError) {
-      const status =
-        error.code === "BUILD_NOT_FOUND"
-          ? 404
-          : error.code === "INVALID_REQUEST"
-            ? 400
-            : 409;
-      const observation =
-        status === 409 && req.frontmindUser
-          ? await getKnowledgeBaseObservation({
-              userId: req.frontmindUser.id,
-              conversationId,
-              upstreamStatus: "running",
-            }).catch(() => null)
-          : null;
-      res.status(status).json({
+      res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
         traceId: requestTraceId,
         error: { code: error.code, message: error.message },
         reservationCreated: false,
-        ...(observation
-          ? {
-              observation,
-              progress: observation.interaction.progress,
-              interaction: observation.interaction,
-            }
-          : {}),
       });
       return;
     }
@@ -4167,36 +7244,24 @@ router.post("/start", async (req, res) => {
         traceId: requestTraceId,
         error: error.message,
         code: error.code,
-        reservationCreated,
-      });
-      return;
-    }
-    if (error instanceof KnowledgeBaseBuildError) {
-      res.status(422).json({
-        traceId: requestTraceId,
-        error: {
-          code: error.code,
-          message: error.message,
-          traceId: requestTraceId,
-        },
-        reservationCreated,
+        reservationCreated: false,
       });
       return;
     }
     logKnowledgeBaseRuntimeFailure({
       level: "error",
-      event: "[KnowledgeBaseStart] failed",
+      event: "[KnowledgeBaseLegacyStartReplay] failed",
       error,
-      additionalSecrets: [apiKey, req.frontmindCredential?.apiKey],
+      additionalSecrets: [req.frontmindCredential?.apiKey],
     });
     res.status(503).json({
       traceId: requestTraceId,
       error: {
-        code: "KNOWLEDGE_BASE_START_FAILED",
-        message: "启动企业知识库任务失败，请稍后重试",
+        code: "KNOWLEDGE_BASE_START_REPLAY_FAILED",
+        message: "正在核对旧版启动请求，请稍后重试",
         traceId: requestTraceId,
       },
-      reservationCreated,
+      reservationCreated: false,
     });
   }
 });
@@ -4315,20 +7380,26 @@ router.post("/turn/reserve", async (req, res) => {
       );
     }
     const { build: boundBuild, taskId: parentTaskId } = authority;
-    assertKnowledgeBaseManifestDoesNotRepeatOfficialLogo(
-      boundBuild,
-      attachmentManifest,
-    );
+    const deferredLogoPolicy = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: boundBuild.providerProtocol,
+      legacyLogoRequired: knowledgeBaseBuildRequiresOfficialLogo(boundBuild),
+    });
+    if (deferredLogoPolicy.rejectRepeatedOfficialLogo) {
+      assertKnowledgeBaseManifestDoesNotRepeatOfficialLogo(
+        boundBuild,
+        attachmentManifest,
+      );
+    }
     await assertKnowledgeBaseCustomerUploadCapacity({
       userId: req.frontmindUser.id,
       buildId: boundBuild.id,
       generation: boundBuild.generation,
       officialLogoSha256: boundBuild.logoSha256,
-      officialLogoRequired: knowledgeBaseBuildRequiresOfficialLogo(boundBuild),
+      officialLogoRequired: deferredLogoPolicy.requiresOfficialLogo,
       attachmentManifest,
     });
     if (
-      knowledgeBaseBuildRequiresOfficialLogo(boundBuild) &&
+      deferredLogoPolicy.requiresOfficialLogo &&
       (attachmentManifest.length !== 1 ||
         ![
           "image/avif",
@@ -4372,23 +7443,22 @@ router.post("/turn/reserve", async (req, res) => {
       directPrefilledCount: boundBuild.directPrefilledCount,
       action,
     });
-    if (finalPackageRequired) {
+    if (finalPackageRequired && deferredLogoPolicy.assertFinalLogoProvenance) {
       await assertKnowledgeBaseFinalLogoProvenanceForBuild(
         req.frontmindUser.id,
         boundBuild,
       );
     }
-    const skillDescriptor = finalPackageRequired
-      ? await getKnowledgeBaseSkillDescriptor(
-          knowledgeBasePinnedV4SkillSelection({
-            skillVersion: boundBuild.skillVersion,
-            skillContentHash: boundBuild.skillContentHash,
-          }),
-        )
-      : {
-          version: boundBuild.skillVersion,
-          contentHash: boundBuild.skillContentHash,
-        };
+    if (finalPackageRequired) {
+      knowledgeBasePinnedV4SkillSelection({
+        skillVersion: boundBuild.skillVersion,
+        skillContentHash: boundBuild.skillContentHash,
+      });
+    }
+    const skillDescriptor = {
+      version: boundBuild.skillVersion,
+      contentHash: boundBuild.skillContentHash,
+    };
     const skillVersion = skillDescriptor.version;
     const skillContentHash = skillDescriptor.contentHash;
     const reservation = await reserveKnowledgeBaseTurn({
@@ -4543,6 +7613,9 @@ router.post("/turn/attachments/stage", async (req, res) => {
     if (
       !attachment ||
       !manifestItem ||
+      !manifestItem.itemId ||
+      manifestItem.ordinal !== index + 1 ||
+      manifestItem.total !== manifest.length ||
       attachment.filename !== manifestItem.filename
     ) {
       throw new KnowledgeBaseTurnReservationError(
@@ -4574,33 +7647,50 @@ router.post("/turn/attachments/stage", async (req, res) => {
       req.frontmindUser.id,
       conversationId,
     );
-    const parentTaskId = String(build?.upstreamTaskId || "");
-    if (!build || !parentTaskId) {
+    const isStartReservation = Boolean(
+      build &&
+        build.activeTurnId === turnId &&
+        build.revision === 0 &&
+        build.currentLeafId === null,
+    );
+    const parentTaskId = String(
+      build?.canonicalTaskId || build?.upstreamTaskId || "",
+    );
+    if (!build || (!isStartReservation && !parentTaskId)) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
         "当前知识库尚未绑定可恢复任务，请先同步状态",
       );
     }
-    // Historical deferred reservations may predate the provenance gate. Check
-    // the immutable build before staging can claim a lease or launch upstream.
-    await assertKnowledgeBaseFinalLogoProvenanceForBuild(
-      req.frontmindUser.id,
-      build,
-    );
-    const taskCredential = await getCredentialForUpstreamResource(
-      req.frontmindUser.id,
-      "task",
-      parentTaskId,
-    );
+    // A first start reservation has no provider task by design. Its exact
+    // credential was frozen on the durable turn before any browser bytes.
+    const projectAssignmentId =
+      req.frontmindDeliveryProjectContext?.projectAssignmentId;
+    const taskCredential = isStartReservation
+      ? await getDecryptedCredentialForKnowledgeBaseUploadReservation({
+          userId: req.frontmindUser.id,
+          conversationId,
+          turnId,
+          projectAssignmentId: projectAssignmentId ?? null,
+        })
+      : await getCredentialForUpstreamResource(
+          req.frontmindUser.id,
+          "task",
+          parentTaskId,
+          projectAssignmentId,
+        );
     const fileCredential = await getCredentialForUpstreamResource(
       req.frontmindUser.id,
       "file",
       attachment.file_id,
+      projectAssignmentId,
     );
     if (
-      !taskCredential ||
       !fileCredential ||
-      !credentialsUseSameUpstreamApiKey(fileCredential, taskCredential)
+      (isStartReservation
+        ? !taskCredential || fileCredential.id !== taskCredential.id
+        : !taskCredential ||
+          !credentialsUseSameUpstreamApiKey(fileCredential, taskCredential))
     ) {
       if (await replayAfterMutableFailure()) return;
       const observation = await getKnowledgeBaseObservation({
@@ -4617,9 +7707,64 @@ router.post("/turn/attachments/stage", async (req, res) => {
       });
       return;
     }
+    // A provider file id is never sufficient authority for staging. Resolve
+    // the exact server-owned managed intent by the frozen itemId, prove its
+    // receipt/provider generation, then read the Dashboard retained stream to
+    // EOF and re-hash it before any turn metadata is mutated.
+    const managedUploadProof = await proveKnowledgeBaseManagedUploadForStage({
+      userId: req.frontmindUser.id,
+      projectAssignmentId: projectAssignmentId ?? null,
+      conversationId,
+      turnId,
+      clientRequestId,
+      credential: {
+        id: fileCredential.id,
+        userId: fileCredential.userId,
+        version: fileCredential.version,
+      },
+      manifestItem: {
+        itemId: manifestItem.itemId,
+        filename: manifestItem.filename,
+        mimeType: manifestItem.mimeType,
+        sizeBytes: manifestItem.sizeBytes,
+        sha256: manifestItem.sha256,
+        ordinal: manifestItem.ordinal,
+        total: manifestItem.total,
+      },
+      index,
+      total: manifest.length,
+      fileId: attachment.file_id,
+    });
+    // Install immutable build-owned bytes before the DB stage. A crash here
+    // can leave only a content-addressed duplicate; it cannot authorize the
+    // turn. Once the DB write succeeds, active-build recovery no longer
+    // depends on the generic 30-day retained-file lifetime.
+    const buildOwnedSource = await persistKnowledgeBaseBuildSource({
+      userId: req.frontmindUser.id,
+      buildId: build.id,
+      generation: build.generation,
+      bytes: managedUploadProof.bytes,
+    });
+    if (
+      buildOwnedSource.contentSha256 !== managedUploadProof.sha256 ||
+      buildOwnedSource.sizeBytes !== managedUploadProof.sizeBytes
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Dashboard 知识库固定副本与上传证明不一致",
+      );
+    }
+    const deferredLogoPolicy = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: build.providerProtocol,
+      legacyLogoRequired:
+        !isStartReservation && knowledgeBaseBuildRequiresOfficialLogo(build),
+    });
     const deferredOfficialLogoRequired =
-      knowledgeBaseBuildRequiresOfficialLogo(build);
-    if (knowledgeBaseManifestRepeatsOfficialLogo(build, manifest)) {
+      deferredLogoPolicy.requiresOfficialLogo;
+    if (
+      deferredLogoPolicy.rejectRepeatedOfficialLogo &&
+      knowledgeBaseManifestRepeatsOfficialLogo(build, manifest)
+    ) {
       if (await replayAfterMutableFailure()) return;
       const message =
         "该图片与已绑定的企业主 Logo 完全相同，无需作为普通补图再次上传";
@@ -4691,16 +7836,46 @@ router.post("/turn/attachments/stage", async (req, res) => {
     // Re-downloading the entire object here made submission time depend on
     // object-store read-after-write visibility and incorrectly rejected slow
     // or large uploads after an arbitrary verification window.
-    const dispatchClaim =
-      await stageAndClaimKnowledgeBaseDeferredTurnAttachment({
-        userId: req.frontmindUser.id,
-        buildId: build.id,
-        turnId,
-        clientRequestId,
-        clientAttachmentManifest: manifest,
-        index,
-        attachment,
-      });
+    const dispatchClaim = isStartReservation
+      ? {
+          state: "awaiting_attachments" as const,
+          turn: await stageKnowledgeBaseDeferredTurnAttachment({
+            userId: req.frontmindUser.id,
+            buildId: build.id,
+            turnId,
+            clientRequestId,
+            clientAttachmentManifest: manifest,
+            index,
+            attachment,
+            managedUploadProof: {
+              intentId: managedUploadProof.intentId,
+              itemId: managedUploadProof.operationId,
+              mimeType: managedUploadProof.mimeType,
+              sizeBytes: managedUploadProof.sizeBytes,
+              contentSha256: managedUploadProof.sha256,
+              localStorageKey: buildOwnedSource.storageKey,
+            },
+            projectAssignmentId: projectAssignmentId ?? null,
+          }),
+        }
+      : await stageAndClaimKnowledgeBaseDeferredTurnAttachment({
+          userId: req.frontmindUser.id,
+          buildId: build.id,
+          turnId,
+          clientRequestId,
+          clientAttachmentManifest: manifest,
+          index,
+          attachment,
+          managedUploadProof: {
+            intentId: managedUploadProof.intentId,
+            itemId: managedUploadProof.operationId,
+            mimeType: managedUploadProof.mimeType,
+            sizeBytes: managedUploadProof.sizeBytes,
+            contentSha256: managedUploadProof.sha256,
+            localStorageKey: buildOwnedSource.storageKey,
+          },
+          projectAssignmentId: projectAssignmentId ?? null,
+        });
     dispatchClaimAcquiredByThisRequest = dispatchClaim.state === "acquired";
     const turn = dispatchClaim.turn;
     if (dispatchClaim.state !== "awaiting_attachments") {
@@ -4789,7 +7964,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
         });
         launchAcceptedKnowledgeBaseClaim({
           claim: acceptedClaim,
-          credential: taskCredential,
+          credential: taskCredential!,
           outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
         });
         return;
@@ -4838,6 +8013,20 @@ router.post("/turn/attachments/stage", async (req, res) => {
       )
     )
       return;
+    if (error instanceof ManagedUploadIntentError) {
+      const observation = req.frontmindUser
+        ? await getKnowledgeBaseObservation({
+            userId: req.frontmindUser.id,
+            conversationId,
+            upstreamStatus: "running",
+          }).catch(() => null)
+        : null;
+      res.status(error.statusCode).json({
+        error: { code: error.code, message: error.message },
+        ...(observation ? { observation } : {}),
+      });
+      return;
+    }
     if (error instanceof KnowledgeBaseTurnReservationError) {
       const observation = await getKnowledgeBaseObservation({
         userId: req.frontmindUser.id,
@@ -4908,9 +8097,13 @@ router.post("/turn/dispatch", async (req, res) => {
   let replayAfterMutableFailure: (() => Promise<boolean>) | null = null;
   try {
     await assertKnowledgeBaseWritable(req.frontmindUser.id);
-    const attachmentManifest = normalizeKnowledgeBaseClientAttachmentManifest(
-      body.attachmentManifest,
-    );
+    const attachmentManifest =
+      Array.isArray(body.attachmentManifest) &&
+      body.attachmentManifest.length === 0
+        ? []
+        : normalizeKnowledgeBaseClientAttachmentManifest(
+            body.attachmentManifest,
+          );
     replayAfterMutableFailure = () =>
       respondIfKnowledgeBaseTurnReplay({
         userId: req.frontmindUser!.id,
@@ -4933,8 +8126,16 @@ router.post("/turn/dispatch", async (req, res) => {
       req.frontmindUser.id,
       conversationId,
     );
-    const parentTaskId = String(build?.upstreamTaskId || "");
-    if (!build || !parentTaskId) {
+    const isStartReservation = Boolean(
+      build &&
+        build.activeTurnId === turnId &&
+        build.revision === 0 &&
+        build.currentLeafId === null,
+    );
+    const parentTaskId = String(
+      build?.canonicalTaskId || build?.upstreamTaskId || "",
+    );
+    if (!build || (!isStartReservation && !parentTaskId)) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
         "当前知识库尚未绑定可恢复任务，请先同步状态",
@@ -4942,15 +8143,32 @@ router.post("/turn/dispatch", async (req, res) => {
     }
     // Run before claimKnowledgeBaseDeferredTurnDispatch mutates the lease. The
     // assertion is a no-op outside the final v4 coordinate.
-    await assertKnowledgeBaseFinalLogoProvenanceForBuild(
-      req.frontmindUser.id,
-      build,
-    );
-    const taskCredential = await getCredentialForUpstreamResource(
-      req.frontmindUser.id,
-      "task",
-      parentTaskId,
-    );
+    const dispatchLogoPolicy = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: build.providerProtocol,
+      legacyLogoRequired:
+        !isStartReservation && knowledgeBaseBuildRequiresOfficialLogo(build),
+    });
+    if (!isStartReservation && dispatchLogoPolicy.assertFinalLogoProvenance) {
+      await assertKnowledgeBaseFinalLogoProvenanceForBuild(
+        req.frontmindUser.id,
+        build,
+      );
+    }
+    const projectAssignmentId =
+      req.frontmindDeliveryProjectContext?.projectAssignmentId;
+    const taskCredential = isStartReservation
+      ? await getDecryptedCredentialForKnowledgeBaseUploadReservation({
+          userId: req.frontmindUser.id,
+          conversationId,
+          turnId,
+          projectAssignmentId: projectAssignmentId ?? null,
+        })
+      : await getCredentialForUpstreamResource(
+          req.frontmindUser.id,
+          "task",
+          parentTaskId,
+          projectAssignmentId,
+        );
     if (!taskCredential) {
       if (await replayAfterMutableFailure()) return;
       const observation = await getKnowledgeBaseObservation({
@@ -4985,7 +8203,7 @@ router.post("/turn/dispatch", async (req, res) => {
       return;
     }
 
-    const officialLogoRequired = knowledgeBaseBuildRequiresOfficialLogo(build);
+    const officialLogoRequired = dispatchLogoPolicy.requiresOfficialLogo;
     if (
       !officialLogoRequired &&
       knowledgeBaseManifestRepeatsOfficialLogo(build, attachmentManifest)
@@ -5122,7 +8340,7 @@ router.post("/turn/dispatch", async (req, res) => {
     });
     launchAcceptedKnowledgeBaseClaim({
       claim: acceptedClaim,
-      credential: taskCredential,
+      credential: taskCredential!,
       outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
     });
   } catch (caught) {
@@ -5413,6 +8631,11 @@ router.post("/turn", async (req, res) => {
       return;
     }
     const { build: boundBuild, taskId } = authority;
+    const directLogoPolicy = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: boundBuild.providerProtocol,
+      manualLogoSubmission,
+      legacyLogoRequired: knowledgeBaseBuildRequiresOfficialLogo(boundBuild),
+    });
     assertKnowledgeBaseExpectedGeneration({
       expectedGeneration,
       actualGeneration: boundBuild.generation,
@@ -5516,8 +8739,7 @@ router.post("/turn", async (req, res) => {
         }
       }
 
-      const officialLogoRequired =
-        knowledgeBaseBuildRequiresOfficialLogo(boundBuild);
+      const officialLogoRequired = directLogoPolicy.requiresOfficialLogo;
       if (
         officialLogoRequired &&
         (attachments.length !== 1 ||
@@ -5552,7 +8774,9 @@ router.post("/turn", async (req, res) => {
     const officialLogoUploadCandidate:
       | Omit<KnowledgeBaseOfficialLogoUpload, "verified">
       | undefined =
-      manualLogoSubmission && attachmentManifest?.[0] && attachments[0]
+      directLogoPolicy.validateManualLogoSubmission &&
+      attachmentManifest?.[0] &&
+      attachments[0]
         ? {
             index: 0,
             fileId: attachments[0].file_id,
@@ -5561,7 +8785,7 @@ router.post("/turn", async (req, res) => {
             sizeBytes: attachmentManifest[0].sizeBytes,
             sourceSha256: attachmentManifest[0].sha256,
           }
-        : knowledgeBaseBuildRequiresOfficialLogo(boundBuild) &&
+        : directLogoPolicy.inferOrdinaryAttachmentAsLogo &&
             attachmentManifest?.length === 1 &&
             attachments.length === 1
           ? {
@@ -5573,16 +8797,16 @@ router.post("/turn", async (req, res) => {
               sourceSha256: attachmentManifest[0]!.sha256,
             }
           : undefined;
-    if (
-      knowledgeBaseBuildRequiresOfficialLogo(boundBuild) &&
-      !officialLogoUploadCandidate
-    ) {
+    if (directLogoPolicy.requiresOfficialLogo && !officialLogoUploadCandidate) {
       throw new KnowledgeBaseTurnReservationError(
         "INVALID_REQUEST",
         "请先上传一张合格的企业官方主 Logo，再继续确认第一个知识节点",
       );
     }
-    if (manualLogoSubmission && officialLogoUploadCandidate) {
+    if (
+      directLogoPolicy.validateManualLogoSubmission &&
+      officialLogoUploadCandidate
+    ) {
       await assertManualKnowledgeBaseLogoUploadCandidate(
         officialLogoUploadCandidate,
       );
@@ -5598,21 +8822,22 @@ router.post("/turn", async (req, res) => {
     });
     // Keep the direct path aligned with deferred reserve/stage/dispatch: a
     // final-coordinate build with missing provenance is repair-only.
-    await assertKnowledgeBaseFinalLogoProvenanceForBuild(
-      req.frontmindUser!.id,
-      boundBuild,
-    );
-    const currentSkillDescriptor = finalPackageRequired
-      ? await getKnowledgeBaseSkillDescriptor(
-          knowledgeBasePinnedV4SkillSelection({
-            skillVersion: boundBuild.skillVersion,
-            skillContentHash: boundBuild.skillContentHash,
-          }),
-        )
-      : {
-          version: boundBuild.skillVersion,
-          contentHash: boundBuild.skillContentHash,
-        };
+    if (finalPackageRequired && directLogoPolicy.assertFinalLogoProvenance) {
+      await assertKnowledgeBaseFinalLogoProvenanceForBuild(
+        req.frontmindUser!.id,
+        boundBuild,
+      );
+    }
+    if (finalPackageRequired) {
+      knowledgeBasePinnedV4SkillSelection({
+        skillVersion: boundBuild.skillVersion,
+        skillContentHash: boundBuild.skillContentHash,
+      });
+    }
+    const currentSkillDescriptor = {
+      version: boundBuild.skillVersion,
+      contentHash: boundBuild.skillContentHash,
+    };
     const recoveryMetadata = {
       kind: "turn",
       conversationId,
@@ -5933,10 +9158,8 @@ router.post("/turn", async (req, res) => {
         const failureToPersist =
           knowledgeBaseManualLogoCreateFailureForPersistence(error);
         try {
-          failureClass = await persistKnowledgeBaseCreateFailure({
-            userId: acceptedClaim.turn.userId,
-            turnId: acceptedClaim.turn.id,
-            leaseToken: acceptedClaim.leaseToken,
+          failureClass = await persistKnowledgeBaseDispatchFailure({
+            claim: acceptedClaim,
             error: failureToPersist,
             outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
             recoveryDelayMs: 1_000,
@@ -6548,10 +9771,16 @@ router.post("/retry", async (req, res) => {
           "当前失败轮次没有服务端授权的重新生成操作",
         );
       }
-      await assertKnowledgeBaseFinalLogoProvenanceForBuild(
-        req.frontmindUser.id,
-        retryBuild,
-      );
+      const retryLogoPolicy = knowledgeBaseTurnLogoPolicy({
+        providerProtocol: retryBuild.providerProtocol,
+        legacyLogoRequired: knowledgeBaseBuildRequiresOfficialLogo(retryBuild),
+      });
+      if (retryLogoPolicy.assertFinalLogoProvenance) {
+        await assertKnowledgeBaseFinalLogoProvenanceForBuild(
+          req.frontmindUser.id,
+          retryBuild,
+        );
+      }
     }
     const retry = await reserveKnowledgeBaseRetryTurn({
       userId: req.frontmindUser.id,
@@ -7025,6 +10254,37 @@ router.post("/progress/reconcile", async (req, res) => {
           interaction: failure.observation?.interaction || null,
         });
       }
+      return;
+    }
+    if (boundBuild.providerProtocol === "manus_v2") {
+      const reconciled = await reconcilePolledManusV2KnowledgeBaseTask({
+        userId: req.frontmindUser!.id,
+        conversationId,
+        taskId,
+        apiKey: credential.apiKey,
+        baseUrl: getUpstreamBaseUrl(req),
+        build: boundBuild,
+      });
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser!.id,
+        conversationId,
+        upstreamStatus: reconciled.taskStatus,
+      });
+      res.json({
+        progress:
+          observation?.interaction.progress ||
+          reconciled.progress ||
+          currentObservation?.interaction.progress ||
+          null,
+        interaction:
+          observation?.interaction ||
+          currentObservation?.interaction ||
+          deriveKnowledgeBaseInteraction(
+            reconciled.progress,
+            reconciled.taskStatus,
+          ),
+        observation,
+      });
       return;
     }
     let taskResponse;

@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const authMocks = vi.hoisted(() => ({
   discardUnboundUpstreamFile: vi.fn(),
+  getDecryptedCredentialForKnowledgeBaseUploadReservation: vi.fn(),
   getCredentialForUpstreamResource: vi.fn(),
   recordUpstreamResource: vi.fn(),
 }));
@@ -30,6 +31,8 @@ vi.mock("./auth-service", async () => {
   return {
     ...actual,
     discardUnboundUpstreamFile: authMocks.discardUnboundUpstreamFile,
+    getDecryptedCredentialForKnowledgeBaseUploadReservation:
+      authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation,
     getCredentialForUpstreamResource:
       authMocks.getCredentialForUpstreamResource,
     recordUpstreamResource: authMocks.recordUpstreamResource,
@@ -78,24 +81,42 @@ import { MANAGED_UPLOAD_POST_INGRESS_TIMEOUT_MS } from "./managed-upload-provide
 
 async function withManusProxyServer(
   run: (baseUrl: string) => Promise<void>,
-  options: { authenticated?: boolean } = {},
+  options: {
+    authenticated?: boolean;
+    userId?: number;
+    projectAssignmentId?: string | null;
+    activeCredentialId?: string;
+    activeCredentialVersion?: number;
+    activeCredential?: boolean;
+  } = {},
 ) {
   const app = express();
   app.use(express.json());
   app.use((req: any, _res, next) => {
     if (options.authenticated) {
+      const userId = options.userId ?? 42;
       req.frontmindUser = {
-        id: 42,
+        id: userId,
         username: "capture-test-user",
         role: "user",
         isActive: true,
       };
-      req.frontmindCredential = {
-        id: "credential-capture-test",
-        userId: 42,
-        version: 1,
-        apiKey: "test-only-credential",
-      };
+      if (options.activeCredential !== false) {
+        req.frontmindCredential = {
+          id: options.activeCredentialId ?? "credential-capture-test",
+          userId,
+          version: options.activeCredentialVersion ?? 1,
+          apiKey: "test-only-credential",
+        };
+      }
+      if (options.projectAssignmentId) {
+        req.frontmindDeliveryProjectContext = {
+          projectAssignmentId: options.projectAssignmentId,
+          customerUserId: userId,
+          roleType: "ai_operations_engineer",
+          customerName: "Capture Test Customer",
+        };
+      }
     }
     next();
   });
@@ -114,6 +135,7 @@ async function withManusProxyServer(
 
 afterEach(() => {
   authMocks.discardUnboundUpstreamFile.mockReset();
+  authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockReset();
   authMocks.getCredentialForUpstreamResource.mockReset();
   authMocks.recordUpstreamResource.mockReset();
   retentionMocks.markUploadedFileRetention.mockClear();
@@ -306,6 +328,333 @@ describe("stage-first intent capability cache policy", () => {
             );
           },
           { authenticated: true },
+        );
+      });
+    });
+  });
+
+  it("rediscovers the complete frozen reservation with fresh tickets on the pinned retired credential", async () => {
+    const conversationId = "conversation-discovery";
+    const turnId = "00000000-0000-4000-8000-000000000042";
+    const clientRequestId = "client-discovery";
+    const projectAssignmentId = "project-discovery";
+    const attachmentManifest = [
+      {
+        itemId: "discovery-item-1",
+        ordinal: 1,
+        total: 2,
+        filename: "discovery-one.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 1,
+        lastModified: 1_700_000_000_001,
+        sha256: "a".repeat(64),
+      },
+      {
+        itemId: "discovery-item-2",
+        ordinal: 2,
+        total: 2,
+        filename: "discovery-two.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 2,
+        lastModified: 1_700_000_000_002,
+        sha256: "b".repeat(64),
+      },
+    ];
+    const pinnedRetiredCredential = {
+      id: "credential-frozen-retired",
+      userId: 42,
+      version: 7,
+      apiKey: "test-only-retired-credential",
+      fingerprint: "retired-fingerprint",
+      status: "retired" as const,
+      verifiedAt: null,
+      reservation: {
+        clientRequestId,
+        attachmentManifest,
+        stagedAttachmentCount: 1,
+      },
+    };
+    authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockResolvedValue(
+      pinnedRetiredCredential,
+    );
+    const now = Date.parse("2026-08-12T00:00:00.000Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+
+    await withCaptureAssetDirectory(async () => {
+      await withManagedUploadKey(async () => {
+        const createdTickets: Array<{
+          intentTicket: string;
+          expiresAt: number;
+        }> = [];
+        await withManusProxyServer(
+          async (baseUrl) => {
+            const resumeScope = {
+              kind: "knowledge_base",
+              conversationId,
+              turnId,
+              clientRequestId,
+            };
+            for (const item of attachmentManifest) {
+              const created = await fetch(`${baseUrl}/v1/managed-uploads`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  operationId: item.itemId,
+                  batchId: clientRequestId,
+                  ordinal: item.ordinal,
+                  total: item.total,
+                  filename: item.filename,
+                  mimeType: item.mimeType,
+                  sizeBytes: item.sizeBytes,
+                  resumeScope,
+                }),
+              });
+              expect(created.status).toBe(201);
+              createdTickets.push(
+                (await created.json()) as {
+                  intentTicket: string;
+                  expiresAt: number;
+                },
+              );
+            }
+
+            clock.mockReturnValue(now + 5_000);
+            const discovered = await fetch(
+              `${baseUrl}/v1/managed-uploads?conversationId=${conversationId}&turnId=${turnId}`,
+            );
+            expect(discovered.status).toBe(200);
+            expect(discovered.headers.get("cache-control")).toBe(
+              "private, no-store",
+            );
+            const payload = (await discovered.json()) as {
+              uploads: any[];
+              reservation: unknown;
+            };
+            expect(payload.reservation).toEqual({
+              clientRequestId,
+              attachmentManifest,
+              stagedAttachmentCount: 1,
+            });
+            expect(payload.uploads).toHaveLength(2);
+            expect(payload.uploads.map((upload) => upload.ordinal)).toEqual([
+              1, 2,
+            ]);
+            for (const [index, upload] of payload.uploads.entries()) {
+              expect(upload).toMatchObject({
+                batchId: clientRequestId,
+                ordinal: index + 1,
+                total: 2,
+                filename: attachmentManifest[index].filename,
+                mimeType: "application/pdf",
+                sizeBytes: attachmentManifest[index].sizeBytes,
+                state: "awaiting_browser",
+                clientRequestId,
+                intentTicket: expect.stringMatching(/^mi1\./u),
+                ticketExpiresAt: expect.any(Number),
+              });
+              expect(upload.intentTicket).not.toBe(
+                createdTickets[index].intentTicket,
+              );
+              expect(upload.ticketExpiresAt).toBeGreaterThan(
+                createdTickets[index].expiresAt,
+              );
+            }
+            expect(
+              authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation,
+            ).toHaveBeenLastCalledWith({
+              userId: 42,
+              projectAssignmentId,
+              conversationId,
+              turnId,
+            });
+          },
+          {
+            authenticated: true,
+            projectAssignmentId,
+            // The account has no current credential. Creation is authorized
+            // solely by the exact KB reservation's frozen retired credential.
+            activeCredential: false,
+          },
+        );
+
+        authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockResolvedValue(
+          null,
+        );
+        await withManusProxyServer(
+          async (baseUrl) => {
+            const response = await fetch(
+              `${baseUrl}/v1/managed-uploads?conversationId=${conversationId}&turnId=${turnId}`,
+            );
+            expect(response.status).toBe(403);
+            expect(await response.json()).toMatchObject({
+              error: { code: "UPLOAD_INTENT_FORBIDDEN" },
+            });
+          },
+          { authenticated: true, userId: 99, projectAssignmentId },
+        );
+        expect(
+          authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation,
+        ).toHaveBeenLastCalledWith({
+          userId: 99,
+          projectAssignmentId,
+          conversationId,
+          turnId,
+        });
+
+        await withManusProxyServer(
+          async (baseUrl) => {
+            const response = await fetch(
+              `${baseUrl}/v1/managed-uploads?conversationId=${conversationId}&turnId=${turnId}`,
+            );
+            expect(response.status).toBe(403);
+            expect(await response.json()).toMatchObject({
+              error: { code: "UPLOAD_INTENT_FORBIDDEN" },
+            });
+          },
+          {
+            authenticated: true,
+            userId: 42,
+            projectAssignmentId: "project-other",
+          },
+        );
+        expect(
+          authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation,
+        ).toHaveBeenLastCalledWith({
+          userId: 42,
+          projectAssignmentId: "project-other",
+          conversationId,
+          turnId,
+        });
+
+        authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockResolvedValue(
+          {
+            ...pinnedRetiredCredential,
+            id: "credential-drifted",
+            version: 8,
+            status: "active",
+          },
+        );
+        await withManusProxyServer(
+          async (baseUrl) => {
+            const response = await fetch(
+              `${baseUrl}/v1/managed-uploads?conversationId=${conversationId}&turnId=${turnId}`,
+            );
+            expect(response.status).toBe(403);
+            expect(await response.json()).toMatchObject({
+              error: { code: "UPLOAD_INTENT_FORBIDDEN" },
+            });
+          },
+          { authenticated: true, userId: 42, projectAssignmentId },
+        );
+      });
+    });
+  });
+
+  it("rejects every scoped upload tuple injection before allocating an intent or resume index", async () => {
+    const conversationId = "conversation-frozen-post";
+    const turnId = "00000000-0000-4000-8000-000000000043";
+    const clientRequestId = "client-frozen-post";
+    const projectAssignmentId = "project-frozen-post";
+    const attachmentManifest = [
+      {
+        itemId: "frozen-batch:1",
+        ordinal: 1,
+        total: 2,
+        filename: "frozen-one.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 11,
+        lastModified: 1_700_000_000_011,
+        sha256: "c".repeat(64),
+      },
+      {
+        itemId: "frozen-batch:2",
+        ordinal: 2,
+        total: 2,
+        filename: "frozen-two.txt",
+        mimeType: "text/plain",
+        sizeBytes: 12,
+        lastModified: 1_700_000_000_012,
+        sha256: "d".repeat(64),
+      },
+    ];
+    authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockResolvedValue(
+      {
+        id: "credential-frozen-post",
+        userId: 42,
+        version: 4,
+        apiKey: "test-only-frozen-post",
+        fingerprint: "frozen-post-fingerprint",
+        status: "active" as const,
+        verifiedAt: null,
+        reservation: {
+          clientRequestId,
+          attachmentManifest,
+          stagedAttachmentCount: 0,
+        },
+      },
+    );
+    const validRequest = {
+      operationId: attachmentManifest[0].itemId,
+      batchId: "frozen-batch",
+      ordinal: 1,
+      total: 2,
+      filename: attachmentManifest[0].filename,
+      mimeType: attachmentManifest[0].mimeType,
+      sizeBytes: attachmentManifest[0].sizeBytes,
+      resumeScope: {
+        kind: "knowledge_base",
+        conversationId,
+        turnId,
+        clientRequestId,
+      },
+    };
+    const attacks: Array<[string, Record<string, unknown>]> = [
+      ["extra ordinal", { operationId: "frozen-batch:3", ordinal: 3 }],
+      ["wrong item", { operationId: attachmentManifest[1].itemId }],
+      [
+        "wrong client request",
+        {
+          resumeScope: {
+            ...validRequest.resumeScope,
+            clientRequestId: "client-attacker",
+          },
+        },
+      ],
+      ["wrong batch", { batchId: "batch-attacker" }],
+      ["wrong ordinal", { ordinal: 2 }],
+      ["wrong total", { total: 3 }],
+      ["wrong filename", { filename: "attacker.pdf" }],
+      ["wrong MIME", { mimeType: "application/zip" }],
+      ["wrong size", { sizeBytes: 10 }],
+    ];
+
+    await withCaptureAssetDirectory(async (assetDirectory) => {
+      await withManagedUploadKey(async () => {
+        await withManusProxyServer(
+          async (baseUrl) => {
+            for (const [label, mutation] of attacks) {
+              const response = await fetch(`${baseUrl}/v1/managed-uploads`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ...validRequest, ...mutation }),
+              });
+              expect(response.status, label).toBe(409);
+              expect(await response.json(), label).toMatchObject({
+                error: { code: "UPLOAD_RESERVATION_MISMATCH" },
+              });
+            }
+
+            const intentRoot = path.join(
+              assetDirectory,
+              "managed-upload-intents",
+            );
+            const entries = await readdir(intentRoot).catch(() => []);
+            expect(entries).toEqual([]);
+            expect(
+              authMocks.getDecryptedCredentialForKnowledgeBaseUploadReservation,
+            ).toHaveBeenCalledTimes(attacks.length);
+          },
+          { authenticated: true, projectAssignmentId },
         );
       });
     });

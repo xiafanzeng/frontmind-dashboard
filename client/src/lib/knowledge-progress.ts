@@ -3,6 +3,7 @@ import type {
   KnowledgeBaseInteractionDto,
   KnowledgeBaseProgressDto,
 } from "@shared/knowledge-base-progress";
+import { deliveryProjectHeaders } from "@/lib/delivery-project";
 
 export type KnowledgeBaseObservationDto = SharedKnowledgeBaseObservationDto & {
   /** Transitional compatibility for endpoints that still return progress beside observation. */
@@ -120,7 +121,7 @@ export async function fetchKnowledgeBaseProgress(
   if (!conversationId) return null;
   const response = await fetch(
     `/api/knowledge-base/progress/${encodeURIComponent(conversationId)}`,
-    { credentials: "include" },
+    { credentials: "include", headers: deliveryProjectHeaders() },
   );
   if (!response.ok) throw new Error(await readErrorMessage(response));
   const payload = await response.json();
@@ -133,7 +134,7 @@ export async function fetchKnowledgeBaseInteraction(
   if (!conversationId) return null;
   const response = await fetch(
     `/api/knowledge-base/progress/${encodeURIComponent(conversationId)}`,
-    { credentials: "include" },
+    { credentials: "include", headers: deliveryProjectHeaders() },
   );
   if (!response.ok) throw new Error(await readErrorMessage(response));
   const payload = await response.json();
@@ -167,9 +168,70 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
   )
     ? (source.authoritativeTaskId ?? null)
     : (source.taskId ?? payload?.task?.id ?? null);
+  const hasDisplaySequence = Object.prototype.hasOwnProperty.call(
+    source,
+    "displaySequence",
+  );
+  const displaySequence = source.displaySequence;
+  if (
+    hasDisplaySequence &&
+    (typeof displaySequence !== "number" ||
+      !Number.isSafeInteger(displaySequence) ||
+      displaySequence < 0)
+  ) {
+    throw new Error("知识库状态接口返回了无效的 displaySequence");
+  }
+  const syncState = ["synced", "repairing", "attention_required"].includes(
+    source.syncState,
+  )
+    ? source.syncState
+    : undefined;
+  const processingPhase = [
+    "uploading",
+    "restoring_files",
+    "migrating_task",
+    "waiting_provider",
+    "accepting",
+    "package_preparing",
+  ].includes(source.processingPhase)
+    ? source.processingPhase
+    : source.processingPhase === null
+      ? null
+      : undefined;
+  const contentState = ["building", "completed"].includes(source.contentState)
+    ? source.contentState
+    : undefined;
+  const packageState = [
+    "not_started",
+    "preparing",
+    "retrying",
+    "ready",
+    "attention_required",
+  ].includes(source.packageState)
+    ? source.packageState
+    : undefined;
+  const publicationState = ["draft", "published"].includes(
+    source.publicationState,
+  )
+    ? source.publicationState
+    : undefined;
+  const contentCompletedAt =
+    source.contentCompletedAt === null ||
+    (typeof source.contentCompletedAt === "number" &&
+      Number.isSafeInteger(source.contentCompletedAt) &&
+      source.contentCompletedAt >= 0)
+      ? source.contentCompletedAt
+      : undefined;
   return {
     stateEpoch: Number(source.stateEpoch ?? 0),
     generation: Number(source.generation ?? 0),
+    ...(hasDisplaySequence ? { displaySequence } : {}),
+    ...(syncState ? { syncState } : {}),
+    ...(processingPhase !== undefined ? { processingPhase } : {}),
+    ...(contentState ? { contentState } : {}),
+    ...(packageState ? { packageState } : {}),
+    ...(publicationState ? { publicationState } : {}),
+    ...(contentCompletedAt !== undefined ? { contentCompletedAt } : {}),
     authoritativeTaskId,
     activeTurn: source.activeTurn ?? null,
     completedTurn: source.completedTurn ?? null,
@@ -195,7 +257,7 @@ export async function reconcileKnowledgeBaseObservation(
   const response = await fetch("/api/knowledge-base/progress/reconcile", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ conversationId: input.conversationId }),
     signal,
   });
@@ -204,7 +266,11 @@ export async function reconcileKnowledgeBaseObservation(
     if (response.status === 422) {
       const projectionResponse = await fetch(
         `/api/knowledge-base/progress/${encodeURIComponent(input.conversationId)}`,
-        { credentials: "include", signal },
+        {
+          credentials: "include",
+          headers: deliveryProjectHeaders(),
+          signal,
+        },
       );
       if (projectionResponse.ok) {
         const projection = normalizeObservation(
@@ -235,7 +301,7 @@ export async function retryKnowledgeBaseTurn(input: {
   const response = await fetch("/api/knowledge-base/retry", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(input),
   });
   if (!response.ok) {
@@ -260,7 +326,7 @@ export async function replaceKnowledgeBaseTurnAttachments(input: {
   const response = await fetch("/api/knowledge-base/turn/replace-attachments", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(input),
   });
   if (!response.ok) {
@@ -289,7 +355,7 @@ export async function repairKnowledgeBaseLogoProvenance(input: {
   const response = await fetch("/api/knowledge-base/logo-provenance/repair", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(input),
   });
   const payload = await response.json().catch(() => null);

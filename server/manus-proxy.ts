@@ -34,6 +34,7 @@ import {
   discardUnboundUpstreamFile,
   getEffectiveDecryptedCredentialForAccount,
   getCredentialForUpstreamResource,
+  getDecryptedCredentialForKnowledgeBaseUploadReservation,
   recordUpstreamResource,
 } from "./auth-service";
 import { getAccountMonthlyCreditUsage } from "./dashboard-service";
@@ -103,6 +104,7 @@ import {
   deleteManagedUploadIntent,
   ManagedUploadIntentError,
   MANAGED_UPLOAD_INTENT_MAX_BYTES,
+  listManagedUploadIntentsByResumeScope,
   processManagedUploadIntent,
   readManagedUploadIntent,
   receiveManagedUploadIntentBody,
@@ -3137,10 +3139,238 @@ function preventManagedIntentCapabilityCaching(res: Response) {
   });
 }
 
+type KnowledgeBaseManagedUploadResumeScope = {
+  kind: "knowledge_base";
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+};
+
+type KnowledgeBaseManagedUploadReservation = {
+  clientRequestId: string;
+  attachmentManifest: Array<{
+    filename: string;
+    sizeBytes: number;
+    mimeType: string;
+    lastModified: number;
+    sha256: string;
+    itemId?: string;
+    ordinal?: number;
+    total?: number;
+  }>;
+};
+
+function knowledgeBaseManagedUploadReservationMismatch(): never {
+  throw new ManagedUploadIntentError(
+    409,
+    "UPLOAD_RESERVATION_MISMATCH",
+    "文件上传参数与服务器预约不一致，请刷新后继续",
+    false,
+    "refresh_page",
+  );
+}
+
+/**
+ * A scoped upload is a capability bound to a server-frozen KB turn, not a
+ * client-selected operation namespace. Reject malformed scope objects instead
+ * of silently falling back to the generic upload path.
+ */
+function parseKnowledgeBaseManagedUploadResumeScope(
+  value: unknown,
+): KnowledgeBaseManagedUploadResumeScope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  const source = value as Record<string, unknown>;
+  const expectedKeys = ["clientRequestId", "conversationId", "kind", "turnId"];
+  if (
+    Object.keys(source).sort().join("\0") !== expectedKeys.join("\0") ||
+    source.kind !== "knowledge_base"
+  ) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  const conversationId = source.conversationId;
+  const turnId = source.turnId;
+  const clientRequestId = source.clientRequestId;
+  if (
+    typeof conversationId !== "string" ||
+    !conversationId ||
+    conversationId !== conversationId.trim() ||
+    conversationId.length > 191 ||
+    typeof turnId !== "string" ||
+    !turnId ||
+    turnId !== turnId.trim() ||
+    turnId.length > 36 ||
+    typeof clientRequestId !== "string" ||
+    !clientRequestId ||
+    clientRequestId !== clientRequestId.trim() ||
+    clientRequestId.length > 191
+  ) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  return { kind: "knowledge_base", conversationId, turnId, clientRequestId };
+}
+
+function frozenKnowledgeBaseManagedUploadItems(
+  reservation: KnowledgeBaseManagedUploadReservation,
+) {
+  const manifest = reservation.attachmentManifest;
+  if (
+    typeof reservation.clientRequestId !== "string" ||
+    !reservation.clientRequestId ||
+    reservation.clientRequestId !== reservation.clientRequestId.trim() ||
+    !Array.isArray(manifest) ||
+    manifest.length < 1 ||
+    manifest.length > 1_000
+  ) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  const itemIds = new Set<string>();
+  return manifest.map((item, index) => {
+    const ordinal = index + 1;
+    if (
+      !item ||
+      typeof item !== "object" ||
+      typeof item.itemId !== "string" ||
+      !item.itemId ||
+      item.itemId !== item.itemId.trim() ||
+      itemIds.has(item.itemId) ||
+      item.ordinal !== ordinal ||
+      item.total !== manifest.length ||
+      typeof item.filename !== "string" ||
+      !item.filename ||
+      item.filename !== item.filename.trim() ||
+      typeof item.mimeType !== "string" ||
+      !item.mimeType ||
+      item.mimeType !== item.mimeType.trim() ||
+      !Number.isSafeInteger(item.sizeBytes) ||
+      item.sizeBytes < 1
+    ) {
+      return knowledgeBaseManagedUploadReservationMismatch();
+    }
+    itemIds.add(item.itemId);
+    return {
+      itemId: item.itemId,
+      ordinal,
+      total: manifest.length,
+      filename: item.filename,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+    };
+  });
+}
+
+/**
+ * Starter uploads use the frozen clientRequestId as their batch coordinate.
+ * Attachment-turn uploads encode their independently frozen batch coordinate
+ * into every itemId as `<batch>:<ordinal>`. No client batch value is trusted.
+ */
+function frozenKnowledgeBaseManagedUploadBatchId(input: {
+  clientRequestId: string;
+  items: ReturnType<typeof frozenKnowledgeBaseManagedUploadItems>;
+}) {
+  const prefixes = input.items.map((item) => {
+    const suffix = `:${item.ordinal}`;
+    return item.itemId.endsWith(suffix)
+      ? item.itemId.slice(0, -suffix.length)
+      : null;
+  });
+  const first = prefixes[0];
+  return first && prefixes.every((prefix) => prefix === first)
+    ? first
+    : input.clientRequestId;
+}
+
+function bindManagedUploadRequestToKnowledgeBaseReservation(input: {
+  body: Record<string, unknown>;
+  resumeScope: KnowledgeBaseManagedUploadResumeScope;
+  reservation: KnowledgeBaseManagedUploadReservation;
+}) {
+  if (input.resumeScope.clientRequestId !== input.reservation.clientRequestId) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  const items = frozenKnowledgeBaseManagedUploadItems(input.reservation);
+  const operationId = input.body.operationId;
+  if (typeof operationId !== "string") {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  const item = items.find((candidate) => candidate.itemId === operationId);
+  const batchId = frozenKnowledgeBaseManagedUploadBatchId({
+    clientRequestId: input.reservation.clientRequestId,
+    items,
+  });
+  if (
+    !item ||
+    input.body.batchId !== batchId ||
+    input.body.ordinal !== item.ordinal ||
+    input.body.total !== item.total ||
+    input.body.filename !== item.filename ||
+    input.body.mimeType !== item.mimeType ||
+    input.body.sizeBytes !== item.sizeBytes
+  ) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  return { ...item, operationId, batchId };
+}
+
+router.get("/v1/managed-uploads", async (req: Request, res: Response) => {
+  preventManagedIntentCapabilityCaching(res);
+  const traceId = randomUUID();
+  if (!req.frontmindUser) {
+    return res.status(401).json({
+      error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
+    });
+  }
+  const conversationId =
+    typeof req.query.conversationId === "string"
+      ? req.query.conversationId
+      : "";
+  const turnId = typeof req.query.turnId === "string" ? req.query.turnId : "";
+  try {
+    // A filesystem manifest is only a resumability index, never current
+    // authorization. Re-prove the active turn, project boundary and its
+    // frozen active/retired credential before issuing a fresh capability.
+    const pinnedCredential =
+      await getDecryptedCredentialForKnowledgeBaseUploadReservation({
+        userId: req.frontmindUser.id,
+        projectAssignmentId:
+          req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+        conversationId,
+        turnId,
+      });
+    if (!pinnedCredential) {
+      throw new ManagedUploadIntentError(
+        403,
+        "UPLOAD_INTENT_FORBIDDEN",
+        "上传预约不属于当前账号、项目或知识库轮次",
+        false,
+        "refresh_page",
+      );
+    }
+    const uploads = await listManagedUploadIntentsByResumeScope({
+      userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      conversationId,
+      turnId,
+      credentialId: pinnedCredential.id,
+      credentialOwnerUserId: pinnedCredential.userId,
+      credentialVersion: pinnedCredential.version,
+    });
+    return res.status(200).json({
+      uploads,
+      reservation: pinnedCredential.reservation,
+      traceId,
+    });
+  } catch (error) {
+    return managedIntentErrorResponse(res, error, traceId);
+  }
+});
+
 router.post("/v1/managed-uploads", async (req: Request, res: Response) => {
   preventManagedIntentCapabilityCaching(res);
   const traceId = randomUUID();
-  if (!req.frontmindUser || !req.frontmindCredential) {
+  if (!req.frontmindUser) {
     return res.status(401).json({
       error: { message: "请先登录", code: "UNAUTHORIZED", traceId },
     });
@@ -3150,23 +3380,81 @@ router.post("/v1/managed-uploads", async (req: Request, res: Response) => {
       ? (req.body as Record<string, unknown>)
       : {};
   try {
+    const hasResumeScope = Object.prototype.hasOwnProperty.call(
+      body,
+      "resumeScope",
+    );
+    const resumeScope = hasResumeScope
+      ? parseKnowledgeBaseManagedUploadResumeScope(body.resumeScope)
+      : null;
+    let pinnedCredential: NonNullable<typeof req.frontmindCredential> | null =
+      req.frontmindCredential ?? null;
+    let frozenRequest: ReturnType<
+      typeof bindManagedUploadRequestToKnowledgeBaseReservation
+    > | null = null;
+    if (resumeScope) {
+      const reservationCredential =
+        await getDecryptedCredentialForKnowledgeBaseUploadReservation({
+          userId: req.frontmindUser.id,
+          projectAssignmentId:
+            req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+          conversationId: resumeScope.conversationId,
+          turnId: resumeScope.turnId,
+        });
+      if (reservationCredential) {
+        pinnedCredential = reservationCredential;
+        frozenRequest = bindManagedUploadRequestToKnowledgeBaseReservation({
+          body,
+          resumeScope,
+          reservation: reservationCredential.reservation,
+        });
+      } else {
+        pinnedCredential = null;
+      }
+    }
+    if (!pinnedCredential) {
+      if (!resumeScope) {
+        throw new ManagedUploadIntentError(
+          428,
+          "API_CREDENTIAL_REQUIRED",
+          "当前账号尚未由管理员配置 API Key",
+          false,
+          "contact_admin",
+        );
+      }
+      throw new ManagedUploadIntentError(
+        403,
+        "UPLOAD_INTENT_FORBIDDEN",
+        "上传预约不属于当前账号、项目或知识库轮次",
+        false,
+        "refresh_page",
+      );
+    }
     const manifest = await createManagedUploadIntent({
-      operationId: typeof body.operationId === "string" ? body.operationId : "",
-      batchId: typeof body.batchId === "string" ? body.batchId : "",
-      ordinal: Number(body.ordinal),
-      total: Number(body.total),
-      filename: typeof body.filename === "string" ? body.filename : "",
+      operationId:
+        frozenRequest?.operationId ??
+        (typeof body.operationId === "string" ? body.operationId : ""),
+      batchId:
+        frozenRequest?.batchId ??
+        (typeof body.batchId === "string" ? body.batchId : ""),
+      ordinal: frozenRequest?.ordinal ?? Number(body.ordinal),
+      total: frozenRequest?.total ?? Number(body.total),
+      filename:
+        frozenRequest?.filename ??
+        (typeof body.filename === "string" ? body.filename : ""),
       mimeType:
-        typeof body.mimeType === "string"
+        frozenRequest?.mimeType ??
+        (typeof body.mimeType === "string"
           ? body.mimeType
-          : "application/octet-stream",
-      sizeBytes: Number(body.sizeBytes),
+          : "application/octet-stream"),
+      sizeBytes: frozenRequest?.sizeBytes ?? Number(body.sizeBytes),
       userId: req.frontmindUser.id,
       projectAssignmentId:
         req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
-      credentialId: req.frontmindCredential.id,
-      credentialOwnerUserId: req.frontmindCredential.userId,
-      credentialVersion: req.frontmindCredential.version,
+      credentialId: pinnedCredential.id,
+      credentialOwnerUserId: pinnedCredential.userId,
+      credentialVersion: pinnedCredential.version,
+      resumeScope,
     });
     const ticket = createManagedUploadIntentTicket(manifest);
     return res.status(201).json({

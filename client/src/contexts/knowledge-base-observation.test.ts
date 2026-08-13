@@ -209,6 +209,127 @@ describe("authoritative KB observation reducer", () => {
     ).toBe(true);
   });
 
+  it("keeps an older accepted presentation visible while a newer turn is active", () => {
+    const active = observation(3, "turn-new", 1, "1.2", "## 1.2\n已批准正文");
+    active.approvedPresentation = {
+      ...active.approvedPresentation!,
+      turnId: "turn-old",
+      clientRequestId: "request-turn-old",
+      messageSequence: 13,
+    };
+
+    const next = applyKnowledgeBaseObservation(conversation(), active);
+
+    expect(
+      next.messages.some((message) => message.content.includes("已批准正文")),
+    ).toBe(true);
+    expect(next.knowledgeBase).toMatchObject({
+      activeTurnId: "turn-new",
+      presentationTurnId: "turn-old",
+    });
+  });
+
+  it("ignores an observation older than the latest accepted display sequence", () => {
+    const current = applyKnowledgeBaseObservation(conversation(), {
+      ...observation(2, "turn-old", 1, "1.2", "## 1.2\n已批准正文"),
+      displaySequence: 13,
+      approvedPresentation: {
+        ...observation(2, "turn-old", 1, "1.2", "## 1.2\n已批准正文")
+          .approvedPresentation!,
+        messageSequence: 13,
+      },
+    });
+    const stale = {
+      ...observation(3, "turn-stale", 1, "1.2", "## 1.2\n旧正文"),
+      displaySequence: 12,
+    };
+
+    expect(applyKnowledgeBaseObservation(current, stale)).toBe(current);
+  });
+
+  it("persists a completion receipt sequence and rejects an older observation at the same epoch", () => {
+    const completed = {
+      ...observation(5, "turn-final", 3, "1.3", "## 1.3\n最后一个节点"),
+      displaySequence: 21,
+      activeTurn: null,
+      completedTurn: {
+        turnId: "turn-final",
+        clientRequestId: "request-turn-final",
+        messageSequence: 20,
+      },
+      interaction: {
+        progress: null,
+        interactionState: "ready_to_publish" as const,
+        canReply: false,
+        canPublish: true,
+        lockReason: null,
+      },
+      approvedPresentation: {
+        ...observation(5, "turn-final", 3, "1.3", "## 1.3\n最后一个节点")
+          .approvedPresentation!,
+        messageSequence: 19,
+      },
+    };
+    const accepted = applyKnowledgeBaseObservation(conversation(), completed);
+
+    expect(accepted.knowledgeBase?.displaySequence).toBe(21);
+    expect(accepted.status).toBe("completed");
+    expect(
+      accepted.messages.some((message) => message.serverSequence === 21),
+    ).toBe(false);
+
+    const delayed = {
+      ...observation(5, "turn-stale", 3, "1.3", "## 1.3\n迟到的旧正文"),
+      displaySequence: 20,
+    };
+
+    expect(applyKnowledgeBaseObservation(accepted, delayed)).toBe(accepted);
+    const legacyDelayed = { ...delayed };
+    delete legacyDelayed.displaySequence;
+    legacyDelayed.approvedPresentation = {
+      ...legacyDelayed.approvedPresentation!,
+      messageSequence: 20,
+    };
+    expect(applyKnowledgeBaseObservation(accepted, legacyDelayed)).toBe(
+      accepted,
+    );
+  });
+
+  it("does not let same-epoch hydration rewind a persisted completion sequence", () => {
+    const local = applyKnowledgeBaseObservation(conversation(), {
+      ...observation(5, "turn-final", 3, "1.3", "## 1.3\n最后一个节点"),
+      displaySequence: 21,
+      activeTurn: null,
+      interaction: {
+        progress: null,
+        interactionState: "ready_to_publish" as const,
+        canReply: false,
+        canPublish: true,
+        lockReason: null,
+      },
+      approvedPresentation: {
+        ...observation(5, "turn-final", 3, "1.3", "## 1.3\n最后一个节点")
+          .approvedPresentation!,
+        messageSequence: 19,
+      },
+    });
+    const remote = applyKnowledgeBaseObservation(conversation(), {
+      ...observation(5, "turn-stale", 3, "1.3", "## 1.3\n最后一个节点"),
+      displaySequence: 20,
+      approvedPresentation: {
+        ...observation(5, "turn-stale", 3, "1.3", "## 1.3\n最后一个节点")
+          .approvedPresentation!,
+        messageSequence: 20,
+      },
+    });
+
+    const merged = mergeKnowledgeBaseHydration(local, remote);
+
+    expect(merged.knowledgeBase?.displaySequence).toBe(21);
+    expect(merged.status).toBe("completed");
+    expect(merged.knowledgeBase?.interactionState).toBe("ready_to_publish");
+  });
+
   it("keeps a network-unknown pending request unbound when only the old presentation is observed", () => {
     const releasedOld = {
       ...observation(2, "turn-1", 1, "1.2", "## 1.2\n旧的已批准正文"),
@@ -462,6 +583,39 @@ describe("authoritative KB observation reducer", () => {
     expect(
       twice.messages.filter((message) => message.role === "assistant"),
     ).toHaveLength(0);
+  });
+
+  it("keeps accepted content visible while surfacing v2 attention as local recovery", () => {
+    const recovering = {
+      ...observation(4, "turn-new", 1, "1.2", "## 1.2\n已批准正文"),
+      syncState: "attention_required" as const,
+      processingPhase: "waiting_provider" as const,
+      notice: {
+        key: "build:4:MANUS_V2_TASK_ERROR",
+        code: "MANUS_V2_TASK_ERROR",
+        severity: "warning" as const,
+        message: "系统正在恢复当前操作。已完成内容不受影响。",
+        retryable: true,
+        failureClass: "recoverable_same_turn" as const,
+        recoveryAction: "reconcile" as const,
+        canRegenerate: false,
+        turnId: "turn-new",
+        createdAt: 4,
+      },
+    };
+
+    const next = applyKnowledgeBaseObservation(conversation(), recovering);
+
+    expect(next.messages.at(-1)?.content).toContain("已批准正文");
+    expect(next.knowledgeBase).toMatchObject({
+      syncState: "attention_required",
+      processingPhase: "waiting_provider",
+      notice: {
+        severity: "warning",
+        recoveryAction: "reconcile",
+        canRegenerate: false,
+      },
+    });
   });
 
   it("does not let a stale hydration response erase an approved node", () => {

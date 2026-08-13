@@ -36,13 +36,16 @@ export function classifyKnowledgeBaseOpenRecoveryBuild(
     KnowledgeBaseBuild,
     | "activeTurnId"
     | "upstreamTaskId"
+    | "canonicalTaskId"
     | "status"
     | "awaitingResponseSince"
     | "packageStorageKey"
     | "protocolErrorCode"
   >,
 ): KnowledgeBaseOpenRecoveryKind | null {
-  if (build.activeTurnId || !build.upstreamTaskId) return null;
+  if (build.activeTurnId || !(build.canonicalTaskId || build.upstreamTaskId)) {
+    return null;
+  }
   if (
     build.status === "researching" ||
     (build.status === "confirming" && build.awaitingResponseSince)
@@ -101,7 +104,8 @@ export async function claimKnowledgeBaseOpenRecoveryBuild(
       !kind ||
       build.generation !== input.expectedGeneration ||
       build.stateEpoch !== input.expectedStateEpoch ||
-      build.upstreamTaskId !== input.expectedTaskId ||
+      (build.canonicalTaskId || build.upstreamTaskId) !==
+        input.expectedTaskId ||
       (build.recoveryLeaseExpiresAt &&
         build.recoveryLeaseExpiresAt.getTime() > now.getTime())
     ) {
@@ -124,7 +128,9 @@ export async function claimKnowledgeBaseOpenRecoveryBuild(
           eq(knowledgeBaseBuilds.userId, build.userId),
           eq(knowledgeBaseBuilds.generation, input.expectedGeneration),
           eq(knowledgeBaseBuilds.stateEpoch, input.expectedStateEpoch),
-          eq(knowledgeBaseBuilds.upstreamTaskId, input.expectedTaskId),
+          build.canonicalTaskId
+            ? eq(knowledgeBaseBuilds.canonicalTaskId, input.expectedTaskId)
+            : eq(knowledgeBaseBuilds.upstreamTaskId, input.expectedTaskId),
           isNull(knowledgeBaseBuilds.activeTurnId),
           or(
             isNull(knowledgeBaseBuilds.recoveryLeaseExpiresAt),

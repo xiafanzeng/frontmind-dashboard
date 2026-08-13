@@ -1,6 +1,6 @@
 import { TRPCError } from "@trpc/server";
 import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   apiCredentials,
@@ -20,10 +20,6 @@ import {
 } from "../drizzle/schema";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
 import { normalizeKnowledgeBaseAttachmentFilename } from "../shared/knowledge-base-attachment";
-import {
-  knowledgeBasePresentationMessagePublicId,
-  knowledgeBaseUserMessagePublicId,
-} from "../shared/knowledge-base-message";
 import { uniquifyOrderedIds } from "../shared/ordered-id";
 import {
   type AuthenticatedUser,
@@ -38,7 +34,15 @@ import {
   knowledgeBaseCustomerUploadResources,
   knowledgeBaseOfficialLogoUploadFromTurn,
 } from "./knowledge-base-customer-upload";
-import { knowledgeBaseMarkdownSha256 } from "./knowledge-base-package-validation";
+import {
+  knowledgeBaseMessageSchema,
+  matchesAuthoritativeKnowledgeBaseMessageTuple,
+  parsedKnowledgeBaseMessageMetadata,
+  type KnowledgeBaseMessageMetadata,
+  type ServerOwnedBuildIdentity,
+  type ServerOwnedMessageIdentity,
+  type ServerOwnedTurnIdentity,
+} from "./knowledge-base-authoritative-message";
 import { protectedProcedure, router } from "./_core/trpc";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
@@ -62,54 +66,11 @@ const inlineImageSchema = z.object({
   alt: z.string().max(512).optional(),
 });
 
-const knowledgeBaseMessageSchema = z.object({
-  schemaVersion: z.literal(1).optional(),
-  kind: z.enum(["pending_user", "presentation"]),
-  buildId: z.string().min(1).max(128).optional(),
-  operationKey: z.string().min(1).max(128).optional(),
-  clientRequestId: z.string().min(1).max(128).optional(),
-  turnId: z.string().min(1).max(128).optional(),
-  presentationKey: z.string().min(1).max(191).optional(),
-  generation: z.number().int().nonnegative().optional(),
-  revision: z.number().int().nonnegative().optional(),
-  leafId: z.string().max(191).nullable().optional(),
-  serverOwned: z.boolean().optional(),
-});
-
-type KnowledgeBaseMessageMetadata = z.infer<typeof knowledgeBaseMessageSchema>;
-
-type ServerOwnedMessageIdentity = {
-  id: string;
-  conversationId: string;
-  turnId: string | null;
-  userId: number;
-  role: string;
-  content: string;
-};
-
-type ServerOwnedTurnIdentity = {
-  id: string;
-  conversationId: string;
-  userId: number;
-  clientRequestId: string;
-  buildId: string | null;
-  buildGeneration: number | null;
-  operationKey: string | null;
-  expectedRevision: number | null;
-  expectedLeafId: string | null;
-};
-
 type ServerOwnedTurnResourceIdentity = ServerOwnedTurnIdentity &
   Pick<
     typeof conversationTurns.$inferSelect,
     "operationType" | "attachmentFileIds" | "metadata" | "status"
   >;
-
-type ServerOwnedBuildIdentity = {
-  id: string;
-  userId: number;
-  conversationId: string;
-};
 
 type ServerOwnedBuildResourceIdentity = ServerOwnedBuildIdentity &
   Pick<
@@ -128,113 +89,7 @@ type ServerOwnedBuildNodeIdentity = {
   sourceTurnId: string | null;
 };
 
-function knowledgeBasePresentationKey(input: {
-  buildId: string;
-  generation: number;
-  revision: number;
-  leafId: string;
-  content: string;
-}) {
-  return createHash("sha256")
-    .update(
-      [
-        input.buildId,
-        input.generation,
-        input.revision,
-        input.leafId,
-        knowledgeBaseMarkdownSha256(input.content),
-      ].join(":"),
-    )
-    .digest("hex");
-}
-
-/**
- * `serverOwned` is not an authentication token. A database message receives
- * immutable KB treatment only when its complete identity still matches the
- * server-reserved turn/build and the deterministic public message identity.
- */
-export function matchesAuthoritativeKnowledgeBaseMessageTuple(input: {
-  message: ServerOwnedMessageIdentity;
-  publicMessageId: string;
-  knowledgeBase: KnowledgeBaseMessageMetadata;
-  turn: ServerOwnedTurnIdentity | undefined;
-  build: ServerOwnedBuildIdentity | undefined;
-  publicConversationId: string;
-}) {
-  const { message, publicMessageId, knowledgeBase, turn, build } = input;
-  if (
-    knowledgeBase.serverOwned !== true ||
-    knowledgeBase.schemaVersion !== 1 ||
-    !turn ||
-    !build ||
-    message.userId !== turn.userId ||
-    message.conversationId !== turn.conversationId ||
-    message.turnId !== turn.id ||
-    build.userId !== message.userId ||
-    build.conversationId !== input.publicConversationId ||
-    knowledgeBase.turnId !== turn.id ||
-    knowledgeBase.buildId !== turn.buildId ||
-    knowledgeBase.buildId !== build.id ||
-    knowledgeBase.generation !== turn.buildGeneration ||
-    knowledgeBase.operationKey !== turn.operationKey ||
-    knowledgeBase.revision === undefined ||
-    knowledgeBase.leafId === undefined
-  ) {
-    return false;
-  }
-
-  if (knowledgeBase.kind === "pending_user") {
-    try {
-      if (
-        message.role !== "user" ||
-        publicMessageId !== knowledgeBaseUserMessagePublicId(turn.id) ||
-        knowledgeBase.clientRequestId !== turn.clientRequestId ||
-        knowledgeBase.presentationKey !== undefined ||
-        knowledgeBase.revision !== turn.expectedRevision ||
-        (knowledgeBase.leafId ?? null) !== (turn.expectedLeafId ?? null)
-      ) {
-        return false;
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  if (
-    message.role !== "assistant" ||
-    knowledgeBase.clientRequestId !== undefined ||
-    !knowledgeBase.presentationKey ||
-    !knowledgeBase.leafId ||
-    (knowledgeBase.revision !== turn.expectedRevision &&
-      knowledgeBase.revision !== (turn.expectedRevision ?? -2) + 1)
-  ) {
-    return false;
-  }
-  try {
-    return (
-      publicMessageId ===
-        knowledgeBasePresentationMessagePublicId(
-          knowledgeBase.presentationKey,
-        ) &&
-      knowledgeBase.presentationKey ===
-        knowledgeBasePresentationKey({
-          buildId: build.id,
-          generation: knowledgeBase.generation,
-          revision: knowledgeBase.revision,
-          leafId: knowledgeBase.leafId,
-          content: message.content,
-        })
-    );
-  } catch {
-    return false;
-  }
-}
-
-function parsedKnowledgeBaseMessageMetadata(metadata: MessageMetadata) {
-  const parsed = knowledgeBaseMessageSchema.safeParse(metadata.knowledgeBase);
-  return parsed.success ? parsed.data : undefined;
-}
+export { matchesAuthoritativeKnowledgeBaseMessageTuple };
 
 const messageSchema = z.object({
   id: z.string().min(1).max(128),
@@ -1393,7 +1248,6 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
     if (
       matchesAuthoritativeKnowledgeBaseMessageTuple({
         message,
-        publicMessageId: publicId(userId, message.id, projectAssignmentId),
         knowledgeBase,
         turn,
         build,

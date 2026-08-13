@@ -428,6 +428,13 @@
       "when": 1786354308771,
       "tag": "0060_knowledge_base_tree_policy",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "5",
+      "when": 1786541554323,
+      "tag": "0061_knowledge_base_resilient_manus_v2",
+      "breakpoints": true
     }
   ]
 }

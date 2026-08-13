@@ -12,6 +12,7 @@ import {
   buildMonitoringImportPreview,
   buildMonitoringCurrentTemplatePreview,
   assertKnowledgeArchiveEnterpriseIdentity,
+  assertDashboardOwnedKnowledgePackageEnterpriseIdentity,
   assertDashboardImportModuleEnabled,
   assertDashboardImportPublishHash,
   assertDashboardImportRevision,
@@ -867,6 +868,24 @@ describe("progress report screenshot validation", () => {
 });
 
 describe("knowledge archive enterprise identity", () => {
+  it("binds Dashboard-owned package identity to build and manifest rather than node prose", () => {
+    expect(() =>
+      assertDashboardOwnedKnowledgePackageEnterpriseIdentity({
+        brandName: "验收企业",
+        buildCompanyName: " 验收 企业 ",
+        manifestCompanyName: "验收企业",
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      assertDashboardOwnedKnowledgePackageEnterpriseIdentity({
+        brandName: "验收企业",
+        buildCompanyName: "验收企业",
+        manifestCompanyName: "另一企业",
+      }),
+    ).toThrow("验收企业");
+  });
+
   it("accepts a package that declares the account-bound enterprise", () => {
     expect(() =>
       assertKnowledgeArchiveEnterpriseIdentity({

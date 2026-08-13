@@ -49,6 +49,19 @@ export function observationNeedsPolling(
   now = Date.now(),
 ): boolean {
   const state = observation.interaction?.interactionState;
+  if (
+    state === "ready_to_publish" &&
+    (observation.packageState === "not_started" ||
+      observation.packageState === "preparing" ||
+      observation.packageState === "retrying")
+  ) {
+    // Semantic completion and local package generation are separate durable
+    // phases. The package worker does not advance the content stateEpoch, so
+    // keep a low-cost observation loop until its same-coordinate refinement
+    // becomes ready or build-local attention. Otherwise an open tab would
+    // never reveal the download button without a manual refresh.
+    return true;
+  }
   if (state !== "queued" && state !== "executing") {
     // Failed, published, ready-to-publish and stable awaiting-input states are
     // terminal from the coordinator's perspective. Focus/online may perform a

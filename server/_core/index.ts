@@ -12,6 +12,7 @@ import { configureServerTimeouts } from "./server-timeouts";
 import manusProxy from "../manus-proxy";
 import knowledgeBaseApi, {
   getKnowledgeBaseSkillDescriptor,
+  migrateActiveLegacyKnowledgeBaseBuilds,
   recoverExpiredKnowledgeBaseTurns,
   recoverOpenKnowledgeBaseTasks,
 } from "../knowledge-base-api";
@@ -44,6 +45,7 @@ import { resolveUpstreamCredential } from "./upstream-credential";
 import {
   enforceDeliveryProjectContext,
   enforceFrontMindProxyAccess,
+  rejectDeliveryMemberKnowledgeBaseProjectScope,
 } from "./frontmind-proxy-policy";
 import { processKnowledgeResetCleanupJobs } from "../knowledge-base-reset-service";
 import { sweepOrphanedKnowledgeBaseUploadEvidence } from "../knowledge-base-upload-evidence-lifecycle";
@@ -88,7 +90,10 @@ import { createProjectOrderRegistryService } from "../project-order-registry-ser
 import { startServiceContractLifecycleReconciliationScheduler } from "../service-entitlement";
 import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
 import knowledgeBaseArtifactApi from "../knowledge-base-artifact-api";
-import { auditKnowledgeBaseStateInvariants } from "../knowledge-base-invariant-audit";
+import {
+  auditKnowledgeBaseStateInvariants,
+  getKnowledgeBaseInvariantAuditSnapshot,
+} from "../knowledge-base-invariant-audit";
 import { runtimeErrorForLog } from "./runtime-error-log";
 import {
   ensureManagedUploadIntentWorker,
@@ -96,12 +101,22 @@ import {
 } from "../managed-upload-intent";
 import { knowledgeBaseNewBuildPolicyBinding } from "../knowledge-base-tree-policy-rollout";
 import {
+  knowledgeBaseManusV2ActiveMigrationEnabled,
+  knowledgeBaseManusV2WriterEnabled,
+} from "../knowledge-base-manus-v2-rollout";
+import {
   evaluateKnowledgeBaseReadiness,
   knowledgeBaseReadinessHttpStatus,
   knowledgeBaseRecoveryHealth,
   runLeasedKnowledgeBaseRecovery,
 } from "./knowledge-base-readiness";
 import { createKnowledgeBaseRecoverySweep } from "../knowledge-base-recovery-worker";
+import {
+  inspectKnowledgeBaseMigrationInventory,
+  knowledgeBaseMigrationDiagnostics,
+} from "../knowledge-base-migration-diagnostics";
+import { runKnowledgeBasePackageSweep } from "../knowledge-base-local-package";
+import { sweepKnowledgeBaseBuildSources } from "../knowledge-base-local-source-lifecycle";
 import {
   bundledMigrationManifestPath,
   evaluateMigrationJournal,
@@ -189,7 +204,21 @@ async function evaluateReleaseReadiness(
 
 async function startServer() {
   let migrationManifest: MigrationManifest | null = null;
+  // Parse this in every environment before opening the listener. A malformed
+  // rollout flag must not silently select either provider writer.
+  const knowledgeBaseManusV2Writer = knowledgeBaseManusV2WriterEnabled();
+  const knowledgeBaseManusV2ActiveMigration =
+    knowledgeBaseManusV2ActiveMigrationEnabled();
   const knowledgeBaseTreePolicyWriter = knowledgeBaseNewBuildPolicyBinding();
+  console.info("[KnowledgeBase] manus_v2_writer", {
+    enabled: knowledgeBaseManusV2Writer,
+    newBuildProviderProtocol: knowledgeBaseManusV2Writer
+      ? "manus_v2"
+      : "legacy_v1",
+  });
+  console.info("[KnowledgeBase] manus_v2_active_migration", {
+    enabled: knowledgeBaseManusV2ActiveMigration,
+  });
   console.info("[KnowledgeBase] tree_policy_writer", {
     enabled: knowledgeBaseTreePolicyWriter.treePolicyVersion === 2,
     treePolicyVersion: knowledgeBaseTreePolicyWriter.treePolicyVersion,
@@ -318,6 +347,8 @@ async function startServer() {
             migrationState.schema.status === "exact",
           recoveryRequired: process.env.NODE_ENV === "production",
           assetRootRequired: process.env.NODE_ENV === "production",
+          degradedBuildCount:
+            getKnowledgeBaseInvariantAuditSnapshot().degradedBuildCount,
         }),
         getDedicatedMonitorCredentialReadiness(),
       ]);
@@ -359,6 +390,18 @@ async function startServer() {
             skillVersion: knowledgeBaseTreePolicyWriter.skillVersion,
             skillContentHash: knowledgeBaseTreePolicyWriter.skillContentHash,
           },
+          knowledgeBaseManusV2Writer: {
+            enabled: knowledgeBaseManusV2Writer,
+            newBuildProviderProtocol: knowledgeBaseManusV2Writer
+              ? "manus_v2"
+              : "legacy_v1",
+          },
+          knowledgeBaseManusV2ActiveMigration: {
+            enabled: knowledgeBaseManusV2ActiveMigration,
+            diagnostics: knowledgeBaseMigrationDiagnostics.snapshot({
+              enabled: knowledgeBaseManusV2ActiveMigration,
+            }),
+          },
         },
         preparedFiles: {
           status: "ok",
@@ -378,7 +421,12 @@ async function startServer() {
           version,
           contentHash,
         })),
-        knowledgeBase: knowledgeBase.dto,
+        knowledgeBase: {
+          ...knowledgeBase.dto,
+          // Build-local findings are observable, but never participate in the
+          // readiness decision above.
+          ...getKnowledgeBaseInvariantAuditSnapshot(),
+        },
       };
       if (!ready) {
         console.error("[Health] readiness_unavailable", {
@@ -433,11 +481,15 @@ async function startServer() {
   app.use(
     "/api/knowledge-base/artifacts",
     requireExpressAuth,
+    enforceDeliveryProjectContext,
+    rejectDeliveryMemberKnowledgeBaseProjectScope,
     knowledgeBaseArtifactApi,
   );
   app.use(
     "/api/knowledge-base",
     requireExpressAuth,
+    enforceDeliveryProjectContext,
+    rejectDeliveryMemberKnowledgeBaseProjectScope,
     attachOptionalActiveCredential,
     knowledgeBaseApi,
   );
@@ -559,15 +611,44 @@ async function startServer() {
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
         recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),
+        ...(knowledgeBaseManusV2ActiveMigration
+          ? {
+              migrateActiveLegacyBuilds: (
+                options: Parameters<
+                  typeof migrateActiveLegacyKnowledgeBaseBuilds
+                >[0],
+              ) => migrateActiveLegacyKnowledgeBaseBuilds(options),
+            }
+          : {}),
         cleanupArtifactCandidates: () =>
           cleanupOrphanedKnowledgeBuildArtifactCandidates(),
       });
       const runKnowledgeRecovery = async () => {
-        try {
-          const recovery = await runLeasedKnowledgeBaseRecovery({
+        const [recoveryResult, packageResult] = await Promise.allSettled([
+          runLeasedKnowledgeBaseRecovery({
             tracker: knowledgeBaseRecoveryHealth,
             recover: recoverKnowledgeBaseState,
-          });
+          }),
+          runKnowledgeBasePackageSweep(),
+        ]);
+        if (packageResult.status === "fulfilled") {
+          const packages = packageResult.value;
+          if (packages.scanned || packages.ready || packages.failed) {
+            console.info(
+              "[KnowledgeBasePackage] scan_complete",
+              JSON.stringify(packages),
+            );
+          }
+        } else {
+          // Package generation is build-local. Its failure must not hide a
+          // successful provider recovery sweep or degrade global readiness.
+          console.error(
+            "[KnowledgeBasePackage] scan_failed",
+            runtimeErrorForLog(packageResult.reason),
+          );
+        }
+        if (recoveryResult.status === "fulfilled") {
+          const recovery = recoveryResult.value;
           if (!recovery) return;
           const { claimedTurnIds: _claimedTurnIds, ...turnMetrics } =
             recovery.turns;
@@ -576,15 +657,25 @@ async function startServer() {
             JSON.stringify({
               turns: turnMetrics,
               builds: recovery.builds,
+              migrations: recovery.migrations,
               artifacts: recovery.artifacts,
             }),
           );
-        } catch (error) {
+        } else {
           console.error(
             "[KnowledgeBaseRecovery] scan_failed",
-            runtimeErrorForLog(error),
+            runtimeErrorForLog(recoveryResult.reason),
           );
         }
+        await knowledgeBaseMigrationDiagnostics.recordSweep({
+          enabled: knowledgeBaseManusV2ActiveMigration,
+          infrastructureSucceeded: recoveryResult.status === "fulfilled",
+          loadInventory: async () => {
+            const db = await getDb();
+            if (!db) throw new Error("Database is not configured");
+            return inspectKnowledgeBaseMigrationInventory(db);
+          },
+        });
       };
       void runKnowledgeRecovery();
       const knowledgeRecoveryTimer = setInterval(
@@ -593,9 +684,7 @@ async function startServer() {
       );
       knowledgeRecoveryTimer.unref();
       const runKnowledgeInvariantAudit = () => {
-        void auditKnowledgeBaseStateInvariants({
-          blockWritesOnP0: true,
-        }).catch((error) => {
+        void auditKnowledgeBaseStateInvariants().catch((error) => {
           console.error(
             "[KnowledgeBaseInvariant] audit_failed",
             runtimeErrorForLog(error),
@@ -616,12 +705,20 @@ async function startServer() {
         void Promise.all([
           processKnowledgeResetCleanupJobs(),
           sweepOrphanedKnowledgeBaseUploadEvidence(),
+          sweepKnowledgeBaseBuildSources(),
         ])
-          .then(([, evidence]) => {
-            if (!evidence.scanned && !evidence.failed) return;
+          .then(([, evidence, buildSources]) => {
+            if (
+              !evidence.scanned &&
+              !evidence.failed &&
+              !buildSources.scanned &&
+              !buildSources.failed
+            ) {
+              return;
+            }
             console.info(
               "[KnowledgeBaseEvidence] orphan_sweep_complete",
-              JSON.stringify(evidence),
+              JSON.stringify({ evidence, buildSources }),
             );
           })
           .catch((error) => {

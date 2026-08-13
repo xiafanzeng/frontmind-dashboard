@@ -242,6 +242,63 @@ describe("KnowledgeBasePollingCoordinator", () => {
     coordinator.dispose();
   });
 
+  it("polls a completed build until the same-epoch local package becomes ready", async () => {
+    let scheduled: (() => void) | undefined;
+    const preparing = {
+      ...executingObservation(),
+      stateEpoch: 9,
+      contentState: "completed" as const,
+      packageState: "preparing" as const,
+      interaction: {
+        ...executingObservation().interaction,
+        interactionState: "ready_to_publish" as const,
+      },
+    };
+    const ready = {
+      ...preparing,
+      packageState: "ready" as const,
+      package: {
+        revision: 3,
+        outputItemId: null,
+        fileId: null,
+        filename: "knowledge-base.zip",
+        mimeType: "application/zip" as const,
+        sha256: "a".repeat(64),
+        sizeBytes: 128,
+        downloadPath: "/api/knowledge-base/artifacts/build/package",
+      },
+    };
+    const observe = vi
+      .fn()
+      .mockResolvedValueOnce(preparing)
+      .mockResolvedValueOnce(ready);
+    const apply = vi.fn();
+    const coordinator = new KnowledgeBasePollingCoordinator({
+      observe,
+      apply,
+      now: () => 1_000,
+      setTimer: ((callback: () => void) => {
+        scheduled = callback;
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      }) as unknown as typeof setTimeout,
+    });
+
+    coordinator.wake("conversation");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(observationNeedsPolling(preparing)).toBe(true);
+    expect(scheduled).toBeTypeOf("function");
+
+    scheduled?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(apply).toHaveBeenNthCalledWith(2, "conversation", ready);
+    expect(observationNeedsPolling(ready)).toBe(false);
+    expect(observe).toHaveBeenCalledTimes(2);
+    coordinator.dispose();
+  });
+
   it("does not extend the pending-request grace when the same request wakes again", async () => {
     let now = 1_000;
     let scheduled: (() => void) | undefined;

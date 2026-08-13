@@ -2597,6 +2597,31 @@ export const knowledgeBaseBuilds = mysqlTable(
     companyName: varchar("companyName", { length: 255 }).notNull(),
     companyWebsite: text("companyWebsite"),
     upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
+    /**
+     * Provider protocol authority. Legacy rows continue to read through
+     * upstreamTaskId; v2 rows bind exactly one canonical writer task for the
+     * lifetime of a build generation.
+     */
+    providerProtocol: varchar("providerProtocol", { length: 32 })
+      .default("legacy_v1")
+      .notNull(),
+    canonicalTaskId: varchar("canonicalTaskId", { length: 255 }),
+    canonicalTaskGeneration: int("canonicalTaskGeneration", {
+      unsigned: true,
+    }),
+    canonicalCredentialId: varchar("canonicalCredentialId", {
+      length: 36,
+    }),
+    canonicalTaskState: varchar("canonicalTaskState", { length: 32 })
+      .default("unbound")
+      .notNull(),
+    canonicalTaskUrl: varchar("canonicalTaskUrl", { length: 1024 }),
+    canonicalTaskCreatedAt: timestamp("canonicalTaskCreatedAt"),
+    /** Content-safe hashes and old task references for a legacy handoff. */
+    handoffProvenance: json("handoffProvenance").$type<Record<
+      string,
+      unknown
+    > | null>(),
     skillName: varchar("skillName", { length: 128 })
       .default("socratic-kb-builder")
       .notNull(),
@@ -2667,6 +2692,22 @@ export const knowledgeBaseBuilds = mysqlTable(
     packageFileId: varchar("packageFileId", { length: 255 }),
     packageFilename: varchar("packageFilename", { length: 512 }),
     packageDescriptorHash: varchar("packageDescriptorHash", { length: 64 }),
+    /** Immutable physical Skill archive pinned for this build. */
+    skillArchiveSha256: varchar("skillArchiveSha256", { length: 64 }),
+    skillArchiveBytes: int("skillArchiveBytes", { unsigned: true }),
+    skillArchiveStorageKey: varchar("skillArchiveStorageKey", {
+      length: 1024,
+    }),
+    /** Content completion is independent from asynchronous package readiness. */
+    contentCompletedAt: timestamp("contentCompletedAt"),
+    packageStatus: varchar("packageStatus", { length: 32 })
+      .default("not_started")
+      .notNull(),
+    packageAttemptCount: int("packageAttemptCount", { unsigned: true })
+      .default(0)
+      .notNull(),
+    packageNextRetryAt: timestamp("packageNextRetryAt"),
+    packageLastErrorCode: varchar("packageLastErrorCode", { length: 128 }),
     /** Immutable, Dashboard-owned copy of the first-node official logo. */
     logoStorageKey: varchar("logoStorageKey", { length: 1024 }),
     logoSha256: varchar("logoSha256", { length: 64 }),
@@ -2697,6 +2738,12 @@ export const knowledgeBaseBuilds = mysqlTable(
       table.status,
     ),
     index("knowledge_base_builds_task_idx").on(table.upstreamTaskId),
+    uniqueIndex("knowledge_base_builds_canonical_task_idx").on(
+      table.canonicalTaskId,
+    ),
+    index("knowledge_base_builds_canonical_credential_idx").on(
+      table.canonicalCredentialId,
+    ),
     index("knowledge_base_builds_active_turn_idx").on(table.activeTurnId),
     index("knowledge_base_builds_recovery_lease_idx").on(
       table.status,

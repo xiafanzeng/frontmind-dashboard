@@ -142,6 +142,13 @@ import {
   createManagedServiceUser,
 } from "./managed-user-onboarding-service";
 import {
+  applyKnowledgeBaseIncidentRepair,
+  KnowledgeBaseIncidentRepairAuthorizationError,
+  knowledgeBaseIncidentAuditTarget,
+  knowledgeBaseIncidentRepairKinds,
+  previewKnowledgeBaseIncidentRepair,
+} from "./knowledge-base-incident-repair";
+import {
   bulkAssignJenovaBrandTrackingCredential,
   configureJenovaBrandTrackingCredential,
   JenovaBrandTrackingError,
@@ -245,6 +252,10 @@ const presalesApiKeySchema = z
   .trim()
   .min(8, "API Key 至少需要 8 个字符")
   .max(4096, "API Key 不能超过 4096 个字符");
+
+const knowledgeBaseIncidentRepairKindSchema = z.enum(
+  knowledgeBaseIncidentRepairKinds,
+);
 
 export const adminUpdateServiceSchema = z
   .object({
@@ -793,6 +804,102 @@ export const adminRouter = router({
       } catch (error) {
         throw toTrpcError(error);
       }
+    }),
+
+    knowledgeBaseIncidentRepair: router({
+      preview: adminProcedure
+        .input(
+          z
+            .object({
+              userId: z.number().int().positive(),
+              conversationId: z.string().trim().min(1).max(191),
+              repairKind: knowledgeBaseIncidentRepairKindSchema,
+            })
+            .strict(),
+        )
+        .query(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
+          try {
+            await getManagedCredentialStatus(ctx.user, input.userId);
+            const preview = await previewKnowledgeBaseIncidentRepair(input);
+            if (!preview) {
+              throw new TRPCError({
+                code: "NOT_FOUND",
+                message: "未找到指定的知识库构建",
+              });
+            }
+            return preview;
+          } catch (error) {
+            if (error instanceof TRPCError) throw error;
+            if (
+              error instanceof KnowledgeBaseIncidentRepairAuthorizationError
+            ) {
+              throw new TRPCError({
+                code: "FORBIDDEN",
+                message: "该知识库修复尚未获得 Manus v2 发布授权",
+              });
+            }
+            throw toTrpcError(error);
+          }
+        }),
+      execute: adminProcedure
+        .input(
+          z
+            .object({
+              userId: z.number().int().positive(),
+              conversationId: z.string().trim().min(1).max(191),
+              repairKind: knowledgeBaseIncidentRepairKindSchema,
+              expectedStateHash: z
+                .string()
+                .trim()
+                .toLowerCase()
+                .regex(/^[a-f0-9]{64}$/u),
+              reason: z.string().trim().min(1).max(2_000),
+            })
+            .strict(),
+        )
+        .mutation(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
+          try {
+            await getManagedCredentialStatus(ctx.user, input.userId);
+            return await applyKnowledgeBaseIncidentRepair({
+              ...input,
+              afterApplyInTransaction: async (result, executor) => {
+                if (!result.applied) return;
+                await writeWorkspaceAuditEvent(
+                  {
+                    actor: ctx.user,
+                    action: "knowledge_base.incident_repair_applied",
+                    targetType: "knowledge_base_repair",
+                    targetId: knowledgeBaseIncidentAuditTarget(result.buildId),
+                    workspaceUserId: input.userId,
+                    reason: input.reason,
+                    metadata: {
+                      repairKind: result.repairKind,
+                      stateHash: result.expectedStateHash,
+                      previousGeneration: result.previousGeneration,
+                      generation: result.generation,
+                      nodeCount: result.nodeCount,
+                      userAttachmentCount: result.userAttachmentCount,
+                      outcome: "applied",
+                    },
+                  },
+                  executor,
+                );
+              },
+            });
+          } catch (error) {
+            if (
+              error instanceof KnowledgeBaseIncidentRepairAuthorizationError
+            ) {
+              throw new TRPCError({
+                code: "FORBIDDEN",
+                message: "该知识库修复尚未获得 Manus v2 发布授权",
+              });
+            }
+            throw toTrpcError(error);
+          }
+        }),
     }),
 
     content: router({

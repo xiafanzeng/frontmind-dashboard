@@ -78,6 +78,9 @@ export function classifyKnowledgeBaseUpstreamTaskStatus(
       "success",
       "done",
       "finished",
+      // Manus v2 emits `stopped` after a normal finish; failures arrive as
+      // the separate `error` status and error_message event.
+      "stopped",
     ]).has(normalized)
   ) {
     return {

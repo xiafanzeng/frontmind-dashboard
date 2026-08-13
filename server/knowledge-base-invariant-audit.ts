@@ -10,7 +10,6 @@ import {
 } from "../drizzle/schema";
 import { getDb } from "./db";
 import { readKnowledgeBuildArtifact } from "./knowledge-build-artifact-store";
-import { activateKnowledgeBaseInvariantWriteBlock } from "./knowledge-base-runtime-guard";
 import {
   inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority,
   inspectKnowledgeBaseRetryAuthority,
@@ -23,6 +22,37 @@ export type KnowledgeBaseInvariantViolation = {
   generation: number;
   turnId?: string | null;
 };
+
+export type KnowledgeBaseInvariantAuditSnapshot = {
+  scanned: number;
+  degradedBuildCount: number;
+  violationCount: number;
+  completedAt: string | null;
+};
+
+let latestKnowledgeBaseInvariantAudit = {
+  scanned: 0,
+  violations: [] as KnowledgeBaseInvariantViolation[],
+  completedAt: null as Date | null,
+};
+
+/**
+ * Readiness exposes build-local degradation for diagnostics only. The value
+ * deliberately has no influence on the readiness HTTP status or write path.
+ */
+export function getKnowledgeBaseInvariantAuditSnapshot(): KnowledgeBaseInvariantAuditSnapshot {
+  return {
+    scanned: latestKnowledgeBaseInvariantAudit.scanned,
+    degradedBuildCount: new Set(
+      latestKnowledgeBaseInvariantAudit.violations.map(
+        (violation) => violation.buildId,
+      ),
+    ).size,
+    violationCount: latestKnowledgeBaseInvariantAudit.violations.length,
+    completedAt:
+      latestKnowledgeBaseInvariantAudit.completedAt?.toISOString() ?? null,
+  };
+}
 
 function isValidRetryableFailedActiveTurn(
   build: KnowledgeBaseBuild,
@@ -173,19 +203,11 @@ export function findKnowledgeBaseInvariantViolations(input: {
         generation: build.generation,
       });
     }
-    if (
-      build.status === "ready_to_publish" &&
-      (!build.packageStorageKey ||
-        !build.packageArchiveSha256 ||
-        !build.packageSizeBytes ||
-        !build.logoStorageKey ||
-        !build.logoSha256 ||
-        !build.logoBytes ||
-        build.packageRevision !== build.revision ||
-        build.currentLeafId !== null)
-    ) {
+    // `ready_to_publish` means the content transaction completed. Package and
+    // optional Logo readiness are independent, recoverable resource states.
+    if (build.status === "ready_to_publish" && build.currentLeafId !== null) {
       violations.push({
-        code: "READY_ARTIFACT_BINDING_INVALID",
+        code: "CONTENT_COMPLETION_COORDINATE_INVALID",
         buildId: build.id,
         generation: build.generation,
       });
@@ -195,10 +217,7 @@ export function findKnowledgeBaseInvariantViolations(input: {
 }
 
 export async function auditKnowledgeBaseStateInvariants(
-  input: {
-    limit?: number;
-    blockWritesOnP0?: boolean;
-  } = {},
+  input: { limit?: number } = {},
 ) {
   const db = await getDb();
   if (!db)
@@ -249,40 +268,28 @@ export async function auditKnowledgeBaseStateInvariants(
 
     for (const build of builds) {
       if (
-        build.status !== "ready_to_publish" ||
+        build.packageStatus !== "ready" ||
         !build.packageArchiveSha256 ||
-        !build.packageSizeBytes ||
-        !build.logoSha256 ||
-        !build.logoBytes
+        !build.packageSizeBytes
       ) {
         continue;
       }
-      for (const kind of ["logo", "package"] as const) {
-        try {
-          await readKnowledgeBuildArtifact({
-            userId: build.userId,
-            buildId: build.id,
-            generation: build.generation,
-            kind,
-            storageKey:
-              kind === "logo"
-                ? build.logoStorageKey || undefined
-                : build.packageStorageKey || undefined,
-            expectedSha256:
-              kind === "logo" ? build.logoSha256 : build.packageArchiveSha256,
-            expectedBytes:
-              kind === "logo" ? build.logoBytes : build.packageSizeBytes,
-          });
-        } catch {
-          violations.push({
-            code:
-              kind === "logo"
-                ? "LOGO_INTEGRITY_MISMATCH"
-                : "PACKAGE_INTEGRITY_MISMATCH",
-            buildId: build.id,
-            generation: build.generation,
-          });
-        }
+      try {
+        await readKnowledgeBuildArtifact({
+          userId: build.userId,
+          buildId: build.id,
+          generation: build.generation,
+          kind: "package",
+          storageKey: build.packageStorageKey || undefined,
+          expectedSha256: build.packageArchiveSha256,
+          expectedBytes: build.packageSizeBytes,
+        });
+      } catch {
+        violations.push({
+          code: "PACKAGE_INTEGRITY_MISMATCH",
+          buildId: build.id,
+          generation: build.generation,
+        });
       }
     }
 
@@ -291,16 +298,18 @@ export async function auditKnowledgeBaseStateInvariants(
   }
 
   if (violations.length > 0) {
-    console.error(
-      "[KnowledgeBaseInvariant] p0",
+    console.warn(
+      "[KnowledgeBaseInvariant] build_degraded",
       JSON.stringify({
         count: violations.length,
         samples: violations.slice(0, 20),
       }),
     );
-    if (input.blockWritesOnP0 !== false) {
-      activateKnowledgeBaseInvariantWriteBlock(violations[0]!.code);
-    }
   }
+  latestKnowledgeBaseInvariantAudit = {
+    scanned,
+    violations: [...violations],
+    completedAt: new Date(),
+  };
   return { scanned, violations };
 }

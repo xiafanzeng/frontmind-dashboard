@@ -137,4 +137,98 @@ describe("KnowledgeBaseProgressPanel", () => {
     expect(metrics.className).not.toContain("sm:grid-cols-6");
     expect(branch.open).toBe(false);
   });
+
+  it("shows completed content immediately while the package is still preparing", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "ready_to_publish",
+            currentLeafId: null,
+          },
+          packageAllowed: false,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "知识库内容已完成，下载包正在后台准备；已完成正文不会回退。",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("uses a build-local warning while preserving completed content", () => {
+    const { container } = render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "ready_to_publish",
+            currentLeafId: null,
+            protocolError: "当前包操作正在对账",
+          },
+          packageAllowed: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("系统正在恢复当前操作")).toBeTruthy();
+    expect(screen.getByText("已完成内容不受影响。")).toBeTruthy();
+    expect(container.querySelector(".border-amber-200")).toBeTruthy();
+    expect(container.querySelector(".border-red-200")).toBeNull();
+    expect(
+      screen.getByText(
+        "知识库内容已完成，下载包正在后台准备；已完成正文不会回退。",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("distinguishes package ready from content-only completion", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "published",
+            currentLeafId: null,
+          },
+          packageAllowed: true,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText("知识库内容与下载包均已完成，可以直接更新。"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/下载包正在后台准备/)).toBeNull();
+  });
+
+  it("shows package attention as a local warning instead of endless preparation", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "ready_to_publish",
+            currentLeafId: null,
+          },
+          packageAllowed: false,
+          packageState: "attention_required",
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响。",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/下载包正在后台准备/)).toBeNull();
+  });
 });

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY } from "./delivery-project";
 
 import {
   isKnowledgeBaseProgressCoordinateOlder,
@@ -11,6 +12,7 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  sessionStorage.clear();
 });
 
 describe("reconcileKnowledgeBaseObservation", () => {
@@ -76,6 +78,103 @@ describe("reconcileKnowledgeBaseObservation", () => {
     expect(observation.authoritativeTaskId).toBeNull();
   });
 
+  it("preserves a valid display receipt sequence and rejects malformed values", () => {
+    const payload = {
+      observation: {
+        stateEpoch: 4,
+        generation: 2,
+        displaySequence: 17,
+        authoritativeTaskId: null,
+        activeTurn: null,
+        interaction: {
+          progress: null,
+          interactionState: "ready_to_publish",
+          canReply: false,
+          canPublish: true,
+          lockReason: null,
+        },
+        approvedPresentation: null,
+        package: null,
+        notice: null,
+        conversationVersion: 4,
+      },
+    };
+
+    expect(knowledgeBaseObservationFromPayload(payload).displaySequence).toBe(
+      17,
+    );
+    expect(() =>
+      knowledgeBaseObservationFromPayload({
+        observation: { ...payload.observation, displaySequence: "17" },
+      }),
+    ).toThrow("无效的 displaySequence");
+    expect(() =>
+      knowledgeBaseObservationFromPayload({
+        observation: { ...payload.observation, displaySequence: -1 },
+      }),
+    ).toThrow("无效的 displaySequence");
+  });
+
+  it("preserves validated repair status without trusting arbitrary server strings", () => {
+    const base = {
+      stateEpoch: 4,
+      generation: 2,
+      authoritativeTaskId: "canonical-task",
+      activeTurn: null,
+      interaction: {
+        progress: null,
+        interactionState: "running",
+        canReply: false,
+        canPublish: false,
+        lockReason: null,
+      },
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 4,
+    };
+    expect(
+      knowledgeBaseObservationFromPayload({
+        observation: {
+          ...base,
+          syncState: "attention_required",
+          processingPhase: "waiting_provider",
+          contentState: "completed",
+          packageState: "preparing",
+          publicationState: "draft",
+          contentCompletedAt: 17,
+        },
+      }),
+    ).toMatchObject({
+      syncState: "attention_required",
+      processingPhase: "waiting_provider",
+      contentState: "completed",
+      packageState: "preparing",
+      publicationState: "draft",
+      contentCompletedAt: 17,
+    });
+    expect(
+      knowledgeBaseObservationFromPayload({
+        observation: {
+          ...base,
+          syncState: "provider-secret-state",
+          processingPhase: "unsafe-side-effect",
+          contentState: "secret-content",
+          packageState: "secret-package",
+          publicationState: "secret-publication",
+          contentCompletedAt: "17",
+        },
+      }),
+    ).not.toMatchObject({
+      syncState: expect.anything(),
+      processingPhase: expect.anything(),
+      contentState: expect.anything(),
+      packageState: expect.anything(),
+      publicationState: expect.anything(),
+      contentCompletedAt: expect.anything(),
+    });
+  });
+
   it("recovers a durable failed projection after reconcile returns 422", async () => {
     const failedObservation = {
       stateEpoch: 3,
@@ -133,7 +232,68 @@ describe("reconcileKnowledgeBaseObservation", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       "/api/knowledge-base/progress/conversation-1",
-      { credentials: "include", signal: undefined },
+      { credentials: "include", headers: {}, signal: undefined },
+    );
+  });
+
+  it("carries the selected delivery project through reconcile and projection recovery", async () => {
+    sessionStorage.setItem(
+      DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+      "delivery-project-7",
+    );
+    const failedObservation = {
+      stateEpoch: 3,
+      generation: 1,
+      authoritativeTaskId: null,
+      activeTurn: null,
+      interaction: {
+        progress: null,
+        interactionState: "failed",
+        canReply: false,
+        canPublish: false,
+        lockReason: "PROGRESS_PROTOCOL_INVALID",
+      },
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 3,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("{}", { status: 422 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ observation: failedObservation }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await reconcileKnowledgeBaseObservation({
+      conversationId: "conversation-project",
+    });
+
+    const projectHeaders = {
+      "x-delivery-project-assignment-id": "delivery-project-7",
+    };
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/knowledge-base/progress/reconcile",
+      expect.objectContaining({
+        headers: {
+          ...projectHeaders,
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/knowledge-base/progress/conversation-project",
+      {
+        credentials: "include",
+        headers: projectHeaders,
+        signal: undefined,
+      },
     );
   });
 });

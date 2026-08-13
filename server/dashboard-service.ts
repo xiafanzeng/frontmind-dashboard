@@ -1153,6 +1153,7 @@ export async function createKnowledgeSnapshot(input: {
           status: knowledgeBaseBuilds.status,
           revision: knowledgeBaseBuilds.revision,
           upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
+          canonicalTaskId: knowledgeBaseBuilds.canonicalTaskId,
           packageRevision: knowledgeBaseBuilds.packageRevision,
           packageTaskId: knowledgeBaseBuilds.packageTaskId,
           packageDescriptorHash: knowledgeBaseBuilds.packageDescriptorHash,
@@ -1182,7 +1183,8 @@ export async function createKnowledgeSnapshot(input: {
         input.archiveHash === undefined ||
         builds[0].revision !== input.sourceBuildRevision ||
         builds[0].packageRevision !== input.sourceBuildRevision ||
-        builds[0].upstreamTaskId !== input.sourceTaskId ||
+        (builds[0].canonicalTaskId || builds[0].upstreamTaskId) !==
+          input.sourceTaskId ||
         builds[0].packageTaskId !== input.sourceTaskId ||
         knowledgeBasePublicationBindingHash(builds[0]) !==
           input.sourceArtifactHash

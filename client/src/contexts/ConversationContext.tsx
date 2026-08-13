@@ -20,8 +20,13 @@ import {
 } from "@/lib/frontmind-api";
 import { normalizeKnowledgeCollectionCopy } from "@shared/knowledge-base-copy";
 import type {
+  KnowledgeBaseContentState,
   KnowledgeBaseFailureClass,
+  KnowledgeBasePackageState,
+  KnowledgeBaseProcessingPhase,
+  KnowledgeBasePublicationState,
   KnowledgeBaseRecoveryAction,
+  KnowledgeBaseSyncState,
 } from "@shared/knowledge-base-progress";
 import {
   knowledgeBasePresentationMessagePublicId,
@@ -107,12 +112,13 @@ export interface LocalMessage {
   /** Server-approved knowledge-base projection metadata. Never inferred from raw output. */
   knowledgeBase?: {
     schemaVersion?: 1;
-    kind: "pending_user" | "presentation";
+    kind: "pending_user" | "presentation" | "completion";
     buildId?: string;
     operationKey?: string;
     clientRequestId?: string;
     turnId?: string;
     presentationKey?: string;
+    contentSha256?: string;
     generation?: number;
     revision?: number;
     leafId?: string | null;
@@ -138,6 +144,13 @@ export interface KnowledgeBaseClientState {
   initialized: boolean;
   generation: number;
   stateEpoch: number;
+  /** Latest immutable receipt sequence accepted for display in this conversation. */
+  displaySequence?: number;
+  syncState?: KnowledgeBaseSyncState;
+  processingPhase?: KnowledgeBaseProcessingPhase | null;
+  contentState?: KnowledgeBaseContentState;
+  packageState?: KnowledgeBasePackageState;
+  publicationState?: KnowledgeBasePublicationState;
   activeTurnId: string | null;
   activeClientRequestId: string | null;
   /** Provenance of the currently approved presentation; remains after the reservation is released. */
@@ -668,6 +681,12 @@ function emptyKnowledgeBaseClientState(): KnowledgeBaseClientState {
     initialized: false,
     generation: 0,
     stateEpoch: 0,
+    displaySequence: 0,
+    syncState: "synced",
+    processingPhase: null,
+    contentState: "building",
+    packageState: "not_started",
+    publicationState: "draft",
     activeTurnId: null,
     activeClientRequestId: null,
     presentationTurnId: null,
@@ -692,16 +711,12 @@ export function approvedKnowledgeBasePresentationMatches(
   observation: KnowledgeBaseObservationDto,
 ) {
   const presentation = observation.approvedPresentation;
-  const progress = observation.progress ?? observation.interaction.progress;
-  const activeTurnId = observationActiveTurnId(observation);
   return Boolean(
     presentation &&
       presentation.visibleMarkdown.trim() &&
       presentation.turnId &&
-      (!activeTurnId || presentation.turnId === activeTurnId) &&
-      progress &&
-      presentation.revision === progress.build.revision &&
-      presentation.leafId === progress.build.currentLeafId,
+      (presentation.messageSequence === undefined ||
+        Number.isSafeInteger(presentation.messageSequence)),
   );
 }
 
@@ -719,6 +734,41 @@ function knowledgeObservationIsStale(
   // awaiting_input after a 422) even when the durable build itself did not
   // advance stateEpoch. Only a strictly older monotonic coordinate is stale.
   return false;
+}
+
+function acceptedDisplaySequence(messages: readonly LocalMessage[]) {
+  return messages.reduce(
+    (latest, message) =>
+      isServerOwnedKnowledgeBaseMessage(message) &&
+      (message.knowledgeBase?.kind === "presentation" ||
+        message.knowledgeBase?.kind === "completion") &&
+      Number.isSafeInteger(message.serverSequence)
+        ? Math.max(latest, message.serverSequence!)
+        : latest,
+    0,
+  );
+}
+
+function persistedDisplaySequence(conversation: Conversation) {
+  const stateSequence = conversation.knowledgeBase?.displaySequence;
+  return Math.max(
+    Number.isSafeInteger(stateSequence) && stateSequence! >= 0
+      ? stateSequence!
+      : 0,
+    acceptedDisplaySequence(conversation.messages),
+  );
+}
+
+function observationDisplaySequence(observation: KnowledgeBaseObservationDto) {
+  if (observation.displaySequence !== undefined) {
+    return observation.displaySequence;
+  }
+  const presentationSequence =
+    observation.approvedPresentation?.messageSequence;
+  return Number.isSafeInteger(presentationSequence) &&
+    presentationSequence! >= 0
+    ? presentationSequence!
+    : 0;
 }
 
 function observationPrecedesPersistedKnowledgeBaseHistory(
@@ -807,7 +857,10 @@ export function applyKnowledgeBaseObservation(
   conversation: Conversation,
   observation: KnowledgeBaseObservationDto,
 ): Conversation {
+  const currentDisplaySequence = persistedDisplaySequence(conversation);
   if (
+    (currentDisplaySequence > 0 &&
+      observationDisplaySequence(observation) < currentDisplaySequence) ||
     knowledgeObservationIsStale(conversation.knowledgeBase, observation) ||
     observationPrecedesPersistedKnowledgeBaseHistory(
       conversation.messages,
@@ -991,6 +1044,11 @@ export function applyKnowledgeBaseObservation(
   // approved current node after a newer optimistic request and wait for a
   // subsequent history fetch to repair it.
   messages = mergeServerOwnedKnowledgeBaseMessages([], messages);
+  const displaySequence = Math.max(
+    currentDisplaySequence,
+    acceptedDisplaySequence(messages),
+    observationDisplaySequence(observation),
+  );
 
   const protectedMessageIds = new Set(
     messages
@@ -1059,6 +1117,12 @@ export function applyKnowledgeBaseObservation(
       initialized: true,
       generation: observation.generation,
       stateEpoch: observation.stateEpoch,
+      displaySequence,
+      syncState: observation.syncState,
+      processingPhase: observation.processingPhase,
+      contentState: observation.contentState,
+      packageState: observation.packageState,
+      publicationState: observation.publicationState,
       activeTurnId,
       activeClientRequestId,
       presentationTurnId:
@@ -1393,10 +1457,22 @@ function compareHydratedMessageOrder(left: LocalMessage, right: LocalMessage) {
       // that advances it. Sorting every pending message first temporarily put
       // 1.2 below the confirmation for 1.2, allowing 1.3 to render above 1.2
       // until a later hydration happened to rebuild the history.
+      type KnowledgeBaseMessageKind = NonNullable<
+        LocalMessage["knowledgeBase"]
+      >["kind"];
+      const leftKind = left.knowledgeBase?.kind;
+      const rightKind = right.knowledgeBase?.kind;
+      if (!leftKind || !rightKind) return 0;
+      const kindRank = (kind: KnowledgeBaseMessageKind) =>
+        kind === "pending_user" ? 0 : kind === "presentation" ? 1 : 2;
       if (sameTurn) {
-        return left.knowledgeBase?.kind === "pending_user" ? -1 : 1;
+        return kindRank(leftKind) - kindRank(rightKind);
       }
-      return left.knowledgeBase?.kind === "presentation" ? -1 : 1;
+      // A presentation belongs before the next turn's pending request; the
+      // completion receipt is terminal and remains last at its revision.
+      const crossTurnRank = (kind: KnowledgeBaseMessageKind) =>
+        kind === "presentation" ? 0 : kind === "pending_user" ? 1 : 2;
+      return crossTurnRank(leftKind) - crossTurnRank(rightKind);
     }
   }
   return left.timestamp - right.timestamp;
@@ -1519,11 +1595,24 @@ export function mergeKnowledgeBaseHydration(
   if (!local.knowledgeBase?.initialized) return remoteWithProtectedHistory;
   const localState = local.knowledgeBase;
   const remoteState = remote.knowledgeBase;
+  const localDisplaySequence = persistedDisplaySequence(local);
+  const remoteDisplaySequence = persistedDisplaySequence(
+    remoteWithProtectedHistory,
+  );
+  const remoteDisplaySequenceIsOlder =
+    localDisplaySequence > 0 && remoteDisplaySequence < localDisplaySequence;
+  const coordinatesMatch = Boolean(
+    remoteState?.initialized &&
+      remoteState.generation === localState.generation &&
+      remoteState.stateEpoch === localState.stateEpoch,
+  );
   const remoteIsNewer = Boolean(
     remoteState?.initialized &&
+      !remoteDisplaySequenceIsOlder &&
       (remoteState.generation > localState.generation ||
         (remoteState.generation === localState.generation &&
-          remoteState.stateEpoch > localState.stateEpoch)),
+          remoteState.stateEpoch > localState.stateEpoch) ||
+        (coordinatesMatch && remoteDisplaySequence > localDisplaySequence)),
   );
   if (remoteIsNewer) return remoteWithProtectedHistory;
 

@@ -29,6 +29,7 @@ import {
   assertKnowledgeBaseAttachmentManifestPresent,
   assertKnowledgeBaseExpectedGeneration,
   assertManualKnowledgeBaseLogoUploadCandidate,
+  applyKnowledgeBasePresentationProjectionGuard,
   classifyKnowledgeBaseUpstreamCreateFailure,
   classifyKnowledgeBaseOpenRecoveryFailure,
   createFrontMindTask,
@@ -47,6 +48,9 @@ import {
   knowledgeBaseManualLogoPendingResponse,
   knowledgeBaseManualLogoDeterministicCreateFailureStatus,
   knowledgeBaseManualLogoTerminalFailure,
+  knowledgeBaseManusV2LifecycleTestHooks,
+  knowledgeBasePresentationRequiresBoundLogo,
+  knowledgeBaseTurnLogoPolicy,
   knowledgeBaseTurnReplayHttpStatus,
   knowledgeBaseTurnReservationErrorStatus,
   knowledgeBaseUpstreamReadFailureAuthority,
@@ -59,6 +63,7 @@ import {
   logKnowledgeBaseRuntimeFailure,
   normalizeRecoveredTaskOutput,
   normalizeKnowledgeBaseClientAttachmentManifest,
+  persistKnowledgeBaseDispatchFailure,
   persistKnowledgeBaseCreateFailure,
   readKnowledgeBaseSkillArchiveAttachment,
   recoverKnowledgeBaseTurnClaimTask,
@@ -80,6 +85,9 @@ import { KnowledgeBaseArtifactBindingError } from "./knowledge-base-artifact-bin
 import { KnowledgeBaseBuildError } from "./knowledge-base-progress-service";
 import { knowledgeBaseLogoRepairFileIsOwned } from "./knowledge-base-logo-provenance-api";
 import { applyKnowledgeBaseFinalLogoProvenanceObservation } from "./knowledge-base-logo-provenance-repair";
+import { knowledgeBaseBuildRequiresOfficialLogo } from "./knowledge-base-final-turn-service";
+import { classifyKnowledgeBaseManusV2Lifecycle } from "./knowledge-base-manus-v2-lifecycle";
+import { buildKnowledgeBaseManusV2FormatRepair } from "./knowledge-base-manus-v2-lifecycle";
 import { UpstreamTaskAttachmentContentProofError } from "./upstream-task-attachment";
 
 function expectEnterpriseIdentityError(
@@ -518,6 +526,76 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(failDeterministically).not.toHaveBeenCalled();
   });
 
+  it("keeps a provider-acknowledged v2 operation on read-only reconciliation after local persistence fails", async () => {
+    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const persistCreateFailure = vi.fn().mockResolvedValue("unknown");
+    const claim = {
+      turn: {
+        id: "turn-v2-post-ack-bind-failure",
+        userId: 7,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "output_pending",
+      },
+      leaseToken: "lease-v2-post-ack-bind-failure",
+    } as any;
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error: new Error("temporary database failure after provider 2xx"),
+          outcomeUnknownCode: "MANUS_V2_BIND_PERSISTENCE_UNKNOWN",
+          recoveryDelayMs: 1_000,
+        },
+        { markManusV2OutcomeUnknown, persistCreateFailure },
+      ),
+    ).resolves.toBe("retriable");
+    expect(markManusV2OutcomeUnknown).toHaveBeenCalledTimes(1);
+    expect(markManusV2OutcomeUnknown).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      code: "MANUS_V2_BIND_PERSISTENCE_UNKNOWN",
+      recoveryDelayMs: 1_000,
+    });
+    expect(persistCreateFailure).not.toHaveBeenCalled();
+  });
+
+  it("keeps a not-sent v2 preparation failure on the pre-create failure path", async () => {
+    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const persistCreateFailure = vi.fn().mockResolvedValue("retriable");
+    const claim = {
+      turn: {
+        id: "turn-v2-not-sent-local-failure",
+        userId: 7,
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+      },
+      leaseToken: "lease-v2-not-sent-local-failure",
+    } as any;
+    const error = new Error("local preparation failed before provider POST");
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error,
+          outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+        },
+        { markManusV2OutcomeUnknown, persistCreateFailure },
+      ),
+    ).resolves.toBe("retriable");
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
+    expect(persistCreateFailure).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      error,
+      outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+    });
+  });
+
   it("keeps generated-file content proof failures before task create and never asks users to repair PDFs", async () => {
     const taskPost = vi.spyOn(axios, "post");
     const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
@@ -908,6 +986,288 @@ describe("knowledge-base turn HTTP outcomes", () => {
   });
 });
 
+describe("Manus v2 durable waiting side effects", () => {
+  const contract = {
+    operationToken: "op-wait",
+    turnId: "turn-wait",
+    generation: 1,
+    baseRevision: 3,
+    action: "confirm" as const,
+    fromLeafId: "leaf-3",
+    expectContentCompleted: false,
+    requiresManifest: false,
+  };
+  const operationEvent = {
+    id: "user-op",
+    type: "user_message",
+    timestamp: 1,
+    user_message: {
+      content:
+        'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"op-wait"}',
+    },
+  };
+  const waitingStatus = (id: string, eventId: string, timestamp: number) => ({
+    id,
+    type: "status_update",
+    timestamp,
+    status_update: {
+      agent_status: "waiting",
+      status_detail: {
+        waiting_for_event_id: eventId,
+        waiting_for_event_type: "messageAskUser",
+      },
+    },
+  });
+  const build = {
+    generation: 1,
+    revision: 3,
+    skillVersion: "4",
+    currentLeafId: "leaf-3",
+    totalNodeCount: 5,
+    confirmedCount: 2,
+    directPrefilledCount: 0,
+  } as any;
+
+  it("adopts a response-loss continuation token and handles a later wait with one new POST", async () => {
+    const firstEvents = [
+      operationEvent,
+      waitingStatus("status-1", "evt-1", 10),
+    ];
+    const first = classifyKnowledgeBaseManusV2Lifecycle({
+      events: firstEvents,
+      contract,
+    });
+    expect(first.kind).toBe("ask_user_continue");
+    if (first.kind !== "ask_user_continue") throw new Error("missing wait");
+    const lifecycle: any = {
+      waitingEventId: first.eventId,
+      waitingEventType: first.eventType,
+      waitingStatusEventId: first.statusEventId,
+      waitingAction: first.kind,
+      waitingAttemptState: "outcome_unknown",
+      waitingRequestHash: first.requestHash,
+      waitingContinuationToken: first.continuationToken,
+    };
+    const events = [
+      ...firstEvents,
+      {
+        id: "continuation-1",
+        type: "user_message",
+        timestamp: 11,
+        user_message: { content: first.prompt },
+      },
+      waitingStatus("status-2", "evt-2", 20),
+    ];
+    const mutateLifecycle = vi.fn(async ({ mutation }: any) => {
+      Object.assign(lifecycle, {
+        waitingEventId: mutation.eventId,
+        waitingEventType: mutation.eventType,
+        waitingStatusEventId: mutation.statusEventId,
+        waitingAction: mutation.action,
+        waitingAttemptState: mutation.state,
+        waitingRequestHash: mutation.requestHash,
+        waitingContinuationToken: mutation.continuationToken,
+      });
+    });
+    const sendMessage = vi.fn().mockResolvedValue({ requestId: "request-2" });
+    await knowledgeBaseManusV2LifecycleTestHooks.reconcile({
+      claim: {
+        turn: {
+          id: contract.turnId,
+          userId: 1,
+          manusV2Lifecycle: lifecycle,
+        },
+        leaseToken: "lease",
+      } as any,
+      build,
+      client: { sendMessage } as any,
+      taskId: "canonical-task",
+      events,
+      contract,
+      dependencies: {
+        mutateLifecycle: mutateLifecycle as any,
+        markAttention: vi.fn() as any,
+      },
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: "canonical-task" }),
+    );
+    expect(
+      mutateLifecycle.mock.calls.map(([value]) => value.mutation.state),
+    ).toEqual(["acknowledged", "sending", "acknowledged"]);
+  });
+
+  it("does not POST when a sending continuation has no exact token evidence", async () => {
+    const events = [operationEvent, waitingStatus("status-1", "evt-1", 10)];
+    const decision = classifyKnowledgeBaseManusV2Lifecycle({
+      events,
+      contract,
+    });
+    if (decision.kind !== "ask_user_continue") throw new Error("missing wait");
+    const sendMessage = vi.fn();
+    await knowledgeBaseManusV2LifecycleTestHooks.reconcile({
+      claim: {
+        turn: {
+          id: contract.turnId,
+          userId: 1,
+          manusV2Lifecycle: {
+            waitingEventId: decision.eventId,
+            waitingEventType: decision.eventType,
+            waitingStatusEventId: decision.statusEventId,
+            waitingAction: decision.kind,
+            waitingAttemptState: "sending",
+            waitingRequestHash: decision.requestHash,
+            waitingContinuationToken: decision.continuationToken,
+          },
+        },
+        leaseToken: "lease",
+      } as any,
+      build,
+      client: { sendMessage } as any,
+      taskId: "canonical-task",
+      events,
+      contract,
+      dependencies: {
+        mutateLifecycle: vi.fn() as any,
+        markAttention: vi.fn() as any,
+      },
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("Manus v2 durable format repair", () => {
+  it("adopts an exact repair token after local acknowledgement loss and never POSTs it twice", async () => {
+    const contract = {
+      operationToken: "op-format",
+      turnId: "turn-format",
+      generation: 1,
+      baseRevision: 3,
+      action: "confirm" as const,
+      fromLeafId: "leaf-3",
+      expectContentCompleted: false,
+      requiresManifest: false,
+    };
+    const operationEvent = {
+      id: "user-op",
+      type: "user_message",
+      timestamp: 1,
+      user_message: {
+        content:
+          'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"op-format"}',
+      },
+    };
+    const repair = buildKnowledgeBaseManusV2FormatRepair({
+      contract,
+      events: [operationEvent],
+    });
+    if (!repair) throw new Error("missing repair");
+    const lifecycle: any = {
+      formatRepairAttempt: 1,
+      formatRepairToken: repair.repairToken,
+      formatRepairRequestHash: repair.requestHash,
+      formatRepairAttemptState: "sending",
+    };
+    const mutateLifecycle = vi.fn(async ({ mutation }: any) => {
+      lifecycle.formatRepairAttemptState = mutation.state;
+    });
+    const markAttention = vi.fn();
+    const sendMessage = vi.fn();
+    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
+      claim: {
+        turn: {
+          id: contract.turnId,
+          userId: 1,
+          manusV2Lifecycle: lifecycle,
+        },
+        leaseToken: "lease",
+      } as any,
+      client: { sendMessage } as any,
+      taskId: "canonical-task",
+      events: [
+        operationEvent,
+        {
+          id: "repair-message",
+          type: "user_message",
+          timestamp: 2,
+          user_message: { content: repair.prompt },
+        },
+      ],
+      contract,
+      dependencies: {
+        mutateLifecycle: mutateLifecycle as any,
+        markAttention: markAttention as any,
+      },
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(mutateLifecycle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mutation: expect.objectContaining({ state: "acknowledged" }),
+      }),
+    );
+    expect(markAttention).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "MANUS_V2_FORMAT_REPAIR_EXHAUSTED" }),
+    );
+  });
+
+  it("leaves a tokenless response-loss repair in local attention without a second POST", async () => {
+    const contract = {
+      operationToken: "op-format-unknown",
+      turnId: "turn-format-unknown",
+      generation: 1,
+      baseRevision: 3,
+      action: "confirm" as const,
+      fromLeafId: "leaf-3",
+      expectContentCompleted: false,
+      requiresManifest: false,
+    };
+    const operationEvent = {
+      id: "user-op",
+      type: "user_message",
+      timestamp: 1,
+      user_message: {
+        content:
+          'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"op-format-unknown"}',
+      },
+    };
+    const repair = buildKnowledgeBaseManusV2FormatRepair({
+      contract,
+      events: [operationEvent],
+    });
+    if (!repair) throw new Error("missing repair");
+    const sendMessage = vi.fn();
+    const markAttention = vi.fn();
+    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
+      claim: {
+        turn: {
+          id: contract.turnId,
+          userId: 1,
+          manusV2Lifecycle: {
+            formatRepairAttempt: 1,
+            formatRepairToken: repair.repairToken,
+            formatRepairRequestHash: repair.requestHash,
+            formatRepairAttemptState: "outcome_unknown",
+          },
+        },
+        leaseToken: "lease",
+      } as any,
+      client: { sendMessage } as any,
+      taskId: "canonical-task",
+      events: [operationEvent],
+      contract,
+      dependencies: {
+        mutateLifecycle: vi.fn() as any,
+        markAttention: markAttention as any,
+      },
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(markAttention).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "MANUS_V2_FORMAT_REPAIR_UNPROVEN" }),
+    );
+  });
+});
+
 describe("knowledge-base upstream read failure authority", () => {
   it.each([
     [
@@ -1177,6 +1537,99 @@ describe("knowledge base execution contract", () => {
         activeTurn: { id: "turn-active" },
       } as any),
     ).toBe(false);
+  });
+
+  it("keeps an accepted first-node presentation replyable while its optional Logo projection repairs", () => {
+    const progress = {
+      build: {
+        id: "build-logo-projection-repair",
+        conversationId: "conversation-logo-projection-repair",
+        companyName: "Projection Fixture",
+        skillVersion: "4",
+        status: "confirming",
+        revision: 0,
+        currentLeafId: "1.1",
+        protocolError: null,
+        awaitingResponseSince: null,
+        logoRequired: false,
+        logoAvailable: true,
+        updatedAt: 123,
+      },
+      summary: {
+        total: 40,
+        handled: 0,
+        confirmed: 0,
+        directPrefilled: 0,
+        pending: 39,
+        current: 1,
+        needsVerification: 0,
+      },
+      branches: [],
+      packageAllowed: false,
+    } as any;
+    const interaction = deriveKnowledgeBaseInteraction(
+      progress,
+      "awaiting_input",
+    );
+    const approvedPresentation = {
+      turnId: "turn-first-node",
+      clientRequestId: "request-first-node",
+      presentationKey: "presentation-first-node",
+      revision: 0,
+      leafId: "1.1",
+      visibleMarkdown: "## 1.1 企业主体\n\n已接受并展示的正文。",
+      contentSha256: "a".repeat(64),
+      // Simulate an immutable receipt that remains valid while the optional
+      // Logo/current-node resource projection is absent.
+      imageState: "no_eligible_asset" as const,
+      resources: [],
+    };
+
+    const guarded = applyKnowledgeBasePresentationProjectionGuard({
+      progress,
+      observation: {
+        approvedPresentation,
+        localRestrictions: [],
+        notice: null,
+      },
+      interaction,
+    });
+
+    expect(approvedPresentation.visibleMarkdown).toContain(
+      "已接受并展示的正文",
+    );
+    expect(guarded.interaction).toMatchObject({
+      interactionState: "awaiting_input",
+      canReply: true,
+      lockReason: null,
+    });
+    expect(guarded.localRestrictions).toContain("logo_projection_repairing");
+    expect(guarded.notice).toMatchObject({
+      code: "KNOWLEDGE_BASE_LOGO_PROJECTION_REPAIRING",
+      severity: "warning",
+      retryable: false,
+    });
+
+    const existingNotice = {
+      key: "existing-higher-priority-notice",
+      code: "KNOWLEDGE_BASE_CANONICAL_TASK_RECOVERING",
+      severity: "warning" as const,
+      message: "系统正在恢复当前操作。已完成内容不受影响。",
+      retryable: true,
+      turnId: null,
+      createdAt: 122,
+    };
+    expect(
+      applyKnowledgeBasePresentationProjectionGuard({
+        progress,
+        observation: {
+          approvedPresentation,
+          localRestrictions: ["canonical_task_repairing"],
+          notice: existingNotice,
+        },
+        interaction,
+      }).notice,
+    ).toBe(existingNotice);
   });
 
   it("normalizes a stable pre-upload attachment manifest and rejects partial entries", () => {
@@ -1859,6 +2312,149 @@ describe("knowledge base execution contract", () => {
     ).toBe(true);
   });
 
+  it("accepts a Manus v2 final content transition without Logo or provider ZIP", async () => {
+    const prompt = await buildKnowledgeBaseTurnPrompt({
+      userId: 0,
+      conversationId: "v2-content-completion-contract",
+      userMessage: "确认",
+      attachments: [],
+      skillVersion: "4",
+      contentCompletionOnly: true,
+      protocolOperation: {
+        operationId: "v2-content-operation",
+        turnId: "v2-content-turn",
+      },
+      progressOverride: {
+        build: { revision: 46, currentLeafId: "7.2" },
+        branches: [
+          {
+            leaves: [
+              {
+                id: "7.2",
+                title: "最终节点",
+                branchTitle: "最终分支",
+                status: "current",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(prompt).toContain("Manus v2 内容完成轮");
+    expect(prompt).toContain("Dashboard 在内容接受后异步生成");
+    expect(prompt).toContain("不得创建或返回 ZIP、Logo、图片");
+    expect(prompt).not.toContain("application/zip");
+    expect(prompt).not.toContain("FINAL.zip");
+    expect(prompt).not.toContain("finalization-input");
+  });
+
+  it("never turns an optional Logo into a Manus v2 confirmation gate", () => {
+    const firstNodeWithoutLogo = {
+      skillVersion: "4",
+      status: "confirming",
+      revision: 0,
+      currentLeafId: "1.1",
+      totalNodeCount: 40,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      logoSha256: null,
+    };
+
+    expect(knowledgeBaseBuildRequiresOfficialLogo(firstNodeWithoutLogo)).toBe(
+      true,
+    );
+    expect(
+      knowledgeBaseBuildRequiresOfficialLogo({
+        ...firstNodeWithoutLogo,
+        providerProtocol: "manus_v2",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps first and final Manus v2 turns non-blocking when Logo is absent", () => {
+    const firstConfirm = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: "manus_v2",
+      legacyLogoRequired: true,
+    });
+    const finalConfirm = knowledgeBaseTurnLogoPolicy({
+      providerProtocol: "manus_v2",
+      legacyLogoRequired: true,
+    });
+
+    for (const policy of [firstConfirm, finalConfirm]) {
+      expect(policy.requiresOfficialLogo).toBe(false);
+      expect(policy.inferOrdinaryAttachmentAsLogo).toBe(false);
+      expect(policy.assertFinalLogoProvenance).toBe(false);
+    }
+    expect(
+      knowledgeBasePresentationRequiresBoundLogo({
+        skillVersion: "4",
+        revision: 0,
+        handled: 0,
+        logoRequired: false,
+        logoAvailable: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("never infers an ordinary Manus v2 image attachment as Logo", () => {
+    expect(
+      knowledgeBaseTurnLogoPolicy({
+        providerProtocol: "manus_v2",
+        manualLogoSubmission: false,
+        legacyLogoRequired: true,
+      }),
+    ).toMatchObject({
+      requiresOfficialLogo: false,
+      inferOrdinaryAttachmentAsLogo: false,
+      readPersistedLogoSubmission: false,
+      rejectRepeatedOfficialLogo: true,
+    });
+  });
+
+  it("validates only explicit manual Logo submissions on Manus v2", () => {
+    expect(
+      knowledgeBaseTurnLogoPolicy({
+        providerProtocol: "manus_v2",
+        manualLogoSubmission: true,
+        legacyLogoRequired: false,
+      }),
+    ).toMatchObject({
+      requiresOfficialLogo: false,
+      inferOrdinaryAttachmentAsLogo: false,
+      validateManualLogoSubmission: true,
+      readPersistedLogoSubmission: true,
+      assertFinalLogoProvenance: false,
+    });
+  });
+
+  it("preserves the legacy v1 Logo requirement and ordinary-image inference", () => {
+    expect(
+      knowledgeBaseTurnLogoPolicy({
+        providerProtocol: "legacy_v1",
+        manualLogoSubmission: false,
+        legacyLogoRequired: true,
+      }),
+    ).toMatchObject({
+      requiresOfficialLogo: true,
+      inferOrdinaryAttachmentAsLogo: true,
+      validateManualLogoSubmission: false,
+      readPersistedLogoSubmission: true,
+      acceptProviderDiscoveredLogo: true,
+      assertFinalLogoProvenance: true,
+    });
+    expect(
+      knowledgeBasePresentationRequiresBoundLogo({
+        skillVersion: "4",
+        revision: 0,
+        handled: 0,
+        logoRequired: false,
+        logoAvailable: true,
+      }),
+    ).toBe(true);
+  });
+
   it("preserves the actionable v4 archive failure instead of hiding it", () => {
     expect(
       knowledgeBaseArtifactFailureNotice(
@@ -2075,11 +2671,13 @@ describe("knowledge base execution contract", () => {
       version: "4",
       contentHash: legacyActiveHash,
     });
-    const recoveredHistoricalAlias = await getKnowledgeBaseSkillDescriptor({
-      version: "4",
-      contentHash:
-        "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
-    });
+    await expect(
+      getKnowledgeBaseSkillDescriptor({
+        version: "4",
+        contentHash:
+          "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
+      }),
+    ).rejects.toThrow("content hash does not match");
     const legacy = await getKnowledgeBaseSkillDescriptor({ version: "1" });
     const previous = await getKnowledgeBaseSkillDescriptor({ version: "2" });
     const priorV3Hash =
@@ -2108,9 +2706,6 @@ describe("knowledge base execution contract", () => {
       await canonicalKnowledgeBaseSkillArchiveHash(activeArchive.bytes),
     );
     expect(recoveredLegacyActive.contentHash).toBe(legacyActiveHash);
-    expect(recoveredHistoricalAlias.contentHash).toBe(
-      "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
-    );
     expect(legacy).toMatchObject({
       name: "socratic-kb-builder",
       version: "1",
@@ -2134,7 +2729,7 @@ describe("knowledge base execution contract", () => {
     ).rejects.toThrow("content hash does not match");
   });
 
-  it("resolves every immutable v3/v4 filename pin shipped in the runtime", async () => {
+  it("resolves only v3/v4 filenames whose logical hash matches their bytes", async () => {
     const skillRoot = path.resolve(process.cwd(), "private-workflows");
     const aliases = (await readdir(skillRoot))
       .map((name) =>
@@ -2145,9 +2740,23 @@ describe("knowledge base execution contract", () => {
     for (const alias of aliases) {
       const version = alias[1] as "3" | "4";
       const contentHash = alias[2]!;
-      await expect(
-        getKnowledgeBaseSkillDescriptor({ version, contentHash }),
-      ).resolves.toMatchObject({ version, contentHash });
+      const descriptor = getKnowledgeBaseSkillDescriptor({
+        version,
+        contentHash,
+      });
+      if (
+        [
+          "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
+          "be9385b6add7b1aeb2c4b4c136b86ef12cc38774fe52c3d2b15233d04aedc80b",
+        ].includes(contentHash)
+      ) {
+        await expect(descriptor).rejects.toThrow("content hash does not match");
+      } else {
+        await expect(descriptor).resolves.toMatchObject({
+          version,
+          contentHash,
+        });
+      }
     }
   });
 

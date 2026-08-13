@@ -186,3 +186,25 @@ export function createDeliveryProjectContextMiddleware(
 
 export const enforceDeliveryProjectContext =
   createDeliveryProjectContextMiddleware();
+
+/**
+ * Knowledge-base persistence is still account-scoped. Validate the selected
+ * delivery project first, then stop before any account credential or KB row
+ * can be read or written under an ambiguous null project scope.
+ */
+export function rejectDeliveryMemberKnowledgeBaseProjectScope(
+  req: FrontMindRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  if (req.frontmindUser?.role !== "delivery_member") {
+    next();
+    return;
+  }
+  res.status(403).json({
+    error: {
+      message: "当前知识库暂不支持工程师项目工作区，请由客户账号操作",
+      code: "KNOWLEDGE_BASE_PROJECT_SCOPE_UNSUPPORTED",
+    },
+  });
+}

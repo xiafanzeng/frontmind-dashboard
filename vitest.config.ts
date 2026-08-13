@@ -2,12 +2,14 @@ import { defineConfig } from "vitest/config";
 import path from "path";
 import react from "@vitejs/plugin-react";
 
+import { siblingWebsiteRepositoryRoot } from "./server/cross-repo-test-path";
+
 const templateRoot = path.resolve(import.meta.dirname);
 const configuredWebsiteTestRoot =
   process.env.FRONTMIND_WEBSITE_REPOSITORY_ROOT?.trim();
 const websiteTestRoot = configuredWebsiteTestRoot
   ? path.resolve(configuredWebsiteTestRoot)
-  : path.resolve(templateRoot, "../frontmind-website");
+  : siblingWebsiteRepositoryRoot(templateRoot);
 
 export const nonClientTestIncludes = [
   "server/**/*.test.ts",
