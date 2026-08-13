@@ -170,6 +170,7 @@ import {
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   renewKnowledgeBaseTurnLease,
   releaseGeneratedAttachmentInvalidPreproviderTurns,
+  reclassifyHistoricalPreproviderAuthoritySelfTerminal,
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
@@ -6759,6 +6760,7 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
     rebound: 0,
     reconciled: 0,
     credentialPaused: 0,
+    localRehydrateSelfTerminalReclassified: 0,
     skipped: 0,
     failed: 0,
   };
@@ -6769,6 +6771,15 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
       let claim: KnowledgeBaseRecoveryClaim | null = null;
       let recoveryApiKey: string | undefined;
       try {
+        if (
+          await reclassifyHistoricalPreproviderAuthoritySelfTerminal({
+            turnId: candidate.turnId,
+          })
+        ) {
+          result.localRehydrateSelfTerminalReclassified += 1;
+          result.skipped += 1;
+          continue;
+        }
         claim = await claimKnowledgeBaseTurnForRecovery({
           turnId: candidate.turnId,
           leaseMs: 300_000,

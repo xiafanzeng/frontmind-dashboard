@@ -66,6 +66,7 @@ import {
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   releaseGeneratedAttachmentInvalidPreproviderTurn,
+  reclassifyHistoricalPreproviderAuthoritySelfTerminal,
   reserveKnowledgeBaseGeneratedAttachment,
   reserveKnowledgeBaseNewCanonicalFromSnapshot,
   reserveKnowledgeBaseFailedNotSentLegacyHandoff,
@@ -1319,6 +1320,345 @@ describe("generated attachment invalid pre-provider release", () => {
         harness.executor,
       ),
     ).rejects.toMatchObject({ code: "IDEMPOTENCY_PENDING" });
+  });
+
+  function historicalSelfTerminalFixture() {
+    const released = fixture();
+    const oldOperationKey = released.source.operationKey!;
+    const releasedAt = "2026-08-01T00:01:00.000Z";
+    const sourceOperationKey = createHash("sha256")
+      .update(
+        `frontmind-kb-failed-confirm-preprovider-release:${released.source.id}:${oldOperationKey}`,
+        "utf8",
+      )
+      .digest("hex");
+    const marker = {
+      schemaVersion: 1,
+      reason: "generated_attachment_invalid_preprovider",
+      buildId: released.build.id,
+      generation: released.build.generation,
+      revision: released.build.revision,
+      leafId: released.build.currentLeafId,
+      presentationKey: released.build.currentPresentationKey,
+      sourceTurnId: released.source.id,
+      releasedAt,
+    };
+    const source = {
+      ...released.source,
+      operationKey: sourceOperationKey,
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(sourceOperationKey),
+      ),
+      status: "cancelled" as const,
+      attachmentFileIds: [],
+      metadata: {
+        attachmentsFrozen: false,
+        createAttemptState: "not_sent",
+        providerProtocol: "legacy_v1",
+        providerAttemptState: "not_sent",
+        localPreproviderRelease: true,
+        repairKind: "failed_confirm_preprovider_release",
+        cancelledOperationKey: oldOperationKey,
+        releasedOperationTombstone: {
+          schemaVersion: 1,
+          kind: "failed_confirm_preprovider_release",
+          operationKey: oldOperationKey,
+          releasedAt,
+        },
+        localRehydrateRequired: marker,
+      },
+    } as ConversationTurn;
+    const active = turn({
+      id: "00000000-0000-4000-8000-000000000099",
+      conversationId: source.conversationId,
+      userId: source.userId,
+      apiCredentialId: "credential-old-revoked",
+      buildId: source.buildId,
+      buildGeneration: source.buildGeneration,
+      operationKey: "d".repeat(64),
+      operationType: "confirm",
+      expectedRevision: source.expectedRevision,
+      expectedLeafId: source.expectedLeafId,
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
+      errorMessage: "old scanner self-terminal",
+      completedAt: new Date("2026-08-01T00:03:00.000Z"),
+      leaseExpiresAt: null,
+      attachmentFileIds: [],
+      metadata: {
+        attachmentsFrozen: false,
+        createAttemptState: "not_sent",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+        operationToken: "d".repeat(64),
+        expectedPresentationKey: released.build.currentPresentationKey,
+        dispatchState: "failed",
+        failureClass: "terminal_nonregenerable",
+        recoveryAction: "contact_support",
+        canRegenerate: false,
+        recovery: {
+          kind: "turn",
+          conversationId: released.build.conversationId,
+          localRehydrateAuthority: "local_rehydrate_unbound",
+          chargeDisposition: "reuse_original_no_charge",
+          userMessage: "确认",
+          attachments: [],
+        },
+      },
+    });
+    active.upstreamIdempotencyKeyHash = hashKnowledgeBaseUpstreamIdempotencyKey(
+      createKnowledgeBaseUpstreamIdempotencyKey(active.operationKey!),
+    );
+    const build = {
+      ...released.build,
+      upstreamTaskId: null,
+      providerProtocol: "manus_v2",
+      canonicalTaskId: null,
+      canonicalTaskGeneration: null,
+      canonicalCredentialId: null,
+      canonicalTaskState: "unbound",
+      status: "protocol_error",
+      activeTurnId: active.id,
+      protocolErrorCode: "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
+      protocolError: "old scanner self-terminal",
+      handoffProvenance: {
+        schemaVersion: 1,
+        sourceProtocol: "legacy_v1",
+        localRehydrateRequired: marker,
+      },
+    } as any;
+    return { source, active, build };
+  }
+
+  it("reclassifies only the exact historical self-terminal without a lease or Provider side effect", async () => {
+    const value = historicalSelfTerminalFixture();
+    const activeSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.active.id);
+    const sourceSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.source.id);
+    const harness = createTurnServiceExecutor({
+      build: value.build,
+      conversation: {
+        id: value.active.conversationId,
+        userId: value.active.userId,
+        status: "failed",
+        version: 7,
+      },
+      turns: [value.source, value.active],
+      turnSelections: [[activeSelection, sourceSelection, activeSelection]],
+    });
+
+    await expect(
+      reclassifyHistoricalPreproviderAuthoritySelfTerminal(
+        { turnId: value.active.id },
+        harness.executor,
+      ),
+    ).resolves.toBe(true);
+    expect(harness.store.build).toMatchObject({
+      status: "protocol_error",
+      activeTurnId: value.active.id,
+      canonicalTaskState: "unbound",
+      protocolErrorCode: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+    });
+    expect(harness.store.turns[1]).toMatchObject({
+      id: value.active.id,
+      status: "failed",
+      apiCredentialId: "credential-old-revoked",
+      operationKey: value.active.operationKey,
+      upstreamTaskId: null,
+      leaseExpiresAt: null,
+      errorCode: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+      metadata: {
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+        failureClass: "requires_user_fix",
+        recoveryAction: "update_credential",
+        historicalLocalRehydrateAuthoritySelfTerminal: {
+          sourceErrorCode: "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
+        },
+      },
+    });
+    expect(harness.store.turns[0]).toEqual(value.source);
+  });
+
+  it("reproves the source and resumes the same operation with only the current credential", async () => {
+    const value = historicalSelfTerminalFixture();
+    const activeSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.active.id);
+    const sourceSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.source.id);
+    const currentCredentialSelection = () => [
+      { id: "credential-current", userId: 1, status: "active" },
+    ];
+    const harness = createTurnServiceExecutor({
+      build: value.build,
+      conversation: {
+        id: value.active.conversationId,
+        userId: value.active.userId,
+        status: "failed",
+        version: 7,
+      },
+      turns: [value.source, value.active],
+      credentials: [
+        { id: "credential-current", userId: 1, status: "active" },
+        { id: "credential-old-revoked", userId: 1, status: "deleted" },
+      ],
+      turnSelections: [
+        [activeSelection, sourceSelection, activeSelection],
+        [activeSelection, sourceSelection],
+        [activeSelection],
+      ],
+    });
+    await reclassifyHistoricalPreproviderAuthoritySelfTerminal(
+      { turnId: value.active.id },
+      harness.executor,
+    );
+    const operationKey = harness.store.turns[1]!.operationKey;
+    const claim = await resumeKnowledgeBaseTurnAfterUserFix(
+      {
+        userId: 1,
+        turnId: value.active.id,
+        apiCredentialId: "credential-current",
+      },
+      harness.executor,
+    );
+
+    expect(claim).not.toBeNull();
+    expect(claim?.turn).toMatchObject({
+      id: value.active.id,
+      apiCredentialId: "credential-current",
+      operationKey,
+      status: "running",
+      upstreamTaskId: null,
+      providerAttemptState: "not_sent",
+      createAttemptState: "not_sent",
+    });
+    expect(claim?.recoveryMetadata).toMatchObject({
+      kind: "turn",
+      localRehydrateAuthority: "local_rehydrate_unbound",
+      chargeDisposition: "reuse_original_no_charge",
+    });
+    expect(harness.store.build).toMatchObject({
+      status: "confirming",
+      activeTurnId: value.active.id,
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+      protocolErrorCode: null,
+    });
+    harness.store.turns[1]!.status = "failed";
+    await expect(
+      resumeKnowledgeBaseTurnAfterUserFix(
+        {
+          userId: 1,
+          turnId: value.active.id,
+          apiCredentialId: "credential-current",
+        },
+        harness.executor,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it.each([
+    ["same historical credential", "active"],
+    ["retired replacement credential", "retired"],
+  ])(
+    "refuses %s before historical rehydrate dispatch",
+    async (_label, status) => {
+      const value = historicalSelfTerminalFixture();
+      const requestedCredentialId =
+        status === "active"
+          ? value.active.apiCredentialId!
+          : "credential-retired";
+      const activeSelection = (store: TurnServiceStore) =>
+        store.turns.filter((candidate) => candidate.id === value.active.id);
+      const sourceSelection = (store: TurnServiceStore) =>
+        store.turns.filter((candidate) => candidate.id === value.source.id);
+      const harness = createTurnServiceExecutor({
+        build: value.build,
+        conversation: {
+          id: value.active.conversationId,
+          userId: value.active.userId,
+          status: "failed",
+          version: 7,
+        },
+        turns: [value.source, value.active],
+        credentials: [
+          { id: requestedCredentialId, userId: 1, status },
+          { id: value.active.apiCredentialId, userId: 1, status: "active" },
+        ],
+        turnSelections: [
+          [activeSelection, sourceSelection, activeSelection],
+          [activeSelection, sourceSelection],
+        ],
+      });
+      await reclassifyHistoricalPreproviderAuthoritySelfTerminal(
+        { turnId: value.active.id },
+        harness.executor,
+      );
+      const before = structuredClone(harness.store);
+      await expect(
+        resumeKnowledgeBaseTurnAfterUserFix(
+          {
+            userId: 1,
+            turnId: value.active.id,
+            apiCredentialId: requestedCredentialId,
+          },
+          harness.executor,
+        ),
+      ).resolves.toBeNull();
+      expect(harness.store).toEqual(before);
+    },
+  );
+
+  it.each([
+    [
+      "source operation drift",
+      (value: ReturnType<typeof historicalSelfTerminalFixture>) => {
+        value.source.operationKey = "e".repeat(64);
+      },
+    ],
+    [
+      "active coordinate drift",
+      (value: ReturnType<typeof historicalSelfTerminalFixture>) => {
+        value.active.expectedRevision += 1;
+      },
+    ],
+    [
+      "prepared request exists",
+      (value: ReturnType<typeof historicalSelfTerminalFixture>) => {
+        (value.active.metadata as Record<string, unknown>).preparedDispatch = {
+          schemaVersion: 2,
+        };
+      },
+    ],
+    [
+      "generic contact support",
+      (value: ReturnType<typeof historicalSelfTerminalFixture>) => {
+        value.active.errorCode = "GENERIC_FAILURE";
+        value.build.protocolErrorCode = "GENERIC_FAILURE";
+      },
+    ],
+  ])("refuses historical reclassification for %s", async (_label, mutate) => {
+    const value = historicalSelfTerminalFixture();
+    mutate(value);
+    const activeSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.active.id);
+    const sourceSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.source.id);
+    const harness = createTurnServiceExecutor({
+      build: value.build,
+      turns: [value.source, value.active],
+      turnSelections: [[activeSelection, sourceSelection, activeSelection]],
+    });
+    const before = structuredClone(harness.store);
+    await expect(
+      reclassifyHistoricalPreproviderAuthoritySelfTerminal(
+        { turnId: value.active.id },
+        harness.executor,
+      ),
+    ).resolves.toBe(false);
+    expect(harness.store).toEqual(before);
   });
 
   it("settles a historical explicit not-sent row whose provider projection was absent", async () => {

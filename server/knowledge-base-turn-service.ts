@@ -8161,6 +8161,109 @@ export type KnowledgeBasePreproviderLocalRehydrateAuthority = {
   presentationKey: string;
 };
 
+const KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID =
+  "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID";
+
+function isHistoricalPreproviderAuthoritySelfTerminal(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "id"
+    | "userId"
+    | "conversationId"
+    | "status"
+    | "protocolErrorCode"
+    | "activeTurnId"
+    | "generation"
+    | "revision"
+    | "currentLeafId"
+    | "currentPresentationKey"
+    | "providerProtocol"
+    | "upstreamTaskId"
+    | "canonicalTaskId"
+    | "canonicalTaskGeneration"
+    | "canonicalCredentialId"
+    | "canonicalTaskState"
+  >,
+  turn: Pick<
+    ConversationTurn,
+    | "id"
+    | "userId"
+    | "conversationId"
+    | "buildId"
+    | "status"
+    | "errorCode"
+    | "upstreamTaskId"
+    | "attachmentFileIds"
+    | "buildGeneration"
+    | "expectedRevision"
+    | "expectedLeafId"
+    | "operationType"
+    | "operationKey"
+    | "upstreamIdempotencyKeyHash"
+    | "metadata"
+  >,
+) {
+  const metadata = metadataOf(turn as ConversationTurn);
+  const recovery = retryAuthorityRecord(metadata.recovery);
+  return Boolean(
+    build.status === "protocol_error" &&
+      build.protocolErrorCode ===
+        KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID &&
+      build.activeTurnId === turn.id &&
+      turn.userId === build.userId &&
+      turn.conversationId ===
+        knowledgeBaseConversationStorageId(
+          build.userId,
+          build.conversationId,
+        ) &&
+      turn.buildId === build.id &&
+      build.providerProtocol === "manus_v2" &&
+      build.upstreamTaskId === null &&
+      build.canonicalTaskId === null &&
+      build.canonicalTaskGeneration === null &&
+      build.canonicalCredentialId === null &&
+      build.canonicalTaskState === "unbound" &&
+      turn.status === "failed" &&
+      turn.errorCode === KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID &&
+      turn.upstreamTaskId === null &&
+      turn.attachmentFileIds.length === 0 &&
+      turn.buildGeneration === build.generation &&
+      turn.expectedRevision === build.revision &&
+      (turn.expectedLeafId ?? null) === (build.currentLeafId ?? null) &&
+      turn.operationType === "confirm" &&
+      typeof turn.operationKey === "string" &&
+      Boolean(turn.operationKey) &&
+      turn.upstreamIdempotencyKeyHash ===
+        hashKnowledgeBaseUpstreamIdempotencyKey(
+          createKnowledgeBaseUpstreamIdempotencyKey(turn.operationKey),
+        ) &&
+      metadata.providerProtocol === "manus_v2" &&
+      metadata.dispatchState === "failed" &&
+      metadata.failureClass === "terminal_nonregenerable" &&
+      metadata.recoveryAction === "contact_support" &&
+      metadata.canRegenerate === false &&
+      storedKnowledgeBaseCreateAttemptState(metadata) === "not_sent" &&
+      metadata.providerAttemptState === "not_sent" &&
+      metadata.providerMethod === undefined &&
+      (metadata.operationToken === undefined ||
+        metadata.operationToken === turn.operationKey) &&
+      (metadata.expectedPresentationKey === undefined ||
+        metadata.expectedPresentationKey === build.currentPresentationKey) &&
+      metadata.attachmentsFrozen !== true &&
+      metadata.awaitingClientAttachments !== true &&
+      metadata.dispatchingAt === undefined &&
+      metadata.outcomeUnknownAt === undefined &&
+      metadata.preparedDispatch === undefined &&
+      metadata.frozenProviderRequestHash === undefined &&
+      Object.keys(generatedAttachmentReservations(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentMappings(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentAttempts(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentUnknownAttempts(metadata)).length === 0 &&
+      recovery?.kind === "turn" &&
+      recovery.localRehydrateAuthority === "local_rehydrate_unbound",
+  );
+}
+
 function isPreproviderLocalRehydrateBuildShape(
   build: Pick<
     KnowledgeBaseBuild,
@@ -8404,6 +8507,271 @@ export async function loadKnowledgeBasePreproviderLocalRehydrateAuthority(
         expectedActiveTurnId,
       )
     : null;
+}
+
+/**
+ * Repairs the one bad terminal projection written by the first active-turn
+ * local-rehydrate rollout. That rollout had already proved and released the
+ * legacy source, but its scanner checked the new continuation against an
+ * inactive-build shape and deterministically wrote
+ * LOCAL_REHYDRATE_AUTHORITY_INVALID before any Provider preparation.
+ *
+ * This transaction does not claim a lease, bind a credential or call the
+ * Provider. It only changes that exact historical self-terminal row into the
+ * existing user-fix state. The customer's reconcile click must subsequently
+ * present an active credential; resumeKnowledgeBaseTurnAfterUserFix repeats
+ * the complete source/tombstone/current-coordinate proof before dispatch.
+ */
+export async function reclassifyHistoricalPreproviderAuthoritySelfTerminal(
+  input: { turnId: string; now?: Date },
+  executor?: any,
+): Promise<boolean> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    let turn: ConversationTurn;
+    let build: KnowledgeBaseBuild;
+    try {
+      ({ turn, build } = await lockedOwnedTurnAndBuild(tx, input));
+    } catch (error) {
+      if (
+        error instanceof KnowledgeBaseTurnReservationError &&
+        (error.code === "RESERVATION_NOT_FOUND" || error.code === "CONFLICT")
+      ) {
+        return false;
+      }
+      throw error;
+    }
+    if (!isHistoricalPreproviderAuthoritySelfTerminal(build, turn)) {
+      return false;
+    }
+
+    const provenance = retryAuthorityRecord(build.handoffProvenance);
+    const requirement = retryAuthorityRecord(
+      provenance?.localRehydrateRequired,
+    );
+    const sourceTurnId = String(requirement?.sourceTurnId || "");
+    if (!sourceTurnId || sourceTurnId === turn.id) return false;
+    const source = (
+      (await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, sourceTurnId),
+            eq(conversationTurns.userId, turn.userId),
+            eq(conversationTurns.buildId, build.id),
+          ),
+        )
+        .limit(1)
+        .for("update")) as ConversationTurn[]
+    )[0];
+    if (
+      !source ||
+      !inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
+        {
+          ...build,
+          status: "confirming",
+          protocolErrorCode: null,
+          protocolError: null,
+        },
+        source,
+        turn.id,
+      )
+    ) {
+      return false;
+    }
+
+    const now = input.now ?? new Date();
+    const metadata = metadataOf(turn);
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      dispatchState: "failed",
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+      canRegenerate: false,
+      historicalLocalRehydrateAuthoritySelfTerminal: {
+        schemaVersion: 1,
+        sourceErrorCode: KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+        reclassifiedAt: now.toISOString(),
+      },
+    };
+    const message =
+      "本轮曾被旧版恢复程序提前终止；已完成内容和原操作均已保留，请使用当前 Manus API 凭证继续同一轮次";
+    const buildUpdate = await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        protocolErrorCode: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        protocolError: message,
+        stateEpoch: build.stateEpoch + 1,
+        awaitingResponseSince: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, turn.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.revision, build.revision),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          eq(knowledgeBaseBuilds.status, "protocol_error"),
+          eq(
+            knowledgeBaseBuilds.protocolErrorCode,
+            KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+          ),
+          isNull(knowledgeBaseBuilds.canonicalTaskId),
+          isNull(knowledgeBaseBuilds.upstreamTaskId),
+        ),
+      );
+    if (!buildUpdate[0]?.affectedRows) return false;
+    // Refresh the active row after locking the historical source so the final
+    // CAS cannot accidentally target that source in test executors and is
+    // independently pinned in production.
+    await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, turn.userId),
+          eq(conversationTurns.buildId, build.id),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    const turnUpdate = await tx
+      .update(conversationTurns)
+      .set({
+        errorCode: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        errorMessage: message,
+        metadata: nextMetadata,
+        leaseExpiresAt: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, turn.userId),
+          eq(conversationTurns.status, "failed"),
+          eq(
+            conversationTurns.errorCode,
+            KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+          ),
+          isNull(conversationTurns.upstreamTaskId),
+        ),
+      );
+    if (!turnUpdate[0]?.affectedRows) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Historical local-rehydrate terminal changed during reclassification",
+      );
+    }
+    return true;
+  });
+}
+
+async function proveHistoricalPreproviderAuthorityUserFix(
+  input: {
+    userId: number;
+    build: KnowledgeBaseBuild;
+    turn: ConversationTurn;
+  },
+  tx: any,
+) {
+  const { build, turn } = input;
+  const metadata = metadataOf(turn);
+  const recovery = retryAuthorityRecord(metadata.recovery);
+  const historical = retryAuthorityRecord(
+    metadata.historicalLocalRehydrateAuthoritySelfTerminal,
+  );
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
+  if (
+    build.status !== "protocol_error" ||
+    build.protocolErrorCode !== "UPSTREAM_CREDENTIAL_UNAVAILABLE" ||
+    build.activeTurnId !== turn.id ||
+    build.providerProtocol !== "manus_v2" ||
+    build.upstreamTaskId !== null ||
+    build.canonicalTaskId !== null ||
+    build.canonicalTaskGeneration !== null ||
+    build.canonicalCredentialId !== null ||
+    build.canonicalTaskState !== "unbound" ||
+    turn.status !== "failed" ||
+    turn.errorCode !== "UPSTREAM_CREDENTIAL_UNAVAILABLE" ||
+    turn.upstreamTaskId !== null ||
+    turn.attachmentFileIds.length !== 0 ||
+    turn.userId !== build.userId ||
+    turn.conversationId !==
+      knowledgeBaseConversationStorageId(build.userId, build.conversationId) ||
+    turn.buildId !== build.id ||
+    turn.buildGeneration !== build.generation ||
+    turn.expectedRevision !== build.revision ||
+    (turn.expectedLeafId ?? null) !== (build.currentLeafId ?? null) ||
+    turn.operationType !== "confirm" ||
+    typeof turn.operationKey !== "string" ||
+    !turn.operationKey ||
+    turn.upstreamIdempotencyKeyHash !==
+      hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(turn.operationKey),
+      ) ||
+    metadata.providerProtocol !== "manus_v2" ||
+    metadata.dispatchState !== "failed" ||
+    metadata.failureClass !== "requires_user_fix" ||
+    metadata.recoveryAction !== "update_credential" ||
+    metadata.canRegenerate !== false ||
+    storedKnowledgeBaseCreateAttemptState(metadata) !== "not_sent" ||
+    metadata.providerAttemptState !== "not_sent" ||
+    metadata.providerMethod !== undefined ||
+    (metadata.operationToken !== undefined &&
+      metadata.operationToken !== turn.operationKey) ||
+    (metadata.expectedPresentationKey !== undefined &&
+      metadata.expectedPresentationKey !== build.currentPresentationKey) ||
+    metadata.attachmentsFrozen === true ||
+    metadata.awaitingClientAttachments === true ||
+    metadata.dispatchingAt !== undefined ||
+    metadata.outcomeUnknownAt !== undefined ||
+    metadata.preparedDispatch !== undefined ||
+    metadata.frozenProviderRequestHash !== undefined ||
+    Object.keys(generatedAttachmentReservations(metadata)).length !== 0 ||
+    Object.keys(manusV2AttachmentMappings(metadata)).length !== 0 ||
+    Object.keys(manusV2AttachmentAttempts(metadata)).length !== 0 ||
+    Object.keys(manusV2AttachmentUnknownAttempts(metadata)).length !== 0 ||
+    recovery?.kind !== "turn" ||
+    recovery.localRehydrateAuthority !== "local_rehydrate_unbound" ||
+    historical?.schemaVersion !== 1 ||
+    historical.sourceErrorCode !==
+      KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID
+  ) {
+    return false;
+  }
+  const sourceTurnId = String(requirement?.sourceTurnId || "");
+  if (!sourceTurnId || sourceTurnId === turn.id) return false;
+  const source = (
+    (await tx
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, sourceTurnId),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+        ),
+      )
+      .limit(1)
+      .for("update")) as ConversationTurn[]
+  )[0];
+  return Boolean(
+    source &&
+      inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
+        {
+          ...build,
+          status: "confirming",
+          protocolErrorCode: null,
+          protocolError: null,
+        },
+        source,
+        turn.id,
+      ),
+  );
 }
 
 export function inspectKnowledgeBaseLocalRehydrateRequirement(
@@ -13825,6 +14193,34 @@ export async function findRecoverableKnowledgeBaseTurnIds(
             eq(conversationTurns.status, "failed"),
             eq(
               conversationTurns.errorCode,
+              KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+            ),
+            eq(
+              knowledgeBaseBuilds.protocolErrorCode,
+              KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+            ),
+            eq(knowledgeBaseBuilds.providerProtocol, "manus_v2"),
+            isNull(conversationTurns.upstreamTaskId),
+            isNull(knowledgeBaseBuilds.upstreamTaskId),
+            isNull(knowledgeBaseBuilds.canonicalTaskId),
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), '') = 'not_sent'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchState')), '') = 'failed'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.failureClass')), '') = 'terminal_nonregenerable'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.recoveryAction')), '') = 'contact_support'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.canRegenerate')), '') = 'false'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.recovery.localRehydrateAuthority')), '') = 'local_rehydrate_unbound'`,
+            sql`COALESCE(JSON_LENGTH(${conversationTurns.attachmentFileIds}), 0) = 0`,
+            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.preparedDispatch') IS NULL`,
+            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.frozenProviderRequestHash') IS NULL`,
+            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NULL`,
+            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NULL`,
+          ),
+          and(
+            eq(conversationTurns.status, "failed"),
+            eq(
+              conversationTurns.errorCode,
               "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
             ),
             sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
@@ -13896,6 +14292,13 @@ export async function claimKnowledgeBaseTurnForRecovery(
       throw error;
     }
     const currentMetadata = metadataOf(turn);
+    if (isHistoricalPreproviderAuthoritySelfTerminal(build, turn)) {
+      // A scan may discover this exact historical self-terminal row, but it
+      // must never claim a dispatch lease or touch the Provider. Reclassify
+      // under the same locks; the customer must supply the current credential
+      // through the ordinary reconcile action before this operation can run.
+      return null;
+    }
     const terminalRejectedV2 =
       !isKnowledgeBaseAnchorHandoffRepairKind(currentMetadata.repairKind) &&
       currentMetadata.providerProtocol === "manus_v2" &&
@@ -14137,6 +14540,17 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   assertInteger(leaseMs, "leaseMs", 1_000);
   return db.transaction(async (tx: any) => {
+    // Credential -> current owner -> build -> turn is the global rotation
+    // order. Lock the customer-selected credential first so Admin replacement
+    // cannot retire it between validation and the same-turn rebind commit.
+    const pinnedCurrentCredential =
+      await lockKnowledgeBaseReservationCredential(tx, apiCredentialId);
+    const hasCurrentCredentialAuthority =
+      await lockCurrentKnowledgeBaseCredentialAuthority(
+        tx,
+        input.userId,
+        pinnedCurrentCredential,
+      );
     const { turn, build } = await lockedOwnedTurnAndBuild(tx, {
       userId: input.userId,
       turnId,
@@ -14171,6 +14585,16 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       Object.keys(manusV2AttachmentUnknownAttempts(metadata)).length === 0 &&
       !turn.upstreamTaskId &&
       !build.canonicalTaskId;
+    const historicalLocalRehydrateSelfTerminal = retryAuthorityRecord(
+      metadata.historicalLocalRehydrateAuthoritySelfTerminal,
+    );
+    const historicalPreproviderAuthorityUserFix =
+      historicalLocalRehydrateSelfTerminal === undefined
+        ? false
+        : await proveHistoricalPreproviderAuthorityUserFix(
+            { userId: input.userId, build, turn },
+            tx,
+          );
     if (
       turn.status !== "failed" ||
       turn.upstreamTaskId ||
@@ -14182,30 +14606,14 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       (!pristinePreprepareCredentialPause &&
         metadata.attachmentsFrozen !== true) ||
       (!pristinePreprepareCredentialPause && !metadata.preparedDispatch) ||
+      (historicalLocalRehydrateSelfTerminal &&
+        (!historicalPreproviderAuthorityUserFix ||
+          turn.apiCredentialId === apiCredentialId)) ||
+      hasCurrentCredentialAuthority !== true ||
       !metadata.recovery
     ) {
       return null;
     }
-    const credential = (
-      await tx
-        .select({ id: apiCredentials.id })
-        .from(apiCredentials)
-        .where(
-          and(
-            eq(apiCredentials.id, apiCredentialId),
-            eq(apiCredentials.userId, input.userId),
-            eq(apiCredentials.status, "active"),
-          ),
-        )
-        .limit(1)
-    )[0];
-    if (!credential) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "修复后的 API 凭证不可用",
-      );
-    }
-
     const leaseToken = randomUUID();
     const leaseExpiresAt = new Date(now.getTime() + leaseMs);
     const {
