@@ -22,6 +22,7 @@ import {
   type KnowledgeBaseIncidentRepairCliResult,
 } from "./knowledge-base-incident-repair-cli-core";
 import { validateReleaseRuntimeEnvironment } from "./_core/release-channel-adapter";
+import { closeDbForOneShotMaintenance } from "./db";
 
 declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 declare const __FRONTMIND_RELEASE_CHANNEL__: string | undefined;
@@ -161,6 +162,7 @@ async function main() {
     connection = null;
     if (executed.mode === "reset-pollution-preview") {
       if (!lockReleased) fail("LOCK_RELEASE_UNCONFIRMED");
+      await closeDbForOneShotMaintenance();
       writeOutput(
         serializeResetPollutionCleanupCliResult({
           success: true,
@@ -172,6 +174,7 @@ async function main() {
     }
     if (executed.mode === "reset-pollution-apply") {
       if (!lockReleased) fail("LOCK_RELEASE_UNCONFIRMED");
+      await closeDbForOneShotMaintenance();
       writeOutput(
         serializeResetPollutionCleanupCliResult({
           success: true,
@@ -202,6 +205,7 @@ async function main() {
       command?.mode === "reset-pollution-preview" ||
       command?.mode === "reset-pollution-apply"
     ) {
+      await closeDbForOneShotMaintenance().catch(() => undefined);
       const raw = lockReleased && error instanceof Error ? error.message : "";
       writeOutput(
         serializeResetPollutionCleanupCliResult({

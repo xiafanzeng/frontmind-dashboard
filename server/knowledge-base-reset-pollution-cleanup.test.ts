@@ -205,30 +205,65 @@ function facts(): ResetPollutionCleanupFacts {
     pendingUserMessageCount: 1,
     messageCount: 1,
     attachmentCount: 1,
-    upstreamResourceCount: 0,
+    upstreamResourceCount: 1,
+    upstreamFileCleanup: {
+      upstreamId: staged.file_id,
+      apiCredentialId: "credential-1",
+      upstreamIdSha256: createHash("sha256")
+        .update(staged.file_id)
+        .digest("hex"),
+      apiCredentialIdSha256: createHash("sha256")
+        .update("credential-1")
+        .digest("hex"),
+    },
     messageStateSha256: "f".repeat(64),
     attachmentStateSha256: "0".repeat(64),
-    providerGenerationZero: true,
     uploadProof: {
-      intentCount: 8,
+      intentCount: 2,
       stateSha256: "e".repeat(64),
-      localOnlyItems: manifests.map((item, index) => ({
-        intentIdSha256: createHash("sha256")
-          .update(
-            index === 0
-              ? staged.managedIntentId
-              : `managed-intent-${index + 1}`,
-          )
-          .digest("hex"),
-        operationIdSha256: createHash("sha256")
-          .update(item.itemId)
-          .digest("hex"),
-        ordinal: index + 1,
-        total: 8,
-        state: index === 0 ? "sealed" : "awaiting_browser",
-        sizeBytes: index === 0 ? staged.sizeBytes : null,
-        sha256: index === 0 ? staged.contentSha256 : null,
-      })),
+      retired: false,
+      items: [
+        {
+          intentIdSha256: createHash("sha256")
+            .update(staged.managedIntentId)
+            .digest("hex"),
+          operationIdSha256: createHash("sha256")
+            .update(staged.itemId)
+            .digest("hex"),
+          credentialIdSha256: createHash("sha256")
+            .update("credential-1")
+            .digest("hex"),
+          ordinal: 1,
+          total: 8,
+          state: "uploaded",
+          providerGeneration: 1,
+          safeErrorCode: null,
+          fileIdSha256: createHash("sha256")
+            .update(staged.file_id)
+            .digest("hex"),
+          sizeBytes: staged.sizeBytes,
+          sha256: staged.contentSha256,
+        },
+        {
+          intentIdSha256: createHash("sha256")
+            .update("managed-intent-2")
+            .digest("hex"),
+          operationIdSha256: createHash("sha256")
+            .update(manifests[1]!.itemId)
+            .digest("hex"),
+          credentialIdSha256: createHash("sha256")
+            .update("credential-1")
+            .digest("hex"),
+          ordinal: 2,
+          total: 8,
+          state: "awaiting_browser",
+          providerGeneration: 0,
+          safeErrorCode: "UPLOAD_BROWSER_BODY_INCOMPLETE",
+          fileIdSha256: null,
+          sizeBytes: null,
+          sha256: null,
+        },
+      ],
     },
   };
 }
@@ -242,7 +277,7 @@ const input = {
 };
 
 describe("reset-pollution strict cleanup facts", () => {
-  it("accepts only the reset-after pristine rev0 awaiting-attachment start", () => {
+  it("accepts only the exact mixed uploaded/browser-incomplete reset pollution", () => {
     expect(inspectResetPollutionCleanupFacts(input, facts())).toMatchObject({
       status: "eligible",
       stateSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
@@ -252,8 +287,10 @@ describe("reset-pollution strict cleanup facts", () => {
         turns: 1,
         nodes: 0,
         acceptedReceipts: 0,
-        uploadIntents: 8,
-        upstreamResources: 0,
+        uploadIntents: 2,
+        upstreamResources: 1,
+        upstreamFilesToDelete: 1,
+        localAssetsToDelete: 1,
       },
     });
     expect(planResetPollutionCleanupTransaction(input, facts())).toEqual({
@@ -281,6 +318,16 @@ describe("reset-pollution strict cleanup facts", () => {
       "task identity",
       (value: ResetPollutionCleanupFacts) =>
         (value.turn.upstreamTaskId = "task"),
+    ],
+    [
+      "upstream file identity mismatch",
+      (value: ResetPollutionCleanupFacts) =>
+        (value.upstreamFileCleanup!.upstreamId = "different-file"),
+    ],
+    [
+      "uploaded intent receipt mismatch",
+      (value: ResetPollutionCleanupFacts) =>
+        (value.uploadProof.items[0]!.fileIdSha256 = "a".repeat(64)),
     ],
     ["node", (value: ResetPollutionCleanupFacts) => (value.nodeCount = 1)],
     [

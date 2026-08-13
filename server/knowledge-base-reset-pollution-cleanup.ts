@@ -9,6 +9,7 @@ import {
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
   knowledgeBaseConversationTombstones,
+  knowledgeBaseResetCleanupJobs,
   knowledgeBaseResetRequests,
   knowledgeBaseResetStates,
   messages,
@@ -18,9 +19,10 @@ import {
   type KnowledgeBaseBuild,
 } from "../drizzle/schema";
 import { getDb } from "./db";
+import { prepareKnowledgeResetCleanupResource } from "./knowledge-base-reset-service";
 import {
+  inspectResetPollutionRetainedSources,
   inspectResetPollutionUploadIntents,
-  removeResetPollutionRetainedSources,
   retireResetPollutionUploadIntents,
   type ResetPollutionUploadProof,
 } from "./knowledge-base-reset-pollution-upload-cleanup";
@@ -72,9 +74,14 @@ export type ResetPollutionCleanupFacts = {
   messageCount: number;
   attachmentCount: number;
   upstreamResourceCount: number;
+  upstreamFileCleanup: {
+    upstreamId: string;
+    apiCredentialId: string;
+    upstreamIdSha256: string;
+    apiCredentialIdSha256: string;
+  } | null;
   messageStateSha256: string;
   attachmentStateSha256: string;
-  providerGenerationZero: boolean;
   uploadProof: ResetPollutionUploadProof;
 };
 
@@ -91,6 +98,8 @@ export type ResetPollutionCleanupPreview = {
     acceptedReceipts: number;
     uploadIntents: number;
     upstreamResources: number;
+    upstreamFilesToDelete: number;
+    localAssetsToDelete: number;
   };
 };
 
@@ -225,13 +234,15 @@ function uploadProofMatchesLocalLedger(
   ledger: NonNullable<ReturnType<typeof strictLocalStagedLedger>>,
 ) {
   if (
-    proof.intentCount !== proof.localOnlyItems.length ||
-    proof.intentCount < ledger.staged.length
+    proof.intentCount !== 2 ||
+    proof.intentCount !== proof.items.length ||
+    proof.items.filter((item) => item.state === "uploaded").length !== 1 ||
+    proof.items.filter((item) => item.state === "awaiting_browser").length !== 1
   ) {
     return false;
   }
   const ordinals = new Set<number>();
-  for (const item of proof.localOnlyItems) {
+  for (const item of proof.items) {
     if (
       !Number.isSafeInteger(item.ordinal) ||
       item.ordinal < 1 ||
@@ -245,20 +256,29 @@ function uploadProofMatchesLocalLedger(
       return false;
     }
     ordinals.add(item.ordinal);
-    if (item.state === "sealed") {
+    if (item.state === "uploaded") {
       const descriptor = ledger.manifest[item.ordinal - 1]!;
       if (
+        item.providerGeneration !== 1 ||
+        item.safeErrorCode !== null ||
+        !item.fileIdSha256 ||
         item.sizeBytes !== integer(descriptor.sizeBytes, 1) ||
         item.sha256 !== text(descriptor.sha256).toLowerCase()
       ) {
         return false;
       }
-    } else if (item.sizeBytes !== null || item.sha256 !== null) {
+    } else if (
+      item.providerGeneration !== 0 ||
+      item.safeErrorCode !== "UPLOAD_BROWSER_BODY_INCOMPLETE" ||
+      item.fileIdSha256 !== null ||
+      item.sizeBytes !== null ||
+      item.sha256 !== null
+    ) {
       return false;
     }
   }
   return ledger.staged.every((staged) =>
-    proof.localOnlyItems.some(
+    proof.items.some(
       (intent) =>
         intent.intentIdSha256 ===
           createHash("sha256")
@@ -269,7 +289,12 @@ function uploadProofMatchesLocalLedger(
             .update(text(staged.itemId), "utf8")
             .digest("hex") &&
         intent.ordinal === Number(staged.index) + 1 &&
-        intent.state === "sealed" &&
+        intent.state === "uploaded" &&
+        intent.providerGeneration === 1 &&
+        intent.fileIdSha256 ===
+          createHash("sha256")
+            .update(text(staged.file_id), "utf8")
+            .digest("hex") &&
         intent.sizeBytes === integer(staged.sizeBytes, 1) &&
         intent.sha256 === text(staged.contentSha256).toLowerCase(),
     ),
@@ -407,7 +432,14 @@ export function resetPollutionStateSha256(facts: ResetPollutionCleanupFacts) {
         upstreamResourceCount: facts.upstreamResourceCount,
         messageStateSha256: facts.messageStateSha256,
         attachmentStateSha256: facts.attachmentStateSha256,
-        providerGenerationZero: facts.providerGenerationZero,
+        upstreamFileCleanup:
+          facts.upstreamFileCleanup === null
+            ? null
+            : {
+                upstreamIdSha256: facts.upstreamFileCleanup.upstreamIdSha256,
+                apiCredentialIdSha256:
+                  facts.upstreamFileCleanup.apiCredentialIdSha256,
+              },
         uploadIntentCount: facts.uploadProof.intentCount,
         uploadIntentStateSha256: facts.uploadProof.stateSha256,
       }),
@@ -479,9 +511,22 @@ function validateFacts(
     facts.acceptedReceiptCount !== 0 ||
     facts.pendingUserMessageCount !== 1 ||
     facts.messageCount !== 1 ||
-    facts.providerGenerationZero !== true ||
-    facts.attachmentCount !== localLedger.staged.length ||
-    facts.upstreamResourceCount !== 0 ||
+    facts.attachmentCount > localLedger.staged.length ||
+    facts.upstreamResourceCount !== 1 ||
+    !facts.upstreamFileCleanup ||
+    createHash("sha256")
+      .update(facts.upstreamFileCleanup.upstreamId, "utf8")
+      .digest("hex") !== facts.upstreamFileCleanup.upstreamIdSha256 ||
+    createHash("sha256")
+      .update(facts.upstreamFileCleanup.apiCredentialId, "utf8")
+      .digest("hex") !== facts.upstreamFileCleanup.apiCredentialIdSha256 ||
+    !facts.uploadProof.items.some(
+      (item) =>
+        item.state === "uploaded" &&
+        item.fileIdSha256 === facts.upstreamFileCleanup!.upstreamIdSha256 &&
+        item.credentialIdSha256 ===
+          facts.upstreamFileCleanup!.apiCredentialIdSha256,
+    ) ||
     facts.conversation.id !== persistedConversationId ||
     facts.conversation.userId !== input.userId ||
     facts.conversation.projectAssignmentId !== null ||
@@ -499,6 +544,7 @@ function validateFacts(
     facts.turn.expectedLeafId !== null ||
     facts.turn.status !== "queued" ||
     facts.turn.upstreamTaskId !== null ||
+    facts.upstreamFileCleanup.apiCredentialId !== facts.turn.apiCredentialId ||
     !facts.turn.operationKey ||
     !facts.turn.requestHash ||
     !facts.turn.upstreamIdempotencyKeyHash ||
@@ -535,6 +581,9 @@ function counts(
     acceptedReceipts: facts.acceptedReceiptCount,
     uploadIntents: facts.uploadProof.intentCount,
     upstreamResources: facts.upstreamResourceCount,
+    upstreamFilesToDelete: facts.upstreamFileCleanup ? 1 : 0,
+    localAssetsToDelete: strictLocalStagedLedger(record(facts.turn.metadata))!
+      .sources.length,
   };
 }
 
@@ -658,8 +707,15 @@ async function loadFacts(
       tx
         .select({
           id: upstreamResources.id,
+          userId: upstreamResources.userId,
+          apiCredentialId: upstreamResources.apiCredentialId,
+          projectAssignmentId: upstreamResources.projectAssignmentId,
           kind: upstreamResources.kind,
           upstreamId: upstreamResources.upstreamId,
+          conversationId: upstreamResources.conversationId,
+          uploadedAt: upstreamResources.uploadedAt,
+          contentExpiresAt: upstreamResources.contentExpiresAt,
+          contentDeletedAt: upstreamResources.contentDeletedAt,
         })
         .from(upstreamResources)
         .where(
@@ -679,11 +735,32 @@ async function loadFacts(
         knowledgeBase.kind === "completion")
     );
   }).length;
-  const providerGenerationZero =
-    uploadProof.localOnlyItems.length === uploadProof.intentCount &&
-    uploadProof.localOnlyItems.every((item) =>
-      ["awaiting_browser", "receiving", "sealed"].includes(item.state),
-    );
+  const uploadedIntent = uploadProof.items.filter(
+    (item) => item.state === "uploaded",
+  )[0];
+  const resource = resourceRows[0];
+  const upstreamFileCleanup =
+    resourceRows.length === 1 &&
+    resource?.kind === "file" &&
+    resource.userId === input.userId &&
+    resource.projectAssignmentId === null &&
+    resource.conversationId === persistedId &&
+    resource.uploadedAt !== null &&
+    resource.contentExpiresAt !== null &&
+    resource.contentDeletedAt === null &&
+    uploadedIntent?.fileIdSha256 ===
+      createHash("sha256").update(resource.upstreamId, "utf8").digest("hex") &&
+    uploadedIntent.credentialIdSha256 ===
+      createHash("sha256")
+        .update(resource.apiCredentialId, "utf8")
+        .digest("hex")
+      ? {
+          upstreamId: resource.upstreamId,
+          apiCredentialId: resource.apiCredentialId,
+          upstreamIdSha256: uploadedIntent.fileIdSha256,
+          apiCredentialIdSha256: uploadedIntent.credentialIdSha256,
+        }
+      : null;
   const pendingUserMessageCount = messageRows.filter((message: any) => {
     const knowledgeBase = record(record(message.metadata).knowledgeBase);
     return (
@@ -714,11 +791,10 @@ async function loadFacts(
     throw new Error("KB_RESET_POLLUTION_PREDICATE_NOT_MET");
   }
   if (
-    attachmentRows.some(
-      (attachment: any) =>
-        typeof attachment.upstreamFileId === "string" &&
-        attachment.upstreamFileId.length > 0,
-    )
+    !upstreamFileCleanup ||
+    attachmentRows.length !== 1 ||
+    attachmentRows[0]!.upstreamFileId !== upstreamFileCleanup.upstreamId ||
+    attachmentRows[0]!.deletedAt !== null
   ) {
     throw new Error("KB_RESET_POLLUTION_PREDICATE_NOT_MET");
   }
@@ -734,6 +810,7 @@ async function loadFacts(
     messageCount: messageRows.length,
     attachmentCount: attachmentRows.length,
     upstreamResourceCount: resourceRows.length,
+    upstreamFileCleanup,
     messageStateSha256: createHash("sha256")
       .update(
         JSON.stringify(
@@ -773,7 +850,6 @@ async function loadFacts(
         "utf8",
       )
       .digest("hex"),
-    providerGenerationZero,
     uploadProof,
   } satisfies ResetPollutionCleanupFacts;
 }
@@ -838,10 +914,20 @@ export async function previewResetPollutionCleanup(
     turnId: seedTurn[0]!.id,
     clientRequestId: seedTurn[0]!.clientRequestId,
   });
-  return db.transaction(async (tx: any) => {
+  const preview = await db.transaction(async (tx: any) => {
     const facts = await loadFacts(tx, input, uploadProof);
-    return inspectResetPollutionCleanupFacts(input, facts);
+    return {
+      preview: inspectResetPollutionCleanupFacts(input, facts),
+      sources: strictLocalStagedLedger(record(facts.turn.metadata))!.sources,
+    };
   });
+  await inspectResetPollutionRetainedSources({
+    userId: input.userId,
+    buildId: input.buildId,
+    generation: 1,
+    sources: preview.sources,
+  });
+  return preview.preview;
 }
 
 export async function executeResetPollutionCleanup(
@@ -883,28 +969,6 @@ export async function executeResetPollutionCleanup(
     ...uploadCoordinate,
     expectedStateSha256: uploadProof.stateSha256,
   });
-  const retainedSources = await db.transaction(async (tx: any) => {
-    const retiredUploadProof =
-      await inspectResetPollutionUploadIntents(uploadCoordinate);
-    const facts = await loadFacts(tx, input, retiredUploadProof);
-    validateFacts(input, facts);
-    if (
-      retiredUploadProof.stateSha256 !== uploadProof.stateSha256 ||
-      resetPollutionStateSha256(facts) !== input.expectedStateSha256
-    ) {
-      throw new Error("KB_RESET_POLLUTION_STATE_CHANGED");
-    }
-    return strictLocalStagedLedger(record(facts.turn.metadata))!.sources;
-  });
-  // Filesystem bytes cannot share the SQL transaction. Remove them first;
-  // if SQL later fails, the retired local-only reservation remains safe and
-  // this exact cleanup is idempotently retryable without any Provider call.
-  await removeResetPollutionRetainedSources({
-    userId: input.userId,
-    buildId: input.buildId,
-    generation: 1,
-    sources: retainedSources,
-  });
   const applied = await db.transaction(async (tx: any) => {
     const retiredUploadProof =
       await inspectResetPollutionUploadIntents(uploadCoordinate);
@@ -917,6 +981,45 @@ export async function executeResetPollutionCleanup(
       throw new Error("KB_RESET_POLLUTION_STATE_CHANGED");
     }
     const plan = planResetPollutionCleanupTransaction(input, facts);
+    const cleanup = facts.upstreamFileCleanup!;
+    const retainedSources = strictLocalStagedLedger(
+      record(facts.turn.metadata),
+    )!.sources;
+    const now = new Date();
+    await tx
+      .insert(knowledgeBaseResetCleanupJobs)
+      .values(
+        [
+          prepareKnowledgeResetCleanupResource({
+            kind: "file",
+            upstreamId: cleanup.upstreamId,
+            apiCredentialId: cleanup.apiCredentialId,
+          }),
+          ...retainedSources.map((source) =>
+            prepareKnowledgeResetCleanupResource({
+              kind: "local_asset" as const,
+              upstreamId: source.localStorageKey,
+              apiCredentialId: null,
+            }),
+          ),
+        ].map((resource) => ({
+          ...resource,
+          id: randomUUID(),
+          resetRequestId: input.resetRequestId,
+          userId: input.userId,
+          status: "pending" as const,
+          attemptCount: 0,
+          lastError: null,
+          completedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        })),
+      )
+      .onDuplicateKeyUpdate({
+        set: {
+          updatedAt: now,
+        },
+      });
     await tx
       .insert(knowledgeBaseConversationTombstones)
       .values({

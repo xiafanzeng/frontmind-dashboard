@@ -28,6 +28,9 @@ describe("signed-image incident repair CLI integration boundary", () => {
     expect(entrypoint).toContain(
       "FRONTMIND_RESET_POLLUTION_OFFLINE_MAINTENANCE",
     );
+    expect(entrypoint.match(/closeDbForOneShotMaintenance\(\)/gu)).toHaveLength(
+      3,
+    );
     expect(entrypoint).not.toMatch(
       /from ["'][^"']*(?:manus|upstream)[^"']*["']/u,
     );

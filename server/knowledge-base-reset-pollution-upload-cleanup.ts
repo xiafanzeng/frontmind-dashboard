@@ -7,12 +7,17 @@ type JsonRecord = Record<string, unknown>;
 export type ResetPollutionUploadProof = {
   intentCount: number;
   stateSha256: string;
-  localOnlyItems: Array<{
+  retired: boolean;
+  items: Array<{
     intentIdSha256: string;
     operationIdSha256: string;
+    credentialIdSha256: string;
     ordinal: number;
     total: number;
     state: string;
+    providerGeneration: 0 | 1;
+    safeErrorCode: string | null;
+    fileIdSha256: string | null;
     sizeBytes: number | null;
     sha256: string | null;
   }>;
@@ -21,6 +26,7 @@ export type ResetPollutionUploadProof = {
 type ProvenIntent = {
   directory: string;
   operationIndex: string;
+  intentId: string;
   state: JsonRecord;
 };
 
@@ -82,6 +88,15 @@ async function readJson(target: string) {
   return JSON.parse(await fs.readFile(target, "utf8")) as JsonRecord;
 }
 
+async function syncDirectory(target: string) {
+  const directory = await fs.open(target, "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 async function writeJsonAtomic(target: string, value: unknown) {
   await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
   const temporary = `${target}.${randomUUID()}.tmp`;
@@ -94,6 +109,7 @@ async function writeJsonAtomic(target: string, value: unknown) {
   }
   try {
     await fs.rename(temporary, target);
+    await syncDirectory(path.dirname(target));
   } finally {
     await fs.rm(temporary, { force: true }).catch(() => undefined);
   }
@@ -110,11 +126,15 @@ function safeIdentifier(value: unknown, max: number) {
 
 function safeManifestState(value: JsonRecord) {
   const scope = value.resumeScope as JsonRecord;
+  const provider = Array.isArray(value.provider)
+    ? (value.provider[0] as JsonRecord | undefined)
+    : undefined;
+  const receipt = value.receipt as JsonRecord | null;
   return {
-    intentId: value.intentId,
-    operationId: value.operationId,
+    intentIdSha256: storageKey(String(value.intentId)),
+    operationIdSha256: storageKey(String(value.operationId)),
     requestHash: value.requestHash,
-    batchId: value.batchId,
+    batchIdSha256: storageKey(String(value.batchId)),
     ordinal: value.ordinal,
     total: value.total,
     revision: value.revision,
@@ -123,43 +143,108 @@ function safeManifestState(value: JsonRecord) {
     declaredSizeBytes: value.declaredSizeBytes,
     sizeBytes: value.sizeBytes,
     sha256: value.sha256,
-    clientRequestId: scope.clientRequestId,
+    clientRequestIdSha256: storageKey(String(scope.clientRequestId)),
+    credentialIdSha256: storageKey(String(value.credentialId)),
+    filenameSha256: storageKey(String(value.filename)),
+    providerGeneration: value.providerGeneration,
+    safeErrorCode: value.safeErrorCode,
+    fileIdSha256:
+      typeof receipt?.fileId === "string" ? storageKey(receipt.fileId) : null,
+    providerState: provider?.state ?? null,
+    providerOwnershipRecorded: provider?.ownershipRecorded ?? null,
+    providerStatus: provider?.providerStatus ?? null,
+    providerPutResponse2xx: provider?.putResponse2xx ?? null,
+    providerPutReplayed: provider?.putReplayed ?? null,
+    receiptUploadedAt: receipt?.uploadedAt ?? null,
+    receiptProviderReadyAt: receipt?.providerReadyAt ?? null,
+    receiptExpiresAt: receipt?.expiresAt ?? null,
+    receiptReplayed: receipt?.replayed ?? null,
+    receiptRecreated: receipt?.recreated ?? null,
     createdAt: value.createdAt,
     sealedAt: value.sealedAt,
     updatedAt: value.updatedAt,
+    completedAt: value.completedAt,
   };
 }
 
-function isStrictLocalOnlyState(manifest: JsonRecord) {
-  if (
+function timestamp(value: unknown) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function isStrictAwaitingBrowserFailure(manifest: JsonRecord) {
+  return (
     manifest.state === "awaiting_browser" &&
     manifest.phase === null &&
+    manifest.providerGeneration === 0 &&
+    Array.isArray(manifest.provider) &&
+    manifest.provider.length === 0 &&
+    manifest.receipt === null &&
     manifest.sizeBytes === null &&
     manifest.sha256 === null &&
-    manifest.sealedAt === null
-  ) {
-    return true;
-  }
-  if (
-    manifest.state === "receiving" &&
-    manifest.phase === "receiving" &&
-    manifest.sizeBytes === null &&
-    manifest.sha256 === null &&
-    manifest.sealedAt === null
-  ) {
-    return true;
-  }
-  return (
-    manifest.state === "sealed" &&
-    manifest.phase === "sealed" &&
-    manifest.sizeBytes === manifest.declaredSizeBytes &&
-    Number.isSafeInteger(Number(manifest.sizeBytes)) &&
-    Number(manifest.sizeBytes) > 0 &&
-    typeof manifest.sha256 === "string" &&
-    /^[a-f0-9]{64}$/u.test(manifest.sha256) &&
-    typeof manifest.sealedAt === "string" &&
-    Number.isFinite(Date.parse(manifest.sealedAt))
+    manifest.sealedAt === null &&
+    manifest.completedAt === null &&
+    manifest.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE"
   );
+}
+
+function isStrictUploadedGenerationOne(manifest: JsonRecord) {
+  const provider = Array.isArray(manifest.provider)
+    ? (manifest.provider[0] as JsonRecord | undefined)
+    : undefined;
+  const receipt = manifest.receipt as JsonRecord | null;
+  return Boolean(
+    manifest.state === "uploaded" &&
+      manifest.phase === null &&
+      manifest.providerGeneration === 1 &&
+      Array.isArray(manifest.provider) &&
+      manifest.provider.length === 1 &&
+      provider?.generation === 1 &&
+      provider.state === "uploaded" &&
+      provider.ownershipRecorded === true &&
+      safeIdentifier(provider.fileId, 255) &&
+      provider.filename === manifest.filename &&
+      provider.providerStatus === "uploaded" &&
+      provider.putResponse2xx === true &&
+      typeof provider.putReplayed === "boolean" &&
+      timestamp(provider.updatedAt) &&
+      receipt &&
+      receipt.fileId === provider.fileId &&
+      receipt.sizeBytes === manifest.sizeBytes &&
+      Number.isSafeInteger(receipt.sizeBytes) &&
+      Number(receipt.sizeBytes) > 0 &&
+      Number.isFinite(receipt.uploadedAt) &&
+      Number.isFinite(receipt.providerReadyAt) &&
+      Number.isFinite(receipt.expiresAt) &&
+      Number(receipt.expiresAt) > Number(receipt.uploadedAt) &&
+      typeof receipt.replayed === "boolean" &&
+      typeof receipt.recreated === "boolean" &&
+      manifest.sizeBytes === manifest.declaredSizeBytes &&
+      typeof manifest.sha256 === "string" &&
+      /^[a-f0-9]{64}$/u.test(manifest.sha256) &&
+      timestamp(manifest.sealedAt) &&
+      timestamp(manifest.completedAt) &&
+      manifest.safeErrorCode === null,
+  );
+}
+
+function proofItem(
+  state: JsonRecord,
+): ResetPollutionUploadProof["items"][number] {
+  return {
+    intentIdSha256: String(state.intentIdSha256),
+    operationIdSha256: String(state.operationIdSha256),
+    credentialIdSha256: String(state.credentialIdSha256),
+    ordinal: Number(state.ordinal),
+    total: Number(state.total),
+    state: String(state.state),
+    providerGeneration: Number(state.providerGeneration) as 0 | 1,
+    safeErrorCode:
+      typeof state.safeErrorCode === "string" ? state.safeErrorCode : null,
+    fileIdSha256:
+      typeof state.fileIdSha256 === "string" ? state.fileIdSha256 : null,
+    sizeBytes: state.sizeBytes === null ? null : Number(state.sizeBytes),
+    sha256: typeof state.sha256 === "string" ? state.sha256 : null,
+  };
 }
 
 async function inspectInternal(input: {
@@ -175,37 +260,58 @@ async function inspectInternal(input: {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   });
+  let retiredLedger: ResetPollutionUploadProof | null = null;
   if (indexed?.state === "retired") {
-    const localOnlyItems = Array.isArray(indexed.localOnlyItems)
-      ? indexed.localOnlyItems
-      : null;
+    const items = Array.isArray(indexed.items) ? indexed.items : null;
     if (
       indexed.schemaVersion !== 1 ||
+      indexed.state !== "retired" ||
+      !Array.isArray(indexed.intentIds) ||
+      indexed.intentIds.length !== 0 ||
+      !timestamp(indexed.retiredAt) ||
+      Object.keys(indexed).sort().join("\0") !==
+        [
+          "intentIds",
+          "items",
+          "retiredAt",
+          "retiredCount",
+          "schemaVersion",
+          "state",
+          "stateSha256",
+        ].join("\0") ||
       !Number.isSafeInteger(indexed.retiredCount) ||
       Number(indexed.retiredCount) < 0 ||
       typeof indexed.stateSha256 !== "string" ||
       !/^[a-f0-9]{64}$/u.test(indexed.stateSha256) ||
-      !localOnlyItems ||
-      localOnlyItems.length !== Number(indexed.retiredCount) ||
-      localOnlyItems.some((item) => {
+      !items ||
+      items.length !== Number(indexed.retiredCount) ||
+      items.some((item) => {
         const value = item as JsonRecord;
         return (
           typeof value.intentIdSha256 !== "string" ||
           !/^[a-f0-9]{64}$/u.test(value.intentIdSha256) ||
           typeof value.operationIdSha256 !== "string" ||
           !/^[a-f0-9]{64}$/u.test(value.operationIdSha256) ||
+          typeof value.credentialIdSha256 !== "string" ||
+          !/^[a-f0-9]{64}$/u.test(value.credentialIdSha256) ||
           !Number.isSafeInteger(value.ordinal) ||
           !Number.isSafeInteger(value.total) ||
-          !["awaiting_browser", "receiving", "sealed"].includes(
-            String(value.state),
-          ) ||
+          !["awaiting_browser", "uploaded"].includes(String(value.state)) ||
+          ![0, 1].includes(Number(value.providerGeneration)) ||
           !(
-            (value.state === "sealed" &&
+            (value.state === "uploaded" &&
+              value.providerGeneration === 1 &&
+              value.safeErrorCode === null &&
+              typeof value.fileIdSha256 === "string" &&
+              /^[a-f0-9]{64}$/u.test(value.fileIdSha256) &&
               Number.isSafeInteger(value.sizeBytes) &&
               Number(value.sizeBytes) > 0 &&
               typeof value.sha256 === "string" &&
               /^[a-f0-9]{64}$/u.test(value.sha256)) ||
-            (value.state !== "sealed" &&
+            (value.state === "awaiting_browser" &&
+              value.providerGeneration === 0 &&
+              value.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE" &&
+              value.fileIdSha256 === null &&
               value.sizeBytes === null &&
               value.sha256 === null)
           )
@@ -214,13 +320,10 @@ async function inspectInternal(input: {
     ) {
       throw new Error("KB_RESET_POLLUTION_UPLOAD_SCOPE_INDEX_INVALID");
     }
-    return {
+    retiredLedger = {
       intentCount: Number(indexed.retiredCount),
       stateSha256: indexed.stateSha256,
-      localOnlyItems:
-        localOnlyItems as ResetPollutionUploadProof["localOnlyItems"],
-      intents: [],
-      resumeIndex,
+      items: items as ResetPollutionUploadProof["items"],
       retired: true,
     };
   }
@@ -250,7 +353,6 @@ async function inspectInternal(input: {
     ) {
       continue;
     }
-    const provider = Array.isArray(manifest.provider) ? manifest.provider : [];
     if (
       manifest.schemaVersion !== 2 ||
       manifest.userId !== input.userId ||
@@ -259,14 +361,14 @@ async function inspectInternal(input: {
       !safeIdentifier(manifest.intentId, 255) ||
       !safeIdentifier(manifest.operationId, 255) ||
       !safeIdentifier(manifest.requestHash, 64) ||
-      manifest.providerGeneration !== 0 ||
-      provider.length !== 0 ||
-      manifest.receipt !== null ||
-      !isStrictLocalOnlyState(manifest) ||
+      !safeIdentifier(manifest.credentialId, 36) ||
+      !safeIdentifier(manifest.filename, 512) ||
+      !(
+        isStrictAwaitingBrowserFailure(manifest) ||
+        isStrictUploadedGenerationOne(manifest)
+      ) ||
       manifest.leaseOwner !== null ||
       manifest.leaseExpiresAt !== null ||
-      manifest.completedAt !== null ||
-      manifest.safeErrorCode !== null ||
       manifest.deletedAt !== null ||
       entry.name !== storageKey(String(manifest.intentId))
     ) {
@@ -278,17 +380,26 @@ async function inspectInternal(input: {
       operationId: String(manifest.operationId),
     });
     const index = await readJson(operationIndex);
-    if (
-      index.schemaVersion !== 1 ||
-      index.intentId !== manifest.intentId ||
-      index.requestHash !== manifest.requestHash ||
-      index.state === "retired"
-    ) {
+    const activeIndex =
+      index.schemaVersion === 1 &&
+      index.intentId === manifest.intentId &&
+      index.requestHash === manifest.requestHash &&
+      index.state === undefined &&
+      Object.keys(index).sort().join("\0") ===
+        ["intentId", "requestHash", "schemaVersion"].join("\0");
+    const retiredIndex =
+      index.schemaVersion === 1 &&
+      index.state === "retired" &&
+      timestamp(index.retiredAt) &&
+      Object.keys(index).sort().join("\0") ===
+        ["retiredAt", "schemaVersion", "state"].join("\0");
+    if ((!activeIndex && !retiredIndex) || (retiredLedger && !retiredIndex)) {
       throw new Error("KB_RESET_POLLUTION_UPLOAD_INDEX_INVALID");
     }
     intents.push({
       directory,
       operationIndex,
+      intentId: String(manifest.intentId),
       state: safeManifestState(manifest),
     });
   }
@@ -296,10 +407,40 @@ async function inspectInternal(input: {
     (left, right) => Number(left.state.ordinal) - Number(right.state.ordinal),
   );
   const indexedIds = Array.isArray(indexed?.intentIds) ? indexed.intentIds : [];
-  const provenIds = intents.map((intent) => intent.state.intentId);
+  const provenIds = intents.map((intent) => intent.intentId);
+  const provenItems = intents.map((intent) => proofItem(intent.state));
+  if (retiredLedger) {
+    if (
+      provenItems.some(
+        (item) =>
+          !retiredLedger.items.some(
+            (expected) => JSON.stringify(expected) === JSON.stringify(item),
+          ),
+      ) ||
+      (intents.length === retiredLedger.intentCount &&
+        createHash("sha256")
+          .update(JSON.stringify(intents.map((intent) => intent.state)), "utf8")
+          .digest("hex") !== retiredLedger.stateSha256)
+    ) {
+      throw new Error("KB_RESET_POLLUTION_UPLOAD_SCOPE_INDEX_INVALID");
+    }
+    return {
+      ...retiredLedger,
+      intents,
+      resumeIndex,
+    };
+  }
+  const activeResumeIndex =
+    indexed !== null &&
+    indexed.schemaVersion === 1 &&
+    indexed.state === undefined &&
+    Array.isArray(indexed.intentIds) &&
+    timestamp(indexed.updatedAt) &&
+    Object.keys(indexed).sort().join("\0") ===
+      ["intentIds", "schemaVersion", "updatedAt"].join("\0");
   if (
-    indexed &&
-    (indexed.schemaVersion !== 1 ||
+    !activeResumeIndex ||
+    (indexed &&
       JSON.stringify([...indexedIds].sort()) !==
         JSON.stringify([...provenIds].sort()))
   ) {
@@ -311,20 +452,10 @@ async function inspectInternal(input: {
   return {
     intentCount: intents.length,
     stateSha256,
-    localOnlyItems: intents.map((intent) => ({
-      intentIdSha256: storageKey(String(intent.state.intentId)),
-      operationIdSha256: storageKey(String(intent.state.operationId)),
-      ordinal: Number(intent.state.ordinal),
-      total: Number(intent.state.total),
-      state: String(intent.state.state),
-      sizeBytes:
-        intent.state.sizeBytes === null ? null : Number(intent.state.sizeBytes),
-      sha256:
-        typeof intent.state.sha256 === "string" ? intent.state.sha256 : null,
-    })),
+    retired: false,
+    items: provenItems,
     intents,
     resumeIndex,
-    retired: false,
   };
 }
 
@@ -339,7 +470,8 @@ export async function inspectResetPollutionUploadIntents(input: {
   return {
     intentCount: proof.intentCount,
     stateSha256: proof.stateSha256,
-    localOnlyItems: proof.localOnlyItems,
+    retired: proof.retired,
+    items: proof.items,
   };
 }
 
@@ -355,7 +487,13 @@ export async function retireResetPollutionUploadIntents(input: {
   if (proof.stateSha256 !== input.expectedStateSha256) {
     throw new Error("KB_RESET_POLLUTION_UPLOAD_STATE_CHANGED");
   }
-  if (proof.retired) return { retiredCount: proof.intentCount };
+  if (proof.retired) {
+    for (const intent of proof.intents) {
+      await fs.rm(intent.directory, { recursive: true, force: true });
+    }
+    if (proof.intents.length) await syncDirectory(intentRoot());
+    return { retiredCount: proof.intentCount };
+  }
   const retiredAt = new Date().toISOString();
   // The owning application is stopped for this one-shot maintenance command.
   // Retired indexes are written before bytes disappear, so a crash can never
@@ -373,19 +511,20 @@ export async function retireResetPollutionUploadIntents(input: {
     intentIds: [],
     retiredCount: proof.intentCount,
     stateSha256: proof.stateSha256,
-    localOnlyItems: proof.localOnlyItems,
+    items: proof.items,
     retiredAt,
   });
   for (const intent of proof.intents) {
     await fs.rm(intent.directory, { recursive: true, force: true });
   }
+  if (proof.intents.length) await syncDirectory(intentRoot());
   return { retiredCount: proof.intentCount };
 }
 
 const BUILD_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
-export async function removeResetPollutionRetainedSources(input: {
+type ResetPollutionRetainedSourcesInput = {
   userId: number;
   buildId: string;
   generation: number;
@@ -394,7 +533,12 @@ export async function removeResetPollutionRetainedSources(input: {
     contentSha256: string;
     sizeBytes: number;
   }>;
-}) {
+};
+
+async function validateResetPollutionRetainedSources(
+  input: ResetPollutionRetainedSourcesInput,
+  remove: boolean,
+) {
   if (
     !Number.isSafeInteger(input.userId) ||
     input.userId < 1 ||
@@ -452,7 +596,10 @@ export async function removeResetPollutionRetainedSources(input: {
         throw new Error("KB_RESET_POLLUTION_LOCAL_SOURCE_SCOPE_INVALID");
       }
     }
-    if (missing) continue;
+    if (missing) {
+      if (remove) continue;
+      throw new Error("KB_RESET_POLLUTION_LOCAL_SOURCE_MISSING");
+    }
     const bytes = await fs.readFile(target);
     if (
       bytes.length !== source.sizeBytes ||
@@ -460,8 +607,9 @@ export async function removeResetPollutionRetainedSources(input: {
     ) {
       throw new Error("KB_RESET_POLLUTION_LOCAL_SOURCE_INTEGRITY_MISMATCH");
     }
-    await fs.rm(target, { force: true });
+    if (remove) await fs.rm(target, { force: true });
   }
+  if (!remove) return { verifiedCount: unique.size };
   const generationDirectory = path.resolve(
     root,
     ...expectedGenerationRoot.split("/"),
@@ -482,4 +630,16 @@ export async function removeResetPollutionRetainedSources(input: {
     });
   }
   return { removedOrMissingCount: unique.size };
+}
+
+export async function inspectResetPollutionRetainedSources(
+  input: ResetPollutionRetainedSourcesInput,
+) {
+  return validateResetPollutionRetainedSources(input, false);
+}
+
+export async function removeResetPollutionRetainedSources(
+  input: ResetPollutionRetainedSourcesInput,
+) {
+  return validateResetPollutionRetainedSources(input, true);
 }
