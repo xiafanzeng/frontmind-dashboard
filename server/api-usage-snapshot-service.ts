@@ -477,36 +477,6 @@ function latestManagedCredentialByUser<
   return latest;
 }
 
-export function bulkPreviousCredentialGroups(input: {
-  targets: Array<{ userId: number }>;
-  latestCredentials: Map<
-    number,
-    { userId: number; status: string; fingerprint: string }
-  >;
-  nextFingerprint: string;
-}) {
-  const groups = new Map<
-    string,
-    { fingerprint: string; accountIds: Set<number> }
-  >();
-  for (const target of input.targets) {
-    const credential = input.latestCredentials.get(target.userId);
-    if (
-      credential?.status !== "active" ||
-      credential.fingerprint === input.nextFingerprint
-    ) {
-      continue;
-    }
-    const group = groups.get(credential.fingerprint) ?? {
-      fingerprint: credential.fingerprint,
-      accountIds: new Set<number>(),
-    };
-    group.accountIds.add(target.userId);
-    groups.set(credential.fingerprint, group);
-  }
-  return [...groups.values()];
-}
-
 export function syncableManagedWorkspaceUserIds(input: {
   workspaceUserIds: number[];
   ownershipRows: Array<{ userId: number; deliveryAdminId: number }>;
@@ -542,26 +512,7 @@ export function apiUsageSnapshotCompletionState(input: {
   };
 }
 
-async function scanBulkPreviousCredentialGroups(
-  groups: Array<{ fingerprint: string; accountIds: Set<number> }>,
-) {
-  for (const group of groups) {
-    const accountIds = [...group.accountIds];
-    try {
-      await getSharedKeyMonthlyCreditUsageForAccounts({
-        credentialOwnerIds: accountIds,
-        accountIds,
-        poolFingerprint: group.fingerprint,
-        windowDays: DEFAULT_API_USAGE_WINDOW_DAYS,
-      });
-    } catch {
-      // Coverage is checked authoritatively after the best-effort scan. A
-      // prior fresh proof may still permit the atomic batch replacement.
-    }
-  }
-}
-
-function incompleteBulkHistoryTargets(input: {
+export function bulkManagedApiKeyHistoryDisposition(input: {
   targets: Array<{ userId: number }>;
   latestCredentials: Map<
     number,
@@ -575,37 +526,75 @@ function incompleteBulkHistoryTargets(input: {
     DEFAULT_API_USAGE_WINDOW_DAYS,
     input.nowMs,
   ).startAt;
-  return input.targets.filter((target) => {
+  const incompleteTargetIds: number[] = [];
+  const incompleteCredentialFingerprints = new Set<string>();
+  for (const target of input.targets) {
     const credential = input.latestCredentials.get(target.userId);
     if (
       credential?.status !== "active" ||
       credential.fingerprint === input.nextFingerprint
     ) {
-      return false;
+      continue;
     }
-    return !usageCoverageSupportsReplacement({
+    const complete = usageCoverageSupportsReplacement({
       coverage: input.coverageByFingerprint.get(credential.fingerprint),
       periodStartMs,
       nowMs: input.nowMs,
     });
-  });
+    if (!complete) {
+      incompleteTargetIds.push(target.userId);
+      // Fingerprints are one-way Key identifiers. Never put plaintext Key
+      // material, encrypted payloads, or per-account mappings in batch audit
+      // metadata.
+      incompleteCredentialFingerprints.add(credential.fingerprint);
+    }
+  }
+  return {
+    incompleteTargetIds,
+    incompleteCredentialFingerprints: [
+      ...incompleteCredentialFingerprints,
+    ].sort(),
+  };
 }
 
-export async function bulkReplaceManagedApiKeyTargets(input: {
-  actor: AuthenticatedUser;
-  scope: BulkManagedApiKeyScope;
-  targets: BulkManagedApiKeyRequestedTarget[];
-  applyMode: BulkManagedApiKeyApplyMode;
-  apiKey: string;
-  reason?: string;
-}) {
+export type BulkManagedApiKeyRuntime = {
+  requireDatabase: typeof requireDb;
+  validateApiKey: typeof validateUpstreamApiKey;
+  fingerprintApiKey: typeof getApiKeyFingerprint;
+  replaceCredential: typeof replaceApiCredentialInTransaction;
+  writeAuditEvent: typeof writeWorkspaceAuditEvent;
+  queueRefresh: typeof queueManagedApiUsageFingerprintRefresh;
+  now: () => Date;
+};
+
+export async function bulkReplaceManagedApiKeyTargets(
+  input: {
+    actor: AuthenticatedUser;
+    scope: BulkManagedApiKeyScope;
+    targets: BulkManagedApiKeyRequestedTarget[];
+    applyMode: BulkManagedApiKeyApplyMode;
+    apiKey: string;
+    reason?: string;
+  },
+  runtimeOverrides: Partial<BulkManagedApiKeyRuntime> = {},
+) {
+  const runtime: BulkManagedApiKeyRuntime = {
+    requireDatabase: requireDb,
+    validateApiKey: validateUpstreamApiKey,
+    fingerprintApiKey: getApiKeyFingerprint,
+    replaceCredential: replaceApiCredentialInTransaction,
+    writeAuditEvent: writeWorkspaceAuditEvent,
+    queueRefresh: queueManagedApiUsageFingerprintRefresh,
+    now: () => new Date(),
+    ...runtimeOverrides,
+  };
   if (!isSystemAdmin(input.actor)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
       "只有系统管理员可以批量配置账号 API Key。",
     );
   }
-  const db = await requireDb();
+  const db = await runtime.requireDatabase();
   const initialScope = await loadBulkManagedApiKeyScopeState({
     executor: db,
     scope: input.scope,
@@ -633,7 +622,7 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
     resolvedTargets: initialScope.resolvedTargets,
     requestedTargets: input.targets,
   });
-  const nextFingerprint = getApiKeyFingerprint(input.apiKey);
+  const nextFingerprint = runtime.fingerprintApiKey(input.apiKey);
   const initialActionTargets = bulkManagedApiKeyActionTargets({
     resolvedTargets: initialScopeTargets,
     latestCredentials: initialLatestCredentials,
@@ -646,51 +635,10 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
       "单次批量配置最多支持 200 个实际变更账号，请缩小范围后重试",
     );
   }
-  await validateUpstreamApiKey(input.apiKey);
-  const previousGroups = bulkPreviousCredentialGroups({
-    targets: initialActionTargets,
-    latestCredentials: initialLatestCredentials,
-    nextFingerprint,
-  });
-  const initialFingerprints = previousGroups.map((group) => group.fingerprint);
-  const initialCoverageRows = initialFingerprints.length
-    ? await db
-        .select()
-        .from(apiUsageCredentialCoverage)
-        .where(
-          and(
-            eq(apiUsageCredentialCoverage.scope, "managed_user"),
-            inArray(
-              apiUsageCredentialCoverage.credentialFingerprint,
-              initialFingerprints,
-            ),
-          ),
-        )
-    : [];
-  const initialCoverageByFingerprint = new Map(
-    initialCoverageRows.map((coverage: any) => [
-      String(coverage.credentialFingerprint),
-      coverage,
-    ]),
-  );
-  const coverageNowMs = Date.now();
-  const coveragePeriodStartMs = getShanghaiRollingUsagePeriod(
-    DEFAULT_API_USAGE_WINDOW_DAYS,
-    coverageNowMs,
-  ).startAt;
-  await scanBulkPreviousCredentialGroups(
-    previousGroups.filter(
-      (group) =>
-        !usageCoverageSupportsReplacement({
-          coverage: initialCoverageByFingerprint.get(group.fingerprint),
-          periodStartMs: coveragePeriodStartMs,
-          nowMs: coverageNowMs,
-        }),
-    ),
-  );
+  await runtime.validateApiKey(input.apiKey);
 
   const batchId = randomUUID();
-  const replacedAt = new Date();
+  const replacedAt = runtime.now();
   const result = await db.transaction(async (tx) => {
     const lockedScope = await loadBulkManagedApiKeyScopeState({
       executor: tx,
@@ -779,19 +727,16 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
         coverage,
       ]),
     );
-    const historyIncomplete = incompleteBulkHistoryTargets({
+    const historyDisposition = bulkManagedApiKeyHistoryDisposition({
       targets: input.applyMode === "replace_all" ? lockedActionTargets : [],
       latestCredentials,
       coverageByFingerprint,
       nextFingerprint,
       nowMs: replacedAt.getTime(),
     });
-    if (historyIncomplete.length > 0) {
-      throw new AuthServiceError(
-        "CONFLICT",
-        `${historyIncomplete.length} 个账号的旧 API Key 未完成近 30 天扫描，批量操作已全部停止。请重试；失效 Key 请改用单账号应急替换。`,
-      );
-    }
+    const historyIncompleteTargetIds = new Set(
+      historyDisposition.incompleteTargetIds,
+    );
 
     let updatedCount = 0;
     let unchangedCount = lockedScopeTargets.length - lockedActionTargets.length;
@@ -810,7 +755,7 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
         });
         continue;
       }
-      const credential = await replaceApiCredentialInTransaction({
+      const credential = await runtime.replaceCredential({
         executor: tx,
         userId: target.userId,
         apiKey: input.apiKey,
@@ -818,7 +763,7 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
       });
       updatedCount += 1;
       versions.push({ userId: target.userId, version: credential.version });
-      await writeWorkspaceAuditEvent(
+      await runtime.writeAuditEvent(
         {
           actor: input.actor,
           action: "admin.api_credential.bulk_replaced",
@@ -833,13 +778,18 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
             applyMode: input.applyMode,
             previousVersion: currentCredential?.version ?? 0,
             credentialVersion: credential.version,
-            historyIncomplete: false,
+            historyIncomplete: historyIncompleteTargetIds.has(target.userId),
+            usageHistoryDisposition: historyIncompleteTargetIds.has(
+              target.userId,
+            )
+              ? "preserved_incomplete"
+              : "preserved_complete",
           },
         },
         tx,
       );
     }
-    await writeWorkspaceAuditEvent(
+    await runtime.writeAuditEvent(
       {
         actor: input.actor,
         action: "admin.api_credential.bulk_completed",
@@ -854,6 +804,10 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
           targetCount: lockedActionTargets.length,
           updatedCount,
           unchangedCount,
+          historyIncompleteCount: historyDisposition.incompleteTargetIds.length,
+          incompleteHistoryCredentialFingerprints:
+            historyDisposition.incompleteCredentialFingerprints,
+          newSnapshotBaseline: "credential_created_at",
           targetUserIds: lockedActionTargets.map((target) => target.userId),
         },
       },
@@ -865,6 +819,7 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
       targetCount: lockedActionTargets.length,
       updatedCount,
       unchangedCount,
+      historyIncompleteCount: historyDisposition.incompleteTargetIds.length,
       versions,
     };
   });
@@ -874,7 +829,7 @@ export async function bulkReplaceManagedApiKeyTargets(input: {
   // refresh for the new physical-Key pool; the queue shares the global named
   // lock and retries after an overlapping full synchronization finishes.
   if (result.updatedCount > 0) {
-    queueManagedApiUsageFingerprintRefresh({
+    runtime.queueRefresh({
       actor: input.actor,
       fingerprint: nextFingerprint,
     });

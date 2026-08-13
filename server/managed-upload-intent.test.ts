@@ -76,6 +76,7 @@ import {
   readKnowledgeBaseManagedUploadIntentByOperation,
   readManagedUploadIntent,
   receiveManagedUploadIntentBody,
+  scheduleManagedUploadIntentCleanup,
   stopManagedUploadIntentWorkerForTests,
   sweepManagedUploadIntents,
 } from "./managed-upload-intent";
@@ -1496,6 +1497,160 @@ describe("stage-first managed upload intents", () => {
     expect(
       await readManagedUploadIntent(uploaded.sealed.intentId),
     ).toMatchObject({ state: "cancelled", receipt: null });
+  });
+
+  it("durably schedules uploaded provider files for background cleanup without using the revoked credential", async () => {
+    const uploaded = await finalizeIntentForDelete("provider-deferred-delete");
+    mocks.credential.mockResolvedValue(null);
+
+    await expect(
+      scheduleManagedUploadIntentCleanup({
+        intentId: uploaded.sealed.intentId,
+        ticket: uploaded.ticket,
+        userId: 42,
+      }),
+    ).resolves.toMatchObject({
+      scheduled: true,
+      state: "cleanup_pending",
+    });
+    expect(
+      await readManagedUploadIntent(uploaded.sealed.intentId),
+    ).toMatchObject({
+      state: "cleanup_pending",
+      phase: "cleanup_pending",
+      safeErrorCode: "UPLOAD_CUSTOMER_CANCELLATION",
+      receipt: expect.objectContaining({ fileId: "provider-deferred-delete" }),
+      provider: [
+        expect.objectContaining({
+          fileId: "provider-deferred-delete",
+          state: "uploaded",
+          ownershipRecorded: true,
+        }),
+      ],
+    });
+    expect(mocks.axiosDelete).not.toHaveBeenCalled();
+
+    await expect(
+      processManagedUploadIntent({
+        intentId: uploaded.sealed.intentId,
+        userId: 42,
+        traceId: "revoked-cleanup-worker",
+      }),
+    ).rejects.toMatchObject({ code: "UPLOAD_CREDENTIAL_UNAVAILABLE" });
+    expect(
+      await readManagedUploadIntent(uploaded.sealed.intentId),
+    ).toMatchObject({
+      state: "cleanup_pending",
+      phase: "cleanup_pending",
+      receipt: expect.objectContaining({ fileId: "provider-deferred-delete" }),
+    });
+    expect(mocks.axiosDelete).not.toHaveBeenCalled();
+
+    await expect(
+      scheduleManagedUploadIntentCleanup({
+        intentId: uploaded.sealed.intentId,
+        ticket: uploaded.ticket,
+        userId: 42,
+      }),
+    ).resolves.toMatchObject({
+      scheduled: true,
+      state: "cleanup_pending",
+    });
+    expect(
+      await readManagedUploadIntent(uploaded.sealed.intentId),
+    ).toMatchObject({
+      state: "cleanup_pending",
+      receipt: expect.objectContaining({ fileId: "provider-deferred-delete" }),
+    });
+  });
+
+  it("lets an in-flight worker observe a durable cleanup request at its next CAS", async () => {
+    const { sealed, ticket } = await sealIntent();
+    let finishCreate!: (value: unknown) => void;
+    mocks.axiosPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishCreate = resolve;
+        }),
+    );
+    const running = processManagedUploadIntent({
+      intentId: sealed.intentId,
+      userId: 42,
+      traceId: "active-upload-worker",
+    });
+    await vi.waitFor(() => expect(mocks.axiosPost).toHaveBeenCalledOnce());
+
+    await expect(
+      scheduleManagedUploadIntentCleanup({
+        intentId: sealed.intentId,
+        ticket,
+        userId: 42,
+      }),
+    ).resolves.toMatchObject({
+      scheduled: true,
+      state: "cleanup_pending",
+    });
+    expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
+      state: "processing",
+      phase: "creating_provider",
+      leaseOwner: expect.any(String),
+    });
+    await expect(
+      processManagedUploadIntent({
+        intentId: sealed.intentId,
+        userId: 42,
+        traceId: "competing-cleanup-worker",
+      }),
+    ).resolves.toMatchObject({
+      state: "processing",
+      phase: "creating_provider",
+    });
+    expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
+      state: "processing",
+      phase: "creating_provider",
+      leaseOwner: expect.any(String),
+    });
+    expect(mocks.axiosPost).toHaveBeenCalledOnce();
+    expect(mocks.axiosDelete).not.toHaveBeenCalled();
+    finishCreate({
+      status: 201,
+      data: {
+        id: "provider-created-after-cancel",
+        filename: "provider-document.pdf",
+        status: "pending",
+        upload_url: "https://storage.example.com/created-after-cancel",
+        upload_expires_at: Date.now() + 180_000,
+      },
+    });
+    await expect(running).resolves.toMatchObject({
+      state: "processing",
+      phase: "cleanup_pending",
+    });
+    expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
+      state: "cleanup_pending",
+      phase: "cleanup_pending",
+      leaseOwner: null,
+      provider: [
+        expect.objectContaining({ fileId: "provider-created-after-cancel" }),
+      ],
+    });
+    expect(mocks.axiosPost).toHaveBeenCalledOnce();
+    expect(mocks.axiosPut).not.toHaveBeenCalled();
+
+    mocks.axiosDelete.mockResolvedValue({ status: 204, data: "" });
+    await expect(
+      processManagedUploadIntent({
+        intentId: sealed.intentId,
+        userId: 42,
+        traceId: "cleanup-request-handoff",
+      }),
+    ).resolves.toMatchObject({ state: "processing" });
+    expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
+      state: "cancelled",
+      phase: null,
+      leaseOwner: null,
+    });
+    expect(mocks.axiosDelete).toHaveBeenCalledOnce();
   });
 
   it("restores an uploaded receipt when binding wins the DELETE preflight race", async () => {

@@ -270,6 +270,11 @@ describe("administrator channel navigation", () => {
     expect(source).not.toContain("美元");
     expect(source).toContain('confirmation: "BULK_REPLACE_API_KEYS"');
     expect(source).toContain("任一账号发生版本冲突都会全部回滚");
+    expect(source).toContain("即使已失效也不会阻断轮换");
+    expect(source).toContain("最后已知用量会保留并标记为扫描不完整");
+    expect(source).not.toContain(
+      "无法完整扫描时，整批会停止，需改用单账号应急替换",
+    );
     expect(source).toContain('confirmation: "REPLACE_API_KEY"');
     expect(source).toContain('confirmation: "REVOKE_API_KEY"');
     expect(source).toContain("迟到请求不会覆盖较新的 Key");

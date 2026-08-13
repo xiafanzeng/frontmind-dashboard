@@ -1330,9 +1330,11 @@ function AdminBulkApiKeyDialog({
       await onSaved();
       toast.success(`已为 ${result.updatedCount} 个账号配置 API Key`, {
         description:
-          result.unchangedCount > 0
-            ? `${result.unchangedCount} 个账号无需变更；用量统计将在下次同步后更新`
-            : "用量统计将在下次同步后更新",
+          result.historyIncompleteCount > 0
+            ? `${result.historyIncompleteCount} 个账号的旧 Key 历史用量保留为“扫描不完整”；新 Key 用量将从本次替换时间开始同步`
+            : result.unchangedCount > 0
+              ? `${result.unchangedCount} 个账号无需变更；用量统计将在下次同步后更新`
+              : "用量统计将在下次同步后更新",
       });
       reset();
       onOpenChange(false);
@@ -1618,7 +1620,8 @@ function AdminBulkApiKeyDialog({
           <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-950">
             这是一次性批量分发；以后单独修改某个账号不会自动联动其他账号。共享
             Key 会扩大泄露影响范围，并限制未知历史任务导入。旧 Key
-            无法完整扫描时，整批会停止，需改用单账号应急替换。
+            即使已失效也不会阻断轮换；其最后已知用量会保留并标记为扫描不完整，新
+            Key 的用量从替换时间开始同步。
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={busy}>返回检查</AlertDialogCancel>

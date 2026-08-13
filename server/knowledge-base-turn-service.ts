@@ -10813,6 +10813,41 @@ export async function deferKnowledgeBaseManusV2AnchorHandoffAfterRejection(
 
 const MAX_MANUS_V2_EXPLICIT_REJECTION_RETRIES = 3;
 
+const MANUS_V2_CREDENTIAL_REJECTION =
+  /(?:permission[_-]?denied|unauth|forbidden|invalid[_-]?(?:api[_-]?)?key|credential)/iu;
+
+export function knowledgeBaseManusV2TerminalRejectionAuthority(input: {
+  providerCode?: unknown;
+  providerStatus?: unknown;
+  attachmentAttempts?: unknown;
+}) {
+  const status = Number(input.providerStatus);
+  const attemptCodes = Object.values(
+    retryAuthorityRecord(input.attachmentAttempts) || {},
+  ).flatMap((value) => {
+    const attempt = retryAuthorityRecord(value);
+    return typeof attempt?.code === "string" ? [attempt.code] : [];
+  });
+  const credentialRejected =
+    status === 401 ||
+    status === 403 ||
+    [input.providerCode, ...attemptCodes].some(
+      (value) =>
+        typeof value === "string" && MANUS_V2_CREDENTIAL_REJECTION.test(value),
+    );
+  return credentialRejected
+    ? ({
+        failureClass: "requires_user_fix" as const,
+        recoveryAction: "update_credential" as const,
+        message: "Manus API 凭证已被拒绝，请更新凭证后继续当前操作",
+      } as const)
+    : ({
+        failureClass: "terminal_nonregenerable" as const,
+        recoveryAction: "contact_support" as const,
+        message: "Manus 明确拒绝了当前请求；系统不会自动重发，请联系支持处理",
+      } as const);
+}
+
 function explicitManusV2RejectionDelayMs(
   metadata: KnowledgeBaseTurnMetadata,
   nextAttempt: number,
@@ -10849,6 +10884,9 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
     leaseToken: string;
     code: string;
     retryable: boolean;
+    /** Safe provider classification; never includes response bodies or keys. */
+    providerCode?: string;
+    providerStatus?: number | null;
     /** undefined means Manus did not supply Retry-After. */
     recoveryDelayMs?: number;
     now?: Date;
@@ -10902,9 +10940,22 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
       !localRehydrateRejected &&
       input.retryable &&
       nextCount <= MAX_MANUS_V2_EXPLICIT_REJECTION_RETRIES;
+    const providerCode = safeProviderDiagnostic(input.providerCode);
+    const providerStatus = Number.isSafeInteger(input.providerStatus)
+      ? Number(input.providerStatus)
+      : null;
+    const terminalAuthority = knowledgeBaseManusV2TerminalRejectionAuthority({
+      providerCode,
+      providerStatus,
+      attachmentAttempts: metadata.manusV2AttachmentAttempts,
+    });
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadata,
       providerRejectionCount: nextCount,
+      ...(providerCode ? { providerReasonCategory: providerCode } : {}),
+      ...(providerStatus !== null
+        ? { providerRejectionStatus: providerStatus }
+        : {}),
       createAttemptState: mayRetry ? "not_sent" : "rejected",
       createAttemptUpdatedAt: now.toISOString(),
       providerAttemptState: mayRetry ? "not_sent" : "rejected",
@@ -10912,11 +10963,15 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
       failureClass:
         !mayRetry && localRehydrateRejected
           ? "requires_user_fix"
-          : "recoverable_same_turn",
+          : !mayRetry
+            ? terminalAuthority.failureClass
+            : "recoverable_same_turn",
       recoveryAction:
         !mayRetry && localRehydrateRejected
           ? "create_new_canonical_from_snapshot"
-          : "wait",
+          : !mayRetry
+            ? terminalAuthority.recoveryAction
+            : "wait",
       canRegenerate: false,
     };
     const delayMs = mayRetry
@@ -10925,14 +10980,15 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
           nextCount,
           input.recoveryDelayMs,
         )
-      : DEFAULT_LEASE_MS;
+      : 0;
     await tx
       .update(conversationTurns)
       .set({
-        status: "running",
+        status: mayRetry ? "running" : "failed",
         errorCode: code,
-        errorMessage: null,
-        leaseExpiresAt: new Date(now.getTime() + delayMs),
+        errorMessage: mayRetry ? null : terminalAuthority.message,
+        completedAt: mayRetry ? turn.completedAt : now,
+        leaseExpiresAt: mayRetry ? new Date(now.getTime() + delayMs) : null,
         metadata: nextMetadata,
         updatedAt: now,
       })
@@ -10959,17 +11015,13 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
           : code,
         protocolError: requiresNewCanonical
           ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
-          : null,
+          : terminalAuthority.message,
         stateEpoch: build.stateEpoch + 1,
         awaitingResponseSince: null,
         updatedAt: now,
       })
       .where(eq(knowledgeBaseBuilds.id, build.id));
-    if (requiresNewCanonical) {
-      await tx
-        .update(conversationTurns)
-        .set({ status: "failed", completedAt: now, leaseExpiresAt: null })
-        .where(eq(conversationTurns.id, turn.id));
+    if (!mayRetry) {
       await markKnowledgeBaseConversationFailedInTransaction({
         tx,
         userId: input.userId,
@@ -13618,7 +13670,6 @@ export async function findRecoverableKnowledgeBaseTurnIds(
         input.allowLegacySkill404IncidentRepair
           ? sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind')`
           : sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind', 'legacy_skill_404_confirm')`,
-        sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), '') <> 'rejected'`,
         sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.attentionCode')), '') = ''`,
         sql`COALESCE(
           JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')),
@@ -13676,6 +13727,94 @@ export async function claimKnowledgeBaseTurnForRecovery(
       throw error;
     }
     const currentMetadata = metadataOf(turn);
+    const terminalRejectedV2 =
+      !isKnowledgeBaseAnchorHandoffRepairKind(currentMetadata.repairKind) &&
+      currentMetadata.providerProtocol === "manus_v2" &&
+      currentMetadata.providerAttemptState === "rejected" &&
+      storedKnowledgeBaseCreateAttemptState(currentMetadata) === "rejected" &&
+      (currentMetadata.providerMethod === "task.create" ||
+        currentMetadata.providerMethod === "task.sendMessage") &&
+      typeof currentMetadata.operationToken === "string" &&
+      /^[a-f0-9]{64}$/u.test(
+        String(currentMetadata.frozenProviderRequestHash || ""),
+      ) &&
+      currentMetadata.recoveryAction !== "create_new_canonical_from_snapshot" &&
+      (turn.status === "queued" || turn.status === "running");
+    if (terminalRejectedV2) {
+      const localRehydrateRejected =
+        currentMetadata.providerMethod === "task.sendMessage" &&
+        Boolean(
+          retryAuthorityRecord(build.handoffProvenance)
+            ?.localRehydrateRequired,
+        );
+      const authority = knowledgeBaseManusV2TerminalRejectionAuthority({
+        providerCode: currentMetadata.providerReasonCategory,
+        providerStatus: currentMetadata.providerRejectionStatus,
+        attachmentAttempts: currentMetadata.manusV2AttachmentAttempts,
+      });
+      const code = normalizeRequiredId(
+        turn.errorCode ||
+          (currentMetadata.providerMethod === "task.create"
+            ? "MANUS_V2_CREATE_REJECTED"
+            : "MANUS_V2_SEND_REJECTED"),
+        "code",
+        128,
+      );
+      const nextMetadata: KnowledgeBaseTurnMetadata = {
+        ...currentMetadata,
+        dispatchState: "failed",
+        failureClass: localRehydrateRejected
+          ? "requires_user_fix"
+          : authority.failureClass,
+        recoveryAction: localRehydrateRejected
+          ? "create_new_canonical_from_snapshot"
+          : authority.recoveryAction,
+        canRegenerate: false,
+      };
+      const terminalMessage = localRehydrateRejected
+        ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
+        : authority.message;
+      await tx
+        .update(conversationTurns)
+        .set({
+          status: "failed",
+          errorCode: code,
+          errorMessage: terminalMessage,
+          completedAt: now,
+          leaseExpiresAt: null,
+          metadata: nextMetadata,
+          updatedAt: now,
+        })
+        .where(eq(conversationTurns.id, turn.id));
+      await tx
+        .update(knowledgeBaseBuilds)
+        .set({
+          status: "protocol_error",
+          canonicalTaskState: "attention_required",
+          protocolErrorCode: localRehydrateRejected
+            ? "MANUS_V2_LOCAL_REHYDRATE_REJECTED"
+            : code,
+          protocolError: terminalMessage,
+          stateEpoch: build.stateEpoch + 1,
+          awaitingResponseSince: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, build.id),
+            eq(knowledgeBaseBuilds.generation, build.generation),
+            eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          ),
+        );
+      await markKnowledgeBaseConversationFailedInTransaction({
+        tx,
+        userId: turn.userId,
+        conversationId: turn.conversationId,
+        authoritativeTaskId: turn.upstreamTaskId || build.upstreamTaskId,
+        failedAt: now,
+      });
+      return null;
+    }
     if (isKnowledgeBaseAnchorHandoffRepairKind(currentMetadata.repairKind)) {
       return null;
     }
@@ -13838,6 +13977,14 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
     const recoveryAction = metadata.recoveryAction;
     const storedCreateAttemptState =
       storedKnowledgeBaseCreateAttemptState(metadata);
+    const rejectedCredentialAttempt =
+      recoveryAction === "update_credential" &&
+      storedCreateAttemptState === "rejected" &&
+      metadata.providerProtocol === "manus_v2" &&
+      metadata.providerMethod === "task.create" &&
+      metadata.providerAttemptState === "rejected" &&
+      !turn.upstreamTaskId &&
+      !build.canonicalTaskId;
     if (
       turn.status !== "failed" ||
       turn.upstreamTaskId ||
@@ -13845,7 +13992,7 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       build.activeTurnId !== turn.id ||
       metadata.failureClass !== "requires_user_fix" ||
       (recoveryAction !== "top_up" && recoveryAction !== "update_credential") ||
-      storedCreateAttemptState !== "not_sent" ||
+      (storedCreateAttemptState !== "not_sent" && !rejectedCredentialAttempt) ||
       metadata.attachmentsFrozen !== true ||
       !metadata.preparedDispatch ||
       !metadata.recovery
@@ -13887,6 +14034,23 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       leaseOwnerHash: leaseOwnerHash(leaseToken),
       createAttemptState: "not_sent",
       createAttemptUpdatedAt: now.toISOString(),
+      ...(rejectedCredentialAttempt
+        ? {
+            credentialRejectionHistory: [
+              ...(Array.isArray(metadata.credentialRejectionHistory)
+                ? metadata.credentialRejectionHistory
+                : []),
+              {
+                code: turn.errorCode,
+                providerCode: metadata.providerReasonCategory ?? null,
+                providerStatus: metadata.providerRejectionStatus ?? null,
+                credentialId: turn.apiCredentialId,
+                rejectedAt: turn.completedAt?.toISOString() ?? null,
+              },
+            ].slice(-4),
+          }
+        : {}),
+      providerAttemptState: "not_sent",
       dispatchState: "recovering",
       failureClass: "recoverable_same_turn",
       recoveryAction: "reconcile",

@@ -205,6 +205,12 @@ export class ManagedUploadIntentError extends Error {
   }
 }
 
+class ManagedUploadCleanupRequestedError extends Error {
+  constructor() {
+    super("Managed upload cleanup was requested");
+  }
+}
+
 type IntentTicketClaims = {
   v: 1;
   kind: typeof TICKET_KIND;
@@ -268,6 +274,7 @@ function intentPaths(intentId: string) {
     manifest: path.join(directory, "manifest.json"),
     part: path.join(directory, "upload.part"),
     content: path.join(directory, "upload.content"),
+    cleanupRequest: path.join(directory, "cleanup-request.json"),
     lock: path.join(directory, "intent.lock"),
   };
 }
@@ -1785,7 +1792,7 @@ async function acquireLease(
   allowedStates: ManagedUploadIntentManifest["state"][],
 ) {
   return withIntentLock(intentId, async () => {
-    const current = await readManagedUploadIntent(intentId);
+    let current = await readManagedUploadIntent(intentId);
     if (!current) {
       throw new ManagedUploadIntentError(
         404,
@@ -1795,13 +1802,42 @@ async function acquireLease(
         "refresh_page",
       );
     }
-    if (!allowedStates.includes(current.state))
-      return { state: "not_allowed" as const, manifest: current };
     const leaseActive =
       current.leaseOwner &&
       current.leaseOwner !== owner &&
       Date.parse(String(current.leaseExpiresAt)) > Date.now();
+    // A cleanup request cannot revoke the authority of an in-flight worker:
+    // that worker may still be inside a Provider call and must get one final
+    // CAS to record any returned file identity. Its updateLeased fence then
+    // persists cleanup_pending and stops before the next Provider step.
     if (leaseActive) return { state: "busy" as const, manifest: current };
+    const cleanupRequested = await fs
+      .stat(intentPaths(intentId).cleanupRequest)
+      .then(() => true)
+      .catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      });
+    if (
+      cleanupRequested &&
+      current.state !== "cancelled" &&
+      current.state !== "cleanup_pending"
+    ) {
+      const timestamp = nowIso();
+      current = {
+        ...current,
+        state: "cleanup_pending",
+        phase: "cleanup_pending",
+        safeErrorCode: "UPLOAD_CUSTOMER_CANCELLATION",
+        revision: current.revision + 1,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        updatedAt: timestamp,
+      };
+      await writeJsonAtomic(intentPaths(intentId).manifest, current);
+    }
+    if (!allowedStates.includes(current.state))
+      return { state: "not_allowed" as const, manifest: current };
     const timestamp = nowIso();
     const next: ManagedUploadIntentManifest = {
       ...current,
@@ -1824,7 +1860,17 @@ async function updateLeased(
     manifest: ManagedUploadIntentManifest,
   ) => Partial<ManagedUploadIntentManifest>,
 ) {
-  return replaceManifest(previous, (current) => {
+  return withIntentLock(previous.intentId, async () => {
+    const current = await readManagedUploadIntent(previous.intentId);
+    if (!current || current.revision !== previous.revision) {
+      throw new ManagedUploadIntentError(
+        409,
+        "UPLOAD_INTENT_CONFLICT",
+        "上传状态已由其他请求推进，请重新检查",
+        true,
+        "check_status",
+      );
+    }
     if (current.leaseOwner !== owner) {
       throw new ManagedUploadIntentError(
         409,
@@ -1835,8 +1881,34 @@ async function updateLeased(
       );
     }
     const delta = update(current);
+    const cleanupRequested =
+      current.state === "cleanup_pending"
+        ? false
+        : await fs
+            .stat(intentPaths(current.intentId).cleanupRequest)
+            .then(() => true)
+            .catch((error) => {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT")
+                return false;
+              throw error;
+            });
+    if (cleanupRequested && delta.state !== "cancelled") {
+      const next: ManagedUploadIntentManifest = {
+        ...current,
+        ...delta,
+        state: "cleanup_pending",
+        phase: "cleanup_pending",
+        safeErrorCode: "UPLOAD_CUSTOMER_CANCELLATION",
+        revision: current.revision + 1,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        updatedAt: nowIso(),
+      };
+      await writeJsonAtomic(intentPaths(current.intentId).manifest, next);
+      throw new ManagedUploadCleanupRequestedError();
+    }
     const releasing = delta.leaseOwner === null;
-    return {
+    const next: ManagedUploadIntentManifest = {
       ...current,
       ...delta,
       revision: current.revision + 1,
@@ -1845,6 +1917,65 @@ async function updateLeased(
         ? null
         : new Date(Date.now() + MANAGED_UPLOAD_LEASE_MS).toISOString(),
       updatedAt: nowIso(),
+    };
+    await writeJsonAtomic(intentPaths(current.intentId).manifest, next);
+    return next;
+  });
+}
+
+/**
+ * Durably requests cleanup without waiting for Provider deletion. This is the
+ * cancellation boundary used after a pristine KB start reservation has been
+ * retired: the customer may immediately start over, while the existing
+ * managed-upload worker remains responsible for every known Provider file.
+ */
+export async function scheduleManagedUploadIntentCleanup(input: {
+  intentId: string;
+  ticket: string;
+  userId: number;
+  projectAssignmentId?: string | null;
+}) {
+  return withIntentLock(input.intentId, async () => {
+    const manifest = await readManagedUploadIntent(input.intentId);
+    if (!manifest) {
+      return { scheduled: true as const, state: "cancelled" as const };
+    }
+    assertIntentOwner(manifest, input);
+    openManagedUploadIntentTicket(input.ticket, manifest, {
+      allowExpired: true,
+    });
+    if (manifest.state === "cancelled") {
+      await fs.rm(intentPaths(input.intentId).cleanupRequest, { force: true });
+      return { scheduled: true as const, state: "cancelled" as const };
+    }
+    if (manifest.state === "cleanup_pending") {
+      return { scheduled: true as const, state: "cleanup_pending" as const };
+    }
+    const leaseActive =
+      Boolean(manifest.leaseOwner) &&
+      Date.parse(String(manifest.leaseExpiresAt)) > Date.now();
+    await writeJsonAtomic(intentPaths(input.intentId).cleanupRequest, {
+      schemaVersion: 1,
+      requestedAt: nowIso(),
+    });
+    const next: ManagedUploadIntentManifest = {
+      ...manifest,
+      state: leaseActive ? manifest.state : "cleanup_pending",
+      phase: leaseActive ? manifest.phase : "cleanup_pending",
+      safeErrorCode: leaseActive
+        ? manifest.safeErrorCode
+        : "UPLOAD_CUSTOMER_CANCELLATION",
+      revision: manifest.revision + 1,
+      leaseOwner: leaseActive ? manifest.leaseOwner : null,
+      leaseExpiresAt: leaseActive ? manifest.leaseExpiresAt : null,
+      updatedAt: nowIso(),
+    };
+    if (!leaseActive) {
+      await writeJsonAtomic(intentPaths(input.intentId).manifest, next);
+    }
+    return {
+      scheduled: true as const,
+      state: leaseActive ? ("cleanup_pending" as const) : next.state,
     };
   });
 }
@@ -2691,6 +2822,13 @@ async function completeIntentCleanup(input: {
     });
   }
   const paths = intentPaths(manifest.intentId);
+  // Removing the durable request before the terminal CAS prevents the
+  // updateLeased cancellation fence from recursively re-scheduling the
+  // cleanup which this worker has just completed. A crash before that CAS is
+  // still safe: the manifest remains cleanup_pending and the next worker
+  // repeats the idempotent local/provider cleanup.
+  await fs.rm(paths.cleanupRequest, { force: true });
+  await fsyncDirectory(paths.directory);
   await Promise.all([
     fs.rm(paths.part, { force: true }),
     fs.rm(paths.content, { force: true }),
@@ -3847,6 +3985,15 @@ export async function processManagedUploadIntent(input: {
     manifest = await releaseLease(manifest, owner);
     return statusFromManifest(manifest, input.traceId);
   } catch (error) {
+    if (error instanceof ManagedUploadCleanupRequestedError) {
+      const cleanupPending = await readManagedUploadIntent(
+        input.intentId,
+      ).catch(() => null);
+      if (cleanupPending?.state === "cleanup_pending") {
+        return statusFromManifest(cleanupPending, input.traceId);
+      }
+      throw error;
+    }
     const current = await readManagedUploadIntent(input.intentId).catch(
       () => null,
     );

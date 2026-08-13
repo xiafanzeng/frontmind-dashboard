@@ -45,6 +45,7 @@ import {
   knowledgeBaseManualLogoCreateFailureForPersistence,
   knowledgeBaseManualLogoUnclassifiedFailureResponse,
   knowledgeBaseNoticeAllowsSameTaskReconcile,
+  knowledgeBasePreCreateUserFixObservationAllowsResume,
   knowledgeBaseManualLogoPendingResponse,
   knowledgeBaseManualLogoDeterministicCreateFailureStatus,
   knowledgeBaseManualLogoTerminalFailure,
@@ -1845,6 +1846,48 @@ describe("knowledge-base upstream read failure authority", () => {
       knowledgeBaseNoticeAllowsSameTaskReconcile({
         recoveryAction: "regenerate_turn",
         canRegenerate: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("allows only an unbound rejected credential create to rearm through reconcile", () => {
+    const activeTurn = {
+      id: "turn-rejected-create",
+      status: "failed",
+      upstreamTaskId: null,
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+      canRegenerate: false,
+      createAttemptState: "rejected",
+    } as any;
+    const notice = {
+      turnId: activeTurn.id,
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+      canRegenerate: false,
+    } as any;
+    const input = { activeTurn, notice, hasCredential: true };
+
+    expect(
+      knowledgeBasePreCreateUserFixObservationAllowsResume(input),
+    ).toBe(true);
+    expect(
+      knowledgeBasePreCreateUserFixObservationAllowsResume({
+        ...input,
+        activeTurn: { ...activeTurn, upstreamTaskId: "old-task" },
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBasePreCreateUserFixObservationAllowsResume({
+        ...input,
+        activeTurn: { ...activeTurn, recoveryAction: "top_up" },
+        notice: { ...notice, recoveryAction: "top_up" },
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBasePreCreateUserFixObservationAllowsResume({
+        ...input,
+        hasCredential: false,
       }),
     ).toBe(false);
   });

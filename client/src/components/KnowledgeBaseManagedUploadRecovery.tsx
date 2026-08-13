@@ -433,6 +433,7 @@ export default function KnowledgeBaseManagedUploadRecovery({
           }
           return discardManagedUploadIntent(
             discoveredUploadHandle(upload, manifest),
+            { deferProviderCleanup: true },
           );
         }),
       );
@@ -440,6 +441,9 @@ export default function KnowledgeBaseManagedUploadRecovery({
         (result): result is PromiseRejectedResult =>
           result.status === "rejected",
       );
+      // We wait only for the local durable cleanup marker, never for Provider
+      // deletion. If that small request loses its response the retry path
+      // schedules it idempotently before leaving the old conversation.
       if (failed) throw failed.reason;
       await onCancelledRef.current();
       setCancelled(true);

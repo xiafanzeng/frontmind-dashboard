@@ -105,6 +105,7 @@ import {
   ManagedUploadIntentError,
   MANAGED_UPLOAD_INTENT_MAX_BYTES,
   listManagedUploadIntentsByResumeScope,
+  scheduleManagedUploadIntentCleanup,
   processManagedUploadIntent,
   readManagedUploadIntent,
   receiveManagedUploadIntentBody,
@@ -3625,6 +3626,16 @@ router.delete("/v1/managed-uploads", async (req: Request, res: Response) => {
     });
   }
   try {
+    if (req.headers["x-frontmind-upload-cleanup-mode"] === "deferred") {
+      const scheduled = await scheduleManagedUploadIntentCleanup({
+        intentId,
+        ticket,
+        userId: req.frontmindUser.id,
+        projectAssignmentId:
+          req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      });
+      return res.status(202).json(scheduled);
+    }
     await deleteManagedUploadIntent({
       intentId,
       ticket,

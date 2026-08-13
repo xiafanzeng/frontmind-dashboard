@@ -1286,6 +1286,34 @@ export function knowledgeBaseNoticeAllowsSameTaskReconcile(
   );
 }
 
+export function knowledgeBasePreCreateUserFixObservationAllowsResume(input: {
+  activeTurn: KnowledgeBaseObservationDto["activeTurn"];
+  notice: KnowledgeBaseObservationDto["notice"];
+  hasCredential: boolean;
+}) {
+  const { activeTurn, notice } = input;
+  const resumableCreateBoundary =
+    activeTurn?.createAttemptState === "not_sent" ||
+    (activeTurn?.createAttemptState === "rejected" &&
+      activeTurn.recoveryAction === "update_credential");
+  return Boolean(
+    activeTurn &&
+      notice &&
+      notice.turnId === activeTurn.id &&
+      activeTurn.status === "failed" &&
+      !activeTurn.upstreamTaskId &&
+      activeTurn.failureClass === "requires_user_fix" &&
+      activeTurn.canRegenerate === false &&
+      resumableCreateBoundary &&
+      notice.failureClass === "requires_user_fix" &&
+      notice.canRegenerate === false &&
+      notice.recoveryAction === activeTurn.recoveryAction &&
+      (notice.recoveryAction === "top_up" ||
+        notice.recoveryAction === "update_credential") &&
+      input.hasCredential,
+  );
+}
+
 export function knowledgeBaseReconcileFailureStatus(error: unknown) {
   return error instanceof KnowledgeBaseBuildError
     ? error.code === "BUILD_NOT_FOUND"
@@ -6534,6 +6562,8 @@ export async function persistKnowledgeBaseDispatchFailure(
           ? "MANUS_V2_CREATE_REJECTED"
           : "MANUS_V2_SEND_REJECTED",
       retryable: v2Error.retryable,
+      providerCode: v2Error.code,
+      providerStatus: v2Error.status,
       ...(v2Error.retryAfterMs !== null
         ? { recoveryDelayMs: v2Error.retryAfterMs }
         : {}),
@@ -11217,19 +11247,11 @@ router.post("/progress/reconcile", async (req, res) => {
       const activeTurn = currentObservation?.activeTurn;
       const notice = currentObservation?.notice;
       const canResumePreCreateFailure =
-        Boolean(activeTurn) &&
-        Boolean(notice) &&
-        notice!.turnId === activeTurn!.id &&
-        activeTurn!.status === "failed" &&
-        activeTurn!.failureClass === "requires_user_fix" &&
-        activeTurn!.canRegenerate === false &&
-        activeTurn!.createAttemptState === "not_sent" &&
-        notice!.failureClass === "requires_user_fix" &&
-        notice!.canRegenerate === false &&
-        notice!.recoveryAction === activeTurn!.recoveryAction &&
-        (notice!.recoveryAction === "top_up" ||
-          notice!.recoveryAction === "update_credential") &&
-        Boolean(req.frontmindCredential);
+        knowledgeBasePreCreateUserFixObservationAllowsResume({
+          activeTurn: activeTurn ?? null,
+          notice: notice ?? null,
+          hasCredential: Boolean(req.frontmindCredential),
+        });
       if (canResumePreCreateFailure) {
         const claim = await resumeKnowledgeBaseTurnAfterUserFix({
           userId: req.frontmindUser.id,

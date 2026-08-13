@@ -2512,7 +2512,7 @@ export async function discardUnboundUpload(
 
 export async function discardManagedUploadIntent(
   handle: ManagedUploadHandle,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; deferProviderCleanup?: boolean } = {},
 ) {
   if (!handle.intentId || !handle.ticket) {
     if (!handle.fileId) {
@@ -2528,11 +2528,19 @@ export async function discardManagedUploadIntent(
     headers: deliveryProjectHeaders({
       "X-FrontMind-Upload-Intent-Id": handle.intentId,
       "X-FrontMind-Upload-Intent-Ticket": handle.ticket,
+      ...(options.deferProviderCleanup
+        ? { "X-FrontMind-Upload-Cleanup-Mode": "deferred" }
+        : {}),
     }),
     credentials: "include",
     signal: options.signal,
   });
-  if (response.status === 204) return;
+  if (
+    response.status === 204 ||
+    (options.deferProviderCleanup && response.status === 202)
+  ) {
+    return;
+  }
   throw await managedUploadResponseError(
     response,
     "文件暂时无法清理，请稍后重试",

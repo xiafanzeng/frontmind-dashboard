@@ -78,6 +78,7 @@ import {
   stageKnowledgeBaseDeferredTurnAttachment,
   sanitizeKnowledgeBaseRecoveryMetadata,
   settleKnowledgeBaseManusV2ExplicitRejection,
+  knowledgeBaseManusV2TerminalRejectionAuthority,
 } from "./knowledge-base-turn-service";
 import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import {
@@ -1346,6 +1347,36 @@ describe("generated attachment invalid pre-provider release", () => {
 });
 
 describe("Manus v2 canonical task writer fence", () => {
+  it("classifies durable credential and generic provider rejections as terminal", () => {
+    expect(
+      knowledgeBaseManusV2TerminalRejectionAuthority({
+        providerCode: "permission_denied",
+        providerStatus: 403,
+      }),
+    ).toMatchObject({
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+    });
+    expect(
+      knowledgeBaseManusV2TerminalRejectionAuthority({
+        attachmentAttempts: {
+          skill: { code: "MANUS_V2_FILE_CREATE_PERMISSION_DENIED" },
+        },
+      }),
+    ).toMatchObject({
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+    });
+    expect(
+      knowledgeBaseManusV2TerminalRejectionAuthority({
+        providerCode: "invalid_request",
+        providerStatus: 422,
+      }),
+    ).toMatchObject({
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+    });
+  });
   const build = (overrides: Record<string, unknown> = {}) => ({
     id: identity.buildId,
     userId: 1,
@@ -2162,6 +2193,12 @@ describe("Manus v2 canonical task writer fence", () => {
     const harness = createTurnServiceExecutor({
       build: build(),
       turns: [activeTurn],
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+        version: 1,
+      },
       turnSelections: [[(store) => store.turns]],
     });
     const attempt = {
@@ -3773,6 +3810,12 @@ describe("Manus v2 canonical task writer fence", () => {
         canonicalTaskState: "active",
       }),
       turns: [activeTurn],
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+        version: 1,
+      },
       turnSelections: [[(store) => store.turns]],
     });
     await expect(
@@ -3844,6 +3887,12 @@ describe("Manus v2 canonical task writer fence", () => {
         protocolErrorCode: "MANUS_V2_CREATE_REJECTED",
       }),
       turns: [rejectedTurn],
+      conversation: {
+        id: rejectedTurn.conversationId,
+        userId: rejectedTurn.userId,
+        projectAssignmentId: null,
+        version: 1,
+      },
       turnSelections: [[(store) => store.turns]],
     });
     await expect(
@@ -3863,6 +3912,82 @@ describe("Manus v2 canonical task writer fence", () => {
       canonicalTaskId: null,
       canonicalTaskState: "attention_required",
       protocolErrorCode: "MANUS_V2_CREATE_REJECTED",
+    });
+  });
+
+  it("terminalizes a historical bound local-rehydrate rejection as new-canonical authority", async () => {
+    const rejectedTurn = turn({
+      status: "running",
+      upstreamTaskId: "canonical-task",
+      leaseExpiresAt: new Date("2026-08-01T00:00:00.000Z"),
+      errorCode: "MANUS_V2_SEND_REJECTED",
+      metadata: {
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        operationToken: "a".repeat(64),
+        frozenProviderRequestHash: "f".repeat(64),
+        providerReasonCategory: "permission_denied",
+        providerRejectionStatus: 403,
+        attachmentsFrozen: true,
+        recoveryAction: "wait",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        upstreamTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "attention_required",
+        handoffProvenance: {
+          localRehydrateRequired: {
+            schemaVersion: 1,
+            sourceTurnId: "00000000-0000-4000-8000-000000000003",
+            snapshotSha256: "c".repeat(64),
+            taskIdSha256: createHash("sha256")
+              .update("canonical-task")
+              .digest("hex"),
+            generation: 3,
+            revision: 7,
+            leafId: "1.8",
+          },
+        },
+      }),
+      turns: [rejectedTurn],
+      conversation: {
+        id: rejectedTurn.conversationId,
+        userId: rejectedTurn.userId,
+        projectAssignmentId: null,
+        version: 1,
+      },
+      turnSelections: [
+        [(store) => store.turns, (store) => store.turns],
+      ],
+    });
+
+    await expect(
+      claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: rejectedTurn.id,
+          now: new Date("2026-08-01T00:10:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toBeNull();
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      leaseExpiresAt: null,
+      metadata: {
+        failureClass: "requires_user_fix",
+        recoveryAction: "create_new_canonical_from_snapshot",
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_LOCAL_REHYDRATE_REJECTED",
     });
   });
 });
@@ -4920,14 +5045,25 @@ describe("knowledge-base recovery metadata", () => {
     });
   });
 
-  it.each([
-    ["rejected", "top_up"],
-    ["sending", "update_credential"],
-    ["unknown", "top_up"],
-    ["acknowledged", "update_credential"],
-  ] as const)(
+  it.each(
+    [
+      ["rejected", "top_up", "legacy_v1", undefined],
+      ["rejected", "update_credential", "legacy_v1", undefined],
+      ["sending", "update_credential"],
+      ["unknown", "top_up"],
+      ["acknowledged", "update_credential"],
+    ].map(
+      ([state, action, protocol = "legacy_v1", method]) =>
+        [state, action, protocol, method] as const,
+    ),
+  )(
     "never resets provider create state %s through %s recovery",
-    async (createAttemptState, recoveryAction) => {
+    async (
+      createAttemptState,
+      recoveryAction,
+      providerProtocol,
+      providerMethod,
+    ) => {
       const failed = turn({
         status: "failed",
         upstreamTaskId: null,
@@ -4939,6 +5075,8 @@ describe("knowledge-base recovery metadata", () => {
         metadata: {
           attachmentsFrozen: true,
           createAttemptState,
+          providerProtocol,
+          ...(providerMethod ? { providerMethod } : {}),
           expectedAttachmentCount: 1,
           userAttachmentCount: 0,
           preparedDispatch: {
@@ -5009,6 +5147,77 @@ describe("knowledge-base recovery metadata", () => {
       expect(store).toStrictEqual(before);
     },
   );
+
+  it("rearms an explicitly rejected credential create on the same operation with a replacement credential", async () => {
+    const failed = turn({
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "MANUS_V2_CREATE_REJECTED",
+      completedAt: new Date("2026-08-01T00:00:10.000Z"),
+      leaseExpiresAt: null,
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        providerReasonCategory: "permission_denied",
+        providerRejectionStatus: 403,
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: { prompt: "frozen", attachments: [] },
+          bodySha256: "d".repeat(64),
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+        recovery: { kind: "turn", conversationId: "conversation-1" },
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "update_credential",
+        canRegenerate: false,
+      },
+    });
+    const current = (state: TurnServiceStore) =>
+      state.turns.filter((candidate) => candidate.id === failed.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build: {
+        id: failed.buildId,
+        userId: 1,
+        conversationId: "conversation-1",
+        generation: failed.buildGeneration,
+        stateEpoch: 8,
+        status: "protocol_error",
+        activeTurnId: failed.id,
+        canonicalTaskId: null,
+      },
+      conversation: { id: failed.conversationId, userId: 1, version: 3 },
+      turns: [failed],
+      credentials: [{ id: "credential-repaired", userId: 1, status: "active" }],
+      turnSelections: [[current]],
+    });
+    const claim = await resumeKnowledgeBaseTurnAfterUserFix(
+      {
+        userId: 1,
+        turnId: failed.id,
+        apiCredentialId: "credential-repaired",
+        now: new Date("2026-08-01T00:01:00.000Z"),
+      },
+      executor,
+    );
+    expect(claim?.turn).toMatchObject({
+      id: failed.id,
+      operationKey: failed.operationKey,
+      apiCredentialId: "credential-repaired",
+      createAttemptState: "not_sent",
+      providerAttemptState: "not_sent",
+    });
+    expect(store.turns).toHaveLength(1);
+    expect(store.turns[0]?.metadata).toMatchObject({
+      credentialRejectionHistory: [
+        expect.objectContaining({ providerStatus: 403 }),
+      ],
+    });
+  });
 
   it("replaces a not-sent pre-create attachment failure on the same turn exactly once", async () => {
     const failed = turn({

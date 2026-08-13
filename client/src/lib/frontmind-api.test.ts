@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   createKnowledgeBaseTurnTask,
+  discardManagedUploadIntent,
   discardUnboundUpload,
   reserveKnowledgeBaseStart,
   reserveKnowledgeBaseTurnWithAttachments,
@@ -1323,6 +1324,33 @@ describe("managed knowledge-base upload discovery", () => {
         "X-FrontMind-Upload-Intent-Id",
       ),
     ).toBe(upload.intentId);
+  });
+
+  it("durably schedules cleanup and treats the worker's 202 as cancellation success", async () => {
+    const upload = discoveryPayload().uploads[0];
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => ({ scheduled: true, state: "cleanup_pending" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      discardManagedUploadIntent(
+        {
+          intentId: upload.intentId,
+          ticket: upload.intentTicket,
+          filename: upload.filename,
+          expiresAt: upload.ticketExpiresAt,
+        },
+        { deferProviderCleanup: true },
+      ),
+    ).resolves.toBeUndefined();
+    const request = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(request.method).toBe("DELETE");
+    expect(
+      new Headers(request.headers).get("X-FrontMind-Upload-Cleanup-Mode"),
+    ).toBe("deferred");
   });
 });
 

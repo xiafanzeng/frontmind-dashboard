@@ -4,6 +4,13 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  apiCredentials,
+  apiUsageCredentialCoverage,
+  apiUsageSnapshots,
+  users,
+} from "../drizzle/schema";
+
+import {
   API_USAGE_SCAN_CONCURRENCY,
   API_USAGE_SNAPSHOT_SYNC_LOCK_NAME,
   apiUsageSnapshotCompletionState,
@@ -11,8 +18,9 @@ import {
   assertBulkManagedApiKeyTargetSelection,
   assertBulkManagedApiKeyTargetVersions,
   assertManagedApiKeyTarget,
+  bulkReplaceManagedApiKeyTargets,
   bulkManagedApiKeyActionTargets,
-  bulkPreviousCredentialGroups,
+  bulkManagedApiKeyHistoryDisposition,
   claimUsageSnapshotRefresh,
   createManagedApiUsageRefreshQueue,
   finalizeApiUsageSnapshotClaim,
@@ -872,8 +880,8 @@ describe("bulk managed API Key scopes", () => {
     ).toEqual([201]);
   });
 
-  it("deduplicates shared old fingerprints and ignores same-Key or deleted credentials", () => {
-    const groups = bulkPreviousCredentialGroups({
+  it("marks incomplete old-Key history without treating same-Key or deleted credentials as rotation gaps", () => {
+    const disposition = bulkManagedApiKeyHistoryDisposition({
       targets: [{ userId: 1 }, { userId: 2 }, { userId: 3 }, { userId: 4 }],
       latestCredentials: new Map([
         [1, { userId: 1, status: "active", fingerprint: "fp_old_shared" }],
@@ -882,11 +890,207 @@ describe("bulk managed API Key scopes", () => {
         [4, { userId: 4, status: "active", fingerprint: "fp_next" }],
       ]),
       nextFingerprint: "fp_next",
+      coverageByFingerprint: new Map(),
+      nowMs: 2_000,
     });
 
-    expect(groups).toHaveLength(1);
-    expect(groups[0]?.fingerprint).toBe("fp_old_shared");
-    expect([...groups[0]!.accountIds]).toEqual([1, 2]);
+    expect(disposition).toEqual({
+      incompleteTargetIds: [1, 2],
+      incompleteCredentialFingerprints: ["fp_old_shared"],
+    });
+  });
+
+  it("keeps a complete last-known coverage proof while allowing other revoked pools to rotate", () => {
+    const disposition = bulkManagedApiKeyHistoryDisposition({
+      targets: [{ userId: 1 }, { userId: 2 }, { userId: 3 }],
+      latestCredentials: new Map([
+        [1, { userId: 1, status: "active", fingerprint: "fp_complete" }],
+        [2, { userId: 2, status: "active", fingerprint: "fp_revoked" }],
+        [3, { userId: 3, status: "active", fingerprint: "fp_next" }],
+      ]),
+      nextFingerprint: "fp_next",
+      coverageByFingerprint: new Map([
+        [
+          "fp_complete",
+          {
+            coveredFromMs: 0,
+            fullScanAtMs: 2_999_999_900,
+            allTasksSettled: true,
+            scanToken: null,
+          },
+        ],
+      ]),
+      nowMs: 3_000_000_000,
+    });
+
+    expect(disposition).toEqual({
+      incompleteTargetIds: [2],
+      incompleteCredentialFingerprints: ["fp_revoked"],
+    });
+  });
+
+  it("classifies all 15 revoked-Key accounts without turning incomplete coverage into a batch blocker", () => {
+    const targets = Array.from({ length: 15 }, (_, index) => ({
+      userId: index + 1,
+    }));
+    const disposition = bulkManagedApiKeyHistoryDisposition({
+      targets,
+      latestCredentials: new Map(
+        targets.map((target) => [
+          target.userId,
+          {
+            userId: target.userId,
+            status: "active",
+            fingerprint: "fp_revoked_shared",
+          },
+        ]),
+      ),
+      nextFingerprint: "fp_next",
+      coverageByFingerprint: new Map(),
+      nowMs: 3_000_000_000,
+    });
+
+    expect(disposition).toEqual({
+      incompleteTargetIds: targets.map((target) => target.userId),
+      incompleteCredentialFingerprints: ["fp_revoked_shared"],
+    });
+  });
+
+  it("atomically replaces all 15 targets with incomplete history, preserves old snapshots, and queues one refresh", async () => {
+    const accounts = Array.from({ length: 15 }, (_, index) => ({
+      id: index + 1,
+      role: "user",
+      adminAccessLevel: null,
+      isActive: true,
+    }));
+    const credentials = accounts.map((account) => ({
+      userId: account.id,
+      version: 1,
+      status: "active",
+      fingerprint: "fp_revoked_shared",
+    }));
+    const oldSnapshots = accounts.map((account) => ({
+      policyId: `policy-${account.id}`,
+      credentialFingerprint: "fp_revoked_shared",
+      used: account.id * 101,
+      accountUsed: account.id * 17,
+      syncStatus: "error",
+      errorCode: "INVALID_CREDENTIAL",
+    }));
+    const oldSnapshotsBefore = structuredClone(oldSnapshots);
+    const selectedTables: unknown[] = [];
+    const transaction = vi.fn();
+
+    const rowsFor = (table: unknown) => {
+      selectedTables.push(table);
+      if (table === users) return accounts;
+      if (table === apiCredentials) return credentials;
+      if (table === apiUsageCredentialCoverage) return [];
+      if (table === apiUsageSnapshots) return oldSnapshots;
+      throw new Error(`unexpected table: ${String(table)}`);
+    };
+    const database: any = {
+      select: () => ({
+        from: (table: unknown) => {
+          const query: any = {
+            where: () => query,
+            orderBy: () => query,
+            for: async () => rowsFor(table),
+            then: (
+              resolve: (rows: unknown[]) => unknown,
+              reject: (error: unknown) => unknown,
+            ) => Promise.resolve(rowsFor(table)).then(resolve, reject),
+          };
+          return query;
+        },
+      }),
+      transaction: async (operation: (tx: unknown) => Promise<unknown>) => {
+        transaction();
+        return operation(database);
+      },
+    };
+    const validateApiKey = vi.fn().mockResolvedValue(undefined);
+    const replaceCredential = vi.fn(async ({ userId }: { userId: number }) => ({
+      configured: true,
+      version: 2,
+      userId,
+    }));
+    const auditEvents: Array<Record<string, any>> = [];
+    const writeAuditEvent = vi.fn(async (event: Record<string, any>) => {
+      auditEvents.push(event);
+      return event;
+    });
+    const queueRefresh = vi.fn();
+    const replacedAt = new Date("2026-08-14T00:00:00.000Z");
+
+    const result = await bulkReplaceManagedApiKeyTargets(
+      {
+        actor: {
+          id: 900,
+          role: "admin",
+          username: "system-admin",
+          adminAccessLevel: "system_admin",
+        } as any,
+        scope: { kind: "all" },
+        targets: accounts.map((account) => ({
+          userId: account.id,
+          expectedVersion: 1,
+        })),
+        applyMode: "replace_all",
+        apiKey: "new-valid-key-never-audited",
+        reason: "rotate revoked shared key",
+      },
+      {
+        requireDatabase: async () => database,
+        validateApiKey,
+        fingerprintApiKey: () => "fp_new_shared",
+        replaceCredential: replaceCredential as any,
+        writeAuditEvent: writeAuditEvent as any,
+        queueRefresh,
+        now: () => replacedAt,
+      },
+    );
+
+    expect(validateApiKey).toHaveBeenCalledTimes(1);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(replaceCredential).toHaveBeenCalledTimes(15);
+    expect(replaceCredential.mock.calls.map(([call]) => call.userId)).toEqual(
+      accounts.map((account) => account.id),
+    );
+    expect(result).toMatchObject({
+      scopeTargetCount: 15,
+      targetCount: 15,
+      updatedCount: 15,
+      unchangedCount: 0,
+      historyIncompleteCount: 15,
+    });
+    expect(oldSnapshots).toEqual(oldSnapshotsBefore);
+    expect(selectedTables).not.toContain(apiUsageSnapshots);
+    expect(queueRefresh).toHaveBeenCalledTimes(1);
+    expect(queueRefresh).toHaveBeenCalledWith({
+      actor: expect.objectContaining({ id: 900 }),
+      fingerprint: "fp_new_shared",
+    });
+    expect(auditEvents).toHaveLength(16);
+    expect(
+      auditEvents.filter(
+        (event) => event.action === "admin.api_credential.bulk_replaced",
+      ),
+    ).toHaveLength(15);
+    for (const event of auditEvents.slice(0, 15)) {
+      expect(event.metadata).toMatchObject({
+        historyIncomplete: true,
+        usageHistoryDisposition: "preserved_incomplete",
+      });
+    }
+    expect(auditEvents.at(-1)?.metadata).toMatchObject({
+      historyIncompleteCount: 15,
+      incompleteHistoryCredentialFingerprints: ["fp_revoked_shared"],
+      newSnapshotBaseline: "credential_created_at",
+    });
+    expect(JSON.stringify(auditEvents)).not.toContain(
+      "new-valid-key-never-audited",
+    );
   });
 
   it("preflights every actionable version before a batch writes", () => {
@@ -938,5 +1142,31 @@ describe("bulk managed API Key scopes", () => {
         applyMode: "unconfigured_only",
       }),
     ).toThrow(/迟到请求不会覆盖/);
+  });
+
+  it("does not reintroduce an old-Key scan or history-completeness hard stop in the atomic bulk path", () => {
+    const source = readFileSync(
+      path.resolve(process.cwd(), "server/api-usage-snapshot-service.ts"),
+      "utf8",
+    );
+    const start = source.indexOf(
+      "export async function bulkReplaceManagedApiKeyTargets",
+    );
+    const end = source.indexOf(
+      "export async function replaceManagedApiKeyTarget",
+      start,
+    );
+    const bulkPath = source.slice(start, end);
+
+    expect(bulkPath).toContain("validateApiKey: validateUpstreamApiKey");
+    expect(bulkPath).toContain("await runtime.validateApiKey(input.apiKey)");
+    expect(bulkPath).toContain("await db.transaction(async (tx)");
+    expect(bulkPath).toContain("bulkManagedApiKeyHistoryDisposition");
+    expect(bulkPath).toContain("usageHistoryDisposition");
+    expect(bulkPath).toContain("queueManagedApiUsageFingerprintRefresh");
+    expect(bulkPath).not.toContain("getSharedKeyMonthlyCreditUsageForAccounts");
+    expect(bulkPath).not.toContain("批量操作已全部停止");
+    expect(bulkPath).not.toContain("apiUsageSnapshots");
+    expect(bulkPath).not.toContain(".delete(");
   });
 });

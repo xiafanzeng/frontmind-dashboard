@@ -408,6 +408,16 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
     expect(mocks.createKnowledgeBaseTurnTask).not.toHaveBeenCalled();
     expect(mocks.stageKnowledgeBaseTurnAttachment).not.toHaveBeenCalled();
     expect(mocks.discardManagedUploadIntent).toHaveBeenCalledTimes(2);
+    expect(mocks.discardManagedUploadIntent).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ intentId: "intent-1" }),
+      { deferProviderCleanup: true },
+    );
+    expect(mocks.discardManagedUploadIntent).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ intentId: "intent-2" }),
+      { deferProviderCleanup: true },
+    );
     expect(
       mocks.discardManagedUploadIntent.mock.calls.map(
         ([handle]) => handle.intentId,
