@@ -8,6 +8,10 @@ import { deliveryProjectHeaders } from "@/lib/delivery-project";
 export type KnowledgeBaseObservationDto = SharedKnowledgeBaseObservationDto & {
   /** Transitional compatibility for endpoints that still return progress beside observation. */
   progress?: KnowledgeBaseProgressDto | null;
+  /** True only when a recovery endpoint durably accepted the same turn. */
+  accepted?: boolean;
+  /** True only when that endpoint resumed an existing reservation. */
+  resumed?: boolean;
 };
 
 export interface KnowledgeBaseProgressEventDetail {
@@ -241,6 +245,8 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
     notice: source.notice ?? null,
     conversationVersion: source.conversationVersion ?? null,
     progress,
+    ...(payload?.accepted === true ? { accepted: true } : {}),
+    ...(payload?.resumed === true ? { resumed: true } : {}),
   };
 }
 
@@ -288,7 +294,7 @@ export async function reconcileKnowledgeBaseObservation(
     throw error;
   }
   const payload = await response.json();
-  return normalizeObservation(payload?.observation ?? payload);
+  return normalizeObservation(payload);
 }
 
 export async function retryKnowledgeBaseTurn(input: {

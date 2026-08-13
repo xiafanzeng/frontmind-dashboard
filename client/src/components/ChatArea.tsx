@@ -247,6 +247,12 @@ export function knowledgeBasePackageRebindResolved(
   );
 }
 
+export function knowledgeBaseSameTurnRecoveryAccepted(
+  observation: KnowledgeBaseObservationDto,
+) {
+  return observation.accepted === true && observation.resumed === true;
+}
+
 /**
  * PACKAGE_REBIND_REQUIRED is repaired by rereading the existing authoritative
  * task. It must never reserve a new turn or submit another billable request.
@@ -1392,7 +1398,10 @@ export default function ChatArea({
       commitKnowledgeBaseObservation(conversation.id, observation);
       wakeKnowledgeBaseConversation(conversation.id);
       if (recoveryMode === "reconcile") {
-        if (!knowledgeBasePackageRebindResolved(observation)) {
+        const packageRebind =
+          knowledgeBase.notice.code ===
+          KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE;
+        if (packageRebind && !knowledgeBasePackageRebindResolved(observation)) {
           toast.warning("知识库成品仍在等待重新绑定", {
             description:
               observation.notice?.message ||
@@ -1400,9 +1409,20 @@ export default function ChatArea({
           });
           return;
         }
-        toast.success("知识库成品已重新绑定", {
-          description: "已复用原权威任务完成校验，没有创建新的模型任务。",
-        });
+        if (packageRebind) {
+          toast.success("知识库成品已重新绑定", {
+            description: "已复用原权威任务完成校验，没有创建新的模型任务。",
+          });
+        } else if (knowledgeBaseSameTurnRecoveryAccepted(observation)) {
+          toast.success("已继续当前操作", {
+            description: "系统已接受同一轮次，并继续等待模型返回结果。",
+          });
+        } else {
+          toast.warning("当前操作尚未恢复", {
+            description:
+              observation.notice?.message || "请刷新当前状态后再次尝试。",
+          });
+        }
       } else {
         toast.success("已重新发起当前节点", {
           description: "本次使用新的幂等操作，不会复用上一条失败任务。",

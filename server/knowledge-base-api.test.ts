@@ -42,6 +42,7 @@ import {
   knowledgeBaseAttachmentRepairObservationAllowsReplacement,
   knowledgeBaseClaimTraceId,
   knowledgeBaseGeneratedAttachmentFailureForPersistence,
+  knowledgeBaseLocalRehydrateAuthorityFailureForPersistence,
   knowledgeBaseManualLogoCreateFailureForPersistence,
   knowledgeBaseManualLogoUnclassifiedFailureResponse,
   knowledgeBaseNoticeAllowsSameTaskReconcile,
@@ -598,6 +599,37 @@ describe("knowledge-base turn HTTP outcomes", () => {
       leaseToken: claim.leaseToken,
       error,
       outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+    });
+  });
+
+  it("terminalizes a drifted local-rehydrate authority instead of rescanning it forever", async () => {
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const error = new KnowledgeBaseLocalPreparationError(
+      "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
+      "local rehydrate coordinate drifted",
+    );
+
+    await expect(
+      knowledgeBaseLocalRehydrateAuthorityFailureForPersistence(
+        {
+          userId: 7,
+          turnId: "turn-local-rehydrate-drift",
+          leaseToken: "lease-local-rehydrate-drift",
+          error,
+        },
+        { failDeterministically },
+      ),
+    ).resolves.toBe(true);
+    expect(failDeterministically).toHaveBeenCalledOnce();
+    expect(failDeterministically).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: "turn-local-rehydrate-drift",
+      leaseToken: "lease-local-rehydrate-drift",
+      code: "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
+      message: "local rehydrate coordinate drifted。未向上游创建任务",
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+      canRegenerate: false,
     });
   });
 
@@ -1868,9 +1900,9 @@ describe("knowledge-base upstream read failure authority", () => {
     } as any;
     const input = { activeTurn, notice, hasCredential: true };
 
-    expect(
-      knowledgeBasePreCreateUserFixObservationAllowsResume(input),
-    ).toBe(true);
+    expect(knowledgeBasePreCreateUserFixObservationAllowsResume(input)).toBe(
+      true,
+    );
     expect(
       knowledgeBasePreCreateUserFixObservationAllowsResume({
         ...input,
@@ -1918,6 +1950,7 @@ describe("knowledge-base upstream read failure authority", () => {
 
 describe("knowledge base execution contract", () => {
   afterEach(() => {
+    delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -3999,6 +4032,182 @@ describe("knowledge base execution contract", () => {
     expect(createTask.mock.calls[0]?.[0]).toBe(dispatch);
     expect(bindTask).not.toHaveBeenCalled();
     expect(registerTask).not.toHaveBeenCalled();
+  });
+
+  it("dispatches an active local-rehydrate reservation through one inline v2 create and never creates twice", async () => {
+    process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
+    const operationKey = "a".repeat(64);
+    const claim = {
+      turn: {
+        id: "turn-local-rehydrate",
+        userId: 7,
+        conversationId: "conversation-local-rehydrate",
+        buildId: "build-local-rehydrate",
+        buildGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        operationType: "confirm",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        providerProtocol: "manus_v2",
+        providerMethod: null,
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+        attachmentsFrozen: false,
+      },
+      leaseToken: "lease-local-rehydrate",
+      leaseExpiresAt: new Date("2026-08-14T00:05:00.000Z"),
+      upstreamIdempotencyKey: `frontmind-kb-v2:${operationKey}`,
+      recoveryMetadata: {
+        kind: "turn",
+        conversationId: "conversation-local-rehydrate",
+        localRehydrateAuthority: "local_rehydrate_unbound",
+      },
+      preparedDispatch: null,
+    } as any;
+    const build = {
+      id: claim.turn.buildId,
+      userId: claim.turn.userId,
+      generation: claim.turn.buildGeneration,
+      revision: claim.turn.expectedRevision,
+      currentLeafId: claim.turn.expectedLeafId,
+      status: "confirming",
+      providerProtocol: "manus_v2",
+      activeTurnId: claim.turn.id,
+      canonicalTaskId: null,
+      canonicalTaskUrl: null,
+      upstreamTaskId: null,
+      totalNodeCount: 8,
+      confirmedCount: 7,
+      directPrefilledCount: 0,
+      lastTurnAttachmentCount: 0,
+      skillVersion: "knowledge-base-v2",
+      handoffProvenance: {
+        localRehydrateRequired: {
+          reason: "generated_attachment_invalid_preprovider",
+          sourceTurnId: "released-source-turn",
+        },
+      },
+    } as any;
+    const prepared = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "确认当前节点",
+        agentProfile: "manus-1.6-max",
+        attachments: [{ file_id: "local-skill", filename: "skill.zip" }],
+      },
+      bodySha256: "f".repeat(64),
+      preparedAt: "2026-08-14T00:00:00.000Z",
+    };
+    const handoff = {
+      snapshot: {} as any,
+      json: JSON.stringify({
+        schemaVersion: 1,
+        purpose: "legacy_to_manus_v2_handoff",
+        build: { id: build.id, revision: 7 },
+        nodes: [{ leafId: "1.8", contentMarkdown: "已完成正文" }],
+        acceptedReceipts: [],
+        pendingOperation: { action: "confirm" },
+      }),
+      sha256: "e".repeat(64),
+    };
+    const loadPreproviderAuthority = vi.fn().mockResolvedValue({
+      sourceTurnId: "released-source-turn",
+    });
+    const ensureDispatch = vi.fn().mockResolvedValue(prepared);
+    const ensureManusV2Attachments = vi.fn().mockResolvedValue([
+      {
+        file_data: "data:application/zip;base64,UEsDBAoAAAAA",
+        filename: "skill.zip",
+        mime_type: "application/zip",
+      },
+    ]);
+    const beginDispatch = vi.fn().mockResolvedValue({
+      method: "task.create",
+      canonicalTaskId: null,
+      title: `FrontMind KB ${build.id} g${build.generation}`,
+      operationToken: operationKey,
+    });
+    const createTask = vi.fn().mockResolvedValue({
+      taskId: "new-canonical-task",
+      taskUrl: "https://example.test/task/new-canonical-task",
+      requestId: "request-new-canonical-task",
+    });
+    const sendMessage = vi.fn();
+    const client = {
+      createTask,
+      sendMessage,
+      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
+      findCreatedTask: vi.fn(),
+      listAllMessages: vi.fn().mockResolvedValue([]),
+    };
+    const bindSubmission = vi.fn().mockImplementation(async ({ taskId }) => {
+      build.canonicalTaskId = taskId;
+      claim.turn.upstreamTaskId = taskId;
+    });
+    const dependencies = {
+      loadBuild: vi.fn().mockImplementation(async () => build),
+      loadPreproviderAuthority,
+      buildHandoffSnapshot: vi.fn().mockResolvedValue(handoff),
+      ensureDispatch,
+      ensureManusV2Attachments,
+      beginDispatch,
+      createClient: vi.fn().mockReturnValue(client),
+      bindSubmission,
+      reconcileTask: vi.fn().mockResolvedValue(false),
+    } as any;
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        dependencies,
+      ),
+    ).resolves.toEqual({
+      taskId: "new-canonical-task",
+      rebound: true,
+      reconciled: false,
+    });
+    expect(loadPreproviderAuthority).toHaveBeenCalledWith({
+      userId: 7,
+      build,
+      expectedActiveTurnId: claim.turn.id,
+    });
+    expect(ensureDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ claim }),
+    );
+    expect(ensureManusV2Attachments).toHaveBeenCalledOnce();
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attachments: [
+          expect.objectContaining({
+            file_data: expect.stringContaining("base64,"),
+            filename: "skill.zip",
+          }),
+        ],
+      }),
+    );
+    const providerPrompt = createTask.mock.calls[0]?.[0].prompt;
+    expect(providerPrompt).toContain("# FrontMind legacy build handoff");
+    expect(providerPrompt).toContain(`snapshotSha256=${handoff.sha256}`);
+    expect(providerPrompt).toContain("已完成正文");
+    expect(providerPrompt).toContain("确认当前节点");
+    expect(providerPrompt).not.toContain("old-task-id");
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        dependencies,
+      ),
+    ).rejects.toMatchObject({ code: "OPERATION_NOT_OBSERVED" });
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(sendMessage).not.toHaveBeenCalled();
+    delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
   });
 
   it("runs manual Logo promotion only after the real task is created, bound, and registered", async () => {

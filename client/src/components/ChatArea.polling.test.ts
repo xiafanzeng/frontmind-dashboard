@@ -6,6 +6,7 @@ import {
   knowledgeBaseNoticeRequiresLogoProvenanceRepair,
   knowledgeBaseNoticeRetryLabel,
   knowledgeBasePackageRebindResolved,
+  knowledgeBaseSameTurnRecoveryAccepted,
   readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
   runningAssistantStatusText,
@@ -249,7 +250,11 @@ describe("knowledge-base notice recovery", () => {
   });
 
   it("continues the same bound task after a credential update", async () => {
-    const observation = { interaction: { progress: null } } as any;
+    const observation = {
+      accepted: true,
+      resumed: true,
+      interaction: { progress: null },
+    } as any;
     const reconcile = vi.fn().mockResolvedValue(observation);
     const retry = vi.fn();
     const notice = {
@@ -266,6 +271,14 @@ describe("knowledge-base notice recovery", () => {
     });
     expect(retry).not.toHaveBeenCalled();
     expect(knowledgeBaseNoticeRetryLabel(notice)).toBe("更新凭证后继续本轮");
+    expect(knowledgeBaseSameTurnRecoveryAccepted(observation)).toBe(true);
+    expect(
+      knowledgeBasePackageRebindResolved({
+        ...observation,
+        package: null,
+        notice,
+      }),
+    ).toBe(false);
   });
 
   it("continues a pre-create quota failure without exposing regeneration", async () => {
@@ -284,6 +297,16 @@ describe("knowledge-base notice recovery", () => {
     expect(reconcile).toHaveBeenCalledOnce();
     expect(retry).not.toHaveBeenCalled();
     expect(knowledgeBaseNoticeRetryLabel(notice)).toBe("补充额度后继续本轮");
+  });
+
+  it("does not report a same-turn recovery as accepted without the resume receipt", () => {
+    expect(
+      knowledgeBaseSameTurnRecoveryAccepted({
+        accepted: true,
+        resumed: false,
+        interaction: { progress: null },
+      } as any),
+    ).toBe(false);
   });
 
   it("routes only a pre-create attachment failure to the replacement entrance", () => {

@@ -16,6 +16,38 @@ afterEach(() => {
 });
 
 describe("reconcileKnowledgeBaseObservation", () => {
+  it("preserves the accepted same-turn resume receipt from the reconcile envelope", async () => {
+    const observation = {
+      stateEpoch: 4,
+      generation: 2,
+      authoritativeTaskId: null,
+      activeTurn: { id: "turn-1", status: "running" },
+      interaction: {
+        progress: null,
+        interactionState: "processing",
+        canReply: false,
+        canPublish: false,
+      },
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 4,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ observation, accepted: true, resumed: true }),
+          { status: 202, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    await expect(
+      reconcileKnowledgeBaseObservation({ conversationId: "conversation-1" }),
+    ).resolves.toMatchObject({ accepted: true, resumed: true });
+  });
+
   it("orders progress coordinates by generation and then state epoch", () => {
     expect(
       isKnowledgeBaseProgressCoordinateOlder(

@@ -19,6 +19,7 @@ import {
   toUpstreamAgentProfile,
 } from "./upstream-config";
 import {
+  AuthServiceError,
   credentialsUseSameUpstreamApiKey,
   getDecryptedCredentialForKnowledgeBaseReservation,
   getDecryptedCredentialForKnowledgeBaseUploadReservation,
@@ -152,6 +153,7 @@ import {
   observeAndLocallySettleKnowledgeBaseTerminalAnchor,
   markKnowledgeBaseManusV2CredentialRebindAttention,
   mutateKnowledgeBaseManusV2Lifecycle,
+  pauseKnowledgeBasePreCreateCredentialUnavailable,
   prepareKnowledgeBaseTurnDispatch,
   promoteKnowledgeBaseGeneratedAttachmentReady,
   replaceUnusableKnowledgeBaseGeneratedAttachment,
@@ -4752,12 +4754,50 @@ function appendKnowledgeBaseManusV2HandoffSnapshot(
 async function dispatchKnowledgeBaseRecoveryClaim(
   claim: KnowledgeBaseRecoveryClaim,
   credential: RecoveryCredential,
+  dependencies: {
+    loadBuild?: typeof loadKnowledgeBaseBuildRecordById;
+    loadPreproviderAuthority?: typeof loadKnowledgeBasePreproviderLocalRehydrateAuthority;
+    buildHandoffSnapshot?: typeof buildKnowledgeBaseManusV2HandoffSnapshot;
+    ensureDispatch?: typeof ensureKnowledgeBaseRecoveryDispatch;
+    ensureManusV2Attachments?: typeof ensureKnowledgeBaseManusV2Attachments;
+    beginDispatch?: typeof beginKnowledgeBaseManusV2Dispatch;
+    createClient?: (input: {
+      baseUrl: string;
+      apiKey: string;
+    }) => Pick<
+      ManusV2Client,
+      | "createTask"
+      | "sendMessage"
+      | "updateTaskVisibility"
+      | "findCreatedTask"
+      | "listAllMessages"
+    >;
+    bindSubmission?: typeof bindKnowledgeBaseManusV2Submission;
+    reconcileTask?: typeof reconcileRecoveredKnowledgeBaseTask;
+  } = {},
 ) {
   beginKnowledgeBaseClaimReadinessTiming(claim);
-  let existingBuild = await loadKnowledgeBaseBuildRecordById(
-    claim.turn.userId,
-    claim.turn.buildId,
-  );
+  const loadBuild = dependencies.loadBuild ?? loadKnowledgeBaseBuildRecordById;
+  const loadPreproviderAuthority =
+    dependencies.loadPreproviderAuthority ??
+    loadKnowledgeBasePreproviderLocalRehydrateAuthority;
+  const buildHandoffSnapshot =
+    dependencies.buildHandoffSnapshot ??
+    buildKnowledgeBaseManusV2HandoffSnapshot;
+  const ensureDispatch =
+    dependencies.ensureDispatch ?? ensureKnowledgeBaseRecoveryDispatch;
+  const ensureManusV2Attachments =
+    dependencies.ensureManusV2Attachments ??
+    ensureKnowledgeBaseManusV2Attachments;
+  const beginDispatch =
+    dependencies.beginDispatch ?? beginKnowledgeBaseManusV2Dispatch;
+  const createClient =
+    dependencies.createClient ?? ((input) => new ManusV2Client(input));
+  const bindSubmission =
+    dependencies.bindSubmission ?? bindKnowledgeBaseManusV2Submission;
+  const reconcileTask =
+    dependencies.reconcileTask ?? reconcileRecoveredKnowledgeBaseTask;
+  let existingBuild = await loadBuild(claim.turn.userId, claim.turn.buildId);
   let handoff: Awaited<
     ReturnType<typeof buildKnowledgeBaseManusV2HandoffSnapshot>
   > | null = null;
@@ -4793,10 +4833,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     });
     claim.turn.providerProtocol = "manus_v2";
     claim.turn.providerAttemptState = "not_sent";
-    existingBuild = await loadKnowledgeBaseBuildRecordById(
-      claim.turn.userId,
-      claim.turn.buildId,
-    );
+    existingBuild = await loadBuild(claim.turn.userId, claim.turn.buildId);
   }
   if (
     existingBuild?.providerProtocol === "manus_v2" &&
@@ -4807,19 +4844,24 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     typeof existingBuild.handoffProvenance === "object" &&
     !Array.isArray(existingBuild.handoffProvenance)
   ) {
-    // Crash-safe continuation of a cutover committed before task.create. The
-    // snapshot is deterministically rebuilt from durable receipts/nodes and
-    // must match the digest committed by the cutover transaction.
-    const rebuilt = await buildKnowledgeBaseManusV2HandoffSnapshot({
-      claim,
-      build: existingBuild,
-    });
-    const localRehydrateRequired =
+    const localRehydrateValue =
       existingBuild.handoffProvenance.localRehydrateRequired;
+    const localRehydrateMarker =
+      localRehydrateValue &&
+      typeof localRehydrateValue === "object" &&
+      !Array.isArray(localRehydrateValue)
+        ? (localRehydrateValue as Record<string, unknown>)
+        : null;
+    const localRehydrateRequired = Boolean(localRehydrateMarker);
+    const preproviderMarker =
+      localRehydrateMarker &&
+      localRehydrateMarker.reason ===
+        "generated_attachment_invalid_preprovider";
     const preproviderLocalRehydrate = localRehydrateRequired
-      ? await loadKnowledgeBasePreproviderLocalRehydrateAuthority({
+      ? await loadPreproviderAuthority({
           userId: claim.turn.userId,
           build: existingBuild,
+          expectedActiveTurnId: claim.turn.id,
         })
       : null;
     if (preproviderLocalRehydrate) {
@@ -4827,14 +4869,45 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       // release deliberately has no frozen provider snapshot. Rebuild the
       // complete Dashboard-owned nodes/receipts plus this new operation from
       // durable state, after reproving the exact release source.
-      handoff = rebuilt;
+      handoff = await buildHandoffSnapshot({
+        claim,
+        build: existingBuild,
+      });
+    } else if (preproviderMarker) {
+      // This marker can only be consumed with its released source tombstone
+      // and the exact active continuation proof. Do not fall through to the
+      // older local-settlement snapshot protocol: a stale/corrupt coordinate
+      // would otherwise return to the generic recovery scan forever.
+      throw new KnowledgeBaseLocalPreparationError(
+        "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
+        "知识库本地恢复坐标已发生变化，请联系支持处理",
+      );
     } else if (localRehydrateRequired) {
       localCanonicalSnapshot = await loadKnowledgeBaseLocalRehydrateSnapshot({
         userId: claim.turn.userId,
         build: existingBuild,
       });
     } else {
-      if (existingBuild.handoffProvenance.snapshotSha256 !== rebuilt.sha256) {
+      // Only the legacy cutover protocol owns a top-level snapshot digest.
+      // A local rehydrate marker is a different authority and must never be
+      // compared to this digest (historically undefined !== rebuilt caused a
+      // permanent pre-create recovery loop).
+      const committedSnapshotSha256 =
+        existingBuild.handoffProvenance.snapshotSha256;
+      if (
+        typeof committedSnapshotSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(committedSnapshotSha256)
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The durable Manus v2 handoff snapshot authority is missing",
+        );
+      }
+      const rebuilt = await buildHandoffSnapshot({
+        claim,
+        build: existingBuild,
+      });
+      if (committedSnapshotSha256 !== rebuilt.sha256) {
         throw new KnowledgeBaseTurnReservationError(
           "CONFLICT",
           "The durable Manus v2 handoff snapshot changed before task creation",
@@ -4853,7 +4926,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       throw new KnowledgeBaseManusV2RolloutDeferredError();
     }
     if (recoveryAuthority === "reconcile_only") {
-      const client = new ManusV2Client({
+      const client = createClient({
         baseUrl: claim.preparedDispatch?.baseUrl || getUpstreamBaseUrl(),
         apiKey: credential.apiKey,
       });
@@ -4884,7 +4957,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
           );
         }
         taskId = reconciled.unique.id;
-        await bindKnowledgeBaseManusV2Submission({
+        await bindSubmission({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -4918,7 +4991,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
           claim.turn.providerMethod === "task.sendMessage" &&
           !claim.turn.upstreamTaskId
         ) {
-          await bindKnowledgeBaseManusV2Submission({
+          await bindSubmission({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -4927,7 +5000,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
           });
           claim.turn.upstreamTaskId = taskId;
         }
-        const reconciled = await reconcileRecoveredKnowledgeBaseTask({
+        const reconciled = await reconcileTask({
           claim,
           credential,
           taskId,
@@ -4966,7 +5039,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         claim.turn.providerMethod === "task.sendMessage" &&
         !claim.turn.upstreamTaskId
       ) {
-        await bindKnowledgeBaseManusV2Submission({
+        await bindSubmission({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -4986,7 +5059,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       });
       const reconciled =
         output.length > 0 && shouldReconcileKnowledgeOutput(output, taskStatus)
-          ? await reconcileRecoveredKnowledgeBaseTask({
+          ? await reconcileTask({
               claim,
               credential,
               taskId,
@@ -4994,11 +5067,11 @@ async function dispatchKnowledgeBaseRecoveryClaim(
           : false;
       return { taskId, rebound: false, reconciled };
     }
-    const prepared = await ensureKnowledgeBaseRecoveryDispatch({
+    const prepared = await ensureDispatch({
       claim,
       credential,
     });
-    const v2Attachments = await ensureKnowledgeBaseManusV2Attachments({
+    const v2Attachments = await ensureManusV2Attachments({
       claim,
       credential,
       baseUrl: prepared.baseUrl,
@@ -5073,7 +5146,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         }),
       )
       .digest("hex");
-    const authority = await beginKnowledgeBaseManusV2Dispatch({
+    const authority = await beginDispatch({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
       leaseToken: claim.leaseToken,
@@ -5084,7 +5157,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     claim.turn.providerMethod = authority.method;
     claim.turn.providerAttemptState = "sending";
     claim.turn.operationToken = authority.operationToken;
-    const client = new ManusV2Client({
+    const client = createClient({
       baseUrl: prepared.baseUrl,
       apiKey: credential.apiKey,
     });
@@ -5144,7 +5217,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         "The Manus v2 task acknowledgement is missing its task id",
       );
     }
-    await bindKnowledgeBaseManusV2Submission({
+    await bindSubmission({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
       leaseToken: claim.leaseToken,
@@ -5164,16 +5237,13 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     // task.create/sendMessage are asynchronous. The first read frequently has
     // only running status; the normal recovery worker will keep polling the
     // same canonical task until an accepted output appears.
-    const reconciled = await reconcileRecoveredKnowledgeBaseTask({
+    const reconciled = await reconcileTask({
       claim,
       credential,
       taskId,
     });
     if (reconciled && existingBuild) {
-      const after = await loadKnowledgeBaseBuildRecordById(
-        claim.turn.userId,
-        claim.turn.buildId,
-      );
+      const after = await loadBuild(claim.turn.userId, claim.turn.buildId);
       if (
         after &&
         after.generation === existingBuild.generation &&
@@ -6688,6 +6758,7 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
     claimedTurnIds: [] as string[],
     rebound: 0,
     reconciled: 0,
+    credentialPaused: 0,
     skipped: 0,
     failed: 0,
   };
@@ -6713,19 +6784,44 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
           result.claimedTurnIds.push(ownedClaim.turn.id);
         }
         await assertKnowledgeBaseWritable(ownedClaim.turn.userId);
-        if (!ownedClaim.turn.apiCredentialId) {
-          throw new Error("Turn reservation has no credential binding");
+        let credential: Awaited<
+          ReturnType<typeof getDecryptedCredentialForKnowledgeBaseReservation>
+        > = null;
+        let credentialUnavailable = !ownedClaim.turn.apiCredentialId;
+        if (!credentialUnavailable) {
+          try {
+            credential =
+              await getDecryptedCredentialForKnowledgeBaseReservation({
+                userId: ownedClaim.turn.userId,
+                turnId: ownedClaim.turn.id,
+                buildId: ownedClaim.turn.buildId!,
+                buildGeneration: ownedClaim.turn.buildGeneration!,
+                apiCredentialId: ownedClaim.turn.apiCredentialId!,
+              });
+            credentialUnavailable = credential === null;
+          } catch (error) {
+            credentialUnavailable =
+              error instanceof AuthServiceError &&
+              error.code === "INVALID_CREDENTIAL";
+            if (!credentialUnavailable) throw error;
+          }
         }
-        const credential =
-          await getDecryptedCredentialForKnowledgeBaseReservation({
-            userId: ownedClaim.turn.userId,
-            turnId: ownedClaim.turn.id,
-            buildId: ownedClaim.turn.buildId!,
-            buildGeneration: ownedClaim.turn.buildGeneration!,
-            apiCredentialId: ownedClaim.turn.apiCredentialId,
-          });
-        if (!credential) {
+        if (credentialUnavailable) {
+          const paused = await pauseKnowledgeBasePreCreateCredentialUnavailable(
+            {
+              userId: ownedClaim.turn.userId,
+              turnId: ownedClaim.turn.id,
+              leaseToken: ownedClaim.leaseToken,
+            },
+          );
+          if (paused) {
+            result.credentialPaused += 1;
+            continue;
+          }
           throw new Error("Reserved credential version is unavailable");
+        }
+        if (!credential) {
+          throw new Error("Reserved credential resolution was inconclusive");
         }
         recoveryApiKey = credential.apiKey;
         const recovered = await withKnowledgeBaseRecoveryLeaseHeartbeat({
@@ -6826,11 +6922,20 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
             }
           }
           if (!manualLogoFailureSettled) {
-            await persistKnowledgeBaseDispatchFailure({
-              claim,
-              error: failureToPersist,
-              outcomeUnknownCode: "RECOVERY_DEFERRED",
-            }).catch(() => undefined);
+            const localAuthoritySettled =
+              await knowledgeBaseLocalRehydrateAuthorityFailureForPersistence({
+                userId: claim.turn.userId,
+                turnId: claim.turn.id,
+                leaseToken: claim.leaseToken,
+                error: failureToPersist,
+              }).catch(() => false);
+            if (!localAuthoritySettled) {
+              await persistKnowledgeBaseDispatchFailure({
+                claim,
+                error: failureToPersist,
+                outcomeUnknownCode: "RECOVERY_DEFERRED",
+              }).catch(() => undefined);
+            }
           }
         }
         logKnowledgeBaseRuntimeFailure({
@@ -6882,6 +6987,38 @@ export function knowledgeBaseGeneratedAttachmentFailureForPersistence(
     );
   }
   return error;
+}
+
+export async function knowledgeBaseLocalRehydrateAuthorityFailureForPersistence(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    error: unknown;
+  },
+  dependencies: {
+    failDeterministically?: typeof failKnowledgeBaseTurnDeterministically;
+  } = {},
+) {
+  if (
+    !(input.error instanceof KnowledgeBaseLocalPreparationError) ||
+    input.error.code !== "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID"
+  ) {
+    return false;
+  }
+  await (
+    dependencies.failDeterministically ?? failKnowledgeBaseTurnDeterministically
+  )({
+    userId: input.userId,
+    turnId: input.turnId,
+    leaseToken: input.leaseToken,
+    code: input.error.code,
+    message: `${input.error.message}。未向上游创建任务`,
+    failureClass: "terminal_nonregenerable",
+    recoveryAction: "contact_support",
+    canRegenerate: false,
+  });
+  return true;
 }
 
 async function uploadDurableKnowledgeBaseGeneratedAttachment(input: {

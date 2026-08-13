@@ -8182,6 +8182,7 @@ function isPreproviderLocalRehydrateBuildShape(
     | "protocolError"
     | "handoffProvenance"
   >,
+  expectedActiveTurnId: string | null = null,
 ) {
   const provenance = retryAuthorityRecord(build.handoffProvenance);
   const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
@@ -8189,7 +8190,7 @@ function isPreproviderLocalRehydrateBuildShape(
   return Boolean(
     build.providerProtocol === "manus_v2" &&
       build.status === "confirming" &&
-      build.activeTurnId === null &&
+      build.activeTurnId === expectedActiveTurnId &&
       build.upstreamTaskId === null &&
       build.canonicalTaskId === null &&
       build.canonicalTaskGeneration === null &&
@@ -8254,6 +8255,7 @@ export function inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
     | "upstreamTaskId"
     | "metadata"
   >,
+  expectedActiveTurnId: string | null = null,
 ): KnowledgeBasePreproviderLocalRehydrateAuthority | null {
   const provenance = retryAuthorityRecord(build.handoffProvenance);
   const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
@@ -8265,7 +8267,7 @@ export function inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
     sourceMetadata.releasedOperationTombstone,
   );
   if (
-    !isPreproviderLocalRehydrateBuildShape(build) ||
+    !isPreproviderLocalRehydrateBuildShape(build, expectedActiveTurnId) ||
     !requirement ||
     !sourceRequirement ||
     source.userId !== build.userId ||
@@ -8329,32 +8331,77 @@ export function inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
 }
 
 export async function loadKnowledgeBasePreproviderLocalRehydrateAuthority(
-  input: { userId: number; build: KnowledgeBaseBuild },
+  input: {
+    userId: number;
+    build: KnowledgeBaseBuild;
+    /** Exact newly-reserved continuation, or null while granting authority. */
+    expectedActiveTurnId?: string | null;
+  },
   executor?: any,
 ): Promise<KnowledgeBasePreproviderLocalRehydrateAuthority | null> {
   const provenance = retryAuthorityRecord(input.build.handoffProvenance);
   const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
-  if (!isPreproviderLocalRehydrateBuildShape(input.build)) return null;
+  const expectedActiveTurnId = input.expectedActiveTurnId ?? null;
+  if (!isPreproviderLocalRehydrateBuildShape(input.build, expectedActiveTurnId))
+    return null;
   const sourceTurnId = String(requirement?.sourceTurnId || "");
   if (!sourceTurnId) return null;
   const db = executor ?? (await requireDb());
-  const source = (
-    await db
-      .select()
-      .from(conversationTurns)
-      .where(
-        and(
-          eq(conversationTurns.id, sourceTurnId),
-          eq(conversationTurns.userId, input.userId),
-          eq(conversationTurns.buildId, input.build.id),
-        ),
-      )
-      .limit(1)
-  )[0] as ConversationTurn | undefined;
+  const turnIds = [sourceTurnId];
+  if (expectedActiveTurnId !== null) turnIds.push(expectedActiveTurnId);
+  const turns = (await db
+    .select()
+    .from(conversationTurns)
+    .where(
+      and(
+        inArray(conversationTurns.id, turnIds),
+        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.buildId, input.build.id),
+      ),
+    )
+    .limit(turnIds.length)) as ConversationTurn[];
+  const source = turns.find((turn) => turn.id === sourceTurnId);
+  const active =
+    expectedActiveTurnId === null
+      ? null
+      : turns.find((turn) => turn.id === expectedActiveTurnId);
+  if (expectedActiveTurnId !== null) {
+    const activeMetadata = active ? metadataOf(active) : {};
+    const activeRecovery = retryAuthorityRecord(activeMetadata.recovery);
+    if (
+      !active ||
+      active.userId !== input.userId ||
+      active.conversationId !==
+        knowledgeBaseConversationStorageId(
+          input.userId,
+          input.build.conversationId,
+        ) ||
+      active.buildId !== input.build.id ||
+      active.buildGeneration !== input.build.generation ||
+      active.expectedRevision !== input.build.revision ||
+      active.expectedLeafId !== input.build.currentLeafId ||
+      (active.status !== "queued" && active.status !== "running") ||
+      active.upstreamTaskId !== null ||
+      activeMetadata.providerProtocol !== "manus_v2" ||
+      activeMetadata.providerAttemptState !== "not_sent" ||
+      storedKnowledgeBaseCreateAttemptState(activeMetadata) !== "not_sent" ||
+      activeMetadata.dispatchingAt !== undefined ||
+      activeMetadata.outcomeUnknownAt !== undefined ||
+      activeMetadata.preparedDispatch !== undefined ||
+      activeMetadata.frozenProviderRequestHash !== undefined ||
+      activeMetadata.attachmentsFrozen === true ||
+      activeMetadata.awaitingClientAttachments === true ||
+      activeRecovery?.kind !== "turn" ||
+      activeRecovery.localRehydrateAuthority !== "local_rehydrate_unbound"
+    ) {
+      return null;
+    }
+  }
   return source
     ? inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
         input.build,
         source,
+        expectedActiveTurnId,
       )
     : null;
 }
@@ -13592,6 +13639,128 @@ export async function failKnowledgeBaseTurnDeterministically(
   });
 }
 
+/**
+ * Pause an unbound Manus v2 reservation whose credential can no longer be
+ * resolved before task.create. A frozen prepared request remains exact; a
+ * pristine pre-prepare reservation is allowed to rebuild from its durable
+ * recovery metadata after the customer binds the current active credential.
+ *
+ * This deliberately rejects partial attachment/preparation ledgers,
+ * sendMessage, acknowledged/ambiguous attempts and bound builds: those states
+ * require different reconciliation and must never be converted into a safe
+ * pre-create retry.
+ */
+export async function pauseKnowledgeBasePreCreateCredentialUnavailable(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    now?: Date;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseTurnRecord | null> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const metadata = metadataOf(turn);
+    const frozenPreparedCreate =
+      metadata.providerMethod === "task.create" &&
+      metadata.attachmentsFrozen === true &&
+      Boolean(metadata.preparedDispatch);
+    const pristinePreprepareCreate =
+      metadata.providerMethod === undefined &&
+      metadata.attachmentsFrozen !== true &&
+      metadata.preparedDispatch === undefined &&
+      metadata.frozenProviderRequestHash === undefined &&
+      turn.attachmentFileIds.length === 0 &&
+      Object.keys(generatedAttachmentReservations(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentMappings(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentAttempts(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentUnknownAttempts(metadata)).length === 0;
+    if (
+      (turn.status !== "queued" && turn.status !== "running") ||
+      turn.upstreamTaskId !== null ||
+      build.activeTurnId !== turn.id ||
+      build.generation !== turn.buildGeneration ||
+      build.providerProtocol !== "manus_v2" ||
+      build.canonicalTaskId !== null ||
+      build.upstreamTaskId !== null ||
+      metadata.providerProtocol !== "manus_v2" ||
+      metadata.providerAttemptState !== "not_sent" ||
+      storedKnowledgeBaseCreateAttemptState(metadata) !== "not_sent" ||
+      metadata.dispatchingAt !== undefined ||
+      metadata.outcomeUnknownAt !== undefined ||
+      metadata.awaitingClientAttachments === true ||
+      !metadata.recovery ||
+      (!frozenPreparedCreate && !pristinePreprepareCreate)
+    ) {
+      return null;
+    }
+
+    const now = input.now ?? new Date();
+    const code = "UPSTREAM_CREDENTIAL_UNAVAILABLE";
+    const message =
+      "本轮绑定的 Manus API 凭证已不可用；已完成内容和本轮请求均已保留，请更新凭证后继续同一轮次";
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      dispatchState: "failed",
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+      canRegenerate: false,
+    };
+    await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "protocol_error",
+        stateEpoch: build.stateEpoch + 1,
+        protocolErrorCode: code,
+        protocolError: message,
+        awaitingResponseSince: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          isNull(knowledgeBaseBuilds.canonicalTaskId),
+          isNull(knowledgeBaseBuilds.upstreamTaskId),
+        ),
+      );
+    await tx
+      .update(conversationTurns)
+      .set({
+        status: "failed",
+        errorCode: code,
+        errorMessage: message,
+        completedAt: now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    await markKnowledgeBaseConversationFailedInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: null,
+      failedAt: now,
+    });
+    return turnRecord({
+      ...turn,
+      status: "failed",
+      errorCode: code,
+      errorMessage: message,
+      completedAt: now,
+      leaseExpiresAt: null,
+      metadata: nextMetadata,
+      updatedAt: now,
+    });
+  });
+}
+
 export async function renewKnowledgeBaseTurnLease(
   input: {
     userId: number;
@@ -13744,8 +13913,7 @@ export async function claimKnowledgeBaseTurnForRecovery(
       const localRehydrateRejected =
         currentMetadata.providerMethod === "task.sendMessage" &&
         Boolean(
-          retryAuthorityRecord(build.handoffProvenance)
-            ?.localRehydrateRequired,
+          retryAuthorityRecord(build.handoffProvenance)?.localRehydrateRequired,
         );
       const authority = knowledgeBaseManusV2TerminalRejectionAuthority({
         providerCode: currentMetadata.providerReasonCategory,
@@ -13985,6 +14153,24 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       metadata.providerAttemptState === "rejected" &&
       !turn.upstreamTaskId &&
       !build.canonicalTaskId;
+    const pristinePreprepareCredentialPause =
+      recoveryAction === "update_credential" &&
+      storedCreateAttemptState === "not_sent" &&
+      metadata.providerProtocol === "manus_v2" &&
+      metadata.providerMethod === undefined &&
+      metadata.providerAttemptState === "not_sent" &&
+      metadata.attachmentsFrozen !== true &&
+      metadata.preparedDispatch === undefined &&
+      metadata.frozenProviderRequestHash === undefined &&
+      metadata.dispatchingAt === undefined &&
+      metadata.outcomeUnknownAt === undefined &&
+      turn.attachmentFileIds.length === 0 &&
+      Object.keys(generatedAttachmentReservations(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentMappings(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentAttempts(metadata)).length === 0 &&
+      Object.keys(manusV2AttachmentUnknownAttempts(metadata)).length === 0 &&
+      !turn.upstreamTaskId &&
+      !build.canonicalTaskId;
     if (
       turn.status !== "failed" ||
       turn.upstreamTaskId ||
@@ -13993,8 +14179,9 @@ export async function resumeKnowledgeBaseTurnAfterUserFix(
       metadata.failureClass !== "requires_user_fix" ||
       (recoveryAction !== "top_up" && recoveryAction !== "update_credential") ||
       (storedCreateAttemptState !== "not_sent" && !rejectedCredentialAttempt) ||
-      metadata.attachmentsFrozen !== true ||
-      !metadata.preparedDispatch ||
+      (!pristinePreprepareCredentialPause &&
+        metadata.attachmentsFrozen !== true) ||
+      (!pristinePreprepareCredentialPause && !metadata.preparedDispatch) ||
       !metadata.recovery
     ) {
       return null;

@@ -48,18 +48,9 @@ describe("knowledge-base Manus v2 recovery rollout wiring", () => {
       'recoveryAuthority === "deferred_disabled"',
       authority,
     );
-    const prepare = dispatch.indexOf(
-      "ensureKnowledgeBaseRecoveryDispatch({",
-      disabled,
-    );
-    const upload = dispatch.indexOf(
-      "ensureKnowledgeBaseManusV2Attachments({",
-      disabled,
-    );
-    const writerFence = dispatch.indexOf(
-      "beginKnowledgeBaseManusV2Dispatch({",
-      disabled,
-    );
+    const prepare = dispatch.indexOf("ensureDispatch({", disabled);
+    const upload = dispatch.indexOf("ensureManusV2Attachments({", disabled);
+    const writerFence = dispatch.indexOf("beginDispatch({", disabled);
     const providerCreate = dispatch.indexOf(
       "const created = await client.createTask({",
       disabled,

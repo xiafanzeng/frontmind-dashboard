@@ -57,6 +57,7 @@ import {
   markLegacyKnowledgeBaseCreateAttentionRequired,
   mutateKnowledgeBaseManusV2Lifecycle,
   observeAndLocallySettleKnowledgeBaseTerminalAnchor,
+  pauseKnowledgeBasePreCreateCredentialUnavailable,
   persistKnowledgeBaseManusV2AttachmentAttempt,
   persistKnowledgeBaseManusV2AttachmentOutcomeUnknown,
   persistKnowledgeBaseManusV2AttachmentMapping,
@@ -1068,6 +1069,94 @@ describe("generated attachment invalid pre-provider release", () => {
     await expect(
       loadKnowledgeBasePreproviderLocalRehydrateAuthority(
         { userId: 1, build: harness.store.build },
+        db,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("reproves the same released source after the ordinary confirm reservation becomes active", async () => {
+    const value = fixture();
+    const harness = createTurnServiceExecutor({
+      build: value.build,
+      conversation: value.conversation,
+      turns: [value.source],
+      nodes: [value.node],
+      turnSelections: [[value.selection, value.selection]],
+    });
+    await releaseGeneratedAttachmentInvalidPreproviderTurn(
+      { turnId: value.source.id },
+      harness.executor,
+    );
+    const activeTurnId = "00000000-0000-4000-8000-000000000099";
+    harness.store.build.activeTurnId = activeTurnId;
+    harness.store.turns.push(
+      turn({
+        id: activeTurnId,
+        userId: 1,
+        conversationId: "u1:conversation-1",
+        buildId: harness.store.build.id,
+        buildGeneration: harness.store.build.generation,
+        expectedRevision: harness.store.build.revision,
+        expectedLeafId: harness.store.build.currentLeafId,
+        status: "running",
+        upstreamTaskId: null,
+        metadata: {
+          attachmentsFrozen: false,
+          createAttemptState: "not_sent",
+          providerProtocol: "manus_v2",
+          providerAttemptState: "not_sent",
+          recovery: {
+            kind: "turn",
+            conversationId: "conversation-1",
+            localRehydrateAuthority: "local_rehydrate_unbound",
+          },
+        },
+      }),
+    );
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: () => ({ limit: async () => harness.store.turns }),
+        }),
+      }),
+    };
+
+    await expect(
+      loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+        {
+          userId: 1,
+          build: harness.store.build,
+          expectedActiveTurnId: activeTurnId,
+        },
+        db,
+      ),
+    ).resolves.toMatchObject({
+      kind: "failed_confirm_preprovider_release",
+      sourceTurnId: value.source.id,
+    });
+    await expect(
+      loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+        {
+          userId: 1,
+          build: harness.store.build,
+          expectedActiveTurnId: "different-turn",
+        },
+        db,
+      ),
+    ).resolves.toBeNull();
+
+    const active = harness.store.turns[1]!;
+    harness.store.turns[1] = {
+      ...active,
+      expectedRevision: Number(active.expectedRevision) + 1,
+    };
+    await expect(
+      loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+        {
+          userId: 1,
+          build: harness.store.build,
+          expectedActiveTurnId: activeTurnId,
+        },
         db,
       ),
     ).resolves.toBeNull();
@@ -3962,9 +4051,7 @@ describe("Manus v2 canonical task writer fence", () => {
         projectAssignmentId: null,
         version: 1,
       },
-      turnSelections: [
-        [(store) => store.turns, (store) => store.turns],
-      ],
+      turnSelections: [[(store) => store.turns, (store) => store.turns]],
     });
 
     await expect(
@@ -5184,16 +5271,18 @@ describe("knowledge-base recovery metadata", () => {
         id: failed.buildId,
         userId: 1,
         conversationId: "conversation-1",
+        providerProtocol: "manus_v2",
         generation: failed.buildGeneration,
         stateEpoch: 8,
         status: "protocol_error",
         activeTurnId: failed.id,
         canonicalTaskId: null,
+        canonicalTaskState: "unbound",
       },
       conversation: { id: failed.conversationId, userId: 1, version: 3 },
       turns: [failed],
       credentials: [{ id: "credential-repaired", userId: 1, status: "active" }],
-      turnSelections: [[current]],
+      turnSelections: [[current], [current, current], [current, current]],
     });
     const claim = await resumeKnowledgeBaseTurnAfterUserFix(
       {
@@ -5217,6 +5306,42 @@ describe("knowledge-base recovery metadata", () => {
         expect.objectContaining({ providerStatus: 403 }),
       ],
     });
+
+    const operationKey = claim!.turn.operationKey;
+    const authority = await beginKnowledgeBaseManusV2Dispatch(
+      {
+        userId: 1,
+        turnId: failed.id,
+        leaseToken: claim!.leaseToken,
+        frozenProviderRequestHash: "f".repeat(64),
+        now: new Date("2026-08-01T00:01:01.000Z"),
+      },
+      executor,
+    );
+    expect(authority).toMatchObject({
+      method: "task.create",
+      canonicalTaskId: null,
+      operationToken: operationKey,
+    });
+    expect(store.turns[0]).toMatchObject({
+      operationKey,
+      apiCredentialId: "credential-repaired",
+      metadata: {
+        createAttemptState: "sending",
+        providerAttemptState: "sending",
+      },
+    });
+    await expect(
+      beginKnowledgeBaseManusV2Dispatch(
+        {
+          userId: 1,
+          turnId: failed.id,
+          leaseToken: claim!.leaseToken,
+          frozenProviderRequestHash: "f".repeat(64),
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_PENDING" });
   });
 
   it("replaces a not-sent pre-create attachment failure on the same turn exactly once", async () => {
@@ -9104,6 +9229,231 @@ describe("acknowledged manual Logo rejection", () => {
 });
 
 describe("knowledge-base deterministic dispatch failure", () => {
+  it("pauses only a frozen unbound v2 create when its credential disappears", async () => {
+    const leaseToken = "missing-credential-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: null,
+      completedAt: null,
+      leaseExpiresAt: new Date("2026-08-01T00:05:00.000Z"),
+      metadata: {
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        attachmentsFrozen: true,
+        createAttemptState: "not_sent",
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "not_sent",
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: { prompt: "exact prompt", attachments: [] },
+          bodySha256: "d".repeat(64),
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+        recovery: { kind: "turn", conversationId: "conversation-1" },
+        dispatchState: "recovering",
+        failureClass: "recoverable_same_turn",
+        recoveryAction: "reconcile",
+      },
+    });
+    const build = {
+      id: active.buildId,
+      userId: active.userId,
+      conversationId: "conversation-1",
+      providerProtocol: "manus_v2",
+      generation: active.buildGeneration,
+      stateEpoch: 12,
+      revision: active.expectedRevision,
+      currentLeafId: active.expectedLeafId,
+      status: "confirming",
+      activeTurnId: active.id,
+      upstreamTaskId: null,
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+      protocolErrorCode: null,
+      protocolError: null,
+      awaitingResponseSince: new Date("2026-08-01T00:00:00.000Z"),
+    };
+    const conversation = {
+      id: active.conversationId,
+      userId: active.userId,
+      projectAssignmentId: null,
+      deletedAt: null,
+      deletedMessageIds: [],
+      version: 4,
+      status: "running",
+    };
+    const current = (state: TurnServiceStore) =>
+      state.turns.filter((candidate) => candidate.id === active.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [active],
+      turnSelections: [[current]],
+    });
+
+    await expect(
+      pauseKnowledgeBasePreCreateCredentialUnavailable(
+        {
+          userId: active.userId,
+          turnId: active.id,
+          leaseToken,
+          now: new Date("2026-08-01T00:00:20.000Z"),
+        },
+        executor,
+      ),
+    ).resolves.toMatchObject({
+      id: active.id,
+      status: "failed",
+      upstreamTaskId: null,
+      operationKey: active.operationKey,
+      createAttemptState: "not_sent",
+      failureClass: "requires_user_fix",
+      recoveryAction: "update_credential",
+      leaseExpiresAt: null,
+    });
+    expect(store.build).toMatchObject({
+      status: "protocol_error",
+      stateEpoch: 13,
+      activeTurnId: active.id,
+      canonicalTaskId: null,
+      protocolErrorCode: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+    });
+    expect(store.conversation).toMatchObject({ status: "failed", version: 5 });
+
+    const ambiguous = {
+      ...active,
+      metadata: {
+        ...(active.metadata as Record<string, unknown>),
+        createAttemptState: "unknown",
+        providerAttemptState: "outcome_unknown",
+        outcomeUnknownAt: "2026-08-01T00:00:10.000Z",
+      },
+    } as ConversationTurn;
+    const rejectedHarness = createTurnServiceExecutor({
+      build: { ...build, activeTurnId: ambiguous.id },
+      conversation,
+      turns: [ambiguous],
+      turnSelections: [[(state) => state.turns]],
+    });
+    await expect(
+      pauseKnowledgeBasePreCreateCredentialUnavailable(
+        { userId: 1, turnId: ambiguous.id, leaseToken },
+        rejectedHarness.executor,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("rebinds a pristine pre-prepare credential pause to the current credential on the same operation", async () => {
+    const leaseToken = "missing-preprepare-credential-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: null,
+      completedAt: null,
+      leaseExpiresAt: new Date("2026-08-01T00:05:00.000Z"),
+      attachmentFileIds: [],
+      metadata: {
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        attachmentsFrozen: false,
+        createAttemptState: "not_sent",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          localRehydrateAuthority: "local_rehydrate_unbound",
+        },
+        dispatchState: "recovering",
+        failureClass: "recoverable_same_turn",
+        recoveryAction: "reconcile",
+      },
+    });
+    const build = {
+      id: active.buildId,
+      userId: active.userId,
+      conversationId: "conversation-1",
+      providerProtocol: "manus_v2",
+      generation: active.buildGeneration,
+      stateEpoch: 12,
+      revision: active.expectedRevision,
+      currentLeafId: active.expectedLeafId,
+      status: "confirming",
+      activeTurnId: active.id,
+      upstreamTaskId: null,
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+      protocolErrorCode: null,
+      protocolError: null,
+      awaitingResponseSince: new Date("2026-08-01T00:00:00.000Z"),
+    };
+    const conversation = {
+      id: active.conversationId,
+      userId: active.userId,
+      projectAssignmentId: null,
+      deletedAt: null,
+      deletedMessageIds: [],
+      version: 4,
+      status: "running",
+    };
+    const current = (state: TurnServiceStore) =>
+      state.turns.filter((candidate) => candidate.id === active.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [active],
+      credentials: [{ id: "credential-current", userId: 1, status: "active" }],
+      turnSelections: [[current], [current]],
+    });
+
+    const paused = await pauseKnowledgeBasePreCreateCredentialUnavailable(
+      {
+        userId: active.userId,
+        turnId: active.id,
+        leaseToken,
+        now: new Date("2026-08-01T00:00:20.000Z"),
+      },
+      executor,
+    );
+    expect(paused).toMatchObject({
+      status: "failed",
+      operationKey: active.operationKey,
+      recoveryAction: "update_credential",
+      providerAttemptState: "not_sent",
+      attachmentsFrozen: false,
+    });
+
+    const claim = await resumeKnowledgeBaseTurnAfterUserFix(
+      {
+        userId: active.userId,
+        turnId: active.id,
+        apiCredentialId: "credential-current",
+        now: new Date("2026-08-01T00:01:00.000Z"),
+      },
+      executor,
+    );
+    expect(claim).toMatchObject({
+      turn: {
+        id: active.id,
+        operationKey: active.operationKey,
+        apiCredentialId: "credential-current",
+        status: "running",
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+      },
+      preparedDispatch: undefined,
+    });
+    expect(store.turns).toHaveLength(1);
+    expect(store.turns[0]).toMatchObject({
+      operationKey: active.operationKey,
+      apiCredentialId: "credential-current",
+      status: "running",
+    });
+  });
+
   it("settles the active turn once so it is retryable and cannot be recovered forever", async () => {
     const leaseToken = "deterministic-failure-lease";
     const active = retryableFailedTurn({
