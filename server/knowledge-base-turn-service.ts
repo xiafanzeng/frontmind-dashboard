@@ -1172,6 +1172,40 @@ function manusV2AttachmentUnknownAttempts(
     : {};
 }
 
+function hasInlineEligibleGeneratedCreateRejection(
+  metadata: KnowledgeBaseTurnMetadata,
+) {
+  const reservations = Object.values(generatedAttachmentReservations(metadata));
+  const attempts = Object.values(manusV2AttachmentAttempts(metadata));
+  const prepared = metadata.preparedDispatch as
+    | KnowledgeBasePreparedDispatch
+    | undefined;
+  const matches = attempts.filter((attempt) => {
+    const preparedSource =
+      prepared?.requestBody.attachments[attempt.attachmentIndex];
+    if (
+      attempt.state !== "create_rejected" ||
+      attempt.upstreamFileId !== null ||
+      attempt.sizeBytes < 1 ||
+      attempt.sizeBytes > 20 * 1024 * 1024 ||
+      preparedSource?.file_id !== attempt.sourceFileId ||
+      preparedSource.filename !== attempt.filename
+    ) {
+      return false;
+    }
+    const reservationMatches = reservations.filter(
+      (reservation) =>
+        (reservation.role === "skill" || reservation.role === "instructions") &&
+        reservation.attachmentIndex === attempt.attachmentIndex &&
+        reservation.filename === attempt.filename &&
+        reservation.contentSha256 === attempt.contentSha256 &&
+        reservation.sizeBytes === attempt.sizeBytes,
+    );
+    return reservationMatches.length === 1;
+  });
+  return matches.length === 1;
+}
+
 function retryAuthorityRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -11975,12 +12009,15 @@ export async function markKnowledgeBaseTurnOutcomeUnknown(
  * the build returns to the same authoritative leaf without a protocol-error
  * retry that would require a prepared request body.
  */
-export async function cancelUnpreparedKnowledgeBaseTurn(
+async function cancelUnpreparedKnowledgeBaseTurnInternal(
   input: {
     userId: number;
+    conversationId?: string;
     turnId: string;
     clientRequestId?: string;
     leaseToken?: string;
+    expectedResetRevision?: number;
+    strictStartCancellation?: boolean;
     code: string;
     message: string;
     now?: Date;
@@ -11988,6 +12025,10 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
   executor?: any,
 ) {
   const db = executor ?? (await requireDb());
+  const strictStartCancellation = input.strictStartCancellation === true;
+  const expectedConversationId = input.conversationId
+    ? knowledgeBaseConversationStorageId(input.userId, input.conversationId)
+    : null;
   const code = normalizeRequiredId(input.code, "cancellation code", 128);
   const message = String(input.message || "")
     .trim()
@@ -12003,6 +12044,21 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
       allowInactiveTurn: true,
     });
     const metadata = metadataOf(turn);
+    if (
+      expectedConversationId &&
+      turn.conversationId !== expectedConversationId
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The upload turn belongs to another conversation",
+      );
+    }
+    if (strictStartCancellation && turn.operationType !== "start") {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Only an incomplete start operation can be cancelled",
+      );
+    }
     if (
       turn.status === "cancelled" &&
       metadata.unpreparedCancellation === true
@@ -12026,23 +12082,266 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
       (input.leaseToken &&
         metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken)) ||
       (!input.leaseToken && metadata.awaitingClientAttachments !== true) ||
+      build.activeTurnId !== turn.id ||
       (turn.status !== "queued" && turn.status !== "running") ||
       turn.upstreamTaskId ||
       metadata.preparedDispatch ||
-      build.status !== "confirming"
+      (strictStartCancellation && metadata.attachmentsFrozen === true) ||
+      (strictStartCancellation &&
+        metadata.frozenProviderRequestHash !== undefined) ||
+      (strictStartCancellation &&
+        Object.keys(generatedAttachmentReservations(metadata)).length > 0) ||
+      (strictStartCancellation &&
+        Object.keys(manusV2AttachmentMappings(metadata)).length > 0) ||
+      (strictStartCancellation &&
+        Object.keys(manusV2AttachmentAttempts(metadata)).length > 0) ||
+      (strictStartCancellation &&
+        Object.keys(manusV2AttachmentUnknownAttempts(metadata)).length > 0) ||
+      knowledgeBaseCreateAttemptState(turn, metadata) !== "not_sent" ||
+      (metadata.providerAttemptState !== undefined &&
+        metadata.providerAttemptState !== "not_sent") ||
+      Boolean(metadata.dispatchingAt || metadata.outcomeUnknownAt) ||
+      (strictStartCancellation
+        ? build.status !== "researching" ||
+          build.revision !== 0 ||
+          build.currentLeafId !== null ||
+          build.upstreamTaskId !== null
+        : !(
+            build.status === "confirming" ||
+            (turn.operationType === "start" &&
+              build.status === "researching" &&
+              build.revision === 0 &&
+              build.currentLeafId === null &&
+              build.upstreamTaskId === null)
+          ))
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
         "Only an unprepared active upload turn can be cancelled",
       );
     }
+    if (turn.operationType === "start") {
+      await assertStartResetRevisionInTransaction({
+        tx,
+        turn,
+        metadata,
+        expectedResetRevision: input.expectedResetRevision,
+      });
+    }
     const now = input.now ?? new Date();
+    let strictStartConversation: typeof conversations.$inferSelect | null =
+      null;
+    if (strictStartCancellation) {
+      const buildTurns = (await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, build.id),
+          ),
+        )
+        .limit(2)
+        .for("update")) as ConversationTurn[];
+      const buildNodes = await tx
+        .select({ id: knowledgeBaseBuildNodes.id })
+        .from(knowledgeBaseBuildNodes)
+        .where(eq(knowledgeBaseBuildNodes.buildId, build.id))
+        .limit(1)
+        .for("update");
+      const conversation = (
+        await tx
+          .select()
+          .from(conversations)
+          .where(
+            and(
+              eq(conversations.id, turn.conversationId),
+              eq(conversations.userId, input.userId),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0] as typeof conversations.$inferSelect | undefined;
+      const conversationMessages = await tx
+        .select()
+        .from(messages)
+        .where(
+          and(
+            eq(messages.userId, input.userId),
+            eq(messages.conversationId, turn.conversationId),
+          ),
+        )
+        .limit(2)
+        .for("update");
+      const onlyMessage = conversationMessages[0];
+      const onlyMessageMetadata = onlyMessage
+        ? parsedKnowledgeBaseMessageMetadata(onlyMessage.metadata)
+        : undefined;
+      const pristineBuild =
+        buildTurns.length === 1 &&
+        buildTurns[0]?.id === turn.id &&
+        buildNodes.length === 0 &&
+        (build.totalNodeCount ?? 0) === 0 &&
+        (build.confirmedCount ?? 0) === 0 &&
+        (build.directPrefilledCount ?? 0) === 0 &&
+        (build.needsVerificationCount ?? 0) === 0 &&
+        !build.currentPresentationKey &&
+        !build.lastAppliedOperationKey &&
+        !build.canonicalTaskId &&
+        !build.canonicalTaskGeneration &&
+        !build.canonicalCredentialId &&
+        (!build.canonicalTaskState || build.canonicalTaskState === "unbound") &&
+        !build.handoffProvenance &&
+        !build.initialResearchCoverage &&
+        !build.publishedSnapshotId &&
+        !build.contentCompletedAt &&
+        !build.packageTaskId &&
+        !build.packageOutputItemId &&
+        !build.packageFileId &&
+        !build.packageDescriptorHash &&
+        !build.packageStorageKey &&
+        !build.packageArchiveSha256 &&
+        !build.packageSizeBytes &&
+        (!build.packageStatus || build.packageStatus === "not_started") &&
+        (build.packageAttemptCount ?? 0) === 0 &&
+        !build.completedAt &&
+        !build.publishedAt &&
+        (build.lastOutputLength ?? 0) === 0 &&
+        (!Array.isArray(build.lastOutputItemIds) ||
+          build.lastOutputItemIds.length === 0);
+      const pristineConversation =
+        conversation?.id === turn.conversationId &&
+        conversation.projectAssignmentId === null &&
+        conversation.deletedAt === null &&
+        conversation.status === "running" &&
+        !conversation.upstreamTaskId &&
+        !conversation.previousResponseId &&
+        (conversation.lastKnownOutputLength ?? 0) === 0 &&
+        conversationMessages.length === 1 &&
+        onlyMessage?.deletedAt == null &&
+        onlyMessageMetadata?.kind === "pending_user" &&
+        matchesAuthoritativeKnowledgeBaseMessageTuple({
+          message: onlyMessage,
+          knowledgeBase: onlyMessageMetadata,
+          turn,
+          build,
+          publicConversationId: build.conversationId,
+        });
+      if (!pristineBuild || !pristineConversation) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "Only a pristine, zero-result start batch can be retired",
+        );
+      }
+      strictStartConversation = conversation;
+    }
     const {
       leaseOwnerHash: _leaseOwnerHash,
       outcomeUnknownAt: _outcomeUnknownAt,
       outcomeUnknownCode: _outcomeUnknownCode,
       ...metadataWithoutLease
     } = metadata;
+    const stagedAttachments = Array.isArray(metadata.clientStagedAttachments)
+      ? metadata.clientStagedAttachments
+      : [];
+    const stagedAttachmentFileIds = strictStartCancellation
+      ? stagedAttachments.map((attachment) =>
+          String(attachment.file_id || "").trim(),
+        )
+      : [];
+    if (strictStartCancellation) {
+      const recovery = metadata.recovery || {};
+      const recoveryAttachments = Array.isArray(recovery.attachments)
+        ? recovery.attachments
+        : [];
+      const sourceProofs = Array.isArray(recovery.attachmentSourceProofs)
+        ? recovery.attachmentSourceProofs
+        : [];
+      const ledgerMatches =
+        turn.attachmentFileIds.length === stagedAttachments.length &&
+        recoveryAttachments.length === stagedAttachments.length &&
+        sourceProofs.length === stagedAttachments.length &&
+        stagedAttachments.every((staged, index) => {
+          const attachment = recoveryAttachments[index] as
+            | Record<string, unknown>
+            | undefined;
+          const proof = sourceProofs[index] as
+            | Record<string, unknown>
+            | undefined;
+          return (
+            staged.index === index &&
+            Boolean(stagedAttachmentFileIds[index]) &&
+            turn.attachmentFileIds[index] === staged.file_id &&
+            attachment?.file_id === staged.file_id &&
+            attachment?.filename === staged.filename &&
+            proof?.index === index &&
+            proof?.fileId === staged.file_id &&
+            proof?.filename === staged.filename &&
+            (staged.managedIntentId === undefined ||
+              proof.managedIntentId === staged.managedIntentId)
+          );
+        }) &&
+        new Set(stagedAttachmentFileIds).size ===
+          stagedAttachmentFileIds.length;
+      if (!ledgerMatches) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The staged start ledger no longer matches its recovery authority",
+        );
+      }
+    }
+    if (strictStartCancellation && stagedAttachmentFileIds.length > 0) {
+      if (!turn.apiCredentialId) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The staged start files have no credential authority",
+        );
+      }
+      const stagedCredentialId = turn.apiCredentialId;
+      const stagedResources = (await tx
+        .select()
+        .from(upstreamResources)
+        .where(
+          and(
+            eq(upstreamResources.userId, input.userId),
+            eq(upstreamResources.apiCredentialId, stagedCredentialId),
+            eq(upstreamResources.kind, "file"),
+            eq(upstreamResources.conversationId, turn.conversationId),
+            inArray(upstreamResources.upstreamId, stagedAttachmentFileIds),
+          ),
+        )
+        .limit(stagedAttachmentFileIds.length)
+        .for("update")) as UpstreamResource[];
+      const foundFileIds = new Set(
+        stagedResources.map((resource) => resource.upstreamId),
+      );
+      if (
+        foundFileIds.size !== stagedAttachmentFileIds.length ||
+        stagedAttachmentFileIds.some((fileId) => !foundFileIds.has(fileId)) ||
+        stagedResources.some(
+          (resource) =>
+            resource.userId !== input.userId ||
+            resource.apiCredentialId !== stagedCredentialId ||
+            resource.kind !== "file" ||
+            resource.conversationId !== turn.conversationId ||
+            Boolean(resource.contentDeletedAt),
+        )
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The staged start files are no longer exclusively bound to this batch",
+        );
+      }
+    }
+    const nextMetadataBase = { ...metadataWithoutLease };
+    if (strictStartCancellation) {
+      delete nextMetadataBase.clientStagedAttachments;
+      nextMetadataBase.recovery = sanitizeKnowledgeBaseRecoveryMetadata({
+        ...(metadataWithoutLease.recovery || {}),
+        attachments: [],
+        attachmentSourceProofs: [],
+      });
+    }
     const cancelledOperationKey = String(turn.operationKey);
     const tombstoneOperationKey = createHash("sha256")
       .update(
@@ -12051,7 +12350,7 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
       )
       .digest("hex");
     const nextMetadata: KnowledgeBaseTurnMetadata = {
-      ...metadataWithoutLease,
+      ...nextMetadataBase,
       awaitingClientAttachments: false,
       unpreparedCancellation: true,
       cancelledOperationKey,
@@ -12062,10 +12361,76 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
         : "fix_attachments",
       canRegenerate: false,
     };
+    const cancelledRecord = turnRecord({
+      ...turn,
+      operationKey: tombstoneOperationKey,
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
+      ),
+      status: "cancelled",
+      ...(strictStartCancellation ? { attachmentFileIds: [] } : {}),
+      errorCode: code,
+      errorMessage: message,
+      completedAt: now,
+      leaseExpiresAt: null,
+      metadata: nextMetadata,
+      updatedAt: now,
+    });
+    if (strictStartCancellation) {
+      if (stagedAttachmentFileIds.length > 0) {
+        const stagedCredentialId = turn.apiCredentialId!;
+        await tx
+          .update(upstreamResources)
+          .set({ conversationId: null })
+          .where(
+            and(
+              eq(upstreamResources.userId, input.userId),
+              eq(upstreamResources.apiCredentialId, stagedCredentialId),
+              eq(upstreamResources.kind, "file"),
+              eq(upstreamResources.conversationId, turn.conversationId),
+              inArray(upstreamResources.upstreamId, stagedAttachmentFileIds),
+            ),
+          );
+      }
+      await tx
+        .insert(knowledgeBaseConversationRetentionTombstones)
+        .values({
+          id: randomUUID(),
+          userId: input.userId,
+          publicConversationId: build.conversationId,
+          resetAt: now,
+          createdAt: now,
+        })
+        .onDuplicateKeyUpdate({
+          set: {
+            id: sql`${knowledgeBaseConversationRetentionTombstones.id}`,
+          },
+        });
+      await tx
+        .delete(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, build.id),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.generation, build.generation),
+            eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          ),
+        );
+      await tx
+        .delete(conversations)
+        .where(
+          and(
+            eq(conversations.id, strictStartConversation!.id),
+            eq(conversations.userId, input.userId),
+            eq(conversations.version, strictStartConversation!.version),
+          ),
+        );
+      return cancelledRecord;
+    }
     await tx
       .update(knowledgeBaseBuilds)
       .set({
-        status: "confirming",
+        status: turn.operationType === "start" ? "researching" : "confirming",
         stateEpoch: build.stateEpoch + 1,
         activeTurnId: null,
         awaitingResponseSince: null,
@@ -12089,6 +12454,7 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
           createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
         ),
         status: "cancelled",
+        ...(strictStartCancellation ? { attachmentFileIds: [] } : {}),
         errorCode: code,
         errorMessage: message,
         completedAt: now,
@@ -12097,28 +12463,111 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
         updatedAt: now,
       })
       .where(eq(conversationTurns.id, turn.id));
-    await markKnowledgeBaseConversationAwaitingInputInTransaction({
-      tx,
-      userId: input.userId,
-      conversationId: turn.conversationId,
-      authoritativeTaskId: build.upstreamTaskId,
-      updatedAt: now,
-    });
-    return turnRecord({
-      ...turn,
-      operationKey: tombstoneOperationKey,
-      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
-        createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
-      ),
-      status: "cancelled",
-      errorCode: code,
-      errorMessage: message,
-      completedAt: now,
-      leaseExpiresAt: null,
-      metadata: nextMetadata,
-      updatedAt: now,
-    });
+    if (strictStartCancellation && stagedAttachmentFileIds.length > 0) {
+      const stagedCredentialId = turn.apiCredentialId!;
+      await tx
+        .update(upstreamResources)
+        .set({ conversationId: null })
+        .where(
+          and(
+            eq(upstreamResources.userId, input.userId),
+            eq(upstreamResources.apiCredentialId, stagedCredentialId),
+            eq(upstreamResources.kind, "file"),
+            eq(upstreamResources.conversationId, turn.conversationId),
+            inArray(upstreamResources.upstreamId, stagedAttachmentFileIds),
+          ),
+        );
+    }
+    if (turn.operationType === "start") {
+      await tx
+        .update(messages)
+        .set({ deletedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(messages.userId, input.userId),
+            eq(messages.conversationId, turn.conversationId),
+            eq(messages.turnId, turn.id),
+          ),
+        );
+      const conversation = (
+        await tx
+          .select()
+          .from(conversations)
+          .where(
+            and(
+              eq(conversations.id, turn.conversationId),
+              eq(conversations.userId, input.userId),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0];
+      if (conversation) {
+        await tx
+          .update(conversations)
+          .set({
+            status: "idle",
+            upstreamTaskId: null,
+            previousResponseId: null,
+            version: conversation.version + 1,
+            completedAt: null,
+            updatedAt: now,
+          })
+          .where(eq(conversations.id, conversation.id));
+      }
+    } else {
+      await markKnowledgeBaseConversationAwaitingInputInTransaction({
+        tx,
+        userId: input.userId,
+        conversationId: turn.conversationId,
+        authoritativeTaskId: build.upstreamTaskId,
+        updatedAt: now,
+      });
+    }
+    return cancelledRecord;
   });
+}
+
+export async function cancelUnpreparedKnowledgeBaseTurn(
+  input: {
+    userId: number;
+    turnId: string;
+    clientRequestId?: string;
+    leaseToken?: string;
+    code: string;
+    message: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  return cancelUnpreparedKnowledgeBaseTurnInternal(input, executor);
+}
+
+/**
+ * Customer-visible cancellation for an incomplete first-build batch. Internal
+ * Logo/user-attachment cancellation keeps using cancelUnpreparedKnowledgeBaseTurn;
+ * this wrapper prevents that broader helper from becoming an HTTP authority.
+ */
+export async function cancelIncompleteKnowledgeBaseStart(
+  input: {
+    userId: number;
+    conversationId: string;
+    turnId: string;
+    clientRequestId: string;
+    expectedResetRevision: number;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  return cancelUnpreparedKnowledgeBaseTurnInternal(
+    {
+      ...input,
+      strictStartCancellation: true,
+      code: "KNOWLEDGE_BASE_START_BATCH_CANCELLED",
+      message: "客户已取消未完成的资料批次，可重新选择资料开始构建",
+    },
+    executor,
+  );
 }
 
 export type KnowledgeBasePreproviderReleaseCandidate = {
@@ -13149,7 +13598,18 @@ export async function findRecoverableKnowledgeBaseTurnIds(
     )
     .where(
       and(
-        inArray(conversationTurns.status, ["queued", "running"]),
+        or(
+          inArray(conversationTurns.status, ["queued", "running"]),
+          and(
+            eq(conversationTurns.status, "failed"),
+            eq(
+              conversationTurns.errorCode,
+              "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
+            ),
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
+          ),
+        ),
         or(
           isNull(conversationTurns.leaseExpiresAt),
           lte(conversationTurns.leaseExpiresAt, now),
@@ -13180,7 +13640,7 @@ export async function findRecoverableKnowledgeBaseTurnIds(
       ),
     )
     .orderBy(asc(conversationTurns.leaseExpiresAt), asc(conversationTurns.id))
-    .limit(Math.min(limit, 200)) as Promise<KnowledgeBaseRecoveryCandidate[]>;
+    .limit(Math.min(limit, 200));
 }
 
 /**
@@ -13203,8 +13663,9 @@ export async function claimKnowledgeBaseTurnForRecovery(
   assertInteger(leaseMs, "leaseMs", 1_000);
   return db.transaction(async (tx: any) => {
     let turn: ConversationTurn;
+    let build: KnowledgeBaseBuild;
     try {
-      ({ turn } = await lockedOwnedTurnAndBuild(tx, { turnId }));
+      ({ turn, build } = await lockedOwnedTurnAndBuild(tx, { turnId }));
     } catch (error) {
       if (
         error instanceof KnowledgeBaseTurnReservationError &&
@@ -13228,8 +13689,15 @@ export async function claimKnowledgeBaseTurnForRecovery(
       turn,
       currentMetadata,
     );
+    const generatedInlineRecovery =
+      turn.status === "failed" &&
+      hasInlineEligibleGeneratedCreateRejection(currentMetadata) &&
+      createAttemptState === "not_sent" &&
+      currentMetadata.providerProtocol === "manus_v2";
     if (
-      (turn.status !== "queued" && turn.status !== "running") ||
+      (turn.status !== "queued" &&
+        turn.status !== "running" &&
+        !generatedInlineRecovery) ||
       currentMetadata.awaitingClientAttachments === true ||
       currentMetadata.providerAttemptState === "rejected" ||
       Boolean(currentMetadata.manusV2Lifecycle?.attentionCode) ||
@@ -13248,6 +13716,17 @@ export async function claimKnowledgeBaseTurnForRecovery(
       ...currentMetadata,
       leaseOwnerHash: leaseOwnerHash(leaseToken),
     };
+    if (generatedInlineRecovery) {
+      metadata = {
+        ...metadata,
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+        dispatchState: "recovering",
+        failureClass: "recoverable_same_turn",
+        recoveryAction: "reconcile",
+        canRegenerate: false,
+      };
+    }
     if (
       currentMetadata.providerProtocol === "manus_v2" &&
       currentMetadata.providerAttemptState === "outcome_unknown"
@@ -13263,11 +13742,50 @@ export async function claimKnowledgeBaseTurnForRecovery(
     }
     await tx
       .update(conversationTurns)
-      .set({ metadata, leaseExpiresAt, updatedAt: now })
+      .set({
+        status: generatedInlineRecovery ? "running" : turn.status,
+        errorCode: generatedInlineRecovery ? null : turn.errorCode,
+        errorMessage: generatedInlineRecovery ? null : turn.errorMessage,
+        completedAt: generatedInlineRecovery ? null : turn.completedAt,
+        metadata,
+        leaseExpiresAt,
+        updatedAt: now,
+      })
       .where(eq(conversationTurns.id, turn.id));
+    if (generatedInlineRecovery) {
+      await tx
+        .update(knowledgeBaseBuilds)
+        .set({
+          status:
+            turn.operationType === "start" ||
+            (turn.operationType === "retry" &&
+              currentMetadata.recovery !== null &&
+              typeof currentMetadata.recovery === "object" &&
+              !Array.isArray(currentMetadata.recovery) &&
+              currentMetadata.recovery.kind === "start")
+              ? "researching"
+              : "confirming",
+          stateEpoch: build.stateEpoch + 1,
+          protocolErrorCode: null,
+          protocolError: null,
+          awaitingResponseSince: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, build.id),
+            eq(knowledgeBaseBuilds.generation, build.generation),
+            eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          ),
+        );
+    }
     return {
       turn: turnRecord({
         ...turn,
+        status: generatedInlineRecovery ? "running" : turn.status,
+        errorCode: generatedInlineRecovery ? null : turn.errorCode,
+        errorMessage: generatedInlineRecovery ? null : turn.errorMessage,
+        completedAt: generatedInlineRecovery ? null : turn.completedAt,
         metadata,
         leaseExpiresAt,
         updatedAt: now,

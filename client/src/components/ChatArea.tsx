@@ -42,6 +42,7 @@ import {
 import { cn, copyToClipboard } from "@/lib/utils";
 import {
   creditEventBus,
+  cancelKnowledgeBaseStartReservation,
   deliveryProjectHeaders,
   discardManagedUploadIntent,
   discardUnboundUpload,
@@ -434,6 +435,9 @@ export type KnowledgeBaseStarterLifecycle = {
   attachmentManifest?: import("@/lib/frontmind-api").KnowledgeBaseAttachmentManifestItem[];
   startPrepared: boolean;
   onStartPrepared: (prepared: boolean) => void;
+  onReservation?: (
+    reservation: NonNullable<KnowledgeBaseStarterLifecycle["reservation"]>,
+  ) => void;
   onBatchPhase: (phase: KnowledgeBaseStarterBatchPhase) => void;
   onFileUpdate: (
     itemId: string,
@@ -474,6 +478,9 @@ export async function uploadKnowledgeBaseStarterFiles(
   const messageAttachments: Attachment[] = [];
 
   for (const [fileIndex, file] of files.entries()) {
+    if (lifecycle.signal.aborted) {
+      throw new DOMException("上传已停止", "AbortError");
+    }
     const itemId =
       lifecycle.fileItemIds?.[fileIndex] ||
       `${lifecycle.clientRequestId}:${fileIndex + 1}`;
@@ -533,6 +540,7 @@ export async function uploadKnowledgeBaseStarterFiles(
               ? { existingFileId }
               : {}),
           onFileRecord: (event) => {
+            if (lifecycle.signal.aborted) return;
             const fileId = uploadFileRecordId(event);
             if (fileId) currentFileId = fileId;
             if (event.uploadHandle) currentUploadHandle = event.uploadHandle;
@@ -550,6 +558,7 @@ export async function uploadKnowledgeBaseStarterFiles(
             });
           },
           onFileRecordDiscarded: () => {
+            if (lifecycle.signal.aborted) return;
             currentFileId = undefined;
             lifecycle.onFileUpdate(itemId, file, {
               stage: "creating_record",
@@ -560,6 +569,7 @@ export async function uploadKnowledgeBaseStarterFiles(
             });
           },
           onStage: (event) => {
+            if (lifecycle.signal.aborted) return;
             if (typeof event.loadedBytes === "number") {
               transferredBytes = Math.max(
                 transferredBytes,
@@ -596,6 +606,9 @@ export async function uploadKnowledgeBaseStarterFiles(
           undefined,
           uploadOptions,
         );
+        if (lifecycle.signal.aborted) {
+          throw new DOMException("上传已停止", "AbortError");
+        }
         receipt = {
           fileId: uploaded.fileId,
           filename: uploaded.filename,
@@ -605,16 +618,18 @@ export async function uploadKnowledgeBaseStarterFiles(
           traceId: safeKnowledgeBaseTraceId(uploaded.traceId),
         };
         receipts.set(itemId, receipt);
-        lifecycle.onFileUpdate(itemId, file, {
-          stage: "uploaded",
-          fileId: receipt.fileId,
-          loadedBytes: file.size,
-          dashboardReceivedBytes: file.size,
-          totalBytes: file.size,
-          receipt,
-          traceId: receipt.traceId,
-          attempt,
-        });
+        if (!lifecycle.signal.aborted) {
+          lifecycle.onFileUpdate(itemId, file, {
+            stage: "uploaded",
+            fileId: receipt.fileId,
+            loadedBytes: file.size,
+            dashboardReceivedBytes: file.size,
+            totalBytes: file.size,
+            receipt,
+            traceId: receipt.traceId,
+            attempt,
+          });
+        }
       } catch (error) {
         const rawStructuredFileId = (error as { fileId?: unknown } | null)
           ?.fileId;
@@ -637,39 +652,44 @@ export async function uploadKnowledgeBaseStarterFiles(
           structuredRecoveryAction !== "discard_and_recreate"
             ? "check_status"
             : structuredRecoveryAction;
-        lifecycle.onFileUpdate(itemId, file, {
-          stage: uploadWasCancelled(error, lifecycle.signal)
-            ? "cancelled"
-            : "failed",
-          ...(structuredFileId !== undefined
-            ? { fileId: structuredFileId }
-            : currentFileId
-              ? { fileId: currentFileId }
-              : {}),
-          loadedBytes: transferredBytes,
-          totalBytes: file.size,
-          error: uploadErrorMessage(error),
-          errorCode:
-            String((error as { code?: unknown } | null)?.code || "").trim() ||
-            undefined,
-          retryable:
-            typeof structuredRetryable === "boolean"
-              ? structuredRetryable
-              : undefined,
-          recoveryAction,
-          recreateRequired:
-            structuredRecreateRequired &&
-            structuredRecoveryAction === "discard_and_recreate",
-          traceId: safeKnowledgeBaseTraceId(
-            (error as { traceId?: unknown } | null)?.traceId,
-          ),
-          attempt,
-        });
+        if (!lifecycle.signal.aborted) {
+          lifecycle.onFileUpdate(itemId, file, {
+            stage: uploadWasCancelled(error, lifecycle.signal)
+              ? "cancelled"
+              : "failed",
+            ...(structuredFileId !== undefined
+              ? { fileId: structuredFileId }
+              : currentFileId
+                ? { fileId: currentFileId }
+                : {}),
+            loadedBytes: transferredBytes,
+            totalBytes: file.size,
+            error: uploadErrorMessage(error),
+            errorCode:
+              String((error as { code?: unknown } | null)?.code || "").trim() ||
+              undefined,
+            retryable:
+              typeof structuredRetryable === "boolean"
+                ? structuredRetryable
+                : undefined,
+            recoveryAction,
+            recreateRequired:
+              structuredRecreateRequired &&
+              structuredRecoveryAction === "discard_and_recreate",
+            traceId: safeKnowledgeBaseTraceId(
+              (error as { traceId?: unknown } | null)?.traceId,
+            ),
+            attempt,
+          });
+        }
         throw error;
       }
     }
 
     if (lifecycle.reservation && lifecycle.attachmentManifest) {
+      if (lifecycle.signal.aborted) {
+        throw new DOMException("上传已停止", "AbortError");
+      }
       await stageKnowledgeBaseTurnAttachment({
         ...lifecycle.reservation,
         attachmentManifest: lifecycle.attachmentManifest,
@@ -679,6 +699,9 @@ export async function uploadKnowledgeBaseStarterFiles(
           filename: receipt.filename,
         },
       });
+      if (lifecycle.signal.aborted) {
+        throw new DOMException("上传已停止", "AbortError");
+      }
     }
 
     uploadedAttachments.push({
@@ -998,6 +1021,8 @@ export default function ChatArea({
     wakeKnowledgeBaseConversation,
     commitKnowledgeBaseObservation,
     settleKnowledgeBaseStartFailure,
+    discardConversationLocally,
+    refreshConversationsAfterDiscard,
   } = useConversation();
   const dashboardQuery = trpc.workspace.dashboard.useQuery(undefined, {
     enabled: !responseLogicContext && showKnowledgeBaseStarter,
@@ -1025,6 +1050,29 @@ export default function ChatArea({
       description: "上一轮及其附件保持只读；请为新一轮重新选择资料。",
     });
   }, [createConversation, setActive]);
+
+  const discardCancelledKnowledgeBaseStart = useCallback(
+    async (conversationId: string) => {
+      discardConversationLocally(conversationId);
+      await refreshConversationsAfterDiscard();
+      const nextConversationId = createConversation({
+        title: "企业知识库构建",
+        reuseEmpty: false,
+      });
+      setActive(nextConversationId);
+      window.dispatchEvent(
+        new CustomEvent(KNOWLEDGE_BASE_NEW_BUILD_EVENT, {
+          detail: { conversationId: nextConversationId },
+        }),
+      );
+    },
+    [
+      createConversation,
+      discardConversationLocally,
+      refreshConversationsAfterDiscard,
+      setActive,
+    ],
+  );
 
   const status = activeConversation?.status;
   const startedAt = activeConversation?.startedAt;
@@ -1103,21 +1151,25 @@ export default function ChatArea({
           })),
         );
         requestDispatched = true;
-        const reserved = await reserveKnowledgeBaseStart({
-          conversationId,
-          clientRequestId,
-          expectedResetRevision,
-          companyName,
-          companyWebsite,
-          operatorNotes,
-          attachmentManifest,
-        });
+        const reserved = await reserveKnowledgeBaseStart(
+          {
+            conversationId,
+            clientRequestId,
+            expectedResetRevision,
+            companyName,
+            companyWebsite,
+            operatorNotes,
+            attachmentManifest,
+          },
+          lifecycle.signal,
+        );
         const reservation = {
           conversationId,
           turnId: reserved.reservation.turnId,
           clientRequestId,
           expectedResetRevision,
         };
+        lifecycle.onReservation?.(reservation);
         const { messageAttachments } = await uploadKnowledgeBaseStarterFiles(
           files,
           {
@@ -1548,6 +1600,9 @@ export default function ChatArea({
                 onRecovered={() => {
                   wakeKnowledgeBaseConversation(activeConversation.id);
                 }}
+                onCancelled={() =>
+                  discardCancelledKnowledgeBaseStart(activeConversation.id)
+                }
               />
             )}
 
@@ -2056,6 +2111,9 @@ export function EmptyConversationHint({
   const [batchPhase, setBatchPhase] =
     useState<KnowledgeBaseStarterBatchPhase>("ready");
   const [startPrepared, setStartPrepared] = useState(false);
+  const [startReservation, setStartReservation] = useState<NonNullable<
+    KnowledgeBaseStarterLifecycle["reservation"]
+  > | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const clientRequestIdRef = useRef<string | null>(null);
   const batchLocked = batchStartedAt !== null;
@@ -2129,6 +2187,7 @@ export function EmptyConversationHint({
     setBatchError(null);
     setBatchPhase("ready");
     setStartPrepared(false);
+    setStartReservation(null);
     abortControllerRef.current = null;
     clientRequestIdRef.current = null;
     if (fileInputRef.current) {
@@ -2140,15 +2199,16 @@ export function EmptyConversationHint({
     async (index: number) => {
       const removed = files[index];
       const removedItem = fileItems[index];
-      // Once /knowledge-base/start has been projected, retries must keep the
-      // exact attachment payload bound to the same clientRequestId. Cancelling
-      // the whole batch remains available for an intentional new request.
+      // Once the server freezes a start manifest, removing one local row would
+      // leave the operation waiting forever for that exact ordinal. Release
+      // the whole reservation before choosing a different file set instead.
       if (
         !removed ||
         !removedItem ||
         isStarting ||
         isDiscarding ||
-        startPrepared
+        startPrepared ||
+        startReservation
       )
         return;
       const { itemId } = removedItem;
@@ -2209,6 +2269,7 @@ export function EmptyConversationHint({
       isDiscarding,
       isStarting,
       startPrepared,
+      startReservation,
       uploadHandles,
     ],
   );
@@ -2229,13 +2290,34 @@ export function EmptyConversationHint({
       targets.set(itemId, { ...targets.get(itemId), handle });
     }
     const records = Array.from(targets.entries());
-    if (records.length === 0) {
-      setDialogOpen(false);
-      resetDialog();
-      return;
+    setIsDiscarding(true);
+    if (startReservation) {
+      try {
+        await cancelKnowledgeBaseStartReservation(startReservation);
+        setStartReservation(null);
+      } catch (error) {
+        const code = String((error as { code?: unknown } | null)?.code || "");
+        // A reset or retention tombstone already revoked the old reservation;
+        // treating it as released is safe and prevents an old tab from
+        // keeping the freshly reset starter UI blocked.
+        if (
+          ![
+            "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+            "CONVERSATION_RESET",
+            "TURN_NOT_FOUND",
+            "BUILD_NOT_FOUND",
+            "RESERVATION_NOT_FOUND",
+          ].includes(code)
+        ) {
+          toast.warning("本批次暂时无法取消", {
+            description: uploadErrorMessage(error),
+          });
+          setIsDiscarding(false);
+          return;
+        }
+      }
     }
 
-    setIsDiscarding(true);
     const results = await Promise.allSettled(
       records.map(([, target]) => {
         if (target.handle) return discardManagedUploadIntent(target.handle);
@@ -2308,6 +2390,7 @@ export function EmptyConversationHint({
     isDiscarding,
     isStarting,
     resetDialog,
+    startReservation,
     uploadHandles,
   ]);
 
@@ -2563,6 +2646,7 @@ export function EmptyConversationHint({
         fileItemIds: fileItems.map(({ itemId }) => itemId),
         startPrepared,
         onStartPrepared: setStartPrepared,
+        onReservation: setStartReservation,
         onBatchPhase: setBatchPhase,
         onFileUpdate: updateFileState,
       });
@@ -2864,7 +2948,12 @@ export function EmptyConversationHint({
                         size="icon"
                         aria-label={`移除 ${file.name}`}
                         className="h-7 w-7 shrink-0"
-                        disabled={isStarting || isDiscarding || startPrepared}
+                        disabled={
+                          isStarting ||
+                          isDiscarding ||
+                          startPrepared ||
+                          Boolean(startReservation)
+                        }
                         onClick={(event) => {
                           event.stopPropagation();
                           void removeFile(index);
@@ -2973,7 +3062,9 @@ export function EmptyConversationHint({
                   ? uploadSummary.uploadedCount === files.length
                     ? "正在启动"
                     : "停止上传"
-                  : "取消"}
+                  : startReservation
+                    ? "取消本批次并重新选择"
+                    : "取消"}
             </Button>
             <Button
               type="button"

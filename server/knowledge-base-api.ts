@@ -116,6 +116,7 @@ import {
   beginKnowledgeBaseManusV2Dispatch,
   bindKnowledgeBaseManusV2Submission,
   cancelUnpreparedKnowledgeBaseTurn,
+  cancelIncompleteKnowledgeBaseStart,
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseManusV2AnchorHandoff,
   claimKnowledgeBaseTerminalAnchorHandoffRecovery,
@@ -213,7 +214,10 @@ import {
   executeKnowledgeBaseAnchorHandoff,
   inspectKnowledgeBaseAnchorAcknowledgement,
 } from "./knowledge-base-active-v2-migration-core";
-import { ensureKnowledgeBaseManusV2Attachments } from "./knowledge-base-manus-v2-attachments";
+import {
+  ensureKnowledgeBaseManusV2Attachments,
+  isKnowledgeBaseManusV2GeneratedFileCreateRejected,
+} from "./knowledge-base-manus-v2-attachments";
 import {
   claimKnowledgeBaseOpenRecoveryBuild,
   releaseKnowledgeBaseOpenRecoveryLease,
@@ -4975,9 +4979,10 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       v2Attachments.length !== prepared.requestBody.attachments.length ||
       v2Attachments.some(
         (attachment, index) =>
-          !attachment.file_id ||
           attachment.filename !==
-            prepared.requestBody.attachments[index]?.filename,
+            prepared.requestBody.attachments[index]?.filename ||
+          ((!("file_id" in attachment) || !attachment.file_id) &&
+            (!("file_data" in attachment) || !attachment.file_data)),
       )
     ) {
       throw new KnowledgeBaseTurnReservationError(
@@ -5028,11 +5033,12 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       businessPrompt,
       contract,
     );
+    const providerAttachments = v2Attachments;
     const v2BodyHash = createHash("sha256")
       .update(
         JSON.stringify({
           prompt: v2Prompt,
-          attachments: v2Attachments,
+          attachments: providerAttachments,
           agentProfile: prepared.requestBody.agentProfile,
           operationToken: claim.turn.operationKey,
           structuredOutputSchema,
@@ -5061,7 +5067,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       if (authority.method === "task.create") {
         const created = await client.createTask({
           prompt: v2Prompt,
-          attachments: v2Attachments,
+          attachments: providerAttachments,
           title: authority.title,
           agentProfile: prepared.requestBody.agentProfile,
           structuredOutputSchema,
@@ -5080,7 +5086,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         const sent = await client.sendMessage({
           taskId,
           prompt: v2Prompt,
-          attachments: v2Attachments,
+          attachments: providerAttachments,
           structuredOutputSchema,
         });
         requestId = sent.requestId;
@@ -7329,6 +7335,21 @@ export async function persistKnowledgeBaseCreateFailure(
     return "retriable" as const;
   }
   if (input.error instanceof KnowledgeBaseLocalPreparationError) {
+    if (isKnowledgeBaseManusV2GeneratedFileCreateRejected(input.error)) {
+      // file.upload explicitly rejected this server-generated source before
+      // task.create/sendMessage. The durable create_rejected row is the
+      // at-most-once proof used by the next claim to switch only that small
+      // Skill/instructions slot to official Manus v2 inline file_data.
+      await deferBeforeCreate({
+        userId: input.userId,
+        turnId: input.turnId,
+        leaseToken: input.leaseToken,
+        code: "KNOWLEDGE_BASE_MANUS_V2_INLINE_SYSTEM_ATTACHMENT",
+        recoveryDelayMs: 1_000,
+        traceId: input.traceId,
+      });
+      return "retriable" as const;
+    }
     if (input.error.code === "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID") {
       // Logo has its own first-node re-upload flow. Releasing this unbound
       // child is intentional so a new Logo byte identity gets a new provider
@@ -7775,6 +7796,62 @@ router.post("/start/reserve", async (req, res) => {
       },
       reservationCreated: false,
     });
+  }
+});
+
+/**
+ * Customer-requested release of an incomplete browser upload batch. This
+ * route performs no Provider work; the service repeats every no-dispatch and
+ * reset-epoch proof under locks before releasing the start operation slot.
+ */
+router.post("/start/cancel", async (req, res) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const conversationId = String(body.conversationId || "").trim();
+  const turnId = String(body.turnId || "").trim();
+  const clientRequestId = String(body.clientRequestId || "").trim();
+  const expectedResetRevision = Number(body.expectedResetRevision);
+  if (
+    !conversationId ||
+    conversationId.length > 191 ||
+    !turnId ||
+    turnId.length > 36 ||
+    !clientRequestId ||
+    clientRequestId.length > 128 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0
+  ) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_KNOWLEDGE_BASE_START_CANCELLATION",
+        message: "知识库资料批次取消参数无效",
+      },
+    });
+    return;
+  }
+  if (
+    !req.frontmindUser ||
+    !(await requireKnowledgeBuildCapability(req.frontmindUser.id, res))
+  ) {
+    return;
+  }
+  try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
+    await cancelIncompleteKnowledgeBaseStart({
+      userId: req.frontmindUser.id,
+      conversationId,
+      turnId,
+      clientRequestId,
+      expectedResetRevision,
+    });
+    res.status(200).json({ cancelled: true });
+  } catch (error) {
+    if (error instanceof KnowledgeBaseTurnReservationError) {
+      res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
+        error: { code: error.code, message: error.message },
+      });
+      return;
+    }
+    throw error;
   }
 });
 

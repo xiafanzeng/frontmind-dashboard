@@ -370,6 +370,7 @@ describe("stage-first intent capability cache policy", () => {
       verifiedAt: null,
       reservation: {
         clientRequestId,
+        sourceResetRevision: 9,
         attachmentManifest,
         stagedAttachmentCount: 1,
       },
@@ -432,6 +433,7 @@ describe("stage-first intent capability cache policy", () => {
             };
             expect(payload.reservation).toEqual({
               clientRequestId,
+              sourceResetRevision: 9,
               attachmentManifest,
               stagedAttachmentCount: 1,
             });
@@ -588,6 +590,7 @@ describe("stage-first intent capability cache policy", () => {
         verifiedAt: null,
         reservation: {
           clientRequestId,
+          sourceResetRevision: 9,
           attachmentManifest,
           stagedAttachmentCount: 0,
         },

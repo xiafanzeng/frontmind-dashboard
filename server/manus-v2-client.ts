@@ -17,10 +17,20 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_PAGES = 100;
 
-export type ManusV2Attachment = {
-  file_id: string;
-  filename: string;
-};
+export type ManusV2Attachment =
+  | {
+      file_id: string;
+      filename: string;
+      file_data?: never;
+      mime_type?: never;
+    }
+  | {
+      /** Official Manus v2 inline-file data URL (decoded payload <= 20 MiB). */
+      file_data: string;
+      filename: string;
+      mime_type: string;
+      file_id?: never;
+    };
 
 export type ManusV2CreatedFile = {
   fileId: string;
@@ -297,28 +307,66 @@ function normalizeBaseUrl(baseUrl: string) {
 }
 
 function safeAttachment(attachment: ManusV2Attachment) {
-  const fileId = requiredString(attachment.file_id, "file_id", 512);
   const filename = requiredString(
     attachment.filename.replace(/[\\/\0]/gu, "_"),
     "filename",
     512,
   );
-  return { file_id: fileId, filename };
+  if ("file_id" in attachment && attachment.file_id) {
+    return {
+      type: "file" as const,
+      file_id: requiredString(attachment.file_id, "file_id", 512),
+      filename,
+    };
+  }
+  if (!("file_data" in attachment) || !attachment.file_data) {
+    throw new Error("Manus v2 attachment requires exactly one file source");
+  }
+  const mimeType = requiredString(attachment.mime_type, "mime_type", 255);
+  const prefix = `data:${mimeType};base64,`;
+  if (!attachment.file_data.startsWith(prefix)) {
+    throw new Error("Manus v2 inline attachment data URL is invalid");
+  }
+  const encoded = attachment.file_data.slice(prefix.length);
+  if (
+    !encoded ||
+    encoded.length > Math.ceil((20 * 1024 * 1024 * 4) / 3) + 4 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/u.test(encoded)
+  ) {
+    throw new Error("Manus v2 inline attachment exceeds its safe limit");
+  }
+  const decoded = Buffer.from(encoded, "base64");
+  if (
+    decoded.length < 1 ||
+    decoded.length > 20 * 1024 * 1024 ||
+    decoded.toString("base64") !== encoded
+  ) {
+    throw new Error("Manus v2 inline attachment base64 is invalid");
+  }
+  return {
+    type: "file" as const,
+    file_data: attachment.file_data,
+    filename,
+    mime_type: mimeType,
+  };
 }
 
 export function buildManusV2MessageContent(
   prompt: string,
   attachments: ReadonlyArray<ManusV2Attachment>,
 ) {
-  const content: Array<Record<string, string>> = [
-    { type: "text", text: requiredString(prompt, "prompt", 2_000_000) },
-  ];
+  const content: Array<
+    | { type: "text"; text: string }
+    | { type: "file"; file_id: string; filename: string }
+    | {
+        type: "file";
+        file_data: string;
+        filename: string;
+        mime_type: string;
+      }
+  > = [{ type: "text", text: requiredString(prompt, "prompt", 2_000_000) }];
   for (const attachment of attachments.map(safeAttachment)) {
-    content.push({
-      type: "file",
-      file_id: attachment.file_id,
-      filename: attachment.filename,
-    });
+    content.push(attachment);
   }
   return content;
 }

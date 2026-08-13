@@ -59,6 +59,7 @@ function starterLifecycle(
     transferredBytes: new Map(),
     startPrepared: false,
     onStartPrepared: vi.fn(),
+    onReservation: vi.fn(),
     onBatchPhase: vi.fn(),
     onFileUpdate: vi.fn(),
     ...overrides,
@@ -1014,6 +1015,50 @@ describe("EmptyConversationHint", () => {
     expect(discardSpy).toHaveBeenCalledTimes(2);
     expect(discardSpy).toHaveBeenLastCalledWith("file-pending");
     discardSpy.mockRestore();
+  });
+
+  it("releases a frozen incomplete start batch before allowing reselection", async () => {
+    const file = sizedFile("本轮资料.pdf", 32);
+    const reservation = {
+      conversationId: "kb-reset-fresh",
+      turnId: "11111111-1111-4111-8111-111111111111",
+      clientRequestId: "kb-start-frozen",
+      expectedResetRevision: 4,
+    };
+    const cancelSpy = vi
+      .spyOn(frontmindApi, "cancelKnowledgeBaseStartReservation")
+      .mockResolvedValue({ cancelled: true });
+    const onStartKnowledgeBase = vi.fn(async (_input, lifecycle) => {
+      lifecycle.onReservation?.(reservation);
+      throw new Error("第二个文件尚未传入 Dashboard");
+    });
+
+    render(
+      <EmptyConversationHint
+        onStartKnowledgeBase={onStartKnowledgeBase}
+        companyName="验收企业"
+        companyConfigured
+        companyLoading={false}
+        resetRevision={4}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "构建企业知识库" }));
+    addStarterFiles([file]);
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "取消本批次并重新选择" }),
+      ).toBeEnabled();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "取消本批次并重新选择" }),
+    );
+    await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith(reservation));
+    expect(
+      screen.queryByRole("dialog", { name: "构建企业知识库" }),
+    ).not.toBeInTheDocument();
+    cancelSpy.mockRestore();
   });
 });
 

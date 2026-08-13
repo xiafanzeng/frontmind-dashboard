@@ -10,6 +10,8 @@ import {
 } from "@/lib/attachment-files";
 import {
   createKnowledgeBaseTurnTask,
+  cancelKnowledgeBaseStartReservation,
+  discardManagedUploadIntent,
   listManagedUploadsForKnowledgeBase,
   recoverDiscoveredManagedUpload,
   stageKnowledgeBaseTurnAttachment,
@@ -36,6 +38,19 @@ type RecoveryPhase =
   | "needs_browser"
   | "dispatching"
   | "attention";
+
+const RELEASED_START_RESERVATION_CODES = new Set([
+  "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+  "CONVERSATION_RESET",
+  "TURN_NOT_FOUND",
+  "BUILD_NOT_FOUND",
+  "RESERVATION_NOT_FOUND",
+]);
+
+function startReservationAlreadyReleased(error: unknown) {
+  const code = String((error as { code?: unknown } | null)?.code || "");
+  return RELEASED_START_RESERVATION_CODES.has(code);
+}
 
 function orderedRecoveryBatch(discovery: ManagedUploadDiscovery) {
   const { uploads, reservation } = discovery;
@@ -111,20 +126,29 @@ export default function KnowledgeBaseManagedUploadRecovery({
   turnId,
   onObservation,
   onRecovered,
+  onCancelled,
 }: {
   conversationId: string;
   turnId: string;
   onObservation: (observation: KnowledgeBaseObservationDto) => void;
   onRecovered?: () => void;
+  onCancelled: () => void | Promise<void>;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const runningRef = useRef(false);
+  const recoveryControllerRef = useRef<AbortController | null>(null);
   const onObservationRef = useRef(onObservation);
   const onRecoveredRef = useRef(onRecovered);
+  const onCancelledRef = useRef(onCancelled);
   const [phase, setPhase] = useState<RecoveryPhase>("discovering");
   const [missing, setMissing] = useState<MissingUpload[]>([]);
   const [refreshToken, setRefreshToken] = useState(0);
   const [manualUpload, setManualUpload] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelled, setCancelled] = useState(false);
+  const [discovery, setDiscovery] = useState<ManagedUploadDiscovery | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const missingNames = useMemo(
@@ -135,12 +159,14 @@ export default function KnowledgeBaseManagedUploadRecovery({
   useEffect(() => {
     onObservationRef.current = onObservation;
     onRecoveredRef.current = onRecovered;
-  }, [onObservation, onRecovered]);
+    onCancelledRef.current = onCancelled;
+  }, [onCancelled, onObservation, onRecovered]);
 
   useEffect(() => {
     if (!conversationId || !turnId || manualUpload || runningRef.current)
       return;
     const controller = new AbortController();
+    recoveryControllerRef.current = controller;
     let retryTimer: number | undefined;
     runningRef.current = true;
 
@@ -153,6 +179,7 @@ export default function KnowledgeBaseManagedUploadRecovery({
           turnId,
           signal: controller.signal,
         });
+        setDiscovery(discovery);
         const ordered = orderedRecoveryBatch(discovery);
         const recovery = await Promise.all(
           ordered.map(async ({ upload }, index) => {
@@ -297,6 +324,9 @@ export default function KnowledgeBaseManagedUploadRecovery({
     void run();
     return () => {
       controller.abort();
+      if (recoveryControllerRef.current === controller) {
+        recoveryControllerRef.current = null;
+      }
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       runningRef.current = false;
     };
@@ -373,6 +403,56 @@ export default function KnowledgeBaseManagedUploadRecovery({
     [conversationId, manualUpload, missing, turnId],
   );
 
+  const cancelBatch = useCallback(async () => {
+    if (!discovery || cancelling) return;
+    setCancelling(true);
+    setError(null);
+    recoveryControllerRef.current?.abort();
+    try {
+      try {
+        await cancelKnowledgeBaseStartReservation({
+          conversationId,
+          turnId,
+          clientRequestId: discovery.reservation.clientRequestId,
+          expectedResetRevision: discovery.reservation.sourceResetRevision,
+        });
+      } catch (caught) {
+        // The first cancellation may have committed even when its HTTP
+        // response was lost, or a reset may have retired the same batch. In
+        // both cases the reservation is already gone, so a retry must finish
+        // cleaning its durable managed-upload intents instead of getting
+        // permanently stuck on the missing build/turn.
+        if (!startReservationAlreadyReleased(caught)) throw caught;
+      }
+      const cleanup = await Promise.allSettled(
+        discovery.uploads.map((upload) => {
+          const manifest =
+            discovery.reservation.attachmentManifest[upload.ordinal - 1];
+          if (!manifest) {
+            throw new Error("服务器上传批次与知识库预约不一致");
+          }
+          return discardManagedUploadIntent(
+            discoveredUploadHandle(upload, manifest),
+          );
+        }),
+      );
+      const failed = cleanup.find(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      if (failed) throw failed.reason;
+      await onCancelledRef.current();
+      setCancelled(true);
+      toast.success("已取消未完成批次，请重新选择资料");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "取消本批次失败");
+    } finally {
+      setCancelling(false);
+    }
+  }, [cancelling, conversationId, discovery, turnId]);
+
+  if (cancelled) return null;
+
   return (
     <div
       className="mt-3 w-full rounded-lg border border-amber-300/80 bg-white/70 p-3 text-amber-950"
@@ -430,6 +510,20 @@ export default function KnowledgeBaseManagedUploadRecovery({
             }}
           >
             重新检查服务器副本
+          </Button>
+        )}
+        {discovery && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={cancelling}
+            onClick={() => void cancelBatch()}
+          >
+            {cancelling && (
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            )}
+            取消本批次并重新选择
           </Button>
         )}
       </div>

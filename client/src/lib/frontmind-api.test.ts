@@ -1168,6 +1168,7 @@ describe("managed knowledge-base upload discovery", () => {
       })),
       reservation: {
         clientRequestId,
+        sourceResetRevision: 9,
         attachmentManifest,
         stagedAttachmentCount: 1,
       },
@@ -1176,10 +1177,16 @@ describe("managed knowledge-base upload discovery", () => {
   }
 
   it("strictly parses the complete frozen reservation and reissued upload capabilities", async () => {
-    sessionStorage.setItem(
-      DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
-      "project-managed-discovery",
-    );
+    vi.stubGlobal("sessionStorage", {
+      getItem: vi.fn((key: string) =>
+        key === DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY
+          ? "project-managed-discovery"
+          : null,
+      ),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+      clear: vi.fn(),
+    });
     const payload = discoveryPayload();
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

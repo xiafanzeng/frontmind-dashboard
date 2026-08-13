@@ -184,6 +184,7 @@ export type DecryptedCredential = {
 export type KnowledgeBaseUploadReservationCredential = DecryptedCredential & {
   reservation: {
     clientRequestId: string;
+    sourceResetRevision: number;
     attachmentManifest: Array<{
       filename: string;
       sizeBytes: number;
@@ -2584,9 +2585,12 @@ export async function getDecryptedCredentialForKnowledgeBaseUploadReservation(
       return null;
     }
     const declaredUserAttachmentCount = Number(metadata.userAttachmentCount);
+    const sourceResetRevision = Number(metadata.sourceResetRevision);
     if (
       !Number.isSafeInteger(declaredUserAttachmentCount) ||
       declaredUserAttachmentCount < 0 ||
+      !Number.isSafeInteger(sourceResetRevision) ||
+      sourceResetRevision < 0 ||
       attachmentManifest.length !== declaredUserAttachmentCount
     ) {
       return null;
@@ -2672,6 +2676,7 @@ export async function getDecryptedCredentialForKnowledgeBaseUploadReservation(
       verifiedAt: credential.verifiedAt,
       reservation: {
         clientRequestId: turn.clientRequestId,
+        sourceResetRevision,
         attachmentManifest,
         stagedAttachmentCount: Array.isArray(metadata.clientStagedAttachments)
           ? metadata.clientStagedAttachments.length

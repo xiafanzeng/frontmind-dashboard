@@ -29,6 +29,7 @@ import { KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME } from "./knowledge-base-prompt-de
 import {
   ManusV2ApiError,
   ManusV2Client,
+  type ManusV2Attachment,
   type ManusV2CreatedFile,
 } from "./manus-v2-client";
 import { readStoredPresalesFile } from "./presales-file-store";
@@ -39,6 +40,9 @@ const MAX_SOURCE_BYTES = 100 * 1024 * 1024;
 const ENSURE_MINIMUM_USABLE_SECONDS = 16 * 60;
 const FINAL_MINIMUM_USABLE_SECONDS = 15 * 60;
 const MAX_EXPLICIT_FILE_REJECTION_RETRIES = 3;
+const MAX_INLINE_GENERATED_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+export type KnowledgeBaseManusV2ResolvedAttachment = ManusV2Attachment;
 
 type LocalAttachmentSource = {
   sourceFileId: string;
@@ -59,6 +63,19 @@ function localPreparationError(message: string, cause?: unknown) {
     "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
     message,
     cause === undefined ? undefined : { cause },
+  );
+}
+
+export function isKnowledgeBaseManusV2GeneratedFileCreateRejected(
+  error: unknown,
+) {
+  return Boolean(
+    error instanceof KnowledgeBaseLocalPreparationError &&
+      error.code === "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE" &&
+      error.cause instanceof ManusV2ApiError &&
+      error.cause.operation === "file.upload" &&
+      !error.cause.retryable &&
+      !error.cause.outcomeUnknown,
   );
 }
 
@@ -388,6 +405,54 @@ async function resolveLocalSources(claim: KnowledgeBaseRecoveryClaim) {
     );
   }
   return result;
+}
+
+function generatedReservationForSource(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  attachmentIndex: number;
+  source: LocalAttachmentSource;
+}) {
+  const indexed = generatedReservationByIndex(
+    input.claim,
+    input.attachmentIndex,
+  );
+  if (
+    indexed &&
+    indexed.filename === input.source.filename &&
+    indexed.contentSha256 === input.source.contentSha256 &&
+    indexed.sizeBytes === input.source.sizeBytes
+  ) {
+    return indexed;
+  }
+  return generatedReservationBySource(input.claim, {
+    sourceFileId: input.source.sourceFileId,
+    filename: input.source.filename,
+  });
+}
+
+function eligibleInlineGeneratedSource(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  attachmentIndex: number;
+  source: LocalAttachmentSource;
+}) {
+  const reservation = generatedReservationForSource(input);
+  return Boolean(
+    reservation &&
+      (reservation.role === "skill" || reservation.role === "instructions") &&
+      input.source.sizeBytes > 0 &&
+      input.source.sizeBytes <= MAX_INLINE_GENERATED_ATTACHMENT_BYTES,
+  );
+}
+
+function inlineGeneratedAttachment(input: {
+  source: LocalAttachmentSource;
+  attachmentIndex: number;
+}): KnowledgeBaseManusV2ResolvedAttachment {
+  return {
+    file_data: `data:${input.source.mimeType};base64,${input.source.bytes.toString("base64")}`,
+    filename: input.source.filename,
+    mime_type: input.source.mimeType,
+  };
 }
 
 function mappingKey(input: {
@@ -1321,7 +1386,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
   claim: KnowledgeBaseRecoveryClaim;
   credential: Pick<DecryptedCredential, "id" | "userId" | "apiKey">;
   baseUrl: string;
-}): Promise<Array<{ file_id: string; filename: string }>> {
+}): Promise<KnowledgeBaseManusV2ResolvedAttachment[]> {
   const { claim } = input;
   const durable = await loadKnowledgeBaseManusV2AttachmentLedger({
     userId: claim.turn.userId,
@@ -1346,20 +1411,59 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     apiKey: input.credential.apiKey,
   });
   const sources = await resolveLocalSources(claim);
-  const mappings: KnowledgeBaseManusV2AttachmentMapping[] = [];
+  const mappings: Array<KnowledgeBaseManusV2AttachmentMapping | null> = [];
+  const inlineAttachments = new Map<
+    number,
+    KnowledgeBaseManusV2ResolvedAttachment
+  >();
   for (
     let attachmentIndex = 0;
     attachmentIndex < sources.length;
     attachmentIndex += 1
   ) {
-    mappings.push(
-      await ensureOneMapping({
-        claim,
-        client,
-        source: sources[attachmentIndex]!,
+    const source = sources[attachmentIndex]!;
+    const existingRejectedAttempt = existingAttempt({
+      claim,
+      attachmentIndex,
+      source,
+    });
+    if (
+      existingRejectedAttempt?.state === "create_rejected" &&
+      existingRejectedAttempt.upstreamFileId === null &&
+      eligibleInlineGeneratedSource({ claim, attachmentIndex, source })
+    ) {
+      inlineAttachments.set(
         attachmentIndex,
-      }),
-    );
+        inlineGeneratedAttachment({ source, attachmentIndex }),
+      );
+      mappings.push(null);
+      continue;
+    }
+    try {
+      mappings.push(
+        await ensureOneMapping({
+          claim,
+          client,
+          source,
+          attachmentIndex,
+        }),
+      );
+    } catch (error) {
+      const attempt = existingAttempt({ claim, attachmentIndex, source });
+      const durableExplicitRejection =
+        attempt?.state === "create_rejected" && attempt.upstreamFileId === null;
+      if (
+        !eligibleInlineGeneratedSource({ claim, attachmentIndex, source }) ||
+        !durableExplicitRejection
+      ) {
+        throw error;
+      }
+      inlineAttachments.set(
+        attachmentIndex,
+        inlineGeneratedAttachment({ source, attachmentIndex }),
+      );
+      mappings.push(null);
+    }
   }
 
   // Revalidate every mapping after the last upload. This prevents a long
@@ -1380,7 +1484,8 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
       attachmentIndex < mappings.length;
       attachmentIndex += 1
     ) {
-      const mapping = mappings[attachmentIndex]!;
+      const mapping = mappings[attachmentIndex];
+      if (!mapping) continue;
       const source = sources[attachmentIndex]!;
       const durableAttempt = existingAttempt({
         claim,
@@ -1485,19 +1590,43 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     turnId: claim.turn.id,
     leaseToken: claim.leaseToken,
   });
-  const finalized = await finalizeKnowledgeBaseManusV2AttachmentMappings({
-    userId: claim.turn.userId,
-    turnId: claim.turn.id,
-    leaseToken: claim.leaseToken,
-    mappings: finalMappings,
-    minimumUsableSeconds: FINAL_MINIMUM_USABLE_SECONDS,
+  if (inlineAttachments.size === 0) {
+    const finalized = await finalizeKnowledgeBaseManusV2AttachmentMappings({
+      userId: claim.turn.userId,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      mappings: finalMappings,
+      minimumUsableSeconds: FINAL_MINIMUM_USABLE_SECONDS,
+    });
+    claim.turn.attachmentFileIds = [...finalized.attachmentFileIds];
+    claim.turn.manusV2AttachmentMappings = {
+      ...finalized.manusV2AttachmentMappings,
+    };
+  } else {
+    // Inline delivery is a provider request representation, not a rewrite of
+    // the frozen Dashboard source ledger. Every non-inline slot still has the
+    // same ready mapping proof; the create/send at-most-once fence is consumed
+    // only after the complete mixed body hash is computed by the caller.
+    const expectedReady = sources.length - inlineAttachments.size;
+    if (finalMappings.length !== expectedReady) {
+      throw localPreparationError(
+        "Manus v2 内联系统附件降级缺少其余附件的完整可用性证明",
+      );
+    }
+  }
+  const readyByIndex = new Map(
+    finalMappings.map((mapping) => [mapping.attachmentIndex, mapping]),
+  );
+  return sources.map((source, attachmentIndex) => {
+    const inline = inlineAttachments.get(attachmentIndex);
+    if (inline) return inline;
+    const mapping = readyByIndex.get(attachmentIndex);
+    if (!mapping) {
+      throw localPreparationError("Manus v2 附件最终映射缺失");
+    }
+    return {
+      file_id: mapping.upstreamFileId,
+      filename: mapping.filename,
+    };
   });
-  claim.turn.attachmentFileIds = [...finalized.attachmentFileIds];
-  claim.turn.manusV2AttachmentMappings = {
-    ...finalized.manusV2AttachmentMappings,
-  };
-  return finalMappings.map((mapping) => ({
-    file_id: mapping.upstreamFileId,
-    filename: mapping.filename,
-  }));
 }

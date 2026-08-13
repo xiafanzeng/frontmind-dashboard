@@ -827,19 +827,23 @@ export type KnowledgeBaseRequestError = Error & {
 const KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS = 4;
 const KNOWLEDGE_BASE_REQUEST_MAX_RETRY_DELAY_MS = 10_000;
 
-export async function reserveKnowledgeBaseStart(input: {
-  conversationId: string;
-  clientRequestId: string;
-  expectedResetRevision: number;
-  companyName: string;
-  companyWebsite?: string;
-  operatorNotes?: string;
-  attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
-}) {
+export async function reserveKnowledgeBaseStart(
+  input: {
+    conversationId: string;
+    clientRequestId: string;
+    expectedResetRevision: number;
+    companyName: string;
+    companyWebsite?: string;
+    operatorNotes?: string;
+    attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+  },
+  signal?: AbortSignal,
+) {
   const response = await fetch("/api/knowledge-base/start/reserve", {
     method: "POST",
     headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
     credentials: "include",
+    signal,
     body: JSON.stringify(input),
   });
   if (!response.ok) {
@@ -858,6 +862,32 @@ export async function reserveKnowledgeBaseStart(input: {
       ? knowledgeBaseObservationFromPayload(payload)
       : undefined,
   };
+}
+
+/**
+ * Releases only a start reservation which is still waiting for browser
+ * bodies. The server repeats the reset-revision and no-provider proofs under
+ * row locks; this client call is never authority by itself.
+ */
+export async function cancelKnowledgeBaseStartReservation(input: {
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  expectedResetRevision: number;
+}) {
+  const response = await fetch("/api/knowledge-base/start/cancel", {
+    method: "POST",
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    throw await knowledgeBaseRequestError(
+      response,
+      `取消本批次失败（${response.status}）`,
+    );
+  }
+  return (await response.json()) as { cancelled: true };
 }
 
 function isTransientKnowledgeBaseRequestError(error: unknown) {
@@ -1407,6 +1437,7 @@ export type ManagedUploadDiscovery = {
   uploads: ManagedUploadDiscoveryItem[];
   reservation: {
     clientRequestId: string;
+    sourceResetRevision: number;
     attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
     stagedAttachmentCount: number;
   };
@@ -1552,6 +1583,9 @@ function parseManagedUploadDiscoveryPayload(input: {
     typeof reservation.clientRequestId !== "string" ||
     !reservation.clientRequestId ||
     reservation.clientRequestId !== reservation.clientRequestId.trim() ||
+    typeof reservation.sourceResetRevision !== "number" ||
+    !Number.isSafeInteger(reservation.sourceResetRevision) ||
+    reservation.sourceResetRevision < 0 ||
     typeof reservation.stagedAttachmentCount !== "number" ||
     !Number.isSafeInteger(reservation.stagedAttachmentCount) ||
     reservation.stagedAttachmentCount < 0 ||
@@ -1651,6 +1685,7 @@ function parseManagedUploadDiscoveryPayload(input: {
     uploads,
     reservation: {
       clientRequestId,
+      sourceResetRevision: reservation.sourceResetRevision,
       attachmentManifest,
       stagedAttachmentCount: reservation.stagedAttachmentCount,
     },

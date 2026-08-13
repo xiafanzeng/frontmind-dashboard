@@ -907,6 +907,105 @@ describe("ManusV2Client", () => {
     ]);
   });
 
+  it("builds the documented inline file_data part and rejects malformed base64", () => {
+    const encoded = Buffer.from("pinned system Skill bytes").toString("base64");
+    expect(
+      buildManusV2MessageContent("full business prompt", [
+        {
+          file_data: `data:application/zip;base64,${encoded}`,
+          filename: "socratic-kb-builder.skill.zip",
+          mime_type: "application/zip",
+        },
+      ]),
+    ).toEqual([
+      { type: "text", text: "full business prompt" },
+      {
+        type: "file",
+        file_data: `data:application/zip;base64,${encoded}`,
+        filename: "socratic-kb-builder.skill.zip",
+        mime_type: "application/zip",
+      },
+    ]);
+    expect(() =>
+      buildManusV2MessageContent("prompt", [
+        {
+          file_data: "data:application/zip;base64,***",
+          filename: "broken.skill.zip",
+          mime_type: "application/zip",
+        },
+      ]),
+    ).toThrow(/inline attachment/u);
+  });
+
+  it.each([
+    ["unbound task.create", "create"],
+    ["bound task.sendMessage", "send"],
+  ] as const)(
+    "dispatches the rejected-system-file inline fallback once through %s with the full snapshot prompt",
+    async (_label, method) => {
+      const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+        status: 200,
+        data: {
+          ok: true,
+          request_id: `request-${method}`,
+          task_id: "canonical-task",
+          ...(method === "create"
+            ? { task_url: "https://manus.im/app/canonical-task" }
+            : {}),
+        },
+      });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+      const snapshotPrompt = [
+        "# FrontMind local canonical rehydrate",
+        "snapshotSha256=" + "a".repeat(64),
+        '{"revision":41,"leafId":"industry-cases"}',
+        "Confirm the current node and continue.",
+      ].join("\n");
+      const attachment = {
+        file_data: `data:application/zip;base64,${Buffer.from("pinned system Skill bytes").toString("base64")}`,
+        filename: "socratic-kb-builder.skill.zip",
+        mime_type: "application/zip",
+      } as const;
+
+      if (method === "create") {
+        await client.createTask({
+          prompt: snapshotPrompt,
+          title: "FrontMind KB build g1",
+          attachments: [attachment],
+        });
+      } else {
+        await client.sendMessage({
+          taskId: "canonical-task",
+          prompt: snapshotPrompt,
+          attachments: [attachment],
+        });
+      }
+
+      expect(post).toHaveBeenCalledOnce();
+      expect(post.mock.calls[0]?.[0]).toBe(
+        method === "create"
+          ? "https://api.example.test/v2/task.create"
+          : "https://api.example.test/v2/task.sendMessage",
+      );
+      expect(post.mock.calls[0]?.[1]).toMatchObject({
+        message: {
+          content: [
+            { type: "text", text: snapshotPrompt },
+            {
+              type: "file",
+              file_data: attachment.file_data,
+              filename: attachment.filename,
+              mime_type: attachment.mime_type,
+            },
+          ],
+        },
+      });
+    },
+  );
+
   it("pins every structured-result coordinate in the schema and in-band prompt", () => {
     const schema = buildManusV2KnowledgeBaseStructuredOutputSchema(
       operationContract,

@@ -268,6 +268,155 @@ beforeEach(() => {
 });
 
 describe("Manus v2 complete attachment-set recovery", () => {
+  it("falls back only a rejected server Skill to inline file_data and keeps user files strict", async () => {
+    const { claim, sources } = testClaim();
+    const [skill, user] = sources;
+    claim.preparedDispatch.requestBody.attachments = [
+      {
+        file_id: skill!.sourceFileId,
+        filename: "socratic-kb-builder.skill.zip",
+      },
+      { file_id: user!.sourceFileId, filename: user!.filename },
+    ];
+    claim.turn.attachmentFileIds = [skill!.sourceFileId, user!.sourceFileId];
+    claim.turn.generatedAttachmentReservations = {
+      "skill:0": {
+        schemaVersion: 1,
+        role: "skill",
+        attachmentIndex: 0,
+        requestHash: "a".repeat(64),
+        idempotencyKeyHash: "b".repeat(64),
+        filename: "socratic-kb-builder.skill.zip",
+        mimeType: "application/zip",
+        sizeBytes: skill!.sizeBytes,
+        contentSha256: skill!.contentSha256,
+        localStorageKey: skill!.localStorageKey,
+        status: "reserved",
+        reservedAt: "2026-08-12T00:00:00.000Z",
+      },
+    };
+    const rejectedSkillKey = `g1:0:${skill!.contentSha256}:${skill!.sizeBytes}`;
+    claim.turn.manusV2AttachmentAttempts = {
+      [rejectedSkillKey]: {
+        schemaVersion: 1,
+        mappingKey: rejectedSkillKey,
+        buildGeneration: 1,
+        attachmentIndex: 0,
+        sourceFileId: skill!.sourceFileId,
+        localStorageKey: skill!.localStorageKey,
+        contentSha256: skill!.contentSha256,
+        sizeBytes: skill!.sizeBytes,
+        filename: "socratic-kb-builder.skill.zip",
+        mimeType: "application/zip",
+        providerGeneration: 1,
+        state: "create_rejected",
+        upstreamFileId: null,
+        uploadExpiresAt: null,
+        code: "provider_specific_rejection_code",
+        recordedAt: "2026-08-12T00:00:00.000Z",
+      },
+    };
+    claim.turn.manusV2AttachmentMappings = {
+      [`g1:1:${user!.contentSha256}:${user!.sizeBytes}`]: mappingFor(
+        { ...user!, index: 1 },
+        1,
+        Math.floor(Date.now() / 1_000) + 60 * 60,
+      ),
+    };
+    attachmentLedgerMocks.load.mockResolvedValue({
+      turn: claim.turn,
+      preparedDispatch: claim.preparedDispatch,
+    });
+    localSourceMocks.read.mockImplementation(async ({ storageKey }) => {
+      const source = [skill, user].find(
+        (candidate) => candidate!.localStorageKey === storageKey,
+      );
+      return source!.bytes;
+    });
+    const expiry = Math.floor(Date.now() / 1_000) + 60 * 60;
+    vi.spyOn(ManusV2Client.prototype, "fileDetail").mockResolvedValue({
+      fileId: `${user!.filename}-g1`,
+      filename: user!.filename,
+      status: "uploaded",
+      bytes: user!.sizeBytes,
+      expiresAt: expiry,
+      contentType: user!.mimeType,
+      requestId: "detail-user",
+    } as any);
+    const upload = vi.spyOn(ManusV2Client.prototype, "uploadFile");
+
+    const result = await ensureKnowledgeBaseManusV2Attachments({
+      claim,
+      credential: {
+        id: claim.turn.apiCredentialId!,
+        userId: claim.turn.userId,
+        apiKey: "synthetic-manus-key",
+      },
+      baseUrl: "https://api.manus.test",
+    });
+
+    expect(result[0]).toEqual({
+      file_data: `data:application/zip;base64,${skill!.bytes.toString("base64")}`,
+      filename: "socratic-kb-builder.skill.zip",
+      mime_type: "application/zip",
+    });
+    expect(result[1]).toEqual({
+      file_id: `${user!.filename}-g1`,
+      filename: user!.filename,
+    });
+    expect(upload).not.toHaveBeenCalled();
+    expect(attachmentLedgerMocks.finalize).not.toHaveBeenCalled();
+  });
+
+  it("never inlines a rejected customer attachment", async () => {
+    const { claim, sources } = testClaim();
+    const user = sources[0]!;
+    claim.preparedDispatch.requestBody.attachments =
+      claim.preparedDispatch.requestBody.attachments.slice(0, 1);
+    claim.turn.attachmentFileIds = [user.sourceFileId];
+    claim.recoveryMetadata.attachments =
+      claim.recoveryMetadata.attachments.slice(0, 1);
+    claim.recoveryMetadata.attachmentManifest =
+      claim.recoveryMetadata.attachmentManifest.slice(0, 1);
+    claim.recoveryMetadata.attachmentSourceProofs =
+      claim.recoveryMetadata.attachmentSourceProofs.slice(0, 1);
+    claim.turn.manusV2AttachmentAttempts = {
+      rejectedUser: {
+        ...attemptFor(
+          user,
+          1,
+          "put_accepted",
+          Math.floor(Date.now() / 1_000) + 60 * 60,
+        ),
+        state: "create_rejected",
+        upstreamFileId: null,
+        uploadExpiresAt: null,
+        code: "permission_denied",
+      },
+    };
+    attachmentLedgerMocks.load.mockResolvedValue({
+      turn: claim.turn,
+      preparedDispatch: claim.preparedDispatch,
+    });
+    localSourceMocks.read.mockResolvedValue(user.bytes);
+
+    const upload = vi
+      .spyOn(ManusV2Client.prototype, "uploadFile")
+      .mockRejectedValue(new Error("customer upload remains strict"));
+    await expect(
+      ensureKnowledgeBaseManusV2Attachments({
+        claim,
+        credential: {
+          id: claim.turn.apiCredentialId!,
+          userId: claim.turn.userId,
+          apiKey: "synthetic-manus-key",
+        },
+        baseUrl: "https://api.manus.test",
+      }),
+    ).rejects.toThrow(/customer upload remains strict/u);
+    expect(upload).toHaveBeenCalledOnce();
+  });
+
   it("resumes a durable candidate crash before its first PUT without POST or a replacement generation", async () => {
     const { claim, sources } = testClaim();
     const source = sources[0]!;

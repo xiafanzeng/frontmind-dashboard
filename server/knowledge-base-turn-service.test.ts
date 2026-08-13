@@ -21,6 +21,7 @@ import {
   KnowledgeBaseTurnReservationError,
   beginKnowledgeBaseManusV2Dispatch,
   bindKnowledgeBaseManusV2Submission,
+  cancelIncompleteKnowledgeBaseStart,
   cancelUnpreparedKnowledgeBaseTurn,
   completeKnowledgeBaseGeneratedAttachment,
   completeKnowledgeBaseManusV2AnchorHandoff,
@@ -335,6 +336,8 @@ function createTurnServiceExecutor(input: {
               store.resources.push(values);
             } else if (table === knowledgeBaseResetStates) {
               store.resetRevision = Number(values.revision ?? 0);
+            } else if (table === knowledgeBaseConversationRetentionTombstones) {
+              store.retainedTombstones.push(values);
             }
             return {
               onDuplicateKeyUpdate: async () => undefined,
@@ -369,6 +372,23 @@ function createTurnServiceExecutor(input: {
               return [{ affectedRows: 1 }];
             },
           }),
+        }),
+        delete: (table: unknown) => ({
+          where: async () => {
+            if (table === knowledgeBaseBuilds) {
+              store.build = null;
+              store.nodes = [];
+              store.turns = store.turns.map((candidate) => ({
+                ...candidate,
+                buildId: null,
+              }));
+            } else if (table === conversations) {
+              store.conversation = null;
+              store.messages = [];
+              store.turns = [];
+            }
+            return [{ affectedRows: 1 }];
+          },
         }),
       };
       try {
@@ -5792,6 +5812,337 @@ describe("knowledge-base atomic start reservation", () => {
     }
   });
 
+  it("cancels an incomplete start reservation only at its exact reset revision", async () => {
+    const previous = process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+    process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = "true";
+    const attachmentManifest = [
+      {
+        itemId: "starter-item-1",
+        ordinal: 1,
+        total: 2,
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 1,
+        sha256: "a".repeat(64),
+      },
+      {
+        itemId: "starter-item-2",
+        ordinal: 2,
+        total: 2,
+        filename: "profile.docx",
+        sizeBytes: 24,
+        mimeType:
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        lastModified: 2,
+        sha256: "b".repeat(64),
+      },
+    ];
+    const { executor, store } = createTurnServiceExecutor({
+      resetRevision: 0,
+      resources: [
+        {
+          id: "resource-file-facts",
+          userId: 1,
+          apiCredentialId: "credential-1",
+          projectAssignmentId: null,
+          kind: "file",
+          upstreamId: "file-facts",
+          conversationId: null,
+          contentDeletedAt: null,
+        },
+      ],
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns],
+        [(current) => current.turns, (current) => current.turns],
+      ],
+    });
+    try {
+      const started = await reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          userAttachmentCount: 2,
+          expectedAttachmentCount: 4,
+          deferDispatchUntilAttachments: true,
+          clientAttachmentManifest: attachmentManifest,
+          requestPayload: {
+            ...startInput.requestPayload,
+            attachments: [],
+            attachmentManifest,
+          },
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            attachments: [],
+            attachmentManifest,
+            deferredClientAttachments: true,
+          },
+        },
+        executor,
+      );
+      const originalOperationKey = started.reservation.turn.operationKey;
+
+      await stageKnowledgeBaseDeferredTurnAttachment(
+        {
+          userId: 1,
+          buildId: started.build.id,
+          turnId: started.reservation.turn.id,
+          clientRequestId: started.reservation.turn.clientRequestId,
+          clientAttachmentManifest: attachmentManifest,
+          expectedResetRevision: 0,
+          index: 0,
+          attachment: { file_id: "file-facts", filename: "facts.pdf" },
+        },
+        executor,
+      );
+      expect(store.turns[0]).toMatchObject({
+        status: "queued",
+        upstreamTaskId: null,
+        leaseExpiresAt: null,
+        attachmentFileIds: ["file-facts"],
+        metadata: {
+          awaitingClientAttachments: true,
+          createAttemptState: "not_sent",
+          providerAttemptState: "not_sent",
+        },
+      });
+
+      const cancelledAt = new Date("2026-08-01T00:00:30.000Z");
+      const cancelled = await cancelIncompleteKnowledgeBaseStart(
+        {
+          userId: 1,
+          conversationId: startInput.conversationId,
+          turnId: started.reservation.turn.id,
+          clientRequestId: started.reservation.turn.clientRequestId,
+          expectedResetRevision: 0,
+          now: cancelledAt,
+        },
+        executor,
+      );
+
+      expect(cancelled).toMatchObject({
+        id: started.reservation.turn.id,
+        status: "cancelled",
+        upstreamTaskId: null,
+        completedAt: cancelledAt,
+        leaseExpiresAt: null,
+        awaitingClientAttachments: false,
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+      });
+      expect(cancelled.operationKey).not.toBe(originalOperationKey);
+      expect(store.resources[0]).toMatchObject({
+        upstreamId: "file-facts",
+        conversationId: null,
+      });
+      expect(store.retainedTombstones).toEqual([
+        expect.objectContaining({
+          userId: 1,
+          publicConversationId: startInput.conversationId,
+          resetAt: cancelledAt,
+        }),
+      ]);
+      expect(store).toMatchObject({
+        build: null,
+        conversation: null,
+        turns: [],
+        messages: [],
+      });
+
+      const freshConversationId = "conversation-after-cancel";
+      const freshExecutor = createTurnServiceExecutor({
+        resetRevision: 0,
+        resources: store.resources,
+        turnSelections: [[[], []]],
+      });
+      const restarted = await reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          conversationId: freshConversationId,
+          clientRequestId: "start-request-after-cancel",
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            conversationId: freshConversationId,
+          },
+        },
+        freshExecutor.executor,
+      );
+      expect(restarted).toMatchObject({
+        createdBuild: true,
+        reservation: {
+          state: "acquired",
+          turn: {
+            operationType: "start",
+            upstreamTaskId: null,
+          },
+        },
+      });
+      expect(freshExecutor.store.build?.conversationId).toBe(
+        freshConversationId,
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+      } else {
+        process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = previous;
+      }
+    }
+  });
+
+  it("rejects incomplete start cancellation after the reset revision advances", async () => {
+    const previous = process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+    process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = "true";
+    const attachmentManifest = [
+      {
+        itemId: "starter-item-stale",
+        ordinal: 1,
+        total: 1,
+        filename: "stale.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 1,
+        sha256: "c".repeat(64),
+      },
+    ];
+    const { executor, store } = createTurnServiceExecutor({
+      resetRevision: 0,
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns, (current) => current.turns],
+      ],
+    });
+    try {
+      const started = await reserveKnowledgeBaseStartBuild(
+        {
+          ...startInput,
+          userAttachmentCount: 1,
+          expectedAttachmentCount: 3,
+          deferDispatchUntilAttachments: true,
+          clientAttachmentManifest: attachmentManifest,
+          requestPayload: {
+            ...startInput.requestPayload,
+            attachments: [],
+            attachmentManifest,
+          },
+          recoveryMetadata: {
+            ...startInput.recoveryMetadata,
+            attachments: [],
+            attachmentManifest,
+            deferredClientAttachments: true,
+          },
+        },
+        executor,
+      );
+      store.resetRevision = 1;
+      const beforeCancellation = structuredClone(store);
+
+      await expect(
+        cancelIncompleteKnowledgeBaseStart(
+          {
+            userId: 1,
+            conversationId: startInput.conversationId,
+            turnId: started.reservation.turn.id,
+            clientRequestId: started.reservation.turn.clientRequestId,
+            expectedResetRevision: 0,
+          },
+          executor,
+        ),
+      ).rejects.toMatchObject({
+        code: "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+      });
+      expect(store).toEqual(beforeCancellation);
+      expect(store.turns[0]).toMatchObject({
+        status: "queued",
+        upstreamTaskId: null,
+        metadata: {
+          awaitingClientAttachments: true,
+          sourceResetRevision: 0,
+        },
+      });
+      expect(store.build?.activeTurnId).toBe(started.reservation.turn.id);
+    } finally {
+      if (previous === undefined) {
+        delete process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
+      } else {
+        process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = previous;
+      }
+    }
+  });
+
+  it("rejects start cancellation when the staged and recovery ledgers diverge", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      resetRevision: 0,
+      turnSelections: [[[], []], [(current) => current.turns]],
+    });
+    const started = await reserveKnowledgeBaseStartBuild(startInput, executor);
+    store.turns[0].attachmentFileIds = ["unknown-extra-file"];
+    const before = structuredClone(store);
+
+    await expect(
+      cancelIncompleteKnowledgeBaseStart(
+        {
+          userId: 1,
+          conversationId: startInput.conversationId,
+          turnId: started.reservation.turn.id,
+          clientRequestId: started.reservation.turn.clientRequestId,
+          expectedResetRevision: 0,
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toEqual(before);
+  });
+
+  it("rejects confirm attachment turns through the customer start-cancel authority", async () => {
+    const build = {
+      id: identity.buildId,
+      userId: 1,
+      conversationId: "conversation-1",
+      generation: identity.buildGeneration,
+      stateEpoch: 2,
+      revision: identity.expectedRevision,
+      currentLeafId: identity.expectedLeafId,
+      status: "confirming",
+      activeTurnId: turn().id,
+      upstreamTaskId: "parent-task",
+    };
+    const confirmTurn = turn({
+      status: "queued",
+      leaseExpiresAt: null,
+      metadata: {
+        awaitingClientAttachments: true,
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+      },
+    });
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation: {
+        id: "u1:conversation-1",
+        userId: 1,
+        version: 1,
+        status: "running",
+      },
+      turns: [confirmTurn],
+      turnSelections: [[(current) => current.turns]],
+    });
+    const before = structuredClone(store);
+
+    await expect(
+      cancelIncompleteKnowledgeBaseStart(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          turnId: confirmTurn.id,
+          clientRequestId: confirmTurn.clientRequestId,
+          expectedResetRevision: 0,
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store).toEqual(before);
+  });
+
   it("pins a new build and its first turn to legacy only while the Manus v2 writer is explicitly disabled", async () => {
     const previous = process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
     process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = "false";
@@ -7844,6 +8195,233 @@ describe("knowledge-base attachment-first turn reservation", () => {
       turn: { createAttemptState: "not_sent" },
     });
   });
+
+  it("automatically reclaims the exact failed system-file create rejection without changing operation or charge authority", async () => {
+    const rejected = turn({
+      id: "00000000-0000-4000-8000-000000000036",
+      buildId: build.id,
+      buildGeneration: build.generation,
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+      operationKey: "kbv2_exact_inline_recovery",
+      status: "failed",
+      errorCode: "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
+      errorMessage: "system Skill file.create rejected",
+      completedAt: new Date("2026-08-01T00:00:01.000Z"),
+      leaseExpiresAt: null,
+      attachmentFileIds: ["kb-local-skill", "kb-local-instructions"],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 0,
+        createAttemptState: "not_sent",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+        chargeDisposition: "reuse_original_no_charge",
+        recovery: { kind: "turn", conversationId: build.conversationId },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "full frozen business prompt",
+            agentProfile: "manus-1.6-max",
+            attachments: [
+              {
+                file_id: "kb-local-skill",
+                filename: "socratic-kb-builder.skill.zip",
+              },
+              {
+                file_id: "kb-local-instructions",
+                filename: "frontmind-kb-server-instructions.txt",
+              },
+            ],
+          },
+          bodySha256: "f".repeat(64),
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
+        manusV2AttachmentAttempts: {
+          rejectedSkill: {
+            schemaVersion: 1,
+            mappingKey: "rejectedSkill",
+            buildGeneration: build.generation,
+            attachmentIndex: 0,
+            sourceFileId: "kb-local-skill",
+            localStorageKey: "knowledge-base/build-sources/skill.bin",
+            contentSha256: "a".repeat(64),
+            sizeBytes: 48_000,
+            filename: "socratic-kb-builder.skill.zip",
+            mimeType: "application/zip",
+            providerGeneration: 1,
+            state: "create_rejected",
+            upstreamFileId: null,
+            uploadExpiresAt: null,
+            code: "MANUS_V2_FILE_CREATE_any_provider_code",
+            recordedAt: "2026-08-01T00:00:01.000Z",
+          },
+        },
+        generatedAttachmentReservations: {
+          "skill:0": {
+            schemaVersion: 1,
+            role: "skill",
+            attachmentIndex: 0,
+            requestHash: "c".repeat(64),
+            idempotencyKeyHash: "d".repeat(64),
+            filename: "socratic-kb-builder.skill.zip",
+            mimeType: "application/zip",
+            sizeBytes: 48_000,
+            contentSha256: "a".repeat(64),
+            localStorageKey: "knowledge-base/build-sources/skill.bin",
+            status: "reserved",
+            reservedAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+    const selection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === rejected.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build: {
+        ...build,
+        activeTurnId: rejected.id,
+        status: "protocol_error",
+        protocolErrorCode: rejected.errorCode,
+        protocolError: rejected.errorMessage,
+      },
+      conversation: { ...conversation, status: "failed" },
+      turns: [rejected],
+      turnSelections: [[selection]],
+    });
+
+    const claimed = await claimKnowledgeBaseTurnForRecovery(
+      {
+        turnId: rejected.id,
+        now: new Date("2026-08-01T00:00:02.000Z"),
+      },
+      executor,
+    );
+
+    expect(claimed).toMatchObject({
+      turn: {
+        id: rejected.id,
+        operationKey: rejected.operationKey,
+        status: "running",
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+      },
+    });
+    expect(claimed?.recoveryMetadata).toMatchObject({ kind: "turn" });
+    expect(store.turns).toHaveLength(1);
+    expect(store.turns[0]?.metadata).toMatchObject({
+      chargeDisposition: "reuse_original_no_charge",
+      manusV2AttachmentAttempts: {
+        rejectedSkill: { state: "create_rejected", upstreamFileId: null },
+      },
+    });
+    expect(store.build).toMatchObject({
+      status: "confirming",
+      protocolErrorCode: null,
+      activeTurnId: rejected.id,
+    });
+  });
+
+  it.each([
+    ["customer attachment", null],
+    ["prefill", "prefill"],
+    ["finalization", "finalization"],
+    ["hash mismatch", "skill-mismatched"],
+  ])(
+    "does not reclaim rejected %s as an inline system file",
+    async (_label, role) => {
+      const rejected = turn({
+        id: "00000000-0000-4000-8000-000000000037",
+        buildId: build.id,
+        buildGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: build.currentLeafId,
+        status: "failed",
+        errorCode: "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
+        completedAt: new Date("2026-08-01T00:00:01.000Z"),
+        leaseExpiresAt: null,
+        attachmentFileIds: ["source-file"],
+        metadata: {
+          attachmentsFrozen: true,
+          expectedAttachmentCount: 1,
+          createAttemptState: "not_sent",
+          providerProtocol: "manus_v2",
+          providerAttemptState: "not_sent",
+          recovery: { kind: "turn" },
+          preparedDispatch: {
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "frozen prompt",
+              agentProfile: "manus-1.6-max",
+              attachments: [{ file_id: "source-file", filename: "source.bin" }],
+            },
+            bodySha256: "f".repeat(64),
+            preparedAt: "2026-08-01T00:00:00.000Z",
+          },
+          ...(role
+            ? {
+                generatedAttachmentReservations: {
+                  [`${role}:0`]: {
+                    schemaVersion: 1,
+                    role: role === "skill-mismatched" ? "skill" : role,
+                    attachmentIndex: 0,
+                    requestHash: "a".repeat(64),
+                    idempotencyKeyHash: "b".repeat(64),
+                    filename: "source.bin",
+                    mimeType: "application/octet-stream",
+                    sizeBytes: 10,
+                    contentSha256:
+                      role === "skill-mismatched"
+                        ? "e".repeat(64)
+                        : "c".repeat(64),
+                    status: "reserved",
+                    reservedAt: "2026-08-01T00:00:00.000Z",
+                  },
+                },
+              }
+            : {}),
+          manusV2AttachmentAttempts: {
+            rejected: {
+              schemaVersion: 1,
+              mappingKey: "rejected",
+              buildGeneration: build.generation,
+              attachmentIndex: 0,
+              sourceFileId: "source-file",
+              localStorageKey: "knowledge-base/build-sources/source.bin",
+              contentSha256: "c".repeat(64),
+              sizeBytes: 10,
+              filename: "source.bin",
+              mimeType: "application/octet-stream",
+              providerGeneration: 1,
+              state: "create_rejected",
+              upstreamFileId: null,
+              uploadExpiresAt: null,
+              code: "permission_denied",
+              recordedAt: "2026-08-01T00:00:01.000Z",
+            },
+          },
+        },
+      });
+      const selection = (store: TurnServiceStore) =>
+        store.turns.filter((candidate) => candidate.id === rejected.id);
+      const { executor } = createTurnServiceExecutor({
+        build: {
+          ...build,
+          activeTurnId: rejected.id,
+          status: "protocol_error",
+        },
+        conversation: { ...conversation },
+        turns: [rejected],
+        turnSelections: [[selection]],
+      });
+      await expect(
+        claimKnowledgeBaseTurnForRecovery({ turnId: rejected.id }, executor),
+      ).resolves.toBeNull();
+    },
+  );
 });
 
 describe("acknowledged manual Logo rejection", () => {
