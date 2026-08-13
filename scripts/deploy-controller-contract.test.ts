@@ -251,6 +251,10 @@ async function harness(options: HarnessOptions = {}) {
       'install -m 0600 "$source" "$temporary"',
     )
     .replace(
+      'stack_lock_file="/run/lock/frontmind-production-stack.lock"',
+      `stack_lock_file="${path.join(root, "stack.lock")}"`,
+    )
+    .replace(
       'lock_file="/run/lock/frontmind-deploy-${service}.lock"',
       `lock_file="${path.join(root, "deploy.lock")}"`,
     )

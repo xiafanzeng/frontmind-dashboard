@@ -533,7 +533,7 @@ jobs:
           printf '%s\n%s\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |
             ssh -T -i ~/.ssh/dashboard_deploy -p 22 \
               -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-              frontmind-deploy@149.88.85.148 \
+              -- frontmind-deploy@149.88.85.148 \
               "--kb-manus-v2-rollout $PHASE ghcr.io/xiafanzeng/frontmind-dashboard@$EXPECTED_IMAGE_DIGEST $EXPECTED_SOURCE_SHA"
       - name: Independently prove public exact production phase
         shell: bash

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# frontmind-production-controller-version: 2
+# frontmind-production-controller-version: 3
 set -Eeuo pipefail
 umask 077
 
@@ -252,7 +252,10 @@ docker compose version >/dev/null
 
 mkdir -p -m 0700 "$STATE_DIR"
 state_file="${STATE_DIR}/state.json"
+stack_lock_file="/run/lock/frontmind-production-stack.lock"
 lock_file="/run/lock/frontmind-deploy-${service}.lock"
+exec 8>"$stack_lock_file"
+flock -n 8 || die "DEPLOY_STACK_ACTIVE" 75
 exec 9>"$lock_file"
 flock -n 9 || die "DEPLOY_ALREADY_RUNNING:${service}" 75
 

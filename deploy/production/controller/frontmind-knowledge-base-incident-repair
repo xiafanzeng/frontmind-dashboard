@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly CONFIG_FILE="/etc/frontmind-deploy/services/dashboard.env"
+readonly STATE_FILE="/var/lib/frontmind-deploy/dashboard/state.json"
+readonly STACK_LOCK_FILE="/run/lock/frontmind-production-stack.lock"
+readonly DASHBOARD_LOCK_FILE="/run/lock/frontmind-deploy-dashboard.lock"
+readonly CLI_PATH="/app/dist/knowledge-base-incident-repair-cli.js"
+
+die() {
+  printf '%s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+root_only_file() {
+  local file="$1" owner mode
+  [[ -f $file && ! -L $file ]] || return 1
+  owner="$(stat -c '%u' "$file")"
+  mode="$(stat -c '%a' "$file")"
+  [[ $owner == "0" && $((8#$mode & 0077)) -eq 0 ]]
+}
+
+[[ $EUID -eq 0 ]] || die "KB_INCIDENT_REPAIR_REQUIRES_ROOT" 77
+for command in cosign curl docker flock jq mktemp stat; do
+  command -v "$command" >/dev/null 2>&1 \
+    || die "KB_INCIDENT_REPAIR_COMMAND_MISSING:${command}" 69
+done
+docker compose version >/dev/null 2>&1 \
+  || die "KB_INCIDENT_REPAIR_DOCKER_COMPOSE_REQUIRED" 69
+
+mode="${1:-}"
+case "$mode" in
+  preview)
+    [[ $# -eq 4 ]] || die "KB_INCIDENT_REPAIR_ARGUMENTS_REJECTED" 64
+    ;;
+  apply)
+    [[ $# -eq 6 ]] || die "KB_INCIDENT_REPAIR_ARGUMENTS_REJECTED" 64
+    ;;
+  *) die "KB_INCIDENT_REPAIR_MODE_REJECTED" 64 ;;
+esac
+[[ ${2:-} =~ ^--user-id=[1-9][0-9]{0,9}$ ]] \
+  || die "KB_INCIDENT_REPAIR_USER_ID_REJECTED" 64
+[[ ${3:-} =~ ^--conversation-id=.+$ && ${#3} -le 209 && ${3} != *$'\n'* && ${3} != *$'\r'* ]] \
+  || die "KB_INCIDENT_REPAIR_CONVERSATION_ID_REJECTED" 64
+[[ ${4:-} =~ ^--repair-kind=(legacy_skill_404_confirm|retained_upstream_create_3_start)$ ]] \
+  || die "KB_INCIDENT_REPAIR_KIND_REJECTED" 64
+if [[ $mode == "apply" ]]; then
+  [[ ${5:-} =~ ^--expected-state-sha256=[a-f0-9]{64}$ ]] \
+    || die "KB_INCIDENT_REPAIR_STATE_REJECTED" 64
+  [[ ${6:-} == "--reason-code=authorized_incident_recovery" ]] \
+    || die "KB_INCIDENT_REPAIR_REASON_REJECTED" 64
+fi
+
+# Lock order is shared-stack then Dashboard everywhere. The wrapper never
+# reaches the database while an application release, rollout or peer release
+# owns either production serialization boundary.
+exec 8>"$STACK_LOCK_FILE"
+flock -n 8 || die "KB_INCIDENT_REPAIR_STACK_ACTIVE" 75
+exec 9>"$DASHBOARD_LOCK_FILE"
+flock -n 9 || die "KB_INCIDENT_REPAIR_DASHBOARD_ACTIVE" 75
+
+root_only_file "$CONFIG_FILE" || die "KB_INCIDENT_REPAIR_CONFIG_REJECTED" 73
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+for name in IMAGE_REPOSITORY COSIGN_IDENTITY COSIGN_ISSUER COMPOSE_DIR \
+  COMPOSE_FILE COMPOSE_ENV_FILE IMAGE_ENV_FILE COMPOSE_SERVICE IMAGE_ENV_KEY \
+  LOCAL_READY_URL PUBLIC_READY_URL; do
+  [[ -n ${!name:-} ]] || die "KB_INCIDENT_REPAIR_CONFIG_MISSING:${name}" 73
+done
+[[ $IMAGE_REPOSITORY == "ghcr.io/xiafanzeng/frontmind-dashboard" \
+  && $COMPOSE_SERVICE == "dashboard" \
+  && $IMAGE_ENV_KEY == "FRONTMIND_DASHBOARD_IMAGE" ]] \
+  || die "KB_INCIDENT_REPAIR_CONFIG_IDENTITY_REJECTED" 73
+root_only_file "$COMPOSE_ENV_FILE" \
+  || die "KB_INCIDENT_REPAIR_COMPOSE_ENV_REJECTED" 73
+root_only_file "$IMAGE_ENV_FILE" \
+  || die "KB_INCIDENT_REPAIR_IMAGE_ENV_REJECTED" 73
+root_only_file "$STATE_FILE" || die "KB_INCIDENT_REPAIR_STATE_REJECTED" 73
+
+jq -e '
+  type == "object" and
+  (.currentDigest | type == "string" and test("^sha256:[a-f0-9]{64}$")) and
+  (.sourceSha | type == "string" and test("^[a-f0-9]{40}$")) and
+  (.journalHash | type == "string" and test("^[a-f0-9]{64}$")) and
+  .lastResult.status == "success"
+' "$STATE_FILE" >/dev/null || die "KB_INCIDENT_REPAIR_STATE_REJECTED" 73
+digest="$(jq -r '.currentDigest' "$STATE_FILE")"
+source_sha="$(jq -r '.sourceSha' "$STATE_FILE")"
+journal_hash="$(jq -r '.journalHash' "$STATE_FILE")"
+image="${IMAGE_REPOSITORY}@${digest}"
+[[ $(grep -Fxc -- "${IMAGE_ENV_KEY}=${image}" "$IMAGE_ENV_FILE" || true) == 1 \
+  && $(grep -Fxc -- "FRONTMIND_IMAGE_DIGEST=${digest}" "$IMAGE_ENV_FILE" || true) == 1 \
+  && $(grep -Fxc -- "FRONTMIND_SOURCE_SHA=${source_sha}" "$IMAGE_ENV_FILE" || true) == 1 ]] \
+  || die "KB_INCIDENT_REPAIR_IMAGE_STATE_MISMATCH" 73
+
+cosign verify \
+  --certificate-identity "$COSIGN_IDENTITY" \
+  --certificate-oidc-issuer "$COSIGN_ISSUER" \
+  "$image" >/dev/null 2>&1 \
+  || die "KB_INCIDENT_REPAIR_SIGNATURE_REJECTED" 77
+[[ $(docker image inspect "$image" \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}') == "$source_sha" ]] \
+  || die "KB_INCIDENT_REPAIR_IMAGE_REVISION_MISMATCH" 73
+
+compose_environment="$(mktemp)" \
+  || die "KB_INCIDENT_REPAIR_COMPOSE_ENV_CREATE_FAILED" 70
+cleanup() {
+  rm -f -- "$compose_environment" || true
+}
+trap cleanup EXIT
+cat "$COMPOSE_ENV_FILE" "$IMAGE_ENV_FILE" >"$compose_environment" \
+  || die "KB_INCIDENT_REPAIR_COMPOSE_ENV_CREATE_FAILED" 70
+chmod 0600 "$compose_environment"
+container_id="$(docker compose \
+  --project-directory "$COMPOSE_DIR" \
+  --env-file "$compose_environment" \
+  -f "$COMPOSE_FILE" ps -q "$COMPOSE_SERVICE")"
+[[ -n $container_id && $container_id != *$'\n'* ]] \
+  || die "KB_INCIDENT_REPAIR_CONTAINER_NOT_UNIQUE" 73
+[[ $(docker inspect --format '{{.State.Running}}' "$container_id") == "true" ]] \
+  || die "KB_INCIDENT_REPAIR_CONTAINER_NOT_RUNNING" 73
+[[ $(docker inspect --format '{{.Config.Image}}' "$container_id") == "$image" ]] \
+  || die "KB_INCIDENT_REPAIR_CONTAINER_IDENTITY_MISMATCH" 73
+
+ready_matches() {
+  jq -e --arg source "$source_sha" --arg digest "$digest" \
+    --arg journal "$journal_hash" '
+    .status == "ok" and
+    .build.sha == $source and .build.imageDigest == $digest and
+    .migration.status == "exact" and
+    .migration.journalHash == $journal and
+    .migration.schema.status == "exact" and
+    .configuration.knowledgeBaseManusV2Writer.enabled == true and
+    .configuration.knowledgeBaseManusV2Writer.newBuildProviderProtocol == "manus_v2" and
+    .configuration.knowledgeBaseManusV2ActiveMigration.enabled == false and
+    .knowledgeBase.schema.status == "ok" and
+    .knowledgeBase.writes.status == "writable"
+  ' >/dev/null
+}
+local_ready="$(curl --fail --silent --show-error --max-time 15 "$LOCAL_READY_URL" 2>/dev/null)" \
+  || die "KB_INCIDENT_REPAIR_LOCAL_READINESS_UNAVAILABLE" 75
+ready_matches <<<"$local_ready" \
+  || die "KB_INCIDENT_REPAIR_LOCAL_READINESS_REJECTED" 75
+public_ready="$(curl --fail --silent --show-error --max-time 15 "$PUBLIC_READY_URL" 2>/dev/null)" \
+  || die "KB_INCIDENT_REPAIR_PUBLIC_READINESS_UNAVAILABLE" 75
+ready_matches <<<"$public_ready" \
+  || die "KB_INCIDENT_REPAIR_PUBLIC_READINESS_REJECTED" 75
+unset local_ready public_ready
+
+docker exec --user 10001:10001 "$container_id" test -s "$CLI_PATH" >/dev/null 2>&1 \
+  || die "KB_INCIDENT_REPAIR_CLI_UNAVAILABLE" 73
+set +e
+result="$(docker exec --user 10001:10001 "$container_id" \
+  node "$CLI_PATH" "$@" 2>/dev/null)"
+cli_status=$?
+set -e
+[[ -n $result && $result != *$'\n'* ]] \
+  || die "KB_INCIDENT_REPAIR_OUTPUT_REJECTED" 70
+jq -e --arg mode "$mode" '
+  type == "object" and .schemaVersion == 1 and .mode == $mode and
+  (.success | type == "boolean") and
+  (.code | type == "string" and startswith("KB_INCIDENT_REPAIR_CLI_"))
+' <<<"$result" >/dev/null || die "KB_INCIDENT_REPAIR_OUTPUT_REJECTED" 70
+if [[ $mode == "apply" && $cli_status -eq 0 ]]; then
+  local_ready="$(curl --fail --silent --show-error --max-time 15 "$LOCAL_READY_URL" 2>/dev/null)" \
+    || die "KB_INCIDENT_REPAIR_POST_LOCAL_READINESS_UNAVAILABLE" 75
+  ready_matches <<<"$local_ready" \
+    || die "KB_INCIDENT_REPAIR_POST_LOCAL_READINESS_REJECTED" 75
+  public_ready="$(curl --fail --silent --show-error --max-time 15 "$PUBLIC_READY_URL" 2>/dev/null)" \
+    || die "KB_INCIDENT_REPAIR_POST_PUBLIC_READINESS_UNAVAILABLE" 75
+  ready_matches <<<"$public_ready" \
+    || die "KB_INCIDENT_REPAIR_POST_PUBLIC_READINESS_REJECTED" 75
+fi
+printf '%s\n' "$result"
+exit "$cli_status"

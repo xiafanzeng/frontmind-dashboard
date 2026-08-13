@@ -82,6 +82,9 @@ install -o root -g root -m 0700 \
 install -o root -g root -m 0700 \
   "$SCRIPT_DIR/controller/frontmind-bootstrap-state" \
   /usr/local/sbin/frontmind-bootstrap-state
+install -o root -g root -m 0700 \
+  "$SCRIPT_DIR/controller/frontmind-knowledge-base-incident-repair" \
+  /usr/local/sbin/frontmind-knowledge-base-incident-repair
 
 install_config_from_example_no_clobber \
   "$SCRIPT_DIR/controller/dashboard-compose.env.example" \
