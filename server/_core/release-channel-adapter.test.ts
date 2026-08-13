@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   applyReleaseChannelHeaders,
   assertReleaseChannelIdentity,
+  validateReleaseRuntimeEnvironment,
 } from "./release-channel-adapter";
 
 describe("Dashboard production runtime channel adapter", () => {
@@ -35,9 +37,28 @@ describe("Dashboard production runtime channel adapter", () => {
     ).toThrow("FRONTMIND_RUNTIME_RELEASE_CHANNEL_MISMATCH");
   });
 
+  it("rejects a conflicting configured runtime channel", () => {
+    expect(() =>
+      validateReleaseRuntimeEnvironment(
+        { FRONTMIND_RELEASE_CHANNEL: "development" },
+        buildSourceSha,
+      ),
+    ).toThrow("FRONTMIND_RUNTIME_RELEASE_CHANNEL_MISMATCH");
+  });
+
   it("does not add a production indexing prohibition", () => {
     const setHeader = vi.fn();
     applyReleaseChannelHeaders({ setHeader });
     expect(setHeader).not.toHaveBeenCalled();
+  });
+
+  it("does not import the executable release command module", () => {
+    const source = readFileSync(
+      "server/_core/release-channel-adapter.ts",
+      "utf8",
+    );
+    expect(source).toContain("production-runtime-validator.mjs");
+    expect(source).not.toContain("validate-production-runtime.mjs");
+    expect(source).not.toContain('from "../../scripts/release-channel.mjs"');
   });
 });

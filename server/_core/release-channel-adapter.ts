@@ -1,7 +1,4 @@
-import {
-  releasePresentation,
-  validateReleaseChannelRuntimeEnvironment,
-} from "../../scripts/release-channel.mjs";
+import { validateProductionRuntimeEnvironment } from "../../scripts/production-runtime-validator.mjs";
 
 declare const __FRONTMIND_RELEASE_CHANNEL__: string | undefined;
 
@@ -20,6 +17,14 @@ const compiledReleaseChannel =
     : "";
 
 export const applicationReleaseChannel = compiledReleaseChannel;
+
+// Keep the runtime adapter free of the executable release-channel module.
+// The production CLI is bundled into one file; importing a module with a
+// direct-entry command guard would otherwise execute that guard at startup.
+const releasePresentation = Object.freeze({
+  releaseChannel: "production",
+  preventIndexing: false,
+});
 
 export function assertReleaseChannelIdentity(
   runtimeIdentity: RuntimeIdentity,
@@ -42,7 +47,25 @@ export function validateReleaseRuntimeEnvironment(
   env: NodeJS.ProcessEnv,
   applicationBuildSha: string | null,
 ) {
-  const runtimeIdentity = validateReleaseChannelRuntimeEnvironment(env);
+  const configuredReleaseChannel = String(env.FRONTMIND_RELEASE_CHANNEL || "")
+    .trim()
+    .toLowerCase();
+  if (
+    configuredReleaseChannel &&
+    configuredReleaseChannel !== releasePresentation.releaseChannel
+  ) {
+    throw new Error("FRONTMIND_RUNTIME_RELEASE_CHANNEL_MISMATCH");
+  }
+  const productionIdentity = validateProductionRuntimeEnvironment(env);
+  const { buildSourceSha, imageDigest } = productionIdentity;
+  if (!buildSourceSha || !imageDigest) {
+    throw new Error("FRONTMIND_RUNTIME_IDENTITY_MISSING");
+  }
+  const runtimeIdentity = {
+    buildSourceSha,
+    imageDigest,
+    releaseChannel: releasePresentation.releaseChannel,
+  };
   assertReleaseChannelIdentity(runtimeIdentity, applicationBuildSha);
   return runtimeIdentity;
 }

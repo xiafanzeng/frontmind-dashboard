@@ -75,6 +75,7 @@ COPY --from=build --chown=10001:10001 /app/node_modules ./node_modules
 COPY --from=build --chown=10001:10001 /app/dist ./dist
 COPY --from=build --chown=10001:10001 /app/drizzle ./drizzle
 COPY --from=build --chown=10001:10001 /app/scripts/validate-production-runtime.mjs ./scripts/validate-production-runtime.mjs
+COPY --from=build --chown=10001:10001 /app/scripts/production-runtime-validator.mjs ./scripts/production-runtime-validator.mjs
 COPY --chown=0:0 deploy/production/dashboard/entrypoint.sh /usr/local/bin/frontmind-dashboard-entrypoint
 
 RUN chmod 0755 /usr/local/bin/frontmind-dashboard-entrypoint \
