@@ -85,6 +85,9 @@ export const knowledgeBaseRecoveryActions = [
   "fix_attachments",
   "reupload_logo",
   "regenerate_turn",
+  "resume_start_from_retained_sources",
+  "reselect_start_sources",
+  "create_new_canonical_from_snapshot",
   "contact_support",
 ] as const;
 

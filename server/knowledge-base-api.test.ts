@@ -1324,6 +1324,9 @@ describe("terminal anchor acknowledgement recovery", () => {
     deferOutputPending: vi.fn().mockResolvedValue(undefined),
     markAttention: vi.fn().mockResolvedValue(undefined),
     completeHandoff: vi.fn().mockResolvedValue(undefined),
+    locallySettle: vi
+      .fn()
+      .mockResolvedValue({ state: "observed", leaseExpiresAt: new Date() }),
   });
 
   it("sends one recovery only to the existing canonical task", async () => {
@@ -1460,6 +1463,82 @@ describe("terminal anchor acknowledgement recovery", () => {
       }),
     );
     expect(client.createTask).toBeUndefined();
+  });
+
+  it("locally settles a stable stopped event after one acknowledged recovery without another provider send", async () => {
+    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
+      operationToken: "operation-anchor",
+      turnId: "turn-terminal-anchor",
+      generation: 7,
+      baseRevision: 11,
+    });
+    const client = {
+      listAllMessages: vi.fn().mockResolvedValue([stopped]),
+      sendMessage: vi.fn(),
+      updateTaskVisibility: vi.fn(),
+    };
+    const injected = dependencies(client);
+    injected.locallySettle.mockResolvedValue({ state: "settled" });
+    const recoveredClaim = claim({
+      errorRecoveryAttempt: 1,
+      errorRecoveryToken: recovery.recoveryToken,
+      errorRecoveryRequestHash: recovery.requestHash,
+      errorRecoveryAttemptState: "acknowledged",
+      errorRecoveryRequestId: "request-1",
+    });
+    recoveredClaim.turn.providerAttemptState = "output_pending";
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
+        {
+          claim: recoveredClaim,
+          credential: { apiKey: "test-key" } as any,
+          dependencies: injected as any,
+        },
+      ),
+    ).resolves.toMatchObject({ bound: true });
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(injected.locallySettle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: "turn-terminal-anchor",
+        taskId: "canonical-anchor-task",
+        terminalEventHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      }),
+    );
+    expect(injected.completeHandoff).not.toHaveBeenCalled();
+  });
+
+  it("does not locally settle outcome-unknown recovery or a stopped event for a different state", async () => {
+    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
+      operationToken: "operation-anchor",
+      turnId: "turn-terminal-anchor",
+      generation: 7,
+      baseRevision: 11,
+    });
+    const client = {
+      listAllMessages: vi.fn().mockResolvedValue([stopped]),
+      sendMessage: vi.fn(),
+      updateTaskVisibility: vi.fn(),
+    };
+    const injected = dependencies(client);
+    const recoveredClaim = claim({
+      errorRecoveryAttempt: 1,
+      errorRecoveryToken: recovery.recoveryToken,
+      errorRecoveryRequestHash: recovery.requestHash,
+      errorRecoveryAttemptState: "outcome_unknown",
+      errorRecoveryRequestId: "request-unknown",
+    });
+
+    await knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
+      {
+        claim: recoveredClaim,
+        credential: { apiKey: "test-key" } as any,
+        dependencies: injected as any,
+      },
+    );
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(injected.locallySettle).not.toHaveBeenCalled();
+    expect(injected.completeHandoff).not.toHaveBeenCalled();
   });
 });
 

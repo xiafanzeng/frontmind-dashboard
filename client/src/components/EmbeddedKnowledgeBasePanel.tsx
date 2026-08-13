@@ -388,6 +388,17 @@ const RESET_REASONS = [
   ["other", "其他"],
 ] as const;
 
+export function knowledgeResetButtonLabel(status: {
+  locked: boolean;
+  engineer: { id: number; name: string } | null;
+}) {
+  return status.locked
+    ? "重置申请审批中"
+    : status.engineer === null
+      ? "请等待分配AI 运维工程师"
+      : "申请重置知识库";
+}
+
 function KnowledgeResetButton({
   status,
   onSubmitted,
@@ -396,6 +407,7 @@ function KnowledgeResetButton({
     locked: boolean;
     canRequest: boolean;
     unavailableReason: string | null;
+    engineer: { id: number; name: string } | null;
     pending: { ticketId: string } | null;
   };
   onSubmitted: () => Promise<unknown>;
@@ -436,7 +448,7 @@ function KnowledgeResetButton({
         onClick={() => setOpen(true)}
       >
         <Trash2 className="h-4 w-4" />
-        {status.locked ? "重置申请审批中" : "申请重置知识库"}
+        {knowledgeResetButtonLabel(status)}
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>

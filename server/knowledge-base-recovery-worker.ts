@@ -22,6 +22,12 @@ type TerminalAnchorRecoveryResult = {
   [key: string]: unknown;
 };
 
+type PreproviderReleaseResult = {
+  failed: number;
+  released?: number;
+  [key: string]: unknown;
+};
+
 type ActiveLegacyMigrationResult = {
   failed: number;
   hasMore: boolean;
@@ -39,6 +45,7 @@ type ActiveLegacyMigrationResult = {
  */
 export function createKnowledgeBaseRecoverySweep(input: {
   recoverExpiredTurns: () => Promise<ExpiredTurnRecoveryResult>;
+  releaseGeneratedAttachmentInvalidTurns?: () => Promise<PreproviderReleaseResult>;
   recoverTerminalAnchorHandoffs?: () => Promise<TerminalAnchorRecoveryResult>;
   recoverOpenBuilds: (options: {
     limit: number;
@@ -69,6 +76,10 @@ export function createKnowledgeBaseRecoverySweep(input: {
 
   return async () => {
     const turns = await input.recoverExpiredTurns();
+    const releasedPreproviderTurns =
+      input.releaseGeneratedAttachmentInvalidTurns
+        ? await input.releaseGeneratedAttachmentInvalidTurns()
+        : null;
     const terminalAnchors = input.recoverTerminalAnchorHandoffs
       ? await input.recoverTerminalAnchorHandoffs()
       : null;
@@ -101,11 +112,13 @@ export function createKnowledgeBaseRecoverySweep(input: {
     return {
       failed:
         turns.failed +
+        (releasedPreproviderTurns?.failed ?? 0) +
         (terminalAnchors?.failed ?? 0) +
         builds.failed +
         (migrations?.failed ?? 0) +
         (artifacts?.failed ?? 0),
       turns,
+      releasedPreproviderTurns,
       terminalAnchors,
       builds,
       migrations,

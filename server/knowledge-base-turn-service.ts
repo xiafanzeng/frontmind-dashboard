@@ -65,6 +65,7 @@ import {
   matchesAuthoritativeKnowledgeBaseMessageTuple,
   parsedKnowledgeBaseMessageMetadata,
 } from "./knowledge-base-authoritative-message";
+import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import {
   classifyKnowledgeBaseCanonicalCredentialRebind,
   planKnowledgeBaseAnchorGeneration,
@@ -88,6 +89,27 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   awaitingClientAttachments?: boolean;
   /** Safe tombstone for a browser upload rejected before any upstream POST. */
   unpreparedCancellation?: boolean;
+  /** Safe tombstone for a generated-file failure proven to precede Provider dispatch. */
+  localPreproviderRelease?: boolean;
+  /** A customer-authorized generation cutover abandoned this rejected canonical send. */
+  localCanonicalRehydrateAbandoned?: boolean;
+  releasedOperationTombstone?: {
+    schemaVersion: 1;
+    kind: "failed_confirm_preprovider_release";
+    operationKey: string;
+    releasedAt: string;
+  };
+  localRehydrateRequired?: {
+    schemaVersion: 1;
+    reason: "generated_attachment_invalid_preprovider";
+    buildId: string;
+    generation: number;
+    revision: number;
+    leafId: string;
+    presentationKey: string;
+    sourceTurnId: string;
+    releasedAt: string;
+  };
   /** Safe tombstone for a manual Logo turn rejected after provider acknowledgement. */
   acknowledgedManualLogoCancellation?: boolean;
   /** Hash of the lease authority that committed the acknowledged cancellation. */
@@ -183,8 +205,31 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
       | "retry_wait"
       | "rejected";
     errorRecoveryRequestId?: string;
+    errorRecoveryAcknowledgedAt?: string;
     errorRecoveryRejectionCount?: number;
     errorRecoveryNextRetryAt?: string;
+  };
+  terminalAnchorObservation?: {
+    schemaVersion: 1;
+    terminalEventHash: string;
+    firstObservedAt: string;
+    lastObservedAt: string;
+    taskId: string;
+    generation: number;
+    revision: number;
+    leafId: string | null;
+    operationToken: string;
+    recoveryToken: string;
+    recoveryRequestId: string;
+  };
+  localSettlement?: {
+    schemaVersion: 1;
+    kind: "terminal_anchor_without_ack";
+    settledAt: string;
+    snapshotSha256: string;
+    presentationKey: string;
+    terminalEventHash: string;
+    recoveryRequestIdSha256: string;
   };
   supersedesTurnId?: string;
   supersededByTurnId?: string;
@@ -2499,6 +2544,8 @@ function knowledgeBaseCreateAttemptState(
 function releasedOperationTombstone(metadata: KnowledgeBaseTurnMetadata) {
   return (
     metadata.unpreparedCancellation === true ||
+    metadata.localPreproviderRelease === true ||
+    metadata.localCanonicalRehydrateAbandoned === true ||
     metadata.acknowledgedManualLogoCancellation === true ||
     metadata.unacknowledgedManualLogoCancellation === true
   );
@@ -2613,6 +2660,9 @@ function isKnowledgeBaseRecoveryAction(
       "fix_attachments",
       "reupload_logo",
       "regenerate_turn",
+      "resume_start_from_retained_sources",
+      "reselect_start_sources",
+      "create_new_canonical_from_snapshot",
       "contact_support",
     ].includes(value)
   );
@@ -2663,6 +2713,7 @@ export function knowledgeBaseTurnDispatchAuthority(
             "update_credential",
             "fix_attachments",
             "reupload_logo",
+            "create_new_canonical_from_snapshot",
             "contact_support",
           ].includes(storedAction || "")) ||
         (storedFailureClass === "terminal_nonregenerable" &&
@@ -7931,6 +7982,590 @@ export type KnowledgeBaseAnchorHandoffReservation =
     targetGeneration: number;
   };
 
+export function inspectKnowledgeBaseLocalRehydrateRequirement(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "id"
+    | "generation"
+    | "revision"
+    | "currentLeafId"
+    | "canonicalTaskId"
+    | "canonicalTaskGeneration"
+    | "providerProtocol"
+    | "handoffProvenance"
+  >,
+) {
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
+  if (!requirement) return null;
+  const replacement = retryAuthorityRecord(
+    provenance?.createNewCanonicalFromSnapshot,
+  );
+  const unboundReplacement =
+    build.canonicalTaskId === null &&
+    build.canonicalTaskGeneration === null &&
+    replacement?.schemaVersion === 1 &&
+    replacement.targetGeneration === build.generation &&
+    replacement.sourceTurnId === requirement.sourceTurnId &&
+    replacement.snapshotSha256 === requirement.snapshotSha256 &&
+    requirement.taskIdSha256 === null &&
+    requirement.sourceGeneration === replacement.sourceGeneration &&
+    requirement.targetGeneration === build.generation;
+  const boundSameCanonical =
+    Boolean(build.canonicalTaskId) &&
+    build.canonicalTaskGeneration === build.generation &&
+    requirement.taskIdSha256 === sha256(build.canonicalTaskId!);
+  if (
+    requirement.schemaVersion !== 1 ||
+    build.providerProtocol !== "manus_v2" ||
+    (!boundSameCanonical && !unboundReplacement) ||
+    requirement.generation !== build.generation ||
+    requirement.revision !== build.revision ||
+    (requirement.leafId ?? null) !== (build.currentLeafId ?? null) ||
+    typeof requirement.sourceTurnId !== "string" ||
+    typeof requirement.snapshotSha256 !== "string"
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The local rehydrate marker no longer matches the canonical build",
+    );
+  }
+  return {
+    sourceTurnId: requirement.sourceTurnId,
+    snapshotSha256: requirement.snapshotSha256,
+  };
+}
+
+export async function loadKnowledgeBaseLocalRehydrateSnapshot(
+  input: { userId: number; build: KnowledgeBaseBuild },
+  executor?: any,
+) {
+  const requirement = inspectKnowledgeBaseLocalRehydrateRequirement(
+    input.build,
+  );
+  if (!requirement) return null;
+  const db = executor ?? (await requireDb());
+  const source = (
+    await db
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, requirement.sourceTurnId),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, input.build.id),
+        ),
+      )
+      .limit(1)
+  )[0] as ConversationTurn | undefined;
+  const metadata = source ? metadataOf(source) : {};
+  const snapshot = metadata.preparedDispatch
+    ? anchorSnapshotFromPreparedPrompt(
+        metadata.preparedDispatch.requestBody.prompt,
+      )
+    : null;
+  const snapshotJson = snapshot ? JSON.stringify(snapshot) : "";
+  if (
+    source?.status !== "completed" ||
+    metadata.localSettlement?.snapshotSha256 !== requirement.snapshotSha256 ||
+    sha256(snapshotJson) !== requirement.snapshotSha256
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The complete local rehydrate snapshot is unavailable",
+    );
+  }
+  return { snapshot, json: snapshotJson, sha256: requirement.snapshotSha256 };
+}
+
+export async function clearKnowledgeBaseLocalRehydrateRequirement(
+  input: {
+    userId: number;
+    buildId: string;
+    generation: number;
+    expectedRevision: number;
+    taskId: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const build = (
+      await tx
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, input.buildId),
+            eq(knowledgeBaseBuilds.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as KnowledgeBaseBuild | undefined;
+    if (
+      !build ||
+      build.generation !== input.generation ||
+      build.revision !== input.expectedRevision ||
+      build.canonicalTaskId !== input.taskId
+    ) {
+      return false;
+    }
+    const provenance = retryAuthorityRecord(build.handoffProvenance);
+    if (!provenance?.localRehydrateRequired) return false;
+    const { localRehydrateRequired: _cleared, ...nextProvenance } = provenance;
+    const updated = await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        handoffProvenance: nextProvenance,
+        updatedAt: input.now ?? new Date(),
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.generation, input.generation),
+          eq(knowledgeBaseBuilds.revision, input.expectedRevision),
+          eq(knowledgeBaseBuilds.canonicalTaskId, input.taskId),
+        ),
+      );
+    return Boolean(updated[0]?.affectedRows);
+  });
+}
+
+export type KnowledgeBaseCanonicalSnapshotReservation = {
+  state: "reserved" | "replay";
+  claim: KnowledgeBaseRecoveryClaim;
+};
+
+/**
+ * Customer-authorized escape hatch for a canonical task which explicitly
+ * rejected the complete local rehydrate request. No provider call occurs in
+ * this transaction. It preserves accepted rows/counters and advances only the
+ * writer generation, so late events from the rejected task cannot apply.
+ */
+export async function reserveKnowledgeBaseNewCanonicalFromSnapshot(
+  input: {
+    userId: number;
+    conversationId: string;
+    clientRequestId: string;
+    expectedGeneration: number;
+    expectedStateEpoch: number;
+    expectedRevision: number;
+    expectedLeafId: string;
+    expectedPresentationKey: string;
+    apiCredentialId: string;
+    now?: Date;
+    leaseMs?: number;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseCanonicalSnapshotReservation> {
+  assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedGeneration, "expectedGeneration", 1);
+  assertInteger(input.expectedStateEpoch, "expectedStateEpoch", 0);
+  assertInteger(input.expectedRevision, "expectedRevision", 0);
+  const conversationId = normalizeRequiredId(
+    input.conversationId,
+    "conversationId",
+    191,
+  );
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const expectedLeafId = normalizeRequiredId(
+    input.expectedLeafId,
+    "expectedLeafId",
+    191,
+  );
+  const expectedPresentationKey = normalizeRequiredId(
+    input.expectedPresentationKey,
+    "expectedPresentationKey",
+    191,
+  );
+  const apiCredentialId = normalizeRequiredId(
+    input.apiCredentialId,
+    "apiCredentialId",
+    36,
+  );
+  const now = input.now ?? new Date();
+  const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
+  assertInteger(leaseMs, "leaseMs", 1_000);
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const credential = await lockKnowledgeBaseReservationCredential(
+      tx,
+      apiCredentialId,
+    );
+    if (
+      !(await lockCurrentKnowledgeBaseCredentialAuthority(
+        tx,
+        input.userId,
+        credential,
+      ))
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The selected credential is no longer authorized",
+      );
+    }
+    const build = (
+      await tx
+        .select()
+        .from(knowledgeBaseBuilds)
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.userId, input.userId),
+            eq(knowledgeBaseBuilds.conversationId, conversationId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as KnowledgeBaseBuild | undefined;
+    if (!build) {
+      throw new KnowledgeBaseTurnReservationError(
+        "BUILD_NOT_FOUND",
+        "Knowledge-base build was not found",
+      );
+    }
+    const persistedConversationId = knowledgeBaseConversationStorageId(
+      input.userId,
+      conversationId,
+    );
+    const replay = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.conversationId, persistedConversationId),
+            eq(conversationTurns.clientRequestId, clientRequestId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    if (replay) {
+      const replayMetadata = metadataOf(replay);
+      if (
+        replayMetadata.repairKind !==
+          "local_rehydrate_new_canonical_from_snapshot" ||
+        replayMetadata.sourceGeneration !== input.expectedGeneration ||
+        replayMetadata.sourceStateEpoch !== input.expectedStateEpoch ||
+        replayMetadata.sourcePresentationKey !== expectedPresentationKey ||
+        replay.buildId !== build.id ||
+        replay.buildGeneration !== build.generation ||
+        replay.expectedRevision !== input.expectedRevision ||
+        replay.expectedRevision !== build.revision ||
+        replay.expectedLeafId !== expectedLeafId ||
+        replay.expectedLeafId !== build.currentLeafId ||
+        build.activeTurnId !== replay.id
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
+          "The request id was already used for a different recovery",
+        );
+      }
+      return {
+        state: "replay" as const,
+        claim: {
+          turn: turnRecord(replay),
+          leaseToken: "replay",
+          leaseExpiresAt: replay.leaseExpiresAt ?? now,
+          upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
+            String(replay.operationKey),
+          ),
+          recoveryMetadata: sanitizeKnowledgeBaseRecoveryMetadata(
+            replayMetadata.recovery,
+          ),
+          preparedDispatch: replayMetadata.preparedDispatch ?? null,
+        },
+      };
+    }
+    const provenance = retryAuthorityRecord(build.handoffProvenance);
+    const requirement = retryAuthorityRecord(
+      provenance?.localRehydrateRequired,
+    );
+    if (
+      build.providerProtocol !== "manus_v2" ||
+      build.generation !== input.expectedGeneration ||
+      build.stateEpoch !== input.expectedStateEpoch ||
+      build.revision !== input.expectedRevision ||
+      build.currentLeafId !== expectedLeafId ||
+      build.currentPresentationKey !== expectedPresentationKey ||
+      build.status !== "protocol_error" ||
+      build.canonicalTaskState !== "attention_required" ||
+      build.protocolErrorCode !== "MANUS_V2_LOCAL_REHYDRATE_REJECTED" ||
+      !build.activeTurnId ||
+      !build.canonicalTaskId ||
+      build.canonicalTaskGeneration !== build.generation ||
+      requirement?.generation !== build.generation ||
+      requirement?.revision !== build.revision ||
+      requirement?.leafId !== build.currentLeafId ||
+      requirement?.taskIdSha256 !== sha256(build.canonicalTaskId) ||
+      typeof requirement?.snapshotSha256 !== "string" ||
+      typeof requirement?.sourceTurnId !== "string"
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The canonical snapshot recovery coordinate changed",
+      );
+    }
+    const rejectedTurn = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(eq(conversationTurns.id, build.activeTurnId))
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    const rejectedMetadata = rejectedTurn ? metadataOf(rejectedTurn) : {};
+    if (
+      !rejectedTurn ||
+      rejectedTurn.status !== "failed" ||
+      rejectedTurn.buildId !== build.id ||
+      rejectedTurn.buildGeneration !== build.generation ||
+      rejectedTurn.expectedRevision !== build.revision ||
+      rejectedTurn.expectedLeafId !== build.currentLeafId ||
+      rejectedTurn.upstreamTaskId !== build.canonicalTaskId ||
+      rejectedMetadata.providerProtocol !== "manus_v2" ||
+      rejectedMetadata.providerMethod !== "task.sendMessage" ||
+      rejectedMetadata.providerAttemptState !== "rejected" ||
+      rejectedMetadata.recoveryAction !== "create_new_canonical_from_snapshot"
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The rejected rehydrate turn is no longer authoritative",
+      );
+    }
+    const targetGeneration = build.generation + 1;
+    const turnId = randomUUID();
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: {
+          ...rejectedMetadata,
+          localCanonicalRehydrateAbandoned: true,
+          supersededByTurnId: turnId,
+          supersededAt: now.toISOString(),
+        },
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, rejectedTurn.id));
+    const source = (
+      await tx
+        .select()
+        .from(conversationTurns)
+        .where(eq(conversationTurns.id, requirement.sourceTurnId))
+        .limit(1)
+        .for("update")
+    )[0] as ConversationTurn | undefined;
+    const sourceMetadata = source ? metadataOf(source) : {};
+    if (
+      source?.status !== "completed" ||
+      source.buildId !== build.id ||
+      sourceMetadata.localSettlement?.snapshotSha256 !==
+        requirement.snapshotSha256
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The complete accepted-state snapshot is unavailable",
+      );
+    }
+    const snapshot = anchorSnapshotFromPreparedPrompt(
+      sourceMetadata.preparedDispatch?.requestBody.prompt || "",
+    );
+    const snapshotJson = snapshot ? JSON.stringify(snapshot) : "";
+    if (!snapshot || sha256(snapshotJson) !== requirement.snapshotSha256) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The complete accepted-state snapshot changed",
+      );
+    }
+    const operationType =
+      rejectedTurn.operationType as KnowledgeBaseOperationType;
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId: build.id,
+      buildGeneration: targetGeneration,
+      operationType,
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+      operationInstanceId: `local-rehydrate-new-canonical:${rejectedTurn.id}`,
+    });
+    const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
+      ...retryAuthorityRecord(rejectedMetadata.recovery),
+      kind: "turn",
+      conversationId: build.conversationId,
+      parentTaskId: null,
+      localCanonicalSnapshotSha256: requirement.snapshotSha256,
+      sourceGeneration: build.generation,
+      targetGeneration,
+      chargeDisposition: "reuse_original_no_charge",
+    });
+    const requestHash = hashKnowledgeBaseTurnRequest({
+      protocol: "frontmind.knowledge-base.local-rehydrate-canonical.v1",
+      supersedesTurnId: rejectedTurn.id,
+      operationKey,
+      snapshotSha256: requirement.snapshotSha256,
+      presentationKey: expectedPresentationKey,
+    });
+    const leaseToken = randomUUID();
+    const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+    const metadata: KnowledgeBaseTurnMetadata = {
+      leaseOwnerHash: leaseOwnerHash(leaseToken),
+      attachmentsFrozen: false,
+      expectedAttachmentCount: Number(
+        rejectedMetadata.expectedAttachmentCount ?? 2,
+      ),
+      userAttachmentCount: Number(rejectedMetadata.userAttachmentCount ?? 0),
+      awaitingClientAttachments: false,
+      recovery,
+      createAttemptState: "not_sent",
+      createAttemptUpdatedAt: now.toISOString(),
+      providerProtocol: "manus_v2",
+      providerAttemptState: "not_sent",
+      operationToken: operationKey,
+      dispatchState: "reserved",
+      failureClass: null,
+      recoveryAction: "wait",
+      canRegenerate: false,
+      repairKind: "local_rehydrate_new_canonical_from_snapshot",
+      supersedesTurnId: rejectedTurn.id,
+      chargeDisposition: "reuse_original_no_charge",
+      sourceGeneration: build.generation,
+      sourceStateEpoch: build.stateEpoch,
+      sourcePresentationKey: expectedPresentationKey,
+      receiptSourceGeneration: build.generation,
+    };
+    const row: ConversationTurn = {
+      id: turnId,
+      conversationId: persistedConversationId,
+      userId: input.userId,
+      apiCredentialId,
+      clientRequestId,
+      buildId: build.id,
+      buildGeneration: targetGeneration,
+      operationKey,
+      operationType,
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+      requestHash,
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      attachmentFileIds: [],
+      metadata,
+      leaseExpiresAt,
+      model: null,
+      status: "queued",
+      upstreamTaskId: null,
+      errorCode: null,
+      errorMessage: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await tx.insert(conversationTurns).values(row);
+    const updated = await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        generation: targetGeneration,
+        activeTurnId: turnId,
+        providerProtocol: "manus_v2",
+        upstreamTaskId: null,
+        canonicalTaskId: null,
+        canonicalTaskGeneration: null,
+        canonicalCredentialId: null,
+        canonicalTaskState: "unbound",
+        canonicalTaskUrl: null,
+        canonicalTaskCreatedAt: null,
+        handoffProvenance: {
+          ...provenance,
+          sourceGeneration: build.generation,
+          targetGeneration,
+          receiptSourceGeneration: build.generation,
+          pendingTurnId: turnId,
+          abandonedCanonicalTaskIdSha256: sha256(build.canonicalTaskId),
+          localRehydrateRequired: {
+            ...requirement,
+            taskIdSha256: null,
+            sourceGeneration: build.generation,
+            generation: targetGeneration,
+            targetGeneration,
+            createdAt: now.toISOString(),
+          },
+          createNewCanonicalFromSnapshot: {
+            schemaVersion: 1,
+            sourceTurnId: requirement.sourceTurnId,
+            snapshotSha256: requirement.snapshotSha256,
+            sourceGeneration: build.generation,
+            receiptSourceGeneration: build.generation,
+            targetGeneration,
+            replacementTurnId: turnId,
+            createdAt: now.toISOString(),
+          },
+        },
+        status: "confirming",
+        stateEpoch: build.stateEpoch + 1,
+        protocolErrorCode: null,
+        protocolError: null,
+        awaitingResponseSince: now,
+        recoveryLeaseOwnerHash: null,
+        recoveryLeaseExpiresAt: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.generation, input.expectedGeneration),
+          eq(knowledgeBaseBuilds.stateEpoch, input.expectedStateEpoch),
+          eq(knowledgeBaseBuilds.activeTurnId, rejectedTurn.id),
+          eq(
+            knowledgeBaseBuilds.currentPresentationKey,
+            expectedPresentationKey,
+          ),
+        ),
+      );
+    if (!updated[0]?.affectedRows) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Another writer acquired the canonical snapshot first",
+      );
+    }
+    await tx
+      .update(conversations)
+      .set({
+        status: "running",
+        apiCredentialId,
+        upstreamTaskId: null,
+        previousResponseId: null,
+        completedAt: null,
+        version: sql`${conversations.version} + 1`,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversations.id, persistedConversationId),
+          eq(conversations.userId, input.userId),
+        ),
+      );
+    return {
+      state: "reserved" as const,
+      claim: {
+        turn: turnRecord(row),
+        leaseToken,
+        leaseExpiresAt,
+        upstreamIdempotencyKey:
+          createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+        recoveryMetadata: recovery,
+        preparedDispatch: null,
+      },
+    };
+  });
+}
+
 function knowledgeBaseReceiptPresentationKey(input: {
   buildId: string;
   generation: number;
@@ -9324,6 +9959,332 @@ export async function claimKnowledgeBaseTerminalAnchorHandoffRecovery(
   });
 }
 
+const TERMINAL_ANCHOR_STABLE_MS = 30_000;
+const TERMINAL_ANCHOR_MAX_ACK_MS = 120_000;
+
+function anchorSnapshotFromPreparedPrompt(prompt: string) {
+  const matches = [
+    ...String(prompt || "").matchAll(/```json\n([\s\S]*?)\n```/gu),
+  ];
+  if (matches.length !== 1) return null;
+  try {
+    const value = JSON.parse(
+      matches[0]![1]!,
+    ) as KnowledgeBaseAnchorHandoffSnapshot;
+    return value?.schemaVersion === 1 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function anchorNodeContentHash(content: string | null) {
+  return content === null ? null : knowledgeBaseMarkdownSha256(content);
+}
+
+/**
+ * Records one exact stopped terminal event and, after a bounded observation,
+ * releases the hidden anchor locally. This transaction never calls Manus and
+ * deliberately does not manufacture an acknowledgement.
+ */
+export async function observeAndLocallySettleKnowledgeBaseTerminalAnchor(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    taskId: string;
+    terminalEventHash: string;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const terminalEventHash = normalizeRequiredId(
+    input.terminalEventHash,
+    "terminalEventHash",
+    64,
+  );
+  if (!/^[a-f0-9]{64}$/u.test(terminalEventHash)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Terminal anchor event hash is invalid",
+    );
+  }
+  const taskId = normalizeRequiredId(input.taskId, "taskId", 255);
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const metadata = metadataOf(turn);
+    const lifecycle = metadata.manusV2Lifecycle || {};
+    const prepared = metadata.preparedDispatch;
+    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
+      operationToken: String(metadata.operationToken || ""),
+      turnId: turn.id,
+      generation: turn.buildGeneration!,
+      baseRevision: turn.expectedRevision!,
+    });
+    const requestId = String(lifecycle.errorRecoveryRequestId || "");
+    const provenance = retryAuthorityRecord(build.handoffProvenance);
+    const snapshot = prepared
+      ? anchorSnapshotFromPreparedPrompt(prepared.requestBody.prompt)
+      : null;
+    const snapshotJson = snapshot ? JSON.stringify(snapshot) : "";
+    const snapshotSha256 = snapshotJson ? sha256(snapshotJson) : "";
+    if (
+      metadata.repairKind !== "legacy_anchor_handoff" ||
+      turn.operationType !== "legacy_reconcile" ||
+      turn.status !== "running" ||
+      metadata.providerProtocol !== "manus_v2" ||
+      metadata.createAttemptState !== "rejected" ||
+      metadata.providerAttemptState !== "output_pending" ||
+      lifecycle.errorRecoveryAttempt !== 1 ||
+      lifecycle.errorRecoveryAttemptState !== "acknowledged" ||
+      lifecycle.errorRecoveryToken !== recovery.recoveryToken ||
+      lifecycle.errorRecoveryRequestHash !== recovery.requestHash ||
+      !requestId ||
+      build.providerProtocol !== "manus_v2" ||
+      build.activeTurnId !== turn.id ||
+      build.canonicalTaskId !== taskId ||
+      build.upstreamTaskId !== taskId ||
+      turn.upstreamTaskId !== taskId ||
+      build.canonicalTaskGeneration !== build.generation ||
+      build.generation !== turn.buildGeneration ||
+      build.revision !== turn.expectedRevision ||
+      (build.currentLeafId ?? null) !== (turn.expectedLeafId ?? null) ||
+      !prepared ||
+      prepared.schemaVersion !== 2 ||
+      prepared.requestBody.attachments.length !== 0 ||
+      prepared.bodySha256 !==
+        hashKnowledgeBaseTurnRequest(prepared.requestBody) ||
+      !snapshot ||
+      snapshot.source.buildId !== build.id ||
+      snapshot.source.targetGeneration !== build.generation ||
+      snapshot.source.revision !== build.revision ||
+      (snapshot.source.currentLeafId ?? null) !==
+        (build.currentLeafId ?? null) ||
+      snapshot.pendingOperation.turnId !== turn.id ||
+      snapshot.pendingOperation.operationToken !== metadata.operationToken ||
+      snapshot.pendingOperation.baseRevision !== build.revision ||
+      (snapshot.pendingOperation.fromLeafId ?? null) !==
+        (build.currentLeafId ?? null) ||
+      snapshotSha256 !==
+        retryAuthorityRecord(metadata.recovery)?.snapshotSha256 ||
+      snapshotSha256 !== provenance?.snapshotSha256 ||
+      provenance?.pendingTurnId !== turn.id
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The stopped anchor no longer matches its frozen local snapshot",
+      );
+    }
+
+    const nodes = await tx
+      .select()
+      .from(knowledgeBaseBuildNodes)
+      .where(eq(knowledgeBaseBuildNodes.buildId, build.id))
+      .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
+    if (
+      nodes.length !== snapshot.nodes.length ||
+      nodes.some((node: any, index: number) => {
+        const frozen = snapshot.nodes[index];
+        return (
+          !frozen ||
+          node.leafId !== frozen.leafId ||
+          node.ordinal !== frozen.ordinal ||
+          node.status !== frozen.status ||
+          (node.contentMarkdown ?? null) !== (frozen.contentMarkdown ?? null) ||
+          anchorNodeContentHash(node.contentMarkdown ?? null) !==
+            (frozen.contentSha256 ?? null) ||
+          (node.contentSha256 ?? null) !== (frozen.contentSha256 ?? null)
+        );
+      })
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Anchor node content changed after the frozen snapshot",
+      );
+    }
+    const currentNode = nodes.find(
+      (node: any) => node.leafId === build.currentLeafId,
+    ) as any;
+    const currentContentSha256 = currentNode
+      ? anchorNodeContentHash(currentNode.contentMarkdown ?? null)
+      : null;
+    const expectedPresentationKey =
+      currentNode && currentContentSha256
+        ? knowledgeBaseReceiptPresentationKey({
+            buildId: build.id,
+            generation: build.generation,
+            revision: build.revision,
+            leafId: currentNode.leafId,
+            contentSha256: currentContentSha256,
+          })
+        : null;
+    if (
+      !currentNode ||
+      !currentNode.sourceTurnId ||
+      !expectedPresentationKey ||
+      currentNode.presentationKey !== expectedPresentationKey ||
+      build.currentPresentationKey !== expectedPresentationKey
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The current node cannot prove the customer-visible presentation",
+      );
+    }
+    const sourceTurns = (await tx
+      .select()
+      .from(conversationTurns)
+      .where(eq(conversationTurns.id, currentNode.sourceTurnId))
+      .limit(1)) as ConversationTurn[];
+    const sourceTurn = sourceTurns[0];
+    if (
+      !sourceTurn ||
+      sourceTurn.status !== "completed" ||
+      sourceTurn.userId !== turn.userId ||
+      sourceTurn.buildId !== build.id ||
+      sourceTurn.buildGeneration !== snapshot.source.generation ||
+      sourceTurn.id !== currentNode.sourceTurnId
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The current presentation is not backed by its historical source turn",
+      );
+    }
+    // Restore the active turn as the update target after the historical
+    // source lookup. This is irrelevant to Drizzle itself, but keeps the
+    // transaction order explicit for lightweight executors and reviewers.
+    await loadTurnByIdForUpdate(tx, turn.id);
+
+    const now = input.now ?? new Date();
+    const existing = metadata.terminalAnchorObservation;
+    if (
+      existing &&
+      (existing.terminalEventHash !== terminalEventHash ||
+        existing.taskId !== taskId ||
+        existing.generation !== build.generation ||
+        existing.revision !== build.revision ||
+        (existing.leafId ?? null) !== (build.currentLeafId ?? null) ||
+        existing.operationToken !== metadata.operationToken ||
+        existing.recoveryToken !== recovery.recoveryToken ||
+        existing.recoveryRequestId !== requestId)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "A different terminal anchor event was already observed",
+      );
+    }
+    const firstObservedAt = existing?.firstObservedAt || now.toISOString();
+    const acknowledgedAt =
+      lifecycle.errorRecoveryAcknowledgedAt || firstObservedAt;
+    const stableAt = Date.parse(firstObservedAt) + TERMINAL_ANCHOR_STABLE_MS;
+    const deadlineAt = Date.parse(acknowledgedAt) + TERMINAL_ANCHOR_MAX_ACK_MS;
+    const observation = {
+      schemaVersion: 1 as const,
+      terminalEventHash,
+      firstObservedAt,
+      lastObservedAt: now.toISOString(),
+      taskId,
+      generation: build.generation,
+      revision: build.revision,
+      leafId: build.currentLeafId,
+      operationToken: String(metadata.operationToken),
+      recoveryToken: recovery.recoveryToken,
+      recoveryRequestId: requestId,
+    };
+    if (now.getTime() < stableAt && now.getTime() < deadlineAt) {
+      const leaseExpiresAt = new Date(Math.min(stableAt, deadlineAt));
+      await tx
+        .update(conversationTurns)
+        .set({
+          metadata: { ...metadata, terminalAnchorObservation: observation },
+          leaseExpiresAt,
+          updatedAt: now,
+        })
+        .where(eq(conversationTurns.id, turn.id));
+      return { state: "observed" as const, leaseExpiresAt };
+    }
+
+    const localSettlement = {
+      schemaVersion: 1 as const,
+      kind: "terminal_anchor_without_ack" as const,
+      settledAt: now.toISOString(),
+      snapshotSha256,
+      presentationKey: expectedPresentationKey,
+      terminalEventHash,
+      recoveryRequestIdSha256: sha256(requestId),
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        status: "completed",
+        completedAt: now,
+        leaseExpiresAt: null,
+        errorCode: null,
+        errorMessage: null,
+        metadata: {
+          ...metadata,
+          terminalAnchorObservation: observation,
+          localSettlement,
+          dispatchState: "completed",
+          failureClass: null,
+          recoveryAction: null,
+          canRegenerate: false,
+        },
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    const nextProvenance = {
+      ...provenance,
+      localRehydrateRequired: {
+        schemaVersion: 1,
+        sourceTurnId: turn.id,
+        snapshotSha256,
+        taskIdSha256: sha256(taskId),
+        generation: build.generation,
+        revision: build.revision,
+        leafId: build.currentLeafId,
+        createdAt: now.toISOString(),
+      },
+    };
+    const released = await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "confirming",
+        activeTurnId: null,
+        canonicalTaskState: "active",
+        stateEpoch: build.stateEpoch + 1,
+        awaitingResponseSince: null,
+        protocolErrorCode: null,
+        protocolError: null,
+        handoffProvenance: nextProvenance,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          eq(knowledgeBaseBuilds.canonicalTaskId, taskId),
+        ),
+      );
+    if (!released[0]?.affectedRows) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The terminal anchor lost its local settlement fence",
+      );
+    }
+    await markKnowledgeBaseConversationAwaitingInputInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: taskId,
+      updatedAt: now,
+    });
+    return { state: "settled" as const, localSettlement };
+  });
+}
+
 /** Isolates an unprovable legacy create without changing accepted content. */
 export async function markLegacyKnowledgeBaseCreateAttentionRequired(
   input: {
@@ -9555,17 +10516,30 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
       ? Math.max(0, Number(metadata.providerRejectionCount))
       : 0;
     const nextCount = previousCount + 1;
+    const localRehydrateRejected =
+      method === "task.sendMessage" &&
+      Boolean(
+        retryAuthorityRecord(build.handoffProvenance)?.localRehydrateRequired,
+      );
     const mayRetry =
-      input.retryable && nextCount <= MAX_MANUS_V2_EXPLICIT_REJECTION_RETRIES;
+      !localRehydrateRejected &&
+      input.retryable &&
+      nextCount <= MAX_MANUS_V2_EXPLICIT_REJECTION_RETRIES;
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadata,
       providerRejectionCount: nextCount,
       createAttemptState: mayRetry ? "not_sent" : "rejected",
       createAttemptUpdatedAt: now.toISOString(),
       providerAttemptState: mayRetry ? "not_sent" : "rejected",
-      dispatchState: "recovering",
-      failureClass: "recoverable_same_turn",
-      recoveryAction: "wait",
+      dispatchState: mayRetry ? "recovering" : "failed",
+      failureClass:
+        !mayRetry && localRehydrateRejected
+          ? "requires_user_fix"
+          : "recoverable_same_turn",
+      recoveryAction:
+        !mayRetry && localRehydrateRejected
+          ? "create_new_canonical_from_snapshot"
+          : "wait",
       canRegenerate: false,
     };
     const delayMs = mayRetry
@@ -9598,16 +10572,35 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
         .where(eq(knowledgeBaseBuilds.id, build.id));
       return { retryScheduled: true as const, attempt: nextCount, delayMs };
     }
+    const requiresNewCanonical = localRehydrateRejected;
     await tx
       .update(knowledgeBaseBuilds)
       .set({
         canonicalTaskState: "attention_required",
-        protocolErrorCode: code,
-        protocolError: null,
+        protocolErrorCode: requiresNewCanonical
+          ? "MANUS_V2_LOCAL_REHYDRATE_REJECTED"
+          : code,
+        protocolError: requiresNewCanonical
+          ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
+          : null,
         stateEpoch: build.stateEpoch + 1,
+        awaitingResponseSince: null,
         updatedAt: now,
       })
       .where(eq(knowledgeBaseBuilds.id, build.id));
+    if (requiresNewCanonical) {
+      await tx
+        .update(conversationTurns)
+        .set({ status: "failed", completedAt: now, leaseExpiresAt: null })
+        .where(eq(conversationTurns.id, turn.id));
+      await markKnowledgeBaseConversationFailedInTransaction({
+        tx,
+        userId: input.userId,
+        conversationId: turn.conversationId,
+        authoritativeTaskId: build.canonicalTaskId,
+        failedAt: now,
+      });
+    }
     return { retryScheduled: false as const, attempt: nextCount, delayMs };
   });
 }
@@ -10234,6 +11227,12 @@ export async function mutateKnowledgeBaseManusV2Lifecycle(
         ...(input.mutation.requestId
           ? { errorRecoveryRequestId: input.mutation.requestId }
           : {}),
+        ...(input.mutation.state === "acknowledged"
+          ? {
+              errorRecoveryAcknowledgedAt:
+                current.errorRecoveryAcknowledgedAt || now.toISOString(),
+            }
+          : {}),
       };
     }
     const nextProviderAttemptState =
@@ -10755,6 +11754,372 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
       updatedAt: now,
     });
   });
+}
+
+export type KnowledgeBasePreproviderReleaseCandidate = {
+  turnId: string;
+  userId: number;
+  buildId: string;
+};
+
+/**
+ * Cheap, provider-free scan for the one historical failure which is safe to
+ * release locally. releaseGeneratedAttachmentInvalidPreproviderTurn repeats
+ * every proof under row locks before changing authority.
+ */
+export async function findGeneratedAttachmentInvalidPreproviderTurns(
+  input: { limit?: number } = {},
+  executor?: any,
+): Promise<KnowledgeBasePreproviderReleaseCandidate[]> {
+  const db = executor ?? (await requireDb());
+  const limit = input.limit ?? 50;
+  assertInteger(limit, "limit", 1);
+  return db
+    .select({
+      turnId: conversationTurns.id,
+      userId: conversationTurns.userId,
+      buildId: conversationTurns.buildId,
+    })
+    .from(conversationTurns)
+    .innerJoin(
+      knowledgeBaseBuilds,
+      and(
+        eq(knowledgeBaseBuilds.id, conversationTurns.buildId),
+        eq(knowledgeBaseBuilds.generation, conversationTurns.buildGeneration),
+        eq(knowledgeBaseBuilds.activeTurnId, conversationTurns.id),
+      ),
+    )
+    .where(
+      and(
+        eq(conversationTurns.status, "failed"),
+        eq(
+          conversationTurns.errorCode,
+          "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
+        ),
+        eq(conversationTurns.operationType, "confirm"),
+        eq(knowledgeBaseBuilds.status, "protocol_error"),
+        eq(knowledgeBaseBuilds.providerProtocol, "legacy_v1"),
+        isNull(conversationTurns.upstreamTaskId),
+        isNull(knowledgeBaseBuilds.canonicalTaskId),
+        sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
+        sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), 'not_sent') = 'not_sent'`,
+        sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.localPreproviderRelease') IS NULL`,
+      ),
+    )
+    .orderBy(asc(conversationTurns.id))
+    .limit(Math.min(limit, 200)) as Promise<
+    KnowledgeBasePreproviderReleaseCandidate[]
+  >;
+}
+
+function currentPreproviderReleasePresentation(
+  build: KnowledgeBaseBuild,
+  nodes: Array<{
+    leafId: string;
+    status: string;
+    contentMarkdown: string | null;
+    contentSha256: string | null;
+    presentationKey: string | null;
+    sourceTurnId: string | null;
+  }>,
+) {
+  if (!build.currentLeafId || !build.currentPresentationKey) return null;
+  const matches = nodes.filter((node) => node.leafId === build.currentLeafId);
+  if (matches.length !== 1) return null;
+  const node = matches[0]!;
+  const content = canonicalKnowledgeBaseMarkdown(node.contentMarkdown || "");
+  if (!content) return null;
+  const contentSha256 = knowledgeBaseMarkdownSha256(content);
+  const presentationKey = knowledgeBaseReceiptPresentationKey({
+    buildId: build.id,
+    generation: build.generation,
+    revision: build.revision,
+    leafId: build.currentLeafId,
+    contentSha256,
+  });
+  if (
+    node.contentSha256 !== contentSha256 ||
+    node.presentationKey !== presentationKey ||
+    build.currentPresentationKey !== presentationKey
+  ) {
+    return null;
+  }
+  return { contentSha256, presentationKey };
+}
+
+/**
+ * Locally releases a confirm which failed while validating a generated file.
+ * This transaction has no Provider dependency and cannot call create/send.
+ */
+export async function releaseGeneratedAttachmentInvalidPreproviderTurn(
+  input: { turnId: string; now?: Date },
+  executor?: any,
+): Promise<boolean> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    let turn: ConversationTurn;
+    let build: KnowledgeBaseBuild;
+    try {
+      ({ turn, build } = await lockedOwnedTurnAndBuild(tx, input));
+    } catch (error) {
+      if (
+        error instanceof KnowledgeBaseTurnReservationError &&
+        (error.code === "RESERVATION_NOT_FOUND" || error.code === "CONFLICT")
+      ) {
+        return false;
+      }
+      throw error;
+    }
+    const metadata = metadataOf(turn);
+    const recovery = retryAuthorityRecord(metadata.recovery);
+    const nodes = (await tx
+      .select({
+        leafId: knowledgeBaseBuildNodes.leafId,
+        status: knowledgeBaseBuildNodes.status,
+        contentMarkdown: knowledgeBaseBuildNodes.contentMarkdown,
+        contentSha256: knowledgeBaseBuildNodes.contentSha256,
+        presentationKey: knowledgeBaseBuildNodes.presentationKey,
+        sourceTurnId: knowledgeBaseBuildNodes.sourceTurnId,
+      })
+      .from(knowledgeBaseBuildNodes)
+      .where(eq(knowledgeBaseBuildNodes.buildId, build.id))) as Array<{
+      leafId: string;
+      status: string;
+      contentMarkdown: string | null;
+      contentSha256: string | null;
+      presentationKey: string | null;
+      sourceTurnId: string | null;
+    }>;
+    const presentation = currentPreproviderReleasePresentation(build, nodes);
+    const completionReceipts = await tx
+      .select({ metadata: messages.metadata })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.userId, turn.userId),
+          // Customer-facing KB turns store the scoped conversation id while
+          // the message ledger is keyed by the user-scoped storage id. Use
+          // the same authority mapping as the progress/incident readers so a
+          // real completion receipt can never be missed here.
+          eq(
+            messages.conversationId,
+            knowledgeBaseConversationStorageId(
+              turn.userId,
+              build.conversationId,
+            ),
+          ),
+          eq(messages.turnId, turn.id),
+          eq(messages.role, "assistant"),
+          isNull(messages.deletedAt),
+        ),
+      );
+    const hasCompletionReceipt = completionReceipts.some((message: any) => {
+      const receipt = parsedKnowledgeBaseMessageMetadata(message.metadata);
+      return receipt?.kind === "completion";
+    });
+    const currentNode = nodes.find(
+      (node) => node.leafId === build.currentLeafId,
+    );
+    const unchangedCounts =
+      nodes.length === build.totalNodeCount &&
+      nodes.filter((node) => node.status === "confirmed").length ===
+        build.confirmedCount &&
+      nodes.filter((node) => node.status === "direct_prefilled").length ===
+        build.directPrefilledCount &&
+      nodes.filter((node) => node.status === "needs_verification").length ===
+        build.needsVerificationCount &&
+      currentNode?.sourceTurnId !== turn.id;
+    if (
+      turn.status !== "failed" ||
+      turn.errorCode !== "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID" ||
+      turn.operationType !== "confirm" ||
+      build.status !== "protocol_error" ||
+      build.activeTurnId !== turn.id ||
+      build.providerProtocol !== "legacy_v1" ||
+      build.canonicalTaskId ||
+      turn.buildGeneration !== build.generation ||
+      turn.expectedRevision !== build.revision ||
+      (turn.expectedLeafId ?? null) !== (build.currentLeafId ?? null) ||
+      turn.upstreamTaskId ||
+      storedKnowledgeBaseCreateAttemptState(metadata) !== "not_sent" ||
+      (metadata.providerAttemptState !== undefined &&
+        metadata.providerAttemptState !== "not_sent") ||
+      metadata.dispatchingAt !== undefined ||
+      metadata.outcomeUnknownAt !== undefined ||
+      metadata.manusRequestId !== undefined ||
+      metadata.providerRequestRef !== undefined ||
+      metadata.preparedDispatch !== undefined ||
+      metadata.frozenProviderRequestHash !== undefined ||
+      !recovery ||
+      recovery.kind !== "turn" ||
+      recovery.conversationId !== build.conversationId ||
+      Number(metadata.userAttachmentCount ?? 0) !== 0 ||
+      (Array.isArray(recovery.attachments) &&
+        recovery.attachments.length > 0) ||
+      !presentation ||
+      hasCompletionReceipt ||
+      !unchangedCounts
+    ) {
+      return false;
+    }
+    const now = input.now ?? new Date();
+    const oldOperationKey = String(turn.operationKey);
+    const tombstoneOperationKey = sha256(
+      `frontmind-kb-failed-confirm-preprovider-release:${turn.id}:${oldOperationKey}`,
+    );
+    const {
+      leaseOwnerHash: _leaseOwnerHash,
+      preparedDispatch: _preparedDispatch,
+      frozenProviderRequestHash: _frozenProviderRequestHash,
+      generatedAttachmentReservations: _generatedAttachmentReservations,
+      manusV2AttachmentMappings: _manusV2AttachmentMappings,
+      manusV2AttachmentAttempts: _manusV2AttachmentAttempts,
+      manusV2AttachmentUnknownAttempts: _manusV2AttachmentUnknownAttempts,
+      ...releasedMetadata
+    } = metadata;
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...releasedMetadata,
+      attachmentsFrozen: false,
+      localPreproviderRelease: true,
+      releasedOperationTombstone: {
+        schemaVersion: 1,
+        kind: "failed_confirm_preprovider_release",
+        operationKey: oldOperationKey,
+        releasedAt: now.toISOString(),
+      },
+      localRehydrateRequired: {
+        schemaVersion: 1,
+        reason: "generated_attachment_invalid_preprovider",
+        buildId: build.id,
+        generation: build.generation,
+        revision: build.revision,
+        leafId: build.currentLeafId!,
+        presentationKey: presentation.presentationKey,
+        sourceTurnId: turn.id,
+        releasedAt: now.toISOString(),
+      },
+      cancelledOperationKey: oldOperationKey,
+      generatedAttachmentReservations: {},
+      manusV2AttachmentMappings: {},
+      manusV2AttachmentAttempts: {},
+      manusV2AttachmentUnknownAttempts: {},
+      dispatchState: "failed",
+      failureClass: null,
+      recoveryAction: null,
+      canRegenerate: false,
+      repairKind: "failed_confirm_preprovider_release",
+      providerProtocol: "legacy_v1",
+      providerAttemptState: "not_sent",
+      createAttemptState: "not_sent",
+    };
+    const buildUpdate = await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "confirming",
+        // The legacy task remains in the resource/turn history, but it is no
+        // longer a writer authority. Leaving this pointer populated would
+        // make the next customer confirmation resolve the old legacy task
+        // before the local-rehydrate branch can create the one v2 canonical
+        // task promised by this settlement.
+        upstreamTaskId: null,
+        providerProtocol: "manus_v2",
+        canonicalTaskId: null,
+        canonicalTaskGeneration: null,
+        canonicalCredentialId: null,
+        canonicalTaskState: "unbound",
+        canonicalTaskUrl: null,
+        canonicalTaskCreatedAt: null,
+        handoffProvenance: {
+          schemaVersion: 1,
+          sourceProtocol: "legacy_v1",
+          legacyTaskIdSha256: build.upstreamTaskId
+            ? sha256(build.upstreamTaskId)
+            : null,
+          localRehydrateRequired: nextMetadata.localRehydrateRequired,
+        },
+        activeTurnId: null,
+        awaitingResponseSince: null,
+        recoveryLeaseOwnerHash: null,
+        recoveryLeaseExpiresAt: null,
+        protocolErrorCode: null,
+        protocolError: null,
+        stateEpoch: build.stateEpoch + 1,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.revision, build.revision),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          eq(knowledgeBaseBuilds.providerProtocol, "legacy_v1"),
+          isNull(knowledgeBaseBuilds.canonicalTaskId),
+        ),
+      );
+    if (!buildUpdate[0]?.affectedRows) return false;
+    await tx
+      .update(conversationTurns)
+      .set({
+        operationKey: tombstoneOperationKey,
+        upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+          createKnowledgeBaseUpstreamIdempotencyKey(tombstoneOperationKey),
+        ),
+        status: "cancelled",
+        attachmentFileIds: [],
+        completedAt: turn.completedAt ?? now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    await markKnowledgeBaseConversationAwaitingInputInTransaction({
+      tx,
+      userId: turn.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: null,
+      updatedAt: now,
+    });
+    return true;
+  });
+}
+
+export async function releaseGeneratedAttachmentInvalidPreproviderTurns(
+  input: { limit?: number; concurrency?: number } = {},
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const candidates = await findGeneratedAttachmentInvalidPreproviderTurns(
+    { limit: input.limit },
+    db,
+  );
+  const concurrency = Math.min(
+    8,
+    Math.max(1, Math.trunc(input.concurrency ?? 3)),
+  );
+  let cursor = 0;
+  const result = { scanned: candidates.length, released: 0, failed: 0 };
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor++];
+      if (!candidate) return;
+      try {
+        if (
+          await releaseGeneratedAttachmentInvalidPreproviderTurn(
+            { turnId: candidate.turnId },
+            db,
+          )
+        ) {
+          result.released += 1;
+        }
+      } catch {
+        result.failed += 1;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, candidates.length) }, worker),
+  );
+  return result;
 }
 
 /**

@@ -1993,6 +1993,64 @@ export type KnowledgeBaseObservationProjection = Omit<
   progress: KnowledgeBaseProgressDto;
 };
 
+/**
+ * A customer-approved node can intentionally outlive the provider generation
+ * that produced it. The explicit "create a new canonical task from the local
+ * snapshot" recovery is the only flow that advances build.generation while
+ * retaining that node and its immutable source turn. Keep the compatibility
+ * presentation anchored to the receipt/source generation recorded by that
+ * exact recovery marker; every ordinary build continues to use its current
+ * generation.
+ *
+ * This deliberately rejects coercion, stale target markers, forward/same-
+ * generation sources, and disagreeing receipt/source claims. A malformed
+ * marker therefore loses no write isolation: it simply cannot grant an older
+ * turn presentation authority.
+ */
+export function knowledgeBaseNodeBackedPresentationGeneration(
+  build: Pick<KnowledgeBaseBuild, "generation" | "handoffProvenance">,
+): number {
+  const currentGeneration = build.generation;
+  const provenance =
+    build.handoffProvenance &&
+    typeof build.handoffProvenance === "object" &&
+    !Array.isArray(build.handoffProvenance)
+      ? (build.handoffProvenance as Record<string, unknown>)
+      : null;
+  const rawMarker = provenance?.createNewCanonicalFromSnapshot;
+  const marker =
+    rawMarker && typeof rawMarker === "object" && !Array.isArray(rawMarker)
+      ? (rawMarker as Record<string, unknown>)
+      : null;
+  if (
+    !marker ||
+    marker.schemaVersion !== 1 ||
+    marker.targetGeneration !== currentGeneration
+  ) {
+    return currentGeneration;
+  }
+
+  const receiptSourceGeneration = marker.receiptSourceGeneration;
+  const sourceGeneration = marker.sourceGeneration;
+  if (
+    (receiptSourceGeneration !== undefined &&
+      (!Number.isSafeInteger(receiptSourceGeneration) ||
+        (receiptSourceGeneration as number) < 1 ||
+        (receiptSourceGeneration as number) >= currentGeneration)) ||
+    (sourceGeneration !== undefined &&
+      (!Number.isSafeInteger(sourceGeneration) ||
+        (sourceGeneration as number) < 1 ||
+        (sourceGeneration as number) !== currentGeneration - 1))
+  ) {
+    return currentGeneration;
+  }
+
+  const resolvedSourceGeneration = receiptSourceGeneration ?? sourceGeneration;
+  return typeof resolvedSourceGeneration === "number"
+    ? resolvedSourceGeneration
+    : currentGeneration;
+}
+
 type KnowledgeBaseAcceptedMessageRow = Pick<
   typeof messages.$inferSelect,
   | "id"
@@ -2076,6 +2134,8 @@ async function readKnowledgeBaseObservationProjection(
   // to honor the requested isolation level.
   const build = await loadBuild(db, input.userId, conversationId);
   if (!build) return null;
+  const nodeBackedPresentationGeneration =
+    knowledgeBaseNodeBackedPresentationGeneration(build);
   const rows = await loadNodes(db, build.id);
   const progress = buildDto(build, rows);
   const currentRow = build.currentLeafId
@@ -2184,7 +2244,10 @@ async function readKnowledgeBaseObservationProjection(
               eq(conversationTurns.id, currentRow.sourceTurnId),
               eq(conversationTurns.userId, input.userId),
               eq(conversationTurns.buildId, build.id),
-              eq(conversationTurns.buildGeneration, build.generation),
+              eq(
+                conversationTurns.buildGeneration,
+                nodeBackedPresentationGeneration,
+              ),
             ),
           )
           .limit(1)
@@ -2512,6 +2575,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
         ]
       : [];
   const resources = [...logoResources, ...customerUploadResources];
+  const nodeBackedPresentationGeneration =
+    knowledgeBaseNodeBackedPresentationGeneration(build);
   let approvedPresentation: KnowledgeBaseApprovedPresentationDto | null = null;
   const acceptedReceiptTurnsById = new Map(
     acceptedReceiptTurnRows.map((turn) => [turn.id, turn]),
@@ -2666,7 +2731,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
         turnId:
           currentRow.sourceTurnId || `legacy:${build.id}:${build.revision}`,
         clientRequestId: presentationTurnRow?.clientRequestId || null,
-        generation: build.generation,
+        generation: nodeBackedPresentationGeneration,
         acceptedAt: (
           currentRow.lastResponseAt || currentRow.updatedAt
         ).getTime(),
@@ -2675,7 +2740,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
           build.currentPresentationKey ||
           knowledgePresentationKey({
             buildId: build.id,
-            generation: build.generation,
+            generation: nodeBackedPresentationGeneration,
             revision: build.revision,
             leafId: currentRow.leafId,
             contentSha256,
@@ -2808,16 +2873,26 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     build.protocolErrorCode
   ) {
     const code = build.protocolErrorCode;
+    const localRehydrateRejected =
+      code === "MANUS_V2_LOCAL_REHYDRATE_REJECTED" &&
+      activeTurnMetadata.recoveryAction ===
+        "create_new_canonical_from_snapshot";
     notice = {
       key: `${build.id}:${build.generation}:${build.stateEpoch}:${code}`,
       code,
       severity: "warning",
-      message: approvedPresentation
-        ? "系统正在恢复当前操作。已完成内容不受影响。"
-        : "系统正在恢复当前操作，当前构建状态已安全保留。",
+      message: localRehydrateRejected
+        ? "当前任务已明确拒绝恢复完整上下文。已完成内容不受影响；可确认创建一个新任务继续。"
+        : approvedPresentation
+          ? "系统正在恢复当前操作。已完成内容不受影响。"
+          : "系统正在恢复当前操作，当前构建状态已安全保留。",
       retryable: true,
-      failureClass: "recoverable_same_turn",
-      recoveryAction: "reconcile",
+      failureClass: localRehydrateRejected
+        ? "requires_user_fix"
+        : "recoverable_same_turn",
+      recoveryAction: localRehydrateRejected
+        ? "create_new_canonical_from_snapshot"
+        : "reconcile",
       canRegenerate: false,
       traceId: safeActiveTraceId,
       attachmentCount: Number.isSafeInteger(activeAttachmentCount)
@@ -4598,6 +4673,19 @@ export async function reconcileKnowledgeBaseProgress(input: {
       const previousCurrentIndex = rows.findIndex(
         (row) => row.leafId === state.currentLeafId,
       );
+      const rehydratedHandoffProvenance =
+        build.handoffProvenance &&
+        typeof build.handoffProvenance === "object" &&
+        !Array.isArray(build.handoffProvenance) &&
+        build.handoffProvenance.localRehydrateRequired
+          ? Object.fromEntries(
+              Object.entries(build.handoffProvenance).filter(
+                ([key]) =>
+                  key !== "localRehydrateRequired" &&
+                  key !== "createNewCanonicalFromSnapshot",
+              ),
+            )
+          : undefined;
 
       for (let index = 0; index < rows.length; index += 1) {
         const previous = rows[index]!;
@@ -4718,6 +4806,9 @@ export async function reconcileKnowledgeBaseProgress(input: {
           ...outputLedger,
           protocolError: null,
           protocolErrorCode: null,
+          ...(rehydratedHandoffProvenance
+            ? { handoffProvenance: rehydratedHandoffProvenance }
+            : {}),
           awaitingResponseSince: null,
           completedAt: contentCompleted ? new Date() : null,
           contentCompletedAt: contentCompleted ? new Date() : null,

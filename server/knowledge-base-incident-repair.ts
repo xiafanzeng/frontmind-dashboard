@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import {
   apiCredentials,
@@ -8,6 +8,7 @@ import {
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  messages,
   upstreamResources,
   type Conversation,
   type ConversationTurn,
@@ -57,6 +58,14 @@ export type KnowledgeBaseIncidentRepairFacts = {
   conversation: Conversation | null;
   credential: CredentialFact;
   attachmentResources: UpstreamResource[];
+  /** Immutable assistant receipts bound to the selected source turn. */
+  acceptedReceiptCount?: number;
+  /** The source was recovered from history because build.activeTurnId is null. */
+  historicalSourceTurn?: boolean;
+  /** Current active credential selected for the replacement Provider writer. */
+  replacementCredential?: CredentialFact;
+  /** New uploaded sources are owned by replacementCredential, not the source turn. */
+  replacementSourcesProvided?: boolean;
 };
 
 export type KnowledgeBaseIncidentRepairReselection = {
@@ -108,6 +117,13 @@ export type KnowledgeBaseIncidentRepairApplyResult = {
   requiresReselection: KnowledgeBaseIncidentRepairReselection[];
 };
 
+export type KnowledgeBaseRetainedStartReplay = {
+  turnId: string;
+  clientRequestId: string;
+  generation: number;
+  mode: "resume_start_from_retained_sources" | "reselect_start_sources";
+};
+
 type RepairDependencies = {
   getDatabase?: typeof getDb;
   readStoredFile?: typeof readStoredPresalesFile;
@@ -130,6 +146,21 @@ export type ApplyKnowledgeBaseIncidentRepairInput = {
   conversationId: string;
   repairKind: KnowledgeBaseIncidentRepairKind;
   expectedStateHash: string;
+  /** Customer-owned retry identity; persisted on the unique replacement. */
+  clientRequestId?: string;
+  /** Current active credential; historical source credentials are provenance only. */
+  replacementCredentialId?: string;
+  replacementSources?: {
+    apiCredentialId?: string;
+    attachments: Array<{ file_id: string; filename: string }>;
+    attachmentManifest: Array<{
+      filename: string;
+      sizeBytes: number;
+      mimeType: string;
+      lastModified: number;
+      sha256: string;
+    }>;
+  };
   now?: Date;
   afterApplyInTransaction?: (
     result: KnowledgeBaseIncidentRepairApplyResult,
@@ -313,6 +344,8 @@ export function knowledgeBaseIncidentRepairState(
       directPrefilledCount: build.directPrefilledCount,
       needsVerificationCount: build.needsVerificationCount,
       protocolErrorCode: build.protocolErrorCode,
+      historicalSourceTurn: facts.historicalSourceTurn === true,
+      acceptedReceiptCount: facts.acceptedReceiptCount ?? 0,
     },
     conversation: facts.conversation
       ? {
@@ -417,13 +450,32 @@ function attachmentManifest(turn: ConversationTurn | null) {
     : [];
 }
 
+export function uniqueHistoricalKnowledgeBaseStartSource(
+  candidates: readonly ConversationTurn[],
+) {
+  const eligible = candidates.filter(
+    (turn) =>
+      turn.status === "failed" &&
+      turn.operationType === "start" &&
+      turn.errorCode === "UPSTREAM_CREATE_3" &&
+      turn.upstreamTaskId === null &&
+      turn.expectedRevision === 0 &&
+      turn.expectedLeafId === null,
+  );
+  return eligible.length === 1 ? eligible[0]! : null;
+}
+
 function credentialUsable(facts: KnowledgeBaseIncidentRepairFacts) {
   const turn = facts.activeTurn;
+  const credential = facts.replacementCredential ?? facts.credential;
+  const expectedCredentialId =
+    facts.replacementCredential?.id ?? turn?.apiCredentialId;
   return Boolean(
-    turn?.apiCredentialId &&
-      facts.credential?.id === turn.apiCredentialId &&
-      (facts.credential.status === "active" ||
-        facts.credential.status === "retired"),
+    expectedCredentialId &&
+      credential?.id === expectedCredentialId &&
+      (facts.replacementCredential
+        ? credential.status === "active"
+        : credential.status === "active" || credential.status === "retired"),
   );
 }
 
@@ -447,7 +499,19 @@ function conversationUsable(facts: KnowledgeBaseIncidentRepairFacts) {
 function commonBlockers(facts: KnowledgeBaseIncidentRepairFacts) {
   const blockers: string[] = [];
   const { build, activeTurn } = facts;
-  if (!activeTurn || activeTurn.id !== build.activeTurnId) {
+  const historicalStartAuthority = Boolean(
+    facts.historicalSourceTurn === true &&
+      build.activeTurnId === null &&
+      activeTurn?.status === "failed" &&
+      activeTurn.operationType === "start" &&
+      activeTurn.errorCode === "UPSTREAM_CREATE_3" &&
+      activeTurn.buildId === build.id &&
+      activeTurn.buildGeneration === build.generation,
+  );
+  if (
+    !activeTurn ||
+    (activeTurn.id !== build.activeTurnId && !historicalStartAuthority)
+  ) {
     blockers.push("active_turn_mismatch");
   } else if (
     activeTurn.userId !== build.userId ||
@@ -506,6 +570,9 @@ function startAttachmentOwnershipBlockers(
     ]),
   );
   const mismatches: KnowledgeBaseIncidentRepairReselection[] = [];
+  const expectedCredentialId = facts.replacementSourcesProvided
+    ? facts.replacementCredential?.id
+    : facts.activeTurn?.apiCredentialId;
   ids.forEach((fileId, index) => {
     const resource = resources.get(fileId);
     if (
@@ -514,7 +581,7 @@ function startAttachmentOwnershipBlockers(
       resource.userId !== facts.build.userId ||
       resource.kind !== "file" ||
       resource.projectAssignmentId !== null ||
-      resource.apiCredentialId !== facts.activeTurn?.apiCredentialId ||
+      resource.apiCredentialId !== expectedCredentialId ||
       Boolean(resource.contentDeletedAt)
     ) {
       mismatches.push({ ordinal: index + 1, code: "ownership_mismatch" });
@@ -531,6 +598,9 @@ function startIncidentBlockers(facts: KnowledgeBaseIncidentRepairFacts) {
   const declaredUserAttachmentCount = safeInteger(
     record(turn?.metadata).userAttachmentCount,
   );
+  if (build.status !== "failed" && build.status !== "protocol_error") {
+    blockers.push("starter_build_not_failed");
+  }
   if (
     !turn ||
     turn.status !== "failed" ||
@@ -542,12 +612,20 @@ function startIncidentBlockers(facts: KnowledgeBaseIncidentRepairFacts) {
     blockers.push("turn_task_already_bound");
   }
   if (build.upstreamTaskId) blockers.push("build_task_already_bound");
+  if (build.canonicalTaskId) blockers.push("canonical_task_already_bound");
   if (
     build.revision !== 0 ||
     build.currentLeafId !== null ||
-    facts.nodes.length !== 0
+    facts.nodes.length !== 0 ||
+    build.totalNodeCount !== 0 ||
+    build.confirmedCount !== 0 ||
+    build.directPrefilledCount !== 0 ||
+    build.needsVerificationCount !== 0
   ) {
     blockers.push("starter_already_has_accepted_nodes");
+  }
+  if ((facts.acceptedReceiptCount ?? 0) !== 0) {
+    blockers.push("starter_has_accepted_receipt");
   }
   if (
     attachments.length < 1 ||
@@ -658,6 +736,7 @@ async function loadRepairFacts(input: {
   userId: number;
   conversationId: string;
   lock: boolean;
+  repairKind: KnowledgeBaseIncidentRepairKind;
 }) {
   let buildQuery = input.executor
     .select()
@@ -682,6 +761,29 @@ async function loadRepairFacts(input: {
       .limit(1);
     if (input.lock) turnQuery = turnQuery.for("update");
     turn = ((await turnQuery)[0] as ConversationTurn | undefined) ?? null;
+  } else if (input.repairKind === "retained_upstream_create_3_start") {
+    let candidatesQuery = input.executor
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, build.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          eq(conversationTurns.operationType, "start"),
+          eq(conversationTurns.status, "failed"),
+          eq(conversationTurns.errorCode, "UPSTREAM_CREATE_3"),
+          isNull(conversationTurns.upstreamTaskId),
+          eq(conversationTurns.expectedRevision, 0),
+          isNull(conversationTurns.expectedLeafId),
+        ),
+      )
+      .orderBy(asc(conversationTurns.createdAt), asc(conversationTurns.id))
+      .limit(2);
+    if (input.lock) candidatesQuery = candidatesQuery.for("update");
+    const candidates = (await candidatesQuery) as ConversationTurn[];
+    // Never guess among historical failures. Exactly one source is required.
+    turn = uniqueHistoricalKnowledgeBaseStartSource(candidates);
   }
 
   let nodesQuery = input.executor
@@ -745,6 +847,31 @@ async function loadRepairFacts(input: {
     if (input.lock) resourceQuery = resourceQuery.for("update");
     attachmentResources = (await resourceQuery) as UpstreamResource[];
   }
+  let acceptedReceiptCount = 0;
+  if (turn) {
+    const acceptedRows = await input.executor
+      .select({ id: messages.id })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.userId, build.userId),
+          eq(
+            messages.conversationId,
+            knowledgeBaseConversationStorageId(
+              build.userId,
+              build.conversationId,
+            ),
+          ),
+          eq(messages.turnId, turn.id),
+          eq(messages.role, "assistant"),
+          isNull(messages.deletedAt),
+          sql`JSON_UNQUOTE(JSON_EXTRACT(${messages.metadata}, '$.knowledgeBase.serverOwned')) = 'true'`,
+          sql`JSON_UNQUOTE(JSON_EXTRACT(${messages.metadata}, '$.knowledgeBase.kind')) IN ('presentation', 'completion')`,
+        ),
+      )
+      .limit(1);
+    acceptedReceiptCount = acceptedRows.length;
+  }
   return {
     build,
     activeTurn: turn,
@@ -752,6 +879,8 @@ async function loadRepairFacts(input: {
     conversation,
     credential,
     attachmentResources,
+    acceptedReceiptCount,
+    historicalSourceTurn: build.activeTurnId === null && turn !== null,
   } satisfies KnowledgeBaseIncidentRepairFacts;
 }
 
@@ -844,6 +973,7 @@ export async function previewKnowledgeBaseIncidentRepair(
     userId: input.userId,
     conversationId: input.conversationId.trim(),
     lock: false,
+    repairKind: input.repairKind,
   });
   if (!facts) return null;
   const retainedFailures =
@@ -920,6 +1050,8 @@ function replacementTurnValues(input: {
   facts: KnowledgeBaseIncidentRepairFacts;
   repairKind: KnowledgeBaseIncidentRepairKind;
   now: Date;
+  clientRequestId?: string;
+  replacementSourcesProvided?: boolean;
 }) {
   const { build, activeTurn: source } = input.facts;
   if (!source) throw new Error("Incident repair has no active turn");
@@ -973,8 +1105,9 @@ function replacementTurnValues(input: {
       id: turnId,
       conversationId: source.conversationId,
       userId: build.userId,
-      apiCredentialId: source.apiCredentialId,
-      clientRequestId: `kb-repair-${turnId}`,
+      apiCredentialId:
+        input.facts.replacementCredential?.id ?? source.apiCredentialId,
+      clientRequestId: input.clientRequestId || `kb-repair-${turnId}`,
       buildId: build.id,
       buildGeneration: generation,
       operationKey,
@@ -1007,6 +1140,15 @@ function replacementTurnValues(input: {
         supersedesTurnId: source.id,
         hiddenReplacement: true,
         chargeDisposition: "reuse_original_no_charge",
+        historicalSourceTurnId:
+          input.facts.historicalSourceTurn === true ? source.id : undefined,
+        sourceRecoveryMode:
+          input.repairKind === "retained_upstream_create_3_start"
+            ? input.replacementSourcesProvided
+              ? "reselect_start_sources"
+              : "resume_start_from_retained_sources"
+            : undefined,
+        sourceRecoveryClientRequestId: input.clientRequestId,
       },
       leaseExpiresAt: null,
       model: null,
@@ -1107,11 +1249,45 @@ export async function applyKnowledgeBaseIncidentRepair(
   const db = await (dependencies.getDatabase ?? getDb)();
   if (!db) throw new Error("Database is not configured");
   return db.transaction(async (tx: any) => {
+    let replacementCredential: CredentialFact = null;
+    if (
+      input.repairKind === "retained_upstream_create_3_start" &&
+      input.replacementCredentialId
+    ) {
+      const replacementCredentialId = input.replacementCredentialId.trim();
+      if (!replacementCredentialId || replacementCredentialId.length > 36) {
+        throw new TypeError(
+          "Knowledge-base start recovery credential id is invalid",
+        );
+      }
+      const replacementCredentialRows = await tx
+        .select({
+          id: apiCredentials.id,
+          userId: apiCredentials.userId,
+          status: apiCredentials.status,
+        })
+        .from(apiCredentials)
+        .where(
+          and(
+            eq(apiCredentials.id, replacementCredentialId),
+            eq(apiCredentials.userId, input.userId),
+            eq(apiCredentials.status, "active"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      replacementCredential =
+        (replacementCredentialRows[0] as CredentialFact) ?? null;
+      if (!replacementCredential) {
+        throw new KnowledgeBaseIncidentRepairAuthorizationError();
+      }
+    }
     const facts = await loadRepairFacts({
       executor: tx,
       userId: input.userId,
       conversationId: input.conversationId.trim(),
       lock: true,
+      repairKind: input.repairKind,
     });
     if (!facts) throw new Error("Knowledge-base build was not found");
     const observedStateHash = hashKnowledgeBaseIncidentRepairState(facts);
@@ -1134,8 +1310,73 @@ export async function applyKnowledgeBaseIncidentRepair(
         noopReason: "state_changed",
       };
     }
+    let effectiveFacts: KnowledgeBaseIncidentRepairFacts = replacementCredential
+      ? { ...facts, replacementCredential }
+      : facts;
+    if (
+      input.repairKind === "retained_upstream_create_3_start" &&
+      input.replacementSources
+    ) {
+      const source = facts.activeTurn;
+      if (!source) {
+        return {
+          ...baseResult,
+          applied: false,
+          noopReason: "predicate_not_met",
+        };
+      }
+      const sourceMetadata = record(source.metadata);
+      const recovery = record(sourceMetadata.recovery);
+      const attachments = input.replacementSources.attachments;
+      const attachmentManifest = input.replacementSources.attachmentManifest;
+      if (
+        attachments.length < 1 ||
+        attachments.length !== attachmentManifest.length ||
+        new Set(attachments.map((item) => item.file_id)).size !==
+          attachments.length
+      ) {
+        return {
+          ...baseResult,
+          applied: false,
+          noopReason: "requires_reselection",
+        };
+      }
+      const ids = attachments.map((item) => item.file_id);
+      const replacementResources = (await tx
+        .select()
+        .from(upstreamResources)
+        .where(
+          and(
+            eq(upstreamResources.kind, "file"),
+            inArray(upstreamResources.upstreamId, ids),
+          ),
+        )
+        .limit(ids.length)
+        .for("update")) as UpstreamResource[];
+      effectiveFacts = {
+        ...effectiveFacts,
+        activeTurn: {
+          ...source,
+          attachmentFileIds: ids,
+          metadata: {
+            ...sourceMetadata,
+            userAttachmentCount: attachments.length,
+            expectedAttachmentCount: attachments.length + 2,
+            recovery: {
+              ...recovery,
+              attachments,
+              attachmentManifest,
+              capturedClientAttachments: true,
+              deferredClientAttachments: false,
+            },
+          },
+        },
+        attachmentResources: replacementResources,
+        replacementSourcesProvided: true,
+      };
+    }
     const inspection = inspectKnowledgeBaseIncidentRepairFacts({
-      facts,
+      facts: effectiveFacts,
       repairKind: input.repairKind,
     });
     if (inspection.blockers.length > 0) {
@@ -1149,7 +1390,7 @@ export async function applyKnowledgeBaseIncidentRepair(
     const retainedFailures =
       input.repairKind === "retained_upstream_create_3_start"
         ? await retainedAttachmentProofs({
-            facts,
+            facts: effectiveFacts,
             readStoredFile:
               dependencies.readStoredFile ?? readStoredPresalesFile,
           })
@@ -1168,9 +1409,11 @@ export async function applyKnowledgeBaseIncidentRepair(
     }
     const source = facts.activeTurn!;
     const replacement = replacementTurnValues({
-      facts,
+      facts: effectiveFacts,
       repairKind: input.repairKind,
       now,
+      clientRequestId: input.clientRequestId,
+      replacementSourcesProvided: input.replacementSources !== undefined,
     });
     const sourceMetadata = record(source.metadata);
     const nextBuildValues = buildUpdateValues({
@@ -1182,7 +1425,7 @@ export async function applyKnowledgeBaseIncidentRepair(
     });
     const conversation = facts.conversation!;
     const nextConversationValues = {
-      apiCredentialId: source.apiCredentialId,
+      apiCredentialId: replacement.row.apiCredentialId,
       status: "running" as const,
       upstreamTaskId:
         input.repairKind === "legacy_skill_404_confirm"
@@ -1207,6 +1450,18 @@ export async function applyKnowledgeBaseIncidentRepair(
           supersededByTurnId: replacement.row.id,
           supersededAt: now.toISOString(),
           supersededReason: input.repairKind,
+          releasedOperationTombstone: {
+            operationKey: source.operationKey,
+            generation: source.buildGeneration,
+            releasedAt: now.toISOString(),
+            reason: input.repairKind,
+          },
+          historicalSourceTurnId:
+            facts.historicalSourceTurn === true ? source.id : undefined,
+          sourceRecoveryMode:
+            input.replacementSources !== undefined
+              ? "reselect_start_sources"
+              : "resume_start_from_retained_sources",
         },
         updatedAt: now,
       })
@@ -1221,6 +1476,9 @@ export async function applyKnowledgeBaseIncidentRepair(
       throw new Error("Knowledge-base incident source turn CAS was lost");
     }
     await tx.insert(conversationTurns).values(replacement.row);
+    const activeTurnPredicate = facts.historicalSourceTurn
+      ? isNull(knowledgeBaseBuilds.activeTurnId)
+      : eq(knowledgeBaseBuilds.activeTurnId, source.id);
     const updated = await tx
       .update(knowledgeBaseBuilds)
       .set(nextBuildValues)
@@ -1230,7 +1488,7 @@ export async function applyKnowledgeBaseIncidentRepair(
           eq(knowledgeBaseBuilds.userId, facts.build.userId),
           eq(knowledgeBaseBuilds.generation, facts.build.generation),
           eq(knowledgeBaseBuilds.stateEpoch, facts.build.stateEpoch),
-          eq(knowledgeBaseBuilds.activeTurnId, source.id),
+          activeTurnPredicate,
         ),
       );
     if (updated[0]?.affectedRows !== 1) {
@@ -1329,6 +1587,99 @@ export function executeKnowledgeBaseIncidentRepairFromSignedImageMaintenance(
     },
     dependencies,
   );
+}
+
+/**
+ * Customer-triggered retained-source restart. The browser supplies only CAS
+ * coordinates and an idempotency id; source-turn selection remains entirely
+ * server-side and still requires the exact single historical failure.
+ */
+export function executeKnowledgeBaseRetainedStartRecoveryFromCustomer(
+  input: {
+    userId: number;
+    conversationId: string;
+    expectedStateHash: string;
+    clientRequestId: string;
+    replacementCredentialId: string;
+    replacementSources?: ApplyKnowledgeBaseIncidentRepairInput["replacementSources"];
+    now?: Date;
+  },
+  dependencies: Omit<RepairDependencies, "maintenanceAuthority"> = {},
+) {
+  const clientRequestId = input.clientRequestId.trim();
+  if (!clientRequestId || clientRequestId.length > 128) {
+    throw new TypeError("Knowledge-base start recovery request id is invalid");
+  }
+  return applyKnowledgeBaseIncidentRepairWithSignedImageAuthority(
+    {
+      userId: input.userId,
+      conversationId: input.conversationId,
+      repairKind: "retained_upstream_create_3_start",
+      expectedStateHash: input.expectedStateHash,
+      clientRequestId,
+      replacementCredentialId: input.replacementCredentialId,
+      replacementSources: input.replacementSources,
+      now: input.now,
+    },
+    dependencies,
+  );
+}
+
+export async function findKnowledgeBaseRetainedStartRecoveryReplay(
+  input: { userId: number; conversationId: string; clientRequestId: string },
+  dependencies: Pick<RepairDependencies, "getDatabase"> = {},
+): Promise<KnowledgeBaseRetainedStartReplay | null> {
+  const clientRequestId = input.clientRequestId.trim();
+  if (!clientRequestId) return null;
+  const db = await (dependencies.getDatabase ?? getDb)();
+  if (!db) throw new Error("Database is not configured");
+  const buildRows = await db
+    .select({
+      id: knowledgeBaseBuilds.id,
+      generation: knowledgeBaseBuilds.generation,
+    })
+    .from(knowledgeBaseBuilds)
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.conversationId, input.conversationId.trim()),
+      ),
+    )
+    .limit(1);
+  const build = buildRows[0];
+  if (!build) return null;
+  const rows = (await db
+    .select()
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.buildId, build.id),
+        eq(conversationTurns.clientRequestId, clientRequestId),
+        eq(conversationTurns.operationType, "start"),
+      ),
+    )
+    .limit(2)) as ConversationTurn[];
+  const replay = rows.find((row) => {
+    const metadata = record(row.metadata);
+    return (
+      metadata.repairKind === "retained_upstream_create_3_start" &&
+      metadata.chargeDisposition === "reuse_original_no_charge" &&
+      row.buildGeneration === build.generation
+    );
+  });
+  return replay?.buildGeneration
+    ? {
+        turnId: replay.id,
+        clientRequestId: replay.clientRequestId,
+        generation: replay.buildGeneration,
+        mode:
+          record(replay.metadata).sourceRecoveryMode ===
+          "reselect_start_sources"
+            ? "reselect_start_sources"
+            : "resume_start_from_retained_sources",
+      }
+    : null;
 }
 
 export function knowledgeBaseIncidentAuditTarget(buildId: string) {

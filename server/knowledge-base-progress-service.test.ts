@@ -17,6 +17,7 @@ import {
   isAmbiguousKnowledgeBaseAdvance,
   isKnowledgeBaseAcknowledgementOnlyOutput,
   knowledgeBaseObservationConversationStorageId,
+  knowledgeBaseNodeBackedPresentationGeneration,
   knowledgeBaseAcceptedProviderAttemptMetadata,
   knowledgeBaseOperationalFailureAuthority,
   knowledgeBasePackageProjectionCompatibility,
@@ -39,6 +40,75 @@ import {
   KnowledgeBaseProgressError,
 } from "./knowledge-base-progress";
 import { stripKnowledgeBaseReferenceAppendix } from "../shared/knowledge-base-output";
+
+describe("knowledge-base replacement canonical presentation authority", () => {
+  it("uses only the strictly matched historical receipt generation for retained node presentation", () => {
+    const build = (
+      createNewCanonicalFromSnapshot?: Record<string, unknown>,
+    ): Parameters<typeof knowledgeBaseNodeBackedPresentationGeneration>[0] =>
+      ({
+        generation: 8,
+        handoffProvenance: createNewCanonicalFromSnapshot
+          ? { createNewCanonicalFromSnapshot }
+          : null,
+      }) as Parameters<typeof knowledgeBaseNodeBackedPresentationGeneration>[0];
+
+    expect(
+      knowledgeBaseNodeBackedPresentationGeneration(
+        build({
+          schemaVersion: 1,
+          receiptSourceGeneration: 7,
+          sourceGeneration: 7,
+          targetGeneration: 8,
+        }),
+      ),
+    ).toBe(7);
+    expect(
+      knowledgeBaseNodeBackedPresentationGeneration(
+        build({
+          schemaVersion: 1,
+          receiptSourceGeneration: 6,
+          sourceGeneration: 7,
+          targetGeneration: 8,
+        }),
+      ),
+    ).toBe(6);
+
+    for (const marker of [
+      undefined,
+      {
+        schemaVersion: 1,
+        sourceGeneration: 7,
+        targetGeneration: 9,
+      },
+      {
+        schemaVersion: 1,
+        sourceGeneration: 6,
+        targetGeneration: 8,
+      },
+      {
+        schemaVersion: 1,
+        sourceGeneration: "7",
+        targetGeneration: 8,
+      },
+      {
+        schemaVersion: 1,
+        receiptSourceGeneration: "6",
+        sourceGeneration: 7,
+        targetGeneration: 8,
+      },
+      {
+        schemaVersion: 1,
+        sourceGeneration: 8,
+        targetGeneration: 8,
+      },
+    ]) {
+      expect(knowledgeBaseNodeBackedPresentationGeneration(build(marker))).toBe(
+        8,
+      );
+    }
+  });
+});
 
 describe("knowledge-base structured-result acceptance metadata", () => {
   it.each(["sending", "output_pending"])(

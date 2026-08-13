@@ -101,6 +101,7 @@ vi.mock("@/lib/trpc", () => ({
 
 import EmbeddedKnowledgeBasePanel, {
   isKnowledgeBaseProgressProjectionOlder,
+  knowledgeResetButtonLabel,
   shouldDiscardConversationAfterKnowledgeReset,
 } from "./EmbeddedKnowledgeBasePanel";
 
@@ -168,6 +169,20 @@ describe("knowledge-base progress projection ordering", () => {
 });
 
 describe("EmbeddedKnowledgeBasePanel reset action", () => {
+  it("uses the exact disabled label while no engineer is assigned", () => {
+    expect(knowledgeResetButtonLabel({ locked: false, engineer: null })).toBe(
+      "请等待分配AI 运维工程师",
+    );
+    expect(
+      knowledgeResetButtonLabel({
+        locked: false,
+        engineer: { id: 9, name: "运维" },
+      }),
+    ).toBe("申请重置知识库");
+    expect(knowledgeResetButtonLabel({ locked: true, engineer: null })).toBe(
+      "重置申请审批中",
+    );
+  });
   it("does not mount the build flow before reset status is known", () => {
     mocks.resetStatus = undefined;
 

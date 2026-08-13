@@ -41,6 +41,8 @@ import {
   inspectKnowledgeBaseLegacyDeferredReservationReplay,
   inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
+  inspectKnowledgeBaseLocalRehydrateRequirement,
+  loadKnowledgeBaseLocalRehydrateSnapshot,
   inspectKnowledgeBaseRetryAuthority,
   inspectKnowledgeBaseFailedNotSentLegacyHandoffAuthority,
   knowledgeBaseRetryRequiresFreshFinalDelivery,
@@ -50,6 +52,7 @@ import {
   markKnowledgeBaseManusV2CredentialRebindAttention,
   markLegacyKnowledgeBaseCreateAttentionRequired,
   mutateKnowledgeBaseManusV2Lifecycle,
+  observeAndLocallySettleKnowledgeBaseTerminalAnchor,
   persistKnowledgeBaseManusV2AttachmentAttempt,
   persistKnowledgeBaseManusV2AttachmentOutcomeUnknown,
   persistKnowledgeBaseManusV2AttachmentMapping,
@@ -57,7 +60,9 @@ import {
   promoteKnowledgeBaseGeneratedAttachmentReady,
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
+  releaseGeneratedAttachmentInvalidPreproviderTurn,
   reserveKnowledgeBaseGeneratedAttachment,
+  reserveKnowledgeBaseNewCanonicalFromSnapshot,
   reserveKnowledgeBaseFailedNotSentLegacyHandoff,
   reserveKnowledgeBaseRetryTurn,
   reserveKnowledgeBaseManusV2AnchorHandoff,
@@ -70,6 +75,7 @@ import {
   sanitizeKnowledgeBaseRecoveryMetadata,
   settleKnowledgeBaseManusV2ExplicitRejection,
 } from "./knowledge-base-turn-service";
+import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import {
   KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
   KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
@@ -812,6 +818,289 @@ describe("failed not-sent legacy business handoff", () => {
   });
 });
 
+describe("generated attachment invalid pre-provider release", () => {
+  function fixture(metadataPatch: Record<string, unknown> = {}) {
+    const source = turn({
+      status: "failed",
+      errorCode: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
+      completedAt: new Date("2026-08-01T00:00:20.000Z"),
+      leaseExpiresAt: null,
+      upstreamTaskId: null,
+      attachmentFileIds: ["stale-skill", "stale-instructions"],
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 2,
+        userAttachmentCount: 0,
+        createAttemptState: "not_sent",
+        providerProtocol: "legacy_v1",
+        providerAttemptState: "not_sent",
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "contact_support",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          userMessage: "确认",
+          attachments: [],
+        },
+        generatedAttachmentReservations: {
+          "skill:0": { status: "ready" },
+        },
+        ...metadataPatch,
+      },
+    });
+    const content = "## 1.8 当前节点\n\n正文保持不变";
+    const contentSha256 = createHash("sha256")
+      .update(content, "utf8")
+      .digest("hex");
+    const presentationKey = createHash("sha256")
+      .update(
+        [
+          source.buildId,
+          source.buildGeneration,
+          source.expectedRevision,
+          source.expectedLeafId,
+          contentSha256,
+        ].join(":"),
+      )
+      .digest("hex");
+    const build = {
+      id: source.buildId,
+      userId: 1,
+      conversationId: "conversation-1",
+      upstreamTaskId: "legacy-main-task",
+      providerProtocol: "legacy_v1",
+      canonicalTaskId: null,
+      canonicalTaskGeneration: null,
+      canonicalCredentialId: null,
+      canonicalTaskState: "unbound",
+      canonicalTaskUrl: null,
+      canonicalTaskCreatedAt: null,
+      handoffProvenance: null,
+      status: "protocol_error",
+      generation: source.buildGeneration,
+      stateEpoch: 9,
+      revision: source.expectedRevision,
+      currentLeafId: source.expectedLeafId,
+      currentPresentationKey: presentationKey,
+      activeTurnId: source.id,
+      protocolErrorCode: source.errorCode,
+      protocolError: "generated attachment invalid",
+      awaitingResponseSince: null,
+      recoveryLeaseOwnerHash: null,
+      recoveryLeaseExpiresAt: null,
+      totalNodeCount: 1,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+    } as any;
+    const node = {
+      id: "node-1",
+      buildId: source.buildId,
+      leafId: source.expectedLeafId,
+      status: "current",
+      contentMarkdown: content,
+      contentSha256,
+      presentationKey,
+      sourceTurnId: "prior-completed-turn",
+    };
+    const conversation = {
+      id: source.conversationId,
+      userId: source.userId,
+      projectAssignmentId: null,
+      deletedAt: null,
+      status: "failed",
+      version: 3,
+      deletedMessageIds: [],
+    };
+    const selection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === source.id);
+    return { source, build, node, conversation, selection };
+  }
+
+  it("locally settles the exact not-sent failure without changing accepted state", async () => {
+    const value = fixture();
+    const { executor, store } = createTurnServiceExecutor({
+      build: value.build,
+      conversation: value.conversation,
+      turns: [value.source],
+      nodes: [value.node],
+      turnSelections: [[value.selection, value.selection]],
+    });
+    const before = {
+      revision: store.build.revision,
+      leaf: store.build.currentLeafId,
+      presentation: store.build.currentPresentationKey,
+      counts: [
+        store.build.totalNodeCount,
+        store.build.confirmedCount,
+        store.build.directPrefilledCount,
+        store.build.needsVerificationCount,
+      ],
+      nodes: structuredClone(store.nodes),
+    };
+    await expect(
+      releaseGeneratedAttachmentInvalidPreproviderTurn(
+        { turnId: value.source.id },
+        executor,
+      ),
+    ).resolves.toBe(true);
+    expect(store.build).toMatchObject({
+      status: "confirming",
+      upstreamTaskId: null,
+      providerProtocol: "manus_v2",
+      canonicalTaskState: "unbound",
+      activeTurnId: null,
+      protocolErrorCode: null,
+      revision: before.revision,
+      currentLeafId: before.leaf,
+      currentPresentationKey: before.presentation,
+      handoffProvenance: {
+        legacyTaskIdSha256: createHash("sha256")
+          .update("legacy-main-task")
+          .digest("hex"),
+      },
+    });
+    expect([
+      store.build.totalNodeCount,
+      store.build.confirmedCount,
+      store.build.directPrefilledCount,
+      store.build.needsVerificationCount,
+    ]).toEqual(before.counts);
+    expect(store.nodes).toEqual(before.nodes);
+    expect(store.turns[0]).toMatchObject({
+      status: "cancelled",
+      upstreamTaskId: null,
+      attachmentFileIds: [],
+      metadata: {
+        localPreproviderRelease: true,
+        generatedAttachmentReservations: {},
+        localRehydrateRequired: {
+          sourceTurnId: value.source.id,
+          presentationKey: before.presentation,
+        },
+      },
+    });
+    expect(store.conversation).toMatchObject({
+      status: "awaiting_input",
+      version: 4,
+    });
+  });
+
+  it("settles a historical explicit not-sent row whose provider projection was absent", async () => {
+    const value = fixture();
+    delete (value.source.metadata as Record<string, unknown>)
+      .providerAttemptState;
+    const { executor, store } = createTurnServiceExecutor({
+      build: value.build,
+      conversation: value.conversation,
+      turns: [value.source],
+      nodes: [value.node],
+      turnSelections: [[value.selection, value.selection]],
+    });
+    await expect(
+      releaseGeneratedAttachmentInvalidPreproviderTurn(
+        { turnId: value.source.id },
+        executor,
+      ),
+    ).resolves.toBe(true);
+    expect(store.turns[0]).toMatchObject({
+      status: "cancelled",
+      metadata: {
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+        localPreproviderRelease: true,
+      },
+    });
+  });
+
+  it("refuses local release when the scoped message ledger already has a completion receipt", async () => {
+    const value = fixture();
+    const { executor, store } = createTurnServiceExecutor({
+      build: value.build,
+      conversation: value.conversation,
+      turns: [value.source],
+      nodes: [value.node],
+      messages: [
+        {
+          id: "completion-message",
+          userId: value.source.userId,
+          conversationId: `u${value.source.userId}:${value.build.conversationId}`,
+          turnId: value.source.id,
+          role: "assistant",
+          deletedAt: null,
+          metadata: {
+            knowledgeBase: { serverOwned: true, kind: "completion" },
+          },
+        },
+      ],
+      selectAllMessages: true,
+      turnSelections: [[value.selection, value.selection]],
+    });
+
+    await expect(
+      releaseGeneratedAttachmentInvalidPreproviderTurn(
+        { turnId: value.source.id },
+        executor,
+      ),
+    ).resolves.toBe(false);
+    expect(store.build.activeTurnId).toBe(value.source.id);
+    expect(store.turns[0]?.status).toBe("failed");
+  });
+
+  it.each([
+    ["wrong code", {}, { errorCode: "UPSTREAM_CREATE_3" }],
+    [
+      "sending",
+      {
+        createAttemptState: "sending",
+        providerAttemptState: "sending",
+        dispatchingAt: "2026-08-01T00:00:10.000Z",
+      },
+      {},
+    ],
+    [
+      "unknown",
+      {
+        createAttemptState: "unknown",
+        providerAttemptState: "outcome_unknown",
+        outcomeUnknownAt: "2026-08-01T00:00:10.000Z",
+      },
+      {},
+    ],
+    [
+      "acknowledged",
+      {
+        createAttemptState: "acknowledged",
+        providerAttemptState: "output_pending",
+      },
+      {},
+    ],
+    ["prepared request", { preparedDispatch: { schemaVersion: 1 } }, {}],
+  ])(
+    "rejects %s without mutating it",
+    async (_label, metadataPatch, turnPatch) => {
+      const value = fixture(metadataPatch);
+      Object.assign(value.source, turnPatch);
+      const { executor, store } = createTurnServiceExecutor({
+        build: value.build,
+        conversation: value.conversation,
+        turns: [value.source],
+        nodes: [value.node],
+        turnSelections: [[value.selection, value.selection]],
+      });
+      const before = structuredClone(store);
+      await expect(
+        releaseGeneratedAttachmentInvalidPreproviderTurn(
+          { turnId: value.source.id },
+          executor,
+        ),
+      ).resolves.toBe(false);
+      expect(store).toEqual(before);
+    },
+  );
+});
+
 describe("Manus v2 canonical task writer fence", () => {
   const build = (overrides: Record<string, unknown> = {}) => ({
     id: identity.buildId,
@@ -883,6 +1172,81 @@ describe("Manus v2 canonical task writer fence", () => {
     completedAt: null,
     publishedAt: null,
     ...overrides,
+  });
+
+  it("does not retry a rejected local rehydrate and exposes only the customer-authorized new-task action", async () => {
+    const leaseToken = "local-rehydrate-rejection-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256").update(leaseToken).digest("hex"),
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "sending",
+        createAttemptState: "acknowledged",
+        frozenProviderRequestHash: "f".repeat(64),
+        operationToken: "operation-1",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+        handoffProvenance: {
+          localRehydrateRequired: {
+            schemaVersion: 1,
+            sourceTurnId: "00000000-0000-4000-8000-000000000003",
+            snapshotSha256: "c".repeat(64),
+            taskIdSha256: createHash("sha256")
+              .update("canonical-task")
+              .digest("hex"),
+            generation: 3,
+            revision: 7,
+            leafId: "1.8",
+          },
+        },
+      }),
+      conversation: {
+        id: active.conversationId,
+        userId: active.userId,
+        projectAssignmentId: null,
+        version: 1,
+      },
+      turns: [active],
+      turnSelections: [[(store) => store.turns, (store) => store.turns]],
+    });
+
+    await expect(
+      settleKnowledgeBaseManusV2ExplicitRejection(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          code: "MANUS_V2_SEND_REJECTED",
+          retryable: true,
+          now: new Date("2026-08-13T00:02:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ retryScheduled: false, attempt: 1 });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      metadata: {
+        providerAttemptState: "rejected",
+        failureClass: "requires_user_fix",
+        recoveryAction: "create_new_canonical_from_snapshot",
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "MANUS_V2_LOCAL_REHYDRATE_REJECTED",
+      activeTurnId: active.id,
+    });
   });
 
   it("reserves an idle legacy anchor without changing accepted nodes or messages", async () => {
@@ -2204,6 +2568,344 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(harness.store.build).toMatchObject({
       activeTurnId: activeTurn.id,
       canonicalTaskId: "canonical-task",
+    });
+  });
+
+  it("accepts local rehydrate only for the exact canonical generation, revision and task", () => {
+    const exactBuild = build({
+      providerProtocol: "manus_v2",
+      canonicalTaskId: "canonical-task",
+      canonicalTaskGeneration: 3,
+      generation: 3,
+      revision: 7,
+      currentLeafId: "1.8",
+      handoffProvenance: {
+        localRehydrateRequired: {
+          schemaVersion: 1,
+          sourceTurnId: "00000000-0000-4000-8000-000000000001",
+          snapshotSha256: "c".repeat(64),
+          taskIdSha256: createHash("sha256")
+            .update("canonical-task")
+            .digest("hex"),
+          generation: 3,
+          revision: 7,
+          leafId: "1.8",
+        },
+      },
+    });
+    expect(inspectKnowledgeBaseLocalRehydrateRequirement(exactBuild)).toEqual({
+      sourceTurnId: "00000000-0000-4000-8000-000000000001",
+      snapshotSha256: "c".repeat(64),
+    });
+    for (const patch of [
+      { canonicalTaskId: "different-task" },
+      { generation: 4 },
+      { revision: 8 },
+      { currentLeafId: "1.9" },
+    ]) {
+      expect(() =>
+        inspectKnowledgeBaseLocalRehydrateRequirement({
+          ...exactBuild,
+          ...patch,
+        }),
+      ).toThrowError(KnowledgeBaseTurnReservationError);
+    }
+  });
+
+  it("accepts the exact unbound replacement marker and reloads its frozen accepted snapshot", async () => {
+    const sourceTurnId = "00000000-0000-4000-8000-000000000003";
+    const snapshot = {
+      schemaVersion: 1,
+      purpose: "legacy_to_manus_v2_anchor_handoff",
+      source: { buildId: identity.buildId },
+      nodes: [{ leafId: "1.8", contentMarkdown: "accepted body" }],
+      acceptedReceipts: [],
+      pendingOperation: { kind: "anchor_only" },
+    };
+    const json = JSON.stringify(snapshot);
+    const snapshotSha256 = createHash("sha256").update(json).digest("hex");
+    const source = turn({
+      id: sourceTurnId,
+      status: "completed",
+      completedAt: new Date("2026-08-13T00:00:00.000Z"),
+      leaseExpiresAt: null,
+      metadata: {
+        localSettlement: { snapshotSha256 },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: `# frozen\n\`\`\`json\n${json}\n\`\`\`\n`,
+            agentProfile: "frontmind-pro",
+            attachments: [],
+          },
+          bodySha256: "b".repeat(64),
+          preparedAt: "2026-08-13T00:00:00.000Z",
+        },
+      },
+    });
+    const replacementBuild = build({
+      generation: 4,
+      canonicalTaskId: null,
+      canonicalTaskGeneration: null,
+      handoffProvenance: {
+        localRehydrateRequired: {
+          schemaVersion: 1,
+          sourceTurnId,
+          snapshotSha256,
+          taskIdSha256: null,
+          sourceGeneration: 3,
+          generation: 4,
+          targetGeneration: 4,
+          revision: 7,
+          leafId: "1.8",
+        },
+        createNewCanonicalFromSnapshot: {
+          schemaVersion: 1,
+          sourceTurnId,
+          snapshotSha256,
+          sourceGeneration: 3,
+          receiptSourceGeneration: 3,
+          targetGeneration: 4,
+        },
+      },
+    });
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: () => ({ limit: async () => [source] }),
+        }),
+      }),
+    };
+
+    expect(
+      inspectKnowledgeBaseLocalRehydrateRequirement(replacementBuild),
+    ).toEqual({ sourceTurnId, snapshotSha256 });
+    await expect(
+      loadKnowledgeBaseLocalRehydrateSnapshot(
+        { userId: 1, build: replacementBuild },
+        db,
+      ),
+    ).resolves.toEqual({ snapshot, json, sha256: snapshotSha256 });
+  });
+
+  it("observes one stopped event for 30 seconds then locally releases the exact anchor without changing accepted state", async () => {
+    const leaseToken = "terminal-local-settlement-lease";
+    const activeTurnId = "00000000-0000-4000-8000-000000000001";
+    const sourceTurnId = "00000000-0000-4000-8000-000000000003";
+    const content = "## 1.8 Current\n\nAccepted body";
+    const contentSha256 = createHash("sha256").update(content).digest("hex");
+    const presentationKey = createHash("sha256")
+      .update(`${identity.buildId}:3:7:1.8:${contentSha256}`)
+      .digest("hex");
+    const snapshot = {
+      schemaVersion: 1,
+      purpose: "legacy_to_manus_v2_anchor_handoff",
+      source: {
+        providerProtocol: "legacy_v1",
+        buildId: identity.buildId,
+        generation: 3,
+        targetGeneration: 3,
+        revision: 7,
+        currentLeafId: "1.8",
+        status: "confirming",
+        skill: {
+          name: "socratic-kb-builder",
+          version: "4",
+          contentHash: "c".repeat(64),
+          archiveSha256: null,
+          archiveBytes: null,
+          archiveStorageKey: null,
+        },
+        treePolicyVersion: 2,
+      },
+      nodes: [
+        {
+          leafId: "1.8",
+          branchId: "1",
+          branchTitle: "Branch",
+          title: "Current",
+          ordinal: 0,
+          status: "current",
+          contentMarkdown: content,
+          contentSha256,
+          lastUserInput: null,
+          sourceUrls: [],
+          imageUrls: [],
+        },
+      ],
+      acceptedReceipts: [],
+      pendingOperation: {
+        kind: "anchor_only",
+        turnId: activeTurnId,
+        operationToken: "operation-1",
+        baseRevision: 7,
+        fromLeafId: "1.8",
+      },
+    } as const;
+    const snapshotJson = JSON.stringify(snapshot);
+    const snapshotSha256 = createHash("sha256")
+      .update(snapshotJson)
+      .digest("hex");
+    const requestBody = {
+      prompt: `# frozen\n\`\`\`json\n${snapshotJson}\n\`\`\`\n`,
+      agentProfile: "frontmind-pro",
+      attachments: [],
+    };
+    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
+      operationToken: "operation-1",
+      turnId: activeTurnId,
+      generation: 3,
+      baseRevision: 7,
+    });
+    const activeTurn = turn({
+      id: activeTurnId,
+      operationType: "legacy_reconcile",
+      status: "running",
+      upstreamTaskId: "canonical-task",
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256").update(leaseToken).digest("hex"),
+        createAttemptState: "rejected",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+        operationToken: "operation-1",
+        repairKind: "legacy_anchor_handoff",
+        recovery: { snapshotSha256 },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          preparedAt: "2026-08-13T00:00:00.000Z",
+        },
+        manusV2Lifecycle: {
+          errorRecoveryAttempt: 1,
+          errorRecoveryToken: recovery.recoveryToken,
+          errorRecoveryRequestHash: recovery.requestHash,
+          errorRecoveryAttemptState: "acknowledged",
+          errorRecoveryRequestId: "recovery-request-1",
+          errorRecoveryAcknowledgedAt: "2026-08-13T00:00:00.000Z",
+        },
+      },
+    });
+    const sourceTurn = turn({
+      id: sourceTurnId,
+      status: "completed",
+      completedAt: new Date("2026-08-12T23:59:00.000Z"),
+      leaseExpiresAt: null,
+    });
+    const node = {
+      id: "node-1",
+      buildId: identity.buildId,
+      leafId: "1.8",
+      branchId: "1",
+      branchTitle: "Branch",
+      title: "Current",
+      ordinal: 0,
+      status: "current",
+      contentMarkdown: content,
+      contentSha256,
+      sourceTurnId,
+      presentationKey,
+    };
+    const initialBuild = build({
+      upstreamTaskId: "canonical-task",
+      canonicalTaskId: "canonical-task",
+      canonicalTaskGeneration: 3,
+      canonicalCredentialId: "credential-1",
+      canonicalTaskState: "reconciling",
+      currentPresentationKey: presentationKey,
+      handoffProvenance: { snapshotSha256, pendingTurnId: activeTurnId },
+      confirmedCount: 6,
+      directPrefilledCount: 1,
+    });
+    const selectTurns = [
+      (store: TurnServiceStore) =>
+        store.turns.filter((candidate) => candidate.id === activeTurnId),
+      (store: TurnServiceStore) =>
+        store.turns.filter((candidate) => candidate.id === sourceTurnId),
+      (store: TurnServiceStore) =>
+        store.turns.filter((candidate) => candidate.id === activeTurnId),
+    ];
+    const harness = createTurnServiceExecutor({
+      build: initialBuild,
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: 1,
+        projectAssignmentId: null,
+        deletedAt: null,
+        status: "running",
+        version: 2,
+      },
+      turns: [activeTurn, sourceTurn],
+      nodes: [node],
+      turnSelections: [selectTurns, selectTurns],
+    });
+
+    await expect(
+      observeAndLocallySettleKnowledgeBaseTerminalAnchor(
+        {
+          userId: 1,
+          turnId: activeTurnId,
+          leaseToken,
+          taskId: "canonical-task",
+          terminalEventHash: "e".repeat(64),
+          now: new Date("2026-08-13T00:00:20.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ state: "observed" });
+    expect(harness.store.build.activeTurnId).toBe(activeTurnId);
+
+    await expect(
+      observeAndLocallySettleKnowledgeBaseTerminalAnchor(
+        {
+          userId: 1,
+          turnId: activeTurnId,
+          leaseToken,
+          taskId: "canonical-task",
+          terminalEventHash: "e".repeat(64),
+          now: new Date("2026-08-13T00:00:50.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ state: "settled" });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: null,
+      status: "confirming",
+      canonicalTaskId: "canonical-task",
+      canonicalTaskState: "active",
+      generation: 3,
+      revision: 7,
+      currentLeafId: "1.8",
+      currentPresentationKey: presentationKey,
+      confirmedCount: 6,
+      directPrefilledCount: 1,
+      handoffProvenance: {
+        localRehydrateRequired: {
+          snapshotSha256,
+          generation: 3,
+          revision: 7,
+          leafId: "1.8",
+        },
+      },
+    });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "completed",
+      leaseExpiresAt: null,
+      metadata: {
+        localSettlement: {
+          kind: "terminal_anchor_without_ack",
+          snapshotSha256,
+          presentationKey,
+        },
+      },
+    });
+    expect(harness.store.nodes).toEqual([node]);
+    expect(harness.store.conversation).toMatchObject({
+      status: "awaiting_input",
+      upstreamTaskId: "canonical-task",
     });
   });
 

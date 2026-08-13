@@ -84,12 +84,15 @@ import {
   KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE,
   knowledgeBaseObservationFromPayload,
   reconcileKnowledgeBaseObservation,
+  recoverKnowledgeBaseCanonicalFromSnapshot,
+  recoverKnowledgeBaseStart,
   retryKnowledgeBaseTurn,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
 import KnowledgeBaseLogoProvenanceRepair from "./KnowledgeBaseLogoProvenanceRepair";
 import KnowledgeBaseAttachmentRepair from "./KnowledgeBaseAttachmentRepair";
 import KnowledgeBaseManagedUploadRecovery from "./KnowledgeBaseManagedUploadRecovery";
+import KnowledgeBaseStartSourceRecovery from "./KnowledgeBaseStartSourceRecovery";
 import {
   assertChatAttachmentSizes,
   chatAttachmentSizeError,
@@ -165,6 +168,15 @@ export function knowledgeBaseNoticeRecoveryMode(
     return "reconcile" as const;
   }
   if (
+    notice.recoveryAction === "resume_start_from_retained_sources" ||
+    notice.recoveryAction === "reselect_start_sources"
+  ) {
+    return "start_recovery" as const;
+  }
+  if (notice.recoveryAction === "create_new_canonical_from_snapshot") {
+    return "canonical_recovery" as const;
+  }
+  if (
     notice.canRegenerate === true &&
     notice.recoveryAction === "regenerate_turn"
   ) {
@@ -187,11 +199,17 @@ export function knowledgeBaseNoticeRetryLabel(
         : notice.recoveryAction === "top_up"
           ? "补充额度后继续本轮"
           : "继续恢复本轮"
-    : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
-      ? "重新上传 Logo 原图"
-      : knowledgeBaseNoticeRecoveryMode(notice) === "regenerate"
-        ? "重新生成本轮（将创建一次新的 API 任务）"
-        : "";
+    : knowledgeBaseNoticeRecoveryMode(notice) === "start_recovery"
+      ? notice.recoveryAction === "reselect_start_sources"
+        ? "重新上传资料"
+        : "使用原资料重新开始（将创建新任务）"
+      : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
+        ? "重新上传 Logo 原图"
+        : knowledgeBaseNoticeRecoveryMode(notice) === "canonical_recovery"
+          ? "创建新任务继续"
+          : knowledgeBaseNoticeRecoveryMode(notice) === "regenerate"
+            ? "重新生成本轮（将创建一次新的 API 任务）"
+            : "";
 }
 
 export function knowledgeBaseNoticeHasRecoveryAction(
@@ -241,8 +259,10 @@ export async function recoverKnowledgeBaseNotice(
     >;
     clientRequestId: string;
     expectedGeneration: number;
+    expectedStateEpoch: number;
     expectedRevision: number;
     expectedLeafId: string | null;
+    expectedPresentationKey?: string | null;
   },
   dependencies: {
     reconcile?: typeof reconcileKnowledgeBaseObservation;
@@ -256,6 +276,31 @@ export async function recoverKnowledgeBaseNotice(
   }
   if (knowledgeBaseNoticeRecoveryMode(input.notice) === "logo_repair") {
     throw new Error("请通过专用入口重新上传当前知识库使用的同一张 Logo 原图");
+  }
+  if (knowledgeBaseNoticeRecoveryMode(input.notice) === "start_recovery") {
+    return recoverKnowledgeBaseStart({
+      conversationId: input.conversationId,
+      clientRequestId: input.clientRequestId,
+      expectedGeneration: input.expectedGeneration,
+      expectedStateEpoch: input.expectedStateEpoch,
+      mode: input.notice.recoveryAction as
+        | "resume_start_from_retained_sources"
+        | "reselect_start_sources",
+    });
+  }
+  if (knowledgeBaseNoticeRecoveryMode(input.notice) === "canonical_recovery") {
+    if (!input.expectedLeafId || !input.expectedPresentationKey) {
+      throw new Error("当前展示坐标不完整，请刷新后重试");
+    }
+    return recoverKnowledgeBaseCanonicalFromSnapshot({
+      conversationId: input.conversationId,
+      clientRequestId: input.clientRequestId,
+      expectedGeneration: input.expectedGeneration,
+      expectedStateEpoch: input.expectedStateEpoch,
+      expectedRevision: input.expectedRevision,
+      expectedLeafId: input.expectedLeafId,
+      expectedPresentationKey: input.expectedPresentationKey,
+    });
   }
   if (knowledgeBaseNoticeRecoveryMode(input.notice) !== "regenerate") {
     throw new Error("当前失败不允许创建新的 API 任务，系统会保留并恢复本轮");
@@ -1263,8 +1308,10 @@ export default function ChatArea({
         notice: knowledgeBase.notice,
         clientRequestId,
         expectedGeneration: knowledgeBase.generation,
+        expectedStateEpoch: knowledgeBase.stateEpoch,
         expectedRevision: knowledgeBase.revision,
         expectedLeafId: knowledgeBase.leafId,
+        expectedPresentationKey: knowledgeBase.presentationKey,
       });
       commitKnowledgeBaseObservation(conversation.id, observation);
       wakeKnowledgeBaseConversation(conversation.id);
@@ -1601,6 +1648,24 @@ export default function ChatArea({
                         }}
                       />
                     ) : null
+                  ) : activeConversation.knowledgeBase.notice.recoveryAction ===
+                    "reselect_start_sources" ? (
+                    <KnowledgeBaseStartSourceRecovery
+                      conversationId={activeConversation.id}
+                      expectedGeneration={
+                        activeConversation.knowledgeBase.generation
+                      }
+                      expectedStateEpoch={
+                        activeConversation.knowledgeBase.stateEpoch
+                      }
+                      onObservation={(observation) => {
+                        commitKnowledgeBaseObservation(
+                          activeConversation.id,
+                          observation,
+                        );
+                        wakeKnowledgeBaseConversation(activeConversation.id);
+                      }}
+                    />
                   ) : knowledgeBaseNoticeHasRecoveryAction(
                       activeConversation.knowledgeBase.notice,
                     ) ? (

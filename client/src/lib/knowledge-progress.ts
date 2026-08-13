@@ -288,7 +288,7 @@ export async function reconcileKnowledgeBaseObservation(
     throw error;
   }
   const payload = await response.json();
-  return normalizeObservation(payload);
+  return normalizeObservation(payload?.observation ?? payload);
 }
 
 export async function retryKnowledgeBaseTurn(input: {
@@ -312,6 +312,61 @@ export async function retryKnowledgeBaseTurn(input: {
     throw error;
   }
   return normalizeObservation(await response.json());
+}
+
+export async function recoverKnowledgeBaseCanonicalFromSnapshot(input: {
+  conversationId: string;
+  clientRequestId: string;
+  expectedGeneration: number;
+  expectedStateEpoch: number;
+  expectedRevision: number;
+  expectedLeafId: string;
+  expectedPresentationKey: string;
+}): Promise<KnowledgeBaseObservationDto> {
+  const response = await fetch(
+    "/api/knowledge-base/canonical/recover-from-snapshot",
+    {
+      method: "POST",
+      credentials: "include",
+      headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(input),
+    },
+  );
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(
+      payload?.error?.message || "创建新任务恢复失败",
+    ) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
+  }
+  return normalizeObservation(payload?.observation ?? payload);
+}
+
+export async function recoverKnowledgeBaseStart(input: {
+  conversationId: string;
+  expectedGeneration: number;
+  expectedStateEpoch: number;
+  clientRequestId: string;
+  mode: "resume_start_from_retained_sources" | "reselect_start_sources";
+  attachmentManifest?: KnowledgeBaseAttachmentRepairManifestItem[];
+  attachments?: Array<{ file_id: string; filename: string }>;
+}): Promise<KnowledgeBaseObservationDto> {
+  const response = await fetch("/api/knowledge-base/start/recover", {
+    method: "POST",
+    credentials: "include",
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(
+      payload?.error?.message || "知识库启动恢复失败",
+    ) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
+  }
+  return normalizeObservation(payload?.observation ?? payload);
 }
 
 export async function replaceKnowledgeBaseTurnAttachments(input: {

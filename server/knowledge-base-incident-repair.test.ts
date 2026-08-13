@@ -20,6 +20,7 @@ import {
   previewKnowledgeBaseIncidentRepair,
   previewKnowledgeBaseIncidentRepairFromSignedImageMaintenance,
   previewKnowledgeBaseIncidentRepairFacts,
+  uniqueHistoricalKnowledgeBaseStartSource,
   type KnowledgeBaseIncidentRepairFacts,
 } from "./knowledge-base-incident-repair";
 
@@ -333,12 +334,14 @@ function query(value: unknown) {
 
 function serviceDb(input: {
   facts: KnowledgeBaseIncidentRepairFacts;
+  replacementCredential?: { id: string; userId: number; status: string };
   failAuditInsert?: boolean;
   mutateFactsBeforeTransaction?: (
     value: KnowledgeBaseIncidentRepairFacts,
   ) => KnowledgeBaseIncidentRepairFacts;
 }) {
   const selections = (value: KnowledgeBaseIncidentRepairFacts) => [
+    ...(input.replacementCredential ? [[input.replacementCredential]] : []),
     [value.build],
     value.activeTurn ? [value.activeTurn] : [],
     value.nodes,
@@ -409,6 +412,63 @@ function stored(bytes: Buffer, filename: string) {
 }
 
 describe("knowledge-base incident CAS repair", () => {
+  it("selects exactly one strict historical start source and never guesses", () => {
+    const starter = startFacts().facts.activeTurn!;
+    const historical = {
+      ...starter,
+      expectedRevision: 0,
+      expectedLeafId: null,
+    };
+    expect(uniqueHistoricalKnowledgeBaseStartSource([historical])).toBe(
+      historical,
+    );
+    expect(
+      uniqueHistoricalKnowledgeBaseStartSource([
+        historical,
+        { ...historical, id: "another-failed-start" },
+      ]),
+    ).toBeNull();
+    expect(
+      uniqueHistoricalKnowledgeBaseStartSource([
+        { ...historical, upstreamTaskId: "already-created" },
+      ]),
+    ).toBeNull();
+    expect(
+      uniqueHistoricalKnowledgeBaseStartSource([
+        { ...historical, expectedRevision: 1 },
+      ]),
+    ).toBeNull();
+  });
+
+  it("rejects a historical start once local nodes or accepted receipts exist", () => {
+    const starter = startFacts();
+    const previewWithNode = previewKnowledgeBaseIncidentRepairFacts({
+      facts: {
+        ...starter.facts,
+        historicalSourceTurn: true,
+        build: { ...starter.facts.build, activeTurnId: null },
+        nodes: nodes(1),
+      },
+      repairKind: "retained_upstream_create_3_start",
+      environment: ACTIVE_MIGRATION_ENV,
+    });
+    expect(previewWithNode.blockers).toContain(
+      "starter_already_has_accepted_nodes",
+    );
+    const previewWithReceipt = previewKnowledgeBaseIncidentRepairFacts({
+      facts: {
+        ...starter.facts,
+        historicalSourceTurn: true,
+        acceptedReceiptCount: 1,
+        build: { ...starter.facts.build, activeTurnId: null },
+      },
+      repairKind: "retained_upstream_create_3_start",
+      environment: ACTIVE_MIGRATION_ENV,
+    });
+    expect(previewWithReceipt.blockers).toContain(
+      "starter_has_accepted_receipt",
+    );
+  });
   it("requires one explicit v2 rollout authority for the retained-start preview and execute path", () => {
     expect(() =>
       assertKnowledgeBaseIncidentRepairRolloutAuthorized(
@@ -888,6 +948,62 @@ describe("knowledge-base incident CAS repair", () => {
           upstreamTaskId: null,
           stateEpoch: 18,
         }),
+      ]),
+    );
+  });
+
+  it("uses the current active credential while retaining the historical source bytes", async () => {
+    const starter = startFacts();
+    const stateHash = hashKnowledgeBaseIncidentRepairState(starter.facts);
+    const currentCredential = {
+      id: "30000000-0000-4000-8000-000000000099",
+      userId: 7,
+      status: "active",
+    };
+    const store = serviceDb({
+      facts: starter.facts,
+      replacementCredential: currentCredential,
+    });
+    const result = await applyKnowledgeBaseIncidentRepair(
+      {
+        userId: 7,
+        conversationId: "conversation-incident",
+        repairKind: "retained_upstream_create_3_start",
+        expectedStateHash: stateHash,
+        clientRequestId: "current-credential-resume",
+        replacementCredentialId: currentCredential.id,
+        now: NOW,
+      },
+      {
+        getDatabase: async () => store.db as any,
+        readStoredFile: async (fileId) => {
+          const index = Number(fileId.replace("retained-file-", "")) - 1;
+          return stored(starter.bytes[index]!, starter.filenames[index]!);
+        },
+        environment: {
+          FRONTMIND_KB_MANUS_V2_WRITER: "true",
+          FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION: "false",
+        },
+      },
+    );
+
+    expect(result.applied).toBe(true);
+    expect(store.insertedTurns[0]).toMatchObject({
+      apiCredentialId: currentCredential.id,
+      buildGeneration: 4,
+      metadata: {
+        sourceRecoveryMode: "resume_start_from_retained_sources",
+        chargeDisposition: "reuse_original_no_charge",
+        recovery: {
+          attachments: expect.arrayContaining([
+            expect.objectContaining({ file_id: "retained-file-1" }),
+          ]),
+        },
+      },
+    });
+    expect(store.updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ apiCredentialId: currentCredential.id }),
       ]),
     );
   });
