@@ -253,12 +253,21 @@ export default function ChatInput({
     syncKnowledgeBaseSnapshot &&
     activeConversation?.knowledgeBase?.notice?.code ===
       KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE;
+  // A Provider task id is an upstream transport pointer, not the Dashboard
+  // knowledge-base lifecycle. Local settlement deliberately clears that
+  // pointer before the next explicit customer reply, while the approved
+  // Dashboard presentation remains fully replyable.
+  const knowledgeBaseInitialized =
+    syncKnowledgeBaseSnapshot &&
+    Boolean(
+      activeConversation?.knowledgeBase?.initialized || knowledgeBaseProgress,
+    );
   const knowledgeBaseNotStarted =
-    syncKnowledgeBaseSnapshot && !activeConversation?.taskId;
+    syncKnowledgeBaseSnapshot && !knowledgeBaseInitialized;
   const knowledgeInteractionLocked =
     syncKnowledgeBaseSnapshot &&
-    Boolean(activeConversation?.taskId) &&
-    activeConversation?.status !== "awaiting_input";
+    knowledgeBaseInitialized &&
+    activeConversation?.knowledgeBase?.canReply !== true;
   const inputLocked =
     knowledgeBaseLogoProvenanceRepairRequired ||
     knowledgeBaseAttachmentResumeRequired ||

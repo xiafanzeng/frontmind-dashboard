@@ -6,6 +6,12 @@ import {
   upstreamAliasedIdentity,
   upstreamTaskRecord,
 } from "./upstream-task-adapter";
+import { classifyManusV2StructuredResultEnvelope } from "./manus-v2-structured-result";
+
+export {
+  classifyManusV2StructuredResultEnvelope,
+  type ManusV2StructuredResultEnvelope,
+} from "./manus-v2-structured-result";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -683,8 +689,10 @@ export function manusV2KnowledgeBaseStructuredResultForOperation(
         right.timestamp - left.timestamp || right.id.localeCompare(left.id),
     );
   for (const event of candidates) {
-    const result = upstreamTaskRecord(event.structured_output_result);
-    if (result?.success !== true || result.value === undefined) continue;
+    const result = classifyManusV2StructuredResultEnvelope(
+      event.structured_output_result,
+    );
+    if (result.kind !== "accepted") continue;
     let decoded = result.value;
     if (typeof decoded === "string") {
       try {
@@ -729,21 +737,6 @@ export function normalizeManusV2Output(
       expected,
     );
     if (!exact) return [];
-    const ordered = [...events].sort(
-      (left, right) =>
-        left.timestamp - right.timestamp || left.id.localeCompare(right.id),
-    );
-    let operationEventIndex = -1;
-    for (let index = ordered.length - 1; index >= 0; index -= 1) {
-      const event = ordered[index]!;
-      if (
-        event.type === "user_message" &&
-        manusV2EventOperationToken(event) === expected.operationToken
-      ) {
-        operationEventIndex = index;
-        break;
-      }
-    }
     const text = exact.value.visibleMarkdown;
     return [
       {
@@ -767,8 +760,10 @@ export function normalizeManusV2Output(
     )
     .flatMap<NormalizedOutput>((event) => {
       if (event.type === "structured_output_result") {
-        const result = upstreamTaskRecord(event.structured_output_result);
-        if (result?.success !== true || result.value === undefined) return [];
+        const result = classifyManusV2StructuredResultEnvelope(
+          event.structured_output_result,
+        );
+        if (result.kind !== "accepted") return [];
         let value: ManusV2KnowledgeBaseStructuredResult;
         try {
           value = normalizeKnowledgeBaseStructuredResult(result.value);

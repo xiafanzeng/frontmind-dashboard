@@ -31,6 +31,7 @@ export default function Home({
   responseLogicContext,
   messageProjection,
   knowledgeBaseProgress,
+  knowledgeBaseResetRevision,
 }: {
   embedded?: boolean;
   fixedAgentProfile?: string;
@@ -45,6 +46,7 @@ export default function Home({
   responseLogicContext?: ResponseLogicTaskContext;
   messageProjection?: (message: LocalMessage) => LocalMessage;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
+  knowledgeBaseResetRevision?: number;
 } = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -175,6 +177,7 @@ export default function Home({
           responseLogicContext={responseLogicContext}
           messageProjection={messageProjection}
           knowledgeBaseProgress={knowledgeBaseProgress}
+          knowledgeBaseResetRevision={knowledgeBaseResetRevision}
           showKnowledgeBaseStarter={showKnowledgeBaseStarter}
           standardWelcomeVariant={standardWelcomeVariant}
           reserveOuterMobileNav={!showAccountMenu}

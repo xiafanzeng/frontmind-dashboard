@@ -22,6 +22,7 @@ import {
   knowledgeBaseBuilds,
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
+  knowledgeBaseResetStates,
   messages,
   upstreamResources,
   userUsageOwners,
@@ -73,6 +74,8 @@ import {
 
 /** Longer than every configured 120s upstream create/upload timeout. */
 const DEFAULT_LEASE_MS = 300_000;
+/** A stopped malformed result must settle or become explicit attention. */
+const MANUS_V2_FORMAT_REPAIR_DEADLINE_MS = 120_000;
 // 99 customer uploads plus Skill, instructions and optional prefill input.
 const MAX_ATTACHMENT_COUNT = 102;
 const MAX_USER_ATTACHMENT_COUNT = 99;
@@ -87,6 +90,8 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   expectedAttachmentCount?: number;
   userAttachmentCount?: number;
   awaitingClientAttachments?: boolean;
+  /** Reset epoch captured before a new start reservation is allowed to exist. */
+  sourceResetRevision?: number;
   /** Safe tombstone for a browser upload rejected before any upstream POST. */
   unpreparedCancellation?: boolean;
   /** Safe tombstone for a generated-file failure proven to precede Provider dispatch. */
@@ -195,6 +200,8 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
     formatRepairRequestHash?: string;
     formatRepairAttemptState?: "sending" | "acknowledged" | "outcome_unknown";
     formatRepairRequestId?: string;
+    formatRepairStartedAt?: string;
+    formatRepairDeadlineAt?: string;
     errorRecoveryAttempt?: 1;
     errorRecoveryToken?: string;
     errorRecoveryRequestHash?: string;
@@ -427,6 +434,7 @@ export type KnowledgeBaseTurnReservationErrorCode =
   | "INVALID_REQUEST"
   | "BUILD_NOT_FOUND"
   | "CONVERSATION_RESET"
+  | "KNOWLEDGE_BASE_RESET_REVISION_CHANGED"
   | "CONFLICT"
   | "STALE_KNOWLEDGE_BASE_PRESENTATION"
   | "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH"
@@ -596,6 +604,8 @@ export interface ReserveKnowledgeBaseTurnInput {
    */
   deferDispatchUntilAttachments?: boolean;
   clientAttachmentManifest?: unknown;
+  /** Present only for a new-build start reservation. */
+  sourceResetRevision?: number;
   /** Resume after browser File objects were lost; original body remains pinned. */
   resumeDeferredReservation?: boolean;
   /**
@@ -641,6 +651,8 @@ export interface ReserveKnowledgeBaseStartBuildInput {
    */
   deferDispatchUntilAttachments?: boolean;
   clientAttachmentManifest?: unknown;
+  /** Browser-observed reset epoch. A stale tab may not cross this fence. */
+  expectedResetRevision: number;
   now?: Date;
   leaseMs?: number;
 }
@@ -3807,6 +3819,35 @@ async function reserveKnowledgeBaseTurnInTransaction(
     build.canonicalTaskGeneration === build.generation &&
     build.canonicalCredentialId === identity.apiCredentialId &&
     identity.apiCredentialId !== null;
+  const requestedLocalRehydrateAuthority = retryAuthorityRecord(
+    input.recoveryMetadata,
+  )?.localRehydrateAuthority;
+  const exactLocalRehydrateAuthority =
+    requestedLocalRehydrateAuthority === "local_rehydrate_unbound"
+      ? await loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+          { userId: input.userId, build },
+          tx,
+        )
+      : null;
+  const isUnboundLocalRehydrateContinuation =
+    input.operationType !== "retry" &&
+    Boolean(exactLocalRehydrateAuthority) &&
+    build.providerProtocol === "manus_v2" &&
+    build.status === "confirming" &&
+    build.activeTurnId === null &&
+    build.upstreamTaskId === null &&
+    build.canonicalTaskId === null &&
+    build.canonicalTaskGeneration === null &&
+    build.canonicalCredentialId === null &&
+    build.canonicalTaskState === "unbound" &&
+    build.protocolErrorCode === null &&
+    build.protocolError === null &&
+    exactLocalRehydrateAuthority?.generation === input.expectedGeneration &&
+    exactLocalRehydrateAuthority.revision === input.expectedRevision &&
+    exactLocalRehydrateAuthority.leafId === expectedLeafId &&
+    (input.expectedPresentationKey === undefined ||
+      exactLocalRehydrateAuthority.presentationKey ===
+        input.expectedPresentationKey);
 
   const clientRows = await tx
     .select()
@@ -4279,6 +4320,17 @@ async function reserveKnowledgeBaseTurnInTransaction(
       pinnedCredential,
       { allowRetired: true },
     );
+  } else if (isUnboundLocalRehydrateContinuation) {
+    // The released legacy writer is deliberately unbound.  The route has
+    // already proved the exact release/source marker, so this new business
+    // operation may pin only the account's current credential and create the
+    // one replacement canonical task.
+    if (hasCurrentCredentialAuthority !== true) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The current credential no longer owns this local rehydrate operation",
+      );
+    }
   } else if (hasCurrentCredentialAuthority === false) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -4310,6 +4362,9 @@ async function reserveKnowledgeBaseTurnInTransaction(
         ? { clientAttachmentManifestHash }
         : {}),
     ...(clientIntentHash ? { clientIntentHash } : {}),
+    ...(input.sourceResetRevision !== undefined
+      ? { sourceResetRevision: input.sourceResetRevision }
+      : {}),
     ...(expectedPresentationKey ? { expectedPresentationKey } : {}),
     recovery: sanitizedRecovery,
     ...(traceId ? { traceId } : {}),
@@ -4640,6 +4695,7 @@ export async function reserveKnowledgeBaseStartBuild(
   executor?: any,
 ): Promise<KnowledgeBaseStartBuildReservation> {
   assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedResetRevision, "expectedResetRevision", 0);
   const conversationId = normalizeRequiredId(
     input.conversationId,
     "conversationId",
@@ -4757,6 +4813,33 @@ export async function reserveKnowledgeBaseStartBuild(
           "The API credential selected for this new knowledge-base build is no longer authorized for the account",
         );
       }
+    }
+    // The reset row is the shared epoch authority for every browser tab. The
+    // same row is updated by approval before old builds are removed, so a
+    // delayed start request can never recreate state from an older revision.
+    await tx
+      .insert(knowledgeBaseResetStates)
+      .values({
+        userId: input.userId,
+        revision: 0,
+        updatedAt: now,
+      })
+      .onDuplicateKeyUpdate({
+        set: { userId: input.userId },
+      });
+    const resetState = (
+      await tx
+        .select({ revision: knowledgeBaseResetStates.revision })
+        .from(knowledgeBaseResetStates)
+        .where(eq(knowledgeBaseResetStates.userId, input.userId))
+        .limit(1)
+        .for("update")
+    )[0];
+    if (resetState?.revision !== input.expectedResetRevision) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+        "知识库已完成重置，请清空旧资料后重新开始",
+      );
     }
     const startAttachmentResources = await lockKnowledgeBaseStartAttachments({
       tx,
@@ -4892,7 +4975,10 @@ export async function reserveKnowledgeBaseStartBuild(
     const createdBuild = build.id === candidateBuildId;
 
     const requestPayload = pinnedStartPayload(build, input.requestPayload);
-    const recoveryMetadata = pinnedStartPayload(build, input.recoveryMetadata);
+    const recoveryMetadata = pinnedStartPayload(build, {
+      ...input.recoveryMetadata,
+      sourceResetRevision: input.expectedResetRevision,
+    });
     const reservation = await reserveKnowledgeBaseTurnInTransaction(
       {
         userId: input.userId,
@@ -4915,6 +5001,7 @@ export async function reserveKnowledgeBaseStartBuild(
         deferDispatchUntilAttachments:
           input.deferDispatchUntilAttachments === true,
         clientAttachmentManifest: input.clientAttachmentManifest,
+        sourceResetRevision: input.expectedResetRevision,
         now,
         leaseMs: input.leaseMs,
       },
@@ -5365,6 +5452,8 @@ type StageKnowledgeBaseDeferredTurnAttachmentInput = {
   turnId: string;
   clientRequestId: string;
   clientAttachmentManifest: unknown;
+  /** Required for start reservations; ignored only for older non-start turns. */
+  expectedResetRevision?: number;
   index: number;
   attachment: { file_id: string; filename: string };
   /**
@@ -5389,9 +5478,44 @@ type ClaimKnowledgeBaseDeferredTurnDispatchInput = {
   turnId: string;
   clientRequestId: string;
   clientAttachmentManifest: unknown;
+  /** Required for start reservations; ignored only for older non-start turns. */
+  expectedResetRevision?: number;
   now?: Date;
   leaseMs?: number;
 };
+
+async function assertStartResetRevisionInTransaction(input: {
+  tx: any;
+  turn: ConversationTurn;
+  metadata: KnowledgeBaseTurnMetadata;
+  expectedResetRevision?: number;
+}) {
+  if (input.turn.operationType !== "start") return;
+  if (
+    !Number.isSafeInteger(input.expectedResetRevision) ||
+    Number(input.expectedResetRevision) < 0 ||
+    input.metadata.sourceResetRevision !== input.expectedResetRevision
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+      "知识库已完成重置，请清空旧资料后重新开始",
+    );
+  }
+  const state = (
+    await input.tx
+      .select({ revision: knowledgeBaseResetStates.revision })
+      .from(knowledgeBaseResetStates)
+      .where(eq(knowledgeBaseResetStates.userId, input.turn.userId))
+      .limit(1)
+      .for("update")
+  )[0];
+  if (state?.revision !== input.expectedResetRevision) {
+    throw new KnowledgeBaseTurnReservationError(
+      "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+      "知识库已完成重置，请清空旧资料后重新开始",
+    );
+  }
+}
 
 async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
   input: StageKnowledgeBaseDeferredTurnAttachmentInput,
@@ -5416,6 +5540,12 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     );
   }
   const metadata = metadataOf(turn);
+  await assertStartResetRevisionInTransaction({
+    tx,
+    turn,
+    metadata,
+    expectedResetRevision: input.expectedResetRevision,
+  });
   const resource = (
     await tx
       .select()
@@ -5635,6 +5765,12 @@ async function claimKnowledgeBaseDeferredTurnDispatchInTransaction(
     );
   }
   const metadata = metadataOf(turn);
+  await assertStartResetRevisionInTransaction({
+    tx,
+    turn,
+    metadata,
+    expectedResetRevision: input.expectedResetRevision,
+  });
   if (
     turn.clientRequestId !== clientRequestId ||
     !metadata.clientAttachmentManifestHash ||
@@ -7981,6 +8117,213 @@ export type KnowledgeBaseAnchorHandoffReservation =
     sourceGeneration: number;
     targetGeneration: number;
   };
+
+export type KnowledgeBasePreproviderLocalRehydrateAuthority = {
+  kind: "failed_confirm_preprovider_release";
+  sourceTurnId: string;
+  generation: number;
+  revision: number;
+  leafId: string;
+  presentationKey: string;
+};
+
+function isPreproviderLocalRehydrateBuildShape(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "id"
+    | "userId"
+    | "generation"
+    | "revision"
+    | "currentLeafId"
+    | "currentPresentationKey"
+    | "status"
+    | "activeTurnId"
+    | "upstreamTaskId"
+    | "canonicalTaskId"
+    | "canonicalTaskGeneration"
+    | "canonicalCredentialId"
+    | "canonicalTaskState"
+    | "providerProtocol"
+    | "protocolErrorCode"
+    | "protocolError"
+    | "handoffProvenance"
+  >,
+) {
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
+  const releasedAt = String(requirement?.releasedAt || "");
+  return Boolean(
+    build.providerProtocol === "manus_v2" &&
+      build.status === "confirming" &&
+      build.activeTurnId === null &&
+      build.upstreamTaskId === null &&
+      build.canonicalTaskId === null &&
+      build.canonicalTaskGeneration === null &&
+      build.canonicalCredentialId === null &&
+      build.canonicalTaskState === "unbound" &&
+      build.protocolErrorCode === null &&
+      build.protocolError === null &&
+      requirement?.schemaVersion === 1 &&
+      requirement.reason === "generated_attachment_invalid_preprovider" &&
+      requirement.buildId === build.id &&
+      requirement.generation === build.generation &&
+      requirement.revision === build.revision &&
+      requirement.leafId === build.currentLeafId &&
+      requirement.presentationKey === build.currentPresentationKey &&
+      typeof requirement.sourceTurnId === "string" &&
+      Boolean(requirement.sourceTurnId) &&
+      Boolean(releasedAt) &&
+      Number.isFinite(Date.parse(releasedAt)),
+  );
+}
+
+/**
+ * Proves the narrow, provider-free release written for a generated attachment
+ * failure.  This is intentionally stricter than merely finding a
+ * `localRehydrateRequired` property: the released source turn and every
+ * customer-visible coordinate must still be the exact tombstoned values.
+ */
+export function inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "id"
+    | "userId"
+    | "generation"
+    | "revision"
+    | "currentLeafId"
+    | "currentPresentationKey"
+    | "status"
+    | "activeTurnId"
+    | "upstreamTaskId"
+    | "canonicalTaskId"
+    | "canonicalTaskGeneration"
+    | "canonicalCredentialId"
+    | "canonicalTaskState"
+    | "providerProtocol"
+    | "protocolErrorCode"
+    | "protocolError"
+    | "handoffProvenance"
+  >,
+  source: Pick<
+    ConversationTurn,
+    | "id"
+    | "userId"
+    | "buildId"
+    | "buildGeneration"
+    | "operationKey"
+    | "upstreamIdempotencyKeyHash"
+    | "operationType"
+    | "expectedRevision"
+    | "expectedLeafId"
+    | "status"
+    | "errorCode"
+    | "upstreamTaskId"
+    | "metadata"
+  >,
+): KnowledgeBasePreproviderLocalRehydrateAuthority | null {
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
+  const sourceMetadata = metadataOf(source);
+  const sourceRequirement = retryAuthorityRecord(
+    sourceMetadata.localRehydrateRequired,
+  );
+  const tombstone = retryAuthorityRecord(
+    sourceMetadata.releasedOperationTombstone,
+  );
+  if (
+    !isPreproviderLocalRehydrateBuildShape(build) ||
+    !requirement ||
+    !sourceRequirement ||
+    source.userId !== build.userId ||
+    source.id !== requirement.sourceTurnId ||
+    source.buildId !== build.id ||
+    source.buildGeneration !== build.generation ||
+    source.operationType !== "confirm" ||
+    source.expectedRevision !== build.revision ||
+    source.expectedLeafId !== build.currentLeafId ||
+    source.status !== "cancelled" ||
+    source.errorCode !== "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID" ||
+    source.upstreamTaskId !== null ||
+    sourceMetadata.localPreproviderRelease !== true ||
+    sourceMetadata.repairKind !== "failed_confirm_preprovider_release" ||
+    sourceMetadata.providerProtocol !== "legacy_v1" ||
+    sourceMetadata.createAttemptState !== "not_sent" ||
+    sourceMetadata.providerAttemptState !== "not_sent" ||
+    sourceMetadata.preparedDispatch !== undefined ||
+    sourceMetadata.frozenProviderRequestHash !== undefined ||
+    tombstone?.kind !== "failed_confirm_preprovider_release" ||
+    sourceRequirement.schemaVersion !== requirement.schemaVersion ||
+    sourceRequirement.reason !== requirement.reason ||
+    sourceRequirement.buildId !== requirement.buildId ||
+    sourceRequirement.generation !== requirement.generation ||
+    sourceRequirement.revision !== requirement.revision ||
+    sourceRequirement.leafId !== requirement.leafId ||
+    sourceRequirement.presentationKey !== requirement.presentationKey ||
+    sourceRequirement.sourceTurnId !== requirement.sourceTurnId ||
+    sourceRequirement.releasedAt !== requirement.releasedAt
+  ) {
+    return null;
+  }
+  const releasedOperationKey = String(tombstone.operationKey || "");
+  const cancelledOperationKey = String(
+    sourceMetadata.cancelledOperationKey || "",
+  );
+  const expectedTombstoneOperationKey = sha256(
+    `frontmind-kb-failed-confirm-preprovider-release:${source.id}:${releasedOperationKey}`,
+  );
+  if (
+    !releasedOperationKey ||
+    cancelledOperationKey !== releasedOperationKey ||
+    source.operationKey !== expectedTombstoneOperationKey ||
+    source.upstreamIdempotencyKeyHash !==
+      hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(
+          expectedTombstoneOperationKey,
+        ),
+      )
+  ) {
+    return null;
+  }
+  return {
+    kind: "failed_confirm_preprovider_release",
+    sourceTurnId: source.id,
+    generation: build.generation,
+    revision: build.revision,
+    leafId: build.currentLeafId!,
+    presentationKey: build.currentPresentationKey!,
+  };
+}
+
+export async function loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+  input: { userId: number; build: KnowledgeBaseBuild },
+  executor?: any,
+): Promise<KnowledgeBasePreproviderLocalRehydrateAuthority | null> {
+  const provenance = retryAuthorityRecord(input.build.handoffProvenance);
+  const requirement = retryAuthorityRecord(provenance?.localRehydrateRequired);
+  if (!isPreproviderLocalRehydrateBuildShape(input.build)) return null;
+  const sourceTurnId = String(requirement?.sourceTurnId || "");
+  if (!sourceTurnId) return null;
+  const db = executor ?? (await requireDb());
+  const source = (
+    await db
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.id, sourceTurnId),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, input.build.id),
+        ),
+      )
+      .limit(1)
+  )[0] as ConversationTurn | undefined;
+  return source
+    ? inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
+        input.build,
+        source,
+      )
+    : null;
+}
 
 export function inspectKnowledgeBaseLocalRehydrateRequirement(
   build: Pick<
@@ -11158,12 +11501,19 @@ export async function mutateKnowledgeBaseManusV2Lifecycle(
           30_000,
         );
       }
+      const formatRepairStartedAt =
+        current.formatRepairStartedAt || now.toISOString();
+      const formatRepairDeadlineAt = new Date(
+        Date.parse(formatRepairStartedAt) + MANUS_V2_FORMAT_REPAIR_DEADLINE_MS,
+      ).toISOString();
       lifecycle = {
         ...current,
         formatRepairAttempt: 1,
         formatRepairToken: input.mutation.repairToken,
         formatRepairRequestHash: input.mutation.requestHash,
         formatRepairAttemptState: input.mutation.state,
+        formatRepairStartedAt,
+        formatRepairDeadlineAt,
         ...(input.mutation.requestId
           ? { formatRepairRequestId: input.mutation.requestId }
           : {}),
@@ -11245,13 +11595,25 @@ export async function mutateKnowledgeBaseManusV2Lifecycle(
             : input.mutation.state === "acknowledged"
               ? "output_pending"
               : metadata.providerAttemptState;
+    const formatRepairDeadlineAt =
+      input.mutation.kind === "format_repair"
+        ? Date.parse(lifecycle.formatRepairDeadlineAt || "")
+        : Number.NaN;
     const nextLeaseExpiresAt =
       input.mutation.kind === "error_recovery" &&
       input.mutation.state === "retry_wait"
         ? new Date(
             now.getTime() + Math.max(0, input.mutation.retryAfterMs ?? 0),
           )
-        : new Date(now.getTime() + DEFAULT_LEASE_MS);
+        : input.mutation.kind === "format_repair" &&
+            Number.isFinite(formatRepairDeadlineAt)
+          ? new Date(
+              Math.min(
+                now.getTime() + DEFAULT_LEASE_MS,
+                formatRepairDeadlineAt,
+              ),
+            )
+          : new Date(now.getTime() + DEFAULT_LEASE_MS);
     await tx
       .update(conversationTurns)
       .set({
@@ -11343,13 +11705,16 @@ export async function markKnowledgeBaseManusV2AttentionRequired(
         status: "running",
         errorCode: code,
         errorMessage: null,
-        leaseExpiresAt: new Date(now.getTime() + DEFAULT_LEASE_MS),
+        // Format attention is the bounded terminal disposition for this
+        // recovery attempt. A renewable lease would make workers reclaim the
+        // same stopped task indefinitely.
+        leaseExpiresAt: null,
         metadata: {
           ...metadata,
           manusV2Lifecycle: lifecycle,
           dispatchState: "recovering",
           failureClass: "recoverable_same_turn",
-          recoveryAction: "wait",
+          recoveryAction: "contact_support",
           canRegenerate: false,
         },
         updatedAt: now,
@@ -12794,6 +13159,7 @@ export async function findRecoverableKnowledgeBaseTurnIds(
           ? sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind')`
           : sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind', 'legacy_skill_404_confirm')`,
         sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), '') <> 'rejected'`,
+        sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.attentionCode')), '') = ''`,
         sql`COALESCE(
           JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')),
           CASE
@@ -12866,6 +13232,7 @@ export async function claimKnowledgeBaseTurnForRecovery(
       (turn.status !== "queued" && turn.status !== "running") ||
       currentMetadata.awaitingClientAttachments === true ||
       currentMetadata.providerAttemptState === "rejected" ||
+      Boolean(currentMetadata.manusV2Lifecycle?.attentionCode) ||
       (createAttemptState === "unknown" &&
         !(
           currentMetadata.providerProtocol === "manus_v2" &&

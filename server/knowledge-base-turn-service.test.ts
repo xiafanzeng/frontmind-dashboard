@@ -10,6 +10,7 @@ import {
   knowledgeBaseBuilds,
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
+  knowledgeBaseResetStates,
   messages,
   upstreamResources,
   userUsageOwners,
@@ -42,6 +43,8 @@ import {
   inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
   inspectKnowledgeBaseLocalRehydrateRequirement,
+  inspectKnowledgeBasePreproviderLocalRehydrateAuthority,
+  loadKnowledgeBasePreproviderLocalRehydrateAuthority,
   loadKnowledgeBaseLocalRehydrateSnapshot,
   inspectKnowledgeBaseRetryAuthority,
   inspectKnowledgeBaseFailedNotSentLegacyHandoffAuthority,
@@ -140,6 +143,7 @@ interface TurnServiceStore {
   resources: any[];
   nodes: any[];
   usageOwnerId: number | null;
+  resetRevision: number;
 }
 
 function createTurnServiceExecutor(input: {
@@ -153,6 +157,7 @@ function createTurnServiceExecutor(input: {
   resources?: any[];
   nodes?: any[];
   usageOwnerId?: number | null;
+  resetRevision?: number;
   selectAllMessages?: boolean;
   turnSelections: TurnSelection[][];
   failConversationInsertAtTransaction?: number;
@@ -176,6 +181,7 @@ function createTurnServiceExecutor(input: {
     resources: [...(input.resources || [])],
     nodes: structuredClone(input.nodes || []),
     usageOwnerId: input.usageOwnerId ?? null,
+    resetRevision: input.resetRevision ?? 0,
   };
   const events: string[] = [];
   let transactionIndex = 0;
@@ -216,6 +222,9 @@ function createTurnServiceExecutor(input: {
         }
         if (table === knowledgeBaseConversationRetentionTombstones) {
           return store.retainedTombstones;
+        }
+        if (table === knowledgeBaseResetStates) {
+          return [{ userId: 1, revision: store.resetRevision }];
         }
         if (table === messages) {
           if (input.selectAllMessages) return store.messages;
@@ -324,6 +333,8 @@ function createTurnServiceExecutor(input: {
               store.messages.push(values);
             } else if (table === upstreamResources) {
               store.resources.push(values);
+            } else if (table === knowledgeBaseResetStates) {
+              store.resetRevision = Number(values.revision ?? 0);
             }
             return {
               onDuplicateKeyUpdate: async () => undefined,
@@ -375,6 +386,7 @@ function createTurnServiceExecutor(input: {
         store.resources = snapshot.resources;
         store.nodes = snapshot.nodes;
         store.usageOwnerId = snapshot.usageOwnerId;
+        store.resetRevision = snapshot.resetRevision;
         throw error;
       }
     },
@@ -985,6 +997,218 @@ describe("generated attachment invalid pre-provider release", () => {
       status: "awaiting_input",
       version: 4,
     });
+
+    expect(
+      inspectKnowledgeBasePreproviderLocalRehydrateAuthority(
+        store.build,
+        store.turns[0]!,
+      ),
+    ).toEqual({
+      kind: "failed_confirm_preprovider_release",
+      sourceTurnId: value.source.id,
+      generation: value.source.buildGeneration,
+      revision: before.revision,
+      leafId: before.leaf,
+      presentationKey: before.presentation,
+    });
+  });
+
+  it("reproves the released source before ordinary confirm may create a new canonical task", async () => {
+    const value = fixture();
+    const harness = createTurnServiceExecutor({
+      build: value.build,
+      conversation: value.conversation,
+      turns: [value.source],
+      nodes: [value.node],
+      turnSelections: [[value.selection, value.selection]],
+    });
+    await releaseGeneratedAttachmentInvalidPreproviderTurn(
+      { turnId: value.source.id },
+      harness.executor,
+    );
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: () => ({ limit: async () => [harness.store.turns[0]] }),
+        }),
+      }),
+    };
+    await expect(
+      loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+        { userId: 1, build: harness.store.build },
+        db,
+      ),
+    ).resolves.toMatchObject({
+      kind: "failed_confirm_preprovider_release",
+      sourceTurnId: value.source.id,
+    });
+
+    harness.store.build.currentPresentationKey = "presentation-drifted";
+    await expect(
+      loadKnowledgeBasePreproviderLocalRehydrateAuthority(
+        { userId: 1, build: harness.store.build },
+        db,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("reserves one current-credential v2 create from the released coordinate without a second charge", async () => {
+    const value = fixture();
+    const sourceSelection = (store: TurnServiceStore) =>
+      store.turns.filter((candidate) => candidate.id === value.source.id);
+    const noExistingTurn = () => [];
+    const harness = createTurnServiceExecutor({
+      build: value.build,
+      conversation: value.conversation,
+      turns: [value.source],
+      nodes: [value.node],
+      credentials: [{ id: "credential-current", userId: 1, status: "active" }],
+      turnSelections: [
+        [sourceSelection, sourceSelection],
+        [noExistingTurn, noExistingTurn, noExistingTurn, sourceSelection],
+      ],
+    });
+    await releaseGeneratedAttachmentInvalidPreproviderTurn(
+      { turnId: value.source.id },
+      harness.executor,
+    );
+    const result = await reserveKnowledgeBaseTurn(
+      {
+        userId: 1,
+        buildId: value.build.id,
+        clientRequestId: "ordinary-confirm-after-release",
+        operationType: "confirm",
+        expectedGeneration: value.build.generation,
+        expectedRevision: value.build.revision,
+        expectedLeafId: value.build.currentLeafId,
+        expectedPresentationKey: value.build.currentPresentationKey,
+        requestPayload: { userMessage: "确认", attachments: [] },
+        apiCredentialId: "credential-current",
+        userText: "确认",
+        userAttachmentCount: 0,
+        expectedAttachmentCount: 2,
+        recoveryMetadata: {
+          kind: "turn",
+          conversationId: value.build.conversationId,
+          parentTaskId: null,
+          localRehydrateAuthority: "local_rehydrate_unbound",
+          chargeDisposition: "reuse_original_no_charge",
+          userMessage: "确认",
+          attachments: [],
+          skillVersion: "4",
+          skillContentHash: "c".repeat(64),
+        },
+      },
+      harness.executor,
+    );
+
+    expect(result.state).toBe("acquired");
+    expect(harness.store.turns).toHaveLength(2);
+    expect(harness.store.turns[0]).toMatchObject({ status: "cancelled" });
+    expect(harness.store.turns[1]).toMatchObject({
+      apiCredentialId: "credential-current",
+      upstreamTaskId: null,
+      status: "queued",
+      metadata: {
+        providerProtocol: "manus_v2",
+        createAttemptState: "not_sent",
+        recovery: {
+          parentTaskId: null,
+          localRehydrateAuthority: "local_rehydrate_unbound",
+          chargeDisposition: "reuse_original_no_charge",
+        },
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      providerProtocol: "manus_v2",
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+      activeTurnId: harness.store.turns[1]!.id,
+    });
+  });
+
+  it("grants task.create only once for the reserved unbound continuation", async () => {
+    const leaseToken = "local-rehydrate-create-lease";
+    const active = turn({
+      status: "queued",
+      upstreamTaskId: null,
+      leaseExpiresAt: new Date("2026-08-01T00:05:00.000Z"),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        createAttemptState: "not_sent",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "not_sent",
+        operationToken: "operation-after-release",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          parentTaskId: null,
+          localRehydrateAuthority: "local_rehydrate_unbound",
+        },
+      },
+    });
+    const releasedMarker = {
+      schemaVersion: 1,
+      reason: "generated_attachment_invalid_preprovider",
+      buildId: active.buildId,
+      generation: active.buildGeneration,
+      revision: active.expectedRevision,
+      leafId: active.expectedLeafId,
+      presentationKey: "presentation-7",
+      sourceTurnId: "released-source-turn",
+      releasedAt: "2026-08-01T00:01:00.000Z",
+    };
+    const harness = createTurnServiceExecutor({
+      build: {
+        ...fixture().build,
+        id: active.buildId,
+        activeTurnId: active.id,
+        providerProtocol: "manus_v2",
+        canonicalTaskState: "unbound",
+        handoffProvenance: { localRehydrateRequired: releasedMarker },
+      },
+      conversation: {
+        id: active.conversationId,
+        userId: active.userId,
+        projectAssignmentId: null,
+      },
+      turns: [active],
+      turnSelections: [[(store) => store.turns], [(store) => store.turns]],
+    });
+
+    await expect(
+      beginKnowledgeBaseManusV2Dispatch(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          frozenProviderRequestHash: "a".repeat(64),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ method: "task.create", canonicalTaskId: null });
+    expect(harness.store.build).toMatchObject({
+      canonicalTaskState: "creating",
+      canonicalTaskGeneration: active.buildGeneration,
+      canonicalCredentialId: active.apiCredentialId,
+    });
+
+    await expect(
+      beginKnowledgeBaseManusV2Dispatch(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          frozenProviderRequestHash: "a".repeat(64),
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_PENDING" });
   });
 
   it("settles a historical explicit not-sent row whose provider projection was absent", async () => {
@@ -3126,7 +3350,18 @@ describe("Manus v2 canonical task writer fence", () => {
     ).resolves.toMatchObject({
       formatRepairAttempt: 1,
       formatRepairAttemptState: "sending",
+      formatRepairStartedAt: expect.any(String),
+      formatRepairDeadlineAt: expect.any(String),
     });
+    const persistedLifecycle = (harness.store.turns[0]!.metadata as any)
+      .manusV2Lifecycle;
+    expect(
+      Date.parse(persistedLifecycle.formatRepairDeadlineAt) -
+        Date.parse(persistedLifecycle.formatRepairStartedAt),
+    ).toBe(120_000);
+    expect(harness.store.turns[0]!.leaseExpiresAt?.toISOString()).toBe(
+      persistedLifecycle.formatRepairDeadlineAt,
+    );
     await expect(
       mutateKnowledgeBaseManusV2Lifecycle(
         {
@@ -3418,6 +3653,22 @@ describe("Manus v2 canonical task writer fence", () => {
       protocolErrorCode: "MANUS_V2_EXTERNAL_CONFIRMATION_REQUIRED",
     });
     expect(harness.store.turns[0]?.status).toBe("running");
+    expect(harness.store.turns[0]?.leaseExpiresAt).toBeNull();
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      recoveryAction: "contact_support",
+      manusV2Lifecycle: {
+        attentionCode: "MANUS_V2_EXTERNAL_CONFIRMATION_REQUIRED",
+      },
+    });
+    await expect(
+      claimKnowledgeBaseTurnForRecovery(
+        {
+          turnId: activeTurn.id,
+          now: new Date("2026-08-01T00:10:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toBeNull();
   });
 
   it("retries only an explicit v2 rejection against the same frozen create request", async () => {
@@ -5290,6 +5541,7 @@ describe("knowledge-base generated attachment reservations", () => {
 describe("knowledge-base atomic start reservation", () => {
   const startInput = {
     userId: 1,
+    expectedResetRevision: 0,
     conversationId: "conversation-atomic",
     clientRequestId: "start-request-a",
     companyName: "FrontMind 超前智能",
@@ -5349,6 +5601,24 @@ describe("knowledge-base atomic start reservation", () => {
       contentDeletedAt: null,
     },
   ];
+
+  it("rejects a stale browser reset revision before creating a build", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      resetRevision: 2,
+      turnSelections: [[]],
+    });
+    await expect(
+      reserveKnowledgeBaseStartBuild(
+        { ...startInput, expectedResetRevision: 1 },
+        executor,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+    });
+    expect(store.build).toBeNull();
+    expect(store.turns).toHaveLength(0);
+    expect(store.messages).toHaveLength(0);
+  });
 
   it("rejects a tombstoned conversation before reserving a build", async () => {
     const { executor, store } = createTurnServiceExecutor({
@@ -6663,6 +6933,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
         ...reserveInput(),
         buildId: startBuild.id,
         operationType: "start",
+        sourceResetRevision: 0,
         expectedGeneration: 1,
         expectedRevision: 0,
         expectedLeafId: null,
@@ -6694,6 +6965,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
           turnId: reserved.turn.id,
           clientRequestId: reserved.turn.clientRequestId,
           clientAttachmentManifest: manifest,
+          expectedResetRevision: 0,
           index,
           attachment,
         },
@@ -6714,6 +6986,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
         turnId: reserved.turn.id,
         clientRequestId: reserved.turn.clientRequestId,
         clientAttachmentManifest: manifest,
+        expectedResetRevision: 0,
       },
       executor,
     );

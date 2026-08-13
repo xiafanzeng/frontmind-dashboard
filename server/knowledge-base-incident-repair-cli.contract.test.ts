@@ -21,6 +21,13 @@ describe("signed-image incident repair CLI integration boundary", () => {
     expect(entrypoint).toContain(
       "serializeKnowledgeBaseIncidentRepairCliResult",
     );
+    expect(entrypoint).toContain("reset-pollution-preview");
+    expect(entrypoint).toContain("reset-pollution-apply");
+    expect(entrypoint).toContain("previewResetPollutionCleanup");
+    expect(entrypoint).toContain("executeResetPollutionCleanup");
+    expect(entrypoint).toContain(
+      "FRONTMIND_RESET_POLLUTION_OFFLINE_MAINTENANCE",
+    );
     expect(entrypoint).not.toMatch(
       /from ["'][^"']*(?:manus|upstream)[^"']*["']/u,
     );

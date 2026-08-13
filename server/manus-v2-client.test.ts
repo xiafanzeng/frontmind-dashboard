@@ -5,6 +5,7 @@ import {
   appendManusV2KnowledgeBaseOperationContract,
   buildManusV2KnowledgeBaseStructuredOutputSchema,
   buildManusV2MessageContent,
+  classifyManusV2StructuredResultEnvelope,
   latestManusV2WaitingDetail,
   latestManusV2TaskState,
   ManusV2ApiError,
@@ -1011,6 +1012,71 @@ describe("ManusV2Client", () => {
       text: "new body",
       structuredOutput: true,
     });
+  });
+
+  it("never accepts a provider-declared extraction failure's schema-shaped zero value", () => {
+    const zeroValue = {
+      schemaVersion: 1,
+      operationToken: "op-1",
+      turnId: "turn-1",
+      generation: 2,
+      baseRevision: 7,
+      action: "confirm",
+      fromLeafId: "leaf-7",
+      nextLeafId: "",
+      visibleMarkdown: "",
+      contentCompleted: false,
+    };
+    const envelope = {
+      error: "Failed to extract structured output",
+      value: zeroValue,
+    };
+    expect(classifyManusV2StructuredResultEnvelope(envelope)).toEqual({
+      kind: "rejected",
+      code: "STRUCTURED_OUTPUT_REJECTED",
+    });
+    expect(
+      normalizeManusV2Output(
+        [
+          {
+            id: "failed-extraction",
+            type: "structured_output_result",
+            timestamp: 10,
+            structured_output_result: envelope,
+          },
+        ],
+        operationContract,
+      ),
+    ).toEqual([]);
+  });
+
+  it("rejects a contradictory nonempty error even when success is true", () => {
+    expect(
+      classifyManusV2StructuredResultEnvelope({
+        success: true,
+        error: "provider reported an extraction error",
+        value: { visibleMarkdown: "must not be accepted" },
+      }),
+    ).toMatchObject({ kind: "rejected" });
+  });
+
+  it("accepts only an explicit successful envelope with no provider error", () => {
+    expect(
+      classifyManusV2StructuredResultEnvelope({
+        success: true,
+        error: "   ",
+        value: { visibleMarkdown: "accepted" },
+      }),
+    ).toEqual({
+      kind: "accepted",
+      value: { visibleMarkdown: "accepted" },
+    });
+    expect(
+      classifyManusV2StructuredResultEnvelope({
+        error: null,
+        value: { visibleMarkdown: "missing success" },
+      }),
+    ).toMatchObject({ kind: "rejected" });
   });
 
   it("rejects a structured result that reuses the token with stale coordinates", () => {

@@ -251,11 +251,76 @@ describe("authoritative KB observation reducer", () => {
       },
     });
     const stale = {
-      ...observation(3, "turn-stale", 1, "1.2", "## 1.2\n旧正文"),
+      ...observation(2, "turn-stale", 1, "1.2", "## 1.2\n旧正文"),
       displaySequence: 12,
     };
 
     expect(applyKnowledgeBaseObservation(current, stale)).toBe(current);
+  });
+
+  it("accepts a higher durable revision even when its display sequence is lower", () => {
+    const current = applyKnowledgeBaseObservation(conversation(), {
+      ...observation(7, "turn-7", 7, "1.7", "## 1.7\n第七版正文"),
+      displaySequence: 70,
+      approvedPresentation: {
+        ...observation(7, "turn-7", 7, "1.7", "## 1.7\n第七版正文")
+          .approvedPresentation!,
+        messageSequence: 70,
+      },
+    });
+    const advanced = {
+      ...observation(8, "turn-8", 8, "1.8", "## 1.8\n第八版正文"),
+      displaySequence: 1,
+      approvedPresentation: {
+        ...observation(8, "turn-8", 8, "1.8", "## 1.8\n第八版正文")
+          .approvedPresentation!,
+        messageSequence: 1,
+      },
+    };
+
+    const next = applyKnowledgeBaseObservation(current, advanced);
+
+    expect(next).not.toBe(current);
+    expect(next.knowledgeBase).toMatchObject({
+      stateEpoch: 8,
+      revision: 8,
+      leafId: "1.8",
+      presentationTurnId: "turn-8",
+    });
+    expect(
+      next.messages.find(
+        (message) => message.knowledgeBase?.presentationKey === presentationKey(8),
+      )?.content,
+    ).toContain("第八版正文");
+  });
+
+  it("accepts a higher durable epoch when the refined observation omits display sequence", () => {
+    const current = applyKnowledgeBaseObservation(conversation(), {
+      ...observation(7, "turn-7", 7, "1.7", "## 1.7\n第七版正文"),
+      displaySequence: 70,
+      approvedPresentation: {
+        ...observation(7, "turn-7", 7, "1.7", "## 1.7\n第七版正文")
+          .approvedPresentation!,
+        messageSequence: 70,
+      },
+    });
+    const advanced = observation(
+      8,
+      "turn-8",
+      8,
+      "1.8",
+      "## 1.8\n第八版正文",
+    );
+
+    const next = applyKnowledgeBaseObservation(current, advanced);
+
+    expect(next).not.toBe(current);
+    expect(next.knowledgeBase).toMatchObject({ stateEpoch: 8, revision: 8 });
+    expect(
+      next.messages.find(
+        (message) => message.knowledgeBase?.presentationKey === presentationKey(8),
+      )?.content,
+    ).toContain("第八版正文");
   });
 
   it("persists a completion receipt sequence and rejects an older observation at the same epoch", () => {

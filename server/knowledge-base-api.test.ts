@@ -63,6 +63,8 @@ import {
   loadKnowledgeBaseTurnAuthority,
   logKnowledgeBaseRuntimeFailure,
   normalizeRecoveredTaskOutput,
+  manusV2KnowledgeBaseAssistantProtocolFallback,
+  normalizeManusV2KnowledgeBaseOperationOutput,
   normalizeKnowledgeBaseClientAttachmentManifest,
   persistKnowledgeBaseDispatchFailure,
   persistKnowledgeBaseCreateFailure,
@@ -1140,6 +1142,246 @@ describe("Manus v2 durable waiting side effects", () => {
 });
 
 describe("Manus v2 durable format repair", () => {
+  const exactAssistantFallbackFixture = {
+    contract: {
+      operationToken: "operation-fallback",
+      turnId: "00000000-0000-4000-8000-000000000154",
+      generation: 1,
+      baseRevision: 7,
+      action: "confirm" as const,
+      fromLeafId: "1.4",
+      expectContentCompleted: false,
+      requiresManifest: false,
+    },
+    assistant: {
+      id: "assistant-exact-protocol",
+      type: "assistant_message",
+      timestamp: 20,
+      assistant_message: {
+        content: [
+          "## 1.5 下一节点",
+          "",
+          "可继续确认的正文。",
+          '<!-- FRONTMIND_KB_PROGRESS\n{"kind":"frontmind.knowledge-base.progress","schemaVersion":2,"operationId":"operation-fallback","turnId":"00000000-0000-4000-8000-000000000154","revision":7,"transition":{"leafId":"1.4","from":"needs_verification","to":"confirmed"}}\n-->',
+          '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":2,"operationId":"operation-fallback","turnId":"00000000-0000-4000-8000-000000000154","revision":8,"leafId":"1.5","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
+        ].join("\n"),
+      },
+    },
+  };
+
+  it("accepts one stopped exact assistant protocol result after structured extraction failure", () => {
+    const { contract, assistant } = exactAssistantFallbackFixture;
+    const candidate = manusV2KnowledgeBaseAssistantProtocolFallback({
+      taskStatus: "stopped",
+      contract,
+      events: [
+        assistant,
+        {
+          id: "structured-zero-value",
+          type: "structured_output_result",
+          timestamp: 21,
+          structured_output_result: {
+            error: "Failed to extract structured output",
+            value: {
+              schemaVersion: 1,
+              operationToken: contract.operationToken,
+              turnId: contract.turnId,
+              generation: contract.generation,
+              baseRevision: contract.baseRevision,
+              action: contract.action,
+              fromLeafId: contract.fromLeafId,
+              nextLeafId: "",
+              visibleMarkdown: "",
+              contentCompleted: false,
+            },
+          },
+        },
+      ] as any,
+    });
+    expect(candidate).toMatchObject({
+      event: { id: "assistant-exact-protocol" },
+    });
+  });
+
+  it("normalizes the observed extraction-error envelope through the ordinary settlement input", async () => {
+    const { contract, assistant } = exactAssistantFallbackFixture;
+    const events = [
+      assistant,
+      {
+        id: "structured-zero-value",
+        type: "structured_output_result",
+        timestamp: 21,
+        structured_output_result: {
+          error: "Failed to extract structured output",
+          value: {
+            schemaVersion: 1,
+            operationToken: contract.operationToken,
+            turnId: contract.turnId,
+            generation: contract.generation,
+            baseRevision: contract.baseRevision,
+            action: contract.action,
+            fromLeafId: contract.fromLeafId,
+            nextLeafId: "",
+            visibleMarkdown: "",
+            contentCompleted: false,
+          },
+        },
+      },
+    ] as any;
+
+    await expect(
+      normalizeManusV2KnowledgeBaseOperationOutput({
+        events,
+        contract,
+        taskStatus: "stopped",
+        build: {} as any,
+        expectedUploadsRead: 0,
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: assistant.id,
+        role: "assistant",
+        text: assistant.assistant_message.content,
+        content: assistant.assistant_message.content,
+        files: [],
+      }),
+    ]);
+  });
+
+  it("does not use the assistant fallback when durable dispatch attribution is absent", async () => {
+    const { contract, assistant } = exactAssistantFallbackFixture;
+    await expect(
+      normalizeManusV2KnowledgeBaseOperationOutput({
+        events: [assistant] as any,
+        contract,
+        taskStatus: "stopped",
+        allowAssistantProtocolFallback: false,
+        build: {} as any,
+        expectedUploadsRead: 0,
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("fails closed for running, duplicate, stale or cross-turn assistant protocol candidates", () => {
+    const { contract, assistant } = exactAssistantFallbackFixture;
+    const inspect = (events: any[], taskStatus = "stopped") =>
+      manusV2KnowledgeBaseAssistantProtocolFallback({
+        taskStatus,
+        contract,
+        events,
+      });
+    expect(inspect([assistant], "running")).toBeNull();
+    expect(inspect([assistant, { ...assistant, id: "duplicate" }])).toBeNull();
+    expect(
+      inspect([
+        {
+          ...assistant,
+          assistant_message: {
+            content: `${assistant.assistant_message.content}\n${assistant.assistant_message.content}`,
+          },
+        },
+      ]),
+    ).toBeNull();
+    expect(
+      inspect([
+        {
+          ...assistant,
+          assistant_message: {
+            content: `${assistant.assistant_message.content}\n<!-- FRONTMIND_KB_UNKNOWN\n{}\n-->`,
+          },
+        },
+      ]),
+    ).toBeNull();
+    expect(
+      inspect([
+        {
+          ...assistant,
+          assistant_message: {
+            content: assistant.assistant_message.content.replace(
+              '"revision":8',
+              '"revision":9',
+            ),
+          },
+        },
+      ]),
+    ).toBeNull();
+    expect(
+      inspect([
+        {
+          ...assistant,
+          assistant_message: {
+            content: assistant.assistant_message.content.replaceAll(
+              contract.turnId,
+              "00000000-0000-4000-8000-000000000999",
+            ),
+          },
+        },
+      ]),
+    ).toBeNull();
+  });
+
+  it("builds one bounded repair even when provider user history omitted the in-band contract", async () => {
+    const contract = exactAssistantFallbackFixture.contract;
+    const sendMessage = vi.fn().mockResolvedValue({ requestId: "repair-req" });
+    const mutateLifecycle = vi.fn();
+    const markAttention = vi.fn();
+    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
+      claim: {
+        turn: { id: contract.turnId, userId: 1, manusV2Lifecycle: {} },
+        leaseToken: "lease",
+      } as any,
+      client: { sendMessage } as any,
+      taskId: "canonical-task",
+      events: [],
+      contract,
+      dependencies: {
+        mutateLifecycle: mutateLifecycle as any,
+        markAttention: markAttention as any,
+      },
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(
+      mutateLifecycle.mock.calls.map(([value]) => value.mutation.state),
+    ).toEqual(["sending", "acknowledged"]);
+    expect(markAttention).not.toHaveBeenCalled();
+  });
+
+  it("turns an expired malformed stopped result into explicit attention without another POST", async () => {
+    const contract = exactAssistantFallbackFixture.contract;
+    const sendMessage = vi.fn();
+    const mutateLifecycle = vi.fn();
+    const markAttention = vi.fn();
+    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
+      claim: {
+        turn: {
+          id: contract.turnId,
+          userId: 1,
+          manusV2Lifecycle: {
+            formatRepairAttempt: 1,
+            formatRepairAttemptState: "outcome_unknown",
+            formatRepairToken: "frozen-repair-token",
+            formatRepairRequestHash: "f".repeat(64),
+            formatRepairDeadlineAt: "2000-01-01T00:00:00.000Z",
+          },
+        },
+        leaseToken: "lease",
+      } as any,
+      client: { sendMessage } as any,
+      taskId: "canonical-task",
+      events: [],
+      contract,
+      dependencies: {
+        mutateLifecycle: mutateLifecycle as any,
+        markAttention: markAttention as any,
+      },
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(mutateLifecycle).not.toHaveBeenCalled();
+    expect(markAttention).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "MANUS_V2_FORMAT_REPAIR_EXPIRED" }),
+    );
+  });
+
   it("adopts an exact repair token after local acknowledgement loss and never POSTs it twice", async () => {
     const contract = {
       operationToken: "op-format",
@@ -2131,9 +2373,55 @@ describe("knowledge base execution contract", () => {
         revision: 3,
       },
       taskId: "task-parent",
+      kind: "bound",
     });
     expect(loadBuild).toHaveBeenCalledOnce();
     expect(loadBuild).toHaveBeenCalledWith(7, "conversation-1");
+  });
+
+  it("admits only an exact local preprovider release as unbound turn authority", async () => {
+    const releasedBuild = {
+      id: "build-released",
+      userId: 7,
+      conversationId: "conversation-released",
+      providerProtocol: "manus_v2",
+      canonicalTaskId: null,
+      upstreamTaskId: null,
+    } as any;
+    const loadBuild = vi.fn(async () => releasedBuild);
+    const loadUnboundAuthority = vi.fn(async () => ({
+      kind: "failed_confirm_preprovider_release" as const,
+      sourceTurnId: "turn-released",
+      generation: 3,
+      revision: 7,
+      leafId: "1.8",
+      presentationKey: "presentation-7",
+    }));
+
+    await expect(
+      loadKnowledgeBaseTurnAuthority(
+        { userId: 7, conversationId: "conversation-released" },
+        loadBuild,
+        loadUnboundAuthority,
+      ),
+    ).resolves.toEqual({
+      build: releasedBuild,
+      taskId: null,
+      kind: "local_rehydrate_unbound",
+    });
+    expect(loadUnboundAuthority).toHaveBeenCalledWith({
+      userId: 7,
+      build: releasedBuild,
+    });
+
+    loadUnboundAuthority.mockResolvedValueOnce(null as never);
+    await expect(
+      loadKnowledgeBaseTurnAuthority(
+        { userId: 7, conversationId: "conversation-released" },
+        loadBuild,
+        loadUnboundAuthority,
+      ),
+    ).resolves.toBeNull();
   });
 
   it("routes only unrecoverable ready packages to explicit rebind", () => {

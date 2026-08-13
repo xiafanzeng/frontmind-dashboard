@@ -6,6 +6,11 @@ import {
   previewKnowledgeBaseIncidentRepairFromSignedImageMaintenance,
 } from "./knowledge-base-incident-repair";
 import {
+  executeResetPollutionCleanup,
+  previewResetPollutionCleanup,
+} from "./knowledge-base-reset-pollution-cleanup";
+import { serializeResetPollutionCleanupCliResult } from "./knowledge-base-reset-pollution-cleanup-cli-core";
+import {
   assertKnowledgeBaseIncidentRepairCliRuntime,
   knowledgeBaseIncidentRepairCliApplyResult,
   knowledgeBaseIncidentRepairCliFailureResult,
@@ -93,6 +98,14 @@ async function releaseMaintenanceLock(connection: Connection | null) {
 }
 
 async function execute(command: KnowledgeBaseIncidentRepairCliCommand) {
+  if (command.mode === "reset-pollution-preview") {
+    const value = await previewResetPollutionCleanup(command);
+    return { mode: command.mode, value } as const;
+  }
+  if (command.mode === "reset-pollution-apply") {
+    const value = await executeResetPollutionCleanup(command);
+    return { mode: command.mode, value } as const;
+  }
   if (command.mode === "preview") {
     const preview =
       await previewKnowledgeBaseIncidentRepairFromSignedImageMaintenance(
@@ -121,6 +134,15 @@ async function main() {
   let result: KnowledgeBaseIncidentRepairCliResult;
   try {
     command = parseKnowledgeBaseIncidentRepairCliArgs(process.argv.slice(2));
+    const resetPollutionMode =
+      command.mode === "reset-pollution-preview" ||
+      command.mode === "reset-pollution-apply";
+    if (
+      resetPollutionMode &&
+      process.env.FRONTMIND_RESET_POLLUTION_OFFLINE_MAINTENANCE !== "1"
+    ) {
+      fail("RESET_POLLUTION_OFFLINE_MAINTENANCE_REQUIRED");
+    }
     const runtimeIdentity = validateReleaseRuntimeEnvironment(
       process.env,
       compiledBuildSha || null,
@@ -130,12 +152,35 @@ async function main() {
       compiledBuildSha,
       compiledReleaseChannel,
       runtimeIdentity,
-      readiness: await readiness(),
+      readiness: resetPollutionMode ? null : await readiness(),
+      skipLoopbackReadiness: resetPollutionMode,
     });
     connection = await acquireMaintenanceLock();
     const executed = await execute(command);
     const lockReleased = await releaseMaintenanceLock(connection);
     connection = null;
+    if (executed.mode === "reset-pollution-preview") {
+      if (!lockReleased) fail("LOCK_RELEASE_UNCONFIRMED");
+      writeOutput(
+        serializeResetPollutionCleanupCliResult({
+          success: true,
+          mode: executed.mode,
+          ...executed.value,
+        }),
+      );
+      return;
+    }
+    if (executed.mode === "reset-pollution-apply") {
+      if (!lockReleased) fail("LOCK_RELEASE_UNCONFIRMED");
+      writeOutput(
+        serializeResetPollutionCleanupCliResult({
+          success: true,
+          mode: executed.mode,
+          ...executed.value,
+        }),
+      );
+      return;
+    }
     result =
       executed.mode === "preview"
         ? knowledgeBaseIncidentRepairCliPreviewResult({
@@ -153,6 +198,21 @@ async function main() {
   } catch (error) {
     const lockReleased = await releaseMaintenanceLock(connection);
     connection = null;
+    if (
+      command?.mode === "reset-pollution-preview" ||
+      command?.mode === "reset-pollution-apply"
+    ) {
+      const raw = lockReleased && error instanceof Error ? error.message : "";
+      writeOutput(
+        serializeResetPollutionCleanupCliResult({
+          success: false,
+          mode: command.mode,
+          code: raw,
+        }),
+      );
+      process.exitCode = 1;
+      return;
+    }
     result = knowledgeBaseIncidentRepairCliFailureResult({
       error: lockReleased
         ? error

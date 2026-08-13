@@ -1272,6 +1272,65 @@ describe("knowledge-base observation consistency", () => {
     });
   });
 
+  it("projects bounded Manus format attention as non-retryable support instead of recovery", async () => {
+    const activeTurn = {
+      id: "turn-format-attention",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-format-attention",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-format-attention",
+      operationType: "confirm",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      status: "running",
+      upstreamTaskId: "task-old",
+      metadata: {
+        recoveryAction: "contact_support",
+        manusV2Lifecycle: {
+          attentionCode: "MANUS_V2_FORMAT_REPAIR_EXPIRED",
+        },
+      },
+      startedAt: new Date("2026-08-01T00:00:01.000Z"),
+      completedAt: null,
+      createdAt: new Date("2026-08-01T00:00:01.000Z"),
+      updatedAt: new Date("2026-08-01T00:02:01.000Z"),
+    };
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              activeTurnId: activeTurn.id,
+              canonicalTaskState: "attention_required",
+              protocolErrorCode: "MANUS_V2_FORMAT_REPAIR_EXPIRED",
+              protocolError: null,
+            }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [activeTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+    expect(observation?.notice).toMatchObject({
+      code: "MANUS_V2_FORMAT_REPAIR_EXPIRED",
+      retryable: false,
+      failureClass: "terminal_nonregenerable",
+      recoveryAction: "contact_support",
+    });
+  });
+
   it("uses a newer completion receipt as displaySequence while retaining the last presentation", async () => {
     const persistedNode = node();
     const contentSha256 = createHash("sha256")

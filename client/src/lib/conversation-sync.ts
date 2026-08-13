@@ -80,6 +80,19 @@ export class ConversationSyncQueue<T extends { id: string }> {
     this.entries.clear();
   }
 
+  /**
+   * Fence one conversation after an authoritative server-side deletion/reset.
+   * An already-running transport cannot always be aborted, but removing its
+   * lane guarantees that its completion cannot enqueue, retry, or acknowledge
+   * any stale snapshot locally.
+   */
+  cancel(id: string) {
+    const entry = this.entries.get(id);
+    if (!entry) return;
+    if (entry.timer) clearTimeout(entry.timer);
+    this.entries.delete(id);
+  }
+
   private getEntry(id: string): QueueEntry<T> {
     const existing = this.entries.get(id);
     if (existing) return existing;

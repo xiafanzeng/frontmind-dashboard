@@ -88,6 +88,8 @@ import {
   KNOWLEDGE_BASE_PRESENTATION_KIND,
   KNOWLEDGE_BASE_PROGRESS_KIND,
   KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
+  parseKnowledgeBasePresentationEnvelope,
+  parseKnowledgeBaseProgressEnvelope,
   parseKnowledgeBaseManifestEnvelope,
   validateKnowledgeBaseManifestForTreePolicy,
 } from "./knowledge-base-progress";
@@ -137,6 +139,7 @@ import {
   inspectKnowledgeBaseLegacyDeferredReservationReplay,
   inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
+  loadKnowledgeBasePreproviderLocalRehydrateAuthority,
   loadKnowledgeBaseLocalRehydrateSnapshot,
   clearKnowledgeBaseLocalRehydrateRequirement,
   markKnowledgeBaseTurnDispatching,
@@ -362,6 +365,7 @@ interface KnowledgeBaseStartRequest {
   companyWebsite?: string;
   operatorNotes?: string;
   attachments?: KnowledgeBaseAttachment[];
+  expectedResetRevision?: number;
 }
 
 function reservationRetryAfterMs(reservation: KnowledgeBaseTurnReservation) {
@@ -644,6 +648,7 @@ export function knowledgeBaseTurnReservationErrorStatus(
     return 404;
   }
   if (error.code === "INVALID_REQUEST") return 400;
+  if (error.code === "KNOWLEDGE_BASE_RESET_REVISION_CHANGED") return 409;
   if (error.code === "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID") return 422;
   if (error.code === "IDEMPOTENCY_PENDING") return 425;
   // Stale presentation, immutable replay mismatch and Logo binding conflict
@@ -787,13 +792,23 @@ type KnowledgeBaseBuildRecord = Awaited<
 export async function loadKnowledgeBaseTurnAuthority(
   input: { userId: number; conversationId: string },
   loadBuild: typeof loadKnowledgeBaseBuildRecord = loadKnowledgeBaseBuildRecord,
+  loadUnboundAuthority: typeof loadKnowledgeBasePreproviderLocalRehydrateAuthority = loadKnowledgeBasePreproviderLocalRehydrateAuthority,
 ): Promise<{
   build: NonNullable<KnowledgeBaseBuildRecord>;
-  taskId: string;
+  taskId: string | null;
+  kind: "bound" | "local_rehydrate_unbound";
 } | null> {
   const build = await loadBuild(input.userId, input.conversationId);
   const taskId = String(build?.canonicalTaskId || build?.upstreamTaskId || "");
-  return build && taskId ? { build, taskId } : null;
+  if (!build) return null;
+  if (taskId) return { build, taskId, kind: "bound" };
+  const unboundAuthority = await loadUnboundAuthority({
+    userId: input.userId,
+    build,
+  });
+  return unboundAuthority
+    ? { build, taskId: null, kind: "local_rehydrate_unbound" }
+    : null;
 }
 
 function outputItemIds(output: unknown[]) {
@@ -3165,6 +3180,9 @@ async function reconcileRecoveredKnowledgeBaseTask(input: {
       output = await normalizeManusV2KnowledgeBaseOperationOutput({
         events,
         contract,
+        taskStatus: status,
+        allowAssistantProtocolFallback:
+          manusV2ClaimProvesFrozenDispatchAttribution({ claim, taskId }),
         build,
         expectedUploadsRead: build.lastTurnAttachmentCount,
       });
@@ -3381,6 +3399,50 @@ function manusV2ContractForTurn(input: {
     expectContentCompleted,
     requiresManifest: build.totalNodeCount === 0,
   };
+}
+
+function manusV2ClaimProvesFrozenDispatchAttribution(input: {
+  claim: KnowledgeBaseRecoveryClaim;
+  taskId: string;
+}) {
+  const { claim } = input;
+  const prepared = claim.preparedDispatch;
+  const method = claim.turn.providerMethod;
+  const providerState = claim.turn.providerAttemptState;
+  return Boolean(
+    claim.turn.providerProtocol === "manus_v2" &&
+      claim.turn.attachmentsFrozen &&
+      prepared &&
+      prepared.schemaVersion === 2 &&
+      prepared.bodySha256 ===
+        hashKnowledgeBaseTurnRequest(prepared.requestBody) &&
+      typeof claim.turn.operationToken === "string" &&
+      claim.turn.operationToken.length > 0 &&
+      method === "task.sendMessage" &&
+      claim.turn.upstreamTaskId === input.taskId &&
+      ["sending", "outcome_unknown", "output_pending"].includes(
+        providerState || "",
+      ),
+  );
+}
+
+function manusV2TurnProvesAcknowledgedAttribution(input: {
+  turn: {
+    providerProtocol: string;
+    providerMethod: string | null;
+    providerAttemptState: string | null;
+    upstreamTaskId: string | null;
+    attachmentsFrozen: boolean;
+  };
+  taskId: string;
+}) {
+  return Boolean(
+    input.turn.providerProtocol === "manus_v2" &&
+      input.turn.providerMethod === "task.sendMessage" &&
+      input.turn.providerAttemptState === "output_pending" &&
+      input.turn.upstreamTaskId === input.taskId &&
+      input.turn.attachmentsFrozen,
+  );
 }
 
 async function reconcileKnowledgeBaseManusV2Lifecycle(input: {
@@ -3799,6 +3861,16 @@ async function repairStoppedManusV2KnowledgeBaseFormat(input: {
     markKnowledgeBaseManusV2AttentionRequired;
   const existing = input.claim.turn.manusV2Lifecycle;
   if (existing.formatRepairAttemptState) {
+    const deadlineAt = Date.parse(existing.formatRepairDeadlineAt || "");
+    if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      await markAttention({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: "MANUS_V2_FORMAT_REPAIR_EXPIRED",
+      });
+      return false;
+    }
     const repair = buildKnowledgeBaseManusV2FormatRepair({
       contract: input.contract,
       events: input.events,
@@ -3858,7 +3930,6 @@ async function repairStoppedManusV2KnowledgeBaseFormat(input: {
     contract: input.contract,
     events: input.events,
   });
-  if (!repair) return false;
   await mutateLifecycle({
     userId: input.claim.turn.userId,
     turnId: input.claim.turn.id,
@@ -3914,19 +3985,142 @@ export const knowledgeBaseManusV2LifecycleTestHooks = {
   repairFormat: repairStoppedManusV2KnowledgeBaseFormat,
 };
 
+type ManusV2AssistantProtocolFallback = {
+  event: Parameters<typeof normalizeManusV2Output>[0][number];
+  text: string;
+};
+
+/**
+ * Structured extraction can fail after Manus has already emitted the exact
+ * closed Dashboard protocol response in an assistant message. Accept that
+ * message only for a non-initial stopped operation and only when one unique
+ * assistant event proves every frozen coordinate. The ordinary progress
+ * transaction remains the final CAS and content validator.
+ */
+export function manusV2KnowledgeBaseAssistantProtocolFallback(input: {
+  events: Parameters<typeof normalizeManusV2Output>[0];
+  contract: ManusV2KnowledgeBaseOperationContract;
+  taskStatus: string;
+}): ManusV2AssistantProtocolFallback | null {
+  if (
+    input.taskStatus !== "stopped" ||
+    input.contract.requiresManifest ||
+    input.contract.expectContentCompleted
+  ) {
+    return null;
+  }
+  const expectedTransition =
+    input.contract.action === "confirm"
+      ? "confirmed"
+      : input.contract.action === "direct_prefill"
+        ? "direct_prefilled"
+        : input.contract.action === "revise"
+          ? "needs_verification"
+          : null;
+  if (!expectedTransition || !input.contract.fromLeafId) return null;
+
+  const candidates = input.events.flatMap((event) => {
+    if (event.type !== "assistant_message") return [];
+    const message =
+      event.assistant_message &&
+      typeof event.assistant_message === "object" &&
+      !Array.isArray(event.assistant_message)
+        ? (event.assistant_message as Record<string, unknown>)
+        : null;
+    const text =
+      typeof message?.content === "string" ? message.content.trim() : "";
+    if (!text || text.length > 4_000_000) return [];
+    try {
+      const progressMarkers = text.match(
+        /<!--\s*FRONTMIND_KB_PROGRESS\b[\s\S]*?-->/giu,
+      );
+      const presentationMarkers = text.match(
+        /<!--\s*FRONTMIND_KB_PRESENTATION\b[\s\S]*?-->/giu,
+      );
+      const protocolMarkers = text.match(
+        /<!--\s*FRONTMIND_KB_[A-Z_]+\b[\s\S]*?-->/giu,
+      );
+      if (
+        progressMarkers?.length !== 1 ||
+        presentationMarkers?.length !== 1 ||
+        protocolMarkers?.length !== 2
+      ) {
+        return [];
+      }
+      const progress = parseKnowledgeBaseProgressEnvelope(text);
+      const presentation = parseKnowledgeBasePresentationEnvelope(text);
+      if (
+        progress.schemaVersion !== KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION ||
+        presentation.schemaVersion !==
+          KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION ||
+        progress.operationId !== input.contract.operationToken ||
+        presentation.operationId !== input.contract.operationToken ||
+        progress.turnId !== input.contract.turnId ||
+        presentation.turnId !== input.contract.turnId ||
+        progress.revision !== input.contract.baseRevision ||
+        presentation.revision !== input.contract.baseRevision + 1 ||
+        progress.transition.leafId !== input.contract.fromLeafId ||
+        progress.transition.to !== expectedTransition ||
+        !presentation.leafId ||
+        presentation.leafId === input.contract.fromLeafId ||
+        presentation.imageState !== "no_eligible_asset" ||
+        presentation.imageCount !== 0 ||
+        presentation.assetIds?.length !== 0
+      ) {
+        return [];
+      }
+      const visibleMarkdown = text
+        .replace(
+          /<!--\s*FRONTMIND_KB_(?:MANIFEST|PROGRESS|REOPEN|PRESENTATION)\b[\s\S]*?-->/giu,
+          "",
+        )
+        .trim();
+      if (!visibleMarkdown) return [];
+      return [{ event, text }];
+    } catch {
+      return [];
+    }
+  });
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
 export async function normalizeManusV2KnowledgeBaseOperationOutput(input: {
   events: Parameters<typeof normalizeManusV2Output>[0];
   contract: ManusV2KnowledgeBaseOperationContract;
+  taskStatus?: string;
+  allowAssistantProtocolFallback?: boolean;
   build: NonNullable<
     Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
   >;
   expectedUploadsRead: number;
 }) {
-  const result = manusV2KnowledgeBaseStructuredResultForOperation(
+  const structuredResult = manusV2KnowledgeBaseStructuredResultForOperation(
     input.events,
     input.contract,
   );
-  if (!result) return [];
+  const fallback = structuredResult
+    ? null
+    : input.allowAssistantProtocolFallback === false
+      ? null
+      : manusV2KnowledgeBaseAssistantProtocolFallback({
+          events: input.events,
+          contract: input.contract,
+          taskStatus: input.taskStatus || "running",
+        });
+  if (!structuredResult && !fallback) return [];
+  if (fallback) {
+    return [
+      {
+        id: fallback.event.id,
+        role: "assistant" as const,
+        text: fallback.text,
+        content: fallback.text,
+        timestamp: fallback.event.timestamp,
+        files: [],
+      },
+    ];
+  }
+  const result = structuredResult!;
   if (
     !input.contract.requiresManifest &&
     !input.contract.expectContentCompleted
@@ -4233,6 +4427,33 @@ async function reconcilePolledManusV2KnowledgeBaseTask(input: {
     output = await normalizeManusV2KnowledgeBaseOperationOutput({
       events,
       contract,
+      taskStatus,
+      allowAssistantProtocolFallback:
+        claim !== null
+          ? manusV2ClaimProvesFrozenDispatchAttribution({
+              claim,
+              taskId: input.taskId,
+            })
+          : manusV2TurnProvesAcknowledgedAttribution({
+              turn: {
+                providerProtocol:
+                  metadata.providerProtocol === "manus_v2"
+                    ? "manus_v2"
+                    : "legacy_v1",
+                providerMethod:
+                  metadata.providerMethod === "task.sendMessage" ||
+                  metadata.providerMethod === "task.create"
+                    ? metadata.providerMethod
+                    : null,
+                providerAttemptState:
+                  typeof metadata.providerAttemptState === "string"
+                    ? metadata.providerAttemptState
+                    : null,
+                upstreamTaskId: activeTurn.upstreamTaskId,
+                attachmentsFrozen: metadata.attachmentsFrozen === true,
+              },
+              taskId: input.taskId,
+            }),
       build: input.build,
       expectedUploadsRead: input.build.lastTurnAttachmentCount,
     });
@@ -4561,10 +4782,21 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       claim,
       build: existingBuild,
     });
-    const localRehydrateRequired = Boolean(
-      existingBuild.handoffProvenance.localRehydrateRequired,
-    );
-    if (localRehydrateRequired) {
+    const localRehydrateRequired =
+      existingBuild.handoffProvenance.localRehydrateRequired;
+    const preproviderLocalRehydrate = localRehydrateRequired
+      ? await loadKnowledgeBasePreproviderLocalRehydrateAuthority({
+          userId: claim.turn.userId,
+          build: existingBuild,
+        })
+      : null;
+    if (preproviderLocalRehydrate) {
+      // The failed legacy confirm had no prepared Provider request, so its
+      // release deliberately has no frozen provider snapshot. Rebuild the
+      // complete Dashboard-owned nodes/receipts plus this new operation from
+      // durable state, after reproving the exact release source.
+      handoff = rebuilt;
+    } else if (localRehydrateRequired) {
       localCanonicalSnapshot = await loadKnowledgeBaseLocalRehydrateSnapshot({
         userId: claim.turn.userId,
         build: existingBuild,
@@ -4640,8 +4872,55 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         taskId,
         order: "asc",
       });
+      const contract = manusV2ContractForTurn({
+        claim,
+        build: existingBuild,
+      });
+      const taskStatus = latestManusV2TaskState(events) || "running";
+      // Never pre-parse a stopped result here. The single lifecycle reconciler
+      // owns all stopped parsing so malformed structured output reaches its
+      // one repair/deadline/attention terminal path instead of being thrown
+      // back into the generic outcome-unknown lease loop.
+      if (taskStatus === "stopped") {
+        if (
+          claim.turn.providerMethod === "task.sendMessage" &&
+          !claim.turn.upstreamTaskId
+        ) {
+          await bindKnowledgeBaseManusV2Submission({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            method: "task.sendMessage",
+            taskId,
+          });
+          claim.turn.upstreamTaskId = taskId;
+        }
+        const reconciled = await reconcileRecoveredKnowledgeBaseTask({
+          claim,
+          credential,
+          taskId,
+        });
+        return { taskId, rebound: false, reconciled };
+      }
+      const exactStructuredResult =
+        manusV2KnowledgeBaseStructuredResultForOperation(events, contract);
+      const exactAssistantResult = manusV2ClaimProvesFrozenDispatchAttribution({
+        claim,
+        taskId,
+      })
+        ? manusV2KnowledgeBaseAssistantProtocolFallback({
+            events,
+            contract,
+            taskStatus,
+          })
+        : null;
       if (
-        !manusV2EventsContainOperationToken(events, claim.turn.operationToken)
+        !manusV2EventsContainOperationToken(
+          events,
+          claim.turn.operationToken,
+        ) &&
+        !exactStructuredResult &&
+        !exactAssistantResult
       ) {
         throw new ManusV2ApiError(
           "task.sendMessage.reconcile",
@@ -4664,16 +4943,17 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         });
         claim.turn.upstreamTaskId = taskId;
       }
-      const contract = manusV2ContractForTurn({ claim, build: existingBuild });
       const output = await normalizeManusV2KnowledgeBaseOperationOutput({
         events,
         contract,
+        taskStatus,
+        allowAssistantProtocolFallback:
+          manusV2ClaimProvesFrozenDispatchAttribution({ claim, taskId }),
         build: existingBuild,
         expectedUploadsRead: existingBuild.lastTurnAttachmentCount,
       });
-      const status = latestManusV2TaskState(events) || "running";
       const reconciled =
-        output.length > 0 && shouldReconcileKnowledgeOutput(output, status)
+        output.length > 0 && shouldReconcileKnowledgeOutput(output, taskStatus)
           ? await reconcileRecoveredKnowledgeBaseTask({
               claim,
               credential,
@@ -7304,11 +7584,14 @@ router.post("/start/reserve", async (req, res) => {
   const requestedCompanyName = String(body.companyName || "").trim();
   const companyWebsite = String(body.companyWebsite || "").trim();
   const operatorNotes = String(body.operatorNotes || "").trim();
+  const expectedResetRevision = Number(body.expectedResetRevision);
   if (
     !conversationId ||
     conversationId.length > 191 ||
     !clientRequestId ||
-    clientRequestId.length > 128
+    clientRequestId.length > 128 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0
   ) {
     res.status(400).json({
       error: {
@@ -7398,10 +7681,12 @@ router.post("/start/reserve", async (req, res) => {
         attachmentManifest.length + 2 + (prefillKnowledgeSnapshot ? 1 : 0),
       deferDispatchUntilAttachments: true,
       clientAttachmentManifest: attachmentManifest,
+      expectedResetRevision,
       requestPayload: {
         companyName,
         companyWebsite,
         operatorNotes,
+        sourceResetRevision: expectedResetRevision,
         attachments: [],
         attachmentManifest,
         skillVersion: latestSkillDescriptor.version,
@@ -7412,6 +7697,7 @@ router.post("/start/reserve", async (req, res) => {
         traceId: requestTraceId,
         kind: "start",
         conversationId,
+        sourceResetRevision: expectedResetRevision,
         companyName,
         companyWebsite,
         operatorNotes,
@@ -8049,27 +8335,10 @@ router.post("/turn/reserve", async (req, res) => {
     if (await replayAfterMutableFailure()) {
       return;
     }
-    let authority = await loadKnowledgeBaseTurnAuthority({
+    const authority = await loadKnowledgeBaseTurnAuthority({
       userId: req.frontmindUser.id,
       conversationId,
     });
-    if (!authority) {
-      const unboundBuild = await loadKnowledgeBaseBuildRecord(
-        req.frontmindUser.id,
-        conversationId,
-      );
-      const localRehydrateRequired =
-        unboundBuild?.providerProtocol === "manus_v2" &&
-        !unboundBuild.canonicalTaskId &&
-        unboundBuild.canonicalTaskState === "unbound" &&
-        unboundBuild.handoffProvenance &&
-        typeof unboundBuild.handoffProvenance === "object" &&
-        !Array.isArray(unboundBuild.handoffProvenance) &&
-        Boolean(unboundBuild.handoffProvenance.localRehydrateRequired);
-      if (unboundBuild && localRehydrateRequired) {
-        authority = { build: unboundBuild, taskId: "" };
-      }
-    }
     if (!authority) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
@@ -8188,6 +8457,12 @@ router.post("/turn/reserve", async (req, res) => {
         kind: "turn",
         conversationId,
         parentTaskId,
+        ...(authority.kind === "local_rehydrate_unbound"
+          ? {
+              localRehydrateAuthority: authority.kind,
+              chargeDisposition: "reuse_original_no_charge",
+            }
+          : {}),
         userMessage,
         attachments: [],
         attachmentManifest,
@@ -8270,6 +8545,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
     attachmentManifest?: unknown;
     index?: number;
     attachment?: KnowledgeBaseAttachment;
+    expectedResetRevision?: number;
   };
   const conversationId = String(body.conversationId || "").trim();
   const turnId = String(body.turnId || "").trim();
@@ -8352,6 +8628,9 @@ router.post("/turn/attachments/stage", async (req, res) => {
         build.revision === 0 &&
         build.currentLeafId === null,
     );
+    const expectedResetRevision = isStartReservation
+      ? Number(body.expectedResetRevision)
+      : undefined;
     const parentTaskId = String(
       build?.canonicalTaskId || build?.upstreamTaskId || "",
     );
@@ -8557,6 +8836,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
             turnId,
             clientRequestId,
             clientAttachmentManifest: manifest,
+            expectedResetRevision,
             index,
             attachment,
             managedUploadProof: {
@@ -8780,6 +9060,7 @@ router.post("/turn/dispatch", async (req, res) => {
     turnId?: string;
     clientRequestId?: string;
     attachmentManifest?: unknown;
+    expectedResetRevision?: number;
   };
   const conversationId = String(body.conversationId || "").trim();
   const turnId = String(body.turnId || "").trim();
@@ -8844,6 +9125,9 @@ router.post("/turn/dispatch", async (req, res) => {
         build.revision === 0 &&
         build.currentLeafId === null,
     );
+    const expectedResetRevision = isStartReservation
+      ? Number(body.expectedResetRevision)
+      : undefined;
     const parentTaskId = String(
       build?.canonicalTaskId || build?.upstreamTaskId || "",
     );
@@ -8916,6 +9200,7 @@ router.post("/turn/dispatch", async (req, res) => {
       turnId,
       clientRequestId,
       clientAttachmentManifest: attachmentManifest,
+      expectedResetRevision,
     });
     if (acquiredClaim.state !== "acquired") {
       await respondKnowledgeBaseTurnReplayReceipt({
@@ -9378,11 +9663,15 @@ router.post("/turn", async (req, res) => {
         "仅可在第一个知识节点待确认时提交或更换企业主 Logo，请刷新当前节点后重试",
       );
     }
-    const taskCredential = await getCredentialForUpstreamResource(
-      req.frontmindUser!.id,
-      "task",
-      taskId,
-    );
+    const taskCredential = taskId
+      ? await getCredentialForUpstreamResource(
+          req.frontmindUser!.id,
+          "task",
+          taskId,
+        )
+      : authority.kind === "local_rehydrate_unbound"
+        ? req.frontmindCredential
+        : null;
     if (!taskCredential) {
       if (await replayAfterMutableFailure()) return;
       const observation = await getKnowledgeBaseObservation({
@@ -9567,6 +9856,12 @@ router.post("/turn", async (req, res) => {
       kind: "turn",
       conversationId,
       parentTaskId: taskId,
+      ...(authority.kind === "local_rehydrate_unbound"
+        ? {
+            localRehydrateAuthority: authority.kind,
+            chargeDisposition: "reuse_original_no_charge",
+          }
+        : {}),
       userMessage: turnUserMessage,
       attachments,
       ...(manualLogoSubmission ? { manualLogoSubmission: true } : {}),

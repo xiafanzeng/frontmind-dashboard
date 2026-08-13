@@ -6,6 +6,7 @@ import {
   ConversationProvider,
   applyKnowledgeBaseObservation,
   currentKnowledgeBaseReplySnapshot,
+  mergeKnowledgeBaseHydration,
   mergeServerOwnedKnowledgeBaseMessages,
   parseOutputMessages,
   prepareConversationForCloud,
@@ -373,6 +374,39 @@ describe("ConversationProvider cloud hydration", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("accepts a higher durable KB revision even when its display sequence is lower", () => {
+    const state = (revision: number, stateEpoch: number) => ({
+      initialized: true,
+      generation: 1,
+      stateEpoch,
+      revision,
+      leafId: `leaf-${revision}`,
+      presentationKey: `presentation-${revision}`,
+      presentationTurnId: `turn-${revision}`,
+      activeTurnId: null,
+      activeClientRequestId: null,
+      interactionState: "awaiting_input" as const,
+      canReply: true,
+      displaySequence: revision === 7 ? 70 : 1,
+      notice: null,
+    });
+    const local: Conversation = {
+      ...conversation("higher-revision-hydration"),
+      status: "running",
+      knowledgeBase: state(7, 7),
+    };
+    const remote: Conversation = {
+      ...conversation("higher-revision-hydration"),
+      status: "awaiting_input",
+      knowledgeBase: state(8, 8),
+    };
+
+    expect(mergeKnowledgeBaseHydration(local, remote)).toMatchObject({
+      status: "awaiting_input",
+      knowledgeBase: { revision: 8, stateEpoch: 8, displaySequence: 1 },
+    });
   });
 
   it("hydrates conversations from the database", async () => {
@@ -800,6 +834,40 @@ describe("ConversationProvider cloud hydration", () => {
     ]);
     expect(current?.deletedMessageIds ?? []).not.toContain("presentation-1");
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
+  });
+
+  it("keeps a reset-discarded conversation out of a late and subsequent cloud hydration", async () => {
+    const stale = {
+      ...conversation("reset-discarded"),
+      title: "企业知识库构建",
+      status: "awaiting_input" as const,
+      knowledgeBase: {
+        initialized: true,
+        generation: 1,
+        stateEpoch: 2,
+        activeTurnId: null,
+        activeClientRequestId: null,
+        presentationTurnId: "turn-old",
+        interactionState: "awaiting_input" as const,
+        canReply: true,
+        presentationKey: "presentation-old",
+        revision: 1,
+        leafId: "1.1",
+        notice: null,
+      },
+    };
+    mocks.listRefetch.mockResolvedValue({ data: [stale] });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    act(() => result.current.discardConversationLocally("reset-discarded"));
+    expect(result.current.state.conversations).toEqual([]);
+
+    await act(async () => {
+      await result.current.refreshConversationsAfterDiscard();
+    });
+
+    expect(result.current.state.conversations).toEqual([]);
   });
 
   it("atomically settles an unaccepted KB start without leaving task identity", async () => {

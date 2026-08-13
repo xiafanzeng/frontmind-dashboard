@@ -771,6 +771,63 @@ function observationDisplaySequence(observation: KnowledgeBaseObservationDto) {
     : 0;
 }
 
+function observationRevision(observation: KnowledgeBaseObservationDto) {
+  return (
+    observation.approvedPresentation?.revision ??
+    observation.interaction.progress?.build.revision ??
+    observation.progress?.build.revision ??
+    -1
+  );
+}
+
+function observationAdvancesDurableClientCoordinate(
+  current: KnowledgeBaseClientState | undefined,
+  messages: readonly LocalMessage[],
+  observation: KnowledgeBaseObservationDto,
+) {
+  const observedRevision = observationRevision(observation);
+  if (current?.initialized) {
+    if (observation.generation !== current.generation) {
+      return observation.generation > current.generation;
+    }
+    if (observation.stateEpoch !== current.stateEpoch) {
+      return observation.stateEpoch > current.stateEpoch;
+    }
+    const currentRevision = current.revision ?? -1;
+    // stateEpoch refinements at the same presentation may update processing
+    // metadata, but they cannot authorize lower receipt history to replace
+    // the immutable body already rendered by the browser.
+    if (observedRevision > currentRevision) return true;
+    if (observedRevision <= currentRevision) return false;
+  }
+
+  const persisted = messages
+    .filter(
+      (message) =>
+        isServerOwnedKnowledgeBaseMessage(message) &&
+        message.knowledgeBase?.kind === "presentation",
+    )
+    .reduce(
+      (latest, message) => {
+        const candidate = {
+          generation: message.knowledgeBase?.generation ?? -1,
+          revision: message.knowledgeBase?.revision ?? -1,
+        };
+        return candidate.generation > latest.generation ||
+          (candidate.generation === latest.generation &&
+            candidate.revision > latest.revision)
+          ? candidate
+          : latest;
+      },
+      { generation: -1, revision: -1 },
+    );
+  return (
+    observation.generation > persisted.generation ||
+    (observation.generation === persisted.generation &&
+      observedRevision > persisted.revision)
+  );
+}
+
 function observationPrecedesPersistedKnowledgeBaseHistory(
   messages: readonly LocalMessage[],
   observation: KnowledgeBaseObservationDto,
@@ -858,8 +915,14 @@ export function applyKnowledgeBaseObservation(
   observation: KnowledgeBaseObservationDto,
 ): Conversation {
   const currentDisplaySequence = persistedDisplaySequence(conversation);
+  const advancesDurableCoordinate = observationAdvancesDurableClientCoordinate(
+    conversation.knowledgeBase,
+    conversation.messages,
+    observation,
+  );
   if (
-    (currentDisplaySequence > 0 &&
+    (!advancesDurableCoordinate &&
+      currentDisplaySequence > 0 &&
       observationDisplaySequence(observation) < currentDisplaySequence) ||
     knowledgeObservationIsStale(conversation.knowledgeBase, observation) ||
     observationPrecedesPersistedKnowledgeBaseHistory(
@@ -1601,18 +1664,25 @@ export function mergeKnowledgeBaseHydration(
   );
   const remoteDisplaySequenceIsOlder =
     localDisplaySequence > 0 && remoteDisplaySequence < localDisplaySequence;
+  const localRevision = localState.revision ?? -1;
+  const remoteRevision = remoteState?.revision ?? -1;
   const coordinatesMatch = Boolean(
     remoteState?.initialized &&
       remoteState.generation === localState.generation &&
-      remoteState.stateEpoch === localState.stateEpoch,
+      remoteState.stateEpoch === localState.stateEpoch &&
+      remoteRevision === localRevision,
   );
   const remoteIsNewer = Boolean(
     remoteState?.initialized &&
-      !remoteDisplaySequenceIsOlder &&
       (remoteState.generation > localState.generation ||
         (remoteState.generation === localState.generation &&
           remoteState.stateEpoch > localState.stateEpoch) ||
-        (coordinatesMatch && remoteDisplaySequence > localDisplaySequence)),
+        (remoteState.generation === localState.generation &&
+          remoteState.stateEpoch === localState.stateEpoch &&
+          remoteRevision > localRevision) ||
+        (coordinatesMatch &&
+          !remoteDisplaySequenceIsOlder &&
+          remoteDisplaySequence > localDisplaySequence)),
   );
   if (remoteIsNewer) return remoteWithProtectedHistory;
 
@@ -1728,6 +1798,8 @@ interface ConversationContextType {
   discardConversationLocally: (id: string) => void;
   deleteMessage: (conversationId: string, messageId: string) => void;
   refreshConversations: () => Promise<void>;
+  /** Re-read cloud history after an authoritative reset/local discard. */
+  refreshConversationsAfterDiscard: () => Promise<void>;
   clearSyncError: () => void;
 }
 
@@ -1770,6 +1842,7 @@ export function ConversationProvider({
   const deleteRemoteRef = useRef(deleteMutation.mutateAsync);
   const projectAssignmentIdRef = useRef(projectAssignmentId);
   const knowledgeBaseConversationIdsRef = useRef(new Set<string>());
+  const locallyDiscardedConversationIdsRef = useRef(new Set<string>());
   const knowledgeBaseCoordinatorRef =
     useRef<KnowledgeBasePollingCoordinator | null>(null);
   const applyKnowledgeBaseObservationRef = useRef<
@@ -2064,6 +2137,10 @@ export function ConversationProvider({
         }
 
         const remoteConversations = (result.data ?? [])
+          .filter(
+            (remote) =>
+              !locallyDiscardedConversationIdsRef.current.has(remote.id),
+          )
           .map(normalizeConversation)
           .map((remote) =>
             mergeKnowledgeBaseHydration(
@@ -2133,6 +2210,7 @@ export function ConversationProvider({
     accountIdRef.current = userId;
     knowledgeBaseCoordinatorRef.current?.reset();
     knowledgeBaseConversationIdsRef.current.clear();
+    locallyDiscardedConversationIdsRef.current.clear();
     replaceState(EMPTY_STATE);
     setSyncError(null);
 
@@ -2323,6 +2401,11 @@ export function ConversationProvider({
 
   const discardConversationLocally = useCallback(
     (id: string) => {
+      // Invalidate a cloud-list response that began before the reset and keep
+      // future hydration from resurrecting this reset-owned conversation.
+      hydrationGenerationRef.current += 1;
+      locallyDiscardedConversationIdsRef.current.add(id);
+      syncQueueRef.current?.cancel(id);
       knowledgeBaseConversationIdsRef.current.delete(id);
       knowledgeBaseCoordinatorRef.current?.unregister(id);
       const nextState = conversationReducer(stateRef.current, {
@@ -2356,6 +2439,12 @@ export function ConversationProvider({
     if (!flushed) return;
     await hydrateForUser(expectedUserId, false);
   }, [hydrateForUser, hydrated]);
+
+  const refreshConversationsAfterDiscard = useCallback(async () => {
+    const expectedUserId = accountIdRef.current;
+    if (expectedUserId === null || !canSyncRef.current) return;
+    await hydrateForUser(expectedUserId, false);
+  }, [hydrateForUser]);
 
   const clearSyncError = useCallback(() => setSyncError(null), []);
 
@@ -2422,6 +2511,7 @@ export function ConversationProvider({
         discardConversationLocally,
         deleteMessage,
         refreshConversations,
+        refreshConversationsAfterDiscard,
         clearSyncError,
       }}
     >

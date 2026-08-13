@@ -283,6 +283,8 @@ describe("knowledge-base ChatInput actions", () => {
       },
     ];
     mocks.activeConversation.status = "awaiting_input";
+    mocks.activeConversation.taskId = "kb-task";
+    mocks.activeConversation.knowledgeBase.initialized = true;
     mocks.activeConversation.knowledgeBase.activeTurnId = "turn-2";
     mocks.activeConversation.knowledgeBase.presentationKey = "presentation-2";
     mocks.activeConversation.knowledgeBase.revision = 2;
@@ -534,6 +536,65 @@ describe("knowledge-base ChatInput actions", () => {
         }),
       ),
     );
+  });
+
+  it("keeps an initialized taskless v2 build replyable from its approved Dashboard presentation", async () => {
+    mocks.activeConversation.taskId = undefined;
+    mocks.activeConversation.knowledgeBase.initialized = true;
+    mocks.activeConversation.knowledgeBase.activeTurnId = null;
+    mocks.activeConversation.knowledgeBase.presentationTurnId = "turn-2";
+
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    expect(
+      screen.getByText("可直接确认，也可以输入修改意见或上传补充资料。"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认当前内容" })).toBeEnabled();
+    expect(screen.getByRole("textbox")).toBeEnabled();
+    expect(container.querySelector('input[type="file"]')).toBeEnabled();
+    expect(
+      screen.queryByPlaceholderText(
+        "请先点击上方“构建企业知识库”完成资料采集设置",
+      ),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认当前内容" }));
+    await waitFor(() =>
+      expect(mocks.sendMessage).toHaveBeenCalledWith(
+        "确认",
+        [],
+        expect.objectContaining({
+          knowledgeBaseExpectedGeneration: 1,
+          knowledgeBaseExpectedRevision: 2,
+          knowledgeBaseExpectedLeafId: "identity.legal",
+          knowledgeBaseExpectedPresentationKey: "presentation-2",
+        }),
+      ),
+    );
+  });
+
+  it("keeps the composer locked when the server denies reply even if a stale client status says awaiting input", () => {
+    mocks.activeConversation.status = "awaiting_input";
+    mocks.activeConversation.knowledgeBase.initialized = true;
+    mocks.activeConversation.knowledgeBase.canReply = false;
+
+    const { container } = render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
+    expect(screen.getByRole("textbox")).toBeDisabled();
+    expect(container.querySelector('input[type="file"]')).toBeDisabled();
+    expect(screen.getByRole("button", { name: "确认当前内容" })).toBeDisabled();
   });
 
   it("locks the confirmation synchronously until the request settles", async () => {

@@ -670,6 +670,34 @@ export async function decideKnowledgeReset(input: {
       return { decision: "rejected" as const, cleanup: null };
     }
 
+    // Serialize approval with every new start/upload path before reading or
+    // deleting knowledge-base state. A delayed browser request holding the old
+    // revision either commits before this lock (and is deleted below) or waits
+    // and observes the incremented revision; it cannot recreate the old build
+    // after cleanup.
+    await tx
+      .insert(knowledgeBaseResetStates)
+      .values({
+        userId: row.request.userId,
+        revision: 0,
+        updatedAt: now,
+      })
+      .onDuplicateKeyUpdate({
+        set: { userId: row.request.userId },
+      });
+    const lockedResetState = (
+      await tx
+        .select({ revision: knowledgeBaseResetStates.revision })
+        .from(knowledgeBaseResetStates)
+        .where(eq(knowledgeBaseResetStates.userId, row.request.userId))
+        .limit(1)
+        .for("update")
+    )[0];
+    if (!lockedResetState) {
+      throw new AuthServiceError("CONFLICT", "知识库重置状态不可用，请重试");
+    }
+    const nextResetRevision = lockedResetState.revision + 1;
+
     const counts = await getKnowledgeCounts(tx, row.request.userId);
     resetBuildSourceScopes = counts.builds.map((build) => ({
       userId: row.request.userId,
@@ -849,18 +877,14 @@ export async function decideKnowledgeReset(input: {
         );
     }
     await tx
-      .insert(knowledgeBaseResetStates)
-      .values({
-        userId: row.request.userId,
-        revision: 1,
-        updatedAt: now,
-      })
-      .onDuplicateKeyUpdate({
-        set: {
-          revision: sql`${knowledgeBaseResetStates.revision} + 1`,
-          updatedAt: now,
-        },
-      });
+      .update(knowledgeBaseResetStates)
+      .set({ revision: nextResetRevision, updatedAt: now })
+      .where(
+        and(
+          eq(knowledgeBaseResetStates.userId, row.request.userId),
+          eq(knowledgeBaseResetStates.revision, lockedResetState.revision),
+        ),
+      );
     await tx
       .update(knowledgeBaseResetRequests)
       .set({

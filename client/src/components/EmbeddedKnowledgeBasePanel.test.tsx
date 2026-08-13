@@ -7,9 +7,11 @@ const mocks = vi.hoisted(() => ({
   deliveryTicketCreate: vi.fn(),
   progressRefetch: vi.fn(),
   setProgressData: vi.fn(),
+  invalidateProgress: vi.fn(),
   createConversation: vi.fn(),
   setActive: vi.fn(),
   discardConversationLocally: vi.fn(),
+  refreshConversationsAfterDiscard: vi.fn(),
   activeConversation: null as any,
   resetIsError: false,
   progressIsError: false,
@@ -38,6 +40,7 @@ vi.mock("@/contexts/ConversationContext", () => ({
     createConversation: mocks.createConversation,
     setActive: mocks.setActive,
     discardConversationLocally: mocks.discardConversationLocally,
+    refreshConversationsAfterDiscard: mocks.refreshConversationsAfterDiscard,
   }),
 }));
 vi.mock("@/components/KnowledgeBaseViewer", () => ({
@@ -53,7 +56,10 @@ vi.mock("@/lib/trpc", () => ({
   trpc: {
     useUtils: () => ({
       workspace: {
-        knowledgeProgress: { setData: mocks.setProgressData },
+        knowledgeProgress: {
+          setData: mocks.setProgressData,
+          invalidate: mocks.invalidateProgress,
+        },
       },
     }),
     workspace: {
@@ -111,11 +117,15 @@ beforeEach(() => {
   mocks.deliveryTicketCreate.mockReset().mockResolvedValue(undefined);
   mocks.progressRefetch.mockReset().mockResolvedValue(undefined);
   mocks.setProgressData.mockReset();
+  mocks.invalidateProgress.mockReset().mockResolvedValue(undefined);
   mocks.createConversation
     .mockReset()
     .mockReturnValue("knowledge-conversation");
   mocks.setActive.mockReset();
   mocks.discardConversationLocally.mockReset();
+  mocks.refreshConversationsAfterDiscard
+    .mockReset()
+    .mockResolvedValue(undefined);
   mocks.resetIsError = false;
   mocks.progressIsError = false;
   mocks.progressData = { progress: null };
@@ -548,6 +558,16 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     expect(mocks.discardConversationLocally).toHaveBeenCalledWith(
       "stale-after-reset",
     );
+    expect(mocks.setProgressData).toHaveBeenCalledWith(
+      undefined,
+      expect.any(Function),
+    );
+    expect(mocks.setProgressData).toHaveBeenCalledWith(
+      { conversationId: "stale-after-reset" },
+      expect.any(Function),
+    );
+    expect(mocks.invalidateProgress).toHaveBeenCalledTimes(1);
+    expect(mocks.refreshConversationsAfterDiscard).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a current or newly created blank KB conversation", () => {

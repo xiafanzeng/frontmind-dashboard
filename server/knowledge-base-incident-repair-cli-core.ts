@@ -8,6 +8,10 @@ import {
   type KnowledgeBaseIncidentRepairKind,
   type KnowledgeBaseIncidentRepairPreview,
 } from "./knowledge-base-incident-repair";
+import {
+  parseResetPollutionCleanupCliArgs,
+  type ResetPollutionCleanupCliCommand,
+} from "./knowledge-base-reset-pollution-cleanup-cli-core";
 
 export const KNOWLEDGE_BASE_INCIDENT_REPAIR_CLI_ERROR_PREFIX =
   "KB_INCIDENT_REPAIR_CLI";
@@ -39,12 +43,16 @@ export type KnowledgeBaseIncidentRepairCliCommand =
       repairKind: KnowledgeBaseIncidentRepairKind;
       expectedStateHash: string;
       reasonCode: typeof KNOWLEDGE_BASE_INCIDENT_REPAIR_REASON_CODE;
-    };
+    }
+  | ResetPollutionCleanupCliCommand;
 
 export function parseKnowledgeBaseIncidentRepairCliArgs(
   argv: readonly string[],
 ): KnowledgeBaseIncidentRepairCliCommand {
   const [mode, ...rawOptions] = argv;
+  if (mode === "reset-pollution-preview" || mode === "reset-pollution-apply") {
+    return parseResetPollutionCleanupCliArgs(argv);
+  }
   if (mode !== "preview" && mode !== "apply") fail("COMMAND_INVALID");
   const values = new Map<string, string>();
   for (const option of rawOptions) {
@@ -150,6 +158,7 @@ export function assertKnowledgeBaseIncidentRepairCliRuntime(input: {
   compiledReleaseChannel: string;
   runtimeIdentity: KnowledgeBaseIncidentRepairCliRuntimeIdentity;
   readiness: unknown;
+  skipLoopbackReadiness?: boolean;
 }) {
   if (input.env.NODE_ENV !== "production") fail("SIGNED_RUNTIME_REQUIRED");
   if (!sha40.safeParse(input.compiledBuildSha).success) {
@@ -175,6 +184,7 @@ export function assertKnowledgeBaseIncidentRepairCliRuntime(input: {
   ) {
     fail("ROLLOUT_PHASE_INVALID");
   }
+  if (input.skipLoopbackReadiness === true) return null;
   const readiness = readinessSchema.safeParse(input.readiness);
   if (!readiness.success) fail("READINESS_CONTRACT_INVALID");
   if (
@@ -364,10 +374,16 @@ export function knowledgeBaseIncidentRepairCliFailureResult(input: {
     ? raw
     : "KB_INCIDENT_REPAIR_CLI_FAILED";
   return baseResult({
-    mode: input.command?.mode ?? null,
+    mode:
+      input.command?.mode === "preview" || input.command?.mode === "apply"
+        ? input.command.mode
+        : null,
     success: false,
     code,
-    repairKind: input.command?.repairKind ?? null,
+    repairKind:
+      input.command && "repairKind" in input.command
+        ? input.command.repairKind
+        : null,
     buildSourceSha: sha40.safeParse(input.buildSourceSha).success
       ? input.buildSourceSha
       : null,

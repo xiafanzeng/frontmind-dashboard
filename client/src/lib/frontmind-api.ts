@@ -395,6 +395,7 @@ export type UploadFileOptions = {
     conversationId: string;
     turnId: string;
     clientRequestId: string;
+    expectedResetRevision?: number;
   };
   signal?: AbortSignal;
   /** Reuses an already-created provider file after an unknown client outcome. */
@@ -829,6 +830,7 @@ const KNOWLEDGE_BASE_REQUEST_MAX_RETRY_DELAY_MS = 10_000;
 export async function reserveKnowledgeBaseStart(input: {
   conversationId: string;
   clientRequestId: string;
+  expectedResetRevision: number;
   companyName: string;
   companyWebsite?: string;
   operatorNotes?: string;
@@ -995,6 +997,7 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
   conversationId: string;
   turnId: string;
   clientRequestId: string;
+  expectedResetRevision?: number;
   attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
   index: number;
   attachment: { file_id: string; filename: string };

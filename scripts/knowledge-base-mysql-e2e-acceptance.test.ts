@@ -2357,6 +2357,7 @@ mysqlDescribe(
       const started = await reserveKnowledgeBaseStartBuild(
         {
           userId: userId!,
+          expectedResetRevision: 0,
           conversationId: publicBarrierConversationId,
           clientRequestId: `kb-barrier-start-${runId}`,
           companyName: "FrontMind MySQL Barrier",

@@ -192,15 +192,16 @@ export function manusV2WaitingEventHasSuccessorEvidence(input: {
   });
   if (!waitingStatus) return false;
   return ordered.some((event) => {
-    if (compareEvents(event, waitingStatus) <= 0 || event.type !== "status_update") {
+    if (
+      compareEvents(event, waitingStatus) <= 0 ||
+      event.type !== "status_update"
+    ) {
       return false;
     }
     const update = record(event.status_update);
     if (!update || typeof update.agent_status !== "string") return false;
     if (update.agent_status !== "waiting") return true;
-    return (
-      record(update.status_detail)?.waiting_for_event_id !== input.eventId
-    );
+    return record(update.status_detail)?.waiting_for_event_id !== input.eventId;
   });
 }
 
@@ -214,7 +215,10 @@ export function manusV2WaitingEventIsStrictSuccessor(input: {
   if (input.previousEventId === input.nextEventId) return false;
   const ordered = [...input.events].sort(compareEvents);
   const previous = ordered.find((event) => {
-    if (input.previousStatusEventId && event.id === input.previousStatusEventId) {
+    if (
+      input.previousStatusEventId &&
+      event.id === input.previousStatusEventId
+    ) {
       return true;
     }
     if (event.type !== "status_update") return false;
@@ -280,9 +284,7 @@ export function classifyKnowledgeBaseManusV2FormatRepairAttempt(input: {
 const MANUS_V2_ERROR_RECOVERY_LINE =
   /^FRONTMIND_MANUS_V2_ERROR_RECOVERY=(\{[^\r\n]+\})\s*$/mu;
 
-function errorRecoveryToken(
-  contract: ManusV2KnowledgeBaseOperationContract,
-) {
+function errorRecoveryToken(contract: ManusV2KnowledgeBaseOperationContract) {
   return sha256({
     purpose: "task_error_recovery",
     operationToken: contract.operationToken,
@@ -410,8 +412,10 @@ export function knowledgeBaseManusV2ErrorRecoveryRejection(input: {
   }
   const base = Math.min(60_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
   const jitter =
-    parseInt(sha256({ recoveryToken: input.recoveryToken, attempt }).slice(0, 2), 16) %
-    21;
+    parseInt(
+      sha256({ recoveryToken: input.recoveryToken, attempt }).slice(0, 2),
+      16,
+    ) % 21;
   return {
     retry: true as const,
     attempt,
@@ -448,7 +452,9 @@ export function classifyKnowledgeBaseManusV2ErrorRecoveryAttempt(input: {
     manusV2EventsContainErrorRecoveryToken([event], input.recoveryToken),
   );
   if (recoveryEvent) {
-    const latestStatus = ordered.find((event) => event.type === "status_update");
+    const latestStatus = ordered.find(
+      (event) => event.type === "status_update",
+    );
     if (
       latestStatus &&
       (latestStatus.timestamp > recoveryEvent.timestamp ||
@@ -603,14 +609,6 @@ export function buildKnowledgeBaseManusV2FormatRepair(input: {
   contract: ManusV2KnowledgeBaseOperationContract;
   events: ReadonlyArray<ManusV2MessageEvent>;
 }) {
-  if (
-    !manusV2EventsContainOperationToken(
-      input.events,
-      input.contract.operationToken,
-    )
-  ) {
-    return null;
-  }
   const repairToken = sha256({
     purpose: "format_repair",
     operationToken: input.contract.operationToken,

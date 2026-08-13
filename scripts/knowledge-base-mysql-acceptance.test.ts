@@ -721,6 +721,7 @@ mysqlDescribe("knowledge-base real MySQL state-machine acceptance", () => {
     const policyBinding = knowledgeBaseNewBuildPolicyBinding();
     const startInput = {
       userId: ownerId,
+      expectedResetRevision: 0,
       conversationId: publicConversationId,
       clientRequestId: `start-${runId}`,
       companyName: "FrontMind MySQL Acceptance",

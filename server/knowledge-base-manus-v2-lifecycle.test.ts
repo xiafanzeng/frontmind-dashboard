@@ -218,15 +218,15 @@ describe("Manus v2 knowledge-base lifecycle policy", () => {
 
   it("uses sendMessage only for messageAskUser", () => {
     const decision = classifyKnowledgeBaseManusV2Lifecycle({
-        events: [
-          operationEvent,
-          status("waiting", {
-            waiting_for_event_id: "evt-question",
-            waiting_for_event_type: "messageAskUser",
-          }),
-        ],
-        contract,
-      });
+      events: [
+        operationEvent,
+        status("waiting", {
+          waiting_for_event_id: "evt-question",
+          waiting_for_event_type: "messageAskUser",
+        }),
+      ],
+      contract,
+    });
     expect(decision).toMatchObject({
       kind: "ask_user_continue",
       eventId: "evt-question",
@@ -386,6 +386,11 @@ describe("Manus v2 knowledge-base lifecycle policy", () => {
     expect(repair?.prompt).toContain("Do not redo research, advance a node");
     expect(repair?.prompt).toContain('"operationToken":"op-1"');
     expect(repair?.repairToken).toMatch(/^[a-f0-9]{64}$/u);
+    const omittedContractRepair = buildKnowledgeBaseManusV2FormatRepair({
+      contract,
+      events: [],
+    });
+    expect(omittedContractRepair).toEqual(repair);
     expect(
       classifyKnowledgeBaseManusV2FormatRepairAttempt({
         attemptState: "outcome_unknown",

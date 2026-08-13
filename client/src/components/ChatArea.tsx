@@ -413,6 +413,8 @@ export type KnowledgeBaseStarterStartOutcome =
 export type KnowledgeBaseStarterLifecycle = {
   signal: AbortSignal;
   clientRequestId: string;
+  /** Reset epoch frozen when this starter batch begins. */
+  expectedResetRevision: number;
   startedAt: number;
   uploadedReceipts: ReadonlyMap<string, KnowledgeBaseStarterUploadReceipt>;
   fileRecordIds: ReadonlyMap<string, string>;
@@ -427,6 +429,7 @@ export type KnowledgeBaseStarterLifecycle = {
     conversationId: string;
     turnId: string;
     clientRequestId: string;
+    expectedResetRevision: number;
   };
   attachmentManifest?: import("@/lib/frontmind-api").KnowledgeBaseAttachmentManifestItem[];
   startPrepared: boolean;
@@ -517,7 +520,9 @@ export async function uploadKnowledgeBaseStarterFiles(
             ? {
                 resumeScope: {
                   kind: "knowledge_base" as const,
-                  ...lifecycle.reservation,
+                  conversationId: lifecycle.reservation.conversationId,
+                  turnId: lifecycle.reservation.turnId,
+                  clientRequestId: lifecycle.reservation.clientRequestId,
                 },
               }
             : {}),
@@ -849,6 +854,10 @@ export function shouldRecoverKnowledgeBaseStartFailure(
   >,
 ) {
   if (!requestDispatched) return false;
+  // A reset epoch mismatch is a definitive rejection of these browser bytes.
+  // It must never enter the network-unknown recovery branch or project an old
+  // pending start into the freshly reset conversation.
+  if (error.code === "KNOWLEDGE_BASE_RESET_REVISION_CHANGED") return false;
   if (error.reservationCreated === true) return true;
   if (error.reservationCreated === false) return false;
   if (error.code === "KNOWLEDGE_BASE_ROLLOUT_PENDING") return false;
@@ -963,6 +972,7 @@ export default function ChatArea({
   standardWelcomeVariant = "simple",
   reserveOuterMobileNav = false,
   knowledgeBaseProgress,
+  knowledgeBaseResetRevision,
 }: {
   fixedAgentProfile?: string;
   syncKnowledgeBaseSnapshot?: boolean;
@@ -973,6 +983,7 @@ export default function ChatArea({
   standardWelcomeVariant?: "simple" | "workflow";
   reserveOuterMobileNav?: boolean;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
+  knowledgeBaseResetRevision?: number;
 }) {
   const {
     activeConversation,
@@ -1069,6 +1080,7 @@ export default function ChatArea({
       const conversationId = activeConversation.id;
       const responseStartedAt = lifecycle.startedAt;
       const clientRequestId = lifecycle.clientRequestId;
+      const expectedResetRevision = lifecycle.expectedResetRevision;
       let requestDispatched = false;
       let preparedMessageAttachments: Attachment[] = [];
 
@@ -1094,6 +1106,7 @@ export default function ChatArea({
         const reserved = await reserveKnowledgeBaseStart({
           conversationId,
           clientRequestId,
+          expectedResetRevision,
           companyName,
           companyWebsite,
           operatorNotes,
@@ -1103,6 +1116,7 @@ export default function ChatArea({
           conversationId,
           turnId: reserved.reservation.turnId,
           clientRequestId,
+          expectedResetRevision,
         };
         const { messageAttachments } = await uploadKnowledgeBaseStarterFiles(
           files,
@@ -1127,6 +1141,7 @@ export default function ChatArea({
               conversationId,
               clientRequestId,
               turnId: reservation.turnId,
+              expectedResetRevision,
               attachmentManifest,
             }),
           },
@@ -1194,6 +1209,8 @@ export default function ChatArea({
         return { status: "accepted" };
       } catch (error: any) {
         const errorMessage = error?.message || "启动失败";
+        const resetRevisionChanged =
+          error?.code === "KNOWLEDGE_BASE_RESET_REVISION_CHANGED";
         if (uploadWasCancelled(error, lifecycle.signal)) {
           lifecycle.onBatchPhase("failed");
           toast.info("上传已停止", {
@@ -1203,6 +1220,13 @@ export default function ChatArea({
         } else if (errorMessage.includes("不能超过 100 MB")) {
           lifecycle.onBatchPhase("failed");
           toast.error("文件过大", { description: errorMessage });
+          throw error;
+        } else if (resetRevisionChanged) {
+          lifecycle.onBatchPhase("failed");
+          toast.info("知识库已完成重置", {
+            description:
+              "本次旧资料提交已停止，请在新的空白构建中重新选择资料。",
+          });
           throw error;
         } else if (
           error?.reservationCreated !== false &&
@@ -1482,6 +1506,7 @@ export default function ChatArea({
                   ).trim(),
                 )}
                 companyLoading={dashboardQuery.isLoading}
+                resetRevision={knowledgeBaseResetRevision ?? 0}
               />
             ) : (
               <StandardConversationHint variant={standardWelcomeVariant} />
@@ -1991,6 +2016,7 @@ export function EmptyConversationHint({
   companyName,
   companyConfigured,
   companyLoading,
+  resetRevision = 0,
 }: {
   onStartKnowledgeBase: (
     input: DeepReportStartInput,
@@ -1999,6 +2025,7 @@ export function EmptyConversationHint({
   companyName: string;
   companyConfigured: boolean;
   companyLoading: boolean;
+  resetRevision?: number;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -2032,6 +2059,16 @@ export function EmptyConversationHint({
   const abortControllerRef = useRef<AbortController | null>(null);
   const clientRequestIdRef = useRef<string | null>(null);
   const batchLocked = batchStartedAt !== null;
+
+  useEffect(
+    () => () => {
+      // Reset-revision remounts and page exits revoke the entire starter
+      // lifecycle. No upload/stage/dispatch from the previous epoch may keep
+      // running after its UI and conversation have been discarded.
+      abortControllerRef.current?.abort();
+    },
+    [],
+  );
 
   const addFiles = useCallback((fileList: FileList | File[]) => {
     const incoming = Array.from(fileList).filter((file) => {
@@ -2500,6 +2537,7 @@ export function EmptyConversationHint({
       const outcome = await onStartKnowledgeBase(payload, {
         signal: controller.signal,
         clientRequestId,
+        expectedResetRevision: resetRevision,
         startedAt,
         uploadedReceipts: new Map(uploadedReceipts),
         fileRecordIds: new Map(fileRecordIds),
@@ -2560,6 +2598,7 @@ export function EmptyConversationHint({
     files,
     onStartKnowledgeBase,
     operatorNotes,
+    resetRevision,
     resetDialog,
     startPrepared,
     updateFileState,

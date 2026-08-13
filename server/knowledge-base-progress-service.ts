@@ -2877,22 +2877,30 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       code === "MANUS_V2_LOCAL_REHYDRATE_REJECTED" &&
       activeTurnMetadata.recoveryAction ===
         "create_new_canonical_from_snapshot";
+    const boundedProviderAttention =
+      activeTurnMetadata.recoveryAction === "contact_support";
     notice = {
       key: `${build.id}:${build.generation}:${build.stateEpoch}:${code}`,
       code,
       severity: "warning",
       message: localRehydrateRejected
         ? "当前任务已明确拒绝恢复完整上下文。已完成内容不受影响；可确认创建一个新任务继续。"
-        : approvedPresentation
-          ? "系统正在恢复当前操作。已完成内容不受影响。"
-          : "系统正在恢复当前操作，当前构建状态已安全保留。",
-      retryable: true,
+        : boundedProviderAttention
+          ? "当前任务未返回可安全接收的结果。已完成内容不受影响，请联系支持处理。"
+          : approvedPresentation
+            ? "系统正在恢复当前操作。已完成内容不受影响。"
+            : "系统正在恢复当前操作，当前构建状态已安全保留。",
+      retryable: !boundedProviderAttention,
       failureClass: localRehydrateRejected
         ? "requires_user_fix"
-        : "recoverable_same_turn",
+        : boundedProviderAttention
+          ? "terminal_nonregenerable"
+          : "recoverable_same_turn",
       recoveryAction: localRehydrateRejected
         ? "create_new_canonical_from_snapshot"
-        : "reconcile",
+        : boundedProviderAttention
+          ? "contact_support"
+          : "reconcile",
       canRegenerate: false,
       traceId: safeActiveTraceId,
       attachmentCount: Number.isSafeInteger(activeAttachmentCount)

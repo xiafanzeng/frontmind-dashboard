@@ -56,6 +56,16 @@ describe("signed-image incident repair CLI core", () => {
         "--reason-code=authorized_incident_recovery",
       ]),
     ).toMatchObject({ mode: "apply", expectedStateHash: "c".repeat(64) });
+    expect(
+      parseKnowledgeBaseIncidentRepairCliArgs([
+        "reset-pollution-preview",
+        "--user-id=7",
+        "--conversation-id=conversation-incident",
+        "--build-id=build-incident",
+        "--reset-request-id=reset-approved",
+        "--expected-reset-revision=3",
+      ]),
+    ).toMatchObject({ mode: "reset-pollution-preview" });
     for (const argv of [
       [
         "preview",
@@ -136,6 +146,19 @@ describe("signed-image incident repair CLI core", () => {
         },
       }),
     ).toThrow("KB_INCIDENT_REPAIR_CLI_READINESS_CONTRACT_INVALID");
+    expect(
+      assertKnowledgeBaseIncidentRepairCliRuntime({
+        env: environment,
+        compiledBuildSha: buildSourceSha,
+        compiledReleaseChannel: "development",
+        runtimeIdentity: {
+          buildSourceSha,
+          releaseChannel: "development",
+        },
+        readiness: null,
+        skipLoopbackReadiness: true,
+      }),
+    ).toBeNull();
   });
 
   it("maps arbitrary failures to one strict allowlisted JSON line", () => {

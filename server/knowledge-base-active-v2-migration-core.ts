@@ -1,3 +1,5 @@
+import { classifyManusV2StructuredResultEnvelope } from "./manus-v2-structured-result";
+
 export type KnowledgeBaseAnchorCreateAttempt =
   | "not_sent"
   | "sending"
@@ -171,8 +173,10 @@ export function inspectKnowledgeBaseAnchorAcknowledgement(input: {
       );
     });
   for (const event of candidates) {
-    const result = record(event.structured_output_result);
-    if (result?.success !== true || result.value === undefined) continue;
+    const result = classifyManusV2StructuredResultEnvelope(
+      event.structured_output_result,
+    );
+    if (result.kind !== "accepted") continue;
     const value = decodedRecord(result.value);
     if (!value || value.operationToken !== input.expected.operationToken) {
       continue;

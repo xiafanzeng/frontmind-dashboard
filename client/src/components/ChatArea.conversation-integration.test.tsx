@@ -205,7 +205,7 @@ function renderIntegratedChat() {
   return render(
     <ConversationProvider>
       <ConversationProbe />
-      <ChatArea syncKnowledgeBaseSnapshot />
+      <ChatArea syncKnowledgeBaseSnapshot knowledgeBaseResetRevision={4} />
     </ConversationProvider>,
   );
 }
@@ -417,6 +417,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       Record<string, unknown>
     >;
     expect(manifest).toHaveLength(5);
+    expect(mocks.reserveRequests[0]!.body.expectedResetRevision).toBe(4);
     expect(manifest.map((item) => item.ordinal)).toEqual([1, 2, 3, 4, 5]);
     expect(manifest.every((item) => item.total === 5)).toBe(true);
     for (const call of mocks.uploadFile.mock.calls) {
@@ -430,6 +431,10 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     expect(mocks.stageRequests.map(({ body }) => body.index)).toEqual([
       0, 1, 2, 3, 4,
     ]);
+    expect(
+      mocks.stageRequests.every(({ body }) => body.expectedResetRevision === 4),
+    ).toBe(true);
+    expect(mocks.startRequests[0]!.body.expectedResetRevision).toBe(4);
 
     mocks.firstStartResolve?.(
       new Response(

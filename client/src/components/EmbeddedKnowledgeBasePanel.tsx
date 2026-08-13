@@ -117,6 +117,7 @@ export default function EmbeddedKnowledgeBasePanel({
 }) {
   const previewMode = import.meta.env.DEV && preview && Boolean(previewData);
   const { user } = useAuth();
+  const trpcUtils = trpc.useUtils();
   const [previewProgress, setPreviewProgress] = useState(
     previewData?.progress ?? null,
   );
@@ -138,7 +139,11 @@ export default function EmbeddedKnowledgeBasePanel({
         ? 5_000
         : 30_000,
   });
-  const { activeConversation, discardConversationLocally } = useConversation();
+  const {
+    activeConversation,
+    discardConversationLocally,
+    refreshConversationsAfterDiscard,
+  } = useConversation();
   useEffect(() => {
     if (previewMode) return;
     const refreshResetStatus = () => {
@@ -181,8 +186,23 @@ export default function EmbeddedKnowledgeBasePanel({
       }) &&
       activeConversation
     ) {
-      discardConversationLocally(activeConversation.id);
-      void knowledgeQuery.refetch();
+      const discardedConversationId = activeConversation.id;
+      discardConversationLocally(discardedConversationId);
+      // Remove both aliases of the old build immediately. Otherwise React
+      // Query can feed the deleted manifest/build back into RealBuildFlow
+      // before the reset-owned refetch completes.
+      trpcUtils.workspace.knowledgeProgress.setData(undefined, () => ({
+        progress: null,
+      }));
+      trpcUtils.workspace.knowledgeProgress.setData(
+        { conversationId: discardedConversationId },
+        () => ({ progress: null }),
+      );
+      void Promise.all([
+        knowledgeQuery.refetch(),
+        refreshConversationsAfterDiscard(),
+        trpcUtils.workspace.knowledgeProgress.invalidate(),
+      ]);
     }
     setObservedResetRevision(revision);
   }, [
@@ -191,6 +211,8 @@ export default function EmbeddedKnowledgeBasePanel({
     knowledgeQuery,
     observedResetRevision,
     resetQuery.data?.revision,
+    refreshConversationsAfterDiscard,
+    trpcUtils,
   ]);
 
   const displayedSnapshot = previewMode
@@ -374,6 +396,7 @@ export default function EmbeddedKnowledgeBasePanel({
         <RealBuildFlow
           key={`knowledge-build-${resetQuery.data?.revision ?? 0}`}
           mode={mode}
+          resetRevision={resetQuery.data.revision}
         />
       )}
     </section>
@@ -723,7 +746,13 @@ function KnowledgeMaintenanceTicketButton({
   );
 }
 
-function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
+function RealBuildFlow({
+  mode,
+  resetRevision,
+}: {
+  mode: "standard" | "workspace";
+  resetRevision: number;
+}) {
   const { state, activeConversation, hydrated, createConversation, setActive } =
     useConversation();
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -964,6 +993,7 @@ function RealBuildFlow({ mode }: { mode: "standard" | "workspace" }) {
             knowledgeBaseProgress={
               liveProgress ?? progressQuery.data?.progress ?? null
             }
+            knowledgeBaseResetRevision={resetRevision}
           />
         ) : (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-[#716a80]">

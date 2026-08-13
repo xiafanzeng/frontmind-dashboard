@@ -50,6 +50,7 @@ function starterLifecycle(
   return {
     signal: new AbortController().signal,
     clientRequestId: "kb-start-test",
+    expectedResetRevision: 0,
     startedAt: 1_000,
     uploadedReceipts: new Map(),
     fileRecordIds: new Map(),
@@ -81,6 +82,7 @@ describe("EmptyConversationHint", () => {
         companyName="验收企业"
         companyConfigured
         companyLoading={false}
+        resetRevision={0}
       />,
     );
 
@@ -1057,6 +1059,16 @@ describe("knowledge-base starter orchestration", () => {
     expect(requestSignal?.aborted).toBe(true);
     expect(lifecycleController.signal.aborted).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never recovers a start rejected by a newer reset revision", () => {
+    expect(
+      shouldRecoverKnowledgeBaseStartFailure(true, {
+        status: 409,
+        code: "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+        reservationCreated: false,
+      }),
+    ).toBe(false);
   });
 
   it("projects the optimistic start message only once for a prepared request", () => {

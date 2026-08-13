@@ -670,6 +670,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     await reserveKnowledgeBaseStart({
       conversationId: "conv-kb",
       clientRequestId: "request-start",
+      expectedResetRevision: 4,
       companyName: "FrontMind",
       companyWebsite: "https://example.com",
       operatorNotes: "notes",
@@ -683,6 +684,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       conversationId: "conv-kb",
       clientRequestId: "request-start",
+      expectedResetRevision: 4,
       companyName: "FrontMind",
       companyWebsite: "https://example.com",
       operatorNotes: "notes",
