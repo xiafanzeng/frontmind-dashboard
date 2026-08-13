@@ -251,6 +251,31 @@ describe("reset-pollution exact mixed upload cleanup", () => {
     ).rejects.toThrow("KB_RESET_POLLUTION_UPLOAD_NOT_NEVER_SENT");
   });
 
+  it("accepts the exact browser-stage expiry after zero Provider work", async () => {
+    const fixture = await exactMixedFixture();
+    await rewriteManifest(fixture.awaiting.intentId, (manifest) => {
+      manifest.state = "expired";
+      manifest.safeErrorCode = "UPLOAD_BROWSER_STAGE_EXPIRED";
+    });
+    const proof = await inspectResetPollutionUploadIntents(fixture.coordinate);
+    expect(proof.items[1]).toMatchObject({
+      state: "expired",
+      providerGeneration: 0,
+      safeErrorCode: "UPLOAD_BROWSER_STAGE_EXPIRED",
+      fileIdSha256: null,
+      sizeBytes: null,
+      sha256: null,
+    });
+    await expect(
+      retireResetPollutionUploadIntents({
+        ...fixture.coordinate,
+        expectedStateSha256: proof.stateSha256,
+      }),
+    ).resolves.toEqual({ retiredCount: 2 });
+    expect(provider.post).not.toHaveBeenCalled();
+    expect(provider.delete).not.toHaveBeenCalled();
+  });
+
   it("resumes after crashing with only the first operation index retired", async () => {
     const fixture = await exactMixedFixture();
     const proof = await inspectResetPollutionUploadIntents(fixture.coordinate);

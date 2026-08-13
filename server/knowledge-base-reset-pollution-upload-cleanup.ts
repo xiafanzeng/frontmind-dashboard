@@ -171,9 +171,14 @@ function timestamp(value: unknown) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
-function isStrictAwaitingBrowserFailure(manifest: JsonRecord) {
+function isStrictZeroProviderBrowserFailure(manifest: JsonRecord) {
+  const exactStateAndError =
+    (manifest.state === "awaiting_browser" &&
+      manifest.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE") ||
+    (manifest.state === "expired" &&
+      manifest.safeErrorCode === "UPLOAD_BROWSER_STAGE_EXPIRED");
   return (
-    manifest.state === "awaiting_browser" &&
+    exactStateAndError &&
     manifest.phase === null &&
     manifest.providerGeneration === 0 &&
     Array.isArray(manifest.provider) &&
@@ -182,8 +187,7 @@ function isStrictAwaitingBrowserFailure(manifest: JsonRecord) {
     manifest.sizeBytes === null &&
     manifest.sha256 === null &&
     manifest.sealedAt === null &&
-    manifest.completedAt === null &&
-    manifest.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE"
+    manifest.completedAt === null
   );
 }
 
@@ -296,7 +300,9 @@ async function inspectInternal(input: {
           !/^[a-f0-9]{64}$/u.test(value.credentialIdSha256) ||
           !Number.isSafeInteger(value.ordinal) ||
           !Number.isSafeInteger(value.total) ||
-          !["awaiting_browser", "uploaded"].includes(String(value.state)) ||
+          !["awaiting_browser", "expired", "uploaded"].includes(
+            String(value.state),
+          ) ||
           ![0, 1].includes(Number(value.providerGeneration)) ||
           !(
             (value.state === "uploaded" &&
@@ -308,9 +314,12 @@ async function inspectInternal(input: {
               Number(value.sizeBytes) > 0 &&
               typeof value.sha256 === "string" &&
               /^[a-f0-9]{64}$/u.test(value.sha256)) ||
-            (value.state === "awaiting_browser" &&
+            (["awaiting_browser", "expired"].includes(String(value.state)) &&
               value.providerGeneration === 0 &&
-              value.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE" &&
+              ((value.state === "awaiting_browser" &&
+                value.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE") ||
+                (value.state === "expired" &&
+                  value.safeErrorCode === "UPLOAD_BROWSER_STAGE_EXPIRED")) &&
               value.fileIdSha256 === null &&
               value.sizeBytes === null &&
               value.sha256 === null)
@@ -364,7 +373,7 @@ async function inspectInternal(input: {
       !safeIdentifier(manifest.credentialId, 36) ||
       !safeIdentifier(manifest.filename, 512) ||
       !(
-        isStrictAwaitingBrowserFailure(manifest) ||
+        isStrictZeroProviderBrowserFailure(manifest) ||
         isStrictUploadedGenerationOne(manifest)
       ) ||
       manifest.leaseOwner !== null ||

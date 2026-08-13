@@ -237,7 +237,9 @@ function uploadProofMatchesLocalLedger(
     proof.intentCount !== 2 ||
     proof.intentCount !== proof.items.length ||
     proof.items.filter((item) => item.state === "uploaded").length !== 1 ||
-    proof.items.filter((item) => item.state === "awaiting_browser").length !== 1
+    proof.items.filter((item) =>
+      ["awaiting_browser", "expired"].includes(item.state),
+    ).length !== 1
   ) {
     return false;
   }
@@ -268,8 +270,14 @@ function uploadProofMatchesLocalLedger(
         return false;
       }
     } else if (
+      !["awaiting_browser", "expired"].includes(item.state) ||
       item.providerGeneration !== 0 ||
-      item.safeErrorCode !== "UPLOAD_BROWSER_BODY_INCOMPLETE" ||
+      !(
+        (item.state === "awaiting_browser" &&
+          item.safeErrorCode === "UPLOAD_BROWSER_BODY_INCOMPLETE") ||
+        (item.state === "expired" &&
+          item.safeErrorCode === "UPLOAD_BROWSER_STAGE_EXPIRED")
+      ) ||
       item.fileIdSha256 !== null ||
       item.sizeBytes !== null ||
       item.sha256 !== null
