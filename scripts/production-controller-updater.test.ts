@@ -21,6 +21,9 @@ const controllerSource = path.resolve(
 const forcedSource = path.resolve(
   "deploy/production/controller/frontmind-deploy-forced-command",
 );
+const incidentSource = path.resolve(
+  "deploy/production/controller/frontmind-knowledge-base-incident-repair",
+);
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
@@ -58,14 +61,25 @@ async function harness({
     controllerDir,
     "frontmind-deploy-forced-command",
   );
+  const incidentTemplate = path.join(
+    controllerDir,
+    "frontmind-knowledge-base-incident-repair",
+  );
   await Promise.all([
     writeFile(controllerTemplate, await readFile(controllerSource), {
       mode: 0o755,
     }),
     writeFile(forcedTemplate, await readFile(forcedSource), { mode: 0o755 }),
+    writeFile(incidentTemplate, await readFile(incidentSource), {
+      mode: 0o700,
+    }),
   ]);
   const controllerTarget = path.join(targets, "frontmind-deploy-controller");
   const forcedTarget = path.join(targets, "frontmind-deploy-forced-command");
+  const incidentTarget = path.join(
+    targets,
+    "frontmind-knowledge-base-incident-repair",
+  );
   await Promise.all([
     writeFile(controllerTarget, "old-controller\n", { mode: 0o755 }),
     writeFile(forcedTarget, "old-forced\n", { mode: 0o755 }),
@@ -82,8 +96,16 @@ async function harness({
       `readonly FORCED_TARGET="${forcedTarget}"`,
     )
     .replace(
+      'readonly INCIDENT_TARGET="/usr/local/sbin/frontmind-knowledge-base-incident-repair"',
+      `readonly INCIDENT_TARGET="${incidentTarget}"`,
+    )
+    .replace(
       'readonly UPDATE_LOCK="/run/lock/frontmind-production-controller-update.lock"',
       `readonly UPDATE_LOCK="${path.join(root, "update.lock")}"`,
+    )
+    .replace(
+      'readonly STACK_LOCK="/run/lock/frontmind-production-stack.lock"',
+      `readonly STACK_LOCK="${path.join(root, "stack.lock")}"`,
     )
     .replace(
       'readonly DASHBOARD_LOCK="/run/lock/frontmind-deploy-dashboard.lock"',
@@ -106,6 +128,10 @@ async function harness({
       '[[ -f $target && ! -L $target && $(stat -c \'%a\' "$target") == "755" ]]',
     )
     .replace(
+      '[[ -f $target && ! -L $target && $(stat -c \'%u:%g:%a\' "$target") == "0:0:700" ]]',
+      '[[ -f $target && ! -L $target && $(stat -c \'%a\' "$target") == "700" ]]',
+    )
+    .replace(
       '[[ -d $RECOVERY_ROOT && ! -L $RECOVERY_ROOT \\\n  && $(stat -c \'%u:%g:%a\' "$RECOVERY_ROOT") == "0:0:700" ]]',
       "[[ -d $RECOVERY_ROOT && ! -L $RECOVERY_ROOT ]]",
     );
@@ -121,14 +147,17 @@ target="\${args[\${#args[@]}-1]}"
 if [[ "${failForcedInstall ? "1" : "0"}" == 1 && "$target" == *frontmind-deploy-forced-command.tmp.* && ! -e "${path.join(root, "failed-once")}" ]]; then touch "${path.join(root, "failed-once")}"; exit 88; fi
 if [[ "${failControllerInstall ? "1" : "0"}" == 1 && "$target" == *frontmind-deploy-controller.tmp.* && ! -e "${path.join(root, "failed-once")}" ]]; then touch "${path.join(root, "failed-once")}"; exit 88; fi
 cp "$source" "$target"
-chmod 0755 "$target"
+if [[ "$source" == *frontmind-knowledge-base-incident-repair* ]]; then chmod 0700 "$target"; else chmod 0755 "$target"; fi
 `,
     { mode: 0o755 },
   );
   await writeFile(
     path.join(bin, "stat"),
     `#!/usr/bin/env bash
-if [[ "\${1:-}" == -c ]]; then printf '%s\\n' 755; exit 0; fi
+if [[ "\${1:-}" == -c ]]; then
+  case "\${3:-}" in *frontmind-knowledge-base-incident-repair*) printf '%s\\n' 700 ;; *) printf '%s\\n' 755 ;; esac
+  exit 0
+fi
 exec /usr/bin/stat "$@"
 `,
     { mode: 0o755 },
@@ -136,7 +165,7 @@ exec /usr/bin/stat "$@"
   await writeFile(path.join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n", {
     mode: 0o755,
   });
-  const result = spawnSync("bash", [updaterFile, "--apply-version=2"], {
+  const result = spawnSync("bash", [updaterFile, "--apply-version=3"], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -147,6 +176,7 @@ exec /usr/bin/stat "$@"
     result,
     controllerTarget,
     forcedTarget,
+    incidentTarget,
     recoveryRoot,
     updaterFile,
     commandPath: `${bin}:${process.env.PATH}`,
@@ -154,17 +184,20 @@ exec /usr/bin/stat "$@"
 }
 
 describe("production controller atomic updater", () => {
-  it("installs the reviewed v2 controller and forced command atomically", async () => {
+  it("installs the reviewed v3 controller, forced command and root incident wrapper atomically", async () => {
     const test = await harness();
     expect(test.result.status, test.result.stderr).toBe(0);
     expect(test.result.stdout).toContain(
-      "PRODUCTION_CONTROLLER_UPDATE_OK version=2",
+      "PRODUCTION_CONTROLLER_UPDATE_OK version=3",
     );
     expect(await readFile(test.controllerTarget, "utf8")).toContain(
-      "frontmind-production-controller-version: 2",
+      "frontmind-production-controller-version: 3",
     );
     expect(await readFile(test.forcedTarget, "utf8")).toContain(
       "--kb-manus-v2-rollout",
+    );
+    expect(await readFile(test.incidentTarget, "utf8")).toContain(
+      "KB_INCIDENT_REPAIR_REQUIRES_ROOT",
     );
   });
 
@@ -197,7 +230,15 @@ describe("production controller atomic updater", () => {
         "recovered-forced\n",
         { mode: 0o600 },
       ),
-      writeFile(path.join(test.recoveryRoot, "pending"), "version=2\n", {
+      writeFile(
+        path.join(
+          test.recoveryRoot,
+          "frontmind-knowledge-base-incident-repair.previous",
+        ),
+        "#!/usr/bin/env bash\necho recovered-incident\n",
+        { mode: 0o600 },
+      ),
+      writeFile(path.join(test.recoveryRoot, "pending"), "version=3\n", {
         mode: 0o600,
       }),
       writeFile(test.controllerTarget, "mixed-new-controller\n", {
@@ -205,7 +246,7 @@ describe("production controller atomic updater", () => {
       }),
       writeFile(test.forcedTarget, "mixed-old-forced\n", { mode: 0o755 }),
     ]);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=2"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=3"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
@@ -214,7 +255,7 @@ describe("production controller atomic updater", () => {
       "PRODUCTION_CONTROLLER_UPDATE_RECOVERED_PREVIOUS",
     );
     expect(await readFile(test.controllerTarget, "utf8")).toContain(
-      "frontmind-production-controller-version: 2",
+      "frontmind-production-controller-version: 3",
     );
   });
 
@@ -236,11 +277,11 @@ describe("production controller atomic updater", () => {
         "recoverable-controller\n",
         { mode: 0o600 },
       ),
-      writeFile(path.join(test.recoveryRoot, "pending"), "version=2\n", {
+      writeFile(path.join(test.recoveryRoot, "pending"), "version=3\n", {
         mode: 0o600,
       }),
     ]);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=2"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=3"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
@@ -257,7 +298,7 @@ describe("production controller atomic updater", () => {
     await writeFile(unsafeController, "unsafe-controller\n", { mode: 0o755 });
     await rm(test.controllerTarget);
     await symlink(unsafeController, test.controllerTarget);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=2"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=3"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });

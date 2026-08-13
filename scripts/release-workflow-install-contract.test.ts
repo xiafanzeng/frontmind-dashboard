@@ -32,6 +32,9 @@ const installer = path.resolve("deploy/production/install.sh");
 const controllerUpdater = path.resolve(
   "deploy/production/update-release-controllers.sh",
 );
+const incidentWrapper = path.resolve(
+  "deploy/production/controller/frontmind-knowledge-base-incident-repair",
+);
 const websiteRuntimeEnvExample = path.resolve(
   "deploy/production/website/runtime.env.example",
 );
@@ -98,6 +101,9 @@ describe("release workflow source-ordering contracts", () => {
     expect(phaseJob).toContain("Preflight public current production identity");
     expect(phaseJob).toContain("--kb-manus-v2-rollout $PHASE");
     expect(phaseJob).toContain(
+      '-- frontmind-deploy@149.88.85.148 \\\n              "--kb-manus-v2-rollout $PHASE',
+    );
+    expect(phaseJob).toContain(
       "Independently prove public exact production phase",
     );
     expect(phaseJob).toContain(
@@ -116,6 +122,33 @@ describe("release workflow source-ordering contracts", () => {
       "frontmind-update-release-controllers",
     );
     expect(installerSource).not.toContain("update-release-controllers.sh");
+  });
+
+  it("installs a root-only exact-runtime incident repair entry", async () => {
+    const [wrapper, installerSource, updater] = await Promise.all([
+      readFile(incidentWrapper, "utf8"),
+      readFile(installer, "utf8"),
+      readFile(controllerUpdater, "utf8"),
+    ]);
+    expect(installerSource).toContain(
+      '"$SCRIPT_DIR/controller/frontmind-knowledge-base-incident-repair"',
+    );
+    expect(installerSource).toContain(
+      "/usr/local/sbin/frontmind-knowledge-base-incident-repair",
+    );
+    expect(installerSource).toMatch(
+      /install -o root -g root -m 0700[\s\S]*frontmind-knowledge-base-incident-repair/u,
+    );
+    expect(updater).toContain("INCIDENT_TEMPLATE");
+    expect(updater).toContain("install_private_atomically");
+    expect(wrapper).toContain("KB_INCIDENT_REPAIR_REQUIRES_ROOT");
+    expect(wrapper).toContain("/run/lock/frontmind-production-stack.lock");
+    expect(wrapper).toContain("/run/lock/frontmind-deploy-dashboard.lock");
+    expect(wrapper).toContain("cosign verify");
+    expect(wrapper).toContain("docker exec --user 10001:10001");
+    expect(wrapper).toContain("knowledge-base-incident-repair-cli.js");
+    expect(wrapper).toContain('.knowledgeBase.writes.status == "writable"');
+    expect(wrapper).not.toContain("SSH_ORIGINAL_COMMAND");
   });
   it("takes the pnpm version only from package.json", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");

@@ -157,19 +157,24 @@ Knowledge Base v2 writer 与 active legacy migration 是两个独立的生产运
 再决定是否执行新 phase。恢复尚未被 local/public readiness 同时证明时失败关闭并保留 sentinel，
 不能越过。`pause`/`complete` 都不撤销已绑定 canonical task，但只有 `complete` 能证明迁移已收口。
 
-首次安装 production-owned v2 controller 必须从已经合并并经过 CI 的精确生产源码执行：
+首次安装 production-owned v3 controller 必须从已经合并并经过 CI 的精确生产源码执行：
 
 ```bash
-sudo deploy/production/update-release-controllers.sh --apply-version=2
+sudo deploy/production/update-release-controllers.sh --apply-version=3
 ```
 
-updater 同时持有 Dashboard、Website 发布锁，原子替换 controller 与 forced command，验证版本、
-生产路径与 phase allowlist；安装失败会恢复旧文件。它不修改服务 env、state、数据库或容器。
+updater 同时持有生产 stack、Dashboard、Website 发布锁，原子替换 controller、forced command
+与 root-only incident wrapper，验证版本、生产路径与 phase allowlist；安装失败会恢复旧文件。
+它不修改服务 env、state、数据库或容器。
 updater 必须直接从这份精确源码 checkout 执行，以便同时校验并安装相邻的两个模板；它不是常驻
 发布入口，installer 不会把它复制到 `/usr/local/sbin`。
 旧的 root-owned Dashboard service config 可以省略三个非敏感 rollout 路径，controller 会使用固定
 生产默认值。首次执行 updater 前必须先把两个 Manus v2 flag 作为一对明确的 false/false 原子写入
 root-owned runtime env；缺失、只出现一个、重复或非布尔值一律拒绝，避免半配置状态。
+
+`workflow_dispatch` 的 rollout SSH 调用必须在 destination 前保留 OpenSSH 的 `--` 选项终止符；
+远端命令本身以 `--kb-manus-v2-rollout` 开头，缺少终止符时 OpenSSH 会在连接服务器前把它误当
+成本地选项并拒绝。对应 source-ordering contract 会阻止该终止符再次丢失。
 
 PDF runtime 仅在 `deploy/1panel-node-pdf/**`、其
 [workflow](../../.github/workflows/pdf-runtime.yml)、revision gate 或晋级脚本变化
@@ -258,8 +263,8 @@ sudo deploy/production/install.sh \
 
 - 安装两个独立 Compose 到 `/opt/frontmind-deploy/dashboard` 和
   `/opt/frontmind-deploy/website`；
-- 安装 root-owned controller、fixed-service forced-command、一次性 bootstrap-state
-  和 contract 入口；
+- 安装 root-owned controller、fixed-service forced-command、一次性 bootstrap-state、
+  contract 入口和 Knowledge Base incident-repair wrapper；
 - 创建 `frontmind-deploy` 用户、持久目录和共享应用网络；
 - 写入配置示例和两条独立 `authorized_keys` capability。
 
@@ -438,6 +443,48 @@ sudo /usr/local/sbin/frontmind-contract-maintenance \
 触发此入口。
 
 ## 7. 失败、回滚与事故处理
+
+### 7.1 Knowledge Base 精确事故修复
+
+已审查的 `knowledge-base-incident-repair-cli.js` 只能通过 root-only wrapper 执行。wrapper
+不在 `frontmind-deploy` 的 authorized_keys 或 sudoers capability 内；管理员必须登录生产
+root session，并使用已经由当前生产 source 构建、签名、激活且正在运行的精确 Dashboard
+容器。它按“生产 stack lock → Dashboard lock”的顺序非阻塞加锁，然后重新核对 controller
+state、root-only image env、实际容器 image、Cosign workflow identity、OCI revision，以及
+local/public `/readyz` 的精确 source/digest/journal/release schema 和 KB schema。只有 writer=`true`、provider
+protocol=`manus_v2`、active migration=`false`、KB writes=`writable` 时才允许 CLI 运行；因此
+修复只能位于已验证 canary 之后、migration 之前或 pause/complete 阶段，不能用来绕过不可用
+readiness。
+
+先预览单个明确的用户、会话和修复类型。wrapper 与 CLI 都只输出一行严格 JSON；不要开启
+shell tracing、重定向环境文件或把客户原始内容写入日志：
+
+```bash
+sudo /usr/local/sbin/frontmind-knowledge-base-incident-repair \
+  preview \
+  --user-id=<decimal-user-id> \
+  --conversation-id=<exact-conversation-id> \
+  --repair-kind=<legacy_skill_404_confirm|retained_upstream_create_3_start>
+```
+
+只有人工核对 preview 的 `applicable=true`、空 blocker、所选 repair kind、generation/revision
+以及 `stateSha256` 后，才可把同一份 `stateSha256` 原样绑定到一次 apply：
+
+```bash
+sudo /usr/local/sbin/frontmind-knowledge-base-incident-repair \
+  apply \
+  --user-id=<same-decimal-user-id> \
+  --conversation-id=<same-exact-conversation-id> \
+  --repair-kind=<same-repair-kind> \
+  --expected-state-sha256=<preview-stateSha256> \
+  --reason-code=authorized_incident_recovery
+```
+
+不要硬编码事件、批量循环、放宽 reason code，或在 CAS 返回 `state_changed` 后盲目重试；重新
+preview 并重新人工核对。apply 返回后再次读取 public `/readyz`，要求同一 source/digest、
+exact journal/schema、writer=true、migration=false、writes=writable。wrapper 不创建备份、
+不执行 migration、不改变 rollout flags、不重启容器；它只在 CLI 自身的 advisory lock 与
+事务/CAS 边界内执行明确的一条修复。
 
 - 候选容器或公网 readiness 超时：停止候选，恢复 previous digest。
 - migration 后候选失败：保持停写，校验备份 SHA，重建目标数据库、恢复备份，
