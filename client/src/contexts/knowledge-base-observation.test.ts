@@ -211,10 +211,13 @@ describe("authoritative KB observation reducer", () => {
 
   it("keeps an older accepted presentation visible while a newer turn is active", () => {
     const active = observation(3, "turn-new", 1, "1.2", "## 1.2\n已批准正文");
+    active.generation = 2;
     active.approvedPresentation = {
       ...active.approvedPresentation!,
       turnId: "turn-old",
       clientRequestId: "request-turn-old",
+      generation: 1,
+      acceptedAt: 1_723_000_000_000,
       messageSequence: 13,
     };
 
@@ -226,6 +229,14 @@ describe("authoritative KB observation reducer", () => {
     expect(next.knowledgeBase).toMatchObject({
       activeTurnId: "turn-new",
       presentationTurnId: "turn-old",
+    });
+    expect(
+      next.messages.find(
+        (message) => message.knowledgeBase?.kind === "presentation",
+      ),
+    ).toMatchObject({
+      timestamp: 1_723_000_000_000,
+      knowledgeBase: { generation: 1 },
     });
   });
 

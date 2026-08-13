@@ -16,6 +16,12 @@ type ArtifactCleanupResult = {
   [key: string]: unknown;
 };
 
+type TerminalAnchorRecoveryResult = {
+  failed: number;
+  claimedTurnIds?: readonly string[];
+  [key: string]: unknown;
+};
+
 type ActiveLegacyMigrationResult = {
   failed: number;
   hasMore: boolean;
@@ -33,6 +39,7 @@ type ActiveLegacyMigrationResult = {
  */
 export function createKnowledgeBaseRecoverySweep(input: {
   recoverExpiredTurns: () => Promise<ExpiredTurnRecoveryResult>;
+  recoverTerminalAnchorHandoffs?: () => Promise<TerminalAnchorRecoveryResult>;
   recoverOpenBuilds: (options: {
     limit: number;
     concurrency: number;
@@ -62,6 +69,9 @@ export function createKnowledgeBaseRecoverySweep(input: {
 
   return async () => {
     const turns = await input.recoverExpiredTurns();
+    const terminalAnchors = input.recoverTerminalAnchorHandoffs
+      ? await input.recoverTerminalAnchorHandoffs()
+      : null;
     const builds = await input.recoverOpenBuilds({
       limit,
       concurrency,
@@ -91,10 +101,12 @@ export function createKnowledgeBaseRecoverySweep(input: {
     return {
       failed:
         turns.failed +
+        (terminalAnchors?.failed ?? 0) +
         builds.failed +
         (migrations?.failed ?? 0) +
         (artifacts?.failed ?? 0),
       turns,
+      terminalAnchors,
       builds,
       migrations,
       artifacts,

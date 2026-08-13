@@ -1140,6 +1140,8 @@ describe("knowledge-base observation consistency", () => {
 
     expect(observation?.approvedPresentation).toMatchObject({
       turnId: presentationTurn.id,
+      generation: 1,
+      acceptedAt: Date.parse("2026-08-01T00:00:00.000Z"),
       requestMessageSequence: 2,
       messageSequence: 3,
     });
@@ -1212,6 +1214,7 @@ describe("knowledge-base observation consistency", () => {
                 role: "assistant",
                 content: persistedNode.contentMarkdown,
                 sequence: 7,
+                sentAt: new Date("2026-08-01T00:00:07.000Z"),
                 metadata: {
                   knowledgeBase: {
                     schemaVersion: 1,
@@ -1247,6 +1250,8 @@ describe("knowledge-base observation consistency", () => {
     // build's invalid activeTurnId coordinate.
     expect(observation?.approvedPresentation).toMatchObject({
       turnId: presentationTurn.id,
+      generation: 1,
+      acceptedAt: Date.parse("2026-08-01T00:00:07.000Z"),
       revision: 1,
       leafId: "1.1",
       visibleMarkdown: persistedNode.contentMarkdown,
@@ -1328,6 +1333,7 @@ describe("knowledge-base observation consistency", () => {
                 role: "assistant",
                 content: persistedNode.contentMarkdown,
                 sequence: 7,
+                sentAt: new Date("2026-08-01T00:00:10.000Z"),
                 metadata: {
                   knowledgeBase: {
                     schemaVersion: 1,
@@ -1479,6 +1485,9 @@ describe("knowledge-base observation consistency", () => {
         role: "assistant",
         content: input.content,
         sequence: input.sequence,
+        sentAt: new Date(
+          `2026-08-01T00:00:${String(input.sequence).padStart(2, "0")}.000Z`,
+        ),
         metadata: {
           knowledgeBase: {
             schemaVersion: 1,
@@ -1652,6 +1661,7 @@ describe("knowledge-base observation consistency", () => {
                 role: "assistant",
                 content: oldContent,
                 sequence: 12,
+                sentAt: new Date("2026-08-01T00:00:10.000Z"),
                 metadata: {
                   knowledgeBase: {
                     schemaVersion: 1,

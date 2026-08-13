@@ -116,6 +116,7 @@ import {
   cancelUnpreparedKnowledgeBaseTurn,
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseManusV2AnchorHandoff,
+  claimKnowledgeBaseTerminalAnchorHandoffRecovery,
   claimKnowledgeBaseTurnForRecovery,
   completeKnowledgeBaseGeneratedAttachment,
   completeKnowledgeBaseManusV2AnchorHandoff,
@@ -126,6 +127,7 @@ import {
   ensureKnowledgeBaseBuildSkillArchivePin,
   findRecoverableKnowledgeBaseTurnIds,
   findRecoverableKnowledgeBaseAnchorHandoffTurnIds,
+  findRecoverableKnowledgeBaseTerminalAnchorHandoffTurnIds,
   failKnowledgeBaseTurnDeterministically,
   freezeKnowledgeBaseTurnAttachments,
   hashKnowledgeBaseTurnRequest,
@@ -1018,6 +1020,7 @@ export function isApprovedKnowledgeBaseAwaitingInputObservation(
       progress.build.currentLeafId &&
       presentation &&
       presentation.visibleMarkdown.trim() &&
+      presentation.generation === observation.generation &&
       presentation.revision === progress.build.revision &&
       presentation.leafId === progress.build.currentLeafId,
   );
@@ -1033,7 +1036,11 @@ export function applyKnowledgeBasePresentationProjectionGuard(input: {
   progress: KnowledgeBaseProgressDto;
   observation: Pick<
     KnowledgeBaseObservationDto,
-    "approvedPresentation" | "localRestrictions" | "notice"
+    | "generation"
+    | "activeTurn"
+    | "approvedPresentation"
+    | "localRestrictions"
+    | "notice"
   >;
   interaction: KnowledgeBaseInteractionDto;
 }) {
@@ -1049,14 +1056,23 @@ export function applyKnowledgeBasePresentationProjectionGuard(input: {
   const hasDisplayableAcceptedPresentation = Boolean(
     presentation?.visibleMarkdown.trim() && presentation.leafId.trim(),
   );
-  if (!hasDisplayableAcceptedPresentation) {
+  const hasCurrentReplyAuthority = Boolean(
+    hasDisplayableAcceptedPresentation &&
+      input.observation.activeTurn === null &&
+      presentation!.generation === input.observation.generation &&
+      presentation!.revision === input.progress.build.revision &&
+      presentation!.leafId === input.progress.build.currentLeafId,
+  );
+  if (!hasCurrentReplyAuthority) {
     return {
       interaction: {
         progress: input.progress,
         interactionState: "executing" as const,
         canReply: false,
         canPublish: false,
-        lockReason: "当前知识节点正在完成服务端展示校验",
+        lockReason: input.observation.activeTurn
+          ? "FrontMind 正在完成当前操作"
+          : "当前知识节点正在完成服务端展示校验",
       },
       localRestrictions: input.observation.localRestrictions,
       notice: input.observation.notice,
@@ -4967,8 +4983,40 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
   credential: NonNullable<
     Awaited<ReturnType<typeof getEffectiveDecryptedCredentialForAccount>>
   >;
+  dependencies?: {
+    client?: Pick<
+      ManusV2Client,
+      | "createTask"
+      | "findCreatedTask"
+      | "listAllMessages"
+      | "sendMessage"
+      | "updateTaskVisibility"
+    >;
+    loadBuild?: typeof loadKnowledgeBaseBuildRecordById;
+    ensureSkillArchivePin?: typeof ensureKnowledgeBaseBuildSkillArchivePin;
+    mutateLifecycle?: typeof mutateKnowledgeBaseManusV2Lifecycle;
+    deferOutputPending?: typeof deferKnowledgeBaseManusV2AnchorHandoffOutputPending;
+    markAttention?: typeof markKnowledgeBaseManusV2AnchorHandoffAttentionRequired;
+    completeHandoff?: typeof completeKnowledgeBaseManusV2AnchorHandoff;
+  };
 }) {
   const { claim, credential } = input;
+  const loadBuild =
+    input.dependencies?.loadBuild ?? loadKnowledgeBaseBuildRecordById;
+  const ensureSkillArchivePin =
+    input.dependencies?.ensureSkillArchivePin ??
+    ensureKnowledgeBaseBuildSkillArchivePin;
+  const mutateLifecycle =
+    input.dependencies?.mutateLifecycle ?? mutateKnowledgeBaseManusV2Lifecycle;
+  const deferOutputPending =
+    input.dependencies?.deferOutputPending ??
+    deferKnowledgeBaseManusV2AnchorHandoffOutputPending;
+  const markAttention =
+    input.dependencies?.markAttention ??
+    markKnowledgeBaseManusV2AnchorHandoffAttentionRequired;
+  const completeHandoff =
+    input.dependencies?.completeHandoff ??
+    completeKnowledgeBaseManusV2AnchorHandoff;
   const prepared = claim.preparedDispatch;
   if (!prepared || prepared.requestBody.attachments.length !== 0) {
     throw new KnowledgeBaseTurnReservationError(
@@ -4976,10 +5024,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
       "The hidden anchor handoff does not have its frozen request",
     );
   }
-  let build = await loadKnowledgeBaseBuildRecordById(
-    claim.turn.userId,
-    claim.turn.buildId,
-  );
+  let build = await loadBuild(claim.turn.userId, claim.turn.buildId);
   if (
     !build ||
     build.generation !== claim.turn.buildGeneration ||
@@ -4989,18 +5034,15 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
     return { bound: false, reconciled: false };
   }
   // The handoff snapshot is self-contained, but the build must still prove
-  // its exact physical Skill archive before creating a new canonical writer.
-  // Historical rows are durably backfilled here while the operation remains
-  // strictly before its first provider side effect.
-  await ensureKnowledgeBaseBuildSkillArchivePin({
+  // its exact physical Skill archive before continuing its canonical writer.
+  // Historical rows are durably backfilled here before any same-task repair
+  // side effect.
+  await ensureSkillArchivePin({
     userId: claim.turn.userId,
     buildId: build.id,
     generation: build.generation,
   });
-  build = await loadKnowledgeBaseBuildRecordById(
-    claim.turn.userId,
-    claim.turn.buildId,
-  );
+  build = await loadBuild(claim.turn.userId, claim.turn.buildId);
   if (
     !build ||
     build.generation !== claim.turn.buildGeneration ||
@@ -5009,10 +5051,12 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
   ) {
     return { bound: false, reconciled: false };
   }
-  const client = new ManusV2Client({
-    baseUrl: prepared.baseUrl,
-    apiKey: credential.apiKey,
-  });
+  const client =
+    input.dependencies?.client ??
+    new ManusV2Client({
+      baseUrl: prepared.baseUrl,
+      apiKey: credential.apiKey,
+    });
   const title = `FrontMind KB ${build.id} g${build.generation}`;
   const structuredOutputSchema = anchorHandoffStructuredOutputSchema({
     operationToken: claim.turn.operationToken,
@@ -5121,7 +5165,10 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
         expected,
       });
       const status = latestManusV2TaskState(events) || "running";
-      if (acknowledgement.kind === "missing" && status === "error") {
+      if (
+        acknowledgement.kind === "missing" &&
+        (status === "error" || status === "stopped")
+      ) {
         const recoveryCoordinates = {
           operationToken: claim.turn.operationToken,
           turnId: claim.turn.id,
@@ -5136,7 +5183,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
           (existing.errorRecoveryToken !== recovery.recoveryToken ||
             existing.errorRecoveryRequestHash !== recovery.requestHash)
         ) {
-          await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+          await markAttention({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5152,7 +5199,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
             nextRetryAt: existing.errorRecoveryNextRetryAt,
           });
         if (recoveryAttempt === "adopt") {
-          await mutateKnowledgeBaseManusV2Lifecycle({
+          await mutateLifecycle({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5163,7 +5210,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
               state: "acknowledged",
             },
           });
-          await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
+          await deferOutputPending({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5172,16 +5219,18 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
           return "output_pending";
         }
         if (recoveryAttempt === "wait") {
-          await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
-            userId: claim.turn.userId,
-            turnId: claim.turn.id,
-            leaseToken: claim.leaseToken,
-            taskId: task.id,
-          });
+          if (claim.turn.providerAttemptState === "output_pending") {
+            await deferOutputPending({
+              userId: claim.turn.userId,
+              turnId: claim.turn.id,
+              leaseToken: claim.leaseToken,
+              taskId: task.id,
+            });
+          }
           return "output_pending";
         }
         if (recoveryAttempt === "attention_required") {
-          await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+          await markAttention({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5189,7 +5238,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
           });
           return "attention_required";
         }
-        await mutateKnowledgeBaseManusV2Lifecycle({
+        await mutateLifecycle({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -5200,13 +5249,15 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
             state: "sending",
           },
         });
+        let sentOutcomeUnknown = false;
+        let sentRetryWait = false;
         try {
           const sent = await client.sendMessage({
             taskId: task.id,
             prompt: recovery.prompt,
             structuredOutputSchema,
           });
-          await mutateKnowledgeBaseManusV2Lifecycle({
+          await mutateLifecycle({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5224,11 +5275,14 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
             ? null
             : knowledgeBaseManusV2ErrorRecoveryRejection({
                 previousCount: existing.errorRecoveryRejectionCount,
-                retryable: error.retryable,
+                // A stopped handoff gets one same-task repair attempt. An
+                // explicit rejection is final here; unlike an errored task,
+                // it never authorizes another send.
+                retryable: status === "error" && error.retryable,
                 retryAfterMs: error.retryAfterMs,
                 recoveryToken: recovery.recoveryToken,
               });
-          await mutateKnowledgeBaseManusV2Lifecycle({
+          await mutateLifecycle({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5245,8 +5299,10 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
               ...(rejection?.retry ? { retryAfterMs: rejection.delayMs } : {}),
             },
           });
+          sentOutcomeUnknown = error.outcomeUnknown;
+          sentRetryWait = Boolean(rejection?.retry);
           if (!error.outcomeUnknown && !rejection?.retry) {
-            await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+            await markAttention({
               userId: claim.turn.userId,
               turnId: claim.turn.id,
               leaseToken: claim.leaseToken,
@@ -5255,19 +5311,21 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
             return "attention_required";
           }
         }
-        await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-          taskId: task.id,
-        });
+        if (!sentOutcomeUnknown && !sentRetryWait) {
+          await deferOutputPending({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            taskId: task.id,
+          });
+        }
         return "output_pending";
       }
       if (acknowledgement.kind === "accepted") {
         if (
           !manusV2EventsContainOperationToken(events, claim.turn.operationToken)
         ) {
-          await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+          await markAttention({
             userId: claim.turn.userId,
             turnId: claim.turn.id,
             leaseToken: claim.leaseToken,
@@ -5275,7 +5333,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
           });
           return "attention_required";
         }
-        await completeKnowledgeBaseManusV2AnchorHandoff({
+        await completeHandoff({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -5290,7 +5348,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
         taskStatus: status,
       });
       if (settlement.state === "attention_required") {
-        await markKnowledgeBaseManusV2AnchorHandoffAttentionRequired({
+        await markAttention({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -5299,7 +5357,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
         return "attention_required";
       }
       if (settlement.state === "output_pending") {
-        await deferKnowledgeBaseManusV2AnchorHandoffOutputPending({
+        await deferOutputPending({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -5362,6 +5420,10 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
           matchCount: reconciledMatchCount,
         };
 }
+
+export const knowledgeBaseTerminalAnchorRecoveryTestHooks = {
+  dispatchKnowledgeBaseAnchorHandoffClaim,
+};
 
 /**
  * Migrates active legacy builds one-by-one. Attempted operations settle first;
@@ -5862,6 +5924,102 @@ export async function migrateActiveLegacyKnowledgeBaseBuilds(options?: {
       });
     }
   }
+  return result;
+}
+
+/**
+ * Finishes only already-created canonical anchor tasks that were quarantined
+ * after a stopped task omitted its exact ACK. This is ordinary recovery, not
+ * migration: it never reserves a build generation or calls task.create.
+ */
+export async function recoverTerminalKnowledgeBaseAnchorHandoffs(options?: {
+  limit?: number;
+  concurrency?: number;
+  includeClaimedTurnIds?: boolean;
+}) {
+  const limit = Math.min(200, Math.max(1, Math.trunc(options?.limit ?? 50)));
+  const concurrency = Math.min(
+    8,
+    Math.max(1, Math.trunc(options?.concurrency ?? 3)),
+  );
+  const candidates =
+    await findRecoverableKnowledgeBaseTerminalAnchorHandoffTurnIds({ limit });
+  const result = {
+    scanned: candidates.length,
+    claimed: 0,
+    claimedTurnIds: [] as string[],
+    completed: 0,
+    pending: 0,
+    skipped: 0,
+    failed: 0,
+  };
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor++];
+      let recoveryApiKey: string | undefined;
+      try {
+        const claim = await claimKnowledgeBaseTerminalAnchorHandoffRecovery({
+          turnId: candidate.turnId,
+          leaseMs: 300_000,
+        });
+        if (!claim) {
+          result.skipped += 1;
+          continue;
+        }
+        result.claimed += 1;
+        if (options?.includeClaimedTurnIds) {
+          result.claimedTurnIds.push(claim.turn.id);
+        }
+        if (!claim.turn.apiCredentialId) {
+          throw new Error(
+            "Terminal anchor reservation has no credential binding",
+          );
+        }
+        await assertKnowledgeBaseWritable(claim.turn.userId);
+        const credential =
+          await getDecryptedCredentialForKnowledgeBaseReservation({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            buildId: claim.turn.buildId,
+            buildGeneration: claim.turn.buildGeneration,
+            apiCredentialId: claim.turn.apiCredentialId,
+          });
+        if (!credential) {
+          throw new Error("Terminal anchor credential version is unavailable");
+        }
+        recoveryApiKey = credential.apiKey;
+        const recovered = await withKnowledgeBaseRecoveryLeaseHeartbeat({
+          claim,
+          operation: () =>
+            dispatchKnowledgeBaseAnchorHandoffClaim({ claim, credential }),
+        });
+        if (recovered.settlement === "output_pending") {
+          result.pending += 1;
+        } else if (recovered.settlement === "attention_required") {
+          result.skipped += 1;
+        } else if (recovered.bound) {
+          result.completed += 1;
+        } else {
+          result.skipped += 1;
+        }
+      } catch (error) {
+        result.failed += 1;
+        logKnowledgeBaseRuntimeFailure({
+          level: "warn",
+          event: "[KnowledgeBaseAnchorRecovery] terminal_ack_deferred",
+          userId: candidate.userId,
+          buildId: candidate.buildId,
+          turnId: candidate.turnId,
+          error,
+          additionalSecrets: [recoveryApiKey],
+        });
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, candidates.length) }, worker),
+  );
   return result;
 }
 

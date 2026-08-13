@@ -8839,7 +8839,12 @@ export async function completeKnowledgeBaseManusV2AnchorHandoff(
     if (
       !isKnowledgeBaseAnchorHandoffRepairKind(metadata.repairKind) ||
       metadata.providerProtocol !== "manus_v2" ||
-      metadata.providerAttemptState !== "output_pending" ||
+      (metadata.providerAttemptState !== "output_pending" &&
+        !(
+          metadata.createAttemptState === "rejected" &&
+          metadata.manusV2Lifecycle?.errorRecoveryAttempt === 1 &&
+          metadata.providerAttemptState === "outcome_unknown"
+        )) ||
       build.providerProtocol !== "manus_v2" ||
       build.canonicalTaskId !== taskId ||
       build.canonicalTaskGeneration !== build.generation ||
@@ -9115,6 +9120,193 @@ export async function claimKnowledgeBaseManusV2AnchorHandoff(
       turn: turnRecord({
         ...turn,
         status: "running",
+        metadata: nextMetadata,
+        leaseExpiresAt,
+        updatedAt: now,
+      }),
+      leaseToken,
+      leaseExpiresAt,
+      upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
+        String(turn.operationKey),
+      ),
+      recoveryMetadata: sanitizeKnowledgeBaseRecoveryMetadata(
+        nextMetadata.recovery,
+      ),
+      preparedDispatch: nextMetadata.preparedDispatch ?? null,
+    };
+  });
+}
+
+const MANUS_V2_TERMINAL_ANCHOR_ACK_MISSING = "MANUS_V2_ANCHOR_ACK_MISSING";
+
+function terminalAnchorAcknowledgementRecoveryEligible(input: {
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  now: Date;
+}) {
+  const { turn, build, now } = input;
+  const metadata = metadataOf(turn);
+  const providerAttemptState = String(
+    metadata.providerAttemptState || "not_sent",
+  );
+  const lifecycle = metadata.manusV2Lifecycle || {};
+  const initialAttention =
+    turn.errorCode === MANUS_V2_TERMINAL_ANCHOR_ACK_MISSING &&
+    providerAttemptState === "rejected" &&
+    build.canonicalTaskState === "attention_required" &&
+    build.protocolErrorCode === MANUS_V2_TERMINAL_ANCHOR_ACK_MISSING;
+  const durableRecoveryInProgress =
+    lifecycle.errorRecoveryAttempt === 1 &&
+    typeof lifecycle.errorRecoveryToken === "string" &&
+    lifecycle.errorRecoveryToken.length > 0 &&
+    typeof lifecycle.errorRecoveryRequestHash === "string" &&
+    lifecycle.errorRecoveryRequestHash.length > 0 &&
+    ["sending", "acknowledged", "outcome_unknown", "retry_wait"].includes(
+      String(lifecycle.errorRecoveryAttemptState || ""),
+    );
+  return (
+    isKnowledgeBaseAnchorHandoffRepairKind(metadata.repairKind) &&
+    turn.operationType === "legacy_reconcile" &&
+    turn.status === "running" &&
+    metadata.createAttemptState === "rejected" &&
+    metadata.providerProtocol === "manus_v2" &&
+    ["rejected", "outcome_unknown", "output_pending"].includes(
+      providerAttemptState,
+    ) &&
+    (!turn.leaseExpiresAt || turn.leaseExpiresAt.getTime() <= now.getTime()) &&
+    build.providerProtocol === "manus_v2" &&
+    ["confirming", "protocol_error"].includes(build.status) &&
+    build.activeTurnId === turn.id &&
+    Boolean(build.canonicalTaskId) &&
+    build.canonicalTaskId === turn.upstreamTaskId &&
+    build.canonicalTaskGeneration === build.generation &&
+    (initialAttention || durableRecoveryInProgress)
+  );
+}
+
+/**
+ * Finds only a previously-bound canonical anchor whose stopped task omitted
+ * the exact acknowledgement. This recovery is intentionally independent of
+ * the active-migration switch: it can finish an already-created writer but it
+ * can never reserve or create a new provider task.
+ */
+export async function findRecoverableKnowledgeBaseTerminalAnchorHandoffTurnIds(
+  input: { now?: Date; limit?: number } = {},
+  executor?: any,
+): Promise<KnowledgeBaseRecoveryCandidate[]> {
+  const db = executor ?? (await requireDb());
+  const now = input.now ?? new Date();
+  const limit = Math.min(200, Math.max(1, Math.trunc(input.limit ?? 50)));
+  return db
+    .select({
+      turnId: conversationTurns.id,
+      userId: conversationTurns.userId,
+      buildId: conversationTurns.buildId,
+      buildGeneration: conversationTurns.buildGeneration,
+      leaseExpiresAt: conversationTurns.leaseExpiresAt,
+    })
+    .from(conversationTurns)
+    .innerJoin(
+      knowledgeBaseBuilds,
+      and(
+        eq(knowledgeBaseBuilds.id, conversationTurns.buildId),
+        eq(knowledgeBaseBuilds.generation, conversationTurns.buildGeneration),
+        eq(knowledgeBaseBuilds.activeTurnId, conversationTurns.id),
+        eq(
+          knowledgeBaseBuilds.canonicalTaskId,
+          conversationTurns.upstreamTaskId,
+        ),
+      ),
+    )
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.providerProtocol, "manus_v2"),
+        inArray(knowledgeBaseBuilds.status, ["confirming", "protocol_error"]),
+        eq(
+          knowledgeBaseBuilds.canonicalTaskGeneration,
+          knowledgeBaseBuilds.generation,
+        ),
+        eq(conversationTurns.status, "running"),
+        or(
+          and(
+            eq(
+              conversationTurns.errorCode,
+              MANUS_V2_TERMINAL_ANCHOR_ACK_MISSING,
+            ),
+            eq(knowledgeBaseBuilds.canonicalTaskState, "attention_required"),
+            eq(
+              knowledgeBaseBuilds.protocolErrorCode,
+              MANUS_V2_TERMINAL_ANCHOR_ACK_MISSING,
+            ),
+            sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')) = 'rejected'`,
+          ),
+          and(
+            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.errorRecoveryAttempt') = 1`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.errorRecoveryToken')), '') <> ''`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.errorRecoveryRequestHash')), '') <> ''`,
+            sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.errorRecoveryAttemptState')) IN ('sending', 'acknowledged', 'outcome_unknown', 'retry_wait')`,
+          ),
+        ),
+        or(
+          isNull(conversationTurns.leaseExpiresAt),
+          lte(conversationTurns.leaseExpiresAt, now),
+        ),
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')) IN ('legacy_anchor_handoff', 'canonical_credential_rebind')`,
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')) = 'rejected'`,
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')) = 'manus_v2'`,
+        sql`JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')) IN ('rejected', 'outcome_unknown', 'output_pending')`,
+      ),
+    )
+    .orderBy(asc(conversationTurns.leaseExpiresAt), asc(conversationTurns.id))
+    .limit(limit) as Promise<KnowledgeBaseRecoveryCandidate[]>;
+}
+
+/** Claims terminal ACK recovery without changing its frozen task or payload. */
+export async function claimKnowledgeBaseTerminalAnchorHandoffRecovery(
+  input: { turnId: string; now?: Date; leaseMs?: number },
+  executor?: any,
+): Promise<KnowledgeBaseRecoveryClaim | null> {
+  const db = executor ?? (await requireDb());
+  const now = input.now ?? new Date();
+  const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
+  assertInteger(leaseMs, "leaseMs", 1_000);
+  return db.transaction(async (tx: any) => {
+    let turn: ConversationTurn;
+    let build: KnowledgeBaseBuild;
+    try {
+      ({ turn, build } = await lockedOwnedTurnAndBuild(tx, {
+        turnId: input.turnId,
+      }));
+    } catch (error) {
+      if (
+        error instanceof KnowledgeBaseTurnReservationError &&
+        (error.code === "RESERVATION_NOT_FOUND" || error.code === "CONFLICT")
+      ) {
+        return null;
+      }
+      throw error;
+    }
+    if (!terminalAnchorAcknowledgementRecoveryEligible({ turn, build, now })) {
+      return null;
+    }
+    const metadata = metadataOf(turn);
+    const leaseToken = randomUUID();
+    const leaseExpiresAt = new Date(now.getTime() + leaseMs);
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      leaseOwnerHash: leaseOwnerHash(leaseToken),
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: nextMetadata,
+        leaseExpiresAt,
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    return {
+      turn: turnRecord({
+        ...turn,
         metadata: nextMetadata,
         leaseExpiresAt,
         updatedAt: now,

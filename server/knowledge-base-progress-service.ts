@@ -2003,6 +2003,7 @@ type KnowledgeBaseAcceptedMessageRow = Pick<
   | "content"
   | "sequence"
   | "metadata"
+  | "sentAt"
 >;
 
 type KnowledgeBaseAcceptedReceiptTurnRow = Pick<
@@ -2230,6 +2231,7 @@ async function readKnowledgeBaseObservationProjection(
         content: messages.content,
         sequence: messages.sequence,
         metadata: messages.metadata,
+        sentAt: messages.sentAt,
       })
       .from(messages)
       .where(
@@ -2629,6 +2631,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     approvedPresentation = {
       turnId: acceptedReceipt.message.turnId!,
       clientRequestId: receiptTurn?.clientRequestId || null,
+      generation: receiptCoordinate.generation as number,
+      acceptedAt: acceptedReceipt.message.sentAt.getTime(),
       presentationKey: receiptCoordinate.presentationKey as string,
       revision: receiptCoordinate.revision as number,
       leafId: receiptCoordinate.leafId as string,
@@ -2662,6 +2666,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
         turnId:
           currentRow.sourceTurnId || `legacy:${build.id}:${build.revision}`,
         clientRequestId: presentationTurnRow?.clientRequestId || null,
+        generation: build.generation,
+        acceptedAt: (
+          currentRow.lastResponseAt || currentRow.updatedAt
+        ).getTime(),
         presentationKey:
           currentRow.presentationKey ||
           build.currentPresentationKey ||

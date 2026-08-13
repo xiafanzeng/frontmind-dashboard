@@ -23,6 +23,7 @@ import {
   cancelUnpreparedKnowledgeBaseTurn,
   completeKnowledgeBaseGeneratedAttachment,
   completeKnowledgeBaseManusV2AnchorHandoff,
+  claimKnowledgeBaseTerminalAnchorHandoffRecovery,
   createKnowledgeBaseGeneratedAttachmentIdempotencyKey,
   createKnowledgeBaseOperationKey,
   createKnowledgeBaseUpstreamIdempotencyKey,
@@ -2153,6 +2154,56 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(harness.store.conversation).toMatchObject({
       status: "awaiting_input",
       upstreamTaskId: "anchor-task",
+    });
+  });
+
+  it("claims only the expired stopped ACK-missing anchor on its exact canonical task", async () => {
+    const expiredAt = new Date("2026-08-13T00:00:00.000Z");
+    const activeTurn = turn({
+      operationType: "legacy_reconcile",
+      status: "running",
+      upstreamTaskId: "canonical-task",
+      errorCode: "MANUS_V2_ANCHOR_ACK_MISSING",
+      leaseExpiresAt: expiredAt,
+      metadata: {
+        attachmentsFrozen: true,
+        createAttemptState: "rejected",
+        providerProtocol: "manus_v2",
+        providerAttemptState: "rejected",
+        operationToken: "operation-1",
+        repairKind: "legacy_anchor_handoff",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        status: "confirming",
+        canonicalTaskId: "canonical-task",
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "attention_required",
+        protocolErrorCode: "MANUS_V2_ANCHOR_ACK_MISSING",
+      }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns, (store) => store.turns]],
+    });
+
+    const claim = await claimKnowledgeBaseTerminalAnchorHandoffRecovery(
+      {
+        turnId: activeTurn.id,
+        now: new Date(expiredAt.getTime() + 1),
+      },
+      harness.executor,
+    );
+    expect(claim).toMatchObject({
+      turn: {
+        id: activeTurn.id,
+        upstreamTaskId: "canonical-task",
+        providerAttemptState: "rejected",
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: activeTurn.id,
+      canonicalTaskId: "canonical-task",
     });
   });
 

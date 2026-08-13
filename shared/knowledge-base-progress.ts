@@ -295,6 +295,17 @@ export interface KnowledgeBaseApprovedPresentationDto {
    * accepted by the server.
    */
   clientRequestId: string | null;
+  /**
+   * Generation that accepted this presentation. Optional while older server
+   * projections and cached observations roll forward.
+   */
+  generation?: number;
+  /**
+   * Server-owned acceptance time from the immutable assistant message ledger.
+   * Optional while older server projections and cached observations roll
+   * forward.
+   */
+  acceptedAt?: number;
   presentationKey: string;
   revision: number;
   leafId: string;

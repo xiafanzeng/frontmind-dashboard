@@ -835,7 +835,7 @@ function knowledgeBasePresentationMessage(
     content: sanitizeKnowledgeBaseCustomerMarkdown(
       presentation.visibleMarkdown,
     ),
-    timestamp: Date.now(),
+    timestamp: presentation.acceptedAt ?? Date.now(),
     inlineImages: inlineImages.length > 0 ? inlineImages : undefined,
     knowledgeBase: {
       schemaVersion: 1,
@@ -845,7 +845,7 @@ function knowledgeBasePresentationMessage(
       operationKey: observation.activeTurn?.operationKey,
       turnId: presentation.turnId,
       presentationKey: presentation.presentationKey,
-      generation: observation.generation,
+      generation: presentation.generation ?? observation.generation,
       revision: presentation.revision,
       leafId: presentation.leafId,
       serverOwned: true,

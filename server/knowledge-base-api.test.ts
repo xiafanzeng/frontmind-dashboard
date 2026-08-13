@@ -49,6 +49,7 @@ import {
   knowledgeBaseManualLogoDeterministicCreateFailureStatus,
   knowledgeBaseManualLogoTerminalFailure,
   knowledgeBaseManusV2LifecycleTestHooks,
+  knowledgeBaseTerminalAnchorRecoveryTestHooks,
   knowledgeBasePresentationRequiresBoundLogo,
   knowledgeBaseTurnLogoPolicy,
   knowledgeBaseTurnReplayHttpStatus,
@@ -76,6 +77,7 @@ import {
   waitForKnowledgeBaseDispatchAttachments,
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
+import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import {
   KnowledgeBaseAttachmentsProcessingError,
   KnowledgeBaseLocalPreparationError,
@@ -1268,6 +1270,199 @@ describe("Manus v2 durable format repair", () => {
   });
 });
 
+describe("terminal anchor acknowledgement recovery", () => {
+  const build = {
+    id: "build-terminal-anchor",
+    userId: 1,
+    generation: 7,
+    revision: 11,
+    currentLeafId: "3.2",
+    providerProtocol: "manus_v2",
+    activeTurnId: "turn-terminal-anchor",
+    canonicalTaskId: "canonical-anchor-task",
+    canonicalTaskUrl: null,
+    canonicalTaskGeneration: 7,
+  } as any;
+  const preparedDispatch = {
+    preparedAt: "2026-08-13T00:00:00.000Z",
+    baseUrl: "https://api.manus.example",
+    requestBody: {
+      prompt: "frozen self-contained handoff",
+      attachments: [],
+      agentProfile: "frontmind-pro",
+    },
+  } as any;
+  const stopped = {
+    id: "status-stopped",
+    type: "status_update",
+    timestamp: 1,
+    status_update: { agent_status: "stopped" },
+  } as any;
+  const claim = (manusV2Lifecycle: Record<string, unknown> = {}) =>
+    ({
+      turn: {
+        id: "turn-terminal-anchor",
+        userId: 1,
+        buildId: build.id,
+        buildGeneration: 7,
+        expectedRevision: 11,
+        operationToken: "operation-anchor",
+        providerAttemptState:
+          Object.keys(manusV2Lifecycle).length > 0
+            ? "outcome_unknown"
+            : "rejected",
+        manusV2Lifecycle,
+      },
+      leaseToken: "lease-terminal-anchor",
+      preparedDispatch,
+    }) as any;
+  const dependencies = (client: any) => ({
+    client,
+    loadBuild: vi.fn().mockResolvedValue(build),
+    ensureSkillArchivePin: vi.fn().mockResolvedValue(undefined),
+    mutateLifecycle: vi.fn().mockResolvedValue(undefined),
+    deferOutputPending: vi.fn().mockResolvedValue(undefined),
+    markAttention: vi.fn().mockResolvedValue(undefined),
+    completeHandoff: vi.fn().mockResolvedValue(undefined),
+  });
+
+  it("sends one recovery only to the existing canonical task", async () => {
+    const client = {
+      listAllMessages: vi.fn().mockResolvedValue([stopped]),
+      sendMessage: vi.fn().mockResolvedValue({ requestId: "request-1" }),
+      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
+    };
+    const injected = dependencies(client);
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
+        {
+          claim: claim(),
+          credential: { apiKey: "test-key" } as any,
+          dependencies: injected as any,
+        },
+      ),
+    ).resolves.toMatchObject({
+      bound: true,
+      taskId: "canonical-anchor-task",
+      settlement: "output_pending",
+    });
+    expect(client.sendMessage).toHaveBeenCalledOnce();
+    expect(client.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: "canonical-anchor-task" }),
+    );
+    expect(injected.mutateLifecycle.mock.calls).toHaveLength(2);
+    expect(
+      injected.mutateLifecycle.mock.calls.map(
+        ([input]) => input.mutation.state,
+      ),
+    ).toEqual(["sending", "acknowledged"]);
+    expect(injected.completeHandoff).not.toHaveBeenCalled();
+  });
+
+  it("does not resend a tokenless response-loss recovery on the next sweep", async () => {
+    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
+      operationToken: "operation-anchor",
+      turnId: "turn-terminal-anchor",
+      generation: 7,
+      baseRevision: 11,
+    });
+    const client = {
+      listAllMessages: vi.fn().mockResolvedValue([stopped]),
+      sendMessage: vi.fn(),
+      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
+    };
+    const injected = dependencies(client);
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
+        {
+          claim: claim({
+            errorRecoveryAttempt: 1,
+            errorRecoveryToken: recovery.recoveryToken,
+            errorRecoveryRequestHash: recovery.requestHash,
+            errorRecoveryAttemptState: "outcome_unknown",
+          }),
+          credential: { apiKey: "test-key" } as any,
+          dependencies: injected as any,
+        },
+      ),
+    ).resolves.toMatchObject({ settlement: "output_pending" });
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(injected.mutateLifecycle).not.toHaveBeenCalled();
+    expect(injected.deferOutputPending).not.toHaveBeenCalled();
+  });
+
+  it("settles an exact recovered ACK through the existing atomic completion", async () => {
+    const exact = {
+      schemaVersion: 1,
+      operationToken: "operation-anchor",
+      turnId: "turn-terminal-anchor",
+      generation: 7,
+      baseRevision: 11,
+      handoffAccepted: true,
+    };
+    const client = {
+      listAllMessages: vi.fn().mockResolvedValue([
+        {
+          id: "operation-attribution",
+          type: "user_message",
+          timestamp: 1,
+          user_message: {
+            content:
+              'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"operation-anchor"}',
+          },
+        },
+        {
+          id: "ack-exact",
+          type: "structured_output_result",
+          timestamp: 2,
+          structured_output_result: { success: true, value: exact },
+        },
+        {
+          id: "status-stopped",
+          type: "status_update",
+          timestamp: 3,
+          status_update: { agent_status: "stopped" },
+        },
+      ]),
+      sendMessage: vi.fn(),
+      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
+    };
+    const injected = dependencies(client);
+    const recoveredClaim = claim({
+      errorRecoveryAttempt: 1,
+      errorRecoveryToken: "recovery-token",
+      errorRecoveryRequestHash: "request-hash",
+      errorRecoveryAttemptState: "acknowledged",
+    });
+    recoveredClaim.turn.providerAttemptState = "output_pending";
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
+        {
+          claim: recoveredClaim,
+          credential: { apiKey: "test-key" } as any,
+          dependencies: injected as any,
+        },
+      ),
+    ).resolves.toMatchObject({
+      bound: true,
+      taskId: "canonical-anchor-task",
+    });
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(injected.completeHandoff).toHaveBeenCalledOnce();
+    expect(injected.completeHandoff).toHaveBeenCalledWith(
+      expect.objectContaining({
+        turnId: "turn-terminal-anchor",
+        taskId: "canonical-anchor-task",
+        acknowledgement: expect.objectContaining({ eventId: "ack-exact" }),
+      }),
+    );
+    expect(client.createTask).toBeUndefined();
+  });
+});
+
 describe("knowledge-base upstream read failure authority", () => {
   it.each([
     [
@@ -1485,6 +1680,7 @@ describe("knowledge base execution contract", () => {
         turnId: "turn-completed-1",
         clientRequestId: "request-1",
         presentationKey: "presentation-1",
+        generation: 2,
         revision: 1,
         leafId: "1.2",
         visibleMarkdown: "## 1.2 企业主体\n\n已批准正文。",
@@ -1534,6 +1730,15 @@ describe("knowledge base execution contract", () => {
     expect(
       isApprovedKnowledgeBaseAwaitingInputObservation({
         ...observation,
+        approvedPresentation: {
+          ...observation.approvedPresentation,
+          generation: 1,
+        },
+      } as any),
+    ).toBe(false);
+    expect(
+      isApprovedKnowledgeBaseAwaitingInputObservation({
+        ...observation,
         activeTurn: { id: "turn-active" },
       } as any),
     ).toBe(false);
@@ -1546,6 +1751,7 @@ describe("knowledge base execution contract", () => {
         conversationId: "conversation-logo-projection-repair",
         companyName: "Projection Fixture",
         skillVersion: "4",
+        generation: 1,
         status: "confirming",
         revision: 0,
         currentLeafId: "1.1",
@@ -1575,6 +1781,7 @@ describe("knowledge base execution contract", () => {
       turnId: "turn-first-node",
       clientRequestId: "request-first-node",
       presentationKey: "presentation-first-node",
+      generation: 1,
       revision: 0,
       leafId: "1.1",
       visibleMarkdown: "## 1.1 企业主体\n\n已接受并展示的正文。",
@@ -1588,6 +1795,8 @@ describe("knowledge base execution contract", () => {
     const guarded = applyKnowledgeBasePresentationProjectionGuard({
       progress,
       observation: {
+        generation: 1,
+        activeTurn: null,
         approvedPresentation,
         localRestrictions: [],
         notice: null,
@@ -1623,6 +1832,8 @@ describe("knowledge base execution contract", () => {
       applyKnowledgeBasePresentationProjectionGuard({
         progress,
         observation: {
+          generation: 1,
+          activeTurn: null,
           approvedPresentation,
           localRestrictions: ["canonical_task_repairing"],
           notice: existingNotice,
@@ -1630,6 +1841,86 @@ describe("knowledge base execution contract", () => {
         interaction,
       }).notice,
     ).toBe(existingNotice);
+  });
+
+  it("keeps accepted text visible but locks reply authority for an active or stale coordinate", () => {
+    const progress = {
+      build: {
+        id: "build-active-turn",
+        conversationId: "conversation-active-turn",
+        companyName: "Projection Fixture",
+        skillVersion: "4",
+        generation: 7,
+        status: "confirming",
+        revision: 11,
+        currentLeafId: "3.2",
+        protocolError: null,
+        awaitingResponseSince: null,
+        logoRequired: false,
+        logoAvailable: false,
+        updatedAt: 123,
+      },
+      summary: {
+        total: 40,
+        handled: 11,
+        confirmed: 10,
+        directPrefilled: 0,
+        pending: 28,
+        current: 1,
+        needsVerification: 1,
+      },
+      branches: [],
+      packageAllowed: false,
+    } as any;
+    const interaction = deriveKnowledgeBaseInteraction(
+      progress,
+      "awaiting_input",
+    );
+    const approvedPresentation = {
+      turnId: "turn-visible",
+      clientRequestId: "request-visible",
+      presentationKey: "presentation-visible",
+      generation: 7,
+      revision: 11,
+      leafId: "3.2",
+      visibleMarkdown: "## 3.2\n\n已接受正文仍可显示。",
+      contentSha256: "a".repeat(64),
+      imageState: "no_eligible_asset" as const,
+      resources: [],
+    };
+
+    const active = applyKnowledgeBasePresentationProjectionGuard({
+      progress,
+      observation: {
+        generation: 7,
+        activeTurn: { id: "hidden-anchor-turn" } as any,
+        approvedPresentation,
+        localRestrictions: [],
+        notice: null,
+      },
+      interaction,
+    });
+    expect(approvedPresentation.visibleMarkdown).toContain("已接受正文");
+    expect(active.interaction).toMatchObject({
+      interactionState: "executing",
+      canReply: false,
+    });
+
+    const stale = applyKnowledgeBasePresentationProjectionGuard({
+      progress,
+      observation: {
+        generation: 7,
+        activeTurn: null,
+        approvedPresentation: { ...approvedPresentation, generation: 6 },
+        localRestrictions: [],
+        notice: null,
+      },
+      interaction,
+    });
+    expect(stale.interaction).toMatchObject({
+      interactionState: "executing",
+      canReply: false,
+    });
   });
 
   it("normalizes a stable pre-upload attachment manifest and rejects partial entries", () => {

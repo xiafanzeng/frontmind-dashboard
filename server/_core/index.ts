@@ -14,6 +14,7 @@ import knowledgeBaseApi, {
   getKnowledgeBaseSkillDescriptor,
   migrateActiveLegacyKnowledgeBaseBuilds,
   recoverExpiredKnowledgeBaseTurns,
+  recoverTerminalKnowledgeBaseAnchorHandoffs,
   recoverOpenKnowledgeBaseTasks,
 } from "../knowledge-base-api";
 import { cleanupOrphanedKnowledgeBuildArtifactCandidates } from "../knowledge-base-artifact-binding-service";
@@ -610,6 +611,8 @@ async function startServer() {
       });
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
+        recoverTerminalAnchorHandoffs: () =>
+          recoverTerminalKnowledgeBaseAnchorHandoffs(),
         recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),
         ...(knowledgeBaseManusV2ActiveMigration
           ? {

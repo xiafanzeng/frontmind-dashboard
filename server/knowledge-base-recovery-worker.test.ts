@@ -7,6 +7,11 @@ describe("knowledge-base production recovery sweep", () => {
     const recoverExpiredTurns = vi
       .fn()
       .mockResolvedValue({ failed: 1, scanned: 2, claimedTurnIds: ["turn-1"] });
+    const recoverTerminalAnchorHandoffs = vi.fn().mockResolvedValue({
+      failed: 1,
+      scanned: 1,
+      claimedTurnIds: ["anchor-turn-1"],
+    });
     const recoverOpenBuilds = vi
       .fn()
       .mockResolvedValueOnce({
@@ -59,15 +64,17 @@ describe("knowledge-base production recovery sweep", () => {
       });
     const sweep = createKnowledgeBaseRecoverySweep({
       recoverExpiredTurns,
+      recoverTerminalAnchorHandoffs,
       recoverOpenBuilds,
       migrateActiveLegacyBuilds,
       cleanupArtifactCandidates,
     });
 
-    await expect(sweep()).resolves.toMatchObject({ failed: 5 });
-    await expect(sweep()).resolves.toMatchObject({ failed: 2 });
-    await expect(sweep()).resolves.toMatchObject({ failed: 2 });
+    await expect(sweep()).resolves.toMatchObject({ failed: 6 });
+    await expect(sweep()).resolves.toMatchObject({ failed: 3 });
+    await expect(sweep()).resolves.toMatchObject({ failed: 3 });
     expect(recoverExpiredTurns).toHaveBeenCalledTimes(3);
+    expect(recoverTerminalAnchorHandoffs).toHaveBeenCalledTimes(3);
     expect(recoverOpenBuilds.mock.calls).toEqual([
       [{ limit: 100, concurrency: 3 }],
       [{ limit: 100, concurrency: 3, afterBuildId: "build-100" }],
@@ -86,6 +93,32 @@ describe("knowledge-base production recovery sweep", () => {
       ],
       [{ limit: 100, concurrency: 3 }],
     ]);
+  });
+
+  it("runs terminal anchor recovery even when migration is not configured", async () => {
+    const recoverExpiredTurns = vi.fn().mockResolvedValue({ failed: 0 });
+    const recoverTerminalAnchorHandoffs = vi.fn().mockResolvedValue({
+      failed: 0,
+      scanned: 1,
+      completed: 1,
+    });
+    const recoverOpenBuilds = vi.fn().mockResolvedValue({
+      failed: 0,
+      hasMore: false,
+      nextCursor: null,
+    });
+    const sweep = createKnowledgeBaseRecoverySweep({
+      recoverExpiredTurns,
+      recoverTerminalAnchorHandoffs,
+      recoverOpenBuilds,
+    });
+
+    await expect(sweep()).resolves.toMatchObject({
+      failed: 0,
+      terminalAnchors: { scanned: 1, completed: 1 },
+      migrations: null,
+    });
+    expect(recoverTerminalAnchorHandoffs).toHaveBeenCalledOnce();
   });
 
   it("does not advance its cursor when an open-build scan throws", async () => {
