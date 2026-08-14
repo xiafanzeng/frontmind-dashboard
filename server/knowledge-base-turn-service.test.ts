@@ -1900,6 +1900,7 @@ describe("Manus v2 canonical task writer fence", () => {
     const harness = createTurnServiceExecutor({
       build: build({
         canonicalTaskId: "canonical-task",
+        upstreamTaskId: "canonical-task",
         canonicalTaskGeneration: 3,
         canonicalCredentialId: "credential-1",
         canonicalTaskState: "active",
@@ -1961,6 +1962,78 @@ describe("Manus v2 canonical task writer fence", () => {
           recoveryStateSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
         },
       },
+    });
+  });
+
+  it("stops a send rejection whose source turn is not bound to the canonical task", async () => {
+    const leaseToken = "unbound-send-rejection-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256").update(leaseToken).digest("hex"),
+        providerProtocol: "manus_v2",
+        providerMethod: "task.sendMessage",
+        providerAttemptState: "sending",
+        createAttemptState: "sending",
+        frozenProviderRequestHash: "f".repeat(64),
+        operationToken: "operation-unbound-send",
+      },
+    });
+    const canonicalTaskId = "canonical-task";
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId,
+        upstreamTaskId: canonicalTaskId,
+        canonicalTaskGeneration: 3,
+        canonicalCredentialId: "credential-1",
+        canonicalTaskState: "active",
+        handoffProvenance: {
+          localRehydrateRequired: {
+            schemaVersion: 1,
+            sourceTurnId: "00000000-0000-4000-8000-000000000003",
+            snapshotSha256: "c".repeat(64),
+            taskIdSha256: createHash("sha256")
+              .update(canonicalTaskId)
+              .digest("hex"),
+            generation: 3,
+            revision: 7,
+            leafId: "1.8",
+          },
+        },
+      }),
+      conversation: {
+        id: active.conversationId,
+        userId: active.userId,
+        projectAssignmentId: null,
+        version: 1,
+        status: "running",
+      },
+      turns: [active],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      settleKnowledgeBaseManusV2ExplicitRejection(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          code: "MANUS_V2_SEND_REJECTED",
+          retryable: true,
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ retryScheduled: false });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: null,
+      status: "protocol_error",
+      protocolErrorCode: "MANUS_V2_SEND_REJECTED",
+      handoffProvenance: { terminalRecovery: { action: "stopped" } },
+    });
+    expect(harness.store.turns[0]?.metadata).toMatchObject({
+      recoveryAction: "contact_support",
     });
   });
 
@@ -2203,7 +2276,7 @@ describe("Manus v2 canonical task writer fence", () => {
     });
   });
 
-  it("normalizes a historical failed active writer without creating a provider operation", async () => {
+  it("normalizes the historical confirming create rejection once without creating a provider operation", async () => {
     const rejected = turn({
       status: "failed",
       leaseExpiresAt: null,
@@ -2218,43 +2291,72 @@ describe("Manus v2 canonical task writer fence", () => {
         providerReasonCategory: "invalid_argument",
         providerRejectionStatus: 400,
         operationToken: "operation-1",
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        recovery: {
+          kind: "start",
+          conversationId: "conversation-1",
+          companyName: "Example",
+          attachments: [],
+        },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "frozen",
+            agentProfile: "frontmind-standard",
+            attachments: [],
+          },
+          bodySha256: "e".repeat(64),
+          preparedAt: "2026-08-13T00:00:00.000Z",
+        },
       },
     });
     const harness = createTurnServiceExecutor({
       build: build({
-        status: "protocol_error",
-        canonicalTaskState: "attention_required",
+        status: "confirming",
+        canonicalTaskState: "creating",
         activeTurnId: rejected.id,
+        recoveryLeaseOwnerHash: null,
+        recoveryLeaseExpiresAt: null,
       }),
       conversation: {
         id: rejected.conversationId,
         userId: rejected.userId,
         projectAssignmentId: null,
         version: 2,
-        status: "failed",
+        status: "running",
+        completedAt: null,
       },
       turns: [rejected],
-      turnSelections: [[(store) => store.turns]],
+      turnSelections: [[(store) => store.turns], [(store) => store.turns]],
     });
 
-    await expect(
-      normalizeKnowledgeBaseTerminalRejection(
-        {
-          userId: 1,
-          conversationId: "conversation-1",
-          now: new Date("2026-08-13T00:03:00.000Z"),
-        },
-        harness.executor,
-      ),
-    ).resolves.toMatchObject({
+    const frozenSource = structuredClone(harness.store.turns[0]);
+    const normalized = await normalizeKnowledgeBaseTerminalRejection(
+      {
+        userId: 1,
+        conversationId: "conversation-1",
+        now: new Date("2026-08-13T00:03:00.000Z"),
+      },
+      harness.executor,
+    );
+    expect(normalized).toMatchObject({
       action: "retry_compatible_create",
       sourceTurnId: rejected.id,
     });
     expect(harness.store.build).toMatchObject({
+      status: "protocol_error",
       activeTurnId: null,
+      canonicalTaskState: "attention_required",
       stateEpoch: 8,
+      awaitingResponseSince: null,
       handoffProvenance: {
         recoverySourceTurnId: rejected.id,
+        terminalRecovery: {
+          action: "retry_compatible_create",
+          recoveryStateSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        },
       },
     });
     expect(harness.store.turns).toHaveLength(1);
@@ -2262,7 +2364,229 @@ describe("Manus v2 canonical task writer fence", () => {
       id: rejected.id,
       status: "failed",
     });
+    expect(harness.store.turns[0]).toStrictEqual(frozenSource);
+    expect(harness.store.conversation).toMatchObject({
+      status: "failed",
+      version: 3,
+      completedAt: new Date("2026-08-13T00:03:00.000Z"),
+    });
+
+    const stableBuild = structuredClone(harness.store.build);
+    const stableConversation = structuredClone(harness.store.conversation);
+    await expect(
+      normalizeKnowledgeBaseTerminalRejection(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          now: new Date("2026-08-13T00:04:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toEqual(normalized);
+    expect(harness.store.build).toStrictEqual(stableBuild);
+    expect(harness.store.conversation).toStrictEqual(stableConversation);
+    expect(harness.store.turns).toStrictEqual([frozenSource]);
   });
+
+  it("repairs an active-null confirming projection from its locked immutable rejection source", async () => {
+    const oldRecoveryToken = "d".repeat(64);
+    const rejected = turn({
+      status: "failed",
+      leaseExpiresAt: null,
+      completedAt: new Date("2026-08-13T00:01:00.000Z"),
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        providerReasonCategory: "invalid_argument",
+        providerRejectionStatus: 400,
+        recovery: {
+          kind: "start",
+          conversationId: "conversation-1",
+          companyName: "Example",
+          attachments: [],
+        },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "frozen",
+            agentProfile: "frontmind-standard",
+            attachments: [],
+          },
+          bodySha256: "e".repeat(64),
+          preparedAt: "2026-08-13T00:00:00.000Z",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        status: "confirming",
+        activeTurnId: null,
+        canonicalTaskState: "creating",
+        awaitingResponseSince: new Date("2026-08-13T00:01:00.000Z"),
+        recoveryLeaseOwnerHash: "a".repeat(64),
+        recoveryLeaseExpiresAt: new Date("2026-08-13T00:10:00.000Z"),
+        handoffProvenance: {
+          recoverySourceTurnId: rejected.id,
+          terminalRecovery: {
+            schemaVersion: 1,
+            action: "retry_compatible_create",
+            sourceTurnId: rejected.id,
+            sourceGeneration: 3,
+            sourceStateEpoch: 7,
+            sourceRevision: 7,
+            sourceLeafId: "1.8",
+            sourcePresentationKey: "presentation-7",
+            sourceCredentialIdSha256: "f".repeat(64),
+            recoveryStateSha256: oldRecoveryToken,
+            normalizedAt: "2026-08-13T00:01:00.000Z",
+          },
+        },
+      }),
+      conversation: {
+        id: rejected.conversationId,
+        userId: rejected.userId,
+        projectAssignmentId: null,
+        version: 2,
+        status: "running",
+        completedAt: null,
+      },
+      turns: [rejected],
+      turnSelections: [
+        [(store) => store.turns],
+        [(store) => store.turns],
+        [(store) => store.turns],
+      ],
+    });
+    const frozenSource = structuredClone(harness.store.turns[0]);
+
+    const normalized = await normalizeKnowledgeBaseTerminalRejection(
+      {
+        userId: 1,
+        conversationId: "conversation-1",
+        now: new Date("2026-08-13T00:03:00.000Z"),
+      },
+      harness.executor,
+    );
+
+    expect(normalized).toMatchObject({
+      action: "retry_compatible_create",
+      sourceStateEpoch: 8,
+      recoveryStateSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    expect(normalized?.recoveryStateSha256).not.toBe(oldRecoveryToken);
+    expect(harness.store.build).toMatchObject({
+      status: "protocol_error",
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      stateEpoch: 8,
+      awaitingResponseSince: null,
+      recoveryLeaseOwnerHash: null,
+      recoveryLeaseExpiresAt: null,
+      handoffProvenance: { terminalRecovery: normalized },
+    });
+    expect(harness.store.turns[0]).toStrictEqual(frozenSource);
+    expect(harness.store.conversation).toMatchObject({
+      status: "failed",
+      version: 3,
+    });
+
+    const stableBuild = structuredClone(harness.store.build);
+    const stableConversation = structuredClone(harness.store.conversation);
+    await expect(
+      normalizeKnowledgeBaseTerminalRejection(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          now: new Date("2026-08-13T00:04:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toEqual(normalized);
+    expect(harness.store.build).toStrictEqual(stableBuild);
+    expect(harness.store.conversation).toStrictEqual(stableConversation);
+    expect(harness.store.turns[0]).toStrictEqual(frozenSource);
+
+    harness.store.turns[0] = {
+      ...harness.store.turns[0]!,
+      expectedRevision: 6,
+    };
+    const staleSource = structuredClone(harness.store.turns[0]);
+    const stopped = await normalizeKnowledgeBaseTerminalRejection(
+      {
+        userId: 1,
+        conversationId: "conversation-1",
+        now: new Date("2026-08-13T00:05:00.000Z"),
+      },
+      harness.executor,
+    );
+    expect(stopped).toMatchObject({
+      action: "stopped",
+      sourceStateEpoch: 9,
+      sourceRevision: 7,
+    });
+    expect(harness.store.build).toMatchObject({
+      status: "protocol_error",
+      activeTurnId: null,
+      stateEpoch: 9,
+      handoffProvenance: { terminalRecovery: stopped },
+    });
+    expect(harness.store.turns[0]).toStrictEqual(staleSource);
+    expect(harness.store.conversation).toMatchObject({
+      status: "failed",
+      version: 4,
+    });
+  });
+
+  it.each([
+    ["generation", { buildGeneration: 2 }],
+    ["revision", { expectedRevision: 6 }],
+    ["leaf", { expectedLeafId: "1.7" }],
+  ] as const)(
+    "does not normalize a rejected active turn across a stale %s fence",
+    async (_fence, staleCoordinate) => {
+      const rejected = turn({
+        ...staleCoordinate,
+        status: "failed",
+        leaseExpiresAt: null,
+        metadata: {
+          providerProtocol: "manus_v2",
+          providerMethod: "task.create",
+          providerAttemptState: "rejected",
+          createAttemptState: "rejected",
+          providerReasonCategory: "invalid_argument",
+          providerRejectionStatus: 400,
+        },
+      });
+      const harness = createTurnServiceExecutor({
+        build: build({ status: "confirming", activeTurnId: rejected.id }),
+        conversation: {
+          id: rejected.conversationId,
+          userId: rejected.userId,
+          projectAssignmentId: null,
+          version: 2,
+          status: "running",
+        },
+        turns: [rejected],
+        turnSelections: [[(store) => store.turns]],
+      });
+      const frozen = structuredClone(harness.store);
+
+      await expect(
+        normalizeKnowledgeBaseTerminalRejection(
+          { userId: 1, conversationId: "conversation-1" },
+          harness.executor,
+        ),
+      ).resolves.toBeNull();
+      expect(harness.store).toStrictEqual(frozen);
+    },
+  );
 
   it("rewrites a historical minimal retry coordinate to non-executable stopped", async () => {
     const rejected = turn({
@@ -4718,7 +5042,7 @@ describe("Manus v2 canonical task writer fence", () => {
     ).resolves.toBeNull();
   });
 
-  it("retries only an explicit v2 rejection against the same frozen create request", async () => {
+  it("terminalizes an explicit v2 create rejection without scheduling a provider retry", async () => {
     const leaseToken = "explicit-create-rejection";
     const activeTurn = turn({
       metadata: {
@@ -4729,6 +5053,20 @@ describe("Manus v2 canonical task writer fence", () => {
         operationToken: "operation-1",
         frozenProviderRequestHash: "f".repeat(64),
         attachmentsFrozen: true,
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        recovery: { kind: "start", conversationId: "conversation-1" },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "frozen",
+            agentProfile: "frontmind-standard",
+            attachments: [],
+          },
+          bodySha256: "e".repeat(64),
+          preparedAt: "2026-08-01T00:00:00.000Z",
+        },
         leaseOwnerHash: createHash("sha256")
           .update(leaseToken, "utf8")
           .digest("hex"),
@@ -4741,6 +5079,13 @@ describe("Manus v2 canonical task writer fence", () => {
         canonicalTaskGeneration: 3,
       }),
       turns: [activeTurn],
+      conversation: {
+        id: activeTurn.conversationId,
+        userId: activeTurn.userId,
+        projectAssignmentId: null,
+        version: 1,
+        status: "running",
+      },
       turnSelections: [[(store) => store.turns]],
     });
     await expect(
@@ -4751,31 +5096,45 @@ describe("Manus v2 canonical task writer fence", () => {
           leaseToken,
           code: "MANUS_V2_CREATE_REJECTED",
           retryable: true,
-          // This mirrors a real, provider-supplied Retry-After value.
           recoveryDelayMs: 7_000,
+          providerCode: "invalid_argument",
+          providerStatus: 400,
           now: new Date("2026-08-01T00:00:00.000Z"),
         },
         harness.executor,
       ),
     ).resolves.toMatchObject({
-      retryScheduled: true,
+      retryScheduled: false,
       attempt: 1,
-      delayMs: 7_000,
+      delayMs: 0,
     });
-    expect(harness.store.turns[0]?.metadata).toMatchObject({
-      createAttemptState: "not_sent",
-      providerAttemptState: "not_sent",
-      providerRejectionCount: 1,
-      frozenProviderRequestHash: "f".repeat(64),
-      operationToken: "operation-1",
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      leaseExpiresAt: null,
+      metadata: {
+        createAttemptState: "rejected",
+        providerAttemptState: "rejected",
+        providerRejectionCount: 1,
+        dispatchState: "failed",
+        recoveryAction: "retry_request",
+        frozenProviderRequestHash: "f".repeat(64),
+        operationToken: "operation-1",
+      },
     });
     expect(harness.store.build).toMatchObject({
       canonicalTaskId: null,
-      canonicalTaskState: "unbound",
+      canonicalTaskState: "attention_required",
+      status: "protocol_error",
+      activeTurnId: null,
+      handoffProvenance: {
+        recoverySourceTurnId: activeTurn.id,
+        terminalRecovery: { action: "retry_compatible_create" },
+      },
     });
+    expect(harness.store.conversation).toMatchObject({ status: "failed" });
   });
 
-  it("puts an exhausted v2 rejection in local attention without revoking the anchor", async () => {
+  it("stops a send rejection when no accepted snapshot authority exists", async () => {
     const leaseToken = "explicit-send-rejection";
     const activeTurn = turn({
       metadata: {
@@ -4824,11 +5183,15 @@ describe("Manus v2 canonical task writer fence", () => {
       canonicalTaskId: "canonical-task",
       canonicalTaskState: "attention_required",
       protocolErrorCode: "MANUS_V2_SEND_REJECTED",
+      handoffProvenance: {
+        terminalRecovery: { action: "stopped" },
+      },
     });
     expect(harness.store.turns[0]?.metadata).toMatchObject({
       createAttemptState: "rejected",
       providerAttemptState: "rejected",
       providerRejectionCount: 4,
+      recoveryAction: "contact_support",
     });
     harness.store.turns[0]!.leaseExpiresAt = new Date(
       "2026-08-01T00:00:00.000Z",
@@ -4853,19 +5216,26 @@ describe("Manus v2 canonical task writer fence", () => {
     });
   });
 
-  it("never reclaims a nonretryable rejected v2 create after its lease expires", async () => {
+  it("terminalizes a rejected recovery claim despite legacy repair metadata and a future lease", async () => {
     const rejectedTurn = turn({
       status: "running",
-      leaseExpiresAt: new Date("2026-08-01T00:00:00.000Z"),
+      leaseExpiresAt: new Date("2026-08-01T01:00:00.000Z"),
       metadata: {
         providerProtocol: "manus_v2",
         providerMethod: "task.create",
         providerAttemptState: "rejected",
         createAttemptState: "rejected",
-        operationToken: "operation-1",
-        frozenProviderRequestHash: "f".repeat(64),
+        providerReasonCategory: "invalid_argument",
+        providerRejectionStatus: 400,
         providerRejectionCount: 1,
         attachmentsFrozen: true,
+        dispatchState: "recovering",
+        failureClass: "recoverable_same_turn",
+        recoveryAction: "reconcile",
+        repairKind: "canonical_credential_rebind",
+        manusV2Lifecycle: {
+          attentionCode: "LEGACY_RECOVERY_ATTENTION",
+        },
       },
     });
     const harness = createTurnServiceExecutor({
@@ -4897,12 +5267,22 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(harness.store.turns[0]?.metadata).toMatchObject({
       providerAttemptState: "rejected",
       createAttemptState: "rejected",
+      dispatchState: "failed",
+      recoveryAction: "contact_support",
     });
     expect(harness.store.build).toMatchObject({
       canonicalTaskId: null,
       canonicalTaskState: "attention_required",
       protocolErrorCode: "MANUS_V2_CREATE_REJECTED",
+      status: "protocol_error",
+      activeTurnId: null,
+      stateEpoch: 8,
+      handoffProvenance: {
+        recoverySourceTurnId: rejectedTurn.id,
+        terminalRecovery: { action: "stopped" },
+      },
     });
+    expect(harness.store.conversation).toMatchObject({ status: "failed" });
   });
 
   it("terminalizes a historical bound local-rehydrate rejection as new-canonical authority", async () => {

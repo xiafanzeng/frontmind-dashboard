@@ -1173,6 +1173,24 @@ export function applyKnowledgeBasePresentationProjectionGuard(input: {
   };
 }
 
+export function knowledgeBaseRetainedStartMayReplaceNotice(
+  notice: KnowledgeBaseObservationDto["notice"],
+) {
+  if (!notice) return true;
+  if (
+    notice.recoveryAction === "stopped" ||
+    notice.code === "FRONTMIND_KB_STOPPED"
+  ) {
+    return false;
+  }
+  return !(
+    (notice.recoveryAction === "retry_request" ||
+      notice.recoveryAction === "start_new_generation") &&
+    typeof notice.recoveryToken === "string" &&
+    /^[a-f0-9]{64}$/u.test(notice.recoveryToken)
+  );
+}
+
 export async function getKnowledgeBaseObservation(input: {
   userId: number;
   conversationId: string;
@@ -1190,7 +1208,8 @@ export async function getKnowledgeBaseObservation(input: {
     progress.build.revision === 0 &&
     progress.build.currentLeafId === null &&
     (progress.build.status === "failed" ||
-      progress.build.status === "protocol_error")
+      progress.build.status === "protocol_error") &&
+    knowledgeBaseRetainedStartMayReplaceNotice(observation.notice)
   ) {
     const preview =
       await previewKnowledgeBaseIncidentRepairFromSignedImageMaintenance({

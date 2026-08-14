@@ -943,6 +943,409 @@ describe("knowledge-base production final-package acceptance", () => {
     if (assetRoot) await rm(assetRoot, { recursive: true, force: true });
   });
 
+  it("reconciles the production confirming create rejection into one stable public action without a provider request", async () => {
+    const state = initialState();
+    const buildId = "19191919-1919-4191-8191-191919191919";
+    const turnId = "20202020-2020-4202-8202-202020202020";
+    const now = new Date("2026-08-14T07:52:00.000Z");
+    state.builds.push({
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      providerProtocol: "manus_v2",
+      canonicalTaskId: null,
+      canonicalTaskGeneration: null,
+      canonicalCredentialId: null,
+      canonicalTaskState: "creating",
+      canonicalTaskUrl: null,
+      canonicalTaskCreatedAt: null,
+      handoffProvenance: null,
+      skillName: "socratic-kb-builder",
+      skillVersion: "4",
+      skillContentHash: "7".repeat(64),
+      skillArchiveSha256: "8".repeat(64),
+      skillArchiveBytes: 128,
+      skillArchiveStorageKey: "skills/frontmind.zip",
+      treePolicyVersion: 2,
+      initialResearchCoverage: null,
+      status: "confirming",
+      generation: 1,
+      stateEpoch: 96,
+      revision: 0,
+      currentLeafId: null,
+      totalNodeCount: 0,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      activeTurnId: turnId,
+      upstreamTaskId: null,
+      lastAppliedOperationKey: null,
+      currentPresentationKey: null,
+      recoveryLeaseOwnerHash: null,
+      recoveryLeaseExpiresAt: null,
+      lastReconciledHash: null,
+      lastOutputLength: 0,
+      lastOutputItemIds: [],
+      lastTurnUserText: "开始构建企业知识库",
+      lastTurnAttachmentCount: 0,
+      awaitingResponseSince: now,
+      contentCompletedAt: null,
+      packageStatus: "not_started",
+      packageAttemptCount: 0,
+      packageNextRetryAt: null,
+      packageLastErrorCode: null,
+      packageRevision: null,
+      packageTaskId: null,
+      packageOutputItemId: null,
+      packageFileId: null,
+      packageFilename: null,
+      packageDescriptorHash: null,
+      packageStorageKey: null,
+      packageArchiveSha256: null,
+      packageSizeBytes: null,
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
+      protocolErrorCode: "MANUS_V2_CREATE_REJECTED",
+      protocolError: "provider detail must stay private",
+      publishedSnapshotId: null,
+      completedAt: null,
+      publishedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.turns.push({
+      id: turnId,
+      conversationId: STORED_CONVERSATION_ID,
+      userId: USER_ID,
+      apiCredentialId: "credential-e2e",
+      clientRequestId: "request-confirming-create-rejected",
+      buildId,
+      buildGeneration: 1,
+      operationKey: "operation-confirming-create-rejected",
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      requestHash: "a".repeat(64),
+      upstreamIdempotencyKeyHash: "b".repeat(64),
+      attachmentFileIds: [],
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        providerReasonCategory: "invalid_argument",
+        providerRejectionStatus: 400,
+        operationToken: "operation-confirming-create-rejected",
+        expectedAttachmentCount: 0,
+        userAttachmentCount: 0,
+        recovery: {
+          kind: "start",
+          conversationId: PUBLIC_CONVERSATION_ID,
+          companyName: "FrontMind超前智能",
+          attachments: [],
+        },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "frozen",
+            agentProfile: "frontmind-standard",
+            attachments: [],
+          },
+          bodySha256: "c".repeat(64),
+          preparedAt: now.toISOString(),
+        },
+      },
+      leaseExpiresAt: null,
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "MANUS_V2_CREATE_REJECTED",
+      errorMessage: "provider detail must stay private",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    dependencies.getDb.mockResolvedValue(
+      memoryDatabase(state, { transactional: true }),
+    );
+
+    let providerRequests = 0;
+    const provider = express();
+    provider.use((_req, res) => {
+      providerRequests += 1;
+      res.status(500).json({ error: "provider must not be called" });
+    });
+    const providerListener = await listen(provider);
+    const previousUpstreamBaseUrl = dependencies.upstreamBaseUrl;
+    dependencies.upstreamBaseUrl = providerListener.baseUrl;
+    let dashboardListener: Awaited<ReturnType<typeof listen>> | undefined;
+    try {
+      const { default: knowledgeBaseRouter } = await import(
+        "./knowledge-base-api"
+      );
+      const { requireExpressAuth } = await import("./_core/express-auth");
+      const dashboard = express();
+      dashboard.use(express.json());
+      dashboard.use(
+        "/api/knowledge-base",
+        requireExpressAuth,
+        knowledgeBaseRouter,
+      );
+      dashboardListener = await listen(dashboard);
+      const reconcile = () =>
+        fetch(
+          `${dashboardListener!.baseUrl}/api/knowledge-base/progress/reconcile`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-test-auth": "user",
+            },
+            body: JSON.stringify({ conversationId: PUBLIC_CONVERSATION_ID }),
+          },
+        );
+
+      const frozenSource = structuredClone(state.turns[0]);
+      const firstResponse = await reconcile();
+      expect(firstResponse.status).toBe(200);
+      const first = (await firstResponse.json()) as any;
+      expect(first).toMatchObject({
+        observation: {
+          stateEpoch: 97,
+          syncState: "attention_required",
+          activeTurn: null,
+          notice: {
+            code: "FRONTMIND_KB_RETRY_AVAILABLE",
+            recoveryAction: "retry_request",
+            recoveryToken: expect.stringMatching(/^[a-f0-9]{64}$/u),
+            turnId: null,
+          },
+          interaction: {
+            interactionState: "failed",
+            progress: { build: { status: "protocol_error" } },
+          },
+        },
+      });
+      expect(state.builds[0]).toMatchObject({
+        status: "protocol_error",
+        activeTurnId: null,
+        canonicalTaskState: "attention_required",
+        stateEpoch: 97,
+        awaitingResponseSince: null,
+        handoffProvenance: {
+          recoverySourceTurnId: turnId,
+          terminalRecovery: {
+            action: "retry_compatible_create",
+            recoveryStateSha256: first.observation.notice.recoveryToken,
+          },
+        },
+      });
+      expect(state.conversations[0]).toMatchObject({
+        status: "failed",
+        version: 1,
+        completedAt: expect.any(Date),
+      });
+      expect(state.turns[0]).toStrictEqual(frozenSource);
+      expect(first.observation.interaction.interactionState).not.toBe(
+        "executing",
+      );
+      expect(JSON.stringify(first).toLowerCase()).not.toContain("manus");
+      expect(JSON.stringify(first)).not.toContain("系统正在恢复当前操作");
+      expect(providerRequests).toBe(0);
+
+      const stableBuild = structuredClone(state.builds[0]);
+      const stableConversation = structuredClone(state.conversations[0]);
+      const stableTurn = structuredClone(state.turns[0]);
+      const secondResponse = await reconcile();
+      expect(secondResponse.status).toBe(200);
+      const second = (await secondResponse.json()) as any;
+      expect(second.observation).toMatchObject({
+        stateEpoch: 97,
+        syncState: "attention_required",
+        activeTurn: null,
+        notice: {
+          recoveryAction: "retry_request",
+          recoveryToken: first.observation.notice.recoveryToken,
+        },
+        interaction: { interactionState: "failed" },
+      });
+      expect(state.builds[0]).toStrictEqual(stableBuild);
+      expect(state.conversations[0]).toStrictEqual(stableConversation);
+      expect(state.turns[0]).toStrictEqual(stableTurn);
+      expect(state.turns).toHaveLength(1);
+      expect(providerRequests).toBe(0);
+
+      const generationTwoTurnId = "21212121-2121-4212-8212-212121212121";
+      state.builds[0] = {
+        ...state.builds[0]!,
+        generation: 2,
+        stateEpoch: 38,
+        status: "protocol_error",
+        activeTurnId: generationTwoTurnId,
+        canonicalTaskId: null,
+        canonicalTaskGeneration: 2,
+        canonicalCredentialId: "credential-e2e",
+        canonicalTaskState: "creating",
+        handoffProvenance: {
+          schemaVersion: 1,
+          sourceGeneration: 1,
+          targetGeneration: 2,
+          credentialMode: "current_rebind",
+        },
+        awaitingResponseSince: now,
+      };
+      state.turns[0] = {
+        ...state.turns[0]!,
+        id: generationTwoTurnId,
+        clientRequestId: "request-generation-two-create-rejected",
+        buildGeneration: 2,
+        operationKey: "operation-generation-two-create-rejected",
+        status: "running",
+        leaseExpiresAt: new Date("2026-08-14T08:10:00.000Z"),
+        completedAt: null,
+        metadata: {
+          attachmentsFrozen: true,
+          providerProtocol: "manus_v2",
+          providerMethod: "task.create",
+          providerAttemptState: "rejected",
+          createAttemptState: "rejected",
+          providerReasonCategory: "invalid_argument",
+          providerRejectionStatus: 400,
+          dispatchState: "recovering",
+          failureClass: "recoverable_same_turn",
+          recoveryAction: "reconcile",
+          canRegenerate: false,
+          repairKind: "canonical_credential_rebind",
+          operationToken: "operation-generation-two-create-rejected",
+          expectedAttachmentCount: 0,
+          userAttachmentCount: 0,
+          recovery: {
+            kind: "start",
+            conversationId: PUBLIC_CONVERSATION_ID,
+            companyName: "FrontMind超前智能",
+            attachments: [],
+          },
+          preparedDispatch: {
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "frozen generation two",
+              agentProfile: "frontmind-standard",
+              attachments: [],
+            },
+            bodySha256: "d".repeat(64),
+            preparedAt: now.toISOString(),
+          },
+        },
+      };
+      state.conversations[0] = {
+        ...state.conversations[0]!,
+        status: "running",
+        version: 4,
+        completedAt: null,
+      };
+
+      const generationTwoResponse = await reconcile();
+      expect(generationTwoResponse.status).toBe(200);
+      const generationTwo = (await generationTwoResponse.json()) as any;
+      expect(generationTwo.observation).toMatchObject({
+        stateEpoch: 39,
+        generation: 2,
+        syncState: "attention_required",
+        activeTurn: null,
+        notice: {
+          code: "FRONTMIND_KB_RETRY_AVAILABLE",
+          recoveryAction: "retry_request",
+          recoveryToken: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        },
+        interaction: {
+          interactionState: "failed",
+          progress: { build: { status: "protocol_error" } },
+        },
+      });
+      expect(state.builds[0]).toMatchObject({
+        generation: 2,
+        stateEpoch: 39,
+        status: "protocol_error",
+        activeTurnId: null,
+        canonicalTaskState: "attention_required",
+        handoffProvenance: {
+          sourceGeneration: 1,
+          targetGeneration: 2,
+          recoverySourceTurnId: generationTwoTurnId,
+          terminalRecovery: {
+            action: "retry_compatible_create",
+            recoveryStateSha256:
+              generationTwo.observation.notice.recoveryToken,
+          },
+        },
+      });
+      expect(state.turns[0]).toMatchObject({
+        id: generationTwoTurnId,
+        status: "failed",
+        upstreamTaskId: null,
+        leaseExpiresAt: null,
+        metadata: {
+          createAttemptState: "rejected",
+          providerAttemptState: "rejected",
+          dispatchState: "failed",
+          failureClass: "requires_user_fix",
+          recoveryAction: "retry_request",
+        },
+      });
+      expect(state.conversations[0]).toMatchObject({
+        status: "failed",
+        version: 5,
+        completedAt: expect.any(Date),
+      });
+      expect(JSON.stringify(generationTwo).toLowerCase()).not.toContain(
+        "manus",
+      );
+      expect(JSON.stringify(generationTwo)).not.toContain(
+        "系统正在恢复当前操作",
+      );
+      expect(providerRequests).toBe(0);
+
+      const stableGenerationTwoBuild = structuredClone(state.builds[0]);
+      const stableGenerationTwoTurn = structuredClone(state.turns[0]);
+      const stableGenerationTwoConversation = structuredClone(
+        state.conversations[0],
+      );
+      const repeatedGenerationTwoResponse = await reconcile();
+      expect(repeatedGenerationTwoResponse.status).toBe(200);
+      expect(
+        ((await repeatedGenerationTwoResponse.json()) as any).observation,
+      ).toMatchObject({
+        stateEpoch: 39,
+        activeTurn: null,
+        notice: {
+          recoveryAction: "retry_request",
+          recoveryToken: generationTwo.observation.notice.recoveryToken,
+        },
+        interaction: { interactionState: "failed" },
+      });
+      expect(state.builds[0]).toStrictEqual(stableGenerationTwoBuild);
+      expect(state.turns[0]).toStrictEqual(stableGenerationTwoTurn);
+      expect(state.conversations[0]).toStrictEqual(
+        stableGenerationTwoConversation,
+      );
+      expect(providerRequests).toBe(0);
+    } finally {
+      dependencies.upstreamBaseUrl = previousUpstreamBaseUrl;
+      await Promise.all([
+        close(dashboardListener?.server),
+        close(providerListener.server),
+      ]);
+    }
+  });
+
   it("recovers a completed v4 zero-image Manifest from the same source task without creating another turn", async () => {
     const fixture = await createFinalPackageFixture();
     const state = initialState();

@@ -73,35 +73,13 @@ function isValidRetryableFailedActiveTurn(
   );
 }
 
-/**
- * A terminal provider-create rejection remains the build's active turn so the
- * progress projection can explain the failure. It is valid history, but it is
- * deliberately not retry authority. Keep that distinction separate from
- * `inspectKnowledgeBaseRetryAuthority`: conflating the two blocks every
- * knowledge-base write as soon as the invariant audit sees a read-only failed
- * turn.
- *
- * Explicit `rejected` is the current durable contract. The narrow legacy case
- * covers deterministic provider-create failures written before
- * `createAttemptState` existed; it grants no mutation capability and requires
- * the same terminal/contact-support metadata.
- */
-function isValidReadOnlyFailedActiveTurn(
+function isValidReadOnlyLegacyCreateRejection(
   build: KnowledgeBaseBuild,
   turn: ConversationTurn,
 ) {
+  const metadata = (turn.metadata || {}) as Record<string, unknown>;
   return Boolean(
-    build.status === "protocol_error" &&
-      turn.status === "failed" &&
-      !turn.upstreamTaskId &&
-      turn.errorCode &&
-      turn.errorCode === build.protocolErrorCode &&
-      turn.buildGeneration === build.generation &&
-      turn.expectedRevision === build.revision &&
-      (turn.expectedLeafId ?? null) === (build.currentLeafId ?? null) &&
-      turn.completedAt &&
-      turn.leaseExpiresAt === null &&
-      turn.operationKey &&
+    metadata.createAttemptState === undefined &&
       inspectKnowledgeBaseTerminalTaskCreateRejectionAuthority(turn, build) &&
       !inspectKnowledgeBaseRetryAuthority(turn, build),
   );
@@ -161,7 +139,7 @@ export function findKnowledgeBaseInvariantViolations(input: {
           active.status === "queued" ||
           active.status === "running" ||
           isValidRetryableFailedActiveTurn(build, active) ||
-          isValidReadOnlyFailedActiveTurn(build, active) ||
+          isValidReadOnlyLegacyCreateRejection(build, active) ||
           isValidReadOnlyLegacyProtocolFailedActiveTurn(build, active)
         )
       ) {

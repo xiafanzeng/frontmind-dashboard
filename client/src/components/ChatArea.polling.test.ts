@@ -7,6 +7,9 @@ import {
   knowledgeBaseNoticeRequiresLogoProvenanceRepair,
   knowledgeBaseNoticeRetryLabel,
   knowledgeBasePackageRebindResolved,
+  knowledgeBaseReconcileResultChangedCoordinate,
+  knowledgeBaseReconcileResultIsStopped,
+  knowledgeBaseReconcileResultRequiresConfirmation,
   knowledgeBaseSameTurnRecoveryAccepted,
   readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
@@ -211,6 +214,93 @@ describe("knowledge-base notice recovery", () => {
     expect(
       knowledgeBaseNoticeRetryLabel({ code: "PROGRESS_PROTOCOL_INVALID" }),
     ).toBe("");
+  });
+
+  it("stops an old reconcile click at the new explicit confirmation point", async () => {
+    const explicitObservation = {
+      notice: {
+        code: "FRONTMIND_KB_RETRY_AVAILABLE",
+        recoveryAction: "retry_request",
+        recoveryToken: "a".repeat(64),
+        canRegenerate: false,
+      },
+      interaction: { progress: null },
+    } as any;
+    const reconcile = vi.fn().mockResolvedValue(explicitObservation);
+    const execute = vi.fn();
+
+    const observation = await recoverKnowledgeBaseNotice(
+      {
+        ...input,
+        notice: {
+          code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+          recoveryAction: "reconcile",
+        },
+      },
+      { reconcile, execute },
+    );
+
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    expect(knowledgeBaseReconcileResultRequiresConfirmation(observation)).toBe(
+      true,
+    );
+    expect(knowledgeBaseNoticeRetryLabel(observation.notice!)).toBe(
+      "确认后继续本轮",
+    );
+  });
+
+  it("reports a stopped reconcile result without treating it as unrestored", async () => {
+    const stoppedObservation = {
+      notice: {
+        code: "FRONTMIND_KB_STOPPED",
+        recoveryAction: "stopped",
+        recoveryToken: "b".repeat(64),
+        canRegenerate: false,
+      },
+      interaction: { progress: null },
+    } as any;
+    const reconcile = vi.fn().mockResolvedValue(stoppedObservation);
+    const execute = vi.fn();
+
+    const observation = await recoverKnowledgeBaseNotice(
+      {
+        ...input,
+        notice: {
+          code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+          recoveryAction: "reconcile",
+        },
+      },
+      { reconcile, execute },
+    );
+
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    expect(knowledgeBaseReconcileResultRequiresConfirmation(observation)).toBe(
+      false,
+    );
+    expect(knowledgeBaseReconcileResultIsStopped(observation)).toBe(true);
+  });
+
+  it("recognizes a reconcile result that advanced the authoritative coordinate", () => {
+    expect(
+      knowledgeBaseReconcileResultChangedCoordinate(
+        { generation: 2, stateEpoch: 39 },
+        { generation: 2, stateEpoch: 38 },
+      ),
+    ).toBe(true);
+    expect(
+      knowledgeBaseReconcileResultChangedCoordinate(
+        { generation: 3, stateEpoch: 1 },
+        { generation: 2, stateEpoch: 38 },
+      ),
+    ).toBe(true);
+    expect(
+      knowledgeBaseReconcileResultChangedCoordinate(
+        { generation: 2, stateEpoch: 38 },
+        { generation: 2, stateEpoch: 38 },
+      ),
+    ).toBe(false);
   });
 
   it.each([

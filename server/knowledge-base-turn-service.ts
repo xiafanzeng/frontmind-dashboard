@@ -11787,8 +11787,6 @@ export async function deferKnowledgeBaseManusV2AnchorHandoffAfterRejection(
   );
 }
 
-const MAX_MANUS_V2_EXPLICIT_REJECTION_RETRIES = 3;
-
 const MANUS_V2_CREDENTIAL_REJECTION =
   /(?:permission[_-]?denied|unauth|forbidden|invalid[_-]?(?:api[_-]?)?key|credential)/iu;
 
@@ -11824,30 +11822,6 @@ export function knowledgeBaseManusV2TerminalRejectionAuthority(input: {
       } as const);
 }
 
-function explicitManusV2RejectionDelayMs(
-  metadata: KnowledgeBaseTurnMetadata,
-  nextAttempt: number,
-  providerRetryAfterMs: number | undefined,
-) {
-  // Honour Retry-After only when the provider actually supplied it. A zero
-  // value is meaningful and must not be silently replaced by our fallback.
-  if (providerRetryAfterMs !== undefined) {
-    return Math.min(
-      60 * 60 * 1_000,
-      Math.max(0, Math.trunc(providerRetryAfterMs)),
-    );
-  }
-  const exponent = Math.min(nextAttempt - 1, 5);
-  const base = Math.min(60_000, 1_000 * 2 ** exponent);
-  const seed =
-    createHash("sha256")
-      .update(`${metadata.operationToken || ""}:${nextAttempt}`, "utf8")
-      .digest()[0] ?? 0;
-  // A deterministic 0–20% jitter distributes same-time retries while keeping
-  // tests and recovery behaviour reproducible for a frozen operation token.
-  return base + Math.floor((base * (seed % 21)) / 100);
-}
-
 function knowledgeBaseExplicitRecoveryAction(input: {
   turn: ConversationTurn;
   build: KnowledgeBaseBuild;
@@ -11855,6 +11829,18 @@ function knowledgeBaseExplicitRecoveryAction(input: {
 }): KnowledgeBaseExplicitRecoveryAction {
   const { turn, build, metadata } = input;
   const recovery = retryAuthorityRecord(metadata.recovery);
+  const preparedDispatch = metadata.preparedDispatch;
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  const localRehydrateRequired = retryAuthorityRecord(
+    provenance?.localRehydrateRequired,
+  );
+  if (
+    turn.buildGeneration !== build.generation ||
+    turn.expectedRevision !== build.revision ||
+    (turn.expectedLeafId ?? null) !== (build.currentLeafId ?? null)
+  ) {
+    return "stopped";
+  }
   if (
     metadata.repairKind === "explicit_compatible_create" ||
     recovery?.compatibilityMode === "minimal_v2_create"
@@ -11867,6 +11853,9 @@ function knowledgeBaseExplicitRecoveryAction(input: {
     metadata.providerMethod === "task.create" &&
     turn.upstreamTaskId === null &&
     build.canonicalTaskId === null &&
+    build.upstreamTaskId === null &&
+    Boolean(preparedDispatch) &&
+    Boolean(recovery) &&
     providerStatus === 400 &&
     /(?:invalid[_-]?argument|HTTP_400)/iu.test(providerCode)
   ) {
@@ -11876,8 +11865,14 @@ function knowledgeBaseExplicitRecoveryAction(input: {
     metadata.providerMethod === "task.sendMessage" &&
     Boolean(build.canonicalTaskId) &&
     Boolean(build.canonicalCredentialId) &&
-    (turn.upstreamTaskId === null ||
-      turn.upstreamTaskId === build.canonicalTaskId)
+    build.canonicalTaskGeneration === build.generation &&
+    localRehydrateRequired?.generation === build.generation &&
+    localRehydrateRequired?.revision === build.revision &&
+    localRehydrateRequired?.leafId === build.currentLeafId &&
+    localRehydrateRequired?.taskIdSha256 === sha256(build.canonicalTaskId!) &&
+    typeof localRehydrateRequired?.snapshotSha256 === "string" &&
+    typeof localRehydrateRequired?.sourceTurnId === "string" &&
+    turn.upstreamTaskId === build.canonicalTaskId
   ) {
     return "create_new_canonical_from_snapshot";
   }
@@ -11952,6 +11947,171 @@ function knowledgeBaseTerminalRecoveryFromBuild(
   return recovery as unknown as KnowledgeBaseExplicitRecoveryCoordinate;
 }
 
+function isKnowledgeBaseTerminalRejectionEvidence(input: {
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+}) {
+  const { turn, build, metadata } = input;
+  return (
+    build.providerProtocol === "manus_v2" &&
+    metadata.providerProtocol === "manus_v2" &&
+    metadata.providerAttemptState === "rejected" &&
+    storedKnowledgeBaseCreateAttemptState(metadata) === "rejected" &&
+    (metadata.providerMethod === "task.create" ||
+      metadata.providerMethod === "task.sendMessage") &&
+    metadata.outcomeUnknownAt === undefined &&
+    ["queued", "running", "failed"].includes(turn.status) &&
+    ["researching", "confirming", "protocol_error", "failed"].includes(
+      build.status,
+    )
+  );
+}
+
+function isKnowledgeBaseTerminalRejectionSource(input: {
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+}) {
+  return (
+    isKnowledgeBaseTerminalRejectionEvidence(input) &&
+    input.turn.buildGeneration === input.build.generation &&
+    input.turn.expectedRevision === input.build.revision &&
+    (input.turn.expectedLeafId ?? null) ===
+      (input.build.currentLeafId ?? null)
+  );
+}
+
+async function settleLockedKnowledgeBaseTerminalRejection(input: {
+  tx: any;
+  userId: number;
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+  code: string;
+  now: Date;
+}) {
+  const { tx, turn, build, metadata, now } = input;
+  if (
+    build.activeTurnId !== turn.id ||
+    !isKnowledgeBaseTerminalRejectionSource({ turn, build, metadata })
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Only a proven terminal provider rejection can release the writer fence",
+    );
+  }
+  const code = normalizeRequiredId(input.code, "code", 128);
+  const coordinate = knowledgeBaseExplicitRecoveryCoordinate({
+    turn,
+    build,
+    metadata,
+    nextStateEpoch: build.stateEpoch + 1,
+    now,
+  });
+  const terminalMessage =
+    coordinate.action === "retry_compatible_create"
+      ? "当前请求已明确被拒绝；需要你确认后才能使用兼容方式继续。"
+      : coordinate.action === "create_new_canonical_from_snapshot"
+        ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
+        : "本轮已停止，不会自动重发。已完成内容不受影响。";
+  const protocolErrorCode =
+    coordinate.action === "create_new_canonical_from_snapshot"
+      ? "MANUS_V2_LOCAL_REHYDRATE_REJECTED"
+      : code;
+  const terminalMetadata: KnowledgeBaseTurnMetadata = {
+    ...metadata,
+    createAttemptState: "rejected",
+    createAttemptUpdatedAt:
+      metadata.createAttemptUpdatedAt || now.toISOString(),
+    providerAttemptState: "rejected",
+    dispatchState: "failed",
+    failureClass:
+      coordinate.action === "stopped"
+        ? "terminal_nonregenerable"
+        : "requires_user_fix",
+    recoveryAction:
+      coordinate.action === "retry_compatible_create"
+        ? "retry_request"
+        : coordinate.action === "create_new_canonical_from_snapshot"
+          ? "create_new_canonical_from_snapshot"
+          : "contact_support",
+    canRegenerate: false,
+  };
+  delete terminalMetadata.leaseOwnerHash;
+  const provenance = retryAuthorityRecord(build.handoffProvenance) || {};
+  const buildUpdated = await tx
+    .update(knowledgeBaseBuilds)
+    .set({
+      status: "protocol_error",
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      handoffProvenance: {
+        ...provenance,
+        recoverySourceTurnId: turn.id,
+        terminalRecovery: coordinate,
+      },
+      protocolErrorCode,
+      protocolError: terminalMessage,
+      stateEpoch: build.stateEpoch + 1,
+      recoveryLeaseOwnerHash: null,
+      recoveryLeaseExpiresAt: null,
+      awaitingResponseSince: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.id, build.id),
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.generation, build.generation),
+        eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
+        eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+      ),
+    );
+  if (!buildUpdated[0]?.affectedRows) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The rejected knowledge-base writer fence changed before settlement",
+    );
+  }
+  if (turn.status !== "failed") {
+    const turnUpdated = await tx
+      .update(conversationTurns)
+      .set({
+        status: "failed",
+        errorCode: protocolErrorCode,
+        errorMessage: terminalMessage,
+        completedAt: turn.completedAt ?? now,
+        leaseExpiresAt: null,
+        metadata: terminalMetadata,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          inArray(conversationTurns.status, ["queued", "running"]),
+        ),
+      );
+    if (!turnUpdated[0]?.affectedRows) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The rejected knowledge-base turn changed before settlement",
+      );
+    }
+  }
+  await markKnowledgeBaseConversationFailedInTransaction({
+    tx,
+    userId: input.userId,
+    conversationId: turn.conversationId,
+    authoritativeTaskId: build.canonicalTaskId,
+    failedAt: now,
+  });
+  return coordinate;
+}
+
 /**
  * Repairs the historical projection where an explicitly rejected provider
  * write was left as the active writer forever. This transaction is strictly
@@ -11985,7 +12145,28 @@ export async function normalizeKnowledgeBaseTerminalRejection(
     if (!build) return null;
     const existing = knowledgeBaseTerminalRecoveryFromBuild(build);
     if (!build.activeTurnId) {
-      if (!existing || existing.action !== "retry_compatible_create") {
+      if (!existing) return null;
+      const coordinateIsCurrent =
+        existing.sourceGeneration === build.generation &&
+        existing.sourceStateEpoch === build.stateEpoch &&
+        existing.sourceRevision === build.revision &&
+        (existing.sourceLeafId ?? null) === (build.currentLeafId ?? null) &&
+        (existing.sourcePresentationKey ?? null) ===
+          (build.currentPresentationKey ?? null);
+      const projectionNeedsRepair =
+        build.status === "researching" || build.status === "confirming";
+      if (
+        !projectionNeedsRepair &&
+        coordinateIsCurrent &&
+        existing.action === "stopped"
+      ) {
+        return existing;
+      }
+      if (
+        !["researching", "confirming", "protocol_error", "failed"].includes(
+          build.status,
+        )
+      ) {
         return existing;
       }
       const source = (
@@ -12003,53 +12184,86 @@ export async function normalizeKnowledgeBaseTerminalRejection(
           .for("update")
       )[0] as ConversationTurn | undefined;
       const sourceMetadata = source ? metadataOf(source) : null;
-      const sourceRecovery = sourceMetadata
-        ? retryAuthorityRecord(sourceMetadata.recovery)
-        : null;
       if (
-        source &&
-        sourceMetadata &&
-        sourceRecovery &&
-        sourceMetadata.repairKind !== "explicit_compatible_create" &&
-        sourceRecovery.compatibilityMode !== "minimal_v2_create"
+        !source ||
+        source.status !== "failed" ||
+        !sourceMetadata ||
+        !isKnowledgeBaseTerminalRejectionEvidence({
+          turn: source,
+          build,
+          metadata: sourceMetadata,
+        })
+      )
+        return null;
+      const now = input.now ?? new Date();
+      const nextStateEpoch = build.stateEpoch + 1;
+      const coordinate = knowledgeBaseExplicitRecoveryCoordinate({
+        turn: source,
+        build,
+        metadata: sourceMetadata,
+        nextStateEpoch,
+        now,
+      });
+      if (
+        !projectionNeedsRepair &&
+        coordinateIsCurrent &&
+        coordinate.action === existing.action
       ) {
         return existing;
       }
-      const now = input.now ?? new Date();
-      const nextStateEpoch = build.stateEpoch + 1;
-      const unsignedStopped = {
-        ...existing,
-        action: "stopped" as const,
-        sourceStateEpoch: nextStateEpoch,
-        normalizedAt: now.toISOString(),
-      };
-      const stopped = {
-        ...unsignedStopped,
-        recoveryStateSha256: signKnowledgeBaseExplicitRecoveryCoordinate(
-          unsignedStopped,
-        ),
-      };
+      const terminalMessage =
+        coordinate.action === "retry_compatible_create"
+          ? "当前请求已明确被拒绝；需要你确认后才能使用兼容方式继续。"
+          : coordinate.action === "create_new_canonical_from_snapshot"
+            ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
+            : "本轮已停止，不会自动重发。已完成内容不受影响。";
+      const sourceCode =
+        source.errorCode ||
+        build.protocolErrorCode ||
+        (sourceMetadata.providerMethod === "task.create"
+          ? "MANUS_V2_CREATE_REJECTED"
+          : "MANUS_V2_SEND_REJECTED");
+      const protocolErrorCode =
+        coordinate.action === "create_new_canonical_from_snapshot"
+          ? "MANUS_V2_LOCAL_REHYDRATE_REJECTED"
+          : sourceCode;
       const provenance = retryAuthorityRecord(build.handoffProvenance) || {};
       const updated = await tx
         .update(knowledgeBaseBuilds)
         .set({
+          status: "protocol_error",
+          canonicalTaskState: "attention_required",
           handoffProvenance: {
             ...provenance,
             recoverySourceTurnId: existing.sourceTurnId,
-            terminalRecovery: stopped,
+            terminalRecovery: coordinate,
           },
+          protocolErrorCode,
+          protocolError: terminalMessage,
           stateEpoch: nextStateEpoch,
+          recoveryLeaseOwnerHash: null,
+          recoveryLeaseExpiresAt: null,
+          awaitingResponseSince: null,
           updatedAt: now,
         })
         .where(
           and(
             eq(knowledgeBaseBuilds.id, build.id),
+            eq(knowledgeBaseBuilds.userId, input.userId),
             eq(knowledgeBaseBuilds.generation, build.generation),
             eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
             isNull(knowledgeBaseBuilds.activeTurnId),
           ),
         );
-      return updated[0]?.affectedRows ? stopped : null;
+      if (!updated[0]?.affectedRows) return null;
+      await markKnowledgeBaseConversationFailedInTransaction({
+        tx,
+        userId: input.userId,
+        conversationId: source.conversationId,
+        authoritativeTaskId: build.canonicalTaskId,
+        failedAt: now,
+      });
+      return coordinate;
     }
     const turn = (
       await tx
@@ -12060,6 +12274,7 @@ export async function normalizeKnowledgeBaseTerminalRejection(
             eq(conversationTurns.id, build.activeTurnId),
             eq(conversationTurns.userId, input.userId),
             eq(conversationTurns.buildId, build.id),
+            eq(conversationTurns.buildGeneration, build.generation),
           ),
         )
         .limit(1)
@@ -12068,51 +12283,25 @@ export async function normalizeKnowledgeBaseTerminalRejection(
     if (!turn) return null;
     const metadata = metadataOf(turn);
     if (
-      turn.status !== "failed" ||
-      turn.leaseExpiresAt !== null ||
-      build.status !== "protocol_error" ||
-      build.providerProtocol !== "manus_v2" ||
-      metadata.providerProtocol !== "manus_v2" ||
-      metadata.providerAttemptState !== "rejected" ||
-      storedKnowledgeBaseCreateAttemptState(metadata) !== "rejected" ||
-      (metadata.providerMethod !== "task.create" &&
-        metadata.providerMethod !== "task.sendMessage") ||
-      metadata.outcomeUnknownAt !== undefined
+      !isKnowledgeBaseTerminalRejectionSource({ turn, build, metadata })
     ) {
       return null;
     }
     const now = input.now ?? new Date();
-    const coordinate = knowledgeBaseExplicitRecoveryCoordinate({
+    return settleLockedKnowledgeBaseTerminalRejection({
+      tx,
+      userId: input.userId,
       turn,
       build,
       metadata,
-      nextStateEpoch: build.stateEpoch + 1,
+      code:
+        turn.errorCode ||
+        build.protocolErrorCode ||
+        (metadata.providerMethod === "task.create"
+          ? "MANUS_V2_CREATE_REJECTED"
+          : "MANUS_V2_SEND_REJECTED"),
       now,
     });
-    const provenance = retryAuthorityRecord(build.handoffProvenance) || {};
-    const updated = await tx
-      .update(knowledgeBaseBuilds)
-      .set({
-        activeTurnId: null,
-        canonicalTaskState: "attention_required",
-        handoffProvenance: {
-          ...provenance,
-          recoverySourceTurnId: turn.id,
-          terminalRecovery: coordinate,
-        },
-        stateEpoch: build.stateEpoch + 1,
-        awaitingResponseSince: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(knowledgeBaseBuilds.id, build.id),
-          eq(knowledgeBaseBuilds.generation, build.generation),
-          eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
-          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
-        ),
-      );
-    return updated[0]?.affectedRows ? coordinate : null;
   });
 }
 
@@ -12313,9 +12502,9 @@ export async function findKnowledgeBaseExplicitRecoveryReplay(input: {
 }
 
 /**
- * A v2 request may be resent only after an explicit, structured rejection.
- * The durable frozen body hash/token are retained; ambiguous responses take
- * the outcome-unknown reconciliation path instead and can never reach here.
+ * An explicit v2 rejection is terminal for the frozen provider operation.
+ * It releases the local writer fence and records at most one customer-bound
+ * recovery action; ambiguous responses take the outcome-unknown path instead.
  */
 export async function settleKnowledgeBaseManusV2ExplicitRejection(
   input: {
@@ -12375,20 +12564,6 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
       ? Math.max(0, Number(metadata.providerRejectionCount))
       : 0;
     const nextCount = previousCount + 1;
-    const localRehydrateRejected =
-      method === "task.sendMessage" &&
-      Boolean(
-        retryAuthorityRecord(build.handoffProvenance)?.localRehydrateRequired,
-      );
-    const minimalCompatibleCreate =
-      metadata.repairKind === "explicit_compatible_create" ||
-      retryAuthorityRecord(metadata.recovery)?.compatibilityMode ===
-        "minimal_v2_create";
-    const mayRetry =
-      !localRehydrateRejected &&
-      !minimalCompatibleCreate &&
-      input.retryable &&
-      nextCount <= MAX_MANUS_V2_EXPLICIT_REJECTION_RETRIES;
     const providerCode = safeProviderDiagnostic(input.providerCode);
     const providerRequestRef =
       safeProviderRequestReference(input.providerRequestRef) ?? undefined;
@@ -12399,11 +12574,6 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
     const providerStatus = Number.isSafeInteger(input.providerStatus)
       ? Number(input.providerStatus)
       : null;
-    const terminalAuthority = knowledgeBaseManusV2TerminalRejectionAuthority({
-      providerCode,
-      providerStatus,
-      attachmentAttempts: metadata.manusV2AttachmentAttempts,
-    });
     const nextMetadata: KnowledgeBaseTurnMetadata = {
       ...metadata,
       providerRejectionCount: nextCount,
@@ -12417,101 +12587,22 @@ export async function settleKnowledgeBaseManusV2ExplicitRejection(
       ...(providerStatus !== null
         ? { providerRejectionStatus: providerStatus }
         : {}),
-      createAttemptState: mayRetry ? "not_sent" : "rejected",
+      createAttemptState: "rejected",
       createAttemptUpdatedAt: now.toISOString(),
-      providerAttemptState: mayRetry ? "not_sent" : "rejected",
-      dispatchState: mayRetry ? "recovering" : "failed",
-      failureClass:
-        !mayRetry && localRehydrateRejected
-          ? "requires_user_fix"
-          : !mayRetry
-            ? terminalAuthority.failureClass
-            : "recoverable_same_turn",
-      recoveryAction:
-        !mayRetry && localRehydrateRejected
-          ? "create_new_canonical_from_snapshot"
-          : !mayRetry
-            ? terminalAuthority.recoveryAction
-            : "wait",
+      providerAttemptState: "rejected",
+      dispatchState: "failed",
       canRegenerate: false,
     };
-    const delayMs = mayRetry
-      ? explicitManusV2RejectionDelayMs(
-          metadata,
-          nextCount,
-          input.recoveryDelayMs,
-        )
-      : 0;
-    await tx
-      .update(conversationTurns)
-      .set({
-        status: mayRetry ? "running" : "failed",
-        errorCode: code,
-        errorMessage: mayRetry ? null : terminalAuthority.message,
-        completedAt: mayRetry ? turn.completedAt : now,
-        leaseExpiresAt: mayRetry ? new Date(now.getTime() + delayMs) : null,
-        metadata: nextMetadata,
-        updatedAt: now,
-      })
-      .where(eq(conversationTurns.id, turn.id));
-    if (mayRetry) {
-      await tx
-        .update(knowledgeBaseBuilds)
-        .set({
-          canonicalTaskState: method === "task.create" ? "unbound" : "active",
-          protocolErrorCode: null,
-          protocolError: null,
-          updatedAt: now,
-        })
-        .where(eq(knowledgeBaseBuilds.id, build.id));
-      return { retryScheduled: true as const, attempt: nextCount, delayMs };
-    }
-    const requiresNewCanonical = localRehydrateRejected;
-    const coordinate = knowledgeBaseExplicitRecoveryCoordinate({
+    await settleLockedKnowledgeBaseTerminalRejection({
+      tx,
+      userId: input.userId,
       turn,
       build,
       metadata: nextMetadata,
-      nextStateEpoch: build.stateEpoch + 1,
+      code,
       now,
     });
-    const provenance = retryAuthorityRecord(build.handoffProvenance) || {};
-    await tx
-      .update(knowledgeBaseBuilds)
-      .set({
-        activeTurnId: null,
-        canonicalTaskState: "attention_required",
-        handoffProvenance: {
-          ...provenance,
-          recoverySourceTurnId: turn.id,
-          terminalRecovery: coordinate,
-        },
-        protocolErrorCode: requiresNewCanonical
-          ? "MANUS_V2_LOCAL_REHYDRATE_REJECTED"
-          : code,
-        protocolError: requiresNewCanonical
-          ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
-          : terminalAuthority.message,
-        stateEpoch: build.stateEpoch + 1,
-        awaitingResponseSince: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(knowledgeBaseBuilds.id, build.id),
-          eq(knowledgeBaseBuilds.generation, build.generation),
-          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
-        ),
-      );
-    if (!mayRetry) {
-      await markKnowledgeBaseConversationFailedInTransaction({
-        tx,
-        userId: input.userId,
-        conversationId: turn.conversationId,
-        authoritativeTaskId: build.canonicalTaskId,
-        failedAt: now,
-      });
-    }
-    return { retryScheduled: false as const, attempt: nextCount, delayMs };
+    return { retryScheduled: false as const, attempt: nextCount, delayMs: 0 };
   });
 }
 
@@ -15369,71 +15460,90 @@ export async function findRecoverableKnowledgeBaseTurnIds(
     .where(
       and(
         or(
-          inArray(conversationTurns.status, ["queued", "running"]),
           and(
-            eq(conversationTurns.status, "failed"),
-            eq(
-              conversationTurns.errorCode,
-              KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
-            ),
-            eq(
-              knowledgeBaseBuilds.protocolErrorCode,
-              KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
-            ),
+            inArray(conversationTurns.status, ["queued", "running", "failed"]),
             eq(knowledgeBaseBuilds.providerProtocol, "manus_v2"),
-            isNull(conversationTurns.upstreamTaskId),
-            isNull(knowledgeBaseBuilds.upstreamTaskId),
-            isNull(knowledgeBaseBuilds.canonicalTaskId),
+            inArray(knowledgeBaseBuilds.status, [
+              "researching",
+              "confirming",
+              "protocol_error",
+              "failed",
+            ]),
             sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), '') = 'not_sent'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchState')), '') = 'failed'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.failureClass')), '') = 'terminal_nonregenerable'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.recoveryAction')), '') = 'contact_support'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.canRegenerate')), '') = 'false'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.recovery.localRehydrateAuthority')), '') = 'local_rehydrate_unbound'`,
-            sql`COALESCE(JSON_LENGTH(${conversationTurns.attachmentFileIds}), 0) = 0`,
-            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.preparedDispatch') IS NULL`,
-            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.frozenProviderRequestHash') IS NULL`,
-            sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NULL`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerMethod')), '') IN ('task.create', 'task.sendMessage')`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'rejected'`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), '') = 'rejected'`,
             sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NULL`,
           ),
           and(
-            eq(conversationTurns.status, "failed"),
-            eq(
-              conversationTurns.errorCode,
-              "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
+            inArray(knowledgeBaseBuilds.status, [
+              "researching",
+              "confirming",
+              "protocol_error",
+            ]),
+            or(
+              inArray(conversationTurns.status, ["queued", "running"]),
+              and(
+                eq(conversationTurns.status, "failed"),
+                eq(
+                  conversationTurns.errorCode,
+                  KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+                ),
+                eq(
+                  knowledgeBaseBuilds.protocolErrorCode,
+                  KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID,
+                ),
+                eq(knowledgeBaseBuilds.providerProtocol, "manus_v2"),
+                isNull(conversationTurns.upstreamTaskId),
+                isNull(knowledgeBaseBuilds.upstreamTaskId),
+                isNull(knowledgeBaseBuilds.canonicalTaskId),
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')), '') = 'not_sent'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchState')), '') = 'failed'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.failureClass')), '') = 'terminal_nonregenerable'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.recoveryAction')), '') = 'contact_support'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.canRegenerate')), '') = 'false'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.recovery.localRehydrateAuthority')), '') = 'local_rehydrate_unbound'`,
+                sql`COALESCE(JSON_LENGTH(${conversationTurns.attachmentFileIds}), 0) = 0`,
+                sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.preparedDispatch') IS NULL`,
+                sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.frozenProviderRequestHash') IS NULL`,
+                sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NULL`,
+                sql`JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NULL`,
+              ),
+              and(
+                eq(conversationTurns.status, "failed"),
+                eq(
+                  conversationTurns.errorCode,
+                  "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
+                ),
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
+                sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
+              ),
             ),
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')), '') = 'manus_v2'`,
-            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')), '') = 'not_sent'`,
+            or(
+              isNull(conversationTurns.leaseExpiresAt),
+              lte(conversationTurns.leaseExpiresAt, now),
+            ),
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.awaitingClientAttachments')), 'false') <> 'true'`,
+            input.allowLegacySkill404IncidentRepair
+              ? sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind')`
+              : sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind', 'legacy_skill_404_confirm')`,
+            sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.attentionCode')), '') = ''`,
+            sql`COALESCE(
+              JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')),
+              CASE
+                WHEN JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NOT NULL
+                  OR JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NOT NULL
+                THEN 'unknown'
+                ELSE 'not_sent'
+              END
+            ) <> 'unknown' OR (
+              JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')) = 'manus_v2'
+              AND JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')) = 'outcome_unknown'
+            )`,
           ),
         ),
-        or(
-          isNull(conversationTurns.leaseExpiresAt),
-          lte(conversationTurns.leaseExpiresAt, now),
-        ),
-        sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.awaitingClientAttachments')), 'false') <> 'true'`,
-        input.allowLegacySkill404IncidentRepair
-          ? sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind')`
-          : sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.repairKind')), '') NOT IN ('legacy_anchor_handoff', 'canonical_credential_rebind', 'legacy_skill_404_confirm')`,
-        sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.manusV2Lifecycle.attentionCode')), '') = ''`,
-        sql`COALESCE(
-          JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.createAttemptState')),
-          CASE
-            WHEN JSON_EXTRACT(${conversationTurns.metadata}, '$.outcomeUnknownAt') IS NOT NULL
-              OR JSON_EXTRACT(${conversationTurns.metadata}, '$.dispatchingAt') IS NOT NULL
-            THEN 'unknown'
-            ELSE 'not_sent'
-          END
-        ) <> 'unknown' OR (
-          JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerProtocol')) = 'manus_v2'
-          AND JSON_UNQUOTE(JSON_EXTRACT(${conversationTurns.metadata}, '$.providerAttemptState')) = 'outcome_unknown'
-        )`,
-        inArray(knowledgeBaseBuilds.status, [
-          "researching",
-          "confirming",
-          "protocol_error",
-        ]),
       ),
     )
     .orderBy(asc(conversationTurns.leaseExpiresAt), asc(conversationTurns.id))
@@ -15480,90 +15590,29 @@ export async function claimKnowledgeBaseTurnForRecovery(
       // through the ordinary reconcile action before this operation can run.
       return null;
     }
-    const terminalRejectedV2 =
-      !isKnowledgeBaseAnchorHandoffRepairKind(currentMetadata.repairKind) &&
-      currentMetadata.providerProtocol === "manus_v2" &&
-      currentMetadata.providerAttemptState === "rejected" &&
-      storedKnowledgeBaseCreateAttemptState(currentMetadata) === "rejected" &&
-      (currentMetadata.providerMethod === "task.create" ||
-        currentMetadata.providerMethod === "task.sendMessage") &&
-      typeof currentMetadata.operationToken === "string" &&
-      /^[a-f0-9]{64}$/u.test(
-        String(currentMetadata.frozenProviderRequestHash || ""),
-      ) &&
-      currentMetadata.recoveryAction !== "create_new_canonical_from_snapshot" &&
-      (turn.status === "queued" || turn.status === "running");
+    const terminalRejectedV2 = isKnowledgeBaseTerminalRejectionSource({
+      turn,
+      build,
+      metadata: currentMetadata,
+    });
     if (terminalRejectedV2) {
-      const localRehydrateRejected =
-        currentMetadata.providerMethod === "task.sendMessage" &&
-        Boolean(
-          retryAuthorityRecord(build.handoffProvenance)?.localRehydrateRequired,
-        );
-      const authority = knowledgeBaseManusV2TerminalRejectionAuthority({
-        providerCode: currentMetadata.providerReasonCategory,
-        providerStatus: currentMetadata.providerRejectionStatus,
-        attachmentAttempts: currentMetadata.manusV2AttachmentAttempts,
-      });
       const code = normalizeRequiredId(
         turn.errorCode ||
+          build.protocolErrorCode ||
           (currentMetadata.providerMethod === "task.create"
             ? "MANUS_V2_CREATE_REJECTED"
             : "MANUS_V2_SEND_REJECTED"),
         "code",
         128,
       );
-      const nextMetadata: KnowledgeBaseTurnMetadata = {
-        ...currentMetadata,
-        dispatchState: "failed",
-        failureClass: localRehydrateRejected
-          ? "requires_user_fix"
-          : authority.failureClass,
-        recoveryAction: localRehydrateRejected
-          ? "create_new_canonical_from_snapshot"
-          : authority.recoveryAction,
-        canRegenerate: false,
-      };
-      const terminalMessage = localRehydrateRejected
-        ? "当前任务已明确拒绝完整上下文恢复；已完成内容不受影响，可由客户确认后创建一个新任务继续。"
-        : authority.message;
-      await tx
-        .update(conversationTurns)
-        .set({
-          status: "failed",
-          errorCode: code,
-          errorMessage: terminalMessage,
-          completedAt: now,
-          leaseExpiresAt: null,
-          metadata: nextMetadata,
-          updatedAt: now,
-        })
-        .where(eq(conversationTurns.id, turn.id));
-      await tx
-        .update(knowledgeBaseBuilds)
-        .set({
-          status: "protocol_error",
-          canonicalTaskState: "attention_required",
-          protocolErrorCode: localRehydrateRejected
-            ? "MANUS_V2_LOCAL_REHYDRATE_REJECTED"
-            : code,
-          protocolError: terminalMessage,
-          stateEpoch: build.stateEpoch + 1,
-          awaitingResponseSince: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(knowledgeBaseBuilds.id, build.id),
-            eq(knowledgeBaseBuilds.generation, build.generation),
-            eq(knowledgeBaseBuilds.activeTurnId, turn.id),
-          ),
-        );
-      await markKnowledgeBaseConversationFailedInTransaction({
+      await settleLockedKnowledgeBaseTerminalRejection({
         tx,
         userId: turn.userId,
-        conversationId: turn.conversationId,
-        authoritativeTaskId: turn.upstreamTaskId || build.upstreamTaskId,
-        failedAt: now,
+        turn,
+        build,
+        metadata: currentMetadata,
+        code,
+        now,
       });
       return null;
     }

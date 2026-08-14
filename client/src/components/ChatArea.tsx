@@ -245,6 +245,38 @@ export function knowledgeBaseNoticeHasRecoveryAction(
   return knowledgeBaseNoticeRecoveryMode(notice) !== "none";
 }
 
+export function knowledgeBaseReconcileResultRequiresConfirmation(
+  observation: Pick<KnowledgeBaseObservationDto, "notice">,
+) {
+  return Boolean(
+    observation.notice &&
+      knowledgeBaseNoticeRecoveryMode({
+        ...observation.notice,
+        recoveryToken: observation.notice.recoveryToken ?? undefined,
+      }) === "explicit_recovery",
+  );
+}
+
+export function knowledgeBaseReconcileResultIsStopped(
+  observation: Pick<KnowledgeBaseObservationDto, "notice">,
+) {
+  return Boolean(
+    observation.notice &&
+      (observation.notice.code === "FRONTMIND_KB_STOPPED" ||
+        observation.notice.recoveryAction === "stopped"),
+  );
+}
+
+export function knowledgeBaseReconcileResultChangedCoordinate(
+  observation: Pick<KnowledgeBaseObservationDto, "generation" | "stateEpoch">,
+  expected: { generation: number; stateEpoch: number },
+) {
+  return (
+    observation.generation !== expected.generation ||
+    observation.stateEpoch !== expected.stateEpoch
+  );
+}
+
 export function knowledgeBaseNoticeRequiresLogoProvenanceRepair(
   notice: Pick<KnowledgeBaseClientNotice, "code">,
 ) {
@@ -1513,6 +1545,21 @@ export default function ChatArea({
         explicitRecoveryRequestRef.current = null;
       }
       if (recoveryMode === "reconcile") {
+        if (knowledgeBaseReconcileResultRequiresConfirmation(observation)) {
+          toast.info("状态已更新，需要你确认后继续", {
+            description:
+              observation.notice?.message ||
+              "已安全停在确认点，不会自动重发。",
+          });
+          return;
+        }
+        if (knowledgeBaseReconcileResultIsStopped(observation)) {
+          toast.warning("本轮已停止，不会自动重发", {
+            description:
+              observation.notice?.message || "已完成内容不受影响。",
+          });
+          return;
+        }
         const packageRebind =
           knowledgeBase.notice.code ===
           KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE;
@@ -1531,6 +1578,16 @@ export default function ChatArea({
         } else if (knowledgeBaseSameTurnRecoveryAccepted(observation)) {
           toast.success("已继续当前操作", {
             description: "系统已接受同一轮次，并继续等待模型返回结果。",
+          });
+        } else if (
+          knowledgeBaseReconcileResultChangedCoordinate(observation, {
+            generation: knowledgeBase.generation,
+            stateEpoch: knowledgeBase.stateEpoch,
+          })
+        ) {
+          toast.info("状态已更新", {
+            description:
+              observation.notice?.message || "已同步当前权威状态。",
           });
         } else {
           toast.warning("当前操作尚未恢复", {

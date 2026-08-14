@@ -192,7 +192,7 @@ describe("knowledge-base build-local invariant audit", () => {
         turns: [terminal],
         nodes: [],
       }).map((item) => item.code),
-    ).not.toContain("INVALID_ACTIVE_TURN");
+    ).toContain("INVALID_ACTIVE_TURN");
 
     const legacyTerminal = {
       ...terminal,

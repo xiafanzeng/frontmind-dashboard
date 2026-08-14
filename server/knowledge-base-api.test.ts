@@ -58,6 +58,7 @@ import {
   knowledgeBaseTurnReservationErrorStatus,
   knowledgeBaseUpstreamReadFailureAuthority,
   knowledgeBaseRecoveryLogoPreparationError,
+  knowledgeBaseRetainedStartMayReplaceNotice,
   knowledgeBaseReconcileFailureStatus,
   knowledgeBaseRetryObservationAllowsRegeneration,
   knowledgeBaseAcceptedReservationReceipt,
@@ -114,6 +115,34 @@ function expectEnterpriseIdentityError(
 }
 
 describe("knowledge-base turn HTTP outcomes", () => {
+  it("never replaces an explicit or stopped recovery token with retained-start preview", () => {
+    for (const recoveryAction of [
+      "retry_request",
+      "start_new_generation",
+    ] as const) {
+      expect(
+        knowledgeBaseRetainedStartMayReplaceNotice({
+          code: "FRONTMIND_KB_RETRY_AVAILABLE",
+          recoveryAction,
+          recoveryToken: "a".repeat(64),
+        } as any),
+      ).toBe(false);
+    }
+    expect(
+      knowledgeBaseRetainedStartMayReplaceNotice({
+        code: "FRONTMIND_KB_STOPPED",
+        recoveryAction: "stopped",
+        recoveryToken: null,
+      } as any),
+    ).toBe(false);
+    expect(
+      knowledgeBaseRetainedStartMayReplaceNotice({
+        code: "UPSTREAM_CREATE_3",
+        recoveryAction: "reconcile",
+      } as any),
+    ).toBe(true);
+  });
+
   it("keeps all in-flight receipts on 202 and terminal receipts on 409", () => {
     expect(knowledgeBaseTurnReplayHttpStatus("pending")).toBe(202);
     expect(knowledgeBaseTurnReplayHttpStatus("bound")).toBe(202);
