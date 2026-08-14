@@ -1,4 +1,4 @@
-import axios from "axios";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 
 export const UPSTREAM_FILE_METADATA_TIMEOUT_MS = 10_000;
 export const UPSTREAM_FILE_READINESS_RETRY_AFTER_MS = 3_000;
@@ -54,61 +54,63 @@ type FilesReadinessRequest = Omit<ReadinessRequest, "file"> & {
   files: UpstreamFileIdentity[];
 };
 
-function officialFileMetadata(value: unknown) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  if (
-    typeof record.id !== "string" ||
-    !record.id ||
-    typeof record.filename !== "string" ||
-    !record.filename.trim() ||
-    Buffer.byteLength(record.filename, "utf8") > 512 ||
-    typeof record.status !== "string" ||
-    !record.status
-  ) {
-    return null;
-  }
-  return {
-    id: record.id,
-    filename: record.filename,
-    status: record.status.trim().toLowerCase(),
-  };
-}
-
-function isTransientStatus(status: number) {
-  return status === 408 || status === 425 || status === 429 || status >= 500;
-}
-
 /**
- * Read the provider's official v1 file metadata shape. This request must never
- * be treated as a source of an upload capability; only id/filename/status are
- * consumed and only API_KEY authentication is sent.
+ * Read the provider's official v2 file metadata shape through the single
+ * Manus gateway. A provider file id is only a short-lived lease; callers must
+ * keep the source bytes locally and use this check solely for lease readiness.
  */
 export async function checkUpstreamFileReadiness(
   input: ReadinessRequest,
 ): Promise<UpstreamFileReadiness> {
-  let response;
+  if (input.signal?.aborted) {
+    throw input.signal.reason ?? new Error("Upstream readiness cancelled");
+  }
+  let metadata;
   try {
-    response = await axios.get(
-      `${input.baseUrl.replace(/\/$/u, "")}/v1/files/${encodeURIComponent(input.file.fileId)}`,
-      {
-        headers: {
-          API_KEY: input.apiKey,
-          Accept: "application/json",
-        },
-        timeout: input.timeoutMs ?? UPSTREAM_FILE_METADATA_TIMEOUT_MS,
-        maxRedirects: 0,
-        maxContentLength: 1024 * 1024,
-        signal: input.signal,
-        validateStatus: () => true,
-      },
-    );
+    metadata = await new ManusV2Client({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      timeoutMs: input.timeoutMs ?? UPSTREAM_FILE_METADATA_TIMEOUT_MS,
+    }).fileDetail(input.file.fileId, { signal: input.signal });
   } catch (error) {
-    if (
-      input.signal?.aborted ||
-      (error as { code?: unknown } | null)?.code === "ERR_CANCELED"
-    ) {
-      throw error;
+    if (input.signal?.aborted)
+      throw input.signal.reason ?? new Error("Upstream readiness cancelled");
+    if (error instanceof ManusV2ApiError) {
+      const status = error.status;
+      if (status === 404 || error.code === "FILE_UNUSABLE") {
+        throw new UpstreamFileReadinessError(
+          "UPSTREAM_FILE_UNUSABLE",
+          "Upstream file no longer exists",
+          false,
+          status,
+          "deleted",
+        );
+      }
+      if (
+        error.code === "FILE_ID_CONFLICT" ||
+        error.code === "FILE_IDENTITY_CONFLICT"
+      ) {
+        throw new UpstreamFileReadinessError(
+          "UPSTREAM_FILE_IDENTITY_MISMATCH",
+          "Upstream file identity does not match the requested file",
+          false,
+          status,
+        );
+      }
+      if (error.retryable || error.outcomeUnknown || status === null) {
+        throw new UpstreamFileReadinessError(
+          "UPSTREAM_FILE_METADATA_UNAVAILABLE",
+          "Upstream file metadata is temporarily unavailable",
+          true,
+          status,
+        );
+      }
+      throw new UpstreamFileReadinessError(
+        "UPSTREAM_FILE_METADATA_INVALID",
+        "Upstream file metadata request was rejected",
+        false,
+        status,
+      );
     }
     throw new UpstreamFileReadinessError(
       "UPSTREAM_FILE_METADATA_UNAVAILABLE",
@@ -116,54 +118,21 @@ export async function checkUpstreamFileReadiness(
       true,
     );
   }
-
-  if (response.status < 200 || response.status >= 300) {
-    if (isTransientStatus(response.status)) {
-      throw new UpstreamFileReadinessError(
-        "UPSTREAM_FILE_METADATA_UNAVAILABLE",
-        "Upstream file metadata is temporarily unavailable",
-        true,
-        response.status,
-      );
-    }
-    throw new UpstreamFileReadinessError(
-      response.status === 404
-        ? "UPSTREAM_FILE_UNUSABLE"
-        : "UPSTREAM_FILE_METADATA_INVALID",
-      response.status === 404
-        ? "Upstream file no longer exists"
-        : "Upstream file metadata request was rejected",
-      false,
-      response.status,
-      response.status === 404 ? "deleted" : null,
-    );
-  }
-
-  const metadata = officialFileMetadata(response.data);
-  if (!metadata) {
-    throw new UpstreamFileReadinessError(
-      "UPSTREAM_FILE_METADATA_INVALID",
-      "Upstream file metadata has an invalid shape",
-      false,
-      response.status,
-    );
-  }
   if (
-    metadata.id !== input.file.fileId ||
-    (input.filenamePolicy !== "provider_authoritative" &&
-      metadata.filename !== input.file.filename)
+    input.filenamePolicy !== "provider_authoritative" &&
+    metadata.filename !== input.file.filename
   ) {
     throw new UpstreamFileReadinessError(
       "UPSTREAM_FILE_IDENTITY_MISMATCH",
       "Upstream file identity does not match the requested file",
       false,
-      response.status,
+      200,
       metadata.status,
     );
   }
   if (metadata.status === "pending" || metadata.status === "uploaded") {
     return {
-      fileId: metadata.id,
+      fileId: metadata.fileId,
       filename: metadata.filename,
       state: metadata.status,
       status: metadata.status,
@@ -176,7 +145,7 @@ export async function checkUpstreamFileReadiness(
       : "UPSTREAM_FILE_METADATA_INVALID",
     "Upstream file is not usable by a task",
     false,
-    response.status,
+    200,
     metadata.status,
   );
 }

@@ -89,11 +89,17 @@ export function knowledgeBaseManusV2RecoveryAuthority(input: {
     : "deferred_disabled";
 }
 
-/** Selects only newly inserted builds; persisted builds remain authoritative. */
+/**
+ * New-build protocol selection is no longer a rollout decision.
+ *
+ * The materialized v5 reservation freezes `manus_v2` before any Provider
+ * work. Keep this compatibility helper v2-only as well so an old
+ * `FRONTMIND_KB_MANUS_V2_WRITER=false` deployment value can never select the
+ * retired conversational protocol for a newly constructed caller. Persisted
+ * pre-v5 rows remain readable only through their RESET_REQUIRED projection.
+ */
 export function knowledgeBaseNewBuildProviderProtocol(
-  environment: NodeJS.ProcessEnv = process.env,
+  _environment: NodeJS.ProcessEnv = process.env,
 ): KnowledgeBaseProviderProtocol {
-  return knowledgeBaseManusV2WriterEnabled(environment)
-    ? "manus_v2"
-    : "legacy_v1";
+  return "manus_v2";
 }

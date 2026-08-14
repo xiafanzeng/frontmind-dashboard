@@ -13,6 +13,7 @@ import {
 import {
   API_USAGE_SCAN_CONCURRENCY,
   API_USAGE_SNAPSHOT_SYNC_LOCK_NAME,
+  apiUsageSyncErrorCode,
   apiUsageSnapshotCompletionState,
   apiUsageSeverity,
   assertBulkManagedApiKeyTargetSelection,
@@ -20,22 +21,32 @@ import {
   assertManagedApiKeyTarget,
   bulkReplaceManagedApiKeyTargets,
   bulkManagedApiKeyActionTargets,
-  bulkManagedApiKeyHistoryDisposition,
   claimUsageSnapshotRefresh,
   createManagedApiUsageRefreshQueue,
   finalizeApiUsageSnapshotClaim,
   isDuplicateApiUsageSnapshotError,
   isRollingUsageSnapshotCurrent,
+  lastSuccessfulUsageSnapshotValue,
   latestUsageSnapshotByPolicy,
+  millisecondsUntilNextShanghaiUsageSync,
   resolveEffectiveUsageCredentials,
   resolveBulkManagedApiKeyTargets,
   runApiUsageSnapshotSyncWithLock,
   syncableManagedWorkspaceUserIds,
   usageCredentialPoolKey,
+  usageKeyPoolStale,
   usageSnapshotUsageValues,
 } from "./api-usage-snapshot-service";
+import { AuthServiceError } from "./auth-service";
 
 describe("managed API usage refresh targeting", () => {
+  it("persists the concrete credential failure code instead of the Error class name", () => {
+    expect(
+      apiUsageSyncErrorCode(
+        new AuthServiceError("INVALID_CREDENTIAL", "revoked"),
+      ),
+    ).toBe("INVALID_CREDENTIAL");
+  });
   it("keeps customers owned by a system administrator in the snapshot scan", () => {
     expect(
       syncableManagedWorkspaceUserIds({
@@ -178,16 +189,14 @@ describe("managed API usage refresh targeting", () => {
 });
 
 describe("API usage snapshot completion state", () => {
-  it("keeps an authoritative total available when only account attribution is partial", () => {
+  it("keeps an authoritative total available without an attribution gate", () => {
     expect(
       apiUsageSnapshotCompletionState({
         totalComplete: true,
-        attributionComplete: false,
-        attributionErrorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
       }),
     ).toEqual({
       status: "ok",
-      errorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
+      errorCode: null,
     });
   });
 
@@ -195,8 +204,6 @@ describe("API usage snapshot completion state", () => {
     expect(
       apiUsageSnapshotCompletionState({
         totalComplete: false,
-        attributionComplete: true,
-        attributionErrorCode: "PARTIAL_ACCOUNT_ATTRIBUTION",
       }),
     ).toEqual({
       status: "error",
@@ -554,6 +561,79 @@ describe("resolveEffectiveUsageCredentials", () => {
 });
 
 describe("rolling usage snapshot identity", () => {
+  it("exposes a pool total only after a successful observation for the current Key", () => {
+    const fingerprint = "same-fingerprint";
+    expect(
+      lastSuccessfulUsageSnapshotValue({
+        fingerprint,
+        snapshot: {
+          credentialFingerprint: fingerprint,
+          fetchedAt: null,
+          used: 0,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      lastSuccessfulUsageSnapshotValue({
+        fingerprint,
+        snapshot: {
+          credentialFingerprint: fingerprint,
+          fetchedAt: new Date("2026-08-02T08:00:00.000Z"),
+          used: 321,
+        },
+      }),
+    ).toBe(321);
+    expect(
+      lastSuccessfulUsageSnapshotValue({
+        fingerprint: "replacement-fingerprint",
+        snapshot: {
+          credentialFingerprint: fingerprint,
+          fetchedAt: new Date("2026-08-02T08:00:00.000Z"),
+          used: 321,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("marks every configured pool stale until it has a current successful observation", () => {
+    const fingerprint = "same-fingerprint";
+    expect(
+      usageKeyPoolStale({
+        fingerprint,
+        snapshot: undefined,
+        snapshotCurrent: false,
+      }),
+    ).toBe(true);
+    expect(
+      usageKeyPoolStale({
+        fingerprint,
+        snapshot: { fetchedAt: null },
+        snapshotCurrent: false,
+      }),
+    ).toBe(true);
+    expect(
+      usageKeyPoolStale({
+        fingerprint,
+        snapshot: { fetchedAt: new Date("2026-08-02T08:00:00.000Z") },
+        snapshotCurrent: true,
+      }),
+    ).toBe(false);
+    expect(
+      usageKeyPoolStale({
+        fingerprint,
+        snapshot: { fetchedAt: new Date("2026-08-02T08:00:00.000Z") },
+        snapshotCurrent: false,
+      }),
+    ).toBe(true);
+    expect(
+      usageKeyPoolStale({
+        fingerprint: null,
+        snapshot: undefined,
+        snapshotCurrent: false,
+      }),
+    ).toBe(false);
+  });
+
   it("keeps last-good values when a retired credential makes a refresh partial", () => {
     expect(
       usageSnapshotUsageValues({
@@ -601,7 +681,7 @@ describe("rolling usage snapshot identity", () => {
     ).toBe(false);
   });
 
-  it("keeps a failed refresh current by updatedAt without treating partial data as ok", () => {
+  it("does not treat a failed attempt timestamp as a successful fresh pool observation", () => {
     const updatedAt = new Date("2026-08-02T08:00:00.000Z");
     expect(
       isRollingUsageSnapshotCurrent({
@@ -615,10 +695,10 @@ describe("rolling usage snapshot identity", () => {
         windowDays: 30,
         now: updatedAt.getTime(),
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
-  it("rejects an otherwise matching snapshot after the freshness TTL", () => {
+  it("rejects an otherwise matching snapshot after the 26-hour freshness TTL", () => {
     const fetchedAt = new Date("2026-08-02T08:00:00.000Z");
     expect(
       isRollingUsageSnapshotCurrent({
@@ -629,7 +709,7 @@ describe("rolling usage snapshot identity", () => {
         },
         fingerprint: "same-fingerprint",
         windowDays: 30,
-        now: fetchedAt.getTime() + 31 * 60_000,
+        now: fetchedAt.getTime() + 26 * 60 * 60_000 + 1,
       }),
     ).toBe(false);
   });
@@ -652,16 +732,23 @@ describe("rolling usage snapshot identity", () => {
 });
 
 describe("unified managed API Key target CAS", () => {
-  it("post-scans the previous fingerprint after rotation", () => {
+  it("does not gate a rotation on an old-Key history scan", () => {
     const source = readFileSync(
       path.resolve(process.cwd(), "server/api-usage-snapshot-service.ts"),
       "utf8",
     );
-    expect(source).toContain(
-      "poolFingerprint: replacement.previousFingerprint",
+    const start = source.indexOf(
+      "export async function replaceManagedApiKeyTarget",
     );
-    expect(source).toContain(
-      "previousFingerprint: currentCredential?.fingerprint ?? null",
+    const end = source.indexOf(
+      "export async function revokeManagedApiKeyTarget",
+      start,
+    );
+    const replacementPath = source.slice(start, end);
+    expect(replacementPath).not.toContain("usageCoverageSupportsReplacement");
+    expect(replacementPath).not.toContain("allowIncompleteHistory");
+    expect(replacementPath).not.toContain(
+      "getSharedKeyMonthlyCreditUsageForAccounts",
     );
   });
   it.each([
@@ -715,6 +802,21 @@ describe("unified managed API Key target CAS", () => {
         expectedVersion: 4,
       }),
     ).toThrow(/类型不匹配/);
+  });
+});
+
+describe("daily API usage schedule", () => {
+  it("targets the next 03:00 in Asia/Shanghai", () => {
+    expect(
+      millisecondsUntilNextShanghaiUsageSync(
+        Date.parse("2026-08-14T18:30:00+08:00"),
+      ),
+    ).toBe(8.5 * 60 * 60_000);
+    expect(
+      millisecondsUntilNextShanghaiUsageSync(
+        Date.parse("2026-08-14T02:30:00+08:00"),
+      ),
+    ).toBe(30 * 60_000);
   });
 });
 
@@ -880,83 +982,30 @@ describe("bulk managed API Key scopes", () => {
     ).toEqual([201]);
   });
 
-  it("marks incomplete old-Key history without treating same-Key or deleted credentials as rotation gaps", () => {
-    const disposition = bulkManagedApiKeyHistoryDisposition({
-      targets: [{ userId: 1 }, { userId: 2 }, { userId: 3 }, { userId: 4 }],
-      latestCredentials: new Map([
-        [1, { userId: 1, status: "active", fingerprint: "fp_old_shared" }],
-        [2, { userId: 2, status: "active", fingerprint: "fp_old_shared" }],
-        [3, { userId: 3, status: "deleted", fingerprint: "fp_tombstone" }],
-        [4, { userId: 4, status: "active", fingerprint: "fp_next" }],
-      ]),
-      nextFingerprint: "fp_next",
-      coverageByFingerprint: new Map(),
-      nowMs: 2_000,
-    });
-
-    expect(disposition).toEqual({
-      incompleteTargetIds: [1, 2],
-      incompleteCredentialFingerprints: ["fp_old_shared"],
-    });
+  it("creates a new credential version when only the selected model changes", () => {
+    const targets = [{ userId: 1, kind: "customer" as const }];
+    const latestCredentials = new Map([
+      [
+        1,
+        {
+          status: "active",
+          fingerprint: "fp_same",
+          agentProfile: "frontmind-pro",
+        },
+      ],
+    ]);
+    expect(
+      bulkManagedApiKeyActionTargets({
+        resolvedTargets: targets,
+        latestCredentials,
+        applyMode: "replace_all",
+        nextFingerprint: "fp_same",
+        nextAgentProfile: "frontmind-base",
+      }),
+    ).toEqual(targets);
   });
 
-  it("keeps a complete last-known coverage proof while allowing other revoked pools to rotate", () => {
-    const disposition = bulkManagedApiKeyHistoryDisposition({
-      targets: [{ userId: 1 }, { userId: 2 }, { userId: 3 }],
-      latestCredentials: new Map([
-        [1, { userId: 1, status: "active", fingerprint: "fp_complete" }],
-        [2, { userId: 2, status: "active", fingerprint: "fp_revoked" }],
-        [3, { userId: 3, status: "active", fingerprint: "fp_next" }],
-      ]),
-      nextFingerprint: "fp_next",
-      coverageByFingerprint: new Map([
-        [
-          "fp_complete",
-          {
-            coveredFromMs: 0,
-            fullScanAtMs: 2_999_999_900,
-            allTasksSettled: true,
-            scanToken: null,
-          },
-        ],
-      ]),
-      nowMs: 3_000_000_000,
-    });
-
-    expect(disposition).toEqual({
-      incompleteTargetIds: [2],
-      incompleteCredentialFingerprints: ["fp_revoked"],
-    });
-  });
-
-  it("classifies all 15 revoked-Key accounts without turning incomplete coverage into a batch blocker", () => {
-    const targets = Array.from({ length: 15 }, (_, index) => ({
-      userId: index + 1,
-    }));
-    const disposition = bulkManagedApiKeyHistoryDisposition({
-      targets,
-      latestCredentials: new Map(
-        targets.map((target) => [
-          target.userId,
-          {
-            userId: target.userId,
-            status: "active",
-            fingerprint: "fp_revoked_shared",
-          },
-        ]),
-      ),
-      nextFingerprint: "fp_next",
-      coverageByFingerprint: new Map(),
-      nowMs: 3_000_000_000,
-    });
-
-    expect(disposition).toEqual({
-      incompleteTargetIds: targets.map((target) => target.userId),
-      incompleteCredentialFingerprints: ["fp_revoked_shared"],
-    });
-  });
-
-  it("atomically replaces all 15 targets with incomplete history, preserves old snapshots, and queues one refresh", async () => {
+  it("atomically replaces all 15 revoked-Key targets, preserves old snapshots, and queues one refresh", async () => {
     const accounts = Array.from({ length: 15 }, (_, index) => ({
       id: index + 1,
       role: "user",
@@ -1062,7 +1111,6 @@ describe("bulk managed API Key scopes", () => {
       targetCount: 15,
       updatedCount: 15,
       unchangedCount: 0,
-      historyIncompleteCount: 15,
     });
     expect(oldSnapshots).toEqual(oldSnapshotsBefore);
     expect(selectedTables).not.toContain(apiUsageSnapshots);
@@ -1078,16 +1126,26 @@ describe("bulk managed API Key scopes", () => {
       ),
     ).toHaveLength(15);
     for (const event of auditEvents.slice(0, 15)) {
-      expect(event.metadata).toMatchObject({
-        historyIncomplete: true,
-        usageHistoryDisposition: "preserved_incomplete",
-      });
+      expect(event.metadata).not.toHaveProperty("historyIncomplete");
+      expect(event.metadata).not.toHaveProperty("usageHistoryDisposition");
     }
     expect(auditEvents.at(-1)?.metadata).toMatchObject({
-      historyIncompleteCount: 15,
-      incompleteHistoryCredentialFingerprints: ["fp_revoked_shared"],
-      newSnapshotBaseline: "credential_created_at",
+      scopeTargetCount: 15,
+      targetCount: 15,
+      updatedCount: 15,
+      unchangedCount: 0,
+      agentProfile: "frontmind-pro",
+      upstreamModel: "manus-1.6-max",
     });
+    expect(auditEvents.at(-1)?.metadata).not.toHaveProperty(
+      "historyIncompleteCount",
+    );
+    expect(auditEvents.at(-1)?.metadata).not.toHaveProperty(
+      "incompleteHistoryCredentialFingerprints",
+    );
+    expect(auditEvents.at(-1)?.metadata).not.toHaveProperty(
+      "newSnapshotBaseline",
+    );
     expect(JSON.stringify(auditEvents)).not.toContain(
       "new-valid-key-never-audited",
     );
@@ -1161,8 +1219,8 @@ describe("bulk managed API Key scopes", () => {
     expect(bulkPath).toContain("validateApiKey: validateUpstreamApiKey");
     expect(bulkPath).toContain("await runtime.validateApiKey(input.apiKey)");
     expect(bulkPath).toContain("await db.transaction(async (tx)");
-    expect(bulkPath).toContain("bulkManagedApiKeyHistoryDisposition");
-    expect(bulkPath).toContain("usageHistoryDisposition");
+    expect(bulkPath).not.toContain("bulkManagedApiKeyHistoryDisposition");
+    expect(bulkPath).not.toContain("usageHistoryDisposition");
     expect(bulkPath).toContain("queueManagedApiUsageFingerprintRefresh");
     expect(bulkPath).not.toContain("getSharedKeyMonthlyCreditUsageForAccounts");
     expect(bulkPath).not.toContain("批量操作已全部停止");

@@ -50,7 +50,7 @@ import {
   reserveKnowledgeBaseStart,
   sanitizeBrandText,
   stageKnowledgeBaseTurnAttachment,
-  uploadFile,
+  uploadKnowledgeBaseLocalAsset,
   type FileUploadRecordEvent,
   type ManagedUploadHandle,
   type OutputMessage,
@@ -533,11 +533,33 @@ function uploadFileRecordId(event: FileUploadRecordEvent) {
   return event.fileId;
 }
 
+type KnowledgeBaseStarterUploadImplementation = (
+  file: File,
+  onProgress?: (percent: number) => void,
+  retryConfig?: {
+    maxRetries: number;
+    initialDelay: number;
+    maxDelay: number;
+  },
+  options?: UploadFileOptions,
+) => Promise<{
+  fileId: string;
+  filename: string;
+  sizeBytes?: number;
+  uploadedAt?: number;
+  providerReadyAt?: number;
+  expiresAt?: number;
+  replayed?: boolean;
+  recovered?: boolean;
+  traceId?: string;
+}>;
+
 export async function uploadKnowledgeBaseStarterFiles(
   files: File[],
   lifecycle: KnowledgeBaseStarterLifecycle,
   responseStartedAt: number,
-  uploadImplementation: typeof uploadFile = uploadFile,
+  uploadImplementation: KnowledgeBaseStarterUploadImplementation =
+    uploadKnowledgeBaseLocalAsset,
 ) {
   const receipts = new Map(lifecycle.uploadedReceipts);
   const uploadedAttachments: Array<{
@@ -671,7 +693,9 @@ export async function uploadKnowledgeBaseStarterFiles(
             });
           },
         };
-        let uploaded: Awaited<ReturnType<typeof uploadFile>>;
+        let uploaded: Awaited<
+          ReturnType<KnowledgeBaseStarterUploadImplementation>
+        >;
         try {
           uploaded = await uploadImplementation(
             file,
@@ -1025,12 +1049,8 @@ function filterWaitingText(content: string): string {
 
 /**
  * Fetch a file URL with auth headers and return a blob URL.
- * Works for both /api/frontmind/v1/files/ URLs, proxy-download URLs, and external URLs.
- *
- * The server proxy now handles:
- * - /v1/files/:id → fetches metadata, then downloads binary from S3
- * - /proxy-download?url=... → proxies binary from external URLs
- * So this function should receive proper binary content.
+ * Dashboard-owned artifact URLs are served locally; explicit external URLs
+ * are routed through the authenticated proxy-download boundary.
  */
 function buildProxyDownloadUrl(
   fileUrl: string,

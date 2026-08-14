@@ -44,6 +44,7 @@ import {
 } from "./service-entitlement";
 import { getUpstreamBaseUrl } from "./upstream-config";
 import { knowledgeSnapshotArchiveStorageKey } from "./knowledge-snapshot-archive-store";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 
 const ACTIVE_TICKET_STATUSES = [
   "submitted",
@@ -1031,20 +1032,15 @@ export async function processKnowledgeResetCleanupJobs() {
           job.upstreamId,
         );
         if (!credential) throw new Error("上游资源凭据已不可用");
-        const response = await fetch(
-          `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(job.upstreamId)}`,
-          {
-            method: "DELETE",
-            redirect: "error",
-            headers: {
-              API_KEY: credential.apiKey,
-              Authorization: `Bearer ${credential.apiKey}`,
-            },
-            signal: AbortSignal.timeout(30_000),
-          },
-        );
-        if (!response.ok && response.status !== 404) {
-          throw new Error(`上游删除失败（HTTP ${response.status}）`);
+        try {
+          await new ManusV2Client({
+            baseUrl: getUpstreamBaseUrl(),
+            apiKey: credential.apiKey,
+          }).deleteFile(job.upstreamId);
+        } catch (error) {
+          if (!(error instanceof ManusV2ApiError && error.status === 404)) {
+            throw error;
+          }
         }
       }
       await db.transaction(async (tx) => {

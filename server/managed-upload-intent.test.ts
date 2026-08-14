@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  axiosCreate: vi.fn(),
   axiosPost: vi.fn(),
   axiosPut: vi.fn(),
   axiosGet: vi.fn(),
@@ -20,6 +21,93 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("axios", () => ({
   default: {
+    create: mocks.axiosCreate.mockImplementation((defaults) => ({
+      post: async (url: string, body: unknown, options: object) => {
+        const requestOptions = {
+          ...options,
+          headers: {
+            ...(defaults?.headers ?? {}),
+            ...((options as { headers?: object })?.headers ?? {}),
+          },
+        };
+        const response = url.endsWith("/v2/file.delete")
+          ? await mocks.axiosDelete(url, {
+              ...requestOptions,
+              data: body,
+            })
+          : await mocks.axiosPost(url, body, requestOptions);
+        const data = response?.data ?? {};
+        if (url.endsWith("/v2/file.upload")) {
+          if (response.status < 200 || response.status >= 300) {
+            return {
+              ...response,
+              data: {
+                ok: false,
+                error: {
+                  code:
+                    response.status === 429
+                      ? "RATE_LIMITED"
+                      : `HTTP_${response.status}`,
+                },
+              },
+            };
+          }
+          return {
+            ...response,
+            data: {
+              ok: true,
+              file: { id: data.id, filename: data.filename },
+              upload_url: data.upload_url,
+              upload_expires_at:
+                Number(data.upload_expires_at) > 10_000_000_000
+                  ? Math.floor(Number(data.upload_expires_at) / 1_000)
+                  : data.upload_expires_at,
+            },
+          };
+        }
+        if (url.endsWith("/v2/file.delete")) {
+          if (response.status === 404) {
+            return {
+              ...response,
+              data: { ok: false, error: { code: "NOT_FOUND" } },
+            };
+          }
+          return {
+            ...response,
+            data: { ok: true, file: { id: (body as any).file_id } },
+          };
+        }
+        return response;
+      },
+      get: async (url: string, options: any) => {
+        const response = await mocks.axiosGet(url, options);
+        if (!url.endsWith("/v2/file.detail")) return response;
+        if (response.status === 404) {
+          return {
+            ...response,
+            data: { ok: false, error: { code: "NOT_FOUND" } },
+          };
+        }
+        const data = response?.data ?? {};
+        return {
+          ...response,
+          data:
+            data.ok === true
+              ? data
+              : {
+                  ok: true,
+                  file: {
+                    id: options.params.file_id,
+                    filename: data.filename ?? "provider-document.pdf",
+                    status: data.status ?? "uploaded",
+                    bytes: data.bytes ?? 11,
+                    expires_at: 2_000_000_000,
+                    content_type: "application/pdf",
+                  },
+                },
+        };
+      },
+    })),
     post: mocks.axiosPost,
     put: mocks.axiosPut,
     get: mocks.axiosGet,
@@ -950,7 +1038,7 @@ describe("stage-first managed upload intents", () => {
     });
   });
 
-  it("persists and safely discards a known create identity with a missing official status", async () => {
+  it("accepts the v2 file.upload contract without a legacy status field", async () => {
     const { sealed } = await sealIntent();
     mocks.axiosPost.mockResolvedValue({
       status: 201,
@@ -961,7 +1049,14 @@ describe("stage-first managed upload intents", () => {
         upload_expires_at: Date.now() + 180_000,
       },
     });
-    mocks.axiosDelete.mockResolvedValue({ status: 204, data: "" });
+    mocks.axiosPut.mockImplementation(consumeSuccessfulPut);
+    mocks.readiness.mockResolvedValue({
+      fileId: "provider-invalid-capability",
+      filename: "provider-document.pdf",
+      state: "uploaded",
+      status: "uploaded",
+      checkedAt: Date.now(),
+    });
 
     await expect(
       processManagedUploadIntent({
@@ -969,22 +1064,23 @@ describe("stage-first managed upload intents", () => {
         userId: 42,
         traceId: "trace-invalid-capability",
       }),
-    ).rejects.toMatchObject({ code: "UPLOAD_PROVIDER_RESPONSE_INVALID" });
+    ).resolves.toMatchObject({
+      state: "uploaded",
+      fileId: "provider-invalid-capability",
+    });
 
     expect(mocks.recordResource).toHaveBeenCalledWith(
       expect.objectContaining({ upstreamId: "provider-invalid-capability" }),
     );
-    expect(mocks.discardResource).toHaveBeenCalledWith(
-      expect.objectContaining({ fileId: "provider-invalid-capability" }),
-    );
-    expect(mocks.axiosPut).not.toHaveBeenCalled();
+    expect(mocks.discardResource).not.toHaveBeenCalled();
+    expect(mocks.axiosPut).toHaveBeenCalledOnce();
     expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
-      state: "failed",
+      state: "uploaded",
       provider: [
         expect.objectContaining({
           fileId: "provider-invalid-capability",
-          state: "discarded",
-          ownershipRecorded: false,
+          state: "uploaded",
+          ownershipRecorded: true,
         }),
       ],
     });

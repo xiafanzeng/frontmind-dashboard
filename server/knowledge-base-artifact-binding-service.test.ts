@@ -13,6 +13,7 @@ import {
   knowledgeBaseArchiveReadContractVersions,
   knowledgeBaseArchiveWriteContractVersions,
   knowledgeBaseExistingLogoUploadBindingDecision,
+  knowledgeBaseAllowsFirstLeafLogoReplacement,
   knowledgeBaseInitialLogoRejectionCode,
   knowledgeBaseStagedArtifactCleanupDecision,
   probeKnowledgeBaseInitialLogoCandidates,
@@ -197,6 +198,56 @@ describe("knowledge-base Logo descriptor normalization", () => {
         allowReplacement: true,
       }),
     ).toBe("replace_artifact");
+  });
+
+  it("allows a materialized v5 Logo replacement only before the first leaf is confirmed", () => {
+    const allowReplacement = knowledgeBaseAllowsFirstLeafLogoReplacement({
+      requested: true,
+      skillVersion: "5",
+      executionMode: "materialized_bundle_v1",
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+    });
+    expect(allowReplacement).toBe(true);
+    expect(
+      knowledgeBaseExistingLogoUploadBindingDecision({
+        buildLogoSha256: "a".repeat(64),
+        buildLogoBytes: 100,
+        buildLogoMimeType: "image/png",
+        stagedSha256: "b".repeat(64),
+        stagedBytes: 120,
+        stagedMimeType: "image/png",
+        existingUpload: null,
+        verifiedUpload: {
+          verified: true,
+          index: 0,
+          fileId: "replacement-logo",
+          filename: "replacement-logo.png",
+          mimeType: "image/png",
+          sizeBytes: 120,
+          sourceSha256: "b".repeat(64),
+        },
+        allowReplacement,
+      }),
+    ).toBe("replace_artifact");
+    expect(
+      knowledgeBaseAllowsFirstLeafLogoReplacement({
+        requested: true,
+        skillVersion: "5",
+        executionMode: "materialized_bundle_v1",
+        confirmedCount: 1,
+        directPrefilledCount: 0,
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseAllowsFirstLeafLogoReplacement({
+        requested: true,
+        skillVersion: "5",
+        executionMode: "legacy_conversational",
+        confirmedCount: 0,
+        directPrefilledCount: 0,
+      }),
+    ).toBe(false);
   });
 
   it("recovers the v4 official Logo without treating ordinary upload assets as candidates", () => {

@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  agentOperations,
   apiCredentials,
   apiKeyOwnership,
   attachments,
@@ -10,6 +11,7 @@ import {
   deliveryTickets,
   knowledgeBaseBuilds,
   knowledgeBaseResetRequests,
+  providerFileLeases,
   upstreamResources,
   users,
   websiteStyleSampleBatches,
@@ -451,6 +453,7 @@ describe("API credential encryption", () => {
       version: 3,
       status: "active",
       encryptedKey: "encrypted",
+      agentProfile: null,
     };
     const inserted: Array<Record<string, unknown>> = [];
     const executor = {
@@ -470,6 +473,15 @@ describe("API credential encryption", () => {
           }
           if (table === upstreamResources) {
             return { where: vi.fn(() => mockLockedRows([])) };
+          }
+          if (table === agentOperations || table === providerFileLeases) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            };
           }
           if (table === knowledgeBaseBuilds) {
             return {
@@ -521,6 +533,7 @@ describe("API credential encryption", () => {
     expect(inserted[0]).toMatchObject({
       userId: 42,
       version: 4,
+      agentProfile: "frontmind-pro",
       status: "deleted",
       validationStatus: "unverified",
     });
@@ -578,6 +591,159 @@ describe("API credential encryption", () => {
       code: "CONFLICT",
       message: expect.stringContaining("知识库轮次"),
     });
+    expect(update).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("blocks credential revocation while a v2 operation is non-terminal", async () => {
+    const active = {
+      id: randomUUID(),
+      userId: 42,
+      version: 3,
+      status: "active",
+      encryptedKey: "still-decryptable",
+    };
+    const update = vi.fn();
+    const insert = vi.fn();
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === apiCredentials) {
+            return {
+              where: vi.fn(() => ({
+                orderBy: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([active]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === conversationTurns) {
+            return {
+              innerJoin: vi.fn(() => ({
+                where: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === upstreamResources) {
+            return { where: vi.fn(() => mockLockedRows([])) };
+          }
+          if (table === agentOperations) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([{ id: "operation-live" }]),
+                })),
+              })),
+            };
+          }
+          if (table === providerFileLeases) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            };
+          }
+          throw new Error("unexpected table in v2 revocation test");
+        }),
+      })),
+      update,
+      insert,
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        fenceToken: credentialFenceToken(42, active.id),
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining("v2 任务或文件上传"),
+    });
+    expect(active.encryptedKey).toBe("still-decryptable");
+    expect(update).not.toHaveBeenCalled();
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("blocks credential revocation while a v2 provider upload outcome is unresolved", async () => {
+    const active = {
+      id: randomUUID(),
+      userId: 42,
+      version: 3,
+      status: "active",
+      encryptedKey: "still-decryptable",
+    };
+    const update = vi.fn();
+    const insert = vi.fn();
+    const executor = {
+      select: vi.fn(() => ({
+        from: vi.fn((table) => {
+          if (table === apiCredentials) {
+            return {
+              where: vi.fn(() => ({
+                orderBy: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([active]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === conversationTurns) {
+            return {
+              innerJoin: vi.fn(() => ({
+                where: vi.fn(() => ({
+                  limit: vi.fn(() => ({
+                    for: vi.fn().mockResolvedValue([]),
+                  })),
+                })),
+              })),
+            };
+          }
+          if (table === upstreamResources) {
+            return { where: vi.fn(() => mockLockedRows([])) };
+          }
+          if (table === agentOperations) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            };
+          }
+          if (table === providerFileLeases) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([{ id: "lease-unknown" }]),
+                })),
+              })),
+            };
+          }
+          throw new Error("unexpected table in v2 lease revocation test");
+        }),
+      })),
+      update,
+      insert,
+    };
+
+    await expect(
+      deleteActiveApiCredentialInTransaction({
+        executor,
+        userId: 42,
+        fenceToken: credentialFenceToken(42, active.id),
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(active.encryptedKey).toBe("still-decryptable");
     expect(update).not.toHaveBeenCalled();
     expect(insert).not.toHaveBeenCalled();
   });
@@ -730,6 +896,15 @@ describe("API credential encryption", () => {
           if (table === upstreamResources) {
             return { where: vi.fn(() => mockLockedRows([])) };
           }
+          if (table === agentOperations || table === providerFileLeases) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
+            };
+          }
           expect(table).toBe(conversationTurns);
           return {
             innerJoin: vi.fn(() => ({
@@ -820,6 +995,15 @@ describe("API credential encryption", () => {
                 // not the current replacement selected above.
                 mockLockedRows([]),
               ),
+            };
+          }
+          if (table === agentOperations || table === providerFileLeases) {
+            return {
+              where: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  for: vi.fn().mockResolvedValue([]),
+                })),
+              })),
             };
           }
           expect(table).toBe(conversationTurns);

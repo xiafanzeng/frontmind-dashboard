@@ -96,7 +96,7 @@ describe("runtime health route contract", () => {
     expect(readiness).toContain("violationCount:");
   });
 
-  it("keeps internal rollout authority available without publishing it", async () => {
+  it("removes the legacy writer and active-migration rollout control plane", async () => {
     const source = await fs.readFile(
       path.resolve("server/_core/index.ts"),
       "utf8",
@@ -105,18 +105,16 @@ describe("runtime health route contract", () => {
     const listener = source.indexOf("server.listen(", readinessStart);
     const readiness = source.slice(readinessStart, listener);
 
-    expect(source).toContain("knowledgeBaseManusV2WriterEnabled()");
-    expect(source).toContain("knowledgeBaseManusV2ActiveMigrationEnabled()");
+    expect(source).not.toContain("knowledgeBaseManusV2WriterEnabled()");
+    expect(source).not.toContain("knowledgeBaseManusV2ActiveMigrationEnabled()");
     expect(readiness).not.toContain("knowledgeBaseManusV2Writer:");
     expect(readiness).not.toContain("knowledgeBaseManusV2ActiveMigration:");
-    expect(source).toContain('"[KnowledgeBase] manus_v2_writer"');
-    expect(source).toContain('"[KnowledgeBase] manus_v2_active_migration"');
-    expect(source).toMatch(
-      /knowledgeBaseManusV2ActiveMigration[\s\S]*\? \{[\s\S]*migrateActiveLegacyBuilds/u,
-    );
+    expect(source).not.toContain('"[KnowledgeBase] manus_v2_writer"');
+    expect(source).not.toContain('"[KnowledgeBase] manus_v2_active_migration"');
+    expect(source).not.toContain("migrateActiveLegacyBuilds");
   });
 
-  it("keeps active-migration diagnostics internal", async () => {
+  it("removes active-migration diagnostics from the runtime", async () => {
     const source = await fs.readFile(
       path.resolve("server/_core/index.ts"),
       "utf8",
@@ -133,9 +131,10 @@ describe("runtime health route contract", () => {
     expect(source.slice(responseStart, listener)).not.toContain(
       "knowledgeBaseMigrationDiagnostics.snapshot",
     );
-    expect(source.slice(listener)).toContain(
+    expect(source.slice(listener)).not.toContain(
       "knowledgeBaseMigrationDiagnostics.recordSweep",
     );
+    expect(source).not.toContain("knowledgeBaseMigrationDiagnostics.snapshot");
   });
 
   it("exposes build-local degradation without using it in the readiness decision", async () => {

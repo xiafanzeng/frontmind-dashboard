@@ -1,10 +1,7 @@
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
-import { basename, extname, join, relative, resolve } from "node:path";
+import { extname, join, relative, resolve } from "node:path";
 import JSZip from "jszip";
-import {
-  canonicalKnowledgeBaseSkillArchiveHash,
-  legacyKnowledgeBaseSkillInstructionHash,
-} from "../shared/knowledge-base-skill-archive-hash.js";
+import { canonicalKnowledgeBaseSkillArchiveHash } from "../shared/knowledge-base-skill-archive-hash.js";
 import { assertCleanProductionBuildSource } from "./assert-clean-build-source.mjs";
 import { verifyBuildArtifactManifest } from "./build-artifact-identity.mjs";
 import {
@@ -138,10 +135,7 @@ function withoutApprovedBranding(content) {
 }
 
 const requiredSkillFiles = [
-  "private-workflows/socratic-kb-builder.skill",
-  "private-workflows/socratic-kb-builder-v1.skill",
-  "private-workflows/socratic-kb-builder-v3.skill",
-  "private-workflows/socratic-kb-builder-v4.skill",
+  "private-workflows/socratic-kb-builder-v5.skill",
   "private-workflows/brand-question-portfolio.skill/SKILL.md",
   "private-workflows/brand-question-portfolio.skill/references/output-contract.md",
   "private-workflows/response-logic-builder.skill/SKILL.md",
@@ -176,10 +170,7 @@ const requiredRuntimeFiles = [
   "verify-presales-file-roundtrip.js",
 ];
 const runtimeSkillRoots = [
-  "private-workflows/socratic-kb-builder.skill",
-  "private-workflows/socratic-kb-builder-v1.skill",
-  "private-workflows/socratic-kb-builder-v3.skill",
-  "private-workflows/socratic-kb-builder-v4.skill",
+  "private-workflows/socratic-kb-builder-v5.skill",
   "private-workflows/brand-question-portfolio.skill",
   "private-workflows/response-logic-builder.skill",
 ];
@@ -187,9 +178,10 @@ const requiredKnowledgeBaseEntries = [
   "SKILL.md",
   "agents/openai.yaml",
   "references/knowledge-tree.md",
+  "references/materialized-working-set.md",
   "references/questioning-strategy.md",
   "references/output-format.md",
-  "scripts/validate_archive.py",
+  "scripts/validate_working_set.py",
 ];
 const allowedKnowledgeBaseArchiveEntries = new Set([
   ...requiredKnowledgeBaseEntries,
@@ -292,13 +284,39 @@ assertCleanProductionBuildSource({
 const violations = [];
 try {
   const skillRoot = join(buildRoot, "private-workflows");
-  const aliasNames = (await readdir(skillRoot)).filter((name) =>
-    /^socratic-kb-builder-v[34]-[a-f0-9]{64}\.skill$/u.test(name),
+  const skillNames = await readdir(skillRoot);
+  const v5AliasName = "socratic-kb-builder-v5.skill";
+  const v5AliasBytes = await readFile(join(skillRoot, v5AliasName));
+  const canonicalHash =
+    await canonicalKnowledgeBaseSkillArchiveHash(v5AliasBytes);
+  const exactV5Name = `socratic-kb-builder-v5-${canonicalHash}.skill`;
+  const allowedKnowledgeBaseArchives = new Set([v5AliasName, exactV5Name]);
+  const knowledgeBaseArchives = skillNames.filter(
+    (name) => name.startsWith("socratic-kb-builder") && name.endsWith(".skill"),
   );
-  const records = [];
-  for (const name of aliasNames) {
+  for (const name of knowledgeBaseArchives) {
+    if (!allowedKnowledgeBaseArchives.has(name)) {
+      violations.push({
+        file: `private-workflows/${name}`,
+        label: "legacy or unpinned knowledge-base Skill archive in runtime",
+      });
+    }
+  }
+  if (!skillNames.includes(exactV5Name)) {
+    violations.push({
+      file: `private-workflows/${exactV5Name}`,
+      label: "missing exact-hash Skill v5 runtime artifact",
+    });
+  }
+  for (const name of [v5AliasName, exactV5Name]) {
     const archivePath = join(skillRoot, name);
     const bytes = await readFile(archivePath);
+    if (!bytes.equals(v5AliasBytes)) {
+      violations.push({
+        file: `private-workflows/${name}`,
+        label: "Skill v5 alias and exact-hash artifact differ",
+      });
+    }
     const archive = await JSZip.loadAsync(bytes);
     const entryNames = Object.keys(archive.files);
     for (const [entryName, entry] of Object.entries(archive.files)) {
@@ -312,7 +330,7 @@ try {
       ) {
         violations.push({
           file: `${relative(projectRoot, archivePath)}:${entryName}`,
-          label: "invalid historical Skill archive entry",
+          label: "invalid Skill v5 archive entry",
         });
       }
       if (entry.dir) continue;
@@ -334,34 +352,19 @@ try {
         });
       }
     }
-    records.push({
-      name,
-      pinnedHash: basename(name, ".skill").split("-").at(-1),
-      canonicalHash: await canonicalKnowledgeBaseSkillArchiveHash(bytes),
-      legacyHash: await legacyKnowledgeBaseSkillInstructionHash(bytes),
-    });
-  }
-  for (const record of records) {
-    const direct =
-      record.pinnedHash === record.canonicalHash ||
-      record.pinnedHash === record.legacyHash;
-    const anchored = records.some(
-      (candidate) =>
-        candidate.canonicalHash === record.canonicalHash &&
-        (candidate.pinnedHash === candidate.canonicalHash ||
-          candidate.pinnedHash === candidate.legacyHash),
-    );
-    if (!direct && !anchored) {
+    if (
+      (await canonicalKnowledgeBaseSkillArchiveHash(bytes)) !== canonicalHash
+    ) {
       violations.push({
-        file: `private-workflows/${record.name}`,
-        label: "historical Skill alias has no canonical or legacy anchor",
+        file: `private-workflows/${name}`,
+        label: "Skill v5 artifact does not match its exact canonical hash",
       });
     }
   }
 } catch {
   violations.push({
-    file: "private-workflows/socratic-kb-builder-v3/v4-<hash>.skill",
-    label: "historical runtime Skill aliases cannot be audited",
+    file: "private-workflows/socratic-kb-builder-v5[-<hash>].skill",
+    label: "Skill v5 runtime artifacts cannot be audited",
   });
 }
 for (const sourceRoot of ["client", "server"]) {
@@ -486,62 +489,6 @@ for (const relativeRoot of runtimeSkillRoots) {
       label: "runtime Skill artifact cannot be compared with source",
     });
   }
-}
-
-try {
-  const archivePath = join(
-    buildRoot,
-    "private-workflows",
-    "socratic-kb-builder-v4.skill",
-  );
-  const archive = await JSZip.loadAsync(await readFile(archivePath));
-  for (const [entryName, entry] of Object.entries(archive.files)) {
-    const originalName = entry.unsafeOriginalName || entryName;
-    const unsafePath =
-      originalName.startsWith("/") ||
-      /^[A-Za-z]:/.test(originalName) ||
-      originalName.includes("\\") ||
-      originalName.split("/").includes("..");
-    if (unsafePath) {
-      violations.push({
-        file: `${relative(projectRoot, archivePath)}:${entryName}`,
-        label: "unsafe Skill archive entry path",
-      });
-      continue;
-    }
-    if (!allowedKnowledgeBaseArchiveEntries.has(entryName)) {
-      violations.push({
-        file: `${relative(projectRoot, archivePath)}:${entryName}`,
-        label: "unexpected Skill archive entry",
-      });
-      continue;
-    }
-    if (entry.dir) continue;
-    const content = await entry.async("string");
-    for (const rule of forbiddenPatterns) {
-      if (rule.pattern.test(content)) {
-        violations.push({
-          file: `${relative(projectRoot, archivePath)}:${entryName}`,
-          label: rule.label,
-        });
-      }
-    }
-  }
-  for (const entryName of requiredKnowledgeBaseEntries) {
-    const entry = archive.file(entryName);
-    if (!entry) {
-      violations.push({
-        file: relative(projectRoot, archivePath),
-        label: `missing Skill entry ${entryName}`,
-      });
-      continue;
-    }
-  }
-} catch {
-  violations.push({
-    file: "private-workflows/socratic-kb-builder-v4.skill",
-    label: "invalid runtime Skill archive",
-  });
 }
 
 try {

@@ -9,7 +9,7 @@ import { Readable } from "node:stream";
 import axios from "axios";
 import { DrizzleQueryError } from "drizzle-orm";
 import express from "express";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const authMocks = vi.hoisted(() => ({
   discardUnboundUpstreamFile: vi.fn(),
@@ -79,6 +79,96 @@ import {
   openManagedUploadTicket,
 } from "./managed-upload-ticket";
 import { MANAGED_UPLOAD_POST_INGRESS_TIMEOUT_MS } from "./managed-upload-provider";
+
+beforeEach(() => {
+  vi.spyOn(axios, "create").mockImplementation(((
+    defaults: { headers?: Record<string, string> } = {},
+  ) => ({
+    get: async (
+      url: string,
+      options: { params?: Record<string, unknown>; headers?: object } = {},
+    ) => {
+      if (url.endsWith("/v2/file.detail")) {
+        const fileId = String(options.params?.file_id ?? "");
+        const response = await axios.get(
+          `${url.slice(0, -"/v2/file.detail".length)}/v1/files/${encodeURIComponent(fileId)}`,
+          {
+            ...options,
+            headers: { ...defaults.headers, ...options.headers },
+          },
+        );
+        if (response.status < 200 || response.status >= 300) {
+          return {
+            ...response,
+            data: {
+              ok: false,
+              error: { code: `HTTP_${response.status}` },
+            },
+          };
+        }
+        const data =
+          response.data &&
+          typeof response.data === "object" &&
+          !Array.isArray(response.data)
+            ? (response.data as Record<string, unknown>)
+            : {};
+        return {
+          ...response,
+          data: {
+            ok: true,
+            file: {
+              id: data.id ?? fileId,
+              filename: data.filename ?? "provider-document.pdf",
+              status: data.status ?? "uploaded",
+              bytes:
+                data.bytes ??
+                data.size ??
+                data.size_bytes ??
+                data.sizeBytes ??
+                null,
+              expires_at: 2_000_000_000,
+              content_type:
+                data.mime_type ?? data.content_type ?? "application/pdf",
+            },
+          },
+        };
+      }
+      return axios.get(url, {
+        ...options,
+        headers: { ...defaults.headers, ...options.headers },
+      });
+    },
+    post: async (
+      url: string,
+      body: Record<string, unknown>,
+      options: { headers?: object } = {},
+    ) => {
+      if (url.endsWith("/v2/file.delete")) {
+        const fileId = String(body.file_id ?? "");
+        const response = await axios.delete(
+          `${url.slice(0, -"/v2/file.delete".length)}/v1/files/${encodeURIComponent(fileId)}`,
+          {
+            ...options,
+            headers: { ...defaults.headers, ...options.headers },
+          },
+        );
+        return response.status === 404
+          ? {
+              ...response,
+              data: { ok: false, error: { code: "NOT_FOUND" } },
+            }
+          : {
+              ...response,
+              data: { ok: true, file: { id: fileId } },
+            };
+      }
+      return axios.post(url, body, {
+        ...options,
+        headers: { ...defaults.headers, ...options.headers },
+      });
+    },
+  })) as typeof axios.create);
+});
 
 async function withManusProxyServer(
   run: (baseUrl: string) => Promise<void>,
@@ -1369,7 +1459,7 @@ describe("proxy upload", () => {
       });
     });
 
-    it("adds a bound managed handle while keeping the raw provider filename inside the ticket", async () => {
+    it("rejects legacy blind file creation without contacting the Provider", async () => {
       await withManagedUploadKey(async () => {
         const fileId = "file-create-managed-handle";
         const providerFilename = "Manus 品牌资料.pdf";
@@ -1394,27 +1484,15 @@ describe("proxy upload", () => {
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ filename: providerFilename }),
             });
-            expect(response.status).toBe(200);
+            expect(response.status).toBe(410);
             const payload = await response.json();
             expect(payload).toMatchObject({
-              id: fileId,
-              proxy_upload_ticket: expect.stringMatching(/^mu1\./u),
-              proxy_upload_expires_at: expect.any(String),
+              error: {
+                code: "LEGACY_MANUS_V1_REMOVED",
+                resetRequired: true,
+              },
             });
-            expect(payload.filename).not.toBe(providerFilename);
-            expect(
-              openManagedUploadTicket(
-                payload.proxy_upload_ticket,
-                {
-                  fileId,
-                  ownerUserId: 42,
-                  credentialId: "credential-capture-test",
-                  projectAssignmentId: null,
-                  providerFilename,
-                },
-                { allowExpired: true },
-              ),
-            ).toMatchObject({ providerFilename, target });
+            expect(axios.request).not.toHaveBeenCalled();
           },
           { authenticated: true },
         );
@@ -1424,7 +1502,7 @@ describe("proxy upload", () => {
     it("accepts provider-authoritative filename changes after official pending metadata", async () => {
       await withCaptureAssetDirectory(async () => {
         await withManagedUploadKey(async () => {
-          const fileId = " file-opaque-managed ";
+          const fileId = "file-opaque-managed";
           const filename = "Manus 企业原始资料.pdf";
           const providerCanonicalFilename = "provider-canonical-name.pdf";
           const publicFilename = "FrontMind 企业原始资料.pdf";
@@ -1498,8 +1576,11 @@ describe("proxy upload", () => {
           expect(
             get.mock.calls.every(
               ([, config]) =>
-                (config as { headers?: { API_KEY?: string } }).headers
-                  ?.API_KEY === "bound-record-credential",
+                (
+                  config as {
+                    headers?: { "x-manus-api-key"?: string };
+                  }
+                ).headers?.["x-manus-api-key"] === "bound-record-credential",
             ),
           ).toBe(true);
           expect(
@@ -1747,7 +1828,7 @@ describe("proxy upload", () => {
       });
     });
 
-    it("requires content hash proof for an early response when uploaded metadata omits size and hash", async () => {
+    it("fails closed when v2 metadata cannot prove the uploaded byte count", async () => {
       await withCaptureAssetDirectory(async () => {
         const fileId = "file-content-proof";
         const filename = "proof.pdf";
@@ -1768,31 +1849,34 @@ describe("proxy upload", () => {
             data: Readable.from([source]),
           });
 
-        const result = await uploadCapturedStage({
-          baseUrl: "https://api.example.test",
-          apiKey: "bound-key",
-          fileId,
-          providerFilename: filename,
-          mimeType: "application/pdf",
-          target: managedUploadTarget(fileId),
-          ticketExpiresAt: Date.now() + 120_000,
-          staged,
-          initialProvider: {
-            status: 200,
-            errorCode: null,
-            providerPutMs: 1,
-            bytesForwarded: 0,
-            requestBodyComplete: false,
-            requestCreatedAtOffsetMs: 0,
-            providerStartedAtOffsetMs: 1,
-          },
-          requestStartedAt: Date.now(),
-          signal: new AbortController().signal,
-          traceId: "trace-content-proof",
-          ingressMs: 1,
+        await expect(
+          uploadCapturedStage({
+            baseUrl: "https://api.example.test",
+            apiKey: "bound-key",
+            fileId,
+            providerFilename: filename,
+            mimeType: "application/pdf",
+            target: managedUploadTarget(fileId),
+            ticketExpiresAt: Date.now() + 120_000,
+            staged,
+            initialProvider: {
+              status: 200,
+              errorCode: null,
+              providerPutMs: 1,
+              bytesForwarded: 0,
+              requestBodyComplete: false,
+              requestCreatedAtOffsetMs: 0,
+              providerStartedAtOffsetMs: 1,
+            },
+            requestStartedAt: Date.now(),
+            signal: new AbortController().signal,
+            traceId: "trace-content-proof",
+            ingressMs: 1,
+          }),
+        ).rejects.toMatchObject({
+          code: "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+          recoveryAction: "discard_and_recreate",
         });
-
-        expect(result).toEqual({ replayed: false, recovered: true });
         expect(get).toHaveBeenCalledTimes(2);
         await staged.discard();
       });
@@ -1860,7 +1944,7 @@ describe("proxy upload", () => {
           authMocks.getCredentialForUpstreamResource.mockResolvedValueOnce(
             boundUploadCredential(),
           );
-          vi.spyOn(axios, "get").mockResolvedValueOnce({
+          const get = vi.spyOn(axios, "get").mockResolvedValueOnce({
             status: 200,
             data: { id: fileId, filename, status },
           });
@@ -1890,7 +1974,7 @@ describe("proxy upload", () => {
             },
             { authenticated: true },
           );
-          vi.restoreAllMocks();
+          get.mockRestore();
         }
       });
     });
@@ -2311,10 +2395,9 @@ describe("discard unbound upload", () => {
         expect.stringMatching(`/v1/files/${fileId}$`),
         expect.objectContaining({
           headers: {
-            API_KEY: "bound-key-before-rotation",
-            Authorization: "Bearer bound-key-before-rotation",
+            "Content-Type": "application/json",
+            "x-manus-api-key": "bound-key-before-rotation",
           },
-          maxRedirects: 0,
         }),
       );
       expect(removePrepared).toHaveBeenCalledWith({
@@ -2535,7 +2618,7 @@ describe("owned file content download", () => {
     });
   });
 
-  it("uses only authenticated /content and durably recaptures a legacy file", async () => {
+  it("returns CONTENT_UNAVAILABLE when a legacy file has no local copy", async () => {
     await withCaptureAssetDirectory(async () => {
       const fileId = "legacy-upstream-file";
       const bytes = Buffer.from("legacy upstream content");
@@ -2557,31 +2640,16 @@ describe("owned file content download", () => {
           const response = await fetch(
             `${baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`,
           );
-          expect(response.status).toBe(200);
-          expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+          expect(response.status).toBe(410);
+          expect(await response.json()).toMatchObject({
+            error: { code: "CONTENT_UNAVAILABLE" },
+          });
         },
         { authenticated: true },
       );
 
-      expect(get).toHaveBeenCalledTimes(1);
-      expect(get.mock.calls[0]?.[0]).toMatch(
-        new RegExp(`/v1/files/${fileId}/content$`),
-      );
-      expect(get.mock.calls[0]?.[1]).toMatchObject({
-        maxRedirects: 0,
-        headers: {
-          API_KEY: "test-only-credential",
-          Authorization: "Bearer test-only-credential",
-        },
-      });
-      expect(get.mock.calls[0]?.[0]).not.toContain("upload_url");
-      const captured = await readStoredPresalesFile(fileId);
-      expect(captured).toMatchObject({
-        filename: "legacy.txt",
-        mimeType: "text/plain",
-        sizeBytes: bytes.length,
-      });
-      expect(await readAll(captured!.createReadStream())).toEqual(bytes);
+      expect(get).not.toHaveBeenCalled();
+      expect(await readStoredPresalesFile(fileId)).toBeNull();
     });
   });
 });

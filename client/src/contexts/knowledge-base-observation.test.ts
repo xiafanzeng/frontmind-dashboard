@@ -122,6 +122,50 @@ function conversation(): Conversation {
 }
 
 describe("authoritative KB observation reducer", () => {
+  it("renders only same-origin Working Set images and evidence from the approved projection", () => {
+    const projected = observation(1, "turn-assets", 1, "1.1", "产品节点正文");
+    projected.approvedPresentation!.resources = [
+      {
+        kind: "working_set_asset",
+        outputItemId: null,
+        fileId: null,
+        sameOriginUrl: `/api/knowledge-base/artifacts/build/working-set/assets/product/${"a".repeat(64)}`,
+        filename: "product.png",
+        mimeType: "image/png",
+        sha256: "a".repeat(64),
+        sizeBytes: 128,
+      },
+      {
+        kind: "working_set_evidence",
+        outputItemId: null,
+        fileId: null,
+        sameOriginUrl: `/api/knowledge-base/artifacts/build/working-set/evidence/1.1/${"b".repeat(64)}/${"c".repeat(64)}`,
+        filename: "source.md",
+        mimeType: "text/plain; charset=utf-8",
+        sha256: "c".repeat(64),
+        sizeBytes: 64,
+      },
+    ];
+
+    const next = applyKnowledgeBaseObservation(conversation(), projected);
+    const assistant = next.messages.find(
+      (message) => message.role === "assistant",
+    );
+    expect(assistant?.inlineImages).toEqual([
+      {
+        src: projected.approvedPresentation!.resources[0]!.sameOriginUrl,
+        alt: "product.png",
+      },
+    ]);
+    expect(assistant?.outputFiles).toEqual([
+      {
+        fileUrl: projected.approvedPresentation!.resources[1]!.sameOriginUrl,
+        fileName: "source.md",
+        mimeType: "text/plain; charset=utf-8",
+      },
+    ]);
+  });
+
   it("upgrades a final optimistic confirmation from completedTurn without inventing a presentation", () => {
     const finalObservation = {
       ...observation(3, "turn-final", 3, "1.3", null),
@@ -289,7 +333,8 @@ describe("authoritative KB observation reducer", () => {
     });
     expect(
       next.messages.find(
-        (message) => message.knowledgeBase?.presentationKey === presentationKey(8),
+        (message) =>
+          message.knowledgeBase?.presentationKey === presentationKey(8),
       )?.content,
     ).toContain("第八版正文");
   });
@@ -304,13 +349,7 @@ describe("authoritative KB observation reducer", () => {
         messageSequence: 70,
       },
     });
-    const advanced = observation(
-      8,
-      "turn-8",
-      8,
-      "1.8",
-      "## 1.8\n第八版正文",
-    );
+    const advanced = observation(8, "turn-8", 8, "1.8", "## 1.8\n第八版正文");
 
     const next = applyKnowledgeBaseObservation(current, advanced);
 
@@ -318,7 +357,8 @@ describe("authoritative KB observation reducer", () => {
     expect(next.knowledgeBase).toMatchObject({ stateEpoch: 8, revision: 8 });
     expect(
       next.messages.find(
-        (message) => message.knowledgeBase?.presentationKey === presentationKey(8),
+        (message) =>
+          message.knowledgeBase?.presentationKey === presentationKey(8),
       )?.content,
     ).toContain("第八版正文");
   });

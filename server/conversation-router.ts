@@ -24,8 +24,6 @@ import { uniquifyOrderedIds } from "../shared/ordered-id";
 import {
   type AuthenticatedUser,
   credentialMayServeAccount,
-  getEffectiveDecryptedCredentialForAccount,
-  isUpstreamApiKeyShared,
 } from "./auth-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { getDb } from "./db";
@@ -44,7 +42,6 @@ import {
   type ServerOwnedTurnIdentity,
 } from "./knowledge-base-authoritative-message";
 import { protectedProcedure, router } from "./_core/trpc";
-import { getUpstreamBaseUrl } from "./upstream-config";
 
 const attachmentSchema = z.object({
   id: z.string().min(1).max(128),
@@ -253,8 +250,6 @@ export function reconstructKnowledgeBaseUserMessageAttachments(input: {
 
 type UpstreamResourceRef = { kind: "task" | "file"; id: string };
 const LEGACY_IMPORT_MAX_RESOURCES = 200;
-const LEGACY_IMPORT_VALIDATION_CONCURRENCY = 4;
-const LEGACY_IMPORT_VALIDATION_TIMEOUT_MS = 30_000;
 type AttachmentRetention = {
   expiresAt: number;
   expired: boolean;
@@ -996,54 +991,18 @@ async function resolveTaskPointersForSnapshot(
 }
 
 /**
- * A client-supplied legacy ID is not ownership proof. Before writing a new
- * ledger row, verify that the credential selected for this conversation can
- * actually read the resource from the upstream API.
+ * v2-only imports may preserve local text, but a browser-supplied Provider ID
+ * can never be adopted. Old task/file conversations must restart under the
+ * local task/asset contract; no Key is probed and no Provider request occurs.
  */
-export async function validateUpstreamResourceAccess(
-  apiKey: string,
-  kind: "task" | "file",
-  upstreamId: string,
-  request: typeof fetch = fetch,
-  signal: AbortSignal = AbortSignal.timeout(15_000),
+export function assertLocalImportHasNoProviderResources(
+  resources: readonly UpstreamResourceRef[],
 ) {
-  let response: Response;
-  try {
-    const collection = kind === "task" ? "tasks" : "files";
-    response = await request(
-      `${getUpstreamBaseUrl()}/v1/${collection}/${encodeURIComponent(upstreamId)}`,
-      {
-        method: "GET",
-        redirect: "error",
-        headers: {
-          API_KEY: apiKey,
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json",
-        },
-        signal,
-      },
-    );
-  } catch {
-    throw new TRPCError({
-      code: "SERVICE_UNAVAILABLE",
-      message: "上游服务暂时不可用，无法验证历史任务或文件归属",
-    });
-  }
-
-  const { ok, status } = response;
-  await response.body?.cancel().catch(() => undefined);
-  if (status === 401 || status === 403 || status === 404) {
-    throw new TRPCError({
-      code: "FORBIDDEN",
-      message: "当前 API Key 无法访问该历史任务或文件",
-    });
-  }
-  if (!ok) {
-    throw new TRPCError({
-      code: "SERVICE_UNAVAILABLE",
-      message: "上游服务暂时无法验证历史任务或文件归属",
-    });
-  }
+  if (resources.length === 0) return;
+  throw new TRPCError({
+    code: "PRECONDITION_FAILED",
+    message: "旧任务或文件会话不再导入；请新建内容流程并重新上传本地资料",
+  });
 }
 
 async function persistResource(
@@ -2161,49 +2120,6 @@ export async function persistSnapshot(
   return existing ? "updated" : "imported";
 }
 
-async function validateWithBoundedConcurrency(
-  resources: UpstreamResourceRef[],
-  apiKey: string,
-) {
-  if (resources.length === 0) return;
-  const abortController = new AbortController();
-  const signal = AbortSignal.any([
-    abortController.signal,
-    AbortSignal.timeout(LEGACY_IMPORT_VALIDATION_TIMEOUT_MS),
-  ]);
-  let nextIndex = 0;
-  const worker = async () => {
-    while (nextIndex < resources.length) {
-      const resource = resources[nextIndex];
-      nextIndex += 1;
-      await validateUpstreamResourceAccess(
-        apiKey,
-        resource.kind,
-        resource.id,
-        fetch,
-        signal,
-      );
-    }
-  };
-
-  try {
-    await Promise.all(
-      Array.from(
-        {
-          length: Math.min(
-            LEGACY_IMPORT_VALIDATION_CONCURRENCY,
-            resources.length,
-          ),
-        },
-        () => worker(),
-      ),
-    );
-  } catch (error) {
-    abortController.abort();
-    throw error;
-  }
-}
-
 async function prepareLegacyImport(
   userId: number,
   projectAssignmentId: string | null,
@@ -2226,6 +2142,7 @@ async function prepareLegacyImport(
       !existingIds.has(storageId(userId, snapshot.id, projectAssignmentId)),
   );
   const resources = collectSnapshotResourceRefs(newSnapshots);
+  assertLocalImportHasNoProviderResources(resources);
   if (resources.length === 0) {
     return {
       credentialId: undefined,
@@ -2233,91 +2150,11 @@ async function prepareLegacyImport(
     };
   }
 
-  const taskIds = resources
-    .filter((item) => item.kind === "task")
-    .map((item) => item.id);
-  const fileIds = resources
-    .filter((item) => item.kind === "file")
-    .map((item) => item.id);
-  const [knownTasks, knownFiles] = await Promise.all([
-    taskIds.length === 0
-      ? []
-      : db
-          .select({
-            kind: upstreamResources.kind,
-            upstreamId: upstreamResources.upstreamId,
-            userId: upstreamResources.userId,
-            projectAssignmentId: upstreamResources.projectAssignmentId,
-          })
-          .from(upstreamResources)
-          .where(
-            and(
-              eq(upstreamResources.kind, "task"),
-              inArray(upstreamResources.upstreamId, taskIds),
-            ),
-          ),
-    fileIds.length === 0
-      ? []
-      : db
-          .select({
-            kind: upstreamResources.kind,
-            upstreamId: upstreamResources.upstreamId,
-            userId: upstreamResources.userId,
-            projectAssignmentId: upstreamResources.projectAssignmentId,
-          })
-          .from(upstreamResources)
-          .where(
-            and(
-              eq(upstreamResources.kind, "file"),
-              inArray(upstreamResources.upstreamId, fileIds),
-            ),
-          ),
-  ]);
-  const known = new Set<string>();
-  for (const resource of [...knownTasks, ...knownFiles]) {
-    const owned = projectAssignmentId
-      ? resource.projectAssignmentId === projectAssignmentId
-      : resource.userId === userId && resource.projectAssignmentId == null;
-    if (!owned) {
-      throw new TRPCError({
-        code: "FORBIDDEN",
-        message: "历史任务或文件已属于其他账号",
-      });
-    }
-    known.add(upstreamResourceKey(resource.kind, resource.upstreamId));
-  }
-
-  const unknown = resources.filter(
-    (resource) => !known.has(upstreamResourceKey(resource.kind, resource.id)),
-  );
-  if (unknown.length === 0) {
-    return {
-      credentialId: undefined,
-      validatedResourceKeys: new Set<string>(),
-    };
-  }
-  const credential = await getEffectiveDecryptedCredentialForAccount(userId);
-  if (!credential) {
-    throw new TRPCError({
-      code: "PRECONDITION_FAILED",
-      message: "请先迁移或配置该会话原来使用的 API Key，再导入历史会话",
-    });
-  }
-  if (await isUpstreamApiKeyShared(userId, credential.fingerprint)) {
-    throw new TRPCError({
-      code: "PRECONDITION_FAILED",
-      message:
-        "共享 API Key 无法证明未知历史任务或文件的账号归属，请由系统管理员完成迁移",
-    });
-  }
-  await validateWithBoundedConcurrency(unknown, credential.apiKey);
+  // The assertion above is exhaustive, but keep a total return for type-flow
+  // analysis in case the resource collector changes in the future.
   return {
-    credentialId: credential.id,
-    validatedResourceKeys: new Set(
-      unknown.map((resource) =>
-        upstreamResourceKey(resource.kind, resource.id),
-      ),
-    ),
+    credentialId: undefined,
+    validatedResourceKeys: new Set<string>(),
   };
 }
 

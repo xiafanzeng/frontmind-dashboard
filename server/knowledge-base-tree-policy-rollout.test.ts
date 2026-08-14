@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
-  KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
+  KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
   KNOWLEDGE_BASE_TREE_POLICY_V2_WRITER_ENV,
   knowledgeBaseNewBuildPolicyBinding,
   knowledgeBaseNewBuildTreePolicyVersion,
@@ -31,15 +30,15 @@ describe("knowledge-base tree-policy v2 writer rollout", () => {
     ).toBe(2);
   });
 
-  it("binds each writer policy to its immutable v4 Skill archive", () => {
+  it("binds every new build to the immutable materialized v5 Skill", () => {
     expect(
       knowledgeBaseNewBuildPolicyBinding({
         [KNOWLEDGE_BASE_TREE_POLICY_V2_WRITER_ENV]: "false",
       }),
     ).toEqual({
-      treePolicyVersion: 1,
-      skillVersion: "4",
-      skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
+      treePolicyVersion: 2,
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
     });
     expect(
       knowledgeBaseNewBuildPolicyBinding({
@@ -47,8 +46,8 @@ describe("knowledge-base tree-policy v2 writer rollout", () => {
       }),
     ).toEqual({
       treePolicyVersion: 2,
-      skillVersion: "4",
-      skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
     });
   });
 

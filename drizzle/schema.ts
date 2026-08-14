@@ -155,6 +155,12 @@ export const apiCredentials = mysqlTable(
     encryptionIv: varchar("encryptionIv", { length: 32 }).notNull(),
     encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
     fingerprint: varchar("fingerprint", { length: 32 }).notNull(),
+    /**
+     * Nullable only for rows created before migration 0062. Every new
+     * credential write supplies an explicit profile; readers normalize a
+     * legacy NULL to frontmind-pro.
+     */
+    agentProfile: varchar("agent_profile", { length: 32 }),
     status: mysqlEnum("status", ["active", "retired", "deleted"])
       .default("active")
       .notNull(),
@@ -224,6 +230,230 @@ export const presalesApiCredentials = mysqlTable(
     index("presales_api_credentials_slot_status_idx").on(
       table.slot,
       table.status,
+    ),
+  ],
+);
+
+/** Durable business operation; provider tasks are replaceable executions. */
+export const agentOperations = mysqlTable(
+  "agent_operations",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    scope: mysqlEnum("scope", ["managed_user", "website_frontend"]).notNull(),
+    accountUserId: int("account_user_id"),
+    presalesProjectId: varchar("presales_project_id", { length: 80 }),
+    operationType: varchar("operation_type", { length: 96 }).notNull(),
+    idempotencyKeyHash: varchar("idempotency_key_hash", {
+      length: 64,
+    }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    contractName: varchar("contract_name", { length: 128 }).notNull(),
+    contractRevision: int("contract_revision", { unsigned: true }).notNull(),
+    schemaHash: varchar("schema_hash", { length: 64 }).notNull(),
+    apiCredentialId: varchar("api_credential_id", { length: 36 }).notNull(),
+    credentialVersion: int("credential_version", { unsigned: true }).notNull(),
+    publicProfile: varchar("public_profile", { length: 32 }).notNull(),
+    upstreamModel: varchar("upstream_model", { length: 64 }).notNull(),
+    status: mysqlEnum("status", [
+      "queued",
+      "running",
+      "result_pending",
+      "succeeded",
+      "failed",
+      "cancelled",
+      "attention_required",
+    ])
+      .default("queued")
+      .notNull(),
+    errorCode: varchar("error_code", { length: 128 }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("agent_operations_scope_idempotency_uq").on(
+      table.scope,
+      table.idempotencyKeyHash,
+    ),
+    index("agent_operations_account_status_idx").on(
+      table.accountUserId,
+      table.status,
+    ),
+    index("agent_operations_project_status_idx").on(
+      table.presalesProjectId,
+      table.status,
+    ),
+    check(
+      "agent_operations_owner_ck",
+      sql`(
+        (${table.scope} = 'managed_user' AND ${table.accountUserId} IS NOT NULL AND ${table.presalesProjectId} IS NULL)
+        OR
+        (${table.scope} = 'website_frontend' AND ${table.accountUserId} IS NULL AND ${table.presalesProjectId} IS NOT NULL)
+      )`,
+    ),
+  ],
+);
+
+export const agentTasks = mysqlTable(
+  "agent_tasks",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    operationId: varchar("operation_id", { length: 36 }).notNull(),
+    providerTaskId: varchar("provider_task_id", { length: 255 }),
+    providerRequestId: varchar("provider_request_id", { length: 512 }),
+    createMarker: varchar("create_marker", { length: 128 }).notNull(),
+    title: varchar("title", { length: 255 }).notNull(),
+    providerState: varchar("provider_state", { length: 32 }).notNull(),
+    lastMessageSyncAt: timestamp("last_message_sync_at"),
+    resultDeadlineAt: timestamp("result_deadline_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("agent_tasks_provider_task_uq").on(table.providerTaskId),
+    uniqueIndex("agent_tasks_operation_marker_uq").on(
+      table.operationId,
+      table.createMarker,
+    ),
+    index("agent_tasks_operation_state_idx").on(
+      table.operationId,
+      table.providerState,
+    ),
+  ],
+);
+
+export const agentEvents = mysqlTable(
+  "agent_events",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    taskId: varchar("task_id", { length: 36 }).notNull(),
+    providerEventId: varchar("provider_event_id", { length: 512 }).notNull(),
+    eventType: varchar("event_type", { length: 64 }).notNull(),
+    providerTimestampMs: bigint("provider_timestamp_ms", {
+      mode: "number",
+      unsigned: true,
+    }).notNull(),
+    normalizedPayload: json("normalized_payload")
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    receivedAt: timestamp("received_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("agent_events_task_provider_event_uq").on(
+      table.taskId,
+      table.providerEventId,
+    ),
+    index("agent_events_task_time_idx").on(
+      table.taskId,
+      table.providerTimestampMs,
+    ),
+  ],
+);
+
+export const localAssets = mysqlTable(
+  "local_assets",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    scope: mysqlEnum("scope", ["managed_user", "website_frontend"]).notNull(),
+    accountUserId: int("account_user_id"),
+    presalesProjectId: varchar("presales_project_id", { length: 80 }),
+    filename: varchar("filename", { length: 512 }).notNull(),
+    mimeType: varchar("mime_type", { length: 255 }).notNull(),
+    sizeBytes: int("size_bytes", { unsigned: true }).notNull(),
+    contentSha256: varchar("content_sha256", { length: 64 }).notNull(),
+    storageKey: varchar("storage_key", { length: 1024 }).notNull(),
+    storageKeyHash: varchar("storage_key_hash", { length: 64 }).notNull(),
+    refCount: int("ref_count", { unsigned: true }).default(1).notNull(),
+    retainUntil: timestamp("retain_until"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("local_assets_scope_storage_uq").on(
+      table.scope,
+      table.storageKeyHash,
+    ),
+    index("local_assets_account_hash_idx").on(
+      table.accountUserId,
+      table.contentSha256,
+    ),
+    index("local_assets_project_hash_idx").on(
+      table.presalesProjectId,
+      table.contentSha256,
+    ),
+  ],
+);
+
+export const providerFileLeases = mysqlTable(
+  "provider_file_leases",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    localAssetId: varchar("local_asset_id", { length: 36 }).notNull(),
+    apiCredentialId: varchar("api_credential_id", { length: 36 }).notNull(),
+    credentialVersion: int("credential_version", { unsigned: true }).notNull(),
+    providerFileId: varchar("provider_file_id", { length: 512 }),
+    providerRequestId: varchar("provider_request_id", { length: 512 }),
+    uploadState: mysqlEnum("upload_state", [
+      "reserved",
+      "uploading",
+      "uploaded",
+      "expired",
+      "failed",
+      "outcome_unknown",
+    ])
+      .default("reserved")
+      .notNull(),
+    uploadedBytes: int("uploaded_bytes", { unsigned: true })
+      .default(0)
+      .notNull(),
+    expiresAt: timestamp("expires_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("provider_file_leases_provider_file_uq").on(
+      table.providerFileId,
+    ),
+    index("provider_file_leases_asset_credential_idx").on(
+      table.localAssetId,
+      table.apiCredentialId,
+      table.uploadState,
+    ),
+  ],
+);
+
+export const artifacts = mysqlTable(
+  "artifacts",
+  {
+    /** Stable public-local identity: `artifact_` + lowercase SHA-256. */
+    id: varchar("id", { length: 96 }).primaryKey(),
+    operationId: varchar("operation_id", { length: 36 }),
+    taskId: varchar("task_id", { length: 36 }),
+    sourceEventId: varchar("source_event_id", { length: 512 }).notNull(),
+    attachmentIndex: int("attachment_index", { unsigned: true }).notNull(),
+    filename: varchar("filename", { length: 512 }).notNull(),
+    mimeType: varchar("mime_type", { length: 255 }).notNull(),
+    sizeBytes: int("size_bytes", { unsigned: true }).notNull(),
+    contentSha256: varchar("content_sha256", { length: 64 }).notNull(),
+    storageKey: varchar("storage_key", { length: 1024 }).notNull(),
+    validationState: mysqlEnum("validation_state", [
+      "staged",
+      "valid",
+      "invalid",
+    ])
+      .default("staged")
+      .notNull(),
+    refCount: int("ref_count", { unsigned: true }).default(1).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("artifacts_task_event_attachment_uq").on(
+      table.taskId,
+      table.sourceEventId,
+      table.attachmentIndex,
+    ),
+    index("artifacts_operation_validation_idx").on(
+      table.operationId,
+      table.validationState,
     ),
   ],
 );
@@ -2598,6 +2828,13 @@ export const knowledgeBaseBuilds = mysqlTable(
     companyWebsite: text("companyWebsite"),
     upstreamTaskId: varchar("upstreamTaskId", { length: 255 }),
     /**
+     * Legacy rows are deliberately not resumed. A reset creates a new
+     * materialized build whose complete working set is Dashboard-owned.
+     */
+    executionMode: varchar("execution_mode", { length: 32 }),
+    activeWorkingSetId: varchar("active_working_set_id", { length: 36 }),
+    contentVersion: int("content_version", { unsigned: true }),
+    /**
      * Provider protocol authority. Legacy rows continue to read through
      * upstreamTaskId; v2 rows bind exactly one canonical writer task for the
      * lifetime of a build generation.
@@ -2783,6 +3020,8 @@ export const knowledgeBaseBuildNodes = mysqlTable(
     sourceTurnId: varchar("sourceTurnId", { length: 36 }),
     presentationKey: varchar("presentationKey", { length: 191 }),
     contentSha256: varchar("contentSha256", { length: 64 }),
+    contentVersion: int("content_version", { unsigned: true }),
+    assetRefs: json("asset_refs").$type<string[]>(),
     lastResponseAt: timestamp("lastResponseAt"),
     confirmedAt: timestamp("confirmedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -2802,6 +3041,92 @@ export const knowledgeBaseBuildNodes = mysqlTable(
       table.status,
     ),
     index("knowledge_base_build_nodes_source_turn_idx").on(table.sourceTurnId),
+  ],
+);
+
+/** One immutable provider execution for initial materialization or revision. */
+export const knowledgeBaseExecutions = mysqlTable(
+  "knowledge_base_executions",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    buildId: varchar("build_id", { length: 36 }).notNull(),
+    generation: int("generation", { unsigned: true }).notNull(),
+    operationType: mysqlEnum("operation_type", [
+      "initial",
+      "revision",
+    ]).notNull(),
+    targetLeafId: varchar("target_leaf_id", { length: 191 }),
+    baseWorkingSetId: varchar("base_working_set_id", { length: 36 }),
+    operationId: varchar("operation_id", { length: 128 }).notNull(),
+    providerTaskId: varchar("provider_task_id", { length: 255 }),
+    apiCredentialId: varchar("api_credential_id", { length: 36 }).notNull(),
+    credentialVersion: int("credential_version", { unsigned: true }).notNull(),
+    publicProfile: varchar("public_profile", { length: 32 }).notNull(),
+    upstreamModel: varchar("upstream_model", { length: 64 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    status: mysqlEnum("status", [
+      "reserved",
+      "submitted",
+      "result_pending",
+      "succeeded",
+      "failed",
+      "attention_required",
+    ])
+      .default("reserved")
+      .notNull(),
+    errorCode: varchar("error_code", { length: 128 }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+    completedAt: timestamp("completed_at"),
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_executions_operation_uq").on(
+      table.buildId,
+      table.generation,
+      table.operationId,
+    ),
+    index("knowledge_base_executions_status_idx").on(
+      table.buildId,
+      table.status,
+    ),
+  ],
+);
+
+/** Complete immutable node/evidence/asset bytes for one content version. */
+export const knowledgeBaseWorkingSets = mysqlTable(
+  "knowledge_base_working_sets",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+    buildId: varchar("build_id", { length: 36 }).notNull(),
+    generation: int("generation", { unsigned: true }).notNull(),
+    contentVersion: int("content_version", { unsigned: true }).notNull(),
+    sourceExecutionId: varchar("source_execution_id", { length: 36 }),
+    storageKey: varchar("storage_key", { length: 1024 }).notNull(),
+    sizeBytes: int("size_bytes", { unsigned: true }).notNull(),
+    packageSha256: varchar("package_sha256", { length: 64 }).notNull(),
+    manifestSha256: varchar("manifest_sha256", { length: 64 }).notNull(),
+    manifest: json("manifest").$type<Record<string, unknown>>().notNull(),
+    status: mysqlEnum("status", ["staged", "active", "superseded", "invalid"])
+      .default("staged")
+      .notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    activatedAt: timestamp("activated_at"),
+  },
+  (table) => [
+    uniqueIndex("knowledge_base_working_sets_version_uq").on(
+      table.buildId,
+      table.generation,
+      table.contentVersion,
+    ),
+    uniqueIndex("knowledge_base_working_sets_package_uq").on(
+      table.buildId,
+      table.generation,
+      table.packageSha256,
+    ),
+    index("knowledge_base_working_sets_status_idx").on(
+      table.buildId,
+      table.status,
+    ),
   ],
 );
 
@@ -3551,6 +3876,18 @@ export type InsertApiCredential = typeof apiCredentials.$inferInsert;
 export type PresalesApiCredential = typeof presalesApiCredentials.$inferSelect;
 export type InsertPresalesApiCredential =
   typeof presalesApiCredentials.$inferInsert;
+export type AgentOperation = typeof agentOperations.$inferSelect;
+export type InsertAgentOperation = typeof agentOperations.$inferInsert;
+export type AgentTask = typeof agentTasks.$inferSelect;
+export type InsertAgentTask = typeof agentTasks.$inferInsert;
+export type AgentEvent = typeof agentEvents.$inferSelect;
+export type InsertAgentEvent = typeof agentEvents.$inferInsert;
+export type LocalAsset = typeof localAssets.$inferSelect;
+export type InsertLocalAsset = typeof localAssets.$inferInsert;
+export type ProviderFileLease = typeof providerFileLeases.$inferSelect;
+export type InsertProviderFileLease = typeof providerFileLeases.$inferInsert;
+export type Artifact = typeof artifacts.$inferSelect;
+export type InsertArtifact = typeof artifacts.$inferInsert;
 export type ApiUsagePolicy = typeof apiUsagePolicies.$inferSelect;
 export type InsertApiUsagePolicy = typeof apiUsagePolicies.$inferInsert;
 export type ApiUsageSnapshot = typeof apiUsageSnapshots.$inferSelect;
@@ -3646,6 +3983,14 @@ export type KnowledgeBaseBuildNode =
   typeof knowledgeBaseBuildNodes.$inferSelect;
 export type InsertKnowledgeBaseBuildNode =
   typeof knowledgeBaseBuildNodes.$inferInsert;
+export type KnowledgeBaseExecution =
+  typeof knowledgeBaseExecutions.$inferSelect;
+export type InsertKnowledgeBaseExecution =
+  typeof knowledgeBaseExecutions.$inferInsert;
+export type KnowledgeBaseWorkingSet =
+  typeof knowledgeBaseWorkingSets.$inferSelect;
+export type InsertKnowledgeBaseWorkingSet =
+  typeof knowledgeBaseWorkingSets.$inferInsert;
 export type KnowledgeBaseResetRequest =
   typeof knowledgeBaseResetRequests.$inferSelect;
 export type InsertKnowledgeBaseResetRequest =

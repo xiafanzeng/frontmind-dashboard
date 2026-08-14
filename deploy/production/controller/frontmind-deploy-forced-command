@@ -3,8 +3,9 @@ set -euo pipefail
 
 # authorized_keys fixes argv[1] to exactly one service and therefore turns the
 # Dashboard and Website public keys into non-interchangeable capabilities. The
-# GitHub workflow may send either the ordinary immutable release coordinates or
-# the single Dashboard-only same-digest Manus v2 rollout capability.
+# GitHub workflow may send ordinary immutable release coordinates or one
+# Dashboard-owned coupled stack command containing both exact production
+# artifacts. The latter is the only command allowed to coordinate both keys.
 expected_service="${1:-}"
 case "$expected_service" in
   dashboard | website) ;;
@@ -15,20 +16,22 @@ case "$expected_service" in
 esac
 read -r -a words <<<"${SSH_ORIGINAL_COMMAND:-}"
 controller_arguments=()
-if [[ ${#words[@]} -eq 4 && ${words[0]} == "--kb-manus-v2-rollout" ]]; then
+if [[ ${#words[@]} -eq 5 && ${words[0]} == "coupled-stack" ]]; then
   [[ $expected_service == "dashboard" ]] || {
-    echo "PRODUCTION_KB_MANUS_V2_ROLLOUT_SERVICE_REJECTED" >&2
+    echo "PRODUCTION_COUPLED_STACK_SERVICE_REJECTED" >&2
     exit 64
   }
-  [[ ${words[1]} =~ ^(dual-read|canary|migration|pause|complete)$ ]] || {
-    echo "PRODUCTION_KB_MANUS_V2_ROLLOUT_PHASE_REJECTED" >&2
+  if [[ ! ${words[1]} =~ ^ghcr\.io/xiafanzeng/frontmind-dashboard@sha256:[a-f0-9]{64}$ ]] \
+    || [[ ! ${words[2]} =~ ^[a-f0-9]{40}$ ]] \
+    || [[ ! ${words[3]} =~ ^ghcr\.io/xiafanzeng/frontmind-website@sha256:[a-f0-9]{64}$ ]] \
+    || [[ ! ${words[4]} =~ ^[a-f0-9]{40}$ ]]; then
+    echo "PRODUCTION_COUPLED_STACK_COORDINATES_REJECTED" >&2
     exit 64
-  }
-  image_index=2
-  sha_index=3
+  fi
+  image_index=1
+  sha_index=2
   controller_arguments=(
-    "--kb-manus-v2-rollout" "${words[1]}" "$expected_service"
-    "${words[2]}" "${words[3]}"
+    "--coupled-stack" "${words[1]}" "${words[2]}" "${words[3]}" "${words[4]}"
   )
 elif [[ ${#words[@]} -eq 2 ]]; then
   image_index=0

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { managedAgentProfileSchema } from "../shared/manus-agent-profile";
 import { adminProcedure, router } from "./_core/trpc";
 import {
   createManagedUser,
@@ -11,7 +12,7 @@ import { passwordSchema, toTrpcError } from "./auth-router";
 import {
   deletePresalesApiCredential,
   getPresalesCredentialStatus,
-  getPresalesCreditUsage,
+  getPresalesCreditUsageSnapshot,
   replacePresalesApiCredential,
   testPresalesApiCredential,
 } from "./presales-service";
@@ -457,6 +458,7 @@ export const adminRouter = router({
               .enum(["unconfigured_only", "replace_all"])
               .default("unconfigured_only"),
             apiKey: presalesApiKeySchema,
+            agentProfile: managedAgentProfileSchema.default("frontmind-pro"),
             reason: z.string().trim().min(1).max(2_000),
             confirmation: z.literal("BULK_REPLACE_API_KEYS"),
           })
@@ -471,6 +473,7 @@ export const adminRouter = router({
             targets: input.targets,
             applyMode: input.applyMode,
             apiKey: input.apiKey,
+            agentProfile: input.agentProfile,
             reason: input.reason,
           });
         } catch (error) {
@@ -489,10 +492,10 @@ export const adminRouter = router({
             ]),
             userId: z.number().int().positive(),
             apiKey: presalesApiKeySchema,
+            agentProfile: managedAgentProfileSchema.default("frontmind-pro"),
             expectedVersion: z.number().int().nonnegative(),
             reason: z.string().trim().min(1).max(2_000),
             confirmation: z.literal("REPLACE_API_KEY"),
-            allowIncompleteHistory: z.boolean().optional().default(false),
             relatedTicketId: z.string().uuid().optional(),
           })
           .strict(),
@@ -505,9 +508,9 @@ export const adminRouter = router({
             kind: input.kind,
             userId: input.userId,
             apiKey: input.apiKey,
+            agentProfile: input.agentProfile,
             expectedVersion: input.expectedVersion,
             reason: input.reason,
-            allowIncompleteHistory: input.allowIncompleteHistory,
             relatedTicketId: input.relatedTicketId,
           });
         } catch (error) {
@@ -1737,7 +1740,6 @@ export const adminRouter = router({
         z.object({
           apiKey: presalesApiKeySchema,
           reason: z.string().trim().max(2_000).optional(),
-          allowIncompleteHistory: z.boolean().optional().default(false),
         }),
       )
       .mutation(async ({ ctx, input }) => {
@@ -1746,8 +1748,6 @@ export const adminRouter = router({
           const credential = await replacePresalesApiCredential(
             ctx.user.id,
             input.apiKey,
-            undefined,
-            input.allowIncompleteHistory,
           );
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
@@ -1758,8 +1758,10 @@ export const adminRouter = router({
             metadata: {
               fingerprint: credential.fingerprint,
               status: credential.status,
-              emergencyReplacement: input.allowIncompleteHistory,
             },
+          });
+          void syncApiUsageSnapshots(ctx.user).catch(() => {
+            console.error("[Presales usage] asynchronous refresh failed");
           });
           return credential;
         } catch (error) {
@@ -1772,7 +1774,6 @@ export const adminRouter = router({
         z.object({
           apiKey: presalesApiKeySchema,
           reason: z.string().trim().max(2_000).optional(),
-          allowIncompleteHistory: z.boolean().optional().default(false),
         }),
       )
       .mutation(async ({ ctx, input }) => {
@@ -1781,8 +1782,6 @@ export const adminRouter = router({
           const credential = await replacePresalesApiCredential(
             ctx.user.id,
             input.apiKey,
-            undefined,
-            input.allowIncompleteHistory,
           );
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
@@ -1793,8 +1792,10 @@ export const adminRouter = router({
             metadata: {
               fingerprint: credential.fingerprint,
               status: credential.status,
-              emergencyReplacement: input.allowIncompleteHistory,
             },
+          });
+          void syncApiUsageSnapshots(ctx.user).catch(() => {
+            console.error("[Presales usage] asynchronous refresh failed");
           });
           return credential;
         } catch (error) {
@@ -1847,7 +1848,7 @@ export const adminRouter = router({
       .query(async ({ ctx, input }) => {
         requireSystemAdmin(ctx.user);
         try {
-          return await getPresalesCreditUsage(input?.windowDays);
+          return await getPresalesCreditUsageSnapshot();
         } catch (error) {
           throw toTrpcError(error);
         }

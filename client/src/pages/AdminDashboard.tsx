@@ -67,6 +67,14 @@ type ApiKeyUsageAlert = {
   syncStatus: "ok" | "error" | "pending" | string;
 };
 
+type ManagedKeyHealth =
+  | "connected"
+  | "invalid_or_revoked"
+  | "sync_error"
+  | "unconfigured"
+  | "pending";
+type ManagedAgentProfile = "frontmind-base" | "frontmind-pro";
+
 type AdminUsageHierarchyManager = {
   adminId: number;
   displayName: string;
@@ -74,30 +82,32 @@ type AdminUsageHierarchyManager = {
   isActive: boolean;
   apiKeyConfigured: boolean;
   apiKeyVersion: number;
+  agentProfile: ManagedAgentProfile;
   keyPool: {
     fingerprint: string | null;
     credentialCount: number;
-    totalUsed: number;
+    totalUsed: number | null;
     limit: number;
     warningRatio: number;
-    syncStatus: string;
+    keyHealth: ManagedKeyHealth;
+    keyPoolStale: boolean;
+    keyLastSuccessfulAt: number | string | Date | null;
+    keyLastAttemptAt: number | string | Date | null;
     fetchedAt: number | string | Date | null;
     severity: string;
   };
-  ownAgentMonthUsed: number;
-  accountUsageComplete: boolean;
-  attributedUsed: number;
-  otherOrUnattributedUsed: number;
+  rolling30DayUsed: number;
+  usageObservedAt: number | string | Date | null;
   users: Array<{
     userId: number;
     enterpriseName: string;
     username: string | null;
-    monthUsed: number;
-    accountUsageComplete: boolean;
+    rolling30DayUsed: number;
+    usageObservedAt: number | string | Date | null;
     fingerprint: string | null;
     usesManagerKey: boolean;
     credentialSource: "manager" | "customer" | "unconfigured";
-    syncStatus: string;
+    keyHealth: ManagedKeyHealth;
     fetchedAt: number | string | Date | null;
   }>;
 };
@@ -109,12 +119,15 @@ type AdminUsageHierarchyEngineer = {
   isActive: boolean;
   apiKeyConfigured: boolean;
   apiKeyVersion: number;
-  keyTotalUsed: number;
-  ownAgentMonthUsed: number;
-  accountUsageComplete: boolean;
-  otherOrUnattributedUsed: number;
+  agentProfile: ManagedAgentProfile;
+  rolling30DayUsed: number;
+  usageObservedAt: number | string | Date | null;
+  keyPoolTotalUsed: number | null;
+  keyLastSuccessfulAt: number | string | Date | null;
+  keyLastAttemptAt: number | string | Date | null;
+  keyHealth: ManagedKeyHealth;
+  keyPoolStale: boolean;
   fingerprint: string | null;
-  syncStatus: string;
   fetchedAt: number | string | Date | null;
 };
 
@@ -132,13 +145,16 @@ type AdminUsageHierarchyCustomer = {
   deliveryAdminName: string | null;
   apiKeyConfigured: boolean;
   apiKeyVersion: number;
+  agentProfile: ManagedAgentProfile;
   usesInheritedKey: boolean;
-  keyTotalUsed: number;
-  ownAgentMonthUsed: number;
-  accountUsageComplete: boolean;
-  otherOrUnattributedUsed: number;
+  rolling30DayUsed: number;
+  usageObservedAt: number | string | Date | null;
+  keyPoolTotalUsed: number | null;
+  keyLastSuccessfulAt: number | string | Date | null;
+  keyLastAttemptAt: number | string | Date | null;
+  keyHealth: ManagedKeyHealth;
+  keyPoolStale: boolean;
   fingerprint: string | null;
-  syncStatus: string;
   fetchedAt: number | string | Date | null;
 };
 
@@ -263,11 +279,10 @@ export type DeliveryEngineerStatusRow = {
   isActive: boolean;
   apiKeyConfigured: boolean;
   apiKeyVersion: number;
-  keyTotalUsed: number;
-  ownAgentMonthUsed: number;
-  accountUsageComplete: boolean;
-  otherOrUnattributedUsed: number;
-  usageSyncStatus: string;
+  agentProfile: ManagedAgentProfile;
+  rolling30DayUsed: number;
+  keyPoolTotalUsed: number | null;
+  keyHealth: ManagedKeyHealth;
 };
 
 export function buildDeliveryEngineerStatusRows(
@@ -355,11 +370,10 @@ export function buildDeliveryEngineerStatusRows(
         isActive,
         apiKeyConfigured: Boolean(engineer.apiKeyConfigured),
         apiKeyVersion: Math.max(0, Number(engineer.apiKeyVersion) || 0),
-        keyTotalUsed: 0,
-        ownAgentMonthUsed: 0,
-        accountUsageComplete: true,
-        otherOrUnattributedUsed: 0,
-        usageSyncStatus: "unconfigured",
+        agentProfile: "frontmind-pro",
+        rolling30DayUsed: 0,
+        keyPoolTotalUsed: null,
+        keyHealth: "unconfigured",
       };
     })
     .sort((left, right) => {
@@ -584,6 +598,22 @@ export function normalizeUsageHierarchy(value: unknown): {
   engineers: AdminUsageHierarchyEngineer[];
   customers: AdminUsageHierarchyCustomer[];
 } {
+  const profile = (candidate: unknown): ManagedAgentProfile =>
+    candidate === "frontmind-base" ? "frontmind-base" : "frontmind-pro";
+  const keyHealth = (candidate: unknown): ManagedKeyHealth =>
+    [
+      "connected",
+      "invalid_or_revoked",
+      "sync_error",
+      "unconfigured",
+      "pending",
+    ].includes(String(candidate))
+      ? (candidate as ManagedKeyHealth)
+      : "unconfigured";
+  const nullableUsage = (candidate: unknown) =>
+    candidate === null || candidate === undefined
+      ? null
+      : Math.max(0, Number(candidate) || 0);
   const payload =
     value && typeof value === "object" ? (value as Record<string, any>) : {};
   const managers = Array.isArray(payload.managers)
@@ -595,6 +625,7 @@ export function normalizeUsageHierarchy(value: unknown): {
         isActive: entry?.isActive !== false,
         apiKeyConfigured: entry?.apiKeyConfigured === true,
         apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
+        agentProfile: profile(entry?.agentProfile),
         keyPool: {
           fingerprint: entry?.keyPool?.fingerprint
             ? String(entry.keyPool.fingerprint)
@@ -604,31 +635,32 @@ export function normalizeUsageHierarchy(value: unknown): {
             Number(entry?.keyPool?.credentialCount) ||
               (entry?.keyPool?.fingerprint ? 1 : 0),
           ),
-          totalUsed: Math.max(0, Number(entry?.keyPool?.totalUsed) || 0),
+          totalUsed: nullableUsage(entry?.keyPool?.totalUsed),
           limit: Math.max(1, Number(entry?.keyPool?.limit) || 230_000),
           warningRatio: Math.min(
             1,
             Math.max(0, Number(entry?.keyPool?.warningRatio) || 0.8),
           ),
-          syncStatus: String(entry?.keyPool?.syncStatus || "pending"),
+          keyHealth: keyHealth(entry?.keyPool?.keyHealth),
+          keyPoolStale: entry?.keyPool?.keyPoolStale === true,
+          keyLastSuccessfulAt: entry?.keyPool?.keyLastSuccessfulAt ?? null,
+          keyLastAttemptAt: entry?.keyPool?.keyLastAttemptAt ?? null,
           fetchedAt: entry?.keyPool?.fetchedAt ?? null,
           severity: String(entry?.keyPool?.severity || "unavailable"),
         },
-        ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
-        accountUsageComplete: entry?.accountUsageComplete === true,
-        attributedUsed: Math.max(0, Number(entry?.attributedUsed) || 0),
-        otherOrUnattributedUsed: Math.max(
-          0,
-          Number(entry?.otherOrUnattributedUsed) || 0,
-        ),
+        rolling30DayUsed: Math.max(0, Number(entry?.rolling30DayUsed) || 0),
+        usageObservedAt: entry?.usageObservedAt ?? null,
         users: Array.isArray(entry?.users)
           ? entry.users.map((customer: any) => ({
               userId: Math.max(0, Number(customer?.userId) || 0),
               enterpriseName:
                 String(customer?.enterpriseName || "").trim() || "未命名客户",
               username: customer?.username ? String(customer.username) : null,
-              monthUsed: Math.max(0, Number(customer?.monthUsed) || 0),
-              accountUsageComplete: customer?.accountUsageComplete === true,
+              rolling30DayUsed: Math.max(
+                0,
+                Number(customer?.rolling30DayUsed) || 0,
+              ),
+              usageObservedAt: customer?.usageObservedAt ?? null,
               fingerprint: customer?.fingerprint
                 ? String(customer.fingerprint)
                 : null,
@@ -642,7 +674,7 @@ export function normalizeUsageHierarchy(value: unknown): {
                     : customer?.fingerprint
                       ? "customer"
                       : "unconfigured",
-              syncStatus: String(customer?.syncStatus || "pending"),
+              keyHealth: keyHealth(customer?.keyHealth),
               fetchedAt: customer?.fetchedAt ?? null,
             }))
           : [],
@@ -658,15 +690,15 @@ export function normalizeUsageHierarchy(value: unknown): {
           isActive: entry?.isActive !== false,
           apiKeyConfigured: entry?.apiKeyConfigured === true,
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
-          keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
-          ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
-          accountUsageComplete: entry?.accountUsageComplete === true,
-          otherOrUnattributedUsed: Math.max(
-            0,
-            Number(entry?.otherOrUnattributedUsed) || 0,
-          ),
+          agentProfile: profile(entry?.agentProfile),
+          rolling30DayUsed: Math.max(0, Number(entry?.rolling30DayUsed) || 0),
+          usageObservedAt: entry?.usageObservedAt ?? null,
+          keyPoolTotalUsed: nullableUsage(entry?.keyPoolTotalUsed),
+          keyLastSuccessfulAt: entry?.keyLastSuccessfulAt ?? null,
+          keyLastAttemptAt: entry?.keyLastAttemptAt ?? null,
+          keyHealth: keyHealth(entry?.keyHealth),
+          keyPoolStale: entry?.keyPoolStale === true,
           fingerprint: entry?.fingerprint ? String(entry.fingerprint) : null,
-          syncStatus: String(entry?.syncStatus || "unconfigured"),
           fetchedAt: entry?.fetchedAt ?? null,
         }),
       )
@@ -681,15 +713,15 @@ export function normalizeUsageHierarchy(value: unknown): {
           isActive: entry?.isActive !== false,
           apiKeyConfigured: entry?.apiKeyConfigured === true,
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
-          keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
-          ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
-          accountUsageComplete: entry?.accountUsageComplete === true,
-          otherOrUnattributedUsed: Math.max(
-            0,
-            Number(entry?.otherOrUnattributedUsed) || 0,
-          ),
+          agentProfile: profile(entry?.agentProfile),
+          rolling30DayUsed: Math.max(0, Number(entry?.rolling30DayUsed) || 0),
+          usageObservedAt: entry?.usageObservedAt ?? null,
+          keyPoolTotalUsed: nullableUsage(entry?.keyPoolTotalUsed),
+          keyLastSuccessfulAt: entry?.keyLastSuccessfulAt ?? null,
+          keyLastAttemptAt: entry?.keyLastAttemptAt ?? null,
+          keyHealth: keyHealth(entry?.keyHealth),
+          keyPoolStale: entry?.keyPoolStale === true,
           fingerprint: entry?.fingerprint ? String(entry.fingerprint) : null,
-          syncStatus: String(entry?.syncStatus || "unconfigured"),
           fetchedAt: entry?.fetchedAt ?? null,
         }),
       )
@@ -712,16 +744,16 @@ export function normalizeUsageHierarchy(value: unknown): {
             : null,
           apiKeyConfigured: entry?.apiKeyConfigured === true,
           apiKeyVersion: Math.max(0, Number(entry?.apiKeyVersion) || 0),
+          agentProfile: profile(entry?.agentProfile),
           usesInheritedKey: entry?.usesInheritedKey === true,
-          keyTotalUsed: Math.max(0, Number(entry?.keyTotalUsed) || 0),
-          ownAgentMonthUsed: Math.max(0, Number(entry?.ownAgentMonthUsed) || 0),
-          accountUsageComplete: entry?.accountUsageComplete === true,
-          otherOrUnattributedUsed: Math.max(
-            0,
-            Number(entry?.otherOrUnattributedUsed) || 0,
-          ),
+          rolling30DayUsed: Math.max(0, Number(entry?.rolling30DayUsed) || 0),
+          usageObservedAt: entry?.usageObservedAt ?? null,
+          keyPoolTotalUsed: nullableUsage(entry?.keyPoolTotalUsed),
+          keyLastSuccessfulAt: entry?.keyLastSuccessfulAt ?? null,
+          keyLastAttemptAt: entry?.keyLastAttemptAt ?? null,
+          keyHealth: keyHealth(entry?.keyHealth),
+          keyPoolStale: entry?.keyPoolStale === true,
           fingerprint: entry?.fingerprint ? String(entry.fingerprint) : null,
-          syncStatus: String(entry?.syncStatus || "unconfigured"),
           fetchedAt: entry?.fetchedAt ?? null,
         }),
       )
@@ -740,15 +772,22 @@ export function normalizeUsageHierarchy(value: unknown): {
 export function usageHierarchyNeedsPolling(value: unknown): boolean {
   const hierarchy = normalizeUsageHierarchy(value);
   return (
-    hierarchy.systemAdmins.some((entry) => entry.syncStatus === "pending") ||
-    hierarchy.engineers.some((entry) => entry.syncStatus === "pending") ||
-    hierarchy.customers.some((entry) => entry.syncStatus === "pending") ||
+    hierarchy.systemAdmins.some((entry) => entry.keyHealth === "pending") ||
+    hierarchy.engineers.some((entry) => entry.keyHealth === "pending") ||
+    hierarchy.customers.some((entry) => entry.keyHealth === "pending") ||
     hierarchy.managers.some(
       (entry) =>
-        entry.keyPool.syncStatus === "pending" ||
-        entry.users.some((customer) => customer.syncStatus === "pending"),
+        entry.keyPool.keyHealth === "pending" ||
+        entry.users.some((customer) => customer.keyHealth === "pending"),
     )
   );
+}
+
+export function resolveKeyPoolStale(input: {
+  keyPoolStale?: boolean;
+  keyHealth: ManagedKeyHealth;
+}) {
+  return input.keyPoolStale ?? input.keyHealth !== "connected";
 }
 
 type OverviewApiKeyTarget = {
@@ -758,6 +797,7 @@ type OverviewApiKeyTarget = {
   username: string;
   configured: boolean;
   version: number;
+  agentProfile: ManagedAgentProfile;
   relatedTicketId?: string;
 };
 
@@ -890,11 +930,10 @@ export type KeyManagementRow = OverviewApiKeyTarget & {
   isActive: boolean;
   deliveryAdminId: number | null;
   inherited: boolean;
-  ownAgentMonthUsed: number;
-  accountUsageComplete: boolean;
-  keyTotalUsed: number;
-  otherOrUnattributedUsed: number;
-  syncStatus: string;
+  rolling30DayUsed: number;
+  keyPoolTotalUsed: number | null;
+  keyHealth: ManagedKeyHealth;
+  keyPoolStale: boolean;
   fetchedAt: number | string | Date | null;
   fingerprint?: string | null;
   sharedKeyAccountCount?: number;
@@ -955,9 +994,10 @@ function AdminOverviewApiKeyDialog({
   onSaved: () => Promise<void> | void;
 }) {
   const [apiKey, setApiKey] = useState("");
+  const [agentProfile, setAgentProfile] =
+    useState<ManagedAgentProfile>("frontmind-pro");
   const [revokeOpen, setRevokeOpen] = useState(false);
   const [replaceConfirmOpen, setReplaceConfirmOpen] = useState(false);
-  const [allowIncompleteHistory, setAllowIncompleteHistory] = useState(false);
   const replaceTargetMutation =
     trpc.admin.apiKeyUsageAlerts.replaceTargetCredential.useMutation();
   const revokeTargetMutation =
@@ -973,12 +1013,16 @@ function AdminOverviewApiKeyDialog({
           ? "客户"
           : "工程师";
 
+  useEffect(() => {
+    if (target) setAgentProfile(target.agentProfile);
+  }, [target]);
+
   const close = () => {
     if (busy) return;
     setApiKey("");
+    setAgentProfile("frontmind-pro");
     setRevokeOpen(false);
     setReplaceConfirmOpen(false);
-    setAllowIncompleteHistory(false);
     replaceTargetMutation.reset();
     revokeTargetMutation.reset();
     onOpenChange(false);
@@ -997,10 +1041,10 @@ function AdminOverviewApiKeyDialog({
         kind: target.kind,
         userId: target.userId,
         apiKey: apiKey.trim(),
+        agentProfile,
         expectedVersion: target.version,
         reason: "API与人员管理统一入口替换账号 API Key",
         confirmation: "REPLACE_API_KEY",
-        allowIncompleteHistory,
         ...(target.relatedTicketId
           ? { relatedTicketId: target.relatedTicketId }
           : {}),
@@ -1076,6 +1120,24 @@ function AdminOverviewApiKeyDialog({
               </span>
             </div>
             <div className="space-y-2">
+              <Label htmlFor="overview-agent-profile">任务模型</Label>
+              <select
+                id="overview-agent-profile"
+                value={agentProfile}
+                disabled={busy}
+                onChange={(event) =>
+                  setAgentProfile(event.target.value as ManagedAgentProfile)
+                }
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+              >
+                <option value="frontmind-pro">Pro</option>
+                <option value="frontmind-base">Base</option>
+              </select>
+              <p className="text-xs leading-5 text-muted-foreground">
+                本次配置会创建新的 Key 版本，并将模型选择冻结在该版本上。
+              </p>
+            </div>
+            <div className="space-y-2">
               <Label htmlFor="overview-api-key">
                 {target?.configured ? "新的 API Key" : "API Key"}
               </Label>
@@ -1142,24 +1204,10 @@ function AdminOverviewApiKeyDialog({
               }
             </AlertDialogDescription>
           </AlertDialogHeader>
-          {target?.configured && (
-            <label className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={allowIncompleteHistory}
-                onChange={(event) =>
-                  setAllowIncompleteHistory(event.target.checked)
-                }
-                disabled={busy}
-              />
-              <span>
-                旧 Key
-                已失效，允许应急替换。未能完整扫描的历史用量将显示为“不可用”，不会显示为
-                0。
-              </span>
-            </label>
-          )}
+          <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
+            模型：{agentProfile === "frontmind-pro" ? "Pro" : "Base"}。近 30
+            天自用按本地任务账本滚动累计，Key 轮换不会清空历史数字。
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
             <AlertDialogAction
@@ -1230,6 +1278,8 @@ function AdminBulkApiKeyDialog({
   const [engineerIds, setEngineerIds] = useState<number[]>([]);
   const [engineerSearch, setEngineerSearch] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [agentProfile, setAgentProfile] =
+    useState<ManagedAgentProfile>("frontmind-pro");
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const bulkMutation =
@@ -1282,6 +1332,7 @@ function AdminBulkApiKeyDialog({
     setEngineerIds([]);
     setEngineerSearch("");
     setApiKey("");
+    setAgentProfile("frontmind-pro");
     setReplaceExisting(false);
     setConfirmOpen(false);
     bulkMutation.reset();
@@ -1328,17 +1379,16 @@ function AdminBulkApiKeyDialog({
         })),
         applyMode: replaceExisting ? "replace_all" : "unconfigured_only",
         apiKey: apiKey.trim(),
+        agentProfile,
         reason: "API与人员管理批量配置账号 API Key",
         confirmation: "BULK_REPLACE_API_KEYS",
       });
       await onSaved();
       toast.success(`已为 ${result.updatedCount} 个账号配置 API Key`, {
         description:
-          result.historyIncompleteCount > 0
-            ? `${result.historyIncompleteCount} 个账号的旧 Key 历史用量保留为“扫描不完整”；新 Key 用量将从本次替换时间开始同步`
-            : result.unchangedCount > 0
-              ? `${result.unchangedCount} 个账号无需变更；用量统计将在下次同步后更新`
-              : "用量统计将在下次同步后更新",
+          result.unchangedCount > 0
+            ? `${result.unchangedCount} 个账号无需变更；近 30 天自用将继续按任务账本滚动累计`
+            : "近 30 天自用将继续按任务账本滚动累计",
       });
       reset();
       onOpenChange(false);
@@ -1562,6 +1612,25 @@ function AdminBulkApiKeyDialog({
             </label>
 
             <div className="space-y-2">
+              <Label htmlFor="bulk-agent-profile">批量任务模型</Label>
+              <select
+                id="bulk-agent-profile"
+                value={agentProfile}
+                disabled={busy}
+                onChange={(event) =>
+                  setAgentProfile(event.target.value as ManagedAgentProfile)
+                }
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+              >
+                <option value="frontmind-pro">Pro</option>
+                <option value="frontmind-base">Base</option>
+              </select>
+              <p className="text-xs leading-5 text-muted-foreground">
+                整批账号使用同一模型策略；默认 Pro。
+              </p>
+            </div>
+
+            <div className="space-y-2">
               <Label htmlFor="bulk-api-key">API Key</Label>
               <Input
                 id="bulk-api-key"
@@ -1623,9 +1692,8 @@ function AdminBulkApiKeyDialog({
           </AlertDialogHeader>
           <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-950">
             这是一次性批量分发；以后单独修改某个账号不会自动联动其他账号。共享
-            Key 会扩大泄露影响范围，并限制未知历史任务导入。旧 Key
-            即使已失效也不会阻断轮换；其最后已知用量会保留并标记为扫描不完整，新
-            Key 的用量从替换时间开始同步。
+            Key 会扩大泄露影响范围。旧 Key 即使已失效也不会阻断轮换；近 30
+            天自用继续按本地任务账本滚动累计，不会因轮换清零。
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={busy}>返回检查</AlertDialogCancel>
@@ -1676,9 +1744,7 @@ export function AdminBrandTrackingKeyManager({
     trpc.admin as any
   ).brandTrackingCredentials.refreshBalance.useMutation();
   const [search, setSearch] = useState("");
-  const [target, setTarget] = useState<BrandTrackingCredentialRow | null>(
-    null,
-  );
+  const [target, setTarget] = useState<BrandTrackingCredentialRow | null>(null);
   const [deepLinkOpened, setDeepLinkOpened] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -1835,7 +1901,8 @@ export function AdminBrandTrackingKeyManager({
                     {row.displayName}
                   </p>
                   <p className="mt-1 truncate text-xs text-[#857e91]">
-                    @{row.username} · 上限 {formatAdminBrandTrackingCredits(row.limit)}
+                    @{row.username} · 上限{" "}
+                    {formatAdminBrandTrackingCredits(row.limit)}
                   </p>
                 </div>
                 <div className="text-xs">
@@ -1866,7 +1933,9 @@ export function AdminBrandTrackingKeyManager({
                 </p>
                 <div>
                   <p className="text-sm font-semibold tabular-nums text-[#332842]">
-                    {formatAdminBrandTrackingCredits(row.sharedKeyAttributedCost)}
+                    {formatAdminBrandTrackingCredits(
+                      row.sharedKeyAttributedCost,
+                    )}
                   </p>
                   <p className="mt-1 text-xs text-[#857e91]">
                     Dashboard 可归因积分
@@ -2240,8 +2309,8 @@ export default function AdminDashboard({
       userId: item.userId || 0,
       enterpriseName: item.enterpriseName || `客户 ${item.userId || ""}`,
       username: null,
-      monthUsed: item.accountUsed,
-      accountUsageComplete: true,
+      rolling30DayUsed: item.accountUsed,
+      usageObservedAt: item.fetchedAt ?? null,
       fingerprint: item.credentialFingerprint || null,
       usesManagerKey:
         Boolean(pool?.fingerprint) &&
@@ -2253,12 +2322,9 @@ export default function AdminDashboard({
           : item.credentialFingerprint
             ? ("customer" as const)
             : ("unconfigured" as const),
-      syncStatus: item.syncStatus,
+      keyHealth: item.syncStatus === "ok" ? "connected" : "pending",
       fetchedAt: item.fetchedAt ?? null,
     }));
-    const attributedUsed =
-      ownAgentMonthUsed +
-      users.reduce((sum, customer) => sum + customer.monthUsed, 0);
     return {
       period: { label: "近 30 天" },
       systemAdmins: [],
@@ -2272,23 +2338,22 @@ export default function AdminDashboard({
           isActive: true,
           apiKeyConfigured: true,
           apiKeyVersion: 1,
+          agentProfile: "frontmind-pro" as const,
           keyPool: {
             fingerprint: pool?.fingerprint || "9f17b2d4a631c809",
             credentialCount: pool?.fingerprint ? 1 : 0,
             totalUsed: pool?.used || 84_200,
             limit: pool?.limit || 230_000,
             warningRatio: pool?.warningRatio || 0.8,
-            syncStatus: pool?.syncStatus || "ok",
+            keyHealth: "connected" as const,
+            keyPoolStale: false,
+            keyLastSuccessfulAt: pool?.fetchedAt || "2026-07-28T08:00:00+08:00",
+            keyLastAttemptAt: pool?.fetchedAt || "2026-07-28T08:00:00+08:00",
             fetchedAt: pool?.fetchedAt || "2026-07-28T08:00:00+08:00",
             severity: "normal",
           },
-          ownAgentMonthUsed,
-          accountUsageComplete: true,
-          attributedUsed,
-          otherOrUnattributedUsed: Math.max(
-            0,
-            (pool?.used || 84_200) - attributedUsed,
-          ),
+          rolling30DayUsed: ownAgentMonthUsed,
+          usageObservedAt: pool?.fetchedAt || null,
           users,
         },
       ],
@@ -2309,11 +2374,14 @@ export default function AdminDashboard({
       ...engineer,
       apiKeyConfigured: usage?.apiKeyConfigured ?? engineer.apiKeyConfigured,
       apiKeyVersion: usage?.apiKeyVersion ?? engineer.apiKeyVersion,
-      keyTotalUsed: usage?.keyTotalUsed ?? 0,
-      ownAgentMonthUsed: usage?.ownAgentMonthUsed ?? 0,
-      accountUsageComplete: usage?.accountUsageComplete ?? true,
-      otherOrUnattributedUsed: usage?.otherOrUnattributedUsed ?? 0,
-      usageSyncStatus: usage?.syncStatus ?? "unconfigured",
+      agentProfile: usage?.agentProfile ?? "frontmind-pro",
+      rolling30DayUsed: usage?.rolling30DayUsed ?? 0,
+      keyPoolTotalUsed: usage?.keyPoolTotalUsed ?? null,
+      keyHealth: usage?.keyHealth ?? "unconfigured",
+      keyPoolStale: resolveKeyPoolStale({
+        keyPoolStale: usage?.keyPoolStale,
+        keyHealth: usage?.keyHealth ?? "unconfigured",
+      }),
       usageFetchedAt: usage?.fetchedAt ?? null,
       usageFingerprint: usage?.fingerprint ?? null,
     };
@@ -2329,14 +2397,14 @@ export default function AdminDashboard({
         deliveryAdminId: null,
         configured: administrator.apiKeyConfigured,
         version: administrator.apiKeyVersion,
+        agentProfile: administrator.agentProfile,
         typeLabel: "系统管理员",
         scopeLabel: "系统管理与通用 Agent",
         inherited: false,
-        ownAgentMonthUsed: administrator.ownAgentMonthUsed,
-        accountUsageComplete: administrator.accountUsageComplete,
-        keyTotalUsed: administrator.keyTotalUsed,
-        otherOrUnattributedUsed: administrator.otherOrUnattributedUsed,
-        syncStatus: administrator.syncStatus,
+        rolling30DayUsed: administrator.rolling30DayUsed,
+        keyPoolTotalUsed: administrator.keyPoolTotalUsed,
+        keyHealth: administrator.keyHealth,
+        keyPoolStale: administrator.keyPoolStale,
         fetchedAt: administrator.fetchedAt,
         fingerprint: administrator.fingerprint,
       }),
@@ -2351,17 +2419,14 @@ export default function AdminDashboard({
         deliveryAdminId: manager.adminId,
         configured: manager.apiKeyConfigured,
         version: manager.apiKeyVersion,
+        agentProfile: manager.agentProfile,
         typeLabel: "交付管理员",
         scopeLabel: `负责 ${manager.users.length} 个客户`,
         inherited: false,
-        ownAgentMonthUsed: manager.ownAgentMonthUsed,
-        accountUsageComplete: manager.accountUsageComplete,
-        keyTotalUsed: manager.keyPool.totalUsed,
-        otherOrUnattributedUsed: Math.max(
-          0,
-          manager.keyPool.totalUsed - manager.ownAgentMonthUsed,
-        ),
-        syncStatus: manager.keyPool.syncStatus,
+        rolling30DayUsed: manager.rolling30DayUsed,
+        keyPoolTotalUsed: manager.keyPool.totalUsed,
+        keyHealth: manager.keyPool.keyHealth,
+        keyPoolStale: manager.keyPool.keyPoolStale,
         fetchedAt: manager.keyPool.fetchedAt,
         fingerprint: manager.keyPool.fingerprint,
       }),
@@ -2376,16 +2441,16 @@ export default function AdminDashboard({
         deliveryAdminId: null,
         configured: engineer.apiKeyConfigured,
         version: engineer.apiKeyVersion,
+        agentProfile: engineer.agentProfile,
         typeLabel: "工程师",
         scopeLabel: engineer.roleType
           ? `${DELIVERY_ROLE_LABELS[engineer.roleType]} · ${engineer.projectCount} 个项目`
           : `岗位未设置 · ${engineer.projectCount} 个项目`,
         inherited: false,
-        ownAgentMonthUsed: engineer.ownAgentMonthUsed,
-        accountUsageComplete: engineer.accountUsageComplete,
-        keyTotalUsed: engineer.keyTotalUsed,
-        otherOrUnattributedUsed: engineer.otherOrUnattributedUsed,
-        syncStatus: engineer.usageSyncStatus,
+        rolling30DayUsed: engineer.rolling30DayUsed,
+        keyPoolTotalUsed: engineer.keyPoolTotalUsed,
+        keyHealth: engineer.keyHealth,
+        keyPoolStale: engineer.keyPoolStale,
         fetchedAt: engineer.usageFetchedAt,
         fingerprint: engineer.usageFingerprint,
       }),
@@ -2400,16 +2465,16 @@ export default function AdminDashboard({
         deliveryAdminId: customer.deliveryAdminId,
         configured: customer.apiKeyConfigured,
         version: customer.apiKeyVersion,
+        agentProfile: customer.agentProfile,
         typeLabel: "客户",
         scopeLabel: customer.deliveryAdminName
           ? `负责人：${customer.deliveryAdminName}`
           : "负责人待分配",
         inherited: customer.usesInheritedKey,
-        ownAgentMonthUsed: customer.ownAgentMonthUsed,
-        accountUsageComplete: customer.accountUsageComplete,
-        keyTotalUsed: customer.keyTotalUsed,
-        otherOrUnattributedUsed: customer.otherOrUnattributedUsed,
-        syncStatus: customer.syncStatus,
+        rolling30DayUsed: customer.rolling30DayUsed,
+        keyPoolTotalUsed: customer.keyPoolTotalUsed,
+        keyHealth: customer.keyHealth,
+        keyPoolStale: customer.keyPoolStale,
         fetchedAt: customer.fetchedAt,
         fingerprint: customer.fingerprint,
       }),
@@ -2464,6 +2529,7 @@ export default function AdminDashboard({
       username: target.username,
       configured: target.configured,
       version: target.version,
+      agentProfile: target.agentProfile,
       ...(credentialDeepLink.relatedTicketId
         ? { relatedTicketId: credentialDeepLink.relatedTicketId }
         : {}),
@@ -2519,7 +2585,7 @@ export default function AdminDashboard({
                 </div>
                 <p className="mt-1 text-sm leading-6 text-[#716a80]">
                   {apiKeyManagementTab === "general"
-                    ? "客户、系统管理员、交付管理员和工程师使用同一套管理入口；通用 Agent Key 由系统管理员统一维护，账号自用量单独归因，无法完整归因时不会误显示为 0。"
+                    ? "客户、系统管理员、交付管理员和工程师使用同一套管理入口；通用 Agent Key 由系统管理员统一维护，近 30 天自用量按本地任务账本滚动累计。"
                     : "只为海外客户分配 FrontMind 品牌追踪 Key。不同客户可以共享同一 Key，个人积分仍按每轮实际用量分别归因。"}
                 </p>
               </div>
@@ -2701,6 +2767,11 @@ export default function AdminDashboard({
                                   ? "使用历史共享 Key"
                                   : "Key 待配置"}
                             </p>
+                            <p className="mt-1 text-[#716a80]">
+                              {row.agentProfile === "frontmind-pro"
+                                ? "Pro"
+                                : "Base"}
+                            </p>
                             {row.inherited && (
                               <p className="mt-1 text-[#946800]">
                                 建议配置独立 Key
@@ -2709,40 +2780,26 @@ export default function AdminDashboard({
                           </div>
                           <div>
                             <p className="text-sm font-semibold text-[#5b2a86]">
-                              {row.syncStatus === "ok" &&
-                              row.accountUsageComplete
-                                ? row.ownAgentMonthUsed.toLocaleString()
-                                : "—"}
+                              {row.rolling30DayUsed.toLocaleString()}
                             </p>
-                            {row.syncStatus === "ok" &&
-                              !row.accountUsageComplete && (
-                                <p className="mt-1 text-xs text-[#946800]">
-                                  账号归因不完整
-                                </p>
-                              )}
                           </div>
                           <div>
                             <p className="text-sm font-semibold text-[#332842]">
-                              {row.syncStatus === "ok"
-                                ? row.keyTotalUsed.toLocaleString()
-                                : "—"}
+                              {row.keyPoolTotalUsed?.toLocaleString() ?? "—"}
                             </p>
-                            {row.syncStatus !== "ok" ? (
+                            {row.keyHealth !== "connected" ? (
                               <p className="mt-1 text-xs text-[#946800]">
-                                {row.syncStatus === "unconfigured"
+                                {row.keyHealth === "unconfigured"
                                   ? "尚未配置"
-                                  : row.syncStatus === "pending"
-                                    ? "等待同步"
-                                    : "同步不完整"}
+                                  : row.keyHealth === "invalid_or_revoked"
+                                    ? "Key 已失效或撤销"
+                                    : row.keyHealth === "pending"
+                                      ? "等待同步"
+                                      : "连接同步失败"}
                               </p>
-                            ) : !row.accountUsageComplete ? (
+                            ) : row.keyPoolStale ? (
                               <p className="mt-1 text-xs text-[#857e91]">
-                                上游总额完整
-                              </p>
-                            ) : row.keyTotalUsed > row.ownAgentMonthUsed ? (
-                              <p className="mt-1 text-xs text-[#857e91]">
-                                其他{" "}
-                                {row.otherOrUnattributedUsed.toLocaleString()}
+                                上次成功值，等待每日刷新
                               </p>
                             ) : null}
                           </div>
@@ -2760,6 +2817,7 @@ export default function AdminDashboard({
                                 username: row.username,
                                 configured: row.configured,
                                 version: row.version,
+                                agentProfile: row.agentProfile,
                               });
                             }}
                           >
@@ -2892,33 +2950,26 @@ export default function AdminDashboard({
                               <p>
                                 自用{" "}
                                 <span className="font-semibold text-[#5b2a86]">
-                                  {engineer.usageSyncStatus === "ok" &&
-                                  engineer.accountUsageComplete
-                                    ? engineer.ownAgentMonthUsed.toLocaleString()
-                                    : "—"}
+                                  {engineer.rolling30DayUsed.toLocaleString()}
                                 </span>
                               </p>
                               <p>
                                 积分池总额{" "}
                                 <span className="font-semibold text-[#332842]">
-                                  {engineer.usageSyncStatus === "ok"
-                                    ? engineer.keyTotalUsed.toLocaleString()
-                                    : "—"}
+                                  {engineer.keyPoolTotalUsed?.toLocaleString() ??
+                                    "—"}
                                 </span>
                               </p>
-                              {engineer.usageSyncStatus === "ok" &&
-                                !engineer.accountUsageComplete && (
-                                  <p className="text-[#946800]">
-                                    账号归因不完整，上游总额可用
-                                  </p>
-                                )}
-                              {engineer.usageSyncStatus !== "ok" && (
+                              {engineer.keyHealth !== "connected" && (
                                 <p className="text-[#946800]">
-                                  {engineer.usageSyncStatus === "unconfigured"
+                                  {engineer.keyHealth === "unconfigured"
                                     ? "尚未配置"
-                                    : engineer.usageSyncStatus === "pending"
-                                      ? "等待同步"
-                                      : "同步不完整"}
+                                    : engineer.keyHealth ===
+                                        "invalid_or_revoked"
+                                      ? "Key 已失效或撤销"
+                                      : engineer.keyHealth === "pending"
+                                        ? "等待同步"
+                                        : "连接同步失败"}
                                 </p>
                               )}
                             </div>

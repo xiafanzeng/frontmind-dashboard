@@ -116,7 +116,7 @@ export function assertKnowledgeBaseAttachmentManifestPresent(input: {
     | undefined;
 }) {
   if (
-    input.skillVersion === "4" &&
+    (input.skillVersion === "4" || input.skillVersion === "5") &&
     input.attachmentCount > 0 &&
     input.attachmentManifest === undefined
   ) {

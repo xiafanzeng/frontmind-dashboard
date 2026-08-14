@@ -11,9 +11,13 @@ export const KNOWLEDGE_BASE_TREE_POLICY_V2_WRITER_ENV =
 export const KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH =
   "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472";
 
-/** Immutable v4 archive that implements the deep 30–115 contract. */
+/** Immutable v4 archive retained only for pre-v5 reset diagnostics. */
 export const KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH =
   "5e0487004c604c0b95feae0c19ee9544a7e82b10ca923ca6c779ed240f333f56";
+
+/** Immutable materialized v5 archive used by every new build. */
+export const KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH =
+  "4e155fef8a1c6bcb673c69101c660e5a48a40b36e912d8c7da1e2900002e471b";
 
 export function knowledgeBaseSkillContentHashForTreePolicy(
   treePolicyVersion: KnowledgeBaseTreePolicyVersion,
@@ -62,13 +66,12 @@ export function knowledgeBaseNewBuildTreePolicyVersion(
  * independently would make the migration-stage v1 rollback run the v2 Skill.
  */
 export function knowledgeBaseNewBuildPolicyBinding(
-  environment: NodeJS.ProcessEnv = process.env,
+  _environment: NodeJS.ProcessEnv = process.env,
 ) {
-  const treePolicyVersion = knowledgeBaseNewBuildTreePolicyVersion(environment);
   return {
-    treePolicyVersion,
-    skillVersion: "4" as const,
-    skillContentHash:
-      knowledgeBaseSkillContentHashForTreePolicy(treePolicyVersion),
+    treePolicyVersion:
+      KNOWLEDGE_BASE_TREE_POLICY_VERSION_DEEP as KnowledgeBaseTreePolicyVersion,
+    skillVersion: "5" as const,
+    skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
   };
 }

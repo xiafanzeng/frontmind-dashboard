@@ -88,6 +88,7 @@ export const knowledgeBaseRecoveryActions = [
   "update_credential",
   "fix_attachments",
   "reupload_logo",
+  "approve_reset",
   "regenerate_turn",
   "resume_start_from_retained_sources",
   "reselect_start_sources",
@@ -195,6 +196,9 @@ export interface KnowledgeBaseProgressDto {
     researchSummary: KnowledgeBaseResearchSummaryDto | null;
     status: KnowledgeBaseBuildStatus;
     revision: number;
+    /** Dashboard-owned immutable Working Set version; 0 means legacy/reset-required. */
+    contentVersion?: number;
+    executionMode?: "legacy_conversational" | "materialized_bundle_v1";
     currentLeafId: string | null;
     /** True while the first knowledge leaf is waiting for an official Logo upload. */
     logoRequired?: boolean;
@@ -278,7 +282,11 @@ export interface KnowledgeBaseCompletedTurnDto {
 
 /** A server-owned resource that is safe for the customer UI to render. */
 export interface KnowledgeBaseApprovedResourceDto {
-  kind: "logo" | "customer_upload";
+  kind:
+    | "logo"
+    | "customer_upload"
+    | "working_set_asset"
+    | "working_set_evidence";
   outputItemId: string | null;
   fileId: string | null;
   sameOriginUrl: string;

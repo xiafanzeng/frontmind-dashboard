@@ -943,7 +943,7 @@ describe("knowledge-base production final-package acceptance", () => {
     if (assetRoot) await rm(assetRoot, { recursive: true, force: true });
   });
 
-  it("reconciles the production confirming create rejection into one stable public action without a provider request", async () => {
+  it.skip("retires production canonical-create rejection recovery", async () => {
     const state = initialState();
     const buildId = "19191919-1919-4191-8191-191919191919";
     const turnId = "20202020-2020-4202-8202-202020202020";
@@ -1346,7 +1346,10 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   });
 
-  it("recovers a completed v4 zero-image Manifest from the same source task without creating another turn", async () => {
+  // Pre-v5 provider-task recovery is intentionally unsupported. Old builds now
+  // fail closed as RESET_REQUIRED; v5 initial/revision/confirm coverage lives in
+  // knowledge-base-materialized-contract.test.ts and knowledge-base-api.test.ts.
+  it.skip("retires completed v4 zero-image Manifest recovery", async () => {
     const fixture = await createFinalPackageFixture();
     const state = initialState();
     const buildId = "12121212-1212-4121-8121-121212121212";
@@ -1641,7 +1644,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   });
 
-  it("rolls back an accepted transition when the atomic turn completion write fails", async () => {
+  it("keeps an atomic pre-v5 rollback reset-only when turn completion fails", async () => {
     const fixture = await createFinalPackageFixture();
     const state = initialState();
     const buildId = "24242424-2424-4242-8242-242424242424";
@@ -1830,7 +1833,9 @@ describe("knowledge-base production final-package acceptance", () => {
 
     expect(rejectedCompletionWrites).toBe(1);
     expect(progress.build).toMatchObject({
-      status: "confirming",
+      status: "protocol_error",
+      executionMode: "legacy_conversational",
+      protocolError: expect.stringContaining("RESET_REQUIRED"),
       revision: 0,
       currentLeafId: fixture.leaves[0]!.id,
     });
@@ -1842,7 +1847,7 @@ describe("knowledge-base production final-package acceptance", () => {
     });
   });
 
-  it("accepts a Manus v2 migrated reopen result without dropping its ledger", async () => {
+  it("projects a migrated pre-v5 reopen result as RESET_REQUIRED", async () => {
     const fixture = await createFinalPackageFixture();
     const state = initialState();
     const buildId = "26262626-2626-4262-8262-262626262626";
@@ -2011,30 +2016,15 @@ describe("knowledge-base production final-package acceptance", () => {
     });
 
     expect(progress.build).toMatchObject({
-      status: "confirming",
+      status: "protocol_error",
+      executionMode: "legacy_conversational",
+      protocolError: expect.stringContaining("RESET_REQUIRED"),
       revision: revision + 1,
       currentLeafId: reopenedLeaf.id,
     });
-    expect(state.nodes[2]).toMatchObject({
-      status: "needs_verification",
-      sourceTurnId: turnId,
-      transitionReason: "客户要求重新核验该节点",
-    });
-    expect(state.turns[0]).toMatchObject({
-      status: "completed",
-      completedAt: expect.any(Date),
-      metadata: {
-        providerProtocol: "manus_v2",
-        providerMethod: "task.sendMessage",
-        providerAttemptState: "accepted",
-        operationToken: operationKey,
-        lastSeenEventIds: ["event-reopen-result"],
-        recovery: { migratedFrom: "legacy_v1" },
-      },
-    });
   });
 
-  it("rebinds, downloads and publishes a real historical Skill-v4/schema-v3 archive without v4 upload evidence", async () => {
+  it.skip("retires historical Skill-v4 archive rebinding", async () => {
     const buildId = "13131313-1313-4131-8131-131313131313";
     const taskId = "task-historical-v4-schema3";
     const fileId = "file-historical-v4-schema3";
@@ -2261,7 +2251,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   }, 60_000);
 
-  it("completes content immediately and builds a local package when the provider ZIP is missing", async () => {
+  it("does not expose pre-v5 provider finalization as publishable content", async () => {
     const finalRevision = 45;
     const priorRevision = finalRevision - 1;
     const buildId = "99999999-9999-4999-8999-999999999999";
@@ -2470,93 +2460,16 @@ describe("knowledge-base production final-package acceptance", () => {
       upstreamStatus: "completed",
     });
     expect(completedProgress.build).toMatchObject({
-      status: "ready_to_publish",
+      status: "protocol_error",
+      executionMode: "legacy_conversational",
+      protocolError: expect.stringContaining("RESET_REQUIRED"),
       revision: finalRevision,
       currentLeafId: null,
-    });
-    expect(completedProgress.summary).toMatchObject({
-      total: finalRevision,
-      handled: finalRevision,
-      confirmed: finalRevision,
-      current: 0,
-      overallPercent: 100,
     });
     expect(completedProgress.packageAllowed).toBe(false);
-    expect(state.builds[0]).toMatchObject({
-      status: "ready_to_publish",
-      revision: finalRevision,
-      currentLeafId: null,
-      confirmedCount: finalRevision,
-      activeTurnId: null,
-      contentCompletedAt: expect.any(Date),
-      packageStatus: "preparing",
-      packageStorageKey: null,
-      protocolError: null,
-      protocolErrorCode: null,
-    });
-    expect(state.turns[0]).toMatchObject({
-      id: turnId,
-      operationKey,
-      status: "completed",
-      errorCode: null,
-      completedAt: expect.any(Date),
-      metadata: {
-        attachmentsFrozen: true,
-        providerProtocol: "manus_v2",
-        providerMethod: "task.sendMessage",
-        providerAttemptState: "accepted",
-        operationToken: operationKey,
-        lastSeenEventIds: ["event-final-result"],
-        providerRejectionCount: 0,
-        recovery: { outputCursor: 45 },
-      },
-    });
-    expect(state.nodes.every((node) => node.status === "confirmed")).toBe(true);
-    expect(
-      state.messages.some(
-        (message) =>
-          message.role === "assistant" &&
-          message.metadata?.knowledgeBase?.kind === "completion" &&
-          message.metadata?.knowledgeBase?.revision === finalRevision,
-      ),
-    ).toBe(true);
-
-    const { runKnowledgeBasePackageSweep } = await import(
-      "./knowledge-base-local-package"
-    );
-    await expect(runKnowledgeBasePackageSweep(1)).resolves.toEqual({
-      scanned: 1,
-      ready: 1,
-      failed: 0,
-    });
-    expect(state.builds[0]).toMatchObject({
-      status: "ready_to_publish",
-      revision: finalRevision,
-      packageStatus: "ready",
-      packageRevision: finalRevision,
-      packageTaskId: taskId,
-      packageOutputItemId: `dashboard-local:${buildId}:${finalRevision}`,
-      packageStorageKey: expect.any(String),
-      packageArchiveSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      packageSizeBytes: expect.any(Number),
-    });
-    const locallyPackagedProgress = await reconcileKnowledgeBaseProgress({
-      userId: USER_ID,
-      conversationId: PUBLIC_CONVERSATION_ID,
-      taskId,
-      userText: "确认",
-      attachmentCount: 0,
-      output: textOnlyOutput,
-      upstreamStatus: "completed",
-    });
-    expect(locallyPackagedProgress).toMatchObject({
-      build: { status: "ready_to_publish", revision: finalRevision },
-      summary: { handled: finalRevision, total: finalRevision },
-      packageAllowed: true,
-    });
   }, 60_000);
 
-  it("recovers a settled legacy task's late ZIP once and keeps the published snapshot immutable", async () => {
+  it.skip("retires settled legacy task late-ZIP recovery", async () => {
     // Tree policy v1 is the smallest production archive contract (8 leaves).
     // Keep this fixture compact without reviving the deleted 30/45-leaf flow.
     const finalRevision = 8;
@@ -3142,7 +3055,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   }, 60_000);
 
-  it("retries a failed final package and repairs only its derived visible-character count", async () => {
+  it.skip("retires provider final-package repair turns", async () => {
     const finalRevision = 45;
     const priorRevision = finalRevision - 1;
     const buildId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -3996,7 +3909,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   }, 60_000);
 
-  it("rejects a settled acknowledgement before first-Logo binding and unlocks an immediate retry", async () => {
+  it.skip("retires legacy first-Logo acknowledgement retries", async () => {
     const state = initialState();
     const buildId = "77777777-7777-4777-8777-777777777777";
     const turnId = "88888888-8888-4888-8888-888888888888";
@@ -4161,7 +4074,7 @@ describe("knowledge-base production final-package acceptance", () => {
     }
   });
 
-  it("returns the durable third settled failure only for the exact active task", async () => {
+  it("keeps every settled pre-v5 failure projection reset-only", async () => {
     const state = initialState();
     const buildId = "44444444-4444-4444-8444-444444444444";
     const turnId = "55555555-5555-4555-8555-555555555555";
@@ -4291,9 +4204,11 @@ describe("knowledge-base production final-package acceptance", () => {
           ],
           upstreamStatus: "completed",
         });
-        expect(progress.build.status).toBe(
-          second === 10 ? "protocol_error" : "confirming",
-        );
+        expect(progress.build).toMatchObject({
+          status: "protocol_error",
+          executionMode: "legacy_conversational",
+          protocolError: expect.stringContaining("RESET_REQUIRED"),
+        });
       }
     } finally {
       vi.useRealTimers();
@@ -4313,7 +4228,7 @@ describe("knowledge-base production final-package acceptance", () => {
     });
   });
 
-  it("keeps the exact legacy protocol-terminal start incident read-only across every HTTP recovery route", async () => {
+  it.skip("retires legacy protocol-terminal HTTP recovery", async () => {
     const state = initialState();
     const buildId = "77777777-7777-4777-8777-777777777777";
     const turnId = "88888888-8888-4888-8888-888888888888";

@@ -11,7 +11,9 @@ import {
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   knowledgeBaseResetStates,
+  localAssets,
   messages,
+  providerFileLeases,
   upstreamResources,
   userUsageOwners,
   type ConversationTurn,
@@ -87,6 +89,7 @@ import {
 } from "./knowledge-base-turn-service";
 import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import {
+  KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
   KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
   KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
 } from "./knowledge-base-tree-policy-rollout";
@@ -148,6 +151,8 @@ interface TurnServiceStore {
   tombstones: any[];
   retainedTombstones: any[];
   resources: any[];
+  localAssets: any[];
+  providerFileLeases: any[];
   nodes: any[];
   usageOwnerId: number | null;
   resetRevision: number;
@@ -162,6 +167,8 @@ function createTurnServiceExecutor(input: {
   tombstones?: any[];
   retainedTombstones?: any[];
   resources?: any[];
+  localAssets?: any[];
+  providerFileLeases?: any[];
   nodes?: any[];
   usageOwnerId?: number | null;
   resetRevision?: number;
@@ -180,12 +187,15 @@ function createTurnServiceExecutor(input: {
           id: "credential-1",
           userId: 1,
           status: "active",
+          version: 1,
         },
       ]),
     ],
     tombstones: [...(input.tombstones || [])],
     retainedTombstones: [...(input.retainedTombstones || [])],
     resources: [...(input.resources || [])],
+    localAssets: [...(input.localAssets || [])],
+    providerFileLeases: [...(input.providerFileLeases || [])],
     nodes: structuredClone(input.nodes || []),
     usageOwnerId: input.usageOwnerId ?? null,
     resetRevision: input.resetRevision ?? 0,
@@ -248,6 +258,9 @@ function createTurnServiceExecutor(input: {
         }
         if (table === upstreamResources) {
           return store.resources;
+        }
+        if (table === localAssets) {
+          return store.localAssets;
         }
         if (table === userUsageOwners) {
           return store.usageOwnerId == null
@@ -340,6 +353,8 @@ function createTurnServiceExecutor(input: {
               store.messages.push(values);
             } else if (table === upstreamResources) {
               store.resources.push(values);
+            } else if (table === providerFileLeases) {
+              store.providerFileLeases.push(values);
             } else if (table === knowledgeBaseConversationRetentionTombstones) {
               store.retainedTombstones.push(values);
             }
@@ -410,6 +425,8 @@ function createTurnServiceExecutor(input: {
         store.tombstones = snapshot.tombstones;
         store.retainedTombstones = snapshot.retainedTombstones;
         store.resources = snapshot.resources;
+        store.localAssets = snapshot.localAssets;
+        store.providerFileLeases = snapshot.providerFileLeases;
         store.nodes = snapshot.nodes;
         store.usageOwnerId = snapshot.usageOwnerId;
         store.resetRevision = snapshot.resetRevision;
@@ -2704,9 +2721,7 @@ describe("Manus v2 canonical task writer fence", () => {
           requestBody: {
             prompt: "frozen source prompt",
             agentProfile: "manus-1.6-max",
-            attachments: [
-              { file_id: sourceFileId, filename: "workflow.zip" },
-            ],
+            attachments: [{ file_id: sourceFileId, filename: "workflow.zip" }],
           },
           bodySha256: "9".repeat(64),
           preparedAt: "2026-08-13T00:00:00.000Z",
@@ -3273,9 +3288,10 @@ describe("Manus v2 canonical task writer fence", () => {
 
   it("keeps source ids frozen until every ready v2 mapping commits atomically", async () => {
     const leaseToken = "v2-attachment-ledger-lease";
+    const customerAssetId = `asset_${"c".repeat(30)}`;
     const sourceAttachments = [
       { file_id: "source-skill", filename: "skill.zip" },
-      { file_id: "source-facts", filename: "facts.pdf" },
+      { file_id: customerAssetId, filename: "facts.pdf" },
     ];
     const preparedBody = {
       prompt: "continue",
@@ -3333,7 +3349,7 @@ describe("Manus v2 canonical task writer fence", () => {
       verifiedAt: "2026-08-01T00:00:20.000Z",
     });
     const first = mapping(0, "source-skill", "skill.zip", "v2-skill");
-    const second = mapping(1, "source-facts", "facts.pdf", "v2-facts");
+    const second = mapping(1, customerAssetId, "facts.pdf", "v2-facts");
     const persistAcceptedAttempt = async (target: typeof first) => {
       const base = {
         schemaVersion: 1 as const,
@@ -3388,7 +3404,7 @@ describe("Manus v2 canonical task writer fence", () => {
     );
     expect(harness.store.turns[0]!.attachmentFileIds).toEqual([
       "source-skill",
-      "source-facts",
+      customerAssetId,
     ]);
     await expect(
       finalizeKnowledgeBaseManusV2AttachmentMappings(
@@ -3404,7 +3420,7 @@ describe("Manus v2 canonical task writer fence", () => {
     ).rejects.toMatchObject({ code: "CONFLICT" });
     expect(harness.store.turns[0]!.attachmentFileIds).toEqual([
       "source-skill",
-      "source-facts",
+      customerAssetId,
     ]);
 
     await persistAcceptedAttempt(second);
@@ -3432,6 +3448,15 @@ describe("Manus v2 canonical task writer fence", () => {
       [first.mappingKey]: first,
       [second.mappingKey]: second,
     });
+    expect(harness.store.providerFileLeases).toEqual([
+      expect.objectContaining({
+        localAssetId: customerAssetId,
+        apiCredentialId: "credential-1",
+        credentialVersion: 1,
+        providerFileId: "v2-facts",
+        uploadState: "uploaded",
+      }),
+    ]);
   });
 
   it("freezes an ambiguous v2 file side effect without promoting or retrying its slot", async () => {
@@ -3855,7 +3880,7 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(harness.store.build.canonicalTaskId).toBe("canonical-task");
   });
 
-  it("reclaims a post-2xx bind failure only for v2 reconciliation and never grants another POST", async () => {
+  it.skip("retires canonical-task post-2xx bind recovery", async () => {
     const leaseToken = "post-ack-bind-failure-lease";
     const activeTurn = turn({
       status: "running",
@@ -5216,7 +5241,7 @@ describe("Manus v2 canonical task writer fence", () => {
     });
   });
 
-  it("terminalizes a rejected recovery claim despite legacy repair metadata and a future lease", async () => {
+  it.skip("retires rejected canonical repair claims", async () => {
     const rejectedTurn = turn({
       status: "running",
       leaseExpiresAt: new Date("2026-08-01T01:00:00.000Z"),
@@ -5285,7 +5310,7 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(harness.store.conversation).toMatchObject({ status: "failed" });
   });
 
-  it("terminalizes a historical bound local-rehydrate rejection as new-canonical authority", async () => {
+  it.skip("retires historical local-rehydrate canonical recovery", async () => {
     const rejectedTurn = turn({
       status: "running",
       upstreamTaskId: "canonical-task",
@@ -6338,6 +6363,10 @@ describe("knowledge-base recovery metadata", () => {
       conversationId: "conversation-1",
       generation: failed.buildGeneration,
       stateEpoch: 8,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      providerProtocol: "manus_v2",
+      contentVersion: 1,
       status: "protocol_error",
       activeTurnId: failed.id,
       protocolErrorCode: failed.errorCode,
@@ -6680,6 +6709,10 @@ describe("knowledge-base recovery metadata", () => {
       conversationId: "conversation-1",
       generation: failed.buildGeneration,
       stateEpoch: 8,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      providerProtocol: "manus_v2",
+      contentVersion: 1,
       status: "protocol_error",
       activeTurnId: failed.id,
       protocolErrorCode: failed.errorCode,
@@ -6812,6 +6845,10 @@ describe("knowledge-base recovery metadata", () => {
         conversationId: "conversation-1",
         generation: rejected.buildGeneration,
         stateEpoch: 8,
+        executionMode: "materialized_bundle_v1",
+        skillVersion: "5",
+        providerProtocol: "manus_v2",
+        contentVersion: 1,
         status: "protocol_error",
         activeTurnId: rejected.id,
         protocolErrorCode: rejected.errorCode,
@@ -7182,8 +7219,8 @@ describe("knowledge-base atomic start reservation", () => {
     companyName: "FrontMind 超前智能",
     companyWebsite: "https://www.frontmind.net/",
     skillName: "socratic-kb-builder",
-    skillVersion: "4",
-    skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
+    skillVersion: "5",
+    skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
     apiCredentialId: "credential-1",
     userText: "开始构建企业知识库",
     expectedAttachmentCount: 1,
@@ -7781,7 +7818,7 @@ describe("knowledge-base atomic start reservation", () => {
     expect(store).toEqual(before);
   });
 
-  it("pins a new build and its first turn to legacy only while the Manus v2 writer is explicitly disabled", async () => {
+  it("ignores the removed writer flag and always pins new builds to Manus v2", async () => {
     const previous = process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
     process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV] = "false";
     try {
@@ -7801,9 +7838,9 @@ describe("knowledge-base atomic start reservation", () => {
         executor,
       );
 
-      expect(result.build.providerProtocol).toBe("legacy_v1");
-      expect(result.reservation.turn.providerProtocol).toBe("legacy_v1");
-      expect(store.build?.providerProtocol).toBe("legacy_v1");
+      expect(result.build.providerProtocol).toBe("manus_v2");
+      expect(result.reservation.turn.providerProtocol).toBe("manus_v2");
+      expect(store.build?.providerProtocol).toBe("manus_v2");
     } finally {
       if (previous === undefined) {
         delete process.env[KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV];
@@ -7995,24 +8032,24 @@ describe("knowledge-base atomic start reservation", () => {
     ).toBe(true);
   });
 
-  it("can roll back only the new-build writer to legacy policy v1", async () => {
+  it("rejects an attempted rollback of the v5-only new-build policy", async () => {
     const previous = process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
     process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = "false";
     try {
       const { executor, store } = createTurnServiceExecutor({
         turnSelections: [[[], []]],
       });
-      const result = await reserveKnowledgeBaseStartBuild(
-        {
-          ...startInput,
-          skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
-          treePolicyVersion: 1,
-        },
-        executor,
-      );
-      expect(result.createdBuild).toBe(true);
-      expect(result.build.treePolicyVersion).toBe(1);
-      expect(store.build?.treePolicyVersion).toBe(1);
+      await expect(
+        reserveKnowledgeBaseStartBuild(
+          {
+            ...startInput,
+            skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
+            treePolicyVersion: 1,
+          },
+          executor,
+        ),
+      ).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+      expect(store.build).toBeNull();
     } finally {
       if (previous === undefined) {
         delete process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
@@ -8687,6 +8724,107 @@ describe("knowledge-base attachment-first turn reservation", () => {
       ...overrides,
     };
   }
+
+  it("stages a v5 local asset by account ownership without a Provider file resource", async () => {
+    const localAssetId = `asset_${"a".repeat(30)}`;
+    const localManifest = [
+      {
+        ...manifest[0]!,
+        itemId: "materialized-local-item-1",
+        ordinal: 1,
+        total: 1,
+      },
+    ];
+    const materializedBuild = {
+      ...build,
+      executionMode: "materialized_bundle_v1",
+      providerProtocol: "manus_v2",
+      skillVersion: "5",
+      upstreamTaskId: null,
+      canonicalTaskId: null,
+      canonicalCredentialId: null,
+      activeWorkingSetId: "working-set-1",
+      contentVersion: 1,
+    };
+    const { executor, store } = createTurnServiceExecutor({
+      build: materializedBuild,
+      conversation: { ...conversation },
+      localAssets: [
+        {
+          id: localAssetId,
+          scope: "managed_user",
+          accountUserId: 1,
+          filename: "facts.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 12,
+          contentSha256: "a".repeat(64),
+        },
+      ],
+      resources: [],
+      turnSelections: [
+        [[], []],
+        [(current) => current.turns, (current) => current.turns],
+      ],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(
+      {
+        ...reserveInput(),
+        userAttachmentCount: 1,
+        expectedAttachmentCount: 4,
+        clientAttachmentManifest: localManifest,
+        requestPayload: {
+          userMessage: "请结合附件修订",
+          attachmentManifest: localManifest,
+          skillVersion: "5",
+        },
+        recoveryMetadata: {
+          kind: "turn",
+          conversationId: build.conversationId,
+          parentTaskId: null,
+          userMessage: "请结合附件修订",
+          attachments: [],
+          attachmentManifest: localManifest,
+          deferredClientAttachments: true,
+          skillVersion: "5",
+        },
+      },
+      executor,
+    );
+    const staged = await stageKnowledgeBaseDeferredTurnAttachment(
+      {
+        userId: 1,
+        buildId: materializedBuild.id,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        clientAttachmentManifest: localManifest,
+        index: 0,
+        attachment: { file_id: localAssetId, filename: "facts.pdf" },
+        managedUploadProof: {
+          intentId: `local-asset:${localAssetId}`,
+          itemId: "materialized-local-item-1",
+          mimeType: "application/pdf",
+          sizeBytes: 12,
+          contentSha256: "a".repeat(64),
+          localStorageKey:
+            "knowledge-base/build-sources/1/materialized/facts.bin",
+        },
+      },
+      executor,
+    );
+
+    expect(staged.attachmentFileIds).toEqual([localAssetId]);
+    expect(store.resources).toEqual([]);
+    expect((store.turns[0]!.metadata as any).recovery).toMatchObject({
+      attachmentSourceProofs: [
+        {
+          fileId: localAssetId,
+          contentSha256: "a".repeat(64),
+          localStorageKey:
+            "knowledge-base/build-sources/1/materialized/facts.bin",
+        },
+      ],
+    });
+  });
 
   it("does not create a competing turn while open-build recovery owns the lease", async () => {
     const { executor } = createTurnServiceExecutor({
@@ -9684,7 +9822,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
     ).resolves.toBeNull();
   });
 
-  it("keeps the exact 15:52 replacement inert until migration grants recovery", async () => {
+  it.skip("retires the legacy 15:52 migration replacement", async () => {
     const replacement = turn({
       id: "00000000-0000-4000-8000-000000000035",
       buildId: build.id,
@@ -9750,7 +9888,15 @@ describe("knowledge-base attachment-first turn reservation", () => {
         },
       });
       const { executor, store } = createTurnServiceExecutor({
-        build: { ...build, activeTurnId: unresolved.id },
+        build: {
+          ...build,
+          executionMode: "materialized_bundle_v1",
+          skillVersion: "5",
+          providerProtocol: "manus_v2",
+          upstreamTaskId: null,
+          canonicalTaskId: null,
+          activeTurnId: unresolved.id,
+        },
         conversation: { ...conversation },
         turns: [unresolved],
         turnSelections: [[[unresolved]]],
@@ -9795,7 +9941,15 @@ describe("knowledge-base attachment-first turn reservation", () => {
     const dynamicActive = (current: TurnServiceStore) =>
       current.turns.filter((candidate) => candidate.id === unresolved.id);
     const { executor, store } = createTurnServiceExecutor({
-      build: { ...build, activeTurnId: unresolved.id },
+      build: {
+        ...build,
+        executionMode: "materialized_bundle_v1",
+        skillVersion: "5",
+        providerProtocol: "manus_v2",
+        upstreamTaskId: null,
+        canonicalTaskId: null,
+        activeTurnId: unresolved.id,
+      },
       conversation: { ...conversation },
       turns: [unresolved],
       turnSelections: [[dynamicActive], [dynamicActive]],
@@ -9920,6 +10074,11 @@ describe("knowledge-base attachment-first turn reservation", () => {
     const { executor, store } = createTurnServiceExecutor({
       build: {
         ...build,
+        executionMode: "materialized_bundle_v1",
+        skillVersion: "5",
+        providerProtocol: "manus_v2",
+        upstreamTaskId: null,
+        canonicalTaskId: null,
         activeTurnId: rejected.id,
         status: "protocol_error",
         protocolErrorCode: rejected.errorCode,

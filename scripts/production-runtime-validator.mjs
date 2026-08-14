@@ -26,7 +26,7 @@ const exactValues = {
   FRONTMIND_CONVERSATION_RETENTION_DAYS: "30",
   FRONTMIND_SERVICE_ENTITLEMENT_ENFORCEMENT: "auto",
   FRONTMIND_KB_SKILL_PATH:
-    "/app/dist/private-workflows/socratic-kb-builder.skill",
+    "/app/dist/private-workflows/socratic-kb-builder-v5.skill",
   FRONTMIND_BRAND_QUESTION_SKILL_PATH:
     "/app/dist/private-workflows/brand-question-portfolio.skill",
   FRONTMIND_RESPONSE_LOGIC_SKILL_PATH:
@@ -84,21 +84,6 @@ export function validateProductionRuntimeEnvironment(env = process.env) {
     if (env[name] !== expected) fail(`${name}_VALUE_INVALID`);
   }
 
-  const knowledgeBaseRollout = env.FRONTMIND_KB_V4_ROLLOUT_PERCENT || "";
-  if (!/^(?:100|[0-9]{1,2})(?:\.\d{1,2})?$/u.test(knowledgeBaseRollout)) {
-    fail("FRONTMIND_KB_V4_ROLLOUT_PERCENT_VALUE_INVALID");
-  }
-  const rolloutValue = Number(knowledgeBaseRollout);
-  if (rolloutValue < 0 || rolloutValue > 100) {
-    fail("FRONTMIND_KB_V4_ROLLOUT_PERCENT_VALUE_INVALID");
-  }
-  const knowledgeBaseAllowlist = env.FRONTMIND_KB_V4_ALLOW_USER_IDS || "";
-  if (
-    knowledgeBaseAllowlist &&
-    !/^[1-9]\d*(?:,[1-9]\d*)*$/u.test(knowledgeBaseAllowlist)
-  ) {
-    fail("FRONTMIND_KB_V4_ALLOW_USER_IDS_VALUE_INVALID");
-  }
   const knowledgeBaseWritesDisabled = env.KNOWLEDGE_BASE_WRITES_DISABLED || "";
   if (
     knowledgeBaseWritesDisabled &&

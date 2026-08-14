@@ -38,6 +38,13 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     operationId: string;
     turnId: string;
   };
+  materializedBase?: {
+    buildId: string;
+    generation: number;
+    contentVersion: number;
+    packageSha256: string;
+    filename: string;
+  };
   progressOverride?: {
     build: {
       revision: number;
@@ -86,6 +93,41 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     input.userMessage,
     input.attachments.length,
   );
+  if (input.skillVersion === "5") {
+    const base = input.materializedBase;
+    if (
+      !base ||
+      !current ||
+      action === "confirm" ||
+      action === "direct_prefill"
+    ) {
+      throw new KnowledgeBaseBuildError(
+        "PROGRESS_PROTOCOL_INVALID",
+        "物化知识库 revision 缺少当前 Working Set 或目标节点坐标",
+      );
+    }
+    const operationId = input.protocolOperation?.operationId || "";
+    return assertUpstreamPromptBudget(
+      [
+        "用户已授权 FrontMind Dashboard 修订当前企业知识库节点。",
+        `完整读取 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME} 内的 SKILL.md、references/materialized-working-set.md 和校验器。`,
+        "执行且只执行 operation=revise_leaf_bundle。每次 revision 都是一个全新 Manus v2 task；不得寻找、继续或引用旧 task。",
+        `完整读取附件 ${base.filename}；它是本轮唯一权威完整 Working Set。`,
+        "只允许修改目标节点正文、该节点证据和该节点资产；禁止修改知识树、顺序、其他节点或确认状态。",
+        "最终只返回一个助手 Patch ZIP 附件；不得返回 Markdown 正文、进度信封、Structured Output、第二个文件或等待用户确认。",
+        `operationId=${operationId}`,
+        `buildId=${base.buildId}`,
+        `generation=${base.generation}`,
+        `baseContentVersion=${base.contentVersion}`,
+        `baseWorkingSetSha256=${base.packageSha256}`,
+        `targetLeafId=${current.id}`,
+        `用户修改要求=${input.userMessage.trim() || "仅根据本轮附件修订"}`,
+        `customerAttachments=${JSON.stringify(input.attachments.map((item) => item.filename))}`,
+        `ZIP 文件名必须为 frontmind-kb-patch-${operationId}.zip，根目录必须含 PATCH.json。`,
+        `运行 python3 scripts/validate_working_set.py frontmind-kb-patch-${operationId}.zip；只有输出 VALID frontmind.kb-node-patch.v1 后才能把同一 ZIP 作为唯一附件返回。`,
+      ].join("\n"),
+    );
+  }
   const postRevision = progress.build.revision + 1;
   const isV4 = input.skillVersion === "4";
   const isOfficialLogoUpload = isV4 && Boolean(input.officialLogoUpload);

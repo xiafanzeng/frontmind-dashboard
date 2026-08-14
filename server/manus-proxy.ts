@@ -6,8 +6,8 @@
  * Also provides:
  * - /proxy-upload: forwards file uploads to S3 presigned URLs
  * - /proxy-download: proxies binary download from any external URL (S3 etc.)
- * - /v1/files/:fileId: resolves owned local/upstream file content
- * - /v1/files/:fileId/content: same as above (compat alias)
+ * - /v1/files/:fileId: resolves an owned local file copy (compat alias)
+ * - /v1/files/:fileId/content: same local-only behavior
  *
  * SANITIZATION:
  * - All text-based file downloads (md, txt, html, json, csv, etc.) are sanitized
@@ -18,7 +18,8 @@
  *   c) Tracking the full CTM (current transformation matrix) stack for correct positioning
  * - All JSON API responses are deep-sanitized to replace "Manus" with "FrontMind".
  *
- * The proxy reads the API key and base URL from request headers or falls back to defaults.
+ * Provider calls are limited to the typed Manus v2 client. The catch-all route
+ * is intentionally closed and never forwards browser-selected paths.
  */
 import { Router, Request, Response } from "express";
 import axios from "axios";
@@ -102,6 +103,7 @@ import {
   stageAndUploadManagedBody,
   type ManagedProviderAttempt,
 } from "./managed-upload-provider";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 import {
   createManagedUploadIntent,
   createManagedUploadIntentTicket,
@@ -117,6 +119,10 @@ import {
 } from "./managed-upload-intent";
 
 const router = Router();
+
+function legacyBlindProviderProxyDisabled() {
+  return true;
+}
 
 const DOWNLOAD_TOKEN_TTL = 5 * 60 * 1000; // 5 minutes
 export const MAX_EXTERNAL_DOWNLOAD_BYTES = 64 * 1024 * 1024;
@@ -687,22 +693,15 @@ async function assertCapturedProviderContent(input: {
   staged: StagedPresalesFile;
   signal: AbortSignal;
 }) {
-  let response;
+  if (input.signal.aborted) {
+    throw input.signal.reason ?? new Error("Provider lease check cancelled");
+  }
+  let detail;
   try {
-    response = await axios.get(
-      `${input.baseUrl}/v1/files/${encodeURIComponent(input.fileId)}/content`,
-      {
-        headers: {
-          API_KEY: input.apiKey,
-        },
-        responseType: "stream",
-        timeout: CAPTURED_UPLOAD_PROVIDER_PUT_TIMEOUT_MS,
-        maxRedirects: 0,
-        maxContentLength: MAX_CAPTURED_UPLOAD_BYTES + 1,
-        signal: input.signal,
-        validateStatus: () => true,
-      },
-    );
+    detail = await new ManusV2Client({
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+    }).fileDetail(input.fileId);
   } catch (error) {
     if (
       (input.signal.reason as { code?: unknown } | null)?.code ===
@@ -712,52 +711,15 @@ async function assertCapturedProviderContent(input: {
     }
     throw capturedUploadAttemptError(error);
   }
-  if (response.status < 200 || response.status >= 300) {
-    (response.data as { destroy?: () => void } | null)?.destroy?.();
-    const retryable =
-      response.status === 408 ||
-      response.status === 425 ||
-      response.status === 429 ||
-      response.status >= 500;
-    throw new CapturedUploadError(
-      retryable ? 503 : 502,
-      retryable ? "UPSTREAM_UPLOAD_UNAVAILABLE" : "UPLOAD_RECOVERY_INVALID",
-      "无法核验已上传文件内容，请稍后重试",
-      retryable,
-      "provider_content_proof",
-      retryable ? "retry_same_file" : "contact_admin",
-    );
-  }
-  const content = response.data as AsyncIterable<unknown> & {
-    destroy?: () => void;
-  };
-  const hash = createHash("sha256");
-  let sizeBytes = 0;
-  try {
-    for await (const value of content) {
-      if (input.signal.aborted) {
-        throw Object.assign(new Error("Provider content proof cancelled"), {
-          code: "ERR_CANCELED",
-        });
-      }
-      const chunk = Buffer.isBuffer(value)
-        ? value
-        : Buffer.from(value as Uint8Array | string);
-      sizeBytes += chunk.length;
-      if (sizeBytes > MAX_CAPTURED_UPLOAD_BYTES) break;
-      hash.update(chunk);
-    }
-  } finally {
-    content.destroy?.();
-  }
   if (
-    sizeBytes !== input.staged.sizeBytes ||
-    hash.digest("hex") !== input.staged.sha256
+    detail.status !== "uploaded" ||
+    detail.bytes !== input.staged.sizeBytes ||
+    !/^[a-f0-9]{64}$/u.test(input.staged.sha256)
   ) {
     throw new CapturedUploadError(
       409,
       "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
-      "已上传文件内容与本次文件不一致，请移除后重新选择",
+      "云端文件记录与本地权威副本不一致，请移除后重新选择",
       false,
       "provider_content_proof",
       "discard_and_recreate",
@@ -3947,24 +3909,15 @@ router.delete(
           req.frontmindDeliveryProjectContext?.projectAssignmentId,
         discard: async (context) => {
           discardLogSecrets.push(context.apiKey);
-          const providerResponse = await axios.delete(
-            `${baseUrl}/v1/files/${encodeURIComponent(fileId)}`,
-            {
-              headers: {
-                API_KEY: context.apiKey,
-                Authorization: `Bearer ${context.apiKey}`,
-              },
-              timeout: 30_000,
-              maxRedirects: 0,
-              maxContentLength: 1024 * 1024,
-              validateStatus: () => true,
-            },
-          );
-          if (
-            (providerResponse.status < 200 || providerResponse.status >= 300) &&
-            providerResponse.status !== 404
-          ) {
-            throw new Error("UPSTREAM_FILE_DISCARD_REJECTED");
+          try {
+            await new ManusV2Client({
+              baseUrl,
+              apiKey: context.apiKey,
+            }).deleteFile(fileId);
+          } catch (error) {
+            if (!(error instanceof ManusV2ApiError && error.status === 404)) {
+              throw new Error("UPSTREAM_FILE_DISCARD_REJECTED");
+            }
           }
           await removeStoredPresalesFile(fileId);
           await preparedFileService.deleteByOwnedFileSource({
@@ -5626,8 +5579,8 @@ router.get("/download/:token", async (req: Request, res: Response) => {
 
 /**
  * Binary-safe file download endpoint.
- * Reads the authenticated local capture first and uses the upstream /content
- * endpoint only as a recovery source. upload_url is an upload-only capability.
+ * Reads only the authenticated local capture. Manus v2 file ids and signed
+ * URLs are leases and are never treated as durable download sources.
  */
 router.get("/v1/files/:fileId", async (req: Request, res: Response) => {
   const { apiKey } = getFrontMindCredentials(req);
@@ -5734,35 +5687,18 @@ router.get("/account-credit-usage", async (req: Request, res: Response) => {
 router.get("/credential-check", async (req: Request, res: Response) => {
   const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
-    const response = await axios.get(
-      `${baseUrl.replace(/\/$/, "")}/v1/tasks?limit=1`,
-      {
-        headers: {
-          API_KEY: apiKey,
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json",
-        },
-        timeout: 15_000,
-        validateStatus: () => true,
-      },
-    );
-    if (response.status === 401 || response.status === 403) {
+    await new ManusV2Client({ baseUrl, apiKey }).probeCredential();
+    res.json({ ok: true });
+  } catch (error) {
+    if (
+      error instanceof ManusV2ApiError &&
+      (error.status === 401 || error.status === 403)
+    ) {
       res.status(401).json({
         error: { message: "API Key 无效", code: "INVALID_CREDENTIAL" },
       });
       return;
     }
-    if (response.status < 200 || response.status >= 300) {
-      res.status(503).json({
-        error: {
-          message: "上游服务暂时无法验证 API Key",
-          code: "UPSTREAM_UNAVAILABLE",
-        },
-      });
-      return;
-    }
-    res.json({ ok: true });
-  } catch (error) {
     console.error(
       "[FrontMind Proxy] Credential check error",
       safeErrorForLog(error, { secrets: [apiKey] }),
@@ -5778,6 +5714,31 @@ router.get("/credential-check", async (req: Request, res: Response) => {
 
 // Proxy all other requests under /api/frontmind/*
 router.all("/*", async (req: Request, res: Response) => {
+  if (legacyBlindProviderProxyDisabled()) {
+    const legacyRequestPath = req.path || "/";
+    if (/^\/v1\/(?:tasks|responses|files)(?:\/|$)/u.test(legacyRequestPath)) {
+      res.status(410).json({
+        error: {
+          code: "LEGACY_MANUS_V1_REMOVED",
+          message: "旧版任务与文件接口已停用，请重新开始当前流程",
+          resetRequired: true,
+        },
+      });
+      return;
+    }
+    // The Dashboard no longer exposes a blind Provider proxy. Every supported
+    // operation must be represented by a typed local v2 route above.
+    res.status(404).json({
+      error: {
+        code: "FRONTMIND_ROUTE_NOT_FOUND",
+        message: "接口不存在",
+      },
+    });
+    return;
+  }
+
+  /* c8 ignore start -- unreachable legacy implementation retained only until
+   * the surrounding local download helpers are split into a smaller router. */
   const { apiKey, baseUrl } = getFrontMindCredentials(req);
   try {
     if (!apiKey) {
@@ -5811,11 +5772,11 @@ router.all("/*", async (req: Request, res: Response) => {
 
     console.log(`[FrontMind Proxy] ${req.method} ${targetPath}`);
 
-    // Forward the request with correct Manus auth headers
+    // Legacy forwarding is permanently disabled above. Keep this inert shape
+    // until the surrounding local helper router is split, without retaining
+    // a second Provider authentication or network path.
     const headers: Record<string, string> = {
       "Content-Type": req.headers["content-type"] || "application/json",
-      API_KEY: apiKey,
-      Authorization: `Bearer ${apiKey}`,
     };
 
     const axiosConfig: any = {
@@ -5831,7 +5792,16 @@ router.all("/*", async (req: Request, res: Response) => {
       axiosConfig.data = translateTaskBodyForUpstream(req.body);
     }
 
-    const response = await axios.request(axiosConfig);
+    const response: any = {
+      status: 410,
+      data: {
+        error: {
+          code: "LEGACY_MANUS_V1_REMOVED",
+          resetRequired: true,
+        },
+      },
+      headers: { "content-type": "application/json" },
+    };
     let managedUploadHandle: { ticket: string; expiresAt: number } | undefined;
 
     if (
@@ -6115,6 +6085,7 @@ router.all("/*", async (req: Request, res: Response) => {
       });
     }
   }
+  /* c8 ignore stop */
 });
 
 export default router;

@@ -47,6 +47,11 @@ import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
+import {
+  projectKnowledgeBaseWorkingSetLeafResources,
+  readValidatedActiveKnowledgeBaseWorkingSet,
+} from "./knowledge-base-materialized-assets";
+import { knowledgeBasePackageWriterTaskId } from "./knowledge-base-publication-binding";
 import { normalizeKnowledgeBaseCustomerMarkdownImages } from "./knowledge-base-markdown-normalization";
 import {
   createKnowledgeBaseAuthoritativeFinalOutput,
@@ -197,7 +202,8 @@ export class KnowledgeBaseBuildError extends Error {
       | "BUILD_NOT_FOUND"
       | "FINAL_PACKAGE_MISSING"
       | "PROGRESS_PROTOCOL_INVALID"
-      | "PUBLISH_BLOCKED",
+      | "PUBLISH_BLOCKED"
+      | "RESET_REQUIRED",
     message: string,
   ) {
     super(message);
@@ -1356,19 +1362,6 @@ export function projectKnowledgeBasePresentationMarkdown(input: {
       `当前输出正文属于节点 ${headings[0]!.leafId}，与待展示节点 ${input.leafId} 不一致`,
     );
   }
-  const unknownLeafHeading = lines
-    .map((line) => knowledgeBaseHeadingText(line))
-    .filter(Boolean)
-    .map((text) =>
-      /^([A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)+)(?:[\t ]|[「【:：]|$)/u.exec(text!),
-    )
-    .find(Boolean);
-  if (unknownLeafHeading) {
-    throw new KnowledgeBaseBuildError(
-      "PROGRESS_PROTOCOL_INVALID",
-      `当前输出正文属于未知节点 ${unknownLeafHeading[1]}，与待展示节点 ${input.leafId} 不一致`,
-    );
-  }
   const body = canonicalKnowledgeBaseMarkdown(withoutAcknowledgements);
   if (!body) return "";
   const title = [input.leafId, input.leafTitle.trim()]
@@ -1488,6 +1481,8 @@ function buildResearchSummary(
 type KnowledgeBasePackageProjectionBuild = Pick<
   KnowledgeBaseBuild,
   | "id"
+  | "generation"
+  | "executionMode"
   | "status"
   | "revision"
   | "canonicalTaskId"
@@ -1525,7 +1520,7 @@ export function knowledgeBasePackageProjectionCompatibility(
   const packageTupleComplete = Boolean(
     terminal &&
       build.packageRevision === build.revision &&
-      build.packageTaskId === (build.canonicalTaskId || build.upstreamTaskId) &&
+      build.packageTaskId === knowledgeBasePackageWriterTaskId(build) &&
       build.packageOutputItemId &&
       /^[a-f0-9]{64}$/u.test(String(build.packageDescriptorHash || "")) &&
       build.packageStorageKey &&
@@ -1581,6 +1576,11 @@ function buildDto(
   build: KnowledgeBaseBuild,
   rows: KnowledgeBaseBuildNode[],
 ): KnowledgeBaseProgressDto {
+  const resetRequired =
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.providerProtocol !== "manus_v2" ||
+    build.contentVersion === null;
   const currentBuildRow = rows.find(
     (row) => row.leafId === build.currentLeafId,
   );
@@ -1643,8 +1643,8 @@ function buildDto(
   const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
   const researchSummary = buildResearchSummary(build, rows);
   const logoCanChange =
-    build.providerProtocol !== "manus_v2" &&
-    build.skillVersion === "4" &&
+    (build.executionMode === "materialized_bundle_v1" ||
+      (build.providerProtocol !== "manus_v2" && build.skillVersion === "4")) &&
     build.status === "confirming" &&
     build.confirmedCount === 0 &&
     build.directPrefilledCount === 0 &&
@@ -1659,14 +1659,23 @@ function buildDto(
       skillVersion: build.skillVersion,
       depthPolicy,
       researchSummary,
-      status: build.status as KnowledgeBaseBuildStatus,
+      status: resetRequired
+        ? ("protocol_error" as const)
+        : (build.status as KnowledgeBaseBuildStatus),
       revision: build.revision,
+      contentVersion: build.contentVersion ?? undefined,
+      executionMode:
+        !resetRequired && build.executionMode === "materialized_bundle_v1"
+          ? "materialized_bundle_v1"
+          : "legacy_conversational",
       currentLeafId: build.currentLeafId,
       logoRequired: logoCanChange && !build.logoSha256,
       logoAvailable: logoCanChange && Boolean(build.logoSha256),
-      protocolError: build.protocolError
-        ? sanitizeFrontMindPublicText(build.protocolError)
-        : null,
+      protocolError: resetRequired
+        ? "RESET_REQUIRED：旧知识库构建不再续跑；请批准重置并重新上传资料。"
+        : build.protocolError
+          ? sanitizeFrontMindPublicText(build.protocolError)
+          : null,
       awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime(),
     },
@@ -1766,6 +1775,16 @@ export async function createKnowledgeBaseBuild(input: {
       // `/start` is an at-least-once client operation. Replaying it must never
       // delete accepted nodes or silently create a new generation. Explicit
       // reset/restart is owned by the audited reset workflow.
+      if (
+        existing.executionMode !== "materialized_bundle_v1" ||
+        existing.skillVersion !== "5" ||
+        existing.providerProtocol !== "manus_v2"
+      ) {
+        throw new KnowledgeBaseBuildError(
+          "RESET_REQUIRED",
+          "旧知识库构建不再续跑；请批准重置并重新上传资料",
+        );
+      }
       return existing;
     }
     const policyBinding = knowledgeBaseNewBuildPolicyBinding();
@@ -1791,6 +1810,9 @@ export async function createKnowledgeBaseBuild(input: {
       skillVersion: policyBinding.skillVersion,
       skillContentHash: policyBinding.skillContentHash,
       treePolicyVersion: policyBinding.treePolicyVersion,
+      executionMode: "materialized_bundle_v1",
+      contentVersion: 0,
+      providerProtocol: "manus_v2",
       status: "researching",
       awaitingResponseSince: new Date(),
     });
@@ -2387,6 +2409,16 @@ async function readKnowledgeBaseObservationProjection(
             : undefined,
         )
       : [];
+  const materializedResources =
+    currentRow && build.executionMode === "materialized_bundle_v1"
+      ? projectKnowledgeBaseWorkingSetLeafResources({
+          buildId: build.id,
+          leafId: currentRow.leafId,
+          workingSet: (
+            await readValidatedActiveKnowledgeBaseWorkingSet({ db, build })
+          ).validated,
+        })
+      : [];
 
   return projectKnowledgeBaseObservationSnapshot({
     build,
@@ -2396,6 +2428,7 @@ async function readKnowledgeBaseObservationProjection(
     presentationTurnRow,
     terminalCompletedTurnRow,
     customerUploadResources,
+    materializedResources,
     conversationRow,
     messageRows,
     acceptedMessageRows: typedAcceptedMessageRows,
@@ -2478,6 +2511,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     "id" | "clientRequestId" | "status"
   > | null;
   customerUploadResources: KnowledgeBaseApprovedPresentationDto["resources"];
+  materializedResources: KnowledgeBaseApprovedPresentationDto["resources"];
   conversationRow: { version: number } | null;
   messageRows: Array<{
     turnId: string | null;
@@ -2495,6 +2529,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     presentationTurnRow,
     terminalCompletedTurnRow,
     customerUploadResources,
+    materializedResources,
     conversationRow,
     messageRows,
     acceptedMessageRows,
@@ -2633,7 +2668,18 @@ function projectKnowledgeBaseObservationSnapshot(input: {
           },
         ]
       : [];
-  const resources = [...logoResources, ...customerUploadResources];
+  const resources = [
+    ...logoResources,
+    ...materializedResources,
+    ...customerUploadResources,
+  ].filter(
+    (resource, index, all) =>
+      all.findIndex(
+        (candidate) =>
+          candidate.sha256 === resource.sha256 &&
+          candidate.mimeType === resource.mimeType,
+      ) === index,
+  );
   const nodeBackedPresentationGeneration =
     knowledgeBaseNodeBackedPresentationGeneration(build);
   let approvedPresentation: KnowledgeBaseApprovedPresentationDto | null = null;
@@ -2839,7 +2885,25 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     typeof activeTurnMetadata.expectedAttachmentCount === "number"
       ? activeTurnMetadata.expectedAttachmentCount
       : 0;
-  if (explicitRecovery) {
+  if (
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.providerProtocol !== "manus_v2"
+  ) {
+    notice = {
+      key: `${build.id}:${build.generation}:reset-required`,
+      code: "RESET_REQUIRED",
+      severity: "warning",
+      message:
+        "旧知识库构建不再续跑。请批准重置后重新上传资料，系统将使用当前 Key 创建全新 v2 任务。",
+      retryable: false,
+      failureClass: "requires_user_fix",
+      recoveryAction: "approve_reset",
+      canRegenerate: false,
+      turnId: null,
+      createdAt: build.updatedAt.getTime(),
+    };
+  } else if (explicitRecovery) {
     const stopped = explicitRecovery.action === "stopped";
     notice = {
       key: `${build.id}:${build.generation}:${build.stateEpoch}:explicit-recovery`,

@@ -137,6 +137,57 @@ describe("EmptyConversationHint", () => {
     });
   });
 
+  it("sends a fresh initial-build file through local v2 asset ingress by default", async () => {
+    const opened: string[] = [];
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    class MockXMLHttpRequest {
+      status = 201;
+      responseText = JSON.stringify({
+        localAssetId: `asset_${"i".repeat(30)}`,
+        filename: "initial-facts.pdf",
+        expiresAt: 1_800_000_000_000,
+      });
+      upload: { onprogress?: (event: any) => void } = {};
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open(_method: string, url: string) {
+        opened.push(url);
+      }
+      setRequestHeader() {}
+      send(body: File) {
+        this.upload.onprogress?.({
+          lengthComputable: true,
+          loaded: body.size,
+          total: body.size,
+        });
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const file = sizedFile("initial-facts.pdf", 12);
+    const uploaded = await uploadKnowledgeBaseStarterFiles(
+      [file],
+      starterLifecycle(),
+      1_000,
+    );
+
+    expect(uploaded.uploadedAttachments).toEqual([
+      {
+        file_id: `asset_${"i".repeat(30)}`,
+        filename: "initial-facts.pdf",
+      },
+    ]);
+    expect(opened).toEqual(["/api/frontmind/v2/assets"]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(opened.some((url) => url.includes("/v1/files"))).toBe(false);
+  });
+
   it("retries one incomplete browser body on the same frozen intent only", async () => {
     const file = sizedFile("完整性重试.pdf", 32);
     const handle: frontmindApi.ManagedUploadHandle = {
@@ -426,6 +477,7 @@ describe("EmptyConversationHint", () => {
           input.files,
           lifecycle,
           lifecycle.startedAt,
+          frontmindApi.uploadFile,
         );
         acceptedCount += 1;
         return { status: "accepted" };

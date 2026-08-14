@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, or } from "drizzle-orm";
 
 import {
+  agentOperations,
+  agentTasks,
   apiCredentials,
   conversations,
   conversationTurns,
@@ -20,7 +22,10 @@ import {
   type KnowledgeDocumentRecord,
   type WorkspaceContentRevision,
 } from "../drizzle/schema";
-import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
+import {
+  knowledgeBasePackageWriterTaskId,
+  knowledgeBasePublicationBindingHash,
+} from "./knowledge-base-publication-binding";
 import {
   effectiveKnowledgeArchiveCharacterCount,
   knowledgeArchiveFormalText,
@@ -77,12 +82,9 @@ import {
   selectPhysicalCredentialRows,
   usageCoverageSupportsRetiredCredential,
 } from "./api-usage-ledger";
-import {
-  buildRollingUsageTaskParams,
-  parseRollingUsageTaskPayload,
-  usagePageReachedCutoff,
-} from "./upstream-task-usage";
+import { usagePageReachedCutoff } from "./upstream-task-usage";
 import { getManusRollingCreditUsage } from "./manus-usage-service";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 
 const CREDIT_PAGE_LIMIT = 100;
 const CREDIT_MAX_PAGES = 100;
@@ -1190,6 +1192,9 @@ export async function createKnowledgeSnapshot(input: {
     if (input.sourceBuildId) {
       const builds = await tx
         .select({
+          id: knowledgeBaseBuilds.id,
+          generation: knowledgeBaseBuilds.generation,
+          executionMode: knowledgeBaseBuilds.executionMode,
           status: knowledgeBaseBuilds.status,
           revision: knowledgeBaseBuilds.revision,
           upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
@@ -1223,8 +1228,7 @@ export async function createKnowledgeSnapshot(input: {
         input.archiveHash === undefined ||
         builds[0].revision !== input.sourceBuildRevision ||
         builds[0].packageRevision !== input.sourceBuildRevision ||
-        (builds[0].canonicalTaskId || builds[0].upstreamTaskId) !==
-          input.sourceTaskId ||
+        knowledgeBasePackageWriterTaskId(builds[0]) !== input.sourceTaskId ||
         builds[0].packageTaskId !== input.sourceTaskId ||
         knowledgeBasePublicationBindingHash(builds[0]) !==
           input.sourceArtifactHash
@@ -1908,6 +1912,43 @@ export function usageContributionForCredential(input: {
   };
 }
 
+type ManagedAgentUsageRow = {
+  providerTaskId: string | null;
+  apiCredentialId: string;
+  accountUserId: number | null;
+  status: string;
+};
+
+/** Includes ordinary v2 chat tasks, which do not create upstream_resources. */
+export function projectManagedAgentUsageRows(
+  rows: readonly ManagedAgentUsageRow[],
+) {
+  const expectedTaskIdsByCredential = new Map<string, Set<string>>();
+  const ownerByTask = new Map<string, number>();
+  const unsettledCredentialIds = new Set<string>();
+  const terminalStates = new Set([
+    "succeeded",
+    "failed",
+    "cancelled",
+  ]);
+  for (const row of rows) {
+    const taskId = row.providerTaskId?.trim();
+    if (taskId) {
+      const expected =
+        expectedTaskIdsByCredential.get(row.apiCredentialId) ?? new Set();
+      expected.add(taskId);
+      expectedTaskIdsByCredential.set(row.apiCredentialId, expected);
+      if (row.accountUserId !== null) {
+        ownerByTask.set(taskId, row.accountUserId);
+      }
+    }
+    if (!terminalStates.has(row.status)) {
+      unsettledCredentialIds.add(row.apiCredentialId);
+    }
+  }
+  return { expectedTaskIdsByCredential, ownerByTask, unsettledCredentialIds };
+}
+
 export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
   credentialOwnerId?: number;
   credentialOwnerIds?: number[];
@@ -2065,6 +2106,26 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
         gte(upstreamResources.createdAt, new Date(period.startAt)),
       ),
     );
+  const managedAgentTaskRows = await db
+    .select({
+      providerTaskId: agentTasks.providerTaskId,
+      apiCredentialId: agentOperations.apiCredentialId,
+      accountUserId: agentOperations.accountUserId,
+      status: agentOperations.status,
+    })
+    .from(agentTasks)
+    .innerJoin(agentOperations, eq(agentTasks.operationId, agentOperations.id))
+    .where(
+      and(
+        eq(agentOperations.scope, "managed_user"),
+        inArray(
+          agentOperations.apiCredentialId,
+          credentialRows.map((credential) => credential.id),
+        ),
+        gte(agentOperations.createdAt, new Date(period.startAt)),
+      ),
+    );
+  const managedAgentUsage = projectManagedAgentUsageRows(managedAgentTaskRows);
   const expectedTaskIdsByFingerprint = new Map<string, Set<string>>();
   for (const row of localTaskRows) {
     if (!row.apiCredentialId || !row.upstreamId) continue;
@@ -2072,6 +2133,16 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     if (!fingerprint) continue;
     const expected = expectedTaskIdsByFingerprint.get(fingerprint) ?? new Set();
     expected.add(row.upstreamId);
+    expectedTaskIdsByFingerprint.set(fingerprint, expected);
+  }
+  for (const [
+    credentialId,
+    taskIds,
+  ] of managedAgentUsage.expectedTaskIdsByCredential) {
+    const fingerprint = fingerprintByCredentialId.get(credentialId);
+    if (!fingerprint) continue;
+    const expected = expectedTaskIdsByFingerprint.get(fingerprint) ?? new Set();
+    for (const taskId of taskIds) expected.add(taskId);
     expectedTaskIdsByFingerprint.set(fingerprint, expected);
   }
   const terminalProofsByFingerprint = await loadTerminalUsageTaskProofs({
@@ -2120,6 +2191,10 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       )
       .filter((value): value is string => Boolean(value)),
   );
+  for (const credentialId of managedAgentUsage.unsettledCredentialIds) {
+    const fingerprint = fingerprintByCredentialId.get(credentialId);
+    if (fingerprint) unsettledFingerprints.add(fingerprint);
+  }
   const seen = new Set<string>();
   let attributionComplete = true;
   for (const credential of credentials) {
@@ -2160,28 +2235,19 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     );
     const seenForCredential = new Set<string>();
     const seenCursors = new Set<string>();
+    const usageClient = new ManusV2Client({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey: credential.apiKey,
+    });
     for (let pageIndex = 0; pageIndex < CREDIT_MAX_PAGES; pageIndex += 1) {
-      const params = buildRollingUsageTaskParams({
-        limit: CREDIT_PAGE_LIMIT,
-        startAt: period.startAt,
-        endAt: period.endAt,
-        after,
-      });
-      let response: globalThis.Response;
+      let payload: Awaited<ReturnType<ManusV2Client["listTasksPage"]>>;
       try {
-        response = await fetch(
-          `${getUpstreamBaseUrl()}/v1/tasks?${params.toString()}`,
-          {
-            headers: {
-              API_KEY: credential.apiKey,
-              Authorization: `Bearer ${credential.apiKey}`,
-              Accept: "application/json",
-            },
-            redirect: "error",
-            signal: AbortSignal.timeout(30_000),
-          },
-        );
-      } catch (error) {
+        payload = await usageClient.listTasksPage({
+          limit: CREDIT_PAGE_LIMIT,
+          order: "desc",
+          cursor: after,
+        });
+      } catch {
         if (credential.status === "retired") {
           credentialComplete = usageCoverageSupportsRetiredCredential({
             coverage: coverageByFingerprint.get(credential.fingerprint),
@@ -2193,29 +2259,9 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
         credentialComplete = false;
         break;
       }
-      if (!response.ok) {
-        if (
-          credential.status === "retired" &&
-          (response.status === 401 || response.status === 403)
-        ) {
-          credentialComplete = usageCoverageSupportsRetiredCredential({
-            coverage: coverageByFingerprint.get(credential.fingerprint),
-            periodStartMs: period.startAt,
-            credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
-          });
-          break;
-        }
-        credentialComplete = false;
-        break;
-      }
-      const payload = await parseRollingUsageTaskPayload(response);
-      if (!payload) {
-        credentialComplete = false;
-        break;
-      }
       const tasks = payload.data;
       if (tasks.length === 0) {
-        if (payload?.has_more) credentialComplete = false;
+        if (payload.has_more) credentialComplete = false;
         break;
       }
       const taskIds = tasks
@@ -2235,9 +2281,13 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
               ),
             )
         : [];
-      const ownerByTask = new Map(
+      const ownerByTask = new Map<string, number>(
         ownershipRows.map((row) => [row.upstreamId, row.userId]),
       );
+      for (const taskId of taskIds) {
+        const ownerId = managedAgentUsage.ownerByTask.get(taskId);
+        if (ownerId !== undefined) ownerByTask.set(taskId, ownerId);
+      }
       let datedTaskCount = 0;
       let expiredTaskCount = 0;
       let pageComplete = true;
@@ -2340,17 +2390,13 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
       if (!pageComplete) credentialComplete = false;
       if (pageReachedCutoff) break;
       after =
-        String(
-          payload?.last_id ??
-            tasks[tasks.length - 1]?.id ??
-            tasks[tasks.length - 1]?.task_id ??
-            "",
-        ) || undefined;
-      if (payload?.has_more && !after) {
+        payload.next_cursor ??
+        (String(tasks[tasks.length - 1]?.id ?? "") || undefined);
+      if (payload.has_more && !after) {
         credentialComplete = false;
         break;
       }
-      if (!payload?.has_more) break;
+      if (!payload.has_more) break;
       if (seenCursors.has(String(after))) {
         credentialComplete = false;
         break;
@@ -2443,39 +2489,34 @@ async function getAccountCreditUsageBetween(
   let after: string | undefined;
   let reachedCutoff = false;
   let complete = true;
+  const usageClient = new ManusV2Client({
+    baseUrl: getUpstreamBaseUrl(),
+    apiKey: credential.apiKey,
+    rateLimitScope: `managed-user:${userId}`,
+  });
 
   for (
     let pageIndex = 0;
     pageIndex < CREDIT_MAX_PAGES && !reachedCutoff;
     pageIndex += 1
   ) {
-    const params = new URLSearchParams({
-      limit: String(CREDIT_PAGE_LIMIT),
-      order: "desc",
-    });
-    if (after) params.set("after", after);
-    const response = await fetch(
-      `${getUpstreamBaseUrl()}/v1/tasks?${params.toString()}`,
-      {
-        headers: {
-          API_KEY: credential.apiKey,
-          Authorization: `Bearer ${credential.apiKey}`,
-          Accept: "application/json",
-        },
-        redirect: "error",
-        signal: AbortSignal.timeout(30_000),
-      },
-    );
-    if (!response.ok) {
+    let payload: Awaited<ReturnType<ManusV2Client["listTasksPage"]>>;
+    try {
+      payload = await usageClient.listTasksPage({
+        limit: CREDIT_PAGE_LIMIT,
+        order: "desc",
+        cursor: after,
+      });
+    } catch (error) {
       throw new AuthServiceError(
-        response.status === 401 || response.status === 403
+        error instanceof ManusV2ApiError &&
+        (error.status === 401 || error.status === 403)
           ? "INVALID_CREDENTIAL"
           : "UPSTREAM_UNAVAILABLE",
         "暂时无法读取该用户的积分使用情况",
       );
     }
-    const payload = (await response.json()) as any;
-    const tasks = Array.isArray(payload?.data) ? payload.data : [];
+    const tasks = payload.data;
     if (tasks.length === 0) break;
     const taskIds = tasks
       .map((task: any) => String(task?.id ?? task?.task_id ?? ""))
@@ -2497,16 +2538,16 @@ async function getAccountCreditUsageBetween(
     recentTasks.push(...pageResult.recentTasks);
     reachedCutoff = pageResult.reachedCutoff;
     if (!pageResult.complete) complete = false;
-    after = payload?.last_id || tasks[tasks.length - 1]?.id;
+    after = payload.next_cursor ?? tasks[tasks.length - 1]?.id ?? undefined;
     if (
       pageIndex === CREDIT_MAX_PAGES - 1 &&
-      payload?.has_more &&
+      payload.has_more &&
       after &&
       !reachedCutoff
     ) {
       complete = false;
     }
-    if (!payload?.has_more || !after) break;
+    if (!payload.has_more || !after) break;
   }
   return {
     totalUsed,

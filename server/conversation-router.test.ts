@@ -15,6 +15,7 @@ import {
 } from "../drizzle/schema";
 import {
   assignBrowserOwnedSnapshotMessageSequences,
+  assertLocalImportHasNoProviderResources,
   buildMessageMetadata,
   collectSnapshotResourceRefs,
   conversationSyncMysqlErrorCode,
@@ -33,7 +34,6 @@ import {
   retryConversationSyncTransaction,
   resolveSnapshotCredentialId,
   sanitizeKnowledgeBaseDeletionTombstones,
-  validateUpstreamResourceAccess,
   type ConversationSnapshot,
 } from "./conversation-router";
 import {
@@ -1718,46 +1718,13 @@ describe("legacy upstream resource ownership validation", () => {
     );
   });
 
-  it("uses the selected credential against the exact encoded resource URL", async () => {
-    let requestedUrl = "";
-    let requestedHeaders: HeadersInit | undefined;
-    await validateUpstreamResourceAccess(
-      "sk-owner",
-      "file",
-      "file/with spaces",
-      async (input, init) => {
-        requestedUrl = String(input);
-        requestedHeaders = init?.headers;
-        return new Response(null, { status: 200 });
-      },
-    );
-
-    expect(requestedUrl).toContain("/v1/files/file%2Fwith%20spaces");
-    expect(requestedHeaders).toMatchObject({
-      API_KEY: "sk-owner",
-      Authorization: "Bearer sk-owner",
-    });
-  });
-
-  it.each([401, 403, 404])(
-    "rejects an unprovable resource when upstream returns %s",
-    async (status) => {
-      await expect(
-        validateUpstreamResourceAccess(
-          "sk-wrong",
-          "task",
-          "task-victim",
-          async () => new Response(null, { status }),
-        ),
-      ).rejects.toMatchObject({ code: "FORBIDDEN" });
-    },
-  );
-
-  it("does not bind resources when upstream validation is unavailable", async () => {
-    await expect(
-      validateUpstreamResourceAccess("sk-owner", "task", "task-1", async () => {
-        throw new Error("timeout");
-      }),
-    ).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" });
+  it("rejects every Provider-backed legacy import without a network probe", () => {
+    expect(() =>
+      assertLocalImportHasNoProviderResources([
+        { kind: "task", id: "task-v1" },
+        { kind: "file", id: "file-v1" },
+      ]),
+    ).toThrow("旧任务或文件会话不再导入");
+    expect(() => assertLocalImportHasNoProviderResources([])).not.toThrow();
   });
 });

@@ -24,10 +24,17 @@ import {
 import type { Request } from "express";
 import { COOKIE_NAME } from "../shared/const";
 import {
+  DEFAULT_MANAGED_AGENT_PROFILE,
+  managedAgentProfileModel,
+  normalizeManagedAgentProfile,
+  type ManagedAgentProfile,
+} from "../shared/manus-agent-profile";
+import {
   isExplicitAdminAccessLevel,
   isProtectedBuiltinAdminUsername,
 } from "../shared/admin-access";
 import {
+  agentOperations,
   apiCredentials,
   apiKeyOwnership,
   attachments,
@@ -40,6 +47,7 @@ import {
   knowledgeBaseBuilds,
   knowledgeBaseResetRequests,
   presalesApiCredentials,
+  providerFileLeases,
   sessions,
   upstreamResources,
   userAdminAssignments,
@@ -56,6 +64,7 @@ import {
 import { getDb } from "./db";
 import { isFileResourceContentExpired } from "./file-content-retention";
 import { getUpstreamBaseUrl } from "./upstream-config";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 import {
   acquireManagedUploadDeletionFence,
   assertManagedUploadScopesAvailable,
@@ -179,6 +188,8 @@ export type DecryptedCredential = {
   fingerprint: string;
   status: "active" | "retired";
   verifiedAt: Date | null;
+  agentProfile: ManagedAgentProfile;
+  upstreamModel: "manus-1.6" | "manus-1.6-max";
 };
 
 export type KnowledgeBaseUploadReservationCredential = DecryptedCredential & {
@@ -205,6 +216,8 @@ export type CredentialStatus = {
   fingerprint: string | null;
   status: "active" | "retired" | "invalid" | null;
   verifiedAt: number | null;
+  agentProfile: ManagedAgentProfile;
+  upstreamModel: "manus-1.6" | "manus-1.6-max";
 };
 
 type LoginAttempt = {
@@ -1607,37 +1620,42 @@ export function decryptApiKey(
 }
 
 export async function validateUpstreamApiKey(apiKey: string) {
-  let response: globalThis.Response;
   try {
-    response = await fetch(`${getUpstreamBaseUrl()}/v1/tasks?limit=1`, {
-      method: "GET",
-      redirect: "error",
-      headers: {
-        API_KEY: apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-      },
-      signal: AbortSignal.timeout(15_000),
-    });
-  } catch {
+    await new ManusV2Client({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey,
+    }).probeCredential();
+  } catch (error) {
+    if (
+      error instanceof ManusV2ApiError &&
+      (error.status === 401 || error.status === 403)
+    ) {
+      throw new AuthServiceError(
+        "INVALID_CREDENTIAL",
+        "API credential is invalid",
+      );
+    }
     throw new AuthServiceError(
       "UPSTREAM_UNAVAILABLE",
       "Unable to validate the API credential",
     );
   }
+}
 
-  if (response.status === 401 || response.status === 403) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "API credential is invalid",
-    );
-  }
-  if (!response.ok) {
-    throw new AuthServiceError(
-      "UPSTREAM_UNAVAILABLE",
-      "Upstream service could not validate the API credential",
-    );
-  }
+function credentialAgentProfile(credential?: unknown): ManagedAgentProfile {
+  return normalizeManagedAgentProfile(
+    credential && typeof credential === "object"
+      ? (credential as { agentProfile?: unknown }).agentProfile
+      : undefined,
+  );
+}
+
+function credentialProfileProjection(credential?: unknown) {
+  const agentProfile = credentialAgentProfile(credential);
+  return {
+    agentProfile,
+    upstreamModel: managedAgentProfileModel(agentProfile),
+  } as const;
 }
 
 function toCredentialStatus(
@@ -1655,6 +1673,7 @@ function toCredentialStatus(
     fingerprint: credential?.fingerprint ?? null,
     status,
     verifiedAt: credential?.verifiedAt?.getTime() ?? null,
+    ...credentialProfileProjection(credential),
   };
 }
 
@@ -1698,6 +1717,7 @@ export async function replaceApiCredentialInTransaction(input: {
   apiKey: string;
   now?: Date;
   credentialId?: string;
+  agentProfile?: ManagedAgentProfile;
 }): Promise<CredentialStatus> {
   // Permanent account deletion fences the credential owner before enumerating
   // all key generations. Check inside every transactional rotation path so a
@@ -1718,6 +1738,7 @@ export async function replaceApiCredentialInTransaction(input: {
   const credentialId = input.credentialId ?? randomUUID();
   const encrypted = encryptApiKey(input.userId, credentialId, input.apiKey);
   const now = input.now ?? new Date();
+  const agentProfile = input.agentProfile ?? DEFAULT_MANAGED_AGENT_PROFILE;
   const tx = input.executor;
 
   const ownerRows = await tx
@@ -1753,6 +1774,7 @@ export async function replaceApiCredentialInTransaction(input: {
     version: nextVersion,
     ...encrypted,
     fingerprint,
+    agentProfile,
     status: "active" as const,
     validationStatus: "verified" as const,
     verifiedAt: now,
@@ -1761,13 +1783,14 @@ export async function replaceApiCredentialInTransaction(input: {
     retiredAt: null,
     deletedAt: null,
   };
-  await tx.insert(apiCredentials).values(inserted);
+  await tx.insert(apiCredentials).values(inserted as any);
   return toCredentialStatus(inserted);
 }
 
 export async function replaceApiCredential(
   userId: number,
   apiKey: string,
+  agentProfile: ManagedAgentProfile = DEFAULT_MANAGED_AGENT_PROFILE,
   validator: (apiKey: string) => Promise<void> = validateUpstreamApiKey,
 ): Promise<CredentialStatus> {
   const db = await requireDb();
@@ -1777,6 +1800,7 @@ export async function replaceApiCredential(
       executor: tx,
       userId,
       apiKey,
+      agentProfile,
     }),
   );
 }
@@ -1980,6 +2004,48 @@ export async function deleteActiveApiCredentialInTransaction(input: {
     throw new AuthServiceError(
       "CONFLICT",
       "当前 API Key 仍绑定已有任务或文件，无法安全撤销；请改用替换 Key，系统会保留旧版本供在途任务恢复",
+    );
+  }
+
+  // v2-only chat and materialized knowledge-base work is represented by the
+  // durable operation/lease tables rather than upstream_resources. Deleting
+  // the frozen credential while either side effect is non-terminal would
+  // strand reconciliation or an upload whose outcome is still unknown.
+  const activeAgentOperations = await input.executor
+    .select({ id: agentOperations.id })
+    .from(agentOperations)
+    .where(
+      and(
+        eq(agentOperations.apiCredentialId, latest.id),
+        inArray(agentOperations.status, [
+          "queued",
+          "running",
+          "result_pending",
+          "attention_required",
+        ]),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const activeProviderFileLeases = await input.executor
+    .select({ id: providerFileLeases.id })
+    .from(providerFileLeases)
+    .where(
+      and(
+        eq(providerFileLeases.apiCredentialId, latest.id),
+        inArray(providerFileLeases.uploadState, [
+          "reserved",
+          "uploading",
+          "outcome_unknown",
+        ]),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  if (activeAgentOperations[0] || activeProviderFileLeases[0]) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前 API Key 仍被 v2 任务或文件上传使用，无法安全撤销；请等待任务完成或改用替换 Key。",
     );
   }
 
@@ -2233,6 +2299,7 @@ export async function deleteActiveApiCredentialInTransaction(input: {
     encryptionIv: randomBytes(12).toString("base64"),
     encryptionAuthTag: randomBytes(16).toString("base64"),
     fingerprint: randomBytes(16).toString("hex"),
+    agentProfile: credentialAgentProfile(latest),
     status: "deleted",
     validationStatus: "unverified",
     verifiedAt: null,
@@ -2273,6 +2340,7 @@ export async function getDecryptedCredentialForUser(
     fingerprint: credential.fingerprint,
     status: credential.status,
     verifiedAt: credential.verifiedAt,
+    ...credentialProfileProjection(credential),
   };
 }
 
@@ -2310,6 +2378,7 @@ export async function getDecryptedCredentialForAccountById(
     fingerprint: credential.fingerprint,
     status: credential.status,
     verifiedAt: credential.verifiedAt,
+    ...credentialProfileProjection(credential),
   };
 }
 
@@ -2361,6 +2430,7 @@ export async function getDecryptedCredentialForManagedUploadIntent(
     fingerprint: credential.fingerprint,
     status: credential.status,
     verifiedAt: credential.verifiedAt,
+    ...credentialProfileProjection(credential),
   };
 }
 
@@ -2464,6 +2534,7 @@ export async function getDecryptedCredentialForKnowledgeBaseReservation(
       fingerprint: credential.fingerprint,
       status: credential.status,
       verifiedAt: credential.verifiedAt,
+      ...credentialProfileProjection(credential),
     };
   });
 }
@@ -2674,6 +2745,7 @@ export async function getDecryptedCredentialForKnowledgeBaseUploadReservation(
       fingerprint: credential.fingerprint,
       status: credential.status,
       verifiedAt: credential.verifiedAt,
+      ...credentialProfileProjection(credential),
       reservation: {
         clientRequestId: turn.clientRequestId,
         sourceResetRevision,
@@ -2784,6 +2856,7 @@ export async function getCredentialForUpstreamResource(
     fingerprint: row.credential.fingerprint,
     status: row.credential.status,
     verifiedAt: row.credential.verifiedAt,
+    ...credentialProfileProjection(row.credential),
     resource: row.resource,
   };
 }

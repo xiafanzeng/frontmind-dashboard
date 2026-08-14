@@ -17,7 +17,10 @@ import {
   isDashboardOwnedKnowledgePackageBuild,
   readDashboardOwnedKnowledgePackage,
 } from "./knowledge-base-local-package";
-import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
+import {
+  knowledgeBasePackageWriterTaskId,
+  knowledgeBasePublicationBindingHash,
+} from "./knowledge-base-publication-binding";
 
 type SnapshotBindingFields = Pick<
   KnowledgeBaseSnapshot,
@@ -42,6 +45,7 @@ type BuildBindingFields = Pick<
   | "status"
   | "generation"
   | "revision"
+  | "executionMode"
   | "upstreamTaskId"
   | "canonicalTaskId"
   | "packageStatus"
@@ -202,9 +206,7 @@ export function resolveDashboardOwnedSnapshotDownloadBinding(input: {
         `dashboard-local:${build.id}:${build.generation}:${build.revision}:${archiveSha256}`,
       )
     : null;
-  const writerTaskId = String(
-    build.canonicalTaskId || build.upstreamTaskId || "",
-  );
+  const writerTaskId = knowledgeBasePackageWriterTaskId(build);
 
   if (
     snapshot.userId !== build.userId ||

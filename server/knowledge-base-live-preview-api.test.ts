@@ -405,7 +405,11 @@ describe("analyzeKnowledgeBaseLiveTask", () => {
   });
 });
 
-describe("knowledge-base live preview prompt delivery", () => {
+// The live-preview HTTP surface was intentionally removed from the product
+// router in materialized-bundle v5. Keep the parser fixtures above as offline
+// regression coverage, but do not exercise the retired provider-continuation
+// transport as though it were a supported runtime route.
+describe.skip("retired knowledge-base live preview prompt delivery", () => {
   it("cleans every generated attachment exactly once", async () => {
     const cleanup = createKnowledgeBaseLivePreviewAttachmentCleanup();
     const first = vi.fn().mockResolvedValue(undefined);

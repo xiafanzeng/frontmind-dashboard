@@ -20,20 +20,6 @@ const testRoot = await mkdtemp(
 const gitRepository = path.join(testRoot, "git-source");
 const archiveRepository = path.join(testRoot, "archive-source");
 
-execFileSync(
-  process.execPath,
-  ["--test", path.join(projectRoot, "scripts/promotion-prebuild-gate.node-test.mjs")],
-  { cwd: projectRoot, stdio: "inherit" },
-);
-execFileSync(
-  process.execPath,
-  [
-    "--test",
-    path.join(projectRoot, "scripts/promotion-prebuild-gate-runtime.node-test.mjs"),
-  ],
-  { cwd: projectRoot, stdio: "inherit" },
-);
-
 function git(args) {
   return execFileSync("git", args, {
     cwd: gitRepository,
@@ -85,6 +71,8 @@ async function copySource(sourceRoot, destinationRoot, includeUntracked) {
     .filter(
       (relativePath) =>
         relativePath &&
+        relativePath !== "node_modules" &&
+        !relativePath.startsWith("node_modules/") &&
         relativePath !== "dist" &&
         !relativePath.startsWith("dist/"),
   );

@@ -1,14 +1,9 @@
 import axios from "axios";
 import { createHash } from "node:crypto";
-import { readdir } from "node:fs/promises";
-import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import JSZip from "jszip";
 
-import {
-  canonicalKnowledgeBaseSkillArchiveHash,
-  legacyKnowledgeBaseSkillInstructionHash,
-} from "../shared/knowledge-base-skill-archive-hash.js";
+import { canonicalKnowledgeBaseSkillArchiveHash } from "../shared/knowledge-base-skill-archive-hash.js";
 
 import {
   KnowledgeBaseEnterpriseIdentityError,
@@ -74,6 +69,7 @@ import {
   readKnowledgeBaseSkillArchiveAttachment,
   recoverKnowledgeBaseTurnClaimTask,
   resolveKnowledgeBaseEnterpriseIdentity,
+  selectMaterializedKnowledgeBaseAttachmentCredential,
   selectUnreconciledKnowledgeOutput,
   shouldReplayStableKnowledgeOutput,
   shouldBindKnowledgeBaseInitialLogo,
@@ -83,10 +79,8 @@ import {
   withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
 import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
-import {
-  buildManusV2CreateTaskBody,
-  ManusV2ApiError,
-} from "./manus-v2-client";
+import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
+import { buildManusV2CreateTaskBody, ManusV2ApiError } from "./manus-v2-client";
 import {
   KnowledgeBaseAttachmentsProcessingError,
   KnowledgeBaseLocalPreparationError,
@@ -100,6 +94,33 @@ import { knowledgeBaseBuildRequiresOfficialLogo } from "./knowledge-base-final-t
 import { classifyKnowledgeBaseManusV2Lifecycle } from "./knowledge-base-manus-v2-lifecycle";
 import { buildKnowledgeBaseManusV2FormatRepair } from "./knowledge-base-manus-v2-lifecycle";
 import { UpstreamTaskAttachmentContentProofError } from "./upstream-task-attachment";
+
+function mockManusV2Post(
+  ...responses: Array<{ status: number; data: unknown; headers?: unknown }>
+) {
+  const post = vi.fn();
+  for (const response of responses) {
+    post.mockResolvedValueOnce({ headers: {}, ...response });
+  }
+  vi.spyOn(axios, "create").mockReturnValue({
+    post,
+  } as unknown as ReturnType<typeof axios.create>);
+  return post;
+}
+
+describe("materialized knowledge-base attachment revision authority", () => {
+  it("uses the current exact credential for a revision with no parent task or file credential", () => {
+    const currentCredential = { id: "credential-current", version: 7 };
+    const selected = selectMaterializedKnowledgeBaseAttachmentCredential({
+      isStartReservation: false,
+      startCredential: null,
+      currentCredential,
+    });
+
+    expect(selected).toBe(currentCredential);
+    expect(selected?.id).toBe("credential-current");
+  });
+});
 
 function expectEnterpriseIdentityError(
   action: () => unknown,
@@ -602,9 +623,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
   });
 
   it("stops an ambiguous compatible create exactly once instead of marking it reconciling", async () => {
-    const stopCompatibleCreateOutcomeUnknown = vi
-      .fn()
-      .mockResolvedValue(true);
+    const stopCompatibleCreateOutcomeUnknown = vi.fn().mockResolvedValue(true);
     const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
     const persistCreateFailure = vi.fn().mockResolvedValue("unknown");
     const claim = {
@@ -1898,6 +1917,33 @@ describe("terminal anchor acknowledgement recovery", () => {
     expect(injected.locallySettle).not.toHaveBeenCalled();
     expect(injected.completeHandoff).not.toHaveBeenCalled();
   });
+
+  it("does not create or continue an anchor for a legacy execution mode", async () => {
+    const client = {
+      createTask: vi.fn(),
+      sendMessage: vi.fn(),
+      listAllMessages: vi.fn(),
+      updateTaskVisibility: vi.fn(),
+    };
+    const injected = dependencies(client);
+    injected.loadBuild.mockResolvedValue({
+      ...build,
+      executionMode: "legacy_conversational",
+    });
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
+        {
+          claim: claim(),
+          credential: { apiKey: "test-key" } as any,
+          dependencies: injected as any,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+    expect(client.createTask).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(client.listAllMessages).not.toHaveBeenCalled();
+  });
 });
 
 describe("knowledge-base upstream read failure authority", () => {
@@ -2509,6 +2555,10 @@ describe("knowledge base execution contract", () => {
       id: "build-1",
       userId: 7,
       conversationId: "conversation-1",
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      providerProtocol: "manus_v2",
+      contentVersion: 1,
       upstreamTaskId: "task-parent",
       revision: 3,
     };
@@ -2538,11 +2588,13 @@ describe("knowledge base execution contract", () => {
     expect(loadBuild).toHaveBeenCalledWith(7, "conversation-1");
   });
 
-  it("admits only an exact local preprovider release as unbound turn authority", async () => {
+  it("rejects a historical local-preprovider release instead of rehydrating it", async () => {
     const releasedBuild = {
       id: "build-released",
       userId: 7,
       conversationId: "conversation-released",
+      executionMode: "legacy_conversational",
+      skillVersion: "4",
       providerProtocol: "manus_v2",
       canonicalTaskId: null,
       upstreamTaskId: null,
@@ -2563,24 +2615,33 @@ describe("knowledge base execution contract", () => {
         loadBuild,
         loadUnboundAuthority,
       ),
-    ).resolves.toEqual({
-      build: releasedBuild,
-      taskId: null,
-      kind: "local_rehydrate_unbound",
-    });
-    expect(loadUnboundAuthority).toHaveBeenCalledWith({
-      userId: 7,
-      build: releasedBuild,
-    });
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+    expect(loadUnboundAuthority).not.toHaveBeenCalled();
+  });
 
-    loadUnboundAuthority.mockResolvedValueOnce(null as never);
+  it("treats a nullable pre-0062 content version as RESET_REQUIRED", async () => {
+    const legacyNullBuild = {
+      id: "build-pre-0062",
+      userId: 7,
+      conversationId: "conversation-pre-0062",
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      providerProtocol: "manus_v2",
+      contentVersion: null,
+      canonicalTaskId: "task-must-not-be-read",
+      upstreamTaskId: null,
+    };
+    const loadBuild = vi.fn().mockResolvedValue(legacyNullBuild);
+    const loadUnboundAuthority = vi.fn();
+
     await expect(
       loadKnowledgeBaseTurnAuthority(
-        { userId: 7, conversationId: "conversation-released" },
+        { userId: 7, conversationId: "conversation-pre-0062" },
         loadBuild,
         loadUnboundAuthority,
       ),
-    ).resolves.toBeNull();
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+    expect(loadUnboundAuthority).not.toHaveBeenCalled();
   });
 
   it("routes only unrecoverable ready packages to explicit rebind", () => {
@@ -2839,45 +2900,47 @@ describe("knowledge base execution contract", () => {
     expect(manifestExample.researchCoverage.dimensions).toHaveLength(7);
 
     const archive = await readKnowledgeBaseSkillArchiveAttachment();
-    expect(archive.filename).toBe("socratic-kb-builder.skill.zip");
+    expect(archive.filename).toBe("socratic-kb-builder-v5.skill.zip");
     expect(archive.bytes.subarray(0, 4).toString("hex")).toBe("504b0304");
     const zip = await JSZip.loadAsync(archive.bytes);
     const skill = await zip.file("SKILL.md")?.async("string");
     const normalizedSkill = String(skill || "").replace(/\s+/gu, " ");
     for (const invariant of [
-      "current Pro Agent",
+      "Socratic Enterprise Knowledge Base Builder v5",
+      "materialize_initial_bundle",
+      "revise_leaf_bundle",
+      "Every operation is a new top-level Manus v2 task",
       "120 successfully parsed official pages",
       "200 visited links",
       "30 useful official documents",
       "30 public queries",
-      "30–115 leaf tree",
+      "30–115-leaf tree",
       "40–55 leaves",
-      "researchCoverage",
       "3,000,000",
       "limited_evidence",
       "evidenceDocumentIds",
-      "schemaVersion: 4",
       "1,500 ZIP files",
       "30 MiB",
-      "00_package_manifest.json",
-      "dashboard-enterprise-v1",
       "FRONTMIND_FORMAL_CONTENT_START",
       "assetType",
       "displayRole",
-      "scannedSourcePages",
       "256×256",
-      "Customer writing boundary",
-      "Never create an interactive",
-      "verification_gaps",
-      "00_web_intelligence_report.md",
-      "Conversational image delivery",
-      "validated local Logo byte attachment",
+      "verification gaps",
+      "frontmind-kb-bundle-<operationId>.zip",
+      "frontmind-kb-patch-<operationId>.zip",
       "references/output-format.md",
-      "python3 scripts/validate_archive.py FINAL.zip",
-      "VALID dashboard-enterprise-v1 archive",
-      "README/TXT marker",
+      "scripts/validate_working_set.py <zip>",
+      "VALID frontmind.kb-working-set.v1",
     ]) {
       expect(normalizedSkill).toContain(invariant);
+    }
+    for (const removedContinuationContract of [
+      "current Pro Agent",
+      "One leaf per turn",
+      "FINALIZATION_INPUT",
+      "task.sendMessage",
+    ]) {
+      expect(normalizedSkill).not.toContain(removedContinuationContract);
     }
   });
 
@@ -3451,130 +3514,53 @@ describe("knowledge base execution contract", () => {
     );
   });
 
-  it("pins new builds to v4 while preserving immutable prior archives", async () => {
-    expect(
-      knowledgeBasePinnedV4SkillSelection({
-        skillVersion: "4",
-        skillContentHash:
-          "A619A6EB2D21147EBCCECBF023171834BAB34D46E26D40AC44E8FC98785F8472",
-      }),
-    ).toEqual({
-      version: "4",
-      contentHash:
-        "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
-    });
+  it("pins every new build to the exact v5 archive and rejects pre-v5 selection", async () => {
     expect(() =>
       knowledgeBasePinnedV4SkillSelection({
         skillVersion: "4",
-        skillContentHash: null,
+        skillContentHash: "a".repeat(64),
       }),
-    ).toThrow("immutable Skill content hash");
+    ).toThrow("RESET_REQUIRED");
     const active = await getKnowledgeBaseSkillDescriptor();
-    const immutableA619 = await getKnowledgeBaseSkillDescriptor({
-      version: "4",
-      contentHash:
-        "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
-    });
-    const immutableA619Archive = await readKnowledgeBaseSkillArchiveAttachment({
-      version: "4",
-      contentHash:
-        "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
+    const exact = await getKnowledgeBaseSkillDescriptor({
+      version: "5",
+      contentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
     });
     const activeArchive = await readKnowledgeBaseSkillArchiveAttachment();
-    const legacyActiveHash = await legacyKnowledgeBaseSkillInstructionHash(
-      activeArchive.bytes,
-    );
-    const recoveredLegacyActive = await getKnowledgeBaseSkillDescriptor({
-      version: "4",
-      contentHash: legacyActiveHash,
-    });
-    await expect(
-      getKnowledgeBaseSkillDescriptor({
-        version: "4",
-        contentHash:
-          "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
-      }),
-    ).rejects.toThrow("content hash does not match");
-    const legacy = await getKnowledgeBaseSkillDescriptor({ version: "1" });
-    const previous = await getKnowledgeBaseSkillDescriptor({ version: "2" });
-    const priorV3Hash =
-      "ee62269164a46a54b33dbf71ff492b1d08b3974ab314d11aaa97e885dff96f27";
-    const priorV3 = await getKnowledgeBaseSkillDescriptor({
-      version: "3",
-      contentHash: priorV3Hash,
-    });
-
     expect(active).toMatchObject({
       name: "socratic-kb-builder",
-      version: "4",
-      contentHash:
-        "5e0487004c604c0b95feae0c19ee9544a7e82b10ca923ca6c779ed240f333f56",
+      version: "5",
+      contentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
     });
-    expect(immutableA619.contentHash).toBe(
-      "a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472",
+    expect(exact.contentHash).toBe(
+      KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
     );
-    expect(
-      await canonicalKnowledgeBaseSkillArchiveHash(immutableA619Archive.bytes),
-    ).toBe("a619a6eb2d21147ebccecbf023171834bab34d46e26d40ac44e8fc98785f8472");
-    expect(
-      createHash("sha256").update(immutableA619Archive.bytes).digest("hex"),
-    ).toBe("5d106aa5905c2db2dd3f0c81e74934fdc98fc171d1d264b68c168bb6f7f9d05a");
     expect(active.contentHash).toBe(
       await canonicalKnowledgeBaseSkillArchiveHash(activeArchive.bytes),
     );
-    expect(recoveredLegacyActive.contentHash).toBe(legacyActiveHash);
-    expect(legacy).toMatchObject({
-      name: "socratic-kb-builder",
-      version: "1",
-      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
-    });
-    expect(previous).toMatchObject({
-      name: "socratic-kb-builder",
-      version: "2",
-      contentHash: expect.stringMatching(/^[0-9a-f]{64}$/),
-    });
-    expect(active.contentHash).not.toBe(legacy.contentHash);
-    expect(active.contentHash).not.toBe(previous.contentHash);
-    expect(active.contentHash).not.toBe(priorV3Hash);
-    expect(priorV3.contentHash).toBe(priorV3Hash);
-
-    await expect(
-      getKnowledgeBaseSkillDescriptor({
-        version: "1",
-        contentHash: "0".repeat(64),
-      }),
-    ).rejects.toThrow("content hash does not match");
+    for (const version of ["1", "2", "3", "4"]) {
+      await expect(
+        getKnowledgeBaseSkillDescriptor({ version }),
+      ).rejects.toThrow("RESET_REQUIRED");
+    }
   });
 
-  it("resolves only v3/v4 filenames whose logical hash matches their bytes", async () => {
-    const skillRoot = path.resolve(process.cwd(), "private-workflows");
-    const aliases = (await readdir(skillRoot))
-      .map((name) =>
-        name.match(/^socratic-kb-builder-v([34])-([a-f0-9]{64})\.skill$/u),
-      )
-      .filter((match): match is RegExpMatchArray => Boolean(match));
-    expect(aliases.length).toBeGreaterThan(0);
-    for (const alias of aliases) {
-      const version = alias[1] as "3" | "4";
-      const contentHash = alias[2]!;
-      const descriptor = getKnowledgeBaseSkillDescriptor({
-        version,
-        contentHash,
-      });
-      if (
-        [
-          "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
-          "be9385b6add7b1aeb2c4b4c136b86ef12cc38774fe52c3d2b15233d04aedc80b",
-        ].includes(contentHash)
-      ) {
-        await expect(descriptor).rejects.toThrow("content hash does not match");
-      } else {
-        await expect(descriptor).resolves.toMatchObject({
-          version,
-          contentHash,
-        });
-      }
-    }
+  it("resolves only the exact current v5 logical hash", async () => {
+    await expect(
+      getKnowledgeBaseSkillDescriptor({
+        version: "5",
+        contentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      }),
+    ).resolves.toMatchObject({
+      version: "5",
+      contentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+    });
+    await expect(
+      getKnowledgeBaseSkillDescriptor({
+        version: "5",
+        contentHash: "0".repeat(64),
+      }),
+    ).rejects.toThrow();
   });
 
   it("defers ambiguous v3 response images to the ZIP manifest without weakening v4", () => {
@@ -3585,28 +3571,42 @@ describe("knowledge base execution contract", () => {
   });
 
   it("uploads the Skill ZIP through the exact signed URL without auth headers", async () => {
+    const archive = await readKnowledgeBaseSkillArchiveAttachment();
     const uploadUrl =
       "https://uploads.example.test/socratic.skill.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc";
-    vi.spyOn(axios, "post").mockResolvedValue({
-      status: 201,
+    const apiPost = vi.fn().mockResolvedValue({
+      status: 200,
       data: {
-        id: "skill-file-1",
-        filename: "socratic-kb-builder.skill.zip",
+        ok: true,
+        file: {
+          id: "skill-file-1",
+          filename: "socratic-kb-builder-v5.skill.zip",
+        },
         upload_url: uploadUrl,
+        upload_expires_at: Math.floor(Date.now() / 1_000) + 180,
       },
     });
     const put = vi.spyOn(axios, "put").mockResolvedValue({
       status: 200,
       data: "",
     });
-    vi.spyOn(axios, "get").mockResolvedValue({
+    const apiGet = vi.fn().mockResolvedValue({
       status: 200,
       data: {
-        id: "skill-file-1",
-        filename: "socratic-kb-builder.skill.zip",
-        status: "uploaded",
+        ok: true,
+        file: {
+          id: "skill-file-1",
+          filename: "socratic-kb-builder-v5.skill.zip",
+          status: "uploaded",
+          bytes: archive.bytes.length,
+          expires_at: Math.floor(Date.now() / 1_000) + 48 * 60 * 60,
+        },
       },
     });
+    vi.spyOn(axios, "create").mockReturnValue({
+      post: apiPost,
+      get: apiGet,
+    } as unknown as ReturnType<typeof axios.create>);
 
     const uploaded = await uploadKnowledgeBaseSkillArchive({
       baseUrl: "https://api.example.test",
@@ -3615,8 +3615,13 @@ describe("knowledge base execution contract", () => {
 
     expect(uploaded.attachment).toEqual({
       file_id: "skill-file-1",
-      filename: "socratic-kb-builder.skill.zip",
+      filename: "socratic-kb-builder-v5.skill.zip",
     });
+    expect(apiPost).toHaveBeenCalledWith(
+      "https://api.example.test/v2/file.upload",
+      { filename: "socratic-kb-builder-v5.skill.zip" },
+      { headers: { "Content-Type": "application/json" } },
+    );
     expect(put).toHaveBeenCalledTimes(1);
     expect(put.mock.calls[0]?.[0]).toBe(uploadUrl);
     expect(put.mock.calls[0]?.[2]).toMatchObject({
@@ -3629,7 +3634,7 @@ describe("knowledge base execution contract", () => {
     expect(put.mock.calls[0]?.[2]?.headers).not.toHaveProperty("API_KEY");
   });
 
-  it("replays a legacy frozen task body without undocumented auth or idempotency headers", async () => {
+  it("creates an isolated v2 task without leaking legacy task coordinates", async () => {
     const requestBody = {
       prompt: "固定的恢复提示词",
       agentProfile: "manus-1.6-max",
@@ -3637,15 +3642,15 @@ describe("knowledge base execution contract", () => {
       attachments: [
         {
           file_id: "frozen-skill-file",
-          filename: "socratic-kb-builder.skill.zip",
+          filename: "socratic-kb-builder-v5.skill.zip",
         },
         { file_id: "frozen-facts-file", filename: "facts.pdf" },
       ],
       taskId: "parent-task",
     };
-    const post = vi.spyOn(axios, "post").mockResolvedValue({
+    const post = mockManusV2Post({
       status: 200,
-      data: { id: "original-task", status: "running", output: [] },
+      data: { ok: true, task_id: "original-task" },
     });
 
     const result = await createFrontMindTask({
@@ -3660,18 +3665,29 @@ describe("knowledge base execution contract", () => {
       task: { id: "original-task", status: "running" },
     });
     expect(post).toHaveBeenCalledTimes(1);
-    expect(post.mock.calls[0]?.[1]).toEqual(requestBody);
-    expect(post.mock.calls[0]?.[2]).toMatchObject({
-      timeout: KNOWLEDGE_BASE_UPSTREAM_CREATE_TIMEOUT_MS,
-      headers: {
-        API_KEY: "credential-value",
-      },
-    });
-    expect(post.mock.calls[0]?.[2]?.headers).not.toHaveProperty(
-      "Idempotency-Key",
+    expect(post.mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/v2/task.create",
     );
-    expect(post.mock.calls[0]?.[2]?.headers).not.toHaveProperty(
-      "Authorization",
+    expect(post.mock.calls[0]?.[1]).toEqual(
+      buildManusV2CreateTaskBody({
+        prompt: requestBody.prompt,
+        attachments: requestBody.attachments,
+        agentProfile: requestBody.agentProfile,
+        locale: "zh-CN",
+        interactiveMode: false,
+        hideInTaskList: true,
+      }),
+    );
+    expect(post.mock.calls[0]?.[2]).toMatchObject({
+      headers: { "Content-Type": "application/json" },
+    });
+    expect(axios.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        headers: { "x-manus-api-key": "credential-value" },
+      }),
+    );
+    expect(JSON.stringify(post.mock.calls[0]?.[1])).not.toContain(
+      "parent-task",
     );
   });
 
@@ -3691,10 +3707,8 @@ describe("knowledge base execution contract", () => {
       ...userAttachments,
     ];
     let userThreePending = true;
-    const get = vi.spyOn(axios, "get").mockImplementation(async (url) => {
-      const fileId = decodeURIComponent(
-        new URL(String(url)).pathname.split("/").pop()!,
-      );
+    const get = vi.fn().mockImplementation(async (_url, config) => {
+      const fileId = String(config?.params?.file_id || "");
       const userIndex = userAttachments.findIndex(
         (attachment) => attachment.file_id === fileId,
       );
@@ -3704,19 +3718,31 @@ describe("knowledge base execution contract", () => {
       return {
         status: 200,
         data: {
-          id: fileId,
-          filename:
-            userIndex >= 0
-              ? `provider-${userIndex + 1}.pdf`
-              : generated?.filename,
-          status:
-            fileId === "user-file-3" && userThreePending
-              ? "pending"
-              : "uploaded",
+          ok: true,
+          file: {
+            id: fileId,
+            filename:
+              userIndex >= 0
+                ? `provider-${userIndex + 1}.pdf`
+                : generated?.filename,
+            status:
+              fileId === "user-file-3" && userThreePending
+                ? "pending"
+                : "uploaded",
+            bytes: null,
+            expires_at: Math.floor(Date.now() / 1_000) + 48 * 60 * 60,
+          },
         },
       } as any;
     });
-    const post = vi.spyOn(axios, "post");
+    const post = vi.fn().mockResolvedValue({
+      status: 201,
+      data: { ok: true, task_id: "task-seven-attachments" },
+    });
+    vi.spyOn(axios, "create").mockReturnValue({
+      get,
+      post,
+    } as unknown as ReturnType<typeof axios.create>);
     const claim = {
       turn: {
         id: "turn-seven-attachments",
@@ -3771,10 +3797,6 @@ describe("knowledge base execution contract", () => {
       credential,
       dispatch,
     });
-    post.mockResolvedValue({
-      status: 201,
-      data: { id: "task-seven-attachments", status: "running" },
-    });
     await expect(
       createFrontMindTask({
         baseUrl: dispatch.baseUrl,
@@ -3783,12 +3805,9 @@ describe("knowledge base execution contract", () => {
       }),
     ).resolves.toMatchObject({ ok: true });
     expect(post).toHaveBeenCalledTimes(1);
-    expect(post.mock.calls[0]?.[1]).toEqual(dispatch.requestBody);
-    expect(Object.keys(post.mock.calls[0]?.[1] as object).sort()).toEqual([
-      "agentProfile",
-      "attachments",
-      "prompt",
-    ]);
+    expect(post.mock.calls[0]?.[0]).toBe(
+      "https://api.example.test/v2/task.create",
+    );
 
     post.mockClear();
     const eightAttachments = [
@@ -3832,55 +3851,56 @@ describe("knowledge base execution contract", () => {
       }),
     ).resolves.toMatchObject({ ok: true });
     expect(post).toHaveBeenCalledTimes(1);
-    expect(post.mock.calls[0]?.[1]).toEqual(prefillDispatch.requestBody);
+    expect(post.mock.calls[0]?.[1]).toEqual(
+      buildManusV2CreateTaskBody({
+        prompt: prefillDispatch.requestBody.prompt,
+        attachments: prefillDispatch.requestBody.attachments,
+        agentProfile: prefillDispatch.requestBody.agentProfile,
+        locale: "zh-CN",
+        interactiveMode: false,
+        hideInTaskList: true,
+      }),
+    );
     expect(get).toHaveBeenCalled();
   });
 
-  it("accepts wrapped create responses and fails closed on a 2xx response without a task id", async () => {
-    const post = vi
-      .spyOn(axios, "post")
-      .mockResolvedValueOnce({
+  it("accepts the v2 task id and treats a 2xx response without it as outcome-unknown", async () => {
+    const post = mockManusV2Post(
+      {
         status: 201,
-        data: {
-          id: "stale-wrapper-id",
-          status: "running",
-          output: "stale wrapper output",
-          task: {
-            id: "wrapped-task-id",
-            status: "done",
-            output: "wrapped output",
-          },
-        },
-      })
-      .mockResolvedValueOnce({
+        data: { ok: true, task_id: "v2-task-id" },
+      },
+      {
         status: 200,
-        data: { task: { status: "succeeded", output: "missing id" } },
-      });
+        data: { ok: true },
+      },
+    );
 
     await expect(
       createFrontMindTask({
         baseUrl: "https://api.example.test",
         apiKey: "credential-value",
+        agentProfile: "manus-1.6-max",
         prompt: "wrapped",
       }),
     ).resolves.toMatchObject({
       ok: true,
       task: {
-        id: "wrapped-task-id",
-        status: "done",
-        output: [expect.objectContaining({ role: "assistant" })],
+        id: "v2-task-id",
+        status: "running",
       },
     });
     await expect(
       createFrontMindTask({
         baseUrl: "https://api.example.test",
         apiKey: "credential-value",
+        agentProfile: "manus-1.6-max",
         prompt: "missing id",
       }),
     ).resolves.toMatchObject({
       ok: false,
       failureClass: "unknown",
-      failureCode: "UPSTREAM_TASK_ID_MISSING",
+      failureCode: "UPSTREAM_CREATE_TRANSPORT_UNKNOWN",
     });
     expect(post).toHaveBeenCalledTimes(2);
   });
@@ -3919,12 +3939,16 @@ describe("knowledge base execution contract", () => {
   ] as const)(
     "classifies upstream HTTP $status as $expectedFailureClass only from its explicit contract",
     async ({ status, data, expectedFailureClass, expectedFailureCode }) => {
-      vi.spyOn(axios, "post").mockResolvedValue({ status, data });
+      mockManusV2Post({
+        status,
+        data: { ok: false, ...data },
+      });
 
       await expect(
         createFrontMindTask({
           baseUrl: "https://api.example.test",
           apiKey: "credential-value",
+          agentProfile: "manus-1.6-max",
           prompt: "manual Logo",
           idempotencyKey: "frontmind-kb-v2:manual-logo-operation",
         }),
@@ -3938,25 +3962,30 @@ describe("knowledge base execution contract", () => {
   );
 
   it("keeps numeric provider code 3 but never persists an arbitrary provider code", async () => {
-    const post = vi
-      .spyOn(axios, "post")
-      .mockResolvedValueOnce({
+    const post = mockManusV2Post(
+      {
         status: 400,
-        data: { error: { code: 3, message: "invalid argument" } },
-      })
-      .mockResolvedValueOnce({
+        data: {
+          ok: false,
+          error: { code: "3", message: "invalid argument" },
+        },
+      },
+      {
         status: 422,
         data: {
+          ok: false,
           error: {
             code: "FILE_ID_CUSTOMER_SECRET_ABC123",
             message: "attachment rejected",
           },
         },
-      });
+      },
+    );
 
     const numeric = await createFrontMindTask({
       baseUrl: "https://api.example.test",
       apiKey: "credential-value",
+      agentProfile: "manus-1.6-max",
       prompt: "numeric provider code",
     });
     expect(numeric).toMatchObject({
@@ -3968,6 +3997,7 @@ describe("knowledge base execution contract", () => {
     const malicious = await createFrontMindTask({
       baseUrl: "https://api.example.test",
       apiKey: "credential-value",
+      agentProfile: "manus-1.6-max",
       prompt: "untrusted provider code",
     });
     expect(malicious).toMatchObject({
@@ -4117,6 +4147,202 @@ describe("knowledge base execution contract", () => {
     expect(registerTask).not.toHaveBeenCalled();
   });
 
+  it("freezes and sends zh-CN on every fresh materialized v5 task create", async () => {
+    const operationKey = "e".repeat(64);
+    const turnId = "00000000-0000-4000-8000-0000000000e5";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000b5",
+      userId: 7,
+      conversationId: "conversation-materialized-zh-cn",
+      generation: 2,
+      revision: 4,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: "a".repeat(64),
+      providerProtocol: "manus_v2",
+      contentVersion: 1,
+    } as any;
+    const claim = {
+      turn: {
+        id: turnId,
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: "2.1",
+        operationType: "revise",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+      },
+      leaseToken: "lease-materialized-zh-cn",
+      upstreamIdempotencyKey: `frontmind-kb-v2:${operationKey}`,
+      recoveryMetadata: {
+        kind: "turn",
+        conversationId: build.conversationId,
+        parentTaskId: null,
+      },
+      preparedDispatch: null,
+    } as any;
+    const prepared = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "只返回本轮 Patch ZIP",
+        agentProfile: "manus-1.6",
+        attachments: [],
+      },
+      bodySha256: "b".repeat(64),
+      preparedAt: "2026-08-14T00:00:00.000Z",
+    };
+    const title = `FrontMind KB ${build.id} g${build.generation} ${turnId}`;
+    const createTask = vi.fn().mockResolvedValue({
+      taskId: "materialized-task-zh-cn",
+      taskUrl: null,
+      requestId: "request-materialized-zh-cn",
+    });
+    const sendMessage = vi.fn();
+    const beginDispatch = vi.fn().mockResolvedValue({
+      method: "task.create",
+      canonicalTaskId: null,
+      operationToken: operationKey,
+      title,
+    });
+    const bindSubmission = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue(prepared),
+          ensureManusV2Attachments: vi.fn().mockResolvedValue([]),
+          beginDispatch,
+          bindSubmission,
+          createClient: vi.fn().mockReturnValue({
+            createTask,
+            sendMessage,
+            updateTaskVisibility: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue([]),
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({
+      taskId: "materialized-task-zh-cn",
+      rebound: true,
+      reconciled: false,
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(createTask).toHaveBeenCalledWith({
+      prompt: prepared.requestBody.prompt,
+      attachments: [],
+      title,
+      agentProfile: "manus-1.6",
+      locale: "zh-CN",
+      hideInTaskList: true,
+    });
+    const frozenBodyHash = createHash("sha256")
+      .update(
+        JSON.stringify(
+          buildManusV2CreateTaskBody(createTask.mock.calls[0]![0]),
+        ),
+      )
+      .digest("hex");
+    expect(beginDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedMethod: "task.create",
+        frozenProviderRequestHash: frozenBodyHash,
+      }),
+    );
+    expect(bindSubmission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "task.create",
+        taskId: "materialized-task-zh-cn",
+      }),
+    );
+  });
+
+  it("rejects an explicitly legacy build before preparing files or creating a Provider task", async () => {
+    const ensureDispatch = vi.fn();
+    const ensureManusV2Attachments = vi.fn();
+    const createTask = vi.fn();
+    const sendMessage = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        {
+          turn: {
+            id: "turn-legacy-reset-required",
+            userId: 7,
+            buildId: "build-legacy-reset-required",
+            buildGeneration: 1,
+          },
+        } as any,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue({
+            id: "build-legacy-reset-required",
+            executionMode: "legacy_conversational",
+            skillVersion: "4",
+            providerProtocol: "manus_v2",
+          }),
+          ensureDispatch,
+          ensureManusV2Attachments,
+          createClient: vi.fn().mockReturnValue({ createTask, sendMessage }),
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing build before preparing files or creating a Provider task", async () => {
+    const ensureDispatch = vi.fn();
+    const ensureManusV2Attachments = vi.fn();
+    const beginDispatch = vi.fn();
+    const createTask = vi.fn();
+    const sendMessage = vi.fn();
+    const createClient = vi.fn().mockReturnValue({ createTask, sendMessage });
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        {
+          turn: {
+            id: "turn-missing-build",
+            userId: 7,
+            buildId: "build-missing",
+            buildGeneration: 1,
+          },
+        } as any,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(null),
+          ensureDispatch,
+          ensureManusV2Attachments,
+          beginDispatch,
+          createClient,
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: "BUILD_NOT_FOUND" });
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it("fails a compatible create closed when the build already has a canonical task", async () => {
     const operationKey = "b".repeat(64);
     const claim = {
@@ -4173,7 +4399,7 @@ describe("knowledge base execution contract", () => {
           }),
         } as any,
       ),
-    ).rejects.toMatchObject({ code: "CONFLICT" });
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
     expect(ensureDispatch).not.toHaveBeenCalled();
     expect(ensureManusV2Attachments).not.toHaveBeenCalled();
     expect(beginDispatch).not.toHaveBeenCalled();
@@ -4181,7 +4407,7 @@ describe("knowledge base execution contract", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it("dispatches the compatible create with title and a matching frozen shape hash", async () => {
+  it("rejects a retired compatible-create reservation before any Provider work", async () => {
     process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
     const operationKey = "c".repeat(64);
     const claim = {
@@ -4215,8 +4441,10 @@ describe("knowledge base execution contract", () => {
     const build = {
       id: claim.turn.buildId,
       userId: claim.turn.userId,
+      executionMode: "legacy_conversational",
       generation: claim.turn.buildGeneration,
       revision: claim.turn.expectedRevision,
+      contentVersion: null,
       currentLeafId: claim.turn.expectedLeafId,
       status: "confirming",
       providerProtocol: "manus_v2",
@@ -4229,7 +4457,7 @@ describe("knowledge base execution contract", () => {
       confirmedCount: 7,
       directPrefilledCount: 0,
       lastTurnAttachmentCount: 0,
-      skillVersion: "knowledge-base-v2",
+      skillVersion: "4",
       handoffProvenance: {},
     } as any;
     const prepared = {
@@ -4255,6 +4483,15 @@ describe("knowledge base execution contract", () => {
       requestId: "request-compatible-create",
     });
     const sendMessage = vi.fn();
+    const ensureDispatch = vi.fn().mockResolvedValue(prepared);
+    const ensureManusV2Attachments = vi.fn().mockResolvedValue([]);
+    const createClient = vi.fn().mockReturnValue({
+      createTask,
+      sendMessage,
+      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
+      findCreatedTask: vi.fn(),
+      listAllMessages: vi.fn(),
+    });
 
     try {
       await expect(
@@ -4263,105 +4500,28 @@ describe("knowledge base execution contract", () => {
           { id: "credential-current", apiKey: "current-secret-key" } as any,
           {
             loadBuild: vi.fn().mockResolvedValue(build),
-            ensureDispatch: vi.fn().mockResolvedValue(prepared),
-            ensureManusV2Attachments: vi.fn().mockResolvedValue([]),
+            ensureDispatch,
+            ensureManusV2Attachments,
             beginDispatch,
-            createClient: vi.fn().mockReturnValue({
-              createTask,
-              sendMessage,
-              updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
-              findCreatedTask: vi.fn(),
-              listAllMessages: vi.fn(),
-            }),
+            createClient,
             bindSubmission: vi.fn().mockResolvedValue(undefined),
             reconcileTask: vi.fn().mockResolvedValue(false),
           } as any,
         ),
-      ).resolves.toMatchObject({
-        taskId: "compatible-canonical-task",
-        rebound: true,
-      });
+      ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
     } finally {
       delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
     }
 
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        title: `FrontMind KB ${build.id} g${build.generation}`,
-        hideInTaskList: true,
-      }),
-    );
-    const request = createTask.mock.calls[0]?.[0];
-    expect(request).not.toHaveProperty("agentProfile");
-    expect(request).not.toHaveProperty("structuredOutputSchema");
-    const expectedHash = createHash("sha256")
-      .update(JSON.stringify(buildManusV2CreateTaskBody(request)))
-      .digest("hex");
-    expect(beginDispatch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        expectedMethod: "task.create",
-        frozenProviderRequestHash: expectedHash,
-      }),
-    );
-
-    const ambiguousOperationKey = "d".repeat(64);
-    const ambiguousClaim = {
-      ...claim,
-      turn: {
-        ...claim.turn,
-        id: "turn-compatible-create-unknown",
-        operationKey: ambiguousOperationKey,
-        operationToken: ambiguousOperationKey,
-        providerAttemptState: "not_sent",
-        createAttemptState: "not_sent",
-        upstreamTaskId: null,
-        status: "running",
-      },
-      leaseToken: "lease-compatible-create-unknown",
-      upstreamIdempotencyKey: `frontmind-kb-v2:${ambiguousOperationKey}`,
-    } as any;
-    const ambiguousError = new ManusV2ApiError(
-      "task.create",
-      null,
-      "TRANSPORT_UNKNOWN",
-      false,
-      true,
-    );
-    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
-    createTask.mockReset().mockRejectedValueOnce(ambiguousError);
-
-    process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
-    try {
-      await expect(
-        knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
-          ambiguousClaim,
-          { id: "credential-current", apiKey: "current-secret-key" } as any,
-          {
-            loadBuild: vi.fn().mockResolvedValue(build),
-            ensureDispatch: vi.fn().mockResolvedValue(prepared),
-            ensureManusV2Attachments: vi.fn().mockResolvedValue([]),
-            beginDispatch,
-            markManusV2OutcomeUnknown,
-            createClient: vi.fn().mockReturnValue({
-              createTask,
-              sendMessage,
-              updateTaskVisibility: vi.fn(),
-              findCreatedTask: vi.fn(),
-              listAllMessages: vi.fn(),
-            }),
-            bindSubmission: vi.fn(),
-            reconcileTask: vi.fn(),
-          } as any,
-        ),
-      ).rejects.toBe(ambiguousError);
-    } finally {
-      delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
-    }
-    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
   });
 
-  it("dispatches an active local-rehydrate reservation through one inline v2 create and never creates twice", async () => {
+  it("rejects a retired local-rehydrate reservation before any Provider work", async () => {
     process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
     const operationKey = "a".repeat(64);
     const claim = {
@@ -4397,8 +4557,10 @@ describe("knowledge base execution contract", () => {
     const build = {
       id: claim.turn.buildId,
       userId: claim.turn.userId,
+      executionMode: "legacy_conversational",
       generation: claim.turn.buildGeneration,
       revision: claim.turn.expectedRevision,
+      contentVersion: null,
       currentLeafId: claim.turn.expectedLeafId,
       status: "confirming",
       providerProtocol: "manus_v2",
@@ -4410,7 +4572,7 @@ describe("knowledge base execution contract", () => {
       confirmedCount: 7,
       directPrefilledCount: 0,
       lastTurnAttachmentCount: 0,
-      skillVersion: "knowledge-base-v2",
+      skillVersion: "4",
       handoffProvenance: {
         localRehydrateRequired: {
           reason: "generated_attachment_invalid_preprovider",
@@ -4493,46 +4655,13 @@ describe("knowledge base execution contract", () => {
         { id: "credential-current", apiKey: "current-secret-key" } as any,
         dependencies,
       ),
-    ).resolves.toEqual({
-      taskId: "new-canonical-task",
-      rebound: true,
-      reconciled: false,
-    });
-    expect(loadPreproviderAuthority).toHaveBeenCalledWith({
-      userId: 7,
-      build,
-      expectedActiveTurnId: claim.turn.id,
-    });
-    expect(ensureDispatch).toHaveBeenCalledWith(
-      expect.objectContaining({ claim }),
-    );
-    expect(ensureManusV2Attachments).toHaveBeenCalledOnce();
-    expect(createTask).toHaveBeenCalledOnce();
-    expect(createTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        attachments: [
-          expect.objectContaining({
-            file_data: expect.stringContaining("base64,"),
-            filename: "skill.zip",
-          }),
-        ],
-      }),
-    );
-    const providerPrompt = createTask.mock.calls[0]?.[0].prompt;
-    expect(providerPrompt).toContain("# FrontMind legacy build handoff");
-    expect(providerPrompt).toContain(`snapshotSha256=${handoff.sha256}`);
-    expect(providerPrompt).toContain("已完成正文");
-    expect(providerPrompt).toContain("确认当前节点");
-    expect(providerPrompt).not.toContain("old-task-id");
-
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
-        claim,
-        { id: "credential-current", apiKey: "current-secret-key" } as any,
-        dependencies,
-      ),
-    ).rejects.toMatchObject({ code: "OPERATION_NOT_OBSERVED" });
-    expect(createTask).toHaveBeenCalledOnce();
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+    expect(loadPreproviderAuthority).not.toHaveBeenCalled();
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(dependencies.createClient).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
     delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
   });

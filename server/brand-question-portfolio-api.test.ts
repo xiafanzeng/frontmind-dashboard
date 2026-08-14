@@ -87,9 +87,13 @@ describe("brand question public task boundary", () => {
       }),
     ).toMatch(/^[a-f0-9]{64}$/);
 
-    const post = vi.spyOn(axios, "post").mockResolvedValue({
-      status: 201,
-      data: { id: "task-brand-idempotent", status: "created" },
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        request_id: "request-brand-idempotent",
+        task_id: "task-brand-idempotent",
+      },
     });
     await createBrandQuestionUpstreamTask({
       baseUrl: "https://api.example.test",
@@ -99,11 +103,23 @@ describe("brand question public task boundary", () => {
       idempotencyKey: taskIdempotencyKey,
     });
     expect(post).toHaveBeenCalledWith(
-      "https://api.example.test/v1/tasks",
-      expect.objectContaining({ prompt: "bounded prompt" }),
+      "https://api.example.test/v2/task.create",
+      expect.objectContaining({
+        message: expect.objectContaining({
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: "text",
+              text: expect.stringContaining("bounded prompt"),
+            }),
+          ]),
+        }),
+        structured_output_schema: expect.objectContaining({
+          required: ["payload"],
+        }),
+      }),
       expect.objectContaining({
         headers: expect.objectContaining({
-          "Idempotency-Key": taskIdempotencyKey,
+          "Content-Type": "application/json",
         }),
       }),
     );

@@ -26,12 +26,21 @@ import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
+import { readValidatedActiveKnowledgeBaseWorkingSet } from "./knowledge-base-materialized-assets";
+import type { ValidatedKnowledgeBaseWorkingSet } from "./knowledge-base-materialized-contract";
+import { knowledgeBasePackageWriterTaskId } from "./knowledge-base-publication-binding";
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 const PACKAGE_KIND = "frontmind.dashboard-owned-knowledge-package" as const;
 const PACKAGE_PROFILE = "dashboard-core-v1" as const;
 const ROOT_DIRECTORY = "frontmind_knowledge_base";
 const MANIFEST_PATH = `${ROOT_DIRECTORY}/00_package_manifest.json`;
+const SUPPORTING_PATHS = [
+  "README.md",
+  "00_knowledge_tree.md",
+  "00_source_index.md",
+  "reports/package-status.md",
+] as const;
 // A permanently corrupt local projection must not consume one recovery slot
 // forever. The accepted completion receipt remains visible; an operator can
 // explicitly resume this build after correcting its local cause.
@@ -48,10 +57,12 @@ const packageDocumentSchema = z
     contentSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     sourceUrls: z.array(z.string().url()).max(500),
     imageUrls: z.array(z.string().url()).max(500),
+    evidencePaths: z.array(z.string().min(1).max(2_048)).max(1_500).default([]),
+    assetIds: z.array(z.string().min(1).max(191)).max(100).default([]),
   })
   .strict();
 
-const packageAssetSchema = z
+const packageOfficialLogoSchema = z
   .object({
     id: z.literal("official-logo"),
     kind: z.literal("official_logo"),
@@ -69,6 +80,40 @@ const packageAssetSchema = z
   })
   .strict();
 
+const packageWorkingSetAssetSchema = z
+  .object({
+    id: z.string().min(1).max(191),
+    kind: z.literal("working_set_asset"),
+    path: z.string().min(1).max(2_048),
+    sourcePath: z.string().min(1).max(1_024),
+    filename: z.string().min(1).max(512),
+    mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    bytes: z.number().int().positive(),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    provenance: z.record(z.string(), z.unknown()),
+    documentIds: z.array(z.string().min(1).max(191)).max(115),
+  })
+  .strict();
+
+const packageAssetSchema = z.discriminatedUnion("kind", [
+  packageOfficialLogoSchema,
+  packageWorkingSetAssetSchema,
+]);
+
+const packageEvidenceSchema = z
+  .object({
+    path: z.string().min(1).max(2_048),
+    sourcePath: z.string().min(1).max(1_024),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    bytes: z.number().int().positive(),
+    leafId: z.string().min(1).max(191),
+    sourceUrl: z.string().url().nullable(),
+    retrievedAt: z.string().min(1).max(64).nullable(),
+  })
+  .strict();
+
 const packageManifestSchema = z
   .object({
     kind: z.literal(PACKAGE_KIND),
@@ -79,7 +124,8 @@ const packageManifestSchema = z
     revision: z.number().int().nonnegative(),
     companyName: z.string().min(1).max(255),
     documents: z.array(packageDocumentSchema).min(1).max(115),
-    assets: z.array(packageAssetSchema).max(1).default([]),
+    evidence: z.array(packageEvidenceSchema).max(1_500).default([]),
+    assets: z.array(packageAssetSchema).max(101).default([]),
     missing_optional_assets: z.array(z.string().min(1).max(128)).max(50),
     counts: z
       .object({
@@ -140,6 +186,7 @@ function packageNodes(
     | "contentSha256"
     | "sourceUrls"
     | "imageUrls"
+    | "assetRefs"
   >[],
 ) {
   const ordered = [...nodes].sort(
@@ -183,6 +230,8 @@ function packageNodes(
         contentSha256,
         sourceUrls: customerSafeKnowledgeUrls(node.sourceUrls),
         imageUrls: customerSafeKnowledgeUrls(node.imageUrls),
+        evidencePaths: [] as string[],
+        assetIds: [] as string[],
       },
       content,
     };
@@ -198,6 +247,7 @@ function addDeterministicFile(
     binary: Buffer.isBuffer(value),
     date: FIXED_ZIP_DATE,
     unixPermissions: 0o100644,
+    createFolders: false,
   });
 }
 
@@ -252,6 +302,129 @@ function packageLogo(logo?: DashboardOwnedPackageLogo | null) {
   };
 }
 
+function packagedWorkingSetPath(sourcePath: string) {
+  return `working-set/${sourcePath}`;
+}
+
+function packageMaterializedWorkingSet(input: {
+  build: Pick<KnowledgeBaseBuild, "id" | "generation" | "companyName">;
+  nodes: readonly KnowledgeBaseBuildNode[];
+  workingSet?: ValidatedKnowledgeBaseWorkingSet;
+}) {
+  if (!input.workingSet) {
+    return {
+      evidence: [] as Array<z.infer<typeof packageEvidenceSchema>>,
+      assets: [] as Array<z.infer<typeof packageWorkingSetAssetSchema>>,
+      files: [] as Array<[string, Buffer]>,
+      leafBindings: new Map<
+        string,
+        { evidencePaths: string[]; assetIds: string[] }
+      >(),
+    };
+  }
+  const { manifest, files } = input.workingSet;
+  if (
+    manifest.buildId !== input.build.id ||
+    manifest.generation !== input.build.generation ||
+    manifest.company.name !== input.build.companyName ||
+    manifest.leaves.length !== input.nodes.length
+  ) {
+    throw new Error("LOCAL_PACKAGE_WORKING_SET_COORDINATES_MISMATCH");
+  }
+  const orderedNodes = [...input.nodes].sort(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+  const leafBindings = new Map<
+    string,
+    { evidencePaths: string[]; assetIds: string[] }
+  >();
+  for (const [index, leaf] of manifest.leaves.entries()) {
+    const node = orderedNodes[index];
+    const bytes = files.get(leaf.contentPath);
+    const content = canonicalKnowledgeBaseMarkdown(
+      bytes?.toString("utf8") || "",
+    );
+    const nodeContent = canonicalKnowledgeBaseMarkdown(
+      node?.contentMarkdown || "",
+    );
+    if (
+      !node ||
+      node.ordinal !== leaf.ordinal ||
+      node.leafId !== leaf.leafId ||
+      node.branchId !== leaf.branchId ||
+      node.branchTitle !== leaf.branchTitle ||
+      node.title !== leaf.title ||
+      content !== nodeContent ||
+      knowledgeBaseMarkdownSha256(content) !== node.contentSha256 ||
+      JSON.stringify([...(node.assetRefs || [])].sort()) !==
+        JSON.stringify([...leaf.assetIds].sort())
+    ) {
+      throw new Error("LOCAL_PACKAGE_WORKING_SET_NODE_AUTHORITY_MISMATCH");
+    }
+    leafBindings.set(customerSafeKnowledgeText(leaf.leafId), {
+      evidencePaths: leaf.evidencePaths.map(packagedWorkingSetPath),
+      assetIds: [...leaf.assetIds],
+    });
+  }
+  const evidence = manifest.evidenceLedger.map((entry) => {
+    const bytes = files.get(entry.path);
+    if (!bytes || sha256(bytes) !== entry.sha256) {
+      throw new Error("LOCAL_PACKAGE_WORKING_SET_EVIDENCE_HASH_MISMATCH");
+    }
+    return {
+      path: packagedWorkingSetPath(entry.path),
+      sourcePath: entry.path,
+      sha256: entry.sha256,
+      bytes: bytes.length,
+      leafId: entry.leafId,
+      sourceUrl: customerSafeKnowledgeUrls([entry.sourceUrl])[0] ?? null,
+      retrievedAt: entry.retrievedAt,
+    };
+  });
+  const assets = manifest.assets.map((asset) => {
+    const bytes = files.get(asset.path);
+    if (
+      !bytes ||
+      bytes.length !== asset.bytes ||
+      sha256(bytes) !== asset.sha256
+    ) {
+      throw new Error("LOCAL_PACKAGE_WORKING_SET_ASSET_HASH_MISMATCH");
+    }
+    return {
+      id: asset.assetId,
+      kind: "working_set_asset" as const,
+      path: packagedWorkingSetPath(asset.path),
+      sourcePath: asset.path,
+      filename: customerSafeKnowledgeFilename(
+        asset.path,
+        `${asset.assetId}.img`,
+      ),
+      mimeType: asset.mimeType,
+      sha256: asset.sha256,
+      bytes: asset.bytes,
+      width: asset.width,
+      height: asset.height,
+      provenance: asset.provenance,
+      documentIds: [...asset.documentIds],
+    };
+  });
+  return {
+    evidence,
+    assets,
+    leafBindings,
+    files: [
+      ...evidence.map(
+        (entry) =>
+          [entry.path, files.get(entry.sourcePath)!] as [string, Buffer],
+      ),
+      ...assets.map(
+        (asset) =>
+          [asset.path, files.get(asset.sourcePath)!] as [string, Buffer],
+      ),
+    ],
+  };
+}
+
 export async function buildDashboardOwnedKnowledgePackage(input: {
   build: Pick<
     KnowledgeBaseBuild,
@@ -259,15 +432,28 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
   >;
   nodes: readonly KnowledgeBaseBuildNode[];
   logo?: DashboardOwnedPackageLogo | null;
+  materializedWorkingSet?: ValidatedKnowledgeBaseWorkingSet;
 }) {
   assertBuildCoordinates(input.build);
   const packaged = packageNodes(input.nodes);
   const logo = packageLogo(input.logo);
+  const materialized = packageMaterializedWorkingSet({
+    build: input.build,
+    nodes: input.nodes,
+    workingSet: input.materializedWorkingSet,
+  });
+  for (const item of packaged) {
+    const binding = materialized.leafBindings.get(item.metadata.id);
+    if (binding) {
+      item.metadata.evidencePaths = binding.evidencePaths;
+      item.metadata.assetIds = binding.assetIds;
+    }
+  }
   const companyName = customerSafeKnowledgeText(input.build.companyName).trim();
   const missingOptionalAssets = [
     ...(logo ? [] : ["official_logo"]),
     "supplement_overview",
-    "supplement_evidence_index",
+    ...(materialized.evidence.length ? [] : ["supplement_evidence_index"]),
   ];
   const supportingFiles: Array<[string, string]> = [
     [
@@ -288,9 +474,13 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
       `# 来源索引\n\n${packaged
         .map(({ metadata }) => {
           const urls = [...metadata.sourceUrls, ...metadata.imageUrls];
+          const evidencePaths = metadata.evidencePaths;
           return `## ${metadata.id} ${metadata.title}\n\n${
-            urls.length > 0
-              ? urls.map((url) => `- ${url}`).join("\n")
+            urls.length > 0 || evidencePaths.length > 0
+              ? [
+                  ...urls.map((url) => `- ${url}`),
+                  ...evidencePaths.map((evidencePath) => `- ${evidencePath}`),
+                ].join("\n")
               : "- 未附加可公开来源；以已接受正文为准。"
           }`;
         })
@@ -310,11 +500,17 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
     revision: input.build.revision,
     companyName,
     documents: packaged.map((item) => item.metadata),
-    assets: logo ? [logo.metadata] : [],
+    evidence: materialized.evidence,
+    assets: [...(logo ? [logo.metadata] : []), ...materialized.assets],
     missing_optional_assets: missingOptionalAssets,
     counts: {
       nodes: packaged.length,
-      files: packaged.length + supportingFiles.length + 1 + (logo ? 1 : 0),
+      files:
+        packaged.length +
+        supportingFiles.length +
+        1 +
+        (logo ? 1 : 0) +
+        materialized.files.length,
     },
   };
   packageManifestSchema.parse(manifest);
@@ -367,6 +563,11 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
       logo.buffer,
     );
   }
+  for (const [relativePath, bytes] of materialized.files.sort(
+    ([left], [right]) => left.localeCompare(right),
+  )) {
+    addDeterministicFile(zip, `${ROOT_DIRECTORY}/${relativePath}`, bytes);
+  }
   addDeterministicFile(zip, MANIFEST_PATH, canonicalJson(manifest));
   const buffer = await zip.generateAsync({
     type: "nodebuffer",
@@ -399,7 +600,7 @@ export async function readDashboardOwnedKnowledgePackage(input: {
   const entries = Object.values(zip.files).filter((entry) => !entry.dir);
   if (
     entries.length === 0 ||
-    entries.length > 250 ||
+    entries.length > 1_600 ||
     entries.some(
       (entry) =>
         !entry.name.startsWith(`${ROOT_DIRECTORY}/`) ||
@@ -425,6 +626,25 @@ export async function readDashboardOwnedKnowledgePackage(input: {
     manifest.counts.files !== entries.length
   ) {
     throw new Error("LOCAL_PACKAGE_COORDINATES_MISMATCH");
+  }
+  const declaredPaths = new Set([
+    MANIFEST_PATH,
+    ...SUPPORTING_PATHS.map(
+      (relativePath) => `${ROOT_DIRECTORY}/${relativePath}`,
+    ),
+    ...manifest.documents.map(
+      (document) => `${ROOT_DIRECTORY}/${document.path}`,
+    ),
+    ...manifest.evidence.map(
+      (evidence) => `${ROOT_DIRECTORY}/${evidence.path}`,
+    ),
+    ...manifest.assets.map((asset) => `${ROOT_DIRECTORY}/${asset.path}`),
+  ]);
+  if (
+    declaredPaths.size !== entries.length ||
+    entries.some((entry) => !declaredPaths.has(entry.name))
+  ) {
+    throw new Error("LOCAL_PACKAGE_UNREGISTERED_FILE");
   }
   const orderedNodes = input.nodes
     ? [...input.nodes].sort((left, right) => left.ordinal - right.ordinal)
@@ -460,6 +680,8 @@ export async function readDashboardOwnedKnowledgePackage(input: {
           JSON.stringify(metadata.sourceUrls) ||
         JSON.stringify(customerSafeKnowledgeUrls(node.imageUrls)) !==
           JSON.stringify(metadata.imageUrls) ||
+        JSON.stringify([...(node.assetRefs || [])].sort()) !==
+          JSON.stringify([...metadata.assetIds].sort()) ||
         (node.contentSha256 !== null &&
           node.contentSha256 !== undefined &&
           knowledgeBaseMarkdownSha256(authoritativeContent) !==
@@ -478,8 +700,8 @@ export async function readDashboardOwnedKnowledgePackage(input: {
       order: metadata.order,
       evidenceStatus: "needs_verification",
       sourceIds: metadata.sourceUrls,
-      evidenceDocumentIds: [],
-      assetIds: [],
+      evidenceDocumentIds: metadata.evidencePaths,
+      assetIds: metadata.assetIds,
       customerVisible: true,
       evidenceCharacters: 0,
       requiredFormalCharacters: 0,
@@ -488,6 +710,33 @@ export async function readDashboardOwnedKnowledgePackage(input: {
   }
   if (input.nodes && documents.length !== input.nodes.length) {
     throw new Error("LOCAL_PACKAGE_NODE_COUNT_MISMATCH");
+  }
+  for (const metadata of manifest.evidence) {
+    const entry = zip.file(`${ROOT_DIRECTORY}/${metadata.path}`);
+    if (!entry) throw new Error("LOCAL_PACKAGE_EVIDENCE_MISSING");
+    const buffer = await entry.async("nodebuffer");
+    if (
+      buffer.length !== metadata.bytes ||
+      sha256(buffer) !== metadata.sha256 ||
+      !buffer.toString("utf8").trim()
+    ) {
+      throw new Error("LOCAL_PACKAGE_EVIDENCE_HASH_MISMATCH");
+    }
+    const document = manifest.documents.find(
+      (candidate) => candidate.id === metadata.leafId,
+    );
+    if (!document?.evidencePaths.includes(metadata.path)) {
+      throw new Error("LOCAL_PACKAGE_EVIDENCE_BINDING_MISMATCH");
+    }
+  }
+  const referencedEvidence = new Set(
+    manifest.documents.flatMap((document) => document.evidencePaths),
+  );
+  if (
+    referencedEvidence.size !== manifest.evidence.length ||
+    manifest.evidence.some((evidence) => !referencedEvidence.has(evidence.path))
+  ) {
+    throw new Error("LOCAL_PACKAGE_EVIDENCE_BINDING_MISMATCH");
   }
   const assets: KnowledgeAsset[] = [];
   const storedAssetKeys: string[] = [];
@@ -514,20 +763,64 @@ export async function readDashboardOwnedKnowledgePackage(input: {
       throw new Error("LOCAL_PACKAGE_ASSET_STORAGE_FAILED");
     }
     if (input.storeAsset) storedAssetKeys.push(key);
-    assets.push({
-      id: metadata.id,
-      key,
-      path: `${ROOT_DIRECTORY}/${metadata.path}`,
-      mimeType: metadata.mimeType,
-      size: metadata.bytes,
-      sha256: metadata.sha256,
-      caption: "企业官方主 Logo",
-      alt: "企业官方主 Logo",
-      sourceKind: "official_logo_upload",
-      ownership: "first_party",
-      assetType: "brand_identity",
-      displayRole: "badge",
-    });
+    assets.push(
+      metadata.kind === "official_logo"
+        ? {
+            id: metadata.id,
+            key,
+            path: `${ROOT_DIRECTORY}/${metadata.path}`,
+            mimeType: metadata.mimeType,
+            size: metadata.bytes,
+            sha256: metadata.sha256,
+            caption: "企业官方主 Logo",
+            alt: "企业官方主 Logo",
+            sourceKind: "official_logo_upload",
+            ownership: "first_party",
+            assetType: "brand_identity",
+            displayRole: "badge",
+          }
+        : {
+            id: metadata.id,
+            key,
+            path: `${ROOT_DIRECTORY}/${metadata.path}`,
+            mimeType: metadata.mimeType,
+            size: metadata.bytes,
+            sha256: metadata.sha256,
+            width: metadata.width,
+            height: metadata.height,
+            caption: metadata.filename,
+            alt: metadata.filename,
+            documentIds: metadata.documentIds,
+            sourceDocumentPath: metadata.sourcePath,
+            sourceKind: "official_document",
+            ownership: "unknown",
+            assetType: "other",
+            displayRole: "inline",
+          },
+    );
+  }
+  const referencedAssets = new Set(
+    manifest.documents.flatMap((document) => document.assetIds),
+  );
+  const workingSetAssets = manifest.assets.filter(
+    (asset) => asset.kind === "working_set_asset",
+  );
+  const workingSetAssetIds = new Set(workingSetAssets.map((asset) => asset.id));
+  if (
+    [...referencedAssets].some((assetId) => !workingSetAssetIds.has(assetId)) ||
+    workingSetAssets.some(
+      (asset) =>
+        !referencedAssets.has(asset.id) ||
+        JSON.stringify([...asset.documentIds].sort()) !==
+          JSON.stringify(
+            manifest.documents
+              .filter((document) => document.assetIds.includes(asset.id))
+              .map((document) => document.id)
+              .sort(),
+          ),
+    )
+  ) {
+    throw new Error("LOCAL_PACKAGE_ASSET_BINDING_MISMATCH");
   }
   return {
     manifest,
@@ -615,6 +908,15 @@ export async function runKnowledgeBasePackageSweep(limit = 8) {
       .where(eq(knowledgeBaseBuildNodes.buildId, candidate.id))
       .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
     try {
+      const materializedWorkingSet =
+        candidate.executionMode === "materialized_bundle_v1"
+          ? (
+              await readValidatedActiveKnowledgeBaseWorkingSet({
+                db,
+                build: candidate,
+              })
+            ).validated
+          : undefined;
       const logo =
         candidate.logoStorageKey &&
         candidate.logoSha256 &&
@@ -648,6 +950,7 @@ export async function runKnowledgeBasePackageSweep(limit = 8) {
         build: candidate,
         nodes,
         logo,
+        materializedWorkingSet,
       });
       const stored = await persistKnowledgeBuildArtifact({
         userId: candidate.userId,
@@ -663,7 +966,7 @@ export async function runKnowledgeBasePackageSweep(limit = 8) {
           revision: candidate.revision,
         }),
       });
-      const taskId = candidate.canonicalTaskId || candidate.upstreamTaskId;
+      const taskId = knowledgeBasePackageWriterTaskId(candidate);
       const result = await db
         .update(knowledgeBaseBuilds)
         .set({

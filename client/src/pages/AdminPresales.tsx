@@ -61,29 +61,21 @@ export const DEFAULT_API_KEY_USAGE_LIMIT = 230_000;
 export const DEFAULT_API_KEY_WARNING_RATIO = 0.8;
 
 export function presalesUsageDisplayState(input: {
-  complete: boolean;
-  attributionComplete: boolean;
-  keyTotalUsed: number;
-  websiteUsed: number;
+  keyPoolTotalUsed: number | null;
+  rollingWebsiteUsed: number;
   limit: number;
 }) {
-  if (!input.complete) {
-    return {
-      keyTotalLabel: "—",
-      websiteUsedLabel: "—",
-      percentageLabel: "—",
-      progressPercentage: 0,
-    };
-  }
   const percentage =
-    Math.round((input.keyTotalUsed / Math.max(1, input.limit)) * 1000) / 10;
+    input.keyPoolTotalUsed === null
+      ? null
+      : Math.round(
+          (input.keyPoolTotalUsed / Math.max(1, input.limit)) * 1000,
+        ) / 10;
   return {
-    keyTotalLabel: input.keyTotalUsed.toLocaleString(),
-    websiteUsedLabel: input.attributionComplete
-      ? input.websiteUsed.toLocaleString()
-      : "—",
-    percentageLabel: `${percentage}%`,
-    progressPercentage: Math.min(100, percentage),
+    keyTotalLabel: input.keyPoolTotalUsed?.toLocaleString() ?? "—",
+    websiteUsedLabel: input.rollingWebsiteUsed.toLocaleString(),
+    percentageLabel: percentage === null ? "—" : `${percentage}%`,
+    progressPercentage: percentage === null ? 0 : Math.min(100, percentage),
   };
 }
 
@@ -93,7 +85,6 @@ export default function AdminPresales() {
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const [allowIncompleteHistory, setAllowIncompleteHistory] = useState(false);
   const [connectionState, setConnectionState] = useState<
     "idle" | "success" | "error"
   >("idle");
@@ -133,7 +124,7 @@ export default function AdminPresales() {
   const usageQuery = trpc.admin.presales.usage.useQuery(
     { windowDays: usageWindowDays },
     {
-      enabled: isAdmin && status.configured,
+      enabled: isAdmin,
       retry: false,
       refetchOnWindowFocus: false,
     },
@@ -162,10 +153,6 @@ export default function AdminPresales() {
   }, [apiKey]);
 
   useEffect(() => {
-    setAllowIncompleteHistory(false);
-  }, [status.version]);
-
-  useEffect(() => {
     if (!websitePolicy) return;
     setPolicyLimit(String(websitePolicy.limit));
     setPolicyWarningPercent(
@@ -188,19 +175,12 @@ export default function AdminPresales() {
     }
     try {
       if (status.configured) {
-        await replaceMutation.mutateAsync({
-          apiKey: value,
-          allowIncompleteHistory,
-        });
+        await replaceMutation.mutateAsync({ apiKey: value });
       } else {
-        await setMutation.mutateAsync({
-          apiKey: value,
-          allowIncompleteHistory,
-        });
+        await setMutation.mutateAsync({ apiKey: value });
       }
       setApiKey("");
       setShowApiKey(false);
-      setAllowIncompleteHistory(false);
       setConnectionState("success");
       await refreshAll();
       toast.success(
@@ -233,7 +213,6 @@ export default function AdminPresales() {
       toast.success("售前服务连接正常", { description: `${latency}ms` });
     } catch (error) {
       setLatencyMs(null);
-      setAllowIncompleteHistory(false);
       setConnectionState("error");
       toast.error("连接测试失败", {
         description:
@@ -329,10 +308,9 @@ export default function AdminPresales() {
   }
 
   const recentWebsiteTasks = usageQuery.data?.recentWebsiteTasks ?? [];
-  const keyTotalUsed = usageQuery.data?.keyTotalUsed ?? 0;
-  const websiteUsed = usageQuery.data?.websiteUsed ?? 0;
-  const usageComplete = usageQuery.data?.complete !== false;
-  const attributionComplete = usageQuery.data?.attributionComplete === true;
+  const keyPoolTotalUsed = usageQuery.data?.keyPoolTotalUsed ?? null;
+  const rollingWebsiteUsed = usageQuery.data?.rollingWebsiteUsed ?? 0;
+  const keyHealth = usageQuery.data?.keyHealth ?? "unconfigured";
   const usageLimit = Math.max(
     1,
     Number(websitePolicy?.limit) || DEFAULT_API_KEY_USAGE_LIMIT,
@@ -345,17 +323,15 @@ export default function AdminPresales() {
     ),
   );
   const usageDisplay = presalesUsageDisplayState({
-    complete: usageComplete,
-    attributionComplete,
-    keyTotalUsed,
-    websiteUsed,
+    keyPoolTotalUsed,
+    rollingWebsiteUsed,
     limit: usageLimit,
   });
-  const usageTone = !usageComplete
+  const usageTone = keyPoolTotalUsed === null
     ? "unavailable"
-    : keyTotalUsed >= usageLimit
+    : keyPoolTotalUsed >= usageLimit
       ? "critical"
-      : keyTotalUsed >= usageLimit * warningRatio
+      : keyPoolTotalUsed >= usageLimit * warningRatio
         ? "warning"
         : "normal";
 
@@ -493,22 +469,10 @@ export default function AdminPresales() {
                   </div>
 
                   {status.configured && (
-                    <label className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2.5 text-xs leading-5 text-amber-950">
-                      <input
-                        type="checkbox"
-                        className="mt-1"
-                        checked={allowIncompleteHistory}
-                        onChange={(event) =>
-                          setAllowIncompleteHistory(event.target.checked)
-                        }
-                        disabled={saving}
-                      />
-                      <span>
-                        旧 Key
-                        已失效时允许应急替换；未完整扫描的历史用量会显示为“不可用”，不会记为
-                        0。
-                      </span>
-                    </label>
+                    <p className="rounded-xl border border-border/60 bg-muted/30 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
+                      更换 Key 不会清空本地近 30 天滚动用量；新 Key
+                      验证后会异步刷新连接状态和积分池总额。
+                    </p>
                   )}
 
                   {connectionState !== "idle" && (
@@ -592,21 +556,12 @@ export default function AdminPresales() {
                   天积分使用
                 </CardTitle>
                 <p className="text-sm text-muted-foreground">
-                  统计当前凭据所属上游积分池的全部消耗，并单独归因官网任务用量。
+                  官网任务按本地账本滚动累计；当前 Key
+                  的上游积分池总额与连接状态单独展示。
                 </p>
               </CardHeader>
               <CardContent className="p-5 sm:p-6">
-                {!status.configured ? (
-                  <div className="flex min-h-64 flex-col items-center justify-center text-center">
-                    <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-                      <Coins className="h-5 w-5" />
-                    </div>
-                    <p className="text-sm font-medium">尚无可用统计</p>
-                    <p className="mt-1 max-w-xs text-xs leading-relaxed text-muted-foreground">
-                      验证并启用售前 API Key 后，这里会显示积分消耗和最近任务。
-                    </p>
-                  </div>
-                ) : usageQuery.isLoading ? (
+                {usageQuery.isLoading ? (
                   <div className="space-y-3">
                     <Skeleton className="h-24 rounded-xl" />
                     {[0, 1, 2].map((item) => (
@@ -631,15 +586,15 @@ export default function AdminPresales() {
                   </div>
                 ) : (
                   <div className="space-y-5">
-                    {!usageComplete && (
+                    {keyHealth !== "connected" && (
                       <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-                        历史 Key 或任务分页未能完整读取。近 30
-                        天总量与百分比已隐藏，避免把部分结果误认为准确用量。
-                      </div>
-                    )}
-                    {usageComplete && !attributionComplete && (
-                      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-                        上游积分池总额与百分比已完整读取，但历史任务未能全部归因到官网。官网任务用量已隐藏，避免把部分结果误认为准确值。
+                        {keyHealth === "invalid_or_revoked"
+                          ? "当前 Key 无法连接或已失效；下方官网近 30 天自用仍按本地记录展示。"
+                          : keyHealth === "unconfigured"
+                            ? "当前未配置 Key；下方官网近 30 天自用仍按本地记录展示。"
+                            : keyHealth === "pending"
+                              ? "当前 Key 正在等待刷新；下方官网近 30 天自用不受影响。"
+                              : "当前 Key 同步失败；下方官网近 30 天自用仍按本地记录展示。"}
                       </div>
                     )}
                     <div
@@ -707,7 +662,7 @@ export default function AdminPresales() {
 
                     <div className="rounded-xl border border-border/60 bg-background/55 px-4 py-3">
                       <p className="text-xs text-muted-foreground">
-                        其中官网前台任务使用
+                        官网前台近 30 天本地已记录
                       </p>
                       <p className="mt-1 text-2xl font-semibold text-foreground">
                         {usageDisplay.websiteUsedLabel}

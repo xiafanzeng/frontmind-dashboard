@@ -250,6 +250,7 @@ export async function buildKnowledgeBasePrompt({
   attachments,
   prefillKnowledgeSnapshot,
   protocolOperation,
+  materializedCoordinates,
   treePolicyVersion,
 }: {
   conversationId?: string;
@@ -263,8 +264,45 @@ export async function buildKnowledgeBasePrompt({
     operationId: string;
     turnId: string;
   };
+  materializedCoordinates?: {
+    buildId: string;
+    generation: number;
+    contentVersion: 1;
+  };
   treePolicyVersion?: number;
 }) {
+  const isV5 = protocolOperation?.skillVersion === "5";
+  if (isV5) {
+    if (!materializedCoordinates) {
+      throw new KnowledgeBaseEnterpriseIdentityError(
+        "ENTERPRISE_IDENTITY_MISMATCH",
+        "知识库物化任务缺少构建坐标",
+      );
+    }
+    return [
+      "用户已授权 FrontMind Dashboard 创建全量物化企业知识库。",
+      `完整读取 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME} 内的 SKILL.md、references/materialized-working-set.md 和校验器。`,
+      "执行且只执行 operation=materialize_initial_bundle。一次生成全部 30–115 个真实叶子、全部正文、证据账本和资产；不得只生成首节点。",
+      "最终只返回一个助手 ZIP 附件；不得返回 Markdown 正文、进度信封、Structured Output、第二个文件或等待用户确认。",
+      `operationId=${protocolOperation.operationId}`,
+      `buildId=${materializedCoordinates.buildId}`,
+      `generation=${materializedCoordinates.generation}`,
+      `contentVersion=${materializedCoordinates.contentVersion}`,
+      `skillName=socratic-kb-builder；skillVersion=5`,
+      `company.name=${companyName}`,
+      `company.website=${companyWebsite || "null"}`,
+      `treePolicyVersion=${treePolicyVersion ?? 2}`,
+      `ZIP 文件名必须为 frontmind-kb-bundle-${protocolOperation.operationId}.zip，根目录必须含 BUNDLE.json。`,
+      `运行 python3 scripts/validate_working_set.py frontmind-kb-bundle-${protocolOperation.operationId}.zip；只有输出 VALID frontmind.kb-working-set.v1 后才能把同一 ZIP 作为唯一附件返回。`,
+      "只有 customerAttachments 中明确列出的文件属于客户事实资料；应用管理的 Skill、instructions 与 prefill 只用于执行合同。",
+      "完整读取全部客户资料，并使用普通浏览/搜索补足证据；不得输出过程回执。",
+      `customerAttachments=${JSON.stringify(attachments.map((item) => item.filename))}`,
+      operatorNotes ? `operatorNotes=${operatorNotes}` : "operatorNotes=null",
+      prefillKnowledgeSnapshot
+        ? `prefillSnapshot=${KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME}`
+        : "prefillSnapshot=null",
+    ].join("\n");
+  }
   const isV4 = protocolOperation?.skillVersion === "4";
   const isDeepTree = isV4 && treePolicyVersion === 2;
   const protocolIdentity = isV4

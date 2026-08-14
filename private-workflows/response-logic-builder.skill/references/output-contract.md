@@ -1,13 +1,11 @@
-# Dashboard field mapping
+# Dashboard structured-output contract
 
-The dashboard maps the exact Markdown headings to these persisted fields:
+The v2 task schema requires exactly these string fields:
 
-| Markdown heading  | Field        |
-| ----------------- | ------------ |
-| 用户真实关心      | `concern`    |
-| 核心结论/执行口径 | `conclusion` |
-| 企业材料/官方依据 | `facts`      |
-| 回答边界/禁止表达 | `boundaries` |
+- `concern`
+- `conclusion`
+- `facts`
+- `boundaries`
 
 `pending` and `references` remain only as backward-compatible persisted fields
 for older records. New model output does not create or display either section.
@@ -19,6 +17,5 @@ their provenance only with `引自知识库文档`. Uploaded images and files ar
 incorporated directly and must not trigger a placement, caption, copyright,
 public-scope, or authorization question.
 
-The four-section Markdown must be the final assistant message body. A short
-message plus an attached Markdown file is not the normal contract, and an
-output file must never be the only copy of the structured response.
+The structured result is the only accepted result. Assistant prose, code
+fences, task metadata, and output attachments are never parsed as a fallback.

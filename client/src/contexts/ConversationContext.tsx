@@ -145,6 +145,7 @@ export interface KnowledgeBaseClientState {
   initialized: boolean;
   generation: number;
   stateEpoch: number;
+  contentVersion?: number;
   /** Latest immutable receipt sequence accepted for display in this conversation. */
   displaySequence?: number;
   syncState?: KnowledgeBaseSyncState;
@@ -885,6 +886,17 @@ function knowledgeBasePresentationMessage(
           /image|logo/i.test(resource.kind)),
     )
     .map(({ src, alt }) => ({ src, alt }));
+  const evidenceFiles = (presentation.resources ?? [])
+    .filter(
+      (resource) =>
+        resource.kind === "working_set_evidence" &&
+        resource.sameOriginUrl.startsWith("/"),
+    )
+    .map((resource) => ({
+      fileUrl: resource.sameOriginUrl,
+      fileName: resource.filename,
+      mimeType: resource.mimeType,
+    }));
 
   return {
     id: stableKnowledgeBaseMessageId(presentation.presentationKey),
@@ -895,6 +907,7 @@ function knowledgeBasePresentationMessage(
     ),
     timestamp: presentation.acceptedAt ?? Date.now(),
     inlineImages: inlineImages.length > 0 ? inlineImages : undefined,
+    outputFiles: evidenceFiles.length > 0 ? evidenceFiles : undefined,
     knowledgeBase: {
       schemaVersion: 1,
       kind: "presentation",
@@ -1189,6 +1202,10 @@ export function applyKnowledgeBaseObservation(
       initialized: true,
       generation: observation.generation,
       stateEpoch: observation.stateEpoch,
+      contentVersion:
+        observation.interaction.progress?.build.contentVersion ??
+        conversation.knowledgeBase?.contentVersion ??
+        0,
       displaySequence,
       syncState: observation.syncState,
       processingPhase: observation.processingPhase,
@@ -1225,6 +1242,7 @@ export function applyKnowledgeBaseObservation(
 export interface KnowledgeBaseReplySnapshot {
   generation: number;
   stateEpoch: number;
+  contentVersion: number;
   revision: number;
   leafId: string;
   presentationKey: string;
@@ -1267,6 +1285,7 @@ export function currentKnowledgeBaseReplySnapshot(
   return {
     generation: knowledgeBase.generation,
     stateEpoch: knowledgeBase.stateEpoch,
+    contentVersion: knowledgeBase.contentVersion ?? 0,
     revision: knowledgeBase.revision,
     leafId: knowledgeBase.leafId,
     presentationKey: knowledgeBase.presentationKey,

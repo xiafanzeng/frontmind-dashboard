@@ -140,7 +140,10 @@ import {
   assertKnowledgeBaseCustomerUploadVisualBindings,
   verifiedKnowledgeBasePackageUploadEvidenceForBuild,
 } from "./knowledge-base-customer-upload";
-import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
+import {
+  knowledgeBasePackageWriterTaskId,
+  knowledgeBasePublicationBindingHash,
+} from "./knowledge-base-publication-binding";
 import {
   isDashboardOwnedKnowledgePackageBuild,
   readDashboardOwnedKnowledgePackage,
@@ -6513,8 +6516,9 @@ export async function downloadArchiveBytes(input: {
       }
       return { buffer, filename };
     }
-    downloadUrl = `${input.baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`;
-    headers = upstreamHeaders(input.apiKey);
+    throw new Error(
+      "知识库 ZIP 尚未本地化；旧 Provider 文件不再可读，请批准重置后重新构建",
+    );
   } else if (input.descriptor.url) {
     downloadUrl = assertSafeExternalUrl(input.descriptor.url);
   }
@@ -6820,12 +6824,7 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       res.json({ kind: "knowledge", snapshot, idempotent: true });
       return;
     }
-    const taskId = String(
-      build.packageTaskId ||
-        build.canonicalTaskId ||
-        build.upstreamTaskId ||
-        "",
-    );
+    const taskId = knowledgeBasePackageWriterTaskId(build);
     const hasDurablePackage = Boolean(
       build.packageStorageKey &&
         build.packageArchiveSha256 &&
@@ -6854,70 +6853,9 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
       };
       sourceArtifactHash = knowledgeBasePublicationBindingHash(build)!;
     } else {
-      // Only pre-state-machine v1 imports retain the upstream compatibility
-      // path. Builder v3/v4 publication must consume bytes that reconcile
-      // already validated and persisted under the build generation.
-      if (
-        build.skillVersion === "3" ||
-        build.skillVersion === "4" ||
-        !taskId ||
-        taskId !== build.upstreamTaskId ||
-        build.packageRevision !== build.revision ||
-        !build.packageOutputItemId ||
-        !build.packageDescriptorHash
-      ) {
-        throw new Error("最终知识库文件尚未完成不可变持久化与版本绑定");
-      }
-      const credential = await getCredentialForUpstreamResource(
-        targetUserId,
-        "task",
-        taskId,
+      throw new Error(
+        "旧知识库构建不再续跑或回读 Provider；请批准重置后使用 v2 全量物化重新构建",
       );
-      if (!credential)
-        throw new Error("知识库任务不属于当前用户或 API Key 已失效");
-      publishLogSecrets.push(credential.apiKey);
-
-      const baseUrl = getUpstreamBaseUrl(req);
-      const taskResponse = await axios.get(
-        `${baseUrl}/v1/tasks/${encodeURIComponent(taskId)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          proxy: false,
-          timeout: 120_000,
-          maxContentLength: 50 * 1024 * 1024,
-          validateStatus: () => true,
-        },
-      );
-      if (taskResponse.status !== 200) {
-        throw new Error(`读取知识库任务结果失败 (${taskResponse.status})`);
-      }
-      const task = taskResponse.data?.task || taskResponse.data || {};
-      const returnedTaskId = String(task.id || task.task_id || "");
-      if (returnedTaskId !== taskId) {
-        throw new Error("读取到的知识库任务与当前完成版本不匹配");
-      }
-      if (task.status === "failed" || task.status === "error") {
-        throw new Error("知识库任务执行失败，无法发布");
-      }
-      const output = Array.isArray(task.output) ? task.output : [];
-      const matchingDescriptors = collectKnowledgeArchiveDescriptors(
-        output,
-      ).filter(
-        (candidate) =>
-          candidate.outputItemId === build.packageOutputItemId &&
-          knowledgeArchiveDescriptorHash(candidate) ===
-            build.packageDescriptorHash &&
-          (!build.packageFileId || candidate.fileId === build.packageFileId),
-      );
-      if (matchingDescriptors.length !== 1) {
-        throw new Error("任务结果中无法唯一确认当前版本的知识库 ZIP");
-      }
-      downloaded = await downloadArchiveBytes({
-        descriptor: matchingDescriptors[0]!,
-        apiKey: credential.apiKey,
-        baseUrl,
-      });
-      sourceArtifactHash = build.packageDescriptorHash;
     }
     const archiveHash = createHash("sha256")
       .update(downloaded.buffer)
@@ -6943,9 +6881,15 @@ router.post("/knowledge/publish", async (req: FrontMindRequest, res) => {
             companyName: build.companyName,
           },
           nodes: packageNodes,
-          storeAsset: async ({ path: assetPath, buffer }) => {
-            const extension = path.extname(assetPath).toLowerCase();
-            if (!imageMimeByExtension[extension]) {
+          storeAsset: async ({ path: assetPath, mimeType, buffer }) => {
+            const declaredExtension = path.extname(assetPath).toLowerCase();
+            const extension =
+              imageMimeByExtension[declaredExtension] === mimeType
+                ? declaredExtension
+                : Object.entries(imageMimeByExtension).find(
+                    ([, candidateMimeType]) => candidateMimeType === mimeType,
+                  )?.[0];
+            if (!extension) {
               throw new Error("本地知识库包包含不支持的资源格式");
             }
             const key = `${randomUUID()}${extension}`;

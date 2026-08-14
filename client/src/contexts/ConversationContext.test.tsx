@@ -233,6 +233,7 @@ describe("knowledge-base reply snapshots", () => {
       generation: 3,
       stateEpoch: 9,
       revision: 7,
+      contentVersion: 0,
       leafId: "1.8",
       presentationKey: "presentation-7",
       presentationTurnId: "turn-7",

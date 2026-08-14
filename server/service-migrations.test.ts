@@ -16,7 +16,7 @@ const knowledgeBaseMysqlAcceptance = path.resolve(
 );
 const knowledgeBaseMysqlE2eAcceptance = path.resolve(
   process.cwd(),
-  "scripts/knowledge-base-mysql-e2e-acceptance.test.ts",
+  "scripts/knowledge-base-manus-v2-mysql-e2e-acceptance.test.ts",
 );
 const apiUsageMigrationVerifier = path.resolve(
   process.cwd(),
@@ -119,6 +119,7 @@ describe("service portal migration chain", () => {
       "0059_delivery_ticket_workflow_contracts",
       "0060_knowledge_base_tree_policy",
       "0061_knowledge_base_resilient_manus_v2",
+      "0062_hard_glorian",
     ]);
   });
 
@@ -170,6 +171,142 @@ describe("service portal migration chain", () => {
       snapshot.tables.knowledge_base_builds.foreignKeys
         .kb_builds_canonical_credential_fk,
     ).toBeUndefined();
+  });
+
+  it("adds the v2 operation and materialized knowledge-base stores without contract SQL", async () => {
+    const migrationSql = await migration("0062_hard_glorian.sql");
+    for (const table of [
+      "agent_operations",
+      "agent_tasks",
+      "agent_events",
+      "local_assets",
+      "provider_file_leases",
+      "artifacts",
+      "knowledge_base_executions",
+      "knowledge_base_working_sets",
+    ]) {
+      expect(migrationSql).toContain(`CREATE TABLE \`${table}\``);
+    }
+    expect(migrationSql).toContain(
+      "ALTER TABLE `api_credentials` ADD `agent_profile` varchar(32)",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `knowledge_base_build_nodes` ADD `content_version` int unsigned",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `knowledge_base_builds` ADD `execution_mode` varchar(32)",
+    );
+    expect(migrationSql).toContain(
+      "ALTER TABLE `knowledge_base_builds` ADD `content_version` int unsigned",
+    );
+    expect(migrationSql).not.toMatch(
+      /ALTER TABLE `(?:api_credentials|knowledge_base_build_nodes|knowledge_base_builds)` ADD `(?:agent_profile|execution_mode|content_version)` [^;]*\bNOT NULL\b/iu,
+    );
+    expect(migrationSql).toContain("`create_marker` varchar(128) NOT NULL");
+    expect(migrationSql).toContain("`provider_file_id` varchar(512)");
+    expect(migrationSql).toContain("`storage_key_hash` varchar(64) NOT NULL");
+    expect(migrationSql).toContain(
+      "CONSTRAINT `local_assets_scope_storage_uq` UNIQUE(`scope`,`storage_key_hash`)",
+    );
+    expect(migrationSql).not.toContain("UNIQUE(`scope`,`storage_key`)");
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+    expect(migrationSql).not.toMatch(/\bFOREIGN KEY\b/iu);
+
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0062_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(snapshot.tables.agent_tasks.columns.create_marker.type).toBe(
+      "varchar(128)",
+    );
+    expect(
+      snapshot.tables.provider_file_leases.columns.provider_file_id.type,
+    ).toBe("varchar(512)");
+    expect(snapshot.tables.api_credentials.columns.agent_profile).toMatchObject(
+      { type: "varchar(32)", notNull: false },
+    );
+    expect(
+      snapshot.tables.knowledge_base_build_nodes.columns.content_version,
+    ).toMatchObject({ type: "int unsigned", notNull: false });
+    expect(
+      snapshot.tables.knowledge_base_builds.columns.execution_mode,
+    ).toMatchObject({ type: "varchar(32)", notNull: false });
+    expect(
+      snapshot.tables.knowledge_base_builds.columns.content_version,
+    ).toMatchObject({ type: "int unsigned", notNull: false });
+    expect(snapshot.tables.local_assets.columns.storage_key.type).toBe(
+      "varchar(1024)",
+    );
+    expect(snapshot.tables.local_assets.columns.storage_key_hash).toMatchObject(
+      { type: "varchar(64)", notNull: true },
+    );
+    expect(
+      snapshot.tables.local_assets.indexes.local_assets_scope_storage_uq,
+    ).toMatchObject({
+      isUnique: true,
+      columns: ["scope", "storage_key_hash"],
+    });
+  });
+
+  it("keeps every 0062 index within the InnoDB 3072-byte key limit", async () => {
+    const migrationSql = await migration("0062_hard_glorian.sql");
+    const tableColumns = new Map<string, Map<string, number>>();
+    const indexes: Array<{ table: string; name: string; columns: string[] }> =
+      [];
+    for (const match of migrationSql.matchAll(
+      /CREATE TABLE `([^`]+)` \(([\s\S]*?)\n\);/gu,
+    )) {
+      const [, tableName, body] = match;
+      const columns = new Map<string, number>();
+      for (const column of body!.matchAll(/^\s*`([^`]+)`\s+([^,\n]+)/gmu)) {
+        const definition = column[2]!;
+        const varchar = /\bvarchar\((\d+)\)/iu.exec(definition);
+        const bytes = varchar
+          ? Number(varchar[1]) * 4
+          : /\bbigint\b/iu.test(definition)
+            ? 8
+            : /\b(?:int|timestamp|enum)\b/iu.test(definition)
+              ? 4
+              : 16;
+        columns.set(column[1]!, bytes);
+      }
+      tableColumns.set(tableName!, columns);
+      for (const index of body!.matchAll(
+        /CONSTRAINT `([^`]+)` (?:PRIMARY KEY|UNIQUE)\(([^)]+)\)/gu,
+      )) {
+        indexes.push({
+          table: tableName!,
+          name: index[1]!,
+          columns: [...index[2]!.matchAll(/`([^`]+)`/gu)].map(
+            (column) => column[1]!,
+          ),
+        });
+      }
+    }
+    for (const index of migrationSql.matchAll(
+      /CREATE (?:UNIQUE )?INDEX `([^`]+)` ON `([^`]+)` \(([^)]+)\)/gu,
+    )) {
+      indexes.push({
+        table: index[2]!,
+        name: index[1]!,
+        columns: [...index[3]!.matchAll(/`([^`]+)`/gu)].map(
+          (column) => column[1]!,
+        ),
+      });
+    }
+    const oversized = indexes.flatMap((index) => {
+      const columns = tableColumns.get(index.table);
+      const estimatedBytes = index.columns.reduce(
+        (sum, column) => sum + (columns?.get(column) ?? 3_073),
+        0,
+      );
+      return estimatedBytes > 3_072 ? [{ ...index, estimatedBytes }] : [];
+    });
+    expect(oversized).toEqual([]);
   });
 
   it("adds an independent fixed-point Jenova tracking ledger without migrating Monitor data", async () => {
@@ -598,16 +735,17 @@ describe("service portal migration chain", () => {
     expect(harness).toContain("claimKnowledgeBaseTurnForRecovery");
     expect(harness).toContain("FOR UPDATE");
     expect(harness).toContain("ER_DUP_ENTRY");
-    expect(e2eHarness).toContain("KB_MYSQL_E2E_ACCEPTANCE_COMPLETE");
-    expect(e2eHarness).toContain("frontmind-knowledge-base.zip");
-    for (const migrationTag of [
-      "0045_knowledge_base_state_machine",
-      "0046_api_usage_snapshot_claims",
-      "0047_api_usage_task_ledger",
-      "0048_api_usage_coverage_claims",
-    ]) {
-      expect(e2eHarness).toContain(migrationTag);
-    }
+    expect(e2eHarness).toContain(
+      "KB_MATERIALIZED_MYSQL_E2E_ACCEPTANCE_COMPLETE",
+    );
+    expect(e2eHarness).toContain("operation=materialize_initial_bundle");
+    expect(e2eHarness).toContain("MATERIALIZED_LEAF_COUNT = 30");
+    expect(e2eHarness).toContain('postKnowledgeBase("/confirm"');
+    expect(e2eHarness).toContain("fakeProvider.rejectProviderCalls = true");
+    expect(e2eHarness).toContain("runKnowledgeBasePackageSweep");
+    expect(e2eHarness).toContain('entry.tag === "0062_hard_glorian"');
+    expect(e2eHarness).not.toContain("/v1/tasks");
+    expect(e2eHarness).toContain("taskSendBodies).toHaveLength(0)");
   });
 
   it("drops the delivery-role foreign keys by their executable migration names", async () => {

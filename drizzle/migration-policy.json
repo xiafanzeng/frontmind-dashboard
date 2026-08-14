@@ -14,6 +14,7 @@
     "0058_jenova_brand_tracking": "expand",
     "0059_delivery_ticket_workflow_contracts": "contract",
     "0060_knowledge_base_tree_policy": "expand",
-    "0061_knowledge_base_resilient_manus_v2": "expand"
+    "0061_knowledge_base_resilient_manus_v2": "expand",
+    "0062_hard_glorian": "expand"
   }
 }

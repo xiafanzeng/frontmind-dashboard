@@ -493,6 +493,25 @@ describe("knowledge-base model output boundary", () => {
     ).toBe("## 1.2 公司主体\n\n唯一的下一节点正文。");
   });
 
+  it("never guesses leaf ids from product, standard, or API headings", () => {
+    for (const heading of [
+      "GMS-11A",
+      "GMS_11A",
+      "ISO-9001",
+      "API-V2",
+      "SKU.2026",
+    ]) {
+      expect(
+        projectKnowledgeBasePresentationMarkdown({
+          markdown: `### ${heading}\n\n产品或标准说明。`,
+          leafId: "3.8",
+          leafTitle: "产品能力",
+          leafIds: ["3.7", "3.8", "3.9"],
+        }),
+      ).toBe(`## 3.8 产品能力\n\n### ${heading}\n\n产品或标准说明。`);
+    }
+  });
+
   it("rejects duplicate sections and a title that drifted from the manifest", () => {
     expect(() =>
       projectKnowledgeBasePresentationMarkdown({

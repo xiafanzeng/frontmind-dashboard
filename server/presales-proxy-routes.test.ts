@@ -492,9 +492,8 @@ describe("presales create-time upload capability", () => {
     expect(get).not.toHaveBeenCalled();
   });
 
-  it("streams JSON only when the assistant output is bound to its parent task", async () => {
+  it("fails closed when a task-bound assistant output was not localized", async () => {
     const fileId = "assessment-json-output";
-    const body = Buffer.from('{"schemaVersion":2,"status":"ok"}');
     vi.mocked(getPresalesCredentialForResource).mockResolvedValue({
       id: "credential-1",
       version: 1,
@@ -516,27 +515,24 @@ describe("presales create-time upload capability", () => {
         createdAt: new Date(),
       },
     });
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "content-length": String(body.length),
-        "content-disposition": 'attachment; filename="raw-output.json"',
-      },
-      data: Readable.from([body]),
-    });
+    const get = vi.spyOn(axios, "get");
 
     await withServer(async (baseUrl) => {
       const response = await fetch(
         `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
         { headers: { "x-frontmind-service-token": token } },
       );
-      expect(response.status).toBe(200);
-      expect(response.headers.get("content-type")).toBe("application/json");
-      expect(Buffer.from(await response.arrayBuffer())).toEqual(body);
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "CONTENT_UNAVAILABLE",
+          retryable: false,
+          recoveryAction: "reupload",
+        },
+      });
     });
 
-    expect(get).toHaveBeenCalledOnce();
+    expect(get).not.toHaveBeenCalled();
     expect(await readStoredPresalesFile(fileId)).toBeNull();
   });
 
@@ -773,13 +769,12 @@ describe("presales create-time upload capability", () => {
     });
   });
 
-  it("uses the DB user-upload deadline when the local manifest is missing", async () => {
+  it("uses the DB user-upload deadline but never recovers missing bytes from Provider", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-05T00:00:00.000Z"));
     const fileId = "manifest-missing-user-upload";
     const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
     const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
-    const body = Buffer.from("recovered from authoritative content endpoint");
     presalesContentState = {
       contentSource: "user_upload",
       uploadReservedAt: uploadedAt,
@@ -787,32 +782,26 @@ describe("presales create-time upload capability", () => {
       contentExpiresAt,
       contentDeletedAt: null,
     };
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      headers: {
-        "content-type": "application/pdf",
-        "content-length": String(body.length),
-      },
-      data: Readable.from([body]),
-    });
+    const get = vi.spyOn(axios, "get");
 
     await withServer(async (baseUrl) => {
       const response = await fetch(
         `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
         { headers: { "x-frontmind-service-token": token } },
       );
-      expect(response.status).toBe(200);
-      expect(Buffer.from(await response.arrayBuffer())).toEqual(body);
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "CONTENT_UNAVAILABLE",
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: contentExpiresAt.getTime(),
+        },
+      });
     });
 
-    expect(get.mock.calls[0]?.[0]).toContain(
-      `/v1/files/${encodeURIComponent(fileId)}/content`,
-    );
-    expect(await readPresalesFileLifecycle(fileId)).toMatchObject({
-      state: "stored",
-      uploadedAt,
-      contentExpiresAt,
-    });
+    expect(get).not.toHaveBeenCalled();
+    expect(await readPresalesFileLifecycle(fileId)).toBeNull();
   });
 
   it("fails closed for a historical resource with no provenance and no manifest", async () => {
@@ -845,7 +834,7 @@ describe("presales create-time upload capability", () => {
     expect(get).not.toHaveBeenCalled();
   });
 
-  it("isolates a partial local ledger and recovers with the valid DB deadline", async () => {
+  it("isolates a partial local ledger without falling back to Provider bytes", async () => {
     const fileId = "partial-retention-ledger";
     const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
     const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
@@ -869,39 +858,33 @@ describe("presales create-time upload capability", () => {
     >;
     delete manifest.contentExpiresAt;
     await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
-    const recovered = Buffer.from("recovered after ledger isolation");
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      headers: {
-        "content-type": "application/pdf",
-        "content-length": String(recovered.length),
-      },
-      data: Readable.from([recovered]),
-    });
+    const get = vi.spyOn(axios, "get");
 
     await withServer(async (baseUrl) => {
       const response = await fetch(
         `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
         { headers: { "x-frontmind-service-token": token } },
       );
-      expect(response.status).toBe(200);
-      expect(Buffer.from(await response.arrayBuffer())).toEqual(recovered);
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "CONTENT_UNAVAILABLE",
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: contentExpiresAt.getTime(),
+        },
+      });
     });
 
-    expect(get).toHaveBeenCalledOnce();
-    expect(await readPresalesFileLifecycle(fileId)).toMatchObject({
-      state: "stored",
-      uploadedAt,
-      contentExpiresAt,
-    });
+    expect(get).not.toHaveBeenCalled();
+    expect(await readPresalesFileLifecycle(fileId)).toBeNull();
   });
 
-  it("recovers a SHA-damaged local copy only from encoded /content and strips auth on HTTPS redirects", async () => {
+  it("rejects a SHA-damaged local copy without calling a Provider content endpoint", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-05T00:00:00.000Z"));
     const fileId = "file # 中文 📄";
     const original = Buffer.from("original durable bytes");
-    const recovered = Buffer.from("recovered authoritative bytes");
     const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
     const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
     await storePresalesTestFile({
@@ -945,70 +928,26 @@ describe("presales create-time upload capability", () => {
         };
       },
     );
-    const redirectUrl = "https://objects.example.test/recovered.pdf";
-    const get = vi
-      .spyOn(axios, "get")
-      .mockResolvedValueOnce({
-        status: 302,
-        headers: { location: redirectUrl },
-        data: Readable.from([]),
-      })
-      .mockResolvedValueOnce({
-        status: 200,
-        headers: {
-          "content-type": "application/pdf",
-          "content-length": String(recovered.length),
-          "content-disposition":
-            "attachment; filename*=UTF-8''recovered%20document.pdf",
-        },
-        data: Readable.from([recovered]),
-      });
+    const get = vi.spyOn(axios, "get");
 
     await withServer(async (baseUrl) => {
       const response = await fetch(
         `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
         { headers: { "x-frontmind-service-token": token } },
       );
-      expect(response.status).toBe(200);
-      expect(Buffer.from(await response.arrayBuffer())).toEqual(recovered);
-      expect(response.headers.get("content-disposition")).toContain(
-        "recovered%20document.pdf",
-      );
+      expect(response.status).toBe(410);
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "CONTENT_UNAVAILABLE",
+          retryable: false,
+          recoveryAction: "reupload",
+          expiresAt: contentExpiresAt.getTime(),
+        },
+      });
     });
 
-    expect(get).toHaveBeenCalledTimes(2);
-    expect(get.mock.calls[0]?.[0]).toMatch(
-      new RegExp(
-        `/v1/files/${encodeURIComponent(fileId).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/content$`,
-      ),
-    );
-    expect(get.mock.calls[0]?.[1]).toMatchObject({
-      maxRedirects: 0,
-      headers: {
-        API_KEY: "sk-upload-file",
-        Authorization: "Bearer sk-upload-file",
-      },
-    });
-    expect(get.mock.calls[1]?.[0]).toBe(redirectUrl);
-    expect(get.mock.calls[1]?.[1]).toMatchObject({ maxRedirects: 0 });
-    expect(get.mock.calls[1]?.[1]).not.toHaveProperty("headers.API_KEY");
-    expect(get.mock.calls[1]?.[1]).not.toHaveProperty("headers.Authorization");
-    expect(get.mock.calls.map(([url]) => String(url)).join("\n")).not.toContain(
-      "upload_url",
-    );
-
-    const stored = await readStoredPresalesFile(fileId);
-    expect(stored).toMatchObject({
-      filename: "recovered document.pdf",
-      sizeBytes: recovered.length,
-      uploadedAt,
-      contentExpiresAt,
-    });
-    const storedChunks: Buffer[] = [];
-    for await (const chunk of stored!.createReadStream()) {
-      storedChunks.push(Buffer.from(chunk));
-    }
-    expect(Buffer.concat(storedChunks)).toEqual(recovered);
+    expect(get).not.toHaveBeenCalled();
+    expect(await readStoredPresalesFile(fileId)).toBeNull();
   });
 
   it("keeps a DB deletion tombstone so GET cannot recover a deleted user upload", async () => {
@@ -1361,35 +1300,17 @@ describe("presales create-time upload capability", () => {
   it.each([
     {
       upstreamStatus: 403,
-      responseStatus: 403,
-      code: "SOURCE_FORBIDDEN",
-      retryable: false,
-      recoveryAction: "contact_admin",
     },
     {
       upstreamStatus: 404,
-      responseStatus: 410,
-      code: "SOURCE_UNAVAILABLE",
-      retryable: false,
-      recoveryAction: "reupload",
     },
     {
       upstreamStatus: 503,
-      responseStatus: 503,
-      code: "SOURCE_DOWNLOAD_FAILED",
-      retryable: true,
-      recoveryAction: "retry",
     },
   ])(
-    "returns $code for upstream status $upstreamStatus",
-    async ({
-      upstreamStatus,
-      responseStatus,
-      code,
-      retryable,
-      recoveryAction,
-    }) => {
-      vi.spyOn(axios, "get").mockResolvedValue({
+    "ignores a mocked legacy Provider status $upstreamStatus when local bytes are absent",
+    async ({ upstreamStatus }) => {
+      const get = vi.spyOn(axios, "get").mockResolvedValue({
         status: upstreamStatus,
         headers: {},
         data: { secret: "must-not-leak" },
@@ -1399,18 +1320,23 @@ describe("presales create-time upload capability", () => {
         const response = await fetch(`${baseUrl}/files/file-1/content`, {
           headers: { "x-frontmind-service-token": token },
         });
-        expect(response.status).toBe(responseStatus);
+        expect(response.status).toBe(410);
         const body = await response.json();
         expect(body).toMatchObject({
-          error: { code, retryable, recoveryAction },
+          error: {
+            code: "CONTENT_UNAVAILABLE",
+            retryable: false,
+            recoveryAction: "reupload",
+          },
         });
         expect(JSON.stringify(body)).not.toContain("must-not-leak");
       });
+      expect(get).not.toHaveBeenCalled();
     },
   );
 
-  it("rejects an empty upstream file body", async () => {
-    vi.spyOn(axios, "get").mockResolvedValue({
+  it("does not inspect an empty mocked Provider body when local bytes are absent", async () => {
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
       status: 200,
       headers: { "content-type": "application/zip" },
       data: Readable.from([]),
@@ -1420,19 +1346,20 @@ describe("presales create-time upload capability", () => {
       const response = await fetch(`${baseUrl}/files/file-1/content`, {
         headers: { "x-frontmind-service-token": token },
       });
-      expect(response.status).toBe(422);
+      expect(response.status).toBe(410);
       await expect(response.json()).resolves.toMatchObject({
         error: {
-          code: "SOURCE_CONTENT_INVALID",
+          code: "CONTENT_UNAVAILABLE",
           retryable: false,
           recoveryAction: "reupload",
         },
       });
     });
+    expect(get).not.toHaveBeenCalled();
   });
 
-  it("rejects an upstream file whose declared body exceeds the archive limit", async () => {
-    vi.spyOn(axios, "get").mockResolvedValue({
+  it("does not inspect mocked oversized Provider bytes when local bytes are absent", async () => {
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
       status: 200,
       headers: {
         "content-type": "application/zip",
@@ -1445,15 +1372,16 @@ describe("presales create-time upload capability", () => {
       const response = await fetch(`${baseUrl}/files/file-1/content`, {
         headers: { "x-frontmind-service-token": token },
       });
-      expect(response.status).toBe(413);
+      expect(response.status).toBe(410);
       await expect(response.json()).resolves.toMatchObject({
         error: {
-          code: "SOURCE_CONTENT_TOO_LARGE",
+          code: "CONTENT_UNAVAILABLE",
           retryable: false,
           recoveryAction: "reupload",
         },
       });
     });
+    expect(get).not.toHaveBeenCalled();
   });
 
   it("keeps the trusted URL-only task-output fallback for historical tasks", async () => {

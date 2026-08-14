@@ -1,6 +1,6 @@
-import axios from "axios";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 import {
   checkUpstreamFileReadiness,
   UpstreamFileReadinessError,
@@ -13,46 +13,44 @@ const base = {
   file: { fileId: "file-1", filename: "provider-name.pdf" },
 };
 
-describe("upstream file readiness", () => {
+function detail(
+  status: "pending" | "uploaded" | "deleted" | "error",
+  overrides: Partial<Awaited<ReturnType<ManusV2Client["fileDetail"]>>> = {},
+) {
+  return {
+    fileId: base.file.fileId,
+    filename: base.file.filename,
+    status,
+    bytes: status === "uploaded" ? 12 : null,
+    expiresAt: 2_000_000_000,
+    contentType: "application/pdf",
+    requestId: "request-1",
+    ...overrides,
+  };
+}
+
+describe("upstream file readiness v2", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("accepts the official v1 shape and sends API_KEY only", async () => {
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: base.file.fileId,
-        filename: base.file.filename,
-        status: "uploaded",
-      },
-    });
+  it("uses the unified Manus v2 file.detail client", async () => {
+    const fileDetail = vi
+      .spyOn(ManusV2Client.prototype, "fileDetail")
+      .mockResolvedValue(detail("uploaded"));
 
     await expect(checkUpstreamFileReadiness(base)).resolves.toMatchObject({
       ...base.file,
       state: "uploaded",
     });
-    const options = get.mock.calls[0]?.[1];
-    expect(options?.timeout).toBe(10_000);
-    expect(options?.headers).toEqual({
-      API_KEY: base.apiKey,
-      Accept: "application/json",
+    expect(fileDetail).toHaveBeenCalledWith(base.file.fileId, {
+      signal: undefined,
     });
-    expect(options?.headers).not.toHaveProperty("Authorization");
   });
 
-  it("waits pending metadata with the bounded backoff before succeeding", async () => {
-    vi.spyOn(axios, "get")
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { ...base.file, id: base.file.fileId, status: "pending" },
-      })
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { ...base.file, id: base.file.fileId, status: "pending" },
-      })
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { ...base.file, id: base.file.fileId, status: "uploaded" },
-      });
+  it("waits pending metadata with bounded backoff before succeeding", async () => {
+    vi.spyOn(ManusV2Client.prototype, "fileDetail")
+      .mockResolvedValueOnce(detail("pending"))
+      .mockResolvedValueOnce(detail("pending"))
+      .mockResolvedValueOnce(detail("uploaded"));
     const delays: number[] = [];
 
     const result = await waitForUpstreamFilesReady({
@@ -71,35 +69,22 @@ describe("upstream file readiness", () => {
   });
 
   it("returns pending when the readiness deadline is reached", async () => {
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: base.file.fileId,
-        filename: base.file.filename,
-        status: "pending",
-      },
-    });
-
+    vi.spyOn(ManusV2Client.prototype, "fileDetail").mockResolvedValue(
+      detail("pending"),
+    );
     const result = await waitForUpstreamFilesReady({
       ...base,
       files: [base.file],
       deadlineMs: 0,
     });
-
     expect(result.pending).toHaveLength(1);
     expect(result.ready).toEqual([]);
   });
 
-  it("supports an authoritative provider filename for first-time canonicalization", async () => {
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: base.file.fileId,
-        filename: "provider-normalized.pdf",
-        status: "uploaded",
-      },
-    });
-
+  it("supports a provider-authoritative normalized filename", async () => {
+    vi.spyOn(ManusV2Client.prototype, "fileDetail").mockResolvedValue(
+      detail("uploaded", { filename: "provider-normalized.pdf" }),
+    );
     await expect(
       checkUpstreamFileReadiness({
         ...base,
@@ -111,54 +96,27 @@ describe("upstream file readiness", () => {
     });
   });
 
-  it("rejects an all-whitespace provider filename before task preparation", async () => {
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      data: {
-        id: base.file.fileId,
-        filename: "   ",
-        status: "uploaded",
-      },
-    });
-
-    await expect(
-      checkUpstreamFileReadiness({
-        ...base,
-        filenamePolicy: "provider_authoritative",
-      }),
-    ).rejects.toMatchObject({
-      code: "UPSTREAM_FILE_METADATA_INVALID",
-      retryable: false,
-    });
-  });
-
-  it("fails closed for deleted, error, unknown, or mismatched identities", async () => {
-    const get = vi.spyOn(axios, "get");
-    for (const status of ["deleted", "error", "processing"]) {
-      get.mockResolvedValueOnce({
-        status: 200,
-        data: { id: base.file.fileId, filename: base.file.filename, status },
-      });
+  it("fails closed for deleted and error leases", async () => {
+    const fileDetail = vi.spyOn(ManusV2Client.prototype, "fileDetail");
+    for (const status of ["deleted", "error"] as const) {
+      fileDetail.mockResolvedValueOnce(detail(status));
       await expect(checkUpstreamFileReadiness(base)).rejects.toBeInstanceOf(
         UpstreamFileReadinessError,
       );
     }
-    get.mockResolvedValueOnce({
-      status: 200,
-      data: { id: "other", filename: base.file.filename, status: "uploaded" },
-    });
-    await expect(checkUpstreamFileReadiness(base)).rejects.toMatchObject({
-      code: "UPSTREAM_FILE_IDENTITY_MISMATCH",
-      retryable: false,
-    });
   });
 
-  it("classifies temporary metadata failures without exposing response data", async () => {
-    vi.spyOn(axios, "get").mockResolvedValue({
-      status: 503,
-      data: { secret: "must-not-be-copied" },
-    });
-
+  it("classifies a transient v2 metadata failure safely", async () => {
+    vi.spyOn(ManusV2Client.prototype, "fileDetail").mockRejectedValue(
+      new ManusV2ApiError(
+        "file.detail",
+        503,
+        "UPSTREAM_BUSY",
+        true,
+        false,
+        "request-safe",
+      ),
+    );
     await expect(checkUpstreamFileReadiness(base)).rejects.toMatchObject({
       code: "UPSTREAM_FILE_METADATA_UNAVAILABLE",
       retryable: true,

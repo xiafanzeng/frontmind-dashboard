@@ -1,8 +1,10 @@
 import axios from "axios";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { collectKnowledgeArchiveDescriptors } from "./knowledge-base-artifact";
 import {
   appendManusV2KnowledgeBaseOperationContract,
+  buildManusV2CreateTaskBody,
   buildManusV2KnowledgeBaseStructuredOutputSchema,
   buildManusV2MessageContent,
   classifyManusV2StructuredResultEnvelope,
@@ -27,6 +29,31 @@ describe("ManusV2Client", () => {
     expectContentCompleted: false,
     requiresManifest: false,
   };
+
+  it("pins production Gateway construction to the official root origin", () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(
+        () =>
+          new ManusV2Client({
+            baseUrl: "https://api.manus.ai",
+            apiKey: "secret",
+          }),
+      ).not.toThrow();
+      for (const baseUrl of [
+        "https://api.manus.ai/custom",
+        "https://api.example.test",
+      ]) {
+        expect(
+          () => new ManusV2Client({ baseUrl, apiKey: "secret" }),
+        ).toThrow("Unsafe Manus v2 production base URL");
+      }
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+    }
+  });
 
   it("creates once and sends every continuation to the same task", async () => {
     const post = vi.spyOn(axios.Axios.prototype, "post");
@@ -136,6 +163,81 @@ describe("ManusV2Client", () => {
       { headers: { "Content-Type": "application/json" } },
     );
   });
+
+  it("accepts the official task.stop success envelope without task identity", async () => {
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: { ok: true, request_id: "req-stop" },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(client.stopTask("canonical-task")).resolves.toEqual({
+      taskId: "canonical-task",
+      requestId: "req-stop",
+    });
+    expect(post).toHaveBeenCalledWith(
+      "https://api.example.test/v2/task.stop",
+      { task_id: "canonical-task" },
+      { headers: { "Content-Type": "application/json" } },
+    );
+  });
+
+  it("accepts only the official task.delete identity and deleted acknowledgement", async () => {
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        request_id: "req-delete",
+        id: "canonical-task",
+        deleted: true,
+      },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(client.deleteTask("canonical-task")).resolves.toEqual({
+      taskId: "canonical-task",
+      requestId: "req-delete",
+    });
+    expect(post).toHaveBeenCalledWith(
+      "https://api.example.test/v2/task.delete",
+      { task_id: "canonical-task" },
+      { headers: { "Content-Type": "application/json" } },
+    );
+  });
+
+  it.each([
+    ["omits id", { ok: true, deleted: true }],
+    [
+      "uses a non-contract task_id alias",
+      { ok: true, task_id: "canonical-task", deleted: true },
+    ],
+    ["omits deleted", { ok: true, id: "canonical-task" }],
+    ["does not confirm deletion", { ok: true, id: "canonical-task", deleted: false }],
+    ["changes task identity", { ok: true, id: "other-task", deleted: true }],
+  ])(
+    "treats a task.delete 2xx response that %s as outcome unknown",
+    async (_label, data) => {
+      vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+        status: 200,
+        data,
+      });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+
+      await expect(client.deleteTask("canonical-task")).rejects.toMatchObject({
+        outcomeUnknown: true,
+        retryable: false,
+      });
+    },
+  );
 
   it.each([
     ["has no task identity", { ok: true, confirmed: true }],
@@ -467,6 +569,56 @@ describe("ManusV2Client", () => {
       { id: "e2", role: "assistant", text: "second" },
     ]);
     expect(get.mock.calls[1]?.[1]?.params).toMatchObject({ cursor: "page-2" });
+  });
+
+  it("defaults to newest-first pagination and keeps the newest repeated event payload", async () => {
+    const get = vi.spyOn(axios.Axios.prototype, "get");
+    get
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "canonical-task",
+          messages: [
+            {
+              id: "updated-event",
+              type: "assistant_message",
+              timestamp: 20,
+              assistant_message: { content: "newest payload" },
+            },
+          ],
+          has_more: true,
+          next_cursor: "older-page",
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          task_id: "canonical-task",
+          messages: [
+            {
+              id: "updated-event",
+              type: "assistant_message",
+              timestamp: 20,
+              assistant_message: { content: "stale payload" },
+            },
+          ],
+          has_more: false,
+        },
+      });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    const events = await client.listAllMessages({ taskId: "canonical-task" });
+
+    expect(get.mock.calls[0]?.[1]?.params).toMatchObject({ order: "desc" });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.assistant_message).toEqual({
+      content: "newest payload",
+    });
   });
 
   it("reconciles unknown create only when title and operation token identify one task", async () => {
@@ -966,6 +1118,22 @@ describe("ManusV2Client", () => {
     ]);
   });
 
+  it("pins locale, privacy, and non-interactive execution on v2 task.create", () => {
+    expect(
+      buildManusV2CreateTaskBody({
+        prompt: "materialize the complete bundle",
+        locale: "zh-CN",
+        interactiveMode: false,
+        hideInTaskList: true,
+      }),
+    ).toMatchObject({
+      locale: "zh-CN",
+      interactive_mode: false,
+      hide_in_task_list: true,
+      share_visibility: "private",
+    });
+  });
+
   it("builds the documented inline file_data part and rejects malformed base64", () => {
     const encoded = Buffer.from("pinned system Skill bytes").toString("base64");
     expect(
@@ -1087,6 +1255,61 @@ describe("ManusV2Client", () => {
       ),
     ).toContain('"operationToken":"op-1"');
   });
+
+  it.each(["", "bundle ready"])(
+    "projects a stable, deduplicated typed ZIP from assistant content %j",
+    (content) => {
+      const events = [
+        {
+          id: "event-materialized-zip",
+          type: "assistant_message",
+          timestamp: 1_723_600_000_000,
+          assistant_message: {
+            content,
+            attachments: [
+              {
+                type: "file",
+                filename: "frontmind-kb-bundle-operation.zip",
+                content_type: "application/zip",
+                url: "https://downloads.example.test/materialized.zip",
+              },
+            ],
+          },
+        },
+      ];
+      const output = normalizeManusV2Output(events);
+      const replayed = normalizeManusV2Output(events);
+      const typed = output.find((item) => "type" in item);
+
+      expect(output[0]).toMatchObject({
+        id: "event-materialized-zip",
+        text: content,
+        content,
+        files: [
+          expect.objectContaining({
+            filename: "frontmind-kb-bundle-operation.zip",
+          }),
+        ],
+      });
+      expect(typed).toMatchObject({
+        id: expect.stringMatching(/^v2-attachment-[a-f0-9]{64}$/u),
+        role: "assistant",
+        type: "file",
+        filename: "frontmind-kb-bundle-operation.zip",
+        content_type: "application/zip",
+        url: "https://downloads.example.test/materialized.zip",
+      });
+      expect(replayed.find((item) => "type" in item)?.id).toBe(typed?.id);
+      expect(collectKnowledgeArchiveDescriptors(output)).toEqual([
+        expect.objectContaining({
+          outputItemId: typed?.id,
+          filename: "frontmind-kb-bundle-operation.zip",
+          mimeType: "application/zip",
+          url: "https://downloads.example.test/materialized.zip",
+        }),
+      ]);
+    },
+  );
 
   it("requires a manifest only for initial tree creation", () => {
     const schema = buildManusV2KnowledgeBaseStructuredOutputSchema({

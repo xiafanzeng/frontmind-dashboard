@@ -235,7 +235,9 @@ export default function ImagePreview({
   expired = false,
 }: ImagePreviewProps) {
   const sourceUrl = fileId
-    ? `/api/frontmind/v1/files/${encodeURIComponent(fileId)}`
+    ? fileId.startsWith("asset_")
+      ? `/api/frontmind/v2/assets/${encodeURIComponent(fileId)}/content`
+      : `/api/frontmind/v1/files/${encodeURIComponent(fileId)}`
     : src || "";
   const [isOpen, setIsOpen] = useState(false);
   const [scale, setScale] = useState(1);

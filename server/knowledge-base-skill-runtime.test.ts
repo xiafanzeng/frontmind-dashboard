@@ -101,27 +101,20 @@ describe("knowledge-base durable physical Skill pins", () => {
     ).rejects.toThrow("does not match the build physical pin");
   });
 
-  it("keeps alias-only logical compatibility inside the historical pinned reader", async () => {
-    const historical = await readKnowledgeBasePinnedSkillArchiveAttachment({
-      version: "4",
-      contentHash:
-        "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
-      physicalSha256:
-        "86cf73a2270082fc020d23d1a76b056ba54b0c1f725550e53081acba81b85145",
-      archiveBytes: 33_003,
-      storageKey: null,
-    });
-    expect(historical.contentHash).toBe(
-      "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
-    );
-    expect(path.isAbsolute(historical.storageKey)).toBe(false);
-
+  it("rejects every pre-v5 runtime selection with reset-required", async () => {
     await expect(
-      getKnowledgeBaseSkillDescriptor({
+      readKnowledgeBasePinnedSkillArchiveAttachment({
         version: "4",
         contentHash:
           "08d30fed3d992e6e52d3a7fdaba1e7ffd09e0c6d48052f400b12ac680f460fb3",
+        physicalSha256:
+          "86cf73a2270082fc020d23d1a76b056ba54b0c1f725550e53081acba81b85145",
+        archiveBytes: 33_003,
+        storageKey: null,
       }),
-    ).rejects.toThrow("content hash does not match");
+    ).rejects.toThrow("RESET_REQUIRED");
+    await expect(
+      getKnowledgeBaseSkillDescriptor({ version: "1" }),
+    ).rejects.toThrow("RESET_REQUIRED");
   });
 });

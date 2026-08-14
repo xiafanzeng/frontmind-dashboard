@@ -34,6 +34,10 @@ function validLeaseMs(value: number | undefined) {
 export function classifyKnowledgeBaseOpenRecoveryBuild(
   build: Pick<
     KnowledgeBaseBuild,
+    | "executionMode"
+    | "skillVersion"
+    | "providerProtocol"
+    | "contentVersion"
     | "activeTurnId"
     | "upstreamTaskId"
     | "canonicalTaskId"
@@ -43,6 +47,14 @@ export function classifyKnowledgeBaseOpenRecoveryBuild(
     | "protocolErrorCode"
   >,
 ): KnowledgeBaseOpenRecoveryKind | null {
+  if (
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.providerProtocol !== "manus_v2" ||
+    build.contentVersion === null
+  ) {
+    return null;
+  }
   if (build.activeTurnId || !(build.canonicalTaskId || build.upstreamTaskId)) {
     return null;
   }

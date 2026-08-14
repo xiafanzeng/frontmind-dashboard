@@ -174,8 +174,18 @@ function node(overrides: Record<string, unknown> = {}) {
   };
 }
 
+const RESET_REQUIRED_NOTICE = {
+  code: "RESET_REQUIRED",
+  severity: "warning",
+  retryable: false,
+  failureClass: "requires_user_fix",
+  recoveryAction: "approve_reset",
+  canRegenerate: false,
+  turnId: null,
+} as const;
+
 describe("knowledge-base observation consistency", () => {
-  it("keeps completed content stable and reports package exhaustion as a local warning", async () => {
+  it("keeps completed pre-v5 content visible but requires an approved reset", async () => {
     const completedAt = new Date("2026-08-01T00:00:10.000Z");
     dependencies.getDb.mockResolvedValue({
       async transaction<T>(operation: (tx: any) => Promise<T>) {
@@ -213,19 +223,16 @@ describe("knowledge-base observation consistency", () => {
       packageState: "attention_required",
       contentCompletedAt: completedAt.getTime(),
       localRestrictions: ["package_attention_required"],
-      notice: {
-        code: "KNOWLEDGE_BASE_PACKAGE_ATTENTION_REQUIRED",
-        severity: "warning",
-        message:
-          "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响，系统不会重复推进内容。",
-        retryable: false,
-        canRegenerate: false,
-      },
+      notice: RESET_REQUIRED_NOTICE,
     });
-    expect(observation?.progress.build.status).toBe("ready_to_publish");
+    expect(observation?.progress.build).toMatchObject({
+      status: "protocol_error",
+      executionMode: "legacy_conversational",
+      protocolError: expect.stringContaining("RESET_REQUIRED"),
+    });
   });
 
-  it("projects attachment readiness processing as a same-turn recovery notice", async () => {
+  it("requires reset instead of recovering attachment readiness for pre-v5 builds", async () => {
     const now = new Date("2026-08-11T05:32:59.000Z");
     const activeTurn = {
       id: "turn-attachments-processing",
@@ -284,19 +291,10 @@ describe("knowledge-base observation consistency", () => {
       conversationId: "conversation-snapshot",
     });
 
-    expect(observation?.notice).toMatchObject({
-      code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",
-      severity: "info",
-      retryable: true,
-      failureClass: "recoverable_same_turn",
-      recoveryAction: "reconcile",
-      traceId: "4b8be659-2b38-43f5-b89d-1697e3e77655",
-      attachmentCount: 7,
-      turnId: activeTurn.id,
-    });
+    expect(observation?.notice).toMatchObject(RESET_REQUIRED_NOTICE);
   });
 
-  it("projects an unknown create outcome as contact-support and never as retry", async () => {
+  it("requires reset instead of reconciling an unknown pre-v5 create outcome", async () => {
     const now = new Date("2026-08-11T05:32:59.000Z");
     const activeTurn = {
       id: "turn-create-outcome-unknown",
@@ -355,19 +353,10 @@ describe("knowledge-base observation consistency", () => {
       conversationId: "conversation-snapshot",
     });
 
-    expect(observation?.notice).toMatchObject({
-      code: "KNOWLEDGE_BASE_CREATE_OUTCOME_UNKNOWN",
-      severity: "warning",
-      retryable: false,
-      failureClass: "terminal_nonregenerable",
-      recoveryAction: "contact_support",
-      traceId: "e948069c-b6e1-4c8f-b829-a3ee6a3495b4",
-      attachmentCount: 7,
-      turnId: activeTurn.id,
-    });
+    expect(observation?.notice).toMatchObject(RESET_REQUIRED_NOTICE);
   });
 
-  it("projects safe trace and attachment count for an UPSTREAM_CREATE_3 failure", async () => {
+  it("requires reset for a pre-v5 UPSTREAM_CREATE_3 failure", async () => {
     const now = new Date("2026-08-11T05:32:59.000Z");
     const activeTurn = {
       id: "turn-upstream-create-3",
@@ -430,15 +419,10 @@ describe("knowledge-base observation consistency", () => {
       conversationId: "conversation-snapshot",
     });
 
-    expect(observation.notice).toMatchObject({
-      code: "UPSTREAM_CREATE_3",
-      traceId: "b150314c-3c10-4073-8ebc-241e16f53600",
-      attachmentCount: 7,
-      turnId: activeTurn.id,
-    });
+    expect(observation.notice).toMatchObject(RESET_REQUIRED_NOTICE);
   });
 
-  it("keeps a legacy UPSTREAM_CREATE_3 code and attachment count without inventing a trace", async () => {
+  it("does not expose legacy UPSTREAM_CREATE_3 recovery coordinates", async () => {
     const now = new Date("2026-08-11T05:32:59.000Z");
     const activeTurn = {
       id: "turn-legacy-upstream-create-3",
@@ -499,15 +483,11 @@ describe("knowledge-base observation consistency", () => {
       conversationId: "conversation-snapshot",
     });
 
-    expect(observation?.notice).toMatchObject({
-      code: "UPSTREAM_CREATE_3",
-      attachmentCount: 7,
-      turnId: activeTurn.id,
-    });
-    expect(observation?.notice?.traceId).toBeNull();
+    expect(observation?.notice).toMatchObject(RESET_REQUIRED_NOTICE);
+    expect(observation?.notice).not.toHaveProperty("traceId");
   });
 
-  it("projects exact legacy protocol-terminal history as read-only support history", async () => {
+  it("keeps legacy protocol-terminal history read-only behind RESET_REQUIRED", async () => {
     const now = new Date("2026-08-01T00:00:10.000Z");
     const userAttachment = {
       file_id: "customer-file",
@@ -653,14 +633,7 @@ describe("knowledge-base observation consistency", () => {
         recoveryAction: "contact_support",
         canRegenerate: false,
       },
-      notice: {
-        code: "PROGRESS_PROTOCOL_INVALID",
-        retryable: false,
-        failureClass: "terminal_nonregenerable",
-        recoveryAction: "contact_support",
-        canRegenerate: false,
-        turnId: activeTurn.id,
-      },
+      notice: RESET_REQUIRED_NOTICE,
     });
   });
 
@@ -1260,19 +1233,11 @@ describe("knowledge-base observation consistency", () => {
     expect(observation?.displaySequence).toBe(7);
     expect(observation).toMatchObject({
       syncState: "attention_required",
-      notice: {
-        code: "MANUS_V2_TASK_ERROR",
-        severity: "warning",
-        message: "系统正在恢复当前操作。已完成内容不受影响。",
-        retryable: true,
-        failureClass: "recoverable_same_turn",
-        recoveryAction: "reconcile",
-        canRegenerate: false,
-      },
+      notice: RESET_REQUIRED_NOTICE,
     });
   });
 
-  it("projects bounded Manus format attention as non-retryable support instead of recovery", async () => {
+  it("requires reset instead of attempting pre-v5 format repair", async () => {
     const activeTurn = {
       id: "turn-format-attention",
       conversationId: "u7:conversation-snapshot",
@@ -1323,12 +1288,7 @@ describe("knowledge-base observation consistency", () => {
       userId: 7,
       conversationId: "conversation-snapshot",
     });
-    expect(observation?.notice).toMatchObject({
-      code: "MANUS_V2_FORMAT_REPAIR_EXPIRED",
-      retryable: false,
-      failureClass: "terminal_nonregenerable",
-      recoveryAction: "contact_support",
-    });
+    expect(observation?.notice).toMatchObject(RESET_REQUIRED_NOTICE);
   });
 
   it("uses a newer completion receipt as displaySequence while retaining the last presentation", async () => {

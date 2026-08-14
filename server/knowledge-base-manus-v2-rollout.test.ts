@@ -12,13 +12,13 @@ import {
 
 describe("knowledge-base Manus v2 writer rollout", () => {
   it.each(["development", "production"])(
-    "keeps the %s writer closed until an operator explicitly enables v2",
+    "keeps retired rollout telemetry closed in %s without selecting legacy for a new build",
     (nodeEnv) => {
       expect(knowledgeBaseManusV2WriterEnabled({ NODE_ENV: nodeEnv })).toBe(
         false,
       );
       expect(knowledgeBaseNewBuildProviderProtocol({ NODE_ENV: nodeEnv })).toBe(
-        "legacy_v1",
+        "manus_v2",
       );
       expect(
         knowledgeBaseManusV2ActiveMigrationEnabled({ NODE_ENV: nodeEnv }),
@@ -29,7 +29,7 @@ describe("knowledge-base Manus v2 writer rollout", () => {
     },
   );
 
-  it("selects the v2 new-build writer only when explicitly enabled", () => {
+  it("selects v2 for every new build even when the retired writer flag is false", () => {
     expect(
       knowledgeBaseManusV2WriterEnabled({
         [KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV]: "false",
@@ -39,7 +39,7 @@ describe("knowledge-base Manus v2 writer rollout", () => {
       knowledgeBaseNewBuildProviderProtocol({
         [KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV]: "false",
       }),
-    ).toBe("legacy_v1");
+    ).toBe("manus_v2");
     expect(
       knowledgeBaseNewBuildProviderProtocol({
         [KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV]: "true",

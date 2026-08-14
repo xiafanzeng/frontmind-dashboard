@@ -428,6 +428,12 @@ export default function ChatInput({
             knowledgeBaseExpectedGeneration: syncKnowledgeBaseSnapshot
               ? knowledgeBaseReplySnapshot?.generation
               : undefined,
+            knowledgeBaseExpectedStateEpoch: syncKnowledgeBaseSnapshot
+              ? knowledgeBaseReplySnapshot?.stateEpoch
+              : undefined,
+            knowledgeBaseExpectedContentVersion: syncKnowledgeBaseSnapshot
+              ? knowledgeBaseReplySnapshot?.contentVersion
+              : undefined,
             knowledgeBaseExpectedRevision: syncKnowledgeBaseSnapshot
               ? knowledgeBaseReplySnapshot?.revision
               : undefined,

@@ -28,6 +28,9 @@ const productionArtifactIdentity = path.resolve(
 const productionBundleAudit = path.resolve(
   "scripts/audit-production-bundle.mjs",
 );
+const productionController = path.resolve(
+  "deploy/production/controller/frontmind-deploy-controller",
+);
 const installer = path.resolve("deploy/production/install.sh");
 const controllerUpdater = path.resolve(
   "deploy/production/update-release-controllers.sh",
@@ -74,40 +77,21 @@ describe("release workflow source-ordering contracts", () => {
     expect(dockerfile).toContain(`/app/dist/${output}`);
   });
 
-  it("wires the five production same-digest Manus v2 phases without rebuilding", async () => {
+  it("wires one exact coupled production deployment without a rollout control plane", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const updater = await readFile(controllerUpdater, "utf8");
     const installerSource = await readFile(installer, "utf8");
-    const phaseJob = workflow.slice(workflow.indexOf("  kb-manus-v2-rollout:"));
+    const coupledJob = workflow.slice(
+      workflow.indexOf("  coupled-stack-deploy:"),
+    );
 
-    for (const phase of [
-      "dual-read",
-      "canary",
-      "migration",
-      "pause",
-      "complete",
-    ]) {
-      expect(workflow).toContain(`          - ${phase}`);
-      expect(phaseJob).toContain(phase);
-    }
-    expect(workflow).toContain(
-      "(github.event_name != 'workflow_dispatch' || inputs.kb_manus_v2_rollout_phase == 'deploy')",
-    );
-    expect(phaseJob).toContain("needs.promotion-gate.result == 'success'");
-    expect(phaseJob).toContain("Verify exact signed production digest");
-    expect(phaseJob).toContain("Preflight public current production identity");
-    expect(phaseJob).toContain("--kb-manus-v2-rollout $PHASE");
-    expect(phaseJob).toContain(
-      "Independently prove public exact production phase",
-    );
-    expect(phaseJob).toContain(
-      "Require converged migration diagnostics before complete",
-    );
-    expect(phaseJob).toContain("lastSweepInfrastructureStatus");
-    expect(phaseJob).toContain("migrationConverged");
-    expect(phaseJob).toContain("activeLegacyTotal == 0");
-    expect(phaseJob).toContain("inFlightHandoffs == 0");
-    expect(phaseJob).not.toContain("docker/build-push-action");
+    expect(workflow).toContain("          - reuse-coupled-stack");
+    expect(coupledJob).toContain("inputs.release_mode == 'reuse-coupled-stack'");
+    expect(coupledJob).toContain("Verify both existing signed production artifacts");
+    expect(coupledJob).toContain("coupled-stack ghcr.io/xiafanzeng/frontmind-dashboard@");
+    expect(coupledJob).not.toContain("docker/build-push-action");
+    expect(coupledJob).not.toMatch(/canary|dual-read|shadow/iu);
+    expect(workflow).not.toContain("--kb-manus-v2-rollout");
     expect(updater).toContain(
       'VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"',
     );
@@ -117,25 +101,111 @@ describe("release workflow source-ordering contracts", () => {
     );
     expect(installerSource).not.toContain("update-release-controllers.sh");
   });
+
+  it("stops the consumer first and keeps one durable coupled failure recovery path", async () => {
+    const controller = await readFile(productionController, "utf8");
+    const execution = controller.slice(
+      controller.lastIndexOf('candidate_env="$(mktemp)"'),
+    );
+    const prepare = controller.slice(
+      controller.indexOf("prepare_coupled_stack()"),
+      controller.indexOf("dashboard_health_and_changed_surface_once()"),
+    );
+    const success = controller.slice(
+      controller.indexOf("deploy_coupled_website_and_finalize()"),
+      controller.indexOf(
+        'if [[ $operation == "deploy" && $mode == "acknowledge-incident" ]]',
+      ),
+    );
+    const recovery = controller.slice(
+      controller.indexOf("restore_coupled_stack()"),
+      controller.indexOf("deploy_coupled_website_and_finalize()"),
+    );
+    const main = controller.slice(
+      controller.indexOf(
+        'if [[ $operation == "deploy" && $mode == "acknowledge-incident" ]]',
+      ),
+    );
+
+    expect(controller).toContain(
+      'COUPLED_STACK_CAPSULE_FILE="/var/lib/frontmind-deploy/dashboard/coupled-stack-pending.json"',
+    );
+    expect(controller).toContain(
+      'COUPLED_DASHBOARD_RUNTIME_ROLLBACK_ENV="/var/lib/frontmind-deploy/dashboard/coupled-dashboard-runtime-rollback.env"',
+    );
+    expect(controller).toContain(
+      'COUPLED_DASHBOARD_RUNTIME_RETIRING_ENV="/var/lib/frontmind-deploy/dashboard/coupled-dashboard-runtime-rollback.retiring"',
+    );
+    expect(controller).toContain(
+      'COUPLED_WEBSITE_RUNTIME_ROLLBACK_ENV="/var/lib/frontmind-deploy/dashboard/coupled-website-runtime-rollback.env"',
+    );
+    expect(controller).toContain(
+      'COUPLED_WEBSITE_RUNTIME_RETIRING_ENV="/var/lib/frontmind-deploy/dashboard/coupled-website-runtime-rollback.retiring"',
+    );
+    expect(controller).not.toMatch(/--kb-manus-v2-rollout|dual-read|canary|shadow/u);
+    expect(prepare).toContain('stop website');
+    expect(prepare).toContain("render_coupled_dashboard_runtime_v5");
+    expect(prepare).toContain("render_coupled_website_runtime_v2");
+    expect(controller).toContain("/^FRONTMIND_KB_V4_ROLLOUT_PERCENT=/ { next }");
+    expect(controller).toContain("/^FRONTMIND_KB_MANUS_V2_WRITER=/ { next }");
+    expect(prepare.indexOf('stop website')).toBeLessThan(
+      prepare.indexOf("render_coupled_dashboard_runtime_v5"),
+    );
+    expect(execution.indexOf("prepare_coupled_stack")).toBeLessThan(
+      execution.indexOf('log "DATABASE_PLAN_START"'),
+    );
+    expect(execution.indexOf('stop "$COMPOSE_SERVICE"')).toBeLessThan(
+      execution.indexOf("backup_database"),
+    );
+    expect(success.match(/dashboard_health_and_changed_surface_once/g)).toHaveLength(1);
+    expect(success.match(/wait_coupled_website_ready/g)).toHaveLength(1);
+    expect(success.match(/coupled_website_health_once/g)).toHaveLength(1);
+    expect(recovery).toContain('restore_production_database "$backup"');
+    expect(recovery).toContain(
+      '"$COUPLED_DASHBOARD_RUNTIME_ROLLBACK_ENV" "$COUPLED_DASHBOARD_RUNTIME_ENV_FILE"',
+    );
+    expect(recovery).toContain(
+      '"$COUPLED_WEBSITE_RUNTIME_ROLLBACK_ENV" "$COUPLED_WEBSITE_RUNTIME_ENV_FILE"',
+    );
+    expect(recovery).toContain('wait_until_ready "$old_dashboard_source"');
+    expect(recovery).toContain('wait_coupled_website_ready');
+    expect(controller).toContain("mark_coupled_stack_external_fact_changed");
+    expect(controller).toContain("commit_coupled_stack_capsule_cleanup");
+    expect(controller).toContain(
+      '.dashboard.databaseRestoreRequired = false |',
+    );
+    expect(controller).toContain("coupled_recovery_pending=1");
+    expect(controller).toContain(
+      "COUPLED_STACK_RECOVERY_MUST_FINISH_BEFORE_INCIDENT_ACKNOWLEDGEMENT",
+    );
+    expect(recovery).toContain(
+      '$persisted_message == migration-applied-fact-changed-*',
+    );
+    expect(main.indexOf("restore_coupled_stack")).toBeLessThan(
+      main.indexOf("read_ephemeral_registry_auth"),
+    );
+    expect(main.indexOf("restore_coupled_stack")).toBeLessThan(
+      main.indexOf("verify_candidate"),
+    );
+  });
   it("takes the pnpm version only from package.json", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);
   });
 
-  it("builds and signs before every automatic main deployment", async () => {
+  it("builds and signs once before the separately dispatched coupled deployment", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     expect(workflow).not.toContain("DASHBOARD_AUTO_DEPLOY_ENABLED");
     expect(workflow.indexOf("Build and push image")).toBeLessThan(
-      workflow.indexOf("Install restricted deploy key"),
+      workflow.indexOf("  coupled-stack-deploy:"),
     );
     expect(workflow.indexOf("Sign exact application digest")).toBeLessThan(
-      workflow.indexOf("Install restricted deploy key"),
+      workflow.indexOf("  coupled-stack-deploy:"),
     );
     expect(workflow).toContain(
       "install -m 0644 .github/deploy/production_known_hosts ~/.ssh/known_hosts",
     );
-    expect(workflow).toContain("DEPLOY_HOST: 149.88.85.148");
-    expect(workflow).toContain("DEPLOY_USER: frontmind-deploy");
+    expect(workflow).toContain("frontmind-deploy@149.88.85.148");
     expect(workflow).not.toContain("ssh-keyscan");
 
     const knownHosts = await readFile(productionKnownHosts, "utf8");
@@ -144,14 +214,11 @@ describe("release workflow source-ordering contracts", () => {
     );
   });
 
-  it("streams the job-scoped GHCR credential to the restricted deploy command", async () => {
+  it("streams the job-scoped GHCR credential to the coupled deploy command", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const deployStep = workflow.slice(
       workflow.indexOf(
-        "      - name: Deploy through fixed Dashboard capability",
-      ),
-      workflow.indexOf(
-        "      - name: Record immutable successful-deployment marker",
+        "      - name: Run the ordinary coupled stop, migrate, and start command",
       ),
     );
 
@@ -161,11 +228,12 @@ describe("release workflow source-ordering contracts", () => {
       `printf '%s\\n%s\\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |`,
     );
     expect(deployStep).toContain(
-      '"$IMAGE@$DIGEST $FRONTMIND_RELEASE_SOURCE_SHA"',
+      '"coupled-stack ghcr.io/xiafanzeng/frontmind-dashboard@$DASHBOARD_IMAGE_DIGEST',
     );
-    expect(deployStep).not.toContain(
-      '"$IMAGE@$DIGEST $FRONTMIND_RELEASE_SOURCE_SHA $GHCR_TOKEN"',
-    );
+    const remoteCommand = deployStep.match(/"coupled-stack [^\n]+"/u)?.[0];
+    expect(remoteCommand).toBeTruthy();
+    expect(remoteCommand).not.toContain('"--coupled-stack');
+    expect(remoteCommand).not.toContain("GHCR_TOKEN");
   });
 
   it("checks the complete multi-commit push range for PDF base changes", async () => {

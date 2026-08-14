@@ -28,38 +28,28 @@ affiliations, performance numbers, prices, or authorization status.
    current response logic. Include them with a sensible default caption and
    placement; do not ask about placement, caption, copyright, public scope, or
    authorization.
-8. Always use the response structure below so the dashboard can load the latest
-   model output into the editable response record.
-9. Put the complete four-section Markdown directly in the final assistant
-   message. Do not replace it with a generated `.md`/`.txt` attachment or a
-   short note that only points to a file.
+8. Always fill the four fields in the v2 structured-output schema so the
+   dashboard can load the latest model output into the editable response
+   record.
+9. Put the complete response only in the structured result. Do not replace it
+   with Markdown prose, a generated attachment, or a note that points to a
+   file.
 10. Never expose internal knowledge-base paths, filenames, archive names,
     extensions, version labels, or document inventories. Customer-visible
     provenance must use only the phrase `引自知识库文档`.
 
-## Response structure
+## Structured response
 
-Return normal Markdown with these exact level-two headings, in this order:
+Fill exactly these required string fields:
 
-## 用户真实关心
+- `concern`: state the decision need behind the selected question.
+- `conclusion`: give the direct opening conclusion and ordered answer logic in
+  customer-ready language.
+- `facts`: list supported evidence; attribute enterprise facts only with
+  `引自知识库文档` and never expose an internal path, filename, archive, version,
+  URL, or extension.
+- `boundaries`: list claims or formulations that require more evidence and
+  therefore must not be used.
 
-State the decision need behind the selected question.
-
-## 核心结论/执行口径
-
-Give the direct opening conclusion, followed by the ordered answer logic. Write
-customer-ready language, not a description of what you plan to write.
-
-## 企业材料/官方依据
-
-List one evidence item per bullet. Attribute supported facts only with
-`引自知识库文档`; never print the source path, source filename, archive filename,
-document version, URL, or extension.
-
-## 回答边界/禁止表达
-
-List claims or formulations that must not be used without additional evidence.
-
-Do not wrap the response in JSON or a code fence. Do not append any other
-heading after `回答边界/禁止表达`, do not ask the user a confirmation
-question, and do not return the structured response only as an output file.
+Do not emit a Markdown/JSON/code-fence fallback, add extra fields, ask a
+confirmation question, or return the response as an output file.

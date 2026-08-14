@@ -17,14 +17,11 @@ import {
   createResponseLogicFileIdempotencyKey,
   createResponseLogicTask,
   createResponseLogicTaskIdempotencyKey,
-  extractFinalResponseLogicAssistantReply,
   normalizeResponseLogicTaskStatus,
-  parseCompletedResponseLogicTask,
-  parseCompletedResponseLogicTaskWithFileFallback,
   publicResponseLogicTask,
   responseLogicEvidenceAttachmentFilename,
   responseLogicRecordMatchesConfiguredQuestion,
-  responseLogicTextOutputDescriptor,
+  responseLogicStructuredDraftFromV2Events,
   responseLogicTurnInputAttachmentFilename,
 } from "./response-logic-api";
 import { assertResponseLogicDraftPublishable } from "./response-logic-service";
@@ -36,33 +33,6 @@ import {
   FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
   upstreamPromptCharacterCount,
 } from "./upstream-prompt-budget";
-
-const validStructuredReply = `## 用户真实关心
-采购方需要判断方案是否可信。
-
-## 核心结论/执行口径
-先给出结论，再按证据解释。
-
-## 企业材料/官方依据
-- 企业知识库 V3
-
-## 回答边界/禁止表达
-- 不使用绝对化排名`;
-
-const legacyFiveStructuredReply = `## 用户真实关心
-采购方需要判断方案是否可信。
-
-## 核心结论/执行口径
-先给出结论，再按证据解释。
-
-## 企业材料/官方依据
-- 企业知识库 V3
-
-## 回答边界/禁止表达
-- 不使用绝对化排名
-
-## 引用与核验规则
-引自知识库文档。`;
 
 const legacyStructuredReply = `## 用户真实关心
 采购方需要判断方案是否可信。
@@ -85,26 +55,40 @@ const legacyStructuredReply = `## 用户真实关心
 ## 本轮确认
 请确认案例是否可公开。`;
 
-const siliconFlowStructuredReply = `## 用户真实关心
-
-用户希望了解硅基流动的核心产品线、服务形态和适用客群。
-
-## 核心结论/执行口径
-
-核心产品体系围绕公有云服务和本地部署解决方案构建。
-
-## 企业材料/官方依据
-
-- 产品体系总览（来源路径：硅基流动*knowledge\_base/branches/products\_products/3.1*.md）——公有云与本地部署两类产品。
-- 客户附件：images.jpeg 已纳入图文依据。
-- 知识库版本：V1，来源文件：FINAL.zip
-- 引用文档：products_products/00_overview.md、products_products/3.1_.md
-
-## 回答边界/禁止表达
-
-- 不承诺可能变化的绝对价格`;
-
 describe("response logic execution contract", () => {
+  it("accepts only a successful Manus v2 structured result", () => {
+    const value = {
+      concern: "采购方关心落地风险。",
+      conclusion: "先核验场景，再按证据给出方案。",
+      facts: "企业事实引自知识库文档。",
+      boundaries: "不得使用未经证明的绝对化排名。",
+    };
+    expect(
+      responseLogicStructuredDraftFromV2Events([
+        {
+          id: "rejected",
+          type: "structured_output_result",
+          timestamp: 1,
+          structured_output_result: {
+            success: false,
+            value,
+            error: "schema extraction failed",
+          },
+        },
+      ]),
+    ).toBeNull();
+    expect(
+      responseLogicStructuredDraftFromV2Events([
+        {
+          id: "accepted",
+          type: "structured_output_result",
+          timestamp: 2,
+          structured_output_result: { success: true, value, error: null },
+        },
+      ]),
+    ).toEqual(value);
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
@@ -147,13 +131,6 @@ describe("response logic execution contract", () => {
         task_url: "https://tasks.example/task-response-1",
         task_title: "Draft [REDACTED]",
       },
-      output: [
-        {
-          type: "message",
-          text: "safe [REDACTED]",
-          nested: {},
-        },
-      ],
     });
     expect(serialized).not.toContain(credential);
     expect(serialized).not.toContain("rawUpstreamField");
@@ -246,11 +223,11 @@ describe("response logic execution contract", () => {
       "references/output-contract.md",
     ]);
     expect(await skillZip.file("SKILL.md")!.async("string")).toContain(
-      "complete four-section Markdown directly in the final assistant",
+      "four fields in the v2 structured-output schema",
     );
     expect(
       await skillZip.file("references/output-contract.md")!.async("string"),
-    ).toContain("output file must never be the only copy");
+    ).toContain("output attachments are never parsed as a fallback");
     expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
       "这里是已经确认的企业事实",
     );
@@ -281,12 +258,10 @@ describe("response logic execution contract", () => {
       ],
       customerMessage: "请先给出第一版应答逻辑。",
       outputContract: {
-        exactOrderedLevelTwoHeadings: [
-          "用户真实关心",
-          "核心结论/执行口径",
-          "企业材料/官方依据",
-          "回答边界/禁止表达",
-        ],
+        format: "manus_v2_structured_output",
+        requiredFields: ["concern", "conclusion", "facts", "boundaries"],
+        everyFieldMustBeNonEmpty: true,
+        extraFieldsForbidden: true,
         publicProvenance: "引自知识库文档。",
         followUpConfirmationForbidden: true,
       },
@@ -444,9 +419,13 @@ describe("response logic execution contract", () => {
       }),
     ).toThrow("attachment limit exceeded");
 
-    const post = vi.spyOn(axios, "post").mockResolvedValue({
-      status: 201,
-      data: { id: "task-response-idempotent", status: "created" },
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        request_id: "request-response-idempotent",
+        task_id: "task-response-idempotent",
+      },
     });
     await createResponseLogicTask({
       baseUrl: "https://api.example.test",
@@ -454,13 +433,27 @@ describe("response logic execution contract", () => {
       prompt: "bounded prompt",
       attachments: [],
       idempotencyKey: taskIdempotencyKey,
+      agentProfile: "manus-1.6-max",
     });
     expect(post).toHaveBeenCalledWith(
-      "https://api.example.test/v1/tasks",
-      expect.objectContaining({ prompt: "bounded prompt" }),
+      "https://api.example.test/v2/task.create",
+      expect.objectContaining({
+        agent_profile: "manus-1.6-max",
+        message: expect.objectContaining({
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: "text",
+              text: expect.stringContaining("bounded prompt"),
+            }),
+          ]),
+        }),
+        structured_output_schema: expect.objectContaining({
+          required: ["concern", "conclusion", "facts", "boundaries"],
+        }),
+      }),
       expect.objectContaining({
         headers: expect.objectContaining({
-          "Idempotency-Key": taskIdempotencyKey,
+          "Content-Type": "application/json",
         }),
       }),
     );
@@ -473,96 +466,10 @@ describe("response logic execution contract", () => {
         prompt: "界".repeat(3_001),
         attachments: [],
         idempotencyKey: taskIdempotencyKey,
+        agentProfile: "manus-1.6-max",
       }),
     ).rejects.toThrow("UPSTREAM_PROMPT_EXCEEDS_3000_CHARACTERS");
     expect(post).not.toHaveBeenCalled();
-  });
-
-  it("accepts only a completed Pro assistant reply with all four ordered sections", () => {
-    const structured = parseCompletedResponseLogicTask({
-      id: "task-1",
-      status: "completed",
-      output: [
-        {
-          type: "reasoning",
-          text: "这段内部推理不能进入草稿。",
-        },
-        {
-          type: "message",
-          role: "assistant",
-          content: [{ type: "output_text", text: validStructuredReply }],
-        },
-      ],
-    });
-
-    expect(structured).toEqual({
-      concern: "采购方需要判断方案是否可信。",
-      conclusion: "先给出结论，再按证据解释。",
-      facts: "- 企业知识库文档",
-      boundaries: "- 不使用绝对化排名",
-    });
-    expect(
-      extractFinalResponseLogicAssistantReply({
-        output: [
-          { type: "reasoning", text: "不能使用" },
-          {
-            type: "message",
-            role: "assistant",
-            content: validStructuredReply,
-          },
-        ],
-      }),
-    ).toBe(validStructuredReply);
-  });
-
-  it("always applies the existing one-pass deterministic fence recovery", () => {
-    const task = {
-      status: "completed",
-      output: [
-        {
-          type: "message",
-          role: "assistant",
-          content: `\`\`\`markdown\n${validStructuredReply}\n\`\`\``,
-        },
-      ],
-    };
-    const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
-    vi.stubEnv("FRONTMIND_RESPONSE_LOGIC_OUTPUT_REPAIR", "shadow");
-    expect(parseCompletedResponseLogicTask(task)).toMatchObject({
-      concern: "采购方需要判断方案是否可信。",
-      boundaries: "- 不使用绝对化排名",
-    });
-    expect(log).toHaveBeenCalledWith(
-      "[Model Output Repair]",
-      expect.stringContaining("known_fence_removed"),
-    );
-  });
-
-  it("removes internal provenance from the user's product response", () => {
-    const structured = parseCompletedResponseLogicTask({
-      status: "completed",
-      output: [
-        {
-          type: "message",
-          role: "assistant",
-          content: siliconFlowStructuredReply,
-        },
-      ],
-    });
-    expect(structured).toMatchObject({
-      concern: "用户希望了解硅基流动的核心产品线、服务形态和适用客群。",
-      conclusion: "核心产品体系围绕公有云服务和本地部署解决方案构建。",
-      facts:
-        "- 产品体系总览（引自知识库文档）——公有云与本地部署两类产品。\n- 客户附件：用户上传图片 已纳入图文依据。",
-    });
-    const serialized = JSON.stringify(structured);
-    expect(serialized).not.toContain("knowledge_base/");
-    expect(serialized).not.toContain(".md");
-    expect(serialized).not.toContain(".zip");
-    expect(serialized).not.toContain("images.jpeg");
-    expect(serialized).not.toContain("来源路径");
-    expect(serialized).not.toContain("来源文件");
-    expect(serialized).not.toContain("引用文档");
   });
 
   it("sanitizes every public field without deleting facts after a source marker", () => {
@@ -598,176 +505,6 @@ describe("response logic execution contract", () => {
     expect(projected).not.toContain("待补充/待确认");
     expect(projected).not.toContain("本轮确认");
     expect(projected).not.toContain("企业事实确认表.pdf");
-  });
-
-  it("accepts the exact legacy five-section shape without retaining references", () => {
-    expect(
-      parseCompletedResponseLogicTask({
-        status: "completed",
-        output: [
-          {
-            type: "message",
-            role: "assistant",
-            content: legacyFiveStructuredReply,
-          },
-        ],
-      }),
-    ).toEqual({
-      concern: "采购方需要判断方案是否可信。",
-      conclusion: "先给出结论，再按证据解释。",
-      facts: "- 企业知识库文档",
-      boundaries: "- 不使用绝对化排名",
-    });
-  });
-
-  it("accepts the exact legacy seven-section shape without retaining pending prompts", () => {
-    expect(
-      parseCompletedResponseLogicTask({
-        status: "completed",
-        output: [
-          {
-            type: "message",
-            role: "assistant",
-            content: legacyStructuredReply,
-          },
-        ],
-      }),
-    ).toEqual({
-      concern: "采购方需要判断方案是否可信。",
-      conclusion: "先给出结论，再按证据解释。",
-      facts: "- 企业知识库文档",
-      boundaries: "- 不使用绝对化排名",
-    });
-  });
-
-  it("downloads and parses the only trusted typed Markdown output file", async () => {
-    const task = {
-      status: "completed",
-      output: [
-        {
-          type: "message",
-          role: "assistant",
-          content: "已生成应答逻辑文件。",
-        },
-        {
-          type: "output_file",
-          file_id: "file-response-logic",
-          filename: "用户真实关心.md",
-          mime_type: "text/markdown",
-        },
-      ],
-    };
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      headers: { "content-type": "text/markdown; charset=utf-8" },
-      data: Buffer.from(siliconFlowStructuredReply, "utf8"),
-    });
-
-    expect(responseLogicTextOutputDescriptor(task)).toEqual({
-      fileId: "file-response-logic",
-      filename: "用户真实关心.md",
-      mimeType: "text/markdown",
-    });
-    await expect(
-      parseCompletedResponseLogicTaskWithFileFallback({
-        task,
-        baseUrl: "https://api.example.test/",
-        apiKey: "secret-key",
-      }),
-    ).resolves.toMatchObject({
-      conclusion: "核心产品体系围绕公有云服务和本地部署解决方案构建。",
-    });
-    expect(get).toHaveBeenCalledWith(
-      "https://api.example.test/v1/files/file-response-logic/content",
-      expect.objectContaining({
-        maxRedirects: 0,
-        proxy: false,
-        headers: {
-          API_KEY: "secret-key",
-          Authorization: "Bearer secret-key",
-        },
-      }),
-    );
-  });
-
-  it("does not download untyped, ambiguous or non-assistant output files", () => {
-    const file = {
-      type: "output_file",
-      file_id: "file-one",
-      filename: "logic.md",
-      mime_type: "text/markdown",
-    };
-    expect(
-      responseLogicTextOutputDescriptor({
-        output: [{ ...file, role: "user" }],
-      }),
-    ).toBeNull();
-    expect(
-      responseLogicTextOutputDescriptor({
-        output: [file, { ...file, file_id: "file-two" }],
-      }),
-    ).toBeNull();
-    expect(
-      responseLogicTextOutputDescriptor({
-        output: [{ ...file, mime_type: "application/octet-stream" }],
-      }),
-    ).toBeNull();
-  });
-
-  it("keeps the single typed Markdown fallback when the assistant also returns an image", () => {
-    expect(
-      responseLogicTextOutputDescriptor({
-        output: [
-          {
-            type: "output_image",
-            file_id: "file-image",
-            filename: "product.png",
-            mime_type: "image/png",
-          },
-          {
-            type: "output_file",
-            file_id: "file-logic",
-            filename: "response.md",
-            mime_type: "text/markdown",
-          },
-        ],
-      }),
-    ).toEqual({
-      fileId: "file-logic",
-      filename: "response.md",
-      mimeType: "text/markdown",
-    });
-  });
-
-  it("rejects missing, reordered, duplicate, extra and empty model sections", () => {
-    const invalidOutputs = [
-      validStructuredReply.replace(/## 回答边界\/禁止表达[\s\S]*$/, ""),
-      validStructuredReply.replace(
-        "## 核心结论/执行口径",
-        "## 企业材料/官方依据",
-      ),
-      `${validStructuredReply}\n\n## 额外说明\n不允许`,
-      validStructuredReply.replace(
-        "## 企业材料/官方依据\n- 企业知识库 V3",
-        "## 企业材料/官方依据\n",
-      ),
-      `模型前言\n${validStructuredReply}`,
-    ];
-
-    for (const output of invalidOutputs) {
-      expect(() =>
-        parseCompletedResponseLogicTask({
-          status: "completed",
-          output: [
-            {
-              type: "message",
-              role: "assistant",
-              content: output,
-            },
-          ],
-        }),
-      ).toThrow();
-    }
   });
 
   it("normalizes only known upstream task states", () => {

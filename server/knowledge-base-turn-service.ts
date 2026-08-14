@@ -23,7 +23,9 @@ import {
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   knowledgeBaseResetStates,
+  localAssets,
   messages,
+  providerFileLeases,
   upstreamResources,
   userUsageOwners,
   type ConversationTurn,
@@ -50,16 +52,12 @@ import {
 } from "./knowledge-base-conversation-messages";
 import { getDb } from "./db";
 import type { KnowledgeBaseTreePolicyVersion } from "./knowledge-base-progress";
-import {
-  knowledgeBaseNewBuildPolicyBinding,
-  knowledgeBaseSkillContentHashForTreePolicy,
-} from "./knowledge-base-tree-policy-rollout";
+import { knowledgeBaseNewBuildPolicyBinding } from "./knowledge-base-tree-policy-rollout";
 import { normalizeKnowledgeBaseCustomerMarkdownImages } from "./knowledge-base-markdown-normalization";
 import {
   canonicalKnowledgeBaseMarkdown,
   knowledgeBaseMarkdownSha256,
 } from "./knowledge-base-package-validation";
-import { knowledgeBaseNewBuildProviderProtocol } from "./knowledge-base-manus-v2-rollout";
 import {
   persistKnowledgeBaseBuildSource,
   readKnowledgeBaseLocalSource,
@@ -327,6 +325,7 @@ export type KnowledgeBaseGeneratedAttachmentRole =
   | "skill"
   | "prefill"
   | "instructions"
+  | "working_set"
   | "finalization";
 
 export interface KnowledgeBaseGeneratedAttachmentReservation {
@@ -471,6 +470,7 @@ export type KnowledgeBaseTurnReservationErrorCode =
   | "INVALID_REQUEST"
   | "BUILD_NOT_FOUND"
   | "CONVERSATION_RESET"
+  | "RESET_REQUIRED"
   | "KNOWLEDGE_BASE_RESET_REVISION_CHANGED"
   | "CONFLICT"
   | "STALE_KNOWLEDGE_BASE_PRESENTATION"
@@ -1118,6 +1118,7 @@ function normalizeGeneratedAttachmentInput(input: {
     input.role !== "skill" &&
     input.role !== "prefill" &&
     input.role !== "instructions" &&
+    input.role !== "working_set" &&
     input.role !== "finalization"
   ) {
     throw new KnowledgeBaseTurnReservationError(
@@ -2208,6 +2209,12 @@ export async function reserveKnowledgeBaseFailedNotSentLegacyHandoff(
     )[0] as KnowledgeBaseBuild | undefined;
     if (!build) {
       return { state: "stale", sourceTurnId, replacementTurnId: null };
+    }
+    if (build.executionMode === "legacy_conversational") {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESET_REQUIRED",
+        "旧知识库构建不再续跑；请批准重置并重新上传资料",
+      );
     }
     if (build.activeTurnId !== sourceTurnId) {
       const source = (
@@ -4812,17 +4819,17 @@ export async function reserveKnowledgeBaseStartBuild(
         1_024,
       )
     : null;
-  const policyBinding =
-    input.treePolicyVersion === undefined
-      ? knowledgeBaseNewBuildPolicyBinding()
-      : {
-          treePolicyVersion: input.treePolicyVersion,
-          skillVersion: "4" as const,
-          skillContentHash: knowledgeBaseSkillContentHashForTreePolicy(
-            input.treePolicyVersion,
-          ),
-        };
-  const providerProtocol = knowledgeBaseNewBuildProviderProtocol();
+  const policyBinding = knowledgeBaseNewBuildPolicyBinding();
+  if (
+    input.treePolicyVersion !== undefined &&
+    input.treePolicyVersion !== policyBinding.treePolicyVersion
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "All new knowledge-base builds require the materialized v5 tree policy",
+    );
+  }
+  const providerProtocol = "manus_v2" as const;
   if (
     skillVersion !== policyBinding.skillVersion ||
     skillContentHash !== policyBinding.skillContentHash
@@ -4978,6 +4985,8 @@ export async function reserveKnowledgeBaseStartBuild(
         skillArchiveBytes: pinnedSkillArchive.archiveBytes,
         skillArchiveStorageKey: pinnedSkillArchive.storageKey,
         treePolicyVersion: policyBinding.treePolicyVersion,
+        executionMode: "materialized_bundle_v1",
+        contentVersion: 0,
         providerProtocol,
         canonicalTaskState: "unbound",
         status: "researching",
@@ -5012,6 +5021,16 @@ export async function reserveKnowledgeBaseStartBuild(
       throw new KnowledgeBaseTurnReservationError(
         "BUILD_NOT_FOUND",
         "Knowledge-base build could not be reserved",
+      );
+    }
+    if (
+      build.executionMode !== "materialized_bundle_v1" ||
+      build.skillVersion !== "5" ||
+      build.providerProtocol !== "manus_v2"
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESET_REQUIRED",
+        "旧知识库构建不再续跑；请批准重置并重新上传资料",
       );
     }
     // A retention worker may have held the build unique-key gap while this
@@ -5617,28 +5636,60 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     metadata,
     expectedResetRevision: input.expectedResetRevision,
   });
-  const resource = (
-    await tx
-      .select()
-      .from(upstreamResources)
-      .where(
-        and(
-          eq(upstreamResources.kind, "file"),
-          eq(upstreamResources.upstreamId, attachment.file_id),
-        ),
-      )
-      .limit(1)
-      .for("update")
-  )[0] as UpstreamResource | undefined;
-  if (
-    !resource ||
-    resource.userId !== turn.userId ||
-    resource.apiCredentialId !== turn.apiCredentialId ||
-    resource.projectAssignmentId !== (input.projectAssignmentId ?? null) ||
-    Boolean(resource.contentDeletedAt) ||
+  const localAsset = input.managedUploadProof
+    ? (
+        await tx
+          .select()
+          .from(localAssets)
+          .where(
+            and(
+              eq(localAssets.id, attachment.file_id),
+              eq(localAssets.scope, "managed_user"),
+              eq(localAssets.accountUserId, turn.userId),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0]
+    : null;
+  const legacyResource = !input.managedUploadProof
+    ? ((
+        await tx
+          .select()
+          .from(upstreamResources)
+          .where(
+            and(
+              eq(upstreamResources.kind, "file"),
+              eq(upstreamResources.upstreamId, attachment.file_id),
+            ),
+          )
+          .limit(1)
+          .for("update")
+      )[0] as UpstreamResource | undefined)
+    : undefined;
+  if (input.managedUploadProof) {
+    if (
+      !localAsset ||
+      localAsset.filename !== attachment.filename ||
+      localAsset.mimeType !== input.managedUploadProof.mimeType ||
+      localAsset.sizeBytes !== input.managedUploadProof.sizeBytes ||
+      localAsset.contentSha256 !== input.managedUploadProof.contentSha256
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The uploaded local asset is not owned by this knowledge-base account",
+      );
+    }
+  } else if (
+    !legacyResource ||
+    legacyResource.userId !== turn.userId ||
+    legacyResource.apiCredentialId !== turn.apiCredentialId ||
+    legacyResource.projectAssignmentId !==
+      (input.projectAssignmentId ?? null) ||
+    Boolean(legacyResource.contentDeletedAt) ||
     !(
-      resource.conversationId === null ||
-      resource.conversationId === turn.conversationId
+      legacyResource.conversationId === null ||
+      legacyResource.conversationId === turn.conversationId
     )
   ) {
     throw new KnowledgeBaseTurnReservationError(
@@ -5768,11 +5819,11 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     })),
   });
   const now = input.now ?? new Date();
-  if (resource.conversationId === null) {
+  if (legacyResource?.conversationId === null) {
     await tx
       .update(upstreamResources)
       .set({ conversationId: turn.conversationId })
-      .where(eq(upstreamResources.id, resource.id));
+      .where(eq(upstreamResources.id, legacyResource.id));
   }
   const nextMetadata: KnowledgeBaseTurnMetadata = {
     ...metadata,
@@ -6197,6 +6248,7 @@ export async function completeKnowledgeBaseGeneratedAttachment(
     input.role !== "skill" &&
     input.role !== "prefill" &&
     input.role !== "instructions" &&
+    input.role !== "working_set" &&
     input.role !== "finalization"
   ) {
     throw new KnowledgeBaseTurnReservationError(
@@ -7165,6 +7217,46 @@ export async function persistKnowledgeBaseManusV2AttachmentMapping(
         conversationId: turn.conversationId,
         createdAt: now,
       });
+    }
+    if (
+      normalized.sourceFileId.startsWith("asset_") &&
+      normalized.sourceFileId.length <= 36
+    ) {
+      const credential = (
+        await tx
+          .select({ version: apiCredentials.version })
+          .from(apiCredentials)
+          .where(eq(apiCredentials.id, turn.apiCredentialId))
+          .limit(1)
+      )[0];
+      if (!credential) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The frozen credential version for this local asset is unavailable",
+        );
+      }
+      await tx
+        .insert(providerFileLeases)
+        .values({
+          id: randomUUID(),
+          localAssetId: normalized.sourceFileId,
+          apiCredentialId: turn.apiCredentialId,
+          credentialVersion: credential.version,
+          providerFileId: normalized.upstreamFileId,
+          providerRequestId: null,
+          uploadState: "uploaded",
+          uploadedBytes: normalized.sizeBytes,
+          expiresAt: new Date(normalized.expiresAt * 1_000),
+        })
+        .onDuplicateKeyUpdate({
+          set: {
+            apiCredentialId: turn.apiCredentialId,
+            credentialVersion: credential.version,
+            uploadState: "uploaded",
+            uploadedBytes: normalized.sizeBytes,
+            expiresAt: new Date(normalized.expiresAt * 1_000),
+          },
+        });
     }
     mappings[normalized.mappingKey] = normalized;
     const nextMetadata = {
@@ -8990,9 +9082,7 @@ function reusableCompatibleCreateAttachmentMappings(input: {
   ) {
     return {};
   }
-  const stored = Object.values(
-    manusV2AttachmentMappings(input.sourceMetadata),
-  );
+  const stored = Object.values(manusV2AttachmentMappings(input.sourceMetadata));
   if (stored.length !== expectedCount) return {};
   const reusable: Record<string, KnowledgeBaseManusV2AttachmentMapping> = {};
   try {
@@ -9244,7 +9334,9 @@ export async function reserveKnowledgeBaseCompatibleCreateRecovery(
     const metadata: KnowledgeBaseTurnMetadata = {
       leaseOwnerHash: leaseOwnerHash(leaseToken),
       attachmentsFrozen: false,
-      expectedAttachmentCount: Number(sourceMetadata.expectedAttachmentCount || 0),
+      expectedAttachmentCount: Number(
+        sourceMetadata.expectedAttachmentCount || 0,
+      ),
       userAttachmentCount: Number(sourceMetadata.userAttachmentCount || 0),
       awaitingClientAttachments: false,
       recovery,
@@ -9356,9 +9448,8 @@ export async function reserveKnowledgeBaseCompatibleCreateRecovery(
         turn: turnRecord(row),
         leaseToken,
         leaseExpiresAt,
-        upstreamIdempotencyKey: createKnowledgeBaseUpstreamIdempotencyKey(
-          operationKey,
-        ),
+        upstreamIdempotencyKey:
+          createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
         recoveryMetadata: recovery,
         preparedDispatch: null,
       },
@@ -9518,8 +9609,7 @@ export async function reserveKnowledgeBaseNewCanonicalFromSnapshot(
     const terminalRecovery = knowledgeBaseTerminalRecoveryFromBuild(build);
     const rejectedTurnId =
       build.activeTurnId ||
-      (terminalRecovery?.action ===
-        "create_new_canonical_from_snapshot" &&
+      (terminalRecovery?.action === "create_new_canonical_from_snapshot" &&
       terminalRecovery.sourceStateEpoch === build.stateEpoch
         ? terminalRecovery.sourceTurnId
         : null);
@@ -10056,7 +10146,11 @@ export async function reserveKnowledgeBaseManusV2AnchorHandoff(
     ? normalizeRequiredId(input.recoveryToken, "recoveryToken", 64)
     : null;
   if (
-    [explicitClientRequestId, explicitRecoverySourceTurnId, explicitRecoveryToken].some(Boolean) &&
+    [
+      explicitClientRequestId,
+      explicitRecoverySourceTurnId,
+      explicitRecoveryToken,
+    ].some(Boolean) &&
     (!explicitClientRequestId ||
       !explicitRecoverySourceTurnId ||
       !explicitRecoveryToken ||
@@ -10241,18 +10335,20 @@ export async function reserveKnowledgeBaseManusV2AnchorHandoff(
         : undefined;
     const explicitSource =
       sourceProtocol === "manus_v2" && explicitRecoverySourceTurnId
-        ? ((await tx
-            .select()
-            .from(conversationTurns)
-            .where(
-              and(
-                eq(conversationTurns.id, explicitRecoverySourceTurnId),
-                eq(conversationTurns.userId, input.userId),
-                eq(conversationTurns.buildId, buildId),
-              ),
-            )
-            .limit(1)
-            .for("update"))[0] as ConversationTurn | undefined)
+        ? ((
+            await tx
+              .select()
+              .from(conversationTurns)
+              .where(
+                and(
+                  eq(conversationTurns.id, explicitRecoverySourceTurnId),
+                  eq(conversationTurns.userId, input.userId),
+                  eq(conversationTurns.buildId, buildId),
+                ),
+              )
+              .limit(1)
+              .for("update")
+          )[0] as ConversationTurn | undefined)
         : undefined;
     const explicitSourceMetadata = explicitSource
       ? metadataOf(explicitSource)
@@ -11818,7 +11914,8 @@ export function knowledgeBaseManusV2TerminalRejectionAuthority(input: {
     : ({
         failureClass: "terminal_nonregenerable" as const,
         recoveryAction: "contact_support" as const,
-        message: "FrontMind 明确拒绝了当前请求；系统不会自动重发，请联系支持处理",
+        message:
+          "FrontMind 明确拒绝了当前请求；系统不会自动重发，请联系支持处理",
       } as const);
 }
 
@@ -11977,8 +12074,7 @@ function isKnowledgeBaseTerminalRejectionSource(input: {
     isKnowledgeBaseTerminalRejectionEvidence(input) &&
     input.turn.buildGeneration === input.build.generation &&
     input.turn.expectedRevision === input.build.revision &&
-    (input.turn.expectedLeafId ?? null) ===
-      (input.build.currentLeafId ?? null)
+    (input.turn.expectedLeafId ?? null) === (input.build.currentLeafId ?? null)
   );
 }
 
@@ -12282,9 +12378,7 @@ export async function normalizeKnowledgeBaseTerminalRejection(
     )[0] as ConversationTurn | undefined;
     if (!turn) return null;
     const metadata = metadataOf(turn);
-    if (
-      !isKnowledgeBaseTerminalRejectionSource({ turn, build, metadata })
-    ) {
+    if (!isKnowledgeBaseTerminalRejectionSource({ turn, build, metadata })) {
       return null;
     }
     const now = input.now ?? new Date();
@@ -12455,9 +12549,7 @@ export async function inspectKnowledgeBaseExplicitRecovery(input: {
       )
       .limit(1)
   )[0] as KnowledgeBaseBuild | undefined;
-  const recovery = build
-    ? knowledgeBaseTerminalRecoveryFromBuild(build)
-    : null;
+  const recovery = build ? knowledgeBaseTerminalRecoveryFromBuild(build) : null;
   if (!build || !recovery) return null;
   if (recovery.recoveryStateSha256 !== input.recoveryToken) {
     throw new KnowledgeBaseTurnReservationError(
@@ -12649,9 +12741,11 @@ export async function beginKnowledgeBaseManusV2Dispatch(
         "The build is not ready for Manus v2 dispatch",
       );
     }
+    const materialized = build.executionMode === "materialized_bundle_v1";
     if (
       turn.apiCredentialId === null ||
-      (build.canonicalCredentialId &&
+      (!materialized &&
+        build.canonicalCredentialId &&
         build.canonicalCredentialId !== turn.apiCredentialId)
     ) {
       throw new KnowledgeBaseTurnReservationError(
@@ -12667,10 +12761,15 @@ export async function beginKnowledgeBaseManusV2Dispatch(
         30_000,
       );
     }
-    const canonicalTaskId = build.canonicalTaskId
-      ? normalizeRequiredId(build.canonicalTaskId, "canonicalTaskId", 255)
-      : null;
-    const method = canonicalTaskId ? "task.sendMessage" : "task.create";
+    const canonicalTaskId =
+      !materialized && build.canonicalTaskId
+        ? normalizeRequiredId(build.canonicalTaskId, "canonicalTaskId", 255)
+        : null;
+    const method = materialized
+      ? ("task.create" as const)
+      : canonicalTaskId
+        ? ("task.sendMessage" as const)
+        : ("task.create" as const);
     if (input.expectedMethod && input.expectedMethod !== method) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
@@ -12678,6 +12777,7 @@ export async function beginKnowledgeBaseManusV2Dispatch(
       );
     }
     if (
+      !materialized &&
       canonicalTaskId &&
       (build.canonicalTaskGeneration !== build.generation ||
         !["active", "reconciling"].includes(build.canonicalTaskState))
@@ -12688,6 +12788,7 @@ export async function beginKnowledgeBaseManusV2Dispatch(
       );
     }
     if (
+      !materialized &&
       !canonicalTaskId &&
       build.canonicalTaskState !== "unbound" &&
       build.canonicalTaskState !== "creating"
@@ -12703,7 +12804,9 @@ export async function beginKnowledgeBaseManusV2Dispatch(
       "operationToken",
       128,
     );
-    const title = `FrontMind KB ${build.id} g${build.generation}`;
+    const title = materialized
+      ? `FrontMind KB ${build.id} g${build.generation} ${turn.id}`
+      : `FrontMind KB ${build.id} g${build.generation}`;
     const now = input.now ?? new Date();
     const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
     assertInteger(leaseMs, "leaseMs", 1_000);
@@ -12733,7 +12836,7 @@ export async function beginKnowledgeBaseManusV2Dispatch(
         updatedAt: now,
       })
       .where(eq(conversationTurns.id, turn.id));
-    if (!canonicalTaskId) {
+    if (!materialized && !canonicalTaskId) {
       const canonicalBinding = await tx
         .update(knowledgeBaseBuilds)
         .set({
@@ -12780,6 +12883,7 @@ export async function bindKnowledgeBaseManusV2Submission(
     const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
     assertLease(turn, input.leaseToken);
     const metadata = metadataOf(turn);
+    const materialized = build.executionMode === "materialized_bundle_v1";
     const reconciledUnknownAcknowledgement =
       metadata.outcomeUnknownAt !== undefined &&
       (metadata.providerAttemptState === "outcome_unknown" ||
@@ -12798,6 +12902,7 @@ export async function bindKnowledgeBaseManusV2Submission(
     }
     if (
       input.method === "task.create" &&
+      !materialized &&
       (build.canonicalTaskId ||
         !["creating", "reconciling"].includes(build.canonicalTaskState) ||
         build.canonicalTaskGeneration !== build.generation)
@@ -12809,7 +12914,8 @@ export async function bindKnowledgeBaseManusV2Submission(
     }
     if (
       input.method === "task.sendMessage" &&
-      (build.canonicalTaskId !== taskId ||
+      (materialized ||
+        build.canonicalTaskId !== taskId ||
         build.canonicalTaskGeneration !== build.generation)
     ) {
       throw new KnowledgeBaseTurnReservationError(
@@ -12822,7 +12928,10 @@ export async function bindKnowledgeBaseManusV2Submission(
       const apiCredentialId = turn.apiCredentialId
         ? normalizeRequiredId(turn.apiCredentialId, "apiCredentialId", 36)
         : null;
-      if (!apiCredentialId || build.canonicalCredentialId !== apiCredentialId) {
+      if (
+        !apiCredentialId ||
+        (!materialized && build.canonicalCredentialId !== apiCredentialId)
+      ) {
         throw new KnowledgeBaseTurnReservationError(
           "CONFLICT",
           "The canonical Manus task credential changed before acknowledgement",
@@ -12921,7 +13030,7 @@ export async function bindKnowledgeBaseManusV2Submission(
         updatedAt: now,
       })
       .where(eq(conversationTurns.id, turn.id));
-    if (input.method === "task.create") {
+    if (input.method === "task.create" && !materialized) {
       const canonicalBinding = await tx
         .update(knowledgeBaseBuilds)
         .set({
@@ -12956,6 +13065,23 @@ export async function bindKnowledgeBaseManusV2Submission(
           "A canonical Manus task was bound by another writer",
         );
       }
+    } else if (input.method === "task.create") {
+      await tx
+        .update(knowledgeBaseBuilds)
+        .set({
+          // Audit pointer only. It is cleared when the complete local Working
+          // Set is activated and is never used for a later continuation.
+          upstreamTaskId: taskId,
+          stateEpoch: build.stateEpoch + 1,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(knowledgeBaseBuilds.id, build.id),
+            eq(knowledgeBaseBuilds.generation, build.generation),
+            eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          ),
+        );
     }
     return turnRecord({
       ...turn,
@@ -15459,6 +15585,10 @@ export async function findRecoverableKnowledgeBaseTurnIds(
     )
     .where(
       and(
+        eq(
+          knowledgeBaseBuilds.executionMode,
+          "materialized_bundle_v1",
+        ),
         or(
           and(
             inArray(conversationTurns.status, ["queued", "running", "failed"]),
@@ -15583,6 +15713,15 @@ export async function claimKnowledgeBaseTurnForRecovery(
       throw error;
     }
     const currentMetadata = metadataOf(turn);
+    if (
+      build.executionMode !== "materialized_bundle_v1" ||
+      build.skillVersion !== "5" ||
+      build.providerProtocol !== "manus_v2"
+    ) {
+      // Pre-v5 builds are deliberately inert. They remain readable only as a
+      // RESET_REQUIRED projection and must never acquire a Provider lease.
+      return null;
+    }
     if (isHistoricalPreproviderAuthoritySelfTerminal(build, turn)) {
       // A scan may discover this exact historical self-terminal row, but it
       // must never claim a dispatch lease or touch the Provider. Reclassify
@@ -16042,6 +16181,17 @@ export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
       userId: input.userId,
       turnId,
     });
+    if (
+      build.executionMode !== "materialized_bundle_v1" ||
+      build.skillVersion !== "5" ||
+      build.providerProtocol !== "manus_v2" ||
+      build.contentVersion === null
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESET_REQUIRED",
+        "旧知识库构建不再续跑；请批准重置并重新上传资料",
+      );
+    }
     const metadata = metadataOf(turn);
     const storedCreateAttemptState =
       storedKnowledgeBaseCreateAttemptState(metadata);

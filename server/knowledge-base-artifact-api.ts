@@ -42,6 +42,11 @@ import {
   isDashboardOwnedKnowledgePackageBuild,
   readDashboardOwnedKnowledgePackage,
 } from "./knowledge-base-local-package";
+import {
+  KnowledgeBaseMaterializedAssetError,
+  readValidatedActiveKnowledgeBaseWorkingSet,
+  resolveKnowledgeBaseWorkingSetResource,
+} from "./knowledge-base-materialized-assets";
 
 const router = Router();
 const MAX_CUSTOMER_UPLOAD_SOURCE_BYTES = 100 * 1024 * 1024;
@@ -208,6 +213,20 @@ export function resolveKnowledgeBaseArtifactDescriptor(
 }
 
 function sendArtifactError(res: Response, error: unknown) {
+  if (error instanceof KnowledgeBaseMaterializedAssetError) {
+    res
+      .status(error.code === "WORKING_SET_RESOURCE_NOT_FOUND" ? 404 : 409)
+      .json({
+        error: {
+          code: error.code,
+          message:
+            error.code === "WORKING_SET_RESOURCE_NOT_FOUND"
+              ? "该知识库资源不属于当前内容版本"
+              : "当前知识库资源完整性复核未通过",
+        },
+      });
+    return;
+  }
   if (error instanceof KnowledgeBuildArtifactError) {
     const status = error.code === "ARTIFACT_NOT_FOUND" ? 404 : 409;
     res.status(status).json({
@@ -240,6 +259,80 @@ function sendArtifactError(res: Response, error: unknown) {
       message: "知识库资源读取失败，请稍后重试",
     },
   });
+}
+
+async function serveWorkingSetResource(
+  req: FrontMindRequest,
+  res: Response,
+  kind: "asset" | "evidence",
+) {
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({
+      error: { code: "UNAUTHORIZED", message: "请先登录" },
+    });
+    return;
+  }
+  const buildId = String(req.params.buildId || "").trim();
+  const db = await getDb();
+  if (!db) {
+    res.status(503).json({
+      error: { code: "DATABASE_UNAVAILABLE", message: "数据库暂不可用" },
+    });
+    return;
+  }
+  const build = (
+    await db
+      .select()
+      .from(knowledgeBaseBuilds)
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, buildId),
+          eq(knowledgeBaseBuilds.userId, userId),
+        ),
+      )
+      .limit(1)
+  )[0];
+  if (!build || build.userId !== userId) {
+    res.status(404).json({
+      error: { code: "BUILD_NOT_FOUND", message: "知识库构建记录不存在" },
+    });
+    return;
+  }
+  try {
+    const active = await readValidatedActiveKnowledgeBaseWorkingSet({
+      db,
+      build,
+    });
+    const resource = resolveKnowledgeBaseWorkingSetResource({
+      buildId,
+      workingSet: active.validated,
+      kind,
+      expectedSha256: String(req.params.sha256 || ""),
+      ...(kind === "asset"
+        ? { assetId: String(req.params.assetId || "") }
+        : {
+            leafId: String(req.params.leafId || ""),
+            pathSha256: String(req.params.pathSha256 || ""),
+          }),
+    });
+    const digest = createHash("sha256").update(resource.bytes).digest("hex");
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Content-Type", resource.mimeType);
+    res.setHeader("Content-Length", String(resource.bytes.length));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+    res.setHeader("ETag", `\"sha256-${digest}\"`);
+    res.setHeader(
+      "Content-Disposition",
+      `${resource.disposition}; filename*=UTF-8''${encodeURIComponent(resource.filename)}`,
+    );
+    res.end(resource.bytes);
+  } catch (error) {
+    sendArtifactError(res, error);
+  }
 }
 
 async function serveBuildArtifact(
@@ -788,6 +881,20 @@ router.get(
   "/:buildId/customer-uploads/:turnId/:index/:sourceSha",
   (req: FrontMindRequest, res) => {
     void serveCustomerUploadPreview(req, res);
+  },
+);
+
+router.get(
+  "/:buildId/working-set/assets/:assetId/:sha256",
+  (req: FrontMindRequest, res) => {
+    void serveWorkingSetResource(req, res, "asset");
+  },
+);
+
+router.get(
+  "/:buildId/working-set/evidence/:leafId/:pathSha256/:sha256",
+  (req: FrontMindRequest, res) => {
+    void serveWorkingSetResource(req, res, "evidence");
   },
 );
 

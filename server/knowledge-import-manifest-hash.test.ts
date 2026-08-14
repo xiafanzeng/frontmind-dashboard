@@ -1,14 +1,22 @@
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { websiteProjectDeletionTombstones } from "../drizzle/schema";
 
+const candidateBytes = Buffer.from("candidate artifact bytes");
+const finalBytes = Buffer.from("finalized local knowledge archive bytes");
+const candidateSha256 = createHash("sha256")
+  .update(candidateBytes)
+  .digest("hex");
+const finalSha256 = createHash("sha256").update(finalBytes).digest("hex");
+const candidateArtifactId = `artifact_${"a".repeat(64)}`;
+const finalArtifactId = `artifact_${"b".repeat(64)}`;
+
 const mocks = vi.hoisted(() => ({
   getDb: vi.fn(),
-  axiosGet: vi.fn(),
-  collectDescriptors: vi.fn(),
-  descriptorHash: vi.fn(),
-  downloadArchiveBytes: vi.fn(),
+  readArtifact: vi.fn(),
+  readStoredFile: vi.fn(),
   readKnowledgeArchive: vi.fn(),
   removeStoredKnowledgeAssets: vi.fn(),
   persistKnowledgeSnapshotArchive: vi.fn(),
@@ -17,54 +25,33 @@ const mocks = vi.hoisted(() => ({
   createKnowledgeSnapshot: vi.fn(),
   getDashboardWorkspace: vi.fn(),
   getKnowledgeSnapshotById: vi.fn(),
-  getPresalesCredentialForResource: vi.fn(),
-  getPresalesTaskProjectBinding: vi.fn(),
   assertServiceCapability: vi.fn(),
   assertKnowledgeBaseWritable: vi.fn(),
   createKnowledgeMonitoringHandoff: vi.fn(),
 }));
 
-vi.mock("axios", () => ({
-  default: { get: mocks.axiosGet },
+vi.mock("./db", () => ({ getDb: mocks.getDb }));
+vi.mock("./presales-v2-store", () => ({
+  readPresalesV2Artifact: mocks.readArtifact,
 }));
-
-vi.mock("./db", () => ({
-  getDb: mocks.getDb,
+vi.mock("./presales-file-store", () => ({
+  readStoredPresalesFile: mocks.readStoredFile,
 }));
-
-vi.mock("./knowledge-base-artifact", () => ({
-  collectKnowledgeArchiveDescriptors: mocks.collectDescriptors,
-  knowledgeArchiveDescriptorHash: mocks.descriptorHash,
-}));
-
 vi.mock("./dashboard-api", () => ({
   assertKnowledgeArchiveEnterpriseIdentity:
     mocks.assertKnowledgeArchiveEnterpriseIdentity,
-  downloadArchiveBytes: mocks.downloadArchiveBytes,
   readKnowledgeArchive: mocks.readKnowledgeArchive,
   removeStoredKnowledgeAssets: mocks.removeStoredKnowledgeAssets,
 }));
-
 vi.mock("./dashboard-service", () => ({
   createKnowledgeSnapshot: mocks.createKnowledgeSnapshot,
   getDashboardWorkspace: mocks.getDashboardWorkspace,
   getKnowledgeSnapshotById: mocks.getKnowledgeSnapshotById,
 }));
-
 vi.mock("./knowledge-snapshot-archive-store", () => ({
   persistKnowledgeSnapshotArchive: mocks.persistKnowledgeSnapshotArchive,
   removeKnowledgeSnapshotArchive: mocks.removeKnowledgeSnapshotArchive,
 }));
-
-vi.mock("./presales-service", () => ({
-  getPresalesCredentialForResource: mocks.getPresalesCredentialForResource,
-  getPresalesTaskProjectBinding: mocks.getPresalesTaskProjectBinding,
-}));
-
-vi.mock("./upstream-config", () => ({
-  getUpstreamBaseUrl: () => "https://api.example.test",
-}));
-
 vi.mock("./service-entitlement", () => {
   class ServiceEntitlementError extends Error {
     statusCode = 403;
@@ -74,11 +61,9 @@ vi.mock("./service-entitlement", () => {
     ServiceEntitlementError,
   };
 });
-
 vi.mock("./knowledge-base-reset-service", () => ({
   assertKnowledgeBaseWritable: mocks.assertKnowledgeBaseWritable,
 }));
-
 vi.mock("./delivery-role-service", () => ({
   createKnowledgeMonitoringHandoff: mocks.createKnowledgeMonitoringHandoff,
 }));
@@ -96,12 +81,8 @@ function queryResult<T>(rows: T[]) {
 }
 
 function importDatabase(transactionResults: unknown[][] = [[], []]) {
-  const transactionUpdates: Array<Record<string, unknown>> = [];
-  const transactionUpdateQuery = {
-    set: (value: Record<string, unknown>) => {
-      transactionUpdates.push(value);
-      return transactionUpdateQuery;
-    },
+  const txUpdate = {
+    set: () => txUpdate,
     where: vi.fn().mockResolvedValue(undefined),
   };
   const tx = {
@@ -119,7 +100,7 @@ function importDatabase(transactionResults: unknown[][] = [[], []]) {
             })
           : vi.fn().mockResolvedValue(undefined),
     }),
-    update: () => transactionUpdateQuery,
+    update: () => txUpdate,
   };
   const provisionQuery = {
     from: () => provisionQuery,
@@ -143,55 +124,76 @@ function importDatabase(transactionResults: unknown[][] = [[], []]) {
     transaction: async (operation: (value: typeof tx) => unknown) =>
       operation(tx),
     update: () => updateQuery,
-    transactionUpdates,
-    receiptUpdateWhere: updateQuery.where,
   };
 }
 
-describe("website knowledge import v3 manifest binding", () => {
+function value(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 5 as const,
+    companyName: "示例企业",
+    candidateArtifactId,
+    finalArtifactId,
+    candidateSha256,
+    finalSha256,
+    packageManifestSha256: "c".repeat(64),
+    finalizerVersion: "website-kb-finalizer-v1" as const,
+    ...overrides,
+  };
+}
+
+function stored(bytes: Buffer, sha256: string, filename: string) {
+  return {
+    filename,
+    mimeType: "application/zip",
+    recordedSizeBytes: bytes.length,
+    sizeBytes: bytes.length,
+    sha256,
+    uploadedAt: new Date(),
+    contentExpiresAt: new Date(Date.now() + 60_000),
+    contentStoredAt: new Date(),
+    manifestUpdatedAt: new Date(),
+    createReadStream: () => Readable.from(bytes),
+  };
+}
+
+describe("website knowledge import v5 local artifact binding", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getDb.mockResolvedValue(importDatabase());
-    mocks.getPresalesTaskProjectBinding.mockResolvedValue({
-      projectId: "project-acceptance-001",
-      apiCredentialId: "credential-1",
-      credentialVersion: 3,
-    });
-    mocks.getPresalesCredentialForResource.mockResolvedValue({
-      id: "credential-1",
-      version: 3,
-      apiKey: "sk-test-credential",
-    });
-    mocks.assertServiceCapability.mockResolvedValue(undefined);
-    mocks.assertKnowledgeBaseWritable.mockResolvedValue(undefined);
-    mocks.createKnowledgeMonitoringHandoff.mockResolvedValue({
-      created: [],
-      assigned: false,
-    });
-    mocks.axiosGet.mockResolvedValue({
-      status: 200,
-      data: {
-        task: {
-          id: "task-website-kb-v3",
-          status: "completed",
-          output: [{ type: "output_file" }],
-        },
-      },
-    });
-    mocks.collectDescriptors.mockReturnValue([
-      {
-        outputItemId: "output-v3",
-        fileId: "file-v3",
-        filename: "knowledge.zip",
-      },
-    ]);
-    mocks.descriptorHash.mockReturnValue("a".repeat(64));
-    mocks.downloadArchiveBytes.mockResolvedValue({
-      buffer: Buffer.from("validated archive bytes"),
-      filename: "knowledge.zip",
-    });
+    mocks.readArtifact.mockImplementation(async (artifactId: string) =>
+      artifactId === candidateArtifactId
+        ? {
+            artifactId,
+            projectId: "project-acceptance-001",
+            filename: "candidate.zip",
+            mimeType: "application/zip",
+            bytes: candidateBytes.length,
+            sha256: candidateSha256,
+          }
+        : artifactId === finalArtifactId
+          ? {
+              artifactId,
+              projectId: "project-acceptance-001",
+              filename: "示例企业_knowledge_base.zip",
+              mimeType: "application/zip",
+              bytes: finalBytes.length,
+              sha256: finalSha256,
+            }
+          : null,
+    );
+    mocks.readStoredFile.mockImplementation(async (artifactId: string) =>
+      artifactId === candidateArtifactId
+        ? stored(candidateBytes, candidateSha256, "candidate.zip")
+        : artifactId === finalArtifactId
+          ? stored(
+              finalBytes,
+              finalSha256,
+              "示例企业_knowledge_base.zip",
+            )
+          : null,
+    );
     mocks.readKnowledgeArchive.mockResolvedValue({
-      packageManifestSha256: "d".repeat(64),
+      packageManifestSha256: "c".repeat(64),
       storedAssetKeys: [],
       documents: [],
       assets: [],
@@ -212,465 +214,105 @@ describe("website knowledge import v3 manifest binding", () => {
       id: "snapshot-existing",
       version: 1,
     });
-  });
-
-  it("rejects a parsed package manifest whose hash differs from the v3 declaration", async () => {
-    const buffer = Buffer.from("validated archive bytes");
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-project-acceptance-v3",
-        value: {
-          schemaVersion: 3,
-          archiveContractVersion: 1,
-          validationProfile: "website-lead-v1",
-          packageManifestSha256: "c".repeat(64),
-          companyName: "示例企业",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactSha256: createHash("sha256").update(buffer).digest("hex"),
-          filename: "knowledge.zip",
-        },
-      }),
-    ).rejects.toMatchObject({
-      code: "ARTIFACT_HASH_MISMATCH",
-      status: 409,
-      message: "知识库 package manifest 哈希与官网声明不一致",
+    mocks.assertServiceCapability.mockResolvedValue(undefined);
+    mocks.assertKnowledgeBaseWritable.mockResolvedValue(undefined);
+    mocks.createKnowledgeMonitoringHandoff.mockResolvedValue({
+      created: [],
+      assigned: false,
     });
-
-    expect(mocks.readKnowledgeArchive).toHaveBeenCalledWith(
-      buffer,
-      "knowledge.zip",
-      expect.any(String),
-      {
-        validationProfile: "website-lead-v1",
-        archiveContractVersion: 1,
-      },
-    );
-    expect(mocks.createKnowledgeSnapshot).not.toHaveBeenCalled();
-    expect(mocks.persistKnowledgeSnapshotArchive).not.toHaveBeenCalled();
-    expect(mocks.removeStoredKnowledgeAssets).toHaveBeenCalledWith([]);
   });
 
-  it("does not reopen a completed legacy receipt under a different source contract", async () => {
-    const buffer = Buffer.from("validated archive bytes");
-    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
-    const database = importDatabase([
-      [
-        {
-          id: "receipt-v2",
-          userId: 7,
-          projectId: "project-acceptance-001",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactHash: artifactSha256,
-          sourceReference: "project-acceptance-001:task-website-kb-v3",
-          status: "completed",
-          snapshotId: "snapshot-v2",
-          attemptCount: 1,
-          revision: 1,
-          updatedAt: new Date("2026-07-29T00:00:00.000Z"),
-        },
-      ],
-    ]);
-    mocks.getDb.mockResolvedValue(database);
-    mocks.readKnowledgeArchive.mockResolvedValue({
-      packageManifestSha256: "c".repeat(64),
-      storedAssetKeys: [],
-      documents: [],
-      assets: [],
-    });
-
+  it("imports the exact final local bytes without any Provider lookup", async () => {
     await expect(
       importWebsiteKnowledgeArtifact({
         projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-project-acceptance-v3",
-        value: {
-          schemaVersion: 3,
-          archiveContractVersion: 1,
-          validationProfile: "website-lead-v1",
-          packageManifestSha256: "c".repeat(64),
-          companyName: "示例企业",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactSha256,
-          filename: "knowledge.zip",
-        },
-      }),
-    ).rejects.toMatchObject({
-      code: "IDEMPOTENCY_CONFLICT",
-      status: 409,
-    });
-
-    expect(mocks.readKnowledgeArchive).not.toHaveBeenCalled();
-    expect(mocks.getKnowledgeSnapshotById).not.toHaveBeenCalled();
-    expect(database.transactionUpdates).toEqual([]);
-    expect(mocks.assertKnowledgeBaseWritable).not.toHaveBeenCalled();
-    expect(mocks.persistKnowledgeSnapshotArchive).not.toHaveBeenCalled();
-    expect(mocks.createKnowledgeMonitoringHandoff).not.toHaveBeenCalled();
-  });
-
-  it("never reclaims a completed v4 receipt when the same key changes candidate lineage", async () => {
-    const buffer = Buffer.from("finalized v4 archive bytes");
-    const finalSha256 = createHash("sha256").update(buffer).digest("hex");
-    const originalValue = {
-      schemaVersion: 4 as const,
-      companyName: "示例企业",
-      candidate: {
-        taskId: "task-website-kb-v3",
-        outputItemId: "output-v3",
-        fileId: "file-v3",
-        descriptorHash: "a".repeat(64),
-        sha256: "b".repeat(64),
-      },
-      finalArtifact: {
-        fileId: "final-file-v4",
-        filename: "示例企业_knowledge_base.zip",
-        sha256: finalSha256,
-        archiveContractVersion: 3 as const,
-        validationProfile: "website-lead-v1" as const,
-        packageManifestSha256: "d".repeat(64),
-        finalizerVersion: "website-kb-finalizer-v1" as const,
-      },
-    };
-    const database = importDatabase([
-      [
-        {
-          id: "receipt-v4",
-          userId: 7,
-          projectId: "project-acceptance-001",
-          taskId: originalValue.candidate.taskId,
-          outputItemId: originalValue.candidate.outputItemId,
-          fileId: originalValue.finalArtifact.fileId,
-          descriptorHash: originalValue.candidate.descriptorHash,
-          artifactHash: finalSha256,
-          sourceReference: `website-kb:v4:${originalValue.finalArtifact.finalizerVersion}:${createHash(
-            "sha256",
-          )
-            .update(
-              [
-                originalValue.candidate.sha256,
-                originalValue.finalArtifact.sha256,
-                originalValue.finalArtifact.packageManifestSha256,
-              ].join(":"),
-            )
-            .digest("hex")}`,
-          status: "completed",
-          snapshotId: "snapshot-v4",
-          attemptCount: 1,
-          revision: 1,
-          updatedAt: new Date("2026-07-29T00:00:00.000Z"),
-        },
-      ],
-    ]);
-    mocks.getDb.mockResolvedValue(database);
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-project-acceptance-v4",
-        value: {
-          ...originalValue,
-          candidate: {
-            ...originalValue.candidate,
-            sha256: "e".repeat(64),
-          },
-        },
-      }),
-    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT", status: 409 });
-
-    expect(database.transactionUpdates).toEqual([]);
-    expect(mocks.downloadArchiveBytes).not.toHaveBeenCalled();
-    expect(mocks.createKnowledgeSnapshot).not.toHaveBeenCalled();
-    expect(mocks.createKnowledgeMonitoringHandoff).not.toHaveBeenCalled();
-  });
-
-  it("does not rebind a completed artifact under a different key and source contract", async () => {
-    const buffer = Buffer.from("validated archive bytes");
-    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
-    const database = importDatabase([
-      [],
-      [
-        {
-          id: "receipt-v2-by-artifact",
-          userId: 7,
-          projectId: "project-acceptance-001",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactHash: artifactSha256,
-          sourceReference: "project-acceptance-001:task-website-kb-v3",
-          status: "completed",
-          snapshotId: "snapshot-v2",
-          attemptCount: 1,
-          revision: 1,
-          updatedAt: new Date("2026-07-29T00:00:00.000Z"),
-        },
-      ],
-    ]);
-    mocks.getDb.mockResolvedValue(database);
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "new-key-for-existing-artifact",
-        value: {
-          schemaVersion: 3,
-          archiveContractVersion: 1,
-          validationProfile: "website-lead-v1",
-          packageManifestSha256: "c".repeat(64),
-          companyName: "示例企业",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactSha256,
-          filename: "knowledge.zip",
-        },
-      }),
-    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT", status: 409 });
-
-    expect(database.transactionUpdates).toEqual([]);
-    expect(mocks.downloadArchiveBytes).not.toHaveBeenCalled();
-    expect(mocks.createKnowledgeSnapshot).not.toHaveBeenCalled();
-  });
-
-  it("preserves committed snapshot assets when the monitoring handoff fails", async () => {
-    const buffer = Buffer.from("validated archive bytes");
-    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
-    mocks.readKnowledgeArchive.mockResolvedValue({
-      packageManifestSha256: "c".repeat(64),
-      storedAssetKeys: ["committed-image.webp"],
-      documents: [],
-      assets: [],
-    });
-    mocks.createKnowledgeMonitoringHandoff.mockRejectedValue(
-      new Error("simulated handoff failure"),
-    );
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-handoff-failure",
-        value: {
-          schemaVersion: 3,
-          archiveContractVersion: 1,
-          validationProfile: "website-lead-v1",
-          packageManifestSha256: "c".repeat(64),
-          companyName: "示例企业",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactSha256,
-          filename: "knowledge.zip",
-        },
+        idempotencyKey: "website-kb-project-acceptance-v5",
+        value: value(),
       }),
     ).resolves.toMatchObject({
       status: "completed",
       replayed: false,
       snapshot: { id: "snapshot-new" },
-    });
-
-    expect(mocks.createKnowledgeSnapshot).toHaveBeenCalled();
-    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledTimes(2);
-    expect(mocks.removeStoredKnowledgeAssets).not.toHaveBeenCalled();
-    expect(mocks.removeKnowledgeSnapshotArchive).not.toHaveBeenCalled();
-  });
-
-  it("passes the claimant revision into the atomic snapshot commit", async () => {
-    const buffer = Buffer.from("validated archive bytes");
-    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
-    mocks.readKnowledgeArchive.mockResolvedValue({
-      packageManifestSha256: "c".repeat(64),
-      storedAssetKeys: ["committed-image.webp"],
-      documents: [],
-      assets: [],
-    });
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-receipt-recovery",
-        value: {
-          schemaVersion: 3,
-          archiveContractVersion: 1,
-          validationProfile: "website-lead-v1",
-          packageManifestSha256: "c".repeat(64),
-          companyName: "示例企业",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactSha256,
-          filename: "knowledge.zip",
-        },
-      }),
-    ).resolves.toMatchObject({
-      status: "completed",
-      replayed: false,
-      snapshot: { id: "snapshot-new" },
-    });
-
-    expect(mocks.createKnowledgeSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({
-        importReceiptClaim: {
-          receiptId: expect.any(String),
-          claimRevision: 1,
-        },
-      }),
-    );
-    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledOnce();
-    expect(mocks.removeStoredKnowledgeAssets).not.toHaveBeenCalled();
-    expect(mocks.removeKnowledgeSnapshotArchive).not.toHaveBeenCalled();
-  });
-
-  it("repairs the idempotent monitoring handoff when replaying a completed receipt", async () => {
-    const buffer = Buffer.from("validated archive bytes");
-    const artifactSha256 = createHash("sha256").update(buffer).digest("hex");
-    mocks.getDb.mockResolvedValue(
-      importDatabase([
-        [
-          {
-            id: "receipt-v3",
-            userId: 7,
-            projectId: "project-acceptance-001",
-            taskId: "task-website-kb-v3",
-            outputItemId: "output-v3",
-            fileId: "file-v3",
-            descriptorHash: "a".repeat(64),
-            artifactHash: artifactSha256,
-            sourceReference: `website-kb:v3:1:website-lead-v1:${"c".repeat(64)}`,
-            status: "completed",
-            snapshotId: "snapshot-v3",
-            attemptCount: 1,
-            revision: 1,
-            updatedAt: new Date("2026-07-29T00:00:00.000Z"),
-          },
-        ],
-      ]),
-    );
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-project-acceptance-v3",
-        value: {
-          schemaVersion: 3,
-          archiveContractVersion: 1,
-          validationProfile: "website-lead-v1",
-          packageManifestSha256: "c".repeat(64),
-          companyName: "示例企业",
-          taskId: "task-website-kb-v3",
-          outputItemId: "output-v3",
-          fileId: "file-v3",
-          descriptorHash: "a".repeat(64),
-          artifactSha256,
-          filename: "knowledge.zip",
-        },
-      }),
-    ).resolves.toMatchObject({
-      status: "completed",
-      replayed: true,
-      receiptId: "receipt-v3",
-      snapshot: { id: "snapshot-existing" },
-    });
-
-    expect(mocks.axiosGet).not.toHaveBeenCalled();
-    expect(mocks.readKnowledgeArchive).not.toHaveBeenCalled();
-    expect(mocks.persistKnowledgeSnapshotArchive).not.toHaveBeenCalled();
-    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledOnce();
-    expect(mocks.createKnowledgeMonitoringHandoff).toHaveBeenCalledWith({
-      userId: 7,
-      actorUserId: 7,
-      knowledgeSnapshotId: "snapshot-v3",
-    });
-  });
-
-  it("uses the finalized file for v4 while binding lineage to the candidate task", async () => {
-    const buffer = Buffer.from("finalized v4 archive bytes");
-    const finalSha256 = createHash("sha256").update(buffer).digest("hex");
-    mocks.downloadArchiveBytes.mockResolvedValue({
-      buffer,
-      filename: "示例企业_knowledge_base.zip",
-    });
-    mocks.readKnowledgeArchive.mockResolvedValue({
-      packageManifestSha256: "d".repeat(64),
-      storedAssetKeys: [],
-      documents: [],
-      assets: [],
-    });
-
-    await expect(
-      importWebsiteKnowledgeArtifact({
-        projectId: "project-acceptance-001",
-        idempotencyKey: "website-kb-project-acceptance-v4",
-        value: {
-          schemaVersion: 4,
-          companyName: "示例企业",
-          candidate: {
-            taskId: "task-website-kb-v3",
-            outputItemId: "output-v3",
-            fileId: "file-v3",
-            descriptorHash: "a".repeat(64),
-            sha256: "b".repeat(64),
-          },
-          finalArtifact: {
-            fileId: "final-file-v4",
-            filename: "示例企业_knowledge_base.zip",
-            sha256: finalSha256,
-            archiveContractVersion: 4,
-            validationProfile: "website-lead-v1",
-            packageManifestSha256: "d".repeat(64),
-            finalizerVersion: "website-kb-finalizer-v1",
-          },
-        },
-      }),
-    ).resolves.toMatchObject({
-      status: "completed",
-      replayed: false,
-      snapshot: { id: "snapshot-new" },
-    });
-
-    expect(mocks.downloadArchiveBytes).toHaveBeenCalledWith({
-      descriptor: {
-        outputItemId: "output-v3",
-        fileId: "final-file-v4",
-        filename: "示例企业_knowledge_base.zip",
-        mimeType: "application/zip",
-      },
-      apiKey: "sk-test-credential",
-      baseUrl: "https://api.example.test",
     });
     expect(mocks.readKnowledgeArchive).toHaveBeenCalledWith(
-      buffer,
+      finalBytes,
       "示例企业_knowledge_base.zip",
       expect.any(String),
       {
         validationProfile: "website-lead-v1",
-        archiveContractVersion: 4,
+        archiveContractVersion: undefined,
       },
-    );
-    expect(mocks.createKnowledgeSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sourceTaskId: "task-website-kb-v3",
-        sourceArtifactHash: "a".repeat(64),
-        archiveHash: finalSha256,
-      }),
     );
     expect(mocks.persistKnowledgeSnapshotArchive).toHaveBeenCalledWith({
       userId: 7,
       snapshotId: expect.any(String),
-      buffer,
+      buffer: finalBytes,
       expectedSha256: finalSha256,
     });
+    expect(mocks.createKnowledgeSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceTaskId: candidateArtifactId,
+        sourceArtifactHash: candidateSha256,
+        archiveHash: finalSha256,
+      }),
+    );
+  });
+
+  it("rejects project ownership and byte/hash mismatches before importing", async () => {
+    mocks.readArtifact.mockImplementation(async (artifactId: string) => ({
+      artifactId,
+      projectId: "different-project",
+      filename: "knowledge.zip",
+      bytes:
+        artifactId === candidateArtifactId
+          ? candidateBytes.length
+          : finalBytes.length,
+      sha256:
+        artifactId === candidateArtifactId ? candidateSha256 : finalSha256,
+    }));
+    await expect(
+      importWebsiteKnowledgeArtifact({
+        projectId: "project-acceptance-001",
+        idempotencyKey: "website-kb-project-mismatch-v5",
+        value: value(),
+      }),
+    ).rejects.toMatchObject({ code: "TASK_PROJECT_MISMATCH", status: 403 });
+    expect(mocks.readKnowledgeArchive).not.toHaveBeenCalled();
+
+    mocks.readArtifact.mockReset();
+    mocks.readArtifact.mockResolvedValue({
+      artifactId: candidateArtifactId,
+      projectId: "project-acceptance-001",
+      filename: "bad.zip",
+      bytes: candidateBytes.length,
+      sha256: "f".repeat(64),
+    });
+    await expect(
+      importWebsiteKnowledgeArtifact({
+        projectId: "project-acceptance-001",
+        idempotencyKey: "website-kb-hash-mismatch-v5",
+        value: value(),
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_HASH_MISMATCH", status: 409 });
+  });
+
+  it("rejects a package manifest hash mismatch and removes staged assets", async () => {
+    mocks.readKnowledgeArchive.mockResolvedValue({
+      packageManifestSha256: "f".repeat(64),
+      storedAssetKeys: ["staged-image.webp"],
+      documents: [],
+      assets: [],
+    });
+    await expect(
+      importWebsiteKnowledgeArtifact({
+        projectId: "project-acceptance-001",
+        idempotencyKey: "website-kb-manifest-mismatch-v5",
+        value: value(),
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_HASH_MISMATCH", status: 409 });
+    expect(mocks.removeStoredKnowledgeAssets).toHaveBeenCalledWith([
+      "staged-image.webp",
+    ]);
+    expect(mocks.createKnowledgeSnapshot).not.toHaveBeenCalled();
   });
 });

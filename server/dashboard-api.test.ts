@@ -2286,48 +2286,27 @@ describe("knowledge archive byte download", () => {
     }
   });
 
-  it("uses only the authenticated content endpoint when no durable copy exists", async () => {
+  it("fails closed without reading an old Provider file when no durable copy exists", async () => {
     const assetRoot = await mkdtemp(
       path.join(tmpdir(), "frontmind-dashboard-kb-fallback-"),
     );
     const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
     process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
-    const bytes = Buffer.from("upstream-output-zip", "utf8");
-    const get = vi.spyOn(axios, "get").mockResolvedValue({
-      status: 200,
-      headers: {
-        "content-length": String(bytes.length),
-        "content-disposition":
-          "attachment; filename*=UTF-8''authoritative-output.zip",
-      },
-      data: Readable.from([bytes]),
-    });
+    const get = vi.spyOn(axios, "get");
     try {
-      const downloaded = await downloadArchiveBytes({
-        descriptor: {
-          outputItemId: "output-upstream",
-          fileId: "file-output-only",
-          filename: "descriptor-name.zip",
-          mimeType: "application/zip",
-        },
-        apiKey: "secret-test-key",
-        baseUrl: "https://api.example.test",
-      });
-
-      expect(downloaded).toEqual({
-        buffer: bytes,
-        filename: "authoritative-output.zip",
-      });
-      expect(get).toHaveBeenCalledTimes(1);
-      expect(get.mock.calls[0]?.[0]).toBe(
-        "https://api.example.test/v1/files/file-output-only/content",
-      );
-      expect(get.mock.calls[0]?.[1]).toMatchObject({
-        headers: {
-          API_KEY: "secret-test-key",
-          Authorization: "Bearer secret-test-key",
-        },
-      });
+      await expect(
+        downloadArchiveBytes({
+          descriptor: {
+            outputItemId: "output-upstream",
+            fileId: "file-output-only",
+            filename: "descriptor-name.zip",
+            mimeType: "application/zip",
+          },
+          apiKey: "secret-test-key",
+          baseUrl: "https://api.example.test",
+        }),
+      ).rejects.toThrow("批准重置后重新构建");
+      expect(get).not.toHaveBeenCalled();
     } finally {
       if (previousAssetRoot === undefined) {
         delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;

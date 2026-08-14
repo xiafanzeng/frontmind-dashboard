@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthServiceError, decryptApiKey, encryptApiKey } from "./auth-service";
 import { WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED } from "./website-project-lifecycle";
 import {
+  agentOperations,
+  presalesApiCredentials,
   presalesOutputUrls,
   presalesMonitorRuns,
   presalesTaskRequests,
   presalesUpstreamResources,
+  providerFileLeases,
   websiteProjectDeletionTombstones,
 } from "../drizzle/schema";
 import {
@@ -28,6 +31,7 @@ import {
   hashPresalesTaskPayload,
   isPresalesDuplicateEntryError,
   markPresalesFileContentDeleted,
+  projectWebsiteUsageOwnership,
   recordPresalesUpstreamResource,
   readPresalesProjectTaskPurgeSnapshot,
   releasePresalesTaskReservation,
@@ -96,6 +100,44 @@ describe("presales credential encryption", () => {
 });
 
 describe("presales rolling usage aggregation", () => {
+  it("includes v2 agent tasks in Website ownership and unsettled scans", () => {
+    const createdAt = new Date("2026-08-02T08:00:00.000Z");
+    const projected = projectWebsiteUsageOwnership({
+      resourceRows: [],
+      ownedRows: [],
+      monitorRows: [],
+      agentTaskRows: [
+        {
+          upstreamTaskId: "provider-v2-running",
+          apiCredentialId: "credential-v2-running",
+          createdAt,
+          status: "running",
+        },
+        {
+          upstreamTaskId: "provider-v2-complete",
+          apiCredentialId: "credential-v2-complete",
+          createdAt,
+          status: "succeeded",
+        },
+        {
+          upstreamTaskId: null,
+          apiCredentialId: "credential-v2-unknown",
+          createdAt,
+          status: "attention_required",
+        },
+      ],
+    });
+
+    expect([...projected.websiteTaskIds]).toEqual([
+      "provider-v2-running",
+      "provider-v2-complete",
+    ]);
+    expect([...projected.unsettledCredentialIds]).toEqual([
+      "credential-v2-running",
+      "credential-v2-unknown",
+    ]);
+  });
+
   it("deduplicates the same task returned by multiple credential versions and enforces the 30-day boundary", () => {
     const now = Date.parse("2026-08-02T08:00:00.000Z");
     const cutoff = now - 30 * 86_400_000;
@@ -325,6 +367,70 @@ describe("presales credential revocation", () => {
           }),
         };
       },
+      update: () => {
+        updateCalled = true;
+        return { set: () => ({ where: async () => undefined }) };
+      },
+    };
+
+    await expect(deletePresalesApiCredential(executor)).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(updateCalled).toBe(false);
+  });
+
+  it("fails closed when a website v2 operation is still non-terminal", async () => {
+    let updateCalled = false;
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => {
+            const rows =
+              table === presalesApiCredentials
+                ? [{ id: "active-credential" }]
+                : table === agentOperations
+                  ? [{ id: "operation-running" }]
+                  : table === providerFileLeases
+                    ? []
+                    : [];
+            return {
+              for: async () => rows,
+              limit: () => ({ for: async () => rows }),
+            };
+          },
+        }),
+      }),
+      update: () => {
+        updateCalled = true;
+        return { set: () => ({ where: async () => undefined }) };
+      },
+    };
+
+    await expect(deletePresalesApiCredential(executor)).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(updateCalled).toBe(false);
+  });
+
+  it("fails closed when a website v2 provider upload outcome is unresolved", async () => {
+    let updateCalled = false;
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => {
+            const rows =
+              table === presalesApiCredentials
+                ? [{ id: "active-credential" }]
+                : table === providerFileLeases
+                  ? [{ id: "lease-unknown" }]
+                  : [];
+            return {
+              for: async () => rows,
+              limit: () => ({ for: async () => rows }),
+            };
+          },
+        }),
+      }),
       update: () => {
         updateCalled = true;
         return { set: () => ({ where: async () => undefined }) };

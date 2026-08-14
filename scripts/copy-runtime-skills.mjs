@@ -9,27 +9,17 @@ const projectRoot = path.resolve(
 );
 const sourceRoot = path.join(projectRoot, "private-workflows");
 const outputRoot = path.join(projectRoot, "dist", "private-workflows");
-// Packaging can create immutable canonical/legacy aliases for the previously
-// active v4 archive. Discover compatibility artifacts only after that step so
-// the same deployment always contains every pin the server may resolve.
-await packageSocraticKnowledgeBaseSkill();
+const materializedSkill = await packageSocraticKnowledgeBaseSkill();
+const exactMaterializedSkill = `socratic-kb-builder-v5-${materializedSkill.contentHash}.skill`;
 const skillArtifacts = [
-  "socratic-kb-builder.skill",
-  "socratic-kb-builder-v1.skill",
-  "socratic-kb-builder-v3.skill",
-  "socratic-kb-builder-v4.skill",
+  "socratic-kb-builder-v5.skill",
+  exactMaterializedSkill,
   "brand-question-portfolio.skill",
   "response-logic-builder.skill",
 ];
-const compatibilitySkillArtifacts = (await fs.readdir(sourceRoot)).filter(
-  (name) => /^socratic-kb-builder-v[34]-[a-f0-9]{64}\.skill$/.test(name),
-);
-skillArtifacts.push(...compatibilitySkillArtifacts);
 const requiredFiles = [
-  "socratic-kb-builder.skill",
-  "socratic-kb-builder-v1.skill",
-  "socratic-kb-builder-v3.skill",
-  "socratic-kb-builder-v4.skill",
+  "socratic-kb-builder-v5.skill",
+  exactMaterializedSkill,
   "brand-question-portfolio.skill/SKILL.md",
   "brand-question-portfolio.skill/references/output-contract.md",
   "response-logic-builder.skill/SKILL.md",

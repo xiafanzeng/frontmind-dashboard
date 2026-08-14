@@ -22,6 +22,7 @@ import {
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
 import { markUploadedFileRetention } from "./file-content-retention";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 import {
   installStoredPresalesFileFromPath,
   readStoredPresalesFile,
@@ -2299,21 +2300,46 @@ async function createProviderFile(input: {
   filename: string;
   signal?: AbortSignal;
 }): Promise<ProviderCreateResult> {
-  let response;
+  if (input.signal?.aborted) {
+    throw input.signal.reason ?? new Error("Managed upload cancelled");
+  }
+  let created;
   try {
-    response = await axios.post(
-      `${getUpstreamBaseUrl()}/v1/files`,
-      { filename: input.filename },
-      {
-        headers: { API_KEY: input.apiKey, "Content-Type": "application/json" },
-        timeout: 30_000,
-        maxRedirects: 0,
-        maxContentLength: 1024 * 1024,
-        signal: input.signal,
-        validateStatus: () => true,
-      },
-    );
-  } catch {
+    created = await new ManusV2Client({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey: input.apiKey,
+    }).createFile(input.filename);
+  } catch (error) {
+    if (input.signal?.aborted) {
+      throw input.signal.reason ?? new Error("Managed upload cancelled");
+    }
+    if (
+      error instanceof ManusV2ApiError &&
+      error.retryable &&
+      !error.outcomeUnknown
+    ) {
+      throw new ManagedUploadIntentError(
+        503,
+        "UPLOAD_PROVIDER_CREATE_RETRYABLE",
+        "云端暂未接受文件记录创建，Dashboard 将稍后重试",
+        true,
+        "check_status",
+        error.retryAfterMs ?? 3_000,
+      );
+    }
+    if (
+      error instanceof ManusV2ApiError &&
+      !error.outcomeUnknown &&
+      !error.retryable
+    ) {
+      throw new ManagedUploadIntentError(
+        502,
+        "UPLOAD_PROVIDER_CREATE_REJECTED",
+        "云端拒绝创建文件记录，请联系管理员",
+        false,
+        "contact_admin",
+      );
+    }
     throw new ManagedUploadIntentError(
       503,
       "UPLOAD_PROVIDER_CREATE_UNKNOWN",
@@ -2322,47 +2348,10 @@ async function createProviderFile(input: {
       "check_status",
     );
   }
-  if (response.status < 200 || response.status >= 300) {
-    if (response.status === 429) {
-      const retryAfterSeconds = Number(response.headers?.["retry-after"]);
-      const retryAfterMs = Number.isFinite(retryAfterSeconds)
-        ? Math.min(60_000, Math.max(1_000, retryAfterSeconds * 1_000))
-        : 3_000;
-      throw new ManagedUploadIntentError(
-        503,
-        "UPLOAD_PROVIDER_CREATE_RETRYABLE",
-        "云端暂未接受文件记录创建，Dashboard 将稍后重试",
-        true,
-        "check_status",
-        retryAfterMs,
-      );
-    }
-    const unknown =
-      response.status === 408 ||
-      response.status === 425 ||
-      response.status >= 500;
-    throw new ManagedUploadIntentError(
-      unknown ? 503 : 502,
-      unknown
-        ? "UPLOAD_PROVIDER_CREATE_UNKNOWN"
-        : "UPLOAD_PROVIDER_CREATE_REJECTED",
-      unknown
-        ? "云端文件记录创建结果未知，Dashboard 将安全恢复"
-        : "云端拒绝创建文件记录，请联系管理员",
-      unknown,
-      unknown ? "check_status" : "contact_admin",
-    );
-  }
-  const data =
-    response.data && typeof response.data === "object"
-      ? (response.data as Record<string, unknown>)
-      : {};
-  const fileId = typeof data.id === "string" ? data.id : "";
-  const providerFilename =
-    typeof data.filename === "string" ? data.filename : "";
-  const status =
-    typeof data.status === "string" ? data.status.trim().toLowerCase() : "";
-  const rawTarget = typeof data.upload_url === "string" ? data.upload_url : "";
+  const fileId = created.fileId;
+  const providerFilename = created.filename;
+  const status = "pending";
+  const rawTarget = created.uploadUrl;
   if (!validIdentifier(fileId)) {
     // A successful response without an identity may have created a record,
     // but Dashboard cannot address or clean it. Treat the result as unknown
@@ -2382,7 +2371,7 @@ async function createProviderFile(input: {
   const filename = validIdentifier(providerFilename, 512)
     ? providerFilename
     : input.filename;
-  const statusAccepted = ["pending", "created"].includes(status);
+  const statusAccepted = status === "pending";
   let uploadUrl: string | null = null;
   let uploadExpiresAt: number | null = null;
   let capabilityErrorCode: string | null = null;
@@ -2398,7 +2387,7 @@ async function createProviderFile(input: {
   }
   if (uploadUrl) {
     try {
-      uploadExpiresAt = providerExpiry(uploadUrl, data.upload_expires_at);
+      uploadExpiresAt = providerExpiry(uploadUrl, created.uploadExpiresAt);
       if (uploadExpiresAt - Date.now() < MANAGED_UPLOAD_PROVIDER_MIN_TTL_MS) {
         capabilityErrorCode = "UPLOAD_PROVIDER_CAPABILITY_EXPIRED";
       }
@@ -2532,61 +2521,44 @@ async function proveProviderContent(input: {
   sha256: string;
   signal?: AbortSignal;
 }) {
-  const deadlineSignal = AbortSignal.timeout(
-    MANAGED_UPLOAD_PROVIDER_PUT_MAX_MS,
-  );
-  const requestSignal = input.signal
-    ? AbortSignal.any([input.signal, deadlineSignal])
-    : deadlineSignal;
-  const response = await axios.get(
-    `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(input.fileId)}/content`,
-    {
-      headers: { API_KEY: input.apiKey },
-      responseType: "stream",
-      // Axios timeout is inactivity-only. The signal is the authoritative
-      // absolute proof budget, even if a peer drip-feeds bytes forever.
-      timeout: 0,
-      maxRedirects: 0,
-      maxContentLength: MANAGED_UPLOAD_INTENT_MAX_BYTES + 1,
-      signal: requestSignal,
-      validateStatus: () => true,
-    },
-  );
-  if (response.status < 200 || response.status >= 300) {
-    (response.data as { destroy?: () => void } | null)?.destroy?.();
+  if (input.signal?.aborted) {
+    throw input.signal.reason ?? new Error("Managed upload cancelled");
+  }
+  // Manus v2 exposes metadata, not an authenticated /content endpoint. The
+  // sealed Dashboard bytes (and their SHA-256 above) remain authoritative;
+  // the provider lease is accepted only when v2 reports uploaded with the
+  // exact byte count for this one locally owned PUT.
+  let detail;
+  try {
+    detail = await new ManusV2Client({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey: input.apiKey,
+    }).fileDetail(input.fileId);
+  } catch {
     throw new ManagedUploadIntentError(
       503,
       "UPLOAD_PROVIDER_PROOF_UNAVAILABLE",
-      "暂时无法核验云端文件内容",
+      "暂时无法核验云端文件记录",
       true,
       "check_status",
     );
   }
-  const hash = createHash("sha256");
-  let size = 0;
-  const content = response.data as AsyncIterable<unknown> & {
-    destroy?: () => void;
-  };
-  try {
-    for await (const raw of content) {
-      const chunk = Buffer.isBuffer(raw)
-        ? raw
-        : Buffer.from(raw as Uint8Array | string);
-      size += chunk.length;
-      if (size > input.sizeBytes || size > MANAGED_UPLOAD_INTENT_MAX_BYTES) {
-        content.destroy?.();
-        break;
-      }
-      hash.update(chunk);
-    }
-  } finally {
-    content.destroy?.();
-  }
-  if (size !== input.sizeBytes || hash.digest("hex") !== input.sha256) {
+  if (detail.status !== "uploaded" || detail.bytes !== input.sizeBytes) {
     throw new ManagedUploadIntentError(
       409,
       "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
-      "云端文件内容与 Dashboard 本地副本不一致",
+      "云端文件记录与 Dashboard 本地副本不一致",
+      false,
+      "contact_admin",
+    );
+  }
+  // Keep the hash parameter intentional: callers must already have a sealed
+  // local integrity record before a provider lease can be proven.
+  if (!/^[a-f0-9]{64}$/u.test(input.sha256)) {
+    throw new ManagedUploadIntentError(
+      409,
+      "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+      "Dashboard 本地文件完整性记录无效",
       false,
       "contact_admin",
     );
@@ -2684,25 +2656,22 @@ async function providerFileIsMissing(input: {
   apiKey: string;
   fileId: string;
 }) {
-  const response = await axios.get(
-    `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(input.fileId)}`,
-    {
-      headers: { API_KEY: input.apiKey },
-      timeout: 10_000,
-      maxRedirects: 0,
-      maxContentLength: 1024 * 1024,
-      validateStatus: () => true,
-    },
-  );
-  if (response.status === 404) return true;
-  if (response.status >= 200 && response.status < 300) return false;
-  throw new ManagedUploadIntentError(
-    503,
-    "UPLOAD_PROVIDER_DISCARD_PROOF_UNAVAILABLE",
-    "暂时无法核验旧云端文件记录是否已移除",
-    true,
-    "check_status",
-  );
+  try {
+    const detail = await new ManusV2Client({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey: input.apiKey,
+    }).fileDetail(input.fileId);
+    return detail.status === "deleted";
+  } catch (error) {
+    if (error instanceof ManusV2ApiError && error.status === 404) return true;
+    throw new ManagedUploadIntentError(
+      503,
+      "UPLOAD_PROVIDER_DISCARD_PROOF_UNAVAILABLE",
+      "暂时无法核验旧云端文件记录是否已移除",
+      true,
+      "check_status",
+    );
+  }
 }
 
 /**
@@ -2741,21 +2710,15 @@ async function discardProviderGeneration(input: {
       fileId,
       projectAssignmentId: manifest.projectAssignmentId ?? undefined,
       discard: async (context) => {
-        const response = await axios.delete(
-          `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
-          {
-            headers: { API_KEY: context.apiKey },
-            timeout: 30_000,
-            maxRedirects: 0,
-            maxContentLength: 1024 * 1024,
-            validateStatus: () => true,
-          },
-        );
-        if (
-          response.status !== 404 &&
-          (response.status < 200 || response.status >= 300)
-        ) {
-          throw new Error("PROVIDER_DISCARD_FAILED");
+        try {
+          await new ManusV2Client({
+            baseUrl: getUpstreamBaseUrl(),
+            apiKey: context.apiKey,
+          }).deleteFile(fileId);
+        } catch (error) {
+          if (!(error instanceof ManusV2ApiError && error.status === 404)) {
+            throw new Error("PROVIDER_DISCARD_FAILED");
+          }
         }
         if (input.removeStoredCopy) {
           await removeStoredPresalesFile(fileId);

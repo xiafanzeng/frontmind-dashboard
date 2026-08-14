@@ -27,6 +27,7 @@ import {
   provisionWebsiteUser,
   type WebsiteProvisionRequest,
 } from "./provisioning-service";
+import { ManusV2Client } from "./manus-v2-client";
 
 const REQUEST_HASH_KEY = "mZE7Hc8h9KJErqfZ76u21kSx3U95QPJNgLw9b4eE5do";
 
@@ -220,9 +221,10 @@ describe("shared Admin and website user creation path", () => {
   beforeEach(() => {
     process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY =
       "base64:MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response("{}", { status: 200 }),
-    );
+    vi.spyOn(ManusV2Client.prototype, "probeCredential").mockResolvedValue({
+      ok: true,
+      requestId: "request-provisioning-key-validation",
+    });
     db = new SharedUsersTableDb();
     dbMock.getDb.mockResolvedValue(db);
   });

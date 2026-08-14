@@ -12,7 +12,8 @@ const mocks = vi.hoisted(() => ({
   listRefetch: vi.fn(),
   syncSnapshot: vi.fn(),
   deleteConversation: vi.fn(),
-  uploadFile: vi.fn(),
+  uploadKnowledgeBaseLocalAsset: vi.fn(),
+  providerUploadFile: vi.fn(),
   startRequests: [] as Array<{ body: Record<string, unknown> }>,
   reserveRequests: [] as Array<{ body: Record<string, unknown> }>,
   stageRequests: [] as Array<{ body: Record<string, unknown> }>,
@@ -51,7 +52,11 @@ vi.mock("@/lib/trpc", () => ({
 
 vi.mock("@/lib/frontmind-api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/frontmind-api")>();
-  return { ...actual, uploadFile: mocks.uploadFile };
+  return {
+    ...actual,
+    uploadKnowledgeBaseLocalAsset: mocks.uploadKnowledgeBaseLocalAsset,
+    uploadFile: mocks.providerUploadFile,
+  };
 });
 
 vi.mock("sonner", () => ({
@@ -288,26 +293,19 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       Promise.resolve(conversation),
     );
     mocks.deleteConversation.mockResolvedValue({ success: true });
-    mocks.uploadFile.mockImplementation(
+    mocks.uploadKnowledgeBaseLocalAsset.mockImplementation(
       async (file: File, _progress: unknown, _retry: unknown, options: any) => {
         const ordinal = Number(options.batchOrdinal);
-        const fileId = `file-${ordinal}`;
-        const uploadHandle = {
-          fileId,
-          filename: file.name,
-          ticket: `ticket-${ordinal}`,
-          expiresAt: 4_000_000_000_000,
-        };
+        const fileId = `asset_test_${ordinal}`;
         await options.onFileRecord?.({
           fileId,
           filename: file.name,
-          uploadHandle,
           reusedExistingFileId: false,
         });
         options.onStage?.({
-          stage: "uploading",
+          stage: "creating_record",
           fileId,
-          loadedBytes: file.size,
+          loadedBytes: 0,
           totalBytes: file.size,
         });
         options.onStage?.({
@@ -398,7 +396,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     vi.unstubAllGlobals();
   });
 
-  it("reserves before upload, scopes and stages N/N files, then dispatches one user request", async () => {
+  it("reserves a materialized build, stores N/N local assets, then dispatches once", async () => {
     renderIntegratedChat();
     await waitFor(() =>
       expect(
@@ -419,7 +417,8 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     );
     expect(mocks.reserveRequests).toHaveLength(1);
     expect(mocks.stageRequests).toHaveLength(5);
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
+    expect(mocks.uploadKnowledgeBaseLocalAsset).toHaveBeenCalledTimes(5);
+    expect(mocks.providerUploadFile).not.toHaveBeenCalled();
     const clientRequestId = String(
       mocks.startRequests[0]?.body.clientRequestId,
     );
@@ -430,7 +429,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     expect(mocks.reserveRequests[0]!.body.expectedResetRevision).toBe(4);
     expect(manifest.map((item) => item.ordinal)).toEqual([1, 2, 3, 4, 5]);
     expect(manifest.every((item) => item.total === 5)).toBe(true);
-    for (const call of mocks.uploadFile.mock.calls) {
+    for (const call of mocks.uploadKnowledgeBaseLocalAsset.mock.calls) {
       expect(call[3]?.resumeScope).toEqual({
         kind: "knowledge_base",
         conversationId: "knowledge-conversation",
@@ -441,6 +440,17 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     }
     expect(mocks.stageRequests.map(({ body }) => body.index)).toEqual([
       0, 1, 2, 3, 4,
+    ]);
+    expect(
+      mocks.stageRequests.map(({ body }) =>
+        String((body.attachment as { file_id?: unknown })?.file_id),
+      ),
+    ).toEqual([
+      "asset_test_1",
+      "asset_test_2",
+      "asset_test_3",
+      "asset_test_4",
+      "asset_test_5",
     ]);
     expect(
       mocks.stageRequests.every(({ body }) => body.expectedResetRevision === 4),
@@ -462,7 +472,8 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       ).not.toBeInTheDocument(),
     );
     expect(mocks.startRequests).toHaveLength(1);
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
+    expect(mocks.uploadKnowledgeBaseLocalAsset).toHaveBeenCalledTimes(5);
+    expect(mocks.providerUploadFile).not.toHaveBeenCalled();
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
       '"messageCount":1',
     );
@@ -481,7 +492,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     });
     let uploadSignal: AbortSignal | undefined;
     let finishUpload: ((value: any) => void) | undefined;
-    mocks.uploadFile.mockImplementationOnce(
+    mocks.uploadKnowledgeBaseLocalAsset.mockImplementationOnce(
       async (
         _file: File,
         _progress: unknown,
@@ -502,7 +513,10 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       target: { files: [file] },
     });
     fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
-    await waitFor(() => expect(mocks.uploadFile).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(mocks.uploadKnowledgeBaseLocalAsset).toHaveBeenCalledOnce(),
+    );
+    expect(mocks.providerUploadFile).not.toHaveBeenCalled();
 
     const coordinatorButton = Array.from(
       document.querySelectorAll("button"),
@@ -610,7 +624,8 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       ).not.toBeInTheDocument(),
     );
     expect(startCalls).toBe(1);
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
+    expect(mocks.uploadKnowledgeBaseLocalAsset).toHaveBeenCalledTimes(5);
+    expect(mocks.providerUploadFile).not.toHaveBeenCalled();
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
       '"messageCount":1',
     );
@@ -646,7 +661,8 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
         screen.queryByRole("dialog", { name: "构建企业知识库" }),
       ).not.toBeInTheDocument(),
     );
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(5);
+    expect(mocks.uploadKnowledgeBaseLocalAsset).toHaveBeenCalledTimes(5);
+    expect(mocks.providerUploadFile).not.toHaveBeenCalled();
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
       '"messageCount":1',
     );

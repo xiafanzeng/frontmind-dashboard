@@ -4,6 +4,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 
 import axios, {
   AxiosHeaders,
@@ -14,11 +15,13 @@ import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { migrate } from "drizzle-orm/mysql2/migrator";
 import express from "express";
+import JSZip from "jszip";
 import mysql, {
   type Pool,
   type ResultSetHeader,
   type RowDataPacket,
 } from "mysql2/promise";
+import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
@@ -26,7 +29,7 @@ import {
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
-  knowledgeBaseSnapshots,
+  knowledgeBaseWorkingSets,
   messages,
   upstreamResources,
   userDashboardContents,
@@ -34,7 +37,7 @@ import {
 import { createDefaultDashboardPayload } from "../shared/dashboard";
 import { KNOWLEDGE_BASE_COMPLETION_MESSAGE_CONTENT } from "../shared/knowledge-base-message";
 import { knowledgeBaseMarkdownSha256 } from "../server/knowledge-base-package-validation";
-import { KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH } from "../server/knowledge-base-tree-policy-rollout";
+import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "../server/knowledge-base-tree-policy-rollout";
 
 const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
@@ -63,7 +66,7 @@ vi.mock("../server/_core/express-auth", () => ({
     }
     req.frontmindUser = {
       id: dependencies.userId,
-      username: "frontmind-manus-v2-mysql-e2e",
+      username: "frontmind-materialized-mysql-e2e",
       displayName: SYNTHETIC_COMPANY,
       role: "user",
       adminAccessLevel: null,
@@ -75,9 +78,10 @@ vi.mock("../server/_core/express-auth", () => ({
       id: dependencies.credentialId,
       userId: dependencies.userId,
       version: 1,
-      label: "Synthetic Manus v2 MySQL E2E credential",
+      label: "Synthetic materialized MySQL E2E credential",
       apiKey: dependencies.apiKey,
       fingerprint: dependencies.credentialFingerprint,
+      agentProfile: "frontmind-pro",
     };
     next();
   },
@@ -134,9 +138,11 @@ const DATABASE_MARKER = "frontmind_kb_acceptance";
 const REPOSITORY_ROOT = path.resolve(process.cwd());
 const SYNTHETIC_COMPANY = "合成示例企业";
 const SYNTHETIC_WEBSITE = "https://synthetic.invalid/";
-const FINAL_REVISION = 8;
+const MATERIALIZED_LEAF_COUNT = 30;
 const PROVIDER_BASE_URL = "https://fake.manus-v2.frontmind.test";
 const PROVIDER_UPLOAD_ORIGIN = "https://upload.manus-v2.frontmind.test";
+const PROVIDER_DOWNLOAD_ORIGIN = "https://download.manus-v2.frontmind.test";
+const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 
 type AcceptanceTarget = { url: string; databaseName: string };
 
@@ -145,7 +151,6 @@ export function parseKnowledgeBaseManusV2MysqlE2eAcceptanceTarget(
 ): AcceptanceTarget {
   const value = rawValue?.trim();
   if (!value) throw new Error(`${ACCEPTANCE_ENV}_MISSING`);
-
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -162,11 +167,9 @@ export function parseKnowledgeBaseManusV2MysqlE2eAcceptanceTarget(
   ) {
     throw new Error(`${ACCEPTANCE_ENV}_DATABASE_OVERRIDE_FORBIDDEN`);
   }
-
-  const encodedDatabaseName = parsed.pathname.replace(/^\/+/, "");
   let databaseName = "";
   try {
-    databaseName = decodeURIComponent(encodedDatabaseName);
+    databaseName = decodeURIComponent(parsed.pathname.replace(/^\/+/, ""));
   } catch {
     throw new Error(`${ACCEPTANCE_ENV}_DATABASE_INVALID`);
   }
@@ -183,41 +186,6 @@ export function parseKnowledgeBaseManusV2MysqlE2eAcceptanceTarget(
 
 function sha256(value: Buffer | string) {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function providerOperationContract(prompt: string) {
-  const line = prompt
-    .split(/\r?\n/u)
-    .find((candidate) =>
-      candidate.startsWith("FRONTMIND_MANUS_V2_OPERATION_CONTRACT="),
-    );
-  if (!line) throw new Error("FAKE_MANUS_V2_OPERATION_CONTRACT_MISSING");
-  const value = JSON.parse(line.slice(line.indexOf("=") + 1)) as Record<
-    string,
-    unknown
-  >;
-  if (
-    typeof value.operationToken !== "string" ||
-    typeof value.turnId !== "string" ||
-    !Number.isSafeInteger(value.generation) ||
-    !Number.isSafeInteger(value.baseRevision) ||
-    typeof value.action !== "string" ||
-    typeof value.contentCompleted !== "boolean" ||
-    typeof value.requiresManifest !== "boolean"
-  ) {
-    throw new Error("FAKE_MANUS_V2_OPERATION_CONTRACT_INVALID");
-  }
-  return value as {
-    schemaVersion: number;
-    operationToken: string;
-    turnId: string;
-    generation: number;
-    baseRevision: number;
-    action: string;
-    fromLeafId: string | null;
-    contentCompleted: boolean;
-    requiresManifest: boolean;
-  };
 }
 
 function messagePrompt(body: any) {
@@ -254,11 +222,12 @@ function axiosResponse(
   config: InternalAxiosRequestConfig,
   status: number,
   data: unknown,
+  headers: Record<string, string> = {},
 ) {
   return {
     status,
     statusText: status >= 200 && status < 300 ? "OK" : "ERROR",
-    headers: new AxiosHeaders(),
+    headers: new AxiosHeaders(headers),
     config,
     data,
   };
@@ -267,98 +236,124 @@ function axiosResponse(
 function syntheticLeaf(index: number) {
   const leafId = `1.${index + 1}`;
   const title = `合成知识节点 ${index + 1}`;
-  // Deliberately omit the workspace's exact enterprise name. Dashboard-owned
-  // package identity is bound by the frozen build + embedded manifest, not by
-  // forcing every accepted business node to repeat a legal company name.
-  const visibleMarkdown = `# ${leafId} ${title}\n\n## 核心事实\n\n本验收节点只包含“合成产品代号 A”的完全合成资料，用于证明 Dashboard 接受正文、保持单调展示并生成本地知识库下载包。节点编号为 ${leafId}，不引用任何客户文档、生产任务或真实 API 凭证。`;
+  const visibleMarkdown = `# ${leafId} ${title}\n\n## 核心事实\n\n本验收节点只包含“合成产品代号 A”的完全合成资料，用于证明 Dashboard 一次物化全部内容、只在本地确认并生成最终客户包。节点编号为 ${leafId}，不引用任何客户文档、生产任务或真实 API 凭证。`;
   return { leafId, title, visibleMarkdown };
 }
 
-const syntheticLeaves = Array.from({ length: FINAL_REVISION }, (_, index) =>
-  syntheticLeaf(index),
+const syntheticLeaves = Array.from(
+  { length: MATERIALIZED_LEAF_COUNT },
+  (_, index) => syntheticLeaf(index),
 );
 
-function expectedStructuredValue(
-  contract: ReturnType<typeof providerOperationContract>,
-) {
-  if (contract.requiresManifest) {
-    return {
-      schemaVersion: 1,
-      operationToken: contract.operationToken,
-      turnId: contract.turnId,
-      generation: contract.generation,
-      baseRevision: contract.baseRevision,
-      action: contract.action,
-      fromLeafId: contract.fromLeafId,
-      nextLeafId: syntheticLeaves[0]!.leafId,
-      visibleMarkdown: syntheticLeaves[0]!.visibleMarkdown,
-      contentCompleted: false,
-      manifestJson: JSON.stringify({
-        leaves: syntheticLeaves.map((leaf) => ({
-          id: leaf.leafId,
-          title: leaf.title,
-          branchId: "synthetic_products",
-          branchTitle: "合成产品",
-        })),
-      }),
-    };
-  }
-
-  const nextIndex = contract.baseRevision + 1;
-  const next = syntheticLeaves[nextIndex];
-  const completed = nextIndex === FINAL_REVISION;
-  return {
-    schemaVersion: 1,
-    operationToken: contract.operationToken,
-    turnId: contract.turnId,
-    generation: contract.generation,
-    baseRevision: contract.baseRevision,
-    action: contract.action,
-    fromLeafId: contract.fromLeafId,
-    nextLeafId: next?.leafId ?? null,
-    visibleMarkdown: next?.visibleMarkdown ?? "",
-    contentCompleted: completed,
-  };
+function promptValue(prompt: string, key: string) {
+  const prefix = `${key}=`;
+  const line = prompt
+    .split(/\r?\n/u)
+    .find((candidate) => candidate.startsWith(prefix));
+  if (!line) throw new Error(`FAKE_MANUS_V2_PROMPT_COORDINATE_MISSING:${key}`);
+  return line.slice(prefix.length).trim();
 }
 
-function assertStructuredSchema(
-  schema: any,
-  contract: ReturnType<typeof providerOperationContract>,
-) {
-  expect(schema).toMatchObject({
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      schemaVersion: { enum: [1] },
-      operationToken: { enum: [contract.operationToken] },
-      turnId: { enum: [contract.turnId] },
-      generation: { enum: [contract.generation] },
-      baseRevision: { enum: [contract.baseRevision] },
-      action: { enum: [contract.action] },
-      fromLeafId: { enum: [contract.fromLeafId] },
-      contentCompleted: { enum: [contract.contentCompleted] },
+async function buildSyntheticMaterializedWorkingSet(prompt: string) {
+  expect(prompt).toContain("operation=materialize_initial_bundle");
+  expect(prompt).toContain("一次生成全部 30–115 个真实叶子");
+  expect(prompt).not.toContain("FRONTMIND_MANUS_V2_OPERATION_CONTRACT=");
+  const coordinates = {
+    operationId: promptValue(prompt, "operationId"),
+    buildId: promptValue(prompt, "buildId"),
+    generation: Number(promptValue(prompt, "generation")),
+    contentVersion: Number(promptValue(prompt, "contentVersion")),
+    companyName: promptValue(prompt, "company.name"),
+    companyWebsite: promptValue(prompt, "company.website"),
+  };
+  expect(coordinates).toMatchObject({ generation: 1, contentVersion: 1 });
+  const zip = new JSZip();
+  const logoBytes = await sharp({
+    create: {
+      width: 2,
+      height: 2,
+      channels: 4,
+      background: { r: 63, g: 37, b: 116, alpha: 1 },
     },
+  })
+    .png()
+    .toBuffer();
+  zip.file("assets/official-logo.png", logoBytes, {
+    date: FIXED_ZIP_DATE,
+    createFolders: false,
   });
-  expect(schema.required).toEqual(
-    expect.arrayContaining([
-      "schemaVersion",
-      "operationToken",
-      "turnId",
-      "generation",
-      "baseRevision",
-      "action",
-      "fromLeafId",
-      "nextLeafId",
-      "visibleMarkdown",
-      "contentCompleted",
-      ...(contract.requiresManifest ? ["manifestJson"] : []),
-    ]),
-  );
-  if (contract.requiresManifest) {
-    expect(schema.properties.manifestJson).toEqual({ type: "string" });
-  } else {
-    expect(schema.properties.manifestJson).toBeUndefined();
-  }
+  const leaves = syntheticLeaves.map((leaf, index) => {
+    const contentPath = `nodes/${String(index + 1).padStart(4, "0")}.md`;
+    zip.file(contentPath, leaf.visibleMarkdown, {
+      date: FIXED_ZIP_DATE,
+      createFolders: false,
+    });
+    return {
+      leafId: leaf.leafId,
+      branchId: "synthetic-products",
+      branchTitle: "合成产品",
+      title: leaf.title,
+      ordinal: index,
+      contentPath,
+      contentSha256: sha256(leaf.visibleMarkdown),
+      evidencePaths: [],
+      assetIds: [],
+    };
+  });
+  const manifest = {
+    kind: "frontmind.kb-working-set",
+    schemaVersion: 1,
+    operationId: coordinates.operationId,
+    buildId: coordinates.buildId,
+    generation: coordinates.generation,
+    contentVersion: coordinates.contentVersion,
+    skill: {
+      name: "socratic-kb-builder",
+      version: "5",
+      contentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+    },
+    treePolicyVersion: 2,
+    company: {
+      name: coordinates.companyName,
+      website:
+        coordinates.companyWebsite === "null"
+          ? null
+          : coordinates.companyWebsite,
+    },
+    researchCoverage: { acceptance: "synthetic-only" },
+    branches: [
+      { branchId: "synthetic-products", title: "合成产品", ordinal: 0 },
+    ],
+    evidenceLedger: [],
+    leaves,
+    assets: [
+      {
+        assetId: "official-logo",
+        path: "assets/official-logo.png",
+        sha256: sha256(logoBytes),
+        mimeType: "image/png",
+        bytes: logoBytes.length,
+        width: 2,
+        height: 2,
+        provenance: { kind: "synthetic-acceptance" },
+        documentIds: [],
+      },
+    ],
+    logo: { status: "available", assetId: "official-logo" },
+    counts: {
+      leaves: MATERIALIZED_LEAF_COUNT,
+      evidenceFiles: 0,
+      assets: 1,
+    },
+  };
+  zip.file("BUNDLE.json", JSON.stringify(manifest), {
+    date: FIXED_ZIP_DATE,
+    createFolders: false,
+  });
+  return {
+    filename: `frontmind-kb-bundle-${coordinates.operationId}.zip`,
+    bytes: await zip.generateAsync({ type: "nodebuffer", platform: "UNIX" }),
+  };
 }
 
 type FakeProviderState = {
@@ -373,13 +368,17 @@ type FakeProviderState = {
   taskSendBodies: any[];
   taskUpdateBodies: any[];
   taskListCalls: number;
-  canonicalTaskId: string;
+  providerCalls: string[];
+  rejectProviderCalls: boolean;
+  rejectedCallCount: number;
+  bundleDownloads: number;
+  taskId: string;
   taskEvents: Map<string, Array<Record<string, unknown>>>;
 };
 
 function createFakeManusV2Provider(input: {
   apiKey: string;
-  canonicalTaskId: string;
+  taskId: string;
 }): FakeProviderState {
   let fileSequence = 0;
   let eventSequence = 0;
@@ -394,7 +393,11 @@ function createFakeManusV2Provider(input: {
     taskSendBodies: [],
     taskUpdateBodies: [],
     taskListCalls: 0,
-    canonicalTaskId: input.canonicalTaskId,
+    providerCalls: [],
+    rejectProviderCalls: false,
+    rejectedCallCount: 0,
+    bundleDownloads: 0,
+    taskId: input.taskId,
     taskEvents,
   };
 
@@ -404,14 +407,11 @@ function createFakeManusV2Provider(input: {
     expect(headers.has("authorization")).toBe(false);
   };
 
-  const appendOperationEvents = (taskId: string, body: any) => {
+  const appendMaterializedEvents = async (taskId: string, body: any) => {
     const prompt = messagePrompt(body);
-    const contract = providerOperationContract(prompt);
-    const schema = body.structured_output_schema;
-    assertStructuredSchema(schema, contract);
-    const value = expectedStructuredValue(contract);
-    expect(value.contentCompleted).toBe(contract.contentCompleted);
-    expect(value.fromLeafId).toBe(contract.fromLeafId);
+    expect(body.structured_output_schema).toBeUndefined();
+    expect(body.locale).toBe("zh-CN");
+    const bundle = await buildSyntheticMaterializedWorkingSet(prompt);
     const attachments = (body.message.content as any[]).filter(
       (part) => part?.type === "file",
     );
@@ -420,9 +420,8 @@ function createFakeManusV2Provider(input: {
       expect(file?.bytes?.length).toBeGreaterThan(0);
       expect(attachment.filename).toBe(file?.filename);
     }
-    const events = taskEvents.get(taskId) || [];
     const at = Date.now() + eventSequence * 10;
-    events.push(
+    taskEvents.set(taskId, [
       {
         id: `event-user-${++eventSequence}`,
         type: "user_message",
@@ -430,10 +429,20 @@ function createFakeManusV2Provider(input: {
         user_message: { content: prompt },
       },
       {
-        id: `event-result-${++eventSequence}`,
-        type: "structured_output_result",
+        id: `event-bundle-${++eventSequence}`,
+        type: "assistant_message",
         timestamp: at + 1,
-        structured_output_result: { success: true, value },
+        assistant_message: {
+          content: "",
+          attachments: [
+            {
+              type: "file",
+              filename: bundle.filename,
+              content_type: "application/zip",
+              url: `${PROVIDER_DOWNLOAD_ORIGIN}/${encodeURIComponent(taskId)}/${encodeURIComponent(bundle.filename)}`,
+            },
+          ],
+        },
       },
       {
         id: `event-status-${++eventSequence}`,
@@ -441,13 +450,34 @@ function createFakeManusV2Provider(input: {
         timestamp: at + 2,
         status_update: { agent_status: "stopped" },
       },
-    );
-    taskEvents.set(taskId, events);
+    ]);
+    uploadedFiles.set(`bundle:${taskId}`, {
+      filename: bundle.filename,
+      bytes: bundle.bytes,
+      contentType: "application/zip",
+    });
   };
 
   state.adapter = async (config) => {
     const method = String(config.method || "get").toLowerCase();
     const url = new URL(String(config.url || ""), PROVIDER_BASE_URL);
+    state.providerCalls.push(`${method}:${url.origin}${url.pathname}`);
+    if (state.rejectProviderCalls) {
+      state.rejectedCallCount += 1;
+      throw new Error("FAKE_MANUS_V2_CREDENTIAL_REVOKED");
+    }
+
+    if (url.origin === PROVIDER_DOWNLOAD_ORIGIN && method === "get") {
+      const taskId = decodeURIComponent(url.pathname.split("/")[1] || "");
+      const bundle = uploadedFiles.get(`bundle:${taskId}`);
+      if (!bundle?.bytes) throw new Error("FAKE_MANUS_V2_BUNDLE_NOT_FOUND");
+      state.bundleDownloads += 1;
+      return axiosResponse(config, 200, Readable.from(bundle.bytes), {
+        "content-type": "application/zip",
+        "content-length": String(bundle.bytes.length),
+        "content-disposition": `attachment; filename="${bundle.filename}"`,
+      });
+    }
 
     if (url.origin === PROVIDER_UPLOAD_ORIGIN && method === "put") {
       const fileId = decodeURIComponent(url.pathname.split("/").at(-1) || "");
@@ -518,34 +548,28 @@ function createFakeManusV2Provider(input: {
         interactive_mode: false,
         hide_in_task_list: true,
         share_visibility: "private",
+        locale: "zh-CN",
       });
       expect(body.title).toEqual(expect.any(String));
-      appendOperationEvents(input.canonicalTaskId, body);
+      await appendMaterializedEvents(input.taskId, body);
       return axiosResponse(config, 200, {
         ok: true,
-        task_id: input.canonicalTaskId,
-        task_url: `https://manus.im/app/${input.canonicalTaskId}`,
+        task_id: input.taskId,
+        task_url: `https://manus.im/app/${input.taskId}`,
         task_title: body.title,
         request_id: "request-task-create-1",
       });
     }
 
     if (method === "post" && url.pathname === "/v2/task.sendMessage") {
-      const body = requestBody(config) as any;
-      state.taskSendBodies.push(body);
-      expect(body.task_id).toBe(input.canonicalTaskId);
-      appendOperationEvents(input.canonicalTaskId, body);
-      return axiosResponse(config, 200, {
-        ok: true,
-        task_id: input.canonicalTaskId,
-        request_id: `request-task-send-${state.taskSendBodies.length}`,
-      });
+      state.taskSendBodies.push(requestBody(config));
+      throw new Error("MATERIALIZED_ACCEPTANCE_FORBIDS_TASK_SEND_MESSAGE");
     }
 
     if (method === "get" && url.pathname === "/v2/task.listMessages") {
       state.taskListCalls += 1;
       const taskId = String((config.params as any)?.task_id || "");
-      expect(taskId).toBe(input.canonicalTaskId);
+      expect(taskId).toBe(input.taskId);
       return axiosResponse(config, 200, {
         ok: true,
         task_id: taskId,
@@ -560,12 +584,12 @@ function createFakeManusV2Provider(input: {
       const body = requestBody(config) as any;
       state.taskUpdateBodies.push(body);
       expect(body).toEqual({
-        task_id: input.canonicalTaskId,
+        task_id: input.taskId,
         enable_visible_in_task_list: true,
       });
       return axiosResponse(config, 200, {
         ok: true,
-        task_id: input.canonicalTaskId,
+        task_id: input.taskId,
         request_id: `request-task-update-${state.taskUpdateBodies.length}`,
       });
     }
@@ -609,18 +633,17 @@ async function waitFor<T>(input: {
   );
 }
 
-describe("knowledge-base Manus v2 MySQL E2E acceptance URL guard", () => {
+describe("knowledge-base materialized Manus v2 MySQL E2E URL guard", () => {
   it("accepts only an explicitly named disposable MySQL acceptance database", () => {
     expect(
       parseKnowledgeBaseManusV2MysqlE2eAcceptanceTarget(
-        "mysql://tester:secret@127.0.0.1:3306/frontmind_kb_acceptance_manus_v2_ci_01",
+        "mysql://tester:secret@127.0.0.1:3306/frontmind_kb_acceptance_materialized_ci_01",
       ).databaseName,
-    ).toBe("frontmind_kb_acceptance_manus_v2_ci_01");
-
+    ).toBe("frontmind_kb_acceptance_materialized_ci_01");
     for (const unsafe of [
       undefined,
-      "postgres://tester:secret@127.0.0.1/frontmind_kb_acceptance_manus_v2",
-      "mysql://tester:secret@127.0.0.1/frontmind_manus_v2_production",
+      "postgres://tester:secret@127.0.0.1/frontmind_kb_acceptance_materialized",
+      "mysql://tester:secret@127.0.0.1/frontmind_materialized_production",
       "mysql://tester:secret@127.0.0.1/frontmind_kb_acceptance/other",
       "mysql://tester:secret@127.0.0.1/frontmind_kb_acceptance?database=production",
     ]) {
@@ -638,7 +661,7 @@ if (process.env[REQUIRED_ENV] === "1" && !acceptanceUrl) {
 const mysqlDescribe = acceptanceUrl ? describe.sequential : describe.skip;
 
 mysqlDescribe(
-  "knowledge-base Manus v2 controllers on disposable real MySQL",
+  "knowledge-base materialized v5 controllers on disposable real MySQL",
   () => {
     let pool: Pool;
     let executor: ReturnType<typeof drizzle>;
@@ -649,13 +672,12 @@ mysqlDescribe(
     let fakeProvider: FakeProviderState;
     let acceptancePassed = false;
     const runId = randomUUID().replaceAll("-", "");
-    const publicConversationId = `kb-v2-mysql-e2e-${runId}`;
+    const publicConversationId = `kb-materialized-e2e-${runId}`;
     const credentialId = randomUUID();
-    const upstreamApiKey = "sk-synthetic-manus-v2-mysql-e2e-only";
+    const upstreamApiKey = "sk-synthetic-materialized-mysql-e2e-only";
     const credentialFingerprint = `fp_${sha256(upstreamApiKey).slice(0, 16)}`;
-    const canonicalTaskId = `task-v2-canonical-${runId}`;
+    const initialTaskId = `task-v2-materialized-${runId}`;
     const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
-    const previousRolloutPercent = process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT;
     const previousTreePolicyWriter =
       process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER;
     const previousManusV2Writer = process.env.FRONTMIND_KB_MANUS_V2_WRITER;
@@ -684,7 +706,7 @@ mysqlDescribe(
     };
 
     const postKnowledgeBase = async (
-      pathname: "/start/reserve" | "/turn/dispatch" | "/turn",
+      pathname: "/start/reserve" | "/turn/dispatch" | "/confirm",
       body: Record<string, unknown>,
     ) => {
       const response = await fetch(
@@ -747,9 +769,7 @@ mysqlDescribe(
         journal.entries.length,
       );
       expect(
-        journal.entries.some(
-          (entry) => entry.tag === "0061_knowledge_base_resilient_manus_v2",
-        ),
+        journal.entries.some((entry) => entry.tag === "0062_hard_glorian"),
       ).toBe(true);
       const [engineRows] = await pool.query<RowDataPacket[]>(
         `SELECT TABLE_NAME AS tableName, ENGINE AS engine
@@ -757,11 +777,12 @@ mysqlDescribe(
           WHERE table_schema = DATABASE()
             AND table_name IN (
               'knowledge_base_builds', 'knowledge_base_build_nodes',
+              'knowledge_base_working_sets', 'knowledge_base_executions',
               'conversation_turns', 'conversations', 'messages',
               'upstream_resources'
             )`,
       );
-      expect(engineRows).toHaveLength(6);
+      expect(engineRows).toHaveLength(8);
       expect(engineRows.every((row) => row.engine === "InnoDB")).toBe(true);
 
       const [userResult] = await pool.execute<ResultSetHeader>(
@@ -769,8 +790,8 @@ mysqlDescribe(
            (openId, username, displayName, role, marketEdition, isActive)
          VALUES (?, ?, ?, 'user', 'domestic', 1)`,
         [
-          `kb-v2-e2e-${runId}`.slice(0, 64),
-          `kb_v2_e2e_${runId}`.slice(0, 64),
+          `kb-materialized-${runId}`.slice(0, 64),
+          `kb_materialized_${runId}`.slice(0, 64),
           SYNTHETIC_COMPANY,
         ],
       );
@@ -790,6 +811,7 @@ mysqlDescribe(
         encryptionIv: "synthetic-acceptance-placeholder",
         encryptionAuthTag: "synthetic-acceptance-placeholder",
         fingerprint: credentialFingerprint,
+        agentProfile: "frontmind-pro",
         status: "active",
         validationStatus: "verified",
         verifiedAt: new Date(),
@@ -797,7 +819,7 @@ mysqlDescribe(
       await executor.insert(userDashboardContents).values({
         userId,
         payload: createDefaultDashboardPayload(SYNTHETIC_COMPANY),
-        sourceName: "synthetic-manus-v2-mysql-e2e.json",
+        sourceName: "synthetic-materialized-mysql-e2e.json",
         enterpriseIdentityBoundAt: new Date(),
         revision: 1,
       });
@@ -808,6 +830,7 @@ mysqlDescribe(
         version: 1,
         apiKey: upstreamApiKey,
         fingerprint: credentialFingerprint,
+        agentProfile: "frontmind-pro",
         status: "active",
         validationStatus: "verified",
         verifiedAt: new Date(),
@@ -825,26 +848,21 @@ mysqlDescribe(
       dependencies.getDecryptedCredentialForKnowledgeBaseUploadReservation.mockResolvedValue(
         decryptedCredential,
       );
-      // The authoritative task/file ownership rows are inserted by the v2
-      // binding transactions. The legacy compatibility callback is a no-op.
       dependencies.recordUpstreamResource.mockResolvedValue(undefined);
 
       assetRoot = await mkdtemp(
-        path.join(tmpdir(), "frontmind-kb-manus-v2-mysql-e2e-"),
+        path.join(tmpdir(), "frontmind-kb-materialized-mysql-e2e-"),
       );
       process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
-      process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = "100";
-      process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = "false";
+      process.env.FRONTMIND_KB_TREE_POLICY_V2_WRITER = "true";
       process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
       process.env.FRONTMIND_UPSTREAM_BASE_URL = PROVIDER_BASE_URL;
       process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY = `base64:${Buffer.alloc(32, 73).toString("base64")}`;
 
       fakeProvider = createFakeManusV2Provider({
         apiKey: upstreamApiKey,
-        canonicalTaskId,
+        taskId: initialTaskId,
       });
-      // Manus endpoints remain HTTPS. This adapter is the only network seam;
-      // TLS validation is never disabled and Dashboard HTTP routes stay real.
       axios.defaults.adapter = fakeProvider.adapter;
 
       const { default: knowledgeBaseRouter } = await import(
@@ -852,9 +870,6 @@ mysqlDescribe(
       );
       const { default: artifactRouter } = await import(
         "../server/knowledge-base-artifact-api"
-      );
-      const { default: dashboardRouter } = await import(
-        "../server/dashboard-api"
       );
       const { requireExpressAuth } = await import(
         "../server/_core/express-auth"
@@ -871,7 +886,6 @@ mysqlDescribe(
         requireExpressAuth,
         knowledgeBaseRouter,
       );
-      dashboard.use("/api/dashboard", dashboardRouter);
       const listener = await listen(dashboard);
       dashboardServer = listener.server;
       dashboardBaseUrl = listener.baseUrl;
@@ -891,14 +905,6 @@ mysqlDescribe(
         if (pool && userId) {
           await pool.execute(
             "DELETE FROM upstream_resources WHERE userId = ?",
-            [userId],
-          );
-          await pool.execute(
-            "UPDATE knowledge_base_builds SET publishedSnapshotId = NULL WHERE userId = ?",
-            [userId],
-          );
-          await pool.execute(
-            "DELETE FROM knowledge_base_snapshots WHERE userId = ?",
             [userId],
           );
           await pool.execute(
@@ -940,10 +946,6 @@ mysqlDescribe(
       };
       restoreEnvironment("FRONTMIND_DASHBOARD_ASSET_DIR", previousAssetRoot);
       restoreEnvironment(
-        "FRONTMIND_KB_V4_ROLLOUT_PERCENT",
-        previousRolloutPercent,
-      );
-      restoreEnvironment(
         "FRONTMIND_KB_TREE_POLICY_V2_WRITER",
         previousTreePolicyWriter,
       );
@@ -958,14 +960,12 @@ mysqlDescribe(
       );
       if (cleanupError) throw cleanupError;
       if (acceptancePassed) {
-        console.log("KB_MANUS_V2_MYSQL_E2E_ACCEPTANCE_COMPLETE");
+        console.log("KB_MATERIALIZED_MYSQL_E2E_ACCEPTANCE_COMPLETE");
       }
     }, 120_000);
 
-    it("runs reserve/dispatch, create-once/send-many, receipt acceptance, content completion, local packaging and immutable publication", async () => {
-      expect(process.env.FRONTMIND_KB_MANUS_V2_WRITER).toBe("true");
+    it("creates one v2 task, materializes every node, confirms locally after revoke, and builds the final ZIP", async () => {
       expect(userId).not.toBeNull();
-
       const startRequest = {
         conversationId: publicConversationId,
         clientRequestId: `start-${runId}`,
@@ -973,6 +973,7 @@ mysqlDescribe(
         companyWebsite: SYNTHETIC_WEBSITE,
         operatorNotes: "仅包含合成验收资料",
         attachmentManifest: [],
+        expectedResetRevision: 0,
       };
       const reserved = await postKnowledgeBase("/start/reserve", startRequest);
       expect(reserved).toMatchObject({
@@ -983,42 +984,35 @@ mysqlDescribe(
           requiresUpload: false,
         },
       });
-      // A reservation must not cross the provider boundary.
-      expect(fakeProvider.fileUploads).toHaveLength(0);
-      expect(fakeProvider.taskCreateBodies).toHaveLength(0);
+      expect(fakeProvider.providerCalls).toHaveLength(0);
 
       await postKnowledgeBase("/turn/dispatch", {
         conversationId: publicConversationId,
         turnId: reserved.reservation.turnId,
         clientRequestId: startRequest.clientRequestId,
         attachmentManifest: [],
+        expectedResetRevision: 0,
       });
       let progress = await waitFor({
-        label: "initial Manus v2 presentation",
+        label: "initial complete materialized Working Set",
         read: getProgress,
         accept: (payload) =>
           payload.observation?.interaction?.interactionState ===
             "awaiting_input" &&
+          payload.observation?.progress?.build?.contentVersion === 1 &&
+          payload.observation?.progress?.summary?.total ===
+            MATERIALIZED_LEAF_COUNT &&
           payload.observation?.approvedPresentation?.leafId === "1.1",
       });
-      expect(progress.observation).toMatchObject({
-        generation: 1,
-        contentState: "building",
-        publicationState: "draft",
-        authoritativeTaskId: canonicalTaskId,
-        canonicalTaskUrl: `https://manus.im/app/${canonicalTaskId}`,
-        approvedPresentation: {
-          revision: 0,
-          leafId: "1.1",
-          visibleMarkdown: syntheticLeaves[0]!.visibleMarkdown,
-          contentSha256: knowledgeBaseMarkdownSha256(
-            syntheticLeaves[0]!.visibleMarkdown,
-          ),
-          resources: [],
-        },
+      await waitFor({
+        label: "initial task visibility update",
+        read: async () => fakeProvider.taskUpdateBodies.length,
+        accept: (count) => count === 1,
       });
+
       expect(fakeProvider.taskCreateBodies).toHaveLength(1);
       expect(fakeProvider.taskSendBodies).toHaveLength(0);
+      expect(fakeProvider.bundleDownloads).toBe(1);
       expect(fakeProvider.fileUploads.length).toBeGreaterThanOrEqual(2);
       expect(fakeProvider.fileDetailCalls.length).toBeGreaterThanOrEqual(
         fakeProvider.fileUploads.length * 2,
@@ -1030,139 +1024,163 @@ mysqlDescribe(
           .from(knowledgeBaseBuilds)
           .where(eq(knowledgeBaseBuilds.conversationId, publicConversationId))
           .limit(1)
-      )[0];
+      )[0]!;
       expect(build).toMatchObject({
+        executionMode: "materialized_bundle_v1",
         providerProtocol: "manus_v2",
-        canonicalTaskId,
-        canonicalTaskGeneration: 1,
-        canonicalCredentialId: credentialId,
-        canonicalTaskState: "active",
-        upstreamTaskId: canonicalTaskId,
-        treePolicyVersion: 1,
-        skillContentHash: KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
+        skillVersion: "5",
+        skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+        contentVersion: 1,
+        status: "confirming",
         revision: 0,
         currentLeafId: "1.1",
+        totalNodeCount: MATERIALIZED_LEAF_COUNT,
+        confirmedCount: 0,
+        upstreamTaskId: null,
+        canonicalTaskId: null,
+      });
+      expect(build.activeWorkingSetId).toEqual(expect.any(String));
+      expect(build.logoSha256).toMatch(/^[a-f0-9]{64}$/u);
+
+      const workingSets = await executor
+        .select()
+        .from(knowledgeBaseWorkingSets)
+        .where(eq(knowledgeBaseWorkingSets.buildId, build.id));
+      expect(workingSets).toHaveLength(1);
+      expect(workingSets[0]).toMatchObject({
+        id: build.activeWorkingSetId,
+        generation: 1,
+        contentVersion: 1,
+        status: "active",
       });
 
-      for (let index = 0; index < FINAL_REVISION; index += 1) {
+      const materializedNodes = await executor
+        .select()
+        .from(knowledgeBaseBuildNodes)
+        .where(eq(knowledgeBaseBuildNodes.buildId, build.id))
+        .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
+      expect(materializedNodes).toHaveLength(MATERIALIZED_LEAF_COUNT);
+      expect(materializedNodes[0]!.status).toBe("current");
+      expect(
+        materializedNodes.slice(1).every((node) => node.status === "pending"),
+      ).toBe(true);
+      expect(
+        materializedNodes.every(
+          (node, index) =>
+            node.contentVersion === 1 &&
+            node.contentMarkdown === syntheticLeaves[index]!.visibleMarkdown &&
+            node.contentSha256 ===
+              knowledgeBaseMarkdownSha256(
+                syntheticLeaves[index]!.visibleMarkdown,
+              ),
+        ),
+      ).toBe(true);
+
+      await executor
+        .update(apiCredentials)
+        .set({
+          status: "deleted",
+          validationStatus: "invalid",
+          deletedAt: new Date(),
+        })
+        .where(eq(apiCredentials.id, credentialId));
+      fakeProvider.rejectProviderCalls = true;
+      const providerCallsBeforeConfirmation = fakeProvider.providerCalls.length;
+
+      for (let index = 0; index < MATERIALIZED_LEAF_COUNT; index += 1) {
         const leaf = syntheticLeaves[index]!;
-        const presentationKey =
-          progress.observation.approvedPresentation?.presentationKey;
-        expect(presentationKey).toEqual(expect.any(String));
-        await postKnowledgeBase("/turn", {
+        const observation = progress.observation;
+        expect(observation.approvedPresentation).toMatchObject({
+          leafId: leaf.leafId,
+          revision: index,
+          visibleMarkdown: leaf.visibleMarkdown,
+        });
+        const confirmation = await postKnowledgeBase("/confirm", {
           conversationId: publicConversationId,
           clientRequestId: `confirm-${index + 1}-${runId}`,
-          userMessage: "确认",
-          expectedGeneration: 1,
-          expectedRevision: index,
+          expectedGeneration: observation.generation,
+          expectedResetRevision: 0,
+          expectedStateEpoch: observation.stateEpoch,
+          expectedRevision: observation.progress.build.revision,
           expectedLeafId: leaf.leafId,
-          expectedPresentationKey: presentationKey,
+          expectedPresentationKey:
+            observation.approvedPresentation.presentationKey,
+          expectedContentVersion: observation.progress.build.contentVersion,
         });
-        const isFinal = index === FINAL_REVISION - 1;
-        progress = await waitFor({
-          label: `confirmation ${index + 1}`,
-          read: getProgress,
-          accept: (payload) =>
-            isFinal
-              ? payload.observation?.contentState === "completed" &&
-                payload.observation?.interaction?.progress?.build?.revision ===
-                  FINAL_REVISION
-              : payload.observation?.interaction?.interactionState ===
-                  "awaiting_input" &&
-                payload.observation?.approvedPresentation?.leafId ===
-                  syntheticLeaves[index + 1]!.leafId,
+        expect(confirmation).toMatchObject({
+          accepted: true,
+          execution: "local",
+          disposition:
+            index === MATERIALIZED_LEAF_COUNT - 1 ? "completed" : "advanced",
         });
-        if (!isFinal) {
-          expect(progress.observation.approvedPresentation).toMatchObject({
-            revision: index + 1,
-            leafId: syntheticLeaves[index + 1]!.leafId,
-            visibleMarkdown: syntheticLeaves[index + 1]!.visibleMarkdown,
-          });
-        }
+        expect(fakeProvider.providerCalls).toHaveLength(
+          providerCallsBeforeConfirmation,
+        );
+        progress = { observation: confirmation.observation };
       }
 
+      expect(fakeProvider.rejectedCallCount).toBe(0);
       expect(fakeProvider.taskCreateBodies).toHaveLength(1);
-      expect(fakeProvider.taskSendBodies).toHaveLength(FINAL_REVISION);
-      expect(fakeProvider.taskSendBodies.length).toBeGreaterThanOrEqual(2);
-      expect(
-        new Set(
-          fakeProvider.taskSendBodies.map((body) => String(body.task_id)),
-        ),
-      ).toEqual(new Set([canonicalTaskId]));
-      expect(fakeProvider.taskListCalls).toBeGreaterThanOrEqual(
-        FINAL_REVISION + 1,
-      );
-      for (const body of [
-        ...fakeProvider.taskCreateBodies,
-        ...fakeProvider.taskSendBodies,
-      ]) {
-        const contract = providerOperationContract(messagePrompt(body));
-        assertStructuredSchema(body.structured_output_schema, contract);
-      }
+      expect(fakeProvider.taskSendBodies).toHaveLength(0);
+      expect(progress.observation).toMatchObject({
+        contentState: "completed",
+        packageState: "preparing",
+        progress: {
+          build: {
+            revision: MATERIALIZED_LEAF_COUNT,
+            currentLeafId: null,
+            contentVersion: 1,
+          },
+          summary: {
+            total: MATERIALIZED_LEAF_COUNT,
+            confirmed: MATERIALIZED_LEAF_COUNT,
+          },
+        },
+      });
 
-      const contentCompleteBuild = (
+      const completedBuild = (
         await executor
           .select()
           .from(knowledgeBaseBuilds)
           .where(eq(knowledgeBaseBuilds.id, build.id))
           .limit(1)
-      )[0];
-      expect(contentCompleteBuild).toMatchObject({
+      )[0]!;
+      expect(completedBuild).toMatchObject({
         status: "ready_to_publish",
-        providerProtocol: "manus_v2",
-        canonicalTaskId,
-        upstreamTaskId: canonicalTaskId,
-        revision: FINAL_REVISION,
-        confirmedCount: FINAL_REVISION,
+        revision: MATERIALIZED_LEAF_COUNT,
+        confirmedCount: MATERIALIZED_LEAF_COUNT,
         currentLeafId: null,
         activeTurnId: null,
         packageStatus: "preparing",
-        packageStorageKey: null,
-        packageArchiveSha256: null,
-        protocolErrorCode: null,
+        activeWorkingSetId: build.activeWorkingSetId,
+        contentVersion: 1,
       });
-      expect(contentCompleteBuild.contentCompletedAt).toBeInstanceOf(Date);
-      expect(progress.observation).toMatchObject({
-        contentState: "completed",
-        packageState: "preparing",
-        publicationState: "draft",
-        authoritativeTaskId: canonicalTaskId,
-        approvedPresentation: {
-          leafId: "1.8",
-          visibleMarkdown: syntheticLeaves[7]!.visibleMarkdown,
-        },
-        package: null,
-      });
-      expect(progress.observation.displaySequence).toEqual(expect.any(Number));
 
       const turns = await executor
         .select()
         .from(conversationTurns)
         .where(eq(conversationTurns.userId, userId!));
-      expect(turns).toHaveLength(FINAL_REVISION + 1);
-      expect(turns.every((turn) => turn.status === "completed")).toBe(true);
-      expect(new Set(turns.map((turn) => turn.upstreamTaskId))).toEqual(
-        new Set([canonicalTaskId]),
+      const initialTurns = turns.filter(
+        (turn) => turn.operationType === "start",
       );
-      const createTurns = turns.filter(
-        (turn) => (turn.metadata as any).providerMethod === "task.create",
+      const localConfirmTurns = turns.filter(
+        (turn) => turn.operationType === "local_confirm",
       );
-      const sendTurns = turns.filter(
-        (turn) => (turn.metadata as any).providerMethod === "task.sendMessage",
-      );
-      expect(createTurns).toHaveLength(1);
-      expect(createTurns[0]!.expectedRevision).toBe(0);
-      expect(sendTurns).toHaveLength(FINAL_REVISION);
+      expect(initialTurns).toHaveLength(1);
+      expect(initialTurns[0]).toMatchObject({
+        status: "completed",
+        upstreamTaskId: initialTaskId,
+        apiCredentialId: credentialId,
+      });
+      expect(localConfirmTurns).toHaveLength(MATERIALIZED_LEAF_COUNT);
       expect(
-        sendTurns
-          .map((turn) => turn.expectedRevision)
-          .sort((left, right) => Number(left) - Number(right)),
-      ).toEqual(Array.from({ length: FINAL_REVISION }, (_, index) => index));
-      expect(
-        turns.every(
+        localConfirmTurns.every(
           (turn) =>
-            (turn.metadata as any).providerProtocol === "manus_v2" &&
-            (turn.metadata as any).providerAttemptState === "accepted",
+            turn.status === "completed" &&
+            turn.upstreamTaskId === null &&
+            turn.apiCredentialId === null &&
+            (turn.metadata as any).execution === "local" &&
+            (turn.metadata as any).providerRequestCount === 0,
         ),
       ).toBe(true);
 
@@ -1179,117 +1197,62 @@ mysqlDescribe(
         (message) =>
           (message.metadata as any)?.knowledgeBase?.kind === "completion",
       );
-      expect(presentations).toHaveLength(FINAL_REVISION);
+      expect(presentations).toHaveLength(MATERIALIZED_LEAF_COUNT);
       expect(completions).toHaveLength(1);
-      expect(
-        presentations.map((message) => ({
-          leafId: (message.metadata as any).knowledgeBase.leafId,
-          generation: (message.metadata as any).knowledgeBase.generation,
-          serverOwned: (message.metadata as any).knowledgeBase.serverOwned,
-          content: message.content,
-        })),
-      ).toEqual(
-        syntheticLeaves.map((leaf) => ({
-          leafId: leaf.leafId,
-          generation: 1,
-          serverOwned: true,
-          content: leaf.visibleMarkdown,
-        })),
-      );
       expect(completions[0]).toMatchObject({
         role: "assistant",
         content: KNOWLEDGE_BASE_COMPLETION_MESSAGE_CONTENT,
       });
-      expect((completions[0]!.metadata as any).knowledgeBase).toMatchObject({
-        schemaVersion: 1,
-        kind: "completion",
-        buildId: build.id,
-        generation: 1,
-        revision: FINAL_REVISION,
-        leafId: null,
-        serverOwned: true,
-      });
-      expect(completions[0]!.sequence).toBeGreaterThan(
-        presentations.at(-1)!.sequence,
-      );
-      expect(progress.observation.displaySequence).toBe(
-        completions[0]!.sequence,
-      );
 
-      const nodes = await executor
+      const confirmedNodes = await executor
         .select()
         .from(knowledgeBaseBuildNodes)
         .where(eq(knowledgeBaseBuildNodes.buildId, build.id))
         .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
-      expect(nodes).toHaveLength(FINAL_REVISION);
-      expect(nodes.every((node) => node.status === "confirmed")).toBe(true);
-      expect(
-        nodes.map((node) => ({
-          leafId: node.leafId,
-          content: node.contentMarkdown,
-          sha256: node.contentSha256,
-        })),
-      ).toEqual(
-        syntheticLeaves.map((leaf) => ({
-          leafId: leaf.leafId,
-          content: leaf.visibleMarkdown,
-          sha256: knowledgeBaseMarkdownSha256(leaf.visibleMarkdown),
-        })),
+      expect(confirmedNodes).toHaveLength(MATERIALIZED_LEAF_COUNT);
+      expect(confirmedNodes.every((node) => node.status === "confirmed")).toBe(
+        true,
       );
 
       const resources = await executor
         .select()
         .from(upstreamResources)
         .where(eq(upstreamResources.userId, userId!));
-      const taskResources = resources.filter(
-        (resource) => resource.kind === "task",
-      );
-      const fileResources = resources.filter(
-        (resource) => resource.kind === "file",
-      );
-      expect(taskResources).toHaveLength(1);
-      expect(taskResources[0]).toMatchObject({
-        upstreamId: canonicalTaskId,
-        apiCredentialId: credentialId,
-      });
-      expect(fileResources.length).toBe(fakeProvider.fileUploads.length);
-      expect(
-        new Set(resources.map((resource) => resource.apiCredentialId)),
-      ).toEqual(new Set([credentialId]));
+      expect(resources.filter((resource) => resource.kind === "task")).toEqual([
+        expect.objectContaining({
+          upstreamId: initialTaskId,
+          apiCredentialId: credentialId,
+        }),
+      ]);
 
       const {
         runKnowledgeBasePackageSweep,
         readDashboardOwnedKnowledgePackage,
       } = await import("../server/knowledge-base-local-package");
       const packageSettlement = await waitFor({
-        label: "Dashboard-owned package",
+        label: "Dashboard local final package",
         read: async () => {
           const sweep = await runKnowledgeBasePackageSweep(1);
           const projection = await getProgress();
           return { sweep, projection };
         },
         accept: ({ sweep, projection }) => {
-          const packageState = projection.observation?.packageState;
-          if (
-            sweep.failed !== 0 ||
-            packageState === "retrying" ||
-            packageState === "attention_required"
-          ) {
-            throw new Error(
-              `Dashboard-owned package failed: ${JSON.stringify({ sweep, packageState })}`,
-            );
+          if (sweep.failed !== 0) {
+            throw new Error(`local package failed: ${JSON.stringify(sweep)}`);
           }
-          return packageState === "ready";
+          return projection.observation?.packageState === "ready";
         },
       });
       progress = packageSettlement.projection;
+      expect(fakeProvider.providerCalls).toHaveLength(
+        providerCallsBeforeConfirmation,
+      );
       expect(progress.observation).toMatchObject({
         contentState: "completed",
         packageState: "ready",
-        publicationState: "draft",
         package: {
-          revision: FINAL_REVISION,
-          outputItemId: `dashboard-local:${build.id}:${FINAL_REVISION}`,
+          revision: MATERIALIZED_LEAF_COUNT,
+          outputItemId: `dashboard-local:${build.id}:${MATERIALIZED_LEAF_COUNT}`,
           downloadPath: `/api/knowledge-base/artifacts/${build.id}/package`,
           mimeType: "application/zip",
         },
@@ -1311,157 +1274,34 @@ mysqlDescribe(
           .from(knowledgeBaseBuilds)
           .where(eq(knowledgeBaseBuilds.id, build.id))
           .limit(1)
-      )[0];
+      )[0]!;
       expect(packageBuild).toMatchObject({
-        contentCompletedAt: contentCompleteBuild.contentCompletedAt,
         packageStatus: "ready",
         packageAttemptCount: 1,
-        packageRevision: FINAL_REVISION,
-        packageTaskId: canonicalTaskId,
-        packageOutputItemId: `dashboard-local:${build.id}:${FINAL_REVISION}`,
+        packageRevision: MATERIALIZED_LEAF_COUNT,
+        packageTaskId: `dashboard-materialized:${build.id}:1`,
+        packageOutputItemId: `dashboard-local:${build.id}:${MATERIALIZED_LEAF_COUNT}`,
         packageFileId: null,
         packageArchiveSha256: sha256(packageBytes),
         packageSizeBytes: packageBytes.length,
       });
-      expect(packageBuild.packageStorageKey).toEqual(expect.any(String));
       const parsedPackage = await readDashboardOwnedKnowledgePackage({
         buffer: packageBytes,
         expected: {
           buildId: build.id,
           generation: 1,
-          revision: FINAL_REVISION,
+          revision: MATERIALIZED_LEAF_COUNT,
           companyName: SYNTHETIC_COMPANY,
         },
-        nodes,
+        nodes: confirmedNodes,
       });
-      expect(parsedPackage.documents).toHaveLength(FINAL_REVISION);
-      expect(parsedPackage.manifest.missing_optional_assets).toContain(
+      expect(parsedPackage.documents).toHaveLength(MATERIALIZED_LEAF_COUNT);
+      expect(parsedPackage.manifest.missing_optional_assets).not.toContain(
         "official_logo",
       );
+      expect(fakeProvider.rejectedCallCount).toBe(0);
       expect(fakeProvider.taskCreateBodies).toHaveLength(1);
-      expect(fakeProvider.taskSendBodies).toHaveLength(FINAL_REVISION);
-
-      const unauthenticatedPublish = await fetch(
-        `${dashboardBaseUrl}/api/dashboard/knowledge/publish`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ conversationId: publicConversationId }),
-        },
-      );
-      expect(unauthenticatedPublish.status).toBe(401);
-      const publishResponse = await fetch(
-        `${dashboardBaseUrl}/api/dashboard/knowledge/publish`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-test-auth": "user",
-          },
-          body: JSON.stringify({ conversationId: publicConversationId }),
-        },
-      );
-      expect(publishResponse.status).toBe(200);
-      const published = (await publishResponse.json()) as any;
-      expect(published).toMatchObject({
-        kind: "knowledge",
-        snapshot: {
-          id: expect.any(String),
-          sourceBuildId: build.id,
-          sourceBuildRevision: FINAL_REVISION,
-          sourceTaskId: canonicalTaskId,
-          sourceArtifactHash: sha256(packageBytes),
-          archiveHash: sha256(packageBytes),
-          archiveAvailable: true,
-          documentCount: FINAL_REVISION,
-        },
-      });
-
-      const repeatedPublishResponse = await fetch(
-        `${dashboardBaseUrl}/api/dashboard/knowledge/publish`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-test-auth": "user",
-          },
-          body: JSON.stringify({ conversationId: publicConversationId }),
-        },
-      );
-      expect(repeatedPublishResponse.status).toBe(200);
-      const repeatedPublished = (await repeatedPublishResponse.json()) as any;
-      expect(repeatedPublished).toMatchObject({
-        kind: "knowledge",
-        idempotent: true,
-        snapshot: { id: published.snapshot.id },
-      });
-
-      const snapshots = await executor
-        .select()
-        .from(knowledgeBaseSnapshots)
-        .where(eq(knowledgeBaseSnapshots.sourceBuildId, build.id));
-      expect(snapshots).toHaveLength(1);
-      expect(snapshots[0]).toMatchObject({
-        id: published.snapshot.id,
-        userId,
-        sourceBuildRevision: FINAL_REVISION,
-        sourceTaskId: canonicalTaskId,
-        sourceArtifactHash: sha256(packageBytes),
-        archiveHash: sha256(packageBytes),
-        documentCount: FINAL_REVISION,
-        imageCount: 0,
-        totalBytes: packageBytes.length,
-        status: "active",
-      });
-      expect(
-        (snapshots[0]!.documents as any[]).map((document) => ({
-          id: document.id,
-          order: document.order,
-          contentSha256: knowledgeBaseMarkdownSha256(document.content),
-        })),
-      ).toEqual(
-        syntheticLeaves.map((leaf, order) => ({
-          id: leaf.leafId,
-          order,
-          contentSha256: knowledgeBaseMarkdownSha256(leaf.visibleMarkdown),
-        })),
-      );
-
-      const publishedArchiveUrl = `${dashboardBaseUrl}/api/dashboard/knowledge/snapshots/${published.snapshot.id}/archive`;
-      expect((await fetch(publishedArchiveUrl)).status).toBe(401);
-      const publishedArchiveResponse = await fetch(publishedArchiveUrl, {
-        headers: { "x-test-auth": "user" },
-      });
-      expect(publishedArchiveResponse.status).toBe(200);
-      expect(publishedArchiveResponse.headers.get("cache-control")).toBe(
-        "private, no-store",
-      );
-      expect(Buffer.from(await publishedArchiveResponse.arrayBuffer())).toEqual(
-        packageBytes,
-      );
-
-      const publishedBuild = (
-        await executor
-          .select()
-          .from(knowledgeBaseBuilds)
-          .where(eq(knowledgeBaseBuilds.id, build.id))
-          .limit(1)
-      )[0];
-      expect(publishedBuild).toMatchObject({
-        status: "published",
-        publishedSnapshotId: published.snapshot.id,
-        contentCompletedAt: contentCompleteBuild.contentCompletedAt,
-        packageStatus: "ready",
-        packageArchiveSha256: sha256(packageBytes),
-      });
-      progress = await getProgress();
-      expect(progress.observation).toMatchObject({
-        contentState: "completed",
-        packageState: "ready",
-        publicationState: "published",
-      });
-      expect(fakeProvider.taskCreateBodies).toHaveLength(1);
-      expect(fakeProvider.taskSendBodies).toHaveLength(FINAL_REVISION);
+      expect(fakeProvider.taskSendBodies).toHaveLength(0);
 
       acceptancePassed = true;
     }, 300_000);

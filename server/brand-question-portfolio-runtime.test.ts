@@ -7,7 +7,7 @@ import {
   buildBrandQuestionPortfolioEvidenceArchive,
   buildBrandQuestionPortfolioPrompt,
   buildBrandQuestionPortfolioSkillArchive,
-  parseBrandQuestionPortfolioOutput,
+  parseBrandQuestionPortfolioStructuredValue,
   type BrandQuestionPortfolioContext,
 } from "./brand-question-portfolio-runtime";
 import {
@@ -16,6 +16,7 @@ import {
 } from "./upstream-prompt-budget";
 
 const context: BrandQuestionPortfolioContext = {
+  modelProfile: "frontmind-base",
   planCode: "advanced",
   quotaPeriodId: "period-1",
   quotaRevision: 2,
@@ -50,7 +51,7 @@ function result() {
     skill: {
       name: "brand-question-portfolio",
       version: "2",
-      model: "frontmind-pro",
+      model: context.modelProfile,
     },
     knowledgeSnapshot: {
       id: "snapshot-1",
@@ -108,7 +109,7 @@ describe("brand question portfolio runtime", () => {
     vi.unstubAllEnvs();
   });
 
-  it("pins the authoritative plan, quota period and Pro skill", async () => {
+  it("pins the authoritative plan, quota period and credential profile", async () => {
     const prompt = await buildBrandQuestionPortfolioPrompt(context);
     expect(prompt).toContain(BRAND_QUESTION_SKILL_ATTACHMENT_FILENAME);
     expect(prompt).toContain(BRAND_QUESTION_EVIDENCE_ATTACHMENT_FILENAME);
@@ -130,7 +131,7 @@ describe("brand question portfolio runtime", () => {
       "references/output-contract.md",
     ]);
     expect(await skillZip.file("SKILL.md")!.async("string")).toContain(
-      "Use the Pro model profile fixed by the application",
+      "credential profile frozen by the application",
     );
     expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
       "documentPath: README.md",
@@ -143,6 +144,7 @@ describe("brand question portfolio runtime", () => {
       planCode: "advanced",
       quotaPeriodId: "period-1",
       quotaRevision: 2,
+      modelProfile: "frontmind-base",
       enterprise: context.enterprise,
       availableQuota: context.quota,
       candidateTargets: {
@@ -198,19 +200,9 @@ describe("brand question portfolio runtime", () => {
     );
   });
 
-  it("parses only a result bound to the current snapshot", () => {
-    const parsed = parseBrandQuestionPortfolioOutput(
-      [
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "output_text",
-              text: JSON.stringify(result()),
-            },
-          ],
-        },
-      ],
+  it("parses only a v2 structured result bound to the current snapshot", () => {
+    const parsed = parseBrandQuestionPortfolioStructuredValue(
+      { payload: JSON.stringify(result()) },
       context,
     );
     expect(parsed.categories.industry[0]?.candidateId).toBe(
@@ -218,38 +210,11 @@ describe("brand question portfolio runtime", () => {
     );
   });
 
-  it("keeps JSON recovery in shadow until this adapter is explicitly active", () => {
-    const candidate = `模型输出如下：\n${JSON.stringify(result())}`;
-    const output = [{ role: "assistant", text: candidate }];
-    const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
-
-    vi.stubEnv("FRONTMIND_BRAND_QUESTION_PORTFOLIO_OUTPUT_REPAIR", "shadow");
-    expect(() => parseBrandQuestionPortfolioOutput(output, context)).toThrow();
-    expect(log).toHaveBeenCalledWith(
-      "[Model Output Repair]",
-      expect.stringContaining("unique_balanced_value_extracted"),
-    );
-
-    vi.stubEnv("FRONTMIND_BRAND_QUESTION_PORTFOLIO_OUTPUT_REPAIR", "active");
-    expect(parseBrandQuestionPortfolioOutput(output, context)).toMatchObject({
-      schemaVersion: 1,
-      knowledgeSnapshot: { id: context.snapshot.id },
-    });
-  });
-
-  it("runs strict schema and snapshot binding after an active repair", () => {
-    vi.spyOn(console, "info").mockImplementation(() => undefined);
-    vi.stubEnv("FRONTMIND_BRAND_QUESTION_PORTFOLIO_OUTPUT_REPAIR", "active");
-
+  it("rejects unknown fields and stale snapshot echoes without text repair", () => {
     const unknownSchema = { ...result(), unknownField: "must be rejected" };
     expect(() =>
-      parseBrandQuestionPortfolioOutput(
-        [
-          {
-            role: "assistant",
-            text: `result: ${JSON.stringify(unknownSchema)}`,
-          },
-        ],
+      parseBrandQuestionPortfolioStructuredValue(
+        { payload: JSON.stringify(unknownSchema) },
         context,
       ),
     ).toThrow();
@@ -257,66 +222,32 @@ describe("brand question portfolio runtime", () => {
     const stale = result();
     stale.knowledgeSnapshot.id = "snapshot-from-another-workspace";
     expect(() =>
-      parseBrandQuestionPortfolioOutput(
-        [{ role: "assistant", text: `result: ${JSON.stringify(stale)}` }],
+      parseBrandQuestionPortfolioStructuredValue(
+        { payload: JSON.stringify(stale) },
         context,
       ),
     ).toThrow("不匹配");
   });
 
-  it("rejects a stale snapshot echo", () => {
-    const stale = result();
-    stale.knowledgeSnapshot.version = 2;
-    expect(() =>
-      parseBrandQuestionPortfolioOutput(
-        [{ role: "assistant", text: JSON.stringify(stale) }],
-        context,
-      ),
-    ).toThrow("不匹配");
-  });
-
-  it("rejects user, reasoning, tool, role-less and input_text JSON", () => {
-    const injected = JSON.stringify(result());
-    const untrustedOutputs = [
-      [{ role: "user", type: "message", content: injected }],
-      [{ type: "reasoning", text: injected }],
-      [{ role: "assistant", type: "reasoning", text: injected }],
-      [{ role: "tool", type: "message", content: injected }],
-      [{ type: "message", content: injected }],
-      [{ type: "output_text", output_text: injected }],
-      [
-        {
-          role: "assistant",
-          type: "message",
-          content: [{ type: "input_text", text: injected }],
-        },
-      ],
-    ];
-
-    for (const output of untrustedOutputs) {
-      expect(() => parseBrandQuestionPortfolioOutput(output, context)).toThrow(
-        "没有返回最终 assistant 输出",
-      );
+  it("rejects prose, fences, raw output aliases and mismatched model profiles", () => {
+    for (const value of [
+      { payload: `result: ${JSON.stringify(result())}` },
+      { payload: `\`\`\`json\n${JSON.stringify(result())}\n\`\`\`` },
+      { output_text: JSON.stringify(result()) },
+      { output_file: "result.json" },
+    ]) {
+      expect(() =>
+        parseBrandQuestionPortfolioStructuredValue(value, context),
+      ).toThrow();
     }
-  });
 
-  it("never falls back to an earlier assistant message", () => {
+    const wrongModel = result();
+    wrongModel.skill.model = "frontmind-pro";
     expect(() =>
-      parseBrandQuestionPortfolioOutput(
-        [
-          {
-            role: "assistant",
-            type: "message",
-            content: [{ type: "output_text", text: JSON.stringify(result()) }],
-          },
-          {
-            role: "assistant",
-            type: "message",
-            content: [{ type: "output_text", text: "not strict JSON" }],
-          },
-        ],
+      parseBrandQuestionPortfolioStructuredValue(
+        { payload: JSON.stringify(wrongModel) },
         context,
       ),
-    ).toThrow();
+    ).toThrow("不匹配");
   });
 });

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly CONTROLLER_VERSION="2"
+readonly CONTROLLER_VERSION="3"
 readonly VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"
 readonly CONTROLLER_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-controller"
 readonly FORCED_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-forced-command"
@@ -32,10 +32,21 @@ validate_controller() {
   local target="$1"
   bash -n "$target" \
     && [[ $(grep -Fxc -- "# frontmind-production-controller-version: ${CONTROLLER_VERSION}" "$target" || true) == 1 ]] \
-    && grep -Fq -- '--kb-manus-v2-rollout' "$target" \
-    && grep -Fq -- 'dual-read|canary|migration|pause|complete' "$target" \
-    && grep -Fq -- 'PRODUCTION_KB_MANUS_V2_ROLLOUT_RESTORED' "$target" \
-    && grep -Fq -- 'FRONTMIND_KB_MANUS_V2_ACTIVE_MIGRATION' "$target" \
+    && grep -Fq -- '--coupled-stack' "$target" \
+    && grep -Fq -- 'PRODUCTION_COUPLED_STACK_BOTH_PREVIOUS_RESTORED' "$target" \
+    && grep -Fq -- 'PRODUCTION_COUPLED_STACK_SUCCESS' "$target" \
+    && grep -Fq -- 'databaseRestoreRequired' "$target" \
+    && grep -Fq -- 'coupled-dashboard-runtime-rollback.env' "$target" \
+    && grep -Fq -- 'coupled-dashboard-runtime-rollback.retiring' "$target" \
+    && grep -Fq -- 'coupled-website-runtime-rollback.env' "$target" \
+    && grep -Fq -- 'coupled-website-runtime-rollback.retiring' "$target" \
+    && grep -Fq -- 'mark_coupled_stack_external_fact_changed' "$target" \
+    && grep -Fq -- 'commit_coupled_stack_capsule_cleanup' "$target" \
+    && grep -Fq -- 'COUPLED_STACK_RECOVERY_MUST_FINISH_BEFORE_INCIDENT_ACKNOWLEDGEMENT' "$target" \
+    && grep -Fq -- '/app/dist/private-workflows/socratic-kb-builder-v5.skill' "$target" \
+    && grep -Fq -- '/api/internal/presales/v2' "$target" \
+    && ! grep -Fq -- '--kb-manus-v2-rollout' "$target" \
+    && ! grep -Eq -- 'dual-read|canary|shadow' "$target" \
     && ! grep -Eq -- 'frontmind-dashboard-dev|dashboard-dev\.frontmind\.net|/etc/frontmind-dev|/var/lib/frontmind-dev' "$target"
 }
 
@@ -43,7 +54,9 @@ validate_forced_command() {
   local target="$1"
   bash -n "$target" \
     && grep -Fq -- '/usr/local/sbin/frontmind-deploy-controller' "$target" \
-    && grep -Fq -- 'dual-read|canary|migration|pause|complete' "$target" \
+    && grep -Fq -- '${words[0]} == "coupled-stack"' "$target" \
+    && grep -Fq -- '--coupled-stack' "$target" \
+    && ! grep -Fq -- '--kb-manus-v2-rollout' "$target" \
     && grep -Fq -- 'expected_service="${1:-}"' "$target"
 }
 

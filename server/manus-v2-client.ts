@@ -20,6 +20,120 @@ export {
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_PAGES = 100;
+const MANUS_V2_RATE_LIMIT_WINDOW_MS = 60_000;
+
+export const MANUS_V2_DEFAULT_RATE_LIMIT_SCOPE = "manus-account:unknown-global";
+
+export const MANUS_V2_RATE_LIMITS = Object.freeze({
+  /** Manus documents 10 create/send requests per minute. Keep 10% headroom. */
+  taskWrite: 9,
+  /** Manus documents 100 task/file reads per minute. Keep 10% headroom. */
+  read: 90,
+  /** Manus documents 40 file writes per minute. Keep 10% headroom. */
+  fileWrite: 36,
+});
+
+export type ManusV2RateLimitLane = keyof typeof MANUS_V2_RATE_LIMITS;
+
+export type ManusV2RateLimiter = {
+  acquire(input: { scope: string; lane: ManusV2RateLimitLane }): Promise<void>;
+};
+
+type ManusV2RateLimitState = {
+  acceptedAt: number[];
+  tail: Promise<void>;
+};
+
+/**
+ * Process-wide, account-scoped sliding-window limiter. A scope is deliberately
+ * independent of API-key identity: rotating or adding a key must not create a
+ * fresh provider allowance. The default scope therefore puts every caller
+ * that has not yet resolved its Manus account into one conservative bucket.
+ */
+export function createManusV2AccountRateLimiter(
+  input: {
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+    windowMs?: number;
+  } = {},
+): ManusV2RateLimiter {
+  const now = input.now ?? Date.now;
+  const sleep =
+    input.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const windowMs = input.windowMs ?? MANUS_V2_RATE_LIMIT_WINDOW_MS;
+  if (!Number.isSafeInteger(windowMs) || windowMs < 1) {
+    throw new Error("Invalid Manus v2 rate-limit window");
+  }
+  const states = new Map<string, ManusV2RateLimitState>();
+
+  return {
+    async acquire({ scope, lane }) {
+      const key = `${scope}\0${lane}`;
+      let state = states.get(key);
+      if (!state) {
+        state = { acceptedAt: [], tail: Promise.resolve() };
+        states.set(key, state);
+      }
+
+      // Serialize admission for one account/lane. This makes concurrent
+      // callers deterministic and prevents a burst from all observing the
+      // same last free slot.
+      const previous = state.tail.catch(() => undefined);
+      let release!: () => void;
+      state.tail = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        for (;;) {
+          const observedNow = now();
+          if (!Number.isSafeInteger(observedNow) || observedNow < 0) {
+            throw new Error("Invalid Manus v2 rate-limit clock");
+          }
+          const cutoff = observedNow - windowMs;
+          while (
+            state.acceptedAt.length > 0 &&
+            state.acceptedAt[0]! <= cutoff
+          ) {
+            state.acceptedAt.shift();
+          }
+          const limit = MANUS_V2_RATE_LIMITS[lane];
+          if (state.acceptedAt.length < limit) {
+            state.acceptedAt.push(observedNow);
+            return;
+          }
+          const retryAt = state.acceptedAt[0]! + windowMs;
+          await sleep(Math.max(1, retryAt - observedNow));
+        }
+      } finally {
+        release();
+      }
+    },
+  };
+}
+
+const sharedManusV2AccountRateLimiter = createManusV2AccountRateLimiter();
+const noopManusV2RateLimiter: ManusV2RateLimiter = {
+  async acquire() {},
+};
+
+function normalizeManusV2RateLimitScope(value: string | undefined) {
+  if (value === undefined) return MANUS_V2_DEFAULT_RATE_LIMIT_SCOPE;
+  const scope = requiredString(value, "rateLimitScope", 255);
+  if (!/^[A-Za-z0-9][A-Za-z0-9:._/-]*$/u.test(scope)) {
+    throw new Error("Invalid Manus v2 rate-limit scope");
+  }
+  return scope;
+}
+
+function manusV2RateLimitLane(
+  operation: string,
+  sideEffect: boolean,
+): ManusV2RateLimitLane {
+  if (operation.startsWith("file.") && sideEffect) return "fileWrite";
+  return sideEffect ? "taskWrite" : "read";
+}
 
 export type ManusV2Attachment =
   | {
@@ -120,7 +234,27 @@ export type ManusV2TaskSummary = {
   title: string;
   taskUrl: string | null;
   createdAt: number | null;
+  updatedAt: number | null;
+  creditUsage: number | null;
   status: string | null;
+};
+
+export type ManusV2TaskListPage = {
+  data: Array<{
+    id: string;
+    task_id: string;
+    title: string;
+    instructions: string;
+    task_url: string | null;
+    created_at: number | null;
+    updated_at: number | null;
+    credit_usage: number | null;
+    status: string | null;
+    metadata: { task_title: string; credit_usage: number | null };
+  }>;
+  has_more: boolean;
+  next_cursor: string | null;
+  request_id: string | null;
 };
 
 export type ManusV2WaitingDetail = {
@@ -343,6 +477,12 @@ function normalizeBaseUrl(baseUrl: string) {
   ) {
     throw new Error("Unsafe Manus v2 base URL");
   }
+  if (
+    process.env.NODE_ENV === "production" &&
+    (parsed.origin !== "https://api.manus.ai" || parsed.pathname !== "/")
+  ) {
+    throw new Error("Unsafe Manus v2 production base URL");
+  }
   return parsed.toString().replace(/\/+$/u, "");
 }
 
@@ -416,6 +556,8 @@ export type ManusV2CreateTaskInput = {
   attachments?: ReadonlyArray<ManusV2Attachment>;
   title?: string;
   agentProfile?: string;
+  locale?: string;
+  interactiveMode?: boolean;
   structuredOutputSchema?: ManusV2StructuredOutputSchema;
   taskReferences?: string[];
   hideInTaskList?: boolean;
@@ -435,16 +577,15 @@ export function buildManusV2CreateTaskBody(input: ManusV2CreateTaskInput) {
     ...(input.title
       ? { title: requiredString(input.title, "title", 255) }
       : {}),
-    interactive_mode: false,
+    interactive_mode: input.interactiveMode ?? false,
+    ...(input.locale
+      ? { locale: requiredString(input.locale, "locale", 32) }
+      : {}),
     hide_in_task_list: input.hideInTaskList ?? true,
     share_visibility: "private",
     ...(input.agentProfile
       ? {
-          agent_profile: requiredString(
-            input.agentProfile,
-            "agentProfile",
-            64,
-          ),
+          agent_profile: requiredString(input.agentProfile, "agentProfile", 64),
         }
       : {}),
     ...(input.structuredOutputSchema
@@ -460,9 +601,7 @@ export type ManusV2SendMessageInput = {
   structuredOutputSchema?: ManusV2StructuredOutputSchema;
 };
 
-export function buildManusV2SendMessageBody(
-  input: ManusV2SendMessageInput,
-) {
+export function buildManusV2SendMessageBody(input: ManusV2SendMessageInput) {
   return {
     task_id: requiredString(input.taskId, "taskId", 255),
     message: {
@@ -876,15 +1015,26 @@ export function normalizeManusV2Output(
   events: ReadonlyArray<ManusV2MessageEvent>,
   expected?: ManusV2KnowledgeBaseOperationContract,
 ) {
-  type NormalizedOutput = {
-    id: string;
-    role: "assistant";
-    text: string;
-    content: string;
-    timestamp: number;
-    files?: unknown[];
-    structuredOutput?: true;
-  };
+  type NormalizedOutput =
+    | {
+        id: string;
+        role: "assistant";
+        text: string;
+        content: string;
+        timestamp: number;
+        files?: unknown[];
+        structuredOutput?: true;
+      }
+    | {
+        id: string;
+        role: "assistant";
+        type: "file";
+        filename: unknown;
+        content_type: unknown;
+        url: unknown;
+        file_id?: unknown;
+        timestamp: number;
+      };
   if (expected) {
     const exact = manusV2KnowledgeBaseStructuredResultForOperation(
       events,
@@ -939,10 +1089,40 @@ export function normalizeManusV2Output(
       if (event.type !== "assistant_message") return [];
       const message = upstreamTaskRecord(event.assistant_message);
       const text = typeof message?.content === "string" ? message.content : "";
-      if (!text) return [];
       const attachments = Array.isArray(message?.attachments)
         ? message.attachments
         : [];
+      // Materialized knowledge-base tasks intentionally return one ZIP and no
+      // prose. Preserve that assistant event so the archive validator can see
+      // the attachment; only a truly empty event is noise.
+      if (!text && attachments.length === 0) return [];
+      const typedAttachments = attachments.flatMap((attachment, index) => {
+        const record = upstreamTaskRecord(attachment);
+        if (!record) return [];
+        // task.listMessages identifies an output attachment by the immutable
+        // Provider event and its array position. Project each attachment once
+        // into the typed-file shape already consumed by the archive boundary;
+        // keep the ordinary assistant message separately for visible text.
+        const id = `v2-attachment-${createHash("sha256")
+          .update(`${event.id}\0${index}`, "utf8")
+          .digest("hex")}`;
+        return [
+          {
+            id,
+            role: "assistant" as const,
+            type: "file" as const,
+            filename:
+              record.filename ?? record.file_name ?? record.fileName ?? "",
+            content_type:
+              record.content_type ?? record.mime_type ?? record.mimeType ?? "",
+            url: record.url ?? record.file_url ?? record.fileUrl ?? "",
+            ...(record.file_id !== undefined || record.fileId !== undefined
+              ? { file_id: record.file_id ?? record.fileId }
+              : {}),
+            timestamp: event.timestamp,
+          },
+        ];
+      });
       return [
         {
           id: event.id,
@@ -952,6 +1132,7 @@ export function normalizeManusV2Output(
           files: attachments,
           timestamp: event.timestamp,
         },
+        ...typedAttachments,
       ];
     });
 }
@@ -959,19 +1140,39 @@ export function normalizeManusV2Output(
 export class ManusV2Client {
   private readonly baseUrl: string;
   private readonly api: AxiosInstance;
+  private readonly rateLimitScope: string;
+  private readonly rateLimiter: ManusV2RateLimiter;
 
   constructor(input: {
     baseUrl: string;
     apiKey: string;
     axiosInstance?: AxiosInstance;
+    timeoutMs?: number;
+    /** Stable Manus-account identity, never an API-key fingerprint. */
+    rateLimitScope?: string;
+    /** Deterministic injection used by Gateway tests with an explicit mock URL. */
+    rateLimiter?: ManusV2RateLimiter;
   }) {
     this.baseUrl = normalizeBaseUrl(input.baseUrl);
+    this.rateLimitScope = normalizeManusV2RateLimitScope(input.rateLimitScope);
+    // Production egress is pinned to api.manus.ai. Explicit mock origins do
+    // not consume the process-global production allowance unless a test
+    // injects a limiter intentionally.
+    this.rateLimiter =
+      input.rateLimiter ??
+      (new URL(this.baseUrl).hostname === "api.manus.ai"
+        ? sharedManusV2AccountRateLimiter
+        : noopManusV2RateLimiter);
     const apiKey = requiredString(input.apiKey, "apiKey", 8_192);
+    const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new Error("Invalid Manus v2 timeout");
+    }
     this.api =
       input.axiosInstance ??
       axios.create({
         headers: { "x-manus-api-key": apiKey },
-        timeout: DEFAULT_TIMEOUT_MS,
+        timeout: timeoutMs,
         maxRedirects: 0,
         maxContentLength: MAX_RESPONSE_BYTES,
         validateStatus: () => true,
@@ -983,6 +1184,13 @@ export class ManusV2Client {
     request: () => Promise<AxiosResponse>,
     sideEffect: boolean,
   ) {
+    // Admission happens before the transport boundary. Waiting locally can
+    // never make a side-effect outcome unknown; only an attempted network
+    // request may carry that classification.
+    await this.rateLimiter.acquire({
+      scope: this.rateLimitScope,
+      lane: manusV2RateLimitLane(operation, sideEffect),
+    });
     try {
       const response = await request();
       return assertOk(operation, response, sideEffect);
@@ -1044,6 +1252,126 @@ export class ManusV2Client {
       );
     }
     return { taskId, requestId: providerRequestId(result), raw: result };
+  }
+
+  async taskDetail(taskId: string) {
+    const expectedTaskId = requiredString(taskId, "taskId", 255);
+    const result = await this.request(
+      "task.detail",
+      () =>
+        this.api.get(`${this.baseUrl}/v2/task.detail`, {
+          params: { task_id: expectedTaskId },
+        }),
+      false,
+    );
+    const task = upstreamTaskRecord(result.task ?? result.data ?? result);
+    if (!task) {
+      throw new ManusV2ApiError(
+        "task.detail",
+        502,
+        "INVALID_RESPONSE",
+        false,
+        false,
+        providerRequestId(result),
+      );
+    }
+    const actualTaskId = upstreamAliasedIdentity({
+      record: task,
+      aliases: ["task_id", "id"],
+      label: "Manus v2 task id",
+      maxLength: 255,
+      required: true,
+    });
+    if (actualTaskId !== expectedTaskId) {
+      throw new ManusV2ApiError(
+        "task.detail",
+        502,
+        "TASK_ID_CONFLICT",
+        false,
+        false,
+        providerRequestId(result),
+      );
+    }
+    return {
+      taskId: expectedTaskId,
+      status: optionalString(task.status, 64),
+      title: optionalString(task.title, 255),
+      taskUrl: optionalString(task.task_url, 2_048),
+      createdAt: Number.isSafeInteger(Number(task.created_at))
+        ? Number(task.created_at)
+        : null,
+      updatedAt: Number.isSafeInteger(Number(task.updated_at))
+        ? Number(task.updated_at)
+        : null,
+      requestId: providerRequestId(result),
+      raw: task,
+    };
+  }
+
+  async stopTask(taskId: string) {
+    const expectedTaskId = requiredString(taskId, "taskId", 255);
+    const result = await this.request(
+      "task.stop",
+      () =>
+        this.api.post(
+          `${this.baseUrl}/v2/task.stop`,
+          { task_id: expectedTaskId },
+          { headers: { "Content-Type": "application/json" } },
+        ),
+      true,
+    );
+    // The official v2 task.stop success envelope contains only ok/request_id.
+    // The request body already freezes the target; requiring a response task
+    // identity would reject every valid stop acknowledgement.
+    return { taskId: expectedTaskId, requestId: providerRequestId(result) };
+  }
+
+  async deleteTask(taskId: string) {
+    const expectedTaskId = requiredString(taskId, "taskId", 255);
+    const result = await this.request(
+      "task.delete",
+      () =>
+        this.api.post(
+          `${this.baseUrl}/v2/task.delete`,
+          { task_id: expectedTaskId },
+          { headers: { "Content-Type": "application/json" } },
+        ),
+      true,
+    );
+    let actualTaskId: string;
+    try {
+      actualTaskId = requiredString(result.id, "task.delete.id", 255);
+    } catch {
+      throw new ManusV2ApiError(
+        "task.delete",
+        200,
+        "INVALID_RESPONSE",
+        false,
+        true,
+        providerRequestId(result),
+      );
+    }
+    if (actualTaskId !== expectedTaskId) {
+      throw new ManusV2ApiError(
+        "task.delete",
+        502,
+        "TASK_ID_CONFLICT",
+        false,
+        true,
+        providerRequestId(result),
+      );
+    }
+    if (result.deleted !== true) {
+      throw new ManusV2ApiError(
+        "task.delete",
+        200,
+        "INVALID_RESPONSE",
+        false,
+        true,
+        providerRequestId(result),
+      );
+    }
+    return { taskId: expectedTaskId, requestId: providerRequestId(result) };
   }
 
   async confirmAction(input: {
@@ -1151,16 +1479,24 @@ export class ManusV2Client {
     order?: "asc" | "desc";
     stopAfterOperationToken?: string;
   }) {
+    const order = input.order ?? "desc";
     const events = new Map<string, ManusV2MessageEvent>();
     const seenCursors = new Set<string>();
     let cursor: string | null = null;
     for (let page = 0; page < MAX_PAGES; page += 1) {
       const result = await this.listMessagesPage({
         taskId: input.taskId,
-        order: input.order ?? "asc",
+        order,
         cursor,
       });
-      for (const event of result.messages) events.set(event.id, event);
+      for (const event of result.messages) {
+        // Desc pagination observes the newest representation first. If the
+        // Provider repeats an updated event on a later/older page, never let
+        // that stale copy overwrite the authoritative first observation. Asc
+        // pagination has the inverse page order, so the later copy wins.
+        if (order === "desc" && events.has(event.id)) continue;
+        events.set(event.id, event);
+      }
       if (
         input.stopAfterOperationToken &&
         manusV2EventsContainOperationToken(
@@ -1199,40 +1535,24 @@ export class ManusV2Client {
     const seenCursors = new Set<string>();
     let cursor: string | null = null;
     for (let page = 0; page < MAX_PAGES; page += 1) {
-      const result = await this.request(
-        "task.list",
-        () =>
-          this.api.get(`${this.baseUrl}/v2/task.list`, {
-            params: {
-              limit: 100,
-              order: input.order ?? "desc",
-              scope: "standard",
-              ...(input.apiKeyId ? { api_key_id: input.apiKeyId } : {}),
-              ...(cursor ? { cursor } : {}),
-            },
-          }),
-        false,
-      );
-      for (const value of Array.isArray(result.data) ? result.data : []) {
-        const record = upstreamTaskRecord(value);
-        if (!record) continue;
-        try {
-          const id = requiredString(record.id, "task.id", 255);
-          tasks.set(id, {
-            id,
-            title: requiredString(record.title, "task.title", 255),
-            taskUrl: optionalString(record.task_url, 2_048),
-            createdAt: Number.isSafeInteger(Number(record.created_at))
-              ? Number(record.created_at)
-              : null,
-            status: optionalString(record.status, 64),
-          });
-        } catch {
-          continue;
-        }
+      const result = await this.listTasksPage({
+        apiKeyId: input.apiKeyId,
+        order: input.order,
+        cursor,
+      });
+      for (const task of result.data) {
+        tasks.set(task.id, {
+          id: task.id,
+          title: task.title,
+          taskUrl: task.task_url,
+          createdAt: task.created_at,
+          updatedAt: task.updated_at,
+          creditUsage: task.credit_usage,
+          status: task.status,
+        });
       }
-      if (result.has_more !== true) break;
-      const nextCursor = optionalString(result.next_cursor, 2_048);
+      if (!result.has_more) break;
+      const nextCursor = result.next_cursor;
       if (!nextCursor || seenCursors.has(nextCursor)) {
         throw new ManusV2ApiError(
           "task.list",
@@ -1246,6 +1566,93 @@ export class ManusV2Client {
       cursor = nextCursor;
     }
     return [...tasks.values()];
+  }
+
+  /**
+   * One exact Manus v2 task.list page in the legacy-neutral shape consumed by
+   * the rolling task-fact ledger. Cursor semantics are kept intact so callers
+   * can persist coverage checkpoints without ever touching a v1 endpoint.
+   */
+  async listTasksPage(
+    input: {
+      apiKeyId?: string;
+      order?: "asc" | "desc";
+      cursor?: string | null;
+      limit?: number;
+    } = {},
+  ): Promise<ManusV2TaskListPage> {
+    const result = await this.request(
+      "task.list",
+      () =>
+        this.api.get(`${this.baseUrl}/v2/task.list`, {
+          params: {
+            limit: Math.min(100, Math.max(1, input.limit ?? 100)),
+            order: input.order ?? "desc",
+            scope: "standard",
+            ...(input.apiKeyId ? { api_key_id: input.apiKeyId } : {}),
+            ...(input.cursor ? { cursor: input.cursor } : {}),
+          },
+        }),
+      false,
+    );
+    const data = (Array.isArray(result.data) ? result.data : []).flatMap(
+      (value) => {
+        const record = upstreamTaskRecord(value);
+        if (!record) return [];
+        try {
+          const id = requiredString(record.id, "task.id", 255);
+          const title = requiredString(record.title, "task.title", 255);
+          const numericCredit =
+            record.credit_usage === undefined || record.credit_usage === null
+              ? null
+              : Number(record.credit_usage);
+          if (
+            numericCredit !== null &&
+            (!Number.isSafeInteger(numericCredit) || numericCredit < 0)
+          ) {
+            return [];
+          }
+          return [
+            {
+              id,
+              task_id: id,
+              title,
+              instructions: title,
+              task_url: optionalString(record.task_url, 2_048),
+              created_at: Number.isSafeInteger(Number(record.created_at))
+                ? Number(record.created_at)
+                : null,
+              updated_at: Number.isSafeInteger(Number(record.updated_at))
+                ? Number(record.updated_at)
+                : null,
+              credit_usage: numericCredit,
+              status: optionalString(record.status, 64),
+              metadata: { task_title: title, credit_usage: numericCredit },
+            },
+          ];
+        } catch {
+          return [];
+        }
+      },
+    );
+    return {
+      data,
+      has_more: result.has_more === true,
+      next_cursor: optionalString(result.next_cursor, 2_048),
+      request_id: providerRequestId(result),
+    };
+  }
+
+  async probeCredential() {
+    const result = await this.request(
+      "task.list",
+      () =>
+        this.api.get(`${this.baseUrl}/v2/task.list`, {
+          params: { limit: 1, order: "desc", scope: "standard" },
+        }),
+      false,
+    );
+    return { ok: true as const, requestId: providerRequestId(result) };
   }
 
   async findCreatedTask(input: {
@@ -1669,13 +2076,14 @@ export class ManusV2Client {
     }
   }
 
-  async fileDetail(fileId: string) {
+  async fileDetail(fileId: string, options?: { signal?: AbortSignal }) {
     const expectedFileId = requiredString(fileId, "fileId", 512);
     const result = await this.request(
       "file.detail",
       () =>
         this.api.get(`${this.baseUrl}/v2/file.detail`, {
           params: { file_id: expectedFileId },
+          signal: options?.signal,
         }),
       false,
     );
@@ -1759,5 +2167,40 @@ export class ManusV2Client {
       contentType,
       requestId: providerRequestId(result),
     };
+  }
+
+  async deleteFile(fileId: string) {
+    const expectedFileId = requiredString(fileId, "fileId", 512);
+    const result = await this.request(
+      "file.delete",
+      () =>
+        this.api.post(
+          `${this.baseUrl}/v2/file.delete`,
+          { file_id: expectedFileId },
+          { headers: { "Content-Type": "application/json" } },
+        ),
+      true,
+    );
+    const file = upstreamTaskRecord(result.file ?? result.data ?? result);
+    const actualFileId = file
+      ? upstreamAliasedIdentity({
+          record: file,
+          aliases: ["file_id", "id"],
+          label: "Manus v2 file id",
+          maxLength: 512,
+          required: false,
+        })
+      : optionalString(result.file_id, 512);
+    if (actualFileId && actualFileId !== expectedFileId) {
+      throw new ManusV2ApiError(
+        "file.delete",
+        502,
+        "FILE_ID_CONFLICT",
+        false,
+        true,
+        providerRequestId(result),
+      );
+    }
+    return { fileId: expectedFileId, requestId: providerRequestId(result) };
   }
 }

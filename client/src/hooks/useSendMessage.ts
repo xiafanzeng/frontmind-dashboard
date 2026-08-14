@@ -14,7 +14,8 @@ import {
   reserveKnowledgeBaseTurnWithAttachments,
   retrieveTask,
   stageKnowledgeBaseTurnAttachment,
-  uploadFile,
+  uploadChatLocalAsset,
+  uploadKnowledgeBaseLocalAsset,
   fileToBase64,
   creditEventBus,
   sanitizeBrandText,
@@ -459,6 +460,8 @@ export function useSendMessage() {
         agentProfile?: string;
         syncKnowledgeBaseSnapshot?: boolean;
         knowledgeBaseExpectedGeneration?: number;
+        knowledgeBaseExpectedStateEpoch?: number;
+        knowledgeBaseExpectedContentVersion?: number;
         knowledgeBaseExpectedRevision?: number;
         knowledgeBaseExpectedLeafId?: string;
         knowledgeBaseExpectedPresentationKey?: string;
@@ -764,49 +767,45 @@ export function useSendMessage() {
               ),
             });
 
-            const result = await uploadFile(
-              file,
-              (percent) => {
-                setUploadProgress({
-                  currentFileIndex: i,
-                  totalFiles,
-                  currentFileName: file.name,
-                  currentFilePercent: percent,
-                  overallPercent: Math.round(
-                    ((i + percent / 100) / totalFiles) * 100,
-                  ),
-                  conversationId: convId,
-                });
-              },
-              retryConfig,
-              {
-                // Every chat upload is retained through the authenticated
-                // Dashboard proxy so it remains reopenable for its retention
-                // window, regardless of which agent entry created it.
-                captureLocalCopy: true,
-                ...(options?.syncKnowledgeBaseSnapshot
-                  ? {
-                      captureFilename: knowledgeBaseFilename!,
-                      ...(knowledgeBaseAttachmentReservation &&
-                      knowledgeBaseUploadBatchId
-                        ? {
-                            batchId: knowledgeBaseUploadBatchId,
-                            batchOrdinal: i + 1,
-                            batchTotal: totalFiles,
-                            itemId:
-                              knowledgeBaseAttachmentManifest?.[i]?.itemId,
-                            resumeScope: {
-                              kind: "knowledge_base" as const,
-                              conversationId: convId,
-                              turnId: knowledgeBaseAttachmentReservation.turnId,
-                              clientRequestId: knowledgeBaseClientRequestId!,
-                            },
-                          }
-                        : {}),
-                    }
-                  : {}),
-              },
-            );
+            const uploadProgressHandler = (percent: number) => {
+              setUploadProgress({
+                currentFileIndex: i,
+                totalFiles,
+                currentFileName: file.name,
+                currentFilePercent: percent,
+                overallPercent: Math.round(
+                  ((i + percent / 100) / totalFiles) * 100,
+                ),
+                conversationId: convId,
+              });
+            };
+            const result = options?.syncKnowledgeBaseSnapshot
+              ? await uploadKnowledgeBaseLocalAsset(
+                  file,
+                  uploadProgressHandler,
+                  retryConfig,
+                  {
+                    captureLocalCopy: true,
+                    captureFilename: knowledgeBaseFilename!,
+                    ...(knowledgeBaseAttachmentReservation &&
+                    knowledgeBaseUploadBatchId
+                      ? {
+                          batchId: knowledgeBaseUploadBatchId,
+                          batchOrdinal: i + 1,
+                          batchTotal: totalFiles,
+                          itemId:
+                            knowledgeBaseAttachmentManifest?.[i]?.itemId,
+                          resumeScope: {
+                            kind: "knowledge_base" as const,
+                            conversationId: convId,
+                            turnId: knowledgeBaseAttachmentReservation.turnId,
+                            clientRequestId: knowledgeBaseClientRequestId!,
+                          },
+                        }
+                      : {}),
+                  },
+                )
+              : await uploadChatLocalAsset(file, uploadProgressHandler);
 
             console.log("[SendMessage] Uploaded file attachment", {
               filename: result.filename,
@@ -861,8 +860,8 @@ export function useSendMessage() {
               sanitizeBrandText(uploadErr?.message || "上传失败"),
             );
             // A terminal upload failure must release the composer immediately.
-            // uploadFile already performs its bounded retries; keeping progress
-            // here would leave the UI permanently disabled after those retries.
+            // The local ingress already applies its bounded request contract;
+            // keeping progress here would leave the UI permanently disabled.
             setUploadProgress(null);
             if (uploadErr?.knowledgeObservation) {
               commitKnowledgeBaseObservation(
@@ -945,8 +944,13 @@ export function useSendMessage() {
           const taskOptions: {
             previousResponseId?: string;
             taskId?: string;
+            conversationId: string;
+            clientRequestId: string;
             agentProfile?: string;
-          } = {};
+          } = {
+            conversationId: convId,
+            clientRequestId: userMessage.id,
+          };
 
           if (conv?.previousResponseId) {
             taskOptions.previousResponseId = conv.previousResponseId;
@@ -986,6 +990,9 @@ export function useSendMessage() {
               conversationId: convId,
               clientRequestId: knowledgeBaseClientRequestId!,
               expectedGeneration: options?.knowledgeBaseExpectedGeneration,
+              expectedStateEpoch: options?.knowledgeBaseExpectedStateEpoch,
+              expectedContentVersion:
+                options?.knowledgeBaseExpectedContentVersion,
               expectedRevision: options?.knowledgeBaseExpectedRevision,
               expectedLeafId: options?.knowledgeBaseExpectedLeafId,
               expectedPresentationKey:

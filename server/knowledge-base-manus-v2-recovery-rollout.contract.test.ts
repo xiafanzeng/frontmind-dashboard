@@ -230,9 +230,12 @@ describe("knowledge-base Manus v2 recovery rollout wiring", () => {
     const route = source.slice(start, end);
 
     expect(start).toBeGreaterThan(-1);
-    expect(route).toContain("normalizeKnowledgeBaseTerminalRejection({");
+    expect(route).toContain("requireMaterializedKnowledgeBaseBuild({");
+    expect(route).toContain("Browser polling is projection-only");
+    expect(route).not.toContain("normalizeKnowledgeBaseTerminalRejection({");
     expect(route).not.toContain("resumeKnowledgeBaseTurnAfterUserFix({");
     expect(route).not.toContain("launchAcceptedKnowledgeBaseClaim({");
+    expect(route).not.toContain("dispatchAcceptedKnowledgeBaseClaim({");
     expect(route).not.toContain("createTask({");
     expect(route).not.toContain("sendMessage({");
   });

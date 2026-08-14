@@ -10,7 +10,10 @@ import {
   knowledgeBaseTreePolicy,
   validateStoredKnowledgeBaseResearchCoverage,
 } from "./knowledge-base-progress";
-import { knowledgeBasePublicationBindingHash } from "./knowledge-base-publication-binding";
+import {
+  knowledgeBasePackageWriterTaskId,
+  knowledgeBasePublicationBindingHash,
+} from "./knowledge-base-publication-binding";
 import { getDb } from "./db";
 
 export function isAuthenticatedAdvancedKnowledgePublication(input: {
@@ -30,6 +33,8 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     KnowledgeBaseBuild,
     | "id"
     | "userId"
+    | "generation"
+    | "executionMode"
     | "status"
     | "revision"
     | "currentLeafId"
@@ -38,6 +43,7 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     | "directPrefilledCount"
     | "needsVerificationCount"
     | "upstreamTaskId"
+    | "canonicalTaskId"
     | "packageRevision"
     | "packageTaskId"
     | "packageDescriptorHash"
@@ -74,7 +80,7 @@ export function isAuthenticatedAdvancedKnowledgePublication(input: {
     snapshot.sourceBuildId === build.id &&
     snapshot.sourceBuildRevision === build.revision &&
     snapshot.sourceBuildRevision === build.packageRevision &&
-    snapshot.sourceTaskId === build.upstreamTaskId &&
+    snapshot.sourceTaskId === knowledgeBasePackageWriterTaskId(build) &&
     snapshot.sourceTaskId === build.packageTaskId &&
     Boolean(snapshot.sourceArtifactHash) &&
     snapshot.sourceArtifactHash === publicationBindingHash &&

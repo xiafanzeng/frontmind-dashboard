@@ -326,7 +326,9 @@ async function fetchFileAsBlob(
 ): Promise<string> {
   const url =
     source.kind === "owned_file"
-      ? `/api/frontmind/v1/files/${encodeURIComponent(source.fileId)}`
+      ? source.fileId.startsWith("asset_")
+        ? `/api/frontmind/v2/assets/${encodeURIComponent(source.fileId)}/content`
+        : `/api/frontmind/v1/files/${encodeURIComponent(source.fileId)}`
       : buildProxyDownloadUrl(source.url, fileName, false) || source.url;
 
   const response = await fetch(url, {

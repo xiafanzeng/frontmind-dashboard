@@ -5,6 +5,7 @@ export type KnowledgeBaseOperationTelemetryEvent =
   | "turn_replay_hit"
   | "turn_replay_mismatch"
   | "stale_presentation_submission"
+  | "logo_upload_candidate_staged"
   | "logo_upload_candidate_promoted"
   | "logo_upload_candidate_recovered"
   | "logo_upload_candidate_rejected"

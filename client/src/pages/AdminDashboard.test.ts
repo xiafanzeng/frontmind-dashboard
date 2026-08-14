@@ -21,6 +21,7 @@ import {
   normalizeBrandTrackingCredentialRows,
   normalizeUsageHierarchy,
   parseCredentialManagementDeepLink,
+  resolveKeyPoolStale,
   usageHierarchyNeedsPolling,
   type KeyManagementRow,
 } from "./AdminDashboard";
@@ -271,7 +272,7 @@ describe("administrator channel navigation", () => {
     expect(source).toContain('confirmation: "BULK_REPLACE_API_KEYS"');
     expect(source).toContain("任一账号发生版本冲突都会全部回滚");
     expect(source).toContain("即使已失效也不会阻断轮换");
-    expect(source).toContain("最后已知用量会保留并标记为扫描不完整");
+    expect(source).toContain("任务账本滚动累计");
     expect(source).not.toContain(
       "无法完整扫描时，整批会停止，需改用单账号应急替换",
     );
@@ -281,10 +282,12 @@ describe("administrator channel navigation", () => {
     expect(source).toContain("近 30 天自用");
     expect(source).toContain("积分池总额");
     expect(source).not.toContain("Key 总额");
-    expect(source).toContain("row.accountUsageComplete");
-    expect(source).toContain("同步不完整");
-    expect(source).toContain('row.syncStatus === "ok"');
-    expect(source).toContain('engineer.usageSyncStatus === "ok"');
+    expect(source).not.toContain("accountUsageComplete");
+    expect(source).not.toContain("账号归因不完整");
+    expect(source).toContain("row.rolling30DayUsed");
+    expect(source).toContain("row.keyHealth");
+    expect(source).toContain('value="frontmind-pro"');
+    expect(source).toContain('value="frontmind-base"');
     expect(source).toContain("只读验收预览 · 近 30 天");
     expect(source).not.toContain("管理员通用 Agent");
     expect(source).not.toContain("从客户签约到交付验收的统一工作台");
@@ -345,10 +348,9 @@ describe("administrator channel navigation", () => {
           username: "system.admin",
           apiKeyConfigured: true,
           apiKeyVersion: 3,
-          keyTotalUsed: 20,
-          ownAgentMonthUsed: 10,
-          accountUsageComplete: false,
-          syncStatus: "error",
+          keyPoolTotalUsed: 20,
+          rolling30DayUsed: 10,
+          keyHealth: "sync_error",
           fetchedAt: null,
         },
       ],
@@ -357,50 +359,59 @@ describe("administrator channel navigation", () => {
       expect.objectContaining({
         adminId: 1,
         apiKeyVersion: 3,
-        syncStatus: "error",
-        accountUsageComplete: false,
+        keyHealth: "sync_error",
+        rolling30DayUsed: 10,
       }),
     ]);
   });
 
-  it("treats a missing account-attribution proof as incomplete", () => {
+  it("keeps rolling self-use independent from Key health", () => {
     const normalized = normalizeUsageHierarchy({
       engineers: [
         {
           engineerId: 9,
           displayName: "工程师",
-          syncStatus: "ok",
-          ownAgentMonthUsed: 0,
+          keyHealth: "invalid_or_revoked",
+          rolling30DayUsed: 42,
         },
       ],
     });
 
-    expect(normalized.engineers[0]?.accountUsageComplete).toBe(false);
+    expect(normalized.engineers[0]?.rolling30DayUsed).toBe(42);
+    expect(normalized.engineers[0]?.keyHealth).toBe("invalid_or_revoked");
+  });
+
+  it("preserves a connected engineer's server-side stale signal", () => {
+    expect(
+      resolveKeyPoolStale({ keyHealth: "connected", keyPoolStale: true }),
+    ).toBe(true);
+    expect(resolveKeyPoolStale({ keyHealth: "connected" })).toBe(false);
+    expect(resolveKeyPoolStale({ keyHealth: "sync_error" })).toBe(true);
   });
 
   it("polls only while at least one hierarchy usage snapshot is pending", () => {
     expect(
       usageHierarchyNeedsPolling({
-        systemAdmins: [{ syncStatus: "ok" }],
-        engineers: [{ syncStatus: "pending" }],
+        systemAdmins: [{ keyHealth: "connected" }],
+        engineers: [{ keyHealth: "pending" }],
       }),
     ).toBe(true);
     expect(
       usageHierarchyNeedsPolling({
         managers: [
           {
-            keyPool: { syncStatus: "ok" },
-            users: [{ syncStatus: "pending" }],
+            keyPool: { keyHealth: "connected" },
+            users: [{ keyHealth: "pending" }],
           },
         ],
       }),
     ).toBe(true);
     expect(
       usageHierarchyNeedsPolling({
-        systemAdmins: [{ syncStatus: "ok" }],
-        engineers: [{ syncStatus: "error" }],
-        customers: [{ syncStatus: "unconfigured" }],
-        managers: [{ keyPool: { syncStatus: "ok" }, users: [] }],
+        systemAdmins: [{ keyHealth: "connected" }],
+        engineers: [{ keyHealth: "sync_error" }],
+        customers: [{ keyHealth: "unconfigured" }],
+        managers: [{ keyPool: { keyHealth: "connected" }, users: [] }],
       }),
     ).toBe(false);
   });
@@ -590,10 +601,9 @@ describe("administrator channel navigation", () => {
           displayName: "工程师一组",
           apiKeyConfigured: true,
           apiKeyVersion: 3,
-          keyTotalUsed: 900,
-          ownAgentMonthUsed: 240,
-          otherOrUnattributedUsed: 660,
-          syncStatus: "ok",
+          keyPoolTotalUsed: 900,
+          rolling30DayUsed: 240,
+          keyHealth: "connected",
         },
       ],
       customers: [
@@ -605,10 +615,9 @@ describe("administrator channel navigation", () => {
           apiKeyConfigured: false,
           apiKeyVersion: 2,
           usesInheritedKey: true,
-          keyTotalUsed: 1_000,
-          ownAgentMonthUsed: 300,
-          otherOrUnattributedUsed: 700,
-          syncStatus: "ok",
+          keyPoolTotalUsed: 1_000,
+          rolling30DayUsed: 300,
+          keyHealth: "connected",
         },
       ],
       managers: [
@@ -616,14 +625,12 @@ describe("administrator channel navigation", () => {
           adminId: 11,
           displayName: "交付一组",
           keyPool: { fingerprint: "fp_shared", totalUsed: 1_000 },
-          ownAgentMonthUsed: 120,
-          attributedUsed: 420,
-          otherOrUnattributedUsed: 580,
+          rolling30DayUsed: 120,
           users: [
             {
               userId: 101,
               enterpriseName: "甲公司",
-              monthUsed: 300,
+              rolling30DayUsed: 300,
               fingerprint: "fp_customer",
               credentialSource: "customer",
             },
@@ -633,10 +640,10 @@ describe("administrator channel navigation", () => {
           adminId: 12,
           displayName: "交付二组",
           keyPool: { fingerprint: "fp_shared", totalUsed: 1_000 },
-          ownAgentMonthUsed: 80,
-          attributedUsed: 280,
-          otherOrUnattributedUsed: 720,
-          users: [{ userId: 102, enterpriseName: "乙公司", monthUsed: 200 }],
+          rolling30DayUsed: 80,
+          users: [
+            { userId: 102, enterpriseName: "乙公司", rolling30DayUsed: 200 },
+          ],
         },
       ],
     });
@@ -645,10 +652,10 @@ describe("administrator channel navigation", () => {
     expect(hierarchy.managers.map((manager) => manager.adminId)).toEqual([
       11, 12,
     ]);
-    expect(hierarchy.managers[0]?.users[0]?.monthUsed).toBe(300);
+    expect(hierarchy.managers[0]?.users[0]?.rolling30DayUsed).toBe(300);
     expect(hierarchy.managers[0]?.users[0]?.credentialSource).toBe("customer");
     expect(hierarchy.managers[0]?.users[0]?.usesManagerKey).toBe(false);
-    expect(hierarchy.managers[1]?.users[0]?.monthUsed).toBe(200);
+    expect(hierarchy.managers[1]?.users[0]?.rolling30DayUsed).toBe(200);
     expect(
       hierarchy.managers.map((manager) => manager.keyPool.totalUsed),
     ).toEqual([1_000, 1_000]);
@@ -656,8 +663,8 @@ describe("administrator channel navigation", () => {
       engineerId: 21,
       apiKeyConfigured: true,
       apiKeyVersion: 3,
-      keyTotalUsed: 900,
-      ownAgentMonthUsed: 240,
+      keyPoolTotalUsed: 900,
+      rolling30DayUsed: 240,
     });
     expect(hierarchy.customers[0]).toMatchObject({
       userId: 101,
@@ -665,8 +672,8 @@ describe("administrator channel navigation", () => {
       apiKeyConfigured: false,
       apiKeyVersion: 2,
       usesInheritedKey: true,
-      keyTotalUsed: 1_000,
-      ownAgentMonthUsed: 300,
+      keyPoolTotalUsed: 1_000,
+      rolling30DayUsed: 300,
     });
   });
 

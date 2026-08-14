@@ -1,12 +1,18 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, desc, eq, gte, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lt, ne, sql } from "drizzle-orm";
 
 import {
+  agentOperations,
+  agentTasks,
   presalesApiCredentials,
+  apiUsagePolicies,
+  apiUsageSnapshots,
+  apiUsageTaskLedger,
   presalesOutputUrls,
   presalesMonitorRuns,
   presalesTaskRequests,
   presalesUpstreamResources,
+  providerFileLeases,
   websiteProjectDeletionTombstones,
   type PresalesApiCredential,
   type PresalesTaskRequest,
@@ -32,14 +38,10 @@ import {
   recordUsageLedgerEntries,
   selectPhysicalCredentialRows,
   usageCoverageSupportsRetiredCredential,
-  usageCoverageSupportsReplacement,
 } from "./api-usage-ledger";
-import {
-  buildRollingUsageTaskParams,
-  parseRollingUsageTaskPayload,
-  usagePageReachedCutoff,
-} from "./upstream-task-usage";
+import { usagePageReachedCutoff } from "./upstream-task-usage";
 import { getManusRollingCreditUsage } from "./manus-usage-service";
+import { ManusV2Client } from "./manus-v2-client";
 import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
 import { hasPresalesFileCreateReservationsForCredentials } from "./presales-file-store";
 import {
@@ -153,6 +155,82 @@ export type WebsiteApiKeyUsage = {
   attributionComplete: boolean;
 };
 
+export type WebsiteApiKeyUsageSnapshot = {
+  windowDays: 30;
+  rollingWebsiteUsed: number;
+  usageObservedAt: number | null;
+  keyPoolTotalUsed: number | null;
+  keyLastSuccessfulAt: number | null;
+  keyLastAttemptAt: number | null;
+  keyHealth:
+    | "connected"
+    | "invalid_or_revoked"
+    | "sync_error"
+    | "unconfigured"
+    | "pending";
+  keyPoolStale: boolean;
+  recentWebsiteTasks: PresalesCreditUsageTask[];
+};
+
+type WebsiteUsageOwnershipRow = {
+  upstreamTaskId: string | null;
+  apiCredentialId: string;
+  createdAt: Date;
+  status?: string | null;
+};
+
+/**
+ * Projects every durable Website task authority into the usage scanner. New
+ * Presales v2 operations live in agent_operations/agent_tasks rather than the
+ * retired proxy tables, so omitting that lane would silently classify all new
+ * Website spend as third-party usage.
+ */
+export function projectWebsiteUsageOwnership(input: {
+  resourceRows: readonly WebsiteUsageOwnershipRow[];
+  ownedRows: readonly WebsiteUsageOwnershipRow[];
+  monitorRows: readonly WebsiteUsageOwnershipRow[];
+  agentTaskRows: readonly WebsiteUsageOwnershipRow[];
+}) {
+  const firstPartyRows = [
+    ...input.resourceRows,
+    ...input.ownedRows,
+    ...input.monitorRows,
+    ...input.agentTaskRows,
+  ];
+  const websiteTaskIds = new Set(
+    firstPartyRows
+      .map((row) => row.upstreamTaskId?.trim())
+      .filter((id): id is string => Boolean(id)),
+  );
+  const unsettledCredentialIds = new Set<string>();
+  for (const row of input.ownedRows) {
+    if (row.status === "pending")
+      unsettledCredentialIds.add(row.apiCredentialId);
+  }
+  const terminalMonitorStates = new Set([
+    "completed",
+    "partial_review_required",
+    "remote_failed",
+    "shape_mismatch",
+  ]);
+  for (const row of input.monitorRows) {
+    if (!row.status || !terminalMonitorStates.has(row.status)) {
+      unsettledCredentialIds.add(row.apiCredentialId);
+    }
+  }
+  const terminalAgentStates = new Set([
+    "succeeded",
+    "failed",
+    "cancelled",
+  ]);
+  for (const row of input.agentTaskRows) {
+    if (!row.status || !terminalAgentStates.has(row.status)) {
+      unsettledCredentialIds.add(row.apiCredentialId);
+    }
+  }
+  return { firstPartyRows, websiteTaskIds, unsettledCredentialIds };
+}
+
 export type PresalesTaskReservation =
   | {
       state: "acquired";
@@ -241,7 +319,6 @@ export async function replacePresalesApiCredential(
   actorUserId: number,
   apiKey: string,
   validator: (apiKey: string) => Promise<void> = validateUpstreamApiKey,
-  allowIncompleteHistory = false,
 ) {
   await validator(apiKey);
   const db = await requireDb();
@@ -257,36 +334,6 @@ export async function replacePresalesApiCredential(
     .orderBy(desc(presalesApiCredentials.version))
     .limit(1);
   const existing = existingRows[0];
-  if (existing) {
-    try {
-      await getPresalesCreditUsage(CREDIT_USAGE_LOOKBACK_DAYS);
-    } catch {
-      // Coverage below decides whether normal replacement may proceed.
-    }
-  }
-  const coverageByFingerprint = existing
-    ? await loadUsageCoverage({
-        executor: db,
-        scope: "website_frontend",
-        fingerprints: [existing.fingerprint],
-      })
-    : new Map<string, any>();
-  const coverageNow = Date.now();
-  const historyIncomplete = Boolean(
-    existing &&
-      !usageCoverageSupportsReplacement({
-        coverage: coverageByFingerprint.get(existing.fingerprint),
-        periodStartMs:
-          coverageNow - CREDIT_USAGE_LOOKBACK_DAYS * 24 * 60 * 60 * 1_000,
-        nowMs: coverageNow,
-      }),
-  );
-  if (historyIncomplete && !allowIncompleteHistory) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "旧官网 API Key 无法完成近 30 天扫描或仍有进行中任务。若旧 Key 已失效，可明确允许历史用量暂时不可用后应急替换；系统不会把缺失历史显示为 0。",
-    );
-  }
   const credentialId = randomUUID();
   const encrypted = encryptPresalesApiKey(credentialId, apiKey);
   const fingerprint = getApiKeyFingerprint(apiKey);
@@ -337,12 +384,128 @@ export async function replacePresalesApiCredential(
     return credential;
   });
 
-  try {
-    await getPresalesCreditUsage(CREDIT_USAGE_LOOKBACK_DAYS);
-  } catch {
-    // Keep the prior exact values hidden until a later complete scan.
-  }
   return toCredentialStatus(inserted);
+}
+
+/**
+ * Administrator reads are local-only. The daily/manual synchronizer updates
+ * the task ledger and current-Key pool snapshot; a revoked Key therefore never
+ * hides the rolling Website total already observed locally.
+ */
+export async function getPresalesCreditUsageSnapshot(
+  now = Date.now(),
+): Promise<WebsiteApiKeyUsageSnapshot> {
+  const db = await requireDb();
+  const cutoffMs = now - 30 * 24 * 60 * 60 * 1_000;
+  const [credentialRows, policyRows, ledgerRows, recentRows] =
+    await Promise.all([
+      db
+        .select()
+        .from(presalesApiCredentials)
+        .where(
+          and(
+            eq(presalesApiCredentials.slot, PRESALES_CREDENTIAL_SLOT),
+            eq(presalesApiCredentials.status, "active"),
+          ),
+        )
+        .orderBy(desc(presalesApiCredentials.version))
+        .limit(1),
+      db
+        .select()
+        .from(apiUsagePolicies)
+        .where(eq(apiUsagePolicies.policyKey, "website_frontend"))
+        .limit(1),
+      db
+        .select({
+          used: sql<number>`COALESCE(SUM(CASE WHEN ${apiUsageTaskLedger.isFirstParty} = 1 THEN ${apiUsageTaskLedger.creditUsage} ELSE 0 END), 0)`,
+          observedAt: sql<Date | null>`MAX(${apiUsageTaskLedger.observedAt})`,
+        })
+        .from(apiUsageTaskLedger)
+        .where(
+          and(
+            eq(apiUsageTaskLedger.scope, "website_frontend"),
+            gte(apiUsageTaskLedger.taskCreatedAtMs, cutoffMs),
+            lt(apiUsageTaskLedger.taskCreatedAtMs, now),
+          ),
+        ),
+      db
+        .select({
+          id: apiUsageTaskLedger.upstreamTaskId,
+          creditUsage: apiUsageTaskLedger.creditUsage,
+          createdAt: apiUsageTaskLedger.taskCreatedAtMs,
+        })
+        .from(apiUsageTaskLedger)
+        .where(
+          and(
+            eq(apiUsageTaskLedger.scope, "website_frontend"),
+            eq(apiUsageTaskLedger.isFirstParty, true),
+            gte(apiUsageTaskLedger.taskCreatedAtMs, cutoffMs),
+            lt(apiUsageTaskLedger.taskCreatedAtMs, now),
+          ),
+        )
+        .orderBy(desc(apiUsageTaskLedger.taskCreatedAtMs))
+        .limit(50),
+    ]);
+  const credential = credentialRows[0];
+  const policy = policyRows[0];
+  const snapshots = policy
+    ? await db
+        .select()
+        .from(apiUsageSnapshots)
+        .where(eq(apiUsageSnapshots.policyId, policy.id))
+        .limit(1)
+    : [];
+  const snapshot = snapshots[0];
+  const snapshotMatchesCredential = Boolean(
+    credential &&
+      snapshot &&
+      snapshot.credentialFingerprint === credential.fingerprint,
+  );
+  const keyLastSuccessfulAt = snapshotMatchesCredential
+    ? (snapshot?.fetchedAt?.getTime() ?? null)
+    : null;
+  const keyHealth: WebsiteApiKeyUsageSnapshot["keyHealth"] = !credential
+    ? "unconfigured"
+    : !snapshotMatchesCredential
+      ? "pending"
+      : snapshot!.syncStatus === "ok"
+        ? "connected"
+        : snapshot!.syncStatus === "pending"
+          ? "pending"
+          : snapshot!.syncStatus === "unconfigured"
+            ? "unconfigured"
+            : snapshot!.errorCode === "INVALID_CREDENTIAL" ||
+                snapshot!.errorCode === "invalid_or_revoked"
+              ? "invalid_or_revoked"
+              : "sync_error";
+  const observedAt = ledgerRows[0]?.observedAt;
+  return {
+    windowDays: 30,
+    rollingWebsiteUsed: Math.max(0, Number(ledgerRows[0]?.used) || 0),
+    usageObservedAt:
+      observedAt instanceof Date
+        ? observedAt.getTime()
+        : Number.isFinite(Number(observedAt))
+          ? Number(observedAt)
+          : null,
+    keyPoolTotalUsed: snapshotMatchesCredential && keyLastSuccessfulAt !== null
+      ? Math.max(0, Number(snapshot!.used) || 0)
+      : null,
+    keyLastSuccessfulAt,
+    keyLastAttemptAt: snapshotMatchesCredential
+      ? (snapshot!.updatedAt?.getTime() ?? null)
+      : null,
+    keyHealth,
+    keyPoolStale:
+      keyLastSuccessfulAt === null ||
+      now - keyLastSuccessfulAt > 26 * 60 * 60 * 1_000,
+    recentWebsiteTasks: recentRows.map((row) => ({
+      id: row.id,
+      title: row.id,
+      creditUsage: Math.max(0, Number(row.creditUsage) || 0),
+      createdAt: Number(row.createdAt),
+    })),
+  };
 }
 
 export async function deletePresalesApiCredential(executor?: any) {
@@ -361,7 +524,13 @@ export async function deletePresalesApiCredential(executor?: any) {
       .for("update");
     if (activeRows.length === 0) return;
     const activeIds = activeRows.map((row: any) => row.id);
-    const [resources, taskRequests, monitorRuns] = await Promise.all([
+    const [
+      resources,
+      taskRequests,
+      monitorRuns,
+      activeAgentOperations,
+      activeProviderFileLeases,
+    ] = await Promise.all([
       tx
         .select({ id: presalesUpstreamResources.id })
         .from(presalesUpstreamResources)
@@ -380,6 +549,38 @@ export async function deletePresalesApiCredential(executor?: any) {
         .where(inArray(presalesMonitorRuns.apiCredentialId, activeIds))
         .limit(1)
         .for("update"),
+      tx
+        .select({ id: agentOperations.id })
+        .from(agentOperations)
+        .where(
+          and(
+            eq(agentOperations.scope, "website_frontend"),
+            inArray(agentOperations.apiCredentialId, activeIds),
+            inArray(agentOperations.status, [
+              "queued",
+              "running",
+              "result_pending",
+              "attention_required",
+            ]),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: providerFileLeases.id })
+        .from(providerFileLeases)
+        .where(
+          and(
+            inArray(providerFileLeases.apiCredentialId, activeIds),
+            inArray(providerFileLeases.uploadState, [
+              "reserved",
+              "uploading",
+              "outcome_unknown",
+            ]),
+          ),
+        )
+        .limit(1)
+        .for("update"),
     ]);
     const fileCreateReservations =
       await hasPresalesFileCreateReservationsForCredentials(new Set(activeIds));
@@ -387,6 +588,8 @@ export async function deletePresalesApiCredential(executor?: any) {
       resources[0] ||
       taskRequests[0] ||
       monitorRuns[0] ||
+      activeAgentOperations[0] ||
+      activeProviderFileLeases[0] ||
       fileCreateReservations
     ) {
       throw new AuthServiceError(
@@ -2396,60 +2599,82 @@ export async function getPresalesCreditUsage(
     startAt: cutoffMs,
     endAt: usageNow,
   });
-  const [resourceRows, ownedRows, monitorRows] = await Promise.all([
-    db
-      .select({
-        upstreamTaskId: presalesUpstreamResources.upstreamId,
-        apiCredentialId: presalesUpstreamResources.apiCredentialId,
-        createdAt: presalesUpstreamResources.createdAt,
-      })
-      .from(presalesUpstreamResources)
-      .where(
-        and(
-          inArray(presalesUpstreamResources.apiCredentialId, credentialIds),
-          eq(presalesUpstreamResources.kind, "task"),
-          gte(presalesUpstreamResources.createdAt, new Date(cutoffMs)),
+  const [resourceRows, ownedRows, monitorRows, agentTaskRows] =
+    await Promise.all([
+      db
+        .select({
+          upstreamTaskId: presalesUpstreamResources.upstreamId,
+          apiCredentialId: presalesUpstreamResources.apiCredentialId,
+          createdAt: presalesUpstreamResources.createdAt,
+        })
+        .from(presalesUpstreamResources)
+        .where(
+          and(
+            inArray(presalesUpstreamResources.apiCredentialId, credentialIds),
+            eq(presalesUpstreamResources.kind, "task"),
+            gte(presalesUpstreamResources.createdAt, new Date(cutoffMs)),
+          ),
         ),
-      ),
-    db
-      .select({
-        upstreamTaskId: presalesTaskRequests.upstreamTaskId,
-        apiCredentialId: presalesTaskRequests.apiCredentialId,
-        createdAt: presalesTaskRequests.createdAt,
-        status: presalesTaskRequests.status,
-      })
-      .from(presalesTaskRequests)
-      .where(
-        and(
-          inArray(presalesTaskRequests.apiCredentialId, credentialIds),
-          gte(presalesTaskRequests.createdAt, new Date(cutoffMs)),
+      db
+        .select({
+          upstreamTaskId: presalesTaskRequests.upstreamTaskId,
+          apiCredentialId: presalesTaskRequests.apiCredentialId,
+          createdAt: presalesTaskRequests.createdAt,
+          status: presalesTaskRequests.status,
+        })
+        .from(presalesTaskRequests)
+        .where(
+          and(
+            inArray(presalesTaskRequests.apiCredentialId, credentialIds),
+            gte(presalesTaskRequests.createdAt, new Date(cutoffMs)),
+          ),
         ),
-      ),
-    db
-      .select({
-        upstreamTaskId: presalesMonitorRuns.upstreamTaskId,
-        apiCredentialId: presalesMonitorRuns.apiCredentialId,
-        createdAt: presalesMonitorRuns.createdAt,
-        status: presalesMonitorRuns.status,
-      })
-      .from(presalesMonitorRuns)
-      .where(
-        and(
-          inArray(presalesMonitorRuns.apiCredentialId, credentialIds),
-          gte(presalesMonitorRuns.createdAt, new Date(cutoffMs)),
+      db
+        .select({
+          upstreamTaskId: presalesMonitorRuns.upstreamTaskId,
+          apiCredentialId: presalesMonitorRuns.apiCredentialId,
+          createdAt: presalesMonitorRuns.createdAt,
+          status: presalesMonitorRuns.status,
+        })
+        .from(presalesMonitorRuns)
+        .where(
+          and(
+            inArray(presalesMonitorRuns.apiCredentialId, credentialIds),
+            gte(presalesMonitorRuns.createdAt, new Date(cutoffMs)),
+          ),
         ),
-      ),
-  ]);
-  const websiteTaskIds = new Set(
-    [...resourceRows, ...ownedRows, ...monitorRows]
-      .map((row) => row.upstreamTaskId?.trim())
-      .filter((id): id is string => Boolean(id)),
-  );
+      db
+        .select({
+          upstreamTaskId: agentTasks.providerTaskId,
+          apiCredentialId: agentOperations.apiCredentialId,
+          createdAt: agentOperations.createdAt,
+          status: agentOperations.status,
+        })
+        .from(agentTasks)
+        .innerJoin(
+          agentOperations,
+          eq(agentTasks.operationId, agentOperations.id),
+        )
+        .where(
+          and(
+            eq(agentOperations.scope, "website_frontend"),
+            inArray(agentOperations.apiCredentialId, credentialIds),
+            gte(agentOperations.createdAt, new Date(cutoffMs)),
+          ),
+        ),
+    ]);
+  const { firstPartyRows, websiteTaskIds, unsettledCredentialIds } =
+    projectWebsiteUsageOwnership({
+      resourceRows,
+      ownedRows,
+      monitorRows,
+      agentTaskRows,
+    });
   const fingerprintByCredentialId = new Map(
     credentialRows.map((credential) => [credential.id, credential.fingerprint]),
   );
   const expectedTaskIdsByFingerprint = new Map<string, Set<string>>();
-  for (const row of [...resourceRows, ...ownedRows, ...monitorRows]) {
+  for (const row of firstPartyRows) {
     const taskId = row.upstreamTaskId?.trim();
     if (!taskId || row.createdAt.getTime() < cutoffMs) continue;
     const fingerprint = fingerprintByCredentialId.get(row.apiCredentialId);
@@ -2458,21 +2683,9 @@ export async function getPresalesCreditUsage(
     expected.add(taskId);
     expectedTaskIdsByFingerprint.set(fingerprint, expected);
   }
-  const terminalMonitorStates = new Set([
-    "completed",
-    "partial_review_required",
-    "remote_failed",
-    "shape_mismatch",
-  ]);
   const unsettledFingerprints = new Set<string>();
-  for (const row of ownedRows) {
-    if (row.status !== "pending") continue;
-    const fingerprint = fingerprintByCredentialId.get(row.apiCredentialId);
-    if (fingerprint) unsettledFingerprints.add(fingerprint);
-  }
-  for (const row of monitorRows) {
-    if (terminalMonitorStates.has(row.status)) continue;
-    const fingerprint = fingerprintByCredentialId.get(row.apiCredentialId);
+  for (const credentialId of unsettledCredentialIds) {
+    const fingerprint = fingerprintByCredentialId.get(credentialId);
     if (fingerprint) unsettledFingerprints.add(fingerprint);
   }
   const recentWebsiteTasks: PresalesCreditUsageTask[] = [];
@@ -2516,27 +2729,19 @@ export async function getPresalesCreditUsage(
     );
     const seenForCredential = new Set<string>();
     const seenCursors = new Set<string>();
+    const usageClient = new ManusV2Client({
+      baseUrl: getUpstreamBaseUrl(),
+      apiKey: credential.apiKey,
+      rateLimitScope: "website-managed-provider",
+    });
     for (let page = 0; page < CREDIT_USAGE_MAX_PAGES; page += 1) {
-      const params = buildRollingUsageTaskParams({
-        limit: CREDIT_USAGE_PAGE_LIMIT,
-        startAt: cutoffMs,
-        endAt: usageNow,
-        after,
-      });
-      let response: globalThis.Response;
+      let payload: Awaited<ReturnType<ManusV2Client["listTasksPage"]>>;
       try {
-        response = await fetch(
-          `${getUpstreamBaseUrl()}/v1/tasks?${params.toString()}`,
-          {
-            headers: {
-              API_KEY: credential.apiKey,
-              Authorization: `Bearer ${credential.apiKey}`,
-              Accept: "application/json",
-            },
-            redirect: "error",
-            signal: AbortSignal.timeout(30_000),
-          },
-        );
+        payload = await usageClient.listTasksPage({
+          limit: CREDIT_USAGE_PAGE_LIMIT,
+          order: "desc",
+          cursor: after,
+        });
       } catch {
         if (credential.status === "retired") {
           credentialComplete = usageCoverageSupportsRetiredCredential({
@@ -2549,30 +2754,9 @@ export async function getPresalesCreditUsage(
         credentialComplete = false;
         break;
       }
-      if (!response.ok) {
-        if (
-          credential.status === "retired" &&
-          (response.status === 401 || response.status === 403)
-        ) {
-          credentialComplete = usageCoverageSupportsRetiredCredential({
-            coverage: coverageByFingerprint.get(credential.fingerprint),
-            periodStartMs: cutoffMs,
-            credentialRetiredAtMs: credential.retiredAt?.getTime() ?? null,
-          });
-          break;
-        }
-        credentialComplete = false;
-        break;
-      }
-
-      const payload = await parseRollingUsageTaskPayload(response);
-      if (!payload) {
-        credentialComplete = false;
-        break;
-      }
       const tasks = payload.data;
       if (tasks.length === 0) {
-        if (payload?.has_more) credentialComplete = false;
+        if (payload.has_more) credentialComplete = false;
         break;
       }
       for (const task of tasks) {
@@ -2629,13 +2813,9 @@ export async function getPresalesCreditUsage(
       if (pageUsage.reachedCutoff) break;
 
       after =
-        String(
-          payload?.last_id ??
-            tasks[tasks.length - 1]?.id ??
-            tasks[tasks.length - 1]?.task_id ??
-            "",
-        ) || undefined;
-      if (payload?.has_more && !after) {
+        payload.next_cursor ??
+        (String(tasks[tasks.length - 1]?.id ?? "") || undefined);
+      if (payload.has_more && !after) {
         credentialComplete = false;
         break;
       }
@@ -2644,10 +2824,10 @@ export async function getPresalesCreditUsage(
         break;
       }
       if (after) seenCursors.add(after);
-      if (page === CREDIT_USAGE_MAX_PAGES - 1 && payload?.has_more && after) {
+      if (page === CREDIT_USAGE_MAX_PAGES - 1 && payload.has_more && after) {
         credentialComplete = false;
       }
-      if (!payload?.has_more || !after) break;
+      if (!payload.has_more || !after) break;
     }
     const expectedTaskIds =
       expectedTaskIdsByFingerprint.get(credential.fingerprint) ?? new Set();

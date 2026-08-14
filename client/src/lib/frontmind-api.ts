@@ -5,10 +5,9 @@
  * avoiding CORS issues entirely.
  *
  * KEY CHANGES:
- * - Switched from /v1/responses to /v1/tasks endpoint for correct model selection
- * - agentProfile is now a top-level parameter (not buried in extra_body)
- * - Uses prompt (text) + attachments format instead of input (messages array)
- * - Multi-turn uses taskId instead of previous_response_id
+ * - Ordinary chat uses Dashboard's local /v2 contract; provider identities
+ *   never enter browser state.
+ * - Model/profile selection is frozen from the bound server credential.
  * - Added credit event bus for real-time refresh
  * - Updated system prompt to keep upstream identity private
  */
@@ -18,7 +17,10 @@ import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progres
 import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
 import { sanitizeFrontMindPublicText } from "@shared/frontmind-public-brand";
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
-import { assertChatAttachmentSizes } from "@/lib/attachment-files";
+import {
+  assertChatAttachmentSizes,
+  normalizedKnowledgeBaseUploadFilename,
+} from "@/lib/attachment-files";
 import {
   dispatchKnowledgeBaseProgressUpdated,
   knowledgeBaseObservationFromPayload,
@@ -639,93 +641,196 @@ function extractAttachments(
 }
 
 /**
- * Create a new task using the native /v1/tasks endpoint.
- *
- * KEY FIX: Uses /v1/tasks with agentProfile as a top-level parameter
- * so the API correctly routes to the selected model (lite/base/max).
- *
- * For multi-turn conversations, uses taskId to continue an existing task.
+ * Create or continue an ordinary chat through Dashboard's local v2 contract.
+ * Every id returned here is a Dashboard-local identity.
  */
 export async function createTask(
   input: Message[],
   options?: {
     previousResponseId?: string;
     taskId?: string;
+    conversationId?: string;
+    clientRequestId?: string;
     projectId?: string;
     agentProfile?: string;
   },
 ): Promise<TaskResponse> {
-  const config = getConfig();
-
-  // Use per-message model override if provided, otherwise fall back to config
-  const modelToUse = options?.agentProfile || config.agentProfile;
-
-  const isMultiTurn = !!options?.previousResponseId;
-
-  // Build prompt text from input messages
   const prompt = buildPromptText(input);
-
-  // Extract attachments (images, files)
   const attachments = extractAttachments(input);
-
-  // Build the request body for /v1/tasks
-  const body: Record<string, unknown> = {
+  const localTaskId = options?.taskId || options?.previousResponseId;
+  const conversationId = String(options?.conversationId || "").trim();
+  const clientRequestId = String(options?.clientRequestId || "").trim();
+  if (!conversationId || !clientRequestId) {
+    throw new Error("普通内容流程缺少本地会话坐标，请刷新后重试");
+  }
+  const localAssetIds = attachments.map((attachment) => attachment.file_id);
+  if (localAssetIds.some((id) => !String(id).startsWith("asset_"))) {
+    throw new Error("普通内容流程附件尚未完成本地化，请重新上传");
+  }
+  const body = {
+    conversationId,
+    clientRequestId,
     prompt,
-    agentProfile: modelToUse,
-    taskMode: "agent",
+    localAssetIds,
   };
-
-  // Add attachments if any
-  if (attachments.length > 0) {
-    body.attachments = attachments;
-  }
-
-  // Multi-turn: use taskId to continue existing task
-  if (options?.previousResponseId) {
-    body.taskId = options.previousResponseId;
-  }
-
-  if (options?.projectId) {
-    body.projectId = options.projectId;
-  }
-
-  // No 404 retry logic needed: API key changes now force a new workflow,
-  // so taskId will always belong to the current key.
   const response = await apiRequest(
-    "/v1/tasks",
+    localTaskId
+      ? `/v2/tasks/${encodeURIComponent(localTaskId)}/messages`
+      : "/v2/tasks",
     {
       method: "POST",
       body: JSON.stringify(body),
     },
     CREATE_TASK_TIMEOUT_MS,
   );
-  const data = withoutProviderTaskNavigationUrls(await response.json());
+  return withoutProviderTaskNavigationUrls(await response.json());
+}
 
-  // Normalize the response format
-  // The native /v1/tasks API may return different field names
-  const taskId = data.id || data.task_id;
-  const taskStatus = data.status || "running";
+/**
+ * Stores an ordinary-chat attachment in Dashboard before any Provider file
+ * lease exists. The returned id is local and remains usable after a Key is
+ * rotated or revoked.
+ */
+export async function uploadChatLocalAsset(
+  file: File,
+  onProgress?: (percent: number) => void,
+  options: {
+    filename?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<{
+  fileId: string;
+  filename: string;
+  expiresAt: number;
+}> {
+  assertChatAttachmentSizes([file]);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const filename = options.filename || file.name || "attachment.bin";
+    const abortFromSignal = () => xhr.abort();
+    if (options.signal?.aborted) {
+      reject(new DOMException("附件上传已取消", "AbortError"));
+      return;
+    }
+    xhr.open("POST", "/api/frontmind/v2/assets");
+    const headers = deliveryProjectHeaders({
+      // This route is mounted after the bounded JSON parser. Keep the wire
+      // body unconditionally binary so a user-supplied .json file is not
+      // consumed as an HTTP request object before the asset stream runs.
+      "Content-Type": "application/octet-stream",
+      "X-FrontMind-Mime": file.type || "application/octet-stream",
+      "X-FrontMind-Filename": encodeURIComponent(filename),
+      "X-FrontMind-Size": String(file.size),
+    });
+    Object.entries(headers).forEach(([name, value]) => {
+      xhr.setRequestHeader(name, value);
+    });
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable || event.total <= 0) return;
+      onProgress?.(
+        Math.min(100, Math.round((event.loaded / event.total) * 100)),
+      );
+    };
+    const detachAbortListener = () =>
+      options.signal?.removeEventListener("abort", abortFromSignal);
+    options.signal?.addEventListener("abort", abortFromSignal, { once: true });
+    xhr.onerror = () => {
+      detachAbortListener();
+      reject(new Error("附件上传网络异常，请稍后重试"));
+    };
+    xhr.onabort = () => {
+      detachAbortListener();
+      reject(new DOMException("附件上传已取消", "AbortError"));
+    };
+    xhr.onload = () => {
+      detachAbortListener();
+      let payload: any = null;
+      try {
+        payload = JSON.parse(xhr.responseText || "null");
+      } catch {
+        payload = null;
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(
+          Object.assign(
+            new Error(
+              payload?.error?.message || `附件上传失败（${xhr.status}）`,
+            ),
+            { status: xhr.status, code: payload?.error?.code },
+          ),
+        );
+        return;
+      }
+      const id = String(payload?.localAssetId || "");
+      if (!id.startsWith("asset_")) {
+        reject(new Error("附件本地身份无效，请重新上传"));
+        return;
+      }
+      onProgress?.(100);
+      resolve({
+        fileId: id,
+        filename: String(payload?.filename || filename),
+        expiresAt: Number(payload?.expiresAt || Date.now()),
+      });
+    };
+    xhr.send(file);
+  });
+}
 
-  // If the response has task_id but no id, normalize it
-  if (!data.id && data.task_id) {
-    return {
-      id: data.task_id,
-      status: taskStatus === "failed" ? "error" : taskStatus,
-      model: data.model,
-      metadata: {
-        credit_usage: data.credit_usage || data.metadata?.credit_usage,
-        task_title: data.task_title || data.metadata?.task_title,
-      },
-      output: data.output || [],
-    } as TaskResponse;
-  }
-
-  // Normalize status
-  if (data.status === "failed") {
-    data.status = "error";
-  }
-
-  return data;
+/**
+ * Knowledge-base browser ingress is local-first as well. The adapter retains
+ * the starter dialog's progress callback shape, but it never
+ * creates a Provider file record: dispatch later leases a v2 file from these
+ * immutable Dashboard bytes under the operation's frozen credential.
+ */
+export async function uploadKnowledgeBaseLocalAsset(
+  file: File,
+  onProgress?: (percent: number) => void,
+  _retryConfig?: {
+    maxRetries: number;
+    initialDelay: number;
+    maxDelay: number;
+  },
+  options: UploadFileOptions = {},
+): Promise<UploadRetentionReceipt & { filename: string }> {
+  const filename =
+    options.captureFilename ||
+    normalizedKnowledgeBaseUploadFilename(file.name);
+  options.onStage?.({
+    stage: "creating_record",
+    totalBytes: file.size,
+    loadedBytes: 0,
+  });
+  const uploaded = await uploadChatLocalAsset(file, onProgress, {
+    filename,
+    signal: options.signal,
+  });
+  const uploadedAt = Date.now();
+  await options.onFileRecord?.({
+    itemId: options.itemId,
+    fileId: uploaded.fileId,
+    filename: uploaded.filename,
+    reusedExistingFileId: false,
+  });
+  const receipt = {
+    fileId: uploaded.fileId,
+    filename: uploaded.filename,
+    sizeBytes: file.size,
+    uploadedAt,
+    providerReadyAt: uploadedAt,
+    expiresAt: uploaded.expiresAt,
+    replayed: false,
+    recovered: false,
+  };
+  options.onStage?.({
+    stage: "uploaded",
+    fileId: uploaded.fileId,
+    loadedBytes: file.size,
+    dashboardReceivedBytes: file.size,
+    totalBytes: file.size,
+    receipt,
+  });
+  return receipt;
 }
 
 /**
@@ -1121,7 +1226,10 @@ export async function createKnowledgeBaseTurnTask(
     clientRequestId: string;
     submissionKind?: "message" | "logo";
     expectedGeneration?: number;
+    expectedResetRevision?: number;
+    expectedStateEpoch?: number;
     expectedRevision?: number;
+    expectedContentVersion?: number;
     expectedLeafId?: string;
     expectedPresentationKey?: string;
     /** Exact browser bytes for upload-first knowledge-base attachments. */
@@ -1146,40 +1254,64 @@ export async function createKnowledgeBaseTurnTask(
     CREATE_TASK_TIMEOUT_MS,
   );
   try {
-    const endpoint = context.attachmentReservation
-      ? "/api/knowledge-base/turn/dispatch"
-      : "/api/knowledge-base/turn";
+    const userMessage = buildPromptText(input);
+    const attachments = extractAttachments(input);
+    const normalizedAction = userMessage
+      .normalize("NFKC")
+      .replace(/[\s。！!，,：:；;]+/gu, "");
+    const localConfirmation =
+      !context.attachmentReservation &&
+      context.submissionKind !== "logo" &&
+      attachments.length === 0 &&
+      ["确认", "确认当前内容", "确认内容", "确认当前节点"].includes(
+        normalizedAction,
+      );
+    const endpoint = localConfirmation
+      ? "/api/knowledge-base/confirm"
+      : context.attachmentReservation
+        ? "/api/knowledge-base/turn/dispatch"
+        : "/api/knowledge-base/turn";
     // The server reserves this logical turn by clientRequestId before external
     // dispatch. Serialize once and replay these exact bytes so a disconnected
     // response can never become a second logical confirmation.
     const requestBody = JSON.stringify({
       conversationId: context.conversationId,
       clientRequestId: context.clientRequestId,
-      ...(context.attachmentReservation
+      ...(localConfirmation
         ? {
-            turnId: context.attachmentReservation.turnId,
-            attachmentManifest:
-              context.attachmentReservation.attachmentManifest,
-          }
-        : {
             expectedGeneration: context.expectedGeneration,
+            expectedResetRevision: context.expectedResetRevision,
+            expectedStateEpoch: context.expectedStateEpoch,
             expectedRevision: context.expectedRevision,
             expectedLeafId: context.expectedLeafId,
             expectedPresentationKey: context.expectedPresentationKey,
-            submissionKind: context.submissionKind ?? "message",
-            userMessage: buildPromptText(input),
-            attachments: extractAttachments(input),
-            ...(context.attachmentManifest
-              ? { attachmentManifest: context.attachmentManifest }
-              : {}),
-            ...(context.legacyAttachmentTakeover
-              ? {
-                  resumeLegacyAttachments: true,
-                  attachmentManifest:
-                    context.legacyAttachmentTakeover.attachmentManifest,
-                }
-              : {}),
-          }),
+            expectedContentVersion: context.expectedContentVersion,
+          }
+        : context.attachmentReservation
+          ? {
+              turnId: context.attachmentReservation.turnId,
+              attachmentManifest:
+                context.attachmentReservation.attachmentManifest,
+            }
+          : {
+              expectedGeneration: context.expectedGeneration,
+              expectedRevision: context.expectedRevision,
+              expectedLeafId: context.expectedLeafId,
+              expectedPresentationKey: context.expectedPresentationKey,
+              submissionKind: context.submissionKind ?? "message",
+              userMessage,
+              attachments,
+              ...(context.attachmentManifest
+                ? { attachmentManifest: context.attachmentManifest }
+                : {}),
+              ...(context.legacyAttachmentTakeover
+                ? {
+                    resumeLegacyAttachments: true,
+                    attachmentManifest:
+                      context.legacyAttachmentTakeover.attachmentManifest,
+                  }
+                : {}),
+            }),
     });
     let lastError: unknown;
 
@@ -1265,36 +1397,13 @@ export async function createKnowledgeBaseTurnTask(
 /**
  * Retrieve task status and results.
  *
- * Try /v1/tasks/ first for richer intermediate step data,
- * falls back to /v1/responses/ if /v1/tasks/ fails.
+ * The argument is a Dashboard-local task id, never a Provider id.
  */
 export async function retrieveTask(responseId: string): Promise<TaskResponse> {
-  // Try native tasks API first for richer intermediate step data
-  try {
-    const response = await apiRequest(`/v1/tasks/${responseId}`);
-    const data = await response.json();
-    if (data.status === "failed") {
-      data.status = "error";
-    }
-    return data;
-  } catch (err: any) {
-    if (err?.status !== 404 && err?.status !== 405) {
-      throw err;
-    }
-    console.warn(
-      `[retrieveTask] /v1/tasks/ is unavailable (${err.status}), trying /v1/responses/`,
-    );
-    try {
-      const response = await apiRequest(`/v1/responses/${responseId}`);
-      const data = await response.json();
-      if (data.status === "failed") {
-        data.status = "error";
-      }
-      return data;
-    } catch (fallbackErr: any) {
-      throw fallbackErr;
-    }
-  }
+  const response = await apiRequest(
+    `/v2/tasks/${encodeURIComponent(responseId)}`,
+  );
+  return response.json();
 }
 
 /**
@@ -1320,7 +1429,7 @@ export async function listTasks(params?: {
   }
 
   const query = searchParams.toString();
-  const response = await apiRequest(`/v1/tasks${query ? `?${query}` : ""}`);
+  const response = await apiRequest(`/v2/tasks${query ? `?${query}` : ""}`);
   return response.json();
 }
 

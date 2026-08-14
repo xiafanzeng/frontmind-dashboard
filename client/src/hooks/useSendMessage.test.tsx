@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   createResponseLogicTask: vi.fn(),
   retrieveTask: vi.fn(),
   reconcileKnowledgeBaseProgress: vi.fn(),
+  uploadChatLocalAsset: vi.fn(),
+  providerV1UploadFile: vi.fn(),
   uploadFile: vi.fn(),
   fileToBase64: vi.fn(),
   creditEmit: vi.fn(),
@@ -49,7 +51,9 @@ vi.mock("@/lib/frontmind-api", () => ({
   stageKnowledgeBaseTurnAttachment: mocks.stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask: mocks.createResponseLogicTask,
   retrieveTask: mocks.retrieveTask,
-  uploadFile: mocks.uploadFile,
+  uploadChatLocalAsset: mocks.uploadChatLocalAsset,
+  uploadKnowledgeBaseLocalAsset: mocks.uploadFile,
+  uploadFile: mocks.providerV1UploadFile,
   fileToBase64: mocks.fileToBase64,
   creditEventBus: {
     emit: mocks.creditEmit,
@@ -261,6 +265,11 @@ describe("useSendMessage", () => {
       uploadedAt: 1_000,
       expiresAt: 2_593_000_000,
     }));
+    mocks.uploadChatLocalAsset.mockImplementation(async (file: File) => ({
+      fileId: `asset_${file.name.replace(/[^a-z0-9]/gi, "").slice(0, 30)}`,
+      filename: file.name,
+      expiresAt: 2_593_000_000,
+    }));
     mocks.fileToBase64.mockResolvedValue("data:text/plain;base64,dGVzdA==");
     mocks.isImageUpload.mockReturnValue(false);
     mocks.normalizedKnowledgeBaseUploadFilename.mockImplementation(
@@ -463,6 +472,8 @@ describe("useSendMessage", () => {
     expect(
       mocks.createKnowledgeBaseTurnTask.mock.calls[0]![1],
     ).not.toHaveProperty("attachmentManifest");
+    expect(mocks.uploadFile).toHaveBeenCalledTimes(1);
+    expect(mocks.providerV1UploadFile).not.toHaveBeenCalled();
     expect(mocks.sha256UploadFile).not.toHaveBeenCalled();
     expect(mocks.updateStatus).not.toHaveBeenCalledWith(
       "test-conv-id",
@@ -1123,6 +1134,7 @@ describe("useSendMessage", () => {
     expect(mocks.uploadFile.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
     );
+    expect(mocks.providerV1UploadFile).not.toHaveBeenCalled();
     expect(
       mocks.stageKnowledgeBaseTurnAttachment.mock.invocationCallOrder[0],
     ).toBeLessThan(
@@ -1406,7 +1418,7 @@ describe("useSendMessage", () => {
     );
   });
 
-  it("captures local copies for ordinary agent uploads", async () => {
+  it("stores ordinary-agent uploads as local assets", async () => {
     const file = new File(["report"], "report.pdf", {
       type: "application/pdf",
     });
@@ -1417,12 +1429,11 @@ describe("useSendMessage", () => {
       await result.current.sendMessage("请阅读", [file]);
     });
 
-    expect(mocks.uploadFile).toHaveBeenCalledWith(
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledWith(
       file,
       expect.any(Function),
-      expect.any(Object),
-      { captureLocalCopy: true },
     );
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
   });
 
   it("rejects an oversized attachment before preparation or upload", async () => {
@@ -1441,6 +1452,7 @@ describe("useSendMessage", () => {
 
     expect(sent).toBe(false);
     expect(mocks.prepareUploadFiles).not.toHaveBeenCalled();
+    expect(mocks.uploadChatLocalAsset).not.toHaveBeenCalled();
     expect(mocks.uploadFile).not.toHaveBeenCalled();
     expect(mocks.createTask).not.toHaveBeenCalled();
   });
@@ -1701,14 +1713,15 @@ describe("useSendMessage", () => {
     });
 
     expect(mocks.fileToBase64).not.toHaveBeenCalled();
-    expect(mocks.uploadFile).toHaveBeenCalledTimes(1);
-    expect(mocks.uploadFile.mock.calls[0][0]).toBe(originalImage);
+    expect(mocks.uploadChatLocalAsset).toHaveBeenCalledTimes(1);
+    expect(mocks.uploadChatLocalAsset.mock.calls[0][0]).toBe(originalImage);
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
 
     const input = mocks.createTask.mock.calls[0][0][0].content;
     expect(input).toContainEqual(
       expect.objectContaining({
         type: "input_file",
-        file_id: "file-original.png",
+        file_id: "asset_originalpng",
         filename: "original.png",
         mime_type: "image/png",
       }),
@@ -1746,7 +1759,7 @@ describe("useSendMessage", () => {
       ]);
     });
 
-    expect(mocks.uploadFile.mock.calls[0][0]).toBe(zipFile);
+    expect(mocks.uploadChatLocalAsset.mock.calls[0][0]).toBe(zipFile);
     const input = mocks.createTask.mock.calls[0][0][0].content;
     expect(input).toContainEqual({
       type: "input_text",
@@ -1755,7 +1768,7 @@ describe("useSendMessage", () => {
     expect(input).toContainEqual(
       expect.objectContaining({
         type: "input_file",
-        file_id: "file-frontmind-original-images-20260706.zip",
+        file_id: "asset_frontmindoriginalimages2026070",
         filename: "frontmind-original-images-20260706.zip",
         mime_type: "application/zip",
       }),
@@ -1768,7 +1781,9 @@ describe("useSendMessage", () => {
     });
     mockPreparedFiles([file]);
     mocks.isImageUpload.mockReturnValue(true);
-    mocks.uploadFile.mockRejectedValue(new Error("Manus upload failed"));
+    mocks.uploadChatLocalAsset.mockRejectedValue(
+      new Error("Manus upload failed"),
+    );
 
     const { result } = renderHook(() => useSendMessage());
 
@@ -1779,6 +1794,7 @@ describe("useSendMessage", () => {
     });
 
     expect(mocks.createTask).not.toHaveBeenCalled();
+    expect(mocks.uploadFile).not.toHaveBeenCalled();
     expect(mocks.fileToBase64).not.toHaveBeenCalled();
     expect(result.current.uploadProgress).toBeNull();
     expect(toast.error).toHaveBeenCalledWith('文件 "original.png" 上传失败', {

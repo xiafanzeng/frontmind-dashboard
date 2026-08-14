@@ -6,36 +6,34 @@ import { describe, expect, it } from "vitest";
 import { presalesUsageDisplayState } from "./AdminPresales";
 
 describe("presalesUsageDisplayState", () => {
-  it("requires an explicit attribution-complete proof from the API", () => {
+  it("does not contain the retired attribution or emergency-replacement gates", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
       "utf8",
     );
-    expect(source).toContain("usageQuery.data?.attributionComplete === true");
+    expect(source).not.toContain("attributionComplete");
+    expect(source).not.toContain("allowIncompleteHistory");
+    expect(source).not.toContain("历史任务未能全部归因到官网");
   });
-  it("hides every aggregate and percentage when the scan is incomplete", () => {
+  it("keeps the locally recorded Website total visible without a Key pool snapshot", () => {
     expect(
       presalesUsageDisplayState({
-        complete: false,
-        attributionComplete: false,
-        keyTotalUsed: 98_765,
-        websiteUsed: 12_345,
+        keyPoolTotalUsed: null,
+        rollingWebsiteUsed: 12_345,
         limit: 230_000,
       }),
     ).toEqual({
       keyTotalLabel: "—",
-      websiteUsedLabel: "—",
+      websiteUsedLabel: "12,345",
       percentageLabel: "—",
       progressPercentage: 0,
     });
   });
 
-  it("shows exact values only after a complete scan", () => {
+  it("shows the latest Key pool snapshot independently from the rolling Website total", () => {
     const display = presalesUsageDisplayState({
-      complete: true,
-      attributionComplete: true,
-      keyTotalUsed: 115_000,
-      websiteUsed: 12_345,
+      keyPoolTotalUsed: 115_000,
+      rollingWebsiteUsed: 12_345,
       limit: 230_000,
     });
     expect(display.keyTotalLabel).not.toBe("—");
@@ -44,18 +42,16 @@ describe("presalesUsageDisplayState", () => {
     expect(display.progressPercentage).toBe(50);
   });
 
-  it("keeps the authoritative pool total visible when only task attribution is incomplete", () => {
+  it("never gates the rolling Website total on account attribution", () => {
     expect(
       presalesUsageDisplayState({
-        complete: true,
-        attributionComplete: false,
-        keyTotalUsed: 216_314,
-        websiteUsed: 144_360,
+        keyPoolTotalUsed: 216_314,
+        rollingWebsiteUsed: 144_360,
         limit: 230_000,
       }),
     ).toEqual({
       keyTotalLabel: "216,314",
-      websiteUsedLabel: "—",
+      websiteUsedLabel: "144,360",
       percentageLabel: "94%",
       progressPercentage: 94,
     });

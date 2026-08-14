@@ -777,10 +777,6 @@ export function collectKnowledgeBaseLogoDescriptors(value: unknown) {
   return [...descriptors.values()];
 }
 
-function upstreamHeaders(apiKey: string) {
-  return { API_KEY: apiKey, Authorization: `Bearer ${apiKey}` };
-}
-
 async function downloadLogoBytes(input: {
   descriptor: KnowledgeBaseLogoDescriptor;
   apiKey: string;
@@ -793,14 +789,15 @@ async function downloadLogoBytes(input: {
       : undefined);
   let response: AxiosResponse<ArrayBuffer>;
   try {
-    const downloadUrl = fileId
-      ? `${input.baseUrl.replace(/\/$/u, "")}/v1/files/${encodeURIComponent(fileId)}/content`
-      : assertSafeExternalUrl(input.descriptor.url || "");
+    if (fileId && !input.descriptor.url) {
+      throw new KnowledgeBaseArtifactBindingError(
+        "ARTIFACT_DOWNLOAD_FAILED",
+        "Provider file ID 不是可持久读取的资产；请使用已本地化附件",
+      );
+    }
+    const downloadUrl = assertSafeExternalUrl(input.descriptor.url || "");
     response = await axios.get<ArrayBuffer>(downloadUrl, {
-      ...(fileId
-        ? { proxy: false as const, maxRedirects: 0 }
-        : safeExternalRequestOptions),
-      ...(fileId ? { headers: upstreamHeaders(input.apiKey) } : {}),
+      ...safeExternalRequestOptions,
       responseType: "arraybuffer",
       timeout: 120_000,
       maxContentLength: MAX_LOGO_DOWNLOAD_BYTES,
@@ -934,6 +931,50 @@ export type KnowledgeBaseOfficialLogoUpload = {
   sourceSha256: string;
 };
 
+/**
+ * A materialized v5 Logo replacement is only a staged candidate until the
+ * corresponding PATCH Working Set wins its CAS.  Keeping these coordinates in
+ * the turn ledger lets recovery validate the exact local bytes without
+ * changing the build's authoritative Logo pointer early.
+ */
+export type KnowledgeBaseStagedOfficialLogo = {
+  schemaVersion: 1;
+  kind: "materialized_official_logo";
+  operationKey: string;
+  expectedRevision: number;
+  expectedLeafId: string;
+  storageKey: string;
+  sha256: string;
+  bytes: number;
+  filename: string;
+  mimeType: string;
+  sourceSha256: string;
+};
+
+export function materializedKnowledgeBaseStagedOfficialLogo(input: {
+  operationKey: string;
+  expectedRevision: number;
+  expectedLeafId: string;
+  staged: { storageKey: string; sha256: string; bytes: number };
+  filename: string;
+  mimeType: string;
+  sourceSha256: string;
+}): KnowledgeBaseStagedOfficialLogo {
+  return {
+    schemaVersion: 1,
+    kind: "materialized_official_logo",
+    operationKey: input.operationKey,
+    expectedRevision: input.expectedRevision,
+    expectedLeafId: input.expectedLeafId,
+    storageKey: input.staged.storageKey,
+    sha256: input.staged.sha256,
+    bytes: input.staged.bytes,
+    filename: input.filename.slice(0, 512),
+    mimeType: input.mimeType.slice(0, 255),
+    sourceSha256: input.sourceSha256,
+  };
+}
+
 export function knowledgeBaseExistingLogoUploadBindingDecision(input: {
   buildLogoSha256: string | null;
   buildLogoBytes: number | null;
@@ -979,6 +1020,23 @@ export function knowledgeBaseExistingLogoUploadBindingDecision(input: {
   return input.existingUpload?.verified === true
     ? ("already_complete" as const)
     : ("repair_provenance" as const);
+}
+
+export function knowledgeBaseAllowsFirstLeafLogoReplacement(input: {
+  requested: boolean;
+  skillVersion: string;
+  executionMode?: string | null;
+  confirmedCount: number;
+  directPrefilledCount: number;
+}) {
+  return (
+    input.requested === true &&
+    (input.skillVersion === "4" ||
+      (input.skillVersion === "5" &&
+        input.executionMode === "materialized_bundle_v1")) &&
+    input.confirmedCount === 0 &&
+    input.directPrefilledCount === 0
+  );
 }
 
 async function readOfficialLogoUploadBytes(input: {
@@ -1043,6 +1101,7 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
   expectedLeafId: string;
   upload: Omit<KnowledgeBaseOfficialLogoUpload, "verified">;
   allowFirstLeafReplacement?: boolean;
+  activation?: "immediate" | "materialized_patch";
 }) {
   const uploadFileId = assertKnowledgeBaseBindingIdentity(
     input.upload.fileId,
@@ -1203,19 +1262,45 @@ export async function bindKnowledgeBaseOfficialLogoUpload(input: {
         stagedMimeType,
         existingUpload,
         verifiedUpload,
-        allowReplacement:
-          input.allowFirstLeafReplacement === true &&
-          build.skillVersion === "4" &&
-          build.confirmedCount === 0 &&
-          build.directPrefilledCount === 0,
+        allowReplacement: knowledgeBaseAllowsFirstLeafLogoReplacement({
+          requested: input.allowFirstLeafReplacement === true,
+          skillVersion: build.skillVersion,
+          executionMode: build.executionMode,
+          confirmedCount: build.confirmedCount,
+          directPrefilledCount: build.directPrefilledCount,
+        }),
       });
       const nextMetadata = {
         ...metadata,
         recovery: {
           ...recovery,
           officialLogoUpload: verifiedUpload,
+          ...(input.activation === "materialized_patch"
+            ? {
+                stagedOfficialLogo:
+                  materializedKnowledgeBaseStagedOfficialLogo({
+                    operationKey: input.operationKey,
+                    expectedRevision: input.expectedRevision,
+                    expectedLeafId: input.expectedLeafId,
+                    staged,
+                    filename: upload.filename,
+                    mimeType: stagedMimeType,
+                    sourceSha256: upload.sourceSha256,
+                  }),
+              }
+            : {}),
         },
       };
+      if (input.activation === "materialized_patch") {
+        // PATCH validation and Working Set activation have not happened yet.
+        // Persist only the immutable staging ledger; the build Logo pointer
+        // and the previous artifact stay authoritative until the PATCH CAS.
+        await tx
+          .update(conversationTurns)
+          .set({ metadata: nextMetadata, updatedAt: new Date() })
+          .where(eq(conversationTurns.id, input.turnId));
+        return verifiedUpload;
+      }
       if (build.logoSha256 && bindingDecision !== "replace_artifact") {
         // A crash/replay may have committed the immutable artifact before the
         // turn provenance marker. Same bytes are not enough: repair the exact

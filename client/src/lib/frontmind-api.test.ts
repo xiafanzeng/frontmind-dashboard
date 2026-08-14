@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+  createTask,
   createKnowledgeBaseTurnTask,
   discardManagedUploadIntent,
   discardUnboundUpload,
@@ -23,6 +24,7 @@ import {
   type FileUploadStageEvent,
   type ManagedUploadHandle,
   uploadFile,
+  uploadKnowledgeBaseLocalAsset,
   uploadFileToUrl,
   withoutProviderTaskNavigationUrls,
 } from "./frontmind-api";
@@ -291,8 +293,10 @@ describe("createKnowledgeBaseTurnTask", () => {
       expectedRevision: 5,
       expectedLeafId: "1.6",
       expectedPresentationKey: "presentation-5",
-      userMessage: "确认",
     });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).not.toHaveProperty(
+      "userMessage",
+    );
   });
 
   it("replays the exact legacy takeover manifest with the same request bytes", async () => {
@@ -910,10 +914,10 @@ describe("createKnowledgeBaseTurnTask", () => {
     expect(body).toMatchObject({
       conversationId: "conv-kb",
       clientRequestId: "request-confirm-1",
-      userMessage: "确认",
       expectedRevision: 45,
       expectedLeafId: "5.5",
     });
+    expect(body).not.toHaveProperty("userMessage");
   });
 
   it("marks a dedicated Logo submission and accepts only the returned upstream task id", async () => {
@@ -1091,7 +1095,7 @@ describe("retrieveTask", () => {
     await retrieveTask("task-project");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/frontmind/v1/tasks/task-project",
+      "/api/frontmind/v2/tasks/task-project",
       expect.objectContaining({
         headers: expect.objectContaining({
           "x-delivery-project-assignment-id": "project-assignment-1",
@@ -1103,7 +1107,7 @@ describe("retrieveTask", () => {
     );
   });
 
-  it("preserves a structured authorization error without trying the legacy endpoint", async () => {
+  it("preserves a structured authorization error without any Provider fallback", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,
       status: 403,
@@ -1119,38 +1123,153 @@ describe("retrieveTask", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/frontmind/v1/tasks/task-private",
+      "/api/frontmind/v2/tasks/task-private",
       expect.any(Object),
     );
   });
 
-  it("falls back to the legacy endpoint only when the task endpoint is unavailable", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 404,
-        json: async () => ({ message: "route not found" }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          id: "task-legacy",
-          status: "completed",
-          output: [],
-        }),
-      });
+  it("does not fall back to v1 when the local v2 task is missing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: { message: "任务不存在" } }),
+    });
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(retrieveTask("task-legacy")).resolves.toMatchObject({
-      id: "task-legacy",
-      status: "completed",
+    await expect(retrieveTask("task-local")).rejects.toMatchObject({
+      status: 404,
     });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe(
-      "/api/frontmind/v1/responses/task-legacy",
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/frontmind/v2/tasks/task-local",
+      expect.any(Object),
     );
+  });
+});
+
+describe("ordinary chat local v2 contract", () => {
+  it("creates a local task without browser-selected model or Provider fields", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({ id: "local-task-1", status: "running", output: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createTask(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "分析附件" },
+            {
+              type: "input_file",
+              file_id: "asset_123456789012345678901234567890",
+              filename: "facts.pdf",
+            },
+          ],
+        },
+      ],
+      {
+        conversationId: "conversation-local-1",
+        clientRequestId: "request-local-1",
+        agentProfile: "frontmind-base",
+      },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/frontmind/v2/tasks",
+      expect.any(Object),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toEqual({
+      conversationId: "conversation-local-1",
+      clientRequestId: "request-local-1",
+      prompt: "分析附件",
+      localAssetIds: ["asset_123456789012345678901234567890"],
+    });
+    expect(body).not.toHaveProperty("agentProfile");
+    expect(body).not.toHaveProperty("model");
+    expect(body).not.toHaveProperty("taskMode");
+  });
+
+  it("continues by local task id without sending a Provider task id field", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "local-task-1", status: "running", output: [] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createTask([{ role: "user", content: "继续分析" }], {
+      conversationId: "conversation-local-1",
+      clientRequestId: "request-local-2",
+      previousResponseId: "local-task-1",
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/frontmind/v2/tasks/local-task-1/messages",
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("taskId");
+    expect(body).not.toHaveProperty("previousResponseId");
+  });
+});
+
+describe("materialized knowledge-base local asset ingress", () => {
+  it("uploads browser bytes only to the v2 local asset endpoint", async () => {
+    const opened: Array<{ method: string; url: string }> = [];
+    const headers = new Map<string, string>();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    class MockXMLHttpRequest {
+      status = 201;
+      responseText = JSON.stringify({
+        localAssetId: `asset_${"a".repeat(30)}`,
+        filename: "brand-logo.png",
+        expiresAt: 1_800_000_000_000,
+      });
+      upload: { onprogress?: (event: any) => void } = {};
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open(method: string, url: string) {
+        opened.push({ method, url });
+      }
+      setRequestHeader(name: string, value: string) {
+        headers.set(name, value);
+      }
+      send(body: File) {
+        this.upload.onprogress?.({
+          lengthComputable: true,
+          loaded: body.size,
+          total: body.size,
+        });
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadKnowledgeBaseLocalAsset(
+        new File(["logo"], "brand-logo.png", { type: "image/png" }),
+      ),
+    ).resolves.toMatchObject({
+      fileId: `asset_${"a".repeat(30)}`,
+      filename: "brand-logo.png",
+      sizeBytes: 4,
+    });
+
+    expect(opened).toEqual([
+      { method: "POST", url: "/api/frontmind/v2/assets" },
+    ]);
+    expect(headers.get("Content-Type")).toBe("application/octet-stream");
+    expect(headers.get("X-FrontMind-Mime")).toBe("image/png");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(opened.some(({ url }) => url.includes("/v1/files"))).toBe(false);
   });
 });
 

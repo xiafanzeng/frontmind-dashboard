@@ -10,12 +10,10 @@ import { createContext } from "./context";
 import { serveStatic } from "./static";
 import { configureServerTimeouts } from "./server-timeouts";
 import manusProxy from "../manus-proxy";
+import frontmindV2ChatRouter from "../frontmind-v2-chat-router";
 import knowledgeBaseApi, {
   getKnowledgeBaseSkillDescriptor,
-  migrateActiveLegacyKnowledgeBaseBuilds,
   recoverExpiredKnowledgeBaseTurns,
-  releaseGeneratedAttachmentInvalidPreproviderTurns,
-  recoverTerminalKnowledgeBaseAnchorHandoffs,
   recoverOpenKnowledgeBaseTasks,
 } from "../knowledge-base-api";
 import { cleanupOrphanedKnowledgeBuildArtifactCandidates } from "../knowledge-base-artifact-binding-service";
@@ -30,9 +28,8 @@ import brandTrackingApi from "../brand-tracking-api";
 import { startJenovaBrandTrackingRecoveryScheduler } from "../jenova-brand-tracking-service";
 import { getBrandQuestionPortfolioSkillDescriptor } from "../brand-question-portfolio-runtime";
 import preparedFileRouter from "../prepared-file-router";
-import presalesProxy, {
-  assertPresalesProxyConfigured,
-} from "../presales-proxy";
+import presalesV2Router from "../presales-v2-router";
+import { assertPresalesServiceConfigured } from "../presales-service-auth";
 import provisioningRouter, {
   assertProvisioningConfigured,
 } from "../provisioning-router";
@@ -73,22 +70,17 @@ import {
   getDedicatedMonitorCredentialReadiness,
   monitorBaseUrl,
 } from "../presales-monitor";
-import {
-  assertFrontMindPublicUrlConfigured,
-} from "../public-url";
+import { assertFrontMindPublicUrlConfigured } from "../public-url";
 import {
   assertDashboardImportPreflightConfigured,
   startDashboardImportPreflightCleanupScheduler,
 } from "../dashboard-import-preflight-service";
 import websiteContentTemplateApi from "../website-content-template-api";
 import { assertAdminAccessLevelsBackfilled } from "../admin-control-plane-service";
-import {
-  assertUpstreamBaseUrlConfigured,
-} from "../upstream-config";
+import { assertUpstreamBaseUrlConfigured } from "../upstream-config";
 import { createPaymentReceiptLedgerService } from "../payment-receipt-ledger-service";
 import { createProjectOrderRegistryService } from "../project-order-registry-service";
 import { startServiceContractLifecycleReconciliationScheduler } from "../service-entitlement";
-import knowledgeBaseLivePreviewApi from "../knowledge-base-live-preview-api";
 import knowledgeBaseArtifactApi from "../knowledge-base-artifact-api";
 import {
   auditKnowledgeBaseStateInvariants,
@@ -101,20 +93,12 @@ import {
 } from "../managed-upload-intent";
 import { knowledgeBaseNewBuildPolicyBinding } from "../knowledge-base-tree-policy-rollout";
 import {
-  knowledgeBaseManusV2ActiveMigrationEnabled,
-  knowledgeBaseManusV2WriterEnabled,
-} from "../knowledge-base-manus-v2-rollout";
-import {
   evaluateKnowledgeBaseReadiness,
   knowledgeBaseReadinessHttpStatus,
   knowledgeBaseRecoveryHealth,
   runLeasedKnowledgeBaseRecovery,
 } from "./knowledge-base-readiness";
 import { createKnowledgeBaseRecoverySweep } from "../knowledge-base-recovery-worker";
-import {
-  inspectKnowledgeBaseMigrationInventory,
-  knowledgeBaseMigrationDiagnostics,
-} from "../knowledge-base-migration-diagnostics";
 import { runKnowledgeBasePackageSweep } from "../knowledge-base-local-package";
 import { sweepKnowledgeBaseBuildSources } from "../knowledge-base-local-source-lifecycle";
 import {
@@ -156,7 +140,7 @@ function assertProductionConfiguration() {
     throw new Error("DATABASE_URL is required in production");
   }
   assertCredentialEncryptionConfigured();
-  assertPresalesProxyConfigured();
+  assertPresalesServiceConfigured();
   assertProvisioningConfigured();
   assertDedicatedMonitorCredentialConfigured();
   monitorBaseUrl();
@@ -204,21 +188,7 @@ async function evaluateReleaseReadiness(
 
 async function startServer() {
   let migrationManifest: MigrationManifest | null = null;
-  // Parse this in every environment before opening the listener. A malformed
-  // rollout flag must not silently select either provider writer.
-  const knowledgeBaseManusV2Writer = knowledgeBaseManusV2WriterEnabled();
-  const knowledgeBaseManusV2ActiveMigration =
-    knowledgeBaseManusV2ActiveMigrationEnabled();
   const knowledgeBaseTreePolicyWriter = knowledgeBaseNewBuildPolicyBinding();
-  console.info("[KnowledgeBase] manus_v2_writer", {
-    enabled: knowledgeBaseManusV2Writer,
-    newBuildProviderProtocol: knowledgeBaseManusV2Writer
-      ? "manus_v2"
-      : "legacy_v1",
-  });
-  console.info("[KnowledgeBase] manus_v2_active_migration", {
-    enabled: knowledgeBaseManusV2ActiveMigration,
-  });
   console.info("[KnowledgeBase] tree_policy_writer", {
     enabled: knowledgeBaseTreePolicyWriter.treePolicyVersion === 2,
     treePolicyVersion: knowledgeBaseTreePolicyWriter.treePolicyVersion,
@@ -290,16 +260,12 @@ async function startServer() {
     next();
   });
   // Authenticate private service routes before the global JSON parser.
-  app.use("/api/internal/presales", presalesProxy);
+  app.use("/api/internal/presales/v2", presalesV2Router);
   app.use("/api/internal/provisioning", provisioningRouter);
 
   // JSON/form payloads keep a bounded parser.
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
-  if (process.env.NODE_ENV === "development") {
-    app.use("/api/dev/knowledge-base-live", knowledgeBaseLivePreviewApi);
-  }
 
   app.get("/healthz", (_req, res) => {
     res.status(200).json({
@@ -417,6 +383,13 @@ async function startServer() {
     preparedFileRouter,
   );
   app.use(
+    "/api/frontmind/v2",
+    requireExpressAuth,
+    enforceFrontMindProxyAccess,
+    attachOptionalActiveCredential,
+    frontmindV2ChatRouter,
+  );
+  app.use(
     "/api/frontmind",
     requireExpressAuth,
     enforceFrontMindProxyAccess,
@@ -439,15 +412,16 @@ async function startServer() {
     attachOptionalActiveCredential,
     knowledgeBaseApi,
   );
-  // Per-question response logic workflow powered by a private Skill and Pro.
+  // Per-question response logic workflow; the active credential version
+  // freezes Base/Pro for each operation.
   app.use(
     "/api/response-logic",
     requireExpressAuth,
     attachOptionalActiveCredential,
     responseLogicApi,
   );
-  // Evidence-backed brand question candidates. Capability and quota are
-  // resolved server-side before any Pro task is created.
+  // Evidence-backed brand question candidates. Capability, quota and the
+  // credential-frozen Base/Pro profile are resolved before task creation.
   app.use(
     "/api/brand-question-portfolio",
     requireExpressAuth,
@@ -556,20 +530,7 @@ async function startServer() {
       });
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
-        releaseGeneratedAttachmentInvalidTurns: () =>
-          releaseGeneratedAttachmentInvalidPreproviderTurns(),
-        recoverTerminalAnchorHandoffs: () =>
-          recoverTerminalKnowledgeBaseAnchorHandoffs(),
         recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),
-        ...(knowledgeBaseManusV2ActiveMigration
-          ? {
-              migrateActiveLegacyBuilds: (
-                options: Parameters<
-                  typeof migrateActiveLegacyKnowledgeBaseBuilds
-                >[0],
-              ) => migrateActiveLegacyKnowledgeBaseBuilds(options),
-            }
-          : {}),
         cleanupArtifactCandidates: () =>
           cleanupOrphanedKnowledgeBuildArtifactCandidates(),
       });
@@ -607,9 +568,7 @@ async function startServer() {
             JSON.stringify({
               turns: turnMetrics,
               releasedPreproviderTurns: recovery.releasedPreproviderTurns,
-              terminalAnchors: recovery.terminalAnchors,
               builds: recovery.builds,
-              migrations: recovery.migrations,
               artifacts: recovery.artifacts,
             }),
           );
@@ -619,15 +578,6 @@ async function startServer() {
             runtimeErrorForLog(recoveryResult.reason),
           );
         }
-        await knowledgeBaseMigrationDiagnostics.recordSweep({
-          enabled: knowledgeBaseManusV2ActiveMigration,
-          infrastructureSucceeded: recoveryResult.status === "fulfilled",
-          loadInventory: async () => {
-            const db = await getDb();
-            if (!db) throw new Error("Database is not configured");
-            return inspectKnowledgeBaseMigrationInventory(db);
-          },
-        });
       };
       void runKnowledgeRecovery();
       const knowledgeRecoveryTimer = setInterval(
