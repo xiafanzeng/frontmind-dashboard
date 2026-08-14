@@ -163,6 +163,7 @@ jobs:
     env:
       DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci
       FRONTMIND_KB_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci
+      FRONTMIND_KB_MANUS_V2_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci
       FRONTMIND_AUTH_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci
       FRONTMIND_RELEASE_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci
     steps:

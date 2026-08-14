@@ -193,6 +193,20 @@ describe("release workflow source-ordering contracts", () => {
     expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);
   });
 
+  it("reuses the job-scoped MySQL service for the materialized v2 acceptance", async () => {
+    const workflow = await readFile(dashboardWorkflow, "utf8");
+    const mysqlAcceptance = workflow.slice(
+      workflow.indexOf("  mysql-acceptance:"),
+      workflow.indexOf("  build-sign:"),
+    );
+
+    expect(mysqlAcceptance).toContain(
+      "FRONTMIND_KB_MANUS_V2_MYSQL_ACCEPTANCE_DATABASE_URL: mysql://root:frontmind-ci-root-only@127.0.0.1:3306/frontmind_kb_acceptance_ci",
+    );
+    expect(mysqlAcceptance).toContain("matrix.suite == 'production-e2e'");
+    expect(mysqlAcceptance).toContain("pnpm test:kb:mysql-e2e-acceptance");
+  });
+
   it("builds and signs once before the separately dispatched coupled deployment", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     expect(workflow).not.toContain("DASHBOARD_AUTO_DEPLOY_ENABLED");
