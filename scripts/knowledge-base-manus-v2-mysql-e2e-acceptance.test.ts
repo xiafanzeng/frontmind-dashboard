@@ -37,6 +37,7 @@ import {
 import { createDefaultDashboardPayload } from "../shared/dashboard";
 import { KNOWLEDGE_BASE_COMPLETION_MESSAGE_CONTENT } from "../shared/knowledge-base-message";
 import { knowledgeBaseMarkdownSha256 } from "../server/knowledge-base-package-validation";
+import { KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME } from "../server/knowledge-base-prompt-delivery";
 import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "../server/knowledge-base-tree-policy-rollout";
 
 const dependencies = vi.hoisted(() => ({
@@ -411,7 +412,6 @@ function createFakeManusV2Provider(input: {
     const prompt = messagePrompt(body);
     expect(body.structured_output_schema).toBeUndefined();
     expect(body.locale).toBe("zh-CN");
-    const bundle = await buildSyntheticMaterializedWorkingSet(prompt);
     const attachments = (body.message.content as any[]).filter(
       (part) => part?.type === "file",
     );
@@ -420,6 +420,20 @@ function createFakeManusV2Provider(input: {
       expect(file?.bytes?.length).toBeGreaterThan(0);
       expect(attachment.filename).toBe(file?.filename);
     }
+    const instructionsAttachment = attachments.find(
+      (attachment) =>
+        attachment.filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
+    );
+    expect(instructionsAttachment).toBeDefined();
+    const instructionsFile = uploadedFiles.get(
+      String(instructionsAttachment.file_id),
+    );
+    expect(instructionsFile?.contentType).toContain("text/plain");
+    const instructions = instructionsFile?.bytes?.toString("utf8") || "";
+    expect(prompt).toContain(KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME);
+    expect(prompt).toContain(`SHA-256=${sha256(instructions)}`);
+    expect(prompt).not.toContain("operation=materialize_initial_bundle");
+    const bundle = await buildSyntheticMaterializedWorkingSet(instructions);
     const at = Date.now() + eventSequence * 10;
     taskEvents.set(taskId, [
       {
@@ -831,6 +845,7 @@ mysqlDescribe(
         apiKey: upstreamApiKey,
         fingerprint: credentialFingerprint,
         agentProfile: "frontmind-pro",
+        upstreamModel: "manus-1.6-max" as const,
         status: "active",
         validationStatus: "verified",
         verifiedAt: new Date(),
@@ -999,9 +1014,8 @@ mysqlDescribe(
         accept: (payload) =>
           payload.observation?.interaction?.interactionState ===
             "awaiting_input" &&
-          payload.observation?.progress?.build?.contentVersion === 1 &&
-          payload.observation?.progress?.summary?.total ===
-            MATERIALIZED_LEAF_COUNT &&
+          payload.progress?.build?.contentVersion === 1 &&
+          payload.progress?.summary?.total === MATERIALIZED_LEAF_COUNT &&
           payload.observation?.approvedPresentation?.leafId === "1.1",
       });
       await waitFor({
@@ -1090,6 +1104,7 @@ mysqlDescribe(
       for (let index = 0; index < MATERIALIZED_LEAF_COUNT; index += 1) {
         const leaf = syntheticLeaves[index]!;
         const observation = progress.observation;
+        const observationProgress = observation.interaction.progress;
         expect(observation.approvedPresentation).toMatchObject({
           leafId: leaf.leafId,
           revision: index,
@@ -1101,11 +1116,11 @@ mysqlDescribe(
           expectedGeneration: observation.generation,
           expectedResetRevision: 0,
           expectedStateEpoch: observation.stateEpoch,
-          expectedRevision: observation.progress.build.revision,
+          expectedRevision: observationProgress.build.revision,
           expectedLeafId: leaf.leafId,
           expectedPresentationKey:
             observation.approvedPresentation.presentationKey,
-          expectedContentVersion: observation.progress.build.contentVersion,
+          expectedContentVersion: observationProgress.build.contentVersion,
         });
         expect(confirmation).toMatchObject({
           accepted: true,
@@ -1125,15 +1140,17 @@ mysqlDescribe(
       expect(progress.observation).toMatchObject({
         contentState: "completed",
         packageState: "preparing",
-        progress: {
-          build: {
-            revision: MATERIALIZED_LEAF_COUNT,
-            currentLeafId: null,
-            contentVersion: 1,
-          },
-          summary: {
-            total: MATERIALIZED_LEAF_COUNT,
-            confirmed: MATERIALIZED_LEAF_COUNT,
+        interaction: {
+          progress: {
+            build: {
+              revision: MATERIALIZED_LEAF_COUNT,
+              currentLeafId: null,
+              contentVersion: 1,
+            },
+            summary: {
+              total: MATERIALIZED_LEAF_COUNT,
+              confirmed: MATERIALIZED_LEAF_COUNT,
+            },
           },
         },
       });

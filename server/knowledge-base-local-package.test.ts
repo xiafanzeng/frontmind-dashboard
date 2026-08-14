@@ -229,6 +229,60 @@ describe("Dashboard-owned knowledge package", () => {
     expect(parsed.storedAssetKeys).toEqual(["snapshot-logo.png"]);
   });
 
+  it("keeps an unbound registered asset while enforcing its empty document binding", async () => {
+    const built = await buildDashboardOwnedKnowledgePackage({
+      build,
+      nodes: nodes(),
+    });
+    const zip = await JSZip.loadAsync(built.buffer);
+    const manifestPath = "frontmind_knowledge_base/00_package_manifest.json";
+    const assetPath =
+      "frontmind_knowledge_base/working-set/assets/unbound-brand-reference.png";
+    const asset = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const assetSha256 = await import("node:crypto").then(({ createHash }) =>
+      createHash("sha256").update(asset).digest("hex"),
+    );
+    const manifest = JSON.parse(await zip.file(manifestPath)!.async("string"));
+    manifest.assets.push({
+      id: "unbound-brand-reference",
+      kind: "working_set_asset",
+      path: "working-set/assets/unbound-brand-reference.png",
+      sourcePath: "assets/unbound-brand-reference.png",
+      filename: "unbound-brand-reference.png",
+      mimeType: "image/png",
+      sha256: assetSha256,
+      bytes: asset.length,
+      width: 1,
+      height: 1,
+      provenance: { kind: "brand-reference" },
+      documentIds: [],
+    });
+    manifest.counts.files += 1;
+    zip.file(assetPath, asset);
+    zip.file(manifestPath, JSON.stringify(manifest));
+
+    const parsed = await readDashboardOwnedKnowledgePackage({
+      buffer: await zip.generateAsync({ type: "nodebuffer", platform: "UNIX" }),
+      expected: {
+        buildId: build.id,
+        generation: build.generation,
+        revision: build.revision,
+        companyName: build.companyName,
+      },
+      nodes: nodes(),
+    });
+    expect(parsed.assets).toContainEqual(
+      expect.objectContaining({
+        id: "unbound-brand-reference",
+        sha256: assetSha256,
+        documentIds: [],
+      }),
+    );
+  });
+
   it("rejects a Logo whose declared durable identity does not match its bytes", async () => {
     const logo = Buffer.from("not-the-declared-logo", "utf8");
     await expect(

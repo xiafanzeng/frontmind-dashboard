@@ -810,7 +810,6 @@ export async function readDashboardOwnedKnowledgePackage(input: {
     [...referencedAssets].some((assetId) => !workingSetAssetIds.has(assetId)) ||
     workingSetAssets.some(
       (asset) =>
-        !referencedAssets.has(asset.id) ||
         JSON.stringify([...asset.documentIds].sort()) !==
           JSON.stringify(
             manifest.documents

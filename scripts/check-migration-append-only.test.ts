@@ -56,6 +56,38 @@ describe("append-only expand SQL policy", () => {
     }
   });
 
+  it("allows a unique writer fence only on a nullable column added earlier in the same expand migration", () => {
+    expect(() =>
+      assertExpandSql(
+        "0061_nullable_writer_fence",
+        [
+          "ALTER TABLE `knowledge_base_builds` ADD `canonicalTaskId` varchar(255);",
+          "CREATE UNIQUE INDEX `knowledge_base_builds_canonical_task_idx` ON `knowledge_base_builds` (`canonicalTaskId`);",
+        ].join("--> statement-breakpoint\n"),
+      ),
+    ).not.toThrow();
+
+    for (const sql of [
+      "CREATE UNIQUE INDEX `uq_name` ON `users` (`name`);",
+      [
+        "CREATE UNIQUE INDEX `uq_token` ON `users` (`token`);",
+        "ALTER TABLE `users` ADD `token` varchar(36);",
+      ].join("--> statement-breakpoint\n"),
+      [
+        "ALTER TABLE `users` ADD `token` varchar(36) NOT NULL DEFAULT 'none';",
+        "CREATE UNIQUE INDEX `uq_token` ON `users` (`token`);",
+      ].join("--> statement-breakpoint\n"),
+      [
+        "ALTER TABLE `users` ADD `token` varchar(36);",
+        "CREATE UNIQUE INDEX `uq_token_pair` ON `users` (`token`, `name`);",
+      ].join("--> statement-breakpoint\n"),
+    ]) {
+      expect(() => assertExpandSql("0061_unsafe_unique", sql)).toThrow(
+        "EXPAND_MIGRATION_HAS_CONTRACT_SQL",
+      );
+    }
+  });
+
   it("rejects non-null additions without a compatible literal default", () => {
     for (const sql of [
       "ALTER TABLE `users` ADD `status` varchar(32) NOT NULL;",
