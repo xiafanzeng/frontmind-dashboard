@@ -30,6 +30,7 @@ import {
   stripKnowledgeBaseProtocolPayloads,
   stripKnowledgeBaseReferenceAppendix,
 } from "../shared/knowledge-base-output";
+import { sanitizeFrontMindPublicText } from "../shared/frontmind-public-brand";
 import { AuthServiceError } from "./auth-service";
 import { getDb } from "./db";
 import { markKnowledgeBaseBuildSourceGenerationTerminal } from "./knowledge-base-local-source-lifecycle";
@@ -1663,7 +1664,9 @@ function buildDto(
       currentLeafId: build.currentLeafId,
       logoRequired: logoCanChange && !build.logoSha256,
       logoAvailable: logoCanChange && Boolean(build.logoSha256),
-      protocolError: build.protocolError,
+      protocolError: build.protocolError
+        ? sanitizeFrontMindPublicText(build.protocolError)
+        : null,
       awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime(),
     },
@@ -2400,6 +2403,62 @@ async function readKnowledgeBaseObservationProjection(
   });
 }
 
+export function knowledgeBasePublicTerminalRecovery(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "activeTurnId"
+    | "canonicalTaskState"
+    | "currentLeafId"
+    | "currentPresentationKey"
+    | "generation"
+    | "handoffProvenance"
+    | "revision"
+    | "stateEpoch"
+    | "status"
+  >,
+): {
+  action: "retry_request" | "start_new_generation" | "stopped";
+  recoveryToken: string;
+} | null {
+  if (
+    build.activeTurnId !== null ||
+    build.canonicalTaskState !== "attention_required" ||
+    (build.status !== "protocol_error" && build.status !== "failed") ||
+    !build.handoffProvenance ||
+    typeof build.handoffProvenance !== "object" ||
+    Array.isArray(build.handoffProvenance)
+  ) {
+    return null;
+  }
+  const raw = (build.handoffProvenance as Record<string, unknown>)
+    .terminalRecovery;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const recovery = raw as Record<string, unknown>;
+  const recoveryToken = String(recovery.recoveryStateSha256 || "");
+  const action =
+    recovery.action === "retry_compatible_create"
+      ? "retry_request"
+      : recovery.action === "create_new_canonical_from_snapshot"
+        ? "start_new_generation"
+        : recovery.action === "stopped"
+          ? "stopped"
+          : null;
+  if (
+    recovery.schemaVersion !== 1 ||
+    !action ||
+    !/^[a-f0-9]{64}$/u.test(recoveryToken) ||
+    recovery.sourceGeneration !== build.generation ||
+    recovery.sourceStateEpoch !== build.stateEpoch ||
+    recovery.sourceRevision !== build.revision ||
+    (recovery.sourceLeafId ?? null) !== (build.currentLeafId ?? null) ||
+    (recovery.sourcePresentationKey ?? null) !==
+      (build.currentPresentationKey ?? null)
+  ) {
+    return null;
+  }
+  return { action, recoveryToken };
+}
+
 function projectKnowledgeBaseObservationSnapshot(input: {
   build: KnowledgeBaseBuild;
   progress: KnowledgeBaseProgressDto;
@@ -2763,6 +2822,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   const packageCompatibility =
     knowledgeBasePackageProjectionCompatibility(build);
   const packageDto = packageCompatibility.package;
+  const explicitRecovery = knowledgeBasePublicTerminalRecovery(build);
 
   let notice: KnowledgeBaseNoticeDto | null = null;
   const activeTraceId =
@@ -2779,7 +2839,30 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     typeof activeTurnMetadata.expectedAttachmentCount === "number"
       ? activeTurnMetadata.expectedAttachmentCount
       : 0;
-  if (activeTurnRow?.errorCode === "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING") {
+  if (explicitRecovery) {
+    const stopped = explicitRecovery.action === "stopped";
+    notice = {
+      key: `${build.id}:${build.generation}:${build.stateEpoch}:explicit-recovery`,
+      code: stopped
+        ? "FRONTMIND_KB_STOPPED"
+        : explicitRecovery.action === "start_new_generation"
+          ? "FRONTMIND_KB_NEW_GENERATION_REQUIRED"
+          : "FRONTMIND_KB_RETRY_AVAILABLE",
+      severity: "warning",
+      message: stopped
+        ? "本轮已停止，不会自动重发。已完成内容不受影响。"
+        : "需要你确认后继续。已完成内容不受影响。",
+      retryable: !stopped,
+      failureClass: stopped ? "terminal_nonregenerable" : "requires_user_fix",
+      recoveryAction: explicitRecovery.action,
+      recoveryToken: explicitRecovery.recoveryToken,
+      canRegenerate: false,
+      turnId: null,
+      createdAt: build.updatedAt.getTime(),
+    };
+  } else if (
+    activeTurnRow?.errorCode === "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING"
+  ) {
     notice = {
       key: `${build.id}:${build.generation}:${activeTurnRow.id}:attachments-processing`,
       code: "KNOWLEDGE_BASE_ATTACHMENTS_PROCESSING",

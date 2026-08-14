@@ -21,6 +21,7 @@ import {
   knowledgeBaseAcceptedProviderAttemptMetadata,
   knowledgeBaseOperationalFailureAuthority,
   knowledgeBasePackageProjectionCompatibility,
+  knowledgeBasePublicTerminalRecovery,
   knowledgeBaseProtocolFailureShouldBecomeTerminal,
   knowledgeBaseProtocolErrorAllowsSameTaskRecovery,
   knowledgeBaseProtocolErrorIsRetryable,
@@ -107,6 +108,60 @@ describe("knowledge-base replacement canonical presentation authority", () => {
         8,
       );
     }
+  });
+});
+
+describe("knowledge-base public terminal recovery", () => {
+  const build = (action: string, overrides: Record<string, unknown> = {}) =>
+    ({
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      status: "protocol_error",
+      generation: 3,
+      stateEpoch: 9,
+      revision: 7,
+      currentLeafId: "1.8",
+      currentPresentationKey: "presentation-7",
+      handoffProvenance: {
+        terminalRecovery: {
+          schemaVersion: 1,
+          action,
+          sourceTurnId: "private-source-turn",
+          sourceCredentialIdSha256: "c".repeat(64),
+          sourceGeneration: 3,
+          sourceStateEpoch: 9,
+          sourceRevision: 7,
+          sourceLeafId: "1.8",
+          sourcePresentationKey: "presentation-7",
+          recoveryStateSha256: "a".repeat(64),
+          normalizedAt: "2026-08-14T01:00:00.000Z",
+        },
+      },
+      ...overrides,
+    }) as any;
+
+  it.each([
+    ["retry_compatible_create", "retry_request"],
+    ["create_new_canonical_from_snapshot", "start_new_generation"],
+    ["stopped", "stopped"],
+  ])("maps %s without exposing private coordinates", (internal, action) => {
+    expect(knowledgeBasePublicTerminalRecovery(build(internal))).toEqual({
+      action,
+      recoveryToken: "a".repeat(64),
+    });
+  });
+
+  it("keeps a cleared writer stable and rejects stale recovery state", () => {
+    expect(
+      knowledgeBasePublicTerminalRecovery(
+        build("retry_compatible_create", { stateEpoch: 10 }),
+      ),
+    ).toBeNull();
+    expect(
+      knowledgeBasePublicTerminalRecovery(
+        build("retry_compatible_create", { activeTurnId: "new-turn" }),
+      ),
+    ).toBeNull();
   });
 });
 

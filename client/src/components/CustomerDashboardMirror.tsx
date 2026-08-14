@@ -51,6 +51,7 @@ import type {
 } from "@shared/delivery-ticket";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { keywordCategoryKey } from "@shared/keyword-categories";
+import { sanitizeBrandText } from "@/lib/frontmind-api";
 
 import "@/dashboard/dashboard-styles.css";
 import "./customer-dashboard-mirror.css";
@@ -804,7 +805,12 @@ function KnowledgeActivityPanel({
   error?: string | null;
 }) {
   if (error) {
-    return <MirrorError title="知识库任务记录读取失败" message={error} />;
+    return (
+      <MirrorError
+        title="知识库任务记录读取失败"
+        message={sanitizeBrandText(error)}
+      />
+    );
   }
   if (loading) {
     return (
@@ -830,19 +836,19 @@ function KnowledgeActivityPanel({
               当前知识库构建
             </p>
             <h3 className="mt-1 font-semibold text-[#171321]">
-              {activity.build.companyName}
+              {sanitizeBrandText(activity.build.companyName)}
             </h3>
             <p className="mt-2 break-all font-mono text-xs text-[#9a94a8]">
               {activity.build.conversationId}
             </p>
           </div>
           <span className="w-fit rounded-full bg-[#5b2a86]/10 px-2.5 py-1 text-xs font-semibold text-[#5b2a86]">
-            {activity.build.status}
+            {sanitizeBrandText(activity.build.status)}
           </span>
         </div>
         {activity.build.protocolError && (
           <div className="mt-4 rounded-xl border border-[#ebc8d4] bg-[#fff8fa] p-3 text-sm leading-6 text-[#a02652]">
-            {activity.build.protocolError}
+            本轮已停止，不会自动重发。已完成内容不受影响。
           </div>
         )}
       </div>
@@ -858,10 +864,10 @@ function KnowledgeActivityPanel({
                 >
                   <div className="flex items-center justify-between gap-3">
                     <span className="text-xs font-semibold text-[#484057]">
-                      {turn.model || "模型未记录"}
+                      {sanitizeBrandText(turn.model || "模型未记录")}
                     </span>
                     <span className="text-xs text-[#857e91]">
-                      {turn.status}
+                      {sanitizeBrandText(turn.status)}
                     </span>
                   </div>
                   <p className="mt-2 text-xs text-[#857e91]">
@@ -869,7 +875,7 @@ function KnowledgeActivityPanel({
                   </p>
                   {turn.errorMessage && (
                     <p className="mt-2 text-xs leading-5 text-[#a02652]">
-                      {turn.errorMessage}
+                      本轮已停止。已完成内容不受影响。
                     </p>
                   )}
                 </article>
@@ -907,7 +913,9 @@ function KnowledgeActivityPanel({
                     </span>
                   </div>
                   <div className="text-sm leading-6 text-[#484057]">
-                    <MarkdownRenderer content={message.content} />
+                    <MarkdownRenderer
+                      content={sanitizeBrandText(message.content)}
+                    />
                   </div>
                 </article>
               ))}

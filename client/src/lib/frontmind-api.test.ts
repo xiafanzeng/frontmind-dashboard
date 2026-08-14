@@ -24,6 +24,7 @@ import {
   type ManagedUploadHandle,
   uploadFile,
   uploadFileToUrl,
+  withoutProviderTaskNavigationUrls,
 } from "./frontmind-api";
 
 afterEach(() => {
@@ -34,6 +35,16 @@ afterEach(() => {
 });
 
 describe("sanitizeBrandText", () => {
+  it("covers underscored codes, hyphenated identifiers, paths and domains", () => {
+    const visible = sanitizeBrandText(
+      "MANUS_V2_TASK_ERROR manus-v2 /__manus__/ https://open.manus.ai/task/1",
+    );
+
+    expect(visible).not.toMatch(/manus/iu);
+    expect(visible).toContain("FrontMind");
+    expect(visible).toContain("https://frontmind.net");
+  });
+
   it("rebrands alternate provider copy before it reaches the interface", () => {
     const sourceBrand = ["Jeno", "va"].join("");
     const visible = sanitizeBrandText(
@@ -120,6 +131,26 @@ describe("sanitizeBrandText", () => {
 
     visit(sourceRoot);
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("provider task navigation boundary", () => {
+  it("removes top-level and metadata task/share URLs from client task data", () => {
+    const sanitized = withoutProviderTaskNavigationUrls({
+      id: "task-safe",
+      task_url: "https://provider.example/task/1",
+      shareUrl: "https://provider.example/share/1",
+      metadata: {
+        credit_usage: "3",
+        taskUrl: "https://provider.example/task/1",
+        share_url: "https://provider.example/share/1",
+      },
+    });
+
+    expect(sanitized).toEqual({
+      id: "task-safe",
+      metadata: { credit_usage: "3" },
+    });
   });
 });
 

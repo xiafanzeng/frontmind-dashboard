@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import axios, { type AxiosInstance, type AxiosResponse } from "axios";
 
 import {
+  classifyProviderValidationCoordinate,
+  safeProviderRequestReference,
+} from "./provider-diagnostic-safety";
+import {
   upstreamAliasedIdentity,
   upstreamTaskRecord,
 } from "./upstream-task-adapter";
@@ -142,6 +146,8 @@ export class ManusV2ApiError extends Error {
      * never resent.
      */
     public readonly retryAfterMs: number | null = null,
+    public readonly providerField: string | null = null,
+    public readonly providerPath: string | null = null,
   ) {
     super(`Manus v2 ${operation} failed (${code})`);
     this.name = "ManusV2ApiError";
@@ -172,13 +178,27 @@ function optionalString(value: unknown, maxLength = 2_048) {
 }
 
 function providerRequestId(record: Record<string, unknown>) {
-  try {
-    return optionalString(record.request_id, 512);
-  } catch {
-    // Provider request ids are diagnostic only. A malformed optional field
-    // must never discard an otherwise usable task/file acknowledgement.
-    return null;
+  // Provider request ids are diagnostic only. A malformed optional field
+  // must never discard an otherwise usable task/file acknowledgement.
+  return safeProviderRequestReference(record.request_id);
+}
+
+function providerResponseRequestId(
+  response: AxiosResponse,
+  record: Record<string, unknown> | null,
+) {
+  const bodyRequestId = record ? providerRequestId(record) : null;
+  if (bodyRequestId) return bodyRequestId;
+  const headers = response.headers as
+    | { get?: (name: string) => unknown; [key: string]: unknown }
+    | undefined;
+  for (const name of ["x-request-id", "request-id", "x-correlation-id"]) {
+    const raw = headers?.get?.(name) ?? headers?.[name];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    const requestId = safeProviderRequestReference(value);
+    if (requestId) return requestId;
   }
+  return null;
 }
 
 function acknowledgedSideEffectTaskId(
@@ -211,6 +231,21 @@ function providerErrorCode(record: Record<string, unknown>, status: number) {
   const error = upstreamTaskRecord(record.error);
   const value = optionalString(error?.code ?? record.code, 128);
   return value || `HTTP_${status}`;
+}
+
+function providerValidationCoordinates(record: Record<string, unknown>) {
+  const error = upstreamTaskRecord(record.error);
+  const firstDetail = Array.isArray(error?.details)
+    ? upstreamTaskRecord(error.details[0])
+    : null;
+  return {
+    field: classifyProviderValidationCoordinate(
+      error?.field ?? firstDetail?.field,
+    ),
+    path: classifyProviderValidationCoordinate(
+      error?.path ?? firstDetail?.path,
+    ),
+  };
 }
 
 function retryableStatus(status: number) {
@@ -263,6 +298,9 @@ function assertOk(
   const record = upstreamTaskRecord(response.data);
   if (response.status < 200 || response.status >= 300) {
     const explicitRejection = record?.ok === false;
+    const coordinates = record
+      ? providerValidationCoordinates(record)
+      : { field: null, path: null };
     throw new ManusV2ApiError(
       operation,
       response.status,
@@ -271,8 +309,10 @@ function assertOk(
         : `HTTP_${response.status}`,
       explicitRejection && retryableStatus(response.status),
       sideEffect && !explicitRejection,
-      record ? providerRequestId(record) : null,
+      providerResponseRequestId(response, record),
       explicitRejection ? retryAfterMs(response) : null,
+      coordinates.field,
+      coordinates.path,
     );
   }
   // Once a side-effect endpoint returned 2xx, an empty/non-object body or a
@@ -286,7 +326,7 @@ function assertOk(
       "INVALID_RESPONSE",
       false,
       sideEffect,
-      record ? providerRequestId(record) : null,
+      providerResponseRequestId(response, record),
     );
   }
   return record;
@@ -369,6 +409,72 @@ export function buildManusV2MessageContent(
     content.push(attachment);
   }
   return content;
+}
+
+export type ManusV2CreateTaskInput = {
+  prompt: string;
+  attachments?: ReadonlyArray<ManusV2Attachment>;
+  title?: string;
+  agentProfile?: string;
+  structuredOutputSchema?: ManusV2StructuredOutputSchema;
+  taskReferences?: string[];
+  hideInTaskList?: boolean;
+};
+
+export function buildManusV2CreateTaskBody(input: ManusV2CreateTaskInput) {
+  return {
+    message: {
+      content: buildManusV2MessageContent(
+        input.prompt,
+        input.attachments ?? [],
+      ),
+      ...(input.taskReferences?.length
+        ? { task_references: input.taskReferences }
+        : {}),
+    },
+    ...(input.title
+      ? { title: requiredString(input.title, "title", 255) }
+      : {}),
+    interactive_mode: false,
+    hide_in_task_list: input.hideInTaskList ?? true,
+    share_visibility: "private",
+    ...(input.agentProfile
+      ? {
+          agent_profile: requiredString(
+            input.agentProfile,
+            "agentProfile",
+            64,
+          ),
+        }
+      : {}),
+    ...(input.structuredOutputSchema
+      ? { structured_output_schema: input.structuredOutputSchema }
+      : {}),
+  };
+}
+
+export type ManusV2SendMessageInput = {
+  taskId: string;
+  prompt: string;
+  attachments?: ReadonlyArray<ManusV2Attachment>;
+  structuredOutputSchema?: ManusV2StructuredOutputSchema;
+};
+
+export function buildManusV2SendMessageBody(
+  input: ManusV2SendMessageInput,
+) {
+  return {
+    task_id: requiredString(input.taskId, "taskId", 255),
+    message: {
+      content: buildManusV2MessageContent(
+        input.prompt,
+        input.attachments ?? [],
+      ),
+    },
+    ...(input.structuredOutputSchema
+      ? { structured_output_schema: input.structuredOutputSchema }
+      : {}),
+  };
 }
 
 function normalizeEvent(value: unknown): ManusV2MessageEvent | null {
@@ -582,7 +688,7 @@ export function appendManusV2KnowledgeBaseOperationContract(
   return [
     requiredString(prompt, "prompt", 2_000_000),
     "",
-    "# FrontMind Manus v2 operation contract",
+    "# FrontMind operation contract",
     `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify(contract)}`,
     input.requiresManifest
       ? "Put only the customer-facing first-node body in visibleMarkdown. Put the initial manifest object (leaves and researchCoverage, plus optional officialLogo) as JSON text in manifestJson. Dashboard owns and synthesizes all machine envelopes. nextLeafId must be the first manifest leaf id."
@@ -892,42 +998,8 @@ export class ManusV2Client {
     }
   }
 
-  async createTask(input: {
-    prompt: string;
-    attachments?: ReadonlyArray<ManusV2Attachment>;
-    title: string;
-    agentProfile?: string;
-    structuredOutputSchema?: ManusV2StructuredOutputSchema;
-    taskReferences?: string[];
-    hideInTaskList?: boolean;
-  }) {
-    const body = {
-      message: {
-        content: buildManusV2MessageContent(
-          input.prompt,
-          input.attachments ?? [],
-        ),
-        ...(input.taskReferences?.length
-          ? { task_references: input.taskReferences }
-          : {}),
-      },
-      title: requiredString(input.title, "title", 255),
-      interactive_mode: false,
-      hide_in_task_list: input.hideInTaskList ?? true,
-      share_visibility: "private",
-      ...(input.agentProfile
-        ? {
-            agent_profile: requiredString(
-              input.agentProfile,
-              "agentProfile",
-              64,
-            ),
-          }
-        : {}),
-      ...(input.structuredOutputSchema
-        ? { structured_output_schema: input.structuredOutputSchema }
-        : {}),
-    };
+  async createTask(input: ManusV2CreateTaskInput) {
+    const body = buildManusV2CreateTaskBody(input);
     const result = await this.request(
       "task.create",
       () =>
@@ -946,25 +1018,9 @@ export class ManusV2Client {
     };
   }
 
-  async sendMessage(input: {
-    taskId: string;
-    prompt: string;
-    attachments?: ReadonlyArray<ManusV2Attachment>;
-    structuredOutputSchema?: ManusV2StructuredOutputSchema;
-  }) {
-    const taskId = requiredString(input.taskId, "taskId", 255);
-    const body = {
-      task_id: taskId,
-      message: {
-        content: buildManusV2MessageContent(
-          input.prompt,
-          input.attachments ?? [],
-        ),
-      },
-      ...(input.structuredOutputSchema
-        ? { structured_output_schema: input.structuredOutputSchema }
-        : {}),
-    };
+  async sendMessage(input: ManusV2SendMessageInput) {
+    const body = buildManusV2SendMessageBody(input);
+    const taskId = body.task_id;
     const result = await this.request(
       "task.sendMessage",
       () =>

@@ -284,7 +284,7 @@ const publicOpinionSubpages = [
     id: "brand-tracking",
     section: "public-opinion",
     label: "品牌追踪智能体",
-    desc: "通过 Jenova Brand Tracker 追踪品牌评价、舆情趋势与潜在风险。",
+    desc: "通过 FrontMind 品牌追踪智能体追踪品牌评价、舆情趋势与潜在风险。",
   },
 ];
 

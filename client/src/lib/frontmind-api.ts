@@ -16,6 +16,7 @@
 import type { ResponseLogicDraft } from "@shared/response-logic";
 import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progress";
 import { stripKnowledgeBaseProtocolPayloads } from "@shared/knowledge-base-output";
+import { sanitizeFrontMindPublicText } from "@shared/frontmind-public-brand";
 import { userFacingErrorMessage } from "@/lib/user-facing-error";
 import { assertChatAttachmentSizes } from "@/lib/attachment-files";
 import {
@@ -110,23 +111,9 @@ export function sanitizeBrandText(text: string): string {
   }
 
   try {
-    const sourceBrands = [["ma", "nus"].join(""), ["jeno", "va"].join("")];
-    return sourceBrands.reduce((visibleText, source) => {
-      return visibleText
-        .replace(
-          new RegExp(`https?:\\/\\/api\\.${source}\\.`, "gi"),
-          "https://api.frontmind.",
-        )
-        .replace(
-          new RegExp(`https?:\\/\\/www\\.${source}\\.`, "gi"),
-          "https://www.frontmind.",
-        )
-        .replace(
-          new RegExp(`https?:\\/\\/${source}\\.`, "gi"),
-          "https://frontmind.",
-        )
-        .replace(new RegExp(`\\b${source}\\b`, "gi"), "FrontMind");
-    }, stripKnowledgeBaseProtocolPayloads(text));
+    return sanitizeFrontMindPublicText(
+      stripKnowledgeBaseProtocolPayloads(text),
+    );
   } catch (e) {
     console.error("[sanitizeBrandText] Error:", e);
     return text;
@@ -191,8 +178,6 @@ export interface TaskResponse {
   created_at?: string;
   metadata?: {
     credit_usage?: string;
-    task_url?: string;
-    share_url?: string;
     task_title?: string;
     [key: string]: unknown;
   };
@@ -205,6 +190,35 @@ export interface TaskResponse {
   knowledgeObservation?: KnowledgeBaseObservationDto;
   /** Existing operation adopted after a tab remounted with a new request id. */
   adoptedClientRequestId?: string;
+}
+
+/** Defense in depth for dedicated routes during a mixed-version rollout. */
+export function withoutProviderTaskNavigationUrls<T>(value: T): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const source = value as Record<string, unknown>;
+  const {
+    task_url: _taskUrl,
+    taskUrl: _taskUrlCamel,
+    share_url: _shareUrl,
+    shareUrl: _shareUrlCamel,
+    metadata: rawMetadata,
+    ...rest
+  } = source;
+  if (
+    !rawMetadata ||
+    typeof rawMetadata !== "object" ||
+    Array.isArray(rawMetadata)
+  ) {
+    return rest as T;
+  }
+  const {
+    task_url: _metadataTaskUrl,
+    taskUrl: _metadataTaskUrlCamel,
+    share_url: _metadataShareUrl,
+    shareUrl: _metadataShareUrlCamel,
+    ...metadata
+  } = rawMetadata as Record<string, unknown>;
+  return { ...rest, metadata } as T;
 }
 
 export interface ResponseLogicTaskContext {
@@ -685,7 +699,7 @@ export async function createTask(
     },
     CREATE_TASK_TIMEOUT_MS,
   );
-  const data = await response.json();
+  const data = withoutProviderTaskNavigationUrls(await response.json());
 
   // Normalize the response format
   // The native /v1/tasks API may return different field names
@@ -700,9 +714,7 @@ export async function createTask(
       model: data.model,
       metadata: {
         credit_usage: data.credit_usage || data.metadata?.credit_usage,
-        task_url: data.task_url || data.metadata?.task_url,
         task_title: data.task_title || data.metadata?.task_title,
-        share_url: data.share_url || data.metadata?.share_url,
       },
       output: data.output || [],
     } as TaskResponse;
@@ -764,7 +776,7 @@ export async function createResponseLogicTask(
       );
     }
     const payload = await response.json();
-    const data = payload?.task || payload;
+    const data = withoutProviderTaskNavigationUrls(payload?.task || payload);
     const taskId = data?.id || data?.task_id;
     if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
     return {
@@ -773,7 +785,6 @@ export async function createResponseLogicTask(
       status: data.status === "failed" ? "error" : data.status || "running",
       metadata: {
         ...(data.metadata || {}),
-        task_url: data.task_url || data.metadata?.task_url,
         task_title: data.task_title || data.metadata?.task_title,
       },
       output: data.output || [],
@@ -887,7 +898,23 @@ export async function cancelKnowledgeBaseStartReservation(input: {
       `取消本批次失败（${response.status}）`,
     );
   }
-  return (await response.json()) as { cancelled: true };
+  const payload = (await response.json()) as {
+    cancelled?: unknown;
+    resetRevision?: unknown;
+    idempotent?: unknown;
+  };
+  if (
+    payload.cancelled !== true ||
+    !Number.isSafeInteger(payload.resetRevision) ||
+    Number(payload.resetRevision) < 0
+  ) {
+    throw new Error("取消本批次失败：服务端未返回新的知识库版本");
+  }
+  return {
+    cancelled: true as const,
+    resetRevision: Number(payload.resetRevision),
+    idempotent: payload.idempotent === true,
+  };
 }
 
 function isTransientKnowledgeBaseRequestError(error: unknown) {
@@ -1201,7 +1228,7 @@ export async function createKnowledgeBaseTurnTask(
       }
 
       const payload = await response.json();
-      const data = payload?.task || payload;
+      const data = withoutProviderTaskNavigationUrls(payload?.task || payload);
       const observation = payload?.observation
         ? knowledgeBaseObservationFromPayload(payload)
         : undefined;
@@ -1217,7 +1244,6 @@ export async function createKnowledgeBaseTurnTask(
         status: data.status === "failed" ? "error" : data.status || "running",
         metadata: {
           ...(data.metadata || {}),
-          task_url: data.taskUrl || data.task_url || data.metadata?.task_url,
           task_title:
             data.title || data.task_title || data.metadata?.task_title,
         },

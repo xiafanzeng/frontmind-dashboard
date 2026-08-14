@@ -65,6 +65,7 @@ import manusProxy, {
   publicUpstreamTaskPayload,
   readBoundedExternalDownload,
   runManagedUploadOperation,
+  sanitizeFileBuffer,
   uploadCapturedStage,
 } from "./manus-proxy";
 import {
@@ -394,6 +395,7 @@ describe("stage-first intent capability cache policy", () => {
               conversationId,
               turnId,
               clientRequestId,
+              expectedResetRevision: 9,
             };
             for (const item of attachmentManifest) {
               const created = await fetch(`${baseUrl}/v1/managed-uploads`, {
@@ -609,6 +611,7 @@ describe("stage-first intent capability cache policy", () => {
         conversationId,
         turnId,
         clientRequestId,
+        expectedResetRevision: 9,
       },
     };
     const attacks: Array<[string, Record<string, unknown>]> = [
@@ -750,6 +753,40 @@ describe("publicUpstreamPayload", () => {
     expect(serialized.toLowerCase()).not.toContain("api_key");
   });
 
+  it("sanitizes underscored codes and long text without a fail-open bypass", () => {
+    const sourceBrand = ["MA", "NUS"].join("");
+    const result = publicUpstreamPayload(
+      {
+        code: `${sourceBrand}_V2_TASK_ERROR`,
+        message: `${"x".repeat(100_001)} ${sourceBrand}-v2 rejected`,
+      },
+      "current-api-key",
+    );
+    expect(JSON.stringify(result)).not.toMatch(new RegExp(sourceBrand, "iu"));
+  });
+
+  it("drops public URL capabilities and provider-branded keys recursively", () => {
+    const sourceBrand = ["ma", "nus"].join("");
+    const result = publicUpstreamPayload(
+      {
+        src: `https://open.${sourceBrand}.ai/task/1`,
+        href: `https://${sourceBrand}.im/task/1`,
+        download_url: `https://${sourceBrand}.im/download/1`,
+        upload_url: `https://${sourceBrand}.im/upload/1`,
+        [`${sourceBrand}_request_id`]: "private-request-id",
+        [`${sourceBrand}.request`]: "private-dotted-key",
+        [`prefix ${sourceBrand} label`]: "private-spaced-key",
+        nested: {
+          imageUrl: "https://provider.example/image/1",
+          [`${sourceBrand}Status`]: "private-camel-key",
+        },
+      },
+      "current-api-key",
+    );
+    expect(result).toEqual({ nested: {} });
+    expect(JSON.stringify(result)).not.toMatch(new RegExp(sourceBrand, "iu"));
+  });
+
   it("preserves every SigV4 query parameter only for a scoped file payload", () => {
     const signedUrl =
       "https://uploads.example.test/object.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAEXAMPLE%2F20260730%2Fcn-north-1%2Fs3%2Faws4_request&X-Amz-Date=20260730T010203Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abcdef0123456789";
@@ -769,6 +806,130 @@ describe("publicUpstreamPayload", () => {
     expect(isPublicFilePayloadRequest("GET", "/v1/files/file-safe")).toBe(true);
     expect(isPublicFilePayloadRequest("GET", "/v1/files")).toBe(false);
   });
+
+  it("never restores a provider-branded upload capability", () => {
+    const sourceBrand = ["ma", "nus"].join("");
+    const result = publicUpstreamFilePayload(
+      {
+        id: "file-safe",
+        filename: "Logo.png",
+        upload_url: `https://uploads.${sourceBrand}.ai/private`,
+      },
+      "current-api-key",
+    ) as Record<string, unknown>;
+    expect(result).not.toHaveProperty("upload_url");
+    expect(JSON.stringify(result)).not.toMatch(new RegExp(sourceBrand, "iu"));
+  });
+
+  it("checks the canonical upload host before restoring an encoded capability", () => {
+    const result = publicUpstreamFilePayload(
+      {
+        id: "file-safe",
+        upload_url: "https://uploads.ma%6Eus.ai/private",
+      },
+      "current-api-key",
+    ) as Record<string, unknown>;
+    expect(result).not.toHaveProperty("upload_url");
+  });
+
+  it("never restores an upload capability containing the active credential", () => {
+    const credential = "api-secret-do-not-expose";
+    const result = publicUpstreamFilePayload(
+      {
+        id: "file-safe",
+        upload_url: `https://uploads.example.test/private?token=${encodeURIComponent(credential)}`,
+      },
+      credential,
+    ) as Record<string, unknown>;
+    expect(result).not.toHaveProperty("upload_url");
+    expect(JSON.stringify(result)).not.toContain(credential);
+  });
+
+  it("never restores a non-TLS upload capability", () => {
+    const result = publicUpstreamFilePayload(
+      {
+        id: "file-safe",
+        filename: "Logo.png",
+        upload_url: "http://uploads.example.test/private",
+      },
+      "current-api-key",
+    ) as Record<string, unknown>;
+    expect(result).not.toHaveProperty("upload_url");
+  });
+
+  it("fails closed for arbitrary ZIP archives with uninspected text entries", async () => {
+    const sourceBrand = ["Ma", "nus"].join("");
+    const JSZip = (await import("jszip")).default;
+    const zip = new JSZip();
+    zip.file("SKILL.md", `# ${sourceBrand} internal package`);
+    const archive = await zip.generateAsync({ type: "nodebuffer" });
+
+    await expect(
+      sanitizeFileBuffer(archive, "package.zip", "application/zip"),
+    ).rejects.toMatchObject({ code: "PUBLIC_FILE_UNAVAILABLE" });
+  });
+
+  it("fails closed for an explicit ZIP with a self-extracting preamble", async () => {
+    const sourceBrand = ["Ma", "nus"].join("");
+    const JSZip = (await import("jszip")).default;
+    const zip = new JSZip();
+    zip.file("SKILL.md", `# ${sourceBrand} internal payload`);
+    const archive = await zip.generateAsync({ type: "nodebuffer" });
+    const selfExtractingArchive = Buffer.concat([
+      Buffer.from("MZstub", "ascii"),
+      archive,
+    ]);
+
+    await expect(
+      sanitizeFileBuffer(
+        selfExtractingArchive,
+        "package.zip",
+        "application/zip",
+      ),
+    ).rejects.toMatchObject({ code: "PUBLIC_FILE_UNAVAILABLE" });
+  });
+
+  it.each(["utf16le", "utf16be"] as const)(
+    "sanitizes provider branding in %s Office XML without changing its encoding",
+    async (encoding) => {
+      const sourceBrand = ["Ma", "nus"].join("");
+      const JSZip = (await import("jszip")).default;
+      const zip = new JSZip();
+      const xml = `<?xml version="1.0" encoding="UTF-16"?><Types>${sourceBrand} internal</Types>`;
+      const littleEndian = Buffer.from(xml, "utf16le");
+      const encoded =
+        encoding === "utf16le"
+          ? Buffer.concat([Buffer.from([0xff, 0xfe]), littleEndian])
+          : Buffer.concat([
+              Buffer.from([0xfe, 0xff]),
+              Buffer.from(littleEndian).swap16(),
+            ]);
+      zip.file("[Content_Types].xml", encoded);
+      const archive = await zip.generateAsync({ type: "nodebuffer" });
+
+      const result = await sanitizeFileBuffer(
+        archive,
+        "report.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      );
+      expect(result.wasSanitized).toBe(true);
+
+      const output = await JSZip.loadAsync(result.buffer);
+      const outputBytes = await output
+        .file("[Content_Types].xml")!
+        .async("nodebuffer");
+      expect(Array.from(outputBytes.subarray(0, 2))).toEqual(
+        encoding === "utf16le" ? [0xff, 0xfe] : [0xfe, 0xff],
+      );
+      const payload = outputBytes.subarray(2);
+      const outputText =
+        encoding === "utf16le"
+          ? payload.toString("utf16le")
+          : Buffer.from(payload).swap16().toString("utf16le");
+      expect(outputText).toContain("FrontMind internal");
+      expect(outputText).not.toMatch(new RegExp(sourceBrand, "iu"));
+    },
+  );
 });
 
 describe("proxy upload", () => {
@@ -2426,6 +2587,38 @@ describe("owned file content download", () => {
 });
 
 describe("public task payload boundary", () => {
+  it("drops provider navigation URLs from generic proxy objects recursively", () => {
+    const firstPrivateCode = ["MAN", "US_V2_TASK_REJECTED"].join("");
+    const secondPrivateCode = ["JENO", "VA_UPSTREAM_FAILED"].join("");
+    expect(
+      publicUpstreamPayload(
+        {
+          id: "safe",
+          url: "https://provider.example/task/1",
+          task_url: "https://example.test/task/1",
+          metadata: {
+            shareUrl: "https://example.test/share/1",
+            file_url: "https://provider.example/file/1",
+            nested: {
+              imageUrl: "https://provider.example/image/1",
+              code: firstPrivateCode,
+              safeCode: "RATE_LIMITED",
+              alternateProviderCode: secondPrivateCode,
+            },
+            title: "safe title",
+          },
+        },
+        "credential",
+      ),
+    ).toEqual({
+      id: "safe",
+      metadata: {
+        nested: { safeCode: "RATE_LIMITED" },
+        title: "safe title",
+      },
+    });
+  });
+
   it.each([
     ["GET", "/v1/tasks/task-1"],
     ["HEAD", "/v1/tasks/task-1?include=output"],
@@ -2454,6 +2647,8 @@ describe("public task payload boundary", () => {
         task_id: "task-safe",
         status: "running",
         model: "FrontMind-Pro",
+        task_url: "https://example.test/top-level-task-safe",
+        share_url: "https://example.test/top-level-share-safe",
         prompt: privateSentinel,
         input: { text: privateSentinel },
         system: privateSentinel,
@@ -2462,6 +2657,7 @@ describe("public task payload boundary", () => {
         metadata: {
           credit_usage: "12",
           task_url: "https://example.test/task-safe",
+          share_url: "https://example.test/share-safe",
           prompt: privateSentinel,
           nested: { instructions: privateSentinel },
           privateKnowledge: privateSentinel,
@@ -2503,6 +2699,14 @@ describe("public task payload boundary", () => {
             },
           },
           {
+            id: "file-safe",
+            type: "output_file",
+            file_id: "file-safe",
+            filename: "safe.pdf",
+            file_url: "https://provider.example/files/file-safe",
+            image_url: "https://provider.example/images/file-safe",
+          },
+          {
             id: "input-secret",
             type: "message",
             role: "user",
@@ -2537,7 +2741,6 @@ describe("public task payload boundary", () => {
       model: "FrontMind-Pro",
       metadata: {
         credit_usage: "12",
-        task_url: "https://example.test/task-safe",
       },
       output: [
         {
@@ -2556,10 +2759,13 @@ describe("public task payload boundary", () => {
           id: "call-safe",
           type: "function_call",
           name: "public_tool",
-          action: {
-            type: "navigate",
-            url: "https://example.test/",
-          },
+          action: { type: "navigate" },
+        },
+        {
+          id: "file-safe",
+          type: "output_file",
+          file_id: "file-safe",
+          filename: "safe.pdf",
         },
       ],
       usage: {
@@ -2576,6 +2782,8 @@ describe("public task payload boundary", () => {
     expect(serialized).not.toContain('"prompt"');
     expect(serialized).not.toContain('"input"');
     expect(serialized).not.toContain('"system"');
+    expect(serialized).not.toContain("task_url");
+    expect(serialized).not.toContain("share_url");
     expect(serialized).not.toContain('"instructions"');
     expect(serialized).not.toContain('"knowledge_base"');
   });
@@ -2719,6 +2927,39 @@ describe("public task payload boundary", () => {
 });
 
 describe("external download size boundary", () => {
+  it("returns a neutral 409 instead of serving an arbitrary ZIP package", async () => {
+    const sourceBrand = ["Ma", "nus"].join("");
+    const JSZip = (await import("jszip")).default;
+    const zip = new JSZip();
+    zip.file("SKILL.md", `# ${sourceBrand} internal package`);
+    const archive = await zip.generateAsync({ type: "nodebuffer" });
+    vi.spyOn(axios, "get").mockResolvedValueOnce({
+      status: 200,
+      headers: {
+        "content-type": "application/zip",
+        "content-length": String(archive.length),
+      },
+      data: Readable.from([archive]),
+    } as any);
+
+    await withManusProxyServer(async (baseUrl) => {
+      const target = "https://files.example.test/package.zip";
+      const response = await fetch(
+        `${baseUrl}/proxy-download?url=${encodeURIComponent(target)}`,
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(409);
+      expect(body).toEqual({
+        error: {
+          message: "该文件暂时无法提供安全下载，请联系支持处理",
+          code: "PUBLIC_FILE_UNAVAILABLE",
+        },
+      });
+      expect(JSON.stringify(body)).not.toMatch(new RegExp(sourceBrand, "iu"));
+    });
+  });
+
   it("rejects an oversized declared Content-Length with 413 before reading", async () => {
     const credentialSentinel = "SIGNED-CREDENTIAL-MUST-NOT-LEAK";
     const source = Readable.from([Buffer.from("must not be consumed")]);

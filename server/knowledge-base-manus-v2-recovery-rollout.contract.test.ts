@@ -219,4 +219,106 @@ describe("knowledge-base Manus v2 recovery rollout wiring", () => {
     expect(branch).not.toContain("createTask(");
     expect(branch).not.toContain("dispatchKnowledgeBaseRecoveryClaim(");
   });
+
+  it("keeps browser reconcile provider-write-free", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const start = source.indexOf('router.post("/progress/reconcile"');
+    const end = source.indexOf("export default router", start);
+    const route = source.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(route).toContain("normalizeKnowledgeBaseTerminalRejection({");
+    expect(route).not.toContain("resumeKnowledgeBaseTurnAfterUserFix({");
+    expect(route).not.toContain("launchAcceptedKnowledgeBaseClaim({");
+    expect(route).not.toContain("createTask({");
+    expect(route).not.toContain("sendMessage({");
+  });
+
+  it("coalesces explicit recovery before reserving a provider operation", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const start = source.indexOf('router.post("/recovery/execute"');
+    const end = source.indexOf(
+      'router.post("/canonical/recover-from-snapshot"',
+      start,
+    );
+    const route = source.slice(start, end);
+    const replay = route.indexOf("findKnowledgeBaseExplicitRecoveryReplay({");
+    const compatible = route.indexOf(
+      "reserveKnowledgeBaseCompatibleCreateRecovery({",
+    );
+    const generation = route.indexOf(
+      "reserveKnowledgeBaseManusV2AnchorHandoff({",
+    );
+
+    expect(start).toBeGreaterThan(-1);
+    expect(replay).toBeGreaterThan(-1);
+    expect(compatible).toBeGreaterThan(replay);
+    expect(generation).toBeGreaterThan(replay);
+    const concurrentReplay = route.indexOf(
+      "findKnowledgeBaseExplicitRecoveryReplay({",
+      generation,
+    );
+    expect(concurrentReplay).toBeGreaterThan(generation);
+    expect(route.slice(concurrentReplay)).toContain(
+      'disposition: "already_applied"',
+    );
+    expect(route).toContain(
+      'decision.recovery.action === "retry_compatible_create"',
+    );
+  });
+
+  it("does not require a migration snapshot for the one compatible create", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const dispatchStart = source.indexOf(
+      "async function dispatchKnowledgeBaseRecoveryClaim(",
+    );
+    const migrationTypes = source.indexOf(
+      "type KnowledgeBaseActiveLegacyMigrationCandidate",
+      dispatchStart,
+    );
+    const dispatch = source.slice(dispatchStart, migrationTypes);
+    const unboundSnapshotBranch = dispatch.indexOf(
+      "existingBuild?.providerProtocol === \"manus_v2\"",
+    );
+
+    expect(unboundSnapshotBranch).toBeGreaterThan(-1);
+    expect(dispatch.slice(unboundSnapshotBranch, unboundSnapshotBranch + 700)).toContain(
+      'claim.recoveryMetadata.compatibilityMode !== "minimal_v2_create"',
+    );
+  });
+
+  it("keeps title in the compatible create while omitting only optional request fields", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const dispatchStart = source.indexOf(
+      "async function dispatchKnowledgeBaseRecoveryClaim(",
+    );
+    const migrationTypes = source.indexOf(
+      "type KnowledgeBaseActiveLegacyMigrationCandidate",
+      dispatchStart,
+    );
+    const dispatch = source.slice(dispatchStart, migrationTypes);
+    const createStart = dispatch.indexOf("const created = await client.createTask({");
+    const createEnd = dispatch.indexOf("});", createStart);
+    const createRequest = dispatch.slice(createStart, createEnd);
+
+    expect(createStart).toBeGreaterThan(-1);
+    expect(createRequest).toContain("title: authority.title");
+    expect(createRequest).toContain("minimalCompatibleCreate");
+    expect(createRequest).toContain("agentProfile");
+    expect(createRequest).toContain("structuredOutputSchema");
+    expect(dispatch).toContain("titleUtf8Bytes");
+    expect(dispatch).toContain("structuredOutputSchemaSha256");
+  });
 });

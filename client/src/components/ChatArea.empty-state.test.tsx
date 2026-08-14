@@ -20,6 +20,11 @@ import {
   type KnowledgeBaseStarterStartOutcome,
 } from "./ChatArea";
 import * as frontmindApi from "@/lib/frontmind-api";
+import {
+  normalizedKnowledgeBaseUploadFilename,
+  normalizedKnowledgeBaseUploadMimeType,
+  sha256UploadFile,
+} from "@/lib/attachment-files";
 
 function sizedFile(name: string, size: number) {
   return new File([new Uint8Array(size)], name, {
@@ -130,6 +135,97 @@ describe("EmptyConversationHint", () => {
     expect(toast.error).toHaveBeenCalledWith("文件过大", {
       description: "文件“oversized.pdf”不能超过 100 MB",
     });
+  });
+
+  it("retries one incomplete browser body on the same frozen intent only", async () => {
+    const file = sizedFile("完整性重试.pdf", 32);
+    const handle: frontmindApi.ManagedUploadHandle = {
+      itemId: "item-body-retry",
+      intentId: "intent-body-retry",
+      filename: file.name,
+      ticket: "mi1.body-retry.signature",
+      expiresAt: Date.now() + 60_000,
+    };
+    const uploadImplementation = vi.fn(
+      async (
+        receivedFile: File,
+        _progress?: unknown,
+        _retry?: unknown,
+        options?: frontmindApi.UploadFileOptions,
+      ) => {
+        if (uploadImplementation.mock.calls.length === 1) {
+          await options?.onFileRecord?.({
+            itemId: handle.itemId,
+            intentId: handle.intentId,
+            filename: file.name,
+            uploadHandle: handle,
+            reusedExistingFileId: false,
+          });
+          throw new frontmindApi.FileUploadError("文件体未完整接收", {
+            code: "UPLOAD_BROWSER_BODY_INCOMPLETE",
+            retryable: true,
+            recoveryAction: "retry_same_file",
+          });
+        }
+        expect(receivedFile).toBe(file);
+        expect(options?.existingUploadHandle).toBe(handle);
+        expect(options?.resumeScope?.expectedResetRevision).toBe(4);
+        return {
+          fileId: "file-body-retry",
+          filename: file.name,
+          uploadedAt: 10_000,
+          providerReadyAt: 11_000,
+          expiresAt: 20_000,
+        };
+      },
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+    const itemId = "item-body-retry";
+    const lifecycle = starterLifecycle({
+      expectedResetRevision: 4,
+      fileItemIds: [itemId],
+      reservation: {
+        conversationId: "conversation-body-retry",
+        turnId: "11111111-1111-4111-8111-111111111111",
+        clientRequestId: "request-body-retry",
+        expectedResetRevision: 4,
+      },
+      attachmentManifest: [
+        {
+          itemId,
+          ordinal: 1,
+          total: 1,
+          filename: normalizedKnowledgeBaseUploadFilename(file.name),
+          sizeBytes: file.size,
+          mimeType: normalizedKnowledgeBaseUploadMimeType(file),
+          lastModified: file.lastModified,
+          sha256: await sha256UploadFile(file),
+        },
+      ],
+    });
+
+    await expect(
+      uploadKnowledgeBaseStarterFiles(
+        [file],
+        lifecycle,
+        1_000,
+        uploadImplementation as unknown as typeof frontmindApi.uploadFile,
+      ),
+    ).resolves.toMatchObject({
+      uploadedAttachments: [
+        { file_id: "file-body-retry", filename: file.name },
+      ],
+    });
+    expect(uploadImplementation).toHaveBeenCalledTimes(2);
   });
 
   it("keeps three completed files when the fourth fails, then retries only the fourth and fifth in original order", async () => {
@@ -1027,15 +1123,21 @@ describe("EmptyConversationHint", () => {
     };
     const cancelSpy = vi
       .spyOn(frontmindApi, "cancelKnowledgeBaseStartReservation")
-      .mockResolvedValue({ cancelled: true });
+      .mockResolvedValue({
+        cancelled: true,
+        resetRevision: 5,
+        idempotent: false,
+      });
     const onStartKnowledgeBase = vi.fn(async (_input, lifecycle) => {
       lifecycle.onReservation?.(reservation);
       throw new Error("第二个文件尚未传入 Dashboard");
     });
+    const onBatchCancelled = vi.fn();
 
     render(
       <EmptyConversationHint
         onStartKnowledgeBase={onStartKnowledgeBase}
+        onBatchCancelled={onBatchCancelled}
         companyName="验收企业"
         companyConfigured
         companyLoading={false}
@@ -1055,9 +1157,8 @@ describe("EmptyConversationHint", () => {
       screen.getByRole("button", { name: "取消本批次并重新选择" }),
     );
     await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith(reservation));
-    expect(
-      screen.queryByRole("dialog", { name: "构建企业知识库" }),
-    ).not.toBeInTheDocument();
+    expect(onBatchCancelled).toHaveBeenCalledWith(5);
+    expect(onStartKnowledgeBase).toHaveBeenCalledOnce();
     cancelSpy.mockRestore();
   });
 });

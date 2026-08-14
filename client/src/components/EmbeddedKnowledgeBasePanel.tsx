@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Download,
   FileClock,
@@ -397,6 +397,7 @@ export default function EmbeddedKnowledgeBasePanel({
           key={`knowledge-build-${resetQuery.data?.revision ?? 0}`}
           mode={mode}
           resetRevision={resetQuery.data.revision}
+          accountId={user?.id ?? 0}
         />
       )}
     </section>
@@ -749,12 +750,21 @@ function KnowledgeMaintenanceTicketButton({
 function RealBuildFlow({
   mode,
   resetRevision,
+  accountId,
 }: {
   mode: "standard" | "workspace";
   resetRevision: number;
+  accountId: number;
 }) {
-  const { state, activeConversation, hydrated, createConversation, setActive } =
-    useConversation();
+  const {
+    state,
+    activeConversation,
+    hydrated,
+    createConversation,
+    setActive,
+    discardConversationLocally,
+    refreshConversationsAfterDiscard,
+  } = useConversation();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const trpcUtils = trpc.useUtils();
   const latestProgressQuery = trpc.workspace.knowledgeProgress.useQuery(
@@ -853,6 +863,51 @@ function RealBuildFlow({
     generation: -1,
     stateEpoch: -1,
   });
+
+  const installCancelledBatchRevision = useCallback(
+    async (cancelledConversationId: string, nextRevision: number) => {
+      trpcUtils.workspace.knowledgeReset.status.setData(undefined, (current) =>
+        current
+          ? {
+              ...current,
+              revision: Math.max(current.revision, nextRevision),
+              hasKnowledge: false,
+              locked: false,
+              canRequest: false,
+              pending: null,
+              unavailableReason: "当前没有可重置的知识库记录",
+            }
+          : current,
+      );
+      trpcUtils.workspace.knowledgeProgress.setData(undefined, () => ({
+        progress: null,
+      }));
+      trpcUtils.workspace.knowledgeProgress.setData(
+        { conversationId: cancelledConversationId },
+        () => ({ progress: null }),
+      );
+      setLiveProgress(null);
+      discardConversationLocally(cancelledConversationId);
+      const nextConversationId = createConversation({
+        title: "企业知识库构建",
+        reuseEmpty: false,
+      });
+      setConversationId(nextConversationId);
+      setActive(nextConversationId);
+      void Promise.all([
+        refreshConversationsAfterDiscard(),
+        trpcUtils.workspace.knowledgeReset.status.invalidate(),
+        trpcUtils.workspace.knowledgeProgress.invalidate(),
+      ]);
+    },
+    [
+      createConversation,
+      discardConversationLocally,
+      refreshConversationsAfterDiscard,
+      setActive,
+      trpcUtils,
+    ],
+  );
 
   useEffect(() => {
     setLiveProgress(null);
@@ -994,6 +1049,8 @@ function RealBuildFlow({
               liveProgress ?? progressQuery.data?.progress ?? null
             }
             knowledgeBaseResetRevision={resetRevision}
+            knowledgeBaseAccountId={accountId}
+            onKnowledgeBaseBatchCancelled={installCancelledBatchRevision}
           />
         ) : (
           <div className="flex h-full items-center justify-center gap-2 text-sm text-[#716a80]">

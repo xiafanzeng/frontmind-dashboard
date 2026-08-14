@@ -80,6 +80,10 @@ export type KnowledgeBaseFailureClass =
 export const knowledgeBaseRecoveryActions = [
   "wait",
   "reconcile",
+  /** Provider-neutral explicit recovery actions backed by a server token. */
+  "retry_request",
+  "start_new_generation",
+  "stopped",
   "top_up",
   "update_credential",
   "fix_attachments",
@@ -342,6 +346,8 @@ export interface KnowledgeBaseNoticeDto {
   retryable: boolean;
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
+  /** Opaque, same-account recovery capability bound to the current state. */
+  recoveryToken?: string | null;
   canRegenerate?: boolean;
   /** Safe correlation id; never a provider id or credential-bearing value. */
   traceId?: string | null;

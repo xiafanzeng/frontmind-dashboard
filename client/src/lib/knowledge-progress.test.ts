@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY } from "./delivery-project";
 
 import {
+  executeKnowledgeBaseRecovery,
   isKnowledgeBaseProgressCoordinateOlder,
   knowledgeBaseObservationFromPayload,
   readKnowledgeBaseProgressEventDetail,
@@ -326,6 +327,60 @@ describe("reconcileKnowledgeBaseObservation", () => {
         headers: projectHeaders,
         signal: undefined,
       },
+    );
+  });
+});
+
+describe("executeKnowledgeBaseRecovery", () => {
+  it("posts the opaque token and stable client request id", async () => {
+    const observation = {
+      stateEpoch: 10,
+      generation: 4,
+      authoritativeTaskId: null,
+      activeTurn: null,
+      interaction: {
+        progress: null,
+        interactionState: "executing",
+        canReply: false,
+        canPublish: false,
+        lockReason: "FrontMind 正在完成当前操作",
+      },
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 5,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          disposition: "accepted",
+          accepted: true,
+          resumed: true,
+          observation,
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      executeKnowledgeBaseRecovery({
+        conversationId: "conversation-1",
+        recoveryToken: "a".repeat(64),
+        clientRequestId: "stable-request-1",
+      }),
+    ).resolves.toMatchObject({ accepted: true, resumed: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/knowledge-base/recovery/execute",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        body: JSON.stringify({
+          conversationId: "conversation-1",
+          recoveryToken: "a".repeat(64),
+          clientRequestId: "stable-request-1",
+        }),
+      }),
     );
   });
 });

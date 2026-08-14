@@ -56,6 +56,7 @@ import {
   markKnowledgeBaseManusV2CredentialRebindAttention,
   markLegacyKnowledgeBaseCreateAttentionRequired,
   mutateKnowledgeBaseManusV2Lifecycle,
+  normalizeKnowledgeBaseTerminalRejection,
   observeAndLocallySettleKnowledgeBaseTerminalAnchor,
   pauseKnowledgeBasePreCreateCredentialUnavailable,
   persistKnowledgeBaseManusV2AttachmentAttempt,
@@ -68,6 +69,7 @@ import {
   releaseGeneratedAttachmentInvalidPreproviderTurn,
   reclassifyHistoricalPreproviderAuthoritySelfTerminal,
   reserveKnowledgeBaseGeneratedAttachment,
+  reserveKnowledgeBaseCompatibleCreateRecovery,
   reserveKnowledgeBaseNewCanonicalFromSnapshot,
   reserveKnowledgeBaseFailedNotSentLegacyHandoff,
   reserveKnowledgeBaseRetryTurn,
@@ -80,6 +82,7 @@ import {
   stageKnowledgeBaseDeferredTurnAttachment,
   sanitizeKnowledgeBaseRecoveryMetadata,
   settleKnowledgeBaseManusV2ExplicitRejection,
+  stopKnowledgeBaseCompatibleCreateOutcomeUnknown,
   knowledgeBaseManusV2TerminalRejectionAuthority,
 } from "./knowledge-base-turn-service";
 import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
@@ -337,8 +340,6 @@ function createTurnServiceExecutor(input: {
               store.messages.push(values);
             } else if (table === upstreamResources) {
               store.resources.push(values);
-            } else if (table === knowledgeBaseResetStates) {
-              store.resetRevision = Number(values.revision ?? 0);
             } else if (table === knowledgeBaseConversationRetentionTombstones) {
               store.retainedTombstones.push(values);
             }
@@ -371,6 +372,8 @@ function createTurnServiceExecutor(input: {
                   ...values,
                 }));
                 events.push("start-attachments:bind");
+              } else if (table === knowledgeBaseResetStates) {
+                store.resetRevision = Number(values.revision);
               }
               return [{ affectedRows: 1 }];
             },
@@ -1949,8 +1952,522 @@ describe("Manus v2 canonical task writer fence", () => {
       canonicalTaskId: "canonical-task",
       canonicalTaskState: "attention_required",
       protocolErrorCode: "MANUS_V2_LOCAL_REHYDRATE_REJECTED",
-      activeTurnId: active.id,
+      activeTurnId: null,
+      handoffProvenance: {
+        recoverySourceTurnId: active.id,
+        terminalRecovery: {
+          action: "create_new_canonical_from_snapshot",
+          sourceTurnId: active.id,
+          recoveryStateSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        },
+      },
     });
+  });
+
+  it("releases an explicit create 400 and freezes one compatible recovery coordinate", async () => {
+    const leaseToken = "explicit-create-400-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256").update(leaseToken).digest("hex"),
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "sending",
+        createAttemptState: "sending",
+        frozenProviderRequestHash: "f".repeat(64),
+        operationToken: "operation-1",
+        recovery: { kind: "start", conversationId: "conversation-1" },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: { prompt: "frozen", attachments: [] },
+          bodySha256: "e".repeat(64),
+          preparedAt: "2026-08-13T00:00:00.000Z",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({ canonicalTaskState: "creating" }),
+      conversation: {
+        id: active.conversationId,
+        userId: active.userId,
+        projectAssignmentId: null,
+        version: 1,
+        status: "running",
+      },
+      turns: [active],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      settleKnowledgeBaseManusV2ExplicitRejection(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          code: "MANUS_V2_CREATE_REJECTED",
+          retryable: false,
+          providerCode: "invalid_argument",
+          providerStatus: 400,
+          providerRequestRef: "request_123:01",
+          providerField: "input_schema",
+          providerPath: "request.input_schema[0]",
+          providerRequestShape: {
+            promptUtf8Bytes: 6,
+            titleUtf8Bytes: 25,
+            attachmentCount: 0,
+            agentProfile: "manus-1.6-max",
+            hasAgentProfile: true,
+            hasStructuredOutputSchema: true,
+            structuredOutputSchemaUtf8Bytes: 128,
+            structuredOutputSchemaSha256: "a".repeat(64),
+            compatibilityMode: "standard",
+          },
+          now: new Date("2026-08-13T00:02:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ retryScheduled: false, attempt: 1 });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      handoffProvenance: {
+        recoverySourceTurnId: active.id,
+        terminalRecovery: {
+          action: "retry_compatible_create",
+          sourceTurnId: active.id,
+          recoveryStateSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        },
+      },
+    });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      upstreamTaskId: null,
+      metadata: {
+        providerAttemptState: "rejected",
+        providerReasonCategory: "invalid_argument",
+        providerRequestRef: "request_123:01",
+        providerField: "structured_output_schema",
+        providerPath: "structured_output_schema",
+        providerRequestShape: {
+          promptUtf8Bytes: 6,
+          titleUtf8Bytes: 25,
+          attachmentCount: 0,
+          agentProfile: "manus-1.6-max",
+          hasAgentProfile: true,
+          hasStructuredOutputSchema: true,
+          structuredOutputSchemaUtf8Bytes: 128,
+          structuredOutputSchemaSha256: "a".repeat(64),
+          compatibilityMode: "standard",
+        },
+      },
+    });
+    expect(harness.store.conversation).toMatchObject({
+      status: "failed",
+      version: 2,
+    });
+  });
+
+  it("stops the one compatible create on its first explicit rejection", async () => {
+    const leaseToken = "minimal-create-rejection-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256").update(leaseToken).digest("hex"),
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "sending",
+        createAttemptState: "sending",
+        frozenProviderRequestHash: "f".repeat(64),
+        operationToken: "operation-compatible",
+        repairKind: "explicit_compatible_create",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          compatibilityMode: "minimal_v2_create",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({ canonicalTaskState: "creating" }),
+      conversation: {
+        id: active.conversationId,
+        userId: active.userId,
+        projectAssignmentId: null,
+        version: 1,
+        status: "running",
+      },
+      turns: [active],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      settleKnowledgeBaseManusV2ExplicitRejection(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          code: "MANUS_V2_CREATE_REJECTED",
+          retryable: true,
+          providerCode: "invalid_argument",
+          providerStatus: 400,
+          now: new Date("2026-08-13T00:03:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({ retryScheduled: false, attempt: 1 });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      metadata: {
+        repairKind: "explicit_compatible_create",
+        providerAttemptState: "rejected",
+        recoveryAction: "contact_support",
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      handoffProvenance: {
+        terminalRecovery: { action: "stopped" },
+      },
+    });
+  });
+
+  it("atomically stops an ambiguous compatible create without a reconcile loop", async () => {
+    const leaseToken = "minimal-create-outcome-unknown-lease";
+    const active = turn({
+      status: "running",
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256").update(leaseToken).digest("hex"),
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "sending",
+        createAttemptState: "sending",
+        frozenProviderRequestHash: "f".repeat(64),
+        operationToken: "operation-compatible-unknown",
+        repairKind: "explicit_compatible_create",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          compatibilityMode: "minimal_v2_create",
+        },
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({ canonicalTaskState: "creating" }),
+      conversation: {
+        id: active.conversationId,
+        userId: active.userId,
+        projectAssignmentId: null,
+        version: 1,
+        status: "running",
+      },
+      turns: [active],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      stopKnowledgeBaseCompatibleCreateOutcomeUnknown(
+        {
+          userId: 1,
+          turnId: active.id,
+          leaseToken,
+          code: "MANUS_V2_CREATE_OUTCOME_UNKNOWN",
+          now: new Date("2026-08-13T00:04:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toBe(true);
+    expect(harness.store.turns[0]).toMatchObject({
+      status: "failed",
+      leaseExpiresAt: null,
+      metadata: {
+        providerAttemptState: "outcome_unknown",
+        dispatchState: "failed",
+        recoveryAction: "contact_support",
+      },
+    });
+    expect(harness.store.build).toMatchObject({
+      status: "failed",
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      handoffProvenance: {
+        terminalRecovery: { action: "stopped" },
+      },
+    });
+  });
+
+  it("normalizes a historical failed active writer without creating a provider operation", async () => {
+    const rejected = turn({
+      status: "failed",
+      leaseExpiresAt: null,
+      completedAt: new Date("2026-08-13T00:01:00.000Z"),
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        providerReasonCategory: "invalid_argument",
+        providerRejectionStatus: 400,
+        operationToken: "operation-1",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        status: "protocol_error",
+        canonicalTaskState: "attention_required",
+        activeTurnId: rejected.id,
+      }),
+      conversation: {
+        id: rejected.conversationId,
+        userId: rejected.userId,
+        projectAssignmentId: null,
+        version: 2,
+        status: "failed",
+      },
+      turns: [rejected],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      normalizeKnowledgeBaseTerminalRejection(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          now: new Date("2026-08-13T00:03:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      action: "retry_compatible_create",
+      sourceTurnId: rejected.id,
+    });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: null,
+      stateEpoch: 8,
+      handoffProvenance: {
+        recoverySourceTurnId: rejected.id,
+      },
+    });
+    expect(harness.store.turns).toHaveLength(1);
+    expect(harness.store.turns[0]).toMatchObject({
+      id: rejected.id,
+      status: "failed",
+    });
+  });
+
+  it("rewrites a historical minimal retry coordinate to non-executable stopped", async () => {
+    const rejected = turn({
+      status: "failed",
+      leaseExpiresAt: null,
+      completedAt: new Date("2026-08-13T00:01:00.000Z"),
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        providerReasonCategory: "invalid_argument",
+        providerRejectionStatus: 400,
+        operationToken: "operation-compatible-history",
+        repairKind: "explicit_compatible_create",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          compatibilityMode: "minimal_v2_create",
+        },
+      },
+    });
+    const staleToken = "e".repeat(64);
+    const harness = createTurnServiceExecutor({
+      build: build({
+        status: "protocol_error",
+        canonicalTaskState: "attention_required",
+        activeTurnId: null,
+        handoffProvenance: {
+          recoverySourceTurnId: rejected.id,
+          terminalRecovery: {
+            schemaVersion: 1,
+            action: "retry_compatible_create",
+            sourceTurnId: rejected.id,
+            sourceGeneration: 3,
+            sourceStateEpoch: 7,
+            sourceRevision: 7,
+            sourceLeafId: "1.8",
+            sourcePresentationKey: "presentation-7",
+            sourceCredentialIdSha256: "f".repeat(64),
+            recoveryStateSha256: staleToken,
+            normalizedAt: "2026-08-13T00:01:00.000Z",
+          },
+        },
+      }),
+      conversation: {
+        id: rejected.conversationId,
+        userId: rejected.userId,
+        projectAssignmentId: null,
+        version: 2,
+        status: "failed",
+      },
+      turns: [rejected],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      normalizeKnowledgeBaseTerminalRejection(
+        {
+          userId: 1,
+          conversationId: "conversation-1",
+          now: new Date("2026-08-13T00:05:00.000Z"),
+        },
+        harness.executor,
+      ),
+    ).resolves.toMatchObject({
+      action: "stopped",
+      sourceStateEpoch: 8,
+      recoveryStateSha256: expect.not.stringMatching(staleToken),
+    });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: null,
+      stateEpoch: 8,
+      handoffProvenance: {
+        terminalRecovery: {
+          action: "stopped",
+          sourceStateEpoch: 8,
+        },
+      },
+    });
+  });
+
+  it("carries only same-credential ready mappings as compatible-create candidates", async () => {
+    const contentSha256 = "7".repeat(64);
+    const sourceFileId = `kb-local-${"8".repeat(48)}`;
+    const upstreamFileId = "provider-ready-file";
+    const mappingKey = `g3:0:${contentSha256}:32`;
+    const source = turn({
+      status: "failed",
+      leaseExpiresAt: null,
+      completedAt: new Date("2026-08-13T00:01:00.000Z"),
+      attachmentFileIds: [upstreamFileId],
+      upstreamTaskId: null,
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 1,
+        userAttachmentCount: 0,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "rejected",
+        createAttemptState: "rejected",
+        providerReasonCategory: "invalid_argument",
+        providerRejectionStatus: 400,
+        operationToken: "operation-source",
+        recovery: {
+          kind: "turn",
+          conversationId: "conversation-1",
+          userMessage: "确认",
+        },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody: {
+            prompt: "frozen source prompt",
+            agentProfile: "manus-1.6-max",
+            attachments: [
+              { file_id: sourceFileId, filename: "workflow.zip" },
+            ],
+          },
+          bodySha256: "9".repeat(64),
+          preparedAt: "2026-08-13T00:00:00.000Z",
+        },
+        manusV2AttachmentMappings: {
+          [mappingKey]: {
+            schemaVersion: 1,
+            providerProtocol: "manus_v2",
+            mappingKey,
+            buildGeneration: 3,
+            attachmentIndex: 0,
+            sourceFileId,
+            localStorageKey: "generated/source.bin",
+            contentSha256,
+            sizeBytes: 32,
+            filename: "workflow.zip",
+            mimeType: "application/zip",
+            upstreamFileId,
+            status: "ready",
+            expiresAt: 4_000_000_000,
+            providerGeneration: 1,
+            verifiedAt: "2026-08-13T00:00:30.000Z",
+          },
+        },
+        manusV2AttachmentAttempts: {
+          secretCapabilityMustNotCopy: {
+            uploadCapability: { ciphertext: "must-not-copy" },
+          },
+        },
+      },
+    });
+    const recoveryToken = "a".repeat(64);
+    const harness = createTurnServiceExecutor({
+      build: build({
+        status: "protocol_error",
+        canonicalTaskState: "attention_required",
+        activeTurnId: null,
+        handoffProvenance: {
+          recoverySourceTurnId: source.id,
+          terminalRecovery: {
+            schemaVersion: 1,
+            action: "retry_compatible_create",
+            sourceTurnId: source.id,
+            sourceGeneration: 3,
+            sourceStateEpoch: 7,
+            sourceRevision: 7,
+            sourceLeafId: "1.8",
+            sourcePresentationKey: "presentation-7",
+            sourceCredentialIdSha256: "f".repeat(64),
+            recoveryStateSha256: recoveryToken,
+            normalizedAt: "2026-08-13T00:01:00.000Z",
+          },
+        },
+      }),
+      conversation: {
+        id: source.conversationId,
+        userId: source.userId,
+        projectAssignmentId: null,
+        version: 2,
+        status: "failed",
+      },
+      turns: [source],
+      turnSelections: [[[], (store) => store.turns]],
+    });
+
+    const reserved = await reserveKnowledgeBaseCompatibleCreateRecovery(
+      {
+        userId: 1,
+        conversationId: "conversation-1",
+        clientRequestId: "compatible-recovery-request",
+        recoveryToken,
+        apiCredentialId: "credential-1",
+        now: new Date("2026-08-13T00:02:00.000Z"),
+      },
+      harness.executor,
+    );
+    expect(reserved).toMatchObject({ state: "reserved" });
+    expect(reserved.claim.turn).toMatchObject({
+      attachmentFileIds: [],
+      manusV2AttachmentMappings: {
+        [mappingKey]: expect.objectContaining({ upstreamFileId }),
+      },
+      manusV2AttachmentAttempts: {},
+    });
+    expect(JSON.stringify(reserved.claim.turn)).not.toContain("must-not-copy");
   });
 
   it("reserves an idle legacy anchor without changing accepted nodes or messages", async () => {
@@ -2968,6 +3485,50 @@ describe("Manus v2 canonical task writer fence", () => {
       canonicalTaskId: "canonical-task",
       operationToken: "operation-2",
     });
+  });
+
+  it("fails closed before mutation when a compatible create observes a canonical task", async () => {
+    const leaseToken = "compatible-create-method-fence";
+    const activeTurn = turn({
+      metadata: {
+        attachmentsFrozen: true,
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+        createAttemptState: "not_sent",
+      },
+    });
+    const harness = createTurnServiceExecutor({
+      build: build({
+        canonicalTaskId: "canonical-task",
+        upstreamTaskId: "canonical-task",
+        canonicalTaskState: "active",
+        canonicalTaskGeneration: activeTurn.buildGeneration,
+        canonicalCredentialId: "credential-1",
+      }),
+      turns: [activeTurn],
+      turnSelections: [[(store) => store.turns]],
+    });
+
+    await expect(
+      beginKnowledgeBaseManusV2Dispatch(
+        {
+          userId: 1,
+          turnId: activeTurn.id,
+          leaseToken,
+          frozenProviderRequestHash: "f".repeat(64),
+          expectedMethod: "task.create",
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(harness.store.turns[0]).toMatchObject({
+      status: activeTurn.status,
+      metadata: expect.objectContaining({
+        createAttemptState: "not_sent",
+      }),
+    });
+    expect(harness.store.build.canonicalTaskId).toBe("canonical-task");
   });
 
   it("reclaims a post-2xx bind failure only for v2 reconciliation and never grants another POST", async () => {
@@ -6603,6 +7164,9 @@ describe("knowledge-base atomic start reservation", () => {
         awaitingClientAttachments: false,
         createAttemptState: "not_sent",
         providerAttemptState: "not_sent",
+        cancelled: true,
+        resetRevision: 1,
+        idempotent: false,
       });
       expect(cancelled.operationKey).not.toBe(originalOperationKey);
       expect(store.resources[0]).toMatchObject({
@@ -6621,11 +7185,30 @@ describe("knowledge-base atomic start reservation", () => {
         conversation: null,
         turns: [],
         messages: [],
+        resetRevision: 1,
       });
+
+      const replayedCancellation = await cancelIncompleteKnowledgeBaseStart(
+        {
+          userId: 1,
+          conversationId: startInput.conversationId,
+          turnId: started.reservation.turn.id,
+          clientRequestId: started.reservation.turn.clientRequestId,
+          expectedResetRevision: 0,
+          now: new Date("2026-08-01T00:00:40.000Z"),
+        },
+        executor,
+      );
+      expect(replayedCancellation).toEqual({
+        cancelled: true,
+        resetRevision: 1,
+        idempotent: true,
+      });
+      expect(store.resetRevision).toBe(1);
 
       const freshConversationId = "conversation-after-cancel";
       const freshExecutor = createTurnServiceExecutor({
-        resetRevision: 0,
+        resetRevision: 1,
         resources: store.resources,
         turnSelections: [[[], []]],
       });
@@ -6634,6 +7217,7 @@ describe("knowledge-base atomic start reservation", () => {
           ...startInput,
           conversationId: freshConversationId,
           clientRequestId: "start-request-after-cancel",
+          expectedResetRevision: 1,
           recoveryMetadata: {
             ...startInput.recoveryMetadata,
             conversationId: freshConversationId,

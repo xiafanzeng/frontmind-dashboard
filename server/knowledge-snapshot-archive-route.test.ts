@@ -342,6 +342,78 @@ describe("knowledge snapshot ZIP endpoint", () => {
     expect(mocks.readKnowledgeSnapshotArchive).not.toHaveBeenCalled();
   });
 
+  it("makes a legacy archive unavailable when its public filename is polluted", async () => {
+    const privateBrand = ["Ma", "nus"].join("");
+    mocks.getKnowledgeSnapshotForWorkspace.mockResolvedValueOnce({
+      id: snapshotId,
+      userId: 42,
+      sourceFileName: `${privateBrand}_V2_知识库.zip`,
+      archiveHash,
+      totalBytes: archive.length,
+    });
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(409);
+    const payload = await response.json();
+    expect(payload).toMatchObject({
+      error: { code: "KNOWLEDGE_ARCHIVE_PUBLIC_CONTENT_UNAVAILABLE" },
+    });
+    expect(JSON.stringify(payload)).not.toMatch(/manus/iu);
+  });
+
+  it("makes a legacy archive unavailable when extracted text is polluted", async () => {
+    const privateBrand = ["Ma", "nus"].join("");
+    const polluted = await downloadableArchive({
+      "company_knowledge_base/notes.md": `${privateBrand.toUpperCase()}_V2_TASK`,
+    });
+    const pollutedHash = createHash("sha256").update(polluted).digest("hex");
+    mocks.getKnowledgeSnapshotForWorkspace.mockResolvedValueOnce({
+      id: snapshotId,
+      userId: 42,
+      sourceFileName: "企业知识库.zip",
+      archiveHash: pollutedHash,
+      totalBytes: polluted.length,
+    });
+    mocks.readKnowledgeSnapshotArchive.mockResolvedValueOnce(polluted);
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "KNOWLEDGE_ARCHIVE_PUBLIC_CONTENT_UNAVAILABLE" },
+    });
+  });
+
+  it("makes a legacy archive unavailable when ZIP metadata is polluted", async () => {
+    const privateBrand = ["Ma", "nus"].join("");
+    const zip = await JSZip.loadAsync(await downloadableArchive());
+    zip.comment = `${privateBrand} internal archive`;
+    const polluted = await zip.generateAsync({ type: "nodebuffer" });
+    const pollutedHash = createHash("sha256").update(polluted).digest("hex");
+    mocks.getKnowledgeSnapshotForWorkspace.mockResolvedValueOnce({
+      id: snapshotId,
+      userId: 42,
+      sourceFileName: "企业知识库.zip",
+      archiveHash: pollutedHash,
+      totalBytes: polluted.length,
+    });
+    mocks.readKnowledgeSnapshotArchive.mockResolvedValueOnce(polluted);
+
+    const response = await fetch(await startApp(), {
+      headers: { "x-test-auth": "user" },
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "KNOWLEDGE_ARCHIVE_PUBLIC_CONTENT_UNAVAILABLE" },
+    });
+  });
+
   it("refuses a path-traversal ZIP before sending any archive bytes", async () => {
     const unsafe = await downloadableArchive({
       "../escaped.md": "不得写出知识库根目录",

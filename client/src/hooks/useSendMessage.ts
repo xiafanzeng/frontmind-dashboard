@@ -317,7 +317,6 @@ export function useSendMessage() {
 
           updateStatusRef.current(convId, normalizedStatus as any, {
             taskId: updated.id,
-            taskUrl: updated.metadata?.task_url,
           });
 
           if (normalizedStatus === "completed" && !completionHandled) {
@@ -1080,7 +1079,6 @@ export function useSendMessage() {
 
           updateStatus(convId, effectiveStatus as any, {
             taskId: response.id,
-            taskUrl: response.metadata?.task_url,
             previousResponseId: response.id,
             startedAt: responseStartedAt,
             ...(initialStatusIsTerminal

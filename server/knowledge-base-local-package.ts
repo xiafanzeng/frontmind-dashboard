@@ -11,6 +11,11 @@ import {
   type KnowledgeBaseBuildNode,
 } from "../drizzle/schema";
 import type { KnowledgeAsset, KnowledgeDocument } from "../shared/dashboard";
+import {
+  customerSafeKnowledgeFilename,
+  customerSafeKnowledgeText,
+  customerSafeKnowledgeUrls,
+} from "../shared/knowledge-base-public-artifacts";
 import { getDb } from "./db";
 import {
   knowledgeBuildArtifactLocalPackageStorageKey,
@@ -104,23 +109,6 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function sortedUrls(values: unknown) {
-  return [
-    ...new Set(
-      (Array.isArray(values) ? values : [])
-        .map((value) => String(value || "").trim())
-        .filter((value) => {
-          try {
-            const url = new URL(value);
-            return url.protocol === "http:" || url.protocol === "https:";
-          } catch {
-            return false;
-          }
-        }),
-    ),
-  ].sort();
-}
-
 function assertBuildCoordinates(
   build: Pick<
     KnowledgeBaseBuild,
@@ -169,23 +157,32 @@ function packageNodes(
     throw new Error("LOCAL_PACKAGE_CORE_NODES_INCOMPLETE");
   }
   return ordered.map((node, index) => {
-    const content = canonicalKnowledgeBaseMarkdown(node.contentMarkdown || "");
-    if (!content) throw new Error("LOCAL_PACKAGE_CORE_NODE_EMPTY");
-    const contentSha256 = knowledgeBaseMarkdownSha256(content);
-    if (node.contentSha256 && node.contentSha256 !== contentSha256) {
+    const authoritativeContent = canonicalKnowledgeBaseMarkdown(
+      node.contentMarkdown || "",
+    );
+    if (!authoritativeContent) {
+      throw new Error("LOCAL_PACKAGE_CORE_NODE_EMPTY");
+    }
+    const authoritativeSha256 =
+      knowledgeBaseMarkdownSha256(authoritativeContent);
+    if (node.contentSha256 && node.contentSha256 !== authoritativeSha256) {
       throw new Error("LOCAL_PACKAGE_CORE_NODE_HASH_MISMATCH");
     }
+    const content = canonicalKnowledgeBaseMarkdown(
+      customerSafeKnowledgeText(authoritativeContent),
+    );
+    const contentSha256 = knowledgeBaseMarkdownSha256(content);
     return {
       metadata: {
-        id: node.leafId,
-        title: node.title,
-        branchId: node.branchId,
-        branchTitle: node.branchTitle,
+        id: customerSafeKnowledgeText(node.leafId),
+        title: customerSafeKnowledgeText(node.title),
+        branchId: customerSafeKnowledgeText(node.branchId),
+        branchTitle: customerSafeKnowledgeText(node.branchTitle),
         order: index,
         path: `nodes/${String(index + 1).padStart(4, "0")}.md`,
         contentSha256,
-        sourceUrls: sortedUrls(node.sourceUrls),
-        imageUrls: sortedUrls(node.imageUrls),
+        sourceUrls: customerSafeKnowledgeUrls(node.sourceUrls),
+        imageUrls: customerSafeKnowledgeUrls(node.imageUrls),
       },
       content,
     };
@@ -222,11 +219,15 @@ type DashboardOwnedPackageLogo = {
 
 function packageLogo(logo?: DashboardOwnedPackageLogo | null) {
   if (!logo) return null;
-  const filename = String(logo.filename || "").trim();
+  const sourceFilename = String(logo.filename || "").trim();
+  const filename = customerSafeKnowledgeFilename(
+    sourceFilename,
+    "FrontMind-logo",
+  );
   const extension = LOGO_EXTENSION_BY_MIME[logo.mimeType];
   const digest = sha256(logo.buffer);
   if (
-    !filename ||
+    !sourceFilename ||
     filename.length > 512 ||
     !extension ||
     !Number.isSafeInteger(logo.bytes) ||
@@ -262,6 +263,7 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
   assertBuildCoordinates(input.build);
   const packaged = packageNodes(input.nodes);
   const logo = packageLogo(input.logo);
+  const companyName = customerSafeKnowledgeText(input.build.companyName).trim();
   const missingOptionalAssets = [
     ...(logo ? [] : ["official_logo"]),
     "supplement_overview",
@@ -270,7 +272,7 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
   const supportingFiles: Array<[string, string]> = [
     [
       "README.md",
-      `# ${input.build.companyName} 企业知识库\n\n本归档由 Dashboard 从已接受节点确定性生成。缺失的可选资源不会影响正文完整性。\n`,
+      `# ${companyName} 企业知识库\n\n本归档由 Dashboard 从已接受节点确定性生成。缺失的可选资源不会影响正文完整性。\n`,
     ],
     [
       "00_knowledge_tree.md",
@@ -306,7 +308,7 @@ export async function buildDashboardOwnedKnowledgePackage(input: {
     buildId: input.build.id,
     generation: input.build.generation,
     revision: input.build.revision,
-    companyName: input.build.companyName.trim(),
+    companyName,
     documents: packaged.map((item) => item.metadata),
     assets: logo ? [logo.metadata] : [],
     missing_optional_assets: missingOptionalAssets,
@@ -417,13 +419,16 @@ export async function readDashboardOwnedKnowledgePackage(input: {
     manifest.buildId !== input.expected.buildId ||
     manifest.generation !== input.expected.generation ||
     manifest.revision !== input.expected.revision ||
-    manifest.companyName !== input.expected.companyName.trim() ||
+    manifest.companyName !==
+      customerSafeKnowledgeText(input.expected.companyName).trim() ||
     manifest.counts.nodes !== manifest.documents.length ||
     manifest.counts.files !== entries.length
   ) {
     throw new Error("LOCAL_PACKAGE_COORDINATES_MISMATCH");
   }
-  const nodeById = new Map(input.nodes?.map((node) => [node.leafId, node]));
+  const orderedNodes = input.nodes
+    ? [...input.nodes].sort((left, right) => left.ordinal - right.ordinal)
+    : undefined;
   const documents: KnowledgeDocument[] = [];
   for (const metadata of manifest.documents) {
     const entry = zip.file(`${ROOT_DIRECTORY}/${metadata.path}`);
@@ -432,18 +437,33 @@ export async function readDashboardOwnedKnowledgePackage(input: {
     if (knowledgeBaseMarkdownSha256(content) !== metadata.contentSha256) {
       throw new Error("LOCAL_PACKAGE_NODE_HASH_MISMATCH");
     }
-    const node = nodeById.get(metadata.id);
+    const node = orderedNodes?.[metadata.order];
+    const authoritativeContent = canonicalKnowledgeBaseMarkdown(
+      node?.contentMarkdown || "",
+    );
+    const projectedContent = canonicalKnowledgeBaseMarkdown(
+      customerSafeKnowledgeText(authoritativeContent),
+    );
     if (
       input.nodes &&
       (!node ||
         (node.status !== "confirmed" && node.status !== "direct_prefilled") ||
         node.ordinal !== metadata.order ||
-        node.title !== metadata.title ||
-        node.branchId !== metadata.branchId ||
-        node.branchTitle !== metadata.branchTitle ||
-        knowledgeBaseMarkdownSha256(
-          canonicalKnowledgeBaseMarkdown(node.contentMarkdown || ""),
-        ) !== metadata.contentSha256)
+        customerSafeKnowledgeText(node.leafId) !== metadata.id ||
+        customerSafeKnowledgeText(node.title) !== metadata.title ||
+        customerSafeKnowledgeText(node.branchId) !== metadata.branchId ||
+        customerSafeKnowledgeText(node.branchTitle) !== metadata.branchTitle ||
+        knowledgeBaseMarkdownSha256(projectedContent) !==
+          metadata.contentSha256 ||
+        content !== projectedContent ||
+        JSON.stringify(customerSafeKnowledgeUrls(node.sourceUrls)) !==
+          JSON.stringify(metadata.sourceUrls) ||
+        JSON.stringify(customerSafeKnowledgeUrls(node.imageUrls)) !==
+          JSON.stringify(metadata.imageUrls) ||
+        (node.contentSha256 !== null &&
+          node.contentSha256 !== undefined &&
+          knowledgeBaseMarkdownSha256(authoritativeContent) !==
+            node.contentSha256))
     ) {
       throw new Error("LOCAL_PACKAGE_NODE_AUTHORITY_MISMATCH");
     }

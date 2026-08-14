@@ -137,7 +137,6 @@ async function checkAndUpdateOrdinaryTask(
       normalizedStatus === "pending" ? "pending" : "running",
       {
         taskId: taskData.id,
-        taskUrl: taskData.metadata?.task_url,
       },
     );
     return true;

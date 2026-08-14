@@ -12,13 +12,13 @@ import {
   filterApiKeyUsageForAdmin,
   filterPreviewApiKeyUsageForAdmin,
   filterPreviewTicketsForAdmin,
-  formatJenovaCredits,
+  formatAdminBrandTrackingCredits,
   getAdminNav,
   getPreviewAdminNav,
   getPreviewAdminWorkspaceHref,
   issueMonitorUrl,
   normalizeApiKeyUsageAlerts,
-  normalizeJenovaBrandTrackingCredentialRows,
+  normalizeBrandTrackingCredentialRows,
   normalizeUsageHierarchy,
   parseCredentialManagementDeepLink,
   usageHierarchyNeedsPolling,
@@ -297,8 +297,8 @@ describe("administrator channel navigation", () => {
     expect(source).not.toContain("stats?.pendingAssignment");
   });
 
-  it("keeps Jenova accounting exact while presenting it as credits", () => {
-    const rows = normalizeJenovaBrandTrackingCredentialRows({
+  it("keeps brand-tracking accounting exact while presenting it as credits", () => {
+    const rows = normalizeBrandTrackingCredentialRows({
       users: [
         {
           userId: 7,
@@ -324,11 +324,15 @@ describe("administrator channel navigation", () => {
       balance: "74.99999999",
       sharedAccountCount: 2,
     });
-    expect(formatJenovaCredits(rows[0]!.rolling30DayCost)).toBe(
+    expect(formatAdminBrandTrackingCredits(rows[0]!.rolling30DayCost)).toBe(
       "1,000.00001积分",
     );
-    expect(formatJenovaCredits(rows[0]!.lifetimeCost)).toBe("12,500积分");
-    expect(formatJenovaCredits(rows[0]!.balance)).toBe("74,999.99999积分");
+    expect(formatAdminBrandTrackingCredits(rows[0]!.lifetimeCost)).toBe(
+      "12,500积分",
+    );
+    expect(formatAdminBrandTrackingCredits(rows[0]!.balance)).toBe(
+      "74,999.99999积分",
+    );
   });
 
   it("keeps system administrators and non-ok usage states in the unified hierarchy", () => {

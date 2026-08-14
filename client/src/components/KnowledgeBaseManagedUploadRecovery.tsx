@@ -39,19 +39,6 @@ type RecoveryPhase =
   | "dispatching"
   | "attention";
 
-const RELEASED_START_RESERVATION_CODES = new Set([
-  "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
-  "CONVERSATION_RESET",
-  "TURN_NOT_FOUND",
-  "BUILD_NOT_FOUND",
-  "RESERVATION_NOT_FOUND",
-]);
-
-function startReservationAlreadyReleased(error: unknown) {
-  const code = String((error as { code?: unknown } | null)?.code || "");
-  return RELEASED_START_RESERVATION_CODES.has(code);
-}
-
 function orderedRecoveryBatch(discovery: ManagedUploadDiscovery) {
   const { uploads, reservation } = discovery;
   const manifest = reservation.attachmentManifest;
@@ -132,7 +119,7 @@ export default function KnowledgeBaseManagedUploadRecovery({
   turnId: string;
   onObservation: (observation: KnowledgeBaseObservationDto) => void;
   onRecovered?: () => void;
-  onCancelled: () => void | Promise<void>;
+  onCancelled: (resetRevision: number) => void | Promise<void>;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const runningRef = useRef(false);
@@ -371,6 +358,7 @@ export default function KnowledgeBaseManagedUploadRecovery({
               conversationId,
               turnId,
               clientRequestId: target.clientRequestId,
+              expectedResetRevision: discovery!.reservation.sourceResetRevision,
             },
             ...(target.upload
               ? {
@@ -409,22 +397,13 @@ export default function KnowledgeBaseManagedUploadRecovery({
     setError(null);
     recoveryControllerRef.current?.abort();
     try {
-      try {
-        await cancelKnowledgeBaseStartReservation({
-          conversationId,
-          turnId,
-          clientRequestId: discovery.reservation.clientRequestId,
-          expectedResetRevision: discovery.reservation.sourceResetRevision,
-        });
-      } catch (caught) {
-        // The first cancellation may have committed even when its HTTP
-        // response was lost, or a reset may have retired the same batch. In
-        // both cases the reservation is already gone, so a retry must finish
-        // cleaning its durable managed-upload intents instead of getting
-        // permanently stuck on the missing build/turn.
-        if (!startReservationAlreadyReleased(caught)) throw caught;
-      }
-      const cleanup = await Promise.allSettled(
+      const cancelled = await cancelKnowledgeBaseStartReservation({
+        conversationId,
+        turnId,
+        clientRequestId: discovery.reservation.clientRequestId,
+        expectedResetRevision: discovery.reservation.sourceResetRevision,
+      });
+      const cleanup = Promise.allSettled(
         discovery.uploads.map((upload) => {
           const manifest =
             discovery.reservation.attachmentManifest[upload.ordinal - 1];
@@ -437,17 +416,10 @@ export default function KnowledgeBaseManagedUploadRecovery({
           );
         }),
       );
-      const failed = cleanup.find(
-        (result): result is PromiseRejectedResult =>
-          result.status === "rejected",
-      );
-      // We wait only for the local durable cleanup marker, never for Provider
-      // deletion. If that small request loses its response the retry path
-      // schedules it idempotently before leaving the old conversation.
-      if (failed) throw failed.reason;
-      await onCancelledRef.current();
+      await onCancelledRef.current(cancelled.resetRevision);
       setCancelled(true);
       toast.success("已取消未完成批次，请重新选择资料");
+      void cleanup;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "取消本批次失败");
     } finally {

@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 
 import type { FrontMindRequest } from "./_core/express-auth";
+import { toBrandTrackingPublicEvent } from "./brand-tracking-public-projection";
 import {
   JenovaBrandTrackingError,
   jenovaBrandTrackingHttpStatus,
@@ -58,10 +59,18 @@ function sendJsonError(res: Response, error: unknown) {
   if (known && error.retryAfterMs) {
     res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1_000)));
   }
-  res.status(status).json({
-    error: {
+  const projected = toBrandTrackingPublicEvent({
+    event: "error",
+    data: {
       code: known ? error.code : "INTERNAL_ERROR",
       message: known ? error.message : "品牌追踪服务暂时不可用，请稍后重试",
+      recoverable: status >= 500,
+    },
+  });
+  res.status(status).json({
+    error: {
+      code: projected.data.code,
+      message: projected.data.message,
     },
   });
 }
@@ -99,8 +108,9 @@ function createSseChannel(res: Response) {
     emit(event: BrandTrackingSseEvent) {
       initialize();
       if (disconnected || res.writableEnded || res.destroyed) return;
-      res.write(`event: ${event.event}\n`);
-      res.write(`data: ${JSON.stringify(event.data)}\n\n`);
+      const projected = toBrandTrackingPublicEvent(event);
+      res.write(`event: ${projected.event}\n`);
+      res.write(`data: ${JSON.stringify(projected.data)}\n\n`);
     },
     finish() {
       if (heartbeat) clearInterval(heartbeat);

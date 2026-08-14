@@ -146,7 +146,9 @@ import {
   readDashboardOwnedKnowledgePackage,
 } from "./knowledge-base-local-package";
 import {
+  assertKnowledgeSnapshotArchiveCustomerSafe,
   KnowledgeSnapshotDownloadBindingError,
+  KnowledgeSnapshotPublicArchiveError,
   loadKnowledgeSnapshotDownloadValidation,
   validateDashboardOwnedSnapshotArchiveForDownload,
 } from "./knowledge-snapshot-download-validation";
@@ -8195,6 +8197,10 @@ router.get(
           validationProfile: "historical",
         });
       }
+      await assertKnowledgeSnapshotArchiveCustomerSafe({
+        buffer: bytes,
+        sourceFileName: snapshot.sourceFileName,
+      });
       res.setHeader("Cache-Control", "private, no-store");
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Length", String(bytes.length));
@@ -8210,10 +8216,13 @@ router.get(
         error instanceof KnowledgeArchiveValidationError ? error : null;
       const bindingError =
         error instanceof KnowledgeSnapshotDownloadBindingError ? error : null;
+      const publicArchiveError =
+        error instanceof KnowledgeSnapshotPublicArchiveError ? error : null;
       res
         .status(
           validationError ||
             bindingError ||
+            publicArchiveError ||
             (archiveError && archiveError.code !== "ARCHIVE_NOT_FOUND")
             ? 409
             : 404,
@@ -8223,11 +8232,15 @@ router.get(
             message:
               validationError?.message ||
               bindingError?.message ||
+              publicArchiveError?.message ||
               archiveError?.message ||
               "知识库 ZIP 不存在",
             code:
               knowledgeArchiveErrorCode(validationError) ||
               (bindingError ? "KNOWLEDGE_ARCHIVE_BINDING_INVALID" : null) ||
+              (publicArchiveError
+                ? "KNOWLEDGE_ARCHIVE_PUBLIC_CONTENT_UNAVAILABLE"
+                : null) ||
               archiveError?.code ||
               "NOT_FOUND",
           },

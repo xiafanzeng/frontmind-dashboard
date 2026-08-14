@@ -31,6 +31,11 @@ import {
   dashboardPayloadSchema,
   type DashboardPayload,
 } from "../shared/dashboard";
+import {
+  customerSafeKnowledgeFilename,
+  toCustomerSafeKnowledgeAsset,
+  toCustomerSafeKnowledgeDocument,
+} from "../shared/knowledge-base-public-artifacts";
 import { lockActiveWebsiteProjectLifecycle } from "./website-project-lifecycle";
 import { isExplicitAdminAccessLevel } from "../shared/admin-access";
 import type {
@@ -919,25 +924,50 @@ export async function rollbackDashboardContentRevision(input: {
   };
 }
 
-function publicSnapshot<
+export function toKnowledgeSnapshotPublicJson<
   T extends {
     id: string;
-    userId: number;
+    version: number;
     sourceFileName: string;
     archiveHash: string | null;
+    documents: KnowledgeDocumentRecord[];
+    documentCount: number;
+    imageCount: number;
+    characterCount: number;
     totalBytes: number;
     assets: KnowledgeAssetRecord[];
+    status: "active" | "archived";
+    createdAt: Date;
   },
 >(snapshot: T, archiveAvailable: boolean) {
   return {
-    ...snapshot,
+    id: snapshot.id,
+    version: snapshot.version,
+    sourceFileName: customerSafeKnowledgeFilename(snapshot.sourceFileName),
+    archiveHash: snapshot.archiveHash,
+    documents: snapshot.documents.map((document) =>
+      toCustomerSafeKnowledgeDocument(
+        document as unknown as Record<string, unknown>,
+      ),
+    ) as KnowledgeDocumentRecord[],
+    documentCount: snapshot.documentCount,
+    imageCount: snapshot.imageCount,
+    characterCount: snapshot.characterCount,
+    totalBytes: snapshot.totalBytes,
+    status: snapshot.status,
+    createdAt: snapshot.createdAt,
     archiveAvailable,
-    assets: snapshot.assets.map((asset, index) => ({
-      ...asset,
-      url: asset.id
-        ? `/api/dashboard/knowledge/assets/${snapshot.id}/by-id/${encodeURIComponent(asset.id)}`
-        : `/api/dashboard/knowledge/assets/${snapshot.id}/${index}`,
-    })),
+    assets: snapshot.assets.map((asset, index) => {
+      const projected = toCustomerSafeKnowledgeAsset(
+        asset as unknown as Record<string, unknown>,
+        index,
+      ) as unknown as KnowledgeAssetRecord;
+      return {
+        ...projected,
+        // The public URL never embeds a raw provider-owned asset identifier.
+        url: `/api/dashboard/knowledge/assets/${snapshot.id}/${index}`,
+      };
+    }),
   };
 }
 
@@ -945,10 +975,17 @@ async function publicKnowledgeSnapshot<
   T extends {
     id: string;
     userId: number;
+    version: number;
     sourceFileName: string;
     archiveHash: string | null;
+    documents: KnowledgeDocumentRecord[];
+    documentCount: number;
+    imageCount: number;
+    characterCount: number;
     totalBytes: number;
     assets: KnowledgeAssetRecord[];
+    status: "active" | "archived";
+    createdAt: Date;
   },
 >(snapshot: T) {
   const archiveAvailable =
@@ -959,7 +996,7 @@ async function publicKnowledgeSnapshot<
       snapshotId: snapshot.id,
       expectedBytes: snapshot.totalBytes,
     }));
-  return publicSnapshot(snapshot, archiveAvailable);
+  return toKnowledgeSnapshotPublicJson(snapshot, archiveAvailable);
 }
 
 export async function getLatestKnowledgeSnapshot(userId: number) {
@@ -1009,7 +1046,10 @@ export async function getKnowledgeSnapshotForWorkspace(input: {
   const snapshot = rows[0];
   if (!snapshot) return null;
   await assertWorkspaceAccess(input.actor, snapshot.userId);
-  return publicKnowledgeSnapshot(snapshot);
+  // This record is consumed only by the authenticated archive endpoint, which
+  // needs immutable publication coordinates to validate the stored bytes. It
+  // is never serialized as snapshot JSON.
+  return snapshot;
 }
 
 export async function getKnowledgeAsset(input: {

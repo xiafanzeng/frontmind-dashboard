@@ -60,6 +60,69 @@ function nodes() {
 }
 
 describe("Dashboard-owned knowledge package", () => {
+  it("builds and revalidates a customer-safe derivative before hashing", async () => {
+    const privateBrand = ["Ma", "nus"].join("");
+    const pollutedNodes = nodes();
+    pollutedNodes[0] = {
+      ...pollutedNodes[0]!,
+      leafId: `${privateBrand}_V2_1.1`,
+      title: `${privateBrand} 节点`,
+      branchId: `${privateBrand}-identity`,
+      branchTitle: `${privateBrand} 企业身份`,
+      contentMarkdown: `## ${privateBrand} 节点\n\n内部码 ${privateBrand.toUpperCase()}_V2_TASK，来源 https://open.${privateBrand.toLowerCase()}.ai/task/1。`,
+      contentSha256: knowledgeBaseMarkdownSha256(
+        `## ${privateBrand} 节点\n\n内部码 ${privateBrand.toUpperCase()}_V2_TASK，来源 https://open.${privateBrand.toLowerCase()}.ai/task/1。`,
+      ),
+      sourceUrls: [
+        `https://api.${privateBrand.toLowerCase()}.ai/source`,
+        "https://frontmind.net/source",
+      ],
+      imageUrls: [`https://cdn.${privateBrand.toLowerCase()}.ai/image.png`],
+    };
+    const logo = Buffer.from("customer-logo-bytes", "utf8");
+    const logoSha256 = await import("node:crypto").then(({ createHash }) =>
+      createHash("sha256").update(logo).digest("hex"),
+    );
+    const built = await buildDashboardOwnedKnowledgePackage({
+      build: {
+        ...build,
+        companyName: `${privateBrand} 企业`,
+      },
+      nodes: pollutedNodes,
+      logo: {
+        buffer: logo,
+        filename: `${privateBrand}_logo.png`,
+        mimeType: "image/png",
+        sha256: logoSha256,
+        bytes: logo.length,
+      },
+    });
+
+    const zip = await JSZip.loadAsync(built.buffer, { checkCRC32: true });
+    const publicStrings = [JSON.stringify(built.manifest)];
+    for (const entry of Object.values(zip.files)) {
+      publicStrings.push(entry.name);
+      if (!entry.dir) publicStrings.push(await entry.async("string"));
+    }
+    expect(publicStrings.join("\n")).not.toMatch(/manus/iu);
+    expect(built.manifest.documents[0]?.sourceUrls).toEqual([
+      "https://frontmind.net/source",
+    ]);
+    expect(built.manifest.documents[0]?.imageUrls).toEqual([]);
+
+    const parsed = await readDashboardOwnedKnowledgePackage({
+      buffer: built.buffer,
+      expected: {
+        buildId: build.id,
+        generation: build.generation,
+        revision: build.revision,
+        companyName: `${privateBrand} 企业`,
+      },
+      nodes: pollutedNodes,
+    });
+    expect(parsed.documents[0]?.title).toBe("FrontMind 节点");
+  });
+
   it("builds deterministic bytes solely from accepted nodes", async () => {
     const first = await buildDashboardOwnedKnowledgePackage({
       build,

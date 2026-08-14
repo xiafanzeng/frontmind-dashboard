@@ -32,6 +32,8 @@ export default function Home({
   messageProjection,
   knowledgeBaseProgress,
   knowledgeBaseResetRevision,
+  knowledgeBaseAccountId,
+  onKnowledgeBaseBatchCancelled,
 }: {
   embedded?: boolean;
   fixedAgentProfile?: string;
@@ -47,6 +49,11 @@ export default function Home({
   messageProjection?: (message: LocalMessage) => LocalMessage;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
   knowledgeBaseResetRevision?: number;
+  knowledgeBaseAccountId?: number;
+  onKnowledgeBaseBatchCancelled?: (
+    conversationId: string,
+    resetRevision: number,
+  ) => void | Promise<void>;
 } = {}) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -178,6 +185,8 @@ export default function Home({
           messageProjection={messageProjection}
           knowledgeBaseProgress={knowledgeBaseProgress}
           knowledgeBaseResetRevision={knowledgeBaseResetRevision}
+          knowledgeBaseAccountId={knowledgeBaseAccountId}
+          onKnowledgeBaseBatchCancelled={onKnowledgeBaseBatchCancelled}
           showKnowledgeBaseStarter={showKnowledgeBaseStarter}
           standardWelcomeVariant={standardWelcomeVariant}
           reserveOuterMobileNav={!showAccountMenu}

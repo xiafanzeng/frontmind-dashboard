@@ -349,13 +349,13 @@ describe("admin customer workspace", () => {
     );
   });
 
-  it("uses the canonical Jenova manager scoped to the selected customer", () => {
+  it("uses the canonical brand-tracking manager scoped to the selected customer", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminWorkspace.tsx"),
       "utf8",
     );
 
-    expect(source).toContain("<AdminJenovaBrandTrackingKeyManager");
+    expect(source).toContain("<AdminBrandTrackingKeyManager");
     expect(source).toContain("restrictedUserId={selectedUser.id}");
     expect(source).not.toContain("JenovaSentimentManagementPanel");
     expect(source).not.toContain("jenovaSentiment");

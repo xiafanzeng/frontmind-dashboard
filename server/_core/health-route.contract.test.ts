@@ -57,31 +57,29 @@ describe("runtime health route contract", () => {
     expect(source.slice(readinessStart, listener)).toContain(
       "fileRetentionPreflightEvidence.read()",
     );
-    expect(source.slice(readinessStart, listener)).toContain("fileRetention,");
+    expect(source.slice(readinessStart, listener)).toContain(
+      "fileRetention?.ready === true",
+    );
   });
 
-  it("reports monitor authentication without making it a core readiness gate", async () => {
+  it("keeps provider and credential diagnostics out of public readiness", async () => {
     const source = await fs.readFile(
       path.resolve("server/_core/index.ts"),
       "utf8",
     );
     const readinessStart = source.indexOf('app.get("/readyz"');
-    const readyStart = source.indexOf("const ready =", readinessStart);
-    const statusStart = source.indexOf("const status =", readyStart);
-    const responseStart = source.indexOf("const response =", statusStart);
+    const listener = source.indexOf("server.listen(", readinessStart);
+    const readiness = source.slice(readinessStart, listener);
 
     expect(readinessStart).toBeGreaterThan(-1);
-    expect(readyStart).toBeGreaterThan(readinessStart);
-    expect(statusStart).toBeGreaterThan(readyStart);
-    expect(source.slice(readyStart, statusStart)).not.toContain(
-      "monitorCredential",
-    );
-    expect(source.slice(responseStart)).toContain(
-      "monitorCredentialAuthenticated: monitorCredential.authenticated",
-    );
+    expect(readiness).not.toContain("monitorCredentialAuthenticated:");
+    expect(readiness).not.toContain("knowledgeBaseManusV2Writer:");
+    expect(readiness).not.toContain("knowledgeBaseManusV2ActiveMigration:");
+    expect(readiness).not.toContain("latestExpectedTag:");
+    expect(readiness).not.toContain("latestAppliedTag:");
   });
 
-  it("exposes the non-secret knowledge-base tree writer policy in readiness", async () => {
+  it("retains only neutral deployment identity, schema and degradation fields", async () => {
     const source = await fs.readFile(
       path.resolve("server/_core/index.ts"),
       "utf8",
@@ -89,14 +87,16 @@ describe("runtime health route contract", () => {
     const readinessStart = source.indexOf('app.get("/readyz"');
     const listener = source.indexOf("server.listen(", readinessStart);
 
-    expect(source).toContain("knowledgeBaseNewBuildPolicyBinding()");
-    expect(source.slice(readinessStart, listener)).toContain(
-      "knowledgeBaseTreePolicyWriter",
-    );
-    expect(source).toContain('"[KnowledgeBase] tree_policy_writer"');
+    const readiness = source.slice(readinessStart, listener);
+    expect(readiness).toContain("channel: applicationReleaseChannel");
+    expect(readiness).toContain("sha: applicationBuildSha");
+    expect(readiness).toContain("imageDigest: applicationImageDigest");
+    expect(readiness).toContain("migrationState.schema.status");
+    expect(readiness).toContain("degradedBuildCount:");
+    expect(readiness).toContain("violationCount:");
   });
 
-  it("reports new-build and active-legacy Manus v2 authorities separately", async () => {
+  it("keeps internal rollout authority available without publishing it", async () => {
     const source = await fs.readFile(
       path.resolve("server/_core/index.ts"),
       "utf8",
@@ -107,8 +107,8 @@ describe("runtime health route contract", () => {
 
     expect(source).toContain("knowledgeBaseManusV2WriterEnabled()");
     expect(source).toContain("knowledgeBaseManusV2ActiveMigrationEnabled()");
-    expect(readiness).toContain("knowledgeBaseManusV2Writer");
-    expect(readiness).toContain("knowledgeBaseManusV2ActiveMigration");
+    expect(readiness).not.toContain("knowledgeBaseManusV2Writer:");
+    expect(readiness).not.toContain("knowledgeBaseManusV2ActiveMigration:");
     expect(source).toContain('"[KnowledgeBase] manus_v2_writer"');
     expect(source).toContain('"[KnowledgeBase] manus_v2_active_migration"');
     expect(source).toMatch(
@@ -116,7 +116,7 @@ describe("runtime health route contract", () => {
     );
   });
 
-  it("exposes active-migration convergence diagnostics without gating readiness", async () => {
+  it("keeps active-migration diagnostics internal", async () => {
     const source = await fs.readFile(
       path.resolve("server/_core/index.ts"),
       "utf8",
@@ -130,7 +130,7 @@ describe("runtime health route contract", () => {
     expect(source.slice(readyStart, statusStart)).not.toContain(
       "knowledgeBaseMigrationDiagnostics",
     );
-    expect(source.slice(responseStart, listener)).toContain(
+    expect(source.slice(responseStart, listener)).not.toContain(
       "knowledgeBaseMigrationDiagnostics.snapshot",
     );
     expect(source.slice(listener)).toContain(
@@ -153,7 +153,7 @@ describe("runtime health route contract", () => {
       "degradedBuildCount",
     );
     expect(source.slice(responseStart, listener)).toContain(
-      "getKnowledgeBaseInvariantAuditSnapshot()",
+      "invariantSnapshot.degradedBuildCount",
     );
   });
 });

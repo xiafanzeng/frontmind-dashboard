@@ -90,6 +90,7 @@ import {
   getDeliveryTicketWorkspace,
 } from "./delivery-ticket-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
+import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
 import { getQuestionQuotaState } from "./question-quota-service";
 import { questionCategoryForPublic } from "./question-selection-policy";
 import { listResponseLogicEntriesByQuestionIds } from "./response-logic-service";
@@ -2683,7 +2684,8 @@ export async function getMyDeliveryWorkbench(input: {
       role.roleType === "ai_operations_engineer"
         ? {
             websiteWorkspace,
-            knowledgeProgress,
+            knowledgeProgress:
+              toKnowledgeBasePublicPayload(knowledgeProgress),
             knowledgeSnapshot,
           }
         : null,

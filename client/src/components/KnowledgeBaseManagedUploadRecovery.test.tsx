@@ -129,6 +129,8 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
     });
     mocks.cancelKnowledgeBaseStartReservation.mockResolvedValue({
       cancelled: true,
+      resetRevision: 10,
+      idempotent: false,
     });
     mocks.discardManagedUploadIntent.mockResolvedValue(undefined);
     mocks.onCancelled.mockResolvedValue(undefined);
@@ -348,6 +350,7 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
         conversationId,
         turnId,
         clientRequestId,
+        expectedResetRevision: 7,
       },
     });
     await waitFor(() =>
@@ -430,7 +433,7 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("retries managed-intent cleanup after the reservation was already retired", async () => {
+  it("leaves immediately after revision cutover even when intent cleanup fails", async () => {
     const upload = unresolvedDiscoveryItem("awaiting_browser");
     const attachmentManifest = [{ ...manifestItem(1), ordinal: 1, total: 1 }];
     mocks.listManagedUploadsForKnowledgeBase.mockResolvedValue({
@@ -456,26 +459,9 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
       }),
     );
 
-    expect(await screen.findByText("文件仍在清理")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "取消本批次并重新选择" }),
-    ).toBeEnabled();
-    expect(mocks.onRecovered).not.toHaveBeenCalled();
-    expect(mocks.onCancelled).not.toHaveBeenCalled();
-    expect(
-      screen.getByTestId("knowledge-base-managed-upload-recovery"),
-    ).toBeInTheDocument();
-
-    mocks.cancelKnowledgeBaseStartReservation.mockRejectedValueOnce(
-      Object.assign(new Error("预约已删除"), { code: "BUILD_NOT_FOUND" }),
-    );
-    fireEvent.click(
-      screen.getByRole("button", { name: "取消本批次并重新选择" }),
-    );
-
-    await waitFor(() => expect(mocks.onCancelled).toHaveBeenCalledOnce());
-    expect(mocks.cancelKnowledgeBaseStartReservation).toHaveBeenCalledTimes(2);
-    expect(mocks.discardManagedUploadIntent).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(mocks.onCancelled).toHaveBeenCalledWith(10));
+    expect(mocks.cancelKnowledgeBaseStartReservation).toHaveBeenCalledOnce();
+    expect(mocks.discardManagedUploadIntent).toHaveBeenCalledOnce();
     expect(mocks.onRecovered).not.toHaveBeenCalled();
     expect(
       screen.queryByTestId("knowledge-base-managed-upload-recovery"),

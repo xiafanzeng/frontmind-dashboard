@@ -9,6 +9,7 @@ import {
   toPublicDashboardPayload,
 } from "./dashboard-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
+import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
 import {
   listResponseLogicEntries,
   saveResponseLogicEntry,
@@ -653,10 +654,12 @@ export const workspaceRouter = router({
     .query(async ({ ctx, input }) => {
       try {
         return {
-          progress: await getKnowledgeBaseProgress({
-            userId: ctx.user.id,
-            conversationId: input?.conversationId,
-          }),
+          progress: toKnowledgeBasePublicPayload(
+            await getKnowledgeBaseProgress({
+              userId: ctx.user.id,
+              conversationId: input?.conversationId,
+            }),
+          ),
         };
       } catch (error) {
         throw toTrpcError(error);

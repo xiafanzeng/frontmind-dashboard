@@ -26,7 +26,7 @@ import {
 } from "@/lib/admin-workspace-tabs";
 import { trpc } from "@/lib/trpc";
 import {
-  AdminJenovaBrandTrackingKeyManager,
+  AdminBrandTrackingKeyManager,
   getAdminNav,
 } from "@/pages/AdminDashboard";
 
@@ -495,7 +495,7 @@ export default function AdminWorkspace({
   const brandTrackingManagement =
     selectedUser?.marketEdition === "overseas" ? (
       isSystemAdmin ? (
-        <AdminJenovaBrandTrackingKeyManager
+        <AdminBrandTrackingKeyManager
           previewMode={false}
           restrictedUserId={selectedUser.id}
         />

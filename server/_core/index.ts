@@ -75,7 +75,6 @@ import {
 } from "../presales-monitor";
 import {
   assertFrontMindPublicUrlConfigured,
-  isFrontMindPublicUrlConfigured,
 } from "../public-url";
 import {
   assertDashboardImportPreflightConfigured,
@@ -85,7 +84,6 @@ import websiteContentTemplateApi from "../website-content-template-api";
 import { assertAdminAccessLevelsBackfilled } from "../admin-control-plane-service";
 import {
   assertUpstreamBaseUrlConfigured,
-  isUpstreamBaseUrlConfigured,
 } from "../upstream-config";
 import { createPaymentReceiptLedgerService } from "../payment-receipt-ledger-service";
 import { createProjectOrderRegistryService } from "../project-order-registry-service";
@@ -330,14 +328,7 @@ async function startServer() {
       );
       const fileRetention = fileRetentionPreflightEvidence.read();
       const managedUploads = getManagedUploadIntentWorkerReadiness();
-      const [
-        preparedFiles,
-        skills,
-        paymentReceipts,
-        projectOrders,
-        knowledgeBase,
-        monitorCredential,
-      ] = await Promise.all([
+      const [, , , , knowledgeBase] = await Promise.all([
         preparedFileService.health(),
         getRuntimeSkillReadiness(),
         paymentReceiptLedgerReadiness.ready(),
@@ -362,6 +353,7 @@ async function startServer() {
         migrationState.journal.status === "exact" &&
         migrationState.schema.status === "exact";
       const status = ready ? 200 : 503;
+      const invariantSnapshot = getKnowledgeBaseInvariantAuditSnapshot();
       const response = {
         status: "ok",
         channel: applicationReleaseChannel,
@@ -371,64 +363,21 @@ async function startServer() {
         },
         migration: {
           status: migrationState.journal.status,
-          journalHash: migrationState.journal.journalHash,
-          expectedCount: migrationState.journal.expected.count,
-          appliedCount: migrationState.journal.applied.count,
-          latestExpectedTag: migrationState.journal.expected.latestTag,
-          latestAppliedTag: migrationState.journal.applied.latestTag,
-          pendingCount: migrationState.journal.pending.length,
-          allPendingExpand: migrationState.journal.allPendingExpand,
-          schema: migrationState.schema,
-        },
-        configuration: {
-          monitorCredentialConfigured: monitorCredential.configured,
-          monitorCredentialAuthenticated: monitorCredential.authenticated,
-          monitorApiBaseUrlConfigured: true,
-          publicUrlConfigured: isFrontMindPublicUrlConfigured(),
-          upstreamBaseUrlConfigured: isUpstreamBaseUrlConfigured(),
-          knowledgeBaseTreePolicyWriter: {
-            enabled: knowledgeBaseTreePolicyWriter.treePolicyVersion === 2,
-            treePolicyVersion: knowledgeBaseTreePolicyWriter.treePolicyVersion,
-            skillVersion: knowledgeBaseTreePolicyWriter.skillVersion,
-            skillContentHash: knowledgeBaseTreePolicyWriter.skillContentHash,
-          },
-          knowledgeBaseManusV2Writer: {
-            enabled: knowledgeBaseManusV2Writer,
-            newBuildProviderProtocol: knowledgeBaseManusV2Writer
-              ? "manus_v2"
-              : "legacy_v1",
-          },
-          knowledgeBaseManusV2ActiveMigration: {
-            enabled: knowledgeBaseManusV2ActiveMigration,
-            diagnostics: knowledgeBaseMigrationDiagnostics.snapshot({
-              enabled: knowledgeBaseManusV2ActiveMigration,
-            }),
+          schema: {
+            status: migrationState.schema.status,
           },
         },
-        preparedFiles: {
-          status: "ok",
-          availableBytes: preparedFiles.availableBytes,
-          reserveBytes: preparedFiles.reserveBytes,
-          queueLength: preparedFiles.queueLength,
-          activeWorkers: preparedFiles.activeWorkers,
+        schema: {
+          status:
+            migrationState.schema.status === "exact" &&
+            knowledgeBase.dto.schema.status === "ok"
+              ? "ok"
+              : "unavailable",
         },
-        fileRetention,
-        managedUploads,
-        internalLedgers: {
-          paymentReceipts,
-          projectOrders,
-        },
-        skills: skills.map(({ name, version, contentHash }) => ({
-          name,
-          version,
-          contentHash,
-        })),
-        knowledgeBase: {
-          ...knowledgeBase.dto,
-          // Build-local findings are observable, but never participate in the
-          // readiness decision above.
-          ...getKnowledgeBaseInvariantAuditSnapshot(),
-        },
+        // Build-local findings are observable, but never participate in the
+        // readiness decision above. Do not expose their internal codes.
+        degradedBuildCount: invariantSnapshot.degradedBuildCount,
+        violationCount: invariantSnapshot.violationCount,
       };
       if (!ready) {
         console.error("[Health] readiness_unavailable", {
@@ -474,11 +423,6 @@ async function startServer() {
     resolveUpstreamCredential,
     manusProxy,
   );
-  app.use("/api/manus", (_req, res) => {
-    res
-      .status(404)
-      .json({ error: { message: "接口不存在", code: "NOT_FOUND" } });
-  });
   // One-click enterprise knowledge base workflow powered by the Socratic KB skill.
   app.use(
     "/api/knowledge-base/artifacts",

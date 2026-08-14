@@ -843,8 +843,7 @@ function BrandTrackingUsageEditor({
           <div>
             <CardTitle>品牌追踪积分</CardTitle>
             <p className="mt-1 text-sm leading-6 text-muted-foreground">
-              仅展示该海外客户由 Dashboard 明确归因的 Jenova
-              积分消耗；不提供对话内容或凭据配置能力。
+              仅展示该海外客户由 FrontMind 明确归因的品牌追踪积分消耗；不提供对话内容或凭据配置能力。
             </p>
           </div>
           <Button

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { eq } from "drizzle-orm";
+import JSZip from "jszip";
 
 import {
   knowledgeBaseBuildNodes,
@@ -9,6 +10,7 @@ import {
   type KnowledgeBaseBuildNode,
   type KnowledgeBaseSnapshot,
 } from "../drizzle/schema";
+import { containsPrivateProviderBrand } from "../shared/frontmind-public-brand";
 import { getDb } from "./db";
 import { knowledgeBuildArtifactLocalPackageStorageKey } from "./knowledge-build-artifact-store";
 import {
@@ -77,6 +79,88 @@ export class KnowledgeSnapshotDownloadBindingError extends Error {
   constructor(message = "知识库本地归档与已发布版本绑定不一致") {
     super(message);
     this.name = "KnowledgeSnapshotDownloadBindingError";
+  }
+}
+
+export class KnowledgeSnapshotPublicArchiveError extends Error {
+  constructor() {
+    super("该知识库归档包含无法公开的内部信息，请重新生成后下载");
+    this.name = "KnowledgeSnapshotPublicArchiveError";
+  }
+}
+
+const MAX_PUBLIC_ARCHIVE_SCAN_BYTES = 250 * 1024 * 1024;
+const PUBLIC_ARCHIVE_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+function bufferContainsPrivateProviderBrand(buffer: Buffer) {
+  for (
+    let offset = 0;
+    offset < buffer.length;
+    offset += PUBLIC_ARCHIVE_SCAN_CHUNK_BYTES
+  ) {
+    const start = Math.max(0, offset - 64);
+    const end = Math.min(
+      buffer.length,
+      offset + PUBLIC_ARCHIVE_SCAN_CHUNK_BYTES,
+    );
+    const chunk = buffer.subarray(start, end);
+    if (
+      containsPrivateProviderBrand(chunk.toString("latin1")) ||
+      containsPrivateProviderBrand(chunk.toString("utf16le"))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Final customer-download gate for both historical and Dashboard-owned ZIPs.
+ * The immutable archive and receipt are never rewritten: a polluted legacy
+ * package is simply unavailable until a new customer-safe derivative exists.
+ */
+export async function assertKnowledgeSnapshotArchiveCustomerSafe(input: {
+  buffer: Buffer;
+  sourceFileName: string;
+}) {
+  if (containsPrivateProviderBrand(input.sourceFileName)) {
+    throw new KnowledgeSnapshotPublicArchiveError();
+  }
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(input.buffer, { checkCRC32: true });
+  } catch {
+    throw new KnowledgeSnapshotPublicArchiveError();
+  }
+  if (
+    containsPrivateProviderBrand(
+      (zip as JSZip & { comment?: string }).comment || "",
+    )
+  ) {
+    throw new KnowledgeSnapshotPublicArchiveError();
+  }
+  let scannedBytes = 0;
+  for (const entry of Object.values(zip.files)) {
+    const rawEntry = entry as typeof entry & {
+      comment?: string;
+      unsafeOriginalName?: string;
+    };
+    if (
+      containsPrivateProviderBrand(entry.name) ||
+      containsPrivateProviderBrand(rawEntry.unsafeOriginalName || "") ||
+      containsPrivateProviderBrand(rawEntry.comment || "")
+    ) {
+      throw new KnowledgeSnapshotPublicArchiveError();
+    }
+    if (entry.dir) continue;
+    const bytes = await entry.async("nodebuffer");
+    scannedBytes += bytes.length;
+    if (
+      scannedBytes > MAX_PUBLIC_ARCHIVE_SCAN_BYTES ||
+      bufferContainsPrivateProviderBrand(bytes)
+    ) {
+      throw new KnowledgeSnapshotPublicArchiveError();
+    }
   }
 }
 

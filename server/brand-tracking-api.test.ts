@@ -21,6 +21,9 @@ import brandTrackingApi from "./brand-tracking-api";
 import type { AuthenticatedUser } from "./auth-service";
 import { JenovaBrandTrackingError } from "./jenova-brand-tracking-service";
 
+const privateProvider = ["Jeno", "va"].join("");
+const alternatePrivateProvider = ["Ma", "nus"].join("");
+
 let server: Server | null = null;
 
 afterEach(async () => {
@@ -141,6 +144,64 @@ describe("Jenova brand tracking SSE API", () => {
       expect.objectContaining({
         clientRequestId: "11111111-1111-4111-8111-111111111111",
       }),
+    );
+  });
+
+  it("projects every customer SSE payload through the neutral brand boundary", async () => {
+    serviceMocks.start.mockImplementation(async ({ emit }) => {
+      await emit({
+        event: "delta",
+        data: {
+          messageId: "turn-1:assistant",
+          text: `${privateProvider} 已启动`,
+          content: `${privateProvider} 已启动`,
+          file_url: "https://provider.example/file/1",
+        },
+      });
+      await emit({
+        event: "progress",
+        data: {
+          messageId: "turn-1:assistant",
+          message: `${alternatePrivateProvider}_V2 正在处理`,
+          imageUrl: "https://provider.example/image/1",
+        },
+      });
+      await emit({
+        event: "warning",
+        data: {
+          messageId: "turn-1:assistant",
+          code: `${privateProvider.toUpperCase()}_SOURCE_WARNING`,
+          message: `${privateProvider} 返回警告`,
+        },
+      });
+      await emit({
+        event: "error",
+        data: {
+          code: `${alternatePrivateProvider.toUpperCase()}_V2_REJECTED`,
+          message: `${alternatePrivateProvider} 拒绝了请求`,
+          recoverable: false,
+        },
+      });
+    });
+    const baseUrl = await appUrl();
+    const response = await fetch(`${baseUrl}/api/brand-tracking/sessions`, {
+      method: "POST",
+      headers: paidPostHeaders(baseUrl),
+      body: JSON.stringify({
+        clientRequestId: "11111111-1111-4111-8111-111111111111",
+      }),
+    });
+    const body = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(body).toContain("FrontMind 已启动");
+    expect(body).toContain("FrontMind 正在处理");
+    expect(body).toContain('"code":null');
+    expect(body).toContain('"code":"UPSTREAM_UNAVAILABLE"');
+    expect(body).not.toContain("file_url");
+    expect(body).not.toContain("imageUrl");
+    expect(body).not.toMatch(
+      new RegExp(`${privateProvider}|${alternatePrivateProvider}`, "iu"),
     );
   });
 
@@ -310,7 +371,7 @@ describe("Jenova brand tracking SSE API", () => {
     await expect(response.json()).resolves.toEqual({
       error: {
         code: "UPSTREAM_UNAVAILABLE",
-        message: "Jenova 正在限流，请稍后重试",
+        message: "FrontMind 正在限流，请稍后重试",
       },
     });
   });

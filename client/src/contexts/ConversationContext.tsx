@@ -134,6 +134,7 @@ export interface KnowledgeBaseClientNotice {
   retryable: boolean;
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
+  recoveryToken?: string;
   canRegenerate?: boolean;
   traceId?: string;
   attachmentCount?: number;
@@ -431,9 +432,9 @@ function conversationReducer(
                 taskId: action.payload.clearTaskPointer
                   ? undefined
                   : (action.payload.taskId ?? c.taskId),
-                taskUrl: action.payload.clearTaskPointer
-                  ? undefined
-                  : (action.payload.taskUrl ?? c.taskUrl),
+                // Provider task/share navigation URLs are never conversation
+                // state. Older hydrated values are removed on the next write.
+                taskUrl: undefined,
                 previousResponseId: action.payload.clearTaskPointer
                   ? undefined
                   : (action.payload.previousResponseId ?? c.previousResponseId),
@@ -1134,6 +1135,11 @@ export function applyKnowledgeBaseObservation(
       ? rawNotice.traceId
       : undefined;
   const noticeAttachmentCount = Number(rawNotice?.attachmentCount);
+  const noticeRecoveryToken =
+    typeof rawNotice?.recoveryToken === "string" &&
+    /^[a-f0-9]{64}$/u.test(rawNotice.recoveryToken)
+      ? rawNotice.recoveryToken
+      : undefined;
   const notice =
     rawNotice?.message && noticeKey
       ? {
@@ -1144,6 +1150,9 @@ export function applyKnowledgeBaseObservation(
           retryable: rawNotice.retryable === true,
           failureClass: rawNotice.failureClass ?? null,
           recoveryAction: rawNotice.recoveryAction ?? null,
+          ...(noticeRecoveryToken
+            ? { recoveryToken: noticeRecoveryToken }
+            : {}),
           // Missing means an old server, never implicit permission to create
           // another paid model task.
           canRegenerate: rawNotice.canRegenerate === true,
@@ -1295,8 +1304,11 @@ function getTrpcErrorCode(error: unknown): string | undefined {
 export function prepareConversationForCloud(
   conversation: Conversation,
 ): Conversation {
-  const { apiKeyFingerprint: _legacyFingerprint, ...cloudConversation } =
-    conversation;
+  const {
+    apiKeyFingerprint: _legacyFingerprint,
+    taskUrl: _legacyProviderTaskUrl,
+    ...cloudConversation
+  } = conversation;
   const repairedMessages = repairConversationMessageIds(conversation.messages);
   const protectedMessageIds = new Set(
     repairedMessages
@@ -1358,6 +1370,7 @@ function normalizeConversation(conversation: Conversation): Conversation {
 
   return {
     ...conversation,
+    taskUrl: undefined,
     // A crash can leave both the optimistic request and the canonical
     // server-owned turn in the first cloud snapshot. Collapse that pair before
     // it ever reaches the reducer; otherwise it survives until another save.
@@ -1704,7 +1717,7 @@ export function mergeKnowledgeBaseHydration(
     status: local.status,
     taskId: local.taskId,
     previousResponseId: local.previousResponseId,
-    taskUrl: local.taskUrl,
+    taskUrl: undefined,
     startedAt: local.startedAt,
     completedAt: local.completedAt,
     knowledgeBase: localState,

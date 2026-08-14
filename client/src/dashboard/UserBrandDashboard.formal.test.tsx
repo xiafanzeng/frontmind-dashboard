@@ -5,6 +5,8 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
@@ -758,6 +760,20 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(
       screen.getByRole("button", { name: "品牌追踪智能体" }),
     ).toBeInTheDocument();
+  });
+
+  it("keeps the customer dashboard chunk free of the private tracker brand", () => {
+    const source = readFileSync(
+      path.resolve(
+        process.cwd(),
+        "client/src/dashboard/UserBrandDashboard.tsx",
+      ),
+      "utf8",
+    );
+    const privateTrackerBrand = ["jeno", "va"].join("");
+
+    expect(source).toContain("通过 FrontMind 品牌追踪智能体");
+    expect(source).not.toMatch(new RegExp(privateTrackerBrand, "iu"));
   });
 
   it("keeps the website workflow on the authenticated overseas edition while workspace metadata is legacy", () => {

@@ -367,7 +367,7 @@ async function resolveLocalSources(claim: KnowledgeBaseRecoveryClaim) {
   const prepared = claim.preparedDispatch;
   if (!prepared) {
     throw localPreparationError(
-      "Manus v2 附件映射缺少冻结的 prepared dispatch",
+      "FrontMind 附件映射缺少冻结的 prepared dispatch",
     );
   }
   const result: LocalAttachmentSource[] = [];
@@ -508,7 +508,7 @@ function openUploadCapability(input: {
   const capability = input.attempt.uploadCapability;
   if (!capability || !input.attempt.upstreamFileId) {
     throw localPreparationError(
-      "Manus v2 附件的耐久上传能力缺失，无法安全恢复明确未受理的 PUT",
+      "FrontMind 附件的耐久上传能力缺失，无法安全恢复明确未受理的 PUT",
     );
   }
   const uploadUrl = decryptCredentialSecret(
@@ -532,7 +532,7 @@ function openUploadCapability(input: {
     target.password ||
     uploadUrl.length > 8_192
   ) {
-    throw localPreparationError("Manus v2 附件的耐久上传能力无效");
+    throw localPreparationError("FrontMind 附件的耐久上传能力无效");
   }
   return uploadUrl;
 }
@@ -770,7 +770,7 @@ function mappingFromCandidate(input: {
   detail: Awaited<ReturnType<ManusV2Client["fileDetail"]>>;
 }): KnowledgeBaseManusV2AttachmentMapping {
   if (!input.attempt.upstreamFileId) {
-    throw localPreparationError("Manus v2 附件 candidate 缺少 Provider ID");
+    throw localPreparationError("FrontMind 附件 candidate 缺少 Provider ID");
   }
   return {
     schemaVersion: 1,
@@ -867,7 +867,7 @@ async function ensureOneMapping(input: {
     const nextRetryAt = Date.parse(String(attempt.nextRetryAt || ""));
     if (!Number.isFinite(nextRetryAt)) {
       throw localPreparationError(
-        `Manus v2 附件“${input.source.filename}”的 PUT 重试时间无效`,
+        `FrontMind 附件“${input.source.filename}”的 PUT 重试时间无效`,
       );
     }
     if (Date.now() < nextRetryAt) {
@@ -922,7 +922,7 @@ async function ensureOneMapping(input: {
     const nextRetryAt = Date.parse(String(attempt.nextRetryAt || ""));
     if (!Number.isFinite(nextRetryAt)) {
       throw localPreparationError(
-        `Manus v2 附件“${input.source.filename}”的重试时间无效`,
+        `FrontMind 附件“${input.source.filename}”的重试时间无效`,
       );
     }
     if (Date.now() < nextRetryAt) {
@@ -1002,7 +1002,7 @@ async function ensureOneMapping(input: {
     }
     if (existing.providerGeneration >= 2) {
       throw localPreparationError(
-        `Manus v2 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
+        `FrontMind 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
       );
     }
     // Older ready-only ledgers had no candidate lifecycle row. A definitely
@@ -1139,7 +1139,7 @@ async function ensureOneMapping(input: {
       : nextKnowledgeBaseManusV2FileCreateGeneration(attempt || null);
   if (providerGeneration === null) {
     throw localPreparationError(
-      `Manus v2 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
+      `FrontMind 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
     );
   }
   const creating = retryingPutSameCandidate
@@ -1310,7 +1310,7 @@ async function ensureOneMapping(input: {
       }
       if (explicitCreateRejection) {
         throw localPreparationError(
-          `Manus v2 附件“${input.source.filename}”创建请求被明确拒绝`,
+          `FrontMind 附件“${input.source.filename}”创建请求被明确拒绝`,
           error,
         );
       }
@@ -1403,7 +1403,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     !claim.preparedDispatch
   ) {
     throw localPreparationError(
-      "Manus v2 附件映射的用户、credential 或 frozen turn 所有权不一致",
+      "FrontMind 附件映射的用户、credential 或 frozen turn 所有权不一致",
     );
   }
   const client = new ManusV2Client({
@@ -1531,12 +1531,12 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
       }
       if (action === "isolate") {
         throw localPreparationError(
-          `Manus v2 附件“${mapping.filename}”两次失效，当前构建已局部隔离`,
+          `FrontMind 附件“${mapping.filename}”两次失效，当前构建已局部隔离`,
         );
       }
       if (action === "replace") {
         if (inspection.state !== "unusable") {
-          throw localPreparationError("Manus v2 附件最终复核状态无效");
+          throw localPreparationError("FrontMind 附件最终复核状态无效");
         }
         if (durableAttempt?.state !== "unusable") {
           await persistAttempt({
@@ -1560,7 +1560,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
         }
         replacementCount += 1;
         if (replacementCount > sources.length) {
-          throw localPreparationError("Manus v2 附件最终复核超出有界替换次数");
+          throw localPreparationError("FrontMind 附件最终复核超出有界替换次数");
         }
         mappings[attachmentIndex] = await ensureOneMapping({
           claim,
@@ -1572,7 +1572,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
         break;
       }
       if (inspection.state !== "ready") {
-        throw localPreparationError("Manus v2 附件最终复核状态无效");
+        throw localPreparationError("FrontMind 附件最终复核状态无效");
       }
       const refreshed = {
         ...mapping,
@@ -1610,7 +1610,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     const expectedReady = sources.length - inlineAttachments.size;
     if (finalMappings.length !== expectedReady) {
       throw localPreparationError(
-        "Manus v2 内联系统附件降级缺少其余附件的完整可用性证明",
+        "FrontMind 内联系统附件降级缺少其余附件的完整可用性证明",
       );
     }
   }
@@ -1622,7 +1622,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     if (inline) return inline;
     const mapping = readyByIndex.get(attachmentIndex);
     if (!mapping) {
-      throw localPreparationError("Manus v2 附件最终映射缺失");
+      throw localPreparationError("FrontMind 附件最终映射缺失");
     }
     return {
       file_id: mapping.upstreamFileId,

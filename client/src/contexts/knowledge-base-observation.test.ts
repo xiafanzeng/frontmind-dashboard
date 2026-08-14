@@ -694,6 +694,36 @@ describe("authoritative KB observation reducer", () => {
     });
   });
 
+  it("keeps only a valid opaque explicit-recovery token in client state", () => {
+    const recovering = {
+      ...observation(4, "turn-new", 1, "1.2", "## 1.2\n已批准正文"),
+      notice: {
+        key: "frontmind-kb:RECOVERY",
+        code: "FRONTMIND_KB_RETRY_AVAILABLE",
+        severity: "warning" as const,
+        message: "需要你确认后继续。已完成内容不受影响。",
+        retryable: true,
+        failureClass: "requires_user_fix" as const,
+        recoveryAction: "retry_request" as const,
+        recoveryToken: "a".repeat(64),
+        canRegenerate: false,
+        turnId: null,
+        createdAt: 4,
+      },
+    };
+
+    const next = applyKnowledgeBaseObservation(conversation(), recovering);
+    expect(next.knowledgeBase?.notice).toMatchObject({
+      recoveryAction: "retry_request",
+      recoveryToken: "a".repeat(64),
+    });
+    const invalid = applyKnowledgeBaseObservation(conversation(), {
+      ...recovering,
+      notice: { ...recovering.notice, recoveryToken: "private-source-turn" },
+    });
+    expect(invalid.knowledgeBase?.notice).not.toHaveProperty("recoveryToken");
+  });
+
   it("does not let a stale hydration response erase an approved node", () => {
     const local = applyKnowledgeBaseObservation(
       conversation(),

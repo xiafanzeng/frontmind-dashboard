@@ -230,7 +230,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
     providerPackageRequired
       ? "这是最终交付轮，不是纯文字轮次：不得返回图片，但必须实际创建并返回恰好一个 application/zip 的 typed output_file；该 ZIP 是本轮唯一允许的非文本资源。恰好一张企业官方主 Logo 必须使用 Dashboard 已绑定栅格字节；自动返回的 Logo 不要求外部来源字段，official_logo_upload 则必须保持客户原始上传字节。客户上传图片必须按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。"
       : input.contentCompletionOnly === true
-        ? "这是 Manus v2 内容完成轮：只提交最终语义状态，不生成、不上传、不等待任何 ZIP、Logo 或补充报告。Dashboard 会在核心内容原子接受后，依据全部 accepted nodes 异步生成本地确定性下载包；可选资源缺失不得阻止内容完成。"
+        ? "这是 FrontMind 内容完成轮：只提交最终语义状态，不生成、不上传、不等待任何 ZIP、Logo 或补充报告。Dashboard 会在核心内容原子接受后，依据全部 accepted nodes 异步生成本地确定性下载包；可选资源缺失不得阻止内容完成。"
         : isOfficialLogoUpload
           ? "这是首节点 Logo 补料轮。Dashboard 已自行保存并展示受管 Logo 原始字节；上游回复必须纯文字，不得返回或重复附加任何图片资源。必须完整修订并重新展示同一个首节点，等待用户下一轮明确确认。最终 schema v4 ZIP 中该 Logo 必须使用 sourceKind=official_logo_upload、ownership=first_party、assetType=brand_identity、displayRole=badge，并逐字段保留本轮 sourceUploadIndex/FileId/Filename/MimeType/SizeBytes/Sha256；imageSelection.method 必须为 customer_upload。该 Logo 不属于普通 user_upload 节点配图。"
           : "这是非首轮知识节点回复，客户可见正文必须纯文字且不得附资源：不得继续搜索图片，不得返回、重复或重新附加任何 output_image、image MIME output_file、包内图片路径或官网/CDN 热链。恰好一张企业官方主 Logo 只允许在首轮第一个叶子展示；客户主动上传的节点图片由 Dashboard 从受管原始字节自行回显，你只负责把它按 customer_upload_sha256 与绑定节点保留进 schema v4 最终 ZIP。",

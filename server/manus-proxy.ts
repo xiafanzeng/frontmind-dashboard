@@ -53,6 +53,10 @@ import { preparedFileService } from "./prepared-file-service";
 import { writeWorkspaceAuditEvent } from "./admin-control-plane-service";
 import { assertDeliveryProjectContext } from "./delivery-role-service";
 import { normalizeKnowledgeCollectionCopy } from "../shared/knowledge-base-copy";
+import {
+  containsPrivateProviderBrand,
+  sanitizeFrontMindPublicText,
+} from "../shared/frontmind-public-brand";
 import { collectUpstreamOutputFileIds } from "./upstream-output-resources";
 import {
   readStoredPresalesFile,
@@ -1175,31 +1179,11 @@ function sanitizeText(text: string): string {
   if (!text || typeof text !== "string") return text || "";
 
   try {
-    const sanitized = getSourceBrandLowers().reduce(
-      (visibleText, sourceLower) =>
-        visibleText
-          .replace(
-            new RegExp(`https?:\\/\\/api\\.${sourceLower}\\.`, "gi"),
-            "https://api.frontmind.",
-          )
-          .replace(
-            new RegExp(`https?:\\/\\/www\\.${sourceLower}\\.`, "gi"),
-            "https://www.frontmind.",
-          )
-          .replace(
-            new RegExp(`https?:\\/\\/${sourceLower}\\.`, "gi"),
-            "https://frontmind.",
-          )
-          .replace(
-            new RegExp(`\\b${escapeRegExp(sourceLower)}\\b`, "gi"),
-            "FrontMind",
-          ),
-      text,
-    );
+    const sanitized = sanitizeFrontMindPublicText(text);
     return normalizeKnowledgeCollectionCopy(sanitized);
   } catch (e) {
     console.error("[sanitizeText] Error:", e);
-    return text;
+    return "";
   }
 }
 
@@ -1436,9 +1420,39 @@ const SANITIZE_SKIP_KEYS = new Set([
   "etag",
   "previous_response_id",
   "previousResponseId",
-  "task_url",
-  "share_url",
 ]);
+
+const PUBLIC_PROVIDER_URL_KEYS = new Set([
+  "url",
+  "src",
+  "href",
+  "file_url",
+  "fileUrl",
+  "image_url",
+  "imageUrl",
+  "download_url",
+  "downloadUrl",
+  "upload_url",
+  "uploadUrl",
+  "task_url",
+  "taskUrl",
+  "share_url",
+  "shareUrl",
+]);
+
+const PRIVATE_PROVIDER_CODE_PREFIXES = [
+  ["ma", "nus"].join(""),
+  ["jeno", "va"].join(""),
+] as const;
+
+function isPrivateProviderCode(value: unknown) {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim();
+  if (!/^[a-z0-9_-]+$/iu.test(normalized)) return false;
+  return PRIVATE_PROVIDER_CODE_PREFIXES.some((prefix) =>
+    new RegExp(prefix, "iu").test(normalized),
+  );
+}
 
 /**
  * Deep-sanitize a JSON value by recursively replacing source-brand references in all string fields.
@@ -1456,31 +1470,44 @@ function deepSanitizeJson(
   if (value === null || value === undefined) return value;
 
   // Prevent infinite recursion on deeply nested objects
-  if (depth > 50) return value;
+  if (depth > 50) return null;
 
   if (typeof value === "string") {
     // Skip brand replacement for identifier and URL fields.
-    if (currentKey && SANITIZE_SKIP_KEYS.has(currentKey)) {
+    if (
+      currentKey &&
+      SANITIZE_SKIP_KEYS.has(currentKey) &&
+      !containsPrivateProviderBrand(value)
+    ) {
       return value;
     }
     // Skip sanitization for strings that look like IDs (e.g., "task_xxx", "file-xxx", UUIDs)
-    if (value.match(/^[a-zA-Z0-9_-]{8,}$/) && !value.includes(" ")) {
-      return value;
-    }
-    // Skip very long strings (likely base64 or encoded data)
-    if (value.length > 100_000) {
+    if (
+      value.match(/^[a-zA-Z0-9_-]{8,}$/) &&
+      !value.includes(" ") &&
+      !containsPrivateProviderBrand(value)
+    ) {
       return value;
     }
     return sanitizeText(value);
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => deepSanitizeJson(item, undefined, depth + 1));
+    return value
+      .filter((item) => !isPrivateProviderCode(item))
+      .map((item) => deepSanitizeJson(item, undefined, depth + 1));
   }
 
   if (typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      if (
+        PUBLIC_PROVIDER_URL_KEYS.has(key) ||
+        containsPrivateProviderBrand(key) ||
+        isPrivateProviderCode(val)
+      ) {
+        continue;
+      }
       result[key] = deepSanitizeJson(val, key, depth + 1);
     }
     return result;
@@ -1519,10 +1546,27 @@ export function publicUpstreamFilePayload(value: unknown, apiKey: string) {
 
   const rawUploadUrl = (value as Record<string, unknown>).upload_url;
   if (typeof rawUploadUrl !== "string") return sanitized;
+  const safeUploadUrl = assertSafeExternalUrl(rawUploadUrl);
+  if (containsPrivateProviderBrand(safeUploadUrl)) return sanitized;
+  if (new URL(safeUploadUrl).protocol !== "https:") return sanitized;
+  let decodedUploadUrl = safeUploadUrl;
+  try {
+    decodedUploadUrl = decodeURIComponent(safeUploadUrl);
+  } catch {
+    return sanitized;
+  }
+  if (
+    apiKey &&
+    (rawUploadUrl.includes(apiKey) ||
+      safeUploadUrl.includes(apiKey) ||
+      decodedUploadUrl.includes(apiKey))
+  ) {
+    return sanitized;
+  }
 
   return {
     ...(sanitized as Record<string, unknown>),
-    upload_url: assertSafeExternalUrl(rawUploadUrl),
+    upload_url: safeUploadUrl,
   };
 }
 
@@ -1547,8 +1591,6 @@ const PUBLIC_TASK_TOP_LEVEL_SCALAR_KEYS = [
   "started_at",
   "completed_at",
   "credit_usage",
-  "task_url",
-  "share_url",
   "task_title",
   "title",
 ] as const;
@@ -1601,8 +1643,6 @@ const PUBLIC_TASK_CONTENT_SCALAR_KEYS = [
 
 const PUBLIC_TASK_METADATA_SCALAR_KEYS = [
   "credit_usage",
-  "task_url",
-  "share_url",
   "task_title",
   "title",
 ] as const;
@@ -3001,6 +3041,131 @@ function isZipMagicBytes(data: Buffer): boolean {
   );
 }
 
+function isExplicitZipFile(filename: string, contentType?: string): boolean {
+  const ext = filename.split(".").pop()?.toLowerCase() || "";
+  if (ext === "zip") return true;
+  const normalizedContentType = contentType
+    ?.split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  return (
+    normalizedContentType === "application/zip" ||
+    normalizedContentType === "application/x-zip-compressed"
+  );
+}
+
+function containsZipContainerSignature(data: Buffer): boolean {
+  return [
+    Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+    Buffer.from([0x50, 0x4b, 0x05, 0x06]),
+    Buffer.from([0x50, 0x4b, 0x07, 0x08]),
+  ].some((signature) => data.indexOf(signature) >= 0);
+}
+
+class PublicFileSanitizationError extends Error {
+  readonly code = "PUBLIC_FILE_UNAVAILABLE";
+}
+
+type OfficeXmlEncoding = "utf8" | "utf16le" | "utf16be";
+
+function swapUtf16ByteOrder(data: Buffer): Buffer {
+  if (data.length % 2 !== 0) {
+    throw new PublicFileSanitizationError(
+      "The Office XML entry has an invalid UTF-16 byte length",
+    );
+  }
+  const swapped = Buffer.allocUnsafe(data.length);
+  for (let index = 0; index < data.length; index += 2) {
+    swapped[index] = data[index + 1]!;
+    swapped[index + 1] = data[index]!;
+  }
+  return swapped;
+}
+
+function decodeOfficeXmlEntry(data: Buffer): {
+  text: string;
+  encode: (text: string) => Buffer;
+} {
+  let encoding: OfficeXmlEncoding = "utf8";
+  let bomLength = 0;
+  if (data.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))) {
+    encoding = "utf8";
+    bomLength = 3;
+  } else if (data.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))) {
+    encoding = "utf16le";
+    bomLength = 2;
+  } else if (data.subarray(0, 2).equals(Buffer.from([0xfe, 0xff]))) {
+    encoding = "utf16be";
+    bomLength = 2;
+  } else if (
+    data.length >= 4 &&
+    data[0] === 0x3c &&
+    data[1] === 0x00 &&
+    data[2] === 0x3f &&
+    data[3] === 0x00
+  ) {
+    encoding = "utf16le";
+  } else if (
+    data.length >= 4 &&
+    data[0] === 0x00 &&
+    data[1] === 0x3c &&
+    data[2] === 0x00 &&
+    data[3] === 0x3f
+  ) {
+    encoding = "utf16be";
+  }
+
+  const payload = data.subarray(bomLength);
+  const text =
+    encoding === "utf8"
+      ? payload.toString("utf8")
+      : encoding === "utf16le"
+        ? payload.toString("utf16le")
+        : swapUtf16ByteOrder(payload).toString("utf16le");
+  if (text.includes("\uFFFD")) {
+    throw new PublicFileSanitizationError(
+      "The Office XML entry could not be decoded safely",
+    );
+  }
+
+  const declared = text
+    .slice(0, 512)
+    .match(/<\?xml[^>]*\bencoding\s*=\s*["']([^"']+)["']/iu)?.[1]
+    ?.toLowerCase()
+    .replace(/[_\s]/g, "-");
+  const declarationMatches =
+    !declared ||
+    (declared === "utf-8" && encoding === "utf8") ||
+    (declared === "utf-16" && encoding !== "utf8") ||
+    (declared === "utf-16le" && encoding === "utf16le") ||
+    (declared === "utf-16be" && encoding === "utf16be");
+  if (!declarationMatches) {
+    throw new PublicFileSanitizationError(
+      "The Office XML encoding declaration is inconsistent",
+    );
+  }
+
+  const encode = (nextText: string) => {
+    if (encoding === "utf8") {
+      const bytes = Buffer.from(nextText, "utf8");
+      return bomLength
+        ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes])
+        : bytes;
+    }
+    const littleEndian = Buffer.from(nextText, "utf16le");
+    if (encoding === "utf16le") {
+      return bomLength
+        ? Buffer.concat([Buffer.from([0xff, 0xfe]), littleEndian])
+        : littleEndian;
+    }
+    const bigEndian = swapUtf16ByteOrder(littleEndian);
+    return bomLength
+      ? Buffer.concat([Buffer.from([0xfe, 0xff]), bigEndian])
+      : bigEndian;
+  };
+  return { text, encode };
+}
+
 /**
  * Sanitize an Office Open XML file (DOCX/XLSX/PPTX) by:
  * 1. Unzipping the archive in memory
@@ -3017,13 +3182,34 @@ async function sanitizeOfficeXmlBuffer(
   try {
     const JSZip = (await import("jszip")).default;
     const zip = await JSZip.loadAsync(data);
+    const fileNames = Object.keys(zip.files);
+    if (
+      !fileNames.some((name) => name.toLowerCase() === "[content_types].xml")
+    ) {
+      throw new PublicFileSanitizationError(
+        "The ZIP is not a recognized Office document",
+      );
+    }
+    const archiveComment = (zip as unknown as { comment?: string }).comment;
+    if (containsPrivateProviderBrand(archiveComment || "")) {
+      throw new PublicFileSanitizationError(
+        "The Office archive comment is not customer-safe",
+      );
+    }
 
     let modified = false;
 
     // Process all files in the ZIP
-    const fileNames = Object.keys(zip.files);
     for (const fname of fileNames) {
       const file = zip.files[fname];
+      if (
+        containsPrivateProviderBrand(fname) ||
+        containsPrivateProviderBrand(file.comment || "")
+      ) {
+        throw new PublicFileSanitizationError(
+          "The Office archive metadata is not customer-safe",
+        );
+      }
       if (file.dir) continue;
 
       // Only process XML-based files inside the archive
@@ -3033,16 +3219,35 @@ async function sanitizeOfficeXmlBuffer(
         lowerName.endsWith(".rels") ||
         lowerName === "[content_types].xml"
       ) {
-        try {
-          const content = await file.async("string");
-          const sanitized = sanitizeText(content);
-          if (sanitized !== content) {
-            zip.file(fname, sanitized);
-            modified = true;
-          }
-        } catch {
-          // Skip files that can't be read as text
+        const bytes = await file.async("nodebuffer");
+        const decoded = decodeOfficeXmlEntry(bytes);
+        const sanitized = sanitizeText(decoded.text);
+        if (containsPrivateProviderBrand(sanitized)) {
+          throw new PublicFileSanitizationError(
+            "The Office XML entry is not customer-safe",
+          );
         }
+        if (sanitized !== decoded.text) {
+          zip.file(fname, decoded.encode(sanitized));
+          modified = true;
+        }
+        continue;
+      }
+      const bytes = await file.async("nodebuffer");
+      const utf8 = bytes.toString("utf8");
+      const utf16le = bytes.length % 2 === 0 ? bytes.toString("utf16le") : "";
+      const utf16be =
+        bytes.length % 2 === 0
+          ? swapUtf16ByteOrder(bytes).toString("utf16le")
+          : "";
+      if (
+        containsPrivateProviderBrand(utf8) ||
+        containsPrivateProviderBrand(utf16le) ||
+        containsPrivateProviderBrand(utf16be)
+      ) {
+        throw new PublicFileSanitizationError(
+          "The Office archive contains unsafe binary metadata",
+        );
       }
     }
 
@@ -3061,7 +3266,10 @@ async function sanitizeOfficeXmlBuffer(
     console.error(
       `[FrontMind Proxy] Office XML sanitization error: ${err.message}`,
     );
-    return { buffer: data, wasSanitized: false };
+    if (err instanceof PublicFileSanitizationError) throw err;
+    throw new PublicFileSanitizationError(
+      "The Office document could not be safely inspected",
+    );
   }
 }
 
@@ -3074,7 +3282,7 @@ async function sanitizeOfficeXmlBuffer(
  * Handles text files, PDFs, and Office Open XML (DOCX/XLSX/PPTX).
  * Uses magic bytes as fallback detection when filename/content-type are unreliable.
  */
-async function sanitizeFileBuffer(
+export async function sanitizeFileBuffer(
   data: Buffer,
   filename: string,
   contentType?: string,
@@ -3087,13 +3295,25 @@ async function sanitizeFileBuffer(
     return sanitizePdfBuffer(data);
   }
 
-  // Check if it's an Office Open XML file (DOCX/XLSX/PPTX)
-  if (
-    isOfficeXmlFile(filename, contentType) ||
-    (isZipMagicBytes(data) && !isTextBasedFile(filename, contentType))
-  ) {
+  // Only explicit Office formats may enter the OOXML sanitizer. Arbitrary ZIP
+  // archives are not customer-safe unless every entry type can be proved and
+  // rewritten; fail closed instead of returning an uninspected package.
+  if (isOfficeXmlFile(filename, contentType)) {
+    if (!isZipMagicBytes(data)) {
+      throw new PublicFileSanitizationError(
+        "The Office document is not a valid ZIP package",
+      );
+    }
     console.log(`[FrontMind Proxy] Detected Office XML file: ${filename}`);
     return sanitizeOfficeXmlBuffer(data);
+  }
+  if (
+    isExplicitZipFile(filename, contentType) ||
+    containsZipContainerSignature(data)
+  ) {
+    throw new PublicFileSanitizationError(
+      "ZIP downloads require a customer-safe generated package",
+    );
   }
 
   // Check if it's a text-based file
@@ -3145,10 +3365,12 @@ type KnowledgeBaseManagedUploadResumeScope = {
   conversationId: string;
   turnId: string;
   clientRequestId: string;
+  expectedResetRevision: number;
 };
 
 type KnowledgeBaseManagedUploadReservation = {
   clientRequestId: string;
+  sourceResetRevision: number;
   attachmentManifest: Array<{
     filename: string;
     sizeBytes: number;
@@ -3183,7 +3405,13 @@ function parseKnowledgeBaseManagedUploadResumeScope(
     return knowledgeBaseManagedUploadReservationMismatch();
   }
   const source = value as Record<string, unknown>;
-  const expectedKeys = ["clientRequestId", "conversationId", "kind", "turnId"];
+  const expectedKeys = [
+    "clientRequestId",
+    "conversationId",
+    "expectedResetRevision",
+    "kind",
+    "turnId",
+  ];
   if (
     Object.keys(source).sort().join("\0") !== expectedKeys.join("\0") ||
     source.kind !== "knowledge_base"
@@ -3193,6 +3421,7 @@ function parseKnowledgeBaseManagedUploadResumeScope(
   const conversationId = source.conversationId;
   const turnId = source.turnId;
   const clientRequestId = source.clientRequestId;
+  const expectedResetRevision = source.expectedResetRevision;
   if (
     typeof conversationId !== "string" ||
     !conversationId ||
@@ -3205,11 +3434,19 @@ function parseKnowledgeBaseManagedUploadResumeScope(
     typeof clientRequestId !== "string" ||
     !clientRequestId ||
     clientRequestId !== clientRequestId.trim() ||
-    clientRequestId.length > 191
+    clientRequestId.length > 191 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    Number(expectedResetRevision) < 0
   ) {
     return knowledgeBaseManagedUploadReservationMismatch();
   }
-  return { kind: "knowledge_base", conversationId, turnId, clientRequestId };
+  return {
+    kind: "knowledge_base",
+    conversationId,
+    turnId,
+    clientRequestId,
+    expectedResetRevision: Number(expectedResetRevision),
+  };
 }
 
 function frozenKnowledgeBaseManagedUploadItems(
@@ -3220,6 +3457,8 @@ function frozenKnowledgeBaseManagedUploadItems(
     typeof reservation.clientRequestId !== "string" ||
     !reservation.clientRequestId ||
     reservation.clientRequestId !== reservation.clientRequestId.trim() ||
+    !Number.isSafeInteger(reservation.sourceResetRevision) ||
+    reservation.sourceResetRevision < 0 ||
     !Array.isArray(manifest) ||
     manifest.length < 1 ||
     manifest.length > 1_000
@@ -3288,6 +3527,12 @@ function bindManagedUploadRequestToKnowledgeBaseReservation(input: {
   reservation: KnowledgeBaseManagedUploadReservation;
 }) {
   if (input.resumeScope.clientRequestId !== input.reservation.clientRequestId) {
+    return knowledgeBaseManagedUploadReservationMismatch();
+  }
+  if (
+    input.resumeScope.expectedResetRevision !==
+    input.reservation.sourceResetRevision
+  ) {
     return knowledgeBaseManagedUploadReservationMismatch();
   }
   const items = frozenKnowledgeBaseManagedUploadItems(input.reservation);
@@ -3455,7 +3700,14 @@ router.post("/v1/managed-uploads", async (req: Request, res: Response) => {
       credentialId: pinnedCredential.id,
       credentialOwnerUserId: pinnedCredential.userId,
       credentialVersion: pinnedCredential.version,
-      resumeScope,
+      resumeScope: resumeScope
+        ? {
+            kind: resumeScope.kind,
+            conversationId: resumeScope.conversationId,
+            turnId: resumeScope.turnId,
+            clientRequestId: resumeScope.clientRequestId,
+          }
+        : null,
     });
     const ticket = createManagedUploadIntentTicket(manifest);
     return res.status(201).json({
@@ -5007,6 +5259,14 @@ router.get("/proxy-download", async (req: Request, res: Response) => {
     if (isExternalDownloadTooLarge(error)) {
       return sendExternalDownloadTooLarge(res);
     }
+    if (error instanceof PublicFileSanitizationError) {
+      return res.status(409).json({
+        error: {
+          message: "该文件暂时无法提供安全下载，请联系支持处理",
+          code: error.code,
+        },
+      });
+    }
     if (error instanceof ExternalUrlRejectedError) {
       return res.status(400).json({
         error: {
@@ -5143,11 +5403,26 @@ async function handleFileDownload(
   res.status(200);
   res.setHeader("content-type", finalContentType);
   setSafeContentDisposition(res, disposition, finalFilename);
-  const { buffer: sanitizedBuffer } = await sanitizeFileBuffer(
-    rawBuffer,
-    finalFilename,
-    finalContentType,
-  );
+  let sanitizedBuffer: Buffer;
+  try {
+    ({ buffer: sanitizedBuffer } = await sanitizeFileBuffer(
+      rawBuffer,
+      finalFilename,
+      finalContentType,
+    ));
+  } catch (error) {
+    if (!(error instanceof PublicFileSanitizationError)) throw error;
+    throw new OwnedFileContentError(
+      error.code,
+      "该文件暂时无法提供安全下载，请联系支持处理",
+      {
+        statusCode: 409,
+        retryable: false,
+        recoveryAction: "contact_admin",
+        expiresAt: resolved.expiresAt,
+      },
+    );
+  }
   res.setHeader("content-length", String(sanitizedBuffer.length));
   res.send(sanitizedBuffer);
 }

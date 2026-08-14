@@ -83,6 +83,10 @@ import {
 } from "./knowledge-base-api";
 import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import {
+  buildManusV2CreateTaskBody,
+  ManusV2ApiError,
+} from "./manus-v2-client";
+import {
   KnowledgeBaseAttachmentsProcessingError,
   KnowledgeBaseLocalPreparationError,
 } from "./knowledge-base-api-errors";
@@ -565,6 +569,56 @@ describe("knowledge-base turn HTTP outcomes", () => {
       code: "MANUS_V2_BIND_PERSISTENCE_UNKNOWN",
       recoveryDelayMs: 1_000,
     });
+    expect(persistCreateFailure).not.toHaveBeenCalled();
+  });
+
+  it("stops an ambiguous compatible create exactly once instead of marking it reconciling", async () => {
+    const stopCompatibleCreateOutcomeUnknown = vi
+      .fn()
+      .mockResolvedValue(true);
+    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const persistCreateFailure = vi.fn().mockResolvedValue("unknown");
+    const claim = {
+      turn: {
+        id: "turn-compatible-outcome-unknown",
+        userId: 7,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "sending",
+      },
+      leaseToken: "lease-compatible-outcome-unknown",
+      recoveryMetadata: { compatibilityMode: "minimal_v2_create" },
+    } as any;
+    const error = new ManusV2ApiError(
+      "task.create",
+      null,
+      "TRANSPORT_UNKNOWN",
+      false,
+      true,
+    );
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error,
+          outcomeUnknownCode: "MANUS_V2_CREATE_OUTCOME_UNKNOWN",
+        },
+        {
+          stopCompatibleCreateOutcomeUnknown,
+          markManusV2OutcomeUnknown,
+          persistCreateFailure,
+        },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(stopCompatibleCreateOutcomeUnknown).toHaveBeenCalledOnce();
+    expect(stopCompatibleCreateOutcomeUnknown).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      code: "MANUS_V2_CREATE_OUTCOME_UNKNOWN",
+    });
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
     expect(persistCreateFailure).not.toHaveBeenCalled();
   });
 
@@ -3075,7 +3129,7 @@ describe("knowledge base execution contract", () => {
       },
     });
 
-    expect(prompt).toContain("Manus v2 内容完成轮");
+    expect(prompt).toContain("FrontMind 内容完成轮");
     expect(prompt).toContain("Dashboard 在内容接受后异步生成");
     expect(prompt).toContain("不得创建或返回 ZIP、Logo、图片");
     expect(prompt).not.toContain("application/zip");
@@ -4032,6 +4086,250 @@ describe("knowledge base execution contract", () => {
     expect(createTask.mock.calls[0]?.[0]).toBe(dispatch);
     expect(bindTask).not.toHaveBeenCalled();
     expect(registerTask).not.toHaveBeenCalled();
+  });
+
+  it("fails a compatible create closed when the build already has a canonical task", async () => {
+    const operationKey = "b".repeat(64);
+    const claim = {
+      turn: {
+        id: "turn-compatible-state-changed",
+        userId: 7,
+        conversationId: "conversation-compatible-state-changed",
+        buildId: "build-compatible-state-changed",
+        buildGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        operationType: "confirm",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+      },
+      leaseToken: "lease-compatible-state-changed",
+      recoveryMetadata: {
+        kind: "turn",
+        conversationId: "conversation-compatible-state-changed",
+        compatibilityMode: "minimal_v2_create",
+      },
+      preparedDispatch: null,
+    } as any;
+    const beginDispatch = vi.fn();
+    const ensureDispatch = vi.fn();
+    const ensureManusV2Attachments = vi.fn();
+    const createTask = vi.fn();
+    const sendMessage = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue({
+            id: claim.turn.buildId,
+            userId: claim.turn.userId,
+            generation: claim.turn.buildGeneration,
+            providerProtocol: "manus_v2",
+            canonicalTaskId: "canonical-task-created-concurrently",
+          }),
+          ensureDispatch,
+          ensureManusV2Attachments,
+          beginDispatch,
+          createClient: vi.fn().mockReturnValue({
+            createTask,
+            sendMessage,
+          }),
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("dispatches the compatible create with title and a matching frozen shape hash", async () => {
+    process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
+    const operationKey = "c".repeat(64);
+    const claim = {
+      turn: {
+        id: "turn-compatible-create",
+        userId: 7,
+        conversationId: "conversation-compatible-create",
+        buildId: "build-compatible-create",
+        buildGeneration: 3,
+        expectedRevision: 7,
+        expectedLeafId: "1.8",
+        operationType: "confirm",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+      },
+      leaseToken: "lease-compatible-create",
+      upstreamIdempotencyKey: `frontmind-kb-v2:${operationKey}`,
+      recoveryMetadata: {
+        kind: "turn",
+        conversationId: "conversation-compatible-create",
+        compatibilityMode: "minimal_v2_create",
+      },
+      preparedDispatch: null,
+    } as any;
+    const build = {
+      id: claim.turn.buildId,
+      userId: claim.turn.userId,
+      generation: claim.turn.buildGeneration,
+      revision: claim.turn.expectedRevision,
+      currentLeafId: claim.turn.expectedLeafId,
+      status: "confirming",
+      providerProtocol: "manus_v2",
+      activeTurnId: claim.turn.id,
+      canonicalTaskId: null,
+      canonicalTaskUrl: null,
+      canonicalTaskState: "unbound",
+      upstreamTaskId: null,
+      totalNodeCount: 8,
+      confirmedCount: 7,
+      directPrefilledCount: 0,
+      lastTurnAttachmentCount: 0,
+      skillVersion: "knowledge-base-v2",
+      handoffProvenance: {},
+    } as any;
+    const prepared = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "确认当前节点",
+        agentProfile: "manus-1.6-max",
+        attachments: [],
+      },
+      bodySha256: "f".repeat(64),
+      preparedAt: "2026-08-14T00:00:00.000Z",
+    };
+    const beginDispatch = vi.fn().mockResolvedValue({
+      method: "task.create",
+      canonicalTaskId: null,
+      title: `FrontMind KB ${build.id} g${build.generation}`,
+      operationToken: operationKey,
+    });
+    const createTask = vi.fn().mockResolvedValue({
+      taskId: "compatible-canonical-task",
+      taskUrl: null,
+      requestId: "request-compatible-create",
+    });
+    const sendMessage = vi.fn();
+
+    try {
+      await expect(
+        knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+          claim,
+          { id: "credential-current", apiKey: "current-secret-key" } as any,
+          {
+            loadBuild: vi.fn().mockResolvedValue(build),
+            ensureDispatch: vi.fn().mockResolvedValue(prepared),
+            ensureManusV2Attachments: vi.fn().mockResolvedValue([]),
+            beginDispatch,
+            createClient: vi.fn().mockReturnValue({
+              createTask,
+              sendMessage,
+              updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
+              findCreatedTask: vi.fn(),
+              listAllMessages: vi.fn(),
+            }),
+            bindSubmission: vi.fn().mockResolvedValue(undefined),
+            reconcileTask: vi.fn().mockResolvedValue(false),
+          } as any,
+        ),
+      ).resolves.toMatchObject({
+        taskId: "compatible-canonical-task",
+        rebound: true,
+      });
+    } finally {
+      delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
+    }
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: `FrontMind KB ${build.id} g${build.generation}`,
+        hideInTaskList: true,
+      }),
+    );
+    const request = createTask.mock.calls[0]?.[0];
+    expect(request).not.toHaveProperty("agentProfile");
+    expect(request).not.toHaveProperty("structuredOutputSchema");
+    const expectedHash = createHash("sha256")
+      .update(JSON.stringify(buildManusV2CreateTaskBody(request)))
+      .digest("hex");
+    expect(beginDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedMethod: "task.create",
+        frozenProviderRequestHash: expectedHash,
+      }),
+    );
+
+    const ambiguousOperationKey = "d".repeat(64);
+    const ambiguousClaim = {
+      ...claim,
+      turn: {
+        ...claim.turn,
+        id: "turn-compatible-create-unknown",
+        operationKey: ambiguousOperationKey,
+        operationToken: ambiguousOperationKey,
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+        upstreamTaskId: null,
+        status: "running",
+      },
+      leaseToken: "lease-compatible-create-unknown",
+      upstreamIdempotencyKey: `frontmind-kb-v2:${ambiguousOperationKey}`,
+    } as any;
+    const ambiguousError = new ManusV2ApiError(
+      "task.create",
+      null,
+      "TRANSPORT_UNKNOWN",
+      false,
+      true,
+    );
+    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    createTask.mockReset().mockRejectedValueOnce(ambiguousError);
+
+    process.env.FRONTMIND_KB_MANUS_V2_WRITER = "true";
+    try {
+      await expect(
+        knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+          ambiguousClaim,
+          { id: "credential-current", apiKey: "current-secret-key" } as any,
+          {
+            loadBuild: vi.fn().mockResolvedValue(build),
+            ensureDispatch: vi.fn().mockResolvedValue(prepared),
+            ensureManusV2Attachments: vi.fn().mockResolvedValue([]),
+            beginDispatch,
+            markManusV2OutcomeUnknown,
+            createClient: vi.fn().mockReturnValue({
+              createTask,
+              sendMessage,
+              updateTaskVisibility: vi.fn(),
+              findCreatedTask: vi.fn(),
+              listAllMessages: vi.fn(),
+            }),
+            bindSubmission: vi.fn(),
+            reconcileTask: vi.fn(),
+          } as any,
+        ),
+      ).rejects.toBe(ambiguousError);
+    } finally {
+      delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
+    }
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
   });
 
   it("dispatches an active local-rehydrate reservation through one inline v2 create and never creates twice", async () => {

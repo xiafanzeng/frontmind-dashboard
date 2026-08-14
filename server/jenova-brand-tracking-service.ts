@@ -34,6 +34,12 @@ import {
   encryptCredentialSecret,
   type AuthenticatedUser,
 } from "./auth-service";
+import {
+  toBrandTrackingPublicCode,
+  toBrandTrackingPublicEvent,
+  toBrandTrackingPublicRecord,
+  toBrandTrackingPublicText,
+} from "./brand-tracking-public-projection";
 import { getDb } from "./db";
 import { getDashboardWorkspace } from "./dashboard-service";
 import {
@@ -212,6 +218,13 @@ export type BrandTrackingSseEvent =
         status: "completed" | "failed" | "pending_reconciliation";
       };
     };
+
+function brandTrackingPublicEmitter(
+  emit: (event: BrandTrackingSseEvent) => void | Promise<void>,
+) {
+  return (event: BrandTrackingSseEvent) =>
+    emit(toBrandTrackingPublicEvent(event));
+}
 
 export type JenovaCredentialAssignmentRowDto = {
   userId: number;
@@ -555,9 +568,16 @@ export async function getJenovaBrandTrackingOverview(
     eligible,
     keyConfigured: usage.keyConfigured,
     blocked: usage.blocked,
-    blockReason: usage.blockReason,
+    blockReason: usage.blockReason
+      ? toBrandTrackingPublicText(usage.blockReason)
+      : null,
     activeSessionId: activeSession[0]?.id ?? null,
-    usage,
+    usage: {
+      ...usage,
+      blockReason: usage.blockReason
+        ? toBrandTrackingPublicText(usage.blockReason)
+        : null,
+    },
   };
 }
 
@@ -570,11 +590,13 @@ function sessionSummary(
 ): BrandTrackingSessionSummaryDto {
   return {
     sessionId: session.id,
-    title: session.title,
+    title: toBrandTrackingPublicText(session.title),
     status: session.status,
     createdAt: toIso(session.createdAt),
     updatedAt: toIso(session.updatedAt),
-    ...(lastMessagePreview ? { lastMessagePreview } : {}),
+    ...(lastMessagePreview
+      ? { lastMessagePreview: toBrandTrackingPublicText(lastMessagePreview) }
+      : {}),
   };
 }
 
@@ -670,7 +692,7 @@ export async function getJenovaBrandTrackingSession(
       messages.push({
         messageId: `${turn.id}:user`,
         role: "user",
-        content: turn.userContent,
+        content: toBrandTrackingPublicText(turn.userContent),
         status: turn.status === "failed" ? "failed" : "completed",
         createdAt: toIso(turn.createdAt),
       });
@@ -678,7 +700,7 @@ export async function getJenovaBrandTrackingSession(
     messages.push({
       messageId: `${turn.id}:assistant`,
       role: "assistant",
-      content: turn.assistantContent,
+      content: toBrandTrackingPublicText(turn.assistantContent),
       status,
       createdAt: toIso(turn.createdAt),
       ...(turn.costState === "confirmed"
@@ -2022,24 +2044,30 @@ async function streamReservedTurn(input: {
           return;
         }
         if (event.type === "delta") {
-          input.reservation.turn.assistantContent += event.text;
+          const publicText = toBrandTrackingPublicText(event.text);
+          input.reservation.turn.assistantContent += publicText;
           await db
             .update(jenovaBrandTrackingTurns)
             .set({
-              assistantContent: sql`CONCAT(COALESCE(${jenovaBrandTrackingTurns.assistantContent}, ''), ${event.text})`,
+              assistantContent: sql`CONCAT(COALESCE(${jenovaBrandTrackingTurns.assistantContent}, ''), ${publicText})`,
               updatedAt: eventNow,
             })
             .where(eq(jenovaBrandTrackingTurns.id, input.reservation.turn.id));
-          if (event.text) {
+          if (publicText) {
             await input.emit({
               event: "delta",
-              data: { messageId, text: event.text, content: event.text },
+              data: { messageId, text: publicText, content: publicText },
             });
           }
           return;
         }
         if (event.type === "progress") {
-          progress.push(event.raw);
+          const publicMessage = toBrandTrackingPublicText(event.message);
+          const publicProgress: Record<string, unknown> = {
+            ...toBrandTrackingPublicRecord(event.raw),
+            message: publicMessage,
+          };
+          progress.push(publicProgress);
           if (progress.length > 100) progress.shift();
           await db
             .update(jenovaBrandTrackingTurns)
@@ -2049,19 +2077,25 @@ async function streamReservedTurn(input: {
             event: "progress",
             data: {
               messageId,
-              message: event.message,
-              ...(typeof event.raw.label === "string"
-                ? { label: event.raw.label }
+              message: publicMessage,
+              ...(typeof publicProgress.label === "string"
+                ? { label: publicProgress.label }
                 : {}),
-              ...(typeof event.raw.detail === "string"
-                ? { detail: event.raw.detail }
+              ...(typeof publicProgress.detail === "string"
+                ? { detail: publicProgress.detail }
                 : {}),
             },
           });
           return;
         }
         if (event.type === "warning") {
-          warnings.push(event.raw);
+          const publicCode = toBrandTrackingPublicCode(event.code, null);
+          const publicMessage = toBrandTrackingPublicText(event.message);
+          warnings.push({
+            ...toBrandTrackingPublicRecord(event.raw),
+            code: publicCode,
+            message: publicMessage,
+          });
           if (warnings.length > 100) warnings.shift();
           await db
             .update(jenovaBrandTrackingTurns)
@@ -2071,23 +2105,27 @@ async function streamReservedTurn(input: {
             event: "warning",
             data: {
               messageId,
-              code: event.code,
-              message: event.message,
+              code: publicCode,
+              message: publicMessage,
             },
           });
           return;
         }
         if (event.type === "error") {
+          const publicCode =
+            toBrandTrackingPublicCode(event.code, "UPSTREAM_UNAVAILABLE") ??
+            "UPSTREAM_UNAVAILABLE";
+          const publicMessage = toBrandTrackingPublicText(event.message);
           streamFailure.current = {
-            code: event.code,
-            message: event.message,
+            code: publicCode,
+            message: publicMessage,
             usageCost: event.usageCost,
           };
           await db
             .update(jenovaBrandTrackingTurns)
             .set({
-              errorCode: event.code,
-              errorMessage: event.message,
+              errorCode: publicCode,
+              errorMessage: publicMessage,
               ...(event.usageCost
                 ? {
                     usageCost: event.usageCost,
@@ -2100,8 +2138,8 @@ async function streamReservedTurn(input: {
           await input.emit({
             event: "error",
             data: {
-              code: event.code,
-              message: event.message,
+              code: publicCode,
+              message: publicMessage,
               recoverable: true,
             },
           });
@@ -2117,13 +2155,16 @@ async function streamReservedTurn(input: {
           hasStreamError: Boolean(streamFailure.current),
         });
         const completedAt = eventNow;
+        const publicStopReason = event.stopReason
+          ? toBrandTrackingPublicText(event.stopReason)
+          : null;
         await db
           .update(jenovaBrandTrackingTurns)
           .set({
             status,
             costState,
             usageCost: finalUsageCost,
-            stopReason: event.stopReason,
+            stopReason: publicStopReason,
             errorCode: streamFailure.current?.code ?? null,
             errorMessage: streamFailure.current?.message ?? null,
             completedAt,
@@ -2135,7 +2176,7 @@ async function streamReservedTurn(input: {
           status,
           costState,
           usageCost: finalUsageCost,
-          stopReason: event.stopReason,
+          stopReason: publicStopReason,
           completedAt,
           updatedAt: completedAt,
         };
@@ -2213,15 +2254,20 @@ async function streamReservedTurn(input: {
     const status = definiteFailed ? "failed" : "recovering";
     const costState = definiteFailed ? "confirmed" : "unknown";
     const serviceError = mapClientError(error);
+    const publicErrorCode =
+      toBrandTrackingPublicCode(
+        error instanceof JenovaClientError ? error.code : serviceError.code,
+        "UPSTREAM_UNAVAILABLE",
+      ) ?? "UPSTREAM_UNAVAILABLE";
+    const publicErrorMessage = toBrandTrackingPublicText(serviceError.message);
     await db
       .update(jenovaBrandTrackingTurns)
       .set({
         status,
         costState,
         usageCost: definiteFailed ? (rejectedUsageCost ?? ZERO) : null,
-        errorCode:
-          error instanceof JenovaClientError ? error.code : serviceError.code,
-        errorMessage: serviceError.message,
+        errorCode: publicErrorCode,
+        errorMessage: publicErrorMessage,
         completedAt: definiteFailed ? failedAt : null,
         updatedAt: failedAt,
       })
@@ -2231,17 +2277,16 @@ async function streamReservedTurn(input: {
       status,
       costState,
       usageCost: definiteFailed ? (rejectedUsageCost ?? ZERO) : null,
-      errorCode:
-        error instanceof JenovaClientError ? error.code : serviceError.code,
-      errorMessage: serviceError.message,
+      errorCode: publicErrorCode,
+      errorMessage: publicErrorMessage,
       completedAt: definiteFailed ? failedAt : null,
       updatedAt: failedAt,
     };
     await input.emit({
       event: "error",
       data: {
-        code: serviceError.code,
-        message: serviceError.message,
+        code: publicErrorCode,
+        message: publicErrorMessage,
         recoverable: !definiteFailed,
       },
     });
@@ -2284,6 +2329,7 @@ export async function startJenovaBrandTrackingSession(input: {
   dependencies?: JenovaBrandTrackingDependencies;
 }) {
   assertEligibleActor(input.actor);
+  const emit = brandTrackingPublicEmitter(input.emit);
   let clientRequestId: string;
   try {
     clientRequestId = clientRequestSchema.parse(input.clientRequestId);
@@ -2300,7 +2346,7 @@ export async function startJenovaBrandTrackingSession(input: {
     return streamReservedTurn({
       actor: input.actor,
       reservation: replay,
-      emit: input.emit,
+      emit,
       dependencies: resolved,
     });
   }
@@ -2334,7 +2380,7 @@ export async function startJenovaBrandTrackingSession(input: {
   return streamReservedTurn({
     actor: input.actor,
     reservation,
-    emit: input.emit,
+    emit,
     dependencies: resolved,
   });
 }
@@ -2348,6 +2394,7 @@ export async function sendJenovaBrandTrackingMessage(input: {
   dependencies?: JenovaBrandTrackingDependencies;
 }) {
   assertEligibleActor(input.actor);
+  const emit = brandTrackingPublicEmitter(input.emit);
   let clientRequestId: string;
   let content: string;
   try {
@@ -2367,7 +2414,7 @@ export async function sendJenovaBrandTrackingMessage(input: {
   return streamReservedTurn({
     actor: input.actor,
     reservation,
-    emit: input.emit,
+    emit,
     dependencies: resolved,
   });
 }
@@ -2571,7 +2618,8 @@ async function reconcileReservedTurn(
   }
   if (!record) return null;
   const terminal = recoveredTerminalState(record);
-  const content = recoveredContent(record);
+  const recovered = recoveredContent(record);
+  const content = recovered ? toBrandTrackingPublicText(recovered) : null;
   if (!terminal.terminal) {
     if (content) {
       await db
@@ -2599,8 +2647,20 @@ async function reconcileReservedTurn(
       .where(eq(jenovaBrandTrackingTurns.id, reservation.turn.id));
     return null;
   }
-  const completedContent = content ?? reservation.turn.assistantContent;
+  const completedContent = toBrandTrackingPublicText(
+    content ?? reservation.turn.assistantContent,
+  );
   const status = terminal.failed ? "failed" : "completed";
+  const publicStopReason = terminal.stopReason
+    ? toBrandTrackingPublicText(terminal.stopReason)
+    : null;
+  const publicErrorCode = toBrandTrackingPublicCode(
+    terminal.errorCode,
+    terminal.errorCode ? "UPSTREAM_UNAVAILABLE" : null,
+  );
+  const publicErrorMessage = terminal.errorMessage
+    ? toBrandTrackingPublicText(terminal.errorMessage)
+    : null;
   await db
     .update(jenovaBrandTrackingTurns)
     .set({
@@ -2608,9 +2668,9 @@ async function reconcileReservedTurn(
       status,
       costState: "confirmed",
       usageCost,
-      stopReason: terminal.stopReason,
-      errorCode: terminal.errorCode,
-      errorMessage: terminal.errorMessage,
+      stopReason: publicStopReason,
+      errorCode: publicErrorCode,
+      errorMessage: publicErrorMessage,
       completedAt: now,
       updatedAt: now,
     })
@@ -2621,9 +2681,9 @@ async function reconcileReservedTurn(
     status,
     costState: "confirmed",
     usageCost,
-    stopReason: terminal.stopReason,
-    errorCode: terminal.errorCode,
-    errorMessage: terminal.errorMessage,
+    stopReason: publicStopReason,
+    errorCode: publicErrorCode,
+    errorMessage: publicErrorMessage,
     completedAt: now,
     updatedAt: now,
   };
@@ -2690,7 +2750,7 @@ export async function recoverJenovaBrandTrackingTurns(
           costState: "confirmed",
           usageCost: ZERO,
           errorCode: "dispatch_not_started",
-          errorMessage: "服务重启前尚未向 Jenova 发送请求",
+          errorMessage: "服务重启前尚未发出请求",
           completedAt: now,
           updatedAt: now,
         })
@@ -2726,7 +2786,7 @@ export async function recoverJenovaBrandTrackingTurns(
                 status: "recovering",
                 costState: "unknown",
                 errorCode: "identity_missing",
-                errorMessage: "Jenova 已接收状态未知，等待人工或上游对账",
+                errorMessage: "请求接收状态未知，等待人工核验",
                 updatedAt: now,
               }
             : { updatedAt: now },

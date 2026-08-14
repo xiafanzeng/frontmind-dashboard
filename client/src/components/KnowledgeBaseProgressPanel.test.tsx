@@ -160,14 +160,14 @@ describe("KnowledgeBaseProgressPanel", () => {
     ).toBeTruthy();
   });
 
-  it("uses a build-local warning while preserving completed content", () => {
+  it("never presents a stopped build as an operation being restored", () => {
     const { container } = render(
       <KnowledgeBaseProgressPanel
         progress={{
           ...progress,
           build: {
             ...progress.build,
-            status: "ready_to_publish",
+            status: "protocol_error",
             currentLeafId: null,
             protocolError: "当前包操作正在对账",
           },
@@ -176,15 +176,15 @@ describe("KnowledgeBaseProgressPanel", () => {
       />,
     );
 
-    expect(screen.getByText("系统正在恢复当前操作")).toBeTruthy();
-    expect(screen.getByText("已完成内容不受影响。")).toBeTruthy();
-    expect(container.querySelector(".border-amber-200")).toBeTruthy();
-    expect(container.querySelector(".border-red-200")).toBeNull();
+    expect(screen.getByText("本轮已停止")).toBeTruthy();
     expect(
-      screen.getByText(
-        "知识库内容已完成，下载包正在后台准备；已完成正文不会回退。",
-      ),
+      screen.getByText("系统不会自动重发。已完成内容不受影响。"),
     ).toBeTruthy();
+    expect(screen.queryByText("当前包操作正在对账")).toBeNull();
+    expect(screen.queryByText("系统正在恢复当前操作")).toBeNull();
+    expect(container.querySelector(".border-slate-200")).toBeTruthy();
+    expect(container.querySelector(".border-red-200")).toBeNull();
+    expect(screen.queryByText(/Manus/i)).toBeNull();
   });
 
   it("distinguishes package ready from content-only completion", () => {

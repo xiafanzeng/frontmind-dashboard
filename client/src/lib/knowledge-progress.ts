@@ -297,6 +297,34 @@ export async function reconcileKnowledgeBaseObservation(
   return normalizeObservation(payload);
 }
 
+export async function executeKnowledgeBaseRecovery(input: {
+  conversationId: string;
+  recoveryToken: string;
+  clientRequestId: string;
+}): Promise<KnowledgeBaseObservationDto> {
+  const response = await fetch("/api/knowledge-base/recovery/execute", {
+    method: "POST",
+    credentials: "include",
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(input),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(
+      payload?.error?.message || "当前恢复状态已变化，请刷新后重试",
+    ) as Error & {
+      status?: number;
+      knowledgeObservation?: KnowledgeBaseObservationDto;
+    };
+    error.status = response.status;
+    if (payload?.observation?.interaction) {
+      error.knowledgeObservation = normalizeObservation(payload);
+    }
+    throw error;
+  }
+  return normalizeObservation(payload);
+}
+
 export async function retryKnowledgeBaseTurn(input: {
   conversationId: string;
   clientRequestId: string;

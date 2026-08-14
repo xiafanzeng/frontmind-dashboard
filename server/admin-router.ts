@@ -30,6 +30,7 @@ import {
   updateDashboardWorkspace,
 } from "./dashboard-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
+import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
 import {
   listMonitoringCitationsSchema,
   listMonitoringSampleCitationsSchema,
@@ -836,7 +837,7 @@ export const adminRouter = router({
             ) {
               throw new TRPCError({
                 code: "FORBIDDEN",
-                message: "该知识库修复尚未获得 Manus v2 发布授权",
+                message: "该知识库修复尚未获得 FrontMind 发布授权",
               });
             }
             throw toTrpcError(error);
@@ -894,7 +895,7 @@ export const adminRouter = router({
             ) {
               throw new TRPCError({
                 code: "FORBIDDEN",
-                message: "该知识库修复尚未获得 Manus v2 发布授权",
+                message: "该知识库修复尚未获得 FrontMind 发布授权",
               });
             }
             throw toTrpcError(error);
@@ -1386,10 +1387,12 @@ export const adminRouter = router({
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           return {
-            progress: await getKnowledgeBaseProgress({
-              userId: input.userId,
-              conversationId: input.conversationId,
-            }),
+            progress: toKnowledgeBasePublicPayload(
+              await getKnowledgeBaseProgress({
+                userId: input.userId,
+                conversationId: input.conversationId,
+              }),
+            ),
           };
         } catch (error) {
           throw toTrpcError(error);
@@ -1414,7 +1417,9 @@ export const adminRouter = router({
       .query(async ({ ctx, input }) => {
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
-          return await getManagedKnowledgeActivity(input.userId);
+          return toKnowledgeBasePublicPayload(
+            await getManagedKnowledgeActivity(input.userId),
+          );
         } catch (error) {
           throw toTrpcError(error);
         }

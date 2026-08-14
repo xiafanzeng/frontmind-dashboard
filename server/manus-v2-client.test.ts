@@ -305,6 +305,65 @@ describe("ManusV2Client", () => {
     });
   });
 
+  it("captures only allowlisted request and validation coordinates from an explicit rejection", async () => {
+    vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 400,
+      headers: { "x-request-id": "req-create-400:01" },
+      data: {
+        ok: false,
+        error: {
+          code: "invalid_argument",
+          field: "agent_profile",
+          path: "request.agent_profile[0]",
+        },
+      },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.createTask({ prompt: "start", title: "unique title" }),
+    ).rejects.toMatchObject({
+      code: "invalid_argument",
+      outcomeUnknown: false,
+      providerRequestId: "req-create-400:01",
+      providerField: "agent_profile",
+      providerPath: "agent_profile",
+    });
+  });
+
+  it("drops malformed provider diagnostics instead of retaining response text", async () => {
+    vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 400,
+      headers: { "x-request-id": "request id with unsafe text" },
+      data: {
+        ok: false,
+        request_id: "../../unsafe request id",
+        error: {
+          code: "invalid_argument",
+          field: "sk-proj-secret",
+          path: "secret.token",
+        },
+      },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.createTask({ prompt: "start", title: "unique title" }),
+    ).rejects.toMatchObject({
+      code: "invalid_argument",
+      outcomeUnknown: false,
+      providerRequestId: null,
+      providerField: null,
+      providerPath: null,
+    });
+  });
+
   it("uses Retry-After only when Manus explicitly rejected the request and supplied it", async () => {
     const post = vi.spyOn(axios.Axios.prototype, "post");
     post

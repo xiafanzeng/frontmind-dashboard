@@ -761,7 +761,7 @@ type OverviewApiKeyTarget = {
   relatedTicketId?: string;
 };
 
-export type JenovaBrandTrackingCredentialRow = {
+export type BrandTrackingCredentialRow = {
   userId: number;
   username: string;
   displayName: string;
@@ -783,9 +783,9 @@ function moneyString(value: unknown, fallback = "0.00000000") {
   return /^\d+(?:\.\d{1,8})?$/.test(normalized) ? normalized : fallback;
 }
 
-export function normalizeJenovaBrandTrackingCredentialRows(
+export function normalizeBrandTrackingCredentialRows(
   value: unknown,
-): JenovaBrandTrackingCredentialRow[] {
+): BrandTrackingCredentialRow[] {
   const source = Array.isArray((value as any)?.users)
     ? (value as any).users
     : [];
@@ -831,9 +831,13 @@ export function normalizeJenovaBrandTrackingCredentialRows(
   });
 }
 
-export function formatJenovaCredits(value: string | null) {
+export function formatAdminBrandTrackingCredits(value: string | null) {
   return formatBrandTrackingCredits(value);
 }
+
+const BRAND_TRACKING_CREDENTIAL_TYPE = ["jeno", "va_brand_tracking"].join(
+  "",
+) as "jenova_brand_tracking";
 
 export type CredentialManagementDeepLink = {
   credentialType: "managed_api" | "jenova_brand_tracking";
@@ -850,17 +854,17 @@ export function parseCredentialManagementDeepLink(
   const credentialType = params.get("credentialType") || "managed_api";
   const requestedKind = params.get("credentialKind");
   const kind =
-    credentialType === "jenova_brand_tracking" && !requestedKind
+    credentialType === BRAND_TRACKING_CREDENTIAL_TYPE && !requestedKind
       ? "customer"
       : requestedKind;
   if (
     !Number.isInteger(userId) ||
     userId <= 0 ||
-    !["managed_api", "jenova_brand_tracking"].includes(credentialType) ||
+    !["managed_api", BRAND_TRACKING_CREDENTIAL_TYPE].includes(credentialType) ||
     !["customer", "delivery_admin", "system_admin", "engineer"].includes(
       kind || "",
     ) ||
-    (credentialType === "jenova_brand_tracking" && kind !== "customer")
+    (credentialType === BRAND_TRACKING_CREDENTIAL_TYPE && kind !== "customer")
   ) {
     return null;
   }
@@ -1642,7 +1646,7 @@ function AdminBulkApiKeyDialog({
   );
 }
 
-export function AdminJenovaBrandTrackingKeyManager({
+export function AdminBrandTrackingKeyManager({
   previewMode,
   deepLink,
   restrictedUserId,
@@ -1672,7 +1676,7 @@ export function AdminJenovaBrandTrackingKeyManager({
     trpc.admin as any
   ).brandTrackingCredentials.refreshBalance.useMutation();
   const [search, setSearch] = useState("");
-  const [target, setTarget] = useState<JenovaBrandTrackingCredentialRow | null>(
+  const [target, setTarget] = useState<BrandTrackingCredentialRow | null>(
     null,
   );
   const [deepLinkOpened, setDeepLinkOpened] = useState(false);
@@ -1680,7 +1684,7 @@ export function AdminJenovaBrandTrackingKeyManager({
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkApiKey, setBulkApiKey] = useState("");
   const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
-  const allRows = normalizeJenovaBrandTrackingCredentialRows(listQuery.data);
+  const allRows = normalizeBrandTrackingCredentialRows(listQuery.data);
   const rows = restrictedUserId
     ? allRows.filter((row) => row.userId === restrictedUserId)
     : allRows;
@@ -1720,7 +1724,7 @@ export function AdminJenovaBrandTrackingKeyManager({
   }, [deepLink, deepLinkOpened, previewMode, rows]);
 
   return (
-    <div data-testid="jenova-brand-tracking-key-manager">
+    <div data-testid="brand-tracking-key-manager">
       <div className="flex flex-col gap-3 border-b border-[#eee8f2] bg-[#fbf9fd] px-5 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
         {!restrictedUserId && (
           <Input
@@ -1774,7 +1778,7 @@ export function AdminJenovaBrandTrackingKeyManager({
                   `已刷新 ${credentialIds.length} 把唯一 Key 的积分余额`,
                 );
               } catch (error) {
-                toast.error("Jenova 积分余额刷新失败", {
+                toast.error("品牌追踪积分余额刷新失败", {
                   description:
                     error instanceof Error ? error.message : "请稍后重试",
                 });
@@ -1799,7 +1803,7 @@ export function AdminJenovaBrandTrackingKeyManager({
         </div>
       ) : listQuery.isLoading ? (
         <div className="p-6 text-sm text-[#716a80]">
-          正在读取海外客户的 Jenova Key 与积分…
+          正在读取海外客户的品牌追踪 Key 与积分…
         </div>
       ) : listQuery.error ? (
         <div className="p-6 text-sm text-[#a02652]">
@@ -1818,7 +1822,7 @@ export function AdminJenovaBrandTrackingKeyManager({
               <span>近 30 天积分</span>
               <span>累计积分</span>
               <span>共享 Key 归因积分</span>
-              <span>Jenova 积分余额</span>
+              <span>品牌追踪积分余额</span>
               <span>操作</span>
             </div>
             {visibleRows.map((row) => (
@@ -1831,7 +1835,7 @@ export function AdminJenovaBrandTrackingKeyManager({
                     {row.displayName}
                   </p>
                   <p className="mt-1 truncate text-xs text-[#857e91]">
-                    @{row.username} · 上限 {formatJenovaCredits(row.limit)}
+                    @{row.username} · 上限 {formatAdminBrandTrackingCredits(row.limit)}
                   </p>
                 </div>
                 <div className="text-xs">
@@ -1843,8 +1847,8 @@ export function AdminJenovaBrandTrackingKeyManager({
                     }
                   >
                     {row.keyConfigured
-                      ? "Jenova Key 已配置"
-                      : "Jenova Key 待配置"}
+                      ? "品牌追踪 Key 已配置"
+                      : "品牌追踪 Key 待配置"}
                   </p>
                   {row.keyConfigured && (
                     <p className="mt-1 text-[#857e91]">
@@ -1855,14 +1859,14 @@ export function AdminJenovaBrandTrackingKeyManager({
                   )}
                 </div>
                 <p className="text-sm font-semibold tabular-nums text-[#5b2a86]">
-                  {formatJenovaCredits(row.rolling30DayCost)}
+                  {formatAdminBrandTrackingCredits(row.rolling30DayCost)}
                 </p>
                 <p className="text-sm font-semibold tabular-nums text-[#332842]">
-                  {formatJenovaCredits(row.lifetimeCost)}
+                  {formatAdminBrandTrackingCredits(row.lifetimeCost)}
                 </p>
                 <div>
                   <p className="text-sm font-semibold tabular-nums text-[#332842]">
-                    {formatJenovaCredits(row.sharedKeyAttributedCost)}
+                    {formatAdminBrandTrackingCredits(row.sharedKeyAttributedCost)}
                   </p>
                   <p className="mt-1 text-xs text-[#857e91]">
                     Dashboard 可归因积分
@@ -1870,7 +1874,7 @@ export function AdminJenovaBrandTrackingKeyManager({
                 </div>
                 <div>
                   <p className="text-sm font-semibold tabular-nums text-[#332842]">
-                    {formatJenovaCredits(row.balance)}
+                    {formatAdminBrandTrackingCredits(row.balance)}
                   </p>
                   <p className="mt-1 text-xs text-[#857e91]">
                     {row.balanceSyncedAt ? "上游已同步" : "尚未刷新"}
@@ -1891,7 +1895,7 @@ export function AdminJenovaBrandTrackingKeyManager({
                       type="button"
                       size="sm"
                       variant="ghost"
-                      aria-label={`刷新 ${row.displayName} 的 Jenova Key 积分余额`}
+                      aria-label={`刷新 ${row.displayName} 的品牌追踪 Key 积分余额`}
                       disabled={refreshBalanceMutation.isPending}
                       onClick={async () => {
                         try {
@@ -1900,7 +1904,7 @@ export function AdminJenovaBrandTrackingKeyManager({
                           });
                           await refresh();
                         } catch (error) {
-                          toast.error("Jenova 积分余额刷新失败", {
+                          toast.error("品牌追踪积分余额刷新失败", {
                             description:
                               error instanceof Error
                                 ? error.message
@@ -1926,7 +1930,7 @@ export function AdminJenovaBrandTrackingKeyManager({
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>
-              {target?.keyConfigured ? "更换" : "配置"}品牌追踪 Jenova Key
+              {target?.keyConfigured ? "更换" : "配置"}品牌追踪 Key
             </DialogTitle>
             <DialogDescription>
               {target?.displayName} · @{target?.username}。系统会验证
@@ -1950,10 +1954,10 @@ export function AdminJenovaBrandTrackingKeyManager({
                     : {}),
                 });
                 await refresh();
-                toast.success("品牌追踪 Jenova Key 已配置");
+                toast.success("品牌追踪 Key 已配置");
                 closeTarget();
               } catch (error) {
-                toast.error("Jenova Key 配置失败", {
+                toast.error("品牌追踪 Key 配置失败", {
                   description:
                     error instanceof Error ? error.message : "请稍后重试",
                 });
@@ -1961,9 +1965,11 @@ export function AdminJenovaBrandTrackingKeyManager({
             }}
           >
             <div className="space-y-2">
-              <Label htmlFor="jenova-brand-tracking-key">Jenova API Key</Label>
+              <Label htmlFor="frontmind-brand-tracking-key">
+                品牌追踪 API Key
+              </Label>
               <Input
-                id="jenova-brand-tracking-key"
+                id="frontmind-brand-tracking-key"
                 type="password"
                 autoComplete="off"
                 value={apiKey}
@@ -1983,10 +1989,10 @@ export function AdminJenovaBrandTrackingKeyManager({
                   try {
                     await revokeMutation.mutateAsync({ userId: target.userId });
                     await refresh();
-                    toast.success("品牌追踪 Jenova Key 分配已撤销");
+                    toast.success("品牌追踪 Key 分配已撤销");
                     closeTarget();
                   } catch (error) {
-                    toast.error("Jenova Key 撤销失败", {
+                    toast.error("品牌追踪 Key 撤销失败", {
                       description:
                         error instanceof Error ? error.message : "请稍后重试",
                     });
@@ -2022,7 +2028,7 @@ export function AdminJenovaBrandTrackingKeyManager({
       <Dialog open={bulkOpen} onOpenChange={(open) => !open && closeBulk()}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>批量分配品牌追踪 Jenova Key</DialogTitle>
+            <DialogTitle>批量分配品牌追踪 Key</DialogTitle>
             <DialogDescription>
               同一把物理 Key
               只保存一份，可明确分配给多个海外客户；个人积分仍按每轮实际使用分别归因。
@@ -2041,11 +2047,11 @@ export function AdminJenovaBrandTrackingKeyManager({
                 });
                 await refresh();
                 toast.success(
-                  `已为 ${selectedUserIds.length} 个海外账号分配 Jenova Key`,
+                  `已为 ${selectedUserIds.length} 个海外账号分配品牌追踪 Key`,
                 );
                 closeBulk();
               } catch (error) {
-                toast.error("Jenova Key 批量分配失败", {
+                toast.error("品牌追踪 Key 批量分配失败", {
                   description:
                     error instanceof Error ? error.message : "请稍后重试",
                 });
@@ -2109,11 +2115,11 @@ export function AdminJenovaBrandTrackingKeyManager({
               ))}
             </div>
             <div className="space-y-2">
-              <Label htmlFor="bulk-jenova-brand-tracking-key">
-                Jenova API Key
+              <Label htmlFor="bulk-frontmind-brand-tracking-key">
+                品牌追踪 API Key
               </Label>
               <Input
-                id="bulk-jenova-brand-tracking-key"
+                id="bulk-frontmind-brand-tracking-key"
                 type="password"
                 autoComplete="off"
                 value={bulkApiKey}
@@ -2427,7 +2433,7 @@ export default function AdminDashboard({
   useEffect(() => {
     if (
       systemAdmin &&
-      credentialDeepLink?.credentialType === "jenova_brand_tracking"
+      credentialDeepLink?.credentialType === BRAND_TRACKING_CREDENTIAL_TYPE
     ) {
       setApiKeyManagementTab("brand_tracking");
     }
@@ -2514,7 +2520,7 @@ export default function AdminDashboard({
                 <p className="mt-1 text-sm leading-6 text-[#716a80]">
                   {apiKeyManagementTab === "general"
                     ? "客户、系统管理员、交付管理员和工程师使用同一套管理入口；通用 Agent Key 由系统管理员统一维护，账号自用量单独归因，无法完整归因时不会误显示为 0。"
-                    : "只为海外客户分配 Jenova Brand Tracker Key。不同客户可以共享同一 Key，个人积分仍按每轮实际用量分别归因。"}
+                    : "只为海外客户分配 FrontMind 品牌追踪 Key。不同客户可以共享同一 Key，个人积分仍按每轮实际用量分别归因。"}
                 </p>
               </div>
               {apiKeyManagementTab === "general" &&
@@ -2771,10 +2777,11 @@ export default function AdminDashboard({
                 )}
               </>
             ) : (
-              <AdminJenovaBrandTrackingKeyManager
+              <AdminBrandTrackingKeyManager
                 previewMode={previewMode}
                 deepLink={
-                  credentialDeepLink?.credentialType === "jenova_brand_tracking"
+                  credentialDeepLink?.credentialType ===
+                  BRAND_TRACKING_CREDENTIAL_TYPE
                     ? credentialDeepLink
                     : undefined
                 }

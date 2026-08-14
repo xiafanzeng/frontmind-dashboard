@@ -1022,6 +1022,7 @@ describe("prepareConversationForCloud", () => {
     const clean = prepareConversationForCloud({
       ...conversation("one"),
       apiKeyFingerprint: "fingerprint",
+      taskUrl: "https://provider.example/task/private",
       messages: [
         {
           id: "message",
@@ -1050,6 +1051,7 @@ describe("prepareConversationForCloud", () => {
     });
 
     expect(clean.apiKeyFingerprint).toBeUndefined();
+    expect(clean.taskUrl).toBeUndefined();
     expect(clean.messages[0].attachments).toEqual([
       {
         id: "file",

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   KNOWLEDGE_BASE_FOUNDATION_COPY,
+  knowledgeBaseExplicitRecoveryRequest,
   knowledgeBaseNoticeRecoveryMode,
   knowledgeBaseNoticeRequiresAttachmentRepair,
   knowledgeBaseNoticeRequiresLogoProvenanceRepair,
@@ -210,6 +211,85 @@ describe("knowledge-base notice recovery", () => {
     expect(
       knowledgeBaseNoticeRetryLabel({ code: "PROGRESS_PROTOCOL_INVALID" }),
     ).toBe("");
+  });
+
+  it.each([
+    ["retry_request", "确认后继续本轮"],
+    ["start_new_generation", "创建新任务继续"],
+  ] as const)(
+    "routes %s only through the token-bound execute endpoint",
+    async (recoveryAction, label) => {
+      const observation = { interaction: { progress: null } } as any;
+      const reconcile = vi.fn();
+      const retry = vi.fn();
+      const execute = vi.fn().mockResolvedValue(observation);
+      const notice = {
+        code: "FRONTMIND_KB_RETRY_AVAILABLE",
+        recoveryAction,
+        recoveryToken: "a".repeat(64),
+        canRegenerate: false,
+      };
+
+      await expect(
+        recoverKnowledgeBaseNotice(
+          { ...input, notice },
+          { reconcile, retry, execute },
+        ),
+      ).resolves.toBe(observation);
+      expect(execute).toHaveBeenCalledWith({
+        conversationId: "knowledge-conversation",
+        recoveryToken: "a".repeat(64),
+        clientRequestId: "retry-request",
+      });
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(retry).not.toHaveBeenCalled();
+      expect(knowledgeBaseNoticeRecoveryMode(notice)).toBe("explicit_recovery");
+      expect(knowledgeBaseNoticeRetryLabel(notice)).toBe(label);
+    },
+  );
+
+  it("does not expose an executable action without a valid token", () => {
+    expect(
+      knowledgeBaseNoticeRecoveryMode({
+        code: "FRONTMIND_KB_RETRY_AVAILABLE",
+        recoveryAction: "retry_request",
+        recoveryToken: "invalid",
+      }),
+    ).toBe("none");
+    expect(
+      knowledgeBaseNoticeRecoveryMode({
+        code: "FRONTMIND_KB_STOPPED",
+        recoveryAction: "stopped",
+        recoveryToken: "a".repeat(64),
+      }),
+    ).toBe("none");
+  });
+
+  it("reuses one client request id for double-click and response-loss replay", () => {
+    const createClientRequestId = vi
+      .fn()
+      .mockReturnValueOnce("request-one")
+      .mockReturnValueOnce("request-two");
+    const first = knowledgeBaseExplicitRecoveryRequest(
+      null,
+      "a".repeat(64),
+      createClientRequestId,
+    );
+    const replay = knowledgeBaseExplicitRecoveryRequest(
+      first,
+      "a".repeat(64),
+      createClientRequestId,
+    );
+    const changed = knowledgeBaseExplicitRecoveryRequest(
+      replay,
+      "b".repeat(64),
+      createClientRequestId,
+    );
+
+    expect(replay).toBe(first);
+    expect(replay.clientRequestId).toBe("request-one");
+    expect(changed.clientRequestId).toBe("request-two");
+    expect(createClientRequestId).toHaveBeenCalledTimes(2);
   });
 
   it("creates a new task only from the authoritative regeneration contract", async () => {

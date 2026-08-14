@@ -83,6 +83,7 @@ import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progres
 import { trpc } from "@/lib/trpc";
 import {
   KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE,
+  executeKnowledgeBaseRecovery,
   knowledgeBaseObservationFromPayload,
   reconcileKnowledgeBaseObservation,
   recoverKnowledgeBaseCanonicalFromSnapshot,
@@ -143,6 +144,16 @@ function safeKnowledgeBaseTraceId(value: unknown) {
     : undefined;
 }
 
+export function knowledgeBaseExplicitRecoveryRequest(
+  current: { recoveryToken: string; clientRequestId: string } | null,
+  recoveryToken: string,
+  createClientRequestId: () => string,
+) {
+  return current?.recoveryToken === recoveryToken
+    ? current
+    : { recoveryToken, clientRequestId: createClientRequestId() };
+}
+
 export function shouldRenderKnowledgeBaseNotice(
   notice: Pick<KnowledgeBaseClientNotice, "code">,
 ) {
@@ -152,7 +163,7 @@ export function shouldRenderKnowledgeBaseNotice(
 export function knowledgeBaseNoticeRecoveryMode(
   notice: Pick<
     KnowledgeBaseClientNotice,
-    "code" | "recoveryAction" | "canRegenerate"
+    "code" | "recoveryAction" | "recoveryToken" | "canRegenerate"
   >,
 ) {
   if (notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE) {
@@ -160,6 +171,14 @@ export function knowledgeBaseNoticeRecoveryMode(
   }
   if (notice.code === KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE) {
     return "logo_repair" as const;
+  }
+  if (
+    (notice.recoveryAction === "retry_request" ||
+      notice.recoveryAction === "start_new_generation") &&
+    typeof notice.recoveryToken === "string" &&
+    /^[a-f0-9]{64}$/u.test(notice.recoveryToken)
+  ) {
+    return "explicit_recovery" as const;
   }
   if (
     notice.recoveryAction === "reconcile" ||
@@ -189,34 +208,38 @@ export function knowledgeBaseNoticeRecoveryMode(
 export function knowledgeBaseNoticeRetryLabel(
   notice: Pick<
     KnowledgeBaseClientNotice,
-    "code" | "recoveryAction" | "canRegenerate"
+    "code" | "recoveryAction" | "recoveryToken" | "canRegenerate"
   >,
 ) {
-  return knowledgeBaseNoticeRecoveryMode(notice) === "reconcile"
-    ? notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE
-      ? "重新绑定成品"
-      : notice.recoveryAction === "update_credential"
-        ? "更新凭证后继续本轮"
-        : notice.recoveryAction === "top_up"
-          ? "补充额度后继续本轮"
-          : "继续恢复本轮"
-    : knowledgeBaseNoticeRecoveryMode(notice) === "start_recovery"
-      ? notice.recoveryAction === "reselect_start_sources"
-        ? "重新上传资料"
-        : "使用原资料重新开始（将创建新任务）"
-      : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
-        ? "重新上传 Logo 原图"
-        : knowledgeBaseNoticeRecoveryMode(notice) === "canonical_recovery"
-          ? "创建新任务继续"
-          : knowledgeBaseNoticeRecoveryMode(notice) === "regenerate"
-            ? "重新生成本轮（将创建一次新的 API 任务）"
-            : "";
+  return knowledgeBaseNoticeRecoveryMode(notice) === "explicit_recovery"
+    ? notice.recoveryAction === "start_new_generation"
+      ? "创建新任务继续"
+      : "确认后继续本轮"
+    : knowledgeBaseNoticeRecoveryMode(notice) === "reconcile"
+      ? notice.code === KNOWLEDGE_BASE_PACKAGE_REBIND_NOTICE_CODE
+        ? "重新绑定成品"
+        : notice.recoveryAction === "update_credential"
+          ? "更新凭证后继续本轮"
+          : notice.recoveryAction === "top_up"
+            ? "补充额度后继续本轮"
+            : "继续恢复本轮"
+      : knowledgeBaseNoticeRecoveryMode(notice) === "start_recovery"
+        ? notice.recoveryAction === "reselect_start_sources"
+          ? "重新上传资料"
+          : "使用原资料重新开始（将创建新任务）"
+        : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
+          ? "重新上传 Logo 原图"
+          : knowledgeBaseNoticeRecoveryMode(notice) === "canonical_recovery"
+            ? "创建新任务继续"
+            : knowledgeBaseNoticeRecoveryMode(notice) === "regenerate"
+              ? "重新生成本轮（将创建一次新的 API 任务）"
+              : "";
 }
 
 export function knowledgeBaseNoticeHasRecoveryAction(
   notice: Pick<
     KnowledgeBaseClientNotice,
-    "code" | "recoveryAction" | "canRegenerate"
+    "code" | "recoveryAction" | "recoveryToken" | "canRegenerate"
   >,
 ) {
   return knowledgeBaseNoticeRecoveryMode(notice) !== "none";
@@ -262,7 +285,7 @@ export async function recoverKnowledgeBaseNotice(
     conversationId: string;
     notice: Pick<
       KnowledgeBaseClientNotice,
-      "code" | "recoveryAction" | "canRegenerate"
+      "code" | "recoveryAction" | "recoveryToken" | "canRegenerate"
     >;
     clientRequestId: string;
     expectedGeneration: number;
@@ -274,8 +297,16 @@ export async function recoverKnowledgeBaseNotice(
   dependencies: {
     reconcile?: typeof reconcileKnowledgeBaseObservation;
     retry?: typeof retryKnowledgeBaseTurn;
+    execute?: typeof executeKnowledgeBaseRecovery;
   } = {},
 ): Promise<KnowledgeBaseObservationDto> {
+  if (knowledgeBaseNoticeRecoveryMode(input.notice) === "explicit_recovery") {
+    return (dependencies.execute ?? executeKnowledgeBaseRecovery)({
+      conversationId: input.conversationId,
+      recoveryToken: input.notice.recoveryToken!,
+      clientRequestId: input.clientRequestId,
+    });
+  }
   if (knowledgeBaseNoticeRecoveryMode(input.notice) === "reconcile") {
     return (dependencies.reconcile ?? reconcileKnowledgeBaseObservation)({
       conversationId: input.conversationId,
@@ -536,6 +567,8 @@ export async function uploadKnowledgeBaseStarterFiles(
                   conversationId: lifecycle.reservation.conversationId,
                   turnId: lifecycle.reservation.turnId,
                   clientRequestId: lifecycle.reservation.clientRequestId,
+                  expectedResetRevision:
+                    lifecycle.reservation.expectedResetRevision,
                 },
               }
             : {}),
@@ -606,12 +639,60 @@ export async function uploadKnowledgeBaseStarterFiles(
             });
           },
         };
-        const uploaded = await uploadImplementation(
-          file,
-          undefined,
-          undefined,
-          uploadOptions,
-        );
+        let uploaded: Awaited<ReturnType<typeof uploadFile>>;
+        try {
+          uploaded = await uploadImplementation(
+            file,
+            undefined,
+            undefined,
+            uploadOptions,
+          );
+        } catch (firstError) {
+          const code = String(
+            (firstError as { code?: unknown } | null)?.code || "",
+          );
+          const frozen = lifecycle.attachmentManifest?.[fileIndex];
+          const retryHandle = currentUploadHandle;
+          const sameFile = Boolean(
+            frozen &&
+              frozen.filename ===
+                normalizedKnowledgeBaseUploadFilename(file.name) &&
+              frozen.sizeBytes === file.size &&
+              frozen.mimeType === normalizedKnowledgeBaseUploadMimeType(file) &&
+              frozen.lastModified ===
+                Math.max(0, Number(file.lastModified || 0)) &&
+              frozen.sha256 === (await sha256UploadFile(file)),
+          );
+          const canRetrySameIntent = Boolean(
+            [
+              "UPLOAD_BROWSER_BODY_INCOMPLETE",
+              "UPLOAD_BROWSER_BODY_REQUIRED",
+            ].includes(code) &&
+              sameFile &&
+              retryHandle?.intentId &&
+              retryHandle.ticket &&
+              retryHandle.expiresAt > Date.now() &&
+              lifecycle.reservation &&
+              lifecycle.expectedResetRevision ===
+                lifecycle.reservation.expectedResetRevision &&
+              !lifecycle.signal.aborted,
+          );
+          if (!canRetrySameIntent) throw firstError;
+          lifecycle.onFileUpdate(itemId, file, {
+            stage: "recovering",
+            itemId: retryHandle!.itemId,
+            intentId: retryHandle!.intentId,
+            uploadHandle: retryHandle,
+            loadedBytes: transferredBytes,
+            totalBytes: file.size,
+            attempt,
+          });
+          uploaded = await uploadImplementation(file, undefined, undefined, {
+            ...uploadOptions,
+            existingFileId: undefined,
+            existingUploadHandle: retryHandle,
+          });
+        }
         if (lifecycle.signal.aborted) {
           throw new DOMException("上传已停止", "AbortError");
         }
@@ -1002,6 +1083,8 @@ export default function ChatArea({
   reserveOuterMobileNav = false,
   knowledgeBaseProgress,
   knowledgeBaseResetRevision,
+  knowledgeBaseAccountId,
+  onKnowledgeBaseBatchCancelled,
 }: {
   fixedAgentProfile?: string;
   syncKnowledgeBaseSnapshot?: boolean;
@@ -1013,6 +1096,11 @@ export default function ChatArea({
   reserveOuterMobileNav?: boolean;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
   knowledgeBaseResetRevision?: number;
+  knowledgeBaseAccountId?: number;
+  onKnowledgeBaseBatchCancelled?: (
+    conversationId: string,
+    resetRevision: number,
+  ) => void | Promise<void>;
 }) {
   const {
     activeConversation,
@@ -1037,6 +1125,10 @@ export default function ChatArea({
     staleTime: 30_000,
   });
   const messagesViewportRef = useRef<HTMLDivElement>(null);
+  const explicitRecoveryRequestRef = useRef<{
+    recoveryToken: string;
+    clientRequestId: string;
+  } | null>(null);
 
   const [, setTick] = useState(0);
   const [retryingKnowledgeBase, setRetryingKnowledgeBase] = useState(false);
@@ -1058,9 +1150,12 @@ export default function ChatArea({
   }, [createConversation, setActive]);
 
   const discardCancelledKnowledgeBaseStart = useCallback(
-    async (conversationId: string) => {
+    async (conversationId: string, resetRevision: number) => {
+      if (onKnowledgeBaseBatchCancelled) {
+        await onKnowledgeBaseBatchCancelled(conversationId, resetRevision);
+        return;
+      }
       discardConversationLocally(conversationId);
-      await refreshConversationsAfterDiscard();
       const nextConversationId = createConversation({
         title: "企业知识库构建",
         reuseEmpty: false,
@@ -1071,10 +1166,12 @@ export default function ChatArea({
           detail: { conversationId: nextConversationId },
         }),
       );
+      void refreshConversationsAfterDiscard();
     },
     [
       createConversation,
       discardConversationLocally,
+      onKnowledgeBaseBatchCancelled,
       refreshConversationsAfterDiscard,
       setActive,
     ],
@@ -1380,10 +1477,22 @@ export default function ChatArea({
       return;
     }
     setRetryingKnowledgeBase(true);
-    const clientRequestId =
+    const nextClientRequestId = () =>
       typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
         : `kb-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const explicitRecoveryToken = knowledgeBase.notice.recoveryToken;
+    if (recoveryMode === "explicit_recovery" && explicitRecoveryToken) {
+      explicitRecoveryRequestRef.current = knowledgeBaseExplicitRecoveryRequest(
+        explicitRecoveryRequestRef.current,
+        explicitRecoveryToken,
+        nextClientRequestId,
+      );
+    }
+    const clientRequestId =
+      recoveryMode === "explicit_recovery"
+        ? explicitRecoveryRequestRef.current!.clientRequestId
+        : nextClientRequestId();
     try {
       const observation = await recoverKnowledgeBaseNotice({
         conversationId: conversation.id,
@@ -1397,6 +1506,12 @@ export default function ChatArea({
       });
       commitKnowledgeBaseObservation(conversation.id, observation);
       wakeKnowledgeBaseConversation(conversation.id);
+      if (
+        recoveryMode === "explicit_recovery" &&
+        observation.notice?.recoveryToken !== explicitRecoveryToken
+      ) {
+        explicitRecoveryRequestRef.current = null;
+      }
       if (recoveryMode === "reconcile") {
         const packageRebind =
           knowledgeBase.notice.code ===
@@ -1430,6 +1545,12 @@ export default function ChatArea({
       }
     } catch (error) {
       const status = Number((error as { status?: unknown })?.status || 0);
+      const changedObservation = (
+        error as { knowledgeObservation?: KnowledgeBaseObservationDto }
+      )?.knowledgeObservation;
+      if (changedObservation) {
+        commitKnowledgeBaseObservation(conversation.id, changedObservation);
+      }
       if (!status || status === 408 || status === 429 || status >= 500) {
         wakeKnowledgeBaseConversation(conversation.id);
         toast.warning("正在恢复重试结果", {
@@ -1437,6 +1558,9 @@ export default function ChatArea({
             "网络结果暂时未知，系统会恢复同一操作，不会重复创建任务。",
         });
       } else {
+        if (recoveryMode === "explicit_recovery") {
+          explicitRecoveryRequestRef.current = null;
+        }
         toast.error(
           recoveryMode === "reconcile"
             ? "重新绑定知识库成品失败"
@@ -1557,32 +1681,40 @@ export default function ChatArea({
       >
         <div className="max-w-4xl mx-auto px-3 py-6 space-y-6 sm:px-5 sm:py-8 sm:space-y-7">
           {messages.length === 0 &&
-            status === "idle" &&
-            (responseLogicContext ? (
-              <ResponseLogicConversationHint
-                question={responseLogicContext.question}
-              />
-            ) : showKnowledgeBaseStarter ? (
-              <EmptyConversationHint
-                onStartKnowledgeBase={startKnowledgeBase}
-                companyName={
+          status === "idle" &&
+          responseLogicContext ? (
+            <ResponseLogicConversationHint
+              question={responseLogicContext.question}
+            />
+          ) : showKnowledgeBaseStarter ? (
+            <EmptyConversationHint
+              key={`${knowledgeBaseAccountId ?? 0}:${knowledgeBaseResetRevision ?? 0}:${activeConversation.id}`}
+              onStartKnowledgeBase={startKnowledgeBase}
+              onBatchCancelled={(resetRevision) =>
+                discardCancelledKnowledgeBaseStart(
+                  activeConversation.id,
+                  resetRevision,
+                )
+              }
+              eligible={messages.length === 0 && status === "idle"}
+              companyName={
+                dashboardQuery.data?.enterpriseName ||
+                dashboardQuery.data?.payload?.brandName ||
+                ""
+              }
+              companyConfigured={Boolean(
+                (
                   dashboardQuery.data?.enterpriseName ||
                   dashboardQuery.data?.payload?.brandName ||
                   ""
-                }
-                companyConfigured={Boolean(
-                  (
-                    dashboardQuery.data?.enterpriseName ||
-                    dashboardQuery.data?.payload?.brandName ||
-                    ""
-                  ).trim(),
-                )}
-                companyLoading={dashboardQuery.isLoading}
-                resetRevision={knowledgeBaseResetRevision ?? 0}
-              />
-            ) : (
-              <StandardConversationHint variant={standardWelcomeVariant} />
-            ))}
+                ).trim(),
+              )}
+              companyLoading={dashboardQuery.isLoading}
+              resetRevision={knowledgeBaseResetRevision ?? 0}
+            />
+          ) : messages.length === 0 && status === "idle" ? (
+            <StandardConversationHint variant={standardWelcomeVariant} />
+          ) : null}
 
           <AnimatePresence initial={false}>
             {messages.map((msg) => (
@@ -1620,8 +1752,11 @@ export default function ChatArea({
                 onRecovered={() => {
                   wakeKnowledgeBaseConversation(activeConversation.id);
                 }}
-                onCancelled={() =>
-                  discardCancelledKnowledgeBaseStart(activeConversation.id)
+                onCancelled={(resetRevision) =>
+                  discardCancelledKnowledgeBaseStart(
+                    activeConversation.id,
+                    resetRevision,
+                  )
                 }
               />
             )}
@@ -2088,6 +2223,8 @@ function knowledgeBaseStarterRecoveryCopy(
 
 export function EmptyConversationHint({
   onStartKnowledgeBase,
+  onBatchCancelled,
+  eligible = true,
   companyName,
   companyConfigured,
   companyLoading,
@@ -2097,6 +2234,8 @@ export function EmptyConversationHint({
     input: DeepReportStartInput,
     lifecycle: KnowledgeBaseStarterLifecycle,
   ) => Promise<KnowledgeBaseStarterStartOutcome>;
+  onBatchCancelled?: (resetRevision: number) => void | Promise<void>;
+  eligible?: boolean;
   companyName: string;
   companyConfigured: boolean;
   companyLoading: boolean;
@@ -2313,8 +2452,26 @@ export function EmptyConversationHint({
     setIsDiscarding(true);
     if (startReservation) {
       try {
-        await cancelKnowledgeBaseStartReservation(startReservation);
+        const cancelled =
+          await cancelKnowledgeBaseStartReservation(startReservation);
         setStartReservation(null);
+        await onBatchCancelled?.(cancelled.resetRevision);
+        void Promise.allSettled(
+          records.map(([, target]) => {
+            if (target.handle) {
+              return discardManagedUploadIntent(target.handle, {
+                deferProviderCleanup: true,
+              });
+            }
+            return discardUnboundUpload(target.fileId!);
+          }),
+        );
+        if (!onBatchCancelled) {
+          setIsDiscarding(false);
+          setDialogOpen(false);
+          resetDialog();
+        }
+        return;
       } catch (error) {
         const code = String((error as { code?: unknown } | null)?.code || "");
         // A reset or retention tombstone already revoked the old reservation;
@@ -2410,6 +2567,7 @@ export function EmptyConversationHint({
     isDiscarding,
     isStarting,
     resetDialog,
+    onBatchCancelled,
     startReservation,
     uploadHandles,
   ]);
@@ -2713,6 +2871,8 @@ export function EmptyConversationHint({
   const stopUpload = useCallback(() => {
     abortControllerRef.current?.abort();
   }, []);
+
+  if (!eligible && batchStartedAt === null && !dialogOpen) return null;
 
   return (
     <>

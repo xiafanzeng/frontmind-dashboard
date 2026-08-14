@@ -181,23 +181,33 @@ function terminalObservation(stateEpoch: number) {
 }
 
 function ConversationProbe() {
-  const { activeConversation, state } = useConversation();
+  const { activeConversation, state, updateStatus } = useConversation();
   return (
-    <output data-testid="conversation-probe">
-      {JSON.stringify({
-        activeId: activeConversation?.id ?? null,
-        conversationCount: state.conversations.length,
-        messageCount: activeConversation?.messages.length ?? 0,
-        requestIds:
-          activeConversation?.messages
-            .map((message) => message.knowledgeBase?.clientRequestId)
-            .filter(Boolean) ?? [],
-        serverOwned:
-          activeConversation?.messages.filter(
-            (message) => message.knowledgeBase?.serverOwned === true,
-          ).length ?? 0,
-      })}
-    </output>
+    <>
+      <button
+        type="button"
+        onClick={() =>
+          activeConversation && updateStatus(activeConversation.id, "running")
+        }
+      >
+        模拟协调器观察
+      </button>
+      <output data-testid="conversation-probe">
+        {JSON.stringify({
+          activeId: activeConversation?.id ?? null,
+          conversationCount: state.conversations.length,
+          messageCount: activeConversation?.messages.length ?? 0,
+          requestIds:
+            activeConversation?.messages
+              .map((message) => message.knowledgeBase?.clientRequestId)
+              .filter(Boolean) ?? [],
+          serverOwned:
+            activeConversation?.messages.filter(
+              (message) => message.knowledgeBase?.serverOwned === true,
+            ).length ?? 0,
+        })}
+      </output>
+    </>
   );
 }
 
@@ -426,6 +436,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
         conversationId: "knowledge-conversation",
         turnId: "turn-start-1",
         clientRequestId,
+        expectedResetRevision: 4,
       });
     }
     expect(mocks.stageRequests.map(({ body }) => body.index)).toEqual([
@@ -460,6 +471,66 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     );
     expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
       clientRequestId,
+    );
+  });
+
+  it("keeps the upload owner alive when a coordinator observation changes status", async () => {
+    const file = new File(["durable-body"], "资料.pdf", {
+      type: "application/pdf",
+      lastModified: 1,
+    });
+    let uploadSignal: AbortSignal | undefined;
+    let finishUpload: ((value: any) => void) | undefined;
+    mocks.uploadFile.mockImplementationOnce(
+      async (
+        _file: File,
+        _progress: unknown,
+        _retry: unknown,
+        options: any,
+      ) => {
+        uploadSignal = options.signal;
+        return new Promise((resolve) => {
+          finishUpload = resolve;
+        });
+      },
+    );
+    renderIntegratedChat();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "构建企业知识库" }),
+    );
+    fireEvent.change(document.querySelector('input[type="file"]')!, {
+      target: { files: [file] },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+    await waitFor(() => expect(mocks.uploadFile).toHaveBeenCalledOnce());
+
+    const coordinatorButton = Array.from(
+      document.querySelectorAll("button"),
+    ).find((button) => button.textContent === "模拟协调器观察");
+    expect(coordinatorButton).toBeDefined();
+    fireEvent.click(coordinatorButton!);
+
+    expect(uploadSignal?.aborted).toBe(false);
+    expect(
+      screen.getByRole("dialog", { name: "构建企业知识库" }),
+    ).toBeVisible();
+    finishUpload?.({
+      fileId: "file-durable",
+      filename: file.name,
+      uploadedAt: 10_000,
+      providerReadyAt: 11_000,
+      expiresAt: 20_000,
+    });
+    await waitFor(() => expect(mocks.startRequests).toHaveLength(1));
+    mocks.firstStartResolve?.(
+      new Response(
+        JSON.stringify({
+          observation: acceptedObservation(
+            String(mocks.startRequests[0]?.body.clientRequestId),
+          ),
+        }),
+        { status: 202, headers: { "content-type": "application/json" } },
+      ),
     );
   });
 

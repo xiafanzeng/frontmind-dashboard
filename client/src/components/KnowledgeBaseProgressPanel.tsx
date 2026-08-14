@@ -151,6 +151,14 @@ export default function KnowledgeBaseProgressPanel({
   const contentCompleted =
     progress.build.status === "ready_to_publish" ||
     progress.build.status === "published";
+  const buildStopped =
+    progress.build.status === "failed" ||
+    progress.build.status === "protocol_error";
+  const buildExecuting =
+    !buildStopped &&
+    progress.build.awaitingResponseSince != null &&
+    (progress.build.status === "researching" ||
+      progress.build.status === "confirming");
   const currentLeaf = progress.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === progress.build.currentLeafId);
@@ -218,13 +226,26 @@ export default function KnowledgeBaseProgressPanel({
         </div>
       </header>
 
-      {progress.build.protocolError && (
-        <div className="mx-5 mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900 sm:mx-6">
+      {(buildStopped || buildExecuting) && (
+        <div
+          className={`mx-5 mt-4 flex items-start gap-2 rounded-xl border px-3.5 py-3 text-xs leading-5 sm:mx-6 ${
+            buildStopped
+              ? "border-slate-200 bg-slate-50 text-slate-800"
+              : "border-violet-200 bg-violet-50 text-violet-900"
+          }`}
+        >
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
-            <strong className="block">系统正在恢复当前操作</strong>
-            <span>{progress.build.protocolError}</span>
-            <span className="mt-1 block">已完成内容不受影响。</span>
+            <strong className="block">
+              {buildStopped
+                ? "本轮已停止"
+                : "FrontMind 正在处理当前操作"}
+            </strong>
+            <span>
+              {buildStopped
+                ? "系统不会自动重发。已完成内容不受影响。"
+                : "请稍候，已完成内容不受影响。"}
+            </span>
           </div>
         </div>
       )}

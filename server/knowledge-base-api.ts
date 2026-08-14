@@ -13,6 +13,7 @@ import {
 } from "drizzle-orm";
 import { Router } from "express";
 import { createHash, randomUUID } from "node:crypto";
+import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
 import {
   getFrontMindCredentials,
   getUpstreamBaseUrl,
@@ -127,6 +128,7 @@ import {
   deferKnowledgeBaseManusV2AnchorHandoffOutputPending,
   deferKnowledgeBaseManusV2AnchorHandoffAfterRejection,
   settleKnowledgeBaseManusV2ExplicitRejection,
+  stopKnowledgeBaseCompatibleCreateOutcomeUnknown,
   deferKnowledgeBaseTurnBeforeCreate,
   ensureKnowledgeBaseBuildSkillArchivePin,
   findRecoverableKnowledgeBaseTurnIds,
@@ -141,6 +143,8 @@ import {
   inspectKnowledgeBaseLegacyDeferredReservationReplay,
   inspectKnowledgeBaseLegacyStartReplay,
   inspectKnowledgeBaseTurnReplay,
+  inspectKnowledgeBaseExplicitRecovery,
+  findKnowledgeBaseExplicitRecoveryReplay,
   loadKnowledgeBasePreproviderLocalRehydrateAuthority,
   loadKnowledgeBaseLocalRehydrateSnapshot,
   clearKnowledgeBaseLocalRehydrateRequirement,
@@ -162,15 +166,16 @@ import {
   reserveKnowledgeBaseRetryTurn,
   reserveKnowledgeBaseManusV2AnchorHandoff,
   reserveKnowledgeBaseNewCanonicalFromSnapshot,
+  reserveKnowledgeBaseCompatibleCreateRecovery,
   reserveKnowledgeBaseStartBuild,
   reserveKnowledgeBaseTurn,
   replaceKnowledgeBaseTurnAttachmentsAfterUserFix,
-  resumeKnowledgeBaseTurnAfterUserFix,
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   renewKnowledgeBaseTurnLease,
   releaseGeneratedAttachmentInvalidPreproviderTurns,
   reclassifyHistoricalPreproviderAuthoritySelfTerminal,
+  normalizeKnowledgeBaseTerminalRejection,
   stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
@@ -186,7 +191,9 @@ import {
 export { releaseGeneratedAttachmentInvalidPreproviderTurns };
 import {
   appendManusV2KnowledgeBaseOperationContract,
+  buildManusV2CreateTaskBody,
   buildManusV2KnowledgeBaseStructuredOutputSchema,
+  buildManusV2SendMessageBody,
   latestManusV2TaskState,
   ManusV2ApiError,
   ManusV2Client,
@@ -343,6 +350,15 @@ export {
 export { buildKnowledgeBaseTurnPrompt } from "./knowledge-base-turn-prompt";
 
 const router = Router();
+
+// No authenticated knowledge-base response bypasses the customer-safe
+// projection, including legacy error branches that predate observation DTOs.
+router.use((_req, res, next) => {
+  const sendJson = res.json.bind(res);
+  res.json = ((body: unknown) =>
+    sendJson(toKnowledgeBasePublicPayload(body))) as typeof res.json;
+  next();
+});
 
 async function requireKnowledgeBuildCapability(
   userId: number,
@@ -4762,6 +4778,7 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     ensureDispatch?: typeof ensureKnowledgeBaseRecoveryDispatch;
     ensureManusV2Attachments?: typeof ensureKnowledgeBaseManusV2Attachments;
     beginDispatch?: typeof beginKnowledgeBaseManusV2Dispatch;
+    markManusV2OutcomeUnknown?: typeof markKnowledgeBaseManusV2OutcomeUnknown;
     createClient?: (input: {
       baseUrl: string;
       apiKey: string;
@@ -4792,6 +4809,9 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     ensureKnowledgeBaseManusV2Attachments;
   const beginDispatch =
     dependencies.beginDispatch ?? beginKnowledgeBaseManusV2Dispatch;
+  const markManusV2OutcomeUnknownForDispatch =
+    dependencies.markManusV2OutcomeUnknown ??
+    markKnowledgeBaseManusV2OutcomeUnknown;
   const createClient =
     dependencies.createClient ?? ((input) => new ManusV2Client(input));
   const bindSubmission =
@@ -4836,11 +4856,20 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     claim.turn.providerAttemptState = "not_sent";
     existingBuild = await loadBuild(claim.turn.userId, claim.turn.buildId);
   }
+  const minimalCompatibleCreate =
+    claim.recoveryMetadata.compatibilityMode === "minimal_v2_create";
+  if (minimalCompatibleCreate && existingBuild?.canonicalTaskId) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The compatible create authority changed before dispatch",
+    );
+  }
   if (
     existingBuild?.providerProtocol === "manus_v2" &&
     !existingBuild.canonicalTaskId &&
     claim.turn.createAttemptState === "not_sent" &&
     claim.turn.providerAttemptState === "not_sent" &&
+    claim.recoveryMetadata.compatibilityMode !== "minimal_v2_create" &&
     existingBuild.handoffProvenance &&
     typeof existingBuild.handoffProvenance === "object" &&
     !Array.isArray(existingBuild.handoffProvenance)
@@ -5136,16 +5165,30 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       contract,
     );
     const providerAttachments = v2Attachments;
+    const expectedProviderMethod = existingBuild.canonicalTaskId
+      ? ("task.sendMessage" as const)
+      : ("task.create" as const);
+    const structuredOutputSchemaJson = JSON.stringify(structuredOutputSchema);
+    const frozenProviderRequestBody =
+      expectedProviderMethod === "task.create"
+        ? buildManusV2CreateTaskBody({
+            prompt: v2Prompt,
+            attachments: providerAttachments,
+            title: `FrontMind KB ${existingBuild.id} g${existingBuild.generation}`,
+            ...(minimalCompatibleCreate
+              ? {}
+              : { agentProfile: prepared.requestBody.agentProfile }),
+            ...(minimalCompatibleCreate ? {} : { structuredOutputSchema }),
+            hideInTaskList: true,
+          })
+        : buildManusV2SendMessageBody({
+            taskId: existingBuild.canonicalTaskId!,
+            prompt: v2Prompt,
+            attachments: providerAttachments,
+            structuredOutputSchema,
+          });
     const v2BodyHash = createHash("sha256")
-      .update(
-        JSON.stringify({
-          prompt: v2Prompt,
-          attachments: providerAttachments,
-          agentProfile: prepared.requestBody.agentProfile,
-          operationToken: claim.turn.operationKey,
-          structuredOutputSchema,
-        }),
-      )
+      .update(JSON.stringify(frozenProviderRequestBody))
       .digest("hex");
     const authority = await beginDispatch({
       userId: claim.turn.userId,
@@ -5153,7 +5196,19 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       leaseToken: claim.leaseToken,
       frozenProviderRequestHash: v2BodyHash,
       leaseMs: 300_000,
+      expectedMethod: expectedProviderMethod,
     });
+    if (
+      authority.method !== expectedProviderMethod ||
+      (expectedProviderMethod === "task.create" && authority.canonicalTaskId) ||
+      (expectedProviderMethod === "task.sendMessage" &&
+        authority.canonicalTaskId !== existingBuild.canonicalTaskId)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The knowledge-base dispatch authority changed before dispatch",
+      );
+    }
     claim.turn.providerProtocol = "manus_v2";
     claim.turn.providerMethod = authority.method;
     claim.turn.providerAttemptState = "sending";
@@ -5170,9 +5225,14 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         const created = await client.createTask({
           prompt: v2Prompt,
           attachments: providerAttachments,
+          // The title is part of the stable core create envelope. Only the
+          // optional profile/schema are omitted by the one compatibility
+          // variant after a proven 400 rejection.
           title: authority.title,
-          agentProfile: prepared.requestBody.agentProfile,
-          structuredOutputSchema,
+          ...(minimalCompatibleCreate
+            ? {}
+            : { agentProfile: prepared.requestBody.agentProfile }),
+          ...(minimalCompatibleCreate ? {} : { structuredOutputSchema }),
           hideInTaskList: true,
         });
         taskId = created.taskId;
@@ -5194,8 +5254,42 @@ async function dispatchKnowledgeBaseRecoveryClaim(
         requestId = sent.requestId;
       }
     } catch (error) {
-      if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
-        await markKnowledgeBaseManusV2OutcomeUnknown({
+      if (error instanceof ManusV2ApiError) {
+        Object.assign(error, {
+          frontmindRequestShape: {
+            promptUtf8Bytes: Buffer.byteLength(v2Prompt, "utf8"),
+            titleUtf8Bytes:
+              authority.method === "task.create"
+                ? Buffer.byteLength(authority.title, "utf8")
+                : 0,
+            attachmentCount: providerAttachments.length,
+            agentProfile:
+              authority.method === "task.create" && !minimalCompatibleCreate
+                ? prepared.requestBody.agentProfile
+                : null,
+            hasAgentProfile:
+              authority.method === "task.create" && !minimalCompatibleCreate,
+            hasStructuredOutputSchema: !minimalCompatibleCreate,
+            structuredOutputSchemaUtf8Bytes: minimalCompatibleCreate
+              ? 0
+              : Buffer.byteLength(structuredOutputSchemaJson, "utf8"),
+            structuredOutputSchemaSha256: minimalCompatibleCreate
+              ? null
+              : createHash("sha256")
+                  .update(structuredOutputSchemaJson, "utf8")
+                  .digest("hex"),
+            compatibilityMode: minimalCompatibleCreate
+              ? "minimal_v2_create"
+              : "standard",
+          },
+        });
+      }
+      if (
+        error instanceof ManusV2ApiError &&
+        error.outcomeUnknown &&
+        !minimalCompatibleCreate
+      ) {
+        await markManusV2OutcomeUnknownForDispatch({
           userId: claim.turn.userId,
           turnId: claim.turn.id,
           leaseToken: claim.leaseToken,
@@ -6597,6 +6691,7 @@ export async function persistKnowledgeBaseDispatchFailure(
   dependencies: {
     markManusV2OutcomeUnknown?: typeof markKnowledgeBaseManusV2OutcomeUnknown;
     persistCreateFailure?: typeof persistKnowledgeBaseCreateFailure;
+    stopCompatibleCreateOutcomeUnknown?: typeof stopKnowledgeBaseCompatibleCreateOutcomeUnknown;
   } = {},
 ) {
   const markManusV2OutcomeUnknown =
@@ -6604,6 +6699,9 @@ export async function persistKnowledgeBaseDispatchFailure(
     markKnowledgeBaseManusV2OutcomeUnknown;
   const persistCreateFailure =
     dependencies.persistCreateFailure ?? persistKnowledgeBaseCreateFailure;
+  const stopCompatibleCreateOutcomeUnknown =
+    dependencies.stopCompatibleCreateOutcomeUnknown ??
+    stopKnowledgeBaseCompatibleCreateOutcomeUnknown;
   if (input.error instanceof KnowledgeBaseManusV2RolloutDeferredError) {
     await deferKnowledgeBaseTurnBeforeCreate({
       userId: input.claim.turn.userId,
@@ -6624,6 +6722,21 @@ export async function persistKnowledgeBaseDispatchFailure(
       v2Error.operation === "task.sendMessage") &&
     input.claim.turn.providerAttemptState === "sending";
   if (isCurrentExplicitV2Rejection && v2Error) {
+    const requestShape = (
+      v2Error as ManusV2ApiError & {
+        frontmindRequestShape?: {
+          promptUtf8Bytes: number;
+          titleUtf8Bytes: number;
+          attachmentCount: number;
+          agentProfile: string | null;
+          hasAgentProfile: boolean;
+          hasStructuredOutputSchema: boolean;
+          structuredOutputSchemaUtf8Bytes: number;
+          structuredOutputSchemaSha256: string | null;
+          compatibilityMode: "standard" | "minimal_v2_create";
+        };
+      }
+    ).frontmindRequestShape;
     const settled = await settleKnowledgeBaseManusV2ExplicitRejection({
       userId: input.claim.turn.userId,
       turnId: input.claim.turn.id,
@@ -6635,6 +6748,10 @@ export async function persistKnowledgeBaseDispatchFailure(
       retryable: v2Error.retryable,
       providerCode: v2Error.code,
       providerStatus: v2Error.status,
+      providerRequestRef: v2Error.providerRequestId,
+      providerField: v2Error.providerField,
+      providerPath: v2Error.providerPath,
+      ...(requestShape ? { providerRequestShape: requestShape } : {}),
       ...(v2Error.retryAfterMs !== null
         ? { recoveryDelayMs: v2Error.retryAfterMs }
         : {}),
@@ -6648,6 +6765,18 @@ export async function persistKnowledgeBaseDispatchFailure(
     input.error instanceof ManusV2ApiError &&
     input.error.outcomeUnknown
   ) {
+    if (
+      input.claim.recoveryMetadata.compatibilityMode ===
+      "minimal_v2_create"
+    ) {
+      await stopCompatibleCreateOutcomeUnknown({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        code: input.outcomeUnknownCode,
+      });
+      return "deterministic" as const;
+    }
     await markManusV2OutcomeUnknown({
       userId: input.claim.turn.userId,
       turnId: input.claim.turn.id,
@@ -8014,14 +8143,18 @@ router.post("/start/cancel", async (req, res) => {
   }
   try {
     await assertKnowledgeBaseWritable(req.frontmindUser.id);
-    await cancelIncompleteKnowledgeBaseStart({
+    const cancelled = await cancelIncompleteKnowledgeBaseStart({
       userId: req.frontmindUser.id,
       conversationId,
       turnId,
       clientRequestId,
       expectedResetRevision,
     });
-    res.status(200).json({ cancelled: true });
+    res.status(200).json({
+      cancelled: true,
+      resetRevision: cancelled.resetRevision,
+      idempotent: cancelled.idempotent,
+    });
   } catch (error) {
     if (error instanceof KnowledgeBaseTurnReservationError) {
       res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
@@ -8250,6 +8383,282 @@ router.post("/start/recover", async (req, res) => {
       error: {
         code: "KNOWLEDGE_BASE_START_RECOVERY_FAILED",
         message: "启动恢复失败，请使用同一请求稍后重试",
+      },
+    });
+  }
+});
+
+router.post("/recovery/execute", async (req, res) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const conversationId = String(body.conversationId || "").trim();
+  const recoveryToken = String(body.recoveryToken || "").trim();
+  const clientRequestId = String(body.clientRequestId || "").trim();
+  if (
+    !conversationId ||
+    conversationId.length > 191 ||
+    !/^[a-f0-9]{64}$/u.test(recoveryToken) ||
+    !clientRequestId ||
+    clientRequestId.length > 128
+  ) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_KNOWLEDGE_BASE_RECOVERY",
+        message: "知识库恢复参数无效",
+      },
+    });
+    return;
+  }
+  if (
+    !req.frontmindUser ||
+    !(await requireKnowledgeBuildCapability(req.frontmindUser.id, res))
+  ) {
+    return;
+  }
+  if (!req.frontmindCredential) {
+    res.status(401).json({
+      error: {
+        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        message: "请先配置 API Key",
+      },
+    });
+    return;
+  }
+  try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
+    const replay = await findKnowledgeBaseExplicitRecoveryReplay({
+      userId: req.frontmindUser.id,
+      conversationId,
+      clientRequestId,
+      recoveryToken,
+    });
+    if (replay) {
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "running",
+      });
+      res.status(200).json({
+        disposition: "already_applied",
+        recoveryId: replay.id,
+        accepted: true,
+        resumed: false,
+        observation,
+      });
+      return;
+    }
+    await normalizeKnowledgeBaseTerminalRejection({
+      userId: req.frontmindUser.id,
+      conversationId,
+    });
+    const decision = await inspectKnowledgeBaseExplicitRecovery({
+      userId: req.frontmindUser.id,
+      conversationId,
+      recoveryToken,
+    });
+    if (!decision) {
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "failed",
+      });
+      res.status(409).json({
+        disposition: "state_changed",
+        accepted: false,
+        resumed: false,
+        observation,
+      });
+      return;
+    }
+    if (decision.recovery.action === "stopped") {
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "failed",
+      });
+      res.status(200).json({
+        disposition: "stopped",
+        accepted: false,
+        resumed: false,
+        observation,
+      });
+      return;
+    }
+    if (decision.recovery.action === "retry_compatible_create") {
+      const reservation = await reserveKnowledgeBaseCompatibleCreateRecovery({
+        userId: req.frontmindUser.id,
+        conversationId,
+        clientRequestId,
+        recoveryToken,
+        apiCredentialId: req.frontmindCredential.id,
+      });
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "running",
+      });
+      res.status(reservation.state === "reserved" ? 202 : 200).json({
+        disposition:
+          reservation.state === "reserved" ? "accepted" : "already_applied",
+        recoveryId: reservation.claim.turn.id,
+        accepted: true,
+        resumed: reservation.state === "reserved",
+        observation,
+      });
+      if (reservation.state === "reserved") {
+        launchAcceptedKnowledgeBaseClaim({
+          claim: reservation.claim,
+          credential: req.frontmindCredential,
+          outcomeUnknownCode:
+            "KNOWLEDGE_BASE_COMPATIBLE_CREATE_OUTCOME_UNKNOWN",
+        });
+      }
+      return;
+    }
+    const build = decision.build;
+    const handoffProvenance =
+      build.handoffProvenance &&
+      typeof build.handoffProvenance === "object" &&
+      !Array.isArray(build.handoffProvenance)
+        ? build.handoffProvenance
+        : null;
+    if (handoffProvenance?.localRehydrateRequired) {
+      if (!build.currentLeafId || !build.currentPresentationKey) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The accepted presentation coordinate is unavailable",
+        );
+      }
+      const reservation = await reserveKnowledgeBaseNewCanonicalFromSnapshot({
+        userId: req.frontmindUser.id,
+        conversationId,
+        clientRequestId,
+        expectedGeneration: build.generation,
+        expectedStateEpoch: build.stateEpoch,
+        expectedRevision: build.revision,
+        expectedLeafId: build.currentLeafId,
+        expectedPresentationKey: build.currentPresentationKey,
+        apiCredentialId: req.frontmindCredential.id,
+      });
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "running",
+      });
+      res.status(reservation.state === "reserved" ? 202 : 200).json({
+        disposition:
+          reservation.state === "reserved" ? "accepted" : "already_applied",
+        recoveryId: reservation.claim.turn.id,
+        accepted: true,
+        resumed: reservation.state === "reserved",
+        observation,
+      });
+      if (reservation.state === "reserved") {
+        launchAcceptedKnowledgeBaseClaim({
+          claim: reservation.claim,
+          credential: req.frontmindCredential,
+          outcomeUnknownCode: "LOCAL_REHYDRATE_NEW_CANONICAL_OUTCOME_UNKNOWN",
+        });
+      }
+      return;
+    }
+    if (!build.canonicalTaskId || !build.canonicalCredentialId) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The rejected canonical source is unavailable",
+      );
+    }
+    const reservation = await reserveKnowledgeBaseManusV2AnchorHandoff({
+      userId: req.frontmindUser.id,
+      buildId: build.id,
+      expectedGeneration: build.generation,
+      expectedStateEpoch: build.stateEpoch,
+      expectedRevision: build.revision,
+      expectedLeafId: build.currentLeafId,
+      expectedLegacyTaskId: null,
+      sourceProtocol: "manus_v2",
+      expectedCanonicalTaskId: build.canonicalTaskId,
+      expectedCanonicalCredentialId: build.canonicalCredentialId,
+      apiCredentialId: req.frontmindCredential.id,
+      credentialMode: "current_rebind",
+      baseUrl: getUpstreamBaseUrl(req),
+      agentProfile: toUpstreamAgentProfile(KNOWLEDGE_BASE_AGENT_PROFILE),
+      clientRequestId,
+      recoverySourceTurnId: decision.recovery.sourceTurnId,
+      recoveryToken,
+    });
+    const observation = await getKnowledgeBaseObservation({
+      userId: req.frontmindUser.id,
+      conversationId,
+      upstreamStatus: "running",
+    });
+    res.status(202).json({
+      disposition: "accepted",
+      recoveryId: reservation.turn.id,
+      accepted: true,
+      resumed: true,
+      observation,
+    });
+    void dispatchKnowledgeBaseAnchorHandoffClaim({
+      claim: reservation,
+      credential: req.frontmindCredential,
+    }).catch((error) =>
+      logKnowledgeBaseRuntimeFailure({
+        level: "warn",
+        event: "[KnowledgeBaseExplicitRecovery] anchor_dispatch_deferred",
+        userId: req.frontmindUser!.id,
+        buildId: build.id,
+        turnId: reservation.turn.id,
+        error,
+        additionalSecrets: [req.frontmindCredential?.apiKey],
+      }),
+    );
+  } catch (error) {
+    if (error instanceof KnowledgeBaseTurnReservationError) {
+      const concurrentReplay = await findKnowledgeBaseExplicitRecoveryReplay({
+        userId: req.frontmindUser.id,
+        conversationId,
+        clientRequestId,
+        recoveryToken,
+      }).catch(() => null);
+      if (concurrentReplay) {
+        const observation = await getKnowledgeBaseObservation({
+          userId: req.frontmindUser.id,
+          conversationId,
+          upstreamStatus: "running",
+        });
+        res.status(200).json({
+          disposition: "already_applied",
+          recoveryId: concurrentReplay.id,
+          accepted: true,
+          resumed: false,
+          observation,
+        });
+        return;
+      }
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "failed",
+      }).catch(() => null);
+      res.status(error.code === "INVALID_REQUEST" ? 400 : 409).json({
+        disposition: "state_changed",
+        accepted: false,
+        resumed: false,
+        error: { code: error.code, message: error.message },
+        observation,
+      });
+      return;
+    }
+    logKnowledgeBaseRuntimeFailure({
+      level: "error",
+      event: "[KnowledgeBaseExplicitRecovery] failed",
+      error,
+      additionalSecrets: [req.frontmindCredential?.apiKey],
+    });
+    res.status(503).json({
+      error: {
+        code: "KNOWLEDGE_BASE_RECOVERY_UNAVAILABLE",
+        message: "当前恢复暂时不可用，请使用同一请求稍后重试",
       },
     });
   }
@@ -11338,6 +11747,13 @@ router.post("/progress/reconcile", async (req, res) => {
       return;
     }
     await assertKnowledgeBaseWritable(req.frontmindUser.id);
+    // Local-only compatibility repair: release historical failed writer
+    // fences before projecting state. It never creates files/tasks or binds a
+    // credential; provider writes require /recovery/execute.
+    await normalizeKnowledgeBaseTerminalRejection({
+      userId: req.frontmindUser.id,
+      conversationId,
+    });
     const currentObservation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser.id,
       conversationId,
@@ -11392,48 +11808,6 @@ router.post("/progress/reconcile", async (req, res) => {
     }
     const taskId = currentObservation?.authoritativeTaskId || requestedTaskId;
     if (!taskId) {
-      const activeTurn = currentObservation?.activeTurn;
-      const notice = currentObservation?.notice;
-      const canResumePreCreateFailure =
-        knowledgeBasePreCreateUserFixObservationAllowsResume({
-          activeTurn: activeTurn ?? null,
-          notice: notice ?? null,
-          hasCredential: Boolean(req.frontmindCredential),
-        });
-      if (canResumePreCreateFailure) {
-        const claim = await resumeKnowledgeBaseTurnAfterUserFix({
-          userId: req.frontmindUser.id,
-          turnId: activeTurn!.id,
-          apiCredentialId: req.frontmindCredential!.id,
-        });
-        if (claim) {
-          const observation = await getKnowledgeBaseObservation({
-            userId: req.frontmindUser.id,
-            conversationId,
-            upstreamStatus: "running",
-          });
-          res.status(202).json({
-            reservation: knowledgeBaseAcceptedReservationReceipt({
-              turn: claim.turn,
-              stateEpoch: observation?.stateEpoch,
-            }),
-            progress: observation?.interaction.progress || null,
-            interaction:
-              observation?.interaction ||
-              deriveKnowledgeBaseInteraction(null, "running"),
-            observation,
-            accepted: true,
-            resumed: true,
-            reservationCreated: false,
-          });
-          launchAcceptedKnowledgeBaseClaim({
-            claim,
-            credential: req.frontmindCredential!,
-            outcomeUnknownCode: "USER_FIX_DISPATCH_OUTCOME_UNKNOWN",
-          });
-          return;
-        }
-      }
       if (currentObservation) {
         res.json({
           progress: currentObservation.interaction.progress,
@@ -11513,7 +11887,7 @@ router.post("/progress/reconcile", async (req, res) => {
       } else {
         res.status(503).json({
           error: {
-            code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+            code: "FRONTMIND_KB_RETRY_AVAILABLE",
             message: "知识库任务凭证暂不可用，正在保留并复核当前状态",
           },
           observation: failure.observation,
@@ -11593,7 +11967,7 @@ router.post("/progress/reconcile", async (req, res) => {
       } else {
         res.status(503).json({
           error: {
-            code: "UPSTREAM_TASK_READ_FAILED",
+            code: "FRONTMIND_KB_RETRY_AVAILABLE",
             message: "读取知识库任务结果失败，正在自动重试",
           },
           observation: failure.observation,
@@ -11630,9 +12004,7 @@ router.post("/progress/reconcile", async (req, res) => {
       } else {
         res.status(503).json({
           error: {
-            code: credentialFailure
-              ? "UPSTREAM_CREDENTIAL_REJECTED"
-              : "UPSTREAM_TASK_READ_FAILED",
+            code: "FRONTMIND_KB_RETRY_AVAILABLE",
             message: "读取知识库任务结果失败，正在自动重试",
           },
           observation: failure.observation,
