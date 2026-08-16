@@ -27,7 +27,6 @@ import {
   messages,
   providerFileLeases,
   upstreamResources,
-  userUsageOwners,
   type ConversationTurn,
   type KnowledgeBaseBuild,
   type UpstreamResource,
@@ -35,11 +34,16 @@ import {
 import type {
   KnowledgeBaseDispatchState,
   KnowledgeBaseFailureClass,
+  KnowledgeBaseMaterializedResultFailureCode,
   KnowledgeBaseOperationType,
   KnowledgeBaseRecoveryAction,
   KnowledgeBaseTurnStatus,
 } from "../shared/knowledge-base-progress";
-import { knowledgeBaseOperationTypes } from "../shared/knowledge-base-progress";
+import {
+  isKnowledgeBaseMaterializedResultFailureCode,
+  knowledgeBaseOperationTypes,
+  KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+} from "../shared/knowledge-base-progress";
 import { AuthServiceError } from "./auth-service";
 import {
   classifyProviderValidationCoordinate,
@@ -52,7 +56,10 @@ import {
 } from "./knowledge-base-conversation-messages";
 import { getDb } from "./db";
 import type { KnowledgeBaseTreePolicyVersion } from "./knowledge-base-progress";
-import { knowledgeBaseNewBuildPolicyBinding } from "./knowledge-base-tree-policy-rollout";
+import {
+  knowledgeBaseNewBuildPolicyBinding,
+  KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+} from "./knowledge-base-tree-policy-rollout";
 import { normalizeKnowledgeBaseCustomerMarkdownImages } from "./knowledge-base-markdown-normalization";
 import {
   canonicalKnowledgeBaseMarkdown,
@@ -73,11 +80,28 @@ import {
   classifyKnowledgeBaseCanonicalCredentialRebind,
   planKnowledgeBaseAnchorGeneration,
 } from "./knowledge-base-active-v2-migration-core";
+import {
+  KNOWLEDGE_BASE_MATERIALIZED_CANDIDATE_STABILITY_MS,
+  KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION,
+  KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_POLL_MS,
+  KNOWLEDGE_BASE_MATERIALIZED_NATURAL_STOP_WINDOW_MS,
+  KNOWLEDGE_BASE_MATERIALIZED_STOP_OUTCOME_UNKNOWN_WINDOW_MS,
+  KNOWLEDGE_BASE_MATERIALIZED_STOP_SETTLE_WINDOW_MS,
+} from "./knowledge-base-materialized-completion-contract";
+import {
+  canonicalizeKnowledgeBaseCompanyName,
+  canonicalizeKnowledgeBaseWebsiteLines,
+  KnowledgeBaseCompanyIdentityNormalizationError,
+} from "./knowledge-base-company-identity";
 
 /** Longer than every configured 120s upstream create/upload timeout. */
 const DEFAULT_LEASE_MS = 300_000;
 /** A stopped malformed result must settle or become explicit attention. */
 const MANUS_V2_FORMAT_REPAIR_DEADLINE_MS = 120_000;
+const MATERIALIZED_RESULT_READ_WINDOW_MS = 10 * 60_000;
+const MATERIALIZED_RESULT_READ_BACKOFF_MS = [
+  15_000, 30_000, 60_000, 120_000,
+] as const;
 // 99 customer uploads plus Skill, instructions and optional prefill input.
 const MAX_ATTACHMENT_COUNT = 102;
 const MAX_USER_ATTACHMENT_COUNT = 99;
@@ -85,6 +109,49 @@ const MAX_ATTACHMENT_ID_LENGTH = 512;
 const MAX_RECOVERY_METADATA_DEPTH = 20;
 const SECRET_KEY_PATTERN =
   /(?:^|[_-])(api[_-]?key|authorization|credential|password|secret|token)(?:$|[_-])/i;
+
+export type KnowledgeBaseMaterializedResultRead = {
+  firstObservedAt: string;
+  attempt: number;
+  nextRetryAt?: string;
+  lastErrorKind?: string;
+};
+
+export type KnowledgeBaseMaterializedCompletionStopAttemptState =
+  | "sending"
+  | "acknowledged"
+  | "outcome_unknown"
+  | "rejected";
+
+/**
+ * Durable, migration-free result terminalization ledger. It contains only a
+ * hash-addressed local candidate and bounded lifecycle timestamps; Provider
+ * URLs, response text and raw request identifiers are deliberately absent.
+ */
+export type KnowledgeBaseMaterializedCompletionLedger = {
+  schemaVersion: 1;
+  lastStatus?: string;
+  statusFirstObservedAt?: string;
+  statusDeadlineAt?: string;
+  listMessages404FirstObservedAt?: string;
+  nextRetryAt?: string;
+  /** Milliseconds observed in active running segments; pauses never reset it. */
+  activeRunningMs?: number;
+  /** Last observation used to advance the current running segment. */
+  runningObservedAt?: string;
+  candidateEventIdHash?: string;
+  storageKey?: string;
+  candidateArchiveSha256?: string;
+  sizeBytes?: number;
+  firstObservedAt?: string;
+  lastObservedAt?: string;
+  stableAt?: string;
+  naturalStopDeadlineAt?: string;
+  stopAttemptState?: KnowledgeBaseMaterializedCompletionStopAttemptState;
+  stopAttemptedAt?: string;
+  stopRequestRefHash?: string;
+  stopSettleDeadlineAt?: string;
+};
 
 type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   leaseOwnerHash?: string;
@@ -153,6 +220,14 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   createAttemptState?: KnowledgeBaseCreateAttemptState;
   createAttemptUpdatedAt?: string;
   traceId?: string;
+  /**
+   * Recovery cutover fence for reset-created materialized v5 operations.
+   * Historical rows deliberately have no value and may only project
+   * RESET_REQUIRED; they must never be upgraded in place or touch Provider.
+   */
+  materializedRecoveryContractVersion?: 1;
+  /** Birth-only capability fence for bounded completion terminalization. */
+  materializedCompletionContractVersion?: 2;
   providerReasonCategory?: string;
   providerRequestRef?: string;
   /** Safe provider validation coordinates; never response prose or payload. */
@@ -179,7 +254,12 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
     | "rejected"
     | "outcome_unknown"
     | "output_pending"
-    | "accepted";
+    | "accepted"
+    | "result_rejected";
+  /** Bounded, lease-fenced reads of one terminal materialized task result. */
+  materializedResultRead?: KnowledgeBaseMaterializedResultRead;
+  /** Bounded, lease-fenced running-result candidate and task.stop ledger. */
+  materializedCompletion?: KnowledgeBaseMaterializedCompletionLedger;
   operationToken?: string;
   frozenProviderRequestHash?: string;
   /**
@@ -525,14 +605,20 @@ export interface KnowledgeBaseTurnRecord {
   canRegenerate: boolean;
   createAttemptState?: KnowledgeBaseCreateAttemptState;
   traceId?: string | null;
+  materializedRecoveryContractVersion: 1 | null;
+  materializedCompletionContractVersion: 2 | null;
   providerProtocol: "legacy_v1" | "manus_v2";
   providerMethod: "task.create" | "task.sendMessage" | null;
   providerAttemptState: string | null;
+  materializedResultRead?: KnowledgeBaseMaterializedResultRead | null;
+  materializedCompletion?: KnowledgeBaseMaterializedCompletionLedger | null;
   operationToken: string;
   manusV2Lifecycle: NonNullable<KnowledgeBaseTurnMetadata["manusV2Lifecycle"]>;
   attachmentFileIds: string[];
   attachmentsFrozen: boolean;
   awaitingClientAttachments: boolean;
+  /** Reset epoch frozen when a browser-backed start/revise batch was reserved. */
+  sourceResetRevision?: number;
   expectedUserAttachmentCount: number;
   stagedUserAttachmentCount: number;
   generatedAttachmentReservations: Record<
@@ -641,7 +727,7 @@ export interface ReserveKnowledgeBaseTurnInput {
    */
   deferDispatchUntilAttachments?: boolean;
   clientAttachmentManifest?: unknown;
-  /** Present only for a new-build start reservation. */
+  /** Required for every browser-backed materialized start/revise reservation. */
   sourceResetRevision?: number;
   /** Resume after browser File objects were lost; original body remains pinned. */
   resumeDeferredReservation?: boolean;
@@ -777,6 +863,7 @@ export interface InspectKnowledgeBaseDeferredAttachmentReplayInput {
   turnId: string;
   clientRequestId: string;
   clientAttachmentManifest: unknown;
+  expectedResetRevision: number;
   index: number;
   attachment: { file_id: string; filename: string };
   now?: Date;
@@ -789,6 +876,7 @@ export interface InspectKnowledgeBaseDeferredDispatchReplayInput {
   turnId: string;
   clientRequestId: string;
   clientAttachmentManifest: unknown;
+  expectedResetRevision: number;
   now?: Date;
 }
 
@@ -1247,6 +1335,47 @@ function hasInlineEligibleGeneratedCreateRejection(
 function retryAuthorityRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
+    : null;
+}
+
+export function knowledgeBaseMaterializedRecoveryContractVersion(build: {
+  executionMode?: string | null;
+  skillVersion?: string | null;
+  providerProtocol?: string | null;
+  contentVersion?: number | null;
+  handoffProvenance?: unknown;
+}) {
+  if (
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.providerProtocol !== "manus_v2" ||
+    typeof build.contentVersion !== "number"
+  ) {
+    return null;
+  }
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  return provenance?.materializedRecoveryContractVersion === 1 ? 1 : null;
+}
+
+export function knowledgeBaseMaterializedCompletionContractVersion(build: {
+  executionMode?: string | null;
+  skillVersion?: string | null;
+  providerProtocol?: string | null;
+  contentVersion?: number | null;
+  handoffProvenance?: unknown;
+}) {
+  if (
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.providerProtocol !== "manus_v2" ||
+    typeof build.contentVersion !== "number"
+  ) {
+    return null;
+  }
+  const provenance = retryAuthorityRecord(build.handoffProvenance);
+  return provenance?.materializedCompletionContractVersion ===
+    KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+    ? KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
     : null;
 }
 
@@ -2685,6 +2814,13 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     ...dispatchAuthority,
     createAttemptState: knowledgeBaseCreateAttemptState(row, metadata),
     traceId: safeKnowledgeBaseTraceId(metadata.traceId),
+    materializedRecoveryContractVersion:
+      metadata.materializedRecoveryContractVersion === 1 ? 1 : null,
+    materializedCompletionContractVersion:
+      metadata.materializedCompletionContractVersion ===
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+        ? KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+        : null,
     providerProtocol:
       metadata.providerProtocol === "manus_v2" ? "manus_v2" : "legacy_v1",
     providerMethod:
@@ -2696,6 +2832,12 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
       typeof metadata.providerAttemptState === "string"
         ? metadata.providerAttemptState
         : null,
+    materializedResultRead: metadata.materializedResultRead
+      ? { ...metadata.materializedResultRead }
+      : null,
+    materializedCompletion: metadata.materializedCompletion
+      ? { ...metadata.materializedCompletion }
+      : null,
     operationToken:
       typeof metadata.operationToken === "string" && metadata.operationToken
         ? metadata.operationToken
@@ -2706,6 +2848,10 @@ function turnRecord(row: ConversationTurn): KnowledgeBaseTurnRecord {
     attachmentFileIds: [...(row.attachmentFileIds ?? [])],
     attachmentsFrozen: metadata.attachmentsFrozen === true,
     awaitingClientAttachments: metadata.awaitingClientAttachments === true,
+    ...(Number.isSafeInteger(metadata.sourceResetRevision) &&
+    Number(metadata.sourceResetRevision) >= 0
+      ? { sourceResetRevision: Number(metadata.sourceResetRevision) }
+      : {}),
     expectedUserAttachmentCount,
     stagedUserAttachmentCount: Array.isArray(metadata.clientStagedAttachments)
       ? metadata.clientStagedAttachments.length
@@ -2744,11 +2890,13 @@ function isKnowledgeBaseRecoveryAction(
     typeof value === "string" &&
     [
       "wait",
+      "awaiting_input",
       "reconcile",
       "top_up",
       "update_credential",
       "fix_attachments",
       "reupload_logo",
+      "approve_reset",
       "regenerate_turn",
       "resume_start_from_retained_sources",
       "reselect_start_sources",
@@ -2796,13 +2944,16 @@ export function knowledgeBaseTurnDispatchAuthority(
     const nonRegenerativeAuthorityIsExact =
       storedCanRegenerate === false &&
       ((storedFailureClass === "recoverable_same_turn" &&
-        (storedAction === "reconcile" || storedAction === "wait")) ||
+        (storedAction === "reconcile" ||
+          storedAction === "wait" ||
+          storedAction === "awaiting_input")) ||
         (storedFailureClass === "requires_user_fix" &&
           [
             "top_up",
             "update_credential",
             "fix_attachments",
             "reupload_logo",
+            "approve_reset",
             "create_new_canonical_from_snapshot",
             "contact_support",
           ].includes(storedAction || "")) ||
@@ -3347,8 +3498,8 @@ export async function inspectKnowledgeBaseLegacyStartReplay(
 /**
  * Read-only replay lookup for a completed browser attachment-stage request.
  * The staged ledger remains durable after the final file claims a worker
- * lease, so a lost HTTP response can be replayed without consulting current
- * Logo or build gates and without dispatching twice.
+ * lease, so a lost HTTP response can be replayed without consulting mutable
+ * Logo/build gates. The live reset fence remains mandatory.
  */
 export async function inspectKnowledgeBaseDeferredAttachmentReplay(
   input: InspectKnowledgeBaseDeferredAttachmentReplayInput,
@@ -3356,6 +3507,7 @@ export async function inspectKnowledgeBaseDeferredAttachmentReplay(
 ): Promise<KnowledgeBaseTurnReplayReceipt | null> {
   assertInteger(input.userId, "userId", 1);
   assertInteger(input.index, "attachment index", 0);
+  assertInteger(input.expectedResetRevision, "expectedResetRevision", 0);
   const conversationId = knowledgeBaseConversationStorageId(
     input.userId,
     input.conversationId,
@@ -3387,6 +3539,12 @@ export async function inspectKnowledgeBaseDeferredAttachmentReplay(
     const row = rows[0] as ConversationTurn | undefined;
     if (!row) return null;
     const metadata = metadataOf(row);
+    await assertDeferredResetRevisionInTransaction({
+      tx,
+      turn: row,
+      metadata,
+      expectedResetRevision: input.expectedResetRevision,
+    });
     if (
       row.clientRequestId !== clientRequestId ||
       metadata.clientAttachmentManifestHash !== manifestHash
@@ -3418,13 +3576,14 @@ export async function inspectKnowledgeBaseDeferredAttachmentReplay(
 /**
  * Read-only dispatch receipt lookup. A reservation which is still awaiting
  * browser files is not yet a dispatch replay; every later state is durable and
- * must be returned before consulting the mutable build/task authority.
+ * can be returned after the live reset fence, before mutable build/task gates.
  */
 export async function inspectKnowledgeBaseDeferredDispatchReplay(
   input: InspectKnowledgeBaseDeferredDispatchReplayInput,
   executor?: any,
 ): Promise<KnowledgeBaseTurnReplayReceipt | null> {
   assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedResetRevision, "expectedResetRevision", 0);
   const conversationId = knowledgeBaseConversationStorageId(
     input.userId,
     input.conversationId,
@@ -3456,6 +3615,12 @@ export async function inspectKnowledgeBaseDeferredDispatchReplay(
     )[0] as ConversationTurn | undefined;
     if (!row) return null;
     const metadata = metadataOf(row);
+    await assertDeferredResetRevisionInTransaction({
+      tx,
+      turn: row,
+      metadata,
+      expectedResetRevision: input.expectedResetRevision,
+    });
     if (
       row.clientRequestId !== clientRequestId ||
       metadata.clientAttachmentManifestHash !== manifestHash
@@ -3682,31 +3847,20 @@ async function lockKnowledgeBaseReservationCredential(
 
 /**
  * A brand-new operation may use only a credential that currently belongs to
- * the customer or to the customer's current usage owner. Locking the owner
- * slot makes a request that resolved owner A before a concurrent A -> B
- * reassignment fail closed instead of creating a new A-bound reservation
- * after the reassignment commits.
+ * the customer. Delivery ownership remains an authorization/reporting
+ * relationship and never supplies a customer's model credential.
  *
  * Historical retry/recovery does not use this check: its authority is the
  * already-persisted active turn and is verified by the KB-only resolver in
  * auth-service.
  */
 async function lockCurrentKnowledgeBaseCredentialAuthority(
-  tx: any,
+  _tx: any,
   userId: number,
   credential: { id: string; userId: number; status: string } | null | undefined,
 ) {
   if (!credential || credential.status !== "active") return false;
-  if (credential.userId === userId) return true;
-  const owner = (
-    await tx
-      .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-      .from(userUsageOwners)
-      .where(eq(userUsageOwners.userId, userId))
-      .limit(1)
-      .for("update")
-  )[0];
-  return owner?.deliveryAdminId === credential.userId;
+  return credential.userId === userId;
 }
 
 function assertKnowledgeBaseReservationCredentialAvailable(
@@ -3799,6 +3953,19 @@ async function reserveKnowledgeBaseTurnInTransaction(
       "Deferred dispatch requires a customer attachment manifest",
     );
   }
+  const resetFencedDeferredOperation =
+    deferredClientAttachments &&
+    (input.operationType === "start" || input.operationType === "revise");
+  if (
+    resetFencedDeferredOperation &&
+    (!Number.isSafeInteger(input.sourceResetRevision) ||
+      Number(input.sourceResetRevision) < 0)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Deferred start/revise dispatch requires the current reset revision",
+    );
+  }
   const clientAttachmentManifestHash =
     input.clientAttachmentManifest === undefined
       ? null
@@ -3865,6 +4032,22 @@ async function reserveKnowledgeBaseTurnInTransaction(
           pinnedCredential,
         )
       : null;
+  if (resetFencedDeferredOperation) {
+    const resetState = (
+      await tx
+        .select({ revision: knowledgeBaseResetStates.revision })
+        .from(knowledgeBaseResetStates)
+        .where(eq(knowledgeBaseResetStates.userId, input.userId))
+        .limit(1)
+        .for("update")
+    )[0];
+    if (resetState?.revision !== input.sourceResetRevision) {
+      throw new KnowledgeBaseTurnReservationError(
+        "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+        "知识库已完成重置，请清空旧资料后重新开始",
+      );
+    }
+  }
   const buildRows = await tx
     .select()
     .from(knowledgeBaseBuilds)
@@ -3881,6 +4064,19 @@ async function reserveKnowledgeBaseTurnInTransaction(
     throw new KnowledgeBaseTurnReservationError(
       "BUILD_NOT_FOUND",
       "Knowledge-base build was not found",
+    );
+  }
+  if (
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+  ) {
+    // A turn may inherit dispatch authority only from the immutable birth
+    // provenance of a reset-created materialized build. Never create, replay,
+    // or take over a turn on an older row and never upgrade that row here.
+    throw new KnowledgeBaseTurnReservationError(
+      "RESET_REQUIRED",
+      "旧知识库构建不再续跑；请批准重置并重新上传资料",
     );
   }
   const conversationId = await ensureConversation(
@@ -4446,6 +4642,16 @@ async function reserveKnowledgeBaseTurnInTransaction(
     ...(expectedPresentationKey ? { expectedPresentationKey } : {}),
     recovery: sanitizedRecovery,
     ...(traceId ? { traceId } : {}),
+    ...(knowledgeBaseMaterializedRecoveryContractVersion(build) === 1
+      ? { materializedRecoveryContractVersion: 1 as const }
+      : {}),
+    ...(knowledgeBaseMaterializedCompletionContractVersion(build) ===
+    KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+      ? {
+          materializedCompletionContractVersion:
+            KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION,
+        }
+      : {}),
     createAttemptState: "not_sent",
     createAttemptUpdatedAt: now.toISOString(),
     // Persist the protocol authority at reservation time. Recovery must never
@@ -4543,11 +4749,13 @@ async function reserveKnowledgeBaseTurnInTransaction(
 function pinnedStartPayload(
   build: KnowledgeBaseBuild,
   payload: Record<string, unknown>,
+  researchWebsites: readonly string[],
 ) {
   return {
     ...payload,
     companyName: build.companyName,
     companyWebsite: build.companyWebsite || "",
+    researchWebsites: [...researchWebsites],
     skillVersion: build.skillVersion,
     skillContentHash: build.skillContentHash,
     skillArchiveSha256: build.skillArchiveSha256,
@@ -4779,11 +4987,25 @@ export async function reserveKnowledgeBaseStartBuild(
     "conversationId",
     191,
   );
-  const companyName = normalizeRequiredId(
-    input.companyName,
-    "companyName",
-    255,
-  );
+  let companyName: string;
+  let companyWebsite: string | null;
+  let researchWebsites: string[];
+  try {
+    companyName = canonicalizeKnowledgeBaseCompanyName(input.companyName);
+    const websites = canonicalizeKnowledgeBaseWebsiteLines(
+      input.companyWebsite,
+    );
+    companyWebsite = websites.primary;
+    researchWebsites = websites.researchWebsites;
+  } catch (error) {
+    if (error instanceof KnowledgeBaseCompanyIdentityNormalizationError) {
+      throw new KnowledgeBaseTurnReservationError(
+        "INVALID_REQUEST",
+        error.message,
+      );
+    }
+    throw error;
+  }
   const skillName = normalizeRequiredId(input.skillName, "skillName", 128);
   const skillVersion = normalizeRequiredId(
     input.skillVersion,
@@ -4860,7 +5082,6 @@ export async function reserveKnowledgeBaseStartBuild(
       "The new build Skill physical pin is not a controlled durable archive",
     );
   }
-  const companyWebsite = String(input.companyWebsite || "").trim() || null;
   const now = input.now ?? new Date();
   const startAttachmentFileIds = knowledgeBaseStartAttachmentFileIds(input);
   const storedConversationId = knowledgeBaseConversationStorageId(
@@ -4988,6 +5209,13 @@ export async function reserveKnowledgeBaseStartBuild(
         executionMode: "materialized_bundle_v1",
         contentVersion: 0,
         providerProtocol,
+        handoffProvenance: {
+          materializedRecoveryContractVersion: 1,
+          materializedCompletionContractVersion:
+            KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION,
+          sourceResetRevision: input.expectedResetRevision,
+          authorizedAt: now.toISOString(),
+        },
         canonicalTaskState: "unbound",
         status: "researching",
         generation: 1,
@@ -5026,11 +5254,25 @@ export async function reserveKnowledgeBaseStartBuild(
     if (
       build.executionMode !== "materialized_bundle_v1" ||
       build.skillVersion !== "5" ||
-      build.providerProtocol !== "manus_v2"
+      build.skillContentHash !==
+        KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH ||
+      build.providerProtocol !== "manus_v2" ||
+      knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+      knowledgeBaseMaterializedCompletionContractVersion(build) !==
+        KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "RESET_REQUIRED",
         "旧知识库构建不再续跑；请批准重置并重新上传资料",
+      );
+    }
+    if (
+      build.companyName !== companyName ||
+      (build.companyWebsite || null) !== companyWebsite
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Knowledge-base start enterprise identity does not match the frozen build",
       );
     }
     // A retention worker may have held the build unique-key gap while this
@@ -5064,11 +5306,19 @@ export async function reserveKnowledgeBaseStartBuild(
     }
     const createdBuild = build.id === candidateBuildId;
 
-    const requestPayload = pinnedStartPayload(build, input.requestPayload);
-    const recoveryMetadata = pinnedStartPayload(build, {
-      ...input.recoveryMetadata,
-      sourceResetRevision: input.expectedResetRevision,
-    });
+    const requestPayload = pinnedStartPayload(
+      build,
+      input.requestPayload,
+      researchWebsites,
+    );
+    const recoveryMetadata = pinnedStartPayload(
+      build,
+      {
+        ...input.recoveryMetadata,
+        sourceResetRevision: input.expectedResetRevision,
+      },
+      researchWebsites,
+    );
     const reservation = await reserveKnowledgeBaseTurnInTransaction(
       {
         userId: input.userId,
@@ -5542,8 +5792,8 @@ type StageKnowledgeBaseDeferredTurnAttachmentInput = {
   turnId: string;
   clientRequestId: string;
   clientAttachmentManifest: unknown;
-  /** Required for start reservations; ignored only for older non-start turns. */
-  expectedResetRevision?: number;
+  /** Required for browser-backed materialized start/revise reservations. */
+  expectedResetRevision: number;
   index: number;
   attachment: { file_id: string; filename: string };
   /**
@@ -5556,8 +5806,13 @@ type StageKnowledgeBaseDeferredTurnAttachmentInput = {
     mimeType: string;
     sizeBytes: number;
     contentSha256: string;
-    localStorageKey: string;
+    localStorageKey?: string;
   };
+  /**
+   * When present, retain these already-verified bytes while the live reset
+   * row and deferred turn coordinate are locked by the staging transaction.
+   */
+  managedUploadBytes?: Buffer;
   projectAssignmentId?: string | null;
   now?: Date;
 };
@@ -5568,28 +5823,24 @@ type ClaimKnowledgeBaseDeferredTurnDispatchInput = {
   turnId: string;
   clientRequestId: string;
   clientAttachmentManifest: unknown;
-  /** Required for start reservations; ignored only for older non-start turns. */
-  expectedResetRevision?: number;
+  /** Required for browser-backed materialized start/revise reservations. */
+  expectedResetRevision: number;
   now?: Date;
   leaseMs?: number;
 };
 
-async function assertStartResetRevisionInTransaction(input: {
+async function assertDeferredResetRevisionInTransaction(input: {
   tx: any;
   turn: ConversationTurn;
   metadata: KnowledgeBaseTurnMetadata;
   expectedResetRevision?: number;
 }) {
-  if (input.turn.operationType !== "start") return;
+  assertDeferredResetRevisionCoordinate(input);
   if (
-    !Number.isSafeInteger(input.expectedResetRevision) ||
-    Number(input.expectedResetRevision) < 0 ||
-    input.metadata.sourceResetRevision !== input.expectedResetRevision
+    input.turn.operationType !== "start" &&
+    input.turn.operationType !== "revise"
   ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
-      "知识库已完成重置，请清空旧资料后重新开始",
-    );
+    return;
   }
   const state = (
     await input.tx
@@ -5607,6 +5858,187 @@ async function assertStartResetRevisionInTransaction(input: {
   }
 }
 
+function assertDeferredResetRevisionCoordinate(input: {
+  turn: ConversationTurn;
+  metadata: KnowledgeBaseTurnMetadata;
+  expectedResetRevision?: number;
+}) {
+  if (
+    input.turn.operationType !== "start" &&
+    input.turn.operationType !== "revise"
+  ) {
+    return;
+  }
+  if (
+    !Number.isSafeInteger(input.expectedResetRevision) ||
+    Number(input.expectedResetRevision) < 0 ||
+    input.metadata.sourceResetRevision !== input.expectedResetRevision
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+      "知识库已完成重置，请清空旧资料后重新开始",
+    );
+  }
+}
+
+export type KnowledgeBaseLocalUploadCoordinateAssertion = {
+  userId: number;
+  projectAssignmentId: string | null;
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  itemId: string;
+  expectedResetRevision: number;
+  ordinal: number;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  contentSha256: string;
+};
+
+/**
+ * Proves that a private local-upload coordinate still names the authenticated
+ * account's active, un-dispatched start/revise reservation and the exact frozen
+ * manifest slot. Callers intentionally run this once before consuming the
+ * request stream and once more immediately before committing its staged bytes.
+ */
+export async function assertKnowledgeBaseLocalUploadCoordinate(
+  input: KnowledgeBaseLocalUploadCoordinateAssertion,
+  executor?: any,
+) {
+  assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedResetRevision, "expectedResetRevision", 0);
+  assertInteger(input.ordinal, "attachment ordinal", 1);
+  assertInteger(input.sizeBytes, "attachment size", 1);
+  if (input.sizeBytes > 100 * 1024 * 1024) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Attachment size exceeds the local upload limit",
+    );
+  }
+  const conversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const itemId = normalizeRequiredId(input.itemId, "itemId", 191);
+  const filename = normalizeRequiredId(input.filename, "filename", 512);
+  const mimeType = normalizeRequiredId(input.mimeType, "mimeType", 255);
+  const contentSha256 = String(input.contentSha256 || "")
+    .trim()
+    .toLowerCase();
+  if (!KNOWLEDGE_BASE_SHA256_PATTERN.test(contentSha256)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Attachment content hash is invalid",
+    );
+  }
+
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, {
+      userId: input.userId,
+      turnId,
+    });
+    const metadata = metadataOf(turn);
+    await assertDeferredResetRevisionInTransaction({
+      tx,
+      turn,
+      metadata,
+      expectedResetRevision: input.expectedResetRevision,
+    });
+    const ownedConversation = (
+      await tx
+        .select()
+        .from(conversations)
+        .where(
+          and(
+            eq(conversations.id, conversationId),
+            eq(conversations.userId, input.userId),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (
+      turn.conversationId !== conversationId ||
+      build.conversationId !== input.conversationId ||
+      !ownedConversation ||
+      ownedConversation.deletedAt ||
+      ownedConversation.projectAssignmentId !== input.projectAssignmentId ||
+      turn.clientRequestId !== clientRequestId ||
+      (turn.operationType !== "start" && turn.operationType !== "revise") ||
+      turn.status !== "queued" ||
+      Boolean(turn.upstreamTaskId) ||
+      metadata.awaitingClientAttachments !== true ||
+      storedKnowledgeBaseCreateAttemptState(metadata) !== "not_sent"
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The upload coordinate no longer owns an active deferred reservation",
+      );
+    }
+
+    const expectedCount = Number(metadata.userAttachmentCount);
+    const recovery =
+      metadata.recovery &&
+      typeof metadata.recovery === "object" &&
+      !Array.isArray(metadata.recovery)
+        ? metadata.recovery
+        : {};
+    const manifest = Array.isArray(recovery.attachmentManifest)
+      ? recovery.attachmentManifest
+      : [];
+    if (
+      !Number.isSafeInteger(expectedCount) ||
+      expectedCount < 1 ||
+      manifest.length !== expectedCount ||
+      input.ordinal > expectedCount ||
+      metadata.clientAttachmentManifestHash !==
+        hashKnowledgeBaseTurnRequest(manifest)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The upload coordinate does not match the frozen attachment manifest",
+      );
+    }
+    const rawEntry = manifest[input.ordinal - 1];
+    const entry =
+      rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry)
+        ? (rawEntry as Record<string, unknown>)
+        : null;
+    if (
+      !entry ||
+      entry.itemId !== itemId ||
+      entry.ordinal !== input.ordinal ||
+      entry.total !== expectedCount ||
+      entry.filename !== filename ||
+      entry.mimeType !== mimeType ||
+      entry.sizeBytes !== input.sizeBytes ||
+      String(entry.sha256 || "").toLowerCase() !== contentSha256
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The uploaded file does not match its reserved manifest item",
+      );
+    }
+    const staged = Array.isArray(metadata.clientStagedAttachments)
+      ? metadata.clientStagedAttachments
+      : [];
+    if (staged.length >= input.ordinal) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The reserved manifest item is already staged",
+      );
+    }
+    return { buildId: build.id, turnId: turn.id };
+  });
+}
+
 async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
   input: StageKnowledgeBaseDeferredTurnAttachmentInput,
   tx: any,
@@ -5622,7 +6054,7 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     input.clientAttachmentManifest,
   );
   const attachment = normalizeDeferredUserAttachments([input.attachment])[0]!;
-  const { turn } = await lockedOwnedTurnAndBuild(tx, input);
+  const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
   if (turn.buildId !== normalizeRequiredId(input.buildId, "buildId", 36)) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -5630,12 +6062,35 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     );
   }
   const metadata = metadataOf(turn);
-  await assertStartResetRevisionInTransaction({
+  await assertDeferredResetRevisionInTransaction({
     tx,
     turn,
     metadata,
     expectedResetRevision: input.expectedResetRevision,
   });
+  if (
+    turn.status === "completed" ||
+    turn.status === "failed" ||
+    turn.status === "cancelled"
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "TERMINAL",
+      "Knowledge-base turn is already terminal",
+    );
+  }
+  if (
+    (turn.operationType !== "start" && turn.operationType !== "revise") ||
+    turn.status !== "queued" ||
+    Boolean(turn.upstreamTaskId) ||
+    storedKnowledgeBaseCreateAttemptState(metadata) !== "not_sent" ||
+    turn.clientRequestId !== clientRequestId ||
+    metadata.clientAttachmentManifestHash !== manifestHash
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The uploaded file does not match its logical turn reservation",
+    );
+  }
   const localAsset = input.managedUploadProof
     ? (
         await tx
@@ -5680,6 +6135,15 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
         "The uploaded local asset is not owned by this knowledge-base account",
       );
     }
+    if (
+      input.managedUploadBytes !== undefined &&
+      !Buffer.isBuffer(input.managedUploadBytes)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The retained upload bytes are invalid",
+      );
+    }
   } else if (
     !legacyResource ||
     legacyResource.userId !== turn.userId ||
@@ -5697,25 +6161,7 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
       "The uploaded file is not owned by the start reservation credential",
     );
   }
-  if (
-    turn.clientRequestId !== clientRequestId ||
-    metadata.clientAttachmentManifestHash !== manifestHash
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      "The uploaded file does not match its logical turn reservation",
-    );
-  }
-  if (
-    turn.status === "completed" ||
-    turn.status === "failed" ||
-    turn.status === "cancelled"
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "TERMINAL",
-      "Knowledge-base turn is already terminal",
-    );
-  }
+  let managedUploadProof = input.managedUploadProof;
   const expectedCount = Number(metadata.userAttachmentCount ?? 0);
   if (
     !Number.isSafeInteger(expectedCount) ||
@@ -5736,13 +6182,14 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
       prior.index !== input.index ||
       prior.file_id !== attachment.file_id ||
       prior.filename !== attachment.filename ||
-      (input.managedUploadProof !== undefined &&
-        (prior.managedIntentId !== input.managedUploadProof.intentId ||
-          prior.itemId !== input.managedUploadProof.itemId ||
-          prior.mimeType !== input.managedUploadProof.mimeType ||
-          prior.sizeBytes !== input.managedUploadProof.sizeBytes ||
-          prior.contentSha256 !== input.managedUploadProof.contentSha256 ||
-          prior.localStorageKey !== input.managedUploadProof.localStorageKey))
+      (managedUploadProof !== undefined &&
+        (prior.managedIntentId !== managedUploadProof.intentId ||
+          prior.itemId !== managedUploadProof.itemId ||
+          prior.mimeType !== managedUploadProof.mimeType ||
+          prior.sizeBytes !== managedUploadProof.sizeBytes ||
+          prior.contentSha256 !== managedUploadProof.contentSha256 ||
+          (managedUploadProof.localStorageKey !== undefined &&
+            prior.localStorageKey !== managedUploadProof.localStorageKey)))
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "KNOWLEDGE_BASE_REQUEST_REPLAY_MISMATCH",
@@ -5761,34 +6208,61 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
       "Customer files must be staged once in manifest order",
     );
   }
+  if (managedUploadProof && input.managedUploadBytes !== undefined) {
+    const retained = await persistKnowledgeBaseBuildSource({
+      userId: input.userId,
+      buildId: build.id,
+      generation: build.generation,
+      bytes: input.managedUploadBytes,
+    });
+    if (
+      retained.contentSha256 !== managedUploadProof.contentSha256 ||
+      retained.sizeBytes !== managedUploadProof.sizeBytes
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Dashboard knowledge-base retained source does not match its upload proof",
+      );
+    }
+    managedUploadProof = {
+      ...managedUploadProof,
+      localStorageKey: retained.storageKey,
+    };
+  }
+  if (managedUploadProof && !managedUploadProof.localStorageKey) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The retained upload source is missing",
+    );
+  }
   staged.push({
     index: input.index,
     ...attachment,
-    ...(input.managedUploadProof
+    ...(managedUploadProof
       ? {
           managedIntentId: normalizeRequiredId(
-            input.managedUploadProof.intentId,
+            managedUploadProof.intentId,
             "managed upload intent id",
             255,
           ),
           itemId: normalizeRequiredId(
-            input.managedUploadProof.itemId,
+            managedUploadProof.itemId,
             "managed upload item id",
             255,
           ),
           mimeType: normalizeRequiredId(
-            input.managedUploadProof.mimeType,
+            managedUploadProof.mimeType,
             "managed upload mime type",
             255,
           ),
-          sizeBytes: input.managedUploadProof.sizeBytes,
+          sizeBytes: managedUploadProof.sizeBytes,
           contentSha256: normalizeRequiredId(
-            input.managedUploadProof.contentSha256,
+            managedUploadProof.contentSha256,
             "managed upload content hash",
             64,
           ),
           localStorageKey: normalizeRequiredId(
-            input.managedUploadProof.localStorageKey,
+            managedUploadProof.localStorageKey!,
             "managed upload local storage key",
             1_024,
           ),
@@ -5887,13 +6361,14 @@ async function claimKnowledgeBaseDeferredTurnDispatchInTransaction(
     );
   }
   const metadata = metadataOf(turn);
-  await assertStartResetRevisionInTransaction({
+  await assertDeferredResetRevisionInTransaction({
     tx,
     turn,
     metadata,
     expectedResetRevision: input.expectedResetRevision,
   });
   if (
+    (turn.operationType !== "start" && turn.operationType !== "revise") ||
     turn.clientRequestId !== clientRequestId ||
     !metadata.clientAttachmentManifestHash ||
     metadata.clientAttachmentManifestHash !== manifestHash
@@ -12743,6 +13218,20 @@ export async function beginKnowledgeBaseManusV2Dispatch(
     }
     const materialized = build.executionMode === "materialized_bundle_v1";
     if (
+      materialized &&
+      (metadata.materializedRecoveryContractVersion !== 1 ||
+        knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+        metadata.materializedCompletionContractVersion !==
+          KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
+        knowledgeBaseMaterializedCompletionContractVersion(build) !==
+          KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESET_REQUIRED",
+        "旧知识库构建不再续跑；请批准重置并重新上传资料",
+      );
+    }
+    if (
       turn.apiCredentialId === null ||
       (!materialized &&
         build.canonicalCredentialId &&
@@ -13878,7 +14367,7 @@ async function cancelUnpreparedKnowledgeBaseTurnInternal(
       );
     }
     if (turn.operationType === "start") {
-      await assertStartResetRevisionInTransaction({
+      await assertDeferredResetRevisionInTransaction({
         tx,
         turn,
         metadata,
@@ -13948,7 +14437,8 @@ async function cancelUnpreparedKnowledgeBaseTurnInternal(
         !build.canonicalTaskGeneration &&
         !build.canonicalCredentialId &&
         (!build.canonicalTaskState || build.canonicalTaskState === "unbound") &&
-        !build.handoffProvenance &&
+        (!build.handoffProvenance ||
+          knowledgeBaseMaterializedRecoveryContractVersion(build) === 1) &&
         !build.initialResearchCoverage &&
         !build.publishedSnapshotId &&
         !build.contentCompletedAt &&
@@ -15214,6 +15704,988 @@ export async function rejectAcknowledgedKnowledgeBaseManualLogoTurn(
   });
 }
 
+function materializedResultSettlementIsExact(input: {
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+  code: KnowledgeBaseMaterializedResultFailureCode;
+}) {
+  const { turn, build, metadata, code } = input;
+  return (
+    turn.status === "failed" &&
+    turn.errorCode === code &&
+    turn.leaseExpiresAt === null &&
+    build.status === "protocol_error" &&
+    build.activeTurnId === null &&
+    build.canonicalTaskState === "attention_required" &&
+    build.protocolErrorCode === code &&
+    metadata.providerAttemptState === "result_rejected" &&
+    metadata.dispatchState === "failed" &&
+    metadata.failureClass === "requires_user_fix" &&
+    metadata.recoveryAction === "approve_reset" &&
+    metadata.canRegenerate === false
+  );
+}
+
+function assertMaterializedResultPendingAuthority(input: {
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+}) {
+  const { turn, build, metadata } = input;
+  const taskId = turn.upstreamTaskId;
+  if (
+    build.activeTurnId !== turn.id ||
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.providerProtocol !== "manus_v2" ||
+    (build.status !== "researching" && build.status !== "confirming") ||
+    !taskId ||
+    build.upstreamTaskId !== taskId ||
+    (build.canonicalTaskId !== null && build.canonicalTaskId !== taskId) ||
+    metadata.materializedRecoveryContractVersion !== 1 ||
+    metadata.providerProtocol !== "manus_v2" ||
+    metadata.createAttemptState !== "acknowledged" ||
+    metadata.providerAttemptState !== "output_pending"
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Only the active materialized result reader may settle this turn",
+    );
+  }
+}
+
+function assertMaterializedCompletionV2Authority(input: {
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+}) {
+  assertMaterializedResultPendingAuthority(input);
+  if (
+    knowledgeBaseMaterializedCompletionContractVersion(input.build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
+    input.metadata.materializedCompletionContractVersion !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Historical materialized tasks cannot use completion terminalization",
+    );
+  }
+}
+
+function completionLedger(
+  metadata: KnowledgeBaseTurnMetadata,
+): KnowledgeBaseMaterializedCompletionLedger {
+  const value = metadata.materializedCompletion;
+  return value?.schemaVersion === 1 ? { ...value } : { schemaVersion: 1 };
+}
+
+function advanceMaterializedActiveRunningClock(input: {
+  ledger: KnowledgeBaseMaterializedCompletionLedger;
+  turn: ConversationTurn;
+  now: Date;
+  isRunning: boolean;
+}): KnowledgeBaseMaterializedCompletionLedger {
+  const { ledger, turn, now, isRunning } = input;
+  const {
+    runningObservedAt: _runningObservedAt,
+    activeRunningMs: _activeRunningMs,
+    ...retained
+  } = ledger;
+  const priorActiveRunningMs =
+    Number.isSafeInteger(ledger.activeRunningMs) &&
+    Number(ledger.activeRunningMs) >= 0
+      ? Number(ledger.activeRunningMs)
+      : 0;
+  let activeRunningMs = priorActiveRunningMs;
+  if (ledger.lastStatus === "running") {
+    const observedMs = Date.parse(
+      ledger.runningObservedAt ||
+        ledger.lastObservedAt ||
+        ledger.statusFirstObservedAt ||
+        "",
+    );
+    const fallbackStartedMs = turn.startedAt?.getTime() ?? Number.NaN;
+    const segmentObservedMs = Number.isFinite(observedMs)
+      ? observedMs
+      : fallbackStartedMs;
+    if (Number.isFinite(segmentObservedMs)) {
+      activeRunningMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        activeRunningMs + Math.max(0, now.getTime() - segmentObservedMs),
+      );
+    }
+  } else if (ledger.lastStatus === undefined && isRunning) {
+    const startedMs = turn.startedAt?.getTime() ?? Number.NaN;
+    if (Number.isFinite(startedMs)) {
+      activeRunningMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        activeRunningMs + Math.max(0, now.getTime() - startedMs),
+      );
+    }
+  }
+  return {
+    ...retained,
+    schemaVersion: 1,
+    activeRunningMs,
+    ...(isRunning ? { runningObservedAt: now.toISOString() } : {}),
+  };
+}
+
+function completionLedgerWithoutCandidate(
+  ledger: KnowledgeBaseMaterializedCompletionLedger,
+): KnowledgeBaseMaterializedCompletionLedger {
+  const {
+    candidateEventIdHash: _candidateEventIdHash,
+    storageKey: _storageKey,
+    candidateArchiveSha256: _candidateArchiveSha256,
+    sizeBytes: _sizeBytes,
+    firstObservedAt: _firstObservedAt,
+    lastObservedAt: _lastObservedAt,
+    stableAt: _stableAt,
+    naturalStopDeadlineAt: _naturalStopDeadlineAt,
+    stopAttemptState: _stopAttemptState,
+    stopAttemptedAt: _stopAttemptedAt,
+    stopRequestRefHash: _stopRequestRefHash,
+    stopSettleDeadlineAt: _stopSettleDeadlineAt,
+    ...retained
+  } = ledger;
+  return retained;
+}
+
+function completionPollAt(now: Date, deadlineAt?: string) {
+  const deadlineMs = Date.parse(deadlineAt || "");
+  const nextMs = Number.isFinite(deadlineMs)
+    ? Math.min(
+        now.getTime() + KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_POLL_MS,
+        deadlineMs,
+      )
+    : now.getTime() + KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_POLL_MS;
+  return new Date(Math.max(now.getTime() + 1_000, nextMs));
+}
+
+export type KnowledgeBaseMaterializedCompletionCandidateDisposition =
+  | "stabilizing"
+  | "natural_stop_wait"
+  | "stop_due"
+  | "stop_pending"
+  | "stop_settle_expired";
+
+/**
+ * Stage one fully validated running-result candidate under the active turn
+ * writer fence. Descriptor identities may rotate, but a different canonical
+ * byte hash or storage tuple resets stability; only canonical-equivalent
+ * content can advance to bounded task.stop.
+ */
+export async function observeKnowledgeBaseMaterializedCompletionCandidate(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    candidateEventIdHash: string;
+    storageKey: string;
+    candidateArchiveSha256: string;
+    sizeBytes: number;
+    providerStatus?: string;
+    now?: Date;
+  },
+  executor?: any,
+): Promise<{
+  disposition: KnowledgeBaseMaterializedCompletionCandidateDisposition;
+  ledger: KnowledgeBaseMaterializedCompletionLedger;
+  deduplicated: boolean;
+}> {
+  const candidateEventIdHash = normalizeRequiredId(
+    input.candidateEventIdHash,
+    "candidateEventIdHash",
+    64,
+  );
+  const storageKey = normalizeRequiredId(input.storageKey, "storageKey", 1024);
+  const candidateArchiveSha256 = normalizeRequiredId(
+    input.candidateArchiveSha256,
+    "candidateArchiveSha256",
+    64,
+  );
+  if (
+    !/^[a-f0-9]{64}$/u.test(candidateEventIdHash) ||
+    !/^[a-f0-9]{64}$/u.test(candidateArchiveSha256) ||
+    !Number.isSafeInteger(input.sizeBytes) ||
+    input.sizeBytes < 1 ||
+    input.sizeBytes > 100 * 1024 * 1024
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Materialized completion candidate proof is invalid",
+    );
+  }
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const metadata = metadataOf(turn);
+    assertMaterializedCompletionV2Authority({ turn, build, metadata });
+    const now = input.now ?? new Date();
+    const stored = completionLedger(metadata);
+    const sameCandidate =
+      stored.storageKey === storageKey &&
+      stored.candidateArchiveSha256 === candidateArchiveSha256 &&
+      stored.sizeBytes === input.sizeBytes;
+    if (stored.stopAttemptState && !sameCandidate) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "A task.stop candidate cannot be replaced or re-staged",
+      );
+    }
+    const providerStatus =
+      safeProviderDiagnostic(input.providerStatus, 64) || "running";
+    const clocked = advanceMaterializedActiveRunningClock({
+      ledger: stored,
+      turn,
+      now,
+      isRunning: providerStatus === "running",
+    });
+    const firstObservedAt = sameCandidate
+      ? stored.firstObservedAt || now.toISOString()
+      : now.toISOString();
+    const firstObservedMs = Date.parse(firstObservedAt);
+    let stableAt = sameCandidate ? stored.stableAt : undefined;
+    let naturalStopDeadlineAt = sameCandidate
+      ? stored.naturalStopDeadlineAt
+      : undefined;
+    if (
+      !stableAt &&
+      Number.isFinite(firstObservedMs) &&
+      now.getTime() - firstObservedMs >=
+        KNOWLEDGE_BASE_MATERIALIZED_CANDIDATE_STABILITY_MS
+    ) {
+      stableAt = now.toISOString();
+      naturalStopDeadlineAt = new Date(
+        now.getTime() + KNOWLEDGE_BASE_MATERIALIZED_NATURAL_STOP_WINDOW_MS,
+      ).toISOString();
+    }
+    const ledger: KnowledgeBaseMaterializedCompletionLedger = {
+      ...(sameCandidate ? clocked : completionLedgerWithoutCandidate(clocked)),
+      schemaVersion: 1,
+      lastStatus: providerStatus,
+      candidateEventIdHash,
+      storageKey,
+      candidateArchiveSha256,
+      sizeBytes: input.sizeBytes,
+      firstObservedAt,
+      lastObservedAt: now.toISOString(),
+      ...(stableAt ? { stableAt } : {}),
+      ...(naturalStopDeadlineAt ? { naturalStopDeadlineAt } : {}),
+    };
+    const settleDeadlineMs = Date.parse(ledger.stopSettleDeadlineAt || "");
+    const naturalDeadlineMs = Date.parse(ledger.naturalStopDeadlineAt || "");
+    const disposition: KnowledgeBaseMaterializedCompletionCandidateDisposition =
+      ledger.stopAttemptState
+        ? Number.isFinite(settleDeadlineMs) && now.getTime() >= settleDeadlineMs
+          ? "stop_settle_expired"
+          : "stop_pending"
+        : !ledger.stableAt
+          ? "stabilizing"
+          : Number.isFinite(naturalDeadlineMs) &&
+              now.getTime() >= naturalDeadlineMs
+            ? "stop_due"
+            : "natural_stop_wait";
+    const nextDeadline =
+      disposition === "stabilizing"
+        ? new Date(
+            firstObservedMs +
+              KNOWLEDGE_BASE_MATERIALIZED_CANDIDATE_STABILITY_MS,
+          ).toISOString()
+        : disposition === "natural_stop_wait"
+          ? ledger.naturalStopDeadlineAt
+          : disposition === "stop_pending"
+            ? ledger.stopSettleDeadlineAt
+            : undefined;
+    ledger.nextRetryAt = completionPollAt(now, nextDeadline).toISOString();
+    const updatedMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      materializedCompletion: ledger,
+      dispatchState: "recovering",
+      failureClass: "recoverable_same_turn",
+      recoveryAction: "wait",
+      canRegenerate: false,
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: updatedMetadata,
+        leaseExpiresAt: new Date(ledger.nextRetryAt),
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          inArray(conversationTurns.status, ["queued", "running"]),
+        ),
+      );
+    return { disposition, ledger, deduplicated: sameCandidate };
+  });
+}
+
+export type KnowledgeBaseMaterializedProviderStatus =
+  | "running"
+  | "waiting"
+  | "quota_error"
+  | "error"
+  | "unknown"
+  | "list_messages_404";
+
+/**
+ * Persist an explicit no-candidate Provider state with a hard deadline. Error
+ * states not proven to be an exact quota type settle immediately; waiting and
+ * quota interruption retain the same task for at most 24 hours.
+ */
+export async function deferKnowledgeBaseMaterializedProviderStatus(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    status: KnowledgeBaseMaterializedProviderStatus;
+    resetCandidate?: boolean;
+    now?: Date;
+  },
+  executor?: any,
+): Promise<
+  | {
+      state: "deferred";
+      retryAfterMs: number;
+      ledger: KnowledgeBaseMaterializedCompletionLedger;
+    }
+  | { state: "unavailable"; turn: KnowledgeBaseTurnRecord }
+> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const metadata = metadataOf(turn);
+    assertMaterializedCompletionV2Authority({ turn, build, metadata });
+    const now = input.now ?? new Date();
+    const original = completionLedger(metadata);
+    if (input.resetCandidate && original.stopAttemptState) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "A task.stop candidate cannot be cleared by provider status",
+      );
+    }
+    const stored = input.resetCandidate
+      ? completionLedgerWithoutCandidate(original)
+      : original;
+    if (input.status === "error") {
+      const settled =
+        await settleLockedKnowledgeBaseMaterializedProviderAttention({
+          tx,
+          userId: input.userId,
+          turn,
+          build,
+          metadata,
+          now,
+        });
+      return { state: "unavailable", turn: settled };
+    }
+    const clocked = advanceMaterializedActiveRunningClock({
+      ledger: stored,
+      turn,
+      now,
+      isRunning: input.status === "running",
+    });
+    const priorStatus = stored.lastStatus;
+    const sameInterruptionClass =
+      (priorStatus === "waiting" || priorStatus === "quota_error") &&
+      (input.status === "waiting" || input.status === "quota_error");
+    const sameStatus = priorStatus === input.status || sameInterruptionClass;
+    const firstObservedAt = sameStatus
+      ? stored.statusFirstObservedAt || now.toISOString()
+      : input.status === "running" &&
+          !priorStatus &&
+          turn.startedAt instanceof Date &&
+          Number.isFinite(turn.startedAt.getTime())
+        ? turn.startedAt.toISOString()
+        : now.toISOString();
+    const firstObservedMs = Date.parse(firstObservedAt);
+    const durationMs =
+      input.status === "list_messages_404" || input.status === "unknown"
+        ? 10 * 60_000
+        : input.status === "waiting" || input.status === "quota_error"
+          ? 24 * 60 * 60_000
+          : turn.operationType === "start"
+            ? 3 * 60 * 60_000
+            : 90 * 60_000;
+    const activeRunningMs = clocked.activeRunningMs || 0;
+    const deadlineMs =
+      input.status === "running"
+        ? now.getTime() + Math.max(0, durationMs - activeRunningMs)
+        : firstObservedMs + durationMs;
+    if (
+      !Number.isFinite(firstObservedMs) ||
+      !Number.isFinite(deadlineMs) ||
+      (input.status === "running"
+        ? activeRunningMs >= durationMs
+        : now.getTime() >= deadlineMs)
+    ) {
+      const settled =
+        await settleLockedKnowledgeBaseMaterializedResultForApprovedReset({
+          tx,
+          userId: input.userId,
+          turn,
+          build,
+          metadata,
+          code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+          now,
+        });
+      return { state: "unavailable", turn: settled };
+    }
+    const nextRetryAt = completionPollAt(
+      now,
+      new Date(deadlineMs).toISOString(),
+    );
+    const ledger: KnowledgeBaseMaterializedCompletionLedger = {
+      ...clocked,
+      schemaVersion: 1,
+      lastStatus: input.status,
+      statusFirstObservedAt: firstObservedAt,
+      statusDeadlineAt: new Date(deadlineMs).toISOString(),
+      ...(input.status === "list_messages_404"
+        ? { listMessages404FirstObservedAt: firstObservedAt }
+        : {}),
+      nextRetryAt: nextRetryAt.toISOString(),
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: {
+          ...metadata,
+          materializedCompletion: ledger,
+          dispatchState: "recovering",
+          failureClass: "recoverable_same_turn",
+          recoveryAction:
+            input.status === "quota_error"
+              ? "top_up"
+              : input.status === "waiting"
+                ? "awaiting_input"
+                : "wait",
+          canRegenerate: false,
+        },
+        leaseExpiresAt: nextRetryAt,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          inArray(conversationTurns.status, ["queued", "running"]),
+        ),
+      );
+    return {
+      state: "deferred",
+      retryAfterMs: nextRetryAt.getTime() - now.getTime(),
+      ledger,
+    };
+  });
+}
+
+/** Atomically spend the one allowed task.stop attempt for this candidate. */
+export async function beginKnowledgeBaseMaterializedCompletionStop(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    now?: Date;
+  },
+  executor?: any,
+): Promise<{
+  send: boolean;
+  ledger: KnowledgeBaseMaterializedCompletionLedger;
+}> {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const metadata = metadataOf(turn);
+    assertMaterializedCompletionV2Authority({ turn, build, metadata });
+    const now = input.now ?? new Date();
+    const ledger = completionLedger(metadata);
+    if (ledger.stopAttemptState) return { send: false, ledger };
+    const naturalDeadlineMs = Date.parse(ledger.naturalStopDeadlineAt || "");
+    if (
+      !ledger.stableAt ||
+      !ledger.candidateEventIdHash ||
+      !ledger.storageKey ||
+      !ledger.candidateArchiveSha256 ||
+      !ledger.sizeBytes ||
+      !Number.isFinite(naturalDeadlineMs) ||
+      now.getTime() < naturalDeadlineMs
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Materialized completion candidate is not eligible for task.stop",
+      );
+    }
+    const stopSettleDeadlineAt = new Date(
+      now.getTime() + KNOWLEDGE_BASE_MATERIALIZED_STOP_SETTLE_WINDOW_MS,
+    ).toISOString();
+    const next: KnowledgeBaseMaterializedCompletionLedger = {
+      ...ledger,
+      stopAttemptState: "sending",
+      stopAttemptedAt: now.toISOString(),
+      stopSettleDeadlineAt,
+      nextRetryAt: completionPollAt(now, stopSettleDeadlineAt).toISOString(),
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: { ...metadata, materializedCompletion: next },
+        leaseExpiresAt: new Date(next.nextRetryAt!),
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    return { send: true, ledger: next };
+  });
+}
+
+export async function settleKnowledgeBaseMaterializedCompletionStopAttempt(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    state: "acknowledged" | "outcome_unknown" | "rejected";
+    requestRef?: string | null;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input);
+    assertLease(turn, input.leaseToken);
+    const metadata = metadataOf(turn);
+    assertMaterializedCompletionV2Authority({ turn, build, metadata });
+    const now = input.now ?? new Date();
+    const ledger = completionLedger(metadata);
+    if (ledger.stopAttemptState && ledger.stopAttemptState !== "sending") {
+      return { ledger, deduplicated: true };
+    }
+    if (ledger.stopAttemptState !== "sending") {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "No materialized task.stop attempt is in flight",
+      );
+    }
+    const requestRef = safeProviderDiagnostic(input.requestRef, 512);
+    const attemptedAtMs = Date.parse(ledger.stopAttemptedAt || "");
+    if (!Number.isFinite(attemptedAtMs)) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Materialized task.stop attempt timestamp is invalid",
+      );
+    }
+    const stopSettleDeadlineAt =
+      input.state === "outcome_unknown"
+        ? new Date(
+            attemptedAtMs +
+              KNOWLEDGE_BASE_MATERIALIZED_STOP_OUTCOME_UNKNOWN_WINDOW_MS,
+          ).toISOString()
+        : ledger.stopSettleDeadlineAt;
+    const next: KnowledgeBaseMaterializedCompletionLedger = {
+      ...ledger,
+      stopAttemptState: input.state,
+      ...(stopSettleDeadlineAt ? { stopSettleDeadlineAt } : {}),
+      ...(requestRef ? { stopRequestRefHash: sha256(requestRef) } : {}),
+      nextRetryAt: completionPollAt(now, stopSettleDeadlineAt).toISOString(),
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: { ...metadata, materializedCompletion: next },
+        leaseExpiresAt: new Date(next.nextRetryAt!),
+        updatedAt: now,
+      })
+      .where(eq(conversationTurns.id, turn.id));
+    return { ledger: next, deduplicated: false };
+  });
+}
+
+const KNOWLEDGE_BASE_MATERIALIZED_PROVIDER_ATTENTION =
+  "KNOWLEDGE_BASE_MATERIALIZED_PROVIDER_ATTENTION";
+const KNOWLEDGE_BASE_MATERIALIZED_PROVIDER_ATTENTION_MESSAGE =
+  "原任务执行发生错误，系统不会自动重发；请联系支持处理。已完成内容不受影响。";
+
+async function settleLockedKnowledgeBaseMaterializedProviderAttention(input: {
+  tx: any;
+  userId: number;
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+  now: Date;
+}) {
+  return settleLockedKnowledgeBaseMaterializedResultForApprovedReset({
+    ...input,
+    code: KNOWLEDGE_BASE_MATERIALIZED_PROVIDER_ATTENTION,
+    settlement: "provider_attention",
+  });
+}
+
+async function settleLockedKnowledgeBaseMaterializedResultForApprovedReset(input: {
+  tx: any;
+  userId: number;
+  turn: ConversationTurn;
+  build: KnowledgeBaseBuild;
+  metadata: KnowledgeBaseTurnMetadata;
+  code:
+    | KnowledgeBaseMaterializedResultFailureCode
+    | typeof KNOWLEDGE_BASE_MATERIALIZED_PROVIDER_ATTENTION;
+  settlement?: "result_reset" | "provider_attention";
+  now: Date;
+}) {
+  const { tx, turn, build, metadata, code, now } = input;
+  const providerAttention = input.settlement === "provider_attention";
+  const customerMessage = providerAttention
+    ? KNOWLEDGE_BASE_MATERIALIZED_PROVIDER_ATTENTION_MESSAGE
+    : KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE;
+  assertMaterializedResultPendingAuthority({ turn, build, metadata });
+  const resultRead = metadata.materializedResultRead;
+  const terminalResultRead = resultRead
+    ? (({ nextRetryAt: _nextRetryAt, ...retained }) => retained)(resultRead)
+    : null;
+  const completion = metadata.materializedCompletion;
+  const terminalCompletion = completion
+    ? (({ nextRetryAt: _nextRetryAt, ...retained }) => retained)(completion)
+    : null;
+  const failedMetadata: KnowledgeBaseTurnMetadata = {
+    ...metadata,
+    providerAttemptState: providerAttention
+      ? "output_pending"
+      : "result_rejected",
+    dispatchState: "failed",
+    failureClass: providerAttention
+      ? "terminal_nonregenerable"
+      : "requires_user_fix",
+    recoveryAction: providerAttention ? "contact_support" : "approve_reset",
+    canRegenerate: false,
+    manusV2Lifecycle: {
+      ...(metadata.manusV2Lifecycle || {}),
+      attentionCode: code,
+    },
+    ...(terminalResultRead
+      ? {
+          materializedResultRead: terminalResultRead,
+        }
+      : {}),
+    ...(terminalCompletion
+      ? {
+          materializedCompletion: terminalCompletion,
+        }
+      : {}),
+  };
+  const buildUpdated = await tx
+    .update(knowledgeBaseBuilds)
+    .set({
+      status: "protocol_error",
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: code,
+      protocolError: customerMessage,
+      stateEpoch: build.stateEpoch + 1,
+      recoveryLeaseOwnerHash: null,
+      recoveryLeaseExpiresAt: null,
+      awaitingResponseSince: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(knowledgeBaseBuilds.id, build.id),
+        eq(knowledgeBaseBuilds.userId, input.userId),
+        eq(knowledgeBaseBuilds.generation, build.generation),
+        eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
+        eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+      ),
+    );
+  if (!buildUpdated[0]?.affectedRows) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The materialized result lost its writer fence before settlement",
+    );
+  }
+  const turnUpdated = await tx
+    .update(conversationTurns)
+    .set({
+      status: "failed",
+      errorCode: code,
+      errorMessage: customerMessage,
+      completedAt: turn.completedAt ?? now,
+      leaseExpiresAt: null,
+      metadata: failedMetadata,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(conversationTurns.id, turn.id),
+        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.buildId, build.id),
+        eq(conversationTurns.buildGeneration, build.generation),
+        inArray(conversationTurns.status, ["queued", "running"]),
+      ),
+    );
+  if (!turnUpdated[0]?.affectedRows) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The materialized result turn changed before settlement",
+    );
+  }
+  await markKnowledgeBaseConversationFailedInTransaction({
+    tx,
+    userId: input.userId,
+    conversationId: turn.conversationId,
+    authoritativeTaskId:
+      turn.upstreamTaskId || build.canonicalTaskId || build.upstreamTaskId,
+    failedAt: now,
+  });
+  return turnRecord({
+    ...turn,
+    status: "failed",
+    errorCode: code,
+    errorMessage: customerMessage,
+    completedAt: turn.completedAt ?? now,
+    leaseExpiresAt: null,
+    metadata: failedMetadata,
+    updatedAt: now,
+  });
+}
+
+/**
+ * Reject one terminal materialized archive without weakening its contract or
+ * creating a replacement task. The exact replay is idempotent even after the
+ * writer fence has been released.
+ */
+export async function failKnowledgeBaseMaterializedResultForApprovedReset(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    code: KnowledgeBaseMaterializedResultFailureCode;
+    now?: Date;
+  },
+  executor?: any,
+): Promise<{ turn: KnowledgeBaseTurnRecord; deduplicated: boolean }> {
+  if (!isKnowledgeBaseMaterializedResultFailureCode(input.code)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Unsupported materialized result failure code",
+    );
+  }
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input, {
+      allowInactiveTurn: true,
+    });
+    const metadata = metadataOf(turn);
+    if (metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken)) {
+      throw new KnowledgeBaseTurnReservationError(
+        "LEASE_LOST",
+        "Knowledge-base turn lease is owned by another worker",
+        1_000,
+      );
+    }
+    if (
+      materializedResultSettlementIsExact({
+        turn,
+        build,
+        metadata,
+        code: input.code,
+      })
+    ) {
+      return { turn: turnRecord(turn), deduplicated: true };
+    }
+    assertLease(turn, input.leaseToken);
+    const settledTurn =
+      await settleLockedKnowledgeBaseMaterializedResultForApprovedReset({
+        tx,
+        userId: input.userId,
+        turn,
+        build,
+        metadata,
+        code: input.code,
+        now: input.now ?? new Date(),
+      });
+    return { turn: settledTurn, deduplicated: false };
+  });
+}
+
+export type KnowledgeBaseMaterializedResultReadDisposition =
+  | {
+      state: "deferred";
+      firstObservedAt: string;
+      attempt: number;
+      nextRetryAt: string;
+      retryAfterMs: number;
+      deduplicated: boolean;
+    }
+  | {
+      state: "unavailable";
+      turn: KnowledgeBaseTurnRecord;
+      deduplicated: boolean;
+    };
+
+/**
+ * Lease-fenced retry schedule for transient reads of one stopped Manus result.
+ * The original task remains the sole provider task; at ten minutes the same
+ * transaction converts it to the approved-reset terminal state.
+ */
+export async function deferKnowledgeBaseMaterializedResultRead(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    lastErrorKind: string;
+    now?: Date;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseMaterializedResultReadDisposition> {
+  const lastErrorKind = safeProviderDiagnostic(input.lastErrorKind, 128);
+  if (!lastErrorKind) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "A safe materialized result read error kind is required",
+    );
+  }
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input, {
+      allowInactiveTurn: true,
+    });
+    const metadata = metadataOf(turn);
+    if (metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken)) {
+      throw new KnowledgeBaseTurnReservationError(
+        "LEASE_LOST",
+        "Knowledge-base turn lease is owned by another worker",
+        1_000,
+      );
+    }
+    if (
+      materializedResultSettlementIsExact({
+        turn,
+        build,
+        metadata,
+        code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+      })
+    ) {
+      return {
+        state: "unavailable",
+        turn: turnRecord(turn),
+        deduplicated: true,
+      };
+    }
+    assertLease(turn, input.leaseToken);
+    assertMaterializedResultPendingAuthority({ turn, build, metadata });
+    const now = input.now ?? new Date();
+    const stored = metadata.materializedResultRead;
+    const storedFirstObservedMs = stored
+      ? Date.parse(stored.firstObservedAt)
+      : Number.NaN;
+    const firstObservedAt = stored ? stored.firstObservedAt : now.toISOString();
+    const firstObservedMs = stored ? storedFirstObservedMs : now.getTime();
+    const existingRetryAt = Date.parse(stored?.nextRetryAt || "");
+    if (
+      stored &&
+      Number.isFinite(existingRetryAt) &&
+      existingRetryAt > now.getTime()
+    ) {
+      return {
+        state: "deferred",
+        firstObservedAt,
+        attempt: stored.attempt,
+        nextRetryAt: stored.nextRetryAt!,
+        retryAfterMs: existingRetryAt - now.getTime(),
+        deduplicated: true,
+      };
+    }
+    const deadlineAt = firstObservedMs + MATERIALIZED_RESULT_READ_WINDOW_MS;
+    if (!Number.isFinite(firstObservedMs) || now.getTime() >= deadlineAt) {
+      const settledTurn =
+        await settleLockedKnowledgeBaseMaterializedResultForApprovedReset({
+          tx,
+          userId: input.userId,
+          turn,
+          build,
+          metadata: {
+            ...metadata,
+            materializedResultRead: {
+              firstObservedAt: Number.isFinite(firstObservedMs)
+                ? firstObservedAt
+                : now.toISOString(),
+              attempt:
+                Number.isSafeInteger(stored?.attempt) && stored!.attempt >= 0
+                  ? stored!.attempt
+                  : 0,
+              lastErrorKind,
+            },
+          },
+          code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+          now,
+        });
+      return { state: "unavailable", turn: settledTurn, deduplicated: false };
+    }
+    const priorAttempt =
+      Number.isSafeInteger(stored?.attempt) && stored!.attempt >= 0
+        ? stored!.attempt
+        : 0;
+    const attempt = priorAttempt + 1;
+    const delayMs =
+      MATERIALIZED_RESULT_READ_BACKOFF_MS[
+        Math.min(attempt - 1, MATERIALIZED_RESULT_READ_BACKOFF_MS.length - 1)
+      ];
+    const nextRetryMs = Math.min(now.getTime() + delayMs, deadlineAt);
+    const nextRetryAt = new Date(nextRetryMs).toISOString();
+    const materializedResultRead: KnowledgeBaseMaterializedResultRead = {
+      firstObservedAt,
+      attempt,
+      nextRetryAt,
+      lastErrorKind,
+    };
+    await tx
+      .update(conversationTurns)
+      .set({
+        metadata: {
+          ...metadata,
+          providerAttemptState: "output_pending",
+          dispatchState: "recovering",
+          failureClass: "recoverable_same_turn",
+          recoveryAction: "wait",
+          canRegenerate: false,
+          materializedResultRead,
+        },
+        leaseExpiresAt: new Date(nextRetryMs),
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          inArray(conversationTurns.status, ["queued", "running"]),
+        ),
+      );
+    return {
+      state: "deferred",
+      firstObservedAt,
+      attempt,
+      nextRetryAt,
+      retryAfterMs: nextRetryMs - now.getTime(),
+      deduplicated: false,
+    };
+  });
+}
+
 /**
  * Settles a provider rejection which proves that no usable task was created.
  *
@@ -15585,10 +17057,7 @@ export async function findRecoverableKnowledgeBaseTurnIds(
     )
     .where(
       and(
-        eq(
-          knowledgeBaseBuilds.executionMode,
-          "materialized_bundle_v1",
-        ),
+        eq(knowledgeBaseBuilds.executionMode, "materialized_bundle_v1"),
         or(
           and(
             inArray(conversationTurns.status, ["queued", "running", "failed"]),
@@ -15714,12 +17183,61 @@ export async function claimKnowledgeBaseTurnForRecovery(
     }
     const currentMetadata = metadataOf(turn);
     if (
-      build.executionMode !== "materialized_bundle_v1" ||
-      build.skillVersion !== "5" ||
-      build.providerProtocol !== "manus_v2"
+      currentMetadata.materializedRecoveryContractVersion !== 1 ||
+      knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+      currentMetadata.materializedCompletionContractVersion !==
+        KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
+      knowledgeBaseMaterializedCompletionContractVersion(build) !==
+        KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
     ) {
-      // Pre-v5 builds are deliberately inert. They remain readable only as a
-      // RESET_REQUIRED projection and must never acquire a Provider lease.
+      // Reset-only cutover: old rows are readable history, not dispatch
+      // authority. Mark the build once under the existing build -> turn locks
+      // so the cheap scanner excludes it on every later pass. No Provider
+      // lease, upload, handoff, rehydrate, poll, or create is allowed here.
+      if (
+        currentMetadata.manusV2Lifecycle?.attentionCode !== "RESET_REQUIRED" ||
+        turn.status !== "failed" ||
+        currentMetadata.failureClass !== "requires_user_fix" ||
+        currentMetadata.recoveryAction !== "approve_reset" ||
+        build.status !== "protocol_error" ||
+        build.canonicalTaskState !== "attention_required" ||
+        build.protocolErrorCode !== "RESET_REQUIRED"
+      ) {
+        const nextMetadata: KnowledgeBaseTurnMetadata = {
+          ...currentMetadata,
+          manusV2Lifecycle: {
+            ...(currentMetadata.manusV2Lifecycle || {}),
+            attentionCode: "RESET_REQUIRED",
+          },
+          dispatchState: "failed",
+          failureClass: "requires_user_fix",
+          recoveryAction: "approve_reset",
+          canRegenerate: false,
+        };
+        await tx
+          .update(conversationTurns)
+          .set({
+            status: "failed",
+            errorCode: "RESET_REQUIRED",
+            errorMessage: null,
+            completedAt: turn.completedAt ?? now,
+            leaseExpiresAt: null,
+            metadata: nextMetadata,
+            updatedAt: now,
+          })
+          .where(eq(conversationTurns.id, turn.id));
+        await tx
+          .update(knowledgeBaseBuilds)
+          .set({
+            status: "protocol_error",
+            canonicalTaskState: "attention_required",
+            protocolErrorCode: "RESET_REQUIRED",
+            protocolError: null,
+            stateEpoch: build.stateEpoch + 1,
+            updatedAt: now,
+          })
+          .where(eq(knowledgeBaseBuilds.id, build.id));
+      }
       return null;
     }
     if (isHistoricalPreproviderAuthoritySelfTerminal(build, turn)) {
@@ -16184,6 +17702,8 @@ export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(
     if (
       build.executionMode !== "materialized_bundle_v1" ||
       build.skillVersion !== "5" ||
+      build.skillContentHash !==
+        KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH ||
       build.providerProtocol !== "manus_v2" ||
       build.contentVersion === null
     ) {

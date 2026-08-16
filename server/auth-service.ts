@@ -1689,25 +1689,10 @@ export async function getApiCredentialStatus(userId: number) {
 }
 
 export async function getEffectiveApiCredentialStatus(accountId: number) {
-  const db = await requireDb();
-  const directStatus = await getApiCredentialStatus(accountId);
-  if (directStatus.configured) {
-    return {
-      ...directStatus,
-      ownerUserId: accountId,
-      inherited: false,
-    };
-  }
-  const ownerRows = await db
-    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-    .from(userUsageOwners)
-    .where(eq(userUsageOwners.userId, accountId))
-    .limit(1);
-  const ownerUserId = ownerRows[0]?.deliveryAdminId ?? accountId;
   return {
-    ...(await getApiCredentialStatus(ownerUserId)),
-    ownerUserId,
-    inherited: ownerUserId !== accountId,
+    ...(await getApiCredentialStatus(accountId)),
+    ownerUserId: accountId,
+    inherited: false,
   };
 }
 
@@ -1717,7 +1702,7 @@ export async function replaceApiCredentialInTransaction(input: {
   apiKey: string;
   now?: Date;
   credentialId?: string;
-  agentProfile?: ManagedAgentProfile;
+  agentProfile?: ManagedAgentProfile | null;
 }): Promise<CredentialStatus> {
   // Permanent account deletion fences the credential owner before enumerating
   // all key generations. Check inside every transactional rotation path so a
@@ -1738,7 +1723,10 @@ export async function replaceApiCredentialInTransaction(input: {
   const credentialId = input.credentialId ?? randomUUID();
   const encrypted = encryptApiKey(input.userId, credentialId, input.apiKey);
   const now = input.now ?? new Date();
-  const agentProfile = input.agentProfile ?? DEFAULT_MANAGED_AGENT_PROFILE;
+  const agentProfile =
+    input.agentProfile === null
+      ? null
+      : (input.agentProfile ?? DEFAULT_MANAGED_AGENT_PROFILE);
   const tx = input.executor;
 
   const ownerRows = await tx
@@ -2299,7 +2287,10 @@ export async function deleteActiveApiCredentialInTransaction(input: {
     encryptionIv: randomBytes(12).toString("base64"),
     encryptionAuthTag: randomBytes(16).toString("base64"),
     fingerprint: randomBytes(16).toString("hex"),
-    agentProfile: credentialAgentProfile(latest),
+    agentProfile:
+      typeof (latest as { agentProfile?: unknown }).agentProfile === "string"
+        ? (latest as { agentProfile: string }).agentProfile
+        : null,
     status: "deleted",
     validationStatus: "unverified",
     verifiedAt: null,
@@ -2758,31 +2749,11 @@ export async function getDecryptedCredentialForKnowledgeBaseUploadReservation(
   });
 }
 
-/**
- * Returns the active runtime credential for an account. A customer-owned
- * credential always wins. Legacy customers without one may temporarily
- * inherit the credential of their assigned usage owner.
- */
+/** Returns only the account's own active runtime credential. */
 export async function getEffectiveDecryptedCredentialForAccount(
   accountId: number,
 ): Promise<DecryptedCredential | null> {
-  const db = await requireDb();
-  const accountRows = await db
-    .select({ role: users.role })
-    .from(users)
-    .where(eq(users.id, accountId))
-    .limit(1);
-  const account = accountRows[0];
-  if (!account) return null;
-  const directCredential = await getDecryptedCredentialForUser(accountId);
-  if (directCredential || account.role === "admin") return directCredential;
-  const ownerRows = await db
-    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-    .from(userUsageOwners)
-    .where(eq(userUsageOwners.userId, accountId))
-    .limit(1);
-  const ownerId = ownerRows[0]?.deliveryAdminId;
-  return ownerId ? getDecryptedCredentialForUser(ownerId) : null;
+  return getDecryptedCredentialForUser(accountId);
 }
 
 export async function credentialMayServeAccount(
@@ -2800,13 +2771,7 @@ export async function credentialMayServeAccount(
     .limit(1);
   const credential = credentialRows[0];
   if (!credential || credential.status === "deleted") return false;
-  if (credential.ownerUserId === accountId) return true;
-  const ownerRows = await executor
-    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-    .from(userUsageOwners)
-    .where(eq(userUsageOwners.userId, accountId))
-    .limit(1);
-  return ownerRows[0]?.deliveryAdminId === credential.ownerUserId;
+  return credential.ownerUserId === accountId;
 }
 
 export async function getCredentialForUpstreamResource(

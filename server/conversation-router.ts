@@ -12,9 +12,9 @@ import {
   knowledgeBaseConversationRetentionTombstones,
   knowledgeBaseConversationTombstones,
   knowledgeBaseResetRequests,
+  localAssets,
   messages,
   upstreamResources,
-  userUsageOwners,
   users,
   type MessageMetadata,
 } from "../drizzle/schema";
@@ -32,6 +32,10 @@ import {
   knowledgeBaseCustomerUploadResources,
   knowledgeBaseOfficialLogoUploadFromTurn,
 } from "./knowledge-base-customer-upload";
+import {
+  knowledgeBaseOfficialLogoInternalIdentity,
+  knowledgeBasePublicResource,
+} from "./knowledge-base-public-resource";
 import {
   knowledgeBaseMessageSchema,
   matchesAuthoritativeKnowledgeBaseMessageTuple,
@@ -72,6 +76,7 @@ type ServerOwnedTurnResourceIdentity = ServerOwnedTurnIdentity &
 type ServerOwnedBuildResourceIdentity = ServerOwnedBuildIdentity &
   Pick<
     typeof knowledgeBaseBuilds.$inferSelect,
+    | "generation"
     | "logoStorageKey"
     | "logoSha256"
     | "logoBytes"
@@ -264,29 +269,64 @@ async function attachmentRetentionByFileId(
 ) {
   const uniqueFileIds = [...new Set(fileIds.filter(Boolean))];
   if (uniqueFileIds.length === 0) return new Map<string, AttachmentRetention>();
-  const rows = await executor
-    .select({
-      upstreamId: upstreamResources.upstreamId,
-      createdAt: upstreamResources.createdAt,
-      uploadedAt: upstreamResources.uploadedAt,
-      contentExpiresAt: upstreamResources.contentExpiresAt,
-      contentDeletedAt: upstreamResources.contentDeletedAt,
-    })
-    .from(upstreamResources)
-    .where(
-      and(
-        eq(upstreamResources.kind, "file"),
-        inArray(upstreamResources.upstreamId, uniqueFileIds),
-        projectAssignmentId
-          ? eq(upstreamResources.projectAssignmentId, projectAssignmentId)
-          : and(
-              eq(upstreamResources.userId, userId),
-              isNull(upstreamResources.projectAssignmentId),
+  const localFileIds = uniqueFileIds.filter((fileId) =>
+    fileId.startsWith("asset_"),
+  );
+  const providerFileIds = uniqueFileIds.filter(
+    (fileId) => !fileId.startsWith("asset_"),
+  );
+  const localRows =
+    localFileIds.length === 0
+      ? []
+      : await executor
+          .select({
+            id: localAssets.id,
+            retainUntil: localAssets.retainUntil,
+          })
+          .from(localAssets)
+          .where(
+            and(
+              eq(localAssets.scope, "managed_user"),
+              eq(localAssets.accountUserId, userId),
+              inArray(localAssets.id, localFileIds),
             ),
-      ),
-    );
-  return new Map<string, AttachmentRetention>(
-    rows.map(
+          );
+  const rows =
+    providerFileIds.length === 0
+      ? []
+      : await executor
+          .select({
+            upstreamId: upstreamResources.upstreamId,
+            createdAt: upstreamResources.createdAt,
+            uploadedAt: upstreamResources.uploadedAt,
+            contentExpiresAt: upstreamResources.contentExpiresAt,
+            contentDeletedAt: upstreamResources.contentDeletedAt,
+          })
+          .from(upstreamResources)
+          .where(
+            and(
+              eq(upstreamResources.kind, "file"),
+              inArray(upstreamResources.upstreamId, providerFileIds),
+              projectAssignmentId
+                ? eq(upstreamResources.projectAssignmentId, projectAssignmentId)
+                : and(
+                    eq(upstreamResources.userId, userId),
+                    isNull(upstreamResources.projectAssignmentId),
+                  ),
+            ),
+          );
+  return new Map<string, AttachmentRetention>([
+    ...localRows.map((row: { id: string; retainUntil: Date | null }) => {
+      const expiresAt = row.retainUntil?.getTime() ?? 0;
+      return [
+        row.id,
+        {
+          expiresAt,
+          expired: expiresAt <= now,
+        },
+      ] as const;
+    }),
+    ...rows.map(
       (row: {
         upstreamId: string;
         createdAt: Date;
@@ -310,10 +350,10 @@ async function attachmentRetentionByFileId(
             expiresAt,
             expired: Boolean(row.contentDeletedAt) || expiresAt <= now,
           },
-        ];
+        ] as const;
       },
     ),
-  );
+  ]);
 }
 
 function applyAttachmentRetention<T extends { fileId?: string }>(
@@ -611,11 +651,7 @@ async function getLatestActiveCredentialIdForUser(
   return rows[0]?.id as string | undefined;
 }
 
-/**
- * Mirrors runtime credential selection: the account's own active credential
- * wins, and only legacy customer accounts without one inherit their current
- * delivery owner's credential.
- */
+/** Mirrors runtime credential selection: only the account's own Key applies. */
 export async function getActiveCredentialId(executor: any, userId: number) {
   const accountRows = await executor
     .select({ role: users.role })
@@ -624,23 +660,7 @@ export async function getActiveCredentialId(executor: any, userId: number) {
     .limit(1);
   if (!accountRows[0]) return undefined;
 
-  const directCredentialId = await getLatestActiveCredentialIdForUser(
-    executor,
-    userId,
-  );
-  if (directCredentialId || accountRows[0].role === "admin") {
-    return directCredentialId;
-  }
-
-  const ownerRows = await executor
-    .select({ deliveryAdminId: userUsageOwners.deliveryAdminId })
-    .from(userUsageOwners)
-    .where(eq(userUsageOwners.userId, userId))
-    .limit(1);
-  const ownerId = ownerRows[0]?.deliveryAdminId;
-  return ownerId
-    ? getLatestActiveCredentialIdForUser(executor, ownerId)
-    : undefined;
+  return getLatestActiveCredentialIdForUser(executor, userId);
 }
 
 async function assertResourceOwnership(
@@ -1296,9 +1316,20 @@ export async function reconstructKnowledgeBasePresentationInlineImages(
     input.build.logoFilename &&
     input.build.logoMimeType
   ) {
+    const logo = knowledgeBasePublicResource({
+      buildId: input.build.id,
+      kind: "logo",
+      internalIdentity: knowledgeBaseOfficialLogoInternalIdentity({
+        generation: input.build.generation,
+        sha256: input.build.logoSha256,
+      }),
+      contentSha256: input.build.logoSha256,
+      mimeType: input.build.logoMimeType,
+      sizeBytes: input.build.logoBytes,
+    });
     images.push({
-      src: `/api/knowledge-base/artifacts/${encodeURIComponent(input.build.id)}/logo`,
-      alt: input.build.logoFilename,
+      src: logo.sameOriginUrl,
+      alt: logo.caption,
     });
   }
 
@@ -1312,7 +1343,9 @@ export async function reconstructKnowledgeBasePresentationInlineImages(
     images.push(
       ...resources.map((resource) => ({
         src: resource.sameOriginUrl,
-        alt: resource.filename,
+        // Legacy cached resources may not have caption yet. Do not promote
+        // their storage filename back into newly persisted assistant alt text.
+        alt: resource.caption || "知识库配图",
       })),
     );
   }

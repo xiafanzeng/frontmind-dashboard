@@ -38,6 +38,7 @@ import {
   usageSnapshotUsageValues,
 } from "./api-usage-snapshot-service";
 import { AuthServiceError } from "./auth-service";
+import { ManusUsageSyncError } from "./manus-usage-service";
 
 describe("managed API usage refresh targeting", () => {
   it("persists the concrete credential failure code instead of the Error class name", () => {
@@ -45,7 +46,18 @@ describe("managed API usage refresh targeting", () => {
       apiUsageSyncErrorCode(
         new AuthServiceError("INVALID_CREDENTIAL", "revoked"),
       ),
-    ).toBe("INVALID_CREDENTIAL");
+    ).toBe("CREDENTIAL_REJECTED");
+    expect(
+      apiUsageSyncErrorCode(
+        new ManusUsageSyncError("PAGE_DRIFT", "safe message"),
+      ),
+    ).toBe("PAGE_DRIFT");
+    const timeout = new Error("timeout");
+    timeout.name = "TimeoutError";
+    expect(apiUsageSyncErrorCode(timeout)).toBe("TIMEOUT");
+    expect(apiUsageSyncErrorCode(new Error("unknown"))).toBe(
+      "UPSTREAM_UNAVAILABLE",
+    );
   });
   it("keeps customers owned by a system administrator in the snapshot scan", () => {
     expect(
@@ -208,6 +220,15 @@ describe("API usage snapshot completion state", () => {
     ).toEqual({
       status: "error",
       errorCode: "PARTIAL_USAGE_SCAN",
+    });
+    expect(
+      apiUsageSnapshotCompletionState({
+        totalComplete: false,
+        issueCode: "PAGINATION_INVALID",
+      }),
+    ).toEqual({
+      status: "error",
+      errorCode: "PAGINATION_INVALID",
     });
   });
 });
@@ -488,7 +509,7 @@ describe("resolveEffectiveUsageCredentials", () => {
     expect(result.credentialVersionByUser.get(42)).toBe(5);
   });
 
-  it("keeps the assigned manager's Key as a legacy fallback", () => {
+  it("does not use the assigned manager's Key as a customer fallback", () => {
     const result = resolveEffectiveUsageCredentials({
       userIds: [7, 42],
       credentialRows: [
@@ -502,12 +523,12 @@ describe("resolveEffectiveUsageCredentials", () => {
       ownerRows: [{ userId: 42, deliveryAdminId: 7 }],
     });
 
-    expect(result.byUser.get(42)).toBe("fp_manager");
-    expect(result.credentialOwnerByUser.get(42)).toBe(7);
-    expect(result.credentialIdByUser.get(42)).toBe("cred-manager");
+    expect(result.byUser.has(42)).toBe(false);
+    expect(result.credentialOwnerByUser.has(42)).toBe(false);
+    expect(result.credentialIdByUser.has(42)).toBe(false);
   });
 
-  it("leaves an account unconfigured when neither direct nor fallback Key exists", () => {
+  it("leaves an account unconfigured when it has no direct Key", () => {
     const result = resolveEffectiveUsageCredentials({
       userIds: [42],
       credentialRows: [],
@@ -639,8 +660,8 @@ describe("rolling usage snapshot identity", () => {
       usageSnapshotUsageValues({
         status: "error",
         credentialFingerprint: "current-C",
-        used: 20,
-        accountUsed: 20,
+        used: 99,
+        accountUsed: 88,
         existing: {
           credentialFingerprint: "current-C",
           used: 20,
@@ -758,10 +779,6 @@ describe("unified managed API Key target CAS", () => {
       "delivery_admin",
       { id: 3, role: "admin", adminAccessLevel: "delivery_admin" },
     ],
-    [
-      "system_admin",
-      { id: 4, role: "admin", adminAccessLevel: "system_admin" },
-    ],
   ] as const)("accepts a matching %s target", (kind, target) => {
     expect(() =>
       assertManagedApiKeyTarget({
@@ -792,11 +809,11 @@ describe("unified managed API Key target CAS", () => {
     ).toThrow(/类型不匹配/);
     expect(() =>
       assertManagedApiKeyTarget({
-        kind: "system_admin",
+        kind: "system_admin" as any,
         target: {
           id: 3,
           role: "admin",
-          adminAccessLevel: "delivery_admin",
+          adminAccessLevel: "system_admin",
         },
         actualVersion: 4,
         expectedVersion: 4,
@@ -845,7 +862,7 @@ describe("bulk managed API Key scopes", () => {
     { userId: 5, deliveryAdminId: 2 },
   ];
 
-  it("resolves every active supported account while excluding disabled and legacy admin rows", () => {
+  it("resolves active configurable accounts while excluding system administrators", () => {
     expect(
       resolveBulkManagedApiKeyTargets({
         scope: { kind: "all" },
@@ -855,7 +872,6 @@ describe("bulk managed API Key scopes", () => {
     ).toEqual([
       { userId: 1, kind: "customer" },
       { userId: 2, kind: "delivery_admin" },
-      { userId: 3, kind: "system_admin" },
       { userId: 4, kind: "engineer" },
       { userId: 7, kind: "engineer" },
     ]);
@@ -1005,6 +1021,28 @@ describe("bulk managed API Key scopes", () => {
     ).toEqual(targets);
   });
 
+  it("does not bind an internal account Key to a customer service model", () => {
+    const targets = [{ userId: 4, kind: "engineer" as const }];
+    expect(
+      bulkManagedApiKeyActionTargets({
+        resolvedTargets: targets,
+        latestCredentials: new Map([
+          [
+            4,
+            {
+              status: "active",
+              fingerprint: "fp_same",
+              agentProfile: "frontmind-pro",
+            },
+          ],
+        ]),
+        applyMode: "replace_all",
+        nextFingerprint: "fp_same",
+        nextAgentProfile: "frontmind-base",
+      }),
+    ).toEqual([]);
+  });
+
   it("atomically replaces all 15 revoked-Key targets, preserves old snapshots, and queues one refresh", async () => {
     const accounts = Array.from({ length: 15 }, (_, index) => ({
       id: index + 1,
@@ -1134,8 +1172,8 @@ describe("bulk managed API Key scopes", () => {
       targetCount: 15,
       updatedCount: 15,
       unchangedCount: 0,
-      agentProfile: "frontmind-pro",
-      upstreamModel: "manus-1.6-max",
+      customerAgentProfile: "frontmind-pro",
+      customerUpstreamModel: "manus-1.6-max",
     });
     expect(auditEvents.at(-1)?.metadata).not.toHaveProperty(
       "historyIncompleteCount",

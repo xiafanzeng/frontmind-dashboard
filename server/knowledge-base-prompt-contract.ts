@@ -8,7 +8,14 @@ import {
   KNOWLEDGE_BASE_PROGRESS_KIND,
   KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
 } from "./knowledge-base-progress";
+import type { KnowledgeBaseInitialBundleExpectation } from "./knowledge-base-materialized-contract";
 import { KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME } from "./knowledge-base-skill-runtime";
+import { KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_SENTENCE } from "./knowledge-base-materialized-completion-contract";
+import {
+  canonicalizeKnowledgeBaseCompanyName,
+  canonicalizeKnowledgeBaseWebsite,
+  canonicalizeKnowledgeBaseWebsiteLines,
+} from "./knowledge-base-company-identity";
 
 export type KnowledgeBaseEnterpriseIdentityErrorCode =
   | "ENTERPRISE_NOT_CONFIGURED"
@@ -25,7 +32,7 @@ export class KnowledgeBaseEnterpriseIdentityError extends Error {
 }
 
 function normalizedEnterpriseName(value: string) {
-  return value.normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
+  return canonicalizeKnowledgeBaseCompanyName(value).toLowerCase();
 }
 
 /** Resolve the immutable enterprise identity already assigned to the account. */
@@ -34,8 +41,10 @@ export function resolveKnowledgeBaseEnterpriseIdentity(input: {
   brandName: string;
   requestedCompanyName?: string;
 }) {
-  const companyName = input.brandName.normalize("NFKC").trim();
-  if (!companyName) {
+  let companyName: string;
+  try {
+    companyName = canonicalizeKnowledgeBaseCompanyName(input.brandName);
+  } catch {
     throw new KnowledgeBaseEnterpriseIdentityError(
       "ENTERPRISE_NOT_CONFIGURED",
       "当前账号尚未由管理员配置企业名称，无法启动知识库构建",
@@ -246,16 +255,18 @@ export async function buildKnowledgeBasePrompt({
   conversationId,
   companyName,
   companyWebsite,
+  researchWebsites,
   operatorNotes,
   attachments,
   prefillKnowledgeSnapshot,
   protocolOperation,
-  materializedCoordinates,
+  initialBundleExpectation,
   treePolicyVersion,
 }: {
   conversationId?: string;
   companyName: string;
   companyWebsite: string;
+  researchWebsites?: readonly string[];
   operatorNotes: string;
   attachments: Array<{ file_id: string; filename: string }>;
   prefillKnowledgeSnapshot?: KnowledgePrefillSnapshot | null;
@@ -264,36 +275,87 @@ export async function buildKnowledgeBasePrompt({
     operationId: string;
     turnId: string;
   };
-  materializedCoordinates?: {
-    buildId: string;
-    generation: number;
-    contentVersion: 1;
-  };
+  initialBundleExpectation?: KnowledgeBaseInitialBundleExpectation;
   treePolicyVersion?: number;
 }) {
   const isV5 = protocolOperation?.skillVersion === "5";
   if (isV5) {
-    if (!materializedCoordinates) {
+    if (!initialBundleExpectation) {
       throw new KnowledgeBaseEnterpriseIdentityError(
         "ENTERPRISE_IDENTITY_MISMATCH",
-        "知识库物化任务缺少构建坐标",
+        "知识库物化任务缺少冻结合同坐标",
       );
     }
+    const expectation = initialBundleExpectation;
+    const normalizedCompanyName =
+      canonicalizeKnowledgeBaseCompanyName(companyName);
+    const normalizedCompanyWebsite =
+      canonicalizeKnowledgeBaseWebsite(companyWebsite);
+    const expectedCompanyName = canonicalizeKnowledgeBaseCompanyName(
+      expectation.companyName,
+    );
+    const expectedCompanyWebsite = canonicalizeKnowledgeBaseWebsite(
+      expectation.companyWebsite,
+    );
+    const normalizedResearchWebsites = canonicalizeKnowledgeBaseWebsiteLines(
+      researchWebsites?.length
+        ? researchWebsites.join("\n")
+        : expectedCompanyWebsite || "",
+    ).researchWebsites;
+    if (
+      expectation.operationId !== protocolOperation.operationId ||
+      !expectation.operationId ||
+      !expectation.buildId ||
+      !Number.isSafeInteger(expectation.generation) ||
+      expectation.generation < 1 ||
+      !Number.isSafeInteger(expectation.expectedUploadsRead) ||
+      expectation.expectedUploadsRead < 0 ||
+      expectation.expectedUploadsRead !== attachments.length ||
+      expectation.contentVersion !== 1 ||
+      !/^[a-f0-9]{64}$/u.test(expectation.skillContentHash) ||
+      expectation.treePolicyVersion !== 2 ||
+      expectation.companyName !== expectedCompanyName ||
+      expectedCompanyName !== normalizedCompanyName ||
+      expectation.companyWebsite !== expectedCompanyWebsite ||
+      expectedCompanyWebsite !== normalizedCompanyWebsite ||
+      (expectedCompanyWebsite !== null &&
+        normalizedResearchWebsites[0] !== expectedCompanyWebsite) ||
+      (expectedCompanyWebsite === null && normalizedResearchWebsites.length) ||
+      treePolicyVersion !== expectation.treePolicyVersion
+    ) {
+      throw new KnowledgeBaseEnterpriseIdentityError(
+        "ENTERPRISE_IDENTITY_MISMATCH",
+        "知识库物化任务的冻结合同坐标不一致",
+      );
+    }
+    const expectedCompanyIdentity = Buffer.from(
+      JSON.stringify({
+        name: expectedCompanyName,
+        website: expectedCompanyWebsite,
+      }),
+      "utf8",
+    ).toString("base64url");
+    const archiveFilename = `frontmind-kb-bundle-${expectation.operationId}.zip`;
     return [
       "用户已授权 FrontMind Dashboard 创建全量物化企业知识库。",
       `完整读取 ${KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME} 内的 SKILL.md、references/materialized-working-set.md 和校验器。`,
       "执行且只执行 operation=materialize_initial_bundle。一次生成全部 30–115 个真实叶子、全部正文、证据账本和资产；不得只生成首节点。",
       "最终只返回一个助手 ZIP 附件；不得返回 Markdown 正文、进度信封、Structured Output、第二个文件或等待用户确认。",
-      `operationId=${protocolOperation.operationId}`,
-      `buildId=${materializedCoordinates.buildId}`,
-      `generation=${materializedCoordinates.generation}`,
-      `contentVersion=${materializedCoordinates.contentVersion}`,
+      `附带唯一且已验证的 ZIP 后，最终回复正文只能逐字输出“${KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_SENTENCE}”；发送该附件与固定短句后必须立即结束当前任务，不得再调用工具、更新计划、补充正文、询问确认、等待或发送第二个附件。Dashboard 只消费 ZIP，不消费该短句。`,
+      `operationId=${expectation.operationId}`,
+      `buildId=${expectation.buildId}`,
+      `generation=${expectation.generation}`,
+      `contentVersion=${expectation.contentVersion}`,
       `skillName=socratic-kb-builder；skillVersion=5`,
-      `company.name=${companyName}`,
-      `company.website=${companyWebsite || "null"}`,
-      `treePolicyVersion=${treePolicyVersion ?? 2}`,
-      `ZIP 文件名必须为 frontmind-kb-bundle-${protocolOperation.operationId}.zip，根目录必须含 BUNDLE.json。`,
-      `运行 python3 scripts/validate_working_set.py frontmind-kb-bundle-${protocolOperation.operationId}.zip；只有输出 VALID frontmind.kb-working-set.v1 后才能把同一 ZIP 作为唯一附件返回。`,
+      `skillContentHash=${expectation.skillContentHash}`,
+      "BUNDLE.json.skill.contentHash 必须逐字复制上述 skillContentHash。它是 FrontMind 冻结的 Skill 逻辑内容哈希，不是 Skill ZIP 的物理 SHA-256；禁止重新计算、替换或推断。",
+      `company.name=${expectation.companyName}`,
+      `company.website=${expectation.companyWebsite ?? "null"}`,
+      `researchWebsites=${JSON.stringify(normalizedResearchWebsites)}`,
+      `expectedUploadsRead=${expectation.expectedUploadsRead}`,
+      `treePolicyVersion=${expectation.treePolicyVersion}`,
+      `ZIP 文件名必须为 ${archiveFilename}，根目录必须含 BUNDLE.json。`,
+      `运行 python3 scripts/validate_working_set.py --expected-operation-id ${expectation.operationId} --expected-build-id ${expectation.buildId} --expected-generation ${expectation.generation} --expected-content-version ${expectation.contentVersion} --expected-skill-content-hash ${expectation.skillContentHash} --expected-tree-policy-version ${expectation.treePolicyVersion} --expected-company-base64url ${expectedCompanyIdentity} --expected-uploads-read ${expectation.expectedUploadsRead} ${archiveFilename}；只有输出 VALID frontmind.kb-working-set.v1 后才能把同一 ZIP 作为唯一附件返回。`,
       "只有 customerAttachments 中明确列出的文件属于客户事实资料；应用管理的 Skill、instructions 与 prefill 只用于执行合同。",
       "完整读取全部客户资料，并使用普通浏览/搜索补足证据；不得输出过程回执。",
       `customerAttachments=${JSON.stringify(attachments.map((item) => item.filename))}`,

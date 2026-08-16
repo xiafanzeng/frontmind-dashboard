@@ -87,6 +87,12 @@ export function dispatchKnowledgeBaseProgressUpdated(
 
 export const KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE =
   "KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED";
+export const KNOWLEDGE_BASE_RESET_REQUEST_EVENT =
+  "frontmind:request-knowledge-reset";
+
+export function requestKnowledgeBaseReset() {
+  window.dispatchEvent(new CustomEvent(KNOWLEDGE_BASE_RESET_REQUEST_EVENT));
+}
 
 export interface KnowledgeBaseLogoProvenanceRepairManifestItem {
   filename: string;

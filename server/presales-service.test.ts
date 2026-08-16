@@ -32,6 +32,7 @@ import {
   isPresalesDuplicateEntryError,
   markPresalesFileContentDeleted,
   projectWebsiteUsageOwnership,
+  projectPresalesTaskBusinessOwners,
   recordPresalesUpstreamResource,
   readPresalesProjectTaskPurgeSnapshot,
   releasePresalesTaskReservation,
@@ -100,6 +101,25 @@ describe("presales credential encryption", () => {
 });
 
 describe("presales rolling usage aggregation", () => {
+  it("projects owner names for v2 and monitor tasks without guessing history", () => {
+    const projected = projectPresalesTaskBusinessOwners({
+      taskIds: ["v2-task", "monitor-task", "historical-task"],
+      agentTaskRows: [{ upstreamTaskId: "v2-task", projectId: "project-v2" }],
+      monitorRows: [
+        { upstreamTaskId: "monitor-task", projectId: "project-monitor" },
+      ],
+      attributionRows: [
+        { projectId: "project-v2", businessOwnerName: "应祥" },
+        { projectId: "project-monitor", businessOwnerName: "Alice" },
+      ],
+    });
+    expect(Object.fromEntries(projected)).toEqual({
+      "v2-task": "应祥",
+      "monitor-task": "Alice",
+      "historical-task": null,
+    });
+  });
+
   it("includes v2 agent tasks in Website ownership and unsettled scans", () => {
     const createdAt = new Date("2026-08-02T08:00:00.000Z");
     const projected = projectWebsiteUsageOwnership({
@@ -165,6 +185,9 @@ describe("presales rolling usage aggregation", () => {
     expect(currentVersion).toMatchObject({
       keyTotalUsed: 40,
       websiteUsed: 40,
+      recentWebsiteTasks: [
+        expect.objectContaining({ businessOwnerName: null }),
+      ],
     });
     expect(retiredVersion).toMatchObject({
       keyTotalUsed: 0,

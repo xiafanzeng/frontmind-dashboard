@@ -29,6 +29,7 @@ import {
 } from "./knowledge-snapshot-archive-store";
 import { readPresalesV2Artifact } from "./presales-v2-store";
 import { readStoredPresalesFile } from "./presales-file-store";
+import { canonicalizeWebsiteKnowledgeImportArchive } from "./website-knowledge-import-archive-adapter";
 import {
   lockActiveWebsiteProjectLifecycle,
   WebsiteProjectInactiveError,
@@ -705,19 +706,22 @@ export async function importWebsiteKnowledgeArtifact(input: {
       buffer: finalArtifact.buffer,
       filename: finalArtifact.filename,
     };
-    const archiveHash = createHash("sha256")
+    const rawArchiveHash = createHash("sha256")
       .update(downloaded.buffer)
       .digest("hex");
-    if (archiveHash !== knowledgeImportArtifactSha256(value).toLowerCase()) {
+    if (rawArchiveHash !== knowledgeImportArtifactSha256(value).toLowerCase()) {
       throw new KnowledgeImportError(
         "ARTIFACT_HASH_MISMATCH",
         "知识库 ZIP 哈希与官网声明不一致",
         409,
       );
     }
+    const canonicalArchive = await canonicalizeWebsiteKnowledgeImportArchive(
+      downloaded.buffer,
+    );
     const snapshotId = randomUUID();
     const parsed = await readKnowledgeArchive(
-      downloaded.buffer,
+      canonicalArchive.buffer,
       downloaded.filename,
       snapshotId,
       {
@@ -757,8 +761,8 @@ export async function importWebsiteKnowledgeArtifact(input: {
     await persistKnowledgeSnapshotArchive({
       userId: provision.userId,
       snapshotId,
-      buffer: downloaded.buffer,
-      expectedSha256: archiveHash,
+      buffer: canonicalArchive.buffer,
+      expectedSha256: canonicalArchive.sha256,
     });
     storedArchive = { userId: provision.userId, snapshotId };
     snapshotCommitAttempted = true;
@@ -769,10 +773,10 @@ export async function importWebsiteKnowledgeArtifact(input: {
       sourceFileName: downloaded.filename,
       sourceTaskId: taskId,
       sourceArtifactHash: knowledgeImportDescriptorHash(value).toLowerCase(),
-      archiveHash,
+      archiveHash: canonicalArchive.sha256,
       documents: parsed.documents,
       assets: parsed.assets,
-      totalBytes: downloaded.buffer.length,
+      totalBytes: canonicalArchive.buffer.length,
       importReceiptClaim: {
         receiptId: reservation.receiptId,
         claimRevision: reservation.claimRevision,

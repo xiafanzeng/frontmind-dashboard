@@ -26,6 +26,10 @@ import type {
   KnowledgeBaseOperationType,
 } from "../shared/knowledge-base-progress";
 import {
+  isKnowledgeBaseMaterializedResultFailureCode,
+  KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+} from "../shared/knowledge-base-progress";
+import {
   extractKnowledgeBaseProtocolObjects,
   stripKnowledgeBaseProtocolPayloads,
   stripKnowledgeBaseReferenceAppendix,
@@ -51,7 +55,16 @@ import {
   projectKnowledgeBaseWorkingSetLeafResources,
   readValidatedActiveKnowledgeBaseWorkingSet,
 } from "./knowledge-base-materialized-assets";
+import {
+  isMaterializedBuildPublishable,
+  materializedBuildResultQuality,
+} from "./knowledge-base-materialized-quality";
+import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
 import { knowledgeBasePackageWriterTaskId } from "./knowledge-base-publication-binding";
+import {
+  knowledgeBaseOfficialLogoInternalIdentity,
+  knowledgeBasePublicResource,
+} from "./knowledge-base-public-resource";
 import { normalizeKnowledgeBaseCustomerMarkdownImages } from "./knowledge-base-markdown-normalization";
 import {
   createKnowledgeBaseAuthoritativeFinalOutput,
@@ -93,8 +106,11 @@ import {
   type KnowledgeBasePresentationEnvelope,
   type KnowledgeBaseProgressState,
 } from "./knowledge-base-progress";
-import { knowledgeBaseNewBuildPolicyBinding } from "./knowledge-base-tree-policy-rollout";
-import { knowledgeBaseTurnDispatchAuthority } from "./knowledge-base-turn-service";
+import {
+  knowledgeBaseMaterializedCompletionContractVersion,
+  knowledgeBaseMaterializedRecoveryContractVersion,
+  knowledgeBaseTurnDispatchAuthority,
+} from "./knowledge-base-turn-service";
 import type {
   KnowledgeBaseInitialLogoDisposition,
   KnowledgeBaseRejectedInitialLogoDisposition,
@@ -1572,15 +1588,65 @@ export function knowledgeBasePackageProjectionCompatibility(
   };
 }
 
+export function knowledgeBaseBuildRequiresApprovedReset(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "executionMode"
+    | "skillVersion"
+    | "skillContentHash"
+    | "providerProtocol"
+    | "contentVersion"
+    | "handoffProvenance"
+  >,
+) {
+  return (
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    build.skillContentHash !==
+      KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH ||
+    build.providerProtocol !== "manus_v2" ||
+    build.contentVersion === null ||
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !== 2
+  );
+}
+
+export function knowledgeBaseLogoProgressPolicy(input: {
+  executionMode: string | null;
+  providerProtocol: string | null;
+  skillVersion: string;
+  status: string;
+  confirmedCount: number;
+  directPrefilledCount: number;
+  currentOrdinal: number | null;
+  logoSha256: string | null;
+}) {
+  const firstLeafCanChange =
+    input.status === "confirming" &&
+    input.confirmedCount === 0 &&
+    input.directPrefilledCount === 0 &&
+    input.currentOrdinal === 0;
+  const materializedLogoCanChange =
+    input.executionMode === "materialized_bundle_v1" && firstLeafCanChange;
+  const legacyRequiredLogoCanChange =
+    input.providerProtocol !== "manus_v2" &&
+    input.skillVersion === "4" &&
+    firstLeafCanChange;
+  return {
+    logoRequired: legacyRequiredLogoCanChange && !input.logoSha256,
+    logoAvailable:
+      (materializedLogoCanChange || legacyRequiredLogoCanChange) &&
+      Boolean(input.logoSha256),
+  };
+}
+
 function buildDto(
   build: KnowledgeBaseBuild,
   rows: KnowledgeBaseBuildNode[],
 ): KnowledgeBaseProgressDto {
-  const resetRequired =
-    build.executionMode !== "materialized_bundle_v1" ||
-    build.skillVersion !== "5" ||
-    build.providerProtocol !== "manus_v2" ||
-    build.contentVersion === null;
+  const resetRequired = knowledgeBaseBuildRequiresApprovedReset(build);
+  const resultQuality = materializedBuildResultQuality(build);
+  const displayOnlyPartial = resultQuality?.completeness === "partial";
   const currentBuildRow = rows.find(
     (row) => row.leafId === build.currentLeafId,
   );
@@ -1591,6 +1657,9 @@ function buildDto(
     branchTitle: row.branchTitle,
     ordinal: row.ordinal,
     status: row.status,
+    ...(displayOnlyPartial && row.contentMarkdown
+      ? { contentMarkdown: canonicalKnowledgeBaseMarkdown(row.contentMarkdown) }
+      : {}),
   }));
   const branchMap = new Map<
     string,
@@ -1642,13 +1711,16 @@ function buildDto(
   const total = leaves.length;
   const depthPolicy = knowledgeBaseTreePolicy(build.treePolicyVersion);
   const researchSummary = buildResearchSummary(build, rows);
-  const logoCanChange =
-    (build.executionMode === "materialized_bundle_v1" ||
-      (build.providerProtocol !== "manus_v2" && build.skillVersion === "4")) &&
-    build.status === "confirming" &&
-    build.confirmedCount === 0 &&
-    build.directPrefilledCount === 0 &&
-    currentBuildRow?.ordinal === 0;
+  const logoPolicy = knowledgeBaseLogoProgressPolicy({
+    executionMode: build.executionMode,
+    providerProtocol: build.providerProtocol,
+    skillVersion: build.skillVersion,
+    status: build.status,
+    confirmedCount: build.confirmedCount,
+    directPrefilledCount: build.directPrefilledCount,
+    currentOrdinal: currentBuildRow?.ordinal ?? null,
+    logoSha256: build.logoSha256,
+  });
   const packageCompatibility =
     knowledgeBasePackageProjectionCompatibility(build);
   return {
@@ -1669,13 +1741,15 @@ function buildDto(
           ? "materialized_bundle_v1"
           : "legacy_conversational",
       currentLeafId: build.currentLeafId,
-      logoRequired: logoCanChange && !build.logoSha256,
-      logoAvailable: logoCanChange && Boolean(build.logoSha256),
+      logoRequired: logoPolicy.logoRequired,
+      logoAvailable: logoPolicy.logoAvailable,
       protocolError: resetRequired
         ? "RESET_REQUIRED：旧知识库构建不再续跑；请批准重置并重新上传资料。"
-        : build.protocolError
-          ? sanitizeFrontMindPublicText(build.protocolError)
-          : null,
+        : isKnowledgeBaseMaterializedResultFailureCode(build.protocolErrorCode)
+          ? KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
+          : build.protocolError
+            ? sanitizeFrontMindPublicText(build.protocolError)
+            : null,
       awaitingResponseSince: build.awaitingResponseSince?.getTime() ?? null,
       updatedAt: build.updatedAt.getTime(),
     },
@@ -1690,6 +1764,7 @@ function buildDto(
       overallPercent: total === 0 ? 0 : Math.round((handled / total) * 100),
     },
     branches: [...branchMap.values()],
+    ...(resultQuality ? { resultQuality } : {}),
     packageAllowed: packageCompatibility.packageAllowed,
     packageState: packageCompatibility.packageState,
   };
@@ -1775,11 +1850,7 @@ export async function createKnowledgeBaseBuild(input: {
       // `/start` is an at-least-once client operation. Replaying it must never
       // delete accepted nodes or silently create a new generation. Explicit
       // reset/restart is owned by the audited reset workflow.
-      if (
-        existing.executionMode !== "materialized_bundle_v1" ||
-        existing.skillVersion !== "5" ||
-        existing.providerProtocol !== "manus_v2"
-      ) {
+      if (knowledgeBaseBuildRequiresApprovedReset(existing)) {
         throw new KnowledgeBaseBuildError(
           "RESET_REQUIRED",
           "旧知识库构建不再续跑；请批准重置并重新上传资料",
@@ -1787,36 +1858,15 @@ export async function createKnowledgeBaseBuild(input: {
       }
       return existing;
     }
-    const policyBinding = knowledgeBaseNewBuildPolicyBinding();
-    if (
-      (input.skillVersion !== undefined &&
-        input.skillVersion !== policyBinding.skillVersion) ||
-      (input.skillContentHash !== undefined &&
-        input.skillContentHash !== policyBinding.skillContentHash)
-    ) {
-      throw new KnowledgeBaseBuildError(
-        "PROGRESS_PROTOCOL_INVALID",
-        "知识库深度策略与固定 Skill 归档不匹配",
-      );
-    }
-    const id = randomUUID();
-    await tx.insert(knowledgeBaseBuilds).values({
-      id,
-      userId: input.userId,
-      conversationId,
-      companyName,
-      companyWebsite: input.companyWebsite?.trim() || null,
-      skillName: input.skillName || "socratic-kb-builder",
-      skillVersion: policyBinding.skillVersion,
-      skillContentHash: policyBinding.skillContentHash,
-      treePolicyVersion: policyBinding.treePolicyVersion,
-      executionMode: "materialized_bundle_v1",
-      contentVersion: 0,
-      providerProtocol: "manus_v2",
-      status: "researching",
-      awaitingResponseSince: new Date(),
-    });
-    return (await loadBuild(tx, input.userId, conversationId))!;
+    // This legacy helper has no reset-revision or upload-batch authority and
+    // therefore cannot mint the immutable birth provenance required by the
+    // materialized runtime. New builds must enter through
+    // reserveKnowledgeBaseStartBuild, which commits reset proof, build, turn,
+    // and attachment intent atomically.
+    throw new KnowledgeBaseBuildError(
+      "RESET_REQUIRED",
+      "请通过“开始构建企业知识库”重新上传资料并创建新构建",
+    );
   });
   return buildDto(build, await loadNodes(db, build.id));
 }
@@ -2017,6 +2067,22 @@ export type KnowledgeBaseObservationProjection = Omit<
 > & {
   progress: KnowledgeBaseProgressDto;
 };
+
+export function knowledgeBaseDeferredUploadProjection(input: {
+  awaitingClientAttachments: boolean;
+  operationType: string | null | undefined;
+  expectedAttachmentCount: number;
+  stagedAttachmentCount: number;
+}) {
+  const browserBackedOperation =
+    input.operationType === "start" || input.operationType === "revise";
+  return {
+    processingPhase:
+      input.awaitingClientAttachments && browserBackedOperation
+        ? ("uploading" as const)
+        : null,
+  };
+}
 
 /**
  * A customer-approved node can intentionally outlive the provider generation
@@ -2492,6 +2558,45 @@ export function knowledgeBasePublicTerminalRecovery(
   return { action, recoveryToken };
 }
 
+/**
+ * Public projection for a stopped Manus task whose archive was rejected or
+ * could not be read within the bounded window. No provider coordinate,
+ * validation detail, hash, trace id or turn id crosses this boundary.
+ */
+export function knowledgeBaseMaterializedResultFailureNotice(
+  build: Pick<
+    KnowledgeBaseBuild,
+    | "activeTurnId"
+    | "canonicalTaskState"
+    | "generation"
+    | "protocolErrorCode"
+    | "stateEpoch"
+    | "status"
+    | "updatedAt"
+  >,
+): KnowledgeBaseNoticeDto | null {
+  if (
+    build.activeTurnId !== null ||
+    build.canonicalTaskState !== "attention_required" ||
+    build.status !== "protocol_error" ||
+    !isKnowledgeBaseMaterializedResultFailureCode(build.protocolErrorCode)
+  ) {
+    return null;
+  }
+  return {
+    key: `materialized-result-reset:${build.generation}:${build.stateEpoch}`,
+    code: build.protocolErrorCode,
+    severity: "error",
+    message: KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+    retryable: false,
+    failureClass: "requires_user_fix",
+    recoveryAction: "approve_reset",
+    canRegenerate: false,
+    turnId: null,
+    createdAt: build.updatedAt.getTime(),
+  };
+}
+
 function projectKnowledgeBaseObservationSnapshot(input: {
   build: KnowledgeBaseBuild;
   progress: KnowledgeBaseProgressDto;
@@ -2562,6 +2667,12 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       : 0;
   const requiresAttachmentReselection =
     activeTurnMetadata.awaitingClientAttachments === true;
+  const deferredUploadProjection = knowledgeBaseDeferredUploadProjection({
+    awaitingClientAttachments: requiresAttachmentReselection,
+    operationType: activeTurnRow?.operationType,
+    expectedAttachmentCount: expectedClientAttachments,
+    stagedAttachmentCount: stagedClientAttachments,
+  });
   const activeDispatchAuthority = activeTurnRow
     ? knowledgeBaseTurnDispatchAuthority(activeTurnRow)
     : {
@@ -2610,6 +2721,11 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       failureClass: activeDispatchAuthority.failureClass,
       recoveryAction: activeDispatchAuthority.recoveryAction,
       canRegenerate: activeDispatchAuthority.canRegenerate,
+      ...(Number.isSafeInteger(activeTurnMetadata.sourceResetRevision) &&
+      Number(activeTurnMetadata.sourceResetRevision) >= 0
+        ? { resetRevision: Number(activeTurnMetadata.sourceResetRevision) }
+        : {}),
+      awaitingClientAttachments: requiresAttachmentReselection,
       requiresAttachmentReselection,
       stagedAttachmentCount: stagedClientAttachments,
       expectedAttachmentCount:
@@ -2656,16 +2772,17 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     build.logoFilename &&
     build.logoMimeType
       ? [
-          {
-            kind: "logo" as const,
-            outputItemId: null,
-            fileId: null,
-            sameOriginUrl: `/api/knowledge-base/artifacts/${encodeURIComponent(build.id)}/logo`,
-            filename: build.logoFilename,
+          knowledgeBasePublicResource({
+            buildId: build.id,
+            kind: "logo",
+            internalIdentity: knowledgeBaseOfficialLogoInternalIdentity({
+              generation: build.generation,
+              sha256: build.logoSha256,
+            }),
+            contentSha256: build.logoSha256,
             mimeType: build.logoMimeType,
-            sha256: build.logoSha256,
             sizeBytes: build.logoBytes,
-          },
+          }),
         ]
       : [];
   const resources = [
@@ -2676,7 +2793,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     (resource, index, all) =>
       all.findIndex(
         (candidate) =>
-          candidate.sha256 === resource.sha256 &&
+          candidate.id === resource.id &&
           candidate.mimeType === resource.mimeType,
       ) === index,
   );
@@ -2869,6 +2986,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     knowledgeBasePackageProjectionCompatibility(build);
   const packageDto = packageCompatibility.package;
   const explicitRecovery = knowledgeBasePublicTerminalRecovery(build);
+  const materializedResultFailureNotice =
+    knowledgeBaseMaterializedResultFailureNotice(build);
 
   let notice: KnowledgeBaseNoticeDto | null = null;
   const activeTraceId =
@@ -2885,11 +3004,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     typeof activeTurnMetadata.expectedAttachmentCount === "number"
       ? activeTurnMetadata.expectedAttachmentCount
       : 0;
-  if (
-    build.executionMode !== "materialized_bundle_v1" ||
-    build.skillVersion !== "5" ||
-    build.providerProtocol !== "manus_v2"
-  ) {
+  if (knowledgeBaseBuildRequiresApprovedReset(build)) {
     notice = {
       key: `${build.id}:${build.generation}:reset-required`,
       code: "RESET_REQUIRED",
@@ -2903,6 +3018,8 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       turnId: null,
       createdAt: build.updatedAt.getTime(),
     };
+  } else if (materializedResultFailureNotice) {
+    notice = materializedResultFailureNotice;
   } else if (explicitRecovery) {
     const stopped = explicitRecovery.action === "stopped";
     notice = {
@@ -2961,22 +3078,6 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       attachmentCount: Number.isSafeInteger(activeAttachmentCount)
         ? activeAttachmentCount
         : 0,
-      turnId: activeTurnRow.id,
-      createdAt: activeTurnRow.updatedAt.getTime(),
-    };
-  } else if (requiresAttachmentReselection && activeTurnRow) {
-    notice = {
-      key: `${build.id}:${build.generation}:${activeTurnRow.id}:attachments-required`,
-      code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
-      severity: "warning",
-      message:
-        stagedClientAttachments > 0
-          ? `正在校验并暂存本轮附件（${stagedClientAttachments}/${expectedClientAttachments}）；完成后会直接提交本轮。`
-          : "附件已上传，正在完成完整性校验；校验通过后会直接提交本轮。",
-      retryable: false,
-      failureClass: "requires_user_fix",
-      recoveryAction: "fix_attachments",
-      canRegenerate: false,
       turnId: activeTurnRow.id,
       createdAt: activeTurnRow.updatedAt.getTime(),
     };
@@ -3131,9 +3232,11 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       packageCompatibility.packageState !== "attention_required"
         ? "package_preparing"
         : activeTurnRow
-          ? build.canonicalTaskState === "creating"
-            ? "migrating_task"
-            : "waiting_provider"
+          ? deferredUploadProjection.processingPhase
+            ? deferredUploadProjection.processingPhase
+            : build.canonicalTaskState === "creating"
+              ? "migrating_task"
+              : "waiting_provider"
           : null,
     contentState: packageCompatibility.contentCompleted
       ? "completed"
@@ -3142,7 +3245,9 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     publicationState: build.status === "published" ? "published" : "draft",
     contentCompletedAt:
       packageCompatibility.contentCompletedAt?.getTime() ?? null,
-    canonicalTaskUrl: build.canonicalTaskUrl,
+    canonicalTaskUrl: materializedResultFailureNotice
+      ? null
+      : build.canonicalTaskUrl,
     localRestrictions:
       packageCompatibility.packageState === "attention_required"
         ? ["package_attention_required"]
@@ -3155,9 +3260,11 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     // id would make the coordinator reconcile old output during the short
     // accepted-but-unbound window. Only the active turn can be authoritative
     // until it releases the build.
-    authoritativeTaskId: activeTurnRow
-      ? activeTurnRow.upstreamTaskId
-      : build.canonicalTaskId || build.upstreamTaskId,
+    authoritativeTaskId: materializedResultFailureNotice
+      ? null
+      : activeTurnRow
+        ? activeTurnRow.upstreamTaskId
+        : build.canonicalTaskId || build.upstreamTaskId,
     activeTurn,
     completedTurn,
     approvedPresentation,
@@ -5189,6 +5296,17 @@ export async function assertKnowledgeBasePublishable(input: {
     throw new KnowledgeBaseBuildError(
       "PUBLISH_BLOCKED",
       "知识库尚未完成全部节点确认",
+    );
+  }
+  if (
+    build.executionMode === "materialized_bundle_v1" &&
+    !isMaterializedBuildPublishable(build, {
+      knownLeafIds: rows.map((row) => row.leafId),
+    })
+  ) {
+    throw new KnowledgeBaseBuildError(
+      "PUBLISH_BLOCKED",
+      "知识库内容或研究覆盖不完整；当前内容可以查看，但不能发布，请批准重置后重跑",
     );
   }
   try {

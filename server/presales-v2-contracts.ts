@@ -12,6 +12,7 @@ export const PRESALES_V2_CAPABILITIES = [
   "typed-results",
   "local-artifacts",
   "safe-events",
+  "project-business-owner",
 ] as const;
 
 export const PRESALES_V2_CONTRACT_NAMES = [

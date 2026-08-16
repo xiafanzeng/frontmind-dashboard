@@ -1,4 +1,4 @@
 interface:
   display_name: "企业知识库全量物化"
   short_description: "生成完整工作包或单节点修订补丁"
-  default_prompt: "Use $socratic-kb-builder to execute the application-declared materialize_initial_bundle or revise_leaf_bundle operation and return exactly one validated ZIP attachment."
+  default_prompt: "Use $socratic-kb-builder to execute the application-declared materialize_initial_bundle or revise_leaf_bundle operation, return exactly one validated ZIP attachment with the exact final text 已完成，知识库 ZIP 已附上。, and end the task immediately without any later tool call, plan update, prose, confirmation, wait, or second attachment."

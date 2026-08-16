@@ -27,6 +27,7 @@ import {
   purgePresalesFileCreateReservation,
   stagePresalesFileContent,
   sweepPresalesFileStorageRetention,
+  withStoredPresalesFileMutationLock,
 } from "./presales-file-store";
 
 const originalAssetDir = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
@@ -201,6 +202,41 @@ describe("durable presales file-create reservations", () => {
     expect(tombstone).not.toContain("uploads.example.test");
     expect(tombstone).not.toContain("classifier.skill.zip");
     expect(Buffer.byteLength(tombstone)).toBeLessThan(1_024);
+  });
+
+  it("serializes final-file mutation through the shared filesystem lock", async () => {
+    let releaseFirst!: () => void;
+    let markFirstEntered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => {
+      markFirstEntered = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const order: string[] = [];
+    const first = withStoredPresalesFileMutationLock(
+      "asset-shared",
+      async () => {
+        order.push("first-enter");
+        markFirstEntered();
+        await firstGate;
+        order.push("first-leave");
+      },
+    );
+    await firstEntered;
+
+    const second = withStoredPresalesFileMutationLock(
+      "asset-shared",
+      async () => {
+        order.push("second-enter");
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(order).toEqual(["first-enter"]);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first-enter", "first-leave", "second-enter"]);
   });
 
   it("reclaims only an expired lease with the same upstream key hash", async () => {
@@ -386,6 +422,24 @@ describe("presales file content retention manifest", () => {
       contentExpiresAt: input.contentExpiresAt,
     });
   }
+
+  it("reports monotonically received bytes while staging a stream", async () => {
+    const received: number[] = [];
+    const staged = await stagePresalesFileContent({
+      fileId: "progress-upload",
+      stream: Readable.from([
+        Buffer.alloc(2),
+        Buffer.alloc(3),
+        Buffer.alloc(5),
+      ]),
+      maxBytes: 1_024,
+      onProgress: (receivedBytes) => received.push(receivedBytes),
+    });
+
+    expect(received).toEqual([2, 5, 10]);
+    expect(staged.sizeBytes).toBe(10);
+    await staged.discard();
+  });
 
   it("incrementally stages exact bytes with caller-controlled backpressure", async () => {
     const stage = await createIncrementalPresalesFileStage({

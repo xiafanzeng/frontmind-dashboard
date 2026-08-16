@@ -52,3 +52,81 @@ export function logKnowledgeBaseOperationTelemetry(
     JSON.stringify(record),
   );
 }
+
+export type KnowledgeBaseDispatchPhase =
+  | "validate_ledger"
+  | "skill"
+  | "prefill"
+  | "instructions"
+  | "freeze"
+  | "prepare"
+  | "map"
+  | "task_create";
+
+const DISPATCH_CREATE_STATES = new Set([
+  "not_sent",
+  "sending",
+  "acknowledged",
+  "rejected",
+  "unknown",
+]);
+
+function safeCount(value: unknown) {
+  return Number.isSafeInteger(value) && Number(value) >= 0
+    ? Number(value)
+    : undefined;
+}
+
+/**
+ * Strict diagnostic envelope for the pre-provider knowledge-base pipeline.
+ * Its input surface deliberately has no filename, content, URL, task id or
+ * Provider id field, making accidental secret expansion a type-level error.
+ */
+export function knowledgeBaseDispatchPhaseTelemetryRecord(input: {
+  phase: KnowledgeBaseDispatchPhase;
+  traceId?: string | null;
+  errorCode?: string | null;
+  userCount?: number;
+  expectedCount?: number;
+  stagedCount?: number;
+  generatedReservationCount?: number;
+  mappingCount?: number;
+  createState?: string | null;
+}) {
+  const traceId = safeIdentifier(input.traceId);
+  const errorCode = safeIdentifier(input.errorCode);
+  const userCount = safeCount(input.userCount);
+  const expectedCount = safeCount(input.expectedCount);
+  const stagedCount = safeCount(input.stagedCount);
+  const generatedReservationCount = safeCount(input.generatedReservationCount);
+  const mappingCount = safeCount(input.mappingCount);
+  const createState = DISPATCH_CREATE_STATES.has(
+    String(input.createState || ""),
+  )
+    ? String(input.createState)
+    : undefined;
+  return {
+    event: "dispatch_phase" as const,
+    phase: input.phase,
+    ...(traceId ? { traceId } : {}),
+    ...(errorCode ? { errorCode } : {}),
+    ...(userCount !== undefined ? { userCount } : {}),
+    ...(expectedCount !== undefined ? { expected: expectedCount } : {}),
+    ...(stagedCount !== undefined ? { staged: stagedCount } : {}),
+    ...(generatedReservationCount !== undefined
+      ? { generatedReservation: generatedReservationCount }
+      : {}),
+    ...(mappingCount !== undefined ? { mapping: mappingCount } : {}),
+    ...(createState ? { createState } : {}),
+  };
+}
+
+export function logKnowledgeBaseDispatchPhaseTelemetry(
+  input: Parameters<typeof knowledgeBaseDispatchPhaseTelemetryRecord>[0],
+) {
+  const record = knowledgeBaseDispatchPhaseTelemetryRecord(input);
+  console.info(
+    `[KnowledgeBaseDispatch] ${record.phase}`,
+    JSON.stringify(record),
+  );
+}

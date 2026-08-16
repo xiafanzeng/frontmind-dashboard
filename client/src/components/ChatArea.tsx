@@ -52,6 +52,7 @@ import {
   stageKnowledgeBaseTurnAttachment,
   uploadKnowledgeBaseLocalAsset,
   type FileUploadRecordEvent,
+  type KnowledgeBaseAttachmentManifestItem,
   type ManagedUploadHandle,
   type OutputMessage,
   type ResponseLogicTaskContext,
@@ -83,18 +84,16 @@ import type { KnowledgeBaseInteractionDto } from "@shared/knowledge-base-progres
 import { trpc } from "@/lib/trpc";
 import {
   KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE,
+  requestKnowledgeBaseReset,
   executeKnowledgeBaseRecovery,
   knowledgeBaseObservationFromPayload,
   reconcileKnowledgeBaseObservation,
   recoverKnowledgeBaseCanonicalFromSnapshot,
-  recoverKnowledgeBaseStart,
   retryKnowledgeBaseTurn,
   type KnowledgeBaseObservationDto,
 } from "@/lib/knowledge-progress";
 import KnowledgeBaseLogoProvenanceRepair from "./KnowledgeBaseLogoProvenanceRepair";
 import KnowledgeBaseAttachmentRepair from "./KnowledgeBaseAttachmentRepair";
-import KnowledgeBaseManagedUploadRecovery from "./KnowledgeBaseManagedUploadRecovery";
-import KnowledgeBaseStartSourceRecovery from "./KnowledgeBaseStartSourceRecovery";
 import {
   assertChatAttachmentSizes,
   chatAttachmentSizeError,
@@ -103,7 +102,6 @@ import {
   sha256UploadFile,
 } from "@/lib/attachment-files";
 import { isAttachmentExpired } from "@/lib/attachment-expiry";
-import { knowledgeBaseObservationAcknowledgesClientRequest } from "@/lib/knowledge-base-coordinator";
 
 export const KNOWLEDGE_BASE_FOUNDATION_COPY =
   "企业知识库是品牌事实与产品信息的统一底稿，也是构建 AI 专用友好官网、生成内容与准确回答客户问题的基础。";
@@ -112,6 +110,21 @@ export function runningAssistantStatusText(syncKnowledgeBaseSnapshot: boolean) {
   return syncKnowledgeBaseSnapshot
     ? KNOWLEDGE_COLLECTION_STATUS_COPY
     : "FrontMind AI 正在处理...";
+}
+
+export function isKnowledgeBaseTaskVisiblyRunning(input: {
+  status: string | undefined;
+  syncKnowledgeBaseSnapshot: boolean;
+  interactionState?: string | null;
+  noticeSeverity?: string | null;
+}) {
+  const taskIsRunning =
+    input.status === "running" || input.status === "pending";
+  if (!taskIsRunning) return false;
+  if (!input.syncKnowledgeBaseSnapshot) return true;
+  return (
+    input.interactionState !== "failed" && input.noticeSeverity !== "error"
+  );
 }
 
 export function scrollChatViewportToBottom(
@@ -155,9 +168,9 @@ export function knowledgeBaseExplicitRecoveryRequest(
 }
 
 export function shouldRenderKnowledgeBaseNotice(
-  notice: Pick<KnowledgeBaseClientNotice, "code">,
+  _notice: Pick<KnowledgeBaseClientNotice, "code">,
 ) {
-  return notice.code !== KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE;
+  return true;
 }
 
 export function knowledgeBaseNoticeRecoveryMode(
@@ -173,6 +186,14 @@ export function knowledgeBaseNoticeRecoveryMode(
     return "logo_repair" as const;
   }
   if (
+    notice.code === KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE ||
+    notice.recoveryAction === "approve_reset" ||
+    notice.recoveryAction === "resume_start_from_retained_sources" ||
+    notice.recoveryAction === "reselect_start_sources"
+  ) {
+    return "reset" as const;
+  }
+  if (
     (notice.recoveryAction === "retry_request" ||
       notice.recoveryAction === "start_new_generation") &&
     typeof notice.recoveryToken === "string" &&
@@ -186,12 +207,6 @@ export function knowledgeBaseNoticeRecoveryMode(
     notice.recoveryAction === "top_up"
   ) {
     return "reconcile" as const;
-  }
-  if (
-    notice.recoveryAction === "resume_start_from_retained_sources" ||
-    notice.recoveryAction === "reselect_start_sources"
-  ) {
-    return "start_recovery" as const;
   }
   if (notice.recoveryAction === "create_new_canonical_from_snapshot") {
     return "canonical_recovery" as const;
@@ -223,12 +238,10 @@ export function knowledgeBaseNoticeRetryLabel(
           : notice.recoveryAction === "top_up"
             ? "补充额度后继续本轮"
             : "继续恢复本轮"
-      : knowledgeBaseNoticeRecoveryMode(notice) === "start_recovery"
-        ? notice.recoveryAction === "reselect_start_sources"
-          ? "重新上传资料"
-          : "使用原资料重新开始（将创建新任务）"
-        : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
-          ? "重新上传 Logo 原图"
+      : knowledgeBaseNoticeRecoveryMode(notice) === "logo_repair"
+        ? "重新上传 Logo 原图"
+        : knowledgeBaseNoticeRecoveryMode(notice) === "reset"
+          ? "申请重置知识库"
           : knowledgeBaseNoticeRecoveryMode(notice) === "canonical_recovery"
             ? "创建新任务继续"
             : knowledgeBaseNoticeRecoveryMode(notice) === "regenerate"
@@ -347,17 +360,6 @@ export async function recoverKnowledgeBaseNotice(
   if (knowledgeBaseNoticeRecoveryMode(input.notice) === "logo_repair") {
     throw new Error("请通过专用入口重新上传当前知识库使用的同一张 Logo 原图");
   }
-  if (knowledgeBaseNoticeRecoveryMode(input.notice) === "start_recovery") {
-    return recoverKnowledgeBaseStart({
-      conversationId: input.conversationId,
-      clientRequestId: input.clientRequestId,
-      expectedGeneration: input.expectedGeneration,
-      expectedStateEpoch: input.expectedStateEpoch,
-      mode: input.notice.recoveryAction as
-        | "resume_start_from_retained_sources"
-        | "reselect_start_sources",
-    });
-  }
   if (knowledgeBaseNoticeRecoveryMode(input.notice) === "canonical_recovery") {
     if (!input.expectedLeafId || !input.expectedPresentationKey) {
       throw new Error("当前展示坐标不完整，请刷新后重试");
@@ -451,6 +453,7 @@ type KnowledgeBaseStarterUploadReceipt = {
   fileId: string;
   filename: string;
   uploadedAt?: number;
+  dashboardReadyAt?: number;
   providerReadyAt?: number;
   expiresAt?: number;
   traceId?: string;
@@ -533,6 +536,36 @@ function uploadFileRecordId(event: FileUploadRecordEvent) {
   return event.fileId;
 }
 
+export async function buildKnowledgeBaseStarterAttachmentManifest(
+  files: readonly File[],
+  itemIds: readonly string[],
+  signal: AbortSignal,
+  hashFile: (file: File) => Promise<string> = sha256UploadFile,
+): Promise<KnowledgeBaseAttachmentManifestItem[]> {
+  if (files.length !== itemIds.length) {
+    throw new Error("知识库附件坐标不完整，请重新选择资料");
+  }
+  const manifest: KnowledgeBaseAttachmentManifestItem[] = [];
+  // Hash one browser File at a time. Promise.all would materialize every
+  // large arrayBuffer concurrently and can exhaust a tab before upload starts.
+  for (const [index, file] of files.entries()) {
+    if (signal.aborted) {
+      throw new DOMException("上传已停止", "AbortError");
+    }
+    manifest.push({
+      itemId: itemIds[index],
+      ordinal: index + 1,
+      total: files.length,
+      filename: normalizedKnowledgeBaseUploadFilename(file.name),
+      sizeBytes: file.size,
+      mimeType: normalizedKnowledgeBaseUploadMimeType(file),
+      lastModified: Math.max(0, Number(file.lastModified || 0)),
+      sha256: await hashFile(file),
+    });
+  }
+  return manifest;
+}
+
 type KnowledgeBaseStarterUploadImplementation = (
   file: File,
   onProgress?: (percent: number) => void,
@@ -547,6 +580,7 @@ type KnowledgeBaseStarterUploadImplementation = (
   filename: string;
   sizeBytes?: number;
   uploadedAt?: number;
+  dashboardReadyAt?: number;
   providerReadyAt?: number;
   expiresAt?: number;
   replayed?: boolean;
@@ -558,8 +592,7 @@ export async function uploadKnowledgeBaseStarterFiles(
   files: File[],
   lifecycle: KnowledgeBaseStarterLifecycle,
   responseStartedAt: number,
-  uploadImplementation: KnowledgeBaseStarterUploadImplementation =
-    uploadKnowledgeBaseLocalAsset,
+  uploadImplementation: KnowledgeBaseStarterUploadImplementation = uploadKnowledgeBaseLocalAsset,
 ) {
   const receipts = new Map(lifecycle.uploadedReceipts);
   const uploadedAttachments: Array<{
@@ -614,6 +647,11 @@ export async function uploadKnowledgeBaseStarterFiles(
           batchOrdinal: fileIndex + 1,
           batchTotal: files.length,
           itemId,
+          ...(lifecycle.attachmentManifest?.[fileIndex]?.sha256
+            ? {
+                contentSha256: lifecycle.attachmentManifest[fileIndex]!.sha256,
+              }
+            : {}),
           ...(lifecycle.reservation
             ? {
                 resumeScope: {
@@ -756,6 +794,7 @@ export async function uploadKnowledgeBaseStarterFiles(
           fileId: uploaded.fileId,
           filename: uploaded.filename,
           uploadedAt: uploaded.uploadedAt,
+          dashboardReadyAt: uploaded.dashboardReadyAt,
           providerReadyAt: uploaded.providerReadyAt,
           expiresAt: uploaded.expiresAt,
           traceId: safeKnowledgeBaseTraceId(uploaded.traceId),
@@ -837,6 +876,7 @@ export async function uploadKnowledgeBaseStarterFiles(
         ...lifecycle.reservation,
         attachmentManifest: lifecycle.attachmentManifest,
         index: fileIndex,
+        signal: lifecycle.signal,
         attachment: {
           file_id: receipt.fileId,
           filename: receipt.filename,
@@ -925,6 +965,7 @@ export async function fetchKnowledgeBaseStartRequest(
     timeoutMs?: number;
     fetchImplementation?: typeof fetch;
     endpoint?: string;
+    onRequestStarted?: () => void;
   },
 ) {
   if (options.signal.aborted) {
@@ -934,6 +975,11 @@ export async function fetchKnowledgeBaseStartRequest(
   const controller = new AbortController();
   const abortFromLifecycle = () => controller.abort();
   options.signal.addEventListener("abort", abortFromLifecycle, { once: true });
+  if (options.signal.aborted) controller.abort();
+  if (controller.signal.aborted) {
+    options.signal.removeEventListener("abort", abortFromLifecycle);
+    throw new DOMException("上传已停止", "AbortError");
+  }
   const timeoutMs = options.timeoutMs ?? KNOWLEDGE_BASE_START_TIMEOUT_MS;
   let timedOut = false;
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -946,6 +992,10 @@ export async function fetchKnowledgeBaseStartRequest(
   });
 
   try {
+    if (controller.signal.aborted) {
+      throw new DOMException("上传已停止", "AbortError");
+    }
+    options.onRequestStarted?.();
     return await Promise.race([
       (options.fetchImplementation ?? fetch)(
         options.endpoint ?? "/api/knowledge-base/start/reserve",
@@ -1013,21 +1063,23 @@ export async function readKnowledgeBaseStartRequestError(
 }
 
 export function shouldRecoverKnowledgeBaseStartFailure(
-  requestDispatched: boolean,
+  dispatchAttempted: boolean,
   error: Pick<
     KnowledgeBaseStartRequestError,
     "status" | "code" | "reservationCreated"
   >,
 ) {
-  if (!requestDispatched) return false;
+  if (!dispatchAttempted) return false;
   // A reset epoch mismatch is a definitive rejection of these browser bytes.
   // It must never enter the network-unknown recovery branch or project an old
   // pending start into the freshly reset conversation.
   if (error.code === "KNOWLEDGE_BASE_RESET_REVISION_CHANGED") return false;
-  if (error.reservationCreated === true) return true;
   if (error.reservationCreated === false) return false;
   if (error.code === "KNOWLEDGE_BASE_ROLLOUT_PENDING") return false;
   const status = Number(error.status || 0);
+  // A reserve receipt embedded in an explicit 4xx does not acknowledge the
+  // final dispatch. Only a sent request with a transport/timeout/transient
+  // response can have an unknown dispatch outcome.
   return !status || status === 408 || status === 429 || status >= 500;
 }
 
@@ -1233,6 +1285,16 @@ export default function ChatArea({
   const startedAt = activeConversation?.startedAt;
   const completedAt = activeConversation?.completedAt;
   const hasKnowledgeBaseProgress = Boolean(knowledgeBaseProgress);
+  const displayActiveTask = isKnowledgeBaseTaskVisiblyRunning({
+    status,
+    syncKnowledgeBaseSnapshot,
+    interactionState: activeConversation?.knowledgeBase?.interactionState,
+    noticeSeverity: activeConversation?.knowledgeBase?.notice?.severity,
+  });
+  const knowledgeBaseDisplayFailed =
+    syncKnowledgeBaseSnapshot &&
+    (activeConversation?.knowledgeBase?.interactionState === "failed" ||
+      activeConversation?.knowledgeBase?.notice?.severity === "error");
 
   useEffect(() => {
     if (!syncKnowledgeBaseSnapshot || !activeConversation?.id) return;
@@ -1260,11 +1322,11 @@ export default function ChatArea({
 
   // Force re-render every second when running to update elapsed time
   useEffect(() => {
-    if ((status === "running" || status === "pending") && startedAt) {
+    if (displayActiveTask && startedAt) {
       const timer = setInterval(() => setTick((t) => t + 1), 1000);
       return () => clearInterval(timer);
     }
-  }, [status, startedAt]);
+  }, [displayActiveTask, startedAt]);
 
   const startKnowledgeBase = useCallback(
     async (
@@ -1284,7 +1346,7 @@ export default function ChatArea({
       const responseStartedAt = lifecycle.startedAt;
       const clientRequestId = lifecycle.clientRequestId;
       const expectedResetRevision = lifecycle.expectedResetRevision;
-      let requestDispatched = false;
+      let dispatchAttempted = false;
       let preparedMessageAttachments: Attachment[] = [];
 
       try {
@@ -1293,19 +1355,12 @@ export default function ChatArea({
           (_file, index) =>
             lifecycle.fileItemIds?.[index] || `${clientRequestId}:${index + 1}`,
         );
-        const attachmentManifest = await Promise.all(
-          files.map(async (file, index) => ({
-            itemId: itemIds[index],
-            ordinal: index + 1,
-            total: files.length,
-            filename: normalizedKnowledgeBaseUploadFilename(file.name),
-            sizeBytes: file.size,
-            mimeType: normalizedKnowledgeBaseUploadMimeType(file),
-            lastModified: Math.max(0, Number(file.lastModified || 0)),
-            sha256: await sha256UploadFile(file),
-          })),
-        );
-        requestDispatched = true;
+        const attachmentManifest =
+          await buildKnowledgeBaseStarterAttachmentManifest(
+            files,
+            itemIds,
+            lifecycle.signal,
+          );
         const reserved = await reserveKnowledgeBaseStart(
           {
             conversationId,
@@ -1337,6 +1392,9 @@ export default function ChatArea({
         preparedMessageAttachments = messageAttachments;
         lifecycle.onBatchPhase("starting");
 
+        // Only the final dispatch can have an unknown Provider-task outcome.
+        // Reserve, local upload and stage failures must keep the browser-owned
+        // batch open and must never project the conversation as running.
         const response = await fetchKnowledgeBaseStartRequest(
           {
             method: "POST",
@@ -1355,6 +1413,9 @@ export default function ChatArea({
           {
             signal: lifecycle.signal,
             endpoint: "/api/knowledge-base/turn/dispatch",
+            onRequestStarted: () => {
+              dispatchAttempted = true;
+            },
           },
         );
 
@@ -1436,44 +1497,12 @@ export default function ChatArea({
           });
           throw error;
         } else if (
-          error?.reservationCreated !== false &&
-          error?.observation &&
-          knowledgeBaseObservationAcknowledgesClientRequest(
-            error.observation,
-            clientRequestId,
-          )
+          !shouldRecoverKnowledgeBaseStartFailure(dispatchAttempted, error)
         ) {
-          projectKnowledgeBaseStarterRequest({
-            lifecycle,
-            conversationId,
-            responseStartedAt,
-            messageAttachments: preparedMessageAttachments,
-            registerConversation: registerKnowledgeBaseConversation,
-            addConversationMessage: addMessage,
-            updateConversationTitle: updateTitle,
-          });
-          commitKnowledgeBaseObservation(conversationId, error.observation);
-          wakeKnowledgeBaseConversation(conversationId);
-          const attachmentCount = Number(error.attachmentCount || 0);
-          const diagnostic = [error.code, error.traceId]
-            .filter(Boolean)
-            .join(" · ");
-          toast.error("知识库任务未创建", {
-            description: `${
-              attachmentCount > 0
-                ? `${attachmentCount}/${attachmentCount} 个附件已保留。`
-                : "附件已保留。"
-            }${errorMessage}${diagnostic ? `（${diagnostic}）` : ""}`,
-          });
-          lifecycle.onBatchPhase("completed");
-          return { status: "accepted" };
-        } else if (
-          !shouldRecoverKnowledgeBaseStartFailure(requestDispatched, error)
-        ) {
-          if (requestDispatched) {
+          if (dispatchAttempted) {
             settleKnowledgeBaseStartFailure(conversationId, clientRequestId);
           }
-          toast.error(requestDispatched ? "启动失败" : "上传失败", {
+          toast.error(dispatchAttempted ? "启动失败" : "上传失败", {
             description: errorMessage,
           });
           lifecycle.onBatchPhase("failed");
@@ -1568,15 +1597,13 @@ export default function ChatArea({
         if (knowledgeBaseReconcileResultRequiresConfirmation(observation)) {
           toast.info("状态已更新，需要你确认后继续", {
             description:
-              observation.notice?.message ||
-              "已安全停在确认点，不会自动重发。",
+              observation.notice?.message || "已安全停在确认点，不会自动重发。",
           });
           return;
         }
         if (knowledgeBaseReconcileResultIsStopped(observation)) {
           toast.warning("本轮已停止，不会自动重发", {
-            description:
-              observation.notice?.message || "已完成内容不受影响。",
+            description: observation.notice?.message || "已完成内容不受影响。",
           });
           return;
         }
@@ -1606,8 +1633,7 @@ export default function ChatArea({
           })
         ) {
           toast.info("状态已更新", {
-            description:
-              observation.notice?.message || "已同步当前权威状态。",
+            description: observation.notice?.message || "已同步当前权威状态。",
           });
         } else {
           toast.warning("当前操作尚未恢复", {
@@ -1675,7 +1701,8 @@ export default function ChatArea({
   const sanitizedTitle = activeConversation.title
     ? sanitizeBrandText(activeConversation.title)
     : activeConversation.title;
-  const activeTask = status === "running" || status === "pending";
+  const activeTask = displayActiveTask;
+  const displayStatus = knowledgeBaseDisplayFailed ? "error" : status;
   const executionDuration =
     startedAt && (activeTask || completedAt)
       ? Math.max(
@@ -1704,7 +1731,7 @@ export default function ChatArea({
               {sanitizedTitle}
             </h2>
             <StatusBadge
-              status={status || "idle"}
+              status={displayStatus || "idle"}
               knowledgeBase={syncKnowledgeBaseSnapshot}
             />
           </div>
@@ -1798,7 +1825,7 @@ export default function ChatArea({
               <MessageBubble
                 key={msg.id}
                 message={msg}
-                isRunning={status === "running" || status === "pending"}
+                isRunning={displayActiveTask}
                 suppressKnowledgeArtifacts={syncKnowledgeBaseSnapshot}
                 onDelete={
                   syncKnowledgeBaseSnapshot
@@ -1812,31 +1839,6 @@ export default function ChatArea({
               />
             ))}
           </AnimatePresence>
-
-          {syncKnowledgeBaseSnapshot &&
-            activeConversation.knowledgeBase?.notice?.code ===
-              KNOWLEDGE_BASE_INTERNAL_ATTACHMENT_NOTICE_CODE &&
-            activeConversation.knowledgeBase.notice.turnId && (
-              <KnowledgeBaseManagedUploadRecovery
-                conversationId={activeConversation.id}
-                turnId={activeConversation.knowledgeBase.notice.turnId}
-                onObservation={(observation) => {
-                  commitKnowledgeBaseObservation(
-                    activeConversation.id,
-                    observation,
-                  );
-                }}
-                onRecovered={() => {
-                  wakeKnowledgeBaseConversation(activeConversation.id);
-                }}
-                onCancelled={(resetRevision) =>
-                  discardCancelledKnowledgeBaseStart(
-                    activeConversation.id,
-                    resetRevision,
-                  )
-                }
-              />
-            )}
 
           {syncKnowledgeBaseSnapshot &&
             activeConversation.knowledgeBase?.notice &&
@@ -1883,26 +1885,6 @@ export default function ChatArea({
                               .attachmentCount
                           }{" "}
                           个附件已保留，知识库任务未创建。
-                        </p>
-                      )}
-                    {activeConversation.knowledgeBase.notice.severity ===
-                      "error" &&
-                      (activeConversation.knowledgeBase.notice.code ||
-                        activeConversation.knowledgeBase.notice.traceId) && (
-                        <p
-                          className="mt-1 break-all text-[11px] opacity-75"
-                          data-testid="knowledge-base-safe-diagnostic"
-                        >
-                          {activeConversation.knowledgeBase.notice.code
-                            ? `错误码：${activeConversation.knowledgeBase.notice.code}`
-                            : ""}
-                          {activeConversation.knowledgeBase.notice.code &&
-                          activeConversation.knowledgeBase.notice.traceId
-                            ? " · "
-                            : ""}
-                          {activeConversation.knowledgeBase.notice.traceId
-                            ? `排查编号：${activeConversation.knowledgeBase.notice.traceId}`
-                            : ""}
                         </p>
                       )}
                   </div>
@@ -1960,24 +1942,6 @@ export default function ChatArea({
                         }}
                       />
                     ) : null
-                  ) : activeConversation.knowledgeBase.notice.recoveryAction ===
-                    "reselect_start_sources" ? (
-                    <KnowledgeBaseStartSourceRecovery
-                      conversationId={activeConversation.id}
-                      expectedGeneration={
-                        activeConversation.knowledgeBase.generation
-                      }
-                      expectedStateEpoch={
-                        activeConversation.knowledgeBase.stateEpoch
-                      }
-                      onObservation={(observation) => {
-                        commitKnowledgeBaseObservation(
-                          activeConversation.id,
-                          observation,
-                        );
-                        wakeKnowledgeBaseConversation(activeConversation.id);
-                      }}
-                    />
                   ) : knowledgeBaseNoticeHasRecoveryAction(
                       activeConversation.knowledgeBase.notice,
                     ) ? (
@@ -1986,7 +1950,17 @@ export default function ChatArea({
                       size="sm"
                       variant="outline"
                       disabled={retryingKnowledgeBase}
-                      onClick={() => void retryCurrentKnowledgeBaseTurn()}
+                      onClick={() => {
+                        if (
+                          knowledgeBaseNoticeRecoveryMode(
+                            activeConversation.knowledgeBase!.notice!,
+                          ) === "reset"
+                        ) {
+                          requestKnowledgeBaseReset();
+                          return;
+                        }
+                        void retryCurrentKnowledgeBaseTurn();
+                      }}
                     >
                       {retryingKnowledgeBase && (
                         <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -2001,7 +1975,7 @@ export default function ChatArea({
             )}
 
           {/* Typing indicator when running */}
-          {(status === "running" || status === "pending") &&
+          {displayActiveTask &&
             (() => {
               let lastUserIdx = -1;
               for (let i = messages.length - 1; i >= 0; i--) {
@@ -2036,6 +2010,7 @@ export default function ChatArea({
         composerPrefill={composerPrefill}
         responseLogicContext={responseLogicContext}
         knowledgeBaseProgress={knowledgeBaseProgress}
+        knowledgeBaseResetRevision={knowledgeBaseResetRevision}
       />
     </div>
   );
@@ -2229,7 +2204,7 @@ function knowledgeBaseStarterStageCopy(state: KnowledgeBaseStarterFileState) {
     case "waiting_cloud_ready":
       return "文件已接收，正在等待云端就绪";
     case "creating_record":
-      return "正在准备安全上传";
+      return "正在准备 Dashboard 接收";
     case "recovering":
       return "正在确认云端上传状态";
     case "uploading": {
@@ -2244,7 +2219,7 @@ function knowledgeBaseStarterStageCopy(state: KnowledgeBaseStarterFileState) {
     case "server_processing":
       return "文件已接收，正在等待云端就绪";
     case "uploaded":
-      return "云端已确认";
+      return "Dashboard 已确认，等待其余文件";
     case "failed":
       return state.error || "上传失败";
     case "cancelled":
@@ -2259,11 +2234,11 @@ function knowledgeBaseStarterBatchCopy(phase: KnowledgeBaseStarterBatchPhase) {
     case "uploading":
       return "资料上传中，尚未启动知识库构建";
     case "starting":
-      return "资料已由云端确认，正在启动知识库构建";
+      return "全部资料已确认，正在创建知识库任务";
     case "recovering":
       return "请求结果暂时未知，正在确认是否已启动";
     case "completed":
-      return "资料已接收，知识库构建已启动";
+      return "资料与派发请求已由 Dashboard 接收，等待上游任务创建";
     case "failed":
       return "本批次尚未完成，可安全重试";
     default:
@@ -2359,7 +2334,11 @@ export function EmptyConversationHint({
       // Reset-revision remounts and page exits revoke the entire starter
       // lifecycle. No upload/stage/dispatch from the previous epoch may keep
       // running after its UI and conversation have been discarded.
-      abortControllerRef.current?.abort();
+      abortControllerRef.current?.abort(
+        Object.assign(new DOMException("页面生命周期已结束", "AbortError"), {
+          frontmindAbortSource: "PAGE_OR_RESET_LIFECYCLE",
+        }),
+      );
     },
     [],
   );
@@ -2946,7 +2925,11 @@ export function EmptyConversationHint({
   ]);
 
   const stopUpload = useCallback(() => {
-    abortControllerRef.current?.abort();
+    abortControllerRef.current?.abort(
+      Object.assign(new DOMException("用户已停止上传", "AbortError"), {
+        frontmindAbortSource: "USER_STOP",
+      }),
+    );
   }, []);
 
   if (!eligible && batchStartedAt === null && !dialogOpen) return null;
@@ -3177,16 +3160,6 @@ export function EmptyConversationHint({
                                       {knowledgeBaseStarterRecoveryCopy(state)}
                                     </div>
                                   )}
-                                {state.errorCode && (
-                                  <div className="mt-0.5 break-all text-[11px] leading-4 text-destructive">
-                                    错误码：{state.errorCode}
-                                  </div>
-                                )}
-                                {state.traceId && (
-                                  <div className="mt-0.5 break-all text-[11px] leading-4 text-muted-foreground">
-                                    排查编号：{state.traceId}
-                                  </div>
-                                )}
                                 {fileElapsedMs !== null && (
                                   <div className="mt-0.5 text-[11px] tabular-nums text-muted-foreground">
                                     本次耗时{" "}
@@ -3248,7 +3221,7 @@ export function EmptyConversationHint({
                       已完成 {uploadSummary.uploadedCount}/{files.length} 个文件
                     </span>
                     <span>
-                      已传输
+                      已从浏览器传出
                       {formatKnowledgeBaseStarterBytes(
                         uploadSummary.transferredBytes,
                       )}
@@ -3258,7 +3231,7 @@ export function EmptyConversationHint({
                       )}
                     </span>
                     <span>
-                      已确认
+                      Dashboard 已完整确认
                       {formatKnowledgeBaseStarterBytes(
                         uploadSummary.confirmedBytes,
                       )}
@@ -3268,14 +3241,9 @@ export function EmptyConversationHint({
                       )}
                     </span>
                     <span>
-                      Dashboard 已接收
-                      {formatKnowledgeBaseStarterBytes(
-                        uploadSummary.dashboardReceivedBytes,
-                      )}
-                      /
-                      {formatKnowledgeBaseStarterBytes(
-                        uploadSummary.totalBytes,
-                      )}
+                      {batchPhase === "completed"
+                        ? "Dashboard 派发已接收，等待上游任务创建"
+                        : "上游任务尚未创建"}
                     </span>
                     <span>
                       已用时{" "}

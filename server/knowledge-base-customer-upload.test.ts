@@ -190,7 +190,11 @@ describe("knowledge-base customer upload provenance", () => {
       ).resolves.toEqual([
         expect.objectContaining({
           kind: "customer_upload",
-          sha256: sourceSha256,
+          caption: "知识库配图",
+          mimeType: "image/jpeg",
+          sameOriginUrl: expect.stringMatching(
+            /^\/api\/knowledge-base\/artifacts\/resources\//u,
+          ),
         }),
       ]);
       expect(dependencies.getDb).not.toHaveBeenCalled();
@@ -255,22 +259,34 @@ describe("knowledge-base customer upload provenance", () => {
         sourceSha256: "a".repeat(64),
       }),
     ]);
-    await expect(
-      knowledgeBaseCustomerUploadResources("build-1", turn),
-    ).resolves.toEqual([
-      {
-        kind: "customer_upload",
-        outputItemId: null,
-        fileId: null,
-        sameOriginUrl:
-          "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-customer-image/0/" +
-          "a".repeat(64),
-        filename: "customer-proof.jpg",
-        mimeType: "image/jpeg",
-        sha256: "a".repeat(64),
-        sizeBytes: 1234,
-      },
+    const resources = await knowledgeBaseCustomerUploadResources(
+      "build-1",
+      turn,
+    );
+    expect(resources).toHaveLength(1);
+    expect(resources[0]).toMatchObject({
+      kind: "customer_upload",
+      caption: "知识库配图",
+      mimeType: "image/jpeg",
+      sizeBytes: 1234,
+    });
+    expect(Object.keys(resources[0]!).sort()).toEqual([
+      "caption",
+      "id",
+      "kind",
+      "mimeType",
+      "sameOriginUrl",
+      "sizeBytes",
     ]);
+    expect(resources[0]!.sameOriginUrl).toMatch(
+      /^\/api\/knowledge-base\/artifacts\/resources\/[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/u,
+    );
+    const serialized = JSON.stringify(resources);
+    expect(serialized).not.toContain("build-1");
+    expect(serialized).not.toContain("turn-customer-image");
+    expect(serialized).not.toContain("customer-proof.jpg");
+    expect(serialized).not.toContain("file-customer-image");
+    expect(serialized).not.toContain("a".repeat(64));
   });
 
   it("excludes a verified recovery officialLogoUpload from the ordinary customer-upload manifest", () => {
@@ -353,6 +369,53 @@ describe("knowledge-base customer upload provenance", () => {
             revision: 49,
           },
         },
+      }),
+    ).toBeNull();
+  });
+
+  it("accepts a completed server-authored local materialized Logo ledger", () => {
+    const turn = {
+      id: "turn-local-logo",
+      operationType: "local_logo",
+      buildId: "build-1",
+      buildGeneration: 7,
+      expectedRevision: 50,
+      expectedLeafId: "1.1",
+      attachmentFileIds: ["file-local-logo"],
+      status: "completed" as const,
+      metadata: {
+        execution: "local",
+        providerRequestCount: 0,
+        localLogo: {
+          kind: "frontmind.knowledge-base.local-logo",
+          schemaVersion: 1,
+          immutable: true,
+          buildId: "build-1",
+          generation: 7,
+          revision: 50,
+          leafId: "1.1",
+          officialLogoUpload: {
+            verified: true,
+            index: 0,
+            fileId: "file-local-logo",
+            filename: "brand.png",
+            mimeType: "image/png",
+            sizeBytes: 4096,
+            sourceSha256: "c".repeat(64),
+          },
+        },
+      },
+    };
+    expect(knowledgeBaseOfficialLogoUploadFromTurn(turn)).toMatchObject({
+      turnId: "turn-local-logo",
+      leafId: "1.1",
+      fileId: "file-local-logo",
+      sourceSha256: "c".repeat(64),
+    });
+    expect(
+      knowledgeBaseOfficialLogoUploadFromTurn({
+        ...turn,
+        expectedRevision: 51,
       }),
     ).toBeNull();
   });

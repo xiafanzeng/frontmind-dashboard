@@ -1,0 +1,174 @@
+import { createHash } from "node:crypto";
+
+import {
+  KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS,
+  type KnowledgeBaseLocalUploadCoordinate,
+} from "../shared/knowledge-base-local-upload";
+
+type HeaderValue = string | string[] | undefined;
+
+export class KnowledgeBaseLocalAssetCoordinateError extends Error {
+  readonly code = "KNOWLEDGE_BASE_UPLOAD_COORDINATE_INVALID";
+
+  constructor() {
+    super("Knowledge-base upload coordinate is invalid");
+    this.name = "KnowledgeBaseLocalAssetCoordinateError";
+  }
+}
+
+function lowerCaseHeaders(headers: Record<string, HeaderValue>) {
+  return new Map(
+    Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]),
+  );
+}
+
+function scalarHeader(
+  headers: Map<string, HeaderValue>,
+  name: string,
+): string | undefined {
+  const value = headers.get(name.toLowerCase());
+  if (Array.isArray(value)) return undefined;
+  return typeof value === "string" ? value.trim() : undefined;
+}
+
+/**
+ * Ordinary-chat uploads send none of these headers. A knowledge-base upload
+ * must send the complete set so a partial or forged coordinate cannot silently
+ * fall back to a non-idempotent asset.
+ */
+export function parseKnowledgeBaseLocalUploadCoordinate(
+  inputHeaders: Record<string, HeaderValue>,
+): KnowledgeBaseLocalUploadCoordinate | null {
+  const headers = lowerCaseHeaders(inputHeaders);
+  const names = Object.values(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS).filter(
+    (name) => name !== KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.attempt,
+  );
+  const present = names.filter(
+    (name) => scalarHeader(headers, name) !== undefined,
+  );
+  if (present.length === 0) return null;
+  if (present.length !== names.length) {
+    throw new KnowledgeBaseLocalAssetCoordinateError();
+  }
+
+  const conversationId = scalarHeader(
+    headers,
+    KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.conversationId,
+  )!;
+  const turnId = scalarHeader(
+    headers,
+    KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.turnId,
+  )!;
+  const clientRequestId = scalarHeader(
+    headers,
+    KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.clientRequestId,
+  )!;
+  const itemId = scalarHeader(
+    headers,
+    KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.itemId,
+  )!;
+  const expectedResetRevision = Number(
+    scalarHeader(
+      headers,
+      KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.expectedResetRevision,
+    ),
+  );
+  const contentSha256 = String(
+    scalarHeader(headers, KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256),
+  ).toLowerCase();
+  const ordinal = Number(
+    scalarHeader(headers, KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.ordinal),
+  );
+
+  if (
+    !conversationId ||
+    conversationId.length > 191 ||
+    !turnId ||
+    turnId.length > 191 ||
+    !clientRequestId ||
+    clientRequestId.length > 128 ||
+    !itemId ||
+    itemId.length > 191 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0 ||
+    !/^[a-f0-9]{64}$/u.test(contentSha256) ||
+    !Number.isSafeInteger(ordinal) ||
+    ordinal < 1 ||
+    ordinal > 1_000
+  ) {
+    throw new KnowledgeBaseLocalAssetCoordinateError();
+  }
+
+  return {
+    conversationId,
+    turnId,
+    clientRequestId,
+    itemId,
+    expectedResetRevision,
+    contentSha256,
+    ordinal,
+  };
+}
+
+function digest(value: unknown) {
+  return createHash("sha256")
+    .update(JSON.stringify(value), "utf8")
+    .digest("hex");
+}
+
+/**
+ * The local id is stable for one reserved manifest item. Content identity is
+ * deliberately part of storageKey but not localAssetId: replaying the same
+ * item with changed bytes therefore becomes a conflict instead of a fork.
+ */
+export function knowledgeBaseLocalAssetIdentity(input: {
+  userId: number;
+  projectAssignmentId: string | null;
+  coordinate: KnowledgeBaseLocalUploadCoordinate;
+  sizeBytes: number;
+}) {
+  const operation = [
+    input.userId,
+    input.projectAssignmentId,
+    input.coordinate.conversationId,
+    input.coordinate.turnId,
+    input.coordinate.clientRequestId,
+    input.coordinate.itemId,
+    input.coordinate.expectedResetRevision,
+  ];
+  const operationDigest = digest(operation);
+  const contentDigest = digest([
+    operationDigest,
+    input.coordinate.contentSha256,
+    input.sizeBytes,
+  ]);
+  return {
+    localAssetId: `asset_${operationDigest.slice(0, 30)}`,
+    storageKey: `frontmind-v2:knowledge-base:${contentDigest}`,
+  };
+}
+
+export function knowledgeBaseLocalAssetReplayMatches(
+  existing: {
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+    contentSha256: string;
+    storageKey: string;
+  },
+  expected: {
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+    contentSha256: string;
+    storageKey: string;
+  },
+) {
+  return (
+    existing.filename === expected.filename &&
+    existing.mimeType === expected.mimeType &&
+    existing.sizeBytes === expected.sizeBytes &&
+    existing.contentSha256 === expected.contentSha256 &&
+    existing.storageKey === expected.storageKey
+  );
+}

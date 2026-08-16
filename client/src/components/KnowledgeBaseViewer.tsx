@@ -11,6 +11,7 @@ import {
 import MarkdownRenderer from "@/components/MarkdownRenderer";
 import { Input } from "@/components/ui/input";
 import type { KnowledgeAsset, KnowledgeDocument } from "@shared/dashboard";
+import { customerSafeKnowledgeAssetLabel } from "@shared/knowledge-base-public-artifacts";
 
 type KnowledgeDisplayAsset = KnowledgeAsset & {
   sectionHint?: string;
@@ -287,12 +288,25 @@ function placeKnowledgeAssets(snapshot: KnowledgeSnapshotView): AssetPlacement {
 
 function assetDisplayName(asset: KnowledgeDisplayAsset) {
   return (
-    asset.caption?.trim() ||
-    asset.alt?.trim() ||
-    asset.title?.trim() ||
-    archiveFileName(asset.path)
-      .replace(/\.[^.]+$/, "")
-      .replaceAll(/[_-]+/g, " ")
+    customerSafeKnowledgeAssetLabel(asset.caption) ||
+    customerSafeKnowledgeAssetLabel(asset.alt) ||
+    knowledgeAssetSemanticFallback(asset)
+  );
+}
+
+function knowledgeAssetSemanticFallback(asset: KnowledgeDisplayAsset) {
+  return asset.sourceKind === "official_logo_upload" ||
+    asset.assetType === "brand_identity"
+    ? "企业官方主 Logo"
+    : undefined;
+}
+
+function assetAlternativeText(asset: KnowledgeDisplayAsset) {
+  return (
+    customerSafeKnowledgeAssetLabel(asset.alt) ||
+    customerSafeKnowledgeAssetLabel(asset.caption) ||
+    knowledgeAssetSemanticFallback(asset) ||
+    "知识库配图"
   );
 }
 
@@ -391,29 +405,35 @@ function KnowledgeImageGrid({
   );
   const renderAsset = (asset: KnowledgeDisplayAsset) => {
     const displayName = assetDisplayName(asset);
+    const source = assetSource(asset);
+    const showSource = isExternalHttpUrl(source);
     return (
       <figure key={asset.key} className="min-w-0">
         <img
           src={asset.url}
-          alt={asset.alt?.trim() || displayName}
+          alt={assetAlternativeText(asset)}
           loading="lazy"
           className={knowledgeAssetImageClass(asset)}
         />
-        <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
-          <span className="block break-words font-medium text-[#51495d]">
-            {displayName}
-          </span>
-          {isExternalHttpUrl(assetSource(asset)) && (
-            <a
-              href={assetSource(asset)}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
-            >
-              查看图片来源
-            </a>
-          )}
-        </figcaption>
+        {(displayName || showSource) && (
+          <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
+            {displayName && (
+              <span className="block break-words font-medium text-[#51495d]">
+                {displayName}
+              </span>
+            )}
+            {showSource && (
+              <a
+                href={source}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-0.5 inline-flex text-[#6d3497] hover:underline"
+              >
+                查看图片来源
+              </a>
+            )}
+          </figcaption>
+        )}
       </figure>
     );
   };
@@ -640,15 +660,17 @@ export default function KnowledgeBaseViewer({
                   <figure key={asset.id || asset.key} className="min-w-0">
                     <img
                       src={asset.url}
-                      alt={asset.alt?.trim() || displayName}
+                      alt={assetAlternativeText(asset)}
                       loading="lazy"
                       className={knowledgeAssetImageClass(asset)}
                     />
-                    <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
-                      <span className="block break-words font-medium text-[#51495d]">
-                        {displayName}
-                      </span>
-                    </figcaption>
+                    {displayName && (
+                      <figcaption className="px-1 pt-2 text-xs leading-5 text-[#716a80]">
+                        <span className="block break-words font-medium text-[#51495d]">
+                          {displayName}
+                        </span>
+                      </figcaption>
+                    )}
                   </figure>
                 );
               })}

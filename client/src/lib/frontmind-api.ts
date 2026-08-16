@@ -20,7 +20,12 @@ import { userFacingErrorMessage } from "@/lib/user-facing-error";
 import {
   assertChatAttachmentSizes,
   normalizedKnowledgeBaseUploadFilename,
+  normalizedKnowledgeBaseUploadMimeType,
 } from "@/lib/attachment-files";
+import {
+  knowledgeBaseLocalUploadHeaders,
+  type KnowledgeBaseLocalUploadCoordinate,
+} from "@shared/knowledge-base-local-upload";
 import {
   dispatchKnowledgeBaseProgressUpdated,
   knowledgeBaseObservationFromPayload,
@@ -45,6 +50,8 @@ export const MODEL_OPTIONS = [
   { value: "frontmind-base", label: "FrontMind-Base", description: "通用任务" },
   { value: "frontmind-pro", label: "FrontMind-Pro", description: "复杂分析" },
 ] as const;
+
+export type GeneralAgentModelProfile = (typeof MODEL_OPTIONS)[number]["value"];
 
 /**
  * Get the display label for a model value.
@@ -329,7 +336,10 @@ export type UploadRetentionReceipt = {
   fileId: string;
   sizeBytes: number;
   uploadedAt: number;
-  providerReadyAt: number;
+  /** Dashboard has durably accepted the complete browser body. */
+  dashboardReadyAt?: number;
+  /** Set only after the Provider has actually confirmed a file lease. */
+  providerReadyAt?: number;
   expiresAt: number;
   replayed: boolean;
   recovered: boolean;
@@ -405,6 +415,8 @@ export type UploadFileOptions = {
   batchTotal?: number;
   /** Stable dialog item identity. It is not a provider file id. */
   itemId?: string;
+  /** SHA-256 frozen by the reservation manifest for this exact browser File. */
+  contentSha256?: string;
   /** Durable server-side coordinate used to rediscover this upload elsewhere. */
   resumeScope?: {
     kind: "knowledge_base";
@@ -652,7 +664,7 @@ export async function createTask(
     conversationId?: string;
     clientRequestId?: string;
     projectId?: string;
-    agentProfile?: string;
+    modelProfile?: GeneralAgentModelProfile;
   },
 ): Promise<TaskResponse> {
   const prompt = buildPromptText(input);
@@ -672,6 +684,13 @@ export async function createTask(
     clientRequestId,
     prompt,
     localAssetIds,
+    ...(!localTaskId
+      ? {
+          modelProfile: normalizePublicAgentProfile(
+            options?.modelProfile,
+          ) as GeneralAgentModelProfile,
+        }
+      : {}),
   };
   const response = await apiRequest(
     localTaskId
@@ -696,17 +715,26 @@ export async function uploadChatLocalAsset(
   onProgress?: (percent: number) => void,
   options: {
     filename?: string;
+    mimeType?: string;
     signal?: AbortSignal;
+    knowledgeBaseCoordinate?: KnowledgeBaseLocalUploadCoordinate;
+    attempt?: number;
+    onTransfer?: (loadedBytes: number, totalBytes: number) => void;
+    onUploadComplete?: () => void;
   } = {},
 ): Promise<{
   fileId: string;
   filename: string;
   expiresAt: number;
+  replayed: boolean;
+  traceId?: string;
 }> {
   assertChatAttachmentSizes([file]);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const filename = options.filename || file.name || "attachment.bin";
+    const mimeType =
+      options.mimeType || file.type || "application/octet-stream";
     const abortFromSignal = () => xhr.abort();
     if (options.signal?.aborted) {
       reject(new DOMException("附件上传已取消", "AbortError"));
@@ -718,32 +746,54 @@ export async function uploadChatLocalAsset(
       // body unconditionally binary so a user-supplied .json file is not
       // consumed as an HTTP request object before the asset stream runs.
       "Content-Type": "application/octet-stream",
-      "X-FrontMind-Mime": file.type || "application/octet-stream",
+      "X-FrontMind-Mime": mimeType,
       "X-FrontMind-Filename": encodeURIComponent(filename),
       "X-FrontMind-Size": String(file.size),
+      ...(options.knowledgeBaseCoordinate
+        ? knowledgeBaseLocalUploadHeaders(
+            options.knowledgeBaseCoordinate,
+            Math.max(1, Number(options.attempt || 1)),
+          )
+        : {}),
     });
     Object.entries(headers).forEach(([name, value]) => {
       xhr.setRequestHeader(name, value);
     });
-    xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable || event.total <= 0) return;
-      onProgress?.(
-        Math.min(100, Math.round((event.loaded / event.total) * 100)),
-      );
-    };
+    const watchdog = installFileUploadWatchdog(xhr, onProgress, {
+      totalBytes: file.size,
+      onTransfer: options.onTransfer,
+      onUploadComplete: options.onUploadComplete,
+    });
     const detachAbortListener = () =>
       options.signal?.removeEventListener("abort", abortFromSignal);
+    const cleanup = () => {
+      watchdog.clear();
+      detachAbortListener();
+    };
     options.signal?.addEventListener("abort", abortFromSignal, { once: true });
     xhr.onerror = () => {
-      detachAbortListener();
-      reject(new Error("附件上传网络异常，请稍后重试"));
+      cleanup();
+      reject(
+        new FileUploadError("附件上传网络异常，请稍后重试", {
+          code: "UPLOAD_NETWORK_ERROR",
+          retryable: true,
+        }),
+      );
     };
     xhr.onabort = () => {
-      detachAbortListener();
-      reject(new DOMException("附件上传已取消", "AbortError"));
+      const timeoutCode = watchdog.timeoutCode();
+      cleanup();
+      reject(
+        timeoutCode
+          ? timedOutFileUploadError(undefined, timeoutCode)
+          : cancelledFileUploadError(),
+      );
     };
     xhr.onload = () => {
-      detachAbortListener();
+      if (xhr.status >= 200 && xhr.status < 300) {
+        watchdog.markUploadComplete();
+      }
+      cleanup();
       let payload: any = null;
       try {
         payload = JSON.parse(xhr.responseText || "null");
@@ -751,30 +801,75 @@ export async function uploadChatLocalAsset(
         payload = null;
       }
       if (xhr.status < 200 || xhr.status >= 300) {
+        const structuredError =
+          payload?.error && typeof payload.error === "object"
+            ? payload.error
+            : null;
+        const status = Number(xhr.status || 0);
         reject(
-          Object.assign(
-            new Error(
-              payload?.error?.message || `附件上传失败（${xhr.status}）`,
-            ),
-            { status: xhr.status, code: payload?.error?.code },
+          new FileUploadError(
+            structuredError?.message || `附件上传失败（${xhr.status}）`,
+            {
+              code: structuredError?.code || "UPLOAD_REJECTED",
+              status,
+              retryable:
+                structuredError?.retryable === true ||
+                isRetryableUploadStatus(status) ||
+                (status === 400 && structuredError === null),
+              traceId:
+                typeof structuredError?.traceId === "string"
+                  ? structuredError.traceId
+                  : undefined,
+            },
           ),
         );
         return;
       }
       const id = String(payload?.localAssetId || "");
       if (!id.startsWith("asset_")) {
-        reject(new Error("附件本地身份无效，请重新上传"));
+        reject(
+          new FileUploadError("附件本地身份无效，请重新上传", {
+            code: "UPLOAD_RECEIPT_INVALID",
+            retryable: true,
+          }),
+        );
+        return;
+      }
+      const expiresAt = Number(payload?.expiresAt);
+      if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) {
+        reject(
+          new FileUploadError("附件保留期回执无效，请重新上传", {
+            code: "UPLOAD_RECEIPT_INVALID",
+            retryable: true,
+          }),
+        );
         return;
       }
       onProgress?.(100);
       resolve({
         fileId: id,
         filename: String(payload?.filename || filename),
-        expiresAt: Number(payload?.expiresAt || Date.now()),
+        expiresAt,
+        replayed: payload?.replayed === true,
+        ...(typeof payload?.traceId === "string" && payload.traceId.trim()
+          ? { traceId: payload.traceId.trim() }
+          : {}),
       });
     };
+    watchdog.start();
     xhr.send(file);
   });
+}
+
+function localAssetUploadWasCancelled(
+  error: unknown,
+  signal: AbortSignal | undefined,
+) {
+  return (
+    signal?.aborted === true ||
+    (error as { cancelled?: unknown } | null)?.cancelled === true ||
+    (error as { name?: unknown } | null)?.name === "AbortError"
+  );
 }
 
 /**
@@ -786,7 +881,7 @@ export async function uploadChatLocalAsset(
 export async function uploadKnowledgeBaseLocalAsset(
   file: File,
   onProgress?: (percent: number) => void,
-  _retryConfig?: {
+  retryConfig?: {
     maxRetries: number;
     initialDelay: number;
     maxDelay: number;
@@ -794,18 +889,135 @@ export async function uploadKnowledgeBaseLocalAsset(
   options: UploadFileOptions = {},
 ): Promise<UploadRetentionReceipt & { filename: string }> {
   const filename =
-    options.captureFilename ||
-    normalizedKnowledgeBaseUploadFilename(file.name);
+    options.captureFilename || normalizedKnowledgeBaseUploadFilename(file.name);
+  const coordinate = options.resumeScope
+    ? (() => {
+        const contentSha256 = String(options.contentSha256 || "").toLowerCase();
+        const itemId = String(options.itemId || "").trim();
+        const ordinal = Number(options.batchOrdinal);
+        const expectedResetRevision = Number(
+          options.resumeScope?.expectedResetRevision,
+        );
+        if (
+          !itemId ||
+          !/^[a-f0-9]{64}$/u.test(contentSha256) ||
+          !Number.isSafeInteger(ordinal) ||
+          ordinal < 1 ||
+          !Number.isSafeInteger(expectedResetRevision) ||
+          expectedResetRevision < 0
+        ) {
+          throw new FileUploadError("知识库上传坐标无效，请重新选择资料", {
+            code: "INVALID_UPLOAD_OPTIONS",
+            retryable: false,
+          });
+        }
+        return {
+          conversationId: options.resumeScope.conversationId,
+          turnId: options.resumeScope.turnId,
+          clientRequestId: options.resumeScope.clientRequestId,
+          itemId,
+          expectedResetRevision,
+          contentSha256,
+          ordinal,
+        } satisfies KnowledgeBaseLocalUploadCoordinate;
+      })()
+    : undefined;
   options.onStage?.({
     stage: "creating_record",
     totalBytes: file.size,
     loadedBytes: 0,
   });
-  const uploaded = await uploadChatLocalAsset(file, onProgress, {
-    filename,
-    signal: options.signal,
-  });
-  const uploadedAt = Date.now();
+  const configuredRetries = Number(retryConfig?.maxRetries ?? 2);
+  const maxRetries = Math.min(
+    2,
+    Number.isSafeInteger(configuredRetries) && configuredRetries >= 0
+      ? configuredRetries
+      : 2,
+  );
+  const configuredInitialDelay = Number(retryConfig?.initialDelay ?? 1_000);
+  const initialDelay =
+    Number.isFinite(configuredInitialDelay) && configuredInitialDelay >= 0
+      ? configuredInitialDelay
+      : 1_000;
+  const configuredMaxDelay = Number(retryConfig?.maxDelay ?? 3_000);
+  const maxDelay =
+    Number.isFinite(configuredMaxDelay) && configuredMaxDelay >= initialDelay
+      ? configuredMaxDelay
+      : Math.max(initialDelay, 3_000);
+  let retryIndex = 0;
+  let uploaded: Awaited<ReturnType<typeof uploadChatLocalAsset>>;
+  while (true) {
+    try {
+      uploaded = await uploadChatLocalAsset(file, onProgress, {
+        filename,
+        mimeType: normalizedKnowledgeBaseUploadMimeType(file),
+        signal: options.signal,
+        knowledgeBaseCoordinate: coordinate,
+        attempt: retryIndex + 1,
+        onTransfer: (loadedBytes, totalBytes) =>
+          options.onStage?.({
+            stage: "uploading_to_dashboard",
+            loadedBytes,
+            totalBytes,
+          }),
+        onUploadComplete: () =>
+          options.onStage?.({
+            stage: "uploading_to_dashboard",
+            loadedBytes: file.size,
+            totalBytes: file.size,
+          }),
+      });
+      break;
+    } catch (error) {
+      const errorCode = String(
+        (error as { code?: unknown } | null)?.code || "",
+      ).trim();
+      const abortReasonCode = String(
+        (
+          options.signal?.reason as {
+            frontmindAbortSource?: unknown;
+          } | null
+        )?.frontmindAbortSource || "",
+      ).trim();
+      console.warn("[KnowledgeBaseUpload] attempt_failed", {
+        conversationId: coordinate?.conversationId ?? null,
+        turnId: coordinate?.turnId ?? null,
+        itemId: coordinate?.itemId ?? options.itemId ?? null,
+        ordinal: coordinate?.ordinal ?? options.batchOrdinal ?? null,
+        attempt: retryIndex + 1,
+        errorCode: errorCode || null,
+        status: Number((error as { status?: unknown } | null)?.status || 0),
+        abortSource: abortReasonCode
+          ? abortReasonCode
+          : [
+                "UPLOAD_TIMEOUT",
+                "UPLOAD_BROWSER_STALLED",
+                "UPLOAD_SERVER_RESPONSE_TIMEOUT",
+              ].includes(errorCode)
+            ? "WATCHDOG"
+            : errorCode === "UPLOAD_NETWORK_ERROR"
+              ? "XHR_NETWORK_ERROR"
+              : null,
+      });
+      const retryable =
+        !localAssetUploadWasCancelled(error, options.signal) &&
+        ((error as { retryable?: unknown } | null)?.retryable === true ||
+          isRetryableUploadStatus(
+            Number((error as { status?: unknown } | null)?.status || 0),
+          ));
+      if (!retryable || retryIndex >= maxRetries) throw error;
+      const delayMs = Math.min(maxDelay, initialDelay * 3 ** retryIndex);
+      retryIndex += 1;
+      options.onStage?.({
+        stage: "recovering",
+        itemId: options.itemId,
+        loadedBytes: 0,
+        totalBytes: file.size,
+      });
+      await waitForUploadRetry(delayMs, options.signal, undefined);
+    }
+  }
+  const dashboardReadyAt = Date.now();
   await options.onFileRecord?.({
     itemId: options.itemId,
     fileId: uploaded.fileId,
@@ -816,11 +1028,12 @@ export async function uploadKnowledgeBaseLocalAsset(
     fileId: uploaded.fileId,
     filename: uploaded.filename,
     sizeBytes: file.size,
-    uploadedAt,
-    providerReadyAt: uploadedAt,
+    uploadedAt: dashboardReadyAt,
+    dashboardReadyAt,
     expiresAt: uploaded.expiresAt,
-    replayed: false,
+    replayed: uploaded.replayed,
     recovered: false,
+    ...(uploaded.traceId ? { traceId: uploaded.traceId } : {}),
   };
   options.onStage?.({
     stage: "uploaded",
@@ -924,6 +1137,7 @@ export interface KnowledgeBaseAttachmentTurnReservation {
     | "terminal";
   turnId: string;
   clientRequestId: string;
+  sourceResetRevision: number;
   generation: number;
   revision: number;
   leafId: string | null;
@@ -955,29 +1169,59 @@ export async function reserveKnowledgeBaseStart(
   },
   signal?: AbortSignal,
 ) {
-  const response = await fetch("/api/knowledge-base/start/reserve", {
-    method: "POST",
-    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
-    credentials: "include",
-    signal,
-    body: JSON.stringify(input),
-  });
-  if (!response.ok) {
-    throw await knowledgeBaseRequestError(
-      response,
-      `启动预约失败（${response.status}）`,
-    );
+  const requestBody = JSON.stringify(input);
+  let lastError: unknown;
+  for (
+    let attempt = 0;
+    attempt < KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("上传已停止", "AbortError");
+      }
+      const response = await fetch("/api/knowledge-base/start/reserve", {
+        method: "POST",
+        headers: deliveryProjectHeaders({
+          "Content-Type": "application/json",
+        }),
+        credentials: "include",
+        signal,
+        body: requestBody,
+      });
+      if (!response.ok) {
+        throw await knowledgeBaseRequestError(
+          response,
+          `启动预约失败（${response.status}）`,
+        );
+      }
+      const payload = await response.json();
+      if (
+        !payload?.reservation?.turnId ||
+        !payload.reservation.clientRequestId
+      ) {
+        throw new Error("启动预约失败：服务端未返回逻辑轮次");
+      }
+      return {
+        reservation:
+          payload.reservation as KnowledgeBaseAttachmentTurnReservation,
+        knowledgeObservation: payload?.observation
+          ? knowledgeBaseObservationFromPayload(payload)
+          : undefined,
+      };
+    } catch (error) {
+      lastError = error;
+      if (
+        signal?.aborted ||
+        !isTransientKnowledgeBaseRequestError(error) ||
+        attempt === KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      await waitForKnowledgeBaseRequestRetry(error, attempt, signal);
+    }
   }
-  const payload = await response.json();
-  if (!payload?.reservation?.turnId || !payload.reservation.clientRequestId) {
-    throw new Error("启动预约失败：服务端未返回逻辑轮次");
-  }
-  return {
-    reservation: payload.reservation as KnowledgeBaseAttachmentTurnReservation,
-    knowledgeObservation: payload?.observation
-      ? knowledgeBaseObservationFromPayload(payload)
-      : undefined,
-  };
+  throw lastError;
 }
 
 /**
@@ -1052,10 +1296,25 @@ function knowledgeBaseRequestRetryDelay(error: unknown, attempt: number) {
 async function waitForKnowledgeBaseRequestRetry(
   error: unknown,
   attempt: number,
+  signal?: AbortSignal,
 ) {
-  await new Promise((resolve) =>
-    setTimeout(resolve, knowledgeBaseRequestRetryDelay(error, attempt)),
-  );
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("上传已停止", "AbortError");
+  }
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new DOMException("上传已停止", "AbortError"));
+    };
+    const timer = setTimeout(
+      () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      knowledgeBaseRequestRetryDelay(error, attempt),
+    );
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function retryAfterMilliseconds(value: string | null): number | undefined {
@@ -1110,6 +1369,7 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
   context: {
     conversationId: string;
     clientRequestId: string;
+    expectedResetRevision: number;
     expectedGeneration: number;
     expectedRevision: number;
     expectedLeafId: string;
@@ -1121,57 +1381,136 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
   reservation: KnowledgeBaseAttachmentTurnReservation;
   knowledgeObservation?: KnowledgeBaseObservationDto;
 }> {
-  const response = await fetch("/api/knowledge-base/turn/reserve", {
-    method: "POST",
-    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
-    credentials: "include",
-    body: JSON.stringify({
-      conversationId: context.conversationId,
-      clientRequestId: context.clientRequestId,
-      expectedGeneration: context.expectedGeneration,
-      expectedRevision: context.expectedRevision,
-      expectedLeafId: context.expectedLeafId,
-      expectedPresentationKey: context.expectedPresentationKey,
-      userMessage: buildPromptText(input),
-      attachmentManifest: context.attachmentManifest,
-      resumeExisting: context.resumeExisting === true,
-    }),
-  });
-  if (!response.ok) {
-    throw await knowledgeBaseRequestError(
-      response,
-      `本轮预约失败（${response.status}）`,
+  const coordinateIsComplete =
+    context.conversationId.trim().length > 0 &&
+    context.clientRequestId.trim().length > 0 &&
+    Number.isSafeInteger(context.expectedResetRevision) &&
+    context.expectedResetRevision >= 0 &&
+    Number.isSafeInteger(context.expectedGeneration) &&
+    context.expectedGeneration >= 1 &&
+    Number.isSafeInteger(context.expectedRevision) &&
+    context.expectedRevision >= 0 &&
+    context.expectedLeafId.trim().length > 0 &&
+    context.attachmentManifest.length > 0 &&
+    context.attachmentManifest.every(
+      (item, index) =>
+        typeof item.itemId === "string" &&
+        item.itemId.trim().length > 0 &&
+        item.ordinal === index + 1 &&
+        item.total === context.attachmentManifest.length &&
+        item.filename.trim().length > 0 &&
+        Number.isSafeInteger(item.sizeBytes) &&
+        item.sizeBytes >= 0 &&
+        item.mimeType.trim().length > 0 &&
+        Number.isSafeInteger(item.lastModified) &&
+        item.lastModified >= 0 &&
+        /^[a-f0-9]{64}$/u.test(item.sha256),
     );
+  if (!coordinateIsComplete) {
+    throw new Error("知识库附件坐标不完整，请刷新后重新选择资料");
   }
-  const payload = await response.json();
-  if (!payload?.reservation?.turnId || !payload.reservation.clientRequestId) {
-    throw new Error("本轮预约失败：服务端未返回逻辑轮次");
+
+  const requestBody = JSON.stringify({
+    conversationId: context.conversationId,
+    clientRequestId: context.clientRequestId,
+    expectedResetRevision: context.expectedResetRevision,
+    expectedGeneration: context.expectedGeneration,
+    expectedRevision: context.expectedRevision,
+    expectedLeafId: context.expectedLeafId,
+    expectedPresentationKey: context.expectedPresentationKey,
+    userMessage: buildPromptText(input),
+    attachmentManifest: context.attachmentManifest,
+    resumeExisting: context.resumeExisting === true,
+  });
+  let lastError: unknown;
+  for (
+    let attempt = 0;
+    attempt < KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      const response = await fetch("/api/knowledge-base/turn/reserve", {
+        method: "POST",
+        headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+        credentials: "include",
+        body: requestBody,
+      });
+      if (!response.ok) {
+        throw await knowledgeBaseRequestError(
+          response,
+          `本轮预约失败（${response.status}）`,
+        );
+      }
+      const payload = await response.json();
+      const reservation = payload?.reservation;
+      if (
+        typeof reservation?.turnId !== "string" ||
+        reservation.turnId.trim().length === 0 ||
+        reservation.clientRequestId !== context.clientRequestId ||
+        !Number.isSafeInteger(reservation.sourceResetRevision) ||
+        reservation.sourceResetRevision !== context.expectedResetRevision ||
+        !Number.isSafeInteger(reservation.generation) ||
+        reservation.generation !== context.expectedGeneration ||
+        !Number.isSafeInteger(reservation.revision) ||
+        reservation.revision !== context.expectedRevision ||
+        reservation.leafId !== context.expectedLeafId
+      ) {
+        throw Object.assign(
+          new Error("本轮预约失败：服务端返回的知识库坐标不一致"),
+          {
+            status: 409,
+            code: "KNOWLEDGE_BASE_RESERVATION_COORDINATE_MISMATCH",
+          },
+        );
+      }
+      return {
+        reservation: reservation as KnowledgeBaseAttachmentTurnReservation,
+        knowledgeObservation: payload?.observation
+          ? knowledgeBaseObservationFromPayload(payload)
+          : undefined,
+      };
+    } catch (error) {
+      lastError = error;
+      if (
+        !isTransientKnowledgeBaseRequestError(error) ||
+        attempt === KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      await waitForKnowledgeBaseRequestRetry(error, attempt);
+    }
   }
-  return {
-    reservation: payload.reservation,
-    knowledgeObservation: payload?.observation
-      ? knowledgeBaseObservationFromPayload(payload)
-      : undefined,
-  };
+  throw lastError;
 }
 
 export async function stageKnowledgeBaseTurnAttachment(input: {
   conversationId: string;
   turnId: string;
   clientRequestId: string;
-  expectedResetRevision?: number;
+  expectedResetRevision: number;
   attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
   index: number;
   attachment: { file_id: string; filename: string };
+  signal?: AbortSignal;
 }) {
+  if (
+    !Number.isSafeInteger(input.expectedResetRevision) ||
+    input.expectedResetRevision < 0
+  ) {
+    throw new Error("知识库附件坐标不完整，请刷新后重新选择资料");
+  }
   // Staging is a replay-safe database append. Retry the same file id so a lost
   // response cannot force a second upload or a replacement at this index.
   const maxAttempts = 4;
   const maxRetryDelayMs = 10_000;
-  const requestBody = JSON.stringify(input);
+  const { signal, ...requestInput } = input;
+  const requestBody = JSON.stringify(requestInput);
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("上传已停止", "AbortError");
+      }
       const response = await fetch(
         "/api/knowledge-base/turn/attachments/stage",
         {
@@ -1180,6 +1519,7 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
             "Content-Type": "application/json",
           }),
           credentials: "include",
+          signal,
           body: requestBody,
         },
       );
@@ -1195,11 +1535,13 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
       const status = Number((error as { status?: unknown })?.status || 0);
       const code = String((error as { code?: unknown })?.code || "");
       const retryable =
-        !status ||
-        code === "IDEMPOTENCY_PENDING" ||
-        status === 425 ||
-        status === 429 ||
-        status >= 500;
+        !signal?.aborted &&
+        (!status ||
+          code === "IDEMPOTENCY_PENDING" ||
+          status === 408 ||
+          status === 425 ||
+          status === 429 ||
+          status >= 500);
       if (!retryable || attempt === maxAttempts - 1) throw error;
 
       const serverDelay = Number(
@@ -1213,7 +1555,11 @@ export async function stageKnowledgeBaseTurnAttachment(input: {
           Number.isFinite(serverDelay) && serverDelay >= 0 ? serverDelay : 0,
         ),
       );
-      await new Promise((resolve) => setTimeout(resolve, retryDelay));
+      await waitForKnowledgeBaseRequestRetry(
+        { retryAfterMs: retryDelay },
+        0,
+        signal,
+      );
     }
   }
   throw lastError;
@@ -1238,16 +1584,15 @@ export async function createKnowledgeBaseTurnTask(
       turnId: string;
       attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
     };
-    /**
-     * Rollout-only bridge for a durable browser reservation created by the
-     * former reserve-before-upload client. The ordered manifest identifies
-     * the original browser bytes; it is not an upload-completion probe.
-     */
-    legacyAttachmentTakeover?: {
-      attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
-    };
   },
 ): Promise<TaskResponse> {
+  if (
+    context.attachmentReservation &&
+    (!Number.isSafeInteger(context.expectedResetRevision) ||
+      Number(context.expectedResetRevision) < 0)
+  ) {
+    throw new Error("知识库附件坐标不完整，请刷新后重新选择资料");
+  }
   const controller = new AbortController();
   const timeoutId = window.setTimeout(
     () => controller.abort(),
@@ -1290,11 +1635,13 @@ export async function createKnowledgeBaseTurnTask(
         : context.attachmentReservation
           ? {
               turnId: context.attachmentReservation.turnId,
+              expectedResetRevision: context.expectedResetRevision,
               attachmentManifest:
                 context.attachmentReservation.attachmentManifest,
             }
           : {
               expectedGeneration: context.expectedGeneration,
+              expectedResetRevision: context.expectedResetRevision,
               expectedRevision: context.expectedRevision,
               expectedLeafId: context.expectedLeafId,
               expectedPresentationKey: context.expectedPresentationKey,
@@ -1303,13 +1650,6 @@ export async function createKnowledgeBaseTurnTask(
               attachments,
               ...(context.attachmentManifest
                 ? { attachmentManifest: context.attachmentManifest }
-                : {}),
-              ...(context.legacyAttachmentTakeover
-                ? {
-                    resumeLegacyAttachments: true,
-                    attachmentManifest:
-                      context.legacyAttachmentTakeover.attachmentManifest,
-                  }
                 : {}),
             }),
     });
@@ -1366,14 +1706,24 @@ export async function createKnowledgeBaseTurnTask(
         : undefined;
       const returnedTaskId = data?.id || data?.task_id || "";
       const taskId = returnedTaskId || observation?.authoritativeTaskId || "";
-      if (!observation && !data?.id && !data?.task_id) {
+      const acceptedLocalExecution =
+        payload?.accepted === true && payload?.execution === "local";
+      if (
+        !observation &&
+        !data?.id &&
+        !data?.task_id &&
+        !acceptedLocalExecution
+      ) {
         throw new Error("任务创建失败：未返回权威任务状态");
       }
       if (observation) dispatchKnowledgeBaseProgressUpdated(observation);
       return {
         ...data,
         id: taskId,
-        status: data.status === "failed" ? "error" : data.status || "running",
+        status:
+          data.status === "failed"
+            ? "error"
+            : data.status || (acceptedLocalExecution ? "completed" : "running"),
         metadata: {
           ...(data.metadata || {}),
           task_title:
@@ -2744,19 +3094,29 @@ function installFileUploadWatchdog(
   } = { totalBytes: 0 },
 ) {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
+  let timeoutCode:
+    | "UPLOAD_BROWSER_STALLED"
+    | "UPLOAD_SERVER_RESPONSE_TIMEOUT"
+    | undefined;
   let uploadComplete = false;
-  const arm = (waitMs: number) => {
+  let maximumLoadedBytes = 0;
+  const arm = (
+    waitMs: number,
+    code: "UPLOAD_BROWSER_STALLED" | "UPLOAD_SERVER_RESPONSE_TIMEOUT",
+  ) => {
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     timeoutId = setTimeout(() => {
-      timedOut = true;
+      timeoutCode = code;
       xhr.abort();
     }, waitMs);
   };
   const markUploadComplete = () => {
     if (uploadComplete) return;
     uploadComplete = true;
-    arm(FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS);
+    arm(
+      FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS,
+      "UPLOAD_SERVER_RESPONSE_TIMEOUT",
+    );
     if (onProgress) onProgress(100);
     input.onTransfer?.(input.totalBytes, input.totalBytes);
     input.onUploadComplete?.();
@@ -2764,11 +3124,15 @@ function installFileUploadWatchdog(
   xhr.upload.addEventListener("progress", (event) => {
     const transferComplete =
       event.lengthComputable && event.loaded >= event.total;
-    arm(
-      transferComplete
-        ? FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS
-        : FILE_UPLOAD_STALL_TIMEOUT_MS,
-    );
+    if (transferComplete) {
+      arm(
+        FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS,
+        "UPLOAD_SERVER_RESPONSE_TIMEOUT",
+      );
+    } else if (event.loaded > maximumLoadedBytes) {
+      maximumLoadedBytes = event.loaded;
+      arm(FILE_UPLOAD_STALL_TIMEOUT_MS, "UPLOAD_BROWSER_STALLED");
+    }
     if (event.lengthComputable) {
       if (onProgress) {
         onProgress(Math.round((event.loaded / event.total) * 100));
@@ -2779,13 +3143,13 @@ function installFileUploadWatchdog(
   });
   xhr.upload.addEventListener("load", markUploadComplete);
   return {
-    start: () => arm(FILE_UPLOAD_STALL_TIMEOUT_MS),
+    start: () => arm(FILE_UPLOAD_STALL_TIMEOUT_MS, "UPLOAD_BROWSER_STALLED"),
     markUploadComplete,
     clear: () => {
       if (timeoutId !== undefined) clearTimeout(timeoutId);
       timeoutId = undefined;
     },
-    timedOut: () => timedOut,
+    timeoutCode: () => timeoutCode,
   };
 }
 
@@ -2852,9 +3216,13 @@ export async function uploadFileToUrl(
     });
 
     xhr.addEventListener("abort", () => {
-      const timedOut = watchdog.timedOut();
+      const timeoutCode = watchdog.timeoutCode();
       cleanup();
-      reject(timedOut ? timedOutFileUploadError() : cancelledFileUploadError());
+      reject(
+        timeoutCode
+          ? timedOutFileUploadError(undefined, timeoutCode)
+          : cancelledFileUploadError(),
+      );
     });
 
     watchdog.start();
@@ -2965,11 +3333,11 @@ function uploadManagedIntentBody(input: {
       );
     });
     xhr.addEventListener("abort", () => {
-      const timedOut = watchdog.timedOut();
+      const timeoutCode = watchdog.timeoutCode();
       cleanup();
       reject(
-        timedOut
-          ? timedOutFileUploadError(errorIdentity)
+        timeoutCode
+          ? timedOutFileUploadError(errorIdentity, timeoutCode)
           : cancelledFileUploadError(errorIdentity),
       );
     });
@@ -3579,12 +3947,23 @@ function cancelledFileUploadError(
   });
 }
 
-function timedOutFileUploadError(identity?: FileUploadErrorIdentity) {
-  return new FileUploadError("文件上传长时间没有进度，请检查网络后重试", {
-    code: "UPLOAD_TIMEOUT",
-    ...fileUploadErrorIdentityFields(identity),
-    retryable: true,
-  });
+function timedOutFileUploadError(
+  identity?: FileUploadErrorIdentity,
+  code:
+    | "UPLOAD_BROWSER_STALLED"
+    | "UPLOAD_SERVER_RESPONSE_TIMEOUT"
+    | "UPLOAD_TIMEOUT" = "UPLOAD_TIMEOUT",
+) {
+  return new FileUploadError(
+    code === "UPLOAD_SERVER_RESPONSE_TIMEOUT"
+      ? "文件已传完，但 Dashboard 长时间没有完成确认，请重试"
+      : "文件上传长时间没有进度，请检查网络后重试",
+    {
+      code,
+      ...fileUploadErrorIdentityFields(identity),
+      retryable: true,
+    },
+  );
 }
 
 function waitForUploadRetry(
@@ -4079,11 +4458,11 @@ async function uploadFileToUrlViaProxy(
       );
     });
     xhr.addEventListener("abort", () => {
-      const timedOut = watchdog.timedOut();
+      const timeoutCode = watchdog.timeoutCode();
       cleanup();
       reject(
-        timedOut
-          ? timedOutFileUploadError(stageFileId)
+        timeoutCode
+          ? timedOutFileUploadError(stageFileId, timeoutCode)
           : cancelledFileUploadError(stageFileId),
       );
     });

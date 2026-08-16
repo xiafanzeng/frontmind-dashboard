@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   getDb: vi.fn(),
   readKnowledgeBuildArtifact: vi.fn(),
   readValidatedActiveKnowledgeBaseWorkingSet: vi.fn(),
+  resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle: vi.fn(),
   resolveKnowledgeBaseWorkingSetResource: vi.fn(),
 }));
 
@@ -38,12 +39,15 @@ vi.mock("./knowledge-base-materialized-assets", async (importOriginal) => {
     ...actual,
     readValidatedActiveKnowledgeBaseWorkingSet:
       mocks.readValidatedActiveKnowledgeBaseWorkingSet,
+    resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle:
+      mocks.resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle,
     resolveKnowledgeBaseWorkingSetResource:
       mocks.resolveKnowledgeBaseWorkingSetResource,
   };
 });
 
 import artifactRouter from "./knowledge-base-artifact-api";
+import { knowledgeBasePublicResourceHandle } from "./knowledge-base-public-resource";
 
 const servers: Server[] = [];
 
@@ -53,10 +57,9 @@ beforeEach(() => {
     select: () => ({
       from: () => {
         selectCount += 1;
-        if (selectCount === 1) {
-          return {
-            where: () => ({
-              limit: async () => [
+        const rows =
+          selectCount === 1
+            ? [
                 {
                   id: buildId,
                   userId: 42,
@@ -76,11 +79,15 @@ beforeEach(() => {
                   packageSizeBytes: invalidZip.length,
                   packageFilename: "knowledge-base.zip",
                 },
-              ],
-            }),
-          };
-        }
-        return { where: async () => [] };
+              ]
+            : [];
+        return {
+          where: () => ({
+            limit: async () => rows,
+            then: (resolve: (value: typeof rows) => unknown) =>
+              Promise.resolve(rows).then(resolve),
+          }),
+        };
       },
     }),
   });
@@ -94,6 +101,14 @@ beforeEach(() => {
     mimeType: "image/png",
     disposition: "inline",
   });
+  mocks.resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle
+    .mockReset()
+    .mockReturnValue({
+      bytes: Buffer.from("verified-working-set-image"),
+      filename: "private-product-name.png",
+      mimeType: "image/png",
+      disposition: "inline",
+    });
 });
 
 afterEach(async () => {
@@ -109,7 +124,7 @@ afterEach(async () => {
   );
 });
 
-async function startApp(path = "package") {
+async function startApp(path = "package", opaque = false) {
   const app = express();
   app.use((req: any, _res, next) => {
     req.frontmindUser = { id: 42, username: "knowledge-user", role: "user" };
@@ -120,7 +135,7 @@ async function startApp(path = "package") {
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as AddressInfo;
-  return `http://127.0.0.1:${address.port}/api/knowledge-base/artifacts/${buildId}/${path}`;
+  return `http://127.0.0.1:${address.port}/api/knowledge-base/artifacts/${opaque ? path : `${buildId}/${path}`}`;
 }
 
 describe("knowledge-base final package download", () => {
@@ -164,6 +179,35 @@ describe("knowledge-base final package download", () => {
         kind: "asset",
         assetId: "product-main",
         expectedSha256: "a".repeat(64),
+      }),
+    );
+  });
+
+  it("serves the current Working Set through an opaque URL without reflecting internal identity", async () => {
+    const handle = knowledgeBasePublicResourceHandle({
+      buildId,
+      kind: "working_set_asset",
+      internalIdentity: `1.1\0private-asset-id\0assets/private-product-name.png\0${"a".repeat(64)}`,
+    });
+    const response = await fetch(await startApp(`resources/${handle}`, true));
+
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(
+      Buffer.from("verified-working-set-image"),
+    );
+    expect(response.headers.get("etag")).toBeNull();
+    expect(response.headers.get("content-disposition")).toBe(
+      'inline; filename="knowledge-base-image.png"',
+    );
+    expect(response.url).not.toContain(buildId);
+    expect(response.url).not.toContain("private-asset-id");
+    expect(response.url).not.toContain("private-product-name.png");
+    expect(
+      mocks.resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        suppliedHandle: handle,
+        buildId,
       }),
     );
   });

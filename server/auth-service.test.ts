@@ -533,7 +533,7 @@ describe("API credential encryption", () => {
     expect(inserted[0]).toMatchObject({
       userId: 42,
       version: 4,
-      agentProfile: "frontmind-pro",
+      agentProfile: null,
       status: "deleted",
       validationStatus: "unverified",
     });

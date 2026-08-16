@@ -70,6 +70,84 @@ function dependencies(input?: {
 }
 
 describe("OwnedFileContentResolver v2 local authority", () => {
+  it("authorizes a managed local asset by owner and retainUntil without a Provider credential", async () => {
+    const bytes = Buffer.from("managed local asset");
+    const { deps } = dependencies({ stored: storedFile(bytes) });
+    deps.getManagedLocalAsset = vi.fn(async () => ({
+      id: `asset_${"a".repeat(30)}`,
+      retainUntil: new Date("2026-09-14T00:00:00Z"),
+    }));
+    const resolver = new OwnedFileContentResolver(deps);
+    const resolved = await resolver.resolve({
+      ownerUserId: 7,
+      fileId: `asset_${"a".repeat(30)}`,
+      expectedSourceKind: "managed_local_asset",
+      expectedSourceAuthorityId: `asset_${"a".repeat(30)}`,
+      now: Date.parse("2026-08-15T00:00:00Z"),
+    });
+
+    expect(resolved).toMatchObject({
+      sourceKind: "managed_local_asset",
+      sourceAuthorityId: `asset_${"a".repeat(30)}`,
+      credentialId: undefined,
+      expiresAt: Date.parse("2026-09-14T00:00:00Z"),
+    });
+    expect(deps.getCredential).not.toHaveBeenCalled();
+    expect(await readAll(resolved.stream)).toEqual(bytes);
+  });
+
+  it("rejects a managed local asset after its immutable retainUntil", async () => {
+    const localAssetId = `asset_${"b".repeat(30)}`;
+    const { deps } = dependencies({
+      stored: storedFile(Buffer.from("expired managed asset")),
+    });
+    deps.getManagedLocalAsset = vi.fn(async () => ({
+      id: localAssetId,
+      retainUntil: new Date("2026-08-14T00:00:00Z"),
+    }));
+
+    await expect(
+      new OwnedFileContentResolver(deps).resolve({
+        ownerUserId: 7,
+        fileId: localAssetId,
+        now: Date.parse("2026-08-15T00:00:00Z"),
+      }),
+    ).rejects.toMatchObject({
+      code: "SOURCE_EXPIRED",
+      statusCode: 410,
+      retryable: false,
+      recoveryAction: "reupload",
+      expiresAt: Date.parse("2026-08-14T00:00:00Z"),
+    });
+    expect(deps.getCredential).not.toHaveBeenCalled();
+    expect(deps.readStoredFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["belongs to another owner", `asset_${"c".repeat(30)}`],
+    ["is absent from local_assets", `asset_${"d".repeat(30)}`],
+  ])("fails closed when a managed local asset %s", async (_label, fileId) => {
+    const { deps } = dependencies({
+      stored: storedFile(Buffer.from("unreachable bytes")),
+    });
+    deps.getManagedLocalAsset = vi.fn(async () => null);
+
+    await expect(
+      new OwnedFileContentResolver(deps).resolve({
+        ownerUserId: 7,
+        fileId,
+        now: Date.parse("2026-08-15T00:00:00Z"),
+      }),
+    ).rejects.toMatchObject({
+      code: "SOURCE_FORBIDDEN",
+      statusCode: 403,
+      retryable: false,
+      recoveryAction: "contact_admin",
+    });
+    expect(deps.getCredential).not.toHaveBeenCalled();
+    expect(deps.readStoredFile).not.toHaveBeenCalled();
+  });
+
   it("serves a size/SHA verified local copy without Provider access", async () => {
     const bytes = Buffer.from("durable local copy");
     const { deps, request } = dependencies({ stored: storedFile(bytes) });
@@ -81,7 +159,12 @@ describe("OwnedFileContentResolver v2 local authority", () => {
       now: Date.parse("2026-08-04T00:00:00Z"),
     });
 
-    expect(resolved.source).toBe("local");
+    expect(resolved).toMatchObject({
+      source: "local",
+      sourceKind: "provider_file",
+      sourceAuthorityId: "credential-1",
+      credentialId: "credential-1",
+    });
     expect(await readAll(resolved.stream)).toEqual(bytes);
     expect(request).not.toHaveBeenCalled();
   });

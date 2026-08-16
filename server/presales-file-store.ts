@@ -78,6 +78,8 @@ export type PresalesFileCreateReservationResult =
 // cannot retire a reservation while its HTTP request can still succeed.
 const FILE_CREATE_RESERVATION_LEASE_MS = 3 * 60_000;
 const FILE_CREATE_LOCK_STALE_MS = 30_000;
+const FILE_MUTATION_LOCK_STALE_MS = 2 * 60_000;
+const FILE_MUTATION_LOCK_WAIT_MS = 60_000;
 const DEFAULT_STALE_UPLOAD_TEMP_MS = 6 * 60 * 60 * 1_000;
 const DEFAULT_STALE_MANIFEST_TEMP_MS = 6 * 60 * 60 * 1_000;
 const DEFAULT_STORAGE_SWEEP_BATCH_SIZE = 200;
@@ -264,6 +266,14 @@ function reservationRoot() {
   return path.join(storageRoot(), "create-reservations");
 }
 
+function fileMutationLockPaths(fileId: string) {
+  const root = path.join(storageRoot(), "mutation-locks");
+  return {
+    root,
+    lock: path.join(root, `${storageKey(fileId)}.lock`),
+  };
+}
+
 function reservationPaths(keyHash: string) {
   const root = reservationRoot();
   return {
@@ -389,6 +399,65 @@ async function withReservationLock<T>(
     }
   }
   throw new Error("PRESALES_FILE_RESERVATION_LOCKED");
+}
+
+/**
+ * Serializes the short final-file/ownership-row commit across application
+ * processes which share the durable asset volume. Upload bodies are staged
+ * before this lock is taken, so a slow client never monopolizes it.
+ */
+export async function withStoredPresalesFileMutationLock<T>(
+  fileId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const { root, lock } = fileMutationLockPaths(fileId);
+  await ensurePrivateDirectory(root);
+  const deadline = Date.now() + FILE_MUTATION_LOCK_WAIT_MS;
+  let acquiredNonce: string | null = null;
+
+  while (Date.now() < deadline) {
+    const nonce = randomUUID();
+    try {
+      const handle = await fs.open(lock, "wx", 0o600);
+      try {
+        await handle.writeFile(`${nonce}\n`, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      acquiredNonce = nonce;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stats = await fs.stat(lock).catch(() => null);
+      if (stats && Date.now() - stats.mtimeMs > FILE_MUTATION_LOCK_STALE_MS) {
+        // Rename, rather than unlink, so an old owner's nonce-aware release
+        // cannot remove a newly acquired lock at the original path.
+        const stale = path.join(
+          root,
+          `${path.basename(lock)}.${randomUUID()}.stale`,
+        );
+        await fs.rename(lock, stale).catch((renameError) => {
+          if ((renameError as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw renameError;
+          }
+        });
+        await fs.rm(stale, { force: true }).catch(() => undefined);
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!acquiredNonce) throw new Error("PRESALES_FILE_MUTATION_LOCKED");
+  try {
+    return await operation();
+  } finally {
+    const owner = await fs.readFile(lock, "utf8").catch(() => null);
+    if (owner?.trim() === acquiredNonce) {
+      await fs.rm(lock, { force: true }).catch(() => undefined);
+      await fsyncPresalesDirectory(root).catch(() => undefined);
+    }
+  }
 }
 
 function completedReservationResult(
@@ -1267,16 +1336,19 @@ export async function stagePresalesFileContent(input: {
   fileId: string;
   stream: Readable;
   maxBytes: number;
+  onProgress?: (receivedBytes: number) => void;
 }): Promise<StagedPresalesFile> {
   const incremental = await createIncrementalPresalesFileStage({
     fileId: input.fileId,
     maxBytes: input.maxBytes,
   });
+  let receivedBytes = 0;
   try {
     for await (const chunk of input.stream) {
-      await incremental.append(
-        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
-      );
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      await incremental.append(bytes);
+      receivedBytes += bytes.length;
+      input.onProgress?.(receivedBytes);
     }
     return await incremental.finalize();
   } catch (error) {

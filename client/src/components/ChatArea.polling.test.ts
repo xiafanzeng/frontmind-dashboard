@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   KNOWLEDGE_BASE_FOUNDATION_COPY,
   knowledgeBaseExplicitRecoveryRequest,
+  knowledgeBaseNoticeHasRecoveryAction,
   knowledgeBaseNoticeRecoveryMode,
   knowledgeBaseNoticeRequiresAttachmentRepair,
   knowledgeBaseNoticeRequiresLogoProvenanceRepair,
@@ -11,6 +12,7 @@ import {
   knowledgeBaseReconcileResultIsStopped,
   knowledgeBaseReconcileResultRequiresConfirmation,
   knowledgeBaseSameTurnRecoveryAccepted,
+  isKnowledgeBaseTaskVisiblyRunning,
   readKnowledgeBaseStartRequestError,
   recoverKnowledgeBaseNotice,
   runningAssistantStatusText,
@@ -18,6 +20,7 @@ import {
   shouldRenderKnowledgeBaseNotice,
   shouldRecoverKnowledgeBaseStartFailure,
 } from "./ChatArea";
+import { requestKnowledgeBaseReset } from "@/lib/knowledge-progress";
 
 describe("chat message viewport", () => {
   it("scrolls only the message viewport instead of every scrollable ancestor", () => {
@@ -49,6 +52,30 @@ describe("knowledge-base starter", () => {
     expect(runningAssistantStatusText(false)).toBe("FrontMind AI 正在处理...");
   });
 
+  it("stops the typing indicator and elapsed clock on an authoritative error", () => {
+    expect(
+      isKnowledgeBaseTaskVisiblyRunning({
+        status: "running",
+        syncKnowledgeBaseSnapshot: true,
+        interactionState: "failed",
+      }),
+    ).toBe(false);
+    expect(
+      isKnowledgeBaseTaskVisiblyRunning({
+        status: "pending",
+        syncKnowledgeBaseSnapshot: true,
+        noticeSeverity: "error",
+      }),
+    ).toBe(false);
+    expect(
+      isKnowledgeBaseTaskVisiblyRunning({
+        status: "running",
+        syncKnowledgeBaseSnapshot: false,
+        noticeSeverity: "error",
+      }),
+    ).toBe(true);
+  });
+
   it("uses the durable reservation fact instead of treating every 5xx as accepted", () => {
     expect(
       shouldRecoverKnowledgeBaseStartFailure(true, {
@@ -61,7 +88,7 @@ describe("knowledge-base starter", () => {
         status: 409,
         reservationCreated: true,
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       shouldRecoverKnowledgeBaseStartFailure(true, {
         status: 503,
@@ -132,12 +159,17 @@ describe("knowledge-base notice recovery", () => {
     expectedLeafId: null,
   };
 
-  it("keeps the legacy attachment unlock notice internal while rendering real failures", () => {
+  it("renders an old attachment notice as reset-only instead of managed recovery", () => {
     expect(
       shouldRenderKnowledgeBaseNotice({
         code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
       }),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      knowledgeBaseNoticeRecoveryMode({
+        code: "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
+      }),
+    ).toBe("reset");
     expect(
       shouldRenderKnowledgeBaseNotice({ code: "PROGRESS_PROTOCOL_INVALID" }),
     ).toBe(true);
@@ -353,6 +385,24 @@ describe("knowledge-base notice recovery", () => {
         recoveryToken: "a".repeat(64),
       }),
     ).toBe("none");
+  });
+
+  it("routes a rejected materialized result to the reset approval UI", () => {
+    const notice = {
+      code: "FRONTMIND_KB_RESET_REQUIRED",
+      recoveryAction: "approve_reset" as const,
+      canRegenerate: false,
+    };
+    const requested = vi.fn();
+    window.addEventListener("frontmind:request-knowledge-reset", requested, {
+      once: true,
+    });
+
+    expect(knowledgeBaseNoticeRecoveryMode(notice)).toBe("reset");
+    expect(knowledgeBaseNoticeRetryLabel(notice)).toBe("申请重置知识库");
+    expect(knowledgeBaseNoticeHasRecoveryAction(notice)).toBe(true);
+    requestKnowledgeBaseReset();
+    expect(requested).toHaveBeenCalledOnce();
   });
 
   it("reuses one client request id for double-click and response-loss replay", () => {

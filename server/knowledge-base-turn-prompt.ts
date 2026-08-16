@@ -13,6 +13,7 @@ import {
   KNOWLEDGE_BASE_PROTOCOL_V4_SCHEMA_VERSION,
 } from "./knowledge-base-progress";
 import { KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME } from "./knowledge-base-skill-runtime";
+import { KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_SENTENCE } from "./knowledge-base-materialized-completion-contract";
 import { assertUpstreamPromptBudget } from "./upstream-prompt-budget";
 
 export async function buildKnowledgeBaseTurnPrompt(input: {
@@ -115,6 +116,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         `完整读取附件 ${base.filename}；它是本轮唯一权威完整 Working Set。`,
         "只允许修改目标节点正文、该节点证据和该节点资产；禁止修改知识树、顺序、其他节点或确认状态。",
         "最终只返回一个助手 Patch ZIP 附件；不得返回 Markdown 正文、进度信封、Structured Output、第二个文件或等待用户确认。",
+        `附带唯一且已验证的 Patch ZIP 后，最终回复正文只能逐字输出“${KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_SENTENCE}”；发送该附件与固定短句后必须立即结束当前任务，不得再调用工具、更新计划、补充正文、询问确认、等待或发送第二个附件。Dashboard 只消费 ZIP，不消费该短句。`,
         `operationId=${operationId}`,
         `buildId=${base.buildId}`,
         `generation=${base.generation}`,
@@ -124,7 +126,7 @@ export async function buildKnowledgeBaseTurnPrompt(input: {
         `用户修改要求=${input.userMessage.trim() || "仅根据本轮附件修订"}`,
         `customerAttachments=${JSON.stringify(input.attachments.map((item) => item.filename))}`,
         `ZIP 文件名必须为 frontmind-kb-patch-${operationId}.zip，根目录必须含 PATCH.json。`,
-        `运行 python3 scripts/validate_working_set.py frontmind-kb-patch-${operationId}.zip；只有输出 VALID frontmind.kb-node-patch.v1 后才能把同一 ZIP 作为唯一附件返回。`,
+        `运行 python3 scripts/validate_working_set.py --expected-operation-id ${operationId} --expected-build-id ${base.buildId} --expected-generation ${base.generation} --expected-base-content-version ${base.contentVersion} --expected-base-working-set-sha256 ${base.packageSha256} --expected-target-leaf-id ${current.id} frontmind-kb-patch-${operationId}.zip；只有输出 VALID frontmind.kb-node-patch.v1 后才能把同一 ZIP 作为唯一附件返回。`,
       ].join("\n"),
     );
   }

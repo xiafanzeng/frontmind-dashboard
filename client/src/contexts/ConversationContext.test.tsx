@@ -5,6 +5,7 @@ import { knowledgeBaseUserMessagePublicId } from "@shared/knowledge-base-message
 import {
   ConversationProvider,
   applyKnowledgeBaseObservation,
+  conversationSyncErrorMessage,
   currentKnowledgeBaseReplySnapshot,
   mergeKnowledgeBaseHydration,
   mergeServerOwnedKnowledgeBaseMessages,
@@ -15,6 +16,17 @@ import {
   useConversation,
   type Conversation,
 } from "./ConversationContext";
+
+describe("conversation sync errors", () => {
+  it("localizes transient browser fetch failures without changing business errors", () => {
+    expect(conversationSyncErrorMessage(new TypeError("Failed to fetch"))).toBe(
+      "会话同步暂时中断，连接恢复后将自动重试。",
+    );
+    expect(conversationSyncErrorMessage(new Error("保存被拒绝"))).toBe(
+      "保存被拒绝",
+    );
+  });
+});
 
 describe("knowledge-base attachment payload reconciliation", () => {
   function pendingUserMessage(input: {
@@ -869,6 +881,43 @@ describe("ConversationProvider cloud hydration", () => {
     });
 
     expect(result.current.state.conversations).toEqual([]);
+  });
+
+  it("retires two inactive blank KB conversations, preserves ordinary chat, and creates one fresh KB", async () => {
+    const blankKbOne = {
+      ...conversation("kb-old-1"),
+      title: "企业知识库构建",
+    };
+    const blankKbTwo = {
+      ...conversation("kb-old-2"),
+      title: "企业知识库构建",
+    };
+    const ordinary = conversation("ordinary-chat");
+    mocks.listRefetch.mockResolvedValueOnce({
+      data: [blankKbOne, ordinary, blankKbTwo],
+    });
+    const { result } = renderHook(() => useConversation(), { wrapper });
+    await waitFor(() => expect(result.current.hydrated).toBe(true));
+
+    let freshConversationId = "";
+    act(() => {
+      result.current.discardKnowledgeBaseConversationsLocally();
+      freshConversationId = result.current.createConversation({
+        title: "企业知识库构建",
+        reuseEmpty: false,
+      });
+    });
+
+    expect(
+      result.current.state.conversations.map((candidate) => candidate.id),
+    ).toEqual([freshConversationId, "ordinary-chat"]);
+    expect(
+      result.current.state.conversations.filter(
+        (candidate) => candidate.title === "企业知识库构建",
+      ),
+    ).toHaveLength(1);
+    expect(result.current.isKnowledgeBaseConversation("kb-old-1")).toBe(false);
+    expect(result.current.isKnowledgeBaseConversation("kb-old-2")).toBe(false);
   });
 
   it("atomically settles an unaccepted KB start without leaving task identity", async () => {

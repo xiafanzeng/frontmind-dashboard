@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { and, eq } from "drizzle-orm";
 
+import { localAssets } from "../drizzle/schema";
 import { getCredentialForUpstreamResource } from "./auth-service";
+import { getDb } from "./db";
 import {
   readStoredPresalesFile,
   removeStoredPresalesFile,
@@ -10,7 +13,7 @@ import {
 } from "./presales-file-store";
 import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
 
-export const OWNED_FILE_CONTENT_RESOLVER_VERSION = 2;
+export const OWNED_FILE_CONTENT_RESOLVER_VERSION = 3;
 
 export type FileContentRecoveryAction = "retry" | "reupload" | "contact_admin";
 
@@ -69,6 +72,13 @@ export type OwnedFileContentResolverDependencies = {
   ) => Promise<OwnedResourceCredential | null>;
   readStoredFile: (fileId: string) => Promise<StoredPresalesFile | null>;
   removeStoredFile: (fileId: string) => Promise<void>;
+  getManagedLocalAsset?: (
+    ownerUserId: number,
+    fileId: string,
+  ) => Promise<{
+    id: string;
+    retainUntil: Date | string | number | null;
+  } | null>;
   /** @deprecated v2 keeps this only for source compatibility; never called. */
   stageStoredFile?: (input: {
     fileId: string;
@@ -93,19 +103,25 @@ export type OwnedFileAccessInput = {
   fileId: string;
   projectAssignmentId?: string | null;
   expectedCredentialId?: string;
+  expectedSourceKind?: "managed_local_asset" | "provider_file";
+  expectedSourceAuthorityId?: string;
   now?: number;
 };
 
 export type OwnedFileAuthorization = {
-  credentialId: string;
-  apiKey: string;
+  credentialId?: string;
+  apiKey?: string;
+  sourceKind: "managed_local_asset" | "provider_file";
+  sourceAuthorityId: string;
   expiresAt?: number;
   isTaskBoundAssistantOutput: boolean;
 };
 
 export type ResolvedOwnedFileContent = {
   fileId: string;
-  credentialId: string;
+  credentialId?: string;
+  sourceKind: "managed_local_asset" | "provider_file";
+  sourceAuthorityId: string;
   source: "local" | "upstream";
   filename: string;
   mimeType: string;
@@ -136,6 +152,26 @@ function cleanFilename(value: unknown, fallback: string) {
     .replace(/[\\/\0\r\n"]/g, "_")
     .trim();
   return filename || fallback;
+}
+
+async function getManagedLocalAsset(ownerUserId: number, fileId: string) {
+  const db = await getDb();
+  if (!db) return null;
+  return (
+    (
+      await db
+        .select({ id: localAssets.id, retainUntil: localAssets.retainUntil })
+        .from(localAssets)
+        .where(
+          and(
+            eq(localAssets.id, fileId),
+            eq(localAssets.scope, "managed_user"),
+            eq(localAssets.accountUserId, ownerUserId),
+          ),
+        )
+        .limit(1)
+    )[0] ?? null
+  );
 }
 
 async function validateStoredFile(stored: StoredPresalesFile) {
@@ -181,6 +217,7 @@ export class OwnedFileContentResolver {
         ),
       readStoredFile: readStoredPresalesFile,
       removeStoredFile: removeStoredPresalesFile,
+      getManagedLocalAsset,
     },
   ) {}
 
@@ -201,6 +238,49 @@ export class OwnedFileContentResolver {
         },
       );
     }
+    if (fileId.startsWith("asset_")) {
+      const localAsset = await this.dependencies.getManagedLocalAsset?.(
+        input.ownerUserId,
+        fileId,
+      );
+      if (
+        !localAsset ||
+        (input.expectedSourceKind &&
+          input.expectedSourceKind !== "managed_local_asset") ||
+        (input.expectedSourceAuthorityId &&
+          input.expectedSourceAuthorityId !== localAsset.id)
+      ) {
+        throw new OwnedFileContentError(
+          "SOURCE_FORBIDDEN",
+          "文件不属于当前账号或客户项目，请联系管理员",
+          {
+            statusCode: 403,
+            retryable: false,
+            recoveryAction: "contact_admin",
+          },
+        );
+      }
+      const expiresAt = timestampMillis(localAsset.retainUntil);
+      const now = input.now ?? Date.now();
+      if (expiresAt === undefined || expiresAt <= now) {
+        throw new OwnedFileContentError(
+          "SOURCE_EXPIRED",
+          "文件已超过 30 天，请重新上传",
+          {
+            statusCode: 410,
+            retryable: false,
+            recoveryAction: "reupload",
+            expiresAt,
+          },
+        );
+      }
+      return {
+        sourceKind: "managed_local_asset" as const,
+        sourceAuthorityId: localAsset.id,
+        expiresAt,
+        isTaskBoundAssistantOutput: false,
+      };
+    }
     const credential = await this.dependencies.getCredential(
       input.ownerUserId,
       "file",
@@ -209,6 +289,10 @@ export class OwnedFileContentResolver {
     );
     if (
       !credential ||
+      (input.expectedSourceKind &&
+        input.expectedSourceKind !== "provider_file") ||
+      (input.expectedSourceAuthorityId &&
+        input.expectedSourceAuthorityId !== credential.id) ||
       (input.expectedCredentialId &&
         credential.id !== input.expectedCredentialId)
     ) {
@@ -258,6 +342,8 @@ export class OwnedFileContentResolver {
     return {
       credentialId: credential.id,
       apiKey: credential.apiKey,
+      sourceKind: "provider_file" as const,
+      sourceAuthorityId: credential.id,
       expiresAt,
       isTaskBoundAssistantOutput,
     };
@@ -276,6 +362,8 @@ export class OwnedFileContentResolver {
         return {
           fileId,
           credentialId: authorization.credentialId,
+          sourceKind: authorization.sourceKind,
+          sourceAuthorityId: authorization.sourceAuthorityId,
           source: "local",
           filename: cleanFilename(stored.filename, fileId),
           mimeType: stored.mimeType || "application/octet-stream",

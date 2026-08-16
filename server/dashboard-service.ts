@@ -26,6 +26,7 @@ import {
   knowledgeBasePackageWriterTaskId,
   knowledgeBasePublicationBindingHash,
 } from "./knowledge-base-publication-binding";
+import { isMaterializedBuildPublishable } from "./knowledge-base-materialized-quality";
 import {
   effectiveKnowledgeArchiveCharacterCount,
   knowledgeArchiveFormalText,
@@ -942,16 +943,33 @@ export function toKnowledgeSnapshotPublicJson<
     createdAt: Date;
   },
 >(snapshot: T, archiveAvailable: boolean) {
+  const publicAssetIds = new Map<string, string>();
+  snapshot.assets.forEach((asset, index) => {
+    const internalId = String(asset.id || "").trim();
+    if (internalId && !publicAssetIds.has(internalId)) {
+      publicAssetIds.set(internalId, `public-asset-${index + 1}`);
+    }
+  });
   return {
     id: snapshot.id,
     version: snapshot.version,
     sourceFileName: customerSafeKnowledgeFilename(snapshot.sourceFileName),
     archiveHash: snapshot.archiveHash,
-    documents: snapshot.documents.map((document) =>
-      toCustomerSafeKnowledgeDocument(
+    documents: snapshot.documents.map((document) => {
+      const projected = toCustomerSafeKnowledgeDocument(
         document as unknown as Record<string, unknown>,
-      ),
-    ) as KnowledgeDocumentRecord[],
+      ) as unknown as KnowledgeDocumentRecord;
+      return {
+        ...projected,
+        ...(Array.isArray(document.assetIds)
+          ? {
+              assetIds: document.assetIds
+                .map((assetId) => publicAssetIds.get(String(assetId).trim()))
+                .filter((assetId): assetId is string => Boolean(assetId)),
+            }
+          : {}),
+      };
+    }) as KnowledgeDocumentRecord[],
     documentCount: snapshot.documentCount,
     imageCount: snapshot.imageCount,
     characterCount: snapshot.characterCount,
@@ -1195,6 +1213,15 @@ export async function createKnowledgeSnapshot(input: {
           id: knowledgeBaseBuilds.id,
           generation: knowledgeBaseBuilds.generation,
           executionMode: knowledgeBaseBuilds.executionMode,
+          providerProtocol: knowledgeBaseBuilds.providerProtocol,
+          skillVersion: knowledgeBaseBuilds.skillVersion,
+          skillContentHash: knowledgeBaseBuilds.skillContentHash,
+          activeWorkingSetId: knowledgeBaseBuilds.activeWorkingSetId,
+          contentVersion: knowledgeBaseBuilds.contentVersion,
+          treePolicyVersion: knowledgeBaseBuilds.treePolicyVersion,
+          totalNodeCount: knowledgeBaseBuilds.totalNodeCount,
+          initialResearchCoverage: knowledgeBaseBuilds.initialResearchCoverage,
+          handoffProvenance: knowledgeBaseBuilds.handoffProvenance,
           status: knowledgeBaseBuilds.status,
           revision: knowledgeBaseBuilds.revision,
           upstreamTaskId: knowledgeBaseBuilds.upstreamTaskId,
@@ -1219,6 +1246,14 @@ export async function createKnowledgeSnapshot(input: {
           builds[0]?.status === "published"
             ? "当前知识库已同步，请先在构建流程中补充内容"
             : "知识库尚未完成全部节点确认",
+        );
+      }
+      if (
+        builds[0].executionMode === "materialized_bundle_v1" &&
+        !isMaterializedBuildPublishable(builds[0])
+      ) {
+        throw new Error(
+          "知识库内容或研究覆盖不完整；当前内容可以查看，但不能发布，请批准重置后重跑",
         );
       }
       if (
@@ -1926,11 +1961,7 @@ export function projectManagedAgentUsageRows(
   const expectedTaskIdsByCredential = new Map<string, Set<string>>();
   const ownerByTask = new Map<string, number>();
   const unsettledCredentialIds = new Set<string>();
-  const terminalStates = new Set([
-    "succeeded",
-    "failed",
-    "cancelled",
-  ]);
+  const terminalStates = new Set(["succeeded", "failed", "cancelled"]);
   for (const row of rows) {
     const taskId = row.providerTaskId?.trim();
     if (taskId) {
@@ -2454,6 +2485,7 @@ export async function getSharedKeyMonthlyCreditUsageForAccounts(input: {
     fingerprint: input.poolFingerprint ?? credentials[0]?.fingerprint ?? null,
     period,
     complete: authoritativePoolUsage.complete,
+    issueCode: authoritativePoolUsage.issueCode,
     attributionComplete,
   };
 }

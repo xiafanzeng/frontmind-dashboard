@@ -79,6 +79,8 @@ export type KnowledgeBaseFailureClass =
 
 export const knowledgeBaseRecoveryActions = [
   "wait",
+  /** The same Provider task is paused until the customer confirms or inputs. */
+  "awaiting_input",
   "reconcile",
   /** Provider-neutral explicit recovery actions backed by a server token. */
   "retry_request",
@@ -98,6 +100,34 @@ export const knowledgeBaseRecoveryActions = [
 
 export type KnowledgeBaseRecoveryAction =
   (typeof knowledgeBaseRecoveryActions)[number];
+
+/**
+ * A terminal Manus task whose materialized archive cannot become a trusted
+ * Dashboard Working Set. These codes are deliberately stable and contain no
+ * provider coordinate or validation detail.
+ */
+export const knowledgeBaseMaterializedResultFailureCodes = [
+  "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+  "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+  "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+] as const;
+
+export type KnowledgeBaseMaterializedResultFailureCode =
+  (typeof knowledgeBaseMaterializedResultFailureCodes)[number];
+
+export function isKnowledgeBaseMaterializedResultFailureCode(
+  value: unknown,
+): value is KnowledgeBaseMaterializedResultFailureCode {
+  return (
+    typeof value === "string" &&
+    knowledgeBaseMaterializedResultFailureCodes.includes(
+      value as KnowledgeBaseMaterializedResultFailureCode,
+    )
+  );
+}
+
+export const KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE =
+  "Manus 已完成，但返回的知识库文件未通过完整性校验。系统不会自动重试；请申请重置后重新上传资料。";
 
 export const knowledgeBaseNoticeSeverities = [
   "info",
@@ -135,6 +165,8 @@ export interface KnowledgeBaseProgressLeafDto {
   branchTitle: string;
   ordinal: number;
   status: KnowledgeBaseLeafStatus;
+  /** Present only for a server-approved display-only partial materialization. */
+  contentMarkdown?: string;
 }
 
 export interface KnowledgeBaseProgressBranchDto {
@@ -186,6 +218,30 @@ export interface KnowledgeBaseResearchSummaryDto {
   stopReason: "coverage_complete" | "source_limited" | "budget_reached";
 }
 
+export type KnowledgeBaseResultQualityWarningCode =
+  | "RESULT_INCOMPLETE"
+  | "ITEM_DROPPED"
+  | "EVIDENCE_INCOMPLETE"
+  | "AGGREGATE_UNAVAILABLE"
+  | "OPTIONAL_ASSET_SKIPPED"
+  | "PRESENTATION_NORMALIZED"
+  | "COVERAGE_INCOMPLETE";
+
+export interface KnowledgeBaseResultQualityDto {
+  completeness: "complete" | "partial";
+  stats?: {
+    acceptedCount: number;
+    expectedCount?: number;
+    droppedCount: number;
+  };
+  warnings?: Array<{
+    code: KnowledgeBaseResultQualityWarningCode;
+    area?: string;
+  }>;
+  downstreamEligible?: boolean;
+  publishable?: boolean;
+}
+
 export interface KnowledgeBaseProgressDto {
   build: {
     id: string;
@@ -210,6 +266,8 @@ export interface KnowledgeBaseProgressDto {
   };
   summary: KnowledgeBaseProgressSummaryDto;
   branches: KnowledgeBaseProgressBranchDto[];
+  /** Server-computed content quality; omitted for historical read-only builds. */
+  resultQuality?: KnowledgeBaseResultQualityDto;
   packageAllowed: boolean;
   /** Additive package phase; older projections may omit it. */
   packageState?: KnowledgeBasePackageState;
@@ -261,7 +319,11 @@ export interface KnowledgeBaseActiveTurnDto {
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
   canRegenerate?: boolean;
-  /** True only while the logical turn exists but browser files are not frozen. */
+  /** Reset fence frozen when this browser-backed turn was reserved. */
+  resetRevision?: number;
+  /** True while this turn is still waiting for one or more browser Files. */
+  awaitingClientAttachments?: boolean;
+  /** True while the logical turn still awaits one or more browser-backed files. */
   requiresAttachmentReselection?: boolean;
   stagedAttachmentCount?: number;
   expectedAttachmentCount?: number;
@@ -282,18 +344,14 @@ export interface KnowledgeBaseCompletedTurnDto {
 
 /** A server-owned resource that is safe for the customer UI to render. */
 export interface KnowledgeBaseApprovedResourceDto {
-  kind:
-    | "logo"
-    | "customer_upload"
-    | "working_set_asset"
-    | "working_set_evidence";
-  outputItemId: string | null;
-  fileId: string | null;
-  sameOriginUrl: string;
-  filename: string;
+  /** Opaque content handle; never an internal asset/file identifier. */
+  id: string;
+  kind: "logo" | "customer_upload" | "working_set_asset";
+  caption: string;
   mimeType: string;
-  sha256: string;
-  sizeBytes: number;
+  sizeBytes?: number;
+  /** Authenticated same-origin URL containing only an opaque HMAC handle. */
+  sameOriginUrl: string;
 }
 
 /**
@@ -357,7 +415,7 @@ export interface KnowledgeBaseNoticeDto {
   /** Opaque, same-account recovery capability bound to the current state. */
   recoveryToken?: string | null;
   canRegenerate?: boolean;
-  /** Safe correlation id; never a provider id or credential-bearing value. */
+  /** Internal correlation only; the final customer projection removes it. */
   traceId?: string | null;
   /** Total frozen attachment count relevant to this notice. */
   attachmentCount?: number;

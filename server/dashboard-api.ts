@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import axios from "axios";
+import axios, { type AxiosResponse } from "axios";
 import { and, eq, inArray } from "drizzle-orm";
 import ExcelJS from "exceljs";
 import express from "express";
@@ -52,6 +52,7 @@ import { safeErrorForLog } from "./_core/sensitive-data";
 import { parseUploadedJsonWithRepair } from "./model-output-repair";
 import {
   assertSafeExternalUrl,
+  ExternalUrlRejectedError,
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
 import {
@@ -79,6 +80,7 @@ import {
   knowledgeArchiveFileIdFromUrl,
   type KnowledgeArchiveDescriptor,
 } from "./knowledge-base-artifact";
+import { KnowledgeArchiveDownloadError } from "./knowledge-archive-download-error";
 import { assertKnowledgeBasePublishable } from "./knowledge-base-progress-service";
 import { knowledgeBaseTreePolicy } from "./knowledge-base-progress";
 import { assertKnowledgeBaseWritable } from "./knowledge-base-reset-service";
@@ -179,6 +181,10 @@ import {
 } from "./knowledge-archive-text-utils";
 
 export { validateProgressReportScreenshot } from "./knowledge-archive-image-validation";
+export {
+  KnowledgeArchiveDownloadError,
+  type KnowledgeArchiveDownloadErrorKind,
+} from "./knowledge-archive-download-error";
 
 const router = express.Router();
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -6469,10 +6475,76 @@ export function dashboardKnowledgePublishErrorForLog(
   return safeErrorForLog(error, { secrets });
 }
 
+function knowledgeArchiveDownloadFailureCode(error: unknown) {
+  const code = String(
+    (error as { code?: unknown } | null)?.code || "",
+  ).toUpperCase();
+  if (code) return code;
+  const message = String(
+    (error as { message?: unknown } | null)?.message || "",
+  ).toUpperCase();
+  return /^[A-Z0-9_]{1,100}$/u.test(message) ? message : "";
+}
+
+function isKnowledgeArchiveUnsafeUrlFailure(error: unknown) {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof ExternalUrlRejectedError) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function knowledgeArchiveTransportFailure(
+  error: unknown,
+  abortedForStall = false,
+) {
+  if (isKnowledgeArchiveUnsafeUrlFailure(error)) {
+    return new KnowledgeArchiveDownloadError(
+      "unsafe_url",
+      "知识库 ZIP 下载地址不安全",
+    );
+  }
+  const code = knowledgeArchiveDownloadFailureCode(error);
+  if (
+    abortedForStall ||
+    code === "ECONNABORTED" ||
+    code === "ETIMEDOUT" ||
+    code === "ESOCKETTIMEDOUT"
+  ) {
+    return new KnowledgeArchiveDownloadError("timeout", "知识库 ZIP 下载超时");
+  }
+  return new KnowledgeArchiveDownloadError(
+    "transport",
+    "知识库 ZIP 下载连接失败",
+  );
+}
+
+function knowledgeArchiveLocalReadFailure(error: unknown) {
+  const code = knowledgeArchiveDownloadFailureCode(error);
+  if (code === "LOCAL_FILE_CONTENT_SIZE_MISMATCH") {
+    return new KnowledgeArchiveDownloadError(
+      "local_size_mismatch",
+      "知识库 ZIP 本地持久副本不完整",
+    );
+  }
+  if (
+    code === "LOCAL_FILE_CONTENT_INVALID" ||
+    code === "PRESALES_FILE_RETENTION_INVALID"
+  ) {
+    return new KnowledgeArchiveDownloadError(
+      "local_copy_invalid",
+      "知识库 ZIP 本地持久副本无效",
+    );
+  }
+  return knowledgeArchiveTransportFailure(error);
+}
+
 export async function downloadArchiveBytes(input: {
   descriptor: KnowledgeArchiveDescriptor;
   apiKey: string;
   baseUrl: string;
+  allowProviderFileIdFallback?: boolean;
 }) {
   let filename = input.descriptor.filename;
   let downloadUrl: string | undefined;
@@ -6484,30 +6556,52 @@ export async function downloadArchiveBytes(input: {
       : undefined);
 
   if (fileId) {
-    const stored = await readStoredPresalesFile(fileId);
+    let stored: Awaited<ReturnType<typeof readStoredPresalesFile>>;
+    try {
+      stored = await readStoredPresalesFile(fileId);
+    } catch (error) {
+      throw knowledgeArchiveLocalReadFailure(error);
+    }
     if (stored) {
       if (stored.sizeBytes > MAX_ARCHIVE_BYTES) {
-        throw new Error("知识库 ZIP 超过 250 MB");
+        throw new KnowledgeArchiveDownloadError(
+          "too_large",
+          "知识库 ZIP 超过 250 MB",
+        );
       }
       const chunks: Buffer[] = [];
       let totalBytes = 0;
       const hash = createHash("sha256");
-      for await (const rawChunk of stored.createReadStream()) {
-        const chunk = Buffer.isBuffer(rawChunk)
-          ? rawChunk
-          : Buffer.from(rawChunk);
-        totalBytes += chunk.length;
-        if (totalBytes > MAX_ARCHIVE_BYTES) {
-          throw new Error("知识库 ZIP 超过 250 MB");
+      try {
+        for await (const rawChunk of stored.createReadStream()) {
+          const chunk = Buffer.isBuffer(rawChunk)
+            ? rawChunk
+            : Buffer.from(rawChunk);
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_ARCHIVE_BYTES) {
+            throw new KnowledgeArchiveDownloadError(
+              "too_large",
+              "知识库 ZIP 超过 250 MB",
+            );
+          }
+          chunks.push(chunk);
+          hash.update(chunk);
         }
-        chunks.push(chunk);
-        hash.update(chunk);
+      } catch (error) {
+        if (error instanceof KnowledgeArchiveDownloadError) throw error;
+        throw knowledgeArchiveLocalReadFailure(error);
       }
       if (totalBytes === 0 || totalBytes !== stored.sizeBytes) {
-        throw new Error("知识库 ZIP 本地持久副本不完整");
+        throw new KnowledgeArchiveDownloadError(
+          totalBytes === 0 ? "empty" : "local_size_mismatch",
+          "知识库 ZIP 本地持久副本不完整",
+        );
       }
       if (stored.sha256 && hash.digest("hex") !== stored.sha256) {
-        throw new Error("知识库 ZIP 本地持久副本校验失败");
+        throw new KnowledgeArchiveDownloadError(
+          "local_sha256_mismatch",
+          "知识库 ZIP 本地持久副本校验失败",
+        );
       }
       const buffer = Buffer.concat(chunks, totalBytes);
       filename = stored.filename || filename;
@@ -6516,47 +6610,101 @@ export async function downloadArchiveBytes(input: {
       }
       return { buffer, filename };
     }
-    throw new Error(
-      "知识库 ZIP 尚未本地化；旧 Provider 文件不再可读，请批准重置后重新构建",
-    );
-  } else if (input.descriptor.url) {
-    downloadUrl = assertSafeExternalUrl(input.descriptor.url);
+    if (!input.descriptor.url && input.allowProviderFileIdFallback === true) {
+      try {
+        downloadUrl = assertSafeExternalUrl(
+          new URL(
+            `v1/files/${encodeURIComponent(fileId)}/content`,
+            `${input.baseUrl.replace(/\/+$/u, "")}/`,
+          ).toString(),
+        );
+        headers = upstreamHeaders(input.apiKey);
+      } catch {
+        throw new KnowledgeArchiveDownloadError(
+          "local_copy_missing",
+          "知识库 ZIP 没有可读取的本地副本或 Provider 文件地址",
+        );
+      }
+    }
+    if (!input.descriptor.url && !downloadUrl) {
+      throw new KnowledgeArchiveDownloadError(
+        "local_copy_missing",
+        "知识库 ZIP 没有可读取的本地副本或 Provider 文件地址",
+      );
+    }
+  }
+  if (!downloadUrl && input.descriptor.url) {
+    try {
+      downloadUrl = assertSafeExternalUrl(input.descriptor.url);
+    } catch {
+      throw new KnowledgeArchiveDownloadError(
+        "unsafe_url",
+        "知识库 ZIP 下载地址不安全",
+      );
+    }
   }
 
-  if (!downloadUrl) throw new Error("知识库文件没有可验证的下载地址");
-  const controller = new AbortController();
-  let response = await axios.get(downloadUrl, {
-    ...(headers
-      ? { maxRedirects: 0, proxy: false as const }
-      : safeExternalRequestOptions),
-    headers,
-    responseType: "stream",
-    timeout: 120_000,
-    maxContentLength: MAX_ARCHIVE_BYTES,
-    signal: controller.signal,
-    validateStatus: () => true,
-  });
-  if (
-    headers &&
-    response.status >= 300 &&
-    response.status < 400 &&
-    response.headers.location
-  ) {
-    const redirectUrl = assertSafeExternalUrl(
-      new URL(String(response.headers.location), downloadUrl).toString(),
+  if (!downloadUrl) {
+    throw new KnowledgeArchiveDownloadError(
+      "missing_url",
+      "知识库文件没有可验证的下载地址",
     );
-    response = await axios.get(redirectUrl, {
-      ...safeExternalRequestOptions,
+  }
+  const controller = new AbortController();
+  let response: AxiosResponse;
+  try {
+    response = await axios.get(downloadUrl, {
+      ...(headers
+        ? { maxRedirects: 0, proxy: false as const }
+        : safeExternalRequestOptions),
+      headers,
       responseType: "stream",
       timeout: 120_000,
       maxContentLength: MAX_ARCHIVE_BYTES,
       signal: controller.signal,
       validateStatus: () => true,
     });
+  } catch (error) {
+    throw knowledgeArchiveTransportFailure(error);
+  }
+  if (
+    headers &&
+    response.status >= 300 &&
+    response.status < 400 &&
+    response.headers.location
+  ) {
+    let redirectUrl: string;
+    try {
+      redirectUrl = assertSafeExternalUrl(
+        new URL(String(response.headers.location), downloadUrl).toString(),
+      );
+    } catch {
+      response.data?.destroy?.();
+      throw new KnowledgeArchiveDownloadError(
+        "unsafe_url",
+        "知识库 ZIP 下载地址不安全",
+      );
+    }
+    try {
+      response = await axios.get(redirectUrl, {
+        ...safeExternalRequestOptions,
+        responseType: "stream",
+        timeout: 120_000,
+        maxContentLength: MAX_ARCHIVE_BYTES,
+        signal: controller.signal,
+        validateStatus: () => true,
+      });
+    } catch (error) {
+      throw knowledgeArchiveTransportFailure(error);
+    }
   }
   if (response.status !== 200) {
     response.data?.destroy?.();
-    throw new Error(`下载知识库 ZIP 失败 (${response.status})`);
+    throw new KnowledgeArchiveDownloadError(
+      "http_status",
+      `下载知识库 ZIP 失败 (${response.status})`,
+      response.status,
+    );
   }
   const disposition = String(response.headers["content-disposition"] || "");
   const encodedFilename = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
@@ -6572,13 +6720,18 @@ export async function downloadArchiveBytes(input: {
   const declaredLength = Number(response.headers["content-length"] || 0);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_ARCHIVE_BYTES) {
     response.data?.destroy?.();
-    throw new Error("知识库 ZIP 超过 250 MB");
+    throw new KnowledgeArchiveDownloadError(
+      "too_large",
+      "知识库 ZIP 超过 250 MB",
+    );
   }
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   let lastProgressAt = Date.now();
+  let stalled = false;
   const watchdog = setInterval(() => {
     if (Date.now() - lastProgressAt >= 120_000) {
+      stalled = true;
       controller.abort();
     }
   }, 10_000);
@@ -6593,18 +6746,32 @@ export async function downloadArchiveBytes(input: {
       totalBytes += chunk.length;
       if (totalBytes > MAX_ARCHIVE_BYTES) {
         controller.abort();
-        throw new Error("知识库 ZIP 超过 250 MB");
+        throw new KnowledgeArchiveDownloadError(
+          "too_large",
+          "知识库 ZIP 超过 250 MB",
+        );
       }
       chunks.push(chunk);
       lastProgressAt = Date.now();
     }
+  } catch (error) {
+    if (error instanceof KnowledgeArchiveDownloadError) throw error;
+    throw knowledgeArchiveTransportFailure(error, stalled);
   } finally {
     clearInterval(watchdog);
   }
+  if (stalled) {
+    throw new KnowledgeArchiveDownloadError("timeout", "知识库 ZIP 下载超时");
+  }
   const buffer = Buffer.concat(chunks, totalBytes);
-  if (buffer.length === 0) throw new Error("知识库 ZIP 内容为空");
+  if (buffer.length === 0) {
+    throw new KnowledgeArchiveDownloadError("empty", "知识库 ZIP 内容为空");
+  }
   if (buffer.length > MAX_ARCHIVE_BYTES) {
-    throw new Error("知识库 ZIP 超过 250 MB");
+    throw new KnowledgeArchiveDownloadError(
+      "too_large",
+      "知识库 ZIP 超过 250 MB",
+    );
   }
   if (!filename.toLowerCase().endsWith(".zip")) {
     filename = `${path.basename(filename, path.extname(filename)) || "knowledge-base"}.zip`;

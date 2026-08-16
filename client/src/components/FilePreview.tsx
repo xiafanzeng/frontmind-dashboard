@@ -23,6 +23,7 @@ import type { Attachment } from "@/contexts/ConversationContext";
 import { isAttachmentExpired } from "@/lib/attachment-expiry";
 import {
   filePreviewSource,
+  managedLocalAssetContentUrl,
   type FilePreviewSource,
 } from "@/lib/file-preview-source";
 
@@ -326,9 +327,8 @@ async function fetchFileAsBlob(
 ): Promise<string> {
   const url =
     source.kind === "owned_file"
-      ? source.fileId.startsWith("asset_")
-        ? `/api/frontmind/v2/assets/${encodeURIComponent(source.fileId)}/content`
-        : `/api/frontmind/v1/files/${encodeURIComponent(source.fileId)}`
+      ? managedLocalAssetContentUrl(source.fileId) ||
+        `/api/frontmind/v1/files/${encodeURIComponent(source.fileId)}`
       : buildProxyDownloadUrl(source.url, fileName, false) || source.url;
 
   const response = await fetch(url, {
@@ -615,6 +615,15 @@ export default function FilePreview({
       }
 
       if (previewSource?.kind === "owned_file") {
+        if (managedLocalAssetContentUrl(previewSource.fileId)) {
+          const blobUrl = await fetchFileAsBlobWithRetry(
+            previewSource,
+            downloadName,
+          );
+          nativeDownload(blobUrl, downloadName);
+          URL.revokeObjectURL(blobUrl);
+          return;
+        }
         // Fast path for uploaded files with real file IDs: create a short-lived
         // same-origin URL and let the browser download natively. A file ID is
         // opaque and is never interpreted as a URL.

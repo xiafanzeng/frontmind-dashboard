@@ -255,6 +255,15 @@ const presalesApiKeySchema = z
   .min(8, "API Key 至少需要 8 个字符")
   .max(4096, "API Key 不能超过 4096 个字符");
 
+const managedApiKeyReplaceShape = {
+  userId: z.number().int().positive(),
+  apiKey: presalesApiKeySchema,
+  expectedVersion: z.number().int().nonnegative(),
+  reason: z.string().trim().min(1).max(2_000),
+  confirmation: z.literal("REPLACE_API_KEY"),
+  relatedTicketId: z.string().uuid().optional(),
+} as const;
+
 const knowledgeBaseIncidentRepairKindSchema = z.enum(
   knowledgeBaseIncidentRepairKinds,
 );
@@ -458,7 +467,9 @@ export const adminRouter = router({
               .enum(["unconfigured_only", "replace_all"])
               .default("unconfigured_only"),
             apiKey: presalesApiKeySchema,
-            agentProfile: managedAgentProfileSchema.default("frontmind-pro"),
+            agentProfile: managedAgentProfileSchema
+              .default("frontmind-pro")
+              .optional(),
             reason: z.string().trim().min(1).max(2_000),
             confirmation: z.literal("BULK_REPLACE_API_KEYS"),
           })
@@ -482,23 +493,27 @@ export const adminRouter = router({
       }),
     replaceTargetCredential: adminProcedure
       .input(
-        z
-          .object({
-            kind: z.enum([
-              "customer",
-              "delivery_admin",
-              "system_admin",
-              "engineer",
-            ]),
-            userId: z.number().int().positive(),
-            apiKey: presalesApiKeySchema,
-            agentProfile: managedAgentProfileSchema.default("frontmind-pro"),
-            expectedVersion: z.number().int().nonnegative(),
-            reason: z.string().trim().min(1).max(2_000),
-            confirmation: z.literal("REPLACE_API_KEY"),
-            relatedTicketId: z.string().uuid().optional(),
-          })
-          .strict(),
+        z.discriminatedUnion("kind", [
+          z
+            .object({
+              ...managedApiKeyReplaceShape,
+              kind: z.literal("customer"),
+              agentProfile: managedAgentProfileSchema.default("frontmind-pro"),
+            })
+            .strict(),
+          z
+            .object({
+              ...managedApiKeyReplaceShape,
+              kind: z.literal("delivery_admin"),
+            })
+            .strict(),
+          z
+            .object({
+              ...managedApiKeyReplaceShape,
+              kind: z.literal("engineer"),
+            })
+            .strict(),
+        ]),
       )
       .mutation(async ({ ctx, input }) => {
         requireSystemAdmin(ctx.user);
@@ -508,7 +523,8 @@ export const adminRouter = router({
             kind: input.kind,
             userId: input.userId,
             apiKey: input.apiKey,
-            agentProfile: input.agentProfile,
+            agentProfile:
+              input.kind === "customer" ? input.agentProfile : undefined,
             expectedVersion: input.expectedVersion,
             reason: input.reason,
             relatedTicketId: input.relatedTicketId,
@@ -521,12 +537,7 @@ export const adminRouter = router({
       .input(
         z
           .object({
-            kind: z.enum([
-              "customer",
-              "delivery_admin",
-              "system_admin",
-              "engineer",
-            ]),
+            kind: z.enum(["customer", "delivery_admin", "engineer"]),
             userId: z.number().int().positive(),
             expectedVersion: z.number().int().nonnegative(),
             reason: z.string().trim().min(1).max(2_000),

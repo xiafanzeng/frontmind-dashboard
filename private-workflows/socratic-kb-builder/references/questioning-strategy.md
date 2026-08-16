@@ -27,8 +27,8 @@ tree coordinates or file paths.
 ## Thin evidence
 
 - Keep an applicable leaf even when evidence is incomplete.
-- Write only the supported minimum and mark the leaf `limited_evidence` or
-  `needs_verification` in its metadata/evidence record.
+- Write only the supported minimum. Retain verification gaps in leaf-scoped
+  evidence files without adding internal status metadata to node Markdown.
 - Do not ask a question, wait for confirmation or return a partial tree.
 - Do not repeat a generic disclaimer to inflate length.
 

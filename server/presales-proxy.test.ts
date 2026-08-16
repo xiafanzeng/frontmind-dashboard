@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import presalesProxy, {
   assertPresalesProxyConfigured,
-  buildPresalesFileDeleteOutcome,
   buildPresalesTaskBody,
   buildProxyUploadSuccess,
   collectTaskArtifacts,
@@ -215,37 +214,6 @@ describe("presales upstream contract", () => {
       ok: true,
       status: "uploaded",
       upstreamStatus: 204,
-    });
-  });
-
-  it("treats successful and already-missing upstream files as deleted", () => {
-    expect(buildPresalesFileDeleteOutcome(204)).toEqual({
-      ok: true,
-      status: 204,
-      body: null,
-    });
-    expect(buildPresalesFileDeleteOutcome(404)).toEqual({
-      ok: true,
-      status: 204,
-      body: null,
-    });
-  });
-
-  it("returns a controlled response when upstream file deletion fails", () => {
-    const outcome = buildPresalesFileDeleteOutcome(
-      503,
-      { message: "upstream failed with sk-secret" },
-      "sk-secret",
-    );
-    expect(outcome).toEqual({
-      ok: false,
-      status: 503,
-      body: {
-        error: {
-          code: "UPSTREAM_FILE_DELETE_FAILED",
-          message: "upstream failed with [redacted]",
-        },
-      },
     });
   });
 

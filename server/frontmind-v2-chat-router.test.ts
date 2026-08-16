@@ -39,15 +39,27 @@ describe("Dashboard ordinary-chat v2 boundary", () => {
     );
   });
 
-  it("freezes model policy from the credential and rejects browser model fields", () => {
+  it("maps and freezes the public create-only model profile", () => {
     expect(serverSource).toContain(
-      "upstreamModel: input.credential.upstreamModel",
+      "upstreamModel: generalAgentModelProfileModel(input.value.modelProfile)",
     );
+    expect(serverSource).toContain("modelProfile: input.value.modelProfile");
     expect(serverSource).toContain(
       "agentProfile: reserved.operation.upstreamModel",
     );
+    expect(clientSource).toContain(
+      "modelProfile: normalizePublicAgentProfile(",
+    );
     expect(clientSource).not.toContain('taskMode: "agent"');
     expect(clientSource).not.toContain("agentProfile: modelToUse");
+    expect(serverSource).toContain('user?.role === "delivery_member"');
+    expect(serverSource).toContain(
+      'user.adminAccessLevel === "delivery_admin"',
+    );
+    expect(serverSource).toContain("GENERAL_AGENT_ROLE_FORBIDDEN");
+    expect(serverSource).toContain(
+      ".omit({ conversationId: true, modelProfile: true })",
+    );
   });
 
   it("reconciles outcome-unknown side effects by operation marker", () => {

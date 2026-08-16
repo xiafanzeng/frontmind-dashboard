@@ -120,7 +120,31 @@ describe("service portal migration chain", () => {
       "0060_knowledge_base_tree_policy",
       "0061_knowledge_base_resilient_manus_v2",
       "0062_hard_glorian",
+      "0063_lean_blue_marvel",
     ]);
+  });
+
+  it("adds immutable Website project attribution as an expand-only table", async () => {
+    const migrationSql = await migration("0063_lean_blue_marvel.sql");
+    expect(migrationSql).toContain(
+      "CREATE TABLE `website_project_attributions`",
+    );
+    expect(migrationSql).toContain("`project_id` varchar(80) NOT NULL");
+    expect(migrationSql).toContain(
+      "`business_owner_name` varchar(40) NOT NULL",
+    );
+    expect(migrationSql).not.toMatch(
+      /(?:^|-->\s*statement-breakpoint\s*)(?:ALTER|UPDATE|INSERT|REPLACE|DELETE|DROP|TRUNCATE|RENAME)\b/imu,
+    );
+    const snapshot = JSON.parse(
+      await readFile(
+        path.join(drizzleRoot, "meta", "0063_snapshot.json"),
+        "utf8",
+      ),
+    );
+    expect(
+      snapshot.tables.website_project_attributions.columns.business_owner_name,
+    ).toMatchObject({ type: "varchar(40)", notNull: true });
   });
 
   it("adds an optional unsigned overseas brand-tracking quota as an expand migration", async () => {

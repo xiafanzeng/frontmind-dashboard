@@ -45,9 +45,9 @@ describe("ManusV2Client", () => {
         "https://api.manus.ai/custom",
         "https://api.example.test",
       ]) {
-        expect(
-          () => new ManusV2Client({ baseUrl, apiKey: "secret" }),
-        ).toThrow("Unsafe Manus v2 production base URL");
+        expect(() => new ManusV2Client({ baseUrl, apiKey: "secret" })).toThrow(
+          "Unsafe Manus v2 production base URL",
+        );
       }
     } finally {
       if (previous === undefined) delete process.env.NODE_ENV;
@@ -218,7 +218,10 @@ describe("ManusV2Client", () => {
       { ok: true, task_id: "canonical-task", deleted: true },
     ],
     ["omits deleted", { ok: true, id: "canonical-task" }],
-    ["does not confirm deletion", { ok: true, id: "canonical-task", deleted: false }],
+    [
+      "does not confirm deletion",
+      { ok: true, id: "canonical-task", deleted: false },
+    ],
     ["changes task identity", { ok: true, id: "other-task", deleted: true }],
   ])(
     "treats a task.delete 2xx response that %s as outcome unknown",
@@ -781,6 +784,7 @@ describe("ManusV2Client", () => {
             filename: "facts.pdf",
             status: "uploaded",
             bytes: 3,
+            content_type: "application/pdf; charset=binary",
             expires_at: now + 48 * 3600,
           },
         },
@@ -805,6 +809,274 @@ describe("ManusV2Client", () => {
       "x-manus-api-key",
     );
   });
+
+  it("confirms an exact 45,119,307-byte file after a transient detail failure without another PUT", async () => {
+    const now = Math.floor(Date.now() / 1_000);
+    const bytes = Buffer.alloc(45_119_307);
+    const infoLog = vi
+      .spyOn(console, "info")
+      .mockImplementation(() => undefined);
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: { id: "file-large", filename: "facts.pdf" },
+        upload_url: "https://uploads.example.test/large-signed",
+        upload_expires_at: now + 180,
+      },
+    });
+    const put = vi.spyOn(axios, "put").mockResolvedValue({ status: 200 });
+    const get = vi
+      .spyOn(axios.Axios.prototype, "get")
+      .mockRejectedValueOnce(new Error("detail timed out"))
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          file: {
+            id: "file-large",
+            filename: "facts.pdf",
+            status: "uploaded",
+            bytes: 45_119_307,
+            content_type: "Application/PDF; charset=binary",
+            expires_at: now + 48 * 3600,
+          },
+        },
+      });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "facts.pdf",
+        bytes,
+        contentType: "application/pdf",
+        sleep: async () => undefined,
+      }),
+    ).resolves.toMatchObject({
+      fileId: "file-large",
+      detail: { status: "uploaded", bytes: 45_119_307 },
+    });
+    expect(post).toHaveBeenCalledOnce();
+    expect(put).toHaveBeenCalledOnce();
+    expect(get).toHaveBeenCalledTimes(2);
+    const serializedLogs = JSON.stringify(infoLog.mock.calls);
+    expect(serializedLogs).not.toContain("facts.pdf");
+    expect(serializedLogs).not.toContain("file-large");
+    expect(serializedLogs).not.toContain("large-signed");
+    expect(serializedLogs).not.toContain("secret");
+  });
+
+  it("journals confirmation unknown and never creates a second file when readiness expires", async () => {
+    const now = Math.floor(Date.now() / 1_000);
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: { id: "file-still-pending", filename: "facts.pdf" },
+        upload_url: "https://uploads.example.test/pending-signed",
+        upload_expires_at: now + 180,
+      },
+    });
+    const put = vi.spyOn(axios, "put").mockResolvedValue({ status: 200 });
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-still-pending",
+          filename: "facts.pdf",
+          status: "pending",
+          bytes: null,
+          content_type: null,
+          expires_at: now + 48 * 3600,
+        },
+      },
+    });
+    const confirmationUnknown = vi.fn().mockResolvedValue(undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "facts.pdf",
+        bytes: Buffer.from("abc"),
+        contentType: "application/pdf",
+        readinessDeadlineMs: 1,
+        detailAttemptTimeoutMs: 1,
+        sleep: async () => undefined,
+        observer: { onConfirmationUnknown: confirmationUnknown },
+      }),
+    ).rejects.toMatchObject({
+      code: "FILE_UPLOAD_CONFIRMATION_UNKNOWN",
+      outcomeUnknown: true,
+      retryable: false,
+    });
+    expect(confirmationUnknown).toHaveBeenCalledOnce();
+    expect(post).toHaveBeenCalledOnce();
+    expect(put).toHaveBeenCalledOnce();
+  });
+
+  it.each([408, 425, 429, 503])(
+    "retries a transient file.detail HTTP %s on the same file id",
+    async (status) => {
+      const now = Math.floor(Date.now() / 1_000);
+      const get = vi
+        .spyOn(axios.Axios.prototype, "get")
+        .mockResolvedValueOnce({ status, data: { ok: false } })
+        .mockResolvedValueOnce({
+          status: 200,
+          data: {
+            ok: true,
+            file: {
+              id: "file-retry-detail",
+              filename: "facts.pdf",
+              status: "uploaded",
+              bytes: 3,
+              content_type: "application/pdf",
+              expires_at: now + 48 * 3600,
+            },
+          },
+        });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+
+      await expect(
+        client.waitForExactProviderFile({
+          fileId: "file-retry-detail",
+          filename: "facts.pdf",
+          expectedBytes: 3,
+          expectedContentType: "application/pdf",
+          sleep: async () => undefined,
+        }),
+      ).resolves.toMatchObject({ status: "uploaded" });
+      expect(get).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("retries an invalid file.detail envelope before accepting exact proof", async () => {
+    const now = Math.floor(Date.now() / 1_000);
+    const get = vi
+      .spyOn(axios.Axios.prototype, "get")
+      .mockResolvedValueOnce({ status: 200, data: { ok: true } })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          file: {
+            id: "file-invalid-envelope",
+            filename: "facts.pdf",
+            status: "uploaded",
+            bytes: 3,
+            content_type: "application/pdf",
+            expires_at: now + 48 * 3600,
+          },
+        },
+      });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.waitForExactProviderFile({
+        fileId: "file-invalid-envelope",
+        filename: "facts.pdf",
+        expectedBytes: 3,
+        expectedContentType: "application/pdf",
+        sleep: async () => undefined,
+      }),
+    ).resolves.toMatchObject({ status: "uploaded" });
+    expect(get).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [
+      "identity",
+      {
+        id: "file-exact",
+        filename: "other.pdf",
+        status: "uploaded",
+        bytes: 3,
+        content_type: "application/pdf",
+      },
+      "FILE_IDENTITY_CONFLICT",
+    ],
+    [
+      "bytes",
+      {
+        id: "file-exact",
+        filename: "facts.pdf",
+        status: "uploaded",
+        bytes: 4,
+        content_type: "application/pdf",
+      },
+      "FILE_BYTES_CONFLICT",
+    ],
+    [
+      "MIME",
+      {
+        id: "file-exact",
+        filename: "facts.pdf",
+        status: "uploaded",
+        bytes: 3,
+        content_type: "text/plain",
+      },
+      "FILE_MIME_CONFLICT",
+    ],
+    [
+      "deleted status",
+      {
+        id: "file-exact",
+        filename: "facts.pdf",
+        status: "deleted",
+        bytes: null,
+        content_type: null,
+      },
+      "FILE_UNUSABLE",
+    ],
+    [
+      "error status",
+      {
+        id: "file-exact",
+        filename: "facts.pdf",
+        status: "error",
+        bytes: null,
+        content_type: null,
+      },
+      "FILE_UNUSABLE",
+    ],
+  ] as const)(
+    "fails an exact confirmation %s immediately",
+    async (_label, file, code) => {
+      const now = Math.floor(Date.now() / 1_000);
+      const get = vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+        status: 200,
+        data: { ok: true, file: { ...file, expires_at: now + 48 * 3600 } },
+      });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+
+      await expect(
+        client.waitForExactProviderFile({
+          fileId: "file-exact",
+          filename: "facts.pdf",
+          expectedBytes: 3,
+          expectedContentType: "application/pdf",
+          sleep: async () => undefined,
+        }),
+      ).rejects.toMatchObject({ code, outcomeUnknown: false });
+      expect(get).toHaveBeenCalledOnce();
+    },
+  );
 
   it("awaits durable candidate and PUT boundaries before advancing", async () => {
     const now = Math.floor(Date.now() / 1_000);
@@ -831,6 +1103,7 @@ describe("ManusV2Client", () => {
           filename: "facts.pdf",
           status: "uploaded",
           bytes: 3,
+          content_type: "application/pdf",
           expires_at: now + 48 * 3600,
         },
       },
@@ -870,6 +1143,20 @@ describe("ManusV2Client", () => {
       },
     });
     vi.spyOn(axios, "put").mockRejectedValue(new Error("socket closed"));
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-ambiguous",
+          filename: "facts.pdf",
+          status: "uploaded",
+          bytes: 3,
+          content_type: "application/pdf",
+          expires_at: now + 48 * 3600,
+        },
+      },
+    });
     const unknown = vi.fn().mockResolvedValue(undefined);
     const client = new ManusV2Client({
       baseUrl: "https://api.example.test",
@@ -882,12 +1169,74 @@ describe("ManusV2Client", () => {
         contentType: "application/pdf",
         observer: { onPutOutcomeUnknown: unknown },
       }),
-    ).rejects.toMatchObject({
-      operation: "file.upload.content",
-      outcomeUnknown: true,
+    ).resolves.toMatchObject({
+      fileId: "file-ambiguous",
+      detail: { status: "uploaded", bytes: 3 },
     });
     expect(unknown).toHaveBeenCalledWith(
       expect.objectContaining({ fileId: "file-ambiguous" }),
+    );
+  });
+
+  it("preserves PUT outcome-unknown when its durable observer fails", async () => {
+    const now = Math.floor(Date.now() / 1_000);
+    vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: { id: "file-ambiguous-journal", filename: "facts.pdf" },
+        upload_url: "https://uploads.example.test/signed",
+        upload_expires_at: now + 180,
+      },
+    });
+    vi.spyOn(axios, "put").mockRejectedValue(new Error("socket closed"));
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-ambiguous-journal",
+          filename: "facts.pdf",
+          status: "uploaded",
+          bytes: 3,
+          content_type: "application/pdf",
+          expires_at: now + 48 * 3600,
+        },
+      },
+    });
+    const unknown = vi
+      .fn()
+      .mockRejectedValue(new Error("provider lease journal unavailable"));
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+    try {
+      await expect(
+        client.uploadFile({
+          filename: "facts.pdf",
+          bytes: Buffer.from("abc"),
+          contentType: "application/pdf",
+          observer: { onPutOutcomeUnknown: unknown },
+        }),
+      ).resolves.toMatchObject({
+        fileId: "file-ambiguous-journal",
+        detail: { status: "uploaded", bytes: 3 },
+      });
+      expect(errorLog).toHaveBeenCalledWith(
+        "[Manus v2] file outcome journal failed",
+        expect.objectContaining({
+          diagnosticCode: "MANUS_V2_FILE_OUTCOME_JOURNAL_FAILED",
+        }),
+      );
+    } finally {
+      errorLog.mockRestore();
+    }
+    expect(unknown).toHaveBeenCalledWith(
+      expect.objectContaining({ fileId: "file-ambiguous-journal" }),
     );
   });
 
@@ -918,6 +1267,7 @@ describe("ManusV2Client", () => {
           filename: "facts.pdf",
           status: "uploaded",
           bytes: 3,
+          content_type: "application/pdf",
           expires_at: now + 48 * 3600,
         },
       },
@@ -949,7 +1299,7 @@ describe("ManusV2Client", () => {
     expect(sleep).toHaveBeenCalledWith(0);
   });
 
-  it("does not retry a PUT response loss", async () => {
+  it("does not retry a PUT response loss while reconciling by GET", async () => {
     const now = Math.floor(Date.now() / 1_000);
     vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
       status: 200,
@@ -963,6 +1313,20 @@ describe("ManusV2Client", () => {
     const put = vi
       .spyOn(axios, "put")
       .mockRejectedValue(new Error("response lost"));
+    const get = vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-unknown-once",
+          filename: "facts.pdf",
+          status: "uploaded",
+          bytes: 3,
+          content_type: "application/pdf",
+          expires_at: now + 48 * 3600,
+        },
+      },
+    });
     const client = new ManusV2Client({
       baseUrl: "https://api.example.test",
       apiKey: "secret",
@@ -974,8 +1338,9 @@ describe("ManusV2Client", () => {
         contentType: "application/pdf",
         sleep: async () => undefined,
       }),
-    ).rejects.toMatchObject({ outcomeUnknown: true });
+    ).resolves.toMatchObject({ fileId: "file-unknown-once" });
     expect(put).toHaveBeenCalledOnce();
+    expect(get).toHaveBeenCalledOnce();
   });
 
   it("resumes a known candidate by detail without POST or PUT", async () => {
@@ -991,6 +1356,7 @@ describe("ManusV2Client", () => {
           filename: "facts.pdf",
           status: "uploaded",
           bytes: 3,
+          content_type: "application/pdf",
           expires_at: now + 48 * 3600,
         },
       },
@@ -1030,6 +1396,7 @@ describe("ManusV2Client", () => {
           filename: "facts.pdf",
           status: "uploaded",
           bytes: 3,
+          content_type: "application/pdf",
           expires_at: now + 48 * 3600,
         },
       },
@@ -1124,12 +1491,14 @@ describe("ManusV2Client", () => {
         prompt: "materialize the complete bundle",
         locale: "zh-CN",
         interactiveMode: false,
+        // A stale caller preference must not be able to override the global
+        // task-list policy even at runtime.
         hideInTaskList: true,
-      }),
+      } as any),
     ).toMatchObject({
       locale: "zh-CN",
       interactive_mode: false,
-      hide_in_task_list: true,
+      hide_in_task_list: false,
       share_visibility: "private",
     });
   });

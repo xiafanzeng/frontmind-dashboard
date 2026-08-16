@@ -80,6 +80,7 @@ describe("ordinary-user FrontMind proxy policy", () => {
   it.each([
     ["GET", "/api/frontmind/v1/tasks/task-1"],
     ["HEAD", "/api/frontmind/v1/files/file-1"],
+    ["POST", "/api/frontmind/v2/assets"],
     ["POST", "/api/frontmind/v1/files"],
     ["PUT", "/api/frontmind/proxy-upload?target=https%3A%2F%2Fexample.com"],
     ["POST", "/api/frontmind/download-token"],
@@ -95,6 +96,7 @@ describe("ordinary-user FrontMind proxy policy", () => {
   });
 
   it.each([
+    ["POST", "/api/frontmind/v2/assets"],
     ["POST", "/api/frontmind/v1/files"],
     ["PUT", "/api/frontmind/proxy-upload?target=https%3A%2F%2Fexample.com"],
     ["POST", "/api/frontmind/v1/files/file-1/upload-recovery"],
@@ -121,7 +123,7 @@ describe("ordinary-user FrontMind proxy policy", () => {
     });
     const req = {
       method: "POST",
-      originalUrl: "/api/frontmind/v1/files",
+      originalUrl: "/api/frontmind/v2/assets",
       frontmindUser: actor("user"),
     } as FrontMindRequest;
     const res = response();
@@ -176,6 +178,10 @@ describe("ordinary-user FrontMind proxy policy", () => {
   });
 
   it.each([
+    ["POST", "/api/frontmind/v2/tasks"],
+    ["POST", "/api/frontmind/v2/tasks/task-1/messages"],
+    ["POST", "/api/frontmind/v2/tasks/task-1/actions/message-1/confirm"],
+    ["POST", "/api/frontmind/v2/tasks/task-1/stop"],
     ["POST", "/api/frontmind/v1/tasks"],
     ["POST", "/api/frontmind/v1/responses"],
     ["POST", "/api/frontmind/v1/tasks/task-1"],

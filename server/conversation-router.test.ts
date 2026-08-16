@@ -8,6 +8,7 @@ import {
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  localAssets,
   messages,
   upstreamResources,
   userUsageOwners,
@@ -433,6 +434,58 @@ describe("conversation multi-device merge", () => {
     expect(snapshots[0]?.messages[0]?.attachments).toEqual([
       expectedAttachment,
     ]);
+
+    const localAssetId = `asset_${"a".repeat(30)}`;
+    const localRetainUntil = new Date("2026-09-14T00:00:00.000Z");
+    const localTurn = {
+      ...turn,
+      attachmentFileIds: ["generated-skill-file", localAssetId],
+      metadata: {
+        ...turn.metadata,
+        recovery: {
+          ...turn.metadata.recovery,
+          attachments: [
+            {
+              file_id: localAssetId,
+              filename: "企业事实确认表.pdf",
+            },
+          ],
+        },
+      },
+    };
+    const localRowsForTable = (table: unknown) => {
+      if (table === conversationTurns) return [localTurn];
+      if (table === localAssets) {
+        return [{ id: localAssetId, retainUntil: localRetainUntil }];
+      }
+      if (table === upstreamResources) return [];
+      return rowsForTable(table);
+    };
+    const expectedLocalAttachment = {
+      ...expectedAttachment,
+      fileId: localAssetId,
+      expiresAt: localRetainUntil.getTime(),
+    };
+    const { executor: localHistoryExecutor } =
+      createSelectExecutor(localRowsForTable);
+    const localHistory = await loadPersistedMessages(
+      localHistoryExecutor,
+      7,
+      "u7:conversation-1",
+      null,
+    );
+    expect(localHistory[0]?.attachments).toEqual([expectedLocalAttachment]);
+
+    const { executor: localListExecutor } =
+      createSelectExecutor(localRowsForTable);
+    const localSnapshots = await listSnapshots(
+      7,
+      null,
+      localListExecutor as Parameters<typeof listSnapshots>[2],
+    );
+    expect(localSnapshots[0]?.messages[0]?.attachments).toEqual([
+      expectedLocalAttachment,
+    ]);
   });
 
   it("reconstructs durable customer images only for their authoritative presentation leaf", async () => {
@@ -490,7 +543,7 @@ describe("conversation multi-device merge", () => {
         src:
           "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-1/0/" +
           "a".repeat(64),
-        alt: "customer-proof.jpg",
+        alt: "知识库配图",
       },
     ]);
     expect(loadResources).toHaveBeenCalledWith("build-1", turn);
@@ -565,7 +618,7 @@ describe("conversation multi-device merge", () => {
         src:
           "/api/knowledge-base/artifacts/build-1/customer-uploads/turn-earlier/0/" +
           "b".repeat(64),
-        alt: "earlier-proof.png",
+        alt: "知识库配图",
       },
     ]);
     expect(loadResources).toHaveBeenCalledWith("build-1", turn);
@@ -611,8 +664,10 @@ describe("conversation multi-device merge", () => {
       ),
     ).resolves.toEqual([
       {
-        src: "/api/knowledge-base/artifacts/build-1/logo",
-        alt: "official-logo.png",
+        src: expect.stringMatching(
+          /^\/api\/knowledge-base\/artifacts\/resources\//u,
+        ),
+        alt: "企业官方主 Logo",
       },
     ]);
     expect(loadResources).not.toHaveBeenCalled();
@@ -692,8 +747,10 @@ describe("conversation multi-device merge", () => {
       ),
     ).resolves.toEqual([
       {
-        src: "/api/knowledge-base/artifacts/build-1/logo",
-        alt: "official-logo.png",
+        src: expect.stringMatching(
+          /^\/api\/knowledge-base\/artifacts\/resources\//u,
+        ),
+        alt: "企业官方主 Logo",
       },
     ]);
   });
@@ -803,8 +860,10 @@ describe("conversation multi-device merge", () => {
     );
     expect(history[0]?.inlineImages).toEqual([
       {
-        src: "/api/knowledge-base/artifacts/build-1/logo",
-        alt: "official-logo.png",
+        src: expect.stringMatching(
+          /^\/api\/knowledge-base\/artifacts\/resources\//u,
+        ),
+        alt: "企业官方主 Logo",
       },
     ]);
 
@@ -816,8 +875,10 @@ describe("conversation multi-device merge", () => {
     );
     expect(snapshots[0]?.messages[0]?.inlineImages).toEqual([
       {
-        src: "/api/knowledge-base/artifacts/build-1/logo",
-        alt: "official-logo.png",
+        src: expect.stringMatching(
+          /^\/api\/knowledge-base\/artifacts\/resources\//u,
+        ),
+        alt: "企业官方主 Logo",
       },
     ]);
   });
@@ -1602,29 +1663,17 @@ describe("conversation credential binding", () => {
     expect(selectedTables).not.toContain(userUsageOwners);
   });
 
-  it("falls back to the assigned delivery admin only when the customer has no key", async () => {
-    let credentialQueryCount = 0;
+  it("does not inherit the assigned delivery admin key when the customer has no key", async () => {
     const { executor, selectedTables } = createSelectExecutor((table) => {
       if (table === users) return [{ role: "user" }];
       if (table === userUsageOwners) return [{ deliveryAdminId: 42 }];
-      if (table === apiCredentials) {
-        credentialQueryCount += 1;
-        return credentialQueryCount === 1
-          ? []
-          : [{ id: "credential-delivery-admin" }];
-      }
+      if (table === apiCredentials) return [];
       return [];
     });
 
-    await expect(getActiveCredentialId(executor, 7)).resolves.toBe(
-      "credential-delivery-admin",
-    );
-    expect(selectedTables).toEqual([
-      users,
-      apiCredentials,
-      userUsageOwners,
-      apiCredentials,
-    ]);
+    await expect(getActiveCredentialId(executor, 7)).resolves.toBeUndefined();
+    expect(selectedTables).toEqual([users, apiCredentials]);
+    expect(selectedTables).not.toContain(userUsageOwners);
   });
 
   it("keeps an old task bound to its original credential after manager reassignment", async () => {

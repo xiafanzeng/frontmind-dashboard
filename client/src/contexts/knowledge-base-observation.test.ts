@@ -122,7 +122,7 @@ function conversation(): Conversation {
 }
 
 describe("authoritative KB observation reducer", () => {
-  it("renders only same-origin Working Set images and evidence from the approved projection", () => {
+  it("keeps one-cycle read compatibility for legacy resources without using their filename as image alt", () => {
     const projected = observation(1, "turn-assets", 1, "1.1", "产品节点正文");
     projected.approvedPresentation!.resources = [
       {
@@ -154,7 +154,7 @@ describe("authoritative KB observation reducer", () => {
     expect(assistant?.inlineImages).toEqual([
       {
         src: projected.approvedPresentation!.resources[0]!.sameOriginUrl,
-        alt: "product.png",
+        alt: "知识库配图",
       },
     ]);
     expect(assistant?.outputFiles).toEqual([
@@ -164,6 +164,32 @@ describe("authoritative KB observation reducer", () => {
         mimeType: "text/plain; charset=utf-8",
       },
     ]);
+  });
+
+  it("renders a new opaque resource from its semantic caption only", () => {
+    const projected = observation(1, "turn-assets", 1, "1.1", "产品节点正文");
+    projected.approvedPresentation!.resources = [
+      {
+        id: "opaque-content-handle",
+        kind: "working_set_asset",
+        caption: "产品界面配图",
+        sameOriginUrl: `/api/knowledge-base/artifacts/resources/${"a".repeat(43)}.${"b".repeat(43)}`,
+        mimeType: "image/png",
+        sizeBytes: 128,
+      },
+    ];
+
+    const next = applyKnowledgeBaseObservation(conversation(), projected);
+    const assistant = next.messages.find(
+      (message) => message.role === "assistant",
+    );
+    expect(assistant?.inlineImages).toEqual([
+      {
+        src: projected.approvedPresentation!.resources[0]!.sameOriginUrl,
+        alt: "产品界面配图",
+      },
+    ]);
+    expect(assistant?.outputFiles).toBeUndefined();
   });
 
   it("upgrades a final optimistic confirmation from completedTurn without inventing a presentation", () => {
@@ -665,6 +691,122 @@ describe("authoritative KB observation reducer", () => {
     expect(stale).toBe(current);
     expect(stale.messages.at(-1)?.content).toContain("新正文");
     expect(stale.messages.at(-1)?.content).not.toContain("旧正文");
+  });
+
+  it("rejects an older same-turn refinement at the same generation and epoch", () => {
+    const latestObservation = observation(4, "turn-upload", 1, "1.2", null);
+    latestObservation.activeTurn = {
+      ...latestObservation.activeTurn!,
+      updatedAt: 200,
+      resetRevision: 7,
+      awaitingClientAttachments: true,
+      requiresAttachmentReselection: true,
+      stagedAttachmentCount: 1,
+      expectedAttachmentCount: 2,
+    };
+    const current = applyKnowledgeBaseObservation(
+      conversation(),
+      latestObservation,
+    );
+    expect(current.knowledgeBase).toMatchObject({
+      activeTurnId: "turn-upload",
+      activeTurnUpdatedAt: 200,
+      activeTurnResetRevision: 7,
+      activeTurnAwaitingClientAttachments: true,
+      activeTurnStagedAttachmentCount: 1,
+      activeTurnExpectedAttachmentCount: 2,
+    });
+
+    const staleObservation = {
+      ...latestObservation,
+      activeTurn: {
+        ...latestObservation.activeTurn!,
+        updatedAt: 100,
+        stagedAttachmentCount: 0,
+      },
+    };
+    expect(applyKnowledgeBaseObservation(current, staleObservation)).toBe(
+      current,
+    );
+  });
+
+  it("does not compare raw updatedAt clocks across different active turns", () => {
+    const firstObservation = observation(4, "turn-a", 1, "1.2", null);
+    firstObservation.activeTurn = {
+      ...firstObservation.activeTurn!,
+      updatedAt: 500,
+      messageSequence: 10,
+    };
+    const current = applyKnowledgeBaseObservation(
+      conversation(),
+      firstObservation,
+    );
+    const nextObservation = observation(4, "turn-b", 1, "1.2", null);
+    nextObservation.activeTurn = {
+      ...nextObservation.activeTurn!,
+      updatedAt: 100,
+      messageSequence: 11,
+    };
+
+    const next = applyKnowledgeBaseObservation(current, nextObservation);
+    expect(next).not.toBe(current);
+    expect(next.knowledgeBase).toMatchObject({
+      activeTurnId: "turn-b",
+      activeTurnUpdatedAt: 100,
+      activeTurnMessageSequence: 11,
+    });
+  });
+
+  it("rejects a different-turn observation with an older durable message sequence", () => {
+    const firstObservation = observation(4, "turn-new", 1, "1.2", null);
+    firstObservation.activeTurn = {
+      ...firstObservation.activeTurn!,
+      updatedAt: 100,
+      messageSequence: 11,
+    };
+    const current = applyKnowledgeBaseObservation(
+      conversation(),
+      firstObservation,
+    );
+    const staleObservation = observation(4, "turn-old", 1, "1.2", null);
+    staleObservation.activeTurn = {
+      ...staleObservation.activeTurn!,
+      updatedAt: 900,
+      messageSequence: 10,
+    };
+
+    expect(applyKnowledgeBaseObservation(current, staleObservation)).toBe(
+      current,
+    );
+  });
+
+  it("treats legacy reset notices as neutral progress while a turn awaits browser Files", () => {
+    const uploading = observation(4, "turn-upload", 1, "1.2", null);
+    uploading.activeTurn = {
+      ...uploading.activeTurn!,
+      awaitingClientAttachments: true,
+      requiresAttachmentReselection: true,
+      stagedAttachmentCount: 0,
+      expectedAttachmentCount: 1,
+    };
+    uploading.processingPhase = "uploading";
+    uploading.notice = {
+      key: "legacy-reset",
+      code: "KNOWLEDGE_BASE_REVISION_UPLOAD_INCOMPLETE",
+      severity: "warning",
+      message: "请重置",
+      retryable: false,
+      recoveryAction: "approve_reset",
+      turnId: "turn-upload",
+      createdAt: 4,
+    };
+
+    const next = applyKnowledgeBaseObservation(conversation(), uploading);
+    expect(next.knowledgeBase).toMatchObject({
+      processingPhase: "uploading",
+      notice: null,
+      activeTurnAwaitingClientAttachments: true,
+    });
   });
 
   it("deduplicates a repeated notice without creating assistant error bubbles", () => {

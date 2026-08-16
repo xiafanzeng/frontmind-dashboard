@@ -94,7 +94,6 @@ import {
   getDedicatedMonitorCredentialReadiness,
   purgePresalesProjectMonitorRuns,
 } from "./presales-monitor";
-import { WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED } from "./website-project-lifecycle";
 
 const token = "4UT1aQh7tFzS0I8NDkcM8Gv7r5d9ZLr0shF9xXfPjYg";
 const originalServiceToken = process.env.FRONTMIND_PRESALES_SERVICE_TOKEN;
@@ -950,7 +949,7 @@ describe("presales create-time upload capability", () => {
     expect(await readStoredPresalesFile(fileId)).toBeNull();
   });
 
-  it("keeps a DB deletion tombstone so GET cannot recover a deleted user upload", async () => {
+  it("retains a user upload and its local content when cleanup is requested", async () => {
     const fileId = "deleted-user-upload";
     const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
     const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
@@ -967,7 +966,9 @@ describe("presales create-time upload capability", () => {
       contentExpiresAt,
       contentDeletedAt: null,
     };
-    vi.spyOn(axios, "delete").mockResolvedValue({ status: 204, data: "" });
+    const deleteMock = vi
+      .spyOn(axios, "delete")
+      .mockResolvedValue({ status: 204, data: "" });
     const get = vi.spyOn(axios, "get");
 
     await withServer(async (baseUrl) => {
@@ -984,20 +985,17 @@ describe("presales create-time upload capability", () => {
         `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
         { headers: { "x-frontmind-service-token": token } },
       );
-      expect(downloaded.status).toBe(410);
-      await expect(downloaded.json()).resolves.toMatchObject({
-        error: { code: "SOURCE_EXPIRED", retryable: false },
-      });
+      expect(downloaded.status).toBe(200);
+      expect(await downloaded.text()).toBe("delete me");
     });
 
-    expect(markPresalesFileContentDeleted).toHaveBeenCalledWith(
-      expect.objectContaining({ fileId, apiCredentialId: "credential-1" }),
-    );
+    expect(markPresalesFileContentDeleted).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
     expect(get).not.toHaveBeenCalled();
-    expect(await readPresalesFileLifecycle(fileId)).toBeNull();
+    expect(await readPresalesFileLifecycle(fileId)).not.toBeNull();
   });
 
-  it("keeps GET and PUT blocked when the upstream DELETE fails after the DB tombstone", async () => {
+  it("does not create a DB tombstone or contact Provider during cleanup", async () => {
     const fileId = "delete-upstream-failure";
     const uploadedAt = new Date("2026-08-04T00:00:00.000Z");
     const contentExpiresAt = new Date("2026-09-03T00:00:00.000Z");
@@ -1008,12 +1006,10 @@ describe("presales create-time upload capability", () => {
       contentExpiresAt,
       contentDeletedAt: null,
     };
-    vi.spyOn(axios, "delete").mockResolvedValue({
+    const deleteMock = vi.spyOn(axios, "delete").mockResolvedValue({
       status: 503,
       data: { message: "storage unavailable" },
     });
-    const get = vi.spyOn(axios, "get");
-    const put = vi.spyOn(axios, "put");
 
     await withServer(async (baseUrl) => {
       const deleted = await fetch(
@@ -1023,36 +1019,15 @@ describe("presales create-time upload capability", () => {
           headers: { "x-frontmind-service-token": token },
         },
       );
-      expect(deleted.status).toBe(503);
-      const deletedAt = presalesContentState.contentDeletedAt;
-      expect(deletedAt).toBeInstanceOf(Date);
-
-      const downloaded = await fetch(
-        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
-        { headers: { "x-frontmind-service-token": token } },
-      );
-      expect(downloaded.status).toBe(410);
-
-      const uploaded = await fetch(
-        `${baseUrl}/files/${encodeURIComponent(fileId)}/content`,
-        {
-          method: "PUT",
-          headers: {
-            "content-type": "application/pdf",
-            "x-frontmind-service-token": token,
-          },
-          body: Buffer.from("must remain blocked"),
-        },
-      );
-      expect(uploaded.status).toBe(410);
-      expect(presalesContentState.contentDeletedAt).toBe(deletedAt);
+      expect(deleted.status).toBe(204);
+      expect(presalesContentState.contentDeletedAt).toBeNull();
     });
 
-    expect(get).not.toHaveBeenCalled();
-    expect(put).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(markPresalesFileContentDeleted).not.toHaveBeenCalled();
   });
 
-  it("replays one durable file id after the create response is lost, then tombstones cleanup", async () => {
+  it("replays one durable file id after the create response is lost and cleanup is retained", async () => {
     const idempotencyKey =
       "geo-custom-question-file:operation-hash:archive:0:v1";
     const signedUrl =
@@ -1118,12 +1093,10 @@ describe("presales create-time upload capability", () => {
       expect(cleaned.status).toBe(204);
 
       const lateReplay = await fetch(`${baseUrl}/files`, request);
-      expect(lateReplay.status).toBe(410);
-      await expect(lateReplay.json()).resolves.toEqual({
-        error: {
-          code: "FILE_OPERATION_RETIRED",
-          message: "该文件创建操作已完成清理，不能再次执行",
-        },
+      expect(lateReplay.status).toBe(200);
+      await expect(lateReplay.json()).resolves.toMatchObject({
+        id: "file-response-lost",
+        filename: "custom.zip",
       });
     });
 
@@ -1521,7 +1494,7 @@ describe("presales deletion routes", () => {
     }
   });
 
-  it("returns 204 when the upstream file is already absent", async () => {
+  it("retains a legacy Provider file when Website requests cleanup", async () => {
     const deleteMock = vi
       .spyOn(axios, "delete")
       .mockResolvedValue({ status: 404, data: { message: "not found" } });
@@ -1535,15 +1508,12 @@ describe("presales deletion routes", () => {
       expect(await response.text()).toBe("");
     });
 
-    expect(deleteMock).toHaveBeenCalledOnce();
-    expect(deleteMock.mock.calls[0][0]).toContain("/v1/files/file-1");
-    expect(deletePresalesFileEvidence).toHaveBeenCalledTimes(
-      WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED ? 1 : 0,
-    );
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(deletePresalesFileEvidence).not.toHaveBeenCalled();
   });
 
-  it("forwards a controlled JSON error for an upstream failure", async () => {
-    vi.spyOn(axios, "delete").mockResolvedValue({
+  it("does not contact Provider when its delete endpoint would fail", async () => {
+    const deleteMock = vi.spyOn(axios, "delete").mockResolvedValue({
       status: 503,
       data: { message: "storage unavailable" },
     });
@@ -1553,59 +1523,10 @@ describe("presales deletion routes", () => {
         method: "DELETE",
         headers: { "x-frontmind-service-token": token },
       });
-      expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toEqual({
-        error: {
-          code: "UPSTREAM_FILE_DELETE_FAILED",
-          message: "storage unavailable",
-        },
-      });
+      expect(response.status).toBe(204);
     });
+    expect(deleteMock).not.toHaveBeenCalled();
   });
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "keeps an explicitly deleted project file retryable while its upload request is in flight",
-    async () => {
-      vi.mocked(getPresalesCredentialForResource).mockResolvedValue({
-        id: "credential-1",
-        version: 1,
-        apiKey: "sk-delete-file",
-        fingerprint: "fingerprint",
-        status: "active",
-        verifiedAt: new Date(),
-        resource: {
-          id: "resource-1",
-          projectId: "project-20260728-0001",
-          apiCredentialId: "credential-1",
-          kind: "file",
-          upstreamId: "file-1",
-          parentTaskId: null,
-          contentSource: "user_upload",
-          uploadReservedAt: new Date(),
-          uploadedAt: null,
-          contentExpiresAt: null,
-          contentDeletedAt: null,
-          createdAt: new Date(),
-        },
-      });
-      const deleteMock = vi.spyOn(axios, "delete");
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/files/file-1`, {
-          method: "DELETE",
-          headers: { "x-frontmind-service-token": token },
-        });
-        expect(response.status).toBe(425);
-        expect(response.headers.get("retry-after")).toBe("2");
-        await expect(response.json()).resolves.toMatchObject({
-          error: { code: "FILE_DELETE_PENDING" },
-          retryAfterMs: 2_000,
-        });
-      });
-      expect(deleteMock).not.toHaveBeenCalled();
-      expect(deletePresalesFileEvidence).not.toHaveBeenCalled();
-    },
-  );
 
   it("uploads website attachments to the exact SigV4 URL without redirects", async () => {
     const signedUrl =
@@ -1691,8 +1612,8 @@ describe("presales deletion routes", () => {
     expect(put).not.toHaveBeenCalled();
   });
 
-  it.runIf(!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "keeps the legacy generic task cleanup as a retained acknowledgement in D0",
+  it(
+    "keeps the legacy generic task cleanup as a retained acknowledgement",
     async () => {
       const deleteMock = vi.spyOn(axios, "delete");
 
@@ -1702,9 +1623,7 @@ describe("presales deletion routes", () => {
           headers: { "x-frontmind-service-token": token },
         });
         expect(response.status).toBe(204);
-        expect(response.headers.get("x-frontmind-task-retention")).toBe(
-          "retained",
-        );
+        expect(response.headers.get("x-frontmind-task-retention")).toBeNull();
       });
 
       expect(deleteMock).not.toHaveBeenCalled();
@@ -1712,343 +1631,8 @@ describe("presales deletion routes", () => {
     },
   );
 
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "physically deletes an upstream task and its local evidence mappings",
-    async () => {
-      const deleteMock = vi
-        .spyOn(axios, "delete")
-        .mockResolvedValue({ status: 204, data: null });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/tasks/task-1`, {
-          method: "DELETE",
-          headers: { "x-frontmind-service-token": token },
-        });
-        expect(response.status).toBe(204);
-        expect(response.headers.get("x-frontmind-task-retention")).toBeNull();
-        expect(await response.text()).toBe("");
-      });
-
-      expect(deleteMock).toHaveBeenCalledOnce();
-      expect(deleteMock.mock.calls[0][0]).toContain("/v1/tasks/task-1");
-      expect(deletePresalesTaskEvidence).toHaveBeenCalledWith({
-        taskId: "task-1",
-        apiCredentialId: "credential-1",
-        deletedFileIds: [],
-      });
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "treats missing local or upstream tasks as an idempotent success",
-    async () => {
-      vi.mocked(getPresalesCredentialForResource)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce({
-          id: "credential-1",
-          version: 1,
-          apiKey: "sk-delete-task",
-          fingerprint: "fingerprint",
-          status: "active",
-          verifiedAt: new Date(),
-          resource: {
-            id: "task-resource-1",
-            apiCredentialId: "credential-1",
-            kind: "task",
-            upstreamId: "task-1",
-            parentTaskId: null,
-            contentSource: null,
-            uploadReservedAt: null,
-            uploadedAt: null,
-            contentExpiresAt: null,
-            contentDeletedAt: null,
-            createdAt: new Date(),
-          },
-        } as never);
-      const deleteMock = vi
-        .spyOn(axios, "delete")
-        .mockResolvedValue({ status: 404, data: { message: "not found" } });
-
-      await withServer(async (baseUrl) => {
-        const localReplay = await fetch(`${baseUrl}/tasks/task-1`, {
-          method: "DELETE",
-          headers: { "x-frontmind-service-token": token },
-        });
-        expect(localReplay.status).toBe(204);
-        expect(localReplay.headers.get("idempotent-replayed")).toBe("true");
-
-        const upstreamReplay = await fetch(`${baseUrl}/tasks/task-1`, {
-          method: "DELETE",
-          headers: { "x-frontmind-service-token": token },
-        });
-        expect(upstreamReplay.status).toBe(204);
-      });
-
-      expect(deleteMock).toHaveBeenCalledOnce();
-      expect(deletePresalesTaskEvidence).toHaveBeenCalledOnce();
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "keeps local evidence mapped when upstream task deletion fails",
-    async () => {
-      vi.spyOn(axios, "delete").mockResolvedValue({
-        status: 503,
-        data: { message: "task service unavailable" },
-      });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(`${baseUrl}/tasks/task-1`, {
-          method: "DELETE",
-          headers: { "x-frontmind-service-token": token },
-        });
-        expect(response.status).toBe(503);
-        await expect(response.json()).resolves.toEqual({
-          error: {
-            code: "UPSTREAM_TASK_DELETE_FAILED",
-            message: "task service unavailable",
-          },
-        });
-      });
-
-      expect(deletePresalesTaskEvidence).not.toHaveBeenCalled();
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "physically purges a legacy monitor run only after provider cleanup",
-    async () => {
-      vi.mocked(purgePresalesProjectMonitorRuns).mockResolvedValue({
-        deletedRuns: 1,
-        pendingRuns: 0,
-      });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(
-          `${baseUrl}/projects/project-20260728-0001/monitor-runs/00000000-0000-4000-8000-000000000001`,
-          {
-            method: "DELETE",
-            headers: { "x-frontmind-service-token": token },
-          },
-        );
-        expect(response.status).toBe(204);
-      });
-
-      expect(purgePresalesProjectMonitorRuns).toHaveBeenCalledWith({
-        projectId: "project-20260728-0001",
-        runIds: ["00000000-0000-4000-8000-000000000001"],
-      });
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "returns a retriable non-success while a legacy monitor submit is in flight",
-    async () => {
-      vi.mocked(purgePresalesProjectMonitorRuns).mockResolvedValue({
-        deletedRuns: 0,
-        pendingRuns: 1,
-      });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(
-          `${baseUrl}/projects/project-20260728-0001/monitor-runs/00000000-0000-4000-8000-000000000001`,
-          {
-            method: "DELETE",
-            headers: { "x-frontmind-service-token": token },
-          },
-        );
-        expect(response.status).toBe(425);
-        expect(response.headers.get("retry-after")).toBe("2");
-        await expect(response.json()).resolves.toEqual({
-          error: {
-            code: "MONITOR_DELETE_PENDING",
-            message: "监控任务正在提交，请稍后重试项目删除",
-          },
-          retryAfterMs: 2_000,
-        });
-      });
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "purges every durable project task target and marks the tombstone deleted",
-    async () => {
-      vi.mocked(readPresalesProjectTaskPurgeSnapshot).mockResolvedValue({
-        projectId: "project-20260728-0001",
-        pendingReservations: 0,
-        tasks: [
-          {
-            taskId: "task-project-1",
-            apiCredentialId: "credential-1",
-          },
-        ],
-      });
-      vi.mocked(getPresalesCredentialById).mockResolvedValue({
-        id: "credential-1",
-        version: 1,
-        apiKey: "sk-delete-project-task",
-        fingerprint: "fingerprint",
-        status: "active",
-        verifiedAt: new Date(),
-        retiredAt: null,
-      });
-      vi.spyOn(axios, "delete").mockResolvedValue({
-        status: 404,
-        data: { message: "already absent" },
-      });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(
-          `${baseUrl}/projects/project-20260728-0001/tasks`,
-          {
-            method: "DELETE",
-            headers: { "x-frontmind-service-token": token },
-          },
-        );
-        expect(response.status).toBe(200);
-        await expect(response.json()).resolves.toEqual({
-          schemaVersion: 1,
-          projectId: "project-20260728-0001",
-          status: "deleted",
-          deletedTasks: 1,
-          deletedFiles: 0,
-          pendingReservations: 0,
-        });
-      });
-
-      expect(deletePresalesTaskEvidence).toHaveBeenCalledWith({
-        taskId: "task-project-1",
-        apiCredentialId: "credential-1",
-        deletedFileIds: [],
-      });
-      expect(completePresalesProjectTaskPurge).toHaveBeenCalledWith(
-        "project-20260728-0001",
-      );
-      expect(purgePresalesProjectMonitorRuns).toHaveBeenCalledWith({
-        projectId: "project-20260728-0001",
-      });
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "returns 202 until an in-flight project task records its purge target",
-    async () => {
-      vi.mocked(readPresalesProjectTaskPurgeSnapshot).mockResolvedValue({
-        projectId: "project-20260728-0001",
-        pendingReservations: 1,
-        tasks: [],
-      });
-      vi.mocked(completePresalesProjectTaskPurge).mockResolvedValue({
-        completed: false,
-        pendingReservations: 1,
-        remainingTasks: 0,
-      });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(
-          `${baseUrl}/projects/project-20260728-0001/tasks`,
-          {
-            method: "DELETE",
-            headers: { "x-frontmind-service-token": token },
-          },
-        );
-        expect(response.status).toBe(202);
-        expect(response.headers.get("retry-after")).toBe("2");
-        await expect(response.json()).resolves.toEqual({
-          schemaVersion: 1,
-          projectId: "project-20260728-0001",
-          status: "deleting",
-          deletedTasks: 0,
-          deletedFiles: 0,
-          pendingReservations: 1,
-          remainingTasks: 0,
-          retryAfterMs: 2_000,
-        });
-      });
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "returns 202 while a project file upload remains inside its five-minute request window",
-    async () => {
-      vi.mocked(readPresalesProjectTaskPurgeSnapshot).mockResolvedValue({
-        projectId: "project-20260728-0001",
-        pendingReservations: 0,
-        tasks: [],
-      });
-      vi.mocked(countPresalesProjectPendingFileUploads).mockResolvedValue(1);
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(
-          `${baseUrl}/projects/project-20260728-0001/tasks`,
-          {
-            method: "DELETE",
-            headers: { "x-frontmind-service-token": token },
-          },
-        );
-        expect(response.status).toBe(202);
-        expect(response.headers.get("retry-after")).toBe("2");
-        await expect(response.json()).resolves.toMatchObject({
-          status: "deleting",
-          pendingReservations: 1,
-          retryAfterMs: 2_000,
-        });
-      });
-      expect(completePresalesProjectTaskPurge).not.toHaveBeenCalled();
-    },
-  );
-
-  it.runIf(WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "returns project-level 202 when a late output file appears during task evidence deletion",
-    async () => {
-      vi.mocked(readPresalesProjectTaskPurgeSnapshot).mockResolvedValue({
-        projectId: "project-20260728-0001",
-        pendingReservations: 0,
-        tasks: [
-          { taskId: "task-late-output", apiCredentialId: "credential-1" },
-        ],
-      });
-      vi.mocked(readPresalesTaskEvidenceFileIds).mockResolvedValue([
-        "file-before-lock",
-      ]);
-      vi.mocked(deletePresalesTaskEvidence).mockRejectedValueOnce(
-        new AuthServiceError("IDEMPOTENCY_PENDING", "late output file", 1_000),
-      );
-      vi.mocked(getPresalesCredentialById).mockResolvedValue({
-        id: "credential-1",
-        version: 1,
-        apiKey: "sk-delete-project-task",
-        fingerprint: "fingerprint",
-        status: "active",
-        verifiedAt: new Date(),
-        retiredAt: null,
-      });
-      vi.spyOn(axios, "delete").mockResolvedValue({ status: 204, data: null });
-
-      await withServer(async (baseUrl) => {
-        const response = await fetch(
-          `${baseUrl}/projects/project-20260728-0001/tasks`,
-          {
-            method: "DELETE",
-            headers: { "x-frontmind-service-token": token },
-          },
-        );
-        expect(response.status).toBe(202);
-        expect(response.headers.get("retry-after")).toBe("2");
-        await expect(response.json()).resolves.toMatchObject({
-          schemaVersion: 1,
-          projectId: "project-20260728-0001",
-          status: "deleting",
-          pendingReservations: 1,
-          retryAfterMs: 2_000,
-        });
-      });
-      expect(completePresalesProjectTaskPurge).not.toHaveBeenCalled();
-    },
-  );
-
-  it.runIf(!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED)(
-    "rejects project deletion routes before invoking purge providers in D0",
+  it(
+    "acknowledges project deletion routes without invoking purge providers",
     async () => {
       await withServer(async (baseUrl) => {
         for (const endpoint of [
@@ -2059,10 +1643,19 @@ describe("presales deletion routes", () => {
             method: "DELETE",
             headers: { "x-frontmind-service-token": token },
           });
-          expect(response.status).toBe(503);
-          await expect(response.json()).resolves.toMatchObject({
-            error: { code: "PROJECT_DELETE_DISABLED" },
-          });
+          if (endpoint.includes("monitor-runs")) {
+            expect(response.status).toBe(204);
+          } else {
+            expect(response.status).toBe(200);
+            await expect(response.json()).resolves.toEqual({
+              schemaVersion: 1,
+              projectId: "project-20260728-0001",
+              status: "deleted",
+              deletedTasks: 0,
+              deletedFiles: 0,
+              pendingReservations: 0,
+            });
+          }
         }
       });
       expect(purgePresalesProjectMonitorRuns).not.toHaveBeenCalled();
@@ -2149,7 +1742,7 @@ describe("presales idempotent task route", () => {
     );
   });
 
-  it("compensates a known upstream task when its project reservation was deleted", async () => {
+  it("adopts a known upstream task when local reservation completion fails", async () => {
     vi.mocked(acquirePresalesTaskReservation).mockResolvedValue({
       state: "acquired",
       reservationId: "reservation-delete-race",
@@ -2182,23 +1775,20 @@ describe("presales idempotent task route", () => {
           projectId: "project-20260728-0001",
         }),
       });
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(502);
     });
 
-    expect(cleanup).toHaveBeenCalledWith(
-      expect.stringContaining("/v1/tasks/task-delete-race"),
-      expect.any(Object),
-    );
-    expect(releasePresalesTaskReservation).toHaveBeenCalledWith(
-      expect.objectContaining({
-        reservationId: "reservation-delete-race",
-        attemptId: "attempt-delete-race",
-      }),
-    );
-    expect(retainPresalesTaskPurgeTarget).not.toHaveBeenCalled();
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(releasePresalesTaskReservation).not.toHaveBeenCalled();
+    expect(retainPresalesTaskPurgeTarget).toHaveBeenCalledWith({
+      reservationId: "reservation-delete-race",
+      attemptId: "attempt-delete-race",
+      apiCredentialId: "credential-1",
+      upstreamTaskId: "task-delete-race",
+    });
   });
 
-  it("retains a known task ID for project-purge retry when immediate compensation fails", async () => {
+  it("retains a known task ID without attempting Provider compensation", async () => {
     vi.mocked(acquirePresalesTaskReservation).mockResolvedValue({
       state: "acquired",
       reservationId: "reservation-cleanup-retry",
@@ -2213,7 +1803,7 @@ describe("presales idempotent task route", () => {
       status: 201,
       data: { id: "task-cleanup-retry", status: "queued" },
     });
-    vi.spyOn(axios, "delete").mockResolvedValue({
+    const cleanup = vi.spyOn(axios, "delete").mockResolvedValue({
       status: 503,
       data: { message: "provider unavailable" },
     });
@@ -2240,6 +1830,7 @@ describe("presales idempotent task route", () => {
       apiCredentialId: "credential-1",
       upstreamTaskId: "task-cleanup-retry",
     });
+    expect(cleanup).not.toHaveBeenCalled();
     expect(releasePresalesTaskReservation).not.toHaveBeenCalled();
   });
 
@@ -2336,7 +1927,7 @@ describe("presales idempotent task route", () => {
     await responsePromise;
   });
 
-  it("retains a known output file for project purge when immediate deletion fails", async () => {
+  it("retains a known output file without Provider deletion", async () => {
     vi.mocked(acquirePresalesTaskReservation).mockResolvedValue({
       state: "acquired",
       reservationId: "reservation-output-cleanup",
@@ -2368,7 +1959,7 @@ describe("presales idempotent task route", () => {
       status: 200,
       data: { id: "file-output-cleanup", filename: "output.md" },
     });
-    vi.spyOn(axios, "delete").mockResolvedValue({
+    const cleanup = vi.spyOn(axios, "delete").mockResolvedValue({
       status: 503,
       data: { message: "provider unavailable" },
     });
@@ -2389,7 +1980,7 @@ describe("presales idempotent task route", () => {
           projectId: "project-20260728-0001",
         }),
       });
-      expect(response.status).toBe(502);
+      expect(response.status).toBe(201);
     });
 
     expect(retainPresalesProjectFilePurgeTarget).toHaveBeenCalledWith({
@@ -2397,6 +1988,7 @@ describe("presales idempotent task route", () => {
       fileId: "file-output-cleanup",
       apiCredentialId: "credential-1",
     });
+    expect(cleanup).not.toHaveBeenCalled();
     expect(deletePresalesFileEvidence).not.toHaveBeenCalledWith({
       fileId: "file-output-cleanup",
       apiCredentialId: "credential-1",

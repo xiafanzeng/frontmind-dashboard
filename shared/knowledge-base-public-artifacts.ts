@@ -4,6 +4,16 @@ import {
 } from "./frontmind-public-brand";
 
 const HTTP_URL_PATTERN = /https?:\/\/[^\s<>"'`\])}]+/giu;
+const IMAGE_FILENAME_EXTENSION_PATTERN =
+  "(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|tiff?|webp)";
+const IMAGE_FILENAME_TOKEN_PATTERN = new RegExp(
+  String.raw`(?:[a-z]:[\\/])?(?:[^\\/\s（）()【】\[\]，,。；;：:'"]+[\\/])*[^\\/\s（）()【】\[\]，,。；;：:'"]+\.${IMAGE_FILENAME_EXTENSION_PATTERN}(?:[?#][^\s（）()【】\[\]]*)?`,
+  "giu",
+);
+const IMAGE_FILENAME_WHOLE_PATTERN = new RegExp(
+  String.raw`^(?:[a-z]:[\\/])?(?:.*[\\/])?[^\\/]+\.${IMAGE_FILENAME_EXTENSION_PATTERN}(?:[?#].*)?$`,
+  "iu",
+);
 
 /**
  * Produce customer-owned text without changing the immutable source record.
@@ -29,6 +39,27 @@ export function customerSafeKnowledgeFilename(
     .pop()
     ?.trim();
   return filename || fallback;
+}
+
+/**
+ * Keep only a human-authored image label. Imported archive paths and upload
+ * filenames are storage metadata, not customer copy. Historical snapshots can
+ * contain those values in caption/alt, so this filter is also applied while
+ * projecting and rendering old records.
+ */
+export function customerSafeKnowledgeAssetLabel(
+  value: unknown,
+): string | undefined {
+  const source = customerSafeKnowledgeText(value).trim();
+  if (!source || IMAGE_FILENAME_WHOLE_PATTERN.test(source)) return undefined;
+  const label = source
+    .replace(IMAGE_FILENAME_TOKEN_PATTERN, " ")
+    .replace(/(?:（\s*）|\(\s*\)|【\s*】|\[\s*\])/gu, " ")
+    .replace(/\s+([，,。；;：:])/gu, "$1")
+    .replace(/[\s，,。；;：:]+$/gu, "")
+    .replace(/\s{2,}/gu, " ")
+    .trim();
+  return label || undefined;
 }
 
 export function customerSafeKnowledgeUrls(value: unknown): string[] {
@@ -128,50 +159,82 @@ export function toCustomerSafeKnowledgeDocument<
     ...(Array.isArray(document.assetIds)
       ? { assetIds: customerSafeKnowledgeReferenceIds(document.assetIds) }
       : {}),
-  } as T;
+  } as unknown as T;
 }
 
 export function toCustomerSafeKnowledgeAsset<T extends Record<string, unknown>>(
   asset: T,
   index: number,
 ): T {
-  const id =
-    typeof asset.id === "string"
-      ? customerSafeKnowledgeText(asset.id)
+  const opaqueId = `public-asset-${index + 1}`;
+  const caption = customerSafeKnowledgeAssetLabel(asset.caption);
+  const alt = customerSafeKnowledgeAssetLabel(asset.alt);
+  const sourceKind = [
+    "official_web",
+    "official_document",
+    "official_logo_upload",
+    "user_upload",
+  ].includes(String(asset.sourceKind || ""))
+    ? String(asset.sourceKind)
+    : undefined;
+  const ownership = ["first_party", "third_party", "unknown"].includes(
+    String(asset.ownership || ""),
+  )
+    ? String(asset.ownership)
+    : undefined;
+  const assetType = [
+    "brand_identity",
+    "product_ui",
+    "product_diagram",
+    "case_photo",
+    "team_photo",
+    "environment_photo",
+    "certificate_badge",
+    "document_figure",
+    "customer_supplied",
+    "other",
+  ].includes(String(asset.assetType || ""))
+    ? String(asset.assetType)
+    : undefined;
+  const displayRole = ["hero", "inline", "badge"].includes(
+    String(asset.displayRole || ""),
+  )
+    ? String(asset.displayRole)
+    : undefined;
+  const sourcePageUrl =
+    sourceKind === "official_web"
+      ? customerSafeKnowledgeUrl(asset.sourcePageUrl)
       : undefined;
+  const authenticatedUrl = String(asset.url || "").trim();
   return {
-    ...customerSafeKnowledgeRecord(asset),
-    ...(id ? { id } : {}),
-    // Storage keys and upstream file identities are not public capabilities.
-    key: id || `public-asset-${index + 1}`,
-    path: customerSafeKnowledgeText(asset.path),
-    ...(typeof asset.caption === "string"
-      ? { caption: customerSafeKnowledgeText(asset.caption) }
+    // This is an explicit public allowlist. Raw ids, storage keys, archive
+    // paths, hashes, upload provenance and upstream asset URLs stay server-side.
+    id: opaqueId,
+    key: opaqueId,
+    path: `assets/${opaqueId}`,
+    ...(typeof asset.mimeType === "string"
+      ? { mimeType: customerSafeKnowledgeText(asset.mimeType) }
       : {}),
-    ...(typeof asset.alt === "string"
-      ? { alt: customerSafeKnowledgeText(asset.alt) }
-      : {}),
+    ...(typeof asset.size === "number" ? { size: asset.size } : {}),
+    ...(typeof asset.width === "number" ? { width: asset.width } : {}),
+    ...(typeof asset.height === "number" ? { height: asset.height } : {}),
+    ...(caption ? { caption } : {}),
+    ...(alt ? { alt } : {}),
     ...(typeof asset.branchId === "string"
       ? { branchId: customerSafeKnowledgeText(asset.branchId) }
       : {}),
-    ...(typeof asset.sourceDocumentPath === "string"
+    ...(Array.isArray(asset.documentIds)
       ? {
-          sourceDocumentPath: customerSafeKnowledgeText(
-            asset.sourceDocumentPath,
-          ),
+          documentIds: customerSafeKnowledgeReferenceIds(asset.documentIds),
         }
       : {}),
-    ...(typeof asset.sourceUploadFilename === "string"
-      ? {
-          sourceUploadFilename: customerSafeKnowledgeFilename(
-            asset.sourceUploadFilename,
-            "FrontMind-upload",
-          ),
-        }
+    ...(sourceKind ? { sourceKind } : {}),
+    ...(ownership ? { ownership } : {}),
+    ...(assetType ? { assetType } : {}),
+    ...(displayRole ? { displayRole } : {}),
+    ...(sourcePageUrl ? { sourcePageUrl } : {}),
+    ...(authenticatedUrl.startsWith("/api/dashboard/knowledge/assets/")
+      ? { url: authenticatedUrl }
       : {}),
-    sourcePageUrl: customerSafeKnowledgeUrl(asset.sourcePageUrl),
-    sourceAssetUrl: customerSafeKnowledgeUrl(asset.sourceAssetUrl),
-    sourceUploadFileId: undefined,
-    sourceUploadSha256: undefined,
-  } as T;
+  } as unknown as T;
 }

@@ -46,7 +46,10 @@ import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { consumePendingFrontMindBuildDraft } from "@/lib/build-version";
 import { useComposition } from "@/hooks/useComposition";
 import { chatAttachmentSizeError } from "@/lib/attachment-files";
-import { KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE } from "@/lib/knowledge-progress";
+import {
+  KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE,
+  requestKnowledgeBaseReset,
+} from "@/lib/knowledge-progress";
 
 interface FilePreview {
   file: File;
@@ -147,12 +150,14 @@ export default function ChatInput({
   composerPrefill,
   responseLogicContext,
   knowledgeBaseProgress,
+  knowledgeBaseResetRevision,
 }: {
   fixedAgentProfile?: string;
   syncKnowledgeBaseSnapshot?: boolean;
   composerPrefill?: string;
   responseLogicContext?: ResponseLogicTaskContext;
   knowledgeBaseProgress?: KnowledgeBaseProgressDto | null;
+  knowledgeBaseResetRevision?: number;
 }) {
   const responseLogicInitialPromptLocked = Boolean(
     responseLogicContext && composerPrefill,
@@ -232,8 +237,39 @@ export default function ChatInput({
     };
   }, [resizeComposer]);
 
-  const { sendMessage, uploadProgress: rawUploadProgress } = useSendMessage();
+  const {
+    sendMessage,
+    uploadProgress: rawUploadProgress,
+    knowledgeBaseAttachmentAttempt,
+    continueKnowledgeBaseAttachmentAttempt,
+    discardKnowledgeBaseAttachmentAttempt,
+  } = useSendMessage();
   const { activeConversation } = useConversation();
+  const frozenConversationModel = [...(activeConversation?.messages ?? [])]
+    .reverse()
+    .find(
+      (message) =>
+        message.modelName &&
+        MODEL_OPTIONS.some((option) => option.value === message.modelName),
+    )?.modelName;
+  const modelSelectionLocked =
+    !fixedAgentProfile && Boolean(activeConversation?.previousResponseId);
+
+  useEffect(() => {
+    if (fixedAgentProfile) return;
+    if (frozenConversationModel) {
+      setSelectedModel(frozenConversationModel);
+      return;
+    }
+    if (!activeConversation?.previousResponseId) {
+      setSelectedModel(getConfig().agentProfile || "frontmind-pro");
+    }
+  }, [
+    activeConversation?.id,
+    activeConversation?.previousResponseId,
+    fixedAgentProfile,
+    frozenConversationModel,
+  ]);
 
   // Only show upload progress if it belongs to the current active conversation
   const uploadProgress =
@@ -245,10 +281,53 @@ export default function ChatInput({
   const isRunning =
     activeConversation?.status === "running" ||
     activeConversation?.status === "pending";
+  const candidateKnowledgeBaseAttachmentAttempt =
+    knowledgeBaseAttachmentAttempt;
+  const matchingKnowledgeBaseAttachmentAttempt = (() => {
+    const candidate = candidateKnowledgeBaseAttachmentAttempt;
+    if (!syncKnowledgeBaseSnapshot || !candidate) return null;
+    if (candidate.conversationId !== activeConversation?.id) return null;
+    if (
+      candidate.generation !== activeConversation?.knowledgeBase?.generation
+    ) {
+      return null;
+    }
+    const activeClientRequestId =
+      activeConversation?.knowledgeBase?.activeClientRequestId;
+    if (
+      activeClientRequestId &&
+      candidate.clientRequestId !== activeClientRequestId
+    ) {
+      return null;
+    }
+    const activeTurnId = activeConversation?.knowledgeBase?.activeTurnId;
+    if (activeTurnId && candidate.turnId && candidate.turnId !== activeTurnId) {
+      return null;
+    }
+    const activeResetRevision =
+      activeConversation?.knowledgeBase?.activeTurnResetRevision;
+    if (
+      activeResetRevision !== undefined &&
+      candidate.resetRevision !== activeResetRevision
+    ) {
+      return null;
+    }
+    return candidate;
+  })();
   const knowledgeBaseAttachmentResumeRequired =
+    matchingKnowledgeBaseAttachmentAttempt?.phase === "failed_retryable";
+  const knowledgeBaseAttachmentReconciliationPending =
+    matchingKnowledgeBaseAttachmentAttempt?.phase === "reconciling_dispatch";
+  const knowledgeBaseAttachmentAttemptActive = Boolean(
+    matchingKnowledgeBaseAttachmentAttempt &&
+      matchingKnowledgeBaseAttachmentAttempt.phase !== "accepted",
+  );
+  const knowledgeBaseFreshResetRequired = Boolean(
     syncKnowledgeBaseSnapshot &&
-    activeConversation?.knowledgeBase?.notice?.code ===
-      "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED";
+      activeConversation?.knowledgeBase?.activeTurnAwaitingClientAttachments ===
+        true &&
+      !matchingKnowledgeBaseAttachmentAttempt,
+  );
   const knowledgeBaseLogoProvenanceRepairRequired =
     syncKnowledgeBaseSnapshot &&
     activeConversation?.knowledgeBase?.notice?.code ===
@@ -270,9 +349,10 @@ export default function ChatInput({
     activeConversation?.knowledgeBase?.canReply !== true;
   const inputLocked =
     knowledgeBaseLogoProvenanceRepairRequired ||
-    knowledgeBaseAttachmentResumeRequired ||
-    ((isRunning || knowledgeInteractionLocked) &&
-      !knowledgeBaseAttachmentResumeRequired);
+    knowledgeBaseAttachmentAttemptActive ||
+    knowledgeBaseFreshResetRequired ||
+    isRunning ||
+    knowledgeInteractionLocked;
   const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === knowledgeBaseProgress.build.currentLeafId);
@@ -289,6 +369,14 @@ export default function ChatInput({
   const officialLogoAvailable =
     syncKnowledgeBaseSnapshot &&
     knowledgeBaseProgress?.build.logoAvailable === true;
+  const optionalOfficialLogoChoice = Boolean(
+    syncKnowledgeBaseSnapshot &&
+      knowledgeBaseProgress?.build.executionMode === "materialized_bundle_v1" &&
+      currentKnowledgeLeaf &&
+      knowledgeBaseProgress.summary.handled === 0 &&
+      !officialLogoAvailable &&
+      !officialLogoRequiredByBuild,
+  );
   const officialLogoRequired =
     officialLogoRequiredByBuild || replacingOfficialLogo;
 
@@ -299,6 +387,13 @@ export default function ChatInput({
     setText("");
     setFiles([]);
   }, [officialLogoRequired]);
+
+  useEffect(() => {
+    if (!matchingKnowledgeBaseAttachmentAttempt || files.length === 0) return;
+    // Ownership of the browser File has moved to the page-memory attempt. The
+    // composer selection can clear without losing retryable bytes.
+    setFiles([]);
+  }, [files.length, matchingKnowledgeBaseAttachmentAttempt]);
 
   const clearSelectedFiles = useCallback(() => {
     setFiles([]);
@@ -390,7 +485,9 @@ export default function ChatInput({
       if (officialLogoRequired) {
         if (selectedFiles.length !== 1) {
           toast.error("请先上传一张企业官方主 Logo", {
-            description: "上传并校验成功后，才可以确认第一个知识节点。",
+            description: officialLogoRequiredByBuild
+              ? "上传并校验成功后，才可以确认第一个知识节点。"
+              : "Logo 为可选项；如暂不上传，可返回并直接确认当前内容。",
           });
           return;
         }
@@ -427,6 +524,9 @@ export default function ChatInput({
             syncKnowledgeBaseSnapshot,
             knowledgeBaseExpectedGeneration: syncKnowledgeBaseSnapshot
               ? knowledgeBaseReplySnapshot?.generation
+              : undefined,
+            knowledgeBaseExpectedResetRevision: syncKnowledgeBaseSnapshot
+              ? knowledgeBaseResetRevision
               : undefined,
             knowledgeBaseExpectedStateEpoch: syncKnowledgeBaseSnapshot
               ? knowledgeBaseReplySnapshot?.stateEpoch
@@ -466,7 +566,9 @@ export default function ChatInput({
       knowledgeBaseNotStarted,
       knowledgeBaseAttachmentResumeRequired,
       knowledgeBaseReplySnapshot,
+      knowledgeBaseResetRevision,
       officialLogoRequired,
+      officialLogoRequiredByBuild,
       knowledgeBaseProgress,
       currentKnowledgeLeaf,
       responseLogicContext,
@@ -633,9 +735,11 @@ export default function ChatInput({
                         )}
                       >
                         {officialLogoRequired
-                          ? replacingOfficialLogo
-                            ? "更换企业主 Logo"
-                            : "需要上传企业主 Logo"
+                          ? replacingOfficialLogo && !officialLogoAvailable
+                            ? "上传企业主 Logo（可选）"
+                            : replacingOfficialLogo
+                              ? "更换企业主 Logo"
+                              : "需要上传企业主 Logo"
                           : "当前待确认"}
                       </p>
                       <p
@@ -659,7 +763,9 @@ export default function ChatInput({
                       >
                         {officialLogoRequired
                           ? replacingOfficialLogo
-                            ? "请选择一张新图片；提交后将替换当前 Logo，当前知识节点不会推进。"
+                            ? officialLogoAvailable
+                              ? "请选择一张新图片；提交后将替换当前 Logo，当前知识节点不会推进。"
+                              : "请选择一张图片作为企业主 Logo；也可暂不上传并直接确认当前内容。"
                             : "当前节点尚未绑定 Logo。请选择一张图片；用户选择后将直接作为当前 Logo，并可在首节点确认前再次更换。"
                           : currentNodePresentationReady
                             ? "可直接确认，也可以输入修改意见或上传补充资料。"
@@ -667,6 +773,19 @@ export default function ChatInput({
                       </p>
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
+                      {!officialLogoRequired && optionalOfficialLogoChoice && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setReplacingOfficialLogo(true)}
+                          disabled={quickActionsDisabled}
+                          className="rounded-xl bg-white"
+                        >
+                          <Upload className="h-4 w-4" />
+                          上传 Logo（可选）
+                        </Button>
+                      )}
                       {!officialLogoRequired && officialLogoAvailable && (
                         <Button
                           type="button"
@@ -680,6 +799,22 @@ export default function ChatInput({
                           更换 Logo
                         </Button>
                       )}
+                      {replacingOfficialLogo &&
+                        !officialLogoRequiredByBuild && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              clearSelectedFiles();
+                              setReplacingOfficialLogo(false);
+                            }}
+                            disabled={isSending || isUploading}
+                            className="rounded-xl bg-white"
+                          >
+                            暂不上传
+                          </Button>
+                        )}
                       <Button
                         type="button"
                         size="sm"
@@ -711,7 +846,9 @@ export default function ChatInput({
                             : files.length === 1
                               ? "使用此图并继续"
                               : "选择 Logo 原图"
-                          : "确认当前内容"}
+                          : optionalOfficialLogoChoice
+                            ? "跳过 Logo，确认当前内容"
+                            : "确认当前内容"}
                       </Button>
                     </div>
                   </div>
@@ -731,6 +868,73 @@ export default function ChatInput({
               )}
             </div>
           )}
+
+        {knowledgeBaseAttachmentResumeRequired &&
+          matchingKnowledgeBaseAttachmentAttempt && (
+            <div className="mb-3 rounded-xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950">
+              <p className="font-medium">本轮资料仍保留在当前页面</p>
+              <p className="mt-1 text-xs leading-5 text-amber-900/80">
+                {matchingKnowledgeBaseAttachmentAttempt.lastError ||
+                  "上传或暂存暂时中断。继续时会复用同一请求、同一附件清单和已完成的暂存结果。"}
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => void continueKnowledgeBaseAttachmentAttempt()}
+                  disabled={isSending || isUploading}
+                >
+                  {isSending || isUploading ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Upload className="h-4 w-4" />
+                  )}
+                  继续上传当前资料
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={discardKnowledgeBaseAttachmentAttempt}
+                  disabled={isSending || isUploading}
+                >
+                  放弃本轮上传
+                </Button>
+              </div>
+            </div>
+          )}
+
+        {knowledgeBaseAttachmentReconciliationPending &&
+          matchingKnowledgeBaseAttachmentAttempt && (
+            <div className="mb-3 rounded-xl border border-violet-200 bg-violet-50/80 p-3 text-sm text-violet-950">
+              <div className="flex items-center gap-2 font-medium">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                正在核对本轮是否已受理
+              </div>
+              <p className="mt-1 text-xs leading-5 text-violet-900/75">
+                当前页面仍保留全部资料；系统只核对同一请求，不会创建新的 turn
+                或第二个任务。
+              </p>
+            </div>
+          )}
+
+        {knowledgeBaseFreshResetRequired && (
+          <div className="mb-3 rounded-xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950">
+            <p className="font-medium">本轮补充资料尚未完成，任务尚未派发</p>
+            <p className="mt-1 text-xs leading-5 text-amber-900/80">
+              当前页面已没有可继续上传的原始文件。请申请重置知识库后重新上传全部资料。
+            </p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="mt-3"
+              onClick={requestKnowledgeBaseReset}
+            >
+              申请重置知识库
+            </Button>
+          </div>
+        )}
 
         {/* Upload progress indicator */}
         <AnimatePresence>
@@ -900,10 +1104,16 @@ export default function ChatInput({
                         <TooltipTrigger asChild>
                           <button
                             type="button"
-                            onClick={() => setModelMenuOpen(!modelMenuOpen)}
+                            disabled={modelSelectionLocked}
+                            onClick={() =>
+                              !modelSelectionLocked &&
+                              setModelMenuOpen(!modelMenuOpen)
+                            }
                             className={cn(
                               "flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-medium transition-all",
                               "bg-secondary/80 text-muted-foreground hover:bg-primary/10 hover:text-primary",
+                              modelSelectionLocked &&
+                                "cursor-not-allowed opacity-70 hover:bg-secondary/80 hover:text-muted-foreground",
                               modelMenuOpen && "bg-primary/10 text-primary",
                             )}
                           >
@@ -918,12 +1128,16 @@ export default function ChatInput({
                             />
                           </button>
                         </TooltipTrigger>
-                        <TooltipContent>选择模型</TooltipContent>
+                        <TooltipContent>
+                          {modelSelectionLocked
+                            ? "当前任务模型已锁定；新建任务后可重新选择"
+                            : "选择模型"}
+                        </TooltipContent>
                       </Tooltip>
 
                       {/* Dropdown menu */}
                       <AnimatePresence>
-                        {modelMenuOpen && (
+                        {modelMenuOpen && !modelSelectionLocked && (
                           <motion.div
                             initial={{ opacity: 0, y: 4, scale: 0.95 }}
                             animate={{ opacity: 1, y: 0, scale: 1 }}

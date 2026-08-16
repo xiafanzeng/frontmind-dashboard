@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -25,6 +26,7 @@ import {
   dashboardQuestionCatalogFromService,
   dashboardKnowledgePublishErrorForLog,
   downloadArchiveBytes,
+  KnowledgeArchiveDownloadError,
   importDashboardPayload,
   mergeDashboardModule,
   monitoringPayloadFromTabularSources,
@@ -2286,13 +2288,55 @@ describe("knowledge archive byte download", () => {
     }
   });
 
-  it("fails closed without reading an old Provider file when no durable copy exists", async () => {
+  it("keeps a legacy fileId with no durable copy fail-closed and performs no Provider I/O", async () => {
+    const assetRoot = await mkdtemp(
+      path.join(tmpdir(), "frontmind-dashboard-kb-legacy-file-id-"),
+    );
+    const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+    process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
+    const get = vi.spyOn(axios, "get");
+    try {
+      await expect(
+        downloadArchiveBytes({
+          descriptor: {
+            outputItemId: "output-legacy-file-id",
+            fileId: "legacy-provider-file-only",
+            filename: "legacy-result.zip",
+            mimeType: "application/zip",
+          },
+          apiKey: "secret-test-key",
+          baseUrl: "https://api.example.test",
+        }),
+      ).rejects.toMatchObject({
+        kind: "local_copy_missing",
+        retryable: false,
+      });
+      expect(get).not.toHaveBeenCalled();
+    } finally {
+      if (previousAssetRoot === undefined) {
+        delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+      } else {
+        process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetRoot;
+      }
+      await rm(assetRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("downloads a fresh materialized candidate's unique Provider fileId when explicitly enabled", async () => {
     const assetRoot = await mkdtemp(
       path.join(tmpdir(), "frontmind-dashboard-kb-fallback-"),
     );
     const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
     process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
-    const get = vi.spyOn(axios, "get");
+    const bytes = Buffer.from("provider-file-id-archive", "utf8");
+    const get = vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-length": String(bytes.length),
+        "content-disposition": "attachment; filename=provider-file-id.zip",
+      },
+      data: Readable.from([bytes]),
+    });
     try {
       await expect(
         downloadArchiveBytes({
@@ -2304,9 +2348,18 @@ describe("knowledge archive byte download", () => {
           },
           apiKey: "secret-test-key",
           baseUrl: "https://api.example.test",
+          allowProviderFileIdFallback: true,
         }),
-      ).rejects.toThrow("批准重置后重新构建");
-      expect(get).not.toHaveBeenCalled();
+      ).resolves.toEqual({ buffer: bytes, filename: "provider-file-id.zip" });
+      expect(get).toHaveBeenCalledWith(
+        "https://api.example.test/v1/files/file-output-only/content",
+        expect.objectContaining({
+          headers: {
+            API_KEY: "secret-test-key",
+            Authorization: "Bearer secret-test-key",
+          },
+        }),
+      );
     } finally {
       if (previousAssetRoot === undefined) {
         delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
@@ -2316,4 +2369,260 @@ describe("knowledge archive byte download", () => {
       await rm(assetRoot, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    [404, true],
+    [408, true],
+    [425, true],
+    [429, true],
+    [500, true],
+    [599, true],
+    [400, false],
+    [403, false],
+    [410, false],
+  ])(
+    "classifies HTTP %i with retryable=%s without retaining the URL",
+    async (status, retryable) => {
+      const secretUrl =
+        "https://downloads.example.test/company.zip?signature=secret-url-value";
+      vi.spyOn(axios, "get").mockResolvedValue({
+        status,
+        headers: {},
+        data: Readable.from([]),
+      });
+
+      const failure = await downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-remote",
+          url: secretUrl,
+          filename: "company.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      }).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(KnowledgeArchiveDownloadError);
+      expect(failure).toMatchObject({
+        kind: "http_status",
+        status,
+        retryable,
+      });
+      expect(String(failure)).not.toContain("secret-url-value");
+      expect(JSON.stringify(failure)).not.toContain("secret-url-value");
+    },
+  );
+
+  it("preserves the successful remote ZIP download result", async () => {
+    const bytes = Buffer.from("remote-archive-bytes", "utf8");
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {
+        "content-length": String(bytes.length),
+        "content-disposition": "attachment; filename=provider-result.zip",
+      },
+      data: Readable.from([bytes]),
+    });
+
+    await expect(
+      downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-remote",
+          url: "https://downloads.example.test/company.zip",
+          filename: "company.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      }),
+    ).resolves.toEqual({
+      buffer: bytes,
+      filename: "provider-result.zip",
+    });
+  });
+
+  it("classifies a missing download address as deterministic", async () => {
+    const get = vi.spyOn(axios, "get");
+
+    await expect(
+      downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-without-address",
+          filename: "company.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      }),
+    ).rejects.toMatchObject({
+      kind: "missing_url",
+      status: null,
+      retryable: false,
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["ECONNABORTED", "timeout"],
+    ["ETIMEDOUT", "timeout"],
+    ["ECONNRESET", "transport"],
+  ])("classifies %s as a retryable %s failure", async (code, kind) => {
+    vi.spyOn(axios, "get").mockRejectedValue(
+      Object.assign(new Error("signed-url=secret-response-value"), { code }),
+    );
+
+    const failure = await downloadArchiveBytes({
+      descriptor: {
+        outputItemId: "output-remote",
+        url: "https://downloads.example.test/company.zip",
+        filename: "company.zip",
+        mimeType: "application/zip",
+      },
+      apiKey: "secret-test-key",
+      baseUrl: "https://api.example.test",
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(KnowledgeArchiveDownloadError);
+    expect(failure).toMatchObject({ kind, status: null, retryable: true });
+    expect(String(failure)).not.toContain("secret-response-value");
+    expect(failure).not.toHaveProperty("cause");
+  });
+
+  it("rejects an unsafe URL as a deterministic failure before transport", async () => {
+    const get = vi.spyOn(axios, "get");
+
+    await expect(
+      downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-unsafe",
+          url: "http://127.0.0.1/private.zip",
+          filename: "company.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      }),
+    ).rejects.toMatchObject({
+      kind: "unsafe_url",
+      status: null,
+      retryable: false,
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("classifies an empty successful response as deterministic", async () => {
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: {},
+      data: Readable.from([]),
+    });
+
+    await expect(
+      downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-empty",
+          url: "https://downloads.example.test/company.zip",
+          filename: "company.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      }),
+    ).rejects.toMatchObject({
+      kind: "empty",
+      status: null,
+      retryable: false,
+    });
+  });
+
+  it("classifies an oversized declared response as deterministic", async () => {
+    const data = Readable.from([]);
+    const destroy = vi.spyOn(data, "destroy");
+    vi.spyOn(axios, "get").mockResolvedValue({
+      status: 200,
+      headers: { "content-length": String(250 * 1024 * 1024 + 1) },
+      data,
+    });
+
+    await expect(
+      downloadArchiveBytes({
+        descriptor: {
+          outputItemId: "output-large",
+          url: "https://downloads.example.test/company.zip",
+          filename: "company.zip",
+          mimeType: "application/zip",
+        },
+        apiKey: "secret-test-key",
+        baseUrl: "https://api.example.test",
+      }),
+    ).rejects.toMatchObject({
+      kind: "too_large",
+      status: null,
+      retryable: false,
+    });
+    expect(destroy).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["size", "local_size_mismatch"],
+    ["sha256", "local_sha256_mismatch"],
+  ])(
+    "classifies a local %s mismatch as deterministic",
+    async (corruption, kind) => {
+      const assetRoot = await mkdtemp(
+        path.join(tmpdir(), "frontmind-dashboard-kb-corrupt-"),
+      );
+      const previousAssetRoot = process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+      process.env.FRONTMIND_DASHBOARD_ASSET_DIR = assetRoot;
+      const fileId = `file-corrupt-${corruption}`;
+      const bytes = Buffer.from("durable-local-archive", "utf8");
+      try {
+        await recordPresalesFileDescriptor({
+          fileId,
+          filename: "company.zip",
+          mimeType: "application/zip",
+          sizeBytes: bytes.length,
+        });
+        const staged = await stagePresalesFileContent({
+          fileId,
+          stream: Readable.from([bytes]),
+          maxBytes: 1024,
+        });
+        await staged.commit({});
+        const storageKey = createHash("sha256")
+          .update(fileId, "utf8")
+          .digest("hex");
+        await writeFile(
+          path.join(assetRoot, "presales-files", `${storageKey}.content`),
+          corruption === "size"
+            ? Buffer.from("short", "utf8")
+            : Buffer.alloc(bytes.length, 0x78),
+        );
+
+        await expect(
+          downloadArchiveBytes({
+            descriptor: {
+              outputItemId: "output-corrupt",
+              fileId,
+              filename: "company.zip",
+              mimeType: "application/zip",
+            },
+            apiKey: "secret-test-key",
+            baseUrl: "https://api.example.test",
+          }),
+        ).rejects.toMatchObject({
+          kind,
+          status: null,
+          retryable: false,
+        });
+      } finally {
+        if (previousAssetRoot === undefined) {
+          delete process.env.FRONTMIND_DASHBOARD_ASSET_DIR;
+        } else {
+          process.env.FRONTMIND_DASHBOARD_ASSET_DIR = previousAssetRoot;
+        }
+        await rm(assetRoot, { recursive: true, force: true });
+      }
+    },
+  );
 });

@@ -50,7 +50,7 @@ describe("response logic task persistence", () => {
             limit: () =>
               awaitedRows(
                 table === apiCredentials
-                  ? [{ id: "credential-1" }]
+                  ? [{ ownerUserId: 42, status: "active" }]
                   : table === upstreamResources
                     ? resources
                     : table === responseLogicEntries
@@ -149,7 +149,7 @@ describe("response logic task persistence", () => {
             limit: () =>
               awaitedRows(
                 table === apiCredentials
-                  ? [{ id: "credential-1" }]
+                  ? [{ ownerUserId: 42, status: "active" }]
                   : table === responseLogicEntries
                     ? existingEntries
                     : [],
@@ -225,7 +225,7 @@ describe("response logic task persistence", () => {
             limit: () =>
               awaitedRows(
                 table === apiCredentials
-                  ? [{ id: "credential-1" }]
+                  ? [{ ownerUserId: 42, status: "active" }]
                   : table === responseLogicEntries
                     ? existingEntries
                     : [],
@@ -363,7 +363,7 @@ describe("response logic task persistence", () => {
             limit: () =>
               awaitedRows(
                 table === apiCredentials
-                  ? [{ id: "credential-1" }]
+                  ? [{ ownerUserId: 42, status: "active" }]
                   : table === workspaceQuestions
                     ? [
                         {
@@ -427,7 +427,9 @@ describe("response logic task persistence", () => {
           where: () => ({
             limit: () =>
               awaitedRows(
-                table === apiCredentials ? [{ id: "credential-1" }] : [],
+                table === apiCredentials
+                  ? [{ ownerUserId: 42, status: "active" }]
+                  : [],
               ),
           }),
         }),
@@ -519,7 +521,7 @@ describe("response logic task persistence", () => {
             limit: () =>
               awaitedRows(
                 table === apiCredentials
-                  ? [{ id: "credential-1" }]
+                  ? [{ ownerUserId: 42, status: "active" }]
                   : table === upstreamResources
                     ? [{ userId: 42, upstreamId: "task-1" }]
                     : table === responseLogicEntries

@@ -9,10 +9,10 @@ import {
 } from "./_core/server-timeouts";
 
 describe("dashboard HTTP server timeouts", () => {
-  it("keeps headers bounded while allowing the managed 20-minute ingress deadline", () => {
+  it("removes the total request deadline while preserving header and socket-idle fences", () => {
     const server = {
       headersTimeout: 0,
-      requestTimeout: 0,
+      requestTimeout: 123,
       timeout: 0,
       keepAliveTimeout: 0,
     };
@@ -26,7 +26,8 @@ describe("dashboard HTTP server timeouts", () => {
       keepAliveTimeout: SERVER_KEEP_ALIVE_TIMEOUT_MS,
     });
     expect(SERVER_HEADERS_TIMEOUT_MS).toBe(60_000);
-    expect(SERVER_REQUEST_TIMEOUT_MS).toBeGreaterThan(20 * 60_000);
-    expect(SERVER_SOCKET_TIMEOUT_MS).toBeGreaterThan(SERVER_REQUEST_TIMEOUT_MS);
+    expect(SERVER_REQUEST_TIMEOUT_MS).toBe(0);
+    expect(SERVER_SOCKET_TIMEOUT_MS).toBe(25 * 60_000);
+    expect(SERVER_KEEP_ALIVE_TIMEOUT_MS).toBe(5_000);
   });
 });

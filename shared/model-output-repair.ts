@@ -82,6 +82,7 @@ function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {
 }
 
 export type StructuredJsonRepairPolicy = {
+  maxCharacters?: number;
   fenceLanguages?: readonly string[];
   aliases?: Readonly<Record<string, string>>;
   numericKeys?: readonly string[];
@@ -100,6 +101,7 @@ export type RepairedStructuredJson = RepairedModelOutput<JsonValue> & {
 };
 
 export const DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS = 1024 * 1024;
+export const MAX_MODEL_OUTPUT_REPAIR_CHARACTERS = 2 * 1024 * 1024;
 const MAX_REPAIRED_JSON_NESTING_DEPTH = 128;
 
 function runtimeModelOutputRepairEnvironment(): ModelOutputRepairEnvironment {
@@ -658,6 +660,17 @@ function isJsonObject(value: JsonValue): value is Record<string, JsonValue> {
 }
 
 function assertSafePolicy(policy: StructuredJsonRepairPolicy) {
+  if (
+    policy.maxCharacters !== undefined &&
+    (!Number.isSafeInteger(policy.maxCharacters) ||
+      policy.maxCharacters < 1 ||
+      policy.maxCharacters > MAX_MODEL_OUTPUT_REPAIR_CHARACTERS)
+  ) {
+    throw new ModelOutputRepairError(
+      "UNSAFE_POLICY",
+      "结构化输出修复字符上限无效",
+    );
+  }
   const identityKeys = new Set(policy.identityKeys ?? []);
   const aliases = policy.aliases ?? {};
   for (const key of policy.numericKeys ?? []) {
@@ -777,7 +790,10 @@ export function repairStructuredJsonCandidate(
   raw: string,
   policy: StructuredJsonRepairPolicy = {},
 ): RepairedStructuredJson {
-  if (raw.length > DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS) {
+  if (
+    raw.length >
+    (policy.maxCharacters ?? DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS)
+  ) {
     return invalidCandidate("结构化输出超过安全修复上限");
   }
   assertSafePolicy(policy);

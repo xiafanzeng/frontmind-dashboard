@@ -36,12 +36,29 @@ Accept exactly one operation declared by the application:
 5. Preserve evidence documents and eligible assets.
 6. Create exactly one `frontmind-kb-bundle-<operationId>.zip` attachment.
 7. Put `BUNDLE.json` at the ZIP root and include every file it declares.
-8. Run `scripts/validate_working_set.py <zip>` and attach the ZIP only after it
-   prints `VALID frontmind.kb-working-set.v1`.
+8. Run `scripts/validate_working_set.py` with every named
+   `--expected-*` coordinate supplied by the application instructions:
+   `--expected-operation-id`, `--expected-build-id`,
+   `--expected-generation`, `--expected-content-version`,
+   `--expected-skill-content-hash` and `--expected-tree-policy-version`.
+   Also pass `--expected-company-base64url` and
+   `--expected-uploads-read` exactly as supplied by the application.
+   Attach the ZIP only after it prints `VALID frontmind.kb-working-set.v1`.
+
+Copy the application-provided `skillContentHash` byte-for-byte into
+`BUNDLE.json.skill.contentHash`. It is the frozen logical content hash, not the
+physical SHA-256 of the attached Skill ZIP. Never calculate, replace or infer
+this value.
 
 Do not emit a first-leaf-only response, progress envelope, presentation
 envelope, confirmation question or later-turn instruction. The complete ZIP is
 the sole business result.
+
+Alongside the one validated ZIP, the final response text must be exactly
+`已完成，知识库 ZIP 已附上。`. After sending that attachment and fixed sentence,
+end the current task immediately. Do not call another tool, update a plan, add
+prose, ask for confirmation, wait, or send a second attachment. Dashboard
+consumes the ZIP only and does not consume this sentence.
 
 ### `revise_leaf_bundle`
 
@@ -54,12 +71,22 @@ the sole business result.
 5. Create exactly one `frontmind-kb-patch-<operationId>.zip` attachment.
 6. Put `PATCH.json` at the ZIP root and include only the replacement leaf,
    leaf-scoped evidence delta and node-scoped asset additions.
-7. Run `scripts/validate_working_set.py <zip>` and attach the ZIP only after it
-   prints `VALID frontmind.kb-node-patch.v1`.
+7. Run `scripts/validate_working_set.py` with every named
+   `--expected-*` coordinate supplied by the application instructions:
+   `--expected-operation-id`, `--expected-build-id`,
+   `--expected-generation`, `--expected-base-content-version`,
+   `--expected-base-working-set-sha256` and `--expected-target-leaf-id`.
+   Attach the ZIP only after it prints `VALID frontmind.kb-node-patch.v1`.
 
 Never mutate another leaf, reorder the tree, advance traversal or construct a
 new working set yourself. Dashboard validates the patch and performs the
 immutable assembly.
+
+Alongside the one validated Patch ZIP, the final response text must be exactly
+`已完成，知识库 ZIP 已附上。`. After sending that attachment and fixed sentence,
+end the current task immediately. Do not call another tool, update a plan, add
+prose, ask for confirmation, wait, or send a second attachment. Dashboard
+consumes the ZIP only and does not consume this sentence.
 
 ## Task isolation
 
@@ -83,17 +110,25 @@ variants. A brochure-only enterprise still needs at least 30 distinct business
 questions; unanswered applicable questions become specific
 `needs_verification` leaves, never invented facts or repeated disclaimers.
 
-For each overview and leaf:
+For each overview and leaf, use stable manifest IDs and branch metadata. Keep
+evidence relationships only in `evidenceLedger` and leaf `evidencePaths`; keep
+asset relationships only in manifest fields. Omit unsupported metadata such as
+`documentRole`, `evidenceStatus`, `sourceIds`, `evidenceDocumentIds`,
+`sameBranchEvidenceDocumentIds`, `evidenceCharacters` and `formalCharacters`.
 
-- use stable IDs and branch metadata;
-- record evidence status, `sourceIds`, same-branch `evidenceDocumentIds`,
-  evidence characters and required formal characters;
-- record `complete`, `limited_evidence` or `needs_verification`;
-- record related `assetIds`; product leaves also record `productFamilyId`;
-- place one polished customer-visible block between
-  `FRONTMIND_FORMAL_CONTENT_START` and `FRONTMIND_FORMAL_CONTENT_END`;
-- keep sources, excerpts, crawl notes, conflicts and verification gaps outside
-  the formal block.
+Every `nodes/*.md` file and Patch body contains customer-visible Markdown only:
+
+```md
+# Exact leaf title from BUNDLE.json
+
+Polished customer-visible body.
+```
+
+Use exactly one non-empty level-one title matching the leaf manifest title and
+a non-empty body. Do not emit formal-content markers, `## 资料元数据`,
+`## 证据与核验说明`, an evidence appendix, internal IDs/paths, character counts
+or metadata keys in node Markdown. Preserve sources, excerpts, crawl notes,
+conflicts and verification gaps as declared evidence files instead.
 
 Use these evidence-adaptive minimums:
 
@@ -102,11 +137,11 @@ Use these evidence-adaptive minimums:
   5,000 for product/service branches and 2,500 otherwise;
 - leaf with evidence:
   `max(80, min(500, floor(evidenceCharacters * 0.20)))`;
-- zero-evidence overview: 60; zero-evidence leaf: 40, both marked
-  `needs_verification`.
+- zero-evidence overview: 60; zero-evidence leaf: 40. State only the supported
+  facts in node prose and retain the specific gap in leaf-scoped evidence.
 
 Never pad one topic with another topic's facts. Do not expose source appendices
-inside formal prose.
+inside customer-visible prose.
 
 ## Logo and image rules
 
@@ -149,6 +184,9 @@ invent sources, facts, images or completeness values.
 ## Output discipline
 
 - Return exactly one ZIP attachment for the selected operation.
+- Alongside it, return exactly `已完成，知识库 ZIP 已附上。`, then end the task
+  immediately with no later tool call, plan update, prose, confirmation, wait
+  or second attachment.
 - Do not return bare JSON, fenced JSON, a prose substitute or a second archive.
 - Use safe relative POSIX paths; forbid absolute paths, `..`, backslashes,
   symlinks, encrypted entries and undeclared files.
@@ -156,5 +194,17 @@ invent sources, facts, images or completeness values.
 - Keep IDs and paths stable across revisions.
 - A successful initial bundle contains all leaf bodies. A pending leaf with no
   body is invalid.
+- Initial `researchCoverage.uploadsRead` equals the frozen
+  `--expected-uploads-read` customer-upload count. Never count the Skill,
+  instructions, prefill or other application attachments.
+- Initial `researchCoverage.sourceCount` equals the retained
+  `evidenceLedger` row count.
 - A successful patch is leaf-scoped. Global reports and tree files are invalid
   patch payloads.
+- Use only the `assetType`, `displayRole` and `caption` vocabulary in
+  `references/materialized-working-set.md`. These presentation fields never
+  replace byte/provenance proof: Dashboard derives frozen customer-upload
+  identity and ownership from its attachment ledger and rewrites the canonical
+  Patch. One optional bad image/evidence item may be omitted while safe sibling
+  content remains usable; ZIP safety, frozen coordinates, CAS/removal ownership
+  and frozen upload SHA/bytes/MIME are always hard requirements.

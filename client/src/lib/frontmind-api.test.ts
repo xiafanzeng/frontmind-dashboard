@@ -11,6 +11,7 @@ import {
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
+  FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS,
   FILE_UPLOAD_STALL_TIMEOUT_MS,
   getModelDisplayName,
   listManagedUploadsForKnowledgeBase,
@@ -28,6 +29,7 @@ import {
   uploadFileToUrl,
   withoutProviderTaskNavigationUrls,
 } from "./frontmind-api";
+import { KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS } from "@shared/knowledge-base-local-upload";
 
 afterEach(() => {
   localStorage.clear();
@@ -230,8 +232,8 @@ describe("createKnowledgeBaseTurnTask", () => {
       },
       json: async () => ({
         error: {
-          code: "IDEMPOTENCY_PENDING",
-          message: "相同附件仍在暂存",
+          code: "UPLOAD_OPERATION_CONFLICT",
+          message: "附件坐标冲突",
         },
       }),
     });
@@ -241,15 +243,27 @@ describe("createKnowledgeBaseTurnTask", () => {
       reserveKnowledgeBaseTurnWithAttachments([], {
         conversationId: "conv-kb",
         clientRequestId: "request-files",
+        expectedResetRevision: 4,
         expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
         expectedPresentationKey: "presentation-5",
-        attachmentManifest: [],
+        attachmentManifest: [
+          {
+            itemId: "request-files:1",
+            ordinal: 1,
+            total: 1,
+            filename: "facts.pdf",
+            sizeBytes: 12,
+            mimeType: "application/pdf",
+            lastModified: 10,
+            sha256: "a".repeat(64),
+          },
+        ],
       }),
     ).rejects.toMatchObject({
       status: 409,
-      code: "IDEMPOTENCY_PENDING",
+      code: "UPLOAD_OPERATION_CONFLICT",
       retryAfter: "2",
       retryAfterMs: 2_000,
     });
@@ -299,7 +313,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     );
   });
 
-  it("replays the exact legacy takeover manifest with the same request bytes", async () => {
+  it("replays an ordinary attachment turn without legacy takeover flags", async () => {
     vi.useFakeTimers();
     const fetchMock = vi
       .fn()
@@ -311,16 +325,6 @@ describe("createKnowledgeBaseTurnTask", () => {
         }),
       });
     vi.stubGlobal("fetch", fetchMock);
-    const attachmentManifest = [
-      {
-        filename: "facts.pdf",
-        sizeBytes: 12,
-        mimeType: "application/pdf",
-        lastModified: 123,
-        sha256: "a".repeat(64),
-      },
-    ];
-
     const created = createKnowledgeBaseTurnTask(
       [
         {
@@ -339,7 +343,6 @@ describe("createKnowledgeBaseTurnTask", () => {
         clientRequestId: "legacy-request",
         expectedRevision: 5,
         expectedLeafId: "1.6",
-        legacyAttachmentTakeover: { attachmentManifest },
       },
     );
 
@@ -349,10 +352,11 @@ describe("createKnowledgeBaseTurnTask", () => {
     expect(fetchMock.mock.calls[0][1].body).toBe(
       fetchMock.mock.calls[1][1].body,
     );
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
-      resumeLegacyAttachments: true,
-      attachmentManifest,
-    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.attachments).toEqual([
+      { file_id: "replacement-file", filename: "facts.pdf" },
+    ]);
+    expect(body).not.toHaveProperty("resumeLegacyAttachments");
   });
 
   it.each([408, 425, 429, 503])(
@@ -554,6 +558,7 @@ describe("createKnowledgeBaseTurnTask", () => {
           state: "awaiting_attachments",
           turnId: "turn-reserved",
           clientRequestId: "request-files",
+          sourceResetRevision: 4,
           generation: 2,
           revision: 5,
           leafId: "1.6",
@@ -566,6 +571,9 @@ describe("createKnowledgeBaseTurnTask", () => {
     vi.stubGlobal("fetch", fetchMock);
     const manifest = [
       {
+        itemId: "request-files:1",
+        ordinal: 1,
+        total: 1,
         filename: "facts.pdf",
         sizeBytes: 12,
         mimeType: "application/pdf",
@@ -579,6 +587,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       {
         conversationId: "conv-kb",
         clientRequestId: "request-files",
+        expectedResetRevision: 4,
         expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
@@ -591,6 +600,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       conversationId: "conv-kb",
       clientRequestId: "request-files",
+      expectedResetRevision: 4,
       expectedGeneration: 2,
       expectedRevision: 5,
       expectedLeafId: "1.6",
@@ -600,6 +610,101 @@ describe("createKnowledgeBaseTurnTask", () => {
       resumeExisting: false,
     });
   });
+
+  it("rejects an incomplete deferred-upload coordinate before any HTTP request", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const manifest = [
+      {
+        itemId: "request-files:1",
+        ordinal: 1,
+        total: 1,
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 10,
+        sha256: "a".repeat(64),
+      },
+    ];
+    const context = {
+      conversationId: "conv-kb",
+      clientRequestId: "request-files",
+      expectedResetRevision: 4,
+      expectedGeneration: 2,
+      expectedRevision: 5,
+      expectedLeafId: "1.6",
+      attachmentManifest: manifest,
+    };
+
+    await expect(
+      reserveKnowledgeBaseTurnWithAttachments([], {
+        ...context,
+        expectedResetRevision: undefined as never,
+      }),
+    ).rejects.toThrow("知识库附件坐标不完整");
+    await expect(
+      reserveKnowledgeBaseTurnWithAttachments([], {
+        ...context,
+        attachmentManifest: [{ ...manifest[0]!, sha256: "" }],
+      }),
+    ).rejects.toThrow("知识库附件坐标不完整");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["client request", { clientRequestId: "other-request" }],
+    ["reset revision", { sourceResetRevision: 5 }],
+    ["generation", { generation: 3 }],
+    ["revision", { revision: 6 }],
+    ["leaf", { leafId: null }],
+  ])(
+    "fails closed without retry when the reservation receipt changes the %s coordinate",
+    async (_coordinate, changedReceipt) => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          reservation: {
+            state: "awaiting_attachments",
+            turnId: "turn-reserved",
+            clientRequestId: "request-files",
+            sourceResetRevision: 4,
+            generation: 2,
+            revision: 5,
+            leafId: "1.6",
+            ...changedReceipt,
+          },
+        }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(
+        reserveKnowledgeBaseTurnWithAttachments([], {
+          conversationId: "conv-kb",
+          clientRequestId: "request-files",
+          expectedResetRevision: 4,
+          expectedGeneration: 2,
+          expectedRevision: 5,
+          expectedLeafId: "1.6",
+          attachmentManifest: [
+            {
+              itemId: "request-files:1",
+              ordinal: 1,
+              total: 1,
+              filename: "facts.pdf",
+              sizeBytes: 12,
+              mimeType: "application/pdf",
+              lastModified: 10,
+              sha256: "a".repeat(64),
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        status: 409,
+        code: "KNOWLEDGE_BASE_RESERVATION_COORDINATE_MISMATCH",
+      });
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
 
   it("carries one selected delivery project through the entire KB write sequence", async () => {
     sessionStorage.setItem(
@@ -615,6 +720,7 @@ describe("createKnowledgeBaseTurnTask", () => {
             state: "awaiting_attachments",
             turnId: "turn-project",
             clientRequestId: "request-project",
+            sourceResetRevision: 4,
             generation: 2,
             revision: 5,
             leafId: "1.6",
@@ -632,6 +738,9 @@ describe("createKnowledgeBaseTurnTask", () => {
     vi.stubGlobal("fetch", fetchMock);
     const attachmentManifest = [
       {
+        itemId: "request-project:1",
+        ordinal: 1,
+        total: 1,
         filename: "facts.pdf",
         sizeBytes: 12,
         mimeType: "application/pdf",
@@ -645,6 +754,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       {
         conversationId: "conv-project",
         clientRequestId: "request-project",
+        expectedResetRevision: 4,
         expectedGeneration: 2,
         expectedRevision: 5,
         expectedLeafId: "1.6",
@@ -655,6 +765,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       conversationId: "conv-project",
       turnId: reservation.turnId,
       clientRequestId: "request-project",
+      expectedResetRevision: 4,
       attachmentManifest,
       index: 0,
       attachment: { file_id: "file-project", filename: "facts.pdf" },
@@ -662,6 +773,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     await createKnowledgeBaseTurnTask([], {
       conversationId: "conv-project",
       clientRequestId: "request-project",
+      expectedResetRevision: 4,
       attachmentReservation: { turnId: reservation.turnId, attachmentManifest },
     });
 
@@ -728,6 +840,53 @@ describe("createKnowledgeBaseTurnTask", () => {
     });
   });
 
+  it("replays an unknown starter reservation with the exact same coordinates", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          reservation: {
+            state: "awaiting_attachments",
+            turnId: "turn-start-replay",
+            clientRequestId: "request-start-replay",
+          },
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const input = {
+      conversationId: "conv-kb-replay",
+      clientRequestId: "request-start-replay",
+      expectedResetRevision: 4,
+      companyName: "FrontMind",
+      attachmentManifest: [
+        {
+          itemId: "starter-item-replay",
+          ordinal: 1,
+          total: 1,
+          filename: "facts.pdf",
+          sizeBytes: 12,
+          mimeType: "application/pdf",
+          lastModified: 10,
+          sha256: "a".repeat(64),
+        },
+      ],
+    };
+
+    const reservation = reserveKnowledgeBaseStart(input);
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(reservation).resolves.toMatchObject({
+      reservation: { turnId: "turn-start-replay" },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1].body).toBe(
+      fetchMock.mock.calls[1][1].body,
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(input);
+  });
+
   it("stages one stable file id and dispatches without resending file ids", async () => {
     const fetchMock = vi
       .fn()
@@ -739,6 +898,9 @@ describe("createKnowledgeBaseTurnTask", () => {
     vi.stubGlobal("fetch", fetchMock);
     const manifest = [
       {
+        itemId: "request-files:1",
+        ordinal: 1,
+        total: 1,
         filename: "facts.pdf",
         sizeBytes: 12,
         mimeType: "application/pdf",
@@ -750,6 +912,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       conversationId: "conv-kb",
       turnId: "turn-reserved",
       clientRequestId: "request-files",
+      expectedResetRevision: 4,
       attachmentManifest: manifest,
       index: 0,
       attachment: { file_id: "file-facts", filename: "facts.pdf" },
@@ -757,6 +920,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     await createKnowledgeBaseTurnTask([], {
       conversationId: "conv-kb",
       clientRequestId: "request-files",
+      expectedResetRevision: 4,
       attachmentReservation: {
         turnId: "turn-reserved",
         attachmentManifest: manifest,
@@ -773,6 +937,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       conversationId: "conv-kb",
       clientRequestId: "request-files",
       turnId: "turn-reserved",
+      expectedResetRevision: 4,
       attachmentManifest: manifest,
     });
   });
@@ -781,6 +946,7 @@ describe("createKnowledgeBaseTurnTask", () => {
     vi.useFakeTimers();
     const transientFailures = [
       { status: 409, code: "IDEMPOTENCY_PENDING" },
+      { status: 408, code: "REQUEST_TIMEOUT" },
       { status: 425, code: "TOO_EARLY" },
       { status: 429, code: "RATE_LIMITED" },
       { status: 503, code: "TEMPORARILY_UNAVAILABLE" },
@@ -791,6 +957,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       conversationId: "conv-kb",
       turnId: "turn-reserved",
       clientRequestId: "request-files",
+      expectedResetRevision: 4,
       attachmentManifest: [
         {
           filename: "facts.pdf",
@@ -848,6 +1015,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       conversationId: "conv-kb",
       turnId: "turn-reserved",
       clientRequestId: "request-files",
+      expectedResetRevision: 4,
       attachmentManifest: [],
       index: 0,
       attachment: { file_id: "file-facts", filename: "facts.pdf" },
@@ -878,6 +1046,7 @@ describe("createKnowledgeBaseTurnTask", () => {
       conversationId: "conv-kb",
       turnId: "turn-reserved",
       clientRequestId: "request-files",
+      expectedResetRevision: 4,
       attachmentManifest: [],
       index: 0,
       attachment: { file_id: "file-facts", filename: "facts.pdf" },
@@ -975,6 +1144,38 @@ describe("createKnowledgeBaseTurnTask", () => {
         submissionKind: "logo",
       }),
     ).rejects.toThrow("任务创建失败：未返回权威任务状态");
+  });
+
+  it("accepts a committed local Logo receipt when observation projection is deferred", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          accepted: true,
+          execution: "local",
+          disposition: "logo_bound",
+          buildId: "build-local-logo",
+          revision: 3,
+          contentVersion: 1,
+          observation: null,
+        }),
+      }),
+    );
+
+    await expect(
+      createKnowledgeBaseTurnTask([], {
+        conversationId: "conv-kb",
+        clientRequestId: "request-logo-local",
+        submissionKind: "logo",
+      }),
+    ).resolves.toMatchObject({
+      accepted: true,
+      execution: "local",
+      disposition: "logo_bound",
+      status: "completed",
+      id: "",
+    });
   });
 
   it("accepts a recovering Logo observation without inventing a task id", async () => {
@@ -1148,7 +1349,7 @@ describe("retrieveTask", () => {
 });
 
 describe("ordinary chat local v2 contract", () => {
-  it("creates a local task without browser-selected model or Provider fields", async () => {
+  it("creates a local task with a public model profile and no Provider model fields", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 201,
@@ -1173,7 +1374,7 @@ describe("ordinary chat local v2 contract", () => {
       {
         conversationId: "conversation-local-1",
         clientRequestId: "request-local-1",
-        agentProfile: "frontmind-base",
+        modelProfile: "frontmind-base",
       },
     );
 
@@ -1187,6 +1388,7 @@ describe("ordinary chat local v2 contract", () => {
       clientRequestId: "request-local-1",
       prompt: "分析附件",
       localAssetIds: ["asset_123456789012345678901234567890"],
+      modelProfile: "frontmind-base",
     });
     expect(body).not.toHaveProperty("agentProfile");
     expect(body).not.toHaveProperty("model");
@@ -1213,13 +1415,45 @@ describe("ordinary chat local v2 contract", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body).not.toHaveProperty("taskId");
     expect(body).not.toHaveProperty("previousResponseId");
+    expect(body).not.toHaveProperty("modelProfile");
   });
 });
 
 describe("materialized knowledge-base local asset ingress", () => {
+  it("rejects a partial operation coordinate before constructing XHR", async () => {
+    const xhrConstructed = vi.fn();
+    class MockXMLHttpRequest {
+      constructor() {
+        xhrConstructed();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadKnowledgeBaseLocalAsset(
+        new File(["image"], "supplement.jpg", { type: "image/jpeg" }),
+        undefined,
+        undefined,
+        {
+          itemId: "request-image:1",
+          batchOrdinal: 1,
+          resumeScope: {
+            kind: "knowledge_base",
+            conversationId: "conv-image",
+            turnId: "turn-image",
+            clientRequestId: "request-image",
+            expectedResetRevision: 4,
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_UPLOAD_OPTIONS" });
+    expect(xhrConstructed).not.toHaveBeenCalled();
+  });
+
   it("uploads browser bytes only to the v2 local asset endpoint", async () => {
     const opened: Array<{ method: string; url: string }> = [];
     const headers = new Map<string, string>();
+    const stages: FileUploadStageEvent[] = [];
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     class MockXMLHttpRequest {
@@ -1229,7 +1463,14 @@ describe("materialized knowledge-base local asset ingress", () => {
         filename: "brand-logo.png",
         expiresAt: 1_800_000_000_000,
       });
-      upload: { onprogress?: (event: any) => void } = {};
+      uploadListeners = new Map<string, Array<(event?: any) => void>>();
+      upload = {
+        addEventListener: (name: string, listener: (event?: any) => void) => {
+          const listeners = this.uploadListeners.get(name) ?? [];
+          listeners.push(listener);
+          this.uploadListeners.set(name, listeners);
+        },
+      };
       onerror?: () => void;
       onabort?: () => void;
       onload?: () => void;
@@ -1240,11 +1481,23 @@ describe("materialized knowledge-base local asset ingress", () => {
         headers.set(name, value);
       }
       send(body: File) {
-        this.upload.onprogress?.({
-          lengthComputable: true,
-          loaded: body.size,
-          total: body.size,
-        });
+        for (const listener of this.uploadListeners.get("progress") ?? []) {
+          listener({
+            lengthComputable: true,
+            loaded: 2,
+            total: body.size,
+          });
+        }
+        for (const listener of this.uploadListeners.get("progress") ?? []) {
+          listener({
+            lengthComputable: true,
+            loaded: body.size,
+            total: body.size,
+          });
+        }
+        for (const listener of this.uploadListeners.get("load") ?? []) {
+          listener();
+        }
         queueMicrotask(() => this.onload?.());
       }
       abort() {
@@ -1256,12 +1509,31 @@ describe("materialized knowledge-base local asset ingress", () => {
     await expect(
       uploadKnowledgeBaseLocalAsset(
         new File(["logo"], "brand-logo.png", { type: "image/png" }),
+        undefined,
+        undefined,
+        { onStage: (event) => stages.push(event) },
       ),
     ).resolves.toMatchObject({
       fileId: `asset_${"a".repeat(30)}`,
       filename: "brand-logo.png",
       sizeBytes: 4,
+      dashboardReadyAt: expect.any(Number),
     });
+
+    expect(stages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: "uploading_to_dashboard",
+          loadedBytes: 2,
+          totalBytes: 4,
+        }),
+        expect.objectContaining({
+          stage: "uploaded",
+          dashboardReceivedBytes: 4,
+        }),
+      ]),
+    );
+    expect(stages.at(-1)?.receipt).not.toHaveProperty("providerReadyAt");
 
     expect(opened).toEqual([
       { method: "POST", url: "/api/frontmind/v2/assets" },
@@ -1270,6 +1542,159 @@ describe("materialized knowledge-base local asset ingress", () => {
     expect(headers.get("X-FrontMind-Mime")).toBe("image/png");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(opened.some(({ url }) => url.includes("/v1/files"))).toBe(false);
+  });
+
+  it("rejects a local receipt whose expiry is missing or not in the future", async () => {
+    class MockXMLHttpRequest {
+      status = 201;
+      responseText = JSON.stringify({
+        localAssetId: `asset_${"b".repeat(30)}`,
+        filename: "expired.pdf",
+        expiresAt: Date.now(),
+      });
+      private uploadListeners = new Map<string, (event?: any) => void>();
+      upload = {
+        addEventListener: (event: string, listener: (event?: any) => void) =>
+          this.uploadListeners.set(event, listener),
+      };
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open() {}
+      setRequestHeader() {}
+      send() {
+        this.uploadListeners.get("load")?.();
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    await expect(
+      uploadKnowledgeBaseLocalAsset(
+        new File(["pdf"], "expired.pdf", { type: "application/pdf" }),
+        undefined,
+        { maxRetries: 0, initialDelay: 0, maxDelay: 0 },
+      ),
+    ).rejects.toMatchObject({ code: "UPLOAD_RECEIPT_INVALID" });
+  });
+
+  it("retries the same knowledge-base File with stable operation coordinates", async () => {
+    const requests: Array<{
+      headers: Map<string, string>;
+      body: File;
+    }> = [];
+    const onFileRecord = vi.fn();
+    let requestIndex = 0;
+
+    class MockXMLHttpRequest {
+      status = 0;
+      responseText = "";
+      private headers = new Map<string, string>();
+      private uploadListeners = new Map<string, Array<(event?: any) => void>>();
+      upload = {
+        addEventListener: (name: string, listener: (event?: any) => void) => {
+          const listeners = this.uploadListeners.get(name) ?? [];
+          listeners.push(listener);
+          this.uploadListeners.set(name, listeners);
+        },
+      };
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open() {}
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value);
+      }
+      send(body: File) {
+        const index = requestIndex++;
+        requests.push({ headers: new Map(this.headers), body });
+        if (index === 0) {
+          queueMicrotask(() => this.onerror?.());
+          return;
+        }
+        this.status = 200;
+        this.responseText = JSON.stringify({
+          localAssetId: `asset_${"c".repeat(30)}`,
+          filename: "资料.pptx",
+          expiresAt: Date.now() + 60_000,
+          replayed: true,
+        });
+        for (const listener of this.uploadListeners.get("progress") ?? []) {
+          listener({
+            lengthComputable: true,
+            loaded: body.size,
+            total: body.size,
+          });
+        }
+        for (const listener of this.uploadListeners.get("load") ?? []) {
+          listener();
+        }
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const file = new File(["pptx-body"], "资料.pptx", {
+      type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    });
+    await expect(
+      uploadKnowledgeBaseLocalAsset(
+        file,
+        undefined,
+        { maxRetries: 2, initialDelay: 0, maxDelay: 0 },
+        {
+          itemId: "item-2",
+          batchOrdinal: 2,
+          contentSha256: "a".repeat(64),
+          resumeScope: {
+            kind: "knowledge_base",
+            conversationId: "conversation-1",
+            turnId: "turn-1",
+            clientRequestId: "request-1",
+            expectedResetRevision: 4,
+          },
+          onFileRecord,
+        },
+      ),
+    ).resolves.toMatchObject({
+      fileId: `asset_${"c".repeat(30)}`,
+      replayed: true,
+    });
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.body).toBe(file);
+    expect(requests[1]?.body).toBe(file);
+    for (const request of requests) {
+      expect(
+        request.headers.get(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.conversationId),
+      ).toBe("conversation-1");
+      expect(
+        request.headers.get(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.turnId),
+      ).toBe("turn-1");
+      expect(
+        request.headers.get(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.itemId),
+      ).toBe("item-2");
+      expect(
+        request.headers.get(
+          KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.expectedResetRevision,
+        ),
+      ).toBe("4");
+      expect(
+        request.headers.get(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256),
+      ).toBe("a".repeat(64));
+    }
+    expect(
+      requests.map((request) =>
+        request.headers.get(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.attempt),
+      ),
+    ).toEqual(["1", "2"]);
+    expect(onFileRecord).toHaveBeenCalledOnce();
   });
 });
 
@@ -1806,6 +2231,94 @@ describe("uploadFile", () => {
 
     await vi.advanceTimersByTimeAsync(1);
     await expect(upload).rejects.toThrow("长时间没有进度");
+  });
+
+  it("does not extend the stall deadline for duplicate progress events", async () => {
+    vi.useFakeTimers();
+    let xhr: MockXMLHttpRequest | undefined;
+    class MockXMLHttpRequest {
+      status = 0;
+      private uploadListeners = new Map<string, (event: any) => void>();
+      upload = {
+        addEventListener: (event: string, listener: (event: any) => void) =>
+          this.uploadListeners.set(event, listener),
+      };
+      private listeners = new Map<string, () => void>();
+      constructor() {
+        xhr = this;
+      }
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {}
+      progress(loaded: number, total: number) {
+        this.uploadListeners.get("progress")?.({
+          lengthComputable: true,
+          loaded,
+          total,
+        });
+      }
+      abort() {
+        this.listeners.get("abort")?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const upload = uploadFileToUrl(
+      "https://uploads.example/stalled-duplicate",
+      new File(["abcd"], "proof.png", { type: "image/png" }),
+    );
+    const rejected = expect(upload).rejects.toMatchObject({
+      code: "UPLOAD_BROWSER_STALLED",
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    xhr!.progress(1, 4);
+    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_STALL_TIMEOUT_MS - 1);
+    xhr!.progress(1, 4);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+  });
+
+  it("uses the separate Dashboard response timeout after all bytes leave the browser", async () => {
+    vi.useFakeTimers();
+    class MockXMLHttpRequest {
+      status = 0;
+      private uploadListeners = new Map<string, (event?: any) => void>();
+      upload = {
+        addEventListener: (event: string, listener: (event?: any) => void) =>
+          this.uploadListeners.set(event, listener),
+      };
+      private listeners = new Map<string, () => void>();
+      open() {}
+      setRequestHeader() {}
+      addEventListener(event: string, listener: () => void) {
+        this.listeners.set(event, listener);
+      }
+      send() {
+        this.uploadListeners.get("progress")?.({
+          lengthComputable: true,
+          loaded: 4,
+          total: 4,
+        });
+        this.uploadListeners.get("load")?.();
+      }
+      abort() {
+        this.listeners.get("abort")?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+
+    const upload = uploadFileToUrl(
+      "https://uploads.example/server-timeout",
+      new File(["abcd"], "proof.png", { type: "image/png" }),
+    );
+    const rejected = expect(upload).rejects.toMatchObject({
+      code: "UPLOAD_SERVER_RESPONSE_TIMEOUT",
+    });
+    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS);
+    await rejected;
   });
 
   it("keeps the signed URL out of a captured request and preserves both filenames", async () => {

@@ -183,6 +183,36 @@ export type ManusV2FileUploadObserver = {
     },
   ) => Promise<void>;
   onPutOutcomeUnknown?: (file: ManusV2CreatedFile) => Promise<void>;
+  /**
+   * The PUT candidate is durable, but Provider readiness could not be proven
+   * inside the bounded confirmation window. This is intentionally distinct
+   * from a lost PUT response so durable callers can journal the exact phase.
+   */
+  onConfirmationUnknown?: (file: ManusV2CreatedFile) => Promise<void>;
+};
+
+export type ManusV2ProviderFileDetail = {
+  fileId: string;
+  filename: string;
+  status: "pending" | "uploaded" | "deleted" | "error";
+  bytes: number | null;
+  expiresAt: number;
+  contentType: string | null;
+  requestId: string | null;
+};
+
+export type ManusV2WaitForExactProviderFileInput = {
+  fileId: string;
+  filename: string;
+  expectedBytes: number;
+  expectedContentType: string;
+  minimumUsableSeconds?: number;
+  readinessDeadlineMs?: number;
+  detailAttemptTimeoutMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  observer?: ManusV2FileUploadObserver;
+  candidate?: ManusV2CreatedFile;
 };
 
 export type ManusV2StructuredOutputSchema = Record<string, unknown>;
@@ -304,6 +334,46 @@ function requiredInteger(value: unknown, label: string, minimum: number) {
     throw new ManusV2ApiError(label, 502, "INVALID_RESPONSE", false, false);
   }
   return Number(value);
+}
+
+function canonicalProviderFilename(value: unknown) {
+  return requiredString(
+    typeof value === "string" ? value.replace(/[\\/\0]/gu, "_") : value,
+    "filename",
+    512,
+  );
+}
+
+function canonicalMediaType(value: unknown) {
+  if (typeof value !== "string") return null;
+  const mediaType = value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType)
+    ? mediaType
+    : null;
+}
+
+const TERMINAL_FILE_DETAIL_CODES = new Set([
+  "FILE_ID_CONFLICT",
+  "FILE_IDENTITY_CONFLICT",
+  "FILE_BYTES_CONFLICT",
+  "FILE_MIME_CONFLICT",
+  "FILE_UNUSABLE",
+  "FILE_EXPIRING",
+]);
+
+function retryableFileDetailFailure(error: unknown) {
+  if (!(error instanceof ManusV2ApiError)) return true;
+  if (TERMINAL_FILE_DETAIL_CODES.has(error.code)) return false;
+  return (
+    error.code === "TRANSPORT_UNKNOWN" ||
+    error.code === "INVALID_RESPONSE" ||
+    error.retryable ||
+    error.status === null ||
+    error.status === 408 ||
+    error.status === 425 ||
+    error.status === 429 ||
+    (error.status !== null && error.status >= 500)
+  );
 }
 
 function optionalString(value: unknown, maxLength = 2_048) {
@@ -560,7 +630,6 @@ export type ManusV2CreateTaskInput = {
   interactiveMode?: boolean;
   structuredOutputSchema?: ManusV2StructuredOutputSchema;
   taskReferences?: string[];
-  hideInTaskList?: boolean;
 };
 
 export function buildManusV2CreateTaskBody(input: ManusV2CreateTaskInput) {
@@ -581,7 +650,10 @@ export function buildManusV2CreateTaskBody(input: ManusV2CreateTaskInput) {
     ...(input.locale
       ? { locale: requiredString(input.locale, "locale", 32) }
       : {}),
-    hide_in_task_list: input.hideInTaskList ?? true,
+    // FrontMind tasks stay private but are always visible to their owner.
+    // Pinning this at the wire boundary prevents any business flow from
+    // silently creating a task that disappears from the Manus task list.
+    hide_in_task_list: false,
     share_visibility: "private",
     ...(input.agentProfile
       ? {
@@ -1771,12 +1843,166 @@ export class ManusV2Client {
     }
   }
 
+  async waitForExactProviderFile(
+    input: ManusV2WaitForExactProviderFileInput,
+  ): Promise<ManusV2ProviderFileDetail> {
+    const expectedFileId = requiredString(input.fileId, "fileId", 512);
+    const expectedFilename = canonicalProviderFilename(input.filename);
+    const expectedBytes = requiredInteger(
+      input.expectedBytes,
+      "expectedBytes",
+      0,
+    );
+    const expectedContentType = canonicalMediaType(input.expectedContentType);
+    if (!expectedContentType) {
+      throw new ManusV2ApiError(
+        "contentType",
+        502,
+        "INVALID_RESPONSE",
+        false,
+        false,
+      );
+    }
+    const minimumUsableSeconds = requiredInteger(
+      input.minimumUsableSeconds ?? 15 * 60,
+      "minimumUsableSeconds",
+      1,
+    );
+    const readinessDeadlineMs = requiredInteger(
+      input.readinessDeadlineMs ?? 5 * 60_000,
+      "readinessDeadlineMs",
+      1,
+    );
+    const detailAttemptTimeoutMs = requiredInteger(
+      input.detailAttemptTimeoutMs ?? 20_000,
+      "detailAttemptTimeoutMs",
+      1,
+    );
+    const now = input.now ?? Date.now;
+    const sleep =
+      input.sleep ??
+      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const startedAt = now();
+    if (!Number.isSafeInteger(startedAt) || startedAt < 0) {
+      throw new Error("Invalid Manus v2 file confirmation clock");
+    }
+    const readinessDeadline = startedAt + readinessDeadlineMs;
+    let elapsedBySleeps = 0;
+
+    const confirmationUnknown = async () => {
+      if (!input.observer?.onConfirmationUnknown || !input.candidate) return;
+      try {
+        await input.observer.onConfirmationUnknown(input.candidate);
+      } catch (observerError) {
+        console.error("[Manus v2] file confirmation journal failed", {
+          diagnosticCode: "MANUS_V2_FILE_CONFIRMATION_JOURNAL_FAILED",
+          errorType:
+            observerError instanceof Error
+              ? observerError.name
+              : "UnknownError",
+        });
+      }
+    };
+
+    for (let attempt = 0; ; attempt += 1) {
+      console.info("[Manus v2] provider file confirmation", {
+        phase: "detail_attempt",
+        detailAttempt: attempt + 1,
+        declaredBytes: expectedBytes,
+      });
+      try {
+        const detail = await this.fileDetail(expectedFileId, {
+          signal: AbortSignal.timeout(detailAttemptTimeoutMs),
+        });
+        if (
+          detail.fileId !== expectedFileId ||
+          detail.filename !== expectedFilename
+        ) {
+          throw new ManusV2ApiError(
+            "file.detail",
+            502,
+            "FILE_IDENTITY_CONFLICT",
+            false,
+            false,
+          );
+        }
+        if (detail.status === "uploaded") {
+          if (detail.bytes !== expectedBytes) {
+            throw new ManusV2ApiError(
+              "file.detail",
+              502,
+              "FILE_BYTES_CONFLICT",
+              false,
+              false,
+            );
+          }
+          if (canonicalMediaType(detail.contentType) !== expectedContentType) {
+            throw new ManusV2ApiError(
+              "file.detail",
+              502,
+              "FILE_MIME_CONFLICT",
+              false,
+              false,
+            );
+          }
+          const observedNow = Math.max(now(), startedAt + elapsedBySleeps);
+          if (
+            detail.expiresAt - Math.floor(observedNow / 1_000) <
+            minimumUsableSeconds
+          ) {
+            throw new ManusV2ApiError(
+              "file.detail",
+              409,
+              "FILE_EXPIRING",
+              false,
+              false,
+            );
+          }
+          return detail;
+        }
+        if (detail.status === "deleted" || detail.status === "error") {
+          throw new ManusV2ApiError(
+            "file.detail",
+            409,
+            "FILE_UNUSABLE",
+            false,
+            false,
+          );
+        }
+      } catch (error) {
+        if (!retryableFileDetailFailure(error)) throw error;
+      }
+
+      const observedNow = Math.max(now(), startedAt + elapsedBySleeps);
+      if (observedNow >= readinessDeadline) {
+        await confirmationUnknown();
+        throw new ManusV2ApiError(
+          "file.detail",
+          null,
+          "FILE_UPLOAD_CONFIRMATION_UNKNOWN",
+          false,
+          true,
+        );
+      }
+      const delayMs = Math.min(
+        readinessDeadline - observedNow,
+        3_000,
+        500 * 2 ** Math.min(attempt, 3),
+      );
+      await sleep(delayMs);
+      elapsedBySleeps += delayMs;
+    }
+  }
+
   async uploadFile(input: {
     filename: string;
     bytes: Buffer;
     contentType: string;
     minimumUsableSeconds?: number;
+    readinessDeadlineMs?: number;
+    detailAttemptTimeoutMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
     observer?: ManusV2FileUploadObserver;
     /** Resume a durable provider id after a crash/response-loss boundary. */
     existingCandidate?: {
@@ -1788,98 +2014,67 @@ export class ManusV2Client {
       resumePutRejectionCount?: number;
     };
   }) {
-    if (input.existingCandidate && !input.existingCandidate.uploadUrl) {
-      const expectedFileId = requiredString(
-        input.existingCandidate.fileId,
-        "fileId",
-        512,
+    const expectedFilename = canonicalProviderFilename(input.filename);
+    const expectedContentType = canonicalMediaType(input.contentType);
+    if (!expectedContentType) {
+      throw new ManusV2ApiError(
+        "contentType",
+        502,
+        "INVALID_RESPONSE",
+        false,
+        false,
       );
-      const expectedFilename = requiredString(
-        input.existingCandidate.filename.replace(/[\\/\0]/gu, "_"),
-        "filename",
-        512,
-      );
-      const sleep =
-        input.sleep ??
-        ((ms: number) =>
-          new Promise<void>((resolve) => setTimeout(resolve, ms)));
-      const readinessDeadline = Date.now() + 5 * 60_000;
-      for (let attempt = 0; ; attempt += 1) {
-        const detail = await this.fileDetail(expectedFileId);
-        if (detail.filename !== expectedFilename) {
-          throw new ManusV2ApiError(
-            "file.detail",
-            502,
-            "FILE_IDENTITY_CONFLICT",
-            false,
-            false,
-          );
-        }
-        if (detail.status === "uploaded") {
-          if (detail.bytes !== input.bytes.length) {
-            throw new ManusV2ApiError(
-              "file.detail",
-              502,
-              "FILE_BYTES_CONFLICT",
-              false,
-              false,
-            );
-          }
-          const minimumUsableSeconds = input.minimumUsableSeconds ?? 15 * 60;
-          if (
-            detail.expiresAt - Math.floor(Date.now() / 1_000) <
-            minimumUsableSeconds
-          ) {
-            throw new ManusV2ApiError(
-              "file.detail",
-              409,
-              "FILE_EXPIRING",
-              false,
-              false,
-            );
-          }
-          return {
-            fileId: expectedFileId,
-            filename: expectedFilename,
-            uploadUrl: "",
-            uploadExpiresAt: 0,
-            requestId: detail.requestId,
-            detail,
-          };
-        }
-        if (detail.status === "deleted" || detail.status === "error") {
-          throw new ManusV2ApiError(
-            "file.detail",
-            409,
-            "FILE_UNUSABLE",
-            false,
-            false,
-          );
-        }
-        if (Date.now() >= readinessDeadline) {
-          throw new ManusV2ApiError(
-            "file.detail",
-            null,
-            "FILE_PENDING",
-            true,
-            false,
-          );
-        }
-        await sleep(Math.min(3_000, 500 * 2 ** Math.min(attempt, 3)));
-      }
     }
+    const now = input.now ?? Date.now;
+    const sleep =
+      input.sleep ??
+      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const waitForExact = async (candidate: ManusV2CreatedFile) =>
+      this.waitForExactProviderFile({
+        fileId: candidate.fileId,
+        filename: expectedFilename,
+        expectedBytes: input.bytes.length,
+        expectedContentType,
+        minimumUsableSeconds: input.minimumUsableSeconds,
+        readinessDeadlineMs: input.readinessDeadlineMs,
+        detailAttemptTimeoutMs: input.detailAttemptTimeoutMs,
+        sleep,
+        now,
+        observer: input.observer,
+        candidate,
+      });
+
+    if (input.existingCandidate && !input.existingCandidate.uploadUrl) {
+      const candidate: ManusV2CreatedFile = {
+        fileId: requiredString(input.existingCandidate.fileId, "fileId", 512),
+        filename: canonicalProviderFilename(input.existingCandidate.filename),
+        uploadUrl: "",
+        uploadExpiresAt: 0,
+        requestId: null,
+      };
+      if (candidate.filename !== expectedFilename) {
+        throw new ManusV2ApiError(
+          "file.detail",
+          502,
+          "FILE_IDENTITY_CONFLICT",
+          false,
+          false,
+        );
+      }
+      const detail = await waitForExact(candidate);
+      return { ...candidate, requestId: detail.requestId, detail };
+    }
+
     const resumedUpload = Boolean(input.existingCandidate?.uploadUrl);
-    const created = resumedUpload
+    const created: ManusV2CreatedFile = resumedUpload
       ? {
           fileId: requiredString(
             input.existingCandidate!.fileId,
             "fileId",
             512,
           ),
-          filename: requiredString(
-            input.existingCandidate!.filename.replace(/[\\/\0]/gu, "_"),
-            "filename",
-            512,
+          filename: canonicalProviderFilename(
+            input.existingCandidate!.filename,
           ),
           uploadUrl: requiredString(
             input.existingCandidate!.uploadUrl,
@@ -1893,7 +2088,16 @@ export class ManusV2Client {
           ),
           requestId: null,
         }
-      : await this.createFile(input.filename);
+      : await this.createFile(expectedFilename);
+    if (created.filename !== expectedFilename) {
+      throw new ManusV2ApiError(
+        "file.upload",
+        502,
+        "FILE_IDENTITY_CONFLICT",
+        false,
+        false,
+      );
+    }
     if (!resumedUpload) {
       await input.observer?.onCandidateCreated?.(created);
     }
@@ -1911,8 +2115,8 @@ export class ManusV2Client {
         false,
       );
     }
-    const deadlineMs = created.uploadExpiresAt * 1_000 - 5_000;
-    if (Date.now() >= deadlineMs) {
+    const uploadDeadlineMs = created.uploadExpiresAt * 1_000 - 5_000;
+    if (now() >= uploadDeadlineMs) {
       throw new ManusV2ApiError(
         "file.upload.content",
         null,
@@ -1921,10 +2125,6 @@ export class ManusV2Client {
         false,
       );
     }
-    const sleep =
-      input.sleep ??
-      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    let response: AxiosResponse;
     const resumedRejectionCount = resumedUpload
       ? requiredInteger(
           input.existingCandidate!.resumePutRejectionCount,
@@ -1941,33 +2141,36 @@ export class ManusV2Client {
         false,
       );
     }
+    let putOutcomeUnknown = false;
     for (let putAttempt = resumedRejectionCount; ; putAttempt += 1) {
       await input.observer?.onPutStarted?.(created);
+      let response: AxiosResponse;
       try {
         response = await axios.put(created.uploadUrl, input.bytes, {
           headers: {
-            "Content-Type": requiredString(
-              input.contentType,
-              "contentType",
-              255,
-            ),
+            "Content-Type": expectedContentType,
             "Content-Length": String(input.bytes.length),
           },
-          timeout: Math.max(1, deadlineMs - Date.now()),
+          timeout: Math.max(1, uploadDeadlineMs - now()),
           maxRedirects: 0,
           maxBodyLength: input.bytes.length,
           maxContentLength: 1024 * 1024,
           validateStatus: () => true,
         });
       } catch {
-        await input.observer?.onPutOutcomeUnknown?.(created);
-        throw new ManusV2ApiError(
-          "file.upload.content",
-          null,
-          "TRANSPORT_UNKNOWN",
-          false,
-          true,
-        );
+        try {
+          await input.observer?.onPutOutcomeUnknown?.(created);
+        } catch (observerError) {
+          console.error("[Manus v2] file outcome journal failed", {
+            diagnosticCode: "MANUS_V2_FILE_OUTCOME_JOURNAL_FAILED",
+            errorType:
+              observerError instanceof Error
+                ? observerError.name
+                : "UnknownError",
+          });
+        }
+        putOutcomeUnknown = true;
+        break;
       }
       if (response.status >= 200 && response.status < 300) break;
       const rejectionCount = putAttempt + 1;
@@ -1993,7 +2196,7 @@ export class ManusV2Client {
         retryAfterMs: providerRetryAfterMs,
         fileId: created.fileId,
       });
-      const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+      const nextRetryAt = new Date(now() + delayMs).toISOString();
       await input.observer?.onPutRetryWait?.(created, {
         status: response.status,
         code: `HTTP_${response.status}`,
@@ -2002,7 +2205,7 @@ export class ManusV2Client {
         nextRetryAt,
       });
       await sleep(delayMs);
-      if (Date.now() >= deadlineMs) {
+      if (now() >= uploadDeadlineMs) {
         await input.observer?.onPutRejected?.(created, {
           status: 408,
           code: "UPLOAD_URL_EXPIRED",
@@ -2016,67 +2219,17 @@ export class ManusV2Client {
         );
       }
     }
-    await input.observer?.onPutAccepted?.(created);
-    const readinessDeadline = Date.now() + 5 * 60_000;
-    for (let attempt = 0; ; attempt += 1) {
-      const detail = await this.fileDetail(created.fileId);
-      if (detail.filename !== created.filename) {
-        throw new ManusV2ApiError(
-          "file.detail",
-          502,
-          "FILE_IDENTITY_CONFLICT",
-          false,
-          false,
-        );
-      }
-      if (detail.status === "uploaded") {
-        if (detail.bytes !== input.bytes.length) {
-          throw new ManusV2ApiError(
-            "file.detail",
-            502,
-            "FILE_BYTES_CONFLICT",
-            false,
-            false,
-          );
-        }
-        const minimumUsableSeconds = input.minimumUsableSeconds ?? 15 * 60;
-        if (
-          detail.expiresAt - Math.floor(Date.now() / 1_000) <
-          minimumUsableSeconds
-        ) {
-          throw new ManusV2ApiError(
-            "file.detail",
-            409,
-            "FILE_EXPIRING",
-            false,
-            false,
-          );
-        }
-        return { ...created, detail };
-      }
-      if (detail.status === "deleted" || detail.status === "error") {
-        throw new ManusV2ApiError(
-          "file.detail",
-          409,
-          "FILE_UNUSABLE",
-          false,
-          false,
-        );
-      }
-      if (Date.now() >= readinessDeadline) {
-        throw new ManusV2ApiError(
-          "file.detail",
-          null,
-          "FILE_PENDING",
-          true,
-          false,
-        );
-      }
-      await sleep(Math.min(3_000, 500 * 2 ** Math.min(attempt, 3)));
+    if (!putOutcomeUnknown) {
+      await input.observer?.onPutAccepted?.(created);
     }
+    const detail = await waitForExact(created);
+    return { ...created, detail };
   }
 
-  async fileDetail(fileId: string, options?: { signal?: AbortSignal }) {
+  async fileDetail(
+    fileId: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<ManusV2ProviderFileDetail> {
     const expectedFileId = requiredString(fileId, "fileId", 512);
     const result = await this.request(
       "file.detail",

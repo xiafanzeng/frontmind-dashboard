@@ -6,11 +6,13 @@ const mocks = vi.hoisted(() => ({
   knowledgeRefetch: vi.fn(),
   deliveryTicketCreate: vi.fn(),
   progressRefetch: vi.fn(),
+  setKnowledgeData: vi.fn(),
   setProgressData: vi.fn(),
   invalidateProgress: vi.fn(),
   createConversation: vi.fn(),
   setActive: vi.fn(),
   discardConversationLocally: vi.fn(),
+  discardKnowledgeBaseConversationsLocally: vi.fn(),
   refreshConversationsAfterDiscard: vi.fn(),
   activeConversation: null as any,
   resetIsError: false,
@@ -40,6 +42,8 @@ vi.mock("@/contexts/ConversationContext", () => ({
     createConversation: mocks.createConversation,
     setActive: mocks.setActive,
     discardConversationLocally: mocks.discardConversationLocally,
+    discardKnowledgeBaseConversationsLocally:
+      mocks.discardKnowledgeBaseConversationsLocally,
     refreshConversationsAfterDiscard: mocks.refreshConversationsAfterDiscard,
   }),
 }));
@@ -56,6 +60,9 @@ vi.mock("@/lib/trpc", () => ({
   trpc: {
     useUtils: () => ({
       workspace: {
+        knowledge: {
+          setData: mocks.setKnowledgeData,
+        },
         knowledgeProgress: {
           setData: mocks.setProgressData,
           invalidate: mocks.invalidateProgress,
@@ -116,6 +123,7 @@ beforeEach(() => {
   mocks.knowledgeRefetch.mockReset().mockResolvedValue(undefined);
   mocks.deliveryTicketCreate.mockReset().mockResolvedValue(undefined);
   mocks.progressRefetch.mockReset().mockResolvedValue(undefined);
+  mocks.setKnowledgeData.mockReset();
   mocks.setProgressData.mockReset();
   mocks.invalidateProgress.mockReset().mockResolvedValue(undefined);
   mocks.createConversation
@@ -123,6 +131,9 @@ beforeEach(() => {
     .mockReturnValue("knowledge-conversation");
   mocks.setActive.mockReset();
   mocks.discardConversationLocally.mockReset();
+  mocks.discardKnowledgeBaseConversationsLocally
+    .mockReset()
+    .mockReturnValue([]);
   mocks.refreshConversationsAfterDiscard
     .mockReset()
     .mockResolvedValue(undefined);
@@ -266,6 +277,35 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
       );
     });
     expect(mocks.resetRefetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the existing approval dialog from a failed build reset CTA", () => {
+    mocks.progressIsError = true;
+    mocks.resetStatus = {
+      revision: 0,
+      hasKnowledge: true,
+      locked: false,
+      canRequest: true,
+      unavailableReason: null,
+      engineer: { id: 9, name: "运维" },
+      pending: null,
+    };
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent("frontmind:request-knowledge-reset"),
+      );
+    });
+
+    expect(
+      screen.getByRole("dialog", { name: "申请重置知识库" }),
+    ).toBeInTheDocument();
   });
 
   it("shows only maintenance and ZIP actions on the published display page", () => {
@@ -514,49 +554,30 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     ).toBe(true);
   });
 
-  it("keeps an initial reset pending until the stale scoped conversation appears", () => {
+  it("clears every local KB lane immediately when an approved revision is observed", () => {
+    mocks.discardKnowledgeBaseConversationsLocally.mockReturnValue([
+      "stale-after-reset",
+    ]);
     mocks.resetStatus = {
       ...mocks.resetStatus,
       revision: 2,
       hasKnowledge: false,
     };
-    const { rerender } = render(
+    render(
       <EmbeddedKnowledgeBasePanel
         page="display"
         onPageChange={() => undefined}
       />,
     );
-    expect(mocks.discardConversationLocally).not.toHaveBeenCalled();
-
-    mocks.activeConversation = {
-      id: "stale-after-reset",
-      title: "企业知识库构建",
-      messages: [
-        {
-          id: "old-start",
-          role: "user",
-          content: "开始构建企业知识库",
-          timestamp: 1,
-          knowledgeBase: {
-            kind: "pending_user",
-            clientRequestId: "old-request",
-            serverOwned: true,
-          },
-        },
-      ],
-      status: "running",
-      createdAt: 1,
-      updatedAt: 1,
-    };
-    rerender(
-      <EmbeddedKnowledgeBasePanel
-        page="display"
-        onPageChange={() => undefined}
-      />,
+    expect(mocks.discardKnowledgeBaseConversationsLocally).toHaveBeenCalledWith(
+      undefined,
     );
-
-    expect(mocks.discardConversationLocally).toHaveBeenCalledWith(
-      "stale-after-reset",
+    expect(mocks.setKnowledgeData).toHaveBeenCalledWith(
+      undefined,
+      expect.any(Function),
+    );
+    expect(mocks.setKnowledgeData.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.knowledgeRefetch.mock.invocationCallOrder[0]!,
     );
     expect(mocks.setProgressData).toHaveBeenCalledWith(
       undefined,
@@ -570,7 +591,7 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     expect(mocks.refreshConversationsAfterDiscard).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps a current or newly created blank KB conversation", () => {
+  it("treats a blank KB conversation as stale across an approved revision", () => {
     const blankConversation = {
       id: "new-conversation",
       title: "企业知识库构建",
@@ -608,6 +629,6 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
         hasKnowledge: false,
         conversation: blankConversation,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 });

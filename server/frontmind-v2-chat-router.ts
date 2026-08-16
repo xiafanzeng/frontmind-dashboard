@@ -27,14 +27,34 @@ import {
 import {
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
+  removeStoredPresalesFile,
   stagePresalesFileContent,
+  withStoredPresalesFileMutationLock,
 } from "./presales-file-store";
 import { sealLocalAssetStorageIdentity } from "./local-asset-storage-key";
+import {
+  KnowledgeBaseLocalAssetCoordinateError,
+  knowledgeBaseLocalAssetIdentity,
+  knowledgeBaseLocalAssetReplayMatches,
+  parseKnowledgeBaseLocalUploadCoordinate,
+} from "./knowledge-base-local-asset-upload";
+import {
+  assertKnowledgeBaseLocalUploadCoordinate,
+  KnowledgeBaseTurnReservationError,
+} from "./knowledge-base-turn-service";
+import {
+  OwnedFileContentError,
+  ownedFileContentResolver,
+} from "./owned-file-content-resolver";
 import {
   assertSafeExternalUrl,
   safeExternalRequestOptions,
 } from "./_core/safe-external-url";
 import { sanitizeFrontMindPublicText } from "../shared/frontmind-public-brand";
+import {
+  generalAgentModelProfileModel,
+  generalAgentModelProfileSchema,
+} from "../shared/manus-agent-profile";
 import { getUpstreamBaseUrl } from "./upstream-config";
 
 const router = Router();
@@ -55,6 +75,7 @@ const taskCreateSchema = z
     conversationId: z.string().trim().min(1).max(191),
     clientRequestId: z.string().trim().min(1).max(128),
     prompt: z.string().trim().min(1).max(2_000_000),
+    modelProfile: generalAgentModelProfileSchema.default("frontmind-pro"),
     localAssetIds: z
       .array(z.string().trim().min(1).max(36))
       .max(32)
@@ -63,7 +84,7 @@ const taskCreateSchema = z
   .strict();
 
 const taskMessageSchema = taskCreateSchema
-  .omit({ conversationId: true })
+  .omit({ conversationId: true, modelProfile: true })
   .extend({ conversationId: z.string().trim().min(1).max(191) })
   .strict();
 
@@ -87,6 +108,13 @@ class ChatV2HttpError extends Error {
     super(code);
     this.name = "ChatV2HttpError";
   }
+}
+
+function assertGeneralAgentActor(user: Express.Request["frontmindUser"]) {
+  const allowed =
+    user?.role === "delivery_member" ||
+    (user?.role === "admin" && user.adminAccessLevel === "delivery_admin");
+  if (!allowed) throw new ChatV2HttpError("GENERAL_AGENT_ROLE_FORBIDDEN", 403);
 }
 
 function hash(value: string) {
@@ -123,6 +151,45 @@ function cleanMimeType(value: unknown) {
   )
     ? normalized.slice(0, 255)
     : "application/octet-stream";
+}
+
+function knowledgeBaseUploadReservationError(error: unknown) {
+  if (!(error instanceof KnowledgeBaseTurnReservationError)) return error;
+  if (error.code === "INVALID_REQUEST") {
+    return new ChatV2HttpError("KNOWLEDGE_BASE_UPLOAD_COORDINATE_INVALID", 400);
+  }
+  if (error.code === "KNOWLEDGE_BASE_RESET_REVISION_CHANGED") {
+    return new ChatV2HttpError(error.code, 409);
+  }
+  return new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
+}
+
+async function storedLocalAssetContentMatches(input: {
+  id: string;
+  sizeBytes: number;
+  contentSha256: string;
+}) {
+  const stored = await readStoredPresalesFile(input.id);
+  if (
+    !stored ||
+    stored.sizeBytes !== input.sizeBytes ||
+    (stored.recordedSizeBytes !== null &&
+      stored.recordedSizeBytes !== input.sizeBytes) ||
+    stored.sha256 !== input.contentSha256
+  ) {
+    return false;
+  }
+  const digest = createHash("sha256");
+  let total = 0;
+  for await (const chunk of stored.createReadStream()) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += bytes.length;
+    if (total > input.sizeBytes || total > MAX_LOCAL_ASSET_BYTES) return false;
+    digest.update(bytes);
+  }
+  return (
+    total === input.sizeBytes && digest.digest("hex") === input.contentSha256
+  );
 }
 
 async function requireDb(): Promise<Db> {
@@ -816,6 +883,7 @@ async function reserveCreate(input: {
     conversationId: input.value.conversationId,
     prompt: input.value.prompt,
     localAssetIds: input.value.localAssetIds,
+    modelProfile: input.value.modelProfile,
   });
   const existing = (
     await db
@@ -859,8 +927,8 @@ async function reserveCreate(input: {
         schemaHash: CHAT_SCHEMA_HASH,
         apiCredentialId: input.credential.id,
         credentialVersion: input.credential.version,
-        publicProfile: input.credential.agentProfile,
-        upstreamModel: input.credential.upstreamModel,
+        publicProfile: input.value.modelProfile,
+        upstreamModel: generalAgentModelProfileModel(input.value.modelProfile),
         status: "queued",
       });
       await tx.insert(agentTasks).values({
@@ -1049,6 +1117,20 @@ async function sendProviderMessage(input: {
 }
 
 function sendError(res: Response, error: unknown) {
+  if (error instanceof OwnedFileContentError) {
+    res.status(error.statusCode).json({
+      error: {
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        recoveryAction: error.recoveryAction,
+        ...(error.expiresAt !== undefined
+          ? { expiresAt: error.expiresAt }
+          : {}),
+      },
+    });
+    return;
+  }
   if (error instanceof ChatV2HttpError) {
     res.status(error.statusCode).json({
       error: {
@@ -1098,13 +1180,27 @@ function sendError(res: Response, error: unknown) {
 }
 
 router.post("/assets", async (req, res) => {
+  const traceId = randomUUID();
+  const startedAt = Date.now();
+  let declaredBytes: number | undefined;
+  let receivedBytes = 0;
+  let temporaryDiscarded = false;
+  let assetCommitted = false;
+  const uploadAttempt = Math.max(
+    1,
+    Math.min(3, Number(req.headers["x-frontmind-upload-attempt"]) || 1),
+  );
+  let knowledgeCoordinate: ReturnType<
+    typeof parseKnowledgeBaseLocalUploadCoordinate
+  > = null;
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
+    const ownerUserId = req.frontmindUser.id;
     const filename = cleanFilename(req.headers["x-frontmind-filename"]);
     const mimeType = cleanMimeType(
       req.headers["x-frontmind-mime"] ?? req.headers["content-type"],
     );
-    const declaredBytes = Number(
+    declaredBytes = Number(
       req.headers["x-frontmind-size"] ?? req.headers["content-length"],
     );
     if (
@@ -1114,48 +1210,301 @@ router.post("/assets", async (req, res) => {
     ) {
       throw new ChatV2HttpError("LOCAL_ASSET_SIZE_INVALID", 413);
     }
-    const id = localAssetId();
-    const staged = await stagePresalesFileContent({
-      fileId: id,
-      stream: req,
-      maxBytes: MAX_LOCAL_ASSET_BYTES,
-    });
-    if (staged.sizeBytes !== declaredBytes) {
-      await staged.discard();
-      throw new ChatV2HttpError("LOCAL_ASSET_SIZE_MISMATCH", 400);
+    try {
+      knowledgeCoordinate = parseKnowledgeBaseLocalUploadCoordinate(
+        req.headers,
+      );
+    } catch (error) {
+      if (error instanceof KnowledgeBaseLocalAssetCoordinateError) {
+        throw new ChatV2HttpError(error.code, 400);
+      }
+      throw error;
     }
-    const now = Date.now();
-    await staged.commit({
-      filename,
-      mimeType,
-      uploadedAt: now,
-      contentExpiresAt: now + LOCAL_CONTENT_RETENTION_MS,
+    const knowledgeIdentity = knowledgeCoordinate
+      ? knowledgeBaseLocalAssetIdentity({
+          userId: ownerUserId,
+          projectAssignmentId:
+            req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+          coordinate: knowledgeCoordinate,
+          sizeBytes: declaredBytes,
+        })
+      : null;
+    const assertKnowledgeCoordinate = async () => {
+      if (!knowledgeCoordinate) return;
+      try {
+        await assertKnowledgeBaseLocalUploadCoordinate({
+          userId: ownerUserId,
+          projectAssignmentId:
+            req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+          conversationId: knowledgeCoordinate.conversationId,
+          turnId: knowledgeCoordinate.turnId,
+          clientRequestId: knowledgeCoordinate.clientRequestId,
+          itemId: knowledgeCoordinate.itemId,
+          expectedResetRevision: knowledgeCoordinate.expectedResetRevision,
+          ordinal: knowledgeCoordinate.ordinal,
+          filename,
+          mimeType,
+          sizeBytes: declaredBytes!,
+          contentSha256: knowledgeCoordinate.contentSha256,
+        });
+      } catch (error) {
+        throw knowledgeBaseUploadReservationError(error);
+      }
+    };
+    // Reject forged, reset or already-dispatched coordinates before consuming
+    // a potentially 100 MiB request body.
+    await assertKnowledgeCoordinate();
+    console.info("[FrontMindV2Asset] upload_start", {
+      traceId,
+      declaredBytes,
+      uploadAttempt,
+      ...(knowledgeCoordinate
+        ? {
+            conversationId: knowledgeCoordinate.conversationId,
+            turnId: knowledgeCoordinate.turnId,
+            itemId: knowledgeCoordinate.itemId,
+            ordinal: knowledgeCoordinate.ordinal,
+            expectedResetRevision: knowledgeCoordinate.expectedResetRevision,
+          }
+        : {}),
     });
-    const db = await requireDb();
-    await db.insert(localAssets).values(
-      sealLocalAssetStorageIdentity({
-        id,
-        scope: "managed_user" as const,
-        accountUserId: req.frontmindUser.id,
-        presalesProjectId: null,
-        filename,
-        mimeType,
-        sizeBytes: staged.sizeBytes,
-        contentSha256: staged.sha256,
-        storageKey: `frontmind-v2:${id}`,
-        refCount: 1,
-        retainUntil: new Date(now + LOCAL_CONTENT_RETENTION_MS),
-      }),
-    );
-    res.status(201).json({
-      localAssetId: id,
-      filename,
-      mimeType,
-      bytes: staged.sizeBytes,
-      sha256: staged.sha256,
-      expiresAt: now + LOCAL_CONTENT_RETENTION_MS,
+    const persistUpload = async () => {
+      const db = await requireDb();
+      const id = knowledgeIdentity?.localAssetId || localAssetId();
+      const loadExisting = async () =>
+        knowledgeIdentity
+          ? (
+              await db
+                .select()
+                .from(localAssets)
+                .where(
+                  and(
+                    eq(localAssets.id, knowledgeIdentity.localAssetId),
+                    eq(localAssets.scope, "managed_user"),
+                    eq(localAssets.accountUserId, ownerUserId),
+                  ),
+                )
+                .limit(1)
+            )[0]
+          : undefined;
+      const progressThresholds = [25, 50, 75] as const;
+      let nextProgressThreshold = 0;
+      const staged = await stagePresalesFileContent({
+        fileId: id,
+        stream: req,
+        maxBytes: MAX_LOCAL_ASSET_BYTES,
+        onProgress: (nextReceivedBytes) => {
+          receivedBytes = nextReceivedBytes;
+          while (
+            nextProgressThreshold < progressThresholds.length &&
+            nextReceivedBytes * 100 >=
+              declaredBytes! * progressThresholds[nextProgressThreshold]
+          ) {
+            const percent = progressThresholds[nextProgressThreshold];
+            console.info("[FrontMindV2Asset] upload_progress", {
+              traceId,
+              declaredBytes,
+              receivedBytes: nextReceivedBytes,
+              percent,
+              durationMs: Date.now() - startedAt,
+              ...(knowledgeCoordinate
+                ? {
+                    conversationId: knowledgeCoordinate.conversationId,
+                    turnId: knowledgeCoordinate.turnId,
+                    itemId: knowledgeCoordinate.itemId,
+                    ordinal: knowledgeCoordinate.ordinal,
+                  }
+                : {}),
+            });
+            nextProgressThreshold += 1;
+          }
+        },
+      }).catch((error) => {
+        // stagePresalesFileContent guarantees removal of its partial temp.
+        temporaryDiscarded = true;
+        throw error;
+      });
+      try {
+        if (staged.sizeBytes !== declaredBytes) {
+          throw new ChatV2HttpError("LOCAL_ASSET_SIZE_MISMATCH", 400);
+        }
+        if (
+          knowledgeCoordinate &&
+          staged.sha256 !== knowledgeCoordinate.contentSha256
+        ) {
+          throw new ChatV2HttpError("LOCAL_ASSET_SHA256_MISMATCH", 400);
+        }
+        const finalizeUpload = async () => {
+          // Reset/dispatch can advance while the body is in flight. Re-prove
+          // the reservation immediately before the short durable commit.
+          await assertKnowledgeCoordinate();
+          const replayPayload = async (
+            existing: typeof localAssets.$inferSelect,
+          ) => {
+            const matches =
+              knowledgeIdentity &&
+              knowledgeBaseLocalAssetReplayMatches(existing, {
+                filename,
+                mimeType,
+                sizeBytes: staged.sizeBytes,
+                contentSha256: staged.sha256,
+                storageKey: knowledgeIdentity.storageKey,
+              });
+            const bytesMatch =
+              matches &&
+              (await storedLocalAssetContentMatches({
+                id: existing.id,
+                sizeBytes: existing.sizeBytes,
+                contentSha256: existing.contentSha256,
+              }));
+            if (!matches || !bytesMatch) {
+              throw new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
+            }
+            const expiresAt = existing.retainUntil?.getTime() ?? 0;
+            if (expiresAt <= Date.now()) {
+              throw new ChatV2HttpError("LOCAL_ASSET_EXPIRED", 409);
+            }
+            await staged.discard();
+            temporaryDiscarded = true;
+            assetCommitted = true;
+            return {
+              status: 200,
+              payload: {
+                localAssetId: existing.id,
+                filename: existing.filename,
+                mimeType: existing.mimeType,
+                bytes: existing.sizeBytes,
+                sha256: existing.contentSha256,
+                expiresAt,
+                traceId,
+                replayed: true,
+              },
+            };
+          };
+
+          const existing = await loadExisting();
+          if (existing && knowledgeIdentity) return replayPayload(existing);
+
+          const now = Date.now();
+          const storageKey =
+            knowledgeIdentity?.storageKey ?? `frontmind-v2:${id}`;
+          await staged.commit({
+            filename,
+            mimeType,
+            uploadedAt: now,
+            contentExpiresAt: now + LOCAL_CONTENT_RETENTION_MS,
+          });
+          try {
+            await db.insert(localAssets).values(
+              sealLocalAssetStorageIdentity({
+                id,
+                scope: "managed_user" as const,
+                accountUserId: ownerUserId,
+                presalesProjectId: null,
+                filename,
+                mimeType,
+                sizeBytes: staged.sizeBytes,
+                contentSha256: staged.sha256,
+                storageKey,
+                refCount: 1,
+                retainUntil: new Date(now + LOCAL_CONTENT_RETENTION_MS),
+              }),
+            );
+            assetCommitted = true;
+          } catch (insertError) {
+            // The insert can commit while its response is lost. Re-read under
+            // the same cross-process lock; an exact row is the winner and its
+            // final file must never be deleted. If the re-read itself fails,
+            // retain the possible winner for reconciliation/retention cleanup.
+            let winner: typeof localAssets.$inferSelect | undefined;
+            try {
+              winner = await loadExisting();
+            } catch {
+              throw insertError;
+            }
+            if (winner && knowledgeIdentity) return replayPayload(winner);
+            await removeStoredPresalesFile(id).catch(() => undefined);
+            temporaryDiscarded = true;
+            throw insertError;
+          }
+          return {
+            status: 201,
+            payload: {
+              localAssetId: id,
+              filename,
+              mimeType,
+              bytes: staged.sizeBytes,
+              sha256: staged.sha256,
+              expiresAt: now + LOCAL_CONTENT_RETENTION_MS,
+              traceId,
+              replayed: false,
+            },
+          };
+        };
+        return knowledgeIdentity
+          ? withStoredPresalesFileMutationLock(id, finalizeUpload)
+          : finalizeUpload();
+      } catch (error) {
+        await staged.discard().catch(() => undefined);
+        temporaryDiscarded = true;
+        throw error;
+      }
+    };
+    const completed = await persistUpload();
+    res.status(completed.status).json(completed.payload);
+    console.info("[FrontMindV2Asset] upload_complete", {
+      traceId,
+      declaredBytes,
+      receivedBytes: completed.payload.bytes,
+      durationMs: Date.now() - startedAt,
+      status: completed.status,
+      requestAborted: req.aborted,
+      requestComplete: req.complete,
+      requestDestroyed: req.destroyed,
+      temporaryDiscarded,
+      assetCommitted,
+      replayed: completed.payload.replayed,
+      ...(knowledgeCoordinate
+        ? {
+            conversationId: knowledgeCoordinate.conversationId,
+            turnId: knowledgeCoordinate.turnId,
+            itemId: knowledgeCoordinate.itemId,
+            ordinal: knowledgeCoordinate.ordinal,
+          }
+        : {}),
     });
   } catch (error) {
+    console.warn("[FrontMindV2Asset] upload_failed", {
+      traceId,
+      declaredBytes,
+      receivedBytes,
+      durationMs: Date.now() - startedAt,
+      requestAborted: req.aborted,
+      requestComplete: req.complete,
+      requestDestroyed: req.destroyed,
+      socketDestroyed: req.socket.destroyed,
+      uploadAttempt,
+      temporaryDiscarded,
+      assetCommitted,
+      ...(knowledgeCoordinate
+        ? {
+            conversationId: knowledgeCoordinate.conversationId,
+            turnId: knowledgeCoordinate.turnId,
+            itemId: knowledgeCoordinate.itemId,
+            ordinal: knowledgeCoordinate.ordinal,
+          }
+        : {}),
+      code:
+        error instanceof ChatV2HttpError
+          ? error.code
+          : error instanceof Error
+            ? error.name
+            : "UNKNOWN_ERROR",
+      streamErrorCode:
+        typeof (error as NodeJS.ErrnoException | null)?.code === "string"
+          ? (error as NodeJS.ErrnoException).code
+          : null,
+    });
     sendError(res, error);
   }
 });
@@ -1163,34 +1512,25 @@ router.post("/assets", async (req, res) => {
 router.get("/assets/:localAssetId/content", async (req, res) => {
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
-    const asset = (
-      await (
-        await requireDb()
-      )
-        .select()
-        .from(localAssets)
-        .where(
-          and(
-            eq(localAssets.id, req.params.localAssetId),
-            eq(localAssets.scope, "managed_user"),
-            eq(localAssets.accountUserId, req.frontmindUser.id),
-          ),
-        )
-        .limit(1)
-    )[0];
-    const stored = asset
-      ? await readStoredPresalesFile(req.params.localAssetId)
-      : null;
-    if (!asset || !stored)
-      throw new ChatV2HttpError("LOCAL_ASSET_NOT_FOUND", 404);
+    const asset = await ownedFileContentResolver.resolve({
+      ownerUserId: req.frontmindUser.id,
+      fileId: req.params.localAssetId,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      expectedSourceKind: "managed_local_asset",
+      expectedSourceAuthorityId: req.params.localAssetId,
+    });
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.setHeader("Content-Type", asset.mimeType);
-    res.setHeader("Content-Length", String(asset.sizeBytes));
-    res.setHeader("ETag", `\"sha256:${asset.contentSha256}\"`);
+    if (asset.sizeBytes !== undefined) {
+      res.setHeader("Content-Length", String(asset.sizeBytes));
+    }
+    if (asset.sha256) res.setHeader("ETag", `\"sha256:${asset.sha256}\"`);
     res.setHeader(
       "Content-Disposition",
       `attachment; filename*=UTF-8''${encodeURIComponent(asset.filename)}`,
     );
-    stored.createReadStream().pipe(res);
+    asset.stream.pipe(res);
   } catch (error) {
     sendError(res, error);
   }
@@ -1198,7 +1538,11 @@ router.get("/assets/:localAssetId/content", async (req, res) => {
 
 router.post("/tasks", async (req, res) => {
   try {
-    if (!req.frontmindUser || !req.frontmindCredential) {
+    if (!req.frontmindUser) {
+      throw new ChatV2HttpError("UNAUTHORIZED", 401);
+    }
+    assertGeneralAgentActor(req.frontmindUser);
+    if (!req.frontmindCredential) {
       throw new ChatV2HttpError("API_CREDENTIAL_REQUIRED", 428);
     }
     const value = taskCreateSchema.parse(req.body ?? {});
@@ -1224,7 +1568,6 @@ router.post("/tasks", async (req, res) => {
           agentProfile: reserved.operation.upstreamModel,
           interactiveMode: true,
           locale: "zh-CN",
-          hideInTaskList: true,
         });
         await updateTaskState({
           operationId: reserved.operation.id,
@@ -1284,6 +1627,7 @@ router.post("/tasks", async (req, res) => {
 router.post("/tasks/:localTaskId/messages", async (req, res) => {
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
+    assertGeneralAgentActor(req.frontmindUser);
     const value = taskMessageSchema.parse(req.body ?? {});
     let owned = await syncTask({
       userId: req.frontmindUser.id,
@@ -1319,6 +1663,7 @@ router.post("/tasks/:localTaskId/messages", async (req, res) => {
 router.get("/tasks/:localTaskId", async (req, res) => {
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
+    assertGeneralAgentActor(req.frontmindUser);
     const owned = await syncTask({
       userId: req.frontmindUser.id,
       localTaskId: req.params.localTaskId,
@@ -1332,6 +1677,7 @@ router.get("/tasks/:localTaskId", async (req, res) => {
 router.get("/tasks", async (req, res) => {
   try {
     if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
+    assertGeneralAgentActor(req.frontmindUser);
     const rows = await (
       await requireDb()
     )
@@ -1365,6 +1711,7 @@ router.post(
   async (req, res) => {
     try {
       if (!req.frontmindUser) throw new ChatV2HttpError("UNAUTHORIZED", 401);
+      assertGeneralAgentActor(req.frontmindUser);
       const value = actionSchema.parse(req.body ?? {});
       const owned = await findOwnedTask({
         userId: req.frontmindUser.id,

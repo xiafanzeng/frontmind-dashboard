@@ -281,6 +281,11 @@ describe("Dashboard-owned knowledge package", () => {
         documentIds: [],
       }),
     );
+    const parsedAsset = parsed.assets.find(
+      (candidate) => candidate.id === "unbound-brand-reference",
+    );
+    expect(parsedAsset).not.toHaveProperty("caption");
+    expect(parsedAsset).not.toHaveProperty("alt");
   });
 
   it("rejects a Logo whose declared durable identity does not match its bytes", async () => {
@@ -433,6 +438,19 @@ describe("Dashboard-owned knowledge package", () => {
       packageAttemptCount: MAX_AUTOMATIC_PACKAGE_ATTEMPTS,
       packageNextRetryAt: null,
       packageLastErrorCode: "LOCAL_PACKAGE_CORE_NODES_INCOMPLETE",
+    });
+
+    expect(
+      nextKnowledgeBasePackageFailure({
+        packageAttemptCount: 0,
+        now: new Date("2026-08-12T00:00:00.000Z"),
+        errorCode: "MATERIALIZED_BUILD_NOT_PUBLISHABLE",
+      }),
+    ).toEqual({
+      packageStatus: "attention_required",
+      packageAttemptCount: 1,
+      packageNextRetryAt: null,
+      packageLastErrorCode: "MATERIALIZED_BUILD_NOT_PUBLISHABLE",
     });
   });
 

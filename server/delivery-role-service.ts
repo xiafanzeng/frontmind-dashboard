@@ -1422,6 +1422,7 @@ export async function createDeliveryEngineer(input: {
         executor: tx,
         userId: user.id,
         apiKey,
+        agentProfile: null,
       });
     }
     await tx.insert(deliveryMemberOrigins).values({
@@ -5878,6 +5879,7 @@ export async function setDeliveryMemberCredential(input: {
       executor: tx,
       userId: input.memberUserId,
       apiKey: input.apiKey,
+      agentProfile: null,
     });
     await writeWorkspaceAuditEvent(
       {
@@ -6041,6 +6043,7 @@ export async function setDeliveryAdminCredential(input: {
       executor: tx,
       userId: input.adminUserId,
       apiKey: input.apiKey,
+      agentProfile: null,
     });
     await writeWorkspaceAuditEvent(
       {

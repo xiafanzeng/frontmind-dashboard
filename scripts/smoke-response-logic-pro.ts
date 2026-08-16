@@ -65,7 +65,6 @@ try {
     agentProfile: toUpstreamAgentProfile("frontmind-pro"),
     locale: "zh-CN",
     interactiveMode: false,
-    hideInTaskList: true,
     structuredOutputSchema: RESPONSE_LOGIC_STRUCTURED_OUTPUT_SCHEMA,
   });
   taskId = created.taskId;

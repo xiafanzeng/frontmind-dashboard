@@ -63,6 +63,9 @@ describe("socratic knowledge-base Skill v5 packaging", () => {
     const contract = await archive
       .file("references/materialized-working-set.md")!
       .async("string");
+    const validator = await archive
+      .file("scripts/validate_working_set.py")!
+      .async("string");
 
     expect(entries).toEqual([...socraticKnowledgeBaseSkillEntries].sort());
     expect(skill).toContain("materialize_initial_bundle");
@@ -71,11 +74,33 @@ describe("socratic knowledge-base Skill v5 packaging", () => {
     expect(skill.replace(/\s+/gu, " ")).toContain(
       "complete ZIP is the sole business result",
     );
+    expect(skill).toContain("--expected-skill-content-hash");
+    expect(skill).toContain("--expected-uploads-read");
+    expect(skill).toContain("frozen logical content hash");
+    expect(skill).toContain("customer-visible Markdown only");
+    expect(skill).not.toContain(
+      "place one polished customer-visible block between",
+    );
     expect(skill).not.toContain("One leaf per turn");
     expect(skill).not.toContain("task.sendMessage");
     expect(skill).not.toContain("Pro Agent");
     expect(contract).toContain('"kind": "frontmind.kb-working-set"');
     expect(contract).toContain('"kind": "frontmind.kb-node-patch"');
+    expect(contract).not.toContain('"researchCoverage": {}');
+    for (const dimensionId of [
+      "enterprise_identity",
+      "team_and_organization",
+      "products_and_services",
+      "capabilities_and_delivery",
+      "industries_scenarios_and_cases",
+      "differentiation_and_evidence",
+      "cooperation_delivery_and_support",
+    ]) {
+      expect(contract).toContain(`"id": "${dimensionId}"`);
+    }
+    expect(validator).toContain('parser.add_argument("--expected-uploads-read"');
+    expect(validator).toContain("validate_research_coverage(");
+    expect(validator).toContain("customer_markdown_title(");
     expect(entries).not.toContain("scripts/validate_archive.py");
     expect(result.contentHash).toBe(
       await canonicalKnowledgeBaseSkillArchiveHash(archiveBytes),

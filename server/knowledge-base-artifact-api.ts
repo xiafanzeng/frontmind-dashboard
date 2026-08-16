@@ -22,7 +22,9 @@ import {
 import {
   assertKnowledgeBaseCustomerUploadVisualBindings,
   declaredKnowledgeBaseCustomerUploadImagesFromTurn,
+  knowledgeBaseCustomerUploadInternalIdentity,
   persistedKnowledgeBaseCustomerUploadBytesForBuild,
+  type KnowledgeBaseCustomerUploadImage,
   verifiedKnowledgeBaseCustomerUploadImagesFromTurn,
   verifiedKnowledgeBasePackageUploadEvidenceForBuild,
 } from "./knowledge-base-customer-upload";
@@ -45,8 +47,15 @@ import {
 import {
   KnowledgeBaseMaterializedAssetError,
   readValidatedActiveKnowledgeBaseWorkingSet,
+  resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle,
   resolveKnowledgeBaseWorkingSetResource,
 } from "./knowledge-base-materialized-assets";
+import {
+  knowledgeBaseOfficialLogoInternalIdentity,
+  knowledgeBasePublicBuildSelectorMatches,
+  knowledgeBasePublicResourceHandleMatches,
+  parseKnowledgeBasePublicResourceHandle,
+} from "./knowledge-base-public-resource";
 
 const router = Router();
 const MAX_CUSTOMER_UPLOAD_SOURCE_BYTES = 100 * 1024 * 1024;
@@ -711,6 +720,95 @@ async function readCustomerUploadBytes(
   return Buffer.concat(chunks, bytesRead);
 }
 
+function usesPersistedCustomerUploadEvidence(build: ArtifactBuild) {
+  return (
+    build.skillVersion === "4" &&
+    (build.status === "ready_to_publish" || build.status === "published") &&
+    /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || ""))
+  );
+}
+
+async function renderCustomerUploadImageForBuild(input: {
+  userId: number;
+  build: ArtifactBuild;
+  image: KnowledgeBaseCustomerUploadImage;
+}) {
+  const sourceBytes = usesPersistedCustomerUploadEvidence(input.build)
+    ? await persistedKnowledgeBaseCustomerUploadBytesForBuild({
+        userId: input.userId,
+        buildId: input.build.id,
+        generation: input.build.generation,
+        packageArchiveSha256: input.build.packageArchiveSha256!,
+        sourceSha256: input.image.sourceSha256,
+      })
+    : await (async () => {
+        const stored = await readStoredPresalesFile(input.image.fileId);
+        if (
+          !stored ||
+          stored.filename !== input.image.filename ||
+          stored.sizeBytes !== input.image.sizeBytes ||
+          stored.sha256?.toLowerCase() !== input.image.sourceSha256
+        ) {
+          throw new CustomerUploadPreviewError(
+            409,
+            "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+            "补充图片完整性校验未通过",
+          );
+        }
+        return readCustomerUploadBytes(stored);
+      })();
+  if (
+    createHash("sha256").update(sourceBytes).digest("hex") !==
+    input.image.sourceSha256
+  ) {
+    throw new CustomerUploadPreviewError(
+      409,
+      "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+      "补充图片完整性校验未通过",
+    );
+  }
+  return renderSafeCustomerUploadPreview({
+    bytes: sourceBytes,
+    declaredMimeType: input.image.mimeType,
+    filename: input.image.filename,
+  });
+}
+
+function opaqueImageFilename(mimeType: string, prefix: string) {
+  const extension =
+    {
+      "image/avif": "avif",
+      "image/gif": "gif",
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/svg+xml": "svg",
+      "image/webp": "webp",
+    }[mimeType.toLowerCase()] || "img";
+  return `${prefix}.${extension}`;
+}
+
+function sendOpaquePublicResource(input: {
+  res: Response;
+  bytes: Buffer;
+  mimeType: string;
+  filename: string;
+}) {
+  input.res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  input.res.setHeader("Pragma", "no-cache");
+  input.res.setHeader("Content-Type", input.mimeType);
+  input.res.setHeader("Content-Length", String(input.bytes.length));
+  input.res.setHeader("X-Content-Type-Options", "nosniff");
+  input.res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  input.res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  // No source digest, asset id, path, turn id, or upload filename is reflected
+  // in headers on the new endpoint. The HMAC URL is already cache-unique.
+  input.res.setHeader(
+    "Content-Disposition",
+    `inline; filename="${input.filename}"`,
+  );
+  input.res.end(input.bytes);
+}
+
 async function serveCustomerUploadPreview(
   req: FrontMindRequest,
   res: Response,
@@ -796,10 +894,7 @@ async function serveCustomerUploadPreview(
   }
 
   try {
-    const usePersistedEvidence =
-      build.skillVersion === "4" &&
-      (build.status === "ready_to_publish" || build.status === "published") &&
-      /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || ""));
+    const usePersistedEvidence = usesPersistedCustomerUploadEvidence(build);
     const image = (
       usePersistedEvidence
         ? declaredKnowledgeBaseCustomerUploadImagesFromTurn(turn)
@@ -817,44 +912,10 @@ async function serveCustomerUploadPreview(
         "补充图片不存在",
       );
     }
-    const sourceBytes = usePersistedEvidence
-      ? await persistedKnowledgeBaseCustomerUploadBytesForBuild({
-          userId,
-          buildId: build.id,
-          generation: build.generation,
-          packageArchiveSha256: build.packageArchiveSha256!,
-          sourceSha256: image.sourceSha256,
-        })
-      : await (async () => {
-          const stored = await readStoredPresalesFile(image.fileId);
-          if (
-            !stored ||
-            stored.filename !== image.filename ||
-            stored.sizeBytes !== image.sizeBytes ||
-            stored.sha256?.toLowerCase() !== image.sourceSha256
-          ) {
-            throw new CustomerUploadPreviewError(
-              409,
-              "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
-              "补充图片完整性校验未通过",
-            );
-          }
-          return readCustomerUploadBytes(stored);
-        })();
-    if (
-      createHash("sha256").update(sourceBytes).digest("hex") !==
-      image.sourceSha256
-    ) {
-      throw new CustomerUploadPreviewError(
-        409,
-        "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
-        "补充图片完整性校验未通过",
-      );
-    }
-    const preview = await renderSafeCustomerUploadPreview({
-      bytes: sourceBytes,
-      declaredMimeType: image.mimeType,
-      filename: image.filename,
+    const preview = await renderCustomerUploadImageForBuild({
+      userId,
+      build,
+      image,
     });
     const previewSha256 = createHash("sha256").update(preview).digest("hex");
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
@@ -876,6 +937,195 @@ async function serveCustomerUploadPreview(
     sendCustomerUploadPreviewError(res, error);
   }
 }
+
+async function serveOpaqueKnowledgeBaseResource(
+  req: FrontMindRequest,
+  res: Response,
+) {
+  const userId = req.frontmindUser?.id;
+  if (!userId) {
+    res.status(401).json({
+      error: { code: "UNAUTHORIZED", message: "请先登录" },
+    });
+    return;
+  }
+  const parsedHandle = parseKnowledgeBasePublicResourceHandle(
+    req.params.handle,
+  );
+  if (!parsedHandle) {
+    res.status(404).json({
+      error: { code: "RESOURCE_NOT_FOUND", message: "知识库资源不存在" },
+    });
+    return;
+  }
+  const db = await getDb();
+  if (!db) {
+    res.status(503).json({
+      error: { code: "DATABASE_UNAVAILABLE", message: "数据库暂不可用" },
+    });
+    return;
+  }
+
+  // The build id is never encoded into the public URL. Resolve the first HMAC
+  // half only inside the authenticated user's build set, then re-authorize the
+  // second half against the current generation and immutable resource proof.
+  const builds = await db
+    .select()
+    .from(knowledgeBaseBuilds)
+    .where(eq(knowledgeBaseBuilds.userId, userId));
+  const build = builds.find(
+    (candidate: typeof knowledgeBaseBuilds.$inferSelect) =>
+      knowledgeBasePublicBuildSelectorMatches({
+        suppliedSelector: parsedHandle.buildSelector,
+        buildId: candidate.id,
+      }),
+  );
+  if (!build || build.userId !== userId) {
+    res.status(404).json({
+      error: { code: "RESOURCE_NOT_FOUND", message: "知识库资源不存在" },
+    });
+    return;
+  }
+
+  try {
+    if (
+      build.logoSha256 &&
+      knowledgeBasePublicResourceHandleMatches({
+        suppliedHandle: parsedHandle.handle,
+        buildId: build.id,
+        kind: "logo",
+        internalIdentity: knowledgeBaseOfficialLogoInternalIdentity({
+          generation: build.generation,
+          sha256: build.logoSha256,
+        }),
+      })
+    ) {
+      const descriptor = resolveKnowledgeBaseArtifactDescriptor(build, "logo");
+      const bytes = await readKnowledgeBuildArtifact({
+        userId,
+        buildId: build.id,
+        generation: build.generation,
+        kind: "logo",
+        expectedSha256: descriptor.sha256,
+        expectedBytes: descriptor.bytes,
+        storageKey: descriptor.storageKey,
+      });
+      sendOpaquePublicResource({
+        res,
+        bytes,
+        mimeType: descriptor.mimeType,
+        filename: opaqueImageFilename(descriptor.mimeType, "enterprise-logo"),
+      });
+      return;
+    }
+
+    let materializedIntegrityError: unknown = null;
+    try {
+      const active = await readValidatedActiveKnowledgeBaseWorkingSet({
+        db,
+        build,
+      });
+      const resource = resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle({
+        suppliedHandle: parsedHandle.handle,
+        buildId: build.id,
+        workingSet: active.validated,
+      });
+      if (resource) {
+        sendOpaquePublicResource({
+          res,
+          bytes: resource.bytes,
+          mimeType: resource.mimeType,
+          filename: opaqueImageFilename(
+            resource.mimeType,
+            "knowledge-base-image",
+          ),
+        });
+        return;
+      }
+    } catch (error) {
+      if (
+        error instanceof KnowledgeBaseMaterializedAssetError &&
+        error.code === "WORKING_SET_RESOURCE_INTEGRITY_MISMATCH"
+      ) {
+        materializedIntegrityError = error;
+      }
+    }
+
+    const turns = await db
+      .select()
+      .from(conversationTurns)
+      .where(
+        and(
+          eq(conversationTurns.userId, userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          eq(conversationTurns.status, "completed"),
+        ),
+      );
+    for (const turn of turns) {
+      let declared: KnowledgeBaseCustomerUploadImage[];
+      try {
+        declared = declaredKnowledgeBaseCustomerUploadImagesFromTurn(turn);
+      } catch {
+        // An unrelated legacy turn with an incomplete ledger cannot authorize
+        // a resource and must not block an otherwise valid current resource.
+        continue;
+      }
+      const claimed = declared.find((candidate) =>
+        knowledgeBasePublicResourceHandleMatches({
+          suppliedHandle: parsedHandle.handle,
+          buildId: build.id,
+          kind: "customer_upload",
+          internalIdentity:
+            knowledgeBaseCustomerUploadInternalIdentity(candidate),
+        }),
+      );
+      if (!claimed) continue;
+      const image = usesPersistedCustomerUploadEvidence(build)
+        ? claimed
+        : (await verifiedKnowledgeBaseCustomerUploadImagesFromTurn(turn)).find(
+            (candidate) =>
+              candidate.turnId === claimed.turnId &&
+              candidate.index === claimed.index &&
+              candidate.sourceSha256 === claimed.sourceSha256,
+          );
+      if (!image) {
+        throw new CustomerUploadPreviewError(
+          409,
+          "CUSTOMER_UPLOAD_INTEGRITY_MISMATCH",
+          "补充图片完整性校验未通过",
+        );
+      }
+      const preview = await renderCustomerUploadImageForBuild({
+        userId,
+        build,
+        image,
+      });
+      sendOpaquePublicResource({
+        res,
+        bytes: preview,
+        mimeType: "image/png",
+        filename: "knowledge-base-image.png",
+      });
+      return;
+    }
+
+    if (materializedIntegrityError) throw materializedIntegrityError;
+    res.status(404).json({
+      error: { code: "RESOURCE_NOT_FOUND", message: "知识库资源不存在" },
+    });
+  } catch (error) {
+    if (error instanceof CustomerUploadPreviewError) {
+      sendCustomerUploadPreviewError(res, error);
+      return;
+    }
+    sendArtifactError(res, error);
+  }
+}
+
+router.get("/resources/:handle", (req: FrontMindRequest, res) => {
+  void serveOpaqueKnowledgeBaseResource(req, res);
+});
 
 router.get(
   "/:buildId/customer-uploads/:turnId/:index/:sourceSha",

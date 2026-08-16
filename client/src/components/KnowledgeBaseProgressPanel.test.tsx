@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import KnowledgeBaseProgressPanel, {
   type KnowledgeBaseProgressDto,
 } from "./KnowledgeBaseProgressPanel";
+import { KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE } from "@shared/knowledge-base-progress";
 
 const progress: KnowledgeBaseProgressDto = {
   build: {
@@ -187,6 +188,29 @@ describe("KnowledgeBaseProgressPanel", () => {
     expect(screen.queryByText(/Manus/i)).toBeNull();
   });
 
+  it("shows the fixed approved-reset message for a rejected materialized result", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "protocol_error",
+            currentLeafId: null,
+            protocolError: KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+          },
+          packageAllowed: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("本轮已停止")).toBeTruthy();
+    expect(
+      screen.getByText(KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE),
+    ).toBeTruthy();
+    expect(screen.queryByText(/排查编号|sha256|trace|task[_-]?id/i)).toBeNull();
+  });
+
   it("distinguishes package ready from content-only completion", () => {
     render(
       <KnowledgeBaseProgressPanel
@@ -230,5 +254,73 @@ describe("KnowledgeBaseProgressPanel", () => {
       ),
     ).toBeTruthy();
     expect(screen.queryByText(/下载包正在后台准备/)).toBeNull();
+  });
+
+  it("shows partial safe nodes as view-only and never implies package eligibility", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          branches: progress.branches.map((branch) => ({
+            ...branch,
+            leaves: branch.leaves.map((leaf) => ({
+              ...leaf,
+              contentMarkdown: `## ${leaf.title}\n\n该安全节点的完整正文。`,
+            })),
+          })),
+          resultQuality: {
+            completeness: "partial",
+            stats: {
+              acceptedCount: 7,
+              expectedCount: 30,
+              droppedCount: 0,
+            },
+            warnings: [{ code: "RESULT_INCOMPLETE" }],
+            downstreamEligible: false,
+            publishable: false,
+          },
+          packageAllowed: false,
+        }}
+      />,
+    );
+
+    const warning = screen.getByTestId("knowledge-result-quality-partial");
+    expect(warning.textContent).toContain("内容不完整，可安全查看");
+    expect(warning.textContent).toContain("当前保留 7 个安全节点");
+    expect(warning.textContent).toContain("确认、修订、打包和发布均已锁定");
+    expect(screen.getAllByTestId("partial-knowledge-leaf")).toHaveLength(5);
+    expect(screen.getAllByText("该安全节点的完整正文。")).toHaveLength(5);
+    expect(
+      screen.getByText("当前安全内容已保留并可查看，但不驱动后续操作或发布。"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/可以直接更新/)).toBeNull();
+  });
+
+  it("explains coverage-only partial results without implying missing node bodies", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          resultQuality: {
+            completeness: "partial",
+            stats: {
+              acceptedCount: 54,
+              expectedCount: 30,
+              droppedCount: 0,
+            },
+            warnings: [{ code: "COVERAGE_INCOMPLETE" }],
+            downstreamEligible: false,
+            publishable: false,
+          },
+        }}
+      />,
+    );
+
+    const warning = screen.getByTestId("knowledge-result-quality-partial");
+    expect(warning.textContent).toContain("研究覆盖信息不完整");
+    expect(warning.textContent).toContain(
+      "节点内容已保留，但研究覆盖信息不完整，暂不能确认、修订、打包或发布；请申请重置后重新生成。",
+    );
+    expect(warning.textContent).not.toContain("当前保留 54 个安全节点");
   });
 });

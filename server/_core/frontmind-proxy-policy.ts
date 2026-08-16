@@ -9,6 +9,7 @@ import {
 import { assertDeliveryProjectContext } from "../delivery-role-service";
 
 const ORDINARY_USER_SUPPORT_OPERATIONS = new Set([
+  "POST /v2/assets",
   "POST /download-token",
   "POST /v1/files",
   "POST /v1/managed-uploads",
@@ -59,6 +60,7 @@ export function ordinaryUserProxyWriteRequiresActiveService(
 ) {
   const operation = `${req.method.toUpperCase()} ${proxyPath(req)}`;
   return (
+    operation === "POST /v2/assets" ||
     operation === "POST /v1/files" ||
     operation === "POST /v1/managed-uploads" ||
     operation === "POST /v1/managed-uploads/recovery" ||

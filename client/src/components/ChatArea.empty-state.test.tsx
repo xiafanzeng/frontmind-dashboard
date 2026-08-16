@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import {
   EmptyConversationHint,
+  buildKnowledgeBaseStarterAttachmentManifest,
   fetchKnowledgeBaseStartRequest,
   KNOWLEDGE_BASE_FOUNDATION_COPY,
   KNOWLEDGE_BASE_START_TIMEOUT_MS,
@@ -148,7 +149,14 @@ describe("EmptyConversationHint", () => {
         filename: "initial-facts.pdf",
         expiresAt: 1_800_000_000_000,
       });
-      upload: { onprogress?: (event: any) => void } = {};
+      private uploadListeners = new Map<string, Array<(event?: any) => void>>();
+      upload = {
+        addEventListener: (event: string, listener: (event?: any) => void) => {
+          const listeners = this.uploadListeners.get(event) ?? [];
+          listeners.push(listener);
+          this.uploadListeners.set(event, listeners);
+        },
+      };
       onerror?: () => void;
       onabort?: () => void;
       onload?: () => void;
@@ -157,11 +165,16 @@ describe("EmptyConversationHint", () => {
       }
       setRequestHeader() {}
       send(body: File) {
-        this.upload.onprogress?.({
-          lengthComputable: true,
-          loaded: body.size,
-          total: body.size,
-        });
+        for (const listener of this.uploadListeners.get("progress") ?? []) {
+          listener({
+            lengthComputable: true,
+            loaded: body.size,
+            total: body.size,
+          });
+        }
+        for (const listener of this.uploadListeners.get("load") ?? []) {
+          listener();
+        }
         queueMicrotask(() => this.onload?.());
       }
       abort() {
@@ -372,12 +385,15 @@ describe("EmptyConversationHint", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "重试并继续" })).toBeEnabled();
     });
-    expect(screen.getAllByText("云端已确认")).toHaveLength(3);
+    expect(screen.getAllByText("Dashboard 已确认，等待其余文件")).toHaveLength(
+      3,
+    );
     expect(screen.getAllByText("第4个文件上传失败")).toHaveLength(2);
     expect(screen.getByText("等待上传")).toBeInTheDocument();
-    expect(screen.getByText("已传输100 B/150 B")).toBeInTheDocument();
-    expect(screen.getByText("Dashboard 已接收60 B/150 B")).toBeInTheDocument();
-    expect(screen.getByText("已确认60 B/150 B")).toBeInTheDocument();
+    expect(screen.getByText("已从浏览器传出100 B/150 B")).toBeInTheDocument();
+    expect(
+      screen.getByText("Dashboard 已完整确认60 B/150 B"),
+    ).toBeInTheDocument();
     expect(startRequests).not.toHaveBeenCalled();
     expect(files.every((file) => screen.getByText(file.name))).toBe(true);
 
@@ -730,9 +746,10 @@ describe("EmptyConversationHint", () => {
       });
     });
     expect(screen.getByText("13%")).toBeInTheDocument();
-    expect(screen.getByText("已传输50 B/400 B")).toBeInTheDocument();
-    expect(screen.getByText("Dashboard 已接收0 B/400 B")).toBeInTheDocument();
-    expect(screen.getByText("已确认0 B/400 B")).toBeInTheDocument();
+    expect(screen.getByText("已从浏览器传出50 B/400 B")).toBeInTheDocument();
+    expect(
+      screen.getByText("Dashboard 已完整确认0 B/400 B"),
+    ).toBeInTheDocument();
     expect(screen.getByText("正在上传 50%")).toBeInTheDocument();
     expect(
       screen.getByText("资料上传中，尚未启动知识库构建"),
@@ -747,9 +764,10 @@ describe("EmptyConversationHint", () => {
       });
     });
     expect(screen.getByText("25%")).toBeInTheDocument();
-    expect(screen.getByText("已传输100 B/400 B")).toBeInTheDocument();
-    expect(screen.getByText("Dashboard 已接收100 B/400 B")).toBeInTheDocument();
-    expect(screen.getByText("已确认0 B/400 B")).toBeInTheDocument();
+    expect(screen.getByText("已从浏览器传出100 B/400 B")).toBeInTheDocument();
+    expect(
+      screen.getByText("Dashboard 已完整确认0 B/400 B"),
+    ).toBeInTheDocument();
     expect(
       screen.getByText("文件已接收，正在等待云端就绪"),
     ).toBeInTheDocument();
@@ -889,7 +907,9 @@ describe("EmptyConversationHint", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "重试启动" })).toBeEnabled();
     });
-    expect(screen.getByText("云端已确认")).toBeInTheDocument();
+    expect(
+      screen.getByText("Dashboard 已确认，等待其余文件"),
+    ).toBeInTheDocument();
     expect(screen.getByText("品牌手册.pdf")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "移除 品牌手册.pdf" }),
@@ -960,12 +980,12 @@ describe("EmptyConversationHint", () => {
       screen.queryByRole("button", { name: "重试并继续" }),
     ).not.toBeInTheDocument();
     expect(screen.getByText("第 1 次尝试")).toBeInTheDocument();
-    expect(
-      screen.getByText("错误码：UPLOAD_PROVIDER_IDENTITY_MISMATCH"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("排查编号：22222222-2222-4222-8222-222222222222"),
-    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(
+      "UPLOAD_PROVIDER_IDENTITY_MISMATCH",
+    );
+    expect(document.body.textContent).not.toContain(
+      "22222222-2222-4222-8222-222222222222",
+    );
   });
 
   it("does not render provider secrets from a managed-upload failure", async () => {
@@ -1044,16 +1064,16 @@ describe("EmptyConversationHint", () => {
         screen.getAllByText("文件上传失败，请稍后重试").length,
       ).toBeGreaterThan(0);
     });
-    expect(screen.getByText("错误码：UPLOAD_REJECTED")).toBeInTheDocument();
-    expect(
-      screen.getByText("排查编号：11111111-1111-4111-8111-111111111111"),
-    ).toBeInTheDocument();
+    expect(rendered.container.textContent).not.toContain("UPLOAD_REJECTED");
+    expect(rendered.container.textContent).not.toContain(
+      "11111111-1111-4111-8111-111111111111",
+    );
     for (const secret of secrets) {
       expect(rendered.container.textContent).not.toContain(secret);
     }
   });
 
-  it("allows an explicit recreate recovery and shows its attempt and trace", async () => {
+  it("allows an explicit recreate recovery without exposing diagnostics", async () => {
     const file = sizedFile("凭证过期.pdf", 48);
     const onStartKnowledgeBase = vi.fn(async (_input, lifecycle) => {
       lifecycle.onFileUpdate(lifecycle.fileItemIds![0], file, {
@@ -1098,15 +1118,16 @@ describe("EmptyConversationHint", () => {
       screen.getByText("重试时会先确认云端状态，再清理旧记录并创建新上传。"),
     ).toBeInTheDocument();
     expect(screen.getByText("第 1 次尝试")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(
+      "UPLOAD_CAPABILITY_EXPIRED",
+    );
+    expect(document.body.textContent).not.toContain(
+      "33333333-3333-4333-8333-333333333333",
+    );
+    expect(screen.getByText("已从浏览器传出48 B/48 B")).toBeInTheDocument();
     expect(
-      screen.getByText("错误码：UPLOAD_CAPABILITY_EXPIRED"),
+      screen.getByText("Dashboard 已完整确认0 B/48 B"),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText("排查编号：33333333-3333-4333-8333-333333333333"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("已传输48 B/48 B")).toBeInTheDocument();
-    expect(screen.getByText("Dashboard 已接收0 B/48 B")).toBeInTheDocument();
-    expect(screen.getByText("已确认0 B/48 B")).toBeInTheDocument();
   });
 
   it("discards an explicitly removed unbound file and keeps the modal open when cancellation cleanup is still in progress", async () => {
@@ -1216,6 +1237,87 @@ describe("EmptyConversationHint", () => {
 });
 
 describe("knowledge-base starter orchestration", () => {
+  it("hashes large starter files sequentially before reserve", async () => {
+    const files = [
+      sizedFile("one.pdf", 12),
+      sizedFile("two.pdf", 13),
+      sizedFile("three.pdf", 14),
+    ];
+    let active = 0;
+    let maximumActive = 0;
+    const hashFile = vi.fn(async (file: File) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      active -= 1;
+      return file.name.charCodeAt(0).toString(16).padStart(64, "0");
+    });
+
+    const manifest = await buildKnowledgeBaseStarterAttachmentManifest(
+      files,
+      ["item-1", "item-2", "item-3"],
+      new AbortController().signal,
+      hashFile,
+    );
+
+    expect(maximumActive).toBe(1);
+    expect(hashFile.mock.calls.map(([file]) => file.name)).toEqual([
+      "one.pdf",
+      "two.pdf",
+      "three.pdf",
+    ]);
+    expect(manifest.map((item) => item.ordinal)).toEqual([1, 2, 3]);
+  });
+
+  it("does not mark dispatch attempted when lifecycle cancellation wins before fetch", async () => {
+    const lifecycleController = new AbortController();
+    lifecycleController.abort();
+    const onRequestStarted = vi.fn();
+    const fetchImplementation = vi.fn() as unknown as typeof fetch;
+
+    await expect(
+      fetchKnowledgeBaseStartRequest(
+        { method: "POST" },
+        {
+          signal: lifecycleController.signal,
+          fetchImplementation,
+          onRequestStarted,
+        },
+      ),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(onRequestStarted).not.toHaveBeenCalled();
+    expect(fetchImplementation).not.toHaveBeenCalled();
+    expect(shouldRecoverKnowledgeBaseStartFailure(false, { status: 0 })).toBe(
+      false,
+    );
+  });
+
+  it("marks an actually invoked statusless dispatch as recovery-eligible", async () => {
+    let dispatchAttempted = false;
+    const fetchImplementation = vi
+      .fn()
+      .mockRejectedValue(
+        new TypeError("Failed to fetch"),
+      ) as unknown as typeof fetch;
+
+    const error = await fetchKnowledgeBaseStartRequest(
+      { method: "POST" },
+      {
+        signal: new AbortController().signal,
+        fetchImplementation,
+        onRequestStarted: () => {
+          dispatchAttempted = true;
+        },
+      },
+    ).catch((caught) => caught);
+
+    expect(fetchImplementation).toHaveBeenCalledOnce();
+    expect(dispatchAttempted).toBe(true);
+    expect(
+      shouldRecoverKnowledgeBaseStartFailure(dispatchAttempted, error),
+    ).toBe(true);
+  });
+
   it("bounds a pending start request and aborts only the linked request signal", async () => {
     vi.useFakeTimers();
     const lifecycleController = new AbortController();
@@ -1265,6 +1367,16 @@ describe("knowledge-base starter orchestration", () => {
         status: 409,
         code: "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
         reservationCreated: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("never lets a reserve receipt turn an explicit dispatch 4xx into recovery", () => {
+    expect(
+      shouldRecoverKnowledgeBaseStartFailure(true, {
+        status: 409,
+        code: "CONFLICT",
+        reservationCreated: true,
       }),
     ).toBe(false);
   });

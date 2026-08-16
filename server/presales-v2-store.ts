@@ -40,6 +40,7 @@ export type PresalesV2ArtifactIndex = PresalesV2Artifact & {
 };
 
 export type PresalesV2RepairRecord = {
+  reason?: "business_invalid_result" | "transport_missing_result";
   operationId: string;
   idempotencyHash: string;
   requestHash: string;
@@ -93,6 +94,18 @@ export type PresalesV2TaskRecord = {
   artifacts: PresalesV2Artifact[];
   errorCode: string | null;
   resultDeadlineAt: string | null;
+  resultDecoderRevision?: 2 | 3;
+  resultSource?:
+    | "structured_object"
+    | "structured_json_string"
+    | "structured_recovered_value"
+    | "assistant_json_fallback"
+    | null;
+  resultHash?: string | null;
+  providerStartedAt?: string | null;
+  providerRunDeadlineAt?: string | null;
+  providerRunDeadlineExceededAt?: string | null;
+  terminalAt?: string | null;
   createSearchUntil: string;
   repair?: PresalesV2RepairRecord | null;
   providerDeleteAt?: string | null;
@@ -463,6 +476,13 @@ export async function acquirePresalesV2Task(input: {
       artifacts: [],
       errorCode: null,
       resultDeadlineAt: null,
+      resultDecoderRevision: 3,
+      resultSource: null,
+      resultHash: null,
+      providerStartedAt: null,
+      providerRunDeadlineAt: null,
+      providerRunDeadlineExceededAt: null,
+      terminalAt: null,
       createSearchUntil: new Date(Date.now() + 5 * 60_000).toISOString(),
       createdAt: now,
       updatedAt: now,
@@ -493,6 +513,20 @@ export async function updatePresalesV2Task(
     const current = await readPresalesV2Task(localTaskId);
     if (!current) return null;
     const next = update(current);
+    const deadlineResultFinalization =
+      current.status === "attention_required" &&
+      current.errorCode === "PROVIDER_RUN_DEADLINE_EXCEEDED" &&
+      (next.status === "succeeded" || next.status === "failed");
+    const terminalStatusRegression =
+      (current.status === "succeeded" && next.status !== "succeeded") ||
+      (current.status === "failed" && next.status !== "failed") ||
+      (current.status === "cancelled" && next.status !== "cancelled") ||
+      (current.status === "attention_required" &&
+        next.status !== "attention_required" &&
+        !deadlineResultFinalization);
+    if (terminalStatusRegression) {
+      throw new Error("PRESALES_V2_TERMINAL_STATUS_REGRESSION");
+    }
     if (
       next.localTaskId !== current.localTaskId ||
       next.operationId !== current.operationId ||
@@ -507,6 +541,7 @@ export async function updatePresalesV2Task(
       (current.repair !== undefined &&
         current.repair !== null &&
         (!next.repair ||
+          next.repair.reason !== current.repair.reason ||
           next.repair.operationId !== current.repair.operationId ||
           next.repair.idempotencyHash !== current.repair.idempotencyHash ||
           next.repair.requestHash !== current.repair.requestHash ||

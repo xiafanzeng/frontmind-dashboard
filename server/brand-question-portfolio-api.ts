@@ -239,7 +239,6 @@ export async function createBrandQuestionUpstreamTask(input: {
       agentProfile: input.agentProfile,
       locale: "zh-CN",
       interactiveMode: false,
-      hideInTaskList: true,
       structuredOutputSchema: BRAND_QUESTION_STRUCTURED_OUTPUT_SCHEMA,
     });
   } catch (error) {
@@ -271,8 +270,8 @@ router.post("/start", async (req, res) => {
     if (!req.frontmindCredential) {
       res.status(428).json({
         error: {
-          code: "API_CREDENTIAL_REQUIRED",
-          message: "当前账号尚未由管理员配置 API Key",
+          code: "CUSTOMER_KEY_REQUIRED",
+          message: "当前客户账号尚未配置 API Key",
         },
       });
       return;

@@ -7,6 +7,7 @@ import { canonicalKnowledgeBaseSkillArchiveHash } from "../shared/knowledge-base
 
 import {
   KnowledgeBaseEnterpriseIdentityError,
+  KnowledgeBaseMaterializedResultError,
   KnowledgeBaseOpenRecoveryLeaseError,
   KnowledgeBaseUpstreamCreateError,
   KNOWLEDGE_BASE_AGENT_PROFILE,
@@ -66,6 +67,8 @@ import {
   normalizeKnowledgeBaseClientAttachmentManifest,
   persistKnowledgeBaseDispatchFailure,
   persistKnowledgeBaseCreateFailure,
+  planKnowledgeBaseClaimUserFirstAttachmentLedger,
+  planKnowledgeBaseUserFirstAttachmentLedger,
   readKnowledgeBaseSkillArchiveAttachment,
   recoverKnowledgeBaseTurnClaimTask,
   resolveKnowledgeBaseEnterpriseIdentity,
@@ -94,6 +97,8 @@ import { knowledgeBaseBuildRequiresOfficialLogo } from "./knowledge-base-final-t
 import { classifyKnowledgeBaseManusV2Lifecycle } from "./knowledge-base-manus-v2-lifecycle";
 import { buildKnowledgeBaseManusV2FormatRepair } from "./knowledge-base-manus-v2-lifecycle";
 import { UpstreamTaskAttachmentContentProofError } from "./upstream-task-attachment";
+import { KnowledgeBaseMaterializedContractError } from "./knowledge-base-materialized-contract";
+import { KnowledgeArchiveDownloadError } from "./knowledge-archive-download-error";
 
 function mockManusV2Post(
   ...responses: Array<{ status: number; data: unknown; headers?: unknown }>
@@ -107,6 +112,169 @@ function mockManusV2Post(
   } as unknown as ReturnType<typeof axios.create>);
   return post;
 }
+
+describe("knowledge-base user-first generated attachment ledger", () => {
+  const userIds = Array.from({ length: 9 }, (_, index) => `asset-${index}`);
+  const reservation = (
+    role: "skill" | "prefill" | "instructions",
+    attachmentIndex: number,
+    fill: string,
+  ) => {
+    const requestHash = fill.repeat(64);
+    return {
+      sourceId: `kb-local-${requestHash.slice(0, 48)}`,
+      value: {
+        schemaVersion: 1,
+        role,
+        attachmentIndex,
+        requestHash,
+        idempotencyKeyHash: "f".repeat(64),
+        filename: `${role}.bin`,
+        mimeType: "application/octet-stream",
+        sizeBytes: 1,
+        contentSha256: "e".repeat(64),
+        status: "reserved",
+        reservedAt: "2026-08-15T00:00:00.000Z",
+      } as const,
+    };
+  };
+
+  it.each([
+    { userAttachmentIds: [] as string[], expected: [0, 1] },
+    { userAttachmentIds: ["asset-only"], expected: [1, 2] },
+  ])(
+    "offsets generated slots after N=$userAttachmentIds.length users",
+    (test) => {
+      const plan = planKnowledgeBaseUserFirstAttachmentLedger({
+        userAttachmentIds: test.userAttachmentIds,
+        stagedAttachmentIds: test.userAttachmentIds,
+        generatedRoles: ["skill", "instructions"],
+      });
+      expect([0, 1].map(plan.generatedAttachmentIndex)).toEqual(test.expected);
+    },
+  );
+
+  it("recovers the accepted nine-file start at generated slots 9 and 10", () => {
+    const plan = planKnowledgeBaseUserFirstAttachmentLedger({
+      userAttachmentIds: userIds,
+      stagedAttachmentIds: userIds,
+      generatedRoles: ["skill", "instructions"],
+    });
+
+    expect(plan.generatedAttachmentIndex(0)).toBe(9);
+    expect(plan.generatedAttachmentIndex(1)).toBe(10);
+    expect(
+      plan.attachmentFileIdsForGenerated(["local-skill", "local-instructions"]),
+    ).toEqual([...userIds, "local-skill", "local-instructions"]);
+  });
+
+  it("keeps the same user prefix when a prefill adds a third system slot", () => {
+    const plan = planKnowledgeBaseUserFirstAttachmentLedger({
+      userAttachmentIds: userIds,
+      stagedAttachmentIds: userIds,
+      generatedRoles: ["skill", "prefill", "instructions"],
+    });
+
+    expect([0, 1, 2].map(plan.generatedAttachmentIndex)).toEqual([9, 10, 11]);
+  });
+
+  it("rejects a truly polluted prefix with the stable local error", () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const claim = {
+      turn: {
+        traceId: "10470000-0000-4000-8000-000000000000",
+        attachmentFileIds: userIds,
+        generatedAttachmentReservations: {},
+        manusV2AttachmentMappings: {},
+        createAttemptState: "not_sent",
+      },
+      recoveryMetadata: {
+        attachments: userIds.map((file_id) => ({ file_id })),
+      },
+    } as any;
+    expect(() =>
+      planKnowledgeBaseClaimUserFirstAttachmentLedger(claim, {
+        userAttachmentIds: userIds,
+        stagedAttachmentIds: [userIds[1]!, userIds[0]!, ...userIds.slice(2)],
+        generatedRoles: ["skill", "instructions"],
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT",
+      }),
+    );
+    expect(info).toHaveBeenCalledWith(
+      "[KnowledgeBaseDispatch] validate_ledger",
+      JSON.stringify({
+        event: "dispatch_phase",
+        phase: "validate_ledger",
+        traceId: "10470000-0000-4000-8000-000000000000",
+        errorCode: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT",
+        userCount: 9,
+        expected: 11,
+        staged: 9,
+        generatedReservation: 0,
+        mapping: 0,
+        createState: "not_sent",
+      }),
+    );
+    info.mockRestore();
+  });
+
+  it("accepts a crash-recovered generated slot only with its durable reservation", () => {
+    const requestHash = "a".repeat(64);
+    const localSkillId = `kb-local-${requestHash.slice(0, 48)}`;
+    const reservation = {
+      schemaVersion: 1,
+      role: "skill",
+      attachmentIndex: 9,
+      requestHash,
+      idempotencyKeyHash: "b".repeat(64),
+      filename: "skill.zip",
+      mimeType: "application/zip",
+      sizeBytes: 1,
+      contentSha256: "c".repeat(64),
+      status: "reserved",
+      reservedAt: "2026-08-15T00:00:00.000Z",
+    } as const;
+    const plan = planKnowledgeBaseUserFirstAttachmentLedger({
+      userAttachmentIds: userIds,
+      stagedAttachmentIds: [...userIds, localSkillId],
+      generatedRoles: ["skill", "instructions"],
+      generatedReservations: { "skill:9": reservation },
+    });
+
+    expect(plan.stagedGeneratedIds).toEqual([localSkillId]);
+    expect(plan.generatedAttachmentIndex(1)).toBe(10);
+  });
+
+  it("replays a fully staged skill/prefill/instructions ledger without changing order", () => {
+    const skill = reservation("skill", 9, "a");
+    const prefill = reservation("prefill", 10, "b");
+    const instructions = reservation("instructions", 11, "c");
+    const stagedGenerated = [
+      skill.sourceId,
+      prefill.sourceId,
+      instructions.sourceId,
+    ];
+    const plan = planKnowledgeBaseUserFirstAttachmentLedger({
+      userAttachmentIds: userIds,
+      stagedAttachmentIds: [...userIds, ...stagedGenerated],
+      generatedRoles: ["skill", "prefill", "instructions"],
+      generatedReservations: {
+        "skill:9": skill.value,
+        "prefill:10": prefill.value,
+        "instructions:11": instructions.value,
+      },
+    });
+
+    expect(plan.stagedGeneratedIds).toEqual(stagedGenerated);
+    expect(plan.attachmentFileIdsForGenerated(stagedGenerated)).toEqual([
+      ...userIds,
+      ...stagedGenerated,
+    ]);
+  });
+});
 
 describe("materialized knowledge-base attachment revision authority", () => {
   it("uses the current exact credential for a revision with no parent task or file credential", () => {
@@ -401,6 +569,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
       failureClass: "recoverable_same_turn",
       recoveryAction: "reconcile",
       canRegenerate: false,
+      sourceResetRevision: 4,
       stagedUserAttachmentCount: 0,
       expectedUserAttachmentCount: 0,
     } as any;
@@ -421,6 +590,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
       upstreamTaskId: null,
       stateEpoch: 11,
       canRegenerate: false,
+      sourceResetRevision: 4,
     });
     expect(
       knowledgeBaseAcceptedReservationReceipt({ turn, stateEpoch: 11 }),
@@ -431,6 +601,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
       upstreamTaskId: null,
       stateEpoch: 11,
       canRegenerate: false,
+      sourceResetRevision: 4,
     });
     expect(
       knowledgeBaseAcceptedReservationReceipt({
@@ -622,6 +793,128 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(persistCreateFailure).not.toHaveBeenCalled();
   });
 
+  it("settles a deterministic materialized ZIP contract failure before the generic output-pending branch", async () => {
+    const failMaterializedResult = vi.fn().mockResolvedValue({
+      turn: {},
+      deduplicated: false,
+    });
+    const deferMaterializedResultRead = vi.fn();
+    const markManusV2OutcomeUnknown = vi.fn();
+    const persistCreateFailure = vi.fn();
+    const claim = {
+      turn: {
+        id: "turn-materialized-contract-invalid",
+        userId: 7,
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+      },
+      leaseToken: "lease-materialized-contract-invalid",
+    } as any;
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error: new KnowledgeBaseMaterializedContractError(
+            "skill.contentHash 与任务坐标不一致",
+          ),
+          outcomeUnknownCode: "RECOVERY_DEFERRED",
+        },
+        {
+          failMaterializedResult,
+          deferMaterializedResultRead,
+          markManusV2OutcomeUnknown,
+          persistCreateFailure,
+        },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(failMaterializedResult).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      code: "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+    });
+    expect(deferMaterializedResultRead).not.toHaveBeenCalled();
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
+    expect(persistCreateFailure).not.toHaveBeenCalled();
+  });
+
+  it("bounds transient archive reads and terminalizes deterministic download failures without replacing the task", async () => {
+    const claim = {
+      turn: {
+        id: "turn-materialized-download",
+        userId: 7,
+        providerProtocol: "manus_v2",
+        providerAttemptState: "output_pending",
+      },
+      leaseToken: "lease-materialized-download",
+    } as any;
+    const failMaterializedResult = vi.fn().mockResolvedValue({
+      turn: {},
+      deduplicated: false,
+    });
+    const deferMaterializedResultRead = vi.fn().mockResolvedValue({
+      state: "deferred",
+      firstObservedAt: "2026-08-15T00:00:00.000Z",
+      attempt: 1,
+      nextRetryAt: "2026-08-15T00:00:15.000Z",
+      retryAfterMs: 15_000,
+      deduplicated: false,
+    });
+    const markManusV2OutcomeUnknown = vi.fn();
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error: new KnowledgeArchiveDownloadError(
+            "http_status",
+            "知识库 ZIP 暂不可读",
+            503,
+          ),
+          outcomeUnknownCode: "RECOVERY_DEFERRED",
+        },
+        {
+          failMaterializedResult,
+          deferMaterializedResultRead,
+          markManusV2OutcomeUnknown,
+        },
+      ),
+    ).resolves.toBe("retriable");
+    expect(deferMaterializedResultRead).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      lastErrorKind: "archive_http_status_503",
+    });
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error: new KnowledgeArchiveDownloadError(
+            "missing_url",
+            "知识库 ZIP 缺少下载地址",
+          ),
+          outcomeUnknownCode: "RECOVERY_DEFERRED",
+        },
+        {
+          failMaterializedResult,
+          deferMaterializedResultRead,
+          markManusV2OutcomeUnknown,
+        },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(failMaterializedResult).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+    });
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
+  });
+
   it("stops an ambiguous compatible create exactly once instead of marking it reconciling", async () => {
     const stopCompatibleCreateOutcomeUnknown = vi.fn().mockResolvedValue(true);
     const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
@@ -733,6 +1026,77 @@ describe("knowledge-base turn HTTP outcomes", () => {
       recoveryAction: "contact_support",
       canRegenerate: false,
     });
+  });
+
+  it("settles a polluted generated ledger as build-local attention without a provider or generic failure", async () => {
+    const markAttention = vi.fn().mockResolvedValue(undefined);
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
+    const taskPost = vi.spyOn(axios, "post");
+    const error = new KnowledgeBaseLocalPreparationError(
+      "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT",
+      "safe ledger conflict",
+    );
+
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        {
+          userId: 7,
+          turnId: "turn-ledger-conflict",
+          leaseToken: "lease-ledger-conflict",
+          outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+          error,
+        },
+        {
+          markAttention,
+          failDeterministically,
+          markOutcomeUnknown,
+          deferBeforeCreate,
+        },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(markAttention).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: "turn-ledger-conflict",
+      leaseToken: "lease-ledger-conflict",
+      code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT",
+    });
+    expect(failDeterministically).not.toHaveBeenCalled();
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
+    expect(deferBeforeCreate).not.toHaveBeenCalled();
+    expect(taskPost).not.toHaveBeenCalled();
+    taskPost.mockRestore();
+  });
+
+  it("settles a reset-only dispatch fence as attention instead of generic recovery", async () => {
+    const markAttention = vi.fn().mockResolvedValue(undefined);
+    const failDeterministically = vi.fn();
+    const markOutcomeUnknown = vi.fn();
+
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        {
+          userId: 7,
+          turnId: "turn-reset-required",
+          leaseToken: "lease-reset-required",
+          outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+          error: new KnowledgeBaseTurnReservationError(
+            "RESET_REQUIRED",
+            "approved reset required",
+          ),
+        },
+        { markAttention, failDeterministically, markOutcomeUnknown },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(markAttention).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: "turn-reset-required",
+      leaseToken: "lease-reset-required",
+      code: "RESET_REQUIRED",
+    });
+    expect(failDeterministically).not.toHaveBeenCalled();
+    expect(markOutcomeUnknown).not.toHaveBeenCalled();
   });
 
   it("keeps generated-file content proof failures before task create and never asks users to repair PDFs", async () => {
@@ -1651,10 +2015,17 @@ describe("terminal anchor acknowledgement recovery", () => {
   const build = {
     id: "build-terminal-anchor",
     userId: 1,
+    executionMode: "materialized_bundle_v1",
+    skillVersion: "5",
+    contentVersion: 1,
     generation: 7,
     revision: 11,
     currentLeafId: "3.2",
     providerProtocol: "manus_v2",
+    handoffProvenance: {
+      materializedRecoveryContractVersion: 1,
+      materializedCompletionContractVersion: 2,
+    },
     activeTurnId: "turn-terminal-anchor",
     canonicalTaskId: "canonical-anchor-task",
     canonicalTaskUrl: null,
@@ -1683,6 +2054,8 @@ describe("terminal anchor acknowledgement recovery", () => {
         buildId: build.id,
         buildGeneration: 7,
         expectedRevision: 11,
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
         operationToken: "operation-anchor",
         providerAttemptState:
           Object.keys(manusV2Lifecycle).length > 0
@@ -1918,7 +2291,7 @@ describe("terminal anchor acknowledgement recovery", () => {
     expect(injected.completeHandoff).not.toHaveBeenCalled();
   });
 
-  it("does not create or continue an anchor for a legacy execution mode", async () => {
+  it("does not create or continue an anchor without build and turn birth authority", async () => {
     const client = {
       createTask: vi.fn(),
       sendMessage: vi.fn(),
@@ -1928,13 +2301,15 @@ describe("terminal anchor acknowledgement recovery", () => {
     const injected = dependencies(client);
     injected.loadBuild.mockResolvedValue({
       ...build,
-      executionMode: "legacy_conversational",
+      handoffProvenance: null,
     });
+    const historicalClaim = claim();
+    historicalClaim.turn.materializedRecoveryContractVersion = null;
 
     await expect(
       knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
         {
-          claim: claim(),
+          claim: historicalClaim,
           credential: { apiKey: "test-key" } as any,
           dependencies: injected as any,
         },
@@ -1943,6 +2318,7 @@ describe("terminal anchor acknowledgement recovery", () => {
     expect(client.createTask).not.toHaveBeenCalled();
     expect(client.sendMessage).not.toHaveBeenCalled();
     expect(client.listAllMessages).not.toHaveBeenCalled();
+    expect(injected.ensureSkillArchivePin).not.toHaveBeenCalled();
   });
 });
 
@@ -2064,6 +2440,21 @@ describe("knowledge-base upstream read failure authority", () => {
         new KnowledgeBaseBuildError("BUILD_NOT_FOUND", "missing"),
       ),
     ).toBe(404);
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        new KnowledgeBaseTurnReservationError("BUILD_NOT_FOUND", "missing"),
+      ),
+    ).toBe(404);
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        new KnowledgeBaseTurnReservationError("CONVERSATION_RESET", "reset"),
+      ),
+    ).toBe(410);
+    expect(
+      knowledgeBaseReconcileFailureStatus(
+        new KnowledgeBaseTurnReservationError("RESET_REQUIRED", "reset"),
+      ),
+    ).toBe(410);
     expect(
       knowledgeBaseReconcileFailureStatus(
         Object.assign(new Error("deadlock"), { code: "ER_LOCK_DEADLOCK" }),
@@ -2559,6 +2950,10 @@ describe("knowledge base execution contract", () => {
       skillVersion: "5",
       providerProtocol: "manus_v2",
       contentVersion: 1,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
       upstreamTaskId: "task-parent",
       revision: 3,
     };
@@ -2917,11 +3312,10 @@ describe("knowledge base execution contract", () => {
       "30–115-leaf tree",
       "40–55 leaves",
       "3,000,000",
-      "limited_evidence",
-      "evidenceDocumentIds",
+      "customer-visible Markdown only",
+      "Do not emit formal-content markers",
       "1,500 ZIP files",
       "30 MiB",
-      "FRONTMIND_FORMAL_CONTENT_START",
       "assetType",
       "displayRole",
       "256×256",
@@ -2929,8 +3323,10 @@ describe("knowledge base execution contract", () => {
       "frontmind-kb-bundle-<operationId>.zip",
       "frontmind-kb-patch-<operationId>.zip",
       "references/output-format.md",
-      "scripts/validate_working_set.py <zip>",
+      "--expected-skill-content-hash",
       "VALID frontmind.kb-working-set.v1",
+      "已完成，知识库 ZIP 已附上。",
+      "end the current task immediately",
     ]) {
       expect(normalizedSkill).toContain(invariant);
     }
@@ -3518,7 +3914,7 @@ describe("knowledge base execution contract", () => {
     expect(() =>
       knowledgeBasePinnedV4SkillSelection({
         skillVersion: "4",
-        skillContentHash: "a".repeat(64),
+        skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
       }),
     ).toThrow("RESET_REQUIRED");
     const active = await getKnowledgeBaseSkillDescriptor();
@@ -3599,6 +3995,7 @@ describe("knowledge base execution contract", () => {
           filename: "socratic-kb-builder-v5.skill.zip",
           status: "uploaded",
           bytes: archive.bytes.length,
+          content_type: "application/zip",
           expires_at: Math.floor(Date.now() / 1_000) + 48 * 60 * 60,
         },
       },
@@ -3675,7 +4072,6 @@ describe("knowledge base execution contract", () => {
         agentProfile: requestBody.agentProfile,
         locale: "zh-CN",
         interactiveMode: false,
-        hideInTaskList: true,
       }),
     );
     expect(post.mock.calls[0]?.[2]).toMatchObject({
@@ -3858,7 +4254,6 @@ describe("knowledge base execution contract", () => {
         agentProfile: prefillDispatch.requestBody.agentProfile,
         locale: "zh-CN",
         interactiveMode: false,
-        hideInTaskList: true,
       }),
     );
     expect(get).toHaveBeenCalled();
@@ -4158,9 +4553,13 @@ describe("knowledge base execution contract", () => {
       revision: 4,
       executionMode: "materialized_bundle_v1",
       skillVersion: "5",
-      skillContentHash: "a".repeat(64),
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
       providerProtocol: "manus_v2",
       contentVersion: 1,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
     } as any;
     const claim = {
       turn: {
@@ -4178,6 +4577,8 @@ describe("knowledge base execution contract", () => {
         upstreamTaskId: null,
         providerProtocol: "manus_v2",
         providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
         providerAttemptState: "not_sent",
         createAttemptState: "not_sent",
       },
@@ -4226,6 +4627,11 @@ describe("knowledge base execution contract", () => {
           ensureManusV2Attachments: vi.fn().mockResolvedValue([]),
           beginDispatch,
           bindSubmission,
+          deferProviderStatus: vi.fn().mockResolvedValue({
+            state: "deferred",
+            retryAfterMs: 15_000,
+            ledger: { schemaVersion: 1 },
+          }),
           createClient: vi.fn().mockReturnValue({
             createTask,
             sendMessage,
@@ -4248,7 +4654,6 @@ describe("knowledge base execution contract", () => {
       title,
       agentProfile: "manus-1.6",
       locale: "zh-CN",
-      hideInTaskList: true,
     });
     const frozenBodyHash = createHash("sha256")
       .update(
@@ -4269,6 +4674,1719 @@ describe("knowledge base execution contract", () => {
         taskId: "materialized-task-zh-cn",
       }),
     );
+  });
+
+  it("stages a contract-v2 running ZIP and spends exactly one task.stop without activating before stopped", async () => {
+    const operationKey = "7".repeat(64);
+    const taskId = "materialized-task-contract-v2-running";
+    const turnId = "00000000-0000-4000-8000-0000000000f7";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c7",
+      userId: 7,
+      conversationId: "conversation-materialized-contract-v2-running",
+      companyName: "Completion Company",
+      companyWebsite: "https://completion.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: turnId,
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedCompletion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-contract-v2-running",
+      recoveryMetadata: { kind: "start", conversationId: build.conversationId },
+      preparedDispatch: null,
+    } as any;
+    const expectedFilename = `frontmind-kb-bundle-${operationKey}.zip`;
+    const events = [
+      {
+        id: "assistant-contract-v2-zip",
+        type: "assistant_message",
+        timestamp: 10,
+        assistant_message: {
+          // The sentence helps Manus converge naturally, but Dashboard only
+          // consumes and validates the ZIP.
+          content: "",
+          attachments: [
+            {
+              type: "file",
+              filename: "manus-materialized-result.zip",
+              content_type: "application/zip",
+              url: "https://downloads.example.test/contract-v2.zip",
+            },
+          ],
+        },
+      },
+      {
+        id: "status-contract-v2-running",
+        type: "status_update",
+        timestamp: 11,
+        status_update: { agent_status: "running" },
+      },
+    ];
+    const prepared = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "bundle",
+        agentProfile: "manus-1.6",
+        attachments: [],
+      },
+      bodySha256: "b".repeat(64),
+      preparedAt: "2026-08-15T00:00:00.000Z",
+    };
+    const archive = Buffer.from("fully-validated-running-bundle");
+    const retained = {
+      storageKey: "knowledge-base/build-sources/7/candidate.bin",
+      contentSha256: createHash("sha256").update(archive).digest("hex"),
+      sizeBytes: archive.length,
+    };
+    const stopTask = vi.fn().mockResolvedValue({
+      taskId,
+      requestId: "stop-request-contract-v2",
+    });
+    const createTask = vi.fn();
+    const findCreatedTask = vi.fn();
+    const sendMessage = vi.fn();
+    const deleteTask = vi.fn();
+    const settleStop = vi.fn().mockResolvedValue(undefined);
+    const activateInitial = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue(prepared),
+          ensureManusV2Attachments: vi.fn(),
+          beginDispatch: vi.fn(),
+          bindSubmission: vi.fn(),
+          downloadArchive: vi.fn().mockResolvedValue({
+            buffer: archive,
+            contentType: "application/zip",
+          }),
+          validateInitialCandidate: vi
+            .fn()
+            .mockResolvedValue({ archiveBytes: archive }),
+          persistCandidate: vi.fn().mockResolvedValue(retained),
+          observeCandidate: vi.fn().mockResolvedValue({
+            disposition: "stop_due",
+            ledger: {
+              schemaVersion: 1,
+              candidateEventIdHash: "c".repeat(64),
+              storageKey: retained.storageKey,
+              candidateArchiveSha256: retained.contentSha256,
+              sizeBytes: retained.sizeBytes,
+              firstObservedAt: "2026-08-15T00:00:00.000Z",
+              lastObservedAt: "2026-08-15T00:02:30.000Z",
+              stableAt: "2026-08-15T00:00:30.000Z",
+              naturalStopDeadlineAt: "2026-08-15T00:02:30.000Z",
+            },
+            deduplicated: true,
+          }),
+          beginStop: vi.fn().mockResolvedValue({
+            send: true,
+            ledger: { schemaVersion: 1, stopAttemptState: "sending" },
+          }),
+          settleStop,
+          activateInitial,
+          createClient: vi.fn().mockReturnValue({
+            createTask,
+            findCreatedTask,
+            listAllMessages: vi.fn().mockResolvedValue(events),
+            stopTask,
+            sendMessage,
+            deleteTask,
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+
+    expect(stopTask).toHaveBeenCalledOnce();
+    expect(stopTask).toHaveBeenCalledWith(taskId);
+    expect(settleStop).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: "acknowledged",
+        requestRef: "stop-request-contract-v2",
+      }),
+    );
+    expect(activateInitial).not.toHaveBeenCalled();
+    expect(createTask).not.toHaveBeenCalled();
+    expect(findCreatedTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(deleteTask).not.toHaveBeenCalled();
+
+    const ambiguousStop = vi
+      .fn()
+      .mockRejectedValue(
+        new ManusV2ApiError("task.stop", null, "timeout", true, true),
+      );
+    const settleUnknown = vi.fn().mockResolvedValue(undefined);
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue(prepared),
+          downloadArchive: vi.fn().mockResolvedValue({
+            buffer: archive,
+            contentType: "application/zip",
+          }),
+          validateInitialCandidate: vi
+            .fn()
+            .mockResolvedValue({ archiveBytes: archive }),
+          persistCandidate: vi.fn().mockResolvedValue(retained),
+          observeCandidate: vi.fn().mockResolvedValue({
+            disposition: "stop_due",
+            ledger: {
+              schemaVersion: 1,
+              candidateEventIdHash: "c".repeat(64),
+              storageKey: retained.storageKey,
+              candidateArchiveSha256: retained.contentSha256,
+              sizeBytes: retained.sizeBytes,
+              stableAt: "2026-08-15T00:00:30.000Z",
+              naturalStopDeadlineAt: "2026-08-15T00:02:30.000Z",
+            },
+            deduplicated: true,
+          }),
+          beginStop: vi.fn().mockResolvedValue({
+            send: true,
+            ledger: { schemaVersion: 1, stopAttemptState: "sending" },
+          }),
+          settleStop: settleUnknown,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue(events),
+            stopTask: ambiguousStop,
+            sendMessage: vi.fn(),
+            deleteTask: vi.fn(),
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    expect(ambiguousStop).toHaveBeenCalledOnce();
+    expect(settleUnknown).toHaveBeenCalledWith(
+      expect.objectContaining({ state: "outcome_unknown" }),
+    );
+  });
+
+  it("converts a persisted sending stop to the ten-minute unknown window before observing it", async () => {
+    const operationKey = "2".repeat(64);
+    const taskId = "materialized-task-persisted-stop-sending";
+    const eventId = "assistant-persisted-stop-sending";
+    const attachmentItemId = `v2-attachment-${createHash("sha256")
+      .update(`${eventId}\0${0}`, "utf8")
+      .digest("hex")}`;
+    const candidateEventIdHash = createHash("sha256")
+      .update(JSON.stringify([attachmentItemId]), "utf8")
+      .digest("hex");
+    const archive = Buffer.from("persisted-stop-sending-archive");
+    const contentSha256 = createHash("sha256").update(archive).digest("hex");
+    const storageKey = "knowledge-base/build-sources/7/sending-candidate.bin";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c2",
+      userId: 7,
+      conversationId: "conversation-materialized-persisted-stop-sending",
+      companyName: "Sending Company",
+      companyWebsite: "https://sending.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000f2",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        materializedCompletion: {
+          schemaVersion: 1,
+          candidateEventIdHash,
+          storageKey,
+          candidateArchiveSha256: contentSha256,
+          sizeBytes: archive.length,
+          firstObservedAt: "2026-08-15T00:00:00.000Z",
+          lastObservedAt: "2026-08-15T00:02:30.000Z",
+          stableAt: "2026-08-15T00:00:30.000Z",
+          naturalStopDeadlineAt: "2026-08-15T00:02:30.000Z",
+          stopAttemptState: "sending",
+          stopAttemptedAt: "2026-08-15T00:02:30.000Z",
+          stopSettleDeadlineAt: "2026-08-15T00:04:30.000Z",
+        },
+      },
+      leaseToken: "lease-materialized-persisted-stop-sending",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+    const settleStop = vi.fn().mockResolvedValue(undefined);
+    const observeCandidate = vi.fn().mockResolvedValue({
+      disposition: "stop_pending",
+      ledger: {
+        ...claim.turn.materializedCompletion,
+        stopAttemptState: "outcome_unknown",
+        stopSettleDeadlineAt: "2026-08-15T00:12:30.000Z",
+      },
+      deduplicated: true,
+    });
+    const beginStop = vi.fn();
+    const stopTask = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "bundle",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-15T00:00:00.000Z",
+          }),
+          downloadArchive: vi.fn().mockResolvedValue({
+            buffer: archive,
+            contentType: "application/zip",
+          }),
+          validateInitialCandidate: vi
+            .fn()
+            .mockResolvedValue({ archiveBytes: archive }),
+          readCandidate: vi.fn().mockResolvedValue(archive),
+          persistCandidate: vi.fn(),
+          observeCandidate,
+          beginStop,
+          settleStop,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue([
+              {
+                id: eventId,
+                type: "assistant_message",
+                timestamp: 10,
+                assistant_message: {
+                  content: "",
+                  attachments: [
+                    {
+                      type: "file",
+                      filename: `frontmind-kb-bundle-${operationKey}.zip`,
+                      content_type: "application/zip",
+                      url: "https://downloads.example.test/sending.zip",
+                    },
+                  ],
+                },
+              },
+              {
+                id: "status-persisted-stop-sending-running",
+                type: "status_update",
+                timestamp: 11,
+                status_update: { agent_status: "running" },
+              },
+            ]),
+            stopTask,
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+
+    expect(settleStop).toHaveBeenCalledOnce();
+    expect(settleStop).toHaveBeenCalledWith(
+      expect.objectContaining({ state: "outcome_unknown" }),
+    );
+    expect(observeCandidate).toHaveBeenCalledOnce();
+    expect(settleStop.mock.invocationCallOrder[0]).toBeLessThan(
+      observeCandidate.mock.invocationCallOrder[0]!,
+    );
+    expect(beginStop).not.toHaveBeenCalled();
+    expect(stopTask).not.toHaveBeenCalled();
+  });
+
+  it("converges descriptor changes by canonical bytes and rejects content changes after task.stop", async () => {
+    const operationKey = "3".repeat(64);
+    const taskId = "materialized-task-stop-proof-mutation";
+    const eventId = "assistant-stop-proof-mutation";
+    const attachmentItemId = `v2-attachment-${createHash("sha256")
+      .update(`${eventId}\0${0}`, "utf8")
+      .digest("hex")}`;
+    const candidateEventIdHash = createHash("sha256")
+      .update(JSON.stringify([attachmentItemId]), "utf8")
+      .digest("hex");
+    const archive = Buffer.from("immutable-stop-proof-archive");
+    const contentSha256 = createHash("sha256").update(archive).digest("hex");
+    const storageKey = "knowledge-base/build-sources/7/immutable.bin";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c3",
+      userId: 7,
+      conversationId: "conversation-materialized-stop-proof-mutation",
+      companyName: "Immutable Company",
+      companyWebsite: "https://immutable.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000f3",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        materializedCompletion: {
+          schemaVersion: 1,
+          candidateEventIdHash,
+          storageKey,
+          candidateArchiveSha256: contentSha256,
+          sizeBytes: archive.length,
+          stableAt: "2026-08-15T00:00:30.000Z",
+          naturalStopDeadlineAt: "2026-08-15T00:02:30.000Z",
+          stopAttemptState: "acknowledged",
+          stopAttemptedAt: "2026-08-15T00:02:30.000Z",
+          stopSettleDeadlineAt: "2026-08-15T00:04:30.000Z",
+        },
+      },
+      leaseToken: "lease-materialized-stop-proof-mutation",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+    const eventsFor = (candidateEventId: string) => [
+      {
+        id: candidateEventId,
+        type: "assistant_message",
+        timestamp: 10,
+        assistant_message: {
+          content: "",
+          attachments: [
+            {
+              type: "file",
+              filename: `frontmind-kb-bundle-${operationKey}.zip`,
+              content_type: "application/zip",
+              url: "https://downloads.example.test/immutable.zip",
+            },
+          ],
+        },
+      },
+      {
+        id: "status-stop-proof-running",
+        type: "status_update",
+        timestamp: 11,
+        status_update: { agent_status: "running" },
+      },
+    ];
+    const prepared = {
+      schemaVersion: 2,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "bundle",
+        agentProfile: "manus-1.6",
+        attachments: [],
+      },
+      bodySha256: "b".repeat(64),
+      preparedAt: "2026-08-15T00:00:00.000Z",
+    };
+    const exercise = async (input: {
+      candidateEventId?: string;
+      downloaded?: Buffer;
+      staged?: Buffer;
+      expectFailure?: boolean;
+    }) => {
+      const persistCandidate = vi.fn();
+      const observeCandidate = vi.fn().mockResolvedValue({
+        disposition: "stop_pending",
+        ledger: claim.turn.materializedCompletion,
+        deduplicated: true,
+      });
+      const beginStop = vi.fn();
+      const stopTask = vi.fn();
+      const result =
+        knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+          claim,
+          { id: "credential-base", apiKey: "base-secret" } as any,
+          {
+            loadBuild: vi.fn().mockResolvedValue(build),
+            ensureDispatch: vi.fn().mockResolvedValue(prepared),
+            downloadArchive: vi.fn().mockResolvedValue({
+              buffer: input.downloaded ?? archive,
+              contentType: "application/zip",
+            }),
+            readCandidate: vi.fn().mockResolvedValue(input.staged ?? archive),
+            validateInitialCandidate: vi
+              .fn()
+              .mockImplementation(async (bytes: Buffer) => ({
+                archiveBytes: bytes,
+              })),
+            persistCandidate,
+            observeCandidate,
+            beginStop,
+            createClient: vi.fn().mockReturnValue({
+              createTask: vi.fn(),
+              findCreatedTask: vi.fn(),
+              listAllMessages: vi
+                .fn()
+                .mockResolvedValue(
+                  eventsFor(input.candidateEventId ?? eventId),
+                ),
+              stopTask,
+            }),
+          } as any,
+        );
+      if (input.expectFailure) {
+        await expect(result).rejects.toMatchObject({
+          code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        });
+      } else {
+        await expect(result).resolves.toEqual({
+          taskId,
+          rebound: true,
+          reconciled: false,
+        });
+      }
+      expect(persistCandidate).not.toHaveBeenCalled();
+      if (input.expectFailure) {
+        expect(observeCandidate).not.toHaveBeenCalled();
+      } else {
+        expect(observeCandidate).toHaveBeenCalledOnce();
+      }
+      expect(beginStop).not.toHaveBeenCalled();
+      expect(stopTask).not.toHaveBeenCalled();
+    };
+
+    await exercise({ candidateEventId: "assistant-replaced-after-stop" });
+    await exercise({
+      downloaded: Buffer.from("changed-after-stop"),
+      expectFailure: true,
+    });
+    await exercise({
+      staged: Buffer.from("corrupt-local-staging"),
+      expectFailure: true,
+    });
+  });
+
+  it("keeps a running task read-only when its candidate URL or download is unavailable", async () => {
+    const operationKey = "4".repeat(64);
+    const taskId = "materialized-task-running-download-unavailable";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c4",
+      userId: 7,
+      conversationId: "conversation-materialized-download-unavailable",
+      companyName: "Download Company",
+      companyWebsite: "https://download.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000f4",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedCompletion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-download-unavailable",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+    const events = [
+      {
+        id: "assistant-running-download-unavailable",
+        type: "assistant_message",
+        timestamp: 10,
+        assistant_message: {
+          content: "",
+          attachments: [
+            {
+              type: "file",
+              filename: `frontmind-kb-bundle-${operationKey}.zip`,
+              content_type: "application/zip",
+              url: "https://downloads.example.test/unavailable.zip",
+            },
+          ],
+        },
+      },
+      {
+        id: "status-running-download-unavailable",
+        type: "status_update",
+        timestamp: 11,
+        status_update: { agent_status: "running" },
+      },
+    ];
+
+    for (const error of [
+      new KnowledgeArchiveDownloadError(
+        "http_status",
+        "candidate download forbidden",
+        403,
+      ),
+      new KnowledgeArchiveDownloadError(
+        "http_status",
+        "candidate download temporarily unavailable",
+        503,
+      ),
+    ]) {
+      const deferProviderStatus = vi.fn().mockResolvedValue({
+        state: "deferred",
+        retryAfterMs: 15_000,
+        ledger: { schemaVersion: 1 },
+      });
+      const persistCandidate = vi.fn();
+      const observeCandidate = vi.fn();
+      const beginStop = vi.fn();
+      const stopTask = vi.fn();
+      const createTask = vi.fn();
+      const sendMessage = vi.fn();
+      const deleteTask = vi.fn();
+
+      await expect(
+        knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+          claim,
+          { id: "credential-base", apiKey: "base-secret" } as any,
+          {
+            loadBuild: vi.fn().mockResolvedValue(build),
+            ensureDispatch: vi.fn().mockResolvedValue({
+              schemaVersion: 2,
+              baseUrl: "https://api.example.test",
+              requestBody: {
+                prompt: "bundle",
+                agentProfile: "manus-1.6",
+                attachments: [],
+              },
+              bodySha256: "b".repeat(64),
+              preparedAt: "2026-08-15T00:00:00.000Z",
+            }),
+            downloadArchive: vi.fn().mockRejectedValue(error),
+            persistCandidate,
+            observeCandidate,
+            beginStop,
+            deferProviderStatus,
+            createClient: vi.fn().mockReturnValue({
+              createTask,
+              findCreatedTask: vi.fn(),
+              listAllMessages: vi.fn().mockResolvedValue(events),
+              stopTask,
+              sendMessage,
+              deleteTask,
+            }),
+          } as any,
+        ),
+      ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+
+      expect(deferProviderStatus).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "running",
+          resetCandidate: true,
+        }),
+      );
+      expect(persistCandidate).not.toHaveBeenCalled();
+      expect(observeCandidate).not.toHaveBeenCalled();
+      expect(beginStop).not.toHaveBeenCalled();
+      expect(stopTask).not.toHaveBeenCalled();
+      expect(createTask).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(deleteTask).not.toHaveBeenCalled();
+    }
+  });
+
+  it("routes a marker-missing historical task to reset without Provider reads or writes", async () => {
+    const operationKey = "8".repeat(64);
+    const taskId = "materialized-task-historical-running-zip";
+    const expectedFilename = `frontmind-kb-bundle-${operationKey}.zip`;
+    const stopTask = vi.fn();
+    const downloadArchive = vi.fn();
+    const ensureDispatch = vi.fn();
+    const createClient = vi.fn();
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c8",
+      userId: 7,
+      conversationId: "conversation-materialized-historical-running",
+      generation: 1,
+      revision: 0,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000f8",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-historical-running",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch,
+          downloadArchive,
+          createClient: createClient.mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue([
+              {
+                id: "assistant-historical-zip",
+                type: "assistant_message",
+                timestamp: 10,
+                assistant_message: {
+                  content: "",
+                  attachments: [
+                    {
+                      type: "file",
+                      filename: expectedFilename,
+                      content_type: "application/zip",
+                      url: "https://downloads.example.test/historical.zip",
+                    },
+                  ],
+                },
+              },
+              {
+                id: "status-historical-running",
+                type: "status_update",
+                timestamp: 11,
+                status_update: { agent_status: "running" },
+              },
+            ]),
+            stopTask,
+          }),
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+    expect(downloadArchive).not.toHaveBeenCalled();
+    expect(stopTask).not.toHaveBeenCalled();
+  });
+
+  it("only stages running candidates and classifies waiting, typed quota, unknown error, and missing status without Provider writes", async () => {
+    const operationKey = "6".repeat(64);
+    const taskId = "materialized-task-contract-v2-status-classification";
+    const expectedFilename = `frontmind-kb-bundle-${operationKey}.zip`;
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c6",
+      userId: 7,
+      conversationId: "conversation-materialized-status-classification",
+      companyName: "Status Company",
+      companyWebsite: "https://status.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000f6",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedCompletion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-status-classification",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+    const archiveEvent = {
+      id: "assistant-status-classification-zip",
+      type: "assistant_message",
+      timestamp: 10,
+      assistant_message: {
+        content: "",
+        attachments: [
+          {
+            type: "file",
+            filename: expectedFilename,
+            content_type: "application/zip",
+            url: "https://downloads.example.test/status.zip",
+          },
+        ],
+      },
+    };
+    const cases = [
+      {
+        label: "waiting",
+        events: [
+          archiveEvent,
+          {
+            id: "status-waiting",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "waiting" },
+          },
+        ],
+        expectedStatus: "waiting",
+      },
+      {
+        label: "typed quota",
+        events: [
+          archiveEvent,
+          {
+            id: "quota-envelope",
+            type: "error_message",
+            timestamp: 11,
+            error_message: { error_type: "insufficient_credits" },
+          },
+          {
+            id: "status-quota-error",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "error" },
+          },
+        ],
+        expectedStatus: "quota_error",
+      },
+      {
+        label: "unknown typed error",
+        events: [
+          archiveEvent,
+          {
+            id: "unknown-error-envelope",
+            type: "error_message",
+            timestamp: 11,
+            error_message: {
+              error_type: "provider_internal",
+              content: "insufficient credits must not be inferred from text",
+            },
+          },
+          {
+            id: "status-unknown-error",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "error" },
+          },
+        ],
+        expectedStatus: "error",
+      },
+      {
+        label: "stale quota envelope before a later error",
+        events: [
+          archiveEvent,
+          {
+            id: "old-quota-envelope",
+            type: "error_message",
+            timestamp: 4,
+            error_message: { error_type: "quota_exceeded" },
+          },
+          {
+            id: "old-quota-status",
+            type: "status_update",
+            timestamp: 5,
+            status_update: { agent_status: "error" },
+          },
+          {
+            id: "continued-running-status",
+            type: "status_update",
+            timestamp: 11,
+            status_update: { agent_status: "running" },
+          },
+          {
+            id: "later-untyped-error-status",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "error" },
+          },
+        ],
+        expectedStatus: "error",
+      },
+      {
+        label: "missing status",
+        events: [archiveEvent],
+        expectedStatus: "unknown",
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      const deferProviderStatus = vi.fn().mockResolvedValue({
+        state: "deferred",
+        retryAfterMs: 15_000,
+        ledger: { schemaVersion: 1 },
+      });
+      const downloadArchive = vi.fn();
+      const observeCandidate = vi.fn();
+      const stopTask = vi.fn();
+      const createTask = vi.fn();
+      const sendMessage = vi.fn();
+      const deleteTask = vi.fn();
+
+      await expect(
+        knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+          claim,
+          { id: "credential-base", apiKey: "base-secret" } as any,
+          {
+            loadBuild: vi.fn().mockResolvedValue(build),
+            ensureDispatch: vi.fn().mockResolvedValue({
+              schemaVersion: 2,
+              baseUrl: "https://api.example.test",
+              requestBody: {
+                prompt: "bundle",
+                agentProfile: "manus-1.6",
+                attachments: [],
+              },
+              bodySha256: "b".repeat(64),
+              preparedAt: "2026-08-15T00:00:00.000Z",
+            }),
+            downloadArchive,
+            observeCandidate,
+            deferProviderStatus,
+            createClient: vi.fn().mockReturnValue({
+              createTask,
+              findCreatedTask: vi.fn(),
+              listAllMessages: vi.fn().mockResolvedValue(fixture.events),
+              stopTask,
+              sendMessage,
+              deleteTask,
+            }),
+          } as any,
+        ),
+        fixture.label,
+      ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+
+      expect(deferProviderStatus, fixture.label).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: fixture.expectedStatus,
+          resetCandidate: false,
+        }),
+      );
+      expect(downloadArchive, fixture.label).not.toHaveBeenCalled();
+      expect(observeCandidate, fixture.label).not.toHaveBeenCalled();
+      expect(stopTask, fixture.label).not.toHaveBeenCalled();
+      expect(createTask, fixture.label).not.toHaveBeenCalled();
+      expect(sendMessage, fixture.label).not.toHaveBeenCalled();
+      expect(deleteTask, fixture.label).not.toHaveBeenCalled();
+    }
+  });
+
+  it("activates a contract-v2 staged candidate only after stopped proves the same immutable ZIP", async () => {
+    const operationKey = "9".repeat(64);
+    const taskId = "materialized-task-contract-v2-stopped";
+    const turnId = "00000000-0000-4000-8000-0000000000f9";
+    const eventId = "assistant-contract-v2-stopped-zip";
+    const attachmentItemId = `v2-attachment-${createHash("sha256")
+      .update(`${eventId}\0${0}`, "utf8")
+      .digest("hex")}`;
+    const candidateEventIdHash = createHash("sha256")
+      .update(JSON.stringify([attachmentItemId]), "utf8")
+      .digest("hex");
+    const archive = Buffer.from("same-staged-and-stopped-bundle");
+    const contentSha256 = createHash("sha256").update(archive).digest("hex");
+    const storageKey = "knowledge-base/build-sources/7/stopped-candidate.bin";
+    const expectedFilename = `frontmind-kb-bundle-${operationKey}.zip`;
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c9",
+      userId: 7,
+      conversationId: "conversation-materialized-contract-v2-stopped",
+      companyName: "Completion Company",
+      companyWebsite: "https://completion.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: turnId,
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        materializedCompletion: {
+          schemaVersion: 1,
+          candidateEventIdHash,
+          storageKey,
+          candidateArchiveSha256: contentSha256,
+          sizeBytes: archive.length,
+          firstObservedAt: "2026-08-15T00:00:00.000Z",
+          lastObservedAt: "2026-08-15T00:02:30.000Z",
+          stableAt: "2026-08-15T00:00:30.000Z",
+          naturalStopDeadlineAt: "2026-08-15T00:02:30.000Z",
+          stopAttemptState: "acknowledged",
+          stopAttemptedAt: "2026-08-15T00:02:30.000Z",
+          stopSettleDeadlineAt: "2026-08-15T00:04:30.000Z",
+        },
+      },
+      leaseToken: "lease-materialized-contract-v2-stopped",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+    const activateInitial = vi.fn().mockResolvedValue(undefined);
+    const stopTask = vi.fn();
+    const stoppedEvents = [
+      {
+        id: eventId,
+        type: "assistant_message",
+        timestamp: 10,
+        assistant_message: {
+          content: "",
+          attachments: [
+            {
+              type: "file",
+              filename: expectedFilename,
+              content_type: "application/zip",
+              url: "https://downloads.example.test/stopped.zip",
+            },
+          ],
+        },
+      },
+      {
+        id: "status-contract-v2-stopped",
+        type: "status_update",
+        timestamp: 11,
+        status_update: { agent_status: "stopped" },
+      },
+    ];
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "bundle",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-15T00:00:00.000Z",
+          }),
+          downloadArchive: vi.fn().mockResolvedValue({
+            buffer: archive,
+            contentType: "application/zip",
+          }),
+          validateInitialCandidate: vi
+            .fn()
+            .mockResolvedValue({ archiveBytes: archive }),
+          readCandidate: vi.fn().mockResolvedValue(archive),
+          activateInitial,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue(stoppedEvents),
+            stopTask,
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
+
+    expect(stopTask).not.toHaveBeenCalled();
+    expect(activateInitial).toHaveBeenCalledOnce();
+    expect(activateInitial).toHaveBeenCalledWith(
+      expect.objectContaining({
+        archiveBytes: archive,
+        providerTaskId: taskId,
+      }),
+    );
+
+    const mismatchedActivation = vi.fn();
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "bundle",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-15T00:00:00.000Z",
+          }),
+          downloadArchive: vi.fn().mockResolvedValue({
+            buffer: Buffer.from("changed-after-task-stop"),
+            contentType: "application/zip",
+          }),
+          validateInitialCandidate: vi
+            .fn()
+            .mockImplementation(async (bytes: Buffer) => ({
+              archiveBytes: bytes,
+            })),
+          readCandidate: vi.fn().mockResolvedValue(archive),
+          activateInitial: mismatchedActivation,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue(stoppedEvents),
+            stopTask: vi.fn(),
+          }),
+        } as any,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+    });
+    expect(mismatchedActivation).not.toHaveBeenCalled();
+
+    const deferAfterStop = vi.fn();
+    const observeAfterStop = vi.fn().mockResolvedValue({
+      disposition: "stop_settle_expired",
+      ledger: claim.turn.materializedCompletion,
+      deduplicated: true,
+    });
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "bundle",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-15T00:00:00.000Z",
+          }),
+          observeCandidate: observeAfterStop,
+          deferProviderStatus: deferAfterStop,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue([
+              stoppedEvents[0],
+              {
+                id: "status-after-stop-waiting",
+                type: "status_update",
+                timestamp: 12,
+                status_update: { agent_status: "waiting" },
+              },
+            ]),
+            stopTask: vi.fn(),
+          }),
+        } as any,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+    });
+    expect(observeAfterStop).toHaveBeenCalledWith(
+      expect.objectContaining({ providerStatus: "waiting" }),
+    );
+    expect(deferAfterStop).not.toHaveBeenCalled();
+  });
+
+  it("accepts an interrupted task after a manual continue and activates its valid ZIP without another Provider POST", async () => {
+    const operationKey = "e".repeat(64);
+    const taskId = "materialized-task-manual-continue";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c6",
+      userId: 7,
+      conversationId: "conversation-materialized-manual-continue",
+      companyName: "Manual Continue Company",
+      companyWebsite: "https://manual-continue.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000f6",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedCompletion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-manual-continue",
+      recoveryMetadata: {
+        kind: "start",
+        conversationId: build.conversationId,
+      },
+      preparedDispatch: null,
+    } as any;
+    const prepared = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "只返回本轮 Bundle ZIP",
+        agentProfile: "manus-1.6",
+        attachments: [],
+      },
+      bodySha256: "b".repeat(64),
+      preparedAt: "2026-08-15T00:00:00.000Z",
+    };
+    const expectedFilename = `frontmind-kb-bundle-${operationKey}.zip`;
+    const listAllMessages = vi
+      .fn()
+      .mockResolvedValueOnce([
+        {
+          id: "error-credit-interrupted",
+          type: "error_message",
+          timestamp: 9,
+          error_message: { error_type: "credit_exhausted" },
+        },
+        {
+          id: "status-credit-interrupted",
+          type: "status_update",
+          timestamp: 10,
+          status_update: { agent_status: "error" },
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "status-credit-interrupted",
+          type: "status_update",
+          timestamp: 10,
+          status_update: { agent_status: "error" },
+        },
+        {
+          id: "status-manual-continue-running",
+          type: "status_update",
+          timestamp: 20,
+          status_update: { agent_status: "running" },
+        },
+        {
+          id: "assistant-valid-bundle",
+          type: "assistant_message",
+          timestamp: 29,
+          assistant_message: {
+            content: "",
+            attachments: [
+              {
+                type: "file",
+                filename: expectedFilename,
+                content_type: "application/zip",
+                url: "https://downloads.example.test/manual-continue.zip",
+              },
+            ],
+          },
+        },
+        {
+          id: "status-manual-continue-stopped",
+          type: "status_update",
+          timestamp: 30,
+          status_update: { agent_status: "stopped" },
+        },
+      ]);
+    const createTask = vi.fn();
+    const findCreatedTask = vi.fn();
+    const ensureManusV2Attachments = vi.fn();
+    const beginDispatch = vi.fn();
+    const bindSubmission = vi.fn();
+    const downloadArchive = vi.fn().mockResolvedValue({
+      buffer: Buffer.from("valid-bundle"),
+      contentType: "application/zip",
+    });
+    const activateInitial = vi.fn().mockResolvedValue(undefined);
+    const deferProviderStatus = vi.fn().mockResolvedValue({
+      state: "deferred",
+      retryAfterMs: 15_000,
+      ledger: { schemaVersion: 1 },
+    });
+    const stopTask = vi.fn();
+    const sendMessage = vi.fn();
+    const deleteTask = vi.fn();
+    const dependencies = {
+      loadBuild: vi.fn().mockResolvedValue(build),
+      ensureDispatch: vi.fn().mockResolvedValue(prepared),
+      ensureManusV2Attachments,
+      beginDispatch,
+      bindSubmission,
+      downloadArchive,
+      validateInitialCandidate: vi
+        .fn()
+        .mockImplementation(async (bytes: Buffer) => ({
+          archiveBytes: bytes,
+        })),
+      activateInitial,
+      deferProviderStatus,
+      createClient: vi.fn().mockReturnValue({
+        createTask,
+        findCreatedTask,
+        listAllMessages,
+        stopTask,
+        sendMessage,
+        deleteTask,
+      }),
+    } as any;
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        dependencies,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        dependencies,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
+
+    expect(createTask).not.toHaveBeenCalled();
+    expect(findCreatedTask).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(bindSubmission).not.toHaveBeenCalled();
+    expect(deferProviderStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "quota_error" }),
+    );
+    expect(downloadArchive).toHaveBeenCalledOnce();
+    expect(downloadArchive).toHaveBeenCalledWith(
+      expect.objectContaining({ allowProviderFileIdFallback: true }),
+    );
+    expect(activateInitial).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providerTaskId: taskId,
+        operationKey,
+        initialBundleExpectation: {
+          operationId: operationKey,
+          buildId: build.id,
+          generation: 1,
+          contentVersion: 1,
+          skillContentHash: build.skillContentHash,
+          treePolicyVersion: 2,
+          companyName: build.companyName,
+          companyWebsite: `${build.companyWebsite}/`,
+          expectedUploadsRead: 0,
+        },
+      }),
+    );
+    expect(stopTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("adopts the one created task after a Provider 2xx-to-local-bind crash without reposting create", async () => {
+    const operationKey = "9".repeat(64);
+    const taskId = "materialized-task-created-before-bind-crash";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000b7",
+      userId: 7,
+      conversationId: "conversation-materialized-bind-crash",
+      generation: 1,
+      revision: 0,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000e7",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: null,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerAttemptState: "not_sent",
+        createAttemptState: "not_sent",
+      },
+      leaseToken: "lease-materialized-bind-crash",
+      recoveryMetadata: { kind: "start", parentTaskId: null },
+      preparedDispatch: null,
+    } as any;
+    const prepared = {
+      schemaVersion: 2 as const,
+      baseUrl: "https://api.example.test",
+      requestBody: {
+        prompt: "只返回本轮 Bundle ZIP",
+        agentProfile: "manus-1.6",
+        attachments: [],
+      },
+      bodySha256: "b".repeat(64),
+      preparedAt: "2026-08-15T00:00:00.000Z",
+    };
+    const createTask = vi.fn().mockResolvedValue({
+      taskId,
+      taskUrl: `https://manus.im/app/${taskId}`,
+      requestId: "request-created-before-bind-crash",
+    });
+    const findCreatedTask = vi.fn().mockResolvedValue({
+      candidates: [{ id: taskId }],
+      matches: [{ id: taskId, taskUrl: `https://manus.im/app/${taskId}` }],
+      unique: { id: taskId, taskUrl: `https://manus.im/app/${taskId}` },
+    });
+    const listAllMessages = vi
+      .fn()
+      .mockRejectedValue(
+        new ManusV2ApiError(
+          "task.listMessages",
+          404,
+          "not_found",
+          false,
+          false,
+        ),
+      );
+    const bindSubmission = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("local bind transaction failed"))
+      .mockResolvedValueOnce(undefined);
+    const ensureManusV2Attachments = vi.fn().mockResolvedValue([]);
+    const dependencies = {
+      loadBuild: vi.fn().mockResolvedValue(build),
+      ensureDispatch: vi.fn().mockResolvedValue(prepared),
+      ensureManusV2Attachments,
+      beginDispatch: vi.fn().mockResolvedValue({
+        method: "task.create",
+        canonicalTaskId: null,
+        operationToken: operationKey,
+        title: `FrontMind KB ${build.id} g${build.generation} ${claim.turn.id}`,
+      }),
+      bindSubmission,
+      deferProviderStatus: vi.fn().mockResolvedValue({
+        state: "deferred",
+        retryAfterMs: 15_000,
+        ledger: { schemaVersion: 1 },
+      }),
+      createClient: vi.fn().mockReturnValue({
+        createTask,
+        findCreatedTask,
+        listAllMessages,
+      }),
+    } as any;
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        dependencies,
+      ),
+    ).rejects.toThrow("local bind transaction failed");
+    expect(claim.turn).toMatchObject({
+      upstreamTaskId: null,
+      createAttemptState: "unknown",
+      providerAttemptState: "output_pending",
+    });
+
+    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error: new Error("local bind transaction failed"),
+          outcomeUnknownCode: "MANUS_V2_BIND_PERSISTENCE_UNKNOWN",
+          recoveryDelayMs: 1_000,
+        },
+        { markManusV2OutcomeUnknown },
+      ),
+    ).resolves.toBe("retriable");
+    expect(markManusV2OutcomeUnknown).toHaveBeenCalledOnce();
+
+    claim.turn.providerAttemptState = "outcome_unknown";
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        dependencies,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(findCreatedTask).toHaveBeenCalledOnce();
+    expect(bindSubmission).toHaveBeenCalledTimes(2);
+    expect(ensureManusV2Attachments).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a pre-cutover materialized turn before prepare or any Provider call", async () => {
+    const ensureDispatch = vi.fn();
+    const ensureManusV2Attachments = vi.fn();
+    const beginDispatch = vi.fn();
+    const createClient = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        {
+          turn: {
+            id: "turn-materialized-reset-required",
+            userId: 7,
+            buildId: "build-materialized-reset-required",
+            buildGeneration: 1,
+            materializedRecoveryContractVersion: null,
+          },
+        } as any,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue({
+            id: "build-materialized-reset-required",
+            executionMode: "materialized_bundle_v1",
+            skillVersion: "5",
+            providerProtocol: "manus_v2",
+            contentVersion: 0,
+            handoffProvenance: null,
+          }),
+          ensureDispatch,
+          ensureManusV2Attachments,
+          beginDispatch,
+          createClient,
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
+  });
+
+  it("rejects an old-hash unfinished v5 build before any Provider I/O", async () => {
+    const ensureDispatch = vi.fn();
+    const ensureManusV2Attachments = vi.fn();
+    const beginDispatch = vi.fn();
+    const createClient = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        {
+          turn: {
+            id: "turn-materialized-old-hash",
+            userId: 7,
+            buildId: "build-materialized-old-hash",
+            buildGeneration: 1,
+            materializedRecoveryContractVersion: 1,
+            materializedCompletionContractVersion: 2,
+          },
+        } as any,
+        { id: "credential-current", apiKey: "current-secret-key" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue({
+            id: "build-materialized-old-hash",
+            executionMode: "materialized_bundle_v1",
+            skillVersion: "5",
+            skillContentHash: "a".repeat(64),
+            providerProtocol: "manus_v2",
+            contentVersion: 0,
+            handoffProvenance: {
+              materializedRecoveryContractVersion: 1,
+              materializedCompletionContractVersion: 2,
+            },
+          }),
+          ensureDispatch,
+          ensureManusV2Attachments,
+          beginDispatch,
+          createClient,
+        } as any,
+      ),
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
+
+    expect(ensureDispatch).not.toHaveBeenCalled();
+    expect(ensureManusV2Attachments).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+    expect(createClient).not.toHaveBeenCalled();
   });
 
   it("rejects an explicitly legacy build before preparing files or creating a Provider task", async () => {

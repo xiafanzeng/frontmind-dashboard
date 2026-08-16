@@ -14,6 +14,10 @@ import {
   validateKnowledgeBaseWorkingSetArchive,
 } from "./knowledge-base-materialized-contract";
 import { readKnowledgeBaseLocalSource } from "./knowledge-base-local-source-store";
+import {
+  knowledgeBasePublicResource,
+  knowledgeBasePublicResourceHandleMatches,
+} from "./knowledge-base-public-resource";
 
 const SHA256_RE = /^[a-f0-9]{64}$/u;
 
@@ -67,6 +71,13 @@ export function knowledgeBaseWorkingSetEvidenceUrl(input: {
   return `/api/knowledge-base/artifacts/${encoded(input.buildId)}/working-set/evidence/${encoded(input.leafId)}/${sha256(input.path)}/${input.sha256}`;
 }
 
+export function knowledgeBaseWorkingSetAssetInternalIdentity(input: {
+  leafId: string;
+  asset: Pick<KnowledgeBaseWorkingSetAsset, "assetId" | "sha256" | "path">;
+}) {
+  return `${input.leafId}\0${input.asset.assetId}\0${input.asset.path}\0${input.asset.sha256}`;
+}
+
 export function projectKnowledgeBaseWorkingSetLeafResources(input: {
   buildId: string;
   leafId: string;
@@ -84,12 +95,6 @@ export function projectKnowledgeBaseWorkingSetLeafResources(input: {
   const assetById = new Map(
     input.workingSet.manifest.assets.map((asset) => [asset.assetId, asset]),
   );
-  const evidenceByPath = new Map(
-    input.workingSet.manifest.evidenceLedger.map((entry) => [
-      entry.path,
-      entry,
-    ]),
-  );
   const assetResources = leaf.assetIds.map((assetId) => {
     const asset = assetById.get(assetId);
     const bytes = asset ? input.workingSet.files.get(asset.path) : undefined;
@@ -105,53 +110,59 @@ export function projectKnowledgeBaseWorkingSetLeafResources(input: {
         "Active Working Set asset does not match its manifest binding",
       );
     }
-    return {
-      kind: "working_set_asset" as const,
-      outputItemId: null,
-      fileId: null,
-      sameOriginUrl: knowledgeBaseWorkingSetAssetUrl({
-        buildId: input.buildId,
+    return knowledgeBasePublicResource({
+      buildId: input.buildId,
+      kind: "working_set_asset",
+      internalIdentity: knowledgeBaseWorkingSetAssetInternalIdentity({
+        leafId: leaf.leafId,
         asset,
       }),
-      filename: filename(asset.path, `${asset.assetId}.img`),
+      contentSha256: asset.sha256,
       mimeType: asset.mimeType,
-      sha256: asset.sha256,
       sizeBytes: asset.bytes,
-    };
+      caption: asset.caption,
+    });
   });
-  const evidenceResources = leaf.evidencePaths.map((evidencePath) => {
-    const evidence = evidenceByPath.get(evidencePath);
-    const bytes = evidence
-      ? input.workingSet.files.get(evidence.path)
-      : undefined;
-    if (
-      !evidence ||
-      evidence.leafId !== leaf.leafId ||
-      !bytes ||
-      sha256(bytes) !== evidence.sha256
-    ) {
-      return resourceError(
-        "WORKING_SET_RESOURCE_INTEGRITY_MISMATCH",
-        "Active Working Set evidence does not match its manifest binding",
+  // Evidence bytes remain bound inside the immutable Working Set and are
+  // available to server-side validation/revision code. They are deliberately
+  // not projected as source.md cards into the customer conversation.
+  return assetResources;
+}
+
+export function resolveKnowledgeBaseWorkingSetResourceByOpaqueHandle(input: {
+  suppliedHandle: string;
+  buildId: string;
+  workingSet: ValidatedKnowledgeBaseWorkingSet;
+}) {
+  for (const leaf of input.workingSet.manifest.leaves) {
+    for (const assetId of leaf.assetIds) {
+      const asset = input.workingSet.manifest.assets.find(
+        (candidate) => candidate.assetId === assetId,
       );
+      if (
+        asset &&
+        asset.documentIds.includes(leaf.leafId) &&
+        knowledgeBasePublicResourceHandleMatches({
+          suppliedHandle: input.suppliedHandle,
+          buildId: input.buildId,
+          kind: "working_set_asset",
+          internalIdentity: knowledgeBaseWorkingSetAssetInternalIdentity({
+            leafId: leaf.leafId,
+            asset,
+          }),
+        })
+      ) {
+        return resolveKnowledgeBaseWorkingSetResource({
+          buildId: input.buildId,
+          workingSet: input.workingSet,
+          kind: "asset",
+          assetId: asset.assetId,
+          expectedSha256: asset.sha256,
+        });
+      }
     }
-    return {
-      kind: "working_set_evidence" as const,
-      outputItemId: null,
-      fileId: null,
-      sameOriginUrl: knowledgeBaseWorkingSetEvidenceUrl({
-        buildId: input.buildId,
-        leafId: leaf.leafId,
-        path: evidence.path,
-        sha256: evidence.sha256,
-      }),
-      filename: filename(evidence.path, `${leaf.leafId}-evidence.txt`),
-      mimeType: "text/plain; charset=utf-8",
-      sha256: evidence.sha256,
-      sizeBytes: bytes.length,
-    };
-  });
-  return [...assetResources, ...evidenceResources];
+  }
+  return null;
 }
 
 export function knowledgeBaseWorkingSetLeafLocalUrls(input: {
@@ -164,9 +175,9 @@ export function knowledgeBaseWorkingSetLeafLocalUrls(input: {
     imageUrls: resources
       .filter((resource) => resource.kind === "working_set_asset")
       .map((resource) => resource.sameOriginUrl),
-    evidenceUrls: resources
-      .filter((resource) => resource.kind === "working_set_evidence")
-      .map((resource) => resource.sameOriginUrl),
+    // Evidence remains an internal integrity input. New customer snapshots do
+    // not mint paths containing evidence paths, hashes, or leaf coordinates.
+    evidenceUrls: [] as string[],
   };
 }
 

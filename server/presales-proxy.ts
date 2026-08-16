@@ -13,23 +13,14 @@ import { z } from "zod";
 import { AuthServiceError } from "./auth-service";
 import {
   acquirePresalesTaskReservation,
-  completePresalesProjectTaskPurge,
   completePresalesTaskReservation,
-  countPresalesProjectPendingFileUploads,
-  deletePresalesFileEvidence,
-  deletePresalesTaskEvidence,
   finalizePresalesFileUploadRetention,
   getActivePresalesCredential,
-  getPresalesCredentialById,
   getPresalesCredentialForResource,
   hashPresalesTaskPayload,
   hasPresalesOutputUrlGrant,
-  markPresalesFileContentDeleted,
   recordPresalesUpstreamResource,
   releasePresalesTaskReservation,
-  readPresalesProjectTaskPurgeSnapshot,
-  readPresalesProjectFileTargets,
-  readPresalesTaskEvidenceFileIds,
   retainPresalesProjectFilePurgeTarget,
   retainPresalesTaskPurgeTarget,
   reservePresalesFileUploadRetention,
@@ -48,20 +39,16 @@ import { getUpstreamBaseUrl, toUpstreamAgentProfile } from "./upstream-config";
 import {
   getDedicatedMonitorCredentialReadiness,
   presalesMonitorRouter,
-  purgePresalesProjectMonitorRuns,
 } from "./presales-monitor";
 import { isFrontMindPublicUrlConfigured } from "./public-url";
 import {
   acquirePresalesFileCreateReservation,
   completePresalesFileCreateReservation,
   hashPresalesFileCreatePayload,
-  purgePresalesFileCreateReservation,
   readPresalesFileLifecycle,
-  readPresalesProjectFileCreateReservations,
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
   releasePresalesFileCreateReservation,
-  removePresalesFileCreateReservation,
   removeStoredPresalesFile,
   removeStoredPresalesFileContent,
   stagePresalesFileContent,
@@ -76,7 +63,6 @@ import {
   FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
   upstreamPromptCharacterCount,
 } from "./upstream-prompt-budget";
-import { WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED } from "./website-project-lifecycle";
 
 const router = Router();
 const SERVICE_TOKEN_HEADER = "x-frontmind-service-token";
@@ -829,36 +815,10 @@ async function registerTaskArtifacts(
           apiCredentialId: credential.id,
         });
       }
-      const cleanup = await axios.delete(
-        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          timeout: 60_000,
-          validateStatus: () => true,
-        },
-      );
-      const outcome = buildPresalesFileDeleteOutcome(
-        cleanup.status,
-        cleanup.data,
-        credential.apiKey,
-      );
-      if (!outcome.ok) {
-        throw new AuthServiceError(
-          "UPSTREAM_UNAVAILABLE",
-          "任务删除期间产生的输出文件无法同步清理",
-        );
-      }
-      await Promise.all([
-        removeStoredPresalesFile(fileId),
-        purgePresalesFileCreateReservation(fileId),
-      ]);
-      if (projectId) {
-        await deletePresalesFileEvidence({
-          fileId,
-          apiCredentialId: credential.id,
-        });
-      }
-      throw error;
+      // Project removal is browser-local. Preserve the Provider output and its
+      // durable evidence so a late result is adoptable instead of compensating
+      // with a destructive Provider DELETE.
+      continue;
     }
   }
   const normalizedUrls = new Set<string>();
@@ -1101,24 +1061,12 @@ router.post("/files", fileJsonParser, async (req, res) => {
       ) {
         throw error;
       }
-      const cleanup = await axios.delete(
-        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(id)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          timeout: 60_000,
-          validateStatus: () => true,
-        },
-      );
-      const cleanupOutcome = buildPresalesFileDeleteOutcome(
-        cleanup.status,
-        cleanup.data,
-        credential.apiKey,
-      );
-      if (cleanupOutcome.ok) {
-        await Promise.all([
-          removeStoredPresalesFile(id),
-          purgePresalesFileCreateReservation(id),
-        ]);
+      if (input.projectId) {
+        await retainPresalesProjectFilePurgeTarget({
+          projectId: input.projectId,
+          fileId: id,
+          apiCredentialId: credential.id,
+        });
       }
       throw error;
     }
@@ -1175,52 +1123,6 @@ async function fetchFileMetadata(
 
 export function buildProxyUploadSuccess(upstreamStatus: number) {
   return { ok: true, status: "uploaded", upstreamStatus } as const;
-}
-
-export function buildPresalesFileDeleteOutcome(
-  upstreamStatus: number,
-  data?: unknown,
-  apiKey?: string,
-) {
-  if (
-    upstreamStatus === 404 ||
-    (upstreamStatus >= 200 && upstreamStatus < 300)
-  ) {
-    return { ok: true as const, status: 204, body: null };
-  }
-  return {
-    ok: false as const,
-    status: forwardedStatus(upstreamStatus),
-    body: {
-      error: {
-        code: "UPSTREAM_FILE_DELETE_FAILED",
-        message: upstreamErrorDetail(data, "File deletion failed", apiKey),
-      },
-    },
-  };
-}
-
-export function buildPresalesTaskDeleteOutcome(
-  upstreamStatus: number,
-  data?: unknown,
-  apiKey?: string,
-) {
-  if (
-    upstreamStatus === 404 ||
-    (upstreamStatus >= 200 && upstreamStatus < 300)
-  ) {
-    return { ok: true as const, status: 204, body: null };
-  }
-  return {
-    ok: false as const,
-    status: forwardedStatus(upstreamStatus),
-    body: {
-      error: {
-        code: "UPSTREAM_TASK_DELETE_FAILED",
-        message: upstreamErrorDetail(data, "Task deletion failed", apiKey),
-      },
-    },
-  };
 }
 
 router.put("/files/:fileId/content", async (req, res) => {
@@ -1422,73 +1324,10 @@ router.put("/files/:fileId/content", async (req, res) => {
   }
 });
 
-router.delete("/files/:fileId", async (req, res) => {
-  try {
-    const fileId = String(req.params.fileId || "");
-    const credential = WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED
-      ? await getPresalesCredentialForResource("file", fileId)
-      : await requireResourceCredential("file", fileId);
-    if (!credential) {
-      res.setHeader("Idempotent-Replayed", "true");
-      res.status(204).end();
-      return;
-    }
-    if (
-      WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED &&
-      credential.resource.contentSource === "user_upload" &&
-      credential.resource.uploadReservedAt &&
-      !credential.resource.uploadedAt &&
-      credential.resource.uploadReservedAt.getTime() + UPSTREAM_TIMEOUT_MS >
-        Date.now()
-    ) {
-      res.setHeader("Retry-After", "2");
-      res.status(425).json({
-        error: {
-          code: "FILE_DELETE_PENDING",
-          message: "文件正在上传，请稍后重试项目删除",
-        },
-        retryAfterMs: 2_000,
-      });
-      return;
-    }
-    if (credential.resource.contentSource === "user_upload") {
-      await markPresalesFileContentDeleted({
-        fileId,
-        apiCredentialId: credential.id,
-        now: new Date(),
-      });
-    }
-    const response = await axios.delete(
-      `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
-      {
-        headers: upstreamHeaders(credential.apiKey),
-        timeout: 60_000,
-        validateStatus: () => true,
-      },
-    );
-    const outcome = buildPresalesFileDeleteOutcome(
-      response.status,
-      response.data,
-      credential.apiKey,
-    );
-    if (outcome.ok) {
-      await Promise.all([
-        removeStoredPresalesFile(fileId),
-        removePresalesFileCreateReservation(fileId),
-      ]);
-      if (WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
-        await deletePresalesFileEvidence({
-          fileId,
-          apiCredentialId: credential.id,
-        });
-      }
-      res.status(outcome.status).end();
-      return;
-    }
-    res.status(outcome.status).json(outcome.body);
-  } catch (error) {
-    sendKnownError(res, error);
-  }
+router.delete("/files/:fileId", (_req, res) => {
+  // Rolling compatibility: Website project removal is local-only. Preserve
+  // Provider files and Dashboard evidence for retention-based cleanup.
+  res.status(204).end();
 });
 
 async function releaseTaskReservationSafely(reservation: {
@@ -1610,48 +1449,17 @@ router.post("/tasks", taskJsonParser, async (req, res) => {
           upstreamTaskId: id,
           attachmentFileIds: input.attachments.map((item) => item.file_id),
         });
-      } catch (error) {
-        let cleanup;
-        try {
-          cleanup = await axios.delete(
-            `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(id)}`,
-            {
-              headers: upstreamHeaders(credential.apiKey),
-              timeout: 60_000,
-              validateStatus: () => true,
-            },
-          );
-        } catch {
-          await retainPresalesTaskPurgeTarget({
-            reservationId: reservation.reservationId,
-            attemptId: reservation.attemptId,
-            apiCredentialId: credential.id,
-            upstreamTaskId: id,
-          });
-          throw new AuthServiceError(
-            "UPSTREAM_UNAVAILABLE",
-            "项目删除期间产生的任务无法同步清理",
-          );
-        }
-        const outcome = buildPresalesTaskDeleteOutcome(
-          cleanup.status,
-          cleanup.data,
-          credential.apiKey,
+      } catch {
+        await retainPresalesTaskPurgeTarget({
+          reservationId: reservation.reservationId,
+          attemptId: reservation.attemptId,
+          apiCredentialId: credential.id,
+          upstreamTaskId: id,
+        }).catch(() => undefined);
+        throw new AuthServiceError(
+          "UPSTREAM_UNAVAILABLE",
+          "上游已接收任务，正在等待本地确认",
         );
-        if (!outcome.ok) {
-          await retainPresalesTaskPurgeTarget({
-            reservationId: reservation.reservationId,
-            attemptId: reservation.attemptId,
-            apiCredentialId: credential.id,
-            upstreamTaskId: id,
-          });
-          throw new AuthServiceError(
-            "UPSTREAM_UNAVAILABLE",
-            "项目删除期间产生的任务无法同步清理",
-          );
-        }
-        await releaseTaskReservationSafely(reservation);
-        throw error;
       }
     } else {
       await recordPresalesUpstreamResource({
@@ -1693,111 +1501,15 @@ async function sendTask(req: Request, res: Response) {
 router.get("/tasks/:taskId", sendTask);
 router.get("/tasks/:taskId/result", sendTask);
 
-router.delete("/tasks/:taskId", async (req, res) => {
-  try {
-    const taskId = String(req.params.taskId || "");
-    if (!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
-      await requireResourceCredential("task", taskId);
-      // Rolling compatibility for older Website releases: acknowledge their
-      // cleanup call, but retain both the upstream task and its local evidence.
-      res.setHeader("X-FrontMind-Task-Retention", "retained");
-      res.status(204).end();
-      return;
-    }
-    const credential = await getPresalesCredentialForResource("task", taskId);
-    if (!credential) {
-      res.setHeader("Idempotent-Replayed", "true");
-      res.status(204).end();
-      return;
-    }
-    const response = await axios.delete(
-      `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(taskId)}`,
-      {
-        headers: upstreamHeaders(credential.apiKey),
-        timeout: 60_000,
-        validateStatus: () => true,
-      },
-    );
-    const outcome = buildPresalesTaskDeleteOutcome(
-      response.status,
-      response.data,
-      credential.apiKey,
-    );
-    if (!outcome.ok) {
-      res.status(outcome.status).json(outcome.body);
-      return;
-    }
-    const fileIds = await readPresalesTaskEvidenceFileIds({
-      taskId,
-      apiCredentialId: credential.id,
-    });
-    for (const fileId of fileIds) {
-      const fileResponse = await axios.delete(
-        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          timeout: 60_000,
-          validateStatus: () => true,
-        },
-      );
-      const fileOutcome = buildPresalesFileDeleteOutcome(
-        fileResponse.status,
-        fileResponse.data,
-        credential.apiKey,
-      );
-      if (!fileOutcome.ok) {
-        res.status(fileOutcome.status).json(fileOutcome.body);
-        return;
-      }
-    }
-    await Promise.all(
-      fileIds.flatMap((fileId: string) => [
-        removeStoredPresalesFile(fileId),
-        removePresalesFileCreateReservation(fileId),
-      ]),
-    );
-    await deletePresalesTaskEvidence({
-      taskId,
-      apiCredentialId: credential.id,
-      deletedFileIds: fileIds,
-    });
-    res.status(204).end();
-  } catch (error) {
-    sendKnownError(res, error);
-  }
+router.delete("/tasks/:taskId", (_req, res) => {
+  // Provider task history is immutable from Website cleanup paths.
+  res.status(204).end();
 });
 
 router.delete("/projects/:projectId/monitor-runs/:runId", async (req, res) => {
-  if (!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
-    res.status(503).json({
-      error: {
-        code: "PROJECT_DELETE_DISABLED",
-        message: "Website project physical deletion is not enabled",
-      },
-    });
-    return;
-  }
   try {
-    const projectId = projectOrderProjectIdSchema.parse(req.params.projectId);
-    const runId = z.string().uuid().parse(req.params.runId);
-    const result = await purgePresalesProjectMonitorRuns({
-      projectId,
-      runIds: [runId],
-    });
-    if (result.pendingRuns > 0) {
-      res.setHeader("Retry-After", "2");
-      res.status(425).json({
-        error: {
-          code: "MONITOR_DELETE_PENDING",
-          message: "监控任务正在提交，请稍后重试项目删除",
-        },
-        retryAfterMs: 2_000,
-      });
-      return;
-    }
-    if (result.deletedRuns === 0) {
-      res.setHeader("Idempotent-Replayed", "true");
-    }
+    projectOrderProjectIdSchema.parse(req.params.projectId);
+    z.string().uuid().parse(req.params.runId);
     res.status(204).end();
   } catch (error) {
     sendKnownError(res, error);
@@ -1805,244 +1517,14 @@ router.delete("/projects/:projectId/monitor-runs/:runId", async (req, res) => {
 });
 
 router.delete("/projects/:projectId/tasks", async (req, res) => {
-  if (!WEBSITE_PROJECT_PHYSICAL_DELETE_ENABLED) {
-    res.status(503).json({
-      error: {
-        code: "PROJECT_DELETE_DISABLED",
-        message: "Website project physical deletion is not enabled",
-      },
-    });
-    return;
-  }
   try {
     const projectId = projectOrderProjectIdSchema.parse(req.params.projectId);
-    const snapshot = await readPresalesProjectTaskPurgeSnapshot(projectId);
-    let deletedTasks = 0;
-    let deletedFiles = 0;
-    for (const task of snapshot.tasks) {
-      const credential = await getPresalesCredentialById(task.apiCredentialId);
-      if (!credential) {
-        throw new AuthServiceError(
-          "DATABASE_UNAVAILABLE",
-          "项目任务的 API Key 版本不可用，无法确认上游物理删除",
-        );
-      }
-      const response = await axios.delete(
-        `${getUpstreamBaseUrl()}/v1/tasks/${encodeURIComponent(task.taskId)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          timeout: 60_000,
-          validateStatus: () => true,
-        },
-      );
-      const outcome = buildPresalesTaskDeleteOutcome(
-        response.status,
-        response.data,
-        credential.apiKey,
-      );
-      if (!outcome.ok) {
-        res.status(outcome.status).json(outcome.body);
-        return;
-      }
-      const fileIds = await readPresalesTaskEvidenceFileIds({
-        taskId: task.taskId,
-        apiCredentialId: task.apiCredentialId,
-      });
-      for (const fileId of fileIds) {
-        const fileResponse = await axios.delete(
-          `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(fileId)}`,
-          {
-            headers: upstreamHeaders(credential.apiKey),
-            timeout: 60_000,
-            validateStatus: () => true,
-          },
-        );
-        const fileOutcome = buildPresalesFileDeleteOutcome(
-          fileResponse.status,
-          fileResponse.data,
-          credential.apiKey,
-        );
-        if (!fileOutcome.ok) {
-          res.status(fileOutcome.status).json(fileOutcome.body);
-          return;
-        }
-      }
-      await Promise.all(
-        fileIds.flatMap((fileId: string) => [
-          removeStoredPresalesFile(fileId),
-          purgePresalesFileCreateReservation(fileId),
-        ]),
-      );
-      try {
-        await deletePresalesTaskEvidence({
-          taskId: task.taskId,
-          apiCredentialId: task.apiCredentialId,
-          deletedFileIds: fileIds,
-        });
-      } catch (error) {
-        if (
-          error instanceof AuthServiceError &&
-          error.code === "IDEMPOTENCY_PENDING"
-        ) {
-          res.setHeader("Retry-After", "2");
-          res.status(202).json({
-            schemaVersion: 1,
-            projectId,
-            status: "deleting",
-            deletedTasks,
-            deletedFiles,
-            pendingReservations: snapshot.pendingReservations + 1,
-            remainingTasks: snapshot.tasks.length,
-            retryAfterMs: 2_000,
-          });
-          return;
-        }
-        throw error;
-      }
-      deletedTasks += 1;
-    }
-
-    const files = await readPresalesProjectFileTargets(projectId);
-    const pendingFileUploads = await countPresalesProjectPendingFileUploads(
-      projectId,
-      { graceMs: UPSTREAM_TIMEOUT_MS },
-    );
-    if (pendingFileUploads > 0) {
-      res.setHeader("Retry-After", "2");
-      res.status(202).json({
-        schemaVersion: 1,
-        projectId,
-        status: "deleting",
-        deletedTasks,
-        deletedFiles,
-        pendingReservations: snapshot.pendingReservations + pendingFileUploads,
-        remainingTasks: snapshot.tasks.length,
-        retryAfterMs: 2_000,
-      });
-      return;
-    }
-    for (const file of files) {
-      const credential = await getPresalesCredentialById(file.apiCredentialId);
-      if (!credential) {
-        throw new AuthServiceError(
-          "DATABASE_UNAVAILABLE",
-          "项目文件的 API Key 版本不可用，无法确认上游物理删除",
-        );
-      }
-      const response = await axios.delete(
-        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(file.fileId)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          timeout: 60_000,
-          validateStatus: () => true,
-        },
-      );
-      const outcome = buildPresalesFileDeleteOutcome(
-        response.status,
-        response.data,
-        credential.apiKey,
-      );
-      if (!outcome.ok) {
-        res.status(outcome.status).json(outcome.body);
-        return;
-      }
-      await Promise.all([
-        removeStoredPresalesFile(file.fileId),
-        purgePresalesFileCreateReservation(file.fileId),
-      ]);
-      await deletePresalesFileEvidence(file);
-      deletedFiles += 1;
-    }
-
-    const fileReservations =
-      await readPresalesProjectFileCreateReservations(projectId);
-    for (const file of fileReservations.files) {
-      const credential = await getPresalesCredentialById(file.apiCredentialId);
-      if (!credential) {
-        throw new AuthServiceError(
-          "DATABASE_UNAVAILABLE",
-          "项目文件预留的 API Key 版本不可用，无法确认上游物理删除",
-        );
-      }
-      const response = await axios.delete(
-        `${getUpstreamBaseUrl()}/v1/files/${encodeURIComponent(file.fileId)}`,
-        {
-          headers: upstreamHeaders(credential.apiKey),
-          timeout: 60_000,
-          validateStatus: () => true,
-        },
-      );
-      const outcome = buildPresalesFileDeleteOutcome(
-        response.status,
-        response.data,
-        credential.apiKey,
-      );
-      if (!outcome.ok) {
-        res.status(outcome.status).json(outcome.body);
-        return;
-      }
-      await Promise.all([
-        removeStoredPresalesFile(file.fileId),
-        purgePresalesFileCreateReservation(file.fileId),
-      ]);
-      await deletePresalesFileEvidence(file);
-      deletedFiles += 1;
-    }
-
-    if (fileReservations.pendingReservations > 0) {
-      res.setHeader("Retry-After", "2");
-      res.status(202).json({
-        schemaVersion: 1,
-        projectId,
-        status: "deleting",
-        deletedTasks,
-        deletedFiles,
-        pendingReservations:
-          snapshot.pendingReservations + fileReservations.pendingReservations,
-        remainingTasks: snapshot.tasks.length,
-        retryAfterMs: 2_000,
-      });
-      return;
-    }
-
-    const monitors = await purgePresalesProjectMonitorRuns({ projectId });
-    if (monitors.pendingRuns > 0) {
-      res.setHeader("Retry-After", "2");
-      res.status(202).json({
-        schemaVersion: 1,
-        projectId,
-        status: "deleting",
-        deletedTasks,
-        deletedFiles,
-        pendingReservations:
-          snapshot.pendingReservations + monitors.pendingRuns,
-        remainingTasks: snapshot.tasks.length,
-        retryAfterMs: 2_000,
-      });
-      return;
-    }
-
-    const completion = await completePresalesProjectTaskPurge(projectId);
-    if (!completion.completed) {
-      res.setHeader("Retry-After", "2");
-      res.status(202).json({
-        schemaVersion: 1,
-        projectId,
-        status: "deleting",
-        deletedTasks,
-        deletedFiles,
-        pendingReservations: completion.pendingReservations,
-        remainingTasks: completion.remainingTasks,
-        retryAfterMs: 2_000,
-      });
-      return;
-    }
     res.json({
       schemaVersion: 1,
       projectId,
       status: "deleted",
-      deletedTasks,
-      deletedFiles,
+      deletedTasks: 0,
+      deletedFiles: 0,
       pendingReservations: 0,
     });
   } catch (error) {

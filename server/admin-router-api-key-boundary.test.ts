@@ -22,6 +22,10 @@ describe("admin API Key mutation boundary", () => {
       'confirmation: z.literal("BULK_REPLACE_API_KEYS")',
     );
     expect(source).toContain('.enum(["unconfigured_only", "replace_all"])');
+    expect(source).toContain('kind: z.literal("customer")');
+    expect(source).toContain('kind: z.literal("delivery_admin")');
+    expect(source).toContain('kind: z.literal("engineer")');
+    expect(source).not.toContain('kind: z.literal("system_admin")');
   });
 
   it("removes delivery-role mutation aliases and disables the legacy self-service writer", async () => {

@@ -19,6 +19,10 @@ import {
   knowledgeBaseObservationConversationStorageId,
   knowledgeBaseNodeBackedPresentationGeneration,
   knowledgeBaseAcceptedProviderAttemptMetadata,
+  knowledgeBaseBuildRequiresApprovedReset,
+  knowledgeBaseDeferredUploadProjection,
+  knowledgeBaseMaterializedResultFailureNotice,
+  knowledgeBaseLogoProgressPolicy,
   knowledgeBaseOperationalFailureAuthority,
   knowledgeBasePackageProjectionCompatibility,
   knowledgeBasePublicTerminalRecovery,
@@ -31,6 +35,7 @@ import {
   projectKnowledgeBasePresentationMarkdown,
   selectKnowledgeBaseProtocolOperationOutput,
 } from "./knowledge-base-progress-service";
+import { KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE } from "../shared/knowledge-base-progress";
 import type {
   KnowledgeBaseRejectedInitialLogoDisposition,
   KnowledgeBaseStagedArtifactCandidate,
@@ -41,6 +46,198 @@ import {
   KnowledgeBaseProgressError,
 } from "./knowledge-base-progress";
 import { stripKnowledgeBaseReferenceAppendix } from "../shared/knowledge-base-output";
+import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
+
+describe("knowledge-base Logo progress policy", () => {
+  const firstLeaf = {
+    status: "confirming",
+    confirmedCount: 0,
+    directPrefilledCount: 0,
+    currentOrdinal: 0,
+    logoSha256: null,
+  };
+
+  it("keeps Logo optional for materialized v5 and exposes a bound Logo", () => {
+    expect(
+      knowledgeBaseLogoProgressPolicy({
+        ...firstLeaf,
+        executionMode: "materialized_bundle_v1",
+        providerProtocol: "manus_v2",
+        skillVersion: "5",
+      }),
+    ).toEqual({ logoRequired: false, logoAvailable: false });
+    expect(
+      knowledgeBaseLogoProgressPolicy({
+        ...firstLeaf,
+        executionMode: "materialized_bundle_v1",
+        providerProtocol: "manus_v2",
+        skillVersion: "5",
+        logoSha256: "a".repeat(64),
+      }),
+    ).toEqual({ logoRequired: false, logoAvailable: true });
+  });
+
+  it("preserves the legacy v4 first-node Logo requirement", () => {
+    expect(
+      knowledgeBaseLogoProgressPolicy({
+        ...firstLeaf,
+        executionMode: null,
+        providerProtocol: "legacy",
+        skillVersion: "4",
+      }),
+    ).toEqual({ logoRequired: true, logoAvailable: false });
+  });
+});
+
+describe("knowledge-base reset-only materialized authority", () => {
+  const current = {
+    executionMode: "materialized_bundle_v1",
+    skillVersion: "5",
+    skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+    providerProtocol: "manus_v2",
+    contentVersion: 0,
+    handoffProvenance: {
+      materializedRecoveryContractVersion: 1,
+      materializedCompletionContractVersion: 2,
+    },
+  } as any;
+
+  it("accepts only a build born with the durable recovery contract marker", () => {
+    expect(knowledgeBaseBuildRequiresApprovedReset(current)).toBe(false);
+    expect(
+      knowledgeBaseBuildRequiresApprovedReset({
+        ...current,
+        skillContentHash: "0".repeat(64),
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseBuildRequiresApprovedReset({
+        ...current,
+        handoffProvenance: null,
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseBuildRequiresApprovedReset({
+        ...current,
+        contentVersion: null,
+      }),
+    ).toBe(true);
+    expect(
+      knowledgeBaseBuildRequiresApprovedReset({
+        ...current,
+        handoffProvenance: {
+          materializedRecoveryContractVersion: 1,
+          materializedCompletionContractVersion: 2,
+          sourceResetRevision: 4,
+          authorizedAt: "2026-08-15T00:00:00.000Z",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      knowledgeBaseBuildRequiresApprovedReset({
+        ...current,
+        handoffProvenance: { materializedRecoveryContractVersion: 1 },
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("knowledge-base deferred upload projection", () => {
+  const base = {
+    awaitingClientAttachments: true,
+    expectedAttachmentCount: 1,
+    stagedAttachmentCount: 0,
+  };
+
+  it("projects a start reservation as neutral upload progress", () => {
+    expect(
+      knowledgeBaseDeferredUploadProjection({
+        ...base,
+        operationType: "start",
+      }),
+    ).toEqual({
+      processingPhase: "uploading",
+    });
+  });
+
+  it("projects a middle-node revise as neutral upload progress", () => {
+    expect(
+      knowledgeBaseDeferredUploadProjection({
+        ...base,
+        operationType: "revise",
+      }),
+    ).toEqual({
+      processingPhase: "uploading",
+    });
+  });
+
+  it("keeps partial k/n staging as neutral upload progress", () => {
+    expect(
+      knowledgeBaseDeferredUploadProjection({
+        ...base,
+        operationType: "revise",
+        expectedAttachmentCount: 3,
+        stagedAttachmentCount: 1,
+      }),
+    ).toEqual({ processingPhase: "uploading" });
+  });
+
+  it("keeps n/n staging in upload progress until dispatch releases the fence", () => {
+    expect(
+      knowledgeBaseDeferredUploadProjection({
+        ...base,
+        operationType: "revise",
+        stagedAttachmentCount: 1,
+      }),
+    ).toEqual({ processingPhase: "uploading" });
+  });
+});
+
+describe("knowledge-base rejected materialized result projection", () => {
+  const terminalBuild = {
+    activeTurnId: null,
+    canonicalTaskState: "attention_required",
+    generation: 6,
+    protocolErrorCode: "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+    stateEpoch: 14,
+    status: "protocol_error",
+    updatedAt: new Date("2026-08-15T12:00:00.000Z"),
+  } as any;
+
+  it("exposes only the fixed approved-reset notice", () => {
+    const notice = knowledgeBaseMaterializedResultFailureNotice(terminalBuild);
+    expect(notice).toEqual({
+      key: "materialized-result-reset:6:14",
+      code: "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+      severity: "error",
+      message: KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+      retryable: false,
+      failureClass: "requires_user_fix",
+      recoveryAction: "approve_reset",
+      canRegenerate: false,
+      turnId: null,
+      createdAt: Date.parse("2026-08-15T12:00:00.000Z"),
+    });
+    expect(JSON.stringify(notice)).not.toMatch(
+      /(?:trace|sha256|provider|task[_-]?id|turn-[a-z0-9])/iu,
+    );
+  });
+
+  it("does not project a recoverable or still-active result as terminal", () => {
+    expect(
+      knowledgeBaseMaterializedResultFailureNotice({
+        ...terminalBuild,
+        activeTurnId: "active-turn",
+      }),
+    ).toBeNull();
+    expect(
+      knowledgeBaseMaterializedResultFailureNotice({
+        ...terminalBuild,
+        protocolErrorCode: "RECOVERY_DEFERRED",
+      }),
+    ).toBeNull();
+  });
+});
 
 describe("knowledge-base replacement canonical presentation authority", () => {
   it("uses only the strictly matched historical receipt generation for retained node presentation", () => {

@@ -13,6 +13,7 @@ import {
   presalesTaskRequests,
   presalesUpstreamResources,
   providerFileLeases,
+  websiteProjectAttributions,
   websiteProjectDeletionTombstones,
   type PresalesApiCredential,
   type PresalesTaskRequest,
@@ -143,6 +144,7 @@ export type PresalesCreditUsageTask = {
   title: string;
   creditUsage: number;
   createdAt: number | null;
+  businessOwnerName: string | null;
 };
 
 export type WebsiteApiKeyUsage = {
@@ -178,6 +180,41 @@ type WebsiteUsageOwnershipRow = {
   createdAt: Date;
   status?: string | null;
 };
+
+type WebsiteTaskProjectRow = {
+  upstreamTaskId: string | null;
+  projectId: string | null;
+};
+
+/** Builds the bounded recent-task attribution projection without changing the
+ * usage ledger's role as the sole authority for credits and timestamps. */
+export function projectPresalesTaskBusinessOwners(input: {
+  taskIds: readonly string[];
+  agentTaskRows: readonly WebsiteTaskProjectRow[];
+  monitorRows: readonly WebsiteTaskProjectRow[];
+  attributionRows: readonly {
+    projectId: string;
+    businessOwnerName: string;
+  }[];
+}) {
+  const requested = new Set(input.taskIds);
+  const projectByTask = new Map<string, string>();
+  for (const row of [...input.agentTaskRows, ...input.monitorRows]) {
+    const taskId = row.upstreamTaskId?.trim();
+    const projectId = row.projectId?.trim();
+    if (!taskId || !projectId || !requested.has(taskId)) continue;
+    projectByTask.set(taskId, projectId);
+  }
+  const ownerByProject = new Map(
+    input.attributionRows.map((row) => [row.projectId, row.businessOwnerName]),
+  );
+  return new Map(
+    input.taskIds.map((taskId) => [
+      taskId,
+      ownerByProject.get(projectByTask.get(taskId) ?? "") ?? null,
+    ]),
+  );
+}
 
 /**
  * Projects every durable Website task authority into the usage scanner. New
@@ -456,6 +493,60 @@ export async function getPresalesCreditUsageSnapshot(
         .limit(1)
     : [];
   const snapshot = snapshots[0];
+  const recentTaskIds = recentRows.map((row) => row.id);
+  const [recentAgentTaskRows, recentMonitorRows] =
+    recentTaskIds.length > 0
+      ? await Promise.all([
+          db
+            .select({
+              upstreamTaskId: agentTasks.providerTaskId,
+              projectId: agentOperations.presalesProjectId,
+            })
+            .from(agentTasks)
+            .innerJoin(
+              agentOperations,
+              eq(agentTasks.operationId, agentOperations.id),
+            )
+            .where(
+              and(
+                eq(agentOperations.scope, "website_frontend"),
+                inArray(agentTasks.providerTaskId, recentTaskIds),
+              ),
+            ),
+          db
+            .select({
+              upstreamTaskId: presalesMonitorRuns.upstreamTaskId,
+              projectId: presalesMonitorRuns.projectId,
+            })
+            .from(presalesMonitorRuns)
+            .where(inArray(presalesMonitorRuns.upstreamTaskId, recentTaskIds)),
+        ])
+      : [[], []];
+  const recentProjectIds = [
+    ...new Set(
+      [...recentAgentTaskRows, ...recentMonitorRows]
+        .map((row) => row.projectId?.trim())
+        .filter((projectId): projectId is string => Boolean(projectId)),
+    ),
+  ];
+  const attributionRows =
+    recentProjectIds.length > 0
+      ? await db
+          .select({
+            projectId: websiteProjectAttributions.projectId,
+            businessOwnerName: websiteProjectAttributions.businessOwnerName,
+          })
+          .from(websiteProjectAttributions)
+          .where(
+            inArray(websiteProjectAttributions.projectId, recentProjectIds),
+          )
+      : [];
+  const businessOwnerByTask = projectPresalesTaskBusinessOwners({
+    taskIds: recentTaskIds,
+    agentTaskRows: recentAgentTaskRows,
+    monitorRows: recentMonitorRows,
+    attributionRows,
+  });
   const snapshotMatchesCredential = Boolean(
     credential &&
       snapshot &&
@@ -504,6 +595,7 @@ export async function getPresalesCreditUsageSnapshot(
       title: row.id,
       creditUsage: Math.max(0, Number(row.creditUsage) || 0),
       createdAt: Number(row.createdAt),
+      businessOwnerName: businessOwnerByTask.get(row.id) ?? null,
     })),
   };
 }
@@ -2516,6 +2608,7 @@ export function aggregatePresalesCreditUsagePage(input: {
       ),
       creditUsage,
       createdAt,
+      businessOwnerName: null,
     });
   }
   reachedCutoff = usagePageReachedCutoff({

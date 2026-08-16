@@ -20,6 +20,7 @@ import {
 } from "@/lib/frontmind-api";
 import { normalizeKnowledgeCollectionCopy } from "@shared/knowledge-base-copy";
 import type {
+  KnowledgeBaseApprovedResourceDto,
   KnowledgeBaseContentState,
   KnowledgeBaseFailureClass,
   KnowledgeBasePackageState,
@@ -28,6 +29,10 @@ import type {
   KnowledgeBaseRecoveryAction,
   KnowledgeBaseSyncState,
 } from "@shared/knowledge-base-progress";
+import {
+  customerSafeKnowledgeAssetLabel,
+  customerSafeKnowledgeFilename,
+} from "@shared/knowledge-base-public-artifacts";
 import {
   knowledgeBasePresentationMessagePublicId,
   knowledgeBaseUserMessagePublicId,
@@ -47,6 +52,16 @@ import {
   isAttachmentExpired,
   localAttachmentPayloadExpiresAt,
 } from "@/lib/attachment-expiry";
+
+export function conversationSyncErrorMessage(error: unknown): string {
+  const message = getErrorMessage(error);
+  return error instanceof TypeError ||
+    /failed to fetch|networkerror|network request failed|load failed/iu.test(
+      message,
+    )
+    ? "会话同步暂时中断，连接恢复后将自动重试。"
+    : message;
+}
 
 // Types for local conversation management
 export interface Attachment {
@@ -136,7 +151,6 @@ export interface KnowledgeBaseClientNotice {
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
   recoveryToken?: string;
   canRegenerate?: boolean;
-  traceId?: string;
   attachmentCount?: number;
   turnId?: string | null;
 }
@@ -155,6 +169,13 @@ export interface KnowledgeBaseClientState {
   publicationState?: KnowledgeBasePublicationState;
   activeTurnId: string | null;
   activeClientRequestId: string | null;
+  /** Same-turn freshness fence; never compares unrelated turn clocks. */
+  activeTurnUpdatedAt?: number;
+  activeTurnMessageSequence?: number;
+  activeTurnResetRevision?: number;
+  activeTurnAwaitingClientAttachments?: boolean;
+  activeTurnStagedAttachmentCount?: number;
+  activeTurnExpectedAttachmentCount?: number;
   /** Provenance of the currently approved presentation; remains after the reservation is released. */
   presentationTurnId: string | null;
   interactionState: KnowledgeBaseObservationDto["interaction"]["interactionState"];
@@ -691,6 +712,12 @@ function emptyKnowledgeBaseClientState(): KnowledgeBaseClientState {
     publicationState: "draft",
     activeTurnId: null,
     activeClientRequestId: null,
+    activeTurnUpdatedAt: undefined,
+    activeTurnMessageSequence: undefined,
+    activeTurnResetRevision: undefined,
+    activeTurnAwaitingClientAttachments: false,
+    activeTurnStagedAttachmentCount: 0,
+    activeTurnExpectedAttachmentCount: 0,
     presentationTurnId: null,
     interactionState: "queued",
     canReply: false,
@@ -731,6 +758,26 @@ function knowledgeObservationIsStale(
   if (observation.generation < current.generation) return true;
   if (observation.generation > current.generation) return false;
   if (observation.stateEpoch < current.stateEpoch) return true;
+  if (observation.stateEpoch > current.stateEpoch) return false;
+  const observedActiveTurn = observation.activeTurn;
+  if (
+    observedActiveTurn &&
+    current.activeTurnId === observedActiveTurn.id &&
+    Number.isFinite(current.activeTurnUpdatedAt) &&
+    observedActiveTurn.updatedAt < current.activeTurnUpdatedAt!
+  ) {
+    return true;
+  }
+  if (
+    observedActiveTurn &&
+    current.activeTurnId &&
+    current.activeTurnId !== observedActiveTurn.id &&
+    Number.isSafeInteger(current.activeTurnMessageSequence) &&
+    Number.isSafeInteger(observedActiveTurn.messageSequence) &&
+    observedActiveTurn.messageSequence! < current.activeTurnMessageSequence!
+  ) {
+    return true;
+  }
   // A same-coordinate observation is still authoritative. It must be allowed
   // to repair optimistic browser-only state (for example running ->
   // awaiting_input after a 422) even when the durable build itself did not
@@ -872,10 +919,29 @@ function knowledgeBasePresentationMessage(
   if (!presentation || !approvedKnowledgeBasePresentationMatches(observation)) {
     return null;
   }
-  const inlineImages = (presentation.resources ?? [])
+  // A cached observation from the previous response contract may still carry
+  // `filename` and the coordinate-bearing legacy URL for one rollout cycle.
+  // New server projections always carry `caption` and an opaque URL; in that
+  // shape filename is never consulted or copied into alt text.
+  type CompatibleApprovedResource = Omit<
+    KnowledgeBaseApprovedResourceDto,
+    "kind" | "caption"
+  > & {
+    kind: KnowledgeBaseApprovedResourceDto["kind"] | "working_set_evidence";
+    caption?: string;
+    filename?: string;
+  };
+  const resources = (presentation.resources ??
+    []) as CompatibleApprovedResource[];
+  const resourceCaption = (resource: CompatibleApprovedResource) => {
+    const caption = customerSafeKnowledgeAssetLabel(resource.caption);
+    if (caption) return caption;
+    return resource.kind === "logo" ? "企业官方主 Logo" : "知识库配图";
+  };
+  const inlineImages = resources
     .map((resource) => ({
       src: resource.sameOriginUrl,
-      alt: resource.filename,
+      alt: resourceCaption(resource),
       mimeType: resource.mimeType,
       kind: resource.kind,
     }))
@@ -886,7 +952,7 @@ function knowledgeBasePresentationMessage(
           /image|logo/i.test(resource.kind)),
     )
     .map(({ src, alt }) => ({ src, alt }));
-  const evidenceFiles = (presentation.resources ?? [])
+  const evidenceFiles = resources
     .filter(
       (resource) =>
         resource.kind === "working_set_evidence" &&
@@ -894,7 +960,10 @@ function knowledgeBasePresentationMessage(
     )
     .map((resource) => ({
       fileUrl: resource.sameOriginUrl,
-      fileName: resource.filename,
+      fileName: customerSafeKnowledgeFilename(
+        resource.filename,
+        "知识库参考资料.txt",
+      ),
       mimeType: resource.mimeType,
     }));
 
@@ -1133,19 +1202,29 @@ export function applyKnowledgeBaseObservation(
       .map((message) => message.id),
   );
 
-  const rawNotice = observation.notice;
+  const serverAwaitsBrowserAttachments =
+    observation.activeTurn?.awaitingClientAttachments ??
+    observation.activeTurn?.requiresAttachmentReselection ??
+    false;
+  const legacyDeferredUploadNoticeCodes = new Set([
+    "KNOWLEDGE_BASE_START_INCOMPLETE",
+    "KNOWLEDGE_BASE_REVISION_UPLOAD_INCOMPLETE",
+    "KNOWLEDGE_BASE_ATTACHMENTS_REQUIRED",
+  ]);
+  // Old servers synthesized reset-required notices from a normal reserve ->
+  // stage window. The current-page File attempt owns that distinction; an
+  // active awaiting turn is neutral upload progress, never a server terminal.
+  const rawNotice =
+    serverAwaitsBrowserAttachments &&
+    observation.notice?.code &&
+    legacyDeferredUploadNoticeCodes.has(observation.notice.code)
+      ? null
+      : observation.notice;
   const noticeKey = rawNotice?.key;
   const noticeCode =
     typeof rawNotice?.code === "string" &&
     /^[A-Z0-9_:-]{1,128}$/u.test(rawNotice.code)
       ? rawNotice.code
-      : undefined;
-  const noticeTraceId =
-    typeof rawNotice?.traceId === "string" &&
-    /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
-      rawNotice.traceId,
-    )
-      ? rawNotice.traceId
       : undefined;
   const noticeAttachmentCount = Number(rawNotice?.attachmentCount);
   const noticeRecoveryToken =
@@ -1169,7 +1248,6 @@ export function applyKnowledgeBaseObservation(
           // Missing means an old server, never implicit permission to create
           // another paid model task.
           canRegenerate: rawNotice.canRegenerate === true,
-          ...(noticeTraceId ? { traceId: noticeTraceId } : {}),
           ...(Number.isSafeInteger(noticeAttachmentCount) &&
           noticeAttachmentCount >= 0 &&
           noticeAttachmentCount <= 1_000
@@ -1214,6 +1292,17 @@ export function applyKnowledgeBaseObservation(
       publicationState: observation.publicationState,
       activeTurnId,
       activeClientRequestId,
+      activeTurnUpdatedAt: observation.activeTurn?.updatedAt,
+      activeTurnMessageSequence: observation.activeTurn?.messageSequence,
+      activeTurnResetRevision: observation.activeTurn?.resetRevision,
+      activeTurnAwaitingClientAttachments:
+        observation.activeTurn?.awaitingClientAttachments ??
+        observation.activeTurn?.requiresAttachmentReselection ??
+        false,
+      activeTurnStagedAttachmentCount:
+        observation.activeTurn?.stagedAttachmentCount ?? 0,
+      activeTurnExpectedAttachmentCount:
+        observation.activeTurn?.expectedAttachmentCount ?? 0,
       presentationTurnId:
         observation.approvedPresentation?.turnId ??
         conversation.knowledgeBase?.presentationTurnId ??
@@ -1828,6 +1917,9 @@ interface ConversationContextType {
   updateTitle: (conversationId: string, title: string) => void;
   deleteConversation: (id: string) => void;
   discardConversationLocally: (id: string) => void;
+  discardKnowledgeBaseConversationsLocally: (
+    primaryConversationId?: string,
+  ) => string[];
   deleteMessage: (conversationId: string, messageId: string) => void;
   refreshConversations: () => Promise<void>;
   /** Re-read cloud history after an authoritative reset/local discard. */
@@ -1903,7 +1995,7 @@ export function ConversationProvider({
             ? { projectAssignmentId: projectAssignmentIdRef.current }
             : {}),
         }),
-      onError: (error) => setSyncError(getErrorMessage(error)),
+      onError: (error) => setSyncError(conversationSyncErrorMessage(error)),
       onSuccess: () => setSyncError(null),
       shouldRetry: (error) => {
         const code = getTrpcErrorCode(error);
@@ -2218,7 +2310,7 @@ export function ConversationProvider({
           accountIdRef.current === expectedUserId &&
           hydrationGenerationRef.current === generation
         ) {
-          setSyncError(getErrorMessage(error));
+          setSyncError(conversationSyncErrorMessage(error));
           if (initial) setHydrated(false);
         }
       } finally {
@@ -2449,6 +2541,37 @@ export function ConversationProvider({
     [replaceState],
   );
 
+  const discardKnowledgeBaseConversationsLocally = useCallback(
+    (primaryConversationId?: string) => {
+      hydrationGenerationRef.current += 1;
+      const conversationIds = new Set(knowledgeBaseConversationIdsRef.current);
+      if (primaryConversationId) conversationIds.add(primaryConversationId);
+      for (const conversation of stateRef.current.conversations) {
+        if (
+          conversation.title === "企业知识库构建" ||
+          conversation.knowledgeBase?.initialized ||
+          hasServerOwnedKnowledgeBaseMessages(conversation)
+        ) {
+          conversationIds.add(conversation.id);
+        }
+      }
+      knowledgeBaseCoordinatorRef.current?.reset();
+      knowledgeBaseConversationIdsRef.current.clear();
+      let nextState = stateRef.current;
+      for (const conversationId of conversationIds) {
+        locallyDiscardedConversationIdsRef.current.add(conversationId);
+        syncQueueRef.current?.cancel(conversationId);
+        nextState = conversationReducer(nextState, {
+          type: "DISCARD_CONVERSATION_LOCALLY",
+          payload: conversationId,
+        });
+      }
+      replaceState(nextState);
+      return [...conversationIds];
+    },
+    [replaceState],
+  );
+
   const deleteMessage = useCallback(
     (conversationId: string, messageId: string) => {
       commit(
@@ -2541,6 +2664,7 @@ export function ConversationProvider({
         updateTitle,
         deleteConversation,
         discardConversationLocally,
+        discardKnowledgeBaseConversationsLocally,
         deleteMessage,
         refreshConversations,
         refreshConversationsAfterDiscard,

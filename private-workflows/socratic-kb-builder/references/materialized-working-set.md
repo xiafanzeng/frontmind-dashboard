@@ -20,7 +20,55 @@ Extra top-level fields are forbidden.
   },
   "treePolicyVersion": 2,
   "company": { "name": "Example", "website": "https://example.com" },
-  "researchCoverage": {},
+  "researchCoverage": {
+    "officialPages": {
+      "discovered": 18,
+      "attempted": 16,
+      "succeeded": 14,
+      "failed": 2
+    },
+    "publicQueries": 6,
+    "officialDocuments": 4,
+    "uploadsRead": 2,
+    "sourceCount": 1,
+    "productFamilies": [
+      { "id": "primary-service", "name": "核心服务", "leafIds": ["1.1"] }
+    ],
+    "dimensions": [
+      { "id": "enterprise_identity", "status": "covered", "leafIds": ["1.1"] },
+      {
+        "id": "team_and_organization",
+        "status": "covered",
+        "leafIds": ["1.1"]
+      },
+      {
+        "id": "products_and_services",
+        "status": "covered",
+        "leafIds": ["1.1"]
+      },
+      {
+        "id": "capabilities_and_delivery",
+        "status": "covered",
+        "leafIds": ["1.1"]
+      },
+      {
+        "id": "industries_scenarios_and_cases",
+        "status": "covered",
+        "leafIds": ["1.1"]
+      },
+      {
+        "id": "differentiation_and_evidence",
+        "status": "covered",
+        "leafIds": ["1.1"]
+      },
+      {
+        "id": "cooperation_delivery_and_support",
+        "status": "covered",
+        "leafIds": ["1.1"]
+      }
+    ],
+    "stopReason": "coverage_complete"
+  },
   "branches": [{ "branchId": "identity", "title": "企业身份", "ordinal": 0 }],
   "evidenceLedger": [
     {
@@ -54,9 +102,17 @@ Requirements:
 
 - `operationId`, `buildId`, `generation`, Skill coordinates and company
   identity equal the application instructions exactly.
+- `skill.contentHash` is copied byte-for-byte from the application's frozen
+  `skillContentHash`. It is a logical content hash, not the attached Skill
+  ZIP's physical SHA-256; never calculate or infer it.
 - `contentVersion` is `1` for an initial bundle.
 - Branch ordinals and leaf ordinals are contiguous from zero.
 - Leaf count is 30–115; every leaf has a non-empty declared body.
+- Every node is UTF-8 customer-visible Markdown in `nodes/*.md` with exactly
+  one first-level heading `# {leaf.title}` and a non-empty body. The heading
+  must equal the bound manifest leaf title. Formal markers, `## 资料元数据`,
+  `## 证据与核验说明`, evidence appendices and internal metadata keys are
+  forbidden.
 - Every `branchId` resolves and `branchTitle` equals the branch title.
 - Every content/evidence/asset path is safe, unique and present.
 - Every declared SHA-256 equals the exact uncompressed file bytes.
@@ -66,6 +122,31 @@ Requirements:
 - `logo.status` is `available` only when `assetId` resolves to the sole valid
   official Logo; otherwise it is `missing` and `assetId` is null.
 - No ZIP entry may be undeclared except `BUNDLE.json`.
+
+`researchCoverage` uses exactly the shape above:
+
+- `officialPages.discovered` is 0–10,000; `attempted` and `failed` are 0–200;
+  `succeeded` is 0–120. `attempted <= discovered` and
+  `succeeded + failed == attempted`.
+- `publicQueries` is 6–30, `officialDocuments` is 0–30,
+  `uploadsRead` is 0–100, and `sourceCount` is 1–2,000.
+- `uploadsRead` equals the application-provided `--expected-uploads-read`.
+  Count only real customer uploads, never the Skill, instructions, prefill or
+  another application attachment.
+- `sourceCount` equals the retained `evidenceLedger` row count.
+- `productFamilies` contains 1–115 unique IDs. Every family has exactly
+  `id/name/leafIds`; each `leafIds` array contains 1–115 unique IDs that resolve
+  to real manifest leaves.
+- `dimensions` contains each of the seven IDs shown above exactly once. Every
+  item has exactly `id/status/leafIds`, `status` is `covered` or `gap`, and its
+  non-empty unique leaf IDs resolve to real manifest leaves.
+- `stopReason` is `coverage_complete`, `source_limited` or `budget_reached`.
+  `coverage_complete` requires at least 12 successful official pages and no
+  `limitationReason`. `source_limited` requires an exhausted discovered page
+  queue and a specific 8–2,000-character `limitationReason`. `budget_reached`
+  requires at least 12 successful pages, a specific limitation, and at least
+  one reached cap: 120 successful pages, 200 attempted pages, 30 public
+  queries, or 30 official documents.
 
 Asset entries use:
 
@@ -83,11 +164,30 @@ Asset entries use:
     "sourcePageUrl": "https://example.com/",
     "sourceAssetUrl": "https://example.com/logo.png"
   },
-  "documentIds": ["1.1"]
+  "documentIds": ["1.1"],
+  "assetType": "brand_identity",
+  "displayRole": "badge",
+  "caption": "企业官方主 Logo"
 }
 ```
 
 `documentIds` and leaf `assetIds` are bidirectional.
+
+The optional presentation fields share one vocabulary across the Skill,
+portable Python validator and Dashboard TypeScript validator:
+
+- `assetType`: `brand_identity`, `product_ui`, `product_diagram`,
+  `case_photo`, `team_photo`, `environment_photo`, `certificate_badge`,
+  `document_figure`, `customer_supplied`, or `other`.
+- `displayRole`: `hero`, `inline`, or `badge`.
+- `caption`: a short human label, never an imported path or upload filename.
+
+An official Logo is always `brand_identity/badge`. An exact Dashboard-frozen
+customer upload is always `customer_supplied/inline`; its source kind,
+ownership, internal asset ID, canonical path and upload proof are derived by
+Dashboard from the frozen bytes, not trusted from Provider-authored fields.
+Unknown presentation values or additional presentation fields are omitted by
+the canonicalizer and do not invalidate otherwise safe content.
 
 ## Leaf patch
 
@@ -119,6 +219,9 @@ Requirements:
 
 - All base and target coordinates equal the operation instructions.
 - The replacement body is non-empty and its hash matches.
+- The replacement body is customer-visible UTF-8 Markdown with one non-empty
+  first-level title and a non-empty body. Formal markers, metadata/evidence
+  headings, evidence appendices and internal metadata keys are forbidden.
 - Added evidence stays under `evidence/<targetLeafId>/`.
 - Added assets name only `targetLeafId` in `documentIds`.
 - Removed evidence paths and asset IDs already belong to the target leaf.
@@ -126,5 +229,32 @@ Requirements:
   progress state or confirmation state.
 - No ZIP entry may be undeclared except `PATCH.json`.
 
+`PATCH.json` may be ordinary UTF-8 JSON (with an optional UTF-8 BOM), exactly
+one otherwise-empty `json` Markdown fence, or JSON serialized as a string
+exactly once. Explanatory prose, nested fences, duplicate object keys, multiple
+JSON values and a second string unwrap are invalid.
+
+Dashboard applies Patch results by component after the ZIP safety and frozen
+coordinate checks pass:
+
+- invalid or empty replacement Markdown keeps the previous clean body;
+- one invalid optional evidence item or non-frozen image is dropped without
+  dropping valid siblings;
+- a safe new image/evidence/remove still creates a new content version even if
+  the body text is unchanged;
+- no valid content/evidence/asset delta completes as `no_effective_change`;
+- ZIP/path/symlink/compression safety, operation/build/generation/base/leaf
+  coordinates, CAS/removal ownership, duplicate asset identities, and any
+  Dashboard-frozen upload SHA/byte/MIME mismatch remain hard failures.
+
+The canonical `PATCH.json` is rebuilt from the canonical DTO. Raw extra fields,
+original upload filenames, Provider URLs and untrusted provenance are never
+copied into the activated Working Set.
+
 Dashboard assembles a new immutable working set and independently validates the
 whole result. Never emit the assembled result in a revision task.
+
+Always run `scripts/validate_working_set.py` with the complete named
+`--expected-*` flags printed in the operation instructions. Initial validation
+must include `--expected-uploads-read`; a structural-only validation without
+frozen coordinates is invalid.

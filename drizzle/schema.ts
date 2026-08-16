@@ -156,9 +156,9 @@ export const apiCredentials = mysqlTable(
     encryptionAuthTag: varchar("encryptionAuthTag", { length: 32 }).notNull(),
     fingerprint: varchar("fingerprint", { length: 32 }).notNull(),
     /**
-     * Nullable only for rows created before migration 0062. Every new
-     * credential write supplies an explicit profile; readers normalize a
-     * legacy NULL to frontmind-pro.
+     * Customer credentials freeze Base/Pro here. Delivery-administrator and
+     * engineer Keys intentionally store NULL because their general Agent
+     * freezes Lite/Base/Pro per task instead of per credential version.
      */
     agentProfile: varchar("agent_profile", { length: 32 }),
     status: mysqlEnum("status", ["active", "retired", "deleted"])
@@ -291,6 +291,22 @@ export const agentOperations = mysqlTable(
       )`,
     ),
   ],
+);
+
+/**
+ * Immutable Website project attribution supplied by the trusted Website
+ * invitation flow. It intentionally stays separate from the usage ledger so
+ * task credit facts remain provider-derived and append-only.
+ */
+export const websiteProjectAttributions = mysqlTable(
+  "website_project_attributions",
+  {
+    projectId: varchar("project_id", { length: 80 }).primaryKey(),
+    businessOwnerName: varchar("business_owner_name", {
+      length: 40,
+    }).notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
 );
 
 export const agentTasks = mysqlTable(

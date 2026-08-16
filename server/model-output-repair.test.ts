@@ -7,6 +7,7 @@ import {
 
 import {
   DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS,
+  MAX_MODEL_OUTPUT_REPAIR_CHARACTERS,
   ModelOutputRepairError,
   configuredModelOutputRepairMode,
   parseExactJson,
@@ -137,6 +138,27 @@ describe("compatibility-first model output repair", () => {
       }),
     ).toThrow(originalError);
     expect(repairParse).not.toHaveBeenCalled();
+  });
+
+  it("allows a caller to raise the bounded repair limit to two MiB", () => {
+    const raw = `{"body":"${"x".repeat(
+      DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS,
+    )}",}`;
+    expect(() => repairStructuredJsonCandidate(raw)).toThrow();
+    expect(
+      repairStructuredJsonCandidate(raw, {
+        maxCharacters: MAX_MODEL_OUTPUT_REPAIR_CHARACTERS,
+      }).value,
+    ).toEqual({ body: "x".repeat(DEFAULT_MODEL_OUTPUT_REPAIR_MAX_CHARACTERS) });
+    expect(() =>
+      repairStructuredJsonCandidate("{}", {
+        maxCharacters: MAX_MODEL_OUTPUT_REPAIR_CHARACTERS + 1,
+      }),
+    ).toThrowError(
+      expect.objectContaining<ModelOutputRepairError>({
+        code: "UNSAFE_POLICY",
+      }),
+    );
   });
 
   it("requires the adapter-specific active mode before accepting recovery", () => {

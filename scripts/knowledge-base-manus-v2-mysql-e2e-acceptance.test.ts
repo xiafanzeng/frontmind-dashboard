@@ -144,6 +144,15 @@ const PROVIDER_BASE_URL = "https://fake.manus-v2.frontmind.test";
 const PROVIDER_UPLOAD_ORIGIN = "https://upload.manus-v2.frontmind.test";
 const PROVIDER_DOWNLOAD_ORIGIN = "https://download.manus-v2.frontmind.test";
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
+const RESEARCH_DIMENSION_IDS = [
+  "enterprise_identity",
+  "team_and_organization",
+  "products_and_services",
+  "capabilities_and_delivery",
+  "industries_scenarios_and_cases",
+  "differentiation_and_evidence",
+  "cooperation_delivery_and_support",
+] as const;
 
 type AcceptanceTarget = { url: string; databaseName: string };
 
@@ -267,6 +276,9 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
     companyName: promptValue(prompt, "company.name"),
     companyWebsite: promptValue(prompt, "company.website"),
   };
+  expect(JSON.parse(promptValue(prompt, "researchWebsites"))).toEqual([
+    SYNTHETIC_WEBSITE,
+  ]);
   expect(coordinates).toMatchObject({ generation: 1, contentVersion: 1 });
   const zip = new JSZip();
   const logoBytes = await sharp({
@@ -321,7 +333,31 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
           ? null
           : coordinates.companyWebsite,
     },
-    researchCoverage: { acceptance: "synthetic-only" },
+    researchCoverage: {
+      officialPages: {
+        discovered: 12,
+        attempted: 12,
+        succeeded: 12,
+        failed: 0,
+      },
+      publicQueries: 6,
+      officialDocuments: 0,
+      uploadsRead: 0,
+      sourceCount: 12,
+      productFamilies: [
+        {
+          id: "synthetic-product",
+          name: "合成产品代号 A",
+          leafIds: leaves.map((leaf) => leaf.leafId),
+        },
+      ],
+      dimensions: RESEARCH_DIMENSION_IDS.map((id, index) => ({
+        id,
+        status: "covered",
+        leafIds: [leaves[index]!.leafId],
+      })),
+      stopReason: "coverage_complete",
+    },
     branches: [
       { branchId: "synthetic-products", title: "合成产品", ordinal: 0 },
     ],
@@ -560,7 +596,7 @@ function createFakeManusV2Provider(input: {
       expect(state.taskCreateBodies).toHaveLength(1);
       expect(body).toMatchObject({
         interactive_mode: false,
-        hide_in_task_list: true,
+        hide_in_task_list: false,
         share_visibility: "private",
         locale: "zh-CN",
       });
@@ -886,6 +922,9 @@ mysqlDescribe(
       const { default: artifactRouter } = await import(
         "../server/knowledge-base-artifact-api"
       );
+      const { default: dashboardRouter } = await import(
+        "../server/dashboard-api"
+      );
       const { requireExpressAuth } = await import(
         "../server/_core/express-auth"
       );
@@ -901,6 +940,7 @@ mysqlDescribe(
         requireExpressAuth,
         knowledgeBaseRouter,
       );
+      dashboard.use("/api/dashboard", dashboardRouter);
       const listener = await listen(dashboard);
       dashboardServer = listener.server;
       dashboardBaseUrl = listener.baseUrl;
@@ -1055,6 +1095,21 @@ mysqlDescribe(
       });
       expect(build.activeWorkingSetId).toEqual(expect.any(String));
       expect(build.logoSha256).toMatch(/^[a-f0-9]{64}$/u);
+      expect(build.initialResearchCoverage).toEqual(
+        expect.objectContaining({
+          officialPages: expect.objectContaining({ succeeded: 12 }),
+          publicQueries: 6,
+          uploadsRead: 0,
+          stopReason: "coverage_complete",
+        }),
+      );
+      expect(build.handoffProvenance).toMatchObject({
+        materializedQuality: {
+          completeness: "complete",
+          downstreamEligible: true,
+          publishable: true,
+        },
+      });
 
       const workingSets = await executor
         .select()
@@ -1319,6 +1374,43 @@ mysqlDescribe(
       expect(fakeProvider.rejectedCallCount).toBe(0);
       expect(fakeProvider.taskCreateBodies).toHaveLength(1);
       expect(fakeProvider.taskSendBodies).toHaveLength(0);
+
+      const publishResponse = await fetch(
+        `${dashboardBaseUrl}/api/dashboard/knowledge/publish`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({ conversationId: publicConversationId }),
+        },
+      );
+      const publication = (await publishResponse.json()) as any;
+      expect(publishResponse.status).toBe(200);
+      expect(publication.snapshot).toMatchObject({
+        sourceBuildId: build.id,
+        sourceBuildRevision: MATERIALIZED_LEAF_COUNT,
+        sourceArtifactHash: sha256(packageBytes),
+        archiveHash: sha256(packageBytes),
+        archiveAvailable: true,
+      });
+      const publishedBuild = (
+        await executor
+          .select()
+          .from(knowledgeBaseBuilds)
+          .where(eq(knowledgeBaseBuilds.id, build.id))
+          .limit(1)
+      )[0]!;
+      expect(publishedBuild).toMatchObject({
+        status: "published",
+        publishedSnapshotId: publication.snapshot.id,
+        initialResearchCoverage: expect.objectContaining({
+          publicQueries: 6,
+          uploadsRead: 0,
+          stopReason: "coverage_complete",
+        }),
+      });
 
       acceptancePassed = true;
     }, 300_000);

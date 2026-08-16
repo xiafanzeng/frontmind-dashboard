@@ -9,6 +9,7 @@ import {
   artifacts,
   localAssets,
   providerFileLeases,
+  websiteProjectAttributions,
 } from "../drizzle/schema";
 import { getDb } from "./db";
 import type {
@@ -29,6 +30,58 @@ export async function assertActiveWebsiteProject(projectId: string) {
   const db = await requireDb();
   await db.transaction(async (tx) => {
     await lockActiveWebsiteProjectLifecycle(tx, projectId);
+  });
+}
+
+export type WebsiteProjectBusinessOwnerBinding =
+  | { state: "bound" | "existing"; businessOwnerName: string }
+  | { state: "missing" | "conflict" };
+
+export function resolveWebsiteProjectBusinessOwnerBinding(
+  current: string | null,
+  requested: string | null,
+): WebsiteProjectBusinessOwnerBinding {
+  if (current) {
+    if (requested === null || requested === current) {
+      return { state: "existing", businessOwnerName: current };
+    }
+    return { state: "conflict" };
+  }
+  return requested === null
+    ? { state: "missing" }
+    : { state: "bound", businessOwnerName: requested };
+}
+
+/**
+ * Binds the invitation-verified business owner before any Provider work.
+ * The lifecycle row is the project-wide mutex, so two initial requests cannot
+ * race an insert and silently relabel the same project.
+ */
+export async function bindWebsiteProjectBusinessOwner(input: {
+  projectId: string;
+  businessOwnerName: string | null;
+}): Promise<WebsiteProjectBusinessOwnerBinding> {
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    await lockActiveWebsiteProjectLifecycle(tx, input.projectId);
+    const existing = await tx
+      .select({
+        businessOwnerName: websiteProjectAttributions.businessOwnerName,
+      })
+      .from(websiteProjectAttributions)
+      .where(eq(websiteProjectAttributions.projectId, input.projectId))
+      .limit(1)
+      .for("update");
+    const decision = resolveWebsiteProjectBusinessOwnerBinding(
+      existing[0]?.businessOwnerName ?? null,
+      input.businessOwnerName,
+    );
+    if (decision.state !== "bound") return decision;
+    await tx.insert(websiteProjectAttributions).values({
+      projectId: input.projectId,
+      businessOwnerName: decision.businessOwnerName,
+    });
+    return decision;
   });
 }
 

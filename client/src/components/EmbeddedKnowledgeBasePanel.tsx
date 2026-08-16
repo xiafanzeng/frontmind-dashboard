@@ -39,6 +39,7 @@ import {
 } from "@/contexts/ConversationContext";
 import { syncKnowledgeBaseArchiveFromOutput } from "@/lib/knowledge-snapshot";
 import {
+  KNOWLEDGE_BASE_RESET_REQUEST_EVENT,
   isKnowledgeBaseProgressCoordinateOlder,
   readKnowledgeBaseProgressEventDetail,
 } from "@/lib/knowledge-progress";
@@ -58,7 +59,7 @@ function isKnowledgeBaseConversationCandidate(
     conversation &&
       (conversation.knowledgeBase ||
         conversation.title === "企业知识库构建" ||
-        conversation.messages.some((message) => message.knowledgeBase)),
+        conversation.messages?.some((message) => message.knowledgeBase)),
   );
 }
 
@@ -82,19 +83,24 @@ export function shouldDiscardConversationAfterKnowledgeReset(input: {
   hasKnowledge: boolean;
   conversation: Conversation | null;
 }) {
-  const resetCompleted =
-    input.observedRevision === null
-      ? input.revision > 0 && !input.hasKnowledge
-      : input.revision > input.observedRevision;
-  if (!resetCompleted || !input.conversation) return false;
-  const conversation = input.conversation;
+  const resetCompleted = shouldInstallFreshConversationAfterKnowledgeReset({
+    observedRevision: input.observedRevision,
+    revision: input.revision,
+    hasKnowledge: input.hasKnowledge,
+  });
   return Boolean(
-    isKnowledgeBaseConversationCandidate(conversation) &&
-      (conversation.knowledgeBase?.initialized ||
-        conversation.taskId ||
-        conversation.status !== "idle" ||
-        conversation.messages.some((message) => message.knowledgeBase)),
+    resetCompleted && isKnowledgeBaseConversationCandidate(input.conversation),
   );
+}
+
+export function shouldInstallFreshConversationAfterKnowledgeReset(input: {
+  observedRevision: number | null;
+  revision: number;
+  hasKnowledge: boolean;
+}) {
+  return input.observedRevision === null
+    ? input.revision > 0 && !input.hasKnowledge
+    : input.revision > input.observedRevision;
 }
 
 export default function EmbeddedKnowledgeBasePanel({
@@ -141,7 +147,8 @@ export default function EmbeddedKnowledgeBasePanel({
   });
   const {
     activeConversation,
-    discardConversationLocally,
+    hydrated,
+    discardKnowledgeBaseConversationsLocally,
     refreshConversationsAfterDiscard,
   } = useConversation();
   useEffect(() => {
@@ -162,42 +169,37 @@ export default function EmbeddedKnowledgeBasePanel({
   const [observedResetRevision, setObservedResetRevision] = useState<
     number | null
   >(null);
+  const resetNeedsFreshConversation = resetQuery.data
+    ? shouldInstallFreshConversationAfterKnowledgeReset({
+        observedRevision: observedResetRevision,
+        revision: resetQuery.data.revision,
+        hasKnowledge: resetQuery.data.hasKnowledge,
+      })
+    : false;
   useEffect(() => {
     const revision = resetQuery.data?.revision;
-    if (revision === undefined) return;
-    const resetNeedsAcknowledgement =
-      observedResetRevision === null
-        ? revision > 0 && resetQuery.data?.hasKnowledge === false
-        : revision > observedResetRevision;
-    if (
-      resetNeedsAcknowledgement &&
-      !isKnowledgeBaseConversationCandidate(activeConversation)
-    ) {
-      // RealBuildFlow may not have selected its scoped conversation yet. Keep
-      // the reset pending so a stale KB conversation cannot become the baseline.
-      return;
-    }
-    if (
-      shouldDiscardConversationAfterKnowledgeReset({
-        observedRevision: observedResetRevision,
-        revision,
-        hasKnowledge: resetQuery.data?.hasKnowledge === true,
-        conversation: activeConversation,
-      }) &&
-      activeConversation
-    ) {
-      const discardedConversationId = activeConversation.id;
-      discardConversationLocally(discardedConversationId);
-      // Remove both aliases of the old build immediately. Otherwise React
-      // Query can feed the deleted manifest/build back into RealBuildFlow
-      // before the reset-owned refetch completes.
+    if (revision === undefined || !hydrated) return;
+    if (resetNeedsFreshConversation) {
+      const discardedConversationIds = discardKnowledgeBaseConversationsLocally(
+        isKnowledgeBaseConversationCandidate(activeConversation)
+          ? activeConversation?.id
+          : undefined,
+      );
+      // The approved revision is a hard local boundary: cancel every KB sync
+      // lane/coordinator through the context discard, then remove both query
+      // aliases before a single fresh RealBuildFlow is allowed to mount.
+      trpcUtils.workspace.knowledge.setData(undefined, (current) =>
+        current ? { ...current, snapshot: null } : current,
+      );
       trpcUtils.workspace.knowledgeProgress.setData(undefined, () => ({
         progress: null,
       }));
-      trpcUtils.workspace.knowledgeProgress.setData(
-        { conversationId: discardedConversationId },
-        () => ({ progress: null }),
-      );
+      for (const conversationId of discardedConversationIds) {
+        trpcUtils.workspace.knowledgeProgress.setData(
+          { conversationId },
+          () => ({ progress: null }),
+        );
+      }
       void Promise.all([
         knowledgeQuery.refetch(),
         refreshConversationsAfterDiscard(),
@@ -207,9 +209,11 @@ export default function EmbeddedKnowledgeBasePanel({
     setObservedResetRevision(revision);
   }, [
     activeConversation,
-    discardConversationLocally,
+    discardKnowledgeBaseConversationsLocally,
+    hydrated,
     knowledgeQuery,
     observedResetRevision,
+    resetNeedsFreshConversation,
     resetQuery.data?.revision,
     refreshConversationsAfterDiscard,
     trpcUtils,
@@ -392,6 +396,11 @@ export default function EmbeddedKnowledgeBasePanel({
             </p>
           </div>
         </div>
+      ) : resetNeedsFreshConversation ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
+          <Loader2 className="h-5 w-5 animate-spin text-primary" />
+          正在清理旧任务并准备全新知识库…
+        </div>
       ) : (
         <RealBuildFlow
           key={`knowledge-build-${resetQuery.data?.revision ?? 0}`}
@@ -440,12 +449,33 @@ function KnowledgeResetButton({
   const [reasonCode, setReasonCode] =
     useState<(typeof RESET_REASONS)[number][0]>("stuck");
   const [reasonNote, setReasonNote] = useState("");
+  const submittingRef = useRef(false);
   const submitMutation = trpc.workspace.knowledgeReset.submit.useMutation();
+  useEffect(() => {
+    const openResetRequest = () => {
+      if (status.canRequest) {
+        setOpen(true);
+        return;
+      }
+      toast.info(status.unavailableReason || "当前暂时无法提交知识库重置申请");
+    };
+    window.addEventListener(
+      KNOWLEDGE_BASE_RESET_REQUEST_EVENT,
+      openResetRequest,
+    );
+    return () =>
+      window.removeEventListener(
+        KNOWLEDGE_BASE_RESET_REQUEST_EVENT,
+        openResetRequest,
+      );
+  }, [status.canRequest, status.unavailableReason]);
   const submit = async () => {
+    if (submittingRef.current || submitMutation.isPending) return;
     if (reasonCode === "other" && !reasonNote.trim()) {
       toast.warning("请填写补充说明");
       return;
     }
+    submittingRef.current = true;
     try {
       await submitMutation.mutateAsync({
         reasonCode,
@@ -460,6 +490,8 @@ function KnowledgeResetButton({
       toast.error("重置申请提交失败", {
         description: error instanceof Error ? error.message : "请稍后重试",
       });
+    } finally {
+      submittingRef.current = false;
     }
   };
   return (
@@ -762,7 +794,7 @@ function RealBuildFlow({
     hydrated,
     createConversation,
     setActive,
-    discardConversationLocally,
+    discardKnowledgeBaseConversationsLocally,
     refreshConversationsAfterDiscard,
   } = useConversation();
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -833,7 +865,7 @@ function RealBuildFlow({
     if (!conversationId) {
       const nextConversationId = createConversation({
         title: "企业知识库构建",
-        reuseEmpty: true,
+        reuseEmpty: false,
       });
       setConversationId(nextConversationId);
     }
@@ -882,18 +914,16 @@ function RealBuildFlow({
       trpcUtils.workspace.knowledgeProgress.setData(undefined, () => ({
         progress: null,
       }));
-      trpcUtils.workspace.knowledgeProgress.setData(
-        { conversationId: cancelledConversationId },
-        () => ({ progress: null }),
+      const discardedConversationIds = discardKnowledgeBaseConversationsLocally(
+        cancelledConversationId,
       );
+      for (const conversationId of discardedConversationIds) {
+        trpcUtils.workspace.knowledgeProgress.setData(
+          { conversationId },
+          () => ({ progress: null }),
+        );
+      }
       setLiveProgress(null);
-      discardConversationLocally(cancelledConversationId);
-      const nextConversationId = createConversation({
-        title: "企业知识库构建",
-        reuseEmpty: false,
-      });
-      setConversationId(nextConversationId);
-      setActive(nextConversationId);
       void Promise.all([
         refreshConversationsAfterDiscard(),
         trpcUtils.workspace.knowledgeReset.status.invalidate(),
@@ -901,10 +931,8 @@ function RealBuildFlow({
       ]);
     },
     [
-      createConversation,
-      discardConversationLocally,
+      discardKnowledgeBaseConversationsLocally,
       refreshConversationsAfterDiscard,
-      setActive,
       trpcUtils,
     ],
   );

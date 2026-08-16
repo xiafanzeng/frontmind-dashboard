@@ -4,7 +4,8 @@
     "local-assets",
     "typed-results",
     "local-artifacts",
-    "safe-events"
+    "safe-events",
+    "project-business-owner"
   ],
   "contractHashes": {
     "website.question-recommendation": "c2410c0b93f1c67e589e716e254bf9ce6e3f4ec9bb845b99e5f85706315dabb4",

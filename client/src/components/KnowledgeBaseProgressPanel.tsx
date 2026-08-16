@@ -11,11 +11,14 @@ import {
   Waypoints,
 } from "lucide-react";
 
+import MarkdownRenderer from "@/components/MarkdownRenderer";
+
 import type {
   KnowledgeBaseLeafStatus,
   KnowledgeBaseProgressBranchDto,
   KnowledgeBaseProgressDto,
 } from "@shared/knowledge-base-progress";
+import { KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE } from "@shared/knowledge-base-progress";
 
 export type { KnowledgeBaseProgressDto };
 
@@ -151,6 +154,10 @@ export default function KnowledgeBaseProgressPanel({
   const contentCompleted =
     progress.build.status === "ready_to_publish" ||
     progress.build.status === "published";
+  const partialResult = progress.resultQuality?.completeness === "partial";
+  const coverageIncomplete = progress.resultQuality?.warnings?.some(
+    (warning) => warning.code === "COVERAGE_INCOMPLETE",
+  );
   const buildStopped =
     progress.build.status === "failed" ||
     progress.build.status === "protocol_error";
@@ -159,6 +166,11 @@ export default function KnowledgeBaseProgressPanel({
     progress.build.awaitingResponseSince != null &&
     (progress.build.status === "researching" ||
       progress.build.status === "confirming");
+  const stoppedMessage =
+    progress.build.protocolError ===
+    KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
+      ? KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
+      : "系统不会自动重发。已完成内容不受影响。";
   const currentLeaf = progress.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === progress.build.currentLeafId);
@@ -237,14 +249,36 @@ export default function KnowledgeBaseProgressPanel({
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <strong className="block">
-              {buildStopped
-                ? "本轮已停止"
-                : "FrontMind 正在处理当前操作"}
+              {buildStopped ? "本轮已停止" : "FrontMind 正在处理当前操作"}
             </strong>
             <span>
-              {buildStopped
-                ? "系统不会自动重发。已完成内容不受影响。"
-                : "请稍候，已完成内容不受影响。"}
+              {buildStopped ? stoppedMessage : "请稍候，已完成内容不受影响。"}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {partialResult && (
+        <div
+          className="mx-5 mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-900 sm:mx-6"
+          data-testid="knowledge-result-quality-partial"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <strong className="block">
+              {coverageIncomplete
+                ? "研究覆盖信息不完整，节点仍可查看"
+                : "内容不完整，可安全查看"}
+            </strong>
+            <span>
+              {coverageIncomplete ? (
+                "节点内容已保留，但研究覆盖信息不完整，暂不能确认、修订、打包或发布；请申请重置后重新生成。"
+              ) : (
+                <>
+                  当前保留 {progress.resultQuality?.stats?.acceptedCount ?? total}{" "}
+                  个安全节点，但未达到完整发布条件。确认、修订、打包和发布均已锁定；请批准重置后重新上传资料并创建全新任务。
+                </>
+              )}
             </span>
           </div>
         </div>
@@ -291,11 +325,13 @@ export default function KnowledgeBaseProgressPanel({
         <span>
           {progress.packageAllowed
             ? "知识库内容与下载包均已完成，可以直接更新。"
-            : progress.packageState === "attention_required"
-              ? "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响。"
-              : contentCompleted
-                ? "知识库内容已完成，下载包正在后台准备；已完成正文不会回退。"
-                : "知识库必须逐项走完；“企业已确认”和“直接预填”都会计入已处理，但只有企业明确确认的节点显示对号。"}
+            : partialResult
+              ? "当前安全内容已保留并可查看，但不驱动后续操作或发布。"
+              : progress.packageState === "attention_required"
+                ? "知识库内容已完成，下载包暂时无法生成；已完成正文不受影响。"
+                : contentCompleted
+                  ? "知识库内容已完成，下载包正在后台准备；已完成正文不会回退。"
+                  : "知识库必须逐项走完；“企业已确认”和“直接预填”都会计入已处理，但只有企业明确确认的节点显示对号。"}
         </span>
       </footer>
     </section>
@@ -388,23 +424,50 @@ function BranchProgress({
         <ol className="grid gap-2">
           {[...branch.leaves]
             .sort((a, b) => a.ordinal - b.ordinal)
-            .map((leaf) => (
-              <li
-                key={leaf.id}
-                data-leaf-status={leaf.status}
-                className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 ${leafStatusClassNames[leaf.status]}`}
-              >
-                <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-white/75">
-                  <LeafStatusIcon status={leaf.status} />
-                </span>
-                <span className="min-w-0 flex-1 text-xs font-semibold leading-5">
-                  {leaf.title}
-                </span>
-                <span className="shrink-0 text-xs font-bold">
-                  {leafStatusLabels[leaf.status]}
-                </span>
-              </li>
-            ))}
+            .map((leaf) => {
+              const summary = (
+                <>
+                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-white/75">
+                    <LeafStatusIcon status={leaf.status} />
+                  </span>
+                  <span className="min-w-0 flex-1 text-xs font-semibold leading-5">
+                    {leaf.title}
+                  </span>
+                  <span className="shrink-0 text-xs font-bold">
+                    {leaf.contentMarkdown
+                      ? "查看内容"
+                      : leafStatusLabels[leaf.status]}
+                  </span>
+                </>
+              );
+              return (
+                <li key={leaf.id} data-leaf-status={leaf.status}>
+                  {leaf.contentMarkdown ? (
+                    <details
+                      className={`group/leaf overflow-hidden rounded-xl border ${leafStatusClassNames[leaf.status]}`}
+                      data-testid="partial-knowledge-leaf"
+                    >
+                      <summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-2.5 marker:hidden">
+                        {summary}
+                        <ChevronRight className="h-4 w-4 shrink-0 transition-transform group-open/leaf:rotate-90" />
+                      </summary>
+                      <div className="border-t border-current/10 bg-white px-4 py-4 text-[#261d32]">
+                        <MarkdownRenderer
+                          content={leaf.contentMarkdown}
+                          className="prose prose-sm max-w-none"
+                        />
+                      </div>
+                    </details>
+                  ) : (
+                    <div
+                      className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 ${leafStatusClassNames[leaf.status]}`}
+                    >
+                      {summary}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
         </ol>
       </div>
     </details>

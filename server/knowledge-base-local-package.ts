@@ -28,6 +28,7 @@ import {
 } from "./knowledge-base-package-validation";
 import { readValidatedActiveKnowledgeBaseWorkingSet } from "./knowledge-base-materialized-assets";
 import type { ValidatedKnowledgeBaseWorkingSet } from "./knowledge-base-materialized-contract";
+import { isMaterializedBuildPublishable } from "./knowledge-base-materialized-quality";
 import { knowledgeBasePackageWriterTaskId } from "./knowledge-base-publication-binding";
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
@@ -87,7 +88,13 @@ const packageWorkingSetAssetSchema = z
     path: z.string().min(1).max(2_048),
     sourcePath: z.string().min(1).max(1_024),
     filename: z.string().min(1).max(512),
-    mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+    mimeType: z.enum([
+      "image/png",
+      "image/jpeg",
+      "image/webp",
+      "image/avif",
+      "image/gif",
+    ]),
     sha256: z.string().regex(/^[a-f0-9]{64}$/u),
     bytes: z.number().int().positive(),
     width: z.number().int().positive(),
@@ -788,8 +795,6 @@ export async function readDashboardOwnedKnowledgePackage(input: {
             sha256: metadata.sha256,
             width: metadata.width,
             height: metadata.height,
-            caption: metadata.filename,
-            alt: metadata.filename,
             documentIds: metadata.documentIds,
             sourceDocumentPath: metadata.sourcePath,
             sourceKind: "official_document",
@@ -811,12 +816,12 @@ export async function readDashboardOwnedKnowledgePackage(input: {
     workingSetAssets.some(
       (asset) =>
         JSON.stringify([...asset.documentIds].sort()) !==
-          JSON.stringify(
-            manifest.documents
-              .filter((document) => document.assetIds.includes(asset.id))
-              .map((document) => document.id)
-              .sort(),
-          ),
+        JSON.stringify(
+          manifest.documents
+            .filter((document) => document.assetIds.includes(asset.id))
+            .map((document) => document.id)
+            .sort(),
+        ),
     )
   ) {
     throw new Error("LOCAL_PACKAGE_ASSET_BINDING_MISMATCH");
@@ -848,7 +853,9 @@ export function nextKnowledgeBasePackageFailure(input: {
   errorCode: string;
 }) {
   const packageAttemptCount = input.packageAttemptCount + 1;
-  const terminal = packageAttemptCount >= MAX_AUTOMATIC_PACKAGE_ATTEMPTS;
+  const terminal =
+    input.errorCode === "MATERIALIZED_BUILD_NOT_PUBLISHABLE" ||
+    packageAttemptCount >= MAX_AUTOMATIC_PACKAGE_ATTEMPTS;
   return {
     packageStatus: terminal
       ? ("attention_required" as const)
@@ -907,6 +914,14 @@ export async function runKnowledgeBasePackageSweep(limit = 8) {
       .where(eq(knowledgeBaseBuildNodes.buildId, candidate.id))
       .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
     try {
+      if (
+        candidate.executionMode === "materialized_bundle_v1" &&
+        !isMaterializedBuildPublishable(candidate, {
+          knownLeafIds: nodes.map((node) => node.leafId),
+        })
+      ) {
+        throw new Error("MATERIALIZED_BUILD_NOT_PUBLISHABLE");
+      }
       const materializedWorkingSet =
         candidate.executionMode === "materialized_bundle_v1"
           ? (

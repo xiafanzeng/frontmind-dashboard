@@ -697,10 +697,29 @@ describe("knowledge-base observation consistency", () => {
       resources: [
         {
           kind: "logo",
-          filename: "official-logo.png",
+          caption: "企业官方主 Logo",
         },
       ],
     });
+    expect(
+      JSON.stringify(observation?.approvedPresentation?.resources),
+    ).not.toContain("official-logo.png");
+    expect(
+      observation?.approvedPresentation?.resources[0]?.sameOriginUrl,
+    ).toMatch(/^\/api\/knowledge-base\/artifacts\/resources\//u);
+    expect(
+      Object.keys(observation!.approvedPresentation!.resources[0]!).sort(),
+    ).toEqual([
+      "caption",
+      "id",
+      "kind",
+      "mimeType",
+      "sameOriginUrl",
+      "sizeBytes",
+    ]);
+    expect(
+      observation?.approvedPresentation?.resources[0]?.sameOriginUrl,
+    ).not.toContain("build-snapshot");
   });
 
   it("shows the exact official Logo on the revised first node that bound its upload", async () => {
@@ -766,7 +785,7 @@ describe("knowledge-base observation consistency", () => {
       resources: [
         {
           kind: "logo",
-          filename: "official-logo.png",
+          caption: "企业官方主 Logo",
         },
       ],
     });
@@ -796,15 +815,11 @@ describe("knowledge-base observation consistency", () => {
     };
     dependencies.customerUploadResources.mockResolvedValueOnce([
       {
+        id: "opaque-customer-content",
         kind: "customer_upload",
-        outputItemId: null,
-        fileId: null,
-        sameOriginUrl:
-          "/api/knowledge-base/artifacts/build-snapshot/customer-uploads/turn-customer-image/0/" +
-          "c".repeat(64),
-        filename: "customer.jpg",
+        caption: "知识库配图",
+        sameOriginUrl: `/api/knowledge-base/artifacts/resources/${"c".repeat(43)}.${"d".repeat(43)}`,
         mimeType: "image/jpeg",
-        sha256: "c".repeat(64),
         sizeBytes: 1234,
       },
     ]);
@@ -846,10 +861,13 @@ describe("knowledge-base observation consistency", () => {
       resources: [
         {
           kind: "customer_upload",
-          filename: "customer.jpg",
+          caption: "知识库配图",
         },
       ],
     });
+    expect(
+      JSON.stringify(observation?.approvedPresentation?.resources),
+    ).not.toContain("customer.jpg");
     expect(
       observation?.approvedPresentation?.resources.some((resource) =>
         resource.sameOriginUrl.startsWith("https://"),
@@ -941,15 +959,11 @@ describe("knowledge-base observation consistency", () => {
     };
     dependencies.customerUploadResources.mockResolvedValueOnce([
       {
+        id: "opaque-later-content",
         kind: "customer_upload",
-        outputItemId: null,
-        fileId: null,
-        sameOriginUrl:
-          "/api/knowledge-base/artifacts/build-snapshot/customer-uploads/turn-later-customer-image/0/" +
-          "d".repeat(64),
-        filename: "later-customer.png",
+        caption: "知识库配图",
+        sameOriginUrl: `/api/knowledge-base/artifacts/resources/${"e".repeat(43)}.${"f".repeat(43)}`,
         mimeType: "image/png",
-        sha256: "d".repeat(64),
         sizeBytes: 222,
       },
     ]);
@@ -995,7 +1009,7 @@ describe("knowledge-base observation consistency", () => {
       resources: [
         {
           kind: "customer_upload",
-          filename: "later-customer.png",
+          caption: "知识库配图",
         },
       ],
     });

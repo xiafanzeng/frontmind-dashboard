@@ -13,6 +13,7 @@ import { getDb } from "./db";
 import { KnowledgeBasePackageBindingError } from "./knowledge-base-package-validation";
 import type { KnowledgeBaseOfficialLogoProvenance } from "./knowledge-base-progress";
 import { readStoredPresalesFile } from "./presales-file-store";
+import { knowledgeBasePublicResource } from "./knowledge-base-public-resource";
 import {
   KnowledgeBaseUploadEvidenceError,
   persistKnowledgeBaseUploadEvidence,
@@ -111,6 +112,58 @@ export function knowledgeBaseOfficialLogoUploadFromTurn(
 ): KnowledgeBaseOfficialLogoUpload | null {
   if (turn.status !== "completed") return null;
   const metadata = record(turn.metadata) || {};
+  const localLogo = record(metadata.localLogo);
+  const localUpload = record(localLogo?.officialLogoUpload);
+  if (turn.operationType === "local_logo" || localLogo !== null) {
+    const index = Number(localUpload?.index);
+    const fileId = String(localUpload?.fileId || "").trim();
+    const filename = normalizeKnowledgeBaseAttachmentFilename(
+      localUpload?.filename,
+      "official-logo",
+    );
+    const mimeType = normalizeKnowledgeBaseAttachmentMimeType(
+      filename,
+      localUpload?.mimeType,
+    );
+    const sizeBytes = Number(localUpload?.sizeBytes);
+    const sourceSha256 = String(localUpload?.sourceSha256 || "")
+      .trim()
+      .toLowerCase();
+    const leafId = String(turn.expectedLeafId || "").trim();
+    if (
+      turn.operationType !== "local_logo" ||
+      localLogo?.kind !== "frontmind.knowledge-base.local-logo" ||
+      localLogo?.schemaVersion !== 1 ||
+      localLogo?.immutable !== true ||
+      localLogo?.buildId !== turn.buildId ||
+      localLogo?.leafId !== leafId ||
+      localLogo?.generation !== turn.buildGeneration ||
+      localLogo?.revision !== turn.expectedRevision ||
+      localUpload?.verified !== true ||
+      index !== 0 ||
+      !fileId ||
+      !leafId ||
+      !mimeType.startsWith("image/") ||
+      !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 1 ||
+      !/^[a-f0-9]{64}$/u.test(sourceSha256) ||
+      !Array.isArray(turn.attachmentFileIds) ||
+      turn.attachmentFileIds.length !== 1 ||
+      turn.attachmentFileIds[0] !== fileId
+    ) {
+      return null;
+    }
+    return {
+      turnId: turn.id,
+      leafId,
+      index,
+      fileId,
+      filename,
+      mimeType,
+      sizeBytes,
+      sourceSha256,
+    };
+  }
   const repair = record(metadata.logoProvenanceRepair);
   const repairUpload = record(repair?.officialLogoUpload);
   if (turn.operationType === "logo_provenance_repair" || repair !== null) {
@@ -496,16 +549,23 @@ export function knowledgeBaseCustomerUploadResource(
   buildId: string,
   image: KnowledgeBaseCustomerUploadImage,
 ): KnowledgeBaseApprovedResourceDto {
-  return {
+  return knowledgeBasePublicResource({
+    buildId,
     kind: "customer_upload",
-    outputItemId: null,
-    fileId: null,
-    sameOriginUrl: `/api/knowledge-base/artifacts/${encodeURIComponent(buildId)}/customer-uploads/${encodeURIComponent(image.turnId)}/${image.index}/${image.sourceSha256}`,
-    filename: image.filename,
+    internalIdentity: knowledgeBaseCustomerUploadInternalIdentity(image),
+    contentSha256: image.sourceSha256,
     mimeType: image.mimeType,
-    sha256: image.sourceSha256,
     sizeBytes: image.sizeBytes,
-  };
+  });
+}
+
+export function knowledgeBaseCustomerUploadInternalIdentity(
+  image: Pick<
+    KnowledgeBaseCustomerUploadImage,
+    "turnId" | "index" | "sourceSha256"
+  >,
+) {
+  return `${image.turnId}\0${image.index}\0${image.sourceSha256}`;
 }
 
 export async function knowledgeBaseCustomerUploadResources(

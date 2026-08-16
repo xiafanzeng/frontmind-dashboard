@@ -275,6 +275,7 @@ export default function KnowledgeBaseManagedUploadRecovery({
             conversationId,
             turnId,
             clientRequestId: discovery.reservation.clientRequestId,
+            expectedResetRevision: discovery.reservation.sourceResetRevision,
             attachmentManifest: discovery.reservation.attachmentManifest,
             index,
             attachment: {
@@ -286,6 +287,7 @@ export default function KnowledgeBaseManagedUploadRecovery({
         const result = await createKnowledgeBaseTurnTask([], {
           conversationId,
           clientRequestId: discovery.reservation.clientRequestId,
+          expectedResetRevision: discovery.reservation.sourceResetRevision,
           attachmentReservation: {
             turnId,
             attachmentManifest: discovery.reservation.attachmentManifest,

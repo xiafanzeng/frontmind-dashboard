@@ -5297,13 +5297,13 @@ async function handleFileDownload(
   fileId: string,
   disposition: "inline" | "attachment" = "inline",
   ownerUserId?: number,
-  credentialId?: string,
+  sourceAuthorityId?: string,
   projectAssignmentId?: string | null,
 ): Promise<void> {
   // Owned bytes and prepared redirects share the immutable source deadline;
   // cached responses must never remain reusable past that authorization point.
   res.setHeader("Cache-Control", "private, no-store, max-age=0");
-  if (!ownerUserId || !credentialId) {
+  if (!ownerUserId || !sourceAuthorityId) {
     throw new OwnedFileContentError(
       "SOURCE_FORBIDDEN",
       "文件不属于当前账号或客户项目",
@@ -5318,7 +5318,7 @@ async function handleFileDownload(
     ownerUserId,
     fileId,
     projectAssignmentId,
-    expectedCredentialId: credentialId,
+    expectedSourceAuthorityId: sourceAuthorityId,
   });
   const rawBuffer = await readResolvedOwnedContent(resolved);
   const finalFilename = ensureFilenameMatchesContent(
@@ -5335,11 +5335,13 @@ async function handleFileDownload(
   if (
     (isPdfFile(finalFilename) || finalContentType === "application/pdf") &&
     ownerUserId &&
-    credentialId
+    sourceAuthorityId
   ) {
     const asset = await preparedFileService.registerFile({
       ownerUserId,
-      credentialId,
+      credentialId: resolved.credentialId,
+      sourceKind: resolved.sourceKind,
+      sourceAuthorityId: resolved.sourceAuthorityId,
       projectAssignmentId,
       fileId,
       filename: finalFilename,
@@ -5433,7 +5435,7 @@ router.post("/download-token", async (req: Request, res: Response) => {
       kind: "owned_file",
       fileId,
       userId: req.frontmindUser.id,
-      credentialId: req.frontmindCredential.id,
+      credentialId: authorization.sourceAuthorityId,
       projectAssignmentId:
         req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
       exp: expiresAt,

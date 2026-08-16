@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   PRESALES_V2_CONTRACT_HASHES,
+  PRESALES_V2_CAPABILITIES,
   presalesV2CanonicalContractDescriptor,
   PRESALES_V2_STRUCTURED_OUTPUT_SCHEMAS,
   presalesV2ContractSchema,
@@ -64,6 +65,10 @@ function inspectRestrictedSchema(value: unknown, objectDepth = 0): number {
 }
 
 describe("Presales v2 contracts", () => {
+  it("advertises immutable Website project business-owner attribution", () => {
+    expect(PRESALES_V2_CAPABILITIES).toContain("project-business-owner");
+  });
+
   it("binds every readiness hash to the canonical exact Provider descriptor", () => {
     const canonical = (value: unknown): string => {
       if (value === null || typeof value !== "object") {

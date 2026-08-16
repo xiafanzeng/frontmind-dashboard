@@ -52,7 +52,10 @@ import {
   getKnowledgeSnapshotById,
   getLatestKnowledgeSnapshot,
 } from "./dashboard-service";
-import { downloadArchiveBytes } from "./dashboard-api";
+import {
+  downloadArchiveBytes,
+  KnowledgeArchiveDownloadError,
+} from "./dashboard-api";
 import {
   assertServiceCapability,
   ServiceEntitlementError,
@@ -98,7 +101,11 @@ import {
   validateKnowledgeBaseManifestForTreePolicy,
 } from "./knowledge-base-progress";
 import { knowledgeBaseInteractionTelemetryEvents } from "./knowledge-base-interaction-telemetry";
-import { logKnowledgeBaseOperationTelemetry } from "./knowledge-base-operation-telemetry";
+import {
+  logKnowledgeBaseDispatchPhaseTelemetry,
+  logKnowledgeBaseOperationTelemetry,
+  type KnowledgeBaseDispatchPhase,
+} from "./knowledge-base-operation-telemetry";
 import {
   bindKnowledgeBaseFinalPackage,
   bindKnowledgeBaseInitialLogo,
@@ -119,6 +126,7 @@ import {
   bindKnowledgeBaseTurnUpstreamTask,
   beginKnowledgeBaseManusV2Dispatch,
   bindKnowledgeBaseManusV2Submission,
+  beginKnowledgeBaseMaterializedCompletionStop,
   cancelUnpreparedKnowledgeBaseTurn,
   cancelIncompleteKnowledgeBaseStart,
   claimKnowledgeBaseDeferredTurnDispatch,
@@ -133,6 +141,8 @@ import {
   stopKnowledgeBaseCompatibleCreateOutcomeUnknown,
   deferKnowledgeBaseTurnBeforeCreate,
   ensureKnowledgeBaseBuildSkillArchivePin,
+  failKnowledgeBaseMaterializedResultForApprovedReset,
+  deferKnowledgeBaseMaterializedResultRead,
   findRecoverableKnowledgeBaseTurnIds,
   findRecoverableKnowledgeBaseAnchorHandoffTurnIds,
   findRecoverableKnowledgeBaseTerminalAnchorHandoffTurnIds,
@@ -147,6 +157,7 @@ import {
   inspectKnowledgeBaseTurnReplay,
   inspectKnowledgeBaseExplicitRecovery,
   findKnowledgeBaseExplicitRecoveryReplay,
+  knowledgeBaseMaterializedRecoveryContractVersion,
   loadKnowledgeBasePreproviderLocalRehydrateAuthority,
   loadKnowledgeBaseLocalRehydrateSnapshot,
   clearKnowledgeBaseLocalRehydrateRequirement,
@@ -154,6 +165,8 @@ import {
   markLegacyKnowledgeBaseCreateAttentionRequired,
   markKnowledgeBaseTurnOutcomeUnknown,
   markKnowledgeBaseManusV2OutcomeUnknown,
+  observeKnowledgeBaseMaterializedCompletionCandidate,
+  deferKnowledgeBaseMaterializedProviderStatus,
   markKnowledgeBaseManusV2AttentionRequired,
   markKnowledgeBaseManusV2AnchorHandoffAttentionRequired,
   observeAndLocallySettleKnowledgeBaseTerminalAnchor,
@@ -175,19 +188,22 @@ import {
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   renewKnowledgeBaseTurnLease,
+  settleKnowledgeBaseMaterializedCompletionStopAttempt,
   releaseGeneratedAttachmentInvalidPreproviderTurns,
   reclassifyHistoricalPreproviderAuthoritySelfTerminal,
   normalizeKnowledgeBaseTerminalRejection,
-  stageAndClaimKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseDeferredTurnAttachment,
   stageKnowledgeBaseTurnAttachments,
   KnowledgeBaseTurnReservationError,
   type KnowledgeBaseCreateAttemptState,
+  type KnowledgeBaseGeneratedAttachmentReservation,
+  type KnowledgeBaseGeneratedAttachmentRole,
   type KnowledgeBasePreparedDispatch,
   type KnowledgeBaseRecoveryClaim,
   type KnowledgeBaseAnchorHandoffCredentialMode,
   type KnowledgeBaseDeferredDispatchClaim,
   type KnowledgeBaseTurnReservation,
+  knowledgeBaseMaterializedCompletionContractVersion,
 } from "./knowledge-base-turn-service";
 
 export { releaseGeneratedAttachmentInvalidPreproviderTurns };
@@ -241,18 +257,26 @@ import { readStoredPresalesFile } from "./presales-file-store";
 import {
   persistKnowledgeBaseBuildSource,
   persistKnowledgeBaseGeneratedSource,
+  readKnowledgeBaseLocalSource,
 } from "./knowledge-base-local-source-store";
 import {
   activateInitialKnowledgeBaseWorkingSet,
   applyKnowledgeBaseRevisionWorkingSet,
+  bindMaterializedKnowledgeBaseOfficialLogoLocally,
   confirmMaterializedKnowledgeBaseNode,
   KnowledgeBaseMaterializedError,
   MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE,
   readActiveKnowledgeBaseWorkingSet,
+  validateKnowledgeBaseRevisionAgainstActiveWorkingSet,
 } from "./knowledge-base-materialized-service";
+import { isMaterializedBuildPublishable } from "./knowledge-base-materialized-quality";
 import {
-  ManagedUploadIntentError,
-} from "./managed-upload-intent";
+  KnowledgeBaseMaterializedContractError,
+  validateKnowledgeBaseWorkingSetArchive,
+  type KnowledgeBaseInitialBundleExpectation,
+} from "./knowledge-base-materialized-contract";
+import { KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION } from "./knowledge-base-materialized-completion-contract";
+import { ManagedUploadIntentError } from "./managed-upload-intent";
 import {
   assertKnowledgeBaseAttachmentManifestPresent,
   normalizeKnowledgeBaseClientAttachmentManifest,
@@ -272,7 +296,10 @@ import {
   knowledgeBasePinnedV4SkillSelection,
   readKnowledgeBaseSkillArchiveAttachment,
 } from "./knowledge-base-skill-runtime";
-import { knowledgeBaseNewBuildPolicyBinding } from "./knowledge-base-tree-policy-rollout";
+import {
+  knowledgeBaseNewBuildPolicyBinding,
+  KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+} from "./knowledge-base-tree-policy-rollout";
 import {
   executeKnowledgeBaseRetainedStartRecoveryFromCustomer,
   findKnowledgeBaseRetainedStartRecoveryReplay,
@@ -285,6 +312,10 @@ import {
   KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
   resolveKnowledgeBaseEnterpriseIdentity,
 } from "./knowledge-base-prompt-contract";
+import {
+  canonicalizeKnowledgeBaseCompanyName,
+  canonicalizeKnowledgeBaseWebsite,
+} from "./knowledge-base-company-identity";
 import {
   buildKnowledgeBaseInstructionDelivery,
   KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
@@ -429,6 +460,7 @@ export function knowledgeBaseReservationReceipt(
     canRegenerate: reservation.turn.canRegenerate,
     createAttemptState: reservation.turn.createAttemptState,
     traceId: reservation.turn.traceId,
+    sourceResetRevision: reservation.turn.sourceResetRevision ?? null,
     stagedAttachmentCount: reservation.turn.stagedUserAttachmentCount,
     expectedAttachmentCount: reservation.turn.expectedUserAttachmentCount,
     requiresUpload:
@@ -461,6 +493,7 @@ export function knowledgeBaseAcceptedReservationReceipt(input: {
     canRegenerate: input.turn.canRegenerate,
     createAttemptState: input.turn.createAttemptState,
     traceId: input.turn.traceId,
+    sourceResetRevision: input.turn.sourceResetRevision ?? null,
     stagedAttachmentCount: input.turn.stagedUserAttachmentCount,
     expectedAttachmentCount: input.turn.expectedUserAttachmentCount,
     requiresUpload: false,
@@ -815,6 +848,158 @@ type KnowledgeBaseBuildRecord = Awaited<
   ReturnType<typeof loadKnowledgeBaseBuildRecord>
 >;
 
+const MATERIALIZED_BUNDLE_COORDINATE_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+
+/**
+ * Builds the provider-visible initial bundle contract exclusively from the
+ * locked Dashboard build and its server-owned operation id. Every value used
+ * on the validator command line is constrained to a shell-safe alphabet
+ * before any Provider file or task request can occur.
+ */
+function knowledgeBaseInitialBundleExpectation(input: {
+  build: NonNullable<KnowledgeBaseBuildRecord>;
+  operationId: string;
+  expectedUploadsRead: number;
+}): KnowledgeBaseInitialBundleExpectation {
+  const { build, operationId, expectedUploadsRead } = input;
+  let companyName: string;
+  let companyWebsite: string | null;
+  try {
+    companyName = canonicalizeKnowledgeBaseCompanyName(build.companyName);
+    companyWebsite = canonicalizeKnowledgeBaseWebsite(build.companyWebsite);
+  } catch {
+    throw new KnowledgeBaseEnterpriseIdentityError(
+      "ENTERPRISE_IDENTITY_MISMATCH",
+      "知识库物化任务的冻结合同坐标无效",
+    );
+  }
+  if (
+    !MATERIALIZED_BUNDLE_COORDINATE_PATTERN.test(operationId) ||
+    !MATERIALIZED_BUNDLE_COORDINATE_PATTERN.test(build.id) ||
+    !Number.isSafeInteger(build.generation) ||
+    build.generation < 1 ||
+    !/^[a-f0-9]{64}$/u.test(build.skillContentHash || "") ||
+    build.treePolicyVersion !== 2 ||
+    !Number.isSafeInteger(expectedUploadsRead) ||
+    expectedUploadsRead < 0 ||
+    expectedUploadsRead > 100 ||
+    !companyName
+  ) {
+    throw new KnowledgeBaseEnterpriseIdentityError(
+      "ENTERPRISE_IDENTITY_MISMATCH",
+      "知识库物化任务的冻结合同坐标无效",
+    );
+  }
+  return {
+    operationId,
+    buildId: build.id,
+    generation: build.generation,
+    contentVersion: 1,
+    skillContentHash: build.skillContentHash!,
+    treePolicyVersion: 2,
+    companyName,
+    companyWebsite,
+    expectedUploadsRead,
+  };
+}
+
+export class KnowledgeBaseMaterializedResultError extends Error {
+  constructor(
+    readonly code:
+      | "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID"
+      | "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+    message: string,
+  ) {
+    super(message);
+    this.name = "KnowledgeBaseMaterializedResultError";
+  }
+}
+
+const MATERIALIZED_QUOTA_ERROR_TYPES = new Set([
+  "insufficient_credits",
+  "credit_exhausted",
+  "quota_exceeded",
+]);
+
+function latestMaterializedErrorType(
+  events: ReadonlyArray<
+    Record<string, unknown> & {
+      id: string;
+      type: string;
+      timestamp: number;
+    }
+  >,
+) {
+  const ordered = [...events].sort(
+    (left, right) =>
+      right.timestamp - left.timestamp || right.id.localeCompare(left.id),
+  );
+  const latestStatus = ordered.find((candidate) => {
+    const statusUpdate =
+      candidate.status_update &&
+      typeof candidate.status_update === "object" &&
+      !Array.isArray(candidate.status_update)
+        ? (candidate.status_update as Record<string, unknown>)
+        : null;
+    return typeof statusUpdate?.agent_status === "string";
+  });
+  const latestStatusAt = latestStatus?.timestamp ?? Number.POSITIVE_INFINITY;
+  const precedingNonErrorStatusAt = ordered.reduce<number | null>(
+    (boundary, candidate) => {
+      if (candidate.timestamp >= latestStatusAt) return boundary;
+      const statusUpdate =
+        candidate.status_update &&
+        typeof candidate.status_update === "object" &&
+        !Array.isArray(candidate.status_update)
+          ? (candidate.status_update as Record<string, unknown>)
+          : null;
+      const status =
+        typeof statusUpdate?.agent_status === "string"
+          ? statusUpdate.agent_status.trim().toLowerCase()
+          : "";
+      if (!status || status === "error" || status === "failed") {
+        return boundary;
+      }
+      return boundary === null
+        ? candidate.timestamp
+        : Math.max(boundary, candidate.timestamp);
+    },
+    null,
+  );
+  const event = ordered.find(
+    (candidate) =>
+      candidate.type === "error_message" &&
+      (precedingNonErrorStatusAt === null ||
+        candidate.timestamp > precedingNonErrorStatusAt),
+  );
+  const envelope =
+    event?.error_message &&
+    typeof event.error_message === "object" &&
+    !Array.isArray(event.error_message)
+      ? (event.error_message as Record<string, unknown>)
+      : null;
+  const errorType =
+    typeof envelope?.error_type === "string"
+      ? envelope.error_type.trim().toLowerCase()
+      : "";
+  return errorType && errorType.length <= 128 ? errorType : null;
+}
+
+function materializedDescriptorIdentityHash(input: {
+  outputItemId: string;
+  outputItemIds?: string[];
+}) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify(
+        [...new Set(input.outputItemIds || [input.outputItemId])].sort(),
+      ),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 async function requireMaterializedKnowledgeBaseBuild(input: {
   userId: number;
   conversationId: string;
@@ -832,8 +1017,13 @@ async function requireMaterializedKnowledgeBaseBuild(input: {
   if (
     build.executionMode !== MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
     build.skillVersion !== "5" ||
+    build.skillContentHash !==
+      KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH ||
     build.providerProtocol !== "manus_v2" ||
-    build.contentVersion === null
+    build.contentVersion === null ||
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
   ) {
     throw new KnowledgeBaseTurnReservationError(
       "RESET_REQUIRED",
@@ -971,7 +1161,10 @@ export async function loadKnowledgeBaseTurnAuthority(
     build.executionMode !== MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
     build.skillVersion !== "5" ||
     build.providerProtocol !== "manus_v2" ||
-    build.contentVersion === null
+    build.contentVersion === null ||
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
   ) {
     throw new KnowledgeBaseBuildError(
       "RESET_REQUIRED",
@@ -1156,6 +1349,20 @@ export function deriveKnowledgeBaseInteraction(
       canReply: false,
       canPublish: false,
       lockReason: "知识库已发布；后续修改请提交维护需求",
+    };
+  }
+  if (
+    progress?.resultQuality?.completeness === "partial" ||
+    progress?.resultQuality?.downstreamEligible === false ||
+    progress?.resultQuality?.publishable === false
+  ) {
+    return {
+      progress,
+      interactionState: "awaiting_input",
+      canReply: false,
+      canPublish: false,
+      lockReason:
+        "知识库内容不完整，可查看当前安全内容，但不能确认、修订或发布；请批准重置后重跑",
     };
   }
   if (progress?.build.status === "ready_to_publish") {
@@ -1364,6 +1571,15 @@ export async function getKnowledgeBaseObservation(input: {
     progress,
     input.upstreamStatus,
   );
+  if (projection.processingPhase === "uploading") {
+    interaction = {
+      ...interaction,
+      interactionState: "queued",
+      canReply: false,
+      canPublish: false,
+      lockReason: "正在接收并校验本轮资料，任务尚未派发",
+    };
+  }
   if (
     !knowledgeBaseLegacyRecoveryRoutesRetired() &&
     projection.activeTurn === null &&
@@ -1515,11 +1731,22 @@ export function knowledgeBasePreCreateUserFixObservationAllowsResume(input: {
 }
 
 export function knowledgeBaseReconcileFailureStatus(error: unknown) {
-  return error instanceof KnowledgeBaseBuildError
-    ? error.code === "BUILD_NOT_FOUND"
-      ? 404
-      : 422
-    : 503;
+  if (error instanceof KnowledgeBaseBuildError) {
+    return error.code === "BUILD_NOT_FOUND" ? 404 : 422;
+  }
+  if (error instanceof KnowledgeBaseTurnReservationError) {
+    if (error.code === "BUILD_NOT_FOUND") return 404;
+    if (
+      error.code === "CONVERSATION_RESET" ||
+      error.code === "RESET_REQUIRED" ||
+      error.code === "KNOWLEDGE_BASE_RESET_REVISION_CHANGED" ||
+      error.code === "TERMINAL"
+    ) {
+      return 410;
+    }
+    return 422;
+  }
+  return 503;
 }
 
 async function observeKnowledgeBaseUpstreamFailure(input: {
@@ -2184,6 +2411,16 @@ function recoveryString(
   return typeof value === "string" ? value : fallback;
 }
 
+function recoveryStringArray(
+  metadata: Record<string, unknown>,
+  key: string,
+): string[] {
+  const value = metadata[key];
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : [];
+}
+
 function recoveryOfficialLogoUpload(
   metadata: Record<string, unknown>,
 ): KnowledgeBaseOfficialLogoUpload | undefined {
@@ -2432,6 +2669,33 @@ function knowledgeBaseUserAttachmentIds(claim: KnowledgeBaseRecoveryClaim) {
       return fileId ? [fileId] : [];
     }),
   );
+}
+
+function logKnowledgeBaseClaimDispatchPhase(
+  claim: KnowledgeBaseRecoveryClaim,
+  phase: KnowledgeBaseDispatchPhase,
+  overrides: {
+    errorCode?: string;
+    expectedCount?: number;
+    stagedCount?: number;
+    generatedReservationCount?: number;
+    mappingCount?: number;
+    createState?: string | null;
+  } = {},
+) {
+  logKnowledgeBaseDispatchPhaseTelemetry({
+    phase,
+    traceId: knowledgeBaseClaimTraceId(claim),
+    userCount: knowledgeBaseUserAttachmentIds(claim).size,
+    stagedCount: claim.turn.attachmentFileIds?.length ?? 0,
+    generatedReservationCount: Object.keys(
+      claim.turn.generatedAttachmentReservations || {},
+    ).length,
+    mappingCount: Object.keys(claim.turn.manusV2AttachmentMappings || {})
+      .length,
+    createState: claim.turn.createAttemptState,
+    ...overrides,
+  });
 }
 
 function knowledgeBaseReadinessFailure(
@@ -2691,6 +2955,128 @@ async function uploadRecoverySkill(input: {
   return uploaded;
 }
 
+const KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT =
+  "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT";
+
+function knowledgeBaseGeneratedAttachmentLedgerConflict(): never {
+  throw new KnowledgeBaseLocalPreparationError(
+    KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT,
+    "知识库附件账本顺序与已保留的原始资料不一致，请联系支持处理",
+  );
+}
+
+/**
+ * Plans the only supported v5 source order: every browser-owned attachment
+ * remains an immutable prefix and generated files are appended by role. This
+ * pure guard runs before any generated-file or task Provider call, so a truly
+ * polluted ledger becomes one stable local failure instead of an endless
+ * generic recovery loop.
+ */
+export function planKnowledgeBaseUserFirstAttachmentLedger(input: {
+  userAttachmentIds: readonly string[];
+  stagedAttachmentIds: readonly string[];
+  generatedRoles: readonly KnowledgeBaseGeneratedAttachmentRole[];
+  generatedReservations?: Readonly<
+    Record<string, KnowledgeBaseGeneratedAttachmentReservation>
+  >;
+}) {
+  const userAttachmentIds = [...input.userAttachmentIds];
+  const stagedAttachmentIds = [...input.stagedAttachmentIds];
+  const generatedRoles = [...input.generatedRoles];
+  const generatedReservations = input.generatedReservations || {};
+  const userCount = userAttachmentIds.length;
+  const expectedCount = userCount + generatedRoles.length;
+  if (
+    new Set(userAttachmentIds).size !== userCount ||
+    new Set(stagedAttachmentIds).size !== stagedAttachmentIds.length ||
+    stagedAttachmentIds.length < userCount ||
+    stagedAttachmentIds.length > expectedCount ||
+    userAttachmentIds.some(
+      (fileId, index) => !fileId || stagedAttachmentIds[index] !== fileId,
+    )
+  ) {
+    knowledgeBaseGeneratedAttachmentLedgerConflict();
+  }
+
+  for (const reservation of Object.values(generatedReservations)) {
+    const offset = reservation.attachmentIndex - userCount;
+    if (
+      offset < 0 ||
+      offset >= generatedRoles.length ||
+      generatedRoles[offset] !== reservation.role ||
+      generatedReservations[
+        `${reservation.role}:${reservation.attachmentIndex}`
+      ] !== reservation
+    ) {
+      knowledgeBaseGeneratedAttachmentLedgerConflict();
+    }
+  }
+
+  const stagedGeneratedIds = stagedAttachmentIds.slice(userCount);
+  for (let offset = 0; offset < stagedGeneratedIds.length; offset += 1) {
+    const role = generatedRoles[offset]!;
+    const attachmentIndex = userCount + offset;
+    const reservation = generatedReservations[`${role}:${attachmentIndex}`];
+    const expectedSourceId = reservation
+      ? reservation.upstreamFileId ||
+        `kb-local-${reservation.requestHash.slice(0, 48)}`
+      : null;
+    if (!expectedSourceId || stagedGeneratedIds[offset] !== expectedSourceId) {
+      knowledgeBaseGeneratedAttachmentLedgerConflict();
+    }
+  }
+
+  return {
+    userAttachmentIds,
+    stagedGeneratedIds,
+    generatedAttachmentIndex(offset: number) {
+      if (
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        offset >= generatedRoles.length
+      ) {
+        knowledgeBaseGeneratedAttachmentLedgerConflict();
+      }
+      return userCount + offset;
+    },
+    attachmentFileIdsForGenerated(generatedFileIds: readonly string[]) {
+      if (
+        generatedFileIds.length > generatedRoles.length ||
+        new Set([...userAttachmentIds, ...generatedFileIds]).size !==
+          userAttachmentIds.length + generatedFileIds.length
+      ) {
+        knowledgeBaseGeneratedAttachmentLedgerConflict();
+      }
+      return [...userAttachmentIds, ...generatedFileIds];
+    },
+  };
+}
+
+export function planKnowledgeBaseClaimUserFirstAttachmentLedger(
+  claim: KnowledgeBaseRecoveryClaim,
+  input: Parameters<typeof planKnowledgeBaseUserFirstAttachmentLedger>[0],
+) {
+  try {
+    return planKnowledgeBaseUserFirstAttachmentLedger(input);
+  } catch (error) {
+    if (
+      error instanceof KnowledgeBaseLocalPreparationError &&
+      error.code === KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT
+    ) {
+      logKnowledgeBaseClaimDispatchPhase(claim, "validate_ledger", {
+        errorCode: error.code,
+        expectedCount:
+          input.userAttachmentIds.length + input.generatedRoles.length,
+        stagedCount: input.stagedAttachmentIds.length,
+        generatedReservationCount: Object.keys(
+          input.generatedReservations || {},
+        ).length,
+      });
+    }
+    throw error;
+  }
+}
+
 /**
  * Handles the small pre-prepare crash window. Every value needed to recreate
  * the request is pinned in recovery metadata, and every already staged file id
@@ -2743,7 +3129,13 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     skillArchiveBytes: skillArchive.archiveBytes,
     skillArchiveStorageKey: skillArchive.storageKey,
   };
-  if (claim.preparedDispatch) return claim.preparedDispatch;
+  if (claim.preparedDispatch) {
+    logKnowledgeBaseClaimDispatchPhase(claim, "prepare", {
+      expectedCount: claim.preparedDispatch.requestBody.attachments.length,
+      stagedCount: claim.preparedDispatch.requestBody.attachments.length,
+    });
+    return claim.preparedDispatch;
+  }
   const recovery = claim.recoveryMetadata;
   const kind = recoveryString(recovery, "kind");
   const conversationId = recoveryString(recovery, "conversationId");
@@ -2760,10 +3152,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
   const baseUrl =
     recoveryString(recovery, "retryBaseUrl") || getUpstreamBaseUrl();
   const agentProfile = knowledgeBaseUpstreamModelForCredential(credential);
-  const recordedAgentProfile = recoveryString(
-    recovery,
-    "retryAgentProfile",
-  );
+  const recordedAgentProfile = recoveryString(recovery, "retryAgentProfile");
   if (recordedAgentProfile && recordedAgentProfile !== agentProfile) {
     throw new KnowledgeBaseLocalPreparationError(
       "KNOWLEDGE_BASE_CREDENTIAL_PROFILE_CHANGED",
@@ -2886,17 +3275,26 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     const stagedUserIds = userAttachments.map(
       (attachment) => attachment.file_id,
     );
-    if (
-      deferredClientAttachments &&
-      (stagedIds.length < stagedUserIds.length ||
-        stagedUserIds.some((fileId, index) => stagedIds[index] !== fileId) ||
-        stagedIds.length >
-          stagedUserIds.length + (materializedRevision ? 3 : 2))
-    ) {
-      throw new Error("Deferred turn attachment ledger is inconsistent");
-    }
+    const userFirstGeneratedRoles: KnowledgeBaseGeneratedAttachmentRole[] =
+      materializedRevision
+        ? ["skill", "working_set", "instructions"]
+        : providerPackageRequired
+          ? ["skill", "finalization"]
+          : ["skill", "instructions"];
+    const userFirstLedger = deferredClientAttachments
+      ? planKnowledgeBaseClaimUserFirstAttachmentLedger(claim, {
+          userAttachmentIds: stagedUserIds,
+          stagedAttachmentIds: stagedIds,
+          generatedRoles: userFirstGeneratedRoles,
+          generatedReservations: claim.turn.generatedAttachmentReservations,
+        })
+      : null;
+    logKnowledgeBaseClaimDispatchPhase(claim, "validate_ledger", {
+      expectedCount: stagedUserIds.length + userFirstGeneratedRoles.length,
+      stagedCount: stagedIds.length,
+    });
     const boundSkillId = deferredClientAttachments
-      ? stagedIds[stagedUserIds.length]
+      ? userFirstLedger!.stagedGeneratedIds[0]
       : stagedIds[0];
     const recoveredSkill = await uploadRecoverySkill({
       claim,
@@ -2905,10 +3303,20 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       skillVersion,
       skillContentHash,
       skillArchive,
-      stagedPrefix: deferredClientAttachments ? stagedUserIds : [],
+      stagedPrefix: deferredClientAttachments
+        ? userFirstLedger!.userAttachmentIds
+        : [],
       ...(boundSkillId ? { boundUpstreamFileId: boundSkillId } : {}),
     });
     const skillId = recoveredSkill.fileId;
+    logKnowledgeBaseClaimDispatchPhase(claim, "skill", {
+      expectedCount: stagedUserIds.length + userFirstGeneratedRoles.length,
+      stagedCount: (deferredClientAttachments ? stagedUserIds.length : 0) + 1,
+      generatedReservationCount: Math.max(
+        Object.keys(claim.turn.generatedAttachmentReservations || {}).length,
+        1,
+      ),
+    });
     const generatedAttachments: Array<{
       file_id: string;
       filename: string;
@@ -2934,8 +3342,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         generation: pinnedBuild.generation,
       });
       const filename = "frontmind-kb-active-working-set.zip";
-      const attachmentIndex =
-        (deferredClientAttachments ? stagedUserIds.length : 0) + 1;
+      const attachmentIndex = userFirstLedger?.generatedAttachmentIndex(1) ?? 1;
       const uploaded = await uploadDurableKnowledgeBaseGeneratedAttachment({
         baseUrl,
         apiKey: credential.apiKey,
@@ -2960,7 +3367,10 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         turnId: claim.turn.id,
         leaseToken: claim.leaseToken,
         attachmentFileIds: deferredClientAttachments
-          ? [...stagedUserIds, skillId, uploaded.fileId]
+          ? userFirstLedger!.attachmentFileIdsForGenerated([
+              skillId,
+              uploaded.fileId,
+            ])
           : [skillId, uploaded.fileId],
       });
       materializedBase = {
@@ -3105,8 +3515,9 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         turnId: claim.turn.id,
       });
       const instructionIndex =
-        (deferredClientAttachments ? stagedUserIds.length : 0) +
-        generatedAttachments.length;
+        userFirstLedger?.generatedAttachmentIndex(
+          generatedAttachments.length,
+        ) ?? generatedAttachments.length;
       const boundInstructionFileId = stagedIds[instructionIndex];
       const uploadedInstruction =
         await uploadDurableKnowledgeBaseGeneratedAttachment({
@@ -3144,11 +3555,10 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         turnId: claim.turn.id,
         leaseToken: claim.leaseToken,
         attachmentFileIds: deferredClientAttachments
-          ? [
-              ...stagedUserIds,
+          ? userFirstLedger!.attachmentFileIdsForGenerated([
               ...generatedAttachments.map((item) => item.file_id),
               instructionFileId,
-            ]
+            ])
           : [
               ...generatedAttachments.map((item) => item.file_id),
               instructionFileId,
@@ -3165,6 +3575,13 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       generatedAttachments.push({
         file_id: instructionFileId,
         filename: KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
+      });
+      logKnowledgeBaseClaimDispatchPhase(claim, "instructions", {
+        expectedCount: stagedUserIds.length + userFirstGeneratedRoles.length,
+        stagedCount:
+          (deferredClientAttachments ? stagedUserIds.length : 0) +
+          generatedAttachments.length,
+        generatedReservationCount: generatedAttachments.length,
       });
       prompt = instructionDelivery.prompt;
     }
@@ -3193,6 +3610,11 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         (attachment) => attachment.file_id,
       ),
     });
+    logKnowledgeBaseClaimDispatchPhase(claim, "freeze", {
+      expectedCount: readyAttachments.length,
+      stagedCount: readyAttachments.length,
+      generatedReservationCount: generatedAttachments.length,
+    });
     const prepared = await prepareKnowledgeBaseTurnDispatch({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
@@ -3202,6 +3624,11 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       agentProfile,
       attachments: readyAttachments,
       parentTaskId,
+    });
+    logKnowledgeBaseClaimDispatchPhase(claim, "prepare", {
+      expectedCount: prepared.requestBody.attachments.length,
+      stagedCount: prepared.requestBody.attachments.length,
+      generatedReservationCount: generatedAttachments.length,
     });
     // Short accepted-path retries must reuse the exact prepared POST instead
     // of rebuilding attachments from the stale in-memory claim.
@@ -3214,9 +3641,36 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
   }
   const companyName = recoveryString(recovery, "companyName");
   const companyWebsite = recoveryString(recovery, "companyWebsite");
+  const researchWebsites = recoveryStringArray(recovery, "researchWebsites");
   const operatorNotes = recoveryString(recovery, "operatorNotes");
   const prefillSnapshotId = recoveryString(recovery, "prefillSnapshotId");
   const includePrefill = Boolean(recovery.includePrefill);
+  const initialBundleExpectation =
+    skillVersion === "5"
+      ? knowledgeBaseInitialBundleExpectation({
+          build: pinnedBuild,
+          operationId: claim.turn.operationKey,
+          expectedUploadsRead: claim.turn.expectedUserAttachmentCount,
+        })
+      : undefined;
+  const deferredClientAttachments = recovery.deferredClientAttachments === true;
+  const stagedUserIds = userAttachments.map((attachment) => attachment.file_id);
+  const startGeneratedRoles: KnowledgeBaseGeneratedAttachmentRole[] =
+    includePrefill
+      ? ["skill", "prefill", "instructions"]
+      : ["skill", "instructions"];
+  const userFirstLedger = deferredClientAttachments
+    ? planKnowledgeBaseClaimUserFirstAttachmentLedger(claim, {
+        userAttachmentIds: stagedUserIds,
+        stagedAttachmentIds: stagedIds,
+        generatedRoles: startGeneratedRoles,
+        generatedReservations: claim.turn.generatedAttachmentReservations,
+      })
+    : null;
+  logKnowledgeBaseClaimDispatchPhase(claim, "validate_ledger", {
+    expectedCount: stagedUserIds.length + startGeneratedRoles.length,
+    stagedCount: stagedIds.length,
+  });
   const prefillKnowledgeSnapshot = prefillSnapshotId
     ? await getKnowledgeSnapshotById({
         userId: claim.turn.userId,
@@ -3227,6 +3681,9 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     throw new Error("Pinned knowledge-base prefill snapshot is unavailable");
   }
 
+  const boundStartSkillId = userFirstLedger
+    ? userFirstLedger.stagedGeneratedIds[0]
+    : stagedIds[0];
   const recoveredSkill = await uploadRecoverySkill({
     claim,
     credential,
@@ -3234,9 +3691,18 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     skillVersion,
     skillContentHash,
     skillArchive,
-    ...(stagedIds[0] ? { boundUpstreamFileId: stagedIds[0] } : {}),
+    stagedPrefix: userFirstLedger?.userAttachmentIds ?? [],
+    ...(boundStartSkillId ? { boundUpstreamFileId: boundStartSkillId } : {}),
   });
   const skillId = recoveredSkill.fileId;
+  logKnowledgeBaseClaimDispatchPhase(claim, "skill", {
+    expectedCount: stagedUserIds.length + startGeneratedRoles.length,
+    stagedCount: (deferredClientAttachments ? stagedUserIds.length : 0) + 1,
+    generatedReservationCount: Math.max(
+      Object.keys(claim.turn.generatedAttachmentReservations || {}).length,
+      1,
+    ),
+  });
   const generatedAttachments = [
     { file_id: skillId, filename: KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME },
   ];
@@ -3259,14 +3725,17 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
         userId: claim.turn.userId,
         turnId: claim.turn.id,
         leaseToken: claim.leaseToken,
-        attachmentIndex: 1,
+        attachmentIndex: userFirstLedger?.generatedAttachmentIndex(1) ?? 1,
         role: "prefill",
       },
     });
     const prefillFileId = uploaded.fileId;
+    const boundPrefillFileId = userFirstLedger
+      ? userFirstLedger.stagedGeneratedIds[1]
+      : stagedIds[1];
     if (
-      stagedIds[1] &&
-      prefillFileId !== stagedIds[1] &&
+      boundPrefillFileId &&
+      prefillFileId !== boundPrefillFileId &&
       claim.turn.providerProtocol !== "manus_v2"
     ) {
       throw new Error("Recovered prefill file id changed during byte upload");
@@ -3280,7 +3749,12 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       userId: claim.turn.userId,
       turnId: claim.turn.id,
       leaseToken: claim.leaseToken,
-      attachmentFileIds: [skillId, prefillFileId],
+      attachmentFileIds: userFirstLedger
+        ? userFirstLedger.attachmentFileIdsForGenerated([
+            skillId,
+            prefillFileId,
+          ])
+        : [skillId, prefillFileId],
     });
     if (claim.turn.providerProtocol !== "manus_v2") {
       await recordUpstreamResource({
@@ -3294,11 +3768,20 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       file_id: prefillFileId,
       filename: KNOWLEDGE_BASE_PREFILL_ATTACHMENT_FILENAME,
     });
+    logKnowledgeBaseClaimDispatchPhase(claim, "prefill", {
+      expectedCount: stagedUserIds.length + startGeneratedRoles.length,
+      stagedCount: (deferredClientAttachments ? stagedUserIds.length : 0) + 2,
+      generatedReservationCount: Math.max(
+        Object.keys(claim.turn.generatedAttachmentReservations || {}).length,
+        2,
+      ),
+    });
   }
   const fullInstructions = await buildKnowledgeBasePrompt({
     conversationId,
     companyName,
     companyWebsite,
+    researchWebsites,
     operatorNotes,
     attachments: userAttachments,
     prefillKnowledgeSnapshot,
@@ -3308,14 +3791,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
       operationId: claim.turn.operationKey,
       turnId: claim.turn.id,
     },
-    materializedCoordinates:
-      skillVersion === "5"
-        ? {
-            buildId: pinnedBuild.id,
-            generation: pinnedBuild.generation,
-            contentVersion: 1,
-          }
-        : undefined,
+    initialBundleExpectation,
   });
   const instructionDelivery = buildKnowledgeBaseInstructionDelivery({
     instructions: fullInstructions,
@@ -3324,7 +3800,10 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     operationId: claim.turn.operationKey,
     turnId: claim.turn.id,
   });
-  const instructionIndex = includePrefill ? 2 : 1;
+  const instructionOffset = includePrefill ? 2 : 1;
+  const instructionIndex =
+    userFirstLedger?.generatedAttachmentIndex(instructionOffset) ??
+    instructionOffset;
   const uploadedInstruction =
     await uploadDurableKnowledgeBaseGeneratedAttachment({
       baseUrl,
@@ -3360,10 +3839,15 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     userId: claim.turn.userId,
     turnId: claim.turn.id,
     leaseToken: claim.leaseToken,
-    attachmentFileIds: [
-      ...generatedAttachments.map((attachment) => attachment.file_id),
-      instructionFileId,
-    ],
+    attachmentFileIds: userFirstLedger
+      ? userFirstLedger.attachmentFileIdsForGenerated([
+          ...generatedAttachments.map((attachment) => attachment.file_id),
+          instructionFileId,
+        ])
+      : [
+          ...generatedAttachments.map((attachment) => attachment.file_id),
+          instructionFileId,
+        ],
   });
   if (claim.turn.providerProtocol !== "manus_v2") {
     await recordUpstreamResource({
@@ -3377,7 +3861,16 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     file_id: instructionFileId,
     filename: KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
   });
-  const attachments = [...generatedAttachments, ...userAttachments];
+  logKnowledgeBaseClaimDispatchPhase(claim, "instructions", {
+    expectedCount: stagedUserIds.length + startGeneratedRoles.length,
+    stagedCount:
+      (deferredClientAttachments ? stagedUserIds.length : 0) +
+      generatedAttachments.length,
+    generatedReservationCount: generatedAttachments.length,
+  });
+  const attachments = userFirstLedger
+    ? [...userAttachments, ...generatedAttachments]
+    : [...generatedAttachments, ...userAttachments];
   const readyAttachments =
     claim.turn.providerProtocol === "manus_v2"
       ? attachments
@@ -3393,6 +3886,11 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     leaseToken: claim.leaseToken,
     attachmentFileIds: readyAttachments.map((attachment) => attachment.file_id),
   });
+  logKnowledgeBaseClaimDispatchPhase(claim, "freeze", {
+    expectedCount: readyAttachments.length,
+    stagedCount: readyAttachments.length,
+    generatedReservationCount: generatedAttachments.length,
+  });
   const prepared = await prepareKnowledgeBaseTurnDispatch({
     userId: claim.turn.userId,
     turnId: claim.turn.id,
@@ -3401,6 +3899,11 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     prompt: instructionDelivery.prompt,
     agentProfile,
     attachments: readyAttachments,
+  });
+  logKnowledgeBaseClaimDispatchPhase(claim, "prepare", {
+    expectedCount: prepared.requestBody.attachments.length,
+    stagedCount: prepared.requestBody.attachments.length,
+    generatedReservationCount: generatedAttachments.length,
   });
   claim.preparedDispatch = prepared;
   return prepared;
@@ -4740,216 +5243,6 @@ async function reconcilePolledManusV2KnowledgeBaseTask(input: {
   return { taskStatus, progress };
 }
 
-type KnowledgeBaseManusV2HandoffSnapshot = {
-  schemaVersion: 1;
-  purpose: "legacy_to_manus_v2_handoff";
-  build: {
-    id: string;
-    generation: number;
-    revision: number;
-    currentLeafId: string | null;
-    skillName: string;
-    skillVersion: string;
-    skillContentHash: string | null;
-    skillArchiveSha256: string | null;
-    treePolicyVersion: number;
-  };
-  nodes: Array<{
-    leafId: string;
-    branchId: string;
-    branchTitle: string;
-    title: string;
-    ordinal: number;
-    status: string;
-    contentMarkdown: string | null;
-    contentSha256: string | null;
-    lastUserInput: string | null;
-  }>;
-  acceptedReceipts: Array<{
-    sequence: number;
-    turnId: string | null;
-    kind: string;
-    generation: number;
-    revision: number | null;
-    leafId: string | null;
-    content: string;
-    contentSha256: string;
-  }>;
-  pendingOperation: {
-    turnId: string;
-    operationToken: string;
-    action: string;
-    baseRevision: number;
-    fromLeafId: string | null;
-    userInput: string;
-    attachmentManifest: unknown[];
-  };
-};
-
-async function buildKnowledgeBaseManusV2HandoffSnapshot(input: {
-  claim: KnowledgeBaseRecoveryClaim;
-  build: NonNullable<
-    Awaited<ReturnType<typeof loadKnowledgeBaseBuildRecordById>>
-  >;
-}) {
-  const db = await getDb();
-  if (!db) throw new Error("Database is unavailable for Manus v2 handoff");
-  const persistedConversationId = input.claim.turn.conversationId;
-  const nodes = await db
-    .select({
-      leafId: knowledgeBaseBuildNodes.leafId,
-      branchId: knowledgeBaseBuildNodes.branchId,
-      branchTitle: knowledgeBaseBuildNodes.branchTitle,
-      title: knowledgeBaseBuildNodes.title,
-      ordinal: knowledgeBaseBuildNodes.ordinal,
-      status: knowledgeBaseBuildNodes.status,
-      contentMarkdown: knowledgeBaseBuildNodes.contentMarkdown,
-      contentSha256: knowledgeBaseBuildNodes.contentSha256,
-      lastUserInput: knowledgeBaseBuildNodes.lastUserInput,
-    })
-    .from(knowledgeBaseBuildNodes)
-    .where(eq(knowledgeBaseBuildNodes.buildId, input.build.id))
-    .orderBy(asc(knowledgeBaseBuildNodes.ordinal));
-  const acceptedReceipts = await db
-    .select({
-      id: messages.id,
-      conversationId: messages.conversationId,
-      userId: messages.userId,
-      role: messages.role,
-      sequence: messages.sequence,
-      turnId: messages.turnId,
-      content: messages.content,
-      metadata: messages.metadata,
-    })
-    .from(messages)
-    .where(
-      and(
-        eq(messages.userId, input.claim.turn.userId),
-        eq(messages.conversationId, persistedConversationId),
-        eq(messages.role, "assistant"),
-        isNull(messages.deletedAt),
-      ),
-    )
-    .orderBy(asc(messages.sequence));
-  const receiptTurnIds = [
-    ...new Set(
-      acceptedReceipts.flatMap((message) =>
-        message.turnId ? [message.turnId] : [],
-      ),
-    ),
-  ];
-  const receiptTurns =
-    receiptTurnIds.length > 0
-      ? await db
-          .select({
-            id: conversationTurns.id,
-            conversationId: conversationTurns.conversationId,
-            userId: conversationTurns.userId,
-            clientRequestId: conversationTurns.clientRequestId,
-            buildId: conversationTurns.buildId,
-            buildGeneration: conversationTurns.buildGeneration,
-            operationKey: conversationTurns.operationKey,
-            expectedRevision: conversationTurns.expectedRevision,
-            expectedLeafId: conversationTurns.expectedLeafId,
-            status: conversationTurns.status,
-          })
-          .from(conversationTurns)
-          .where(
-            and(
-              eq(conversationTurns.userId, input.claim.turn.userId),
-              eq(conversationTurns.buildId, input.build.id),
-              inArray(conversationTurns.id, receiptTurnIds),
-            ),
-          )
-      : [];
-  const receiptTurnsById = new Map(receiptTurns.map((turn) => [turn.id, turn]));
-  const snapshot: KnowledgeBaseManusV2HandoffSnapshot = {
-    schemaVersion: 1,
-    purpose: "legacy_to_manus_v2_handoff",
-    build: {
-      id: input.build.id,
-      generation: input.build.generation,
-      revision: input.build.revision,
-      currentLeafId: input.build.currentLeafId,
-      skillName: input.build.skillName,
-      skillVersion: input.build.skillVersion,
-      skillContentHash: input.build.skillContentHash,
-      skillArchiveSha256: input.build.skillArchiveSha256,
-      treePolicyVersion: input.build.treePolicyVersion,
-    },
-    nodes: nodes.map((node) => ({ ...node })),
-    acceptedReceipts: acceptedReceipts.flatMap((message) => {
-      const metadata = parsedKnowledgeBaseMessageMetadata(message.metadata);
-      if (
-        !metadata ||
-        metadata.buildId !== input.build.id ||
-        typeof metadata.generation !== "number" ||
-        metadata.generation > input.build.generation ||
-        (metadata.kind !== "presentation" && metadata.kind !== "completion") ||
-        !message.turnId ||
-        !matchesAuthoritativeKnowledgeBaseMessageTuple({
-          message,
-          knowledgeBase: metadata,
-          turn: receiptTurnsById.get(message.turnId),
-          build: input.build,
-          publicConversationId: input.build.conversationId,
-        })
-      ) {
-        return [];
-      }
-      const content = String(message.content || "").trim();
-      return [
-        {
-          sequence: message.sequence,
-          turnId: message.turnId,
-          kind: String(metadata.kind),
-          generation: metadata.generation,
-          revision:
-            typeof metadata.revision === "number" ? metadata.revision : null,
-          leafId: typeof metadata.leafId === "string" ? metadata.leafId : null,
-          content,
-          contentSha256: createHash("sha256").update(content).digest("hex"),
-        },
-      ];
-    }),
-    pendingOperation: {
-      turnId: input.claim.turn.id,
-      operationToken: input.claim.turn.operationToken,
-      action: input.claim.turn.operationType,
-      baseRevision: input.claim.turn.expectedRevision,
-      fromLeafId: input.claim.turn.expectedLeafId,
-      userInput: String(input.build.lastTurnUserText || ""),
-      attachmentManifest: Array.isArray(
-        input.claim.recoveryMetadata.attachmentManifest,
-      )
-        ? input.claim.recoveryMetadata.attachmentManifest
-        : [],
-    },
-  };
-  const json = JSON.stringify(snapshot);
-  return {
-    snapshot,
-    json,
-    sha256: createHash("sha256").update(json).digest("hex"),
-  };
-}
-
-function appendKnowledgeBaseManusV2HandoffSnapshot(
-  prompt: string,
-  handoff: Awaited<ReturnType<typeof buildKnowledgeBaseManusV2HandoffSnapshot>>,
-) {
-  return [
-    "# FrontMind legacy build handoff",
-    "This is the only self-contained authority for the prior build. Continue the pending operation in this same task; do not require access to or repeat content from an old task.",
-    `snapshotSha256=${handoff.sha256}`,
-    "```json",
-    handoff.json,
-    "```",
-    "",
-    prompt,
-  ].join("\n");
-}
-
 async function dispatchMaterializedKnowledgeBaseClaim(input: {
   claim: KnowledgeBaseRecoveryClaim;
   credential: RecoveryCredential;
@@ -4959,18 +5252,39 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
   beginDispatch: typeof beginKnowledgeBaseManusV2Dispatch;
   bindSubmission: typeof bindKnowledgeBaseManusV2Submission;
   markOutcomeUnknown: typeof markKnowledgeBaseManusV2OutcomeUnknown;
+  downloadArchive: typeof downloadArchiveBytes;
+  persistCandidate: typeof persistKnowledgeBaseBuildSource;
+  readCandidate: typeof readKnowledgeBaseLocalSource;
+  validateInitialCandidate: typeof validateKnowledgeBaseWorkingSetArchive;
+  validateRevisionCandidate: typeof validateKnowledgeBaseRevisionAgainstActiveWorkingSet;
+  observeCandidate: typeof observeKnowledgeBaseMaterializedCompletionCandidate;
+  deferProviderStatus: typeof deferKnowledgeBaseMaterializedProviderStatus;
+  beginStop: typeof beginKnowledgeBaseMaterializedCompletionStop;
+  settleStop: typeof settleKnowledgeBaseMaterializedCompletionStopAttempt;
+  activateInitial: typeof activateInitialKnowledgeBaseWorkingSet;
+  applyRevision: typeof applyKnowledgeBaseRevisionWorkingSet;
   createClient: (input: {
     baseUrl: string;
     apiKey: string;
   }) => Pick<
     ManusV2Client,
-    | "createTask"
-    | "updateTaskVisibility"
-    | "findCreatedTask"
-    | "listAllMessages"
+    "createTask" | "findCreatedTask" | "listAllMessages" | "stopTask"
   >;
 }) {
   const { claim, credential, build } = input;
+  if (
+    claim.turn.materializedRecoveryContractVersion !== 1 ||
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    claim.turn.materializedCompletionContractVersion !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+  ) {
+    throw new KnowledgeBaseLocalPreparationError(
+      "RESET_REQUIRED",
+      "旧知识库构建不再续跑；请批准重置并重新上传资料",
+    );
+  }
   if (
     build.executionMode !== "materialized_bundle_v1" ||
     build.skillVersion !== "5" ||
@@ -4981,36 +5295,53 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       "The build is not a materialized v5 operation",
     );
   }
-  const prepared = await input.ensureDispatch({ claim, credential });
-  const attachments = await input.ensureManusV2Attachments({
-    claim,
-    credential,
-    baseUrl: prepared.baseUrl,
-  });
-  if (attachments.length !== prepared.requestBody.attachments.length) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      "The materialized task attachment ledger is incomplete",
+  if (
+    build.skillContentHash !== KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH
+  ) {
+    throw new KnowledgeBaseLocalPreparationError(
+      "RESET_REQUIRED",
+      "旧知识库构建不再续跑；请批准重置并重新上传资料",
     );
   }
+  const prepared = await input.ensureDispatch({ claim, credential });
   const title = `FrontMind KB ${build.id} g${build.generation} ${claim.turn.id}`;
-  const frozenBody = buildManusV2CreateTaskBody({
-    prompt: prepared.requestBody.prompt,
-    attachments,
-    title,
-    agentProfile: prepared.requestBody.agentProfile,
-    locale: "zh-CN",
-    hideInTaskList: true,
-  });
-  const bodyHash = createHash("sha256")
-    .update(JSON.stringify(frozenBody))
-    .digest("hex");
   const client = input.createClient({
     baseUrl: prepared.baseUrl,
     apiKey: credential.apiKey,
   });
   let taskId = claim.turn.upstreamTaskId || null;
-  if (claim.turn.createAttemptState === "not_sent") {
+  if (!taskId && claim.turn.createAttemptState === "not_sent") {
+    // Provider attachment identities are dispatch-time proof only. Once a
+    // task id is bound, recovery must poll that exact task and must not run
+    // the pre-create finalizer again: the finalizer deliberately accepts only
+    // `not_sent`, and provider files may also change lifecycle after task
+    // create consumes them.
+    const attachments = await input.ensureManusV2Attachments({
+      claim,
+      credential,
+      baseUrl: prepared.baseUrl,
+    });
+    if (attachments.length !== prepared.requestBody.attachments.length) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The materialized task attachment ledger is incomplete",
+      );
+    }
+    logKnowledgeBaseClaimDispatchPhase(claim, "map", {
+      expectedCount: prepared.requestBody.attachments.length,
+      stagedCount: prepared.requestBody.attachments.length,
+      mappingCount: attachments.length,
+    });
+    const frozenBody = buildManusV2CreateTaskBody({
+      prompt: prepared.requestBody.prompt,
+      attachments,
+      title,
+      agentProfile: prepared.requestBody.agentProfile,
+      locale: "zh-CN",
+    });
+    const bodyHash = createHash("sha256")
+      .update(JSON.stringify(frozenBody))
+      .digest("hex");
     const authority = await input.beginDispatch({
       userId: claim.turn.userId,
       turnId: claim.turn.id,
@@ -5031,6 +5362,12 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
     }
     claim.turn.providerMethod = "task.create";
     claim.turn.providerAttemptState = "sending";
+    logKnowledgeBaseClaimDispatchPhase(claim, "task_create", {
+      expectedCount: attachments.length,
+      stagedCount: attachments.length,
+      mappingCount: attachments.length,
+      createState: "sending",
+    });
     try {
       const created = await client.createTask({
         prompt: prepared.requestBody.prompt,
@@ -5038,9 +5375,14 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
         title,
         agentProfile: prepared.requestBody.agentProfile,
         locale: "zh-CN",
-        hideInTaskList: true,
       });
       taskId = created.taskId;
+      // Provider 2xx has consumed the one allowed create even before the
+      // local bind commits. If that bind crashes, persistence must move this
+      // turn to outcome-unknown so recovery finds/adopts the existing task by
+      // frozen title instead of posting task.create again.
+      claim.turn.createAttemptState = "unknown";
+      claim.turn.providerAttemptState = "output_pending";
       await input.bindSubmission({
         userId: claim.turn.userId,
         turnId: claim.turn.id,
@@ -5053,7 +5395,25 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       claim.turn.upstreamTaskId = taskId;
       claim.turn.createAttemptState = "acknowledged";
       claim.turn.providerAttemptState = "output_pending";
+      logKnowledgeBaseClaimDispatchPhase(claim, "task_create", {
+        expectedCount: attachments.length,
+        stagedCount: attachments.length,
+        mappingCount: attachments.length,
+        createState: "acknowledged",
+      });
     } catch (error) {
+      logKnowledgeBaseClaimDispatchPhase(claim, "task_create", {
+        errorCode:
+          error instanceof ManusV2ApiError && error.outcomeUnknown
+            ? "MANUS_V2_CREATE_OUTCOME_UNKNOWN"
+            : error instanceof ManusV2ApiError
+              ? "MANUS_V2_CREATE_REJECTED"
+              : "MANUS_V2_CREATE_LOCAL_BIND_FAILED",
+        expectedCount: attachments.length,
+        stagedCount: attachments.length,
+        mappingCount: attachments.length,
+        createState: claim.turn.createAttemptState,
+      });
       if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
         await input.markOutcomeUnknown({
           userId: claim.turn.userId,
@@ -5106,57 +5466,364 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
   await promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(claim, {
     activation: "materialized_patch",
   });
-  const events = await client.listAllMessages({ taskId, order: "desc" });
-  const status = latestManusV2TaskState(events) || "running";
-  if (status !== "stopped") {
-    if (status === "error" || status === "failed" || status === "cancelled") {
-      throw new KnowledgeBaseMaterializedError(
-        "INVALID_BUILD_STATE",
-        "全量物化任务已失败；上一版 Working Set 未受影响",
-      );
+  let events: Awaited<ReturnType<typeof client.listAllMessages>>;
+  try {
+    events = await client.listAllMessages({ taskId, order: "desc" });
+  } catch (error) {
+    if (
+      error instanceof ManusV2ApiError &&
+      error.operation === "task.listMessages" &&
+      error.status === 404 &&
+      !error.outcomeUnknown
+    ) {
+      const deferred = await input.deferProviderStatus({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        status: "list_messages_404",
+      });
+      return {
+        taskId,
+        rebound: true,
+        reconciled: deferred.state === "unavailable",
+      };
     }
-    return { taskId, rebound: true, reconciled: false };
+    throw error;
   }
+  const status = latestManusV2TaskState(events) || "unknown";
   const output = normalizeManusV2Output(events);
   const descriptors = collectKnowledgeArchiveDescriptors(output);
   const expectedFilename =
     build.contentVersion === 0
       ? `frontmind-kb-bundle-${claim.turn.operationKey}.zip`
       : `frontmind-kb-patch-${claim.turn.operationKey}.zip`;
-  if (
-    descriptors.length !== 1 ||
-    descriptors[0]!.filename !== expectedFilename ||
-    !descriptors[0]!.url
-  ) {
-    throw new KnowledgeBaseMaterializedError(
-      "INVALID_BUILD_STATE",
-      `物化任务必须返回唯一 ZIP 附件 ${expectedFilename}`,
+  const exactDescriptor =
+    descriptors.length === 1 && (descriptors[0]!.url || descriptors[0]!.fileId)
+      ? descriptors[0]!
+      : null;
+  const canonicalCandidateBytes = async (archiveBytes: Buffer) => {
+    if (build.contentVersion === 0) {
+      const validated = await input.validateInitialCandidate(
+        archiveBytes,
+        knowledgeBaseInitialBundleExpectation({
+          build,
+          operationId: claim.turn.operationKey,
+          expectedUploadsRead: claim.turn.expectedUserAttachmentCount,
+        }),
+      );
+      return validated.archiveBytes;
+    }
+    if (!claim.turn.expectedLeafId) {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        "Revision 缺少目标节点",
+      );
+    }
+    const validated = await input.validateRevisionCandidate({
+      userId: claim.turn.userId,
+      buildId: build.id,
+      generation: build.generation,
+      turnId: claim.turn.id,
+      providerTaskId: taskId,
+      targetLeafId: claim.turn.expectedLeafId,
+      operationId: claim.turn.operationKey,
+      archiveBytes,
+    });
+    return validated.patch.archiveBytes;
+  };
+
+  if (status !== "stopped") {
+    if (status === "cancelled") {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+        "全量物化任务已取消，无法读取最终结果",
+      );
+    }
+    const priorCompletion = claim.turn.materializedCompletion;
+    const currentEventIdHash = exactDescriptor
+      ? materializedDescriptorIdentityHash(exactDescriptor)
+      : null;
+    // Descriptor ids and URLs are transport hints, not candidate identity.
+    // Only a successfully downloaded and canonicalized byte change may reset
+    // the stable window below.
+    let resetCandidate = !exactDescriptor;
+    if (priorCompletion?.stopAttemptState) {
+      if (
+        !currentEventIdHash ||
+        !priorCompletion.storageKey ||
+        !priorCompletion.candidateArchiveSha256 ||
+        !priorCompletion.sizeBytes
+      ) {
+        throw new KnowledgeBaseMaterializedResultError(
+          "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+          "task.stop 后物化 ZIP 候选账本不一致",
+        );
+      }
+      if (priorCompletion.stopAttemptState === "sending") {
+        // Persisted `sending` means the Provider side effect may already have
+        // happened. Convert it to the ten-minute read-only ambiguity window
+        // before any 120-second candidate disposition can expire it.
+        await input.settleStop({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          state: "outcome_unknown",
+        });
+      }
+    }
+    if (priorCompletion?.stopAttemptState && status !== "running") {
+      const observedStop = await input.observeCandidate({
+        userId: claim.turn.userId,
+        turnId: claim.turn.id,
+        leaseToken: claim.leaseToken,
+        candidateEventIdHash: currentEventIdHash!,
+        storageKey: priorCompletion.storageKey!,
+        candidateArchiveSha256: priorCompletion.candidateArchiveSha256!,
+        sizeBytes: priorCompletion.sizeBytes!,
+        providerStatus: status,
+      });
+      if (observedStop.disposition === "stop_settle_expired") {
+        throw new KnowledgeBaseMaterializedResultError(
+          "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+          "task.stop 后未在限定时间内观察到 stopped",
+        );
+      }
+      return { taskId, rebound: true, reconciled: false };
+    }
+
+    if (status === "running" && exactDescriptor) {
+      try {
+        const downloaded = await input.downloadArchive({
+          descriptor: exactDescriptor,
+          apiKey: credential.apiKey,
+          baseUrl: prepared.baseUrl,
+          // The exact current Skill hash is checked before any Provider client
+          // or result access. This opt-in is therefore unavailable to legacy
+          // artifact binders and old unfinished builds.
+          allowProviderFileIdFallback: true,
+        });
+        const candidateBytes = await canonicalCandidateBytes(downloaded.buffer);
+        if (priorCompletion?.stopAttemptState) {
+          const downloadedSha256 = createHash("sha256")
+            .update(candidateBytes)
+            .digest("hex");
+          if (
+            downloadedSha256 !== priorCompletion.candidateArchiveSha256 ||
+            candidateBytes.length !== priorCompletion.sizeBytes
+          ) {
+            throw new KnowledgeBaseMaterializedResultError(
+              "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+              "task.stop 后物化 ZIP 内容或大小发生变化",
+            );
+          }
+          let staged: Buffer;
+          try {
+            staged = await input.readCandidate({
+              storageKey: priorCompletion.storageKey!,
+              contentSha256: priorCompletion.candidateArchiveSha256!,
+              sizeBytes: priorCompletion.sizeBytes!,
+            });
+          } catch {
+            throw new KnowledgeBaseMaterializedResultError(
+              "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+              "task.stop 后本地候选暂存不可用",
+            );
+          }
+          if (!staged.equals(candidateBytes)) {
+            throw new KnowledgeBaseMaterializedResultError(
+              "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+              "task.stop 后本地候选字节发生变化",
+            );
+          }
+        }
+        const retained = priorCompletion?.stopAttemptState
+          ? {
+              storageKey: priorCompletion.storageKey!,
+              contentSha256: priorCompletion.candidateArchiveSha256!,
+              sizeBytes: priorCompletion.sizeBytes!,
+            }
+          : await input.persistCandidate({
+              userId: claim.turn.userId,
+              buildId: build.id,
+              generation: build.generation,
+              bytes: candidateBytes,
+            });
+        const observed = await input.observeCandidate({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          candidateEventIdHash:
+            materializedDescriptorIdentityHash(exactDescriptor),
+          storageKey: retained.storageKey,
+          candidateArchiveSha256: retained.contentSha256,
+          sizeBytes: retained.sizeBytes,
+          providerStatus: status,
+        });
+        if (observed.disposition === "stop_settle_expired") {
+          throw new KnowledgeBaseMaterializedResultError(
+            "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+            "task.stop 后未在限定时间内观察到 stopped",
+          );
+        }
+        if (observed.disposition === "stop_pending") {
+          return { taskId, rebound: true, reconciled: false };
+        }
+        if (observed.disposition !== "stop_due") {
+          return { taskId, rebound: true, reconciled: false };
+        }
+        const stop = await input.beginStop({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+        });
+        if (!stop.send) {
+          return { taskId, rebound: true, reconciled: false };
+        }
+        try {
+          const acknowledgement = await client.stopTask(taskId);
+          await input.settleStop({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            state: "acknowledged",
+            requestRef: acknowledgement.requestId,
+          });
+        } catch (error) {
+          const state =
+            error instanceof ManusV2ApiError && !error.outcomeUnknown
+              ? "rejected"
+              : "outcome_unknown";
+          await input.settleStop({
+            userId: claim.turn.userId,
+            turnId: claim.turn.id,
+            leaseToken: claim.leaseToken,
+            state,
+            requestRef:
+              error instanceof ManusV2ApiError ? error.providerRequestId : null,
+          });
+        }
+        return { taskId, rebound: true, reconciled: false };
+      } catch (error) {
+        const candidateInvalid =
+          error instanceof KnowledgeBaseMaterializedContractError ||
+          (error instanceof KnowledgeBaseMaterializedError &&
+            error.code === "PATCH_CONFLICT");
+        const candidateReadUnavailable =
+          error instanceof KnowledgeArchiveDownloadError;
+        if (!candidateInvalid && !candidateReadUnavailable) throw error;
+        if (priorCompletion?.stopAttemptState) {
+          throw new KnowledgeBaseMaterializedResultError(
+            "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+            "task.stop 后物化 ZIP 无法维持已验证合同",
+          );
+        }
+        const descriptorMatchesPriorCandidate =
+          exactDescriptor !== null &&
+          priorCompletion?.candidateEventIdHash ===
+            materializedDescriptorIdentityHash(exactDescriptor);
+        resetCandidate =
+          candidateInvalid ||
+          candidateReadUnavailable ||
+          !descriptorMatchesPriorCandidate;
+        // A running task may replace an invalid/incompletely readable
+        // candidate. Do not reject it until stopped or its provider deadline.
+      }
+    }
+
+    const errorType =
+      status === "error" || status === "failed"
+        ? latestMaterializedErrorType(events)
+        : null;
+    const providerStatus =
+      status === "waiting"
+        ? "waiting"
+        : status === "error" || status === "failed"
+          ? errorType && MATERIALIZED_QUOTA_ERROR_TYPES.has(errorType)
+            ? "quota_error"
+            : "error"
+          : status === "running"
+            ? "running"
+            : "unknown";
+    const deferred = await input.deferProviderStatus({
+      userId: claim.turn.userId,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      status: providerStatus,
+      resetCandidate,
+    });
+    return {
+      taskId,
+      rebound: true,
+      reconciled: deferred.state === "unavailable",
+    };
+  }
+
+  if (!exactDescriptor) {
+    throw new KnowledgeBaseMaterializedResultError(
+      "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+      `物化任务必须返回唯一且可下载的 ZIP 附件；建议文件名 ${expectedFilename}`,
     );
   }
-  const downloaded = await downloadArchiveBytes({
-    descriptor: { ...descriptors[0]!, fileId: undefined },
+  const downloaded = await input.downloadArchive({
+    descriptor: exactDescriptor,
     apiKey: credential.apiKey,
     baseUrl: prepared.baseUrl,
+    allowProviderFileIdFallback: true,
   });
+  const candidateBytes = await canonicalCandidateBytes(downloaded.buffer);
+  const terminalLedger = claim.turn.materializedCompletion;
+  if (terminalLedger?.stopAttemptState) {
+    const stoppedContentSha256 = createHash("sha256")
+      .update(candidateBytes)
+      .digest("hex");
+    if (
+      !terminalLedger.candidateEventIdHash ||
+      !terminalLedger.storageKey ||
+      !terminalLedger.candidateArchiveSha256 ||
+      !terminalLedger.sizeBytes ||
+      stoppedContentSha256 !== terminalLedger.candidateArchiveSha256 ||
+      candidateBytes.length !== terminalLedger.sizeBytes
+    ) {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        "task.stop 后最终 ZIP 与已验证候选不一致",
+      );
+    }
+    const staged = await input.readCandidate({
+      storageKey: terminalLedger.storageKey,
+      contentSha256: terminalLedger.candidateArchiveSha256,
+      sizeBytes: terminalLedger.sizeBytes,
+    });
+    if (!staged.equals(candidateBytes)) {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        "task.stop 后最终 ZIP 字节发生变化",
+      );
+    }
+  }
   if (build.contentVersion === 0) {
-    await activateInitialKnowledgeBaseWorkingSet({
+    await input.activateInitial({
       userId: claim.turn.userId,
       buildId: build.id,
       generation: build.generation,
       turnId: claim.turn.id,
       operationKey: claim.turn.operationKey,
       providerTaskId: taskId,
-      archiveBytes: downloaded.buffer,
-      expectedSkillContentHash: build.skillContentHash!,
+      archiveBytes: candidateBytes,
+      initialBundleExpectation: knowledgeBaseInitialBundleExpectation({
+        build,
+        operationId: claim.turn.operationKey,
+        expectedUploadsRead: claim.turn.expectedUserAttachmentCount,
+      }),
     });
   } else {
     if (!claim.turn.expectedLeafId) {
-      throw new KnowledgeBaseMaterializedError(
-        "PATCH_CONFLICT",
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
         "Revision 缺少目标节点",
       );
     }
-    await applyKnowledgeBaseRevisionWorkingSet({
+    await input.applyRevision({
       userId: claim.turn.userId,
       buildId: build.id,
       generation: build.generation,
@@ -5164,10 +5831,9 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       operationId: claim.turn.operationKey,
       providerTaskId: taskId,
       targetLeafId: claim.turn.expectedLeafId,
-      archiveBytes: downloaded.buffer,
+      archiveBytes: candidateBytes,
     });
   }
-  void client.updateTaskVisibility(taskId, true).catch(() => undefined);
   return { taskId, rebound: true, reconciled: true };
 }
 
@@ -5176,35 +5842,33 @@ async function dispatchKnowledgeBaseRecoveryClaim(
   credential: RecoveryCredential,
   dependencies: {
     loadBuild?: typeof loadKnowledgeBaseBuildRecordById;
-    loadPreproviderAuthority?: typeof loadKnowledgeBasePreproviderLocalRehydrateAuthority;
-    buildHandoffSnapshot?: typeof buildKnowledgeBaseManusV2HandoffSnapshot;
     ensureDispatch?: typeof ensureKnowledgeBaseRecoveryDispatch;
     ensureManusV2Attachments?: typeof ensureKnowledgeBaseManusV2Attachments;
     beginDispatch?: typeof beginKnowledgeBaseManusV2Dispatch;
     markManusV2OutcomeUnknown?: typeof markKnowledgeBaseManusV2OutcomeUnknown;
+    downloadArchive?: typeof downloadArchiveBytes;
+    persistCandidate?: typeof persistKnowledgeBaseBuildSource;
+    readCandidate?: typeof readKnowledgeBaseLocalSource;
+    validateInitialCandidate?: typeof validateKnowledgeBaseWorkingSetArchive;
+    validateRevisionCandidate?: typeof validateKnowledgeBaseRevisionAgainstActiveWorkingSet;
+    observeCandidate?: typeof observeKnowledgeBaseMaterializedCompletionCandidate;
+    deferProviderStatus?: typeof deferKnowledgeBaseMaterializedProviderStatus;
+    beginStop?: typeof beginKnowledgeBaseMaterializedCompletionStop;
+    settleStop?: typeof settleKnowledgeBaseMaterializedCompletionStopAttempt;
+    activateInitial?: typeof activateInitialKnowledgeBaseWorkingSet;
+    applyRevision?: typeof applyKnowledgeBaseRevisionWorkingSet;
     createClient?: (input: {
       baseUrl: string;
       apiKey: string;
     }) => Pick<
       ManusV2Client,
-      | "createTask"
-      | "sendMessage"
-      | "updateTaskVisibility"
-      | "findCreatedTask"
-      | "listAllMessages"
+      "createTask" | "findCreatedTask" | "listAllMessages" | "stopTask"
     >;
     bindSubmission?: typeof bindKnowledgeBaseManusV2Submission;
-    reconcileTask?: typeof reconcileRecoveredKnowledgeBaseTask;
   } = {},
 ) {
   beginKnowledgeBaseClaimReadinessTiming(claim);
   const loadBuild = dependencies.loadBuild ?? loadKnowledgeBaseBuildRecordById;
-  const loadPreproviderAuthority =
-    dependencies.loadPreproviderAuthority ??
-    loadKnowledgeBasePreproviderLocalRehydrateAuthority;
-  const buildHandoffSnapshot =
-    dependencies.buildHandoffSnapshot ??
-    buildKnowledgeBaseManusV2HandoffSnapshot;
   const ensureDispatch =
     dependencies.ensureDispatch ?? ensureKnowledgeBaseRecoveryDispatch;
   const ensureManusV2Attachments =
@@ -5219,9 +5883,33 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     dependencies.createClient ?? ((input) => new ManusV2Client(input));
   const bindSubmission =
     dependencies.bindSubmission ?? bindKnowledgeBaseManusV2Submission;
-  const reconcileTask =
-    dependencies.reconcileTask ?? reconcileRecoveredKnowledgeBaseTask;
-  let existingBuild = await loadBuild(claim.turn.userId, claim.turn.buildId);
+  const downloadArchive = dependencies.downloadArchive ?? downloadArchiveBytes;
+  const persistCandidate =
+    dependencies.persistCandidate ?? persistKnowledgeBaseBuildSource;
+  const readCandidate =
+    dependencies.readCandidate ?? readKnowledgeBaseLocalSource;
+  const validateInitialCandidate =
+    dependencies.validateInitialCandidate ??
+    validateKnowledgeBaseWorkingSetArchive;
+  const validateRevisionCandidate =
+    dependencies.validateRevisionCandidate ??
+    validateKnowledgeBaseRevisionAgainstActiveWorkingSet;
+  const observeCandidate =
+    dependencies.observeCandidate ??
+    observeKnowledgeBaseMaterializedCompletionCandidate;
+  const deferProviderStatus =
+    dependencies.deferProviderStatus ??
+    deferKnowledgeBaseMaterializedProviderStatus;
+  const beginStop =
+    dependencies.beginStop ?? beginKnowledgeBaseMaterializedCompletionStop;
+  const settleStop =
+    dependencies.settleStop ??
+    settleKnowledgeBaseMaterializedCompletionStopAttempt;
+  const activateInitial =
+    dependencies.activateInitial ?? activateInitialKnowledgeBaseWorkingSet;
+  const applyRevision =
+    dependencies.applyRevision ?? applyKnowledgeBaseRevisionWorkingSet;
+  const existingBuild = await loadBuild(claim.turn.userId, claim.turn.buildId);
   if (!existingBuild) {
     throw new KnowledgeBaseTurnReservationError(
       "BUILD_NOT_FOUND",
@@ -5233,642 +5921,39 @@ async function dispatchKnowledgeBaseRecoveryClaim(
       MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
     existingBuild.skillVersion !== "5" ||
     existingBuild.providerProtocol !== "manus_v2" ||
-    existingBuild.contentVersion === null
+    existingBuild.contentVersion === null ||
+    knowledgeBaseMaterializedRecoveryContractVersion(existingBuild) !== 1
   ) {
     // This is the final Provider boundary for both accepted HTTP work and the
     // recovery sweep. Old rows can contain v2-looking task metadata after a
     // historical handoff attempt; only the exact materialized-v5 triple is
     // allowed to reach attachment preparation or the Provider client.
-    throw new KnowledgeBaseTurnReservationError(
+    throw new KnowledgeBaseLocalPreparationError(
       "RESET_REQUIRED",
       "旧知识库构建不再续跑；请批准重置并重新上传资料",
     );
   }
-  if (existingBuild.executionMode === "materialized_bundle_v1") {
-    return dispatchMaterializedKnowledgeBaseClaim({
-      claim,
-      credential,
-      build: existingBuild,
-      ensureDispatch,
-      ensureManusV2Attachments,
-      beginDispatch,
-      bindSubmission,
-      markOutcomeUnknown: markManusV2OutcomeUnknownForDispatch,
-      createClient,
-    });
-  }
-  let handoff: Awaited<
-    ReturnType<typeof buildKnowledgeBaseManusV2HandoffSnapshot>
-  > | null = null;
-  let localCanonicalSnapshot: Awaited<
-    ReturnType<typeof loadKnowledgeBaseLocalRehydrateSnapshot>
-  > = null;
-  if (
-    knowledgeBaseManusV2ActiveMigrationEnabled() &&
-    String(existingBuild.providerProtocol) === "legacy_v1" &&
-    claim.turn.createAttemptState === "not_sent" &&
-    !claim.turn.upstreamTaskId &&
-    ["researching", "confirming", "protocol_error"].includes(
-      existingBuild.status,
-    )
-  ) {
-    handoff = await buildKnowledgeBaseManusV2HandoffSnapshot({
-      claim,
-      build: existingBuild,
-    });
-    await activateKnowledgeBaseManusV2Handoff({
-      userId: claim.turn.userId,
-      turnId: claim.turn.id,
-      leaseToken: claim.leaseToken,
-      expectedGeneration: claim.turn.buildGeneration,
-      expectedRevision: claim.turn.expectedRevision,
-      expectedLeafId: claim.turn.expectedLeafId,
-      snapshotSha256: handoff.sha256,
-      legacyTaskIdSha256: existingBuild.upstreamTaskId
-        ? createHash("sha256")
-            .update(existingBuild.upstreamTaskId)
-            .digest("hex")
-        : null,
-    });
-    claim.turn.providerProtocol = "manus_v2";
-    claim.turn.providerAttemptState = "not_sent";
-    existingBuild = await loadBuild(claim.turn.userId, claim.turn.buildId);
-  }
-  const minimalCompatibleCreate =
-    claim.recoveryMetadata.compatibilityMode === "minimal_v2_create";
-  if (minimalCompatibleCreate && existingBuild?.canonicalTaskId) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      "The compatible create authority changed before dispatch",
-    );
-  }
-  if (
-    existingBuild?.providerProtocol === "manus_v2" &&
-    !existingBuild.canonicalTaskId &&
-    claim.turn.createAttemptState === "not_sent" &&
-    claim.turn.providerAttemptState === "not_sent" &&
-    claim.recoveryMetadata.compatibilityMode !== "minimal_v2_create" &&
-    existingBuild.handoffProvenance &&
-    typeof existingBuild.handoffProvenance === "object" &&
-    !Array.isArray(existingBuild.handoffProvenance)
-  ) {
-    const localRehydrateValue =
-      existingBuild.handoffProvenance.localRehydrateRequired;
-    const localRehydrateMarker =
-      localRehydrateValue &&
-      typeof localRehydrateValue === "object" &&
-      !Array.isArray(localRehydrateValue)
-        ? (localRehydrateValue as Record<string, unknown>)
-        : null;
-    const localRehydrateRequired = Boolean(localRehydrateMarker);
-    const preproviderMarker =
-      localRehydrateMarker &&
-      localRehydrateMarker.reason ===
-        "generated_attachment_invalid_preprovider";
-    const preproviderLocalRehydrate = localRehydrateRequired
-      ? await loadPreproviderAuthority({
-          userId: claim.turn.userId,
-          build: existingBuild,
-          expectedActiveTurnId: claim.turn.id,
-        })
-      : null;
-    if (preproviderLocalRehydrate) {
-      // The failed legacy confirm had no prepared Provider request, so its
-      // release deliberately has no frozen provider snapshot. Rebuild the
-      // complete Dashboard-owned nodes/receipts plus this new operation from
-      // durable state, after reproving the exact release source.
-      handoff = await buildHandoffSnapshot({
-        claim,
-        build: existingBuild,
-      });
-    } else if (preproviderMarker) {
-      // This marker can only be consumed with its released source tombstone
-      // and the exact active continuation proof. Do not fall through to the
-      // older local-settlement snapshot protocol: a stale/corrupt coordinate
-      // would otherwise return to the generic recovery scan forever.
-      throw new KnowledgeBaseLocalPreparationError(
-        "KNOWLEDGE_BASE_LOCAL_REHYDRATE_AUTHORITY_INVALID",
-        "知识库本地恢复坐标已发生变化，请联系支持处理",
-      );
-    } else if (localRehydrateRequired) {
-      localCanonicalSnapshot = await loadKnowledgeBaseLocalRehydrateSnapshot({
-        userId: claim.turn.userId,
-        build: existingBuild,
-      });
-    } else {
-      // Only the legacy cutover protocol owns a top-level snapshot digest.
-      // A local rehydrate marker is a different authority and must never be
-      // compared to this digest (historically undefined !== rebuilt caused a
-      // permanent pre-create recovery loop).
-      const committedSnapshotSha256 =
-        existingBuild.handoffProvenance.snapshotSha256;
-      if (
-        typeof committedSnapshotSha256 !== "string" ||
-        !/^[a-f0-9]{64}$/u.test(committedSnapshotSha256)
-      ) {
-        throw new KnowledgeBaseTurnReservationError(
-          "CONFLICT",
-          "The durable Manus v2 handoff snapshot authority is missing",
-        );
-      }
-      const rebuilt = await buildHandoffSnapshot({
-        claim,
-        build: existingBuild,
-      });
-      if (committedSnapshotSha256 !== rebuilt.sha256) {
-        throw new KnowledgeBaseTurnReservationError(
-          "CONFLICT",
-          "The durable Manus v2 handoff snapshot changed before task creation",
-        );
-      }
-      handoff = rebuilt;
-    }
-  }
-  if (existingBuild?.providerProtocol === "manus_v2") {
-    const recoveryAuthority = knowledgeBaseManusV2RecoveryAuthority({
-      canonicalTaskId: existingBuild.canonicalTaskId,
-      createAttemptState: claim.turn.createAttemptState,
-      providerAttemptState: claim.turn.providerAttemptState,
-    });
-    if (recoveryAuthority === "deferred_disabled") {
-      throw new KnowledgeBaseManusV2RolloutDeferredError();
-    }
-    if (recoveryAuthority === "reconcile_only") {
-      const client = createClient({
-        baseUrl: claim.preparedDispatch?.baseUrl || getUpstreamBaseUrl(),
-        apiKey: credential.apiKey,
-      });
-      let taskId = existingBuild.canonicalTaskId;
-      if (!taskId && claim.turn.providerMethod === "task.create") {
-        const preparedAtSeconds = claim.preparedDispatch?.preparedAt
-          ? Math.floor(Date.parse(claim.preparedDispatch.preparedAt) / 1_000)
-          : undefined;
-        const reconciled = await client.findCreatedTask({
-          title: `FrontMind KB ${existingBuild.id} g${existingBuild.generation}`,
-          operationToken: claim.turn.operationToken,
-          ...(preparedAtSeconds
-            ? {
-                createdAfterSeconds: preparedAtSeconds - 300,
-                createdBeforeSeconds: preparedAtSeconds + 3_600,
-              }
-            : {}),
-        });
-        if (!reconciled.unique) {
-          throw new ManusV2ApiError(
-            "task.create.reconcile",
-            null,
-            reconciled.matches.length > 1
-              ? "AMBIGUOUS_CREATE"
-              : "CREATE_NOT_OBSERVED",
-            true,
-            true,
-          );
-        }
-        taskId = reconciled.unique.id;
-        await bindSubmission({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-          method: "task.create",
-          taskId,
-          taskUrl: reconciled.unique.taskUrl,
-        });
-        claim.turn.upstreamTaskId = taskId;
-      }
-      if (!taskId) {
-        throw new KnowledgeBaseTurnReservationError(
-          "CONFLICT",
-          "The Manus v2 operation has no canonical task to reconcile",
-        );
-      }
-      const events = await client.listAllMessages({
-        taskId,
-        order: "desc",
-      });
-      const contract = manusV2ContractForTurn({
-        claim,
-        build: existingBuild,
-      });
-      const taskStatus = latestManusV2TaskState(events) || "running";
-      // Never pre-parse a stopped result here. The single lifecycle reconciler
-      // owns all stopped parsing so malformed structured output reaches its
-      // one repair/deadline/attention terminal path instead of being thrown
-      // back into the generic outcome-unknown lease loop.
-      if (taskStatus === "stopped") {
-        if (
-          claim.turn.providerMethod === "task.sendMessage" &&
-          !claim.turn.upstreamTaskId
-        ) {
-          await bindSubmission({
-            userId: claim.turn.userId,
-            turnId: claim.turn.id,
-            leaseToken: claim.leaseToken,
-            method: "task.sendMessage",
-            taskId,
-          });
-          claim.turn.upstreamTaskId = taskId;
-        }
-        const reconciled = await reconcileTask({
-          claim,
-          credential,
-          taskId,
-        });
-        return { taskId, rebound: false, reconciled };
-      }
-      const exactStructuredResult =
-        manusV2KnowledgeBaseStructuredResultForOperation(events, contract);
-      const exactAssistantResult = manusV2ClaimProvesFrozenDispatchAttribution({
-        claim,
-        taskId,
-      })
-        ? manusV2KnowledgeBaseAssistantProtocolFallback({
-            events,
-            contract,
-            taskStatus,
-          })
-        : null;
-      if (
-        !manusV2EventsContainOperationToken(
-          events,
-          claim.turn.operationToken,
-        ) &&
-        !exactStructuredResult &&
-        !exactAssistantResult
-      ) {
-        throw new ManusV2ApiError(
-          "task.sendMessage.reconcile",
-          null,
-          "OPERATION_NOT_OBSERVED",
-          true,
-          true,
-        );
-      }
-      if (
-        claim.turn.providerMethod === "task.sendMessage" &&
-        !claim.turn.upstreamTaskId
-      ) {
-        await bindSubmission({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-          method: "task.sendMessage",
-          taskId,
-        });
-        claim.turn.upstreamTaskId = taskId;
-      }
-      const output = await normalizeManusV2KnowledgeBaseOperationOutput({
-        events,
-        contract,
-        taskStatus,
-        allowAssistantProtocolFallback:
-          manusV2ClaimProvesFrozenDispatchAttribution({ claim, taskId }),
-        build: existingBuild,
-        expectedUploadsRead: existingBuild.lastTurnAttachmentCount,
-      });
-      const reconciled =
-        output.length > 0 && shouldReconcileKnowledgeOutput(output, taskStatus)
-          ? await reconcileTask({
-              claim,
-              credential,
-              taskId,
-            })
-          : false;
-      return { taskId, rebound: false, reconciled };
-    }
-    const prepared = await ensureDispatch({
-      claim,
-      credential,
-    });
-    const v2Attachments = await ensureManusV2Attachments({
-      claim,
-      credential,
-      baseUrl: prepared.baseUrl,
-    });
-    if (
-      v2Attachments.length !== prepared.requestBody.attachments.length ||
-      v2Attachments.some(
-        (attachment, index) =>
-          attachment.filename !==
-            prepared.requestBody.attachments[index]?.filename ||
-          ((!("file_id" in attachment) || !attachment.file_id) &&
-            (!("file_data" in attachment) || !attachment.file_data)),
-      )
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "The complete Manus v2 ready attachment ledger is required",
-      );
-    }
-    const contract = manusV2ContractForTurn({ claim, build: existingBuild });
-    const structuredOutputSchema =
-      buildManusV2KnowledgeBaseStructuredOutputSchema(contract);
-    const businessPrompt = localCanonicalSnapshot
-      ? [
-          "# FrontMind local canonical rehydrate",
-          "Restore the exact Dashboard-owned accepted state before applying this business operation in this newly created canonical task.",
-          `snapshotSha256=${localCanonicalSnapshot.sha256}`,
-          "```json",
-          localCanonicalSnapshot.json,
-          "```",
-          "",
-          prepared.requestBody.prompt,
-        ].join("\n")
-      : handoff
-        ? appendKnowledgeBaseManusV2HandoffSnapshot(
-            prepared.requestBody.prompt,
-            handoff,
-          )
-        : existingBuild
-          ? await (async () => {
-              const local = await loadKnowledgeBaseLocalRehydrateSnapshot({
-                userId: claim.turn.userId,
-                build: existingBuild,
-              });
-              return local
-                ? [
-                    "# FrontMind local canonical rehydrate",
-                    "Restore the exact Dashboard-owned accepted state before applying this business operation on the same canonical task.",
-                    `snapshotSha256=${local.sha256}`,
-                    "```json",
-                    local.json,
-                    "```",
-                    "",
-                    prepared.requestBody.prompt,
-                  ].join("\n")
-                : prepared.requestBody.prompt;
-            })()
-          : prepared.requestBody.prompt;
-    const v2Prompt = appendManusV2KnowledgeBaseOperationContract(
-      businessPrompt,
-      contract,
-    );
-    const providerAttachments = v2Attachments;
-    const expectedProviderMethod = existingBuild.canonicalTaskId
-      ? ("task.sendMessage" as const)
-      : ("task.create" as const);
-    const structuredOutputSchemaJson = JSON.stringify(structuredOutputSchema);
-    const frozenProviderRequestBody =
-      expectedProviderMethod === "task.create"
-        ? buildManusV2CreateTaskBody({
-            prompt: v2Prompt,
-            attachments: providerAttachments,
-            title: `FrontMind KB ${existingBuild.id} g${existingBuild.generation}`,
-            ...(minimalCompatibleCreate
-              ? {}
-              : { agentProfile: prepared.requestBody.agentProfile }),
-            ...(minimalCompatibleCreate ? {} : { structuredOutputSchema }),
-            hideInTaskList: true,
-          })
-        : buildManusV2SendMessageBody({
-            taskId: existingBuild.canonicalTaskId!,
-            prompt: v2Prompt,
-            attachments: providerAttachments,
-            structuredOutputSchema,
-          });
-    const v2BodyHash = createHash("sha256")
-      .update(JSON.stringify(frozenProviderRequestBody))
-      .digest("hex");
-    const authority = await beginDispatch({
-      userId: claim.turn.userId,
-      turnId: claim.turn.id,
-      leaseToken: claim.leaseToken,
-      frozenProviderRequestHash: v2BodyHash,
-      leaseMs: 300_000,
-      expectedMethod: expectedProviderMethod,
-    });
-    if (
-      authority.method !== expectedProviderMethod ||
-      (expectedProviderMethod === "task.create" && authority.canonicalTaskId) ||
-      (expectedProviderMethod === "task.sendMessage" &&
-        authority.canonicalTaskId !== existingBuild.canonicalTaskId)
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "The knowledge-base dispatch authority changed before dispatch",
-      );
-    }
-    claim.turn.providerProtocol = "manus_v2";
-    claim.turn.providerMethod = authority.method;
-    claim.turn.providerAttemptState = "sending";
-    claim.turn.operationToken = authority.operationToken;
-    const client = createClient({
-      baseUrl: prepared.baseUrl,
-      apiKey: credential.apiKey,
-    });
-    let taskId = authority.canonicalTaskId;
-    let taskUrl: string | null = existingBuild.canonicalTaskUrl;
-    let requestId: string | null = null;
-    try {
-      if (authority.method === "task.create") {
-        const created = await client.createTask({
-          prompt: v2Prompt,
-          attachments: providerAttachments,
-          // The title is part of the stable core create envelope. Only the
-          // optional profile/schema are omitted by the one compatibility
-          // variant after a proven 400 rejection.
-          title: authority.title,
-          ...(minimalCompatibleCreate
-            ? {}
-            : { agentProfile: prepared.requestBody.agentProfile }),
-          ...(minimalCompatibleCreate ? {} : { structuredOutputSchema }),
-          hideInTaskList: true,
-        });
-        taskId = created.taskId;
-        taskUrl = created.taskUrl;
-        requestId = created.requestId;
-      } else {
-        if (!taskId) {
-          throw new KnowledgeBaseTurnReservationError(
-            "CONFLICT",
-            "The canonical Manus task is missing",
-          );
-        }
-        const sent = await client.sendMessage({
-          taskId,
-          prompt: v2Prompt,
-          attachments: providerAttachments,
-          structuredOutputSchema,
-        });
-        requestId = sent.requestId;
-      }
-    } catch (error) {
-      if (error instanceof ManusV2ApiError) {
-        Object.assign(error, {
-          frontmindRequestShape: {
-            promptUtf8Bytes: Buffer.byteLength(v2Prompt, "utf8"),
-            titleUtf8Bytes:
-              authority.method === "task.create"
-                ? Buffer.byteLength(authority.title, "utf8")
-                : 0,
-            attachmentCount: providerAttachments.length,
-            agentProfile:
-              authority.method === "task.create" && !minimalCompatibleCreate
-                ? prepared.requestBody.agentProfile
-                : null,
-            hasAgentProfile:
-              authority.method === "task.create" && !minimalCompatibleCreate,
-            hasStructuredOutputSchema: !minimalCompatibleCreate,
-            structuredOutputSchemaUtf8Bytes: minimalCompatibleCreate
-              ? 0
-              : Buffer.byteLength(structuredOutputSchemaJson, "utf8"),
-            structuredOutputSchemaSha256: minimalCompatibleCreate
-              ? null
-              : createHash("sha256")
-                  .update(structuredOutputSchemaJson, "utf8")
-                  .digest("hex"),
-            compatibilityMode: minimalCompatibleCreate
-              ? "minimal_v2_create"
-              : "standard",
-          },
-        });
-      }
-      if (
-        error instanceof ManusV2ApiError &&
-        error.outcomeUnknown &&
-        !minimalCompatibleCreate
-      ) {
-        await markManusV2OutcomeUnknownForDispatch({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-          code:
-            authority.method === "task.create"
-              ? "MANUS_V2_CREATE_OUTCOME_UNKNOWN"
-              : "MANUS_V2_SEND_OUTCOME_UNKNOWN",
-        });
-      }
-      throw error;
-    }
-    // The provider has acknowledged the side effect, but its local binding is
-    // still fallible. Reflect that boundary on the in-memory claim so an error
-    // from the following transaction is persisted as outcome-unknown and can
-    // only be reconciled; it must never be treated as a pre-POST failure.
-    claim.turn.providerAttemptState = "output_pending";
-    if (!taskId) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "The Manus v2 task acknowledgement is missing its task id",
-      );
-    }
-    await bindSubmission({
-      userId: claim.turn.userId,
-      turnId: claim.turn.id,
-      leaseToken: claim.leaseToken,
-      method: authority.method,
-      taskId,
-      taskUrl,
-      manusRequestId: requestId,
-    });
-    claim.turn.createAttemptState = "acknowledged";
-    claim.turn.providerAttemptState = "output_pending";
-    claim.turn.upstreamTaskId = taskId;
-    // task.create ownership is committed atomically with the canonical anchor
-    // by bindKnowledgeBaseManusV2Submission. A second best-effort registration
-    // here would reintroduce the bind/ownership crash window and, for project
-    // scoped historical rows, could attempt to rewrite the exact scope.
-    await promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(claim);
-    // task.create/sendMessage are asynchronous. The first read frequently has
-    // only running status; the normal recovery worker will keep polling the
-    // same canonical task until an accepted output appears.
-    const reconciled = await reconcileTask({
-      claim,
-      credential,
-      taskId,
-    });
-    if (reconciled && existingBuild) {
-      const after = await loadBuild(claim.turn.userId, claim.turn.buildId);
-      if (
-        after &&
-        after.generation === existingBuild.generation &&
-        after.revision === existingBuild.revision + 1 &&
-        after.canonicalTaskId === taskId
-      ) {
-        await clearKnowledgeBaseLocalRehydrateRequirement({
-          userId: claim.turn.userId,
-          buildId: after.id,
-          generation: after.generation,
-          expectedRevision: after.revision,
-          taskId,
-        });
-      }
-    }
-    void client.updateTaskVisibility(taskId, true).catch(() => undefined);
-    return { taskId, rebound: authority.method === "task.create", reconciled };
-  }
-  return recoverKnowledgeBaseTurnClaimTask({
+  return dispatchMaterializedKnowledgeBaseClaim({
     claim,
-    ensureDispatch: () =>
-      ensureKnowledgeBaseRecoveryDispatch({ claim, credential }),
-    createTask: async (prepared, idempotencyKey) => {
-      // Final, zero-wait barrier: the exact frozen names and ids must still be
-      // task-usable immediately before consuming the one create permission.
-      await checkKnowledgeBasePreparedAttachments({
-        claim,
-        credential,
-        dispatch: prepared,
-      });
-      await markKnowledgeBaseTurnDispatching({
-        userId: claim.turn.userId,
-        turnId: claim.turn.id,
-        leaseToken: claim.leaseToken,
-        leaseMs: 300_000,
-      });
-      claim.turn.createAttemptState = "sending";
-      const created = await createFrontMindTask({
-        baseUrl: prepared.baseUrl,
-        apiKey: credential.apiKey,
-        requestBody: prepared.requestBody,
-        idempotencyKey,
-        traceId: knowledgeBaseClaimTraceId(claim),
-      });
-      logKnowledgeBaseTaskCreateDiagnostic({
-        claim,
-        dispatch: prepared,
-        result: created,
-      });
-      if (!created.ok) {
-        const createError = knowledgeBaseUpstreamCreateError(created);
-        if (created.failureClass === "deterministic") {
-          claim.turn.createAttemptState = "rejected";
-        } else {
-          claim.turn.createAttemptState = "unknown";
-        }
-        throw createError;
-      }
-      return {
-        taskId: String(created.task.id),
-        taskData: created.task as unknown as Record<string, unknown>,
-      };
-    },
-    bindTask: async (taskId) => {
-      await bindKnowledgeBaseTurnUpstreamTask({
-        userId: claim.turn.userId,
-        turnId: claim.turn.id,
-        leaseToken: claim.leaseToken,
-        upstreamTaskId: taskId,
-      });
-      claim.turn.createAttemptState = "acknowledged";
-      claim.turn.upstreamTaskId = taskId;
-    },
-    registerTask: async (taskId) => {
-      await recordUpstreamResource({
-        userId: claim.turn.userId,
-        apiCredentialId: credential.id,
-        kind: "task",
-        upstreamId: taskId,
-      });
-    },
-    // Manual Logo bytes become the build Logo only after the provider returned
-    // and the exact upstream task id is durably bound to this turn.
-    afterTaskAcknowledged: () =>
-      promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(claim),
-    reconcileTask: (taskId, taskData) =>
-      reconcileRecoveredKnowledgeBaseTask({
-        claim,
-        credential,
-        taskId,
-        taskData,
-      }),
+    credential,
+    build: existingBuild,
+    ensureDispatch,
+    ensureManusV2Attachments,
+    beginDispatch,
+    bindSubmission,
+    markOutcomeUnknown: markManusV2OutcomeUnknownForDispatch,
+    downloadArchive,
+    persistCandidate,
+    readCandidate,
+    validateInitialCandidate,
+    validateRevisionCandidate,
+    observeCandidate,
+    deferProviderStatus,
+    beginStop,
+    settleStop,
+    activateInitial,
+    applyRevision,
+    createClient,
   });
 }
 
@@ -6026,11 +6111,7 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
   dependencies?: {
     client?: Pick<
       ManusV2Client,
-      | "createTask"
-      | "findCreatedTask"
-      | "listAllMessages"
-      | "sendMessage"
-      | "updateTaskVisibility"
+      "createTask" | "findCreatedTask" | "listAllMessages" | "sendMessage"
     >;
     loadBuild?: typeof loadKnowledgeBaseBuildRecordById;
     ensureSkillArchivePin?: typeof ensureKnowledgeBaseBuildSkillArchivePin;
@@ -6069,8 +6150,16 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
     );
   }
   let build = await loadBuild(claim.turn.userId, claim.turn.buildId);
-  if (build?.executionMode === "legacy_conversational") {
-    throw new KnowledgeBaseTurnReservationError(
+  if (
+    claim.turn.materializedRecoveryContractVersion !== 1 ||
+    claim.turn.materializedCompletionContractVersion !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
+    !build ||
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+  ) {
+    throw new KnowledgeBaseLocalPreparationError(
       "RESET_REQUIRED",
       "旧知识库构建不再执行会话锚点恢复；请批准重置并重新上传资料",
     );
@@ -6083,10 +6172,9 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
   ) {
     return { bound: false, reconciled: false };
   }
-  // The handoff snapshot is self-contained, but the build must still prove
-  // its exact physical Skill archive before continuing its canonical writer.
-  // Historical rows are durably backfilled here before any same-task repair
-  // side effect.
+  // A completion-v2 build may repair only its own pinned physical Skill
+  // archive after a same-task crash. Historical rows fail the marker gate
+  // above and are never lazily upgraded or rebuilt here.
   await ensureSkillArchivePin({
     userId: claim.turn.userId,
     buildId: build.id,
@@ -6094,7 +6182,20 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
   });
   build = await loadBuild(claim.turn.userId, claim.turn.buildId);
   if (
+    claim.turn.materializedRecoveryContractVersion !== 1 ||
+    claim.turn.materializedCompletionContractVersion !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
     !build ||
+    knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1 ||
+    knowledgeBaseMaterializedCompletionContractVersion(build) !==
+      KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION
+  ) {
+    throw new KnowledgeBaseLocalPreparationError(
+      "RESET_REQUIRED",
+      "旧知识库构建不再执行会话锚点恢复；请批准重置并重新上传资料",
+    );
+  }
+  if (
     build.generation !== claim.turn.buildGeneration ||
     build.providerProtocol !== "manus_v2" ||
     build.activeTurnId !== claim.turn.id
@@ -6164,7 +6265,6 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
         title: authorityTitle,
         agentProfile: prepared.requestBody.agentProfile,
         structuredOutputSchema,
-        hideInTaskList: true,
       });
       return {
         id: created.taskId,
@@ -6437,7 +6537,6 @@ async function dispatchKnowledgeBaseAnchorHandoffClaim(input: {
           taskId: task.id,
           acknowledgement: acknowledgement.acknowledgement,
         });
-        void client.updateTaskVisibility(task.id, true).catch(() => undefined);
         return "completed";
       }
       const settlement = classifyKnowledgeBaseAnchorAcknowledgementSettlement({
@@ -7136,6 +7235,8 @@ export async function persistKnowledgeBaseDispatchFailure(
     markManusV2OutcomeUnknown?: typeof markKnowledgeBaseManusV2OutcomeUnknown;
     persistCreateFailure?: typeof persistKnowledgeBaseCreateFailure;
     stopCompatibleCreateOutcomeUnknown?: typeof stopKnowledgeBaseCompatibleCreateOutcomeUnknown;
+    failMaterializedResult?: typeof failKnowledgeBaseMaterializedResultForApprovedReset;
+    deferMaterializedResultRead?: typeof deferKnowledgeBaseMaterializedResultRead;
   } = {},
 ) {
   const markManusV2OutcomeUnknown =
@@ -7146,6 +7247,12 @@ export async function persistKnowledgeBaseDispatchFailure(
   const stopCompatibleCreateOutcomeUnknown =
     dependencies.stopCompatibleCreateOutcomeUnknown ??
     stopKnowledgeBaseCompatibleCreateOutcomeUnknown;
+  const failMaterializedResult =
+    dependencies.failMaterializedResult ??
+    failKnowledgeBaseMaterializedResultForApprovedReset;
+  const deferMaterializedResultRead =
+    dependencies.deferMaterializedResultRead ??
+    deferKnowledgeBaseMaterializedResultRead;
   if (input.error instanceof KnowledgeBaseManusV2RolloutDeferredError) {
     await deferKnowledgeBaseTurnBeforeCreate({
       userId: input.claim.turn.userId,
@@ -7156,6 +7263,43 @@ export async function persistKnowledgeBaseDispatchFailure(
       ...(input.traceId ? { traceId: input.traceId } : {}),
     });
     return "retriable" as const;
+  }
+  if (input.error instanceof KnowledgeArchiveDownloadError) {
+    if (input.error.retryable) {
+      const disposition = await deferMaterializedResultRead({
+        userId: input.claim.turn.userId,
+        turnId: input.claim.turn.id,
+        leaseToken: input.claim.leaseToken,
+        lastErrorKind: input.error.status
+          ? `archive_${input.error.kind}_${input.error.status}`
+          : `archive_${input.error.kind}`,
+      });
+      return disposition.state === "deferred"
+        ? ("retriable" as const)
+        : ("deterministic" as const);
+    }
+    await failMaterializedResult({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+    });
+    return "deterministic" as const;
+  }
+  if (
+    input.error instanceof KnowledgeBaseMaterializedContractError ||
+    input.error instanceof KnowledgeBaseMaterializedResultError
+  ) {
+    await failMaterializedResult({
+      userId: input.claim.turn.userId,
+      turnId: input.claim.turn.id,
+      leaseToken: input.claim.leaseToken,
+      code:
+        input.error instanceof KnowledgeBaseMaterializedContractError
+          ? "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID"
+          : input.error.code,
+    });
+    return "deterministic" as const;
   }
   const v2Error = input.error instanceof ManusV2ApiError ? input.error : null;
   const isCurrentExplicitV2Rejection =
@@ -7418,6 +7562,7 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
       } catch (error) {
         result.failed += 1;
         let manualLogoFailureSettled = false;
+        let failureDisposition: "deferred" | "settled" = "deferred";
         let failureToPersist = error;
         if (claim) {
           const terminalLogoFailure =
@@ -7437,6 +7582,7 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
                 message: terminalLogoFailure.message,
               });
               manualLogoFailureSettled = true;
+              failureDisposition = "settled";
             } catch (persistenceError) {
               // The child task may already exist. Never fall through to the
               // generic invalid-upload cancellation, which only accepts an
@@ -7480,6 +7626,7 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
                     deterministicKnowledgeBaseCreateFailureMessage(error),
                 });
                 manualLogoFailureSettled = true;
+                failureDisposition = "settled";
               } catch (persistenceError) {
                 manualLogoFailureSettled = true;
                 await markKnowledgeBaseTurnOutcomeUnknown({
@@ -7513,21 +7660,34 @@ export async function recoverExpiredKnowledgeBaseTurns(options?: {
                 leaseToken: claim.leaseToken,
                 error: failureToPersist,
               }).catch(() => false);
+            if (localAuthoritySettled) failureDisposition = "settled";
             if (!localAuthoritySettled) {
-              await persistKnowledgeBaseDispatchFailure({
+              const persisted = await persistKnowledgeBaseDispatchFailure({
                 claim,
                 error: failureToPersist,
                 outcomeUnknownCode: "RECOVERY_DEFERRED",
               }).catch(() => undefined);
+              if (persisted === "deterministic") {
+                failureDisposition = "settled";
+              }
             }
           }
         }
+        const safeResultFailure =
+          error instanceof KnowledgeBaseMaterializedContractError
+            ? new Error("KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID")
+            : error instanceof KnowledgeBaseMaterializedResultError
+              ? new Error(error.code)
+              : error;
         logKnowledgeBaseRuntimeFailure({
           level: "warn",
-          event: "[KnowledgeBaseTurnRecovery] deferred",
+          event:
+            failureDisposition === "settled"
+              ? "[KnowledgeBaseTurnRecovery] settled"
+              : "[KnowledgeBaseTurnRecovery] deferred",
           turnId: candidate.turnId,
           buildId: candidate.buildId,
-          error,
+          error: safeResultFailure,
           additionalSecrets: [recoveryApiKey],
         });
       }
@@ -7861,7 +8021,6 @@ export async function createFrontMindTask({
       agentProfile: body.agentProfile,
       locale: "zh-CN",
       interactiveMode: false,
-      hideInTaskList: true,
     });
     taskResponse = {
       status: 200,
@@ -8115,6 +8274,7 @@ export async function persistKnowledgeBaseCreateFailure(
     failDeterministically?: typeof failKnowledgeBaseTurnDeterministically;
     markOutcomeUnknown?: typeof markKnowledgeBaseTurnOutcomeUnknown;
     deferBeforeCreate?: typeof deferKnowledgeBaseTurnBeforeCreate;
+    markAttention?: typeof markKnowledgeBaseManusV2AttentionRequired;
   } = {},
 ) {
   const cancelUnprepared =
@@ -8126,6 +8286,8 @@ export async function persistKnowledgeBaseCreateFailure(
     dependencies.markOutcomeUnknown ?? markKnowledgeBaseTurnOutcomeUnknown;
   const deferBeforeCreate =
     dependencies.deferBeforeCreate ?? deferKnowledgeBaseTurnBeforeCreate;
+  const markAttention =
+    dependencies.markAttention ?? markKnowledgeBaseManusV2AttentionRequired;
   if (input.error instanceof KnowledgeBaseAttachmentsProcessingError) {
     await deferBeforeCreate({
       userId: input.userId,
@@ -8137,7 +8299,32 @@ export async function persistKnowledgeBaseCreateFailure(
     });
     return "retriable" as const;
   }
+  if (
+    input.error instanceof KnowledgeBaseTurnReservationError &&
+    input.error.code === "RESET_REQUIRED"
+  ) {
+    await markAttention({
+      userId: input.userId,
+      turnId: input.turnId,
+      leaseToken: input.leaseToken,
+      code: input.error.code,
+    });
+    return "deterministic" as const;
+  }
   if (input.error instanceof KnowledgeBaseLocalPreparationError) {
+    if (
+      input.error.code ===
+        KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT ||
+      input.error.code === "RESET_REQUIRED"
+    ) {
+      await markAttention({
+        userId: input.userId,
+        turnId: input.turnId,
+        leaseToken: input.leaseToken,
+        code: input.error.code,
+      });
+      return "deterministic" as const;
+    }
     if (isKnowledgeBaseManusV2GeneratedFileCreateRejected(input.error)) {
       // file.upload explicitly rejected this server-generated source before
       // task.create/sendMessage. The durable create_rejected row is the
@@ -8435,7 +8622,7 @@ router.post("/start/reserve", async (req, res) => {
   if (!req.frontmindCredential) {
     res.status(401).json({
       error: {
-        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        code: "CUSTOMER_KEY_REQUIRED",
         message: "请先配置 API Key",
       },
       reservationCreated: false,
@@ -8734,7 +8921,7 @@ router.post("/start/recover", async (req, res) => {
   if (!req.frontmindCredential) {
     res.status(401).json({
       error: {
-        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        code: "CUSTOMER_KEY_REQUIRED",
         message: "请先配置 API Key",
       },
     });
@@ -8954,7 +9141,7 @@ router.post("/recovery/execute", async (req, res) => {
   if (!req.frontmindCredential) {
     res.status(401).json({
       error: {
-        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        code: "CUSTOMER_KEY_REQUIRED",
         message: "请先配置 API Key",
       },
     });
@@ -9251,7 +9438,7 @@ router.post("/canonical/recover-from-snapshot", async (req, res) => {
   if (!req.frontmindCredential) {
     res.status(401).json({
       error: {
-        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        code: "CUSTOMER_KEY_REQUIRED",
         message: "请先配置 API Key",
       },
     });
@@ -9504,11 +9691,9 @@ router.post("/confirm", async (req, res) => {
       const status =
         error.code === "DATABASE_UNAVAILABLE"
           ? 503
-          : error.code === "LOGO_REQUIRED"
-            ? 422
-            : error.code === "BUILD_NOT_FOUND"
-              ? 404
-              : 409;
+          : error.code === "BUILD_NOT_FOUND"
+            ? 404
+            : 409;
       const observation = await getKnowledgeBaseObservation({
         userId: req.frontmindUser.id,
         conversationId,
@@ -9544,6 +9729,7 @@ router.post("/turn/reserve", async (req, res) => {
     resumeExisting?: boolean;
     expectedGeneration?: number;
     expectedRevision?: number;
+    expectedResetRevision?: number;
     expectedLeafId?: string;
     expectedPresentationKey?: string;
   };
@@ -9552,6 +9738,7 @@ router.post("/turn/reserve", async (req, res) => {
   const userMessage = String(body.userMessage || "").slice(0, 2_000_000);
   const expectedGeneration = body.expectedGeneration;
   const expectedRevision = body.expectedRevision;
+  const expectedResetRevision = Number(body.expectedResetRevision);
   const expectedLeafId = String(body.expectedLeafId || "").trim();
   const expectedPresentationKey =
     body.expectedPresentationKey === undefined
@@ -9565,6 +9752,8 @@ router.post("/turn/reserve", async (req, res) => {
     Number(expectedGeneration) < 1 ||
     !Number.isSafeInteger(expectedRevision) ||
     Number(expectedRevision) < 0 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0 ||
     !expectedLeafId ||
     (expectedPresentationKey !== undefined &&
       (!expectedPresentationKey || expectedPresentationKey.length > 191)) ||
@@ -9603,6 +9792,7 @@ router.post("/turn/reserve", async (req, res) => {
       attachmentManifest,
       expectedGeneration: Number(expectedGeneration),
       expectedRevision: Number(expectedRevision),
+      expectedResetRevision,
       expectedLeafId,
       expectedPresentationKey: expectedPresentationKey ?? null,
     };
@@ -9745,6 +9935,7 @@ router.post("/turn/reserve", async (req, res) => {
         userMessage,
         attachmentManifest,
         expectedPresentationKey: expectedPresentationKey ?? null,
+        sourceResetRevision: expectedResetRevision,
         skillVersion,
         skillContentHash,
       },
@@ -9756,6 +9947,7 @@ router.post("/turn/reserve", async (req, res) => {
         attachmentManifest.length + (boundBuild.skillVersion === "5" ? 3 : 2),
       deferDispatchUntilAttachments: true,
       clientAttachmentManifest: attachmentManifest,
+      sourceResetRevision: expectedResetRevision,
       resumeDeferredReservation: body.resumeExisting === true,
       recoveryMetadata: {
         kind: "turn",
@@ -9766,6 +9958,7 @@ router.post("/turn/reserve", async (req, res) => {
         attachmentManifest,
         capturedClientAttachments: true,
         deferredClientAttachments: true,
+        sourceResetRevision: expectedResetRevision,
         skillVersion,
         skillContentHash,
         ...(finalPackageRequired
@@ -9848,11 +10041,14 @@ router.post("/turn/attachments/stage", async (req, res) => {
   const conversationId = String(body.conversationId || "").trim();
   const turnId = String(body.turnId || "").trim();
   const clientRequestId = String(body.clientRequestId || "").trim();
+  const expectedResetRevision = Number(body.expectedResetRevision);
   if (
     !conversationId ||
     !turnId ||
     !clientRequestId ||
     clientRequestId.length > 128 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0 ||
     !Number.isSafeInteger(body.index) ||
     Number(body.index) < 0
   ) {
@@ -9872,7 +10068,6 @@ router.post("/turn/attachments/stage", async (req, res) => {
   }
 
   let replayAfterMutableFailure: (() => Promise<boolean>) | null = null;
-  let dispatchClaimAcquiredByThisRequest = false;
   try {
     await assertKnowledgeBaseWritable(req.frontmindUser.id);
     const manifest = normalizeKnowledgeBaseClientAttachmentManifest(
@@ -9908,6 +10103,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
             turnId,
             clientRequestId,
             clientAttachmentManifest: manifest,
+            expectedResetRevision,
             index,
             attachment,
           }),
@@ -9939,45 +10135,8 @@ router.post("/turn/attachments/stage", async (req, res) => {
         build.revision === 0 &&
         build.currentLeafId === null,
     );
-    const expectedResetRevision = isStartReservation
-      ? Number(body.expectedResetRevision)
-      : undefined;
-    // A first start reservation has no provider task by design. Its exact
-    // credential was frozen on the durable turn before any browser bytes. A
-    // revision deliberately has no parent task and uses the current exact
-    // credential version that created its short-lived upload lease.
     const projectAssignmentId =
       req.frontmindDeliveryProjectContext?.projectAssignmentId;
-    const startCredential = isStartReservation
-      ? await getDecryptedCredentialForKnowledgeBaseUploadReservation({
-          userId: req.frontmindUser.id,
-          conversationId,
-          turnId,
-          projectAssignmentId: projectAssignmentId ?? null,
-        })
-      : null;
-    const taskCredential =
-      selectMaterializedKnowledgeBaseAttachmentCredential({
-        isStartReservation,
-        startCredential,
-        currentCredential: req.frontmindCredential ?? null,
-      });
-    if (!taskCredential) {
-      if (await replayAfterMutableFailure()) return;
-      const observation = await getKnowledgeBaseObservation({
-        userId: req.frontmindUser.id,
-        conversationId,
-        upstreamStatus: "running",
-      }).catch(() => null);
-      res.status(403).json({
-        error: {
-          code: "KNOWLEDGE_BASE_FILE_FORBIDDEN",
-          message: "上传资料与当前知识库任务不匹配，请重新上传",
-        },
-        ...(observation ? { observation } : {}),
-      });
-      return;
-    }
     // Browser submissions carry only a Dashboard localAssetId. Re-read the
     // account-owned row and its retained stream, then prove MIME/size/SHA
     // before mutating the turn. A Provider file lease does not exist yet.
@@ -9989,25 +10148,6 @@ router.post("/turn/attachments/stage", async (req, res) => {
       sizeBytes: manifestItem.sizeBytes,
       sha256: manifestItem.sha256,
     });
-    // Install immutable build-owned bytes before the DB stage. A crash here
-    // can leave only a content-addressed duplicate; it cannot authorize the
-    // turn. Once the DB write succeeds, active-build recovery no longer
-    // depends on the generic 30-day retained-file lifetime.
-    const buildOwnedSource = await persistKnowledgeBaseBuildSource({
-      userId: req.frontmindUser.id,
-      buildId: build.id,
-      generation: build.generation,
-      bytes: localAsset.bytes,
-    });
-    if (
-      buildOwnedSource.contentSha256 !== localAsset.contentSha256 ||
-      buildOwnedSource.sizeBytes !== manifestItem.sizeBytes
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        "CONFLICT",
-        "Dashboard 知识库固定副本与上传证明不一致",
-      );
-    }
     const deferredLogoPolicy = knowledgeBaseTurnLogoPolicy({
       providerProtocol: build.providerProtocol,
       legacyLogoRequired:
@@ -10085,154 +10225,28 @@ router.post("/turn/attachments/stage", async (req, res) => {
         return;
       }
     }
-    // uploadFile only calls this route after the signed PUT has completed.
-    // Bind that already-owned file id immediately, as the OEM client does.
-    // Re-downloading the entire object here made submission time depend on
-    // object-store read-after-write visibility and incorrectly rejected slow
-    // or large uploads after an arbitrary verification window.
-    const dispatchClaim = isStartReservation
-      ? {
-          state: "awaiting_attachments" as const,
-          turn: await stageKnowledgeBaseDeferredTurnAttachment({
-            userId: req.frontmindUser.id,
-            buildId: build.id,
-            turnId,
-            clientRequestId,
-            clientAttachmentManifest: manifest,
-            expectedResetRevision,
-            index,
-            attachment,
-            managedUploadProof: {
-              intentId: `local-asset:${attachment.file_id}`,
-              itemId: manifestItem.itemId,
-              mimeType: manifestItem.mimeType,
-              sizeBytes: manifestItem.sizeBytes,
-              contentSha256: localAsset.contentSha256,
-              localStorageKey: buildOwnedSource.storageKey,
-            },
-            projectAssignmentId: projectAssignmentId ?? null,
-          }),
-        }
-      : await stageAndClaimKnowledgeBaseDeferredTurnAttachment({
-          userId: req.frontmindUser.id,
-          buildId: build.id,
-          turnId,
-          clientRequestId,
-          clientAttachmentManifest: manifest,
-          index,
-          attachment,
-          managedUploadProof: {
-            intentId: `local-asset:${attachment.file_id}`,
-            itemId: manifestItem.itemId,
-            mimeType: manifestItem.mimeType,
-            sizeBytes: manifestItem.sizeBytes,
-            contentSha256: localAsset.contentSha256,
-            localStorageKey: buildOwnedSource.storageKey,
-          },
-          projectAssignmentId: projectAssignmentId ?? null,
-        });
-    dispatchClaimAcquiredByThisRequest = dispatchClaim.state === "acquired";
-    const turn = dispatchClaim.turn;
-    if (dispatchClaim.state !== "awaiting_attachments") {
-      if (dispatchClaim.state === "acquired") {
-        let acceptedClaim: KnowledgeBaseRecoveryClaim = dispatchClaim;
-        if (deferredOfficialLogoRequired) {
-          let verifiedLogo: KnowledgeBaseOfficialLogoUpload;
-          try {
-            verifiedLogo = await bindKnowledgeBaseOfficialLogoUpload({
-              userId: req.frontmindUser.id,
-              buildId: build.id,
-              generation: dispatchClaim.turn.buildGeneration,
-              turnId: dispatchClaim.turn.id,
-              operationKey: dispatchClaim.turn.operationKey,
-              expectedRevision: dispatchClaim.turn.expectedRevision,
-              expectedLeafId: dispatchClaim.turn.expectedLeafId!,
-              upload: {
-                index: 0,
-                fileId: attachment.file_id,
-                filename: manifestItem.filename,
-                mimeType: manifestItem.mimeType,
-                sizeBytes: manifestItem.sizeBytes,
-                sourceSha256: manifestItem.sha256,
-              },
-            });
-            logKnowledgeBaseOperationTelemetry({
-              event: "logo_upload_candidate_promoted",
-              buildId: build.id,
-              turnId: dispatchClaim.turn.id,
-            });
-          } catch (error) {
-            logKnowledgeBaseOperationTelemetry({
-              event: "logo_upload_candidate_rejected",
-              buildId: build.id,
-              turnId: dispatchClaim.turn.id,
-              reasonCode:
-                error instanceof KnowledgeBaseArtifactBindingError
-                  ? error.code
-                  : "LOCAL_PREPARATION_FAILED",
-            });
-            const message =
-              error instanceof Error
-                ? error.message
-                : "企业官方主 Logo 校验失败，请重新上传";
-            if (error instanceof KnowledgeBaseArtifactBindingError) {
-              await cancelUnpreparedKnowledgeBaseTurn({
-                userId: req.frontmindUser.id,
-                turnId: dispatchClaim.turn.id,
-                clientRequestId,
-                leaseToken: dispatchClaim.leaseToken,
-                code:
-                  error.code === "LOGO_UPLOAD_INVALID"
-                    ? "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID"
-                    : "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
-                message,
-              });
-            }
-            throw new KnowledgeBaseTurnReservationError(
-              error instanceof KnowledgeBaseArtifactBindingError &&
-              error.code === "LOGO_UPLOAD_INVALID"
-                ? "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID"
-                : "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
-              message,
-            );
-          }
-          acceptedClaim = {
-            ...dispatchClaim,
-            recoveryMetadata: {
-              ...dispatchClaim.recoveryMetadata,
-              officialLogoUpload: verifiedLogo,
-            },
-          };
-        }
-        const observation = await getKnowledgeBaseObservation({
-          userId: req.frontmindUser.id,
-          conversationId,
-          upstreamStatus: "running",
-        }).catch(() => null);
-        res.status(202).json({
-          reservation: knowledgeBaseAcceptedReservationReceipt({
-            turn: acceptedClaim.turn,
-            stateEpoch: observation?.stateEpoch,
-          }),
-          observation,
-          accepted: true,
-        });
-        launchAcceptedKnowledgeBaseClaim({
-          claim: acceptedClaim,
-          credential: taskCredential!,
-          outcomeUnknownCode: "TURN_DISPATCH_OUTCOME_UNKNOWN",
-        });
-        return;
-      }
-      await respondKnowledgeBaseTurnReplayReceipt({
-        userId: req.frontmindUser.id,
-        conversationId,
-        requestedClientRequestId: clientRequestId,
-        receipt: dispatchClaim,
-        res,
-      });
-      return;
-    }
+    // Retain the verified bytes and stage the ledger while the service holds
+    // the same live reset fence. This endpoint never claims or launches a
+    // Provider task; `/turn/dispatch` is the sole dispatch boundary.
+    const turn = await stageKnowledgeBaseDeferredTurnAttachment({
+      userId: req.frontmindUser.id,
+      buildId: build.id,
+      turnId,
+      clientRequestId,
+      clientAttachmentManifest: manifest,
+      expectedResetRevision,
+      index,
+      attachment,
+      managedUploadProof: {
+        intentId: `local-asset:${attachment.file_id}`,
+        itemId: manifestItem.itemId,
+        mimeType: manifestItem.mimeType,
+        sizeBytes: manifestItem.sizeBytes,
+        contentSha256: localAsset.contentSha256,
+      },
+      managedUploadBytes: localAsset.bytes,
+      projectAssignmentId: projectAssignmentId ?? null,
+    });
     const observation = await getKnowledgeBaseObservation({
       userId: req.frontmindUser.id,
       conversationId,
@@ -10245,6 +10259,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
         clientRequestId: turn.clientRequestId,
         stagedAttachmentCount: turn.stagedUserAttachmentCount,
         expectedAttachmentCount: turn.expectedUserAttachmentCount,
+        sourceResetRevision: turn.sourceResetRevision ?? null,
         requiresUpload:
           turn.stagedUserAttachmentCount < turn.expectedUserAttachmentCount,
       },
@@ -10252,7 +10267,7 @@ router.post("/turn/attachments/stage", async (req, res) => {
     });
   } catch (caught) {
     let error = caught;
-    if (replayAfterMutableFailure && !dispatchClaimAcquiredByThisRequest) {
+    if (replayAfterMutableFailure) {
       try {
         if (await replayAfterMutableFailure()) return;
       } catch (replayError) {
@@ -10328,11 +10343,14 @@ router.post("/turn/dispatch", async (req, res) => {
   const conversationId = String(body.conversationId || "").trim();
   const turnId = String(body.turnId || "").trim();
   const clientRequestId = String(body.clientRequestId || "").trim();
+  const expectedResetRevision = Number(body.expectedResetRevision);
   if (
     !conversationId ||
     !turnId ||
     !clientRequestId ||
-    clientRequestId.length > 128
+    clientRequestId.length > 128 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0
   ) {
     res.status(400).json({
       error: {
@@ -10372,6 +10390,7 @@ router.post("/turn/dispatch", async (req, res) => {
             turnId,
             clientRequestId,
             clientAttachmentManifest: attachmentManifest,
+            expectedResetRevision,
           }),
         res,
       });
@@ -10401,9 +10420,6 @@ router.post("/turn/dispatch", async (req, res) => {
         build.revision === 0 &&
         build.currentLeafId === null,
     );
-    const expectedResetRevision = isStartReservation
-      ? Number(body.expectedResetRevision)
-      : undefined;
     // Run before claimKnowledgeBaseDeferredTurnDispatch mutates the lease. The
     // assertion is a no-op outside the final v4 coordinate.
     const dispatchLogoPolicy = knowledgeBaseTurnLogoPolicy({
@@ -10427,12 +10443,11 @@ router.post("/turn/dispatch", async (req, res) => {
           projectAssignmentId: projectAssignmentId ?? null,
         })
       : null;
-    const taskCredential =
-      selectMaterializedKnowledgeBaseAttachmentCredential({
-        isStartReservation,
-        startCredential,
-        currentCredential: req.frontmindCredential ?? null,
-      });
+    const taskCredential = selectMaterializedKnowledgeBaseAttachmentCredential({
+      isStartReservation,
+      startCredential,
+      currentCredential: req.frontmindCredential ?? null,
+    });
     if (!taskCredential) {
       if (await replayAfterMutableFailure()) return;
       const observation = await getKnowledgeBaseObservation({
@@ -10783,6 +10798,12 @@ router.post("/turn", async (req, res) => {
       userId: req.frontmindUser!.id,
       conversationId,
     });
+    if (!isMaterializedBuildPublishable(boundBuild)) {
+      throw new KnowledgeBaseTurnReservationError(
+        "RESET_REQUIRED",
+        "当前知识库内容或研究覆盖不完整；可继续查看，但不能创建修订任务，请批准重置后重跑",
+      );
+    }
     const attachments = normalizeKnowledgeBaseUserAttachments(body.attachments);
     const resumeLegacyAttachments = body.resumeLegacyAttachments === true;
     const attachmentManifest = attachments.length
@@ -10849,6 +10870,89 @@ router.post("/turn", async (req, res) => {
         confirmPath: "/api/knowledge-base/confirm",
         ...(observation ? { observation } : {}),
       });
+      return;
+    }
+    if (manualLogoSubmission) {
+      assertKnowledgeBaseExpectedGeneration({
+        expectedGeneration,
+        actualGeneration: boundBuild.generation,
+      });
+      if (
+        boundBuild.status !== "confirming" ||
+        !boundBuild.currentLeafId ||
+        !boundBuild.currentPresentationKey ||
+        boundBuild.confirmedCount !== 0 ||
+        boundBuild.directPrefilledCount !== 0
+      ) {
+        throw new KnowledgeBaseTurnReservationError(
+          "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
+          "仅可在第一个知识节点待确认时提交或更换企业主 Logo，请刷新当前节点后重试",
+        );
+      }
+      const manifestItem = attachmentManifest?.[0];
+      const attachment = attachments[0];
+      if (!manifestItem || !attachment) {
+        throw new KnowledgeBaseTurnReservationError(
+          "INVALID_REQUEST",
+          "企业主 Logo 本轮只接受一张图片原文件，请重新选择后提交",
+        );
+      }
+      const officialLogoUploadCandidate = {
+        index: 0,
+        fileId: attachment.file_id,
+        filename: manifestItem.filename,
+        mimeType: manifestItem.mimeType,
+        sizeBytes: manifestItem.sizeBytes,
+        sourceSha256: manifestItem.sha256,
+      };
+      await assertManualKnowledgeBaseLogoUploadCandidate(
+        officialLogoUploadCandidate,
+      );
+      const local = await readOwnedMaterializedKnowledgeBaseLocalAsset({
+        userId: req.frontmindUser.id,
+        localAssetId: attachment.file_id,
+        filename: manifestItem.filename,
+        mimeType: manifestItem.mimeType,
+        sizeBytes: manifestItem.sizeBytes,
+        sha256: manifestItem.sha256,
+      });
+      const receipt = await bindMaterializedKnowledgeBaseOfficialLogoLocally({
+        userId: req.frontmindUser.id,
+        conversationId,
+        buildId: boundBuild.id,
+        clientRequestId,
+        expectedGeneration: expectedGeneration ?? boundBuild.generation,
+        expectedRevision: expectedRevision ?? boundBuild.revision,
+        expectedLeafId: expectedLeafId || boundBuild.currentLeafId,
+        expectedPresentationKey:
+          expectedPresentationKey ?? boundBuild.currentPresentationKey,
+        upload: {
+          fileId: attachment.file_id,
+          filename: manifestItem.filename,
+          mimeType: manifestItem.mimeType,
+          sizeBytes: manifestItem.sizeBytes,
+          sourceSha256: manifestItem.sha256,
+        },
+        bytes: local.bytes,
+      });
+      const observation = await getKnowledgeBaseObservation({
+        userId: req.frontmindUser.id,
+        conversationId,
+        upstreamStatus: "local",
+      }).catch((error) => {
+        // The local transaction is already authoritative. A transient
+        // projection/read failure must not turn a committed Logo binding into
+        // an uncertain Provider-style failure or invite a second mutation.
+        logKnowledgeBaseRuntimeFailure({
+          level: "warn",
+          event: "[KnowledgeBaseLocalLogo] observation_deferred",
+          userId: req.frontmindUser?.id,
+          buildId: boundBuild.id,
+          error,
+        });
+        return null;
+      });
+      res.status(200).json({ ...receipt, observation });
       return;
     }
     replayAfterMutableFailure = () =>
@@ -11575,6 +11679,26 @@ router.post("/turn", async (req, res) => {
       });
       return;
     }
+    if (error instanceof KnowledgeBaseMaterializedError) {
+      const observation = req.frontmindUser
+        ? await getKnowledgeBaseObservation({
+            userId: req.frontmindUser.id,
+            conversationId,
+            upstreamStatus: "local",
+          }).catch(() => null)
+        : null;
+      const status =
+        error.code === "DATABASE_UNAVAILABLE"
+          ? 503
+          : error.code === "BUILD_NOT_FOUND"
+            ? 404
+            : 409;
+      res.status(status).json({
+        error: { code: error.code, message: error.message },
+        ...(observation ? { observation } : {}),
+      });
+      return;
+    }
     const terminalManualLogoFailure = manualLogoSubmission
       ? knowledgeBaseManualLogoTerminalFailure(error)
       : null;
@@ -11767,7 +11891,7 @@ router.post("/turn/replace-attachments", async (req, res) => {
   if (!req.frontmindCredential) {
     res.status(409).json({
       error: {
-        code: "UPSTREAM_CREDENTIAL_UNAVAILABLE",
+        code: "CUSTOMER_KEY_REQUIRED",
         message: "请先配置可用 API 凭证后替换附件",
       },
     });
@@ -12015,8 +12139,7 @@ router.post("/retry", async (req, res) => {
     );
     if (
       !retryBuild ||
-      retryBuild.executionMode !==
-        MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
+      retryBuild.executionMode !== MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
       retryBuild.skillVersion !== "5" ||
       retryBuild.providerProtocol !== "manus_v2"
     ) {
@@ -12431,8 +12554,7 @@ router.post("/progress/reconcile", async (req, res) => {
     });
     if (
       boundBuild.id !== runtimeBuild.id ||
-      boundBuild.executionMode !==
-        MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
+      boundBuild.executionMode !== MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
       boundBuild.skillVersion !== "5" ||
       boundBuild.providerProtocol !== "manus_v2"
     ) {

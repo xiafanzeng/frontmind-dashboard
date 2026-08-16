@@ -4,13 +4,15 @@ This reference describes content invariants only. The v5 Manus task never
 creates the final customer archive. Dashboard creates that archive locally
 after every materialized node has been confirmed.
 
-## Formal content
+## Customer-visible node content
 
-- Every leaf body is non-empty Markdown bound to one stable leaf ID.
-- Keep the polished customer-visible text between
-  `FRONTMIND_FORMAL_CONTENT_START` and `FRONTMIND_FORMAL_CONTENT_END`.
+- Every leaf body is non-empty Markdown bound to one stable leaf ID and starts
+  with exactly `# {leaf.title}`, followed by a non-empty body.
+- Store only polished customer-visible content in `nodes/*.md` and Patch node
+  bodies. Do not add formal markers, metadata sections, evidence appendices,
+  internal keys, IDs, paths or character counts.
 - Keep source inventory, excerpts, conflicts and internal verification notes
-  outside that block.
+  in declared evidence files, linked through `evidenceLedger/evidencePaths`.
 - Do not place expiring Provider URLs, task IDs, file IDs, operation markers or
   internal workflow instructions in customer-visible text.
 

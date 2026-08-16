@@ -4,7 +4,69 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 describe("knowledge-base Manus v2 recovery rollout wiring", () => {
-  it("checks active-migration authority before lazy legacy cutover", async () => {
+  it("keeps attachment staging provider-write-free and dispatch as the sole claim boundary", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const stageStart = source.indexOf('router.post("/turn/attachments/stage"');
+    const dispatchStart = source.indexOf('router.post("/turn/dispatch"');
+    const nextRoute = source.indexOf('router.post("/turn"', dispatchStart);
+    const stageRoute = source.slice(stageStart, dispatchStart);
+    const dispatchRoute = source.slice(dispatchStart, nextRoute);
+
+    expect(stageStart).toBeGreaterThan(-1);
+    expect(dispatchStart).toBeGreaterThan(stageStart);
+    expect(stageRoute).toContain("stageKnowledgeBaseDeferredTurnAttachment({");
+    expect(stageRoute).not.toContain(
+      "stageAndClaimKnowledgeBaseDeferredTurnAttachment({",
+    );
+    expect(stageRoute).not.toContain(
+      "claimKnowledgeBaseDeferredTurnDispatch({",
+    );
+    expect(stageRoute).not.toContain("launchAcceptedKnowledgeBaseClaim({");
+    expect(stageRoute).not.toContain("persistKnowledgeBaseBuildSource({");
+    expect(stageRoute).toContain("managedUploadBytes: localAsset.bytes");
+    expect(dispatchRoute).toContain("claimKnowledgeBaseDeferredTurnDispatch({");
+    expect(dispatchRoute).toContain("launchAcceptedKnowledgeBaseClaim({");
+  });
+
+  it("retires all public legacy recovery routes before credential or recovery work", async () => {
+    const source = await fs.readFile(
+      path.resolve("server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const routeStarts = [
+      'router.post("/start/recover"',
+      'router.post("/recovery/execute"',
+      'router.post("/canonical/recover-from-snapshot"',
+    ];
+
+    for (const [index, routeStart] of routeStarts.entries()) {
+      const start = source.indexOf(routeStart);
+      const next =
+        index + 1 < routeStarts.length
+          ? source.indexOf(routeStarts[index + 1]!, start)
+          : source.indexOf("router.post(", start + routeStart.length);
+      const route = source.slice(start, next);
+      const retired = route.indexOf(
+        "if (knowledgeBaseLegacyRecoveryRoutesRetired())",
+      );
+      const gone = route.indexOf("res.status(410)", retired);
+      const credential = route.indexOf("if (!req.frontmindCredential)", gone);
+
+      expect(start).toBeGreaterThan(-1);
+      expect(next).toBeGreaterThan(start);
+      expect(retired).toBeGreaterThan(-1);
+      expect(gone).toBeGreaterThan(retired);
+      expect(credential).toBeGreaterThan(gone);
+      expect(route.slice(retired, credential)).toContain(
+        'code: "RESET_REQUIRED"',
+      );
+    }
+  });
+
+  it("dispatches only reset-authorized materialized work", async () => {
     const source = await fs.readFile(
       path.resolve("server/knowledge-base-api.ts"),
       "utf8",
@@ -17,51 +79,20 @@ describe("knowledge-base Manus v2 recovery rollout wiring", () => {
       dispatchStart,
     );
     const dispatch = source.slice(dispatchStart, migrationTypes);
-    const migrationGate = dispatch.indexOf(
-      "knowledgeBaseManusV2ActiveMigrationEnabled()",
+    const birthAuthority = dispatch.indexOf(
+      "knowledgeBaseMaterializedRecoveryContractVersion(existingBuild) !== 1",
     );
-    const cutover = dispatch.indexOf("activateKnowledgeBaseManusV2Handoff(");
+    const materializedDispatch = dispatch.indexOf(
+      "return dispatchMaterializedKnowledgeBaseClaim({",
+    );
 
     expect(dispatchStart).toBeGreaterThan(-1);
     expect(migrationTypes).toBeGreaterThan(dispatchStart);
-    expect(migrationGate).toBeGreaterThan(-1);
-    expect(cutover).toBeGreaterThan(migrationGate);
-  });
-
-  it("halts an unbound not-sent v2 recovery before file or task provider work", async () => {
-    const source = await fs.readFile(
-      path.resolve("server/knowledge-base-api.ts"),
-      "utf8",
-    );
-    const dispatchStart = source.indexOf(
-      "async function dispatchKnowledgeBaseRecoveryClaim(",
-    );
-    const migrationTypes = source.indexOf(
-      "type KnowledgeBaseActiveLegacyMigrationCandidate",
-      dispatchStart,
-    );
-    const dispatch = source.slice(dispatchStart, migrationTypes);
-    const authority = dispatch.indexOf(
-      "knowledgeBaseManusV2RecoveryAuthority({",
-    );
-    const disabled = dispatch.indexOf(
-      'recoveryAuthority === "deferred_disabled"',
-      authority,
-    );
-    const prepare = dispatch.indexOf("ensureDispatch({", disabled);
-    const upload = dispatch.indexOf("ensureManusV2Attachments({", disabled);
-    const writerFence = dispatch.indexOf("beginDispatch({", disabled);
-    const providerCreate = dispatch.indexOf(
-      "const created = await client.createTask({",
-      disabled,
-    );
-
-    expect(authority).toBeGreaterThan(-1);
-    expect(disabled).toBeGreaterThan(authority);
-    expect(prepare).toBeGreaterThan(disabled);
-    expect(upload).toBeGreaterThan(prepare);
-    expect(writerFence).toBeGreaterThan(upload);
-    expect(providerCreate).toBeGreaterThan(writerFence);
+    expect(birthAuthority).toBeGreaterThan(-1);
+    expect(materializedDispatch).toBeGreaterThan(birthAuthority);
+    expect(dispatch).not.toContain("activateKnowledgeBaseManusV2Handoff(");
+    expect(dispatch).not.toContain("knowledgeBaseManusV2RecoveryAuthority({");
+    expect(dispatch).not.toContain("client.createTask({");
   });
 
   it("gates the migration sweep independently of the new-build writer", async () => {
@@ -276,52 +307,64 @@ describe("knowledge-base Manus v2 recovery rollout wiring", () => {
     );
   });
 
-  it("does not require a migration snapshot for the one compatible create", async () => {
+  it("checks anchor birth authority before skill pinning or Provider access", async () => {
     const source = await fs.readFile(
       path.resolve("server/knowledge-base-api.ts"),
       "utf8",
     );
     const dispatchStart = source.indexOf(
-      "async function dispatchKnowledgeBaseRecoveryClaim(",
+      "async function dispatchKnowledgeBaseAnchorHandoffClaim(",
     );
-    const migrationTypes = source.indexOf(
-      "type KnowledgeBaseActiveLegacyMigrationCandidate",
+    const dispatchEnd = source.indexOf(
+      "async function persistKnowledgeBaseDispatchFailure(",
       dispatchStart,
     );
-    const dispatch = source.slice(dispatchStart, migrationTypes);
-    const unboundSnapshotBranch = dispatch.indexOf(
-      "existingBuild?.providerProtocol === \"manus_v2\"",
+    const dispatch = source.slice(dispatchStart, dispatchEnd);
+    const firstAuthority = dispatch.indexOf(
+      "knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1",
     );
+    const skillPin = dispatch.indexOf("await ensureSkillArchivePin({");
+    const secondAuthority = dispatch.indexOf(
+      "knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1",
+      firstAuthority + 1,
+    );
+    const provider = dispatch.indexOf("const client =");
 
-    expect(unboundSnapshotBranch).toBeGreaterThan(-1);
-    expect(dispatch.slice(unboundSnapshotBranch, unboundSnapshotBranch + 700)).toContain(
-      'claim.recoveryMetadata.compatibilityMode !== "minimal_v2_create"',
-    );
+    expect(dispatchStart).toBeGreaterThan(-1);
+    expect(dispatchEnd).toBeGreaterThan(dispatchStart);
+    expect(firstAuthority).toBeGreaterThan(-1);
+    expect(skillPin).toBeGreaterThan(firstAuthority);
+    expect(secondAuthority).toBeGreaterThan(skillPin);
+    expect(provider).toBeGreaterThan(secondAuthority);
   });
 
-  it("keeps title in the compatible create while omitting only optional request fields", async () => {
+  it("checks birth authority before prepare, mapping, and the durable create fence", async () => {
     const source = await fs.readFile(
       path.resolve("server/knowledge-base-api.ts"),
       "utf8",
     );
     const dispatchStart = source.indexOf(
-      "async function dispatchKnowledgeBaseRecoveryClaim(",
+      "async function dispatchMaterializedKnowledgeBaseClaim(",
     );
-    const migrationTypes = source.indexOf(
-      "type KnowledgeBaseActiveLegacyMigrationCandidate",
+    const dispatchEnd = source.indexOf(
+      "async function dispatchKnowledgeBaseRecoveryClaim(",
       dispatchStart,
     );
-    const dispatch = source.slice(dispatchStart, migrationTypes);
-    const createStart = dispatch.indexOf("const created = await client.createTask({");
-    const createEnd = dispatch.indexOf("});", createStart);
-    const createRequest = dispatch.slice(createStart, createEnd);
+    const dispatch = source.slice(dispatchStart, dispatchEnd);
+    const birthAuthority = dispatch.indexOf(
+      "knowledgeBaseMaterializedRecoveryContractVersion(build) !== 1",
+    );
+    const prepare = dispatch.indexOf("await input.ensureDispatch({");
+    const mapping = dispatch.indexOf("await input.ensureManusV2Attachments({");
+    const writerFence = dispatch.indexOf("await input.beginDispatch({");
+    const providerCreate = dispatch.indexOf("await client.createTask({");
 
-    expect(createStart).toBeGreaterThan(-1);
-    expect(createRequest).toContain("title: authority.title");
-    expect(createRequest).toContain("minimalCompatibleCreate");
-    expect(createRequest).toContain("agentProfile");
-    expect(createRequest).toContain("structuredOutputSchema");
-    expect(dispatch).toContain("titleUtf8Bytes");
-    expect(dispatch).toContain("structuredOutputSchemaSha256");
+    expect(dispatchStart).toBeGreaterThan(-1);
+    expect(dispatchEnd).toBeGreaterThan(dispatchStart);
+    expect(birthAuthority).toBeGreaterThan(-1);
+    expect(prepare).toBeGreaterThan(birthAuthority);
+    expect(mapping).toBeGreaterThan(prepare);
+    expect(writerFence).toBeGreaterThan(mapping);
+    expect(providerCreate).toBeGreaterThan(writerFence);
   });
 });

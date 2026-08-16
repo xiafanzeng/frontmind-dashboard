@@ -20,6 +20,7 @@ import { toast } from "sonner";
 import { useAuth } from "@/_core/hooks/useAuth";
 import { trpc } from "@/lib/trpc";
 import { isSystemAdminAccount } from "@/lib/admin-access";
+import { formatWebsiteUsageTaskDate } from "@/lib/website-usage-task-date";
 import PortalShell from "@/components/PortalShell";
 import { getAdminNav } from "@/pages/AdminDashboard";
 import {
@@ -691,9 +692,10 @@ export default function AdminPresales() {
                                 </p>
                                 <p className="mt-0.5 text-xs text-muted-foreground">
                                   {task.createdAt
-                                    ? new Date(
+                                    ? formatWebsiteUsageTaskDate(
                                         task.createdAt,
-                                      ).toLocaleDateString("zh-CN")
+                                        task.businessOwnerName,
+                                      )
                                     : task.id.slice(0, 16)}
                                 </p>
                               </div>

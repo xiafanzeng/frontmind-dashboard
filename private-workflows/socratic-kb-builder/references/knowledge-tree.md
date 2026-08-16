@@ -69,15 +69,15 @@ Create one branch overview plus the associated leaf documents. The overview:
   owns any later upload requirement.
 - Points to leaves for detail without copying their full text.
 
-Assign every overview and leaf `complete`, `limited_evidence`, or
-`needs_verification` independently from traversal status. Use the
-evidence-proportional formula in `output-format.md`; do not delete applicable
-business breadth or pad a sparse branch merely to reach a writing target.
+Assess evidence sufficiency while drafting, but do not serialize internal
+status or evidence metadata into customer node Markdown. Use the
+evidence-proportional formula in `SKILL.md`; do not delete applicable business
+breadth or pad a sparse branch merely to reach a writing target.
 A white-label or early-stage enterprise can legitimately have short prose
 after uploads, official pages, documents, and public sources have been checked.
-Sparse leaves state the verified facts in formal prose and move unresolved
-items to the evidence/gap section. Status labels and source tables never count
-as formal content.
+Sparse leaves state the verified facts in customer-visible prose and retain
+unresolved research notes only in declared evidence files. Status labels and
+source tables never belong in node content.
 
 ## Traversal boundary
 

@@ -18,6 +18,7 @@ import {
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
   knowledgeBaseSnapshots,
+  localAssets,
   messages,
   upstreamResources,
   userDashboardContents,
@@ -43,7 +44,10 @@ import {
   inspectKnowledgeBaseLegacyProtocolTerminalHistoryAuthority,
   inspectKnowledgeBaseRetryAuthority,
 } from "./knowledge-base-turn-service";
-import { KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
+import {
+  KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+  KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
+} from "./knowledge-base-tree-policy-rollout";
 
 const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
@@ -152,6 +156,7 @@ type MemoryState = {
   messages: Record<string, any>[];
   snapshots: Record<string, any>[];
   resources: Record<string, any>[];
+  localAssets: Record<string, any>[];
 };
 
 function rowsFor(table: unknown, state: MemoryState) {
@@ -177,6 +182,7 @@ function rowsFor(table: unknown, state: MemoryState) {
   if (table === messages) return state.messages;
   if (table === knowledgeBaseSnapshots) return state.snapshots;
   if (table === upstreamResources) return state.resources;
+  if (table === localAssets) return state.localAssets;
   return [];
 }
 
@@ -832,6 +838,7 @@ function initialState() {
     messages: [],
     snapshots: [],
     resources: [],
+    localAssets: [],
   } satisfies MemoryState;
 }
 
@@ -941,6 +948,391 @@ describe("knowledge-base production final-package acceptance", () => {
       process.env.FRONTMIND_KB_V4_ROLLOUT_PERCENT = previousRolloutPercent;
     }
     if (assetRoot) await rm(assetRoot, { recursive: true, force: true });
+  });
+
+  it("binds optional materialized v5 Logos locally with atomic CAS and no Working Set mutation", async () => {
+    const state = initialState();
+    const buildId = "31313131-3131-4313-8313-313131313131";
+    const leafIds = Array.from({ length: 30 }, (_, index) => `1.${index + 1}`);
+    const now = new Date("2026-08-16T04:28:00.000Z");
+    const content = "# 企业身份与定位\n\n这是客户可见的企业身份正文。";
+    const presentationKey = "presentation-materialized-logo-0";
+    state.builds.push({
+      id: buildId,
+      userId: USER_ID,
+      conversationId: PUBLIC_CONVERSATION_ID,
+      companyName: "FrontMind超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      executionMode: "materialized_bundle_v1",
+      providerProtocol: "manus_v2",
+      skillName: "socratic-kb-builder",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      treePolicyVersion: 2,
+      generation: 1,
+      stateEpoch: 4,
+      revision: 0,
+      status: "confirming",
+      activeTurnId: null,
+      activeWorkingSetId: "working-set-immutable",
+      contentVersion: 1,
+      currentLeafId: leafIds[0],
+      currentPresentationKey: presentationKey,
+      totalNodeCount: leafIds.length,
+      confirmedCount: 0,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      initialResearchCoverage: completeResearchCoverage(leafIds),
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedQuality: {
+          completeness: "complete",
+          stats: {
+            acceptedCount: leafIds.length,
+            expectedCount: 30,
+            droppedCount: 0,
+          },
+          warnings: [],
+          downstreamEligible: true,
+          publishable: true,
+        },
+      },
+      logoStorageKey: null,
+      logoSha256: null,
+      logoBytes: null,
+      logoFilename: null,
+      logoMimeType: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    state.nodes.push({
+      id: "node-materialized-logo",
+      buildId,
+      leafId: leafIds[0],
+      branchId: "identity",
+      branchTitle: "企业身份",
+      title: "企业身份与定位",
+      ordinal: 0,
+      status: "current",
+      transitionReason: "materialized_initial_current",
+      contentMarkdown: content,
+      contentSha256: knowledgeBaseMarkdownSha256(content),
+      contentVersion: 1,
+      sourceUrls: [],
+      imageUrls: [],
+      assetRefs: [],
+      lastTaskId: null,
+      sourceTurnId: "turn-materialized-initial",
+      presentationKey,
+      lastResponseAt: now,
+      confirmedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const database = memoryDatabase(state, { transactional: true });
+    const transaction = database.transaction.bind(database);
+    let transactionQueue = Promise.resolve();
+    database.transaction = <T>(operation: (tx: any) => Promise<T>) => {
+      const result = transactionQueue.then(() => transaction(operation));
+      transactionQueue = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    };
+    dependencies.getDb.mockResolvedValue(database);
+    const { bindMaterializedKnowledgeBaseOfficialLogoLocally } = await import(
+      "./knowledge-base-materialized-service"
+    );
+    const png = async (color: string) =>
+      sharp({
+        create: {
+          width: 64,
+          height: 64,
+          channels: 4,
+          background: color,
+        },
+      })
+        .png()
+        .toBuffer();
+    const uploadInput = async (input: {
+      clientRequestId: string;
+      bytes: Buffer;
+      expectedRevision?: number;
+      expectedPresentationKey?: string;
+    }) => {
+      const digest = createHash("sha256").update(input.bytes).digest("hex");
+      return bindMaterializedKnowledgeBaseOfficialLogoLocally({
+        userId: USER_ID,
+        conversationId: PUBLIC_CONVERSATION_ID,
+        buildId,
+        clientRequestId: input.clientRequestId,
+        expectedGeneration: 1,
+        expectedRevision:
+          input.expectedRevision ?? Number(state.builds[0]!.revision),
+        expectedLeafId: leafIds[0]!,
+        expectedPresentationKey:
+          input.expectedPresentationKey ??
+          String(state.builds[0]!.currentPresentationKey),
+        upload: {
+          fileId: `file-${input.clientRequestId}`,
+          filename: "brand.png",
+          mimeType: "image/png",
+          sizeBytes: input.bytes.length,
+          sourceSha256: digest,
+        },
+        bytes: input.bytes,
+        boundAt: now,
+      });
+    };
+
+    const firstBytes = await png("#173c36");
+    const firstInput = {
+      clientRequestId: "logo-first",
+      bytes: firstBytes,
+      expectedRevision: 0,
+      expectedPresentationKey: presentationKey,
+    };
+    const first = await uploadInput(firstInput);
+    expect(first).toMatchObject({
+      execution: "local",
+      disposition: "logo_bound",
+      revision: 1,
+      stateEpoch: 5,
+      contentVersion: 1,
+      workingSetId: "working-set-immutable",
+    });
+    expect(state.builds[0]).toMatchObject({
+      activeWorkingSetId: "working-set-immutable",
+      contentVersion: 1,
+      revision: 1,
+      stateEpoch: 5,
+      logoSha256: createHash("sha256").update(firstBytes).digest("hex"),
+    });
+    expect(state.turns.at(-1)).toMatchObject({
+      operationType: "local_logo",
+      apiCredentialId: null,
+      upstreamTaskId: null,
+      status: "completed",
+      metadata: {
+        execution: "local",
+        providerRequestCount: 0,
+        disposition: "logo_bound",
+        contentVersion: 1,
+      },
+    });
+
+    const replay = await uploadInput(firstInput);
+    expect(replay).toMatchObject({
+      disposition: "idempotent",
+      revision: 1,
+      stateEpoch: 5,
+      contentVersion: 1,
+      workingSetId: "working-set-immutable",
+    });
+    expect(state.builds[0]).toMatchObject({ revision: 1, stateEpoch: 5 });
+
+    const same = await uploadInput({
+      clientRequestId: "logo-same-bytes",
+      bytes: firstBytes,
+    });
+    expect(same).toMatchObject({
+      disposition: "logo_unchanged",
+      revision: 1,
+      stateEpoch: 5,
+      contentVersion: 1,
+    });
+    expect(state.builds[0]).toMatchObject({ revision: 1, stateEpoch: 5 });
+    const firstStorageKey = state.builds[0]!.logoStorageKey;
+
+    const replacementBytes = await png("#8b5cf6");
+    const replacement = await uploadInput({
+      clientRequestId: "logo-replacement",
+      bytes: replacementBytes,
+    });
+    expect(replacement).toMatchObject({
+      disposition: "logo_bound",
+      revision: 2,
+      contentVersion: 1,
+    });
+    expect(state.builds[0]!.logoStorageKey).not.toBe(firstStorageKey);
+
+    const concurrentRevision = state.builds[0]!.revision;
+    const concurrentPresentationKey = state.builds[0]!.currentPresentationKey;
+    const concurrent = await Promise.allSettled([
+      uploadInput({
+        clientRequestId: "logo-concurrent-a",
+        bytes: await png("#be123c"),
+        expectedRevision: concurrentRevision,
+        expectedPresentationKey: concurrentPresentationKey,
+      }),
+      uploadInput({
+        clientRequestId: "logo-concurrent-b",
+        bytes: await png("#0369a1"),
+        expectedRevision: concurrentRevision,
+        expectedPresentationKey: concurrentPresentationKey,
+      }),
+    ]);
+    expect(
+      concurrent.filter((entry) => entry.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrent.filter((entry) => entry.status === "rejected"),
+    ).toHaveLength(1);
+    expect(state.builds[0]).toMatchObject({
+      activeWorkingSetId: "working-set-immutable",
+      contentVersion: 1,
+      revision: 3,
+      stateEpoch: 7,
+    });
+
+    const apiLogoBytes = await png("#15803d");
+    const apiLogoSha256 = createHash("sha256")
+      .update(apiLogoBytes)
+      .digest("hex");
+    const apiLogoFileId = "managed-materialized-local-logo";
+    const { Readable } = await import("node:stream");
+    const presalesStore = await import("./presales-file-store");
+    await presalesStore.recordPresalesFileDescriptor({
+      fileId: apiLogoFileId,
+      filename: "api-brand.png",
+      mimeType: "image/png",
+      sizeBytes: apiLogoBytes.length,
+    });
+    const stagedApiLogo = await presalesStore.stagePresalesFileContent({
+      fileId: apiLogoFileId,
+      stream: Readable.from([apiLogoBytes]),
+      maxBytes: 1024 * 1024,
+    });
+    await stagedApiLogo.commit({
+      filename: "api-brand.png",
+      mimeType: "image/png",
+      uploadedAt: now,
+      contentExpiresAt: new Date(now.getTime() + 86_400_000),
+    });
+    state.localAssets.push({
+      id: apiLogoFileId,
+      scope: "managed_user",
+      accountUserId: USER_ID,
+      filename: "api-brand.png",
+      mimeType: "image/png",
+      sizeBytes: apiLogoBytes.length,
+      contentSha256: apiLogoSha256,
+      createdAt: now,
+      updatedAt: now,
+    });
+    let providerRequestCount = 0;
+    const provider = express();
+    provider.use((_req, res) => {
+      providerRequestCount += 1;
+      res.status(500).json({ error: "provider must not be called" });
+    });
+    const providerListener = await listen(provider);
+    dependencies.upstreamBaseUrl = providerListener.baseUrl;
+    const credentialReadsBefore =
+      dependencies.getDecryptedCredentialForKnowledgeBaseReservation.mock.calls
+        .length;
+    const knowledgeBaseApi = await import("./knowledge-base-api");
+    const knowledgeBaseRouter = knowledgeBaseApi.default;
+    const { requireExpressAuth } = await import("./_core/express-auth");
+    const dashboard = express();
+    dashboard.use(express.json());
+    dashboard.use(
+      "/api/knowledge-base",
+      requireExpressAuth,
+      knowledgeBaseRouter,
+    );
+    const dashboardListener = await listen(dashboard);
+    try {
+      const apiResponse = await fetch(
+        `${dashboardListener.baseUrl}/api/knowledge-base/turn`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-auth": "user",
+          },
+          body: JSON.stringify({
+            conversationId: PUBLIC_CONVERSATION_ID,
+            clientRequestId: "logo-api-local",
+            userMessage: "",
+            submissionKind: "logo",
+            attachments: [
+              {
+                file_id: apiLogoFileId,
+                filename: "api-brand.png",
+              },
+            ],
+            expectedGeneration: 1,
+            expectedRevision: state.builds[0]!.revision,
+            expectedLeafId: leafIds[0],
+            expectedPresentationKey: state.builds[0]!.currentPresentationKey,
+          }),
+        },
+      );
+      const apiBody = await apiResponse.json();
+      expect(apiResponse.status, JSON.stringify(apiBody)).toBe(200);
+      expect(apiBody).toMatchObject({
+        accepted: true,
+        execution: "local",
+        disposition: "logo_bound",
+        contentVersion: 1,
+        workingSetId: "working-set-immutable",
+      });
+      expect(providerRequestCount).toBe(0);
+      expect(
+        dependencies.getDecryptedCredentialForKnowledgeBaseReservation.mock
+          .calls.length,
+      ).toBe(credentialReadsBefore);
+      expect(state.turns.at(-1)).toMatchObject({
+        operationType: "local_logo",
+        apiCredentialId: null,
+        upstreamTaskId: null,
+        metadata: { providerRequestCount: 0 },
+      });
+      expect(state.builds[0]).toMatchObject({
+        activeWorkingSetId: "working-set-immutable",
+        contentVersion: 1,
+        revision: 4,
+        stateEpoch: 8,
+      });
+    } finally {
+      await Promise.all([
+        close(dashboardListener.server),
+        close(providerListener.server),
+      ]);
+      await presalesStore.removeStoredPresalesFile(apiLogoFileId);
+    }
+
+    const beforeBadImage = {
+      revision: state.builds[0]!.revision,
+      stateEpoch: state.builds[0]!.stateEpoch,
+      logoSha256: state.builds[0]!.logoSha256,
+    };
+    await expect(
+      uploadInput({
+        clientRequestId: "logo-bad-image",
+        bytes: Buffer.from("not-an-image", "utf8"),
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_INVALID" });
+    expect(state.builds[0]).toMatchObject(beforeBadImage);
+    expect(state.builds[0]).toMatchObject({
+      activeWorkingSetId: "working-set-immutable",
+      contentVersion: 1,
+    });
+
+    const currentLogoStorageKey = state.builds[0]!.logoStorageKey;
+    if (currentLogoStorageKey) {
+      const artifactStore = await import("./knowledge-build-artifact-store");
+      await artifactStore.removeKnowledgeBuildArtifact({
+        userId: USER_ID,
+        buildId,
+        generation: 1,
+        kind: "logo",
+        storageKey: currentLogoStorageKey,
+      });
+    }
   });
 
   it.skip("retires production canonical-create rejection recovery", async () => {
@@ -1282,8 +1674,7 @@ describe("knowledge-base production final-package acceptance", () => {
           recoverySourceTurnId: generationTwoTurnId,
           terminalRecovery: {
             action: "retry_compatible_create",
-            recoveryStateSha256:
-              generationTwo.observation.notice.recoveryToken,
+            recoveryStateSha256: generationTwo.observation.notice.recoveryToken,
           },
         },
       });

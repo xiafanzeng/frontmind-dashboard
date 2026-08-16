@@ -6,12 +6,14 @@ import { describe, expect, it } from "vitest";
 import {
   adminNav,
   annotateSharedKeyAccountCounts,
+  apiUsageSyncStatusCopy,
   bulkApiKeyTargetsForScope,
   buildDeliveryEngineerStatusRows,
   channelDistributionUrl,
   filterApiKeyUsageForAdmin,
   filterPreviewApiKeyUsageForAdmin,
   filterPreviewTicketsForAdmin,
+  formatApiUsageLastSuccess,
   formatAdminBrandTrackingCredits,
   getAdminNav,
   getPreviewAdminNav,
@@ -248,9 +250,8 @@ describe("administrator channel navigation", () => {
     );
     expect(source).not.toContain("管理员自用 Agent 积分");
     expect(source).toContain("统一 API Key 管理");
-    expect(source).toContain(
-      "客户、系统管理员、交付管理员和工程师使用同一套管理入口",
-    );
+    expect(source).toContain("客户、交付管理员和工程师使用同一套管理入口");
+    expect(source).not.toContain('["system_admin", "系统管理员"]');
     expect(source).toContain(
       "trpc.admin.apiKeyUsageAlerts.replaceTargetCredential.useMutation()",
     );
@@ -266,6 +267,7 @@ describe("administrator channel navigation", () => {
     expect(source).toContain("批量分配品牌追踪 Key");
     expect(source).toContain("共享 Key 归因积分");
     expect(source).toContain("刷新唯一 Key 积分余额");
+    expect(source).not.toContain("连接同步失败");
     expect(source).not.toContain("近 30 天费用");
     expect(source).not.toContain("个人费用");
     expect(source).not.toContain("美元");
@@ -351,6 +353,7 @@ describe("administrator channel navigation", () => {
           keyPoolTotalUsed: 20,
           rolling30DayUsed: 10,
           keyHealth: "sync_error",
+          syncIssueCode: "RATE_LIMITED",
           fetchedAt: null,
         },
       ],
@@ -360,9 +363,28 @@ describe("administrator channel navigation", () => {
         adminId: 1,
         apiKeyVersion: 3,
         keyHealth: "sync_error",
+        syncIssueCode: "RATE_LIMITED",
         rolling30DayUsed: 10,
       }),
     ]);
+  });
+
+  it("shows actionable usage failure categories and a safe last-success time", () => {
+    expect(
+      apiUsageSyncStatusCopy({
+        keyHealth: "sync_error",
+        issueCode: "RATE_LIMITED",
+      }),
+    ).toBe("用量读取频率受限");
+    expect(
+      apiUsageSyncStatusCopy({
+        keyHealth: "sync_error",
+        issueCode: "PAGE_DRIFT",
+      }),
+    ).toBe("积分流水正在变化，等待重试");
+    expect(formatApiUsageLastSuccess("2026-08-15T08:30:00.000Z")).toBe(
+      "08/15 16:30",
+    );
   });
 
   it("keeps rolling self-use independent from Key health", () => {
@@ -732,7 +754,6 @@ describe("bulk API Key target previews", () => {
   }
 
   const rows: KeyManagementRow[] = [
-    keyRow({ kind: "system_admin", userId: 1, deliveryAdminId: null }),
     keyRow({
       kind: "delivery_admin",
       userId: 10,
@@ -754,7 +775,7 @@ describe("bulk API Key target previews", () => {
       bulkApiKeyTargetsForScope(rows, { kind: "all" }).map(
         (target) => target.userId,
       ),
-    ).toEqual([1, 10, 11, 12, 30]);
+    ).toEqual([10, 11, 12, 30]);
   });
 
   it("previews one delivery manager plus owned customers without engineers", () => {

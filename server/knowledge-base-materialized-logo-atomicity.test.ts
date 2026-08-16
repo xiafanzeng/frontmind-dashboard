@@ -165,4 +165,68 @@ describe("materialized Logo replacement atomicity", () => {
     expect(transactionBody).toContain("...(logoActivation.logoUpdate ?? {})");
     expect(postCommitCleanup).toBeGreaterThan(transactionStart);
   });
+
+  it("keeps local v5 Logo binding provider-free and leaves the active Working Set unchanged", () => {
+    const serviceSource = readFileSync(
+      path.join(process.cwd(), "server/knowledge-base-materialized-service.ts"),
+      "utf8",
+    );
+    const localStart = serviceSource.indexOf(
+      "export async function bindMaterializedKnowledgeBaseOfficialLogoLocally",
+    );
+    const localEnd = serviceSource.indexOf(
+      "function updatedEvidenceLedger",
+      localStart,
+    );
+    const localBinding = serviceSource.slice(localStart, localEnd);
+    expect(localStart).toBeGreaterThan(0);
+    expect(localEnd).toBeGreaterThan(localStart);
+    expect(localBinding).toContain('operationType: "local_logo"');
+    expect(localBinding).toContain("providerRequestCount: 0");
+    expect(localBinding).toContain("apiCredentialId: null");
+    expect(localBinding).toContain("upstreamTaskId: null");
+    expect(localBinding).toContain("contentVersion: build.contentVersion");
+    expect(localBinding).toContain("workingSetId: build.activeWorkingSetId");
+    expect(localBinding).not.toContain("knowledgeBaseWorkingSets");
+    expect(localBinding).not.toContain("ManusV2Client");
+  });
+
+  it("routes v5 manual Logo submissions locally before any credential or Provider path", () => {
+    const apiSource = readFileSync(
+      path.join(process.cwd(), "server/knowledge-base-api.ts"),
+      "utf8",
+    );
+    const directRoute = apiSource.indexOf('router.post("/turn",');
+    const localBinding = apiSource.indexOf(
+      "bindMaterializedKnowledgeBaseOfficialLogoLocally",
+      directRoute,
+    );
+    const providerCredential = apiSource.indexOf(
+      "const taskCredential = req.frontmindCredential",
+      directRoute,
+    );
+    expect(directRoute).toBeGreaterThan(0);
+    expect(localBinding).toBeGreaterThan(directRoute);
+    expect(providerCredential).toBeGreaterThan(localBinding);
+    const localBranch = apiSource.slice(localBinding, providerCredential);
+    expect(localBranch).toContain("res.status(200)");
+    expect(localBranch).toContain("return;");
+    expect(localBranch).not.toContain("dispatchAcceptedKnowledgeBaseClaim");
+    expect(localBranch).not.toContain("ManusV2Client");
+
+    const serviceSource = readFileSync(
+      path.join(process.cwd(), "server/knowledge-base-materialized-service.ts"),
+      "utf8",
+    );
+    const confirmStart = serviceSource.indexOf(
+      "export async function confirmMaterializedKnowledgeBaseNode",
+    );
+    const logoStart = serviceSource.indexOf(
+      "export async function bindMaterializedKnowledgeBaseOfficialLogoLocally",
+      confirmStart,
+    );
+    expect(serviceSource.slice(confirmStart, logoStart)).not.toContain(
+      "LOGO_REQUIRED",
+    );
+  });
 });

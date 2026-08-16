@@ -174,7 +174,6 @@ function terminalObservation(stateEpoch: number) {
       failureClass: "requires_user_fix",
       recoveryAction: "contact_support",
       canRegenerate: false,
-      traceId: "a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
       attachmentCount: 7,
       turnId: "turn-failed",
       createdAt: stateEpoch,
@@ -485,6 +484,123 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     );
   });
 
+  it("keeps the starter batch open when a local upload fails before dispatch", async () => {
+    mocks.uploadKnowledgeBaseLocalAsset.mockImplementation(
+      async (file: File, _progress: unknown, _retry: unknown, options: any) => {
+        const ordinal = Number(options.batchOrdinal);
+        if (ordinal === 2) {
+          throw Object.assign(new Error("附件上传网络异常，请稍后重试"), {
+            code: "UPLOAD_NETWORK_ERROR",
+            retryable: true,
+          });
+        }
+        const fileId = `asset_test_${ordinal}`;
+        await options.onFileRecord?.({
+          fileId,
+          filename: file.name,
+          reusedExistingFileId: false,
+        });
+        options.onStage?.({
+          stage: "uploaded",
+          fileId,
+          loadedBytes: file.size,
+          totalBytes: file.size,
+        });
+        return {
+          fileId,
+          filename: file.name,
+          sizeBytes: file.size,
+          uploadedAt: 10_000 + ordinal,
+          dashboardReadyAt: 10_000 + ordinal,
+          expiresAt: 20_000 + ordinal,
+          replayed: false,
+          recovered: false,
+        };
+      },
+    );
+
+    renderIntegratedChat();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "构建企业知识库" }),
+    );
+    const files = [
+      new File(["first"], "第一份.pdf", {
+        type: "application/pdf",
+        lastModified: 1,
+      }),
+      new File(["second"], "第二份.pptx", {
+        type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        lastModified: 2,
+      }),
+    ];
+    fireEvent.change(document.querySelector('input[type="file"]')!, {
+      target: { files },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+
+    await waitFor(() =>
+      expect(mocks.uploadKnowledgeBaseLocalAsset).toHaveBeenCalledTimes(2),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("dialog", { name: "构建企业知识库" }),
+      ).toBeVisible(),
+    );
+    expect(mocks.reserveRequests).toHaveLength(1);
+    expect(mocks.stageRequests).toHaveLength(1);
+    expect(mocks.startRequests).toHaveLength(0);
+    expect(mocks.reconcileCalls).toBe(0);
+    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
+      '"messageCount":0',
+    );
+    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
+      '"serverOwned":0',
+    );
+    for (const call of mocks.uploadKnowledgeBaseLocalAsset.mock.calls) {
+      expect(call[3]?.contentSha256).toMatch(/^[a-f0-9]{64}$/u);
+    }
+  });
+
+  it("keeps the starter batch open when dispatch explicitly rejects the request", async () => {
+    renderIntegratedChat();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "构建企业知识库" }),
+    );
+    addFiveFiles();
+    fireEvent.click(screen.getByRole("button", { name: "开始构建" }));
+
+    await waitFor(() => expect(mocks.startRequests).toHaveLength(1));
+    const clientRequestId = String(
+      mocks.startRequests[0]?.body.clientRequestId,
+    );
+    mocks.firstStartResolve?.(
+      new Response(
+        JSON.stringify({
+          error: { code: "CONFLICT", message: "该启动请求已被明确拒绝" },
+          // A reserve observation describes the upload reservation, not proof
+          // that this final dispatch was accepted.
+          observation: acceptedObservation(clientRequestId),
+        }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    await screen.findByRole("button", {
+      name: /重试启动|重试并继续/u,
+    });
+    expect(
+      screen.getByRole("dialog", { name: "构建企业知识库" }),
+    ).toBeVisible();
+    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
+      '"messageCount":0',
+    );
+    expect(screen.getByTestId("conversation-probe")).toHaveTextContent(
+      '"serverOwned":0',
+    );
+    expect(mocks.reconcileCalls).toBe(0);
+    expect(mocks.startRequests).toHaveLength(1);
+  });
+
   it("keeps the upload owner alive when a coordinator observation changes status", async () => {
     const file = new File(["durable-body"], "资料.pdf", {
       type: "application/pdf",
@@ -702,7 +818,6 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
               failureClass: "requires_user_fix",
               recoveryAction: "contact_support",
               canRegenerate: false,
-              traceId: "a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
               attachmentCount: 7,
               turnId: "turn-failed",
             },
@@ -740,9 +855,11 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       screen.getByTestId("knowledge-base-attachment-retention"),
     ).toHaveTextContent("7/7 个附件已保留，知识库任务未创建");
     expect(
-      screen.getByTestId("knowledge-base-safe-diagnostic"),
-    ).toHaveTextContent(
-      "错误码：UPSTREAM_CREATE_3 · 排查编号：a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
+      screen.queryByTestId("knowledge-base-safe-diagnostic"),
+    ).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("UPSTREAM_CREATE_3");
+    expect(document.body.textContent).not.toContain(
+      "a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
     );
     expect(
       screen.queryByText(/sk-secret|provider raw|filename\.pdf/i),
@@ -783,7 +900,6 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
               failureClass: "requires_user_fix",
               recoveryAction: "contact_support",
               canRegenerate: false,
-              traceId: "a0c7502e-4c1f-4d06-8ab6-407e8a82c138",
               attachmentCount: 7,
               turnId: "turn-failed",
             },
