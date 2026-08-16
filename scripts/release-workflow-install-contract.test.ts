@@ -31,6 +31,7 @@ const productionBundleAudit = path.resolve(
 const productionController = path.resolve(
   "deploy/production/controller/frontmind-deploy-controller",
 );
+const productionReleaseManual = path.resolve("docs/operations/RELEASE.md");
 const installer = path.resolve("deploy/production/install.sh");
 const controllerUpdater = path.resolve(
   "deploy/production/update-release-controllers.sh",
@@ -81,6 +82,7 @@ describe("release workflow source-ordering contracts", () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     const updater = await readFile(controllerUpdater, "utf8");
     const installerSource = await readFile(installer, "utf8");
+    const releaseManual = await readFile(productionReleaseManual, "utf8");
     const coupledJob = workflow.slice(
       workflow.indexOf("  coupled-stack-deploy:"),
     );
@@ -95,6 +97,10 @@ describe("release workflow source-ordering contracts", () => {
     expect(updater).toContain(
       'VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"',
     );
+    expect(updater).toContain('readonly CONTROLLER_VERSION="4"');
+    expect(releaseManual).toContain("production-owned v4 controller");
+    expect(releaseManual).toContain("--apply-version=4");
+    expect(releaseManual).not.toMatch(/--apply-version=[0-3](?:\D|$)/u);
     expect(updater).toContain("PRODUCTION_CONTROLLER_UPDATE_ROLLED_BACK");
     expect(installerSource).not.toContain(
       "frontmind-update-release-controllers",

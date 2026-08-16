@@ -157,10 +157,10 @@ Knowledge Base v2 writer 与 active legacy migration 是两个独立的生产运
 再决定是否执行新 phase。恢复尚未被 local/public readiness 同时证明时失败关闭并保留 sentinel，
 不能越过。`pause`/`complete` 都不撤销已绑定 canonical task，但只有 `complete` 能证明迁移已收口。
 
-首次安装 production-owned v2 controller 必须从已经合并并经过 CI 的精确生产源码执行：
+首次安装 production-owned v4 controller 必须从已经合并并经过 CI 的精确生产源码执行：
 
 ```bash
-sudo deploy/production/update-release-controllers.sh --apply-version=2
+sudo deploy/production/update-release-controllers.sh --apply-version=4
 ```
 
 updater 同时持有 Dashboard、Website 发布锁，原子替换 controller 与 forced command，验证版本、
