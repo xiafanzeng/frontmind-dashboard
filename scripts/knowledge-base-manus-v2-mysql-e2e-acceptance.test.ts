@@ -246,7 +246,7 @@ function axiosResponse(
 function syntheticLeaf(index: number) {
   const leafId = `1.${index + 1}`;
   const title = `合成知识节点 ${index + 1}`;
-  const visibleMarkdown = `# ${leafId} ${title}\n\n## 核心事实\n\n本验收节点只包含“合成产品代号 A”的完全合成资料，用于证明 Dashboard 一次物化全部内容、只在本地确认并生成最终客户包。节点编号为 ${leafId}，不引用任何客户文档、生产任务或真实 API 凭证。`;
+  const visibleMarkdown = `# ${title}\n\n## 核心事实\n\n本验收节点只包含“合成产品代号 A”的完全合成资料，用于证明 Dashboard 一次物化全部内容、只在本地确认并生成最终客户包。节点编号为 ${leafId}，不引用任何客户文档、生产任务或真实 API 凭证。`;
   return { leafId, title, visibleMarkdown };
 }
 
