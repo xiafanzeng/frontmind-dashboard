@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly CONTROLLER_VERSION="4"
+readonly CONTROLLER_VERSION="5"
 readonly VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"
 readonly CONTROLLER_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-controller"
 readonly FORCED_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-forced-command"
@@ -43,6 +43,8 @@ validate_controller() {
     && grep -Fq -- 'mark_coupled_stack_external_fact_changed' "$target" \
     && grep -Fq -- 'commit_coupled_stack_capsule_cleanup' "$target" \
     && grep -Fq -- 'resolve_coupled_website_container_id' "$target" \
+    && grep -Fq -- 'project-business-owner' "$target" \
+    && grep -Fq -- 'PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH' "$target" \
     && grep -Fq -- 'COUPLED_STACK_RECOVERY_MUST_FINISH_BEFORE_INCIDENT_ACKNOWLEDGEMENT' "$target" \
     && grep -Fq -- '/app/dist/private-workflows/socratic-kb-builder-v5.skill' "$target" \
     && grep -Fq -- '/api/internal/presales/v2' "$target" \

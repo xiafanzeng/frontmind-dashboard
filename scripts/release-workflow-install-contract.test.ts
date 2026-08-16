@@ -31,6 +31,9 @@ const productionBundleAudit = path.resolve(
 const productionController = path.resolve(
   "deploy/production/controller/frontmind-deploy-controller",
 );
+const presalesContractFixture = path.resolve(
+  "shared/contracts/presales-v2-contract-hashes.fixture.json",
+);
 const productionReleaseManual = path.resolve("docs/operations/RELEASE.md");
 const installer = path.resolve("deploy/production/install.sh");
 const controllerUpdater = path.resolve(
@@ -97,11 +100,15 @@ describe("release workflow source-ordering contracts", () => {
     expect(updater).toContain(
       'VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"',
     );
-    expect(updater).toContain('readonly CONTROLLER_VERSION="4"');
-    expect(releaseManual).toContain("production-owned v4 controller");
-    expect(releaseManual).toContain("--apply-version=4");
-    expect(releaseManual).not.toMatch(/--apply-version=[0-3](?:\D|$)/u);
+    expect(updater).toContain('readonly CONTROLLER_VERSION="5"');
+    expect(releaseManual).toContain("production-owned v5 controller");
+    expect(releaseManual).toContain("--apply-version=5");
+    expect(releaseManual).not.toMatch(/--apply-version=[0-4](?:\D|$)/u);
     expect(updater).toContain("PRODUCTION_CONTROLLER_UPDATE_ROLLED_BACK");
+    expect(updater).toContain("project-business-owner");
+    expect(updater).toContain(
+      "PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH",
+    );
     expect(installerSource).not.toContain(
       "frontmind-update-release-controllers",
     );
@@ -122,6 +129,10 @@ describe("release workflow source-ordering contracts", () => {
       controller.indexOf(
         'if [[ $operation == "deploy" && $mode == "acknowledge-incident" ]]',
       ),
+    );
+    const dashboardSmoke = controller.slice(
+      controller.indexOf("dashboard_health_and_changed_surface_once()"),
+      controller.indexOf("coupled_website_health_once()"),
     );
     const recovery = controller.slice(
       controller.indexOf("restore_coupled_stack()"),
@@ -174,6 +185,19 @@ describe("release workflow source-ordering contracts", () => {
       execution.indexOf("backup_database"),
     );
     expect(success.match(/dashboard_health_and_changed_surface_once/g)).toHaveLength(1);
+    expect(dashboardSmoke).toContain('"project-business-owner"');
+    expect(dashboardSmoke).toContain(
+      "($status.capabilities | sort) == ($requiredCapabilities | sort)",
+    );
+    expect(dashboardSmoke).toContain(
+      "PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH",
+    );
+    expect(dashboardSmoke).not.toContain(
+      '.capabilities | type == "array" and length == 4',
+    );
+    expect(dashboardSmoke).not.toContain(
+      '.contractHashes | type == "object" and length == 6',
+    );
     expect(success.match(/wait_coupled_website_ready/g)).toHaveLength(1);
     expect(success.match(/coupled_website_health_once/g)).toHaveLength(1);
     expect(recovery).toContain('restore_production_database "$backup"');
@@ -203,6 +227,81 @@ describe("release workflow source-ordering contracts", () => {
     expect(main.indexOf("restore_coupled_stack")).toBeLessThan(
       main.indexOf("verify_candidate"),
     );
+  });
+
+  it("binds the coupled smoke to the canonical Presales consumer contract", async () => {
+    const controller = await readFile(productionController, "utf8");
+    const dashboardSmoke = controller.slice(
+      controller.indexOf("dashboard_health_and_changed_surface_once()"),
+      controller.indexOf("coupled_website_health_once()"),
+    );
+    const filter = dashboardSmoke.match(
+      /jq -e '\n([\s\S]*?)\n  ' <<<"\$status" >\/dev\/null/u,
+    )?.[1];
+    expect(filter).toBeTruthy();
+
+    const fixture = JSON.parse(
+      await readFile(presalesContractFixture, "utf8"),
+    ) as {
+      presalesContractVersion: number;
+      capabilities: string[];
+      contractHashes: Record<string, string>;
+    };
+    const status = {
+      ok: true,
+      ...fixture,
+    };
+    const run = (input: unknown) =>
+      spawnSync("jq", ["-e", filter!], {
+        encoding: "utf8",
+        input: JSON.stringify(input),
+      });
+
+    expect(run(status).status).toBe(0);
+    expect(
+      run({ ...status, capabilities: [...status.capabilities].reverse() }).status,
+    ).toBe(0);
+    expect(
+      run({
+        ...status,
+        capabilities: status.capabilities.filter(
+          (capability) => capability !== "project-business-owner",
+        ),
+      }).status,
+    ).toBe(1);
+    expect(
+      run({
+        ...status,
+        capabilities: [...status.capabilities, status.capabilities[0]],
+      }).status,
+    ).toBe(1);
+    expect(
+      run({
+        ...status,
+        capabilities: [...status.capabilities, "unknown-capability"],
+      }).status,
+    ).toBe(1);
+    const incompleteHashes = { ...status.contractHashes };
+    delete incompleteHashes["website.question-recommendation"];
+    expect(run({ ...status, contractHashes: incompleteHashes }).status).toBe(1);
+    expect(
+      run({
+        ...status,
+        contractHashes: {
+          ...status.contractHashes,
+          "unknown.contract": "f".repeat(64),
+        },
+      }).status,
+    ).toBe(1);
+    expect(
+      run({
+        ...status,
+        contractHashes: {
+          ...status.contractHashes,
+          "website.question-recommendation": "0".repeat(64),
+        },
+      }).status,
+    ).toBe(1);
   });
 
   it("resolves exactly one compose-managed Website container id", async () => {

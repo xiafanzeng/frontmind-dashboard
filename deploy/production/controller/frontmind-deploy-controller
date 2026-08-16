@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# frontmind-production-controller-version: 4
+# frontmind-production-controller-version: 5
 set -Eeuo pipefail
 umask 077
 
@@ -1346,11 +1346,32 @@ dashboard_health_and_changed_surface_once() {
     -H "x-frontmind-service-token: ${token}" \
     "$COUPLED_DASHBOARD_PRESALES_STATUS_URL")" || return 1
   token=""
-  jq -e '
-    .ok == true and .presalesContractVersion == 2 and
-    (.capabilities | type == "array" and length == 4) and
-    (.contractHashes | type == "object" and length == 6 and all(.[]; test("^[a-f0-9]{64}$")))
-  ' <<<"$status" >/dev/null
+  if ! jq -e '
+    . as $status |
+    [
+      "local-assets",
+      "typed-results",
+      "local-artifacts",
+      "safe-events",
+      "project-business-owner"
+    ] as $requiredCapabilities |
+    {
+      "website.question-recommendation": "c2410c0b93f1c67e589e716e254bf9ce6e3f4ec9bb845b99e5f85706315dabb4",
+      "website.knowledge-base-candidate": "f7d08256052c49acd99fff60ca19f8075430851c265072674c3271604a7db4ca",
+      "website.custom-question-classifier": "f810e57e094582892e1434641d20858bd5d7c324d0722411b21ce8e062320c7c",
+      "website.current-state-assessment": "cc5c61ed7841239a2290a7077d7a8ad04296a84a88f6c64858e234d25532bb7c",
+      "website.optimization-forecast": "96bdf3df50dbabaca2618e198c7599c2fc53b3e41bff9076b21efcc2a79886b2",
+      "website.monitor-question-translation": "7c0ceb342ac3bf7410cf6d10fb6d4167f3648c820d79d4fd6600f4965fb02024"
+    } as $requiredContracts |
+    $status.ok == true and $status.presalesContractVersion == 2 and
+    ($status.capabilities | type == "array") and
+    (($status.capabilities | sort) == ($requiredCapabilities | sort)) and
+    ($status.contractHashes | type == "object") and
+    $status.contractHashes == $requiredContracts
+  ' <<<"$status" >/dev/null; then
+    log "PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH"
+    return 1
+  fi
 }
 
 coupled_website_health_once() {
