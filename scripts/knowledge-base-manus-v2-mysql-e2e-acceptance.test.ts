@@ -295,6 +295,21 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
     date: FIXED_ZIP_DATE,
     createFolders: false,
   });
+  const evidenceLedger = Array.from({ length: 12 }, (_, index) => {
+    const path = `evidence/${String(index + 1).padStart(4, "0")}.md`;
+    const content = `# 合成公开信源 ${index + 1}\n\n本文件仅用于验证 Working Set 的证据账本与研究覆盖计数一致，不包含任何客户资料。`;
+    zip.file(path, content, {
+      date: FIXED_ZIP_DATE,
+      createFolders: false,
+    });
+    return {
+      path,
+      sha256: sha256(content),
+      leafId: syntheticLeaves[index]!.leafId,
+      sourceUrl: `https://example.test/research/${index + 1}`,
+      retrievedAt: FIXED_ZIP_DATE.toISOString(),
+    };
+  });
   const leaves = syntheticLeaves.map((leaf, index) => {
     const contentPath = `nodes/${String(index + 1).padStart(4, "0")}.md`;
     zip.file(contentPath, leaf.visibleMarkdown, {
@@ -309,7 +324,8 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
       ordinal: index,
       contentPath,
       contentSha256: sha256(leaf.visibleMarkdown),
-      evidencePaths: [],
+      evidencePaths:
+        index < evidenceLedger.length ? [evidenceLedger[index]!.path] : [],
       assetIds: [],
     };
   });
@@ -343,7 +359,7 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
       publicQueries: 6,
       officialDocuments: 0,
       uploadsRead: 0,
-      sourceCount: 12,
+      sourceCount: evidenceLedger.length,
       productFamilies: [
         {
           id: "synthetic-product",
@@ -361,7 +377,7 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
     branches: [
       { branchId: "synthetic-products", title: "合成产品", ordinal: 0 },
     ],
-    evidenceLedger: [],
+    evidenceLedger,
     leaves,
     assets: [
       {
@@ -379,7 +395,7 @@ async function buildSyntheticMaterializedWorkingSet(prompt: string) {
     logo: { status: "available", assetId: "official-logo" },
     counts: {
       leaves: MATERIALIZED_LEAF_COUNT,
-      evidenceFiles: 0,
+      evidenceFiles: evidenceLedger.length,
       assets: 1,
     },
   };
