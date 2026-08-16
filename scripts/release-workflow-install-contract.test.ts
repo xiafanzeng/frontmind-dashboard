@@ -144,6 +144,16 @@ describe("release workflow source-ordering contracts", () => {
     );
     expect(controller).not.toMatch(/--kb-manus-v2-rollout|dual-read|canary|shadow/u);
     expect(prepare).toContain('stop website');
+    expect(controller).toContain("resolve_coupled_website_container_id()");
+    expect(controller).toContain(
+      'coupled_website_compose "$environment_file" ps -q website',
+    );
+    expect(prepare).toContain(
+      'resolve_coupled_website_container_id "$coupled_website_env"',
+    );
+    expect(prepare).not.toContain(
+      "docker inspect --format '{{.Config.Image}}' frontmind-website",
+    );
     expect(prepare).toContain("render_coupled_dashboard_runtime_v5");
     expect(prepare).toContain("render_coupled_website_runtime_v2");
     expect(controller).toContain("/^FRONTMIND_KB_V4_ROLLOUT_PERCENT=/ { next }");
@@ -188,6 +198,45 @@ describe("release workflow source-ordering contracts", () => {
       main.indexOf("verify_candidate"),
     );
   });
+
+  it("resolves exactly one compose-managed Website container id", async () => {
+    const controller = await readFile(productionController, "utf8");
+    const resolver = controller.slice(
+      controller.indexOf("resolve_coupled_website_container_id()"),
+      controller.indexOf("make_coupled_website_env()"),
+    );
+    const run = (composeOutput: string, composeStatus = 0) =>
+      spawnSync(
+        "bash",
+        [
+          "-c",
+          `coupled_website_compose() {
+  printf '%s' "$TEST_COMPOSE_OUTPUT"
+  return "$TEST_COMPOSE_STATUS"
+}
+${resolver}
+resolve_coupled_website_container_id fixture.env`,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            TEST_COMPOSE_OUTPUT: composeOutput,
+            TEST_COMPOSE_STATUS: String(composeStatus),
+          },
+        },
+      );
+    const containerId = "a".repeat(64);
+
+    expect(run(`${containerId}\n`)).toMatchObject({
+      status: 0,
+      stdout: `${containerId}\n`,
+    });
+    expect(run("").status).toBe(1);
+    expect(run(`${containerId}\n${"b".repeat(64)}\n`).status).toBe(1);
+    expect(run(`${containerId}\n`, 23).status).toBe(1);
+  });
+
   it("takes the pnpm version only from package.json", async () => {
     const workflow = await readFile(dashboardWorkflow, "utf8");
     expect(workflow).not.toMatch(/pnpm\/action-setup@v4\s+with:\s+version:/gu);

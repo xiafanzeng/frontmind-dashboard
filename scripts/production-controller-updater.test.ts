@@ -136,7 +136,7 @@ exec /usr/bin/stat "$@"
   await writeFile(path.join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n", {
     mode: 0o755,
   });
-  const result = spawnSync("bash", [updaterFile, "--apply-version=3"], {
+  const result = spawnSync("bash", [updaterFile, "--apply-version=4"], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -154,15 +154,15 @@ exec /usr/bin/stat "$@"
 }
 
 describe("production controller atomic updater", () => {
-  it("installs the reviewed v3 coupled controller and forced command atomically", async () => {
+  it("installs the reviewed v4 coupled controller and forced command atomically", async () => {
     const test = await harness();
     expect(test.result.status, test.result.stderr).toBe(0);
     expect(test.result.stdout).toContain(
-      "PRODUCTION_CONTROLLER_UPDATE_OK version=3",
+      "PRODUCTION_CONTROLLER_UPDATE_OK version=4",
     );
     const installedController = await readFile(test.controllerTarget, "utf8");
     expect(installedController).toContain(
-      "frontmind-production-controller-version: 3",
+      "frontmind-production-controller-version: 4",
     );
     expect(installedController).toContain("--coupled-stack");
     expect(installedController).toContain(
@@ -173,6 +173,9 @@ describe("production controller atomic updater", () => {
     );
     expect(installedController).toContain(
       "commit_coupled_stack_capsule_cleanup",
+    );
+    expect(installedController).toContain(
+      "resolve_coupled_website_container_id",
     );
     expect(installedController).toContain(
       "mark_coupled_stack_external_fact_changed",
@@ -221,7 +224,7 @@ describe("production controller atomic updater", () => {
         "recovered-forced\n",
         { mode: 0o600 },
       ),
-      writeFile(path.join(test.recoveryRoot, "pending"), "version=3\n", {
+      writeFile(path.join(test.recoveryRoot, "pending"), "version=4\n", {
         mode: 0o600,
       }),
       writeFile(test.controllerTarget, "mixed-new-controller\n", {
@@ -229,7 +232,7 @@ describe("production controller atomic updater", () => {
       }),
       writeFile(test.forcedTarget, "mixed-old-forced\n", { mode: 0o755 }),
     ]);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=3"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=4"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
@@ -238,7 +241,7 @@ describe("production controller atomic updater", () => {
       "PRODUCTION_CONTROLLER_UPDATE_RECOVERED_PREVIOUS",
     );
     expect(await readFile(test.controllerTarget, "utf8")).toContain(
-      "frontmind-production-controller-version: 3",
+      "frontmind-production-controller-version: 4",
     );
   });
 
@@ -260,11 +263,11 @@ describe("production controller atomic updater", () => {
         "recoverable-controller\n",
         { mode: 0o600 },
       ),
-      writeFile(path.join(test.recoveryRoot, "pending"), "version=3\n", {
+      writeFile(path.join(test.recoveryRoot, "pending"), "version=4\n", {
         mode: 0o600,
       }),
     ]);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=3"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=4"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
@@ -281,7 +284,7 @@ describe("production controller atomic updater", () => {
     await writeFile(unsafeController, "unsafe-controller\n", { mode: 0o755 });
     await rm(test.controllerTarget);
     await symlink(unsafeController, test.controllerTarget);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=3"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=4"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
