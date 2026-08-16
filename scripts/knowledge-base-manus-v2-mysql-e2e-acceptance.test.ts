@@ -29,6 +29,7 @@ import {
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
+  knowledgeBaseSnapshots,
   knowledgeBaseWorkingSets,
   messages,
   upstreamResources,
@@ -1400,11 +1401,26 @@ mysqlDescribe(
       const publication = (await publishResponse.json()) as any;
       expect(publishResponse.status).toBe(200);
       expect(publication.snapshot).toMatchObject({
-        sourceBuildId: build.id,
-        sourceBuildRevision: MATERIALIZED_LEAF_COUNT,
-        sourceArtifactHash: sha256(packageBytes),
         archiveHash: sha256(packageBytes),
         archiveAvailable: true,
+      });
+      expect(publication.snapshot).not.toHaveProperty("sourceBuildId");
+      expect(publication.snapshot).not.toHaveProperty("sourceBuildRevision");
+      expect(publication.snapshot).not.toHaveProperty("sourceTaskId");
+      expect(publication.snapshot).not.toHaveProperty("sourceArtifactHash");
+      const publishedSnapshot = (
+        await executor
+          .select()
+          .from(knowledgeBaseSnapshots)
+          .where(eq(knowledgeBaseSnapshots.id, publication.snapshot.id))
+          .limit(1)
+      )[0]!;
+      expect(publishedSnapshot).toMatchObject({
+        sourceBuildId: build.id,
+        sourceBuildRevision: MATERIALIZED_LEAF_COUNT,
+        sourceTaskId: `dashboard-materialized:${build.id}:1`,
+        sourceArtifactHash: sha256(packageBytes),
+        archiveHash: sha256(packageBytes),
       });
       const publishedBuild = (
         await executor
