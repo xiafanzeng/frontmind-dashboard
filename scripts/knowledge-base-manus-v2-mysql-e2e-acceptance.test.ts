@@ -1058,14 +1058,9 @@ mysqlDescribe(
           payload.progress?.summary?.total === MATERIALIZED_LEAF_COUNT &&
           payload.observation?.approvedPresentation?.leafId === "1.1",
       });
-      await waitFor({
-        label: "initial task visibility update",
-        read: async () => fakeProvider.taskUpdateBodies.length,
-        accept: (count) => count === 1,
-      });
-
       expect(fakeProvider.taskCreateBodies).toHaveLength(1);
       expect(fakeProvider.taskSendBodies).toHaveLength(0);
+      expect(fakeProvider.taskUpdateBodies).toHaveLength(0);
       expect(fakeProvider.bundleDownloads).toBe(1);
       expect(fakeProvider.fileUploads.length).toBeGreaterThanOrEqual(2);
       expect(fakeProvider.fileDetailCalls.length).toBeGreaterThanOrEqual(

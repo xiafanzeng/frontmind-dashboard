@@ -180,6 +180,7 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
       turnId,
       clientRequestId,
       attachmentManifest,
+      expectedResetRevision: 7,
       index: 1,
       attachment: {
         file_id: "dashboard-file-2",
@@ -191,6 +192,7 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
       turnId,
       clientRequestId,
       attachmentManifest,
+      expectedResetRevision: 7,
       index: 2,
       attachment: {
         file_id: "dashboard-file-3",
@@ -200,6 +202,7 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
     expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith([], {
       conversationId,
       clientRequestId,
+      expectedResetRevision: 7,
       attachmentReservation: {
         turnId,
         attachmentManifest,
@@ -361,6 +364,7 @@ describe("KnowledgeBaseManagedUploadRecovery", () => {
       turnId,
       clientRequestId,
       attachmentManifest,
+      expectedResetRevision: 7,
       index: 0,
       attachment: {
         file_id: "dashboard-file-recreated",
