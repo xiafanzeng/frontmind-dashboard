@@ -1435,7 +1435,6 @@ describe("materialized knowledge-base local asset ingress", () => {
         undefined,
         undefined,
         {
-          itemId: "request-image:1",
           batchOrdinal: 1,
           resumeScope: {
             kind: "knowledge_base",
@@ -1461,6 +1460,8 @@ describe("materialized knowledge-base local asset ingress", () => {
       responseText = JSON.stringify({
         localAssetId: `asset_${"a".repeat(30)}`,
         filename: "brand-logo.png",
+        bytes: 4,
+        sha256: "a".repeat(64),
         expiresAt: 1_800_000_000_000,
       });
       uploadListeners = new Map<string, Array<(event?: any) => void>>();
@@ -1517,6 +1518,7 @@ describe("materialized knowledge-base local asset ingress", () => {
       fileId: `asset_${"a".repeat(30)}`,
       filename: "brand-logo.png",
       sizeBytes: 4,
+      contentSha256: "a".repeat(64),
       dashboardReadyAt: expect.any(Number),
     });
 
@@ -1581,7 +1583,7 @@ describe("materialized knowledge-base local asset ingress", () => {
     ).rejects.toMatchObject({ code: "UPLOAD_RECEIPT_INVALID" });
   });
 
-  it("retries the same knowledge-base File with stable operation coordinates", async () => {
+  it("retries a digest-free reservation and accepts the server digest receipt", async () => {
     const requests: Array<{
       headers: Map<string, string>;
       body: File;
@@ -1619,6 +1621,8 @@ describe("materialized knowledge-base local asset ingress", () => {
         this.responseText = JSON.stringify({
           localAssetId: `asset_${"c".repeat(30)}`,
           filename: "资料.pptx",
+          bytes: body.size,
+          sha256: "d".repeat(64),
           expiresAt: Date.now() + 60_000,
           replayed: true,
         });
@@ -1651,7 +1655,6 @@ describe("materialized knowledge-base local asset ingress", () => {
         {
           itemId: "item-2",
           batchOrdinal: 2,
-          contentSha256: "a".repeat(64),
           resumeScope: {
             kind: "knowledge_base",
             conversationId: "conversation-1",
@@ -1665,6 +1668,7 @@ describe("materialized knowledge-base local asset ingress", () => {
     ).resolves.toMatchObject({
       fileId: `asset_${"c".repeat(30)}`,
       replayed: true,
+      contentSha256: "d".repeat(64),
     });
 
     expect(requests).toHaveLength(2);
@@ -1687,7 +1691,7 @@ describe("materialized knowledge-base local asset ingress", () => {
       ).toBe("4");
       expect(
         request.headers.get(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256),
-      ).toBe("a".repeat(64));
+      ).toBeUndefined();
     }
     expect(
       requests.map((request) =>

@@ -1053,7 +1053,8 @@ async function readOwnedMaterializedKnowledgeBaseLocalAsset(input: {
   filename: string;
   mimeType: string;
   sizeBytes: number;
-  sha256: string;
+  /** Optional legacy browser digest; stored bytes remain server-verified. */
+  sha256?: string;
 }) {
   const db = await getDb();
   if (!db) {
@@ -1078,17 +1079,22 @@ async function readOwnedMaterializedKnowledgeBaseLocalAsset(input: {
   const stored = asset
     ? await readStoredPresalesFile(input.localAssetId)
     : null;
+  const legacyClientSha256 = String(input.sha256 || "")
+    .trim()
+    .toLowerCase();
   if (
     !asset ||
     !stored ||
     asset.filename !== input.filename ||
     asset.mimeType !== input.mimeType ||
     asset.sizeBytes !== input.sizeBytes ||
-    asset.contentSha256.toLowerCase() !== input.sha256.toLowerCase() ||
+    asset.contentSha256.toLowerCase() !== stored.sha256?.toLowerCase() ||
+    (legacyClientSha256 &&
+      asset.contentSha256.toLowerCase() !== legacyClientSha256) ||
     stored.filename !== input.filename ||
     stored.mimeType !== input.mimeType ||
     stored.sizeBytes !== input.sizeBytes ||
-    stored.sha256?.toLowerCase() !== input.sha256.toLowerCase()
+    (legacyClientSha256 && stored.sha256?.toLowerCase() !== legacyClientSha256)
   ) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -1112,7 +1118,9 @@ async function readOwnedMaterializedKnowledgeBaseLocalAsset(input: {
   const contentSha256 = createHash("sha256").update(bytes).digest("hex");
   if (
     total !== input.sizeBytes ||
-    contentSha256 !== input.sha256.toLowerCase()
+    contentSha256 !== asset.contentSha256.toLowerCase() ||
+    contentSha256 !== stored.sha256?.toLowerCase() ||
+    (legacyClientSha256 && contentSha256 !== legacyClientSha256)
   ) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
@@ -2508,6 +2516,26 @@ async function serverOwnedKnowledgeBaseAttachmentManifest(
   return manifest;
 }
 
+type KnowledgeBaseAuthoritativeAttachmentManifestItem =
+  KnowledgeBaseClientAttachmentManifestItem & { sha256: string };
+
+function requireKnowledgeBaseAuthoritativeAttachmentManifest(
+  value: unknown,
+): KnowledgeBaseAuthoritativeAttachmentManifestItem[] {
+  const manifest = normalizeKnowledgeBaseClientAttachmentManifest(value);
+  if (
+    manifest.some(
+      (item) => !item.sha256 || !/^[a-f0-9]{64}$/u.test(item.sha256),
+    )
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "附件缺少 Dashboard 权威完整性摘要，请重新上传",
+    );
+  }
+  return manifest as KnowledgeBaseAuthoritativeAttachmentManifestItem[];
+}
+
 export function knowledgeBaseRecoveryLogoPreparationError(error: unknown) {
   return new KnowledgeBaseLocalPreparationError(
     "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
@@ -3160,7 +3188,7 @@ async function ensureKnowledgeBaseRecoveryDispatch(input: {
     );
     const userMessage = recoveryString(recovery, "userMessage");
     const attachmentManifest = Array.isArray(recovery.attachmentManifest)
-      ? normalizeKnowledgeBaseClientAttachmentManifest(
+      ? requireKnowledgeBaseAuthoritativeAttachmentManifest(
           recovery.attachmentManifest,
         )
       : undefined;
@@ -5245,10 +5273,7 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
   createClient: (input: {
     baseUrl: string;
     apiKey: string;
-  }) => Pick<
-    ManusV2Client,
-    "createTask" | "listAllMessages" | "stopTask"
-  >;
+  }) => Pick<ManusV2Client, "createTask" | "listAllMessages" | "stopTask">;
 }) {
   const { claim, credential, build } = input;
   if (
@@ -8865,7 +8890,7 @@ router.post("/start/recover", async (req, res) => {
                     : undefined,
                 ),
                 attachmentManifest:
-                  normalizeKnowledgeBaseClientAttachmentManifest(
+                  requireKnowledgeBaseAuthoritativeAttachmentManifest(
                     body.attachmentManifest,
                   ),
               },
@@ -9991,6 +10016,11 @@ router.post("/turn/attachments/stage", async (req, res) => {
       sizeBytes: manifestItem.sizeBytes,
       sha256: manifestItem.sha256,
     });
+    const authoritativeManifestItem = {
+      ...manifestItem,
+      sizeBytes: localAsset.asset.sizeBytes,
+      sha256: localAsset.contentSha256,
+    };
     const deferredLogoPolicy = knowledgeBaseTurnLogoPolicy({
       providerProtocol: build.providerProtocol,
       legacyLogoRequired:
@@ -10000,7 +10030,9 @@ router.post("/turn/attachments/stage", async (req, res) => {
       deferredLogoPolicy.requiresOfficialLogo;
     if (
       deferredLogoPolicy.rejectRepeatedOfficialLogo &&
-      knowledgeBaseManifestRepeatsOfficialLogo(build, manifest)
+      knowledgeBaseManifestRepeatsOfficialLogo(build, [
+        authoritativeManifestItem,
+      ])
     ) {
       if (await replayAfterMutableFailure()) return;
       const message =
@@ -10055,8 +10087,8 @@ router.post("/turn/attachments/stage", async (req, res) => {
           fileId: attachment.file_id,
           filename: manifestItem.filename,
           mimeType: manifestItem.mimeType,
-          sizeBytes: manifestItem.sizeBytes,
-          sourceSha256: manifestItem.sha256,
+          sizeBytes: localAsset.asset.sizeBytes,
+          sourceSha256: localAsset.contentSha256,
         });
       } catch {
         if (
@@ -10326,10 +10358,42 @@ router.post("/turn/dispatch", async (req, res) => {
       return;
     }
 
+    let authoritativeAttachmentManifest: ReturnType<
+      typeof normalizeKnowledgeBaseClientAttachmentManifest
+    >;
+    try {
+      authoritativeAttachmentManifest =
+        normalizeKnowledgeBaseClientAttachmentManifest(
+          acquiredClaim.recoveryMetadata.attachmentManifest,
+        );
+    } catch {
+      authoritativeAttachmentManifest = [];
+    }
+    if (
+      authoritativeAttachmentManifest.length !== attachmentManifest.length ||
+      authoritativeAttachmentManifest.some(
+        (item) => !item.sha256 || !/^[a-f0-9]{64}$/u.test(item.sha256),
+      )
+    ) {
+      const message = "客户附件的服务端完整性账本不完整，请重新上传";
+      await cancelUnpreparedKnowledgeBaseTurn({
+        userId: req.frontmindUser.id,
+        turnId: acquiredClaim.turn.id,
+        clientRequestId,
+        leaseToken: acquiredClaim.leaseToken,
+        code: "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+        message,
+      });
+      throw new KnowledgeBaseTurnReservationError("CONFLICT", message);
+    }
+
     const officialLogoRequired = dispatchLogoPolicy.requiresOfficialLogo;
     if (
       !officialLogoRequired &&
-      knowledgeBaseManifestRepeatsOfficialLogo(build, attachmentManifest)
+      knowledgeBaseManifestRepeatsOfficialLogo(
+        build,
+        authoritativeAttachmentManifest,
+      )
     ) {
       const message =
         "该图片与已绑定的企业主 Logo 完全相同，无需作为普通补图再次上传";
@@ -10347,6 +10411,31 @@ router.post("/turn/dispatch", async (req, res) => {
       );
     }
 
+    try {
+      await assertKnowledgeBaseCustomerUploadCapacity({
+        userId: req.frontmindUser.id,
+        buildId: build.id,
+        generation: acquiredClaim.turn.buildGeneration,
+        officialLogoSha256: build.logoSha256,
+        officialLogoRequired,
+        attachmentManifest: authoritativeAttachmentManifest,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "客户补充图片超过当前知识库容量，请重新选择附件";
+      await cancelUnpreparedKnowledgeBaseTurn({
+        userId: req.frontmindUser.id,
+        turnId: acquiredClaim.turn.id,
+        clientRequestId,
+        leaseToken: acquiredClaim.leaseToken,
+        code: "KNOWLEDGE_BASE_CUSTOMER_UPLOAD_CAPACITY_EXCEEDED",
+        message,
+      });
+      throw error;
+    }
+
     let acceptedClaim: KnowledgeBaseRecoveryClaim = acquiredClaim;
     if (officialLogoRequired) {
       const stagedAttachments = normalizeKnowledgeBaseUserAttachments(
@@ -10355,10 +10444,10 @@ router.post("/turn/dispatch", async (req, res) => {
               .attachments as KnowledgeBaseAttachment[])
           : [],
       );
-      const manifestItem = attachmentManifest[0];
+      const manifestItem = authoritativeAttachmentManifest[0];
       const attachment = stagedAttachments[0];
       if (
-        attachmentManifest.length !== 1 ||
+        authoritativeAttachmentManifest.length !== 1 ||
         stagedAttachments.length !== 1 ||
         !manifestItem ||
         !attachment
@@ -10391,7 +10480,7 @@ router.post("/turn/dispatch", async (req, res) => {
             filename: manifestItem.filename,
             mimeType: manifestItem.mimeType,
             sizeBytes: manifestItem.sizeBytes,
-            sourceSha256: manifestItem.sha256,
+            sourceSha256: manifestItem.sha256!,
           },
         });
         logKnowledgeBaseOperationTelemetry({
@@ -10654,7 +10743,7 @@ router.post("/turn", async (req, res) => {
         ? await serverOwnedKnowledgeBaseAttachmentManifest(attachments)
         : body.attachmentManifest === undefined
           ? undefined
-          : normalizeKnowledgeBaseClientAttachmentManifest(
+          : requireKnowledgeBaseAuthoritativeAttachmentManifest(
               body.attachmentManifest,
             )
       : undefined;
@@ -11770,9 +11859,10 @@ router.post("/turn/replace-attachments", async (req, res) => {
       return;
     }
     const attachments = normalizeKnowledgeBaseUserAttachments(body.attachments);
-    const attachmentManifest = normalizeKnowledgeBaseClientAttachmentManifest(
-      body.attachmentManifest,
-    );
+    const attachmentManifest =
+      requireKnowledgeBaseAuthoritativeAttachmentManifest(
+        body.attachmentManifest,
+      );
     if (
       attachments.length === 0 ||
       attachments.length !== attachmentManifest.length

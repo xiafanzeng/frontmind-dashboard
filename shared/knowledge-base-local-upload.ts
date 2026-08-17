@@ -15,7 +15,8 @@ export type KnowledgeBaseLocalUploadCoordinate = {
   clientRequestId: string;
   itemId: string;
   expectedResetRevision: number;
-  contentSha256: string;
+  /** Legacy browser digest. New uploads rely on Dashboard's streamed digest. */
+  contentSha256?: string;
   ordinal: number;
 };
 
@@ -37,8 +38,12 @@ export function knowledgeBaseLocalUploadHeaders(
     [KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.expectedResetRevision]: String(
       coordinate.expectedResetRevision,
     ),
-    [KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256]:
-      coordinate.contentSha256,
+    ...(coordinate.contentSha256
+      ? {
+          [KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256]:
+            coordinate.contentSha256,
+        }
+      : {}),
     [KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.ordinal]: String(coordinate.ordinal),
     [KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.attempt]: String(attempt),
   };

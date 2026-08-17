@@ -37,7 +37,6 @@ import {
   isImageUpload,
   normalizedKnowledgeBaseUploadFilename,
   normalizedKnowledgeBaseUploadMimeType,
-  sha256UploadFile,
   assertChatAttachmentSizes,
   type PreparedUploadFiles,
 } from "@/lib/attachment-files";
@@ -787,39 +786,25 @@ export function useSendMessage() {
           options.submissionKind !== "logo" &&
           preparedUploads.files.length > 0
         ) {
-          try {
-            // Hash the browser bytes once. Knowledge-base uploads are captured
-            // by the Dashboard during the same proxy upload, so the server can
-            // compare this manifest without a timed remote read-back window.
-            knowledgeBaseAttachmentManifest =
-              resumedKnowledgeBaseAttachmentAttempt?.files.map(
-                ({ manifestItem }) => manifestItem,
-              ) ??
-              (await Promise.all(
-                preparedUploads.files.map(async ({ file }, index) => ({
-                  filename: normalizedKnowledgeBaseUploadFilename(file.name),
-                  sizeBytes: file.size,
-                  mimeType: normalizedKnowledgeBaseUploadMimeType(file),
-                  lastModified: Math.max(0, Number(file.lastModified || 0)),
-                  sha256: await sha256UploadFile(file),
-                  ...(knowledgeBaseUploadBatchId
-                    ? {
-                        itemId: `${knowledgeBaseUploadBatchId}:${index + 1}`,
-                        ordinal: index + 1,
-                        total: preparedUploads.files.length,
-                      }
-                    : {}),
-                })),
-              ));
-          } catch (error) {
-            toast.error("附件读取失败", {
-              description:
-                error instanceof Error
-                  ? error.message
-                  : "请重新选择文件后重试。",
-            });
-            return false;
-          }
+          // Reserve from immutable browser metadata. Dashboard computes and
+          // binds size/SHA-256 while streaming the actual upload bytes.
+          knowledgeBaseAttachmentManifest =
+            resumedKnowledgeBaseAttachmentAttempt?.files.map(
+              ({ manifestItem }) => manifestItem,
+            ) ??
+            preparedUploads.files.map(({ file }, index) => ({
+              filename: normalizedKnowledgeBaseUploadFilename(file.name),
+              sizeBytes: file.size,
+              mimeType: normalizedKnowledgeBaseUploadMimeType(file),
+              lastModified: Math.max(0, Number(file.lastModified || 0)),
+              ...(knowledgeBaseUploadBatchId
+                ? {
+                    itemId: `${knowledgeBaseUploadBatchId}:${index + 1}`,
+                    ordinal: index + 1,
+                    total: preparedUploads.files.length,
+                  }
+                : {}),
+            }));
         }
 
         if (
@@ -845,7 +830,6 @@ export function useSendMessage() {
                   item.itemId &&
                   item.ordinal === index + 1 &&
                   item.total === preparedUploads.files.length &&
-                  /^[a-f0-9]{64}$/u.test(item.sha256) &&
                   item.filename ===
                     normalizedKnowledgeBaseUploadFilename(file.name) &&
                   item.mimeType ===
@@ -913,7 +897,6 @@ export function useSendMessage() {
               file,
               itemId: knowledgeBaseAttachmentManifest![index]!.itemId!,
               ordinal: index + 1,
-              sha256: knowledgeBaseAttachmentManifest![index]!.sha256,
               manifestItem: knowledgeBaseAttachmentManifest![index]!,
             })),
             generation: frozenGeneration,
@@ -1141,8 +1124,12 @@ export function useSendMessage() {
                             batchTotal: totalFiles,
                             itemId:
                               knowledgeBaseAttachmentManifest?.[i]?.itemId,
-                            contentSha256:
-                              knowledgeBaseAttachmentManifest?.[i]?.sha256,
+                            ...(knowledgeBaseAttachmentManifest?.[i]?.sha256
+                              ? {
+                                  contentSha256:
+                                    knowledgeBaseAttachmentManifest[i]!.sha256,
+                                }
+                              : {}),
                             resumeScope: {
                               kind: "knowledge_base" as const,
                               conversationId: convId,

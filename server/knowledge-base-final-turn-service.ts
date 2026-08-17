@@ -70,20 +70,41 @@ export async function assertKnowledgeBaseCustomerUploadCapacity(input: {
   officialLogoRequired: boolean;
   attachmentManifest: readonly KnowledgeBaseClientAttachmentManifestItem[];
 }) {
-  const incomingImages = input.attachmentManifest
-    .filter(
-      (entry) =>
-        entry.mimeType.startsWith("image/") &&
-        !(
-          input.officialLogoRequired &&
-          entry.sha256 === input.attachmentManifest[0]?.sha256
-        ),
-    )
-    .map((entry) => ({
-      sha256: entry.sha256,
-      sizeBytes: entry.sizeBytes,
-    }));
+  const incomingImages = input.attachmentManifest.flatMap((entry, index) => {
+    if (
+      !entry.mimeType.startsWith("image/") ||
+      (input.officialLogoRequired && index === 0)
+    ) {
+      return [];
+    }
+    return [
+      {
+        sha256: entry.sha256,
+        sizeBytes: entry.sizeBytes,
+      },
+    ];
+  });
   if (incomingImages.length === 0) return;
+
+  // One image larger than the aggregate allowance can never fit, even if
+  // every other hashless slot later deduplicates. All other digest-free
+  // reservations remain undecidable until staging binds the server SHA, so
+  // they must not consume virtual capacity and falsely reject a duplicate.
+  if (
+    incomingImages.some(
+      ({ sizeBytes }) => sizeBytes > MAX_KNOWLEDGE_BASE_CUSTOMER_UPLOAD_BYTES,
+    )
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      `单个知识库客户补充图片原始字节合计不得超过 ${Math.floor(MAX_KNOWLEDGE_BASE_CUSTOMER_UPLOAD_BYTES / (1024 * 1024))} MiB，请压缩后再上传`,
+    );
+  }
+  const authoritativeIncomingImages = incomingImages.filter(
+    (entry): entry is { sha256: string; sizeBytes: number } =>
+      typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/u.test(entry.sha256),
+  );
+  if (authoritativeIncomingImages.length === 0) return;
 
   const existingCustomerUploads =
     await declaredKnowledgeBaseCustomerUploadsForBuild({
@@ -95,7 +116,7 @@ export async function assertKnowledgeBaseCustomerUploadCapacity(input: {
   const uniqueHashes = new Set(
     existingCustomerUploads.map((entry) => entry.sourceSha256),
   );
-  incomingImages.forEach(({ sha256 }) => uniqueHashes.add(sha256));
+  authoritativeIncomingImages.forEach(({ sha256 }) => uniqueHashes.add(sha256));
   if (uniqueHashes.size > MAX_KNOWLEDGE_BASE_CUSTOMER_UPLOAD_IMAGES) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
@@ -113,7 +134,7 @@ export async function assertKnowledgeBaseCustomerUploadCapacity(input: {
     }
     uniqueSizeByHash.set(upload.sourceSha256, upload.sizeBytes[0]!);
   }
-  for (const incoming of incomingImages) {
+  for (const incoming of authoritativeIncomingImages) {
     const existingSize = uniqueSizeByHash.get(incoming.sha256);
     if (existingSize !== undefined && existingSize !== incoming.sizeBytes) {
       throw new KnowledgeBaseTurnReservationError(
@@ -345,7 +366,10 @@ export function knowledgeBaseManifestRepeatsOfficialLogo(
     .trim()
     .toLowerCase();
   return Boolean(
-    logoSha256 && manifest.some((item) => item.sha256 === logoSha256),
+    logoSha256 &&
+      manifest.some(
+        (item) => typeof item.sha256 === "string" && item.sha256 === logoSha256,
+      ),
   );
 }
 

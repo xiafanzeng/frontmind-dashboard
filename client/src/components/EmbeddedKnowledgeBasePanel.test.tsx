@@ -319,6 +319,49 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     ).toBeInTheDocument();
   });
 
+  it("times out when conversation loading hangs after hydration and progress", async () => {
+    vi.useFakeTimers();
+    mocks.hydrated = true;
+    mocks.conversationLoading = true;
+    mocks.activeConversation = {
+      id: "loading-kb",
+      title: "企业知识库构建",
+      status: "running",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    mocks.progressData = {
+      progress: {
+        build: {
+          id: "loading-build",
+          conversationId: "loading-kb",
+          generation: 1,
+          stateEpoch: 1,
+          revision: 0,
+          updatedAt: 2,
+        },
+      },
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+    expect(screen.getByText("正在恢复构建会话…")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(KNOWLEDGE_BASE_RECOVERY_UI_TIMEOUT_MS);
+    });
+
+    expect(screen.getByText("构建会话读取失败")).toBeInTheDocument();
+    expect(
+      screen.getByText(/未能在 15 秒内恢复已有构建会话/),
+    ).toBeInTheDocument();
+  });
+
   it("retries both conversation hydration and authoritative progress", () => {
     mocks.syncError = "会话同步暂时中断";
 

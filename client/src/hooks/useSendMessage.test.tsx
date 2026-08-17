@@ -1091,7 +1091,6 @@ describe("useSendMessage", () => {
             sizeBytes: 5,
             mimeType: "application/pdf",
             lastModified: 1_700_000_000_000,
-            sha256: "a".repeat(64),
             itemId: expect.any(String),
             ordinal: 1,
             total: 1,
@@ -1108,7 +1107,6 @@ describe("useSendMessage", () => {
         batchOrdinal: 1,
         batchTotal: 1,
         itemId: reservationManifest[0].itemId,
-        contentSha256: "a".repeat(64),
         resumeScope: {
           kind: "knowledge_base",
           conversationId: "test-conv-id",
@@ -1120,6 +1118,9 @@ describe("useSendMessage", () => {
         },
       }),
     );
+    expect(reservationManifest[0]).not.toHaveProperty("sha256");
+    expect(uploadOptions).not.toHaveProperty("contentSha256");
+    expect(mocks.sha256UploadFile).not.toHaveBeenCalled();
     expect(uploadOptions.batchId).toBe(
       String(reservationManifest[0].itemId).split(":1")[0],
     );

@@ -1402,10 +1402,20 @@ function retryAuthorityRequestPayload(input: {
     operationType === "revise"
   ) {
     if (recovery.deferredClientAttachments === true) {
-      if (!Array.isArray(recovery.attachmentManifest)) return null;
+      const clientAttachmentManifest = Array.isArray(
+        recovery.clientAttachmentManifest,
+      )
+        ? recovery.clientAttachmentManifest
+        : Array.isArray(recovery.attachmentManifest)
+          ? recovery.attachmentManifest
+          : null;
+      if (!clientAttachmentManifest) return null;
       return {
         userMessage: recovery.userMessage,
-        attachmentManifest: recovery.attachmentManifest,
+        // `attachmentManifest` becomes the authoritative server-digest ledger
+        // after staging. Request identity must remain bound to the exact client
+        // manifest accepted by the original reservation.
+        attachmentManifest: clientAttachmentManifest,
         skillVersion: recovery.skillVersion,
         skillContentHash: recovery.skillContentHash,
       };
@@ -3781,6 +3791,13 @@ export async function inspectKnowledgeBaseLegacyAttachmentTakeoverReplay(
     const recoveredAttachments = Array.isArray(recovery?.attachments)
       ? recovery.attachments
       : [];
+    const clientAttachmentManifest = Array.isArray(
+      recovery?.clientAttachmentManifest,
+    )
+      ? recovery.clientAttachmentManifest
+      : Array.isArray(recovery?.attachmentManifest)
+        ? recovery.attachmentManifest
+        : null;
     const immutableMatch =
       recovery?.kind === "turn" &&
       recovery.conversationId === input.conversationId &&
@@ -3791,9 +3808,8 @@ export async function inspectKnowledgeBaseLegacyAttachmentTakeoverReplay(
       metadata.clientAttachmentManifestHash === manifestHash &&
       (metadata.expectedPresentationKey === undefined ||
         metadata.expectedPresentationKey === expectedPresentationKey) &&
-      Array.isArray(recovery?.attachmentManifest) &&
-      hashKnowledgeBaseTurnRequest(recovery.attachmentManifest) ===
-        manifestHash &&
+      clientAttachmentManifest !== null &&
+      hashKnowledgeBaseTurnRequest(clientAttachmentManifest) === manifestHash &&
       recoveredAttachments.length === attachments.length &&
       Number(metadata.userAttachmentCount) === attachments.length &&
       recoveredAttachments.every((value, index) => {
@@ -5893,7 +5909,10 @@ export type KnowledgeBaseLocalUploadCoordinateAssertion = {
   filename: string;
   mimeType: string;
   sizeBytes: number;
-  contentSha256: string;
+  /** Optional digest declared by legacy clients. */
+  contentSha256?: string;
+  /** Digest calculated while Dashboard consumed the complete request body. */
+  authoritativeContentSha256?: string;
 };
 
 /**
@@ -5932,7 +5951,19 @@ export async function assertKnowledgeBaseLocalUploadCoordinate(
   const contentSha256 = String(input.contentSha256 || "")
     .trim()
     .toLowerCase();
-  if (!KNOWLEDGE_BASE_SHA256_PATTERN.test(contentSha256)) {
+  const authoritativeContentSha256 = String(
+    input.authoritativeContentSha256 || "",
+  )
+    .trim()
+    .toLowerCase();
+  if (
+    (contentSha256 && !KNOWLEDGE_BASE_SHA256_PATTERN.test(contentSha256)) ||
+    (authoritativeContentSha256 &&
+      !KNOWLEDGE_BASE_SHA256_PATTERN.test(authoritativeContentSha256)) ||
+    (contentSha256 &&
+      authoritativeContentSha256 &&
+      contentSha256 !== authoritativeContentSha256)
+  ) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
       "Attachment content hash is invalid",
@@ -5990,23 +6021,27 @@ export async function assertKnowledgeBaseLocalUploadCoordinate(
       !Array.isArray(metadata.recovery)
         ? metadata.recovery
         : {};
-    const manifest = Array.isArray(recovery.attachmentManifest)
+    const authoritativeManifest = Array.isArray(recovery.attachmentManifest)
       ? recovery.attachmentManifest
       : [];
+    const clientManifest = Array.isArray(recovery.clientAttachmentManifest)
+      ? recovery.clientAttachmentManifest
+      : authoritativeManifest;
     if (
       !Number.isSafeInteger(expectedCount) ||
       expectedCount < 1 ||
-      manifest.length !== expectedCount ||
+      authoritativeManifest.length !== expectedCount ||
+      clientManifest.length !== expectedCount ||
       input.ordinal > expectedCount ||
       metadata.clientAttachmentManifestHash !==
-        hashKnowledgeBaseTurnRequest(manifest)
+        hashKnowledgeBaseTurnRequest(clientManifest)
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
         "The upload coordinate does not match the frozen attachment manifest",
       );
     }
-    const rawEntry = manifest[input.ordinal - 1];
+    const rawEntry = clientManifest[input.ordinal - 1];
     const entry =
       rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry)
         ? (rawEntry as Record<string, unknown>)
@@ -6019,7 +6054,12 @@ export async function assertKnowledgeBaseLocalUploadCoordinate(
       entry.filename !== filename ||
       entry.mimeType !== mimeType ||
       entry.sizeBytes !== input.sizeBytes ||
-      String(entry.sha256 || "").toLowerCase() !== contentSha256
+      (String(entry.sha256 || "").trim() &&
+        String(entry.sha256 || "").toLowerCase() !== contentSha256) ||
+      (String(entry.sha256 || "").trim() && !contentSha256) ||
+      (authoritativeContentSha256 &&
+        String(entry.sha256 || "").trim() &&
+        String(entry.sha256 || "").toLowerCase() !== authoritativeContentSha256)
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
@@ -6036,6 +6076,68 @@ export async function assertKnowledgeBaseLocalUploadCoordinate(
       );
     }
     return { buildId: build.id, turnId: turn.id };
+  });
+}
+
+function authoritativeDeferredAttachmentManifest(input: {
+  clientAttachmentManifest: unknown;
+  stagedAttachments: ReadonlyArray<{
+    index: number;
+    filename: string;
+    mimeType?: string;
+    sizeBytes?: number;
+    contentSha256?: string;
+  }>;
+  requireComplete?: boolean;
+}) {
+  if (!Array.isArray(input.clientAttachmentManifest)) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The reserved customer attachment manifest is missing",
+    );
+  }
+  return input.clientAttachmentManifest.map((rawEntry, index) => {
+    const entry =
+      rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry)
+        ? (rawEntry as Record<string, unknown>)
+        : null;
+    const staged = input.stagedAttachments[index];
+    if (!entry) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The reserved customer attachment manifest is invalid",
+      );
+    }
+    if (!staged) {
+      if (input.requireComplete) {
+        throw new KnowledgeBaseTurnReservationError(
+          "CONFLICT",
+          "The authoritative customer attachment ledger is incomplete",
+        );
+      }
+      return { ...entry };
+    }
+    const contentSha256 = String(staged.contentSha256 || entry.sha256 || "")
+      .trim()
+      .toLowerCase();
+    if (
+      staged.index !== index ||
+      staged.filename !== entry.filename ||
+      (staged.mimeType !== undefined && staged.mimeType !== entry.mimeType) ||
+      (staged.sizeBytes !== undefined &&
+        staged.sizeBytes !== entry.sizeBytes) ||
+      !KNOWLEDGE_BASE_SHA256_PATTERN.test(contentSha256)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "The authoritative customer attachment proof is invalid",
+      );
+    }
+    return {
+      ...entry,
+      sizeBytes: staged.sizeBytes ?? entry.sizeBytes,
+      sha256: contentSha256,
+    };
   });
 }
 
@@ -6269,13 +6371,19 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
         }
       : {}),
   });
+  const authoritativeAttachmentManifest =
+    authoritativeDeferredAttachmentManifest({
+      clientAttachmentManifest: input.clientAttachmentManifest,
+      stagedAttachments: staged,
+    });
   const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
     ...(metadata.recovery || {}),
     attachments: staged.map(({ file_id, filename }) => ({
       file_id,
       filename,
     })),
-    attachmentManifest: input.clientAttachmentManifest,
+    clientAttachmentManifest: input.clientAttachmentManifest,
+    attachmentManifest: authoritativeAttachmentManifest,
     attachmentSourceProofs: staged.map((item) => ({
       index: item.index,
       fileId: item.file_id,
@@ -6424,10 +6532,17 @@ async function claimKnowledgeBaseDeferredTurnDispatchInTransaction(
     };
   }
 
+  const authoritativeAttachmentManifest =
+    authoritativeDeferredAttachmentManifest({
+      clientAttachmentManifest: input.clientAttachmentManifest,
+      stagedAttachments,
+      requireComplete: true,
+    });
   const recovery = sanitizeKnowledgeBaseRecoveryMetadata({
     ...(metadata.recovery || {}),
     attachments,
-    attachmentManifest: input.clientAttachmentManifest,
+    clientAttachmentManifest: input.clientAttachmentManifest,
+    attachmentManifest: authoritativeAttachmentManifest,
   });
   if (metadata.awaitingClientAttachments !== true) {
     const existingAttachments = Array.isArray(metadata.recovery?.attachments)

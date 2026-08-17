@@ -855,7 +855,9 @@ function RealBuildFlow({
     !lastGoodConversation &&
       !syncError &&
       !latestProgressQuery.isError &&
-      (!hydrated || latestProgressQuery.data === undefined),
+      (conversationLoading ||
+        !hydrated ||
+        latestProgressQuery.data === undefined),
   );
 
   useEffect(() => {

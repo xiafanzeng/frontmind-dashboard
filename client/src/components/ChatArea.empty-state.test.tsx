@@ -147,6 +147,8 @@ describe("EmptyConversationHint", () => {
       responseText = JSON.stringify({
         localAssetId: `asset_${"i".repeat(30)}`,
         filename: "initial-facts.pdf",
+        bytes: 12,
+        sha256: "a".repeat(64),
         expiresAt: 1_800_000_000_000,
       });
       private uploadListeners = new Map<string, Array<(event?: any) => void>>();
@@ -1237,36 +1239,20 @@ describe("EmptyConversationHint", () => {
 });
 
 describe("knowledge-base starter orchestration", () => {
-  it("hashes large starter files sequentially before reserve", async () => {
+  it("builds the reserve manifest without reading browser file bytes", async () => {
     const files = [
       sizedFile("one.pdf", 12),
       sizedFile("two.pdf", 13),
       sizedFile("three.pdf", 14),
     ];
-    let active = 0;
-    let maximumActive = 0;
-    const hashFile = vi.fn(async (file: File) => {
-      active += 1;
-      maximumActive = Math.max(maximumActive, active);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      active -= 1;
-      return file.name.charCodeAt(0).toString(16).padStart(64, "0");
-    });
-
     const manifest = await buildKnowledgeBaseStarterAttachmentManifest(
       files,
       ["item-1", "item-2", "item-3"],
       new AbortController().signal,
-      hashFile,
     );
 
-    expect(maximumActive).toBe(1);
-    expect(hashFile.mock.calls.map(([file]) => file.name)).toEqual([
-      "one.pdf",
-      "two.pdf",
-      "three.pdf",
-    ]);
     expect(manifest.map((item) => item.ordinal)).toEqual([1, 2, 3]);
+    expect(manifest.every((item) => item.sha256 === undefined)).toBe(true);
   });
 
   it("does not mark dispatch attempted when lifecycle cancellation wins before fetch", async () => {

@@ -99,7 +99,6 @@ import {
   chatAttachmentSizeError,
   normalizedKnowledgeBaseUploadFilename,
   normalizedKnowledgeBaseUploadMimeType,
-  sha256UploadFile,
 } from "@/lib/attachment-files";
 import { isAttachmentExpired } from "@/lib/attachment-expiry";
 
@@ -452,6 +451,8 @@ type KnowledgeBaseStarterBatchPhase =
 type KnowledgeBaseStarterUploadReceipt = {
   fileId: string;
   filename: string;
+  sizeBytes?: number;
+  contentSha256?: string;
   uploadedAt?: number;
   dashboardReadyAt?: number;
   providerReadyAt?: number;
@@ -540,14 +541,13 @@ export async function buildKnowledgeBaseStarterAttachmentManifest(
   files: readonly File[],
   itemIds: readonly string[],
   signal: AbortSignal,
-  hashFile: (file: File) => Promise<string> = sha256UploadFile,
 ): Promise<KnowledgeBaseAttachmentManifestItem[]> {
   if (files.length !== itemIds.length) {
     throw new Error("知识库附件坐标不完整，请重新选择资料");
   }
   const manifest: KnowledgeBaseAttachmentManifestItem[] = [];
-  // Hash one browser File at a time. Promise.all would materialize every
-  // large arrayBuffer concurrently and can exhaust a tab before upload starts.
+  // Reserve from immutable browser metadata only. Dashboard computes the
+  // authoritative digest while streaming each upload into managed storage.
   for (const [index, file] of files.entries()) {
     if (signal.aborted) {
       throw new DOMException("上传已停止", "AbortError");
@@ -560,7 +560,6 @@ export async function buildKnowledgeBaseStarterAttachmentManifest(
       sizeBytes: file.size,
       mimeType: normalizedKnowledgeBaseUploadMimeType(file),
       lastModified: Math.max(0, Number(file.lastModified || 0)),
-      sha256: await hashFile(file),
     });
   }
   return manifest;
@@ -579,6 +578,7 @@ type KnowledgeBaseStarterUploadImplementation = (
   fileId: string;
   filename: string;
   sizeBytes?: number;
+  contentSha256?: string;
   uploadedAt?: number;
   dashboardReadyAt?: number;
   providerReadyAt?: number;
@@ -754,8 +754,7 @@ export async function uploadKnowledgeBaseStarterFiles(
               frozen.sizeBytes === file.size &&
               frozen.mimeType === normalizedKnowledgeBaseUploadMimeType(file) &&
               frozen.lastModified ===
-                Math.max(0, Number(file.lastModified || 0)) &&
-              frozen.sha256 === (await sha256UploadFile(file)),
+                Math.max(0, Number(file.lastModified || 0)),
           );
           const canRetrySameIntent = Boolean(
             [
@@ -793,6 +792,8 @@ export async function uploadKnowledgeBaseStarterFiles(
         receipt = {
           fileId: uploaded.fileId,
           filename: uploaded.filename,
+          sizeBytes: uploaded.sizeBytes,
+          contentSha256: uploaded.contentSha256,
           uploadedAt: uploaded.uploadedAt,
           dashboardReadyAt: uploaded.dashboardReadyAt,
           providerReadyAt: uploaded.providerReadyAt,

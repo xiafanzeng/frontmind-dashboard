@@ -25,7 +25,6 @@ import {
   readKnowledgeBaseLocalSource,
 } from "./knowledge-base-local-source-store";
 import { readKnowledgeBasePinnedSkillArchiveAttachment } from "./knowledge-base-skill-runtime";
-import { KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME } from "./knowledge-base-prompt-delivery";
 import {
   ManusV2ApiError,
   ManusV2Client,
@@ -99,37 +98,21 @@ function generatedReservationByIndex(
   return matches[0] || null;
 }
 
-function generatedReservationBySource(
+function generatedReservationByProviderId(
   claim: KnowledgeBaseRecoveryClaim,
-  input: { sourceFileId: string; filename: string },
+  sourceFileId: string,
 ) {
   const reservations = Object.values(
     claim.turn.generatedAttachmentReservations || {},
   );
   const byProviderId = reservations.filter(
-    (item) => item.upstreamFileId === input.sourceFileId,
+    (item) => item.upstreamFileId === sourceFileId,
   );
   if (byProviderId.length === 1) return byProviderId[0]!;
   if (byProviderId.length > 1) {
     throw localPreparationError(
       "同一源文件 ID 对应多个系统附件，已暂停当前构建",
     );
-  }
-  // Older prepared bodies can have generated-slot indices that differ from
-  // final attachment order (notably legacy turn files precede customer files).
-  // Filename is safe only when unique among server-owned reservations.
-  const byFilename = reservations.filter(
-    (item) => item.filename === input.filename,
-  );
-  if (byFilename.length === 1) return byFilename[0]!;
-  if (
-    input.filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME &&
-    byFilename.length === 0
-  ) {
-    return null;
-  }
-  if (byFilename.length > 1) {
-    throw localPreparationError(`系统附件“${input.filename}”的本地来源不唯一`);
   }
   return null;
 }
@@ -385,10 +368,7 @@ async function resolveLocalSources(claim: KnowledgeBaseRecoveryClaim) {
     const generated =
       indexedGenerated?.filename === attachment.filename
         ? indexedGenerated
-        : generatedReservationBySource(claim, {
-            sourceFileId: attachment.file_id,
-            filename: attachment.filename,
-          });
+        : generatedReservationByProviderId(claim, attachment.file_id);
     result.push(
       generated
         ? await generatedLocalSource({
@@ -425,10 +405,7 @@ function generatedReservationForSource(input: {
   ) {
     return indexed;
   }
-  return generatedReservationBySource(input.claim, {
-    sourceFileId: input.source.sourceFileId,
-    filename: input.source.filename,
-  });
+  return null;
 }
 
 function eligibleInlineGeneratedSource(input: {
@@ -1394,10 +1371,10 @@ async function ensureOneMapping(input: {
 }
 
 /**
- * Materialize a frozen operation's attachment set exclusively as Manus v2
- * files. This never returns prepared/v1 ids. Per-item ready mappings survive
- * retries; the turn ledger changes only after a final detail pass proves the
- * complete ordered set has at least 15 minutes of lifetime remaining.
+ * Materialize a frozen operation's attachment set as Manus v2 inputs. Small,
+ * server-owned Skill/Instructions bytes use the provider's inline data form;
+ * every other attachment keeps the durable file mapping/recovery contract.
+ * This never returns prepared/v1 ids.
  */
 export async function ensureKnowledgeBaseManusV2Attachments(input: {
   claim: KnowledgeBaseRecoveryClaim;
@@ -1439,16 +1416,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     attachmentIndex += 1
   ) {
     const source = sources[attachmentIndex]!;
-    const existingRejectedAttempt = existingAttempt({
-      claim,
-      attachmentIndex,
-      source,
-    });
-    if (
-      existingRejectedAttempt?.state === "create_rejected" &&
-      existingRejectedAttempt.upstreamFileId === null &&
-      eligibleInlineGeneratedSource({ claim, attachmentIndex, source })
-    ) {
+    if (eligibleInlineGeneratedSource({ claim, attachmentIndex, source })) {
       inlineAttachments.set(
         attachmentIndex,
         inlineGeneratedAttachment({ source, attachmentIndex }),
@@ -1456,31 +1424,14 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
       mappings.push(null);
       continue;
     }
-    try {
-      mappings.push(
-        await ensureOneMapping({
-          claim,
-          client,
-          source,
-          attachmentIndex,
-        }),
-      );
-    } catch (error) {
-      const attempt = existingAttempt({ claim, attachmentIndex, source });
-      const durableExplicitRejection =
-        attempt?.state === "create_rejected" && attempt.upstreamFileId === null;
-      if (
-        !eligibleInlineGeneratedSource({ claim, attachmentIndex, source }) ||
-        !durableExplicitRejection
-      ) {
-        throw error;
-      }
-      inlineAttachments.set(
+    mappings.push(
+      await ensureOneMapping({
+        claim,
+        client,
+        source,
         attachmentIndex,
-        inlineGeneratedAttachment({ source, attachmentIndex }),
-      );
-      mappings.push(null);
-    }
+      }),
+    );
   }
 
   // Revalidate every mapping after the last upload. This prevents a long
@@ -1627,7 +1578,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
     const expectedReady = sources.length - inlineAttachments.size;
     if (finalMappings.length !== expectedReady) {
       throw localPreparationError(
-        "FrontMind 内联系统附件降级缺少其余附件的完整可用性证明",
+        "FrontMind 内联系统附件混排缺少其余附件的完整可用性证明",
       );
     }
   }

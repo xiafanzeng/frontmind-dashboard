@@ -2840,7 +2840,7 @@ describe("knowledge base execution contract", () => {
     });
   });
 
-  it("normalizes a stable pre-upload attachment manifest and rejects partial entries", () => {
+  it("accepts digest-free reservations while preserving legacy SHA manifests", () => {
     expect(
       normalizeKnowledgeBaseClientAttachmentManifest([
         {
@@ -2876,7 +2876,7 @@ describe("knowledge base execution contract", () => {
         { filename: "facts.pdf", mimeType: "application/pdf" },
       ]),
     ).toThrow("manifest entry 1 is invalid");
-    expect(() =>
+    expect(
       normalizeKnowledgeBaseClientAttachmentManifest([
         {
           filename: "facts.pdf",
@@ -2885,17 +2885,35 @@ describe("knowledge base execution contract", () => {
           lastModified: 10,
         },
       ]),
+    ).toEqual([
+      {
+        filename: "facts.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 10,
+      },
+    ]);
+    expect(() =>
+      normalizeKnowledgeBaseClientAttachmentManifest([
+        {
+          filename: "facts.pdf",
+          sizeBytes: 12,
+          mimeType: "application/pdf",
+          lastModified: 10,
+          sha256: "not-a-digest",
+        },
+      ]),
     ).toThrow("manifest entry 1 is invalid");
   });
 
-  it("requires the exact browser-byte manifest for every v4 attachment", () => {
+  it("requires the reservation manifest for every v4 attachment", () => {
     expect(() =>
       assertKnowledgeBaseAttachmentManifestPresent({
         skillVersion: "4",
         attachmentCount: 1,
         attachmentManifest: undefined,
       }),
-    ).toThrow("必须完成浏览器原始字节校验");
+    ).toThrow("必须包含完整预约清单");
     expect(() =>
       assertKnowledgeBaseAttachmentManifestPresent({
         skillVersion: "4",
@@ -5160,15 +5178,17 @@ describe("knowledge base execution contract", () => {
     const beginStop = vi.fn();
     const stopTask = vi.fn();
     const activateInitial = vi.fn().mockResolvedValue(undefined);
-    const listAllMessages = vi.fn().mockRejectedValue(
-      new ManusV2ApiError(
-        "task.listMessages",
-        404,
-        "task already removed",
-        false,
-        false,
-      ),
-    );
+    const listAllMessages = vi
+      .fn()
+      .mockRejectedValue(
+        new ManusV2ApiError(
+          "task.listMessages",
+          404,
+          "task already removed",
+          false,
+          false,
+        ),
+      );
 
     await expect(
       knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(

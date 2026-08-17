@@ -335,6 +335,8 @@ export type FileUploadStage =
 export type UploadRetentionReceipt = {
   fileId: string;
   sizeBytes: number;
+  /** Dashboard-computed digest of the complete retained upload stream. */
+  contentSha256?: string;
   uploadedAt: number;
   /** Dashboard has durably accepted the complete browser body. */
   dashboardReadyAt?: number;
@@ -415,7 +417,7 @@ export type UploadFileOptions = {
   batchTotal?: number;
   /** Stable dialog item identity. It is not a provider file id. */
   itemId?: string;
-  /** SHA-256 frozen by the reservation manifest for this exact browser File. */
+  /** Legacy browser SHA-256; new reservations rely on Dashboard's receipt. */
   contentSha256?: string;
   /** Durable server-side coordinate used to rediscover this upload elsewhere. */
   resumeScope?: {
@@ -725,6 +727,8 @@ export async function uploadChatLocalAsset(
 ): Promise<{
   fileId: string;
   filename: string;
+  sizeBytes?: number;
+  contentSha256?: string;
   expiresAt: number;
   replayed: boolean;
   traceId?: string;
@@ -845,10 +849,18 @@ export async function uploadChatLocalAsset(
         );
         return;
       }
+      const sizeBytes = Number(payload?.bytes);
+      const contentSha256 = String(payload?.sha256 || "")
+        .trim()
+        .toLowerCase();
       onProgress?.(100);
       resolve({
         fileId: id,
         filename: String(payload?.filename || filename),
+        ...(Number.isSafeInteger(sizeBytes) && sizeBytes >= 0
+          ? { sizeBytes }
+          : {}),
+        ...(/^[a-f0-9]{64}$/u.test(contentSha256) ? { contentSha256 } : {}),
         expiresAt,
         replayed: payload?.replayed === true,
         ...(typeof payload?.traceId === "string" && payload.traceId.trim()
@@ -900,7 +912,8 @@ export async function uploadKnowledgeBaseLocalAsset(
         );
         if (
           !itemId ||
-          !/^[a-f0-9]{64}$/u.test(contentSha256) ||
+          (contentSha256.length > 0 &&
+            !/^[a-f0-9]{64}$/u.test(contentSha256)) ||
           !Number.isSafeInteger(ordinal) ||
           ordinal < 1 ||
           !Number.isSafeInteger(expectedResetRevision) ||
@@ -917,7 +930,7 @@ export async function uploadKnowledgeBaseLocalAsset(
           clientRequestId: options.resumeScope.clientRequestId,
           itemId,
           expectedResetRevision,
-          contentSha256,
+          ...(contentSha256 ? { contentSha256 } : {}),
           ordinal,
         } satisfies KnowledgeBaseLocalUploadCoordinate;
       })()
@@ -1017,6 +1030,17 @@ export async function uploadKnowledgeBaseLocalAsset(
       await waitForUploadRetry(delayMs, options.signal, undefined);
     }
   }
+  if (
+    uploaded.sizeBytes !== file.size ||
+    !uploaded.contentSha256 ||
+    !/^[a-f0-9]{64}$/u.test(uploaded.contentSha256)
+  ) {
+    throw new FileUploadError("Dashboard 附件完整性回执无效，请重新上传", {
+      code: "UPLOAD_RECEIPT_INVALID",
+      retryable: true,
+      traceId: uploaded.traceId,
+    });
+  }
   const dashboardReadyAt = Date.now();
   await options.onFileRecord?.({
     itemId: options.itemId,
@@ -1027,7 +1051,8 @@ export async function uploadKnowledgeBaseLocalAsset(
   const receipt = {
     fileId: uploaded.fileId,
     filename: uploaded.filename,
-    sizeBytes: file.size,
+    sizeBytes: uploaded.sizeBytes,
+    contentSha256: uploaded.contentSha256,
     uploadedAt: dashboardReadyAt,
     dashboardReadyAt,
     expiresAt: uploaded.expiresAt,
@@ -1122,7 +1147,8 @@ export interface KnowledgeBaseAttachmentManifestItem {
   sizeBytes: number;
   mimeType: string;
   lastModified: number;
-  sha256: string;
+  /** Present only for legacy browser-hashed reservations. */
+  sha256?: string;
   itemId?: string;
   ordinal?: number;
   total?: number;
@@ -1404,7 +1430,7 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
         item.mimeType.trim().length > 0 &&
         Number.isSafeInteger(item.lastModified) &&
         item.lastModified >= 0 &&
-        /^[a-f0-9]{64}$/u.test(item.sha256),
+        (item.sha256 === undefined || /^[a-f0-9]{64}$/u.test(item.sha256)),
     );
   if (!coordinateIsComplete) {
     throw new Error("知识库附件坐标不完整，请刷新后重新选择资料");

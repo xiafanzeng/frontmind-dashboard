@@ -40,14 +40,20 @@ export function parseKnowledgeBaseLocalUploadCoordinate(
   inputHeaders: Record<string, HeaderValue>,
 ): KnowledgeBaseLocalUploadCoordinate | null {
   const headers = lowerCaseHeaders(inputHeaders);
-  const names = Object.values(KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS).filter(
-    (name) => name !== KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.attempt,
+  const coordinateNames = Object.values(
+    KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS,
+  ).filter((name) => name !== KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.attempt);
+  const requiredNames = coordinateNames.filter(
+    (name) => name !== KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256,
   );
-  const present = names.filter(
+  const anyPresent = coordinateNames.filter(
     (name) => scalarHeader(headers, name) !== undefined,
   );
-  if (present.length === 0) return null;
-  if (present.length !== names.length) {
+  if (anyPresent.length === 0) return null;
+  const requiredPresent = requiredNames.filter(
+    (name) => scalarHeader(headers, name) !== undefined,
+  );
+  if (requiredPresent.length !== requiredNames.length) {
     throw new KnowledgeBaseLocalAssetCoordinateError();
   }
 
@@ -73,9 +79,10 @@ export function parseKnowledgeBaseLocalUploadCoordinate(
       KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.expectedResetRevision,
     ),
   );
-  const contentSha256 = String(
-    scalarHeader(headers, KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256),
-  ).toLowerCase();
+  const contentSha256 = scalarHeader(
+    headers,
+    KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256,
+  )?.toLowerCase();
   const ordinal = Number(
     scalarHeader(headers, KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.ordinal),
   );
@@ -91,7 +98,7 @@ export function parseKnowledgeBaseLocalUploadCoordinate(
     itemId.length > 191 ||
     !Number.isSafeInteger(expectedResetRevision) ||
     expectedResetRevision < 0 ||
-    !/^[a-f0-9]{64}$/u.test(contentSha256) ||
+    (contentSha256 !== undefined && !/^[a-f0-9]{64}$/u.test(contentSha256)) ||
     !Number.isSafeInteger(ordinal) ||
     ordinal < 1 ||
     ordinal > 1_000
@@ -105,7 +112,7 @@ export function parseKnowledgeBaseLocalUploadCoordinate(
     clientRequestId,
     itemId,
     expectedResetRevision,
-    contentSha256,
+    ...(contentSha256 ? { contentSha256 } : {}),
     ordinal,
   };
 }
@@ -126,6 +133,8 @@ export function knowledgeBaseLocalAssetIdentity(input: {
   projectAssignmentId: string | null;
   coordinate: KnowledgeBaseLocalUploadCoordinate;
   sizeBytes: number;
+  /** Digest calculated from the complete Dashboard-owned upload stream. */
+  authoritativeContentSha256?: string;
 }) {
   const operation = [
     input.userId,
@@ -137,14 +146,16 @@ export function knowledgeBaseLocalAssetIdentity(input: {
     input.coordinate.expectedResetRevision,
   ];
   const operationDigest = digest(operation);
-  const contentDigest = digest([
-    operationDigest,
-    input.coordinate.contentSha256,
-    input.sizeBytes,
-  ]);
+  const contentSha256 =
+    input.authoritativeContentSha256 ?? input.coordinate.contentSha256;
+  const contentDigest = contentSha256
+    ? digest([operationDigest, contentSha256, input.sizeBytes])
+    : null;
   return {
     localAssetId: `asset_${operationDigest.slice(0, 30)}`,
-    storageKey: `frontmind-v2:knowledge-base:${contentDigest}`,
+    ...(contentDigest
+      ? { storageKey: `frontmind-v2:knowledge-base:${contentDigest}` }
+      : {}),
   };
 }
 

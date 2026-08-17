@@ -9984,6 +9984,40 @@ describe("knowledge-base local upload coordinate authority", () => {
     });
   });
 
+  it("accepts a digest-free reservation before upload and binds the streamed server digest", async () => {
+    const [{ sha256: _legacyDigest, ...digestFreeItem }] = manifest;
+    const digestFreeManifest = [digestFreeItem];
+    const digestFreeMetadata = {
+      ...(reservedTurn.metadata as Record<string, unknown>),
+      clientAttachmentManifestHash:
+        hashKnowledgeBaseTurnRequest(digestFreeManifest),
+      recovery: { attachmentManifest: digestFreeManifest },
+    };
+    const { contentSha256: _browserDigest, ...digestFreeAssertion } = assertion;
+
+    await expect(
+      assertKnowledgeBaseLocalUploadCoordinate(
+        digestFreeAssertion,
+        executorFor({ turnOverrides: { metadata: digestFreeMetadata } }),
+      ),
+    ).resolves.toEqual({
+      buildId: reservedTurn.buildId,
+      turnId: reservedTurn.id,
+    });
+    await expect(
+      assertKnowledgeBaseLocalUploadCoordinate(
+        {
+          ...digestFreeAssertion,
+          authoritativeContentSha256: "a".repeat(64),
+        },
+        executorFor({ turnOverrides: { metadata: digestFreeMetadata } }),
+      ),
+    ).resolves.toEqual({
+      buildId: reservedTurn.buildId,
+      turnId: reservedTurn.id,
+    });
+  });
+
   it("accepts the authenticated active revise reservation at the same reset epoch", async () => {
     await expect(
       assertKnowledgeBaseLocalUploadCoordinate(
@@ -10208,9 +10242,11 @@ describe("knowledge-base attachment-first turn reservation", () => {
 
   it("stages a v5 local asset by account ownership without a Provider file resource", async () => {
     const localAssetId = `asset_${"a".repeat(30)}`;
+    const { sha256: _legacyBrowserSha256, ...digestFreeManifestItem } =
+      manifest[0]!;
     const localManifest = [
       {
-        ...manifest[0]!,
+        ...digestFreeManifestItem,
         itemId: "materialized-local-item-1",
         ordinal: 1,
         total: 1,
@@ -10297,6 +10333,10 @@ describe("knowledge-base attachment-first turn reservation", () => {
     expect(staged.attachmentFileIds).toEqual([localAssetId]);
     expect(store.resources).toEqual([]);
     expect((store.turns[0]!.metadata as any).recovery).toMatchObject({
+      clientAttachmentManifest: [
+        expect.not.objectContaining({ sha256: expect.anything() }),
+      ],
+      attachmentManifest: [expect.objectContaining({ sha256: "a".repeat(64) })],
       attachmentSourceProofs: [
         {
           fileId: localAssetId,
@@ -12482,6 +12522,277 @@ describe("knowledge-base deterministic dispatch failure", () => {
 });
 
 describe("knowledge-base safe retry reservation", () => {
+  it("keeps hashless staged revise authority bound to the original client manifest", () => {
+    const clientAttachmentManifest = [
+      {
+        filename: "补充资料.pdf",
+        sizeBytes: 12,
+        mimeType: "application/pdf",
+        lastModified: 1_700_000_000_000,
+        itemId: "request-hashless:1",
+        ordinal: 1,
+        total: 1,
+      },
+    ];
+    const authoritativeAttachmentManifest = [
+      { ...clientAttachmentManifest[0]!, sha256: "a".repeat(64) },
+    ];
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId: "00000000-0000-4000-8000-000000000002",
+      buildGeneration: 3,
+      operationType: "revise",
+      expectedRevision: 7,
+      expectedLeafId: "1.8",
+    });
+    const recovery = {
+      kind: "turn",
+      conversationId: "conversation-1",
+      parentTaskId: "successful-parent-task",
+      userMessage: "补充资料",
+      attachments: [
+        { file_id: "customer-source-file", filename: "补充资料.pdf" },
+      ],
+      deferredClientAttachments: true,
+      clientAttachmentManifest,
+      attachmentManifest: authoritativeAttachmentManifest,
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+    };
+    const requestBody = {
+      prompt: "hashless staged revise prompt",
+      agentProfile: "manus-1.6-max",
+      taskMode: "agent" as const,
+      taskId: recovery.parentTaskId,
+      attachments: [
+        { file_id: "customer-source-file", filename: "补充资料.pdf" },
+        { file_id: "skill-file", filename: "skill.zip" },
+        { file_id: "instructions-file", filename: "instructions.txt" },
+      ],
+    };
+    const source = retryableFailedTurn({
+      operationType: "revise",
+      operationKey,
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "revise",
+        generation: 3,
+        revision: 7,
+        leafId: "1.8",
+        expectedAttachmentCount: 3,
+        userAttachmentCount: 1,
+        payload: {
+          userMessage: recovery.userMessage,
+          attachmentManifest: clientAttachmentManifest,
+          skillVersion: recovery.skillVersion,
+          skillContentHash: recovery.skillContentHash,
+        },
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      attachmentFileIds: requestBody.attachments.map(
+        (attachment) => attachment.file_id,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 3,
+        userAttachmentCount: 1,
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+        recovery,
+        preparedDispatch: {
+          schemaVersion: 1,
+          baseUrl: "https://api.example.test",
+          requestBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const build = {
+      id: source.buildId,
+      userId: source.userId,
+      conversationId: "conversation-1",
+      companyName: "FrontMind 超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      skillVersion: "4",
+      skillContentHash: "c".repeat(64),
+      generation: 3,
+      revision: 7,
+      currentLeafId: "1.8",
+      totalNodeCount: 8,
+      confirmedCount: 7,
+      directPrefilledCount: 0,
+    } as any;
+
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).not.toBeNull();
+    delete (source.metadata as any).recovery.clientAttachmentManifest;
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).toBeNull();
+  });
+
+  it("retains failed-turn authority after mixed v5 inline dispatch while the prepared source ledger stays file-id-only", () => {
+    const skillBytes = Buffer.from("pinned materialized v5 Skill bytes");
+    const instructionsBytes = Buffer.from(
+      "pinned materialized v5 Instructions bytes",
+    );
+    const workingSetBytes = Buffer.from(
+      "pinned materialized Working Set bytes",
+    );
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    const sourceAttachments = [
+      { file_id: "customer-source-file", filename: "客户资料.pdf" },
+      {
+        file_id: "skill-source-file",
+        filename: "socratic-kb-builder.skill.zip",
+      },
+      {
+        file_id: "working-set-source-file",
+        filename: "frontmind-kb-active-working-set.zip",
+      },
+      {
+        file_id: "instructions-source-file",
+        filename: "frontmind-kb-instructions.md",
+      },
+    ];
+    const operationKey = createKnowledgeBaseOperationKey({
+      buildId: "00000000-0000-4000-8000-000000000002",
+      buildGeneration: 3,
+      operationType: "revise",
+      expectedRevision: 7,
+      expectedLeafId: "1.8",
+    });
+    const recovery = {
+      kind: "turn",
+      conversationId: "conversation-1",
+      parentTaskId: "materialized-parent-task",
+      userMessage: "请按补充资料修订当前节点",
+      attachments: [sourceAttachments[0]],
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+    };
+    const requestBody = {
+      prompt: "frozen materialized v5 revision prompt",
+      agentProfile: "manus-1.6-max",
+      attachments: sourceAttachments,
+    };
+    const source = turn({
+      status: "failed",
+      operationType: "revise",
+      operationKey,
+      requestHash: hashKnowledgeBaseTurnRequest({
+        operationType: "revise",
+        generation: 3,
+        revision: 7,
+        leafId: "1.8",
+        expectedAttachmentCount: sourceAttachments.length,
+        userAttachmentCount: 1,
+        payload: {
+          userMessage: recovery.userMessage,
+          attachments: recovery.attachments,
+          skillVersion: recovery.skillVersion,
+          skillContentHash: recovery.skillContentHash,
+        },
+      }),
+      upstreamIdempotencyKeyHash: hashKnowledgeBaseUpstreamIdempotencyKey(
+        createKnowledgeBaseUpstreamIdempotencyKey(operationKey),
+      ),
+      upstreamTaskId: "failed-materialized-v5-task",
+      completedAt: new Date("2026-08-01T00:00:20.000Z"),
+      leaseExpiresAt: null,
+      attachmentFileIds: sourceAttachments.map(
+        (attachment) => attachment.file_id,
+      ),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: sourceAttachments.length,
+        userAttachmentCount: 1,
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+        frozenProviderRequestHash: "f".repeat(64),
+        failureClass: "terminal_requires_regeneration",
+        recoveryAction: "regenerate_turn",
+        canRegenerate: true,
+        recovery,
+        generatedAttachmentReservations: {
+          "skill:1": {
+            schemaVersion: 1,
+            role: "skill",
+            attachmentIndex: 1,
+            requestHash: "1".repeat(64),
+            idempotencyKeyHash: "2".repeat(64),
+            filename: sourceAttachments[1]!.filename,
+            mimeType: "application/zip",
+            sizeBytes: skillBytes.length,
+            contentSha256: sha256(skillBytes),
+            localStorageKey: "knowledge-base/build-sources/v5-skill.bin",
+            status: "reserved",
+            reservedAt: "2026-08-01T00:00:00.000Z",
+          },
+          "working_set:2": {
+            schemaVersion: 1,
+            role: "working_set",
+            attachmentIndex: 2,
+            requestHash: "3".repeat(64),
+            idempotencyKeyHash: "4".repeat(64),
+            filename: sourceAttachments[2]!.filename,
+            mimeType: "application/zip",
+            sizeBytes: workingSetBytes.length,
+            contentSha256: sha256(workingSetBytes),
+            localStorageKey: "knowledge-base/build-sources/v5-working-set.bin",
+            status: "reserved",
+            reservedAt: "2026-08-01T00:00:00.000Z",
+          },
+          "instructions:3": {
+            schemaVersion: 1,
+            role: "instructions",
+            attachmentIndex: 3,
+            requestHash: "5".repeat(64),
+            idempotencyKeyHash: "6".repeat(64),
+            filename: sourceAttachments[3]!.filename,
+            mimeType: "text/markdown",
+            sizeBytes: instructionsBytes.length,
+            contentSha256: sha256(instructionsBytes),
+            localStorageKey: "knowledge-base/build-sources/v5-instructions.bin",
+            status: "reserved",
+            reservedAt: "2026-08-01T00:00:00.000Z",
+          },
+        },
+        preparedDispatch: {
+          schemaVersion: 2,
+          baseUrl: "https://api.example.test",
+          requestBody,
+          bodySha256: hashKnowledgeBaseTurnRequest(requestBody),
+          preparedAt: "2026-08-01T00:00:10.000Z",
+        },
+      },
+    });
+    const build = {
+      id: source.buildId,
+      userId: source.userId,
+      conversationId: "conversation-1",
+      companyName: "FrontMind 超前智能",
+      companyWebsite: "https://www.frontmind.net/",
+      generation: 3,
+      revision: 7,
+      currentLeafId: "1.8",
+      status: "protocol_error",
+      activeTurnId: source.id,
+      ...currentMaterializedRecoveryBuildAuthority,
+    } as any;
+
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).not.toBeNull();
+    (
+      source.metadata as any
+    ).preparedDispatch.requestBody.attachments[0].file_id =
+      "forged-customer-source-file";
+    expect(inspectKnowledgeBaseRetryAuthority(source, build)).toBeNull();
+  });
+
   it("requires explicit regeneration metadata and rejects a forged rejected start", () => {
     const source = retryableFailedTurn();
     const build = {

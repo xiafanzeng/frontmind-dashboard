@@ -11,7 +11,12 @@ export interface KnowledgeBaseClientAttachmentManifestItem {
   sizeBytes: number;
   mimeType: string;
   lastModified: number;
-  sha256: string;
+  /**
+   * Legacy clients may declare a browser-computed digest. New reservations
+   * omit it: Dashboard binds the authoritative digest after streaming the
+   * upload into managed storage.
+   */
+  sha256?: string;
   /** Stable browser row identity used by start-before-upload recovery. */
   itemId?: string;
   /** One-based position and total are frozen only for starter batches. */
@@ -83,7 +88,7 @@ export function normalizeKnowledgeBaseClientAttachmentManifest(
       !Number.isSafeInteger(lastModified) ||
       lastModified < 0 ||
       !mimeType ||
-      !/^[a-f0-9]{64}$/u.test(sha256) ||
+      (sha256.length > 0 && !/^[a-f0-9]{64}$/u.test(sha256)) ||
       (hasStarterCoordinate &&
         (!itemId ||
           itemId.length > 191 ||
@@ -102,7 +107,7 @@ export function normalizeKnowledgeBaseClientAttachmentManifest(
       sizeBytes,
       mimeType,
       lastModified,
-      sha256,
+      ...(sha256 ? { sha256 } : {}),
       ...(hasStarterCoordinate ? { itemId, ordinal, total } : {}),
     };
   });
@@ -122,7 +127,7 @@ export function assertKnowledgeBaseAttachmentManifestPresent(input: {
   ) {
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
-      "当前版本的知识库附件必须完成浏览器原始字节校验，请重新上传",
+      "当前版本的知识库附件必须包含完整预约清单，请重新上传",
     );
   }
 }

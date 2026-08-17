@@ -49,6 +49,36 @@ describe("knowledge-base local asset operation identity", () => {
     expect(changed.storageKey).not.toBe(first.storageKey);
   });
 
+  it("accepts a digest-free coordinate and derives storage only from the server digest", () => {
+    const {
+      [KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS.contentSha256]: _legacyDigest,
+      ...digestFreeHeaders
+    } = headers();
+    const coordinate =
+      parseKnowledgeBaseLocalUploadCoordinate(digestFreeHeaders)!;
+    expect(coordinate.contentSha256).toBeUndefined();
+
+    const reservedIdentity = knowledgeBaseLocalAssetIdentity({
+      userId: 7,
+      projectAssignmentId: "project-1",
+      coordinate,
+      sizeBytes: 12,
+    });
+    const retainedIdentity = knowledgeBaseLocalAssetIdentity({
+      userId: 7,
+      projectAssignmentId: "project-1",
+      coordinate,
+      sizeBytes: 12,
+      authoritativeContentSha256: "c".repeat(64),
+    });
+
+    expect(reservedIdentity.localAssetId).toBe(retainedIdentity.localAssetId);
+    expect(reservedIdentity).not.toHaveProperty("storageKey");
+    expect(retainedIdentity.storageKey).toMatch(
+      /^frontmind-v2:knowledge-base:/u,
+    );
+  });
+
   it("rejects a partial coordinate instead of falling back to ordinary chat", () => {
     expect(() =>
       parseKnowledgeBaseLocalUploadCoordinate({

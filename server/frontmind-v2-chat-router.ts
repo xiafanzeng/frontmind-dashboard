@@ -1229,7 +1229,9 @@ router.post("/assets", async (req, res) => {
           sizeBytes: declaredBytes,
         })
       : null;
-    const assertKnowledgeCoordinate = async () => {
+    const assertKnowledgeCoordinate = async (
+      authoritativeContentSha256?: string,
+    ) => {
       if (!knowledgeCoordinate) return;
       try {
         await assertKnowledgeBaseLocalUploadCoordinate({
@@ -1246,6 +1248,7 @@ router.post("/assets", async (req, res) => {
           mimeType,
           sizeBytes: declaredBytes!,
           contentSha256: knowledgeCoordinate.contentSha256,
+          authoritativeContentSha256,
         });
       } catch (error) {
         throw knowledgeBaseUploadReservationError(error);
@@ -1329,15 +1332,26 @@ router.post("/assets", async (req, res) => {
           throw new ChatV2HttpError("LOCAL_ASSET_SIZE_MISMATCH", 400);
         }
         if (
-          knowledgeCoordinate &&
+          knowledgeCoordinate?.contentSha256 &&
           staged.sha256 !== knowledgeCoordinate.contentSha256
         ) {
           throw new ChatV2HttpError("LOCAL_ASSET_SHA256_MISMATCH", 400);
         }
+        const authoritativeKnowledgeIdentity = knowledgeCoordinate
+          ? knowledgeBaseLocalAssetIdentity({
+              userId: ownerUserId,
+              projectAssignmentId:
+                req.frontmindDeliveryProjectContext?.projectAssignmentId ??
+                null,
+              coordinate: knowledgeCoordinate,
+              sizeBytes: declaredBytes!,
+              authoritativeContentSha256: staged.sha256,
+            })
+          : null;
         const finalizeUpload = async () => {
           // Reset/dispatch can advance while the body is in flight. Re-prove
           // the reservation immediately before the short durable commit.
-          await assertKnowledgeCoordinate();
+          await assertKnowledgeCoordinate(staged.sha256);
           const replayPayload = async (
             existing: typeof localAssets.$inferSelect,
           ) => {
@@ -1348,7 +1362,7 @@ router.post("/assets", async (req, res) => {
                 mimeType,
                 sizeBytes: staged.sizeBytes,
                 contentSha256: staged.sha256,
-                storageKey: knowledgeIdentity.storageKey,
+                storageKey: authoritativeKnowledgeIdentity!.storageKey!,
               });
             const bytesMatch =
               matches &&
@@ -1387,7 +1401,7 @@ router.post("/assets", async (req, res) => {
 
           const now = Date.now();
           const storageKey =
-            knowledgeIdentity?.storageKey ?? `frontmind-v2:${id}`;
+            authoritativeKnowledgeIdentity?.storageKey ?? `frontmind-v2:${id}`;
           await staged.commit({
             filename,
             mimeType,
