@@ -71,6 +71,7 @@ import {
   stageKnowledgeBaseDeferredTurnAttachment,
   sanitizeKnowledgeBaseRecoveryMetadata,
   settleKnowledgeBaseManusV2ExplicitRejection,
+  settleKnowledgeBasePreCreateFailureForApprovedReset,
   settleKnowledgeBaseMaterializedCompletionStopAttempt,
 } from "./knowledge-base-turn-service";
 import {
@@ -878,7 +879,6 @@ describe("failed not-sent legacy business handoff", () => {
   });
 });
 
-
 describe("Manus v2 canonical task writer fence", () => {
   const build = (overrides: Record<string, unknown> = {}) => ({
     id: identity.buildId,
@@ -955,11 +955,6 @@ describe("Manus v2 canonical task writer fence", () => {
     publishedAt: null,
     ...overrides,
   });
-
-
-
-
-
 
   it("settles an unbound create outcome-unknown to reset on the next durable sweep", async () => {
     const leaseToken = "materialized-create-unknown-lease";
@@ -1228,16 +1223,6 @@ describe("Manus v2 canonical task writer fence", () => {
       "https://",
     );
   });
-
-
-
-
-
-
-
-
-
-
 
   it("keeps source ids frozen until every ready v2 mapping commits atomically", async () => {
     const leaseToken = "v2-attachment-ledger-lease";
@@ -1732,8 +1717,6 @@ describe("Manus v2 canonical task writer fence", () => {
     });
   });
 
-
-
   it.skip("retires canonical-task post-2xx bind recovery", async () => {
     const leaseToken = "post-ack-bind-failure-lease";
     const activeTurn = turn({
@@ -1869,14 +1852,6 @@ describe("Manus v2 canonical task writer fence", () => {
     });
   });
 
-
-
-
-
-
-
-
-
   it("commits one crash-safe legacy handoff digest and resumes it idempotently", async () => {
     const leaseToken = "handoff-lease";
     const snapshotSha256 = "f".repeat(64);
@@ -1945,11 +1920,6 @@ describe("Manus v2 canonical task writer fence", () => {
       ),
     ).resolves.toEqual({ migrated: false, snapshotSha256 });
   });
-
-
-
-
-
 
   it("atomically rejects one invalid materialized result, releases recovery, and deduplicates the settlement", async () => {
     const leaseToken = "materialized-result-invalid-lease";
@@ -3025,8 +2995,6 @@ describe("Manus v2 canonical task writer fence", () => {
     expect(harness.store.build?.stateEpoch).toBe(8);
   });
 
-
-
   it.skip("retires rejected canonical repair claims", async () => {
     const rejectedTurn = turn({
       status: "running",
@@ -4056,7 +4024,6 @@ describe("knowledge-base HTTP replay receipts", () => {
     ).rejects.toMatchObject({ code: "STALE_KNOWLEDGE_BASE_PRESENTATION" });
   });
 });
-
 
 describe("knowledge-base generated attachment reservations", () => {
   it("reuses one provider file identity after response loss and binds cleanup ownership atomically", async () => {
@@ -5678,7 +5645,6 @@ describe("knowledge-base server-owned turn messages", () => {
       turn: { apiCredentialId: "credential-c" },
     });
   });
-
 
   it("rejects a deleted v2 canonical credential instead of silently using the replacement key", async () => {
     const canonicalBuild = {
@@ -8163,7 +8129,6 @@ describe("knowledge-base deterministic dispatch failure", () => {
     ).resolves.toBeNull();
   });
 
-
   it("settles the active turn once so it is retryable and cannot be recovered forever", async () => {
     const leaseToken = "deterministic-failure-lease";
     const active = retryableFailedTurn({
@@ -8256,6 +8221,170 @@ describe("knowledge-base deterministic dispatch failure", () => {
       providerRequestRef: "sha256:1234567890abcdef12345678",
     });
     expect(store.conversation).toMatchObject({ status: "failed", version: 5 });
+  });
+
+  it("atomically retires a fresh not-sent materialized pre-create failure", async () => {
+    const leaseToken = "fresh-pre-create-reset-lease";
+    const active = turn({
+      operationType: "start",
+      expectedRevision: 0,
+      expectedLeafId: null,
+      status: "running",
+      leaseExpiresAt: new Date("2026-08-01T00:05:00.000Z"),
+      metadata: {
+        attachmentsFrozen: true,
+        expectedAttachmentCount: 11,
+        userAttachmentCount: 9,
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerProtocol: "manus_v2",
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+        dispatchState: "recovering",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const build = {
+      ...currentMaterializedRecoveryBuildAuthority,
+      id: active.buildId,
+      userId: active.userId,
+      conversationId: "conversation-1",
+      generation: active.buildGeneration,
+      revision: 0,
+      currentLeafId: null,
+      status: "researching",
+      stateEpoch: 7,
+      activeTurnId: active.id,
+      upstreamTaskId: null,
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+      protocolErrorCode: null,
+      protocolError: null,
+      awaitingResponseSince: new Date("2026-08-01T00:00:00.000Z"),
+    };
+    const conversation = {
+      id: active.conversationId,
+      userId: active.userId,
+      projectAssignmentId: null,
+      deletedAt: null,
+      deletedMessageIds: [],
+      version: 4,
+      status: "running",
+    };
+    const current = (state: TurnServiceStore) =>
+      state.turns.filter((candidate) => candidate.id === active.id);
+    const { executor, store } = createTurnServiceExecutor({
+      build,
+      conversation,
+      turns: [active],
+      turnSelections: [[current], [current]],
+    });
+    const input = {
+      userId: active.userId,
+      turnId: active.id,
+      leaseToken,
+      code: "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_INTEGRITY_CONFLICT",
+      message: "provider bytes changed",
+      failureStage: "provider_file_registration" as const,
+      now: new Date("2026-08-01T00:00:20.000Z"),
+    };
+
+    const first = await settleKnowledgeBasePreCreateFailureForApprovedReset(
+      input,
+      executor,
+    );
+    const duplicate = await settleKnowledgeBasePreCreateFailureForApprovedReset(
+      input,
+      executor,
+    );
+
+    expect(first).toMatchObject({ deduplicated: false });
+    expect(duplicate).toMatchObject({ deduplicated: true });
+    expect(store.build).toMatchObject({
+      status: "protocol_error",
+      stateEpoch: 8,
+      activeTurnId: null,
+      canonicalTaskState: "attention_required",
+      protocolErrorCode: "RESET_REQUIRED",
+      awaitingResponseSince: null,
+    });
+    expect(store.turns[0]).toMatchObject({
+      status: "failed",
+      upstreamTaskId: null,
+      errorCode: "RESET_REQUIRED",
+      leaseExpiresAt: null,
+      metadata: {
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+        dispatchState: "failed",
+        failureClass: "requires_user_fix",
+        recoveryAction: "approve_reset",
+        canRegenerate: false,
+        failureStage: "provider_file_registration",
+        preCreateFailureCauseCode:
+          "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_INTEGRITY_CONFLICT",
+      },
+    });
+    expect(store.conversation).toMatchObject({ status: "failed", version: 5 });
+  });
+
+  it("refuses to downgrade a create attempt that has already started", async () => {
+    const leaseToken = "started-create-reset-lease";
+    const active = turn({
+      status: "running",
+      metadata: {
+        attachmentsFrozen: true,
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        providerProtocol: "manus_v2",
+        createAttemptState: "sending",
+        providerAttemptState: "sending",
+        dispatchingAt: "2026-08-01T00:00:10.000Z",
+        leaseOwnerHash: createHash("sha256")
+          .update(leaseToken, "utf8")
+          .digest("hex"),
+      },
+    });
+    const build = {
+      ...currentMaterializedRecoveryBuildAuthority,
+      id: active.buildId,
+      userId: active.userId,
+      conversationId: "conversation-1",
+      generation: active.buildGeneration,
+      revision: active.expectedRevision,
+      currentLeafId: active.expectedLeafId,
+      status: "researching",
+      stateEpoch: 7,
+      activeTurnId: active.id,
+      upstreamTaskId: null,
+      canonicalTaskId: null,
+      canonicalTaskState: "unbound",
+    };
+    const harness = createTurnServiceExecutor({
+      build,
+      turns: [active],
+      turnSelections: [[[active]]],
+    });
+
+    await expect(
+      settleKnowledgeBasePreCreateFailureForApprovedReset(
+        {
+          userId: active.userId,
+          turnId: active.id,
+          leaseToken,
+          code: "LOCAL_FAILURE_AFTER_CREATE_STARTED",
+          message: "must not downgrade",
+        },
+        harness.executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(harness.store.build).toMatchObject({
+      activeTurnId: active.id,
+      stateEpoch: 7,
+    });
+    expect(harness.store.turns[0]).toMatchObject({ status: "running" });
   });
 });
 
@@ -8755,5 +8884,4 @@ describe("knowledge-base safe retry reservation", () => {
     (source.metadata as any).recovery.finalPackageRequired = false;
     expect(inspectKnowledgeBaseRetryAuthority(source, build)).toBeNull();
   });
-
 });

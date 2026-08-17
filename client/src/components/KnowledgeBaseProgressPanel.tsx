@@ -161,6 +161,18 @@ export default function KnowledgeBaseProgressPanel({
     (warning) => warning.code === "COVERAGE_INCOMPLETE",
   );
   const resultResetRequired = progress.operationState === "reset_required";
+  const taskWasNotCreated =
+    progress.taskCreationState === "not_attempted" &&
+    (progress.failureStage === "local_upload" ||
+      progress.failureStage === "provider_file_registration");
+  const hasDisplayableContent =
+    progress.contentAvailability === "partial" ||
+    progress.contentAvailability === "complete";
+  const contentAvailabilityIsLegacyUnknown =
+    progress.contentAvailability === undefined;
+  const retainedCustomerAttachmentCount = clampCount(
+    progress.retainedCustomerAttachmentCount ?? 0,
+  );
   const materializedOperationActive =
     progress.operationState === "creating" ||
     progress.operationState === "waiting_output" ||
@@ -186,7 +198,16 @@ export default function KnowledgeBaseProgressPanel({
     progress.build.protocolError ===
     KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
       ? KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
-      : "系统不会自动重发。已完成内容不受影响。";
+      : hasDisplayableContent || contentAvailabilityIsLegacyUnknown
+        ? "系统不会自动重发。已完成内容不受影响。"
+        : "系统不会自动重发；请申请重置后重新上传资料。";
+  const resetMessage = taskWasNotCreated
+    ? `${
+        retainedCustomerAttachmentCount > 0
+          ? `${retainedCustomerAttachmentCount}/${retainedCustomerAttachmentCount} 个附件已保留，`
+          : ""
+      }知识库任务未创建。请申请重置后重新上传资料。`
+    : KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE;
   const currentLeaf = progress.branches
     .flatMap((branch) => branch.leaves)
     .find((leaf) => leaf.id === progress.build.currentLeafId);
@@ -266,7 +287,9 @@ export default function KnowledgeBaseProgressPanel({
           <div>
             <strong className="block">
               {resultResetRequired
-                ? "本轮结果需要重置"
+                ? taskWasNotCreated
+                  ? "知识库任务未创建"
+                  : "本轮结果需要重置"
                 : buildStopped
                   ? "本轮已停止"
                   : progress.operationState === "normalizing"
@@ -275,10 +298,12 @@ export default function KnowledgeBaseProgressPanel({
             </strong>
             <span>
               {resultResetRequired
-                ? KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
+                ? resetMessage
                 : buildStopped
                   ? stoppedMessage
-                  : "请稍候，已完成内容不受影响。"}
+                  : hasDisplayableContent || contentAvailabilityIsLegacyUnknown
+                    ? "请稍候，已完成内容不受影响。"
+                    : "请稍候，任务状态会自动更新。"}
             </span>
           </div>
         </div>

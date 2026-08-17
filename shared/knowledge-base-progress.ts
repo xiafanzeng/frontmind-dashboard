@@ -158,6 +158,17 @@ export type KnowledgeBaseOperationState =
   | "normalizing"
   | "completed"
   | "reset_required";
+export type KnowledgeBaseTaskCreationState =
+  | "not_attempted"
+  | "submitting"
+  | "acknowledged"
+  | "rejected"
+  | "outcome_unknown";
+export type KnowledgeBaseFailureStage =
+  | "local_upload"
+  | "provider_file_registration"
+  | "task_create"
+  | "result_processing";
 export type KnowledgeBaseProcessingPhase =
   | "uploading"
   | "restoring_files"
@@ -287,6 +298,16 @@ export interface KnowledgeBaseProgressDto {
   operationState?: KnowledgeBaseOperationState;
   resetAllowed?: boolean;
   warningCodes?: string[];
+  /** Public task-create boundary; independent from Provider runtime status. */
+  taskCreationState?: KnowledgeBaseTaskCreationState;
+  /** First customer-relevant stage that made the current operation terminal. */
+  failureStage?: KnowledgeBaseFailureStage | null;
+  /** Frozen customer files only; generated Skill/instructions are excluded. */
+  retainedCustomerAttachmentCount?: number;
+  /** Server-generated Skill/instructions attachment count. */
+  generatedSystemAttachmentCount?: number;
+  /** Server settlement time, never the browser polling time. */
+  settledAt?: number | null;
   packageAllowed: boolean;
   /** Additive package phase; older projections may omit it. */
   packageState?: KnowledgeBasePackageState;
@@ -457,6 +478,11 @@ export interface KnowledgeBaseObservationDto {
   operationState?: KnowledgeBaseOperationState;
   resetAllowed?: boolean;
   warningCodes?: string[];
+  taskCreationState?: KnowledgeBaseTaskCreationState;
+  failureStage?: KnowledgeBaseFailureStage | null;
+  retainedCustomerAttachmentCount?: number;
+  generatedSystemAttachmentCount?: number;
+  settledAt?: number | null;
   processingPhase?: KnowledgeBaseProcessingPhase | null;
   contentState?: KnowledgeBaseContentState;
   packageState?: KnowledgeBasePackageState;

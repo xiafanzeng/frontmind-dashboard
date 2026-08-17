@@ -198,14 +198,32 @@ export type ManusV2ProviderFileDetail = {
   bytes: number | null;
   expiresAt: number;
   contentType: string | null;
+  /**
+   * Provider MIME is optional diagnostic evidence. Keeping its parse status
+   * separate lets frozen-source consumers distinguish a missing value from a
+   * malformed value without rejecting the otherwise valid file envelope.
+   */
+  contentTypeParseStatus: "valid" | "missing" | "invalid";
   requestId: string | null;
 };
+
+export type ManusV2FileConfirmationPolicy =
+  | "strict"
+  | "kb_frozen_source_advisory";
+
+export type ProviderMimeDisposition =
+  | "exact"
+  | "generic"
+  | "missing"
+  | "invalid"
+  | "different";
 
 export type ManusV2WaitForExactProviderFileInput = {
   fileId: string;
   filename: string;
   expectedBytes: number;
   expectedContentType: string;
+  confirmationPolicy?: ManusV2FileConfirmationPolicy;
   minimumUsableSeconds?: number;
   readinessDeadlineMs?: number;
   detailAttemptTimeoutMs?: number;
@@ -359,24 +377,76 @@ function canonicalMediaType(value: unknown) {
     : null;
 }
 
+function isOoxmlContainer(filename: string, expectedContentType: string) {
+  const normalizedFilename = filename.trim().toLowerCase();
+  return (
+    (normalizedFilename.endsWith(".pptx") &&
+      expectedContentType ===
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation") ||
+    (normalizedFilename.endsWith(".docx") &&
+      expectedContentType ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document") ||
+    (normalizedFilename.endsWith(".xlsx") &&
+      expectedContentType ===
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+  );
+}
+
+export function classifyManusV2ProviderFileMime(input: {
+  filename: string;
+  expectedContentType: string;
+  providerContentType: string | null;
+  providerContentTypeParseStatus?: "valid" | "missing" | "invalid";
+}): ProviderMimeDisposition {
+  const expected = canonicalMediaType(input.expectedContentType);
+  if (!expected) return "invalid";
+  const providerParseStatus =
+    input.providerContentTypeParseStatus ??
+    (input.providerContentType === null ? "missing" : "valid");
+  if (providerParseStatus === "invalid") return "invalid";
+  const provider = canonicalMediaType(input.providerContentType);
+  if (providerParseStatus === "missing" || !input.providerContentType) {
+    return "missing";
+  }
+  if (!provider) return "invalid";
+  if (provider === expected) return "exact";
+  if (
+    provider === "application/octet-stream" ||
+    provider === "binary/octet-stream" ||
+    (provider === "application/zip" &&
+      isOoxmlContainer(input.filename, expected))
+  ) {
+    return "generic";
+  }
+  return "different";
+}
+
 /**
- * Manus can preserve the exact uploaded bytes while reporting generic binary
- * MIME for generated ZIP/TXT files. Treat that narrow provider fallback as
- * usable; every other mismatch still fails the exact file proof.
+ * Strict is the default for generic Manus consumers. Knowledge-base uploads
+ * may opt into the advisory policy only after Dashboard has revalidated its
+ * frozen local bytes, hash, size, filename and canonical MIME.
  */
 export function isManusV2ProviderFileMimeUsable(input: {
   filename: string;
   expectedContentType: string;
   providerContentType: string | null;
+  providerContentTypeParseStatus?: "valid" | "missing" | "invalid";
+  confirmationPolicy?: ManusV2FileConfirmationPolicy;
 }) {
   const expected = canonicalMediaType(input.expectedContentType);
+  if (!expected) return false;
+  const disposition = classifyManusV2ProviderFileMime(input);
+  if (input.confirmationPolicy === "kb_frozen_source_advisory") return true;
+  if (disposition === "exact") return true;
+  if (disposition !== "generic") return false;
   const provider = canonicalMediaType(input.providerContentType);
-  if (!expected || !provider) return false;
-  if (provider === expected) return true;
-  if (provider !== "application/octet-stream") return false;
   const filename = String(input.filename || "")
     .trim()
     .toLowerCase();
+  if (provider === "application/zip" && isOoxmlContainer(filename, expected)) {
+    return true;
+  }
+  if (provider !== "application/octet-stream") return false;
   return (
     (filename.endsWith(".zip") &&
       (expected === "application/zip" ||
@@ -2036,6 +2106,8 @@ export class ManusV2Client {
               filename: expectedFilename,
               expectedContentType,
               providerContentType: detail.contentType,
+              providerContentTypeParseStatus: detail.contentTypeParseStatus,
+              confirmationPolicy: input.confirmationPolicy ?? "strict",
             })
           ) {
             throw new ManusV2ApiError(
@@ -2099,6 +2171,7 @@ export class ManusV2Client {
     filename: string;
     bytes: Buffer;
     contentType: string;
+    confirmationPolicy?: ManusV2FileConfirmationPolicy;
     minimumUsableSeconds?: number;
     readinessDeadlineMs?: number;
     detailAttemptTimeoutMs?: number;
@@ -2136,6 +2209,7 @@ export class ManusV2Client {
         filename: expectedFilename,
         expectedBytes: input.bytes.length,
         expectedContentType,
+        confirmationPolicy: input.confirmationPolicy,
         minimumUsableSeconds: input.minimumUsableSeconds,
         readinessDeadlineMs: input.readinessDeadlineMs,
         detailAttemptTimeoutMs: input.detailAttemptTimeoutMs,
@@ -2358,13 +2432,30 @@ export class ManusV2Client {
     let bytes: number | null;
     let expiresAt: number;
     let contentType: string | null;
+    let contentTypeParseStatus: "valid" | "missing" | "invalid";
     try {
       actualFileId = requiredString(file.id, "file.id", 512);
       status = requiredString(file.status, "file.status", 32);
       filename = requiredString(file.filename, "file.filename", 512);
       bytes = file.bytes === null ? null : Number(file.bytes);
       expiresAt = Number(file.expires_at);
-      contentType = optionalString(file.content_type, 255);
+      if (
+        file.content_type === undefined ||
+        file.content_type === null ||
+        file.content_type === ""
+      ) {
+        contentType = null;
+        contentTypeParseStatus = "missing";
+      } else if (
+        typeof file.content_type === "string" &&
+        file.content_type.length <= 255
+      ) {
+        contentType = canonicalMediaType(file.content_type);
+        contentTypeParseStatus = contentType ? "valid" : "invalid";
+      } else {
+        contentType = null;
+        contentTypeParseStatus = "invalid";
+      }
     } catch (error) {
       if (error instanceof ManusV2ApiError) {
         throw new ManusV2ApiError(
@@ -2419,6 +2510,7 @@ export class ManusV2Client {
       bytes,
       expiresAt,
       contentType,
+      contentTypeParseStatus,
       requestId: providerRequestId(result),
     };
   }

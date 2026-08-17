@@ -229,6 +229,71 @@ function uploadBytes(value: unknown) {
   throw new Error("FAKE_MANUS_V2_UPLOAD_BYTES_INVALID");
 }
 
+const INLINE_MIME_TYPE_PATTERN =
+  /^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+(?:;[ \t]*[A-Za-z0-9!#$%&'*+.^_`|~-]+=[A-Za-z0-9!#$%&'*+.^_`|~-]+)*$/u;
+
+function materializeTaskAttachment(attachment: any) {
+  const filename =
+    typeof attachment?.filename === "string" ? attachment.filename : "";
+  if (!filename || filename.length > 512) {
+    throw new Error("FAKE_MANUS_V2_ATTACHMENT_FILENAME_INVALID");
+  }
+  const hasFileId =
+    typeof attachment?.file_id === "string" && attachment.file_id.length > 0;
+  const hasFileData =
+    typeof attachment?.file_data === "string" &&
+    attachment.file_data.length > 0;
+  if (hasFileId === hasFileData) {
+    throw new Error("FAKE_MANUS_V2_ATTACHMENT_SOURCE_INVALID");
+  }
+  if (hasFileId) {
+    if (attachment.mime_type !== undefined) {
+      throw new Error("FAKE_MANUS_V2_FILE_ID_MIME_FORBIDDEN");
+    }
+    return {
+      source: "file_id" as const,
+      filename,
+      fileId: attachment.file_id as string,
+    };
+  }
+  if (attachment.file_id !== undefined) {
+    throw new Error("FAKE_MANUS_V2_INLINE_FILE_ID_FORBIDDEN");
+  }
+  const mimeType =
+    typeof attachment?.mime_type === "string" ? attachment.mime_type : "";
+  if (
+    !mimeType ||
+    mimeType.length > 255 ||
+    !INLINE_MIME_TYPE_PATTERN.test(mimeType)
+  ) {
+    throw new Error("FAKE_MANUS_V2_INLINE_MIME_INVALID");
+  }
+  const prefix = `data:${mimeType};base64,`;
+  if (!attachment.file_data.startsWith(prefix)) {
+    throw new Error("FAKE_MANUS_V2_INLINE_DATA_URL_INVALID");
+  }
+  const encoded = attachment.file_data.slice(prefix.length);
+  if (
+    !encoded ||
+    encoded.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(
+      encoded,
+    )
+  ) {
+    throw new Error("FAKE_MANUS_V2_INLINE_BASE64_INVALID");
+  }
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.length < 1 || bytes.toString("base64") !== encoded) {
+    throw new Error("FAKE_MANUS_V2_INLINE_BASE64_NON_CANONICAL");
+  }
+  return {
+    source: "file_data" as const,
+    filename,
+    bytes,
+    contentType: mimeType,
+  };
+}
+
 function axiosResponse(
   config: InternalAxiosRequestConfig,
   status: number,
@@ -468,44 +533,36 @@ function createFakeManusV2Provider(input: {
     const attachments = (body.message.content as any[]).filter(
       (part) => part?.type === "file",
     );
-    const resolvedAttachments = attachments.map((attachment) => {
-      if (typeof attachment.file_data === "string") {
-        const marker = ";base64,";
-        const markerIndex = attachment.file_data.indexOf(marker);
-        expect(attachment.file_data.startsWith("data:")).toBe(true);
-        expect(markerIndex).toBeGreaterThan("data:".length);
-        const contentType = attachment.file_data.slice(
-          "data:".length,
-          markerIndex,
-        );
-        const encoded = attachment.file_data.slice(markerIndex + marker.length);
-        const bytes = Buffer.from(encoded, "base64");
-        expect(bytes.toString("base64")).toBe(encoded);
-        expect(attachment.mime_type).toBe(contentType);
-        return {
-          filename: String(attachment.filename || ""),
-          bytes,
-          contentType,
-        };
+    const materializedAttachments = attachments.map((attachment) => {
+      const materialized = materializeTaskAttachment(attachment);
+      if (materialized.source === "file_data") return materialized;
+      const file = uploadedFiles.get(materialized.fileId);
+      if (!file?.bytes?.length) {
+        throw new Error("FAKE_MANUS_V2_REFERENCED_FILE_NOT_UPLOADED");
       }
-      const file = uploadedFiles.get(String(attachment.file_id));
-      expect(file).toBeDefined();
-      return file!;
+      expect(materialized.filename).toBe(file.filename);
+      return {
+        ...materialized,
+        bytes: file.bytes,
+        contentType: file.contentType,
+      };
     });
-    for (let index = 0; index < attachments.length; index += 1) {
-      const attachment = attachments[index]!;
-      const file = resolvedAttachments[index]!;
-      expect(file.bytes?.length).toBeGreaterThan(0);
-      expect(attachment.filename).toBe(file.filename);
-    }
-    const instructionsIndex = attachments.findIndex(
+    const instructionsAttachment = materializedAttachments.find(
       (attachment) =>
         attachment.filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
     );
-    expect(instructionsIndex).toBeGreaterThanOrEqual(0);
-    const instructionsFile = resolvedAttachments[instructionsIndex];
-    expect(instructionsFile?.contentType).toContain("text/plain");
-    const instructions = instructionsFile?.bytes?.toString("utf8") || "";
+    if (!instructionsAttachment) {
+      throw new Error("FAKE_MANUS_V2_INSTRUCTIONS_MISSING");
+    }
+    if (instructionsAttachment.source !== "file_data") {
+      throw new Error("FAKE_MANUS_V2_INSTRUCTIONS_MUST_BE_INLINE");
+    }
+    expect(instructionsAttachment.contentType).toBe(
+      "text/plain; charset=utf-8",
+    );
+    const instructions = new TextDecoder("utf-8", { fatal: true }).decode(
+      instructionsAttachment.bytes,
+    );
     expect(prompt).toContain(KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME);
     expect(prompt).toContain(`SHA-256=${sha256(instructions)}`);
     expect(prompt).not.toContain("operation=materialize_initial_bundle");

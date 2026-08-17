@@ -375,6 +375,14 @@ type KnowledgeBaseTurnMetadata = Record<string, unknown> & {
   failureClass?: KnowledgeBaseFailureClass | null;
   recoveryAction?: KnowledgeBaseRecoveryAction | null;
   canRegenerate?: boolean;
+  /** Public lifecycle stage for a terminal failure before task.create. */
+  failureStage?:
+    | "local_upload"
+    | "provider_file_registration"
+    | "task_create"
+    | "result_processing";
+  /** Safe typed cause retained behind the public RESET_REQUIRED code. */
+  preCreateFailureCauseCode?: string;
   attachmentRepair?: {
     clientRequestId: string;
     requestHash: string;
@@ -467,6 +475,20 @@ export interface KnowledgeBaseGeneratedAttachmentReservation {
   replacementCount?: number;
 }
 
+export type KnowledgeBaseManusV2ProviderMimeDisposition =
+  | "exact"
+  | "generic"
+  | "missing"
+  | "invalid"
+  | "different";
+
+export interface KnowledgeBaseManusV2AttachmentMimeEvidence {
+  expectedContentType: string;
+  providerContentType: string | null;
+  disposition: KnowledgeBaseManusV2ProviderMimeDisposition;
+  observedAt: string;
+}
+
 export interface KnowledgeBaseManusV2AttachmentMapping {
   schemaVersion: 1;
   providerProtocol: "manus_v2";
@@ -485,6 +507,8 @@ export interface KnowledgeBaseManusV2AttachmentMapping {
   expiresAt: number;
   providerGeneration: number;
   verifiedAt: string;
+  /** Provider MIME is diagnostic; canonical MIME remains `mimeType`. */
+  mimeEvidence?: KnowledgeBaseManusV2AttachmentMimeEvidence;
 }
 
 export type KnowledgeBaseManusV2AttachmentAttemptState =
@@ -530,6 +554,8 @@ export interface KnowledgeBaseManusV2AttachmentAttempt {
   code: string | null;
   rejectionCount?: number;
   nextRetryAt?: string | null;
+  /** Present only when a monotonic lifecycle transition observed MIME. */
+  mimeEvidence?: KnowledgeBaseManusV2AttachmentMimeEvidence;
   recordedAt: string;
 }
 
@@ -5360,7 +5386,6 @@ export async function reserveKnowledgeBaseStartBuild(
   });
 }
 
-
 export function knowledgeBaseRetryRequiresFreshFinalDelivery(input: {
   skillVersion: string;
   currentLeafId: string | null;
@@ -6870,6 +6895,55 @@ export async function replaceUnusableKnowledgeBaseGeneratedAttachment(
   });
 }
 
+function normalizeManusV2AttachmentMimeEvidence(
+  value: KnowledgeBaseManusV2AttachmentMimeEvidence,
+) {
+  const evidence = { ...value };
+  const dispositions: readonly KnowledgeBaseManusV2ProviderMimeDisposition[] = [
+    "exact",
+    "generic",
+    "missing",
+    "invalid",
+    "different",
+  ];
+  const mediaTypePattern = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
+  const nullProviderDisposition =
+    evidence.disposition === "missing" || evidence.disposition === "invalid";
+  if (
+    !evidence ||
+    typeof evidence !== "object" ||
+    typeof evidence.expectedContentType !== "string" ||
+    evidence.expectedContentType.length < 1 ||
+    evidence.expectedContentType.length > 255 ||
+    !mediaTypePattern.test(evidence.expectedContentType) ||
+    (evidence.providerContentType !== null &&
+      (typeof evidence.providerContentType !== "string" ||
+        evidence.providerContentType.length < 1 ||
+        evidence.providerContentType.length > 255 ||
+        !mediaTypePattern.test(evidence.providerContentType))) ||
+    !dispositions.includes(evidence.disposition) ||
+    !Number.isFinite(Date.parse(evidence.observedAt)) ||
+    (evidence.disposition === "exact" &&
+      evidence.providerContentType !== evidence.expectedContentType) ||
+    nullProviderDisposition !== (evidence.providerContentType === null) ||
+    (evidence.disposition === "generic" &&
+      ![
+        "application/octet-stream",
+        "binary/octet-stream",
+        "application/zip",
+      ].includes(String(evidence.providerContentType || ""))) ||
+    (evidence.disposition === "different" &&
+      (evidence.providerContentType === null ||
+        evidence.providerContentType === evidence.expectedContentType))
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Manus v2 attachment MIME evidence is invalid",
+    );
+  }
+  return evidence;
+}
+
 function normalizeManusV2AttachmentMapping(
   value: KnowledgeBaseManusV2AttachmentMapping,
 ) {
@@ -6882,6 +6956,11 @@ function normalizeManusV2AttachmentMapping(
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
       "Manus v2 attachment mapping is not ready",
+    );
+  }
+  if (mapping.mimeEvidence !== undefined) {
+    mapping.mimeEvidence = normalizeManusV2AttachmentMimeEvidence(
+      mapping.mimeEvidence,
     );
   }
   assertInteger(mapping.buildGeneration, "buildGeneration", 1);
@@ -7021,6 +7100,11 @@ function normalizeManusV2AttachmentAttempt(
     throw new KnowledgeBaseTurnReservationError(
       "INVALID_REQUEST",
       "Manus v2 attachment retry deadline is invalid",
+    );
+  }
+  if (attempt.mimeEvidence !== undefined) {
+    attempt.mimeEvidence = normalizeManusV2AttachmentMimeEvidence(
+      attempt.mimeEvidence,
     );
   }
   if (attempt.uploadExpiresAt !== null) {
@@ -11543,6 +11627,205 @@ export async function failKnowledgeBaseTurnDeterministically(
         completedAt: now,
         leaseExpiresAt: null,
         metadata: failedMetadata,
+        updatedAt: now,
+      }),
+      deduplicated: false,
+    };
+  });
+}
+
+/**
+ * Terminalize one fresh materialized-v5 operation before task.create.
+ *
+ * This boundary is intentionally narrower than the generic deterministic
+ * failure path: a provider task may not exist, task.create must still be
+ * durably `not_sent`, and the current turn must own the build. The build and
+ * turn are settled in one transaction so a failed turn can never remain the
+ * active pointer or be projected as a stopped Provider task.
+ */
+export async function settleKnowledgeBasePreCreateFailureForApprovedReset(
+  input: {
+    userId: number;
+    turnId: string;
+    leaseToken: string;
+    code: string;
+    message: string;
+    failureStage?: "local_upload" | "provider_file_registration";
+    now?: Date;
+  },
+  executor?: any,
+) {
+  const db = executor ?? (await requireDb());
+  const causeCode = normalizeRequiredId(input.code, "failure code", 128);
+  const causeMessage = String(input.message || "")
+    .trim()
+    .slice(0, 10_000);
+  if (!causeMessage) {
+    throw new KnowledgeBaseTurnReservationError(
+      "INVALID_REQUEST",
+      "Pre-create failure message is required",
+    );
+  }
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, input, {
+      allowInactiveTurn: true,
+    });
+    const metadata = metadataOf(turn);
+    const isExactSettlement =
+      turn.status === "failed" &&
+      turn.errorCode === "RESET_REQUIRED" &&
+      turn.upstreamTaskId === null &&
+      metadata.failureStage ===
+        (input.failureStage ?? "provider_file_registration") &&
+      metadata.preCreateFailureCauseCode === causeCode &&
+      metadata.createAttemptState === "not_sent" &&
+      metadata.providerAttemptState === "not_sent" &&
+      build.status === "protocol_error" &&
+      build.activeTurnId === null &&
+      build.canonicalTaskState === "attention_required" &&
+      build.protocolErrorCode === "RESET_REQUIRED";
+    if (isExactSettlement) {
+      return { turn: turnRecord(turn), deduplicated: true };
+    }
+    if (metadata.leaseOwnerHash !== leaseOwnerHash(input.leaseToken)) {
+      throw new KnowledgeBaseTurnReservationError(
+        "LEASE_LOST",
+        "Knowledge-base turn lease is owned by another worker",
+        1_000,
+      );
+    }
+    assertLease(turn, input.leaseToken);
+    if (
+      build.activeTurnId !== turn.id ||
+      build.generation !== turn.buildGeneration ||
+      build.canonicalTaskId !== null ||
+      build.upstreamTaskId !== null ||
+      turn.upstreamTaskId !== null ||
+      (turn.status !== "queued" && turn.status !== "running") ||
+      knowledgeBaseCreateAttemptState(turn, metadata) !== "not_sent" ||
+      metadata.providerAttemptState !== "not_sent" ||
+      metadata.dispatchingAt !== undefined ||
+      metadata.outcomeUnknownAt !== undefined
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Pre-create reset settlement lost its fresh not-sent authority",
+      );
+    }
+    if (
+      build.executionMode !== "materialized_bundle_v1" ||
+      build.skillVersion !== "5" ||
+      build.skillContentHash !==
+        KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH ||
+      build.providerProtocol !== "manus_v2" ||
+      metadata.materializedRecoveryContractVersion !== 1 ||
+      metadata.materializedCompletionContractVersion !==
+        KNOWLEDGE_BASE_MATERIALIZED_COMPLETION_CONTRACT_VERSION ||
+      metadata.providerProtocol !== "manus_v2"
+    ) {
+      // Old contracts remain reset-only history and use their existing
+      // terminal path. Returning null is an explicit classification, not a
+      // reason to upgrade or reconstruct them in place.
+      return null;
+    }
+
+    const now = input.now ?? new Date();
+    const failureStage = input.failureStage ?? "provider_file_registration";
+    const customerMessage =
+      failureStage === "local_upload"
+        ? "知识库任务未创建；本地资料校验未完成。请批准重置后重新上传资料。"
+        : "知识库任务未创建；云端附件登记未完成。请批准重置后重新上传资料。";
+    const nextMetadata: KnowledgeBaseTurnMetadata = {
+      ...metadata,
+      createAttemptState: "not_sent",
+      createAttemptUpdatedAt: now.toISOString(),
+      providerAttemptState: "not_sent",
+      dispatchState: "failed",
+      failureClass: "requires_user_fix",
+      recoveryAction: "approve_reset",
+      canRegenerate: false,
+      failureStage,
+      preCreateFailureCauseCode: causeCode,
+      manusV2Lifecycle: {
+        ...(metadata.manusV2Lifecycle || {}),
+        attentionCode: "RESET_REQUIRED",
+      },
+    };
+    delete nextMetadata.leaseOwnerHash;
+    const buildUpdated = await tx
+      .update(knowledgeBaseBuilds)
+      .set({
+        status: "protocol_error",
+        activeTurnId: null,
+        canonicalTaskState: "attention_required",
+        protocolErrorCode: "RESET_REQUIRED",
+        protocolError: customerMessage,
+        stateEpoch: build.stateEpoch + 1,
+        recoveryLeaseOwnerHash: null,
+        recoveryLeaseExpiresAt: null,
+        awaitingResponseSince: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(knowledgeBaseBuilds.id, build.id),
+          eq(knowledgeBaseBuilds.userId, input.userId),
+          eq(knowledgeBaseBuilds.generation, build.generation),
+          eq(knowledgeBaseBuilds.stateEpoch, build.stateEpoch),
+          eq(knowledgeBaseBuilds.activeTurnId, turn.id),
+          isNull(knowledgeBaseBuilds.canonicalTaskId),
+          isNull(knowledgeBaseBuilds.upstreamTaskId),
+        ),
+      );
+    if (!buildUpdated[0]?.affectedRows) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Pre-create reset settlement lost the build writer fence",
+      );
+    }
+    const turnUpdated = await tx
+      .update(conversationTurns)
+      .set({
+        status: "failed",
+        errorCode: "RESET_REQUIRED",
+        errorMessage: customerMessage,
+        completedAt: turn.completedAt ?? now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(conversationTurns.id, turn.id),
+          eq(conversationTurns.userId, input.userId),
+          eq(conversationTurns.buildId, build.id),
+          eq(conversationTurns.buildGeneration, build.generation),
+          inArray(conversationTurns.status, ["queued", "running"]),
+          isNull(conversationTurns.upstreamTaskId),
+        ),
+      );
+    if (!turnUpdated[0]?.affectedRows) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Pre-create reset settlement lost the turn writer fence",
+      );
+    }
+    await markKnowledgeBaseConversationFailedInTransaction({
+      tx,
+      userId: input.userId,
+      conversationId: turn.conversationId,
+      authoritativeTaskId: null,
+      failedAt: now,
+    });
+    return {
+      turn: turnRecord({
+        ...turn,
+        status: "failed",
+        errorCode: "RESET_REQUIRED",
+        errorMessage: customerMessage,
+        completedAt: turn.completedAt ?? now,
+        leaseExpiresAt: null,
+        metadata: nextMetadata,
         updatedAt: now,
       }),
       deduplicated: false,

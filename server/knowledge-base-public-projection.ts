@@ -137,7 +137,15 @@ function publicNotice(value: Record<string, unknown>): Record<string, unknown> {
               message:
                 "原任务执行发生错误，系统不会自动重发；请联系支持处理。已完成内容不受影响。",
             }
-          : publicRecoveryCopy(action);
+          : action === "approve_reset" &&
+              value.code === "FRONTMIND_KB_RESET_REQUIRED" &&
+              typeof value.message === "string" &&
+              value.message.includes("知识库任务未创建")
+            ? {
+                code: "FRONTMIND_KB_RESET_REQUIRED",
+                message: sanitizeFrontMindPublicText(value.message),
+              }
+            : publicRecoveryCopy(action);
   const createdAt = publicNoticeCreatedAt(value.createdAt);
   return {
     key: ["frontmind-kb", copy.code, action, createdAt].join(":"),

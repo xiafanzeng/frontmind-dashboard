@@ -15,6 +15,7 @@ import {
   useConversation,
   type Attachment,
   type KnowledgeBaseClientNotice,
+  type KnowledgeBaseClientState,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -172,6 +173,19 @@ export function shouldRenderKnowledgeBaseNotice(
   return true;
 }
 
+export function knowledgeBaseTaskWasNotCreated(
+  knowledgeBase:
+    | Pick<KnowledgeBaseClientState, "taskCreationState" | "failureStage">
+    | null
+    | undefined,
+) {
+  return Boolean(
+    knowledgeBase?.taskCreationState === "not_attempted" &&
+      (knowledgeBase.failureStage === "local_upload" ||
+        knowledgeBase.failureStage === "provider_file_registration"),
+  );
+}
+
 export function knowledgeBaseNoticeRecoveryMode(
   notice: Pick<
     KnowledgeBaseClientNotice,
@@ -270,10 +284,11 @@ export function knowledgeBaseReconcileResultRequiresConfirmation(
 }
 
 export function knowledgeBaseReconcileResultIsStopped(
-  observation: Pick<KnowledgeBaseObservationDto, "notice">,
+  observation: Pick<KnowledgeBaseObservationDto, "notice" | "operationState">,
 ) {
   return Boolean(
-    observation.notice &&
+    observation.operationState === undefined &&
+      observation.notice &&
       (observation.notice.code === "FRONTMIND_KB_STOPPED" ||
         observation.notice.recoveryAction === "stopped"),
   );
@@ -1717,6 +1732,21 @@ export default function ChatArea({
       .reverse()
       .find((message) => message.role === "assistant" && message.modelName)
       ?.modelName;
+  const knowledgeBaseTaskNotCreated = knowledgeBaseTaskWasNotCreated(
+    activeConversation.knowledgeBase,
+  );
+  const retainedCustomerAttachmentCount =
+    activeConversation.knowledgeBase?.retainedCustomerAttachmentCount;
+  const knowledgeBaseHasDisplayableContent =
+    activeConversation.knowledgeBase?.contentAvailability === "partial" ||
+    activeConversation.knowledgeBase?.contentAvailability === "complete";
+  const knowledgeBaseNoticeDisplayMessage = knowledgeBaseTaskNotCreated
+    ? "附件未能完成任务创建前的登记，请申请重置后重新上传资料。"
+    : activeConversation.knowledgeBase?.operationState === "reset_required"
+      ? knowledgeBaseHasDisplayableContent
+        ? "本轮需要重置，已完成内容不受影响。"
+        : "本轮需要重置，请申请重置后重新上传资料。"
+      : activeConversation.knowledgeBase?.notice?.message;
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -1863,28 +1893,16 @@ export default function ChatArea({
               >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
-                    <span>
-                      {activeConversation.knowledgeBase.notice.message}
-                    </span>
-                    {activeConversation.knowledgeBase.notice.severity ===
-                      "error" &&
-                      typeof activeConversation.knowledgeBase.notice
-                        .attachmentCount === "number" &&
-                      activeConversation.knowledgeBase.notice.attachmentCount >
-                        0 && (
+                    <span>{knowledgeBaseNoticeDisplayMessage}</span>
+                    {knowledgeBaseTaskNotCreated &&
+                      typeof retainedCustomerAttachmentCount === "number" &&
+                      retainedCustomerAttachmentCount > 0 && (
                         <p
                           className="mt-1 text-xs"
                           data-testid="knowledge-base-attachment-retention"
                         >
-                          {
-                            activeConversation.knowledgeBase.notice
-                              .attachmentCount
-                          }
-                          /
-                          {
-                            activeConversation.knowledgeBase.notice
-                              .attachmentCount
-                          }{" "}
+                          {retainedCustomerAttachmentCount}/
+                          {retainedCustomerAttachmentCount}{" "}
                           个附件已保留，知识库任务未创建。
                         </p>
                       )}

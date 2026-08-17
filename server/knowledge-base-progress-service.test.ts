@@ -310,6 +310,39 @@ describe("knowledge-base materialized business projection", () => {
     },
   );
 
+  it("separates retained customer files from generated system attachments after pre-create settlement", () => {
+    expect(
+      knowledgeBaseMaterializedBusinessProjection({
+        progress: {
+          ...progress,
+          contentAvailability: "none",
+          operationState: "reset_required",
+          resetAllowed: true,
+        },
+        lifecycleTurn: {
+          upstreamTaskId: null,
+          completedAt: new Date("2026-08-17T15:04:37.000Z"),
+          metadata: {
+            createAttemptState: "not_sent",
+            providerAttemptState: "not_sent",
+            failureStage: "provider_file_registration",
+            userAttachmentCount: 9,
+            expectedAttachmentCount: 11,
+          },
+        } as any,
+      }),
+    ).toMatchObject({
+      contentAvailability: "none",
+      operationState: "reset_required",
+      resetAllowed: true,
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: Date.parse("2026-08-17T15:04:37.000Z"),
+    });
+  });
+
   it("leaves a legacy DTO unchanged", () => {
     const legacy = { build: { id: "legacy" } } as any;
     expect(

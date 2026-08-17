@@ -237,6 +237,11 @@ describe("reconcileKnowledgeBaseObservation", () => {
         "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
         "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
       ],
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: 1_787_000_000_000,
     } as any;
 
     expect(
@@ -248,6 +253,11 @@ describe("reconcileKnowledgeBaseObservation", () => {
       operationState: "normalizing",
       resetAllowed: false,
       warningCodes: ["OPTIONAL_BINARY_EVIDENCE_SKIPPED"],
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: 1_787_000_000_000,
     });
     expect(
       knowledgeBaseObservationFromPayload({
@@ -256,11 +266,17 @@ describe("reconcileKnowledgeBaseObservation", () => {
           progress: nestedProgress,
           operationState: "reset_required",
           resetAllowed: true,
+          taskCreationState: "acknowledged",
+          failureStage: "result_processing",
+          retainedCustomerAttachmentCount: 7,
         },
       }),
     ).toMatchObject({
       operationState: "reset_required",
       resetAllowed: true,
+      taskCreationState: "acknowledged",
+      failureStage: "result_processing",
+      retainedCustomerAttachmentCount: 7,
     });
   });
 

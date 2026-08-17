@@ -365,9 +365,6 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(knowledgeBaseTurnReplayHttpStatus("terminal", 200)).toBe(200);
   });
 
-
-
-
   it("accepts only strict RFC4122 trace ids from durable turn authority", () => {
     const claim = (traceId: string) =>
       ({
@@ -473,6 +470,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
     const cancelUnprepared = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
+    const settlePreCreateFailure = vi.fn().mockResolvedValue(undefined);
     const common = {
       userId: 7,
       turnId: "turn-attachment-repair",
@@ -537,16 +535,17 @@ describe("knowledge-base turn HTTP outcomes", () => {
         failDeterministically,
         cancelUnprepared,
         markOutcomeUnknown,
+        settlePreCreateFailure,
       },
     );
-    expect(failDeterministically).toHaveBeenCalledWith(
+    expect(settlePreCreateFailure).toHaveBeenCalledWith(
       expect.objectContaining({
         turnId: common.turnId,
-        failureClass: "requires_user_fix",
-        recoveryAction: "fix_attachments",
-        canRegenerate: false,
+        code: "KNOWLEDGE_BASE_CLIENT_ATTACHMENT_INVALID",
+        failureStage: "provider_file_registration",
       }),
     );
+    expect(failDeterministically).not.toHaveBeenCalled();
   });
 
   it("defers pending attachments for five seconds without marking task-create unknown", async () => {
@@ -787,7 +786,6 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
   });
 
-
   it("keeps a not-sent v2 preparation failure on the pre-create failure path", async () => {
     const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
     const persistCreateFailure = vi.fn().mockResolvedValue("retriable");
@@ -855,6 +853,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
 
   it("settles a polluted generated ledger as reset-required without a provider side effect", async () => {
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const settlePreCreateFailure = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
     const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
     const taskPost = vi.spyOn(axios, "post");
@@ -874,21 +873,21 @@ describe("knowledge-base turn HTTP outcomes", () => {
         },
         {
           failDeterministically,
+          settlePreCreateFailure,
           markOutcomeUnknown,
           deferBeforeCreate,
         },
       ),
     ).resolves.toBe("deterministic");
-    expect(failDeterministically).toHaveBeenCalledWith({
+    expect(settlePreCreateFailure).toHaveBeenCalledWith({
       userId: 7,
       turnId: "turn-ledger-conflict",
       leaseToken: "lease-ledger-conflict",
       code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT",
       message: "safe ledger conflict",
-      failureClass: "requires_user_fix",
-      recoveryAction: "approve_reset",
-      canRegenerate: false,
+      failureStage: "provider_file_registration",
     });
+    expect(failDeterministically).not.toHaveBeenCalled();
     expect(markOutcomeUnknown).not.toHaveBeenCalled();
     expect(deferBeforeCreate).not.toHaveBeenCalled();
     expect(taskPost).not.toHaveBeenCalled();
@@ -897,6 +896,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
 
   it("settles a reset-only dispatch fence as approved-reset authority", async () => {
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const settlePreCreateFailure = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn();
 
     await expect(
@@ -911,20 +911,50 @@ describe("knowledge-base turn HTTP outcomes", () => {
             "approved reset required",
           ),
         },
-        { failDeterministically, markOutcomeUnknown },
+        {
+          failDeterministically,
+          settlePreCreateFailure,
+          markOutcomeUnknown,
+        },
       ),
     ).resolves.toBe("deterministic");
-    expect(failDeterministically).toHaveBeenCalledWith({
+    expect(settlePreCreateFailure).toHaveBeenCalledWith({
       userId: 7,
       turnId: "turn-reset-required",
       leaseToken: "lease-reset-required",
       code: "RESET_REQUIRED",
       message: "approved reset required",
-      failureClass: "requires_user_fix",
-      recoveryAction: "approve_reset",
-      canRegenerate: false,
+      failureStage: "provider_file_registration",
     });
+    expect(failDeterministically).not.toHaveBeenCalled();
     expect(markOutcomeUnknown).not.toHaveBeenCalled();
+  });
+
+  it("keeps an explicitly classified old reset-only contract on its legacy terminal path", async () => {
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const settlePreCreateFailure = vi.fn().mockResolvedValue(null);
+
+    await expect(
+      persistKnowledgeBaseCreateFailure(
+        {
+          userId: 7,
+          turnId: "turn-old-reset-required",
+          leaseToken: "lease-old-reset-required",
+          outcomeUnknownCode: "SHOULD_NOT_BE_USED",
+          error: new KnowledgeBaseTurnReservationError(
+            "RESET_REQUIRED",
+            "old contract requires reset",
+          ),
+        },
+        { failDeterministically, settlePreCreateFailure },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(failDeterministically).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "RESET_REQUIRED",
+        recoveryAction: "approve_reset",
+      }),
+    );
   });
 
   it("keeps generated-file content proof failures before task create and never asks users to repair PDFs", async () => {
@@ -932,6 +962,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
     const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
+    const settlePreCreateFailure = vi.fn().mockResolvedValue(undefined);
     const common = {
       userId: 7,
       turnId: "turn-generated-content-proof",
@@ -950,7 +981,12 @@ describe("knowledge-base turn HTTP outcomes", () => {
     await expect(
       persistKnowledgeBaseCreateFailure(
         { ...common, error: transient },
-        { deferBeforeCreate, markOutcomeUnknown, failDeterministically },
+        {
+          deferBeforeCreate,
+          markOutcomeUnknown,
+          failDeterministically,
+          settlePreCreateFailure,
+        },
       ),
     ).resolves.toBe("retriable");
     expect(deferBeforeCreate).toHaveBeenCalledWith(
@@ -977,16 +1013,19 @@ describe("knowledge-base turn HTTP outcomes", () => {
     await expect(
       persistKnowledgeBaseCreateFailure(
         { ...common, error: deterministic },
-        { deferBeforeCreate, markOutcomeUnknown, failDeterministically },
+        {
+          deferBeforeCreate,
+          markOutcomeUnknown,
+          failDeterministically,
+          settlePreCreateFailure,
+        },
       ),
     ).resolves.toBe("deterministic");
-    expect(failDeterministically).toHaveBeenCalledWith(
+    expect(settlePreCreateFailure).toHaveBeenCalledWith(
       expect.objectContaining({
         turnId: common.turnId,
         code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_INVALID",
-        failureClass: "terminal_nonregenerable",
-        recoveryAction: "contact_support",
-        canRegenerate: false,
+        failureStage: "provider_file_registration",
       }),
     );
     expect(failDeterministically).not.toHaveBeenCalledWith(
@@ -1001,9 +1040,11 @@ describe("knowledge-base turn HTTP outcomes", () => {
   it("keeps Logo re-upload separate and never labels server finalization as attachment repair", async () => {
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
     const cancelUnprepared = vi.fn().mockResolvedValue(undefined);
+    const settlePreCreateFailure = vi.fn().mockResolvedValue(undefined);
     const dependencies = {
       failDeterministically,
       cancelUnprepared,
+      settlePreCreateFailure,
       markOutcomeUnknown: vi.fn().mockResolvedValue(undefined),
     };
     const common = {
@@ -1042,14 +1083,14 @@ describe("knowledge-base turn HTTP outcomes", () => {
       },
       dependencies,
     );
-    expect(failDeterministically).toHaveBeenCalledWith(
+    expect(settlePreCreateFailure).toHaveBeenCalledWith(
       expect.objectContaining({
         turnId: common.turnId,
-        failureClass: "terminal_nonregenerable",
-        recoveryAction: "contact_support",
-        canRegenerate: false,
+        code: "KNOWLEDGE_BASE_FINALIZATION_INPUT_INVALID",
+        failureStage: "provider_file_registration",
       }),
     );
+    expect(failDeterministically).not.toHaveBeenCalled();
     expect(cancelUnprepared).not.toHaveBeenCalled();
   });
 
@@ -1316,9 +1357,6 @@ describe("knowledge-base turn HTTP outcomes", () => {
     });
   });
 });
-
-
-
 
 describe("knowledge-base upstream read failure authority", () => {
   it.each([
@@ -3405,8 +3443,6 @@ describe("knowledge base execution contract", () => {
     expect(markOutcomeUnknown).not.toHaveBeenCalled();
     expect(post).toHaveBeenCalledTimes(2);
   });
-
-
 
   it("freezes and sends zh-CN on every fresh materialized v5 task create", async () => {
     const operationKey = "e".repeat(64);
@@ -6178,11 +6214,6 @@ describe("knowledge base execution contract", () => {
     expect(sendMessage).not.toHaveBeenCalled();
     delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
   });
-
-
-
-
-
 
   it("uses the configured workspace enterprise and rejects client identity changes", () => {
     expect(

@@ -1233,19 +1233,186 @@ describe("Manus v2 complete attachment-set recovery", () => {
       expect(attachmentLedgerMocks.finalize).toHaveBeenCalledOnce();
     },
   );
+
+  it("accepts an octet-stream PPTX on generation one and persists MIME evidence", async () => {
+    const { claim, sources } = testClaim();
+    const source = sources[0]!;
+    const filename = "hospital-profile.pptx";
+    const mimeType =
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    source.filename = filename;
+    source.mimeType = mimeType;
+    claim.preparedDispatch.requestBody.attachments = [
+      { file_id: source.sourceFileId, filename },
+    ];
+    claim.turn.attachmentFileIds = [source.sourceFileId];
+    claim.recoveryMetadata.attachments = [
+      { file_id: source.sourceFileId, filename },
+    ];
+    claim.recoveryMetadata.attachmentManifest = [
+      {
+        sizeBytes: source.sizeBytes,
+        sha256: source.contentSha256,
+        mimeType,
+      },
+    ];
+    claim.recoveryMetadata.attachmentSourceProofs = [
+      {
+        fileId: source.sourceFileId,
+        localStorageKey: source.localStorageKey,
+        sizeBytes: source.sizeBytes,
+        contentSha256: source.contentSha256,
+        mimeType,
+      },
+    ];
+    attachmentLedgerMocks.load.mockResolvedValue({
+      turn: claim.turn,
+      preparedDispatch: claim.preparedDispatch,
+    });
+    localSourceMocks.read.mockResolvedValue(source.bytes);
+    const providerExpiry = Math.floor(Date.now() / 1_000) + 60 * 60;
+    const post = vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: { id: "pptx-file-g1", filename },
+        upload_url: "https://uploads.manus.test/pptx-g1",
+        upload_expires_at: providerExpiry,
+      },
+    });
+    vi.spyOn(axios, "put").mockResolvedValue({ status: 200 });
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "pptx-file-g1",
+          filename,
+          status: "uploaded",
+          bytes: source.sizeBytes,
+          content_type: "application/octet-stream",
+          expires_at: providerExpiry,
+        },
+      },
+    });
+    attachmentLedgerMocks.finalize.mockImplementation(async ({ mappings }) => ({
+      attachmentFileIds: mappings.map((item: any) => item.upstreamFileId),
+      manusV2AttachmentMappings: Object.fromEntries(
+        mappings.map((item: any) => [item.mappingKey, item]),
+      ),
+    }));
+
+    await expect(
+      ensureKnowledgeBaseManusV2Attachments({
+        claim,
+        credential: {
+          id: claim.turn.apiCredentialId!,
+          userId: claim.turn.userId,
+          apiKey: "synthetic-manus-key",
+        },
+        baseUrl: "https://api.manus.test",
+      }),
+    ).resolves.toEqual([{ file_id: "pptx-file-g1", filename }]);
+
+    expect(post).toHaveBeenCalledOnce();
+    expect(
+      attachmentLedgerMocks.persistAttempt.mock.calls.some(
+        ([input]) => input.attempt.providerGeneration > 1,
+      ),
+    ).toBe(false);
+    expect(
+      attachmentLedgerMocks.persistMapping.mock.calls.at(-1)?.[0].mapping,
+    ).toMatchObject({
+      providerGeneration: 1,
+      mimeEvidence: {
+        expectedContentType: mimeType,
+        providerContentType: "application/octet-stream",
+        disposition: "generic",
+      },
+    });
+  });
+
+  it.each([
+    [
+      "identity conflict",
+      1,
+      { status: "uploaded", bytes: 999 },
+      "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_INTEGRITY_CONFLICT",
+    ],
+    [
+      "exhausted lifecycle",
+      2,
+      { status: "deleted", bytes: null },
+      "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_LIFECYCLE_EXHAUSTED",
+    ],
+  ] as const)(
+    "settles deterministic %s as a stable local-preparation error",
+    async (_label, providerGeneration, detailOverride, expectedCode) => {
+      const sources = testSources().slice(0, 1);
+      const source = sources[0]!;
+      const providerExpiry = Math.floor(Date.now() / 1_000) + 60 * 60;
+      const ready = mappingFor(source, providerGeneration, providerExpiry);
+      const { claim } = testClaim({ mappings: { [ready.mappingKey]: ready } });
+      claim.preparedDispatch.requestBody.attachments =
+        claim.preparedDispatch.requestBody.attachments.slice(0, 1);
+      claim.turn.attachmentFileIds = claim.turn.attachmentFileIds.slice(0, 1);
+      claim.recoveryMetadata.attachments =
+        claim.recoveryMetadata.attachments.slice(0, 1);
+      claim.recoveryMetadata.attachmentManifest =
+        claim.recoveryMetadata.attachmentManifest.slice(0, 1);
+      claim.recoveryMetadata.attachmentSourceProofs =
+        claim.recoveryMetadata.attachmentSourceProofs.slice(0, 1);
+      attachmentLedgerMocks.load.mockResolvedValue({
+        turn: claim.turn,
+        preparedDispatch: claim.preparedDispatch,
+      });
+      localSourceMocks.read.mockResolvedValue(source.bytes);
+      vi.spyOn(ManusV2Client.prototype, "fileDetail").mockResolvedValue({
+        fileId: ready.upstreamFileId,
+        filename: ready.filename,
+        status: "uploaded",
+        bytes: ready.sizeBytes,
+        expiresAt: providerExpiry,
+        contentType: ready.mimeType,
+        contentTypeParseStatus: "valid",
+        requestId: null,
+        ...detailOverride,
+      } as any);
+      const upload = vi.spyOn(ManusV2Client.prototype, "uploadFile");
+
+      await expect(
+        ensureKnowledgeBaseManusV2Attachments({
+          claim,
+          credential: {
+            id: claim.turn.apiCredentialId!,
+            userId: claim.turn.userId,
+            apiKey: "synthetic-manus-key",
+          },
+          baseUrl: "https://api.manus.test",
+        }),
+      ).rejects.toMatchObject({ code: expectedCode });
+      expect(upload).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("Manus v2 reusable attachment proof", () => {
   it("uses only one bounded replacement for a definite final-pass failure", () => {
     expect(
       finalKnowledgeBaseManusV2AttachmentInspectionAction({
-        inspection: { state: "unusable", code: "MANUS_V2_FILE_EXPIRING" },
+        inspection: {
+          state: "replaceable_unusable",
+          code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
+        },
         providerGeneration: 1,
       }),
     ).toBe("replace");
     expect(
       finalKnowledgeBaseManusV2AttachmentInspectionAction({
-        inspection: { state: "unusable", code: "MANUS_V2_FILE_UNUSABLE" },
+        inspection: {
+          state: "replaceable_unusable",
+          code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
+        },
         providerGeneration: 2,
       }),
     ).toBe("isolate");
@@ -1261,6 +1428,18 @@ describe("Manus v2 reusable attachment proof", () => {
         providerGeneration: 1,
       }),
     ).toBe("wait");
+  });
+
+  it("rejects an integrity conflict without consuming a replacement generation", () => {
+    expect(
+      finalKnowledgeBaseManusV2AttachmentInspectionAction({
+        inspection: {
+          state: "integrity_conflict",
+          code: "KB_ATTACHMENT_BYTES_CONFLICT",
+        },
+        providerGeneration: 1,
+      }),
+    ).toBe("reject");
   });
 
   it("reconciles a newer durable candidate before the stale ready mapping after a crash", () => {
@@ -1327,6 +1506,7 @@ describe("Manus v2 reusable attachment proof", () => {
   it.each([
     ["generated.zip", "application/zip"],
     ["instructions.txt", "text/plain"],
+    ["facts.pdf", "application/pdf"],
   ])(
     "uses the same generic-MIME allowance when recovering %s",
     async (filename, mimeType) => {
@@ -1370,14 +1550,30 @@ describe("Manus v2 reusable attachment proof", () => {
     },
   );
 
+  it("keeps a byte-exact KB mapping reusable when Provider reports a different MIME", async () => {
+    const detail = vi.fn().mockResolvedValue({
+      fileId: mapping.upstreamFileId,
+      filename: mapping.filename,
+      status: "uploaded",
+      bytes: mapping.sizeBytes,
+      expiresAt: mapping.expiresAt,
+      contentType: "text/html",
+      contentTypeParseStatus: "valid",
+      requestId: "request-detail",
+    });
+
+    await expect(
+      validateReusableKnowledgeBaseManusV2Attachment({
+        client: { fileDetail: detail } as any,
+        mapping,
+        minimumExpirySeconds: mapping.expiresAt - 1,
+      }),
+    ).resolves.toMatchObject({ fileId: mapping.upstreamFileId });
+  });
+
   it.each([
     ["wrong filename", { filename: "other.pdf" }],
     ["wrong bytes", { bytes: 41 }],
-    ["wrong MIME", { contentType: "text/plain" }],
-    [
-      "generic binary MIME for PDF",
-      { contentType: "application/octet-stream" },
-    ],
     ["not uploaded", { status: "pending" }],
     ["expires too soon", { expiresAt: mapping.expiresAt - 2 }],
   ])("requires replacement for %s", async (_label, override) => {
@@ -1478,19 +1674,19 @@ describe("Manus v2 reusable attachment proof", () => {
 
   it.each([
     ["pending", { status: "pending", bytes: null }, "unresolved"],
-    ["deleted", { status: "deleted", bytes: null }, "unusable"],
-    ["error", { status: "error", bytes: null }, "unusable"],
-    ["wrong bytes", { status: "uploaded", bytes: 41 }, "unusable"],
-    ["wrong MIME", { contentType: "text/plain" }, "unusable"],
+    ["deleted", { status: "deleted", bytes: null }, "replaceable_unusable"],
+    ["error", { status: "error", bytes: null }, "replaceable_unusable"],
+    ["wrong bytes", { status: "uploaded", bytes: 41 }, "integrity_conflict"],
+    ["wrong MIME", { contentType: "text/plain" }, "ready"],
     [
       "generic binary MIME for PDF",
       { contentType: "application/octet-stream" },
-      "unusable",
+      "ready",
     ],
     [
       "expired",
       { status: "uploaded", bytes: attempt.sizeBytes, expiresAt: 5 },
-      "unusable",
+      "replaceable_unusable",
     ],
   ])(
     "classifies a durable candidate as %s",
@@ -1560,8 +1756,8 @@ describe("Manus v2 reusable attachment proof", () => {
         minimumExpirySeconds: 1,
       }),
     ).resolves.toMatchObject({
-      state: "unusable",
-      code: "MANUS_V2_FILE_UPLOAD_WINDOW_EXPIRED",
+      state: "replaceable_unusable",
+      code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
     });
   });
 
@@ -1579,8 +1775,8 @@ describe("Manus v2 reusable attachment proof", () => {
         minimumExpirySeconds: 1,
       }),
     ).resolves.toMatchObject({
-      state: "unusable",
-      code: "MANUS_V2_FILE_NOT_FOUND",
+      state: "replaceable_unusable",
+      code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
     });
   });
 

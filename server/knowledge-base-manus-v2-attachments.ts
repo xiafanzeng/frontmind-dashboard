@@ -17,6 +17,7 @@ import {
   renewKnowledgeBaseTurnLease,
   type KnowledgeBaseGeneratedAttachmentReservation,
   type KnowledgeBaseManusV2AttachmentAttempt,
+  type KnowledgeBaseManusV2AttachmentMimeEvidence,
   type KnowledgeBaseManusV2AttachmentMapping,
   type KnowledgeBaseRecoveryClaim,
 } from "./knowledge-base-turn-service";
@@ -28,9 +29,11 @@ import { readKnowledgeBasePinnedSkillArchiveAttachment } from "./knowledge-base-
 import {
   ManusV2ApiError,
   ManusV2Client,
+  classifyManusV2ProviderFileMime,
   isManusV2ProviderFileMimeUsable,
   type ManusV2Attachment,
   type ManusV2CreatedFile,
+  type ManusV2ProviderFileDetail,
 } from "./manus-v2-client";
 import { readStoredPresalesFile } from "./presales-file-store";
 
@@ -61,6 +64,22 @@ type SealedUploadCapability = NonNullable<
 function localPreparationError(message: string, cause?: unknown) {
   return new KnowledgeBaseLocalPreparationError(
     "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_SOURCE_UNAVAILABLE",
+    message,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function attachmentIntegrityError(message: string, cause?: unknown) {
+  return new KnowledgeBaseLocalPreparationError(
+    "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_INTEGRITY_CONFLICT",
+    message,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function attachmentLifecycleExhaustedError(message: string, cause?: unknown) {
+  return new KnowledgeBaseLocalPreparationError(
+    "KNOWLEDGE_BASE_MANUS_V2_ATTACHMENT_LIFECYCLE_EXHAUSTED",
     message,
     cause === undefined ? undefined : { cause },
   );
@@ -544,6 +563,7 @@ function attachmentAttempt(input: {
   rejectionCount?: number;
   nextRetryAt?: string | null;
   uploadCapability?: SealedUploadCapability | null;
+  mimeEvidence?: KnowledgeBaseManusV2AttachmentMimeEvidence;
 }): KnowledgeBaseManusV2AttachmentAttempt {
   return {
     schemaVersion: 1,
@@ -570,8 +590,67 @@ function attachmentAttempt(input: {
     ...(input.nextRetryAt === undefined
       ? {}
       : { nextRetryAt: input.nextRetryAt }),
+    ...(input.mimeEvidence === undefined
+      ? {}
+      : { mimeEvidence: input.mimeEvidence }),
     recordedAt: new Date().toISOString(),
   };
+}
+
+function providerMimeEvidence(input: {
+  filename: string;
+  expectedContentType: string;
+  detail: ManusV2ProviderFileDetail;
+}): KnowledgeBaseManusV2AttachmentMimeEvidence {
+  const expectedContentType = input.expectedContentType
+    .split(";", 1)[0]!
+    .trim()
+    .toLowerCase();
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(expectedContentType)) {
+    throw localPreparationError(
+      "FrontMind 冻结附件的 canonical MIME 无效，无法建立 Provider 文件证明",
+    );
+  }
+  const disposition = classifyManusV2ProviderFileMime({
+    filename: input.filename,
+    expectedContentType,
+    providerContentType: input.detail.contentType,
+    providerContentTypeParseStatus: input.detail.contentTypeParseStatus,
+  });
+  return {
+    expectedContentType,
+    providerContentType: input.detail.contentType,
+    disposition,
+    observedAt: new Date().toISOString(),
+  };
+}
+
+function safeFilenameExtension(filename: string) {
+  const basename = filename.replace(/^.*[\\/]/u, "").toLowerCase();
+  const lastDot = basename.lastIndexOf(".");
+  if (lastDot <= 0 || lastDot === basename.length - 1) return null;
+  const extension = basename.slice(lastDot, lastDot + 17);
+  return /^\.[a-z0-9]{1,15}$/u.test(extension) ? extension : null;
+}
+
+function logProviderMimeDecision(input: {
+  attempt: KnowledgeBaseManusV2AttachmentAttempt;
+  evidence: KnowledgeBaseManusV2AttachmentMimeEvidence;
+  decision: "ready" | "replaceable_unusable" | "integrity_conflict";
+}) {
+  if (input.evidence.disposition === "exact") return;
+  console.info("[Knowledge base] provider attachment MIME advisory", {
+    diagnosticCode: "KB_ATTACHMENT_PROVIDER_MIME_ADVISORY",
+    stage: "provider_file_registration",
+    buildGeneration: input.attempt.buildGeneration,
+    attachmentIndex: input.attempt.attachmentIndex,
+    filenameExtension: safeFilenameExtension(input.attempt.filename),
+    providerGeneration: input.attempt.providerGeneration,
+    expectedContentType: input.evidence.expectedContentType,
+    providerContentType: input.evidence.providerContentType,
+    mimeDisposition: input.evidence.disposition,
+    identityDecision: input.decision,
+  });
 }
 
 async function persistAttempt(input: {
@@ -604,6 +683,8 @@ function exactProviderProof(input: {
       filename: input.mapping.filename,
       expectedContentType: input.mapping.mimeType,
       providerContentType: input.detail.contentType,
+      providerContentTypeParseStatus: input.detail.contentTypeParseStatus,
+      confirmationPolicy: "kb_frozen_source_advisory",
     }) &&
     Number.isSafeInteger(input.detail.expiresAt) &&
     input.detail.expiresAt >= input.minimumExpirySeconds
@@ -645,8 +726,18 @@ type CandidateInspection =
   | {
       state: "ready";
       detail: Awaited<ReturnType<ManusV2Client["fileDetail"]>>;
+      mimeEvidence: KnowledgeBaseManusV2AttachmentMimeEvidence;
     }
-  | { state: "unusable"; code: string }
+  | {
+      state: "replaceable_unusable";
+      code: string;
+      mimeEvidence?: KnowledgeBaseManusV2AttachmentMimeEvidence;
+    }
+  | {
+      state: "integrity_conflict";
+      code: string;
+      mimeEvidence?: KnowledgeBaseManusV2AttachmentMimeEvidence;
+    }
   | { state: "unresolved"; code: string };
 
 export function finalKnowledgeBaseManusV2AttachmentInspectionAction(input: {
@@ -655,6 +746,9 @@ export function finalKnowledgeBaseManusV2AttachmentInspectionAction(input: {
 }) {
   if (input.inspection.state === "ready") return "refresh" as const;
   if (input.inspection.state === "unresolved") return "wait" as const;
+  if (input.inspection.state === "integrity_conflict") {
+    return "reject" as const;
+  }
   return input.providerGeneration < 2
     ? ("replace" as const)
     : ("isolate" as const);
@@ -687,27 +781,41 @@ async function inspectCandidate(input: {
   }
   try {
     const detail = await input.client.fileDetail(input.attempt.upstreamFileId);
+    const mimeEvidence = providerMimeEvidence({
+      filename: input.attempt.filename,
+      expectedContentType: input.attempt.mimeType,
+      detail,
+    });
     if (detail.fileId !== input.attempt.upstreamFileId) {
-      return { state: "unresolved", code: "MANUS_V2_FILE_ID_CONFLICT" };
+      return {
+        state: "integrity_conflict",
+        code: "KB_ATTACHMENT_IDENTITY_CONFLICT",
+        mimeEvidence,
+      };
     }
-    if (
-      detail.filename !== input.attempt.filename ||
-      (detail.bytes !== null && detail.bytes !== input.attempt.sizeBytes)
-    ) {
-      return { state: "unusable", code: "MANUS_V2_FILE_CONTENT_CONFLICT" };
+    if (detail.filename !== input.attempt.filename) {
+      return {
+        state: "integrity_conflict",
+        code: "KB_ATTACHMENT_IDENTITY_CONFLICT",
+        mimeEvidence,
+      };
     }
     if (detail.status === "deleted" || detail.status === "error") {
-      return { state: "unusable", code: "MANUS_V2_FILE_UNUSABLE" };
+      return {
+        state: "replaceable_unusable",
+        code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
+        mimeEvidence,
+      };
     }
     if (
       detail.status === "uploaded" &&
-      !isManusV2ProviderFileMimeUsable({
-        filename: input.attempt.filename,
-        expectedContentType: input.attempt.mimeType,
-        providerContentType: detail.contentType,
-      })
+      detail.bytes !== input.attempt.sizeBytes
     ) {
-      return { state: "unusable", code: "MANUS_V2_FILE_MIME_CONFLICT" };
+      return {
+        state: "integrity_conflict",
+        code: "KB_ATTACHMENT_BYTES_CONFLICT",
+        mimeEvidence,
+      };
     }
     if (
       detail.status === "uploaded" &&
@@ -715,14 +823,24 @@ async function inspectCandidate(input: {
       Number.isSafeInteger(detail.expiresAt) &&
       detail.expiresAt >= input.minimumExpirySeconds
     ) {
-      return { state: "ready", detail };
+      const inspection = { state: "ready", detail, mimeEvidence } as const;
+      logProviderMimeDecision({
+        attempt: input.attempt,
+        evidence: mimeEvidence,
+        decision: "ready",
+      });
+      return inspection;
     }
     if (
       detail.status === "uploaded" &&
       Number.isSafeInteger(detail.expiresAt) &&
       detail.expiresAt < input.minimumExpirySeconds
     ) {
-      return { state: "unusable", code: "MANUS_V2_FILE_EXPIRING" };
+      return {
+        state: "replaceable_unusable",
+        code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
+        mimeEvidence,
+      };
     }
     if (
       detail.status === "pending" &&
@@ -732,13 +850,14 @@ async function inspectCandidate(input: {
       // Once the provider's own signed-upload deadline has passed, a still
       // pending record can no longer become uploaded from this attempt.
       return {
-        state: "unusable",
-        code: "MANUS_V2_FILE_UPLOAD_WINDOW_EXPIRED",
+        state: "replaceable_unusable",
+        code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
+        mimeEvidence,
       };
     }
     // A known pending file is not proof of failure. It remains the only
     // candidate and a later recovery details this same id again.
-    return { state: "unresolved", code: "MANUS_V2_FILE_PENDING" };
+    return { state: "unresolved", code: "KB_ATTACHMENT_PENDING" };
   } catch (error) {
     if (
       error instanceof ManusV2ApiError &&
@@ -746,7 +865,28 @@ async function inspectCandidate(input: {
       !error.retryable &&
       (error.status === 404 || error.status === 410)
     ) {
-      return { state: "unusable", code: "MANUS_V2_FILE_NOT_FOUND" };
+      return {
+        state: "replaceable_unusable",
+        code: "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
+      };
+    }
+    if (
+      error instanceof ManusV2ApiError &&
+      ["FILE_ID_CONFLICT", "FILE_IDENTITY_CONFLICT"].includes(error.code)
+    ) {
+      return {
+        state: "integrity_conflict",
+        code: "KB_ATTACHMENT_IDENTITY_CONFLICT",
+      };
+    }
+    if (
+      error instanceof ManusV2ApiError &&
+      error.code === "FILE_BYTES_CONFLICT"
+    ) {
+      return {
+        state: "integrity_conflict",
+        code: "KB_ATTACHMENT_BYTES_CONFLICT",
+      };
     }
     return {
       state: "unresolved",
@@ -761,6 +901,7 @@ async function inspectCandidate(input: {
 function mappingFromCandidate(input: {
   attempt: KnowledgeBaseManusV2AttachmentAttempt;
   detail: Awaited<ReturnType<ManusV2Client["fileDetail"]>>;
+  mimeEvidence: KnowledgeBaseManusV2AttachmentMimeEvidence;
 }): KnowledgeBaseManusV2AttachmentMapping {
   if (!input.attempt.upstreamFileId) {
     throw localPreparationError("FrontMind 附件 candidate 缺少 Provider ID");
@@ -782,6 +923,7 @@ function mappingFromCandidate(input: {
     expiresAt: input.detail.expiresAt,
     providerGeneration: input.attempt.providerGeneration,
     verifiedAt: new Date().toISOString(),
+    mimeEvidence: input.mimeEvidence,
   };
 }
 
@@ -793,6 +935,15 @@ export function nextKnowledgeBaseManusV2FileCreateGeneration(
   attempt: KnowledgeBaseManusV2AttachmentAttempt | null,
 ) {
   if (!attempt) return 1;
+  if (
+    attempt.state === "unusable" &&
+    [
+      "KB_ATTACHMENT_IDENTITY_CONFLICT",
+      "KB_ATTACHMENT_BYTES_CONFLICT",
+    ].includes(String(attempt.code || ""))
+  ) {
+    return null;
+  }
   if (
     attempt.state !== "unusable" &&
     attempt.state !== "create_outcome_unknown" &&
@@ -983,6 +1134,7 @@ async function ensureOneMapping(input: {
         ...existing,
         expiresAt: inspection.detail.expiresAt,
         verifiedAt: new Date().toISOString(),
+        mimeEvidence: inspection.mimeEvidence,
       };
       await persistReadyMapping({ claim: input.claim, mapping: refreshed });
       return refreshed;
@@ -993,8 +1145,37 @@ async function ensureOneMapping(input: {
         code: inspection.code,
       });
     }
+    if (inspection.state === "integrity_conflict") {
+      if (inspection.mimeEvidence) {
+        logProviderMimeDecision({
+          attempt: inspectionAttempt,
+          evidence: inspection.mimeEvidence,
+          decision: "integrity_conflict",
+        });
+      }
+      if (attempt?.state !== "unusable") {
+        attempt = attachmentAttempt({
+          ...input,
+          providerGeneration: existing.providerGeneration,
+          state: "unusable",
+          file: {
+            fileId: existing.upstreamFileId,
+            filename: existing.filename,
+            uploadUrl: "https://redacted.invalid/",
+            uploadExpiresAt: existing.expiresAt,
+            requestId: null,
+          },
+          code: inspection.code,
+          mimeEvidence: inspection.mimeEvidence,
+        });
+        await persistAttempt({ claim: input.claim, attempt });
+      }
+      throw attachmentIntegrityError(
+        `FrontMind 附件“${input.source.filename}”的 Provider 身份证明与冻结源不一致（${inspection.code}）`,
+      );
+    }
     if (existing.providerGeneration >= 2) {
-      throw localPreparationError(
+      throw attachmentLifecycleExhaustedError(
         `FrontMind 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
       );
     }
@@ -1013,6 +1194,7 @@ async function ensureOneMapping(input: {
           requestId: null,
         },
         code: inspection.code,
+        mimeEvidence: inspection.mimeEvidence,
       });
       await persistAttempt({ claim: input.claim, attempt });
     }
@@ -1043,11 +1225,15 @@ async function ensureOneMapping(input: {
         const mapping = mappingFromCandidate({
           attempt,
           detail: inspection.detail,
+          mimeEvidence: inspection.mimeEvidence,
         });
         await persistReadyMapping({ claim: input.claim, mapping });
         return mapping;
       }
-      if (inspection.state === "unusable") {
+      if (
+        inspection.state === "replaceable_unusable" ||
+        inspection.state === "integrity_conflict"
+      ) {
         attempt = attachmentAttempt({
           ...input,
           providerGeneration: attempt.providerGeneration,
@@ -1060,8 +1246,14 @@ async function ensureOneMapping(input: {
             requestId: null,
           },
           code: inspection.code,
+          mimeEvidence: inspection.mimeEvidence,
         });
         await persistAttempt({ claim: input.claim, attempt });
+        if (inspection.state === "integrity_conflict") {
+          throw attachmentIntegrityError(
+            `FrontMind 附件“${input.source.filename}”的 Provider 身份证明与冻结源不一致（${inspection.code}）`,
+          );
+        }
       } else {
         throw unresolvedCandidateError({
           filename: input.source.filename,
@@ -1099,6 +1291,7 @@ async function ensureOneMapping(input: {
         const mapping = mappingFromCandidate({
           attempt,
           detail: inspection.detail,
+          mimeEvidence: inspection.mimeEvidence,
         });
         await persistReadyMapping({ claim: input.claim, mapping });
         return mapping;
@@ -1121,8 +1314,14 @@ async function ensureOneMapping(input: {
           requestId: null,
         },
         code: inspection.code,
+        mimeEvidence: inspection.mimeEvidence,
       });
       await persistAttempt({ claim: input.claim, attempt });
+      if (inspection.state === "integrity_conflict") {
+        throw attachmentIntegrityError(
+          `FrontMind 附件“${input.source.filename}”的 Provider 身份证明与冻结源不一致（${inspection.code}）`,
+        );
+      }
     }
   }
   const providerGeneration = retryingPutSameCandidate
@@ -1131,8 +1330,24 @@ async function ensureOneMapping(input: {
       ? attempt!.providerGeneration
       : nextKnowledgeBaseManusV2FileCreateGeneration(attempt || null);
   if (providerGeneration === null) {
+    if (
+      attempt?.state === "unusable" &&
+      [
+        "KB_ATTACHMENT_IDENTITY_CONFLICT",
+        "KB_ATTACHMENT_BYTES_CONFLICT",
+      ].includes(String(attempt.code || ""))
+    ) {
+      throw attachmentIntegrityError(
+        `FrontMind 附件“${input.source.filename}”的 Provider 身份证明与冻结源不一致（${attempt.code}）`,
+      );
+    }
+    if (attempt?.state === "unusable") {
+      throw attachmentLifecycleExhaustedError(
+        `FrontMind 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
+      );
+    }
     throw localPreparationError(
-      `FrontMind 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
+      `FrontMind 附件“${input.source.filename}”没有可继续使用的 Provider 文件创建权限`,
     );
   }
   const creating = retryingPutSameCandidate
@@ -1170,6 +1385,7 @@ async function ensureOneMapping(input: {
       filename: input.source.filename,
       bytes: input.source.bytes,
       contentType: input.source.mimeType,
+      confirmationPolicy: "kb_frozen_source_advisory",
       minimumUsableSeconds: ENSURE_MINIMUM_USABLE_SECONDS,
       ...(retryingPutSameCandidate
         ? {
@@ -1320,11 +1536,16 @@ async function ensureOneMapping(input: {
       [
         "FILE_UNUSABLE",
         "FILE_EXPIRING",
+        "FILE_ID_CONFLICT",
         "FILE_IDENTITY_CONFLICT",
         "FILE_BYTES_CONFLICT",
-        "FILE_MIME_CONFLICT",
       ].includes(error.code)
     ) {
+      const integrityConflict = [
+        "FILE_ID_CONFLICT",
+        "FILE_IDENTITY_CONFLICT",
+        "FILE_BYTES_CONFLICT",
+      ].includes(error.code);
       const unusable = attachmentAttempt({
         ...input,
         providerGeneration,
@@ -1336,9 +1557,26 @@ async function ensureOneMapping(input: {
           uploadExpiresAt: currentAttempt.uploadExpiresAt!,
           requestId: null,
         },
-        code: `MANUS_V2_FILE_${error.code}`.slice(0, 128),
+        code: integrityConflict
+          ? error.code === "FILE_BYTES_CONFLICT"
+            ? "KB_ATTACHMENT_BYTES_CONFLICT"
+            : "KB_ATTACHMENT_IDENTITY_CONFLICT"
+          : "KB_ATTACHMENT_LIFECYCLE_UNUSABLE",
       });
       await persistAttempt({ claim: input.claim, attempt: unusable });
+      currentAttempt = unusable;
+      if (integrityConflict) {
+        throw attachmentIntegrityError(
+          `FrontMind 附件“${input.source.filename}”的 Provider 身份证明与冻结源不一致（${unusable.code}）`,
+          error,
+        );
+      }
+      if (providerGeneration >= 2) {
+        throw attachmentLifecycleExhaustedError(
+          `FrontMind 附件“${input.source.filename}”两次失效，当前构建已局部隔离`,
+          error,
+        );
+      }
     }
     if (currentAttempt.state === "unusable") {
       throw unresolvedCandidateError({
@@ -1365,6 +1603,11 @@ async function ensureOneMapping(input: {
     expiresAt: uploaded.detail.expiresAt,
     providerGeneration,
     verifiedAt: new Date().toISOString(),
+    mimeEvidence: providerMimeEvidence({
+      filename: input.source.filename,
+      expectedContentType: input.source.mimeType,
+      detail: uploaded.detail,
+    }),
   };
   await persistReadyMapping({ claim: input.claim, mapping });
   return mapping;
@@ -1498,12 +1741,45 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
         });
       }
       if (action === "isolate") {
-        throw localPreparationError(
+        throw attachmentLifecycleExhaustedError(
           `FrontMind 附件“${mapping.filename}”两次失效，当前构建已局部隔离`,
         );
       }
+      if (action === "reject") {
+        if (
+          inspection.state === "integrity_conflict" &&
+          durableAttempt?.state !== "unusable"
+        ) {
+          await persistAttempt({
+            claim,
+            attempt: attachmentAttempt({
+              claim,
+              attachmentIndex,
+              source,
+              providerGeneration: mapping.providerGeneration,
+              state: "unusable",
+              file: {
+                fileId: mapping.upstreamFileId,
+                filename: mapping.filename,
+                uploadUrl: "https://redacted.invalid/",
+                uploadExpiresAt: mapping.expiresAt,
+                requestId: null,
+              },
+              code: inspection.code,
+              mimeEvidence: inspection.mimeEvidence,
+            }),
+          });
+        }
+        throw attachmentIntegrityError(
+          `FrontMind 附件“${mapping.filename}”的 Provider 身份证明与冻结源不一致（${
+            inspection.state === "integrity_conflict"
+              ? inspection.code
+              : "KB_ATTACHMENT_IDENTITY_CONFLICT"
+          }）`,
+        );
+      }
       if (action === "replace") {
-        if (inspection.state !== "unusable") {
+        if (inspection.state !== "replaceable_unusable") {
           throw localPreparationError("FrontMind 附件最终复核状态无效");
         }
         if (durableAttempt?.state !== "unusable") {
@@ -1523,12 +1799,15 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
                 requestId: null,
               },
               code: inspection.code,
+              mimeEvidence: inspection.mimeEvidence,
             }),
           });
         }
         replacementCount += 1;
         if (replacementCount > sources.length) {
-          throw localPreparationError("FrontMind 附件最终复核超出有界替换次数");
+          throw attachmentLifecycleExhaustedError(
+            "FrontMind 附件最终复核超出有界替换次数",
+          );
         }
         mappings[attachmentIndex] = await ensureOneMapping({
           claim,
@@ -1546,6 +1825,7 @@ export async function ensureKnowledgeBaseManusV2Attachments(input: {
         ...mapping,
         expiresAt: inspection.detail.expiresAt,
         verifiedAt: new Date().toISOString(),
+        mimeEvidence: inspection.mimeEvidence,
       };
       await persistReadyMapping({ claim, mapping: refreshed });
       mappings[attachmentIndex] = refreshed;

@@ -144,6 +144,14 @@ function terminalProgress(updatedAt: number) {
       overallPercent: 0,
     },
     branches: [],
+    contentAvailability: "none",
+    operationState: "reset_required",
+    resetAllowed: true,
+    taskCreationState: "not_attempted",
+    failureStage: "provider_file_registration",
+    retainedCustomerAttachmentCount: 9,
+    generatedSystemAttachmentCount: 2,
+    settledAt: updatedAt,
     packageAllowed: false,
   };
 }
@@ -174,7 +182,7 @@ function terminalObservation(stateEpoch: number) {
       failureClass: "requires_user_fix",
       recoveryAction: "contact_support",
       canRegenerate: false,
-      attachmentCount: 7,
+      attachmentCount: 11,
       turnId: "turn-failed",
       createdAt: stateEpoch,
       providerMessage: "sk-secret provider raw filename.pdf",
@@ -853,7 +861,10 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
     expect(mocks.reconcileCalls).toBe(1);
     expect(
       screen.getByTestId("knowledge-base-attachment-retention"),
-    ).toHaveTextContent("7/7 个附件已保留，知识库任务未创建");
+    ).toHaveTextContent("9/9 个附件已保留，知识库任务未创建");
+    expect(document.body.textContent).not.toContain("11/11");
+    expect(document.body.textContent).not.toContain("本轮已停止");
+    expect(document.body.textContent).not.toContain("已完成内容不受影响");
     expect(
       screen.queryByTestId("knowledge-base-safe-diagnostic"),
     ).not.toBeInTheDocument();

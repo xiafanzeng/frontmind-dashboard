@@ -7,11 +7,13 @@ import {
   buildManusV2CreateTaskBody,
   buildManusV2KnowledgeBaseStructuredOutputSchema,
   buildManusV2MessageContent,
+  classifyManusV2ProviderFileMime,
   classifyManusV2StructuredResultEnvelope,
   latestManusV2WaitingDetail,
   latestManusV2TaskState,
   ManusV2ApiError,
   ManusV2Client,
+  isManusV2ProviderFileMimeUsable,
   manusV2EventsContainOperationToken,
   normalizeManusV2Output,
 } from "./manus-v2-client";
@@ -1070,9 +1072,28 @@ describe("ManusV2Client", () => {
   it.each([
     ["generated.zip", "application/zip"],
     ["instructions.txt", "text/plain"],
+    [
+      "presentation.pptx",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/zip",
+    ],
+    [
+      "brief.docx",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/zip",
+    ],
+    [
+      "workbook.xlsx",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/zip",
+    ],
   ])(
     "accepts provider generic binary MIME for a byte-exact %s",
-    async (filename, expectedContentType) => {
+    async (
+      filename,
+      expectedContentType,
+      providerContentType = "application/octet-stream",
+    ) => {
       const now = Math.floor(Date.now() / 1_000);
       const get = vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
         status: 200,
@@ -1083,7 +1104,7 @@ describe("ManusV2Client", () => {
             filename,
             status: "uploaded",
             bytes: 3,
-            content_type: "application/octet-stream",
+            content_type: providerContentType,
             expires_at: now + 48 * 3600,
           },
         },
@@ -1101,10 +1122,104 @@ describe("ManusV2Client", () => {
           expectedContentType,
           sleep: async () => undefined,
         }),
-      ).resolves.toMatchObject({ contentType: "application/octet-stream" });
+      ).resolves.toMatchObject({ contentType: providerContentType });
       expect(get).toHaveBeenCalledOnce();
     },
   );
+
+  it.each([
+    ["application/octet-stream", "generic"],
+    ["binary/octet-stream", "generic"],
+    ["text/html", "different"],
+    [null, "missing"],
+  ] as const)(
+    "treats KB frozen-source MIME %s as advisory (%s)",
+    async (providerContentType, disposition) => {
+      expect(
+        classifyManusV2ProviderFileMime({
+          filename: "facts.pdf",
+          expectedContentType: "application/pdf",
+          providerContentType,
+        }),
+      ).toBe(disposition);
+      expect(
+        isManusV2ProviderFileMimeUsable({
+          filename: "facts.pdf",
+          expectedContentType: "application/pdf",
+          providerContentType,
+          confirmationPolicy: "kb_frozen_source_advisory",
+        }),
+      ).toBe(true);
+
+      const now = Math.floor(Date.now() / 1_000);
+      vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+        status: 200,
+        data: {
+          ok: true,
+          file: {
+            id: "file-kb-advisory",
+            filename: "facts.pdf",
+            status: "uploaded",
+            bytes: 3,
+            content_type: providerContentType,
+            expires_at: now + 48 * 3600,
+          },
+        },
+      });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+      await expect(
+        client.waitForExactProviderFile({
+          fileId: "file-kb-advisory",
+          filename: "facts.pdf",
+          expectedBytes: 3,
+          expectedContentType: "application/pdf",
+          confirmationPolicy: "kb_frozen_source_advisory",
+          sleep: async () => undefined,
+        }),
+      ).resolves.toMatchObject({ status: "uploaded" });
+    },
+  );
+
+  it("keeps malformed provider content_type diagnostic instead of rejecting file.detail", async () => {
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-malformed-mime",
+          filename: "facts.pdf",
+          status: "uploaded",
+          bytes: 3,
+          content_type: { unexpected: true },
+          expires_at: 2_000_000_000,
+        },
+      },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.fileDetail("file-malformed-mime"),
+    ).resolves.toMatchObject({
+      contentType: null,
+      contentTypeParseStatus: "invalid",
+    });
+    await expect(
+      client.waitForExactProviderFile({
+        fileId: "file-malformed-mime",
+        filename: "facts.pdf",
+        expectedBytes: 3,
+        expectedContentType: "application/pdf",
+        confirmationPolicy: "kb_frozen_source_advisory",
+        sleep: async () => undefined,
+      }),
+    ).resolves.toMatchObject({ status: "uploaded" });
+  });
 
   it.each([
     [

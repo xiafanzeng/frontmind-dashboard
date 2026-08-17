@@ -281,6 +281,63 @@ describe("knowledge-base reply snapshots", () => {
     expect(next.previousResponseId).toBeUndefined();
   });
 
+  it("commits the server-owned pre-create business projection without inferring from the notice", () => {
+    const progress = {
+      build: { id: "build-precreate", revision: 0, currentLeafId: null },
+      contentAvailability: "none",
+      operationState: "reset_required",
+      resetAllowed: true,
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: 1_787_000_000_000,
+    } as any;
+    const next = applyKnowledgeBaseObservation(
+      conversation("precreate-failure"),
+      {
+        generation: 1,
+        stateEpoch: 2,
+        authoritativeTaskId: null,
+        activeTurn: null,
+        completedTurn: null,
+        approvedPresentation: null,
+        progress,
+        notice: {
+          key: "safe-notice",
+          code: "RESET_REQUIRED",
+          severity: "warning",
+          message: "请申请重置",
+          retryable: false,
+          recoveryAction: "approve_reset",
+          attachmentCount: 11,
+          turnId: "turn-precreate",
+          createdAt: 1,
+        },
+        interaction: {
+          interactionState: "failed",
+          canReply: false,
+          canPublish: false,
+          lockReason: "RESET_REQUIRED",
+          progress,
+        },
+      } as any,
+    );
+
+    expect(next.knowledgeBase).toMatchObject({
+      contentAvailability: "none",
+      operationState: "reset_required",
+      resetAllowed: true,
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: 1_787_000_000_000,
+    });
+    expect(next.knowledgeBase?.notice?.severity).toBe("warning");
+    expect(next.knowledgeBase?.notice?.attachmentCount).toBe(11);
+  });
+
   it("applies an equivalent observation to repair optimistic running state", () => {
     const progress = {
       build: {

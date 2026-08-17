@@ -305,6 +305,40 @@ describe("knowledge-base customer public projection", () => {
     expect(payload.notice.message).not.toContain("分析任务尚未创建");
   });
 
+  it("preserves the server-owned pre-create reset copy and customer-only attachment count", () => {
+    const payload = toKnowledgeBasePublicPayload({
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: 1_755_446_677_000,
+      notice: {
+        key: "private-pre-create-reset",
+        code: "FRONTMIND_KB_RESET_REQUIRED",
+        message:
+          "知识库任务未创建。9/9 份客户资料已保留，但云端附件登记未完成。请批准重置后重新上传资料。",
+        attachmentCount: 9,
+        recoveryAction: "approve_reset",
+        retryable: false,
+        createdAt: 1_755_446_677_000,
+      },
+    });
+
+    expect(payload).toMatchObject({
+      taskCreationState: "not_attempted",
+      failureStage: "provider_file_registration",
+      retainedCustomerAttachmentCount: 9,
+      generatedSystemAttachmentCount: 2,
+      settledAt: 1_755_446_677_000,
+      notice: {
+        code: "FRONTMIND_KB_RESET_REQUIRED",
+        message:
+          "知识库任务未创建。9/9 份客户资料已保留，但云端附件登记未完成。请批准重置后重新上传资料。",
+        attachmentCount: 9,
+      },
+    });
+  });
+
   it("drops customer support coordinates recursively at the root and every nested level", () => {
     const payload = toKnowledgeBasePublicPayload({
       traceId: "root-trace",

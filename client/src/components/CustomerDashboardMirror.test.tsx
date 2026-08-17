@@ -299,6 +299,91 @@ describe("CustomerDashboardMirror", () => {
     expect(screen.getByText("知识库构建进度用户页")).toBeInTheDocument();
   });
 
+  it("uses the business projection for a pre-create failure in the dashboard mirror", () => {
+    render(
+      <CustomerDashboardMirror
+        payload={payload}
+        initialSection="knowledge-build"
+        knowledgePreview={{
+          progress: {
+            operationState: "reset_required",
+            contentAvailability: "none",
+            taskCreationState: "not_attempted",
+            failureStage: "provider_file_registration",
+            retainedCustomerAttachmentCount: 9,
+            generatedSystemAttachmentCount: 2,
+          } as any,
+          activity: {
+            build: {
+              companyName: "示例品牌",
+              conversationId: "conversation-precreate",
+              status: "protocol_error",
+              protocolError: "provider raw failure",
+            },
+            turns: [
+              {
+                id: "turn-precreate",
+                status: "failed",
+                errorMessage: "provider raw failure",
+              },
+            ],
+            messages: [],
+          },
+        }}
+      />,
+    );
+
+    expect(
+      screen.getAllByText(
+        "9/9 个附件已保留，知识库任务未创建。请申请重置后重新上传资料。",
+      ),
+    ).toHaveLength(1);
+    expect(screen.queryByText(/本轮已停止/)).toBeNull();
+    expect(screen.queryByText(/已完成内容不受影响/)).toBeNull();
+    expect(screen.queryByText(/provider raw failure/)).toBeNull();
+    expect(screen.queryByText(/11\/11/)).toBeNull();
+  });
+
+  it("uses explicit activity business fields when progress is temporarily unavailable", () => {
+    render(
+      <CustomerDashboardMirror
+        payload={payload}
+        initialSection="knowledge-build"
+        knowledgePreview={{
+          activity: {
+            build: {
+              companyName: "示例品牌",
+              conversationId: "conversation-precreate-activity",
+              status: "protocol_error",
+              protocolError: "provider raw failure",
+              operationState: "reset_required",
+              taskCreationState: "not_attempted",
+              failureStage: "provider_file_registration",
+              retainedCustomerAttachmentCount: 9,
+              generatedSystemAttachmentCount: 2,
+            },
+            turns: [
+              {
+                id: "turn-precreate-activity",
+                status: "failed",
+                errorMessage: "provider raw failure",
+              },
+            ],
+            messages: [],
+          },
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "9/9 个附件已保留，知识库任务未创建。请申请重置后重新上传资料。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/本轮已停止/)).toBeNull();
+    expect(screen.queryByText(/provider raw failure/)).toBeNull();
+  });
+
   it("renders the complete customer dashboard shell for administrators", () => {
     render(
       <CustomerDashboardMirror

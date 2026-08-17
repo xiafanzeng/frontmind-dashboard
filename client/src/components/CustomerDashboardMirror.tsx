@@ -273,6 +273,13 @@ export type CustomerKnowledgeActivity = {
     conversationId: string;
     status: string;
     protocolError?: string | null;
+    operationState?: KnowledgeBaseProgressDto["operationState"];
+    resetAllowed?: boolean;
+    taskCreationState?: KnowledgeBaseProgressDto["taskCreationState"];
+    failureStage?: KnowledgeBaseProgressDto["failureStage"];
+    retainedCustomerAttachmentCount?: number;
+    generatedSystemAttachmentCount?: number;
+    settledAt?: number | null;
   } | null;
   turns: Array<{
     id: string | number;
@@ -657,6 +664,7 @@ function CustomerDashboardSection({
       <section className="page-shell space-y-5">
         <KnowledgeActivityPanel
           activity={knowledgePreview.activity}
+          progress={knowledgePreview.progress}
           loading={knowledgePreview.activityLoading}
           error={knowledgePreview.activityError}
         />
@@ -797,10 +805,12 @@ function CustomerDashboardSection({
 
 function KnowledgeActivityPanel({
   activity,
+  progress,
   loading,
   error,
 }: {
   activity?: CustomerKnowledgeActivity | null;
+  progress?: KnowledgeBaseProgressDto | null;
   loading?: boolean;
   error?: string | null;
 }) {
@@ -827,6 +837,36 @@ function KnowledgeActivityPanel({
     );
   }
 
+  const operationState =
+    progress?.operationState ?? activity.build.operationState;
+  const taskCreationState =
+    progress?.taskCreationState ?? activity.build.taskCreationState;
+  const failureStage = progress?.failureStage ?? activity.build.failureStage;
+  const taskWasNotCreated =
+    taskCreationState === "not_attempted" &&
+    (failureStage === "local_upload" ||
+      failureStage === "provider_file_registration");
+  const hasDisplayableContent =
+    progress?.contentAvailability === "partial" ||
+    progress?.contentAvailability === "complete";
+  const retainedCustomerAttachmentCountCandidate =
+    progress?.retainedCustomerAttachmentCount ??
+    activity.build.retainedCustomerAttachmentCount;
+  const retainedCustomerAttachmentCount =
+    typeof retainedCustomerAttachmentCountCandidate === "number" &&
+    Number.isSafeInteger(retainedCustomerAttachmentCountCandidate)
+      ? Math.max(0, retainedCustomerAttachmentCountCandidate)
+      : 0;
+  const materializedFailureMessage = taskWasNotCreated
+    ? `${
+        retainedCustomerAttachmentCount > 0
+          ? `${retainedCustomerAttachmentCount}/${retainedCustomerAttachmentCount} 个附件已保留，`
+          : ""
+      }知识库任务未创建。请申请重置后重新上传资料。`
+    : hasDisplayableContent
+      ? "本轮需要重置，已完成内容不受影响。"
+      : "本轮需要重置，请申请重置后重新上传资料。";
+
   return (
     <div className="overflow-hidden rounded-2xl border border-[#e5ddea] bg-white">
       <div className="border-b border-[#eee8f2] p-5 sm:p-6">
@@ -846,9 +886,12 @@ function KnowledgeActivityPanel({
             {sanitizeBrandText(activity.build.status)}
           </span>
         </div>
-        {activity.build.protocolError && (
+        {(operationState === "reset_required" ||
+          (operationState === undefined && activity.build.protocolError)) && (
           <div className="mt-4 rounded-xl border border-[#ebc8d4] bg-[#fff8fa] p-3 text-sm leading-6 text-[#a02652]">
-            本轮已停止，不会自动重发。已完成内容不受影响。
+            {operationState !== undefined
+              ? materializedFailureMessage
+              : "本轮已停止，不会自动重发。已完成内容不受影响。"}
           </div>
         )}
       </div>
@@ -873,7 +916,7 @@ function KnowledgeActivityPanel({
                   <p className="mt-2 text-xs text-[#857e91]">
                     {displayDuration(turn.durationMs)}
                   </p>
-                  {turn.errorMessage && (
+                  {turn.errorMessage && operationState === undefined && (
                     <p className="mt-2 text-xs leading-5 text-[#a02652]">
                       本轮已停止。已完成内容不受影响。
                     </p>

@@ -264,6 +264,52 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
       )
     : undefined;
   const resetAllowedCandidate = source.resetAllowed ?? progress?.resetAllowed;
+  const taskCreationStateCandidate =
+    source.taskCreationState ?? progress?.taskCreationState;
+  const taskCreationState = [
+    "not_attempted",
+    "submitting",
+    "acknowledged",
+    "rejected",
+    "outcome_unknown",
+  ].includes(taskCreationStateCandidate)
+    ? taskCreationStateCandidate
+    : undefined;
+  const failureStageCandidate = source.failureStage ?? progress?.failureStage;
+  const failureStage = [
+    "local_upload",
+    "provider_file_registration",
+    "task_create",
+    "result_processing",
+  ].includes(failureStageCandidate)
+    ? failureStageCandidate
+    : failureStageCandidate === null
+      ? null
+      : undefined;
+  const readSafeCount = (value: unknown) => {
+    const candidate = Number(value);
+    return Number.isSafeInteger(candidate) &&
+      candidate >= 0 &&
+      candidate <= 1_000
+      ? candidate
+      : undefined;
+  };
+  const retainedCustomerAttachmentCount = readSafeCount(
+    source.retainedCustomerAttachmentCount ??
+      progress?.retainedCustomerAttachmentCount,
+  );
+  const generatedSystemAttachmentCount = readSafeCount(
+    source.generatedSystemAttachmentCount ??
+      progress?.generatedSystemAttachmentCount,
+  );
+  const settledAtCandidate = source.settledAt ?? progress?.settledAt;
+  const settledAt =
+    settledAtCandidate === null ||
+    (typeof settledAtCandidate === "number" &&
+      Number.isSafeInteger(settledAtCandidate) &&
+      settledAtCandidate >= 0)
+      ? settledAtCandidate
+      : undefined;
   return {
     stateEpoch: Number(source.stateEpoch ?? 0),
     generation: Number(source.generation ?? 0),
@@ -280,6 +326,15 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
       ? { resetAllowed: resetAllowedCandidate }
       : {}),
     ...(warningCodes ? { warningCodes } : {}),
+    ...(taskCreationState ? { taskCreationState } : {}),
+    ...(failureStage !== undefined ? { failureStage } : {}),
+    ...(retainedCustomerAttachmentCount !== undefined
+      ? { retainedCustomerAttachmentCount }
+      : {}),
+    ...(generatedSystemAttachmentCount !== undefined
+      ? { generatedSystemAttachmentCount }
+      : {}),
+    ...(settledAt !== undefined ? { settledAt } : {}),
     authoritativeTaskId,
     activeTurn: source.activeTurn ?? null,
     completedTurn: source.completedTurn ?? null,

@@ -1824,6 +1824,70 @@ const KNOWLEDGE_BASE_RESULT_PROCESSING_STAGES = new Set([
   "presentation",
 ]);
 
+const KNOWLEDGE_BASE_FAILURE_STAGES = new Set([
+  "local_upload",
+  "provider_file_registration",
+  "task_create",
+  "result_processing",
+]);
+
+type KnowledgeBaseLifecycleTurn = Pick<
+  typeof conversationTurns.$inferSelect,
+  "metadata" | "upstreamTaskId" | "completedAt"
+>;
+
+function knowledgeBaseTaskLifecycleFields(
+  turn: KnowledgeBaseLifecycleTurn | null | undefined,
+) {
+  if (!turn) return {};
+  const metadata = isRecord(turn?.metadata) ? turn.metadata : {};
+  const storedCreateAttemptState = metadata.createAttemptState;
+  const taskCreationState =
+    storedCreateAttemptState === "not_sent"
+      ? ("not_attempted" as const)
+      : storedCreateAttemptState === "sending"
+        ? ("submitting" as const)
+        : storedCreateAttemptState === "acknowledged" || turn?.upstreamTaskId
+          ? ("acknowledged" as const)
+          : storedCreateAttemptState === "rejected"
+            ? ("rejected" as const)
+            : storedCreateAttemptState === "unknown"
+              ? ("outcome_unknown" as const)
+              : undefined;
+  const failureStage =
+    typeof metadata.failureStage === "string" &&
+    KNOWLEDGE_BASE_FAILURE_STAGES.has(metadata.failureStage)
+      ? (metadata.failureStage as NonNullable<
+          KnowledgeBaseProgressDto["failureStage"]
+        >)
+      : null;
+  const rawCustomerCount = Number(metadata.userAttachmentCount);
+  const retainedCustomerAttachmentCount =
+    Number.isSafeInteger(rawCustomerCount) && rawCustomerCount >= 0
+      ? rawCustomerCount
+      : 0;
+  const rawExpectedCount = Number(metadata.expectedAttachmentCount);
+  const expectedCount =
+    Number.isSafeInteger(rawExpectedCount) &&
+    rawExpectedCount >= retainedCustomerAttachmentCount
+      ? rawExpectedCount
+      : retainedCustomerAttachmentCount;
+  const reservations = isRecord(metadata.generatedAttachmentReservations)
+    ? Object.keys(metadata.generatedAttachmentReservations).length
+    : 0;
+  const generatedSystemAttachmentCount = Math.max(
+    reservations,
+    expectedCount - retainedCustomerAttachmentCount,
+  );
+  return {
+    ...(taskCreationState ? { taskCreationState } : {}),
+    failureStage,
+    retainedCustomerAttachmentCount,
+    generatedSystemAttachmentCount,
+    settledAt: turn?.completedAt?.getTime() ?? null,
+  };
+}
+
 /**
  * Overlay the build-only projection with the exact active-turn ledger. The
  * public state deliberately consumes no Provider status: task acknowledgement,
@@ -1834,14 +1898,19 @@ export function knowledgeBaseMaterializedBusinessProjection(input: {
   progress: KnowledgeBaseProgressDto;
   activeTurn?: Pick<
     typeof conversationTurns.$inferSelect,
-    "metadata" | "upstreamTaskId"
+    "metadata" | "upstreamTaskId" | "completedAt"
   > | null;
+  /** Latest terminal turn is DTO-only history; it never grants recovery. */
+  lifecycleTurn?: KnowledgeBaseLifecycleTurn | null;
 }) {
   const { progress, activeTurn } = input;
   if (progress.operationState === undefined) {
     return progress;
   }
-  const metadata = isRecord(activeTurn?.metadata) ? activeTurn.metadata : {};
+  const lifecycleTurn = activeTurn ?? input.lifecycleTurn ?? null;
+  const metadata = isRecord(lifecycleTurn?.metadata)
+    ? lifecycleTurn.metadata
+    : {};
   const createAttemptState = metadata.createAttemptState;
   const providerAttemptState = metadata.providerAttemptState;
   const resetRequired =
@@ -1887,6 +1956,7 @@ export function knowledgeBaseMaterializedBusinessProjection(input: {
     operationState,
     resetAllowed,
     warningCodes,
+    ...knowledgeBaseTaskLifecycleFields(lifecycleTurn),
   };
 }
 
@@ -2181,30 +2251,56 @@ export async function getKnowledgeBaseProgress(input: {
   const progress = buildDto(build, await loadNodes(db, build.id));
   if (
     build.executionMode !== "materialized_bundle_v1" ||
-    build.skillVersion !== "5" ||
-    !build.activeTurnId ||
-    progress.operationState === "reset_required"
+    build.skillVersion !== "5"
   ) {
     return progress;
   }
-  const activeRows = await db
-    .select({
-      upstreamTaskId: conversationTurns.upstreamTaskId,
-      metadata: conversationTurns.metadata,
-    })
-    .from(conversationTurns)
-    .where(
-      and(
-        eq(conversationTurns.id, build.activeTurnId),
-        eq(conversationTurns.userId, input.userId),
-        eq(conversationTurns.buildId, build.id),
-        eq(conversationTurns.buildGeneration, build.generation),
-      ),
-    )
-    .limit(1);
+  const activeRows = build.activeTurnId
+    ? await db
+        .select({
+          upstreamTaskId: conversationTurns.upstreamTaskId,
+          metadata: conversationTurns.metadata,
+          completedAt: conversationTurns.completedAt,
+        })
+        .from(conversationTurns)
+        .where(
+          and(
+            eq(conversationTurns.id, build.activeTurnId),
+            eq(conversationTurns.userId, input.userId),
+            eq(conversationTurns.buildId, build.id),
+            eq(conversationTurns.buildGeneration, build.generation),
+          ),
+        )
+        .limit(1)
+    : [];
+  const terminalRows =
+    !build.activeTurnId && progress.operationState === "reset_required"
+      ? await db
+          .select({
+            upstreamTaskId: conversationTurns.upstreamTaskId,
+            metadata: conversationTurns.metadata,
+            completedAt: conversationTurns.completedAt,
+          })
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.userId, input.userId),
+              eq(conversationTurns.buildId, build.id),
+              eq(conversationTurns.buildGeneration, build.generation),
+              eq(conversationTurns.status, "failed"),
+            ),
+          )
+          .orderBy(
+            desc(conversationTurns.completedAt),
+            desc(conversationTurns.updatedAt),
+            desc(conversationTurns.id),
+          )
+          .limit(1)
+      : [];
   return knowledgeBaseMaterializedBusinessProjection({
     progress,
     activeTurn: activeRows[0] || null,
+    lifecycleTurn: activeRows[0] || terminalRows[0] || null,
   });
 }
 
@@ -2439,12 +2535,40 @@ async function readKnowledgeBaseObservationProjection(
         );
     }
   }
+  const terminalFailedTurnRow =
+    !build.activeTurnId &&
+    build.executionMode === "materialized_bundle_v1" &&
+    build.skillVersion === "5" &&
+    (build.status === "protocol_error" || build.status === "failed")
+      ? await db
+          .select()
+          .from(conversationTurns)
+          .where(
+            and(
+              eq(conversationTurns.userId, input.userId),
+              eq(conversationTurns.buildId, build.id),
+              eq(conversationTurns.buildGeneration, build.generation),
+              eq(conversationTurns.status, "failed"),
+            ),
+          )
+          .orderBy(
+            desc(conversationTurns.completedAt),
+            desc(conversationTurns.updatedAt),
+            desc(conversationTurns.id),
+          )
+          .limit(1)
+          .then(
+            (values: Array<typeof conversationTurns.$inferSelect>) =>
+              values[0] || null,
+          )
+      : null;
   const relevantTurnIds = [
     ...new Set(
       [
         build.activeTurnId,
         currentRow?.sourceTurnId,
         terminalCompletedTurnRow?.id,
+        terminalFailedTurnRow?.id,
       ].filter((turnId): turnId is string => Boolean(turnId)),
     ),
   ];
@@ -2666,6 +2790,7 @@ async function readKnowledgeBaseObservationProjection(
     activeTurnRow,
     presentationTurnRow,
     terminalCompletedTurnRow,
+    terminalFailedTurnRow,
     customerUploadResources,
     materializedResources,
     conversationRow,
@@ -2788,6 +2913,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     typeof conversationTurns.$inferSelect,
     "id" | "clientRequestId" | "status"
   > | null;
+  terminalFailedTurnRow: Pick<
+    typeof conversationTurns.$inferSelect,
+    "id" | "metadata" | "upstreamTaskId" | "completedAt" | "updatedAt"
+  > | null;
   customerUploadResources: KnowledgeBaseApprovedPresentationDto["resources"];
   materializedResources: KnowledgeBaseApprovedPresentationDto["resources"];
   conversationRow: { version: number } | null;
@@ -2806,6 +2935,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     activeTurnRow,
     presentationTurnRow,
     terminalCompletedTurnRow,
+    terminalFailedTurnRow,
     customerUploadResources,
     materializedResources,
     conversationRow,
@@ -2832,6 +2962,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   const businessProgress = knowledgeBaseMaterializedBusinessProjection({
     progress,
     activeTurn: activeTurnRow,
+    lifecycleTurn: activeTurnRow || terminalFailedTurnRow,
   });
   const stagedClientAttachments = Array.isArray(
     activeTurnMetadata.clientStagedAttachments,
@@ -3184,9 +3315,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       ? activeTraceId
       : null;
   const activeAttachmentCount =
-    typeof activeTurnMetadata.expectedAttachmentCount === "number"
-      ? activeTurnMetadata.expectedAttachmentCount
-      : 0;
+    businessProgress.retainedCustomerAttachmentCount ??
+    (typeof activeTurnMetadata.userAttachmentCount === "number"
+      ? activeTurnMetadata.userAttachmentCount
+      : 0);
   if (knowledgeBaseBuildRequiresApprovedReset(build)) {
     notice = {
       key: `${build.id}:${build.generation}:reset-required`,
@@ -3204,17 +3336,29 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   } else if (materializedResultFailureNotice) {
     notice = materializedResultFailureNotice;
   } else if (businessProgress.operationState === "reset_required") {
+    const preCreateFailure =
+      businessProgress.taskCreationState === "not_attempted" &&
+      (businessProgress.failureStage === "local_upload" ||
+        businessProgress.failureStage === "provider_file_registration");
+    const retainedCount = businessProgress.retainedCustomerAttachmentCount ?? 0;
+    const stageMessage =
+      businessProgress.failureStage === "local_upload"
+        ? "本地资料校验未完成"
+        : "云端附件登记未完成";
     notice = {
       key: `${build.id}:${build.generation}:${build.stateEpoch}:reset-required`,
       code: "FRONTMIND_KB_RESET_REQUIRED",
       severity: "warning",
-      message: KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+      message: preCreateFailure
+        ? `知识库任务未创建。${retainedCount}/${retainedCount} 份客户资料已保留，但${stageMessage}。请批准重置后重新上传资料。`
+        : KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
       retryable: false,
       failureClass: "requires_user_fix",
       recoveryAction: "approve_reset",
       canRegenerate: false,
+      ...(preCreateFailure ? { attachmentCount: retainedCount } : {}),
       turnId: null,
-      createdAt: build.updatedAt.getTime(),
+      createdAt: businessProgress.settledAt ?? build.updatedAt.getTime(),
     };
   } else if (explicitRecovery) {
     const stopped = explicitRecovery.action === "stopped";
@@ -3433,6 +3577,27 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       : {}),
     ...(businessProgress.warningCodes
       ? { warningCodes: businessProgress.warningCodes }
+      : {}),
+    ...(businessProgress.taskCreationState
+      ? { taskCreationState: businessProgress.taskCreationState }
+      : {}),
+    ...(businessProgress.failureStage !== undefined
+      ? { failureStage: businessProgress.failureStage }
+      : {}),
+    ...(typeof businessProgress.retainedCustomerAttachmentCount === "number"
+      ? {
+          retainedCustomerAttachmentCount:
+            businessProgress.retainedCustomerAttachmentCount,
+        }
+      : {}),
+    ...(typeof businessProgress.generatedSystemAttachmentCount === "number"
+      ? {
+          generatedSystemAttachmentCount:
+            businessProgress.generatedSystemAttachmentCount,
+        }
+      : {}),
+    ...(businessProgress.settledAt !== undefined
+      ? { settledAt: businessProgress.settledAt }
       : {}),
     processingPhase:
       businessProgress.operationState === "normalizing"

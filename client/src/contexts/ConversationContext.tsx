@@ -21,13 +21,17 @@ import {
 import { normalizeKnowledgeCollectionCopy } from "@shared/knowledge-base-copy";
 import type {
   KnowledgeBaseApprovedResourceDto,
+  KnowledgeBaseContentAvailability,
   KnowledgeBaseContentState,
   KnowledgeBaseFailureClass,
+  KnowledgeBaseFailureStage,
+  KnowledgeBaseOperationState,
   KnowledgeBasePackageState,
   KnowledgeBaseProcessingPhase,
   KnowledgeBasePublicationState,
   KnowledgeBaseRecoveryAction,
   KnowledgeBaseSyncState,
+  KnowledgeBaseTaskCreationState,
 } from "@shared/knowledge-base-progress";
 import {
   customerSafeKnowledgeAssetLabel,
@@ -170,6 +174,14 @@ export interface KnowledgeBaseClientState {
   contentState?: KnowledgeBaseContentState;
   packageState?: KnowledgeBasePackageState;
   publicationState?: KnowledgeBasePublicationState;
+  contentAvailability?: KnowledgeBaseContentAvailability;
+  operationState?: KnowledgeBaseOperationState;
+  resetAllowed?: boolean;
+  taskCreationState?: KnowledgeBaseTaskCreationState;
+  failureStage?: KnowledgeBaseFailureStage | null;
+  retainedCustomerAttachmentCount?: number;
+  generatedSystemAttachmentCount?: number;
+  settledAt?: number | null;
   activeTurnId: string | null;
   activeClientRequestId: string | null;
   /** Same-turn freshness fence; never compares unrelated turn clocks. */
@@ -713,6 +725,8 @@ function emptyKnowledgeBaseClientState(): KnowledgeBaseClientState {
     contentState: "building",
     packageState: "not_started",
     publicationState: "draft",
+    contentAvailability: "none",
+    resetAllowed: false,
     activeTurnId: null,
     activeClientRequestId: null,
     activeTurnUpdatedAt: undefined,
@@ -1293,6 +1307,29 @@ export function applyKnowledgeBaseObservation(
       contentState: observation.contentState,
       packageState: observation.packageState,
       publicationState: observation.publicationState,
+      contentAvailability:
+        observation.contentAvailability ??
+        observation.interaction.progress?.contentAvailability,
+      operationState:
+        observation.operationState ??
+        observation.interaction.progress?.operationState,
+      resetAllowed:
+        observation.resetAllowed ??
+        observation.interaction.progress?.resetAllowed,
+      taskCreationState:
+        observation.taskCreationState ??
+        observation.interaction.progress?.taskCreationState,
+      failureStage:
+        observation.failureStage ??
+        observation.interaction.progress?.failureStage,
+      retainedCustomerAttachmentCount:
+        observation.retainedCustomerAttachmentCount ??
+        observation.interaction.progress?.retainedCustomerAttachmentCount,
+      generatedSystemAttachmentCount:
+        observation.generatedSystemAttachmentCount ??
+        observation.interaction.progress?.generatedSystemAttachmentCount,
+      settledAt:
+        observation.settledAt ?? observation.interaction.progress?.settledAt,
       activeTurnId,
       activeClientRequestId,
       activeTurnUpdatedAt: observation.activeTurn?.updatedAt,

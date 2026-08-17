@@ -133,6 +133,7 @@ import {
   claimKnowledgeBaseTurnForRecovery,
   completeKnowledgeBaseGeneratedAttachment,
   settleKnowledgeBaseManusV2ExplicitRejection,
+  settleKnowledgeBasePreCreateFailureForApprovedReset,
   deferKnowledgeBaseTurnBeforeCreate,
   ensureKnowledgeBaseBuildSkillArchivePin,
   failKnowledgeBaseMaterializedResultForApprovedReset,
@@ -5787,6 +5788,7 @@ export async function persistKnowledgeBaseCreateFailure(
     failDeterministically?: typeof failKnowledgeBaseTurnDeterministically;
     markOutcomeUnknown?: typeof markKnowledgeBaseTurnOutcomeUnknown;
     deferBeforeCreate?: typeof deferKnowledgeBaseTurnBeforeCreate;
+    settlePreCreateFailure?: typeof settleKnowledgeBasePreCreateFailureForApprovedReset;
   } = {},
 ) {
   const cancelUnprepared =
@@ -5798,6 +5800,9 @@ export async function persistKnowledgeBaseCreateFailure(
     dependencies.markOutcomeUnknown ?? markKnowledgeBaseTurnOutcomeUnknown;
   const deferBeforeCreate =
     dependencies.deferBeforeCreate ?? deferKnowledgeBaseTurnBeforeCreate;
+  const settlePreCreateFailure =
+    dependencies.settlePreCreateFailure ??
+    settleKnowledgeBasePreCreateFailureForApprovedReset;
   if (input.error instanceof KnowledgeBaseAttachmentsProcessingError) {
     await deferBeforeCreate({
       userId: input.userId,
@@ -5813,24 +5818,15 @@ export async function persistKnowledgeBaseCreateFailure(
     input.error instanceof KnowledgeBaseTurnReservationError &&
     input.error.code === "RESET_REQUIRED"
   ) {
-    await failDeterministically({
+    const settled = await settlePreCreateFailure({
       userId: input.userId,
       turnId: input.turnId,
       leaseToken: input.leaseToken,
       code: input.error.code,
       message: input.error.message,
-      failureClass: "requires_user_fix",
-      recoveryAction: "approve_reset",
-      canRegenerate: false,
+      failureStage: "provider_file_registration",
     });
-    return "deterministic" as const;
-  }
-  if (input.error instanceof KnowledgeBaseLocalPreparationError) {
-    if (
-      input.error.code ===
-        KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT ||
-      input.error.code === "RESET_REQUIRED"
-    ) {
+    if (settled === null) {
       await failDeterministically({
         userId: input.userId,
         turnId: input.turnId,
@@ -5841,6 +5837,56 @@ export async function persistKnowledgeBaseCreateFailure(
         recoveryAction: "approve_reset",
         canRegenerate: false,
       });
+    }
+    return "deterministic" as const;
+  }
+  if (input.error instanceof KnowledgeBaseLocalPreparationError) {
+    if (
+      input.error.code === KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT
+    ) {
+      const settled = await settlePreCreateFailure({
+        userId: input.userId,
+        turnId: input.turnId,
+        leaseToken: input.leaseToken,
+        code: input.error.code,
+        message: input.error.message,
+        failureStage: "provider_file_registration",
+      });
+      if (settled === null) {
+        await failDeterministically({
+          userId: input.userId,
+          turnId: input.turnId,
+          leaseToken: input.leaseToken,
+          code: input.error.code,
+          message: input.error.message,
+          failureClass: "requires_user_fix",
+          recoveryAction: "approve_reset",
+          canRegenerate: false,
+        });
+      }
+      return "deterministic" as const;
+    }
+    if (input.error.code === "RESET_REQUIRED") {
+      const settled = await settlePreCreateFailure({
+        userId: input.userId,
+        turnId: input.turnId,
+        leaseToken: input.leaseToken,
+        code: input.error.code,
+        message: input.error.message,
+        failureStage: "provider_file_registration",
+      });
+      if (settled === null) {
+        await failDeterministically({
+          userId: input.userId,
+          turnId: input.turnId,
+          leaseToken: input.leaseToken,
+          code: input.error.code,
+          message: input.error.message,
+          failureClass: "requires_user_fix",
+          recoveryAction: "approve_reset",
+          canRegenerate: false,
+        });
+      }
       return "deterministic" as const;
     }
     if (isKnowledgeBaseManusV2GeneratedFileCreateRejected(input.error)) {
@@ -5870,27 +5916,37 @@ export async function persistKnowledgeBaseCreateFailure(
         message: `${input.error.message}。未向上游创建任务，请重新上传 Logo 原图`,
       });
     } else {
-      const attachmentRepair = /(?:CLIENT|USER)_ATTACHMENT/u.test(
-        input.error.code,
-      );
-      // All other local preparation failures retain the exact logical turn
-      // and its recovery receipt. User-attachment failures enter the dedicated
-      // replacement path; server-generated finalization failures remain a
-      // non-regenerating support incident instead of inviting duplicate POSTs.
-      await failDeterministically({
+      // A fresh materialized-v5 operation has not crossed task.create. Retire
+      // it atomically and expose the one supported recovery: approved reset,
+      // fresh upload and a fresh task. This also clears activeTurnId so the
+      // page cannot mislabel a local/provider-file failure as task stopped.
+      const settled = await settlePreCreateFailure({
         userId: input.userId,
         turnId: input.turnId,
         leaseToken: input.leaseToken,
         code: input.error.code,
-        message: `${input.error.message}。未向上游创建任务`,
-        failureClass: attachmentRepair
-          ? "requires_user_fix"
-          : "terminal_nonregenerable",
-        recoveryAction: attachmentRepair
-          ? "fix_attachments"
-          : "contact_support",
-        canRegenerate: false,
+        message: input.error.message,
+        failureStage: "provider_file_registration",
       });
+      if (settled === null) {
+        const attachmentRepair = /(?:CLIENT|USER)_ATTACHMENT/u.test(
+          input.error.code,
+        );
+        await failDeterministically({
+          userId: input.userId,
+          turnId: input.turnId,
+          leaseToken: input.leaseToken,
+          code: input.error.code,
+          message: `${input.error.message}。未向上游创建任务`,
+          failureClass: attachmentRepair
+            ? "requires_user_fix"
+            : "terminal_nonregenerable",
+          recoveryAction: attachmentRepair
+            ? "fix_attachments"
+            : "contact_support",
+          canRegenerate: false,
+        });
+      }
     }
     return "deterministic" as const;
   }
@@ -8701,7 +8757,6 @@ router.post("/retry", (_req, res) => {
     },
   });
 });
-
 
 router.get("/progress/:conversationId", async (req, res) => {
   try {

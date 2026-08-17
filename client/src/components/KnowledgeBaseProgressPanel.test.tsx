@@ -215,6 +215,42 @@ describe("KnowledgeBaseProgressPanel", () => {
     expect(screen.queryByText(/排查编号|sha256|trace|task[_-]?id/i)).toBeNull();
   });
 
+  it("shows a pre-create attachment failure as task-not-created with customer files only", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "protocol_error",
+            currentLeafId: null,
+            protocolError: "internal provider mime detail",
+          },
+          contentAvailability: "none",
+          operationState: "reset_required",
+          resetAllowed: true,
+          taskCreationState: "not_attempted",
+          failureStage: "provider_file_registration",
+          retainedCustomerAttachmentCount: 9,
+          generatedSystemAttachmentCount: 2,
+          settledAt: 1_787_000_000_000,
+          packageAllowed: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("知识库任务未创建")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "9/9 个附件已保留，知识库任务未创建。请申请重置后重新上传资料。",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("本轮已停止")).toBeNull();
+    expect(screen.queryByText(/已完成内容不受影响/)).toBeNull();
+    expect(screen.queryByText(/internal provider mime detail/)).toBeNull();
+    expect(screen.queryByText(/11\/11/)).toBeNull();
+  });
+
   it("projects an acknowledged result phase as normalization instead of stopped", () => {
     render(
       <KnowledgeBaseProgressPanel
