@@ -10,6 +10,7 @@ import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  normalizeMaterializedKnowledgeBaseResult,
   projectKnowledgeBaseCustomerMarkdown,
   salvageKnowledgeBaseNodePatchArchive,
   validateKnowledgeBaseNodePatchArchive,
@@ -242,6 +243,30 @@ async function runPortableValidator(bytes: Buffer, args: string[]) {
   }
 }
 
+async function appendPhysicalZipEntries(
+  bytes: Buffer,
+  entries: ReadonlyArray<readonly [name: string, content: string]>,
+) {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), "frontmind-materialized-collision-"),
+  );
+  temporaryDirectories.push(directory);
+  const archivePath = path.join(directory, "collision.zip");
+  await fs.writeFile(archivePath, bytes);
+  await execFileAsync("python3", [
+    "-c",
+    [
+      "import sys, zipfile",
+      "with zipfile.ZipFile(sys.argv[1], 'a') as archive:",
+      "    for index in range(2, len(sys.argv), 2):",
+      "        archive.writestr(sys.argv[index], sys.argv[index + 1])",
+    ].join("\n"),
+    archivePath,
+    ...entries.flat(),
+  ]);
+  return fs.readFile(archivePath);
+}
+
 function portableInitialFlags(company: {
   name: string;
   website: string | null;
@@ -266,7 +291,488 @@ function portableInitialFlags(company: {
   ];
 }
 
+const flatAuthority = {
+  operationId: "flat-operation",
+  buildId: "44444444-4444-4444-8444-444444444444",
+  generation: 1,
+  contentVersion: 1,
+  skillContentHash: skillHash,
+  treePolicyVersion: 2,
+  companyName: "恢复企业",
+  companyWebsite: null,
+  expectedUploadsRead: 2,
+} as const;
+
+async function flatBundle(
+  input: {
+    manifest?: string;
+    gap?: boolean;
+    extra?: boolean;
+  } = {},
+) {
+  const zip = new JSZip();
+  if (input.manifest !== undefined) {
+    zip.file("BUNDLE.json", input.manifest, {
+      date: fixedDate,
+      createFolders: false,
+    });
+  }
+  zip.file("nodes/0001.md", "# 第一节点\n\n安全正文一", {
+    date: fixedDate,
+    createFolders: false,
+  });
+  zip.file(input.gap ? "nodes/0003.md" : "nodes/0002.md", "安全正文二", {
+    date: fixedDate,
+    createFolders: false,
+  });
+  if (input.extra) {
+    zip.file("evidence/customer.pdf", Buffer.from("%PDF-1.7\n\x80", "latin1"), {
+      date: fixedDate,
+      createFolders: false,
+    });
+  }
+  return zip.generateAsync({ type: "nodebuffer", platform: "UNIX" });
+}
+
 describe("materialized knowledge-base ZIP contracts", () => {
+  it("returns a typed accepted outcome and a JSON-roundtrippable presentation", async () => {
+    const outcome = await normalizeMaterializedKnowledgeBaseResult({
+      mode: "initial",
+      archiveBytes: await bundle((manifest) => {
+        manifest.operationId = flatAuthority.operationId;
+        manifest.buildId = flatAuthority.buildId;
+        manifest.company = {
+          name: flatAuthority.companyName,
+          website: flatAuthority.companyWebsite,
+        };
+        manifest.researchCoverage.uploadsRead =
+          flatAuthority.expectedUploadsRead;
+      }),
+      authority: flatAuthority,
+      provenance: {
+        exactBoundTask: true,
+        directAssistantOutput: true,
+        descriptorFilename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "accepted",
+      renderSnapshot: {
+        kind: "frontmind.kb-canonical-presentation",
+        displayEligible: true,
+      },
+    });
+    if (outcome.kind === "accepted") {
+      expect(() =>
+        JSON.parse(JSON.stringify(outcome.renderSnapshot)),
+      ).not.toThrow();
+    }
+  });
+
+  it("keeps server-coordinate repairs complete and downstream-eligible", async () => {
+    const outcome = await normalizeMaterializedKnowledgeBaseResult({
+      mode: "initial",
+      archiveBytes: await bundle((manifest) => {
+        manifest.operationId = flatAuthority.operationId;
+        manifest.buildId = "provider-used-turn-id";
+        manifest.generation = 99;
+        manifest.contentVersion = 88;
+        manifest.skill = { name: "wrong", version: "0", contentHash: "bad" };
+        manifest.company = { name: "错误企业", website: "invalid path" };
+        manifest.researchCoverage.uploadsRead = 99;
+      }),
+      authority: flatAuthority,
+      provenance: {
+        exactBoundTask: true,
+        directAssistantOutput: true,
+        descriptorFilename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "accepted",
+      completeness: "complete",
+      renderSnapshot: {
+        completeness: "complete",
+        downstreamEligible: true,
+        publishable: true,
+      },
+      diagnostics: expect.arrayContaining([
+        { code: "SERVER_COORDINATE_NORMALIZED", area: "manifest" },
+      ]),
+    });
+  });
+
+  it("keeps binary-evidence skips complete when every body is retained", async () => {
+    const pdf = Buffer.from("%PDF-1.7\n\x80\x81binary", "latin1");
+    const outcome = await normalizeMaterializedKnowledgeBaseResult({
+      mode: "initial",
+      archiveBytes: await bundle((manifest, zip) => {
+        manifest.operationId = flatAuthority.operationId;
+        manifest.buildId = flatAuthority.buildId;
+        manifest.company = {
+          name: flatAuthority.companyName,
+          website: flatAuthority.companyWebsite,
+        };
+        manifest.researchCoverage.uploadsRead =
+          flatAuthority.expectedUploadsRead;
+        const evidencePath = "evidence/1.2/customer-copy.pdf";
+        zip.file(evidencePath, pdf, {
+          date: fixedDate,
+          createFolders: false,
+        });
+        manifest.evidenceLedger.push({
+          path: evidencePath,
+          sha256: sha256(pdf),
+          leafId: "1.2",
+          sourceUrl: null,
+          retrievedAt: null,
+        });
+        manifest.leaves[1].evidencePaths = [evidencePath];
+      }),
+      authority: flatAuthority,
+      provenance: {
+        exactBoundTask: true,
+        directAssistantOutput: true,
+        descriptorFilename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "accepted",
+      completeness: "complete",
+      manifest: { counts: { leaves: 30, evidenceFiles: 1 } },
+      renderSnapshot: {
+        completeness: "complete",
+        downstreamEligible: true,
+        publishable: true,
+      },
+      diagnostics: expect.arrayContaining([
+        { code: "OPTIONAL_BINARY_EVIDENCE_SKIPPED", area: "evidence" },
+      ]),
+    });
+  });
+
+  it("marks a real retained-body loss partial and display-only", async () => {
+    const outcome = await normalizeMaterializedKnowledgeBaseResult({
+      mode: "initial",
+      archiveBytes: await bundle((manifest, zip) => {
+        zip.remove(manifest.leaves[4].contentPath);
+      }),
+      authority: {
+        operationId: "initial-operation",
+        buildId,
+        generation: 1,
+        contentVersion: 1,
+        skillContentHash: skillHash,
+        treePolicyVersion: 2,
+        companyName: "示例企业",
+        companyWebsite: null,
+        expectedUploadsRead: 0,
+      },
+      provenance: {
+        exactBoundTask: true,
+        directAssistantOutput: true,
+        descriptorFilename: "frontmind-kb-bundle-initial-operation.zip",
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "accepted",
+      completeness: "partial",
+      manifest: { counts: { leaves: 29 } },
+      renderSnapshot: {
+        completeness: "partial",
+        displayEligible: true,
+        downstreamEligible: false,
+        publishable: false,
+      },
+      diagnostics: expect.arrayContaining([
+        { code: "RESULT_INCOMPLETE", area: "nodes" },
+      ]),
+    });
+  });
+
+  it.each([[undefined], ["{"]])(
+    "recovers a fresh exact-descriptor flat bundle when manifest is %s",
+    async (manifest) => {
+      const outcome = await normalizeMaterializedKnowledgeBaseResult({
+        mode: "initial",
+        archiveBytes: await flatBundle({ manifest, extra: true }),
+        authority: flatAuthority,
+        provenance: {
+          exactBoundTask: true,
+          directAssistantOutput: true,
+          descriptorFilename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+        },
+      });
+
+      expect(outcome).toMatchObject({
+        kind: "accepted",
+        completeness: "partial",
+        manifest: {
+          operationId: flatAuthority.operationId,
+          buildId: flatAuthority.buildId,
+          branches: [{ branchId: "recovered_view_only" }],
+          counts: { leaves: 2, evidenceFiles: 0, assets: 0 },
+        },
+        renderSnapshot: {
+          displayEligible: true,
+          downstreamEligible: false,
+          publishable: false,
+        },
+      });
+      if (outcome.kind === "accepted") {
+        expect(outcome.manifest.leaves.map((leaf) => leaf.contentPath)).toEqual(
+          ["nodes/0001.md", "nodes/0002.md"],
+        );
+        expect(outcome.manifest.leaves[1]?.title).toBe("已恢复节点 2");
+      }
+    },
+  );
+
+  it("keeps flat fallback behind descriptor, continuity and semantic-manifest gates", async () => {
+    for (const input of [
+      {
+        bytes: await flatBundle(),
+        filename: "renamed.zip",
+      },
+      {
+        bytes: await flatBundle({ gap: true }),
+        filename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+      },
+      {
+        bytes: await bundle((manifest) => {
+          manifest.operationId = "other-operation";
+        }),
+        filename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+      },
+      {
+        bytes: Buffer.from("not a zip"),
+        filename: `frontmind-kb-bundle-${flatAuthority.operationId}.zip`,
+      },
+    ]) {
+      await expect(
+        normalizeMaterializedKnowledgeBaseResult({
+          mode: "initial",
+          archiveBytes: input.bytes,
+          authority: flatAuthority,
+          provenance: {
+            exactBoundTask: true,
+            directAssistantOutput: true,
+            descriptorFilename: input.filename,
+          },
+        }),
+      ).resolves.toMatchObject({ kind: "rejected", resetRequired: true });
+    }
+  });
+
+  it("normalizes Provider patch coordinates onto the exact frozen base", async () => {
+    const base = await validateKnowledgeBaseWorkingSetArchive(await bundle());
+    const archiveBytes = await patch((manifest) => {
+      manifest.buildId = "provider-used-turn-id";
+      manifest.generation = 99;
+      manifest.baseContentVersion = 88;
+      manifest.baseWorkingSetSha256 = base.packageSha256;
+    });
+    const outcome = await normalizeMaterializedKnowledgeBaseResult({
+      mode: "patch",
+      archiveBytes,
+      authority: {
+        operationId: "revision-operation",
+        buildId,
+        generation: 1,
+        baseContentVersion: 1,
+        baseWorkingSetSha256: base.packageSha256,
+        targetLeafId: "1.1",
+        attachmentSourceProofs: [],
+      },
+      provenance: {
+        exactBoundTask: true,
+        directAssistantOutput: true,
+        descriptorFilename: "frontmind-kb-patch-revision-operation.zip",
+      },
+      base,
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "accepted",
+      mode: "patch",
+      completeness: "complete",
+      changed: true,
+      manifest: {
+        operationId: "revision-operation",
+        buildId,
+        generation: 1,
+        contentVersion: 2,
+      },
+      sourcePatch: {
+        manifest: {
+          buildId,
+          generation: 1,
+          baseContentVersion: 1,
+          baseWorkingSetSha256: base.packageSha256,
+        },
+      },
+      diagnostics: expect.arrayContaining([
+        { code: "SERVER_COORDINATE_NORMALIZED", area: "manifest" },
+      ]),
+      renderSnapshot: {
+        completeness: "complete",
+        downstreamEligible: true,
+        publishable: true,
+      },
+    });
+  });
+
+  it("keeps patch operation, target and frozen base hash as hard gates", async () => {
+    const base = await validateKnowledgeBaseWorkingSetArchive(await bundle());
+    for (const mutate of [
+      (manifest: Record<string, any>) => {
+        manifest.operationId = "other-operation";
+        manifest.baseWorkingSetSha256 = base.packageSha256;
+      },
+      (manifest: Record<string, any>) => {
+        manifest.targetLeafId = "1.2";
+        manifest.baseWorkingSetSha256 = base.packageSha256;
+      },
+      (manifest: Record<string, any>) => {
+        manifest.baseWorkingSetSha256 = "c".repeat(64);
+      },
+    ]) {
+      const outcome = await normalizeMaterializedKnowledgeBaseResult({
+        mode: "patch",
+        archiveBytes: await patch(mutate),
+        authority: {
+          operationId: "revision-operation",
+          buildId,
+          generation: 1,
+          baseContentVersion: 1,
+          baseWorkingSetSha256: base.packageSha256,
+          targetLeafId: "1.1",
+          attachmentSourceProofs: [],
+        },
+        provenance: {
+          exactBoundTask: true,
+          directAssistantOutput: true,
+          descriptorFilename: "frontmind-kb-patch-revision-operation.zip",
+        },
+        base,
+      });
+      expect(outcome).toMatchObject({
+        kind: "rejected",
+        code: "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+        resetRequired: true,
+      });
+    }
+  });
+
+  it.each([false, true])(
+    "uses the locked exact single-node patch fallback when PATCH.json missing=%s",
+    async (includeBrokenManifest) => {
+      const base = await validateKnowledgeBaseWorkingSetArchive(await bundle());
+      const zip = new JSZip();
+      if (includeBrokenManifest) {
+        zip.file("PATCH.json", "{", { date: fixedDate, createFolders: false });
+      }
+      zip.file("node/1.1.md", "# 修订节点\n\n锁定后的安全正文", {
+        date: fixedDate,
+        createFolders: false,
+      });
+      const archiveBytes = await zip.generateAsync({
+        type: "nodebuffer",
+        platform: "UNIX",
+      });
+      const authority = {
+        operationId: "revision-operation",
+        buildId,
+        generation: 1,
+        baseContentVersion: 1,
+        baseWorkingSetSha256: base.packageSha256,
+        targetLeafId: "1.1",
+        attachmentSourceProofs: [],
+      } as const;
+      const outcome = await normalizeMaterializedKnowledgeBaseResult({
+        mode: "patch",
+        archiveBytes,
+        authority,
+        provenance: {
+          exactBoundTask: true,
+          directAssistantOutput: true,
+          descriptorFilename: "frontmind-kb-patch-revision-operation.zip",
+          baseAuthorityLocked: true,
+        },
+        base,
+      });
+
+      expect(outcome).toMatchObject({
+        kind: "accepted",
+        mode: "patch",
+        completeness: "partial",
+        changed: true,
+        renderSnapshot: {
+          completeness: "partial",
+          displayEligible: true,
+          downstreamEligible: false,
+          publishable: false,
+        },
+        diagnostics: expect.arrayContaining([
+          { code: "RESULT_INCOMPLETE", area: "nodes" },
+          { code: "MANIFEST_NORMALIZED", area: "manifest" },
+        ]),
+      });
+
+      await expect(
+        normalizeMaterializedKnowledgeBaseResult({
+          mode: "patch",
+          archiveBytes,
+          authority,
+          provenance: {
+            exactBoundTask: true,
+            directAssistantOutput: true,
+            descriptorFilename: "frontmind-kb-patch-revision-operation.zip",
+          },
+          base,
+        }),
+      ).resolves.toMatchObject({ kind: "rejected", resetRequired: true });
+
+      await expect(
+        normalizeMaterializedKnowledgeBaseResult({
+          mode: "patch",
+          archiveBytes,
+          authority,
+          provenance: {
+            exactBoundTask: true,
+            directAssistantOutput: true,
+            descriptorFilename: "renamed-patch.zip",
+            baseAuthorityLocked: true,
+          },
+          base,
+        }),
+      ).resolves.toMatchObject({ kind: "rejected", resetRequired: true });
+    },
+  );
+
+  it("reports a blocked missing-manifest fallback as manifest_parse", async () => {
+    await expect(
+      normalizeMaterializedKnowledgeBaseResult({
+        mode: "initial",
+        archiveBytes: await flatBundle(),
+        authority: flatAuthority,
+        provenance: {
+          exactBoundTask: true,
+          directAssistantOutput: true,
+          descriptorFilename: "renamed.zip",
+        },
+      }),
+    ).resolves.toMatchObject({
+      kind: "rejected",
+      stage: "manifest_parse",
+      resetRequired: true,
+    });
+  });
+
   it.each([
     [
       "bare formal markers",
@@ -526,12 +1032,18 @@ describe("materialized knowledge-base ZIP contracts", () => {
     expect(revalidated.archiveBytes.equals(variant.archiveBytes)).toBe(true);
   });
 
-  it("rejects a company website that differs from the frozen build", async () => {
-    await expect(
-      validateKnowledgeBaseWorkingSetArchive(await bundle(), {
-        companyWebsite: "https://different.example/",
-      }),
-    ).rejects.toThrow("company.website 与任务坐标不一致");
+  it("writes the frozen company website over a stale Provider echo", async () => {
+    const validated = await validateKnowledgeBaseWorkingSetArchive(
+      await bundle(),
+      { companyWebsite: "https://different.example/" },
+    );
+    expect(validated.manifest.company.website).toBe(
+      "https://different.example/",
+    );
+    expect(validated.warnings).toContainEqual({
+      code: "SERVER_COORDINATE_NORMALIZED",
+      area: "manifest",
+    });
   });
 
   it("canonicalizes equivalent company coordinates to the frozen identity", async () => {
@@ -672,24 +1184,310 @@ describe("materialized knowledge-base ZIP contracts", () => {
     expect(validated.files.has("assets/bad.svg")).toBe(false);
   });
 
-  it("rejects undeclared files and stale bundle coordinates", async () => {
-    await expect(
-      validateKnowledgeBaseWorkingSetArchive(
-        await bundle((_manifest, zip) => {
-          zip.file("undeclared.txt", "no", {
-            date: fixedDate,
-            createFolders: false,
-          });
-        }),
-        { buildId },
-      ),
-    ).rejects.toThrow("未登记文件");
+  it("drops complete optional identity conflict groups and clears every reference", async () => {
+    const png = await sharp({
+      create: {
+        width: 2,
+        height: 2,
+        channels: 4,
+        background: { r: 42, g: 80, b: 120, alpha: 1 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const validated = await validateKnowledgeBaseWorkingSetArchive(
+      await bundle((manifest, zip) => {
+        manifest.evidenceLedger.push({
+          ...manifest.evidenceLedger[0],
+          sourceUrl: "https://other.example.test/ambiguous",
+        });
+        zip.file("assets/a.png", png, {
+          date: fixedDate,
+          createFolders: false,
+        });
+        zip.file("assets/shared.png", png, {
+          date: fixedDate,
+          createFolders: false,
+        });
+        const asset = (assetId: string, assetPath: string) => ({
+          assetId,
+          path: assetPath,
+          sha256: sha256(png),
+          mimeType: "image/png",
+          bytes: png.length,
+          width: 2,
+          height: 2,
+          provenance: { sourceKind: "official_url" },
+          documentIds: ["1.1"],
+          assetType: "brand_identity",
+          displayRole: "inline",
+        });
+        manifest.assets = [
+          asset("collision-id", "assets/a.png"),
+          asset("collision-id", "assets/shared.png"),
+          asset("other-id", "assets/shared.png"),
+        ];
+        manifest.leaves[0].assetIds = ["collision-id", "other-id"];
+        manifest.logo = { status: "available", assetId: "collision-id" };
+      }),
+    );
+
+    expect(validated.manifest.leaves).toHaveLength(30);
+    expect(validated.manifest.evidenceLedger).toEqual([]);
+    expect(validated.manifest.assets).toEqual([]);
+    expect(validated.manifest.leaves[0]).toMatchObject({
+      evidencePaths: [],
+      assetIds: [],
+    });
+    expect(validated.manifest.logo).toEqual({
+      status: "missing",
+      assetId: null,
+    });
+    expect(validated.warnings).toEqual(
+      expect.arrayContaining([
+        { code: "EVIDENCE_INCOMPLETE", area: "evidence" },
+        { code: "OPTIONAL_ASSET_SKIPPED", area: "assets" },
+      ]),
+    );
+    expect(validated.files.has("evidence/1.1/source.md")).toBe(false);
+    expect(validated.files.has("assets/a.png")).toBe(false);
+    expect(validated.files.has("assets/shared.png")).toBe(false);
+  });
+
+  it.each([
+    ["exact", [["BUNDLE.json", "{}"]] as const],
+    [
+      "case",
+      [
+        ["extras/Case.txt", "one"],
+        ["extras/case.txt", "two"],
+      ] as const,
+    ],
+    [
+      "NFC",
+      [
+        ["extras/caf\u00e9.txt", "one"],
+        ["extras/cafe\u0301.txt", "two"],
+      ] as const,
+    ],
+  ])(
+    "rejects %s physical ZIP path collisions in TypeScript and Python",
+    async (_label, entries) => {
+      const bytes = await appendPhysicalZipEntries(await bundle(), entries);
+      await expect(
+        validateKnowledgeBaseWorkingSetArchive(bytes),
+      ).rejects.toThrow(/ZIP|文件名/u);
+      const portable = await runPortableValidator(
+        bytes,
+        portableInitialFlags({ name: "示例企业", website: null }),
+      );
+      expect(portable.code).not.toBe(0);
+      expect(portable.stderr).toContain("archive contains an unsafe entry");
+    },
+  );
+
+  it("accepts a legal EOCD archive comment and central-entry comment", async () => {
+    const zip = await JSZip.loadAsync(await bundle());
+    zip.comment = "FrontMind deterministic fixture comment";
+    zip.file("BUNDLE.json")!.comment = "manifest entry comment";
+    const bytes = await zip.generateAsync({
+      type: "nodebuffer",
+      platform: "UNIX",
+    });
 
     await expect(
-      validateKnowledgeBaseWorkingSetArchive(await bundle(), {
-        generation: 2,
+      validateKnowledgeBaseWorkingSetArchive(bytes),
+    ).resolves.toMatchObject({ manifest: { counts: { leaves: 30 } } });
+    await expect(
+      runPortableValidator(
+        bytes,
+        portableInitialFlags({ name: "示例企业", website: null }),
+      ),
+    ).resolves.toMatchObject({ code: 0 });
+  });
+
+  it("rejects the same over-limit compression ratio in TypeScript and Python", async () => {
+    const zip = await JSZip.loadAsync(await bundle());
+    zip.file("extras/high-ratio.txt", "0".repeat(1_000_000), {
+      date: fixedDate,
+      createFolders: false,
+    });
+    const raw = await zip.generateAsync({
+      type: "nodebuffer",
+      platform: "UNIX",
+      compression: "DEFLATE",
+      compressionOptions: { level: 9 },
+    });
+
+    await expect(validateKnowledgeBaseWorkingSetArchive(raw)).rejects.toThrow(
+      "ZIP 压缩比异常",
+    );
+    const portable = await runPortableValidator(
+      raw,
+      portableInitialFlags({ name: "示例企业", website: null }),
+    );
+    expect(portable.code).not.toBe(0);
+    expect(portable.stderr).toContain("archive compression ratio is invalid");
+  });
+
+  it("skips binary evidence before UTF-8 decoding and retains every safe node", async () => {
+    const pdf = Buffer.from("%PDF-1.7\n\x80\x81binary", "latin1");
+    const raw = await bundle((manifest, zip) => {
+      const path = "evidence/1.2/customer-copy.pdf";
+      zip.file(path, pdf, { date: fixedDate, createFolders: false });
+      manifest.evidenceLedger.push({
+        path,
+        sha256: sha256(pdf),
+        leafId: "1.2",
+        sourceUrl: null,
+        retrievedAt: null,
+      });
+      manifest.leaves[1].evidencePaths = [path];
+    });
+    const validated = await validateKnowledgeBaseWorkingSetArchive(raw);
+
+    expect(validated.manifest.leaves).toHaveLength(30);
+    expect(validated.manifest.evidenceLedger).toHaveLength(1);
+    expect(validated.files.has("evidence/1.2/customer-copy.pdf")).toBe(false);
+    expect(validated.warnings).toContainEqual({
+      code: "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
+      area: "evidence",
+    });
+    const portable = await runPortableValidator(raw, [
+      "--diagnostics-json",
+      ...portableInitialFlags({ name: "示例企业", website: null }),
+    ]);
+    expect(portable.code).toBe(0);
+    expect(JSON.parse(portable.stdout)).toMatchObject({
+      accepted: true,
+      retained: ["evidence/1.1/source.md"],
+      dropped: ["evidence/1.2/customer-copy.pdf"],
+      warnings: [
+        {
+          code: "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
+          area: "evidence",
+        },
+      ],
+      hardFailure: null,
+    });
+  });
+
+  it.each([".md", ".markdown", ".txt"])(
+    "retains UTF-8 text evidence with the shared %s extension in TypeScript and Python",
+    async (extension) => {
+      const evidencePath = `evidence/1.1/source${extension}`;
+      const evidence = "共享策略证据";
+      const raw = await bundle((manifest, zip) => {
+        zip.remove("evidence/1.1/source.md");
+        zip.file(evidencePath, evidence, {
+          date: fixedDate,
+          createFolders: false,
+        });
+        manifest.evidenceLedger[0].path = evidencePath;
+        manifest.evidenceLedger[0].sha256 = sha256(evidence);
+        manifest.leaves[0].evidencePaths = [evidencePath];
+      });
+
+      const validated = await validateKnowledgeBaseWorkingSetArchive(raw);
+      const portable = await runPortableValidator(raw, [
+        "--diagnostics-json",
+        ...portableInitialFlags({ name: "示例企业", website: null }),
+      ]);
+
+      expect(
+        validated.manifest.evidenceLedger.map((item) => item.path),
+      ).toEqual([evidencePath]);
+      expect(portable.code).toBe(0);
+      expect(JSON.parse(portable.stdout)).toMatchObject({
+        accepted: true,
+        retained: [evidencePath],
+        dropped: [],
+        warnings: [],
+        hardFailure: null,
+      });
+    },
+  );
+
+  it("rebuilds every server-owned coordinate while keeping operationId hard", async () => {
+    const expected = {
+      operationId: "initial-operation",
+      buildId: "22222222-2222-4222-8222-222222222222",
+      generation: 3,
+      contentVersion: 1,
+      skillContentHash: "c".repeat(64),
+      treePolicyVersion: 2,
+      companyName: "冻结企业",
+      companyWebsite: "https://frozen.example/",
+      expectedUploadsRead: 4,
+    } as const;
+    const validated = await validateKnowledgeBaseWorkingSetArchive(
+      await bundle((manifest) => {
+        manifest.buildId = "provider-used-turn-id";
+        manifest.generation = 99;
+        manifest.contentVersion = 88;
+        manifest.skill = { name: "wrong", version: "0", contentHash: "bad" };
+        manifest.treePolicyVersion = 99;
+        manifest.company = { name: "错误企业", website: "invalid path" };
+        manifest.researchCoverage.uploadsRead = 99;
       }),
-    ).rejects.toThrow("generation 与任务坐标不一致");
+      expected,
+    );
+
+    expect(validated.manifest).toMatchObject({
+      operationId: expected.operationId,
+      buildId: expected.buildId,
+      generation: expected.generation,
+      contentVersion: expected.contentVersion,
+      skill: {
+        name: "socratic-kb-builder",
+        version: "5",
+        contentHash: expected.skillContentHash,
+      },
+      treePolicyVersion: 2,
+      company: {
+        name: expected.companyName,
+        website: expected.companyWebsite,
+      },
+      researchCoverage: { uploadsRead: 4, sourceCount: 1 },
+    });
+    expect(validated.warnings).toContainEqual({
+      code: "SERVER_COORDINATE_NORMALIZED",
+      area: "manifest",
+    });
+
+    await expect(
+      validateKnowledgeBaseWorkingSetArchive(
+        await bundle((manifest) => {
+          manifest.operationId = "other-operation";
+        }),
+        expected,
+      ),
+    ).rejects.toThrow("operationId 与任务坐标不一致");
+  });
+
+  it("drops undeclared safe files and overwrites stale server coordinates", async () => {
+    const raw = await bundle((_manifest, zip) => {
+      zip.file("undeclared.txt", "no", {
+        date: fixedDate,
+        createFolders: false,
+      });
+    });
+    const validated = await validateKnowledgeBaseWorkingSetArchive(raw, {
+      buildId,
+      generation: 2,
+    });
+    expect(validated.files.has("undeclared.txt")).toBe(false);
+    expect(validated.manifest.generation).toBe(2);
+    expect(validated.warnings).toContainEqual({
+      code: "SERVER_COORDINATE_NORMALIZED",
+      area: "manifest",
+    });
+    await expect(
+      runPortableValidator(
+        raw,
+        portableInitialFlags({ name: "示例企业", website: null }),
+      ),
+    ).resolves.toMatchObject({ code: 0 });
   });
 
   it("accepts only a target-scoped patch with exact base coordinates", async () => {
@@ -722,6 +1520,57 @@ describe("materialized knowledge-base ZIP contracts", () => {
         { targetLeafId: "1.1" },
       ),
     ).rejects.toThrow("Patch 证据必须属于目标节点");
+  });
+
+  it("normalizes revision server coordinates but keeps base working-set ownership hard", async () => {
+    const expected = {
+      operationId: "revision-operation",
+      buildId,
+      generation: 1,
+      baseContentVersion: 1,
+      baseWorkingSetSha256: "b".repeat(64),
+      targetLeafId: "1.1",
+    } as const;
+    const normalizedRaw = await patch((manifest) => {
+      manifest.buildId = "provider-turn-id";
+      manifest.generation = 99;
+      manifest.baseContentVersion = 88;
+    });
+    const validated = await validateKnowledgeBaseNodePatchArchive(
+      normalizedRaw,
+      expected,
+    );
+    expect(validated.manifest).toMatchObject({
+      buildId: expected.buildId,
+      generation: expected.generation,
+      baseContentVersion: expected.baseContentVersion,
+    });
+    expect(validated.warnings).toContainEqual({
+      code: "SERVER_COORDINATE_NORMALIZED",
+      area: "manifest",
+    });
+    const portableNormalized = await runPortableValidator(normalizedRaw, [
+      "--diagnostics-json",
+      ...portablePatchFlags(),
+    ]);
+    expect(portableNormalized.code).toBe(0);
+    expect(JSON.parse(portableNormalized.stdout).warnings).toContainEqual({
+      code: "SERVER_COORDINATE_NORMALIZED",
+      area: "manifest",
+    });
+
+    const wrongBase = await patch((manifest) => {
+      manifest.baseWorkingSetSha256 = "c".repeat(64);
+    });
+    await expect(
+      validateKnowledgeBaseNodePatchArchive(wrongBase, expected),
+    ).rejects.toThrow("baseWorkingSetSha256");
+    const portableWrongBase = await runPortableValidator(
+      wrongBase,
+      portablePatchFlags(),
+    );
+    expect(portableWrongBase.code).not.toBe(0);
+    expect(portableWrongBase.stderr).toContain("baseWorkingSetSha256");
   });
 
   it("canonicalizes equivalent Patch Markdown and ZIP metadata to one digest", async () => {
@@ -995,15 +1844,6 @@ describe("materialized knowledge-base ZIP contracts", () => {
       await rewritePatchManifest(ordinary, (manifest) =>
         JSON.stringify(JSON.stringify(manifest)),
       ),
-    ]) {
-      await expect(
-        validateKnowledgeBaseNodePatchArchive(encoded),
-      ).resolves.toMatchObject({
-        manifest: { operationId: "revision-operation" },
-      });
-    }
-
-    const ambiguous = [
       await rewritePatchManifest(
         ordinary,
         (manifest) => `说明\n${JSON.stringify(manifest)}`,
@@ -1013,6 +1853,15 @@ describe("materialized knowledge-base ZIP contracts", () => {
         (manifest) =>
           `\`\`\`json\n\`\`\`json\n${JSON.stringify(manifest)}\n\`\`\`\n\`\`\``,
       ),
+    ]) {
+      await expect(
+        validateKnowledgeBaseNodePatchArchive(encoded),
+      ).resolves.toMatchObject({
+        manifest: { operationId: "revision-operation" },
+      });
+    }
+
+    const ambiguous = [
       await rewritePatchManifest(ordinary, (manifest) =>
         JSON.stringify(JSON.stringify(JSON.stringify(manifest))),
       ),
@@ -1035,10 +1884,10 @@ describe("materialized knowledge-base ZIP contracts", () => {
       ).rejects.toThrow();
     }
     await expect(
-      validateKnowledgeBaseNodePatchArchive(ambiguous[3]!),
+      validateKnowledgeBaseNodePatchArchive(ambiguous[1]!),
     ).rejects.toMatchObject({ category: "contract" });
     await expect(
-      validateKnowledgeBaseNodePatchArchive(ambiguous[4]!),
+      validateKnowledgeBaseNodePatchArchive(ambiguous[2]!),
     ).rejects.toMatchObject({ category: "contract" });
   });
 
@@ -1060,7 +1909,7 @@ describe("materialized knowledge-base ZIP contracts", () => {
       date: fixedDate,
       createFolders: false,
     });
-    broken.file("provider-name.png", png, {
+    broken.file("assets/1.1/provider-name.png", png, {
       date: fixedDate,
       createFolders: false,
     });
@@ -1259,12 +2108,19 @@ describe("materialized knowledge-base ZIP contracts", () => {
         await bundle((manifest) => {
           manifest.company.website = provider;
         }),
-        portableInitialFlags({
-          name: "示例企业",
-          website: "https://example.test/",
-        }),
+        [
+          "--diagnostics-json",
+          ...portableInitialFlags({
+            name: "示例企业",
+            website: "https://example.test/",
+          }),
+        ],
       );
-      expect(result.code, provider).not.toBe(0);
+      expect(result.code, provider).toBe(0);
+      expect(JSON.parse(result.stdout).warnings, provider).toContainEqual({
+        code: "SERVER_COORDINATE_NORMALIZED",
+        area: "manifest",
+      });
     }
   });
 });

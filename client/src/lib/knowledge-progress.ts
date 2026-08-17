@@ -232,6 +232,38 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
       source.contentCompletedAt >= 0)
       ? source.contentCompletedAt
       : undefined;
+  const contentAvailabilityCandidate =
+    source.contentAvailability ?? progress?.contentAvailability;
+  const contentAvailability = ["none", "partial", "complete"].includes(
+    contentAvailabilityCandidate,
+  )
+    ? contentAvailabilityCandidate
+    : undefined;
+  const operationStateCandidate =
+    source.operationState ?? progress?.operationState;
+  const operationState = [
+    "creating",
+    "waiting_output",
+    "normalizing",
+    "completed",
+    "reset_required",
+  ].includes(operationStateCandidate)
+    ? operationStateCandidate
+    : undefined;
+  const warningCodesCandidate = source.warningCodes ?? progress?.warningCodes;
+  const warningCodes = Array.isArray(warningCodesCandidate)
+    ? Array.from(
+        new Set(
+          warningCodesCandidate.filter(
+            (value: unknown): value is string =>
+              typeof value === "string" &&
+              value.length > 0 &&
+              value.length <= 128,
+          ),
+        ),
+      )
+    : undefined;
+  const resetAllowedCandidate = source.resetAllowed ?? progress?.resetAllowed;
   return {
     stateEpoch: Number(source.stateEpoch ?? 0),
     generation: Number(source.generation ?? 0),
@@ -242,6 +274,12 @@ function normalizeObservation(payload: any): KnowledgeBaseObservationDto {
     ...(packageState ? { packageState } : {}),
     ...(publicationState ? { publicationState } : {}),
     ...(contentCompletedAt !== undefined ? { contentCompletedAt } : {}),
+    ...(contentAvailability ? { contentAvailability } : {}),
+    ...(operationState ? { operationState } : {}),
+    ...(typeof resetAllowedCandidate === "boolean"
+      ? { resetAllowed: resetAllowedCandidate }
+      : {}),
+    ...(warningCodes ? { warningCodes } : {}),
     authoritativeTaskId,
     activeTurn: source.activeTurn ?? null,
     completedTurn: source.completedTurn ?? null,

@@ -315,6 +315,34 @@ describe("ManusV2Client", () => {
     });
   });
 
+  it("settles equal-timestamp state from Provider rank instead of event id", () => {
+    const events = [
+      {
+        id: "zzz-older-wait",
+        type: "status_update",
+        timestamp: 10,
+        providerOriginalRank: 0,
+        status_update: {
+          agent_status: "waiting",
+          status_detail: {
+            waiting_for_event_id: "wait-old",
+            waiting_for_event_type: "messageAskUser",
+          },
+        },
+      },
+      {
+        id: "000-newer-stop",
+        type: "status_update",
+        timestamp: 10,
+        providerOriginalRank: 1,
+        status_update: { agent_status: "stopped" },
+      },
+    ];
+
+    expect(latestManusV2TaskState(events)).toBe("stopped");
+    expect(latestManusV2WaitingDetail(events)).toBeNull();
+  });
+
   it("marks side-effect transport loss unknown and never labels it retryable", async () => {
     vi.spyOn(axios.Axios.prototype, "post").mockRejectedValue(
       new Error("socket reset"),
@@ -572,6 +600,49 @@ describe("ManusV2Client", () => {
       { id: "e2", role: "assistant", text: "second" },
     ]);
     expect(get.mock.calls[1]?.[1]?.params).toMatchObject({ cursor: "page-2" });
+  });
+
+  it("uses Provider order rather than opaque ids for equal-timestamp messages", async () => {
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValueOnce({
+      status: 200,
+      data: {
+        ok: true,
+        task_id: "canonical-task",
+        // Desc is the production default: the first event is newer even
+        // though its opaque id sorts before the second one.
+        messages: [
+          {
+            id: "000-newer-opaque-id",
+            type: "assistant_message",
+            timestamp: 20,
+            assistant_message: { content: "newer" },
+          },
+          {
+            id: "zzz-older-opaque-id",
+            type: "assistant_message",
+            timestamp: 20,
+            assistant_message: { content: "older" },
+          },
+        ],
+        has_more: false,
+      },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    const events = await client.listAllMessages({ taskId: "canonical-task" });
+
+    expect(events.map((event) => event.id)).toEqual([
+      "zzz-older-opaque-id",
+      "000-newer-opaque-id",
+    ]);
+    expect(events.map((event) => event.providerOriginalRank)).toEqual([0, 1]);
+    expect(normalizeManusV2Output(events).map((item) => item.content)).toEqual([
+      "older",
+      "newer",
+    ]);
   });
 
   it("defaults to newest-first pagination and keeps the newest repeated event payload", async () => {
@@ -1812,6 +1883,54 @@ describe("ManusV2Client", () => {
       text: "new body",
       structuredOutput: true,
     });
+  });
+
+  it("selects the newer equal-timestamp structured candidate by Provider rank", () => {
+    const value = (visibleMarkdown: string) => ({
+      schemaVersion: 1,
+      operationToken: "op-1",
+      turnId: "turn-1",
+      generation: 2,
+      baseRevision: 7,
+      action: "confirm",
+      fromLeafId: "leaf-7",
+      nextLeafId: "leaf-8",
+      visibleMarkdown,
+      contentCompleted: false,
+    });
+    const output = normalizeManusV2Output(
+      [
+        {
+          id: "zzz-older-result",
+          type: "structured_output_result",
+          timestamp: 20,
+          providerOriginalRank: 0,
+          structured_output_result: {
+            success: true,
+            value: value("older body"),
+          },
+        },
+        {
+          id: "000-newer-result",
+          type: "structured_output_result",
+          timestamp: 20,
+          providerOriginalRank: 1,
+          structured_output_result: {
+            success: true,
+            value: value("newer body"),
+          },
+        },
+      ],
+      operationContract,
+    );
+
+    expect(output).toMatchObject([
+      {
+        id: "000-newer-result",
+        text: "newer body",
+        structuredOutput: true,
+      },
+    ]);
   });
 
   it("never accepts a provider-declared extraction failure's schema-shaped zero value", () => {

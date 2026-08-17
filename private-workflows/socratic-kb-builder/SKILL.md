@@ -191,6 +191,13 @@ invent sources, facts, images or completeness values.
 - Use safe relative POSIX paths; forbid absolute paths, `..`, backslashes,
   symlinks, encrypted entries and undeclared files.
 - Hash every declared file from its exact bytes with lowercase SHA-256.
+- Treat `references/working-set-policy.json` as the machine-readable authority
+  for ZIP limits, text-evidence extensions/MIME, hard gates, soft drops and
+  warning codes. Do not duplicate or override those values in prose.
+- Write `evidence/` as non-empty UTF-8 text using a policy-listed extension
+  (`.md`, `.markdown` or `.txt`). Never copy customer PDF,
+  Office, image, archive or other binary upload bytes into the result ZIP;
+  preserve extracted citations in Markdown and leave originals in Dashboard.
 - Keep IDs and paths stable across revisions.
 - A successful initial bundle contains all leaf bodies. A pending leaf with no
   body is invalid.

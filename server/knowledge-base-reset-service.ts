@@ -22,6 +22,7 @@ import {
 import type { KnowledgeResetReason } from "../shared/delivery-roles";
 import {
   AuthServiceError,
+  discardManagedUploadProviderFileForRetirement,
   getCredentialForUpstreamResource,
   type AuthenticatedUser,
 } from "./auth-service";
@@ -33,6 +34,7 @@ import {
   removeKnowledgeBaseUploadEvidenceIfOrphaned,
 } from "./knowledge-base-upload-evidence-lifecycle";
 import { markKnowledgeBaseBuildSourcesTerminal } from "./knowledge-base-local-source-lifecycle";
+import { retireManagedUploadIntentsForKnowledgeBaseReset } from "./managed-upload-intent-fence";
 import {
   assertDeliveryProjectContext,
   deliveryExecutionActorRole,
@@ -589,6 +591,8 @@ export async function decideKnowledgeReset(input: {
     buildId: string;
     terminalAt: Date;
   }> = [];
+  let resetConversationIds: string[] = [];
+  let resetUserId: number | null = null;
   const result = await db.transaction(async (tx) => {
     const row = await requirePendingRequestForMember({
       ...input,
@@ -698,6 +702,7 @@ export async function decideKnowledgeReset(input: {
       throw new AuthServiceError("CONFLICT", "知识库重置状态不可用，请重试");
     }
     const nextResetRevision = lockedResetState.revision + 1;
+    resetUserId = row.request.userId;
 
     const counts = await getKnowledgeCounts(tx, row.request.userId);
     resetBuildSourceScopes = counts.builds.map((build) => ({
@@ -713,6 +718,7 @@ export async function decideKnowledgeReset(input: {
         ].filter((id): id is string => Boolean(id)),
       ),
     );
+    resetConversationIds = publicConversationIds;
     const storedIds = publicConversationIds.map((id) =>
       persistedConversationId(row.request.userId, id),
     );
@@ -964,6 +970,13 @@ export async function decideKnowledgeReset(input: {
         }),
       ),
     );
+    if (resetUserId !== null) {
+      await retireManagedUploadIntentsForKnowledgeBaseReset({
+        userId: resetUserId,
+        conversationIds: resetConversationIds,
+        discardProviderFile: discardManagedUploadProviderFileForRetirement,
+      }).catch(() => undefined);
+    }
     void processKnowledgeResetCleanupJobs();
   }
   return result;

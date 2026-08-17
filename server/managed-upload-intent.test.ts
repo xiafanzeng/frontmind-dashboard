@@ -169,6 +169,12 @@ import {
   sweepManagedUploadIntents,
 } from "./managed-upload-intent";
 import { AuthServiceError } from "./auth-service";
+import {
+  acquireManagedUploadDeletionFence,
+  completeManagedUploadDeletionFence,
+  retireManagedUploadIntentsForAccountDeletion,
+  rollbackManagedUploadDeletionFence,
+} from "./managed-upload-intent-fence";
 import { readStoredPresalesFile } from "./presales-file-store";
 import { UpstreamFileReadinessError } from "./upstream-file-readiness";
 
@@ -377,6 +383,279 @@ describe("stage-first managed upload intents", () => {
     expect(managedUploadIntentStorageRoot()).toContain(
       "managed-upload-intents",
     );
+  });
+
+  it("rejects create replay, resume, body, status and worker entry after a user deletion fence", async () => {
+    const input = {
+      ...createInput(),
+      resumeScope: {
+        kind: "knowledge_base" as const,
+        conversationId: "conversation-deleted-user",
+        turnId: "00000000-0000-4000-8000-000000000042",
+        clientRequestId: "client-request-deleted-user",
+      },
+    };
+    const manifest = await createManagedUploadIntent(input);
+    const { ticket } = createManagedUploadIntentTicket(manifest);
+    const token = await acquireManagedUploadDeletionFence(
+      { kind: "user", userId: 42 },
+      { disposition: "cancel_active_intents" },
+    );
+
+    for (const operation of [
+      () => createManagedUploadIntent(input),
+      () =>
+        listManagedUploadIntentsByResumeScope({
+          userId: 42,
+          conversationId: input.resumeScope.conversationId,
+          turnId: input.resumeScope.turnId,
+        }),
+      () =>
+        readKnowledgeBaseManagedUploadIntentByOperation({
+          userId: 42,
+          operationId: input.operationId,
+        }),
+      () =>
+        receiveManagedUploadIntentBody({
+          intentId: manifest.intentId,
+          ticket,
+          userId: 42,
+          contentLength: manifest.declaredSizeBytes,
+          request: Object.assign(Readable.from([Buffer.alloc(11)]), {
+            complete: true,
+          }),
+        }),
+      () =>
+        processManagedUploadIntent({
+          intentId: manifest.intentId,
+          userId: 42,
+          traceId: "deleted-user-worker",
+        }),
+    ]) {
+      await expect(operation()).rejects.toMatchObject({
+        code: "UPLOAD_IDENTITY_DELETION_IN_PROGRESS",
+      });
+    }
+    await completeManagedUploadDeletionFence(token);
+  });
+
+  it("keeps reset operation and resume indexes retired after its temporary fence rolls back", async () => {
+    const input = {
+      ...createInput(),
+      operationId: "operation-reset-retired",
+      resumeScope: {
+        kind: "knowledge_base" as const,
+        conversationId: "conversation-reset-retired",
+        turnId: "00000000-0000-4000-8000-000000000043",
+        clientRequestId: "client-request-reset-retired",
+      },
+    };
+    await createManagedUploadIntent(input);
+    const token = await acquireManagedUploadDeletionFence(
+      { kind: "user", userId: 42 },
+      { disposition: "cancel_active_intents" },
+    );
+    await retireManagedUploadIntentsForAccountDeletion({
+      userId: 42,
+      token,
+      knowledgeBaseConversationIds: new Set([input.resumeScope.conversationId]),
+    });
+    await rollbackManagedUploadDeletionFence(token);
+
+    await expect(createManagedUploadIntent(input)).rejects.toMatchObject({
+      code: "UPLOAD_OPERATION_RETIRED",
+    });
+    await expect(
+      listManagedUploadIntentsByResumeScope({
+        userId: 42,
+        conversationId: input.resumeScope.conversationId,
+        turnId: input.resumeScope.turnId,
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("retires and quarantines a corrupt intent proven by its server-owned operation/resume authority", async () => {
+    const input = {
+      ...createInput(),
+      userId: 84,
+      credentialOwnerUserId: 42,
+      operationId: "operation-corrupt-proven-reset",
+      resumeScope: {
+        kind: "knowledge_base" as const,
+        conversationId: "conversation-corrupt-proven-reset",
+        turnId: "00000000-0000-4000-8000-000000000044",
+        clientRequestId: "client-corrupt-proven-reset",
+      },
+    };
+    const manifest = await createManagedUploadIntent(input);
+    const root = managedUploadIntentStorageRoot();
+    const directory = path.join(
+      root,
+      createHash("sha256").update(manifest.intentId).digest("hex"),
+    );
+    await fs.writeFile(path.join(directory, "upload.part"), "partial-secret");
+    await fs.writeFile(path.join(directory, "manifest.json"), "{broken-json");
+    const token = await acquireManagedUploadDeletionFence(
+      { kind: "user", userId: 42 },
+      { disposition: "cancel_active_intents" },
+    );
+
+    await expect(
+      retireManagedUploadIntentsForAccountDeletion({
+        userId: 42,
+        token,
+        knowledgeBaseConversationIds: new Set([
+          input.resumeScope.conversationId,
+        ]),
+      }),
+    ).resolves.toMatchObject({
+      matched: 1,
+      retired: 1,
+      corrupt: 1,
+    });
+    await rollbackManagedUploadDeletionFence(token);
+
+    await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    const quarantine = path.join(root, "deletion-fences", "quarantine");
+    const quarantined = await fs.readdir(quarantine);
+    expect(quarantined).toHaveLength(1);
+    await expect(
+      fs.stat(path.join(quarantine, quarantined[0]!, "upload.part")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      readKnowledgeBaseManagedUploadIntentByOperation({
+        userId: 84,
+        operationId: input.operationId,
+      }),
+    ).rejects.toMatchObject({ code: "UPLOAD_OPERATION_RETIRED" });
+    await expect(
+      listManagedUploadIntentsByResumeScope({
+        userId: 84,
+        conversationId: input.resumeScope.conversationId,
+        turnId: input.resumeScope.turnId,
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("holds deletion behind provider create until the returned identity is durably settled", async () => {
+    const { sealed } = await sealIntent();
+    mocks.axiosDelete.mockResolvedValue({ status: 204, data: "" });
+    let finishCreate!: (value: unknown) => void;
+    mocks.axiosPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishCreate = resolve;
+        }),
+    );
+    const running = processManagedUploadIntent({
+      intentId: sealed.intentId,
+      userId: 42,
+      traceId: "provider-create-delete-race",
+    });
+    await vi.waitFor(() => expect(mocks.axiosPost).toHaveBeenCalledOnce());
+
+    let fenceSettled = false;
+    const fencePromise = acquireManagedUploadDeletionFence(
+      { kind: "user", userId: 42 },
+      { disposition: "cancel_active_intents" },
+    ).then((token) => {
+      fenceSettled = true;
+      return token;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(fenceSettled).toBe(false);
+
+    finishCreate({
+      status: 201,
+      data: {
+        id: "provider-create-delete-race",
+        filename: "provider-document.pdf",
+        status: "pending",
+        upload_url: "javascript:unsafe",
+        upload_expires_at: Date.now() + 180_000,
+      },
+    });
+    await expect(running).rejects.toMatchObject({
+      code: "UPLOAD_PROVIDER_RESPONSE_INVALID",
+    });
+    expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
+      provider: [
+        expect.objectContaining({
+          fileId: "provider-create-delete-race",
+          state: "discarded",
+        }),
+      ],
+    });
+    const token = await fencePromise;
+    expect(fenceSettled).toBe(true);
+    await completeManagedUploadDeletionFence(token);
+  });
+
+  it("holds deletion behind provider PUT through the uploaded receipt CAS", async () => {
+    const { sealed } = await sealIntent();
+    mocks.axiosPost.mockResolvedValue({
+      status: 201,
+      data: {
+        id: "provider-put-delete-race",
+        filename: "provider-document.pdf",
+        status: "pending",
+        upload_url: "https://storage.example.com/provider-put-delete-race",
+        upload_expires_at: Date.now() + 180_000,
+      },
+    });
+    let putReached!: () => void;
+    const reachedPut = new Promise<void>((resolve) => {
+      putReached = resolve;
+    });
+    let finishPut!: () => void;
+    mocks.axiosPut.mockImplementationOnce(async (_url, body) => {
+      for await (const _chunk of body) {
+        // Consume EOF before holding the provider response.
+      }
+      putReached();
+      await new Promise<void>((resolve) => {
+        finishPut = resolve;
+      });
+      return { status: 200, data: "" };
+    });
+    mocks.readiness.mockResolvedValue({
+      fileId: "provider-put-delete-race",
+      filename: "provider-document.pdf",
+      state: "uploaded",
+      status: "uploaded",
+      checkedAt: Date.now(),
+    });
+    const running = processManagedUploadIntent({
+      intentId: sealed.intentId,
+      userId: 42,
+      traceId: "provider-put-delete-race",
+    });
+    await reachedPut;
+
+    let fenceSettled = false;
+    const fencePromise = acquireManagedUploadDeletionFence(
+      { kind: "user", userId: 42 },
+      { disposition: "cancel_active_intents" },
+    ).then((token) => {
+      fenceSettled = true;
+      return token;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(fenceSettled).toBe(false);
+
+    finishPut();
+    await expect(running).resolves.toMatchObject({
+      state: "uploaded",
+      fileId: "provider-put-delete-race",
+    });
+    expect(await readManagedUploadIntent(sealed.intentId)).toMatchObject({
+      state: "uploaded",
+      receipt: expect.objectContaining({
+        fileId: "provider-put-delete-race",
+      }),
+    });
+    const token = await fencePromise;
+    await completeManagedUploadDeletionFence(token);
   });
 
   it("discovers a knowledge-base upload on another session and reissues its ticket", async () => {

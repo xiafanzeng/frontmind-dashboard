@@ -114,10 +114,18 @@ Requirements:
   `## 证据与核验说明`, evidence appendices and internal metadata keys are
   forbidden.
 - Every `branchId` resolves and `branchTitle` equals the branch title.
+- `references/working-set-policy.json` is the canonical machine-readable
+  source for ZIP limits, accepted evidence extensions/MIME, authority gates,
+  soft-drop dispositions and warning codes.
 - Every content/evidence/asset path is safe, unique and present.
 - Every declared SHA-256 equals the exact uncompressed file bytes.
 - Every `evidencePaths` entry resolves to exactly one `evidenceLedger` row for
   that leaf. Evidence without an exact hash is invalid.
+- Evidence files are non-empty UTF-8 Markdown (`.md`) only. Never copy customer
+  PDF, Office, image, archive or other binary uploads into `evidence/`; use a
+  policy-listed UTF-8 text extension for extracted evidence, cite
+  their extracted facts in Markdown evidence and leave the frozen originals
+  in Dashboard upload storage.
 - `counts` equals the actual manifest/file inventory.
 - `logo.status` is `available` only when `assetId` resolves to the sole valid
   official Logo; otherwise it is `missing` and `assetId` is null.

@@ -24,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   resetIsError: false,
   progressIsError: false,
   progressData: { progress: null } as any,
+  scopedProgressOverride: false,
+  scopedProgressData: undefined as any,
   knowledgeData: { snapshot: null } as any,
   resetStatus: {
     revision: 0,
@@ -61,7 +63,19 @@ vi.mock("@/components/KnowledgeBaseViewer", () => ({
   default: () => <div>knowledge viewer</div>,
 }));
 vi.mock("@/components/KnowledgeBaseProgressPanel", () => ({
-  default: () => null,
+  default: (props: {
+    progress?: { operationState?: string } | null;
+    loading?: boolean;
+    emptyMessage?: string;
+  }) => (
+    <div data-testid="knowledge-progress-panel">
+      {props.loading
+        ? "progress-loading"
+        : props.progress?.operationState ||
+          props.emptyMessage ||
+          "progress-empty"}
+    </div>
+  ),
 }));
 vi.mock("@/pages/Home", () => ({
   default: () => <div data-testid="knowledge-home">knowledge home</div>,
@@ -83,10 +97,13 @@ vi.mock("@/lib/trpc", () => ({
       knowledgeProgress: {
         useQuery: (input: unknown, options: unknown) => {
           mocks.progressUseQuery(input, options);
+          const data =
+            input && mocks.scopedProgressOverride
+              ? mocks.scopedProgressData
+              : mocks.progressData;
           return {
-            data: mocks.progressData,
-            isLoading:
-              mocks.progressData === undefined && !mocks.progressIsError,
+            data,
+            isLoading: data === undefined && !mocks.progressIsError,
             isError: mocks.progressIsError,
             refetch: mocks.progressRefetch,
           };
@@ -162,6 +179,8 @@ beforeEach(() => {
   mocks.resetIsError = false;
   mocks.progressIsError = false;
   mocks.progressData = { progress: null };
+  mocks.scopedProgressOverride = false;
+  mocks.scopedProgressData = undefined;
   mocks.hydrated = true;
   mocks.conversationLoading = false;
   mocks.syncError = null;
@@ -293,6 +312,46 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
     expect(latestQueryOptions).toBeDefined();
     expect(latestQueryOptions).not.toHaveProperty("enabled");
     expect(screen.getByText("正在恢复构建会话…")).toBeInTheDocument();
+  });
+
+  it("uses the latest canonical business state while the scoped query is still loading", async () => {
+    mocks.activeConversation = {
+      id: "latest-kb",
+      title: "企业知识库构建",
+      status: "running",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    };
+    mocks.progressData = {
+      progress: {
+        build: {
+          id: "latest-build",
+          conversationId: "latest-kb",
+          generation: 1,
+          stateEpoch: 2,
+          revision: 0,
+          updatedAt: 2,
+        },
+        operationState: "waiting_output",
+      },
+    };
+    mocks.scopedProgressOverride = true;
+    mocks.scopedProgressData = undefined;
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("knowledge-progress-panel")).toHaveTextContent(
+        "waiting_output",
+      ),
+    );
+    expect(screen.queryByText("progress-loading")).not.toBeInTheDocument();
   });
 
   it("turns a hanging recovery into an explicit retry within 15 seconds", async () => {

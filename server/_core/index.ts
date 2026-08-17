@@ -14,7 +14,6 @@ import frontmindV2ChatRouter from "../frontmind-v2-chat-router";
 import knowledgeBaseApi, {
   getKnowledgeBaseSkillDescriptor,
   recoverExpiredKnowledgeBaseTurns,
-  recoverOpenKnowledgeBaseTasks,
 } from "../knowledge-base-api";
 import { cleanupOrphanedKnowledgeBuildArtifactCandidates } from "../knowledge-base-artifact-binding-service";
 import responseLogicApi, {
@@ -48,7 +47,10 @@ import {
 } from "./frontmind-proxy-policy";
 import { processKnowledgeResetCleanupJobs } from "../knowledge-base-reset-service";
 import { sweepOrphanedKnowledgeBaseUploadEvidence } from "../knowledge-base-upload-evidence-lifecycle";
-import { assertCredentialEncryptionConfigured } from "../auth-service";
+import {
+  assertCredentialEncryptionConfigured,
+  reconcileManagedUploadAccountDeletionFencesOnStartup,
+} from "../auth-service";
 import { getDb } from "../db";
 import deliveryTicketAttachmentRouter from "../delivery-ticket-attachment-router";
 import { startDeliveryTicketRetentionScheduler } from "../delivery-ticket-retention";
@@ -499,6 +501,7 @@ async function startServer() {
   // Start only after configuration, durable storage and database startup
   // checks have completed. Importing a route module must never trigger
   // provider side effects or hide a preflight failure.
+  await reconcileManagedUploadAccountDeletionFencesOnStartup();
   await ensureManagedUploadIntentWorker();
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
@@ -530,7 +533,6 @@ async function startServer() {
       });
       const recoverKnowledgeBaseState = createKnowledgeBaseRecoverySweep({
         recoverExpiredTurns: () => recoverExpiredKnowledgeBaseTurns(),
-        recoverOpenBuilds: (options) => recoverOpenKnowledgeBaseTasks(options),
         cleanupArtifactCandidates: () =>
           cleanupOrphanedKnowledgeBuildArtifactCandidates(),
       });
@@ -567,8 +569,6 @@ async function startServer() {
             "[KnowledgeBaseRecovery] scan_complete",
             JSON.stringify({
               turns: turnMetrics,
-              releasedPreproviderTurns: recovery.releasedPreproviderTurns,
-              builds: recovery.builds,
               artifacts: recovery.artifacts,
             }),
           );

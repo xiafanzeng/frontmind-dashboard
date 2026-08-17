@@ -37,6 +37,10 @@ export function materializedInitialResearchQuality(input: {
   expectedUploadsRead: number;
   warnings?: KnowledgeBaseResultQualityDto["warnings"];
   droppedCount?: number;
+  normalization?: Pick<
+    KnowledgeBaseResultQualityDto,
+    "completeness" | "downstreamEligible" | "publishable"
+  >;
 }) {
   const acceptedCount = input.leafIds.length;
   const countComplete = acceptedCount >= 30 && acceptedCount <= 115;
@@ -64,13 +68,26 @@ export function materializedInitialResearchQuality(input: {
   } catch {
     initialResearchCoverage = null;
   }
-  const publishable = countComplete && coverageComplete && !droppedBody;
+  const normalizationComplete =
+    !input.normalization ||
+    (input.normalization.completeness === "complete" &&
+      input.normalization.downstreamEligible === true &&
+      input.normalization.publishable === true);
+  const publishable =
+    countComplete && coverageComplete && !droppedBody && normalizationComplete;
   const warnings: NonNullable<KnowledgeBaseResultQualityDto["warnings"]> = [
     ...(input.warnings || []),
   ];
   if (!countComplete && !droppedBody)
     warnings.push({ code: "RESULT_INCOMPLETE" });
   if (!coverageComplete) warnings.push({ code: "COVERAGE_INCOMPLETE" });
+  const deduplicatedWarnings = warnings.filter(
+    (warning, index) =>
+      warnings.findIndex(
+        (candidate) =>
+          candidate.code === warning.code && candidate.area === warning.area,
+      ) === index,
+  );
   return {
     initialResearchCoverage,
     materializedQuality: {
@@ -80,7 +97,7 @@ export function materializedInitialResearchQuality(input: {
         expectedCount: 30,
         droppedCount: Math.max(0, Number(input.droppedCount) || 0),
       },
-      warnings,
+      warnings: deduplicatedWarnings,
       downstreamEligible: publishable,
       publishable,
     } satisfies KnowledgeBaseResultQualityDto,
@@ -93,6 +110,9 @@ const QUALITY_WARNING_CODES = new Set<KnowledgeBaseResultQualityWarningCode>([
   "EVIDENCE_INCOMPLETE",
   "AGGREGATE_UNAVAILABLE",
   "OPTIONAL_ASSET_SKIPPED",
+  "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
+  "MANIFEST_NORMALIZED",
+  "SERVER_COORDINATE_NORMALIZED",
   "PRESENTATION_NORMALIZED",
   "COVERAGE_INCOMPLETE",
 ]);

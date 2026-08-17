@@ -953,6 +953,7 @@ function RealBuildFlow({
   );
   const [liveProgress, setLiveProgress] =
     useState<KnowledgeBaseProgressDto | null>(null);
+  const [progressTimedOut, setProgressTimedOut] = useState(false);
   const liveProgressCoordinateRef = useRef({
     generation: -1,
     stateEpoch: -1,
@@ -1001,6 +1002,7 @@ function RealBuildFlow({
 
   useEffect(() => {
     setLiveProgress(null);
+    setProgressTimedOut(false);
     liveProgressCoordinateRef.current = { generation: -1, stateEpoch: -1 };
   }, [conversationId]);
 
@@ -1016,6 +1018,32 @@ function RealBuildFlow({
       });
     }
   }, [progressQuery.data?.progress]);
+
+  const latestScopedProgress =
+    latestProgressQuery.data?.progress?.build.conversationId === conversationId
+      ? latestProgressQuery.data.progress
+      : null;
+  const displayedProgress =
+    liveProgress ??
+    progressQuery.data?.progress ??
+    latestScopedProgress ??
+    null;
+  const progressRequestPending = Boolean(
+    conversationId && !displayedProgress && progressQuery.isLoading,
+  );
+
+  useEffect(() => {
+    if (!progressRequestPending) {
+      setProgressTimedOut(false);
+      return;
+    }
+    if (progressTimedOut) return;
+    const timeout = window.setTimeout(
+      () => setProgressTimedOut(true),
+      KNOWLEDGE_BASE_RECOVERY_UI_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [progressRequestPending, progressTimedOut]);
 
   useEffect(() => {
     const refresh = (event: Event) => {
@@ -1078,8 +1106,13 @@ function RealBuildFlow({
 
   const progressPanel = (
     <KnowledgeBaseProgressPanel
-      progress={liveProgress ?? progressQuery.data?.progress}
-      loading={progressQuery.isLoading}
+      progress={displayedProgress}
+      loading={progressRequestPending && !progressTimedOut}
+      emptyMessage={
+        progressTimedOut
+          ? "构建状态同步暂时没有响应。任务可继续在上游处理，请稍后重试或在需要时申请重置。"
+          : undefined
+      }
     />
   );
 
@@ -1151,9 +1184,7 @@ function RealBuildFlow({
             hideSidebar
             fixedAgentProfile="frontmind-pro"
             syncKnowledgeBaseSnapshot
-            knowledgeBaseProgress={
-              liveProgress ?? progressQuery.data?.progress ?? null
-            }
+            knowledgeBaseProgress={displayedProgress}
             knowledgeBaseResetRevision={resetRevision}
             knowledgeBaseAccountId={accountId}
             onKnowledgeBaseBatchCancelled={installCancelledBatchRevision}

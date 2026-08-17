@@ -37,6 +37,7 @@ import {
   acquireManagedUploadScopeGuards,
   assertManagedUploadScopesAvailable,
   ManagedUploadDeletionFenceError,
+  reconcileDeletedManagedUploadAccountRetirements,
   type ManagedUploadFenceScope,
 } from "./managed-upload-intent-fence";
 
@@ -317,6 +318,49 @@ function resumeScopeIndexPath(input: {
     managedUploadIntentStorageRoot(),
     "by-resume-scope",
     `${key}.json`,
+  );
+}
+
+function managedUploadIntentIndexAuthority(
+  manifest: Pick<
+    ManagedUploadIntentManifest,
+    | "userId"
+    | "credentialOwnerUserId"
+    | "projectAssignmentId"
+    | "operationId"
+    | "resumeScope"
+  >,
+) {
+  return {
+    userId: manifest.userId,
+    credentialOwnerUserId: manifest.credentialOwnerUserId,
+    projectAssignmentId: manifest.projectAssignmentId,
+    operationId: manifest.operationId,
+    resumeScope: manifest.resumeScope,
+  };
+}
+
+function managedUploadIntentDeletionAuthorityPath(intentId: string) {
+  return path.join(
+    managedUploadIntentStorageRoot(),
+    "deletion-fences",
+    "intent-authority",
+    `${storageKey(intentId)}.json`,
+  );
+}
+
+async function persistManagedUploadIntentDeletionAuthority(
+  manifest: ManagedUploadIntentManifest,
+) {
+  await writeJsonAtomic(
+    managedUploadIntentDeletionAuthorityPath(manifest.intentId),
+    {
+      schemaVersion: 1,
+      intentId: manifest.intentId,
+      requestHash: manifest.requestHash,
+      authority: managedUploadIntentIndexAuthority(manifest),
+      updatedAt: nowIso(),
+    },
   );
 }
 
@@ -1132,6 +1176,46 @@ function managedUploadScopes(input: {
   ];
 }
 
+async function acquireManagedUploadGuardsOrThrow(
+  scopes: ManagedUploadFenceScope[],
+  message: string,
+) {
+  try {
+    return await acquireManagedUploadScopeGuards(scopes);
+  } catch (error) {
+    if (error instanceof ManagedUploadDeletionFenceError) {
+      throw new ManagedUploadIntentError(
+        409,
+        "UPLOAD_IDENTITY_DELETION_IN_PROGRESS",
+        message,
+        false,
+        "refresh_page",
+      );
+    }
+    throw error;
+  }
+}
+
+async function assertManagedUploadScopesAvailableOrThrow(
+  scopes: ManagedUploadFenceScope[],
+  message: string,
+) {
+  try {
+    await assertManagedUploadScopesAvailable(scopes);
+  } catch (error) {
+    if (error instanceof ManagedUploadDeletionFenceError) {
+      throw new ManagedUploadIntentError(
+        410,
+        "UPLOAD_IDENTITY_DELETION_IN_PROGRESS",
+        message,
+        false,
+        "refresh_page",
+      );
+    }
+    throw error;
+  }
+}
+
 async function createManagedUploadIntentUnderOperationLock(
   input: CreateManagedUploadIntentInput,
 ) {
@@ -1223,80 +1307,61 @@ async function createManagedUploadIntentUnderOperationLock(
         intentId: unindexed[0].intentId,
         requestHash: hash,
       });
+      await persistManagedUploadIntentDeletionAuthority(unindexed[0]);
       if (unindexed[0].resumeScope) {
         await appendManagedUploadResumeScopeIndex(unindexed[0]);
       }
       return unindexed[0];
     }
-    // Only a genuinely new allocation needs current credential/deletion
-    // guards and a capacity probe. A lost-201 replay is authoritative from the
-    // old manifest and must remain recoverable after rotation or low disk.
-    const releaseScopes = await acquireManagedUploadScopeGuards(
-      managedUploadScopes(input),
-    ).catch((error) => {
-      if (error instanceof ManagedUploadDeletionFenceError) {
-        throw new ManagedUploadIntentError(
-          409,
-          "UPLOAD_IDENTITY_DELETION_IN_PROGRESS",
-          "账号、项目或上传凭证正在删除，不能创建新上传",
-          false,
-          "refresh_page",
-        );
-      }
-      throw error;
+    await assertStorageWritable(input.sizeBytes);
+    const timestamp = nowIso();
+    const intentId = `mui_${randomUUID()}`;
+    const manifest: ManagedUploadIntentManifest = {
+      schemaVersion: input.resumeScope ? 2 : 1,
+      intentId,
+      operationId: input.operationId,
+      requestHash: hash,
+      batchId: input.batchId,
+      ordinal: input.ordinal,
+      total: input.total,
+      resumeScope: input.resumeScope ?? null,
+      userId: input.userId,
+      projectAssignmentId,
+      credentialId: input.credentialId,
+      credentialOwnerUserId: input.credentialOwnerUserId,
+      credentialVersion: input.credentialVersion,
+      filename: input.filename.trim(),
+      mimeType: input.mimeType.trim(),
+      declaredSizeBytes: input.sizeBytes,
+      sizeBytes: null,
+      sha256: null,
+      state: "awaiting_browser",
+      phase: null,
+      revision: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      providerGeneration: 0,
+      provider: [],
+      receipt: null,
+      safeErrorCode: null,
+      createdAt: timestamp,
+      sealedAt: null,
+      updatedAt: timestamp,
+      completedAt: null,
+      deletedAt: null,
+    };
+    await ensurePrivateDirectory(intentPaths(intentId).directory);
+    await writeJsonAtomic(intentPaths(intentId).manifest, manifest);
+    await writeJsonAtomic(indexPath, {
+      schemaVersion: 1,
+      intentId,
+      requestHash: hash,
     });
-    try {
-      await assertStorageWritable(input.sizeBytes);
-      const timestamp = nowIso();
-      const intentId = `mui_${randomUUID()}`;
-      const manifest: ManagedUploadIntentManifest = {
-        schemaVersion: input.resumeScope ? 2 : 1,
-        intentId,
-        operationId: input.operationId,
-        requestHash: hash,
-        batchId: input.batchId,
-        ordinal: input.ordinal,
-        total: input.total,
-        resumeScope: input.resumeScope ?? null,
-        userId: input.userId,
-        projectAssignmentId,
-        credentialId: input.credentialId,
-        credentialOwnerUserId: input.credentialOwnerUserId,
-        credentialVersion: input.credentialVersion,
-        filename: input.filename.trim(),
-        mimeType: input.mimeType.trim(),
-        declaredSizeBytes: input.sizeBytes,
-        sizeBytes: null,
-        sha256: null,
-        state: "awaiting_browser",
-        phase: null,
-        revision: 1,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        providerGeneration: 0,
-        provider: [],
-        receipt: null,
-        safeErrorCode: null,
-        createdAt: timestamp,
-        sealedAt: null,
-        updatedAt: timestamp,
-        completedAt: null,
-        deletedAt: null,
-      };
-      await ensurePrivateDirectory(intentPaths(intentId).directory);
-      await writeJsonAtomic(intentPaths(intentId).manifest, manifest);
-      await writeJsonAtomic(indexPath, {
-        schemaVersion: 1,
-        intentId,
-        requestHash: hash,
-      });
-      if (manifest.resumeScope) {
-        await appendManagedUploadResumeScopeIndex(manifest);
-      }
-      return manifest;
-    } finally {
-      await releaseScopes();
+    await persistManagedUploadIntentDeletionAuthority(manifest);
+    if (manifest.resumeScope) {
+      await appendManagedUploadResumeScopeIndex(manifest);
     }
+    return manifest;
   } finally {
     await releaseOperationLock();
   }
@@ -1342,7 +1407,18 @@ export async function createManagedUploadIntent(
   input: CreateManagedUploadIntentInput,
 ) {
   validateCreateInput(input);
-  return createManagedUploadIntentUnderOperationLock(input);
+  // The guard covers both allocation and idempotent replay. Otherwise an old
+  // operation index could be replayed after account deletion established its
+  // durable tombstone.
+  const releaseScopes = await acquireManagedUploadGuardsOrThrow(
+    managedUploadScopes(input),
+    "账号、项目或上传凭证正在删除，不能创建或恢复上传",
+  );
+  try {
+    return await createManagedUploadIntentUnderOperationLock(input);
+  } finally {
+    await releaseScopes();
+  }
 }
 
 /**
@@ -1368,6 +1444,21 @@ export async function readKnowledgeBaseManagedUploadIntentByOperation(input: {
       "refresh_page",
     );
   }
+  await assertManagedUploadScopesAvailableOrThrow(
+    [
+      { kind: "user", userId: input.userId },
+      ...(input.projectAssignmentId
+        ? [
+            {
+              kind: "project" as const,
+              userId: input.userId,
+              projectAssignmentId: input.projectAssignmentId,
+            },
+          ]
+        : []),
+    ],
+    "账号或项目已删除，旧上传操作不可恢复",
+  );
   const projectAssignmentId = input.projectAssignmentId ?? null;
   const indexPath = operationIndexPath({
     userId: input.userId,
@@ -1418,6 +1509,10 @@ export async function readKnowledgeBaseManagedUploadIntentByOperation(input: {
   ) {
     throw new Error("MANAGED_UPLOAD_INTENT_INDEX_MISMATCH");
   }
+  await assertManagedUploadScopesAvailableOrThrow(
+    managedUploadScopes(manifest),
+    "账号、项目或上传凭证已删除，旧上传操作不可恢复",
+  );
   return manifest;
 }
 
@@ -1653,6 +1748,21 @@ export async function listManagedUploadIntentsByResumeScope(input: {
       "refresh_page",
     );
   }
+  await assertManagedUploadScopesAvailableOrThrow(
+    [
+      { kind: "user", userId: input.userId },
+      ...(input.projectAssignmentId
+        ? [
+            {
+              kind: "project" as const,
+              userId: input.userId,
+              projectAssignmentId: input.projectAssignmentId,
+            },
+          ]
+        : []),
+    ],
+    "账号或项目已删除，旧上传恢复入口不可用",
+  );
   const indexPath = resumeScopeIndexPath({
     userId: input.userId,
     projectAssignmentId: input.projectAssignmentId ?? null,
@@ -1733,6 +1843,12 @@ export async function listManagedUploadIntentsByResumeScope(input: {
       "上传预约的固定凭证与当前知识库轮次不匹配",
       false,
       "refresh_page",
+    );
+  }
+  for (const manifest of manifests) {
+    await assertManagedUploadScopesAvailableOrThrow(
+      managedUploadScopes(manifest),
+      "账号、项目或上传凭证已删除，旧上传恢复入口不可用",
     );
   }
   return manifests
@@ -2081,7 +2197,7 @@ async function reconcileInterruptedIngress(
   }));
 }
 
-export async function receiveManagedUploadIntentBody(input: {
+type ReceiveManagedUploadIntentBodyInput = {
   intentId: string;
   ticket: string;
   userId: number;
@@ -2090,7 +2206,36 @@ export async function receiveManagedUploadIntentBody(input: {
   request: Pick<Request, "complete"> & AsyncIterable<unknown>;
   /** Test seam for storage failures after the receiving CAS. */
   onBeforePartOpen?: () => Promise<void>;
-}) {
+};
+
+export async function receiveManagedUploadIntentBody(
+  input: ReceiveManagedUploadIntentBodyInput,
+) {
+  const initial = await readManagedUploadIntent(input.intentId);
+  if (!initial) {
+    throw new ManagedUploadIntentError(
+      404,
+      "UPLOAD_INTENT_NOT_FOUND",
+      "上传记录不存在",
+      false,
+      "refresh_page",
+    );
+  }
+  assertIntentOwner(initial, input);
+  const releaseScopes = await acquireManagedUploadGuardsOrThrow(
+    managedUploadScopes(initial),
+    "账号、项目或上传凭证正在删除，不能继续接收文件",
+  );
+  try {
+    return await receiveManagedUploadIntentBodyUnderScopeGuard(input);
+  } finally {
+    await releaseScopes();
+  }
+}
+
+async function receiveManagedUploadIntentBodyUnderScopeGuard(
+  input: ReceiveManagedUploadIntentBodyInput,
+) {
   let initial = await readManagedUploadIntent(input.intentId);
   if (!initial)
     throw new ManagedUploadIntentError(
@@ -2974,13 +3119,72 @@ function statusFromManifest(
   };
 }
 
-export async function processManagedUploadIntent(input: {
+type ProcessManagedUploadIntentInput = {
   intentId: string;
   userId: number;
   projectAssignmentId?: string | null;
   traceId: string;
   signal?: AbortSignal;
-}): Promise<ManagedUploadIntentStatus> {
+};
+
+export async function processManagedUploadIntent(
+  input: ProcessManagedUploadIntentInput,
+): Promise<ManagedUploadIntentStatus> {
+  const initial = await readManagedUploadIntent(input.intentId);
+  if (!initial) {
+    throw new ManagedUploadIntentError(
+      404,
+      "UPLOAD_INTENT_NOT_FOUND",
+      "上传记录不存在",
+      false,
+      "refresh_page",
+    );
+  }
+  assertIntentOwner(initial, input);
+  if (
+    initial.state === "cleanup_pending" &&
+    [
+      "UPLOAD_ACCOUNT_DELETED",
+      "UPLOAD_ACCOUNT_DELETION_CLEANUP_PENDING",
+    ].includes(initial.safeErrorCode ?? "")
+  ) {
+    throw new ManagedUploadIntentError(
+      410,
+      "UPLOAD_INTENT_CANCELLED",
+      "上传记录已由账号删除或知识库重置永久退休",
+      false,
+      "refresh_page",
+    );
+  }
+  await assertManagedUploadScopesAvailableOrThrow(
+    managedUploadScopes(initial),
+    "账号、项目或上传凭证正在删除，云端上传已终止",
+  );
+  if (
+    initial.leaseOwner &&
+    initial.leaseExpiresAt &&
+    Date.parse(initial.leaseExpiresAt) > Date.now()
+  ) {
+    return statusFromManifest(initial, input.traceId);
+  }
+  // Hold the same locks deletion must acquire across Provider create/PUT,
+  // ownership recording and the final manifest CAS. Deletion therefore
+  // happens entirely before or entirely after a side effect, never between
+  // the remote response and its durable local result.
+  const releaseScopes = await acquireManagedUploadGuardsOrThrow(
+    managedUploadScopes(initial),
+    "账号、项目或上传凭证正在删除，云端上传已终止",
+  );
+  try {
+    return await processManagedUploadIntentUnderScopeGuard(input);
+  } finally {
+    await releaseScopes();
+  }
+}
+
+async function processManagedUploadIntentUnderScopeGuard(
+  input: ProcessManagedUploadIntentInput,
+): Promise<ManagedUploadIntentStatus> {
   let initial = await readManagedUploadIntent(input.intentId);
   if (!initial)
     throw new ManagedUploadIntentError(
@@ -4480,6 +4684,9 @@ async function prepareManagedUploadIntentWorkerStorage() {
   }
   await fs.rm(probe, { force: true });
   await fsyncDirectory(root);
+  await reconcileDeletedManagedUploadAccountRetirements().catch(
+    () => undefined,
+  );
   workerReadiness.storageReady = true;
 }
 

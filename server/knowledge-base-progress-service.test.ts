@@ -22,6 +22,7 @@ import {
   knowledgeBaseBuildRequiresApprovedReset,
   knowledgeBaseDeferredUploadProjection,
   knowledgeBaseMaterializedResultFailureNotice,
+  knowledgeBaseMaterializedBusinessProjection,
   knowledgeBaseLogoProgressPolicy,
   knowledgeBaseOperationalFailureAuthority,
   knowledgeBasePackageProjectionCompatibility,
@@ -236,6 +237,84 @@ describe("knowledge-base rejected materialized result projection", () => {
         protocolErrorCode: "RECOVERY_DEFERRED",
       }),
     ).toBeNull();
+  });
+});
+
+describe("knowledge-base materialized business projection", () => {
+  const progress = {
+    build: { id: "build-v5" },
+    contentAvailability: "partial",
+    operationState: "creating",
+    resetAllowed: false,
+    warningCodes: [],
+  } as any;
+
+  it("uses durable acknowledgement rather than Provider terminal status", () => {
+    expect(
+      knowledgeBaseMaterializedBusinessProjection({
+        progress,
+        activeTurn: {
+          upstreamTaskId: "task-v5",
+          metadata: {
+            createAttemptState: "acknowledged",
+            providerAttemptState: "output_pending",
+            materializedCompletion: {
+              schemaVersion: 1,
+              lastStatus: "stopped",
+            },
+          },
+        } as any,
+      }),
+    ).toMatchObject({
+      contentAvailability: "partial",
+      operationState: "waiting_output",
+      resetAllowed: false,
+    });
+  });
+
+  it("projects a locally staged canonical candidate as normalization", () => {
+    expect(
+      knowledgeBaseMaterializedBusinessProjection({
+        progress,
+        activeTurn: {
+          upstreamTaskId: "task-v5",
+          metadata: {
+            createAttemptState: "acknowledged",
+            materializedCompletion: {
+              schemaVersion: 1,
+              storageKey: "working/candidate.zip",
+              candidateArchiveSha256: "a".repeat(64),
+            },
+          },
+        } as any,
+      }).operationState,
+    ).toBe("normalizing");
+  });
+
+  it.each(["unknown", "rejected"])(
+    "opens approved reset for a %s create result without exposing a stopped state",
+    (createAttemptState) => {
+      expect(
+        knowledgeBaseMaterializedBusinessProjection({
+          progress,
+          activeTurn: {
+            upstreamTaskId: null,
+            metadata: { createAttemptState },
+          } as any,
+        }),
+      ).toMatchObject({
+        operationState: "reset_required",
+        resetAllowed: true,
+        warningCodes: ["FRONTMIND_KB_RESET_REQUIRED"],
+      });
+    },
+  );
+
+  it("leaves a legacy DTO unchanged", () => {
+    const legacy = { build: { id: "legacy" } } as any;
+    expect(
+      knowledgeBaseMaterializedBusinessProjection({ progress: legacy }),
+    ).toBe(legacy);
   });
 });
 

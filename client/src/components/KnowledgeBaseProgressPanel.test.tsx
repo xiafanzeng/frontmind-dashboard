@@ -199,16 +199,64 @@ describe("KnowledgeBaseProgressPanel", () => {
             currentLeafId: null,
             protocolError: KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
           },
+          contentAvailability: "none",
+          operationState: "reset_required",
+          resetAllowed: true,
           packageAllowed: false,
         }}
       />,
     );
 
-    expect(screen.getByText("本轮已停止")).toBeTruthy();
+    expect(screen.getByText("本轮结果需要重置")).toBeTruthy();
+    expect(screen.queryByText("本轮已停止")).toBeNull();
     expect(
       screen.getByText(KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE),
     ).toBeTruthy();
     expect(screen.queryByText(/排查编号|sha256|trace|task[_-]?id/i)).toBeNull();
+  });
+
+  it("projects an acknowledged result phase as normalization instead of stopped", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "protocol_error",
+            protocolError: "Provider stopped",
+          },
+          contentAvailability: "partial",
+          operationState: "normalizing",
+          resetAllowed: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("正在处理已返回内容")).toBeTruthy();
+    expect(screen.queryByText("本轮已停止")).toBeNull();
+    expect(screen.queryByText(/Provider/i)).toBeNull();
+  });
+
+  it("keeps a server-declared partial canonical result visible without legacy quality fields", () => {
+    render(
+      <KnowledgeBaseProgressPanel
+        progress={{
+          ...progress,
+          build: {
+            ...progress.build,
+            status: "protocol_error",
+            protocolError: "Provider stopped",
+          },
+          contentAvailability: "partial",
+          operationState: "completed",
+          resetAllowed: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("内容不完整，可安全查看")).toBeTruthy();
+    expect(screen.queryByText("本轮已停止")).toBeNull();
+    expect(screen.queryByText(/Provider/i)).toBeNull();
   });
 
   it("distinguishes package ready from content-only completion", () => {

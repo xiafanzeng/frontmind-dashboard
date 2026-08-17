@@ -128,6 +128,28 @@ describe("materialized knowledge-base publishability", () => {
     ).toBe(false);
   });
 
+  it("does not upgrade a typed partial render snapshot after canonical revalidation", () => {
+    const ids = leafIds();
+    const activated = materializedInitialResearchQuality({
+      researchCoverage: researchCoverage(ids),
+      leafIds: ids,
+      expectedUploadsRead: 2,
+      warnings: [{ code: "MANIFEST_NORMALIZED", area: "nodes" }],
+      normalization: {
+        completeness: "partial",
+        downstreamEligible: false,
+        publishable: false,
+      },
+    });
+
+    expect(activated.materializedQuality).toMatchObject({
+      completeness: "partial",
+      downstreamEligible: false,
+      publishable: false,
+      warnings: [{ code: "MANIFEST_NORMALIZED", area: "nodes" }],
+    });
+  });
+
   it("requires the deep leaf count and exact accepted node identity set", () => {
     const ids = leafIds();
     const activated = materializedInitialResearchQuality({

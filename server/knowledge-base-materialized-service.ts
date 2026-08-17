@@ -22,13 +22,13 @@ import {
 } from "./knowledge-base-conversation-messages";
 import {
   KnowledgeBaseMaterializedContractError,
+  type KnowledgeBaseNormalizationOutcome,
   type KnowledgeBaseInitialBundleExpectation,
   type KnowledgeBaseNodePatchManifest,
   type KnowledgeBasePatchAttachmentSourceProof,
   type KnowledgeBaseWorkingSetManifest,
-  isKnowledgeBasePatchManifestParseError,
+  normalizeMaterializedKnowledgeBaseResult,
   projectKnowledgeBaseCustomerMarkdown,
-  salvageKnowledgeBaseNodePatchArchive,
   validateKnowledgeBaseNodePatchArchive,
   validateKnowledgeBaseWorkingSetArchive,
 } from "./knowledge-base-materialized-contract";
@@ -55,12 +55,18 @@ import {
 } from "./knowledge-base-company-identity";
 import {
   isMaterializedBuildPublishable,
+  materializedBuildResultQuality,
   materializedInitialResearchQuality,
 } from "./knowledge-base-materialized-quality";
 import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
 
 export const MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE =
   "materialized_bundle_v1" as const;
+
+type AcceptedKnowledgeBaseNormalization = Extract<
+  KnowledgeBaseNormalizationOutcome,
+  { kind: "accepted" }
+>;
 
 type MaterializedErrorCode =
   | "DATABASE_UNAVAILABLE"
@@ -310,6 +316,46 @@ function nodeMarkdown(
   );
 }
 
+function assertAcceptedNormalizationMatchesWorkingSet(input: {
+  normalization: AcceptedKnowledgeBaseNormalization;
+  expectedMode: "initial" | "patch";
+  validated: Awaited<ReturnType<typeof validateKnowledgeBaseWorkingSetArchive>>;
+}) {
+  const { normalization, validated } = input;
+  if (
+    normalization.mode !== input.expectedMode ||
+    normalization.packageSha256 !== validated.packageSha256 ||
+    normalization.manifestSha256 !== validated.manifestSha256 ||
+    !normalization.canonicalArchiveBytes.equals(validated.archiveBytes) ||
+    stableJson(normalization.manifest) !== stableJson(validated.manifest) ||
+    normalization.renderSnapshot.operationId !==
+      validated.manifest.operationId ||
+    normalization.renderSnapshot.buildId !== validated.manifest.buildId ||
+    normalization.renderSnapshot.generation !== validated.manifest.generation ||
+    normalization.renderSnapshot.contentVersion !==
+      validated.manifest.contentVersion ||
+    normalization.renderSnapshot.completeness !== normalization.completeness ||
+    normalization.renderSnapshot.leaves.length !==
+      validated.manifest.leaves.length
+  ) {
+    fail("STALE_COORDINATES", "Normalization 与 canonical Working Set 不一致");
+  }
+  for (const [index, leaf] of validated.manifest.leaves.entries()) {
+    const rendered = normalization.renderSnapshot.leaves[index];
+    if (
+      !rendered ||
+      rendered.leafId !== leaf.leafId ||
+      rendered.branchId !== leaf.branchId ||
+      rendered.title !== leaf.title ||
+      rendered.ordinal !== leaf.ordinal ||
+      stableJson(rendered.assetIds) !== stableJson(leaf.assetIds) ||
+      knowledgeBaseMarkdownSha256(rendered.markdown) !== leaf.contentSha256
+    ) {
+      fail("STALE_COORDINATES", "Normalization presentation snapshot 不一致");
+    }
+  }
+}
+
 /**
  * Atomically activates a complete provider bundle. The provider task becomes
  * immutable audit provenance only; all subsequent reads and confirmations use
@@ -325,6 +371,7 @@ export async function activateInitialKnowledgeBaseWorkingSet(input: {
   providerTaskId: string;
   archiveBytes: Buffer;
   initialBundleExpectation: KnowledgeBaseInitialBundleExpectation;
+  normalization?: AcceptedKnowledgeBaseNormalization;
   receivedAt?: Date;
 }) {
   const db = await requireDb();
@@ -333,6 +380,14 @@ export async function activateInitialKnowledgeBaseWorkingSet(input: {
     input.archiveBytes,
     input.initialBundleExpectation,
   );
+  if (input.normalization) {
+    assertAcceptedNormalizationMatchesWorkingSet({
+      normalization: input.normalization,
+      expectedMode: "initial",
+      validated,
+    });
+  }
+  const normalization = input.normalization;
   const retained = await persistKnowledgeBaseBuildSource({
     userId: input.userId,
     buildId: input.buildId,
@@ -447,8 +502,20 @@ export async function activateInitialKnowledgeBaseWorkingSet(input: {
       researchCoverage: validated.manifest.researchCoverage,
       leafIds: validated.manifest.leaves.map((leaf) => leaf.leafId),
       expectedUploadsRead: input.initialBundleExpectation.expectedUploadsRead,
-      warnings: validated.warnings,
-      droppedCount: validated.droppedOptionalCount,
+      warnings: normalization?.diagnostics ?? validated.warnings,
+      droppedCount:
+        normalization?.workingSet.droppedOptionalCount ??
+        validated.droppedOptionalCount,
+      ...(normalization
+        ? {
+            normalization: {
+              completeness: normalization.completeness,
+              downstreamEligible:
+                normalization.renderSnapshot.downstreamEligible,
+              publishable: normalization.renderSnapshot.publishable,
+            },
+          }
+        : {}),
     });
     const existingNodes = await tx
       .select({ id: knowledgeBaseBuildNodes.id })
@@ -476,11 +543,10 @@ export async function activateInitialKnowledgeBaseWorkingSet(input: {
       createdAt: receivedAt,
     });
     const rows = validated.manifest.leaves.map((leaf, index) => {
-      const markdown = nodeMarkdown(
-        validated.manifest,
-        leaf.leafId,
-        validated.files,
-      );
+      const rendered = normalization?.renderSnapshot.leaves[index];
+      const markdown =
+        rendered?.markdown ??
+        nodeMarkdown(validated.manifest, leaf.leafId, validated.files);
       const localUrls = knowledgeBaseWorkingSetLeafLocalUrls({
         buildId: build.id,
         leafId: leaf.leafId,
@@ -577,6 +643,20 @@ export async function activateInitialKnowledgeBaseWorkingSet(input: {
           dispatchState: "completed",
           contentVersion: 1,
           workingSetId,
+          ...(normalization
+            ? {
+                normalization: {
+                  completeness: normalization.completeness,
+                  downstreamEligible:
+                    normalization.renderSnapshot.downstreamEligible,
+                  publishable: normalization.renderSnapshot.publishable,
+                  diagnostics: normalization.diagnostics,
+                  renderSnapshotSha256: sha256(
+                    stableJson(normalization.renderSnapshot),
+                  ),
+                },
+              }
+            : {}),
         },
         updatedAt: receivedAt,
       })
@@ -1595,6 +1675,7 @@ export async function validateKnowledgeBaseRevisionAgainstActiveWorkingSet(input
   targetLeafId: string;
   operationId: string;
   archiveBytes: Buffer;
+  descriptorFilename?: string;
 }) {
   const db = await requireDb();
   const build = (
@@ -1690,15 +1771,24 @@ export async function validateKnowledgeBaseRevisionAgainstActiveWorkingSet(input
     targetLeafId: input.targetLeafId,
     attachmentSourceProofs,
   };
-  let patch: Awaited<ReturnType<typeof validateKnowledgeBaseNodePatchArchive>>;
-  try {
-    patch = await validateKnowledgeBaseNodePatchArchive(
-      input.archiveBytes,
-      patchExpectation,
-    );
-  } catch (error) {
-    if (!isKnowledgeBasePatchManifestParseError(error)) throw error;
-    patch = await db.transaction(async (tx: any) => {
+  const descriptorFilename =
+    input.descriptorFilename ?? `frontmind-kb-patch-${input.operationId}.zip`;
+  let normalization = await normalizeMaterializedKnowledgeBaseResult({
+    mode: "patch",
+    archiveBytes: input.archiveBytes,
+    authority: patchExpectation,
+    provenance: {
+      exactBoundTask: true,
+      directAssistantOutput: true,
+      descriptorFilename,
+    },
+    base: baseValidated,
+  });
+  if (
+    normalization.kind === "rejected" &&
+    normalization.stage === "manifest_parse"
+  ) {
+    normalization = await db.transaction(async (tx: any) => {
       const lockedBuild = (
         await tx
           .select()
@@ -1775,9 +1865,10 @@ export async function validateKnowledgeBaseRevisionAgainstActiveWorkingSet(input
       const lockedProofs = materializedPatchAttachmentSourceProofs(
         lockedTurn.metadata,
       );
-      return salvageKnowledgeBaseNodePatchArchive({
-        bytes: input.archiveBytes,
-        expected: {
+      return normalizeMaterializedKnowledgeBaseResult({
+        mode: "patch",
+        archiveBytes: input.archiveBytes,
+        authority: {
           operationId: input.operationId,
           buildId: lockedBuild.id,
           generation: lockedBuild.generation,
@@ -1786,24 +1877,33 @@ export async function validateKnowledgeBaseRevisionAgainstActiveWorkingSet(input
           targetLeafId: input.targetLeafId,
           attachmentSourceProofs: lockedProofs,
         },
-        dbAuthorityLocked: true,
+        provenance: {
+          exactBoundTask: true,
+          directAssistantOutput: true,
+          descriptorFilename,
+          baseAuthorityLocked: true,
+        },
+        base: baseValidated,
       });
     });
   }
-  assertPatchRemovalOwnership({
-    base: baseValidated.manifest,
-    patch: patch.manifest,
-  });
+  if (normalization.kind === "rejected" || !normalization.sourcePatch) {
+    fail(
+      "PATCH_CONFLICT",
+      normalization.kind === "rejected"
+        ? `${normalization.code}:${normalization.stage}`
+        : "Patch normalization 缺少 canonical source patch",
+    );
+  }
+  const patch = normalization.sourcePatch;
   return {
     build,
     base,
     baseValidated,
     patch,
+    normalization,
     attachmentSourceProofs,
-    nextEvidenceLedger: updatedEvidenceLedger({
-      manifest: baseValidated.manifest,
-      patch: patch.manifest,
-    }),
+    nextEvidenceLedger: normalization.manifest.evidenceLedger,
   };
 }
 
@@ -1816,6 +1916,7 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
   providerTaskId: string;
   targetLeafId: string;
   archiveBytes: Buffer;
+  normalization?: AcceptedKnowledgeBaseNormalization;
   executionId?: string;
   receivedAt?: Date;
 }) {
@@ -1823,6 +1924,51 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
   const receivedAt = input.receivedAt ?? new Date();
   const prepared =
     await validateKnowledgeBaseRevisionAgainstActiveWorkingSet(input);
+  let normalization = prepared.normalization;
+  if (input.normalization) {
+    const suppliedPatch = input.normalization.sourcePatch;
+    if (
+      input.normalization.mode !== "patch" ||
+      !suppliedPatch ||
+      suppliedPatch.packageSha256 !== sha256(input.archiveBytes) ||
+      input.normalization.packageSha256 !== normalization.packageSha256 ||
+      stableJson(input.normalization.manifest) !==
+        stableJson(normalization.manifest)
+    ) {
+      fail(
+        "PATCH_CONFLICT",
+        "预验证 Patch normalization 与 frozen base 不一致",
+      );
+    }
+    normalization = input.normalization;
+  }
+  assertAcceptedNormalizationMatchesWorkingSet({
+    normalization,
+    expectedMode: "patch",
+    validated: normalization.workingSet,
+  });
+  const priorQuality = materializedBuildResultQuality(prepared.build);
+  const coverage = record(normalization.manifest.researchCoverage) || {};
+  const patchDroppedCount = normalization.sourcePatch
+    ? Object.values(normalization.sourcePatch.droppedComponents).reduce(
+        (sum, value) => sum + value,
+        0,
+      )
+    : 0;
+  const revisionQuality = materializedInitialResearchQuality({
+    researchCoverage: normalization.manifest.researchCoverage,
+    leafIds: normalization.manifest.leaves.map((leaf) => leaf.leafId),
+    expectedUploadsRead: Number(coverage.uploadsRead),
+    warnings: [...(priorQuality?.warnings || []), ...normalization.diagnostics],
+    droppedCount:
+      Math.max(0, Number(priorQuality?.stats?.droppedCount) || 0) +
+      patchDroppedCount,
+    normalization: {
+      completeness: normalization.completeness,
+      downstreamEligible: normalization.renderSnapshot.downstreamEligible,
+      publishable: normalization.renderSnapshot.publishable,
+    },
+  });
   const stagedTurn = (
     await db
       .select({ metadata: conversationTurns.metadata })
@@ -1858,10 +2004,11 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
       expectedBytes: stagedLogo.bytes,
     });
   }
-  const composed = await composeKnowledgeBaseWorkingSetRevision({
-    base: prepared.baseValidated,
-    patch: prepared.patch,
-  });
+  const composed = {
+    archiveBytes: normalization.canonicalArchiveBytes,
+    validated: normalization.workingSet,
+    changed: normalization.changed === true,
+  };
   const retained = await persistKnowledgeBaseBuildSource({
     userId: input.userId,
     buildId: input.buildId,
@@ -2009,6 +2156,16 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
             disposition: "no_effective_change",
             contentVersion: build.contentVersion,
             workingSetId: base.id,
+            normalization: {
+              completeness: normalization.completeness,
+              downstreamEligible:
+                normalization.renderSnapshot.downstreamEligible,
+              publishable: normalization.renderSnapshot.publishable,
+              diagnostics: normalization.diagnostics,
+              renderSnapshotSha256: sha256(
+                stableJson(normalization.renderSnapshot),
+              ),
+            },
           },
           updatedAt: receivedAt,
         })
@@ -2061,11 +2218,10 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
     const nextLeaf = composed.validated.manifest.leaves.find(
       (leaf) => leaf.leafId === current.leafId,
     )!;
-    const markdown = nodeMarkdown(
-      composed.validated.manifest,
-      current.leafId,
-      composed.validated.files,
-    );
+    const renderedLeaf = normalization.renderSnapshot.leaves.find(
+      (leaf) => leaf.leafId === current.leafId,
+    )!;
+    const markdown = renderedLeaf.markdown;
     const nextRevision = build.revision + 1;
     const presentationKey = knowledgeBasePresentationKey({
       buildId: build.id,
@@ -2116,6 +2272,10 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
         awaitingResponseSince: null,
         protocolErrorCode: null,
         protocolError: null,
+        handoffProvenance: {
+          ...(record(build.handoffProvenance) || {}),
+          materializedQuality: revisionQuality.materializedQuality,
+        },
         ...(logoActivation.logoUpdate ?? {}),
         updatedAt: receivedAt,
       })
@@ -2134,6 +2294,15 @@ export async function applyKnowledgeBaseRevisionWorkingSet(input: {
           dispatchState: "completed",
           contentVersion: nextVersion,
           workingSetId: nextWorkingSetId,
+          normalization: {
+            completeness: normalization.completeness,
+            downstreamEligible: normalization.renderSnapshot.downstreamEligible,
+            publishable: normalization.renderSnapshot.publishable,
+            diagnostics: normalization.diagnostics,
+            renderSnapshotSha256: sha256(
+              stableJson(normalization.renderSnapshot),
+            ),
+          },
         },
         updatedAt: receivedAt,
       })

@@ -17,7 +17,7 @@ export const KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH =
 
 /** Immutable materialized v5 archive used by every new build. */
 export const KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH =
-  "fa60d261709e9d2aa93c23a251dfb67fc07ba400978c521a71489af6fbb6c536";
+  "eab3455859623078239c32232109e4445a93b8ba7906f785495c2df86fd2182f";
 
 export function knowledgeBaseSkillContentHashForTreePolicy(
   treePolicyVersion: KnowledgeBaseTreePolicyVersion,

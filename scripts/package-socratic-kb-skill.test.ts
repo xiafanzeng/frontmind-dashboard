@@ -66,6 +66,9 @@ describe("socratic knowledge-base Skill v5 packaging", () => {
     const validator = await archive
       .file("scripts/validate_working_set.py")!
       .async("string");
+    const policy = JSON.parse(
+      await archive.file("references/working-set-policy.json")!.async("string"),
+    );
 
     expect(entries).toEqual([...socraticKnowledgeBaseSkillEntries].sort());
     expect(skill).toContain("materialize_initial_bundle");
@@ -98,9 +101,16 @@ describe("socratic knowledge-base Skill v5 packaging", () => {
     ]) {
       expect(contract).toContain(`"id": "${dimensionId}"`);
     }
-    expect(validator).toContain('parser.add_argument("--expected-uploads-read"');
+    expect(validator).toContain(
+      'parser.add_argument("--expected-uploads-read"',
+    );
     expect(validator).toContain("validate_research_coverage(");
     expect(validator).toContain("customer_markdown_title(");
+    expect(validator).toContain("working-set-policy.json");
+    expect(policy).toMatchObject({
+      archive: { maxCompressionRatio: 200, maxEntryCount: 1500 },
+      evidence: { textExtensions: [".md", ".markdown", ".txt"] },
+    });
     expect(entries).not.toContain("scripts/validate_archive.py");
     expect(result.contentHash).toBe(
       await canonicalKnowledgeBaseSkillArchiveHash(archiveBytes),

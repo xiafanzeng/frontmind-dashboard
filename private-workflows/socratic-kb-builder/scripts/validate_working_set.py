@@ -17,8 +17,20 @@ import zipfile
 
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,190}$")
-MAX_FILES = 1500
-MAX_UNCOMPRESSED = 120 * 1024 * 1024
+POLICY_PATH = pathlib.Path(__file__).resolve().parents[1] / "references" / "working-set-policy.json"
+WORKING_SET_POLICY = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+if WORKING_SET_POLICY.get("schemaVersion") != 1:
+    raise ValueError("unsupported working-set policy schema")
+ARCHIVE_POLICY = WORKING_SET_POLICY["archive"]
+EVIDENCE_POLICY = WORKING_SET_POLICY["evidence"]
+AUTHORITY_POLICY = WORKING_SET_POLICY["authority"]
+MAX_COMPRESSED = int(ARCHIVE_POLICY["maxCompressedBytes"])
+MAX_UNCOMPRESSED = int(ARCHIVE_POLICY["maxUncompressedBytes"])
+MAX_FILES = int(ARCHIVE_POLICY["maxEntryCount"])
+MAX_COMPRESSION_RATIO = float(ARCHIVE_POLICY["maxCompressionRatio"])
+MAX_ASSET_BYTES = int(ARCHIVE_POLICY["maxAssetBytes"])
+TEXT_EVIDENCE_EXTENSIONS = frozenset(EVIDENCE_POLICY["textExtensions"])
+TEXT_EVIDENCE_MIME_TYPES = frozenset(EVIDENCE_POLICY["textMimeTypes"])
 RESEARCH_DIMENSION_IDS = (
     "enterprise_identity",
     "team_and_organization",
@@ -56,6 +68,123 @@ ASSET_DISPLAY_ROLES = {"hero", "inline", "badge"}
 
 def fail(message: str) -> None:
     raise ValueError(message)
+
+
+def normalized_media_type(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.split(";", 1)[0].strip().lower()
+    return normalized or None
+
+
+def is_text_evidence_path(value: str) -> bool:
+    return pathlib.PurePosixPath(value).suffix.lower() in TEXT_EVIDENCE_EXTENSIONS
+
+
+def evaluate_archive_policy(value: dict) -> bool:
+    entries = value.get("entries")
+    compressed_bytes = value.get("compressedBytes")
+    if (
+        isinstance(compressed_bytes, bool)
+        or not isinstance(compressed_bytes, int)
+        or not 0 < compressed_bytes <= MAX_COMPRESSED
+        or not isinstance(entries, list)
+        or not 1 <= len(entries) <= MAX_FILES
+    ):
+        return False
+    total_uncompressed = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        compressed = entry.get("compressedBytes")
+        uncompressed = entry.get("uncompressedBytes")
+        if (
+            isinstance(compressed, bool)
+            or isinstance(uncompressed, bool)
+            or not isinstance(compressed, int)
+            or not isinstance(uncompressed, int)
+            or compressed < 0
+            or uncompressed < 0
+        ):
+            return False
+        total_uncompressed += uncompressed
+        if uncompressed > 0 and (
+            compressed <= 0 or uncompressed / compressed > MAX_COMPRESSION_RATIO
+        ):
+            return False
+    return total_uncompressed <= MAX_UNCOMPRESSED
+
+
+def working_set_policy_probe(value: dict) -> dict:
+    retained: list[str] = []
+    dropped: list[str] = []
+    warnings: list[dict] = []
+    archive = value.get("archive")
+    if archive is not None and (
+        not isinstance(archive, dict) or not evaluate_archive_policy(archive)
+    ):
+        return {
+            "accepted": False,
+            "retained": retained,
+            "dropped": dropped,
+            "warnings": warnings,
+            "hardFailure": "archiveSafety",
+        }
+    authority = value.get("authority")
+    if isinstance(authority, dict) and authority.get("matches") is False:
+        mode = authority.get("mode")
+        field = authority.get("field")
+        authority_mode = AUTHORITY_POLICY.get(mode, {})
+        if field in authority_mode.get("hard", []):
+            return {
+                "accepted": False,
+                "retained": retained,
+                "dropped": dropped,
+                "warnings": warnings,
+                "hardFailure": field,
+            }
+        if field in authority_mode.get("serverOwned", []):
+            warnings.append(
+                dict(WORKING_SET_POLICY["warnings"]["serverCoordinateNormalized"])
+            )
+    evidence = value.get("evidence")
+    if isinstance(evidence, dict):
+        evidence_path = str(evidence.get("path", ""))
+        media_type = normalized_media_type(evidence.get("mimeType"))
+        if not is_text_evidence_path(evidence_path):
+            dropped.append(evidence_path)
+            warnings.append(dict(EVIDENCE_POLICY["optionalBinary"]["warning"]))
+        elif (
+            (media_type is not None and media_type not in TEXT_EVIDENCE_MIME_TYPES)
+            or evidence.get("present") is False
+            or evidence.get("digestMatches") is False
+            or evidence.get("utf8") is False
+            or evidence.get("nonEmpty") is False
+        ):
+            dropped.append(evidence_path)
+            warnings.append(dict(EVIDENCE_POLICY["optionalInvalidText"]["warning"]))
+        else:
+            retained.append(evidence_path)
+    return {
+        "accepted": True,
+        "retained": retained,
+        "dropped": dropped,
+        "warnings": warnings,
+        "hardFailure": None,
+    }
+
+
+def add_diagnostic_warning(diagnostics: dict, warning: dict) -> None:
+    if warning not in diagnostics["warnings"]:
+        diagnostics["warnings"].append(dict(warning))
+
+
+def record_evidence_drop(
+    diagnostics: dict, evidence_path: str, warning: dict
+) -> None:
+    if evidence_path not in diagnostics["dropped"]:
+        diagnostics["dropped"].append(evidence_path)
+    add_diagnostic_warning(diagnostics, warning)
 
 
 def safe_path(value: object) -> str:
@@ -510,7 +639,7 @@ def validate_research_coverage(
 
 
 def validate_bundle(
-    archive: zipfile.ZipFile, manifest: dict, expected: dict
+    archive: zipfile.ZipFile, manifest: dict, expected: dict, diagnostics: dict
 ) -> set[str]:
     require_expected(
         expected,
@@ -535,47 +664,37 @@ def validate_bundle(
     if manifest.get("kind") != "frontmind.kb-working-set" or manifest.get("schemaVersion") != 1:
         fail("invalid bundle identity")
     exact_coordinate(manifest, "operationId", expected["operation_id"])
-    exact_coordinate(manifest, "buildId", expected["build_id"])
-    positive_integer(manifest.get("generation"), "generation")
-    exact_coordinate(manifest, "generation", expected["generation"])
-    positive_integer(manifest.get("contentVersion"), "contentVersion")
-    exact_coordinate(manifest, "contentVersion", expected["content_version"])
-    if manifest.get("contentVersion") != 1:
+    coordinate_warning = WORKING_SET_POLICY["warnings"]["serverCoordinateNormalized"]
+    for key, expected_key in (
+        ("buildId", "build_id"),
+        ("generation", "generation"),
+        ("contentVersion", "content_version"),
+        ("treePolicyVersion", "tree_policy_version"),
+    ):
+        if manifest.get(key) != expected[expected_key]:
+            add_diagnostic_warning(diagnostics, coordinate_warning)
+    if expected["content_version"] != 1:
         fail("initial contentVersion must be 1")
     skill = manifest.get("skill")
-    if (
-        not isinstance(skill, dict)
-        or set(skill) != {"name", "version", "contentHash"}
-        or skill.get("name") != "socratic-kb-builder"
-        or skill.get("version") != "5"
-        or not SHA256.fullmatch(str(skill.get("contentHash", "")))
-    ):
-        fail("invalid Skill coordinates")
-    if skill.get("contentHash") != expected["skill_content_hash"]:
-        fail("skillContentHash does not match the expected task coordinate")
-    exact_coordinate(
-        manifest, "treePolicyVersion", expected["tree_policy_version"]
-    )
-    if manifest.get("treePolicyVersion") != 2:
+    expected_skill = {
+        "name": "socratic-kb-builder",
+        "version": "5",
+        "contentHash": expected["skill_content_hash"],
+    }
+    if skill != expected_skill:
+        add_diagnostic_warning(diagnostics, coordinate_warning)
+    if expected["tree_policy_version"] != 2:
         fail("treePolicyVersion must be 2")
     company = manifest.get("company")
-    if (
-        not isinstance(company, dict)
-        or set(company) != {"name", "website"}
-        or not isinstance(company.get("name"), str)
-        or not company["name"].strip()
-        or not (
-            company.get("website") is None
-            or isinstance(company.get("website"), str)
-        )
-    ):
-        fail("invalid company identity")
-    actual_company = {
-        "name": canonical_company_name(company.get("name")),
-        "website": canonical_company_website(company.get("website")),
-    }
+    try:
+        actual_company = {
+            "name": canonical_company_name(company.get("name")),
+            "website": canonical_company_website(company.get("website")),
+        }
+    except (AttributeError, TypeError, ValueError):
+        actual_company = None
     if actual_company != expected["company_identity"]:
-        fail("company identity does not match the expected task coordinate")
+        add_diagnostic_warning(diagnostics, coordinate_warning)
     leaves = manifest.get("leaves")
     branches = manifest.get("branches")
     assets = manifest.get("assets")
@@ -599,14 +718,54 @@ def validate_bundle(
     if not isinstance(ledger, list):
         fail("bundle evidenceLedger is missing")
     evidence_by_path: dict[str, dict] = {}
+    skipped_binary_evidence_paths: set[str] = set()
     for entry in ledger:
         required_evidence = {"path", "sha256", "leafId", "sourceUrl", "retrievedAt"}
         if not isinstance(entry, dict) or set(entry) != required_evidence:
             fail("invalid evidence ledger entry")
-        name = declared_file(archive, entry.get("path"), entry.get("sha256"))
-        if name in evidence_by_path or not archive.read(name).strip():
-            fail("evidence path is duplicate or empty")
+        name = safe_path(entry.get("path"))
+        if not is_text_evidence_path(name):
+            # The consumer contract classifies optional evidence before UTF-8
+            # decoding and removes binary copies from the canonical ledger.
+            # A producer may therefore validate a content-first result without
+            # interpreting, hashing or publishing those copied bytes.
+            if name in skipped_binary_evidence_paths or name in evidence_by_path:
+                fail("evidence path is duplicate")
+            try:
+                archive.getinfo(name)
+            except KeyError:
+                # Missing optional evidence is also removed by the consumer.
+                pass
+            else:
+                declared.add(name)
+            skipped_binary_evidence_paths.add(name)
+            record_evidence_drop(
+                diagnostics,
+                name,
+                EVIDENCE_POLICY["optionalBinary"]["warning"],
+            )
+            continue
+        name, payload, matches = optional_declared_file(
+            archive, name, entry.get("sha256")
+        )
+        try:
+            evidence_text = payload.decode("utf-8") if payload is not None else ""
+        except UnicodeDecodeError:
+            evidence_text = ""
+        if name in evidence_by_path:
+            fail("evidence path is duplicate")
+        if payload is None or not matches or not evidence_text.strip():
+            if payload is not None:
+                declared.add(name)
+            skipped_binary_evidence_paths.add(name)
+            record_evidence_drop(
+                diagnostics,
+                name,
+                EVIDENCE_POLICY["optionalInvalidText"]["warning"],
+            )
+            continue
         evidence_by_path[name] = entry
+        diagnostics["retained"].append(name)
     for index, leaf in enumerate(leaves):
         required_leaf = {
             "leafId", "branchId", "branchTitle", "title", "ordinal",
@@ -640,6 +799,10 @@ def validate_bundle(
             fail("leaf evidencePaths is invalid")
         for evidence_path in evidence_paths:
             name = safe_path(evidence_path)
+            if name in skipped_binary_evidence_paths:
+                # Keep the physical optional byte accounted for, but do not
+                # require it to resolve into the canonical text ledger.
+                continue
             if name in declared:
                 fail("evidence path is duplicated")
             if evidence_by_path.get(name, {}).get("leafId") != leaf_id:
@@ -659,13 +822,22 @@ def validate_bundle(
         asset_ids.add(asset_id)
         name = declared_file(archive, asset.get("path"), asset.get("sha256"))
         payload = archive.read(name)
-        if name in declared or asset.get("bytes") != len(payload):
+        if (
+            name in declared
+            or asset.get("bytes") != len(payload)
+            or len(payload) > MAX_ASSET_BYTES
+        ):
             fail("asset path/size is invalid")
         declared.add(name)
         document_ids = asset.get("documentIds")
         if not isinstance(document_ids, list) or set(map(str, document_ids)) != asset_refs.get(asset_id, set()):
             fail("asset documentIds are not bidirectional")
-    if set(evidence_by_path) != {path for path in declared if path.startswith("evidence/")}:
+    if set(evidence_by_path) != {
+        path
+        for path in declared
+        if path.startswith("evidence/")
+        and path not in skipped_binary_evidence_paths
+    }:
         fail("evidence ledger contains an unreferenced file")
     if asset_ids != set(asset_refs):
         fail("leaf asset reference does not resolve")
@@ -690,7 +862,7 @@ def validate_bundle(
 
 
 def validate_patch(
-    archive: zipfile.ZipFile, manifest: dict, expected: dict
+    archive: zipfile.ZipFile, manifest: dict, expected: dict, diagnostics: dict
 ) -> set[str]:
     require_expected(
         expected,
@@ -713,13 +885,14 @@ def validate_patch(
     if manifest.get("kind") != "frontmind.kb-node-patch" or manifest.get("schemaVersion") != 1:
         fail("invalid patch identity")
     exact_coordinate(manifest, "operationId", expected["operation_id"])
-    exact_coordinate(manifest, "buildId", expected["build_id"])
-    positive_integer(manifest.get("generation"), "generation")
-    exact_coordinate(manifest, "generation", expected["generation"])
-    positive_integer(manifest.get("baseContentVersion"), "baseContentVersion")
-    exact_coordinate(
-        manifest, "baseContentVersion", expected["base_content_version"]
-    )
+    coordinate_warning = WORKING_SET_POLICY["warnings"]["serverCoordinateNormalized"]
+    for key, expected_key in (
+        ("buildId", "build_id"),
+        ("generation", "generation"),
+        ("baseContentVersion", "base_content_version"),
+    ):
+        if manifest.get(key) != expected[expected_key]:
+            add_diagnostic_warning(diagnostics, coordinate_warning)
     exact_coordinate(
         manifest,
         "baseWorkingSetSha256",
@@ -766,6 +939,20 @@ def validate_patch(
         prefix = f"evidence/{target}/"
         if not name.startswith(prefix) or name in evidence_add_paths:
             fail("patch evidence is outside the target leaf")
+        valid_text = is_text_evidence_path(name)
+        if payload is not None and valid_text:
+            try:
+                valid_text = bool(payload.decode("utf-8").strip())
+            except UnicodeDecodeError:
+                valid_text = False
+        if payload is None or not _matches or not valid_text:
+            record_evidence_drop(
+                diagnostics,
+                name,
+                EVIDENCE_POLICY["optionalInvalidText"]["warning"],
+            )
+        else:
+            diagnostics["retained"].append(name)
         evidence_add_paths.append(name)
         if payload is not None:
             declared.add(name)
@@ -855,6 +1042,7 @@ def main() -> None:
     parser.add_argument("--expected-base-content-version", type=int)
     parser.add_argument("--expected-base-working-set-sha256")
     parser.add_argument("--expected-target-leaf-id")
+    parser.add_argument("--diagnostics-json", action="store_true")
     parser.add_argument("archive")
     args = parser.parse_args()
     expected = {
@@ -901,31 +1089,66 @@ def main() -> None:
         bounded_integer(
             expected["uploads_read"], "--expected-uploads-read", 100
         )
-    with zipfile.ZipFile(args.archive) as archive:
+    archive_path = pathlib.Path(args.archive)
+    compressed_archive_bytes = archive_path.stat().st_size
+    if not 0 < compressed_archive_bytes <= MAX_COMPRESSED:
+        fail("archive compressed bytes are invalid")
+    diagnostics = {"retained": [], "dropped": [], "warnings": []}
+    with zipfile.ZipFile(archive_path) as archive:
         entries = archive.infolist()
         if not 1 <= len(entries) <= MAX_FILES:
             fail("archive file count is invalid")
         if sum(item.file_size for item in entries) > MAX_UNCOMPRESSED:
             fail("archive is too large")
         names: set[str] = set()
+        portable_names: set[str] = set()
         for item in entries:
             name = safe_path(item.filename)
-            if item.is_dir() or name in names or item.flag_bits & 1 or (item.external_attr >> 16) & 0o170000 == 0o120000:
+            portable_name = unicodedata.normalize("NFC", name).lower()
+            if (
+                item.is_dir()
+                or name in names
+                or portable_name in portable_names
+                or item.flag_bits & 1
+                or (item.external_attr >> 16) & 0o170000 == 0o120000
+            ):
                 fail("archive contains an unsafe entry")
+            if item.file_size > 0 and (
+                item.compress_size <= 0
+                or item.file_size / item.compress_size > MAX_COMPRESSION_RATIO
+            ):
+                fail("archive compression ratio is invalid")
             names.add(name)
+            portable_names.add(portable_name)
         if "BUNDLE.json" in names and "PATCH.json" not in names:
             manifest = read_json(archive, "BUNDLE.json")
-            declared = validate_bundle(archive, manifest, expected)
+            declared = validate_bundle(archive, manifest, expected, diagnostics)
             label = "frontmind.kb-working-set.v1"
         elif "PATCH.json" in names and "BUNDLE.json" not in names:
             manifest = read_json(archive, "PATCH.json")
-            declared = validate_patch(archive, manifest, expected)
+            declared = validate_patch(archive, manifest, expected, diagnostics)
             label = "frontmind.kb-node-patch.v1"
         else:
             fail("archive must contain exactly one contract manifest")
-        if names != declared:
-            fail("archive contains undeclared files")
-    print(f"VALID {label}")
+        if not declared.issubset(names):
+            fail("archive is missing declared files")
+    if args.diagnostics_json:
+        print(
+            json.dumps(
+                {
+                    "accepted": True,
+                    "label": label,
+                    "retained": diagnostics["retained"],
+                    "dropped": diagnostics["dropped"],
+                    "warnings": diagnostics["warnings"],
+                    "hardFailure": None,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        print(f"VALID {label}")
 
 
 if __name__ == "__main__":

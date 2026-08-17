@@ -428,6 +428,11 @@ export async function stageAndUploadManagedBody(input: {
       // The HTTP response close path still tears down the source socket.
     }
     await stage.discard();
+    // The absolute deadline tears down both the local stage stream and the
+    // Provider request. Under scheduler pressure either stream can surface its
+    // native ERR_STREAM_DESTROYED first; the public contract must still report
+    // the authoritative abort reason instead of leaking that race.
+    if (managedSignal.aborted) throw abortReason(managedSignal);
     throw error;
   } finally {
     managedSignal.removeEventListener("abort", abortProvider);

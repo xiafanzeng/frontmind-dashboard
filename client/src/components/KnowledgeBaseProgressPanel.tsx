@@ -154,18 +154,34 @@ export default function KnowledgeBaseProgressPanel({
   const contentCompleted =
     progress.build.status === "ready_to_publish" ||
     progress.build.status === "published";
-  const partialResult = progress.resultQuality?.completeness === "partial";
+  const partialResult =
+    progress.contentAvailability === "partial" ||
+    progress.resultQuality?.completeness === "partial";
   const coverageIncomplete = progress.resultQuality?.warnings?.some(
     (warning) => warning.code === "COVERAGE_INCOMPLETE",
   );
+  const resultResetRequired = progress.operationState === "reset_required";
+  const materializedOperationActive =
+    progress.operationState === "creating" ||
+    progress.operationState === "waiting_output" ||
+    progress.operationState === "normalizing";
+  // Materialized-v5 presentation is driven by the durable business state. A
+  // Provider terminal status must never be projected as "stopped" after the
+  // server has retained displayable canonical content or explicitly opened
+  // the reset path. Keep the historical build-status fallback only for older
+  // DTOs that do not yet carry operationState.
   const buildStopped =
-    progress.build.status === "failed" ||
-    progress.build.status === "protocol_error";
+    progress.operationState === undefined &&
+    (progress.build.status === "failed" ||
+      progress.build.status === "protocol_error");
   const buildExecuting =
     !buildStopped &&
-    progress.build.awaitingResponseSince != null &&
-    (progress.build.status === "researching" ||
-      progress.build.status === "confirming");
+    !resultResetRequired &&
+    (materializedOperationActive ||
+      (progress.operationState === undefined &&
+        progress.build.awaitingResponseSince != null &&
+        (progress.build.status === "researching" ||
+          progress.build.status === "confirming")));
   const stoppedMessage =
     progress.build.protocolError ===
     KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
@@ -238,10 +254,10 @@ export default function KnowledgeBaseProgressPanel({
         </div>
       </header>
 
-      {(buildStopped || buildExecuting) && (
+      {(buildStopped || buildExecuting || resultResetRequired) && (
         <div
           className={`mx-5 mt-4 flex items-start gap-2 rounded-xl border px-3.5 py-3 text-xs leading-5 sm:mx-6 ${
-            buildStopped
+            buildStopped || resultResetRequired
               ? "border-slate-200 bg-slate-50 text-slate-800"
               : "border-violet-200 bg-violet-50 text-violet-900"
           }`}
@@ -249,10 +265,20 @@ export default function KnowledgeBaseProgressPanel({
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <strong className="block">
-              {buildStopped ? "本轮已停止" : "FrontMind 正在处理当前操作"}
+              {resultResetRequired
+                ? "本轮结果需要重置"
+                : buildStopped
+                  ? "本轮已停止"
+                  : progress.operationState === "normalizing"
+                    ? "正在处理已返回内容"
+                    : "FrontMind 正在处理当前操作"}
             </strong>
             <span>
-              {buildStopped ? stoppedMessage : "请稍候，已完成内容不受影响。"}
+              {resultResetRequired
+                ? KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE
+                : buildStopped
+                  ? stoppedMessage
+                  : "请稍候，已完成内容不受影响。"}
             </span>
           </div>
         </div>
@@ -275,7 +301,8 @@ export default function KnowledgeBaseProgressPanel({
                 "节点内容已保留，但研究覆盖信息不完整，暂不能确认、修订、打包或发布；请申请重置后重新生成。"
               ) : (
                 <>
-                  当前保留 {progress.resultQuality?.stats?.acceptedCount ?? total}{" "}
+                  当前保留{" "}
+                  {progress.resultQuality?.stats?.acceptedCount ?? total}{" "}
                   个安全节点，但未达到完整发布条件。确认、修订、打包和发布均已锁定；请批准重置后重新上传资料并创建全新任务。
                 </>
               )}

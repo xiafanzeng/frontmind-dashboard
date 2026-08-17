@@ -29,6 +29,7 @@ export const socraticKnowledgeBaseSkillEntries = [
   "references/materialized-working-set.md",
   "references/output-format.md",
   "references/questioning-strategy.md",
+  "references/working-set-policy.json",
   "scripts/validate_working_set.py",
 ];
 

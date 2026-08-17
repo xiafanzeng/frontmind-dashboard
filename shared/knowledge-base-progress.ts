@@ -110,6 +110,7 @@ export const knowledgeBaseMaterializedResultFailureCodes = [
   "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
   "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
   "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+  "KNOWLEDGE_BASE_RESULT_PROCESSING_FAILED",
 ] as const;
 
 export type KnowledgeBaseMaterializedResultFailureCode =
@@ -150,6 +151,13 @@ export type KnowledgeBaseSyncState =
   | "synced"
   | "repairing"
   | "attention_required";
+export type KnowledgeBaseContentAvailability = "none" | "partial" | "complete";
+export type KnowledgeBaseOperationState =
+  | "creating"
+  | "waiting_output"
+  | "normalizing"
+  | "completed"
+  | "reset_required";
 export type KnowledgeBaseProcessingPhase =
   | "uploading"
   | "restoring_files"
@@ -224,6 +232,9 @@ export type KnowledgeBaseResultQualityWarningCode =
   | "EVIDENCE_INCOMPLETE"
   | "AGGREGATE_UNAVAILABLE"
   | "OPTIONAL_ASSET_SKIPPED"
+  | "OPTIONAL_BINARY_EVIDENCE_SKIPPED"
+  | "MANIFEST_NORMALIZED"
+  | "SERVER_COORDINATE_NORMALIZED"
   | "PRESENTATION_NORMALIZED"
   | "COVERAGE_INCOMPLETE";
 
@@ -268,6 +279,14 @@ export interface KnowledgeBaseProgressDto {
   branches: KnowledgeBaseProgressBranchDto[];
   /** Server-computed content quality; omitted for historical read-only builds. */
   resultQuality?: KnowledgeBaseResultQualityDto;
+  /**
+   * Server-owned materialized business state. Provider status is deliberately
+   * not part of this projection; older/legacy builds may omit these fields.
+   */
+  contentAvailability?: KnowledgeBaseContentAvailability;
+  operationState?: KnowledgeBaseOperationState;
+  resetAllowed?: boolean;
+  warningCodes?: string[];
   packageAllowed: boolean;
   /** Additive package phase; older projections may omit it. */
   packageState?: KnowledgeBasePackageState;
@@ -433,6 +452,11 @@ export interface KnowledgeBaseObservationDto {
   /** Monotonic display authority backed by messages.sequence. */
   displaySequence?: number;
   syncState?: KnowledgeBaseSyncState;
+  /** Server-owned business projection; Provider task status is never exposed as the conclusion. */
+  contentAvailability?: KnowledgeBaseContentAvailability;
+  operationState?: KnowledgeBaseOperationState;
+  resetAllowed?: boolean;
+  warningCodes?: string[];
   processingPhase?: KnowledgeBaseProcessingPhase | null;
   contentState?: KnowledgeBaseContentState;
   packageState?: KnowledgeBasePackageState;

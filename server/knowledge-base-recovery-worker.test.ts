@@ -3,144 +3,62 @@ import { describe, expect, it, vi } from "vitest";
 import { createKnowledgeBaseRecoverySweep } from "./knowledge-base-recovery-worker";
 
 describe("knowledge-base production recovery sweep", () => {
-  it("runs turn and open-build recovery and advances a fair cursor", async () => {
-    const recoverExpiredTurns = vi
-      .fn()
-      .mockResolvedValue({ failed: 1, scanned: 2, claimedTurnIds: ["turn-1"] });
-    const recoverTerminalAnchorHandoffs = vi.fn().mockResolvedValue({
+  it("runs only reservation recovery and artifact cleanup", async () => {
+    const recoverExpiredTurns = vi.fn().mockResolvedValue({
       failed: 1,
-      scanned: 1,
-      claimedTurnIds: ["anchor-turn-1"],
+      scanned: 2,
+      claimedTurnIds: ["turn-1"],
     });
-    const recoverOpenBuilds = vi
-      .fn()
-      .mockResolvedValueOnce({
-        failed: 2,
-        scanned: 100,
-        hasMore: true,
-        nextCursor: "build-100",
-      })
-      .mockResolvedValueOnce({
-        failed: 0,
-        scanned: 1,
-        hasMore: false,
-        nextCursor: "build-101",
-      })
-      .mockResolvedValueOnce({
-        failed: 0,
-        scanned: 0,
-        hasMore: false,
-        nextCursor: null,
-      });
     const cleanupArtifactCandidates = vi.fn().mockResolvedValue({
       scanned: 3,
       deleted: 1,
       retained: 2,
       failed: 1,
     });
-    const migrateActiveLegacyBuilds = vi
-      .fn()
-      .mockResolvedValueOnce({
-        failed: 1,
-        scanned: 100,
-        hasMore: true,
-        nextCursor: "legacy-100",
-        rebindHasMore: true,
-        rebindNextCursor: "rebind-100",
-      })
-      .mockResolvedValueOnce({
-        failed: 0,
-        scanned: 1,
-        hasMore: false,
-        nextCursor: "legacy-101",
-        rebindHasMore: false,
-        rebindNextCursor: "rebind-101",
-      })
-      .mockResolvedValueOnce({
-        failed: 0,
-        scanned: 0,
-        hasMore: false,
-        nextCursor: null,
-      });
     const sweep = createKnowledgeBaseRecoverySweep({
       recoverExpiredTurns,
-      recoverTerminalAnchorHandoffs,
-      recoverOpenBuilds,
-      migrateActiveLegacyBuilds,
       cleanupArtifactCandidates,
     });
 
-    await expect(sweep()).resolves.toMatchObject({ failed: 6 });
-    await expect(sweep()).resolves.toMatchObject({ failed: 3 });
-    await expect(sweep()).resolves.toMatchObject({ failed: 3 });
-    expect(recoverExpiredTurns).toHaveBeenCalledTimes(3);
-    expect(recoverTerminalAnchorHandoffs).toHaveBeenCalledTimes(3);
-    expect(recoverOpenBuilds.mock.calls).toEqual([
-      [{ limit: 100, concurrency: 3 }],
-      [{ limit: 100, concurrency: 3, afterBuildId: "build-100" }],
-      [{ limit: 100, concurrency: 3 }],
-    ]);
-    expect(cleanupArtifactCandidates).toHaveBeenCalledTimes(3);
-    expect(migrateActiveLegacyBuilds.mock.calls).toEqual([
-      [{ limit: 100, concurrency: 3 }],
-      [
-        {
-          limit: 100,
-          concurrency: 3,
-          afterBuildId: "legacy-100",
-          afterRebindBuildId: "rebind-100",
-        },
-      ],
-      [{ limit: 100, concurrency: 3 }],
-    ]);
+    await expect(sweep()).resolves.toEqual({
+      failed: 2,
+      turns: {
+        failed: 1,
+        scanned: 2,
+        claimedTurnIds: ["turn-1"],
+      },
+      artifacts: {
+        scanned: 3,
+        deleted: 1,
+        retained: 2,
+        failed: 1,
+      },
+    });
+    expect(recoverExpiredTurns).toHaveBeenCalledOnce();
+    expect(cleanupArtifactCandidates).toHaveBeenCalledOnce();
   });
 
-  it("runs terminal anchor recovery even when migration is not configured", async () => {
+  it("does not expose an open-build, migration or adoption hook", async () => {
     const recoverExpiredTurns = vi.fn().mockResolvedValue({ failed: 0 });
-    const recoverTerminalAnchorHandoffs = vi.fn().mockResolvedValue({
-      failed: 0,
-      scanned: 1,
-      completed: 1,
-    });
-    const recoverOpenBuilds = vi.fn().mockResolvedValue({
-      failed: 0,
-      hasMore: false,
-      nextCursor: null,
-    });
-    const sweep = createKnowledgeBaseRecoverySweep({
-      recoverExpiredTurns,
-      recoverTerminalAnchorHandoffs,
-      recoverOpenBuilds,
-    });
+    const sweep = createKnowledgeBaseRecoverySweep({ recoverExpiredTurns });
 
-    await expect(sweep()).resolves.toMatchObject({
+    await expect(sweep()).resolves.toEqual({
       failed: 0,
-      terminalAnchors: { scanned: 1, completed: 1 },
-      migrations: null,
+      turns: { failed: 0 },
+      artifacts: null,
     });
-    expect(recoverTerminalAnchorHandoffs).toHaveBeenCalledOnce();
   });
 
-  it("does not advance its cursor when an open-build scan throws", async () => {
-    const recoverExpiredTurns = vi.fn().mockResolvedValue({ failed: 0 });
-    const recoverOpenBuilds = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("database unavailable"))
-      .mockResolvedValueOnce({
-        failed: 0,
-        hasMore: false,
-        nextCursor: null,
-      });
+  it("does not run cleanup after reservation recovery throws", async () => {
+    const cleanupArtifactCandidates = vi.fn().mockResolvedValue({ failed: 0 });
     const sweep = createKnowledgeBaseRecoverySweep({
-      recoverExpiredTurns,
-      recoverOpenBuilds,
+      recoverExpiredTurns: vi
+        .fn()
+        .mockRejectedValue(new Error("database unavailable")),
+      cleanupArtifactCandidates,
     });
 
     await expect(sweep()).rejects.toThrow("database unavailable");
-    await expect(sweep()).resolves.toMatchObject({ failed: 0 });
-    expect(recoverOpenBuilds).toHaveBeenLastCalledWith({
-      limit: 100,
-      concurrency: 3,
-    });
+    expect(cleanupArtifactCandidates).not.toHaveBeenCalled();
   });
 });

@@ -8,7 +8,6 @@ import { canonicalKnowledgeBaseSkillArchiveHash } from "../shared/knowledge-base
 import {
   KnowledgeBaseEnterpriseIdentityError,
   KnowledgeBaseMaterializedResultError,
-  KnowledgeBaseOpenRecoveryLeaseError,
   KnowledgeBaseUpstreamCreateError,
   KNOWLEDGE_BASE_AGENT_PROFILE,
   KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE,
@@ -31,11 +30,11 @@ import {
   createFrontMindTask,
   checkKnowledgeBasePreparedAttachments,
   deriveKnowledgeBaseInteraction,
+  deriveKnowledgeBaseBusinessResultState,
   getKnowledgeBaseSkillDescriptor,
   knowledgeBasePinnedV4SkillSelection,
   isApprovedKnowledgeBaseAwaitingInputObservation,
   knowledgeBaseArtifactFailureNotice,
-  knowledgeBaseAttachmentRepairObservationAllowsReplacement,
   knowledgeBaseClaimTraceId,
   knowledgeBaseGeneratedAttachmentFailureForPersistence,
   knowledgeBaseLocalRehydrateAuthorityFailureForPersistence,
@@ -46,7 +45,6 @@ import {
   knowledgeBaseManualLogoPendingResponse,
   knowledgeBaseManualLogoDeterministicCreateFailureStatus,
   knowledgeBaseManualLogoTerminalFailure,
-  knowledgeBaseManusV2LifecycleTestHooks,
   knowledgeBaseTerminalAnchorRecoveryTestHooks,
   knowledgeBasePresentationRequiresBoundLogo,
   knowledgeBaseTurnLogoPolicy,
@@ -56,7 +54,6 @@ import {
   knowledgeBaseRecoveryLogoPreparationError,
   knowledgeBaseRetainedStartMayReplaceNotice,
   knowledgeBaseReconcileFailureStatus,
-  knowledgeBaseRetryObservationAllowsRegeneration,
   knowledgeBaseAcceptedReservationReceipt,
   knowledgeBaseReservationReceipt,
   loadKnowledgeBaseTurnAuthority,
@@ -70,7 +67,6 @@ import {
   planKnowledgeBaseClaimUserFirstAttachmentLedger,
   planKnowledgeBaseUserFirstAttachmentLedger,
   readKnowledgeBaseSkillArchiveAttachment,
-  recoverKnowledgeBaseTurnClaimTask,
   resolveKnowledgeBaseEnterpriseIdentity,
   selectMaterializedKnowledgeBaseAttachmentCredential,
   selectUnreconciledKnowledgeOutput,
@@ -79,9 +75,7 @@ import {
   shouldReconcileKnowledgeOutput,
   uploadKnowledgeBaseSkillArchive,
   waitForKnowledgeBaseDispatchAttachments,
-  withKnowledgeBaseOpenRecoveryLeaseHeartbeat,
 } from "./knowledge-base-api";
-import { buildKnowledgeBaseManusV2AnchorErrorRecovery } from "./knowledge-base-manus-v2-lifecycle";
 import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
 import { buildManusV2CreateTaskBody, ManusV2ApiError } from "./manus-v2-client";
 import {
@@ -94,8 +88,6 @@ import { KnowledgeBaseBuildError } from "./knowledge-base-progress-service";
 import { knowledgeBaseLogoRepairFileIsOwned } from "./knowledge-base-logo-provenance-api";
 import { applyKnowledgeBaseFinalLogoProvenanceObservation } from "./knowledge-base-logo-provenance-repair";
 import { knowledgeBaseBuildRequiresOfficialLogo } from "./knowledge-base-final-turn-service";
-import { classifyKnowledgeBaseManusV2Lifecycle } from "./knowledge-base-manus-v2-lifecycle";
-import { buildKnowledgeBaseManusV2FormatRepair } from "./knowledge-base-manus-v2-lifecycle";
 import { UpstreamTaskAttachmentContentProofError } from "./upstream-task-attachment";
 import { KnowledgeBaseMaterializedContractError } from "./knowledge-base-materialized-contract";
 import { KnowledgeArchiveDownloadError } from "./knowledge-archive-download-error";
@@ -112,6 +104,38 @@ function mockManusV2Post(
   } as unknown as ReturnType<typeof axios.create>);
   return post;
 }
+
+describe("knowledge-base business result projection", () => {
+  it("preserves the durable progress projection when legacy summary fields have not caught up", () => {
+    expect(
+      deriveKnowledgeBaseBusinessResultState({
+        progress: {
+          summary: { handled: 0 },
+          contentAvailability: "complete",
+          operationState: "normalizing",
+          resetAllowed: false,
+          warningCodes: ["OPTIONAL_BINARY_EVIDENCE_SKIPPED"],
+          build: {
+            executionMode: "materialized_bundle_v1",
+            skillVersion: "5",
+            status: "researching",
+          },
+        } as any,
+        observation: {
+          activeTurn: null,
+          approvedPresentation: null,
+          notice: null,
+          processingPhase: null,
+        },
+      }),
+    ).toEqual({
+      contentAvailability: "complete",
+      operationState: "normalizing",
+      resetAllowed: false,
+      warningCodes: ["OPTIONAL_BINARY_EVIDENCE_SKIPPED"],
+    });
+  });
+});
 
 describe("knowledge-base user-first generated attachment ledger", () => {
   const userIds = Array.from({ length: 9 }, (_, index) => `asset-${index}`);
@@ -341,204 +365,8 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(knowledgeBaseTurnReplayHttpStatus("terminal", 200)).toBe(200);
   });
 
-  it("allows retry only for one coordinate-matched authoritative regeneration notice", () => {
-    const observation = {
-      generation: 3,
-      activeTurn: {
-        id: "turn-regeneration-authority",
-        status: "failed",
-        buildGeneration: 3,
-        expectedRevision: 7,
-        expectedLeafId: "1.8",
-        failureClass: "terminal_requires_regeneration",
-        recoveryAction: "regenerate_turn",
-        canRegenerate: true,
-      },
-      notice: {
-        turnId: "turn-regeneration-authority",
-        failureClass: "terminal_requires_regeneration",
-        recoveryAction: "regenerate_turn",
-        canRegenerate: true,
-      },
-      interaction: {
-        progress: {
-          build: {
-            id: "build-regeneration-authority",
-            revision: 7,
-            currentLeafId: "1.8",
-          },
-        },
-      },
-    } as any;
-    const authority = {
-      observation,
-      buildId: "build-regeneration-authority",
-      activeTurnId: "turn-regeneration-authority",
-      expectedGeneration: 3,
-      expectedRevision: 7,
-      expectedLeafId: "1.8",
-    };
 
-    expect(knowledgeBaseRetryObservationAllowsRegeneration(authority)).toBe(
-      true,
-    );
-    expect(
-      knowledgeBaseRetryObservationAllowsRegeneration({
-        ...authority,
-        observation: {
-          ...observation,
-          activeTurn: {
-            ...observation.activeTurn,
-            failureClass: "requires_user_fix",
-            recoveryAction: "contact_support",
-            canRegenerate: false,
-          },
-          notice: {
-            ...observation.notice,
-            failureClass: "requires_user_fix",
-            recoveryAction: "contact_support",
-            canRegenerate: false,
-          },
-        },
-      }),
-    ).toBe(false);
-    expect(
-      knowledgeBaseRetryObservationAllowsRegeneration({
-        ...authority,
-        observation: {
-          ...observation,
-          activeTurn: {
-            ...observation.activeTurn,
-            createAttemptState: "rejected",
-          },
-        },
-      }),
-    ).toBe(false);
-    expect(
-      knowledgeBaseRetryObservationAllowsRegeneration({
-        ...authority,
-        expectedRevision: 8,
-      }),
-    ).toBe(false);
-    expect(
-      knowledgeBaseRetryObservationAllowsRegeneration({
-        ...authority,
-        activeTurnId: "another-turn",
-      }),
-    ).toBe(false);
-  });
 
-  it("never treats legacy protocol-terminal support history as retry authority", () => {
-    const observation = {
-      generation: 1,
-      activeTurn: {
-        id: "turn-legacy-protocol-terminal",
-        status: "failed",
-        buildGeneration: 1,
-        expectedRevision: 0,
-        expectedLeafId: null,
-        failureClass: "terminal_nonregenerable",
-        recoveryAction: "contact_support",
-        canRegenerate: false,
-      },
-      notice: {
-        turnId: "turn-legacy-protocol-terminal",
-        code: "PROGRESS_PROTOCOL_INVALID",
-        retryable: false,
-        failureClass: "terminal_nonregenerable",
-        recoveryAction: "contact_support",
-        canRegenerate: false,
-      },
-      interaction: {
-        progress: {
-          build: {
-            id: "build-legacy-protocol-terminal",
-            revision: 0,
-            currentLeafId: null,
-          },
-        },
-      },
-    } as any;
-
-    expect(
-      knowledgeBaseRetryObservationAllowsRegeneration({
-        observation,
-        buildId: "build-legacy-protocol-terminal",
-        activeTurnId: "turn-legacy-protocol-terminal",
-        expectedGeneration: 1,
-        expectedRevision: 0,
-        expectedLeafId: null,
-      }),
-    ).toBe(false);
-  });
-
-  it("allows attachment replacement only for an authoritative pre-create attachment failure", () => {
-    const observation = {
-      generation: 3,
-      activeTurn: {
-        id: "turn-precreate-attachment-failure",
-        status: "failed",
-        buildGeneration: 3,
-        expectedRevision: 7,
-        expectedLeafId: "1.8",
-        failureClass: "requires_user_fix",
-        recoveryAction: "fix_attachments",
-        canRegenerate: false,
-        createAttemptState: "not_sent",
-      },
-      notice: {
-        turnId: "turn-precreate-attachment-failure",
-        code: "KNOWLEDGE_BASE_USER_ATTACHMENT_INVALID",
-        failureClass: "requires_user_fix",
-        recoveryAction: "fix_attachments",
-        canRegenerate: false,
-      },
-      interaction: {
-        progress: {
-          build: {
-            conversationId: "conversation-1",
-            revision: 7,
-            currentLeafId: "1.8",
-          },
-        },
-      },
-    } as any;
-    const authority = {
-      observation,
-      conversationId: "conversation-1",
-      expectedGeneration: 3,
-      expectedRevision: 7,
-      expectedLeafId: "1.8",
-    };
-
-    expect(
-      knowledgeBaseAttachmentRepairObservationAllowsReplacement(authority),
-    ).toBe(true);
-    expect(
-      knowledgeBaseAttachmentRepairObservationAllowsReplacement({
-        ...authority,
-        observation: {
-          ...observation,
-          activeTurn: {
-            ...observation.activeTurn,
-            createAttemptState: "rejected",
-          },
-        },
-      }),
-    ).toBe(false);
-    expect(
-      knowledgeBaseAttachmentRepairObservationAllowsReplacement({
-        ...authority,
-        observation: {
-          ...observation,
-          notice: {
-            ...observation.notice,
-            code: "UPSTREAM_CREATE_3",
-          },
-        },
-      }),
-    ).toBe(false);
-  });
 
   it("accepts only strict RFC4122 trace ids from durable turn authority", () => {
     const claim = (traceId: string) =>
@@ -839,6 +667,50 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(persistCreateFailure).not.toHaveBeenCalled();
   });
 
+  it("settles an acknowledged result-processing exception without reopening task.create", async () => {
+    const failMaterializedResult = vi.fn().mockResolvedValue({
+      turn: {},
+      deduplicated: false,
+    });
+    const markManusV2OutcomeUnknown = vi.fn();
+    const persistCreateFailure = vi.fn();
+    const claim = {
+      turn: {
+        id: "turn-materialized-presentation-exception",
+        userId: 7,
+        providerProtocol: "manus_v2",
+        materializedRecoveryContractVersion: 1,
+        createAttemptState: "acknowledged",
+        providerAttemptState: "output_pending",
+        upstreamTaskId: "bound-materialized-task",
+      },
+      leaseToken: "lease-materialized-presentation-exception",
+    } as any;
+
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim,
+          error: new TypeError("presentation encoder failed"),
+          outcomeUnknownCode: "MUST_NOT_BE_USED",
+        },
+        {
+          failMaterializedResult,
+          markManusV2OutcomeUnknown,
+          persistCreateFailure,
+        },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(failMaterializedResult).toHaveBeenCalledWith({
+      userId: 7,
+      turnId: claim.turn.id,
+      leaseToken: claim.leaseToken,
+      code: "KNOWLEDGE_BASE_RESULT_PROCESSING_FAILED",
+    });
+    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
+    expect(persistCreateFailure).not.toHaveBeenCalled();
+  });
+
   it("bounds transient archive reads and terminalizes deterministic download failures without replacing the task", async () => {
     const claim = {
       turn: {
@@ -915,53 +787,6 @@ describe("knowledge-base turn HTTP outcomes", () => {
     expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
   });
 
-  it("stops an ambiguous compatible create exactly once instead of marking it reconciling", async () => {
-    const stopCompatibleCreateOutcomeUnknown = vi.fn().mockResolvedValue(true);
-    const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
-    const persistCreateFailure = vi.fn().mockResolvedValue("unknown");
-    const claim = {
-      turn: {
-        id: "turn-compatible-outcome-unknown",
-        userId: 7,
-        providerProtocol: "manus_v2",
-        providerMethod: "task.create",
-        providerAttemptState: "sending",
-      },
-      leaseToken: "lease-compatible-outcome-unknown",
-      recoveryMetadata: { compatibilityMode: "minimal_v2_create" },
-    } as any;
-    const error = new ManusV2ApiError(
-      "task.create",
-      null,
-      "TRANSPORT_UNKNOWN",
-      false,
-      true,
-    );
-
-    await expect(
-      persistKnowledgeBaseDispatchFailure(
-        {
-          claim,
-          error,
-          outcomeUnknownCode: "MANUS_V2_CREATE_OUTCOME_UNKNOWN",
-        },
-        {
-          stopCompatibleCreateOutcomeUnknown,
-          markManusV2OutcomeUnknown,
-          persistCreateFailure,
-        },
-      ),
-    ).resolves.toBe("deterministic");
-    expect(stopCompatibleCreateOutcomeUnknown).toHaveBeenCalledOnce();
-    expect(stopCompatibleCreateOutcomeUnknown).toHaveBeenCalledWith({
-      userId: 7,
-      turnId: claim.turn.id,
-      leaseToken: claim.leaseToken,
-      code: "MANUS_V2_CREATE_OUTCOME_UNKNOWN",
-    });
-    expect(markManusV2OutcomeUnknown).not.toHaveBeenCalled();
-    expect(persistCreateFailure).not.toHaveBeenCalled();
-  });
 
   it("keeps a not-sent v2 preparation failure on the pre-create failure path", async () => {
     const markManusV2OutcomeUnknown = vi.fn().mockResolvedValue(undefined);
@@ -1028,8 +853,7 @@ describe("knowledge-base turn HTTP outcomes", () => {
     });
   });
 
-  it("settles a polluted generated ledger as build-local attention without a provider or generic failure", async () => {
-    const markAttention = vi.fn().mockResolvedValue(undefined);
+  it("settles a polluted generated ledger as reset-required without a provider side effect", async () => {
     const failDeterministically = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn().mockResolvedValue(undefined);
     const deferBeforeCreate = vi.fn().mockResolvedValue(undefined);
@@ -1049,29 +873,30 @@ describe("knowledge-base turn HTTP outcomes", () => {
           error,
         },
         {
-          markAttention,
           failDeterministically,
           markOutcomeUnknown,
           deferBeforeCreate,
         },
       ),
     ).resolves.toBe("deterministic");
-    expect(markAttention).toHaveBeenCalledWith({
+    expect(failDeterministically).toHaveBeenCalledWith({
       userId: 7,
       turnId: "turn-ledger-conflict",
       leaseToken: "lease-ledger-conflict",
       code: "KNOWLEDGE_BASE_GENERATED_ATTACHMENT_LEDGER_CONFLICT",
+      message: "safe ledger conflict",
+      failureClass: "requires_user_fix",
+      recoveryAction: "approve_reset",
+      canRegenerate: false,
     });
-    expect(failDeterministically).not.toHaveBeenCalled();
     expect(markOutcomeUnknown).not.toHaveBeenCalled();
     expect(deferBeforeCreate).not.toHaveBeenCalled();
     expect(taskPost).not.toHaveBeenCalled();
     taskPost.mockRestore();
   });
 
-  it("settles a reset-only dispatch fence as attention instead of generic recovery", async () => {
-    const markAttention = vi.fn().mockResolvedValue(undefined);
-    const failDeterministically = vi.fn();
+  it("settles a reset-only dispatch fence as approved-reset authority", async () => {
+    const failDeterministically = vi.fn().mockResolvedValue(undefined);
     const markOutcomeUnknown = vi.fn();
 
     await expect(
@@ -1086,16 +911,19 @@ describe("knowledge-base turn HTTP outcomes", () => {
             "approved reset required",
           ),
         },
-        { markAttention, failDeterministically, markOutcomeUnknown },
+        { failDeterministically, markOutcomeUnknown },
       ),
     ).resolves.toBe("deterministic");
-    expect(markAttention).toHaveBeenCalledWith({
+    expect(failDeterministically).toHaveBeenCalledWith({
       userId: 7,
       turnId: "turn-reset-required",
       leaseToken: "lease-reset-required",
       code: "RESET_REQUIRED",
+      message: "approved reset required",
+      failureClass: "requires_user_fix",
+      recoveryAction: "approve_reset",
+      canRegenerate: false,
     });
-    expect(failDeterministically).not.toHaveBeenCalled();
     expect(markOutcomeUnknown).not.toHaveBeenCalled();
   });
 
@@ -1489,838 +1317,8 @@ describe("knowledge-base turn HTTP outcomes", () => {
   });
 });
 
-describe("Manus v2 durable waiting side effects", () => {
-  const contract = {
-    operationToken: "op-wait",
-    turnId: "turn-wait",
-    generation: 1,
-    baseRevision: 3,
-    action: "confirm" as const,
-    fromLeafId: "leaf-3",
-    expectContentCompleted: false,
-    requiresManifest: false,
-  };
-  const operationEvent = {
-    id: "user-op",
-    type: "user_message",
-    timestamp: 1,
-    user_message: {
-      content:
-        'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"op-wait"}',
-    },
-  };
-  const waitingStatus = (id: string, eventId: string, timestamp: number) => ({
-    id,
-    type: "status_update",
-    timestamp,
-    status_update: {
-      agent_status: "waiting",
-      status_detail: {
-        waiting_for_event_id: eventId,
-        waiting_for_event_type: "messageAskUser",
-      },
-    },
-  });
-  const build = {
-    generation: 1,
-    revision: 3,
-    skillVersion: "4",
-    currentLeafId: "leaf-3",
-    totalNodeCount: 5,
-    confirmedCount: 2,
-    directPrefilledCount: 0,
-  } as any;
 
-  it("adopts a response-loss continuation token and handles a later wait with one new POST", async () => {
-    const firstEvents = [
-      operationEvent,
-      waitingStatus("status-1", "evt-1", 10),
-    ];
-    const first = classifyKnowledgeBaseManusV2Lifecycle({
-      events: firstEvents,
-      contract,
-    });
-    expect(first.kind).toBe("ask_user_continue");
-    if (first.kind !== "ask_user_continue") throw new Error("missing wait");
-    const lifecycle: any = {
-      waitingEventId: first.eventId,
-      waitingEventType: first.eventType,
-      waitingStatusEventId: first.statusEventId,
-      waitingAction: first.kind,
-      waitingAttemptState: "outcome_unknown",
-      waitingRequestHash: first.requestHash,
-      waitingContinuationToken: first.continuationToken,
-    };
-    const events = [
-      ...firstEvents,
-      {
-        id: "continuation-1",
-        type: "user_message",
-        timestamp: 11,
-        user_message: { content: first.prompt },
-      },
-      waitingStatus("status-2", "evt-2", 20),
-    ];
-    const mutateLifecycle = vi.fn(async ({ mutation }: any) => {
-      Object.assign(lifecycle, {
-        waitingEventId: mutation.eventId,
-        waitingEventType: mutation.eventType,
-        waitingStatusEventId: mutation.statusEventId,
-        waitingAction: mutation.action,
-        waitingAttemptState: mutation.state,
-        waitingRequestHash: mutation.requestHash,
-        waitingContinuationToken: mutation.continuationToken,
-      });
-    });
-    const sendMessage = vi.fn().mockResolvedValue({ requestId: "request-2" });
-    await knowledgeBaseManusV2LifecycleTestHooks.reconcile({
-      claim: {
-        turn: {
-          id: contract.turnId,
-          userId: 1,
-          manusV2Lifecycle: lifecycle,
-        },
-        leaseToken: "lease",
-      } as any,
-      build,
-      client: { sendMessage } as any,
-      taskId: "canonical-task",
-      events,
-      contract,
-      dependencies: {
-        mutateLifecycle: mutateLifecycle as any,
-        markAttention: vi.fn() as any,
-      },
-    });
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ taskId: "canonical-task" }),
-    );
-    expect(
-      mutateLifecycle.mock.calls.map(([value]) => value.mutation.state),
-    ).toEqual(["acknowledged", "sending", "acknowledged"]);
-  });
 
-  it("does not POST when a sending continuation has no exact token evidence", async () => {
-    const events = [operationEvent, waitingStatus("status-1", "evt-1", 10)];
-    const decision = classifyKnowledgeBaseManusV2Lifecycle({
-      events,
-      contract,
-    });
-    if (decision.kind !== "ask_user_continue") throw new Error("missing wait");
-    const sendMessage = vi.fn();
-    await knowledgeBaseManusV2LifecycleTestHooks.reconcile({
-      claim: {
-        turn: {
-          id: contract.turnId,
-          userId: 1,
-          manusV2Lifecycle: {
-            waitingEventId: decision.eventId,
-            waitingEventType: decision.eventType,
-            waitingStatusEventId: decision.statusEventId,
-            waitingAction: decision.kind,
-            waitingAttemptState: "sending",
-            waitingRequestHash: decision.requestHash,
-            waitingContinuationToken: decision.continuationToken,
-          },
-        },
-        leaseToken: "lease",
-      } as any,
-      build,
-      client: { sendMessage } as any,
-      taskId: "canonical-task",
-      events,
-      contract,
-      dependencies: {
-        mutateLifecycle: vi.fn() as any,
-        markAttention: vi.fn() as any,
-      },
-    });
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-});
-
-describe("Manus v2 durable format repair", () => {
-  const exactAssistantFallbackFixture = {
-    contract: {
-      operationToken: "operation-fallback",
-      turnId: "00000000-0000-4000-8000-000000000154",
-      generation: 1,
-      baseRevision: 7,
-      action: "confirm" as const,
-      fromLeafId: "1.4",
-      expectContentCompleted: false,
-      requiresManifest: false,
-    },
-    assistant: {
-      id: "assistant-exact-protocol",
-      type: "assistant_message",
-      timestamp: 20,
-      assistant_message: {
-        content: [
-          "## 1.5 下一节点",
-          "",
-          "可继续确认的正文。",
-          '<!-- FRONTMIND_KB_PROGRESS\n{"kind":"frontmind.knowledge-base.progress","schemaVersion":2,"operationId":"operation-fallback","turnId":"00000000-0000-4000-8000-000000000154","revision":7,"transition":{"leafId":"1.4","from":"needs_verification","to":"confirmed"}}\n-->',
-          '<!-- FRONTMIND_KB_PRESENTATION\n{"kind":"frontmind.knowledge-base.presentation","schemaVersion":2,"operationId":"operation-fallback","turnId":"00000000-0000-4000-8000-000000000154","revision":8,"leafId":"1.5","imageState":"no_eligible_asset","assetIds":[],"imageCount":0}\n-->',
-        ].join("\n"),
-      },
-    },
-  };
-
-  it("accepts one stopped exact assistant protocol result after structured extraction failure", () => {
-    const { contract, assistant } = exactAssistantFallbackFixture;
-    const candidate = manusV2KnowledgeBaseAssistantProtocolFallback({
-      taskStatus: "stopped",
-      contract,
-      events: [
-        assistant,
-        {
-          id: "structured-zero-value",
-          type: "structured_output_result",
-          timestamp: 21,
-          structured_output_result: {
-            error: "Failed to extract structured output",
-            value: {
-              schemaVersion: 1,
-              operationToken: contract.operationToken,
-              turnId: contract.turnId,
-              generation: contract.generation,
-              baseRevision: contract.baseRevision,
-              action: contract.action,
-              fromLeafId: contract.fromLeafId,
-              nextLeafId: "",
-              visibleMarkdown: "",
-              contentCompleted: false,
-            },
-          },
-        },
-      ] as any,
-    });
-    expect(candidate).toMatchObject({
-      event: { id: "assistant-exact-protocol" },
-    });
-  });
-
-  it("normalizes the observed extraction-error envelope through the ordinary settlement input", async () => {
-    const { contract, assistant } = exactAssistantFallbackFixture;
-    const events = [
-      assistant,
-      {
-        id: "structured-zero-value",
-        type: "structured_output_result",
-        timestamp: 21,
-        structured_output_result: {
-          error: "Failed to extract structured output",
-          value: {
-            schemaVersion: 1,
-            operationToken: contract.operationToken,
-            turnId: contract.turnId,
-            generation: contract.generation,
-            baseRevision: contract.baseRevision,
-            action: contract.action,
-            fromLeafId: contract.fromLeafId,
-            nextLeafId: "",
-            visibleMarkdown: "",
-            contentCompleted: false,
-          },
-        },
-      },
-    ] as any;
-
-    await expect(
-      normalizeManusV2KnowledgeBaseOperationOutput({
-        events,
-        contract,
-        taskStatus: "stopped",
-        build: {} as any,
-        expectedUploadsRead: 0,
-      }),
-    ).resolves.toEqual([
-      expect.objectContaining({
-        id: assistant.id,
-        role: "assistant",
-        text: assistant.assistant_message.content,
-        content: assistant.assistant_message.content,
-        files: [],
-      }),
-    ]);
-  });
-
-  it("does not use the assistant fallback when durable dispatch attribution is absent", async () => {
-    const { contract, assistant } = exactAssistantFallbackFixture;
-    await expect(
-      normalizeManusV2KnowledgeBaseOperationOutput({
-        events: [assistant] as any,
-        contract,
-        taskStatus: "stopped",
-        allowAssistantProtocolFallback: false,
-        build: {} as any,
-        expectedUploadsRead: 0,
-      }),
-    ).resolves.toEqual([]);
-  });
-
-  it("fails closed for running, duplicate, stale or cross-turn assistant protocol candidates", () => {
-    const { contract, assistant } = exactAssistantFallbackFixture;
-    const inspect = (events: any[], taskStatus = "stopped") =>
-      manusV2KnowledgeBaseAssistantProtocolFallback({
-        taskStatus,
-        contract,
-        events,
-      });
-    expect(inspect([assistant], "running")).toBeNull();
-    expect(inspect([assistant, { ...assistant, id: "duplicate" }])).toBeNull();
-    expect(
-      inspect([
-        {
-          ...assistant,
-          assistant_message: {
-            content: `${assistant.assistant_message.content}\n${assistant.assistant_message.content}`,
-          },
-        },
-      ]),
-    ).toBeNull();
-    expect(
-      inspect([
-        {
-          ...assistant,
-          assistant_message: {
-            content: `${assistant.assistant_message.content}\n<!-- FRONTMIND_KB_UNKNOWN\n{}\n-->`,
-          },
-        },
-      ]),
-    ).toBeNull();
-    expect(
-      inspect([
-        {
-          ...assistant,
-          assistant_message: {
-            content: assistant.assistant_message.content.replace(
-              '"revision":8',
-              '"revision":9',
-            ),
-          },
-        },
-      ]),
-    ).toBeNull();
-    expect(
-      inspect([
-        {
-          ...assistant,
-          assistant_message: {
-            content: assistant.assistant_message.content.replaceAll(
-              contract.turnId,
-              "00000000-0000-4000-8000-000000000999",
-            ),
-          },
-        },
-      ]),
-    ).toBeNull();
-  });
-
-  it("builds one bounded repair even when provider user history omitted the in-band contract", async () => {
-    const contract = exactAssistantFallbackFixture.contract;
-    const sendMessage = vi.fn().mockResolvedValue({ requestId: "repair-req" });
-    const mutateLifecycle = vi.fn();
-    const markAttention = vi.fn();
-    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
-      claim: {
-        turn: { id: contract.turnId, userId: 1, manusV2Lifecycle: {} },
-        leaseToken: "lease",
-      } as any,
-      client: { sendMessage } as any,
-      taskId: "canonical-task",
-      events: [],
-      contract,
-      dependencies: {
-        mutateLifecycle: mutateLifecycle as any,
-        markAttention: markAttention as any,
-      },
-    });
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(
-      mutateLifecycle.mock.calls.map(([value]) => value.mutation.state),
-    ).toEqual(["sending", "acknowledged"]);
-    expect(markAttention).not.toHaveBeenCalled();
-  });
-
-  it("turns an expired malformed stopped result into explicit attention without another POST", async () => {
-    const contract = exactAssistantFallbackFixture.contract;
-    const sendMessage = vi.fn();
-    const mutateLifecycle = vi.fn();
-    const markAttention = vi.fn();
-    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
-      claim: {
-        turn: {
-          id: contract.turnId,
-          userId: 1,
-          manusV2Lifecycle: {
-            formatRepairAttempt: 1,
-            formatRepairAttemptState: "outcome_unknown",
-            formatRepairToken: "frozen-repair-token",
-            formatRepairRequestHash: "f".repeat(64),
-            formatRepairDeadlineAt: "2000-01-01T00:00:00.000Z",
-          },
-        },
-        leaseToken: "lease",
-      } as any,
-      client: { sendMessage } as any,
-      taskId: "canonical-task",
-      events: [],
-      contract,
-      dependencies: {
-        mutateLifecycle: mutateLifecycle as any,
-        markAttention: markAttention as any,
-      },
-    });
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(mutateLifecycle).not.toHaveBeenCalled();
-    expect(markAttention).toHaveBeenCalledWith(
-      expect.objectContaining({ code: "MANUS_V2_FORMAT_REPAIR_EXPIRED" }),
-    );
-  });
-
-  it("adopts an exact repair token after local acknowledgement loss and never POSTs it twice", async () => {
-    const contract = {
-      operationToken: "op-format",
-      turnId: "turn-format",
-      generation: 1,
-      baseRevision: 3,
-      action: "confirm" as const,
-      fromLeafId: "leaf-3",
-      expectContentCompleted: false,
-      requiresManifest: false,
-    };
-    const operationEvent = {
-      id: "user-op",
-      type: "user_message",
-      timestamp: 1,
-      user_message: {
-        content:
-          'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"op-format"}',
-      },
-    };
-    const repair = buildKnowledgeBaseManusV2FormatRepair({
-      contract,
-      events: [operationEvent],
-    });
-    if (!repair) throw new Error("missing repair");
-    const lifecycle: any = {
-      formatRepairAttempt: 1,
-      formatRepairToken: repair.repairToken,
-      formatRepairRequestHash: repair.requestHash,
-      formatRepairAttemptState: "sending",
-    };
-    const mutateLifecycle = vi.fn(async ({ mutation }: any) => {
-      lifecycle.formatRepairAttemptState = mutation.state;
-    });
-    const markAttention = vi.fn();
-    const sendMessage = vi.fn();
-    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
-      claim: {
-        turn: {
-          id: contract.turnId,
-          userId: 1,
-          manusV2Lifecycle: lifecycle,
-        },
-        leaseToken: "lease",
-      } as any,
-      client: { sendMessage } as any,
-      taskId: "canonical-task",
-      events: [
-        operationEvent,
-        {
-          id: "repair-message",
-          type: "user_message",
-          timestamp: 2,
-          user_message: { content: repair.prompt },
-        },
-      ],
-      contract,
-      dependencies: {
-        mutateLifecycle: mutateLifecycle as any,
-        markAttention: markAttention as any,
-      },
-    });
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(mutateLifecycle).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mutation: expect.objectContaining({ state: "acknowledged" }),
-      }),
-    );
-    expect(markAttention).toHaveBeenCalledWith(
-      expect.objectContaining({ code: "MANUS_V2_FORMAT_REPAIR_EXHAUSTED" }),
-    );
-  });
-
-  it("leaves a tokenless response-loss repair in local attention without a second POST", async () => {
-    const contract = {
-      operationToken: "op-format-unknown",
-      turnId: "turn-format-unknown",
-      generation: 1,
-      baseRevision: 3,
-      action: "confirm" as const,
-      fromLeafId: "leaf-3",
-      expectContentCompleted: false,
-      requiresManifest: false,
-    };
-    const operationEvent = {
-      id: "user-op",
-      type: "user_message",
-      timestamp: 1,
-      user_message: {
-        content:
-          'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"op-format-unknown"}',
-      },
-    };
-    const repair = buildKnowledgeBaseManusV2FormatRepair({
-      contract,
-      events: [operationEvent],
-    });
-    if (!repair) throw new Error("missing repair");
-    const sendMessage = vi.fn();
-    const markAttention = vi.fn();
-    await knowledgeBaseManusV2LifecycleTestHooks.repairFormat({
-      claim: {
-        turn: {
-          id: contract.turnId,
-          userId: 1,
-          manusV2Lifecycle: {
-            formatRepairAttempt: 1,
-            formatRepairToken: repair.repairToken,
-            formatRepairRequestHash: repair.requestHash,
-            formatRepairAttemptState: "outcome_unknown",
-          },
-        },
-        leaseToken: "lease",
-      } as any,
-      client: { sendMessage } as any,
-      taskId: "canonical-task",
-      events: [operationEvent],
-      contract,
-      dependencies: {
-        mutateLifecycle: vi.fn() as any,
-        markAttention: markAttention as any,
-      },
-    });
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(markAttention).toHaveBeenCalledWith(
-      expect.objectContaining({ code: "MANUS_V2_FORMAT_REPAIR_UNPROVEN" }),
-    );
-  });
-});
-
-describe("terminal anchor acknowledgement recovery", () => {
-  const build = {
-    id: "build-terminal-anchor",
-    userId: 1,
-    executionMode: "materialized_bundle_v1",
-    skillVersion: "5",
-    contentVersion: 1,
-    generation: 7,
-    revision: 11,
-    currentLeafId: "3.2",
-    providerProtocol: "manus_v2",
-    handoffProvenance: {
-      materializedRecoveryContractVersion: 1,
-      materializedCompletionContractVersion: 2,
-    },
-    activeTurnId: "turn-terminal-anchor",
-    canonicalTaskId: "canonical-anchor-task",
-    canonicalTaskUrl: null,
-    canonicalTaskGeneration: 7,
-  } as any;
-  const preparedDispatch = {
-    preparedAt: "2026-08-13T00:00:00.000Z",
-    baseUrl: "https://api.manus.example",
-    requestBody: {
-      prompt: "frozen self-contained handoff",
-      attachments: [],
-      agentProfile: "frontmind-pro",
-    },
-  } as any;
-  const stopped = {
-    id: "status-stopped",
-    type: "status_update",
-    timestamp: 1,
-    status_update: { agent_status: "stopped" },
-  } as any;
-  const claim = (manusV2Lifecycle: Record<string, unknown> = {}) =>
-    ({
-      turn: {
-        id: "turn-terminal-anchor",
-        userId: 1,
-        buildId: build.id,
-        buildGeneration: 7,
-        expectedRevision: 11,
-        materializedRecoveryContractVersion: 1,
-        materializedCompletionContractVersion: 2,
-        operationToken: "operation-anchor",
-        providerAttemptState:
-          Object.keys(manusV2Lifecycle).length > 0
-            ? "outcome_unknown"
-            : "rejected",
-        manusV2Lifecycle,
-      },
-      leaseToken: "lease-terminal-anchor",
-      preparedDispatch,
-    }) as any;
-  const dependencies = (client: any) => ({
-    client,
-    loadBuild: vi.fn().mockResolvedValue(build),
-    ensureSkillArchivePin: vi.fn().mockResolvedValue(undefined),
-    mutateLifecycle: vi.fn().mockResolvedValue(undefined),
-    deferOutputPending: vi.fn().mockResolvedValue(undefined),
-    markAttention: vi.fn().mockResolvedValue(undefined),
-    completeHandoff: vi.fn().mockResolvedValue(undefined),
-    locallySettle: vi
-      .fn()
-      .mockResolvedValue({ state: "observed", leaseExpiresAt: new Date() }),
-  });
-
-  it("sends one recovery only to the existing canonical task", async () => {
-    const client = {
-      listAllMessages: vi.fn().mockResolvedValue([stopped]),
-      sendMessage: vi.fn().mockResolvedValue({ requestId: "request-1" }),
-      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
-    };
-    const injected = dependencies(client);
-
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
-        {
-          claim: claim(),
-          credential: { apiKey: "test-key" } as any,
-          dependencies: injected as any,
-        },
-      ),
-    ).resolves.toMatchObject({
-      bound: true,
-      taskId: "canonical-anchor-task",
-      settlement: "output_pending",
-    });
-    expect(client.sendMessage).toHaveBeenCalledOnce();
-    expect(client.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ taskId: "canonical-anchor-task" }),
-    );
-    expect(injected.mutateLifecycle.mock.calls).toHaveLength(2);
-    expect(
-      injected.mutateLifecycle.mock.calls.map(
-        ([input]) => input.mutation.state,
-      ),
-    ).toEqual(["sending", "acknowledged"]);
-    expect(injected.completeHandoff).not.toHaveBeenCalled();
-  });
-
-  it("does not resend a tokenless response-loss recovery on the next sweep", async () => {
-    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
-      operationToken: "operation-anchor",
-      turnId: "turn-terminal-anchor",
-      generation: 7,
-      baseRevision: 11,
-    });
-    const client = {
-      listAllMessages: vi.fn().mockResolvedValue([stopped]),
-      sendMessage: vi.fn(),
-      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
-    };
-    const injected = dependencies(client);
-
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
-        {
-          claim: claim({
-            errorRecoveryAttempt: 1,
-            errorRecoveryToken: recovery.recoveryToken,
-            errorRecoveryRequestHash: recovery.requestHash,
-            errorRecoveryAttemptState: "outcome_unknown",
-          }),
-          credential: { apiKey: "test-key" } as any,
-          dependencies: injected as any,
-        },
-      ),
-    ).resolves.toMatchObject({ settlement: "output_pending" });
-    expect(client.sendMessage).not.toHaveBeenCalled();
-    expect(injected.mutateLifecycle).not.toHaveBeenCalled();
-    expect(injected.deferOutputPending).not.toHaveBeenCalled();
-  });
-
-  it("settles an exact recovered ACK through the existing atomic completion", async () => {
-    const exact = {
-      schemaVersion: 1,
-      operationToken: "operation-anchor",
-      turnId: "turn-terminal-anchor",
-      generation: 7,
-      baseRevision: 11,
-      handoffAccepted: true,
-    };
-    const client = {
-      listAllMessages: vi.fn().mockResolvedValue([
-        {
-          id: "operation-attribution",
-          type: "user_message",
-          timestamp: 1,
-          user_message: {
-            content:
-              'FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"operation-anchor"}',
-          },
-        },
-        {
-          id: "ack-exact",
-          type: "structured_output_result",
-          timestamp: 2,
-          structured_output_result: { success: true, value: exact },
-        },
-        {
-          id: "status-stopped",
-          type: "status_update",
-          timestamp: 3,
-          status_update: { agent_status: "stopped" },
-        },
-      ]),
-      sendMessage: vi.fn(),
-      updateTaskVisibility: vi.fn().mockResolvedValue(undefined),
-    };
-    const injected = dependencies(client);
-    const recoveredClaim = claim({
-      errorRecoveryAttempt: 1,
-      errorRecoveryToken: "recovery-token",
-      errorRecoveryRequestHash: "request-hash",
-      errorRecoveryAttemptState: "acknowledged",
-    });
-    recoveredClaim.turn.providerAttemptState = "output_pending";
-
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
-        {
-          claim: recoveredClaim,
-          credential: { apiKey: "test-key" } as any,
-          dependencies: injected as any,
-        },
-      ),
-    ).resolves.toMatchObject({
-      bound: true,
-      taskId: "canonical-anchor-task",
-    });
-    expect(client.sendMessage).not.toHaveBeenCalled();
-    expect(injected.completeHandoff).toHaveBeenCalledOnce();
-    expect(injected.completeHandoff).toHaveBeenCalledWith(
-      expect.objectContaining({
-        turnId: "turn-terminal-anchor",
-        taskId: "canonical-anchor-task",
-        acknowledgement: expect.objectContaining({ eventId: "ack-exact" }),
-      }),
-    );
-    expect(client.createTask).toBeUndefined();
-  });
-
-  it("locally settles a stable stopped event after one acknowledged recovery without another provider send", async () => {
-    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
-      operationToken: "operation-anchor",
-      turnId: "turn-terminal-anchor",
-      generation: 7,
-      baseRevision: 11,
-    });
-    const client = {
-      listAllMessages: vi.fn().mockResolvedValue([stopped]),
-      sendMessage: vi.fn(),
-      updateTaskVisibility: vi.fn(),
-    };
-    const injected = dependencies(client);
-    injected.locallySettle.mockResolvedValue({ state: "settled" });
-    const recoveredClaim = claim({
-      errorRecoveryAttempt: 1,
-      errorRecoveryToken: recovery.recoveryToken,
-      errorRecoveryRequestHash: recovery.requestHash,
-      errorRecoveryAttemptState: "acknowledged",
-      errorRecoveryRequestId: "request-1",
-    });
-    recoveredClaim.turn.providerAttemptState = "output_pending";
-
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
-        {
-          claim: recoveredClaim,
-          credential: { apiKey: "test-key" } as any,
-          dependencies: injected as any,
-        },
-      ),
-    ).resolves.toMatchObject({ bound: true });
-    expect(client.sendMessage).not.toHaveBeenCalled();
-    expect(injected.locallySettle).toHaveBeenCalledWith(
-      expect.objectContaining({
-        turnId: "turn-terminal-anchor",
-        taskId: "canonical-anchor-task",
-        terminalEventHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      }),
-    );
-    expect(injected.completeHandoff).not.toHaveBeenCalled();
-  });
-
-  it("does not locally settle outcome-unknown recovery or a stopped event for a different state", async () => {
-    const recovery = buildKnowledgeBaseManusV2AnchorErrorRecovery({
-      operationToken: "operation-anchor",
-      turnId: "turn-terminal-anchor",
-      generation: 7,
-      baseRevision: 11,
-    });
-    const client = {
-      listAllMessages: vi.fn().mockResolvedValue([stopped]),
-      sendMessage: vi.fn(),
-      updateTaskVisibility: vi.fn(),
-    };
-    const injected = dependencies(client);
-    const recoveredClaim = claim({
-      errorRecoveryAttempt: 1,
-      errorRecoveryToken: recovery.recoveryToken,
-      errorRecoveryRequestHash: recovery.requestHash,
-      errorRecoveryAttemptState: "outcome_unknown",
-      errorRecoveryRequestId: "request-unknown",
-    });
-
-    await knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
-      {
-        claim: recoveredClaim,
-        credential: { apiKey: "test-key" } as any,
-        dependencies: injected as any,
-      },
-    );
-    expect(client.sendMessage).not.toHaveBeenCalled();
-    expect(injected.locallySettle).not.toHaveBeenCalled();
-    expect(injected.completeHandoff).not.toHaveBeenCalled();
-  });
-
-  it("does not create or continue an anchor without build and turn birth authority", async () => {
-    const client = {
-      createTask: vi.fn(),
-      sendMessage: vi.fn(),
-      listAllMessages: vi.fn(),
-      updateTaskVisibility: vi.fn(),
-    };
-    const injected = dependencies(client);
-    injected.loadBuild.mockResolvedValue({
-      ...build,
-      handoffProvenance: null,
-    });
-    const historicalClaim = claim();
-    historicalClaim.turn.materializedRecoveryContractVersion = null;
-
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseAnchorHandoffClaim(
-        {
-          claim: historicalClaim,
-          credential: { apiKey: "test-key" } as any,
-          dependencies: injected as any,
-        },
-      ),
-    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
-    expect(client.createTask).not.toHaveBeenCalled();
-    expect(client.sendMessage).not.toHaveBeenCalled();
-    expect(client.listAllMessages).not.toHaveBeenCalled();
-    expect(injected.ensureSkillArchivePin).not.toHaveBeenCalled();
-  });
-});
 
 describe("knowledge-base upstream read failure authority", () => {
   it.each([
@@ -2473,50 +1471,6 @@ describe("knowledge base execution contract", () => {
     delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
     vi.useRealTimers();
     vi.restoreAllMocks();
-  });
-
-  it("observes a rejected open-recovery renewal immediately and reports lease loss after the operation", async () => {
-    vi.useFakeTimers();
-    let finishOperation!: () => void;
-    const operation = vi.fn(
-      () =>
-        new Promise<string>((resolve) => {
-          finishOperation = () => resolve("completed-after-renewal-failure");
-        }),
-    );
-    const renewLease = vi.fn().mockRejectedValue(new Error("database down"));
-    const unhandled: unknown[] = [];
-    const onUnhandled = (reason: unknown) => unhandled.push(reason);
-    process.on("unhandledRejection", onUnhandled);
-    try {
-      const heartbeat = withKnowledgeBaseOpenRecoveryLeaseHeartbeat({
-        claim: {
-          build: {
-            id: "build-open-recovery",
-            generation: 2,
-          } as any,
-          kind: "reconcile",
-          leaseToken: "lease-token",
-          leaseExpiresAt: new Date("2026-08-01T00:00:01.000Z"),
-        },
-        leaseMs: 1_000,
-        operation,
-        renewLease: renewLease as any,
-      });
-
-      await vi.advanceTimersByTimeAsync(334);
-      expect(renewLease).toHaveBeenCalledTimes(1);
-      expect(unhandled).toEqual([]);
-      finishOperation();
-      await expect(heartbeat).rejects.toMatchObject({
-        name: "KnowledgeBaseOpenRecoveryLeaseError",
-        code: "KNOWLEDGE_BASE_OPEN_RECOVERY_LEASE_LOST",
-        cause: expect.any(Error),
-      } satisfies Partial<KnowledgeBaseOpenRecoveryLeaseError>);
-      expect(unhandled).toEqual([]);
-    } finally {
-      process.off("unhandledRejection", onUnhandled);
-    }
   });
 
   it("keeps dashboard knowledge-base builds on the Pro model", () => {
@@ -4452,113 +3406,7 @@ describe("knowledge base execution contract", () => {
     expect(post).toHaveBeenCalledTimes(2);
   });
 
-  it("recovers a POST accepted before bind without creating a second logical task", async () => {
-    const calls: string[] = [];
-    const dispatch = {
-      schemaVersion: 1 as const,
-      baseUrl: "https://api.example.test",
-      requestBody: {
-        prompt: "prepared",
-        agentProfile: "manus-1.6-max",
-        taskMode: "agent" as const,
-        attachments: [],
-      },
-      bodySha256: "a".repeat(64),
-      preparedAt: "2026-08-01T00:00:00.000Z",
-    };
-    const result = await recoverKnowledgeBaseTurnClaimTask({
-      claim: {
-        turn: { upstreamTaskId: null },
-        upstreamIdempotencyKey: "frontmind-kb-v2:stable-operation",
-      } as any,
-      ensureDispatch: async () => {
-        calls.push("prepare");
-        return dispatch;
-      },
-      createTask: async (actualDispatch, key) => {
-        calls.push(`create:${key}`);
-        expect(actualDispatch).toBe(dispatch);
-        return { taskId: "original-task" };
-      },
-      bindTask: async (taskId) => calls.push(`bind:${taskId}`),
-      registerTask: async (taskId) => calls.push(`register:${taskId}`),
-      reconcileTask: async (taskId) => {
-        calls.push(`reconcile:${taskId}`);
-        return true;
-      },
-    });
 
-    expect(result).toEqual({
-      taskId: "original-task",
-      rebound: true,
-      reconciled: true,
-    });
-    expect(calls).toEqual([
-      "prepare",
-      "create:frontmind-kb-v2:stable-operation",
-      "bind:original-task",
-      "register:original-task",
-      "reconcile:original-task",
-    ]);
-  });
-
-  it("never retries a task create after its outcome becomes unknown", async () => {
-    const dispatch = {
-      schemaVersion: 1 as const,
-      baseUrl: "https://api.example.test",
-      requestBody: {
-        prompt: "manual Logo",
-        agentProfile: "manus-1.6-max",
-        taskMode: "agent" as const,
-        attachments: [],
-      },
-      bodySha256: "c".repeat(64),
-      preparedAt: "2026-08-10T03:00:00.000Z",
-    };
-    const claim = {
-      turn: { upstreamTaskId: null },
-      upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo-stable-request",
-    } as any;
-    const createTask = vi.fn().mockImplementationOnce(async () => {
-      claim.turn.createAttemptState = "unknown";
-      throw new KnowledgeBaseUpstreamCreateError(
-        "unknown",
-        "UPSTREAM_CREATE_HTTP_425",
-        425,
-      );
-    });
-    const bindTask = vi.fn().mockImplementation(async (taskId: string) => {
-      claim.turn.upstreamTaskId = taskId;
-    });
-    const registerTask = vi.fn().mockResolvedValue(undefined);
-    const reconcileTask = vi.fn().mockResolvedValue(false);
-    const recover = () =>
-      recoverKnowledgeBaseTurnClaimTask({
-        claim,
-        ensureDispatch: async () => dispatch,
-        createTask,
-        bindTask,
-        registerTask,
-        reconcileTask,
-      });
-
-    await expect(recover()).rejects.toMatchObject({
-      failureClass: "unknown",
-      failureCode: "UPSTREAM_CREATE_HTTP_425",
-      status: 425,
-    });
-    await expect(recover()).rejects.toMatchObject({
-      failureClass: "unknown",
-      failureCode: "UPSTREAM_CREATE_ATTEMPT_ALREADY_CONSUMED",
-    });
-    expect(createTask).toHaveBeenCalledTimes(1);
-    expect(createTask.mock.calls.map((call) => call[1])).toEqual([
-      claim.upstreamIdempotencyKey,
-    ]);
-    expect(createTask.mock.calls[0]?.[0]).toBe(dispatch);
-    expect(bindTask).not.toHaveBeenCalled();
-    expect(registerTask).not.toHaveBeenCalled();
-  });
 
   it("freezes and sends zh-CN on every fresh materialized v5 task create", async () => {
     const operationKey = "e".repeat(64);
@@ -5040,6 +3888,41 @@ describe("knowledge base execution contract", () => {
     const applyRevision = vi.fn().mockResolvedValue(undefined);
     const stopTask = vi.fn().mockReturnValue(new Promise(() => undefined));
     const deferProviderStatus = vi.fn();
+    let deterministicArchiveSha: string | null = null;
+    const observeResultDiagnostic = vi
+      .fn()
+      .mockImplementation(async (input: any) => {
+        const skipNormalization =
+          input.resultProcessingStage === "archive_safety" &&
+          input.archiveSha === deterministicArchiveSha;
+        if (input.deterministicFailure) {
+          deterministicArchiveSha = input.archiveSha;
+        }
+        return {
+          skipNormalization,
+          diagnostic: {
+            descriptorHash: input.descriptorHash,
+            archiveSha: input.archiveSha,
+            resultProcessingStage: skipNormalization
+              ? "canonical_validation"
+              : input.resultProcessingStage,
+            ...(skipNormalization || input.firstTypedFailureCode
+              ? {
+                  firstTypedFailureCode:
+                    input.firstTypedFailureCode ||
+                    "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+                }
+              : {}),
+            ...(skipNormalization || input.deterministicFailure
+              ? { deterministicFailure: true }
+              : {}),
+            normalizationAttemptId: "n".repeat(64),
+            normalizationStartedAt: "2026-08-15T00:00:00.000Z",
+            firstObservedAt: "2026-08-15T00:00:00.000Z",
+            lastObservedAt: "2026-08-15T00:00:00.000Z",
+          },
+        };
+      });
 
     await expect(
       knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
@@ -5060,6 +3943,38 @@ describe("knowledge base execution contract", () => {
           }),
           downloadArchive,
           validateRevisionCandidate,
+          observeResultDiagnostic,
+          applyRevision,
+          deferProviderStatus,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue(events),
+            stopTask,
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "patch",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-15T00:00:00.000Z",
+          }),
+          downloadArchive,
+          validateRevisionCandidate,
+          observeResultDiagnostic,
           applyRevision,
           deferProviderStatus,
           createClient: vi.fn().mockReturnValue({
@@ -5077,6 +3992,17 @@ describe("knowledge base execution contract", () => {
     ).toEqual([
       "https://downloads.example.test/newer-invalid.zip",
       "https://downloads.example.test/older-valid.zip",
+      "https://downloads.example.test/newer-invalid.zip",
+      "https://downloads.example.test/older-valid.zip",
+    ]);
+    expect(
+      validateRevisionCandidate.mock.calls.map(([value]) =>
+        value.archiveBytes.toString("utf8"),
+      ),
+    ).toEqual([
+      invalidPatch.toString("utf8"),
+      validPatch.toString("utf8"),
+      validPatch.toString("utf8"),
     ]);
     expect(applyRevision).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -5089,6 +4015,21 @@ describe("knowledge base execution contract", () => {
     expect(applyRevision.mock.invocationCallOrder[0]).toBeLessThan(
       stopTask.mock.invocationCallOrder[0]!,
     );
+    expect(observeResultDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        archiveSha: createHash("sha256").update(invalidPatch).digest("hex"),
+        resultProcessingStage: "canonical_validation",
+        firstTypedFailureCode: "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+        deterministicFailure: true,
+      }),
+    );
+    expect(observeResultDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        archiveSha: createHash("sha256").update(validPatch).digest("hex"),
+        resultProcessingStage: "activation",
+      }),
+    );
+    expect(stopTask).toHaveBeenCalledTimes(2);
     expect(stopTask).toHaveBeenCalledWith(taskId);
     expect(deferProviderStatus).not.toHaveBeenCalled();
   });
@@ -5238,6 +4179,205 @@ describe("knowledge base execution contract", () => {
     expect(beginStop).not.toHaveBeenCalled();
     expect(listAllMessages).not.toHaveBeenCalled();
     expect(stopTask).not.toHaveBeenCalled();
+  });
+
+  it("does not re-run normalization after a process exits behind a durable start fence", async () => {
+    const operationKey = "1".repeat(64);
+    const taskId = "materialized-task-normalizer-crash-fence";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000d1",
+      userId: 7,
+      conversationId: "conversation-materialized-normalizer-crash-fence",
+      companyName: "Crash Fence Company",
+      companyWebsite: "https://crash-fence.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claimForLease = (leaseToken: string) =>
+      ({
+        turn: {
+          id: "00000000-0000-4000-8000-0000000000e1",
+          userId: 7,
+          conversationId: build.conversationId,
+          buildId: build.id,
+          buildGeneration: 1,
+          expectedRevision: 0,
+          expectedLeafId: null,
+          expectedUserAttachmentCount: 0,
+          operationType: "start",
+          operationKey,
+          operationToken: operationKey,
+          status: "running",
+          upstreamTaskId: taskId,
+          providerProtocol: "manus_v2",
+          providerMethod: "task.create",
+          materializedRecoveryContractVersion: 1,
+          materializedCompletionContractVersion: 2,
+          materializedCompletion: null,
+          providerAttemptState: "output_pending",
+          createAttemptState: "acknowledged",
+        },
+        leaseToken,
+        recoveryMetadata: { kind: "start" },
+        preparedDispatch: null,
+      }) as any;
+    const events = [
+      {
+        id: "assistant-normalizer-crash-zip",
+        type: "assistant_message",
+        timestamp: 10,
+        assistant_message: {
+          content: "",
+          attachments: [
+            {
+              type: "file",
+              filename: `frontmind-kb-bundle-${operationKey}.zip`,
+              content_type: "application/zip",
+              url: "https://downloads.example.test/normalizer-crash.zip",
+            },
+          ],
+        },
+      },
+      {
+        id: "status-normalizer-crash-running",
+        type: "status_update",
+        timestamp: 11,
+        status_update: { agent_status: "running" },
+      },
+    ];
+    const archive = Buffer.from("normalizer-crash-archive");
+    const archiveSha = createHash("sha256").update(archive).digest("hex");
+    let startedLease: string | null = null;
+    const observeResultDiagnostic = vi
+      .fn()
+      .mockImplementation(async (input: any) => {
+        if (!startedLease) startedLease = input.leaseToken;
+        const interrupted = startedLease !== input.leaseToken;
+        return {
+          skipNormalization: interrupted,
+          diagnostic: {
+            descriptorHash: input.descriptorHash,
+            archiveSha: input.archiveSha,
+            resultProcessingStage: "archive_safety",
+            ...(interrupted
+              ? {
+                  firstTypedFailureCode:
+                    "KNOWLEDGE_BASE_RESULT_PROCESSING_INTERRUPTED",
+                  deterministicFailure: true,
+                }
+              : {}),
+            normalizationAttemptId: "a".repeat(64),
+            normalizationStartedAt: "2026-08-17T00:00:00.000Z",
+            firstObservedAt: "2026-08-17T00:00:00.000Z",
+            lastObservedAt: "2026-08-17T00:00:01.000Z",
+          },
+        };
+      });
+    const validateInitialCandidate = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("simulated process exit in normalizer"))
+      .mockResolvedValueOnce({ archiveBytes: archive });
+    const commonDependencies = {
+      loadBuild: vi.fn().mockResolvedValue(build),
+      ensureDispatch: vi.fn().mockResolvedValue({
+        schemaVersion: 2,
+        baseUrl: "https://api.example.test",
+        requestBody: {
+          prompt: "bundle",
+          agentProfile: "manus-1.6",
+          attachments: [],
+        },
+        bodySha256: "b".repeat(64),
+        preparedAt: "2026-08-17T00:00:00.000Z",
+      }),
+      downloadArchive: vi.fn().mockResolvedValue({
+        buffer: archive,
+        contentType: "application/zip",
+      }),
+      validateInitialCandidate,
+      observeResultDiagnostic,
+      createClient: vi.fn().mockReturnValue({
+        createTask: vi.fn(),
+        findCreatedTask: vi.fn(),
+        listAllMessages: vi.fn().mockResolvedValue(events),
+        stopTask: vi.fn(),
+      }),
+    } as any;
+    const firstClaim = claimForLease("lease-before-normalizer-crash");
+    let firstError: unknown;
+    try {
+      await knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        firstClaim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        commonDependencies,
+      );
+    } catch (error) {
+      firstError = error;
+    }
+    expect(firstError).toMatchObject({
+      message: "simulated process exit in normalizer",
+    });
+    const failedSettlement = vi
+      .fn()
+      .mockRejectedValue(new Error("simulated settlement persistence exit"));
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim: firstClaim,
+          error: firstError,
+          outcomeUnknownCode: "MUST_NOT_REOPEN_CREATE",
+        },
+        { failMaterializedResult: failedSettlement },
+      ),
+    ).rejects.toThrow("simulated settlement persistence exit");
+
+    const restartedClaim = claimForLease("lease-after-normalizer-crash");
+    let restartedError: unknown;
+    try {
+      await knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        restartedClaim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        commonDependencies,
+      );
+    } catch (error) {
+      restartedError = error;
+    }
+    expect(restartedError).toBeInstanceOf(
+      KnowledgeBaseMaterializedContractError,
+    );
+    expect(validateInitialCandidate).toHaveBeenCalledOnce();
+    expect(observeResultDiagnostic).toHaveBeenLastCalledWith(
+      expect.objectContaining({ archiveSha }),
+    );
+    const stableReset = vi.fn().mockResolvedValue({
+      turn: {},
+      deduplicated: false,
+    });
+    await expect(
+      persistKnowledgeBaseDispatchFailure(
+        {
+          claim: restartedClaim,
+          error: restartedError,
+          outcomeUnknownCode: "MUST_NOT_REOPEN_CREATE",
+        },
+        { failMaterializedResult: stableReset },
+      ),
+    ).resolves.toBe("deterministic");
+    expect(stableReset).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "KNOWLEDGE_BASE_MATERIALIZED_CONTRACT_INVALID",
+      }),
+    );
   });
 
   it("applies the immutable staged CAS across descriptor changes and rejects corrupt local bytes", async () => {
@@ -5422,7 +4562,7 @@ describe("knowledge base execution contract", () => {
     });
   });
 
-  it("keeps a running task read-only when its candidate URL or download is unavailable", async () => {
+  it("retries transient candidate reads but terminalizes deterministic unavailability", async () => {
     const operationKey = "4".repeat(64);
     const taskId = "materialized-task-running-download-unavailable";
     const build = {
@@ -5521,7 +4661,8 @@ describe("knowledge base execution contract", () => {
       const sendMessage = vi.fn();
       const deleteTask = vi.fn();
 
-      await expect(
+      const downloadArchive = vi.fn().mockRejectedValue(error);
+      const result =
         knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
           claim,
           { id: "credential-base", apiKey: "base-secret" } as any,
@@ -5538,7 +4679,7 @@ describe("knowledge base execution contract", () => {
               bodySha256: "b".repeat(64),
               preparedAt: "2026-08-15T00:00:00.000Z",
             }),
-            downloadArchive: vi.fn().mockRejectedValue(error),
+            downloadArchive,
             persistCandidate,
             observeCandidate,
             beginStop,
@@ -5552,15 +4693,25 @@ describe("knowledge base execution contract", () => {
               deleteTask,
             }),
           } as any,
-        ),
-      ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
-
-      expect(deferProviderStatus).toHaveBeenCalledWith(
-        expect.objectContaining({
-          status: "running",
-          resetCandidate: true,
-        }),
-      );
+        );
+      if (error.retryable) {
+        await expect(result).resolves.toEqual({
+          taskId,
+          rebound: true,
+          reconciled: false,
+        });
+        expect(deferProviderStatus).toHaveBeenCalledWith(
+          expect.objectContaining({
+            status: "running",
+            resetCandidate: true,
+          }),
+        );
+        expect(downloadArchive).toHaveBeenCalledTimes(3);
+      } else {
+        await expect(result).rejects.toBe(error);
+        expect(deferProviderStatus).not.toHaveBeenCalled();
+        expect(downloadArchive).toHaveBeenCalledOnce();
+      }
       expect(persistCandidate).not.toHaveBeenCalled();
       expect(observeCandidate).not.toHaveBeenCalled();
       expect(beginStop).not.toHaveBeenCalled();
@@ -5822,6 +4973,60 @@ describe("knowledge base execution contract", () => {
         expectedStatus: "error",
       },
       {
+        label:
+          "same-timestamp stale quota before a later running and error status",
+        events: [
+          archiveEvent,
+          {
+            id: "zzz-older-quota-envelope",
+            type: "error_message",
+            timestamp: 12,
+            error_message: { error_type: "quota_exceeded" },
+          },
+          {
+            id: "middle-running-status",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "running" },
+          },
+          {
+            id: "000-newer-untyped-error-status",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "error" },
+          },
+        ],
+        expectedStatus: "error",
+      },
+      {
+        label: "same-timestamp quota after the latest running boundary",
+        events: [
+          archiveEvent,
+          {
+            id: "zzz-older-running-status",
+            type: "status_update",
+            timestamp: 12,
+            providerOriginalRank: 30,
+            status_update: { agent_status: "running" },
+          },
+          {
+            id: "middle-quota-envelope",
+            type: "error_message",
+            timestamp: 12,
+            providerOriginalRank: 31,
+            error_message: { error_type: "quota_exceeded" },
+          },
+          {
+            id: "000-newer-quota-status",
+            type: "status_update",
+            timestamp: 12,
+            providerOriginalRank: 32,
+            status_update: { agent_status: "error" },
+          },
+        ],
+        expectedStatus: "quota_error",
+      },
+      {
         label: "missing status",
         events: [archiveEvent],
         expectedStatus: "unknown",
@@ -5888,7 +5093,7 @@ describe("knowledge base execution contract", () => {
           resetCandidate: true,
         }),
       );
-      expect(downloadArchive, fixture.label).toHaveBeenCalledOnce();
+      expect(downloadArchive, fixture.label).toHaveBeenCalledTimes(3);
       expect(observeCandidate, fixture.label).not.toHaveBeenCalled();
       expect(stopTask, fixture.label).not.toHaveBeenCalled();
       expect(createTask, fixture.label).not.toHaveBeenCalled();
@@ -6208,13 +5413,6 @@ describe("knowledge base execution contract", () => {
         { id: "credential-base", apiKey: "base-secret" } as any,
         dependencies,
       ),
-    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
-        claim,
-        { id: "credential-base", apiKey: "base-secret" } as any,
-        dependencies,
-      ),
     ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
 
     expect(createTask).not.toHaveBeenCalled();
@@ -6222,9 +5420,16 @@ describe("knowledge base execution contract", () => {
     expect(ensureManusV2Attachments).not.toHaveBeenCalled();
     expect(beginDispatch).not.toHaveBeenCalled();
     expect(bindSubmission).not.toHaveBeenCalled();
-    expect(deferProviderStatus).toHaveBeenCalledWith(
-      expect.objectContaining({ status: "quota_error" }),
-    );
+    expect(listAllMessages).toHaveBeenCalledTimes(2);
+    expect(listAllMessages).toHaveBeenNthCalledWith(1, {
+      taskId,
+      order: "desc",
+    });
+    expect(listAllMessages).toHaveBeenNthCalledWith(2, {
+      taskId,
+      order: "desc",
+    });
+    expect(deferProviderStatus).not.toHaveBeenCalled();
     expect(downloadArchive).toHaveBeenCalledOnce();
     expect(downloadArchive).toHaveBeenCalledWith(
       expect.objectContaining({ allowProviderFileIdFallback: true }),
@@ -6382,6 +5587,114 @@ describe("knowledge base execution contract", () => {
     expect(listAllMessages).not.toHaveBeenCalled();
     expect(bindSubmission).toHaveBeenCalledOnce();
     expect(ensureManusV2Attachments).toHaveBeenCalledOnce();
+  });
+
+  it("reads one terminal exact task twice before settling a no-ZIP reset", async () => {
+    const operationKey = "f".repeat(64);
+    const taskId = "materialized-terminal-no-zip";
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000bf",
+      userId: 7,
+      conversationId: "conversation-materialized-terminal-no-zip",
+      companyName: "No ZIP Company",
+      companyWebsite: "https://no-zip.example.test",
+      generation: 1,
+      revision: 0,
+      treePolicyVersion: 2,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 0,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: "00000000-0000-4000-8000-0000000000ef",
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: 1,
+        expectedRevision: 0,
+        expectedLeafId: null,
+        expectedUserAttachmentCount: 0,
+        operationType: "start",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedCompletion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-terminal-no-zip",
+      recoveryMetadata: { kind: "start" },
+      preparedDispatch: null,
+    } as any;
+    const stoppedEvents = [
+      {
+        id: "status-terminal-no-zip",
+        type: "status_update",
+        timestamp: 10,
+        status_update: { agent_status: "stopped" },
+      },
+    ];
+    const listAllMessages = vi.fn().mockResolvedValue(stoppedEvents);
+    const createTask = vi.fn();
+    const findCreatedTask = vi.fn();
+    const sendMessage = vi.fn();
+    const deferProviderStatus = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "bundle",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-17T00:00:00.000Z",
+          }),
+          deferProviderStatus,
+          createClient: vi.fn().mockReturnValue({
+            createTask,
+            findCreatedTask,
+            listAllMessages,
+            sendMessage,
+            stopTask: vi.fn(),
+          }),
+        } as any,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+    });
+    expect(listAllMessages).toHaveBeenCalledTimes(2);
+    expect(listAllMessages).toHaveBeenNthCalledWith(1, {
+      taskId,
+      order: "desc",
+    });
+    expect(listAllMessages).toHaveBeenNthCalledWith(2, {
+      taskId,
+      order: "desc",
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(findCreatedTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(deferProviderStatus).not.toHaveBeenCalled();
   });
 
   it("rejects a pre-cutover materialized turn before prepare or any Provider call", async () => {
@@ -6866,168 +6179,10 @@ describe("knowledge base execution contract", () => {
     delete process.env.FRONTMIND_KB_MANUS_V2_WRITER;
   });
 
-  it("runs manual Logo promotion only after the real task is created, bound, and registered", async () => {
-    const calls: string[] = [];
-    const result = await recoverKnowledgeBaseTurnClaimTask({
-      claim: {
-        turn: { upstreamTaskId: null },
-        upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo",
-      } as any,
-      ensureDispatch: async () => {
-        calls.push("prepare");
-        return {
-          schemaVersion: 1,
-          baseUrl: "https://api.example.test",
-          requestBody: {
-            prompt: "manual Logo",
-            agentProfile: "manus-1.6-max",
-            taskMode: "agent",
-            attachments: [],
-          },
-          bodySha256: "b".repeat(64),
-          preparedAt: "2026-08-10T00:00:00.000Z",
-        };
-      },
-      createTask: async () => {
-        calls.push("create:manus-task-logo");
-        return { taskId: "manus-task-logo" };
-      },
-      bindTask: async (taskId) => calls.push(`bind:${taskId}`),
-      registerTask: async (taskId) => calls.push(`register:${taskId}`),
-      afterTaskAcknowledged: async (taskId) => calls.push(`promote:${taskId}`),
-      reconcileTask: async (taskId) => {
-        calls.push(`reconcile:${taskId}`);
-        return false;
-      },
-    });
 
-    expect(result.taskId).toBe("manus-task-logo");
-    expect(calls).toEqual([
-      "prepare",
-      "create:manus-task-logo",
-      "bind:manus-task-logo",
-      "register:manus-task-logo",
-      "promote:manus-task-logo",
-      "reconcile:manus-task-logo",
-    ]);
-  });
 
-  it("reuses an already-bound Manus task while retrying post-ack Logo promotion", async () => {
-    const calls: string[] = [];
-    const createTask = vi.fn();
-    const result = await recoverKnowledgeBaseTurnClaimTask({
-      claim: {
-        turn: { upstreamTaskId: "manus-task-existing" },
-        upstreamIdempotencyKey: "frontmind-kb-v2:manual-logo",
-      } as any,
-      ensureDispatch: vi.fn(),
-      createTask,
-      bindTask: vi.fn(),
-      registerTask: async (taskId) => calls.push(`register:${taskId}`),
-      afterTaskAcknowledged: async (taskId) => calls.push(`promote:${taskId}`),
-      reconcileTask: async (taskId) => {
-        calls.push(`reconcile:${taskId}`);
-        return false;
-      },
-    });
 
-    expect(result).toMatchObject({
-      taskId: "manus-task-existing",
-      rebound: false,
-    });
-    expect(createTask).not.toHaveBeenCalled();
-    expect(calls).toEqual([
-      "register:manus-task-existing",
-      "promote:manus-task-existing",
-      "reconcile:manus-task-existing",
-    ]);
-  });
 
-  it("stops recovery before upstream create when Logo preparation is deterministically rejected", async () => {
-    const createTask = vi.fn();
-    const bindTask = vi.fn();
-    const registerTask = vi.fn();
-    const reconcileTask = vi.fn();
-    const preparationError = knowledgeBaseRecoveryLogoPreparationError(
-      new KnowledgeBaseArtifactBindingError(
-        "LOGO_UPLOAD_INVALID",
-        "上传的 Logo 原始文件已丢失，请重新上传",
-      ),
-    );
-
-    await expect(
-      recoverKnowledgeBaseTurnClaimTask({
-        claim: {
-          turn: { upstreamTaskId: null },
-          upstreamIdempotencyKey: "frontmind-kb-v2:logo-recovery",
-        } as any,
-        ensureDispatch: vi.fn().mockRejectedValue(preparationError),
-        createTask,
-        bindTask,
-        registerTask,
-        reconcileTask,
-      }),
-    ).rejects.toBe(preparationError);
-    expect(createTask).not.toHaveBeenCalled();
-    expect(bindTask).not.toHaveBeenCalled();
-    expect(registerTask).not.toHaveBeenCalled();
-    expect(reconcileTask).not.toHaveBeenCalled();
-  });
-
-  it("keeps an unclassified ensure-dispatch failure before task create", async () => {
-    const preparationError = new Error("pre-create dependency unavailable");
-    const createTask = vi.fn();
-    const bindTask = vi.fn();
-    const registerTask = vi.fn();
-    const reconcileTask = vi.fn();
-
-    await expect(
-      recoverKnowledgeBaseTurnClaimTask({
-        claim: {
-          turn: { upstreamTaskId: null, createAttemptState: "not_sent" },
-          upstreamIdempotencyKey: "frontmind-kb-v2:pre-create-generic",
-        } as any,
-        ensureDispatch: vi.fn().mockRejectedValue(preparationError),
-        createTask,
-        bindTask,
-        registerTask,
-        reconcileTask,
-      }),
-    ).rejects.toBe(preparationError);
-    expect(createTask).not.toHaveBeenCalled();
-    expect(bindTask).not.toHaveBeenCalled();
-    expect(registerTask).not.toHaveBeenCalled();
-    expect(reconcileTask).not.toHaveBeenCalled();
-  });
-
-  it("repairs a missing task resource ledger after bind without POSTing again", async () => {
-    const createTask = vi.fn();
-    const bindTask = vi.fn();
-    const registerTask = vi.fn().mockResolvedValue(undefined);
-    const reconcileTask = vi.fn().mockResolvedValue(false);
-
-    const result = await recoverKnowledgeBaseTurnClaimTask({
-      claim: {
-        turn: { upstreamTaskId: "already-bound-task" },
-        upstreamIdempotencyKey: "frontmind-kb-v2:stable-operation",
-      } as any,
-      ensureDispatch: vi.fn(),
-      createTask,
-      bindTask,
-      registerTask,
-      reconcileTask,
-    });
-
-    expect(result).toEqual({
-      taskId: "already-bound-task",
-      rebound: false,
-      reconciled: false,
-    });
-    expect(createTask).not.toHaveBeenCalled();
-    expect(bindTask).not.toHaveBeenCalled();
-    expect(registerTask).toHaveBeenCalledWith("already-bound-task");
-    expect(reconcileTask).toHaveBeenCalledWith("already-bound-task", undefined);
-  });
 
   it("uses the configured workspace enterprise and rejects client identity changes", () => {
     expect(

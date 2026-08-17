@@ -57,25 +57,32 @@ import {
   websiteStyleSampleBatches,
   websiteStyleSamples,
   websiteUserProvisions,
+  workspaceAuditEvents,
   type ApiCredential,
   type UpstreamResource,
   type User,
 } from "../drizzle/schema";
 import { getDb } from "./db";
 import { isFileResourceContentExpired } from "./file-content-retention";
+import { removeStoredPresalesFile } from "./presales-file-store";
 import { getUpstreamBaseUrl } from "./upstream-config";
 import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 import {
   acquireManagedUploadDeletionFence,
+  advanceManagedUploadAccountDeletionFence,
   assertManagedUploadScopesAvailable,
   assertCredentialDeletionFenceToken,
   completeManagedUploadDeletionFence,
   listManagedUploadCredentialDeletionFenceScopes,
+  listManagedUploadUserDeletionFences,
   ManagedUploadDeletionFenceError,
   reconcileStaleManagedUploadDeletionFence,
+  replayManagedUploadRetirementForDeletedAccount,
+  retireManagedUploadIntentsForAccountDeletion,
   rollbackManagedUploadDeletionFence,
   startManagedUploadDeletionFenceHeartbeat,
   type ManagedUploadDeletionFenceToken,
+  type ManagedUploadAccountProviderCleanupTarget,
 } from "./managed-upload-intent-fence";
 
 export const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -1150,6 +1157,174 @@ export async function permanentlyDeleteManagedUserRows(
   await executor.delete(users).where(eq(users.id, userId));
 }
 
+/**
+ * Invoked only from the deletion-fence retirement channel, which durably
+ * claims each Provider file before this callback. Resolve the exact frozen
+ * credential and make one idempotent delete attempt; local retained bytes are
+ * removed independently of the remote outcome.
+ */
+export async function discardManagedUploadProviderFileForRetirement(
+  target: ManagedUploadAccountProviderCleanupTarget,
+  executor?: any,
+) {
+  try {
+    const credential = await getDecryptedCredentialForManagedUploadIntent(
+      {
+        credentialId: target.credentialId,
+        credentialOwnerUserId: target.credentialOwnerUserId,
+        credentialVersion: target.credentialVersion,
+      },
+      executor,
+    );
+    if (!credential) {
+      throw new Error("MANAGED_UPLOAD_RETIREMENT_CREDENTIAL_UNAVAILABLE");
+    }
+    try {
+      await new ManusV2Client({
+        baseUrl: getUpstreamBaseUrl(),
+        apiKey: credential.apiKey,
+        timeoutMs: 5_000,
+      }).deleteFile(target.fileId);
+    } catch (error) {
+      if (!(error instanceof ManusV2ApiError && error.status === 404)) {
+        throw error;
+      }
+    }
+  } finally {
+    await removeStoredPresalesFile(target.fileId).catch(() => undefined);
+  }
+}
+
+/**
+ * Startup-only, bounded reconciliation for process exit around the final user
+ * deletion commit. Database absence is the authority for converting a
+ * `deleting` fence to `deleted`; local replay never contacts Provider APIs or
+ * reconstructs conversations.
+ */
+export async function reconcileManagedUploadAccountDeletionFencesOnStartup(
+  limit = 25,
+) {
+  const db = await requireDb();
+  const fences = await listManagedUploadUserDeletionFences(limit);
+  let deleted = 0;
+  let active = 0;
+  let failed = 0;
+  for (const fence of fences) {
+    try {
+      const user = await db.transaction(async (tx) => {
+        const rows = await tx
+          .select({
+            id: users.id,
+            username: users.username,
+            isActive: users.isActive,
+          })
+          .from(users)
+          .where(eq(users.id, fence.scope.userId))
+          .limit(1)
+          .for("update");
+        return rows[0] ?? null;
+      });
+      if (!user) {
+        await reconcileStaleManagedUploadDeletionFence(fence.scope, "deleted");
+        await replayManagedUploadRetirementForDeletedAccount(
+          fence.scope.userId,
+        );
+        deleted += 1;
+        continue;
+      }
+      if (
+        fence.purpose === "account_deletion" &&
+        (fence.accountDeletionPhase === "prepared" ||
+          fence.accountDeletionPhase === "retired") &&
+        user.isActive === false &&
+        !isProtectedBuiltinAdminUsername(user.username)
+      ) {
+        const token = await acquireManagedUploadDeletionFence(fence.scope, {
+          disposition: "cancel_active_intents",
+          purpose: "account_deletion",
+        });
+        // Startup continuation is deliberately local-only. Provider cleanup
+        // was either claimed before the crash or remains best-effort; it is
+        // never replayed without the initiating administrator's live
+        // credential context.
+        await retireManagedUploadIntentsForAccountDeletion({
+          userId: fence.scope.userId,
+          token,
+        });
+        await advanceManagedUploadAccountDeletionFence(token, "retired");
+        const removed = await db.transaction(async (tx) => {
+          const rows = await tx
+            .select({
+              id: users.id,
+              username: users.username,
+              isActive: users.isActive,
+            })
+            .from(users)
+            .where(eq(users.id, fence.scope.userId))
+            .limit(1)
+            .for("update");
+          const current = rows[0];
+          if (!current) return false;
+          if (
+            current.isActive !== false ||
+            isProtectedBuiltinAdminUsername(current.username)
+          ) {
+            throw new AuthServiceError(
+              "CONFLICT",
+              "Prepared account deletion no longer has safe startup authority",
+            );
+          }
+          await permanentlyDeleteManagedUserRows(tx, fence.scope.userId);
+          await tx.insert(workspaceAuditEvents).values({
+            id: randomUUID(),
+            actorUserId: null,
+            actorUsername: "signed-image-maintenance",
+            actorAccessLevel: null,
+            action: "account.deleted_after_crash_recovery",
+            targetType: "user",
+            targetId: String(fence.scope.userId),
+            workspaceUserId: fence.scope.userId,
+            reason: "durable_account_deletion_fence",
+            metadata: {
+              disposition: "permanently_deleted",
+              recovery: "startup_local_only",
+              priorPhase: fence.accountDeletionPhase,
+            },
+            createdAt: new Date(),
+          });
+          return true;
+        });
+        if (removed) {
+          await completeManagedUploadDeletionFence(token);
+          await replayManagedUploadRetirementForDeletedAccount(
+            fence.scope.userId,
+          );
+          deleted += 1;
+          continue;
+        }
+      }
+      if (
+        fence.state === "deleting" &&
+        fence.leaseExpiresAt &&
+        Date.parse(fence.leaseExpiresAt) <= Date.now()
+      ) {
+        // A permanent-account deletion fence is a resumable tombstone, not a
+        // temporary worker lease. Clearing it would re-enable upload
+        // capabilities for an account whose preparation transaction may
+        // already have disabled login and retired local intents. Any system
+        // administrator can resume it through deleteManagedUser.
+        if (fence.purpose !== "account_deletion") {
+          await reconcileStaleManagedUploadDeletionFence(fence.scope, "active");
+        }
+      }
+      active += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { scanned: fences.length, deleted, active, failed };
+}
+
 export async function deleteManagedUser(
   actorUserId: number,
   targetUserId: number,
@@ -1173,7 +1348,10 @@ export async function deleteManagedUser(
   const scope = { kind: "user" as const, userId: targetUserId };
   let fence: ManagedUploadDeletionFenceToken;
   try {
-    fence = await acquireManagedUploadDeletionFence(scope);
+    fence = await acquireManagedUploadDeletionFence(scope, {
+      disposition: "cancel_active_intents",
+      purpose: "account_deletion",
+    });
   } catch (error) {
     if (error instanceof ManagedUploadDeletionFenceError) {
       const existing = await db.transaction(async (tx) => {
@@ -1199,27 +1377,35 @@ export async function deleteManagedUser(
         return rows[0];
       });
       if (!existing) {
+        await replayManagedUploadRetirementForDeletedAccount(
+          targetUserId,
+        ).catch(() => undefined);
         return {
           disposition: "permanently_deleted" as const,
           replayed: true as const,
         };
       }
       if (error.code === "STALE_DELETION_FENCE") {
-        fence = await acquireManagedUploadDeletionFence(scope);
+        fence = await acquireManagedUploadDeletionFence(scope, {
+          disposition: "cancel_active_intents",
+          purpose: "account_deletion",
+        });
       } else {
         throw new AuthServiceError(
           "CONFLICT",
-          "该账号仍有本地上传记录正在接收、恢复或清理，暂时不能永久删除",
+          "该账号的永久删除正在进行，请稍后重试",
         );
       }
     } else {
       throw error;
     }
   }
+  const resumedPermanentDeletion = fence.resumed === true;
   const stopFenceHeartbeat = startManagedUploadDeletionFenceHeartbeat(fence);
-  let transactionCommitted = false;
+  let finalDeletionCommitted = false;
+  let permanentDeletionPrepared = false;
   try {
-    const result = await db.transaction(async (tx) => {
+    const preparation = await db.transaction(async (tx) => {
       const transactionResult = await (async () => {
         const rows = await tx
           .select()
@@ -1228,7 +1414,12 @@ export async function deleteManagedUser(
           .limit(1)
           .for("update");
         const user = rows[0];
-        if (!user) throw new AuthServiceError("NOT_FOUND", "User not found");
+        if (!user) {
+          return {
+            disposition: "permanently_deleted" as const,
+            replayed: true as const,
+          };
+        }
         if (isProtectedBuiltinAdminUsername(user.username)) {
           throw new AuthServiceError(
             "CONFLICT",
@@ -1441,29 +1632,107 @@ export async function deleteManagedUser(
         // both setup-token protocols consumed before deleting the account so the
         // durable ledger does not preserve a misleading live capability.
         const now = new Date();
+        await tx
+          .update(users)
+          .set({ isActive: false, updatedAt: now })
+          .where(eq(users.id, targetUserId));
         await consumeAllUserPasswordSetupTokensInExecutor(
           tx,
           targetUserId,
           now,
         );
         await revokeAllUserSessionsInExecutor(tx, targetUserId, now);
-        await permanentlyDeleteManagedUserRows(tx, targetUserId);
         return { disposition: "permanently_deleted" as const };
       })();
-      await options.onResultInTransaction?.(transactionResult, tx);
+      if (transactionResult.disposition === "deactivated_for_history") {
+        await options.onResultInTransaction?.(transactionResult, tx);
+      }
       return transactionResult;
     });
-    transactionCommitted = true;
-    await stopFenceHeartbeat();
-    if (result.disposition === "permanently_deleted") {
-      await completeManagedUploadDeletionFence(fence);
-    } else {
+    if (preparation.disposition === "deactivated_for_history") {
+      await stopFenceHeartbeat().catch(() => undefined);
       await rollbackManagedUploadDeletionFence(fence);
+      return preparation;
     }
+    permanentDeletionPrepared = true;
+    await advanceManagedUploadAccountDeletionFence(fence, "prepared");
+
+    // No transaction is held across filesystem retirement or Provider I/O.
+    // The preparation transaction has already disabled the account and
+    // revoked sessions, while the user fence excludes every upload worker.
+    await retireManagedUploadIntentsForAccountDeletion({
+      userId: targetUserId,
+      token: fence,
+      discardProviderFile: discardManagedUploadProviderFileForRetirement,
+    });
+    await advanceManagedUploadAccountDeletionFence(fence, "retired");
+
+    const result = await db.transaction(async (tx) => {
+      const rows = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, targetUserId))
+        .limit(1)
+        .for("update");
+      const userExisted = Boolean(rows[0]);
+      if (userExisted) {
+        await permanentlyDeleteManagedUserRows(tx, targetUserId);
+      }
+      const deletionResult = {
+        disposition: "permanently_deleted" as const,
+        ...("replayed" in preparation && preparation.replayed
+          ? { replayed: true as const }
+          : {}),
+      };
+      // A concurrent/resumed caller that finds the row already gone must not
+      // duplicate the original account.deleted audit event.
+      if (userExisted) {
+        await options.onResultInTransaction?.(deletionResult, tx);
+      }
+      return deletionResult;
+    });
+    finalDeletionCommitted = true;
+    await stopFenceHeartbeat().catch(() => undefined);
+    // Once the final transaction removed the account, filesystem/provider
+    // tail failure cannot change the public deletion result. Startup replay
+    // consumes this durable tombstone without reissuing Provider calls.
+    await completeManagedUploadDeletionFence(fence).catch(() => undefined);
     return result;
   } catch (error) {
     await stopFenceHeartbeat().catch(() => undefined);
-    if (!transactionCommitted) {
+    if (
+      !finalDeletionCommitted &&
+      (permanentDeletionPrepared || resumedPermanentDeletion)
+    ) {
+      const userStillExists = await db
+        .transaction(async (tx) => {
+          const rows = await tx
+            .select({ id: users.id })
+            .from(users)
+            .where(eq(users.id, targetUserId))
+            .limit(1)
+            .for("update");
+          return Boolean(rows[0]);
+        })
+        .catch(() => true);
+      if (!userStillExists) {
+        await reconcileStaleManagedUploadDeletionFence(scope, "deleted").catch(
+          () => undefined,
+        );
+        await replayManagedUploadRetirementForDeletedAccount(
+          targetUserId,
+        ).catch(() => undefined);
+        return {
+          disposition: "permanently_deleted" as const,
+          replayed: true as const,
+        };
+      }
+    }
+    if (
+      !finalDeletionCommitted &&
+      !permanentDeletionPrepared &&
+      !resumedPermanentDeletion
+    ) {
       await rollbackManagedUploadDeletionFence(fence).catch(() => undefined);
     }
     throw error;

@@ -582,10 +582,18 @@ export function collectKnowledgeArchiveDescriptors(
     const parentId = () =>
       (resolvedParentId ??= knowledgeBaseParentOutputItemId(item, outputIndex));
 
-    const topLevel =
-      !role || role === "assistant"
-        ? descriptorFromTypedFile(item, parentId)
-        : null;
+    let topLevel: KnowledgeArchiveDescriptor | null = null;
+    try {
+      topLevel =
+        !role || role === "assistant"
+          ? descriptorFromTypedFile(item, parentId)
+          : null;
+    } catch (error) {
+      if (!(error instanceof KnowledgeBaseArtifactIdentityError)) throw error;
+      // One malformed direct descriptor is not authority to discard other
+      // direct assistant ZIPs. The invalid candidate is locally ineligible;
+      // later candidates remain independently verifiable.
+    }
     if (topLevel) descriptors.push(topLevel);
     if (descriptors.length >= MAX_ARCHIVE_CANDIDATES) break;
 
@@ -602,10 +610,16 @@ export function collectKnowledgeArchiveDescriptors(
       contentIndex += 1
     ) {
       if (descriptors.length >= MAX_ARCHIVE_CANDIDATES) break;
-      const descriptor = descriptorFromTypedFile(
-        item.content[contentIndex],
-        () => knowledgeBaseChildOutputItemId(parentId(), contentIndex),
-      );
+      let descriptor: KnowledgeArchiveDescriptor | null = null;
+      try {
+        descriptor = descriptorFromTypedFile(item.content[contentIndex], () =>
+          knowledgeBaseChildOutputItemId(parentId(), contentIndex),
+        );
+      } catch (error) {
+        if (!(error instanceof KnowledgeBaseArtifactIdentityError)) throw error;
+        // Continue with the next sibling instead of widening trust into an
+        // arbitrary nested object or failing the whole assistant message.
+      }
       if (descriptor) descriptors.push(descriptor);
     }
   }

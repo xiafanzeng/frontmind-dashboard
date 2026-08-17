@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  KnowledgeBaseArtifactIdentityError,
   assertKnowledgeBaseV4FinalOutputResourceContract,
   collectKnowledgeArchiveDescriptors,
   KnowledgeBaseFinalOutputResourceContractError,
@@ -34,8 +33,8 @@ describe("knowledge-base ZIP descriptor normalization", () => {
   it.each([
     ["fileId", { file_id: "f".repeat(256) }],
     ["outputItemId", { id: "o".repeat(256) }],
-  ])("rejects an overlong %s instead of truncating it", (_label, identity) => {
-    expect(() =>
+  ])("drops an overlong %s instead of truncating it", (_label, identity) => {
+    expect(
       collectKnowledgeArchiveDescriptors([
         {
           id: "output-1",
@@ -46,11 +45,11 @@ describe("knowledge-base ZIP descriptor normalization", () => {
           ...identity,
         },
       ]),
-    ).toThrow(KnowledgeBaseArtifactIdentityError);
+    ).toEqual([]);
   });
 
-  it("rejects conflicting file identity aliases", () => {
-    expect(() =>
+  it("drops conflicting file identity aliases without hiding a valid sibling", () => {
+    expect(
       collectKnowledgeArchiveDescriptors([
         {
           id: "output-1",
@@ -60,12 +59,24 @@ describe("knowledge-base ZIP descriptor normalization", () => {
           filename: "knowledge.zip",
           mime_type: "application/zip",
         },
+        {
+          id: "output-2",
+          type: "output_file",
+          file_id: "file-valid",
+          filename: "knowledge-valid.zip",
+          mime_type: "application/zip",
+        },
       ]),
-    ).toThrow("别名字段相互冲突");
+    ).toEqual([
+      expect.objectContaining({
+        outputItemId: "output-2",
+        fileId: "file-valid",
+      }),
+    ]);
   });
 
-  it("rejects a numeric artifact identity that cannot be represented losslessly", () => {
-    expect(() =>
+  it("drops a numeric artifact identity that cannot be represented losslessly", () => {
+    expect(
       collectKnowledgeArchiveDescriptors([
         {
           id: "output-1",
@@ -75,11 +86,11 @@ describe("knowledge-base ZIP descriptor normalization", () => {
           mime_type: "application/zip",
         },
       ]),
-    ).toThrow("无法无损表示");
+    ).toEqual([]);
   });
 
-  it("rejects identity whitespace instead of silently rewriting it", () => {
-    expect(() =>
+  it("drops identity whitespace instead of silently rewriting it", () => {
+    expect(
       collectKnowledgeArchiveDescriptors([
         {
           id: "output-1",
@@ -89,8 +100,8 @@ describe("knowledge-base ZIP descriptor normalization", () => {
           mime_type: "application/zip",
         },
       ]),
-    ).toThrow("首尾空白");
-    expect(() =>
+    ).toEqual([]);
+    expect(
       collectKnowledgeArchiveDescriptors([
         {
           id: "output-1",
@@ -101,7 +112,7 @@ describe("knowledge-base ZIP descriptor normalization", () => {
           mime_type: "application/zip",
         },
       ]),
-    ).toThrow("首尾空白");
+    ).toEqual([]);
   });
 
   it("does not reject an unrelated text message solely for its long provider id", () => {
@@ -117,8 +128,8 @@ describe("knowledge-base ZIP descriptor normalization", () => {
     ).toEqual([]);
   });
 
-  it("rejects an object parent output identity instead of stringifying it", () => {
-    expect(() =>
+  it("drops an object parent output identity instead of stringifying it", () => {
+    expect(
       collectKnowledgeArchiveDescriptors([
         {
           id: { providerId: "assistant-1" },
@@ -134,7 +145,7 @@ describe("knowledge-base ZIP descriptor normalization", () => {
           ],
         },
       ]),
-    ).toThrow("上游输出项标识 格式无效");
+    ).toEqual([]);
   });
 
   it("derives a stable bounded child identity from the complete 255-character parent id", () => {

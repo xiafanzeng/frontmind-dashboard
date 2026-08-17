@@ -30,7 +30,6 @@
     "test:release:dev-mysql-bootstrap": "node scripts/release-channel.mjs database-bootstrap-test",
     "audit:kb:rollout": "tsx scripts/audit-knowledge-base-rollout.ts",
     "canary:kb:manus-v2:development": "node dist/run-knowledge-base-manus-v2-dev-canary.js",
-    "repair:kb:incident": "node dist/knowledge-base-incident-repair-cli.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node scripts/release-channel.mjs database-migrate",
     "db:push": "node scripts/release-channel.mjs database-push",

@@ -257,6 +257,13 @@ export type ManusV2MessageEvent = Record<string, unknown> & {
   id: string;
   type: string;
   timestamp: number;
+  /**
+   * Canonical oldest-to-newest position supplied by task.listMessages after
+   * pagination and de-duplication. Provider event ids are opaque identities,
+   * not clocks, so every equal-timestamp decision must use this rank (or the
+   * caller's stable array order for fixtures/legacy callers) instead.
+   */
+  providerOriginalRank?: number;
 };
 
 export type ManusV2TaskSummary = {
@@ -714,7 +721,10 @@ export function buildManusV2SendMessageBody(input: ManusV2SendMessageInput) {
   };
 }
 
-function normalizeEvent(value: unknown): ManusV2MessageEvent | null {
+function normalizeEvent(
+  value: unknown,
+  providerOriginalRank?: number,
+): ManusV2MessageEvent | null {
   const record = upstreamTaskRecord(value);
   if (!record) return null;
   try {
@@ -722,10 +732,60 @@ function normalizeEvent(value: unknown): ManusV2MessageEvent | null {
     const type = requiredString(record.type, "message.type", 64);
     const timestamp = Number(record.timestamp);
     if (!Number.isSafeInteger(timestamp) || timestamp < 0) return null;
-    return { ...record, id, type, timestamp };
+    return {
+      ...record,
+      id,
+      type,
+      timestamp,
+      ...(Number.isSafeInteger(providerOriginalRank) &&
+      Number(providerOriginalRank) >= 0
+        ? { providerOriginalRank }
+        : {}),
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * Preserve the Provider's event order when timestamps collide. Event ids are
+ * opaque identifiers and therefore cannot be used to invent chronology.
+ * Fixtures and older callers without a durable Provider rank retain their
+ * stable input-array order.
+ */
+export function orderManusV2EventsByProviderRank(
+  events: ReadonlyArray<ManusV2MessageEvent>,
+  direction: "oldest_first" | "newest_first",
+) {
+  const hasCompleteProviderRanks = events.every(
+    (event) =>
+      Number.isSafeInteger(event.providerOriginalRank) &&
+      Number(event.providerOriginalRank) >= 0,
+  );
+  return events
+    .map((event, originalIndex) => ({
+      event,
+      originalIndex,
+      providerRank: hasCompleteProviderRanks
+        ? Number(event.providerOriginalRank)
+        : originalIndex,
+    }))
+    .sort((left, right) => {
+      const timestampOrder =
+        direction === "oldest_first"
+          ? left.event.timestamp - right.event.timestamp
+          : right.event.timestamp - left.event.timestamp;
+      if (timestampOrder) return timestampOrder;
+      const rankOrder =
+        direction === "oldest_first"
+          ? left.providerRank - right.providerRank
+          : right.providerRank - left.providerRank;
+      if (rankOrder) return rankOrder;
+      return direction === "oldest_first"
+        ? left.originalIndex - right.originalIndex
+        : right.originalIndex - left.originalIndex;
+    })
+    .map(({ event }) => event);
 }
 
 export function manusV2EventUserText(event: ManusV2MessageEvent) {
@@ -763,10 +823,7 @@ export function manusV2EventOperationToken(event: ManusV2MessageEvent) {
 export function latestManusV2TaskState(
   events: ReadonlyArray<ManusV2MessageEvent>,
 ) {
-  const ordered = [...events].sort(
-    (left, right) =>
-      right.timestamp - left.timestamp || right.id.localeCompare(left.id),
-  );
+  const ordered = orderManusV2EventsByProviderRank(events, "newest_first");
   for (const event of ordered) {
     if (event.type !== "status_update") continue;
     const update = upstreamTaskRecord(event.status_update);
@@ -780,10 +837,7 @@ export function latestManusV2TaskState(
 export function latestManusV2WaitingDetail(
   events: ReadonlyArray<ManusV2MessageEvent>,
 ): ManusV2WaitingDetail | null {
-  const ordered = [...events].sort(
-    (left, right) =>
-      right.timestamp - left.timestamp || right.id.localeCompare(left.id),
-  );
+  const ordered = orderManusV2EventsByProviderRank(events, "newest_first");
   for (const event of ordered) {
     if (event.type !== "status_update") continue;
     const update = upstreamTaskRecord(event.status_update);
@@ -1073,12 +1127,10 @@ export function manusV2KnowledgeBaseStructuredResultForOperation(
   events: ReadonlyArray<ManusV2MessageEvent>,
   expected: ManusV2KnowledgeBaseOperationContract,
 ) {
-  const candidates = [...events]
-    .filter((event) => event.type === "structured_output_result")
-    .sort(
-      (left, right) =>
-        right.timestamp - left.timestamp || right.id.localeCompare(left.id),
-    );
+  const candidates = orderManusV2EventsByProviderRank(
+    events.filter((event) => event.type === "structured_output_result"),
+    "newest_first",
+  );
   for (const event of candidates) {
     const result = classifyManusV2StructuredResultEnvelope(
       event.structured_output_result,
@@ -1155,84 +1207,82 @@ export function normalizeManusV2Output(
       },
     ];
   }
-  return [...events]
-    .sort(
-      (left, right) =>
-        left.timestamp - right.timestamp || left.id.localeCompare(right.id),
-    )
-    .flatMap<NormalizedOutput>((event) => {
-      if (event.type === "structured_output_result") {
-        const result = classifyManusV2StructuredResultEnvelope(
-          event.structured_output_result,
-        );
-        if (result.kind !== "accepted") return [];
-        let value: ManusV2KnowledgeBaseStructuredResult;
-        try {
-          value = normalizeKnowledgeBaseStructuredResult(result.value);
-        } catch {
-          return [];
-        }
-        const text = value.visibleMarkdown;
-        return [
-          {
-            id: event.id,
-            role: "assistant",
-            text,
-            content: text,
-            timestamp: event.timestamp,
-            structuredOutput: true,
-          },
-        ];
+  return orderManusV2EventsByProviderRank(
+    events,
+    "oldest_first",
+  ).flatMap<NormalizedOutput>((event) => {
+    if (event.type === "structured_output_result") {
+      const result = classifyManusV2StructuredResultEnvelope(
+        event.structured_output_result,
+      );
+      if (result.kind !== "accepted") return [];
+      let value: ManusV2KnowledgeBaseStructuredResult;
+      try {
+        value = normalizeKnowledgeBaseStructuredResult(result.value);
+      } catch {
+        return [];
       }
-      if (event.type !== "assistant_message") return [];
-      const message = upstreamTaskRecord(event.assistant_message);
-      const text = typeof message?.content === "string" ? message.content : "";
-      const attachments = Array.isArray(message?.attachments)
-        ? message.attachments
-        : [];
-      // Materialized knowledge-base tasks intentionally return one ZIP and no
-      // prose. Preserve that assistant event so the archive validator can see
-      // the attachment; only a truly empty event is noise.
-      if (!text && attachments.length === 0) return [];
-      const typedAttachments = attachments.flatMap((attachment, index) => {
-        const record = upstreamTaskRecord(attachment);
-        if (!record) return [];
-        // task.listMessages identifies an output attachment by the immutable
-        // Provider event and its array position. Project each attachment once
-        // into the typed-file shape already consumed by the archive boundary;
-        // keep the ordinary assistant message separately for visible text.
-        const id = `v2-attachment-${createHash("sha256")
-          .update(`${event.id}\0${index}`, "utf8")
-          .digest("hex")}`;
-        return [
-          {
-            id,
-            role: "assistant" as const,
-            type: "file" as const,
-            filename:
-              record.filename ?? record.file_name ?? record.fileName ?? "",
-            content_type:
-              record.content_type ?? record.mime_type ?? record.mimeType ?? "",
-            url: record.url ?? record.file_url ?? record.fileUrl ?? "",
-            ...(record.file_id !== undefined || record.fileId !== undefined
-              ? { file_id: record.file_id ?? record.fileId }
-              : {}),
-            timestamp: event.timestamp,
-          },
-        ];
-      });
+      const text = value.visibleMarkdown;
       return [
         {
           id: event.id,
           role: "assistant",
           text,
           content: text,
-          files: attachments,
+          timestamp: event.timestamp,
+          structuredOutput: true,
+        },
+      ];
+    }
+    if (event.type !== "assistant_message") return [];
+    const message = upstreamTaskRecord(event.assistant_message);
+    const text = typeof message?.content === "string" ? message.content : "";
+    const attachments = Array.isArray(message?.attachments)
+      ? message.attachments
+      : [];
+    // Materialized knowledge-base tasks intentionally return one ZIP and no
+    // prose. Preserve that assistant event so the archive validator can see
+    // the attachment; only a truly empty event is noise.
+    if (!text && attachments.length === 0) return [];
+    const typedAttachments = attachments.flatMap((attachment, index) => {
+      const record = upstreamTaskRecord(attachment);
+      if (!record) return [];
+      // task.listMessages identifies an output attachment by the immutable
+      // Provider event and its array position. Project each attachment once
+      // into the typed-file shape already consumed by the archive boundary;
+      // keep the ordinary assistant message separately for visible text.
+      const id = `v2-attachment-${createHash("sha256")
+        .update(`${event.id}\0${index}`, "utf8")
+        .digest("hex")}`;
+      return [
+        {
+          id,
+          role: "assistant" as const,
+          type: "file" as const,
+          filename:
+            record.filename ?? record.file_name ?? record.fileName ?? "",
+          content_type:
+            record.content_type ?? record.mime_type ?? record.mimeType ?? "",
+          url: record.url ?? record.file_url ?? record.fileUrl ?? "",
+          ...(record.file_id !== undefined || record.fileId !== undefined
+            ? { file_id: record.file_id ?? record.fileId }
+            : {}),
           timestamp: event.timestamp,
         },
-        ...typedAttachments,
       ];
     });
+    return [
+      {
+        id: event.id,
+        role: "assistant",
+        text,
+        content: text,
+        files: attachments,
+        timestamp: event.timestamp,
+      },
+      ...typedAttachments,
+    ];
+  });
 }
 
 export class ManusV2Client {
@@ -1561,8 +1611,13 @@ export class ManusV2Client {
     return {
       taskId,
       messages: Array.isArray(result.messages)
-        ? result.messages.flatMap((event) => {
-            const normalized = normalizeEvent(event);
+        ? result.messages.flatMap((event, index, source) => {
+            const normalized = normalizeEvent(
+              event,
+              (input.order ?? "asc") === "desc"
+                ? source.length - 1 - index
+                : index,
+            );
             return normalized ? [normalized] : [];
           })
         : [],
@@ -1576,11 +1631,12 @@ export class ManusV2Client {
     taskId: string;
     order?: "asc" | "desc";
     stopAfterOperationToken?: string;
-  }) {
+  }): Promise<ManusV2MessageEvent[]> {
     const order = input.order ?? "desc";
     const events = new Map<string, ManusV2MessageEvent>();
     const seenCursors = new Set<string>();
     let cursor: string | null = null;
+    let providerEncounterRank = 0;
     for (let page = 0; page < MAX_PAGES; page += 1) {
       const result = await this.listMessagesPage({
         taskId: input.taskId,
@@ -1588,12 +1644,16 @@ export class ManusV2Client {
         cursor,
       });
       for (const event of result.messages) {
+        const rankedEvent: ManusV2MessageEvent = {
+          ...event,
+          providerOriginalRank: providerEncounterRank++,
+        };
         // Desc pagination observes the newest representation first. If the
         // Provider repeats an updated event on a later/older page, never let
         // that stale copy overwrite the authoritative first observation. Asc
         // pagination has the inverse page order, so the later copy wins.
         if (order === "desc" && events.has(event.id)) continue;
-        events.set(event.id, event);
+        events.set(event.id, rankedEvent);
       }
       if (
         input.stopAfterOperationToken &&
@@ -1617,9 +1677,18 @@ export class ManusV2Client {
       seenCursors.add(result.nextCursor);
       cursor = result.nextCursor;
     }
-    return [...events.values()].sort(
-      (left, right) =>
-        left.timestamp - right.timestamp || left.id.localeCompare(right.id),
+    const chronological = [...events.values()].sort((left, right) => {
+      const timestampOrder = left.timestamp - right.timestamp;
+      if (timestampOrder) return timestampOrder;
+      const leftRank = Number(left.providerOriginalRank);
+      const rightRank = Number(right.providerOriginalRank);
+      return order === "asc" ? leftRank - rightRank : rightRank - leftRank;
+    });
+    return chronological.map<ManusV2MessageEvent>(
+      (event, providerOriginalRank) => ({
+        ...event,
+        providerOriginalRank,
+      }),
     );
   }
 

@@ -134,7 +134,7 @@ const dispatchStart = knowledgeBaseApiSource.indexOf(
   "async function dispatchKnowledgeBaseRecoveryClaim(",
 );
 const dispatchEnd = knowledgeBaseApiSource.indexOf(
-  "type KnowledgeBaseActiveLegacyMigrationCandidate",
+  "export const knowledgeBaseTerminalAnchorRecoveryTestHooks",
   dispatchStart,
 );
 const dispatchSource = knowledgeBaseApiSource.slice(dispatchStart, dispatchEnd);
@@ -144,9 +144,6 @@ const resetFence = dispatchSource.indexOf(
 );
 const materializedDispatch = dispatchSource.indexOf(
   "dispatchMaterializedKnowledgeBaseClaim({",
-);
-const legacyHandoff = dispatchSource.indexOf(
-  "activateKnowledgeBaseManusV2Handoff({",
 );
 if (
   dispatchStart < 0 ||
@@ -160,10 +157,22 @@ if (
   !dispatchSource.includes("MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE") ||
   !dispatchSource.includes('existingBuild.skillVersion !== "5"') ||
   !dispatchSource.includes('existingBuild.providerProtocol !== "manus_v2"') ||
-  materializedDispatch <= resetFence ||
-  (legacyHandoff >= 0 && legacyHandoff <= resetFence)
+  materializedDispatch <= resetFence
 ) {
   failures.push("KNOWLEDGE_BASE_LEGACY_DISPATCH_RESET_FENCE_MISSING");
+}
+
+for (const retiredSymbol of [
+  "reconcileRecoveredKnowledgeBaseTask",
+  "reconcilePolledManusV2KnowledgeBaseTask",
+  "repairStoppedManusV2KnowledgeBaseFormat",
+  "activateKnowledgeBaseManusV2Handoff",
+  "findCreatedTask",
+  "task.sendMessage",
+]) {
+  if (knowledgeBaseApiSource.includes(retiredSymbol)) {
+    failures.push(`KNOWLEDGE_BASE_RETIRED_RUNTIME_PRESENT:${retiredSymbol}`);
+  }
 }
 
 const runtimeEntry = await readFile(
@@ -174,15 +183,13 @@ if (runtimeEntry.includes("releaseGeneratedAttachmentInvalidPreproviderTurns")) 
   failures.push("KNOWLEDGE_BASE_LEGACY_PREPROVIDER_SWEEP_MOUNTED");
 }
 
-const rolloutSource = await readFile(
-  path.join(repositoryRoot, "server/knowledge-base-manus-v2-rollout.ts"),
-  "utf8",
-);
-const newBuildSelector = rolloutSource.match(
-  /export function knowledgeBaseNewBuildProviderProtocol[\s\S]*?\n\}/u,
-)?.[0];
-if (!newBuildSelector || !newBuildSelector.includes('return "manus_v2";')) {
-  failures.push("KNOWLEDGE_BASE_NEW_BUILD_PROTOCOL_NOT_V2_ONLY");
+if (
+  reachablePaths.has("server/knowledge-base-manus-v2-rollout.ts") ||
+  reachablePaths.has("server/knowledge-base-active-v2-migration-core.ts") ||
+  reachablePaths.has("server/knowledge-base-manus-v2-lifecycle.ts") ||
+  reachablePaths.has("server/knowledge-base-incident-repair.ts")
+) {
+  failures.push("KNOWLEDGE_BASE_RETIRED_RECOVERY_MODULE_REACHABLE");
 }
 
 const openRecoverySource = await readFile(
@@ -210,14 +217,21 @@ const replaceRoute = knowledgeBaseApiSource.slice(
   replaceRouteStart,
   retryRouteStart,
 );
+const retryRouteEnd = knowledgeBaseApiSource.indexOf(
+  'router.get("/progress/:conversationId"',
+  retryRouteStart,
+);
+const retryRoute = knowledgeBaseApiSource.slice(retryRouteStart, retryRouteEnd);
 if (
   replaceRouteStart < 0 ||
   retryRouteStart <= replaceRouteStart ||
-  replaceRoute.indexOf("requireMaterializedKnowledgeBaseBuild({") < 0 ||
-  replaceRoute.indexOf("requireMaterializedKnowledgeBaseBuild({") >
-    replaceRoute.indexOf("getCredentialForUpstreamResource(")
+  retryRouteEnd <= retryRouteStart ||
+  !replaceRoute.includes("res.status(410)") ||
+  !replaceRoute.includes('code: "RESET_REQUIRED"') ||
+  !retryRoute.includes("res.status(410)") ||
+  !retryRoute.includes('code: "RESET_REQUIRED"')
 ) {
-  failures.push("KNOWLEDGE_BASE_ATTACHMENT_REPAIR_ROUTE_V5_FENCE_MISSING");
+  failures.push("KNOWLEDGE_BASE_RETIRED_REBUILD_ROUTES_NOT_410");
 }
 
 const turnServiceSource = await readFile(
@@ -227,23 +241,8 @@ const turnServiceSource = await readFile(
 const replaceServiceStart = turnServiceSource.indexOf(
   "export async function replaceKnowledgeBaseTurnAttachmentsAfterUserFix(",
 );
-const replaceServiceEnd = turnServiceSource.indexOf(
-  "\n}\n",
-  replaceServiceStart,
-);
-const replaceService = turnServiceSource.slice(
-  replaceServiceStart,
-  replaceServiceEnd,
-);
-if (
-  replaceServiceStart < 0 ||
-  replaceServiceEnd <= replaceServiceStart ||
-  !replaceService.includes('build.executionMode !== "materialized_bundle_v1"') ||
-  !replaceService.includes('build.skillVersion !== "5"') ||
-  !replaceService.includes('build.providerProtocol !== "manus_v2"') ||
-  !replaceService.includes('"RESET_REQUIRED"')
-) {
-  failures.push("KNOWLEDGE_BASE_ATTACHMENT_REPAIR_SERVICE_V5_FENCE_MISSING");
+if (replaceServiceStart >= 0) {
+  failures.push("KNOWLEDGE_BASE_RETIRED_ATTACHMENT_REBUILD_SERVICE_PRESENT");
 }
 
 // Website-facing task JSON is projected by one allowlist function. Provider

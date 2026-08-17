@@ -1724,6 +1724,41 @@ function buildDto(
   });
   const packageCompatibility =
     knowledgeBasePackageProjectionCompatibility(build);
+  const materializedV5 =
+    build.executionMode === "materialized_bundle_v1" &&
+    build.skillVersion === "5";
+  const hasDisplayableContent = rows.some(
+    (row) =>
+      typeof row.contentMarkdown === "string" && row.contentMarkdown.trim(),
+  );
+  const contentAvailability = !hasDisplayableContent
+    ? ("none" as const)
+    : resultQuality?.completeness === "partial"
+      ? ("partial" as const)
+      : ("complete" as const);
+  const materializedResetAllowed = Boolean(
+    materializedV5 &&
+      (resetRequired ||
+        (build.activeTurnId === null &&
+          (build.status === "protocol_error" || build.status === "failed"))),
+  );
+  const materializedOperationState = materializedResetAllowed
+    ? ("reset_required" as const)
+    : build.activeTurnId
+      ? build.upstreamTaskId
+        ? ("waiting_output" as const)
+        : ("creating" as const)
+      : contentAvailability !== "none" ||
+          build.status === "ready_to_publish" ||
+          build.status === "published"
+        ? ("completed" as const)
+        : ("creating" as const);
+  const materializedWarningCodes = Array.from(
+    new Set([
+      ...(resultQuality?.warnings || []).map((warning) => warning.code),
+      ...(materializedResetAllowed ? ["FRONTMIND_KB_RESET_REQUIRED"] : []),
+    ]),
+  );
   return {
     build: {
       id: build.id,
@@ -1766,8 +1801,92 @@ function buildDto(
     },
     branches: [...branchMap.values()],
     ...(resultQuality ? { resultQuality } : {}),
+    ...(materializedV5
+      ? {
+          contentAvailability,
+          operationState: materializedOperationState,
+          resetAllowed: materializedResetAllowed,
+          warningCodes: materializedWarningCodes,
+        }
+      : {}),
     packageAllowed: packageCompatibility.packageAllowed,
     packageState: packageCompatibility.packageState,
+  };
+}
+
+const KNOWLEDGE_BASE_RESULT_PROCESSING_STAGES = new Set([
+  "download",
+  "archive_safety",
+  "manifest_parse",
+  "component_projection",
+  "canonical_validation",
+  "activation",
+  "presentation",
+]);
+
+/**
+ * Overlay the build-only projection with the exact active-turn ledger. The
+ * public state deliberately consumes no Provider status: task acknowledgement,
+ * a locally staged canonical candidate and the reset fence are the only
+ * authorities that may change the page conclusion.
+ */
+export function knowledgeBaseMaterializedBusinessProjection(input: {
+  progress: KnowledgeBaseProgressDto;
+  activeTurn?: Pick<
+    typeof conversationTurns.$inferSelect,
+    "metadata" | "upstreamTaskId"
+  > | null;
+}) {
+  const { progress, activeTurn } = input;
+  if (progress.operationState === undefined) {
+    return progress;
+  }
+  const metadata = isRecord(activeTurn?.metadata) ? activeTurn.metadata : {};
+  const createAttemptState = metadata.createAttemptState;
+  const providerAttemptState = metadata.providerAttemptState;
+  const resetRequired =
+    progress.operationState === "reset_required" ||
+    createAttemptState === "unknown" ||
+    createAttemptState === "rejected" ||
+    providerAttemptState === "result_rejected";
+  const completion = isRecord(metadata.materializedCompletion)
+    ? metadata.materializedCompletion
+    : null;
+  const hasCanonicalCandidate = Boolean(
+    typeof completion?.storageKey === "string" &&
+      completion.storageKey &&
+      typeof completion.candidateArchiveSha256 === "string" &&
+      /^[a-f0-9]{64}$/u.test(completion.candidateArchiveSha256),
+  );
+  const resultProcessingStage =
+    typeof metadata.resultProcessingStage === "string" &&
+    KNOWLEDGE_BASE_RESULT_PROCESSING_STAGES.has(metadata.resultProcessingStage)
+      ? metadata.resultProcessingStage
+      : null;
+  const acknowledged =
+    createAttemptState === "acknowledged" ||
+    Boolean(activeTurn?.upstreamTaskId);
+  const operationState = resetRequired
+    ? ("reset_required" as const)
+    : activeTurn
+      ? hasCanonicalCandidate || resultProcessingStage
+        ? ("normalizing" as const)
+        : acknowledged
+          ? ("waiting_output" as const)
+          : ("creating" as const)
+      : progress.operationState;
+  const resetAllowed = resetRequired || progress.resetAllowed === true;
+  const warningCodes = Array.from(
+    new Set([
+      ...(progress.warningCodes || []),
+      ...(resetAllowed ? ["FRONTMIND_KB_RESET_REQUIRED"] : []),
+    ]),
+  );
+  return {
+    ...progress,
+    operationState,
+    resetAllowed,
+    warningCodes,
   };
 }
 
@@ -2059,7 +2178,34 @@ export async function getKnowledgeBaseProgress(input: {
         .limit(1);
   const build = buildRows[0];
   if (!build) return null;
-  return buildDto(build, await loadNodes(db, build.id));
+  const progress = buildDto(build, await loadNodes(db, build.id));
+  if (
+    build.executionMode !== "materialized_bundle_v1" ||
+    build.skillVersion !== "5" ||
+    !build.activeTurnId ||
+    progress.operationState === "reset_required"
+  ) {
+    return progress;
+  }
+  const activeRows = await db
+    .select({
+      upstreamTaskId: conversationTurns.upstreamTaskId,
+      metadata: conversationTurns.metadata,
+    })
+    .from(conversationTurns)
+    .where(
+      and(
+        eq(conversationTurns.id, build.activeTurnId),
+        eq(conversationTurns.userId, input.userId),
+        eq(conversationTurns.buildId, build.id),
+        eq(conversationTurns.buildGeneration, build.generation),
+      ),
+    )
+    .limit(1);
+  return knowledgeBaseMaterializedBusinessProjection({
+    progress,
+    activeTurn: activeRows[0] || null,
+  });
 }
 
 export type KnowledgeBaseObservationProjection = Omit<
@@ -2488,16 +2634,30 @@ async function readKnowledgeBaseObservationProjection(
       });
     }
   }
-  const materializedResources =
-    currentRow && build.executionMode === "materialized_bundle_v1"
-      ? projectKnowledgeBaseWorkingSetLeafResources({
-          buildId: build.id,
-          leafId: currentRow.leafId,
-          workingSet: (
-            await readValidatedActiveKnowledgeBaseWorkingSet({ db, build })
-          ).validated,
-        })
-      : [];
+  let materializedResources: KnowledgeBaseApprovedPresentationDto["resources"] =
+    [];
+  if (currentRow && build.executionMode === "materialized_bundle_v1") {
+    try {
+      materializedResources = projectKnowledgeBaseWorkingSetLeafResources({
+        buildId: build.id,
+        leafId: currentRow.leafId,
+        workingSet: (
+          await readValidatedActiveKnowledgeBaseWorkingSet({ db, build })
+        ).validated,
+      });
+    } catch (error) {
+      // Working-set assets are presentation enrichment. The canonical node
+      // body and its last-good receipt stay readable even when asset storage
+      // is briefly unavailable or an optional image no longer validates.
+      logKnowledgeBaseCustomerUploadEnrichmentSkipped({
+        surface: "progress",
+        buildId: build.id,
+        turnId:
+          currentRow.sourceTurnId || build.activeTurnId || "working-set-assets",
+        error,
+      });
+    }
+  }
 
   return projectKnowledgeBaseObservationSnapshot({
     build,
@@ -2669,6 +2829,10 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     !Array.isArray(activeTurnRow.metadata)
       ? (activeTurnRow.metadata as Record<string, unknown>)
       : {};
+  const businessProgress = knowledgeBaseMaterializedBusinessProjection({
+    progress,
+    activeTurn: activeTurnRow,
+  });
   const stagedClientAttachments = Array.isArray(
     activeTurnMetadata.clientStagedAttachments,
   )
@@ -2998,7 +3162,13 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   const packageCompatibility =
     knowledgeBasePackageProjectionCompatibility(build);
   const packageDto = packageCompatibility.package;
-  const explicitRecovery = knowledgeBasePublicTerminalRecovery(build);
+  // Materialized-v5 has one public terminal path: approved reset. Historical
+  // Provider "stopped" recovery markers must not become a second page
+  // conclusion beside waiting/normalizing or retained canonical content.
+  const explicitRecovery =
+    businessProgress.operationState === undefined
+      ? knowledgeBasePublicTerminalRecovery(build)
+      : null;
   const materializedResultFailureNotice =
     knowledgeBaseMaterializedResultFailureNotice(build);
 
@@ -3033,6 +3203,19 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     };
   } else if (materializedResultFailureNotice) {
     notice = materializedResultFailureNotice;
+  } else if (businessProgress.operationState === "reset_required") {
+    notice = {
+      key: `${build.id}:${build.generation}:${build.stateEpoch}:reset-required`,
+      code: "FRONTMIND_KB_RESET_REQUIRED",
+      severity: "warning",
+      message: KNOWLEDGE_BASE_MATERIALIZED_RESULT_RESET_MESSAGE,
+      retryable: false,
+      failureClass: "requires_user_fix",
+      recoveryAction: "approve_reset",
+      canRegenerate: false,
+      turnId: null,
+      createdAt: build.updatedAt.getTime(),
+    };
   } else if (explicitRecovery) {
     const stopped = explicitRecovery.action === "stopped";
     notice = {
@@ -3095,7 +3278,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
       createdAt: activeTurnRow.updatedAt.getTime(),
     };
   } else if (
-    progress.build.logoRequired === true &&
+    businessProgress.build.logoRequired === true &&
     currentRow?.ordinal === 0 &&
     !activeTurnRow
   ) {
@@ -3224,7 +3407,7 @@ function projectKnowledgeBaseObservationSnapshot(input: {
   }
 
   return {
-    progress,
+    progress: businessProgress,
     stateEpoch: build.stateEpoch,
     generation: build.generation,
     // The latest accepted presentation/completion receipt is the monotonic
@@ -3239,18 +3422,34 @@ function projectKnowledgeBaseObservationSnapshot(input: {
             build.packageStatus === "retrying"
           ? "repairing"
           : "synced",
+    ...(businessProgress.contentAvailability
+      ? { contentAvailability: businessProgress.contentAvailability }
+      : {}),
+    ...(businessProgress.operationState
+      ? { operationState: businessProgress.operationState }
+      : {}),
+    ...(typeof businessProgress.resetAllowed === "boolean"
+      ? { resetAllowed: businessProgress.resetAllowed }
+      : {}),
+    ...(businessProgress.warningCodes
+      ? { warningCodes: businessProgress.warningCodes }
+      : {}),
     processingPhase:
-      build.status === "ready_to_publish" &&
-      !packageCompatibility.packageAllowed &&
-      packageCompatibility.packageState !== "attention_required"
-        ? "package_preparing"
-        : activeTurnRow
-          ? deferredUploadProjection.processingPhase
-            ? deferredUploadProjection.processingPhase
-            : build.canonicalTaskState === "creating"
-              ? "migrating_task"
-              : "waiting_provider"
-          : null,
+      businessProgress.operationState === "normalizing"
+        ? "accepting"
+        : businessProgress.operationState === "reset_required"
+          ? null
+          : build.status === "ready_to_publish" &&
+              !packageCompatibility.packageAllowed &&
+              packageCompatibility.packageState !== "attention_required"
+            ? "package_preparing"
+            : activeTurnRow
+              ? deferredUploadProjection.processingPhase
+                ? deferredUploadProjection.processingPhase
+                : build.canonicalTaskState === "creating"
+                  ? "migrating_task"
+                  : "waiting_provider"
+              : null,
     contentState: packageCompatibility.contentCompleted
       ? "completed"
       : "building",
@@ -3258,9 +3457,11 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     publicationState: build.status === "published" ? "published" : "draft",
     contentCompletedAt:
       packageCompatibility.contentCompletedAt?.getTime() ?? null,
-    canonicalTaskUrl: materializedResultFailureNotice
-      ? null
-      : build.canonicalTaskUrl,
+    canonicalTaskUrl:
+      materializedResultFailureNotice ||
+      businessProgress.operationState === "reset_required"
+        ? null
+        : build.canonicalTaskUrl,
     localRestrictions:
       packageCompatibility.packageState === "attention_required"
         ? ["package_attention_required"]
@@ -3273,11 +3474,13 @@ function projectKnowledgeBaseObservationSnapshot(input: {
     // id would make the coordinator reconcile old output during the short
     // accepted-but-unbound window. Only the active turn can be authoritative
     // until it releases the build.
-    authoritativeTaskId: materializedResultFailureNotice
-      ? null
-      : activeTurnRow
-        ? activeTurnRow.upstreamTaskId
-        : build.canonicalTaskId || build.upstreamTaskId,
+    authoritativeTaskId:
+      materializedResultFailureNotice ||
+      businessProgress.operationState === "reset_required"
+        ? null
+        : activeTurnRow
+          ? activeTurnRow.upstreamTaskId
+          : build.canonicalTaskId || build.upstreamTaskId,
     activeTurn,
     completedTurn,
     approvedPresentation,

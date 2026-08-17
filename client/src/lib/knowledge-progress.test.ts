@@ -36,12 +36,14 @@ describe("reconcileKnowledgeBaseObservation", () => {
     };
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({ observation, accepted: true, resumed: true }),
-          { status: 202, headers: { "Content-Type": "application/json" } },
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(
+            JSON.stringify({ observation, accepted: true, resumed: true }),
+            { status: 202, headers: { "Content-Type": "application/json" } },
+          ),
         ),
-      ),
     );
 
     await expect(
@@ -205,6 +207,60 @@ describe("reconcileKnowledgeBaseObservation", () => {
       packageState: expect.anything(),
       publicationState: expect.anything(),
       contentCompletedAt: expect.anything(),
+    });
+  });
+
+  it("accepts additive business state from either the observation or nested progress", () => {
+    const base = {
+      stateEpoch: 4,
+      generation: 2,
+      authoritativeTaskId: "canonical-task",
+      activeTurn: null,
+      interaction: {
+        progress: null,
+        interactionState: "running",
+        canReply: false,
+        canPublish: false,
+        lockReason: null,
+      },
+      approvedPresentation: null,
+      package: null,
+      notice: null,
+      conversationVersion: 4,
+    };
+    const nestedProgress = {
+      build: { id: "build-v5" },
+      contentAvailability: "partial",
+      operationState: "normalizing",
+      resetAllowed: false,
+      warningCodes: [
+        "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
+        "OPTIONAL_BINARY_EVIDENCE_SKIPPED",
+      ],
+    } as any;
+
+    expect(
+      knowledgeBaseObservationFromPayload({
+        observation: { ...base, progress: nestedProgress },
+      }),
+    ).toMatchObject({
+      contentAvailability: "partial",
+      operationState: "normalizing",
+      resetAllowed: false,
+      warningCodes: ["OPTIONAL_BINARY_EVIDENCE_SKIPPED"],
+    });
+    expect(
+      knowledgeBaseObservationFromPayload({
+        observation: {
+          ...base,
+          progress: nestedProgress,
+          operationState: "reset_required",
+          resetAllowed: true,
+        },
+      }),
+    ).toMatchObject({
+      operationState: "reset_required",
+      resetAllowed: true,
     });
   });
 

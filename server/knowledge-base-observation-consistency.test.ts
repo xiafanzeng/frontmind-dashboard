@@ -13,6 +13,8 @@ const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
   customerUploadResources: vi.fn().mockResolvedValue([]),
   logCustomerUploadEnrichmentSkipped: vi.fn(),
+  readActiveWorkingSet: vi.fn().mockResolvedValue({ validated: {} }),
+  projectWorkingSetResources: vi.fn().mockReturnValue([]),
   officialLogoUploadFromTurn: vi.fn(
     (turn: { expectedLeafId?: string; metadata?: Record<string, any> }) =>
       turn.metadata?.recovery?.officialLogoUpload?.verified === true
@@ -29,8 +31,14 @@ vi.mock("./knowledge-base-customer-upload", () => ({
   knowledgeBaseOfficialLogoUploadFromTurn:
     dependencies.officialLogoUploadFromTurn,
 }));
+vi.mock("./knowledge-base-materialized-assets", () => ({
+  readValidatedActiveKnowledgeBaseWorkingSet: dependencies.readActiveWorkingSet,
+  projectKnowledgeBaseWorkingSetLeafResources:
+    dependencies.projectWorkingSetResources,
+}));
 
 import { getKnowledgeBaseObservationProjection } from "./knowledge-base-progress-service";
+import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "./knowledge-base-tree-policy-rollout";
 
 function query(values: Record<string, unknown>[]) {
   let selected = [...values];
@@ -938,6 +946,73 @@ describe("knowledge-base observation consistency", () => {
         surface: "progress",
         buildId: "build-snapshot",
         turnId: presentationTurn.id,
+      }),
+    );
+  });
+
+  it("keeps canonical materialized text readable when optional asset enrichment fails", async () => {
+    dependencies.readActiveWorkingSet.mockRejectedValueOnce(
+      new Error("asset storage temporarily unavailable"),
+    );
+    dependencies.logCustomerUploadEnrichmentSkipped.mockClear();
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build({
+              executionMode: "materialized_bundle_v1",
+              providerProtocol: "manus_v2",
+              skillVersion: "5",
+              skillContentHash:
+                KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+              contentVersion: 1,
+              activeWorkingSetId: "working-set-1",
+              canonicalTaskState: "active",
+              handoffProvenance: {
+                materializedRecoveryContractVersion: 1,
+                materializedCompletionContractVersion: 2,
+                materializedQuality: {
+                  completeness: "complete",
+                  stats: {
+                    acceptedCount: 1,
+                    expectedCount: 1,
+                    droppedCount: 0,
+                  },
+                  warnings: [],
+                  downstreamEligible: true,
+                  publishable: true,
+                },
+              },
+            }),
+            nodes: [node()],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toMatchObject({
+      leafId: "1.1",
+      visibleMarkdown: expect.stringContaining("旧快照正文"),
+      imageState: "no_eligible_asset",
+      resources: [],
+    });
+    expect(observation?.contentAvailability).toBe("complete");
+    expect(
+      dependencies.logCustomerUploadEnrichmentSkipped,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        surface: "progress",
+        buildId: "build-snapshot",
       }),
     );
   });
