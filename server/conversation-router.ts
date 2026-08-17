@@ -85,6 +85,18 @@ type ServerOwnedBuildResourceIdentity = ServerOwnedBuildIdentity &
     | "logoMimeType"
   >;
 
+const serverOwnedBuildResourceSelection = {
+  id: knowledgeBaseBuilds.id,
+  userId: knowledgeBaseBuilds.userId,
+  conversationId: knowledgeBaseBuilds.conversationId,
+  generation: knowledgeBaseBuilds.generation,
+  logoStorageKey: knowledgeBaseBuilds.logoStorageKey,
+  logoSha256: knowledgeBaseBuilds.logoSha256,
+  logoBytes: knowledgeBaseBuilds.logoBytes,
+  logoFilename: knowledgeBaseBuilds.logoFilename,
+  logoMimeType: knowledgeBaseBuilds.logoMimeType,
+} satisfies Record<keyof ServerOwnedBuildResourceIdentity, unknown>;
+
 type ServerOwnedBuildNodeIdentity = {
   buildId: string;
   leafId: string;
@@ -1182,20 +1194,11 @@ async function authoritativeKnowledgeBaseMetadataForMessages(
         .filter((buildId): buildId is string => Boolean(buildId)),
     ),
   );
-  const buildRows =
+  const buildRows: ServerOwnedBuildResourceIdentity[] =
     buildIds.length === 0
       ? []
       : ((await executor
-          .select({
-            id: knowledgeBaseBuilds.id,
-            userId: knowledgeBaseBuilds.userId,
-            conversationId: knowledgeBaseBuilds.conversationId,
-            logoStorageKey: knowledgeBaseBuilds.logoStorageKey,
-            logoSha256: knowledgeBaseBuilds.logoSha256,
-            logoBytes: knowledgeBaseBuilds.logoBytes,
-            logoFilename: knowledgeBaseBuilds.logoFilename,
-            logoMimeType: knowledgeBaseBuilds.logoMimeType,
-          })
+          .select(serverOwnedBuildResourceSelection)
           .from(knowledgeBaseBuilds)
           .where(
             and(

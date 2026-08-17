@@ -133,25 +133,29 @@ function serverOwnedMessage(
 
 function createSelectExecutor(rowsForTable: (table: unknown) => unknown[]) {
   const selectedTables: unknown[] = [];
-  const select = vi.fn(() => ({
-    from: (table: unknown) => {
-      selectedTables.push(table);
-      const rows = rowsForTable(table);
-      const query: {
-        where: () => typeof query;
-        orderBy: () => typeof query;
-        limit: () => Promise<unknown[]>;
-        then: Promise<unknown[]>["then"];
-      } = {
-        where: () => query,
-        orderBy: () => query,
-        limit: async () => rows,
-        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
-      };
-      return query;
-    },
-  }));
-  return { executor: { select }, selectedTables };
+  const selectedFields: unknown[] = [];
+  const select = vi.fn((fields?: unknown) => {
+    selectedFields.push(fields);
+    return {
+      from: (table: unknown) => {
+        selectedTables.push(table);
+        const rows = rowsForTable(table);
+        const query: {
+          where: () => typeof query;
+          orderBy: () => typeof query;
+          limit: () => Promise<unknown[]>;
+          then: Promise<unknown[]>["then"];
+        } = {
+          where: () => query,
+          orderBy: () => query,
+          limit: async () => rows,
+          then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
+        };
+        return query;
+      },
+    };
+  });
+  return { executor: { select }, selectedFields, selectedTables };
 }
 
 describe("conversation multi-device merge", () => {
@@ -806,7 +810,7 @@ describe("conversation multi-device merge", () => {
       .update(content, "utf8")
       .digest("hex");
     const presentationKey = createHash("sha256")
-      .update(["build-1", 1, 0, "1.1", contentSha256].join(":"))
+      .update(["build-1", 7, 0, "1.1", contentSha256].join(":"))
       .digest("hex");
     const presentationMessage: typeof messages.$inferSelect = {
       id: `u7:msg-kb-presentation-${presentationKey}`,
@@ -825,7 +829,7 @@ describe("conversation multi-device merge", () => {
           serverOwned: true,
           kind: "presentation",
           buildId: "build-1",
-          generation: 1,
+          generation: 7,
           operationKey: "operation-initial",
           turnId: "turn-initial",
           presentationKey,
@@ -844,7 +848,7 @@ describe("conversation multi-device merge", () => {
       userId: 7,
       clientRequestId: "request-initial",
       buildId: "build-1",
-      buildGeneration: 1,
+      buildGeneration: 7,
       operationKey: "operation-initial",
       operationType: "start",
       expectedRevision: 0,
@@ -857,6 +861,7 @@ describe("conversation multi-device merge", () => {
       id: "build-1",
       userId: 7,
       conversationId: "conversation-1",
+      generation: 7,
       logoStorageKey: "knowledge-base/build-1/logo.png",
       logoSha256: "a".repeat(64),
       logoBytes: 321,
@@ -896,12 +901,18 @@ describe("conversation multi-device merge", () => {
       return [];
     };
 
-    const { executor: historyExecutor } = createSelectExecutor(rowsForTable);
+    const { executor: historyExecutor, selectedFields: historySelectedFields } =
+      createSelectExecutor(rowsForTable);
     const history = await loadPersistedMessages(
       historyExecutor,
       7,
       "u7:conversation-1",
       null,
+    );
+    expect(historySelectedFields).toContainEqual(
+      expect.objectContaining({
+        generation: knowledgeBaseBuilds.generation,
+      }),
     );
     expect(history[0]?.inlineImages).toEqual([
       {
@@ -926,6 +937,9 @@ describe("conversation multi-device merge", () => {
         alt: "企业官方主 Logo",
       },
     ]);
+    expect(snapshots[0]?.messages[0]?.inlineImages).toEqual(
+      history[0]?.inlineImages,
+    );
   });
 
   it("repairs a provider assistant ID reused across two confirmed turns", () => {
