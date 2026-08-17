@@ -557,7 +557,7 @@ describe("ChatArea + ConversationProvider knowledge-base start", () => {
       '"serverOwned":0',
     );
     for (const call of mocks.uploadKnowledgeBaseLocalAsset.mock.calls) {
-      expect(call[3]?.contentSha256).toMatch(/^[a-f0-9]{64}$/u);
+      expect(call[3]).not.toHaveProperty("contentSha256");
     }
   });
 
