@@ -51,6 +51,7 @@ import type {
 } from "@shared/knowledge-base-progress";
 
 const KNOWLEDGE_BASE_NEW_BUILD_EVENT = "frontmind:new-knowledge-base-build";
+export const KNOWLEDGE_BASE_RECOVERY_UI_TIMEOUT_MS = 15_000;
 
 function isKnowledgeBaseConversationCandidate(
   conversation: Conversation | null,
@@ -60,6 +61,31 @@ function isKnowledgeBaseConversationCandidate(
       (conversation.knowledgeBase ||
         conversation.title === "企业知识库构建" ||
         conversation.messages?.some((message) => message.knowledgeBase)),
+  );
+}
+
+function hasLastGoodKnowledgeBasePresentation(
+  conversation: Conversation | null | undefined,
+) {
+  const knowledgeBase = conversation?.knowledgeBase;
+  if (
+    !knowledgeBase?.initialized ||
+    !knowledgeBase.presentationKey ||
+    !knowledgeBase.presentationTurnId
+  ) {
+    return false;
+  }
+  return Boolean(
+    conversation?.messages?.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.content.trim() &&
+        message.knowledgeBase?.kind === "presentation" &&
+        message.knowledgeBase.serverOwned === true &&
+        message.knowledgeBase.presentationKey ===
+          knowledgeBase.presentationKey &&
+        message.knowledgeBase.turnId === knowledgeBase.presentationTurnId,
+    ),
   );
 }
 
@@ -791,18 +817,21 @@ function RealBuildFlow({
   const {
     state,
     activeConversation,
+    loading: conversationLoading,
     hydrated,
+    syncError,
     createConversation,
     setActive,
     discardKnowledgeBaseConversationsLocally,
     refreshConversationsAfterDiscard,
+    refreshConversations,
+    clearSyncError,
   } = useConversation();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const trpcUtils = trpc.useUtils();
   const latestProgressQuery = trpc.workspace.knowledgeProgress.useQuery(
     undefined,
     {
-      enabled: hydrated,
       retry: false,
       refetchOnWindowFocus: true,
     },
@@ -812,6 +841,35 @@ function RealBuildFlow({
         (conversation) => conversation.id === conversationId,
       )
     : undefined;
+  // Home renders ConversationContext.activeConversation. Only use that same
+  // object as the last-good fallback; a stale scoped id must never make the KB
+  // shell mount while Home is actually pointing at an unrelated conversation.
+  const lastGoodConversation = hasLastGoodKnowledgeBasePresentation(
+    activeConversation,
+  )
+    ? activeConversation
+    : undefined;
+  const displayedConversation = lastGoodConversation ?? scopedConversation;
+  const [recoveryTimedOut, setRecoveryTimedOut] = useState(false);
+  const recoveryPending = Boolean(
+    !lastGoodConversation &&
+      !syncError &&
+      !latestProgressQuery.isError &&
+      (!hydrated || latestProgressQuery.data === undefined),
+  );
+
+  useEffect(() => {
+    if (!recoveryPending) {
+      setRecoveryTimedOut(false);
+      return;
+    }
+    if (recoveryTimedOut) return;
+    const timeout = window.setTimeout(
+      () => setRecoveryTimedOut(true),
+      KNOWLEDGE_BASE_RECOVERY_UI_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [recoveryPending, recoveryTimedOut]);
 
   useEffect(() => {
     const selectFreshBuild = (event: Event) => {
@@ -834,6 +892,7 @@ function RealBuildFlow({
   useEffect(() => {
     if (
       !hydrated ||
+      Boolean(syncError) ||
       latestProgressQuery.isLoading ||
       latestProgressQuery.isError ||
       !latestProgressQuery.data
@@ -880,6 +939,7 @@ function RealBuildFlow({
     scopedConversation,
     setActive,
     state.conversations,
+    syncError,
   ]);
 
   const progressQuery = trpc.workspace.knowledgeProgress.useQuery(
@@ -1021,19 +1081,32 @@ function RealBuildFlow({
     />
   );
 
-  if (latestProgressQuery.isError) {
+  const recoveryFailed = Boolean(
+    !lastGoodConversation &&
+      (syncError || latestProgressQuery.isError || recoveryTimedOut),
+  );
+  const retryRecovery = () => {
+    setRecoveryTimedOut(false);
+    clearSyncError();
+    void Promise.allSettled([
+      refreshConversations(),
+      latestProgressQuery.refetch(),
+    ]);
+  };
+
+  if (recoveryFailed) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-6">
         <div className="max-w-lg rounded-2xl border bg-muted/30 p-7 text-center">
           <p className="font-medium">构建会话读取失败</p>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            尚未创建新的构建会话，请先恢复已有会话状态。
+            {syncError || "未能在 15 秒内恢复已有构建会话，请检查网络后重试。"}
           </p>
           <Button
             type="button"
             variant="outline"
             className="mt-4"
-            onClick={() => void latestProgressQuery.refetch()}
+            onClick={retryRecovery}
           >
             重新读取
           </Button>
@@ -1042,7 +1115,10 @@ function RealBuildFlow({
     );
   }
 
-  if (latestProgressQuery.isLoading || !latestProgressQuery.data) {
+  if (
+    !lastGoodConversation &&
+    (conversationLoading || !hydrated || latestProgressQuery.data === undefined)
+  ) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center gap-2 p-6 text-sm text-muted-foreground">
         <Loader2 className="h-5 w-5 animate-spin text-primary" />
@@ -1066,9 +1142,9 @@ function RealBuildFlow({
             : "h-[calc(100dvh-210px)] min-h-[680px] overflow-hidden rounded-[20px] border border-[#e1d8e8] bg-white shadow-[0_18px_48px_rgba(33,19,58,.08)]"
         }
       >
-        {scopedConversation ? (
+        {displayedConversation ? (
           <Home
-            key={scopedConversation.id}
+            key={displayedConversation.id}
             embedded
             hideSidebar
             fixedAgentProfile="frontmind-pro"

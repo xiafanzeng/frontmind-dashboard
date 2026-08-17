@@ -563,6 +563,51 @@ describe("conversation multi-device merge", () => {
     expect(loadResources).not.toHaveBeenCalled();
   });
 
+  it("keeps conversation enrichment readable when optional customer images fail", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const loadResources = vi
+      .fn()
+      .mockRejectedValue(new Error("historical upload ledger unavailable"));
+    const turn = {
+      id: "turn-optional-upload",
+      operationType: "revise",
+      expectedLeafId: "1.2",
+      attachmentFileIds: ["file-optional-upload"],
+      metadata: {},
+      status: "completed" as const,
+    };
+
+    await expect(
+      reconstructKnowledgeBasePresentationInlineImages(
+        {
+          build: {
+            id: "build-1",
+            userId: 7,
+            conversationId: "conversation-1",
+            logoStorageKey: null,
+            logoSha256: null,
+            logoBytes: null,
+            logoFilename: null,
+            logoMimeType: null,
+          },
+          node: {
+            buildId: "build-1",
+            leafId: "1.2",
+            ordinal: 1,
+            sourceTurnId: turn.id,
+          },
+          knowledgeBase: { kind: "presentation", leafId: "1.2" },
+          turn,
+        },
+        loadResources,
+      ),
+    ).resolves.toBeUndefined();
+    expect(warning).toHaveBeenCalledWith(
+      "[KnowledgeBaseCustomerUpload] enrichment_skipped",
+      expect.stringContaining('"surface":"conversation"'),
+    );
+  });
+
   it("keeps an earlier customer image visible after the same leaf is revised again", async () => {
     const loadResources = vi.fn().mockResolvedValue([
       {

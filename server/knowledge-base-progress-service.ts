@@ -75,6 +75,7 @@ import {
 import {
   knowledgeBaseCustomerUploadResources,
   knowledgeBaseOfficialLogoUploadFromTurn,
+  logKnowledgeBaseCustomerUploadEnrichmentSkipped,
 } from "./knowledge-base-customer-upload";
 import {
   markKnowledgeBaseConversationCompletedInTransaction,
@@ -2453,28 +2454,40 @@ async function readKnowledgeBaseObservationProjection(
     throw new KnowledgeBaseObservationSnapshotChangedError();
   }
 
-  const customerUploadResources =
+  let customerUploadResources: KnowledgeBaseApprovedPresentationDto["resources"] =
+    [];
+  if (
     currentRow &&
     presentationTurnRow &&
     presentationTurnRow.id === currentRow.sourceTurnId &&
     presentationTurnRow.expectedLeafId === currentRow.leafId
-      ? await knowledgeBaseCustomerUploadResources(
-          build.id,
-          presentationTurnRow,
-          build.skillVersion === "4" &&
-            (build.status === "ready_to_publish" ||
-              build.status === "published") &&
-            /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || ""))
-            ? {
-                persistedEvidence: {
-                  userId: input.userId,
-                  generation: build.generation,
-                  packageArchiveSha256: build.packageArchiveSha256!,
-                },
-              }
-            : undefined,
-        )
-      : [];
+  ) {
+    try {
+      customerUploadResources = await knowledgeBaseCustomerUploadResources(
+        build.id,
+        presentationTurnRow,
+        build.skillVersion === "4" &&
+          (build.status === "ready_to_publish" ||
+            build.status === "published") &&
+          /^[a-f0-9]{64}$/u.test(String(build.packageArchiveSha256 || ""))
+          ? {
+              persistedEvidence: {
+                userId: input.userId,
+                generation: build.generation,
+                packageArchiveSha256: build.packageArchiveSha256!,
+              },
+            }
+          : undefined,
+      );
+    } catch (error) {
+      logKnowledgeBaseCustomerUploadEnrichmentSkipped({
+        surface: "progress",
+        buildId: build.id,
+        turnId: presentationTurnRow.id,
+        error,
+      });
+    }
+  }
   const materializedResources =
     currentRow && build.executionMode === "materialized_bundle_v1"
       ? projectKnowledgeBaseWorkingSetLeafResources({

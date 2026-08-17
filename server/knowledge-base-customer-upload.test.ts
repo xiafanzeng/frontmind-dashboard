@@ -289,6 +289,50 @@ describe("knowledge-base customer upload provenance", () => {
     expect(serialized).not.toContain("a".repeat(64));
   });
 
+  it("resolves a captured source id through its finalized Manus v2 mapping", async () => {
+    const sourceSha256 = "a".repeat(64);
+    const turn = capturedImageTurn({
+      providerProtocol: "manus_v2",
+      manusV2SourceAttachmentFileIds: ["file-customer-image"],
+      manusV2AttachmentMappings: {
+        customer: {
+          status: "ready",
+          sourceFileId: "file-customer-image",
+          upstreamFileId: "v2-file-customer-image",
+          filename: "customer-proof.jpg",
+          mimeType: "image/jpeg",
+          sizeBytes: 1234,
+          contentSha256: sourceSha256,
+        },
+      },
+      manusV2AttachmentMappingsFinalizedAt: "2026-08-16T22:35:50.538Z",
+    });
+    turn.attachmentFileIds = ["v2-file-customer-image"];
+    dependencies.readStoredPresalesFile.mockResolvedValueOnce({
+      filename: "customer-proof.jpg",
+      mimeType: "image/jpeg",
+      sizeBytes: 1234,
+      sha256: sourceSha256,
+    });
+
+    expect(knowledgeBaseCustomerUploadImagesFromTurn(turn)).toEqual([
+      expect.objectContaining({
+        fileId: "file-customer-image",
+        filename: "customer-proof.jpg",
+        sourceSha256,
+      }),
+    ]);
+    await expect(
+      knowledgeBaseCustomerUploadResources("build-1", turn),
+    ).resolves.toHaveLength(1);
+    expect(knowledgeBaseExpectedCustomerUploadsFromTurns([turn])).toEqual([
+      expect.objectContaining({
+        sourceSha256,
+        fileIds: ["file-customer-image"],
+      }),
+    ]);
+  });
+
   it("excludes a verified recovery officialLogoUpload from the ordinary customer-upload manifest", () => {
     const turn = capturedImageTurn({
       recovery: {

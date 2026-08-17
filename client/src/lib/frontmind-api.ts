@@ -3033,8 +3033,13 @@ export async function discardManagedUploadIntent(
   );
 }
 
-export const FILE_UPLOAD_STALL_TIMEOUT_MS = 2 * 60 * 1000;
-export const FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS = 6 * 60 * 1000;
+export const FILE_UPLOAD_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+export const FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS = 6 * 60 * 1000;
+/** @deprecated Use FILE_UPLOAD_IDLE_TIMEOUT_MS. */
+export const FILE_UPLOAD_STALL_TIMEOUT_MS = FILE_UPLOAD_IDLE_TIMEOUT_MS;
+/** @deprecated Use FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS. */
+export const FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS =
+  FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS;
 export const MANAGED_UPLOAD_RECOVERY_TIMEOUT_MS = 30_000;
 // Covers the 195-second unknown-create fence plus one fresh provider
 // capability, PUT and readiness reconciliation without asking for the PDF.
@@ -3093,45 +3098,48 @@ function installFileUploadWatchdog(
     onUploadComplete?: () => void;
   } = { totalBytes: 0 },
 ) {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let idleTimeoutId: ReturnType<typeof setTimeout> | undefined;
+  let responseTimeoutId: ReturnType<typeof setTimeout> | undefined;
   let timeoutCode:
     | "UPLOAD_BROWSER_STALLED"
     | "UPLOAD_SERVER_RESPONSE_TIMEOUT"
     | undefined;
   let uploadComplete = false;
-  let maximumLoadedBytes = 0;
-  const arm = (
-    waitMs: number,
-    code: "UPLOAD_BROWSER_STALLED" | "UPLOAD_SERVER_RESPONSE_TIMEOUT",
-  ) => {
-    if (timeoutId !== undefined) clearTimeout(timeoutId);
-    timeoutId = setTimeout(() => {
-      timeoutCode = code;
+  const armIdleTimeout = () => {
+    if (idleTimeoutId !== undefined) clearTimeout(idleTimeoutId);
+    idleTimeoutId = setTimeout(() => {
+      timeoutCode = "UPLOAD_BROWSER_STALLED";
       xhr.abort();
-    }, waitMs);
+    }, FILE_UPLOAD_IDLE_TIMEOUT_MS);
+  };
+  const armResponseTimeout = () => {
+    if (responseTimeoutId !== undefined) return;
+    responseTimeoutId = setTimeout(() => {
+      timeoutCode = "UPLOAD_SERVER_RESPONSE_TIMEOUT";
+      xhr.abort();
+    }, FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS);
   };
   const markUploadComplete = () => {
     if (uploadComplete) return;
     uploadComplete = true;
-    arm(
-      FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS,
-      "UPLOAD_SERVER_RESPONSE_TIMEOUT",
-    );
+    if (idleTimeoutId !== undefined) clearTimeout(idleTimeoutId);
+    idleTimeoutId = undefined;
+    armResponseTimeout();
     if (onProgress) onProgress(100);
     input.onTransfer?.(input.totalBytes, input.totalBytes);
     input.onUploadComplete?.();
   };
   xhr.upload.addEventListener("progress", (event) => {
+    if (uploadComplete) return;
     const transferComplete =
       event.lengthComputable && event.loaded >= event.total;
     if (transferComplete) {
-      arm(
-        FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS,
-        "UPLOAD_SERVER_RESPONSE_TIMEOUT",
-      );
-    } else if (event.loaded > maximumLoadedBytes) {
-      maximumLoadedBytes = event.loaded;
-      arm(FILE_UPLOAD_STALL_TIMEOUT_MS, "UPLOAD_BROWSER_STALLED");
+      markUploadComplete();
+    } else {
+      // This is an idle watchdog, not a total upload deadline. Browsers may
+      // emit repeated byte counts while their network stack is still active,
+      // so every upload progress event refreshes the idle window.
+      armIdleTimeout();
     }
     if (event.lengthComputable) {
       if (onProgress) {
@@ -3139,15 +3147,16 @@ function installFileUploadWatchdog(
       }
       input.onTransfer?.(event.loaded, event.total);
     }
-    if (transferComplete) markUploadComplete();
   });
   xhr.upload.addEventListener("load", markUploadComplete);
   return {
-    start: () => arm(FILE_UPLOAD_STALL_TIMEOUT_MS, "UPLOAD_BROWSER_STALLED"),
+    start: armIdleTimeout,
     markUploadComplete,
     clear: () => {
-      if (timeoutId !== undefined) clearTimeout(timeoutId);
-      timeoutId = undefined;
+      if (idleTimeoutId !== undefined) clearTimeout(idleTimeoutId);
+      if (responseTimeoutId !== undefined) clearTimeout(responseTimeoutId);
+      idleTimeoutId = undefined;
+      responseTimeoutId = undefined;
     },
     timeoutCode: () => timeoutCode,
   };

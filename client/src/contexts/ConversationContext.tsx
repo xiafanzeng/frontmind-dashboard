@@ -63,6 +63,9 @@ export function conversationSyncErrorMessage(error: unknown): string {
     : message;
 }
 
+const CONVERSATION_HYDRATION_SUPERSEDED_MESSAGE =
+  "会话列表在读取期间发生变化，请重新读取。";
+
 // Types for local conversation management
 export interface Attachment {
   id: string;
@@ -1960,6 +1963,7 @@ export function ConversationProvider({
   const [syncError, setSyncError] = useState<string | null>(null);
   const accountIdRef = useRef<number | null>(null);
   const hydrationGenerationRef = useRef(0);
+  const activeHydrationGenerationRef = useRef<number | null>(null);
   const canSyncRef = useRef(false);
   const listRefetchRef = useRef(listQuery.refetch);
   const syncSnapshotRef = useRef(syncSnapshotMutation.mutateAsync);
@@ -2245,6 +2249,7 @@ export function ConversationProvider({
   const hydrateForUser = useCallback(
     async (expectedUserId: number, initial: boolean) => {
       const generation = ++hydrationGenerationRef.current;
+      activeHydrationGenerationRef.current = generation;
       if (initial) {
         setHydrated(false);
         setHydrationLoading(true);
@@ -2253,10 +2258,19 @@ export function ConversationProvider({
       try {
         const result = await listRefetchRef.current();
         if (result.error) throw result.error;
-        if (
-          accountIdRef.current !== expectedUserId ||
-          hydrationGenerationRef.current !== generation
-        ) {
+        if (accountIdRef.current !== expectedUserId) {
+          return;
+        }
+        if (hydrationGenerationRef.current !== generation) {
+          // A local reset/discard can invalidate the only initial list request
+          // without starting a replacement request. Settle that abandoned
+          // generation into an explicit retryable state instead of leaving the
+          // whole provider permanently unhydrated. A genuinely newer hydrate
+          // owns the loading state and will perform its own finite settlement.
+          if (initial && activeHydrationGenerationRef.current === generation) {
+            setSyncError(CONVERSATION_HYDRATION_SUPERSEDED_MESSAGE);
+            setHydrated(false);
+          }
           return;
         }
 
@@ -2308,17 +2322,21 @@ export function ConversationProvider({
       } catch (error: unknown) {
         if (
           accountIdRef.current === expectedUserId &&
-          hydrationGenerationRef.current === generation
+          activeHydrationGenerationRef.current === generation
         ) {
           setSyncError(conversationSyncErrorMessage(error));
+          // `hydrated` remains the remote-data-loaded signal consumed by Home,
+          // response logic and resume polling. Finite failure is represented by
+          // loading=false plus syncError, never by pretending the list loaded.
           if (initial) setHydrated(false);
         }
       } finally {
         if (
           accountIdRef.current === expectedUserId &&
-          hydrationGenerationRef.current === generation
+          activeHydrationGenerationRef.current === generation
         ) {
           setHydrationLoading(false);
+          activeHydrationGenerationRef.current = null;
         }
       }
     },
@@ -2329,6 +2347,7 @@ export function ConversationProvider({
     if (auth.loading) return;
 
     hydrationGenerationRef.current += 1;
+    activeHydrationGenerationRef.current = null;
     syncQueueRef.current!.reset();
     canSyncRef.current = false;
     accountIdRef.current = userId;
@@ -2349,8 +2368,8 @@ export function ConversationProvider({
   }, [auth.loading, hydrateForUser, projectAssignmentId, replaceState, userId]);
 
   useEffect(() => {
-    canSyncRef.current = hydrated && userId !== null;
-  }, [hydrated, userId]);
+    canSyncRef.current = hydrated && userId !== null && syncError === null;
+  }, [hydrated, syncError, userId]);
 
   useEffect(() => {
     let timer: number | undefined;
@@ -2585,11 +2604,10 @@ export function ConversationProvider({
   const refreshConversations = useCallback(async () => {
     const expectedUserId = accountIdRef.current;
     if (expectedUserId === null) return;
-    if (!hydrated) {
-      await hydrateForUser(expectedUserId, true);
+    if (!hydrated || !canSyncRef.current) {
+      await hydrateForUser(expectedUserId, !hydrated);
       return;
     }
-    if (!canSyncRef.current) return;
     const flushed = await syncQueueRef.current!.flushAll();
     if (!flushed) return;
     await hydrateForUser(expectedUserId, false);
@@ -2597,9 +2615,9 @@ export function ConversationProvider({
 
   const refreshConversationsAfterDiscard = useCallback(async () => {
     const expectedUserId = accountIdRef.current;
-    if (expectedUserId === null || !canSyncRef.current) return;
-    await hydrateForUser(expectedUserId, false);
-  }, [hydrateForUser]);
+    if (expectedUserId === null) return;
+    await hydrateForUser(expectedUserId, !hydrated);
+  }, [hydrateForUser, hydrated]);
 
   const clearSyncError = useCallback(() => setSyncError(null), []);
 

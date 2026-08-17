@@ -432,6 +432,50 @@ describe("ConversationProvider cloud hydration", () => {
     ]);
   });
 
+  it("settles a failed initial list read and can explicitly retry it", async () => {
+    mocks.listRefetch.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    const { result } = renderHook(() => useConversation(), { wrapper });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.hydrated).toBe(false);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.syncError).toBe(
+      "会话同步暂时中断，连接恢复后将自动重试。",
+    );
+    expect(result.current.state.conversations).toEqual([]);
+
+    await act(async () => {
+      await result.current.refreshConversations();
+    });
+    await waitFor(() => expect(result.current.syncError).toBeNull());
+    expect(result.current.state.conversations.map((item) => item.id)).toEqual([
+      "account-1",
+    ]);
+  });
+
+  it("gives an invalidated initial hydration a finite retryable outcome", async () => {
+    let resolveInitial: ((value: { data: Conversation[] }) => void) | undefined;
+    mocks.listRefetch.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveInitial = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useConversation(), { wrapper });
+
+    expect(result.current.hydrated).toBe(false);
+    act(() => result.current.discardConversationLocally("stale-local"));
+    await act(async () => {
+      resolveInitial?.({ data: [conversation("stale-remote")] });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.hydrated).toBe(false);
+    expect(result.current.loading).toBe(false);
+    expect(result.current.syncError).toContain("请重新读取");
+    expect(result.current.state.conversations).toEqual([]);
+  });
+
   it("clears a released response-logic task pointer so the next turn can start fresh", async () => {
     mocks.listRefetch.mockResolvedValue({
       data: [

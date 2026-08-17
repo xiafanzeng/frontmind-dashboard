@@ -11,8 +11,8 @@ import {
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
-  FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS,
-  FILE_UPLOAD_STALL_TIMEOUT_MS,
+  FILE_UPLOAD_IDLE_TIMEOUT_MS,
+  FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS,
   getModelDisplayName,
   listManagedUploadsForKnowledgeBase,
   MANAGED_UPLOAD_BUSY_RECOVERY_TIMEOUT_MS,
@@ -2226,16 +2226,18 @@ describe("uploadFile", () => {
       },
     );
 
-    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_STALL_TIMEOUT_MS - 1);
+    expect(FILE_UPLOAD_IDLE_TIMEOUT_MS).toBe(5 * 60 * 1000);
+    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_IDLE_TIMEOUT_MS - 1);
     expect(settled).toBe(false);
 
     await vi.advanceTimersByTimeAsync(1);
     await expect(upload).rejects.toThrow("长时间没有进度");
   });
 
-  it("does not extend the stall deadline for duplicate progress events", async () => {
+  it("refreshes the idle deadline for every continuing progress event", async () => {
     vi.useFakeTimers();
     let xhr: MockXMLHttpRequest | undefined;
+    let aborted = false;
     class MockXMLHttpRequest {
       status = 0;
       private uploadListeners = new Map<string, (event: any) => void>();
@@ -2261,6 +2263,7 @@ describe("uploadFile", () => {
         });
       }
       abort() {
+        aborted = true;
         this.listeners.get("abort")?.();
       }
     }
@@ -2275,14 +2278,19 @@ describe("uploadFile", () => {
     });
     await vi.advanceTimersByTimeAsync(60_000);
     xhr!.progress(1, 4);
-    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_STALL_TIMEOUT_MS - 1);
+    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_IDLE_TIMEOUT_MS - 1);
     xhr!.progress(1, 4);
+    expect(aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_IDLE_TIMEOUT_MS - 1);
+    expect(aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     await rejected;
+    expect(aborted).toBe(true);
   });
 
   it("uses the separate Dashboard response timeout after all bytes leave the browser", async () => {
     vi.useFakeTimers();
+    let xhr: MockXMLHttpRequest | undefined;
     class MockXMLHttpRequest {
       status = 0;
       private uploadListeners = new Map<string, (event?: any) => void>();
@@ -2291,6 +2299,9 @@ describe("uploadFile", () => {
           this.uploadListeners.set(event, listener),
       };
       private listeners = new Map<string, () => void>();
+      constructor() {
+        xhr = this;
+      }
       open() {}
       setRequestHeader() {}
       addEventListener(event: string, listener: () => void) {
@@ -2303,6 +2314,13 @@ describe("uploadFile", () => {
           total: 4,
         });
         this.uploadListeners.get("load")?.();
+      }
+      progress(loaded: number, total: number) {
+        this.uploadListeners.get("progress")?.({
+          lengthComputable: true,
+          loaded,
+          total,
+        });
       }
       abort() {
         this.listeners.get("abort")?.();
@@ -2317,7 +2335,14 @@ describe("uploadFile", () => {
     const rejected = expect(upload).rejects.toMatchObject({
       code: "UPLOAD_SERVER_RESPONSE_TIMEOUT",
     });
-    await vi.advanceTimersByTimeAsync(FILE_UPLOAD_SERVER_COMPLETION_TIMEOUT_MS);
+    expect(FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS).toBe(6 * 60 * 1000);
+    await vi.advanceTimersByTimeAsync(
+      FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS - 1,
+    );
+    // Late upload events must not replace or extend the independent response
+    // timer once the request body has completed.
+    xhr!.progress(3, 4);
+    await vi.advanceTimersByTimeAsync(1);
     await rejected;
   });
 

@@ -352,6 +352,32 @@ function canonicalMediaType(value: unknown) {
     : null;
 }
 
+/**
+ * Manus can preserve the exact uploaded bytes while reporting generic binary
+ * MIME for generated ZIP/TXT files. Treat that narrow provider fallback as
+ * usable; every other mismatch still fails the exact file proof.
+ */
+export function isManusV2ProviderFileMimeUsable(input: {
+  filename: string;
+  expectedContentType: string;
+  providerContentType: string | null;
+}) {
+  const expected = canonicalMediaType(input.expectedContentType);
+  const provider = canonicalMediaType(input.providerContentType);
+  if (!expected || !provider) return false;
+  if (provider === expected) return true;
+  if (provider !== "application/octet-stream") return false;
+  const filename = String(input.filename || "")
+    .trim()
+    .toLowerCase();
+  return (
+    (filename.endsWith(".zip") &&
+      (expected === "application/zip" ||
+        expected === "application/x-zip-compressed")) ||
+    (filename.endsWith(".txt") && expected === "text/plain")
+  );
+}
+
 const TERMINAL_FILE_DETAIL_CODES = new Set([
   "FILE_ID_CONFLICT",
   "FILE_IDENTITY_CONFLICT",
@@ -1936,7 +1962,13 @@ export class ManusV2Client {
               false,
             );
           }
-          if (canonicalMediaType(detail.contentType) !== expectedContentType) {
+          if (
+            !isManusV2ProviderFileMimeUsable({
+              filename: expectedFilename,
+              expectedContentType,
+              providerContentType: detail.contentType,
+            })
+          ) {
             throw new ManusV2ApiError(
               "file.detail",
               502,

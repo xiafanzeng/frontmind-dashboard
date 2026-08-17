@@ -31,6 +31,7 @@ import { FILE_CONTENT_RETENTION_MS } from "./file-content-retention";
 import {
   knowledgeBaseCustomerUploadResources,
   knowledgeBaseOfficialLogoUploadFromTurn,
+  logKnowledgeBaseCustomerUploadEnrichmentSkipped,
 } from "./knowledge-base-customer-upload";
 import {
   knowledgeBaseOfficialLogoInternalIdentity,
@@ -1339,7 +1340,17 @@ export async function reconstructKnowledgeBasePresentationInlineImages(
     input.node.leafId === input.knowledgeBase.leafId &&
     input.turn.expectedLeafId === input.node.leafId;
   if (isExactCustomerUploadPresentation) {
-    const resources = await loadResources(input.build.id, input.turn);
+    const resources = await loadResources(input.build.id, input.turn).catch(
+      (error) => {
+        logKnowledgeBaseCustomerUploadEnrichmentSkipped({
+          surface: "conversation",
+          buildId: input.build.id,
+          turnId: input.turn.id,
+          error,
+        });
+        return [];
+      },
+    );
     images.push(
       ...resources.map((resource) => ({
         src: resource.sameOriginUrl,

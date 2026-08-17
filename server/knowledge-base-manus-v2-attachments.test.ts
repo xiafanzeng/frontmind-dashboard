@@ -1069,8 +1069,59 @@ describe("Manus v2 reusable attachment proof", () => {
   });
 
   it.each([
+    ["generated.zip", "application/zip"],
+    ["instructions.txt", "text/plain"],
+  ])(
+    "uses the same generic-MIME allowance when recovering %s",
+    async (filename, mimeType) => {
+      const genericMapping = {
+        ...mapping,
+        filename,
+        mimeType,
+        upstreamFileId: "v2-file-generic-mime",
+      };
+      const genericAttempt = {
+        ...attempt,
+        filename,
+        mimeType,
+        upstreamFileId: "v2-file-generic-mime",
+      };
+      const detail = vi.fn().mockResolvedValue({
+        fileId: "v2-file-generic-mime",
+        filename,
+        status: "uploaded",
+        bytes: mapping.sizeBytes,
+        expiresAt: mapping.expiresAt,
+        contentType: "application/octet-stream",
+        requestId: "request-detail",
+      });
+      const client = { fileDetail: detail } as any;
+
+      await expect(
+        validateReusableKnowledgeBaseManusV2Attachment({
+          client,
+          mapping: genericMapping,
+          minimumExpirySeconds: mapping.expiresAt - 1,
+        }),
+      ).resolves.toMatchObject({ fileId: "v2-file-generic-mime" });
+      await expect(
+        inspectKnowledgeBaseManusV2AttachmentAttempt({
+          client,
+          attempt: genericAttempt,
+          minimumExpirySeconds: mapping.expiresAt - 1,
+        }),
+      ).resolves.toMatchObject({ state: "ready" });
+    },
+  );
+
+  it.each([
     ["wrong filename", { filename: "other.pdf" }],
     ["wrong bytes", { bytes: 41 }],
+    ["wrong MIME", { contentType: "text/plain" }],
+    [
+      "generic binary MIME for PDF",
+      { contentType: "application/octet-stream" },
+    ],
     ["not uploaded", { status: "pending" }],
     ["expires too soon", { expiresAt: mapping.expiresAt - 2 }],
   ])("requires replacement for %s", async (_label, override) => {
@@ -1174,6 +1225,12 @@ describe("Manus v2 reusable attachment proof", () => {
     ["deleted", { status: "deleted", bytes: null }, "unusable"],
     ["error", { status: "error", bytes: null }, "unusable"],
     ["wrong bytes", { status: "uploaded", bytes: 41 }, "unusable"],
+    ["wrong MIME", { contentType: "text/plain" }, "unusable"],
+    [
+      "generic binary MIME for PDF",
+      { contentType: "application/octet-stream" },
+      "unusable",
+    ],
     [
       "expired",
       { status: "uploaded", bytes: attempt.sizeBytes, expiresAt: 5 },

@@ -12,6 +12,7 @@ import {
 const dependencies = vi.hoisted(() => ({
   getDb: vi.fn(),
   customerUploadResources: vi.fn().mockResolvedValue([]),
+  logCustomerUploadEnrichmentSkipped: vi.fn(),
   officialLogoUploadFromTurn: vi.fn(
     (turn: { expectedLeafId?: string; metadata?: Record<string, any> }) =>
       turn.metadata?.recovery?.officialLogoUpload?.verified === true
@@ -23,6 +24,8 @@ const dependencies = vi.hoisted(() => ({
 vi.mock("./db", () => ({ getDb: dependencies.getDb }));
 vi.mock("./knowledge-base-customer-upload", () => ({
   knowledgeBaseCustomerUploadResources: dependencies.customerUploadResources,
+  logKnowledgeBaseCustomerUploadEnrichmentSkipped:
+    dependencies.logCustomerUploadEnrichmentSkipped,
   knowledgeBaseOfficialLogoUploadFromTurn:
     dependencies.officialLogoUploadFromTurn,
 }));
@@ -873,6 +876,70 @@ describe("knowledge-base observation consistency", () => {
         resource.sameOriginUrl.startsWith("https://"),
       ),
     ).toBe(false);
+  });
+
+  it("keeps progress readable when optional customer-upload enrichment fails", async () => {
+    const now = new Date("2026-08-01T00:00:05.000Z");
+    const presentationTurn = {
+      id: "turn-customer-image-unavailable",
+      conversationId: "u7:conversation-snapshot",
+      userId: 7,
+      clientRequestId: "request-customer-image-unavailable",
+      buildId: "build-snapshot",
+      buildGeneration: 1,
+      operationKey: "operation-customer-image-unavailable",
+      operationType: "revise",
+      expectedRevision: 1,
+      expectedLeafId: "1.1",
+      attachmentFileIds: ["file-customer-image"],
+      metadata: {},
+      status: "completed",
+      upstreamTaskId: "task-customer-image-unavailable",
+      startedAt: now,
+      completedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    dependencies.customerUploadResources.mockRejectedValueOnce(
+      new Error("historical upload ledger unavailable"),
+    );
+    dependencies.logCustomerUploadEnrichmentSkipped.mockClear();
+    dependencies.getDb.mockResolvedValue({
+      async transaction<T>(operation: (tx: any) => Promise<T>) {
+        return operation(
+          snapshotExecutor({
+            build: build(),
+            nodes: [node({ sourceTurnId: presentationTurn.id })],
+            conversation: {
+              id: "u7:conversation-snapshot",
+              userId: 7,
+              version: 12,
+            },
+            turns: [presentationTurn],
+          }),
+        );
+      },
+    });
+
+    const observation = await getKnowledgeBaseObservationProjection({
+      userId: 7,
+      conversationId: "conversation-snapshot",
+    });
+
+    expect(observation?.approvedPresentation).toMatchObject({
+      leafId: "1.1",
+      imageState: "no_eligible_asset",
+      resources: [],
+    });
+    expect(
+      dependencies.logCustomerUploadEnrichmentSkipped,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        surface: "progress",
+        buildId: "build-snapshot",
+        turnId: presentationTurn.id,
+      }),
+    );
   });
 
   it("never carries a customer upload onto a different leaf", async () => {

@@ -126,7 +126,6 @@ import {
   bindKnowledgeBaseTurnUpstreamTask,
   beginKnowledgeBaseManusV2Dispatch,
   bindKnowledgeBaseManusV2Submission,
-  beginKnowledgeBaseMaterializedCompletionStop,
   cancelUnpreparedKnowledgeBaseTurn,
   cancelIncompleteKnowledgeBaseStart,
   claimKnowledgeBaseDeferredTurnDispatch,
@@ -165,7 +164,6 @@ import {
   markLegacyKnowledgeBaseCreateAttentionRequired,
   markKnowledgeBaseTurnOutcomeUnknown,
   markKnowledgeBaseManusV2OutcomeUnknown,
-  observeKnowledgeBaseMaterializedCompletionCandidate,
   deferKnowledgeBaseMaterializedProviderStatus,
   markKnowledgeBaseManusV2AttentionRequired,
   markKnowledgeBaseManusV2AnchorHandoffAttentionRequired,
@@ -188,7 +186,6 @@ import {
   rejectAcknowledgedKnowledgeBaseManualLogoTurn,
   rejectUnacknowledgedKnowledgeBaseManualLogoTurn,
   renewKnowledgeBaseTurnLease,
-  settleKnowledgeBaseMaterializedCompletionStopAttempt,
   releaseGeneratedAttachmentInvalidPreproviderTurns,
   reclassifyHistoricalPreproviderAuthoritySelfTerminal,
   normalizeKnowledgeBaseTerminalRejection,
@@ -984,20 +981,6 @@ function latestMaterializedErrorType(
       ? envelope.error_type.trim().toLowerCase()
       : "";
   return errorType && errorType.length <= 128 ? errorType : null;
-}
-
-function materializedDescriptorIdentityHash(input: {
-  outputItemId: string;
-  outputItemIds?: string[];
-}) {
-  return createHash("sha256")
-    .update(
-      JSON.stringify(
-        [...new Set(input.outputItemIds || [input.outputItemId])].sort(),
-      ),
-      "utf8",
-    )
-    .digest("hex");
 }
 
 async function requireMaterializedKnowledgeBaseBuild(input: {
@@ -5253,14 +5236,10 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
   bindSubmission: typeof bindKnowledgeBaseManusV2Submission;
   markOutcomeUnknown: typeof markKnowledgeBaseManusV2OutcomeUnknown;
   downloadArchive: typeof downloadArchiveBytes;
-  persistCandidate: typeof persistKnowledgeBaseBuildSource;
   readCandidate: typeof readKnowledgeBaseLocalSource;
   validateInitialCandidate: typeof validateKnowledgeBaseWorkingSetArchive;
   validateRevisionCandidate: typeof validateKnowledgeBaseRevisionAgainstActiveWorkingSet;
-  observeCandidate: typeof observeKnowledgeBaseMaterializedCompletionCandidate;
   deferProviderStatus: typeof deferKnowledgeBaseMaterializedProviderStatus;
-  beginStop: typeof beginKnowledgeBaseMaterializedCompletionStop;
-  settleStop: typeof settleKnowledgeBaseMaterializedCompletionStopAttempt;
   activateInitial: typeof activateInitialKnowledgeBaseWorkingSet;
   applyRevision: typeof applyKnowledgeBaseRevisionWorkingSet;
   createClient: (input: {
@@ -5268,7 +5247,7 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
     apiKey: string;
   }) => Pick<
     ManusV2Client,
-    "createTask" | "findCreatedTask" | "listAllMessages" | "stopTask"
+    "createTask" | "listAllMessages" | "stopTask"
   >;
 }) {
   const { claim, credential, build } = input;
@@ -5378,9 +5357,9 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       });
       taskId = created.taskId;
       // Provider 2xx has consumed the one allowed create even before the
-      // local bind commits. If that bind crashes, persistence must move this
-      // turn to outcome-unknown so recovery finds/adopts the existing task by
-      // frozen title instead of posting task.create again.
+      // local bind commits. A bind crash is terminal for this build: recovery
+      // must never guess or adopt a task by title. The user can approve a
+      // reset, which creates a fresh turn and a fresh Provider task.
       claim.turn.createAttemptState = "unknown";
       claim.turn.providerAttemptState = "output_pending";
       await input.bindSubmission({
@@ -5425,34 +5404,10 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       throw error;
     }
   } else if (!taskId) {
-    const preparedAtSeconds = Math.floor(
-      Date.parse(prepared.preparedAt) / 1_000,
+    throw new KnowledgeBaseLocalPreparationError(
+      "RESET_REQUIRED",
+      "上游任务创建结果不确定；请批准重置并重新上传资料",
     );
-    const matched = await client.findCreatedTask({
-      title,
-      operationToken: claim.turn.operationToken,
-      createdAfterSeconds: preparedAtSeconds - 300,
-      createdBeforeSeconds: preparedAtSeconds + 3_600,
-    });
-    if (!matched.unique) {
-      throw new ManusV2ApiError(
-        "task.create.reconcile",
-        null,
-        matched.matches.length > 1 ? "AMBIGUOUS_CREATE" : "CREATE_NOT_OBSERVED",
-        true,
-        true,
-      );
-    }
-    taskId = matched.unique.id;
-    await input.bindSubmission({
-      userId: claim.turn.userId,
-      turnId: claim.turn.id,
-      leaseToken: claim.leaseToken,
-      method: "task.create",
-      taskId,
-      taskUrl: matched.unique.taskUrl,
-    });
-    claim.turn.upstreamTaskId = taskId;
   }
   if (!taskId) {
     throw new KnowledgeBaseTurnReservationError(
@@ -5466,29 +5421,35 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
   await promoteManualKnowledgeBaseLogoAfterTaskAcknowledged(claim, {
     activation: "materialized_patch",
   });
-  let events: Awaited<ReturnType<typeof client.listAllMessages>>;
-  try {
-    events = await client.listAllMessages({ taskId, order: "desc" });
-  } catch (error) {
-    if (
-      error instanceof ManusV2ApiError &&
-      error.operation === "task.listMessages" &&
-      error.status === 404 &&
-      !error.outcomeUnknown
-    ) {
-      const deferred = await input.deferProviderStatus({
-        userId: claim.turn.userId,
-        turnId: claim.turn.id,
-        leaseToken: claim.leaseToken,
-        status: "list_messages_404",
-      });
-      return {
-        taskId,
-        rebound: true,
-        reconciled: deferred.state === "unavailable",
-      };
+  const priorCompletion = claim.turn.materializedCompletion;
+  let events: Awaited<ReturnType<typeof client.listAllMessages>> = [];
+  // A persisted stop attempt freezes a fully validated local CAS. Recovery of
+  // that immutable candidate must not depend on the stopped Provider task
+  // still being readable (it may already have been garbage-collected).
+  if (!priorCompletion?.stopAttemptState) {
+    try {
+      events = await client.listAllMessages({ taskId, order: "desc" });
+    } catch (error) {
+      if (
+        error instanceof ManusV2ApiError &&
+        error.operation === "task.listMessages" &&
+        error.status === 404 &&
+        !error.outcomeUnknown
+      ) {
+        const deferred = await input.deferProviderStatus({
+          userId: claim.turn.userId,
+          turnId: claim.turn.id,
+          leaseToken: claim.leaseToken,
+          status: "list_messages_404",
+        });
+        return {
+          taskId,
+          rebound: true,
+          reconciled: deferred.state === "unavailable",
+        };
+      }
+      throw error;
     }
-    throw error;
   }
   const status = latestManusV2TaskState(events) || "unknown";
   const output = normalizeManusV2Output(events);
@@ -5497,10 +5458,20 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
     build.contentVersion === 0
       ? `frontmind-kb-bundle-${claim.turn.operationKey}.zip`
       : `frontmind-kb-patch-${claim.turn.operationKey}.zip`;
-  const exactDescriptor =
-    descriptors.length === 1 && (descriptors[0]!.url || descriptors[0]!.fileId)
-      ? descriptors[0]!
-      : null;
+  const downloadableDescriptors = descriptors.filter(
+    (descriptor) => descriptor.url || descriptor.fileId,
+  );
+  // `normalizeManusV2Output` and the collector preserve chronological order.
+  // A lone Provider-renamed ZIP remains backwards compatible; when several
+  // ZIPs exist, the operation-bound filename becomes the deterministic scope
+  // and candidates inside that scope are tried newest first.
+  const candidateDescriptors = [...downloadableDescriptors]
+    .reverse()
+    .filter(
+      (descriptor) =>
+        downloadableDescriptors.length === 1 ||
+        descriptor.filename === expectedFilename,
+    );
   const canonicalCandidateBytes = async (archiveBytes: Buffer) => {
     if (build.contentVersion === 0) {
       const validated = await input.validateInitialCandidate(
@@ -5531,70 +5502,65 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
     });
     return validated.patch.archiveBytes;
   };
-
-  if (status !== "stopped") {
-    if (status === "cancelled") {
+  const recoverableCandidateError = (error: unknown) =>
+    error instanceof KnowledgeBaseMaterializedContractError ||
+    error instanceof KnowledgeArchiveDownloadError ||
+    (error instanceof KnowledgeBaseMaterializedError &&
+      error.code === "PATCH_CONFLICT");
+  const completionHasCandidate = Boolean(
+    priorCompletion?.storageKey &&
+      priorCompletion.candidateArchiveSha256 &&
+      priorCompletion.sizeBytes,
+  );
+  const readCanonicalStagedCandidate = async () => {
+    if (!completionHasCandidate) return null;
+    const staged = await input.readCandidate({
+      storageKey: priorCompletion!.storageKey!,
+      contentSha256: priorCompletion!.candidateArchiveSha256!,
+      sizeBytes: priorCompletion!.sizeBytes!,
+    });
+    const canonical = await canonicalCandidateBytes(staged);
+    if (
+      canonical.length !== priorCompletion!.sizeBytes ||
+      createHash("sha256").update(canonical).digest("hex") !==
+        priorCompletion!.candidateArchiveSha256
+    ) {
       throw new KnowledgeBaseMaterializedResultError(
-        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
-        "全量物化任务已取消，无法读取最终结果",
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        "本地物化 ZIP 候选与已验证 CAS 不一致",
       );
     }
-    const priorCompletion = claim.turn.materializedCompletion;
-    const currentEventIdHash = exactDescriptor
-      ? materializedDescriptorIdentityHash(exactDescriptor)
-      : null;
-    // Descriptor ids and URLs are transport hints, not candidate identity.
-    // Only a successfully downloaded and canonicalized byte change may reset
-    // the stable window below.
-    let resetCandidate = !exactDescriptor;
-    if (priorCompletion?.stopAttemptState) {
-      if (
-        !currentEventIdHash ||
-        !priorCompletion.storageKey ||
-        !priorCompletion.candidateArchiveSha256 ||
-        !priorCompletion.sizeBytes
-      ) {
-        throw new KnowledgeBaseMaterializedResultError(
-          "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-          "task.stop 后物化 ZIP 候选账本不一致",
-        );
-      }
-      if (priorCompletion.stopAttemptState === "sending") {
-        // Persisted `sending` means the Provider side effect may already have
-        // happened. Convert it to the ten-minute read-only ambiguity window
-        // before any 120-second candidate disposition can expire it.
-        await input.settleStop({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-          state: "outcome_unknown",
-        });
-      }
-    }
-    if (priorCompletion?.stopAttemptState && status !== "running") {
-      const observedStop = await input.observeCandidate({
-        userId: claim.turn.userId,
-        turnId: claim.turn.id,
-        leaseToken: claim.leaseToken,
-        candidateEventIdHash: currentEventIdHash!,
-        storageKey: priorCompletion.storageKey!,
-        candidateArchiveSha256: priorCompletion.candidateArchiveSha256!,
-        sizeBytes: priorCompletion.sizeBytes!,
-        providerStatus: status,
-      });
-      if (observedStop.disposition === "stop_settle_expired") {
-        throw new KnowledgeBaseMaterializedResultError(
-          "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
-          "task.stop 后未在限定时间内观察到 stopped",
-        );
-      }
-      return { taskId, rebound: true, reconciled: false };
-    }
+    return canonical;
+  };
 
-    if (status === "running" && exactDescriptor) {
+  let candidateBytes: Buffer | null = null;
+  let lastCandidateError: unknown = null;
+  let candidateAttempted = false;
+
+  // A persisted stop attempt freezes the previously validated local CAS. It
+  // is already enough authority to apply the content and must not wait for a
+  // later Provider status acknowledgement or a mutable transport descriptor.
+  if (priorCompletion?.stopAttemptState) {
+    if (!priorCompletion.candidateEventIdHash || !completionHasCandidate) {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        "task.stop 后物化 ZIP 候选账本不一致",
+      );
+    }
+    try {
+      candidateBytes = await readCanonicalStagedCandidate();
+    } catch {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        "task.stop 后本地物化 ZIP 候选不可用",
+      );
+    }
+  } else {
+    for (const descriptor of candidateDescriptors) {
+      candidateAttempted = true;
       try {
         const downloaded = await input.downloadArchive({
-          descriptor: exactDescriptor,
+          descriptor,
           apiKey: credential.apiKey,
           baseUrl: prepared.baseUrl,
           // The exact current Skill hash is checked before any Provider client
@@ -5602,134 +5568,38 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
           // artifact binders and old unfinished builds.
           allowProviderFileIdFallback: true,
         });
-        const candidateBytes = await canonicalCandidateBytes(downloaded.buffer);
-        if (priorCompletion?.stopAttemptState) {
-          const downloadedSha256 = createHash("sha256")
-            .update(candidateBytes)
-            .digest("hex");
-          if (
-            downloadedSha256 !== priorCompletion.candidateArchiveSha256 ||
-            candidateBytes.length !== priorCompletion.sizeBytes
-          ) {
-            throw new KnowledgeBaseMaterializedResultError(
-              "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-              "task.stop 后物化 ZIP 内容或大小发生变化",
-            );
-          }
-          let staged: Buffer;
-          try {
-            staged = await input.readCandidate({
-              storageKey: priorCompletion.storageKey!,
-              contentSha256: priorCompletion.candidateArchiveSha256!,
-              sizeBytes: priorCompletion.sizeBytes!,
-            });
-          } catch {
-            throw new KnowledgeBaseMaterializedResultError(
-              "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-              "task.stop 后本地候选暂存不可用",
-            );
-          }
-          if (!staged.equals(candidateBytes)) {
-            throw new KnowledgeBaseMaterializedResultError(
-              "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-              "task.stop 后本地候选字节发生变化",
-            );
-          }
-        }
-        const retained = priorCompletion?.stopAttemptState
-          ? {
-              storageKey: priorCompletion.storageKey!,
-              contentSha256: priorCompletion.candidateArchiveSha256!,
-              sizeBytes: priorCompletion.sizeBytes!,
-            }
-          : await input.persistCandidate({
-              userId: claim.turn.userId,
-              buildId: build.id,
-              generation: build.generation,
-              bytes: candidateBytes,
-            });
-        const observed = await input.observeCandidate({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-          candidateEventIdHash:
-            materializedDescriptorIdentityHash(exactDescriptor),
-          storageKey: retained.storageKey,
-          candidateArchiveSha256: retained.contentSha256,
-          sizeBytes: retained.sizeBytes,
-          providerStatus: status,
-        });
-        if (observed.disposition === "stop_settle_expired") {
-          throw new KnowledgeBaseMaterializedResultError(
-            "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
-            "task.stop 后未在限定时间内观察到 stopped",
-          );
-        }
-        if (observed.disposition === "stop_pending") {
-          return { taskId, rebound: true, reconciled: false };
-        }
-        if (observed.disposition !== "stop_due") {
-          return { taskId, rebound: true, reconciled: false };
-        }
-        const stop = await input.beginStop({
-          userId: claim.turn.userId,
-          turnId: claim.turn.id,
-          leaseToken: claim.leaseToken,
-        });
-        if (!stop.send) {
-          return { taskId, rebound: true, reconciled: false };
-        }
-        try {
-          const acknowledgement = await client.stopTask(taskId);
-          await input.settleStop({
-            userId: claim.turn.userId,
-            turnId: claim.turn.id,
-            leaseToken: claim.leaseToken,
-            state: "acknowledged",
-            requestRef: acknowledgement.requestId,
-          });
-        } catch (error) {
-          const state =
-            error instanceof ManusV2ApiError && !error.outcomeUnknown
-              ? "rejected"
-              : "outcome_unknown";
-          await input.settleStop({
-            userId: claim.turn.userId,
-            turnId: claim.turn.id,
-            leaseToken: claim.leaseToken,
-            state,
-            requestRef:
-              error instanceof ManusV2ApiError ? error.providerRequestId : null,
-          });
-        }
-        return { taskId, rebound: true, reconciled: false };
+        candidateBytes = await canonicalCandidateBytes(downloaded.buffer);
+        break;
       } catch (error) {
-        const candidateInvalid =
-          error instanceof KnowledgeBaseMaterializedContractError ||
-          (error instanceof KnowledgeBaseMaterializedError &&
-            error.code === "PATCH_CONFLICT");
-        const candidateReadUnavailable =
-          error instanceof KnowledgeArchiveDownloadError;
-        if (!candidateInvalid && !candidateReadUnavailable) throw error;
-        if (priorCompletion?.stopAttemptState) {
-          throw new KnowledgeBaseMaterializedResultError(
-            "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-            "task.stop 后物化 ZIP 无法维持已验证合同",
-          );
-        }
-        const descriptorMatchesPriorCandidate =
-          exactDescriptor !== null &&
-          priorCompletion?.candidateEventIdHash ===
-            materializedDescriptorIdentityHash(exactDescriptor);
-        resetCandidate =
-          candidateInvalid ||
-          candidateReadUnavailable ||
-          !descriptorMatchesPriorCandidate;
-        // A running task may replace an invalid/incompletely readable
-        // candidate. Do not reject it until stopped or its provider deadline.
+        if (!recoverableCandidateError(error)) throw error;
+        lastCandidateError = error;
       }
     }
+    if (!candidateBytes && completionHasCandidate) {
+      candidateAttempted = true;
+      try {
+        candidateBytes = await readCanonicalStagedCandidate();
+      } catch (error) {
+        if (!recoverableCandidateError(error)) throw error;
+        lastCandidateError = error;
+      }
+    }
+  }
 
+  if (!candidateBytes) {
+    if (status === "cancelled") {
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
+        "全量物化任务已取消，无法读取最终结果",
+      );
+    }
+    if (status === "stopped") {
+      if (lastCandidateError) throw lastCandidateError;
+      throw new KnowledgeBaseMaterializedResultError(
+        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
+        `物化任务未返回符合当前操作的可下载 ZIP；期望文件名 ${expectedFilename}`,
+      );
+    }
     const errorType =
       status === "error" || status === "failed"
         ? latestMaterializedErrorType(events)
@@ -5749,7 +5619,7 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       turnId: claim.turn.id,
       leaseToken: claim.leaseToken,
       status: providerStatus,
-      resetCandidate,
+      resetCandidate: candidateAttempted || downloadableDescriptors.length > 0,
     });
     return {
       taskId,
@@ -5758,49 +5628,9 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
     };
   }
 
-  if (!exactDescriptor) {
-    throw new KnowledgeBaseMaterializedResultError(
-      "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-      `物化任务必须返回唯一且可下载的 ZIP 附件；建议文件名 ${expectedFilename}`,
-    );
-  }
-  const downloaded = await input.downloadArchive({
-    descriptor: exactDescriptor,
-    apiKey: credential.apiKey,
-    baseUrl: prepared.baseUrl,
-    allowProviderFileIdFallback: true,
-  });
-  const candidateBytes = await canonicalCandidateBytes(downloaded.buffer);
-  const terminalLedger = claim.turn.materializedCompletion;
-  if (terminalLedger?.stopAttemptState) {
-    const stoppedContentSha256 = createHash("sha256")
-      .update(candidateBytes)
-      .digest("hex");
-    if (
-      !terminalLedger.candidateEventIdHash ||
-      !terminalLedger.storageKey ||
-      !terminalLedger.candidateArchiveSha256 ||
-      !terminalLedger.sizeBytes ||
-      stoppedContentSha256 !== terminalLedger.candidateArchiveSha256 ||
-      candidateBytes.length !== terminalLedger.sizeBytes
-    ) {
-      throw new KnowledgeBaseMaterializedResultError(
-        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-        "task.stop 后最终 ZIP 与已验证候选不一致",
-      );
-    }
-    const staged = await input.readCandidate({
-      storageKey: terminalLedger.storageKey,
-      contentSha256: terminalLedger.candidateArchiveSha256,
-      sizeBytes: terminalLedger.sizeBytes,
-    });
-    if (!staged.equals(candidateBytes)) {
-      throw new KnowledgeBaseMaterializedResultError(
-        "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-        "task.stop 后最终 ZIP 字节发生变化",
-      );
-    }
-  }
+  // Activation/application performs the authoritative transaction and repeats
+  // all archive, coordinate, ownership and CAS checks. Provider cleanup only
+  // starts after that transaction has durably made the content displayable.
   if (build.contentVersion === 0) {
     await input.activateInitial({
       userId: claim.turn.userId,
@@ -5834,6 +5664,37 @@ async function dispatchMaterializedKnowledgeBaseClaim(input: {
       archiveBytes: candidateBytes,
     });
   }
+  if (
+    !priorCompletion?.stopAttemptState &&
+    (status === "running" || status === "waiting" || status === "unknown") &&
+    typeof client.stopTask === "function"
+  ) {
+    try {
+      void Promise.resolve(client.stopTask(taskId)).catch((error) => {
+        logKnowledgeBaseRuntimeFailure({
+          level: "warn",
+          event: "[KnowledgeBaseRecovery] materialized_cleanup_stop_failed",
+          userId: claim.turn.userId,
+          buildId: build.id,
+          turnId: claim.turn.id,
+          taskId,
+          error,
+          additionalSecrets: [credential.apiKey],
+        });
+      });
+    } catch (error) {
+      logKnowledgeBaseRuntimeFailure({
+        level: "warn",
+        event: "[KnowledgeBaseRecovery] materialized_cleanup_stop_failed",
+        userId: claim.turn.userId,
+        buildId: build.id,
+        turnId: claim.turn.id,
+        taskId,
+        error,
+        additionalSecrets: [credential.apiKey],
+      });
+    }
+  }
   return { taskId, rebound: true, reconciled: true };
 }
 
@@ -5847,14 +5708,10 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     beginDispatch?: typeof beginKnowledgeBaseManusV2Dispatch;
     markManusV2OutcomeUnknown?: typeof markKnowledgeBaseManusV2OutcomeUnknown;
     downloadArchive?: typeof downloadArchiveBytes;
-    persistCandidate?: typeof persistKnowledgeBaseBuildSource;
     readCandidate?: typeof readKnowledgeBaseLocalSource;
     validateInitialCandidate?: typeof validateKnowledgeBaseWorkingSetArchive;
     validateRevisionCandidate?: typeof validateKnowledgeBaseRevisionAgainstActiveWorkingSet;
-    observeCandidate?: typeof observeKnowledgeBaseMaterializedCompletionCandidate;
     deferProviderStatus?: typeof deferKnowledgeBaseMaterializedProviderStatus;
-    beginStop?: typeof beginKnowledgeBaseMaterializedCompletionStop;
-    settleStop?: typeof settleKnowledgeBaseMaterializedCompletionStopAttempt;
     activateInitial?: typeof activateInitialKnowledgeBaseWorkingSet;
     applyRevision?: typeof applyKnowledgeBaseRevisionWorkingSet;
     createClient?: (input: {
@@ -5884,8 +5741,6 @@ async function dispatchKnowledgeBaseRecoveryClaim(
   const bindSubmission =
     dependencies.bindSubmission ?? bindKnowledgeBaseManusV2Submission;
   const downloadArchive = dependencies.downloadArchive ?? downloadArchiveBytes;
-  const persistCandidate =
-    dependencies.persistCandidate ?? persistKnowledgeBaseBuildSource;
   const readCandidate =
     dependencies.readCandidate ?? readKnowledgeBaseLocalSource;
   const validateInitialCandidate =
@@ -5894,17 +5749,9 @@ async function dispatchKnowledgeBaseRecoveryClaim(
   const validateRevisionCandidate =
     dependencies.validateRevisionCandidate ??
     validateKnowledgeBaseRevisionAgainstActiveWorkingSet;
-  const observeCandidate =
-    dependencies.observeCandidate ??
-    observeKnowledgeBaseMaterializedCompletionCandidate;
   const deferProviderStatus =
     dependencies.deferProviderStatus ??
     deferKnowledgeBaseMaterializedProviderStatus;
-  const beginStop =
-    dependencies.beginStop ?? beginKnowledgeBaseMaterializedCompletionStop;
-  const settleStop =
-    dependencies.settleStop ??
-    settleKnowledgeBaseMaterializedCompletionStopAttempt;
   const activateInitial =
     dependencies.activateInitial ?? activateInitialKnowledgeBaseWorkingSet;
   const applyRevision =
@@ -5943,14 +5790,10 @@ async function dispatchKnowledgeBaseRecoveryClaim(
     bindSubmission,
     markOutcomeUnknown: markManusV2OutcomeUnknownForDispatch,
     downloadArchive,
-    persistCandidate,
     readCandidate,
     validateInitialCandidate,
     validateRevisionCandidate,
-    observeCandidate,
     deferProviderStatus,
-    beginStop,
-    settleStop,
     activateInitial,
     applyRevision,
     createClient,

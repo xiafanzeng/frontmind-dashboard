@@ -45,6 +45,78 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+type KnowledgeBaseCustomerUploadTurn = Pick<
+  ConversationTurn,
+  "id" | "expectedLeafId" | "attachmentFileIds" | "metadata" | "status"
+>;
+
+function knowledgeBaseCustomerUploadHasFinalBinding(
+  turn: KnowledgeBaseCustomerUploadTurn,
+  input: {
+    sourceFileId: string;
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+    sourceSha256: string;
+  },
+) {
+  if (turn.attachmentFileIds.includes(input.sourceFileId)) return true;
+  const metadata = record(turn.metadata) || {};
+  const mappings = record(metadata.manusV2AttachmentMappings);
+  if (!mappings) return false;
+  const matches = Object.values(mappings).filter((candidate) => {
+    const mapping = record(candidate);
+    const upstreamFileId = String(mapping?.upstreamFileId || "").trim();
+    return (
+      mapping?.status === "ready" &&
+      mapping?.sourceFileId === input.sourceFileId &&
+      mapping?.filename === input.filename &&
+      Number(mapping?.sizeBytes) === input.sizeBytes &&
+      String(mapping?.contentSha256 || "").toLowerCase() ===
+        input.sourceSha256 &&
+      normalizeKnowledgeBaseAttachmentMimeType(
+        input.filename,
+        mapping?.mimeType,
+      ) === input.mimeType &&
+      upstreamFileId.length > 0 &&
+      turn.attachmentFileIds.includes(upstreamFileId)
+    );
+  });
+  return matches.length === 1;
+}
+
+function knowledgeBaseCustomerUploadEnrichmentErrorCode(error: unknown) {
+  const candidate = record(error)?.code;
+  if (
+    typeof candidate === "string" &&
+    /^[A-Z][A-Z0-9_]{0,127}$/u.test(candidate)
+  ) {
+    return candidate;
+  }
+  return error instanceof Error &&
+    /^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(error.name)
+    ? error.name
+    : "UNKNOWN_ERROR";
+}
+
+/** Optional UI enrichment must never make an accepted presentation unreadable. */
+export function logKnowledgeBaseCustomerUploadEnrichmentSkipped(input: {
+  surface: "conversation" | "progress";
+  buildId: string;
+  turnId: string;
+  error: unknown;
+}) {
+  console.warn(
+    "[KnowledgeBaseCustomerUpload] enrichment_skipped",
+    JSON.stringify({
+      surface: input.surface,
+      buildId: input.buildId,
+      turnId: input.turnId,
+      errorCode: knowledgeBaseCustomerUploadEnrichmentErrorCode(input.error),
+    }),
+  );
+}
+
 export type KnowledgeBaseCustomerUploadImage = {
   turnId: string;
   leafId: string;
@@ -305,10 +377,7 @@ export function knowledgeBaseOfficialLogoUploadFromTurn(
  * function, so a crawled URL can never become a customer-visible resource.
  */
 export function knowledgeBaseCustomerUploadImagesFromTurn(
-  turn: Pick<
-    ConversationTurn,
-    "id" | "expectedLeafId" | "attachmentFileIds" | "metadata" | "status"
-  >,
+  turn: KnowledgeBaseCustomerUploadTurn,
 ): KnowledgeBaseCustomerUploadImage[] {
   const metadata = record(turn.metadata) || {};
   const recovery = record(metadata.recovery);
@@ -372,7 +441,13 @@ export function knowledgeBaseCustomerUploadImagesFromTurn(
     if (
       !fileId ||
       String(attachment?.filename || "") !== filename ||
-      !turn.attachmentFileIds.includes(fileId) ||
+      !knowledgeBaseCustomerUploadHasFinalBinding(turn, {
+        sourceFileId: fileId,
+        filename,
+        mimeType,
+        sizeBytes,
+        sourceSha256,
+      }) ||
       !dispatchedAttachments.some((candidate) => {
         const dispatched = record(candidate);
         return (
@@ -481,7 +556,13 @@ function assertKnowledgeBaseCustomerUploadLedgerComplete(
     if (
       !fileId ||
       String(attachment.filename || "") !== filename ||
-      !turn.attachmentFileIds.includes(fileId) ||
+      !knowledgeBaseCustomerUploadHasFinalBinding(turn, {
+        sourceFileId: fileId,
+        filename,
+        mimeType,
+        sizeBytes,
+        sourceSha256,
+      }) ||
       !dispatched ||
       !Number.isSafeInteger(sizeBytes) ||
       sizeBytes < 1 ||

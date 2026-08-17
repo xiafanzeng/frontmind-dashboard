@@ -4676,7 +4676,7 @@ describe("knowledge base execution contract", () => {
     );
   });
 
-  it("stages a contract-v2 running ZIP and spends exactly one task.stop without activating before stopped", async () => {
+  it("activates a valid running ZIP before a best-effort task.stop", async () => {
     const operationKey = "7".repeat(64);
     const taskId = "materialized-task-contract-v2-running";
     const turnId = "00000000-0000-4000-8000-0000000000f7";
@@ -4830,17 +4830,15 @@ describe("knowledge base execution contract", () => {
           }),
         } as any,
       ),
-    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
 
     expect(stopTask).toHaveBeenCalledOnce();
     expect(stopTask).toHaveBeenCalledWith(taskId);
-    expect(settleStop).toHaveBeenCalledWith(
-      expect.objectContaining({
-        state: "acknowledged",
-        requestRef: "stop-request-contract-v2",
-      }),
+    expect(settleStop).not.toHaveBeenCalled();
+    expect(activateInitial).toHaveBeenCalledOnce();
+    expect(activateInitial.mock.invocationCallOrder[0]).toBeLessThan(
+      stopTask.mock.invocationCallOrder[0]!,
     );
-    expect(activateInitial).not.toHaveBeenCalled();
     expect(createTask).not.toHaveBeenCalled();
     expect(findCreatedTask).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
@@ -4852,6 +4850,8 @@ describe("knowledge base execution contract", () => {
         new ManusV2ApiError("task.stop", null, "timeout", true, true),
       );
     const settleUnknown = vi.fn().mockResolvedValue(undefined);
+    const activateDespiteStopFailure = vi.fn().mockResolvedValue(undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await expect(
       knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
         claim,
@@ -4885,6 +4885,7 @@ describe("knowledge base execution contract", () => {
             ledger: { schemaVersion: 1, stopAttemptState: "sending" },
           }),
           settleStop: settleUnknown,
+          activateInitial: activateDespiteStopFailure,
           createClient: vi.fn().mockReturnValue({
             createTask: vi.fn(),
             findCreatedTask: vi.fn(),
@@ -4895,14 +4896,186 @@ describe("knowledge base execution contract", () => {
           }),
         } as any,
       ),
-    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
+    await Promise.resolve();
     expect(ambiguousStop).toHaveBeenCalledOnce();
-    expect(settleUnknown).toHaveBeenCalledWith(
-      expect.objectContaining({ state: "outcome_unknown" }),
-    );
+    expect(settleUnknown).not.toHaveBeenCalled();
+    expect(activateDespiteStopFailure).toHaveBeenCalledOnce();
+    warn.mockRestore();
   });
 
-  it("converts a persisted sending stop to the ten-minute unknown window before observing it", async () => {
+  it("applies the latest verifiable running PATCH when several ZIP descriptors exist", async () => {
+    const operationKey = "8".repeat(64);
+    const taskId = "materialized-task-multiple-patches";
+    const turnId = "00000000-0000-4000-8000-0000000000f8";
+    const expectedFilename = `frontmind-kb-patch-${operationKey}.zip`;
+    const build = {
+      id: "00000000-0000-4000-8000-0000000000c8",
+      userId: 7,
+      conversationId: "conversation-materialized-multiple-patches",
+      generation: 2,
+      revision: 3,
+      executionMode: "materialized_bundle_v1",
+      skillVersion: "5",
+      skillContentHash: KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH,
+      providerProtocol: "manus_v2",
+      contentVersion: 4,
+      handoffProvenance: {
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+      },
+    } as any;
+    const claim = {
+      turn: {
+        id: turnId,
+        userId: 7,
+        conversationId: build.conversationId,
+        buildId: build.id,
+        buildGeneration: build.generation,
+        expectedRevision: build.revision,
+        expectedLeafId: "2.1",
+        expectedUserAttachmentCount: 1,
+        operationType: "revise",
+        operationKey,
+        operationToken: operationKey,
+        status: "running",
+        upstreamTaskId: taskId,
+        providerProtocol: "manus_v2",
+        providerMethod: "task.create",
+        materializedRecoveryContractVersion: 1,
+        materializedCompletionContractVersion: 2,
+        materializedCompletion: null,
+        providerAttemptState: "output_pending",
+        createAttemptState: "acknowledged",
+      },
+      leaseToken: "lease-materialized-multiple-patches",
+      recoveryMetadata: { kind: "turn" },
+      preparedDispatch: null,
+    } as any;
+    const descriptorEvent = (
+      id: string,
+      timestamp: number,
+      filename: string,
+      url: string,
+    ) => ({
+      id,
+      type: "assistant_message",
+      timestamp,
+      assistant_message: {
+        content: "",
+        attachments: [
+          {
+            type: "file",
+            filename,
+            content_type: "application/zip",
+            url,
+          },
+        ],
+      },
+    });
+    const events = [
+      descriptorEvent(
+        "assistant-older-valid-patch",
+        10,
+        expectedFilename,
+        "https://downloads.example.test/older-valid.zip",
+      ),
+      descriptorEvent(
+        "assistant-unrelated-zip",
+        11,
+        "unrelated-export.zip",
+        "https://downloads.example.test/unrelated.zip",
+      ),
+      descriptorEvent(
+        "assistant-newer-invalid-patch",
+        12,
+        expectedFilename,
+        "https://downloads.example.test/newer-invalid.zip",
+      ),
+      {
+        id: "status-multiple-patches-running",
+        type: "status_update",
+        timestamp: 13,
+        status_update: { agent_status: "running" },
+      },
+    ];
+    const validPatch = Buffer.from("valid-revision-patch");
+    const invalidPatch = Buffer.from("invalid-revision-patch");
+    const downloadArchive = vi
+      .fn()
+      .mockImplementation(async ({ descriptor }) => ({
+        buffer: descriptor.url.endsWith("newer-invalid.zip")
+          ? invalidPatch
+          : validPatch,
+        contentType: "application/zip",
+      }));
+    const validateRevisionCandidate = vi
+      .fn()
+      .mockImplementation(async ({ archiveBytes }) => {
+        if (archiveBytes.equals(invalidPatch)) {
+          throw new KnowledgeBaseMaterializedContractError(
+            "invalid latest candidate",
+          );
+        }
+        return { patch: { archiveBytes: validPatch } };
+      });
+    const applyRevision = vi.fn().mockResolvedValue(undefined);
+    const stopTask = vi.fn().mockReturnValue(new Promise(() => undefined));
+    const deferProviderStatus = vi.fn();
+
+    await expect(
+      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
+        claim,
+        { id: "credential-base", apiKey: "base-secret" } as any,
+        {
+          loadBuild: vi.fn().mockResolvedValue(build),
+          ensureDispatch: vi.fn().mockResolvedValue({
+            schemaVersion: 2,
+            baseUrl: "https://api.example.test",
+            requestBody: {
+              prompt: "patch",
+              agentProfile: "manus-1.6",
+              attachments: [],
+            },
+            bodySha256: "b".repeat(64),
+            preparedAt: "2026-08-15T00:00:00.000Z",
+          }),
+          downloadArchive,
+          validateRevisionCandidate,
+          applyRevision,
+          deferProviderStatus,
+          createClient: vi.fn().mockReturnValue({
+            createTask: vi.fn(),
+            findCreatedTask: vi.fn(),
+            listAllMessages: vi.fn().mockResolvedValue(events),
+            stopTask,
+          }),
+        } as any,
+      ),
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
+
+    expect(
+      downloadArchive.mock.calls.map(([value]) => value.descriptor.url),
+    ).toEqual([
+      "https://downloads.example.test/newer-invalid.zip",
+      "https://downloads.example.test/older-valid.zip",
+    ]);
+    expect(applyRevision).toHaveBeenCalledWith(
+      expect.objectContaining({
+        archiveBytes: validPatch,
+        operationId: operationKey,
+        providerTaskId: taskId,
+        targetLeafId: "2.1",
+      }),
+    );
+    expect(applyRevision.mock.invocationCallOrder[0]).toBeLessThan(
+      stopTask.mock.invocationCallOrder[0]!,
+    );
+    expect(stopTask).toHaveBeenCalledWith(taskId);
+    expect(deferProviderStatus).not.toHaveBeenCalled();
+  });
+
+  it("applies a persisted CAS-valid candidate without waiting for stop settlement", async () => {
     const operationKey = "2".repeat(64);
     const taskId = "materialized-task-persisted-stop-sending";
     const eventId = "assistant-persisted-stop-sending";
@@ -4986,6 +5159,16 @@ describe("knowledge base execution contract", () => {
     });
     const beginStop = vi.fn();
     const stopTask = vi.fn();
+    const activateInitial = vi.fn().mockResolvedValue(undefined);
+    const listAllMessages = vi.fn().mockRejectedValue(
+      new ManusV2ApiError(
+        "task.listMessages",
+        404,
+        "task already removed",
+        false,
+        false,
+      ),
+    );
 
     await expect(
       knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
@@ -5016,52 +5199,28 @@ describe("knowledge base execution contract", () => {
           observeCandidate,
           beginStop,
           settleStop,
+          activateInitial,
           createClient: vi.fn().mockReturnValue({
             createTask: vi.fn(),
             findCreatedTask: vi.fn(),
-            listAllMessages: vi.fn().mockResolvedValue([
-              {
-                id: eventId,
-                type: "assistant_message",
-                timestamp: 10,
-                assistant_message: {
-                  content: "",
-                  attachments: [
-                    {
-                      type: "file",
-                      filename: `frontmind-kb-bundle-${operationKey}.zip`,
-                      content_type: "application/zip",
-                      url: "https://downloads.example.test/sending.zip",
-                    },
-                  ],
-                },
-              },
-              {
-                id: "status-persisted-stop-sending-running",
-                type: "status_update",
-                timestamp: 11,
-                status_update: { agent_status: "running" },
-              },
-            ]),
+            listAllMessages,
             stopTask,
           }),
         } as any,
       ),
-    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    ).resolves.toEqual({ taskId, rebound: true, reconciled: true });
 
-    expect(settleStop).toHaveBeenCalledOnce();
-    expect(settleStop).toHaveBeenCalledWith(
-      expect.objectContaining({ state: "outcome_unknown" }),
+    expect(activateInitial).toHaveBeenCalledWith(
+      expect.objectContaining({ archiveBytes: archive }),
     );
-    expect(observeCandidate).toHaveBeenCalledOnce();
-    expect(settleStop.mock.invocationCallOrder[0]).toBeLessThan(
-      observeCandidate.mock.invocationCallOrder[0]!,
-    );
+    expect(settleStop).not.toHaveBeenCalled();
+    expect(observeCandidate).not.toHaveBeenCalled();
     expect(beginStop).not.toHaveBeenCalled();
+    expect(listAllMessages).not.toHaveBeenCalled();
     expect(stopTask).not.toHaveBeenCalled();
   });
 
-  it("converges descriptor changes by canonical bytes and rejects content changes after task.stop", async () => {
+  it("applies the immutable staged CAS across descriptor changes and rejects corrupt local bytes", async () => {
     const operationKey = "3".repeat(64);
     const taskId = "materialized-task-stop-proof-mutation";
     const eventId = "assistant-stop-proof-mutation";
@@ -5180,6 +5339,7 @@ describe("knowledge base execution contract", () => {
       });
       const beginStop = vi.fn();
       const stopTask = vi.fn();
+      const activateInitial = vi.fn().mockResolvedValue(undefined);
       const result =
         knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
           claim,
@@ -5200,6 +5360,7 @@ describe("knowledge base execution contract", () => {
             persistCandidate,
             observeCandidate,
             beginStop,
+            activateInitial,
             createClient: vi.fn().mockReturnValue({
               createTask: vi.fn(),
               findCreatedTask: vi.fn(),
@@ -5220,15 +5381,13 @@ describe("knowledge base execution contract", () => {
         await expect(result).resolves.toEqual({
           taskId,
           rebound: true,
-          reconciled: false,
+          reconciled: true,
         });
       }
       expect(persistCandidate).not.toHaveBeenCalled();
-      if (input.expectFailure) {
-        expect(observeCandidate).not.toHaveBeenCalled();
-      } else {
-        expect(observeCandidate).toHaveBeenCalledOnce();
-      }
+      expect(observeCandidate).not.toHaveBeenCalled();
+      if (input.expectFailure) expect(activateInitial).not.toHaveBeenCalled();
+      else expect(activateInitial).toHaveBeenCalledOnce();
       expect(beginStop).not.toHaveBeenCalled();
       expect(stopTask).not.toHaveBeenCalled();
     };
@@ -5236,7 +5395,6 @@ describe("knowledge base execution contract", () => {
     await exercise({ candidateEventId: "assistant-replaced-after-stop" });
     await exercise({
       downloaded: Buffer.from("changed-after-stop"),
-      expectFailure: true,
     });
     await exercise({
       staged: Buffer.from("corrupt-local-staging"),
@@ -5491,7 +5649,7 @@ describe("knowledge base execution contract", () => {
     expect(stopTask).not.toHaveBeenCalled();
   });
 
-  it("only stages running candidates and classifies waiting, typed quota, unknown error, and missing status without Provider writes", async () => {
+  it("classifies Provider status when the reported ZIP is not yet readable", async () => {
     const operationKey = "6".repeat(64);
     const taskId = "materialized-task-contract-v2-status-classification";
     const expectedFilename = `frontmind-kb-bundle-${operationKey}.zip`;
@@ -5656,7 +5814,15 @@ describe("knowledge base execution contract", () => {
         retryAfterMs: 15_000,
         ledger: { schemaVersion: 1 },
       });
-      const downloadArchive = vi.fn();
+      const downloadArchive = vi
+        .fn()
+        .mockRejectedValue(
+          new KnowledgeArchiveDownloadError(
+            "http_status",
+            "candidate is not readable yet",
+            503,
+          ),
+        );
       const observeCandidate = vi.fn();
       const stopTask = vi.fn();
       const createTask = vi.fn();
@@ -5699,10 +5865,10 @@ describe("knowledge base execution contract", () => {
       expect(deferProviderStatus, fixture.label).toHaveBeenCalledWith(
         expect.objectContaining({
           status: fixture.expectedStatus,
-          resetCandidate: false,
+          resetCandidate: true,
         }),
       );
-      expect(downloadArchive, fixture.label).not.toHaveBeenCalled();
+      expect(downloadArchive, fixture.label).toHaveBeenCalledOnce();
       expect(observeCandidate, fixture.label).not.toHaveBeenCalled();
       expect(stopTask, fixture.label).not.toHaveBeenCalled();
       expect(createTask, fixture.label).not.toHaveBeenCalled();
@@ -5711,7 +5877,7 @@ describe("knowledge base execution contract", () => {
     }
   });
 
-  it("activates a contract-v2 staged candidate only after stopped proves the same immutable ZIP", async () => {
+  it("activates a stopped contract-v2 candidate directly from its verified local CAS", async () => {
     const operationKey = "9".repeat(64);
     const taskId = "materialized-task-contract-v2-stopped";
     const turnId = "00000000-0000-4000-8000-0000000000f9";
@@ -5856,97 +6022,6 @@ describe("knowledge base execution contract", () => {
         providerTaskId: taskId,
       }),
     );
-
-    const mismatchedActivation = vi.fn();
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
-        claim,
-        { id: "credential-base", apiKey: "base-secret" } as any,
-        {
-          loadBuild: vi.fn().mockResolvedValue(build),
-          ensureDispatch: vi.fn().mockResolvedValue({
-            schemaVersion: 2,
-            baseUrl: "https://api.example.test",
-            requestBody: {
-              prompt: "bundle",
-              agentProfile: "manus-1.6",
-              attachments: [],
-            },
-            bodySha256: "b".repeat(64),
-            preparedAt: "2026-08-15T00:00:00.000Z",
-          }),
-          downloadArchive: vi.fn().mockResolvedValue({
-            buffer: Buffer.from("changed-after-task-stop"),
-            contentType: "application/zip",
-          }),
-          validateInitialCandidate: vi
-            .fn()
-            .mockImplementation(async (bytes: Buffer) => ({
-              archiveBytes: bytes,
-            })),
-          readCandidate: vi.fn().mockResolvedValue(archive),
-          activateInitial: mismatchedActivation,
-          createClient: vi.fn().mockReturnValue({
-            createTask: vi.fn(),
-            findCreatedTask: vi.fn(),
-            listAllMessages: vi.fn().mockResolvedValue(stoppedEvents),
-            stopTask: vi.fn(),
-          }),
-        } as any,
-      ),
-    ).rejects.toMatchObject({
-      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_INVALID",
-    });
-    expect(mismatchedActivation).not.toHaveBeenCalled();
-
-    const deferAfterStop = vi.fn();
-    const observeAfterStop = vi.fn().mockResolvedValue({
-      disposition: "stop_settle_expired",
-      ledger: claim.turn.materializedCompletion,
-      deduplicated: true,
-    });
-    await expect(
-      knowledgeBaseTerminalAnchorRecoveryTestHooks.dispatchKnowledgeBaseRecoveryClaim(
-        claim,
-        { id: "credential-base", apiKey: "base-secret" } as any,
-        {
-          loadBuild: vi.fn().mockResolvedValue(build),
-          ensureDispatch: vi.fn().mockResolvedValue({
-            schemaVersion: 2,
-            baseUrl: "https://api.example.test",
-            requestBody: {
-              prompt: "bundle",
-              agentProfile: "manus-1.6",
-              attachments: [],
-            },
-            bodySha256: "b".repeat(64),
-            preparedAt: "2026-08-15T00:00:00.000Z",
-          }),
-          observeCandidate: observeAfterStop,
-          deferProviderStatus: deferAfterStop,
-          createClient: vi.fn().mockReturnValue({
-            createTask: vi.fn(),
-            findCreatedTask: vi.fn(),
-            listAllMessages: vi.fn().mockResolvedValue([
-              stoppedEvents[0],
-              {
-                id: "status-after-stop-waiting",
-                type: "status_update",
-                timestamp: 12,
-                status_update: { agent_status: "waiting" },
-              },
-            ]),
-            stopTask: vi.fn(),
-          }),
-        } as any,
-      ),
-    ).rejects.toMatchObject({
-      code: "KNOWLEDGE_BASE_MATERIALIZED_RESULT_UNAVAILABLE",
-    });
-    expect(observeAfterStop).toHaveBeenCalledWith(
-      expect.objectContaining({ providerStatus: "waiting" }),
-    );
-    expect(deferAfterStop).not.toHaveBeenCalled();
   });
 
   it("accepts an interrupted task after a manual continue and activates its valid ZIP without another Provider POST", async () => {
@@ -6156,7 +6231,7 @@ describe("knowledge base execution contract", () => {
     expect(deleteTask).not.toHaveBeenCalled();
   });
 
-  it("adopts the one created task after a Provider 2xx-to-local-bind crash without reposting create", async () => {
+  it("requires an approved reset after a Provider 2xx-to-local-bind crash", async () => {
     const operationKey = "9".repeat(64);
     const taskId = "materialized-task-created-before-bind-crash";
     const build = {
@@ -6217,22 +6292,8 @@ describe("knowledge base execution contract", () => {
       taskUrl: `https://manus.im/app/${taskId}`,
       requestId: "request-created-before-bind-crash",
     });
-    const findCreatedTask = vi.fn().mockResolvedValue({
-      candidates: [{ id: taskId }],
-      matches: [{ id: taskId, taskUrl: `https://manus.im/app/${taskId}` }],
-      unique: { id: taskId, taskUrl: `https://manus.im/app/${taskId}` },
-    });
-    const listAllMessages = vi
-      .fn()
-      .mockRejectedValue(
-        new ManusV2ApiError(
-          "task.listMessages",
-          404,
-          "not_found",
-          false,
-          false,
-        ),
-      );
+    const findCreatedTask = vi.fn();
+    const listAllMessages = vi.fn();
     const bindSubmission = vi
       .fn()
       .mockRejectedValueOnce(new Error("local bind transaction failed"))
@@ -6295,10 +6356,11 @@ describe("knowledge base execution contract", () => {
         { id: "credential-base", apiKey: "base-secret" } as any,
         dependencies,
       ),
-    ).resolves.toEqual({ taskId, rebound: true, reconciled: false });
+    ).rejects.toMatchObject({ code: "RESET_REQUIRED" });
     expect(createTask).toHaveBeenCalledOnce();
-    expect(findCreatedTask).toHaveBeenCalledOnce();
-    expect(bindSubmission).toHaveBeenCalledTimes(2);
+    expect(findCreatedTask).not.toHaveBeenCalled();
+    expect(listAllMessages).not.toHaveBeenCalled();
+    expect(bindSubmission).toHaveBeenCalledOnce();
     expect(ensureManusV2Attachments).toHaveBeenCalledOnce();
   });
 

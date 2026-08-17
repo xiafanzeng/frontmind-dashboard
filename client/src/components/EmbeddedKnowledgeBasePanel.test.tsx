@@ -1,11 +1,12 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   resetRefetch: vi.fn(),
   knowledgeRefetch: vi.fn(),
   deliveryTicketCreate: vi.fn(),
   progressRefetch: vi.fn(),
+  progressUseQuery: vi.fn(),
   setKnowledgeData: vi.fn(),
   setProgressData: vi.fn(),
   invalidateProgress: vi.fn(),
@@ -14,7 +15,12 @@ const mocks = vi.hoisted(() => ({
   discardConversationLocally: vi.fn(),
   discardKnowledgeBaseConversationsLocally: vi.fn(),
   refreshConversationsAfterDiscard: vi.fn(),
+  refreshConversations: vi.fn(),
+  clearSyncError: vi.fn(),
   activeConversation: null as any,
+  hydrated: true,
+  conversationLoading: false,
+  syncError: null as string | null,
   resetIsError: false,
   progressIsError: false,
   progressData: { progress: null } as any,
@@ -38,13 +44,17 @@ vi.mock("@/contexts/ConversationContext", () => ({
       conversations: mocks.activeConversation ? [mocks.activeConversation] : [],
     },
     activeConversation: mocks.activeConversation,
-    hydrated: true,
+    loading: mocks.conversationLoading,
+    hydrated: mocks.hydrated,
+    syncError: mocks.syncError,
     createConversation: mocks.createConversation,
     setActive: mocks.setActive,
     discardConversationLocally: mocks.discardConversationLocally,
     discardKnowledgeBaseConversationsLocally:
       mocks.discardKnowledgeBaseConversationsLocally,
     refreshConversationsAfterDiscard: mocks.refreshConversationsAfterDiscard,
+    refreshConversations: mocks.refreshConversations,
+    clearSyncError: mocks.clearSyncError,
   }),
 }));
 vi.mock("@/components/KnowledgeBaseViewer", () => ({
@@ -54,7 +64,7 @@ vi.mock("@/components/KnowledgeBaseProgressPanel", () => ({
   default: () => null,
 }));
 vi.mock("@/pages/Home", () => ({
-  default: () => null,
+  default: () => <div data-testid="knowledge-home">knowledge home</div>,
 }));
 vi.mock("@/lib/trpc", () => ({
   trpc: {
@@ -71,12 +81,16 @@ vi.mock("@/lib/trpc", () => ({
     }),
     workspace: {
       knowledgeProgress: {
-        useQuery: () => ({
-          data: mocks.progressData,
-          isLoading: false,
-          isError: mocks.progressIsError,
-          refetch: mocks.progressRefetch,
-        }),
+        useQuery: (input: unknown, options: unknown) => {
+          mocks.progressUseQuery(input, options);
+          return {
+            data: mocks.progressData,
+            isLoading:
+              mocks.progressData === undefined && !mocks.progressIsError,
+            isError: mocks.progressIsError,
+            refetch: mocks.progressRefetch,
+          };
+        },
       },
       knowledge: {
         useQuery: () => ({
@@ -113,16 +127,22 @@ vi.mock("@/lib/trpc", () => ({
 }));
 
 import EmbeddedKnowledgeBasePanel, {
+  KNOWLEDGE_BASE_RECOVERY_UI_TIMEOUT_MS,
   isKnowledgeBaseProgressProjectionOlder,
   knowledgeResetButtonLabel,
   shouldDiscardConversationAfterKnowledgeReset,
 } from "./EmbeddedKnowledgeBasePanel";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 beforeEach(() => {
   mocks.resetRefetch.mockReset().mockResolvedValue(undefined);
   mocks.knowledgeRefetch.mockReset().mockResolvedValue(undefined);
   mocks.deliveryTicketCreate.mockReset().mockResolvedValue(undefined);
   mocks.progressRefetch.mockReset().mockResolvedValue(undefined);
+  mocks.progressUseQuery.mockReset();
   mocks.setKnowledgeData.mockReset();
   mocks.setProgressData.mockReset();
   mocks.invalidateProgress.mockReset().mockResolvedValue(undefined);
@@ -137,9 +157,14 @@ beforeEach(() => {
   mocks.refreshConversationsAfterDiscard
     .mockReset()
     .mockResolvedValue(undefined);
+  mocks.refreshConversations.mockReset().mockResolvedValue(undefined);
+  mocks.clearSyncError.mockReset();
   mocks.resetIsError = false;
   mocks.progressIsError = false;
   mocks.progressData = { progress: null };
+  mocks.hydrated = true;
+  mocks.conversationLoading = false;
+  mocks.syncError = null;
   mocks.knowledgeData = { snapshot: null };
   mocks.activeConversation = null;
   mocks.resetStatus = {
@@ -246,6 +271,171 @@ describe("EmbeddedKnowledgeBasePanel reset action", () => {
 
     expect(screen.getByText("构建会话读取失败")).toBeInTheDocument();
     expect(mocks.createConversation).not.toHaveBeenCalled();
+  });
+
+  it("starts the latest progress read before conversation hydration completes", () => {
+    mocks.hydrated = false;
+    mocks.conversationLoading = true;
+    mocks.progressData = undefined;
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    const latestQueryOptions = mocks.progressUseQuery.mock.calls.find(
+      ([, options]) =>
+        (options as { refetchOnWindowFocus?: unknown })
+          ?.refetchOnWindowFocus === true,
+    )?.[1];
+    expect(latestQueryOptions).toBeDefined();
+    expect(latestQueryOptions).not.toHaveProperty("enabled");
+    expect(screen.getByText("正在恢复构建会话…")).toBeInTheDocument();
+  });
+
+  it("turns a hanging recovery into an explicit retry within 15 seconds", async () => {
+    vi.useFakeTimers();
+    mocks.hydrated = false;
+    mocks.conversationLoading = true;
+    mocks.progressData = undefined;
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+    expect(screen.getByText("正在恢复构建会话…")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(KNOWLEDGE_BASE_RECOVERY_UI_TIMEOUT_MS);
+    });
+
+    expect(screen.getByText("构建会话读取失败")).toBeInTheDocument();
+    expect(
+      screen.getByText(/未能在 15 秒内恢复已有构建会话/),
+    ).toBeInTheDocument();
+  });
+
+  it("retries both conversation hydration and authoritative progress", () => {
+    mocks.syncError = "会话同步暂时中断";
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+    act(() => screen.getByRole("button", { name: "重新读取" }).click());
+
+    expect(mocks.clearSyncError).toHaveBeenCalledTimes(1);
+    expect(mocks.refreshConversations).toHaveBeenCalledTimes(1);
+    expect(mocks.progressRefetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an existing approved presentation visible while recovery fails", () => {
+    mocks.hydrated = false;
+    mocks.conversationLoading = true;
+    mocks.syncError = "会话同步暂时中断";
+    mocks.progressData = undefined;
+    mocks.progressIsError = true;
+    mocks.activeConversation = {
+      id: "last-good-kb",
+      title: "企业知识库构建",
+      status: "running",
+      createdAt: 1,
+      updatedAt: 2,
+      knowledgeBase: {
+        initialized: true,
+        generation: 1,
+        stateEpoch: 2,
+        activeTurnId: "running-turn",
+        activeClientRequestId: "running-request",
+        presentationTurnId: "last-good-turn",
+        interactionState: "executing",
+        canReply: false,
+        presentationKey: "presentation-key",
+        revision: 1,
+        leafId: "1.6",
+        notice: null,
+      },
+      messages: [
+        {
+          id: "last-good-presentation",
+          role: "assistant",
+          content: "# 已验证节点\n\n可继续阅读的正文",
+          timestamp: 1,
+          knowledgeBase: {
+            kind: "presentation",
+            presentationKey: "presentation-key",
+            turnId: "last-good-turn",
+            serverOwned: true,
+          },
+        },
+      ],
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.getByTestId("knowledge-home")).toBeInTheDocument();
+    expect(screen.queryByText("构建会话读取失败")).not.toBeInTheDocument();
+  });
+
+  it("does not treat a stale presentation from an old KB coordinate as last-good", () => {
+    mocks.progressData = undefined;
+    mocks.progressIsError = true;
+    mocks.activeConversation = {
+      id: "stale-kb-presentation",
+      title: "企业知识库构建",
+      status: "error",
+      createdAt: 1,
+      updatedAt: 2,
+      knowledgeBase: {
+        initialized: true,
+        generation: 2,
+        stateEpoch: 3,
+        activeTurnId: null,
+        activeClientRequestId: null,
+        presentationTurnId: "current-turn",
+        interactionState: "failed",
+        canReply: false,
+        presentationKey: "current-presentation",
+        revision: 2,
+        leafId: "1.6",
+        notice: null,
+      },
+      messages: [
+        {
+          id: "old-presentation",
+          role: "assistant",
+          content: "旧正文",
+          timestamp: 1,
+          knowledgeBase: {
+            kind: "presentation",
+            presentationKey: "old-presentation",
+            turnId: "old-turn",
+            serverOwned: true,
+          },
+        },
+      ],
+    };
+
+    render(
+      <EmbeddedKnowledgeBasePanel
+        page="build"
+        onPageChange={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("构建会话读取失败")).toBeInTheDocument();
+    expect(screen.queryByTestId("knowledge-home")).not.toBeInTheDocument();
   });
 
   it("keeps reset on the build page only and refreshes it when build progress starts", () => {

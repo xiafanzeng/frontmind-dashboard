@@ -29,6 +29,7 @@ import { KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME } from "./knowledge-base-prompt-de
 import {
   ManusV2ApiError,
   ManusV2Client,
+  isManusV2ProviderFileMimeUsable,
   type ManusV2Attachment,
   type ManusV2CreatedFile,
 } from "./manus-v2-client";
@@ -622,6 +623,11 @@ function exactProviderProof(input: {
     input.detail.filename === input.mapping.filename &&
     input.detail.status === "uploaded" &&
     input.detail.bytes === input.mapping.sizeBytes &&
+    isManusV2ProviderFileMimeUsable({
+      filename: input.mapping.filename,
+      expectedContentType: input.mapping.mimeType,
+      providerContentType: input.detail.contentType,
+    }) &&
     Number.isSafeInteger(input.detail.expiresAt) &&
     input.detail.expiresAt >= input.minimumExpirySeconds
   );
@@ -715,6 +721,16 @@ async function inspectCandidate(input: {
     }
     if (detail.status === "deleted" || detail.status === "error") {
       return { state: "unusable", code: "MANUS_V2_FILE_UNUSABLE" };
+    }
+    if (
+      detail.status === "uploaded" &&
+      !isManusV2ProviderFileMimeUsable({
+        filename: input.attempt.filename,
+        expectedContentType: input.attempt.mimeType,
+        providerContentType: detail.contentType,
+      })
+    ) {
+      return { state: "unusable", code: "MANUS_V2_FILE_MIME_CONFLICT" };
     }
     if (
       detail.status === "uploaded" &&
@@ -1329,6 +1345,7 @@ async function ensureOneMapping(input: {
         "FILE_EXPIRING",
         "FILE_IDENTITY_CONFLICT",
         "FILE_BYTES_CONFLICT",
+        "FILE_MIME_CONFLICT",
       ].includes(error.code)
     ) {
       const unusable = attachmentAttempt({

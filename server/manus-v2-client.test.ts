@@ -997,6 +997,45 @@ describe("ManusV2Client", () => {
   });
 
   it.each([
+    ["generated.zip", "application/zip"],
+    ["instructions.txt", "text/plain"],
+  ])(
+    "accepts provider generic binary MIME for a byte-exact %s",
+    async (filename, expectedContentType) => {
+      const now = Math.floor(Date.now() / 1_000);
+      const get = vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+        status: 200,
+        data: {
+          ok: true,
+          file: {
+            id: "file-generic-mime",
+            filename,
+            status: "uploaded",
+            bytes: 3,
+            content_type: "application/octet-stream",
+            expires_at: now + 48 * 3600,
+          },
+        },
+      });
+      const client = new ManusV2Client({
+        baseUrl: "https://api.example.test",
+        apiKey: "secret",
+      });
+
+      await expect(
+        client.waitForExactProviderFile({
+          fileId: "file-generic-mime",
+          filename,
+          expectedBytes: 3,
+          expectedContentType,
+          sleep: async () => undefined,
+        }),
+      ).resolves.toMatchObject({ contentType: "application/octet-stream" });
+      expect(get).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
     [
       "identity",
       {
@@ -1027,6 +1066,17 @@ describe("ManusV2Client", () => {
         status: "uploaded",
         bytes: 3,
         content_type: "text/plain",
+      },
+      "FILE_MIME_CONFLICT",
+    ],
+    [
+      "generic binary MIME for a PDF",
+      {
+        id: "file-exact",
+        filename: "facts.pdf",
+        status: "uploaded",
+        bytes: 3,
+        content_type: "application/octet-stream",
       },
       "FILE_MIME_CONFLICT",
     ],
