@@ -181,6 +181,7 @@ const requiredKnowledgeBaseEntries = [
   "references/materialized-working-set.md",
   "references/questioning-strategy.md",
   "references/output-format.md",
+  "references/working-set-policy.json",
   "scripts/validate_working_set.py",
 ];
 const allowedKnowledgeBaseArchiveEntries = new Set([
