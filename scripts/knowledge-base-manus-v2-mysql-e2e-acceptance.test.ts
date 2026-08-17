@@ -468,19 +468,42 @@ function createFakeManusV2Provider(input: {
     const attachments = (body.message.content as any[]).filter(
       (part) => part?.type === "file",
     );
-    for (const attachment of attachments) {
+    const resolvedAttachments = attachments.map((attachment) => {
+      if (typeof attachment.file_data === "string") {
+        const marker = ";base64,";
+        const markerIndex = attachment.file_data.indexOf(marker);
+        expect(attachment.file_data.startsWith("data:")).toBe(true);
+        expect(markerIndex).toBeGreaterThan("data:".length);
+        const contentType = attachment.file_data.slice(
+          "data:".length,
+          markerIndex,
+        );
+        const encoded = attachment.file_data.slice(markerIndex + marker.length);
+        const bytes = Buffer.from(encoded, "base64");
+        expect(bytes.toString("base64")).toBe(encoded);
+        expect(attachment.mime_type).toBe(contentType);
+        return {
+          filename: String(attachment.filename || ""),
+          bytes,
+          contentType,
+        };
+      }
       const file = uploadedFiles.get(String(attachment.file_id));
-      expect(file?.bytes?.length).toBeGreaterThan(0);
-      expect(attachment.filename).toBe(file?.filename);
+      expect(file).toBeDefined();
+      return file!;
+    });
+    for (let index = 0; index < attachments.length; index += 1) {
+      const attachment = attachments[index]!;
+      const file = resolvedAttachments[index]!;
+      expect(file.bytes?.length).toBeGreaterThan(0);
+      expect(attachment.filename).toBe(file.filename);
     }
-    const instructionsAttachment = attachments.find(
+    const instructionsIndex = attachments.findIndex(
       (attachment) =>
         attachment.filename === KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME,
     );
-    expect(instructionsAttachment).toBeDefined();
-    const instructionsFile = uploadedFiles.get(
-      String(instructionsAttachment.file_id),
-    );
+    expect(instructionsIndex).toBeGreaterThanOrEqual(0);
+    const instructionsFile = resolvedAttachments[instructionsIndex];
     expect(instructionsFile?.contentType).toContain("text/plain");
     const instructions = instructionsFile?.bytes?.toString("utf8") || "";
     expect(prompt).toContain(KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME);
@@ -1079,10 +1102,8 @@ mysqlDescribe(
       expect(fakeProvider.taskSendBodies).toHaveLength(0);
       expect(fakeProvider.taskUpdateBodies).toHaveLength(0);
       expect(fakeProvider.bundleDownloads).toBe(1);
-      expect(fakeProvider.fileUploads.length).toBeGreaterThanOrEqual(2);
-      expect(fakeProvider.fileDetailCalls.length).toBeGreaterThanOrEqual(
-        fakeProvider.fileUploads.length * 2,
-      );
+      expect(fakeProvider.fileUploads).toHaveLength(0);
+      expect(fakeProvider.fileDetailCalls).toHaveLength(0);
 
       const build = (
         await executor
