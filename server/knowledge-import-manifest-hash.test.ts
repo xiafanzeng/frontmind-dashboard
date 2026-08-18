@@ -3,11 +3,11 @@ import { Readable } from "node:stream";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { websiteProjectDeletionTombstones } from "../drizzle/schema";
-import { buildWebsiteKnowledgeImportFixture } from "./__testutils__/website-knowledge-import-archive";
+import { buildWebsiteKnowledgeImportV4Fixture } from "./__testutils__/website-knowledge-import-archive";
 import { canonicalizeWebsiteKnowledgeImportArchive } from "./website-knowledge-import-archive-adapter";
 
 const candidateBytes = Buffer.from("candidate artifact bytes");
-const finalFixture = await buildWebsiteKnowledgeImportFixture();
+const finalFixture = await buildWebsiteKnowledgeImportV4Fixture();
 const finalBytes = finalFixture.buffer;
 const canonicalFixture =
   await canonicalizeWebsiteKnowledgeImportArchive(finalBytes);
@@ -222,7 +222,7 @@ describe("website knowledge import v5 local artifact binding", () => {
     });
   });
 
-  it("runs the real strict reader and persists only canonical bytes", async () => {
+  it("uses the isolated v4 projection and persists only canonical source bytes", async () => {
     expect(finalSha256).not.toBe(canonicalFixture.sha256);
     await expect(
       importWebsiteKnowledgeArtifact({
@@ -248,18 +248,18 @@ describe("website knowledge import v5 local artifact binding", () => {
         archiveHash: canonicalFixture.sha256,
         totalBytes: canonicalFixture.buffer.length,
         documents: expect.arrayContaining([
-          expect.objectContaining({
-            path: expect.stringContaining("README.md"),
-          }),
+          expect.objectContaining({ id: "overview-1", customerVisible: true }),
+          expect.objectContaining({ id: "leaf-1", customerVisible: true }),
         ]),
       }),
     );
     const snapshotInput = mocks.createKnowledgeSnapshot.mock.calls[0]![0];
+    expect(snapshotInput.documents).toHaveLength(2);
     expect(
-      snapshotInput.documents.filter(
-        (document: { customerVisible?: boolean }) => document.customerVisible,
+      snapshotInput.documents.some((document: { path: string }) =>
+        document.path.endsWith("README.md"),
       ),
-    ).toHaveLength(40);
+    ).toBe(false);
   });
 
   it("keeps independent project and user imports isolated", async () => {

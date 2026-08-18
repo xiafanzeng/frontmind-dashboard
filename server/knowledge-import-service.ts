@@ -29,7 +29,10 @@ import {
 } from "./knowledge-snapshot-archive-store";
 import { readPresalesV2Artifact } from "./presales-v2-store";
 import { readStoredPresalesFile } from "./presales-file-store";
-import { canonicalizeWebsiteKnowledgeImportArchive } from "./website-knowledge-import-archive-adapter";
+import {
+  canonicalizeWebsiteKnowledgeImportArchive,
+  projectWebsiteKnowledgeImportArchiveV4,
+} from "./website-knowledge-import-archive-adapter";
 import {
   lockActiveWebsiteProjectLifecycle,
   WebsiteProjectInactiveError,
@@ -268,7 +271,9 @@ export function knowledgeArtifactReceiptMatchesRequest(
   if (!knowledgeArtifactReceiptDescriptorMatchesRequest(receipt, input)) {
     return false;
   }
-  return receipt.sourceReference === knowledgeImportReceiptSourceReference(input);
+  return (
+    receipt.sourceReference === knowledgeImportReceiptSourceReference(input)
+  );
 }
 
 async function requireImportDb() {
@@ -720,15 +725,22 @@ export async function importWebsiteKnowledgeArtifact(input: {
       downloaded.buffer,
     );
     const snapshotId = randomUUID();
-    const parsed = await readKnowledgeArchive(
-      canonicalArchive.buffer,
-      downloaded.filename,
-      snapshotId,
-      {
-        validationProfile: "website-lead-v1",
-        archiveContractVersion: knowledgeImportArchiveContractVersion(value),
-      },
-    );
+    const parsed =
+      canonicalArchive.schemaVersion === 4
+        ? await projectWebsiteKnowledgeImportArchiveV4({
+            buffer: canonicalArchive.buffer,
+            snapshotId,
+          })
+        : await readKnowledgeArchive(
+            canonicalArchive.buffer,
+            downloaded.filename,
+            snapshotId,
+            {
+              validationProfile: "website-lead-v1",
+              archiveContractVersion:
+                knowledgeImportArchiveContractVersion(value),
+            },
+          );
     storedAssetKeys = parsed.storedAssetKeys;
     const packageManifestSha256 = knowledgeImportPackageManifestSha256(value);
     if (
@@ -753,11 +765,13 @@ export async function importWebsiteKnowledgeArtifact(input: {
         409,
       );
     }
-    assertKnowledgeArchiveEnterpriseIdentity({
-      enterpriseIdentityConfirmed: true,
-      brandName: workspace.payload.brandName,
-      documents: parsed.documents,
-    });
+    if (canonicalArchive.schemaVersion !== 4) {
+      assertKnowledgeArchiveEnterpriseIdentity({
+        enterpriseIdentityConfirmed: true,
+        brandName: workspace.payload.brandName,
+        documents: parsed.documents,
+      });
+    }
     await persistKnowledgeSnapshotArchive({
       userId: provision.userId,
       snapshotId,

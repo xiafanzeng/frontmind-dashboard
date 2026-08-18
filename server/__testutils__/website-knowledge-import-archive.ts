@@ -181,3 +181,177 @@ export async function buildWebsiteKnowledgeImportFixture(options?: {
       .digest("hex"),
   };
 }
+
+const websiteV4FixturePng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVQImWNIMTrxH4QZYAwAUFgJdZeJuy8AAAAASUVORK5CYII=",
+  "base64",
+);
+
+export async function buildWebsiteKnowledgeImportV4Fixture(options?: {
+  root?: string;
+  includeImage?: boolean;
+  includeInventories?: boolean;
+  mutate?: (input: {
+    entries: Map<string, Buffer>;
+    manifest: Record<string, any>;
+  }) => void;
+}) {
+  const entries = new Map<string, Buffer>();
+  const visibleDocuments = [
+    {
+      id: "overview-1",
+      path: "01_company_overview/00_overview.md",
+      kind: "overview",
+      title: "示例企业综述",
+      branchId: "01_company_overview",
+      order: 1,
+      evidenceStatus: "verified_first_party",
+      sourceIds: ["source-1"],
+      assetIds: options?.includeImage ? ["asset-1"] : [],
+      customerVisible: true,
+    },
+    {
+      id: "leaf-1",
+      path: "03_products/product.md",
+      kind: "leaf",
+      title: "示例产品",
+      branchId: "03_products",
+      order: 2,
+      evidenceStatus: "verified_first_party",
+      sourceIds: ["source-1"],
+      assetIds: [],
+      customerVisible: true,
+    },
+  ];
+  const hiddenDocuments = [
+    {
+      id: "readme-1",
+      path: "README.md",
+      kind: "readme",
+      title: "说明",
+      customerVisible: false,
+    },
+    {
+      id: "evidence-1",
+      path: "evidence/source-1.md",
+      kind: "evidence",
+      title: "来源证据",
+      sourceIds: ["source-1"],
+      customerVisible: false,
+    },
+  ];
+  for (const document of visibleDocuments) {
+    entries.set(
+      document.path,
+      Buffer.from(
+        `# ${document.title}\n\n示例企业提供的可展示知识正文。`,
+        "utf8",
+      ),
+    );
+  }
+  entries.set("README.md", Buffer.from("# 示例企业 Website 知识库", "utf8"));
+  entries.set(
+    "evidence/source-1.md",
+    Buffer.from("# 来源证据\n\nhttps://example.com", "utf8"),
+  );
+  entries.set(
+    "00_completeness.json",
+    Buffer.from(JSON.stringify({ counts: {}, acquisition: {} }), "utf8"),
+  );
+  if (options?.includeInventories) {
+    entries.set(
+      "09_media_assets/asset_inventory.md",
+      Buffer.from("# 第一方图片清单", "utf8"),
+    );
+    entries.set(
+      "10_reference_assets/reference_asset_inventory.md",
+      Buffer.from("# 第三方素材索引", "utf8"),
+    );
+  }
+  const assets = options?.includeImage
+    ? [
+        {
+          id: "asset-1",
+          path: "09_media_assets/brand_identity/asset-1.png",
+          sha256: createHash("sha256")
+            .update(websiteV4FixturePng)
+            .digest("hex"),
+          mimeType: "image/png",
+          bytes: websiteV4FixturePng.length,
+          width: 2,
+          height: 2,
+          caption: "示例企业标识",
+          alt: "示例企业标识",
+          branchId: "01_company_overview",
+          documentIds: ["overview-1"],
+          sourceKind: "official_web",
+          ownership: "first_party",
+          assetType: "brand_identity",
+          displayRole: "badge",
+        },
+      ]
+    : [];
+  if (options?.includeImage) {
+    entries.set(
+      "09_media_assets/brand_identity/asset-1.png",
+      websiteV4FixturePng,
+    );
+  }
+  const manifest: Record<string, any> = {
+    schemaVersion: 4,
+    candidateContractVersion: 2,
+    profile: "website-lead-v1",
+    documents: [...hiddenDocuments, ...visibleDocuments],
+    assets,
+    counts: {
+      totalFiles: 0,
+      customerVisibleCharacters: 1,
+      evidenceCharacters: 1,
+      packagedImages: assets.length,
+    },
+    branchEvidence: [],
+    imageSelection: {
+      status: "source_limited",
+      discoveredCandidateImages: assets.length,
+      inspectedCandidateImages: assets.length,
+      eligibleFirstPartyImages: assets.length,
+      rejectedCandidateImages: 0,
+      scannedSourcePages: 1,
+      discoveryMethods: ["img"],
+      candidates: [],
+      productFamilies: [],
+      shortfallReason: "fixture intentionally keeps the content contract small",
+    },
+    allPaths: [],
+    evidencePaths: ["evidence/source-1.md"],
+  };
+  manifest.allPaths = [...entries.keys(), "00_package_manifest.json"].sort();
+  manifest.counts.totalFiles = manifest.allPaths.length;
+  options?.mutate?.({ entries, manifest });
+  const manifestBytes = Buffer.from(JSON.stringify(manifest), "utf8");
+  entries.set("00_package_manifest.json", manifestBytes);
+
+  const prefix = options?.root ? `${options.root}/` : "";
+  const zip = new JSZip();
+  for (const [relativePath, bytes] of [...entries.entries()].sort()) {
+    zip.file(`${prefix}${relativePath}`, bytes, {
+      binary: true,
+      createFolders: false,
+      date: new Date("2026-08-18T00:00:00.000Z"),
+      unixPermissions: 0o100644,
+    });
+  }
+  const buffer = await zip.generateAsync({
+    type: "nodebuffer",
+    platform: "UNIX",
+    compression: "DEFLATE",
+    compressionOptions: { level: 3 },
+  });
+  return {
+    buffer,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+    packageManifestSha256: createHash("sha256")
+      .update(manifestBytes)
+      .digest("hex"),
+  };
+}

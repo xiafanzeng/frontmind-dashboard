@@ -1,7 +1,10 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 
-import { buildWebsiteKnowledgeImportFixture } from "./__testutils__/website-knowledge-import-archive";
+import {
+  buildWebsiteKnowledgeImportFixture,
+  buildWebsiteKnowledgeImportV4Fixture,
+} from "./__testutils__/website-knowledge-import-archive";
 import {
   readKnowledgeArchive,
   removeStoredKnowledgeAssets,
@@ -10,6 +13,7 @@ import {
   WEBSITE_KNOWLEDGE_IMPORT_CANONICAL_ROOT,
   WebsiteKnowledgeImportArchiveError,
   canonicalizeWebsiteKnowledgeImportArchive,
+  projectWebsiteKnowledgeImportArchiveV4,
 } from "./website-knowledge-import-archive-adapter";
 
 describe("Website knowledge-import archive adapter", () => {
@@ -99,6 +103,223 @@ describe("Website knowledge-import archive adapter", () => {
     } finally {
       await removeStoredKnowledgeAssets(parsed.storedAssetKeys);
     }
+  });
+
+  it("projects usable Website v4 content without requiring legacy inventories", async () => {
+    const source = await buildWebsiteKnowledgeImportV4Fixture({
+      root: "website-v4-output",
+      includeImage: true,
+    });
+    const canonical = await canonicalizeWebsiteKnowledgeImportArchive(
+      source.buffer,
+    );
+    expect(canonical.schemaVersion).toBe(4);
+    const archive = await JSZip.loadAsync(canonical.buffer);
+    expect(
+      archive.file(
+        `${WEBSITE_KNOWLEDGE_IMPORT_CANONICAL_ROOT}/09_media_assets/asset_inventory.md`,
+      ),
+    ).toBeNull();
+
+    const projected = await projectWebsiteKnowledgeImportArchiveV4({
+      buffer: canonical.buffer,
+      snapshotId: "website-v4-projection",
+    });
+    try {
+      expect(projected.packageManifestSha256).toBe(
+        source.packageManifestSha256,
+      );
+      expect(projected.documents).toHaveLength(2);
+      expect(
+        projected.documents.map((document) => ({
+          id: document.id,
+          kind: document.kind,
+          branchId: document.branchId,
+          customerVisible: document.customerVisible,
+        })),
+      ).toEqual([
+        {
+          id: "overview-1",
+          kind: "overview",
+          branchId: "company-identity",
+          customerVisible: true,
+        },
+        {
+          id: "leaf-1",
+          kind: "leaf",
+          branchId: "products-services",
+          customerVisible: true,
+        },
+      ]);
+      expect(
+        projected.documents.some((document) =>
+          ["readme", "evidence", "index"].includes(document.kind || ""),
+        ),
+      ).toBe(false);
+      expect(projected.assets).toEqual([
+        expect.objectContaining({
+          id: "asset-1",
+          branchId: "company-identity",
+          documentIds: ["overview-1"],
+          assetType: "brand_identity",
+          displayRole: "badge",
+        }),
+      ]);
+    } finally {
+      await removeStoredKnowledgeAssets(projected.storedAssetKeys);
+    }
+  });
+
+  it("ignores v4 bookkeeping drift, missing hidden files, and non-first-party images", async () => {
+    const source = await buildWebsiteKnowledgeImportV4Fixture({
+      includeImage: true,
+      mutate: ({ entries, manifest }) => {
+        entries.delete("README.md");
+        entries.delete("evidence/source-1.md");
+        manifest.candidateContractVersion = 99;
+        manifest.allPaths = ["invented/path.md"];
+        manifest.counts.totalFiles = 999;
+        manifest.assets[0].ownership = "third_party";
+      },
+    });
+    const canonical = await canonicalizeWebsiteKnowledgeImportArchive(
+      source.buffer,
+    );
+    const projected = await projectWebsiteKnowledgeImportArchiveV4({
+      buffer: canonical.buffer,
+      snapshotId: "website-v4-bookkeeping-drift",
+    });
+    try {
+      expect(projected.documents.map((document) => document.id)).toEqual([
+        "overview-1",
+        "leaf-1",
+      ]);
+      expect(projected.assets).toEqual([]);
+    } finally {
+      await removeStoredKnowledgeAssets(projected.storedAssetKeys);
+    }
+  });
+
+  it("keeps evidence paths hidden even when manifest metadata marks them as visible leaves", async () => {
+    const source = await buildWebsiteKnowledgeImportV4Fixture({
+      mutate: ({ manifest }) => {
+        const evidence = manifest.documents.find(
+          (document: Record<string, unknown>) =>
+            document.path === "evidence/source-1.md",
+        );
+        evidence.kind = "leaf";
+        evidence.customerVisible = true;
+      },
+    });
+    const canonical = await canonicalizeWebsiteKnowledgeImportArchive(
+      source.buffer,
+    );
+    const projected = await projectWebsiteKnowledgeImportArchiveV4({
+      buffer: canonical.buffer,
+      snapshotId: "website-v4-evidence-path-hidden",
+    });
+    try {
+      expect(projected.documents.map((document) => document.id)).toEqual([
+        "overview-1",
+        "leaf-1",
+      ]);
+      expect(
+        projected.documents.some(
+          (document) => document.path.toLowerCase() === "evidence/source-1.md",
+        ),
+      ).toBe(false);
+    } finally {
+      await removeStoredKnowledgeAssets(projected.storedAssetKeys);
+    }
+  });
+
+  it("normalizes reserved paths before hiding visible documents and building the extractor", async () => {
+    const source = await buildWebsiteKnowledgeImportV4Fixture({
+      mutate: ({ entries, manifest }) => {
+        const reservedPath = "ＲｅＡＤＭｅ.md";
+        entries.set(reservedPath, entries.get("README.md")!);
+        entries.delete("README.md");
+        const readme = manifest.documents.find(
+          (document: Record<string, unknown>) => document.path === "README.md",
+        );
+        readme.path = reservedPath;
+        readme.kind = "leaf";
+        readme.customerVisible = true;
+      },
+    });
+    const canonical = await canonicalizeWebsiteKnowledgeImportArchive(
+      source.buffer,
+    );
+    const projected = await projectWebsiteKnowledgeImportArchiveV4({
+      buffer: canonical.buffer,
+      snapshotId: "website-v4-normalized-reserved-path-hidden",
+    });
+    try {
+      expect(projected.documents.map((document) => document.id)).toEqual([
+        "overview-1",
+        "leaf-1",
+      ]);
+      expect(
+        projected.documents.some((document) => document.id === "readme-1"),
+      ).toBe(false);
+    } finally {
+      await removeStoredKnowledgeAssets(projected.storedAssetKeys);
+    }
+  });
+
+  it("keeps usable v4 text when an individual image or document is invalid", async () => {
+    const source = await buildWebsiteKnowledgeImportV4Fixture({
+      includeImage: true,
+      mutate: ({ entries }) => {
+        entries.set(
+          "09_media_assets/brand_identity/asset-1.png",
+          Buffer.from("not-an-image", "utf8"),
+        );
+        entries.delete("03_products/product.md");
+      },
+    });
+    const canonical = await canonicalizeWebsiteKnowledgeImportArchive(
+      source.buffer,
+    );
+    const projected = await projectWebsiteKnowledgeImportArchiveV4({
+      buffer: canonical.buffer,
+      snapshotId: "website-v4-partial",
+    });
+    try {
+      expect(projected.documents.map((document) => document.id)).toEqual([
+        "overview-1",
+      ]);
+      expect(projected.assets).toEqual([]);
+    } finally {
+      await removeStoredKnowledgeAssets(projected.storedAssetKeys);
+    }
+  });
+
+  it("rejects v4 only when its manifest is unrecognized or no displayable text remains", async () => {
+    const empty = await buildWebsiteKnowledgeImportV4Fixture({
+      mutate: ({ entries }) => {
+        entries.delete("01_company_overview/00_overview.md");
+        entries.delete("03_products/product.md");
+      },
+    });
+    const emptyCanonical = await canonicalizeWebsiteKnowledgeImportArchive(
+      empty.buffer,
+    );
+    await expect(
+      projectWebsiteKnowledgeImportArchiveV4({
+        buffer: emptyCanonical.buffer,
+        snapshotId: "website-v4-empty",
+      }),
+    ).rejects.toThrow("没有可安全展示的正式正文");
+
+    const wrongProfile = await buildWebsiteKnowledgeImportV4Fixture({
+      mutate: ({ manifest }) => {
+        manifest.profile = "dashboard-enterprise-v1";
+      },
+    });
+    await expect(
+      canonicalizeWebsiteKnowledgeImportArchive(wrongProfile.buffer),
+    ).rejects.toThrow("合同无法识别");
   });
 
   it.each([
