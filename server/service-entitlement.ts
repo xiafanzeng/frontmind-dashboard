@@ -4488,6 +4488,13 @@ function comparableQuestionText(value: string) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
 
+function mutationAffectedRows(value: unknown) {
+  const header = Array.isArray(value) ? value[0] : value;
+  return Number(
+    (header as { affectedRows?: number } | null)?.affectedRows ?? 0,
+  );
+}
+
 export function countReservedQuestionUsage(
   questions: Array<
     Pick<
@@ -5104,6 +5111,20 @@ export async function confirmWorkspaceBrandKeywordSelection(
         ),
       )
       .for("update");
+    const canonicalCandidateKey = `brand-keyword:${input.tableId}:${input.rowIndex}`;
+    const canonicalSourceTaskId = `dashboard:${input.dashboardRevision}`;
+    const generationRows = await tx
+      .select()
+      .from(workspaceQuestions)
+      .where(
+        and(
+          eq(workspaceQuestions.userId, input.userId),
+          eq(workspaceQuestions.quotaPeriodId, questionStoragePeriod.id),
+          eq(workspaceQuestions.sourceTaskId, canonicalSourceTaskId),
+          eq(workspaceQuestions.candidateKey, canonicalCandidateKey),
+        ),
+      )
+      .for("update");
     const comparable = comparableQuestionText(resolved.selection.question);
     const comparableRows = activeRows.filter(
       (row) => comparableQuestionText(row.question) === comparable,
@@ -5117,6 +5138,18 @@ export async function confirmWorkspaceBrandKeywordSelection(
       comparableRows.find(
         (row) => row.quotaPeriodId === questionStoragePeriod.id,
       );
+    const canonicalGeneration = generationRows[0];
+    if (
+      generationRows.length > 1 ||
+      (canonicalGeneration?.status !== undefined &&
+        canonicalGeneration.status !== "archived" &&
+        canonicalGeneration.id !== existing?.id)
+    ) {
+      throw new ServiceEntitlementError(
+        "QUESTION_GENERATION_CONFLICT",
+        "该品牌词库问题已有其他活动记录，请刷新后重试。",
+      );
+    }
     if (existing?.status === "selected") {
       if (existing.category !== resolved.selection.category) {
         throw new ServiceEntitlementError(
@@ -5182,6 +5215,34 @@ export async function confirmWorkspaceBrandKeywordSelection(
       return toPublicWorkspaceQuestion(updatedQuestion);
     }
 
+    if (canonicalGeneration?.status === "archived") {
+      const retiredCandidateKey = `${canonicalCandidateKey}:archived:${canonicalGeneration.id}`;
+      const retirementResult = await tx
+        .update(workspaceQuestions)
+        .set({
+          candidateKey: retiredCandidateKey,
+          revision: canonicalGeneration.revision + 1,
+          updatedAt: selectedAt,
+        })
+        .where(
+          and(
+            eq(workspaceQuestions.id, canonicalGeneration.id),
+            eq(workspaceQuestions.userId, input.userId),
+            eq(workspaceQuestions.quotaPeriodId, questionStoragePeriod.id),
+            eq(workspaceQuestions.sourceTaskId, canonicalSourceTaskId),
+            eq(workspaceQuestions.candidateKey, canonicalCandidateKey),
+            eq(workspaceQuestions.status, "archived"),
+            eq(workspaceQuestions.revision, canonicalGeneration.revision),
+          ),
+        );
+      if (mutationAffectedRows(retirementResult) !== 1) {
+        throw new ServiceEntitlementError(
+          "QUESTION_GENERATION_CONFLICT",
+          "品牌词库历史记录已更新，请刷新后重试。",
+        );
+      }
+    }
+
     const question: WorkspaceQuestion = {
       id: randomUUID(),
       userId: input.userId,
@@ -5189,7 +5250,7 @@ export async function confirmWorkspaceBrandKeywordSelection(
       quotaPeriodId: questionStoragePeriod.id,
       externalQuestionId: null,
       sourceQuestionId: null,
-      candidateKey: `brand-keyword:${input.tableId}:${input.rowIndex}`,
+      candidateKey: canonicalCandidateKey,
       category: resolved.selection.category,
       question: resolved.selection.question,
       intent: null,
@@ -5208,7 +5269,7 @@ export async function confirmWorkspaceBrandKeywordSelection(
       selectionApprovedAt: selectedAt,
       selectionApprovedByUserId: input.actorUserId,
       locked: true,
-      sourceTaskId: `dashboard:${input.dashboardRevision}`,
+      sourceTaskId: canonicalSourceTaskId,
       knowledgeSnapshotId: null,
       ordinal: activeRows.length,
       revision: 1,

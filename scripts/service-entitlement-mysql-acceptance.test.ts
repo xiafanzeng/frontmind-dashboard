@@ -15,8 +15,12 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   deliveryTicketEvents,
   deliveryTickets,
+  knowledgeBaseBuilds,
+  knowledgeBaseSnapshots,
+  responseLogicEntries,
   serviceContracts,
   serviceQuotaPeriods,
+  userDashboardContents,
   workspaceQuestions,
 } from "../drizzle/schema";
 import { DELIVERY_TICKET_LIMITS } from "../shared/delivery-ticket";
@@ -27,6 +31,7 @@ vi.mock("../server/db", () => ({ getDb: dependencies.getDb }));
 
 import {
   assertQuestionSelectionWithinQuota,
+  confirmWorkspaceBrandKeywordSelection,
   createServiceQuotaWindows,
   getServiceContractTermEnd,
   getServicePortal,
@@ -644,5 +649,276 @@ mysqlDescribe("service-entitlement real MySQL 8.4 acceptance", () => {
       .from(deliveryTicketEvents)
       .where(eq(deliveryTicketEvents.ticketId, ticketId));
     expect(repeatedEvents).toHaveLength(1);
+  }, 60_000);
+
+  it("retires archived brand-keyword generations and creates one clean replacement", async () => {
+    const userId = await insertUser("brand-keyword-reselect");
+    const selectedAt = new Date("2026-08-19T15:36:00.000Z");
+    const contract = await createProgressiveLuxuryContract({
+      userId,
+      startsAt: new Date("2026-08-01T00:00:00.000Z"),
+      sourceReference: `brand-keyword-reselect-${runId}`,
+      now: selectedAt,
+    });
+    const dashboardRevision = 1;
+    const tableId = "问题列表-1";
+    const rowIndex = 0;
+    const question = "国内第三方软件测评机构推荐";
+    const category = "industry" as const;
+    const canonicalCandidateKey = `brand-keyword:${tableId}:${rowIndex}`;
+    const canonicalSourceTaskId = `dashboard:${dashboardRevision}`;
+
+    await executor.insert(userDashboardContents).values({
+      userId,
+      revision: dashboardRevision,
+      updatedByUserId: userId,
+      payload: {
+        brandName: "一航网络",
+        headline: "一航网络品牌看板",
+        keywordTables: [
+          {
+            id: tableId,
+            title: "品牌全域词库",
+            columns: ["序号", "问题", "主分类", "问题细分"],
+            rows: [["1", question, "行业排名词", "机构推荐"]],
+          },
+        ],
+      },
+    });
+
+    const knowledgeBuildId = randomUUID();
+    const knowledgeSnapshotId = randomUUID();
+    const knowledgeRevision = 8;
+    const knowledgeTaskId = `kb-package-task-${runId}`;
+    const knowledgeDescriptorHash = "d".repeat(64);
+    const knowledgeArchiveHash = "a".repeat(64);
+    const knowledgeBuildCreatedAt = new Date("2026-08-01T01:00:00.000Z");
+    const knowledgePublishedAt = new Date("2026-08-02T00:00:00.000Z");
+    await executor.insert(knowledgeBaseSnapshots).values({
+      id: knowledgeSnapshotId,
+      userId,
+      version: 1,
+      sourceFileName: "authenticated-knowledge-acceptance.zip",
+      sourceBuildId: knowledgeBuildId,
+      sourceBuildRevision: knowledgeRevision,
+      sourceTaskId: knowledgeTaskId,
+      sourceArtifactHash: knowledgeDescriptorHash,
+      archiveHash: knowledgeArchiveHash,
+      documents: [],
+      assets: [],
+      status: "active",
+      createdByUserId: userId,
+      createdAt: knowledgePublishedAt,
+    });
+    await executor.insert(knowledgeBaseBuilds).values({
+      id: knowledgeBuildId,
+      userId,
+      conversationId: `kb-conversation-${runId}`,
+      companyName: "一航网络",
+      upstreamTaskId: knowledgeTaskId,
+      status: "published",
+      revision: knowledgeRevision,
+      currentLeafId: null,
+      totalNodeCount: knowledgeRevision,
+      confirmedCount: knowledgeRevision,
+      directPrefilledCount: 0,
+      needsVerificationCount: 0,
+      packageRevision: knowledgeRevision,
+      packageTaskId: knowledgeTaskId,
+      packageDescriptorHash: knowledgeDescriptorHash,
+      publishedSnapshotId: knowledgeSnapshotId,
+      treePolicyVersion: 1,
+      createdAt: knowledgeBuildCreatedAt,
+      completedAt: knowledgePublishedAt,
+      publishedAt: knowledgePublishedAt,
+    });
+
+    const authenticatedPortal = await getServicePortal(userId, {
+      now: selectedAt,
+    });
+    expect(authenticatedPortal.knowledge).toMatchObject({
+      version: 1,
+      authenticatedVersion: 1,
+      authenticatedForCurrentService: true,
+      status: "display_ready",
+    });
+
+    const select = (now: Date) =>
+      confirmWorkspaceBrandKeywordSelection({
+        userId,
+        actorUserId: userId,
+        dashboardRevision,
+        tableId,
+        rowIndex,
+        expectedQuestion: question,
+        expectedCategory: category,
+        now,
+      });
+    const archive = async (questionId: string, revision: number, now: Date) => {
+      const [result] = await pool.execute<ResultSetHeader>(
+        `UPDATE workspace_questions
+         SET status = 'archived', locked = 0, archivedAt = ?,
+             revision = revision + 1, updatedAt = ?
+         WHERE id = ? AND revision = ?`,
+        [now, now, questionId, revision],
+      );
+      expect(result.affectedRows).toBe(1);
+    };
+
+    const first = await select(selectedAt);
+    expect(first).toMatchObject({
+      category,
+      question,
+      status: "selected",
+      selectionApprovalStatus: "approved",
+      locked: true,
+      revision: 1,
+    });
+    const [firstPersisted] = await executor
+      .select()
+      .from(workspaceQuestions)
+      .where(eq(workspaceQuestions.id, first.id));
+    expect(firstPersisted).toMatchObject({
+      candidateKey: canonicalCandidateKey,
+      sourceTaskId: canonicalSourceTaskId,
+      sourceQuestionId: null,
+    });
+
+    const oldConversationId = `response-logic-conversation-${runId}`;
+    const oldTaskId = `response-logic-task-${runId}`;
+    await executor.insert(responseLogicEntries).values({
+      id: randomUUID(),
+      userId,
+      questionId: first.id,
+      groupId: "industry",
+      groupTitle: "行业排名词",
+      question,
+      intent: "旧问题意图",
+      summary: "旧应答逻辑摘要",
+      conversationId: oldConversationId,
+      lastTaskId: oldTaskId,
+      draft: {
+        concern: "旧问题关切",
+        conclusion: "旧问题结论",
+        facts: "旧问题事实",
+        pending: "",
+        boundaries: "旧问题边界",
+        references: "",
+        images: [],
+        attachments: [],
+      },
+      status: "draft",
+      revision: 3,
+    });
+
+    const firstArchivedAt = new Date("2026-08-19T15:37:00.000Z");
+    await archive(first.id, first.revision, firstArchivedAt);
+    const concurrentAt = new Date("2026-08-19T15:38:00.000Z");
+    const [concurrentLeft, concurrentRight] = await Promise.all([
+      select(concurrentAt),
+      select(concurrentAt),
+    ]);
+    expect(concurrentLeft.id).toBe(concurrentRight.id);
+    const second = concurrentLeft;
+    expect(second.id).not.toBe(first.id);
+
+    const [firstAfterReselect, secondPersisted] = await Promise.all([
+      executor
+        .select()
+        .from(workspaceQuestions)
+        .where(eq(workspaceQuestions.id, first.id))
+        .then((rows) => rows[0]),
+      executor
+        .select()
+        .from(workspaceQuestions)
+        .where(eq(workspaceQuestions.id, second.id))
+        .then((rows) => rows[0]),
+    ]);
+    expect(firstAfterReselect).toMatchObject({
+      status: "archived",
+      locked: false,
+      candidateKey: `${canonicalCandidateKey}:archived:${first.id}`,
+      revision: first.revision + 2,
+      archivedAt: firstArchivedAt,
+    });
+    expect(secondPersisted).toMatchObject({
+      candidateKey: canonicalCandidateKey,
+      sourceTaskId: canonicalSourceTaskId,
+      sourceQuestionId: null,
+      intent: null,
+      rationale: null,
+      evidence: [],
+      risks: [],
+      knowledgeSnapshotId: null,
+      status: "selected",
+      selectionApprovalStatus: "approved",
+      locked: true,
+      revision: 1,
+    });
+
+    const oldResponseLogic = await executor
+      .select()
+      .from(responseLogicEntries)
+      .where(eq(responseLogicEntries.userId, userId));
+    expect(oldResponseLogic).toHaveLength(1);
+    expect(oldResponseLogic[0]).toMatchObject({
+      questionId: first.id,
+      conversationId: oldConversationId,
+      lastTaskId: oldTaskId,
+      revision: 3,
+    });
+    expect(oldResponseLogic[0]?.questionId).not.toBe(second.id);
+
+    const secondArchivedAt = new Date("2026-08-19T15:39:00.000Z");
+    await archive(second.id, second.revision, secondArchivedAt);
+    const third = await select(new Date("2026-08-19T15:40:00.000Z"));
+    expect(third.id).not.toBe(first.id);
+    expect(third.id).not.toBe(second.id);
+    await expect(
+      select(new Date("2026-08-19T15:41:00.000Z")),
+    ).resolves.toMatchObject({ id: third.id, revision: third.revision });
+
+    const allGenerations = await executor
+      .select()
+      .from(workspaceQuestions)
+      .where(eq(workspaceQuestions.userId, userId));
+    expect(allGenerations).toHaveLength(3);
+    const generationsById = new Map(
+      allGenerations.map((row) => [row.id, row] as const),
+    );
+    expect(generationsById.get(first.id)).toMatchObject({
+      candidateKey: `${canonicalCandidateKey}:archived:${first.id}`,
+      status: "archived",
+    });
+    expect(generationsById.get(second.id)).toMatchObject({
+      candidateKey: `${canonicalCandidateKey}:archived:${second.id}`,
+      status: "archived",
+    });
+    expect(generationsById.get(third.id)).toMatchObject({
+      candidateKey: canonicalCandidateKey,
+      status: "selected",
+    });
+
+    const responseLogicAfterBothReselections = await executor
+      .select()
+      .from(responseLogicEntries)
+      .where(eq(responseLogicEntries.userId, userId));
+    expect(responseLogicAfterBothReselections).toHaveLength(1);
+    expect(responseLogicAfterBothReselections[0]).toMatchObject({
+      questionId: first.id,
+      conversationId: oldConversationId,
+      lastTaskId: oldTaskId,
+      revision: 3,
+    });
+
+    const portal = await getServicePortal(userId, {
+      now: new Date("2026-08-19T15:41:00.000Z"),
+    });
+    expect(portal.quotas?.usage).toMatchObject({
+      industry: 1,
+      total: 1,
+    });
+    expect(portal.purchasedQuestions).toHaveLength(1);
+    expect(portal.purchasedQuestions[0]?.id).toBe(third.id);
   }, 60_000);
 });
