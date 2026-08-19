@@ -517,6 +517,10 @@ describe("ResponseLogicWorkspace", () => {
     expect(projected).not.toBe(message);
     expect(projected.content).toContain("平台支持 200 个模型");
     expect(projected.content).toContain("引自知识库文档");
+    expect(projected.content).toContain(
+      "## 企业材料/官方依据（引自知识库文档）",
+    );
+    expect(projected.content).not.toMatch(/^## 企业材料\/官方依据$/mu);
     expect(projected.content).not.toContain("引用与核验规则");
     expect(projected.content).not.toMatch(
       /FINAL\.zip|knowledge_base|待补充\/待确认|本轮确认/u,
@@ -1058,31 +1062,72 @@ describe("ResponseLogicWorkspace", () => {
     ).toBeNull();
   });
 
-  it("expands and restores the dialogue without remounting the active conversation", async () => {
+  it("expands and restores the complete workspace without remounting its inputs", async () => {
+    document.body.style.overflow = "auto";
+    document.documentElement.style.overflow = "scroll";
     const { container } = render(<WorkspaceHarness />);
     const composer =
       await screen.findByPlaceholderText("补充企业事实、修改意见或待核验资料…");
+    const facts = screen.getByLabelText(/企业材料\/官方依据（引自知识库文档）/);
+    const workspace = container.querySelector(".response-logic-workspace");
+    const questionNavigator = container.querySelector(".rl-question-nav");
+    const questionList = container.querySelector(".rl-question-list");
+    const questionContext = container.querySelector(".rl-question-context");
+    const dialogue = container.querySelector(".rl-dialogue-card");
+    const editor = container.querySelector(".rl-editor-card");
+    const editorScroll = container.querySelector(".rl-editor-scroll");
     fireEvent.change(composer, { target: { value: "尚未发送的修改内容" } });
+    fireEvent.change(facts, { target: { value: "尚未确认的知识库事实" } });
+    if (questionList) questionList.scrollTop = 31;
+    if (editorScroll) editorScroll.scrollTop = 47;
 
-    fireEvent.click(screen.getByRole("button", { name: "全屏显示对话区" }));
+    fireEvent.click(screen.getByRole("button", { name: "进入全屏" }));
+    expect(workspace).toHaveClass("rl-workspace-expanded");
+    expect(screen.getByRole("button", { name: "退出全屏" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     expect(
-      container
-        .querySelector(".rl-work-columns")
-        ?.classList.contains("dialogue-expanded"),
-    ).toBe(true);
-    expect(screen.getByRole("button", { name: "退出对话全屏" })).toBeTruthy();
+      screen.getByRole("heading", { name: "应答逻辑智能体" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "需求记录" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "提交应答逻辑修改需求" }),
+    ).toBeTruthy();
+    expect(screen.getByText("待优化问题")).toBeTruthy();
+    expect(container.querySelector(".rl-question-nav")).toBe(questionNavigator);
+    expect(container.querySelector(".rl-question-context")).toBe(
+      questionContext,
+    );
+    expect(container.querySelector(".rl-dialogue-card")).toBe(dialogue);
+    expect(container.querySelector(".rl-editor-card")).toBe(editor);
     expect(
       screen.getByPlaceholderText("补充企业事实、修改意见或待核验资料…"),
     ).toBe(composer);
     expect((composer as HTMLTextAreaElement).value).toBe("尚未发送的修改内容");
+    expect(screen.getByLabelText(/企业材料\/官方依据（引自知识库文档）/)).toBe(
+      facts,
+    );
+    expect((facts as HTMLTextAreaElement).value).toBe("尚未确认的知识库事实");
+    expect(document.body.style.overflow).toBe("hidden");
+    expect(document.documentElement.style.overflow).toBe("hidden");
 
-    fireEvent.click(screen.getByRole("button", { name: "退出对话全屏" }));
-    expect(
-      container
-        .querySelector(".rl-work-columns")
-        ?.classList.contains("dialogue-expanded"),
-    ).toBe(false);
-    expect(screen.getByRole("button", { name: "全屏显示对话区" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(workspace).not.toHaveClass("rl-workspace-expanded");
+    expect(screen.getByRole("button", { name: "进入全屏" })).toBeTruthy();
+    expect(document.body.style.overflow).toBe("auto");
+    expect(document.documentElement.style.overflow).toBe("scroll");
+
+    fireEvent.click(screen.getByRole("button", { name: "进入全屏" }));
+    fireEvent.click(screen.getByRole("button", { name: "退出全屏" }));
+    expect(workspace).not.toHaveClass("rl-workspace-expanded");
+    expect(screen.getByRole("button", { name: "进入全屏" })).toBeTruthy();
+    expect(screen.getByLabelText(/企业材料\/官方依据/)).toBe(facts);
+    expect(questionList?.scrollTop).toBe(31);
+    expect(editorScroll?.scrollTop).toBe(47);
+
+    document.body.style.overflow = "";
+    document.documentElement.style.overflow = "";
   });
 
   it("renders confirmed response logic as Markdown without pending or internal source details", () => {
@@ -1118,6 +1163,11 @@ describe("ResponseLogicWorkspace", () => {
     expect(screen.queryByText("不应展示的待确认内容")).toBeNull();
     expect(screen.queryByText("引用与核验规则及图文依据")).toBeNull();
     expect(screen.queryByText("图文依据")).toBeNull();
+    expect(
+      screen.getByRole("heading", {
+        name: "企业材料/官方依据（引自知识库文档）",
+      }),
+    ).toBeInTheDocument();
     expect(container.textContent).not.toContain("FINAL.zip");
     expect(container.textContent).not.toContain("products/3.2.md");
   });

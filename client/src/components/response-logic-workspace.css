@@ -12,6 +12,63 @@
   font-family: var(--fm-font-ui);
 }
 
+.response-logic-workspace.rl-workspace-expanded {
+  position: fixed;
+  z-index: 40;
+  inset: 0 0 0 var(--dashboard-nav-width, 0px);
+  display: flex;
+  width: auto;
+  max-width: none;
+  height: 100dvh;
+  min-height: 0;
+  flex-direction: column;
+  margin: 0;
+  padding: 16px 18px;
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background:
+    radial-gradient(circle at 35% 0%, rgba(91, 42, 134, 0.08), transparent 32%),
+    var(--bg, #f6f3f8);
+  box-shadow: -12px 0 30px rgba(33, 19, 58, 0.08);
+}
+
+.response-logic-workspace.rl-workspace-expanded > .rl-page-header,
+.response-logic-workspace.rl-workspace-expanded > .rl-update-notice {
+  flex: 0 0 auto;
+}
+
+.response-logic-workspace.rl-workspace-expanded > .rl-page-header {
+  margin-bottom: 12px;
+}
+
+.response-logic-workspace.rl-workspace-expanded > .rl-layout {
+  flex: 1 1 0;
+  min-height: 0;
+  align-items: stretch;
+  overflow: hidden;
+}
+
+.response-logic-workspace.rl-workspace-expanded .rl-question-nav {
+  position: static;
+  height: 100%;
+  max-height: none;
+}
+
+.response-logic-workspace.rl-workspace-expanded .rl-agent-area {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.response-logic-workspace.rl-workspace-expanded .rl-question-context {
+  margin-bottom: 10px;
+}
+
+.response-logic-workspace.rl-workspace-expanded .rl-work-columns {
+  height: auto;
+  min-height: 0;
+}
+
 .response-logic-workspace [data-tone="plum"] {
   --rl-category-accent: var(--fm-question-reputation-accent, #8b4d83);
   --rl-category-tint: var(--fm-question-reputation-tint, #f8eef6);
@@ -390,14 +447,6 @@
   min-height: 0;
 }
 
-.rl-work-columns.dialogue-expanded {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.rl-work-columns.dialogue-expanded .rl-editor-card {
-  display: none;
-}
-
 .rl-dialogue-card,
 .rl-editor-card {
   position: relative;
@@ -429,7 +478,7 @@
 }
 
 .rl-dialogue-card > .rl-card-title {
-  padding-right: 305px;
+  padding-right: 370px;
 }
 
 .rl-dialogue-expand {
@@ -437,10 +486,14 @@
   z-index: 3;
   top: 18px;
   right: 16px;
-  display: grid;
-  width: 33px;
+  display: inline-flex;
+  width: auto;
+  min-width: 92px;
   height: 33px;
-  place-items: center;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
   border: 1px solid #d8c7e2;
   border-radius: 9px;
   background: #fff;
@@ -676,7 +729,7 @@
   position: absolute;
   z-index: 2;
   top: 19px;
-  right: 58px;
+  right: 122px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -700,7 +753,7 @@
   .rl-dialogue-card > .rl-card-title {
     align-items: flex-start;
     min-height: 118px;
-    padding-right: 56px;
+    padding-right: 122px;
     padding-bottom: 55px;
   }
 
@@ -1489,6 +1542,23 @@ fieldset.rl-editor-scroll:disabled select {
   .rl-question-list-title {
     grid-column: 1 / -1;
   }
+
+  .response-logic-workspace.rl-workspace-expanded > .rl-layout {
+    align-items: start;
+    overflow-y: auto;
+  }
+
+  .response-logic-workspace.rl-workspace-expanded .rl-question-nav {
+    height: auto;
+  }
+
+  .response-logic-workspace.rl-workspace-expanded .rl-agent-area {
+    display: block;
+  }
+
+  .response-logic-workspace.rl-workspace-expanded .rl-work-columns {
+    height: 720px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1562,6 +1632,19 @@ fieldset.rl-editor-scroll:disabled select {
   }
 }
 
+@media (max-width: 900px) {
+  .response-logic-workspace.rl-workspace-expanded .rl-work-columns {
+    height: auto;
+  }
+}
+
+@media (max-width: 768px) {
+  .response-logic-workspace.rl-workspace-expanded {
+    inset: 0;
+    padding: 64px 14px 18px;
+  }
+}
+
 @media (max-width: 480px) {
   .rl-page-header-with-action,
   .rl-card-title {
@@ -1575,7 +1658,7 @@ fieldset.rl-editor-scroll:disabled select {
 
   .rl-dialogue-card > .rl-card-title {
     min-height: 69px;
-    padding-right: 56px;
+    padding-right: 122px;
     padding-bottom: 13px;
   }
 

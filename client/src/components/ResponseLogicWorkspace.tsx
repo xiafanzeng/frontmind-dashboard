@@ -107,6 +107,8 @@ export interface IntentQuestionGroup {
  * router.
  */
 const EMPTY_QUESTION_GROUPS: IntentQuestionGroup[] = [];
+const RESPONSE_LOGIC_FACTS_DISPLAY_HEADING =
+  "企业材料/官方依据（引自知识库文档）";
 
 type LogicImage = ResponseLogicImage;
 type LogicDraft = ResponseLogicDraft;
@@ -516,7 +518,10 @@ export function projectResponseLogicConversationMessage(
   return {
     ...message,
     content: message.content
-      ? projectResponseLogicAssistantMarkdown(message.content)
+      ? projectResponseLogicAssistantMarkdown(message.content).replace(
+          /^##[ \t]+企业材料\/官方依据[ \t]*$/mu,
+          `## ${RESPONSE_LOGIC_FACTS_DISPLAY_HEADING}`,
+        )
       : message.content,
     attachments: message.attachments?.map((attachment) => ({
       ...attachment,
@@ -1223,7 +1228,27 @@ function ResponseLogicWorkspaceContent({
   const [isPublishing, setIsPublishing] = useState(false);
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
   const [requestHistoryOpen, setRequestHistoryOpen] = useState(false);
-  const [dialogueExpanded, setDialogueExpanded] = useState(false);
+  const [workspaceExpanded, setWorkspaceExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!workspaceExpanded) return;
+
+    const bodyOverflow = document.body.style.overflow;
+    const documentOverflow = document.documentElement.style.overflow;
+    const exitOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setWorkspaceExpanded(false);
+    };
+
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    document.addEventListener("keydown", exitOnEscape);
+
+    return () => {
+      document.removeEventListener("keydown", exitOnEscape);
+      document.body.style.overflow = bodyOverflow;
+      document.documentElement.style.overflow = documentOverflow;
+    };
+  }, [workspaceExpanded]);
 
   useEffect(
     () => () => {
@@ -1682,7 +1707,9 @@ function ResponseLogicWorkspaceContent({
   };
 
   return (
-    <section className="response-logic-workspace page-shell">
+    <section
+      className={`response-logic-workspace page-shell ${workspaceExpanded ? "rl-workspace-expanded" : ""}`}
+    >
       <header className="rl-page-header rl-page-header-with-action">
         <div>
           <span className="rl-eyebrow">MindPromise 智诺 · 应答逻辑智能体</span>
@@ -1755,9 +1782,7 @@ function ResponseLogicWorkspaceContent({
             group={selectedEntry.group}
             question={selectedEntry.question}
           />
-          <div
-            className={`rl-work-columns ${dialogueExpanded ? "dialogue-expanded" : ""}`}
-          >
+          <div className="rl-work-columns">
             <DialoguePanel
               preview={preview}
               PreviewDialogueComponent={previewAdapter?.Dialogue}
@@ -1773,9 +1798,9 @@ function ResponseLogicWorkspaceContent({
               lastTaskRevision={persistedRecord?.revision}
               lastTaskRecordedAt={persistedRecord?.updatedAt}
               readOnly={Boolean(confirmed)}
-              expanded={dialogueExpanded}
+              expanded={workspaceExpanded}
               onToggleExpanded={() =>
-                setDialogueExpanded((expanded) => !expanded)
+                setWorkspaceExpanded((expanded) => !expanded)
               }
               onConversationIdChange={bindConversation}
               onLoadLatestReply={loadModelReply}
@@ -2002,12 +2027,13 @@ function DialoguePanel({
         <button
           type="button"
           className="rl-dialogue-expand"
-          aria-label={expanded ? "退出对话全屏" : "全屏显示对话区"}
+          aria-label={expanded ? "退出全屏" : "进入全屏"}
           aria-pressed={expanded}
-          title={expanded ? "退出对话全屏" : "全屏显示对话区"}
+          title={expanded ? "退出全屏" : "进入全屏"}
           onClick={onToggleExpanded}
         >
           {expanded ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+          <span>{expanded ? "退出全屏" : "进入全屏"}</span>
         </button>
       </div>
       {preview && PreviewDialogueComponent ? (
@@ -2792,7 +2818,7 @@ function LogicEditor({
         />
         <EditorField
           index="03"
-          label="企业材料/官方依据"
+          label={RESPONSE_LOGIC_FACTS_DISPLAY_HEADING}
           hint="事实依据每行一项，后续应与可追溯来源一一对应"
           value={draft.facts}
           onChange={(facts) => onPatch({ facts })}
@@ -3047,7 +3073,7 @@ export function ResponseLogicConfirmationPanel({
         />
         <LogicSection
           number="02"
-          title="事实依据"
+          title={RESPONSE_LOGIC_FACTS_DISPLAY_HEADING}
           content={publicLogic.facts}
         />
         <LogicSection

@@ -444,6 +444,12 @@ describe("response logic execution contract", () => {
     expect(prompt).not.toContain("知识库版本：V3");
     expect(prompt).not.toContain("这里是已经确认的企业事实");
     expect(prompt).not.toContain("企业事实确认表.pdf");
+    expect(prompt).toContain("企业负责人能快速看懂的简体中文");
+    expect(prompt).toContain("800–1600 个中文字符");
+    expect(prompt).toContain("同一事实、建议或限制只在最合适的一栏出现一次");
+    expect(prompt).toContain("企业材料/官方依据（引自知识库文档）");
+    expect(prompt).toContain("四个字段正文均不得再写该来源短语");
+    expect(prompt.match(/引自知识库文档/gu)).toHaveLength(1);
     expect(prompt).toContain("不得输出内部思考");
     expect(upstreamPromptCharacterCount(prompt)).toBeLessThanOrEqual(
       FRONTMIND_UPSTREAM_PROMPT_MAX_CHARACTERS,
@@ -458,12 +464,28 @@ describe("response logic execution contract", () => {
       "SKILL.md",
       "references/output-contract.md",
     ]);
-    expect(await skillZip.file("SKILL.md")!.async("string")).toContain(
-      "four fields in the v2 structured-output schema",
+    const skillText = await skillZip.file("SKILL.md")!.async("string");
+    const outputContractText = await skillZip
+      .file("references/output-contract.md")!
+      .async("string");
+    expect(skillText).toContain("企业负责人能够快速看懂并转述给客户");
+    expect(skillText).toContain("800–1600 个中文字符");
+    expect(skillText).toContain("每个事实、建议和限制只放在最合适的一个字段中");
+    expect(skillText).toContain("企业材料/官方依据（引自知识库文档）");
+    expect(skillText).toContain("任何正文内重复该来源短语");
+    expect(skillText.match(/引自知识库文档/gu)).toHaveLength(1);
+    expect(outputContractText).toContain(
+      "each fact, recommendation, or limitation appears once",
     );
-    expect(
-      await skillZip.file("references/output-contract.md")!.async("string"),
-    ).toContain("output attachments are never parsed as a fallback");
+    expect(outputContractText).toContain(
+      "Dashboard renders provenance once in the fixed title `企业材料/官方依据（引自知识库文档）`",
+    );
+    expect(outputContractText).toContain(
+      "no provenance label, heading, prefix, or parenthetical note inside the body",
+    );
+    expect(outputContractText).toContain(
+      "output attachments are never parsed as a fallback",
+    );
     expect(await evidenceZip.file("knowledge.md")!.async("string")).toContain(
       "这里是已经确认的企业事实",
     );
@@ -498,7 +520,8 @@ describe("response logic execution contract", () => {
         requiredFields: ["concern", "conclusion", "facts", "boundaries"],
         everyFieldMustBeNonEmpty: true,
         extraFieldsForbidden: true,
-        publicProvenance: "引自知识库文档。",
+        publicProvenance:
+          "由 Dashboard 固定标题“企业材料/官方依据（引自知识库文档）”统一展示；四字段正文不得添加来源标注。",
         followUpConfirmationForbidden: true,
       },
     });
