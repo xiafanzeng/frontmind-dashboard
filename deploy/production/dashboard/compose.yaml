@@ -9,6 +9,12 @@ services:
     <<: *dashboard-image
     restart: unless-stopped
     init: true
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    dns_opt:
+      - timeout:2
+      - attempts:2
     env_file:
       - ${FRONTMIND_DASHBOARD_ENV_FILE:-/etc/frontmind/dashboard.env}
     environment:

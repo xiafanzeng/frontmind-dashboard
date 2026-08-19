@@ -10,6 +10,7 @@ import {
   reserveKnowledgeBaseTurnWithAttachments,
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
+  ResponseLogicTaskStartError,
   DELIVERY_PROJECT_ASSIGNMENT_STORAGE_KEY,
   FILE_UPLOAD_IDLE_TIMEOUT_MS,
   FILE_UPLOAD_SERVER_RESPONSE_TIMEOUT_MS,
@@ -190,6 +191,7 @@ describe("createResponseLogicTask", () => {
       ],
       {
         conversationId: "conv-response-logic",
+        operationRevision: 1,
         questionId: "question-1",
         groupId: "group-1",
         groupTitle: "产品场景",
@@ -225,6 +227,230 @@ describe("createResponseLogicTask", () => {
       },
     ]);
     expect(body).not.toHaveProperty("onTaskStarted");
+    expect(body).not.toHaveProperty("onTaskStartFailed");
+  });
+
+  it("does not dispatch until the latest persisted record revision is available", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await createResponseLogicTask([], {
+      conversationId: "conv-response-logic",
+      questionId: "question-1",
+      groupId: "group-1",
+      groupTitle: "产品场景",
+      question: "如何回答？",
+      intent: "核验事实",
+      summary: "形成应答逻辑",
+      draft: {
+        concern: "",
+        conclusion: "",
+        facts: "",
+        pending: "",
+        boundaries: "",
+        references: "",
+        images: [],
+        attachments: [],
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      code: "RESPONSE_LOGIC_RECORD_NOT_READY",
+      retryable: true,
+      resetRequired: false,
+      stage: "validation",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves the structured start-failure envelope for the dedicated UI", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: async () => ({
+          error: {
+            code: "RESPONSE_LOGIC_UPSTREAM_UNAVAILABLE",
+            message: "上游服务暂时不可用，任务尚未创建，请稍后重试",
+            retryable: true,
+            resetRequired: false,
+            stage: "file_upload_intent",
+            incidentId: "incident-safe-retry",
+            retryAfterMs: 1_500,
+          },
+        }),
+      }),
+    );
+
+    const error = await createResponseLogicTask([], {
+      conversationId: "conv-response-logic",
+      operationRevision: 1,
+      questionId: "question-1",
+      groupId: "group-1",
+      groupTitle: "产品场景",
+      question: "如何回答？",
+      intent: "核验事实",
+      summary: "形成应答逻辑",
+      draft: {
+        concern: "",
+        conclusion: "",
+        facts: "",
+        pending: "",
+        boundaries: "",
+        references: "",
+        images: [],
+        attachments: [],
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ResponseLogicTaskStartError);
+    expect(error).toMatchObject({
+      status: 503,
+      code: "RESPONSE_LOGIC_UPSTREAM_UNAVAILABLE",
+      retryable: true,
+      resetRequired: false,
+      stage: "file_upload_intent",
+      incidentId: "incident-safe-retry",
+      retryAfterMs: 1_500,
+    });
+  });
+
+  it("accepts a legacy message-only failure without inventing retryability", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        json: async () => ({ message: "当前问题尚未通过审核" }),
+      }),
+    );
+
+    const error = await createResponseLogicTask([], {
+      conversationId: "conv-response-logic",
+      operationRevision: 1,
+      questionId: "question-1",
+      groupId: "group-1",
+      groupTitle: "产品场景",
+      question: "如何回答？",
+      intent: "核验事实",
+      summary: "形成应答逻辑",
+      draft: {
+        concern: "",
+        conclusion: "",
+        facts: "",
+        pending: "",
+        boundaries: "",
+        references: "",
+        images: [],
+        attachments: [],
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      status: 422,
+      code: "RESPONSE_LOGIC_START_FAILED",
+      message: "当前问题尚未通过审核",
+      retryable: false,
+      resetRequired: false,
+      stage: "response",
+    });
+  });
+
+  it("normalizes an unknown server stage instead of trusting an arbitrary value", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        json: async () => ({
+          error: {
+            code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+            message: "任务创建结果无法确认",
+            retryable: false,
+            resetRequired: true,
+            stage: "unexpected_internal_stage",
+            incidentId: "incident-unknown",
+          },
+        }),
+      }),
+    );
+
+    const error = await createResponseLogicTask([], {
+      conversationId: "conv-response-logic",
+      operationRevision: 1,
+      questionId: "question-1",
+      groupId: "group-1",
+      groupTitle: "产品场景",
+      question: "如何回答？",
+      intent: "核验事实",
+      summary: "形成应答逻辑",
+      draft: {
+        concern: "",
+        conclusion: "",
+        facts: "",
+        pending: "",
+        boundaries: "",
+        references: "",
+        images: [],
+        attachments: [],
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+      stage: "response",
+      resetRequired: true,
+    });
+  });
+
+  it("preserves a reset-required post-dispatch task binding failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        json: async () => ({
+          error: {
+            code: "RESPONSE_LOGIC_TASK_BINDING_PENDING",
+            message: "上游任务已创建，但本地绑定未完成；请申请重置后重新开始",
+            retryable: false,
+            resetRequired: true,
+            stage: "task_binding",
+            incidentId: "incident-binding",
+          },
+        }),
+      }),
+    );
+
+    const error = await createResponseLogicTask([], {
+      conversationId: "conv-response-logic",
+      operationRevision: 2,
+      questionId: "question-1",
+      groupId: "group-1",
+      groupTitle: "产品场景",
+      question: "如何回答？",
+      intent: "核验事实",
+      summary: "形成应答逻辑",
+      draft: {
+        concern: "",
+        conclusion: "",
+        facts: "",
+        pending: "",
+        boundaries: "",
+        references: "",
+        images: [],
+        attachments: [],
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      code: "RESPONSE_LOGIC_TASK_BINDING_PENDING",
+      retryable: false,
+      resetRequired: true,
+      stage: "task_binding",
+      incidentId: "incident-binding",
+    });
   });
 });
 

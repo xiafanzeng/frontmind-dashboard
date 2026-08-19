@@ -103,6 +103,7 @@ type HarnessOptions = {
   questionSelects?: Array<Array<Record<string, any>>>;
   logicSelects?: Array<Array<Record<string, any>>>;
   assignmentSelects?: Array<Array<Record<string, any>>>;
+  deleteAffectedRows?: number;
 };
 
 function createHarness(options: HarnessOptions = {}) {
@@ -143,6 +144,7 @@ function createHarness(options: HarnessOptions = {}) {
       return {
         where: async () => {
           deletes.push({ table });
+          return [{ affectedRows: options.deleteAffectedRows ?? 1 }];
         },
       };
     },
@@ -416,7 +418,7 @@ describe("submitQuestionMaintenance", () => {
     expect(harness.inserts).toHaveLength(0);
   });
 
-  it("requires a confirmed response logic before creating a reset ticket", async () => {
+  it("requires an existing response logic record before creating a reset ticket", async () => {
     const harness = createHarness({
       ticketSelects: [[]],
       questionSelects: [[question()]],
@@ -438,6 +440,43 @@ describe("submitQuestionMaintenance", () => {
       }),
     ).rejects.toThrow("没有可申请重置");
   });
+
+  it.each([
+    ["failed draft", { revision: 5, status: "draft", lastTaskId: null }],
+    ["active draft", { revision: 6, status: "draft", lastTaskId: "task-1" }],
+    [
+      "confirmed result",
+      { revision: 7, status: "confirmed", confirmed: { version: 1 } },
+    ],
+  ])("captures the exact revision for a %s reset", async (_label, logic) => {
+    const harness = createHarness({
+      ticketSelects: [[], []],
+      questionSelects: [[question()]],
+      assignmentSelects: [
+        [{ projectAssignmentId: ids.assignment, memberId: engineer.id }],
+      ],
+      logicSelects: [[logic]],
+    });
+    dependencies.getDb.mockResolvedValue(harness.db);
+
+    const result = await submitQuestionMaintenance({
+      actor: customer,
+      value: {
+        clientRequestId: ids.client,
+        questionId: ids.question,
+        action: "response_logic_reset",
+      },
+    });
+
+    expect(result.request.responseLogicRevision).toBe(logic.revision);
+    const ticket = harness.inserts.find(
+      (entry) => entry.table === deliveryTickets,
+    )?.value;
+    expect(ticket.responseLogicRevision).toBe(logic.revision);
+    expect(
+      parseQuestionMaintenancePayload(ticket.description).responseLogicRevision,
+    ).toBe(logic.revision);
+  });
 });
 
 describe("decideQuestionMaintenance", () => {
@@ -447,7 +486,7 @@ describe("decideQuestionMaintenance", () => {
       questionSelects: [[question()]],
       logicSelects:
         action === "response_logic_reset"
-          ? [[{ revision: 5, status: "confirmed", confirmed: { version: 1 } }]]
+          ? [[{ revision: 5, status: "draft", lastTaskId: "task-active" }]]
           : [],
     });
     dependencies.getDb.mockResolvedValue(harness.db);
@@ -556,7 +595,7 @@ describe("decideQuestionMaintenance", () => {
     expect(harness.deletes).toHaveLength(0);
   });
 
-  it("clears only the confirmed response logic on reset", async () => {
+  it("clears the exact active response logic revision on reset", async () => {
     const { harness, result } = await approve("response_logic_reset");
     expect(result).toMatchObject({
       decision: "approved",
@@ -572,6 +611,49 @@ describe("decideQuestionMaintenance", () => {
       status: "completed",
       publicSummary: expect.stringContaining("应答逻辑修改申请已通过"),
     });
+  });
+
+  it("fails the reset when the captured response logic revision is stale", async () => {
+    const harness = createHarness({
+      ticketSelects: [[maintenanceTicket("response_logic_reset")]],
+      questionSelects: [[question()]],
+      logicSelects: [[{ revision: 6, status: "draft" }]],
+    });
+    dependencies.getDb.mockResolvedValue(harness.db);
+
+    await expect(
+      decideQuestionMaintenance({
+        actor: engineer,
+        projectAssignmentId: ids.assignment,
+        ticketId: ids.ticket,
+        expectedRevision: 1,
+        decision: "approve",
+      }),
+    ).rejects.toThrow("应答逻辑已变更");
+    expect(harness.deletes).toHaveLength(0);
+  });
+
+  it("fails closed when the revision CAS delete loses a concurrent race", async () => {
+    const harness = createHarness({
+      ticketSelects: [[maintenanceTicket("response_logic_reset")]],
+      questionSelects: [[question()]],
+      logicSelects: [[{ revision: 5, status: "draft" }]],
+      deleteAffectedRows: 0,
+    });
+    dependencies.getDb.mockResolvedValue(harness.db);
+
+    await expect(
+      decideQuestionMaintenance({
+        actor: engineer,
+        projectAssignmentId: ids.assignment,
+        ticketId: ids.ticket,
+        expectedRevision: 1,
+        decision: "approve",
+      }),
+    ).rejects.toThrow("应答逻辑已变更");
+    expect(
+      harness.updates.some((entry) => entry.table === deliveryTickets),
+    ).toBe(false);
   });
 
   it("rejects without changing the question or response logic", async () => {

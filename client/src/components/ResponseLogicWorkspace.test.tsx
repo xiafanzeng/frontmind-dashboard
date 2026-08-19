@@ -19,7 +19,9 @@ import ResponseLogicWorkspace, {
   ResponseLogicConfirmationBoard,
   ResponseLogicConfirmationPanel,
   authoritativeResponseLogicTaskMatches,
+  canRequestResponseLogicReset,
   canReloadResponseLogicTask,
+  durableResponseLogicResetBarrier,
   fetchResponseLogicStructuredDraft,
   fetchResponseLogicTaskStatus,
   isAuthoritativeResponseLogicAssistantMessage,
@@ -31,6 +33,8 @@ import ResponseLogicWorkspace, {
   ResponseLogicTaskStatusError,
   reconcileResponseLogicDrafts,
   responseLogicPersistenceAvailability,
+  responseLogicContinuationRevision,
+  scopedResponseLogicTaskStartFailure,
   responseLogicTaskStatusIsRetryable,
   shouldHydrateResponseLogicTask,
   shouldUseResponseLogicInitialPrompt,
@@ -717,6 +721,73 @@ describe("ResponseLogicWorkspace", () => {
         loading: false,
       }),
     ).toBe(true);
+    expect(
+      canReloadResponseLogicTask({
+        taskId: "task-sequence",
+        readOnly: false,
+        loading: false,
+        resetRequired: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("scopes a delayed start failure to its exact question and conversation", () => {
+    const failure = {
+      code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+      message: "任务结果未知",
+      retryable: false,
+      resetRequired: true,
+      stage: "task_create" as const,
+      questionId: "question-a",
+      conversationId: "conversation-a",
+    };
+
+    expect(
+      scopedResponseLogicTaskStartFailure({
+        failure,
+        questionId: "question-a",
+        conversationId: "conversation-a",
+      }),
+    ).toBe(failure);
+    expect(
+      scopedResponseLogicTaskStartFailure({
+        failure,
+        questionId: "question-b",
+        conversationId: "conversation-b",
+      }),
+    ).toBeNull();
+  });
+
+  it("restores a reset-required barrier from the durable conversation after remount", () => {
+    const conversation = {
+      id: "conversation-reset-required",
+      status: "error" as const,
+      messages: [
+        {
+          id: "msg-response-logic-reset-required-1787150000000",
+          role: "assistant" as const,
+          content: "任务创建结果无法确认，请先申请重置。",
+          timestamp: 1,
+        },
+      ],
+    };
+
+    expect(
+      durableResponseLogicResetBarrier({
+        conversation,
+        questionId: "question-1",
+      }),
+    ).toMatchObject({
+      questionId: "question-1",
+      conversationId: conversation.id,
+      resetRequired: true,
+    });
+    expect(
+      durableResponseLogicResetBarrier({
+        conversation: { ...conversation, status: "running" },
+        questionId: "question-1",
+      }),
+    ).toBeNull();
   });
 
   it("keeps a dedicated 401/403 observation retryable instead of declaring a model failure", async () => {
@@ -827,6 +898,42 @@ describe("ResponseLogicWorkspace", () => {
     ).toBe(true);
   });
 
+  it("continues only with the latest persisted record revision", () => {
+    expect(
+      responseLogicContinuationRevision({
+        persistedRevision: 9,
+        activeTaskRevision: 8,
+      }),
+    ).toBe(9);
+    expect(
+      responseLogicContinuationRevision({
+        persistedRevision: undefined,
+        activeTaskRevision: 8,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("allows reset for any persisted draft or failed record, not only a confirmation", () => {
+    expect(
+      canRequestResponseLogicReset({
+        preview: false,
+        record: { questionId: "question-draft" },
+      }),
+    ).toBe(true);
+    expect(
+      canRequestResponseLogicReset({
+        preview: false,
+        record: undefined,
+      }),
+    ).toBe(false);
+    expect(
+      canRequestResponseLogicReset({
+        preview: true,
+        record: { questionId: "question-preview" },
+      }),
+    ).toBe(false);
+  });
+
   it("rejects malformed structured status payloads from the client boundary", async () => {
     vi.stubGlobal(
       "fetch",
@@ -930,6 +1037,13 @@ describe("ResponseLogicWorkspace", () => {
         unavailableTaskIds,
       }),
     ).toBe(true);
+    expect(
+      shouldHydrateResponseLogicTask({
+        authoritativeTaskId: "task-new",
+        unavailableTaskIds,
+        resetRequired: true,
+      }),
+    ).toBe(false);
   });
 
   it("keeps the editor as the only view and does not present a prefill as published", async () => {

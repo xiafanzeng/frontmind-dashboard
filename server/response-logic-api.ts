@@ -40,12 +40,15 @@ import {
 } from "./upstream-config";
 import {
   ResponseLogicConfirmedError,
+  ResponseLogicProviderReadinessError,
+  ResponseLogicRevisionConflictError,
   ResponseLogicTaskActiveError,
+  ResponseLogicTaskSupersededError,
   assertResponseLogicRecordEditable,
   getResponseLogicEntry,
   recordResponseLogicTaskStart,
   releaseResponseLogicTaskBinding,
-  responseLogicReleasedContinuationMatches,
+  requireResponseLogicProviderReadiness,
 } from "./response-logic-service";
 import {
   assertServiceCapability,
@@ -277,6 +280,130 @@ export class ResponseLogicTaskBindingError extends Error {
   }
 }
 
+export type ResponseLogicStartFailureStage =
+  | "file_upload_intent"
+  | "file_upload_content"
+  | "file_confirmation"
+  | "task_create"
+  | "task_message"
+  | "task_binding"
+  | "upstream";
+
+export type ResponseLogicStartFailureEnvelope = {
+  code:
+    | "RESPONSE_LOGIC_UPSTREAM_UNAVAILABLE"
+    | "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN"
+    | "RESPONSE_LOGIC_TASK_BINDING_PENDING"
+    | "RESPONSE_LOGIC_TASK_FAILED";
+  message: string;
+  retryable: boolean;
+  resetRequired: boolean;
+  stage: ResponseLogicStartFailureStage;
+  incidentId: string;
+  retryAfterMs?: number;
+};
+
+class ResponseLogicPostDispatchBindingError extends Error {
+  readonly incidentId = randomUUID();
+
+  constructor(cause: unknown) {
+    super("上游任务已创建，但本地绑定未完成；请申请重置后重新开始", { cause });
+    this.name = "ResponseLogicPostDispatchBindingError";
+  }
+}
+
+export function responseLogicPostDispatchBindingFailure(
+  incidentId = randomUUID(),
+): { status: 502; error: ResponseLogicStartFailureEnvelope } {
+  return {
+    status: 502,
+    error: {
+      code: "RESPONSE_LOGIC_TASK_BINDING_PENDING",
+      message: "上游任务已创建，但本地绑定未完成；请申请重置后重新开始",
+      retryable: false,
+      resetRequired: true,
+      stage: "task_binding",
+      incidentId,
+    },
+  };
+}
+
+function responseLogicStartFailureStage(
+  operation: string,
+): ResponseLogicStartFailureStage {
+  switch (operation) {
+    case "file.upload":
+      return "file_upload_intent";
+    case "file.upload.content":
+      return "file_upload_content";
+    case "file.detail":
+      return "file_confirmation";
+    case "task.create":
+      return "task_create";
+    case "task.sendMessage":
+      return "task_message";
+    default:
+      return "upstream";
+  }
+}
+
+export function responseLogicStartFailureFromManusError(input: {
+  error: ManusV2ApiError;
+  incidentId?: string;
+}): { status: number; error: ResponseLogicStartFailureEnvelope } {
+  const incidentId = input.incidentId ?? randomUUID();
+  const stage = responseLogicStartFailureStage(input.error.operation);
+  const retryableWithoutSideEffect =
+    !input.error.outcomeUnknown &&
+    (input.error.retryable ||
+      input.error.code === "TRANSPORT_PRE_DISPATCH_RETRY_EXHAUSTED");
+  if (input.error.outcomeUnknown) {
+    return {
+      status: 502,
+      error: {
+        code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+        message:
+          stage === "file_upload_intent" ||
+          stage === "file_upload_content" ||
+          stage === "file_confirmation"
+            ? "附件处理结果无法确认，请申请重置后重新开始"
+            : "应答逻辑任务启动结果无法确认，请申请重置后重新开始",
+        retryable: false,
+        resetRequired: true,
+        stage,
+        incidentId,
+      },
+    };
+  }
+  if (retryableWithoutSideEffect) {
+    return {
+      status: 503,
+      error: {
+        code: "RESPONSE_LOGIC_UPSTREAM_UNAVAILABLE",
+        message: "上游服务暂时不可用，任务尚未创建，请稍后重试",
+        retryable: true,
+        resetRequired: false,
+        stage,
+        incidentId,
+        ...(input.error.retryAfterMs !== null
+          ? { retryAfterMs: input.error.retryAfterMs }
+          : {}),
+      },
+    };
+  }
+  return {
+    status: 502,
+    error: {
+      code: "RESPONSE_LOGIC_TASK_FAILED",
+      message: "应答逻辑任务启动失败，请检查 API Key 或稍后重试",
+      retryable: false,
+      resetRequired: false,
+      stage,
+      incidentId,
+    },
+  };
+}
+
 export function responseLogicRecordMatchesConfiguredQuestion(input: {
   record: Pick<
     ResponseLogicRecordDto,
@@ -323,12 +450,6 @@ export function assertResponseLogicTaskBinding(input: {
     intent: string;
     summary: string;
   };
-  /**
-   * Compatibility path for records whose binding was cleared by the old
-   * output-format failure handler. The caller must first prove both upstream
-   * task ownership and the persisted conversation's exact task pointer.
-   */
-  releasedContinuationVerified?: boolean;
 }) {
   if (input.authenticatedUserId !== input.workspaceUserId) {
     throw new ResponseLogicTaskBindingError(
@@ -360,10 +481,7 @@ export function assertResponseLogicTaskBinding(input: {
       "当前会话与应答逻辑记录不匹配",
     );
   }
-  if (
-    input.record.lastTaskId !== input.taskId &&
-    !(input.releasedContinuationVerified && !input.record.lastTaskId)
-  ) {
+  if (input.record.lastTaskId !== input.taskId) {
     throw new ResponseLogicTaskBindingError(
       "RESPONSE_LOGIC_TASK_FORBIDDEN",
       "当前任务不是该问题的最新应答逻辑任务",
@@ -936,11 +1054,18 @@ export async function createResponseLogicTask(input: {
         if (!(error instanceof ManusV2ApiError) || !error.outcomeUnknown) {
           throw error;
         }
-        const events = await client.listAllMessages({
-          taskId: input.taskId,
-          order: "desc",
-          stopAfterOperationToken: operationToken,
-        });
+        let events: ManusV2MessageEvent[];
+        try {
+          events = await client.listAllMessages({
+            taskId: input.taskId,
+            order: "desc",
+            stopAfterOperationToken: operationToken,
+          });
+        } catch {
+          // A failed reconciliation read cannot make the original message
+          // side effect safe to repeat. Preserve the outcome-unknown error.
+          throw error;
+        }
         if (!manusV2EventsContainOperationToken(events, operationToken)) {
           throw error;
         }
@@ -965,10 +1090,17 @@ export async function createResponseLogicTask(input: {
         if (!(error instanceof ManusV2ApiError) || !error.outcomeUnknown) {
           throw error;
         }
-        const reconciled = await client.findCreatedTask({
-          title,
-          operationToken,
-        });
+        let reconciled: Awaited<ReturnType<ManusV2Client["findCreatedTask"]>>;
+        try {
+          reconciled = await client.findCreatedTask({
+            title,
+            operationToken,
+          });
+        } catch {
+          // Never let a secondary read failure replace an ambiguous task
+          // creation. Only a unique token match proves the original success.
+          throw error;
+        }
         if (!reconciled.unique) throw error;
         taskId = reconciled.unique.id;
         raw = { ok: true, task_id: taskId, reconciled: true };
@@ -988,6 +1120,7 @@ export async function createResponseLogicTask(input: {
       ok: false as const,
       status: error.status ?? 502,
       detail: error.code,
+      upstreamError: error,
     };
   }
 }
@@ -1297,11 +1430,11 @@ router.post(["/start", "/turn"], async (req, res) => {
     });
     return;
   }
-  if (isContinuation && !parsed.data.operationRevision) {
+  if (!parsed.data.operationRevision) {
     res.status(400).json({
       error: {
         code: "RESPONSE_LOGIC_OPERATION_REQUIRED",
-        message: "缺少当前应答逻辑轮次标识",
+        message: "缺少当前应答逻辑记录轮次，请刷新后重试",
       },
     });
     return;
@@ -1339,19 +1472,7 @@ router.post(["/start", "/turn"], async (req, res) => {
       );
       assertResponseLogicRecordEditable(existingRecord);
       if (existingRecord?.lastTaskId) {
-        if (
-          responseLogicRecordMatchesConfiguredQuestion({
-            record: existingRecord,
-            configuredQuestion,
-          })
-        ) {
-          throw new ResponseLogicTaskActiveError();
-        }
-        await releaseResponseLogicTaskBinding({
-          userId: req.frontmindUser.id,
-          questionId: value.questionId,
-          taskId: existingRecord.lastTaskId,
-        });
+        throw new ResponseLogicTaskActiveError();
       }
     }
     let taskApiKey = activeCredentials.apiKey;
@@ -1372,14 +1493,6 @@ router.post(["/start", "/turn"], async (req, res) => {
         );
       }
       assertResponseLogicRecordEditable(record);
-      const releasedContinuationVerified =
-        isContinuation &&
-        !record?.lastTaskId &&
-        (await responseLogicReleasedContinuationMatches({
-          userId: req.frontmindUser.id,
-          conversationId: value.conversationId,
-          taskId: value.taskId,
-        }));
       assertResponseLogicTaskBinding({
         authenticatedUserId: req.frontmindUser.id,
         workspaceUserId: req.frontmindUser.id,
@@ -1389,12 +1502,23 @@ router.post(["/start", "/turn"], async (req, res) => {
         operationRevision: value.operationRevision,
         record,
         configuredQuestion,
-        releasedContinuationVerified,
       });
       taskCredential = boundTaskCredential;
       taskApiKey = boundTaskCredential.apiKey;
       logSecret = taskApiKey;
     }
+
+    // No Provider side effect may occur until the approved, locked question,
+    // fresh conversation binding and exact response-logic revision agree.
+    // The returned revision is consumed again by the final transactional CAS.
+    const readiness = await requireResponseLogicProviderReadiness({
+      userId: req.frontmindUser.id,
+      questionId: value.questionId,
+      conversationId: value.conversationId,
+      ...(value.taskId ? { taskId: value.taskId } : {}),
+      expectedOperationRevision: value.operationRevision!,
+      expectedQuestionScope: configuredQuestion.writeScope,
+    });
 
     const responseLogicDb = await getDb();
     if (!responseLogicDb) {
@@ -1540,6 +1664,7 @@ router.post(["/start", "/turn"], async (req, res) => {
         filename: attachmentPackage.filename,
         bytes: attachmentPackage.bytes,
         contentType: "application/zip",
+        fileCreateRetryPolicy: "response_logic_pre_dispatch_only",
         observer: {
           onCandidateCreated: async ({ fileId }) => {
             await recordUpstreamResource({
@@ -1612,6 +1737,7 @@ router.post(["/start", "/turn"], async (req, res) => {
         filename: asset.attachment.filename,
         bytes: Buffer.concat(chunks, byteCount),
         contentType: asset.row.mimeType,
+        fileCreateRetryPolicy: "response_logic_pre_dispatch_only",
       });
       await responseLogicDb.insert(providerFileLeases).values({
         id: randomUUID(),
@@ -1643,21 +1769,20 @@ router.post(["/start", "/turn"], async (req, res) => {
       rateLimitScope: `managed-user:${req.frontmindUser.id}`,
     });
     if (!created.ok) {
-      console.warn(
-        "[Response Logic Start] create task failed:",
-        redactSensitiveText(created.detail, [logSecret]),
-      );
-      res.status(created.status).json({
-        error: {
-          code: "RESPONSE_LOGIC_TASK_FAILED",
-          message: "应答逻辑任务创建失败，请检查 API Key 或稍后重试",
-        },
-      });
-      return;
+      throw created.upstreamError;
     }
 
     let startedRecord: ResponseLogicRecordDto;
     try {
+      // Persist task ownership before the versioned response-logic binding.
+      // If the final CAS loses a race, the task remains attributable but can
+      // never write into a reset/replaced record.
+      await recordUpstreamResource({
+        userId: req.frontmindUser.id,
+        apiCredentialId: taskCredential.id,
+        kind: "task",
+        upstreamId: String(created.task.id),
+      });
       startedRecord = await recordResponseLogicTaskStart({
         userId: req.frontmindUser.id,
         apiCredentialId: taskCredential.id,
@@ -1673,6 +1798,7 @@ router.post(["/start", "/turn"], async (req, res) => {
         },
         taskId: String(created.task.id),
         expectedQuestionScope: configuredQuestion.writeScope,
+        expectedRecordRevision: readiness.recordRevision,
         skillName: skillDescriptor.name,
         skillVersion: skillDescriptor.version,
         skillContentHash: skillDescriptor.contentHash,
@@ -1680,10 +1806,10 @@ router.post(["/start", "/turn"], async (req, res) => {
         verifiedAttachments,
       });
     } catch (persistenceError) {
-      // The upstream task is already an irreversible usage fact. Its files
-      // were durably owned before upload and must remain available so the same
-      // idempotent dispatch can recover this local persistence failure.
-      throw persistenceError;
+      // The Provider side effect is already an irreversible usage fact. Never
+      // report this as a safe retry: a second /start could create another paid
+      // task. The approved reset path deliberately starts a wholly new run.
+      throw new ResponseLogicPostDispatchBindingError(persistenceError);
     }
 
     res.json({
@@ -1707,6 +1833,26 @@ router.post(["/start", "/turn"], async (req, res) => {
       });
       return;
     }
+    if (
+      error instanceof ResponseLogicProviderReadinessError ||
+      error instanceof ResponseLogicTaskSupersededError ||
+      error instanceof ResponseLogicRevisionConflictError
+    ) {
+      res.status(error.statusCode).json({
+        error: { code: error.responseLogicCode, message: error.message },
+      });
+      return;
+    }
+    if (error instanceof ResponseLogicPostDispatchBindingError) {
+      const failure = responseLogicPostDispatchBindingFailure(error.incidentId);
+      console.error("[Response Logic Start] task binding pending:", {
+        ...safeErrorForLog(error.cause, { secrets: [logSecret] }),
+        incidentId: error.incidentId,
+        stage: "task_binding",
+      });
+      res.status(failure.status).json({ error: failure.error });
+      return;
+    }
     if (error instanceof ResponseLogicTaskBindingError) {
       if (
         error.code === "RESPONSE_LOGIC_QUESTION_FORBIDDEN" &&
@@ -1723,6 +1869,22 @@ router.post(["/start", "/turn"], async (req, res) => {
       res.status(403).json({
         error: { code: error.code, message: error.message },
       });
+      return;
+    }
+    if (error instanceof ManusV2ApiError) {
+      const failure = responseLogicStartFailureFromManusError({ error });
+      console.error("[Response Logic Start] upstream failure:", {
+        ...safeErrorForLog(error, { secrets: [logSecret] }),
+        incidentId: failure.error.incidentId,
+        operation: error.operation,
+        outcomeUnknown: error.outcomeUnknown,
+        transportCause: error.transportCause,
+        transportPhase: error.transportPhase,
+        transportAttempt: error.transportAttempt,
+        transportElapsedMs: error.transportElapsedMs,
+        transportBytesWritten: error.transportBytesWritten,
+      });
+      res.status(failure.status).json({ error: failure.error });
       return;
     }
     console.error(

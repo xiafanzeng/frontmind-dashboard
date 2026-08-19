@@ -6,6 +6,8 @@ import {
   classifyFailure,
   getTaskPollDelay,
   outputForKnowledgePresentation,
+  readResponseLogicTaskStartFailure,
+  responseLogicStartFailureMessage,
   sliceNewOutput,
 } from "../hooks/useSendMessage";
 
@@ -44,6 +46,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
+  RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX:
+    "msg-response-logic-reset-required-",
   createTask: mocks.createTask,
   createKnowledgeBaseTurnTask: mocks.createKnowledgeBaseTurnTask,
   reserveKnowledgeBaseTurnWithAttachments:
@@ -364,6 +368,193 @@ describe("useSendMessage", () => {
     );
     expect(mocks.retrieveTask).not.toHaveBeenCalled();
     expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
+  });
+
+  it("keeps a retryable response-logic start failure taskless and preserves its envelope", async () => {
+    const failure = {
+      code: "RESPONSE_LOGIC_UPSTREAM_UNAVAILABLE",
+      message: "上游服务暂时不可用，任务尚未创建，请稍后重试",
+      retryable: true,
+      resetRequired: false,
+      stage: "file_upload_intent",
+      incidentId: "incident-safe-retry",
+      retryAfterMs: 1_500,
+      status: 503,
+    } as const;
+    mocks.createResponseLogicTask.mockRejectedValueOnce(failure);
+    const onTaskStarted = vi.fn();
+    const onTaskStartFailed = vi.fn();
+    const { result } = renderHook(() => useSendMessage());
+
+    let sent = true;
+    await act(async () => {
+      sent = await result.current.sendMessage("生成应答逻辑", [], {
+        responseLogicContext: {
+          questionId: "question-1",
+          groupId: "group-1",
+          groupTitle: "行业排名",
+          question: "如何选择测评机构？",
+          intent: "核验资质",
+          summary: "形成可核验口径",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+          onTaskStarted,
+          onTaskStartFailed,
+        },
+      });
+    });
+
+    expect(sent).toBe(false);
+    expect(onTaskStarted).not.toHaveBeenCalled();
+    expect(onTaskStartFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...failure,
+        questionId: "question-1",
+        conversationId: "test-conv-id",
+      }),
+    );
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "error",
+      expect.objectContaining({
+        clearTaskPointer: true,
+        executionKind: "response_logic",
+      }),
+    );
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.addMessage).toHaveBeenLastCalledWith(
+      "test-conv-id",
+      expect.objectContaining({
+        role: "assistant",
+        content: expect.stringContaining("任务尚未创建"),
+      }),
+    );
+    expect(
+      readResponseLogicTaskStartFailure({ ...failure, stage: "arbitrary" }),
+    ).toBeNull();
+    expect(
+      responseLogicStartFailureMessage(failure).assistantMessage,
+    ).toContain("故障编号：incident-safe-retry");
+  });
+
+  it("requires a reset for an ambiguous response-logic start and never hands it to a poller", async () => {
+    mocks.createResponseLogicTask.mockRejectedValueOnce({
+      code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+      message: "附件处理结果无法确认，请申请重置后重新开始",
+      retryable: false,
+      resetRequired: true,
+      stage: "file_confirmation",
+      incidentId: "incident-unknown",
+      status: 502,
+    });
+    const onTaskStarted = vi.fn();
+    const onTaskStartFailed = vi.fn();
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("生成应答逻辑", [], {
+        responseLogicContext: {
+          questionId: "question-1",
+          groupId: "group-1",
+          groupTitle: "行业排名",
+          question: "如何选择测评机构？",
+          intent: "核验资质",
+          summary: "形成可核验口径",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+          onTaskStarted,
+          onTaskStartFailed,
+        },
+      });
+    });
+
+    expect(onTaskStarted).not.toHaveBeenCalled();
+    expect(onTaskStartFailed).toHaveBeenCalledWith(
+      expect.objectContaining({ resetRequired: true }),
+    );
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.addMessage).toHaveBeenLastCalledWith(
+      "test-conv-id",
+      expect.objectContaining({
+        id: expect.stringMatching(/^msg-response-logic-reset-required-/u),
+        content: expect.stringContaining("请先申请重置"),
+      }),
+    );
+  });
+
+  it("treats a post-dispatch binding failure as reset-required and never polls", async () => {
+    mocks.createResponseLogicTask.mockRejectedValueOnce({
+      code: "RESPONSE_LOGIC_TASK_BINDING_PENDING",
+      message: "上游任务已创建，但本地绑定未完成；请申请重置后重新开始",
+      retryable: false,
+      resetRequired: true,
+      stage: "task_binding",
+      incidentId: "incident-binding",
+      status: 502,
+    });
+    const onTaskStartFailed = vi.fn();
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("生成应答逻辑", [], {
+        responseLogicContext: {
+          questionId: "question-1",
+          groupId: "group-1",
+          groupTitle: "行业排名",
+          question: "如何选择测评机构？",
+          intent: "核验资质",
+          summary: "形成可核验口径",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+          onTaskStarted: vi.fn(),
+          onTaskStartFailed,
+        },
+      });
+    });
+
+    expect(onTaskStartFailed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: "RESPONSE_LOGIC_TASK_BINDING_PENDING",
+        stage: "task_binding",
+        resetRequired: true,
+      }),
+    );
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "error",
+      expect.objectContaining({ clearTaskPointer: true }),
+    );
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.addMessage).toHaveBeenLastCalledWith(
+      "test-conv-id",
+      expect.objectContaining({
+        content: expect.stringContaining("请先申请重置"),
+      }),
+    );
   });
 
   it("hands an async knowledge confirmation to the authoritative coordinator without reading raw output", async () => {

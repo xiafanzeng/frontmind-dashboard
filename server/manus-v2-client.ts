@@ -320,6 +320,27 @@ export type ManusV2WaitingDetail = {
   statusEventId: string;
 };
 
+export type ManusV2TransportCause =
+  | "dns_temporary"
+  | "dns_not_found"
+  | "connection_refused"
+  | "network_unreachable"
+  | "host_unreachable"
+  | "connection_reset"
+  | "timeout"
+  | "tls"
+  | "unknown";
+
+export type ManusV2TransportPhase =
+  | "dns"
+  | "connect"
+  | "request"
+  | "tls"
+  | "timeout"
+  | "unknown";
+
+export type ManusV2FileCreateRetryPolicy = "response_logic_pre_dispatch_only";
+
 export class ManusV2ApiError extends Error {
   constructor(
     public readonly operation: string,
@@ -337,10 +358,133 @@ export class ManusV2ApiError extends Error {
     public readonly retryAfterMs: number | null = null,
     public readonly providerField: string | null = null,
     public readonly providerPath: string | null = null,
+    public readonly transportCause: ManusV2TransportCause | null = null,
+    public readonly transportPhase: ManusV2TransportPhase | null = null,
+    public readonly transportAttempt: number | null = null,
+    public readonly transportElapsedMs: number | null = null,
+    public readonly transportBytesWritten: number | null = null,
   ) {
     super(`Manus v2 ${operation} failed (${code})`);
     this.name = "ManusV2ApiError";
   }
+}
+
+type ManusV2TransportDiagnostic = {
+  cause: ManusV2TransportCause;
+  phase: ManusV2TransportPhase;
+  bytesWritten: number | null;
+  provablyNotDispatched: boolean;
+};
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+const SAFE_TRANSPORT_CODES = new Set([
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ECONNRESET",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ECONNABORTED",
+  "EPROTO",
+]);
+
+function safeTransportCode(error: unknown) {
+  const record = objectRecord(error);
+  const cause = objectRecord(record?.cause);
+  // Axios may wrap the Node errno in `cause` while exposing a generic
+  // ERR_NETWORK code itself. Prefer the lower-level cause when it is safe.
+  const candidates = [cause?.code, record?.code].filter(
+    (candidate): candidate is string =>
+      typeof candidate === "string" &&
+      /^[A-Z][A-Z0-9_]{1,63}$/u.test(candidate),
+  );
+  return (
+    candidates.find(
+      (candidate) =>
+        SAFE_TRANSPORT_CODES.has(candidate) || candidate.startsWith("ERR_TLS_"),
+    ) ??
+    candidates[0] ??
+    null
+  );
+}
+
+function transportBytesWritten(error: unknown) {
+  const record = objectRecord(error);
+  const request = objectRecord(record?.request);
+  const currentRequest = objectRecord(request?._currentRequest);
+  if (request?.reusedSocket === true || currentRequest?.reusedSocket === true) {
+    return null;
+  }
+  const candidates = [
+    request?.bytesWritten,
+    currentRequest?.bytesWritten,
+    objectRecord(request?.socket)?.bytesWritten,
+    objectRecord(currentRequest?.socket)?.bytesWritten,
+  ].filter(
+    (value): value is number =>
+      Number.isSafeInteger(value) && Number(value) >= 0,
+  );
+  if (candidates.length === 0) return null;
+  // A positive observation anywhere means the request may have crossed the
+  // side-effect boundary. Only unanimous zero observations are safe to replay.
+  return candidates.every((value) => value === 0) ? 0 : Math.max(...candidates);
+}
+
+function classifyTransportFailure(error: unknown): ManusV2TransportDiagnostic {
+  const code = safeTransportCode(error);
+  const bytesWritten = transportBytesWritten(error);
+  const classified = (() => {
+    switch (code) {
+      case "EAI_AGAIN":
+        return { cause: "dns_temporary", phase: "dns" } as const;
+      case "ENOTFOUND":
+        return { cause: "dns_not_found", phase: "dns" } as const;
+      case "ECONNREFUSED":
+        return { cause: "connection_refused", phase: "connect" } as const;
+      case "ENETUNREACH":
+        return { cause: "network_unreachable", phase: "connect" } as const;
+      case "EHOSTUNREACH":
+        return { cause: "host_unreachable", phase: "connect" } as const;
+      case "ECONNRESET":
+      case "EPIPE":
+        return { cause: "connection_reset", phase: "request" } as const;
+      case "ETIMEDOUT":
+      case "ECONNABORTED":
+        return { cause: "timeout", phase: "timeout" } as const;
+      default:
+        if (code?.startsWith("ERR_TLS_") || code === "EPROTO") {
+          return { cause: "tls", phase: "tls" } as const;
+        }
+        return { cause: "unknown", phase: "unknown" } as const;
+    }
+  })();
+  return {
+    ...classified,
+    bytesWritten,
+    provablyNotDispatched:
+      // DNS lookup failures happen before a connection exists, so a missing
+      // socket counter is itself expected evidence. Connect failures require
+      // an explicit zero counter. Any positive/unknown request-phase signal
+      // remains ambiguous and is never replayed.
+      (classified.phase === "dns" &&
+        (bytesWritten === null || bytesWritten === 0)) ||
+      (classified.phase === "connect" && bytesWritten === 0),
+  };
+}
+
+function fileCreateRetryDelayMs(attempt: number) {
+  const base = attempt === 1 ? 250 : 1_000;
+  const seed =
+    createHash("sha256").update(`file.upload:${attempt}`, "utf8").digest()[0] ??
+    0;
+  return base + Math.floor((base * (seed % 13)) / 100);
 }
 
 function requiredString(value: unknown, label: string, maxLength = 2_048) {
@@ -1401,27 +1545,78 @@ export class ManusV2Client {
     operation: string,
     request: () => Promise<AxiosResponse>,
     sideEffect: boolean,
+    options: {
+      fileCreateRetryPolicy?: ManusV2FileCreateRetryPolicy;
+      sleep?: (ms: number) => Promise<void>;
+      now?: () => number;
+    } = {},
   ) {
-    // Admission happens before the transport boundary. Waiting locally can
-    // never make a side-effect outcome unknown; only an attempted network
-    // request may carry that classification.
-    await this.rateLimiter.acquire({
-      scope: this.rateLimitScope,
-      lane: manusV2RateLimitLane(operation, sideEffect),
-    });
-    try {
-      const response = await request();
-      return assertOk(operation, response, sideEffect);
-    } catch (error) {
-      if (error instanceof ManusV2ApiError) throw error;
-      throw new ManusV2ApiError(
-        operation,
-        null,
-        "TRANSPORT_UNKNOWN",
-        false,
-        sideEffect,
-      );
+    const now = options.now ?? Date.now;
+    const sleep =
+      options.sleep ??
+      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const startedAt = now();
+    const maxAttempts =
+      operation === "file.upload" &&
+      options.fileCreateRetryPolicy === "response_logic_pre_dispatch_only"
+        ? 3
+        : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      // Every wire attempt consumes Provider allowance. Waiting in the local
+      // limiter is outside the transport boundary and cannot make an outcome
+      // unknown.
+      await this.rateLimiter.acquire({
+        scope: this.rateLimitScope,
+        lane: manusV2RateLimitLane(operation, sideEffect),
+      });
+      try {
+        const response = await request();
+        return assertOk(operation, response, sideEffect);
+      } catch (error) {
+        if (error instanceof ManusV2ApiError) throw error;
+        const transport = classifyTransportFailure(error);
+        const elapsedMs = Math.max(0, now() - startedAt);
+        const mayRetry =
+          maxAttempts > 1 &&
+          attempt < maxAttempts &&
+          transport.provablyNotDispatched;
+        if (mayRetry) {
+          const delayMs = fileCreateRetryDelayMs(attempt);
+          console.warn("[Manus v2] safe pre-dispatch retry", {
+            operation,
+            transportCause: transport.cause,
+            transportPhase: transport.phase,
+            transportAttempt: attempt,
+            transportElapsedMs: elapsedMs,
+            transportBytesWritten: transport.bytesWritten,
+            delayMs,
+          });
+          await sleep(delayMs);
+          continue;
+        }
+        const retryExhausted =
+          maxAttempts > 1 && transport.provablyNotDispatched;
+        throw new ManusV2ApiError(
+          operation,
+          null,
+          retryExhausted
+            ? "TRANSPORT_PRE_DISPATCH_RETRY_EXHAUSTED"
+            : "TRANSPORT_UNKNOWN",
+          retryExhausted,
+          retryExhausted ? false : sideEffect,
+          null,
+          null,
+          null,
+          null,
+          transport.cause,
+          transport.phase,
+          attempt,
+          elapsedMs,
+          transport.bytesWritten,
+        );
+      }
     }
+    throw new Error("Unreachable Manus v2 request state");
   }
 
   async createTask(input: ManusV2CreateTaskInput) {
@@ -1947,7 +2142,14 @@ export class ManusV2Client {
     );
   }
 
-  async createFile(filename: string) {
+  async createFile(
+    filename: string,
+    options: {
+      retryPolicy?: ManusV2FileCreateRetryPolicy;
+      sleep?: (ms: number) => Promise<void>;
+      now?: () => number;
+    } = {},
+  ) {
     const normalizedFilename = requiredString(
       filename.replace(/[\\/\0]/gu, "_"),
       "filename",
@@ -1962,6 +2164,11 @@ export class ManusV2Client {
           { headers: { "Content-Type": "application/json" } },
         ),
       true,
+      {
+        fileCreateRetryPolicy: options.retryPolicy,
+        sleep: options.sleep,
+        now: options.now,
+      },
     );
     const file = upstreamTaskRecord(result.file);
     if (!file) {
@@ -2177,6 +2384,8 @@ export class ManusV2Client {
     detailAttemptTimeoutMs?: number;
     sleep?: (ms: number) => Promise<void>;
     now?: () => number;
+    /** Disabled by default; only response-logic file intent creation opts in. */
+    fileCreateRetryPolicy?: ManusV2FileCreateRetryPolicy;
     observer?: ManusV2FileUploadObserver;
     /** Resume a durable provider id after a crash/response-loss boundary. */
     existingCandidate?: {
@@ -2263,7 +2472,11 @@ export class ManusV2Client {
           ),
           requestId: null,
         }
-      : await this.createFile(expectedFilename);
+      : await this.createFile(expectedFilename, {
+          retryPolicy: input.fileCreateRetryPolicy,
+          sleep,
+          now,
+        });
     if (created.filename !== expectedFilename) {
       throw new ManusV2ApiError(
         "file.upload",

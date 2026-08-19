@@ -250,6 +250,91 @@ export interface ResponseLogicTaskContext {
     operationRevision: number;
     startedAt: number;
   }) => void;
+  /** Client-only failure handoff; never serialized to the server. */
+  onTaskStartFailed?: (
+    failure: ResponseLogicTaskStartFailure & {
+      questionId: string;
+      conversationId: string;
+      continuationTaskId?: string;
+    },
+  ) => void;
+}
+
+export type ResponseLogicTaskStartStage =
+  | "validation"
+  | "file_upload_intent"
+  | "file_upload_content"
+  | "file_confirmation"
+  | "task_create"
+  | "task_message"
+  | "task_binding"
+  | "upstream"
+  | "dashboard_transport"
+  | "response";
+
+const RESPONSE_LOGIC_TASK_START_STAGES = new Set<ResponseLogicTaskStartStage>([
+  "validation",
+  "file_upload_intent",
+  "file_upload_content",
+  "file_confirmation",
+  "task_create",
+  "task_message",
+  "task_binding",
+  "upstream",
+  "dashboard_transport",
+  "response",
+]);
+
+function parseResponseLogicTaskStartStage(
+  value: unknown,
+): ResponseLogicTaskStartStage {
+  return typeof value === "string" &&
+    RESPONSE_LOGIC_TASK_START_STAGES.has(value as ResponseLogicTaskStartStage)
+    ? (value as ResponseLogicTaskStartStage)
+    : "response";
+}
+
+export type ResponseLogicTaskStartFailure = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  resetRequired: boolean;
+  stage: ResponseLogicTaskStartStage;
+  incidentId?: string;
+  retryAfterMs?: number;
+  status?: number;
+};
+
+/**
+ * Durable, browser-visible reset barrier stored in the existing conversation
+ * message stream. The prefix contains no provider detail or customer data.
+ */
+export const RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX =
+  "msg-response-logic-reset-required-";
+
+export class ResponseLogicTaskStartError
+  extends Error
+  implements ResponseLogicTaskStartFailure
+{
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly resetRequired: boolean;
+  readonly stage: ResponseLogicTaskStartStage;
+  readonly incidentId?: string;
+  readonly retryAfterMs?: number;
+  readonly status?: number;
+
+  constructor(failure: ResponseLogicTaskStartFailure, cause?: unknown) {
+    super(failure.message, cause === undefined ? undefined : { cause });
+    this.name = "ResponseLogicTaskStartError";
+    this.code = failure.code;
+    this.retryable = failure.retryable;
+    this.resetRequired = failure.resetRequired;
+    this.stage = failure.stage;
+    this.incidentId = failure.incidentId;
+    this.retryAfterMs = failure.retryAfterMs;
+    this.status = failure.status;
+  }
 }
 
 /**
@@ -1101,43 +1186,145 @@ export async function createResponseLogicTask(
     CREATE_TASK_TIMEOUT_MS,
   );
   try {
-    const { onTaskStarted: _onTaskStarted, ...requestContext } = context;
-    const response = await fetch(
-      context.taskId ? "/api/response-logic/turn" : "/api/response-logic/start",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        signal: controller.signal,
-        body: JSON.stringify({
-          ...requestContext,
-          userMessage: buildPromptText(input),
-          attachments: extractAttachments(input, true),
-        }),
-      },
-    );
-    if (!response.ok) {
-      let message = `API Error ${response.status}`;
-      try {
-        const payload = await response.json();
-        message = payload?.error?.message || payload?.message || message;
-      } catch {
-        // Keep the status-derived message.
-      }
-      throw new Error(
-        userFacingErrorMessage(
-          Object.assign(new Error(message), { status: response.status }),
-          `任务创建失败（${response.status}）`,
-        ),
+    if (
+      !Number.isSafeInteger(context.operationRevision) ||
+      Number(context.operationRevision) < 1
+    ) {
+      throw new ResponseLogicTaskStartError({
+        code: "RESPONSE_LOGIC_RECORD_NOT_READY",
+        message: "当前问题的应答逻辑记录仍在保存，任务尚未创建，请稍后重试",
+        retryable: true,
+        resetRequired: false,
+        stage: "validation",
+      });
+    }
+    const {
+      onTaskStarted: _onTaskStarted,
+      onTaskStartFailed: _onTaskStartFailed,
+      ...requestContext
+    } = context;
+    let response: Response;
+    try {
+      response = await fetch(
+        context.taskId
+          ? "/api/response-logic/turn"
+          : "/api/response-logic/start",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          signal: controller.signal,
+          body: JSON.stringify({
+            ...requestContext,
+            userMessage: buildPromptText(input),
+            attachments: extractAttachments(input, true),
+          }),
+        },
+      );
+    } catch (error) {
+      throw new ResponseLogicTaskStartError(
+        {
+          code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+          message:
+            error instanceof DOMException && error.name === "AbortError"
+              ? "启动应答逻辑请求超时，任务创建结果无法确认；请申请重置后重新开始"
+              : "启动应答逻辑连接中断，任务创建结果无法确认；请申请重置后重新开始",
+          retryable: false,
+          resetRequired: true,
+          stage: "dashboard_transport",
+        },
+        error,
       );
     }
-    const payload = await response.json();
+    if (!response.ok) {
+      let payload: unknown = null;
+      try {
+        payload = await response.json();
+      } catch {
+        // Compatibility with an older or non-JSON proxy response.
+      }
+      const payloadObject =
+        payload && typeof payload === "object" && !Array.isArray(payload)
+          ? (payload as Record<string, unknown>)
+          : null;
+      const nestedError =
+        payloadObject?.error &&
+        typeof payloadObject.error === "object" &&
+        !Array.isArray(payloadObject.error)
+          ? (payloadObject.error as Record<string, unknown>)
+          : null;
+      const envelope = nestedError ?? payloadObject;
+      const legacyMessage =
+        (typeof envelope?.message === "string" && envelope.message.trim()) ||
+        `任务创建失败（${response.status}）`;
+      const retryAfterMs = Number(envelope?.retryAfterMs);
+      const resetRequired =
+        typeof envelope?.resetRequired === "boolean"
+          ? envelope.resetRequired
+          : response.status >= 500;
+      throw new ResponseLogicTaskStartError({
+        code:
+          typeof envelope?.code === "string" && envelope.code.trim()
+            ? envelope.code.trim()
+            : "RESPONSE_LOGIC_START_FAILED",
+        message: userFacingErrorMessage(
+          Object.assign(new Error(legacyMessage), { status: response.status }),
+          `任务创建失败（${response.status}）`,
+        ),
+        retryable: envelope?.retryable === true,
+        resetRequired,
+        stage: parseResponseLogicTaskStartStage(envelope?.stage),
+        ...(typeof envelope?.incidentId === "string" &&
+        envelope.incidentId.trim()
+          ? { incidentId: envelope.incidentId.trim() }
+          : {}),
+        ...(Number.isSafeInteger(retryAfterMs) && retryAfterMs >= 0
+          ? { retryAfterMs }
+          : {}),
+        status: response.status,
+      });
+    }
+    let payload: any;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw new ResponseLogicTaskStartError(
+        {
+          code: "RESPONSE_LOGIC_START_RESPONSE_INVALID",
+          message:
+            "任务创建响应未通过格式校验，创建结果无法确认；请申请重置后重新开始",
+          retryable: false,
+          resetRequired: true,
+          stage: "response",
+          status: response.status,
+        },
+        error,
+      );
+    }
     const data = withoutProviderTaskNavigationUrls(payload?.task || payload);
     const taskId = data?.id || data?.task_id;
-    if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
+    if (!taskId) {
+      throw new ResponseLogicTaskStartError({
+        code: "RESPONSE_LOGIC_START_RESPONSE_INVALID",
+        message:
+          "任务创建响应缺少任务标识，创建结果无法确认；请申请重置后重新开始",
+        retryable: false,
+        resetRequired: true,
+        stage: "response",
+        status: response.status,
+      });
+    }
     const operationRevision = Number(data?.operationRevision);
     if (!Number.isSafeInteger(operationRevision) || operationRevision < 1) {
-      throw new Error("任务创建失败：未返回有效的应答逻辑轮次");
+      throw new ResponseLogicTaskStartError({
+        code: "RESPONSE_LOGIC_START_RESPONSE_INVALID",
+        message:
+          "任务创建响应缺少有效轮次，创建结果无法确认；请申请重置后重新开始",
+        retryable: false,
+        resetRequired: true,
+        stage: "response",
+        status: response.status,
+      });
     }
     return {
       ...data,

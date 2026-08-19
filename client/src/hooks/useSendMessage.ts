@@ -19,10 +19,12 @@ import {
   fileToBase64,
   creditEventBus,
   sanitizeBrandText,
+  RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX,
   type ContentItem,
   type KnowledgeBaseAttachmentManifestItem,
   type Message,
   type ResponseLogicTaskContext,
+  type ResponseLogicTaskStartFailure,
   type TaskResponse,
   type UploadRetentionReceipt,
 } from "@/lib/frontmind-api";
@@ -173,6 +175,68 @@ function getFailureDisplayMessage(errorMsg: string) {
   return classifyFailure(errorMsg) === "attachment"
     ? "历史任务的附件与当前服务凭证不兼容。"
     : errorMsg;
+}
+
+export function readResponseLogicTaskStartFailure(
+  error: unknown,
+): ResponseLogicTaskStartFailure | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = error as Partial<ResponseLogicTaskStartFailure>;
+  if (
+    typeof candidate.code !== "string" ||
+    typeof candidate.message !== "string" ||
+    typeof candidate.retryable !== "boolean" ||
+    typeof candidate.resetRequired !== "boolean" ||
+    ![
+      "validation",
+      "file_upload_intent",
+      "file_upload_content",
+      "file_confirmation",
+      "task_create",
+      "task_message",
+      "task_binding",
+      "upstream",
+      "dashboard_transport",
+      "response",
+    ].includes(candidate.stage as string)
+  ) {
+    return null;
+  }
+  return {
+    code: candidate.code,
+    message: candidate.message,
+    retryable: candidate.retryable,
+    resetRequired: candidate.resetRequired,
+    stage: candidate.stage as ResponseLogicTaskStartFailure["stage"],
+    ...(typeof candidate.incidentId === "string"
+      ? { incidentId: candidate.incidentId }
+      : {}),
+    ...(typeof candidate.retryAfterMs === "number"
+      ? { retryAfterMs: candidate.retryAfterMs }
+      : {}),
+    ...(typeof candidate.status === "number"
+      ? { status: candidate.status }
+      : {}),
+  };
+}
+
+export function responseLogicStartFailureMessage(
+  failure: ResponseLogicTaskStartFailure,
+) {
+  const title = failure.resetRequired ? "任务创建结果无法确认" : "任务尚未创建";
+  const recovery = failure.resetRequired
+    ? "请先申请重置；批准后系统会使用全新会话、全新资料和全新任务重新开始。"
+    : failure.retryable
+      ? "当前输入和附件已保留，可以稍后直接重新发送。"
+      : "请根据页面提示处理后重新发送。";
+  const incident = failure.incidentId
+    ? `\n\n故障编号：${failure.incidentId}`
+    : "";
+  return {
+    title,
+    description: `${failure.message} ${recovery}`,
+    assistantMessage: `❌ ${title}\n\n${failure.message}\n\n${recovery}${incident}`,
+  };
 }
 
 /** Upload progress info exposed to UI */
@@ -1643,6 +1707,53 @@ export function useSendMessage() {
             creditEventBus.emit();
           }
         } catch (err: any) {
+          const responseLogicFailure = options?.responseLogicContext
+            ? readResponseLogicTaskStartFailure(err)
+            : null;
+          if (options?.responseLogicContext && responseLogicFailure) {
+            const continuationTaskId =
+              isMultiTurn && conv?.previousResponseId
+                ? conv.previousResponseId
+                : undefined;
+            // A failed initial start has no task to poll. A failed continuation
+            // may retain its completed historical task solely so a proven-safe
+            // retry can call /turn again; reset-required failures discard it.
+            updateStatus(convId, "error", {
+              ...(!continuationTaskId || responseLogicFailure.resetRequired
+                ? { clearTaskPointer: true }
+                : {}),
+              executionKind: "response_logic",
+              startedAt: responseStartedAt,
+              completedAt: Date.now(),
+            });
+            try {
+              options.responseLogicContext.onTaskStartFailed?.({
+                ...responseLogicFailure,
+                questionId: options.responseLogicContext.questionId,
+                conversationId: convId,
+                ...(continuationTaskId ? { continuationTaskId } : {}),
+              });
+            } catch (callbackError) {
+              console.warn(
+                "[ResponseLogic] start failure handoff deferred",
+                callbackError,
+              );
+            }
+            const presentation =
+              responseLogicStartFailureMessage(responseLogicFailure);
+            toast.error(presentation.title, {
+              description: presentation.description,
+            });
+            addMessage(convId, {
+              id: responseLogicFailure.resetRequired
+                ? `${RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX}${Date.now()}`
+                : `msg-response-logic-start-error-${Date.now()}`,
+              role: "assistant",
+              content: presentation.assistantMessage,
+              timestamp: Date.now(),
+            });
+            return false;
+          }
           if (options?.syncKnowledgeBaseSnapshot) {
             const status = Number(err?.status || 0);
             const isLogoSubmission = options.submissionKind === "logo";

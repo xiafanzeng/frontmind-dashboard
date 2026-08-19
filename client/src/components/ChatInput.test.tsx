@@ -1082,4 +1082,31 @@ describe("knowledge-base ChatInput actions", () => {
       ),
     );
   });
+
+  it("keeps the exact response-logic input in the composer when no task was created", async () => {
+    const prompt =
+      "请基于最新企业知识库，为“国内第三方软件测评机构推荐”生成可核验的应答逻辑。";
+    mocks.sendMessage.mockResolvedValue(false);
+    render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        composerPrefill={prompt}
+        responseLogicContext={responseLogicContext}
+      />,
+    );
+
+    const composer = screen.getByRole("textbox");
+    fireEvent.keyDown(composer, { key: "Enter" });
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+    expect(composer).toHaveValue(prompt);
+
+    fireEvent.keyDown(composer, { key: "Enter" });
+    await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(2));
+    expect(mocks.sendMessage).toHaveBeenLastCalledWith(
+      prompt,
+      [],
+      expect.objectContaining({ responseLogicContext }),
+    );
+    expect(composer).toHaveValue(prompt);
+  });
 });

@@ -20,7 +20,9 @@ import {
   createResponseLogicTaskIdempotencyKey,
   normalizeResponseLogicTaskStatus,
   publicResponseLogicTask,
+  responseLogicPostDispatchBindingFailure,
   responseLogicTaskResultFromCurrentV2Round,
+  responseLogicStartFailureFromManusError,
   responseLogicTaskStatusEnvelopeRoundTrip,
   responseLogicEvidenceAttachmentFilename,
   responseLogicRecordMatchesConfiguredQuestion,
@@ -28,6 +30,7 @@ import {
   responseLogicTurnInputAttachmentFilename,
   setResponseLogicTaskStatusNoStore,
 } from "./response-logic-api";
+import { ManusV2ApiError, ManusV2Client } from "./manus-v2-client";
 import { assertResponseLogicDraftPublishable } from "./response-logic-service";
 import {
   normalizeResponseLogicPublicProvenance,
@@ -60,6 +63,90 @@ const legacyStructuredReply = `## 用户真实关心
 请确认案例是否可公开。`;
 
 describe("response logic execution contract", () => {
+  it("returns a typed 503 only when task start is known not to have dispatched", () => {
+    const failure = responseLogicStartFailureFromManusError({
+      error: new ManusV2ApiError(
+        "file.upload",
+        null,
+        "TRANSPORT_PRE_DISPATCH_RETRY_EXHAUSTED",
+        true,
+        false,
+        null,
+        null,
+        null,
+        null,
+        "dns_temporary",
+        "dns",
+        3,
+        1_500,
+        null,
+      ),
+      incidentId: "incident-safe-retry",
+    });
+
+    expect(failure).toEqual({
+      status: 503,
+      error: {
+        code: "RESPONSE_LOGIC_UPSTREAM_UNAVAILABLE",
+        message: "上游服务暂时不可用，任务尚未创建，请稍后重试",
+        retryable: true,
+        resetRequired: false,
+        stage: "file_upload_intent",
+        incidentId: "incident-safe-retry",
+      },
+    });
+  });
+
+  it("returns a reset-required 502 for an ambiguous file intent", () => {
+    const failure = responseLogicStartFailureFromManusError({
+      error: new ManusV2ApiError(
+        "file.upload",
+        null,
+        "TRANSPORT_UNKNOWN",
+        false,
+        true,
+        null,
+        null,
+        null,
+        null,
+        "connection_reset",
+        "request",
+        1,
+        5_800,
+        128,
+      ),
+      incidentId: "incident-unknown",
+    });
+
+    expect(failure).toEqual({
+      status: 502,
+      error: {
+        code: "RESPONSE_LOGIC_START_OUTCOME_UNKNOWN",
+        message: "附件处理结果无法确认，请申请重置后重新开始",
+        retryable: false,
+        resetRequired: true,
+        stage: "file_upload_intent",
+        incidentId: "incident-unknown",
+      },
+    });
+  });
+
+  it("requires reset when a created task loses the final local binding CAS", () => {
+    expect(responseLogicPostDispatchBindingFailure("incident-binding")).toEqual(
+      {
+        status: 502,
+        error: {
+          code: "RESPONSE_LOGIC_TASK_BINDING_PENDING",
+          message: "上游任务已创建，但本地绑定未完成；请申请重置后重新开始",
+          retryable: false,
+          resetRequired: true,
+          stage: "task_binding",
+          incidentId: "incident-binding",
+        },
+      },
+    );
+  });
+
   it("accepts only a successful Manus v2 structured result", () => {
     const value = {
       concern: "采购方关心落地风险。",
@@ -621,6 +708,81 @@ describe("response logic execution contract", () => {
     expect(post).not.toHaveBeenCalled();
   });
 
+  it("preserves an ambiguous task.create when its reconciliation read fails", async () => {
+    const original = new ManusV2ApiError(
+      "task.create",
+      null,
+      "TRANSPORT_UNKNOWN",
+      false,
+      true,
+    );
+    const createTask = vi
+      .spyOn(ManusV2Client.prototype, "createTask")
+      .mockRejectedValueOnce(original);
+    const findCreatedTask = vi
+      .spyOn(ManusV2Client.prototype, "findCreatedTask")
+      .mockRejectedValueOnce(
+        new ManusV2ApiError(
+          "task.list",
+          503,
+          "UPSTREAM_UNAVAILABLE",
+          true,
+          false,
+        ),
+      );
+
+    const result = await createResponseLogicTask({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret-test-key",
+      prompt: "bounded prompt",
+      attachments: [],
+      idempotencyKey: "task-create-unknown",
+      agentProfile: "manus-1.6-max",
+    });
+
+    expect(result).toMatchObject({ ok: false, upstreamError: original });
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(findCreatedTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves an ambiguous task message when its reconciliation read fails", async () => {
+    const original = new ManusV2ApiError(
+      "task.sendMessage",
+      null,
+      "TRANSPORT_UNKNOWN",
+      false,
+      true,
+    );
+    const sendMessage = vi
+      .spyOn(ManusV2Client.prototype, "sendMessage")
+      .mockRejectedValueOnce(original);
+    const listAllMessages = vi
+      .spyOn(ManusV2Client.prototype, "listAllMessages")
+      .mockRejectedValueOnce(
+        new ManusV2ApiError(
+          "task.listMessages",
+          503,
+          "UPSTREAM_UNAVAILABLE",
+          true,
+          false,
+        ),
+      );
+
+    const result = await createResponseLogicTask({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret-test-key",
+      prompt: "bounded prompt",
+      attachments: [],
+      taskId: "existing-task",
+      idempotencyKey: "task-message-unknown",
+      agentProfile: "manus-1.6-max",
+    });
+
+    expect(result).toMatchObject({ ok: false, upstreamError: original });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(listAllMessages).toHaveBeenCalledTimes(1);
+  });
+
   it("sanitizes every public field without deleting facts after a source marker", () => {
     const publicDraft = normalizeResponseLogicPublicProvenance({
       concern: "先查看 FINAL.zip，再判断用户需求。",
@@ -744,24 +906,10 @@ describe("response logic execution contract", () => {
         workspaceUserId: 7,
         questionId: "question-1",
         conversationId: "conversation-1",
-        taskId: "task-1",
-        operationRevision: 4,
-        record: releasedRecord,
-        configuredQuestion,
-        releasedContinuationVerified: true,
-      }),
-    ).not.toThrow();
-    expect(() =>
-      assertResponseLogicTaskBinding({
-        authenticatedUserId: 7,
-        workspaceUserId: 7,
-        questionId: "question-1",
-        conversationId: "conversation-1",
         taskId: "task-new",
         operationRevision: 4,
         record,
         configuredQuestion,
-        releasedContinuationVerified: true,
       }),
     ).toThrow(ResponseLogicTaskBindingError);
     expect(() =>

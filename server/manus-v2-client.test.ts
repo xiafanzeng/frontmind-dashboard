@@ -20,6 +20,24 @@ import {
 
 afterEach(() => vi.restoreAllMocks());
 
+function transportFailure(
+  code: string,
+  options: { bytesWritten?: number; reusedSocket?: boolean } = {},
+) {
+  const error = Object.assign(new Error("transport failed"), {
+    code,
+    request: {
+      ...(options.bytesWritten === undefined
+        ? {}
+        : { socket: { bytesWritten: options.bytesWritten } }),
+      ...(options.reusedSocket === undefined
+        ? {}
+        : { reusedSocket: options.reusedSocket }),
+    },
+  });
+  return error;
+}
+
 describe("ManusV2Client", () => {
   const operationContract = {
     operationToken: "op-1",
@@ -346,9 +364,9 @@ describe("ManusV2Client", () => {
   });
 
   it("marks side-effect transport loss unknown and never labels it retryable", async () => {
-    vi.spyOn(axios.Axios.prototype, "post").mockRejectedValue(
-      new Error("socket reset"),
-    );
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(new Error("socket reset"));
     const client = new ManusV2Client({
       baseUrl: "https://api.example.test",
       apiKey: "secret",
@@ -362,6 +380,233 @@ describe("ManusV2Client", () => {
       outcomeUnknown: true,
       retryable: false,
     });
+    expect(post).toHaveBeenCalledOnce();
+  });
+
+  it("never retries a task message transport failure", async () => {
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(transportFailure("EAI_AGAIN"));
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.sendMessage({ taskId: "task-1", prompt: "continue" }),
+    ).rejects.toMatchObject({
+      code: "TRANSPORT_UNKNOWN",
+      outcomeUnknown: true,
+      retryable: false,
+      transportCause: "dns_temporary",
+    });
+    expect(post).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the shared file-create default single-attempt even for a DNS failure", async () => {
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(transportFailure("EAI_AGAIN"));
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(client.createFile("facts.pdf")).rejects.toMatchObject({
+      code: "TRANSPORT_UNKNOWN",
+      outcomeUnknown: true,
+      retryable: false,
+      transportCause: "dns_temporary",
+      transportPhase: "dns",
+      transportAttempt: 1,
+      transportBytesWritten: null,
+    });
+    expect(post).toHaveBeenCalledOnce();
+  });
+
+  it("recognizes a Node DNS errno nested beneath a generic Axios code", async () => {
+    const wrappedDnsError = Object.assign(new Error("wrapped transport"), {
+      code: "ERR_NETWORK",
+      cause: { code: "EAI_AGAIN" },
+      request: {},
+    });
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(wrappedDnsError);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.createFile("facts.pdf", {
+        retryPolicy: "response_logic_pre_dispatch_only",
+        sleep,
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSPORT_PRE_DISPATCH_RETRY_EXHAUSTED",
+      transportCause: "dns_temporary",
+      transportAttempt: 3,
+    });
+    expect(post).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries only an opted-in file intent after pre-dispatch DNS failures", async () => {
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValueOnce(transportFailure("EAI_AGAIN"))
+      .mockRejectedValueOnce(transportFailure("EAI_AGAIN"))
+      .mockResolvedValueOnce({
+        status: 200,
+        data: {
+          ok: true,
+          file: { id: "file-after-dns", filename: "facts.pdf" },
+          upload_url: "https://uploads.example.test/after-dns",
+          upload_expires_at: nowSeconds + 180,
+        },
+      });
+    vi.spyOn(axios, "put").mockResolvedValue({ status: 200 });
+    vi.spyOn(axios.Axios.prototype, "get").mockResolvedValue({
+      status: 200,
+      data: {
+        ok: true,
+        file: {
+          id: "file-after-dns",
+          filename: "facts.pdf",
+          status: "uploaded",
+          bytes: 3,
+          content_type: "application/pdf",
+          expires_at: nowSeconds + 48 * 3600,
+        },
+      },
+    });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const warning = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "facts.pdf",
+        bytes: Buffer.from("abc"),
+        contentType: "application/pdf",
+        fileCreateRetryPolicy: "response_logic_pre_dispatch_only",
+        sleep,
+      }),
+    ).resolves.toMatchObject({ fileId: "file-after-dns" });
+    expect(post).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(sleep.mock.calls[0]?.[0]).toBeGreaterThanOrEqual(250);
+    expect(sleep.mock.calls[0]?.[0]).toBeLessThan(500);
+    expect(sleep.mock.calls[1]?.[0]).toBeGreaterThanOrEqual(1_000);
+    expect(sleep.mock.calls[1]?.[0]).toBeLessThan(1_500);
+    const serializedWarnings = JSON.stringify(warning.mock.calls);
+    expect(serializedWarnings).toContain("dns_temporary");
+    expect(serializedWarnings).toContain("transportAttempt");
+    expect(serializedWarnings).not.toContain("transport failed");
+    expect(serializedWarnings).not.toContain("facts.pdf");
+    expect(serializedWarnings).not.toContain("secret");
+    expect(serializedWarnings).not.toContain("uploads.example.test");
+  });
+
+  it("returns an outcome-known retryable error after three safe DNS attempts", async () => {
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(transportFailure("ENOTFOUND"));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "facts.pdf",
+        bytes: Buffer.from("abc"),
+        contentType: "application/pdf",
+        fileCreateRetryPolicy: "response_logic_pre_dispatch_only",
+        sleep,
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSPORT_PRE_DISPATCH_RETRY_EXHAUSTED",
+      outcomeUnknown: false,
+      retryable: true,
+      transportCause: "dns_not_found",
+      transportPhase: "dns",
+      transportAttempt: 3,
+      transportBytesWritten: null,
+    });
+    expect(post).toHaveBeenCalledTimes(3);
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it("never retries an ambiguous reset even when file intent retry is opted in", async () => {
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(transportFailure("ECONNRESET", { bytesWritten: 128 }));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "facts.pdf",
+        bytes: Buffer.from("abc"),
+        contentType: "application/pdf",
+        fileCreateRetryPolicy: "response_logic_pre_dispatch_only",
+        sleep,
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSPORT_UNKNOWN",
+      outcomeUnknown: true,
+      retryable: false,
+      transportCause: "connection_reset",
+      transportPhase: "request",
+      transportAttempt: 1,
+      transportBytesWritten: 128,
+    });
+    expect(post).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("never retries a DNS-labelled failure after any request bytes were written", async () => {
+    const post = vi
+      .spyOn(axios.Axios.prototype, "post")
+      .mockRejectedValue(transportFailure("EAI_AGAIN", { bytesWritten: 1 }));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+
+    await expect(
+      client.uploadFile({
+        filename: "facts.pdf",
+        bytes: Buffer.from("abc"),
+        contentType: "application/pdf",
+        fileCreateRetryPolicy: "response_logic_pre_dispatch_only",
+        sleep,
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSPORT_UNKNOWN",
+      outcomeUnknown: true,
+      retryable: false,
+      transportCause: "dns_temporary",
+      transportAttempt: 1,
+      transportBytesWritten: 1,
+    });
+    expect(post).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it.each([

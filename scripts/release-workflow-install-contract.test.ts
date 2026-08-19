@@ -19,6 +19,9 @@ const pdfDockerfile = path.resolve("deploy/1panel-node-pdf/Dockerfile");
 const dashboardDockerfile = path.resolve(
   "deploy/production/dashboard/Dockerfile",
 );
+const dashboardCompose = path.resolve(
+  "deploy/production/dashboard/compose.yaml",
+);
 const productionBundleBuilder = path.resolve(
   "scripts/build-unsealed-artifact.mjs",
 );
@@ -59,6 +62,17 @@ afterEach(async () => {
 });
 
 describe("release workflow source-ordering contracts", () => {
+  it("pins independent external DNS only for the production Dashboard app", async () => {
+    const compose = await readFile(dashboardCompose, "utf8");
+
+    expect(compose.match(/^    dns:\s*$/gmu)).toHaveLength(1);
+    expect(compose.match(/^    dns_opt:\s*$/gmu)).toHaveLength(1);
+    expect(compose).toContain("      - 1.1.1.1");
+    expect(compose).toContain("      - 8.8.8.8");
+    expect(compose).toContain("      - timeout:2");
+    expect(compose).toContain("      - attempts:2");
+  });
+
   it("conditionally closes the production incident-repair CLI artifact chain", async () => {
     const [builder, artifactIdentity, audit, dockerfile] = await Promise.all([
       readFile(productionBundleBuilder, "utf8"),

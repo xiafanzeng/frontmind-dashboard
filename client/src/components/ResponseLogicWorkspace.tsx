@@ -52,9 +52,14 @@ import {
 import {
   useConversation,
   type Attachment,
+  type Conversation,
   type LocalMessage,
 } from "@/contexts/ConversationContext";
 import { trpc } from "@/lib/trpc";
+import {
+  RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX,
+  type ResponseLogicTaskStartFailure,
+} from "@/lib/frontmind-api";
 import { toast } from "sonner";
 import {
   keywordCategoryKey,
@@ -285,8 +290,55 @@ export function canReloadResponseLogicTask(input: {
   taskId?: string;
   readOnly: boolean;
   loading: boolean;
+  resetRequired?: boolean;
 }) {
-  return Boolean(input.taskId && !input.readOnly && !input.loading);
+  return Boolean(
+    input.taskId && !input.readOnly && !input.loading && !input.resetRequired,
+  );
+}
+
+export function scopedResponseLogicTaskStartFailure<
+  T extends ResponseLogicTaskStartFailure & {
+    questionId: string;
+    conversationId: string;
+  },
+>(input: { failure: T | null; questionId: string; conversationId?: string }) {
+  return input.failure?.questionId === input.questionId &&
+    input.failure.conversationId === input.conversationId
+    ? input.failure
+    : null;
+}
+
+export function durableResponseLogicResetBarrier(input: {
+  conversation?: Pick<Conversation, "id" | "status" | "messages">;
+  questionId: string;
+}):
+  | (ResponseLogicTaskStartFailure & {
+      questionId: string;
+      conversationId: string;
+    })
+  | null {
+  const conversation = input.conversation;
+  if (
+    !conversation ||
+    conversation.status !== "error" ||
+    !conversation.messages.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.id.startsWith(RESPONSE_LOGIC_RESET_REQUIRED_MESSAGE_ID_PREFIX),
+    )
+  ) {
+    return null;
+  }
+  return {
+    code: "RESPONSE_LOGIC_RESET_REQUIRED",
+    message: "此前应答逻辑任务的创建结果无法确认",
+    retryable: false,
+    resetRequired: true,
+    stage: "response" as const,
+    questionId: input.questionId,
+    conversationId: conversation.id,
+  };
 }
 
 export async function fetchResponseLogicTaskStatus(input: {
@@ -692,13 +744,35 @@ export function shouldHydrateResponseLogicTask(input: {
   localTaskId?: string;
   localPreviousResponseId?: string;
   unavailableTaskIds: ReadonlySet<string>;
+  resetRequired?: boolean;
 }) {
   return Boolean(
     input.authoritativeTaskId &&
+      !input.resetRequired &&
       !input.unavailableTaskIds.has(input.authoritativeTaskId) &&
       (input.localTaskId !== input.authoritativeTaskId ||
         input.localPreviousResponseId !== input.authoritativeTaskId),
   );
+}
+
+export function responseLogicContinuationRevision(input: {
+  persistedRevision?: number;
+  activeTaskRevision?: number;
+}) {
+  // A completed task save advances the record revision. Reusing the task's
+  // older operation revision on /turn would incorrectly continue a stale
+  // operation, so only the latest persisted record may authorize a turn.
+  return Number.isSafeInteger(input.persistedRevision) &&
+    Number(input.persistedRevision) > 0
+    ? Number(input.persistedRevision)
+    : undefined;
+}
+
+export function canRequestResponseLogicReset(input: {
+  preview: boolean;
+  record?: Pick<ResponseLogicRecordDto, "questionId">;
+}) {
+  return !input.preview && Boolean(input.record?.questionId);
 }
 
 export default function ResponseLogicWorkspace(
@@ -1278,6 +1352,10 @@ function ResponseLogicWorkspaceContent({
   const persistedRecord = persistence?.records?.find(
     (record) => record.questionId === activeQuestionId,
   );
+  const resetAvailable = canRequestResponseLogicReset({
+    preview,
+    record: persistedRecord,
+  });
 
   const selectGroup = (group: IntentQuestionGroup) => {
     const questionId = group.questions[0].id;
@@ -1627,7 +1705,7 @@ function ResponseLogicWorkspaceContent({
           <QuestionMaintenanceRequestDialog
             mode="response_logic"
             questions={
-              confirmed
+              resetAvailable
                 ? [
                     {
                       id: selectedEntry.question.id,
@@ -1636,8 +1714,9 @@ function ResponseLogicWorkspaceContent({
                   ]
                 : []
             }
-            selectedQuestionId={confirmed ? activeQuestionId : null}
-            disabled={preview || !confirmed}
+            selectedQuestionId={resetAvailable ? activeQuestionId : null}
+            triggerLabel="申请重置应答逻辑"
+            disabled={!resetAvailable}
           />
         </div>
       </header>
@@ -1646,7 +1725,7 @@ function ResponseLogicWorkspaceContent({
         open={requestHistoryOpen}
         onOpenChange={setRequestHistoryOpen}
         title="应答逻辑需求记录"
-        description="仅显示已确认应答逻辑的重置与重新编辑申请。"
+        description="显示草稿、启动失败、处理中或已确认应答逻辑的重置申请。"
         type="knowledge_base"
         surface="response_logic_management"
         preview={preview}
@@ -2036,9 +2115,30 @@ function RealResponseLogicDialogue({
     useState<ResponseLogicTaskStatusEnvelope | null>(null);
   const [unsavedResultId, setUnsavedResultId] = useState<string | null>(null);
   const [loadingOutput, setLoadingOutput] = useState(false);
+  const [startFailure, setStartFailure] = useState<
+    | (ResponseLogicTaskStartFailure & {
+        questionId: string;
+        conversationId: string;
+        continuationTaskId?: string;
+      })
+    | null
+  >(null);
+  const startFailureRef = useRef(startFailure);
+  startFailureRef.current = startFailure;
+  const scopedStartFailure =
+    scopedResponseLogicTaskStartFailure({
+      failure: startFailure,
+      questionId: question.id,
+      conversationId: scopedConversation?.id,
+    }) ??
+    durableResponseLogicResetBarrier({
+      conversation: scopedConversation,
+      questionId: question.id,
+    });
 
   useEffect(() => {
-    if (!lastTaskId || !lastTaskRevision) return;
+    if (!lastTaskId || !lastTaskRevision || scopedStartFailure?.resetRequired)
+      return;
     setActiveDedicatedTask((current) =>
       current?.taskId === lastTaskId &&
       current.operationRevision === lastTaskRevision
@@ -2057,15 +2157,25 @@ function RealResponseLogicDialogue({
     lastTaskRecordedAt,
     lastTaskRevision,
     question.id,
+    scopedStartFailure?.resetRequired,
   ]);
 
   useEffect(() => {
     setLastCompletedObservation(null);
     setUnsavedResultId(null);
+    startFailureRef.current = null;
+    setStartFailure(null);
   }, [conversationId, question.id]);
 
   useEffect(() => {
-    if (!hydrated || recordsLoading || !recordsReady || recordsError) return;
+    if (
+      !hydrated ||
+      recordsLoading ||
+      !recordsReady ||
+      recordsError ||
+      scopedStartFailure?.resetRequired
+    )
+      return;
     if (scopedConversation) {
       initializationRef.current = null;
       const authoritativeTaskId =
@@ -2082,6 +2192,7 @@ function RealResponseLogicDialogue({
           localTaskId: scopedConversation.taskId,
           localPreviousResponseId: scopedConversation.previousResponseId,
           unavailableTaskIds: unavailableTaskIdsRef.current,
+          resetRequired: scopedStartFailure?.resetRequired,
         })
       ) {
         updateStatus(scopedConversation.id, "pending", {
@@ -2129,6 +2240,7 @@ function RealResponseLogicDialogue({
     recordsLoading,
     recordsReady,
     scopedConversation,
+    scopedStartFailure?.resetRequired,
     setActive,
     updateStatus,
     updateTitle,
@@ -2144,12 +2256,23 @@ function RealResponseLogicDialogue({
   >(async () => "ignored");
   applyCompletedObservationRef.current = async (observation) => {
     const conversation = scopedConversationRef.current;
+    const blockingFailure =
+      scopedResponseLogicTaskStartFailure({
+        failure: startFailureRef.current,
+        questionId: question.id,
+        conversationId: conversation?.id,
+      }) ??
+      durableResponseLogicResetBarrier({
+        conversation,
+        questionId: question.id,
+      });
     const currentTaskId =
       scopedActiveDedicatedTask?.taskId || lastTaskId || conversation?.taskId;
     const currentOperationRevision =
       scopedActiveDedicatedTask?.operationRevision || lastTaskRevision;
     if (
       !conversation ||
+      blockingFailure?.resetRequired ||
       observation.taskId !== currentTaskId ||
       observation.operationRevision !== currentOperationRevision
     ) {
@@ -2193,7 +2316,17 @@ function RealResponseLogicDialogue({
       },
       observation.structuredDraft,
     );
-    if (outcome === "ignored") return outcome;
+    const latestFailure =
+      scopedResponseLogicTaskStartFailure({
+        failure: startFailureRef.current,
+        questionId: question.id,
+        conversationId: conversation.id,
+      }) ??
+      durableResponseLogicResetBarrier({
+        conversation: scopedConversationRef.current,
+        questionId: question.id,
+      });
+    if (outcome === "ignored" || latestFailure?.resetRequired) return "ignored";
 
     if (!existingMessage) {
       updateAssistantMessages(conversation.id, [assistantMessage]);
@@ -2224,6 +2357,7 @@ function RealResponseLogicDialogue({
       !recordsReady ||
       recordsError ||
       readOnly ||
+      scopedStartFailure?.resetRequired ||
       !conversationId ||
       !conversation ||
       !taskId ||
@@ -2258,6 +2392,12 @@ function RealResponseLogicDialogue({
           signal: activeController.signal,
         });
         if (disposed) return;
+        const blockingFailure = scopedResponseLogicTaskStartFailure({
+          failure: startFailureRef.current,
+          questionId: question.id,
+          conversationId: conversation.id,
+        });
+        if (blockingFailure?.resetRequired) return;
         consecutiveFailures = 0;
         if (observation.status !== "completed") {
           updateStatus(conversation.id, "running", {
@@ -2337,6 +2477,7 @@ function RealResponseLogicDialogue({
     recordsReady,
     scopedConversation?.id,
     scopedConversation?.status,
+    scopedStartFailure?.resetRequired,
     updateStatus,
   ]);
 
@@ -2383,9 +2524,38 @@ function RealResponseLogicDialogue({
     scopedConversation.taskId;
   const reloadOperationRevision =
     scopedActiveDedicatedTask?.operationRevision || lastTaskRevision;
+  const continuationRevision = responseLogicContinuationRevision({
+    persistedRevision: lastTaskRevision,
+    activeTaskRevision: scopedActiveDedicatedTask?.operationRevision,
+  });
 
   return (
     <>
+      {scopedStartFailure && (
+        <div
+          className="mx-4 mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950"
+          role="alert"
+        >
+          <strong className="block">
+            {scopedStartFailure.resetRequired
+              ? "任务创建结果无法确认"
+              : "任务尚未创建"}
+          </strong>
+          <span className="mt-1 block">
+            {scopedStartFailure.message}
+            {scopedStartFailure.resetRequired
+              ? " 请先申请重置；批准后将以全新会话和全新任务重新开始。"
+              : scopedStartFailure.retryable
+                ? " 当前输入和附件仍保留，可稍后直接重新发送。"
+                : " 请根据提示处理后重新发送。"}
+          </span>
+          {scopedStartFailure.incidentId && (
+            <small className="mt-1 block opacity-75">
+              故障编号：{scopedStartFailure.incidentId}
+            </small>
+          )}
+        </div>
+      )}
       <button
         type="button"
         className="rl-load-reply"
@@ -2395,10 +2565,16 @@ function RealResponseLogicDialogue({
             taskId: reloadTaskId,
             readOnly,
             loading: loadingOutput,
+            resetRequired: scopedStartFailure?.resetRequired,
           })
         }
         onClick={async () => {
-          if (!reloadTaskId || !reloadOperationRevision || !conversationId)
+          if (
+            scopedStartFailure?.resetRequired ||
+            !reloadTaskId ||
+            !reloadOperationRevision ||
+            !conversationId
+          )
             return;
           setLoadingOutput(true);
           try {
@@ -2466,7 +2642,7 @@ function RealResponseLogicDialogue({
       </button>
       <fieldset
         className="rl-home-frame rl-home-fieldset"
-        disabled={readOnly}
+        disabled={readOnly || scopedStartFailure?.resetRequired}
         aria-label={readOnly ? "已确认应答逻辑对话（只读）" : undefined}
       >
         <Home
@@ -2487,8 +2663,7 @@ function RealResponseLogicDialogue({
             intent: question.intent,
             summary: question.summary,
             draft,
-            operationRevision:
-              scopedActiveDedicatedTask?.operationRevision || lastTaskRevision,
+            operationRevision: continuationRevision,
             onTaskStarted: (task) => {
               if (
                 task.questionId !== question.id ||
@@ -2505,6 +2680,24 @@ function RealResponseLogicDialogue({
               });
               setLastCompletedObservation(null);
               setUnsavedResultId(null);
+              startFailureRef.current = null;
+              setStartFailure(null);
+            },
+            onTaskStartFailed: (failure) => {
+              if (
+                failure.questionId !== question.id ||
+                failure.conversationId !== scopedConversation.id
+              ) {
+                return;
+              }
+              startFailureRef.current = failure;
+              setStartFailure(failure);
+              if (failure.resetRequired) {
+                setActiveDedicatedTask(null);
+                setLastCompletedObservation(null);
+                setUnsavedResultId(null);
+                retryRecordsRef.current();
+              }
             },
           }}
           messageProjection={projectResponseLogicConversationMessage}

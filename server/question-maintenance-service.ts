@@ -467,8 +467,6 @@ export async function submitQuestionMaintenance(input: {
         const logicRows = await tx
           .select({
             revision: responseLogicEntries.revision,
-            status: responseLogicEntries.status,
-            confirmed: responseLogicEntries.confirmed,
           })
           .from(responseLogicEntries)
           .where(
@@ -480,10 +478,10 @@ export async function submitQuestionMaintenance(input: {
           .limit(1)
           .for("update");
         const logic = logicRows[0];
-        if (!logic || logic.status !== "confirmed" || !logic.confirmed) {
+        if (!logic) {
           throw new AuthServiceError(
             "CONFLICT",
-            "当前问题没有可申请重置的已确认应答逻辑",
+            "当前问题没有可申请重置的应答逻辑记录",
           );
         }
         responseLogicRevision = logic.revision;
@@ -814,8 +812,6 @@ export async function decideQuestionMaintenance(
     const logicRows = await tx
       .select({
         revision: responseLogicEntries.revision,
-        status: responseLogicEntries.status,
-        confirmed: responseLogicEntries.confirmed,
       })
       .from(responseLogicEntries)
       .where(
@@ -830,8 +826,6 @@ export async function decideQuestionMaintenance(
     if (payload.action === "response_logic_reset") {
       if (
         !currentLogic ||
-        currentLogic.status !== "confirmed" ||
-        !currentLogic.confirmed ||
         currentLogic.revision !== payload.responseLogicRevision ||
         row.ticket.responseLogicRevision !== payload.responseLogicRevision
       ) {
@@ -915,14 +909,21 @@ export async function decideQuestionMaintenance(
     }
 
     if (payload.action === "response_logic_reset") {
-      await tx
+      const deleteResult = await tx
         .delete(responseLogicEntries)
         .where(
           and(
             eq(responseLogicEntries.userId, row.ticket.userId),
             eq(responseLogicEntries.questionId, question.id),
+            eq(responseLogicEntries.revision, payload.responseLogicRevision!),
           ),
         );
+      if (!deleteResult?.[0]?.affectedRows) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "应答逻辑已变更，请刷新后重新提交需求",
+        );
+      }
     }
 
     const publicSummary =

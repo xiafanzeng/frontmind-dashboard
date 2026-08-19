@@ -22,6 +22,8 @@ import {
   assertResponseLogicExpectedTask,
   assertResponseLogicTaskSlotAvailable,
   recordResponseLogicTaskStart,
+  requireResponseLogicProviderReadiness,
+  responseLogicReleasedContinuationMatches,
   saveResponseLogicEntry,
 } from "./response-logic-service";
 
@@ -79,9 +81,275 @@ describe("response logic task persistence", () => {
     ).toThrow(ResponseLogicTaskSupersededError);
   });
 
+  it("pins an approved locked service question and exact fresh conversation before Provider I/O", async () => {
+    const question = {
+      id: "question-1",
+      userId: 42,
+      status: "selected",
+      selectionApprovalStatus: "approved",
+      locked: true,
+      revision: 7,
+      contractId: "contract-1",
+      quotaPeriodId: "period-1",
+    };
+    const record = {
+      questionId: "question-1",
+      conversationId: "conversation-new",
+      lastTaskId: null,
+      revision: 4,
+      confirmed: null,
+    };
+    mocks.getDb.mockResolvedValue({
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === workspaceQuestions
+                  ? [question]
+                  : table === responseLogicEntries
+                    ? [record]
+                    : [],
+              ),
+          }),
+        }),
+      }),
+    });
+
+    await expect(
+      requireResponseLogicProviderReadiness({
+        userId: 42,
+        questionId: "question-1",
+        conversationId: "conversation-new",
+        expectedOperationRevision: 4,
+        expectedQuestionScope: {
+          revision: 7,
+          contractId: "contract-1",
+          quotaPeriodId: "period-1",
+        },
+      }),
+    ).resolves.toEqual({
+      questionScope: {
+        revision: 7,
+        contractId: "contract-1",
+        quotaPeriodId: "period-1",
+      },
+      recordRevision: 4,
+    });
+  });
+
+  it.each([
+    ["missing reset row", null, "conversation-new", 4],
+    [
+      "old conversation",
+      {
+        questionId: "question-1",
+        conversationId: "conversation-old",
+        lastTaskId: null,
+        revision: 4,
+        confirmed: null,
+      },
+      "conversation-new",
+      4,
+    ],
+    [
+      "stale browser revision",
+      {
+        questionId: "question-1",
+        conversationId: "conversation-new",
+        lastTaskId: null,
+        revision: 5,
+        confirmed: null,
+      },
+      "conversation-new",
+      4,
+    ],
+  ])(
+    "rejects %s before Provider I/O",
+    async (_label, record, conversationId, expectedOperationRevision) => {
+      mocks.getDb.mockResolvedValue({
+        select: () => ({
+          from: (table: unknown) => ({
+            where: () => ({
+              limit: () =>
+                awaitedRows(
+                  table === workspaceQuestions
+                    ? [
+                        {
+                          id: "question-1",
+                          userId: 42,
+                          status: "selected",
+                          selectionApprovalStatus: "approved",
+                          locked: true,
+                          revision: 7,
+                          contractId: "contract-1",
+                          quotaPeriodId: "period-1",
+                        },
+                      ]
+                    : table === responseLogicEntries && record
+                      ? [record]
+                      : [],
+                ),
+            }),
+          }),
+        }),
+      });
+
+      await expect(
+        requireResponseLogicProviderReadiness({
+          userId: 42,
+          questionId: "question-1",
+          conversationId,
+          expectedOperationRevision,
+          expectedQuestionScope: {
+            revision: 7,
+            contractId: "contract-1",
+            quotaPeriodId: "period-1",
+          },
+        }),
+      ).rejects.toBeInstanceOf(ResponseLogicTaskSupersededError);
+    },
+  );
+
+  it("rejects an unlocked or out-of-scope question before reading task state", async () => {
+    const selectedTables: unknown[] = [];
+    mocks.getDb.mockResolvedValue({
+      select: () => ({
+        from: (table: unknown) => {
+          selectedTables.push(table);
+          return {
+            where: () => ({
+              limit: () =>
+                awaitedRows(
+                  table === workspaceQuestions
+                    ? [
+                        {
+                          id: "question-1",
+                          userId: 42,
+                          status: "selected",
+                          selectionApprovalStatus: "approved",
+                          locked: false,
+                          revision: 7,
+                          contractId: "contract-1",
+                          quotaPeriodId: "period-1",
+                        },
+                      ]
+                    : [],
+                ),
+            }),
+          };
+        },
+      }),
+    });
+
+    await expect(
+      requireResponseLogicProviderReadiness({
+        userId: 42,
+        questionId: "question-1",
+        conversationId: "conversation-new",
+        expectedOperationRevision: 4,
+        expectedQuestionScope: {
+          revision: 7,
+          contractId: "contract-1",
+          quotaPeriodId: "period-1",
+        },
+      }),
+    ).rejects.toThrow("不再属于有效服务范围");
+    expect(selectedTables).toEqual([workspaceQuestions]);
+  });
+
+  it("accepts only the exact bound task and operation revision for a continuation", async () => {
+    const question = {
+      id: "question-1",
+      userId: 42,
+      status: "selected",
+      selectionApprovalStatus: "approved",
+      locked: true,
+      revision: 7,
+      contractId: "contract-1",
+      quotaPeriodId: "period-1",
+    };
+    const record = {
+      questionId: "question-1",
+      conversationId: "conversation-new",
+      lastTaskId: "task-current",
+      revision: 5,
+      confirmed: null,
+    };
+    mocks.getDb.mockResolvedValue({
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(table === workspaceQuestions ? [question] : [record]),
+          }),
+        }),
+      }),
+    });
+
+    await expect(
+      requireResponseLogicProviderReadiness({
+        userId: 42,
+        questionId: "question-1",
+        conversationId: "conversation-new",
+        taskId: "task-current",
+        expectedOperationRevision: 5,
+        expectedQuestionScope: {
+          revision: 7,
+          contractId: "contract-1",
+          quotaPeriodId: "period-1",
+        },
+      }),
+    ).resolves.toMatchObject({ recordRevision: 5 });
+  });
+
+  it("never authorizes released legacy continuation from conversation history", async () => {
+    await expect(
+      responseLogicReleasedContinuationMatches({
+        userId: 42,
+        conversationId: "conversation-old",
+        taskId: "task-old",
+      }),
+    ).resolves.toBe(false);
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
   it("commits task ownership and the recoverable latest draft in one transaction", async () => {
     const resources: Array<Record<string, any>> = [];
-    const entries: Array<Record<string, any>> = [];
+    const now = new Date("2026-08-19T00:00:00.000Z");
+    const entries: Array<Record<string, any>> = [
+      {
+        id: "entry-1",
+        userId: 42,
+        questionId: "question-1",
+        groupId: "basic",
+        groupTitle: "产品场景",
+        question: "企业有什么核心产品？",
+        intent: "核验产品事实",
+        summary: "给出可核验的产品口径",
+        conversationId: "conversation-1",
+        lastTaskId: null,
+        skillName: "response-logic-builder",
+        skillVersion: "1",
+        skillContentHash: null,
+        draft: {
+          concern: "",
+          conclusion: "",
+          facts: "",
+          pending: "",
+          boundaries: "",
+          references: "",
+          images: [],
+          attachments: [],
+        },
+        confirmed: null,
+        version: 0,
+        revision: 1,
+        status: "draft",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ];
     let transactionCount = 0;
 
     const executor = {
@@ -107,9 +375,14 @@ describe("response logic task persistence", () => {
           if (table === responseLogicEntries) entries.push({ ...value });
         },
       }),
-      update: () => ({
-        set: () => ({
-          where: async () => undefined,
+      update: (table: unknown) => ({
+        set: (values: Record<string, any>) => ({
+          where: async () => {
+            if (table === responseLogicEntries) {
+              Object.assign(entries[0]!, values);
+            }
+            return [{ affectedRows: 1 }];
+          },
         }),
       }),
     };
@@ -147,6 +420,7 @@ describe("response logic task persistence", () => {
       skillName: "response-logic-builder",
       skillVersion: "1",
       skillContentHash: "a".repeat(64),
+      expectedRecordRevision: 1,
       verifiedAttachments: [],
     });
 
@@ -165,6 +439,7 @@ describe("response logic task persistence", () => {
         questionId: "question-1",
         lastTaskId: "task-1",
         conversationId: "conversation-1",
+        revision: 2,
       }),
     ]);
     expect(saved).toMatchObject({
@@ -181,6 +456,7 @@ describe("response logic task persistence", () => {
         userId: 42,
         questionId: "question-1",
         lastTaskId: "task-active",
+        revision: 1,
       },
     ];
     const executor = {
@@ -232,6 +508,7 @@ describe("response logic task persistence", () => {
         skillName: "response-logic-builder",
         skillVersion: "1",
         skillContentHash: "b".repeat(64),
+        expectedRecordRevision: 1,
         verifiedAttachments: [],
       }),
     ).rejects.toBeInstanceOf(ResponseLogicTaskActiveError);
@@ -245,6 +522,7 @@ describe("response logic task persistence", () => {
         userId: 42,
         questionId: "question-1",
         lastTaskId: null,
+        revision: 1,
         confirmed: {
           concern: "已确认",
           conclusion: "已确认",
@@ -308,9 +586,78 @@ describe("response logic task persistence", () => {
         skillName: "response-logic-builder",
         skillVersion: "1",
         skillContentHash: "b".repeat(64),
+        expectedRecordRevision: 1,
         verifiedAttachments: [],
       }),
     ).rejects.toBeInstanceOf(ResponseLogicConfirmedError);
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale provider preflight revision before claiming the task resource", async () => {
+    const insert = vi.fn();
+    const executor = {
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => ({
+            limit: () =>
+              awaitedRows(
+                table === apiCredentials
+                  ? [{ ownerUserId: 42, status: "active" }]
+                  : table === responseLogicEntries
+                    ? [
+                        {
+                          id: "entry-1",
+                          userId: 42,
+                          questionId: "question-1",
+                          conversationId: "conversation-new",
+                          lastTaskId: null,
+                          revision: 2,
+                          confirmed: null,
+                        },
+                      ]
+                    : [],
+              ),
+          }),
+        }),
+      }),
+      insert,
+    };
+    mocks.getDb.mockResolvedValue({
+      transaction: async (callback: (tx: typeof executor) => unknown) =>
+        callback(executor),
+    });
+
+    await expect(
+      recordResponseLogicTaskStart({
+        userId: 42,
+        apiCredentialId: "credential-1",
+        value: {
+          questionId: "question-1",
+          groupId: "basic",
+          groupTitle: "产品场景",
+          question: "企业有什么核心产品？",
+          intent: "核验产品事实",
+          summary: "给出可核验的产品口径",
+          conversationId: "conversation-new",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+        },
+        taskId: "task-created-upstream",
+        skillName: "response-logic-builder",
+        skillVersion: "1",
+        skillContentHash: "b".repeat(64),
+        expectedRecordRevision: 1,
+        verifiedAttachments: [],
+      }),
+    ).rejects.toBeInstanceOf(ResponseLogicRevisionConflictError);
     expect(insert).not.toHaveBeenCalled();
   });
 
@@ -482,6 +829,7 @@ describe("response logic task persistence", () => {
         skillName: "response-logic-builder",
         skillVersion: "1",
         skillContentHash: "c".repeat(64),
+        expectedRecordRevision: 1,
         verifiedAttachments: [],
       }),
     ).rejects.toThrow("不再可编辑");
@@ -542,6 +890,7 @@ describe("response logic task persistence", () => {
         skillName: "response-logic-builder",
         skillVersion: "1",
         skillContentHash: "d".repeat(64),
+        expectedRecordRevision: 1,
         verifiedAttachments: [],
       }),
     ).rejects.toThrow("已不存在");
@@ -604,7 +953,7 @@ describe("response logic task persistence", () => {
       update: () => ({
         set: (values: Record<string, unknown>) => {
           updatedValues = values;
-          return { where: async () => undefined };
+          return { where: async () => [{ affectedRows: 1 }] };
         },
       }),
     };
@@ -632,6 +981,7 @@ describe("response logic task persistence", () => {
       skillVersion: "2",
       skillContentHash: "b".repeat(64),
       preserveExistingSkillBinding: true,
+      expectedRecordRevision: 1,
       verifiedAttachments: [],
     });
 
