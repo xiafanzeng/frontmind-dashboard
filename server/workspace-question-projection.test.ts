@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   confirmWorkspaceBrandKeywordSelection: vi.fn(),
   confirmWorkspaceQuestionIntent: vi.fn(),
   assertServiceCapability: vi.fn(),
+  completeQuestionReviewRequest: vi.fn(),
+  reconcileInitialMonitoringAfterQuestionSelection: vi.fn(),
 }));
 
 vi.mock("./dashboard-service", async (importOriginal) => {
@@ -36,6 +38,25 @@ vi.mock("./service-entitlement", async (importOriginal) => {
       mocks.confirmWorkspaceBrandKeywordSelection,
     confirmWorkspaceQuestionIntent: mocks.confirmWorkspaceQuestionIntent,
     assertServiceCapability: mocks.assertServiceCapability,
+  };
+});
+
+vi.mock("./delivery-role-service", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./delivery-role-service")>();
+  return {
+    ...actual,
+    reconcileInitialMonitoringAfterQuestionSelection:
+      mocks.reconcileInitialMonitoringAfterQuestionSelection,
+  };
+});
+
+vi.mock("./question-maintenance-service", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./question-maintenance-service")>();
+  return {
+    ...actual,
+    completeQuestionReviewRequest: mocks.completeQuestionReviewRequest,
   };
 });
 
@@ -129,6 +150,11 @@ describe("user workspace question DTO boundary", () => {
     mocks.confirmWorkspaceBrandKeywordSelection.mockResolvedValue(question);
     mocks.confirmWorkspaceQuestionIntent.mockResolvedValue(question);
     mocks.assertServiceCapability.mockResolvedValue(undefined);
+    mocks.completeQuestionReviewRequest.mockResolvedValue(undefined);
+    mocks.reconcileInitialMonitoringAfterQuestionSelection.mockResolvedValue({
+      id: "initial-monitoring-ticket",
+      created: true,
+    });
   });
 
   it("loads only the current quota period and strips its internal linkage", async () => {
@@ -195,6 +221,20 @@ describe("user workspace question DTO boundary", () => {
   });
 
   it("resolves a brand keyword row on the server before confirming it", async () => {
+    const selectedQuestion = {
+      ...question,
+      userId: 7,
+      contractId: "contract-current",
+      quotaPeriodId: "period-current",
+      status: "selected",
+      selectionApprovalStatus: "approved",
+    };
+    mocks.confirmWorkspaceBrandKeywordSelection.mockImplementationOnce(
+      async (_input, options) => {
+        await options?.afterWrite?.("transaction", selectedQuestion);
+        return selectedQuestion;
+      },
+    );
     const caller = workspaceRouter.createCaller(userContext());
 
     await caller.requestQuestionSelection({
@@ -205,14 +245,31 @@ describe("user workspace question DTO boundary", () => {
     });
 
     expect(mocks.getDashboardWorkspace).toHaveBeenCalledWith(7);
-    expect(mocks.confirmWorkspaceBrandKeywordSelection).toHaveBeenCalledWith({
+    expect(mocks.confirmWorkspaceBrandKeywordSelection).toHaveBeenCalledWith(
+      {
+        userId: 7,
+        actorUserId: 7,
+        dashboardRevision: 5,
+        tableId: "global-keywords",
+        rowIndex: 0,
+        expectedQuestion: "测试品牌与竞品相比有什么优势？",
+        expectedCategory: "competitor_comparison",
+      },
+      { afterWrite: expect.any(Function) },
+    );
+    expect(mocks.completeQuestionReviewRequest).toHaveBeenCalledWith({
+      executor: "transaction",
       userId: 7,
+      questionId: selectedQuestion.id,
       actorUserId: 7,
-      dashboardRevision: 5,
-      tableId: "global-keywords",
-      rowIndex: 0,
-      expectedQuestion: "测试品牌与竞品相比有什么优势？",
-      expectedCategory: "competitor_comparison",
+      actorRole: "user",
+      message: "该自主填写问题已从正式品牌词库确认并进入当前服务。",
+    });
+    expect(
+      mocks.reconcileInitialMonitoringAfterQuestionSelection,
+    ).toHaveBeenCalledWith({
+      question: selectedQuestion,
+      actorUserId: 7,
     });
   });
 

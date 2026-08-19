@@ -308,10 +308,20 @@ describe("delivery ticket completion contract", () => {
           keywordCatalogPublished: false,
         },
       ),
-    ).toEqual([
-      "正式品牌词库尚未发布，请先通过业务文件发布入口完成发布",
-      "尚无审核通过的客户问题，请先完成问题审核",
-    ]);
+    ).toEqual(["正式品牌词库尚未发布，请先通过业务文件发布入口完成发布"]);
+    expect(
+      deliveryCompletionOptionBlockReasons(
+        { operation: "question_catalog" },
+        {
+          monitoringBatches: [],
+          approvedQuestions: [],
+          keywordCatalogPublished: true,
+        },
+      ),
+    ).toEqual([]);
+    expect(
+      createDeliveryCompletionDraft({ operation: "question_catalog" }).summary,
+    ).toBe("品牌词库已发布");
   });
 
   it("keeps stage-report continuation explicit", () => {

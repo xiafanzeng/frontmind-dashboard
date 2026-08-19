@@ -120,7 +120,7 @@ export function createDeliveryCompletionDraft(
   );
   const existingMonitoringBatchKey = ticket.monitoringBatchKey?.trim() || "";
   return {
-    summary: "",
+    summary: ticket.operation === "question_catalog" ? "品牌词库已发布" : "",
     publicUrl: "",
     previewVerified: false,
     domain: ticket.topic?.trim() || "",
@@ -443,9 +443,6 @@ export function deliveryCompletionOptionBlockReasons(
   if (ticket.operation === "question_catalog") {
     if (!options.keywordCatalogPublished) {
       reasons.push("正式品牌词库尚未发布，请先通过业务文件发布入口完成发布");
-    }
-    if (!options.approvedQuestions.length) {
-      reasons.push("尚无审核通过的客户问题，请先完成问题审核");
     }
     return reasons;
   }

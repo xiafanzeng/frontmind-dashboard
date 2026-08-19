@@ -18,6 +18,8 @@ import {
   ResponseLogicConfirmedError,
   ResponseLogicRevisionConflictError,
   ResponseLogicTaskActiveError,
+  ResponseLogicTaskSupersededError,
+  assertResponseLogicExpectedTask,
   assertResponseLogicTaskSlotAvailable,
   recordResponseLogicTaskStart,
   saveResponseLogicEntry,
@@ -36,6 +38,45 @@ function awaitedRows(rows: unknown[]) {
 describe("response logic task persistence", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("atomically rejects a result after reset or T1→T2 replacement", () => {
+    expect(() =>
+      assertResponseLogicExpectedTask({
+        questionId: "question-1",
+        expectedTaskId: "task-1",
+        expectedOperationRevision: 3,
+        currentTaskId: null,
+        currentRevision: 3,
+      }),
+    ).toThrow(ResponseLogicTaskSupersededError);
+    expect(() =>
+      assertResponseLogicExpectedTask({
+        questionId: "question-1",
+        expectedTaskId: "task-1",
+        expectedOperationRevision: 3,
+        currentTaskId: "task-2",
+        currentRevision: 3,
+      }),
+    ).toThrow(ResponseLogicTaskSupersededError);
+    expect(() =>
+      assertResponseLogicExpectedTask({
+        questionId: "question-1",
+        expectedTaskId: "task-1",
+        expectedOperationRevision: 3,
+        currentTaskId: "task-1",
+        currentRevision: 3,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertResponseLogicExpectedTask({
+        questionId: "question-1",
+        expectedTaskId: "task-1",
+        expectedOperationRevision: 3,
+        currentTaskId: "task-1",
+        currentRevision: 4,
+      }),
+    ).toThrow(ResponseLogicTaskSupersededError);
   });
 
   it("commits task ownership and the recoverable latest draft in one transaction", async () => {
@@ -288,12 +329,13 @@ describe("response logic task persistence", () => {
     ).toThrow(ResponseLogicTaskActiveError);
   });
 
-  it("rejects a stale interactive save before writing the locked row", async () => {
+  it("rejects a stale revision or replaced task before writing the locked row", async () => {
     const update = vi.fn();
     const existingEntry = {
       id: "entry-1",
       userId: 42,
       questionId: "question-1",
+      lastTaskId: "task-2",
       revision: 4,
       confirmed: null,
       draft: {
@@ -351,6 +393,33 @@ describe("response logic task persistence", () => {
         },
       }),
     ).rejects.toBeInstanceOf(ResponseLogicRevisionConflictError);
+
+    await expect(
+      saveResponseLogicEntry({
+        userId: 42,
+        value: {
+          questionId: "question-1",
+          groupId: "basic",
+          groupTitle: "产品场景",
+          question: "企业有什么核心产品？",
+          intent: "核验产品事实",
+          summary: "给出可核验的产品口径",
+          expectedRevision: 4,
+          expectedTaskId: "task-1",
+          draft: {
+            concern: "新内容",
+            conclusion: "新内容",
+            facts: "新内容",
+            pending: "",
+            boundaries: "新内容",
+            references: "新内容",
+            images: [],
+            attachments: [],
+          },
+          publish: false,
+        },
+      }),
+    ).rejects.toBeInstanceOf(ResponseLogicTaskSupersededError);
     expect(update).not.toHaveBeenCalled();
   });
 

@@ -25,7 +25,7 @@ describe("administrator delivery ticket workspace contract", () => {
     expect(ticketTypeLabel("website_operation")).toBe("官网运营");
     expect(ticketTypeLabel("content_asset")).toBe("内容资产");
     expect(ticketTypeLabel("knowledge_base", "question_catalog")).toBe(
-      "品牌词库与问题目录",
+      "配置品牌词库",
     );
     expect(ticketTypeLabel("knowledge_base", "response_logic")).toBe(
       "应答逻辑",

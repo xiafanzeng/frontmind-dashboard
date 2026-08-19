@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   RESPONSE_LOGIC_CUSTOMER_ATTACHMENT_LIMIT,
+  RESPONSE_LOGIC_TASK_STATUS_CACHE_CONTROL,
   ResponseLogicTaskBindingError,
   RESPONSE_LOGIC_SKILL_ATTACHMENT_FILENAME,
   RESPONSE_LOGIC_UPSTREAM_ATTACHMENT_LIMIT,
@@ -19,10 +20,13 @@ import {
   createResponseLogicTaskIdempotencyKey,
   normalizeResponseLogicTaskStatus,
   publicResponseLogicTask,
+  responseLogicTaskResultFromCurrentV2Round,
+  responseLogicTaskStatusEnvelopeRoundTrip,
   responseLogicEvidenceAttachmentFilename,
   responseLogicRecordMatchesConfiguredQuestion,
   responseLogicStructuredDraftFromV2Events,
   responseLogicTurnInputAttachmentFilename,
+  setResponseLogicTaskStatusNoStore,
 } from "./response-logic-api";
 import { assertResponseLogicDraftPublishable } from "./response-logic-service";
 import {
@@ -87,6 +91,151 @@ describe("response logic execution contract", () => {
         },
       ]),
     ).toEqual(value);
+    expect(
+      responseLogicStructuredDraftFromV2Events([
+        {
+          id: "accepted-json-string",
+          type: "structured_output_result",
+          timestamp: 3,
+          structured_output_result: {
+            success: true,
+            value: JSON.stringify(value),
+            error: null,
+          },
+        },
+      ]),
+    ).toEqual(value);
+  });
+
+  it("accepts only the newest operation round and never reuses an older success", () => {
+    const oldValue = {
+      concern: "旧关心",
+      conclusion: "旧结论",
+      facts: "旧事实",
+      boundaries: "旧边界",
+    };
+    const currentMarkdown = `## 用户真实关心
+当前关心
+
+## 核心结论/执行口径
+当前结论
+
+## 企业材料/官方依据
+当前事实（来源路径：knowledge/current.md）。
+
+## 回答边界/禁止表达
+当前边界`;
+    const result = responseLogicTaskResultFromCurrentV2Round([
+      {
+        id: "old-user",
+        type: "user_message",
+        timestamp: 1,
+        user_message: {
+          content:
+            'first\nFRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"old"}',
+        },
+      },
+      {
+        id: "old-result",
+        type: "structured_output_result",
+        timestamp: 2,
+        structured_output_result: {
+          success: true,
+          value: oldValue,
+          error: null,
+        },
+      },
+      {
+        id: "current-user",
+        type: "user_message",
+        timestamp: 3,
+        user_message: {
+          content:
+            'second\nFRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"current"}',
+        },
+      },
+      {
+        id: "current-invalid-structured",
+        type: "structured_output_result",
+        timestamp: 4,
+        structured_output_result: {
+          success: true,
+          value: { ...oldValue, extra: "forbidden" },
+          error: null,
+        },
+      },
+      {
+        id: "current-assistant",
+        type: "assistant_message",
+        timestamp: 5,
+        assistant_message: { content: currentMarkdown },
+      },
+    ]);
+
+    expect(result).toEqual({
+      resultId: "current-assistant",
+      source: "assistant_markdown",
+      structuredDraft: {
+        concern: "当前关心",
+        conclusion: "当前结论",
+        facts: "当前事实（引自知识库文档）。",
+        boundaries: "当前边界",
+      },
+    });
+  });
+
+  it("rejects legacy five/seven-section Markdown in the current operation", () => {
+    expect(
+      responseLogicTaskResultFromCurrentV2Round([
+        {
+          id: "current-user",
+          type: "user_message",
+          timestamp: 1,
+          user_message: {
+            content:
+              'current\nFRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"current"}',
+          },
+        },
+        {
+          id: "legacy-assistant",
+          type: "assistant_message",
+          timestamp: 2,
+          assistant_message: { content: legacyStructuredReply },
+        },
+      ]),
+    ).toBeNull();
+  });
+
+  it("marks the authenticated status payload private and non-cacheable", () => {
+    const setHeader = vi.fn();
+    setResponseLogicTaskStatusNoStore({ setHeader });
+    expect(setHeader).toHaveBeenCalledWith(
+      "Cache-Control",
+      RESPONSE_LOGIC_TASK_STATUS_CACHE_CONTROL,
+    );
+    expect(RESPONSE_LOGIC_TASK_STATUS_CACHE_CONTROL).toBe(
+      "private, no-store, max-age=0",
+    );
+  });
+
+  it("round-trips quotes, newlines, backslashes and emoji before transport", () => {
+    const payload = responseLogicTaskStatusEnvelopeRoundTrip({
+      status: "completed",
+      taskId: "task-escape",
+      operationRevision: 4,
+      model: "frontmind-pro",
+      resultId: "result-escape",
+      source: "structured_output",
+      structuredDraft: {
+        concern: "客户问“为什么”\n第二行 \\ path 😀",
+        conclusion: "结论's",
+        facts: "事实\n- 一\n- 二",
+        boundaries: "不得输出 `internal`",
+      },
+    });
+    expect(payload.structuredDraft.concern).toBe(
+      "客户问“为什么”\n第二行 \\ path 😀",
+    );
   });
 
   afterEach(() => {
@@ -535,6 +684,7 @@ describe("response logic execution contract", () => {
         images: [],
         attachments: [],
       },
+      revision: 4,
       version: 0,
       createdAt: 1,
       updatedAt: 2,
@@ -569,6 +719,7 @@ describe("response logic execution contract", () => {
         questionId: "question-1",
         conversationId: "conversation-1",
         taskId: "task-1",
+        operationRevision: 4,
         record,
         configuredQuestion,
       }),
@@ -582,6 +733,7 @@ describe("response logic execution contract", () => {
         questionId: "question-1",
         conversationId: "conversation-1",
         taskId: "task-1",
+        operationRevision: 4,
         record: releasedRecord,
         configuredQuestion,
       }),
@@ -593,6 +745,7 @@ describe("response logic execution contract", () => {
         questionId: "question-1",
         conversationId: "conversation-1",
         taskId: "task-1",
+        operationRevision: 4,
         record: releasedRecord,
         configuredQuestion,
         releasedContinuationVerified: true,
@@ -605,9 +758,22 @@ describe("response logic execution contract", () => {
         questionId: "question-1",
         conversationId: "conversation-1",
         taskId: "task-new",
+        operationRevision: 4,
         record,
         configuredQuestion,
         releasedContinuationVerified: true,
+      }),
+    ).toThrow(ResponseLogicTaskBindingError);
+    expect(() =>
+      assertResponseLogicTaskBinding({
+        authenticatedUserId: 7,
+        workspaceUserId: 7,
+        questionId: "question-1",
+        conversationId: "conversation-1",
+        taskId: "task-1",
+        operationRevision: 3,
+        record,
+        configuredQuestion,
       }),
     ).toThrow(ResponseLogicTaskBindingError);
 
@@ -630,6 +796,7 @@ describe("response logic execution contract", () => {
           questionId: "question-1",
           conversationId: "conversation-1",
           taskId: "task-1",
+          operationRevision: 4,
           record,
           configuredQuestion,
           ...invalid,

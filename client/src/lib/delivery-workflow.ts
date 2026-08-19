@@ -227,7 +227,7 @@ export function deliveryTicketDependencyBlockReason(
         candidate.status === "completed",
     )
   ) {
-    return "请先完成“品牌词库与问题目录”：至少一条客户选择的问题需要审核通过，随后才能开始首次监控。";
+    return "请先完成“配置品牌词库”并确认至少一条优化问题，随后才能开始首次监控。";
   }
   return null;
 }

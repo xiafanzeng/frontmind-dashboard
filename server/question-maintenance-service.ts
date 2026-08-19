@@ -16,6 +16,8 @@ import { workspaceQuestionCategorySchema } from "../shared/service-portal";
 import {
   assertDeliveryProjectContext,
   deliveryExecutionActorRole,
+  reconcileInitialMonitoringAfterQuestionSelection,
+  type InitialMonitoringQuestionSelection,
 } from "./delivery-role-service";
 import {
   approveWorkspaceQuestionSelection,
@@ -207,7 +209,7 @@ export async function completeQuestionReviewRequest(input: {
   userId: number;
   questionId: string;
   actorUserId: number;
-  actorRole: "admin" | "delivery_member";
+  actorRole: "admin" | "delivery_member" | "user";
   message?: string;
 }) {
   const rows = await input.executor
@@ -607,7 +609,10 @@ export async function decideQuestionMaintenance(
 ) {
   const value = decideQuestionMaintenanceSchema.parse(input);
   const db = await requireDb();
-  return db.transaction(async (tx) => {
+  const reconcileState: {
+    question: InitialMonitoringQuestionSelection | null;
+  } = { question: null };
+  const result = await db.transaction(async (tx) => {
     const row = await requirePendingQuestionMaintenance({
       actor: input.actor,
       projectAssignmentId: value.projectAssignmentId,
@@ -720,7 +725,12 @@ export async function decideQuestionMaintenance(
           category: value.category,
           now,
         },
-        { executor: tx },
+        {
+          executor: tx,
+          afterWrite: async (_executor, approvedQuestion) => {
+            reconcileState.question = approvedQuestion;
+          },
+        },
       );
       const publicSummary = "自主填写问题已通过专业审核并进入当前服务。";
       await tx
@@ -964,4 +974,14 @@ export async function decideQuestionMaintenance(
       replacementQuestionId,
     };
   });
+  if (result.action === "review" && !reconcileState.question) {
+    throw new AuthServiceError("CONFLICT", "问题审核结果缺少当前服务范围");
+  }
+  if (reconcileState.question) {
+    await reconcileInitialMonitoringAfterQuestionSelection({
+      question: reconcileState.question,
+      actorUserId: input.actor.id,
+    });
+  }
+  return result;
 }

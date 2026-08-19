@@ -1409,7 +1409,7 @@ describe("UserBrandDashboard formal workspace", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。",
+        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。",
       ),
     ).toBeInTheDocument();
     expect(
@@ -1570,6 +1570,37 @@ describe("UserBrandDashboard formal workspace", () => {
         classificationVersion: 2,
       }),
     );
+  });
+
+  it("keeps the single question history entry available when selection is disabled and no service question exists", () => {
+    portalUseQuery.mockReturnValue({
+      data: {
+        portal: {
+          ...portalPayload,
+          capabilities: {
+            ...portalPayload.capabilities,
+            questionSelection: {
+              allowed: false,
+              status: "locked",
+              reason: "本期新增问题已锁定。",
+            },
+          },
+          purchasedQuestions: [],
+        },
+      },
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    });
+    render(<UserBrandDashboard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "问题优化" }));
+
+    expect(screen.getAllByRole("button", { name: "需求记录" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
+    expect(
+      screen.getByRole("dialog", { name: "问题需求记录" }),
+    ).toBeInTheDocument();
   });
 
   it("blocks another submission when pending reviews reserve every remaining total slot", () => {

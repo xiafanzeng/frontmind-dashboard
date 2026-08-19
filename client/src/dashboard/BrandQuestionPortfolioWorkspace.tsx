@@ -360,7 +360,7 @@ export default function BrandQuestionPortfolioWorkspace({
                   <td colSpan={5} className="text-center text-[#857e91]">
                     {visibleQuestions.length
                       ? "没有符合当前筛选条件的候选问题。"
-                      : "AI 监控与优化工程师发布问题目录后将在这里展示。"}
+                      : "客户选择或提交的问题审核通过后将在这里展示。"}
                   </td>
                 </tr>
               ) : (

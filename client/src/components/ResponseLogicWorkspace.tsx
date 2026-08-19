@@ -73,8 +73,10 @@ import {
   normalizeResponseLogicPublicText,
   parseResponseLogicStructuredDraft,
   projectResponseLogicAssistantMarkdown,
-  responseLogicStructuredDraftSchema,
+  responseLogicTaskStatusEnvelopeSchema,
+  serializeResponseLogicStructuredDraft,
   type ResponseLogicStructuredDraft,
+  type ResponseLogicTaskStatusEnvelope,
 } from "@shared/response-logic";
 import "./response-logic-workspace.css";
 
@@ -132,8 +134,18 @@ export type ResponseLogicWorkspaceProps = {
 
 export type ResponseLogicPreviewDialogueProps = {
   question: IntentQuestion;
-  onLoadLatestReply: (reply: string) => void | Promise<void>;
+  onLoadLatestReply: (reply: string) => void | Promise<unknown>;
 };
+
+type ResponseLogicLoadResult = "saved" | "displayed_unsaved" | "ignored";
+type ResponseLogicLoadReply = (
+  reply: string,
+  message?: LocalMessage,
+  taskId?: string,
+  operationRevision?: number,
+  onTaskUnavailable?: () => void,
+  suppliedStructuredDraft?: ResponseLogicStructuredDraft,
+) => Promise<ResponseLogicLoadResult>;
 
 export type ResponseLogicPreviewAdapter = {
   createDraft: (
@@ -202,35 +214,138 @@ export class ResponseLogicTaskStatusError extends Error {
   constructor(
     readonly code: string,
     message: string,
+    readonly options: {
+      status?: number;
+      retryable?: boolean;
+      stage?: "transport" | "http" | "response";
+    } = {},
   ) {
     super(message);
     this.name = "ResponseLogicTaskStatusError";
   }
 }
 
-export async function fetchResponseLogicStructuredDraft(input: {
+const RESPONSE_LOGIC_BINDING_FORBIDDEN_CODES = new Set([
+  "RESPONSE_LOGIC_WORKSPACE_FORBIDDEN",
+  "RESPONSE_LOGIC_QUESTION_FORBIDDEN",
+  "RESPONSE_LOGIC_CONVERSATION_FORBIDDEN",
+  "RESPONSE_LOGIC_TASK_FORBIDDEN",
+  "RESPONSE_LOGIC_OPERATION_FORBIDDEN",
+]);
+
+export function isResponseLogicBindingForbiddenCode(code: string) {
+  return RESPONSE_LOGIC_BINDING_FORBIDDEN_CODES.has(code);
+}
+
+export function responseLogicTaskStatusIsRetryable(
+  status: number,
+  code: string,
+) {
+  if (status === 403 && isResponseLogicBindingForbiddenCode(code)) return false;
+  return status === 401 || status === 403 || status === 429 || status >= 500;
+}
+
+export function authoritativeResponseLogicTaskMatches(input: {
+  records: ReadonlyArray<
+    Pick<ResponseLogicRecordDto, "questionId" | "lastTaskId" | "revision">
+  >;
+  questionId: string;
+  taskId: string;
+  operationRevision: number;
+}) {
+  const record = input.records.find(
+    (candidate) => candidate.questionId === input.questionId,
+  );
+  return Boolean(
+    record &&
+      record.lastTaskId === input.taskId &&
+      record.revision === input.operationRevision,
+  );
+}
+
+export function getResponseLogicPollDelay(
+  elapsedMs: number,
+  consecutiveFailures = 0,
+) {
+  const steady = elapsedMs < 5 * 60_000 ? 3_000 : 10_000;
+  return Math.min(30_000, steady * 2 ** Math.min(consecutiveFailures, 3));
+}
+
+export function responseLogicResultMessageId(resultId: string) {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < resultId.length; index += 1) {
+    hash ^= resultId.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619) >>> 0;
+  }
+  const readable = resultId.replace(/[^A-Za-z0-9_-]/gu, "-").slice(0, 72);
+  return `response-logic-${readable || "result"}-${hash.toString(16)}`;
+}
+
+export function canReloadResponseLogicTask(input: {
+  taskId?: string;
+  readOnly: boolean;
+  loading: boolean;
+}) {
+  return Boolean(input.taskId && !input.readOnly && !input.loading);
+}
+
+export async function fetchResponseLogicTaskStatus(input: {
   questionId: string;
   conversationId: string;
   taskId: string;
-}): Promise<ResponseLogicStructuredDraft> {
+  operationRevision: number;
+  signal?: AbortSignal;
+}): Promise<ResponseLogicTaskStatusEnvelope> {
   const query = new URLSearchParams({
     questionId: input.questionId,
     conversationId: input.conversationId,
+    operationRevision: String(input.operationRevision),
   });
-  const response = await fetch(
-    `/api/response-logic/tasks/${encodeURIComponent(input.taskId)}/status?${query.toString()}`,
-    {
-      method: "GET",
-      credentials: "include",
-      headers: { Accept: "application/json" },
-    },
-  );
-  let payload: unknown;
+  let response: Response;
   try {
-    payload = await response.json();
-  } catch {
-    payload = null;
+    response = await fetch(
+      `/api/response-logic/tasks/${encodeURIComponent(input.taskId)}/status?${query.toString()}`,
+      {
+        method: "GET",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+        signal: input.signal,
+      },
+    );
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError")
+      throw error;
+    throw new ResponseLogicTaskStatusError(
+      "RESPONSE_LOGIC_TASK_TRANSPORT_FAILED",
+      "应答逻辑结果传输中断，系统将自动重试",
+      { retryable: true, stage: "transport" },
+    );
   }
+
+  let responseText = "";
+  try {
+    responseText = await response.text();
+  } catch {
+    throw new ResponseLogicTaskStatusError(
+      "RESPONSE_LOGIC_TASK_RESPONSE_READ_FAILED",
+      "应答逻辑结果传输校验失败，系统将自动重试",
+      { status: response.status, retryable: true, stage: "response" },
+    );
+  }
+
+  let payload: unknown = null;
+  try {
+    payload = JSON.parse(responseText);
+  } catch {
+    if (response.ok) {
+      throw new ResponseLogicTaskStatusError(
+        "RESPONSE_LOGIC_TASK_RESPONSE_INVALID_JSON",
+        "应答逻辑结果传输校验失败，系统将自动重试",
+        { status: response.status, retryable: true, stage: "response" },
+      );
+    }
+  }
+
   if (!response.ok) {
     const apiError =
       payload &&
@@ -248,24 +363,42 @@ export async function fetchResponseLogicStructuredDraft(input: {
       apiError && "code" in apiError && typeof apiError.code === "string"
         ? apiError.code
         : "RESPONSE_LOGIC_TASK_READ_FAILED";
-    throw new ResponseLogicTaskStatusError(code, message);
+    throw new ResponseLogicTaskStatusError(code, message, {
+      status: response.status,
+      // Generic session/project authorization can refresh while the provider
+      // task remains valid. Exact binding-forbidden codes are permanent for
+      // this tuple and must instead hand off to the authoritative record.
+      retryable: responseLogicTaskStatusIsRetryable(response.status, code),
+      stage: "http",
+    });
   }
+
+  const parsed = responseLogicTaskStatusEnvelopeSchema.safeParse(payload);
   if (
-    !payload ||
-    typeof payload !== "object" ||
-    !("status" in payload) ||
-    payload.status !== "completed" ||
-    !("structuredDraft" in payload)
+    !parsed.success ||
+    parsed.data.taskId !== input.taskId ||
+    parsed.data.operationRevision !== input.operationRevision
   ) {
-    throw new Error("应答逻辑任务尚未完成，请稍后重试");
-  }
-  const parsed = responseLogicStructuredDraftSchema.safeParse(
-    payload.structuredDraft,
-  );
-  if (!parsed.success) {
-    throw new Error("服务端返回的应答逻辑草稿未通过四栏目校验");
+    throw new ResponseLogicTaskStatusError(
+      "RESPONSE_LOGIC_TASK_RESPONSE_INVALID",
+      "服务端返回的应答逻辑状态未通过传输协议校验",
+      { status: response.status, retryable: true, stage: "response" },
+    );
   }
   return parsed.data;
+}
+
+export async function fetchResponseLogicStructuredDraft(input: {
+  questionId: string;
+  conversationId: string;
+  taskId: string;
+  operationRevision: number;
+}): Promise<ResponseLogicStructuredDraft> {
+  const observation = await fetchResponseLogicTaskStatus(input);
+  if (observation.status !== "completed") {
+    throw new Error("应答逻辑任务尚未完成，请稍后重试");
+  }
+  return observation.structuredDraft;
 }
 
 function responseLogicAttachmentUrl(fileId: string) {
@@ -1180,6 +1313,8 @@ function ResponseLogicWorkspaceContent({
       conversationId?: string;
       publish?: boolean;
       expectedRevision?: number;
+      expectedTaskId?: string;
+      expectedOperationRevision?: number;
     },
   ) => {
     if (preview) return null;
@@ -1193,6 +1328,12 @@ function ResponseLogicWorkspaceContent({
       summary: selectedEntry.question.summary,
       expectedRevision:
         options?.expectedRevision ?? persistedRecord?.revision ?? 0,
+      ...(options?.expectedTaskId
+        ? { expectedTaskId: options.expectedTaskId }
+        : {}),
+      ...(options?.expectedOperationRevision
+        ? { expectedOperationRevision: options.expectedOperationRevision }
+        : {}),
       conversationId: options?.conversationId ?? conversationId,
       draft: nextDraft,
       publish: options?.publish ?? false,
@@ -1220,55 +1361,27 @@ function ResponseLogicWorkspaceContent({
     reply: string,
     message?: LocalMessage,
     taskId?: string,
+    operationRevision?: number,
     onTaskUnavailable?: () => void,
+    suppliedStructuredDraft?: ResponseLogicStructuredDraft,
   ) => {
-    if (confirmed) return;
-    let draftWithVerifiedAttachments = draft;
-    let authoritativeRevision = persistedRecord?.revision ?? 0;
-    if (!preview && persistence) {
-      try {
-        const records = await persistence.refresh();
-        const authoritativeRecord = records.find(
-          (record) => record.questionId === activeQuestionId,
-        );
-        if (
-          taskId &&
-          authoritativeRecord?.lastTaskId &&
-          authoritativeRecord.lastTaskId !== taskId
-        ) {
-          throw new Error(
-            "当前模型输出与服务端记录的最新任务不一致，请重新打开问题",
-          );
-        }
-        authoritativeRevision = authoritativeRecord?.revision ?? 0;
-        draftWithVerifiedAttachments = mergeResponseLogicAttachmentsIntoDraft(
-          draft,
-          authoritativeRecord?.draft.attachments ?? [],
-        );
-      } catch (error) {
-        toast.error("上传资料同步失败", {
-          description:
-            error instanceof Error
-              ? error.message
-              : "无法核对本轮上传资料，请稍后重试",
-        });
-        return;
-      }
-    }
-
+    if (confirmed) return "ignored" as const;
     let parsed: Pick<LogicDraft, LogicTextField>;
     try {
       if (preview) {
         parsed = parseResponseLogicReply(reply);
       } else {
-        if (!taskId || !conversationId) {
+        if (!taskId || !operationRevision || !conversationId) {
           throw new Error("缺少当前问题的会话或任务标识，请重新打开该问题");
         }
-        const structuredDraft = await fetchResponseLogicStructuredDraft({
-          questionId: activeQuestionId,
-          conversationId,
-          taskId,
-        });
+        const structuredDraft =
+          suppliedStructuredDraft ??
+          (await fetchResponseLogicStructuredDraft({
+            questionId: activeQuestionId,
+            conversationId,
+            taskId,
+            operationRevision,
+          }));
         parsed = { ...structuredDraft, pending: "", references: "" };
       }
     } catch (error) {
@@ -1287,7 +1400,7 @@ function ResponseLogicWorkspaceContent({
             ? error.message
             : "模型输出未通过四栏目校验，请重新生成",
       });
-      return;
+      return "ignored" as const;
     }
     const imageCandidates: LogicImage[] = [
       ...(message?.inlineImages || []).map((image, index) => ({
@@ -1311,37 +1424,118 @@ function ResponseLogicWorkspaceContent({
           authorization: "本次应答可用" as const,
         })),
     ];
-    const nextDraft: LogicDraft = {
-      ...draftWithVerifiedAttachments,
+    const draftWithResult: LogicDraft = {
+      ...draft,
       ...parsed,
       images:
         imageCandidates.length > 0
           ? [
-              ...draftWithVerifiedAttachments.images,
+              ...draft.images,
               ...imageCandidates.filter(
                 (candidate) =>
-                  !draftWithVerifiedAttachments.images.some(
-                    (image) => image.url === candidate.url,
-                  ),
+                  !draft.images.some((image) => image.url === candidate.url),
               ),
             ]
-          : draftWithVerifiedAttachments.images,
+          : draft.images,
     };
-    setDrafts((current) => ({
-      ...current,
-      [activeQuestionId]: nextDraft,
-    }));
-    if (!preview) {
+    if (preview) {
+      setDrafts((current) => ({
+        ...current,
+        [activeQuestionId]: draftWithResult,
+      }));
+      return "saved" as const;
+    }
+
+    let nextDraft = draftWithResult;
+    let authoritativeRevision = persistedRecord?.revision ?? 0;
+    if (persistence) {
       try {
-        await persistDraft(nextDraft, {
-          expectedRevision: authoritativeRevision,
-        });
-        toast.success("模型输出已载入应答草稿");
+        const records = await persistence.refresh();
+        const authoritativeRecord = records.find(
+          (record) => record.questionId === activeQuestionId,
+        );
+        if (
+          !taskId ||
+          !operationRevision ||
+          !authoritativeRecord ||
+          authoritativeRecord.lastTaskId !== taskId ||
+          authoritativeRecord.revision !== operationRevision
+        ) {
+          throw new Error(
+            "当前模型输出与服务端记录的最新任务不一致，请重新打开问题",
+          );
+        }
+        authoritativeRevision = operationRevision;
+        nextDraft = mergeResponseLogicAttachmentsIntoDraft(
+          draftWithResult,
+          authoritativeRecord?.draft.attachments ?? [],
+        );
       } catch (error) {
-        toast.error("草稿保存失败", {
-          description: error instanceof Error ? error.message : "请稍后重试",
+        if (
+          error instanceof Error &&
+          error.message.includes("最新任务不一致")
+        ) {
+          toast.error("模型输出未载入", { description: error.message });
+          return "ignored" as const;
+        }
+        // The dedicated status endpoint already authenticated this exact
+        // question/conversation/task tuple. Keep its validated four fields
+        // visible even if the follow-up CAS refresh is temporarily offline.
+        setDrafts((current) => ({
+          ...current,
+          [activeQuestionId]: draftWithResult,
+        }));
+        toast.error("结果已显示但尚未保存", {
+          description:
+            error instanceof Error ? error.message : "连接恢复后请重试保存",
         });
+        return "displayed_unsaved" as const;
       }
+    }
+
+    try {
+      await persistDraft(nextDraft, {
+        expectedRevision: authoritativeRevision,
+        expectedTaskId: taskId,
+        expectedOperationRevision: operationRevision,
+      });
+      setDrafts((current) => ({
+        ...current,
+        [activeQuestionId]: nextDraft,
+      }));
+      toast.success("模型输出已载入应答草稿");
+      return "saved" as const;
+    } catch (error) {
+      if (persistence && taskId && operationRevision) {
+        try {
+          const records = await persistence.refresh();
+          if (
+            !authoritativeResponseLogicTaskMatches({
+              records,
+              questionId: activeQuestionId,
+              taskId,
+              operationRevision,
+            })
+          ) {
+            toast.error("模型输出未载入", {
+              description: "当前任务已被重置或替换，请载入最新任务。",
+            });
+            persistence.retry();
+            return "ignored" as const;
+          }
+        } catch {
+          // The validated result remains useful while persistence is offline.
+          // The atomic expectedTaskId guard still prevents server resurrection.
+        }
+      }
+      setDrafts((current) => ({
+        ...current,
+        [activeQuestionId]: nextDraft,
+      }));
+      toast.error("结果已显示但尚未保存", {
+        description: error instanceof Error ? error.message : "请稍后重试保存",
+      });
+      return "displayed_unsaved" as const;
     }
   };
 
@@ -1497,6 +1691,7 @@ function ResponseLogicWorkspaceContent({
               recordsError={persistence?.error}
               onRetryRecords={() => persistence?.retry()}
               lastTaskId={persistedRecord?.lastTaskId}
+              lastTaskRevision={persistedRecord?.revision}
               lastTaskRecordedAt={persistedRecord?.updatedAt}
               readOnly={Boolean(confirmed)}
               expanded={dialogueExpanded}
@@ -1686,6 +1881,7 @@ function DialoguePanel({
   recordsError,
   onRetryRecords,
   lastTaskId,
+  lastTaskRevision,
   lastTaskRecordedAt,
   readOnly,
   expanded,
@@ -1704,17 +1900,13 @@ function DialoguePanel({
   recordsError?: string;
   onRetryRecords: () => void;
   lastTaskId?: string;
+  lastTaskRevision?: number;
   lastTaskRecordedAt?: number;
   readOnly: boolean;
   expanded: boolean;
   onToggleExpanded: () => void;
   onConversationIdChange: (conversationId: string) => Promise<void>;
-  onLoadLatestReply: (
-    reply: string,
-    message?: LocalMessage,
-    taskId?: string,
-    onTaskUnavailable?: () => void,
-  ) => Promise<void>;
+  onLoadLatestReply: ResponseLogicLoadReply;
 }) {
   return (
     <section className="rl-dialogue-card">
@@ -1761,6 +1953,7 @@ function DialoguePanel({
           recordsError={recordsError}
           onRetryRecords={onRetryRecords}
           lastTaskId={lastTaskId}
+          lastTaskRevision={lastTaskRevision}
           lastTaskRecordedAt={lastTaskRecordedAt}
           readOnly={readOnly}
           onConversationIdChange={onConversationIdChange}
@@ -1781,6 +1974,7 @@ function RealResponseLogicDialogue({
   recordsError,
   onRetryRecords,
   lastTaskId,
+  lastTaskRevision,
   lastTaskRecordedAt,
   readOnly,
   onConversationIdChange,
@@ -1795,15 +1989,11 @@ function RealResponseLogicDialogue({
   recordsError?: string;
   onRetryRecords: () => void;
   lastTaskId?: string;
+  lastTaskRevision?: number;
   lastTaskRecordedAt?: number;
   readOnly: boolean;
   onConversationIdChange: (conversationId: string) => Promise<void>;
-  onLoadLatestReply: (
-    reply: string,
-    message?: LocalMessage,
-    taskId?: string,
-    onTaskUnavailable?: () => void,
-  ) => Promise<void>;
+  onLoadLatestReply: ResponseLogicLoadReply;
 }) {
   const {
     state,
@@ -1811,6 +2001,7 @@ function RealResponseLogicDialogue({
     hydrated,
     createConversation,
     setActive,
+    updateAssistantMessages,
     updateStatus,
     updateTitle,
   } = useConversation();
@@ -1818,31 +2009,90 @@ function RealResponseLogicDialogue({
   const callbackRef = useRef(onConversationIdChange);
   callbackRef.current = onConversationIdChange;
   const unavailableTaskIdsRef = useRef(new Set<string>());
-  const [loadingOutput, setLoadingOutput] = useState(false);
-
   const scopedConversation = conversationId
     ? state.conversations.find(
         (conversation) => conversation.id === conversationId,
       )
     : undefined;
+  const scopedConversationRef = useRef(scopedConversation);
+  scopedConversationRef.current = scopedConversation;
+  const loadLatestReplyRef = useRef(onLoadLatestReply);
+  loadLatestReplyRef.current = onLoadLatestReply;
+  const retryRecordsRef = useRef(onRetryRecords);
+  retryRecordsRef.current = onRetryRecords;
+  const [activeDedicatedTask, setActiveDedicatedTask] = useState<{
+    questionId: string;
+    conversationId?: string;
+    taskId: string;
+    operationRevision: number;
+    startedAt: number;
+  } | null>(null);
+  const scopedActiveDedicatedTask =
+    activeDedicatedTask?.questionId === question.id &&
+    activeDedicatedTask.conversationId === conversationId
+      ? activeDedicatedTask
+      : null;
+  const [lastCompletedObservation, setLastCompletedObservation] =
+    useState<ResponseLogicTaskStatusEnvelope | null>(null);
+  const [unsavedResultId, setUnsavedResultId] = useState<string | null>(null);
+  const [loadingOutput, setLoadingOutput] = useState(false);
+
+  useEffect(() => {
+    if (!lastTaskId || !lastTaskRevision) return;
+    setActiveDedicatedTask((current) =>
+      current?.taskId === lastTaskId &&
+      current.operationRevision === lastTaskRevision
+        ? current
+        : {
+            questionId: question.id,
+            conversationId,
+            taskId: lastTaskId,
+            operationRevision: lastTaskRevision,
+            startedAt: lastTaskRecordedAt || Date.now(),
+          },
+    );
+  }, [
+    conversationId,
+    lastTaskId,
+    lastTaskRecordedAt,
+    lastTaskRevision,
+    question.id,
+  ]);
+
+  useEffect(() => {
+    setLastCompletedObservation(null);
+    setUnsavedResultId(null);
+  }, [conversationId, question.id]);
 
   useEffect(() => {
     if (!hydrated || recordsLoading || !recordsReady || recordsError) return;
     if (scopedConversation) {
       initializationRef.current = null;
+      const authoritativeTaskId =
+        scopedActiveDedicatedTask?.taskId || lastTaskId;
+      const operationRevision =
+        scopedActiveDedicatedTask?.operationRevision || lastTaskRevision;
       if (
+        (Boolean(operationRevision) &&
+          (scopedConversation.status === "running" ||
+            scopedConversation.status === "pending") &&
+          scopedActiveDedicatedTask?.operationRevision !== operationRevision) ||
         shouldHydrateResponseLogicTask({
-          authoritativeTaskId: lastTaskId,
+          authoritativeTaskId,
           localTaskId: scopedConversation.taskId,
           localPreviousResponseId: scopedConversation.previousResponseId,
           unavailableTaskIds: unavailableTaskIdsRef.current,
         })
       ) {
         updateStatus(scopedConversation.id, "pending", {
-          taskId: lastTaskId,
-          previousResponseId: lastTaskId,
+          taskId: authoritativeTaskId,
+          previousResponseId: authoritativeTaskId,
+          executionKind: "response_logic",
           startedAt:
-            scopedConversation.startedAt || lastTaskRecordedAt || Date.now(),
+            scopedConversation.startedAt ||
+            scopedActiveDedicatedTask?.startedAt ||
+            lastTaskRecordedAt ||
+            Date.now(),
         });
         return;
       }
@@ -1864,11 +2114,14 @@ function RealResponseLogicDialogue({
     });
   }, [
     activeConversation?.id,
+    scopedActiveDedicatedTask?.startedAt,
+    scopedActiveDedicatedTask?.taskId,
     conversationId,
     createConversation,
     hydrated,
     lastTaskId,
     lastTaskRecordedAt,
+    lastTaskRevision,
     question.id,
     question.question,
     readOnly,
@@ -1879,6 +2132,212 @@ function RealResponseLogicDialogue({
     setActive,
     updateStatus,
     updateTitle,
+  ]);
+
+  const applyCompletedObservationRef = useRef<
+    (
+      observation: Extract<
+        ResponseLogicTaskStatusEnvelope,
+        { status: "completed" }
+      >,
+    ) => Promise<ResponseLogicLoadResult>
+  >(async () => "ignored");
+  applyCompletedObservationRef.current = async (observation) => {
+    const conversation = scopedConversationRef.current;
+    const currentTaskId =
+      scopedActiveDedicatedTask?.taskId || lastTaskId || conversation?.taskId;
+    const currentOperationRevision =
+      scopedActiveDedicatedTask?.operationRevision || lastTaskRevision;
+    if (
+      !conversation ||
+      observation.taskId !== currentTaskId ||
+      observation.operationRevision !== currentOperationRevision
+    ) {
+      return "ignored";
+    }
+
+    const messageId = responseLogicResultMessageId(observation.resultId);
+    const existingMessage = conversation.messages.find(
+      (message) =>
+        message.id === messageId || message.upstreamOutputId === messageId,
+    );
+    const assistantMessage: LocalMessage = existingMessage ?? {
+      id: messageId,
+      upstreamOutputId: messageId,
+      role: "assistant",
+      content: serializeResponseLogicStructuredDraft(
+        observation.structuredDraft,
+      ),
+      timestamp: Date.now(),
+      responseStartedAt:
+        scopedActiveDedicatedTask?.startedAt ||
+        conversation.startedAt ||
+        lastTaskRecordedAt ||
+        Date.now(),
+      modelName: observation.model,
+    };
+    const outcome = await loadLatestReplyRef.current(
+      assistantMessage.content,
+      assistantMessage,
+      observation.taskId,
+      observation.operationRevision,
+      () => {
+        unavailableTaskIdsRef.current.add(observation.taskId);
+        updateStatus(conversation.id, "error", {
+          clearTaskPointer: true,
+          executionKind: "response_logic",
+          completedAt: Date.now(),
+        });
+        setActiveDedicatedTask(null);
+        retryRecordsRef.current();
+      },
+      observation.structuredDraft,
+    );
+    if (outcome === "ignored") return outcome;
+
+    if (!existingMessage) {
+      updateAssistantMessages(conversation.id, [assistantMessage]);
+    }
+
+    setLastCompletedObservation(observation);
+    setUnsavedResultId(
+      outcome === "displayed_unsaved" ? observation.resultId : null,
+    );
+    updateStatus(conversation.id, "completed", {
+      taskId: observation.taskId,
+      previousResponseId: observation.taskId,
+      executionKind: "response_logic",
+      completedAt: Date.now(),
+    });
+    return outcome;
+  };
+
+  useEffect(() => {
+    const conversation = scopedConversation;
+    const taskId =
+      scopedActiveDedicatedTask?.taskId || lastTaskId || conversation?.taskId;
+    const operationRevision =
+      scopedActiveDedicatedTask?.operationRevision || lastTaskRevision;
+    if (
+      !hydrated ||
+      recordsLoading ||
+      !recordsReady ||
+      recordsError ||
+      readOnly ||
+      !conversationId ||
+      !conversation ||
+      !taskId ||
+      !operationRevision ||
+      (conversation.status !== "running" && conversation.status !== "pending")
+    ) {
+      return;
+    }
+
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let activeController: AbortController | null = null;
+    let consecutiveFailures = 0;
+    const startedAt =
+      scopedActiveDedicatedTask?.startedAt ||
+      conversation.startedAt ||
+      lastTaskRecordedAt ||
+      Date.now();
+    const schedule = (delay: number) => {
+      if (disposed) return;
+      timer = setTimeout(() => void pollOnce(), delay);
+    };
+    const pollOnce = async () => {
+      if (disposed) return;
+      activeController = new AbortController();
+      try {
+        const observation = await fetchResponseLogicTaskStatus({
+          questionId: question.id,
+          conversationId,
+          taskId,
+          operationRevision,
+          signal: activeController.signal,
+        });
+        if (disposed) return;
+        consecutiveFailures = 0;
+        if (observation.status !== "completed") {
+          updateStatus(conversation.id, "running", {
+            taskId,
+            previousResponseId: taskId,
+            executionKind: "response_logic",
+            startedAt,
+          });
+          schedule(getResponseLogicPollDelay(Date.now() - startedAt));
+          return;
+        }
+        await applyCompletedObservationRef.current(observation);
+      } catch (error) {
+        if (
+          disposed ||
+          (error instanceof DOMException && error.name === "AbortError")
+        ) {
+          return;
+        }
+        if (
+          error instanceof ResponseLogicTaskStatusError &&
+          error.options.retryable
+        ) {
+          consecutiveFailures += 1;
+          schedule(
+            getResponseLogicPollDelay(
+              Date.now() - startedAt,
+              consecutiveFailures,
+            ),
+          );
+          return;
+        }
+
+        const unavailable =
+          error instanceof ResponseLogicTaskStatusError &&
+          ([
+            "RESPONSE_LOGIC_TASK_UNAVAILABLE",
+            "RESPONSE_LOGIC_TASK_FAILED",
+          ].includes(error.code) ||
+            isResponseLogicBindingForbiddenCode(error.code));
+        if (unavailable) unavailableTaskIdsRef.current.add(taskId);
+        updateStatus(conversation.id, "error", {
+          ...(unavailable ? { clearTaskPointer: true } : { taskId }),
+          executionKind: "response_logic",
+          completedAt: Date.now(),
+        });
+        if (unavailable) {
+          setActiveDedicatedTask(null);
+          retryRecordsRef.current();
+        }
+        toast.error("应答逻辑任务未完成", {
+          description:
+            error instanceof Error ? error.message : "请稍后重试或重新生成",
+        });
+      }
+    };
+
+    void pollOnce();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      activeController?.abort();
+    };
+  }, [
+    scopedActiveDedicatedTask?.startedAt,
+    scopedActiveDedicatedTask?.taskId,
+    scopedActiveDedicatedTask?.operationRevision,
+    conversationId,
+    hydrated,
+    lastTaskId,
+    lastTaskRecordedAt,
+    lastTaskRevision,
+    question.id,
+    readOnly,
+    recordsError,
+    recordsLoading,
+    recordsReady,
+    scopedConversation?.id,
+    scopedConversation?.status,
+    updateStatus,
   ]);
 
   if (recordsError) {
@@ -1918,12 +2377,12 @@ function RealResponseLogicDialogue({
     );
   }
 
-  const latestAssistantMessage = [...scopedConversation.messages]
-    .reverse()
-    .find(isAuthoritativeResponseLogicAssistantMessage);
-  const taskActive =
-    scopedConversation.status === "running" ||
-    scopedConversation.status === "pending";
+  const reloadTaskId =
+    scopedActiveDedicatedTask?.taskId ||
+    lastTaskId ||
+    scopedConversation.taskId;
+  const reloadOperationRevision =
+    scopedActiveDedicatedTask?.operationRevision || lastTaskRevision;
 
   return (
     <>
@@ -1931,29 +2390,60 @@ function RealResponseLogicDialogue({
         type="button"
         className="rl-load-reply"
         disabled={
-          readOnly || !latestAssistantMessage || taskActive || loadingOutput
+          !reloadOperationRevision ||
+          !canReloadResponseLogicTask({
+            taskId: reloadTaskId,
+            readOnly,
+            loading: loadingOutput,
+          })
         }
         onClick={async () => {
-          if (!latestAssistantMessage) return;
+          if (!reloadTaskId || !reloadOperationRevision || !conversationId)
+            return;
           setLoadingOutput(true);
           try {
-            await onLoadLatestReply(
-              latestAssistantMessage.content,
-              latestAssistantMessage,
-              scopedConversation.taskId,
-              () => {
-                const unavailableTaskId =
-                  scopedConversation.taskId || lastTaskId;
-                if (unavailableTaskId) {
-                  unavailableTaskIdsRef.current.add(unavailableTaskId);
-                }
-                updateStatus(scopedConversation.id, "error", {
-                  clearTaskPointer: true,
-                  completedAt: Date.now(),
-                });
-                onRetryRecords();
-              },
-            );
+            const cached =
+              lastCompletedObservation?.status === "completed" &&
+              lastCompletedObservation.taskId === reloadTaskId &&
+              lastCompletedObservation.operationRevision ===
+                reloadOperationRevision
+                ? lastCompletedObservation
+                : null;
+            const observation =
+              cached ??
+              (await fetchResponseLogicTaskStatus({
+                questionId: question.id,
+                conversationId,
+                taskId: reloadTaskId,
+                operationRevision: reloadOperationRevision,
+              }));
+            if (observation.status !== "completed") {
+              toast.info("应答逻辑仍在生成并校验，请稍后重试");
+              return;
+            }
+            await applyCompletedObservationRef.current(observation);
+          } catch (error) {
+            if (
+              error instanceof ResponseLogicTaskStatusError &&
+              ([
+                "RESPONSE_LOGIC_TASK_UNAVAILABLE",
+                "RESPONSE_LOGIC_TASK_FAILED",
+              ].includes(error.code) ||
+                isResponseLogicBindingForbiddenCode(error.code))
+            ) {
+              unavailableTaskIdsRef.current.add(reloadTaskId);
+              updateStatus(scopedConversation.id, "error", {
+                clearTaskPointer: true,
+                executionKind: "response_logic",
+                completedAt: Date.now(),
+              });
+              setActiveDedicatedTask(null);
+              onRetryRecords();
+            }
+            toast.error("模型输出未载入", {
+              description:
+                error instanceof Error ? error.message : "请稍后重试",
+            });
           } finally {
             setLoadingOutput(false);
           }
@@ -1970,7 +2460,9 @@ function RealResponseLogicDialogue({
           ? "正在载入"
           : readOnly
             ? "应答逻辑已确认"
-            : "载入模型最新输出到应答草稿"}
+            : unsavedResultId
+              ? "重试保存已显示的模型输出"
+              : "载入模型最新输出到应答草稿"}
       </button>
       <fieldset
         className="rl-home-frame rl-home-fieldset"
@@ -1995,6 +2487,25 @@ function RealResponseLogicDialogue({
             intent: question.intent,
             summary: question.summary,
             draft,
+            operationRevision:
+              scopedActiveDedicatedTask?.operationRevision || lastTaskRevision,
+            onTaskStarted: (task) => {
+              if (
+                task.questionId !== question.id ||
+                task.conversationId !== scopedConversation.id
+              ) {
+                return;
+              }
+              setActiveDedicatedTask({
+                questionId: task.questionId,
+                conversationId: task.conversationId,
+                taskId: task.taskId,
+                operationRevision: task.operationRevision,
+                startedAt: task.startedAt,
+              });
+              setLastCompletedObservation(null);
+              setUnsavedResultId(null);
+            },
           }}
           messageProjection={projectResponseLogicConversationMessage}
         />

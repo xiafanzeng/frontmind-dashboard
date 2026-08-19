@@ -310,6 +310,62 @@ describe("useSendMessage", () => {
     expect(result.current.uploadProgress).toBeNull();
   });
 
+  it("hands response-logic tasks to the dedicated poller without ordinary projection", async () => {
+    mocks.createResponseLogicTask.mockResolvedValueOnce({
+      id: "provider-response-task",
+      operationRevision: 4,
+      status: "running",
+      output: [{ id: "raw-provider-output" }],
+    });
+    const onTaskStarted = vi.fn();
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("生成应答逻辑", [], {
+        responseLogicContext: {
+          questionId: "question-1",
+          groupId: "group-1",
+          groupTitle: "行业排名",
+          question: "如何选择测评机构？",
+          intent: "核验资质",
+          summary: "形成可核验口径",
+          draft: {
+            concern: "",
+            conclusion: "",
+            facts: "",
+            pending: "",
+            boundaries: "",
+            references: "",
+            images: [],
+            attachments: [],
+          },
+          onTaskStarted,
+        },
+      });
+    });
+
+    expect(mocks.createResponseLogicTask).toHaveBeenCalledTimes(1);
+    expect(mocks.updateStatus).toHaveBeenCalledWith(
+      "test-conv-id",
+      "running",
+      expect.objectContaining({
+        taskId: "provider-response-task",
+        previousResponseId: "provider-response-task",
+        executionKind: "response_logic",
+      }),
+    );
+    expect(onTaskStarted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        questionId: "question-1",
+        conversationId: "test-conv-id",
+        taskId: "provider-response-task",
+        operationRevision: 4,
+      }),
+    );
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.updateAssistantMessages).not.toHaveBeenCalled();
+  });
+
   it("hands an async knowledge confirmation to the authoritative coordinator without reading raw output", async () => {
     const observation = {
       stateEpoch: 2,

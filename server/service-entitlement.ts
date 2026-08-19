@@ -4953,6 +4953,7 @@ export async function confirmWorkspaceBrandKeywordSelection(
     expectedCategory: WorkspaceQuestionCategory;
     now?: Date;
   },
+  options?: { afterWrite?: WorkspaceQuestionTransactionHook },
 ): Promise<ServicePortalQuestion> {
   const now = input.now ?? new Date();
   const portal = await assertServiceCapability(
@@ -5123,6 +5124,7 @@ export async function confirmWorkspaceBrandKeywordSelection(
           "该问题已按其他类型进入服务，请联系服务团队处理。",
         );
       }
+      await options?.afterWrite?.(tx, existing);
       return toPublicWorkspaceQuestion(existing);
     }
 
@@ -5175,7 +5177,9 @@ export async function confirmWorkspaceBrandKeywordSelection(
             eq(workspaceQuestions.revision, existing.revision),
           ),
         );
-      return toPublicWorkspaceQuestion({ ...existing, ...values });
+      const updatedQuestion: WorkspaceQuestion = { ...existing, ...values };
+      await options?.afterWrite?.(tx, updatedQuestion);
+      return toPublicWorkspaceQuestion(updatedQuestion);
     }
 
     const question: WorkspaceQuestion = {
@@ -5215,6 +5219,7 @@ export async function confirmWorkspaceBrandKeywordSelection(
       updatedAt: selectedAt,
     };
     await tx.insert(workspaceQuestions).values(question);
+    await options?.afterWrite?.(tx, question);
     return toPublicWorkspaceQuestion(question);
   });
 }

@@ -18,15 +18,20 @@ vi.mock("@/components/QuestionMaintenanceRequestDialog", () => ({
 import ResponseLogicWorkspace, {
   ResponseLogicConfirmationBoard,
   ResponseLogicConfirmationPanel,
+  authoritativeResponseLogicTaskMatches,
+  canReloadResponseLogicTask,
   fetchResponseLogicStructuredDraft,
+  fetchResponseLogicTaskStatus,
   isAuthoritativeResponseLogicAssistantMessage,
   isResponseLogicAttachmentExpired,
+  isResponseLogicBindingForbiddenCode,
   mergeResponseLogicAttachmentsIntoDraft,
   parseResponseLogicReply,
   projectResponseLogicConversationMessage,
   ResponseLogicTaskStatusError,
   reconcileResponseLogicDrafts,
   responseLogicPersistenceAvailability,
+  responseLogicTaskStatusIsRetryable,
   shouldHydrateResponseLogicTask,
   shouldUseResponseLogicInitialPrompt,
   useResponseLogicWorkspaceState,
@@ -618,12 +623,16 @@ describe("ResponseLogicWorkspace", () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => ({
-        status: "completed",
-        taskId: "task/1",
-        model: "frontmind-pro",
-        structuredDraft,
-      }),
+      text: async () =>
+        JSON.stringify({
+          status: "completed",
+          taskId: "task/1",
+          operationRevision: 7,
+          model: "frontmind-pro",
+          resultId: "result-1",
+          source: "structured_output",
+          structuredDraft,
+        }),
     });
     vi.stubGlobal("fetch", fetchMock);
 
@@ -632,15 +641,190 @@ describe("ResponseLogicWorkspace", () => {
         questionId: "question-1",
         conversationId: "conversation-1",
         taskId: "task/1",
+        operationRevision: 7,
       }),
     ).resolves.toEqual(structuredDraft);
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/response-logic/tasks/task%2F1/status?questionId=question-1&conversationId=conversation-1",
+      "/api/response-logic/tasks/task%2F1/status?questionId=question-1&conversationId=conversation-1&operationRevision=7",
       expect.objectContaining({
         method: "GET",
         credentials: "include",
       }),
     );
+  });
+
+  it("observes the dedicated 202 → 202 → 200 lifecycle without assistant messages", async () => {
+    const responses = [
+      {
+        status: "running",
+        taskId: "task-sequence",
+        operationRevision: 8,
+        model: "frontmind-pro",
+      },
+      {
+        status: "result_pending",
+        taskId: "task-sequence",
+        operationRevision: 8,
+        model: "frontmind-pro",
+      },
+      {
+        status: "completed",
+        taskId: "task-sequence",
+        operationRevision: 8,
+        model: "frontmind-pro",
+        resultId: "result-sequence",
+        source: "structured_output",
+        structuredDraft: {
+          concern: "用户关心",
+          conclusion: "核心结论",
+          facts: "事实依据",
+          boundaries: "回答边界",
+        },
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async () => {
+        const payload = responses.shift()!;
+        return {
+          ok: true,
+          status: payload.status === "completed" ? 200 : 202,
+          text: async () => JSON.stringify(payload),
+        };
+      }),
+    );
+    const input = {
+      questionId: "question-1",
+      conversationId: "conversation-with-zero-assistant-messages",
+      taskId: "task-sequence",
+      operationRevision: 8,
+    };
+
+    await expect(fetchResponseLogicTaskStatus(input)).resolves.toMatchObject({
+      status: "running",
+    });
+    await expect(fetchResponseLogicTaskStatus(input)).resolves.toMatchObject({
+      status: "result_pending",
+    });
+    await expect(fetchResponseLogicTaskStatus(input)).resolves.toMatchObject({
+      status: "completed",
+      resultId: "result-sequence",
+    });
+    expect(
+      canReloadResponseLogicTask({
+        taskId: "task-sequence",
+        readOnly: false,
+        loading: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps a dedicated 401/403 observation retryable instead of declaring a model failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        text: async () =>
+          JSON.stringify({
+            error: { code: "FORBIDDEN", message: "会话权限正在刷新" },
+          }),
+      }),
+    );
+    const error = await fetchResponseLogicTaskStatus({
+      questionId: "question-1",
+      conversationId: "conversation-1",
+      taskId: "task-1",
+      operationRevision: 3,
+    }).catch((caught) => caught);
+    expect(error).toMatchObject({
+      code: "FORBIDDEN",
+      options: { status: 403, retryable: true, stage: "http" },
+    });
+  });
+
+  it("terminates an exact binding-forbidden tuple but retries generic auth refreshes", async () => {
+    expect(
+      responseLogicTaskStatusIsRetryable(403, "RESPONSE_LOGIC_TASK_FORBIDDEN"),
+    ).toBe(false);
+    expect(
+      isResponseLogicBindingForbiddenCode("RESPONSE_LOGIC_TASK_FORBIDDEN"),
+    ).toBe(true);
+    expect(
+      responseLogicTaskStatusIsRetryable(
+        403,
+        "RESPONSE_LOGIC_OPERATION_FORBIDDEN",
+      ),
+    ).toBe(false);
+    expect(responseLogicTaskStatusIsRetryable(403, "FORBIDDEN")).toBe(true);
+    expect(responseLogicTaskStatusIsRetryable(401, "UNAUTHORIZED")).toBe(true);
+    expect(responseLogicTaskStatusIsRetryable(503, "UPSTREAM_DOWN")).toBe(true);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        text: async () =>
+          JSON.stringify({
+            error: {
+              code: "RESPONSE_LOGIC_TASK_FORBIDDEN",
+              message: "当前任务已被替换",
+            },
+          }),
+      }),
+    );
+    const bindingError = await fetchResponseLogicTaskStatus({
+      questionId: "question-1",
+      conversationId: "conversation-1",
+      taskId: "task-1",
+      operationRevision: 3,
+    }).catch((caught) => caught);
+    expect(bindingError).toMatchObject({
+      code: "RESPONSE_LOGIC_TASK_FORBIDDEN",
+      options: { status: 403, retryable: false, stage: "http" },
+    });
+  });
+
+  it("rejects a reset or T1→T2 replacement before applying a completed result", () => {
+    expect(
+      authoritativeResponseLogicTaskMatches({
+        records: [],
+        questionId: "question-1",
+        taskId: "task-1",
+        operationRevision: 3,
+      }),
+    ).toBe(false);
+    expect(
+      authoritativeResponseLogicTaskMatches({
+        records: [
+          { questionId: "question-1", lastTaskId: "task-2", revision: 3 },
+        ],
+        questionId: "question-1",
+        taskId: "task-1",
+        operationRevision: 3,
+      }),
+    ).toBe(false);
+    expect(
+      authoritativeResponseLogicTaskMatches({
+        records: [
+          { questionId: "question-1", lastTaskId: "task-1", revision: 4 },
+        ],
+        questionId: "question-1",
+        taskId: "task-1",
+        operationRevision: 3,
+      }),
+    ).toBe(false);
+    expect(
+      authoritativeResponseLogicTaskMatches({
+        records: [
+          { questionId: "question-1", lastTaskId: "task-1", revision: 3 },
+        ],
+        questionId: "question-1",
+        taskId: "task-1",
+        operationRevision: 3,
+      }),
+    ).toBe(true);
   });
 
   it("rejects malformed structured status payloads from the client boundary", async () => {
@@ -649,12 +833,18 @@ describe("ResponseLogicWorkspace", () => {
       vi.fn().mockResolvedValue({
         ok: true,
         status: 200,
-        json: async () => ({
-          status: "completed",
-          structuredDraft: {
-            concern: "only one field",
-          },
-        }),
+        text: async () =>
+          JSON.stringify({
+            status: "completed",
+            taskId: "task-1",
+            operationRevision: 3,
+            model: "frontmind-pro",
+            resultId: "result-invalid",
+            source: "structured_output",
+            structuredDraft: {
+              concern: "only one field",
+            },
+          }),
       }),
     );
 
@@ -663,8 +853,32 @@ describe("ResponseLogicWorkspace", () => {
         questionId: "question-1",
         conversationId: "conversation-1",
         taskId: "task-1",
+        operationRevision: 3,
       }),
-    ).rejects.toThrow("未通过四栏目校验");
+    ).rejects.toThrow("未通过传输协议校验");
+  });
+
+  it("distinguishes a truncated JSON delivery from an invalid model result", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => '{"status":"completed","structuredDraft":',
+      }),
+    );
+
+    const error = await fetchResponseLogicStructuredDraft({
+      questionId: "question-1",
+      conversationId: "conversation-1",
+      taskId: "task-1",
+      operationRevision: 3,
+    }).catch((caught) => caught);
+    expect(error).toBeInstanceOf(ResponseLogicTaskStatusError);
+    expect(error).toMatchObject({
+      code: "RESPONSE_LOGIC_TASK_RESPONSE_INVALID_JSON",
+      options: { retryable: true, stage: "response" },
+    });
   });
 
   it("preserves the server task error code so only unavailable tasks reset the local pointer", async () => {
@@ -673,12 +887,13 @@ describe("ResponseLogicWorkspace", () => {
       vi.fn().mockResolvedValue({
         ok: false,
         status: 422,
-        json: async () => ({
-          error: {
-            code: "RESPONSE_LOGIC_TASK_UNAVAILABLE",
-            message: "原应答逻辑任务已不存在，请重新生成",
-          },
-        }),
+        text: async () =>
+          JSON.stringify({
+            error: {
+              code: "RESPONSE_LOGIC_TASK_UNAVAILABLE",
+              message: "原应答逻辑任务已不存在，请重新生成",
+            },
+          }),
       }),
     );
 
@@ -686,6 +901,7 @@ describe("ResponseLogicWorkspace", () => {
       questionId: "question-1",
       conversationId: "conversation-1",
       taskId: "task-gone",
+      operationRevision: 3,
     }).catch((caught) => caught);
     expect(error).toBeInstanceOf(ResponseLogicTaskStatusError);
     expect(error).toMatchObject({

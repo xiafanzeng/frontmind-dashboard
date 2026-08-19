@@ -1359,6 +1359,21 @@ describe("conversation multi-device merge", () => {
     );
   });
 
+  it("preserves the derived response-logic execution boundary in snapshots", () => {
+    const parsed = conversationSnapshotSchema.parse({
+      id: "response-conversation-1",
+      title: "应答-示例问题",
+      status: "running",
+      executionKind: "response_logic",
+      taskId: "provider-task-1",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+    });
+
+    expect(parsed.executionKind).toBe("response_logic");
+  });
+
   it("does not let a stale device roll the task pointer from T2 back to T1", () => {
     const persisted = [
       message("user-turn-1", "user", 100),

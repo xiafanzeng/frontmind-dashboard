@@ -620,7 +620,7 @@ function deliveryRoleTicketScope(actor: AuthenticatedUser) {
 export const MY_DELIVERY_TICKET_LIMIT = 50;
 
 const INITIAL_MONITORING_DEPENDENCY_MESSAGE =
-  "请先完成“品牌词库与问题目录”：至少一条客户选择的问题需要审核通过，随后才能开始首次监控。";
+  "请先完成“配置品牌词库”并确认至少一条优化问题，随后才能开始首次监控。";
 
 type CurrentDeliveryQuotaScope = NonNullable<
   Awaited<ReturnType<typeof resolveCurrentServiceQuotaScope>>
@@ -767,8 +767,8 @@ export function questionCatalogReviewAllowed(input: {
 }) {
   return (
     input.hasActiveCatalog ||
-    (input.progressiveLuxury &&
-      (input.hasCompletedCatalog || input.hasReusableCatalogMilestone))
+    input.hasCompletedCatalog ||
+    input.hasReusableCatalogMilestone
   );
 }
 
@@ -1707,6 +1707,10 @@ export async function createProjectMonitoringHandoffIfReady(input: {
         actorUserId: input.actorUserId,
       });
     }
+    await reconcileInitialMonitoringForCurrentService({
+      userId: input.customerUserId,
+      actorUserId: input.actorUserId,
+    });
   }
 }
 
@@ -2685,8 +2689,7 @@ export async function getMyDeliveryWorkbench(input: {
       role.roleType === "ai_operations_engineer"
         ? {
             websiteWorkspace,
-            knowledgeProgress:
-              toKnowledgeBasePublicPayload(knowledgeProgress),
+            knowledgeProgress: toKnowledgeBasePublicPayload(knowledgeProgress),
             knowledgeSnapshot,
           }
         : null,
@@ -2767,19 +2770,17 @@ async function resolveQuestionCatalogReviewAccess(input: {
     );
   if (input.lock) ticketQuery = ticketQuery.for("update");
   const ticketRows = await ticketQuery;
-  const milestoneRows = questionScope.progressiveLuxury
-    ? await input.executor
-        .select({ id: deliveryWorkflowMilestones.id })
-        .from(deliveryWorkflowMilestones)
-        .where(
-          and(
-            eq(deliveryWorkflowMilestones.userId, input.userId),
-            eq(deliveryWorkflowMilestones.operation, "question_catalog"),
-            deliveryWorkflowMilestoneScopeCondition(questionScope),
-          ),
-        )
-        .limit(1)
-    : [];
+  const milestoneRows = await input.executor
+    .select({ id: deliveryWorkflowMilestones.id })
+    .from(deliveryWorkflowMilestones)
+    .where(
+      and(
+        eq(deliveryWorkflowMilestones.userId, input.userId),
+        eq(deliveryWorkflowMilestones.operation, "question_catalog"),
+        deliveryWorkflowMilestoneScopeCondition(questionScope),
+      ),
+    )
+    .limit(1);
   return {
     allowed: questionCatalogReviewAllowed({
       progressiveLuxury: questionScope.progressiveLuxury,
@@ -2811,22 +2812,37 @@ export async function approveMyCustomerQuestionSelection(input: {
   }
   const db = await requireDb();
   try {
-    return await db.transaction(async (tx) => {
+    const approval = await db.transaction(async (tx) => {
+      const reconcileState: {
+        question: InitialMonitoringQuestionSelection | null;
+      } = { question: null };
+      await tx
+        .select({ id: deliveryProjectAssignments.id })
+        .from(deliveryProjectAssignments)
+        .where(eq(deliveryProjectAssignments.id, input.projectAssignmentId))
+        .limit(1)
+        .for("update");
+      const lockedRole = await assertDeliveryProjectContext({
+        actor: input.actor,
+        projectAssignmentId: input.projectAssignmentId,
+        expectedRoleType: "monitoring_optimization_engineer",
+        executor: tx,
+      });
       const catalogAccess = await resolveQuestionCatalogReviewAccess({
         executor: tx,
-        userId: role.customerUserId,
+        userId: lockedRole.customerUserId,
         questionId: input.questionId,
         lock: true,
       });
       if (!catalogAccess.allowed) {
         throw new AuthServiceError(
           "CONFLICT",
-          "品牌词库与问题目录需求尚未解锁或已经结束",
+          "配置品牌词库需求尚未解锁、完成或形成可复用里程碑",
         );
       }
-      return approveWorkspaceQuestionSelection(
+      const question = await approveWorkspaceQuestionSelection(
         {
-          userId: role.customerUserId,
+          userId: lockedRole.customerUserId,
           questionId: input.questionId,
           expectedRevision: input.expectedRevision,
           category: input.category,
@@ -2835,12 +2851,13 @@ export async function approveMyCustomerQuestionSelection(input: {
         {
           executor: tx,
           afterWrite: async (executor, approvedQuestion) => {
+            reconcileState.question = approvedQuestion;
             const reviewRows = await executor
               .select()
               .from(deliveryTickets)
               .where(
                 and(
-                  eq(deliveryTickets.userId, role.customerUserId),
+                  eq(deliveryTickets.userId, lockedRole.customerUserId),
                   eq(deliveryTickets.sourceQuestionId, approvedQuestion.id),
                   eq(deliveryTickets.operation, "question_maintenance"),
                   eq(deliveryTickets.category, "question_review"),
@@ -2850,49 +2867,62 @@ export async function approveMyCustomerQuestionSelection(input: {
               .limit(1)
               .for("update");
             const review = reviewRows[0];
-            if (!review) return;
-            const now = new Date();
-            const message = "自主填写问题已通过专业审核并进入当前服务。";
-            await executor
-              .update(deliveryTickets)
-              .set({
-                status: "completed",
-                publicSummary: message,
-                technicalDedupeKey: null,
-                resolvedAt: now,
-                revision: sql`${deliveryTickets.revision} + 1`,
-                updatedByUserId: input.actor.id,
-                updatedAt: now,
-              })
-              .where(
-                and(
-                  eq(deliveryTickets.id, review.id),
-                  eq(deliveryTickets.revision, review.revision),
-                ),
-              );
-            await executor.insert(deliveryTicketEvents).values({
-              id: randomUUID(),
-              ticketId: review.id,
-              userId: role.customerUserId,
-              actorUserId: input.actor.id,
-              actorRole:
-                input.actor.role === "admin" ? "admin" : "delivery_member",
-              actorContext: {
-                projectAssignmentId: role.projectAssignmentId,
-                customerUserId: role.customerUserId,
-                roleType: role.roleType,
-              },
-              kind: "status_change",
-              visibility: "customer",
-              message,
-              fromStatus: review.status,
-              toStatus: "completed",
-              createdAt: now,
-            });
+            if (review) {
+              const now = new Date();
+              const message = "自主填写问题已通过专业审核并进入当前服务。";
+              await executor
+                .update(deliveryTickets)
+                .set({
+                  status: "completed",
+                  publicSummary: message,
+                  technicalDedupeKey: null,
+                  resolvedAt: now,
+                  revision: sql`${deliveryTickets.revision} + 1`,
+                  updatedByUserId: input.actor.id,
+                  updatedAt: now,
+                })
+                .where(
+                  and(
+                    eq(deliveryTickets.id, review.id),
+                    eq(deliveryTickets.revision, review.revision),
+                  ),
+                );
+              await executor.insert(deliveryTicketEvents).values({
+                id: randomUUID(),
+                ticketId: review.id,
+                userId: lockedRole.customerUserId,
+                actorUserId: input.actor.id,
+                actorRole:
+                  input.actor.role === "admin" ? "admin" : "delivery_member",
+                actorContext: {
+                  projectAssignmentId: lockedRole.projectAssignmentId,
+                  customerUserId: lockedRole.customerUserId,
+                  roleType: lockedRole.roleType,
+                },
+                kind: "status_change",
+                visibility: "customer",
+                message,
+                fromStatus: review.status,
+                toStatus: "completed",
+                createdAt: now,
+              });
+            }
           },
         },
       );
+      return {
+        question,
+        reconcileQuestion: reconcileState.question,
+      };
     });
+    if (!approval.reconcileQuestion) {
+      throw new AuthServiceError("CONFLICT", "问题审核结果缺少当前服务范围");
+    }
+    await reconcileInitialMonitoringAfterQuestionSelection({
+      question: approval.reconcileQuestion,
+      actorUserId: input.actor.id,
+    });
+    return approval.question;
   } catch (error) {
     if (error instanceof ServiceEntitlementError) {
       throw new AuthServiceError("CONFLICT", error.message);
@@ -2938,7 +2968,7 @@ export async function rejectMyCustomerQuestionSelection(input: {
     if (!catalogAccess.allowed || !catalogAccess.questionScope) {
       throw new AuthServiceError(
         "CONFLICT",
-        "品牌词库与问题目录需求尚未解锁或已经结束",
+        "配置品牌词库需求尚未解锁、完成或形成可复用里程碑",
       );
     }
     const questionRows = await tx
@@ -4116,51 +4146,15 @@ async function syncWorkflowContainer(input: {
   return { rootTicketId: root.id, status: nextStatus };
 }
 
-async function ensureInitialMonitoringWorkflowTicket(input: {
+export async function ensureInitialMonitoringWorkflowTicket(input: {
   executor: any;
-  sourceTicket: typeof deliveryTickets.$inferSelect;
+  sourceTicket: Pick<
+    typeof deliveryTickets.$inferSelect,
+    "userId" | "contractId" | "quotaPeriodId"
+  > &
+    Partial<Pick<typeof deliveryTickets.$inferSelect, "id">>;
   actorUserId: number;
 }) {
-  const projectAssignmentId = input.sourceTicket.assignedProjectAssignmentId;
-  if (!projectAssignmentId) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "问题目录已完成，但监控优化项目负责人尚未配置",
-    );
-  }
-  const assignmentRows = await input.executor
-    .select({ id: deliveryProjectAssignments.id })
-    .from(deliveryProjectAssignments)
-    .where(
-      and(
-        eq(deliveryProjectAssignments.id, projectAssignmentId),
-        eq(
-          deliveryProjectAssignments.customerUserId,
-          input.sourceTicket.userId,
-        ),
-        eq(
-          deliveryProjectAssignments.roleType,
-          "monitoring_optimization_engineer",
-        ),
-      ),
-    )
-    .limit(1)
-    .for("update");
-  const owner = await getActiveDeliveryProjectOwner(
-    input.executor,
-    input.sourceTicket.userId,
-    "monitoring_optimization_engineer",
-  );
-  if (
-    !assignmentRows[0] ||
-    owner?.projectAssignmentId !== projectAssignmentId
-  ) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "问题目录已完成，但当前监控优化项目负责人已变化，请刷新后重试",
-    );
-  }
-
   const now = new Date();
   const activeQuotaSelection = await resolveActiveDeliveryQuotaScopes({
     executor: input.executor,
@@ -4168,16 +4162,13 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
     now,
   });
   const currentScope = activeQuotaSelection
-    ? selectActiveDeliveryQuotaScope({
+    ? findActiveDeliveryQuotaScope({
         selection: activeQuotaSelection,
         record: input.sourceTicket,
       })
     : null;
   if (!currentScope) {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "当前服务合同或运营周期不可用，不能创建首次问题监控需求",
-    );
+    return { id: null, created: false as const };
   }
   const questionScope = deliveryQuestionWorkflowScope(currentScope);
   if (
@@ -4255,9 +4246,7 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
         and(
           eq(deliveryWorkflowMilestones.userId, input.sourceTicket.userId),
           eq(deliveryWorkflowMilestones.operation, "question_catalog"),
-          dependencyScope.progressiveLuxury
-            ? deliveryWorkflowMilestoneScopeCondition(dependencyScope)
-            : undefined,
+          deliveryWorkflowMilestoneScopeCondition(dependencyScope),
         ),
       )
       .limit(1),
@@ -4297,6 +4286,20 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
   const dependencySatisfied =
     Boolean(completedCatalogRows[0] || catalogMilestoneRows[0]) &&
     Boolean(approvedQuestionRows[0]);
+  if (!dependencySatisfied) {
+    return { id: null, created: false as const };
+  }
+  const owner = await getActiveDeliveryProjectOwner(
+    input.executor,
+    input.sourceTicket.userId,
+    "monitoring_optimization_engineer",
+  );
+  if (!owner) {
+    // Question approval and keyword-catalog completion are independent
+    // business writes. A missing assignee must never roll either one back;
+    // assignment reconciliation will call this helper again later.
+    return { id: null, created: false as const };
+  }
   const reusableTicket = scopedExistingTickets.find(
     (ticket: (typeof scopedExistingTickets)[number]) =>
       initialMonitoringExistingTicketAction({
@@ -4351,7 +4354,9 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
         projectAssignmentId: owner.projectAssignmentId,
         customerUserId: input.sourceTicket.userId,
         roleType: "monitoring_optimization_engineer",
-        sourceTicketId: input.sourceTicket.id,
+        ...(input.sourceTicket.id
+          ? { sourceTicketId: input.sourceTicket.id }
+          : {}),
         assignedProjectAssignmentId: owner.projectAssignmentId,
         assignedMemberId: owner.engineerUserId,
       },
@@ -4363,52 +4368,192 @@ async function ensureInitialMonitoringWorkflowTicket(input: {
   }
 
   const ticketId = randomUUID();
-  await input.executor.insert(deliveryTickets).values({
-    id: ticketId,
-    userId: input.sourceTicket.userId,
-    contractId: currentScope.contract.id,
-    quotaPeriodId: currentScope.period.id,
-    type: "website_operation",
-    quotaPool: null,
-    ordinal: 0,
-    clientRequestId: randomUUID(),
-    category: "initial_monitoring",
-    title: "执行首次问题监控",
-    description:
-      "品牌词库与问题目录已经完成，且至少一条优化问题已确认；请执行首次问题监控。",
-    workflowDomain: "monitoring_optimization_engineer",
-    operation: "initial_monitoring",
-    assignedProjectAssignmentId: owner.projectAssignmentId,
-    assignedMemberId: owner.engineerUserId,
-    technicalDedupeKey: "initial-monitoring",
-    quotaState: "consumed",
-    status: "submitted",
-    createdByUserId: input.actorUserId,
-    updatedByUserId: input.actorUserId,
-    createdAt: now,
-    updatedAt: now,
-  });
+  await input.executor
+    .insert(deliveryTickets)
+    .values({
+      id: ticketId,
+      userId: input.sourceTicket.userId,
+      contractId: currentScope.contract.id,
+      quotaPeriodId: currentScope.period.id,
+      type: "website_operation",
+      quotaPool: null,
+      ordinal: 0,
+      clientRequestId: randomUUID(),
+      category: "initial_monitoring",
+      title: "执行首次问题监控",
+      description:
+        "品牌词库配置已经完成，且至少一条优化问题已确认；请执行首次问题监控。",
+      workflowDomain: "monitoring_optimization_engineer",
+      operation: "initial_monitoring",
+      assignedProjectAssignmentId: owner.projectAssignmentId,
+      assignedMemberId: owner.engineerUserId,
+      technicalDedupeKey: "initial-monitoring",
+      quotaState: "consumed",
+      status: "submitted",
+      createdByUserId: input.actorUserId,
+      updatedByUserId: input.actorUserId,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onDuplicateKeyUpdate({
+      set: {
+        technicalDedupeKey: sql`${deliveryTickets.technicalDedupeKey}`,
+      },
+    });
+  const winnerRows = await input.executor
+    .select({ id: deliveryTickets.id })
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.userId, input.sourceTicket.userId),
+        eq(deliveryTickets.technicalDedupeKey, "initial-monitoring"),
+        inArray(deliveryTickets.status, ACTIVE_DELIVERY_STATUSES),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const winnerId = winnerRows[0]?.id;
+  if (!winnerId) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "首次问题监控需求并发创建失败，请刷新后重试",
+    );
+  }
+  if (winnerId !== ticketId) {
+    return { id: winnerId, created: false as const };
+  }
   await input.executor.insert(deliveryTicketEvents).values({
     id: randomUUID(),
-    ticketId,
+    ticketId: winnerId,
     userId: input.sourceTicket.userId,
     actorUserId: input.actorUserId,
     actorRole: "system",
     kind: "created",
     visibility: "customer",
-    message: "优化问题已确认且问题目录已完成，首次问题监控需求现已创建。",
+    message: "优化问题已确认且品牌词库配置已完成，首次问题监控需求现已创建。",
     toStatus: "submitted",
     actorContext: {
       projectAssignmentId: owner.projectAssignmentId,
       customerUserId: input.sourceTicket.userId,
       roleType: "monitoring_optimization_engineer",
-      sourceTicketId: input.sourceTicket.id,
+      ...(input.sourceTicket.id
+        ? { sourceTicketId: input.sourceTicket.id }
+        : {}),
       assignedProjectAssignmentId: owner.projectAssignmentId,
       assignedMemberId: owner.engineerUserId,
     },
     createdAt: now,
   });
-  return { id: ticketId, created: true as const };
+  return { id: winnerId, created: true as const };
+}
+
+export async function ensureInitialMonitoringAfterQuestionSelection(input: {
+  executor: any;
+  question: Pick<
+    typeof workspaceQuestions.$inferSelect,
+    | "userId"
+    | "contractId"
+    | "quotaPeriodId"
+    | "status"
+    | "selectionApprovalStatus"
+  >;
+  actorUserId: number;
+}) {
+  if (
+    input.question.status !== "selected" ||
+    input.question.selectionApprovalStatus !== "approved"
+  ) {
+    return { id: null, created: false as const };
+  }
+  return ensureInitialMonitoringWorkflowTicket({
+    executor: input.executor,
+    sourceTicket: {
+      userId: input.question.userId,
+      contractId: input.question.contractId,
+      quotaPeriodId: input.question.quotaPeriodId,
+    },
+    actorUserId: input.actorUserId,
+  });
+}
+
+export type InitialMonitoringQuestionSelection = Pick<
+  typeof workspaceQuestions.$inferSelect,
+  | "userId"
+  | "contractId"
+  | "quotaPeriodId"
+  | "status"
+  | "selectionApprovalStatus"
+>;
+
+export async function reconcileInitialMonitoringForScope(input: {
+  userId: number;
+  contractId: string;
+  quotaPeriodId: string;
+  actorUserId: number;
+}) {
+  const db = await requireDb();
+  return db.transaction((tx) =>
+    ensureInitialMonitoringWorkflowTicket({
+      executor: tx,
+      sourceTicket: {
+        userId: input.userId,
+        contractId: input.contractId,
+        quotaPeriodId: input.quotaPeriodId,
+      },
+      actorUserId: input.actorUserId,
+    }),
+  );
+}
+
+/**
+ * Reconcile only after the question transaction has committed. This makes the
+ * dependency reads current even when catalog completion and question approval
+ * happen concurrently, and prevents monitoring-ticket failures from rolling
+ * back the customer's selection itself.
+ */
+export async function reconcileInitialMonitoringAfterQuestionSelection(input: {
+  question: InitialMonitoringQuestionSelection;
+  actorUserId: number;
+}) {
+  if (
+    input.question.status !== "selected" ||
+    input.question.selectionApprovalStatus !== "approved"
+  ) {
+    return { id: null, created: false as const };
+  }
+  return reconcileInitialMonitoringForScope({
+    userId: input.question.userId,
+    contractId: input.question.contractId,
+    quotaPeriodId: input.question.quotaPeriodId,
+    actorUserId: input.actorUserId,
+  });
+}
+
+/** Re-run the same idempotent handoff when a monitoring owner is assigned. */
+export async function reconcileInitialMonitoringForCurrentService(input: {
+  userId: number;
+  actorUserId: number;
+}) {
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const selection = await resolveActiveDeliveryQuotaScopes({
+      executor: tx,
+      userId: input.userId,
+    });
+    const scope = selection
+      ? selectActiveDeliveryQuotaScope({ selection })
+      : null;
+    if (!scope) return { id: null, created: false as const };
+    return ensureInitialMonitoringWorkflowTicket({
+      executor: tx,
+      sourceTicket: {
+        userId: input.userId,
+        contractId: scope.contract.id,
+        quotaPeriodId: scope.period.id,
+      },
+      actorUserId: input.actorUserId,
+    });
+  });
 }
 
 async function ensureWebsiteStyleWorkflowTicket(input: {
@@ -4520,7 +4665,14 @@ export async function updateMyDeliveryTicket(input: {
   }
   const systemAdmin = eventActorRole === "admin";
   const db = await requireDb();
-  return db.transaction(async (tx) => {
+  const transactionResult = await db.transaction(async (tx) => {
+    const catalogCompletion: {
+      scope: {
+        userId: number;
+        contractId: string;
+        quotaPeriodId: string;
+      } | null;
+    } = { scope: null };
     const ticketRows = await tx
       .select()
       .from(deliveryTickets)
@@ -4708,33 +4860,11 @@ export async function updateMyDeliveryTicket(input: {
       input.status === "completed" &&
       ticket.operation === "question_catalog"
     ) {
-      const questionScope = await resolveDeliveryTicketQuestionWorkflowScope({
-        executor: tx,
-        ticket,
-      });
-      const questionRows = await tx
-        .select({ id: workspaceQuestions.id })
-        .from(workspaceQuestions)
-        .where(
-          and(
-            eq(workspaceQuestions.userId, ticket.userId),
-            questionScope
-              ? workspaceQuestionDeliveryScopeCondition(questionScope)
-              : sql<boolean>`FALSE`,
-            eq(workspaceQuestions.status, "selected"),
-            eq(workspaceQuestions.selectionApprovalStatus, "approved"),
-          ),
-        )
-        .limit(1);
       const dashboard = await loadPublishedDashboard();
-      if (
-        !questionScope ||
-        !questionRows[0] ||
-        !dashboard?.keywordTables.length
-      ) {
+      if (!dashboard?.keywordTables.length) {
         throw new AuthServiceError(
           "CONFLICT",
-          "完成问题目录需求前必须先发布品牌词库，并至少审核通过一条客户选择的问题",
+          "完成品牌词库配置前必须先发布正式品牌词库",
         );
       }
     }
@@ -4800,7 +4930,7 @@ export async function updateMyDeliveryTicket(input: {
       ) {
         throw new AuthServiceError(
           "CONFLICT",
-          "请先完成品牌词库与问题目录需求，并审核通过客户选择的问题",
+          "请先完成品牌词库配置并审核通过客户选择的问题",
         );
       }
     }
@@ -5351,15 +5481,11 @@ export async function updateMyDeliveryTicket(input: {
     const handoffTicketIds: string[] = [];
     if (effectiveStatus === "completed") {
       if (ticket.operation === "question_catalog") {
-        const initialMonitoringHandoff =
-          await ensureInitialMonitoringWorkflowTicket({
-            executor: tx,
-            sourceTicket: ticket,
-            actorUserId: input.actor.id,
-          });
-        if (initialMonitoringHandoff.created && initialMonitoringHandoff.id) {
-          handoffTicketIds.push(initialMonitoringHandoff.id);
-        }
+        catalogCompletion.scope = {
+          userId: ticket.userId,
+          contractId: ticket.contractId,
+          quotaPeriodId: ticket.quotaPeriodId,
+        };
       } else if (
         ticket.operation === "initial_monitoring" ||
         ticket.operation === "monitoring_import"
@@ -5627,14 +5753,28 @@ export async function updateMyDeliveryTicket(input: {
       );
     }
     return {
-      success: true as const,
-      revision: ticket.revision + 1,
-      retestTicketId,
-      handoffTicketIds,
-      rootTicketId: containerUpdate?.rootTicketId ?? null,
-      rootStatus: containerUpdate?.status ?? null,
+      result: {
+        success: true as const,
+        revision: ticket.revision + 1,
+        retestTicketId,
+        handoffTicketIds,
+        rootTicketId: containerUpdate?.rootTicketId ?? null,
+        rootStatus: containerUpdate?.status ?? null,
+      },
+      completedCatalogScope: catalogCompletion.scope,
     };
   });
+  const { result, completedCatalogScope } = transactionResult;
+  if (completedCatalogScope) {
+    const handoff = await reconcileInitialMonitoringForScope({
+      ...completedCatalogScope,
+      actorUserId: input.actor.id,
+    });
+    if (handoff.created && handoff.id) {
+      result.handoffTicketIds.push(handoff.id);
+    }
+  }
+  return result;
 }
 
 export async function createKnowledgeMonitoringHandoff(input: {
@@ -5814,7 +5954,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
         ordinal: 0,
         clientRequestId: randomUUID(),
         category: operation,
-        title: "配置品牌词库与问题目录",
+        title: "配置品牌词库",
         workflowDomain: "monitoring_optimization_engineer",
         operation,
         assignedProjectAssignmentId: owner?.projectAssignmentId ?? null,
@@ -5832,7 +5972,7 @@ export async function createKnowledgeMonitoringHandoff(input: {
         actorRole: "system",
         kind: "created",
         visibility: "customer",
-        message: "知识库已发布，品牌词库与问题目录配置需求已解锁。",
+        message: "知识库已发布，品牌词库配置需求已解锁。",
         toStatus: "submitted",
         createdAt: new Date(),
       });

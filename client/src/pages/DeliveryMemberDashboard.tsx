@@ -416,11 +416,6 @@ const TICKET_MODULE_IMPORTS: Record<string, BusinessModuleImportDefinition[]> =
         accept:
           ".xlsx,.csv,.json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,application/json",
       },
-      {
-        module: "questions",
-        label: "上传问题目录",
-        accept: ".json,application/json",
-      },
     ],
     initial_monitoring: [
       {
@@ -843,7 +838,8 @@ function BrandTrackingUsageEditor({
           <div>
             <CardTitle>品牌追踪积分</CardTitle>
             <p className="mt-1 text-sm leading-6 text-muted-foreground">
-              仅展示该海外客户由 FrontMind 明确归因的品牌追踪积分消耗；不提供对话内容或凭据配置能力。
+              仅展示该海外客户由 FrontMind
+              明确归因的品牌追踪积分消耗；不提供对话内容或凭据配置能力。
             </p>
           </div>
           <Button
@@ -1818,7 +1814,7 @@ function CustomerWorkbenchView({
           <CardHeader>
             <CardTitle>客户问题审核</CardTitle>
             <p className="text-sm text-muted-foreground">
-              客户提交选择后在这里确认；只有“品牌词库与问题目录”需求处于解锁状态时可以通过。
+              客户提交选择后在这里确认；“配置品牌词库”需求处于执行中、已完成或存在可复用里程碑时可以通过。
             </p>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -3323,7 +3319,7 @@ function DeliveryCompletionDialog({
                 <div>
                   <p className="font-medium">正式品牌词库</p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    这里只核对正式发布结果，不接受手填词库或问题 ID。
+                    这里只核对正式发布结果，不接受手填词库数据。
                   </p>
                 </div>
                 <Badge
@@ -3337,28 +3333,6 @@ function DeliveryCompletionDialog({
                     ? "已发布"
                     : "尚未发布"}
                 </Badge>
-              </div>
-              <div>
-                <p className="font-medium">
-                  审核通过的问题（{completionOptions.approvedQuestions.length}
-                  条）
-                </p>
-                {completionOptions.approvedQuestions.length > 0 ? (
-                  <ul className="mt-2 max-h-48 space-y-2 overflow-y-auto">
-                    {completionOptions.approvedQuestions.map((question) => (
-                      <li
-                        key={question.id}
-                        className="rounded-lg border bg-background px-3 py-2"
-                      >
-                        {question.question}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="mt-2 text-xs text-amber-800">
-                    暂无审核通过的问题。
-                  </p>
-                )}
               </div>
             </section>
           )}

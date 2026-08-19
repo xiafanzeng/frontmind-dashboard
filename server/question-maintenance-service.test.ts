@@ -5,15 +5,21 @@ const dependencies = vi.hoisted(() => ({
   assertDeliveryProjectContext: vi.fn(),
   deliveryExecutionActorRole: vi.fn(),
   assertServiceWriteAccess: vi.fn(),
+  approveWorkspaceQuestionSelection: vi.fn(),
+  reconcileInitialMonitoringAfterQuestionSelection: vi.fn(),
 }));
 
 vi.mock("./db", () => ({ getDb: dependencies.getDb }));
 vi.mock("./delivery-role-service", () => ({
   assertDeliveryProjectContext: dependencies.assertDeliveryProjectContext,
   deliveryExecutionActorRole: dependencies.deliveryExecutionActorRole,
+  reconcileInitialMonitoringAfterQuestionSelection:
+    dependencies.reconcileInitialMonitoringAfterQuestionSelection,
 }));
 vi.mock("./service-entitlement", () => ({
   assertServiceWriteAccess: dependencies.assertServiceWriteAccess,
+  approveWorkspaceQuestionSelection:
+    dependencies.approveWorkspaceQuestionSelection,
   ServiceEntitlementError: class ServiceEntitlementError extends Error {},
 }));
 
@@ -26,6 +32,7 @@ import {
 } from "../drizzle/schema";
 import { deliveryRoleOwnsOperation } from "../shared/delivery-roles";
 import {
+  completeQuestionReviewRequest,
   decideQuestionMaintenance,
   parseQuestionMaintenancePayload,
   serializeQuestionMaintenancePayload,
@@ -146,6 +153,7 @@ function createHarness(options: HarnessOptions = {}) {
         return callback(tx);
       },
     },
+    executor: tx,
     inserts,
     updates,
     deletes,
@@ -191,6 +199,7 @@ function maintenanceTicket(
   revision = 1,
 ) {
   const categories = {
+    review: "question_review",
     modify: "question_modify",
     delete: "question_delete",
     response_logic_reset: "response_logic_reset",
@@ -226,6 +235,19 @@ beforeEach(() => {
   dependencies.assertServiceWriteAccess.mockReset().mockResolvedValue({
     purchasedQuestions: [question()],
   });
+  dependencies.reconcileInitialMonitoringAfterQuestionSelection
+    .mockReset()
+    .mockResolvedValue({ id: "initial-monitoring-ticket", created: true });
+  dependencies.approveWorkspaceQuestionSelection
+    .mockReset()
+    .mockImplementation(async (_input, options) => {
+      const approvedQuestion = question({
+        status: "selected",
+        selectionApprovalStatus: "approved",
+      });
+      await options?.afterWrite?.(options.executor, approvedQuestion);
+      return approvedQuestion;
+    });
 });
 
 describe("question maintenance contract", () => {
@@ -265,6 +287,38 @@ describe("question maintenance contract", () => {
         serializeQuestionMaintenancePayload(request),
       ),
     ).toEqual(request);
+  });
+
+  it("closes an existing review ticket when the same question is confirmed from the brand library", async () => {
+    const harness = createHarness({
+      ticketSelects: [[maintenanceTicket("review")]],
+    });
+
+    await completeQuestionReviewRequest({
+      executor: harness.executor,
+      userId: customer.id,
+      questionId: ids.question,
+      actorUserId: customer.id,
+      actorRole: "user",
+      message: "该自主填写问题已从正式品牌词库确认并进入当前服务。",
+    });
+
+    expect(
+      harness.updates.find((entry) => entry.table === deliveryTickets)?.value,
+    ).toMatchObject({
+      status: "completed",
+      publicSummary: "该自主填写问题已从正式品牌词库确认并进入当前服务。",
+      technicalDedupeKey: null,
+    });
+    expect(
+      harness.inserts.find((entry) => entry.table === deliveryTicketEvents)
+        ?.value,
+    ).toMatchObject({
+      ticketId: ids.ticket,
+      actorRole: "user",
+      fromStatus: "submitted",
+      toStatus: "completed",
+    });
   });
 });
 
@@ -406,6 +460,41 @@ describe("decideQuestionMaintenance", () => {
     });
     return { harness, result };
   }
+
+  it("triggers the idempotent initial-monitoring handoff after approving a review", async () => {
+    const { harness, result } = await approve("review");
+
+    expect(result).toMatchObject({
+      decision: "approved",
+      action: "review",
+      replacementQuestionId: null,
+    });
+    expect(dependencies.approveWorkspaceQuestionSelection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: customer.id,
+        questionId: ids.question,
+        actorUserId: engineer.id,
+      }),
+      expect.objectContaining({
+        executor: expect.any(Object),
+      }),
+    );
+    expect(
+      dependencies.reconcileInitialMonitoringAfterQuestionSelection,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        question: expect.objectContaining({
+          id: ids.question,
+          status: "selected",
+          selectionApprovalStatus: "approved",
+        }),
+        actorUserId: engineer.id,
+      }),
+    );
+    expect(
+      harness.updates.find((entry) => entry.table === deliveryTickets)?.value,
+    ).toMatchObject({ status: "completed" });
+  });
 
   it("archives the old question and creates a clean approved successor on modify", async () => {
     const { harness, result } = await approve("modify");

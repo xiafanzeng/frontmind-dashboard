@@ -138,7 +138,11 @@ import {
 } from "../shared/service-portal";
 import { accountMarketEditionSchema } from "../shared/account-edition";
 import { deliveryRoleTypeSchema } from "../shared/delivery-roles";
-import { createDeliveryEngineer } from "./delivery-role-service";
+import {
+  createDeliveryEngineer,
+  reconcileInitialMonitoringAfterQuestionSelection,
+  type InitialMonitoringQuestionSelection,
+} from "./delivery-role-service";
 import {
   completeManagedServiceUserProvisioning,
   createManagedServiceUser,
@@ -256,7 +260,6 @@ const managedApiKeyReplaceShape = {
   confirmation: z.literal("REPLACE_API_KEY"),
   relatedTicketId: z.string().uuid().optional(),
 } as const;
-
 
 export const adminUpdateServiceSchema = z
   .object({
@@ -1014,6 +1017,9 @@ export const adminRouter = router({
         try {
           await getManagedCredentialStatus(ctx.user, input.userId);
           await assertServiceCapability(input.userId, "questionSelection");
+          const reconcileState: {
+            question: InitialMonitoringQuestionSelection | null;
+          } = { question: null };
           const question = await approveWorkspaceQuestionSelection(
             {
               ...input,
@@ -1021,6 +1027,7 @@ export const adminRouter = router({
             },
             {
               afterWrite: async (executor, approvedQuestion) => {
+                reconcileState.question = approvedQuestion;
                 await completeQuestionReviewRequest({
                   executor,
                   userId: input.userId,
@@ -1032,6 +1039,16 @@ export const adminRouter = router({
               },
             },
           );
+          if (!reconcileState.question) {
+            throw new ServiceEntitlementError(
+              "QUESTION_NOT_CURRENT",
+              "问题审核结果缺少当前服务范围。",
+            );
+          }
+          await reconcileInitialMonitoringAfterQuestionSelection({
+            question: reconcileState.question,
+            actorUserId: ctx.user.id,
+          });
           await writeWorkspaceAuditEvent({
             actor: ctx.user,
             action: "workspace.question.selection_confirmed",

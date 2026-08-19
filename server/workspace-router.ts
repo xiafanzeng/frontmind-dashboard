@@ -79,8 +79,13 @@ import {
 import {
   submitQuestionMaintenance,
   submitQuestionMaintenanceSchema,
+  completeQuestionReviewRequest,
   ensureQuestionReviewRequest,
 } from "./question-maintenance-service";
+import {
+  reconcileInitialMonitoringAfterQuestionSelection,
+  type InitialMonitoringQuestionSelection,
+} from "./delivery-role-service";
 import {
   getJenovaBrandTrackingOverview,
   getJenovaBrandTrackingSession,
@@ -567,12 +572,40 @@ export const workspaceRouter = router({
               resolved.message,
             );
           }
-          question = await confirmWorkspaceBrandKeywordSelection({
-            userId: ctx.user.id,
+          const reconcileState: {
+            question: InitialMonitoringQuestionSelection | null;
+          } = { question: null };
+          question = await confirmWorkspaceBrandKeywordSelection(
+            {
+              userId: ctx.user.id,
+              actorUserId: ctx.user.id,
+              ...reference,
+              expectedQuestion: resolved.selection.question,
+              expectedCategory: resolved.selection.category,
+            },
+            {
+              afterWrite: async (executor, selectedQuestion) => {
+                reconcileState.question = selectedQuestion;
+                await completeQuestionReviewRequest({
+                  executor,
+                  userId: selectedQuestion.userId,
+                  questionId: selectedQuestion.id,
+                  actorUserId: ctx.user.id,
+                  actorRole: "user",
+                  message: "该自主填写问题已从正式品牌词库确认并进入当前服务。",
+                });
+              },
+            },
+          );
+          if (!reconcileState.question) {
+            throw new ServiceEntitlementError(
+              "QUESTION_NOT_CURRENT",
+              "品牌词库选题结果缺少当前服务范围。",
+            );
+          }
+          await reconcileInitialMonitoringAfterQuestionSelection({
+            question: reconcileState.question,
             actorUserId: ctx.user.id,
-            ...reference,
-            expectedQuestion: resolved.selection.question,
-            expectedCategory: resolved.selection.category,
           });
         }
         return {

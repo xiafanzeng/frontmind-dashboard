@@ -209,7 +209,7 @@ export const DELIVERY_OPERATION_SPECS = {
   },
   question_catalog: {
     operation: "question_catalog",
-    label: "品牌词库与问题目录",
+    label: "配置品牌词库",
     ownerRole: "monitoring_optimization_engineer",
     completion: {
       mode: "form",
@@ -217,7 +217,8 @@ export const DELIVERY_OPERATION_SPECS = {
       publicUrl: "hidden",
       previewVerification: "hidden",
     },
-    nextStep: "问题目录完成且客户问题审核通过后，系统会进入首次监控。",
+    nextStep:
+      "品牌词库发布完成后，客户可独立选择或提交问题；问题审核通过后，系统会进入首次监控。",
   },
   question_maintenance: {
     operation: "question_maintenance",

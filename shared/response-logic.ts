@@ -97,6 +97,34 @@ export const responseLogicStructuredDraftSchema = z
   })
   .strict();
 
+const responseLogicTaskStatusBaseSchema = z.object({
+  taskId: z.string().trim().min(1).max(255),
+  operationRevision: z.number().int().positive(),
+  model: z.string().trim().min(1).max(128),
+});
+
+/**
+ * The dedicated response-logic task endpoint never shares the ordinary chat
+ * task envelope. Keeping this as a discriminated union makes a truncated or
+ * cross-wired response fail before any model text can reach the editor.
+ */
+export const responseLogicTaskStatusEnvelopeSchema = z.discriminatedUnion(
+  "status",
+  [
+    responseLogicTaskStatusBaseSchema
+      .extend({ status: z.enum(["running", "result_pending"]) })
+      .strict(),
+    responseLogicTaskStatusBaseSchema
+      .extend({
+        status: z.literal("completed"),
+        resultId: z.string().trim().min(1).max(512),
+        source: z.enum(["structured_output", "assistant_markdown"]),
+        structuredDraft: responseLogicStructuredDraftSchema,
+      })
+      .strict(),
+  ],
+);
+
 export class ResponseLogicOutputContractError extends Error {
   readonly code = "RESPONSE_LOGIC_TASK_OUTPUT_INVALID";
 
@@ -320,6 +348,41 @@ export function parseResponseLogicStructuredDraft(
   return normalizeResponseLogicPublicProvenance(parsed.data);
 }
 
+/**
+ * Parse only the currently dispatched four-section contract. Server-side
+ * status recovery must not accept a legacy five/seven-section assistant turn:
+ * those compatibility shapes are reserved for explicitly loaded historical
+ * content and must never satisfy a newly completed provider operation.
+ */
+export function parseCurrentResponseLogicStructuredDraft(
+  markdown: string,
+): ResponseLogicStructuredDraft {
+  const normalized = markdown
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  if (!normalized) {
+    throw new ResponseLogicOutputContractError("模型没有返回应答逻辑内容");
+  }
+  const parsedSections = parseResponseLogicSections(
+    normalized,
+    RESPONSE_LOGIC_MODEL_SECTIONS,
+  );
+  const values = Object.fromEntries(
+    RESPONSE_LOGIC_MODEL_SECTIONS.map((section) => [
+      section.field,
+      parsedSections[section.field],
+    ]),
+  );
+  const parsed = responseLogicStructuredDraftSchema.safeParse(values);
+  if (!parsed.success) {
+    throw new ResponseLogicOutputContractError(
+      "模型输出栏目内容超出允许范围或格式无效",
+    );
+  }
+  return normalizeResponseLogicPublicProvenance(parsed.data);
+}
+
 export const confirmedResponseLogicSchema = responseLogicDraftSchema.extend({
   version: z.number().int().positive(),
   updatedAt: z.string().datetime(),
@@ -341,6 +404,10 @@ export const saveResponseLogicSchema = responseLogicQuestionSchema.extend({
    * response logic record.
    */
   expectedRevision: z.number().int().nonnegative().default(0),
+  /** Atomic guard used when persisting one validated provider task result. */
+  expectedTaskId: z.string().trim().min(1).max(255).optional(),
+  /** Exact response-logic operation that produced the validated result. */
+  expectedOperationRevision: z.number().int().positive().optional(),
   conversationId: z.string().trim().min(1).max(191).optional(),
   draft: responseLogicDraftSchema,
   publish: z.boolean().default(false),
@@ -356,6 +423,9 @@ export type ResponseLogicAttachment = z.infer<
 export type ResponseLogicDraft = z.infer<typeof responseLogicDraftSchema>;
 export type ResponseLogicStructuredDraft = z.infer<
   typeof responseLogicStructuredDraftSchema
+>;
+export type ResponseLogicTaskStatusEnvelope = z.infer<
+  typeof responseLogicTaskStatusEnvelopeSchema
 >;
 export type ConfirmedResponseLogic = z.infer<
   typeof confirmedResponseLogicSchema

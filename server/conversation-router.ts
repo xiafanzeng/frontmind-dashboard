@@ -14,6 +14,7 @@ import {
   knowledgeBaseResetRequests,
   localAssets,
   messages,
+  responseLogicEntries,
   upstreamResources,
   users,
   type MessageMetadata,
@@ -131,6 +132,7 @@ export const conversationSnapshotSchema = z.object({
   messages: z.array(messageSchema).max(5_000),
   taskId: z.string().max(255).optional(),
   previousResponseId: z.string().max(255).optional(),
+  executionKind: z.enum(["response_logic"]).optional(),
   status: z.enum([
     "idle",
     "running",
@@ -2229,6 +2231,16 @@ export async function listSnapshots(
   if (conversationRows.length === 0) return [];
 
   const ids = conversationRows.map((row) => row.id);
+  const responseLogicConversationIds = new Set(
+    projectAssignmentId
+      ? []
+      : (
+          await db
+            .select({ conversationId: responseLogicEntries.conversationId })
+            .from(responseLogicEntries)
+            .where(eq(responseLogicEntries.userId, userId))
+        ).flatMap((row) => (row.conversationId ? [row.conversationId] : [])),
+  );
   const messageRows = await db
     .select()
     .from(messages)
@@ -2293,6 +2305,11 @@ export async function listSnapshots(
 
   return conversationRows.map((row) => ({
     id: publicId(userId, row.id, projectAssignmentId),
+    ...(responseLogicConversationIds.has(
+      publicId(userId, row.id, projectAssignmentId),
+    )
+      ? { executionKind: "response_logic" as const }
+      : {}),
     title: row.title,
     messages: (messagesByConversation.get(row.id) ?? []).map((message) => {
       const metadata = (message.metadata ?? {}) as MessageMetadata;

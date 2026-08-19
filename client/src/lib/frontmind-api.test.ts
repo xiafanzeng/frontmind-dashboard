@@ -163,7 +163,12 @@ describe("createResponseLogicTask", () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        task: { id: "task-response-logic", status: "running", output: [] },
+        task: {
+          id: "task-response-logic",
+          operationRevision: 4,
+          status: "running",
+          output: [],
+        },
       }),
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -201,6 +206,7 @@ describe("createResponseLogicTask", () => {
           images: [],
           attachments: [],
         },
+        onTaskStarted: vi.fn(),
       },
     );
 
@@ -218,6 +224,7 @@ describe("createResponseLogicTask", () => {
         mime_type: "image/png",
       },
     ]);
+    expect(body).not.toHaveProperty("onTaskStarted");
   });
 });
 

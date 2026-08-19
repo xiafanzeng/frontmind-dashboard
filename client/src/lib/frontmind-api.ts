@@ -181,6 +181,8 @@ export interface Message {
 
 export interface TaskResponse {
   id: string;
+  /** Response-logic operation boundary; absent on ordinary tasks. */
+  operationRevision?: number;
   object?: string;
   status: "running" | "pending" | "completed" | "error" | "failed";
   model?: string;
@@ -238,6 +240,16 @@ export interface ResponseLogicTaskContext {
   intent: string;
   summary: string;
   draft: ResponseLogicDraft;
+  /** Required for a continuation on the same provider task. */
+  operationRevision?: number;
+  /** Client-only handoff to the dedicated response-logic poller. */
+  onTaskStarted?: (task: {
+    questionId: string;
+    conversationId: string;
+    taskId: string;
+    operationRevision: number;
+    startedAt: number;
+  }) => void;
 }
 
 /**
@@ -1089,6 +1101,7 @@ export async function createResponseLogicTask(
     CREATE_TASK_TIMEOUT_MS,
   );
   try {
+    const { onTaskStarted: _onTaskStarted, ...requestContext } = context;
     const response = await fetch(
       context.taskId ? "/api/response-logic/turn" : "/api/response-logic/start",
       {
@@ -1097,7 +1110,7 @@ export async function createResponseLogicTask(
         credentials: "include",
         signal: controller.signal,
         body: JSON.stringify({
-          ...context,
+          ...requestContext,
           userMessage: buildPromptText(input),
           attachments: extractAttachments(input, true),
         }),
@@ -1122,9 +1135,14 @@ export async function createResponseLogicTask(
     const data = withoutProviderTaskNavigationUrls(payload?.task || payload);
     const taskId = data?.id || data?.task_id;
     if (!taskId) throw new Error("任务创建失败：未返回任务 ID");
+    const operationRevision = Number(data?.operationRevision);
+    if (!Number.isSafeInteger(operationRevision) || operationRevision < 1) {
+      throw new Error("任务创建失败：未返回有效的应答逻辑轮次");
+    }
     return {
       ...data,
       id: taskId,
+      operationRevision,
       status: data.status === "failed" ? "error" : data.status || "running",
       metadata: {
         ...(data.metadata || {}),

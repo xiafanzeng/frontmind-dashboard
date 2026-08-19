@@ -1570,7 +1570,7 @@ describe("DeliveryMemberDashboard project context", () => {
     expect(screen.getByText(/复测前基线：baseline-batch/)).toBeInTheDocument();
   });
 
-  it("shows question-catalog evidence as read-only and blocks completion until it is formal", async () => {
+  it("shows brand-keyword evidence as read-only and blocks completion until it is formal", async () => {
     mocks.assignments = [monitoringAssignment];
     mocks.workbenchData = {
       customers: [],
@@ -1578,7 +1578,7 @@ describe("DeliveryMemberDashboard project context", () => {
         {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d93",
           userId: 101,
-          title: "发布品牌词库与问题目录",
+          title: "配置品牌词库",
           operation: "question_catalog",
           status: "in_progress",
           revision: 2,
@@ -1598,14 +1598,14 @@ describe("DeliveryMemberDashboard project context", () => {
       screen.getByText("当前正式数据尚不满足完成条件"),
     ).toBeInTheDocument();
     expect(screen.getByText("尚未发布")).toBeInTheDocument();
-    expect(screen.getByText("审核通过的问题（0条）")).toBeInTheDocument();
+    expect(screen.queryByText(/审核通过的问题/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "完成并交接" })).toBeDisabled();
     expect(
       screen.queryByRole("textbox", { name: /词库|问题 ID/ }),
     ).not.toBeInTheDocument();
   });
 
-  it("allows question-catalog completion after the published lexicon and approved questions are visible", async () => {
+  it("allows brand-keyword completion after publication without requiring an approved question", async () => {
     mocks.assignments = [monitoringAssignment];
     mocks.workbenchData = {
       customers: [],
@@ -1613,23 +1613,14 @@ describe("DeliveryMemberDashboard project context", () => {
         {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d94",
           userId: 101,
-          title: "发布品牌词库与问题目录",
+          title: "配置品牌词库",
           operation: "question_catalog",
           status: "in_progress",
           revision: 3,
         },
       ],
       monitoringBatches: [],
-      customerQuestions: [
-        {
-          id: "approved-catalog-question",
-          category: "product_scenario",
-          question: "产品适合哪些正式使用场景？",
-          status: "selected",
-          selectionApprovalStatus: "approved",
-          revision: 2,
-        },
-      ],
+      customerQuestions: [],
       dashboard: {
         revision: 4,
         payload: {
@@ -1662,14 +1653,13 @@ describe("DeliveryMemberDashboard project context", () => {
     );
 
     expect(screen.getByText("已发布")).toBeInTheDocument();
-    expect(screen.getByText("审核通过的问题（1条）")).toBeInTheDocument();
-    expect(screen.getByText("产品适合哪些正式使用场景？")).toBeInTheDocument();
+    expect(screen.queryByText(/审核通过的问题/)).not.toBeInTheDocument();
     expect(
       screen.queryByText("当前正式数据尚不满足完成条件"),
     ).not.toBeInTheDocument();
-    fireEvent.change(screen.getByRole("textbox", { name: /交付结果摘要/ }), {
-      target: { value: "正式词库已发布，问题目录审核完成。" },
-    });
+    expect(screen.getByRole("textbox", { name: /交付结果摘要/ })).toHaveValue(
+      "品牌词库已发布",
+    );
     fireEvent.click(screen.getByRole("button", { name: "完成并交接" }));
 
     await waitFor(() =>
@@ -1678,7 +1668,7 @@ describe("DeliveryMemberDashboard project context", () => {
         ticketId: "4a67e445-37bb-45ed-9268-4ca9437e4d94",
         expectedRevision: 3,
         status: "completed",
-        message: "正式词库已发布，问题目录审核完成。",
+        message: "品牌词库已发布",
       }),
     );
   });
@@ -1805,7 +1795,7 @@ describe("DeliveryMemberDashboard project context", () => {
     );
   });
 
-  it("previews a business module in a structured dialog before publishing", async () => {
+  it("exposes only the brand-keyword upload for a catalog ticket", async () => {
     mocks.assignments = [
       {
         projectAssignmentId: "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
@@ -1829,7 +1819,7 @@ describe("DeliveryMemberDashboard project context", () => {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d74",
           userId: 101,
           customerName: "示例客户",
-          title: "发布问题目录",
+          title: "配置品牌词库",
           operation: "question_catalog",
           status: "in_progress",
           revision: 2,
@@ -1839,27 +1829,25 @@ describe("DeliveryMemberDashboard project context", () => {
       customerQuestions: [],
       dashboard: null,
     };
-    const confirmSpy = vi.spyOn(window, "confirm");
-    const promptSpy = vi.spyOn(window, "prompt");
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           preview: {
-            sourceName: "question-catalog.json",
+            sourceName: "brand-keywords.json",
             fileHash: "a".repeat(64),
             preflightToken: "signed-preflight-token",
-            summary: ["问题目录将由 4 条更新为 6 条"],
+            summary: ["品牌词库将由 0 条更新为 160 条"],
             recordStats: [
               {
-                label: "问题目录",
-                beforeCount: 4,
-                afterCount: 6,
-                added: 2,
+                label: "品牌词库",
+                beforeCount: 0,
+                afterCount: 160,
+                added: 160,
                 updated: 0,
                 removed: 0,
-                unchanged: 4,
+                unchanged: 0,
               },
             ],
           },
@@ -1869,18 +1857,18 @@ describe("DeliveryMemberDashboard project context", () => {
         ok: true,
         json: async () => ({ success: true }),
       } as Response);
-
     render(<DeliveryMemberDashboard customerWorkbench />);
 
-    expect(await screen.findByLabelText("上传品牌词库")).toHaveAttribute(
+    const keywordInput = await screen.findByLabelText("上传品牌词库");
+    expect(keywordInput).toHaveAttribute(
       "accept",
       expect.stringContaining(".xlsx"),
     );
-    const fileInput = await screen.findByLabelText("上传问题目录");
-    fireEvent.change(fileInput, {
+    expect(screen.queryByLabelText("上传问题目录")).not.toBeInTheDocument();
+    fireEvent.change(keywordInput, {
       target: {
         files: [
-          new File(['{"questions":[]}'], "question-catalog.json", {
+          new File(['{"keywordTables":[]}'], "brand-keywords.json", {
             type: "application/json",
           }),
         ],
@@ -1891,27 +1879,33 @@ describe("DeliveryMemberDashboard project context", () => {
       await screen.findByText("业务文件预检与发布确认"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("问题目录将由 4 条更新为 6 条"),
+      screen.getByText("品牌词库将由 0 条更新为 160 条"),
     ).toBeInTheDocument();
-    expect(screen.getByText(/现有 4 条 → 发布后 6 条/)).toBeInTheDocument();
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(promptSpy).not.toHaveBeenCalled();
+    const preflightHeaders = fetchSpy.mock.calls[0]?.[1]?.headers as Record<
+      string,
+      string
+    >;
+    expect(preflightHeaders).toMatchObject({
+      "x-dashboard-module": "keywords",
+      "x-import-preview": "true",
+      "x-delivery-ticket-id": "4a67e445-37bb-45ed-9268-4ca9437e4d74",
+      "x-delivery-project-assignment-id":
+        "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f",
+    });
 
     fireEvent.click(screen.getByRole("button", { name: "确认发布到正式数据" }));
-
     await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
     const publishHeaders = fetchSpy.mock.calls[1]?.[1]?.headers as Record<
       string,
       string
     >;
-    expect(publishHeaders["x-import-preflight-token"]).toBe(
-      "signed-preflight-token",
-    );
+    expect(publishHeaders).toMatchObject({
+      "x-dashboard-module": "keywords",
+      "x-import-file-hash": "a".repeat(64),
+      "x-import-preflight-token": "signed-preflight-token",
+    });
     expect(publishHeaders["x-import-preview"]).toBeUndefined();
     await waitFor(() => expect(mocks.refetchTickets).toHaveBeenCalled());
-
-    confirmSpy.mockRestore();
-    promptSpy.mockRestore();
     fetchSpy.mockRestore();
   });
 

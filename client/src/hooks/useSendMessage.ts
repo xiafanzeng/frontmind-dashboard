@@ -1494,6 +1494,40 @@ export function useSendMessage() {
             return true;
           }
 
+          if (options?.responseLogicContext) {
+            // Provider task IDs for response logic belong exclusively to the
+            // dedicated authenticated status route. Never project or poll
+            // them through the ordinary Dashboard-local /v2 task contract.
+            if (!response.operationRevision) {
+              throw new Error("应答逻辑任务缺少轮次标识，请重新提交");
+            }
+            updateStatus(convId, "running", {
+              taskId: response.id,
+              previousResponseId: response.id,
+              executionKind: "response_logic",
+              startedAt: responseStartedAt,
+            });
+            try {
+              options.responseLogicContext.onTaskStarted?.({
+                questionId: options.responseLogicContext.questionId,
+                conversationId: convId,
+                taskId: response.id,
+                operationRevision: response.operationRevision,
+                startedAt: responseStartedAt,
+              });
+            } catch (callbackError) {
+              console.warn(
+                "[ResponseLogic] dedicated poller handoff deferred",
+                callbackError,
+              );
+            }
+            toast.success("任务已创建", {
+              description: "FrontMind 正在生成并校验应答逻辑。",
+              duration: 3200,
+            });
+            return true;
+          }
+
           const effectiveStatus = response.status;
           const totalInitialOutputLength = response.output?.length || 0;
           const initialStatusIsTerminal =

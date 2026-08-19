@@ -61,7 +61,9 @@ async function checkAndUpdateOrdinaryTask(
   addMessage: ReturnType<typeof useConversation>["addMessage"],
   boundary: KnowledgeBaseRecoveryBoundary,
 ): Promise<boolean> {
-  if (!conversation.taskId) return false;
+  if (!conversation.taskId || conversation.executionKind === "response_logic") {
+    return false;
+  }
   if (await handOffKnowledgeBaseIfNeeded(conversation, boundary)) return false;
 
   try {
@@ -191,6 +193,7 @@ export function useResumePolling() {
   const resumableTaskKey = state.conversations
     .filter(
       (conversation) =>
+        conversation.executionKind !== "response_logic" &&
         (conversation.status === "running" ||
           conversation.status === "pending") &&
         conversation.taskId,
@@ -209,6 +212,7 @@ export function useResumePolling() {
     if (!hydratedRef.current || runningRef.current) return;
     const candidates = stateRef.current.conversations.filter(
       (conversation) =>
+        conversation.executionKind !== "response_logic" &&
         (conversation.status === "running" ||
           conversation.status === "pending") &&
         conversation.taskId,
@@ -221,6 +225,7 @@ export function useResumePolling() {
       const functions = functionsRef.current;
       for (const conversation of stateRef.current.conversations) {
         if (
+          conversation.executionKind !== "response_logic" &&
           (conversation.status === "running" ||
             conversation.status === "pending") &&
           conversation.taskId
@@ -276,6 +281,7 @@ export function useResumePolling() {
     }
     for (const conversation of stateRef.current.conversations) {
       if (
+        conversation.executionKind !== "response_logic" &&
         (conversation.status === "running" ||
           conversation.status === "pending") &&
         !conversation.taskId &&
@@ -299,6 +305,7 @@ export function useResumePolling() {
     }
     for (const conversation of state.conversations) {
       if (
+        conversation.executionKind === "response_logic" ||
         (conversation.status !== "completed" &&
           conversation.status !== "error") ||
         !conversation.taskId

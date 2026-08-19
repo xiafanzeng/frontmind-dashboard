@@ -118,6 +118,28 @@ describe("useResumePolling ordinary-task boundary", () => {
     );
   });
 
+  it("never sends a persisted response-logic task to the ordinary task API", async () => {
+    mocks.hydrated = true;
+    mocks.conversations[0] = {
+      ...mocks.conversations[0],
+      executionKind: "response_logic",
+      taskId: "provider-response-logic-task",
+      previousResponseId: "provider-response-logic-task",
+      status: "running",
+    };
+
+    renderHook(() => useResumePolling());
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(mocks.retrieveTask).not.toHaveBeenCalled();
+    expect(mocks.fetchKnowledgeBaseProgress).not.toHaveBeenCalled();
+    expect(mocks.updateStatus).not.toHaveBeenCalledWith(
+      "ordinary",
+      "error",
+      expect.anything(),
+    );
+  });
+
   it("hands a discovered knowledge build to the coordinator without retrieving raw output", async () => {
     mocks.hydrated = true;
     mocks.conversations[0] = {

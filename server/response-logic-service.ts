@@ -251,6 +251,36 @@ export class ResponseLogicRevisionConflictError extends AuthServiceError {
   }
 }
 
+export class ResponseLogicTaskSupersededError extends AuthServiceError {
+  readonly responseLogicCode = "RESPONSE_LOGIC_TASK_SUPERSEDED";
+  readonly statusCode = 409;
+
+  constructor(questionId: string) {
+    super(
+      "CONFLICT",
+      `应答逻辑 ${questionId} 的模型任务已被重置或替换，请载入最新任务。`,
+    );
+    this.name = "ResponseLogicTaskSupersededError";
+  }
+}
+
+export function assertResponseLogicExpectedTask(input: {
+  questionId: string;
+  expectedTaskId?: string;
+  expectedOperationRevision?: number;
+  currentTaskId?: string | null;
+  currentRevision?: number | null;
+}) {
+  if (
+    (input.expectedTaskId !== undefined &&
+      input.currentTaskId !== input.expectedTaskId) ||
+    (input.expectedOperationRevision !== undefined &&
+      input.currentRevision !== input.expectedOperationRevision)
+  ) {
+    throw new ResponseLogicTaskSupersededError(input.questionId);
+  }
+}
+
 export class ResponseLogicTaskActiveError extends Error {
   readonly code = "RESPONSE_LOGIC_TASK_ACTIVE";
   readonly statusCode = 409;
@@ -430,6 +460,13 @@ export async function saveResponseLogicEntry(input: {
         actualRevision,
       );
     }
+    assertResponseLogicExpectedTask({
+      questionId: input.value.questionId,
+      expectedTaskId: input.value.expectedTaskId,
+      expectedOperationRevision: input.value.expectedOperationRevision,
+      currentTaskId: existing?.lastTaskId,
+      currentRevision: existing?.revision,
+    });
     assertResponseLogicRecordEditable(existing);
     const draft = withAuthoritativeAttachments({
       draft: input.value.draft,
@@ -565,6 +602,13 @@ export async function saveResponseLogicEntriesBatch(input: {
           actualRevision,
         );
       }
+      assertResponseLogicExpectedTask({
+        questionId: entry.value.questionId,
+        expectedTaskId: entry.value.expectedTaskId,
+        expectedOperationRevision: entry.value.expectedOperationRevision,
+        currentTaskId: current?.lastTaskId,
+        currentRevision: current?.revision,
+      });
       assertResponseLogicRecordEditable(current);
     }
 

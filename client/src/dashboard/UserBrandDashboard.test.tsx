@@ -585,7 +585,7 @@ describe("UserBrandDashboard service experience", () => {
 
     expect(
       screen.getAllByText(
-        "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。",
+        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。",
       ).length,
     ).toBeGreaterThan(0);
     const keywordTable = screen.getByRole("table");
@@ -752,7 +752,8 @@ describe("UserBrandDashboard service experience", () => {
     await waitFor(() =>
       expect(screen.getByText("待监控工程师确认")).toBeInTheDocument(),
     );
-    fireEvent.click(screen.getAllByRole("button", { name: "需求记录" })[0]!);
+    expect(screen.getAllByRole("button", { name: "需求记录" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "需求记录" }));
 
     const historyDialog = screen.getByRole("dialog", {
       name: "问题需求记录",
@@ -760,7 +761,7 @@ describe("UserBrandDashboard service experience", () => {
     expect(historyDialog).toHaveTextContent(
       "验收企业如何证明复杂项目交付能力？",
     );
-    expect(historyDialog).toHaveTextContent("问题审核");
+    expect(historyDialog).toHaveTextContent("问题审核 · 自主填写");
     expect(historyDialog).toHaveTextContent("待处理");
   });
 

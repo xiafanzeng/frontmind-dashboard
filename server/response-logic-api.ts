@@ -8,12 +8,17 @@ import { z } from "zod";
 import {
   RESPONSE_LOGIC_MODEL_SECTIONS,
   ResponseLogicOutputContractError,
+  normalizeResponseLogicPublicProvenance,
+  parseCurrentResponseLogicStructuredDraft,
   responseLogicDraftSchema,
   responseLogicQuestionSchema,
   responseLogicStructuredDraftSchema,
+  responseLogicTaskStatusEnvelopeSchema,
   type ResponseLogicAttachment,
   type ResponseLogicDraft,
   type ResponseLogicRecordDto,
+  type ResponseLogicStructuredDraft,
+  type ResponseLogicTaskStatusEnvelope,
 } from "../shared/response-logic";
 import { localAssets, providerFileLeases } from "../drizzle/schema";
 import {
@@ -63,7 +68,9 @@ import {
   latestManusV2TaskState,
   ManusV2ApiError,
   ManusV2Client,
+  manusV2EventOperationToken,
   manusV2EventsContainOperationToken,
+  orderManusV2EventsByProviderRank,
   type ManusV2MessageEvent,
 } from "./manus-v2-client";
 
@@ -93,12 +100,131 @@ export function responseLogicStructuredDraftFromV2Events(
       event.structured_output_result,
     );
     if (classified.kind !== "accepted") continue;
-    const parsed = responseLogicStructuredDraftSchema.safeParse(
+    const parsed = validatedPublicResponseLogicStructuredDraft(
       classified.value,
     );
-    if (parsed.success) return parsed.data;
+    if (parsed) return parsed;
   }
   return null;
+}
+
+function decodedStructuredResultValue(value: unknown) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** Validate before and after customer-safe provenance normalization. */
+export function validatedPublicResponseLogicStructuredDraft(
+  value: unknown,
+): ResponseLogicStructuredDraft | null {
+  const parsed = responseLogicStructuredDraftSchema.safeParse(
+    decodedStructuredResultValue(value),
+  );
+  if (!parsed.success) return null;
+  const normalized = normalizeResponseLogicPublicProvenance(parsed.data);
+  const publicParsed = responseLogicStructuredDraftSchema.safeParse(normalized);
+  return publicParsed.success ? publicParsed.data : null;
+}
+
+export type ResponseLogicTaskResult = {
+  resultId: string;
+  source: "structured_output" | "assistant_markdown";
+  structuredDraft: ResponseLogicStructuredDraft;
+};
+
+/**
+ * A provider task accumulates every turn. Only events after the newest user
+ * operation marker belong to the current response-logic round; historical
+ * successful output must never satisfy a later turn.
+ */
+export function currentResponseLogicRoundEvents(
+  events: ReadonlyArray<ManusV2MessageEvent>,
+) {
+  const ordered = orderManusV2EventsByProviderRank(events, "oldest_first");
+  let operationIndex = -1;
+  for (let index = 0; index < ordered.length; index += 1) {
+    if (manusV2EventOperationToken(ordered[index]!)) operationIndex = index;
+  }
+  return operationIndex < 0 ? null : ordered.slice(operationIndex + 1);
+}
+
+/**
+ * Accept the newest structured success in the current round. If that exact
+ * event is absent or invalid, the only fallback is the current round's final
+ * assistant message parsed by the strict Markdown section contract.
+ */
+export function responseLogicTaskResultFromCurrentV2Round(
+  events: ReadonlyArray<ManusV2MessageEvent>,
+): ResponseLogicTaskResult | null {
+  const roundEvents = currentResponseLogicRoundEvents(events);
+  if (!roundEvents) return null;
+  const newestFirst = orderManusV2EventsByProviderRank(
+    roundEvents,
+    "newest_first",
+  );
+  const structuredEvent = newestFirst.find(
+    (event) => event.type === "structured_output_result",
+  );
+  if (structuredEvent) {
+    const classified = classifyManusV2StructuredResultEnvelope(
+      structuredEvent.structured_output_result,
+    );
+    if (classified.kind === "accepted") {
+      const structuredDraft = validatedPublicResponseLogicStructuredDraft(
+        classified.value,
+      );
+      if (structuredDraft) {
+        return {
+          resultId: structuredEvent.id,
+          source: "structured_output",
+          structuredDraft,
+        };
+      }
+    }
+  }
+
+  const assistantEvent = newestFirst.find(
+    (event) => event.type === "assistant_message",
+  );
+  const assistantMessage =
+    assistantEvent?.assistant_message &&
+    typeof assistantEvent.assistant_message === "object" &&
+    !Array.isArray(assistantEvent.assistant_message)
+      ? (assistantEvent.assistant_message as Record<string, unknown>)
+      : null;
+  const markdown =
+    typeof assistantMessage?.content === "string"
+      ? assistantMessage.content
+      : null;
+  if (!assistantEvent || !markdown) return null;
+  try {
+    const structuredDraft = validatedPublicResponseLogicStructuredDraft(
+      parseCurrentResponseLogicStructuredDraft(markdown),
+    );
+    return structuredDraft
+      ? {
+          resultId: assistantEvent.id,
+          source: "assistant_markdown",
+          structuredDraft,
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A real JSON round trip is the final transport preflight before res.json. */
+export function responseLogicTaskStatusEnvelopeRoundTrip(
+  value: ResponseLogicTaskStatusEnvelope,
+) {
+  const parsed = responseLogicTaskStatusEnvelopeSchema.parse(value);
+  return responseLogicTaskStatusEnvelopeSchema.parse(
+    JSON.parse(JSON.stringify(parsed)),
+  );
 }
 
 export const RESPONSE_LOGIC_UPSTREAM_ATTACHMENT_LIMIT = 102;
@@ -117,6 +243,7 @@ const attachmentSchema = z.object({
 const responseLogicStartSchema = responseLogicQuestionSchema.extend({
   conversationId: z.string().trim().min(1).max(191),
   taskId: z.string().trim().min(1).max(255).optional(),
+  operationRevision: z.number().int().positive().optional(),
   userMessage: z.string().max(200_000),
   draft: responseLogicDraftSchema,
   attachments: z
@@ -131,6 +258,7 @@ const responseLogicTaskStatusQuerySchema = z
   .object({
     questionId: z.string().trim().min(1).max(191),
     conversationId: z.string().trim().min(1).max(191),
+    operationRevision: z.coerce.number().int().positive(),
   })
   .strict();
 
@@ -140,7 +268,8 @@ export class ResponseLogicTaskBindingError extends Error {
       | "RESPONSE_LOGIC_WORKSPACE_FORBIDDEN"
       | "RESPONSE_LOGIC_QUESTION_FORBIDDEN"
       | "RESPONSE_LOGIC_CONVERSATION_FORBIDDEN"
-      | "RESPONSE_LOGIC_TASK_FORBIDDEN",
+      | "RESPONSE_LOGIC_TASK_FORBIDDEN"
+      | "RESPONSE_LOGIC_OPERATION_FORBIDDEN",
     message: string,
   ) {
     super(message);
@@ -184,6 +313,7 @@ export function assertResponseLogicTaskBinding(input: {
   questionId: string;
   conversationId: string;
   taskId: string;
+  operationRevision?: number;
   record: ResponseLogicRecordDto | null;
   configuredQuestion: {
     questionId: string;
@@ -237,6 +367,15 @@ export function assertResponseLogicTaskBinding(input: {
     throw new ResponseLogicTaskBindingError(
       "RESPONSE_LOGIC_TASK_FORBIDDEN",
       "当前任务不是该问题的最新应答逻辑任务",
+    );
+  }
+  if (
+    input.operationRevision !== undefined &&
+    input.record.revision !== input.operationRevision
+  ) {
+    throw new ResponseLogicTaskBindingError(
+      "RESPONSE_LOGIC_OPERATION_FORBIDDEN",
+      "当前应答逻辑轮次已被更新，请载入最新任务状态",
     );
   }
 }
@@ -902,7 +1041,17 @@ export function publicResponseLogicTask(
   };
 }
 
+export const RESPONSE_LOGIC_TASK_STATUS_CACHE_CONTROL =
+  "private, no-store, max-age=0";
+
+export function setResponseLogicTaskStatusNoStore(input: {
+  setHeader: (name: string, value: string) => unknown;
+}) {
+  input.setHeader("Cache-Control", RESPONSE_LOGIC_TASK_STATUS_CACHE_CONTROL);
+}
+
 router.get("/tasks/:taskId/status", async (req, res) => {
+  setResponseLogicTaskStatusNoStore(res);
   const parsedQuery = responseLogicTaskStatusQuerySchema.safeParse(req.query);
   const taskId = String(req.params.taskId || "").trim();
   if (!taskId || taskId.length > 255 || !parsedQuery.success) {
@@ -949,6 +1098,7 @@ router.get("/tasks/:taskId/status", async (req, res) => {
       questionId: parsedQuery.data.questionId,
       conversationId: parsedQuery.data.conversationId,
       taskId,
+      operationRevision: parsedQuery.data.operationRevision,
       record,
       configuredQuestion,
     });
@@ -966,13 +1116,17 @@ router.get("/tasks/:taskId/status", async (req, res) => {
       rateLimitScope: `managed-user:${user.id}`,
     });
     const events = await client.listAllMessages({ taskId, order: "desc" });
-    const status = latestManusV2TaskState(events);
+    const roundEvents = currentResponseLogicRoundEvents(events);
+    const status = latestManusV2TaskState(roundEvents ?? []);
     if (status === null || status === "running" || status === "waiting") {
-      res.status(202).json({
-        status: "running",
-        taskId,
-        model: credential.agentProfile,
-      });
+      res.status(202).json(
+        responseLogicTaskStatusEnvelopeRoundTrip({
+          status: "running",
+          taskId,
+          operationRevision: parsedQuery.data.operationRevision,
+          model: credential.agentProfile,
+        }),
+      );
       return;
     }
     if (status === "error") {
@@ -999,9 +1153,9 @@ router.get("/tasks/:taskId/status", async (req, res) => {
       return;
     }
 
-    const structuredDraft = responseLogicStructuredDraftFromV2Events(events);
-    if (!structuredDraft) {
-      const stoppedAt = [...events].reverse().find((event) => {
+    const result = responseLogicTaskResultFromCurrentV2Round(events);
+    if (!result) {
+      const stoppedAt = [...(roundEvents ?? [])].reverse().find((event) => {
         if (event.type !== "status_update") return false;
         const update = event.status_update;
         return (
@@ -1016,11 +1170,14 @@ router.get("/tasks/:taskId/status", async (req, res) => {
         Date.now() - stoppedAt >= 0 &&
         Date.now() - stoppedAt < 120_000
       ) {
-        res.status(202).json({
-          status: "result_pending",
-          taskId,
-          model: credential.agentProfile,
-        });
+        res.status(202).json(
+          responseLogicTaskStatusEnvelopeRoundTrip({
+            status: "result_pending",
+            taskId,
+            operationRevision: parsedQuery.data.operationRevision,
+            model: credential.agentProfile,
+          }),
+        );
         return;
       }
       console.warn("[Response Logic Status] completed task output rejected:", {
@@ -1036,12 +1193,17 @@ router.get("/tasks/:taskId/status", async (req, res) => {
       return;
     }
 
-    res.json({
-      status: "completed",
-      taskId,
-      model: credential.agentProfile,
-      structuredDraft,
-    });
+    res.json(
+      responseLogicTaskStatusEnvelopeRoundTrip({
+        status: "completed",
+        taskId,
+        operationRevision: parsedQuery.data.operationRevision,
+        model: credential.agentProfile,
+        resultId: result.resultId,
+        source: result.source,
+        structuredDraft: result.structuredDraft,
+      }),
+    );
   } catch (error) {
     if (error instanceof ResponseLogicTaskBindingError) {
       if (error.code === "RESPONSE_LOGIC_QUESTION_FORBIDDEN") {
@@ -1135,6 +1297,15 @@ router.post(["/start", "/turn"], async (req, res) => {
     });
     return;
   }
+  if (isContinuation && !parsed.data.operationRevision) {
+    res.status(400).json({
+      error: {
+        code: "RESPONSE_LOGIC_OPERATION_REQUIRED",
+        message: "缺少当前应答逻辑轮次标识",
+      },
+    });
+    return;
+  }
 
   const activeCredentials = getFrontMindCredentials(req);
   if (!activeCredentials.apiKey) {
@@ -1215,6 +1386,7 @@ router.post(["/start", "/turn"], async (req, res) => {
         questionId: value.questionId,
         conversationId: value.conversationId,
         taskId: value.taskId,
+        operationRevision: value.operationRevision,
         record,
         configuredQuestion,
         releasedContinuationVerified,
@@ -1484,8 +1656,9 @@ router.post(["/start", "/turn"], async (req, res) => {
       return;
     }
 
+    let startedRecord: ResponseLogicRecordDto;
     try {
-      await recordResponseLogicTaskStart({
+      startedRecord = await recordResponseLogicTaskStart({
         userId: req.frontmindUser.id,
         apiCredentialId: taskCredential.id,
         value: {
@@ -1514,7 +1687,10 @@ router.post(["/start", "/turn"], async (req, res) => {
     }
 
     res.json({
-      task: created.task,
+      task: {
+        ...created.task,
+        operationRevision: startedRecord.revision,
+      },
       startedAt: Date.now(),
       knowledgeVersion: knowledgeSnapshot?.version ?? null,
     });

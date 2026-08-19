@@ -205,6 +205,8 @@ export interface Conversation {
   id: string;
   title: string;
   messages: LocalMessage[];
+  /** Server-derived boundary for provider tasks owned outside ordinary chat. */
+  executionKind?: "response_logic";
   taskId?: string; // Upstream task ID
   previousResponseId?: string;
   status:
@@ -388,6 +390,7 @@ type Action =
         taskId?: string;
         taskUrl?: string;
         previousResponseId?: string;
+        executionKind?: "response_logic";
         clearTaskPointer?: boolean;
         startedAt?: number;
         completedAt?: number;
@@ -475,6 +478,7 @@ function conversationReducer(
                 previousResponseId: action.payload.clearTaskPointer
                   ? undefined
                   : (action.payload.previousResponseId ?? c.previousResponseId),
+                executionKind: action.payload.executionKind ?? c.executionKind,
                 startedAt: action.payload.startedAt ?? c.startedAt,
                 completedAt:
                   action.payload.completedAt !== undefined
@@ -1929,6 +1933,7 @@ interface ConversationContextType {
       taskId?: string;
       taskUrl?: string;
       previousResponseId?: string;
+      executionKind?: "response_logic";
       clearTaskPointer?: boolean;
       startedAt?: number;
       completedAt?: number;
@@ -2520,6 +2525,7 @@ export function ConversationProvider({
         taskId?: string;
         taskUrl?: string;
         previousResponseId?: string;
+        executionKind?: "response_logic";
         clearTaskPointer?: boolean;
         startedAt?: number;
         completedAt?: number;

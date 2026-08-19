@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { DELIVERY_OPERATION_SPECS } from "../shared/delivery-operation-spec";
+import { deliveryTickets } from "../drizzle/schema";
 
 import {
   assertDeliveryCompletionEvidence,
@@ -26,6 +27,7 @@ import {
   deriveWorkflowContainerStatus,
   formalMonitoringBatchOptionsScope,
   getMyDeliveryTickets,
+  ensureInitialMonitoringWorkflowTicket,
   initialMonitoringExistingTicketAction,
   knowledgeMonitoringHandoffOperations,
   knowledgeMonitoringHandoffReusableTicketStatuses,
@@ -786,6 +788,182 @@ describe("delivery workflow structural invariants", () => {
   });
 });
 
+describe("initial monitoring handoff", () => {
+  const activeContract = {
+    id: "contract-current",
+    userId: 42,
+    planCode: "advanced",
+    planVersion: 1,
+    status: "active",
+    startsAt: new Date("2026-01-01T00:00:00.000Z"),
+    endsAt: new Date("2027-01-01T00:00:00.000Z"),
+    revision: 1,
+    replacesContractIds: [],
+  };
+  const activePeriod = {
+    id: "period-current",
+    contractId: activeContract.id,
+    userId: 42,
+    ordinal: 1,
+    startsAt: activeContract.startsAt,
+    endsAt: activeContract.endsAt,
+  };
+  const sourceTicket = {
+    id: "catalog-ticket",
+    userId: 42,
+    contractId: activeContract.id,
+    quotaPeriodId: activePeriod.id,
+  };
+  const selectResults = (input?: {
+    existingInitialMonitoring?: unknown[];
+    approvedQuestions?: unknown[];
+    ownerRows?: unknown[];
+    winnerRows?: unknown[] | (() => unknown[]);
+  }) => [
+    [activeContract],
+    [activePeriod],
+    [activeContract],
+    [activePeriod],
+    input?.existingInitialMonitoring ?? [],
+    [{ id: sourceTicket.id }],
+    [],
+    [],
+    input?.approvedQuestions ?? [],
+    ...(input?.ownerRows !== undefined ? [input.ownerRows] : []),
+    ...(input?.winnerRows !== undefined ? [input.winnerRows] : []),
+  ];
+  const monitoringOwner = {
+    projectAssignmentId: "monitoring-assignment",
+    engineerUserId: 77,
+  };
+
+  it("does not create a hidden monitoring ticket when the catalog completes without an approved question", async () => {
+    const { executor, insertCalls, queue } =
+      queuedDeliveryExecutor(selectResults());
+
+    await expect(
+      ensureInitialMonitoringWorkflowTicket({
+        executor,
+        sourceTicket,
+        actorUserId: 9,
+      }),
+    ).resolves.toEqual({ id: null, created: false });
+    expect(insertCalls).toHaveLength(0);
+    expect(queue).toHaveLength(0);
+  });
+
+  it("keeps the approved selection committed when no monitoring owner is assigned", async () => {
+    const { executor, insertCalls, queue } = queuedDeliveryExecutor(
+      selectResults({
+        approvedQuestions: [{ id: "approved-question" }],
+        ownerRows: [],
+      }),
+    );
+
+    await expect(
+      ensureInitialMonitoringWorkflowTicket({
+        executor,
+        sourceTicket,
+        actorUserId: 9,
+      }),
+    ).resolves.toEqual({ id: null, created: false });
+    expect(insertCalls).toHaveLength(0);
+    expect(queue).toHaveLength(0);
+  });
+
+  it("creates the upsert winner exactly once after a later approved selection", async () => {
+    let first: ReturnType<typeof queuedDeliveryExecutor>;
+    first = queuedDeliveryExecutor(
+      selectResults({
+        approvedQuestions: [{ id: "approved-question" }],
+        ownerRows: [monitoringOwner],
+        winnerRows: () => [
+          {
+            id: first.insertCalls.find(
+              (call) =>
+                call.table === deliveryTickets &&
+                call.values?.operation === "initial_monitoring",
+            )?.values.id,
+          },
+        ],
+      }),
+    );
+    const created = await ensureInitialMonitoringWorkflowTicket({
+      executor: first.executor,
+      sourceTicket,
+      actorUserId: 9,
+    });
+    expect(created.created).toBe(true);
+    expect(
+      first.insertCalls.filter(
+        (call) =>
+          call.table === deliveryTickets &&
+          call.values?.operation === "initial_monitoring",
+      ),
+    ).toHaveLength(1);
+    expect(
+      first.insertCalls.find(
+        (call) =>
+          call.table === deliveryTickets &&
+          call.values?.operation === "initial_monitoring",
+      )?.onDuplicateKeyUpdate,
+    ).toBeDefined();
+    expect(first.queue).toHaveLength(0);
+
+    const second = queuedDeliveryExecutor(
+      selectResults({
+        existingInitialMonitoring: [
+          {
+            id: created.id,
+            contractId: activeContract.id,
+            quotaPeriodId: activePeriod.id,
+            status: "submitted",
+            revision: 1,
+          },
+        ],
+        approvedQuestions: [{ id: "approved-question" }],
+        ownerRows: [monitoringOwner],
+      }),
+    );
+    await expect(
+      ensureInitialMonitoringWorkflowTicket({
+        executor: second.executor,
+        sourceTicket,
+        actorUserId: 9,
+      }),
+    ).resolves.toEqual({ id: created.id, created: false });
+    expect(second.insertCalls).toHaveLength(0);
+    expect(second.queue).toHaveLength(0);
+  });
+
+  it("adopts a concurrent upsert winner without emitting a duplicate created event", async () => {
+    const concurrent = queuedDeliveryExecutor(
+      selectResults({
+        approvedQuestions: [{ id: "approved-question" }],
+        ownerRows: [monitoringOwner],
+        winnerRows: [{ id: "concurrent-winner" }],
+      }),
+    );
+
+    await expect(
+      ensureInitialMonitoringWorkflowTicket({
+        executor: concurrent.executor,
+        sourceTicket,
+        actorUserId: 9,
+      }),
+    ).resolves.toEqual({ id: "concurrent-winner", created: false });
+    expect(
+      concurrent.insertCalls.filter(
+        (call) =>
+          call.table === deliveryTickets &&
+          call.values?.operation === "initial_monitoring",
+      ),
+    ).toHaveLength(1);
+    expect(concurrent.insertCalls).toHaveLength(1);
+    expect(concurrent.queue).toHaveLength(0);
+  });
+});
+
 describe("my delivery ticket pool", () => {
   it("uses a contract scope only for progressive Luxury questions", () => {
     expect(
@@ -835,7 +1013,7 @@ describe("my delivery ticket pool", () => {
     ).toBe(false);
   });
 
-  it("keeps catalog review active after completion only for progressive Luxury", () => {
+  it("keeps catalog review active after completion for every service plan", () => {
     expect(
       questionCatalogReviewAllowed({
         progressiveLuxury: true,
@@ -851,7 +1029,15 @@ describe("my delivery ticket pool", () => {
         hasCompletedCatalog: true,
         hasReusableCatalogMilestone: true,
       }),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      questionCatalogReviewAllowed({
+        progressiveLuxury: false,
+        hasActiveCatalog: false,
+        hasCompletedCatalog: false,
+        hasReusableCatalogMilestone: true,
+      }),
+    ).toBe(true);
   });
 
   it("uses the two public status groups and a bounded result", () => {
@@ -898,7 +1084,7 @@ describe("my delivery ticket pool", () => {
       }),
     ).toMatchObject({
       dependencySatisfied: false,
-      dependencyBlockReason: expect.stringContaining("品牌词库与问题目录"),
+      dependencyBlockReason: expect.stringContaining("配置品牌词库"),
     });
     expect(
       deliveryTicketDependencyState({

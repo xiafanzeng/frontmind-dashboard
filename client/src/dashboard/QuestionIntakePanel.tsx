@@ -136,6 +136,23 @@ type QuestionRequestHistoryItem = {
   publicSummary: string | null;
 };
 
+const questionRequestCategoryLabels: Record<string, string> = {
+  question_review: "问题审核 · 自主填写",
+  question_modify: "问题修改 · 服务问题",
+  question_delete: "问题删除 · 服务问题",
+};
+
+export function questionRequestCategoryLabel(
+  category: string | null | undefined,
+  fallback: string | null | undefined,
+) {
+  return (
+    (category ? questionRequestCategoryLabels[category] : undefined) ??
+    fallback ??
+    null
+  );
+}
+
 function normalizeQuestionHistoryText(value: string) {
   return value.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
@@ -429,11 +446,19 @@ function QuestionIntakePanelView({
     if (submitted) resetForm();
     return submitted;
   };
-  const questionRequestItems = requestHistory.items.filter((item) =>
-    ["question_review", "question_modify", "question_delete"].includes(
-      item.category || "",
-    ),
-  );
+  const questionRequestItems = requestHistory.items
+    .filter((item) =>
+      ["question_review", "question_modify", "question_delete"].includes(
+        item.category || "",
+      ),
+    )
+    .map((item) => ({
+      ...item,
+      categoryLabel: questionRequestCategoryLabel(
+        item.category,
+        item.categoryLabel,
+      ),
+    }));
   return (
     <section
       className="question-intake-panel"
@@ -463,6 +488,14 @@ function QuestionIntakePanelView({
           >
             前往品牌全域词库
             <ArrowUpRight aria-hidden="true" size={15} />
+          </button>
+          <button
+            type="button"
+            className="question-intake-library-link"
+            onClick={() => setHistoryOpen(true)}
+          >
+            <FileClock aria-hidden="true" size={15} />
+            需求记录
           </button>
         </div>
       </div>
@@ -528,14 +561,6 @@ function QuestionIntakePanelView({
               </label>
             )}
           <div className="question-intake-form-actions">
-            <button
-              type="button"
-              className="question-intake-library-link"
-              onClick={() => setHistoryOpen(true)}
-            >
-              <FileClock aria-hidden="true" size={15} />
-              需求记录
-            </button>
             <button
               type="button"
               className="question-intake-submit"
@@ -606,21 +631,11 @@ function QuestionIntakePanelView({
 
       {portal.purchasedQuestions.length > 0 && (
         <section className="mt-5 grid gap-3" aria-label="服务问题变更">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <strong className="text-sm">已进入服务的问题</strong>
-              <p className="mt-1 text-xs text-muted-foreground">
-                修改或删除会先生成需求，由 AI 监控与优化工程师或系统管理员审核。
-              </p>
-            </div>
-            <button
-              type="button"
-              className="question-intake-library-link"
-              onClick={() => setHistoryOpen(true)}
-            >
-              <FileClock aria-hidden="true" size={15} />
-              需求记录
-            </button>
+          <div>
+            <strong className="text-sm">已进入服务的问题</strong>
+            <p className="mt-1 text-xs text-muted-foreground">
+              修改或删除会先生成需求，由 AI 监控与优化工程师或系统管理员审核。
+            </p>
           </div>
           {portal.purchasedQuestions.map((serviceQuestion) => {
             const target = [

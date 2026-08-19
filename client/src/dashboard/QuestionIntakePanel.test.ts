@@ -6,6 +6,7 @@ import {
   pendingQuestionQuotaReservations,
   questionHistoryItemMatchesTarget,
   questionQuotaUnavailableMessage,
+  questionRequestCategoryLabel,
 } from "./QuestionIntakePanel";
 
 function withRuntimeTimeZone<T>(timeZone: string, run: () => T) {
@@ -68,6 +69,22 @@ describe("question demand history identity", () => {
         target,
       ),
     ).toBe(false);
+  });
+});
+
+describe("question demand history labels", () => {
+  it.each([
+    ["question_review", "问题审核 · 自主填写"],
+    ["question_modify", "问题修改 · 服务问题"],
+    ["question_delete", "问题删除 · 服务问题"],
+  ])("maps %s without inspecting a source question id", (category, label) => {
+    expect(questionRequestCategoryLabel(category, "旧标签")).toBe(label);
+  });
+
+  it("keeps the server label for unrelated categories", () => {
+    expect(questionRequestCategoryLabel("content_asset", "内容需求")).toBe(
+      "内容需求",
+    );
   });
 });
 
