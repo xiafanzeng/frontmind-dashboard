@@ -42,7 +42,7 @@ type ManagedKeywordTablesProps = {
 };
 
 const KEYWORD_SOURCE_DESCRIPTION =
-  "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合反馈的真实热度呈现 GEO 优化问题。";
+  "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。";
 
 function normalizedColumnName(value: unknown) {
   return String(value ?? "")
@@ -52,7 +52,12 @@ function normalizedColumnName(value: unknown) {
 
 function isHiddenCustomerColumn(value: unknown) {
   const column = normalizedColumnName(value);
-  return column === "序号" || column === "核心词" || column === "创建日期";
+  return (
+    column === "序号" ||
+    column === "核心词" ||
+    column === "创建日期" ||
+    column.includes("热度")
+  );
 }
 
 function questionColumnIndex(columns: readonly unknown[]) {
@@ -70,32 +75,10 @@ function questionSubdivisionColumnIndex(columns: readonly unknown[]) {
   );
 }
 
-function heatColumnIndex(columns: readonly unknown[]) {
-  return columns.findIndex((column) => normalizedColumnName(column) === "热度");
-}
-
 function keywordDisplayColumns(columns: readonly string[]) {
-  const visibleColumns = columns
+  return columns
     .map((column, columnIndex) => ({ column, columnIndex }))
     .filter(({ column }) => !isHiddenCustomerColumn(column));
-  const subdivisionIndex = visibleColumns.findIndex(
-    ({ column }) => normalizedColumnName(column) === "问题细分",
-  );
-  const visibleHeatIndex = visibleColumns.findIndex(
-    ({ column }) => normalizedColumnName(column) === "热度",
-  );
-  if (subdivisionIndex > visibleHeatIndex && visibleHeatIndex >= 0) {
-    const [subdivisionColumn] = visibleColumns.splice(subdivisionIndex, 1);
-    if (subdivisionColumn) {
-      visibleColumns.splice(visibleHeatIndex, 0, subdivisionColumn);
-    }
-  }
-  return visibleColumns;
-}
-
-function numericHeat(value: unknown) {
-  const parsed = Number(String(value ?? "").replaceAll(",", ""));
-  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function KeywordPageHeader({
@@ -167,7 +150,6 @@ export default function ManagedKeywordTables({
   const [tableFilter, setTableFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
   const [subdivisionFilter, setSubdivisionFilter] = useState("all");
-  const [sortBy, setSortBy] = useState("heat-desc");
   const keyword = searchTerm.trim().toLowerCase();
   const hasKeywordCategories = useMemo(
     () =>
@@ -200,10 +182,6 @@ export default function ManagedKeywordTables({
       ].sort((left, right) => left.localeCompare(right, "zh-CN")),
     [tables],
   );
-  const hasHeat = useMemo(
-    () => tables.some((table) => heatColumnIndex(table.columns) >= 0),
-    [tables],
-  );
   const visibleTables = useMemo(() => {
     const selectedTables =
       tableFilter === "all"
@@ -215,9 +193,8 @@ export default function ManagedKeywordTables({
         const subdivisionColumnIndex = questionSubdivisionColumnIndex(
           table.columns,
         );
-        const tableHeatColumnIndex = heatColumnIndex(table.columns);
         const displayColumns = keywordDisplayColumns(table.columns);
-        let rows = table.rows
+        const rows = table.rows
           .map((row, rowIndex) => ({ row, rowIndex }))
           .filter(({ row }) => {
             if (
@@ -248,16 +225,6 @@ export default function ManagedKeywordTables({
               );
             });
           });
-        if (tableHeatColumnIndex >= 0 && sortBy.startsWith("heat-")) {
-          const direction = sortBy === "heat-asc" ? 1 : -1;
-          rows = [...rows].sort((left, right) => {
-            const leftHeat = numericHeat(left.row[tableHeatColumnIndex]);
-            const rightHeat = numericHeat(right.row[tableHeatColumnIndex]);
-            if (leftHeat === null) return rightHeat === null ? 0 : 1;
-            if (rightHeat === null) return -1;
-            return direction * (leftHeat - rightHeat);
-          });
-        }
         return { ...table, rows, displayColumns };
       })
       .filter(
@@ -267,7 +234,7 @@ export default function ManagedKeywordTables({
             subdivisionFilter === "all") ||
           table.rows.length > 0,
       );
-  }, [categoryFilter, keyword, sortBy, subdivisionFilter, tableFilter, tables]);
+  }, [categoryFilter, keyword, subdivisionFilter, tableFilter, tables]);
   const totalRows = useMemo(
     () => tables.reduce((total, table) => total + table.rows.length, 0),
     [tables],
@@ -323,8 +290,7 @@ export default function ManagedKeywordTables({
             </div>
             {(tables.length > 1 ||
               hasKeywordCategories ||
-              subdivisionOptions.length > 0 ||
-              hasHeat) && (
+              subdivisionOptions.length > 0) && (
               <div className="filter-group">
                 {hasKeywordCategories && (
                   <div className="filter-item">
@@ -363,19 +329,6 @@ export default function ManagedKeywordTables({
                           {subdivision}
                         </option>
                       ))}
-                    </select>
-                  </div>
-                )}
-                {hasHeat && (
-                  <div className="filter-item">
-                    <label htmlFor="managed-keyword-sort">排序</label>
-                    <select
-                      id="managed-keyword-sort"
-                      value={sortBy}
-                      onChange={(event) => setSortBy(event.target.value)}
-                    >
-                      <option value="heat-desc">热度从高到低</option>
-                      <option value="heat-asc">热度从低到高</option>
                     </select>
                   </div>
                 )}
@@ -468,8 +421,6 @@ export default function ManagedKeywordTables({
                                     : value;
                                   const isPriority =
                                     normalizedColumn.includes("优先级");
-                                  const isHeat =
-                                    normalizedColumn.includes("热度");
                                   const priorityTone = value.includes("高")
                                     ? "high"
                                     : value.includes("重点") ||
@@ -498,10 +449,6 @@ export default function ManagedKeywordTables({
                                         >
                                           {displayValue}
                                         </span>
-                                      ) : isHeat ? (
-                                        <strong>
-                                          {formatNumber(row[columnIndex])}
-                                        </strong>
                                       ) : (
                                         displayValue
                                       )}

@@ -30,73 +30,65 @@ async function workbookWithPrefixedSpreadsheetMlElements(buffer: Buffer) {
   return Buffer.from(await archive.generateAsync({ type: "nodebuffer" }));
 }
 
-describe("uploaded keyword workbook compatibility", () => {
-  it("imports the latest seven-column workbook shape and preserves all 160 rows", async () => {
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("问题列表");
+async function fiveColumnKeywordWorkbookBuffer() {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("问题列表");
+  sheet.addRow(["序号", "问题", "核心词", "核心词分类", "问题细分"]);
+  const subdivisions = [
+    "产品能力",
+    "信任验证",
+    "品牌认知",
+    "品类发现",
+    "售后合作",
+    "场景方案",
+    "竞品对比",
+    "采购决策",
+  ];
+  for (let index = 0; index < 160; index += 1) {
+    const category =
+      index < 20
+        ? "行业排名词"
+        : index < 40
+          ? "竞品对比词"
+          : index < 60
+            ? "美誉舆情词"
+            : "产品场景词";
     sheet.addRow([
-      "序号",
-      "问题",
-      "核心词",
-      "核心词分类",
-      "热度",
-      "创建日期",
-      "问题细分",
+      index + 1,
+      `一航网络测试问题 ${index + 1}？`,
+      `核心词 ${Math.floor(index / 12) + 1}`,
+      category,
+      subdivisions[index % subdivisions.length],
     ]);
-    const subdivisions = [
-      "产品能力",
-      "信任验证",
-      "品牌认知",
-      "品类发现",
-      "售后合作",
-      "场景方案",
-      "竞品对比",
-      "采购决策",
-    ];
-    for (let index = 0; index < 160; index += 1) {
-      const category =
-        index < 20
-          ? "行业排名词"
-          : index < 40
-            ? "竞品对比词"
-            : index < 60
-              ? "美誉舆情词"
-              : "产品场景词";
-      sheet.addRow([
-        index + 1,
-        `硅基流动测试问题 ${index + 1}？`,
-        `核心词 ${Math.floor(index / 12) + 1}`,
-        category,
-        10_000 + index,
-        new Date("2026-07-27T00:00:00.000Z"),
-        subdivisions[index % subdivisions.length],
-      ]);
-    }
+  }
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
 
-    const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+describe("uploaded keyword workbook compatibility", () => {
+  it("imports the attachment's five-column shape and preserves all 160 rows", async () => {
+    const buffer = await fiveColumnKeywordWorkbookBuffer();
     const tables = normalizeImportedKeywordTables(
       await tabularTablesFromFile({
         buffer,
-        sourceFileName: "硅基流动-全域词库-问题列表.xlsx",
+        sourceFileName: "一航网络-问题宇宙四分类推荐优先-20260819.xlsx",
       }),
     );
 
     expect(tables).toHaveLength(1);
     expect(tables[0]).toMatchObject({
       title: "问题列表",
-      columns: [
-        "序号",
-        "问题",
-        "核心词",
-        "核心词分类",
-        "热度",
-        "创建日期",
-        "问题细分",
-      ],
+      columns: ["序号", "问题", "核心词", "核心词分类", "问题细分"],
     });
     expect(tables[0]?.rows).toHaveLength(160);
-    expect(tables[0]?.rows[0]?.[5]).toBe("2026-07-27");
-    expect(tables[0]?.rows[0]?.[6]).toBe("产品能力");
+    expect(tables[0]?.rows[0]).toEqual([
+      "1",
+      "一航网络测试问题 1？",
+      "核心词 1",
+      "行业排名词",
+      "产品能力",
+    ]);
+    expect(tables[0]?.rows[159]?.[0]).toBe("160");
+    expect(tables[0]?.rows[159]?.[3]).toBe("产品场景词");
     expect(importedKeywordCategoryCounts(tables)).toEqual({
       行业排名词: 20,
       竞品对比词: 20,
@@ -105,29 +97,9 @@ describe("uploaded keyword workbook compatibility", () => {
     });
   });
 
-  it("imports valid SpreadsheetML workbooks whose elements use a namespace prefix", async () => {
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("问题列表");
-    sheet.addRow([
-      "序号",
-      "问题",
-      "核心词",
-      "核心词分类",
-      "热度",
-      "创建日期",
-      "问题细分",
-    ]);
-    sheet.addRow([
-      1,
-      "免费大模型 API 平台有哪些？",
-      "大模型 API",
-      "行业排名词",
-      37_651,
-      new Date("2026-07-27T00:00:00.000Z"),
-      "采购决策",
-    ]);
+  it("imports the same 160-row shape when SpreadsheetML elements use an x: prefix", async () => {
     const prefixedBuffer = await workbookWithPrefixedSpreadsheetMlElements(
-      Buffer.from(await workbook.xlsx.writeBuffer()),
+      await fiveColumnKeywordWorkbookBuffer(),
     );
     const archive = await JSZip.loadAsync(prefixedBuffer);
     expect(await archive.file("xl/workbook.xml")?.async("string")).toContain(
@@ -147,20 +119,16 @@ describe("uploaded keyword workbook compatibility", () => {
       "问题",
       "核心词",
       "核心词分类",
-      "热度",
-      "创建日期",
       "问题细分",
     ]);
-    expect(tables[0]?.rows).toEqual([
-      [
-        "1",
-        "免费大模型 API 平台有哪些？",
-        "大模型 API",
-        "行业排名词",
-        "37651",
-        "2026-07-27",
-        "采购决策",
-      ],
-    ]);
+    expect(tables[0]?.rows).toHaveLength(160);
+    expect(tables[0]?.rows[0]?.[0]).toBe("1");
+    expect(tables[0]?.rows[159]?.[0]).toBe("160");
+    expect(importedKeywordCategoryCounts(tables)).toEqual({
+      行业排名词: 20,
+      竞品对比词: 20,
+      美誉舆情词: 20,
+      产品场景词: 100,
+    });
   });
 });

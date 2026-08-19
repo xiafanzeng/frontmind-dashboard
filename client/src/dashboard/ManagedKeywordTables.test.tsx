@@ -31,7 +31,7 @@ describe("ManagedKeywordTables", () => {
 
     expect(
       screen.getByText(
-        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合反馈的真实热度呈现 GEO 优化问题。",
+        "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。",
       ),
     ).toBeInTheDocument();
     expect(
@@ -56,7 +56,11 @@ describe("ManagedKeywordTables", () => {
       within(keywordTable)
         .getAllByRole("columnheader")
         .map((header) => header.textContent),
-    ).toEqual(["问题", "主分类", "问题细分", "热度"]);
+    ).toEqual(["问题", "主分类", "问题细分"]);
+    expect(screen.queryByLabelText("排序")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/热度从高到低|热度从低到高/),
+    ).not.toBeInTheDocument();
     expect(
       within(keywordTable).queryByRole("columnheader", { name: "序号" }),
     ).not.toBeInTheDocument();
@@ -116,18 +120,14 @@ describe("ManagedKeywordTables", () => {
     });
   });
 
-  it("filters by question subdivision and sorts heat in both directions", () => {
+  it("filters by question subdivision while preserving the uploaded row order", () => {
     render(<ManagedKeywordTables tables={tables} />);
 
     const rows = within(screen.getByRole("table")).getAllByRole("row");
-    expect(within(rows[1]!).getByText("竞品问题")).toBeInTheDocument();
-    expect(within(rows[4]!).getByText("品牌问题")).toBeInTheDocument();
-
-    fireEvent.change(screen.getByLabelText("排序"), {
-      target: { value: "heat-asc" },
-    });
-    const ascendingRows = within(screen.getByRole("table")).getAllByRole("row");
-    expect(within(ascendingRows[1]!).getByText("品牌问题")).toBeInTheDocument();
+    expect(within(rows[1]!).getByText("品牌问题")).toBeInTheDocument();
+    expect(within(rows[2]!).getByText("场景问题")).toBeInTheDocument();
+    expect(within(rows[3]!).getByText("行业问题")).toBeInTheDocument();
+    expect(within(rows[4]!).getByText("竞品问题")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("问题细分"), {
       target: { value: "场景方案" },

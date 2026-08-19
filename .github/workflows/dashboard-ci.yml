@@ -354,6 +354,47 @@ jobs:
           set -euo pipefail
           printf '### Dashboard production artifact\n\n- Source: `%s`\n- Digest: `%s`\n' \
             "$FRONTMIND_RELEASE_SOURCE_SHA" "$DIGEST" >>"$GITHUB_STEP_SUMMARY"
+      - name: Install restricted deploy key
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.DASHBOARD_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_KEY:?DASHBOARD_DEPLOY_SSH_KEY is required}"
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" >~/.ssh/dashboard_deploy
+          install -m 0644 .github/deploy/production_known_hosts ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/dashboard_deploy
+          ssh-keygen -y -f ~/.ssh/dashboard_deploy >/dev/null
+      - name: Deploy through fixed Dashboard capability
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DEPLOY_HOST: 149.88.85.148
+          DEPLOY_PORT: "22"
+          DEPLOY_USER: frontmind-deploy
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s\n%s\n' "$GHCR_USERNAME" "$GHCR_TOKEN" |
+            ssh -T \
+              -i ~/.ssh/dashboard_deploy \
+              -p "$DEPLOY_PORT" \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "$IMAGE@$DIGEST $FRONTMIND_RELEASE_SOURCE_SHA"
+      - name: Record immutable successful-deployment marker
+        if: github.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.image.outputs.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: node scripts/mark-ghcr-promoted.mjs --marker-prefix deployed
   coupled-stack-deploy:
     name: Reuse exact production artifacts and deploy coupled stack
     if: >-

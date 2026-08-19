@@ -577,6 +577,39 @@ describe("UserBrandDashboard service experience", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("renders the preview word bank without heat controls and keeps fixture order", () => {
+    setPreviewPlan("luxury");
+    render(<UserBrandDashboard preview />);
+
+    fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
+
+    expect(
+      screen.getAllByText(
+        "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。",
+      ).length,
+    ).toBeGreaterThan(0);
+    const keywordTable = screen.getByRole("table");
+    expect(
+      within(keywordTable)
+        .getAllByRole("columnheader")
+        .map((header) => header.textContent),
+    ).toEqual(["问题", "主分类", "问题细分", "问题优化"]);
+    expect(
+      within(keywordTable).queryByRole("columnheader", { name: /热度/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/热度从高到低|热度从低到高/),
+    ).not.toBeInTheDocument();
+
+    const rows = within(keywordTable).getAllByRole("row");
+    expect(
+      within(rows[1]!).getByText("验收企业的方案适合哪些业务场景？"),
+    ).toBeInTheDocument();
+    expect(
+      within(rows[2]!).getByText("如何核验验收企业的公开口碑？"),
+    ).toBeInTheDocument();
+  });
+
   it("locks a brand keyword, confirms it, and reflects preview quota usage", async () => {
     setPreviewPlan("luxury");
     const novelPreviewKeywordQuestion = "验收企业有哪些全新的落地场景？";

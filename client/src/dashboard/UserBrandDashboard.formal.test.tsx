@@ -217,10 +217,8 @@ const managedPayload = {
       id: "enterprise-keywords",
       title: "企业问题词库",
       description: "管理员上传",
-      columns: ["序号", "问题", "核心词", "核心词分类", "热度", "创建日期"],
-      rows: [
-        ["1", "如何选择新企业？", "新企业", "场景痛点词", "1200", "2026-07-27"],
-      ],
+      columns: ["序号", "问题", "核心词", "核心词分类", "问题细分"],
+      rows: [["1", "如何选择新企业？", "新企业", "场景痛点词", "场景方案"]],
     },
   ],
   questions: [],
@@ -1411,7 +1409,7 @@ describe("UserBrandDashboard formal workspace", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合反馈的真实热度呈现 GEO 优化问题。",
+        "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。",
       ),
     ).toBeInTheDocument();
     expect(
@@ -1430,7 +1428,8 @@ describe("UserBrandDashboard formal workspace", () => {
       within(keywordTable)
         .getAllByRole("columnheader")
         .map((header) => header.textContent),
-    ).toEqual(["问题", "主分类", "热度", "问题优化"]);
+    ).toEqual(["问题", "主分类", "问题细分", "问题优化"]);
+    expect(screen.queryByLabelText("排序")).not.toBeInTheDocument();
     expect(
       within(keywordTable).queryByRole("columnheader", { name: "核心词" }),
     ).not.toBeInTheDocument();

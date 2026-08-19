@@ -243,7 +243,7 @@ const brandSubpages = [
   {
     id: "global-keywords",
     label: "品牌全域词库",
-    desc: "基于百度营销、小红书蒲公英、抖音巨量指数等平台反馈的真实热度问题库。",
+    desc: "围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。",
   },
 ];
 
@@ -2424,7 +2424,6 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
   const [category, setCategory] = useState("all");
   const [subdivision, setSubdivision] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
-  const [sortBy, setSortBy] = useState("heat-desc");
   const subdivisionOptions = useMemo(
     () =>
       [
@@ -2455,13 +2454,8 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
             searchTerm,
           ),
       );
-    const heatDirection = sortBy === "heat-asc" ? 1 : -1;
-    items = [...items].sort(
-      (left, right) =>
-        heatDirection * (Number(left["热度"]) - Number(right["热度"])),
-    );
     return items;
-  }, [bank.questions, category, searchTerm, sortBy, subdivision]);
+  }, [bank.questions, category, searchTerm, subdivision]);
 
   const topRows = filteredQuestions.slice(0, 160);
 
@@ -2470,7 +2464,7 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
       <PageHeader
         eyebrow="MindPromise智诺 / 品牌建设"
         title="品牌全域词库"
-        desc="基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合反馈的真实热度呈现 GEO 优化问题。"
+        desc="围绕行业排名、竞品对比、美誉舆情与产品场景整理 GEO 优化问题，支持按主分类与问题细分筛选。"
       />
 
       {/* SaaS化：多维筛选工具栏 */}
@@ -2518,13 +2512,6 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
               ))}
             </select>
           </div>
-          <div className="filter-item">
-            <label>排序</label>
-            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
-              <option value="heat-desc">热度从高到低</option>
-              <option value="heat-asc">热度从低到高</option>
-            </select>
-          </div>
         </div>
       </div>
 
@@ -2545,7 +2532,6 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
                 <th>问题</th>
                 <th>主分类</th>
                 <th>问题细分</th>
-                <th>热度</th>
                 <th>问题优化</th>
               </tr>
             </thead>
@@ -2570,9 +2556,6 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
                       </span>
                     </td>
                     <td>{safeText(item["问题细分"])}</td>
-                    <td>
-                      <strong>{formatNumber(item["热度"])}</strong>
-                    </td>
                     <td>
                       <button
                         type="button"
