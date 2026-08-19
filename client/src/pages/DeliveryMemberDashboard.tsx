@@ -83,6 +83,7 @@ import {
   deliveryCleanupSummaryText,
   deliveryEventDisplayMessage,
   deliveryOperationLabel as deliveryOperationPresentationLabel,
+  deliveryTicketPresentationTitle,
   deliveryTicketStatusLabel,
   knowledgeResetReasonLabel,
   knowledgeResetStatusLabel,
@@ -1435,7 +1436,9 @@ function CustomerWorkbenchView({
         className="mb-5 border-red-400 bg-red-50/70"
       >
         <CardHeader>
-          <CardTitle>{focusedTicket.title}</CardTitle>
+          <CardTitle>
+            {deliveryTicketPresentationTitle(focusedTicket)}
+          </CardTitle>
           <p className="text-sm text-muted-foreground">
             当前需求状态：待处理。请在本客户看板内完成处理。
           </p>
@@ -1674,7 +1677,9 @@ function CustomerWorkbenchView({
                   >
                     <div className="flex flex-wrap items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <p className="font-medium">{ticket.title}</p>
+                        <p className="font-medium">
+                          {deliveryTicketPresentationTitle(ticket)}
+                        </p>
                         {operationLabel(ticket.operation) && (
                           <p className="mt-1 text-xs text-muted-foreground">
                             {operationLabel(ticket.operation)}
@@ -1759,7 +1764,9 @@ function CustomerWorkbenchView({
                         >
                           <div className="flex flex-wrap items-start justify-between gap-3">
                             <div>
-                              <p className="font-medium">{ticket.title}</p>
+                              <p className="font-medium">
+                                {deliveryTicketPresentationTitle(ticket)}
+                              </p>
                               <p className="mt-1 text-xs text-muted-foreground">
                                 {operationLabel(ticket.operation) || "交付任务"}
                               </p>
@@ -2068,7 +2075,11 @@ function DeliveryHistoryDetailDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>{detail?.ticket?.title || "任务详情"}</DialogTitle>
+          <DialogTitle>
+            {detail?.ticket
+              ? deliveryTicketPresentationTitle(detail.ticket)
+              : "任务详情"}
+          </DialogTitle>
           <DialogDescription>
             {detail?.customer
               ? `${detail.customer.name}${

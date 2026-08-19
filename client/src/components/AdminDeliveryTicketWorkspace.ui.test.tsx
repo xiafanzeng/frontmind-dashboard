@@ -111,6 +111,35 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
     );
   });
 
+  it("normalizes legacy question-catalog titles without rewriting stored data", () => {
+    render(
+      <AdminDeliveryTicketWorkspace
+        userId={42}
+        enterpriseName="测试企业"
+        preview
+        previewFixtures={{
+          ...executionPreviewFixtures,
+          tickets: [
+            {
+              ...executionPreviewFixtures.tickets[0],
+              operation: "question_catalog",
+              category: "question_catalog",
+              categoryLabel: "品牌词库与问题目录",
+              title: "配置品牌词库与问题目录",
+              topic: "品牌词库与问题目录",
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText("配置品牌词库").length).toBeGreaterThan(0);
+    expect(
+      screen.queryByText("配置品牌词库与问题目录"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("品牌词库与问题目录")).not.toBeInTheDocument();
+  });
+
   it("uses an explicit irreversible confirmation and exposes deletion only to system administrators", () => {
     expect(
       permanentDeliveryTicketDeletionConfirmation({
@@ -119,6 +148,16 @@ describe("AdminDeliveryTicketWorkspace streamlined UI", () => {
     ).toContain(
       "确认永久删除需求“发布企业事实页面”？关联附件、官网样例与需求处理记录也会永久删除",
     );
+    expect(
+      permanentDeliveryTicketDeletionConfirmation({
+        operation: "website_build",
+      }),
+    ).toContain("确认永久删除需求“未命名需求”？");
+    expect(
+      permanentDeliveryTicketDeletionConfirmation({
+        operation: "question_catalog",
+      }),
+    ).toContain("确认永久删除需求“配置品牌词库”？");
 
     const { rerender } = render(
       <AdminDeliveryTicketWorkspace

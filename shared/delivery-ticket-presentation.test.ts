@@ -80,9 +80,45 @@ describe("delivery ticket presentation", () => {
         operation: "legacy_operation",
       }),
     ).toBe("官网运营需求");
+    expect(
+      deliveryTicketPresentationTitle({
+        title: "配置品牌词库与问题目录",
+        type: "knowledge_base",
+        operation: "question_catalog",
+      }),
+    ).toBe("配置品牌词库");
+    expect(
+      deliveryTicketPresentationTopic({
+        topic: "品牌词库与问题目录",
+        title: "配置品牌词库与问题目录",
+        type: "knowledge_base",
+        operation: "question_catalog",
+      }),
+    ).toBe("配置品牌词库");
+    expect(
+      deliveryTicketPresentationTitle({
+        title: "配置品牌词库与问题目录",
+        type: "knowledge_base",
+        category: "question_catalog",
+      }),
+    ).toBe("配置品牌词库");
+    expect(
+      deliveryTicketPresentationTopic({
+        topic: "品牌词库与问题目录",
+        type: "knowledge_base",
+        category: "question_catalog",
+      }),
+    ).toBe("配置品牌词库");
   });
 
   it("localizes canonical, historical, and unknown categories", () => {
+    expect(
+      deliveryCategoryLabel({
+        type: "knowledge_base",
+        category: "question_catalog",
+        providedLabel: "品牌词库与问题目录",
+      }),
+    ).toBe("配置品牌词库");
     expect(
       deliveryCategoryLabel({ type: "content_asset", category: "D1" }),
     ).toBe("知乎问答");

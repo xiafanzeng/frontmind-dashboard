@@ -186,6 +186,10 @@ function knownCategoryLabel(input: {
   category?: unknown;
   providedLabel?: unknown;
 }) {
+  const category = normalizedString(input.category);
+  if (category === "question_catalog") {
+    return mappedLabel(DELIVERY_CATEGORY_LABELS, category);
+  }
   return (
     safeProvidedChineseLabel(input.providedLabel, input.category) ||
     mappedLabel(DELIVERY_CATEGORY_LABELS, input.category)
@@ -262,9 +266,15 @@ export function deliveryTicketPresentationTitle(input: {
   category?: unknown;
   categoryLabel?: unknown;
 }) {
+  const operation = normalizedString(input.operation);
+  const category = normalizedString(input.category);
+  if (operation === "question_catalog" || category === "question_catalog") {
+    return (
+      getDeliveryOperationSpec("question_catalog")?.label || "配置品牌词库"
+    );
+  }
   const title = normalizedString(input.title);
   if (title) return title;
-  const operation = normalizedString(input.operation);
   const operationLabel = operation
     ? getDeliveryOperationSpec(operation)?.label
     : null;
@@ -286,11 +296,15 @@ export function deliveryTicketPresentationTopic(input: {
   category?: unknown;
   fallbackLabel?: unknown;
 }) {
+  const operation = normalizedString(input.operation);
+  const category = normalizedString(input.category);
+  if (operation === "question_catalog" || category === "question_catalog") {
+    return (
+      getDeliveryOperationSpec("question_catalog")?.label || "配置品牌词库"
+    );
+  }
   const rawValues = new Set(
-    [
-      normalizedString(input.operation),
-      normalizedString(input.category),
-    ].filter((value): value is string => Boolean(value)),
+    [operation, category].filter((value): value is string => Boolean(value)),
   );
   const topic = normalizedString(input.topic);
   if (topic && !rawValues.has(topic)) return topic;

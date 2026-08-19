@@ -206,8 +206,8 @@ export default function BrandQuestionPortfolioWorkspace({
               品牌全域词库
             </h1>
             <p className="mt-3 max-w-3xl text-sm leading-7 text-[#716a80]">
-              品牌词库与候选问题由 AI
-              监控与优化工程师基于当前已发布的企业知识库配置。选择问题后进入专业审核，确认启动后才会锁定并占用额度。
+              品牌词库由 AI
+              监控与优化工程师基于当前已发布的企业知识库配置。客户选题后进入专业审核，确认启动后才会锁定并占用额度。
             </p>
           </div>
           <Button
@@ -328,7 +328,7 @@ export default function BrandQuestionPortfolioWorkspace({
       <section className="panel global-keyword-panel">
         <div className="panel-head">
           <div>
-            <h3>候选问题目录</h3>
+            <h3>词库问题</h3>
             <p className="panel-subtitle">
               按分类筛选问题，并提交给 AI 监控与优化工程师确认。
             </p>

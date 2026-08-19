@@ -1578,7 +1578,7 @@ describe("DeliveryMemberDashboard project context", () => {
         {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d93",
           userId: 101,
-          title: "配置品牌词库",
+          title: "配置品牌词库与问题目录",
           operation: "question_catalog",
           status: "in_progress",
           revision: 2,
@@ -1819,7 +1819,7 @@ describe("DeliveryMemberDashboard project context", () => {
           id: "4a67e445-37bb-45ed-9268-4ca9437e4d74",
           userId: 101,
           customerName: "示例客户",
-          title: "配置品牌词库",
+          title: "配置品牌词库与问题目录",
           operation: "question_catalog",
           status: "in_progress",
           revision: 2,
@@ -1860,6 +1860,10 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard customerWorkbench />);
 
     const keywordInput = await screen.findByLabelText("上传品牌词库");
+    expect(
+      screen.queryByText("配置品牌词库与问题目录"),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByText("配置品牌词库").length).toBeGreaterThan(0);
     expect(keywordInput).toHaveAttribute(
       "accept",
       expect.stringContaining(".xlsx"),

@@ -45,6 +45,8 @@ import {
   deliveryEventDisplayMessage,
   deliveryOperationLabel,
   deliveryStatusTransitionLabel,
+  deliveryTicketPresentationTitle,
+  deliveryTicketPresentationTopic,
   deliveryTicketStatusLabel,
 } from "@shared/delivery-ticket-presentation";
 
@@ -501,8 +503,35 @@ export function formatAdminTicketDate(
   });
 }
 
+function presentedTicketTitle(ticket: {
+  title?: string | null;
+  topic?: string | null;
+  type?: AdminDeliveryTicket["type"];
+  operation?: string | null;
+  category?: string | null;
+  categoryLabel?: string | null;
+}) {
+  const rawTitle = ticket.title?.trim() || ticket.topic?.trim();
+  if (rawTitle) {
+    return deliveryTicketPresentationTitle({ ...ticket, title: rawTitle });
+  }
+  if (
+    ticket.operation === "question_catalog" ||
+    ticket.category === "question_catalog"
+  ) {
+    return deliveryTicketPresentationTitle(ticket);
+  }
+  return "未命名需求";
+}
+
 function ticketTitle(ticket: AdminDeliveryTicket) {
-  return ticket.title || ticket.topic || "未命名需求";
+  return presentedTicketTitle(ticket);
+}
+
+function ticketTopic(ticket: AdminDeliveryTicket) {
+  if (!ticket.topic?.trim()) return null;
+  const topic = deliveryTicketPresentationTopic(ticket);
+  return topic === ticketTitle(ticket) ? null : topic;
 }
 
 export function ticketTypeLabel(
@@ -544,7 +573,7 @@ export function permanentDeliveryTicketDeletionConfirmation(ticket: {
   operation?: string | null;
   category?: string | null;
 }) {
-  const title = ticket.title || ticket.topic || "未命名需求";
+  const title = presentedTicketTitle(ticket);
   return `确认永久删除需求“${title}”？关联附件、官网样例与需求处理记录也会永久删除；删除后用户、工程师和管理员的列表中都不再展示，且无法恢复。`;
 }
 
@@ -1513,9 +1542,7 @@ export default function AdminDeliveryTicketWorkspace({
                         <StatusPill ticket={ticket} />
                       </div>
                       <strong>{ticketTitle(ticket)}</strong>
-                      {ticket.topic && ticket.title !== ticket.topic && (
-                        <p>{ticket.topic}</p>
-                      )}
+                      {ticketTopic(ticket) && <p>{ticketTopic(ticket)}</p>}
                       {ticket.type === "content_asset" &&
                         ticket.preferredMedia && (
                           <p>意向媒体：{ticket.preferredMedia}</p>
@@ -1597,10 +1624,9 @@ export default function AdminDeliveryTicketWorkspace({
                     <StatusPill ticket={detail.ticket} />
                   </div>
                   <h3>{ticketTitle(detail.ticket)}</h3>
-                  {detail.ticket.topic &&
-                    detail.ticket.title !== detail.ticket.topic && (
-                      <p>{detail.ticket.topic}</p>
-                    )}
+                  {ticketTopic(detail.ticket) && (
+                    <p>{ticketTopic(detail.ticket)}</p>
+                  )}
                 </div>
                 <div className="admin-ticket-detail-time">
                   <CalendarClock className="h-4 w-4" />
