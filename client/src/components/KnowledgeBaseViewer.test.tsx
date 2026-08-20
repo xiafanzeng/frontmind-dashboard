@@ -253,8 +253,8 @@ describe("KnowledgeBaseViewer", () => {
     );
 
     expect(
-      screen.getAllByRole("heading", { name: "企业正式综述" }).length,
-    ).toBeGreaterThan(0);
+      screen.getAllByRole("heading", { name: "企业正式综述" }),
+    ).toHaveLength(1);
     expect(screen.queryByText("仅供证据核验。")).toBeNull();
     expect(screen.queryByRole("tab", { name: "证据与来源" })).toBeNull();
     expect(
@@ -264,6 +264,37 @@ describe("KnowledgeBaseViewer", () => {
     expect(screen.getAllByText("企业身份").length).toBeGreaterThan(0);
     expect(screen.queryByText("identity")).toBeNull();
     expect(screen.queryByText(/·/)).toBeNull();
+  });
+
+  it("keeps section headings while removing a repeated document heading", () => {
+    render(
+      <KnowledgeBaseViewer
+        snapshot={{
+          ...snapshot,
+          documents: [
+            {
+              path: "branches/company/culture.md",
+              title: "品牌命名与文化内涵「天印溯方」",
+              content:
+                "## 品牌命名与文化内涵「天印溯方」\n正文内容。\n\n### 文化脉络\n章节内容。",
+              kind: "leaf",
+              customerVisible: true,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("heading", {
+        name: "品牌命名与文化内涵「天印溯方」",
+      }),
+    ).toHaveLength(1);
+    expect(
+      screen.getByRole("heading", { name: "文化脉络" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("正文内容。")).toBeInTheDocument();
+    expect(screen.getByText("章节内容。")).toBeInTheDocument();
   });
 
   it("does not show internal branch identifiers in the image gallery", () => {

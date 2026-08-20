@@ -243,7 +243,7 @@ const brandSubpages = [
   {
     id: "global-keywords",
     label: "品牌全域词库",
-    desc: "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。",
+    desc: "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。",
   },
 ];
 
@@ -2464,7 +2464,7 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
       <PageHeader
         eyebrow="MindPromise智诺 / 品牌建设"
         title="品牌全域词库"
-        desc="基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。"
+        desc="自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。"
       />
 
       {/* SaaS化：多维筛选工具栏 */}

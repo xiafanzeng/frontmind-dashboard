@@ -55,6 +55,43 @@ function splitMarkdownSections(content: string) {
   return sections.filter(Boolean);
 }
 
+function normalizeDocumentTitle(value: string) {
+  return value
+    .normalize("NFKC")
+    .replace(/[*_`~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function withoutDuplicateDocumentHeading(
+  content: string,
+  documentTitle: string,
+) {
+  const lines = content.split("\n");
+  const headingIndex = lines.findIndex((line) => line.trim());
+  if (headingIndex < 0) return content;
+
+  const heading = lines[headingIndex].match(
+    /^ {0,3}#{1,6}[\t ]+(.+?)[\t ]*#*[\t ]*$/,
+  );
+  if (
+    !heading ||
+    normalizeDocumentTitle(heading[1]) !== normalizeDocumentTitle(documentTitle)
+  ) {
+    return content;
+  }
+
+  lines.splice(headingIndex, 1);
+  while (lines[0]?.trim() === "") lines.shift();
+  return lines.join("\n");
+}
+
+function knowledgeDocumentSections(document: KnowledgeDocument) {
+  return splitMarkdownSections(
+    withoutDuplicateDocumentHeading(document.content, document.title),
+  );
+}
+
 function sectionHeading(content: string) {
   return content.match(/^#{1,3}\s+(.+)$/m)?.[1]?.trim() || "";
 }
@@ -216,7 +253,7 @@ function placeKnowledgeAssets(snapshot: KnowledgeSnapshotView): AssetPlacement {
   const relatedByDocument = new Map<string, KnowledgeDisplayAsset[]>();
   const documentSections = snapshot.documents.map((document) => ({
     document,
-    sections: splitMarkdownSections(document.content),
+    sections: knowledgeDocumentSections(document),
   }));
   const fallbackDocument = snapshot.documents[0];
 
@@ -510,8 +547,7 @@ export default function KnowledgeBaseViewer({
     filteredDocuments[0] ||
     formalDocuments[0];
   const documentSections = useMemo(
-    () =>
-      selectedDocument ? splitMarkdownSections(selectedDocument.content) : [],
+    () => (selectedDocument ? knowledgeDocumentSections(selectedDocument) : []),
     [selectedDocument],
   );
   const assetPlacement = useMemo(
@@ -783,7 +819,7 @@ export default function KnowledgeBaseViewer({
                         {sectionAssets.length > 0 && (
                           <KnowledgeImageGrid
                             assets={sectionAssets.slice(0, 3)}
-                            ariaLabel={`${sectionHeading(section) || "知识正文"}配图`}
+                            ariaLabel={`${sectionHeading(section) || selectedDocument.title || "知识正文"}配图`}
                             alternating={index % 2 === 1}
                           />
                         )}

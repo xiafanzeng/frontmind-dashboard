@@ -31,7 +31,7 @@ describe("ManagedKeywordTables", () => {
 
     expect(
       screen.getByText(
-        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。",
+        "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。",
       ),
     ).toBeInTheDocument();
     expect(
