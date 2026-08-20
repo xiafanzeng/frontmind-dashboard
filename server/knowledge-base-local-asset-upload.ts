@@ -159,27 +159,80 @@ export function knowledgeBaseLocalAssetIdentity(input: {
   };
 }
 
-export function knowledgeBaseLocalAssetReplayMatches(
+export function knowledgeBaseLocalAssetContentReplayMatches(
   existing: {
-    filename: string;
-    mimeType: string;
     sizeBytes: number;
     contentSha256: string;
     storageKey: string;
   },
   expected: {
-    filename: string;
-    mimeType: string;
     sizeBytes: number;
     contentSha256: string;
     storageKey: string;
   },
 ) {
   return (
-    existing.filename === expected.filename &&
-    existing.mimeType === expected.mimeType &&
     existing.sizeBytes === expected.sizeBytes &&
-    existing.contentSha256 === expected.contentSha256 &&
+    existing.contentSha256.toLowerCase() ===
+      expected.contentSha256.toLowerCase() &&
     existing.storageKey === expected.storageKey
   );
+}
+
+export type KnowledgeBaseLocalAssetStoredContentState =
+  | "matching"
+  | "missing"
+  | "mismatched";
+
+/**
+ * Decide whether an already-sealed deterministic row can be replayed or have
+ * its missing/expired body rebuilt. Display metadata is intentionally absent:
+ * the live frozen manifest already proved the incoming filename and MIME, and
+ * neither field is part of the Dashboard-owned content identity.
+ */
+export function knowledgeBaseLocalAssetExistingRowDisposition(input: {
+  existing: {
+    id: string;
+    scope: string;
+    accountUserId: number | null;
+    presalesProjectId: string | null;
+    sizeBytes: number;
+    contentSha256: string;
+    storageKey: string;
+    storageKeyHash: string;
+    retainUntil: Date | null;
+  };
+  expected: {
+    localAssetId: string;
+    ownerUserId: number;
+    sizeBytes: number;
+    contentSha256: string;
+    storageKey: string;
+    storageKeyHash: string;
+  };
+  storedContent: KnowledgeBaseLocalAssetStoredContentState;
+  now: number;
+}):
+  | { action: "replay"; status: 200 }
+  | { action: "rebuild"; status: 201 }
+  | { action: "conflict"; status: 409 } {
+  const { existing, expected } = input;
+  if (
+    existing.id !== expected.localAssetId ||
+    existing.scope !== "managed_user" ||
+    existing.accountUserId !== expected.ownerUserId ||
+    existing.presalesProjectId !== null ||
+    !knowledgeBaseLocalAssetContentReplayMatches(existing, expected) ||
+    existing.storageKeyHash !== expected.storageKeyHash ||
+    input.storedContent === "mismatched"
+  ) {
+    return { action: "conflict", status: 409 };
+  }
+  if (
+    input.storedContent === "missing" ||
+    (existing.retainUntil?.getTime() ?? 0) <= input.now
+  ) {
+    return { action: "rebuild", status: 201 };
+  }
+  return { action: "replay", status: 200 };
 }

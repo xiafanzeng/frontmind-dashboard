@@ -71,6 +71,7 @@ import {
   readKnowledgeBaseLocalSource,
 } from "./knowledge-base-local-source-store";
 import { readStoredPresalesFile } from "./presales-file-store";
+import { knowledgeBaseLocalAssetIdentity } from "./knowledge-base-local-asset-upload";
 import { readKnowledgeBasePinnedSkillArchiveAttachment } from "./knowledge-base-skill-runtime";
 import {
   matchesAuthoritativeKnowledgeBaseMessageTuple,
@@ -5623,6 +5624,113 @@ export type KnowledgeBaseLocalUploadCoordinateAssertion = {
   authoritativeContentSha256?: string;
 };
 
+export type KnowledgeBaseDeferredAttachmentReservationSnapshot = {
+  buildId: string;
+  turn: KnowledgeBaseTurnRecord;
+  /**
+   * The customer-only manifest frozen at reserve time. Generated Skill,
+   * prefill and instruction attachments intentionally do not appear here.
+   */
+  clientAttachmentManifest: unknown[];
+};
+
+/**
+ * Read the exact active browser-upload reservation without acquiring a worker
+ * lease. The snapshot is deliberately customer-only so recovery never treats
+ * generated attachments as missing browser files.
+ */
+export async function inspectKnowledgeBaseDeferredAttachmentReservation(
+  input: {
+    userId: number;
+    conversationId: string;
+    turnId: string;
+    clientRequestId: string;
+    expectedResetRevision: number;
+  },
+  executor?: any,
+): Promise<KnowledgeBaseDeferredAttachmentReservationSnapshot> {
+  assertInteger(input.userId, "userId", 1);
+  assertInteger(input.expectedResetRevision, "expectedResetRevision", 0);
+  const expectedConversationId = knowledgeBaseConversationStorageId(
+    input.userId,
+    input.conversationId,
+  );
+  const turnId = normalizeRequiredId(input.turnId, "turnId", 36);
+  const clientRequestId = normalizeRequiredId(
+    input.clientRequestId,
+    "clientRequestId",
+    128,
+  );
+  const db = executor ?? (await requireDb());
+  return db.transaction(async (tx: any) => {
+    const { turn, build } = await lockedOwnedTurnAndBuild(tx, {
+      userId: input.userId,
+      turnId,
+    });
+    const metadata = metadataOf(turn);
+    await assertDeferredResetRevisionInTransaction({
+      tx,
+      turn,
+      metadata,
+      expectedResetRevision: input.expectedResetRevision,
+    });
+    const recovery =
+      metadata.recovery &&
+      typeof metadata.recovery === "object" &&
+      !Array.isArray(metadata.recovery)
+        ? metadata.recovery
+        : {};
+    const clientAttachmentManifest = Array.isArray(
+      recovery.clientAttachmentManifest,
+    )
+      ? recovery.clientAttachmentManifest
+      : Array.isArray(recovery.attachmentManifest)
+        ? recovery.attachmentManifest
+        : null;
+    const userAttachmentCount = Number(metadata.userAttachmentCount);
+    const staged = Array.isArray(metadata.clientStagedAttachments)
+      ? metadata.clientStagedAttachments
+      : [];
+    if (
+      turn.conversationId !== expectedConversationId ||
+      build.conversationId !== input.conversationId ||
+      turn.clientRequestId !== clientRequestId ||
+      (turn.operationType !== "start" && turn.operationType !== "revise") ||
+      turn.status !== "queued" ||
+      Boolean(turn.upstreamTaskId) ||
+      metadata.awaitingClientAttachments !== true ||
+      metadata.attachmentsFrozen === true ||
+      Boolean(metadata.preparedDispatch) ||
+      storedKnowledgeBaseCreateAttemptState(metadata) !== "not_sent" ||
+      (metadata.providerAttemptState !== undefined &&
+        metadata.providerAttemptState !== "not_sent") ||
+      Boolean(metadata.dispatchingAt || metadata.outcomeUnknownAt) ||
+      !Number.isSafeInteger(userAttachmentCount) ||
+      userAttachmentCount < 1 ||
+      !clientAttachmentManifest ||
+      clientAttachmentManifest.length !== userAttachmentCount ||
+      metadata.clientAttachmentManifestHash !==
+        hashKnowledgeBaseTurnRequest(clientAttachmentManifest) ||
+      staged.length > userAttachmentCount ||
+      staged.some((attachment, index) => attachment.index !== index)
+    ) {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Only an active unprepared customer upload reservation can be resumed",
+      );
+    }
+    return {
+      buildId: build.id,
+      turn: turnRecord(turn),
+      clientAttachmentManifest: clientAttachmentManifest.map((entry) =>
+        entry && typeof entry === "object" && !Array.isArray(entry)
+          ? { ...(entry as Record<string, unknown>) }
+          : entry,
+      ),
+    };
+  });
+}
+
 /**
  * Proves that a private local-upload coordinate still names the authenticated
  * account's active, un-dispatched start/revise reservation and the exact frozen
@@ -5901,6 +6009,77 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
       "The uploaded file does not match its logical turn reservation",
     );
   }
+  const expectedCount = Number(metadata.userAttachmentCount ?? 0);
+  if (
+    !Number.isSafeInteger(expectedCount) ||
+    expectedCount < 1 ||
+    input.index >= expectedCount
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "Uploaded file index exceeds the reserved attachment manifest",
+    );
+  }
+  const rawManifestItem = Array.isArray(input.clientAttachmentManifest)
+    ? input.clientAttachmentManifest[input.index]
+    : null;
+  const manifestItem =
+    rawManifestItem &&
+    typeof rawManifestItem === "object" &&
+    !Array.isArray(rawManifestItem)
+      ? (rawManifestItem as Record<string, unknown>)
+      : null;
+  const managedContentSha256 = String(
+    input.managedUploadProof?.contentSha256 || "",
+  )
+    .trim()
+    .toLowerCase();
+  const frozenContentSha256 = String(manifestItem?.sha256 || "")
+    .trim()
+    .toLowerCase();
+  const expectedLocalAssetId = input.managedUploadProof
+    ? knowledgeBaseLocalAssetIdentity({
+        userId: turn.userId,
+        projectAssignmentId: input.projectAssignmentId ?? null,
+        coordinate: {
+          conversationId: build.conversationId,
+          turnId: turn.id,
+          clientRequestId,
+          itemId: input.managedUploadProof.itemId,
+          expectedResetRevision: input.expectedResetRevision,
+          ...(frozenContentSha256
+            ? { contentSha256: frozenContentSha256 }
+            : {}),
+          ordinal: input.index + 1,
+        },
+        sizeBytes: input.managedUploadProof.sizeBytes,
+        authoritativeContentSha256: managedContentSha256 || undefined,
+      }).localAssetId
+    : null;
+  if (
+    input.managedUploadProof &&
+    (!Array.isArray(input.clientAttachmentManifest) ||
+      input.clientAttachmentManifest.length !== expectedCount ||
+      !manifestItem ||
+      manifestItem.itemId !== input.managedUploadProof.itemId ||
+      manifestItem.ordinal !== input.index + 1 ||
+      manifestItem.total !== expectedCount ||
+      manifestItem.filename !== attachment.filename ||
+      manifestItem.mimeType !== input.managedUploadProof.mimeType ||
+      manifestItem.sizeBytes !== input.managedUploadProof.sizeBytes ||
+      !KNOWLEDGE_BASE_SHA256_PATTERN.test(managedContentSha256) ||
+      (frozenContentSha256 &&
+        !KNOWLEDGE_BASE_SHA256_PATTERN.test(frozenContentSha256)) ||
+      (frozenContentSha256 && frozenContentSha256 !== managedContentSha256) ||
+      attachment.file_id !== expectedLocalAssetId ||
+      input.managedUploadProof.intentId !==
+        `local-asset:${expectedLocalAssetId}`)
+  ) {
+    throw new KnowledgeBaseTurnReservationError(
+      "CONFLICT",
+      "The uploaded local asset does not match its frozen manifest coordinate",
+    );
+  }
   const localAsset = input.managedUploadProof
     ? (
         await tx
@@ -5911,6 +6090,7 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
               eq(localAssets.id, attachment.file_id),
               eq(localAssets.scope, "managed_user"),
               eq(localAssets.accountUserId, turn.userId),
+              isNull(localAssets.presalesProjectId),
             ),
           )
           .limit(1)
@@ -5935,10 +6115,12 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
   if (input.managedUploadProof) {
     if (
       !localAsset ||
-      localAsset.filename !== attachment.filename ||
-      localAsset.mimeType !== input.managedUploadProof.mimeType ||
+      localAsset.id !== expectedLocalAssetId ||
+      localAsset.scope !== "managed_user" ||
+      localAsset.accountUserId !== turn.userId ||
+      localAsset.presalesProjectId !== null ||
       localAsset.sizeBytes !== input.managedUploadProof.sizeBytes ||
-      localAsset.contentSha256 !== input.managedUploadProof.contentSha256
+      localAsset.contentSha256.toLowerCase() !== managedContentSha256
     ) {
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
@@ -5972,17 +6154,6 @@ async function stageKnowledgeBaseDeferredTurnAttachmentInTransaction(
     );
   }
   let managedUploadProof = input.managedUploadProof;
-  const expectedCount = Number(metadata.userAttachmentCount ?? 0);
-  if (
-    !Number.isSafeInteger(expectedCount) ||
-    expectedCount < 1 ||
-    input.index >= expectedCount
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      "Uploaded file index exceeds the reserved attachment manifest",
-    );
-  }
   const staged = Array.isArray(metadata.clientStagedAttachments)
     ? [...metadata.clientStagedAttachments]
     : [];
@@ -9222,6 +9393,7 @@ async function cancelUnpreparedKnowledgeBaseTurnInternal(
     leaseToken?: string;
     expectedResetRevision?: number;
     strictStartCancellation?: boolean;
+    strictRevisionCancellation?: boolean;
     code: string;
     message: string;
     now?: Date;
@@ -9230,6 +9402,7 @@ async function cancelUnpreparedKnowledgeBaseTurnInternal(
 ) {
   const db = executor ?? (await requireDb());
   const strictStartCancellation = input.strictStartCancellation === true;
+  const strictRevisionCancellation = input.strictRevisionCancellation === true;
   const expectedConversationId = input.conversationId
     ? knowledgeBaseConversationStorageId(input.userId, input.conversationId)
     : null;
@@ -9261,6 +9434,12 @@ async function cancelUnpreparedKnowledgeBaseTurnInternal(
       throw new KnowledgeBaseTurnReservationError(
         "CONFLICT",
         "Only an incomplete start operation can be cancelled",
+      );
+    }
+    if (strictRevisionCancellation && turn.operationType !== "revise") {
+      throw new KnowledgeBaseTurnReservationError(
+        "CONFLICT",
+        "Only an incomplete revision upload can be cancelled",
       );
     }
     if (
@@ -9324,7 +9503,10 @@ async function cancelUnpreparedKnowledgeBaseTurnInternal(
         "Only an unprepared active upload turn can be cancelled",
       );
     }
-    if (turn.operationType === "start") {
+    if (
+      turn.operationType === "start" ||
+      (strictRevisionCancellation && turn.operationType === "revise")
+    ) {
       await assertDeferredResetRevisionInTransaction({
         tx,
         turn,
@@ -9777,6 +9959,33 @@ export async function cancelUnpreparedKnowledgeBaseTurn(
   executor?: any,
 ) {
   return cancelUnpreparedKnowledgeBaseTurnInternal(input, executor);
+}
+
+/**
+ * Customer-visible release for a revise batch whose browser files have not
+ * crossed the Provider boundary. This preserves the authoritative leaf and
+ * Working Set while returning the conversation to awaiting input.
+ */
+export async function cancelIncompleteKnowledgeBaseRevision(
+  input: {
+    userId: number;
+    conversationId: string;
+    turnId: string;
+    clientRequestId: string;
+    expectedResetRevision: number;
+    now?: Date;
+  },
+  executor?: any,
+) {
+  return cancelUnpreparedKnowledgeBaseTurnInternal(
+    {
+      ...input,
+      strictRevisionCancellation: true,
+      code: "KNOWLEDGE_BASE_REVISION_UPLOAD_CANCELLED",
+      message: "客户已放弃本轮补充资料，可从当前知识节点继续",
+    },
+    executor,
+  );
 }
 
 /**

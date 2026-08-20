@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 import { KNOWLEDGE_BASE_LOCAL_UPLOAD_HEADERS } from "../shared/knowledge-base-local-upload";
 import {
   KnowledgeBaseLocalAssetCoordinateError,
+  knowledgeBaseLocalAssetContentReplayMatches,
+  knowledgeBaseLocalAssetExistingRowDisposition,
   knowledgeBaseLocalAssetIdentity,
-  knowledgeBaseLocalAssetReplayMatches,
   parseKnowledgeBaseLocalUploadCoordinate,
 } from "./knowledge-base-local-asset-upload";
 
@@ -88,7 +89,7 @@ describe("knowledge-base local asset operation identity", () => {
     expect(parseKnowledgeBaseLocalUploadCoordinate({})).toBeNull();
   });
 
-  it("requires every persisted field to match before replay", () => {
+  it("uses content identity rather than display metadata for replay", () => {
     const expected = {
       filename: "资料.pptx",
       mimeType:
@@ -97,12 +98,93 @@ describe("knowledge-base local asset operation identity", () => {
       contentSha256: "a".repeat(64),
       storageKey: "frontmind-v2:knowledge-base:identity",
     };
-    expect(knowledgeBaseLocalAssetReplayMatches(expected, expected)).toBe(true);
     expect(
-      knowledgeBaseLocalAssetReplayMatches(
+      knowledgeBaseLocalAssetContentReplayMatches(expected, expected),
+    ).toBe(true);
+    expect(
+      knowledgeBaseLocalAssetContentReplayMatches(
         { ...expected, contentSha256: "b".repeat(64) },
         expected,
       ),
     ).toBe(false);
+    expect(
+      knowledgeBaseLocalAssetContentReplayMatches(
+        {
+          ...expected,
+          filename: "adapter-renamed.bin",
+          mimeType: "application/octet-stream",
+        },
+        expected,
+      ),
+    ).toBe(true);
+  });
+
+  it("rebuilds an exact deterministic row whose retained body is missing", () => {
+    const existing = {
+      id: "asset_deterministic",
+      scope: "managed_user",
+      accountUserId: 7,
+      presalesProjectId: null,
+      filename: "stale-display-name.pdf",
+      mimeType: "application/x-stale-adapter-type",
+      sizeBytes: 12,
+      contentSha256: "a".repeat(64),
+      storageKey: "frontmind-v2:knowledge-base:identity",
+      storageKeyHash: "b".repeat(64),
+      retainUntil: new Date("2026-09-01T00:00:00.000Z"),
+    };
+    expect(
+      knowledgeBaseLocalAssetExistingRowDisposition({
+        existing,
+        expected: {
+          localAssetId: existing.id,
+          ownerUserId: 7,
+          sizeBytes: 12,
+          contentSha256: "a".repeat(64),
+          storageKey: existing.storageKey,
+          storageKeyHash: existing.storageKeyHash,
+        },
+        storedContent: "missing",
+        now: Date.parse("2026-08-20T00:00:00.000Z"),
+      }),
+    ).toEqual({ action: "rebuild", status: 201 });
+  });
+
+  it("never rebuilds over present corrupt bytes or a changed content identity", () => {
+    const existing = {
+      id: "asset_deterministic",
+      scope: "managed_user",
+      accountUserId: 7,
+      presalesProjectId: null,
+      sizeBytes: 12,
+      contentSha256: "a".repeat(64),
+      storageKey: "frontmind-v2:knowledge-base:identity",
+      storageKeyHash: "b".repeat(64),
+      retainUntil: new Date("2026-09-01T00:00:00.000Z"),
+    };
+    const expected = {
+      localAssetId: existing.id,
+      ownerUserId: 7,
+      sizeBytes: 12,
+      contentSha256: "a".repeat(64),
+      storageKey: existing.storageKey,
+      storageKeyHash: existing.storageKeyHash,
+    };
+    expect(
+      knowledgeBaseLocalAssetExistingRowDisposition({
+        existing,
+        expected,
+        storedContent: "mismatched",
+        now: Date.parse("2026-08-20T00:00:00.000Z"),
+      }),
+    ).toEqual({ action: "conflict", status: 409 });
+    expect(
+      knowledgeBaseLocalAssetExistingRowDisposition({
+        existing,
+        expected: { ...expected, contentSha256: "c".repeat(64) },
+        storedContent: "missing",
+        now: Date.parse("2026-08-20T00:00:00.000Z"),
+      }),
+    ).toEqual({ action: "conflict", status: 409 });
   });
 });

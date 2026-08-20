@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 
 import axios from "axios";
-import { and, desc, eq, gt } from "drizzle-orm";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import { Router, type Response } from "express";
 import { z } from "zod";
 
@@ -34,9 +34,10 @@ import {
 import { sealLocalAssetStorageIdentity } from "./local-asset-storage-key";
 import {
   KnowledgeBaseLocalAssetCoordinateError,
+  knowledgeBaseLocalAssetExistingRowDisposition,
   knowledgeBaseLocalAssetIdentity,
-  knowledgeBaseLocalAssetReplayMatches,
   parseKnowledgeBaseLocalUploadCoordinate,
+  type KnowledgeBaseLocalAssetStoredContentState,
 } from "./knowledge-base-local-asset-upload";
 import {
   assertKnowledgeBaseLocalUploadCoordinate,
@@ -164,32 +165,50 @@ function knowledgeBaseUploadReservationError(error: unknown) {
   return new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
 }
 
-async function storedLocalAssetContentMatches(input: {
+async function storedLocalAssetContentState(input: {
   id: string;
   sizeBytes: number;
   contentSha256: string;
-}) {
-  const stored = await readStoredPresalesFile(input.id);
+}): Promise<KnowledgeBaseLocalAssetStoredContentState> {
+  let stored;
+  try {
+    stored = await readStoredPresalesFile(input.id);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      [
+        "LOCAL_FILE_CONTENT_INVALID",
+        "LOCAL_FILE_CONTENT_SIZE_MISMATCH",
+        "PRESALES_FILE_RETENTION_INVALID",
+      ].includes(error.message)
+    ) {
+      return "mismatched";
+    }
+    throw error;
+  }
+  if (!stored) return "missing";
   if (
-    !stored ||
     stored.sizeBytes !== input.sizeBytes ||
     (stored.recordedSizeBytes !== null &&
       stored.recordedSizeBytes !== input.sizeBytes) ||
     stored.sha256 !== input.contentSha256
   ) {
-    return false;
+    return "mismatched";
   }
   const digest = createHash("sha256");
   let total = 0;
   for await (const chunk of stored.createReadStream()) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += bytes.length;
-    if (total > input.sizeBytes || total > MAX_LOCAL_ASSET_BYTES) return false;
+    if (total > input.sizeBytes || total > MAX_LOCAL_ASSET_BYTES) {
+      return "mismatched";
+    }
     digest.update(bytes);
   }
-  return (
-    total === input.sizeBytes && digest.digest("hex") === input.contentSha256
-  );
+  return total === input.sizeBytes &&
+    digest.digest("hex") === input.contentSha256
+    ? "matching"
+    : "mismatched";
 }
 
 async function requireDb(): Promise<Db> {
@@ -1352,41 +1371,126 @@ router.post("/assets", async (req, res) => {
           // Reset/dispatch can advance while the body is in flight. Re-prove
           // the reservation immediately before the short durable commit.
           await assertKnowledgeCoordinate(staged.sha256);
+          const now = Date.now();
           const replayPayload = async (
             existing: typeof localAssets.$inferSelect,
           ) => {
-            const matches =
-              knowledgeIdentity &&
-              knowledgeBaseLocalAssetReplayMatches(existing, {
-                filename,
-                mimeType,
+            const storageIdentity = sealLocalAssetStorageIdentity({
+              storageKey: authoritativeKnowledgeIdentity!.storageKey!,
+            });
+            const storedContent = await storedLocalAssetContentState({
+              id: existing.id,
+              sizeBytes: existing.sizeBytes,
+              contentSha256: existing.contentSha256,
+            });
+            const disposition = knowledgeBaseLocalAssetExistingRowDisposition({
+              existing,
+              expected: {
+                localAssetId: knowledgeIdentity!.localAssetId,
+                ownerUserId,
                 sizeBytes: staged.sizeBytes,
                 contentSha256: staged.sha256,
                 storageKey: authoritativeKnowledgeIdentity!.storageKey!,
-              });
-            const bytesMatch =
-              matches &&
-              (await storedLocalAssetContentMatches({
-                id: existing.id,
-                sizeBytes: existing.sizeBytes,
-                contentSha256: existing.contentSha256,
-              }));
-            if (!matches || !bytesMatch) {
+                storageKeyHash: storageIdentity.storageKeyHash,
+              },
+              storedContent,
+              now,
+            });
+            if (disposition.action === "conflict") {
               throw new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
             }
-            const expiresAt = existing.retainUntil?.getTime() ?? 0;
-            if (expiresAt <= Date.now()) {
-              throw new ChatV2HttpError("LOCAL_ASSET_EXPIRED", 409);
+
+            const updateExistingRow = async (values: {
+              retainUntil?: Date;
+              refCount?: number;
+            }) => {
+              const refreshed = await db
+                .update(localAssets)
+                .set({ filename, mimeType, ...values })
+                .where(
+                  and(
+                    eq(localAssets.id, existing.id),
+                    eq(localAssets.scope, "managed_user"),
+                    eq(localAssets.accountUserId, ownerUserId),
+                    isNull(localAssets.presalesProjectId),
+                    eq(localAssets.filename, existing.filename),
+                    eq(localAssets.mimeType, existing.mimeType),
+                    eq(localAssets.sizeBytes, existing.sizeBytes),
+                    eq(localAssets.contentSha256, existing.contentSha256),
+                    eq(localAssets.storageKey, existing.storageKey),
+                    eq(localAssets.storageKeyHash, existing.storageKeyHash),
+                    eq(localAssets.refCount, existing.refCount),
+                  ),
+                );
+              const affectedRows = Number(
+                (
+                  refreshed as unknown as Array<{
+                    affectedRows?: unknown;
+                  }>
+                )[0]?.affectedRows ?? 0,
+              );
+              if (affectedRows !== 1) {
+                throw new ChatV2HttpError("UPLOAD_OPERATION_CONFLICT", 409);
+              }
+            };
+
+            if (disposition.action === "rebuild") {
+              const expiresAt = now + LOCAL_CONTENT_RETENTION_MS;
+              // The frozen manifest, staged digest and immutable row all name
+              // the same content. Re-arm only this missing/expired body; a
+              // present corrupt file was rejected above and is never replaced.
+              await staged.commit({
+                filename,
+                mimeType,
+                uploadedAt: now,
+                contentExpiresAt: expiresAt,
+                replaceManagedRetention: true,
+              });
+              await updateExistingRow({
+                retainUntil: new Date(expiresAt),
+                refCount: Math.max(1, existing.refCount),
+              });
+              assetCommitted = true;
+              return {
+                status: disposition.status,
+                payload: {
+                  localAssetId: existing.id,
+                  filename,
+                  mimeType,
+                  bytes: existing.sizeBytes,
+                  sha256: existing.contentSha256,
+                  expiresAt,
+                  traceId,
+                  replayed: false,
+                },
+              };
+            }
+
+            if (
+              existing.filename !== filename ||
+              existing.mimeType !== mimeType ||
+              existing.refCount < 1
+            ) {
+              await updateExistingRow({
+                refCount: Math.max(1, existing.refCount),
+              });
+              await recordPresalesFileDescriptor({
+                fileId: existing.id,
+                filename,
+                mimeType,
+                sizeBytes: existing.sizeBytes,
+              });
             }
             await staged.discard();
             temporaryDiscarded = true;
             assetCommitted = true;
+            const expiresAt = existing.retainUntil!.getTime();
             return {
-              status: 200,
+              status: disposition.status,
               payload: {
                 localAssetId: existing.id,
-                filename: existing.filename,
-                mimeType: existing.mimeType,
+                filename,
+                mimeType,
                 bytes: existing.sizeBytes,
                 sha256: existing.contentSha256,
                 expiresAt,
@@ -1399,7 +1503,6 @@ router.post("/assets", async (req, res) => {
           const existing = await loadExisting();
           if (existing && knowledgeIdentity) return replayPayload(existing);
 
-          const now = Date.now();
           const storageKey =
             authoritativeKnowledgeIdentity?.storageKey ?? `frontmind-v2:${id}`;
           await staged.commit({

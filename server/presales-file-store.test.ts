@@ -24,6 +24,7 @@ import {
   readStoredPresalesFile,
   recordPresalesFileDescriptor,
   removePresalesFileCreateReservation,
+  removeStoredPresalesFileContent,
   purgePresalesFileCreateReservation,
   stagePresalesFileContent,
   sweepPresalesFileStorageRetention,
@@ -594,6 +595,110 @@ describe("presales file content retention manifest", () => {
       contentExpiresAt.toISOString(),
     );
     expect(stored?.manifestUpdatedAt).toBeInstanceOf(Date);
+  });
+
+  it("re-arms retention only for an explicitly proven missing-body rebuild", async () => {
+    const body = "byte-identical deterministic attachment";
+    await store({
+      fileId: "expired-missing-body",
+      body,
+      uploadedAt: "2026-01-01T00:00:00.000Z",
+      contentExpiresAt: "2026-01-31T00:00:00.000Z",
+    });
+    await removeStoredPresalesFileContent("expired-missing-body");
+    expect(await readStoredPresalesFile("expired-missing-body")).toBeNull();
+
+    const retry = await stagePresalesFileContent({
+      fileId: "expired-missing-body",
+      stream: Readable.from([body]),
+      maxBytes: 1_024,
+    });
+    await retry.commit({
+      filename: "reselected.pdf",
+      mimeType: "application/pdf",
+      uploadedAt: "2026-08-20T00:00:00.000Z",
+      contentExpiresAt: "2026-09-19T00:00:00.000Z",
+      replaceManagedRetention: true,
+    });
+
+    const restored = await readStoredPresalesFile("expired-missing-body");
+    expect(restored?.uploadedAt?.toISOString()).toBe(
+      "2026-08-20T00:00:00.000Z",
+    );
+    expect(restored?.contentExpiresAt?.toISOString()).toBe(
+      "2026-09-19T00:00:00.000Z",
+    );
+    const chunks: Buffer[] = [];
+    for await (const chunk of restored!.createReadStream()) {
+      chunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(chunks).toString("utf8")).toBe(body);
+  });
+
+  it("does not let a stale expired sweep delete a concurrently re-armed body", async () => {
+    const fileId = "expired-sweep-rearm-race";
+    const originalBody = "original expired bytes";
+    const rearmedBody = originalBody;
+    await store({
+      fileId,
+      body: originalBody,
+      uploadedAt: "2026-01-01T00:00:00.000Z",
+      contentExpiresAt: "2026-01-31T00:00:00.000Z",
+    });
+
+    let releaseSweep!: () => void;
+    const sweepPaused = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    let markExpiredManifestObserved!: () => void;
+    const expiredManifestObserved = new Promise<void>((resolve) => {
+      markExpiredManifestObserved = resolve;
+    });
+    const onExpiredFile = vi.fn();
+    const sweeping = sweepPresalesFileStorageRetention({
+      now: new Date("2026-02-01T00:00:00.000Z"),
+      cursor: null,
+      persistCursor: false,
+      onRetainedFile: async ({ fileId: observedFileId }) => {
+        if (observedFileId !== fileId) return;
+        markExpiredManifestObserved();
+        await sweepPaused;
+      },
+      onExpiredFile,
+    });
+    await expiredManifestObserved;
+
+    const staged = await stagePresalesFileContent({
+      fileId,
+      stream: Readable.from([rearmedBody]),
+      maxBytes: 1_024,
+    });
+    await withStoredPresalesFileMutationLock(fileId, () =>
+      staged.commit({
+        filename: "recovered.pdf",
+        mimeType: "application/pdf",
+        uploadedAt: "2026-02-01T00:00:01.000Z",
+        contentExpiresAt: "2026-03-03T00:00:01.000Z",
+        replaceManagedRetention: true,
+      }),
+    );
+    releaseSweep();
+
+    await expect(sweeping).resolves.toMatchObject({
+      deleted: 0,
+      expiredFilesDeleted: 0,
+      failures: 0,
+    });
+    expect(onExpiredFile).not.toHaveBeenCalled();
+    const restored = await readStoredPresalesFile(fileId);
+    expect(restored?.contentExpiresAt?.toISOString()).toBe(
+      "2026-03-03T00:00:01.000Z",
+    );
+    const restoredChunks: Buffer[] = [];
+    for await (const chunk of restored!.createReadStream()) {
+      restoredChunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(restoredChunks).toString("utf8")).toBe(rearmedBody);
   });
 
   it("stamps a legacy stored manifest without rewriting its bytes", async () => {

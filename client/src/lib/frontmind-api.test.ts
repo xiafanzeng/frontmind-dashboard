@@ -4,10 +4,12 @@ import { join, resolve } from "node:path";
 import {
   createTask,
   createKnowledgeBaseTurnTask,
+  cancelKnowledgeBaseTurnAttachments,
   discardManagedUploadIntent,
   discardUnboundUpload,
   reserveKnowledgeBaseStart,
   reserveKnowledgeBaseTurnWithAttachments,
+  resumeKnowledgeBaseTurnAttachments,
   stageKnowledgeBaseTurnAttachment,
   createResponseLogicTask,
   ResponseLogicTaskStartError,
@@ -1932,6 +1934,237 @@ describe("materialized knowledge-base local asset ingress", () => {
       ),
     ).toEqual(["1", "2"]);
     expect(onFileRecord).toHaveBeenCalledOnce();
+  });
+
+  it("resumes a revise turn after a lost final upload response and does not send the browser body twice when that ordinal is staged", async () => {
+    let bodySendCount = 0;
+    class MockXMLHttpRequest {
+      status = 0;
+      responseText = "";
+      upload = { addEventListener: vi.fn() };
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open() {}
+      setRequestHeader() {}
+      send() {
+        bodySendCount += 1;
+        queueMicrotask(() => this.onerror?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const attachmentManifest = [
+      {
+        itemId: "item-1",
+        ordinal: 1,
+        total: 1,
+        filename: "facts.jpg",
+        sizeBytes: 5,
+        mimeType: "image/jpeg",
+        lastModified: 1_755_000_000_001,
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        stagedCustomerAttachmentCount: 1,
+        retainedCustomerAttachmentCount: 1,
+        missingCustomerAttachments: [],
+        readyToDispatch: true,
+        attachmentManifest,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const file = new File(["facts"], "facts.jpg", {
+      type: "image/jpeg",
+      lastModified: attachmentManifest[0]!.lastModified,
+    });
+
+    await expect(
+      uploadKnowledgeBaseLocalAsset(
+        file,
+        undefined,
+        { maxRetries: 0, initialDelay: 0, maxDelay: 0 },
+        {
+          itemId: "item-1",
+          batchOrdinal: 1,
+          resumeScope: {
+            kind: "knowledge_base",
+            operationType: "revise",
+            conversationId: "conversation-1",
+            turnId: "turn-1",
+            clientRequestId: "request-1",
+            expectedResetRevision: 4,
+          },
+        },
+      ),
+    ).resolves.toMatchObject({
+      alreadyStaged: true,
+      recovered: true,
+      replayed: true,
+    });
+    expect(bodySendCount).toBe(1);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/knowledge-base/turn/attachments/resume",
+    );
+  });
+
+  it("reconciles an already-staged revise ordinal after both prior recovery responses were lost", async () => {
+    let bodySendCount = 0;
+    class MockXMLHttpRequest {
+      status = 409;
+      responseText = JSON.stringify({
+        error: {
+          code: "UPLOAD_OPERATION_CONFLICT",
+          message: "The upload ordinal is already staged",
+        },
+      });
+      upload = { addEventListener: vi.fn() };
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      open() {}
+      setRequestHeader() {}
+      send() {
+        bodySendCount += 1;
+        queueMicrotask(() => this.onload?.());
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", MockXMLHttpRequest);
+    const attachmentManifest = [
+      {
+        itemId: "item-1",
+        ordinal: 1,
+        total: 1,
+        filename: "facts.jpg",
+        sizeBytes: 5,
+        mimeType: "image/jpeg",
+        lastModified: 1_755_000_000_001,
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        stagedCustomerAttachmentCount: 1,
+        retainedCustomerAttachmentCount: 1,
+        missingCustomerAttachments: [],
+        readyToDispatch: true,
+        attachmentManifest,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      uploadKnowledgeBaseLocalAsset(
+        new File(["facts"], "facts.jpg", {
+          type: "image/jpeg",
+          lastModified: attachmentManifest[0]!.lastModified,
+        }),
+        undefined,
+        { maxRetries: 2, initialDelay: 0, maxDelay: 0 },
+        {
+          itemId: "item-1",
+          batchOrdinal: 1,
+          resumeScope: {
+            kind: "knowledge_base",
+            operationType: "revise",
+            conversationId: "conversation-1",
+            turnId: "turn-1",
+            clientRequestId: "request-1",
+            expectedResetRevision: 4,
+          },
+        },
+      ),
+    ).resolves.toMatchObject({
+      alreadyStaged: true,
+      recovered: true,
+      replayed: true,
+    });
+    expect(bodySendCount).toBe(1);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/knowledge-base/turn/attachments/resume",
+    );
+  });
+});
+
+describe("knowledge-base local attachment recovery contract", () => {
+  it("parses the additive knowledgeObservation field for resume and cancel", async () => {
+    const knowledgeObservation = {
+      generation: 2,
+      stateEpoch: 10,
+      interaction: {
+        interactionState: "awaiting_input",
+        canReply: true,
+        progress: null,
+      },
+    };
+    const attachmentManifest = [
+      {
+        itemId: "item-1",
+        ordinal: 1,
+        total: 1,
+        filename: "facts.pdf",
+        sizeBytes: 5,
+        mimeType: "application/pdf",
+        lastModified: 1,
+      },
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          stagedCustomerAttachmentCount: 1,
+          retainedCustomerAttachmentCount: 1,
+          missingCustomerAttachments: [],
+          readyToDispatch: true,
+          attachmentManifest,
+          knowledgeObservation,
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          cancelled: true,
+          knowledgeObservation,
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+    const coordinate = {
+      conversationId: "conversation-1",
+      turnId: "turn-1",
+      clientRequestId: "request-1",
+      expectedResetRevision: 4,
+    };
+
+    await expect(
+      resumeKnowledgeBaseTurnAttachments(coordinate),
+    ).resolves.toMatchObject({
+      stagedCustomerAttachmentCount: 1,
+      knowledgeObservation: { generation: 2, stateEpoch: 10 },
+    });
+    await expect(
+      cancelKnowledgeBaseTurnAttachments(coordinate),
+    ).resolves.toMatchObject({
+      cancelled: true,
+      knowledgeObservation: { generation: 2, stateEpoch: 10 },
+    });
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "/api/knowledge-base/turn/attachments/resume",
+      "/api/knowledge-base/turn/attachments/cancel",
+    ]);
   });
 });
 

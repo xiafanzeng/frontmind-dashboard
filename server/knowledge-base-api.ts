@@ -72,7 +72,6 @@ import {
   conversations,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
-  localAssets,
   messages,
   upstreamResources,
 } from "../drizzle/schema";
@@ -129,6 +128,7 @@ import {
   bindKnowledgeBaseManusV2Submission,
   cancelUnpreparedKnowledgeBaseTurn,
   cancelIncompleteKnowledgeBaseStart,
+  cancelIncompleteKnowledgeBaseRevision,
   claimKnowledgeBaseDeferredTurnDispatch,
   claimKnowledgeBaseTurnForRecovery,
   completeKnowledgeBaseGeneratedAttachment,
@@ -177,6 +177,15 @@ import {
   type KnowledgeBaseMaterializedResultDiagnostic,
   knowledgeBaseMaterializedCompletionContractVersion,
 } from "./knowledge-base-turn-service";
+import {
+  findRetainedKnowledgeBaseLocalAsset,
+  resumeKnowledgeBaseDeferredTurnAttachments,
+} from "./knowledge-base-deferred-upload-recovery";
+import {
+  inspectKnowledgeBaseDeferredAttachmentStagePolicy,
+  knowledgeBaseTurnLogoPolicy,
+  requireKnowledgeBaseDeferredAttachmentStageBuild,
+} from "./knowledge-base-deferred-attachment-stage-policy";
 
 import {
   appendManusV2KnowledgeBaseOperationContract,
@@ -318,6 +327,7 @@ export * from "./knowledge-base-client-attachment-manifest";
 export * from "./knowledge-base-turn-coordinates";
 export * from "./knowledge-base-runtime-log";
 export * from "./knowledge-base-prompt-contract";
+export { knowledgeBaseTurnLogoPolicy } from "./knowledge-base-deferred-attachment-stage-policy";
 export {
   getKnowledgeBaseSkillDescriptor,
   KNOWLEDGE_BASE_SKILL_ATTACHMENT_FILENAME,
@@ -447,33 +457,6 @@ export const KNOWLEDGE_BASE_MANUAL_LOGO_USER_INSTRUCTION =
   "用户已明确提交一张企业官方主 Logo。请只更新并重新展示当前首节点，不得确认或推进节点。";
 export const KNOWLEDGE_BASE_MANUAL_LOGO_DISPLAY_MESSAGE =
   "已提交新的企业官方主 Logo，正在重新呈现当前知识节点。";
-
-/**
- * Logo is a legacy-v1 correctness contract and a Manus-v2 optional resource.
- * The only v2 operation allowed to validate or bind Logo bytes is an explicit
- * manual Logo submission. Ordinary images must remain ordinary attachments.
- */
-export function knowledgeBaseTurnLogoPolicy(input: {
-  providerProtocol?: string | null;
-  manualLogoSubmission?: boolean;
-  legacyLogoRequired?: boolean;
-}) {
-  const manusV2 = input.providerProtocol === "manus_v2";
-  const manualLogoSubmission = input.manualLogoSubmission === true;
-  const requiresOfficialLogo = !manusV2 && input.legacyLogoRequired === true;
-  return {
-    requiresOfficialLogo,
-    inferOrdinaryAttachmentAsLogo:
-      requiresOfficialLogo && !manualLogoSubmission,
-    validateManualLogoSubmission: manualLogoSubmission,
-    readPersistedLogoSubmission: !manusV2 || manualLogoSubmission,
-    acceptProviderDiscoveredLogo: !manusV2,
-    assertFinalLogoProvenance: !manusV2,
-    // A byte-identical copy of an already-bound Logo is always a duplicate,
-    // even though v2 never requires the customer to provide Logo bytes.
-    rejectRepeatedOfficialLogo: true,
-  } as const;
-}
 
 export function knowledgeBasePresentationRequiresBoundLogo(input: {
   skillVersion?: string;
@@ -980,8 +963,6 @@ export function knowledgeBaseUpstreamModelForCredential(credential: {
   );
 }
 
-const MATERIALIZED_KNOWLEDGE_BASE_LOCAL_ASSET_MAX_BYTES = 100 * 1024 * 1024;
-
 async function readOwnedMaterializedKnowledgeBaseLocalAsset(input: {
   userId: number;
   localAssetId: string;
@@ -991,78 +972,20 @@ async function readOwnedMaterializedKnowledgeBaseLocalAsset(input: {
   /** Optional legacy browser digest; stored bytes remain server-verified. */
   sha256?: string;
 }) {
-  const db = await getDb();
-  if (!db) {
+  const retained = await findRetainedKnowledgeBaseLocalAsset({
+    ...input,
+    includeBytes: true,
+  });
+  if (!retained?.bytes) {
     throw new KnowledgeBaseTurnReservationError(
       "CONFLICT",
-      "Dashboard 本地附件存储暂不可用",
+      `附件“${input.filename}”的本地文件已过期或缺失，请重新上传`,
     );
   }
-  const asset = (
-    await db
-      .select()
-      .from(localAssets)
-      .where(
-        and(
-          eq(localAssets.id, input.localAssetId),
-          eq(localAssets.scope, "managed_user"),
-          eq(localAssets.accountUserId, input.userId),
-        ),
-      )
-      .limit(1)
-  )[0];
-  const stored = asset
-    ? await readStoredPresalesFile(input.localAssetId)
-    : null;
-  const legacyClientSha256 = String(input.sha256 || "")
-    .trim()
-    .toLowerCase();
-  if (
-    !asset ||
-    !stored ||
-    asset.filename !== input.filename ||
-    asset.mimeType !== input.mimeType ||
-    asset.sizeBytes !== input.sizeBytes ||
-    asset.contentSha256.toLowerCase() !== stored.sha256?.toLowerCase() ||
-    (legacyClientSha256 &&
-      asset.contentSha256.toLowerCase() !== legacyClientSha256) ||
-    stored.filename !== input.filename ||
-    stored.mimeType !== input.mimeType ||
-    stored.sizeBytes !== input.sizeBytes ||
-    (legacyClientSha256 && stored.sha256?.toLowerCase() !== legacyClientSha256)
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      `附件“${input.filename}”的本地身份、字节或哈希不匹配，请重新上传`,
-    );
-  }
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of stored.createReadStream()) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += bytes.length;
-    if (total > MATERIALIZED_KNOWLEDGE_BASE_LOCAL_ASSET_MAX_BYTES) {
-      throw new KnowledgeBaseTurnReservationError(
-        "INVALID_REQUEST",
-        `附件“${input.filename}”超过知识库本地处理上限`,
-      );
-    }
-    chunks.push(bytes);
-  }
-  const bytes = Buffer.concat(chunks, total);
-  const contentSha256 = createHash("sha256").update(bytes).digest("hex");
-  if (
-    total !== input.sizeBytes ||
-    contentSha256 !== asset.contentSha256.toLowerCase() ||
-    contentSha256 !== stored.sha256?.toLowerCase() ||
-    (legacyClientSha256 && contentSha256 !== legacyClientSha256)
-  ) {
-    throw new KnowledgeBaseTurnReservationError(
-      "CONFLICT",
-      `附件“${input.filename}”未通过 Dashboard 本地字节校验`,
-    );
-  }
-  return { asset, bytes, contentSha256 };
+  return {
+    bytes: retained.bytes,
+    contentSha256: retained.contentSha256,
+  };
 }
 
 /**
@@ -6897,6 +6820,156 @@ router.post("/turn/reserve", async (req, res) => {
   }
 });
 
+router.post("/turn/attachments/resume", async (req, res) => {
+  const body = (req.body || {}) as {
+    conversationId?: string;
+    turnId?: string;
+    clientRequestId?: string;
+    expectedResetRevision?: number;
+  };
+  const conversationId = String(body.conversationId || "").trim();
+  const turnId = String(body.turnId || "").trim();
+  const clientRequestId = String(body.clientRequestId || "").trim();
+  const expectedResetRevision = Number(body.expectedResetRevision);
+  if (
+    !conversationId ||
+    conversationId.length > 191 ||
+    !turnId ||
+    turnId.length > 36 ||
+    !clientRequestId ||
+    clientRequestId.length > 128 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0
+  ) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_KNOWLEDGE_BASE_ATTACHMENT_RESUME",
+        message: "附件恢复参数无效，请刷新后重试",
+      },
+    });
+    return;
+  }
+  if (
+    !req.frontmindUser ||
+    !(await requireKnowledgeBuildCapability(req.frontmindUser.id, res))
+  ) {
+    return;
+  }
+
+  try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
+    const result = await resumeKnowledgeBaseDeferredTurnAttachments({
+      userId: req.frontmindUser.id,
+      projectAssignmentId:
+        req.frontmindDeliveryProjectContext?.projectAssignmentId ?? null,
+      conversationId,
+      turnId,
+      clientRequestId,
+      expectedResetRevision,
+    });
+    const knowledgeObservation = await getKnowledgeBaseObservation({
+      userId: req.frontmindUser.id,
+      conversationId,
+      upstreamStatus: "running",
+    });
+    res.json({ ...result, knowledgeObservation });
+  } catch (error) {
+    const knowledgeObservation = await getKnowledgeBaseObservation({
+      userId: req.frontmindUser.id,
+      conversationId,
+      upstreamStatus: "running",
+    }).catch(() => null);
+    if (error instanceof KnowledgeBaseTurnReservationError) {
+      res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
+        error: { code: error.code, message: error.message },
+        knowledgeObservation,
+      });
+      return;
+    }
+    res.status(503).json({
+      error: {
+        code: "KNOWLEDGE_BASE_ATTACHMENT_RESUME_FAILED",
+        message: "附件恢复暂时不可用，请刷新后重试",
+      },
+      knowledgeObservation,
+    });
+  }
+});
+
+router.post("/turn/attachments/cancel", async (req, res) => {
+  const body = (req.body || {}) as {
+    conversationId?: string;
+    turnId?: string;
+    clientRequestId?: string;
+    expectedResetRevision?: number;
+  };
+  const conversationId = String(body.conversationId || "").trim();
+  const turnId = String(body.turnId || "").trim();
+  const clientRequestId = String(body.clientRequestId || "").trim();
+  const expectedResetRevision = Number(body.expectedResetRevision);
+  if (
+    !conversationId ||
+    conversationId.length > 191 ||
+    !turnId ||
+    turnId.length > 36 ||
+    !clientRequestId ||
+    clientRequestId.length > 128 ||
+    !Number.isSafeInteger(expectedResetRevision) ||
+    expectedResetRevision < 0
+  ) {
+    res.status(400).json({
+      error: {
+        code: "INVALID_KNOWLEDGE_BASE_ATTACHMENT_CANCEL",
+        message: "放弃本轮补充的参数无效，请刷新后重试",
+      },
+    });
+    return;
+  }
+  if (
+    !req.frontmindUser ||
+    !(await requireKnowledgeBuildCapability(req.frontmindUser.id, res))
+  ) {
+    return;
+  }
+
+  try {
+    await assertKnowledgeBaseWritable(req.frontmindUser.id);
+    await cancelIncompleteKnowledgeBaseRevision({
+      userId: req.frontmindUser.id,
+      conversationId,
+      turnId,
+      clientRequestId,
+      expectedResetRevision,
+    });
+    const knowledgeObservation = await getKnowledgeBaseObservation({
+      userId: req.frontmindUser.id,
+      conversationId,
+      upstreamStatus: "running",
+    });
+    res.json({ cancelled: true, knowledgeObservation });
+  } catch (error) {
+    const knowledgeObservation = await getKnowledgeBaseObservation({
+      userId: req.frontmindUser.id,
+      conversationId,
+      upstreamStatus: "running",
+    }).catch(() => null);
+    if (error instanceof KnowledgeBaseTurnReservationError) {
+      res.status(knowledgeBaseTurnReservationErrorStatus(error)).json({
+        error: { code: error.code, message: error.message },
+        knowledgeObservation,
+      });
+      return;
+    }
+    res.status(503).json({
+      error: {
+        code: "KNOWLEDGE_BASE_ATTACHMENT_CANCEL_FAILED",
+        message: "暂时无法放弃本轮补充，请刷新后重试",
+      },
+      knowledgeObservation,
+    });
+  }
+});
+
 router.post("/turn/attachments/stage", async (req, res) => {
   const body = (req.body || {}) as {
     conversationId?: string;
@@ -6981,34 +7054,16 @@ router.post("/turn/attachments/stage", async (req, res) => {
     if (await replayAfterMutableFailure()) {
       return;
     }
-    const build = await loadKnowledgeBaseBuildRecord(
-      req.frontmindUser.id,
+    const build = await requireKnowledgeBaseDeferredAttachmentStageBuild({
+      userId: req.frontmindUser.id,
       conversationId,
-    );
-    if (
-      !build ||
-      build.executionMode !== MATERIALIZED_KNOWLEDGE_BASE_EXECUTION_MODE ||
-      build.skillVersion !== "5" ||
-      build.providerProtocol !== "manus_v2"
-    ) {
-      throw new KnowledgeBaseTurnReservationError(
-        build ? "RESET_REQUIRED" : "BUILD_NOT_FOUND",
-        build
-          ? "旧知识库构建不再续跑；请批准重置并重新上传资料"
-          : "知识库构建不存在",
-      );
-    }
-    const isStartReservation = Boolean(
-      build &&
-        build.activeTurnId === turnId &&
-        build.revision === 0 &&
-        build.currentLeafId === null,
-    );
+    });
     const projectAssignmentId =
       req.frontmindDeliveryProjectContext?.projectAssignmentId;
     // Browser submissions carry only a Dashboard localAssetId. Re-read the
-    // account-owned row and its retained stream, then prove MIME/size/SHA
-    // before mutating the turn. A Provider file lease does not exist yet.
+    // account-owned row and its retained stream, then prove size/SHA/bytes
+    // before mutating the turn. Frozen filename/MIME remain display labels,
+    // not a second content gate. A Provider file lease does not exist yet.
     const localAsset = await readOwnedMaterializedKnowledgeBaseLocalAsset({
       userId: req.frontmindUser.id,
       localAssetId: attachment.file_id,
@@ -7017,89 +7072,31 @@ router.post("/turn/attachments/stage", async (req, res) => {
       sizeBytes: manifestItem.sizeBytes,
       sha256: manifestItem.sha256,
     });
-    const authoritativeManifestItem = {
-      ...manifestItem,
-      sizeBytes: localAsset.asset.sizeBytes,
-      sha256: localAsset.contentSha256,
-    };
-    const deferredLogoPolicy = knowledgeBaseTurnLogoPolicy({
-      providerProtocol: build.providerProtocol,
-      legacyLogoRequired:
-        !isStartReservation && knowledgeBaseBuildRequiresOfficialLogo(build),
-    });
-    const deferredOfficialLogoRequired =
-      deferredLogoPolicy.requiresOfficialLogo;
-    if (
-      deferredLogoPolicy.rejectRepeatedOfficialLogo &&
-      knowledgeBaseManifestRepeatsOfficialLogo(build, [
-        authoritativeManifestItem,
-      ])
-    ) {
+    const stagePolicyRejection =
+      await inspectKnowledgeBaseDeferredAttachmentStagePolicy({
+        build,
+        turnId,
+        attachmentManifest: manifest,
+        index,
+        fileId: attachment.file_id,
+        filename: manifestItem.filename,
+        mimeType: manifestItem.mimeType,
+        sizeBytes: manifestItem.sizeBytes,
+        contentSha256: localAsset.contentSha256,
+      });
+    if (stagePolicyRejection) {
       if (await replayAfterMutableFailure()) return;
-      const message =
-        "该图片与已绑定的企业主 Logo 完全相同，无需作为普通补图再次上传";
       await cancelUnpreparedKnowledgeBaseTurn({
         userId: req.frontmindUser.id,
         turnId,
         clientRequestId,
-        code: "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
-        message,
+        code: stagePolicyRejection.code,
+        message: stagePolicyRejection.message,
       });
       throw new KnowledgeBaseTurnReservationError(
-        "KNOWLEDGE_BASE_LOGO_UPLOAD_CONFLICT",
-        message,
+        stagePolicyRejection.code,
+        stagePolicyRejection.message,
       );
-    }
-    if (deferredOfficialLogoRequired) {
-      const rejectDeferredLogo = async (message: string) => {
-        if (await replayAfterMutableFailure!()) return true;
-        await cancelUnpreparedKnowledgeBaseTurn({
-          userId: req.frontmindUser!.id,
-          turnId,
-          clientRequestId,
-          code: "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
-          message,
-        });
-        throw new KnowledgeBaseTurnReservationError(
-          "KNOWLEDGE_BASE_LOGO_UPLOAD_INVALID",
-          message,
-        );
-      };
-      if (
-        manifest.length !== 1 ||
-        index !== 0 ||
-        ![
-          "image/avif",
-          "image/gif",
-          "image/jpeg",
-          "image/png",
-          "image/webp",
-        ].includes(manifestItem.mimeType)
-      ) {
-        if (
-          await rejectDeferredLogo(
-            "当前知识库正在等待企业主 Logo，请只上传一张受支持的图片原文件",
-          )
-        )
-          return;
-      }
-      try {
-        await assertCapturedKnowledgeBaseCustomerImage({
-          fileId: attachment.file_id,
-          filename: manifestItem.filename,
-          mimeType: manifestItem.mimeType,
-          sizeBytes: localAsset.asset.sizeBytes,
-          sourceSha256: localAsset.contentSha256,
-        });
-      } catch {
-        if (
-          await rejectDeferredLogo(
-            "上传文件不是可安全解码的企业主 Logo 图片，请重新选择原文件",
-          )
-        )
-          return;
-        return;
-      }
     }
     // Retain the verified bytes and stage the ledger while the service holds
     // the same live reset fence. This endpoint never claims or launches a

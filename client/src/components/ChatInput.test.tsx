@@ -15,6 +15,9 @@ const mocks = vi.hoisted(() => ({
   sendMessage: vi.fn(async () => true),
   continueKnowledgeBaseAttachmentAttempt: vi.fn(async () => true),
   discardKnowledgeBaseAttachmentAttempt: vi.fn(),
+  commitKnowledgeBaseObservation: vi.fn(),
+  wakeKnowledgeBaseConversation: vi.fn(),
+  rollbackPendingKnowledgeBaseTurn: vi.fn(),
   knowledgeBaseAttachmentAttempt: null as any,
   activeConversation: {
     id: "kb-conversation",
@@ -66,6 +69,9 @@ vi.mock("@/hooks/useSendMessage", () => ({
 vi.mock("@/contexts/ConversationContext", () => ({
   useConversation: () => ({
     activeConversation: mocks.activeConversation,
+    commitKnowledgeBaseObservation: mocks.commitKnowledgeBaseObservation,
+    wakeKnowledgeBaseConversation: mocks.wakeKnowledgeBaseConversation,
+    rollbackPendingKnowledgeBaseTurn: mocks.rollbackPendingKnowledgeBaseTurn,
   }),
   currentKnowledgeBaseReplySnapshot: (conversation: any) => {
     const state = conversation?.knowledgeBase;
@@ -94,6 +100,14 @@ vi.mock("@/contexts/ConversationContext", () => ({
         }
       : null;
   },
+}));
+
+vi.mock("./KnowledgeBaseManagedUploadRecovery", () => ({
+  default: () => (
+    <div data-testid="knowledge-base-managed-upload-recovery">
+      Dashboard 同轮附件恢复
+    </div>
+  ),
 }));
 
 vi.mock("@/lib/frontmind-api", () => ({
@@ -308,6 +322,8 @@ describe("knowledge-base ChatInput actions", () => {
     mocks.activeConversation.previousResponseId = undefined;
     mocks.activeConversation.knowledgeBase.initialized = true;
     mocks.activeConversation.knowledgeBase.activeTurnId = "turn-2";
+    mocks.activeConversation.knowledgeBase.activeClientRequestId = "request-2";
+    mocks.activeConversation.knowledgeBase.activeTurnOperationType = undefined;
     mocks.activeConversation.knowledgeBase.presentationKey = "presentation-2";
     mocks.activeConversation.knowledgeBase.revision = 2;
     mocks.activeConversation.knowledgeBase.leafId = "identity.legal";
@@ -927,16 +943,15 @@ describe("knowledge-base ChatInput actions", () => {
     expect(screen.queryByText("请重置")).not.toBeInTheDocument();
   });
 
-  it("shows fresh-reset guidance when the server awaits Files but this page has no matching attempt", () => {
+  it("mounts same-turn recovery for an awaiting revise turn without a page-memory attempt", () => {
     mocks.activeConversation.status = "running";
     mocks.activeConversation.knowledgeBase.canReply = false;
+    mocks.activeConversation.knowledgeBase.activeTurnId = "turn-upload";
+    mocks.activeConversation.knowledgeBase.activeClientRequestId =
+      "request-upload";
+    mocks.activeConversation.knowledgeBase.activeTurnResetRevision = 4;
+    mocks.activeConversation.knowledgeBase.activeTurnOperationType = "revise";
     mocks.activeConversation.knowledgeBase.activeTurnAwaitingClientAttachments = true;
-    const resetRequested = vi.fn();
-    window.addEventListener(
-      "frontmind:request-knowledge-reset",
-      resetRequested,
-      { once: true },
-    );
 
     render(
       <ChatInput
@@ -947,15 +962,32 @@ describe("knowledge-base ChatInput actions", () => {
     );
 
     expect(
-      screen.getByText("本轮补充资料尚未完成，任务尚未派发"),
+      screen.getByTestId("knowledge-base-managed-upload-recovery"),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/申请重置知识库/u)).not.toBeInTheDocument();
+  });
+
+  it("does not mount revise recovery for an initial start reservation", () => {
+    mocks.activeConversation.status = "running";
+    mocks.activeConversation.knowledgeBase.canReply = false;
+    mocks.activeConversation.knowledgeBase.activeTurnId = "turn-start";
+    mocks.activeConversation.knowledgeBase.activeClientRequestId =
+      "request-start";
+    mocks.activeConversation.knowledgeBase.activeTurnResetRevision = 4;
+    mocks.activeConversation.knowledgeBase.activeTurnOperationType = "start";
+    mocks.activeConversation.knowledgeBase.activeTurnAwaitingClientAttachments = true;
+
+    render(
+      <ChatInput
+        fixedAgentProfile="frontmind-pro"
+        syncKnowledgeBaseSnapshot
+        knowledgeBaseProgress={progress}
+      />,
+    );
+
     expect(
-      screen.getByText(
-        "当前页面已没有可继续上传的原始文件。请申请重置知识库后重新上传全部资料。",
-      ),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "申请重置知识库" }));
-    expect(resetRequested).toHaveBeenCalledTimes(1);
+      screen.queryByTestId("knowledge-base-managed-upload-recovery"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows dispatch reconciliation without a second-send action", () => {

@@ -50,6 +50,7 @@ import {
 } from "@/lib/task-output-projection";
 import { toast } from "sonner";
 import { knowledgeBaseObservationAcknowledgesClientRequest } from "@/lib/knowledge-base-coordinator";
+import type { KnowledgeBaseObservationDto } from "@/lib/knowledge-progress";
 
 export {
   collectAssistantOutputIds,
@@ -270,6 +271,8 @@ export type KnowledgeBaseAttachmentAttempt = {
     sha256?: string;
     manifestItem: KnowledgeBaseAttachmentManifestItem;
     stagedReceipt?: UploadRetentionReceipt;
+    /** Dashboard rediscovered and staged the deterministic local asset. */
+    stagedByResume?: boolean;
   }>;
   generation: number;
   stateEpoch: number;
@@ -1092,7 +1095,10 @@ export function useSendMessage() {
           if (knowledgeBaseAttachmentReservation) {
             updateKnowledgeBaseAttachmentAttempt((current) => ({
               ...current,
-              phase: attemptFile?.stagedReceipt ? "staging" : "uploading",
+              phase:
+                attemptFile?.stagedReceipt || attemptFile?.stagedByResume
+                  ? "staging"
+                  : "uploading",
               activeOrdinal: i + 1,
               progressPercent: Math.round((i / totalFiles) * 100),
             }));
@@ -1170,7 +1176,18 @@ export function useSendMessage() {
               ? uploadedKnowledgeBaseReceiptsRef.current.get(attemptFile.itemId)
               : undefined;
             const result =
-              attemptFile?.stagedReceipt ??
+              (attemptFile?.stagedByResume
+                ? ({
+                    fileId: "",
+                    sizeBytes: file.size,
+                    uploadedAt: Date.now(),
+                    expiresAt: Date.now(),
+                    replayed: true,
+                    recovered: true,
+                    alreadyStaged: true as const,
+                    filename: knowledgeBaseFilename!,
+                  } as const)
+                : attemptFile?.stagedReceipt) ??
               retainedReceipt ??
               (options?.syncKnowledgeBaseSnapshot
                 ? await uploadKnowledgeBaseLocalAsset(
@@ -1196,6 +1213,7 @@ export function useSendMessage() {
                               : {}),
                             resumeScope: {
                               kind: "knowledge_base" as const,
+                              operationType: "revise" as const,
                               conversationId: convId,
                               turnId: knowledgeBaseAttachmentReservation.turnId,
                               clientRequestId: knowledgeBaseClientRequestId!,
@@ -1207,11 +1225,27 @@ export function useSendMessage() {
                     },
                   )
                 : await uploadChatLocalAsset(file, uploadProgressHandler));
+            const attachmentAlreadyStaged =
+              "alreadyStaged" in result && result.alreadyStaged === true;
+            const resumedKnowledgeObservation = attachmentAlreadyStaged
+              ? (
+                  result as {
+                    knowledgeObservation?: KnowledgeBaseObservationDto;
+                  }
+                ).knowledgeObservation
+              : undefined;
+            if (resumedKnowledgeObservation) {
+              commitKnowledgeBaseObservation(
+                convId,
+                resumedKnowledgeObservation,
+              );
+            }
 
             if (
               knowledgeBaseAttachmentReservation &&
               attemptFile?.itemId &&
-              !attemptFile.stagedReceipt
+              !attemptFile.stagedReceipt &&
+              !attachmentAlreadyStaged
             ) {
               uploadedKnowledgeBaseReceiptsRef.current.set(
                 attemptFile.itemId,
@@ -1235,7 +1269,8 @@ export function useSendMessage() {
             if (
               knowledgeBaseAttachmentReservation &&
               knowledgeBaseAttachmentManifest &&
-              !attemptFile?.stagedReceipt
+              !attemptFile?.stagedReceipt &&
+              !attachmentAlreadyStaged
             ) {
               updateKnowledgeBaseAttachmentAttempt((current) => ({
                 ...current,
@@ -1269,30 +1304,42 @@ export function useSendMessage() {
                 progressPercent: Math.round(((i + 1) / totalFiles) * 100),
               }));
             }
-
-            contentItems.push({
-              type: "input_file",
-              file_id: result.fileId,
-              filename:
-                knowledgeBaseFilename ||
-                ("filename" in result ? result.filename : file.name),
-              mime_type: file.type || "application/octet-stream",
-            });
-            attachments.push({
-              id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-              type: "file",
-              name: file.name,
-              fileId: result.fileId,
-              ...(!knowledgeBaseAttachmentReservation
-                ? {
-                    base64: fileBase64,
-                    blobUrl: fileBlobUrl,
-                    file,
-                  }
-                : {}),
-              expiresAt: result.expiresAt,
-              expired: false,
-            });
+            if (attachmentAlreadyStaged) {
+              updateKnowledgeBaseAttachmentAttempt((current) => ({
+                ...current,
+                files: current.files.map((candidate) =>
+                  candidate.ordinal === i + 1
+                    ? { ...candidate, stagedByResume: true }
+                    : candidate,
+                ),
+                phase: "uploading",
+                progressPercent: Math.round(((i + 1) / totalFiles) * 100),
+              }));
+            } else {
+              contentItems.push({
+                type: "input_file",
+                file_id: result.fileId,
+                filename:
+                  knowledgeBaseFilename ||
+                  ("filename" in result ? result.filename : file.name),
+                mime_type: file.type || "application/octet-stream",
+              });
+              attachments.push({
+                id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                type: "file",
+                name: file.name,
+                fileId: result.fileId,
+                ...(!knowledgeBaseAttachmentReservation
+                  ? {
+                      base64: fileBase64,
+                      blobUrl: fileBlobUrl,
+                      file,
+                    }
+                  : {}),
+                expiresAt: result.expiresAt,
+                expired: false,
+              });
+            }
           } catch (uploadErr: any) {
             // The attachment never reached ConversationContext, so its normal
             // lifecycle cleanup cannot see this optimistic URL.
@@ -1338,7 +1385,7 @@ export function useSendMessage() {
             toast.error(`文件 "${file.name}" 上传失败`, {
               description: sanitizeBrandText(
                 knowledgeBaseAttachmentReservation
-                  ? `${uploadErr?.message || "上传未完成"}。本轮任务尚未派发；可继续上传当前资料，或放弃本轮后申请重置知识库。`
+                  ? `${uploadErr?.message || "上传未完成"}。本轮任务尚未派发；可继续上传当前资料，或放弃本轮返回当前节点。`
                   : uploadErr?.message || "请稍后重试。",
               ),
             });
@@ -1368,7 +1415,7 @@ export function useSendMessage() {
           }));
         }
 
-        if (contentItems.length === 0) {
+        if (contentItems.length === 0 && !knowledgeBaseAttachmentReservation) {
           return false;
         }
 

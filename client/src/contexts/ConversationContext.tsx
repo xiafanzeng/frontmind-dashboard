@@ -25,6 +25,7 @@ import type {
   KnowledgeBaseContentState,
   KnowledgeBaseFailureClass,
   KnowledgeBaseFailureStage,
+  KnowledgeBaseOperationType,
   KnowledgeBaseOperationState,
   KnowledgeBasePackageState,
   KnowledgeBaseProcessingPhase,
@@ -188,6 +189,7 @@ export interface KnowledgeBaseClientState {
   activeTurnUpdatedAt?: number;
   activeTurnMessageSequence?: number;
   activeTurnResetRevision?: number;
+  activeTurnOperationType?: KnowledgeBaseOperationType;
   activeTurnAwaitingClientAttachments?: boolean;
   activeTurnStagedAttachmentCount?: number;
   activeTurnExpectedAttachmentCount?: number;
@@ -1339,6 +1341,7 @@ export function applyKnowledgeBaseObservation(
       activeTurnUpdatedAt: observation.activeTurn?.updatedAt,
       activeTurnMessageSequence: observation.activeTurn?.messageSequence,
       activeTurnResetRevision: observation.activeTurn?.resetRevision,
+      activeTurnOperationType: observation.activeTurn?.operationType,
       activeTurnAwaitingClientAttachments:
         observation.activeTurn?.awaitingClientAttachments ??
         observation.activeTurn?.requiresAttachmentReselection ??

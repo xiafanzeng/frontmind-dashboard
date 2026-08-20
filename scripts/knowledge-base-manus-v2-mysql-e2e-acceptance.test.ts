@@ -26,17 +26,21 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   apiCredentials,
+  conversations,
   conversationTurns,
   knowledgeBaseBuildNodes,
   knowledgeBaseBuilds,
   knowledgeBaseSnapshots,
   knowledgeBaseWorkingSets,
+  localAssets,
   messages,
   upstreamResources,
   userDashboardContents,
 } from "../drizzle/schema";
 import { createDefaultDashboardPayload } from "../shared/dashboard";
+import { knowledgeBaseLocalUploadHeaders } from "../shared/knowledge-base-local-upload";
 import { KNOWLEDGE_BASE_COMPLETION_MESSAGE_CONTENT } from "../shared/knowledge-base-message";
+import { knowledgeBaseLocalAssetIdentity } from "../server/knowledge-base-local-asset-upload";
 import { knowledgeBaseMarkdownSha256 } from "../server/knowledge-base-package-validation";
 import { KNOWLEDGE_BASE_INSTRUCTIONS_FILENAME } from "../server/knowledge-base-prompt-delivery";
 import { KNOWLEDGE_BASE_MATERIALIZED_V5_SKILL_CONTENT_HASH } from "../server/knowledge-base-tree-policy-rollout";
@@ -141,6 +145,7 @@ const REPOSITORY_ROOT = path.resolve(process.cwd());
 const SYNTHETIC_COMPANY = "合成示例企业";
 const SYNTHETIC_WEBSITE = "https://synthetic.invalid/";
 const MATERIALIZED_LEAF_COUNT = 30;
+const INCIDENT_CUSTOMER_ATTACHMENT_COUNT = 9;
 const PROVIDER_BASE_URL = "https://fake.manus-v2.frontmind.test";
 const PROVIDER_UPLOAD_ORIGIN = "https://upload.manus-v2.frontmind.test";
 const PROVIDER_DOWNLOAD_ORIGIN = "https://download.manus-v2.frontmind.test";
@@ -853,7 +858,14 @@ mysqlDescribe(
     };
 
     const postKnowledgeBase = async (
-      pathname: "/start/reserve" | "/turn/dispatch" | "/confirm",
+      pathname:
+        | "/start/reserve"
+        | "/turn/reserve"
+        | "/turn/attachments/stage"
+        | "/turn/attachments/resume"
+        | "/turn/attachments/cancel"
+        | "/turn/dispatch"
+        | "/confirm",
       body: Record<string, unknown>,
     ) => {
       const response = await fetch(
@@ -871,6 +883,51 @@ mysqlDescribe(
       if (![200, 201, 202].includes(response.status)) {
         throw new Error(
           `${pathname} returned ${response.status}: ${JSON.stringify(payload)}`,
+        );
+      }
+      return payload;
+    };
+
+    const uploadKnowledgeBaseLocalAsset = async (input: {
+      conversationId: string;
+      turnId: string;
+      clientRequestId: string;
+      expectedResetRevision: number;
+      itemId: string;
+      ordinal: number;
+      filename: string;
+      mimeType: string;
+      bytes: Buffer;
+    }) => {
+      const response = await fetch(
+        `${dashboardBaseUrl}/api/frontmind/v2/assets`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/octet-stream",
+            "x-frontmind-filename": encodeURIComponent(input.filename),
+            "x-frontmind-mime": input.mimeType,
+            "x-frontmind-size": String(input.bytes.length),
+            "x-test-auth": "user",
+            ...knowledgeBaseLocalUploadHeaders(
+              {
+                conversationId: input.conversationId,
+                turnId: input.turnId,
+                clientRequestId: input.clientRequestId,
+                itemId: input.itemId,
+                expectedResetRevision: input.expectedResetRevision,
+                ordinal: input.ordinal,
+              },
+              1,
+            ),
+          },
+          body: input.bytes,
+        },
+      );
+      const payload = (await response.json()) as any;
+      if (![200, 201].includes(response.status)) {
+        throw new Error(
+          `/api/frontmind/v2/assets returned ${response.status}: ${JSON.stringify(payload)}`,
         );
       }
       return payload;
@@ -1022,6 +1079,9 @@ mysqlDescribe(
       const { default: dashboardRouter } = await import(
         "../server/dashboard-api"
       );
+      const { default: frontmindV2ChatRouter } = await import(
+        "../server/frontmind-v2-chat-router"
+      );
       const { requireExpressAuth } = await import(
         "../server/_core/express-auth"
       );
@@ -1036,6 +1096,11 @@ mysqlDescribe(
         "/api/knowledge-base",
         requireExpressAuth,
         knowledgeBaseRouter,
+      );
+      dashboard.use(
+        "/api/frontmind/v2",
+        requireExpressAuth,
+        frontmindV2ChatRouter,
       );
       dashboard.use("/api/dashboard", dashboardRouter);
       const listener = await listen(dashboard);
@@ -1116,7 +1181,7 @@ mysqlDescribe(
       }
     }, 120_000);
 
-    it("creates one v2 task, materializes every node, confirms locally after revoke, and builds the final ZIP", async () => {
+    it("creates one v2 task, recovers and releases a lost-response revise upload, confirms locally after revoke, and builds the final ZIP", async () => {
       expect(userId).not.toBeNull();
       const startRequest = {
         conversationId: publicConversationId,
@@ -1234,6 +1299,302 @@ mysqlDescribe(
               ),
         ),
       ).toBe(true);
+
+      // Production-incident shape: the browser reserved nine customer files
+      // (plus the three v5 server-owned attachments), staged files 1-3, then
+      // lost the response after Dashboard durably committed file 4. Recovery
+      // must discover those bytes without dispatching and cancellation must
+      // return the exact materialized leaf/Working Set to awaiting input.
+      const incidentClientRequestId = `lost-upload-${runId}`;
+      const incidentAttachments = Array.from(
+        { length: INCIDENT_CUSTOMER_ATTACHMENT_COUNT },
+        (_, index) => {
+          const ordinal = index + 1;
+          const bytes = Buffer.from(
+            `synthetic lost-response attachment ${ordinal} ${runId}`,
+            "utf8",
+          );
+          return {
+            itemId: `incident-${runId.slice(0, 24)}-${ordinal}`,
+            ordinal,
+            total: INCIDENT_CUSTOMER_ATTACHMENT_COUNT,
+            filename: `incident-attachment-${ordinal}.jpg`,
+            mimeType: "image/jpeg",
+            lastModified: FIXED_ZIP_DATE.getTime() + ordinal,
+            sizeBytes: bytes.length,
+            bytes,
+          };
+        },
+      );
+      const incidentManifest = incidentAttachments.map(
+        ({ bytes: _bytes, ...entry }) => entry,
+      );
+      const invariantBeforeIncident = {
+        currentLeafId: build.currentLeafId,
+        revision: build.revision,
+        contentVersion: build.contentVersion,
+        currentPresentationKey: build.currentPresentationKey,
+        activeWorkingSetId: build.activeWorkingSetId,
+        workingSet: { ...workingSets[0]! },
+        currentNode: { ...materializedNodes[0]! },
+      };
+      const providerCallsBeforeIncident = fakeProvider.providerCalls.length;
+      const taskCreatesBeforeIncident = fakeProvider.taskCreateBodies.length;
+      const incidentReservation = await postKnowledgeBase("/turn/reserve", {
+        conversationId: publicConversationId,
+        clientRequestId: incidentClientRequestId,
+        userMessage: "补充九份完全合成的验收资料",
+        attachmentManifest: incidentManifest,
+        expectedGeneration: 1,
+        expectedRevision: invariantBeforeIncident.revision,
+        expectedResetRevision: 0,
+        expectedLeafId: invariantBeforeIncident.currentLeafId,
+        expectedPresentationKey: invariantBeforeIncident.currentPresentationKey,
+      });
+      expect(incidentReservation.reservation).toMatchObject({
+        state: "awaiting_attachments",
+        turnId: expect.any(String),
+        clientRequestId: incidentClientRequestId,
+        stagedAttachmentCount: 0,
+        expectedAttachmentCount: INCIDENT_CUSTOMER_ATTACHMENT_COUNT,
+        requiresUpload: true,
+        createAttemptState: "not_sent",
+      });
+      const incidentTurnId = String(incidentReservation.reservation.turnId);
+      const reservedIncidentTurn = (
+        await executor
+          .select()
+          .from(conversationTurns)
+          .where(eq(conversationTurns.id, incidentTurnId))
+          .limit(1)
+      )[0]!;
+      expect(reservedIncidentTurn).toMatchObject({
+        operationType: "revise",
+        status: "queued",
+        upstreamTaskId: null,
+        attachmentFileIds: [],
+      });
+      expect(reservedIncidentTurn.metadata).toMatchObject({
+        userAttachmentCount: INCIDENT_CUSTOMER_ATTACHMENT_COUNT,
+        expectedAttachmentCount: INCIDENT_CUSTOMER_ATTACHMENT_COUNT + 3,
+        awaitingClientAttachments: true,
+        attachmentsFrozen: false,
+        clientStagedAttachments: [],
+        createAttemptState: "not_sent",
+        providerAttemptState: "not_sent",
+        dispatchState: "reserved",
+      });
+
+      const uploadReceipts: any[] = [];
+      for (const attachment of incidentAttachments.slice(0, 4)) {
+        const receipt = await uploadKnowledgeBaseLocalAsset({
+          conversationId: publicConversationId,
+          turnId: incidentTurnId,
+          clientRequestId: incidentClientRequestId,
+          expectedResetRevision: 0,
+          itemId: attachment.itemId,
+          ordinal: attachment.ordinal,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          bytes: attachment.bytes,
+        });
+        const identity = knowledgeBaseLocalAssetIdentity({
+          userId: userId!,
+          projectAssignmentId: null,
+          coordinate: {
+            conversationId: publicConversationId,
+            turnId: incidentTurnId,
+            clientRequestId: incidentClientRequestId,
+            itemId: attachment.itemId,
+            expectedResetRevision: 0,
+            ordinal: attachment.ordinal,
+          },
+          sizeBytes: attachment.sizeBytes,
+        });
+        expect(receipt).toMatchObject({
+          localAssetId: identity.localAssetId,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          bytes: attachment.sizeBytes,
+          sha256: sha256(attachment.bytes),
+          replayed: false,
+        });
+        uploadReceipts.push(receipt);
+      }
+
+      for (let index = 0; index < 3; index += 1) {
+        const attachment = incidentAttachments[index]!;
+        const staged = await postKnowledgeBase("/turn/attachments/stage", {
+          conversationId: publicConversationId,
+          turnId: incidentTurnId,
+          clientRequestId: incidentClientRequestId,
+          attachmentManifest: incidentManifest,
+          expectedResetRevision: 0,
+          index,
+          attachment: {
+            file_id: uploadReceipts[index]!.localAssetId,
+            filename: attachment.filename,
+          },
+        });
+        expect(staged.reservation).toMatchObject({
+          turnId: incidentTurnId,
+          stagedAttachmentCount: index + 1,
+          expectedAttachmentCount: INCIDENT_CUSTOMER_ATTACHMENT_COUNT,
+          requiresUpload: true,
+        });
+      }
+
+      const incidentBeforeResume = (
+        await executor
+          .select()
+          .from(conversationTurns)
+          .where(eq(conversationTurns.id, incidentTurnId))
+          .limit(1)
+      )[0]!;
+      expect(incidentBeforeResume.attachmentFileIds).toEqual(
+        uploadReceipts.slice(0, 3).map((receipt) => receipt.localAssetId),
+      );
+      expect(
+        (incidentBeforeResume.metadata as any).clientStagedAttachments,
+      ).toHaveLength(3);
+      const retainedFourth = (
+        await executor
+          .select()
+          .from(localAssets)
+          .where(eq(localAssets.id, uploadReceipts[3]!.localAssetId))
+          .limit(1)
+      )[0]!;
+      expect(retainedFourth).toMatchObject({
+        scope: "managed_user",
+        accountUserId: userId,
+        filename: incidentAttachments[3]!.filename,
+        mimeType: incidentAttachments[3]!.mimeType,
+        sizeBytes: incidentAttachments[3]!.sizeBytes,
+        contentSha256: sha256(incidentAttachments[3]!.bytes),
+      });
+
+      const resumedIncident = await postKnowledgeBase(
+        "/turn/attachments/resume",
+        {
+          conversationId: publicConversationId,
+          turnId: incidentTurnId,
+          clientRequestId: incidentClientRequestId,
+          expectedResetRevision: 0,
+        },
+      );
+      expect(resumedIncident).toMatchObject({
+        stagedCustomerAttachmentCount: 4,
+        retainedCustomerAttachmentCount: 4,
+        readyToDispatch: false,
+        missingCustomerAttachments: incidentManifest
+          .slice(4)
+          .map(({ total: _total, ...entry }) => entry),
+        attachmentManifest: incidentManifest,
+      });
+      const incidentAfterResume = (
+        await executor
+          .select()
+          .from(conversationTurns)
+          .where(eq(conversationTurns.id, incidentTurnId))
+          .limit(1)
+      )[0]!;
+      expect(incidentAfterResume).toMatchObject({
+        status: "queued",
+        upstreamTaskId: null,
+        attachmentFileIds: uploadReceipts.map(
+          (receipt) => receipt.localAssetId,
+        ),
+      });
+      expect(
+        (incidentAfterResume.metadata as any).clientStagedAttachments,
+      ).toHaveLength(4);
+      expect(fakeProvider.providerCalls).toHaveLength(
+        providerCallsBeforeIncident,
+      );
+      expect(fakeProvider.taskCreateBodies).toHaveLength(
+        taskCreatesBeforeIncident,
+      );
+
+      const cancelledIncident = await postKnowledgeBase(
+        "/turn/attachments/cancel",
+        {
+          conversationId: publicConversationId,
+          turnId: incidentTurnId,
+          clientRequestId: incidentClientRequestId,
+          expectedResetRevision: 0,
+        },
+      );
+      expect(cancelledIncident).toMatchObject({
+        cancelled: true,
+        knowledgeObservation: {
+          interaction: { interactionState: "awaiting_input" },
+          approvedPresentation: {
+            leafId: invariantBeforeIncident.currentLeafId,
+            presentationKey: invariantBeforeIncident.currentPresentationKey,
+          },
+        },
+      });
+      const [buildAfterIncident, workingSetAfterIncident, nodeAfterIncident] =
+        await Promise.all([
+          executor
+            .select()
+            .from(knowledgeBaseBuilds)
+            .where(eq(knowledgeBaseBuilds.id, build.id))
+            .limit(1)
+            .then((rows) => rows[0]!),
+          executor
+            .select()
+            .from(knowledgeBaseWorkingSets)
+            .where(eq(knowledgeBaseWorkingSets.id, build.activeWorkingSetId!))
+            .limit(1)
+            .then((rows) => rows[0]!),
+          executor
+            .select()
+            .from(knowledgeBaseBuildNodes)
+            .where(eq(knowledgeBaseBuildNodes.id, materializedNodes[0]!.id))
+            .limit(1)
+            .then((rows) => rows[0]!),
+        ]);
+      expect(buildAfterIncident).toMatchObject({
+        activeTurnId: null,
+        status: "confirming",
+        currentLeafId: invariantBeforeIncident.currentLeafId,
+        revision: invariantBeforeIncident.revision,
+        contentVersion: invariantBeforeIncident.contentVersion,
+        currentPresentationKey: invariantBeforeIncident.currentPresentationKey,
+        activeWorkingSetId: invariantBeforeIncident.activeWorkingSetId,
+      });
+      expect(workingSetAfterIncident).toEqual(
+        invariantBeforeIncident.workingSet,
+      );
+      expect(nodeAfterIncident).toEqual(invariantBeforeIncident.currentNode);
+      const cancelledIncidentTurn = (
+        await executor
+          .select()
+          .from(conversationTurns)
+          .where(eq(conversationTurns.id, incidentTurnId))
+          .limit(1)
+      )[0]!;
+      expect(cancelledIncidentTurn).toMatchObject({
+        status: "cancelled",
+        upstreamTaskId: null,
+        errorCode: "KNOWLEDGE_BASE_REVISION_UPLOAD_CANCELLED",
+      });
+      const incidentConversation = (
+        await executor
+          .select()
+          .from(conversations)
+          .where(eq(conversations.id, cancelledIncidentTurn.conversationId))
+          .limit(1)
+      )[0]!;
+      expect(incidentConversation.status).toBe("awaiting_input");
+      expect(fakeProvider.providerCalls).toHaveLength(
+        providerCallsBeforeIncident,
+      );
+      expect(fakeProvider.taskCreateBodies).toHaveLength(
+        taskCreatesBeforeIncident,
+      );
+      progress = { observation: cancelledIncident.knowledgeObservation };
 
       await executor
         .update(apiCredentials)

@@ -519,6 +519,7 @@ export type UploadFileOptions = {
   /** Durable server-side coordinate used to rediscover this upload elsewhere. */
   resumeScope?: {
     kind: "knowledge_base";
+    operationType?: "start" | "revise";
     conversationId: string;
     turnId: string;
     clientRequestId: string;
@@ -996,7 +997,14 @@ export async function uploadKnowledgeBaseLocalAsset(
     maxDelay: number;
   },
   options: UploadFileOptions = {},
-): Promise<UploadRetentionReceipt & { filename: string }> {
+): Promise<
+  UploadRetentionReceipt & {
+    filename: string;
+    /** The resume route already staged these bytes; callers must not stage again. */
+    alreadyStaged?: true;
+    knowledgeObservation?: KnowledgeBaseObservationDto;
+  }
+> {
   const filename =
     options.captureFilename || normalizedKnowledgeBaseUploadFilename(file.name);
   const coordinate = options.resumeScope
@@ -1115,7 +1123,57 @@ export async function uploadKnowledgeBaseLocalAsset(
           isRetryableUploadStatus(
             Number((error as { status?: unknown } | null)?.status || 0),
           ));
-      if (!retryable || retryIndex >= maxRetries) throw error;
+      const resumableRevisionConflict =
+        Boolean(coordinate) &&
+        options.resumeScope?.operationType === "revise" &&
+        errorCode === "UPLOAD_OPERATION_CONFLICT";
+      if (!retryable && !resumableRevisionConflict) throw error;
+      if (coordinate && options.resumeScope?.operationType === "revise") {
+        const resumed = await resumeKnowledgeBaseTurnAttachments(
+          {
+            conversationId: coordinate.conversationId,
+            turnId: coordinate.turnId,
+            clientRequestId: coordinate.clientRequestId,
+            expectedResetRevision: coordinate.expectedResetRevision,
+          },
+          options.signal,
+        );
+        if (resumed.stagedCustomerAttachmentCount >= coordinate.ordinal) {
+          const resumedAt = Date.now();
+          return {
+            fileId: "",
+            filename,
+            sizeBytes: file.size,
+            ...(coordinate.contentSha256
+              ? { contentSha256: coordinate.contentSha256 }
+              : {}),
+            uploadedAt: resumedAt,
+            dashboardReadyAt: resumedAt,
+            expiresAt: resumedAt,
+            replayed: true,
+            recovered: true,
+            alreadyStaged: true,
+            knowledgeObservation: resumed.knowledgeObservation,
+          };
+        }
+        if (resumableRevisionConflict) throw error;
+        const currentFileIsMissing = resumed.missingCustomerAttachments.some(
+          (item) =>
+            item.ordinal === coordinate.ordinal &&
+            item.itemId === coordinate.itemId,
+        );
+        if (!currentFileIsMissing) {
+          throw Object.assign(
+            new Error("Dashboard 正在恢复当前附件，请稍后继续"),
+            {
+              code: "KNOWLEDGE_BASE_ATTACHMENT_RESUME_PENDING",
+              retryable: true,
+              knowledgeObservation: resumed.knowledgeObservation,
+            },
+          );
+        }
+      }
+      if (retryIndex >= maxRetries) throw error;
       const delayMs = Math.min(maxDelay, initialDelay * 3 ** retryIndex);
       retryIndex += 1;
       options.onStage?.({
@@ -1377,6 +1435,28 @@ export interface KnowledgeBaseAttachmentTurnReservation {
   requiresUpload: boolean;
 }
 
+export interface KnowledgeBaseMissingCustomerAttachment
+  extends KnowledgeBaseAttachmentManifestItem {
+  itemId: string;
+  ordinal: number;
+}
+
+export interface KnowledgeBaseTurnAttachmentResumeResult {
+  stagedCustomerAttachmentCount: number;
+  retainedCustomerAttachmentCount: number;
+  missingCustomerAttachments: KnowledgeBaseMissingCustomerAttachment[];
+  readyToDispatch: boolean;
+  attachmentManifest: KnowledgeBaseAttachmentManifestItem[];
+  knowledgeObservation?: KnowledgeBaseObservationDto;
+}
+
+export interface KnowledgeBaseTurnAttachmentCoordinate {
+  conversationId: string;
+  turnId: string;
+  clientRequestId: string;
+  expectedResetRevision: number;
+}
+
 export type KnowledgeBaseRequestError = Error & {
   status?: number;
   code?: string;
@@ -1436,9 +1516,11 @@ export async function reserveKnowledgeBaseStart(
       return {
         reservation:
           payload.reservation as KnowledgeBaseAttachmentTurnReservation,
-        knowledgeObservation: payload?.observation
-          ? knowledgeBaseObservationFromPayload(payload)
-          : undefined,
+        knowledgeObservation: payload?.knowledgeObservation
+          ? knowledgeBaseObservationFromPayload(payload.knowledgeObservation)
+          : payload?.observation
+            ? knowledgeBaseObservationFromPayload(payload)
+            : undefined,
       };
     } catch (error) {
       lastError = error;
@@ -1589,7 +1671,11 @@ async function knowledgeBaseRequestError(
     String(payload?.error?.code || payload?.code || "").trim() || undefined;
   error.retryAfter = retryAfter;
   error.retryAfterMs = retryAfterMilliseconds(retryAfter || null);
-  if (payload?.observation) {
+  if (payload?.knowledgeObservation) {
+    error.knowledgeObservation = knowledgeBaseObservationFromPayload(
+      payload.knowledgeObservation,
+    );
+  } else if (payload?.observation) {
     error.knowledgeObservation = knowledgeBaseObservationFromPayload(payload);
   }
   return error;
@@ -1696,9 +1782,11 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
       }
       return {
         reservation: reservation as KnowledgeBaseAttachmentTurnReservation,
-        knowledgeObservation: payload?.observation
-          ? knowledgeBaseObservationFromPayload(payload)
-          : undefined,
+        knowledgeObservation: payload?.knowledgeObservation
+          ? knowledgeBaseObservationFromPayload(payload.knowledgeObservation)
+          : payload?.observation
+            ? knowledgeBaseObservationFromPayload(payload)
+            : undefined,
       };
     } catch (error) {
       lastError = error;
@@ -1712,6 +1800,136 @@ export async function reserveKnowledgeBaseTurnWithAttachments(
     }
   }
   throw lastError;
+}
+
+function assertKnowledgeBaseTurnAttachmentCoordinate(
+  input: KnowledgeBaseTurnAttachmentCoordinate,
+) {
+  if (
+    !input.conversationId.trim() ||
+    !input.turnId.trim() ||
+    !input.clientRequestId.trim() ||
+    !Number.isSafeInteger(input.expectedResetRevision) ||
+    input.expectedResetRevision < 0
+  ) {
+    throw new Error("知识库附件恢复坐标不完整，请刷新后重试");
+  }
+}
+
+export async function resumeKnowledgeBaseTurnAttachments(
+  input: KnowledgeBaseTurnAttachmentCoordinate,
+  signal?: AbortSignal,
+): Promise<KnowledgeBaseTurnAttachmentResumeResult> {
+  assertKnowledgeBaseTurnAttachmentCoordinate(input);
+  const requestBody = JSON.stringify(input);
+  let lastError: unknown;
+  for (
+    let attempt = 0;
+    attempt < KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException("上传已停止", "AbortError");
+      }
+      const response = await fetch(
+        "/api/knowledge-base/turn/attachments/resume",
+        {
+          method: "POST",
+          headers: deliveryProjectHeaders({
+            "Content-Type": "application/json",
+          }),
+          credentials: "include",
+          signal,
+          body: requestBody,
+        },
+      );
+      if (!response.ok) {
+        throw await knowledgeBaseRequestError(
+          response,
+          `恢复本轮附件失败（${response.status}）`,
+        );
+      }
+      const payload = await response.json();
+      const stagedCustomerAttachmentCount = Number(
+        payload?.stagedCustomerAttachmentCount,
+      );
+      const retainedCustomerAttachmentCount = Number(
+        payload?.retainedCustomerAttachmentCount,
+      );
+      if (
+        !Number.isSafeInteger(stagedCustomerAttachmentCount) ||
+        stagedCustomerAttachmentCount < 0 ||
+        !Number.isSafeInteger(retainedCustomerAttachmentCount) ||
+        retainedCustomerAttachmentCount < stagedCustomerAttachmentCount ||
+        !Array.isArray(payload?.attachmentManifest) ||
+        !Array.isArray(payload?.missingCustomerAttachments)
+      ) {
+        throw new Error("Dashboard 返回的附件恢复状态无效");
+      }
+      return {
+        stagedCustomerAttachmentCount,
+        retainedCustomerAttachmentCount,
+        missingCustomerAttachments:
+          payload.missingCustomerAttachments as KnowledgeBaseMissingCustomerAttachment[],
+        readyToDispatch: payload.readyToDispatch === true,
+        attachmentManifest:
+          payload.attachmentManifest as KnowledgeBaseAttachmentManifestItem[],
+        knowledgeObservation: payload?.knowledgeObservation
+          ? knowledgeBaseObservationFromPayload(payload.knowledgeObservation)
+          : payload?.observation
+            ? knowledgeBaseObservationFromPayload(payload)
+            : undefined,
+      };
+    } catch (error) {
+      lastError = error;
+      if (
+        signal?.aborted ||
+        !isTransientKnowledgeBaseRequestError(error) ||
+        attempt === KNOWLEDGE_BASE_TURN_REQUEST_MAX_ATTEMPTS - 1
+      ) {
+        throw error;
+      }
+      await waitForKnowledgeBaseRequestRetry(error, attempt, signal);
+    }
+  }
+  throw lastError;
+}
+
+export async function cancelKnowledgeBaseTurnAttachments(
+  input: KnowledgeBaseTurnAttachmentCoordinate,
+  signal?: AbortSignal,
+): Promise<{
+  cancelled: true;
+  knowledgeObservation: KnowledgeBaseObservationDto;
+}> {
+  assertKnowledgeBaseTurnAttachmentCoordinate(input);
+  const response = await fetch("/api/knowledge-base/turn/attachments/cancel", {
+    method: "POST",
+    headers: deliveryProjectHeaders({ "Content-Type": "application/json" }),
+    credentials: "include",
+    signal,
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    throw await knowledgeBaseRequestError(
+      response,
+      `放弃本轮补充失败（${response.status}）`,
+    );
+  }
+  const payload = await response.json();
+  const knowledgeObservation = payload?.knowledgeObservation
+    ? knowledgeBaseObservationFromPayload(payload.knowledgeObservation)
+    : payload?.observation
+      ? knowledgeBaseObservationFromPayload(payload)
+      : undefined;
+  if (payload?.cancelled !== true || !knowledgeObservation) {
+    throw new Error("Dashboard 未确认本轮补充已释放");
+  }
+  return {
+    cancelled: true,
+    knowledgeObservation,
+  };
 }
 
 export async function stageKnowledgeBaseTurnAttachment(input: {

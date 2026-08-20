@@ -46,10 +46,8 @@ import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { consumePendingFrontMindBuildDraft } from "@/lib/build-version";
 import { useComposition } from "@/hooks/useComposition";
 import { chatAttachmentSizeError } from "@/lib/attachment-files";
-import {
-  KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE,
-  requestKnowledgeBaseReset,
-} from "@/lib/knowledge-progress";
+import { KNOWLEDGE_BASE_LOGO_PROVENANCE_REQUIRED_NOTICE_CODE } from "@/lib/knowledge-progress";
+import KnowledgeBaseManagedUploadRecovery from "./KnowledgeBaseManagedUploadRecovery";
 
 interface FilePreview {
   file: File;
@@ -244,7 +242,12 @@ export default function ChatInput({
     continueKnowledgeBaseAttachmentAttempt,
     discardKnowledgeBaseAttachmentAttempt,
   } = useSendMessage();
-  const { activeConversation } = useConversation();
+  const {
+    activeConversation,
+    commitKnowledgeBaseObservation,
+    wakeKnowledgeBaseConversation,
+    rollbackPendingKnowledgeBaseTurn,
+  } = useConversation();
   const frozenConversationModel = [...(activeConversation?.messages ?? [])]
     .reverse()
     .find(
@@ -322,10 +325,16 @@ export default function ChatInput({
     matchingKnowledgeBaseAttachmentAttempt &&
       matchingKnowledgeBaseAttachmentAttempt.phase !== "accepted",
   );
-  const knowledgeBaseFreshResetRequired = Boolean(
+  const knowledgeBaseDeferredUploadRecoveryRequired = Boolean(
     syncKnowledgeBaseSnapshot &&
+      activeConversation?.knowledgeBase?.activeTurnOperationType === "revise" &&
       activeConversation?.knowledgeBase?.activeTurnAwaitingClientAttachments ===
         true &&
+      activeConversation?.knowledgeBase?.activeTurnId &&
+      activeConversation?.knowledgeBase?.activeClientRequestId &&
+      Number.isSafeInteger(
+        activeConversation?.knowledgeBase?.activeTurnResetRevision,
+      ) &&
       !matchingKnowledgeBaseAttachmentAttempt,
   );
   const knowledgeBaseLogoProvenanceRepairRequired =
@@ -350,7 +359,7 @@ export default function ChatInput({
   const inputLocked =
     knowledgeBaseLogoProvenanceRepairRequired ||
     knowledgeBaseAttachmentAttemptActive ||
-    knowledgeBaseFreshResetRequired ||
+    knowledgeBaseDeferredUploadRecoveryRequired ||
     isRunning ||
     knowledgeInteractionLocked;
   const currentKnowledgeLeaf = knowledgeBaseProgress?.branches
@@ -918,23 +927,40 @@ export default function ChatInput({
             </div>
           )}
 
-        {knowledgeBaseFreshResetRequired && (
-          <div className="mb-3 rounded-xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950">
-            <p className="font-medium">本轮补充资料尚未完成，任务尚未派发</p>
-            <p className="mt-1 text-xs leading-5 text-amber-900/80">
-              当前页面已没有可继续上传的原始文件。请申请重置知识库后重新上传全部资料。
-            </p>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="mt-3"
-              onClick={requestKnowledgeBaseReset}
-            >
-              申请重置知识库
-            </Button>
-          </div>
-        )}
+        {knowledgeBaseDeferredUploadRecoveryRequired &&
+          activeConversation?.knowledgeBase?.activeTurnId &&
+          activeConversation.knowledgeBase.activeClientRequestId &&
+          Number.isSafeInteger(
+            activeConversation.knowledgeBase.activeTurnResetRevision,
+          ) && (
+            <KnowledgeBaseManagedUploadRecovery
+              conversationId={activeConversation.id}
+              turnId={activeConversation.knowledgeBase.activeTurnId}
+              clientRequestId={
+                activeConversation.knowledgeBase.activeClientRequestId
+              }
+              expectedResetRevision={
+                activeConversation.knowledgeBase.activeTurnResetRevision!
+              }
+              onObservation={(observation) => {
+                commitKnowledgeBaseObservation(
+                  activeConversation.id,
+                  observation,
+                );
+                wakeKnowledgeBaseConversation(activeConversation.id);
+              }}
+              onRecovered={() =>
+                wakeKnowledgeBaseConversation(activeConversation.id)
+              }
+              onCancelled={() => {
+                rollbackPendingKnowledgeBaseTurn(
+                  activeConversation.id,
+                  activeConversation.knowledgeBase!.activeClientRequestId!,
+                );
+                wakeKnowledgeBaseConversation(activeConversation.id);
+              }}
+            />
+          )}
 
         {/* Upload progress indicator */}
         <AnimatePresence>

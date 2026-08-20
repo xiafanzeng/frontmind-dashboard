@@ -1356,6 +1356,7 @@ describe("useSendMessage", () => {
         itemId: reservationManifest[0].itemId,
         resumeScope: {
           kind: "knowledge_base",
+          operationType: "revise",
           conversationId: "test-conv-id",
           turnId: "reserved-turn-1",
           clientRequestId:
@@ -1438,6 +1439,65 @@ describe("useSendMessage", () => {
     expect(mocks.uploadFile.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.addMessage.mock.invocationCallOrder[0],
     );
+  });
+
+  it("skips empty receipt projection and duplicate staging when upload retry resumes an already staged ordinal", async () => {
+    const file = new File(["facts"], "facts.pdf", {
+      type: "application/pdf",
+      lastModified: 1_700_000_000_000,
+    });
+    const knowledgeObservation = {
+      generation: 3,
+      stateEpoch: 8,
+      interaction: { interactionState: "queued" },
+    };
+    mockPreparedFiles([file]);
+    mocks.uploadFile.mockResolvedValueOnce({
+      fileId: "",
+      filename: "facts.pdf",
+      sizeBytes: file.size,
+      uploadedAt: 1_000,
+      expiresAt: 1_000,
+      replayed: true,
+      recovered: true,
+      alreadyStaged: true,
+      knowledgeObservation,
+    });
+    const { result } = renderHook(() => useSendMessage());
+
+    await act(async () => {
+      await result.current.sendMessage("请结合附件修订", [file], {
+        syncKnowledgeBaseSnapshot: true,
+        knowledgeBaseExpectedResetRevision: 4,
+        knowledgeBaseExpectedGeneration: 3,
+        knowledgeBaseExpectedRevision: 7,
+        knowledgeBaseExpectedLeafId: "2.1",
+      });
+    });
+
+    expect(mocks.stageKnowledgeBaseTurnAttachment).not.toHaveBeenCalled();
+    expect(mocks.commitKnowledgeBaseObservation).toHaveBeenCalledWith(
+      "test-conv-id",
+      knowledgeObservation,
+    );
+    expect(mocks.createKnowledgeBaseTurnTask).toHaveBeenCalledWith(
+      [
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "请结合附件修订" }],
+        },
+      ],
+      expect.objectContaining({
+        attachmentReservation: expect.objectContaining({
+          turnId: "reserved-turn-1",
+        }),
+      }),
+    );
+    const pendingMessages = mocks.addMessage.mock.calls.filter(
+      ([, message]) => message.knowledgeBase?.kind === "pending_user",
+    );
+    expect(pendingMessages).toHaveLength(1);
+    expect(pendingMessages[0]?.[1].attachments).toBeUndefined();
   });
 
   it("uses one frozen reservation and stages every attachment before one dispatch", async () => {

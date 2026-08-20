@@ -25,6 +25,7 @@ import {
   beginKnowledgeBaseManusV2Dispatch,
   beginKnowledgeBaseMaterializedCompletionStop,
   bindKnowledgeBaseManusV2Submission,
+  cancelIncompleteKnowledgeBaseRevision,
   cancelIncompleteKnowledgeBaseStart,
   cancelUnpreparedKnowledgeBaseTurn,
   completeKnowledgeBaseGeneratedAttachment,
@@ -43,6 +44,7 @@ import {
   hashKnowledgeBaseTurnRequest,
   hashKnowledgeBaseUpstreamIdempotencyKey,
   inspectKnowledgeBaseDeferredAttachmentReplay,
+  inspectKnowledgeBaseDeferredAttachmentReservation,
   inspectKnowledgeBaseDeferredDispatchReplay,
   inspectKnowledgeBaseLegacyAttachmentTakeoverReplay,
   inspectKnowledgeBaseLegacyDeferredReservationReplay,
@@ -79,6 +81,7 @@ import {
   KNOWLEDGE_BASE_TREE_POLICY_V1_SKILL_CONTENT_HASH,
   KNOWLEDGE_BASE_TREE_POLICY_V2_SKILL_CONTENT_HASH,
 } from "./knowledge-base-tree-policy-rollout";
+import { knowledgeBaseLocalAssetIdentity } from "./knowledge-base-local-asset-upload";
 
 const KNOWLEDGE_BASE_MANUS_V2_WRITER_ENV = "FRONTMIND_KB_MANUS_V2_WRITER";
 
@@ -6053,8 +6056,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
     expect(store.turns).toHaveLength(0);
   });
 
-  it("stages a v5 local asset by account ownership without a Provider file resource", async () => {
-    const localAssetId = `asset_${"a".repeat(30)}`;
+  it("stages resumed v5 content when the deterministic row display metadata drifted", async () => {
     const { sha256: _legacyBrowserSha256, ...digestFreeManifestItem } =
       manifest[0]!;
     const localManifest = [
@@ -6079,17 +6081,7 @@ describe("knowledge-base attachment-first turn reservation", () => {
     const { executor, store } = createTurnServiceExecutor({
       build: materializedBuild,
       conversation: { ...conversation },
-      localAssets: [
-        {
-          id: localAssetId,
-          scope: "managed_user",
-          accountUserId: 1,
-          filename: "facts.pdf",
-          mimeType: "application/pdf",
-          sizeBytes: 12,
-          contentSha256: "a".repeat(64),
-        },
-      ],
+      localAssets: [],
       resources: [],
       turnSelections: [
         [[], []],
@@ -6120,6 +6112,30 @@ describe("knowledge-base attachment-first turn reservation", () => {
       },
       executor,
     );
+    const localAssetId = knowledgeBaseLocalAssetIdentity({
+      userId: 1,
+      projectAssignmentId: null,
+      coordinate: {
+        conversationId: materializedBuild.conversationId,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        itemId: "materialized-local-item-1",
+        expectedResetRevision: 0,
+        ordinal: 1,
+      },
+      sizeBytes: 12,
+    }).localAssetId;
+    store.localAssets.push({
+      id: localAssetId,
+      scope: "managed_user",
+      accountUserId: 1,
+      presalesProjectId: null,
+      filename: "adapter-renamed-facts.bin",
+      mimeType: "application/x-stale-provider-adapter",
+      sizeBytes: 12,
+      contentSha256: "a".repeat(64),
+      retainUntil: new Date("2099-01-01T00:00:00.000Z"),
+    });
     const staged = await stageKnowledgeBaseDeferredTurnAttachment(
       {
         userId: 1,
@@ -6159,6 +6175,39 @@ describe("knowledge-base attachment-first turn reservation", () => {
         },
       ],
     });
+  });
+
+  it("reads only the frozen customer manifest for an active deferred reservation", async () => {
+    const { executor } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [[[], []], [(current) => current.turns]],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+
+    const inspected = await inspectKnowledgeBaseDeferredAttachmentReservation(
+      {
+        userId: 1,
+        conversationId: build.conversationId,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        expectedResetRevision: 0,
+      },
+      executor,
+    );
+
+    expect(inspected).toMatchObject({
+      buildId: build.id,
+      turn: {
+        id: reserved.turn.id,
+        stagedUserAttachmentCount: 0,
+        expectedUserAttachmentCount: 2,
+        createAttemptState: "not_sent",
+        upstreamTaskId: null,
+      },
+      clientAttachmentManifest: manifest,
+    });
+    expect(inspected.clientAttachmentManifest).toHaveLength(2);
   });
 
   it("does not create a competing turn while open-build recovery owns the lease", async () => {
@@ -6645,6 +6694,117 @@ describe("knowledge-base attachment-first turn reservation", () => {
       previousResponseId: build.upstreamTaskId,
       version: conversation.version + 2,
     });
+  });
+
+  it("releases a revise-only browser batch while preserving its leaf and Working Set", async () => {
+    const preservedBuild = {
+      ...build,
+      activeWorkingSetId: "working-set-2.1",
+      currentPresentationKey: "presentation-2.1",
+      contentVersion: 17,
+    };
+    const { executor, store } = createTurnServiceExecutor({
+      build: preservedBuild,
+      conversation: { ...conversation },
+      turnSelections: [[[], []], [(current) => current.turns]],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+
+    const cancelled = await cancelIncompleteKnowledgeBaseRevision(
+      {
+        userId: 1,
+        conversationId: build.conversationId,
+        turnId: reserved.turn.id,
+        clientRequestId: reserved.turn.clientRequestId,
+        expectedResetRevision: 0,
+        now: new Date("2026-08-01T00:00:30.000Z"),
+      },
+      executor,
+    );
+
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      awaitingClientAttachments: false,
+    });
+    expect(store.turns[0]).toMatchObject({
+      status: "cancelled",
+      errorCode: "KNOWLEDGE_BASE_REVISION_UPLOAD_CANCELLED",
+    });
+    expect(store.build).toMatchObject({
+      activeTurnId: null,
+      status: "confirming",
+      revision: 6,
+      currentLeafId: "2.1",
+      activeWorkingSetId: "working-set-2.1",
+      currentPresentationKey: "presentation-2.1",
+      contentVersion: 17,
+    });
+    expect(store.conversation).toMatchObject({ status: "awaiting_input" });
+  });
+
+  it("does not expose the revise cancellation authority to a start turn", async () => {
+    const { executor, store } = createTurnServiceExecutor({
+      build: { ...build },
+      conversation: { ...conversation },
+      turnSelections: [[[], []], [(current) => current.turns]],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+    store.turns[0] = {
+      ...store.turns[0]!,
+      operationType: "start",
+    };
+
+    await expect(
+      cancelIncompleteKnowledgeBaseRevision(
+        {
+          userId: 1,
+          conversationId: build.conversationId,
+          turnId: reserved.turn.id,
+          clientRequestId: reserved.turn.clientRequestId,
+          expectedResetRevision: 0,
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.build).toMatchObject({ activeTurnId: reserved.turn.id });
+    expect(store.turns[0]).toMatchObject({ status: "queued" });
+  });
+
+  it("leaves the revise turn untouched when its reset revision fence changed", async () => {
+    const preservedBuild = {
+      ...build,
+      activeWorkingSetId: "working-set-2.1",
+      currentPresentationKey: "presentation-2.1",
+      contentVersion: 17,
+    };
+    const { executor, store } = createTurnServiceExecutor({
+      build: preservedBuild,
+      conversation: { ...conversation },
+      turnSelections: [[[], []], [(current) => current.turns]],
+    });
+    const reserved = await reserveKnowledgeBaseTurn(reserveInput(), executor);
+    const beforeBuild = structuredClone(store.build);
+    const beforeTurn = structuredClone(store.turns[0]);
+    const beforeConversation = structuredClone(store.conversation);
+
+    await expect(
+      cancelIncompleteKnowledgeBaseRevision(
+        {
+          userId: 1,
+          conversationId: build.conversationId,
+          turnId: reserved.turn.id,
+          clientRequestId: reserved.turn.clientRequestId,
+          expectedResetRevision: 1,
+        },
+        executor,
+      ),
+    ).rejects.toMatchObject({
+      code: "KNOWLEDGE_BASE_RESET_REVISION_CHANGED",
+    });
+
+    expect(store.build).toEqual(beforeBuild);
+    expect(store.turns[0]).toEqual(beforeTurn);
+    expect(store.conversation).toEqual(beforeConversation);
   });
 
   it("deduplicates the exact unprepared cancellation replay and rejects conflicting replay identities", async () => {

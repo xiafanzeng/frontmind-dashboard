@@ -98,6 +98,13 @@ export type StagedPresalesFile = {
     mimeType?: string;
     uploadedAt?: Date | string | number;
     contentExpiresAt?: Date | string | number;
+    /**
+     * Re-arm retention only when a caller has independently proved that an
+     * immutable ownership row still names these exact bytes and the prior
+     * stored body is missing/expired. Ordinary commits keep the first upload
+     * deadline immutable.
+     */
+    replaceManagedRetention?: boolean;
   }) => Promise<void>;
   discard: () => Promise<void>;
 };
@@ -923,8 +930,23 @@ function immutableManifestRetention(
   input: {
     uploadedAt?: Date | string | number;
     contentExpiresAt?: Date | string | number;
+    replaceManagedRetention?: boolean;
   },
 ) {
+  if (input.replaceManagedRetention === true) {
+    const uploadedAt = normalizedRetentionTimestamp(input.uploadedAt);
+    const contentExpiresAt = normalizedRetentionTimestamp(
+      input.contentExpiresAt,
+    );
+    if (
+      !uploadedAt ||
+      !contentExpiresAt ||
+      Date.parse(contentExpiresAt) <= Date.parse(uploadedAt)
+    ) {
+      throw new Error("PRESALES_FILE_RETENTION_INVALID");
+    }
+    return { uploadedAt, contentExpiresAt };
+  }
   const previousRetention = previous
     ? manifestRetention(previous)
     : ({ state: "unmanaged" } as const);
@@ -1868,16 +1890,42 @@ export async function sweepPresalesFileStorageRetention(
       // have been reclaimed, and prevents an expired upstream file from being
       // silently downloaded and granted a fresh lifetime.
       try {
-        const contentPath = pathsFor(manifest.fileId).content;
-        const contentStats = await fs.stat(contentPath).catch((error) => {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-          throw error;
+        const tombstoneFileId = manifest.fileId;
+        await withStoredPresalesFileMutationLock(tombstoneFileId, async () => {
+          const current = await readManifest(tombstoneFileId);
+          const currentRetention = current
+            ? manifestRetention(current)
+            : ({ state: "unmanaged" } as const);
+          const currentDeletedAt = normalizedRetentionTimestamp(
+            current?.contentDeletedAt,
+          );
+          // A same-id recovery may have replaced this tombstone after the
+          // outer scan read it. Never let the stale observation remove the
+          // newly re-armed body.
+          if (
+            current?.schemaVersion !== 1 ||
+            current.fileId !== tombstoneFileId ||
+            current.state !== "expired"
+          ) {
+            return;
+          }
+          if (currentRetention.state !== "managed" || !currentDeletedAt) {
+            result.invalidManifestsSkipped += 1;
+            return;
+          }
+          const contentPath = pathsFor(tombstoneFileId).content;
+          const contentStats = await fs.stat(contentPath).catch((error) => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+              return null;
+            }
+            throw error;
+          });
+          if (contentStats?.isFile()) {
+            await fs.rm(contentPath, { force: true });
+            result.bytesReclaimed += contentStats.size;
+            result.reclaimedBytes += contentStats.size;
+          }
         });
-        if (contentStats?.isFile()) {
-          await fs.rm(contentPath, { force: true });
-          result.bytesReclaimed += contentStats.size;
-          result.reclaimedBytes += contentStats.size;
-        }
       } catch {
         result.failures += 1;
       }
@@ -2013,35 +2061,66 @@ export async function sweepPresalesFileStorageRetention(
     if (!expired) continue;
 
     try {
-      // The manifest is the retry ledger: retain it until both byte removal
-      // and downstream derived-file cleanup have succeeded.
-      await fs.rm(storedPaths.content, { force: true });
-      result.bytesReclaimed += contentStats?.size ?? 0;
-      result.reclaimedBytes += contentStats?.size ?? 0;
-      await input.onExpiredFile?.({
-        fileId: manifestFileId,
-        sizeBytes:
-          contentStats?.size ??
-          (Number.isSafeInteger(manifest.sizeBytes) &&
-          Number(manifest.sizeBytes) >= 0
-            ? Number(manifest.sizeBytes)
-            : 0),
+      await withStoredPresalesFileMutationLock(manifestFileId, async () => {
+        const current = await readManifest(manifestFileId);
+        const currentRetention = current
+          ? manifestRetention(current)
+          : ({ state: "unmanaged" } as const);
+        if (
+          current?.schemaVersion !== 1 ||
+          current.fileId !== manifestFileId ||
+          current.state !== "stored"
+        ) {
+          return;
+        }
+        if (currentRetention.state !== "managed") {
+          result.invalidManifestsSkipped += 1;
+          return;
+        }
+        // The scan's expired observation is only advisory. A same-id upload
+        // can re-arm retention before this destructive section acquires the
+        // shared mutation lock, so decide again from the locked manifest.
+        if (Date.parse(currentRetention.contentExpiresAt) > now.getTime()) {
+          return;
+        }
+        const currentContentStats = await fs
+          .stat(storedPaths.content)
+          .catch((error) => {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+              return null;
+            }
+            throw error;
+          });
+        // The manifest is the retry ledger: retain it until both byte removal
+        // and downstream derived-file cleanup have succeeded.
+        await fs.rm(storedPaths.content, { force: true });
+        result.bytesReclaimed += currentContentStats?.size ?? 0;
+        result.reclaimedBytes += currentContentStats?.size ?? 0;
+        await input.onExpiredFile?.({
+          fileId: manifestFileId,
+          sizeBytes:
+            currentContentStats?.size ??
+            (Number.isSafeInteger(current.sizeBytes) &&
+            Number(current.sizeBytes) >= 0
+              ? Number(current.sizeBytes)
+              : 0),
+        });
+        await writeManifest(manifestFileId, {
+          schemaVersion: 1,
+          fileId: manifestFileId,
+          filename: cleanFilename(current.filename, manifestFileId),
+          mimeType: cleanMimeType(current.mimeType),
+          sizeBytes: null,
+          sha256: null,
+          state: "expired",
+          uploadedAt: currentRetention.uploadedAt,
+          contentExpiresAt: currentRetention.contentExpiresAt,
+          contentDeletedAt: now.toISOString(),
+          updatedAt: now.toISOString(),
+        });
+        result.deleted += 1;
+        result.expiredFilesDeleted += 1;
       });
-      await writeManifest(manifestFileId, {
-        schemaVersion: 1,
-        fileId: manifestFileId,
-        filename: cleanFilename(manifest.filename, manifestFileId),
-        mimeType: cleanMimeType(manifest.mimeType),
-        sizeBytes: null,
-        sha256: null,
-        state: "expired",
-        uploadedAt: retainedUploadedAt,
-        contentExpiresAt: retainedContentExpiresAt,
-        contentDeletedAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-      });
-      result.deleted += 1;
-      result.expiredFilesDeleted += 1;
     } catch {
       result.failures += 1;
     }

@@ -9,302 +9,142 @@ import {
   sha256UploadFile,
 } from "@/lib/attachment-files";
 import {
+  cancelKnowledgeBaseTurnAttachments,
   createKnowledgeBaseTurnTask,
-  cancelKnowledgeBaseStartReservation,
-  discardManagedUploadIntent,
-  listManagedUploadsForKnowledgeBase,
-  recoverDiscoveredManagedUpload,
-  stageKnowledgeBaseTurnAttachment,
-  uploadFile,
+  resumeKnowledgeBaseTurnAttachments,
+  uploadKnowledgeBaseLocalAsset,
   type KnowledgeBaseAttachmentManifestItem,
-  type ManagedUploadDiscovery,
-  type ManagedUploadDiscoveryItem,
-  type ManagedUploadHandle,
-  type UploadRetentionReceipt,
+  type KnowledgeBaseMissingCustomerAttachment,
+  type KnowledgeBaseTurnAttachmentResumeResult,
 } from "@/lib/frontmind-api";
 import type { KnowledgeBaseObservationDto } from "@/lib/knowledge-progress";
 
-type MissingUpload = {
-  upload: ManagedUploadDiscoveryItem | null;
-  manifest: KnowledgeBaseAttachmentManifestItem;
-  index: number;
-  clientRequestId: string;
-  total: number;
-};
-
 type RecoveryPhase =
-  | "discovering"
-  | "restoring"
+  | "reconciling"
   | "needs_browser"
+  | "uploading"
   | "dispatching"
   | "attention";
 
-function orderedRecoveryBatch(discovery: ManagedUploadDiscovery) {
-  const { uploads, reservation } = discovery;
-  const manifest = reservation.attachmentManifest;
-  if (
-    manifest.length < 1 ||
-    uploads.length > manifest.length ||
-    reservation.stagedAttachmentCount < 0 ||
-    reservation.stagedAttachmentCount > manifest.length
-  ) {
-    throw new Error("服务器上传批次与知识库预约不一致");
-  }
-  const uploadsByOrdinal = new Map<number, ManagedUploadDiscoveryItem>();
-  uploads.forEach((upload) => {
-    const index = upload.ordinal - 1;
-    const item = manifest[index];
-    if (
-      !item ||
-      !Number.isSafeInteger(upload.ordinal) ||
-      uploadsByOrdinal.has(upload.ordinal) ||
-      upload.total !== manifest.length ||
-      upload.clientRequestId !== reservation.clientRequestId ||
-      upload.filename !== item.filename ||
-      upload.sizeBytes !== item.sizeBytes ||
-      upload.mimeType !== item.mimeType
-    ) {
-      throw new Error("服务器上传文件顺序与冻结清单不一致");
-    }
-    uploadsByOrdinal.set(upload.ordinal, upload);
-  });
-  return manifest.map((item, index) => ({
-    upload: uploadsByOrdinal.get(index + 1) ?? null,
-    manifest: item,
-    index,
-    clientRequestId: reservation.clientRequestId,
-    total: manifest.length,
-  }));
-}
-
-function receiptFromDiscovery(upload: ManagedUploadDiscoveryItem) {
-  if (upload.state !== "uploaded" || !upload.receipt?.fileId) return null;
-  return {
-    ...upload.receipt,
-    recovered: true,
-  } satisfies UploadRetentionReceipt;
-}
-
-function discoveredUploadHandle(
-  upload: ManagedUploadDiscoveryItem,
+function fileMatchesManifestMetadata(
+  file: File,
   manifest: KnowledgeBaseAttachmentManifestItem,
-): ManagedUploadHandle {
-  return {
-    intentId: upload.intentId,
-    itemId: manifest.itemId || upload.batchId,
-    filename: upload.filename,
-    ticket: upload.intentTicket,
-    expiresAt: upload.ticketExpiresAt,
-    operationId: manifest.itemId || upload.batchId,
-  };
+) {
+  return (
+    normalizedKnowledgeBaseUploadFilename(file.name) === manifest.filename &&
+    file.size === manifest.sizeBytes &&
+    normalizedKnowledgeBaseUploadMimeType(file) === manifest.mimeType &&
+    Math.max(0, Number(file.lastModified || 0)) === manifest.lastModified
+  );
 }
 
-function frozenBatchIdForMissingUpload(target: MissingUpload) {
-  if (target.upload?.batchId) return target.upload.batchId;
-  const suffix = `:${target.index + 1}`;
-  const itemId = target.manifest.itemId || "";
-  return itemId.endsWith(suffix) && itemId.length > suffix.length
-    ? itemId.slice(0, -suffix.length)
-    : target.clientRequestId;
+async function fileMatchesFrozenManifest(
+  file: File,
+  manifest: KnowledgeBaseAttachmentManifestItem,
+) {
+  if (!fileMatchesManifestMetadata(file, manifest)) return false;
+  if (!manifest.sha256) return true;
+  return (await sha256UploadFile(file)) === manifest.sha256;
 }
 
 export default function KnowledgeBaseManagedUploadRecovery({
   conversationId,
   turnId,
+  clientRequestId,
+  expectedResetRevision,
   onObservation,
   onRecovered,
   onCancelled,
 }: {
   conversationId: string;
   turnId: string;
+  clientRequestId: string;
+  expectedResetRevision: number;
   onObservation: (observation: KnowledgeBaseObservationDto) => void;
   onRecovered?: () => void;
-  onCancelled: (resetRevision: number) => void | Promise<void>;
+  onCancelled?: () => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const runningRef = useRef(false);
-  const recoveryControllerRef = useRef<AbortController | null>(null);
-  const onObservationRef = useRef(onObservation);
-  const onRecoveredRef = useRef(onRecovered);
-  const onCancelledRef = useRef(onCancelled);
-  const [phase, setPhase] = useState<RecoveryPhase>("discovering");
-  const [missing, setMissing] = useState<MissingUpload[]>([]);
+  const controllerRef = useRef<AbortController | null>(null);
+  const callbacksRef = useRef({ onObservation, onRecovered, onCancelled });
+  const [phase, setPhase] = useState<RecoveryPhase>("reconciling");
+  const [resume, setResume] =
+    useState<KnowledgeBaseTurnAttachmentResumeResult | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
-  const [manualUpload, setManualUpload] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [cancelled, setCancelled] = useState(false);
-  const [discovery, setDiscovery] = useState<ManagedUploadDiscovery | null>(
-    null,
-  );
-  const [error, setError] = useState<string | null>(null);
-
-  const missingNames = useMemo(
-    () => missing.map(({ manifest }) => manifest.filename).join("、"),
-    [missing],
-  );
 
   useEffect(() => {
-    onObservationRef.current = onObservation;
-    onRecoveredRef.current = onRecovered;
-    onCancelledRef.current = onCancelled;
+    callbacksRef.current = { onObservation, onRecovered, onCancelled };
   }, [onCancelled, onObservation, onRecovered]);
 
+  const coordinate = useMemo(
+    () => ({
+      conversationId,
+      turnId,
+      clientRequestId,
+      expectedResetRevision,
+    }),
+    [clientRequestId, conversationId, expectedResetRevision, turnId],
+  );
+
   useEffect(() => {
-    if (!conversationId || !turnId || manualUpload || runningRef.current)
-      return;
+    if (cancelled || runningRef.current) return;
     const controller = new AbortController();
-    recoveryControllerRef.current = controller;
-    let retryTimer: number | undefined;
+    controllerRef.current = controller;
     runningRef.current = true;
 
     const run = async () => {
       try {
         setError(null);
-        setPhase("discovering");
-        const discovery = await listManagedUploadsForKnowledgeBase({
-          conversationId,
-          turnId,
-          signal: controller.signal,
-        });
-        setDiscovery(discovery);
-        const ordered = orderedRecoveryBatch(discovery);
-        const recovery = await Promise.all(
-          ordered.map(async ({ upload }, index) => {
-            if (index < discovery.reservation.stagedAttachmentCount) {
-              return {
-                receipt: null,
-                needsBrowserBody: false,
-                retryAfterMs: 0,
-                alreadyStaged: true,
-              };
-            }
-            if (!upload) {
-              return {
-                receipt: null,
-                needsBrowserBody: true,
-                retryAfterMs: 0,
-                alreadyStaged: false,
-              };
-            }
-            const existing = receiptFromDiscovery(upload);
-            if (existing) {
-              return {
-                receipt: existing,
-                needsBrowserBody: false,
-                retryAfterMs: 0,
-                alreadyStaged: false,
-              };
-            }
-            setPhase("restoring");
-            const recovered = await recoverDiscoveredManagedUpload(upload, {
-              signal: controller.signal,
-            });
-            if (recovered.state === "uploaded") {
-              return {
-                receipt: recovered.receipt,
-                needsBrowserBody: false,
-                retryAfterMs: 0,
-                alreadyStaged: false,
-              };
-            }
-            return {
-              receipt: null,
-              needsBrowserBody: recovered.state === "needs_browser_body",
-              retryAfterMs:
-                recovered.state === "processing"
-                  ? recovered.retryAfterMs
-                  : 3_000,
-              alreadyStaged: false,
-            };
-          }),
+        setPhase("reconciling");
+        const recovered = await resumeKnowledgeBaseTurnAttachments(
+          coordinate,
+          controller.signal,
         );
         if (controller.signal.aborted) return;
-
-        const unresolved = ordered
-          .map((item, index) =>
-            recovery[index]?.receipt || recovery[index]?.alreadyStaged
-              ? null
-              : item,
-          )
-          .filter((item): item is MissingUpload => Boolean(item));
-        const requiresBrowser = unresolved.filter(
-          ({ index }) => recovery[index]?.needsBrowserBody === true,
-        );
-        if (requiresBrowser.length > 0) {
-          setMissing(requiresBrowser);
+        setResume(recovered);
+        if (recovered.knowledgeObservation) {
+          callbacksRef.current.onObservation(recovered.knowledgeObservation);
+        }
+        if (!recovered.readyToDispatch) {
           setPhase("needs_browser");
           return;
         }
-        if (unresolved.length > 0) {
-          setMissing([]);
-          setPhase("restoring");
-          const retryAfterMs = Math.max(
-            500,
-            Math.min(
-              10_000,
-              ...recovery
-                .filter((item) => !item.receipt && item.alreadyStaged !== true)
-                .map((item) => item.retryAfterMs || 3_000),
-            ),
-          );
-          retryTimer = window.setTimeout(
-            () => setRefreshToken((value) => value + 1),
-            retryAfterMs,
-          );
-          return;
-        }
 
-        const receipts = recovery.map((item) => item.receipt);
-        if (
-          receipts
-            .slice(discovery.reservation.stagedAttachmentCount)
-            .some((receipt) => !receipt)
-        ) {
-          throw new Error("Dashboard 上传恢复回执不完整");
-        }
-
-        setMissing([]);
         setPhase("dispatching");
-        for (
-          let index = discovery.reservation.stagedAttachmentCount;
-          index < ordered.length;
-          index += 1
-        ) {
-          const receipt = receipts[index]!;
-          await stageKnowledgeBaseTurnAttachment({
-            conversationId,
-            turnId,
-            clientRequestId: discovery.reservation.clientRequestId,
-            expectedResetRevision: discovery.reservation.sourceResetRevision,
-            attachmentManifest: discovery.reservation.attachmentManifest,
-            index,
-            attachment: {
-              file_id: receipt.fileId,
-              filename: ordered[index]!.manifest.filename,
-            },
-          });
-        }
-        const result = await createKnowledgeBaseTurnTask([], {
+        const dispatched = await createKnowledgeBaseTurnTask([], {
           conversationId,
-          clientRequestId: discovery.reservation.clientRequestId,
-          expectedResetRevision: discovery.reservation.sourceResetRevision,
+          clientRequestId,
+          expectedResetRevision,
           attachmentReservation: {
             turnId,
-            attachmentManifest: discovery.reservation.attachmentManifest,
+            attachmentManifest: recovered.attachmentManifest,
           },
         });
-        if (result.knowledgeObservation) {
-          onObservationRef.current(result.knowledgeObservation);
+        if (controller.signal.aborted) return;
+        if (dispatched.knowledgeObservation) {
+          callbacksRef.current.onObservation(dispatched.knowledgeObservation);
         }
-        onRecoveredRef.current?.();
-        toast.success("资料已从 Dashboard 恢复并继续构建", {
-          description: "本次恢复没有再次发送已经 seal 的浏览器文件体。",
+        callbacksRef.current.onRecovered?.();
+        toast.success("缺失资料已补齐，正在继续原知识库轮次", {
+          description: "系统沿用原 turn，只派发一次任务。",
         });
       } catch (caught) {
         if (controller.signal.aborted) return;
+        const knowledgeObservation = (
+          caught as {
+            knowledgeObservation?: KnowledgeBaseObservationDto;
+          } | null
+        )?.knowledgeObservation;
+        if (knowledgeObservation) {
+          callbacksRef.current.onObservation(knowledgeObservation);
+        }
         setPhase("attention");
         setError(
-          caught instanceof Error ? caught.message : "上传恢复暂时不可用",
+          caught instanceof Error ? caught.message : "附件恢复暂时不可用",
         );
       } finally {
         runningRef.current = false;
@@ -313,137 +153,180 @@ export default function KnowledgeBaseManagedUploadRecovery({
     void run();
     return () => {
       controller.abort();
-      if (recoveryControllerRef.current === controller) {
-        recoveryControllerRef.current = null;
-      }
-      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      if (controllerRef.current === controller) controllerRef.current = null;
       runningRef.current = false;
     };
-  }, [conversationId, manualUpload, refreshToken, turnId]);
+  }, [cancelled, coordinate, refreshToken]);
 
-  const selectMissingFiles = useCallback(
+  const selectFiles = useCallback(
     async (fileList: FileList | null) => {
       const selected = Array.from(fileList || []);
-      if (selected.length === 0 || manualUpload) return;
-      setManualUpload(true);
+      if (!resume || selected.length === 0 || phase === "uploading") return;
+      setPhase("uploading");
       setError(null);
       try {
-        const remaining = [...missing];
-        const matched: Array<{ file: File; missing: MissingUpload }> = [];
-        for (const file of selected) {
-          const filename = normalizedKnowledgeBaseUploadFilename(file.name);
-          const mimeType = normalizedKnowledgeBaseUploadMimeType(file);
-          const sha256 = await sha256UploadFile(file);
-          const index = remaining.findIndex(
-            ({ manifest }) =>
-              manifest.filename === filename &&
-              manifest.sizeBytes === file.size &&
-              manifest.mimeType === mimeType &&
-              manifest.sha256 === sha256,
-          );
-          if (index < 0) {
-            throw new Error(`所选文件与待恢复清单不一致：${file.name}`);
-          }
-          const target = remaining.splice(index, 1)[0]!;
-          matched.push({ file, missing: target });
-        }
-        for (const { file, missing: target } of matched) {
-          await uploadFile(file, undefined, undefined, {
-            captureLocalCopy: true,
-            captureFilename: target.manifest.filename,
-            batchId: frozenBatchIdForMissingUpload(target),
-            batchOrdinal: target.index + 1,
-            batchTotal: target.total,
-            itemId: target.manifest.itemId,
-            resumeScope: {
-              kind: "knowledge_base",
-              conversationId,
-              turnId,
-              clientRequestId: target.clientRequestId,
-              expectedResetRevision: discovery!.reservation.sourceResetRevision,
-            },
-            ...(target.upload
-              ? {
-                  existingUploadHandle: discoveredUploadHandle(
-                    target.upload,
-                    target.manifest,
-                  ),
-                }
-              : {}),
-          });
-        }
-        setMissing((current) =>
-          current.filter(
-            (candidate) =>
-              !matched.some(
-                ({ missing: completed }) => completed.index === candidate.index,
-              ),
-          ),
+        const missingByItemId = new Map(
+          resume.missingCustomerAttachments.map((item) => [item.itemId, item]),
         );
+        // When two frozen entries have identical browser metadata and no
+        // digest, a user selecting only the missing copy must not be matched
+        // to an already-retained entry first. Explicit digests still decide
+        // identity inside fileMatchesFrozenManifest when they are present.
+        const unusedManifest = resume.attachmentManifest
+          .map((manifest, index) => ({ manifest, index }))
+          .sort((left, right) => {
+            const leftMissing = left.manifest.itemId
+              ? missingByItemId.has(left.manifest.itemId)
+              : false;
+            const rightMissing = right.manifest.itemId
+              ? missingByItemId.has(right.manifest.itemId)
+              : false;
+            return Number(rightMissing) - Number(leftMissing);
+          });
+        const matched: Array<{
+          file: File;
+          manifest: KnowledgeBaseAttachmentManifestItem;
+          index: number;
+        }> = [];
+        for (const file of selected) {
+          let matchedIndex = -1;
+          for (let index = 0; index < unusedManifest.length; index += 1) {
+            if (
+              await fileMatchesFrozenManifest(
+                file,
+                unusedManifest[index]!.manifest,
+              )
+            ) {
+              matchedIndex = index;
+              break;
+            }
+          }
+          if (matchedIndex < 0) {
+            throw new Error(`所选文件与本轮冻结清单不一致：${file.name}`);
+          }
+          const target = unusedManifest.splice(matchedIndex, 1)[0]!;
+          matched.push({ file, ...target });
+        }
+
+        const missingFiles = matched
+          .map((item) => ({
+            ...item,
+            missing: item.manifest.itemId
+              ? missingByItemId.get(item.manifest.itemId)
+              : undefined,
+          }))
+          .filter(
+            (
+              item,
+            ): item is typeof item & {
+              missing: KnowledgeBaseMissingCustomerAttachment;
+            } => Boolean(item.missing),
+          )
+          .sort((left, right) => left.missing.ordinal - right.missing.ordinal);
+
+        if (missingFiles.length === 0) {
+          throw new Error(
+            "所选资料均已由 Dashboard 保留，请选择仍缺失的原文件",
+          );
+        }
+        for (const { file, missing } of missingFiles) {
+          const uploaded = await uploadKnowledgeBaseLocalAsset(
+            file,
+            undefined,
+            undefined,
+            {
+              captureLocalCopy: true,
+              captureFilename: missing.filename,
+              batchId: clientRequestId,
+              batchOrdinal: missing.ordinal,
+              batchTotal: resume.attachmentManifest.length,
+              itemId: missing.itemId,
+              ...(missing.sha256 ? { contentSha256: missing.sha256 } : {}),
+              resumeScope: {
+                kind: "knowledge_base",
+                operationType: "revise",
+                conversationId,
+                turnId,
+                clientRequestId,
+                expectedResetRevision,
+              },
+            },
+          );
+          if (uploaded.knowledgeObservation) {
+            callbacksRef.current.onObservation(uploaded.knowledgeObservation);
+          }
+        }
         setRefreshToken((value) => value + 1);
       } catch (caught) {
+        const knowledgeObservation = (
+          caught as {
+            knowledgeObservation?: KnowledgeBaseObservationDto;
+          } | null
+        )?.knowledgeObservation;
+        if (knowledgeObservation) {
+          callbacksRef.current.onObservation(knowledgeObservation);
+        }
+        setPhase("needs_browser");
         setError(
           caught instanceof Error ? caught.message : "文件恢复暂时不可用",
         );
       } finally {
-        setManualUpload(false);
         if (inputRef.current) inputRef.current.value = "";
       }
     },
-    [conversationId, manualUpload, missing, turnId],
+    [
+      clientRequestId,
+      conversationId,
+      expectedResetRevision,
+      phase,
+      resume,
+      turnId,
+    ],
   );
 
-  const cancelBatch = useCallback(async () => {
-    if (!discovery || cancelling) return;
+  const cancelTurn = useCallback(async () => {
+    if (cancelling) return;
     setCancelling(true);
     setError(null);
-    recoveryControllerRef.current?.abort();
+    controllerRef.current?.abort();
     try {
-      const cancelled = await cancelKnowledgeBaseStartReservation({
-        conversationId,
-        turnId,
-        clientRequestId: discovery.reservation.clientRequestId,
-        expectedResetRevision: discovery.reservation.sourceResetRevision,
-      });
-      const cleanup = Promise.allSettled(
-        discovery.uploads.map((upload) => {
-          const manifest =
-            discovery.reservation.attachmentManifest[upload.ordinal - 1];
-          if (!manifest) {
-            throw new Error("服务器上传批次与知识库预约不一致");
-          }
-          return discardManagedUploadIntent(
-            discoveredUploadHandle(upload, manifest),
-            { deferProviderCleanup: true },
-          );
-        }),
-      );
-      await onCancelledRef.current(cancelled.resetRevision);
+      const result = await cancelKnowledgeBaseTurnAttachments(coordinate);
+      callbacksRef.current.onObservation(result.knowledgeObservation);
+      callbacksRef.current.onCancelled?.();
       setCancelled(true);
-      toast.success("已取消未完成批次，请重新选择资料");
-      void cleanup;
+      toast.success("已放弃本轮补充，可从当前节点继续");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "取消本批次失败");
+      const knowledgeObservation = (
+        caught as { knowledgeObservation?: KnowledgeBaseObservationDto } | null
+      )?.knowledgeObservation;
+      if (knowledgeObservation) {
+        callbacksRef.current.onObservation(knowledgeObservation);
+      }
+      setError(caught instanceof Error ? caught.message : "放弃本轮补充失败");
+      setPhase("attention");
     } finally {
       setCancelling(false);
     }
-  }, [cancelling, conversationId, discovery, turnId]);
+  }, [cancelling, coordinate]);
 
   if (cancelled) return null;
 
+  const retainedCount = resume?.retainedCustomerAttachmentCount ?? 0;
+  const totalCount = resume?.attachmentManifest.length ?? 0;
+  const missingCount = resume?.missingCustomerAttachments.length ?? 0;
+
   return (
     <div
-      className="mt-3 w-full rounded-lg border border-amber-300/80 bg-white/70 p-3 text-amber-950"
+      className="mb-3 rounded-xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950"
       data-testid="knowledge-base-managed-upload-recovery"
     >
-      <p className="text-xs leading-5">
-        {phase === "needs_browser"
-          ? `Dashboard 尚未完整收到：${missingNames}。请只重新选择这些原文件。`
+      <p className="font-medium">本轮补充资料尚未完成，任务尚未派发</p>
+      <p className="mt-1 text-xs leading-5 text-amber-900/80">
+        {resume
+          ? `Dashboard 已保留 ${retainedCount}/${totalCount}，仍缺 ${missingCount} 份资料。可选择缺失资料，也可重新选择全部原文件；已保留文件不会重复上传。`
           : phase === "attention"
-            ? "Dashboard 暂时无法自动恢复本批资料；已完成内容和服务器副本不受影响。"
-            : phase === "dispatching"
-              ? "资料已恢复，正在继续原知识库轮次。"
-              : "正在从 Dashboard 服务器恢复本批资料，无需重新发送已完成文件。"}
+            ? "Dashboard 暂时无法核对本轮附件；当前节点和已保存资料不受影响。"
+            : "正在核对 Dashboard 已保存的资料，无需重传已完成文件。"}
       </p>
       {error && <p className="mt-1 text-xs text-amber-800">{error}</p>}
       <input
@@ -451,30 +334,29 @@ export default function KnowledgeBaseManagedUploadRecovery({
         type="file"
         multiple
         className="sr-only"
-        aria-label="选择尚未 seal 的知识库原文件"
-        disabled={manualUpload}
-        onChange={(event) => void selectMissingFiles(event.currentTarget.files)}
+        aria-label="选择本轮缺失的知识库原文件"
+        disabled={phase === "uploading" || phase === "dispatching"}
+        onChange={(event) => void selectFiles(event.currentTarget.files)}
       />
       <div className="mt-3 flex flex-wrap gap-2">
-        {phase === "needs_browser" ? (
+        {phase === "needs_browser" && resume ? (
           <Button
             type="button"
             size="sm"
             variant="outline"
-            disabled={manualUpload}
             onClick={() => inputRef.current?.click()}
           >
-            {manualUpload ? (
-              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Upload className="mr-1.5 h-3.5 w-3.5" />
-            )}
-            选择未完成原文件
+            <Upload className="mr-1.5 h-3.5 w-3.5" />
+            继续补充缺失资料
           </Button>
         ) : (
           <span className="inline-flex items-center text-xs">
             <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            自动恢复中
+            {phase === "dispatching"
+              ? "正在继续原任务"
+              : phase === "uploading"
+                ? "正在保存缺失资料"
+                : "正在恢复本轮"}
           </span>
         )}
         {phase === "attention" && (
@@ -482,28 +364,23 @@ export default function KnowledgeBaseManagedUploadRecovery({
             type="button"
             size="sm"
             variant="outline"
-            onClick={() => {
-              setPhase("discovering");
-              setRefreshToken((value) => value + 1);
-            }}
+            onClick={() => setRefreshToken((value) => value + 1)}
           >
             重新检查服务器副本
           </Button>
         )}
-        {discovery && (
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={cancelling}
-            onClick={() => void cancelBatch()}
-          >
-            {cancelling && (
-              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-            )}
-            取消本批次并重新选择
-          </Button>
-        )}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={cancelling || phase === "dispatching"}
+          onClick={() => void cancelTurn()}
+        >
+          {cancelling && (
+            <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          )}
+          放弃本轮补充，返回当前节点
+        </Button>
       </div>
     </div>
   );
