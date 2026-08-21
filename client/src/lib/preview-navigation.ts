@@ -33,7 +33,7 @@ export const previewAdminNav: PortalNavItem[] = [
     group: "运营",
   },
   {
-    label: "官网任务与积分",
+    label: "官网任务与AI建站",
     href: "/preview/admin/presales",
     icon: BriefcaseBusiness,
     group: "运营",

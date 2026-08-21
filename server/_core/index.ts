@@ -115,6 +115,11 @@ import {
   applyReleaseChannelHeaders,
   validateReleaseRuntimeEnvironment,
 } from "./release-channel-adapter";
+import { startSiteOpsWorkerScheduler } from "../siteops/worker";
+import { siteOpsArtifactApi } from "../siteops/artifact-api";
+import { startSiteOpsDomainReminderScheduler } from "../siteops/domain-reminders";
+import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
+import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
 
 declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
@@ -158,15 +163,17 @@ function assertProductionConfiguration() {
 
 async function getRuntimeSkillReadiness() {
   const knowledgeBasePolicy = knowledgeBaseNewBuildPolicyBinding();
-  const [knowledgeBase, brandQuestions, responseLogic] = await Promise.all([
-    getKnowledgeBaseSkillDescriptor({
-      version: knowledgeBasePolicy.skillVersion,
-      contentHash: knowledgeBasePolicy.skillContentHash,
-    }),
-    getBrandQuestionPortfolioSkillDescriptor(),
-    getResponseLogicSkillDescriptor(),
-  ]);
-  return [knowledgeBase, brandQuestions, responseLogic];
+  const [knowledgeBase, brandQuestions, responseLogic, siteOpsSocial] =
+    await Promise.all([
+      getKnowledgeBaseSkillDescriptor({
+        version: knowledgeBasePolicy.skillVersion,
+        contentHash: knowledgeBasePolicy.skillContentHash,
+      }),
+      getBrandQuestionPortfolioSkillDescriptor(),
+      getResponseLogicSkillDescriptor(),
+      getSiteOpsSocialWorkflowReadiness(),
+    ]);
+  return [knowledgeBase, brandQuestions, responseLogic, siteOpsSocial];
 }
 
 async function evaluateReleaseReadiness(
@@ -438,6 +445,10 @@ async function startServer() {
   // Revision-bound, preview-first bulk completion for the five formal website
   // content ticket categories. Domain/ICP prerequisites are not in this API.
   app.use("/api/website-content-template", websiteContentTemplateApi);
+  // Tenant-bound SiteOps build previews and immutable download artifacts.
+  // Authentication precedes every wildcard path so cross-tenant misses stay
+  // indistinguishable from absent artifacts.
+  app.use("/api/site-ops", requireExpressAuth, siteOpsArtifactApi);
   // tRPC API
   app.use(
     "/api/trpc",
@@ -506,10 +517,13 @@ async function startServer() {
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${port}/`);
     if (process.env.NODE_ENV === "production") {
+      registerSiteOpsRuntimeProviders();
       startDeliveryTicketRetentionScheduler();
       startConversationRetentionScheduler();
       startJenovaBrandTrackingRecoveryScheduler();
       startServiceContractLifecycleReconciliationScheduler();
+      startSiteOpsWorkerScheduler();
+      startSiteOpsDomainReminderScheduler();
       startFileContentRetentionScheduler({
         // Let the conversation transaction finish its initial pass before the
         // file worker reconciles newly orphaned resources.

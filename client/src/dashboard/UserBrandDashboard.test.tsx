@@ -36,6 +36,7 @@ vi.mock("@/components/QuestionMaintenanceRequestDialog", () => ({
 
 import {
   getRouteRequestHistoryConfig,
+  hasLegacyWebsiteDeliveryState,
   PreviewUserBrandDashboard,
 } from "./UserBrandDashboard";
 import { userPreviewFixtures } from "@/lib/development-preview-fixtures";
@@ -83,6 +84,26 @@ describe("UserBrandDashboard service experience", () => {
   beforeEach(() => {
     embeddedKnowledgeBasePanel.mockReset();
     setPreviewPlan("basic");
+  });
+
+  it("keeps progressed legacy website customers out of lazy SiteOps creation", () => {
+    expect(
+      hasLegacyWebsiteDeliveryState(
+        { websiteWorkflow: { domainStatus: "completed", styleRevision: 0 } },
+        [],
+      ),
+    ).toBe(true);
+    expect(
+      hasLegacyWebsiteDeliveryState(
+        {
+          websiteWorkflow: { domainStatus: "not_started", icpStatus: "locked" },
+        },
+        [],
+      ),
+    ).toBe(false);
+    expect(hasLegacyWebsiteDeliveryState({}, [{ id: "legacy-ticket" }])).toBe(
+      true,
+    );
   });
 
   it.each([

@@ -774,6 +774,7 @@ export const publicDeliveryTicketWorkspaceMetadataSchema = z
     websiteContentCatalog: z.array(publicWebsiteContentCatalogItemSchema),
     marketEdition: accountMarketEditionSchema,
     preferredMediaOptions: z.array(preferredContentMediaSchema),
+    siteOpsProjectActive: z.boolean().default(false),
     deliveryOwners: z
       .object({
         aiOperations: z.boolean(),

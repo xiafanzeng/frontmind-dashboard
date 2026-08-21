@@ -321,6 +321,8 @@ export default function AdminWorkspace({
           contentDistribution: true,
         },
         websiteWorkflow: deliveryPreviewMetadata.websiteWorkflow ?? null,
+        siteOpsProjectActive:
+          deliveryPreviewMetadata.siteOpsProjectActive === true,
         tickets: deliveryPreviewPages.flatMap(
           (page: any) => page?.tickets ?? page?.items ?? [],
         ),

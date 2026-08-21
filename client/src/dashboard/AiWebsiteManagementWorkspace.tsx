@@ -25,6 +25,7 @@ import {
 import {
   type ChangeEvent,
   type FormEvent,
+  type ReactNode,
   useEffect,
   useMemo,
   useState,
@@ -188,6 +189,9 @@ export type AiWebsiteManagementWorkspaceProps = {
   hasMore?: boolean;
   error?: string | null;
   readOnlyPreview?: boolean;
+  /** New SiteOps keeps build and preview independent from the legacy domain/ICP gate. */
+  siteOpsMode?: boolean;
+  siteOpsPanel?: ReactNode;
   onSubmit?: (input: AiWebsiteWorkOrderSubmission) => Promise<void> | void;
   onSelectStyle?: (input: {
     sampleId: string;
@@ -393,6 +397,8 @@ export default function AiWebsiteManagementWorkspace({
   hasMore = false,
   error = null,
   readOnlyPreview = false,
+  siteOpsMode = false,
+  siteOpsPanel = null,
   onSubmit,
   onSelectStyle,
   onRequestStyleRevision,
@@ -750,6 +756,30 @@ export default function AiWebsiteManagementWorkspace({
           : "提交失败，请稍后重试。",
       );
     }
+  }
+
+  if (siteOpsMode) {
+    return (
+      <section
+        className="ai-website-workspace"
+        aria-labelledby="ai-website-title"
+        data-workflow="site-ops"
+      >
+        <header className="ai-website-header">
+          <p className="ai-website-eyebrow">知识库驱动 · 对话式 SiteOps</p>
+          <h1 id="ai-website-title">AI 友好官网管理</h1>
+          <p className="ai-website-intro">
+            先选择知识库 ZIP 版本和视觉方向，即可生成、检查并预览官网；域名与
+            ICP 只在对应地区正式发布时校验。
+          </p>
+        </header>
+        {siteOpsPanel || (
+          <section className="ai-website-inline-state" role="status">
+            正在连接 AI 建站会话…
+          </section>
+        )}
+      </section>
+    );
   }
 
   return (

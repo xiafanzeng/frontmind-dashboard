@@ -17,6 +17,12 @@ import {
   testPresalesApiCredential,
 } from "./presales-service";
 import {
+  deleteTwentyFirstApiCredential,
+  getTwentyFirstCredentialStatus,
+  replaceTwentyFirstApiCredential,
+  testTwentyFirstApiCredential,
+} from "./twenty-first-service";
+import {
   assertDashboardEnterpriseIdentity,
   getDashboardContentRevision,
   getDashboardWorkspace,
@@ -251,6 +257,16 @@ const presalesApiKeySchema = z
   .trim()
   .min(8, "API Key 至少需要 8 个字符")
   .max(4096, "API Key 不能超过 4096 个字符");
+
+const twentyFirstApiKeySchema = z
+  .string()
+  .trim()
+  .min(8, "21st API Key 至少需要 8 个字符")
+  .max(4096, "21st API Key 不能超过 4096 个字符")
+  .refine(
+    (value) => !/[\u0000-\u001f\u007f]/u.test(value),
+    "21st API Key 包含无效控制字符",
+  );
 
 const managedApiKeyReplaceShape = {
   userId: z.number().int().positive(),
@@ -1775,6 +1791,92 @@ export const adminRouter = router({
           throw toTrpcError(error);
         }
       }),
+
+    twentyFirst: router({
+      status: adminProcedure.query(async ({ ctx }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await getTwentyFirstCredentialStatus();
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
+
+      test: adminProcedure
+        .input(
+          z.object({ apiKey: twentyFirstApiKeySchema.optional() }).strict(),
+        )
+        .mutation(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
+          try {
+            return await testTwentyFirstApiCredential(input.apiKey);
+          } catch (error) {
+            throw toTrpcError(error);
+          }
+        }),
+
+      replace: adminProcedure
+        .input(
+          z
+            .object({
+              apiKey: twentyFirstApiKeySchema,
+              reason: z.string().trim().max(2_000).optional(),
+            })
+            .strict(),
+        )
+        .mutation(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
+          try {
+            const credential = await replaceTwentyFirstApiCredential(
+              ctx.user.id,
+              input.apiKey,
+            );
+            await writeWorkspaceAuditEvent({
+              actor: ctx.user,
+              action: "siteops.twenty_first_credential.replaced",
+              targetType: "presales_api_credential",
+              targetId: "site_builder_21st",
+              reason: input.reason,
+              metadata: {
+                fingerprint: credential.fingerprint,
+                version: credential.version,
+              },
+            });
+            return credential;
+          } catch (error) {
+            throw toTrpcError(error);
+          }
+        }),
+
+      delete: adminProcedure
+        .input(
+          z
+            .object({ reason: z.string().trim().max(2_000).optional() })
+            .strict()
+            .optional(),
+        )
+        .mutation(async ({ ctx, input }) => {
+          requireSystemAdmin(ctx.user);
+          try {
+            const result = await deleteTwentyFirstApiCredential();
+            await writeWorkspaceAuditEvent({
+              actor: ctx.user,
+              action: result.pending
+                ? "siteops.twenty_first_credential.revocation_pending"
+                : "siteops.twenty_first_credential.deleted",
+              targetType: "presales_api_credential",
+              targetId: "site_builder_21st",
+              reason: input?.reason,
+            });
+            return {
+              success: result.deleted || !result.pending,
+              pending: result.pending,
+            };
+          } catch (error) {
+            throw toTrpcError(error);
+          }
+        }),
+    }),
   }),
 
   users: router({

@@ -10,6 +10,7 @@ import {
   knowledgeBaseBuilds,
   localAssets,
   messages,
+  siteProjects,
   upstreamResources,
   userUsageOwners,
   users,
@@ -29,6 +30,7 @@ import {
   mergeConversationMessages,
   mergeConversationTaskPointers,
   permanentlyDeleteConversation,
+  persistSnapshot,
   reconstructKnowledgeBaseUserMessageAttachments,
   reconstructKnowledgeBasePresentationInlineImages,
   repairSnapshotMessageIds,
@@ -92,6 +94,63 @@ describe("conversation snapshot transaction retry", () => {
       }),
     ).rejects.toThrow("forbidden");
     expect(operation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("server-owned SiteOps conversation boundary", () => {
+  const snapshot: ConversationSnapshot = {
+    id: "siteops:7",
+    title: "官网任务与AI建站",
+    messages: [],
+    status: "awaiting_input",
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  it("rejects an ordinary browser snapshot for a SiteOps conversation", async () => {
+    const { executor } = createSelectExecutor((table) =>
+      table === siteProjects
+        ? [{ id: "site-project-1", conversationId: snapshot.id }]
+        : [],
+    );
+
+    await expect(
+      persistSnapshot(executor, 7, snapshot),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+  });
+
+  it("does not expose a SiteOps conversation in the ordinary chat list", async () => {
+    const row = {
+      id: snapshot.id,
+      userId: 7,
+      projectAssignmentId: null,
+      title: snapshot.title,
+      status: snapshot.status,
+      upstreamTaskId: null,
+      previousResponseId: null,
+      taskUrl: null,
+      createdAt: new Date(snapshot.createdAt),
+      updatedAt: new Date(snapshot.updatedAt),
+      startedAt: null,
+      completedAt: null,
+      lastKnownOutputLength: 0,
+      deletedMessageIds: [],
+    };
+    const { executor } = createSelectExecutor((table) => {
+      if (table === conversations) return [row];
+      if (table === siteProjects) return [{ conversationId: snapshot.id }];
+      return [];
+    });
+
+    await expect(
+      listSnapshots(
+        7,
+        null,
+        executor as Parameters<typeof listSnapshots>[2],
+      ),
+    ).resolves.toEqual([]);
   });
 });
 

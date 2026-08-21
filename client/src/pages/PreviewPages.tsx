@@ -316,6 +316,8 @@ export function PreviewAdminAgent({
 export function PreviewAdminPresales() {
   const [keyDraft, setKeyDraft] = useState("");
   const [configured, setConfigured] = useState(true);
+  const [twentyFirstKeyDraft, setTwentyFirstKeyDraft] = useState("");
+  const [twentyFirstConfigured, setTwentyFirstConfigured] = useState(true);
   const tasks = [
     ["官网知识库采集 · 验收企业 B", "2026/7/27 14:22", "6,820"],
     ["普通版单题构建 · 验收企业", "2026/7/26 10:08", "3,460"],
@@ -325,7 +327,7 @@ export function PreviewAdminPresales() {
   return (
     <PortalShell
       eyebrow="管理中心 · 客户与服务"
-      title="官网任务与积分"
+      title="官网任务与AI建站"
       navItems={getRoleScopedPreviewAdminNav("system_admin")}
       accountLabel="系统管理员验收账号"
       roleLabel="系统管理员 · 验收预览"
@@ -421,6 +423,98 @@ export function PreviewAdminPresales() {
                 </span>
               </article>
             ))}
+          </div>
+        </PortalCard>
+
+        <PortalCard className="p-5 sm:p-6 lg:col-span-2">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-5 w-5 text-[#5b2a86]" />
+                <h2 className="font-semibold text-[#171321]">AI建站（21st）</h2>
+              </div>
+              <p className="mt-2 text-sm leading-6 text-[#716a80]">
+                21st 仅用于视觉方向检索；保存时验证 MCP 初始化、search 与
+                get_component，不与 Manus 积分混算。
+              </p>
+            </div>
+            <Badge
+              className={
+                twentyFirstConfigured
+                  ? "bg-[#16794f]/10 text-[#16794f]"
+                  : "bg-[#c89013]/10 text-[#8b6500]"
+              }
+            >
+              {twentyFirstConfigured ? "AI 建站就绪" : "等待配置"}
+            </Badge>
+          </div>
+          <div className="mt-5 grid gap-4 lg:grid-cols-[1.05fr_0.95fr]">
+            <div>
+              <div className="rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
+                <p className="text-xs text-[#857e91]">21st 凭据指纹</p>
+                <p className="mt-1 font-mono text-sm text-[#332842]">
+                  {twentyFirstConfigured ? "•••• •••• 21ST" : "尚未配置"}
+                </p>
+              </div>
+              <Input
+                type="password"
+                value={twentyFirstKeyDraft}
+                onChange={(event) => setTwentyFirstKeyDraft(event.target.value)}
+                className="mt-4"
+                placeholder={
+                  twentyFirstConfigured
+                    ? "输入新的 21st API Key"
+                    : "粘贴 21st_sk_…"
+                }
+              />
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                <Button
+                  variant="outline"
+                  onClick={() =>
+                    toast.success("样例 21st MCP 连接通过 · 318ms")
+                  }
+                >
+                  测试 MCP 连接
+                </Button>
+                <Button
+                  disabled={twentyFirstKeyDraft.trim().length < 8}
+                  className="bg-[#5b2a86] hover:bg-[#49216c]"
+                  onClick={() => {
+                    setTwentyFirstConfigured(true);
+                    setTwentyFirstKeyDraft("");
+                    toast.success("样例 21st Key 已验证并加密保存");
+                  }}
+                >
+                  验证并更换
+                </Button>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 rounded-2xl border border-[#e8e1ee] bg-[#fbf9fd] p-4">
+              {["search", "get_component"].map((capability) => (
+                <div
+                  key={capability}
+                  className="rounded-xl border border-[#e8e1ee] bg-white px-3 py-3"
+                >
+                  <p className="font-mono text-xs text-[#484057]">
+                    {capability}
+                  </p>
+                  <p className="mt-1 text-xs font-medium text-[#16794f]">
+                    可用
+                  </p>
+                </div>
+              ))}
+              {["get_usage", "get_theme"].map((capability) => (
+                <div
+                  key={capability}
+                  className="rounded-xl border border-[#e8e1ee] bg-white px-3 py-3"
+                >
+                  <p className="font-mono text-xs text-[#484057]">
+                    {capability}
+                  </p>
+                  <p className="mt-1 text-xs text-[#857e91]">未提供</p>
+                </div>
+              ))}
+            </div>
           </div>
         </PortalCard>
       </div>

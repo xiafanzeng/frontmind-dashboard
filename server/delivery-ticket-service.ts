@@ -27,6 +27,7 @@ import {
   knowledgeBaseSnapshots,
   serviceContracts,
   serviceQuotaPeriods,
+  siteProjects,
   upstreamResources,
   userAdminAssignments,
   users,
@@ -83,6 +84,10 @@ import {
 import { deliverySummaryLooksLikeCredentialSecret } from "../shared/delivery-ticket-security";
 import type { AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
+import {
+  loadUnifiedDeliveryQuotaUsageRows,
+  unifiedActiveQuotaCountsByPeriod,
+} from "./delivery-quota-usage";
 import { assertWorkspaceAccess, isSystemAdmin } from "./dashboard-service";
 import {
   getServicePortal,
@@ -1374,29 +1379,10 @@ async function currentQuota(
             asc(serviceQuotaPeriods.id),
           );
         const activeRows = periods.length
-          ? await tx
-              .select({
-                quotaPeriodId: deliveryTickets.quotaPeriodId,
-                quotaPool: deliveryTickets.quotaPool,
-                quotaState: deliveryTickets.quotaState,
-                value: count(),
-              })
-              .from(deliveryTickets)
-              .where(
-                and(
-                  eq(deliveryTickets.userId, userId),
-                  inArray(
-                    deliveryTickets.quotaPeriodId,
-                    periods.map((period: any) => period.id),
-                  ),
-                  inArray(deliveryTickets.quotaState, ["reserved", "consumed"]),
-                ),
-              )
-              .groupBy(
-                deliveryTickets.quotaPeriodId,
-                deliveryTickets.quotaPool,
-                deliveryTickets.quotaState,
-              )
+          ? await loadUnifiedDeliveryQuotaUsageRows(tx, {
+              userId,
+              quotaPeriodIds: periods.map((period: any) => period.id),
+            })
           : [];
         return { periods, activeRows };
       })
@@ -1797,6 +1783,7 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
     websiteBuildMilestoneRows,
     websiteLegacyEvidenceTicketRows,
     websiteLegacyEvidenceMilestoneRows,
+    siteOpsProjectRows,
   ] = await Promise.all([
     db
       .select({ marketEdition: users.marketEdition })
@@ -1883,6 +1870,27 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
         ),
       )
       .limit(1),
+    db
+      .select({ id: siteProjects.id })
+      .from(siteProjects)
+      .where(
+        and(
+          eq(siteProjects.userId, userId),
+          inArray(siteProjects.status, [
+            "draft",
+            "collecting_brief",
+            "visual_searching",
+            "awaiting_visual_selection",
+            "building",
+            "preview_ready",
+            "approved",
+            "live",
+            "attention_required",
+            "failed",
+          ]),
+        ),
+      )
+      .limit(1),
   ]);
   const ownerTypes = new Set(ownerRows.map((row) => row.roleType));
   const domainCompleted = siteProfile?.domainStatus === "completed";
@@ -1912,6 +1920,7 @@ export async function getDeliveryTicketWorkspaceMetadata(userId: number) {
     marketEdition,
     preferredMediaOptions:
       contentAssetMediaOptionsForMarketEdition(marketEdition),
+    siteOpsProjectActive: siteOpsProjectRows.length > 0,
     deliveryOwners: {
       aiOperations: ownerTypes.has("ai_operations_engineer"),
       monitoringOptimization: ownerTypes.has(
@@ -2012,6 +2021,7 @@ export function toPublicDeliveryTicketWorkspaceMetadata(
     websiteContentCatalog: metadata.websiteContentCatalog,
     marketEdition: metadata.marketEdition,
     preferredMediaOptions: metadata.preferredMediaOptions,
+    siteOpsProjectActive: metadata.siteOpsProjectActive,
     deliveryOwners,
     websiteWorkflow: {
       domainCompleted,
@@ -2238,7 +2248,11 @@ export async function selectWebsiteStyleSample(input: {
       )
       .limit(1);
     const selected = sampleRows[0];
-    if (!selected) {
+    if (
+      !selected ||
+      selected.batch.sourceKind !== "legacy_manual_three" ||
+      !selected.batch.ticketId
+    ) {
       throw new DeliveryTicketError(
         "WEBSITE_STYLE_SAMPLE_NOT_FOUND",
         "官网风格样例不存在。",
@@ -2369,7 +2383,11 @@ export async function requestWebsiteStyleRevision(input: {
       )
       .limit(1);
     const batch = batchRows[0];
-    if (!batch) {
+    if (
+      !batch ||
+      batch.sourceKind !== "legacy_manual_three" ||
+      !batch.ticketId
+    ) {
       throw new DeliveryTicketError(
         "WEBSITE_STYLE_BATCH_NOT_FOUND",
         "官网风格样例批次不存在。",
@@ -2598,30 +2616,17 @@ export async function createDeliveryTicket(input: {
         let period = periods[0];
         let ordinal = 1;
         if (quotaPool) {
-          const active = await tx
-            .select({
-              quotaPeriodId: deliveryTickets.quotaPeriodId,
-              value: count(),
-            })
-            .from(deliveryTickets)
-            .where(
-              and(
-                eq(deliveryTickets.userId, input.userId),
-                inArray(
-                  deliveryTickets.quotaPeriodId,
-                  periods.map((candidate) => candidate.id),
-                ),
-                eq(deliveryTickets.quotaPool, quotaPool),
-                inArray(deliveryTickets.quotaState, ["reserved", "consumed"]),
-              ),
-            )
-            .groupBy(deliveryTickets.quotaPeriodId);
+          const active = await loadUnifiedDeliveryQuotaUsageRows(tx, {
+            userId: input.userId,
+            quotaPeriodIds: periods.map((candidate) => candidate.id),
+          });
           const selectedPeriod = selectDeliveryTicketQuotaPeriod({
             periods,
             quotaPool,
-            activeCounts: new Map(
-              active.map((row: any) => [row.quotaPeriodId, Number(row.value)]),
-            ),
+            activeCounts: unifiedActiveQuotaCountsByPeriod({
+              rows: active,
+              quotaPool,
+            }),
           });
           if (!selectedPeriod) {
             throw new DeliveryTicketError(
@@ -4165,6 +4170,7 @@ export async function updateManagedDeliveryTicket(input: {
               ? ticket.icpDeclarations.icpNumber
               : profile.icpNumber,
           icpStatus: "approved",
+          icpDomainRevision: profile.domainRevision,
           icpVerifiedAt: now,
           revision: profile.revision + 1,
           updatedByUserId: input.actor.id,
@@ -4406,22 +4412,37 @@ export async function updateWorkspaceSiteProfile(input: {
       );
     }
     const now = new Date();
+    const switchingDomain = Boolean(
+      current && normalizeDomain(current.domain) !== domain,
+    );
+    const domainRevision = switchingDomain
+      ? current!.domainRevision + 1
+      : (current?.domainRevision ?? 1);
+    const effectiveIcpStatus = switchingDomain
+      ? ("not_submitted" as const)
+      : input.icpStatus;
     if (current) {
       await tx
         .update(workspaceSiteProfiles)
         .set({
           domain,
+          normalizedAsciiDomain: domain || null,
+          unicodeDisplayDomain: domain || null,
+          domainRevision,
           siteMode: input.siteMode,
           domainStatus: input.domainStatus,
           domainVerifiedAt:
             input.domainStatus === "completed"
               ? (current.domainVerifiedAt ?? now)
               : null,
-          icpProvince: nonEmpty(input.icpProvince),
-          icpNumber: nonEmpty(input.icpNumber),
-          icpStatus: input.icpStatus,
+          icpProvince: switchingDomain ? null : nonEmpty(input.icpProvince),
+          icpNumber: switchingDomain ? null : nonEmpty(input.icpNumber),
+          icpStatus: effectiveIcpStatus,
+          icpDomainRevision:
+            effectiveIcpStatus === "approved" ? domainRevision : null,
           icpVerifiedAt:
-            input.icpStatus === "approved" || input.icpStatus === "not_required"
+            effectiveIcpStatus === "approved" ||
+            effectiveIcpStatus === "not_required"
               ? (current.icpVerifiedAt ?? now)
               : null,
           revision: revision + 1,
@@ -4433,14 +4454,20 @@ export async function updateWorkspaceSiteProfile(input: {
       await tx.insert(workspaceSiteProfiles).values({
         userId: input.userId,
         domain,
+        normalizedAsciiDomain: domain || null,
+        unicodeDisplayDomain: domain || null,
+        domainRevision,
         siteMode: input.siteMode,
         domainStatus: input.domainStatus,
         domainVerifiedAt: input.domainStatus === "completed" ? now : null,
         icpProvince: nonEmpty(input.icpProvince),
         icpNumber: nonEmpty(input.icpNumber),
-        icpStatus: input.icpStatus,
+        icpStatus: effectiveIcpStatus,
+        icpDomainRevision:
+          effectiveIcpStatus === "approved" ? domainRevision : null,
         icpVerifiedAt:
-          input.icpStatus === "approved" || input.icpStatus === "not_required"
+          effectiveIcpStatus === "approved" ||
+          effectiveIcpStatus === "not_required"
             ? now
             : null,
         revision: 1,
@@ -4448,6 +4475,16 @@ export async function updateWorkspaceSiteProfile(input: {
         createdAt: now,
         updatedAt: now,
       });
+    }
+    if (switchingDomain) {
+      await tx
+        .update(siteProjects)
+        .set({
+          canonicalHostname: domain || null,
+          mainlandLiveDeploymentId: null,
+          updatedAt: now,
+        })
+        .where(eq(siteProjects.userId, input.userId));
     }
     await writeWorkspaceAuditEvent(
       {
@@ -4467,11 +4504,12 @@ export async function updateWorkspaceSiteProfile(input: {
         domainStatus: input.domainStatus,
         domainVerifiedAt:
           input.domainStatus === "completed" ? now.getTime() : null,
-        icpProvince: nonEmpty(input.icpProvince),
-        icpNumber: nonEmpty(input.icpNumber),
-        icpStatus: input.icpStatus,
+        icpProvince: switchingDomain ? null : nonEmpty(input.icpProvince),
+        icpNumber: switchingDomain ? null : nonEmpty(input.icpNumber),
+        icpStatus: effectiveIcpStatus,
         icpVerifiedAt:
-          input.icpStatus === "approved" || input.icpStatus === "not_required"
+          effectiveIcpStatus === "approved" ||
+          effectiveIcpStatus === "not_required"
             ? now.getTime()
             : null,
         revision: revision + 1,

@@ -431,7 +431,7 @@ export function filterPreviewTicketsForAdmin(
 export const adminNav: PortalNavItem[] = [
   { label: "API与人员管理", href: "/", icon: KeyRound, group: "运营" },
   {
-    label: "官网任务与积分",
+    label: "官网任务与AI建站",
     href: "/admin/presales",
     icon: BriefcaseBusiness,
     group: "运营",

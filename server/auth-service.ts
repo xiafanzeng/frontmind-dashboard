@@ -3300,6 +3300,7 @@ export async function isUpstreamApiKeyShared(
       .from(presalesApiCredentials)
       .where(
         and(
+          eq(presalesApiCredentials.slot, "website"),
           eq(presalesApiCredentials.fingerprint, fingerprint),
           ne(presalesApiCredentials.status, "deleted"),
         ),

@@ -5352,6 +5352,7 @@ export async function updateMyDeliveryTicket(input: {
             input.handoff?.icpProvince?.trim() || profile.icpProvince || null,
           icpNumber: notRequired ? null : icpNumber,
           icpStatus: notRequired ? "not_required" : "approved",
+          icpDomainRevision: notRequired ? null : profile.domainRevision,
           icpVerifiedAt: now,
           revision: profile.revision + 1,
           updatedByUserId: input.actor.id,

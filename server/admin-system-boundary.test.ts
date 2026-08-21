@@ -212,6 +212,28 @@ describe("system administrator boundary", () => {
         caller.presales.usage(),
     ],
     [
+      "read the system-wide 21st key",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.twentyFirst.status(),
+    ],
+    [
+      "test the system-wide 21st key",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.twentyFirst.test({ apiKey: "21st_sk_boundary_test" }),
+    ],
+    [
+      "replace the system-wide 21st key",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.twentyFirst.replace({
+          apiKey: "21st_sk_boundary_test",
+        }),
+    ],
+    [
+      "delete the system-wide 21st key",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.twentyFirst.delete(),
+    ],
+    [
       "replace a managed API Key from unified management",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.apiKeyUsageAlerts.replaceTargetCredential({

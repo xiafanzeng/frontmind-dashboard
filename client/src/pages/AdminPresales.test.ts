@@ -15,6 +15,34 @@ describe("presalesUsageDisplayState", () => {
     expect(source).not.toContain("allowIncompleteHistory");
     expect(source).not.toContain("历史任务未能全部归因到官网");
   });
+
+  it("keeps Website usage and 21st AI building as separate administrator sections", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
+      "utf8",
+    );
+    expect(source).toContain('title="官网任务与AI建站"');
+    expect(source).toContain("官网任务与积分");
+    expect(source).toContain("AI建站（21st）");
+    expect(source).toContain("search");
+    expect(source).toContain("get_component");
+    expect(source).toContain("不与 Manus 积分混算");
+  });
+
+  it("sends 21st plaintext through the direct tRPC client without retaining mutation variables", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
+      "utf8",
+    );
+    expect(source).toContain(
+      "utils.client.admin.presales.twentyFirst.replace.mutate",
+    );
+    expect(source).toContain(
+      "utils.client.admin.presales.twentyFirst.test.mutate",
+    );
+    expect(source).not.toContain("twentyFirst.replace.useMutation");
+    expect(source).not.toContain("twentyFirst.test.useMutation");
+  });
   it("keeps the locally recorded Website total visible without a Key pool snapshot", () => {
     expect(
       presalesUsageDisplayState({

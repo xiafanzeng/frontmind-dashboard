@@ -90,7 +90,7 @@ describe("administrator channel navigation", () => {
     (_name, navigation) => {
       expect(navigation.map((item) => item.label)).toEqual([
         "API与人员管理",
-        "官网任务与积分",
+        "官网任务与AI建站",
         "客户交付工作台",
         "客户项目团队",
         "需求管理",
@@ -147,7 +147,7 @@ describe("administrator channel navigation", () => {
         ),
       ).toBe(false);
       expect(
-        navigation.find((item) => item.label === "官网任务与积分"),
+        navigation.find((item) => item.label === "官网任务与AI建站"),
       ).toMatchObject({ group: "运营" });
     },
   );

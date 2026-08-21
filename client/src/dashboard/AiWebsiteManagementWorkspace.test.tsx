@@ -31,6 +31,29 @@ function websiteQuota(
 }
 
 describe("AiWebsiteManagementWorkspace", () => {
+  it("opens the new SiteOps build flow before domain or ICP while legacy gates stay isolated", () => {
+    render(
+      <AiWebsiteManagementWorkspace
+        planCode="advanced"
+        quota={websiteQuota()}
+        websiteWorkflow={{
+          domainStatus: "not_started",
+          icpStatus: "locked",
+          canSubmitDomain: true,
+          canSubmitIcp: false,
+          canSubmitContent: false,
+        }}
+        siteOpsMode
+        siteOpsPanel={<div>对话式建站面板已连接</div>}
+      />,
+    );
+
+    expect(screen.getByText("对话式建站面板已连接")).toBeInTheDocument();
+    expect(screen.getByText(/域名与 ICP 只在对应地区正式发布时校验/)).toBeInTheDocument();
+    expect(screen.queryByText("阿里云企业域名注册图文教程")).toBeNull();
+    expect(screen.queryByText("官网开通进度")).toBeNull();
+  });
+
   it("shows only customer-facing results in the engineer preview", () => {
     render(
       <AiWebsiteManagementWorkspace

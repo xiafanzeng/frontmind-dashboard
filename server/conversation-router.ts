@@ -1,5 +1,14 @@
 import { TRPCError } from "@trpc/server";
-import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  notInArray,
+  or,
+} from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -15,6 +24,7 @@ import {
   localAssets,
   messages,
   responseLogicEntries,
+  siteProjects,
   upstreamResources,
   users,
   type MessageMetadata,
@@ -1755,6 +1765,33 @@ export async function persistSnapshot(
     ),
   };
   const projectAssignmentId = options.projectAssignmentId ?? null;
+  const persistedConversationId = storageId(
+    userId,
+    snapshot.id,
+    projectAssignmentId,
+  );
+  const siteOpsProjects = projectAssignmentId
+    ? []
+    : await executor
+        .select({ id: siteProjects.id })
+        .from(siteProjects)
+        .where(
+          and(
+            eq(siteProjects.userId, userId),
+            or(
+              eq(siteProjects.conversationId, snapshot.id),
+              eq(siteProjects.conversationId, persistedConversationId),
+            ),
+          ),
+        )
+        .limit(1);
+  if (siteOpsProjects[0]) {
+    if (options.skipExisting) return "skipped";
+    throw new TRPCError({
+      code: "CONFLICT",
+      message: "AI建站会话由服务端持有，请在官网任务与AI建站中操作",
+    });
+  }
   const knowledgeBuildCandidates = await executor
     .select({ id: knowledgeBaseBuilds.id })
     .from(knowledgeBaseBuilds)
@@ -1840,11 +1877,6 @@ export async function persistSnapshot(
       message: "该知识库会话已被重置，不能从旧页面重新同步",
     });
   }
-  const persistedConversationId = storageId(
-    userId,
-    snapshot.id,
-    projectAssignmentId,
-  );
   // Do not take a next-key lock for a row that does not exist. Two new public
   // conversations commonly sort into the same PRIMARY-key gap; locking both
   // missing IDs before INSERT makes their insert-intention locks deadlock.
@@ -2213,7 +2245,7 @@ export async function listSnapshots(
   database?: NonNullable<Awaited<ReturnType<typeof getDb>>>,
 ): Promise<ConversationSnapshot[]> {
   const db = database ?? requireDb(await getDb());
-  const conversationRows = await db
+  const allConversationRows = await db
     .select()
     .from(conversations)
     .where(
@@ -2228,6 +2260,23 @@ export async function listSnapshots(
       ),
     )
     .orderBy(desc(conversations.updatedAt));
+  if (allConversationRows.length === 0) return [];
+
+  // SiteOps owns its conversation and messages on the server. Keep it out of
+  // the ordinary chat list so browser snapshots cannot try to mirror it.
+  const siteOpsConversationIds = projectAssignmentId
+    ? new Set<string>()
+    : new Set(
+        (
+          await db
+            .select({ conversationId: siteProjects.conversationId })
+            .from(siteProjects)
+            .where(eq(siteProjects.userId, userId))
+        ).map((row) => row.conversationId),
+      );
+  const conversationRows = allConversationRows.filter(
+    (row) => !siteOpsConversationIds.has(row.id),
+  );
   if (conversationRows.length === 0) return [];
 
   const ids = conversationRows.map((row) => row.id);
@@ -2461,6 +2510,31 @@ export const conversationRouter = router({
         projectAssignmentId,
       );
       await runConversationWriteTransaction(db, async (tx) => {
+        const siteOpsProject = projectAssignmentId
+          ? []
+          : await tx
+              .select({ id: siteProjects.id })
+              .from(siteProjects)
+              .where(
+                and(
+                  eq(siteProjects.userId, ctx.user.id),
+                  or(
+                    eq(siteProjects.conversationId, input.id),
+                    eq(
+                      siteProjects.conversationId,
+                      persistedConversationId,
+                    ),
+                  ),
+                ),
+              )
+              .limit(1)
+              .for("update");
+        if (siteOpsProject[0]) {
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "AI建站会话由服务端持有，请在官网任务与AI建站中操作",
+          });
+        }
         // KB transitions lock the build before touching conversation state.
         // Keep the same order here so delete cannot deadlock or race a start.
         const knowledgeBuild = await tx

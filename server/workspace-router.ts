@@ -91,6 +91,25 @@ import {
   getJenovaBrandTrackingSession,
   listJenovaBrandTrackingSessions,
 } from "./jenova-brand-tracking-service";
+import {
+  siteOpsActInputSchema,
+  siteOpsAliyunConnectionInputSchema,
+  siteOpsAliyunConnectionSetupInputSchema,
+  siteOpsObserveInputSchema,
+  siteOpsOpenInputSchema,
+  siteOpsSendMessageInputSchema,
+} from "../shared/siteops";
+import {
+  actOnSiteOps,
+  disconnectSiteOpsAliyunConnection,
+  getSiteOpsAliyunConnection,
+  observeSiteOps,
+  openSiteOps,
+  sendSiteOpsMessage,
+  setupSiteOpsAliyunConnection,
+  SiteOpsServiceError,
+  verifySiteOpsAliyunConnection,
+} from "./siteops/service";
 
 export function projectUserDashboardPayload(input: {
   payload: DashboardPayload;
@@ -194,7 +213,100 @@ function toBrandTrackingServiceError(error: unknown): never {
   throw new TRPCError({ code: trpcCode, message, cause: error });
 }
 
+function toSiteOpsServiceError(error: unknown): never {
+  if (!(error instanceof SiteOpsServiceError)) throw toTrpcError(error);
+  const code =
+    error.statusCode === 404
+      ? "NOT_FOUND"
+      : error.statusCode === 403
+        ? "FORBIDDEN"
+        : error.statusCode === 400
+          ? "BAD_REQUEST"
+          : error.statusCode === 412
+            ? "PRECONDITION_FAILED"
+            : error.statusCode === 503
+              ? "SERVICE_UNAVAILABLE"
+              : "CONFLICT";
+  throw new TRPCError({ code, message: error.message, cause: error });
+}
+
 export const workspaceRouter = router({
+  siteOps: router({
+    open: protectedProcedure
+      .input(siteOpsOpenInputSchema)
+      .mutation(async ({ ctx }) => {
+        try {
+          return await openSiteOps(ctx.user);
+        } catch (error) {
+          toSiteOpsServiceError(error);
+        }
+      }),
+    observe: protectedProcedure
+      .input(siteOpsObserveInputSchema)
+      .query(async ({ ctx, input }) => {
+        try {
+          return await observeSiteOps(ctx.user, input);
+        } catch (error) {
+          toSiteOpsServiceError(error);
+        }
+      }),
+    sendMessage: protectedProcedure
+      .input(siteOpsSendMessageInputSchema)
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await sendSiteOpsMessage(ctx.user, input);
+        } catch (error) {
+          toSiteOpsServiceError(error);
+        }
+      }),
+    act: protectedProcedure
+      .input(siteOpsActInputSchema)
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await actOnSiteOps(ctx.user, input);
+        } catch (error) {
+          toSiteOpsServiceError(error);
+        }
+      }),
+    aliyunConnection: router({
+      get: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
+        .query(async ({ ctx, input }) => {
+          try {
+            return await getSiteOpsAliyunConnection(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+      setup: protectedProcedure
+        .input(siteOpsAliyunConnectionSetupInputSchema)
+        .mutation(async ({ ctx, input }) => {
+          try {
+            return await setupSiteOpsAliyunConnection(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+      verify: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
+        .mutation(async ({ ctx, input }) => {
+          try {
+            return await verifySiteOpsAliyunConnection(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+      disconnect: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
+        .mutation(async ({ ctx, input }) => {
+          try {
+            return await disconnectSiteOpsAliyunConnection(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+    }),
+  }),
   brandTracking: router({
     overview: protectedProcedure.query(async ({ ctx }) => {
       try {
