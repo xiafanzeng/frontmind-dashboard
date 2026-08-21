@@ -95,10 +95,24 @@ const MONITOR_CREDENTIAL_FAILED_CACHE_MS = 15_000;
 const MAX_MONITOR_RESPONSE_BYTES = 12 * 1024 * 1024;
 const MAX_ANSWER_CHARACTERS = 200_000;
 const MAX_SOURCE_ITEMS = 200;
+const MAX_CITATION_ITEMS = 100;
 const MAX_EVIDENCE_CANDIDATES = 2_000;
 const MAX_MEDIA_ITEMS = 24;
+const MAX_SEARCH_KEYWORDS = 50;
+const MAX_RECOMMENDED_QUESTIONS = 20;
+const MAX_KEYWORD_EVALUATIONS = 100;
+const MAX_MONITOR_LIST_ITEM_CHARACTERS = 500;
+const MAX_MONITOR_EVALUATION_KEYWORD_CHARACTERS = 200;
+const MAX_MONITOR_SOURCE_INDEX = 1_000_000_000;
+const MAX_MONITOR_RANK = 1_000_000;
+const MAX_MONITOR_PUBLISH_TIME_CHARACTERS = 80;
+const MAX_REGION_CATALOG_BYTES = 512 * 1024;
+const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
+const MONITOR_CATALOG_HTTP_TIMEOUT_MS = 5_000;
+const MONITOR_SCREENSHOT_HTTP_TIMEOUT_MS = 15_000;
 const DEFAULT_MONITOR_BASE_URL_B64 =
   "aHR0cHM6Ly9idXNpbmVzcy1hcGkubW9saXpoaXNodS5jb20vYXBpL2J1c2luZXNzL21vbml0b3I=";
+const MONITOR_SCREENSHOT_HOST_B64 = "aW1nLm1vbGl6aGlzaHUuY29t";
 const ENV_MONITOR_CREDENTIAL_PREFIX = "env-";
 const MONITOR_CREDENTIAL_PLACEHOLDER_MARKERS = [
   "replace-with",
@@ -143,6 +157,15 @@ const monitorCreateSchema = z
         message: "platforms must not contain duplicates",
       }),
     idempotencyKey: z.string().trim().min(16).max(512),
+    monitorKeyword: z.string().trim().min(1).max(2_000).optional(),
+    screenshot: z.union([z.literal(0), z.literal(1)]).optional(),
+    region: z
+      .object({
+        scope: z.enum(["domestic", "overseas"]),
+        code: z.string().trim().min(1).max(64),
+      })
+      .strict()
+      .optional(),
     projectId: z
       .string()
       .trim()
@@ -155,6 +178,23 @@ const monitorCreateSchema = z
 
 export type MonitorCreateInput = z.infer<typeof monitorCreateSchema>;
 
+export type MonitorRegionScope = "domestic" | "overseas";
+
+export type PublicMonitorRegion = {
+  scope: MonitorRegionScope;
+  code: string;
+  label: string;
+};
+
+type MonitorRequestRegion = PublicMonitorRegion;
+
+type MonitorRunRequestSnapshot = {
+  consumerTaskId: string;
+  screenshot: 0 | 1;
+  monitorKeyword?: string;
+  region?: MonitorRequestRegion;
+};
+
 type MonitorScope = { platform: MonitorPlatform; runIndex: number };
 type MonitorEvidence =
   | string
@@ -164,8 +204,10 @@ type MonitorEvidence =
       name?: string;
       url?: string;
       source?: string;
+      site?: string;
       domain?: string;
       summary?: string;
+      publishTime?: string;
     };
 
 export type MonitorMedia = {
@@ -185,15 +227,35 @@ type MonitorCheckpointItem = {
   media: MonitorMedia[];
   /** Canonical, deduplicated union of every source returned for the answer. */
   sources?: MonitorEvidence | MonitorEvidence[];
-  /** Legacy checkpoint fields are read only when recovering pre-v2 runs. */
+  citationList?: MonitorEvidence[];
+  referenceList?: MonitorEvidence[];
+  /** Legacy checkpoint field names remain readable for existing runs. */
   citations?: MonitorEvidence[];
   references?: MonitorEvidence[];
+  searchKeywords?: string[];
+  recommendedQuestions?: string[];
+  mentionPosition?: number | null;
+  mentionContext?: string;
+  sentiment?: "positive" | "negative" | "neutral" | null;
+  categoryRanking?: { categoryName: string; rank: number } | null;
+  keywordEvaluations?: Array<{
+    keyword: string;
+    nature: "positive" | "negative" | "neutral";
+    context: string;
+  }>;
+  /** Provider URL remains private and is only dereferenced by the proxy route. */
+  pageScreenshot?: string;
   error?: string;
   completedAt?: string;
 };
 
 type MonitorCheckpoint = {
+  request?: MonitorRunRequestSnapshot;
   items: MonitorCheckpointItem[];
+};
+
+export type PublicMonitorScreenshot = {
+  available: boolean;
 };
 
 export type PublicMonitorRecord = {
@@ -204,6 +266,20 @@ export type PublicMonitorRecord = {
   answerText?: string;
   media: MonitorMedia[];
   sources: MonitorEvidence[];
+  citationList?: MonitorEvidence[];
+  referenceList?: MonitorEvidence[];
+  searchKeywords?: string[];
+  recommendedQuestions?: string[];
+  mentionPosition?: number | null;
+  mentionContext?: string;
+  sentiment?: "positive" | "negative" | "neutral" | null;
+  categoryRanking?: { categoryName: string; rank: number } | null;
+  keywordEvaluations?: Array<{
+    keyword: string;
+    nature: "positive" | "negative" | "neutral";
+    context: string;
+  }>;
+  screenshot?: PublicMonitorScreenshot;
   error?: string;
   completedAt?: string;
 };
@@ -218,6 +294,9 @@ export type PublicMonitorRun = {
   expectedItems: number;
   completedItems: number;
   failedItems: number;
+  monitorKeyword?: string;
+  screenshot?: 0 | 1;
+  region?: PublicMonitorRegion;
   submittedAt?: string;
   nextPollAt?: string;
   complete?: boolean;
@@ -265,6 +344,19 @@ export interface MonitorTransport {
   ): Promise<unknown>;
 }
 
+export interface MonitorRegionCatalog {
+  list(scope: MonitorRegionScope): Promise<PublicMonitorRegion[]>;
+}
+
+export type MonitorScreenshotResponse = {
+  contentType: "image/gif" | "image/jpeg" | "image/png" | "image/webp";
+  data: Buffer;
+};
+
+export interface MonitorScreenshotTransport {
+  fetch(url: string): Promise<MonitorScreenshotResponse>;
+}
+
 export type MonitorReservation =
   | { state: "acquired"; run: PresalesMonitorRun }
   | { state: "replay"; run: PresalesMonitorRun };
@@ -295,6 +387,7 @@ export interface MonitorRepository {
     question: string;
     platforms: MonitorPlatform[];
     expectedItems: number;
+    checkpoint: MonitorCheckpoint;
     now: Date;
     workspaceQuota?: WorkspaceMonitorQuotaWindow;
   }): Promise<MonitorReservation>;
@@ -693,6 +786,10 @@ function toPublicMonitorPlatform(value: unknown): MonitorPlatform | null {
 export function buildMonitorSubmitPayload(input: {
   question: string;
   platforms: readonly MonitorPlatform[];
+  consumerTaskId?: string;
+  monitorKeyword?: string;
+  screenshot?: 0 | 1;
+  region?: Pick<MonitorRequestRegion, "code">;
 }) {
   return {
     prompts: Array.from(
@@ -702,8 +799,11 @@ export function buildMonitorSubmitPayload(input: {
     platforms: input.platforms.map((platform) => ({
       platform: toUpstreamMonitorPlatform(platform),
       mode: "search" as const,
-      screenshot: 0 as const,
+      screenshot: input.screenshot ?? (0 as const),
     })),
+    ...(input.consumerTaskId ? { consumerTaskId: input.consumerTaskId } : {}),
+    ...(input.monitorKeyword ? { monitorKeywords: input.monitorKeyword } : {}),
+    ...(input.region ? { regionCode: [input.region.code] } : {}),
   };
 }
 
@@ -711,13 +811,53 @@ function requestHash(input: {
   projectId?: string;
   question: string;
   platforms: readonly MonitorPlatform[];
+  monitorKeyword?: string;
+  screenshot?: 0 | 1;
+  region?: Pick<MonitorRequestRegion, "scope" | "code">;
 }) {
   return sha256(
     canonicalJson({
       schema: "frontmind-presales-monitor-v1",
       projectId: input.projectId ?? null,
       payload: buildMonitorSubmitPayload(input),
+      ...(input.region ? { regionScope: input.region.scope } : {}),
     }),
+  );
+}
+
+function monitorConsumerTaskId(idempotencyKeyHash: string) {
+  return `fm${sha256(`frontmind-monitor:${idempotencyKeyHash}`).slice(0, 62)}`;
+}
+
+function initialMonitorCheckpoint(input: {
+  consumerTaskId: string;
+  monitorKeyword?: string;
+  screenshot: 0 | 1;
+  region?: MonitorRequestRegion;
+}): MonitorCheckpoint {
+  return {
+    request: {
+      consumerTaskId: input.consumerTaskId,
+      screenshot: input.screenshot,
+      ...(input.monitorKeyword ? { monitorKeyword: input.monitorKeyword } : {}),
+      ...(input.region ? { region: input.region } : {}),
+    },
+    items: [],
+  };
+}
+
+function sameMonitorRequestSnapshot(
+  left: MonitorRunRequestSnapshot | undefined,
+  right: MonitorRunRequestSnapshot | undefined,
+) {
+  return Boolean(
+    left &&
+      right &&
+      left.consumerTaskId === right.consumerTaskId &&
+      left.screenshot === right.screenshot &&
+      (left.monitorKeyword ?? "") === (right.monitorKeyword ?? "") &&
+      (left.region?.scope ?? "") === (right.region?.scope ?? "") &&
+      (left.region?.code ?? "") === (right.region?.code ?? ""),
   );
 }
 
@@ -729,16 +869,61 @@ function normalizedText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function inlineCitationPattern() {
+function normalizeMonitorRequestSnapshot(
+  checkpointValue: unknown,
+): MonitorRunRequestSnapshot | undefined {
+  if (!isRecord(checkpointValue) || !isRecord(checkpointValue.request)) {
+    return undefined;
+  }
+  const value = checkpointValue.request;
+  const consumerTaskId = normalizedText(value.consumerTaskId);
+  const screenshot = value.screenshot;
+  if (
+    !/^[A-Za-z0-9]{8,64}$/.test(consumerTaskId) ||
+    (screenshot !== 0 && screenshot !== 1)
+  ) {
+    return undefined;
+  }
+  const monitorKeyword = normalizedText(value.monitorKeyword).slice(0, 2_000);
+  const rawRegion = isRecord(value.region) ? value.region : null;
+  const scope = rawRegion?.scope;
+  const code = normalizedText(rawRegion?.code);
+  const label = sanitizeMonitorPublicText(
+    normalizedText(rawRegion?.label),
+  ).slice(0, 100);
+  const region: PublicMonitorRegion | undefined =
+    (scope === "domestic" || scope === "overseas") &&
+    code.length >= 1 &&
+    code.length <= 64 &&
+    label
+      ? { scope, code, label }
+      : undefined;
+  return {
+    consumerTaskId,
+    screenshot,
+    ...(monitorKeyword ? { monitorKeyword } : {}),
+    ...(region ? { region } : {}),
+  };
+}
+
+function providerInlineCitationPattern() {
   return /\uE3A0cite\uE3A3web_search:[0-9]+#([0-9]{1,9})\uE3A8/gi;
+}
+
+function bracketInlineCitationPattern() {
+  return /\[citation:([0-9]{1,9})\]/gi;
+}
+
+function anyInlineCitationPattern() {
+  return /\uE3A0cite\uE3A3web_search:[0-9]+#([0-9]{1,9})\uE3A8|\[citation:([0-9]{1,9})\]/gi;
 }
 
 function inlineCitationIndexes(value: unknown): number[] {
   if (typeof value !== "string") return [];
   const indexes: number[] = [];
   const seen = new Set<number>();
-  for (const match of value.matchAll(inlineCitationPattern())) {
-    const index = Number.parseInt(match[1], 10);
+  for (const match of value.matchAll(anyInlineCitationPattern())) {
+    const index = Number.parseInt(match[1] ?? match[2], 10);
     if (!Number.isSafeInteger(index) || index < 0 || seen.has(index)) continue;
     seen.add(index);
     indexes.push(index);
@@ -1096,7 +1281,9 @@ function sanitizeEvidence(value: unknown, maxItems: number): MonitorEvidence[] {
     } else if (isRecord(entry)) {
       const object: Exclude<MonitorEvidence, string> = {};
       const index = nonnegativeInteger(entry.index);
-      if (index !== null) object.index = index;
+      if (index !== null && index <= MAX_MONITOR_SOURCE_INDEX) {
+        object.index = index;
+      }
       const title = normalizedText(entry.title ?? entry.name ?? entry.label);
       const source = normalizedText(
         entry.source ?? entry.site ?? entry.siteName ?? entry.publisher,
@@ -1107,15 +1294,23 @@ function sanitizeEvidence(value: unknown, maxItems: number): MonitorEvidence[] {
       const summary = normalizedText(
         entry.summary ?? entry.snippet ?? entry.description,
       );
+      const publishTime = normalizedText(
+        entry.publishTime ?? entry.publishedAt ?? entry.publish_time,
+      );
       const rawUrl = normalizedText(entry.url ?? entry.href ?? entry.link);
       if (title)
         object.title = sanitizeMonitorPublicText(title).slice(0, 1_000);
       if (source)
-        object.source = sanitizeMonitorPublicText(source).slice(0, 1_000);
+        object.site = sanitizeMonitorPublicText(source).slice(0, 1_000);
       if (domain)
         object.domain = sanitizeMonitorPublicText(domain).slice(0, 255);
       if (summary)
         object.summary = sanitizeMonitorPublicText(summary).slice(0, 2_000);
+      if (publishTime)
+        object.publishTime = sanitizeMonitorPublicText(publishTime).slice(
+          0,
+          MAX_MONITOR_PUBLISH_TIME_CHARACTERS,
+        );
       if (rawUrl) {
         const url = normalizeMonitorSourceUrl(rawUrl);
         if (!url) continue;
@@ -1123,9 +1318,10 @@ function sanitizeEvidence(value: unknown, maxItems: number): MonitorEvidence[] {
       }
       if (
         object.title ||
-        object.source ||
+        object.site ||
         object.domain ||
         object.summary ||
+        object.publishTime ||
         object.url
       ) {
         cleaned = object;
@@ -1139,6 +1335,61 @@ function sanitizeEvidence(value: unknown, maxItems: number): MonitorEvidence[] {
     if (result.length >= maxItems) break;
   }
   return result;
+}
+
+function sanitizeMonitorStringList(value: unknown, maxItems: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value.slice(0, maxItems)) {
+    const text = sanitizeMonitorPublicText(normalizedText(item)).slice(
+      0,
+      MAX_MONITOR_LIST_ITEM_CHARACTERS,
+    );
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    result.push(text);
+  }
+  return result;
+}
+
+function sanitizeMonitorSentiment(
+  value: unknown,
+): "positive" | "negative" | "neutral" | null | undefined {
+  if (value === null) return null;
+  const text = normalizedText(value).toLowerCase();
+  return text === "positive" || text === "negative" || text === "neutral"
+    ? text
+    : undefined;
+}
+
+function sanitizeCategoryRanking(
+  value: unknown,
+): { categoryName: string; rank: number } | null | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const categoryName = sanitizeMonitorPublicText(
+    normalizedText(value.categoryName),
+  ).slice(0, 500);
+  const rank = positiveInteger(value.rank);
+  return categoryName && rank !== null && rank <= MAX_MONITOR_RANK
+    ? { categoryName, rank }
+    : undefined;
+}
+
+function sanitizeKeywordEvaluations(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_KEYWORD_EVALUATIONS).flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const keyword = sanitizeMonitorPublicText(
+      normalizedText(item.keyword),
+    ).slice(0, MAX_MONITOR_EVALUATION_KEYWORD_CHARACTERS);
+    const nature = sanitizeMonitorSentiment(item.nature);
+    const context = sanitizeMonitorPublicText(
+      normalizedText(item.context),
+    ).slice(0, 2_000);
+    return keyword && nature ? [{ keyword, nature, context }] : [];
+  });
 }
 
 /**
@@ -1188,28 +1439,25 @@ function mergeCitationEvidence(
   maxItems = MAX_EVIDENCE_CANDIDATES,
 ): MonitorEvidence[] {
   const result: MonitorEvidence[] = [];
-  const canonicalPositions = new Map<string, number>();
-  const indexes = new Set<number>();
-  const urlPositions = new Map<string, number>();
-  for (const item of [...primary, ...explicitInline]) {
+  const canonicalItems = new Set<string>();
+  const primaryIndexes = new Set(
+    primary.flatMap((item) =>
+      typeof item !== "string" && item.index !== undefined ? [item.index] : [],
+    ),
+  );
+  for (const item of primary) {
     const canonicalKey = canonicalJson(item);
-    const index = typeof item === "string" ? null : (item.index ?? null);
-    const url = typeof item === "string" ? "" : (item.url ?? "");
-    const duplicatePosition =
-      canonicalPositions.get(canonicalKey) ??
-      (url ? urlPositions.get(url) : undefined);
-    if (duplicatePosition !== undefined) {
-      result[duplicatePosition] = mergeMonitorEvidenceItem(
-        result[duplicatePosition],
-        item,
-      );
-      continue;
-    }
-    if (index !== null && indexes.has(index)) continue;
-    const position = result.length;
-    canonicalPositions.set(canonicalKey, position);
-    if (index !== null) indexes.add(index);
-    if (url) urlPositions.set(url, position);
+    if (canonicalItems.has(canonicalKey)) continue;
+    canonicalItems.add(canonicalKey);
+    result.push(item);
+    if (result.length >= maxItems) break;
+  }
+  for (const item of explicitInline) {
+    const index = typeof item === "string" ? undefined : item.index;
+    if (index !== undefined && primaryIndexes.has(index)) continue;
+    const canonicalKey = canonicalJson(item);
+    if (canonicalItems.has(canonicalKey)) continue;
+    canonicalItems.add(canonicalKey);
     result.push(item);
     if (result.length >= maxItems) break;
   }
@@ -1224,7 +1472,7 @@ function monitorEvidenceIdentity(item: MonitorEvidence) {
       : `label:${item.trim().toLocaleLowerCase("en-US")}\u0000`;
   }
   if (item.url) return `url:${item.url}`;
-  const title = (item.title || item.name || item.source || "")
+  const title = (item.title || item.name || item.site || item.source || "")
     .trim()
     .toLocaleLowerCase("en-US");
   const domain = (item.domain || "").trim().toLocaleLowerCase("en-US");
@@ -1268,8 +1516,10 @@ function mergeMonitorEvidenceItem(
     name: preferred.name ?? secondary.name,
     url: preferred.url ?? secondary.url,
     source: preferred.source ?? secondary.source,
+    site: preferred.site ?? secondary.site,
     domain: preferred.domain ?? secondary.domain,
     summary: preferred.summary ?? secondary.summary,
+    publishTime: preferred.publishTime ?? secondary.publishTime,
   };
 }
 
@@ -1295,6 +1545,26 @@ function mergeUnifiedSources(
   return Array.from(byIdentity.values()).slice(0, MAX_SOURCE_ITEMS);
 }
 
+function checkpointItemCitationList(item: MonitorCheckpointItem) {
+  if (Object.prototype.hasOwnProperty.call(item, "citationList")) {
+    return sanitizeEvidence(item.citationList, MAX_CITATION_ITEMS);
+  }
+  if (Object.prototype.hasOwnProperty.call(item, "citations")) {
+    return sanitizeEvidence(item.citations, MAX_CITATION_ITEMS);
+  }
+  return undefined;
+}
+
+function checkpointItemReferenceList(item: MonitorCheckpointItem) {
+  if (Object.prototype.hasOwnProperty.call(item, "referenceList")) {
+    return sanitizeEvidence(item.referenceList, MAX_SOURCE_ITEMS);
+  }
+  if (Object.prototype.hasOwnProperty.call(item, "references")) {
+    return sanitizeEvidence(item.references, MAX_SOURCE_ITEMS);
+  }
+  return undefined;
+}
+
 function checkpointItemSources(item: MonitorCheckpointItem) {
   if (Object.prototype.hasOwnProperty.call(item, "sources")) {
     return mergeUnifiedSources(
@@ -1302,8 +1572,8 @@ function checkpointItemSources(item: MonitorCheckpointItem) {
     );
   }
   return mergeUnifiedSources(
-    sanitizeEvidence(item.citations, MAX_EVIDENCE_CANDIDATES),
-    sanitizeEvidence(item.references, MAX_EVIDENCE_CANDIDATES),
+    checkpointItemCitationList(item),
+    checkpointItemReferenceList(item),
   );
 }
 
@@ -1519,21 +1789,21 @@ export function sanitizeMonitorMedia(
 /** Convert rich provider output into display-safe text. */
 export function sanitizeMonitorAnswerText(
   value: unknown,
-  knownInlineCitationIndexes?: ReadonlySet<number>,
+  _knownInlineCitationIndexes?: ReadonlySet<number>,
 ): string {
   if (typeof value !== "string") return "";
   let text = value.slice(0, MAX_ANSWER_CHARACTERS * 2);
   text = text
-    .replace(inlineCitationPattern(), (_marker, indexText: string) => {
-      const index = Number.parseInt(indexText, 10);
-      if (
-        knownInlineCitationIndexes &&
-        !knownInlineCitationIndexes.has(index)
-      ) {
-        return " ";
-      }
-      return `〔来源 ${index}〕`;
-    })
+    .replace(
+      providerInlineCitationPattern(),
+      (_marker, indexText: string) =>
+        `〔来源 ${Number.parseInt(indexText, 10)}〕`,
+    )
+    .replace(
+      bracketInlineCitationPattern(),
+      (_marker, indexText: string) =>
+        `〔来源 ${Number.parseInt(indexText, 10)}〕`,
+    )
     .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ")
     .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ")
     .replace(
@@ -1611,6 +1881,7 @@ function normalizeResultSnapshot(
     throw new MonitorRemoteError("监控结果接口未返回有效 JSON", true);
   }
   assertResponseOwner(payload, taskId, "监控结果", true);
+  const request = normalizeMonitorRequestSnapshot(run.checkpoint);
   const totalItems = positiveInteger(payload.data.totalItems);
   if (totalItems !== run.expectedItems) {
     throw new PresalesMonitorError(
@@ -1678,37 +1949,41 @@ function normalizeResultSnapshot(
       );
     }
     seen.add(subTaskId);
-    const references = sanitizeEvidence(
-      child.referenceList,
-      MAX_EVIDENCE_CANDIDATES,
+    const hasCitationList = Object.prototype.hasOwnProperty.call(
+      child,
+      "citationList",
     );
-    const inlineCitations = citationsFromInlineMarkers(
-      child.answerContent,
-      child.referenceList,
+    const hasReferenceList = Object.prototype.hasOwnProperty.call(
+      child,
+      "referenceList",
     );
-    const citations = mergeCitationEvidence(
-      sanitizeEvidence(child.citationList, MAX_EVIDENCE_CANDIDATES),
-      inlineCitations,
-    );
+    const references = hasReferenceList
+      ? sanitizeEvidence(child.referenceList, MAX_EVIDENCE_CANDIDATES)
+      : undefined;
+    const citations = hasCitationList
+      ? mergeCitationEvidence(
+          sanitizeEvidence(child.citationList, MAX_EVIDENCE_CANDIDATES),
+          citationsFromInlineMarkers(child.answerContent, child.referenceList),
+        )
+      : undefined;
     const canonicalSources = canonicalMonitorSourceValue(child);
     const sources = canonicalSources.present
       ? mergeUnifiedSources(
           sanitizeEvidence(canonicalSources.value, MAX_EVIDENCE_CANDIDATES),
         )
       : mergeUnifiedSources(citations, references);
-    const knownInlineCitationIndexes = new Set(
-      citations.flatMap((item) =>
-        typeof item !== "string" && item.index !== undefined
-          ? [item.index]
-          : [],
-      ),
-    );
-    const answer = sanitizeMonitorAnswerText(
-      child.answerContent,
-      knownInlineCitationIndexes,
-    );
+    const answer = sanitizeMonitorAnswerText(child.answerContent);
     const media = sanitizeMonitorMedia(child.mediaContent, child.answerContent);
     const error = normalizedText(child.errorMessage) ? "本次回答未成功" : "";
+    const sentiment = Object.prototype.hasOwnProperty.call(child, "sentiment")
+      ? sanitizeMonitorSentiment(child.sentiment)
+      : undefined;
+    const categoryRanking = Object.prototype.hasOwnProperty.call(
+      child,
+      "categoryRanking",
+    )
+      ? sanitizeCategoryRanking(child.categoryRanking)
+      : undefined;
     items.push({
       subTaskId,
       prompt: run.question,
@@ -1721,13 +1996,67 @@ function normalizeResultSnapshot(
       ...(answer ? { answerText: answer } : {}),
       media,
       sources,
+      ...(citations !== undefined
+        ? { citationList: citations.slice(0, MAX_CITATION_ITEMS) }
+        : {}),
+      ...(references !== undefined
+        ? { referenceList: references.slice(0, MAX_SOURCE_ITEMS) }
+        : {}),
+      ...(Array.isArray(child.searchKeywords)
+        ? {
+            searchKeywords: sanitizeMonitorStringList(
+              child.searchKeywords,
+              MAX_SEARCH_KEYWORDS,
+            ),
+          }
+        : {}),
+      ...(Array.isArray(child.recommendedQuestions)
+        ? {
+            recommendedQuestions: sanitizeMonitorStringList(
+              child.recommendedQuestions,
+              MAX_RECOMMENDED_QUESTIONS,
+            ),
+          }
+        : {}),
+      ...(child.mentionPosition === null
+        ? { mentionPosition: null }
+        : positiveInteger(child.mentionPosition) !== null
+          ? { mentionPosition: positiveInteger(child.mentionPosition)! }
+          : {}),
+      ...(normalizedText(child.mentionContext)
+        ? {
+            mentionContext: sanitizeMonitorPublicText(
+              normalizedText(child.mentionContext),
+            ).slice(0, 2_000),
+          }
+        : {}),
+      ...(sentiment !== undefined ? { sentiment } : {}),
+      ...(categoryRanking !== undefined ? { categoryRanking } : {}),
+      ...(Array.isArray(child.keywordEvaluations)
+        ? {
+            keywordEvaluations: sanitizeKeywordEvaluations(
+              child.keywordEvaluations,
+            ),
+          }
+        : {}),
+      ...(request?.screenshot === 1 &&
+      safeMonitorScreenshotUrl(child.pageScreenshot)
+        ? { pageScreenshot: safeMonitorScreenshotUrl(child.pageScreenshot)! }
+        : {}),
       ...(error ? { error } : {}),
       ...(normalizeTimestamp(child.time)
         ? { completedAt: normalizeTimestamp(child.time) }
         : {}),
     });
   }
-  return { checkpoint: { items }, remoteStatus, totalItems };
+  return {
+    checkpoint: {
+      ...(request ? { request } : {}),
+      items,
+    },
+    remoteStatus,
+    totalItems,
+  };
 }
 
 function mergeCheckpoints(
@@ -1744,6 +2073,10 @@ function mergeCheckpoints(
     }
     const priorFinal = CHILD_FINAL_STATUSES.has(prior.status);
     const nextFinal = CHILD_FINAL_STATUSES.has(next.status);
+    const priorCitations = checkpointItemCitationList(prior);
+    const nextCitations = checkpointItemCitationList(next);
+    const priorReferences = checkpointItemReferenceList(prior);
+    const nextReferences = checkpointItemReferenceList(next);
     byId.set(next.subTaskId, {
       ...prior,
       status: priorFinal ? prior.status : next.status || prior.status,
@@ -1756,12 +2089,86 @@ function mergeCheckpoints(
         checkpointItemSources(prior),
         checkpointItemSources(next),
       ),
+      ...(nextCitations !== undefined
+        ? {
+            citationList: sanitizeEvidence(nextCitations, MAX_CITATION_ITEMS),
+          }
+        : priorCitations !== undefined
+          ? { citationList: priorCitations }
+          : {}),
+      ...(nextReferences !== undefined
+        ? {
+            referenceList: sanitizeEvidence(nextReferences, MAX_SOURCE_ITEMS),
+          }
+        : priorReferences !== undefined
+          ? { referenceList: priorReferences }
+          : {}),
+      ...(Object.prototype.hasOwnProperty.call(next, "searchKeywords")
+        ? {
+            searchKeywords: sanitizeMonitorStringList(
+              next.searchKeywords,
+              MAX_SEARCH_KEYWORDS,
+            ),
+          }
+        : Object.prototype.hasOwnProperty.call(prior, "searchKeywords")
+          ? {
+              searchKeywords: sanitizeMonitorStringList(
+                prior.searchKeywords,
+                MAX_SEARCH_KEYWORDS,
+              ),
+            }
+          : {}),
+      ...(Object.prototype.hasOwnProperty.call(next, "recommendedQuestions")
+        ? {
+            recommendedQuestions: sanitizeMonitorStringList(
+              next.recommendedQuestions,
+              MAX_RECOMMENDED_QUESTIONS,
+            ),
+          }
+        : Object.prototype.hasOwnProperty.call(prior, "recommendedQuestions")
+          ? {
+              recommendedQuestions: sanitizeMonitorStringList(
+                prior.recommendedQuestions,
+                MAX_RECOMMENDED_QUESTIONS,
+              ),
+            }
+          : {}),
+      ...(Object.prototype.hasOwnProperty.call(next, "mentionPosition")
+        ? { mentionPosition: next.mentionPosition }
+        : Object.prototype.hasOwnProperty.call(prior, "mentionPosition")
+          ? { mentionPosition: prior.mentionPosition }
+          : {}),
+      ...(next.mentionContext || prior.mentionContext
+        ? { mentionContext: next.mentionContext ?? prior.mentionContext }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(next, "sentiment")
+        ? { sentiment: next.sentiment }
+        : Object.prototype.hasOwnProperty.call(prior, "sentiment")
+          ? { sentiment: prior.sentiment }
+          : {}),
+      ...(Object.prototype.hasOwnProperty.call(next, "categoryRanking")
+        ? { categoryRanking: next.categoryRanking }
+        : Object.prototype.hasOwnProperty.call(prior, "categoryRanking")
+          ? { categoryRanking: prior.categoryRanking }
+          : {}),
+      ...(Object.prototype.hasOwnProperty.call(next, "keywordEvaluations")
+        ? { keywordEvaluations: next.keywordEvaluations }
+        : Object.prototype.hasOwnProperty.call(prior, "keywordEvaluations")
+          ? { keywordEvaluations: prior.keywordEvaluations }
+          : {}),
+      ...(next.pageScreenshot || prior.pageScreenshot
+        ? { pageScreenshot: next.pageScreenshot ?? prior.pageScreenshot }
+        : {}),
       error:
         priorFinal && nextFinal ? prior.error : (next.error ?? prior.error),
       completedAt: next.completedAt ?? prior.completedAt,
     });
   }
-  return { items: [...byId.values()] };
+  const request = existing.request ?? incoming.request;
+  return {
+    ...(request ? { request } : {}),
+    items: [...byId.values()],
+  };
 }
 
 function mergeMedia(
@@ -1782,7 +2189,9 @@ function mergeMedia(
 
 function monitorCheckpoint(value: unknown): MonitorCheckpoint {
   if (!isRecord(value) || !Array.isArray(value.items)) return { items: [] };
+  const request = normalizeMonitorRequestSnapshot(value);
   return {
+    ...(request ? { request } : {}),
     items: value.items.filter(isRecord) as unknown as MonitorCheckpointItem[],
   };
 }
@@ -1843,6 +2252,81 @@ function publicRecordId(runId: string, subTaskId: string) {
   return `mr_${sha256(`${runId}:${subTaskId}`).slice(0, 24)}`;
 }
 
+function publicMonitorRecordFromItem(
+  run: PresalesMonitorRun,
+  scope: MonitorScope,
+  item: MonitorCheckpointItem,
+  request?: MonitorRunRequestSnapshot,
+): PublicMonitorRecord {
+  const recordId = publicRecordId(run.id, item.subTaskId);
+  const citationList = checkpointItemCitationList(item);
+  const referenceList = checkpointItemReferenceList(item);
+  const screenshotAvailable = Boolean(
+    request?.screenshot === 1 && safeMonitorScreenshotUrl(item.pageScreenshot),
+  );
+  return {
+    recordId,
+    platform: scope.platform,
+    runIndex: scope.runIndex,
+    status: normalizedText(item.status),
+    ...(normalizedText(item.answerText)
+      ? { answerText: normalizedText(item.answerText) }
+      : {}),
+    media: sanitizeMonitorMedia(item.media),
+    sources: checkpointItemSources(item),
+    ...(citationList ? { citationList } : {}),
+    ...(referenceList ? { referenceList } : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "searchKeywords")
+      ? {
+          searchKeywords: sanitizeMonitorStringList(
+            item.searchKeywords,
+            MAX_SEARCH_KEYWORDS,
+          ),
+        }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "recommendedQuestions")
+      ? {
+          recommendedQuestions: sanitizeMonitorStringList(
+            item.recommendedQuestions,
+            MAX_RECOMMENDED_QUESTIONS,
+          ),
+        }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "mentionPosition")
+      ? { mentionPosition: item.mentionPosition }
+      : {}),
+    ...(normalizedText(item.mentionContext)
+      ? { mentionContext: normalizedText(item.mentionContext) }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "sentiment")
+      ? { sentiment: item.sentiment }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "categoryRanking")
+      ? { categoryRanking: item.categoryRanking }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(item, "keywordEvaluations")
+      ? {
+          keywordEvaluations: sanitizeKeywordEvaluations(
+            item.keywordEvaluations,
+          ),
+        }
+      : {}),
+    ...(request?.screenshot === 1
+      ? {
+          screenshot: {
+            available: screenshotAvailable,
+          },
+        }
+      : {}),
+    ...(normalizedText(item.error)
+      ? { error: normalizedText(item.error) }
+      : {}),
+    ...(normalizedText(item.completedAt)
+      ? { completedAt: normalizedText(item.completedAt) }
+      : {}),
+  };
+}
+
 function buildFinalResult(
   run: PresalesMonitorRun,
   checkpoint: MonitorCheckpoint,
@@ -1850,22 +2334,13 @@ function buildFinalResult(
 ) {
   const scopes = jsonScopeMap(run.subtaskScopes);
   const byId = new Map(checkpoint.items.map((item) => [item.subTaskId, item]));
+  const request = checkpoint.request;
   const records: PublicMonitorRecord[] = [];
   for (const subTaskId of jsonStringArray(run.initialSubtaskIds)) {
     const scope = scopes[subTaskId];
     const item = byId.get(subTaskId);
     if (!scope || !item) continue;
-    records.push({
-      recordId: publicRecordId(run.id, subTaskId),
-      platform: scope.platform,
-      runIndex: scope.runIndex,
-      status: item.status,
-      ...(item.answerText ? { answerText: item.answerText } : {}),
-      media: item.media ?? [],
-      sources: checkpointItemSources(item),
-      ...(item.error ? { error: item.error } : {}),
-      ...(item.completedAt ? { completedAt: item.completedAt } : {}),
-    });
+    records.push(publicMonitorRecordFromItem(run, scope, item, request));
   }
   records.sort(
     (a, b) =>
@@ -1888,6 +2363,7 @@ function buildCheckpointResult(
   return buildFinalResult(
     run,
     {
+      ...(checkpoint.request ? { request: checkpoint.request } : {}),
       items: checkpoint.items.filter((item) => {
         if (!CHILD_FINAL_STATUSES.has(item.status)) return false;
         if (item.status !== "completed") return true;
@@ -1901,9 +2377,9 @@ function buildCheckpointResult(
 function checkpointSignature(checkpoint: MonitorCheckpoint) {
   return sha256(
     canonicalJson(
-      [...checkpoint.items].sort((a, b) =>
-        a.subTaskId.localeCompare(b.subTaskId),
-      ),
+      [...checkpoint.items]
+        .sort((a, b) => a.subTaskId.localeCompare(b.subTaskId))
+        .map(({ pageScreenshot: _volatileScreenshot, ...item }) => item),
     ),
   );
 }
@@ -1916,10 +2392,18 @@ function publicMonitorRun(
     .map(toPublicMonitorPlatform)
     .filter((item): item is MonitorPlatform => item !== null)
     .filter((item, index, items) => items.indexOf(item) === index);
+  const checkpoint = monitorCheckpoint(run.checkpoint);
+  const request = checkpoint.request;
+  const checkpointByRecordId = new Map(
+    checkpoint.items.map((item) => [
+      publicRecordId(run.id, item.subTaskId),
+      item,
+    ]),
+  );
   const final = isRecord(run.finalResult) ? run.finalResult : null;
   const checkpointResult =
     includeResult && !final && POLLABLE_LOCAL_STATUSES.has(run.status)
-      ? buildCheckpointResult(run, monitorCheckpoint(run.checkpoint))
+      ? buildCheckpointResult(run, checkpoint)
       : null;
   const result =
     includeResult && final && Array.isArray(final.records)
@@ -1930,20 +2414,86 @@ function publicMonitorRun(
         if (!isRecord(record)) return [];
         const platform = toPublicMonitorPlatform(record.platform);
         if (!platform) return [];
-        const legacyRecord = record as unknown as MonitorCheckpointItem;
+        const storedRecordId = normalizedText(record.recordId);
+        const sourceRecord =
+          checkpointByRecordId.get(storedRecordId) ??
+          (record as unknown as MonitorCheckpointItem);
+        const citationList = checkpointItemCitationList(sourceRecord);
+        const referenceList = checkpointItemReferenceList(sourceRecord);
+        const screenshotAvailable = Boolean(
+          request?.screenshot === 1 &&
+            safeMonitorScreenshotUrl(sourceRecord.pageScreenshot),
+        );
         return [
           {
-            recordId: normalizedText(record.recordId),
+            recordId: storedRecordId,
             platform,
             runIndex: positiveInteger(record.runIndex) || 1,
             status: normalizedText(record.status),
             ...(normalizedText(record.answerText)
               ? { answerText: normalizedText(record.answerText) }
               : {}),
-            media: Array.isArray(record.media)
-              ? (record.media as MonitorMedia[])
-              : [],
-            sources: checkpointItemSources(legacyRecord),
+            media: sanitizeMonitorMedia(record.media),
+            sources: checkpointItemSources(sourceRecord),
+            ...(citationList ? { citationList } : {}),
+            ...(referenceList ? { referenceList } : {}),
+            ...(Object.prototype.hasOwnProperty.call(
+              sourceRecord,
+              "searchKeywords",
+            )
+              ? {
+                  searchKeywords: sanitizeMonitorStringList(
+                    sourceRecord.searchKeywords,
+                    MAX_SEARCH_KEYWORDS,
+                  ),
+                }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(
+              sourceRecord,
+              "recommendedQuestions",
+            )
+              ? {
+                  recommendedQuestions: sanitizeMonitorStringList(
+                    sourceRecord.recommendedQuestions,
+                    MAX_RECOMMENDED_QUESTIONS,
+                  ),
+                }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(
+              sourceRecord,
+              "mentionPosition",
+            )
+              ? { mentionPosition: sourceRecord.mentionPosition }
+              : {}),
+            ...(normalizedText(sourceRecord.mentionContext)
+              ? { mentionContext: normalizedText(sourceRecord.mentionContext) }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(sourceRecord, "sentiment")
+              ? { sentiment: sourceRecord.sentiment }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(
+              sourceRecord,
+              "categoryRanking",
+            )
+              ? { categoryRanking: sourceRecord.categoryRanking }
+              : {}),
+            ...(Object.prototype.hasOwnProperty.call(
+              sourceRecord,
+              "keywordEvaluations",
+            )
+              ? {
+                  keywordEvaluations: sanitizeKeywordEvaluations(
+                    sourceRecord.keywordEvaluations,
+                  ),
+                }
+              : {}),
+            ...(request?.screenshot === 1
+              ? {
+                  screenshot: {
+                    available: screenshotAvailable,
+                  },
+                }
+              : {}),
             ...(normalizedText(record.error)
               ? { error: normalizedText(record.error) }
               : {}),
@@ -1964,6 +2514,11 @@ function publicMonitorRun(
     expectedItems: run.expectedItems,
     completedItems: run.completedItems,
     failedItems: run.failedItems,
+    ...(request?.monitorKeyword
+      ? { monitorKeyword: request.monitorKeyword }
+      : {}),
+    ...(request ? { screenshot: request.screenshot } : {}),
+    ...(request?.region ? { region: request.region } : {}),
     ...(run.submittedAt ? { submittedAt: run.submittedAt.toISOString() } : {}),
     ...(run.nextPollAt ? { nextPollAt: run.nextPollAt.toISOString() } : {}),
     ...(result ? { complete: result.complete === true } : {}),
@@ -2171,6 +2726,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       question: input.question,
       platforms: [...input.platforms],
       expectedItems: input.expectedItems,
+      checkpoint: input.checkpoint,
       status: "submission_in_progress",
       completedItems: 0,
       failedItems: 0,
@@ -2258,6 +2814,28 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       const credentialChanged =
         row.apiCredentialId !== input.credential.id ||
         row.credentialVersion !== input.credential.version;
+      const existingRequest = normalizeMonitorRequestSnapshot(row.checkpoint);
+      const incomingRequest = input.checkpoint.request;
+      if (
+        !credentialChanged &&
+        row.status === "submission_unknown" &&
+        !row.upstreamTaskId &&
+        sameMonitorRequestSnapshot(existingRequest, incomingRequest)
+      ) {
+        const retryPatch: Partial<InsertPresalesMonitorRun> = {
+          status: "submission_in_progress",
+          lastError: null,
+          updatedAt: input.now,
+        };
+        await tx
+          .update(presalesMonitorRuns)
+          .set(retryPatch)
+          .where(eq(presalesMonitorRuns.id, row.id));
+        return {
+          state: "acquired" as const,
+          run: { ...row, ...retryPatch } as PresalesMonitorRun,
+        };
+      }
       if (
         credentialChanged &&
         row.status === "remote_failed" &&
@@ -2266,6 +2844,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
         const retryPatch: Partial<InsertPresalesMonitorRun> = {
           apiCredentialId: input.credential.id,
           credentialVersion: input.credential.version,
+          checkpoint: input.checkpoint,
           status: "submission_in_progress",
           lastError: null,
           completedAt: null,
@@ -2422,6 +3001,28 @@ export class DrizzleMonitorRepository implements MonitorRepository {
     const credentialChanged =
       row.apiCredentialId !== input.credential.id ||
       row.credentialVersion !== input.credential.version;
+    const existingRequest = normalizeMonitorRequestSnapshot(row.checkpoint);
+    const incomingRequest = input.checkpoint.request;
+    if (
+      !credentialChanged &&
+      row.status === "submission_unknown" &&
+      !row.upstreamTaskId &&
+      sameMonitorRequestSnapshot(existingRequest, incomingRequest)
+    ) {
+      const retryPatch: Partial<InsertPresalesMonitorRun> = {
+        status: "submission_in_progress",
+        lastError: null,
+        updatedAt: input.now,
+      };
+      await tx
+        .update(presalesMonitorRuns)
+        .set(retryPatch)
+        .where(eq(presalesMonitorRuns.id, row.id));
+      return {
+        state: "acquired",
+        run: { ...row, ...retryPatch } as PresalesMonitorRun,
+      };
+    }
     if (
       credentialChanged &&
       row.status === "remote_failed" &&
@@ -2436,6 +3037,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       const retryPatch: Partial<InsertPresalesMonitorRun> = {
         apiCredentialId: input.credential.id,
         credentialVersion: input.credential.version,
+        checkpoint: input.checkpoint,
         status: "submission_in_progress",
         lastError: null,
         completedAt: null,
@@ -2803,10 +3405,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
   }
 }
 
-export function monitorBaseUrl(env: NodeJS.ProcessEnv = process.env) {
-  const raw =
-    env.FRONTMIND_MONITOR_API_BASE_URL?.trim() ||
-    Buffer.from(DEFAULT_MONITOR_BASE_URL_B64, "base64").toString("utf8");
+function validatedMonitorBaseUrl(raw: string, label: string) {
   let parsed: URL;
   try {
     parsed = new URL(raw);
@@ -2814,7 +3413,7 @@ export function monitorBaseUrl(env: NodeJS.ProcessEnv = process.env) {
     throw new PresalesMonitorError(
       "MONITOR_NOT_CONFIGURED",
       503,
-      "监控 API 地址无效",
+      `${label}地址无效`,
     );
   }
   const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
@@ -2830,10 +3429,30 @@ export function monitorBaseUrl(env: NodeJS.ProcessEnv = process.env) {
     throw new PresalesMonitorError(
       "MONITOR_NOT_CONFIGURED",
       503,
-      "监控 API 地址必须使用安全协议且不能包含凭据、查询或片段",
+      `${label}地址必须使用安全协议且不能包含凭据、查询或片段`,
     );
   }
   return parsed.toString().replace(/\/+$/, "");
+}
+
+export function monitorBaseUrl(env: NodeJS.ProcessEnv = process.env) {
+  const raw =
+    env.FRONTMIND_MONITOR_API_BASE_URL?.trim() ||
+    Buffer.from(DEFAULT_MONITOR_BASE_URL_B64, "base64").toString("utf8");
+  return validatedMonitorBaseUrl(raw, "监控 API ");
+}
+
+export function buildMonitorRegionCatalogUrl(
+  scope: MonitorRegionScope,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const base = new URL(monitorBaseUrl(env));
+  base.pathname = base.pathname.replace(/\/+$/, "").replace(/\/[^/]*$/, "/");
+  const path =
+    scope === "domestic"
+      ? "eip-edge/ports/city-info"
+      : "eip-edge/regions/overseas";
+  return new URL(path, base).toString();
 }
 
 export function buildMonitorRequestUrl(
@@ -2849,6 +3468,232 @@ export function buildMonitorRequestUrl(
     );
   }
   return new URL(normalizedPath, `${monitorBaseUrl(env)}/`).toString();
+}
+
+export type MonitorRegionCatalogRequester = (input: {
+  url: string;
+  timeoutMs: number;
+  maxContentLength: number;
+}) => Promise<{ status: number; data: unknown }>;
+
+const requestMonitorRegionCatalog: MonitorRegionCatalogRequester = async (
+  input,
+) => {
+  const response = await axios.request({
+    method: "GET",
+    url: input.url,
+    headers: { Accept: "application/json" },
+    timeout: input.timeoutMs,
+    maxRedirects: 0,
+    maxContentLength: input.maxContentLength,
+    validateStatus: () => true,
+  });
+  return { status: response.status, data: response.data };
+};
+
+function normalizeMonitorRegionCatalog(
+  scope: MonitorRegionScope,
+  payload: unknown,
+): PublicMonitorRegion[] {
+  if (
+    !isRecord(payload) ||
+    payload.success !== true ||
+    !Array.isArray(payload.data) ||
+    payload.data.length > 1_000
+  ) {
+    throw new PresalesMonitorError(
+      "REGION_CATALOG_UNAVAILABLE",
+      503,
+      "监控地区列表暂时不可用",
+    );
+  }
+  const result: PublicMonitorRegion[] = [];
+  const seen = new Set<string>();
+  for (const raw of payload.data) {
+    if (!isRecord(raw) || !Array.isArray(raw.regionCode)) continue;
+    const label = normalizedText(
+      scope === "domestic" ? raw.province : raw.name,
+    );
+    if (!label || label.length > 100 || raw.regionCode.length > 20) continue;
+    for (const value of raw.regionCode) {
+      const code = normalizedText(value);
+      if (!code || code.length > 64) continue;
+      const key = `${scope}:${code}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({
+        scope,
+        code,
+        label: sanitizeMonitorPublicText(label).slice(0, 100),
+      });
+    }
+  }
+  if (result.length === 0) {
+    throw new PresalesMonitorError(
+      "REGION_CATALOG_UNAVAILABLE",
+      503,
+      "监控地区列表暂时不可用",
+    );
+  }
+  return result;
+}
+
+export class AxiosMonitorRegionCatalog implements MonitorRegionCatalog {
+  constructor(
+    private readonly request: MonitorRegionCatalogRequester = requestMonitorRegionCatalog,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+  ) {}
+
+  async list(scope: MonitorRegionScope) {
+    let response: { status: number; data: unknown };
+    try {
+      response = await this.request({
+        url: buildMonitorRegionCatalogUrl(scope, this.env),
+        timeoutMs: MONITOR_CATALOG_HTTP_TIMEOUT_MS,
+        maxContentLength: MAX_REGION_CATALOG_BYTES,
+      });
+    } catch {
+      throw new PresalesMonitorError(
+        "REGION_CATALOG_UNAVAILABLE",
+        503,
+        "监控地区列表暂时不可用",
+      );
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw new PresalesMonitorError(
+        "REGION_CATALOG_UNAVAILABLE",
+        503,
+        "监控地区列表暂时不可用",
+      );
+    }
+    return normalizeMonitorRegionCatalog(scope, response.data);
+  }
+}
+
+function safeMonitorScreenshotUrl(value: unknown) {
+  const text = normalizedText(value);
+  if (!text || text.length > 4_096) return undefined;
+  try {
+    const url = new URL(text);
+    const allowedHost = Buffer.from(
+      MONITOR_SCREENSHOT_HOST_B64,
+      "base64",
+    ).toString("utf8");
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== allowedHost ||
+      url.username ||
+      url.password
+    ) {
+      return undefined;
+    }
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+export type MonitorScreenshotRequester = (input: {
+  url: string;
+  timeoutMs: number;
+  maxContentLength: number;
+}) => Promise<{
+  status: number;
+  data: unknown;
+  headers?: Record<string, unknown>;
+}>;
+
+const requestMonitorScreenshot: MonitorScreenshotRequester = async (input) => {
+  const response = await axios.request({
+    method: "GET",
+    url: input.url,
+    headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif" },
+    responseType: "arraybuffer",
+    timeout: input.timeoutMs,
+    maxRedirects: 0,
+    maxContentLength: input.maxContentLength,
+    validateStatus: () => true,
+  });
+  return {
+    status: response.status,
+    data: response.data,
+    headers: response.headers as Record<string, unknown>,
+  };
+};
+
+export class AxiosMonitorScreenshotTransport
+  implements MonitorScreenshotTransport
+{
+  constructor(
+    private readonly request: MonitorScreenshotRequester = requestMonitorScreenshot,
+  ) {}
+
+  async fetch(rawUrl: string): Promise<MonitorScreenshotResponse> {
+    const url = safeMonitorScreenshotUrl(rawUrl);
+    if (!url) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    let response: Awaited<ReturnType<MonitorScreenshotRequester>>;
+    try {
+      response = await this.request({
+        url,
+        timeoutMs: MONITOR_SCREENSHOT_HTTP_TIMEOUT_MS,
+        maxContentLength: MAX_SCREENSHOT_BYTES,
+      });
+    } catch {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_UPSTREAM_UNAVAILABLE",
+        502,
+        "监控截图暂时无法读取",
+      );
+    }
+    if (response.status === 404 || response.status === 410) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    if (response.status < 200 || response.status >= 300) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_UPSTREAM_UNAVAILABLE",
+        502,
+        "监控截图暂时无法读取",
+      );
+    }
+    const contentType = normalizedText(response.headers?.["content-type"])
+      .split(";", 1)[0]
+      .toLowerCase();
+    if (
+      !["image/gif", "image/jpeg", "image/png", "image/webp"].includes(
+        contentType,
+      )
+    ) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    const data = Buffer.isBuffer(response.data)
+      ? response.data
+      : Buffer.from(response.data as ArrayBuffer);
+    if (data.length === 0 || data.length > MAX_SCREENSHOT_BYTES) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    return {
+      contentType: contentType as MonitorScreenshotResponse["contentType"],
+      data,
+    };
+  }
 }
 
 export class AxiosMonitorTransport implements MonitorTransport {
@@ -3144,6 +3989,8 @@ export class PresalesMonitorService {
       id: string,
     ) => Promise<DecryptedPresalesCredential | null> = getMonitorCredentialById,
     private readonly now: () => Date = () => new Date(),
+    private readonly regionCatalog: MonitorRegionCatalog = new AxiosMonitorRegionCatalog(),
+    private readonly screenshotTransport: MonitorScreenshotTransport = new AxiosMonitorScreenshotTransport(),
   ) {}
 
   async create(rawInput: unknown) {
@@ -3196,6 +4043,10 @@ export class PresalesMonitorService {
     return this.repository.getWorkspaceQuota(input);
   }
 
+  async regions(scope: MonitorRegionScope) {
+    return this.regionCatalog.list(scope);
+  }
+
   async latestForWorkspace(userId: number) {
     const projectId = workspaceMonitorProjectId(userId);
     const run = await this.repository.getLatestByProject(projectId);
@@ -3227,6 +4078,23 @@ export class PresalesMonitorService {
       workspaceQuota: WorkspaceMonitorQuotaWindow;
     },
   ) {
+    const platforms = [...input.platforms];
+    const expectedItems = platforms.length * MONITOR_REPEAT_PER_PLATFORM;
+    const idempotencyKeyHash = sha256(input.idempotencyKey);
+    const consumerTaskId = monitorConsumerTaskId(idempotencyKeyHash);
+    const screenshot = input.screenshot ?? 0;
+    let region: MonitorRequestRegion | undefined;
+    if (input.region) {
+      const regions = await this.regionCatalog.list(input.region.scope);
+      region = regions.find((item) => item.code === input.region!.code);
+      if (!region) {
+        throw new PresalesMonitorError(
+          "REGION_UNAVAILABLE",
+          422,
+          "所选监控地区已不可用，请刷新地区列表后重试",
+        );
+      }
+    }
     const credential = await this.activeCredential();
     if (!credential) {
       throw new PresalesMonitorError(
@@ -3235,24 +4103,40 @@ export class PresalesMonitorService {
         "FrontMind 监控服务暂未启用，请联系技术人员",
       );
     }
-    const platforms = [...input.platforms];
-    const expectedItems = platforms.length * MONITOR_REPEAT_PER_PLATFORM;
+    const checkpoint = initialMonitorCheckpoint({
+      consumerTaskId,
+      monitorKeyword: input.monitorKeyword,
+      screenshot,
+      region,
+    });
     const reservation = await this.repository.reserve({
       projectId: input.projectId,
-      idempotencyKeyHash: sha256(input.idempotencyKey),
+      idempotencyKeyHash,
       requestHash: requestHash({
         projectId: input.projectId,
         question: input.question,
         platforms,
+        monitorKeyword: input.monitorKeyword,
+        screenshot,
+        region,
       }),
       compatibleRequestHashes:
         input.projectId && !workspaceContext
-          ? [requestHash({ question: input.question, platforms })]
+          ? [
+              requestHash({
+                question: input.question,
+                platforms,
+                monitorKeyword: input.monitorKeyword,
+                screenshot,
+                region,
+              }),
+            ]
           : [],
       credential,
       question: input.question,
       platforms,
       expectedItems,
+      checkpoint,
       now: workspaceContext?.reservationAt ?? this.now(),
       workspaceQuota: workspaceContext?.workspaceQuota,
     });
@@ -3273,6 +4157,10 @@ export class PresalesMonitorService {
     const payload = buildMonitorSubmitPayload({
       question: input.question,
       platforms,
+      consumerTaskId,
+      monitorKeyword: input.monitorKeyword,
+      screenshot,
+      region,
     });
     let validated: ReturnType<typeof validateMonitorSubmitResponse>;
     try {
@@ -3307,7 +4195,7 @@ export class PresalesMonitorService {
       throw new PresalesMonitorError(
         "MONITOR_SUBMISSION_UNKNOWN",
         502,
-        "监控任务可能已提交，但无法确认任务 ID；为避免重复计费，系统不会自动重发",
+        "监控任务可能已提交，但无法确认任务 ID；请使用相同幂等键安全重试",
       );
     }
 
@@ -3377,6 +4265,37 @@ export class PresalesMonitorService {
   async result(runId: string) {
     const run = await this.refreshIfDue(await this.requireRun(runId));
     return publicMonitorRun(run, true);
+  }
+
+  async screenshot(runId: string, recordId: string) {
+    if (!/^mr_[a-f0-9]{24}$/.test(recordId)) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    const run = await this.requireRun(runId);
+    const checkpoint = monitorCheckpoint(run.checkpoint);
+    if (checkpoint.request?.screenshot !== 1) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    const item = checkpoint.items.find(
+      (candidate) => publicRecordId(run.id, candidate.subTaskId) === recordId,
+    );
+    const url = safeMonitorScreenshotUrl(item?.pageScreenshot);
+    if (!url) {
+      throw new PresalesMonitorError(
+        "SCREENSHOT_NOT_AVAILABLE",
+        404,
+        "监控截图不可用",
+      );
+    }
+    return this.screenshotTransport.fetch(url);
   }
 
   async remove(runId: string) {
@@ -3585,6 +4504,29 @@ export function createPresalesMonitorRouter(
   const router = Router();
   const parser = json({ limit: "32kb" });
 
+  router.get("/regions", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const parsedScope = z
+        .enum(["domestic", "overseas"])
+        .safeParse(req.query.scope);
+      if (!parsedScope.success) {
+        throw new PresalesMonitorError(
+          "INVALID_REQUEST",
+          400,
+          "必须指定 domestic 或 overseas 地区范围",
+        );
+      }
+      const regions = await service.regions(parsedScope.data);
+      res.json({
+        scope: parsedScope.data,
+        regions: regions.map(({ code, label }) => ({ code, label })),
+      });
+    } catch (error) {
+      sendMonitorError(res, error);
+    }
+  });
+
   router.post("/", parser, async (req, res) => {
     try {
       const outcome = await service.create(req.body ?? {});
@@ -3613,6 +4555,20 @@ export function createPresalesMonitorRouter(
       const run = await service.result(String(req.params.runId || ""));
       const pending = POLLABLE_LOCAL_STATUSES.has(run.status);
       res.status(pending ? 202 : 200).json({ run });
+    } catch (error) {
+      sendMonitorError(res, error);
+    }
+  });
+
+  router.get("/:runId/records/:recordId/screenshot", async (req, res) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    try {
+      const screenshot = await service.screenshot(
+        String(req.params.runId || ""),
+        String(req.params.recordId || ""),
+      );
+      res.type(screenshot.contentType).status(200).send(screenshot.data);
     } catch (error) {
       sendMonitorError(res, error);
     }

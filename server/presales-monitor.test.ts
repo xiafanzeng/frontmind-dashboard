@@ -16,10 +16,13 @@ import {
 import {
   buildMonitorSubmitPayload,
   buildMonitorRequestUrl,
+  buildMonitorRegionCatalogUrl,
   createPresalesMonitorRouter,
   assertDedicatedMonitorCredentialConfigured,
   assertWorkspaceMonitorQuotaAvailable,
   AxiosMonitorTransport,
+  AxiosMonitorRegionCatalog,
+  AxiosMonitorScreenshotTransport,
   getDedicatedMonitorCredentialReadiness,
   isMonitorDuplicateReservationError,
   isDedicatedMonitorCredentialConfigured,
@@ -39,8 +42,10 @@ import {
   type MonitorCreateInput,
   type MonitorPlatform,
   type MonitorPollLease,
+  type MonitorRegionCatalog,
   type MonitorRepository,
   type MonitorReservation,
+  type MonitorScreenshotTransport,
   type MonitorTransport,
   workspaceMonitorProjectId,
 } from "./presales-monitor";
@@ -194,6 +199,35 @@ class MemoryMonitorRepository implements MonitorRepository {
       const credentialChanged =
         existing.apiCredentialId !== input.credential.id ||
         existing.credentialVersion !== input.credential.version;
+      const existingRequest = (existing.checkpoint as any)?.request;
+      const incomingRequest = input.checkpoint.request;
+      const sameRequestEnvelope = Boolean(
+        existingRequest &&
+          incomingRequest &&
+          existingRequest.consumerTaskId === incomingRequest.consumerTaskId &&
+          existingRequest.screenshot === incomingRequest.screenshot &&
+          (existingRequest.monitorKeyword ?? "") ===
+            (incomingRequest.monitorKeyword ?? "") &&
+          (existingRequest.region?.scope ?? "") ===
+            (incomingRequest.region?.scope ?? "") &&
+          (existingRequest.region?.code ?? "") ===
+            (incomingRequest.region?.code ?? ""),
+      );
+      if (
+        !credentialChanged &&
+        existing.status === "submission_unknown" &&
+        !existing.upstreamTaskId &&
+        sameRequestEnvelope
+      ) {
+        return {
+          state: "acquired",
+          run: this.patch(existing.id, {
+            status: "submission_in_progress",
+            lastError: null,
+            updatedAt: input.now,
+          }),
+        };
+      }
       if (
         credentialChanged &&
         existing.status === "remote_failed" &&
@@ -214,6 +248,7 @@ class MemoryMonitorRepository implements MonitorRepository {
           apiCredentialId: input.credential.id,
           credentialVersion: input.credential.version,
           status: "submission_in_progress",
+          checkpoint: input.checkpoint,
           lastError: null,
           completedAt: null,
           ...(input.workspaceQuota ? { createdAt: input.now } : {}),
@@ -261,7 +296,7 @@ class MemoryMonitorRepository implements MonitorRepository {
       completedItems: 0,
       failedItems: 0,
       totalItems: null,
-      checkpoint: null,
+      checkpoint: input.checkpoint,
       finalResult: null,
       shapeMismatch: false,
       terminalSnapshotHash: null,
@@ -439,6 +474,7 @@ class FakeMonitorTransport implements MonitorTransport {
   resultValues: unknown[];
   submitError: Error | null = null;
   stopError: Error | null = null;
+  submittedPayloads: Array<ReturnType<typeof buildMonitorSubmitPayload>> = [];
 
   constructor(platforms: readonly MonitorPlatform[]) {
     this.submitValue = submitResponse(platforms);
@@ -446,8 +482,9 @@ class FakeMonitorTransport implements MonitorTransport {
     this.resultValues = [resultResponse(platforms)];
   }
 
-  async submit() {
+  async submit(payload: ReturnType<typeof buildMonitorSubmitPayload>) {
     this.submitCalls += 1;
+    this.submittedPayloads.push(payload);
     if (this.submitError) throw this.submitError;
     return this.submitValue;
   }
@@ -473,7 +510,13 @@ class FakeMonitorTransport implements MonitorTransport {
   }
 }
 
-function makeHarness(platforms: MonitorPlatform[] = ["deepseek"]) {
+function makeHarness(
+  platforms: MonitorPlatform[] = ["deepseek"],
+  options: {
+    regionCatalog?: MonitorRegionCatalog;
+    screenshotTransport?: MonitorScreenshotTransport;
+  } = {},
+) {
   const repository = new MemoryMonitorRepository();
   const transport = new FakeMonitorTransport(platforms);
   let clock = new Date("2026-01-01T00:00:00Z");
@@ -483,6 +526,8 @@ function makeHarness(platforms: MonitorPlatform[] = ["deepseek"]) {
     async () => credential,
     async (id) => (id === credential.id ? credential : null),
     () => new Date(clock),
+    options.regionCatalog,
+    options.screenshotTransport,
   );
   return {
     repository,
@@ -565,6 +610,119 @@ describe("presales monitor transport configuration", () => {
     expect(buildMonitorRequestUrl("/task/batch/shared", env)).toBe(
       "https://monitor.frontmind.test/custom/monitor/task/batch/shared",
     );
+    expect(buildMonitorRegionCatalogUrl("domestic", env)).toBe(
+      "https://monitor.frontmind.test/custom/eip-edge/ports/city-info",
+    );
+    expect(buildMonitorRegionCatalogUrl("overseas", env)).toBe(
+      "https://monitor.frontmind.test/custom/eip-edge/regions/overseas",
+    );
+  });
+
+  it("loads a public region catalog without monitor authorization and skips bad entries", async () => {
+    const request = vi.spyOn(axios, "request").mockResolvedValue({
+      status: 200,
+      data: {
+        success: true,
+        data: [
+          { province: "北京市", regionCode: ["110000"] },
+          { province: "多节点", regionCode: ["node-a", "node-b"] },
+          { province: "坏条目", regionCode: [""] },
+          { province: "缺少代码" },
+        ],
+      },
+    });
+    const catalog = new AxiosMonitorRegionCatalog(undefined, {
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor.frontmind.test/api/business/monitor",
+    });
+
+    await expect(catalog.list("domestic")).resolves.toEqual([
+      { scope: "domestic", code: "110000", label: "北京市" },
+      { scope: "domestic", code: "node-a", label: "多节点" },
+      { scope: "domestic", code: "node-b", label: "多节点" },
+    ]);
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "GET",
+        url: "https://monitor.frontmind.test/api/business/eip-edge/ports/city-info",
+        headers: { Accept: "application/json" },
+        maxRedirects: 0,
+      }),
+    );
+    expect(request.mock.calls[0][0].headers).not.toHaveProperty(
+      "Authorization",
+    );
+  });
+
+  it("rejects an empty or malformed region catalog", async () => {
+    const catalog = new AxiosMonitorRegionCatalog(async () => ({
+      status: 200,
+      data: {
+        success: true,
+        data: [{ name: "", regionCode: [""] }, { unexpected: true }],
+      },
+    }));
+
+    await expect(catalog.list("overseas")).rejects.toMatchObject({
+      code: "REGION_CATALOG_UNAVAILABLE",
+      status: 503,
+    });
+  });
+
+  it("downloads only an official HTTPS screenshot with an image MIME", async () => {
+    const request = vi.fn(async (input: { url: string }) => ({
+      status: 200,
+      data: Buffer.from("image-bytes"),
+      headers: { "content-type": "image/png; charset=binary" },
+      requestedUrl: input.url,
+    }));
+    const transport = new AxiosMonitorScreenshotTransport(request);
+    const url =
+      "https://img.molizhishu.com/signed/render?id=answer-1&token=preserved";
+
+    await expect(transport.fetch(url)).resolves.toEqual({
+      contentType: "image/png",
+      data: Buffer.from("image-bytes"),
+    });
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({ url, maxContentLength: 8 * 1024 * 1024 }),
+    );
+  });
+
+  it("rejects unsafe, redirected, oversized or non-image screenshots", async () => {
+    const request = vi.fn(async () => ({
+      status: 302,
+      data: Buffer.from("redirect"),
+      headers: { "content-type": "image/png" },
+    }));
+    const transport = new AxiosMonitorScreenshotTransport(request);
+
+    await expect(
+      transport.fetch("https://other.invalid/signed/render?id=1"),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
+    expect(request).not.toHaveBeenCalled();
+
+    await expect(
+      transport.fetch("https://img.molizhishu.com/signed/render?id=1"),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_UPSTREAM_UNAVAILABLE" });
+
+    request.mockResolvedValueOnce({
+      status: 200,
+      data: Buffer.from("not-an-image"),
+      headers: { "content-type": "text/html" },
+    });
+    await expect(
+      transport.fetch("https://img.molizhishu.com/signed/render?id=2"),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
+
+    request.mockResolvedValueOnce({
+      status: 200,
+      data: Buffer.alloc(8 * 1024 * 1024 + 1),
+      headers: { "content-type": "image/webp" },
+    });
+    await expect(
+      transport.fetch("https://img.molizhishu.com/signed/render?id=3"),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
   });
 
   it("allows HTTP only for explicit loopback development transports", () => {
@@ -677,6 +835,120 @@ describe("presales monitor payload and reservation", () => {
     expect(JSON.stringify(payload)).not.toContain("image");
   });
 
+  it("adds one server-owned brand keyword, screenshot mode, consumer ID and region code", () => {
+    const payload = buildMonitorSubmitPayload({
+      question: QUESTION,
+      platforms: ["deepseek"],
+      consumerTaskId: "fm12345678",
+      monitorKeyword: "华润医药",
+      screenshot: 1,
+      region: { code: "node/custom value" },
+    });
+
+    expect(payload).toMatchObject({
+      prompts: Array(5).fill(QUESTION),
+      consumerTaskId: "fm12345678",
+      monitorKeywords: "华润医药",
+      regionCode: ["node/custom value"],
+      platforms: [{ platform: "deepseek", mode: "search", screenshot: 1 }],
+    });
+    expect(
+      buildMonitorSubmitPayload({
+        question: QUESTION,
+        platforms: ["deepseek"],
+      }),
+    ).not.toHaveProperty("regionCode");
+  });
+
+  it("validates a selected region once in Dashboard and submits its opaque code", async () => {
+    const calls: string[] = [];
+    const regionCatalog: MonitorRegionCatalog = {
+      async list(scope) {
+        calls.push(scope);
+        return [
+          { scope, code: "node/custom value", label: "北京市 · 自定义节点" },
+        ];
+      },
+    };
+    const harness = makeHarness(["deepseek"], { regionCatalog });
+    const input = {
+      ...createInput(),
+      monitorKeyword: "华润医药",
+      screenshot: 1 as const,
+      region: { scope: "domestic" as const, code: "node/custom value" },
+    };
+
+    const created = await harness.service.create(input);
+
+    expect(calls).toEqual(["domestic"]);
+    expect(created.run).toMatchObject({
+      monitorKeyword: "华润医药",
+      screenshot: 1,
+      region: {
+        scope: "domestic",
+        code: "node/custom value",
+        label: "北京市 · 自定义节点",
+      },
+    });
+    expect(harness.transport.submittedPayloads[0]).toMatchObject({
+      monitorKeywords: "华润医药",
+      regionCode: ["node/custom value"],
+      platforms: [{ screenshot: 1 }],
+    });
+    expect(harness.transport.submittedPayloads[0].consumerTaskId).toMatch(
+      /^[A-Za-z0-9]{8,64}$/,
+    );
+    expect(JSON.stringify(created.run)).not.toContain("consumerTaskId");
+  });
+
+  it("rejects a stale selected region before the paid POST", async () => {
+    const harness = makeHarness(["deepseek"], {
+      regionCatalog: {
+        async list(scope) {
+          return [{ scope, code: "110000", label: "北京市" }];
+        },
+      },
+    });
+
+    await expect(
+      harness.service.create({
+        ...createInput(),
+        region: { scope: "domestic", code: "expired-code" },
+      }),
+    ).rejects.toMatchObject({ code: "REGION_UNAVAILABLE", status: 422 });
+    expect(harness.transport.submitCalls).toBe(0);
+  });
+
+  it("treats region scope and code, but not its current label, as request identity", async () => {
+    let label = "北京市";
+    const harness = makeHarness(["deepseek"], {
+      regionCatalog: {
+        async list(scope) {
+          return [{ scope, code: "110000", label }];
+        },
+      },
+    });
+    const input = {
+      ...createInput(),
+      region: { scope: "domestic" as const, code: "110000" },
+    };
+    const first = await harness.service.create(input);
+    label = "北京采集节点";
+    const replay = await harness.service.create(input);
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.run.runId).toBe(first.run.runId);
+    expect(replay.run.region?.label).toBe("北京市");
+    expect(harness.transport.submitCalls).toBe(1);
+
+    await expect(
+      harness.service.create({
+        ...input,
+        region: { scope: "overseas", code: "110000" },
+      }),
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
   it("rejects an unselected platform in a submitted task response", async () => {
     const harness = makeHarness(["baiduai"]);
     const response = submitResponse(["baiduai"]);
@@ -779,6 +1051,14 @@ describe("presales monitor payload and reservation", () => {
     expect(sanitizeMonitorAnswerText(markdown)).toBe(markdown);
   });
 
+  it("canonicalizes only exact provider citation markers and preserves unknown indexes", () => {
+    expect(
+      sanitizeMonitorAnswerText(
+        "甲citeweb_search:1#0乙[citation:12]丙[1]丁[citation:x]",
+      ),
+    ).toBe("甲〔来源 0〕乙〔来源 12〕丙[1]丁[citation:x]");
+  });
+
   it("redacts a monitor secret before limiting error text length", () => {
     const secret = "sk-frontmind-secret-value";
     const cleaned = sanitizeMonitorErrorText(
@@ -806,17 +1086,70 @@ describe("presales monitor payload and reservation", () => {
     });
   });
 
-  it("keeps an ambiguous submission sticky and does not POST on retry", async () => {
+  it("reuses one consumerTaskId when an ambiguous submission is safely retried", async () => {
     const harness = makeHarness(["deepseek"]);
     harness.transport.submitError = new Error("socket closed after write");
     await expect(harness.service.create(createInput())).rejects.toMatchObject({
       code: "MONITOR_SUBMISSION_UNKNOWN",
     });
+    const firstConsumerTaskId =
+      harness.transport.submittedPayloads[0].consumerTaskId;
+    expect(firstConsumerTaskId).toMatch(/^[A-Za-z0-9]{8,64}$/);
     harness.transport.submitError = null;
+    const retried = await harness.service.create(createInput());
+    expect(retried.replayed).toBe(false);
+    expect(retried.run.status).toBe("submitted");
+    expect(harness.transport.submitCalls).toBe(2);
+    expect(harness.transport.submittedPayloads[1].consumerTaskId).toBe(
+      firstConsumerTaskId,
+    );
+  });
+
+  it("does not retry a legacy ambiguous reservation without a stored consumerTaskId", async () => {
+    const harness = makeHarness(["deepseek"]);
+    harness.transport.submitError = new Error("socket closed after write");
+    await expect(harness.service.create(createInput())).rejects.toMatchObject({
+      code: "MONITOR_SUBMISSION_UNKNOWN",
+    });
+    const [run] = [...harness.repository.runs.values()];
+    run.checkpoint = { items: [] };
+    harness.transport.submitError = null;
+
     const replay = await harness.service.create(createInput());
-    expect(replay.replayed).toBe(true);
-    expect(replay.run.status).toBe("submission_unknown");
+
+    expect(replay).toMatchObject({
+      replayed: true,
+      run: { status: "submission_unknown" },
+    });
     expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("does not retry an ambiguous reservation after credential rotation", async () => {
+    const repository = new MemoryMonitorRepository();
+    const transport = new FakeMonitorTransport(["deepseek"]);
+    let activeCredential = credential;
+    const service = new PresalesMonitorService(
+      repository,
+      transport,
+      async () => activeCredential,
+      async () => activeCredential,
+    );
+    transport.submitError = new Error("socket closed after write");
+    await expect(service.create(createInput())).rejects.toMatchObject({
+      code: "MONITOR_SUBMISSION_UNKNOWN",
+    });
+    activeCredential = {
+      ...credential,
+      id: "credential-2",
+      version: 2,
+      apiKey: "sk-rotated-monitor-test",
+    };
+    transport.submitError = null;
+
+    await expect(service.create(createInput())).rejects.toMatchObject({
+      code: "IDEMPOTENCY_CONFLICT",
+    });
+    expect(transport.submitCalls).toBe(1);
   });
 
   it("records an explicit provider rejection as failed, never as submission_unknown", async () => {
@@ -1569,6 +1902,211 @@ describe("presales monitor polling and public result", () => {
     expect(serialized).not.toContain("javascript:");
   });
 
+  it("preserves v1.19 field presence and exposes only the selected public fields", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create({
+      ...createInput(),
+      monitorKeyword: "华润医药",
+      screenshot: 1,
+    });
+    const payload = resultResponse(["deepseek"]);
+    const first = payload.data.subTaskList[0] as Record<string, unknown>;
+    first.answerContent = "回答结论[citation:0]，冲突引用[citation:7]。";
+    first.citationList = [
+      {
+        index: 0,
+        title: "实际引用",
+        url: "https://citation.invalid/actual",
+        source: "行业媒体",
+        publishTime: "2026-08-20",
+      },
+      { index: 7, title: "冲突 A", url: "https://citation.invalid/a" },
+      { index: 7, title: "冲突 B", url: "https://citation.invalid/b" },
+    ];
+    first.referenceList = [
+      {
+        index: 0,
+        name: "完整参考来源",
+        url: "https://reference.invalid/report",
+        site: "参考站点",
+        summary: "来源摘要",
+        publishTime: "2026-08-19T12:00:00Z",
+        icon: "https://private.invalid/icon.ico",
+      },
+    ];
+    first.searchKeywords = Array.from(
+      { length: 60 },
+      (_, index) => `检索词 ${index + 1}`,
+    );
+    first.recommendedQuestions = Array.from(
+      { length: 25 },
+      (_, index) => `推荐追问 ${index + 1}`,
+    );
+    first.mentionPosition = 2;
+    first.mentionContext = "华润医药拥有全国性医药流通网络。";
+    first.sentiment = "positive";
+    first.categoryRanking = {
+      categoryName: "医药流通企业",
+      rank: 2,
+      allRankings: [{ name: "不应公开的竞品", rank: 1 }],
+    };
+    first.keywordEvaluations = Array.from({ length: 110 }, (_, index) => ({
+      keyword: `评价词 ${index + 1}`,
+      nature: index % 2 === 0 ? "positive" : "neutral",
+      context: "评价上下文",
+    }));
+    first.pageScreenshot =
+      "https://img.molizhishu.com/signed/render?id=answer-1&token=secret";
+    first.goods = [{ name: "不应公开的商品" }];
+    first.videoList = [{ url: "https://private.invalid/video.mp4" }];
+    first.competitorRankings = [{ name: "不应公开的竞品" }];
+    first.amount = 99;
+    first.proxyIp = "10.0.0.1";
+
+    const second = payload.data.subTaskList[1] as Record<string, unknown>;
+    delete second.citationList;
+    delete second.referenceList;
+    second.mentionPosition = null;
+    second.sentiment = null;
+    second.categoryRanking = null;
+
+    const third = payload.data.subTaskList[2] as Record<string, unknown>;
+    third.citationList = [];
+    third.referenceList = [];
+    harness.transport.resultValues = [payload];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const result = await harness.service.result(created.run.runId);
+    const record = result.records?.[0];
+
+    expect(result).toMatchObject({
+      monitorKeyword: "华润医药",
+      screenshot: 1,
+    });
+    expect(record).toMatchObject({
+      answerText: "回答结论〔来源 0〕，冲突引用〔来源 7〕。",
+      mentionPosition: 2,
+      mentionContext: "华润医药拥有全国性医药流通网络。",
+      sentiment: "positive",
+      categoryRanking: { categoryName: "医药流通企业", rank: 2 },
+      screenshot: { available: true },
+    });
+    expect(record?.citationList).toEqual([
+      {
+        index: 0,
+        title: "实际引用",
+        url: "https://citation.invalid/actual",
+        site: "行业媒体",
+        publishTime: "2026-08-20",
+      },
+      { index: 7, title: "冲突 A", url: "https://citation.invalid/a" },
+      { index: 7, title: "冲突 B", url: "https://citation.invalid/b" },
+    ]);
+    expect(record?.referenceList).toEqual([
+      {
+        index: 0,
+        title: "完整参考来源",
+        url: "https://reference.invalid/report",
+        site: "参考站点",
+        summary: "来源摘要",
+        publishTime: "2026-08-19T12:00:00Z",
+      },
+    ]);
+    expect(record?.searchKeywords).toHaveLength(50);
+    expect(record?.recommendedQuestions).toHaveLength(20);
+    expect(record?.keywordEvaluations).toHaveLength(100);
+    expect(result.records?.[1]).not.toHaveProperty("citationList");
+    expect(result.records?.[1]).not.toHaveProperty("referenceList");
+    expect(result.records?.[1]).toMatchObject({
+      mentionPosition: null,
+      sentiment: null,
+      categoryRanking: null,
+    });
+    expect(result.records?.[2]).toMatchObject({
+      citationList: [],
+      referenceList: [],
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("consumerTaskId");
+    expect(serialized).not.toContain("img.molizhishu.com");
+    expect(serialized).not.toContain("allRankings");
+    expect(serialized).not.toContain("不应公开的商品");
+    expect(serialized).not.toContain("不应公开的竞品");
+    expect(serialized).not.toContain("proxyIp");
+    expect(serialized).not.toContain("private.invalid");
+  });
+
+  it("lets later explicit empty arrays and null metrics replace checkpoint values", async () => {
+    const harness = makeHarness(["deepseek"]);
+    const created = await harness.service.create({
+      ...createInput(),
+      screenshot: 1,
+    });
+    const first = resultResponse(["deepseek"]);
+    first.data.status = "processing";
+    const firstChild = first.data.subTaskList[0] as Record<string, unknown>;
+    firstChild.citationList = [
+      { index: 0, title: "旧引用", url: "https://citation.invalid/old" },
+    ];
+    firstChild.referenceList = [
+      { index: 0, title: "旧参考", url: "https://reference.invalid/old" },
+    ];
+    firstChild.searchKeywords = ["旧检索词"];
+    firstChild.recommendedQuestions = ["旧追问"];
+    firstChild.mentionPosition = 3;
+    firstChild.sentiment = "positive";
+    firstChild.categoryRanking = { categoryName: "旧类目", rank: 3 };
+    firstChild.keywordEvaluations = [
+      { keyword: "旧评价", nature: "positive", context: "旧上下文" },
+    ];
+    firstChild.pageScreenshot =
+      "https://img.molizhishu.com/signed/render?id=stable";
+    for (const child of first.data.subTaskList.slice(1)) {
+      child.status = "pending";
+      child.answerContent = "";
+      delete (child as Partial<typeof child>).time;
+    }
+
+    const second = resultResponse(["deepseek"]);
+    const secondChild = second.data.subTaskList[0] as Record<string, unknown>;
+    secondChild.citationList = [];
+    secondChild.referenceList = [];
+    secondChild.searchKeywords = [];
+    secondChild.recommendedQuestions = [];
+    secondChild.mentionPosition = null;
+    secondChild.sentiment = null;
+    secondChild.categoryRanking = null;
+    secondChild.keywordEvaluations = [];
+    delete secondChild.pageScreenshot;
+    harness.transport.statusValues = [
+      statusResponse(5, 1, 0, "processing"),
+      statusResponse(5),
+    ];
+    harness.transport.resultValues = [first, second];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const partial = await harness.service.result(created.run.runId);
+    expect(partial.records?.[0]).toMatchObject({
+      citationList: [expect.objectContaining({ title: "旧引用" })],
+      sentiment: "positive",
+      screenshot: { available: true },
+    });
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const completed = await harness.service.result(created.run.runId);
+    expect(completed.records?.[0]).toMatchObject({
+      citationList: [],
+      referenceList: [],
+      searchKeywords: [],
+      recommendedQuestions: [],
+      mentionPosition: null,
+      sentiment: null,
+      categoryRanking: null,
+      keywordEvaluations: [],
+      screenshot: { available: true },
+    });
+  });
+
   it("preserves a full answer and returns one deduplicated source collection", async () => {
     const harness = makeHarness(["deepseek"]);
     const created = await harness.service.create(createInput());
@@ -1622,14 +2160,14 @@ describe("presales monitor polling and public result", () => {
     expect(record?.sources).toHaveLength(200);
     expect(record?.sources).toContainEqual({
       index: 16,
-      source: "实际引用站点",
+      site: "实际引用站点",
       url: "https://citation.invalid/actual-only",
       summary: "实际引用摘要",
     });
     expect(record?.sources).toContainEqual({
       index: 1,
       title: "检索参考来源",
-      source: "检索站点",
+      site: "检索站点",
       url: "https://reference.invalid/retrieved-only",
       summary: "检索来源摘要",
     });
@@ -1872,7 +2410,7 @@ describe("presales monitor polling and public result", () => {
     const record = result.records?.[0];
     expect(record?.answerText).toContain("〔来源 0〕");
     expect(record?.answerText).toContain("〔来源 1〕");
-    expect(record?.answerText).not.toContain("来源 9");
+    expect(record?.answerText).toContain("〔来源 9〕");
     expect(record?.answerText).not.toMatch(/[\uE3A0\uE3A3\uE3A8]/u);
     expect(record?.sources).toHaveLength(3);
     expect(record?.sources).toContainEqual({
@@ -2229,6 +2767,87 @@ describe("presales monitor HTTP contract", () => {
     }
   });
 
+  it("serves region choices and proxies an available screenshot without exposing its URL", async () => {
+    const screenshotFetch = vi.fn(async () => ({
+      contentType: "image/png" as const,
+      data: Buffer.from("proxied-screenshot"),
+    }));
+    const harness = makeHarness(["deepseek"], {
+      regionCatalog: {
+        async list(scope) {
+          return [
+            { scope, code: "110000", label: "北京市" },
+            { scope, code: "310000", label: "上海市" },
+          ];
+        },
+      },
+      screenshotTransport: { fetch: screenshotFetch },
+    });
+    const payload = resultResponse(["deepseek"]);
+    payload.data.subTaskList[0].pageScreenshot =
+      "https://img.molizhishu.com/signed/render?id=answer-1&token=private";
+    harness.transport.resultValues = [payload];
+    const { server, baseUrl } = await listen(
+      createPresalesMonitorRouter(harness.service),
+    );
+    try {
+      const regionsResponse = await fetch(`${baseUrl}/regions?scope=domestic`);
+      expect(regionsResponse.status).toBe(200);
+      expect(regionsResponse.headers.get("cache-control")).toBe("no-store");
+      await expect(regionsResponse.json()).resolves.toEqual({
+        scope: "domestic",
+        regions: [
+          { code: "110000", label: "北京市" },
+          { code: "310000", label: "上海市" },
+        ],
+      });
+
+      const createResponse = await fetch(baseUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...createInput(), screenshot: 1 }),
+      });
+      const created = (await createResponse.json()) as any;
+      harness.advance(MONITOR_POLL_INTERVAL_MS);
+      const resultResponse = await fetch(
+        `${baseUrl}/${created.run.runId}/result`,
+      );
+      const resultBody = (await resultResponse.json()) as any;
+      const record = resultBody.run.records[0];
+      expect(record.screenshot).toEqual({ available: true });
+      expect(JSON.stringify(resultBody)).not.toContain("img.molizhishu.com");
+      expect(JSON.stringify(resultBody)).not.toContain("consumerTaskId");
+
+      const screenshotResponse = await fetch(
+        `${baseUrl}/${created.run.runId}/records/${record.recordId}/screenshot`,
+      );
+      expect(screenshotResponse.status).toBe(200);
+      expect(screenshotResponse.headers.get("content-type")).toContain(
+        "image/png",
+      );
+      expect(screenshotResponse.headers.get("cache-control")).toBe(
+        "private, no-store",
+      );
+      expect(screenshotResponse.headers.get("x-content-type-options")).toBe(
+        "nosniff",
+      );
+      await expect(screenshotResponse.text()).resolves.toBe(
+        "proxied-screenshot",
+      );
+      expect(screenshotFetch).toHaveBeenCalledWith(
+        "https://img.molizhishu.com/signed/render?id=answer-1&token=private",
+      );
+
+      const unavailable = await fetch(
+        `${baseUrl}/${created.run.runId}/records/mr_${"0".repeat(24)}/screenshot`,
+      );
+      expect(unavailable.status).toBe(404);
+      expect(screenshotFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      await close(server);
+    }
+  });
+
   it("returns {run}, exposes completed checkpoint records while polling, and retires deleted idempotency keys", async () => {
     const harness = makeHarness(["deepseek"]);
     const { server, baseUrl } = await listen(
@@ -2367,7 +2986,7 @@ describe("presales monitor HTTP contract", () => {
 
       for (const body of [
         { ...createInput(), mode: "standard" },
-        { ...createInput(), screenshot: 1 },
+        { ...createInput(), screenshot: 2 },
         { ...createInput(), repeat: 1 },
         { ...createInput(), platforms: ["unknown"] },
       ]) {
