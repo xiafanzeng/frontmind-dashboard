@@ -11,13 +11,25 @@ export const SITEOPS_VISUAL_FUNNEL_TARGETS = {
 
 export type TwentyFirstQueryRole = "foundation" | "section" | "motion";
 
+export type TwentyFirstQueryAxis =
+  | "foundation_split"
+  | "foundation_editorial_modular"
+  | "section_proof_conversion"
+  | "motion_accessible";
+
 export type TwentyFirstQuery = {
   role: TwentyFirstQueryRole;
+  axis: TwentyFirstQueryAxis;
+  limit: 2 | 5 | 6;
   query: string;
 };
 
 export type TwentyFirstSearchEnvelope = {
   role: TwentyFirstQueryRole;
+  /** Legacy fixtures and immutable V1 readers may omit the axis. */
+  axis?: TwentyFirstQueryAxis;
+  /** Client-side ceiling in case the provider ignores or omits `limit`. */
+  limit?: number;
   payload: unknown;
 };
 
@@ -45,12 +57,17 @@ export type NormalizedTwentyFirstSearchItem = {
   providerItemId: TwentyFirstProviderItemId;
   providerItemKey: string;
   queryRole: TwentyFirstQueryRole;
+  queryAxis: TwentyFirstQueryAxis;
+  queryRank: number;
   searchRank: number;
   title: string;
   description: string | null;
   author: string | null;
   sourceUrl: string | null;
+  /** Complete provider URL. It must stay inside the current provider call. */
   previewUrl: string | null;
+  /** Safe, non-secret coordinate used by hashes and durable evidence. */
+  previewPublicCoordinate: string | null;
   metadataSha256: string;
 };
 
@@ -120,15 +137,14 @@ export type TwentyFirstVisualScore = {
   accessibility: number;
 };
 
-export type NormalizedTwentyFirstCandidate =
-  NormalizedTwentyFirstSearchItem & {
-    providerResponseSha256: string;
-    normalizedDirectives: SafeVisualDirective[];
-    score: number;
-    scoreBreakdown: TwentyFirstVisualScore;
-    rationale: string;
-    codeIgnored: true;
-  };
+export type NormalizedTwentyFirstCandidate = NormalizedTwentyFirstSearchItem & {
+  providerResponseSha256: string;
+  normalizedDirectives: SafeVisualDirective[];
+  score: number;
+  scoreBreakdown: TwentyFirstVisualScore;
+  rationale: string;
+  codeIgnored: true;
+};
 
 export type TwentyFirstFunnelResult = {
   targets: typeof SITEOPS_VISUAL_FUNNEL_TARGETS;
@@ -140,7 +156,10 @@ export type TwentyFirstFunnelResult = {
   searchedCandidates: NormalizedTwentyFirstSearchItem[];
   retrievalShortlist: NormalizedTwentyFirstCandidate[];
   presentedCandidates: Array<
-    NormalizedTwentyFirstCandidate & { optionLabel: string; presentationRank: number }
+    NormalizedTwentyFirstCandidate & {
+      optionLabel: string;
+      presentationRank: number;
+    }
   >;
   supportingCandidates: NormalizedTwentyFirstCandidate[];
   degradedReasons: string[];
@@ -163,10 +182,14 @@ const SEARCH_ARRAY_KEYS = new Set([
   "hits",
   "content",
 ]);
-const SENSITIVE_QUERY_KEY = /(?:api.?key|token|secret|credential|authorization|auth|signature|jwt)/iu;
-const SENSITIVE_TEXT = /(?:21st_sk_[A-Za-z0-9_-]{12,}|\bBearer\s+[A-Za-z0-9._~+/-]{12,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/iu;
-const INSTRUCTIONAL_METADATA = /(?:ignore\s+(?:all\s+)?(?:previous|system|developer)|reveal\s+(?:the\s+)?(?:system|developer)\s+(?:prompt|message)|modify\s+(?:the\s+)?(?:host|agent|mcp)\s+(?:config|configuration)|exfiltrat(?:e|ion))/iu;
-const UNSAFE_METADATA = /(?:<\s*\/?\s*[A-Za-z][^>]*>|```|["']use client["']|\b(?:npm\s+(?:i|install)|npx\s+|pnpm\s+(?:add|install)|yarn\s+add|bun\s+add)\b|\bimport\s+.+\bfrom\b|\brequire\s*\(|\bfunction\s+[A-Za-z_$]|=>|\bclassName\s*=)/iu;
+const SENSITIVE_QUERY_KEY =
+  /(?:api.?key|token|secret|credential|authorization|auth|signature|jwt)/iu;
+const SENSITIVE_TEXT =
+  /(?:21st_sk_[A-Za-z0-9_-]{12,}|\bBearer\s+[A-Za-z0-9._~+/-]{12,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/iu;
+const INSTRUCTIONAL_METADATA =
+  /(?:ignore\s+(?:all\s+)?(?:previous|system|developer)|reveal\s+(?:the\s+)?(?:system|developer)\s+(?:prompt|message)|modify\s+(?:the\s+)?(?:host|agent|mcp)\s+(?:config|configuration)|exfiltrat(?:e|ion))/iu;
+const UNSAFE_METADATA =
+  /(?:<\s*\/?\s*[A-Za-z][^>]*>|```|["']use client["']|\b(?:npm\s+(?:i|install)|npx\s+|pnpm\s+(?:add|install)|yarn\s+add|bun\s+add)\b|\bimport\s+.+\bfrom\b|\brequire\s*\(|\bfunction\s+[A-Za-z_$]|=>|\bclassName\s*=)/iu;
 
 const DIRECTIVE_TAXONOMY: ReadonlyArray<
   readonly [SafeVisualDirective, RegExp]
@@ -187,8 +210,14 @@ const DIRECTIVE_TAXONOMY: ReadonlyArray<
   ["typography:serif-editorial", /\bserif\b/iu],
   ["typography:neutral-sans", /sans[- ]serif|neutral\s+sans/iu],
   ["surface:border-defined", /\bborder(?:ed|s)?\b|divider/iu],
-  ["surface:soft-shadow-depth", /soft\s+shadow|drop\s+shadow|layered\s+depth/iu],
-  ["surface:glass-like-layering", /glass(?:morphism)?|frosted|backdrop\s+blur/iu],
+  [
+    "surface:soft-shadow-depth",
+    /soft\s+shadow|drop\s+shadow|layered\s+depth/iu,
+  ],
+  [
+    "surface:glass-like-layering",
+    /glass(?:morphism)?|frosted|backdrop\s+blur/iu,
+  ],
   ["surface:rounded-containers", /rounded|corner\s+radius|pill/iu],
   ["color:dark-canvas", /dark\s+(?:mode|canvas|background)|near[- ]black/iu],
   ["color:light-canvas", /light\s+(?:mode|canvas|background)|off[- ]white/iu],
@@ -202,9 +231,18 @@ const DIRECTIVE_TAXONOMY: ReadonlyArray<
   ],
   ["imagery:illustration-led", /illustration|illustrative/iu],
   ["imagery:wide-crop", /wide\s+crop|cinematic\s+crop|panoramic/iu],
-  ["imagery:masked-media", /image\s+mask|masked\s+(?:image|media)|clip[- ]path/iu],
-  ["motion:controlled-reveal", /masked?\s+reveal|controlled\s+reveal|fade[- ]?in|reveal/iu],
-  ["motion:short-transition", /short\s+transition|micro[- ]?interaction|transition/iu],
+  [
+    "imagery:masked-media",
+    /image\s+mask|masked\s+(?:image|media)|clip[- ]path/iu,
+  ],
+  [
+    "motion:controlled-reveal",
+    /masked?\s+reveal|controlled\s+reveal|fade[- ]?in|reveal/iu,
+  ],
+  [
+    "motion:short-transition",
+    /short\s+transition|micro[- ]?interaction|transition/iu,
+  ],
   ["motion:scroll-triggered", /scroll[- ]trigger|on\s+scroll|parallax/iu],
   ["motion:hover-depth", /hover\s+(?:depth|lift|state)|on\s+hover/iu],
   ["tone:technical-precise", /technical|precise|engineering|industrial/iu],
@@ -237,7 +275,13 @@ function safeMetadata(value: string | null, fallback: string | null = null) {
   ) {
     return fallback;
   }
-  return value.replace(/<[^>]*>/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 300) || fallback;
+  return (
+    value
+      .replace(/<[^>]*>/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim()
+      .slice(0, 300) || fallback
+  );
 }
 
 function firstString(
@@ -316,7 +360,10 @@ function firstProviderItemId(
   return null;
 }
 
-function collectSearchRecords(value: unknown, depth = 0): Record<string, unknown>[] {
+function collectSearchRecords(
+  value: unknown,
+  depth = 0,
+): Record<string, unknown>[] {
   if (depth > 5) return [];
   if (Array.isArray(value)) {
     if (value.every(isRecord)) return value;
@@ -360,6 +407,35 @@ function sanitizeHttpsUrl(
     return url.toString();
   } catch {
     return null;
+  }
+}
+
+function sanitizePreviewCoordinates(value: string | null) {
+  if (!value) return { fetchUrl: null, publicCoordinate: null } as const;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password) {
+      return { fetchUrl: null, publicCoordinate: null } as const;
+    }
+    url.hash = "";
+    const safeQueryKeys = Array.from(
+      new Set(Array.from(url.searchParams.keys())),
+    )
+      .filter(
+        (key) =>
+          !SENSITIVE_QUERY_KEY.test(key) && /^[A-Za-z0-9._-]{1,64}$/u.test(key),
+      )
+      .sort((left, right) => left.localeCompare(right, "en"));
+    return {
+      fetchUrl: url.toString(),
+      publicCoordinate: `${url.origin}${url.pathname}${
+        safeQueryKeys.length > 0
+          ? `?${safeQueryKeys.map(encodeURIComponent).join("&")}`
+          : ""
+      }`,
+    } as const;
+  } catch {
+    return { fetchUrl: null, publicCoordinate: null } as const;
   }
 }
 
@@ -410,37 +486,70 @@ export function canonicalSha256(value: unknown) {
   return sha256(canonicalJson(value));
 }
 
-export function createVisualEvidenceV1(input: Omit<VisualEvidenceV1, "evidenceSha256">) {
+export function createVisualEvidenceV1(
+  input: Omit<VisualEvidenceV1, "evidenceSha256">,
+) {
   const evidenceSha256 = canonicalSha256(input);
   return { ...input, evidenceSha256 } satisfies VisualEvidenceV1;
 }
 
-export function composeTwentyFirstQueries(brief: SiteBrief): TwentyFirstQuery[] {
-  const safeWords = [
+export function composeTwentyFirstQueries(
+  brief: SiteBrief,
+): TwentyFirstQuery[] {
+  const safeFragments = [
     brief.companyName,
-    brief.conversionGoal,
     ...brief.offerings,
     ...brief.audience,
+    brief.conversionGoal,
     ...brief.routes.map((route) => route.title),
   ]
-    .flatMap((value) => value.match(/[A-Za-z][A-Za-z0-9+&._/-]{1,39}/gu) ?? [])
-    .map((value) => value.toLocaleLowerCase("en-US"))
-    .filter((value) => !SENSITIVE_TEXT.test(value));
-  const context = Array.from(new Set(safeWords)).slice(0, 8).join(" ");
+    .map((value) =>
+      value
+        .normalize("NFKC")
+        .replace(/[\u0000-\u001f\u007f]/gu, " ")
+        .replace(/[^\p{L}\p{N}\s+&._/-]/gu, " ")
+        .replace(/\s+/gu, " ")
+        .trim()
+        .slice(0, 80),
+    )
+    .filter((value) => value && !SENSITIVE_TEXT.test(value));
+  const context = Array.from(new Set(safeFragments))
+    .slice(0, 8)
+    .join(" ")
+    .slice(0, 320);
   return [
     {
       role: "foundation",
-      query: `${context} responsive company website original brand system`.trim(),
+      axis: "foundation_split",
+      limit: 5,
+      query: `${context} business landing page hero split layout`.trim(),
+    },
+    {
+      role: "foundation",
+      axis: "foundation_editorial_modular",
+      limit: 5,
+      query: `${context} editorial asymmetric modular bento hero`.trim(),
     },
     {
       role: "section",
-      query: `${context} hero features proof contact website sections`.trim(),
+      axis: "section_proof_conversion",
+      limit: 6,
+      query:
+        `${context} services features proof testimonial FAQ contact CTA`.trim(),
     },
     {
       role: "motion",
-      query: `${context} accessible micro interaction reduced motion landing page`.trim(),
+      axis: "motion_accessible",
+      limit: 2,
+      query: `${context} subtle interaction responsive reduced motion`.trim(),
     },
   ];
+}
+
+function defaultAxisForRole(role: TwentyFirstQueryRole): TwentyFirstQueryAxis {
+  if (role === "foundation") return "foundation_split";
+  if (role === "section") return "section_proof_conversion";
+  return "motion_accessible";
 }
 
 export function normalizeTwentyFirstSearchResults(
@@ -449,7 +558,18 @@ export function normalizeTwentyFirstSearchResults(
   const seen = new Set<string>();
   const output: NormalizedTwentyFirstSearchItem[] = [];
   for (const envelope of envelopes) {
-    for (const record of collectSearchRecords(envelope.payload)) {
+    const records = collectSearchRecords(envelope.payload).slice(
+      0,
+      Math.max(
+        0,
+        Math.min(
+          Math.trunc(envelope.limit ?? SITEOPS_VISUAL_FUNNEL_TARGETS.search),
+          SITEOPS_VISUAL_FUNNEL_TARGETS.search,
+        ),
+      ),
+    );
+    for (let queryIndex = 0; queryIndex < records.length; queryIndex += 1) {
+      const record = records[queryIndex]!;
       if (output.length >= SITEOPS_VISUAL_FUNNEL_TARGETS.search) return output;
       const providerItemId = firstProviderItemId(record, [
         "provider_item_id",
@@ -476,7 +596,7 @@ export function normalizeTwentyFirstSearchResults(
       const author = safeMetadata(
         firstString(record, ["author", "creator", "owner"]),
       );
-      const previewUrl = sanitizeHttpsUrl(
+      const previewCoordinates = sanitizePreviewCoordinates(
         firstString(record, [
           "preview_url",
           "previewUrl",
@@ -493,19 +613,22 @@ export function normalizeTwentyFirstSearchResults(
         description,
         author,
         sourceUrl,
-        previewUrl,
+        previewPublicCoordinate: previewCoordinates.publicCoordinate,
       });
       output.push({
         candidateId: candidateIdForProviderItem(providerItemId),
         providerItemId,
         providerItemKey: duplicateKey,
         queryRole: envelope.role,
+        queryAxis: envelope.axis ?? defaultAxisForRole(envelope.role),
+        queryRank: queryIndex + 1,
         searchRank: output.length + 1,
         title,
         description,
         author,
         sourceUrl,
-        previewUrl,
+        previewUrl: previewCoordinates.fetchUrl,
+        previewPublicCoordinate: previewCoordinates.publicCoordinate,
         metadataSha256,
       });
     }
@@ -545,7 +668,9 @@ function defaultScore(
 ): TwentyFirstVisualScore {
   const rankSignal = Math.max(4, 15 - (item.searchRank - 1) * 0.45);
   const hasResponsive = directives.includes("responsive:mobile-reflow");
-  const hasReducedMotion = directives.includes("motion:reduced-motion-required");
+  const hasReducedMotion = directives.includes(
+    "motion:reduced-motion-required",
+  );
   return {
     brandFit: clampScore(rankSignal),
     industryFit: clampScore(rankSignal - 1),
@@ -625,25 +750,27 @@ export function normalizeTwentyFirstDetail(input: {
       ]),
       { providerSource: true },
     ) ?? input.searchItem.sourceUrl;
-  const previewUrl =
-    sanitizeHttpsUrl(
-      firstString(input.detail.payload, [
-        "preview_url",
-        "previewUrl",
-        "preview",
-        "image_url",
-        "imageUrl",
-        "thumbnail_url",
-        "thumbnailUrl",
-      ]),
-    ) ?? input.searchItem.previewUrl;
+  const detailPreview = sanitizePreviewCoordinates(
+    firstString(input.detail.payload, [
+      "preview_url",
+      "previewUrl",
+      "preview",
+      "image_url",
+      "imageUrl",
+      "thumbnail_url",
+      "thumbnailUrl",
+    ]),
+  );
+  const previewUrl = detailPreview.fetchUrl ?? input.searchItem.previewUrl;
+  const previewPublicCoordinate =
+    detailPreview.publicCoordinate ?? input.searchItem.previewPublicCoordinate;
   const metadataProjection = {
     providerItemKey: input.searchItem.providerItemKey,
     title,
     description,
     author,
     sourceUrl,
-    previewUrl,
+    previewPublicCoordinate,
   };
   const normalizedDirectives = extractSafeVisualDirectives(
     [title, description, author].filter(Boolean).join(" "),
@@ -655,6 +782,7 @@ export function normalizeTwentyFirstDetail(input: {
     author,
     sourceUrl,
     previewUrl,
+    previewPublicCoordinate,
     metadataSha256: canonicalSha256(metadataProjection),
   };
   const scoreBreakdown =
@@ -667,6 +795,139 @@ export function normalizeTwentyFirstDetail(input: {
     score: scoreTotal(scoreBreakdown),
     rationale: `${input.searchItem.queryRole} 参考；按真实目录排名和安全视觉特征评估。`,
     codeIgnored: true,
+  };
+}
+
+export type TwentyFirstSearchOnlyFunnelResult = {
+  targets: typeof SITEOPS_VISUAL_FUNNEL_TARGETS;
+  actual: { searched: number; shortlisted: number };
+  searchedCandidates: NormalizedTwentyFirstSearchItem[];
+  retrievalShortlist: NormalizedTwentyFirstCandidate[];
+  degradedReasons: string[];
+  rejectedMetadata: number;
+  generateUsed: false;
+  providerCodeReuse: false;
+};
+
+function searchCandidate(
+  item: NormalizedTwentyFirstSearchItem,
+): NormalizedTwentyFirstCandidate | null {
+  try {
+    const normalizedDirectives = extractSafeVisualDirectives(
+      [item.title, item.description, item.author].filter(Boolean).join(" "),
+    );
+    const scoreBreakdown = defaultScore(item, normalizedDirectives);
+    return {
+      ...item,
+      // Hash only the allowlisted catalog projection. The raw MCP response,
+      // preview query values, install commands and provider code never become
+      // durable evidence.
+      providerResponseSha256: canonicalSha256({
+        providerItemKey: item.providerItemKey,
+        queryAxis: item.queryAxis,
+        queryRank: item.queryRank,
+        metadataSha256: item.metadataSha256,
+      }),
+      normalizedDirectives,
+      scoreBreakdown,
+      score: scoreTotal(scoreBreakdown),
+      rationale: `${item.queryAxis} 参考；按真实目录排名和安全视觉特征评估。`,
+      codeIgnored: true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function interleaveCandidates(
+  left: readonly NormalizedTwentyFirstCandidate[],
+  right: readonly NormalizedTwentyFirstCandidate[],
+) {
+  const result: NormalizedTwentyFirstCandidate[] = [];
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    if (left[index]) result.push(left[index]!);
+    if (right[index]) result.push(right[index]!);
+  }
+  return result;
+}
+
+/**
+ * SiteOps' production visual path consumes only 21st search metadata and
+ * preview references. `get_component` remains a separately advertised
+ * optional provider capability and is never part of this funnel.
+ */
+export function buildTwentyFirstSearchOnlyFunnel(input: {
+  searchEnvelopes: readonly TwentyFirstSearchEnvelope[];
+}): TwentyFirstSearchOnlyFunnelResult {
+  const searchedCandidates = normalizeTwentyFirstSearchResults(
+    input.searchEnvelopes,
+  );
+  let rejectedMetadata = 0;
+  const candidates = searchedCandidates.flatMap((item) => {
+    const normalized = searchCandidate(item);
+    if (!normalized) {
+      rejectedMetadata += 1;
+      return [];
+    }
+    return [normalized];
+  });
+  const withPreview = candidates.filter((candidate) => candidate.previewUrl);
+  const split = withPreview.filter(
+    (candidate) => candidate.queryAxis === "foundation_split",
+  );
+  const editorial = withPreview.filter(
+    (candidate) => candidate.queryAxis === "foundation_editorial_modular",
+  );
+  const foundation = interleaveCandidates(split, editorial);
+  const section = withPreview.filter(
+    (candidate) => candidate.queryAxis === "section_proof_conversion",
+  );
+  const motion = withPreview.filter(
+    (candidate) => candidate.queryAxis === "motion_accessible",
+  );
+  const supporting = interleaveCandidates(section, motion);
+  const shortlist: NormalizedTwentyFirstCandidate[] = [];
+  const selectedKeys = new Set<string>();
+  const append = (candidate: NormalizedTwentyFirstCandidate | undefined) => {
+    if (
+      candidate &&
+      shortlist.length < SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve &&
+      !selectedKeys.has(candidate.providerItemKey)
+    ) {
+      selectedKeys.add(candidate.providerItemKey);
+      shortlist.push(candidate);
+    }
+  };
+  foundation.slice(0, SITEOPS_VISUAL_FUNNEL_TARGETS.present).forEach(append);
+  supporting.slice(0, 3).forEach(append);
+  [...foundation, ...supporting].forEach(append);
+  const degradedReasons: string[] = [];
+  if (searchedCandidates.length < SITEOPS_VISUAL_FUNNEL_TARGETS.search) {
+    degradedReasons.push(
+      `SEARCH_RESULTS_INSUFFICIENT:${searchedCandidates.length}/${SITEOPS_VISUAL_FUNNEL_TARGETS.search}`,
+    );
+  }
+  if (shortlist.length < SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve) {
+    degradedReasons.push(
+      `SHORTLIST_RESULTS_INSUFFICIENT:${shortlist.length}/${SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve}`,
+    );
+  }
+  if (rejectedMetadata > 0) {
+    degradedReasons.push(`SEARCH_METADATA_REJECTED:${rejectedMetadata}`);
+  }
+  return {
+    targets: SITEOPS_VISUAL_FUNNEL_TARGETS,
+    actual: {
+      searched: searchedCandidates.length,
+      shortlisted: shortlist.length,
+    },
+    searchedCandidates,
+    retrievalShortlist: shortlist,
+    degradedReasons,
+    rejectedMetadata,
+    generateUsed: false,
+    providerCodeReuse: false,
   };
 }
 
@@ -703,7 +964,10 @@ export function buildTwentyFirstVisualFunnel(input: {
       (candidate) =>
         candidate.queryRole === "foundation" && Boolean(candidate.previewUrl),
     )
-    .sort((left, right) => right.score - left.score || left.searchRank - right.searchRank)
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.searchRank - right.searchRank,
+    )
     .slice(0, SITEOPS_VISUAL_FUNNEL_TARGETS.present)
     .map((candidate, index) => ({
       ...candidate,
@@ -712,7 +976,10 @@ export function buildTwentyFirstVisualFunnel(input: {
     }));
   const supportingCandidates = retrievalShortlist
     .filter((candidate) => candidate.queryRole !== "foundation")
-    .sort((left, right) => right.score - left.score || left.searchRank - right.searchRank)
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.searchRank - right.searchRank,
+    )
     .slice(0, 2);
   const degradedReasons: string[] = [];
   if (searchedCandidates.length < SITEOPS_VISUAL_FUNNEL_TARGETS.search) {

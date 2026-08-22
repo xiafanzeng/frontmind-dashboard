@@ -15,23 +15,22 @@ import {
 import {
   canonicalJson,
   canonicalSha256,
-  buildTwentyFirstVisualFunnel,
+  buildTwentyFirstSearchOnlyFunnel,
   composeTwentyFirstQueries,
   createVisualEvidenceV1,
-  normalizeTwentyFirstDetail,
   normalizeTwentyFirstSearchResults,
   visualSearchOperationInputV1Schema,
   VISUAL_EVIDENCE_KIND,
   VISUAL_TAXONOMY_DERIVATION_VERSION,
   type NormalizedTwentyFirstCandidate,
   type SafeVisualDirective,
-  type TwentyFirstDetailEnvelope,
+  type TwentyFirstQueryAxis,
   type TwentyFirstQueryRole,
   type TwentyFirstSearchEnvelope,
 } from "../../shared/siteops-workflow";
 import {
   siteBriefSchema,
-  visualSelectionBundleSchema,
+  visualSelectionBundleV2Schema,
   type SiteBrief,
 } from "../../shared/siteops";
 import { AuthServiceError } from "../auth-service";
@@ -46,13 +45,10 @@ import {
 import { persistSiteOpsArtifact } from "./artifact-store";
 import { registerSiteOpsProviderHandler } from "./providers";
 import { fetchSafeVisualPreview } from "./remote-preview";
-import type { SiteOpsProviderHandler, SiteOpsProviderResult } from "./providers";
-
-const SEARCH_LIMITS: Readonly<Record<TwentyFirstQueryRole, number>> = {
-  foundation: 10,
-  section: 6,
-  motion: 2,
-};
+import type {
+  SiteOpsProviderHandler,
+  SiteOpsProviderResult,
+} from "./providers";
 
 const OPERATION_MARKER_PREFIX = "siteops-21st-operation:";
 
@@ -74,9 +70,8 @@ type PreviewArtifact = {
   contentSha256: string;
 };
 
-type MirroredCandidate = {
+type MirroredReference = {
   sampleId: string;
-  optionLabel: string;
   candidate: NormalizedTwentyFirstCandidate;
   taxonomy: ReturnType<typeof taxonomyFromDirectives>;
   previewLocalAssetId: string;
@@ -84,10 +79,37 @@ type MirroredCandidate = {
   visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
 };
 
+type MirroredCandidate = MirroredReference & { optionLabel: string };
+
+type PreviewRejectionReason =
+  | "url"
+  | "dns"
+  | "connect"
+  | "redirect"
+  | "http"
+  | "mime"
+  | "size"
+  | "decode"
+  | "duplicate"
+  | "persist"
+  | "hash"
+  | "aborted";
+
+export type VisualSearchDiagnostics = {
+  diagnosticsVersion: 1;
+  searchedByAxis: Record<TwentyFirstQueryAxis, number>;
+  normalizedUnique: number;
+  shortlistCount: number;
+  withPreviewReference: number;
+  mirrorAttempted: number;
+  mirrorSucceeded: number;
+  rejectedByReason: Partial<Record<PreviewRejectionReason, number>>;
+};
+
 export type TwentyFirstBoardPersistenceInput = {
   operation: SiteOperation;
   context: TwentyFirstProviderContext;
-  selectionBundle: z.infer<typeof visualSelectionBundleSchema>;
+  selectionBundle: z.infer<typeof visualSelectionBundleV2Schema>;
   selectionBundleArtifact: PreviewArtifact;
   mirroredCandidates: MirroredCandidate[];
 };
@@ -127,6 +149,44 @@ type VisualSearchStage =
   | "mirror_previews"
   | "persist_selection_bundle"
   | "persist_board";
+
+function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
+  return {
+    diagnosticsVersion: 1,
+    searchedByAxis: {
+      foundation_split: 0,
+      foundation_editorial_modular: 0,
+      section_proof_conversion: 0,
+      motion_accessible: 0,
+    },
+    normalizedUnique: 0,
+    shortlistCount: 0,
+    withPreviewReference: 0,
+    mirrorAttempted: 0,
+    mirrorSucceeded: 0,
+    rejectedByReason: {},
+  };
+}
+
+function rejectDiagnostic(
+  diagnostics: VisualSearchDiagnostics,
+  reason: PreviewRejectionReason,
+) {
+  diagnostics.rejectedByReason[reason] =
+    (diagnostics.rejectedByReason[reason] ?? 0) + 1;
+}
+
+function abortLike(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const name = "name" in error ? String(error.name) : "";
+  const code = "code" in error ? String(error.code) : "";
+  return (
+    name === "AbortError" ||
+    name === "TimeoutError" ||
+    code === "ABORT_ERR" ||
+    code === "ETIMEDOUT"
+  );
+}
 
 function cleanText(value: unknown, fallback: string, maxLength: number) {
   if (typeof value !== "string") return fallback;
@@ -299,13 +359,20 @@ function taxonomyFromDirectives(
       )
       .map((directive) => directive.slice(directive.indexOf(":") + 1));
   const layout = values(["structure", "surface", "imagery", "tone"]);
-  if (preview && preview.width / preview.height >= 1.4 && !layout.includes("wide-crop")) {
+  if (
+    preview &&
+    preview.width / preview.height >= 1.4 &&
+    !layout.includes("wide-crop")
+  ) {
     layout.push("wide-crop");
   }
   const palette = values(["color"]);
   if (preview?.visualSignals) {
     palette.unshift(preview.visualSignals.dominantHex);
-    if (preview.visualSignals.brightness <= 96 && !palette.includes("dark-canvas")) {
+    if (
+      preview.visualSignals.brightness <= 96 &&
+      !palette.includes("dark-canvas")
+    ) {
       palette.push("dark-canvas");
     } else if (
       preview.visualSignals.brightness >= 180 &&
@@ -313,7 +380,10 @@ function taxonomyFromDirectives(
     ) {
       palette.push("light-canvas");
     }
-    if (preview.visualSignals.contrast >= 60 && !palette.includes("high-contrast")) {
+    if (
+      preview.visualSignals.contrast >= 60 &&
+      !palette.includes("high-contrast")
+    ) {
       palette.push("high-contrast");
     }
   }
@@ -331,79 +401,41 @@ function taxonomyFromDirectives(
   };
 }
 
-function safeSearchEnvelopes(
-  envelopes: readonly TwentyFirstSearchEnvelope[],
-): TwentyFirstSearchEnvelope[] {
-  const candidates = normalizeTwentyFirstSearchResults(envelopes);
-  const sources = new Set<string>();
-  const previews = new Set<string>();
-  return candidates
-    .filter((candidate) => {
-      if (
-        (candidate.sourceUrl && sources.has(candidate.sourceUrl)) ||
-        (candidate.previewUrl && previews.has(candidate.previewUrl))
-      ) {
-        return false;
-      }
-      if (candidate.sourceUrl) sources.add(candidate.sourceUrl);
-      if (candidate.previewUrl) previews.add(candidate.previewUrl);
-      return true;
-    })
-    .map((candidate) => ({
-      role: candidate.queryRole,
-      payload: {
-        results: [
-          {
-            id: candidate.providerItemId,
-            title: candidate.title,
-            description: candidate.description,
-            author: candidate.author,
-            sourceUrl: candidate.sourceUrl,
-            previewUrl: candidate.previewUrl,
-          },
-        ],
-      },
-    }));
-}
-
 async function retrieveFunnel(input: {
   session: TwentyFirstReadOnlySession;
   brief: SiteBrief;
+  signal: AbortSignal;
+  diagnostics: VisualSearchDiagnostics;
 }) {
   const queries = composeTwentyFirstQueries(input.brief);
-  const rawSearchEnvelopes: TwentyFirstSearchEnvelope[] = [];
+  const searchEnvelopes: TwentyFirstSearchEnvelope[] = [];
   for (const query of queries) {
-    rawSearchEnvelopes.push({
-      role: query.role,
-      payload: await input.session.search(query.query, SEARCH_LIMITS[query.role]),
-    });
-  }
-  const searchEnvelopes = safeSearchEnvelopes(rawSearchEnvelopes);
-  const searchItems = normalizeTwentyFirstSearchResults(searchEnvelopes);
-  const details: TwentyFirstDetailEnvelope[] = [];
-  let rejectedDetails = 0;
-  for (const searchItem of searchItems) {
-    const detail: TwentyFirstDetailEnvelope = {
-      operation: "get_component",
-      requestedProviderItemId: searchItem.providerItemId,
-      payload: await input.session.getComponent(searchItem.providerItemId),
-    };
-    try {
-      const normalized = normalizeTwentyFirstDetail({ searchItem, detail });
-      if (!normalized) {
-        rejectedDetails += 1;
-        continue;
-      }
-      details.push(detail);
-      if (details.length >= 12) break;
-    } catch {
-      rejectedDetails += 1;
+    if (input.signal.aborted) {
+      throw new TwentyFirstProviderFailure(
+        "VISUAL_SEARCH_TIMEOUT",
+        "视觉检索已超时，请重置后重新开始。",
+      );
     }
+    const envelope: TwentyFirstSearchEnvelope = {
+      role: query.role,
+      axis: query.axis,
+      limit: query.limit,
+      payload: await input.session.search({
+        query: query.query,
+        type: "component",
+        limit: query.limit,
+      }),
+    };
+    searchEnvelopes.push(envelope);
+    input.diagnostics.searchedByAxis[query.axis] =
+      normalizeTwentyFirstSearchResults([envelope]).length;
   }
-  const funnel = buildTwentyFirstVisualFunnel({ searchEnvelopes, details });
-  if (rejectedDetails > 0) {
-    funnel.degradedReasons.push(`DETAIL_RESULTS_REJECTED:${rejectedDetails}`);
-  }
+  const funnel = buildTwentyFirstSearchOnlyFunnel({ searchEnvelopes });
+  input.diagnostics.normalizedUnique = funnel.searchedCandidates.length;
+  input.diagnostics.shortlistCount = funnel.retrievalShortlist.length;
+  input.diagnostics.withPreviewReference = funnel.searchedCandidates.filter(
+    (candidate) => candidate.previewUrl,
+  ).length;
   return { queries, funnel };
 }
 
@@ -425,6 +457,28 @@ function extensionForMimeType(mimeType: string) {
   }
 }
 
+function previewRejectionReason(error: unknown): PreviewRejectionReason {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String(error.code)
+      : "";
+  const message = error instanceof Error ? error.message : "";
+  const value = `${code}:${message}`;
+  if (abortLike(error)) return "aborted";
+  if (/HASH/u.test(value)) return "hash";
+  if (/MIME/u.test(value)) return "mime";
+  if (/(?:SIZE|LARGE|PIXEL)/u.test(value)) return "size";
+  if (/(?:IMAGE|DECODE|SHARP)/iu.test(value)) return "decode";
+  if (/REDIRECT/u.test(value)) return "redirect";
+  if (/(?:ENOTFOUND|EAI_AGAIN|DNS)/u.test(value)) return "dns";
+  if (/(?:ECONN|ENET|EHOST|TLS|SOCKET|CONNECTED_ADDRESS)/u.test(value)) {
+    return "connect";
+  }
+  if (/(?:HTTP|FETCH|BODY)/u.test(value)) return "http";
+  if (/(?:URL|PRIVATE_ADDRESS|UNSAFE)/u.test(value)) return "url";
+  return "http";
+}
+
 async function mirrorCandidates(input: {
   operation: SiteOperation;
   context: TwentyFirstProviderContext;
@@ -432,32 +486,70 @@ async function mirrorCandidates(input: {
   signal: AbortSignal;
   fetchPreview: typeof fetchSafeVisualPreview;
   persistArtifact: typeof persistSiteOpsArtifact;
+  diagnostics: VisualSearchDiagnostics;
 }) {
-  const mirrored: MirroredCandidate[] = [];
-  let rejectedPreviews = 0;
-  for (const candidate of input.candidates) {
-    if (mirrored.length >= 9) break;
-    if (!candidate.previewUrl) continue;
-    try {
-      const preview = await input.fetchPreview({
-        url: candidate.previewUrl,
-        signal: input.signal,
-      });
-      const asset = await input.persistArtifact({
-        userId: input.operation.userId,
-        projectId: input.context.project.id,
-        kind: "21st-visual-preview",
-        filename: `21st-${candidate.candidateId.slice(0, 120)}.${extensionForMimeType(preview.mimeType)}`,
-        mimeType: preview.mimeType,
-        buffer: preview.buffer,
-        maxBytes: 5 * 1024 * 1024,
-      });
+  const mirrored: MirroredReference[] = [];
+  const seenPreviewHashes = new Set<string>();
+  const budget = AbortSignal.timeout(45_000);
+  const mirrorSignal = AbortSignal.any([input.signal, budget]);
+  for (let offset = 0; offset < input.candidates.length; offset += 3) {
+    if (mirrorSignal.aborted) {
+      throw new TwentyFirstProviderFailure(
+        "VISUAL_SEARCH_TIMEOUT",
+        "视觉预览镜像已超时，请重置后重新开始。",
+      );
+    }
+    const batch = input.candidates.slice(offset, offset + 3);
+    const downloaded = await Promise.all(
+      batch.map(async (candidate) => {
+        input.diagnostics.mirrorAttempted += 1;
+        try {
+          const preview = await input.fetchPreview({
+            url: candidate.previewUrl!,
+            signal: mirrorSignal,
+          });
+          return { candidate, preview } as const;
+        } catch (error) {
+          if (mirrorSignal.aborted) {
+            throw new TwentyFirstProviderFailure(
+              "VISUAL_SEARCH_TIMEOUT",
+              "视觉预览镜像已超时，请重置后重新开始。",
+            );
+          }
+          rejectDiagnostic(input.diagnostics, previewRejectionReason(error));
+          return null;
+        }
+      }),
+    );
+    for (const downloadedItem of downloaded) {
+      if (!downloadedItem) continue;
+      const { candidate, preview } = downloadedItem;
+      if (seenPreviewHashes.has(preview.sha256)) {
+        rejectDiagnostic(input.diagnostics, "duplicate");
+        continue;
+      }
+      seenPreviewHashes.add(preview.sha256);
+      let asset: Awaited<ReturnType<typeof input.persistArtifact>>;
+      try {
+        asset = await input.persistArtifact({
+          userId: input.operation.userId,
+          projectId: input.context.project.id,
+          kind: "21st-visual-preview",
+          filename: `21st-${candidate.candidateId.slice(0, 120)}.${extensionForMimeType(preview.mimeType)}`,
+          mimeType: preview.mimeType,
+          buffer: preview.buffer,
+          maxBytes: 5 * 1024 * 1024,
+        });
+      } catch {
+        rejectDiagnostic(input.diagnostics, "persist");
+        continue;
+      }
       if (asset.contentSha256 !== preview.sha256) {
-        throw new Error("PREVIEW_ARTIFACT_HASH_MISMATCH");
+        rejectDiagnostic(input.diagnostics, "hash");
+        continue;
       }
       mirrored.push({
         sampleId: randomUUID(),
-        optionLabel: String.fromCharCode(65 + mirrored.length),
         candidate,
         taxonomy: taxonomyFromDirectives(
           candidate.queryRole,
@@ -479,11 +571,10 @@ async function mirrorCandidates(input: {
           taxonomyDerivationVersion: VISUAL_TAXONOMY_DERIVATION_VERSION,
         }),
       });
-    } catch {
-      rejectedPreviews += 1;
+      input.diagnostics.mirrorSucceeded += 1;
     }
   }
-  return { mirrored, rejectedPreviews };
+  return mirrored;
 }
 
 async function persistDefaultBoard(
@@ -574,6 +665,11 @@ async function persistDefaultBoard(
         previewLocalAssetId: item.previewLocalAssetId,
         sourceMetadata: {
           providerItemKey: item.candidate.providerItemKey,
+          queryAxis: item.candidate.queryAxis,
+          title: item.candidate.title,
+          description: item.candidate.description,
+          author: item.candidate.author,
+          sourceUrl: item.candidate.sourceUrl,
           visualEvidence: item.visualEvidence,
           taxonomy: {
             ...item.taxonomy,
@@ -637,9 +733,24 @@ async function persistDefaultBoard(
 function safeProviderFailure(
   error: unknown,
   stage: VisualSearchStage,
+  diagnostics: VisualSearchDiagnostics,
+  signal: AbortSignal,
 ): SiteOpsProviderResult {
+  if (signal.aborted || abortLike(error)) {
+    return {
+      status: "failed",
+      code: "VISUAL_SEARCH_TIMEOUT",
+      message: "视觉检索已超时，请重置后重新开始。",
+      result: diagnostics,
+    };
+  }
   if (error instanceof TwentyFirstProviderFailure) {
-    return { status: error.status, code: error.code, message: error.message };
+    return {
+      status: error.status,
+      code: error.code,
+      message: error.message,
+      result: diagnostics,
+    };
   }
   if (error instanceof z.ZodError) {
     if (stage !== "validate_operation" && stage !== "load_context") {
@@ -647,12 +758,14 @@ function safeProviderFailure(
         status: "attention_required",
         code: "VISUAL_BOARD_PERSISTENCE_FAILED",
         message: "视觉方向未能安全保存，请稍后重试。",
+        result: diagnostics,
       };
     }
     return {
       status: "failed",
       code: "VISUAL_OPERATION_CONTRACT_MISMATCH",
       message: "视觉检索任务合同不一致，请重置后重新开始。",
+      result: diagnostics,
     };
   }
   if (error instanceof TwentyFirstToolContractError) {
@@ -660,6 +773,7 @@ function safeProviderFailure(
       status: "attention_required",
       code: "MCP_CONTRACT_INCOMPATIBLE",
       message: "21st 目录工具参数协议暂不兼容，请稍后重试。",
+      result: diagnostics,
     };
   }
   if (error instanceof AuthServiceError) {
@@ -673,6 +787,7 @@ function safeProviderFailure(
         error.code === "INVALID_CREDENTIAL"
           ? "21st API Key 无效，或当前连接缺少必要的只读目录能力。"
           : "21st 目录服务暂时不可用，请稍后重试。",
+      result: diagnostics,
     };
   }
   if (stage === "mcp_retrieval") {
@@ -680,12 +795,14 @@ function safeProviderFailure(
       status: "attention_required",
       code: "MCP_UNAVAILABLE",
       message: "21st 目录服务暂时不可用，请稍后重试。",
+      result: diagnostics,
     };
   }
   return {
     status: "attention_required",
     code: "VISUAL_BOARD_PERSISTENCE_FAILED",
     message: "视觉方向未能安全保存，请稍后重试。",
+    result: diagnostics,
   };
 }
 
@@ -705,6 +822,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
   return async ({ operation, signal }) => {
     let stage: VisualSearchStage = "validate_operation";
     let activeApiKey: string | undefined;
+    const diagnostics = createVisualSearchDiagnostics();
     try {
       const parsedInput = visualSearchOperationInputV1Schema.parse(
         operation.input,
@@ -745,54 +863,107 @@ export function createTwentyFirstSiteOpsProviderHandler(
       stage = "mcp_retrieval";
       const { queries, funnel } = await client.withReadOnlySession(
         credential.apiKey,
-        (session) => retrieveFunnel({ session, brief: context.brief }),
+        (session) =>
+          retrieveFunnel({
+            session,
+            brief: context.brief,
+            signal,
+            diagnostics,
+          }),
         { signal },
       );
-      const foundationCandidates = funnel.retrievalShortlist
-        .filter(
-          (candidate) =>
-            candidate.queryRole === "foundation" && candidate.previewUrl,
-        )
-        .sort(
-          (left, right) =>
-            right.score - left.score || left.searchRank - right.searchRank,
+      if (diagnostics.normalizedUnique === 0) {
+        throw new TwentyFirstProviderFailure(
+          "MCP_SEARCH_EMPTY",
+          "21st 本轮没有返回可解析的真实目录结果。",
         );
+      }
+      if (diagnostics.withPreviewReference === 0) {
+        throw new TwentyFirstProviderFailure(
+          "NO_SAFE_PREVIEW_REFERENCES",
+          "21st 本轮目录结果没有可安全读取的 HTTPS 视觉预览。",
+        );
+      }
       stage = "mirror_previews";
-      const { mirrored, rejectedPreviews } = await mirrorCandidates({
+      const mirrored = await mirrorCandidates({
         operation,
         context,
-        candidates: foundationCandidates,
+        candidates: funnel.retrievalShortlist,
         signal,
         fetchPreview,
         persistArtifact,
+        diagnostics,
       });
       if (mirrored.length === 0) {
         throw new TwentyFirstProviderFailure(
-          "ZERO_VISUAL_CANDIDATES",
-          "21st 本轮没有可安全展示的真实视觉候选；未生成假图补位。",
+          "PREVIEW_MIRROR_FAILED",
+          "21st 返回了真实预览，但本轮下载、解码或安全保存均未成功。",
         );
       }
+      const foundation = mirrored.filter(
+        (item) => item.candidate.queryRole === "foundation",
+      );
+      const nonFoundation = mirrored.filter(
+        (item) => item.candidate.queryRole !== "foundation",
+      );
+      const displayReferences = [...foundation, ...nonFoundation].slice(0, 9);
+      const mirroredCandidates: MirroredCandidate[] = displayReferences.map(
+        (item, index) => ({
+          ...item,
+          optionLabel: String.fromCharCode(65 + index),
+        }),
+      );
+      const displayedIds = new Set(
+        displayReferences.map((item) => item.candidate.providerItemKey),
+      );
+      const supportingReferences = nonFoundation
+        .filter((item) => !displayedIds.has(item.candidate.providerItemKey))
+        .slice(0, 2);
       const degradedReasons = funnel.degradedReasons.filter(
         (reason) => !reason.startsWith("PRESENTATION_RESULTS_INSUFFICIENT:"),
       );
+      const rejectedPreviews = Object.values(
+        diagnostics.rejectedByReason,
+      ).reduce((sum, count) => sum + (count ?? 0), 0);
       if (rejectedPreviews > 0) {
         degradedReasons.push(`PREVIEW_RESULTS_REJECTED:${rejectedPreviews}`);
       }
-      if (mirrored.length < 9) {
+      if (mirroredCandidates.length < 9) {
         degradedReasons.push(
-          `PRESENTATION_RESULTS_INSUFFICIENT:${mirrored.length}/9`,
+          `PRESENTATION_RESULTS_INSUFFICIENT:${mirroredCandidates.length}/9`,
         );
       }
       stage = "persist_selection_bundle";
-      const selectionBundle = visualSelectionBundleSchema.parse({
-        queryHash: canonicalSha256(queries),
+      const selectionBundle = visualSelectionBundleV2Schema.parse({
+        schemaVersion: 2,
+        queryPlanHash: canonicalSha256(queries),
         searchTarget: 18,
-        detailTarget: 12,
+        shortlistTarget: 12,
         displayTarget: 9,
-        candidates: mirrored.map((item) => ({
+        candidates: mirroredCandidates.map((item) => ({
           id: item.sampleId,
           label: item.optionLabel,
+          queryAxis: item.candidate.queryAxis,
           providerItemKey: item.candidate.providerItemKey,
+          title: item.candidate.title,
+          description: item.candidate.description,
+          author: item.candidate.author,
+          sourceUrl: item.candidate.sourceUrl,
+          visualEvidence: item.visualEvidence,
+          previewLocalAssetId: item.previewLocalAssetId,
+          previewSha256: item.previewSha256,
+          taxonomy: item.taxonomy,
+          score: item.candidate.score,
+          rationale: item.candidate.rationale,
+        })),
+        supportingCandidates: supportingReferences.map((item) => ({
+          id: item.sampleId,
+          queryAxis: item.candidate.queryAxis,
+          providerItemKey: item.candidate.providerItemKey,
+          title: item.candidate.title,
+          description: item.candidate.description,
+          author: item.candidate.author,
+          sourceUrl: item.candidate.sourceUrl,
           visualEvidence: item.visualEvidence,
           previewLocalAssetId: item.previewLocalAssetId,
           previewSha256: item.previewSha256,
@@ -804,7 +975,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
         delegated: false,
         degradedReasons: Array.from(new Set(degradedReasons)),
       });
-      const selectionBuffer = Buffer.from(canonicalJson(selectionBundle), "utf8");
+      const selectionBuffer = Buffer.from(
+        canonicalJson(selectionBundle),
+        "utf8",
+      );
       const selectionBundleArtifact = await persistArtifact({
         userId: operation.userId,
         projectId: context.project.id,
@@ -828,7 +1002,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
         context,
         selectionBundle,
         selectionBundleArtifact,
-        mirroredCandidates: mirrored,
+        mirroredCandidates,
       });
       return {
         status: "succeeded",
@@ -839,15 +1013,17 @@ export function createTwentyFirstSiteOpsProviderHandler(
           selectionBundleHash: board.selectionBundleHash ?? undefined,
           actual: {
             searched: funnel.actual.searched,
-            detailRetrieved: funnel.actual.detailRetrieved,
-            presented: mirrored.length,
+            shortlisted: funnel.actual.shortlisted,
+            mirrored: diagnostics.mirrorSucceeded,
+            presented: mirroredCandidates.length,
           },
+          diagnostics,
           degradedReasons: selectionBundle.degradedReasons,
         },
         message:
-          mirrored.length === 9
+          mirroredCandidates.length === 9
             ? "9 个真实视觉方向已准备完成，请选择 A–I。"
-            : `${mirrored.length} 个真实视觉方向已按实际可用结果展示。`,
+            : `${mirroredCandidates.length} 个真实视觉方向已按实际可用结果展示。`,
       };
     } catch (error) {
       console.error("[SiteOps21st] visual_search_failed", {
@@ -858,7 +1034,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           additionalSecrets: activeApiKey ? [activeApiKey] : [],
         }),
       });
-      return safeProviderFailure(error, stage);
+      return safeProviderFailure(error, stage, diagnostics, signal);
     }
   };
 }

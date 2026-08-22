@@ -19,7 +19,26 @@ export const SITEOPS_MATERIALIZER_V1_2 = {
   qaPolicyVersion: "siteops-qa-v1",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_2;
+/** FrontMind 1.3 keeps the trusted materializer implementation while changing
+ * the frozen visual-provider evidence contract to search-only V2 bundles. */
+export const SITEOPS_MATERIALIZER_V1_3 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "1.3.0",
+  runtimeManifestSha256:
+    "6c4b7aed53a2ba821a05a749690efe7686c75dbfd4011b6dcc7b8ae1550fe1bf",
+  starterVersion: "1.3.0",
+  starterSha256:
+    "ad058ea2db058859e5bf5f6399ae027af98f256fba98eeff32c3b075a27cbbff",
+  componentLibraryVersion: "1.0.0",
+  materializerVersion: "1.0.0",
+  materializerSha256:
+    "f309d1ecabbef376df54fcd9976c37ff5408a62a9f16aabfc8ca699413c76b5a",
+  qaPolicyVersion: "siteops-qa-v1",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_3;
 
 export const siteOpsProjectStatusSchema = z.enum([
   "draft",
@@ -212,7 +231,7 @@ export const visualCandidateSchema = z
     }
   });
 
-export const visualSelectionBundleSchema = z
+export const visualSelectionBundleV1Schema = z
   .object({
     queryHash: z.string().regex(/^[a-f0-9]{64}$/),
     searchTarget: z.literal(18),
@@ -224,6 +243,151 @@ export const visualSelectionBundleSchema = z
     degradedReasons: z.array(z.string().max(500)).max(30).default([]),
   })
   .strict();
+
+export const visualQueryAxisSchema = z.enum([
+  "foundation_split",
+  "foundation_editorial_modular",
+  "section_proof_conversion",
+  "motion_accessible",
+]);
+
+const visualCandidateV2BaseSchema = z
+  .object({
+    id: z.string().trim().min(1).max(191),
+    queryAxis: visualQueryAxisSchema,
+    providerItemKey: z.string().trim().min(3).max(514),
+    title: z.string().trim().min(1).max(300),
+    description: z.string().trim().min(1).max(300).nullable(),
+    author: z.string().trim().min(1).max(300).nullable(),
+    sourceUrl: z.string().url().max(2_048).nullable(),
+    visualEvidence: visualEvidenceV1Schema,
+    previewLocalAssetId: z.string().uuid(),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    taxonomy: visualTaxonomySchema,
+    score: z.number().finite().min(0).max(100),
+    rationale: z.string().trim().min(1).max(2_000),
+  })
+  .strict();
+
+function expectedRoleForVisualAxis(
+  axis: z.infer<typeof visualQueryAxisSchema>,
+) {
+  if (axis.startsWith("foundation_")) return "foundation" as const;
+  if (axis.startsWith("section_")) return "section" as const;
+  return "motion" as const;
+}
+
+function validateVisualCandidateCoordinates(
+  value: z.infer<typeof visualCandidateV2BaseSchema>,
+  context: z.RefinementCtx,
+) {
+  if (value.providerItemKey !== value.visualEvidence.providerItemKey) {
+    context.addIssue({
+      code: "custom",
+      path: ["visualEvidence", "providerItemKey"],
+      message: "Visual evidence provider item does not match candidate",
+    });
+  }
+  if (value.previewSha256 !== value.visualEvidence.previewSha256) {
+    context.addIssue({
+      code: "custom",
+      path: ["visualEvidence", "previewSha256"],
+      message: "Visual evidence preview does not match candidate",
+    });
+  }
+  if (value.taxonomy.role !== expectedRoleForVisualAxis(value.queryAxis)) {
+    context.addIssue({
+      code: "custom",
+      path: ["taxonomy", "role"],
+      message: "Visual taxonomy role does not match query axis",
+    });
+  }
+}
+
+export const visualCandidateV2Schema = visualCandidateV2BaseSchema
+  .extend({ label: z.string().regex(/^[A-I]$/) })
+  .strict()
+  .superRefine(validateVisualCandidateCoordinates);
+
+export const visualSupportingCandidateV2Schema =
+  visualCandidateV2BaseSchema.superRefine(validateVisualCandidateCoordinates);
+
+export const visualSelectionBundleV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/),
+    searchTarget: z.literal(18),
+    shortlistTarget: z.literal(12),
+    displayTarget: z.literal(9),
+    candidates: z.array(visualCandidateV2Schema).min(1).max(9),
+    supportingCandidates: z
+      .array(visualSupportingCandidateV2Schema)
+      .max(2)
+      .default([]),
+    selectedCandidateId: z.string().max(191).nullable(),
+    delegated: z.boolean().default(false),
+    degradedReasons: z.array(z.string().max(500)).max(30).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const labels = new Set<string>();
+    for (const candidate of value.candidates) {
+      if (labels.has(candidate.label)) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates", "label"],
+          message: "Visual candidate labels must be unique",
+        });
+      }
+      labels.add(candidate.label);
+    }
+    const ids = new Set<string>();
+    const providerKeys = new Set<string>();
+    const assetIds = new Set<string>();
+    const evidenceHashes = new Set<string>();
+    for (const candidate of [
+      ...value.candidates,
+      ...value.supportingCandidates,
+    ]) {
+      for (const [collection, coordinate, path] of [
+        [ids, candidate.id, "id"],
+        [providerKeys, candidate.providerItemKey, "providerItemKey"],
+        [assetIds, candidate.previewLocalAssetId, "previewLocalAssetId"],
+        [
+          evidenceHashes,
+          candidate.visualEvidence.evidenceSha256,
+          "visualEvidence.evidenceSha256",
+        ],
+      ] as const) {
+        if (collection.has(coordinate)) {
+          context.addIssue({
+            code: "custom",
+            path: [path],
+            message: "Visual selection coordinates must be unique",
+          });
+        }
+        collection.add(coordinate);
+      }
+    }
+    if (
+      value.selectedCandidateId !== null &&
+      !value.candidates.some(
+        (candidate) => candidate.id === value.selectedCandidateId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedCandidateId"],
+        message: "Selected visual candidate is absent",
+      });
+    }
+  });
+
+/** Immutable V1 artifacts remain readable; every new visual operation writes V2. */
+export const visualSelectionBundleSchema = z.union([
+  visualSelectionBundleV2Schema,
+  visualSelectionBundleV1Schema,
+]);
 
 export const buildContractV1Schema = z
   .object({
@@ -364,6 +528,12 @@ export const siteOpsActInputSchema = z
 
 export type SiteOpsCard = z.infer<typeof siteOpsCardSchema>;
 export type SiteBrief = z.infer<typeof siteBriefSchema>;
+export type VisualSelectionBundleV1 = z.infer<
+  typeof visualSelectionBundleV1Schema
+>;
+export type VisualSelectionBundleV2 = z.infer<
+  typeof visualSelectionBundleV2Schema
+>;
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;
 export type SiteOpsActInput = z.infer<typeof siteOpsActInputSchema>;

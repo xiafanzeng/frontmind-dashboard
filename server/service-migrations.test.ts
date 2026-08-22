@@ -121,7 +121,6 @@ describe("service portal migration chain", () => {
       "0061_knowledge_base_resilient_manus_v2",
       "0062_hard_glorian",
       "0063_lean_blue_marvel",
-      "0064_siteops_v1",
     ]);
   });
 

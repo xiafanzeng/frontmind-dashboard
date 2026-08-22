@@ -30,6 +30,8 @@ const TWENTY_FIRST_MAX_RESPONSE_BYTES = 1_000_000;
 const TWENTY_FIRST_MAX_JSON_DEPTH = 32;
 const TWENTY_FIRST_MAX_RETRY_AFTER_MS = 2_000;
 const TWENTY_FIRST_MAX_HTTP_RETRIES = 1;
+const TWENTY_FIRST_MAX_TOOL_PAGES = 3;
+const TWENTY_FIRST_MAX_TOOLS = 100;
 
 export type TwentyFirstCapabilities = {
   search: boolean;
@@ -276,9 +278,17 @@ type TwentyFirstAdvertisedTool = {
 
 export type TwentyFirstProviderItemId = string | number;
 
+export type TwentyFirstSearchRequest = {
+  query: string;
+  type: "component";
+  limit: number;
+};
+
 export type TwentyFirstReadOnlySession = {
-  search(query: string, limit: number): Promise<unknown>;
-  getComponent(providerItemId: TwentyFirstProviderItemId): Promise<unknown>;
+  search(input: TwentyFirstSearchRequest): Promise<unknown>;
+  getComponent?: (
+    providerItemId: TwentyFirstProviderItemId,
+  ) => Promise<unknown>;
 };
 
 export class TwentyFirstToolContractError extends AuthServiceError {
@@ -306,12 +316,37 @@ function compatibleEnumValue(
   property: object | undefined,
   candidates: readonly string[],
 ) {
-  const values = Array.isArray(
+  const declared = Array.isArray(
     (property as { enum?: unknown } | undefined)?.enum,
-  )
+  );
+  const values = declared
     ? ((property as { enum: unknown[] }).enum ?? [])
-    : [];
-  return candidates.find((candidate) => values.includes(candidate));
+    : null;
+  return values
+    ? candidates.find((candidate) => values.includes(candidate))
+    : candidates[0];
+}
+
+function boundedSearchLimit(property: object | undefined, requested: number) {
+  if (!Number.isFinite(requested)) throw new TwentyFirstToolContractError();
+  const constraint = (property ?? {}) as {
+    minimum?: unknown;
+    maximum?: unknown;
+  };
+  const minimum =
+    typeof constraint.minimum === "number" &&
+    Number.isFinite(constraint.minimum)
+      ? Math.ceil(constraint.minimum)
+      : 1;
+  const maximum =
+    typeof constraint.maximum === "number" &&
+    Number.isFinite(constraint.maximum)
+      ? Math.floor(constraint.maximum)
+      : 18;
+  const lower = Math.max(1, minimum);
+  const upper = Math.min(18, maximum);
+  if (lower > upper) throw new TwentyFirstToolContractError();
+  return Math.max(lower, Math.min(Math.trunc(requested), upper));
 }
 
 function advertisedJsonTypes(property: object | undefined) {
@@ -406,7 +441,7 @@ export function buildTwentyFirstToolArguments(input: {
       "page_size",
     ]);
     if (limitKey) {
-      const limit = Math.max(1, Math.min(Math.trunc(input.limit ?? 10), 18));
+      const limit = boundedSearchLimit(properties[limitKey], input.limit ?? 10);
       assertAdvertisedPrimitive(properties[limitKey], limit);
       args[limitKey] = limit;
     }
@@ -417,7 +452,9 @@ export function buildTwentyFirstToolArguments(input: {
         "components",
         "c",
       ]);
-      if (typeValue) args[typeKey] = typeValue;
+      if (!typeValue) throw new TwentyFirstToolContractError();
+      assertAdvertisedPrimitive(properties[typeKey], typeValue);
+      args[typeKey] = typeValue;
     }
   }
   const required = new Set(input.tool.inputSchema.required ?? []);
@@ -432,7 +469,12 @@ export function buildTwentyFirstToolArguments(input: {
 
 function parseToolTextPayload(text: string) {
   const value = text.trim();
-  if (!value || value.length > TWENTY_FIRST_MAX_RESPONSE_BYTES) return null;
+  if (
+    !value ||
+    Buffer.byteLength(value, "utf8") > TWENTY_FIRST_MAX_RESPONSE_BYTES
+  ) {
+    return null;
+  }
   try {
     return JSON.parse(value) as unknown;
   } catch {
@@ -440,29 +482,73 @@ function parseToolTextPayload(text: string) {
   }
 }
 
+function resultsProjection(
+  value: unknown,
+  depth = 0,
+): { results: unknown[] } | null {
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Array.isArray((value as { results?: unknown }).results)
+  ) {
+    return { results: (value as { results: unknown[] }).results };
+  }
+  if (
+    depth < 4 &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const record = value as Record<string, unknown>;
+    for (const key of [
+      "data",
+      "result",
+      "payload",
+      "output",
+      "structuredContent",
+    ]) {
+      const nested = resultsProjection(record[key], depth + 1);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
 /** Returns the provider payload only to the current bounded request. */
 export function projectTwentyFirstToolPayload(result: Record<string, unknown>) {
-  if (
-    result.structuredContent &&
-    typeof result.structuredContent === "object"
-  ) {
-    return result.structuredContent;
-  }
-  const parsed = Array.isArray(result.content)
-    ? result.content
-        .filter((item): item is { type: "text"; text: string } =>
-          Boolean(
-            item &&
-              typeof item === "object" &&
-              (item as { type?: unknown }).type === "text" &&
-              typeof (item as { text?: unknown }).text === "string",
-          ),
-        )
-        .map((item) => parseToolTextPayload(item.text))
-        .filter((item) => item !== null)
+  const structuredResults = resultsProjection(result.structuredContent);
+  if (structuredResults) return structuredResults;
+  const textItems = Array.isArray(result.content)
+    ? result.content.filter((item): item is { type: "text"; text: string } =>
+        Boolean(
+          item &&
+            typeof item === "object" &&
+            (item as { type?: unknown }).type === "text" &&
+            typeof (item as { text?: unknown }).text === "string",
+        ),
+      )
     : [];
+  const totalTextBytes = textItems.reduce(
+    (sum, item) => sum + Buffer.byteLength(item.text, "utf8"),
+    0,
+  );
+  const parsed =
+    totalTextBytes <= TWENTY_FIRST_MAX_RESPONSE_BYTES
+      ? textItems
+          .map((item) => parseToolTextPayload(item.text))
+          .filter((item) => item !== null)
+      : [];
+  const textResults = parsed.flatMap(
+    (item) => resultsProjection(item)?.results ?? [],
+  );
+  if (textResults.length > 0) return { results: textResults };
   if (parsed.length === 1) return parsed[0];
-  return parsed.length > 1 ? { items: parsed } : {};
+  if (parsed.length > 1) return { items: parsed };
+  return result.structuredContent &&
+    typeof result.structuredContent === "object"
+    ? result.structuredContent
+    : {};
 }
 
 function toTwentyFirstConnectionError(error: unknown): AuthServiceError {
@@ -560,6 +646,38 @@ export class TwentyFirstClient {
     } as const;
   }
 
+  private async listAdvertisedTools(client: Client, totalSignal: AbortSignal) {
+    const tools: TwentyFirstAdvertisedTool[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (
+      let page = 0;
+      page < TWENTY_FIRST_MAX_TOOL_PAGES &&
+      tools.length < TWENTY_FIRST_MAX_TOOLS;
+      page += 1
+    ) {
+      const listed = await client.listTools(
+        cursor ? { cursor } : {},
+        this.requestOptions(totalSignal),
+      );
+      assertTwentyFirstJsonDepth(listed);
+      tools.push(
+        ...(listed.tools.slice(
+          0,
+          TWENTY_FIRST_MAX_TOOLS - tools.length,
+        ) as TwentyFirstAdvertisedTool[]),
+      );
+      const next =
+        typeof listed.nextCursor === "string" && listed.nextCursor.trim()
+          ? listed.nextCursor
+          : undefined;
+      if (!next || seenCursors.has(next)) break;
+      seenCursors.add(next);
+      cursor = next;
+    }
+    return tools;
+  }
+
   async inspectCapabilities(
     apiKey: string,
   ): Promise<TwentyFirstConnectionResult> {
@@ -571,28 +689,33 @@ export class TwentyFirstClient {
     );
     const transport = this.createTransport(value);
     try {
-      const requestOptions = this.requestOptions(
-        AbortSignal.timeout(timeoutMs),
-      );
-      await client.connect(transport, requestOptions);
-      const listed = await client.listTools({}, requestOptions);
-      assertTwentyFirstJsonDepth(listed);
-      const names = new Set(listed.tools.map((tool) => tool.name));
-      if (!names.has("search") || !names.has("get_component")) {
+      const totalSignal = AbortSignal.timeout(timeoutMs);
+      await client.connect(transport, this.requestOptions(totalSignal));
+      const tools = await this.listAdvertisedTools(client, totalSignal);
+      const byName = new Map<string, TwentyFirstAdvertisedTool>();
+      for (const tool of tools) {
+        if (!byName.has(tool.name)) byName.set(tool.name, tool);
+      }
+      const search = byName.get("search");
+      if (!search || search.annotations?.destructiveHint === true) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "当前 21st 连接缺少 search 或 get_component 能力",
+          "当前 21st 连接缺少安全的 search 能力",
         );
       }
+      const optionalCapability = (name: string) => {
+        const tool = byName.get(name);
+        return Boolean(tool && tool.annotations?.destructiveHint !== true);
+      };
       const server = client.getServerVersion();
       return {
         ok: true,
         endpoint: TWENTY_FIRST_MCP_ENDPOINT,
         capabilities: {
           search: true,
-          getComponent: true,
-          getUsage: names.has("get_usage"),
-          getTheme: names.has("get_theme"),
+          getComponent: optionalCapability("get_component"),
+          getUsage: optionalCapability("get_usage"),
+          getTheme: optionalCapability("get_theme"),
         },
         server: server ? { name: server.name, version: server.version } : null,
       };
@@ -605,7 +728,9 @@ export class TwentyFirstClient {
 
   /**
    * Opens one bounded read-only MCP session. The callback can invoke only the
-   * two exact existing-catalog tools discovered from tools/list.
+   * exact existing-catalog search tool discovered from tools/list. Optional
+   * catalog capabilities are exposed only when the server advertises them as
+   * non-destructive; SiteOps' normal path never needs component code.
    */
   async withReadOnlySession<T>(
     apiKey: string,
@@ -626,34 +751,29 @@ export class TwentyFirstClient {
     const transport = this.createTransport(value);
     try {
       await client.connect(transport, this.requestOptions(totalSignal));
-      const listed = await client.listTools(
-        {},
-        this.requestOptions(totalSignal),
-      );
-      assertTwentyFirstJsonDepth(listed);
-      const byName = new Map(
-        listed.tools.map((tool) => [
-          tool.name,
-          tool as TwentyFirstAdvertisedTool,
-        ]),
-      );
+      const tools = await this.listAdvertisedTools(client, totalSignal);
+      const byName = new Map<string, TwentyFirstAdvertisedTool>();
+      for (const tool of tools) {
+        if (!byName.has(tool.name)) byName.set(tool.name, tool);
+      }
       const search = byName.get("search");
       const getComponent = byName.get("get_component");
-      if (!search || !getComponent) {
+      if (!search) {
         throw new AuthServiceError(
           "INVALID_CREDENTIAL",
-          "当前 21st 连接缺少 search 或 get_component 能力",
+          "当前 21st 连接缺少 search 能力",
         );
       }
-      if (
-        search.annotations?.destructiveHint === true ||
-        getComponent.annotations?.destructiveHint === true
-      ) {
+      if (search.annotations?.destructiveHint === true) {
         throw new AuthServiceError(
           "UPSTREAM_UNAVAILABLE",
           "21st 只读工具声明异常",
         );
       }
+      const safeGetComponent =
+        getComponent?.annotations?.destructiveHint === true
+          ? undefined
+          : getComponent;
       const call = async (
         operation: "search" | "get_component",
         tool: TwentyFirstAdvertisedTool,
@@ -685,9 +805,18 @@ export class TwentyFirstClient {
         return payload;
       };
       return await use({
-        search: (query, limit) => call("search", search, query, limit),
-        getComponent: (providerItemId) =>
-          call("get_component", getComponent, providerItemId),
+        search: (input) => {
+          if (input.type !== "component") {
+            throw new TwentyFirstToolContractError();
+          }
+          return call("search", search, input.query, input.limit);
+        },
+        ...(safeGetComponent
+          ? {
+              getComponent: (providerItemId: TwentyFirstProviderItemId) =>
+                call("get_component", safeGetComponent, providerItemId),
+            }
+          : {}),
       });
     } catch (error) {
       throw toTwentyFirstConnectionError(error);
@@ -730,7 +859,7 @@ function toCredentialStatus(
       (configured
         ? {
             search: true,
-            getComponent: true,
+            getComponent: false,
             getUsage: null,
             getTheme: null,
           }

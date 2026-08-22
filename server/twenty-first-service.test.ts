@@ -16,6 +16,7 @@ import {
   decryptTwentyFirstApiKey,
   encryptTwentyFirstApiKey,
   hasActiveTwentyFirstConsumers,
+  projectTwentyFirstToolPayload,
   validateTwentyFirstApiKeyInput,
 } from "./twenty-first-service";
 
@@ -165,8 +166,69 @@ describe("TwentyFirstClient", () => {
     }
   });
 
-  it("fails closed when either required read-only tool is missing", async () => {
+  it("bounds capability discovery to three pages and one hundred tools", async () => {
+    const cursors: Array<string | undefined> = [];
+    const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        id?: string | number;
+        method: string;
+        params?: { cursor?: string };
+      };
+      if (body.method === "initialize") {
+        return jsonRpcResponse(body.id!, {
+          protocolVersion: "2025-03-26",
+          capabilities: { tools: {} },
+          serverInfo: { name: "21st-test", version: "1.0.0" },
+        });
+      }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "tools/list") {
+        cursors.push(body.params?.cursor);
+        const page = cursors.length;
+        const tools = Array.from({ length: 34 }, (_, index) => ({
+          name:
+            page === 3 && index === 0 ? "search" : `page_${page}_tool_${index}`,
+          inputSchema: { type: "object", properties: {} },
+        }));
+        return jsonRpcResponse(body.id!, {
+          tools,
+          nextCursor: `cursor-${page}`,
+        });
+      }
+      throw new Error(`unexpected MCP method: ${body.method}`);
+    });
+
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({ capabilities: { search: true } });
+    expect(cursors).toEqual([undefined, "cursor-1", "cursor-2"]);
+  });
+
+  it("accepts a search-only catalog connection and projects optional tools honestly", async () => {
     const fetchImpl = createMcpFetch(["search"]);
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({
+      ok: true,
+      capabilities: {
+        search: true,
+        getComponent: false,
+        getUsage: false,
+        getTheme: false,
+      },
+    });
+  });
+
+  it("fails closed when the required search tool is missing", async () => {
+    const fetchImpl = createMcpFetch(["get_component"]);
     await expect(
       new TwentyFirstClient({
         fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -272,8 +334,12 @@ describe("TwentyFirstClient", () => {
     const output = await client.withReadOnlySession(
       "21st_sk_test_secret",
       async (session) => ({
-        search: await session.search("B2B analytics landing page", 10),
-        detail: await session.getComponent(143),
+        search: await session.search({
+          query: "B2B analytics landing page",
+          type: "component",
+          limit: 10,
+        }),
+        detail: await session.getComponent!(143),
       }),
     );
 
@@ -332,6 +398,86 @@ describe("TwentyFirstClient", () => {
         value: "143",
       }),
     ).toThrow(TwentyFirstToolContractError);
+  });
+
+  it("derives required component type and bounded limit from the live search schema", () => {
+    const tool = {
+      name: "search",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          query: { type: "string" },
+          type: { type: "string" },
+          limit: { type: "integer", minimum: 2, maximum: 5 },
+        },
+        required: ["query", "type", "limit"],
+      },
+    };
+    expect(
+      buildTwentyFirstToolArguments({
+        operation: "search",
+        tool,
+        value: "企业官网 hero",
+        limit: 10,
+      }),
+    ).toEqual({ query: "企业官网 hero", type: "component", limit: 5 });
+    expect(() =>
+      buildTwentyFirstToolArguments({
+        operation: "search",
+        tool: {
+          ...tool,
+          inputSchema: {
+            ...tool.inputSchema,
+            properties: {
+              ...tool.inputSchema.properties,
+              type: { type: "string", enum: ["theme"] },
+            },
+          },
+        },
+        value: "hero",
+        limit: 5,
+      }),
+    ).toThrow(TwentyFirstToolContractError);
+  });
+
+  it("prefers structured results and uses bounded JSON text only as fallback", () => {
+    expect(
+      projectTwentyFirstToolPayload({
+        structuredContent: { results: [{ id: 1 }] },
+        content: [
+          { type: "text", text: JSON.stringify({ results: [{ id: 2 }] }) },
+        ],
+      }),
+    ).toEqual({ results: [{ id: 1 }] });
+    expect(
+      projectTwentyFirstToolPayload({
+        structuredContent: { status: "ok" },
+        content: [
+          { type: "text", text: JSON.stringify({ results: [{ id: 143 }] }) },
+        ],
+      }),
+    ).toEqual({ results: [{ id: 143 }] });
+    expect(
+      projectTwentyFirstToolPayload({
+        structuredContent: { status: "ok" },
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ data: { results: [{ id: 144 }] } }),
+          },
+          {
+            type: "text",
+            text: JSON.stringify({ payload: { results: [{ id: 145 }] } }),
+          },
+        ],
+      }),
+    ).toEqual({ results: [{ id: 144 }, { id: 145 }] });
+    expect(
+      projectTwentyFirstToolPayload({
+        structuredContent: { status: "safe-fallback" },
+        content: [{ type: "text", text: "x".repeat(1_000_001) }],
+      }),
+    ).toEqual({ status: "safe-fallback" });
   });
 
   it("honors Retry-After once with a bounded delay for a read-only request", async () => {

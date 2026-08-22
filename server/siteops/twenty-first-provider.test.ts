@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
 
@@ -21,6 +22,11 @@ import {
   fetchPinnedPublicHttps,
   fetchSafeVisualPreview,
   isPublicPreviewAddress,
+  lookupForPinnedPreviewAddress,
+  pinnedHttpsFetch,
+  pinnedPreviewRequestOptions,
+  responseFromPinnedPreviewIncoming,
+  samePreviewAddress,
 } from "./remote-preview";
 
 const credentialId = "11111111-1111-4111-8111-111111111111";
@@ -44,7 +50,7 @@ function operation(): SiteOperation {
       knowledgeSnapshotId: snapshotId,
       credentialId,
       credentialVersion: 3,
-      workflowVersion: "1.1.0",
+      workflowVersion: "1.3.0",
     },
     provider: "21st",
     providerOperationId: null,
@@ -170,19 +176,23 @@ describe("21st SiteOps provider", () => {
     expect(persistBoard).not.toHaveBeenCalled();
   });
 
-  it("runs the real numeric-ID 10/6/2 funnel without requiring Prompt", async () => {
+  it("runs the real numeric-ID 5/5/6/2 search-only funnel without component code", async () => {
     const secret = "21st_sk_never-persist-this-secret";
     const rawCode = "RAW_PROVIDER_CODE export default function Secret() {}";
-    const searchCalls: Array<{ query: string; limit: number }> = [];
+    const searchCalls: Array<{
+      query: string;
+      type: "component";
+      limit: number;
+    }> = [];
     const detailCalls: Array<string | number> = [];
     let searchIndex = 0;
-    const counts = [10, 6, 2];
+    const counts = [5, 5, 6, 2];
     let nextId = 1;
     const session: TwentyFirstReadOnlySession = {
-      search: vi.fn(async (query, limit) => {
+      search: vi.fn(async (input) => {
         const count = counts[searchIndex]!;
         searchIndex += 1;
-        searchCalls.push({ query, limit });
+        searchCalls.push(input);
         return {
           results: Array.from({ length: count }, (_, index) => {
             const id = nextId++;
@@ -191,6 +201,10 @@ describe("21st SiteOps provider", () => {
               name: `Responsive modular hero ${id}`,
               description: "Light canvas, neutral sans, short transition",
               previewUrl: `https://cdn.example.test/${id}.png`,
+              videoUrl: `https://cdn.example.test/${id}.mp4`,
+              installCommand: "npx 21st add forbidden",
+              componentCode: rawCode,
+              demoCode: "RAW_DEMO_CODE",
             };
           }),
         };
@@ -228,19 +242,18 @@ describe("21st SiteOps provider", () => {
       id: string;
       contentSha256: string;
     }> = [];
-    const persistArtifact = vi.fn(async (input: {
-      kind: string;
-      buffer: Buffer;
-    }) => {
-      const row = {
-        kind: input.kind,
-        buffer: Buffer.from(input.buffer),
-        id: randomUUID(),
-        contentSha256: sha256(input.buffer),
-      };
-      artifacts.push(row);
-      return row as never;
-    });
+    const persistArtifact = vi.fn(
+      async (input: { kind: string; buffer: Buffer }) => {
+        const row = {
+          kind: input.kind,
+          buffer: Buffer.from(input.buffer),
+          id: randomUUID(),
+          contentSha256: sha256(input.buffer),
+        };
+        artifacts.push(row);
+        return row as never;
+      },
+    );
     let persisted: TwentyFirstBoardPersistenceInput | null = null;
     const persistBoard = vi.fn(
       async (_db: unknown, input: TwentyFirstBoardPersistenceInput) => {
@@ -248,8 +261,7 @@ describe("21st SiteOps provider", () => {
         return {
           batchId: "55555555-5555-4555-8555-555555555555",
           candidateCount: input.mirroredCandidates.length,
-          selectionBundleHash:
-            input.selectionBundleArtifact.contentSha256,
+          selectionBundleHash: input.selectionBundleArtifact.contentSha256,
         };
       },
     );
@@ -288,20 +300,30 @@ describe("21st SiteOps provider", () => {
       projectStatus: "awaiting_visual_selection",
       result: {
         candidateCount: 9,
-        actual: { searched: 18, detailRetrieved: 12, presented: 9 },
+        actual: {
+          searched: 18,
+          shortlisted: 12,
+          mirrored: 12,
+          presented: 9,
+        },
       },
     });
-    expect(searchCalls.map((call) => call.limit)).toEqual([10, 6, 2]);
-    expect(searchCalls).toHaveLength(3);
-    expect(detailCalls).toHaveLength(12);
-    expect(detailCalls.slice(0, 10)).toEqual(
-      Array.from({ length: 10 }, (_, index) => index + 1),
-    );
+    expect(searchCalls.map((call) => call.limit)).toEqual([5, 5, 6, 2]);
+    expect(searchCalls.every((call) => call.type === "component")).toBe(true);
+    expect(searchCalls).toHaveLength(4);
+    expect(detailCalls).toHaveLength(0);
     expect(persisted).not.toBeNull();
     expect(persisted!.mirroredCandidates).toHaveLength(9);
-    expect(persisted!.selectionBundle.candidates.map((item) => item.label)).toEqual(
-      ["A", "B", "C", "D", "E", "F", "G", "H", "I"],
-    );
+    expect(persisted!.selectionBundle).toMatchObject({
+      schemaVersion: 2,
+      searchTarget: 18,
+      shortlistTarget: 12,
+      displayTarget: 9,
+    });
+    expect(
+      persisted!.selectionBundle.candidates.map((item) => item.label),
+    ).toEqual(["A", "B", "C", "D", "E", "F", "G", "H", "I"]);
+    expect(persisted!.selectionBundle.supportingCandidates).toHaveLength(2);
     expect(persisted!.selectionBundle.candidates[0]).toMatchObject({
       providerItemKey: "n:1",
       visualEvidence: {
@@ -318,10 +340,12 @@ describe("21st SiteOps provider", () => {
       expect(persistedText).not.toContain(sensitive);
       expect(artifactText).not.toContain(sensitive);
     }
-    expect(artifacts.filter((artifact) => artifact.kind === "21st-visual-preview"))
-      .toHaveLength(9);
-    expect(artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"))
-      .toHaveLength(1);
+    expect(
+      artifacts.filter((artifact) => artifact.kind === "21st-visual-preview"),
+    ).toHaveLength(12);
+    expect(
+      artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"),
+    ).toHaveLength(1);
   });
 
   it("rejects producer drift before database or provider access", async () => {
@@ -427,10 +451,115 @@ describe("21st SiteOps provider", () => {
       }),
     ).resolves.toMatchObject({
       status: "failed",
-      code: "ZERO_VISUAL_CANDIDATES",
+      code: "MCP_SEARCH_EMPTY",
     });
     expect(persistArtifact).not.toHaveBeenCalled();
     expect(persistBoard).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes missing preview references from an empty catalog", async () => {
+    let id = 0;
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            search: async () => ({
+              results: [{ id: ++id, name: `Catalog item ${id}` }],
+            }),
+          }),
+      },
+    });
+    await expect(
+      handler({
+        operation: operation(),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "NO_SAFE_PREVIEW_REFERENCES",
+      result: { normalizedUnique: 4, withPreviewReference: 0 },
+    });
+  });
+
+  it("reports aggregate mirror diagnostics without leaking preview URLs", async () => {
+    let id = 0;
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            search: async () => {
+              const itemId = ++id;
+              return {
+                results: [
+                  {
+                    id: itemId,
+                    name: `Catalog item ${itemId}`,
+                    previewUrl: `https://cdn.example.test/${itemId}.png?token=secret`,
+                  },
+                ],
+              };
+            },
+          }),
+      },
+      fetchPreview: vi.fn(async () => {
+        throw new Error("PREVIEW_FETCH_FAILED");
+      }),
+    });
+    const result = await handler({
+      operation: operation(),
+      signal: new AbortController().signal,
+    });
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "PREVIEW_MIRROR_FAILED",
+      result: {
+        mirrorAttempted: 4,
+        mirrorSucceeded: 0,
+        rejectedByReason: { http: 4 },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("token=secret");
+  });
+
+  it("maps an outer abort to VISUAL_SEARCH_TIMEOUT", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({ search: async () => ({ results: [] }) }),
+      },
+    });
+    await expect(
+      handler({ operation: operation(), signal: controller.signal }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "VISUAL_SEARCH_TIMEOUT",
+    });
   });
 
   it("rejects private preview addresses before making an HTTP request", async () => {
@@ -442,6 +571,115 @@ describe("21st SiteOps provider", () => {
       }),
     ).rejects.toThrow("PREVIEW_URL_PRIVATE_ADDRESS");
     expect(fetchImpl).not.toHaveBeenCalled();
+    expect(isPublicPreviewAddress("fec0::1")).toBe(false);
+  });
+
+  it("returns the Node 22 lookup array shape and disables automatic family selection", async () => {
+    const selected = { address: "93.184.216.34", family: 4 as const };
+    const options = pinnedPreviewRequestOptions({
+      url: new URL("https://example.com/image.png?X-Amz-Signature=memory-only"),
+      selected,
+      signal: new AbortController().signal,
+      headers: {},
+    });
+    expect(options).toMatchObject({
+      agent: false,
+      family: 4,
+      autoSelectFamily: false,
+      servername: "example.com",
+    });
+    const lookup = lookupForPinnedPreviewAddress(selected) as any;
+    await expect(
+      new Promise((resolve, reject) =>
+        lookup(
+          "example.com",
+          { all: true },
+          (error: Error | null, addresses: unknown) =>
+            error ? reject(error) : resolve(addresses),
+        ),
+      ),
+    ).resolves.toEqual([selected]);
+    await expect(
+      new Promise((resolve, reject) =>
+        lookup(
+          "example.com",
+          { all: false },
+          (error: Error | null, address: string, family: number) =>
+            error ? reject(error) : resolve({ address, family }),
+        ),
+      ),
+    ).resolves.toEqual(selected);
+  });
+
+  it.each([204, 205, 304])(
+    "constructs a bodyless Response for HTTP %s without throwing",
+    (status) => {
+      const incoming = Object.assign(Readable.from([]), {
+        statusCode: status,
+        statusMessage: "No Body",
+        headers: { "x-preview": "ok" },
+      });
+      const response = responseFromPinnedPreviewIncoming(incoming as never);
+      expect(response.status).toBe(status);
+      expect(response.body).toBeNull();
+      expect(response.headers.get("x-preview")).toBe("ok");
+    },
+  );
+
+  it("tries at most three pinned public addresses and stops after a response", async () => {
+    const addresses = [
+      { address: "1.1.1.1", family: 4 as const },
+      { address: "8.8.8.8", family: 4 as const },
+      { address: "9.9.9.9", family: 4 as const },
+      { address: "208.67.222.222", family: 4 as const },
+    ];
+    const requestImpl = vi.fn(
+      async ({ selected }: { selected: (typeof addresses)[number] }) => {
+        if (selected.address !== "9.9.9.9") {
+          const error = Object.assign(new Error("connect failed"), {
+            code: "ECONNREFUSED",
+          });
+          throw error;
+        }
+        return new Response("ok", { status: 200 });
+      },
+    );
+    await expect(
+      pinnedHttpsFetch(
+        {
+          url: new URL("https://example.com/image.png"),
+          addresses,
+          signal: new AbortController().signal,
+          headers: {},
+        },
+        requestImpl as never,
+      ),
+    ).resolves.toMatchObject({ status: 200 });
+    expect(
+      requestImpl.mock.calls.map(([input]) => input.selected.address),
+    ).toEqual(["1.1.1.1", "8.8.8.8", "9.9.9.9"]);
+  });
+
+  it("treats an exact peer mismatch as terminal and normalizes mapped IPv4", async () => {
+    expect(samePreviewAddress("93.184.216.34", "::ffff:5db8:d822")).toBe(true);
+    const requestImpl = vi.fn(async () => {
+      throw new Error("PREVIEW_CONNECTED_ADDRESS_UNSAFE");
+    });
+    await expect(
+      pinnedHttpsFetch(
+        {
+          url: new URL("https://example.com/image.png"),
+          addresses: [
+            { address: "1.1.1.1", family: 4 },
+            { address: "8.8.8.8", family: 4 },
+          ],
+          signal: new AbortController().signal,
+          headers: {},
+        },
+        requestImpl as never,
+      ),
+    ).rejects.toThrow("PREVIEW_CONNECTED_ADDRESS_UNSAFE");
+    expect(requestImpl).toHaveBeenCalledTimes(1);
   });
 
   it("normalizes provider images to metadata-free PNG before hashing", async () => {
@@ -458,9 +696,9 @@ describe("21st SiteOps provider", () => {
       .toBuffer();
     const result = await fetchSafeVisualPreview({
       url: "https://preview.example.com/example.png",
-      resolveImpl: vi.fn().mockResolvedValue([
-        { address: "93.184.216.34", family: 4 },
-      ]) as never,
+      resolveImpl: vi
+        .fn()
+        .mockResolvedValue([{ address: "93.184.216.34", family: 4 }]) as never,
       fetchImpl: vi.fn().mockResolvedValue(
         new Response(upstream, {
           status: 200,
@@ -484,14 +722,15 @@ describe("21st SiteOps provider", () => {
     expect(isPublicPreviewAddress("::ffff:a9fe:a9fe")).toBe(false);
     expect(isPublicPreviewAddress("::ffff:0a00:0001")).toBe(false);
     expect(isPublicPreviewAddress("64:ff9b::7f00:1")).toBe(false);
+    expect(isPublicPreviewAddress("::ffff:5db8:d822")).toBe(true);
     expect(isPublicPreviewAddress("93.184.216.34")).toBe(true);
     expect(isPublicPreviewAddress("2001:4860:4860::8888")).toBe(true);
   });
 
   it("re-resolves every pinned redirect and rejects a private next hop", async () => {
-    const resolveImpl = vi.fn().mockResolvedValue([
-      { address: "93.184.216.34", family: 4 },
-    ]);
+    const resolveImpl = vi
+      .fn()
+      .mockResolvedValue([{ address: "93.184.216.34", family: 4 }]);
     const transport = vi.fn().mockResolvedValue(
       new Response(null, {
         status: 302,
@@ -516,13 +755,16 @@ describe("21st SiteOps provider", () => {
   });
 
   it("keeps an ESA-style pinned redirect on the exact allowed origin", async () => {
-    const resolveImpl = vi.fn().mockResolvedValue([
-      { address: "2606:4700:4700::1111", family: 6 },
-    ]);
+    const resolveImpl = vi
+      .fn()
+      .mockResolvedValue([{ address: "2606:4700:4700::1111", family: 6 }]);
     const transport = vi
       .fn()
       .mockResolvedValueOnce(
-        new Response(null, { status: 302, headers: { location: "/final" } }),
+        new Response(null, {
+          status: 302,
+          headers: { location: "/final?signature=redirect-secret" },
+        }),
       )
       .mockResolvedValueOnce(new Response("ok", { status: 200 }));
 
@@ -537,11 +779,9 @@ describe("21st SiteOps provider", () => {
 
     expect(result.finalUrl.toString()).toBe("https://example.com/final");
     expect(transport).toHaveBeenCalledTimes(2);
-    expect(
-      transport.mock.calls.map(([call]) => call.url.toString()),
-    ).toEqual([
+    expect(transport.mock.calls.map(([call]) => call.url.toString())).toEqual([
       "https://example.com/start",
-      "https://example.com/final",
+      "https://example.com/final?signature=redirect-secret",
     ]);
   });
 });

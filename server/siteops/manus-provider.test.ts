@@ -73,7 +73,9 @@ describe("Manus SiteOps provider boundary", () => {
     });
 
     expect(promptBrief.publicAssetIds).toEqual([]);
-    expect(JSON.stringify(promptBrief)).not.toContain("secret-official-logo-id");
+    expect(JSON.stringify(promptBrief)).not.toContain(
+      "secret-official-logo-id",
+    );
   });
 
   it("passes customer-confirmed dashboard-core leaves but never inferred/evidence documents", () => {
@@ -147,7 +149,7 @@ describe("Manus SiteOps provider boundary", () => {
     ]);
   });
 
-  it("packages the hash-verified FrontMind 1.2 workflow with SKILL and runtime contract", async () => {
+  it("packages the hash-verified FrontMind 1.3 workflow with SKILL and runtime contract", async () => {
     const bytes = await loadVerifiedSiteOpsWorkflowPackage();
     const zip = await JSZip.loadAsync(bytes, { checkCRC32: true });
 
@@ -172,7 +174,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(xhs.file("runtime-contract.json")).not.toBeNull();
     expect(readiness).toMatchObject({
       ready: true,
-      website: { version: "1.2.0" },
+      website: { version: "1.3.0" },
       workflows: [
         { channel: "wechat", version: "1.0.0" },
         { channel: "xiaohongshu", version: "1.0.0" },
@@ -215,6 +217,32 @@ describe("Manus SiteOps provider boundary", () => {
       taxonomyDerivationVersion: "catalog-metadata-preview-v1",
     });
     const evidenceHash = visualEvidence.evidenceSha256;
+    const supportOne = Buffer.from("frozen-support-one", "utf8");
+    const supportTwo = Buffer.from("frozen-support-two", "utf8");
+    const supportOneId = "81000000-0000-4000-8000-000000000008";
+    const supportTwoId = "82000000-0000-4000-8000-000000000008";
+    const supportOneHash = createHash("sha256")
+      .update(supportOne)
+      .digest("hex");
+    const supportTwoHash = createHash("sha256")
+      .update(supportTwo)
+      .digest("hex");
+    const supportOneEvidence = createVisualEvidenceV1({
+      evidenceKind: "catalog_metadata_preview_v1",
+      providerItemKey: "n:144",
+      metadataSha256: "1".repeat(64),
+      providerResponseSha256: "2".repeat(64),
+      previewSha256: supportOneHash,
+      taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+    });
+    const supportTwoEvidence = createVisualEvidenceV1({
+      evidenceKind: "catalog_metadata_preview_v1",
+      providerItemKey: "n:145",
+      metadataSha256: "3".repeat(64),
+      providerResponseSha256: "4".repeat(64),
+      previewSha256: supportTwoHash,
+      taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+    });
     const designToken = `siteops-design:${operation.id}`;
     const designResult = {
       operationToken: designToken,
@@ -320,27 +348,78 @@ describe("Manus SiteOps provider boundary", () => {
         },
       },
       batch: {
-        selectionBundleLocalAssetId:
-          "90000000-0000-4000-8000-000000000009",
+        selectionBundleLocalAssetId: "90000000-0000-4000-8000-000000000009",
         selectionBundleHash: "",
       },
     };
     const selectionBundle = {
-      queryHash: "f".repeat(64),
+      schemaVersion: 2,
+      queryPlanHash: "f".repeat(64),
       searchTarget: 18,
-      detailTarget: 12,
+      shortlistTarget: 12,
       displayTarget: 9,
       candidates: [
         {
           id: context.sample.id,
           label: "B",
+          queryAxis: "foundation_split",
           providerItemKey: "n:143",
+          title: "Split hero",
+          description: "Enterprise split layout",
+          author: "21st",
+          sourceUrl: "https://21st.dev/community/components/split-hero",
           visualEvidence,
           previewLocalAssetId: context.sample.previewLocalAssetId,
           previewSha256: previewHash,
           taxonomy: context.sample.sourceMetadata.taxonomy,
           score: 90,
           rationale: "视觉证据完整",
+        },
+      ],
+      supportingCandidates: [
+        {
+          id: "61000000-0000-4000-8000-000000000006",
+          queryAxis: "section_proof_conversion",
+          providerItemKey: "n:144",
+          title: "Proof section",
+          description: "Enterprise proof cards",
+          author: "21st",
+          sourceUrl: "https://21st.dev/community/components/proof",
+          visualEvidence: supportOneEvidence,
+          previewLocalAssetId: supportOneId,
+          previewSha256: supportOneHash,
+          taxonomy: {
+            role: "section",
+            palette: [],
+            typography: [],
+            layout: ["modular-grid"],
+            motion: [],
+            accessibility: ["reduced-motion"],
+          },
+          score: 85,
+          rationale: "真实证明区参考",
+        },
+        {
+          id: "62000000-0000-4000-8000-000000000006",
+          queryAxis: "motion_accessible",
+          providerItemKey: "n:145",
+          title: "Accessible motion",
+          description: "Reduced motion interaction",
+          author: "21st",
+          sourceUrl: "https://21st.dev/community/components/motion",
+          visualEvidence: supportTwoEvidence,
+          previewLocalAssetId: supportTwoId,
+          previewSha256: supportTwoHash,
+          taxonomy: {
+            role: "motion",
+            palette: [],
+            typography: [],
+            layout: [],
+            motion: ["short-transition"],
+            accessibility: ["reduced-motion"],
+          },
+          score: 80,
+          rationale: "真实动效参考",
         },
       ],
       selectedCandidateId: null,
@@ -381,9 +460,19 @@ describe("Manus SiteOps provider boundary", () => {
     const readArtifact = vi.fn(async (input: { localAssetId: string }) => {
       const isSelection =
         input.localAssetId === context.batch.selectionBundleLocalAssetId;
-      const bytes = isSelection ? selectionBytes : preview;
+      const bytes = isSelection
+        ? selectionBytes
+        : input.localAssetId === supportOneId
+          ? supportOne
+          : input.localAssetId === supportTwoId
+            ? supportTwo
+            : preview;
       return {
         row: {
+          id: input.localAssetId,
+          scope: "managed_user",
+          accountUserId: operation.userId,
+          storageKey: `siteops:${operation.projectId}:fixture:${input.localAssetId}`,
           mimeType: isSelection ? "application/json" : "image/png",
           contentSha256: createHash("sha256").update(bytes).digest("hex"),
         },
@@ -395,11 +484,12 @@ describe("Manus SiteOps provider boundary", () => {
     });
     const handler = createManusSiteOpsProviderHandler({
       getDb: async () => db as never,
-      getCredential: async () => ({
-        id: operation.input.manusCredentialId,
-        version: operation.input.manusCredentialVersion,
-        apiKey: "secret-key",
-      }) as never,
+      getCredential: async () =>
+        ({
+          id: operation.input.manusCredentialId,
+          version: operation.input.manusCredentialVersion,
+          apiKey: "secret-key",
+        }) as never,
       createClient: () => client as never,
       readSnapshotArchive: async () => Buffer.from("x"),
       readArtifact: readArtifact as never,
@@ -415,11 +505,27 @@ describe("Manus SiteOps provider boundary", () => {
       result: { stage: "design_pending", taskId: "manus-task-1" },
     });
     expect(createTask).toHaveBeenCalledTimes(1);
-    expect(createTask.mock.calls[0]![0].attachments).toHaveLength(2);
+    expect(createTask.mock.calls[0]![0].attachments).toHaveLength(4);
     expect(createTask.mock.calls[0]![0].attachments[1]).toMatchObject({
       filename: "selected-visual.png",
       mime_type: "image/png",
     });
+    expect(
+      createTask.mock.calls[0]![0].attachments.map(
+        (attachment: { filename: string }) => attachment.filename,
+      ),
+    ).toEqual([
+      "frontmind-astro-company-site-workflow-1.3.0.zip",
+      "selected-visual.png",
+      "support-visual-1.png",
+      "support-visual-2.png",
+    ]);
+    expect(createTask.mock.calls[0]![0].prompt).toContain(
+      supportOneEvidence.evidenceSha256,
+    );
+    expect(createTask.mock.calls[0]![0].prompt).toContain(
+      supportTwoEvidence.evidenceSha256,
+    );
 
     const designed = await handler({
       operation: {
@@ -449,6 +555,15 @@ describe("Manus SiteOps provider boundary", () => {
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]![0].taskId).toBe("manus-task-1");
+    expect(
+      readArtifact.mock.calls.filter(([input]) =>
+        [
+          context.sample.previewLocalAssetId,
+          supportOneId,
+          supportTwoId,
+        ].includes(input.localAssetId),
+      ),
+    ).toHaveLength(3);
   });
 
   it("uses the immutable credential id and version frozen in the operation", async () => {

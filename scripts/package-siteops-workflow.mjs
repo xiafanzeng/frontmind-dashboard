@@ -16,10 +16,7 @@ const upstreamPath = path.join(
   sourceRoot,
   "astro-company-site-workflow-v1.0.0.zip",
 );
-const runtimeRoot = path.join(
-  sourceRoot,
-  "astro-company-site-workflow-v1.2.0",
-);
+const runtimeRoot = path.join(sourceRoot, "astro-company-site-workflow-v1.3.0");
 const manifestPath = path.join(runtimeRoot, "MANIFEST.json");
 const materializerPath = path.join(
   projectRoot,
@@ -79,7 +76,10 @@ export async function verifyUpstreamSiteOpsWorkflow() {
       throw new Error(`SiteOps upstream file is missing: ${expected.path}`);
     }
     const bytes = await entry.async("nodebuffer");
-    if (bytes.byteLength !== expected.bytes || sha256(bytes) !== expected.sha256) {
+    if (
+      bytes.byteLength !== expected.bytes ||
+      sha256(bytes) !== expected.sha256
+    ) {
       throw new Error(`SiteOps upstream file hash mismatch: ${expected.path}`);
     }
   }
@@ -104,7 +104,7 @@ export async function createSiteOpsRuntimeManifest() {
   return {
     schema: "frontmind-runtime-workflow-manifest/v1",
     name: "frontmind-astro-company-site-workflow",
-    version: "1.2.0",
+    version: "1.3.0",
     entrypoint: "SKILL.md",
     upstream: {
       version: "1.0.0",
@@ -133,7 +133,9 @@ export async function verifySiteOpsRuntimeWorkflow() {
   for (const entry of expected.files) {
     const text = await fs.readFile(path.join(runtimeRoot, entry.path), "utf8");
     if (forbidden.test(text)) {
-      throw new Error(`SiteOps runtime contains forbidden demo/secret text: ${entry.path}`);
+      throw new Error(
+        `SiteOps runtime contains forbidden demo/secret text: ${entry.path}`,
+      );
     }
   }
   return expected;

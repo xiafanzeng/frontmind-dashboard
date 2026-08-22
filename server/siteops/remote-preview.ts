@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import https from "node:https";
-import type { IncomingHttpHeaders } from "node:http";
-import { BlockList, isIP } from "node:net";
+import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
+import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
 import sharp from "sharp";
 
 const MAX_PREVIEW_BYTES = 5 * 1024 * 1024;
 const MAX_PREVIEW_PIXELS = 20_000_000;
 const MAX_REDIRECTS = 3;
+const MAX_PINNED_ADDRESSES = 3;
 const ALLOWED_MIME_TYPES = new Set([
   "image/avif",
   "image/jpeg",
@@ -51,17 +52,71 @@ for (const [network, prefix] of [
   ["2001:db8::", 32],
   ["2002::", 16],
   ["fc00::", 7],
+  ["fec0::", 10],
   ["fe80::", 10],
   ["ff00::", 8],
 ] as const) {
   blockedIpv6Addresses.addSubnet(network, prefix, "ipv6");
 }
 
-export function isPublicPreviewAddress(address: string) {
-  const normalized = address.toLowerCase().split("%", 1)[0];
+function expandedIpv6Words(address: string) {
+  let value = address;
+  const dotted = value.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/u);
+  if (dotted) {
+    const octets = dotted[2]!.split(".").map(Number);
+    if (octets.some((octet) => octet < 0 || octet > 255)) return null;
+    value = `${dotted[1]}${((octets[0]! << 8) | octets[1]!).toString(16)}:${((octets[2]! << 8) | octets[3]!).toString(16)}`;
+  }
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const missing = halves.length === 2 ? 8 - left.length - right.length : 0;
+  if (missing < 0 || (halves.length === 1 && left.length !== 8)) return null;
+  const words = [
+    ...left,
+    ...Array.from({ length: missing }, () => "0"),
+    ...right,
+  ].map((word) => Number.parseInt(word || "0", 16));
+  if (
+    words.length !== 8 ||
+    words.some((word) => !Number.isInteger(word) || word < 0 || word > 0xffff)
+  ) {
+    return null;
+  }
+  return words;
+}
+
+export function normalizePreviewAddress(address: string) {
+  const normalized = address
+    .trim()
+    .replace(/^\[|\]$/gu, "")
+    .toLowerCase()
+    .split("%", 1)[0]!;
   const family = isIP(normalized);
-  if (family === 4) return !blockedIpv4Addresses.check(normalized, "ipv4");
-  if (family === 6) return !blockedIpv6Addresses.check(normalized, "ipv6");
+  if (family === 4) return { address: normalized, family: 4 as const };
+  if (family !== 6) return null;
+  const words = expandedIpv6Words(normalized);
+  if (
+    words &&
+    words.slice(0, 5).every((word) => word === 0) &&
+    words[5] === 0xffff
+  ) {
+    const ipv4 = `${words[6]! >> 8}.${words[6]! & 0xff}.${words[7]! >> 8}.${words[7]! & 0xff}`;
+    return { address: ipv4, family: 4 as const };
+  }
+  return { address: normalized, family: 6 as const };
+}
+
+export function isPublicPreviewAddress(address: string) {
+  const normalized = normalizePreviewAddress(address);
+  if (!normalized) return false;
+  if (normalized.family === 4) {
+    return !blockedIpv4Addresses.check(normalized.address, "ipv4");
+  }
+  if (normalized.family === 6) {
+    return !blockedIpv6Addresses.check(normalized.address, "ipv6");
+  }
   return false;
 }
 
@@ -73,10 +128,7 @@ export type PinnedPublicHttpsTransport = (input: {
   headers: Record<string, string>;
 }) => Promise<Response>;
 
-async function assertSafeUrl(
-  raw: string,
-  resolveImpl: typeof lookup = lookup,
-) {
+async function assertSafeUrl(raw: string, resolveImpl: typeof lookup = lookup) {
   let url: URL;
   try {
     url = new URL(raw);
@@ -91,7 +143,9 @@ async function assertSafeUrl(
   ) {
     throw new Error("PREVIEW_URL_UNSAFE");
   }
+  url.hash = "";
   const hostname = url.hostname.toLowerCase().replace(/\.$/u, "");
+  const lookupHostname = hostname.replace(/^\[|\]$/gu, "");
   if (
     !hostname ||
     hostname === "localhost" ||
@@ -99,19 +153,46 @@ async function assertSafeUrl(
   ) {
     throw new Error("PREVIEW_URL_UNSAFE");
   }
-  const addresses = isIP(hostname)
-    ? [{ address: hostname, family: isIP(hostname) as 4 | 6 }]
-    : ((await resolveImpl(hostname, {
+  const rawAddresses = isIP(lookupHostname)
+    ? [
+        {
+          address: lookupHostname,
+          family: isIP(lookupHostname) as 4 | 6,
+        },
+      ]
+    : await resolveImpl(lookupHostname, {
         all: true,
         verbatim: true,
-      })) as ResolvedPublicHttpsAddress[]);
+      });
   if (
-    addresses.length === 0 ||
-    addresses.some(({ address }) => !isPublicPreviewAddress(address))
+    !Array.isArray(rawAddresses) ||
+    rawAddresses.length === 0 ||
+    rawAddresses.some(
+      ({ address }) =>
+        !normalizePreviewAddress(address) || !isPublicPreviewAddress(address),
+    )
   ) {
     throw new Error("PREVIEW_URL_PRIVATE_ADDRESS");
   }
+  const seen = new Set<string>();
+  const addresses = rawAddresses
+    .map(({ address }) => normalizePreviewAddress(address)!)
+    .sort((left, right) => left.family - right.family)
+    .filter((candidate) => {
+      const key = `${candidate.family}:${candidate.address}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, MAX_PINNED_ADDRESSES);
   return { url, addresses };
+}
+
+function safeUrlCoordinate(url: URL) {
+  const safe = new URL(url.toString());
+  safe.search = "";
+  safe.hash = "";
+  return safe;
 }
 
 function responseHeaders(headers: IncomingHttpHeaders) {
@@ -126,44 +207,157 @@ function responseHeaders(headers: IncomingHttpHeaders) {
   return result;
 }
 
-async function pinnedHttpsFetch(input: {
+export function samePreviewAddress(expected: string, actual: string) {
+  const left = normalizePreviewAddress(expected);
+  const right = normalizePreviewAddress(actual);
+  if (!left || !right || left.family !== right.family) return false;
+  if (left.family === 4) return left.address === right.address;
+  const exact = new BlockList();
+  exact.addAddress(left.address, "ipv6");
+  return exact.check(right.address, "ipv6");
+}
+
+export function pinnedPreviewRequestOptions(input: {
   url: URL;
-  addresses: ResolvedPublicHttpsAddress[];
+  selected: ResolvedPublicHttpsAddress;
   signal: AbortSignal;
   headers: Record<string, string>;
 }) {
-  // Choosing one address and returning it from the TLS socket's lookup hook
-  // closes the DNS-rebinding window between validation and connection.
-  const selected = input.addresses[0]!;
-  return new Promise<Response>((resolve, reject) => {
-    const request = https.request(
-      input.url,
+  const hostname = input.url.hostname
+    .toLowerCase()
+    .replace(/\.$/u, "")
+    .replace(/^\[|\]$/gu, "");
+  return {
+    method: "GET",
+    headers: input.headers,
+    signal: input.signal,
+    // A request-specific socket is required so a pooled connection can never
+    // bypass this hop's DNS validation and pinned lookup.
+    agent: false as const,
+    family: input.selected.family,
+    autoSelectFamily: false as const,
+    servername: isIP(hostname) ? undefined : hostname,
+    lookup: lookupForPinnedPreviewAddress(input.selected),
+  } as Parameters<typeof https.request>[1] & {
+    autoSelectFamily: false;
+  };
+}
+
+export function lookupForPinnedPreviewAddress(
+  selected: ResolvedPublicHttpsAddress,
+): LookupFunction {
+  return ((_hostname, options, callback) => {
+    if (typeof options === "object" && options.all === true) {
+      callback(null, [selected]);
+      return;
+    }
+    callback(null, selected.address, selected.family);
+  }) as LookupFunction;
+}
+
+export function responseFromPinnedPreviewIncoming(incoming: IncomingMessage) {
+  const status = incoming.statusCode ?? 500;
+  if (status < 200 || status > 599) {
+    throw new Error("PREVIEW_RESPONSE_INVALID");
+  }
+  const bodyForbidden = status === 204 || status === 205 || status === 304;
+  try {
+    const response = new Response(
+      bodyForbidden ? null : (Readable.toWeb(incoming) as ReadableStream),
       {
-        method: "GET",
-        headers: input.headers,
-        signal: input.signal,
-        servername: input.url.hostname,
-        lookup: (_hostname, _options, callback) =>
-          callback(null, selected.address, selected.family),
-      },
-      (incoming) => {
-        const peer = incoming.socket.remoteAddress;
-        if (!peer || !isPublicPreviewAddress(peer)) {
-          incoming.destroy(new Error("PREVIEW_CONNECTED_ADDRESS_UNSAFE"));
-          return;
-        }
-        resolve(
-          new Response(Readable.toWeb(incoming) as ReadableStream, {
-            status: incoming.statusCode ?? 500,
-            statusText: incoming.statusMessage,
-            headers: responseHeaders(incoming.headers),
-          }),
-        );
+        status,
+        statusText: incoming.statusMessage,
+        headers: responseHeaders(incoming.headers),
       },
     );
-    request.once("error", reject);
+    if (bodyForbidden) incoming.resume();
+    return response;
+  } catch {
+    throw new Error("PREVIEW_RESPONSE_INVALID");
+  }
+}
+
+function requestPinnedHttpsAddress(input: {
+  url: URL;
+  selected: ResolvedPublicHttpsAddress;
+  signal: AbortSignal;
+  headers: Record<string, string>;
+}) {
+  return new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const requestOptions = pinnedPreviewRequestOptions(input);
+    const request = https.request(input.url, requestOptions, (incoming) => {
+      const peer = incoming.socket.remoteAddress;
+      if (
+        !peer ||
+        !isPublicPreviewAddress(peer) ||
+        !samePreviewAddress(input.selected.address, peer)
+      ) {
+        const error = new Error("PREVIEW_CONNECTED_ADDRESS_UNSAFE");
+        rejectOnce(error);
+        // The promise already carries the stable failure. Destroying these
+        // streams with an Error could emit an otherwise unhandled `error` on
+        // IncomingMessage and terminate the worker.
+        incoming.destroy();
+        request.destroy();
+        return;
+      }
+      let response: Response;
+      try {
+        response = responseFromPinnedPreviewIncoming(incoming);
+      } catch {
+        const error = new Error("PREVIEW_RESPONSE_INVALID");
+        rejectOnce(error);
+        incoming.destroy();
+        request.destroy();
+        return;
+      }
+      settled = true;
+      resolve(response);
+    });
+    request.once("error", rejectOnce);
     request.end();
   });
+}
+
+function retryablePinnedConnectionFailure(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const code = "code" in error ? String(error.code) : "";
+  const message = error instanceof Error ? error.message : "";
+  if (message === "PREVIEW_CONNECTED_ADDRESS_UNSAFE") return false;
+  return (
+    /^(?:ECONN|ENET|EHOST|ETIMEDOUT|EPIPE)/u.test(code) ||
+    /^(?:ERR_TLS|ERR_SSL)/u.test(code) ||
+    /(?:TLS|socket hang up|handshake)/iu.test(message)
+  );
+}
+
+export async function pinnedHttpsFetch(
+  input: {
+    url: URL;
+    addresses: ResolvedPublicHttpsAddress[];
+    signal: AbortSignal;
+    headers: Record<string, string>;
+  },
+  requestImpl = requestPinnedHttpsAddress,
+) {
+  let lastError: unknown;
+  for (const selected of input.addresses.slice(0, MAX_PINNED_ADDRESSES)) {
+    try {
+      return await requestImpl({ ...input, selected });
+    } catch (error) {
+      lastError = error;
+      if (input.signal.aborted || !retryablePinnedConnectionFailure(error)) {
+        throw error;
+      }
+    }
+  }
+  throw lastError ?? new Error("PREVIEW_CONNECTION_FAILED");
 }
 
 /**
@@ -204,7 +398,7 @@ export async function fetchPinnedPublicHttps(input: {
       headers: input.headers ?? {},
     });
     if (![301, 302, 303, 307, 308].includes(response.status)) {
-      return { response, finalUrl: resolved.url };
+      return { response, finalUrl: safeUrlCoordinate(resolved.url) };
     }
     const location = response.headers.get("location");
     await response.body?.cancel().catch(() => undefined);
@@ -225,7 +419,8 @@ export async function fetchPinnedPublicHttps(input: {
 async function readBoundedBody(response: Response, maxBytes: number) {
   if (!response.body) throw new Error("PREVIEW_BODY_MISSING");
   const declaredHeader = response.headers.get("content-length");
-  const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
+  const declared =
+    declaredHeader === null ? Number.NaN : Number(declaredHeader);
   if (Number.isFinite(declared) && (declared <= 0 || declared > maxBytes)) {
     throw new Error("PREVIEW_SIZE_INVALID");
   }

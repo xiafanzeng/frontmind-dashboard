@@ -26,7 +26,7 @@ describe("presalesUsageDisplayState", () => {
     expect(source).toContain("AI建站（21st）");
     expect(source).toContain("search");
     expect(source).toContain("get_component");
-    expect(source).toContain("不与官网任务积分混算");
+    expect(source).toContain("不与 Manus 积分混算");
   });
 
   it("sends 21st plaintext through the direct tRPC client without retaining mutation variables", () => {

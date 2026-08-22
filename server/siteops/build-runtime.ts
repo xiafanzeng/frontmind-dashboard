@@ -31,13 +31,12 @@ import type {
 } from "../../drizzle/schema";
 import {
   SITEOPS_MATERIALIZER_V1_2,
+  SITEOPS_MATERIALIZER_V1_3,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
 } from "../../shared/siteops";
-import {
-  canonicalJson,
-} from "../../shared/siteops-workflow";
+import { canonicalJson } from "../../shared/siteops-workflow";
 import {
   buildContractV2Schema,
   canonicalSiteOpsSha256,
@@ -56,7 +55,9 @@ import {
   type TrustedSiteBrandAsset,
 } from "./knowledge-brand-asset";
 
-type SiteOpsMaterializerCoordinates = typeof SITEOPS_MATERIALIZER_V1_2;
+type SiteOpsMaterializerCoordinates =
+  | typeof SITEOPS_MATERIALIZER_V1_2
+  | typeof SITEOPS_MATERIALIZER_V1_3;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 const MAX_SOURCE_BYTES = 12 * 1024 * 1024;
@@ -111,8 +112,7 @@ export const siteOpsGeneratedContentSchema = z
   })
   .strict();
 
-export const siteOpsRuntimeVisualSchema =
-  siteOpsRuntimeVisualEvidenceV1Schema;
+export const siteOpsRuntimeVisualSchema = siteOpsRuntimeVisualEvidenceV1Schema;
 
 export const siteOpsAssetDecisionSchema = z
   .object({
@@ -184,7 +184,11 @@ export const siteOpsFrozenRuntimeInputSchema = z
           "image/webp",
         ]),
         publicPath: z.string().trim().min(1).max(191),
-        sizeBytes: z.number().int().positive().max(8 * 1024 * 1024),
+        sizeBytes: z
+          .number()
+          .int()
+          .positive()
+          .max(8 * 1024 * 1024),
         width: z.number().int().positive().max(8_192),
         height: z.number().int().positive().max(8_192),
       })
@@ -408,8 +412,7 @@ function validateInput(
     input.build.workflowUpstreamHash !== workflow.upstreamSha256 ||
     input.build.workflowVersion !== workflow.frontMindVersion ||
     (input.build.workflowPackageHash !== null &&
-      input.build.workflowPackageHash !==
-        workflow.runtimeManifestSha256) ||
+      input.build.workflowPackageHash !== workflow.runtimeManifestSha256) ||
     input.build.starterVersion !== workflow.starterVersion
   ) {
     throw new Error("SITEOPS_WORKFLOW_COORDINATES_MISMATCH");
@@ -541,8 +544,8 @@ function safeContactHref(kind: "email" | "phone" | "address", value: string) {
 }
 
 function relativeLuminance(hex: string) {
-  const channels = [1, 3, 5].map((offset) =>
-    Number.parseInt(hex.slice(offset, offset + 2), 16) / 255,
+  const channels = [1, 3, 5].map(
+    (offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255,
   );
   const linear = channels.map((channel) =>
     channel <= 0.04045
@@ -590,10 +593,7 @@ export function siteDesignMaterializationProjection(input: unknown) {
   return siteDesignMaterializationProjectionFor(input, SITEOPS_WORKFLOW);
 }
 
-function cssForVisual(
-  visual: SiteOpsRuntimeVisual,
-  design: SiteDesignSpecV1,
-) {
+function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteDesignSpecV1) {
   const colors = visual.taxonomy.palette.filter((value) =>
     /^#[a-f0-9]{6}$/iu.test(value),
   );
@@ -608,9 +608,7 @@ function cssForVisual(
   const accentCandidate =
     colors[design.colorRoles.accentPaletteIndex] ?? "#A33A1B";
   const accent =
-    contrastRatio(accentCandidate, canvas) >= 4.5
-      ? accentCandidate
-      : "#A33A1B";
+    contrastRatio(accentCandidate, canvas) >= 4.5 ? accentCandidate : "#A33A1B";
   const muted = colors[3] ?? "#DDE7E8";
   const radius =
     design.surfaceStyle === "soft_depth" || design.surfaceStyle === "layered"
@@ -629,9 +627,17 @@ function cssForVisual(
         ? "clamp(3rem,9vw,7.4rem)"
         : "clamp(2.7rem,8vw,6.8rem)";
   const gap =
-    design.density === "compact" ? "12px" : design.density === "spacious" ? "32px" : "20px";
+    design.density === "compact"
+      ? "12px"
+      : design.density === "spacious"
+        ? "32px"
+        : "20px";
   const sectionPadding =
-    design.density === "compact" ? "24px" : design.density === "spacious" ? "56px" : "40px";
+    design.density === "compact"
+      ? "24px"
+      : design.density === "spacious"
+        ? "56px"
+        : "40px";
   return `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${design.motionLevel === "subtle" ? "smooth" : "auto"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:3}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid color-mix(in srgb,var(--ink) 30%,transparent);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:color-mix(in srgb,var(--canvas) 88%,white);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--ink)!important;color:var(--canvas);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;opacity:.62}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
 }
 
@@ -744,7 +750,9 @@ function renderPageSource(input: {
   );
   const sections = input.generated.sections
     .map(
-      (section) => `<section class="section section--${variantBySlot.get(section.slotId)}" data-slot="${escapeHtml(section.slotId)}">
+      (
+        section,
+      ) => `<section class="section section--${variantBySlot.get(section.slotId)}" data-slot="${escapeHtml(section.slotId)}">
         <h2>${escapeHtml(section.heading)}</h2>
         ${section.paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("\n        ")}
         <p class="source-note">知识来源：${section.sourceDocumentIds.map(escapeHtml).join("、")}</p>
@@ -899,10 +907,8 @@ function buildTrustedSource(input: {
     files,
     "frontmind-component-manifest.json",
     jsonBuffer(
-      siteDesignMaterializationProjectionFor(
-        input.designSpec,
-        input.workflow,
-      ).componentManifest,
+      siteDesignMaterializationProjectionFor(input.designSpec, input.workflow)
+        .componentManifest,
     ),
   );
   addTextFile(
@@ -1002,7 +1008,8 @@ function assertTrustedSourceAssetIsolation(input: {
     (input.brandAsset &&
       (published[0]?.id !== input.brandAsset.assetId ||
         published[0]?.sha256 !== input.brandAsset.sha256 ||
-        fileHashes.get(input.brandAsset.publicPath) !== input.brandAsset.sha256))
+        fileHashes.get(input.brandAsset.publicPath) !==
+          input.brandAsset.sha256))
   ) {
     throw new Error("SITEOPS_SOURCE_BRAND_ASSET_MISMATCH");
   }
@@ -1175,20 +1182,22 @@ async function collectDirectory(root: string) {
 function servedMimeType(filename: string) {
   const extension = path.posix.extname(filename).toLowerCase();
   return (
-    {
-      ".css": "text/css; charset=utf-8",
-      ".html": "text/html; charset=utf-8",
-      ".ico": "image/x-icon",
-      ".jpeg": "image/jpeg",
-      ".jpg": "image/jpeg",
-      ".json": "application/json; charset=utf-8",
-      ".png": "image/png",
-      ".svg": "image/svg+xml; charset=utf-8",
-      ".txt": "text/plain; charset=utf-8",
-      ".webp": "image/webp",
-      ".xml": "application/xml; charset=utf-8",
-    } as Record<string, string>
-  )[extension] ?? "application/octet-stream";
+    (
+      {
+        ".css": "text/css; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".ico": "image/x-icon",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+        ".json": "application/json; charset=utf-8",
+        ".png": "image/png",
+        ".svg": "image/svg+xml; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+        ".webp": "image/webp",
+        ".xml": "application/xml; charset=utf-8",
+      } as Record<string, string>
+    )[extension] ?? "application/octet-stream"
+  );
 }
 
 async function runBrowserQa(input: {
@@ -1359,8 +1368,7 @@ async function runBrowserQa(input: {
           "best-practices",
           "seo",
         ],
-        skipAudits:
-          input.mode === "preview" ? ["is-crawlable"] : undefined,
+        skipAudits: input.mode === "preview" ? ["is-crawlable"] : undefined,
       },
       undefined,
     );
@@ -1473,7 +1481,9 @@ function qaDist(input: {
           Boolean(expectedBrandPath) &&
           files.has(expectedBrandPath!) &&
           sha256(files.get(expectedBrandPath!)!) === input.brandAsset.sha256
-        : ![...files.keys()].some((name) => /^brand-logo(?:\.|$)/iu.test(name))),
+        : ![...files.keys()].some((name) =>
+            /^brand-logo(?:\.|$)/iu.test(name),
+          )),
     "every publish decision maps to the exact frozen official logo bytes",
   );
   const quarantinedHashes = new Set(
@@ -1801,8 +1811,7 @@ async function materializeAstroSiteWithWorkflow(
         providerItemKey: validated.visual.providerItemKey,
         visualEvidenceSha256: validated.visual.visualEvidenceSha256,
         previewSha256: validated.visual.previewSha256,
-        supportEvidenceSha256s:
-          validated.visual.supportEvidenceSha256s,
+        supportEvidenceSha256s: validated.visual.supportEvidenceSha256s,
         designSpecHash: canonicalSiteOpsSha256(validated.designSpec),
       },
       brandAsset: freezeSiteBrandAsset(validated.brandAsset),
@@ -1847,10 +1856,18 @@ function materializeAstroSiteV1_2(input: MaterializeAstroSiteInput) {
   return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_2);
 }
 
+function materializeAstroSiteV1_3(input: MaterializeAstroSiteInput) {
+  return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_3);
+}
+
 const productionMaterializerRegistry = [
   {
     workflow: SITEOPS_MATERIALIZER_V1_2,
     materialize: materializeAstroSiteV1_2,
+  },
+  {
+    workflow: SITEOPS_MATERIALIZER_V1_3,
+    materialize: materializeAstroSiteV1_3,
   },
 ] as const;
 
@@ -1994,7 +2011,9 @@ export async function materializeProductionSiteFromSource(input: {
     distSha256: materialized.distSha256,
     qaZip: materialized.visualQaZip,
     qaSha256: materialized.visualQaSha256,
-    qaReport: JSON.parse(materialized.qaJson.toString("utf8")) as SiteOpsQaReport,
+    qaReport: JSON.parse(
+      materialized.qaJson.toString("utf8"),
+    ) as SiteOpsQaReport,
     provenanceJson: materialized.provenanceJson,
     provenanceSha256: materialized.provenanceSha256,
   };
