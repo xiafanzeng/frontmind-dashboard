@@ -16,7 +16,8 @@ import {
   workspaceSiteProfiles,
   type SiteOperation,
 } from "../../drizzle/schema";
-import { buildContractV1Schema } from "../../shared/siteops";
+import { buildContractV2Schema } from "../../shared/siteops-design";
+import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
 import {
   persistSiteOpsArtifact,
@@ -480,7 +481,7 @@ export async function packageEsaStaticAssets(input: {
   }
   target.file(
     `assets/${FRONTMIND_MARKER_PATH}`,
-    `${JSON.stringify({ schemaVersion: 1, deploymentId: input.deploymentId, distSha256: input.distHash })}\n`,
+    `${JSON.stringify({ schemaVersion: 2, deploymentId: input.deploymentId, distSha256: input.distHash })}\n`,
     { date: stableDate },
   );
   for (const entry of Object.values(target.files)) entry.date = stableDate;
@@ -681,11 +682,11 @@ async function ensureProductionMaterialization(input: {
   } catch (error) {
     throw new EsaProviderFailure(
       "ESA_PRODUCTION_MATERIALIZATION_FAILED",
-      `production 产物生成或 QA 未通过：${error instanceof Error ? error.message.slice(0, 1_500) : "unknown"}`,
+      "production 产物生成或 QA 未通过；未向 ESA 提交任何变更。",
       "failed",
     );
   }
-  const contract = buildContractV1Schema.parse(
+  const contract = buildContractV2Schema.parse(
     JSON.parse(output.contractJson.toString("utf8")),
   );
   if (
@@ -1499,7 +1500,7 @@ function failure(error: unknown): SiteOpsProviderResult {
   return {
     status: "attention_required",
     code: "ESA_PROVIDER_FAILED",
-    message: error instanceof Error ? error.message.slice(0, 2_000) : "ESA 发布失败。",
+    message: "ESA 发布暂时无法安全推进，请稍后重试或由运营人员处理。",
   };
 }
 
@@ -1711,6 +1712,13 @@ export function createEsaSiteOpsProviderHandler(
             : "官网已直接发布到 ESA，并通过 HTTPS、冻结摘要与 canonical 验证。",
       };
     } catch (error) {
+      console.error("[SiteOpsESA] provider_failed", {
+        event: "siteops_esa_provider_failed",
+        operationId: operation.id,
+        projectId: operation.projectId,
+        kind: operation.kind,
+        error: runtimeErrorForLog(error),
+      });
       return failure(error);
     }
   };

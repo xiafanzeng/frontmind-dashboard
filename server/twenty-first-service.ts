@@ -61,6 +61,12 @@ export type TwentyFirstActiveConsumerProbe = (
   executor: any,
 ) => Promise<boolean>;
 
+export const TWENTY_FIRST_ACTIVE_OPERATION_STATUSES = [
+  "queued",
+  "running",
+  "outcome_unknown",
+] as const;
+
 export async function hasActiveTwentyFirstConsumers(
   credentialIds: readonly string[],
   executor: any,
@@ -74,12 +80,10 @@ export async function hasActiveTwentyFirstConsumers(
         .where(
           and(
             eq(siteOperations.provider, "21st"),
-            inArray(siteOperations.status, [
-              "queued",
-              "running",
-              "outcome_unknown",
-              "attention_required",
-            ]),
+            inArray(
+              siteOperations.status,
+              TWENTY_FIRST_ACTIVE_OPERATION_STATUSES,
+            ),
           ),
         )
         .limit(1)
@@ -270,10 +274,19 @@ type TwentyFirstAdvertisedTool = {
   };
 };
 
+export type TwentyFirstProviderItemId = string | number;
+
 export type TwentyFirstReadOnlySession = {
   search(query: string, limit: number): Promise<unknown>;
-  getComponent(providerItemId: string): Promise<unknown>;
+  getComponent(providerItemId: TwentyFirstProviderItemId): Promise<unknown>;
 };
+
+export class TwentyFirstToolContractError extends AuthServiceError {
+  constructor() {
+    super("UPSTREAM_UNAVAILABLE", "21st 工具参数协议暂不兼容");
+    this.name = "TwentyFirstToolContractError";
+  }
+}
 
 function canonicalToolInputKey(value: string) {
   return value.toLocaleLowerCase("en-US").replace(/[^a-z0-9]/gu, "");
@@ -301,6 +314,51 @@ function compatibleEnumValue(
   return candidates.find((candidate) => values.includes(candidate));
 }
 
+function advertisedJsonTypes(property: object | undefined) {
+  if (!property) return new Set<string>();
+  const candidate = property as {
+    type?: unknown;
+    anyOf?: unknown;
+    oneOf?: unknown;
+  };
+  const types = new Set<string>();
+  const add = (value: unknown) => {
+    if (typeof value === "string") types.add(value);
+    else if (Array.isArray(value)) value.forEach(add);
+  };
+  add(candidate.type);
+  for (const variants of [candidate.anyOf, candidate.oneOf]) {
+    if (!Array.isArray(variants)) continue;
+    for (const variant of variants) {
+      if (variant && typeof variant === "object") {
+        add((variant as { type?: unknown }).type);
+      }
+    }
+  }
+  return types;
+}
+
+function assertAdvertisedPrimitive(
+  property: object | undefined,
+  value: string | number,
+) {
+  const types = advertisedJsonTypes(property);
+  if (types.size === 0) return;
+  const accepted =
+    typeof value === "string"
+      ? types.has("string")
+      : types.has("number") ||
+        (types.has("integer") && Number.isSafeInteger(value));
+  const enumValues = Array.isArray(
+    (property as { enum?: unknown } | undefined)?.enum,
+  )
+    ? (property as { enum: unknown[] }).enum
+    : null;
+  if (!accepted || (enumValues && !enumValues.includes(value))) {
+    throw new TwentyFirstToolContractError();
+  }
+}
+
 /**
  * Builds arguments from the server-advertised JSON schema. Only exact,
  * allowlisted semantic fields are populated; an incompatible schema fails
@@ -309,7 +367,7 @@ function compatibleEnumValue(
 export function buildTwentyFirstToolArguments(input: {
   operation: "search" | "get_component";
   tool: TwentyFirstAdvertisedTool;
-  value: string;
+  value: string | TwentyFirstProviderItemId;
   limit?: number;
 }) {
   const properties = input.tool.inputSchema.properties ?? {};
@@ -333,11 +391,12 @@ export function buildTwentyFirstToolArguments(input: {
           "name",
         ]);
   if (!valueKey) {
-    throw new AuthServiceError(
-      "UPSTREAM_UNAVAILABLE",
-      "21st 工具参数协议暂不兼容",
-    );
+    throw new TwentyFirstToolContractError();
   }
+  if (input.operation === "search" && typeof input.value !== "string") {
+    throw new TwentyFirstToolContractError();
+  }
+  assertAdvertisedPrimitive(properties[valueKey], input.value);
   const args: Record<string, unknown> = { [valueKey]: input.value };
   if (input.operation === "search") {
     const limitKey = findToolInputKey(input.tool, [
@@ -347,7 +406,9 @@ export function buildTwentyFirstToolArguments(input: {
       "page_size",
     ]);
     if (limitKey) {
-      args[limitKey] = Math.max(1, Math.min(Math.trunc(input.limit ?? 10), 18));
+      const limit = Math.max(1, Math.min(Math.trunc(input.limit ?? 10), 18));
+      assertAdvertisedPrimitive(properties[limitKey], limit);
+      args[limitKey] = limit;
     }
     const typeKey = findToolInputKey(input.tool, ["type", "kind"]);
     if (typeKey) {
@@ -364,10 +425,7 @@ export function buildTwentyFirstToolArguments(input: {
     (key) => !Object.prototype.hasOwnProperty.call(args, key),
   );
   if (missingRequired.length > 0) {
-    throw new AuthServiceError(
-      "UPSTREAM_UNAVAILABLE",
-      "21st 工具参数协议暂不兼容",
-    );
+    throw new TwentyFirstToolContractError();
   }
   return args;
 }
@@ -382,7 +440,7 @@ function parseToolTextPayload(text: string) {
   }
 }
 
-/** Keeps raw Prompt/code in the current request only. */
+/** Returns the provider payload only to the current bounded request. */
 export function projectTwentyFirstToolPayload(result: Record<string, unknown>) {
   if (
     result.structuredContent &&
@@ -599,7 +657,7 @@ export class TwentyFirstClient {
       const call = async (
         operation: "search" | "get_component",
         tool: TwentyFirstAdvertisedTool,
-        argumentValue: string,
+        argumentValue: string | TwentyFirstProviderItemId,
         limit?: number,
       ) => {
         const args = buildTwentyFirstToolArguments({

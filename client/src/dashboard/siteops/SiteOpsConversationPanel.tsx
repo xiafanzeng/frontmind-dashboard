@@ -5,6 +5,16 @@ import type {
 } from "@shared/siteops-contract";
 import type { SiteOpsActInput } from "@shared/siteops";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   AlertCircle,
   Bot,
   Check,
@@ -15,6 +25,7 @@ import {
   FileArchive,
   Loader2,
   RefreshCw,
+  RotateCcw,
   Send,
   Sparkles,
   ShieldCheck,
@@ -187,6 +198,8 @@ export default function SiteOpsConversationPanel({
   const [selectedSnapshotId, setSelectedSnapshotId] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const [aliyunAccountUid, setAliyunAccountUid] = useState("");
   const [aliyunRoleArn, setAliyunRoleArn] = useState("");
   const [aliyunSetup, setAliyunSetup] = useState<{
@@ -243,6 +256,34 @@ export default function SiteOpsConversationPanel({
           ? messageError.message
           : "消息发送失败，请稍后重试。",
       );
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function resetWorkflow() {
+    if (!onAction || busyAction || !observation?.resetCapability.allowed) {
+      return;
+    }
+    setBusyAction("reset_workflow");
+    setLocalError(null);
+    setResetError(null);
+    try {
+      await onAction({
+        action: "reset_workflow",
+        input: { confirmed: true },
+      });
+      setMessage("");
+      setSelectedSnapshotId("");
+      setLocalError(null);
+      setResetDialogOpen(false);
+    } catch (resetActionError) {
+      const message =
+        resetActionError instanceof Error
+          ? resetActionError.message
+          : "AI 建站流程没有重置，请刷新后重试。";
+      setResetError(message);
+      setLocalError(message);
     } finally {
       setBusyAction(null);
     }
@@ -408,6 +449,11 @@ export default function SiteOpsConversationPanel({
     observation.deployments.some((deployment) =>
       ["reserved", "deploying", "verifying"].includes(deployment.status),
     );
+  const resetDisabled =
+    !onAction || Boolean(busyAction) || !observation.resetCapability.allowed;
+  const resetDisabledReason = !observation.resetCapability.allowed
+    ? observation.resetCapability.reason
+    : undefined;
 
   return (
     <section className="siteops-panel" aria-labelledby="siteops-panel-title">
@@ -422,22 +468,104 @@ export default function SiteOpsConversationPanel({
             选择知识库版本、确定视觉方向，然后在同一会话中完成构建与预览。
           </span>
         </div>
-        {onRefresh && (
-          <button
-            type="button"
-            className="siteops-icon-button"
-            aria-label="刷新 AI 建站会话"
-            disabled={refreshing}
-            onClick={() => onRefresh()}
-          >
-            <RefreshCw
-              className={refreshing ? "siteops-spin" : undefined}
-              size={17}
-              aria-hidden="true"
-            />
-          </button>
-        )}
+        <div className="siteops-header-controls">
+          <div className="siteops-header-actions">
+            {onRefresh && (
+              <button
+                type="button"
+                className="siteops-icon-button"
+                aria-label="刷新 AI 建站会话"
+                disabled={refreshing}
+                onClick={() => onRefresh()}
+              >
+                <RefreshCw
+                  className={refreshing ? "siteops-spin" : undefined}
+                  size={17}
+                  aria-hidden="true"
+                />
+              </button>
+            )}
+            <button
+              type="button"
+              className="siteops-icon-button siteops-reset-button"
+              aria-label="重置 AI 建站流程"
+              aria-describedby={
+                resetDisabledReason
+                  ? "siteops-reset-disabled-reason"
+                  : undefined
+              }
+              disabled={resetDisabled}
+              title={resetDisabledReason}
+              onClick={() => {
+                setResetError(null);
+                setResetDialogOpen(true);
+              }}
+            >
+              <RotateCcw size={17} aria-hidden="true" />
+            </button>
+          </div>
+          {resetDisabledReason && (
+            <small
+              className="siteops-reset-disabled-reason"
+              id="siteops-reset-disabled-reason"
+            >
+              {resetDisabledReason}
+            </small>
+          )}
+        </div>
       </header>
+
+      <AlertDialog
+        open={resetDialogOpen}
+        onOpenChange={(open) => {
+          if (busyAction === "reset_workflow") return;
+          setResetDialogOpen(open);
+          if (open) setResetError(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认重置 AI 建站流程？</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="siteops-reset-description">
+                <p>当前未完成的会话会被隐藏，知识库选择和视觉候选会被清空。</p>
+                <ul>
+                  <li>旧任务不会恢复或续跑。</li>
+                  <li>重置后需要全新上传或重新选择知识库。</li>
+                  <li>域名、备案和阿里云连接不会被删除。</li>
+                  <li>正在执行或结果待确认的任务结束前不能重置。</li>
+                </ul>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {resetError && (
+            <p className="siteops-reset-error" role="alert">
+              {resetError}
+            </p>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busyAction === "reset_workflow"}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busyAction === "reset_workflow"}
+              onClick={(event) => {
+                event.preventDefault();
+                void resetWorkflow();
+              }}
+            >
+              {busyAction === "reset_workflow" && (
+                <Loader2
+                  className="siteops-spin"
+                  size={15}
+                  aria-hidden="true"
+                />
+              )}
+              确认重置
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {upstreamMessage && (
         <div className="siteops-notice warning" role="status">
@@ -728,6 +856,17 @@ export default function SiteOpsConversationPanel({
                   )}
                 </div>
                 <p>{item.content}</p>
+                {item.metadata?.siteOps?.kind === "operation_recovery" && (
+                  <p className="siteops-operation-reference">
+                    {typeof item.metadata.siteOps.payload.errorCode ===
+                      "string" && (
+                      <span>
+                        错误码：{item.metadata.siteOps.payload.errorCode}
+                      </span>
+                    )}
+                    <span>任务编号：{item.metadata.siteOps.subjectId}</span>
+                  </p>
+                )}
               </div>
             </article>
           ))

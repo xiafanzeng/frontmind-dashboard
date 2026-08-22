@@ -91,6 +91,7 @@ function observation(
     builds: [],
     deployments: [],
     socialPackages: [],
+    resetCapability: { allowed: true },
     interactionState: "awaiting_visual_selection",
     latestSequence: 1,
     ...input,
@@ -98,6 +99,109 @@ function observation(
 }
 
 describe("SiteOpsConversationPanel", () => {
+  it("requires confirmation before submitting a fresh pre-build reset", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onAction={onAction}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "重置 AI 建站流程" }));
+    expect(
+      screen.getByRole("alertdialog", { name: "确认重置 AI 建站流程？" }),
+    ).toBeInTheDocument();
+    expect(onAction).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("alertdialog", {
+          name: "确认重置 AI 建站流程？",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(onAction).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "重置 AI 建站流程" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "reset_workflow",
+        input: { confirmed: true },
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("alertdialog", {
+          name: "确认重置 AI 建站流程？",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps reset visible but disabled with the server reason", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          resetCapability: {
+            allowed: false,
+            reason: "当前仍有任务正在执行或结果待确认，完成后才能重置。",
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "重置 AI 建站流程" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText("当前仍有任务正在执行或结果待确认，完成后才能重置。"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a stable error code and operation id without raw provider errors", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "failed",
+          },
+          interactionState: "failed",
+          messages: [
+            {
+              id: "message-recovery",
+              role: "assistant",
+              content: "视觉检索任务合同不一致，请重置后重新开始。",
+              sequence: 2,
+              metadata: {
+                siteOps: {
+                  kind: "operation_recovery",
+                  subjectId: "operation-safe-id",
+                  revision: 3,
+                  status: "active",
+                  payload: {
+                    errorCode: "VISUAL_OPERATION_CONTRACT_MISMATCH",
+                  },
+                },
+              },
+              sentAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+          visualCandidates: [],
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByText("错误码：VISUAL_OPERATION_CONTRACT_MISMATCH"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("任务编号：operation-safe-id")).toBeInTheDocument();
+  });
+
   it("shows real A-I candidates and submits a structured selection", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(

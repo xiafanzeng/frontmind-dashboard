@@ -14,11 +14,17 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 1.1.0 manifest", async () => {
+  it("has a current deterministic FrontMind 1.2.0 manifest with trusted host hashes", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
-      version: "1.1.0",
+      version: "1.2.0",
       upstream: { archiveSha256: SITEOPS_UPSTREAM_SHA256 },
+      host: {
+        starterSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        componentLibraryVersion: "1.0.0",
+        materializerVersion: "1.0.0",
+        materializerSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      },
     });
     await expect(verifySiteOpsRuntimeWorkflow()).resolves.toEqual(generated);
   });

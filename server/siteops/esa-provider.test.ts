@@ -73,6 +73,29 @@ describe("direct ESA SiteOps provider", () => {
     expect(getDb).not.toHaveBeenCalled();
   });
 
+  it("keeps unexpected ESA failures out of the customer-visible message", async () => {
+    enableEsaTestRuntime();
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi
+        .fn()
+        .mockRejectedValue(
+          new Error("internal path /app/private and provider payload"),
+        ) as never,
+    });
+
+    const result = await handler({
+      operation: operation as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "attention_required",
+      code: "ESA_PROVIDER_FAILED",
+    });
+    expect(result.message).not.toContain("/app/private");
+    expect(result.message).not.toContain("provider payload");
+  });
+
   it("repackages a frozen dist as ESA assets and adds an exact digest marker", async () => {
     const dist = new JSZip();
     dist.file("index.html", "<!doctype html><title>FrontMind</title>");
@@ -104,7 +127,7 @@ describe("direct ESA SiteOps provider", () => {
           .async("string"),
       ),
     ).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       deploymentId: operation.id,
       distSha256: hash,
     });
@@ -137,7 +160,7 @@ describe("direct ESA SiteOps provider", () => {
     const qaZip = Buffer.from("production qa", "utf8");
     const provenanceJson = Buffer.from("{}\n", "utf8");
     const contract = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       source: {
         knowledgeSnapshotId: "11000000-0000-4000-8000-000000000011",
         archiveSha256: "4".repeat(64),
@@ -146,9 +169,13 @@ describe("direct ESA SiteOps provider", () => {
       },
       workflow: {
         upstreamSha256: "5".repeat(64),
-        version: "1.1.0",
-        packageSha256: "6".repeat(64),
-        starterVersion: "1.1.0",
+        version: "1.2.0",
+        manifestSha256: "6".repeat(64),
+        starterVersion: "1.2.0",
+        starterSha256: "b".repeat(64),
+        componentLibraryVersion: "1.0.0",
+        materializerVersion: "1.0.0",
+        materializerSha256: "c".repeat(64),
       },
       identity: {
         companyName: "FrontMind Test",
@@ -158,8 +185,10 @@ describe("direct ESA SiteOps provider", () => {
       visual: {
         queryHash: "7".repeat(64),
         selectedCandidateId: "sample-B",
-        promptSha256: "8".repeat(64),
+        providerItemKey: "n:143",
+        visualEvidenceSha256: "8".repeat(64),
         previewSha256: "9".repeat(64),
+        supportEvidenceSha256s: [],
         taxonomy: {
           role: "foundation",
           palette: [],
@@ -168,6 +197,8 @@ describe("direct ESA SiteOps provider", () => {
           motion: [],
           accessibility: [],
         },
+        designSpecHash: "d".repeat(64),
+        componentLibraryVersion: "1.0.0",
       },
       routes: [
         {
@@ -178,7 +209,13 @@ describe("direct ESA SiteOps provider", () => {
         },
       ],
       assets: [],
-      seo: { environment: "production", siteTitle: "FrontMind Test" },
+      seo: {
+        siteTitle: "FrontMind Test",
+        description: "经过知识来源核验的企业官网。",
+        organizationType: "Organization",
+        environment: "production",
+        canonicalPolicy: "exact_https_origin",
+      },
       target: {
         environment: "global_excluding_cn",
         canonicalOrigin: "https://example.com",
@@ -463,7 +500,7 @@ describe("direct ESA SiteOps provider", () => {
         {
           response: new Response(
             JSON.stringify({
-              schemaVersion: 1,
+              schemaVersion: 2,
               deploymentId: deployment.id,
               distSha256: distHash,
             }),

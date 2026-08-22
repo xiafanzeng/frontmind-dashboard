@@ -17,8 +17,12 @@ import {
   canonicalSha256,
   buildTwentyFirstVisualFunnel,
   composeTwentyFirstQueries,
+  createVisualEvidenceV1,
   normalizeTwentyFirstDetail,
   normalizeTwentyFirstSearchResults,
+  visualSearchOperationInputV1Schema,
+  VISUAL_EVIDENCE_KIND,
+  VISUAL_TAXONOMY_DERIVATION_VERSION,
   type NormalizedTwentyFirstCandidate,
   type SafeVisualDirective,
   type TwentyFirstDetailEnvelope,
@@ -31,9 +35,11 @@ import {
   type SiteBrief,
 } from "../../shared/siteops";
 import { AuthServiceError } from "../auth-service";
+import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
 import {
   TwentyFirstClient,
+  TwentyFirstToolContractError,
   getTwentyFirstCredentialById,
   type TwentyFirstReadOnlySession,
 } from "../twenty-first-service";
@@ -41,15 +47,6 @@ import { persistSiteOpsArtifact } from "./artifact-store";
 import { registerSiteOpsProviderHandler } from "./providers";
 import { fetchSafeVisualPreview } from "./remote-preview";
 import type { SiteOpsProviderHandler, SiteOpsProviderResult } from "./providers";
-
-const visualSearchOperationInputSchema = z
-  .object({
-    knowledgeSnapshotId: z.string().uuid(),
-    credentialId: z.string().uuid(),
-    credentialVersion: z.number().int().positive(),
-    workflowVersion: z.string().trim().min(1).max(32).optional(),
-  })
-  .strict();
 
 const SEARCH_LIMITS: Readonly<Record<TwentyFirstQueryRole, number>> = {
   foundation: 10,
@@ -84,6 +81,7 @@ type MirroredCandidate = {
   taxonomy: ReturnType<typeof taxonomyFromDirectives>;
   previewLocalAssetId: string;
   previewSha256: string;
+  visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
 };
 
 export type TwentyFirstBoardPersistenceInput = {
@@ -120,6 +118,15 @@ class TwentyFirstProviderFailure extends Error {
     this.name = "TwentyFirstProviderFailure";
   }
 }
+
+type VisualSearchStage =
+  | "validate_operation"
+  | "load_context"
+  | "load_credential"
+  | "mcp_retrieval"
+  | "mirror_previews"
+  | "persist_selection_bundle"
+  | "persist_board";
 
 function cleanText(value: unknown, fallback: string, maxLength: number) {
   if (typeof value !== "string") return fallback;
@@ -197,7 +204,7 @@ async function loadDefaultContext(
       "该操作不是有效的 21st 视觉检索任务。",
     );
   }
-  const input = visualSearchOperationInputSchema.parse(operation.input);
+  const input = visualSearchOperationInputV1Schema.parse(operation.input);
   const projectRows = await db
     .select()
     .from(siteProjects)
@@ -275,6 +282,15 @@ async function loadDefaultContext(
 function taxonomyFromDirectives(
   role: TwentyFirstQueryRole,
   directives: readonly SafeVisualDirective[],
+  preview?: {
+    width: number;
+    height: number;
+    visualSignals?: {
+      dominantHex: string;
+      brightness: number;
+      contrast: number;
+    };
+  },
 ) {
   const values = (prefixes: readonly string[]) =>
     directives
@@ -282,11 +298,30 @@ function taxonomyFromDirectives(
         prefixes.some((prefix) => directive.startsWith(`${prefix}:`)),
       )
       .map((directive) => directive.slice(directive.indexOf(":") + 1));
+  const layout = values(["structure", "surface", "imagery", "tone"]);
+  if (preview && preview.width / preview.height >= 1.4 && !layout.includes("wide-crop")) {
+    layout.push("wide-crop");
+  }
+  const palette = values(["color"]);
+  if (preview?.visualSignals) {
+    palette.unshift(preview.visualSignals.dominantHex);
+    if (preview.visualSignals.brightness <= 96 && !palette.includes("dark-canvas")) {
+      palette.push("dark-canvas");
+    } else if (
+      preview.visualSignals.brightness >= 180 &&
+      !palette.includes("light-canvas")
+    ) {
+      palette.push("light-canvas");
+    }
+    if (preview.visualSignals.contrast >= 60 && !palette.includes("high-contrast")) {
+      palette.push("high-contrast");
+    }
+  }
   return {
     role,
-    palette: values(["color"]),
+    palette,
     typography: values(["typography"]),
-    layout: values(["structure", "surface", "imagery", "tone"]),
+    layout,
     motion: values(["motion"]),
     accessibility: values(["responsive"]).concat(
       directives.includes("motion:reduced-motion-required")
@@ -305,17 +340,13 @@ function safeSearchEnvelopes(
   return candidates
     .filter((candidate) => {
       if (
-        !/^[A-Za-z0-9._-]{1,512}$/u.test(candidate.providerItemId) ||
-        /^21st_sk_/iu.test(candidate.providerItemId)
+        (candidate.sourceUrl && sources.has(candidate.sourceUrl)) ||
+        (candidate.previewUrl && previews.has(candidate.previewUrl))
       ) {
         return false;
       }
-      if (!candidate.previewUrl) return false;
-      if (sources.has(candidate.sourceUrl) || previews.has(candidate.previewUrl)) {
-        return false;
-      }
-      sources.add(candidate.sourceUrl);
-      previews.add(candidate.previewUrl);
+      if (candidate.sourceUrl) sources.add(candidate.sourceUrl);
+      if (candidate.previewUrl) previews.add(candidate.previewUrl);
       return true;
     })
     .map((candidate) => ({
@@ -325,10 +356,10 @@ function safeSearchEnvelopes(
           {
             id: candidate.providerItemId,
             title: candidate.title,
+            description: candidate.description,
             author: candidate.author,
             sourceUrl: candidate.sourceUrl,
             previewUrl: candidate.previewUrl,
-            dependencies: candidate.dependencies,
           },
         ],
       },
@@ -431,9 +462,22 @@ async function mirrorCandidates(input: {
         taxonomy: taxonomyFromDirectives(
           candidate.queryRole,
           candidate.normalizedDirectives,
+          {
+            width: preview.width,
+            height: preview.height,
+            visualSignals: preview.visualSignals,
+          },
         ),
         previewLocalAssetId: asset.id,
         previewSha256: preview.sha256,
+        visualEvidence: createVisualEvidenceV1({
+          evidenceKind: VISUAL_EVIDENCE_KIND,
+          providerItemKey: candidate.providerItemKey,
+          metadataSha256: candidate.metadataSha256,
+          providerResponseSha256: candidate.providerResponseSha256,
+          previewSha256: preview.sha256,
+          taxonomyDerivationVersion: VISUAL_TAXONOMY_DERIVATION_VERSION,
+        }),
       });
     } catch {
       rejectedPreviews += 1;
@@ -529,9 +573,8 @@ async function persistDefaultBoard(
         attachmentId: null,
         previewLocalAssetId: item.previewLocalAssetId,
         sourceMetadata: {
-          providerItemId: item.candidate.providerItemId,
-          promptSha256: item.candidate.promptSha256,
-          responseSha256: item.candidate.responseSha256,
+          providerItemKey: item.candidate.providerItemKey,
+          visualEvidence: item.visualEvidence,
           taxonomy: {
             ...item.taxonomy,
             scoreAxes: item.candidate.scoreBreakdown,
@@ -591,9 +634,33 @@ async function persistDefaultBoard(
   });
 }
 
-function safeProviderFailure(error: unknown): SiteOpsProviderResult {
+function safeProviderFailure(
+  error: unknown,
+  stage: VisualSearchStage,
+): SiteOpsProviderResult {
   if (error instanceof TwentyFirstProviderFailure) {
     return { status: error.status, code: error.code, message: error.message };
+  }
+  if (error instanceof z.ZodError) {
+    if (stage !== "validate_operation" && stage !== "load_context") {
+      return {
+        status: "attention_required",
+        code: "VISUAL_BOARD_PERSISTENCE_FAILED",
+        message: "视觉方向未能安全保存，请稍后重试。",
+      };
+    }
+    return {
+      status: "failed",
+      code: "VISUAL_OPERATION_CONTRACT_MISMATCH",
+      message: "视觉检索任务合同不一致，请重置后重新开始。",
+    };
+  }
+  if (error instanceof TwentyFirstToolContractError) {
+    return {
+      status: "attention_required",
+      code: "MCP_CONTRACT_INCOMPATIBLE",
+      message: "21st 目录工具参数协议暂不兼容，请稍后重试。",
+    };
   }
   if (error instanceof AuthServiceError) {
     return {
@@ -608,9 +675,16 @@ function safeProviderFailure(error: unknown): SiteOpsProviderResult {
           : "21st 目录服务暂时不可用，请稍后重试。",
     };
   }
+  if (stage === "mcp_retrieval") {
+    return {
+      status: "attention_required",
+      code: "MCP_UNAVAILABLE",
+      message: "21st 目录服务暂时不可用，请稍后重试。",
+    };
+  }
   return {
     status: "attention_required",
-    code: "VISUAL_SEARCH_PERSISTENCE_FAILED",
+    code: "VISUAL_BOARD_PERSISTENCE_FAILED",
     message: "视觉方向未能安全保存，请稍后重试。",
   };
 }
@@ -629,7 +703,13 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
 
   return async ({ operation, signal }) => {
+    let stage: VisualSearchStage = "validate_operation";
+    let activeApiKey: string | undefined;
     try {
+      const parsedInput = visualSearchOperationInputV1Schema.parse(
+        operation.input,
+      );
+      stage = "load_context";
       const db = await dbGetter();
       if (!db) {
         throw new TwentyFirstProviderFailure(
@@ -638,9 +718,6 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "attention_required",
         );
       }
-      const parsedInput = visualSearchOperationInputSchema.parse(
-        operation.input,
-      );
       const context = await loadContext(db, operation);
       if (context.existingBoard) {
         return {
@@ -655,6 +732,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           message: "视觉方向已恢复，可继续选择。",
         };
       }
+      stage = "load_credential";
       const credential = await getCredential(parsedInput.credentialId);
       if (!credential || credential.version !== parsedInput.credentialVersion) {
         throw new TwentyFirstProviderFailure(
@@ -663,6 +741,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "attention_required",
         );
       }
+      activeApiKey = credential.apiKey;
+      stage = "mcp_retrieval";
       const { queries, funnel } = await client.withReadOnlySession(
         credential.apiKey,
         (session) => retrieveFunnel({ session, brief: context.brief }),
@@ -677,6 +757,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           (left, right) =>
             right.score - left.score || left.searchRank - right.searchRank,
         );
+      stage = "mirror_previews";
       const { mirrored, rejectedPreviews } = await mirrorCandidates({
         operation,
         context,
@@ -702,6 +783,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           `PRESENTATION_RESULTS_INSUFFICIENT:${mirrored.length}/9`,
         );
       }
+      stage = "persist_selection_bundle";
       const selectionBundle = visualSelectionBundleSchema.parse({
         queryHash: canonicalSha256(queries),
         searchTarget: 18,
@@ -710,9 +792,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
         candidates: mirrored.map((item) => ({
           id: item.sampleId,
           label: item.optionLabel,
-          providerItemId: item.candidate.providerItemId,
-          promptSha256: item.candidate.promptSha256,
-          responseSha256: item.candidate.responseSha256,
+          providerItemKey: item.candidate.providerItemKey,
+          visualEvidence: item.visualEvidence,
           previewLocalAssetId: item.previewLocalAssetId,
           previewSha256: item.previewSha256,
           taxonomy: item.taxonomy,
@@ -741,6 +822,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "attention_required",
         );
       }
+      stage = "persist_board";
       const board = await persistBoard(db, {
         operation,
         context,
@@ -757,7 +839,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           selectionBundleHash: board.selectionBundleHash ?? undefined,
           actual: {
             searched: funnel.actual.searched,
-            promptRetrieved: funnel.actual.promptRetrieved,
+            detailRetrieved: funnel.actual.detailRetrieved,
             presented: mirrored.length,
           },
           degradedReasons: selectionBundle.degradedReasons,
@@ -768,7 +850,15 @@ export function createTwentyFirstSiteOpsProviderHandler(
             : `${mirrored.length} 个真实视觉方向已按实际可用结果展示。`,
       };
     } catch (error) {
-      return safeProviderFailure(error);
+      console.error("[SiteOps21st] visual_search_failed", {
+        operationId: operation.id,
+        projectId: operation.projectId,
+        stage,
+        error: runtimeErrorForLog(error, {
+          additionalSecrets: activeApiKey ? [activeApiKey] : [],
+        }),
+      });
+      return safeProviderFailure(error, stage);
     }
   };
 }

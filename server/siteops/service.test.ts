@@ -3,7 +3,9 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   assertSiteOpsDeploymentTargetAvailable,
+  assertCurrentVisualWorkflowVersion,
   assertSiteOpsSnapshotChangeState,
+  createVisualSearchOperationInput,
   hashSiteOpsRequest,
   isSiteOpsOperationReplay,
   isSiteOpsIcpApprovedForCurrentDomain,
@@ -12,9 +14,11 @@ import {
   resolvePinnedTwentyFirstCredentialForBatch,
   siteBriefFromSnapshot,
   siteOpsActiveFinancialIntentKey,
+  siteOpsResetCapability,
   SiteOpsServiceError,
 } from "./service";
 import {
+  SITEOPS_WORKFLOW,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
   siteOpsAliyunConnectionSetupInputSchema,
@@ -22,6 +26,37 @@ import {
 } from "../../shared/siteops";
 
 describe("SiteOps core contracts", () => {
+  it("requires a selected visual board to match the current workflow", () => {
+    expect(() => assertCurrentVisualWorkflowVersion("0.0.0")).toThrow(
+      "视觉检索使用的建站合同已升级",
+    );
+    expect(() =>
+      assertCurrentVisualWorkflowVersion(SITEOPS_WORKFLOW.frontMindVersion),
+    ).not.toThrow();
+  });
+
+  it("creates a strict four-field visual operation without a Manus credential", () => {
+    const input = createVisualSearchOperationInput({
+      knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+      credentialId: "20000000-0000-4000-8000-000000000002",
+      credentialVersion: 7,
+      workflowVersion: "1.2.0",
+    });
+
+    expect(input).toEqual({
+      knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+      credentialId: "20000000-0000-4000-8000-000000000002",
+      credentialVersion: 7,
+      workflowVersion: "1.2.0",
+    });
+    expect(Object.keys(input).sort()).toEqual([
+      "credentialId",
+      "credentialVersion",
+      "knowledgeSnapshotId",
+      "workflowVersion",
+    ]);
+  });
+
   it("hashes canonical object keys while preserving meaningful array order", () => {
     expect(hashSiteOpsRequest({ b: 2, a: { d: 4, c: 3 } })).toBe(
       hashSiteOpsRequest({ a: { c: 3, d: 4 }, b: 2 }),
@@ -158,6 +193,60 @@ describe("SiteOps core contracts", () => {
     ).toThrow();
   });
 
+  it("accepts reset only with explicit confirmation", () => {
+    expect(
+      parseSiteOpsActionPayload("reset_workflow", { confirmed: true }),
+    ).toEqual({ confirmed: true });
+    expect(() =>
+      parseSiteOpsActionPayload("reset_workflow", { confirmed: false }),
+    ).toThrow();
+    expect(() =>
+      parseSiteOpsActionPayload("reset_workflow", {
+        confirmed: true,
+        rebuildOldConversation: true,
+      }),
+    ).toThrow();
+  });
+
+  it("allows reset only before the first build and outside unresolved work", () => {
+    const preBuild = {
+      projectStatus: "attention_required",
+      currentBuild: false,
+      liveHead: false,
+      hasBuild: false,
+      hasDeployment: false,
+      hasBlockingOperation: false,
+      hasActiveDns: false,
+      hasUnresolvedFinancialIntent: false,
+    };
+    expect(siteOpsResetCapability(preBuild)).toEqual({ allowed: true });
+    expect(
+      siteOpsResetCapability({
+        ...preBuild,
+        projectStatus: "visual_searching",
+      }),
+    ).toEqual({ allowed: true });
+
+    for (const blocked of [
+      { currentBuild: true },
+      { hasBuild: true },
+      { liveHead: true },
+      { hasDeployment: true },
+      { hasBlockingOperation: true },
+      { hasActiveDns: true },
+      { hasUnresolvedFinancialIntent: true },
+    ]) {
+      expect(siteOpsResetCapability({ ...preBuild, ...blocked })).toMatchObject(
+        {
+          allowed: false,
+        },
+      );
+    }
+    expect(
+      siteOpsResetCapability({ ...preBuild, projectStatus: "approved" }),
+    ).toMatchObject({ allowed: false });
+  });
+
   it("keeps existing-domain sync read-only and exact-confirmation shaped", () => {
     expect(
       parseSiteOpsActionPayload("domain_sync", {
@@ -258,7 +347,7 @@ describe("SiteOps core contracts", () => {
             knowledgeSnapshotId: snapshotId,
             credentialId: pinnedCredentialId,
             credentialVersion: 7,
-            workflowVersion: "1.1.0",
+            workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
           },
         },
       ],

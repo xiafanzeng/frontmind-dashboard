@@ -344,6 +344,12 @@ export const siteOpsObservationV1Schema = z
       .array(siteOpsSocialPackageProjectionSchema)
       .max(100)
       .default([]),
+    resetCapability: z
+      .object({
+        allowed: z.boolean(),
+        reason: z.string().trim().min(1).max(1_000).optional(),
+      })
+      .strict(),
     interactionState: siteOpsInteractionStateSchema,
     latestSequence: z.number().int().nonnegative(),
   })

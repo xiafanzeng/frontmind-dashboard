@@ -1,15 +1,25 @@
 import { z } from "zod";
 
-export const SITEOPS_WORKFLOW = {
+/** Immutable coordinates for the FrontMind 1.2 host materializer. Keep this
+ * record when a later workflow registers a new handler. */
+export const SITEOPS_MATERIALIZER_V1_2 = {
   upstreamVersion: "1.0.0",
   upstreamSha256:
     "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
-  frontMindVersion: "1.1.0",
+  frontMindVersion: "1.2.0",
   runtimeManifestSha256:
-    "9be677c02ef05d93f08acecf290196065f0ecc2b7c4bbfc097e81b6b29ed4f84",
-  starterVersion: "1.1.0",
+    "5123e62b0ee7f5c73a9ee42410bb62276938a765781d28ad2345b7ce3814cad6",
+  starterVersion: "1.2.0",
+  starterSha256:
+    "441c938e156745de1469f527649397a087ca4379bffa2a4e47d12bcbc94662fe",
+  componentLibraryVersion: "1.0.0",
+  materializerVersion: "1.0.0",
+  materializerSha256:
+    "ba508966169adbd03f87444d499644697b2a5ccaa9b67d0b74730448aaf1eecf",
   qaPolicyVersion: "siteops-qa-v1",
 } as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_2;
 
 export const siteOpsProjectStatusSchema = z.enum([
   "draft",
@@ -155,20 +165,52 @@ export const visualTaxonomySchema = z
   })
   .strict();
 
+export const visualEvidenceV1Schema = z
+  .object({
+    evidenceKind: z.literal("catalog_metadata_preview_v1"),
+    providerItemKey: z
+      .string()
+      .trim()
+      .min(3)
+      .max(514)
+      .regex(/^(?:n:[1-9]\d*|s:.+)$/u),
+    metadataSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    providerResponseSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    taxonomyDerivationVersion: z.literal("catalog-metadata-preview-v1"),
+    evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
 export const visualCandidateSchema = z
   .object({
     id: z.string().trim().min(1).max(191),
     label: z.string().regex(/^[A-I]$/),
-    providerItemId: z.string().trim().min(1).max(512),
-    promptSha256: z.string().regex(/^[a-f0-9]{64}$/),
-    responseSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    providerItemKey: z.string().trim().min(3).max(514),
+    visualEvidence: visualEvidenceV1Schema,
     previewLocalAssetId: z.string().uuid(),
     previewSha256: z.string().regex(/^[a-f0-9]{64}$/),
     taxonomy: visualTaxonomySchema,
     score: z.number().finite().min(0).max(100),
     rationale: z.string().trim().min(1).max(2_000),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.providerItemKey !== value.visualEvidence.providerItemKey) {
+      context.addIssue({
+        code: "custom",
+        path: ["visualEvidence", "providerItemKey"],
+        message: "Visual evidence provider item does not match candidate",
+      });
+    }
+    if (value.previewSha256 !== value.visualEvidence.previewSha256) {
+      context.addIssue({
+        code: "custom",
+        path: ["visualEvidence", "previewSha256"],
+        message: "Visual evidence preview does not match candidate",
+      });
+    }
+  });
 
 export const visualSelectionBundleSchema = z
   .object({
@@ -282,6 +324,7 @@ export const siteOpsSendMessageInputSchema = z
   .strict();
 
 export const siteOpsActionSchema = z.enum([
+  "reset_workflow",
   "select_snapshot",
   "change_snapshot",
   "start_visual_search",

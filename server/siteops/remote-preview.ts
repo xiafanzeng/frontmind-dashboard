@@ -224,7 +224,8 @@ export async function fetchPinnedPublicHttps(input: {
 
 async function readBoundedBody(response: Response, maxBytes: number) {
   if (!response.body) throw new Error("PREVIEW_BODY_MISSING");
-  const declared = Number(response.headers.get("content-length"));
+  const declaredHeader = response.headers.get("content-length");
+  const declared = declaredHeader === null ? Number.NaN : Number(declaredHeader);
   if (Number.isFinite(declared) && (declared <= 0 || declared > maxBytes)) {
     throw new Error("PREVIEW_SIZE_INVALID");
   }
@@ -289,10 +290,11 @@ export async function fetchSafeVisualPreview(input: {
     throw new Error("PREVIEW_MIME_INVALID");
   }
   const buffer = await readBoundedBody(response, MAX_PREVIEW_BYTES);
-  const metadata = await sharp(buffer, {
+  const image = sharp(buffer, {
     failOn: "error",
     limitInputPixels: MAX_PREVIEW_PIXELS,
-  }).metadata();
+  });
+  const metadata = await image.metadata();
   if (
     !metadata.width ||
     !metadata.height ||
@@ -301,12 +303,48 @@ export async function fetchSafeVisualPreview(input: {
   ) {
     throw new Error("PREVIEW_IMAGE_INVALID");
   }
+  // Re-encoding removes EXIF/text/profile metadata and makes the immutable
+  // artifact hash independent from provider-side metadata changes.
+  const normalizedBuffer = await image
+    .clone()
+    .rotate()
+    .png({ compressionLevel: 9, adaptiveFiltering: false })
+    .toBuffer();
+  if (normalizedBuffer.byteLength > MAX_PREVIEW_BYTES) {
+    throw new Error("PREVIEW_TOO_LARGE");
+  }
+  const normalizedImage = sharp(normalizedBuffer, {
+    failOn: "error",
+    limitInputPixels: MAX_PREVIEW_PIXELS,
+  });
+  const [normalizedMetadata, stats] = await Promise.all([
+    normalizedImage.metadata(),
+    normalizedImage.stats(),
+  ]);
+  if (!normalizedMetadata.width || !normalizedMetadata.height) {
+    throw new Error("PREVIEW_IMAGE_INVALID");
+  }
+  const visibleChannels = stats.channels.slice(0, 3);
+  const brightness =
+    visibleChannels.reduce((sum, channel) => sum + channel.mean, 0) /
+    Math.max(1, visibleChannels.length);
+  const contrast =
+    visibleChannels.reduce((sum, channel) => sum + channel.stdev, 0) /
+    Math.max(1, visibleChannels.length);
+  const dominantHex = `#${[stats.dominant.r, stats.dominant.g, stats.dominant.b]
+    .map((value) => Math.round(value).toString(16).padStart(2, "0"))
+    .join("")}`;
   return {
     finalUrl: fetched.finalUrl.toString(),
-    mimeType,
-    buffer,
-    width: metadata.width,
-    height: metadata.height,
-    sha256: createHash("sha256").update(buffer).digest("hex"),
+    mimeType: "image/png" as const,
+    buffer: normalizedBuffer,
+    width: normalizedMetadata.width,
+    height: normalizedMetadata.height,
+    sha256: createHash("sha256").update(normalizedBuffer).digest("hex"),
+    visualSignals: {
+      dominantHex,
+      brightness: Math.round(brightness * 100) / 100,
+      contrast: Math.round(contrast * 100) / 100,
+    },
   };
 }

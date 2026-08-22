@@ -11,18 +11,30 @@ import {
   siteOperations,
   siteProjects,
   socialPackages,
+  websiteStyleSampleBatches,
   websiteStyleSamples,
   type SiteOperation,
 } from "../../drizzle/schema";
 import {
   SITEOPS_WORKFLOW,
   siteBriefSchema,
+  visualEvidenceV1Schema,
+  visualSelectionBundleSchema,
   visualTaxonomySchema,
 } from "../../shared/siteops";
 import {
   canonicalJson,
-  composeBuildContractV1,
+  createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
+import {
+  canonicalSiteOpsSha256,
+  composeBuildContractV2,
+  pageContentResultV1Schema,
+  siteDesignResultV1Schema,
+  siteOpsRuntimeVisualEvidenceV1Schema,
+  validateDesignAndContentBindings,
+} from "../../shared/siteops-design";
+import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
 import {
   classifyManusV2StructuredResultEnvelope,
@@ -41,7 +53,10 @@ import {
   siteOpsGeneratedContentSchema,
   socialPackageInputSchema,
 } from "./build-runtime";
-import { persistSiteOpsArtifact } from "./artifact-store";
+import {
+  persistSiteOpsArtifact,
+  readSiteOpsArtifact,
+} from "./artifact-store";
 import {
   registerSiteOpsProviderHandler,
   type SiteOpsProviderHandler,
@@ -63,29 +78,7 @@ const operationInputSchema = z
   })
   .passthrough();
 
-const designResultSchema = z
-  .object({
-    operationToken: z.string().min(1).max(128),
-    designSystem: z
-      .object({
-        visualDirection: z.string().trim().min(1).max(600),
-        informationHierarchy: z.string().trim().min(1).max(1_200),
-        contentTone: z.string().trim().min(1).max(600),
-      })
-      .strict(),
-    seoPlan: z
-      .object({
-        siteTitle: z.string().trim().min(1).max(80),
-        description: z.string().trim().min(1).max(200),
-        organizationType: z.enum([
-          "Organization",
-          "Corporation",
-          "ProfessionalService",
-        ]),
-      })
-      .strict(),
-  })
-  .strict();
+const designResultSchema = siteDesignResultV1Schema;
 
 const providerStateSchema = z
   .object({
@@ -115,6 +108,7 @@ type ManusProviderDependencies = {
   createClient?: (input: { apiKey: string; credentialId: string }) => ManusV2Client;
   readSnapshotArchive?: typeof readKnowledgeSnapshotArchive;
   persistArtifact?: typeof persistSiteOpsArtifact;
+  readArtifact?: typeof readSiteOpsArtifact;
   materializeSite?: typeof materializeAstroSite;
   generateSocial?: typeof generateSocialPackage;
 };
@@ -142,11 +136,11 @@ function workflowRoots() {
     ...(configured ? [path.resolve(configured)] : []),
     path.resolve(
       process.cwd(),
-      "dist/private-workflows/astro-company-site-workflow-v1.1.0",
+      "dist/private-workflows/astro-company-site-workflow-v1.2.0",
     ),
     path.resolve(
       process.cwd(),
-      "private-workflows/astro-company-site-workflow-v1.1.0",
+      "private-workflows/astro-company-site-workflow-v1.2.0",
     ),
   ];
 }
@@ -168,13 +162,13 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
     if (!root || !manifestBytes) {
       throw new SiteOpsManusFailure(
         "SITEOPS_WORKFLOW_NOT_FOUND",
-        "FrontMind 1.1.0 建站工作流未进入运行镜像。",
+        "FrontMind 1.2.0 建站工作流未进入运行镜像。",
       );
     }
     if (sha256(manifestBytes) !== SITEOPS_WORKFLOW.runtimeManifestSha256) {
       throw new SiteOpsManusFailure(
         "SITEOPS_WORKFLOW_MANIFEST_MISMATCH",
-        "FrontMind 1.1.0 建站工作流 manifest 哈希不一致。",
+        "FrontMind 1.2.0 建站工作流 manifest 哈希不一致。",
         "failed",
       );
     }
@@ -186,6 +180,20 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
           version: z.literal(SITEOPS_WORKFLOW.upstreamVersion),
           archiveSha256: z.literal(SITEOPS_WORKFLOW.upstreamSha256),
         }),
+        host: z
+          .object({
+            starterSha256: z.literal(SITEOPS_WORKFLOW.starterSha256),
+            componentLibraryVersion: z.literal(
+              SITEOPS_WORKFLOW.componentLibraryVersion,
+            ),
+            materializerVersion: z.literal(
+              SITEOPS_WORKFLOW.materializerVersion,
+            ),
+            materializerSha256: z.literal(
+              SITEOPS_WORKFLOW.materializerSha256,
+            ),
+          })
+          .strict(),
         files: z
           .array(
             z.object({
@@ -211,7 +219,7 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
       ) {
         throw new SiteOpsManusFailure(
           "SITEOPS_WORKFLOW_PATH_INVALID",
-          "FrontMind 1.1.0 建站工作流包含不安全路径。",
+          "FrontMind 1.2.0 建站工作流包含不安全路径。",
           "failed",
         );
       }
@@ -219,7 +227,7 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
       if (!absolute.startsWith(`${root}${path.sep}`)) {
         throw new SiteOpsManusFailure(
           "SITEOPS_WORKFLOW_PATH_INVALID",
-          "FrontMind 1.1.0 建站工作流路径越界。",
+          "FrontMind 1.2.0 建站工作流路径越界。",
           "failed",
         );
       }
@@ -227,7 +235,7 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
       if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
         throw new SiteOpsManusFailure(
           "SITEOPS_WORKFLOW_FILE_INVALID",
-          "FrontMind 1.1.0 建站工作流包含非普通文件。",
+          "FrontMind 1.2.0 建站工作流包含非普通文件。",
           "failed",
         );
       }
@@ -235,7 +243,7 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
       if (bytes.length !== entry.bytes || sha256(bytes) !== entry.sha256) {
         throw new SiteOpsManusFailure(
           "SITEOPS_WORKFLOW_FILE_MISMATCH",
-          `FrontMind 1.1.0 建站工作流文件校验失败：${entry.path}`,
+          `FrontMind 1.2.0 建站工作流文件校验失败：${entry.path}`,
           "failed",
         );
       }
@@ -243,7 +251,7 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
       if (total > 18 * 1024 * 1024) {
         throw new SiteOpsManusFailure(
           "SITEOPS_WORKFLOW_PACKAGE_TOO_LARGE",
-          "FrontMind 1.1.0 建站工作流超过附件上限。",
+          "FrontMind 1.2.0 建站工作流超过附件上限。",
           "failed",
         );
       }
@@ -256,7 +264,7 @@ export async function loadVerifiedSiteOpsWorkflowPackage() {
     if (!skill || !contract) {
       throw new SiteOpsManusFailure(
         "SITEOPS_WORKFLOW_CONTRACT_MISSING",
-        "FrontMind 1.1.0 建站工作流缺少 SKILL 或 runtime contract。",
+        "FrontMind 1.2.0 建站工作流缺少 SKILL 或 runtime contract。",
         "failed",
       );
     }
@@ -279,6 +287,89 @@ function workflowAttachment(bytes: Buffer) {
     mime_type: "application/zip",
     file_data: `data:application/zip;base64,${bytes.toString("base64")}`,
   } as const;
+}
+
+async function storedArtifactBytes(
+  artifact: NonNullable<Awaited<ReturnType<typeof readSiteOpsArtifact>>>,
+) {
+  if (
+    artifact.stored.sizeBytes < 1 ||
+    artifact.stored.sizeBytes > 8 * 1024 * 1024
+  ) {
+    throw new SiteOpsManusFailure(
+      "VISUAL_PREVIEW_ATTACHMENT_INVALID",
+      "冻结的视觉预览超过建站任务附件上限。",
+      "failed",
+    );
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of artifact.stored.createReadStream()) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += bytes.length;
+    if (total > artifact.stored.sizeBytes || total > 8 * 1024 * 1024) {
+      throw new SiteOpsManusFailure(
+        "VISUAL_PREVIEW_ATTACHMENT_INVALID",
+        "冻结的视觉预览读取结果不一致。",
+        "failed",
+      );
+    }
+    chunks.push(bytes);
+  }
+  const bytes = Buffer.concat(chunks);
+  if (
+    bytes.length !== artifact.stored.sizeBytes ||
+    sha256(bytes) !== artifact.row.contentSha256
+  ) {
+    throw new SiteOpsManusFailure(
+      "VISUAL_PREVIEW_ATTACHMENT_INVALID",
+      "冻结的视觉预览哈希校验失败。",
+      "failed",
+    );
+  }
+  return bytes;
+}
+
+export async function visualPreviewAttachment(
+  artifact: NonNullable<Awaited<ReturnType<typeof readSiteOpsArtifact>>>,
+  filename: string,
+) {
+  const mimeType = z
+    .enum(["image/png", "image/jpeg", "image/webp"])
+    .parse(artifact.row.mimeType);
+  const bytes = await storedArtifactBytes(artifact);
+  return {
+    filename,
+    mime_type: mimeType,
+    file_data: `data:${mimeType};base64,${bytes.toString("base64")}`,
+  } as const;
+}
+
+async function readFrozenSelectionBundle(input: {
+  artifact: NonNullable<Awaited<ReturnType<typeof readSiteOpsArtifact>>>;
+  expectedCandidateId: string;
+}) {
+  try {
+    if (input.artifact.stored.sizeBytes > 1_000_000) {
+      throw new Error("selection bundle exceeds limit");
+    }
+    const bytes = await storedArtifactBytes(input.artifact);
+    const bundle = visualSelectionBundleSchema.parse(
+      JSON.parse(bytes.toString("utf8")),
+    );
+    const candidate = bundle.candidates.find(
+      (item) => item.id === input.expectedCandidateId,
+    );
+    if (!candidate) throw new Error("selected candidate is absent");
+    return { bundle, candidate };
+  } catch (error) {
+    if (error instanceof SiteOpsManusFailure) throw error;
+    throw new SiteOpsManusFailure(
+      "VISUAL_SELECTION_BUNDLE_INVALID",
+      "冻结的视觉选择合同无法通过校验。",
+      "failed",
+    );
+  }
 }
 
 const SOCIAL_WORKFLOWS = {
@@ -567,63 +658,188 @@ export function briefWithoutBrandAssets(brief: z.infer<typeof siteBriefSchema>) 
   return { ...brief, publicAssetIds: [] };
 }
 
-function designOutputSchema(token: string): ManusV2StructuredOutputSchema {
+function accessibleRuntimePalette(values: readonly string[]) {
+  return Array.from(
+    new Set([
+      ...values.filter((value) => /^#[a-f0-9]{6}$/iu.test(value)),
+      "#F5F2EA",
+      "#10212B",
+      "#A33A1B",
+    ].map((value) => value.toUpperCase())),
+  ).slice(0, 12);
+}
+
+function designOutputSchema(
+  token: string,
+  routeIds: string[],
+  paletteSize: number,
+): ManusV2StructuredOutputSchema {
+  const colorMaximum = Math.max(0, paletteSize - 1);
   return {
     type: "object",
     properties: {
       operationToken: { type: "string", enum: [token] },
-      designSystem: {
+      designSpec: {
         type: "object",
         properties: {
-          visualDirection: { type: "string" },
-          informationHierarchy: { type: "string" },
-          contentTone: { type: "string" },
-        },
-        required: ["visualDirection", "informationHierarchy", "contentTone"],
-        additionalProperties: false,
-      },
-      seoPlan: {
-        type: "object",
-        properties: {
-          siteTitle: { type: "string" },
-          description: { type: "string" },
-          organizationType: {
+          schemaVersion: { type: "number", enum: [1] },
+          layoutArchetype: {
             type: "string",
-            enum: ["Organization", "Corporation", "ProfessionalService"],
+            enum: ["hero_led", "editorial", "modular", "split", "asymmetric"],
+          },
+          heroVariant: {
+            type: "string",
+            enum: [
+              "split_media",
+              "centered_statement",
+              "editorial_lede",
+              "proof_grid",
+            ],
+          },
+          density: {
+            type: "string",
+            enum: ["compact", "balanced", "spacious"],
+          },
+          surfaceStyle: {
+            type: "string",
+            enum: ["flat", "bordered", "soft_depth", "layered"],
+          },
+          typeScale: {
+            type: "string",
+            enum: ["restrained", "editorial", "display"],
+          },
+          imageTreatment: {
+            type: "string",
+            enum: ["contained", "wide", "masked", "none"],
+          },
+          motionLevel: { type: "string", enum: ["none", "subtle"] },
+          colorRoles: {
+            type: "object",
+            properties: {
+              backgroundPaletteIndex: {
+                type: "number",
+                minimum: 0,
+                maximum: colorMaximum,
+              },
+              textPaletteIndex: {
+                type: "number",
+                minimum: 0,
+                maximum: colorMaximum,
+              },
+              accentPaletteIndex: {
+                type: "number",
+                minimum: 0,
+                maximum: colorMaximum,
+              },
+            },
+            required: [
+              "backgroundPaletteIndex",
+              "textPaletteIndex",
+              "accentPaletteIndex",
+            ],
+            additionalProperties: false,
+          },
+          routeCompositions: {
+            type: "array",
+            minItems: routeIds.length,
+            maxItems: routeIds.length,
+            items: {
+              type: "object",
+              properties: {
+                routeId: { type: "string", enum: routeIds },
+                slots: {
+                  type: "array",
+                  minItems: 1,
+                  maxItems: 16,
+                  items: {
+                    type: "object",
+                    properties: {
+                      slotId: {
+                        type: "string",
+                        pattern: "^[a-z][a-z0-9_-]{0,63}$",
+                      },
+                      variant: {
+                        type: "string",
+                        enum: [
+                          "statement",
+                          "split",
+                          "cards",
+                          "timeline",
+                          "faq",
+                          "proof",
+                          "cta",
+                        ],
+                      },
+                    },
+                    required: ["slotId", "variant"],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ["routeId", "slots"],
+              additionalProperties: false,
+            },
+          },
+          seoPlan: {
+            type: "object",
+            properties: {
+              siteTitle: { type: "string" },
+              description: { type: "string" },
+              organizationType: {
+                type: "string",
+                enum: [
+                  "Organization",
+                  "Corporation",
+                  "ProfessionalService",
+                ],
+              },
+            },
+            required: ["siteTitle", "description", "organizationType"],
+            additionalProperties: false,
           },
         },
-        required: ["siteTitle", "description", "organizationType"],
+        required: [
+          "schemaVersion",
+          "layoutArchetype",
+          "heroVariant",
+          "density",
+          "surfaceStyle",
+          "typeScale",
+          "imageTreatment",
+          "motionLevel",
+          "colorRoles",
+          "routeCompositions",
+          "seoPlan",
+        ],
         additionalProperties: false,
       },
     },
-    required: ["operationToken", "designSystem", "seoPlan"],
+    required: ["operationToken", "designSpec"],
     additionalProperties: false,
   };
 }
 
-function generatedContentOutputSchema(token: string, routeIds: string[]) {
+function generatedContentOutputSchema(
+  token: string,
+  routeCompositions: Array<{
+    routeId: string;
+    slots: Array<{ slotId: string }>;
+  }>,
+) {
+  const routeIds = routeCompositions.map((route) => route.routeId);
   return {
     type: "object",
     properties: {
       operationToken: { type: "string", enum: [token] },
-      seo: {
+      pageContent: {
         type: "object",
         properties: {
-          siteTitle: { type: "string" },
-          description: { type: "string" },
-          organizationType: {
-            type: "string",
-            enum: ["Organization", "Corporation", "ProfessionalService"],
-          },
-        },
-        required: ["siteTitle", "description", "organizationType"],
-        additionalProperties: false,
-      },
-      routes: {
-        type: "array",
-        minItems: routeIds.length,
-        maxItems: routeIds.length,
-        items: {
+          schemaVersion: { type: "number", enum: [1] },
+          routes: {
+            type: "array",
+            minItems: routeIds.length,
+            maxItems: routeIds.length,
+            items: {
           type: "object",
           properties: {
             routeId: { type: "string", enum: routeIds },
@@ -638,6 +854,10 @@ function generatedContentOutputSchema(token: string, routeIds: string[]) {
                 type: "object",
                 properties: {
                   heading: { type: "string" },
+                  slotId: {
+                    type: "string",
+                    pattern: "^[a-z][a-z0-9_-]{0,63}$",
+                  },
                   paragraphs: {
                     type: "array",
                     minItems: 1,
@@ -651,17 +871,26 @@ function generatedContentOutputSchema(token: string, routeIds: string[]) {
                     items: { type: "string" },
                   },
                 },
-                required: ["heading", "paragraphs", "sourceDocumentIds"],
+                required: [
+                  "slotId",
+                  "heading",
+                  "paragraphs",
+                  "sourceDocumentIds",
+                ],
                 additionalProperties: false,
               },
             },
           },
           required: ["routeId", "heading", "summary", "sections"],
           additionalProperties: false,
+            },
+          },
         },
+        required: ["schemaVersion", "routes"],
+        additionalProperties: false,
       },
     },
-    required: ["operationToken", "seo", "routes"],
+    required: ["operationToken", "pageContent"],
     additionalProperties: false,
   } satisfies ManusV2StructuredOutputSchema;
 }
@@ -749,11 +978,21 @@ async function findUniqueCreatedTask(
 async function loadBuildContext(db: any, operation: SiteOperation) {
   if (!operation.buildId) throw new SiteOpsManusFailure("BUILD_ID_MISSING", "建站操作缺少版本标识。", "failed");
   const rows = await db
-    .select({ build: siteBuilds, project: siteProjects, snapshot: knowledgeBaseSnapshots, sample: websiteStyleSamples })
+    .select({
+      build: siteBuilds,
+      project: siteProjects,
+      snapshot: knowledgeBaseSnapshots,
+      batch: websiteStyleSampleBatches,
+      sample: websiteStyleSamples,
+    })
     .from(siteBuilds)
     .innerJoin(siteProjects, eq(siteProjects.id, siteBuilds.projectId))
     .innerJoin(knowledgeBaseSnapshots, eq(knowledgeBaseSnapshots.id, siteBuilds.knowledgeSnapshotId))
     .innerJoin(websiteStyleSamples, eq(websiteStyleSamples.id, siteBuilds.styleSampleId))
+    .innerJoin(
+      websiteStyleSampleBatches,
+      eq(websiteStyleSampleBatches.id, websiteStyleSamples.batchId),
+    )
     .where(and(eq(siteBuilds.id, operation.buildId), eq(siteBuilds.userId, operation.userId)))
     .limit(1);
   const context = rows[0];
@@ -930,7 +1169,7 @@ function resultFailure(error: unknown): SiteOpsProviderResult {
   return {
     status: "attention_required",
     code: "MANUS_SITEOPS_FAILED",
-    message: error instanceof Error ? error.message.slice(0, 2_000) : "Manus 建站任务失败。",
+    message: "Manus 建站任务未能安全推进，请稍后重试或由运营人员处理。",
   };
 }
 
@@ -942,6 +1181,7 @@ export function createManusSiteOpsProviderHandler(
   const createClient = dependencies.createClient ?? ((input) => new ManusV2Client({ baseUrl: baseUrl(), apiKey: input.apiKey, rateLimitScope: input.credentialId, timeoutMs: 30_000 }));
   const readArchive = dependencies.readSnapshotArchive ?? readKnowledgeSnapshotArchive;
   const persist = dependencies.persistArtifact ?? persistSiteOpsArtifact;
+  const readArtifact = dependencies.readArtifact ?? readSiteOpsArtifact;
   const materialize = dependencies.materializeSite ?? materializeAstroSite;
   const socialGenerate = dependencies.generateSocial ?? generateSocialPackage;
 
@@ -1078,8 +1318,9 @@ export function createManusSiteOpsProviderHandler(
       });
       const metadata = context.sample.sourceMetadata;
       if (!metadata || !context.sample.previewLocalAssetId) throw new SiteOpsManusFailure("VISUAL_SELECTION_INCOMPLETE", "冻结的视觉选择缺少可信元数据。", "failed");
+      const metadataRecord = metadata as unknown as Record<string, unknown>;
       const rawTaxonomy = metadata.taxonomy;
-      const taxonomy = visualTaxonomySchema.parse({
+      const parsedTaxonomy = visualTaxonomySchema.parse({
         role: rawTaxonomy.role,
         palette: rawTaxonomy.palette,
         typography: rawTaxonomy.typography,
@@ -1087,16 +1328,17 @@ export function createManusSiteOpsProviderHandler(
         motion: rawTaxonomy.motion,
         accessibility: rawTaxonomy.accessibility,
       });
+      const taxonomy = {
+        ...parsedTaxonomy,
+        palette: accessibleRuntimePalette(parsedTaxonomy.palette),
+      };
       const documents = safePublicDocuments(context.snapshot);
-      const workflowPackage = await loadVerifiedSiteOpsWorkflowPackage();
-      const previewArtifact = await import("./artifact-store").then(
-        ({ readSiteOpsArtifact }) =>
-          readSiteOpsArtifact({
-            userId: operation.userId,
-            localAssetId: context.sample.previewLocalAssetId!,
-            expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
-          }),
-      );
+      const previewArtifact = await readArtifact({
+        userId: operation.userId,
+        localAssetId: context.sample.previewLocalAssetId,
+        expectedSha256: context.sample.sourceMetadata?.visualEvidence?.previewSha256,
+        expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+      });
       if (!previewArtifact) {
         throw new SiteOpsManusFailure(
           "VISUAL_PREVIEW_NOT_FOUND",
@@ -1104,14 +1346,83 @@ export function createManusSiteOpsProviderHandler(
           "failed",
         );
       }
-      const visual = {
-        queryHash:
-          context.build.selectionHash ?? sha256(context.sample.batchId),
+      const visualEvidence = visualEvidenceV1Schema.parse(
+        metadataRecord.visualEvidence,
+      );
+      const recomposedVisualEvidence = createVisualEvidenceV1({
+        evidenceKind: visualEvidence.evidenceKind,
+        providerItemKey: visualEvidence.providerItemKey,
+        metadataSha256: visualEvidence.metadataSha256,
+        providerResponseSha256: visualEvidence.providerResponseSha256,
+        previewSha256: visualEvidence.previewSha256,
+        taxonomyDerivationVersion: visualEvidence.taxonomyDerivationVersion,
+      });
+      const metadataProviderItemKey = z
+        .string()
+        .trim()
+        .min(1)
+        .max(512)
+        .parse(metadataRecord.providerItemKey);
+      if (
+        recomposedVisualEvidence.evidenceSha256 !==
+          visualEvidence.evidenceSha256 ||
+        metadataProviderItemKey !== visualEvidence.providerItemKey ||
+        previewArtifact.row.contentSha256 !== visualEvidence.previewSha256
+      ) {
+        throw new SiteOpsManusFailure(
+          "VISUAL_EVIDENCE_COORDINATES_MISMATCH",
+          "冻结的视觉证据与预览坐标不一致。",
+          "failed",
+        );
+      }
+      if (
+        !context.batch.selectionBundleLocalAssetId ||
+        !context.batch.selectionBundleHash
+      ) {
+        throw new SiteOpsManusFailure(
+          "VISUAL_SELECTION_BUNDLE_MISSING",
+          "冻结的视觉选择合同不存在。",
+          "failed",
+        );
+      }
+      const selectionArtifact = await readArtifact({
+        userId: operation.userId,
+        localAssetId: context.batch.selectionBundleLocalAssetId,
+        expectedSha256: context.batch.selectionBundleHash,
+        expectedMimeTypes: ["application/json"],
+      });
+      if (!selectionArtifact) {
+        throw new SiteOpsManusFailure(
+          "VISUAL_SELECTION_BUNDLE_MISSING",
+          "冻结的视觉选择合同不存在。",
+          "failed",
+        );
+      }
+      const selection = await readFrozenSelectionBundle({
+        artifact: selectionArtifact,
+        expectedCandidateId: context.sample.id,
+      });
+      if (
+        selection.candidate.providerItemKey !== visualEvidence.providerItemKey ||
+        selection.candidate.visualEvidence.evidenceSha256 !==
+          visualEvidence.evidenceSha256 ||
+        selection.candidate.previewSha256 !== visualEvidence.previewSha256
+      ) {
+        throw new SiteOpsManusFailure(
+          "VISUAL_SELECTION_COORDINATES_MISMATCH",
+          "冻结的视觉候选与选择合同坐标不一致。",
+          "failed",
+        );
+      }
+      const visual = siteOpsRuntimeVisualEvidenceV1Schema.parse({
+        queryHash: selection.bundle.queryHash,
         selectedCandidateId: context.sample.id,
-        promptSha256: metadata.promptSha256,
+        providerItemKey: visualEvidence.providerItemKey,
+        visualEvidenceSha256: visualEvidence.evidenceSha256,
         previewSha256: previewArtifact.row.contentSha256,
+        supportEvidenceSha256s: [],
         taxonomy,
-      };
+      });
       const designToken = `siteops-design:${operation.id}`;
       const contentToken = `siteops-content:${operation.id}`;
       let taskId = state?.taskId ?? operation.providerTaskId ?? undefined;
@@ -1122,8 +1433,16 @@ export function createManusSiteOpsProviderHandler(
           if (!found) return pending({ schemaVersion: 1, stage: "create_unknown" }, undefined, "design_compiling");
           taskId = found.id;
         } else {
+          const workflowPackage = await loadVerifiedSiteOpsWorkflowPackage();
+          const visualAttachments = [
+            workflowAttachment(workflowPackage),
+            await visualPreviewAttachment(
+              previewArtifact,
+              "selected-visual.png",
+            ),
+          ];
           const prompt = promptWithMarker(
-            `你是 FrontMind 官网信息架构师。必须遵守附件中经 manifest 校验的 FrontMind Astro Company Site Workflow ${SITEOPS_WORKFLOW.frontMindVersion}、SKILL.md 和 runtime-contract.json。根据已验证 SiteBrief、视觉 taxonomy 和知识资料输出设计系统摘要与 SEO 计划。不要生成源码、依赖、脚本或 21st 组件代码；不要扩写未知事实。\n\nSiteBrief：${JSON.stringify(promptBrief)}\n视觉 taxonomy：${JSON.stringify(taxonomy)}\n知识资料：${JSON.stringify(documents)}`,
+            `你是 FrontMind 官网设计与信息架构师。必须遵守附件中经 manifest 校验的 FrontMind Astro Company Site Workflow ${SITEOPS_WORKFLOW.frontMindVersion}、SKILL.md 和 runtime-contract.json。选中的安全视觉预览也已作为附件提供。根据 SiteBrief、视觉 taxonomy、冻结调色板和知识资料输出严格 SiteDesignSpecV1：只使用允许的布局、hero、section slot、视觉 token 与 SEO 字段。每个 route 都必须有唯一 slotId。不要生成源码、HTML、CSS、依赖、脚本或 21st 组件代码；不要扩写未知事实。\n\nSiteBrief：${JSON.stringify(promptBrief)}\n视觉证据：${JSON.stringify(visual)}\n知识资料：${JSON.stringify(documents)}`,
             designToken,
           );
           await persistOperationProgress(db, operation, {
@@ -1134,9 +1453,13 @@ export function createManusSiteOpsProviderHandler(
             const created = await client.createTask({
               title: operationTitle(operation),
               prompt,
-              attachments: [workflowAttachment(workflowPackage)],
+              attachments: visualAttachments,
               locale: brief.primaryLanguage,
-              structuredOutputSchema: designOutputSchema(designToken),
+              structuredOutputSchema: designOutputSchema(
+                designToken,
+                brief.routes.map((route) => route.id),
+                taxonomy.palette.length,
+              ),
             });
             taskId = created.taskId;
             await db.update(siteBuilds).set({ upstreamManusTaskId: taskId, status: "design_compiling", updatedAt: new Date() }).where(eq(siteBuilds.id, context.build.id));
@@ -1176,16 +1499,20 @@ export function createManusSiteOpsProviderHandler(
         const repairToken = `siteops-repair:${operation.id}:${state.repairKind}:${state.repairAttempt}`;
         const repairSchema =
           state.repairKind === "design"
-            ? designOutputSchema(repairToken)
-            : generatedContentOutputSchema(
+            ? designOutputSchema(
                 repairToken,
                 brief.routes.map((route) => route.id),
+                taxonomy.palette.length,
+              )
+            : generatedContentOutputSchema(
+                repairToken,
+                state.design?.designSpec.routeCompositions ?? [],
               );
         if (state.stage === "repair_send_ready") {
           const repairPrompt = promptWithMarker(
             state.repairKind === "design"
-              ? `继续同一个 FrontMind 建站任务。上一次设计/SEO 结构未通过严格契约。第 ${state.repairAttempt}/3 次修复：重新输出完整设计系统与 SEO 结构；继续遵守已附加的 FrontMind workflow，不得输出源码或未知事实。SiteBrief：${JSON.stringify(promptBrief)}\n视觉 taxonomy：${JSON.stringify(taxonomy)}`
-              : `继续同一个 FrontMind 建站任务。上一次官网正文或 Astro/SEO/视觉 QA 未通过。第 ${state.repairAttempt}/3 次修复：重新输出所有 route 的完整结构化正文，严格使用允许的 routeId 与 sourceDocumentIds，不得输出源码、脚本或未知事实。设计摘要：${JSON.stringify(state.design)}\nSiteBrief：${JSON.stringify(promptBrief)}\n知识资料：${JSON.stringify(documents)}`,
+              ? `继续同一个 FrontMind 建站任务。上一次 SiteDesignSpecV1 未通过严格契约。第 ${state.repairAttempt}/3 次修复：重新输出完整设计、route slot 与 SEO 结构；继续遵守已附加 workflow，不得输出源码或未知事实。SiteBrief：${JSON.stringify(promptBrief)}\n视觉 taxonomy：${JSON.stringify(taxonomy)}`
+              : `继续同一个 FrontMind 建站任务。上一次 PageContentSpecV1 或 Astro/SEO/视觉 QA 未通过。第 ${state.repairAttempt}/3 次修复：按已冻结 designSpec 的 route/slot 顺序重新输出完整结构化正文，严格使用允许的 sourceDocumentIds，不得输出源码、脚本或未知事实。设计合同：${JSON.stringify(state.design?.designSpec)}\nSiteBrief：${JSON.stringify(promptBrief)}\n知识资料：${JSON.stringify(documents)}`,
             repairToken,
           );
           const unknownState: ProviderState = {
@@ -1275,6 +1602,11 @@ export function createManusSiteOpsProviderHandler(
         if (state.repairKind === "design") {
           try {
             const repairedDesign = designResultSchema.parse(rawRepair);
+            validateDesignAndContentBindings({
+              routeIds: brief.routes.map((route) => route.id),
+              paletteSize: taxonomy.palette.length,
+              designSpec: repairedDesign.designSpec,
+            });
             return pending(
               {
                 schemaVersion: 1,
@@ -1315,6 +1647,11 @@ export function createManusSiteOpsProviderHandler(
         }
         try {
           design = designResultSchema.parse(raw);
+          validateDesignAndContentBindings({
+            routeIds: brief.routes.map((route) => route.id),
+            paletteSize: taxonomy.palette.length,
+            designSpec: design.designSpec,
+          });
         } catch {
           return scheduleRepair({
             db,
@@ -1336,8 +1673,8 @@ export function createManusSiteOpsProviderHandler(
           );
         }
         const revisionInstruction = input.feedback ? `客户本次修改要求：${input.feedback}` : "这是首版官网内容。";
-        const canonicalContract = composeBuildContractV1({
-          schemaVersion: 1,
+        const canonicalContract = composeBuildContractV2({
+          schemaVersion: 2,
           source: {
             knowledgeSnapshotId: context.snapshot.id,
             archiveSha256: context.build.knowledgeArchiveHash,
@@ -1347,8 +1684,13 @@ export function createManusSiteOpsProviderHandler(
           workflow: {
             upstreamSha256: SITEOPS_WORKFLOW.upstreamSha256,
             version: SITEOPS_WORKFLOW.frontMindVersion,
-            packageSha256: SITEOPS_WORKFLOW.runtimeManifestSha256,
+            manifestSha256: SITEOPS_WORKFLOW.runtimeManifestSha256,
             starterVersion: SITEOPS_WORKFLOW.starterVersion,
+            starterSha256: SITEOPS_WORKFLOW.starterSha256,
+            componentLibraryVersion:
+              SITEOPS_WORKFLOW.componentLibraryVersion,
+            materializerVersion: SITEOPS_WORKFLOW.materializerVersion,
+            materializerSha256: SITEOPS_WORKFLOW.materializerSha256,
           },
           identity: {
             companyName: brief.companyName,
@@ -1357,11 +1699,16 @@ export function createManusSiteOpsProviderHandler(
               (contact) => `${contact.kind}:${contact.value}`,
             ),
           },
-          visual,
+          visual: {
+            ...visual,
+            designSpecHash: canonicalSiteOpsSha256(design.designSpec),
+            componentLibraryVersion:
+              SITEOPS_WORKFLOW.componentLibraryVersion,
+          },
           routes: brief.routes,
-          assets: [],
+          assets: assetDecisions,
           seo: {
-            ...design.seoPlan,
+            ...design.designSpec.seoPlan,
             environment: "preview",
             canonicalPolicy: "forbidden",
           },
@@ -1369,7 +1716,7 @@ export function createManusSiteOpsProviderHandler(
           qaPolicyVersion: SITEOPS_WORKFLOW.qaPolicyVersion,
         });
         const prompt = promptWithMarker(
-          `继续同一个建站任务。以下 canonical build-contract.json 已由 Dashboard 根据受信 workflow 生成并校验，必须遵守：${canonicalJson(canonicalContract)}。请仅输出各路由的静态官网正文与 SEO 字段；routeId 必须与 SiteBrief 完全一致，每段关键内容必须引用给定 sourceDocumentIds。不得生成源码、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}\n\nSiteBrief：${JSON.stringify(promptBrief)}\n知识资料：${JSON.stringify(documents)}`,
+          `继续同一个建站任务。以下 canonical build-contract.json 已由 Dashboard 根据受信 workflow 和刚才通过校验的 SiteDesignSpecV1 生成，必须遵守：${canonicalJson(canonicalContract)}。请仅输出 PageContentSpecV1；routeId 和 slotId 必须按 designSpec 完全一致且顺序相同，每段关键内容必须引用给定 sourceDocumentIds。不得重复 SEO、生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}\n\nSiteBrief：${JSON.stringify(promptBrief)}\n知识资料：${JSON.stringify(documents)}`,
           contentToken,
         );
         await persistOperationProgress(
@@ -1384,7 +1731,14 @@ export function createManusSiteOpsProviderHandler(
           taskId,
         );
         try {
-          await client.sendMessage({ taskId, prompt, structuredOutputSchema: generatedContentOutputSchema(contentToken, brief.routes.map((route) => route.id)) });
+          await client.sendMessage({
+            taskId,
+            prompt,
+            structuredOutputSchema: generatedContentOutputSchema(
+              contentToken,
+              design.designSpec.routeCompositions,
+            ),
+          });
         } catch (error) {
           if (error instanceof ManusV2ApiError && error.outcomeUnknown) return pending({ schemaVersion: 1, stage: "content_send_unknown", taskId, design }, taskId, "building");
           throw error;
@@ -1426,14 +1780,18 @@ export function createManusSiteOpsProviderHandler(
         }
         return pending({ schemaVersion: 1, stage: "content_pending", taskId, design }, taskId, "building");
       }
-      const rawRecord = rawContent as Record<string, unknown>;
       let generatedContent: z.infer<typeof siteOpsGeneratedContentSchema>;
       try {
+        const contentResult = pageContentResultV1Schema.parse(rawContent);
+        validateDesignAndContentBindings({
+          routeIds: brief.routes.map((route) => route.id),
+          paletteSize: taxonomy.palette.length,
+          designSpec: design!.designSpec,
+          pageContent: contentResult.pageContent,
+        });
         generatedContent = siteOpsGeneratedContentSchema.parse({
-          // Dashboard owns the contract. Provider SEO drift cannot change the
-          // canonical contract sent to this same task.
-          seo: design!.seoPlan,
-          routes: rawRecord.routes,
+          seo: design!.designSpec.seoPlan,
+          routes: contentResult.pageContent.routes,
         });
       } catch {
         return scheduleRepair({
@@ -1453,20 +1811,33 @@ export function createManusSiteOpsProviderHandler(
           snapshot: { ...context.snapshot, documents },
           brief,
           visual,
+          designSpec: design!.designSpec,
           generatedContent,
           assetDecisions,
           brandAsset,
           mode: "preview",
         });
-      } catch {
-        return scheduleRepair({
-          db,
-          operation,
-          build: context.build,
-          taskId,
-          kind: "content",
-          design,
-        });
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "";
+        if (
+          /^(?:SITEOPS_GENERATED_|SITEOPS_CONTENT_|SITEOPS_SENSITIVE_OR_DEMO_TEXT_REJECTED|SITEOPS_QA_FAILED|SITEOPS_AXE_BLOCKING_VIOLATIONS)/u.test(
+            code,
+          )
+        ) {
+          return scheduleRepair({
+            db,
+            operation,
+            build: context.build,
+            taskId,
+            kind: "content",
+            design,
+          });
+        }
+        throw new SiteOpsManusFailure(
+          "SITEOPS_HOST_MATERIALIZATION_FAILED",
+          "受信 Astro 构建或 QA 运行环境未能安全完成本次任务。",
+          "attention_required",
+        );
       }
       const artifacts = await persistBuildArtifacts(db, operation, materialized, persist);
       return {
@@ -1478,6 +1849,13 @@ export function createManusSiteOpsProviderHandler(
         message: "原生 Astro 官网已完成构建和 QA，可以在私有预览中检查并批准。",
       };
     } catch (error) {
+      console.error("[siteops-manus] provider_failed", {
+        event: "siteops_manus_provider_failed",
+        operationId: operation.id,
+        projectId: operation.projectId,
+        kind: operation.kind,
+        error: runtimeErrorForLog(error),
+      });
       return resultFailure(error);
     }
   };

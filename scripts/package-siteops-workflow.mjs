@@ -18,9 +18,17 @@ const upstreamPath = path.join(
 );
 const runtimeRoot = path.join(
   sourceRoot,
-  "astro-company-site-workflow-v1.1.0",
+  "astro-company-site-workflow-v1.2.0",
 );
 const manifestPath = path.join(runtimeRoot, "MANIFEST.json");
+const materializerPath = path.join(
+  projectRoot,
+  "server/siteops/build-runtime.ts",
+);
+const starterContractPath = path.join(
+  runtimeRoot,
+  "assets/host-starter-contract.json",
+);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -89,16 +97,26 @@ export async function createSiteOpsRuntimeManifest() {
       sha256: sha256(bytes),
     });
   }
+  const [starterContract, materializer] = await Promise.all([
+    fs.readFile(starterContractPath),
+    fs.readFile(materializerPath),
+  ]);
   return {
     schema: "frontmind-runtime-workflow-manifest/v1",
     name: "frontmind-astro-company-site-workflow",
-    version: "1.1.0",
+    version: "1.2.0",
     entrypoint: "SKILL.md",
     upstream: {
       version: "1.0.0",
       archiveSha256: SITEOPS_UPSTREAM_SHA256,
     },
     hashScope: "all regular files except MANIFEST.json",
+    host: {
+      starterSha256: sha256(starterContract),
+      componentLibraryVersion: "1.0.0",
+      materializerVersion: "1.0.0",
+      materializerSha256: sha256(materializer),
+    },
     files: entries,
   };
 }

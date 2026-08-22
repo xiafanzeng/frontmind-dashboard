@@ -46,6 +46,18 @@ export function domainFinancialTerminalProjection(
   } as const;
 }
 
+export function siteOpsWorkerMayClaimStatus(status: string) {
+  return status === "queued" || status === "running";
+}
+
+export function unexpectedSiteOpsProviderFailure(): SiteOpsProviderResult {
+  return failureResult(
+    "attention_required",
+    "PROVIDER_ERROR",
+    "外部服务操作未能安全完成，请根据错误码和任务编号联系处理。",
+  );
+}
+
 async function claimOne(db: any): Promise<Claimed | null> {
   return db.transaction(async (tx: any) => {
     const now = new Date();
@@ -68,7 +80,9 @@ async function claimOne(db: any): Promise<Claimed | null> {
       .limit(1)
       .for("update", { skipLocked: true });
     const operation = rows[0];
-    if (!operation) return null;
+    if (!operation || !siteOpsWorkerMayClaimStatus(operation.status)) {
+      return null;
+    }
     const leaseOwner = randomUUID();
     await tx
       .update(siteOperations)
@@ -120,11 +134,13 @@ async function invokeProvider(operation: Claimed) {
         "外部操作超时，结果未知；系统只会查询对账，不会盲目重发。",
       );
     }
-    return failureResult(
-      "attention_required",
-      "PROVIDER_ERROR",
-      error instanceof Error ? error.message.slice(0, 2_000) : "外部操作失败",
-    );
+    console.error("[SiteOpsWorker] provider_failed", {
+      operationId: operation.id,
+      projectId: operation.projectId,
+      provider: operation.provider,
+      error: runtimeErrorForLog(error),
+    });
+    return unexpectedSiteOpsProviderFailure();
   } finally {
     clearTimeout(timeout);
   }

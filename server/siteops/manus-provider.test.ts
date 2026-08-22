@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import JSZip from "jszip";
+import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
+import {
+  canonicalJson,
+  createVisualEvidenceV1,
+} from "../../shared/siteops-workflow";
 
 import {
   briefWithoutBrandAssets,
@@ -9,6 +15,7 @@ import {
   loadVerifiedSiteOpsSocialWorkflowPackage,
   loadVerifiedSiteOpsWorkflowPackage,
   safePublicDocuments,
+  visualPreviewAttachment,
 } from "./manus-provider";
 
 const operation = {
@@ -140,7 +147,7 @@ describe("Manus SiteOps provider boundary", () => {
     ]);
   });
 
-  it("packages the hash-verified FrontMind 1.1 workflow with SKILL and runtime contract", async () => {
+  it("packages the hash-verified FrontMind 1.2 workflow with SKILL and runtime contract", async () => {
     const bytes = await loadVerifiedSiteOpsWorkflowPackage();
     const zip = await JSZip.loadAsync(bytes, { checkCRC32: true });
 
@@ -165,12 +172,283 @@ describe("Manus SiteOps provider boundary", () => {
     expect(xhs.file("runtime-contract.json")).not.toBeNull();
     expect(readiness).toMatchObject({
       ready: true,
-      website: { version: "1.1.0" },
+      website: { version: "1.2.0" },
       workflows: [
         { channel: "wechat", version: "1.0.0" },
         { channel: "xiaohongshu", version: "1.0.0" },
       ],
     });
+  });
+
+  it("attaches the frozen same-origin visual bytes to the first Manus task", async () => {
+    const bytes = Buffer.from("normalized-png-preview", "utf8");
+    const attachment = await visualPreviewAttachment(
+      {
+        row: {
+          mimeType: "image/png",
+          contentSha256: createHash("sha256").update(bytes).digest("hex"),
+        },
+        stored: {
+          sizeBytes: bytes.length,
+          createReadStream: () => Readable.from([bytes]),
+        },
+      } as never,
+      "selected-visual.png",
+    );
+
+    expect(attachment).toEqual({
+      filename: "selected-visual.png",
+      mime_type: "image/png",
+      file_data: `data:image/png;base64,${bytes.toString("base64")}`,
+    });
+  });
+
+  it("creates one task with workflow and visual, then sends phase two to that same task", async () => {
+    const preview = Buffer.from("frozen-preview", "utf8");
+    const previewHash = createHash("sha256").update(preview).digest("hex");
+    const visualEvidence = createVisualEvidenceV1({
+      evidenceKind: "catalog_metadata_preview_v1",
+      providerItemKey: "n:143",
+      metadataSha256: "c".repeat(64),
+      providerResponseSha256: "d".repeat(64),
+      previewSha256: previewHash,
+      taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+    });
+    const evidenceHash = visualEvidence.evidenceSha256;
+    const designToken = `siteops-design:${operation.id}`;
+    const designResult = {
+      operationToken: designToken,
+      designSpec: {
+        schemaVersion: 1,
+        layoutArchetype: "asymmetric",
+        heroVariant: "split_media",
+        density: "balanced",
+        surfaceStyle: "bordered",
+        typeScale: "display",
+        imageTreatment: "contained",
+        motionLevel: "subtle",
+        colorRoles: {
+          backgroundPaletteIndex: 2,
+          textPaletteIndex: 0,
+          accentPaletteIndex: 1,
+        },
+        routeCompositions: [
+          {
+            routeId: "home",
+            slots: [{ slotId: "proof", variant: "proof" }],
+          },
+        ],
+        seoPlan: {
+          siteTitle: "星河智造",
+          description: "经过知识来源核验的企业官网。",
+          organizationType: "Organization",
+        },
+      },
+    };
+    const context = {
+      build: {
+        id: operation.buildId,
+        projectId: operation.projectId,
+        userId: operation.userId,
+        knowledgeSnapshotId: "50000000-0000-4000-8000-000000000005",
+        knowledgeArchiveHash: "a".repeat(64),
+        brief: {
+          companyName: "星河智造",
+          primaryLanguage: "zh-CN",
+          contacts: [],
+          offerings: ["设备服务"],
+          audience: ["制造企业"],
+          conversionGoal: "联系咨询",
+          routes: [
+            {
+              id: "home",
+              slug: "/",
+              title: "首页",
+              sourceDocumentIds: ["overview"],
+            },
+          ],
+          verifiedFacts: [
+            {
+              statement: "提供设备服务",
+              sourceDocumentIds: ["overview"],
+            },
+          ],
+          publicAssetIds: [],
+          unknowns: [],
+        },
+        selectionHash: "b".repeat(64),
+        repairAttempts: 0,
+        upstreamManusTaskId: null,
+      },
+      project: { id: operation.projectId },
+      snapshot: {
+        id: "50000000-0000-4000-8000-000000000005",
+        archiveHash: "a".repeat(64),
+        totalBytes: 1,
+        sourceBuildId: null,
+        sourceBuildRevision: null,
+        assets: [],
+        documents: [
+          {
+            id: "overview",
+            path: "overview.md",
+            title: "企业简介",
+            content: "星河智造提供设备服务。",
+            kind: "leaf",
+            evidenceStatus: "verified_first_party",
+            customerVisible: true,
+          },
+        ],
+      },
+      sample: {
+        id: "60000000-0000-4000-8000-000000000006",
+        batchId: "70000000-0000-4000-8000-000000000007",
+        previewLocalAssetId: "80000000-0000-4000-8000-000000000008",
+        sourceMetadata: {
+          providerItemKey: "n:143",
+          visualEvidence,
+          taxonomy: {
+            role: "foundation",
+            palette: ["#10212B", "#EF6C45", "#F5F2EA"],
+            typography: [],
+            layout: [],
+            motion: [],
+            accessibility: ["reduced-motion"],
+          },
+          score: 90,
+          rationale: "视觉证据完整",
+        },
+      },
+      batch: {
+        selectionBundleLocalAssetId:
+          "90000000-0000-4000-8000-000000000009",
+        selectionBundleHash: "",
+      },
+    };
+    const selectionBundle = {
+      queryHash: "f".repeat(64),
+      searchTarget: 18,
+      detailTarget: 12,
+      displayTarget: 9,
+      candidates: [
+        {
+          id: context.sample.id,
+          label: "B",
+          providerItemKey: "n:143",
+          visualEvidence,
+          previewLocalAssetId: context.sample.previewLocalAssetId,
+          previewSha256: previewHash,
+          taxonomy: context.sample.sourceMetadata.taxonomy,
+          score: 90,
+          rationale: "视觉证据完整",
+        },
+      ],
+      selectedCandidateId: null,
+      delegated: false,
+      degradedReasons: [],
+    };
+    const selectionBytes = Buffer.from(canonicalJson(selectionBundle), "utf8");
+    context.batch.selectionBundleHash = createHash("sha256")
+      .update(selectionBytes)
+      .digest("hex");
+    const query: any = {};
+    query.from = () => query;
+    query.innerJoin = () => query;
+    query.where = () => query;
+    query.limit = async () => [context];
+    const db = {
+      select: () => query,
+      update: () => ({
+        set: () => ({ where: async () => undefined }),
+      }),
+    };
+    const createTask = vi.fn(async () => ({ taskId: "manus-task-1" }));
+    const sendMessage = vi.fn(async () => undefined);
+    const client = {
+      createTask,
+      sendMessage,
+      findCreatedTask: vi.fn(),
+      taskDetail: vi.fn(async () => ({ status: "running" })),
+      listAllMessages: vi.fn(async () => [
+        {
+          id: "design-result",
+          type: "structured_output_result",
+          timestamp: 1,
+          structured_output_result: { success: true, value: designResult },
+        },
+      ]),
+    };
+    const readArtifact = vi.fn(async (input: { localAssetId: string }) => {
+      const isSelection =
+        input.localAssetId === context.batch.selectionBundleLocalAssetId;
+      const bytes = isSelection ? selectionBytes : preview;
+      return {
+        row: {
+          mimeType: isSelection ? "application/json" : "image/png",
+          contentSha256: createHash("sha256").update(bytes).digest("hex"),
+        },
+        stored: {
+          sizeBytes: bytes.length,
+          createReadStream: () => Readable.from([bytes]),
+        },
+      };
+    });
+    const handler = createManusSiteOpsProviderHandler({
+      getDb: async () => db as never,
+      getCredential: async () => ({
+        id: operation.input.manusCredentialId,
+        version: operation.input.manusCredentialVersion,
+        apiKey: "secret-key",
+      }) as never,
+      createClient: () => client as never,
+      readSnapshotArchive: async () => Buffer.from("x"),
+      readArtifact: readArtifact as never,
+    });
+
+    const created = await handler({
+      operation: operation as never,
+      signal: new AbortController().signal,
+    });
+    expect(created).toMatchObject({
+      status: "pending",
+      providerTaskId: "manus-task-1",
+      result: { stage: "design_pending", taskId: "manus-task-1" },
+    });
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(createTask.mock.calls[0]![0].attachments).toHaveLength(2);
+    expect(createTask.mock.calls[0]![0].attachments[1]).toMatchObject({
+      filename: "selected-visual.png",
+      mime_type: "image/png",
+    });
+
+    const designed = await handler({
+      operation: {
+        ...operation,
+        providerTaskId: "manus-task-1",
+        result: created.result,
+      } as never,
+      signal: new AbortController().signal,
+    });
+    expect(designed).toMatchObject({
+      status: "pending",
+      result: { stage: "content_send_ready", taskId: "manus-task-1" },
+    });
+
+    const continued = await handler({
+      operation: {
+        ...operation,
+        providerTaskId: "manus-task-1",
+        result: designed.result,
+      } as never,
+      signal: new AbortController().signal,
+    });
+    expect(continued).toMatchObject({
+      status: "pending",
+      result: { stage: "content_pending", taskId: "manus-task-1" },
+    });
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]![0].taskId).toBe("manus-task-1");
   });
 
   it("uses the immutable credential id and version frozen in the operation", async () => {

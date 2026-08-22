@@ -64,6 +64,54 @@
   color: #475569;
 }
 
+.siteops-header-controls {
+  display: grid;
+  max-width: min(320px, 45vw);
+  justify-items: end;
+  gap: 6px;
+}
+
+.siteops-header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.siteops-reset-button:not(:disabled) {
+  color: #b45309;
+}
+
+.siteops-reset-disabled-reason {
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.siteops-reset-description {
+  display: grid;
+  gap: 8px;
+}
+
+.siteops-reset-description p,
+.siteops-reset-description ul,
+.siteops-reset-error {
+  margin: 0;
+}
+
+.siteops-reset-description ul {
+  display: grid;
+  gap: 4px;
+  padding-left: 20px;
+}
+
+.siteops-reset-error {
+  border-radius: 10px;
+  background: #fef2f2;
+  padding: 10px 12px;
+  color: #991b1b;
+  font-size: 13px;
+}
+
 .siteops-panel-state {
   min-height: 150px;
   grid-auto-flow: column;
@@ -561,6 +609,17 @@
   margin: 5px 0 0;
   white-space: pre-wrap;
   line-height: 1.65;
+}
+
+.siteops-message .siteops-operation-reference {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: #64748b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 
 .siteops-visual-board {

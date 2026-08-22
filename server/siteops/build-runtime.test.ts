@@ -98,8 +98,10 @@ function buildInput(
     visual: {
       queryHash: H("queries"),
       selectedCandidateId: "candidate-B",
-      promptSha256: H("ephemeral-prompt"),
+      providerItemKey: "n:143",
+      visualEvidenceSha256: H("visual-evidence"),
       previewSha256: H("same-origin-preview"),
+      supportEvidenceSha256s: [],
       taxonomy: {
         role: "foundation",
         palette: ["#10212B", "#EF6C45", "#F5F2EA", "#DDE7E8"],
@@ -107,6 +109,40 @@ function buildInput(
         layout: ["asymmetric grid"],
         motion: ["reduced motion"],
         accessibility: ["high contrast"],
+      },
+    },
+    designSpec: {
+      schemaVersion: 1,
+      layoutArchetype: "asymmetric",
+      heroVariant: "split_media",
+      density: "balanced",
+      surfaceStyle: "bordered",
+      typeScale: "display",
+      imageTreatment: "contained",
+      motionLevel: "subtle",
+      colorRoles: {
+        backgroundPaletteIndex: 2,
+        textPaletteIndex: 0,
+        accentPaletteIndex: 1,
+      },
+      routeCompositions: [
+        {
+          routeId: "home",
+          slots: [
+            { slotId: "service-proof", variant: "proof" },
+            { slotId: "audience", variant: "split" },
+          ],
+        },
+        {
+          routeId: "services",
+          slots: [{ slotId: "service-list", variant: "cards" }],
+        },
+      ],
+      seoPlan: {
+        siteTitle: "星河智造",
+        description:
+          "面向制造企业的设备运维与状态分析服务。\u2028</script><img onerror=alert(1)>",
+        organizationType: "ProfessionalService",
       },
     },
     generatedContent: {
@@ -124,11 +160,13 @@ function buildInput(
           summary: "基于确认的企业资料，展示设备运维与状态分析能力。",
           sections: [
             {
+              slotId: "service-proof",
               heading: "设备运维",
               paragraphs: ["服务覆盖设备巡检、状态分析和维护建议。"],
               sourceDocumentIds: ["service"],
             },
             {
+              slotId: "audience",
               heading: "面向制造企业",
               paragraphs: ["团队为制造企业提供经过确认的设备数据服务。"],
               sourceDocumentIds: ["overview"],
@@ -141,6 +179,7 @@ function buildInput(
           summary: "查看设备巡检、状态分析和维护建议。",
           sections: [
             {
+              slotId: "service-list",
               heading: "服务范围",
               paragraphs: ["服务覆盖设备巡检、状态分析和维护建议。"],
               sourceDocumentIds: ["service"],
@@ -223,6 +262,7 @@ describe("SiteOps controlled Astro runtime", () => {
     expect(sourceNames).toContain("frontmind-runtime-lock.json");
     expect(sourceNames).toContain("frontmind-runtime-input.json");
     expect(sourceNames).toContain("build-contract.json");
+    expect(sourceNames).toContain("frontmind-component-manifest.json");
     expect(sourceNames).toContain("public/brand-logo.png");
     expect(sourceNames).not.toContain("node_modules/");
     expect(
@@ -233,6 +273,12 @@ describe("SiteOps controlled Astro runtime", () => {
     expect(
       JSON.parse(await source.file("build-contract.json")!.async("string")),
     ).toMatchObject({
+      schemaVersion: 2,
+      visual: {
+        providerItemKey: "n:143",
+        visualEvidenceSha256: H("visual-evidence"),
+        componentLibraryVersion: "1.0.0",
+      },
       assets: [
         {
           id: "official-logo",
@@ -249,6 +295,18 @@ describe("SiteOps controlled Astro runtime", () => {
     const dist = await JSZip.loadAsync(built.distZip, { checkCRC32: true });
     const home = await dist.file("index.html")!.async("string");
     expect(home).toContain("让设备状态更清晰");
+    expect(home).toContain(
+      'class="hero hero--split_media"',
+    );
+    expect(home).toContain(
+      'class="section section--proof" data-slot="service-proof"',
+    );
+    expect(home).toContain(
+      'class="section section--split" data-slot="audience"',
+    );
+    expect(home).toContain(
+      'class="layout--asymmetric surface--bordered type--display image--contained motion--subtle"',
+    );
     expect(home).toContain('class="brand-logo"');
     expect(home).toContain('src="/brand-logo.png"');
     expect(

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 
 import type {
   KnowledgeBaseSnapshot,
@@ -7,7 +8,10 @@ import type {
   SiteProject,
 } from "../../drizzle/schema";
 import type { SiteBrief } from "../../shared/siteops";
-import type { TwentyFirstReadOnlySession } from "../twenty-first-service";
+import {
+  TwentyFirstToolContractError,
+  type TwentyFirstReadOnlySession,
+} from "../twenty-first-service";
 import {
   createTwentyFirstSiteOpsProviderHandler,
   type TwentyFirstBoardPersistenceInput,
@@ -166,29 +170,26 @@ describe("21st SiteOps provider", () => {
     expect(persistBoard).not.toHaveBeenCalled();
   });
 
-  it("runs the real 10/6/2 catalog funnel and persists only the prompt-free safe projection", async () => {
+  it("runs the real numeric-ID 10/6/2 funnel without requiring Prompt", async () => {
     const secret = "21st_sk_never-persist-this-secret";
-    const rawPrompt =
-      "RAW_PROVIDER_PROMPT responsive modular hero neutral sans light canvas short transition";
     const rawCode = "RAW_PROVIDER_CODE export default function Secret() {}";
     const searchCalls: Array<{ query: string; limit: number }> = [];
-    const detailCalls: string[] = [];
+    const detailCalls: Array<string | number> = [];
     let searchIndex = 0;
-    const rolePrefixes = ["foundation", "section", "motion"];
     const counts = [10, 6, 2];
+    let nextId = 1;
     const session: TwentyFirstReadOnlySession = {
       search: vi.fn(async (query, limit) => {
-        const role = rolePrefixes[searchIndex]!;
         const count = counts[searchIndex]!;
         searchIndex += 1;
         searchCalls.push({ query, limit });
         return {
           results: Array.from({ length: count }, (_, index) => {
-            const id = `${role}-${index + 1}`;
+            const id = nextId++;
             return {
               id,
-              name: `${role} candidate ${index + 1}`,
-              sourceUrl: `https://21st.dev/community/components/${id}`,
+              name: `Responsive modular hero ${id}`,
+              description: "Light canvas, neutral sans, short transition",
               previewUrl: `https://cdn.example.test/${id}.png`,
             };
           }),
@@ -199,8 +200,13 @@ describe("21st SiteOps provider", () => {
         return {
           data: {
             id: providerItemId,
-            prompt: rawPrompt,
-            code: rawCode,
+            componentId: providerItemId,
+            name: `Responsive modular hero ${providerItemId}`,
+            description: "Light canvas, neutral sans, short transition",
+            previewUrl: `https://cdn.example.test/${providerItemId}.png`,
+            componentCode: rawCode,
+            demoCode: "RAW_DEMO_CODE",
+            installCommand: "npx 21st add forbidden",
           },
         };
       }),
@@ -282,25 +288,33 @@ describe("21st SiteOps provider", () => {
       projectStatus: "awaiting_visual_selection",
       result: {
         candidateCount: 9,
-        actual: { searched: 18, promptRetrieved: 12, presented: 9 },
+        actual: { searched: 18, detailRetrieved: 12, presented: 9 },
       },
     });
     expect(searchCalls.map((call) => call.limit)).toEqual([10, 6, 2]);
     expect(searchCalls).toHaveLength(3);
     expect(detailCalls).toHaveLength(12);
     expect(detailCalls.slice(0, 10)).toEqual(
-      Array.from({ length: 10 }, (_, index) => `foundation-${index + 1}`),
+      Array.from({ length: 10 }, (_, index) => index + 1),
     );
     expect(persisted).not.toBeNull();
     expect(persisted!.mirroredCandidates).toHaveLength(9);
     expect(persisted!.selectionBundle.candidates.map((item) => item.label)).toEqual(
       ["A", "B", "C", "D", "E", "F", "G", "H", "I"],
     );
+    expect(persisted!.selectionBundle.candidates[0]).toMatchObject({
+      providerItemKey: "n:1",
+      visualEvidence: {
+        evidenceKind: "catalog_metadata_preview_v1",
+        providerItemKey: "n:1",
+        taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+      },
+    });
     const persistedText = JSON.stringify(persisted);
     const artifactText = Buffer.concat(
       artifacts.map((artifact) => artifact.buffer),
     ).toString("utf8");
-    for (const sensitive of [secret, rawPrompt, rawCode]) {
+    for (const sensitive of [secret, rawCode, "RAW_DEMO_CODE", "npx 21st"]) {
       expect(persistedText).not.toContain(sensitive);
       expect(artifactText).not.toContain(sensitive);
     }
@@ -308,6 +322,77 @@ describe("21st SiteOps provider", () => {
       .toHaveLength(9);
     expect(artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"))
       .toHaveLength(1);
+  });
+
+  it("rejects producer drift before database or provider access", async () => {
+    const getDb = vi.fn();
+    const client = { withReadOnlySession: vi.fn() };
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const handler = createTwentyFirstSiteOpsProviderHandler({ getDb, client });
+    const drifted = operation();
+    drifted.input = {
+      ...drifted.input,
+      manusCredentialId: "55555555-5555-4555-8555-555555555555",
+    };
+
+    await expect(
+      handler({
+        operation: drifted,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "VISUAL_OPERATION_CONTRACT_MISMATCH",
+    });
+    expect(getDb).not.toHaveBeenCalled();
+    expect(client.withReadOnlySession).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "[SiteOps21st] visual_search_failed",
+      expect.objectContaining({
+        operationId,
+        projectId,
+        stage: "validate_operation",
+      }),
+    );
+    log.mockRestore();
+  });
+
+  it("classifies MCP schema drift and redacts the active credential in logs", async () => {
+    const secret = "21st_sk_log-redaction-sentinel";
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: secret,
+      }),
+      client: {
+        withReadOnlySession: async () => {
+          const error = new TwentyFirstToolContractError();
+          error.message = `${error.message}: ${secret}`;
+          throw error;
+        },
+      },
+    });
+
+    await expect(
+      handler({
+        operation: operation(),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "MCP_CONTRACT_INCOMPATIBLE",
+    });
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    expect(log).toHaveBeenCalledWith(
+      "[SiteOps21st] visual_search_failed",
+      expect.objectContaining({ stage: "mcp_retrieval" }),
+    );
+    log.mockRestore();
   });
 
   it("fails honestly when the real catalog yields no candidate", async () => {
@@ -357,6 +442,41 @@ describe("21st SiteOps provider", () => {
       }),
     ).rejects.toThrow("PREVIEW_URL_PRIVATE_ADDRESS");
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("normalizes provider images to metadata-free PNG before hashing", async () => {
+    const upstream = await sharp({
+      create: {
+        width: 120,
+        height: 60,
+        channels: 3,
+        background: { r: 24, g: 48, b: 96 },
+      },
+    })
+      .withMetadata({ comment: "provider-private-metadata" })
+      .png()
+      .toBuffer();
+    const result = await fetchSafeVisualPreview({
+      url: "https://preview.example.com/example.png",
+      resolveImpl: vi.fn().mockResolvedValue([
+        { address: "93.184.216.34", family: 4 },
+      ]) as never,
+      fetchImpl: vi.fn().mockResolvedValue(
+        new Response(upstream, {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        }),
+      ) as unknown as typeof fetch,
+    });
+
+    expect(result.mimeType).toBe("image/png");
+    expect((await sharp(result.buffer).metadata()).format).toBe("png");
+    expect(result.buffer.toString("utf8")).not.toContain(
+      "provider-private-metadata",
+    );
+    expect(result.sha256).toBe(sha256(result.buffer));
+    expect(result.visualSignals.dominantHex).toMatch(/^#[a-f0-9]{6}$/u);
+    expect(result.visualSignals.brightness).toBeLessThan(96);
   });
 
   it("rejects embedded private IPv4 across IPv6 transition formats", () => {

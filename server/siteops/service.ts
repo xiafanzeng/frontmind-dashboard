@@ -1,7 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { domainToASCII, domainToUnicode } from "node:url";
-import { and, asc, desc, eq, gt, inArray, isNotNull, max } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNotNull,
+  isNull,
+  max,
+  ne,
+  or,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
   conversations,
@@ -30,10 +42,16 @@ import {
   siteOpsAliyunConnectionSetupInputSchema,
   siteOpsObserveInputSchema,
   siteOpsSendMessageInputSchema,
+  visualEvidenceV1Schema,
   type SiteOpsActInput,
   type SiteBrief,
 } from "../../shared/siteops";
+import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { siteOpsObservationV1Schema } from "../../shared/siteops-contract";
+import {
+  visualSearchOperationInputV1Schema,
+  type VisualSearchOperationInputV1,
+} from "../../shared/siteops-workflow";
 import type { AuthenticatedUser } from "../auth-service";
 import { getDb } from "../db";
 import { getServicePortal } from "../service-entitlement";
@@ -92,13 +110,6 @@ export function isSiteOpsOperationReplay(
 
 const uuidSchema = z.string().uuid();
 const optionalUuidSchema = uuidSchema.optional();
-const visualSearchCredentialInputSchema = z
-  .object({
-    knowledgeSnapshotId: uuidSchema,
-    credentialId: uuidSchema,
-    credentialVersion: z.number().int().positive(),
-  })
-  .passthrough();
 const TWENTY_FIRST_OPERATION_MARKER_PREFIX = "siteops-21st-operation:";
 const domainSchema = z
   .string()
@@ -497,6 +508,70 @@ export function hashSiteOpsRequest(value: unknown) {
     .digest("hex");
 }
 
+const RESETTABLE_PRE_BUILD_STATUSES = new Set([
+  "draft",
+  "collecting_brief",
+  "visual_searching",
+  "awaiting_visual_selection",
+  "failed",
+  "attention_required",
+]);
+
+export function siteOpsResetCapability(input: {
+  projectStatus: string;
+  currentBuild: boolean;
+  liveHead: boolean;
+  hasBuild: boolean;
+  hasDeployment: boolean;
+  hasBlockingOperation: boolean;
+  hasActiveDns: boolean;
+  hasUnresolvedFinancialIntent: boolean;
+}) {
+  if (input.currentBuild || input.hasBuild) {
+    return {
+      allowed: false as const,
+      reason: "已有官网版本，不能重置为全新首轮任务。请使用版本修改或回滚。",
+    };
+  }
+  if (input.liveHead) {
+    return {
+      allowed: false as const,
+      reason: "已有线上官网，不能通过首轮重置清空当前项目。",
+    };
+  }
+  if (input.hasDeployment) {
+    return {
+      allowed: false as const,
+      reason: "已有发布记录，不能通过首轮重置清空当前项目。",
+    };
+  }
+  if (input.hasBlockingOperation) {
+    return {
+      allowed: false as const,
+      reason: "当前仍有任务正在执行或结果待确认，完成后才能重置。",
+    };
+  }
+  if (input.hasActiveDns) {
+    return {
+      allowed: false as const,
+      reason: "当前仍有 DNS 变更待完成或对账，完成后才能重置。",
+    };
+  }
+  if (input.hasUnresolvedFinancialIntent) {
+    return {
+      allowed: false as const,
+      reason: "当前仍有域名付费操作待确认，完成对账后才能重置。",
+    };
+  }
+  if (!RESETTABLE_PRE_BUILD_STATUSES.has(input.projectStatus)) {
+    return {
+      allowed: false as const,
+      reason: "当前阶段不能使用首轮重置，请使用对应的版本管理操作。",
+    };
+  }
+  return { allowed: true as const };
+}
+
 async function appendMessage(
   tx: any,
   input: {
@@ -651,9 +726,13 @@ async function projectObservation(
 ) {
   const messagePredicate =
     input.afterSequence === undefined
-      ? eq(messages.conversationId, input.project.conversationId)
+      ? and(
+          eq(messages.conversationId, input.project.conversationId),
+          isNull(messages.deletedAt),
+        )
       : and(
           eq(messages.conversationId, input.project.conversationId),
+          isNull(messages.deletedAt),
           gt(messages.sequence, input.afterSequence),
         );
   const [
@@ -670,6 +749,8 @@ async function projectObservation(
     dnsOperationRows,
     activeAliyunOperationRows,
     unresolvedFinancialRows,
+    resetOperationRows,
+    activeDnsRecordRows,
   ] = await Promise.all([
     executor
       .select()
@@ -803,6 +884,41 @@ async function projectObservation(
         ),
       )
       .limit(1),
+    executor
+      .select({
+        kind: siteOperations.kind,
+        status: siteOperations.status,
+      })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.project.id),
+          eq(siteOperations.userId, input.userId),
+          or(
+            inArray(siteOperations.status, ["running", "outcome_unknown"]),
+            and(
+              eq(siteOperations.status, "queued"),
+              ne(siteOperations.kind, "visual_search"),
+            ),
+          ),
+        ),
+      )
+      .limit(1),
+    executor
+      .select({ id: siteDnsRecords.id })
+      .from(siteDnsRecords)
+      .where(
+        and(
+          eq(siteDnsRecords.projectId, input.project.id),
+          eq(siteDnsRecords.userId, input.userId),
+          inArray(siteDnsRecords.status, [
+            "applying",
+            "propagating",
+            "outcome_unknown",
+          ]),
+        ),
+      )
+      .limit(1),
   ]);
 
   const candidateRows = batchRows[0]
@@ -843,6 +959,19 @@ async function projectObservation(
   const dnsPlanItems = Array.isArray(latestDnsPlanResult?.plan)
     ? latestDnsPlanResult.plan
     : [];
+  const resetCapability = siteOpsResetCapability({
+    projectStatus: input.project.status,
+    currentBuild: Boolean(input.project.currentBuildId),
+    liveHead: Boolean(
+      input.project.globalLiveDeploymentId ||
+        input.project.mainlandLiveDeploymentId,
+    ),
+    hasBuild: buildRows.length > 0,
+    hasDeployment: deploymentRows.length > 0,
+    hasBlockingOperation: resetOperationRows.length > 0,
+    hasActiveDns: activeDnsRecordRows.length > 0,
+    hasUnresolvedFinancialIntent: unresolvedFinancialRows.length > 0,
+  });
   const observation = {
     schemaVersion: 1 as const,
     executionKind: "site_ops" as const,
@@ -1071,6 +1200,7 @@ async function projectObservation(
         createdAt: row.createdAt.toISOString(),
       }),
     ),
+    resetCapability,
     interactionState:
       input.project.status === "draft"
         ? ("select_snapshot" as const)
@@ -1448,6 +1578,11 @@ export function parseSiteOpsActionPayload(
   raw: unknown,
 ) {
   switch (action) {
+    case "reset_workflow":
+      return z
+        .object({ confirmed: z.literal(true) })
+        .strict()
+        .parse(raw);
     case "select_snapshot":
     case "change_snapshot":
       return z.object({ knowledgeSnapshotId: uuidSchema }).strict().parse(raw);
@@ -1672,7 +1807,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
       ),
     )
     .limit(1);
-  const frozen = visualSearchCredentialInputSchema.safeParse(
+  const frozen = visualSearchOperationInputV1Schema.safeParse(
     operationRows[0]?.input,
   );
   if (
@@ -1685,6 +1820,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
       409,
     );
   }
+  assertCurrentVisualWorkflowVersion(frozen.data.workflowVersion);
   const credentialRows = await tx
     .select({
       id: presalesApiCredentials.id,
@@ -1707,6 +1843,22 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
     );
   }
   return credential;
+}
+
+export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
+  if (workflowVersion !== SITEOPS_WORKFLOW.frontMindVersion) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "视觉检索使用的建站合同已升级，请重新检索视觉方向后再继续。",
+      409,
+    );
+  }
+}
+
+export function createVisualSearchOperationInput(
+  input: VisualSearchOperationInputV1,
+) {
+  return visualSearchOperationInputV1Schema.parse(input);
 }
 
 async function createActionTurn(
@@ -1770,6 +1922,194 @@ async function reserveOperation(
     completedAt: input.status === "succeeded" ? new Date() : undefined,
   });
   return id;
+}
+
+async function handleResetWorkflow(
+  tx: any,
+  input: {
+    actor: AuthenticatedUser;
+    project: typeof siteProjects.$inferSelect;
+    turnId: string;
+    requestId: string;
+    requestHash: string;
+    payload: { confirmed: true };
+  },
+) {
+  const nonterminalOperationRows = await tx
+    .select({
+      id: siteOperations.id,
+      kind: siteOperations.kind,
+      status: siteOperations.status,
+    })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        inArray(siteOperations.status, [
+          "queued",
+          "running",
+          "outcome_unknown",
+        ]),
+      ),
+    )
+    .for("update");
+  const buildRows = await tx
+    .select({ id: siteBuilds.id })
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.projectId, input.project.id),
+        eq(siteBuilds.userId, input.actor.id),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const deploymentRows = await tx
+    .select({ id: siteDeployments.id })
+    .from(siteDeployments)
+    .where(
+      and(
+        eq(siteDeployments.projectId, input.project.id),
+        eq(siteDeployments.userId, input.actor.id),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const activeDnsRows = await tx
+    .select({ id: siteDnsRecords.id })
+    .from(siteDnsRecords)
+    .where(
+      and(
+        eq(siteDnsRecords.projectId, input.project.id),
+        eq(siteDnsRecords.userId, input.actor.id),
+        inArray(siteDnsRecords.status, [
+          "applying",
+          "propagating",
+          "outcome_unknown",
+        ]),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const unresolvedFinancialRows = await tx
+    .select({ id: siteDomainOperations.id })
+    .from(siteDomainOperations)
+    .where(
+      and(
+        eq(siteDomainOperations.projectId, input.project.id),
+        eq(siteDomainOperations.userId, input.actor.id),
+        isNotNull(siteDomainOperations.activeFinancialKey),
+      ),
+    )
+    .limit(1)
+    .for("update");
+
+  const resetCapability = siteOpsResetCapability({
+    projectStatus: input.project.status,
+    currentBuild: Boolean(input.project.currentBuildId),
+    liveHead: Boolean(
+      input.project.globalLiveDeploymentId ||
+        input.project.mainlandLiveDeploymentId,
+    ),
+    hasBuild: buildRows.length > 0,
+    hasDeployment: deploymentRows.length > 0,
+    hasBlockingOperation: nonterminalOperationRows.some(
+      (row: { kind: string; status: string }) =>
+        row.status !== "queued" || row.kind !== "visual_search",
+    ),
+    hasActiveDns: activeDnsRows.length > 0,
+    hasUnresolvedFinancialIntent: unresolvedFinancialRows.length > 0,
+  });
+  if (!resetCapability.allowed) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      resetCapability.reason,
+      409,
+    );
+  }
+
+  const now = new Date();
+  await tx
+    .update(siteOperations)
+    .set({
+      status: "cancelled",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      completedAt: now,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        eq(siteOperations.kind, "visual_search"),
+        eq(siteOperations.status, "queued"),
+      ),
+    );
+  await tx
+    .update(websiteStyleSampleBatches)
+    .set({ status: "superseded", updatedAt: now })
+    .where(
+      and(
+        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+        eq(websiteStyleSampleBatches.userId, input.actor.id),
+        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+        eq(websiteStyleSampleBatches.status, "published"),
+      ),
+    );
+  await tx
+    .update(messages)
+    .set({ deletedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(messages.conversationId, input.project.conversationId),
+        eq(messages.userId, input.actor.id),
+        isNull(messages.deletedAt),
+      ),
+    );
+  await reserveOperation(tx, {
+    actor: input.actor,
+    project: input.project,
+    turnId: input.turnId,
+    clientRequestId: input.requestId,
+    requestHash: input.requestHash,
+    payload: { action: "reset_workflow", confirmed: input.payload.confirmed },
+    kind: "brief_message",
+    status: "succeeded",
+  });
+  const nextRevision = input.project.revision + 1;
+  await tx
+    .update(siteProjects)
+    .set({
+      currentKnowledgeSnapshotId: null,
+      currentBuildId: null,
+      brief: null,
+      status: "draft",
+      revision: nextRevision,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(siteProjects.id, input.project.id),
+        eq(siteProjects.revision, input.project.revision),
+      ),
+    );
+  await appendMessage(tx, {
+    conversationId: input.project.conversationId,
+    userId: input.actor.id,
+    role: "assistant",
+    turnId: input.turnId,
+    content:
+      "已重置 AI 建站流程。请先全新上传知识库 ZIP，或选择一个已完成的知识库版本；旧任务不会恢复或续跑。",
+    siteOps: {
+      kind: "brief_question",
+      subjectId: input.project.id,
+      revision: nextRevision,
+      status: "active",
+      payload: { requested: "knowledge_snapshot", reset: true },
+    },
+  });
 }
 
 const IN_FLIGHT_DEPLOYMENT_STATUSES = [
@@ -2134,21 +2474,19 @@ async function handleVisualSearch(
     tx,
     "site_builder_21st",
   );
-  const manusCredential = await ensureActiveProviderCredential(tx, "website");
+  const operationPayload = createVisualSearchOperationInput({
+    knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+    credentialId: credential.id,
+    credentialVersion: credential.version,
+    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+  });
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
     project: input.project,
     turnId: input.turnId,
     clientRequestId: input.requestId,
     requestHash: input.requestHash,
-    payload: {
-      knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-      credentialId: credential.id,
-      credentialVersion: credential.version,
-      manusCredentialId: manusCredential.id,
-      manusCredentialVersion: manusCredential.version,
-      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-    },
+    payload: operationPayload,
     kind: "visual_search",
     provider: "21st",
   });
@@ -2287,6 +2625,30 @@ async function selectVisualSample(
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "所选视觉参考缺少受控预览或来源证明。",
+      409,
+    );
+  }
+  const selectedMetadata = selected.sample.sourceMetadata;
+  const selectedEvidence = visualEvidenceV1Schema.safeParse(
+    selectedMetadata.visualEvidence,
+  );
+  if (
+    !selectedEvidence.success ||
+    selectedMetadata.providerItemKey !==
+      selectedEvidence.data.providerItemKey ||
+    createVisualEvidenceV1({
+      evidenceKind: selectedEvidence.data.evidenceKind,
+      providerItemKey: selectedEvidence.data.providerItemKey,
+      metadataSha256: selectedEvidence.data.metadataSha256,
+      providerResponseSha256: selectedEvidence.data.providerResponseSha256,
+      previewSha256: selectedEvidence.data.previewSha256,
+      taxonomyDerivationVersion:
+        selectedEvidence.data.taxonomyDerivationVersion,
+    }).evidenceSha256 !== selectedEvidence.data.evidenceSha256
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "所选视觉参考的冻结证据无法通过校验，请重新检索后选择。",
       409,
     );
   }
@@ -3339,6 +3701,12 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
       requestHash,
     };
     switch (input.action) {
+      case "reset_workflow":
+        await handleResetWorkflow(tx, {
+          ...common,
+          payload: payload as { confirmed: true },
+        });
+        break;
       case "select_snapshot":
         await handleSelectSnapshot(tx, {
           ...common,

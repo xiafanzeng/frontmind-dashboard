@@ -7,7 +7,10 @@ import { AuthServiceError } from "./auth-service";
 import { encryptPresalesApiKey } from "./presales-service";
 import {
   TwentyFirstClient,
+  TwentyFirstToolContractError,
+  TWENTY_FIRST_ACTIVE_OPERATION_STATUSES,
   assertTwentyFirstJsonDepth,
+  buildTwentyFirstToolArguments,
   deleteTwentyFirstApiCredential,
   finalizePendingTwentyFirstCredentialRevocations,
   decryptTwentyFirstApiKey,
@@ -226,8 +229,8 @@ describe("TwentyFirstClient", () => {
               name: "get_component",
               inputSchema: {
                 type: "object",
-                properties: { componentId: { type: "string" } },
-                required: ["componentId"],
+                properties: { id: { type: "number" } },
+                required: ["id"],
               },
               annotations: { readOnlyHint: true },
             },
@@ -245,8 +248,14 @@ describe("TwentyFirstClient", () => {
         calls.push(body.params);
         const payload =
           body.params.name === "search"
-            ? { results: [{ id: "component-1" }] }
-            : { id: "component-1", prompt: "responsive editorial hero" };
+            ? { results: [{ id: 143 }] }
+            : {
+                id: 143,
+                name: "Responsive editorial hero",
+                description: "Light canvas and neutral sans",
+                previewUrl: "https://cdn.example.test/143.png",
+                componentCode: "RAW_PROVIDER_CODE",
+              };
         return jsonRpcResponse(body.id!, {
           content: [{ type: "text", text: JSON.stringify(payload) }],
           structuredContent: payload,
@@ -264,13 +273,19 @@ describe("TwentyFirstClient", () => {
       "21st_sk_test_secret",
       async (session) => ({
         search: await session.search("B2B analytics landing page", 10),
-        detail: await session.getComponent("component-1"),
+        detail: await session.getComponent(143),
       }),
     );
 
     expect(output).toEqual({
-      search: { results: [{ id: "component-1" }] },
-      detail: { id: "component-1", prompt: "responsive editorial hero" },
+      search: { results: [{ id: 143 }] },
+      detail: {
+        id: 143,
+        name: "Responsive editorial hero",
+        description: "Light canvas and neutral sans",
+        previewUrl: "https://cdn.example.test/143.png",
+        componentCode: "RAW_PROVIDER_CODE",
+      },
     });
     expect(calls).toEqual([
       {
@@ -283,7 +298,7 @@ describe("TwentyFirstClient", () => {
       },
       {
         name: "get_component",
-        arguments: { componentId: "component-1" },
+        arguments: { id: 143 },
       },
     ]);
     expect(calls.map((call) => call.name)).not.toContain("generate");
@@ -292,6 +307,31 @@ describe("TwentyFirstClient", () => {
         "21st_sk_test_secret",
       );
     }
+  });
+
+  it("preserves provider ID primitives required by the advertised schema", () => {
+    const numericTool = {
+      name: "get_component",
+      inputSchema: {
+        type: "object" as const,
+        properties: { id: { type: "number" } },
+        required: ["id"],
+      },
+    };
+    expect(
+      buildTwentyFirstToolArguments({
+        operation: "get_component",
+        tool: numericTool,
+        value: 143,
+      }),
+    ).toEqual({ id: 143 });
+    expect(() =>
+      buildTwentyFirstToolArguments({
+        operation: "get_component",
+        tool: numericTool,
+        value: "143",
+      }),
+    ).toThrow(TwentyFirstToolContractError);
   });
 
   it("honors Retry-After once with a bounded delay for a read-only request", async () => {
@@ -344,6 +384,12 @@ describe("TwentyFirstClient", () => {
 });
 
 describe("21st credential revocation guard", () => {
+  it("does not retain a key for a terminal attention-required search", () => {
+    expect(TWENTY_FIRST_ACTIVE_OPERATION_STATUSES).not.toContain(
+      "attention_required",
+    );
+  });
+
   function executorWithQueryResults(results: unknown[][]) {
     let cursor = 0;
     return {

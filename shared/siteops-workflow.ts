@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { z } from "zod";
 import type { BuildContractV1, SiteBrief } from "./siteops";
 import { buildContractV1Schema } from "./siteops";
 
@@ -20,22 +21,57 @@ export type TwentyFirstSearchEnvelope = {
   payload: unknown;
 };
 
+export const visualSearchOperationInputV1Schema = z
+  .object({
+    knowledgeSnapshotId: z.string().uuid(),
+    credentialId: z.string().uuid(),
+    credentialVersion: z.number().int().positive(),
+    workflowVersion: z.string().trim().min(1).max(32),
+  })
+  .strict();
+
+export type VisualSearchOperationInputV1 = z.infer<
+  typeof visualSearchOperationInputV1Schema
+>;
+
+export type TwentyFirstProviderItemId = string | number;
+
+export function providerItemKey(value: TwentyFirstProviderItemId) {
+  return typeof value === "number" ? `n:${value}` : `s:${value}`;
+}
+
 export type NormalizedTwentyFirstSearchItem = {
   candidateId: string;
-  providerItemId: string;
+  providerItemId: TwentyFirstProviderItemId;
+  providerItemKey: string;
   queryRole: TwentyFirstQueryRole;
   searchRank: number;
   title: string;
+  description: string | null;
   author: string | null;
-  sourceUrl: string;
+  sourceUrl: string | null;
   previewUrl: string | null;
-  dependencies: string[];
+  metadataSha256: string;
 };
 
 export type TwentyFirstDetailEnvelope = {
   operation: "get_component";
-  requestedProviderItemId: string;
+  requestedProviderItemId: TwentyFirstProviderItemId;
   payload: unknown;
+};
+
+export const VISUAL_EVIDENCE_KIND = "catalog_metadata_preview_v1" as const;
+export const VISUAL_TAXONOMY_DERIVATION_VERSION =
+  "catalog-metadata-preview-v1" as const;
+
+export type VisualEvidenceV1 = {
+  evidenceKind: typeof VISUAL_EVIDENCE_KIND;
+  providerItemKey: string;
+  metadataSha256: string;
+  providerResponseSha256: string;
+  previewSha256: string;
+  taxonomyDerivationVersion: typeof VISUAL_TAXONOMY_DERIVATION_VERSION;
+  evidenceSha256: string;
 };
 
 export type SafeVisualDirective =
@@ -86,8 +122,7 @@ export type TwentyFirstVisualScore = {
 
 export type NormalizedTwentyFirstCandidate =
   NormalizedTwentyFirstSearchItem & {
-    promptSha256: string;
-    responseSha256: string;
+    providerResponseSha256: string;
     normalizedDirectives: SafeVisualDirective[];
     score: number;
     scoreBreakdown: TwentyFirstVisualScore;
@@ -99,7 +134,7 @@ export type TwentyFirstFunnelResult = {
   targets: typeof SITEOPS_VISUAL_FUNNEL_TARGETS;
   actual: {
     searched: number;
-    promptRetrieved: number;
+    detailRetrieved: number;
     presented: number;
   };
   searchedCandidates: NormalizedTwentyFirstSearchItem[];
@@ -113,14 +148,7 @@ export type TwentyFirstFunnelResult = {
   providerCodeReuse: false;
 };
 
-const PROMPT_KEYS = new Set([
-  "prompt",
-  "copyprompt",
-  "designprompt",
-  "componentprompt",
-  "nativeprompt",
-]);
-const PROMPT_CONTAINERS = new Set([
+const RESULT_CONTAINERS = new Set([
   "data",
   "result",
   "component",
@@ -137,7 +165,7 @@ const SEARCH_ARRAY_KEYS = new Set([
 ]);
 const SENSITIVE_QUERY_KEY = /(?:api.?key|token|secret|credential|authorization|auth|signature|jwt)/iu;
 const SENSITIVE_TEXT = /(?:21st_sk_[A-Za-z0-9_-]{12,}|\bBearer\s+[A-Za-z0-9._~+/-]{12,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/iu;
-const PROMPT_INJECTION = /(?:ignore\s+(?:all\s+)?(?:previous|system|developer)|reveal\s+(?:the\s+)?(?:system|developer)\s+(?:prompt|message)|modify\s+(?:the\s+)?(?:host|agent|mcp)\s+(?:config|configuration)|exfiltrat(?:e|ion))/iu;
+const INSTRUCTIONAL_METADATA = /(?:ignore\s+(?:all\s+)?(?:previous|system|developer)|reveal\s+(?:the\s+)?(?:system|developer)\s+(?:prompt|message)|modify\s+(?:the\s+)?(?:host|agent|mcp)\s+(?:config|configuration)|exfiltrat(?:e|ion))/iu;
 const UNSAFE_METADATA = /(?:<\s*\/?\s*[A-Za-z][^>]*>|```|["']use client["']|\b(?:npm\s+(?:i|install)|npx\s+|pnpm\s+(?:add|install)|yarn\s+add|bun\s+add)\b|\bimport\s+.+\bfrom\b|\brequire\s*\(|\bfunction\s+[A-Za-z_$]|=>|\bclassName\s*=)/iu;
 
 const DIRECTIVE_TAXONOMY: ReadonlyArray<
@@ -201,7 +229,12 @@ function compact(value: unknown, maxLength = 2_000) {
 }
 
 function safeMetadata(value: string | null, fallback: string | null = null) {
-  if (!value || SENSITIVE_TEXT.test(value) || UNSAFE_METADATA.test(value)) {
+  if (
+    !value ||
+    SENSITIVE_TEXT.test(value) ||
+    INSTRUCTIONAL_METADATA.test(value) ||
+    UNSAFE_METADATA.test(value)
+  ) {
     return fallback;
   }
   return value.replace(/<[^>]*>/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 300) || fallback;
@@ -230,7 +263,7 @@ function firstString(
   }
   for (const [key, child] of Object.entries(value)) {
     if (
-      PROMPT_CONTAINERS.has(canonicalKey(key)) ||
+      RESULT_CONTAINERS.has(canonicalKey(key)) ||
       canonicalKey(key) === "metadata"
     ) {
       const found = firstString(child, keys, depth + 1);
@@ -240,18 +273,47 @@ function firstString(
   return null;
 }
 
-function firstStringList(value: unknown, keys: readonly string[]) {
-  if (!isRecord(value)) return [];
+function normalizeProviderItemIdValue(
+  value: unknown,
+): TwentyFirstProviderItemId | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (
+    !normalized ||
+    normalized.length > 512 ||
+    /[\u0000-\u001f\u007f]/u.test(normalized) ||
+    /^21st_sk_/iu.test(normalized)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+function firstProviderItemId(
+  value: unknown,
+  keys: readonly string[],
+  depth = 0,
+): TwentyFirstProviderItemId | null {
+  if (depth > 5 || !isRecord(value)) return null;
   const wanted = new Set(keys.map(canonicalKey));
   for (const [key, child] of Object.entries(value)) {
     if (!wanted.has(canonicalKey(key))) continue;
-    if (Array.isArray(child)) {
-      return Array.from(
-        new Set(child.map((item) => compact(item, 128)).filter(Boolean)),
-      ).slice(0, 32);
+    const found = normalizeProviderItemIdValue(child);
+    if (found !== null) return found;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      RESULT_CONTAINERS.has(canonicalKey(key)) ||
+      canonicalKey(key) === "metadata"
+    ) {
+      const found = firstProviderItemId(child, keys, depth + 1);
+      if (found !== null) return found;
     }
   }
-  return [];
+  return null;
 }
 
 function collectSearchRecords(value: unknown, depth = 0): Record<string, unknown>[] {
@@ -268,7 +330,7 @@ function collectSearchRecords(value: unknown, depth = 0): Record<string, unknown
     }
   }
   for (const [key, child] of Object.entries(value)) {
-    if (PROMPT_CONTAINERS.has(canonicalKey(key))) {
+    if (RESULT_CONTAINERS.has(canonicalKey(key))) {
       const records = collectSearchRecords(child, depth + 1);
       if (records.length > 0) return records;
     }
@@ -301,8 +363,10 @@ function sanitizeHttpsUrl(
   }
 }
 
-function normalizeProviderItemId(value: string) {
-  return value.replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 190);
+function candidateIdForProviderItem(value: TwentyFirstProviderItemId) {
+  const key = providerItemKey(value);
+  const label = key.replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 150);
+  return `21st-${label}-${sha256(key).slice(0, 12)}`;
 }
 
 function sha256(value: string) {
@@ -346,6 +410,11 @@ export function canonicalSha256(value: unknown) {
   return sha256(canonicalJson(value));
 }
 
+export function createVisualEvidenceV1(input: Omit<VisualEvidenceV1, "evidenceSha256">) {
+  const evidenceSha256 = canonicalSha256(input);
+  return { ...input, evidenceSha256 } satisfies VisualEvidenceV1;
+}
+
 export function composeTwentyFirstQueries(brief: SiteBrief): TwentyFirstQuery[] {
   const safeWords = [
     brief.companyName,
@@ -382,7 +451,7 @@ export function normalizeTwentyFirstSearchResults(
   for (const envelope of envelopes) {
     for (const record of collectSearchRecords(envelope.payload)) {
       if (output.length >= SITEOPS_VISUAL_FUNNEL_TARGETS.search) return output;
-      const providerItemId = firstString(record, [
+      const providerItemId = firstProviderItemId(record, [
         "provider_item_id",
         "component_id",
         "item_id",
@@ -393,68 +462,69 @@ export function normalizeTwentyFirstSearchResults(
         firstString(record, ["source_url", "sourceUrl", "url", "web_url"]),
         { providerSource: true },
       );
-      if (!providerItemId || !sourceUrl) continue;
-      const duplicateKey = providerItemId.toLocaleLowerCase("en-US");
+      if (providerItemId === null) continue;
+      const duplicateKey = providerItemKey(providerItemId);
       if (seen.has(duplicateKey)) continue;
       seen.add(duplicateKey);
-      const safeId = normalizeProviderItemId(providerItemId);
-      if (!safeId) continue;
+      const title = safeMetadata(
+        firstString(record, ["title", "name", "component_name", "demo_name"]),
+        `21st catalog item ${output.length + 1}`,
+      )!;
+      const description = safeMetadata(
+        firstString(record, ["description", "summary", "caption"]),
+      );
+      const author = safeMetadata(
+        firstString(record, ["author", "creator", "owner"]),
+      );
+      const previewUrl = sanitizeHttpsUrl(
+        firstString(record, [
+          "preview_url",
+          "previewUrl",
+          "preview",
+          "image_url",
+          "imageUrl",
+          "thumbnail_url",
+          "thumbnailUrl",
+        ]),
+      );
+      const metadataSha256 = canonicalSha256({
+        providerItemKey: duplicateKey,
+        title,
+        description,
+        author,
+        sourceUrl,
+        previewUrl,
+      });
       output.push({
-        candidateId: `21st-${safeId}`,
+        candidateId: candidateIdForProviderItem(providerItemId),
         providerItemId,
+        providerItemKey: duplicateKey,
         queryRole: envelope.role,
         searchRank: output.length + 1,
-        title: safeMetadata(
-          firstString(record, ["title", "name", "component_name"]),
-          `21st catalog item ${output.length + 1}`,
-        )!,
-        author: safeMetadata(
-          firstString(record, ["author", "creator", "owner"]),
-        ),
+        title,
+        description,
+        author,
         sourceUrl,
-        previewUrl: sanitizeHttpsUrl(
-          firstString(record, [
-            "preview_url",
-            "previewUrl",
-            "preview",
-            "image_url",
-            "imageUrl",
-            "thumbnail_url",
-            "thumbnailUrl",
-          ]),
-        ),
-        dependencies: firstStringList(record, ["dependencies", "packages"]),
+        previewUrl,
+        metadataSha256,
       });
     }
   }
   return output;
 }
 
-function extractExplicitPrompt(value: unknown, depth = 0): string | null {
-  if (depth > 5 || !isRecord(value)) return null;
-  for (const [key, child] of Object.entries(value)) {
-    if (PROMPT_KEYS.has(canonicalKey(key))) {
-      const prompt = compact(child, 100_000);
-      if (prompt) return prompt;
-    }
-  }
-  for (const [key, child] of Object.entries(value)) {
-    if (PROMPT_CONTAINERS.has(canonicalKey(key))) {
-      const prompt = extractExplicitPrompt(child, depth + 1);
-      if (prompt) return prompt;
-    }
-  }
-  return null;
-}
-
 export function extractSafeVisualDirectives(
-  rawPrompt: string,
+  safeMetadataText: string,
 ): SafeVisualDirective[] {
-  if (SENSITIVE_TEXT.test(rawPrompt) || PROMPT_INJECTION.test(rawPrompt)) {
-    throw new Error("UNSAFE_PROVIDER_PROMPT");
+  if (
+    SENSITIVE_TEXT.test(safeMetadataText) ||
+    INSTRUCTIONAL_METADATA.test(safeMetadataText) ||
+    UNSAFE_METADATA.test(safeMetadataText)
+  ) {
+    throw new Error("UNSAFE_PROVIDER_METADATA");
   }
   const directives = DIRECTIVE_TAXONOMY.filter(([, pattern]) =>
-    pattern.test(rawPrompt),
+    pattern.test(safeMetadataText),
   ).map(([directive]) => directive);
   if (directives.length === 0) {
     directives.push("structure:preview-led-original-translation");
@@ -509,27 +579,89 @@ export function normalizeTwentyFirstDetail(input: {
   score?: TwentyFirstVisualScore;
 }): NormalizedTwentyFirstCandidate | null {
   if (input.detail.operation !== "get_component") return null;
-  if (input.detail.requestedProviderItemId !== input.searchItem.providerItemId) {
+  if (
+    providerItemKey(input.detail.requestedProviderItemId) !==
+    input.searchItem.providerItemKey
+  ) {
     return null;
   }
-  const responseItemId = firstString(input.detail.payload, [
+  const responseItemId = firstProviderItemId(input.detail.payload, [
     "provider_item_id",
     "component_id",
     "item_id",
     "id",
     "slug",
   ]);
-  if (responseItemId && responseItemId !== input.searchItem.providerItemId) {
+  if (
+    responseItemId !== null &&
+    providerItemKey(responseItemId) !== input.searchItem.providerItemKey
+  ) {
     return null;
   }
-  const prompt = extractExplicitPrompt(input.detail.payload);
-  if (!prompt) return null;
-  const normalizedDirectives = extractSafeVisualDirectives(prompt);
-  const scoreBreakdown = input.score ?? defaultScore(input.searchItem, normalizedDirectives);
-  return {
+  const title =
+    safeMetadata(
+      firstString(input.detail.payload, [
+        "title",
+        "name",
+        "component_name",
+        "demo_name",
+      ]),
+    ) ?? input.searchItem.title;
+  const description =
+    safeMetadata(
+      firstString(input.detail.payload, ["description", "summary", "caption"]),
+    ) ?? input.searchItem.description;
+  const author =
+    safeMetadata(
+      firstString(input.detail.payload, ["author", "creator", "owner"]),
+    ) ?? input.searchItem.author;
+  const sourceUrl =
+    sanitizeHttpsUrl(
+      firstString(input.detail.payload, [
+        "source_url",
+        "sourceUrl",
+        "url",
+        "web_url",
+      ]),
+      { providerSource: true },
+    ) ?? input.searchItem.sourceUrl;
+  const previewUrl =
+    sanitizeHttpsUrl(
+      firstString(input.detail.payload, [
+        "preview_url",
+        "previewUrl",
+        "preview",
+        "image_url",
+        "imageUrl",
+        "thumbnail_url",
+        "thumbnailUrl",
+      ]),
+    ) ?? input.searchItem.previewUrl;
+  const metadataProjection = {
+    providerItemKey: input.searchItem.providerItemKey,
+    title,
+    description,
+    author,
+    sourceUrl,
+    previewUrl,
+  };
+  const normalizedDirectives = extractSafeVisualDirectives(
+    [title, description, author].filter(Boolean).join(" "),
+  );
+  const normalizedItem: NormalizedTwentyFirstSearchItem = {
     ...input.searchItem,
-    promptSha256: sha256(prompt),
-    responseSha256: canonicalSha256(input.detail.payload),
+    title,
+    description,
+    author,
+    sourceUrl,
+    previewUrl,
+    metadataSha256: canonicalSha256(metadataProjection),
+  };
+  const scoreBreakdown =
+    input.score ?? defaultScore(normalizedItem, normalizedDirectives);
+  return {
+    ...normalizedItem,
+    providerResponseSha256: canonicalSha256(input.detail.payload),
     normalizedDirectives,
     scoreBreakdown,
     score: scoreTotal(scoreBreakdown),
@@ -547,19 +679,22 @@ export function buildTwentyFirstVisualFunnel(input: {
     input.searchEnvelopes,
   );
   const detailsById = new Map(
-    input.details.map((detail) => [detail.requestedProviderItemId, detail]),
+    input.details.map((detail) => [
+      providerItemKey(detail.requestedProviderItemId),
+      detail,
+    ]),
   );
   const retrievalShortlist: NormalizedTwentyFirstCandidate[] = [];
   for (const searchItem of searchedCandidates) {
     if (retrievalShortlist.length >= SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve) {
       break;
     }
-    const detail = detailsById.get(searchItem.providerItemId);
+    const detail = detailsById.get(searchItem.providerItemKey);
     if (!detail) continue;
     const normalized = normalizeTwentyFirstDetail({
       searchItem,
       detail,
-      score: input.scores?.[searchItem.providerItemId],
+      score: input.scores?.[searchItem.providerItemKey],
     });
     if (normalized) retrievalShortlist.push(normalized);
   }
@@ -599,7 +734,7 @@ export function buildTwentyFirstVisualFunnel(input: {
     targets: SITEOPS_VISUAL_FUNNEL_TARGETS,
     actual: {
       searched: searchedCandidates.length,
-      promptRetrieved: retrievalShortlist.length,
+      detailRetrieved: retrievalShortlist.length,
       presented: presentedCandidates.length,
     },
     searchedCandidates,
@@ -610,20 +745,6 @@ export function buildTwentyFirstVisualFunnel(input: {
     generateUsed: false,
     providerCodeReuse: false,
   };
-}
-
-export function assertEphemeralPromptProof(input: {
-  rawPrompt: string;
-  expectedSha256: string;
-}) {
-  if (SENSITIVE_TEXT.test(input.rawPrompt) || PROMPT_INJECTION.test(input.rawPrompt)) {
-    throw new Error("UNSAFE_PROVIDER_PROMPT");
-  }
-  const actual = sha256(input.rawPrompt);
-  if (actual !== input.expectedSha256) {
-    throw new Error("PROMPT_PROOF_MISMATCH");
-  }
-  return actual;
 }
 
 export function composeBuildContractV1(

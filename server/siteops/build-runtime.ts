@@ -30,22 +30,33 @@ import type {
   SiteBuild,
 } from "../../drizzle/schema";
 import {
+  SITEOPS_MATERIALIZER_V1_2,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
-  visualTaxonomySchema,
-  type BuildContractV1,
   type SiteBrief,
 } from "../../shared/siteops";
 import {
   canonicalJson,
-  composeBuildContractV1,
 } from "../../shared/siteops-workflow";
+import {
+  buildContractV2Schema,
+  canonicalSiteOpsSha256,
+  composeBuildContractV2,
+  siteDesignSpecV1Schema,
+  siteOpsRuntimeVisualEvidenceV1Schema,
+  validateDesignAndContentBindings,
+  type BuildContractV2,
+  type SiteDesignSpecV1,
+  type SiteOpsRuntimeVisualEvidenceV1,
+} from "../../shared/siteops-design";
 import {
   freezeSiteBrandAsset,
   validateTrustedSiteBrandAsset,
   type FrozenSiteBrandAsset,
   type TrustedSiteBrandAsset,
 } from "./knowledge-brand-asset";
+
+type SiteOpsMaterializerCoordinates = typeof SITEOPS_MATERIALIZER_V1_2;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 const MAX_SOURCE_BYTES = 12 * 1024 * 1024;
@@ -62,6 +73,10 @@ const FORBIDDEN_DEMO_TEXT =
 
 const generatedSectionSchema = z
   .object({
+    slotId: z
+      .string()
+      .trim()
+      .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
     heading: z.string().trim().min(1).max(160),
     paragraphs: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
     sourceDocumentIds: z
@@ -96,15 +111,8 @@ export const siteOpsGeneratedContentSchema = z
   })
   .strict();
 
-export const siteOpsRuntimeVisualSchema = z
-  .object({
-    queryHash: z.string().regex(/^[a-f0-9]{64}$/u),
-    selectedCandidateId: z.string().trim().min(1).max(191),
-    promptSha256: z.string().regex(/^[a-f0-9]{64}$/u),
-    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
-    taxonomy: visualTaxonomySchema,
-  })
-  .strict();
+export const siteOpsRuntimeVisualSchema =
+  siteOpsRuntimeVisualEvidenceV1Schema;
 
 export const siteOpsAssetDecisionSchema = z
   .object({
@@ -116,7 +124,7 @@ export const siteOpsAssetDecisionSchema = z
 
 export const siteOpsFrozenRuntimeInputSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     build: z
       .object({
         id: z.string().uuid(),
@@ -138,6 +146,14 @@ export const siteOpsFrozenRuntimeInputSchema = z
           .nullable(),
       })
       .strict(),
+    host: z
+      .object({
+        starterSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        componentLibraryVersion: z.string().min(1).max(32),
+        materializerVersion: z.string().min(1).max(32),
+        materializerSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+      })
+      .strict(),
     snapshot: z
       .object({
         id: z.string().max(36),
@@ -153,6 +169,7 @@ export const siteOpsFrozenRuntimeInputSchema = z
       .strict(),
     brief: siteBriefSchema,
     visual: siteOpsRuntimeVisualSchema,
+    designSpec: siteDesignSpecV1Schema,
     generatedContent: siteOpsGeneratedContentSchema,
     assetDecisions: z.array(siteOpsAssetDecisionSchema).max(500),
     brandAsset: z
@@ -179,7 +196,7 @@ export const siteOpsFrozenRuntimeInputSchema = z
 export type SiteOpsGeneratedContent = z.infer<
   typeof siteOpsGeneratedContentSchema
 >;
-export type SiteOpsRuntimeVisual = z.infer<typeof siteOpsRuntimeVisualSchema>;
+export type SiteOpsRuntimeVisual = SiteOpsRuntimeVisualEvidenceV1;
 
 type TrustedBuildCoordinates = Pick<
   SiteBuild,
@@ -211,6 +228,7 @@ export type MaterializeAstroSiteInput = {
   snapshot: TrustedSnapshot;
   brief: SiteBrief | unknown;
   visual: SiteOpsRuntimeVisual | unknown;
+  designSpec: SiteDesignSpecV1 | unknown;
   generatedContent: SiteOpsGeneratedContent | unknown;
   mode: "preview" | "production";
   canonicalOrigin?: string | null;
@@ -243,7 +261,7 @@ export type SiteOpsQaReport = {
 };
 
 export type MaterializedAstroSite = {
-  contract: BuildContractV1;
+  contract: BuildContractV2;
   contractJson: Buffer;
   contractSha256: string;
   sourceZip: Buffer;
@@ -351,6 +369,7 @@ function validateCanonicalOrigin(
 function validateInput(
   input: MaterializeAstroSiteInput,
   brandAsset: TrustedSiteBrandAsset | null,
+  workflow: SiteOpsMaterializerCoordinates,
 ) {
   const coordinates = z
     .object({
@@ -368,6 +387,7 @@ function validateInput(
     });
   const brief = siteBriefSchema.parse(input.brief);
   const visual = siteOpsRuntimeVisualSchema.parse(input.visual);
+  const designSpec = siteDesignSpecV1Schema.parse(input.designSpec);
   const generatedContent = siteOpsGeneratedContentSchema.parse(
     input.generatedContent,
   );
@@ -384,13 +404,13 @@ function validateInput(
     throw new Error("SITEOPS_SNAPSHOT_COORDINATES_MISMATCH");
   }
   if (
-    input.build.workflowUpstreamVersion !== SITEOPS_WORKFLOW.upstreamVersion ||
-    input.build.workflowUpstreamHash !== SITEOPS_WORKFLOW.upstreamSha256 ||
-    input.build.workflowVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
+    input.build.workflowUpstreamVersion !== workflow.upstreamVersion ||
+    input.build.workflowUpstreamHash !== workflow.upstreamSha256 ||
+    input.build.workflowVersion !== workflow.frontMindVersion ||
     (input.build.workflowPackageHash !== null &&
       input.build.workflowPackageHash !==
-        SITEOPS_WORKFLOW.runtimeManifestSha256) ||
-    input.build.starterVersion !== SITEOPS_WORKFLOW.starterVersion
+        workflow.runtimeManifestSha256) ||
+    input.build.starterVersion !== workflow.starterVersion
   ) {
     throw new Error("SITEOPS_WORKFLOW_COORDINATES_MISMATCH");
   }
@@ -432,6 +452,20 @@ function validateInput(
   ) {
     throw new Error("SITEOPS_GENERATED_ROUTE_SET_MISMATCH");
   }
+  validateDesignAndContentBindings({
+    routeIds: routes.map((route) => route.id),
+    paletteSize: visual.taxonomy.palette.length,
+    designSpec,
+    pageContent: {
+      schemaVersion: 1,
+      routes: generatedContent.routes,
+    },
+  });
+  if (
+    canonicalJson(generatedContent.seo) !== canonicalJson(designSpec.seoPlan)
+  ) {
+    throw new Error("SITEOPS_SEO_PLAN_MISMATCH");
+  }
   for (const route of routes) {
     const generated = generatedByRoute.get(route.id)!;
     const allowedSources = new Set(route.sourceDocumentIds);
@@ -441,7 +475,7 @@ function validateInput(
       }
     }
   }
-  const allText = canonicalJson({ brief, generatedContent });
+  const allText = canonicalJson({ brief, designSpec, generatedContent });
   if (Buffer.byteLength(allText, "utf8") > 2_000_000) {
     throw new Error("SITEOPS_GENERATED_CONTENT_TOO_LARGE");
   }
@@ -472,6 +506,7 @@ function validateInput(
   return {
     brief: { ...brief, routes },
     visual,
+    designSpec,
     generatedContent,
     generatedByRoute,
     sourceDocuments,
@@ -526,37 +561,89 @@ function contrastRatio(left: string, right: string) {
   );
 }
 
-function cssForVisual(visual: SiteOpsRuntimeVisual) {
+function siteDesignMaterializationProjectionFor(
+  input: unknown,
+  workflow: SiteOpsMaterializerCoordinates,
+) {
+  const design = siteDesignSpecV1Schema.parse(input);
+  return {
+    bodyClass: [
+      `layout--${design.layoutArchetype}`,
+      `surface--${design.surfaceStyle}`,
+      `type--${design.typeScale}`,
+      `image--${design.imageTreatment}`,
+      `motion--${design.motionLevel}`,
+    ].join(" "),
+    heroClass: `hero hero--${design.heroVariant}`,
+    componentManifest: {
+      schemaVersion: 1 as const,
+      componentLibraryVersion: workflow.componentLibraryVersion,
+      materializerVersion: workflow.materializerVersion,
+      layoutArchetype: design.layoutArchetype,
+      heroVariant: design.heroVariant,
+      routes: design.routeCompositions,
+    },
+  };
+}
+
+export function siteDesignMaterializationProjection(input: unknown) {
+  return siteDesignMaterializationProjectionFor(input, SITEOPS_WORKFLOW);
+}
+
+function cssForVisual(
+  visual: SiteOpsRuntimeVisual,
+  design: SiteDesignSpecV1,
+) {
   const colors = visual.taxonomy.palette.filter((value) =>
     /^#[a-f0-9]{6}$/iu.test(value),
   );
-  // Provider palette values are suggestions, not accessibility authority.
-  // Only colors with AA contrast survive into foreground roles.
-  const canvas = "#F5F2EA";
-  const inkCandidate = colors[0] ?? "#10212B";
-  const ink = contrastRatio(inkCandidate, canvas) >= 7 ? inkCandidate : "#10212B";
-  const accentCandidate = colors[1] ?? "#A33A1B";
+  const canvasCandidate =
+    colors[design.colorRoles.backgroundPaletteIndex] ?? "#F5F2EA";
+  const inkCandidate = colors[design.colorRoles.textPaletteIndex] ?? "#10212B";
+  const accessiblePair =
+    contrastRatio(inkCandidate, canvasCandidate) >= 7
+      ? { canvas: canvasCandidate, ink: inkCandidate }
+      : { canvas: "#F5F2EA", ink: "#10212B" };
+  const { canvas, ink } = accessiblePair;
+  const accentCandidate =
+    colors[design.colorRoles.accentPaletteIndex] ?? "#A33A1B";
   const accent =
     contrastRatio(accentCandidate, canvas) >= 4.5
       ? accentCandidate
       : "#A33A1B";
   const muted = colors[3] ?? "#DDE7E8";
-  const isEditorial = visual.taxonomy.layout.some((value) =>
-    /editorial/iu.test(value),
-  );
-  const rounded = visual.taxonomy.layout.some((value) =>
-    /rounded|modular|bento/iu.test(value),
-  );
-  return `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${rounded ? "22px" : "4px"};font-family:${isEditorial ? "Georgia, 'Times New Roman', serif" : "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:smooth}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:3}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{padding:clamp(72px,10vw,144px) 0 64px}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:clamp(2.7rem,8vw,6.8rem);line-height:.95;letter-spacing:-.065em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:20px;padding:28px 0 100px}.section{grid-column:span 6;border-top:3px solid var(--ink);padding:24px 4px 40px}.section:nth-child(3n+1){grid-column:span 7}.section:nth-child(3n+2){grid-column:span 5}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;opacity:.62}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts{display:block}.section{padding-block:28px}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}`;
+  const radius =
+    design.surfaceStyle === "soft_depth" || design.surfaceStyle === "layered"
+      ? "22px"
+      : design.surfaceStyle === "bordered"
+        ? "8px"
+        : "2px";
+  const font =
+    design.typeScale === "editorial"
+      ? "Georgia, 'Times New Roman', serif"
+      : "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+  const heroSize =
+    design.typeScale === "restrained"
+      ? "clamp(2.4rem,6vw,5.2rem)"
+      : design.typeScale === "display"
+        ? "clamp(3rem,9vw,7.4rem)"
+        : "clamp(2.7rem,8vw,6.8rem)";
+  const gap =
+    design.density === "compact" ? "12px" : design.density === "spacious" ? "32px" : "20px";
+  const sectionPadding =
+    design.density === "compact" ? "24px" : design.density === "spacious" ? "56px" : "40px";
+  return `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${design.motionLevel === "subtle" ? "smooth" : "auto"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:3}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid color-mix(in srgb,var(--ink) 30%,transparent);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:color-mix(in srgb,var(--canvas) 88%,white);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--ink)!important;color:var(--canvas);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;opacity:.62}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
 }
 
 function renderLayoutSource(input: {
   brief: SiteBrief;
   routes: Array<{ slug: string; title: string }>;
+  designSpec: SiteDesignSpecV1;
   mode: "preview" | "production";
   canonicalOrigin: string | null;
   brandAsset: FrozenSiteBrandAsset | null;
 }) {
+  const projection = siteDesignMaterializationProjection(input.designSpec);
   const nav = input.routes.map((route) => ({
     href: route.slug,
     title: route.title,
@@ -576,6 +663,7 @@ const socialImage = ${JSON.stringify(input.canonicalOrigin ? `${input.canonicalO
 const brandLogo = ${JSON.stringify(input.brandAsset ? `/${input.brandAsset.publicPath.slice("public/".length)}` : null)};
 const brandLogoWidth = ${JSON.stringify(input.brandAsset?.width ?? null)};
 const brandLogoHeight = ${JSON.stringify(input.brandAsset?.height ?? null)};
+const bodyClass = ${JSON.stringify(projection.bodyClass)};
 // JSON-LD is raw script text, so JSON escaping alone is insufficient: a
 // customer/provider value containing </script> would otherwise close the
 // element in the HTML parser. Emit JSON-safe unicode escapes for every less-
@@ -607,7 +695,7 @@ const jsonLdText = jsonLd
     <link rel="stylesheet" href="/styles.css" />
     <title>{title}</title>
   </head>
-  <body>
+  <body class={bodyClass}>
     <header class="site-header">
       <nav class="shell nav" aria-label="主导航">
         <a class="brand" href="/">
@@ -628,11 +716,14 @@ function renderPageSource(input: {
   sourcePath: string;
   route: SiteBrief["routes"][number];
   generated: z.infer<typeof generatedRouteSchema>;
+  composition: SiteDesignSpecV1["routeCompositions"][number];
+  designSpec: SiteDesignSpecV1;
   brief: SiteBrief;
   siteDescription: string;
   organizationType: string;
   canonical: string | null;
 }) {
+  const projection = siteDesignMaterializationProjection(input.designSpec);
   const sourceDir = path.posix.dirname(input.sourcePath);
   let layoutImport = path.posix.relative(
     sourceDir,
@@ -648,9 +739,12 @@ function renderPageSource(input: {
         description: input.siteDescription,
       }
     : null;
+  const variantBySlot = new Map(
+    input.composition.slots.map((slot) => [slot.slotId, slot.variant]),
+  );
   const sections = input.generated.sections
     .map(
-      (section) => `<section class="section">
+      (section) => `<section class="section section--${variantBySlot.get(section.slotId)}" data-slot="${escapeHtml(section.slotId)}">
         <h2>${escapeHtml(section.heading)}</h2>
         ${section.paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("\n        ")}
         <p class="source-note">知识来源：${section.sourceDocumentIds.map(escapeHtml).join("、")}</p>
@@ -674,7 +768,7 @@ const canonical = ${JSON.stringify(input.canonical)};
 const jsonLd = ${JSON.stringify(jsonLd)};
 ---
 <SiteLayout {title} {description} {canonical} {jsonLd}>
-  <section class="hero"><div class="shell">
+  <section class="${projection.heroClass}"><div class="shell">
     <p class="eyebrow">${escapeHtml(input.generated.eyebrow ?? input.brief.companyName)}</p>
     <h1>${escapeHtml(input.generated.heading)}</h1>
     <p class="lede">${escapeHtml(input.generated.summary)}</p>
@@ -706,14 +800,16 @@ function addTextFile(
 }
 
 function buildTrustedSource(input: {
-  contract: BuildContractV1;
+  contract: BuildContractV2;
   frozenRuntimeInput: z.infer<typeof siteOpsFrozenRuntimeInputSchema>;
   brief: SiteBrief;
   visual: SiteOpsRuntimeVisual;
+  designSpec: SiteDesignSpecV1;
   content: SiteOpsGeneratedContent;
   canonicalOrigin: string | null;
   mode: "preview" | "production";
   brandAsset: TrustedSiteBrandAsset | null;
+  workflow: SiteOpsMaterializerCoordinates;
 }) {
   const files: SourceFile[] = [];
   const routePairs = input.brief.routes.map((route) => ({
@@ -746,7 +842,7 @@ function buildTrustedSource(input: {
       installAtCustomerBuildTime: false,
       node: ">=22.19.0",
       dependencies: { astro: ASTRO_VERSION, typescript: TYPESCRIPT_VERSION },
-      workflowPackageSha256: SITEOPS_WORKFLOW.runtimeManifestSha256,
+      workflowManifestSha256: input.workflow.runtimeManifestSha256,
     }),
   );
   addTextFile(
@@ -771,6 +867,7 @@ function buildTrustedSource(input: {
     renderLayoutSource({
       brief: input.brief,
       routes: input.brief.routes,
+      designSpec: input.designSpec,
       mode: input.mode,
       canonicalOrigin: input.canonicalOrigin,
       brandAsset: freezeSiteBrandAsset(input.brandAsset),
@@ -785,6 +882,10 @@ function buildTrustedSource(input: {
         sourcePath,
         route,
         generated,
+        composition: input.designSpec.routeCompositions.find(
+          (item) => item.routeId === route.id,
+        )!,
+        designSpec: input.designSpec,
         brief: input.brief,
         siteDescription: input.content.seo.description,
         organizationType: input.content.seo.organizationType,
@@ -796,10 +897,24 @@ function buildTrustedSource(input: {
   }
   addTextFile(
     files,
+    "frontmind-component-manifest.json",
+    jsonBuffer(
+      siteDesignMaterializationProjectionFor(
+        input.designSpec,
+        input.workflow,
+      ).componentManifest,
+    ),
+  );
+  addTextFile(
+    files,
     "src/pages/404.astro",
     `---\nimport SiteLayout from "../layouts/SiteLayout.astro";\nconst title = ${JSON.stringify(`页面未找到 | ${input.brief.companyName}`)};\nconst description = "请求的页面不存在。";\nconst canonical = null;\nconst jsonLd = null;\n---\n<SiteLayout {title} {description} {canonical} {jsonLd}><section class="hero"><div class="shell"><p class="eyebrow">404</p><h1>页面未找到</h1><p class="lede"><a href="/">返回首页</a></p></div></section></SiteLayout>\n`,
   );
-  addTextFile(files, "public/styles.css", `${cssForVisual(input.visual)}\n`);
+  addTextFile(
+    files,
+    "public/styles.css",
+    `${cssForVisual(input.visual, input.designSpec)}\n`,
+  );
   if (input.brandAsset) {
     addTextFile(files, input.brandAsset.publicPath, input.brandAsset.bytes);
   }
@@ -1314,6 +1429,7 @@ function qaDist(input: {
   canonicalOrigin: string | null;
   assetDecisions: readonly z.infer<typeof siteOpsAssetDecisionSchema>[];
   brandAsset: FrozenSiteBrandAsset | null;
+  qaPolicyVersion: string;
 }) {
   const files = new Map(input.files.map((file) => [file.path, file.bytes]));
   const routeOutputs = input.brief.routes.map((route) =>
@@ -1500,7 +1616,7 @@ function qaDist(input: {
   );
   return {
     schemaVersion: 1,
-    policyVersion: SITEOPS_WORKFLOW.qaPolicyVersion,
+    policyVersion: input.qaPolicyVersion,
     passed: true,
     mode: input.mode,
     routes: input.brief.routes.map((route) => route.slug),
@@ -1513,15 +1629,16 @@ function qaDist(input: {
   } satisfies Omit<SiteOpsQaReport, "browser">;
 }
 
-export async function materializeAstroSite(
+async function materializeAstroSiteWithWorkflow(
   input: MaterializeAstroSiteInput,
+  workflow: SiteOpsMaterializerCoordinates,
 ): Promise<MaterializedAstroSite> {
   const brandAsset = input.brandAsset
     ? await validateTrustedSiteBrandAsset(input.brandAsset)
     : null;
-  const validated = validateInput(input, brandAsset);
-  const contract = composeBuildContractV1({
-    schemaVersion: 1,
+  const validated = validateInput(input, brandAsset, workflow);
+  const contract = composeBuildContractV2({
+    schemaVersion: 2,
     source: {
       knowledgeSnapshotId: input.snapshot.id,
       archiveSha256: input.build.knowledgeArchiveHash,
@@ -1529,10 +1646,14 @@ export async function materializeAstroSite(
       sourceBuildRevision: input.snapshot.sourceBuildRevision,
     },
     workflow: {
-      upstreamSha256: SITEOPS_WORKFLOW.upstreamSha256,
-      version: SITEOPS_WORKFLOW.frontMindVersion,
-      packageSha256: SITEOPS_WORKFLOW.runtimeManifestSha256,
-      starterVersion: SITEOPS_WORKFLOW.starterVersion,
+      upstreamSha256: workflow.upstreamSha256,
+      version: workflow.frontMindVersion,
+      manifestSha256: workflow.runtimeManifestSha256,
+      starterVersion: workflow.starterVersion,
+      starterSha256: workflow.starterSha256,
+      componentLibraryVersion: workflow.componentLibraryVersion,
+      materializerVersion: workflow.materializerVersion,
+      materializerSha256: workflow.materializerSha256,
     },
     identity: {
       companyName: validated.brief.companyName,
@@ -1541,11 +1662,15 @@ export async function materializeAstroSite(
         (contact) => `${contact.kind}:${contact.value}`,
       ),
     },
-    visual: validated.visual,
+    visual: {
+      ...validated.visual,
+      designSpecHash: canonicalSiteOpsSha256(validated.designSpec),
+      componentLibraryVersion: workflow.componentLibraryVersion,
+    },
     routes: validated.brief.routes,
     assets: validated.assetDecisions,
     seo: {
-      ...validated.generatedContent.seo,
+      ...validated.designSpec.seoPlan,
       environment: input.mode,
       canonicalPolicy:
         input.mode === "preview" ? "forbidden" : "exact_https_origin",
@@ -1557,10 +1682,10 @@ export async function materializeAstroSite(
           : (input.target ?? "global_excluding_cn"),
       canonicalOrigin: validated.canonicalOrigin,
     },
-    qaPolicyVersion: SITEOPS_WORKFLOW.qaPolicyVersion,
+    qaPolicyVersion: workflow.qaPolicyVersion,
   });
   const frozenRuntimeInput = siteOpsFrozenRuntimeInputSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: 2,
     build: {
       id: input.build.id,
       projectId: input.build.projectId,
@@ -1574,6 +1699,12 @@ export async function materializeAstroSite(
       starterVersion: input.build.starterVersion,
       selectionHash: input.build.selectionHash,
     },
+    host: {
+      starterSha256: workflow.starterSha256,
+      componentLibraryVersion: workflow.componentLibraryVersion,
+      materializerVersion: workflow.materializerVersion,
+      materializerSha256: workflow.materializerSha256,
+    },
     snapshot: {
       id: input.snapshot.id,
       userId: input.snapshot.userId,
@@ -1584,6 +1715,7 @@ export async function materializeAstroSite(
     },
     brief: validated.brief,
     visual: validated.visual,
+    designSpec: validated.designSpec,
     generatedContent: validated.generatedContent,
     assetDecisions: validated.assetDecisions,
     brandAsset: freezeSiteBrandAsset(validated.brandAsset),
@@ -1594,10 +1726,12 @@ export async function materializeAstroSite(
     frozenRuntimeInput,
     brief: validated.brief,
     visual: validated.visual,
+    designSpec: validated.designSpec,
     content: validated.generatedContent,
     canonicalOrigin: validated.canonicalOrigin,
     mode: input.mode,
     brandAsset: validated.brandAsset,
+    workflow,
   });
   assertTrustedSourceAssetIsolation({
     files: sourceFiles,
@@ -1624,6 +1758,7 @@ export async function materializeAstroSite(
       canonicalOrigin: validated.canonicalOrigin,
       assetDecisions: validated.assetDecisions,
       brandAsset: freezeSiteBrandAsset(validated.brandAsset),
+      qaPolicyVersion: workflow.qaPolicyVersion,
     });
     const browserQa = await runBrowserQa({
       files: distFiles,
@@ -1651,16 +1786,24 @@ export async function materializeAstroSite(
       knowledgeSnapshotId: input.snapshot.id,
       knowledgeArchiveSha256: input.build.knowledgeArchiveHash,
       workflow: {
-        upstreamSha256: SITEOPS_WORKFLOW.upstreamSha256,
-        runtimeManifestSha256: SITEOPS_WORKFLOW.runtimeManifestSha256,
-        version: SITEOPS_WORKFLOW.frontMindVersion,
-        starterVersion: SITEOPS_WORKFLOW.starterVersion,
+        upstreamSha256: workflow.upstreamSha256,
+        runtimeManifestSha256: workflow.runtimeManifestSha256,
+        version: workflow.frontMindVersion,
+        starterVersion: workflow.starterVersion,
+        starterSha256: workflow.starterSha256,
+        componentLibraryVersion: workflow.componentLibraryVersion,
+        materializerVersion: workflow.materializerVersion,
+        materializerSha256: workflow.materializerSha256,
       },
       visual: {
         queryHash: validated.visual.queryHash,
         selectedCandidateId: validated.visual.selectedCandidateId,
-        promptSha256: validated.visual.promptSha256,
+        providerItemKey: validated.visual.providerItemKey,
+        visualEvidenceSha256: validated.visual.visualEvidenceSha256,
         previewSha256: validated.visual.previewSha256,
+        supportEvidenceSha256s:
+          validated.visual.supportEvidenceSha256s,
+        designSpecHash: canonicalSiteOpsSha256(validated.designSpec),
       },
       brandAsset: freezeSiteBrandAsset(validated.brandAsset),
       contractSha256: sha256(contractJson),
@@ -1695,6 +1838,21 @@ export async function materializeAstroSite(
     );
   }
 }
+
+export function materializeAstroSite(input: MaterializeAstroSiteInput) {
+  return materializeAstroSiteWithWorkflow(input, SITEOPS_WORKFLOW);
+}
+
+function materializeAstroSiteV1_2(input: MaterializeAstroSiteInput) {
+  return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_2);
+}
+
+const productionMaterializerRegistry = [
+  {
+    workflow: SITEOPS_MATERIALIZER_V1_2,
+    materialize: materializeAstroSiteV1_2,
+  },
+] as const;
 
 /**
  * Rebuilds the exact approved content for a production hostname from the
@@ -1767,6 +1925,22 @@ export async function materializeProductionSiteFromSource(input: {
   ) {
     throw new Error("SITEOPS_FROZEN_RUNTIME_COORDINATES_MISMATCH");
   }
+  const registeredMaterializer = productionMaterializerRegistry.find(
+    ({ workflow }) =>
+      frozen.build.workflowUpstreamVersion === workflow.upstreamVersion &&
+      frozen.build.workflowUpstreamHash === workflow.upstreamSha256 &&
+      frozen.build.workflowVersion === workflow.frontMindVersion &&
+      frozen.build.workflowPackageHash === workflow.runtimeManifestSha256 &&
+      frozen.build.starterVersion === workflow.starterVersion &&
+      frozen.host.starterSha256 === workflow.starterSha256 &&
+      frozen.host.componentLibraryVersion ===
+        workflow.componentLibraryVersion &&
+      frozen.host.materializerVersion === workflow.materializerVersion &&
+      frozen.host.materializerSha256 === workflow.materializerSha256,
+  );
+  if (!registeredMaterializer) {
+    throw new Error("SITEOPS_FROZEN_HOST_COORDINATES_MISMATCH");
+  }
   let brandAsset: TrustedSiteBrandAsset | null = null;
   if (frozen.brandAsset) {
     const brandEntry = archive.file(frozen.brandAsset.publicPath);
@@ -1784,7 +1958,7 @@ export async function materializeProductionSiteFromSource(input: {
   ) {
     throw new Error("SITEOPS_FROZEN_BRAND_ASSET_UNDECLARED");
   }
-  const materialized = await materializeAstroSite({
+  const materialized = await registeredMaterializer.materialize({
     build: frozen.build,
     snapshot: {
       id: frozen.snapshot.id,
@@ -1802,6 +1976,7 @@ export async function materializeProductionSiteFromSource(input: {
     },
     brief: frozen.brief,
     visual: frozen.visual,
+    designSpec: frozen.designSpec,
     generatedContent: frozen.generatedContent,
     assetDecisions: frozen.assetDecisions,
     brandAsset,
