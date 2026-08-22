@@ -21,6 +21,8 @@ import { publicSiteOpsProviderResult } from "./public-errors";
 
 const DEFAULT_LEASE_MS = 2 * 60_000;
 const DEFAULT_TIMEOUT_MS = 90_000;
+const BUILD_LEASE_MS = 12 * 60_000;
+const BUILD_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_BATCH = 4;
 
 type Claimed = typeof siteOperations.$inferSelect & { leaseOwner: string };
@@ -51,12 +53,54 @@ export function siteOpsWorkerMayClaimStatus(status: string) {
   return status === "queued" || status === "running";
 }
 
+export function siteOpsWorkerExecutionPolicy(kind: string) {
+  const isBuild = kind === "site_build" || kind === "build_revision";
+  return {
+    leaseMs: isBuild ? BUILD_LEASE_MS : DEFAULT_LEASE_MS,
+    timeoutMs: isBuild ? BUILD_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
+  } as const;
+}
+
+export function terminalSiteOpsOperationProjection(
+  locked: Pick<Claimed, "result" | "providerOperationId" | "providerTaskId">,
+  result: SiteOpsProviderResult,
+) {
+  return {
+    result: result.result ?? locked.result,
+    providerOperationId:
+      result.providerOperationId ?? locked.providerOperationId,
+    providerTaskId: result.providerTaskId ?? locked.providerTaskId,
+  };
+}
+
 export function unexpectedSiteOpsProviderFailure(): SiteOpsProviderResult {
   return failureResult(
     "attention_required",
     "PROVIDER_ERROR",
     "外部服务操作未能安全完成，请根据错误码和任务编号联系处理。",
   );
+}
+
+export function knownSiteOpsBuildFailure(
+  error: unknown,
+): SiteOpsProviderResult | null {
+  if (!error || typeof error !== "object") return null;
+  const code = String((error as { code?: unknown }).code ?? "").trim();
+  if (!/^FRONTMIND_BUILD_[A-Z_]+$/u.test(code)) return null;
+  const requestedStatus = String((error as { status?: unknown }).status ?? "");
+  const status =
+    requestedStatus === "attention_required" ||
+    code === "FRONTMIND_BUILD_CONFIGURATION_ERROR"
+      ? "attention_required"
+      : "failed";
+  return {
+    status,
+    code,
+    message:
+      error instanceof Error && error.message.trim()
+        ? error.message
+        : "FrontMind AI 建站任务未能安全完成，请重置后重新开始。",
+  };
 }
 
 async function claimOne(db: any): Promise<Claimed | null> {
@@ -85,12 +129,14 @@ async function claimOne(db: any): Promise<Claimed | null> {
       return null;
     }
     const leaseOwner = randomUUID();
+    const executionPolicy = siteOpsWorkerExecutionPolicy(operation.kind);
+    const leaseExpiresAt = new Date(now.getTime() + executionPolicy.leaseMs);
     await tx
       .update(siteOperations)
       .set({
         status: "running",
         leaseOwner,
-        leaseExpiresAt: new Date(now.getTime() + DEFAULT_LEASE_MS),
+        leaseExpiresAt,
         attempt: operation.attempt + 1,
         startedAt: operation.startedAt ?? now,
         updatedAt: now,
@@ -101,7 +147,12 @@ async function claimOne(db: any): Promise<Claimed | null> {
           eq(siteOperations.status, operation.status),
         ),
       );
-    return { ...operation, status: "running", leaseOwner };
+    return {
+      ...operation,
+      status: "running",
+      leaseOwner,
+      leaseExpiresAt,
+    };
   });
 }
 
@@ -113,7 +164,30 @@ function failureResult(
   return { status, code, message };
 }
 
-async function invokeProvider(operation: Claimed) {
+async function assertClaimLeaseActive(db: any, operation: Claimed) {
+  const rows = await db
+    .select({
+      id: siteOperations.id,
+      leaseExpiresAt: siteOperations.leaseExpiresAt,
+    })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.id, operation.id),
+        eq(siteOperations.status, "running"),
+        eq(siteOperations.leaseOwner, operation.leaseOwner),
+      ),
+    )
+    .limit(1);
+  if (!rows[0] || rows[0].leaseExpiresAt === null) {
+    throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+  }
+  if (rows[0].leaseExpiresAt.getTime() <= Date.now()) {
+    throw new Error("SITEOPS_OPERATION_LEASE_EXPIRED");
+  }
+}
+
+async function invokeProvider(db: any, operation: Claimed) {
   const handler = getSiteOpsProviderHandler(operation.provider);
   if (!handler) {
     return failureResult(
@@ -123,10 +197,19 @@ async function invokeProvider(operation: Claimed) {
     );
   }
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const executionPolicy = siteOpsWorkerExecutionPolicy(operation.kind);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    executionPolicy.timeoutMs,
+  );
   timeout.unref?.();
   try {
-    return await handler({ operation, signal: controller.signal });
+    await assertClaimLeaseActive(db, operation);
+    return await handler({
+      operation,
+      signal: controller.signal,
+      assertLeaseActive: () => assertClaimLeaseActive(db, operation),
+    });
   } catch (error) {
     if (controller.signal.aborted) {
       return failureResult(
@@ -141,7 +224,9 @@ async function invokeProvider(operation: Claimed) {
       provider: operation.provider,
       error: runtimeErrorForLog(error),
     });
-    return unexpectedSiteOpsProviderFailure();
+    return (
+      knownSiteOpsBuildFailure(error) ?? unexpectedSiteOpsProviderFailure()
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -247,13 +332,15 @@ async function finalize(
       return;
     }
     const terminalStatus = result.status;
+    const preservedTerminalState = terminalSiteOpsOperationProjection(
+      locked,
+      result,
+    );
     await tx
       .update(siteOperations)
       .set({
         status: terminalStatus,
-        result: result.result,
-        providerOperationId: result.providerOperationId,
-        providerTaskId: result.providerTaskId,
+        ...preservedTerminalState,
         errorCode: result.status === "succeeded" ? null : result.code,
         errorMessage: result.status === "succeeded" ? null : result.message,
         leaseOwner: null,
@@ -323,8 +410,8 @@ async function finalize(
         // attention_required retains it so neither staff nor a retry can
         // produce a second charge while the provider outcome is unresolved.
         ...domainFinancialTerminalProjection(result.status),
-        providerTaskNo: result.providerTaskId,
-        providerResult: result.result,
+        providerTaskNo: preservedTerminalState.providerTaskId,
+        providerResult: preservedTerminalState.result,
         errorCode: unsuccessful ? result.code : null,
         errorMessage: unsuccessful ? result.message : null,
         completedAt: now,
@@ -520,7 +607,7 @@ export async function runSiteOpsWorkerSweep(options?: { max?: number }) {
     const operation = await claimOne(db);
     if (!operation) break;
     summary.claimed += 1;
-    const result = await invokeProvider(operation);
+    const result = await invokeProvider(db, operation);
     await finalize(db, operation, result);
     if (result.status === "pending") summary.deferred += 1;
     else if (result.status === "succeeded") summary.succeeded += 1;

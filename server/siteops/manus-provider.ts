@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, or } from "drizzle-orm";
 import JSZip from "jszip";
 import { z } from "zod";
 
@@ -25,6 +25,10 @@ import {
   type VisualSelectionBundleV1,
   type VisualSelectionBundleV2,
 } from "../../shared/siteops";
+import {
+  managedAgentProfileModel,
+  managedAgentProfileSchema,
+} from "../../shared/manus-agent-profile";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
   canonicalSiteOpsSha256,
@@ -34,6 +38,7 @@ import {
   validateDesignAndContentBindings,
 } from "../../shared/siteops-design";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
+import { getDecryptedCredentialForUser } from "../auth-service";
 import { getDb } from "../db";
 import { assertUpstreamPromptBudget } from "../upstream-prompt-budget";
 import {
@@ -42,11 +47,12 @@ import {
   latestManusV2TaskState,
   ManusV2ApiError,
   ManusV2Client,
+  manusV2EventOperationToken,
   manusV2EventsContainOperationToken,
+  orderManusV2EventsByProviderRank,
   type ManusV2MessageEvent,
   type ManusV2StructuredOutputSchema,
 } from "../manus-v2-client";
-import { getPresalesCredentialById } from "../presales-service";
 import { readKnowledgeSnapshotArchive } from "../knowledge-snapshot-archive-store";
 import {
   generateSocialPackage,
@@ -72,11 +78,19 @@ import {
   siteOpsSourceDossierAttachments,
   socialWireOutputSchema,
 } from "./manus-wire-contract";
+import {
+  resolveSiteOpsWireOutput,
+  SITEOPS_WIRE_OUTPUT_FILES,
+  SiteOpsWireOutputResolutionError,
+  type SiteOpsWireOutputPhase,
+} from "./manus-wire-output-resolver";
 
 const operationInputSchema = z
   .object({
+    credentialScope: z.literal("customer"),
     manusCredentialId: z.string().uuid(),
     manusCredentialVersion: z.number().int().positive(),
+    agentProfile: managedAgentProfileSchema.default("frontmind-pro"),
     buildId: z.string().uuid().optional(),
     childBuildId: z.string().uuid().optional(),
     parentBuildId: z.string().uuid().optional(),
@@ -117,7 +131,7 @@ type ProviderState = z.infer<typeof providerStateSchema>;
 
 type ManusProviderDependencies = {
   getDb?: typeof getDb;
-  getCredential?: typeof getPresalesCredentialById;
+  getCredential?: typeof getDecryptedCredentialForUser;
   createClient?: (input: {
     apiKey: string;
     credentialId: string;
@@ -152,11 +166,11 @@ function workflowRoots() {
     ...(configured ? [path.resolve(configured)] : []),
     path.resolve(
       process.cwd(),
-      `dist/private-workflows/astro-company-site-workflow-v${SITEOPS_WORKFLOW.frontMindVersion}`,
+      `private-workflows/astro-company-site-workflow-v${SITEOPS_WORKFLOW.frontMindVersion}`,
     ),
     path.resolve(
       process.cwd(),
-      `private-workflows/astro-company-site-workflow-v${SITEOPS_WORKFLOW.frontMindVersion}`,
+      `dist/private-workflows/astro-company-site-workflow-v${SITEOPS_WORKFLOW.frontMindVersion}`,
     ),
   ];
 }
@@ -642,7 +656,7 @@ function baseUrl() {
   return process.env.MANUS_API_BASE_URL?.trim() || "https://api.manus.ai";
 }
 
-function acceptedStructuredValue(
+function acceptedSocialStructuredValue(
   events: readonly ManusV2MessageEvent[],
   token: string,
 ) {
@@ -695,10 +709,45 @@ export function combinedTerminalTaskState(
 ) {
   const eventState = terminalTaskState(eventStatus);
   const detailState = terminalTaskState(detailStatus);
+  const normalizedDetail = String(detailStatus ?? "")
+    .trim()
+    .toLowerCase();
+  const detailIsKnownNonterminal = [
+    "created",
+    "queued",
+    "starting",
+    "running",
+    "pending",
+    "waiting",
+  ].includes(normalizedDetail);
+  // task.detail is the current task authority. An older phase may have left a
+  // stopped status event in the shared one-task history; it must not complete
+  // the next phase while detail already says that phase is running.
+  if (detailIsKnownNonterminal) {
+    return { failed: false, completed: false };
+  }
+  const detailIsTerminal = detailState.failed || detailState.completed;
+  const failed = detailIsTerminal ? detailState.failed : eventState.failed;
+  return {
+    failed,
+    completed: !failed &&
+      (detailIsTerminal ? detailState.completed : eventState.completed),
+  };
+}
+
+export function phaseTerminalTaskState(
+  eventStatus: string | null | undefined,
+  detailStatus: string | null | undefined,
+) {
+  const eventState = terminalTaskState(eventStatus);
+  const detailState = terminalTaskState(detailStatus);
   const failed = eventState.failed || detailState.failed;
   return {
     failed,
-    completed: !failed && (eventState.completed || detailState.completed),
+    // Both authorities must describe completion for the current token window.
+    // This prevents the previous stopped phase in a one-task conversation from
+    // completing a newly sent phase before it actually stops.
+    completed: !failed && eventState.completed && detailState.completed,
   };
 }
 
@@ -909,13 +958,18 @@ async function loadBuildContext(db: any, operation: SiteOperation) {
 
 async function assertFrozenCredential(
   input: z.infer<typeof operationInputSchema>,
-  getCredential: typeof getPresalesCredentialById,
+  userId: number,
+  getCredential: typeof getDecryptedCredentialForUser,
 ) {
-  const credential = await getCredential(input.manusCredentialId);
-  if (!credential || credential.version !== input.manusCredentialVersion) {
+  const credential = await getCredential(userId, input.manusCredentialId);
+  if (
+    !credential ||
+    credential.userId !== userId ||
+    credential.version !== input.manusCredentialVersion
+  ) {
     throw new SiteOpsManusFailure(
-      "MANUS_CREDENTIAL_VERSION_UNAVAILABLE",
-      "建站任务绑定的 Manus 凭据版本不可用。",
+      "FRONTMIND_CUSTOMER_CREDENTIAL_VERSION_UNAVAILABLE",
+      "当前账号绑定的 AI 建站 API Key 版本不可用。",
       "attention_required",
     );
   }
@@ -939,7 +993,7 @@ async function persistOperationProgress(
       "建站操作缺少有效租约，未调用外部服务。",
     );
   }
-  await db
+  const updated = await db
     .update(siteOperations)
     .set({
       result: state,
@@ -953,9 +1007,90 @@ async function persistOperationProgress(
         eq(siteOperations.leaseOwner, operation.leaseOwner),
       ),
     );
+  const affectedRows = Number(
+    (Array.isArray(updated)
+      ? (updated[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+      : (updated as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+      0,
+  );
+  if (affectedRows !== 1) {
+    throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+  }
 }
 
-async function pollEvents(client: ManusV2Client, taskId: string) {
+async function bindCreatedBuildTask(input: {
+  db: any;
+  operation: SiteOperation;
+  buildId: string;
+  taskId: string;
+  state: ProviderState;
+}) {
+  if (!input.operation.leaseOwner) {
+    throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+  }
+  await input.db.transaction(async (tx: any) => {
+    await persistOperationProgress(
+      tx,
+      input.operation,
+      input.state,
+      input.taskId,
+    );
+    const updated = await tx
+      .update(siteBuilds)
+      .set({
+        upstreamManusTaskId: input.taskId,
+        status: "design_compiling",
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(siteBuilds.id, input.buildId),
+          eq(siteBuilds.userId, input.operation.userId),
+          or(
+            isNull(siteBuilds.upstreamManusTaskId),
+            eq(siteBuilds.upstreamManusTaskId, input.taskId),
+          ),
+        ),
+      );
+    const affectedRows = Number(
+      (Array.isArray(updated)
+        ? (updated[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+        : (updated as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+        0,
+    );
+    if (affectedRows !== 1) {
+      throw new Error("SITEOPS_BUILD_TASK_BINDING_CONFLICT");
+    }
+  });
+}
+
+function currentPhaseEvents(
+  events: readonly ManusV2MessageEvent[],
+  operationToken: string,
+) {
+  const ordered = orderManusV2EventsByProviderRank(events, "oldest_first");
+  let start = -1;
+  for (let index = 0; index < ordered.length; index += 1) {
+    if (manusV2EventOperationToken(ordered[index]!) === operationToken) {
+      start = index;
+    }
+  }
+  if (start < 0) return [];
+  let end = ordered.length;
+  for (let index = start + 1; index < ordered.length; index += 1) {
+    if (manusV2EventOperationToken(ordered[index]!) !== null) {
+      end = index;
+      break;
+    }
+  }
+  return ordered.slice(start + 1, end);
+}
+
+async function pollEvents(
+  client: ManusV2Client,
+  taskId: string,
+  operationToken: string,
+) {
   const [detail, events] = await Promise.all([
     client.taskDetail(taskId),
     client.listAllMessages({ taskId, order: "asc" }),
@@ -963,12 +1098,34 @@ async function pollEvents(client: ManusV2Client, taskId: string) {
   return {
     detail,
     events,
-    state: combinedTerminalTaskState(
-      latestManusV2TaskState(events),
+    state: phaseTerminalTaskState(
+      latestManusV2TaskState(currentPhaseEvents(events, operationToken)),
       detail.status,
     ),
     waiting: latestManusV2WaitingDetail(events),
   };
+}
+
+async function resolveBuildWireValue(input: {
+  events: readonly ManusV2MessageEvent[];
+  operationToken: string;
+  phase: SiteOpsWireOutputPhase;
+  expectedFilename: string;
+  taskCompleted: boolean;
+  signal: AbortSignal;
+}) {
+  try {
+    const resolved = await resolveSiteOpsWireOutput(input);
+    return { value: resolved?.value ?? null, invalid: false as const };
+  } catch (error) {
+    if (error instanceof SiteOpsWireOutputResolutionError) {
+      if (error.code === "SITEOPS_WIRE_OUTPUT_UNAVAILABLE") {
+        return { value: null, invalid: false as const };
+      }
+      return { value: null, invalid: true as const };
+    }
+    throw error;
+  }
 }
 
 export function messageAskUserWaiting(
@@ -1024,13 +1181,14 @@ async function scheduleRepair(input: {
   handledWaitingAt?: string;
 }) {
   const attempt = input.build.repairAttempts + 1;
-  if (attempt > 3) {
-    throw new SiteOpsManusFailure(
-      "FRONTMIND_BUILD_OUTPUT_INVALID",
-      "同一 FrontMind AI 建站任务已自动修复 3 次，仍未通过结构或 QA 校验。",
-      "failed",
-    );
-  }
+  if (attempt > 3)
+    return {
+      status: "failed",
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      message:
+        "同一 FrontMind AI 建站任务已自动修复 3 次，仍未通过结构或 QA 校验。",
+      providerTaskId: input.taskId,
+    } satisfies SiteOpsProviderResult;
   await input.db
     .update(siteBuilds)
     .set({ repairAttempts: attempt, updatedAt: new Date() })
@@ -1065,7 +1223,9 @@ async function persistBuildArtifacts(
   operation: SiteOperation,
   materialized: Awaited<ReturnType<typeof materializeAstroSite>>,
   persist: typeof persistSiteOpsArtifact,
+  assertExecutionActive: () => Promise<void>,
 ) {
+  await assertExecutionActive();
   const common = { userId: operation.userId, projectId: operation.projectId };
   const [contract, source, dist, qa, provenance] = await Promise.all([
     persist({
@@ -1117,6 +1277,7 @@ async function persistBuildArtifacts(
       "failed",
     );
   }
+  await assertExecutionActive();
   await db
     .update(siteBuilds)
     .set({
@@ -1186,7 +1347,8 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
       return {
         status: "attention_required",
         code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
-        message: "FrontMind AI 建站服务配置暂不可用，请由系统管理员检查配置。",
+        message:
+          "当前账号的 AI 建站 API Key 无法通过连接验证，请联系系统管理员检查该账号配置。",
       };
     }
     return {
@@ -1206,7 +1368,8 @@ export function createManusSiteOpsProviderHandler(
   dependencies: ManusProviderDependencies = {},
 ): SiteOpsProviderHandler {
   const dbGetter = dependencies.getDb ?? getDb;
-  const getCredential = dependencies.getCredential ?? getPresalesCredentialById;
+  const getCredential =
+    dependencies.getCredential ?? getDecryptedCredentialForUser;
   const createClient =
     dependencies.createClient ??
     ((input) =>
@@ -1223,8 +1386,14 @@ export function createManusSiteOpsProviderHandler(
   const materialize = dependencies.materializeSite ?? materializeAstroSite;
   const socialGenerate = dependencies.generateSocial ?? generateSocialPackage;
 
-  return async ({ operation }) => {
+  return async ({ operation, signal, assertLeaseActive }) => {
     try {
+      const assertExecutionActive = async () => {
+        signal.throwIfAborted();
+        await assertLeaseActive?.();
+        signal.throwIfAborted();
+      };
+      await assertExecutionActive();
       const db = await dbGetter();
       if (!db)
         throw new SiteOpsManusFailure(
@@ -1232,7 +1401,11 @@ export function createManusSiteOpsProviderHandler(
           "AI 建站数据库暂时不可用。",
         );
       const input = operationInputSchema.parse(operation.input);
-      const credential = await assertFrozenCredential(input, getCredential);
+      const credential = await assertFrozenCredential(
+        input,
+        operation.userId,
+        getCredential,
+      );
       const client = createClient({
         apiKey: credential.apiKey,
         credentialId: credential.id,
@@ -1292,6 +1465,7 @@ export function createManusSiteOpsProviderHandler(
               stage: "create_unknown",
             });
             try {
+              await assertExecutionActive();
               const created = await client.createTask({
                 title: operationTitle(operation),
                 prompt,
@@ -1306,6 +1480,7 @@ export function createManusSiteOpsProviderHandler(
                   }),
                 ],
                 locale: "zh-CN",
+                agentProfile: managedAgentProfileModel(input.agentProfile),
                 structuredOutputSchema: socialOutputSchema(
                   token,
                   context.package.channel,
@@ -1319,20 +1494,30 @@ export function createManusSiteOpsProviderHandler(
               }
               throw error;
             }
-            await persistOperationProgress(
-              db,
-              operation,
-              { schemaVersion: 1, stage: "content_pending", taskId },
-              taskId,
-            );
+            try {
+              await persistOperationProgress(
+                db,
+                operation,
+                { schemaVersion: 1, stage: "content_pending", taskId },
+                taskId,
+              );
+            } catch (error) {
+              const code = error instanceof Error ? error.message : "";
+              if (/^SITEOPS_OPERATION_LEASE_(?:LOST|EXPIRED)$/u.test(code)) {
+                throw error;
+              }
+              return pending({ schemaVersion: 1, stage: "create_unknown" });
+            }
             return pending(
               { schemaVersion: 1, stage: "content_pending", taskId },
               taskId,
             );
           }
         }
-        const polled = await pollEvents(client, taskId);
-        const value = acceptedStructuredValue(polled.events, token);
+        await assertExecutionActive();
+        const polled = await pollEvents(client, taskId, token);
+        await assertExecutionActive();
+        const value = acceptedSocialStructuredValue(polled.events, token);
         if (!value) {
           if (polled.waiting)
             throw new SiteOpsManusFailure(
@@ -1389,7 +1574,9 @@ export function createManusSiteOpsProviderHandler(
             "failed",
           );
         }
+        await assertExecutionActive();
         const generated = await socialGenerate(generatedInput);
+        await assertExecutionActive();
         const archive = await persist({
           userId: operation.userId,
           projectId: operation.projectId,
@@ -1410,13 +1597,14 @@ export function createManusSiteOpsProviderHandler(
             }),
           ),
         );
+        await assertExecutionActive();
         if (archive.contentSha256 !== generated.archiveSha256)
           throw new SiteOpsManusFailure(
             "SOCIAL_ARCHIVE_HASH_MISMATCH",
             "社媒 ZIP 写入校验失败。",
             "failed",
           );
-        await db
+        const packageUpdated = await db
           .update(socialPackages)
           .set({
             manifest: generated.manifest,
@@ -1429,6 +1617,17 @@ export function createManusSiteOpsProviderHandler(
             updatedAt: new Date(),
           })
           .where(eq(socialPackages.id, context.package.id));
+        const packageAffectedRows = Number(
+          (Array.isArray(packageUpdated)
+            ? (packageUpdated[0] as { affectedRows?: unknown } | undefined)
+                ?.affectedRows
+            : (packageUpdated as { affectedRows?: unknown } | undefined)
+                ?.affectedRows) ?? 0,
+        );
+        if (packageAffectedRows !== 1) {
+          throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+        }
+        await assertExecutionActive();
         return {
           status: "succeeded",
           providerTaskId: taskId,
@@ -1592,6 +1791,41 @@ export function createManusSiteOpsProviderHandler(
               "design_compiling",
             );
           taskId = found.id;
+          const designPendingState: ProviderState = {
+            schemaVersion: 1,
+            stage: "design_pending",
+            taskId,
+          };
+          try {
+            await bindCreatedBuildTask({
+              db,
+              operation,
+              buildId: context.build.id,
+              taskId,
+              state: designPendingState,
+            });
+          } catch (error) {
+            const code = error instanceof Error ? error.message : "";
+            if (/^SITEOPS_OPERATION_LEASE_(?:LOST|EXPIRED)$/u.test(code)) {
+              throw error;
+            }
+            if (code === "SITEOPS_BUILD_TASK_BINDING_CONFLICT") {
+              throw new SiteOpsManusFailure(
+                "FRONTMIND_BUILD_RESULT_PENDING",
+                "FrontMind AI 建站任务坐标仍在确认中，系统不会重复创建任务。",
+              );
+            }
+            return pending(
+              { schemaVersion: 1, stage: "create_unknown" },
+              undefined,
+              "design_compiling",
+            );
+          }
+          return pending(
+            designPendingState,
+            taskId,
+            "design_compiling",
+          );
         } else {
           const workflowPackage = await loadVerifiedSiteOpsWorkflowPackage();
           const previewArtifact = await readArtifact({
@@ -1661,7 +1895,7 @@ export function createManusSiteOpsProviderHandler(
             )),
           ];
           const prompt = promptWithMarker(
-            `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${SITEOPS_WORKFLOW.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。selected-visual.png 是主视觉参考；support-visual 仅作区块或动效参考，全部参考图都不是客户网站素材。请返回 SiteDesignWireV1：为每个 route 输出有序且唯一的 routeSlots，并使用 dossier 中的冻结调色板。不得输出源码、HTML、CSS、依赖、脚本、21st 组件代码或未知事实。`,
+            `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${SITEOPS_WORKFLOW.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。selected-visual.png 是主视觉参考；support-visual 仅作区块或动效参考，全部参考图都不是客户网站素材。请返回 SiteDesignWireV2：为每个 route 输出按数组顺序排列且唯一的 routeSlots，并使用 dossier 中的冻结调色板；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}，作为结构化抽取失败时的受控恢复副本。不得输出源码、HTML、CSS、依赖、脚本、21st 组件代码或未知事实。`,
             designToken,
           );
           await persistOperationProgress(db, operation, {
@@ -1669,11 +1903,13 @@ export function createManusSiteOpsProviderHandler(
             stage: "create_unknown",
           });
           try {
+            await assertExecutionActive();
             const created = await client.createTask({
               title: operationTitle(operation),
               prompt,
               attachments: visualAttachments,
               locale: brief.primaryLanguage,
+              agentProfile: managedAgentProfileModel(input.agentProfile),
               structuredOutputSchema: designOutputSchema(
                 designToken,
                 brief.routes.map((route) => route.id),
@@ -1681,14 +1917,6 @@ export function createManusSiteOpsProviderHandler(
               ),
             });
             taskId = created.taskId;
-            await db
-              .update(siteBuilds)
-              .set({
-                upstreamManusTaskId: taskId,
-                status: "design_compiling",
-                updatedAt: new Date(),
-              })
-              .where(eq(siteBuilds.id, context.build.id));
           } catch (error) {
             if (error instanceof ManusV2ApiError && error.outcomeUnknown)
               return pending(
@@ -1698,14 +1926,41 @@ export function createManusSiteOpsProviderHandler(
               );
             throw error;
           }
-          await persistOperationProgress(
-            db,
-            operation,
-            { schemaVersion: 1, stage: "design_pending", taskId },
+          const designPendingState: ProviderState = {
+            schemaVersion: 1,
+            stage: "design_pending",
             taskId,
-          );
+          };
+          try {
+            await bindCreatedBuildTask({
+              db,
+              operation,
+              buildId: context.build.id,
+              taskId,
+              state: designPendingState,
+            });
+          } catch (error) {
+            const code = error instanceof Error ? error.message : "";
+            if (/^SITEOPS_OPERATION_LEASE_(?:LOST|EXPIRED)$/u.test(code)) {
+              throw error;
+            }
+            if (code === "SITEOPS_BUILD_TASK_BINDING_CONFLICT") {
+              throw new SiteOpsManusFailure(
+                "FRONTMIND_BUILD_RESULT_PENDING",
+                "FrontMind AI 建站任务坐标仍在确认中，系统不会重复创建任务。",
+              );
+            }
+            // create_unknown was durably reserved before task.create. A
+            // transient post-ack DB failure therefore reconciles by the exact
+            // operation token instead of creating a second private task.
+            return pending(
+              { schemaVersion: 1, stage: "create_unknown" },
+              undefined,
+              "design_compiling",
+            );
+          }
           return pending(
-            { schemaVersion: 1, stage: "design_pending", taskId },
+            designPendingState,
             taskId,
             "design_compiling",
           );
@@ -1713,10 +1968,35 @@ export function createManusSiteOpsProviderHandler(
       }
 
       if (context.build.upstreamManusTaskId !== taskId) {
-        await db
+        if (context.build.upstreamManusTaskId !== null) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_RESULT_PENDING",
+            "FrontMind AI 建站任务坐标仍在确认中，系统不会重复创建任务。",
+          );
+        }
+        const updated = await db
           .update(siteBuilds)
           .set({ upstreamManusTaskId: taskId, updatedAt: new Date() })
-          .where(eq(siteBuilds.id, context.build.id));
+          .where(
+            and(
+              eq(siteBuilds.id, context.build.id),
+              eq(siteBuilds.userId, operation.userId),
+              isNull(siteBuilds.upstreamManusTaskId),
+            ),
+          );
+        const affectedRows = Number(
+          (Array.isArray(updated)
+            ? (updated[0] as { affectedRows?: unknown } | undefined)
+                ?.affectedRows
+            : (updated as { affectedRows?: unknown } | undefined)
+                ?.affectedRows) ?? 0,
+        );
+        if (affectedRows !== 1) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_RESULT_PENDING",
+            "FrontMind AI 建站任务坐标仍在确认中，系统不会重复创建任务。",
+          );
+        }
       }
       let repairedContent: unknown = null;
       if (
@@ -1747,8 +2027,8 @@ export function createManusSiteOpsProviderHandler(
         if (state.stage === "repair_send_ready") {
           const repairPrompt = promptWithMarker(
             state.repairKind === "design"
-              ? `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV1 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：重新读取已附加 workflow、source dossier 与视觉参考，完整返回 SiteDesignWireV1。不得输出源码、脚本或未知事实。`
-              : `继续同一个 FrontMind AI 建站任务。上一次 PageContentWireV1 或受信 Astro QA 未通过。第 ${state.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 PageContentWireV1，只能引用允许的 sourceDocumentIds。不得输出源码、脚本或未知事实。`,
+              ? `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV2 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：重新读取已附加 workflow、source dossier 与视觉参考，完整返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本或未知事实。`
+              : `继续同一个 FrontMind AI 建站任务。上一次 PageContentWireV2 或受信 Astro QA 未通过。第 ${state.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 PageContentWireV2，只能引用允许的 sourceDocumentIds，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}。不得输出源码、脚本或未知事实。`,
             repairToken,
           );
           const unknownState: ProviderState = {
@@ -1757,6 +2037,7 @@ export function createManusSiteOpsProviderHandler(
           };
           await persistOperationProgress(db, operation, unknownState, taskId);
           try {
+            await assertExecutionActive();
             await client.sendMessage({
               taskId,
               prompt: repairPrompt,
@@ -1804,8 +2085,26 @@ export function createManusSiteOpsProviderHandler(
             state.repairKind === "design" ? "design_compiling" : "qa_running",
           );
         }
-        const repaired = await pollEvents(client, taskId);
-        const rawRepair = acceptedStructuredValue(repaired.events, repairToken);
+        const repaired = await pollEvents(client, taskId, repairToken);
+        const repairResolution = await resolveBuildWireValue({
+          events: repaired.events,
+          operationToken: repairToken,
+          phase: state.repairKind,
+          expectedFilename: SITEOPS_WIRE_OUTPUT_FILES[state.repairKind],
+          taskCompleted: repaired.state.completed,
+          signal,
+        });
+        if (repairResolution.invalid) {
+          return await scheduleRepair({
+            db,
+            operation,
+            build: context.build,
+            taskId,
+            kind: state.repairKind,
+            design: state.design,
+          });
+        }
+        const rawRepair = repairResolution.value;
         if (!rawRepair) {
           if (repaired.waiting) {
             if (!messageAskUserWaiting(repaired.waiting))
@@ -1832,7 +2131,7 @@ export function createManusSiteOpsProviderHandler(
                 "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
                 "failed",
               );
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1844,7 +2143,7 @@ export function createManusSiteOpsProviderHandler(
             });
           }
           if (repaired.state.failed) {
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1855,7 +2154,7 @@ export function createManusSiteOpsProviderHandler(
           }
           const grace = structuredResultGrace(state, repaired.state.completed);
           if (grace.expired) {
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1892,7 +2191,7 @@ export function createManusSiteOpsProviderHandler(
               "contract_ready",
             );
           } catch {
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1905,8 +2204,25 @@ export function createManusSiteOpsProviderHandler(
       }
       let design = state?.design;
       if (!design && repairedContent === null) {
-        const polled = await pollEvents(client, taskId);
-        const raw = acceptedStructuredValue(polled.events, designToken);
+        const polled = await pollEvents(client, taskId, designToken);
+        const designResolution = await resolveBuildWireValue({
+          events: polled.events,
+          operationToken: designToken,
+          phase: "design",
+          expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.design,
+          taskCompleted: polled.state.completed,
+          signal,
+        });
+        if (designResolution.invalid) {
+          return await scheduleRepair({
+            db,
+            operation,
+            build: context.build,
+            taskId,
+            kind: "design",
+          });
+        }
+        const raw = designResolution.value;
         if (!raw) {
           if (polled.waiting) {
             if (!messageAskUserWaiting(polled.waiting))
@@ -1939,7 +2255,7 @@ export function createManusSiteOpsProviderHandler(
                 "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
                 "failed",
               );
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1950,7 +2266,7 @@ export function createManusSiteOpsProviderHandler(
             });
           }
           if (polled.state.failed) {
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1971,7 +2287,7 @@ export function createManusSiteOpsProviderHandler(
             polled.state.completed,
           );
           if (grace.expired) {
-            return scheduleRepair({
+            return await scheduleRepair({
               db,
               operation,
               build: context.build,
@@ -1992,7 +2308,7 @@ export function createManusSiteOpsProviderHandler(
             designSpec: design.designSpec,
           });
         } catch {
-          return scheduleRepair({
+          return await scheduleRepair({
             db,
             operation,
             build: context.build,
@@ -2059,7 +2375,7 @@ export function createManusSiteOpsProviderHandler(
           qaPolicyVersion: SITEOPS_WORKFLOW.qaPolicyVersion,
         });
         const prompt = promptWithMarker(
-          `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV1，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`,
+          `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`,
           contentToken,
         );
         await persistOperationProgress(
@@ -2074,6 +2390,7 @@ export function createManusSiteOpsProviderHandler(
           taskId,
         );
         try {
+          await assertExecutionActive();
           await client.sendMessage({
             taskId,
             prompt,
@@ -2141,10 +2458,30 @@ export function createManusSiteOpsProviderHandler(
       }
 
       const polled =
-        repairedContent === null ? await pollEvents(client, taskId) : null;
-      const rawContent =
-        repairedContent ??
-        acceptedStructuredValue(polled!.events, contentToken);
+        repairedContent === null
+          ? await pollEvents(client, taskId, contentToken)
+          : null;
+      const contentResolution = polled
+        ? await resolveBuildWireValue({
+            events: polled.events,
+            operationToken: contentToken,
+            phase: "content",
+            expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.content,
+            taskCompleted: polled.state.completed,
+            signal,
+          })
+        : null;
+      if (contentResolution?.invalid) {
+        return await scheduleRepair({
+          db,
+          operation,
+          build: context.build,
+          taskId,
+          kind: "content",
+          design,
+        });
+      }
+      const rawContent = repairedContent ?? contentResolution?.value ?? null;
       if (!rawContent) {
         if (polled!.waiting) {
           if (!messageAskUserWaiting(polled!.waiting))
@@ -2179,7 +2516,7 @@ export function createManusSiteOpsProviderHandler(
               "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
               "failed",
             );
-          return scheduleRepair({
+          return await scheduleRepair({
             db,
             operation,
             build: context.build,
@@ -2191,7 +2528,7 @@ export function createManusSiteOpsProviderHandler(
           });
         }
         if (polled!.state.failed) {
-          return scheduleRepair({
+          return await scheduleRepair({
             db,
             operation,
             build: context.build,
@@ -2214,7 +2551,7 @@ export function createManusSiteOpsProviderHandler(
           polled!.state.completed,
         );
         if (grace.expired) {
-          return scheduleRepair({
+          return await scheduleRepair({
             db,
             operation,
             build: context.build,
@@ -2243,7 +2580,7 @@ export function createManusSiteOpsProviderHandler(
           routes: contentResult.pageContent.routes,
         });
       } catch {
-        return scheduleRepair({
+        return await scheduleRepair({
           db,
           operation,
           build: context.build,
@@ -2258,6 +2595,7 @@ export function createManusSiteOpsProviderHandler(
         .where(eq(siteBuilds.id, context.build.id));
       let materialized: Awaited<ReturnType<typeof materializeAstroSite>>;
       try {
+        await assertExecutionActive();
         materialized = await materialize({
           build: context.build,
           snapshot: { ...context.snapshot, documents },
@@ -2269,6 +2607,7 @@ export function createManusSiteOpsProviderHandler(
           brandAsset,
           mode: "preview",
         });
+        await assertExecutionActive();
       } catch (error) {
         const code = error instanceof Error ? error.message : "";
         if (
@@ -2276,7 +2615,7 @@ export function createManusSiteOpsProviderHandler(
             code,
           )
         ) {
-          return scheduleRepair({
+          return await scheduleRepair({
             db,
             operation,
             build: context.build,
@@ -2296,6 +2635,7 @@ export function createManusSiteOpsProviderHandler(
         operation,
         materialized,
         persist,
+        assertExecutionActive,
       );
       return {
         status: "succeeded",
@@ -2318,6 +2658,13 @@ export function createManusSiteOpsProviderHandler(
         message: "原生 Astro 官网已完成构建和 QA，可以在私有预览中检查并批准。",
       };
     } catch (error) {
+      if (signal.aborted) throw error;
+      if (
+        error instanceof Error &&
+        /^SITEOPS_OPERATION_LEASE_(?:LOST|EXPIRED)$/u.test(error.message)
+      ) {
+        throw error;
+      }
       console.error("[siteops-manus] provider_failed", {
         event: "siteops_manus_provider_failed",
         operationId: operation.id,

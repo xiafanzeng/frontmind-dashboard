@@ -57,7 +57,26 @@ export const SITEOPS_MATERIALIZER_V1_4 = {
   qaPolicyVersion: "siteops-qa-v1",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_4;
+/** FrontMind 1.5 removes redundant provider-owned SEO/order fields while
+ * retaining the same strict canonical specifications and trusted host. */
+export const SITEOPS_MATERIALIZER_V1_5 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "1.5.0",
+  runtimeManifestSha256:
+    "4c7230dc43444e51eb6e87c531168a401f3ce0e787ec70b3e1070671daeb8248",
+  starterVersion: "1.5.0",
+  starterSha256:
+    "07e07aa3618e8967e120cba6b68897b4b73d8a7a79edbfd10f747bb69d75ba69",
+  componentLibraryVersion: "1.0.0",
+  materializerVersion: "1.0.0",
+  materializerSha256:
+    "4b28fdd0f22a1a694b2b1248cffdf59c9eb3e37f383ec4bae1e340d1147a351a",
+  qaPolicyVersion: "siteops-qa-v1",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_5;
 
 export const siteOpsProjectStatusSchema = z.enum([
   "draft",

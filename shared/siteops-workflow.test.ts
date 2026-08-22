@@ -165,6 +165,14 @@ describe("siteops workflow", () => {
     }
     expect(
       classifyHeroEligibility({
+        title: "Pricing Hero",
+        description: "Pricing comparison cards",
+        sourceUrl: "https://21st.dev/community/components/pricing-hero",
+        queryAxis: "foundation_split",
+      }).eligible,
+    ).toBe(false);
+    expect(
+      classifyHeroEligibility({
         title: "DevTool Landing Page",
         description: "A modern landing page for developer tools",
         sourceUrl: "https://21st.dev/community/components/devtool",

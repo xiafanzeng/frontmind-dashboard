@@ -260,11 +260,51 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       screen.getByRole("heading", { name: "选择首页 Hero 视觉方向" }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /^Pro/u })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: /^Base/u })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(
+      screen.getByText(/任务会使用当前账号配置的个人 API Key/u),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "选择 B" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "select_visual",
-        input: { sampleId: "candidate-b" },
+        input: {
+          sampleId: "candidate-b",
+          agentProfile: "frontmind-pro",
+        },
+        messageId: "message-1",
+        cardKind: "visual_board",
+      }),
+    );
+  });
+
+  it("freezes the selected Base mode when delegating the visual choice", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onAction={onAction}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: /^Base/u }));
+    expect(screen.getByRole("radio", { name: /^Base/u })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "委托 AI 选择" }));
+
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "delegate_visual",
+        input: { agentProfile: "frontmind-base" },
         messageId: "message-1",
         cardKind: "visual_board",
       }),
@@ -287,7 +327,10 @@ describe("SiteOpsConversationPanel", () => {
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "select_visual",
-        input: { sampleId: "candidate-a" },
+        input: {
+          sampleId: "candidate-a",
+          agentProfile: "frontmind-pro",
+        },
       }),
     );
   });
@@ -308,6 +351,74 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "委托 AI 选择" })).toBeNull();
+    expect(screen.getByText("已随官网版本锁定")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /^Pro/u })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: /^Base/u })).toBeDisabled();
+  });
+
+  it("restores the build-frozen Base mode after a refresh", async () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "building" },
+          interactionState: "building",
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 1,
+              parentBuildId: null,
+              agentProfile: "frontmind-base",
+              status: "building",
+              previewUrl: null,
+              sourceUrl: null,
+              qaUrl: null,
+              errorCode: null,
+              errorMessage: null,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: /^Base/u })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      ),
+    );
+    expect(screen.getByRole("radio", { name: /^Pro/u })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("requires the current customer's personal AI building key before visual selection", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          providerState: {
+            ...observation().providerState,
+            aiBuilder: {
+              status: "not_configured",
+              reason: "Upstream provider credential is missing.",
+            },
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "请先为当前账号配置个人 AI 建站 API Key，配置完成后才能锁定视觉并开始建站。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "委托 AI 选择" })).toBeDisabled();
+    expect(document.body.textContent).not.toMatch(/21st|Manus|Upstream/iu);
   });
 
   it("selects an immutable knowledge snapshot through a structured action", async () => {
@@ -444,8 +555,9 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
     expect(
-      screen.getByText("请让系统管理员配置 21st API Key。"),
+      screen.getByText("视觉参考服务尚未配置，暂时不能检索视觉方向。"),
     ).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/21st/iu);
     expect(screen.queryByRole("button", { name: /^选择 [A-I]$/u })).toBeNull();
   });
 

@@ -55,8 +55,46 @@ describe("SiteOps public error projection", () => {
     });
     expect(projected).toEqual({
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
-      message: "FrontMind AI 建站任务未能完成，请根据错误码重置后重新开始。",
+      message: "FrontMind AI 建站输出连续未通过结构校验，请重置后重新开始。",
     });
     expect(JSON.stringify(projected)).not.toMatch(/manus/iu);
+  });
+
+  it("normalizes a frozen customer credential failure to the public configuration code", () => {
+    expect(
+      publicSiteOpsErrorProjection({
+        code: "FRONTMIND_CUSTOMER_CREDENTIAL_VERSION_UNAVAILABLE",
+        message: "当前账号绑定的 AI 建站 API Key 版本不可用。",
+        status: "attention_required",
+      }),
+    ).toEqual({
+      code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
+      message: "FrontMind AI 建站服务配置暂不可用，系统已停止继续创建任务。",
+    });
+  });
+
+  it("keeps host QA failures distinct from platform configuration failures", () => {
+    expect(
+      publicSiteOpsErrorProjection({
+        code: "SITEOPS_HOST_MATERIALIZATION_FAILED",
+        message: "受信 Astro 构建或 QA 未完成。",
+        status: "attention_required",
+        forceBuildProvider: true,
+      }),
+    ).toEqual({
+      code: "FRONTMIND_BUILD_QA_FAILED",
+      message: "FrontMind AI 建站未通过网站构建或质量检查，请重置后重新开始。",
+    });
+    expect(
+      publicSiteOpsErrorProjection({
+        code: "MANUS_CREDENTIAL_VERSION_UNAVAILABLE",
+        message: "provider credential unavailable",
+        status: "attention_required",
+        forceBuildProvider: true,
+      }),
+    ).toEqual({
+      code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
+      message: "FrontMind AI 建站服务配置暂不可用，系统已停止继续创建任务。",
+    });
   });
 });

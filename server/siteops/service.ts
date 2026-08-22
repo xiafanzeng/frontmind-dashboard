@@ -16,6 +16,7 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 import {
+  apiCredentials,
   conversations,
   conversationTurns,
   knowledgeBaseSnapshots,
@@ -52,8 +53,18 @@ import {
   visualSearchOperationInputV1Schema,
   type VisualSearchOperationInputV1,
 } from "../../shared/siteops-workflow";
-import type { AuthenticatedUser } from "../auth-service";
+import {
+  managedAgentProfileSchema,
+  normalizeManagedAgentProfile,
+  type ManagedAgentProfile,
+} from "../../shared/manus-agent-profile";
+import {
+  getDecryptedCredentialForUser,
+  type AuthenticatedUser,
+} from "../auth-service";
 import { getDb } from "../db";
+import { ManusV2Client } from "../manus-v2-client";
+import { getPresalesCredentialById } from "../presales-service";
 import { getServicePortal } from "../service-entitlement";
 import { siteOpsProviderConfigured } from "./providers";
 import {
@@ -689,13 +700,16 @@ export function isSiteOpsFailedBuildResettable(input: {
   provenanceLocalAssetId: string | null;
   approvedAt: Date | null;
   hasProviderTask: boolean;
+  providerTaskStopped?: boolean;
 }) {
+  const providerTaskIsSafe = input.hasProviderTask
+    ? input.providerTaskStopped === true && input.upstreamManusTaskId !== null
+    : input.upstreamManusTaskId === null;
   return (
-    input.ordinal === 1 &&
+    input.ordinal >= 1 &&
     input.parentBuildId === null &&
     ["failed", "attention_required"].includes(input.status) &&
-    input.upstreamManusTaskId === null &&
-    !input.hasProviderTask &&
+    providerTaskIsSafe &&
     input.contractLocalAssetId === null &&
     input.contractHash === null &&
     input.sourceLocalAssetId === null &&
@@ -706,6 +720,193 @@ export function isSiteOpsFailedBuildResettable(input: {
     input.provenanceLocalAssetId === null &&
     input.approvedAt === null
   );
+}
+
+type ResetProviderTaskPreflight = {
+  buildId: string;
+  providerTaskId: string;
+  state: "stopped" | "not_stopped" | "unavailable";
+};
+
+export function siteOpsResetCredentialScope(
+  value: unknown,
+): "customer" | "legacy_presales" | null {
+  if (value === "customer") return "customer";
+  // Only operations written before credentialScope existed may use the
+  // service-wide credential for read-only reset inspection.
+  if (value === undefined) return "legacy_presales";
+  return null;
+}
+
+export type SiteOpsResetProviderTaskInspector = (input: {
+  actorId: number;
+  providerTaskId: string;
+  credentialId: string;
+  credentialVersion: number;
+  credentialScope: "customer" | "legacy_presales";
+}) => Promise<"stopped" | "not_stopped" | "unavailable">;
+
+export function isSiteOpsStoppedProviderTaskResetSafe(input: {
+  buildId: string;
+  buildProviderTaskId: string | null;
+  operationProviderTaskIds: string[];
+  operationStatuses: string[];
+  preflight?: ResetProviderTaskPreflight | null;
+}) {
+  if (
+    !input.buildProviderTaskId ||
+    input.operationProviderTaskIds.length === 0 ||
+    input.operationProviderTaskIds.some(
+      (taskId) => taskId !== input.buildProviderTaskId,
+    ) ||
+    input.operationStatuses.some((status) =>
+      ["queued", "running", "outcome_unknown"].includes(status),
+    )
+  ) {
+    return false;
+  }
+  return Boolean(
+    input.preflight?.state === "stopped" &&
+      input.preflight.buildId === input.buildId &&
+      input.preflight.providerTaskId === input.buildProviderTaskId,
+  );
+}
+
+async function defaultResetProviderTaskInspector(input: {
+  actorId: number;
+  providerTaskId: string;
+  credentialId: string;
+  credentialVersion: number;
+  credentialScope: "customer" | "legacy_presales";
+}) {
+  try {
+    const credential =
+      input.credentialScope === "customer"
+        ? await getDecryptedCredentialForUser(input.actorId, input.credentialId)
+        : await getPresalesCredentialById(input.credentialId);
+    if (!credential || credential.version !== input.credentialVersion) {
+      return "unavailable" as const;
+    }
+    const client = new ManusV2Client({
+      baseUrl: process.env.MANUS_API_BASE_URL?.trim() || "https://api.manus.ai",
+      apiKey: credential.apiKey,
+      rateLimitScope: credential.id,
+      timeoutMs: 30_000,
+    });
+    const detail = await client.taskDetail(input.providerTaskId);
+    return detail.status?.trim().toLowerCase() === "stopped"
+      ? ("stopped" as const)
+      : ("not_stopped" as const);
+  } catch {
+    return "unavailable" as const;
+  }
+}
+
+async function prepareResetProviderTaskPreflight(
+  db: any,
+  input: {
+    actorId: number;
+    conversationId: string;
+    inspect: SiteOpsResetProviderTaskInspector;
+  },
+): Promise<ResetProviderTaskPreflight | null> {
+  const projectRows = await db
+    .select({
+      id: siteProjects.id,
+      currentBuildId: siteProjects.currentBuildId,
+    })
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.userId, input.actorId),
+        eq(siteProjects.conversationId, input.conversationId),
+      ),
+    )
+    .limit(1);
+  const project = projectRows[0];
+  if (!project?.currentBuildId) return null;
+  const buildRows = await db
+    .select({
+      id: siteBuilds.id,
+      upstreamTaskId: siteBuilds.upstreamManusTaskId,
+    })
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.id, project.currentBuildId),
+        eq(siteBuilds.projectId, project.id),
+        eq(siteBuilds.userId, input.actorId),
+      ),
+    )
+    .limit(1);
+  const build = buildRows[0];
+  if (!build?.upstreamTaskId) return null;
+  const operationRows = await db
+    .select({
+      providerTaskId: siteOperations.providerTaskId,
+      status: siteOperations.status,
+      operationInput: siteOperations.input,
+    })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, project.id),
+        eq(siteOperations.userId, input.actorId),
+        eq(siteOperations.buildId, build.id),
+        isNotNull(siteOperations.providerTaskId),
+      ),
+    )
+    .orderBy(desc(siteOperations.createdAt))
+    .limit(10);
+  const matching = operationRows.filter(
+    (row: { providerTaskId: string | null }) =>
+      row.providerTaskId === build.upstreamTaskId,
+  );
+  if (
+    matching.length === 0 ||
+    operationRows.some(
+      (row: { providerTaskId: string | null }) =>
+        row.providerTaskId !== build.upstreamTaskId,
+    ) ||
+    matching.some((row: { status: string }) =>
+      ["queued", "running", "outcome_unknown"].includes(row.status),
+    )
+  ) {
+    return {
+      buildId: build.id,
+      providerTaskId: build.upstreamTaskId,
+      state: "not_stopped",
+    };
+  }
+  const frozen = (matching[0]?.operationInput ?? {}) as Record<string, unknown>;
+  const credentialId =
+    typeof frozen.manusCredentialId === "string"
+      ? frozen.manusCredentialId
+      : "";
+  const credentialVersion = Number(frozen.manusCredentialVersion);
+  const credentialScope = siteOpsResetCredentialScope(frozen.credentialScope);
+  if (
+    !credentialId ||
+    !Number.isSafeInteger(credentialVersion) ||
+    !credentialScope
+  ) {
+    return {
+      buildId: build.id,
+      providerTaskId: build.upstreamTaskId,
+      state: "unavailable",
+    };
+  }
+  return {
+    buildId: build.id,
+    providerTaskId: build.upstreamTaskId,
+    state: await input.inspect({
+      actorId: input.actorId,
+      providerTaskId: build.upstreamTaskId,
+      credentialId,
+      credentialVersion,
+      credentialScope,
+    }),
+  };
 }
 
 async function appendMessage(
@@ -761,33 +962,49 @@ async function loadOwnedProject(
   return rows[0] ?? null;
 }
 
-async function loadProviderState(executor: any, projectId: string) {
-  const [credentials, connections] = await Promise.all([
-    executor
-      .select({ slot: presalesApiCredentials.slot })
-      .from(presalesApiCredentials)
-      .where(
-        and(
-          inArray(presalesApiCredentials.slot, [
-            "website",
-            "site_builder_21st",
-          ]),
-          eq(presalesApiCredentials.status, "active"),
-          eq(presalesApiCredentials.validationStatus, "verified"),
+async function loadProviderState(
+  executor: any,
+  input: { projectId: string; userId: number },
+) {
+  const [twentyFirstCredentials, aiBuilderCredentials, connections] =
+    await Promise.all([
+      executor
+        .select({ slot: presalesApiCredentials.slot })
+        .from(presalesApiCredentials)
+        .where(
+          and(
+            eq(presalesApiCredentials.slot, "site_builder_21st"),
+            eq(presalesApiCredentials.status, "active"),
+            eq(presalesApiCredentials.validationStatus, "verified"),
+          ),
         ),
-      ),
-    executor
-      .select({ status: siteProviderConnections.status })
-      .from(siteProviderConnections)
-      .where(
-        and(
-          eq(siteProviderConnections.projectId, projectId),
-          eq(siteProviderConnections.provider, "aliyun_cn"),
-        ),
-      )
-      .limit(1),
-  ]);
-  const slots = new Set(credentials.map((row: { slot: string }) => row.slot));
+      executor
+        .select({ id: apiCredentials.id })
+        .from(apiCredentials)
+        .where(
+          and(
+            eq(apiCredentials.userId, input.userId),
+            eq(apiCredentials.status, "active"),
+            eq(apiCredentials.validationStatus, "verified"),
+            isNotNull(apiCredentials.verifiedAt),
+            isNull(apiCredentials.deletedAt),
+          ),
+        )
+        .orderBy(desc(apiCredentials.version))
+        .limit(1),
+      executor
+        .select({ status: siteProviderConnections.status })
+        .from(siteProviderConnections)
+        .where(
+          and(
+            eq(siteProviderConnections.projectId, input.projectId),
+            eq(siteProviderConnections.provider, "aliyun_cn"),
+          ),
+        )
+        .limit(1),
+    ]);
+  const hasTwentyFirstCredential = twentyFirstCredentials.length > 0;
+  const hasAiBuilderCredential = aiBuilderCredentials.length > 0;
   const aliyunFeatureEnabled =
     process.env.FRONTMIND_ALIYUN_DOMAIN_ENABLED?.trim() === "1";
   const aliyunRolePrincipalConfigured = Boolean(
@@ -803,20 +1020,20 @@ async function loadProviderState(executor: any, projectId: string) {
   });
   return {
     twentyFirst: {
-      status: slots.has("site_builder_21st")
+      status: hasTwentyFirstCredential
         ? ("configured" as const)
         : ("not_configured" as const),
-      reason: slots.has("site_builder_21st")
+      reason: hasTwentyFirstCredential
         ? undefined
         : "系统管理员尚未配置有效的 21st API Key",
     },
     aiBuilder: {
-      status: slots.has("website")
+      status: hasAiBuilderCredential
         ? ("configured" as const)
         : ("not_configured" as const),
-      reason: slots.has("website")
+      reason: hasAiBuilderCredential
         ? undefined
-        : "系统管理员尚未配置有效的官网任务 API Key",
+        : "当前账号尚未配置有效的 AI 建站 API Key",
     },
     esa: {
       status: esa.configured
@@ -887,6 +1104,7 @@ async function projectObservation(
     unresolvedFinancialRows,
     resetOperationRows,
     providerTaskRows,
+    buildAgentProfileRows,
     activeDnsRecordRows,
   ] = await Promise.all([
     executor
@@ -928,7 +1146,10 @@ async function projectObservation(
       )
       .orderBy(desc(socialPackages.createdAt))
       .limit(50),
-    loadProviderState(executor, input.project.id),
+    loadProviderState(executor, {
+      projectId: input.project.id,
+      userId: input.userId,
+    }),
     executor
       .select()
       .from(knowledgeBaseSnapshots)
@@ -1045,6 +1266,7 @@ async function projectObservation(
       .select({
         buildId: siteOperations.buildId,
         providerTaskId: siteOperations.providerTaskId,
+        status: siteOperations.status,
       })
       .from(siteOperations)
       .where(
@@ -1055,6 +1277,22 @@ async function projectObservation(
         ),
       )
       .limit(50),
+    executor
+      .select({
+        buildId: siteOperations.buildId,
+        input: siteOperations.input,
+      })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.project.id),
+          eq(siteOperations.userId, input.userId),
+          inArray(siteOperations.kind, ["site_build", "build_revision"]),
+          isNotNull(siteOperations.buildId),
+        ),
+      )
+      .orderBy(desc(siteOperations.createdAt))
+      .limit(100),
     executor
       .select({ id: siteDnsRecords.id })
       .from(siteDnsRecords)
@@ -1080,6 +1318,21 @@ async function projectObservation(
         .orderBy(asc(websiteStyleSamples.sortOrder))
         .limit(9)
     : [];
+  const buildAgentProfiles = new Map<string, ManagedAgentProfile>();
+  for (const row of buildAgentProfileRows as Array<{
+    buildId: string | null;
+    input: unknown;
+  }>) {
+    if (!row.buildId || buildAgentProfiles.has(row.buildId)) continue;
+    const operationInput =
+      row.input && typeof row.input === "object" && !Array.isArray(row.input)
+        ? (row.input as Record<string, unknown>)
+        : {};
+    const profile = managedAgentProfileSchema.safeParse(
+      operationInput.agentProfile,
+    );
+    if (profile.success) buildAgentProfiles.set(row.buildId, profile.data);
+  }
 
   const messagesProjected = messageRows.map(
     (row: typeof messages.$inferSelect) => {
@@ -1141,6 +1394,24 @@ async function projectObservation(
     (row: typeof siteBuilds.$inferSelect) =>
       row.id === input.project.currentBuildId,
   );
+  const currentProviderTaskRows = currentBuild
+    ? providerTaskRows.filter(
+        (row: {
+          buildId: string | null;
+          providerTaskId: string | null;
+          status: string;
+        }) => row.buildId === currentBuild.id && Boolean(row.providerTaskId),
+      )
+    : [];
+  const providerTaskCanBeCheckedBeforeReset = Boolean(
+    currentBuild?.upstreamManusTaskId &&
+      currentProviderTaskRows.length > 0 &&
+      currentProviderTaskRows.every(
+        (row: { providerTaskId: string | null; status: string }) =>
+          row.providerTaskId === currentBuild.upstreamManusTaskId &&
+          !["queued", "running", "outcome_unknown"].includes(row.status),
+      ),
+  );
   const resettableFailedBuild = Boolean(
     currentBuild &&
       activeBuildRows.length === 1 &&
@@ -1150,6 +1421,7 @@ async function projectObservation(
           (row: { buildId: string | null; providerTaskId: string | null }) =>
             row.buildId === currentBuild.id && Boolean(row.providerTaskId),
         ),
+        providerTaskStopped: providerTaskCanBeCheckedBeforeReset,
       }),
   );
   const resetCapability = siteOpsResetCapability({
@@ -1374,6 +1646,7 @@ async function projectObservation(
         id: row.id,
         parentBuildId: row.parentBuildId,
         ordinal: row.ordinal,
+        agentProfile: buildAgentProfiles.get(row.id) ?? null,
         status: row.status,
         previewUrl: row.distLocalAssetId
           ? `/api/site-ops/builds/${row.id}/preview/`
@@ -1800,12 +2073,21 @@ export function parseSiteOpsActionPayload(
     case "dns_plan":
       return z.object({}).strict().parse(raw);
     case "select_visual":
-      return z.object({ sampleId: uuidSchema }).strict().parse(raw);
+      return z
+        .object({
+          sampleId: uuidSchema,
+          agentProfile: managedAgentProfileSchema,
+        })
+        .strict()
+        .parse(raw);
     case "delegate_visual":
       // The public observation intentionally does not expose the internal
       // batch id. The server resolves the newest active board for this
       // project and then makes the deterministic highest-score choice.
-      return z.object({}).strict().parse(raw);
+      return z
+        .object({ agentProfile: managedAgentProfileSchema })
+        .strict()
+        .parse(raw);
     case "approve_build":
       return z.object({ buildId: uuidSchema }).strict().parse(raw);
     case "request_revision":
@@ -1954,7 +2236,7 @@ export function parseSiteOpsActionPayload(
 
 async function ensureActiveProviderCredential(
   tx: any,
-  slot: "website" | "site_builder_21st",
+  slot: "site_builder_21st",
 ) {
   const rows = await tx
     .select()
@@ -1972,13 +2254,72 @@ async function ensureActiveProviderCredential(
   if (!row) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      slot === "site_builder_21st"
-        ? "系统管理员尚未配置有效的 21st API Key。"
-        : "系统管理员尚未配置有效的官网任务 API Key。",
+      "系统管理员尚未配置有效的 21st API Key。",
       412,
     );
   }
   return row;
+}
+
+async function ensureActiveCustomerAiCredential(tx: any, userId: number) {
+  const rows = await tx
+    .select()
+    .from(apiCredentials)
+    .where(
+      and(
+        eq(apiCredentials.userId, userId),
+        eq(apiCredentials.status, "active"),
+        eq(apiCredentials.validationStatus, "verified"),
+        isNotNull(apiCredentials.verifiedAt),
+        isNull(apiCredentials.deletedAt),
+      ),
+    )
+    .orderBy(desc(apiCredentials.version))
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    throw new SiteOpsServiceError(
+      "PROVIDER_NOT_CONFIGURED",
+      "当前账号尚未配置有效的 AI 建站 API Key。",
+      412,
+    );
+  }
+  return row;
+}
+
+export function resolveSiteOpsAgentProfile(input: {
+  requested?: unknown;
+  parentOperationInput?: unknown;
+  credentialDefault?: unknown;
+}): ManagedAgentProfile {
+  const requested = managedAgentProfileSchema.safeParse(input.requested);
+  if (requested.success) return requested.data;
+  const parentInput =
+    input.parentOperationInput &&
+    typeof input.parentOperationInput === "object" &&
+    !Array.isArray(input.parentOperationInput)
+      ? (input.parentOperationInput as Record<string, unknown>)
+      : {};
+  const parent = managedAgentProfileSchema.safeParse(parentInput.agentProfile);
+  if (parent.success) return parent.data;
+  return normalizeManagedAgentProfile(input.credentialDefault);
+}
+
+export function freezeSiteOpsCustomerAiCredential(input: {
+  credential: { id: string; version: number; agentProfile?: unknown };
+  requestedProfile?: unknown;
+  parentOperationInput?: unknown;
+}) {
+  return {
+    manusCredentialId: input.credential.id,
+    manusCredentialVersion: input.credential.version,
+    credentialScope: "customer" as const,
+    agentProfile: resolveSiteOpsAgentProfile({
+      requested: input.requestedProfile,
+      parentOperationInput: input.parentOperationInput,
+      credentialDefault: input.credential.agentProfile,
+    }),
+  };
 }
 
 export async function resolvePinnedTwentyFirstCredentialForBatch(
@@ -2142,6 +2483,7 @@ async function handleResetWorkflow(
     requestId: string;
     requestHash: string;
     payload: { confirmed: true };
+    providerTaskPreflight: ResetProviderTaskPreflight | null;
   },
 ) {
   const nonterminalOperationRows = await tx
@@ -2178,6 +2520,7 @@ async function handleResetWorkflow(
     .select({
       buildId: siteOperations.buildId,
       providerTaskId: siteOperations.providerTaskId,
+      status: siteOperations.status,
     })
     .from(siteOperations)
     .where(
@@ -2237,6 +2580,29 @@ async function handleResetWorkflow(
     (row: typeof siteBuilds.$inferSelect) =>
       row.id === input.project.currentBuildId,
   );
+  const currentProviderTaskRows = currentBuild
+    ? providerTaskRows.filter(
+        (row: {
+          buildId: string | null;
+          providerTaskId: string | null;
+          status: string;
+        }) => row.buildId === currentBuild.id && Boolean(row.providerTaskId),
+      )
+    : [];
+  const providerTaskStopped = currentBuild
+    ? isSiteOpsStoppedProviderTaskResetSafe({
+        buildId: currentBuild.id,
+        buildProviderTaskId: currentBuild.upstreamManusTaskId,
+        operationProviderTaskIds: currentProviderTaskRows.flatMap(
+          (row: { providerTaskId: string | null }) =>
+            row.providerTaskId ? [row.providerTaskId] : [],
+        ),
+        operationStatuses: currentProviderTaskRows.map(
+          (row: { status: string }) => row.status,
+        ),
+        preflight: input.providerTaskPreflight,
+      })
+    : false;
   const resettableFailedBuild = Boolean(
     currentBuild &&
       activeBuildRows.length === 1 &&
@@ -2246,6 +2612,7 @@ async function handleResetWorkflow(
           (row: { buildId: string | null; providerTaskId: string | null }) =>
             row.buildId === currentBuild.id && Boolean(row.providerTaskId),
         ),
+        providerTaskStopped,
       }),
   );
   const resetCapability = siteOpsResetCapability({
@@ -2788,6 +3155,7 @@ async function selectVisualSample(
     sampleId?: string;
     batchId?: string;
     delegated: boolean;
+    agentProfile: ManagedAgentProfile;
   },
 ) {
   if (input.project.status !== "awaiting_visual_selection") {
@@ -2937,7 +3305,14 @@ async function selectVisualSample(
     userId: input.actor.id,
     knowledgeSnapshotId: snapshot.id,
   });
-  const manusCredential = await ensureActiveProviderCredential(tx, "website");
+  const aiCredential = await ensureActiveCustomerAiCredential(
+    tx,
+    input.actor.id,
+  );
+  const aiCredentialBinding = freezeSiteOpsCustomerAiCredential({
+    credential: aiCredential,
+    requestedProfile: input.agentProfile,
+  });
   const ordinalRows = await tx
     .select({ ordinal: max(siteBuilds.ordinal) })
     .from(siteBuilds)
@@ -2987,8 +3362,7 @@ async function selectVisualSample(
       styleSampleId: selected.sample.id,
       delegated: input.delegated,
       workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-      manusCredentialId: manusCredential.id,
-      manusCredentialVersion: manusCredential.version,
+      ...aiCredentialBinding,
     },
     kind: "site_build",
     buildId,
@@ -3132,7 +3506,27 @@ async function handleRevision(
       409,
     );
   }
-  const manusCredential = await ensureActiveProviderCredential(tx, "website");
+  const aiCredential = await ensureActiveCustomerAiCredential(
+    tx,
+    input.actor.id,
+  );
+  const parentOperationRows = await tx
+    .select({ input: siteOperations.input })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        eq(siteOperations.buildId, parent.id),
+        inArray(siteOperations.kind, ["site_build", "build_revision"]),
+      ),
+    )
+    .orderBy(desc(siteOperations.createdAt))
+    .limit(1);
+  const aiCredentialBinding = freezeSiteOpsCustomerAiCredential({
+    credential: aiCredential,
+    parentOperationInput: parentOperationRows[0]?.input,
+  });
   const quotaPeriodId = await reserveSiteOpsDeliveryQuota(tx, {
     userId: input.actor.id,
     portal: input.entitlement,
@@ -3175,8 +3569,7 @@ async function handleRevision(
     payload: {
       ...input.payload,
       childBuildId: buildId,
-      manusCredentialId: manusCredential.id,
-      manusCredentialVersion: manusCredential.version,
+      ...aiCredentialBinding,
     },
     kind: "build_revision",
     buildId,
@@ -3486,7 +3879,13 @@ async function handleSocialPackage(
       409,
     );
   }
-  const manusCredential = await ensureActiveProviderCredential(tx, "website");
+  const aiCredential = await ensureActiveCustomerAiCredential(
+    tx,
+    input.actor.id,
+  );
+  const aiCredentialBinding = freezeSiteOpsCustomerAiCredential({
+    credential: aiCredential,
+  });
   const quotaPeriodId = await reserveSiteOpsDeliveryQuota(tx, {
     userId: input.actor.id,
     portal: input.entitlement,
@@ -3503,8 +3902,7 @@ async function handleSocialPackage(
       ...input.payload,
       channel: input.channel,
       packageId,
-      manusCredentialId: manusCredential.id,
-      manusCredentialVersion: manusCredential.version,
+      ...aiCredentialBinding,
     },
     kind: "social_package",
     provider: "manus",
@@ -3879,7 +4277,13 @@ async function handleProviderOperation(
     .where(eq(siteProjects.id, input.project.id));
 }
 
-export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
+export async function actOnSiteOps(
+  actor: AuthenticatedUser,
+  value: unknown,
+  options: {
+    inspectResetProviderTask?: SiteOpsResetProviderTaskInspector;
+  } = {},
+) {
   assertEnabled();
   assertCustomer(actor);
   const entitlement = await requireSiteOpsEntitlement(actor.id);
@@ -3890,6 +4294,20 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
   ) as Record<string, unknown>;
   const requestHash = hashSiteOpsRequest({ action: input.action, payload });
   const db = await requireDb();
+  // A provider task is inspected before the transaction. The transaction then
+  // rechecks the exact build/task ids and every local in-flight boundary before
+  // accepting the immutable stopped result. No network call is made while DB
+  // locks are held.
+  const providerTaskPreflight =
+    input.action === "reset_workflow"
+      ? await prepareResetProviderTaskPreflight(db, {
+          actorId: actor.id,
+          conversationId: input.conversationId,
+          inspect:
+            options.inspectResetProviderTask ??
+            defaultResetProviderTaskInspector,
+        })
+      : null;
   await db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
       tx,
@@ -3966,6 +4384,7 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         await handleResetWorkflow(tx, {
           ...common,
           payload: payload as { confirmed: true },
+          providerTaskPreflight,
         });
         break;
       case "select_snapshot":
@@ -3995,12 +4414,14 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
           ...common,
           sampleId: String(payload.sampleId),
           delegated: false,
+          agentProfile: payload.agentProfile as ManagedAgentProfile,
         });
         break;
       case "delegate_visual":
         await selectVisualSample(tx, {
           ...common,
           delegated: true,
+          agentProfile: payload.agentProfile as ManagedAgentProfile,
         });
         break;
       case "approve_build":

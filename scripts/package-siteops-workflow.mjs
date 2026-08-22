@@ -6,7 +6,7 @@ import JSZip from "jszip";
 
 export const SITEOPS_UPSTREAM_SHA256 =
   "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a";
-export const SITEOPS_RUNTIME_VERSION = "1.4.0";
+export const SITEOPS_RUNTIME_VERSION = "1.5.0";
 
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),

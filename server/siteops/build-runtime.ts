@@ -33,6 +33,7 @@ import {
   SITEOPS_MATERIALIZER_V1_2,
   SITEOPS_MATERIALIZER_V1_3,
   SITEOPS_MATERIALIZER_V1_4,
+  SITEOPS_MATERIALIZER_V1_5,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
@@ -59,7 +60,8 @@ import {
 type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V1_2
   | typeof SITEOPS_MATERIALIZER_V1_3
-  | typeof SITEOPS_MATERIALIZER_V1_4;
+  | typeof SITEOPS_MATERIALIZER_V1_4
+  | typeof SITEOPS_MATERIALIZER_V1_5;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 const MAX_SOURCE_BYTES = 12 * 1024 * 1024;
@@ -1866,6 +1868,10 @@ function materializeAstroSiteV1_4(input: MaterializeAstroSiteInput) {
   return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_4);
 }
 
+function materializeAstroSiteV1_5(input: MaterializeAstroSiteInput) {
+  return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_5);
+}
+
 const productionMaterializerRegistry = [
   {
     workflow: SITEOPS_MATERIALIZER_V1_2,
@@ -1878,6 +1884,10 @@ const productionMaterializerRegistry = [
   {
     workflow: SITEOPS_MATERIALIZER_V1_4,
     materialize: materializeAstroSiteV1_4,
+  },
+  {
+    workflow: SITEOPS_MATERIALIZER_V1_5,
+    materialize: materializeAstroSiteV1_5,
   },
 ] as const;
 

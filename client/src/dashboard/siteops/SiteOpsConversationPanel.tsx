@@ -1,4 +1,5 @@
 import type {
+  SiteOpsAgentProfile,
   SiteOpsMessageProjection,
   SiteOpsObservationV1,
   SiteOpsPublicVisualCandidate,
@@ -31,7 +32,7 @@ import {
   ShieldCheck,
   UserRound,
 } from "lucide-react";
-import { type FormEvent, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import "./siteops-conversation-panel.css";
 
 type SiteOpsActionContext = Pick<
@@ -132,12 +133,17 @@ function actionFromCard(
 function providerMessage(observation: SiteOpsObservationV1) {
   const provider = observation.providerState.twentyFirst;
   if (provider.status === "configured") return null;
-  return (
-    provider.reason ||
-    (provider.status === "not_configured"
-      ? "系统管理员尚未配置 21st API Key，视觉检索暂不可用。"
-      : "21st 连接需要系统管理员处理。")
-  );
+  return provider.status === "not_configured"
+    ? "视觉参考服务尚未配置，暂时不能检索视觉方向。"
+    : "视觉参考服务暂时不可用，请稍后重试或联系系统管理员。";
+}
+
+function aiBuilderMessage(observation: SiteOpsObservationV1) {
+  const provider = observation.providerState.aiBuilder;
+  if (provider.status === "configured") return null;
+  return provider.status === "not_configured"
+    ? "请先为当前账号配置个人 AI 建站 API Key，配置完成后才能锁定视觉并开始建站。"
+    : "当前账号的 AI 建站连接需要处理，恢复后才能锁定视觉并开始建站。";
 }
 
 function visualCandidatePresentation(candidate: SiteOpsPublicVisualCandidate) {
@@ -220,6 +226,8 @@ export default function SiteOpsConversationPanel({
   const [localError, setLocalError] = useState<string | null>(null);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
+  const [managedAgentProfile, setManagedAgentProfile] =
+    useState<SiteOpsAgentProfile>("frontmind-pro");
   const [aliyunAccountUid, setAliyunAccountUid] = useState("");
   const [aliyunRoleArn, setAliyunRoleArn] = useState("");
   const [aliyunSetup, setAliyunSetup] = useState<{
@@ -236,7 +244,7 @@ export default function SiteOpsConversationPanel({
   const [icpNumber, setIcpNumber] = useState("");
   const latestBuild = useMemo(() => {
     const visibleBuilds = observation?.builds.filter(
-      (build) => build.status !== "cancelled",
+      (build) => !["cancelled", "superseded"].includes(build.status),
     );
     return (
       visibleBuilds?.reduce(
@@ -246,6 +254,12 @@ export default function SiteOpsConversationPanel({
       ) ?? null
     );
   }, [observation?.builds]);
+
+  useEffect(() => {
+    if (latestBuild?.agentProfile) {
+      setManagedAgentProfile(latestBuild.agentProfile);
+    }
+  }, [latestBuild?.agentProfile]);
 
   async function runAction(key: string, input: SiteOpsActionContext) {
     if (!onAction || busyAction) return;
@@ -298,6 +312,7 @@ export default function SiteOpsConversationPanel({
       });
       setMessage("");
       setSelectedSnapshotId("");
+      setManagedAgentProfile("frontmind-pro");
       setLocalError(null);
       setResetDialogOpen(false);
     } catch (resetActionError) {
@@ -410,9 +425,15 @@ export default function SiteOpsConversationPanel({
   }
 
   const upstreamMessage = providerMessage(observation);
+  const builderMessage = aiBuilderMessage(observation);
+  const aiBuilderConfigured =
+    observation.providerState.aiBuilder.status === "configured";
   const interactionLocked = Boolean(busyAction || !onAction);
   const visualSelectionOpen =
     observation.interactionState === "awaiting_visual_selection";
+  const agentProfileLocked = interactionLocked || !visualSelectionOpen;
+  const visualSelectionDisabled =
+    interactionLocked || !visualSelectionOpen || !aiBuilderConfigured;
   const currentSnapshotId = observation.project.currentKnowledgeSnapshotId;
   const effectiveSnapshotId = selectedSnapshotId || currentSnapshotId || "";
   const latestQuote = observation.domainOperations.find(
@@ -818,7 +839,9 @@ export default function SiteOpsConversationPanel({
               <Sparkles size={20} aria-hidden="true" />
               <div>
                 <h3 id="siteops-visual-search-title">开始检索视觉方向</h3>
-                <p>可先在下方补充转化目标；准备好后将从 21st 检索真实候选。</p>
+                <p>
+                  可先在下方补充转化目标；准备好后将从视觉目录检索真实候选。
+                </p>
               </div>
             </div>
             <button
@@ -909,7 +932,7 @@ export default function SiteOpsConversationPanel({
                   : "已锁定的首页 Hero 视觉方向"}
               </h3>
               <p>
-                以下均为 21st 目录返回并通过 Hero
+                以下均为视觉目录返回并通过 Hero
                 资格校验的真实预览。选择只决定首页视觉语言，不复制组件代码或示例内容。
               </p>
             </div>
@@ -917,7 +940,7 @@ export default function SiteOpsConversationPanel({
               <button
                 type="button"
                 className="siteops-secondary-button"
-                disabled={interactionLocked}
+                disabled={visualSelectionDisabled}
                 onClick={() =>
                   runAction(
                     "delegate_visual",
@@ -925,7 +948,7 @@ export default function SiteOpsConversationPanel({
                       observation,
                       "visual_board",
                       "delegate_visual",
-                      {},
+                      { agentProfile: managedAgentProfile },
                     ),
                   )
                 }
@@ -934,12 +957,63 @@ export default function SiteOpsConversationPanel({
               </button>
             )}
           </div>
+          <div className="siteops-agent-profile-card">
+            <div className="siteops-agent-profile-heading">
+              <div>
+                <strong>AI 建站模式</strong>
+                <p>
+                  任务会使用当前账号配置的个人 API Key，并出现在该 Key
+                  对应的私有账号中。
+                </p>
+              </div>
+              {!visualSelectionOpen && <span>已随官网版本锁定</span>}
+            </div>
+            <div
+              className="siteops-agent-profile-options"
+              role="radiogroup"
+              aria-label="AI 建站模式"
+            >
+              <button
+                type="button"
+                role="radio"
+                aria-checked={managedAgentProfile === "frontmind-pro"}
+                data-selected={
+                  managedAgentProfile === "frontmind-pro" ? "true" : "false"
+                }
+                disabled={agentProfileLocked}
+                onClick={() => setManagedAgentProfile("frontmind-pro")}
+              >
+                <strong>Pro</strong>
+                <span>适合复杂官网的信息架构与表达</span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={managedAgentProfile === "frontmind-base"}
+                data-selected={
+                  managedAgentProfile === "frontmind-base" ? "true" : "false"
+                }
+                disabled={agentProfileLocked}
+                onClick={() => setManagedAgentProfile("frontmind-base")}
+              >
+                <strong>Base</strong>
+                <span>适合结构清晰的标准企业官网</span>
+              </button>
+            </div>
+            <small>Base / Pro 只对本次不可变官网版本生效。</small>
+            {builderMessage && (
+              <div className="siteops-builder-key-warning" role="status">
+                <AlertCircle size={17} aria-hidden="true" />
+                <span>{builderMessage}</span>
+              </div>
+            )}
+          </div>
           <div className="siteops-visual-grid">
             {observation.visualCandidates.map((candidate) => (
               <VisualCandidateCard
                 key={candidate.id}
                 candidate={candidate}
-                disabled={interactionLocked || !visualSelectionOpen}
+                disabled={visualSelectionDisabled}
                 onSelect={() =>
                   runAction(
                     `visual:${candidate.id}`,
@@ -947,7 +1021,10 @@ export default function SiteOpsConversationPanel({
                       observation,
                       "visual_board",
                       "select_visual",
-                      { sampleId: candidate.id },
+                      {
+                        sampleId: candidate.id,
+                        agentProfile: managedAgentProfile,
+                      },
                     ),
                   )
                 }

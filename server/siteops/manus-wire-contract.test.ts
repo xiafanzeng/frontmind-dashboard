@@ -74,7 +74,7 @@ describe("SiteOps provider wire contracts", () => {
     const design = siteDesignResultFromWire(
       {
         operationToken: "design-token",
-        schemaVersion: 1,
+        schemaVersion: 2,
         layoutArchetype: "split",
         heroVariant: "split_media",
         density: "balanced",
@@ -87,15 +87,13 @@ describe("SiteOps provider wire contracts", () => {
         accentPaletteIndex: 2,
         siteTitle: "星河智造",
         description: "经过知识来源核验的企业官网。",
-        organizationType: "Organization",
         routeSlots: [
-          { routeId: "home", slotId: "cta", variant: "cta", order: 1 },
           {
             routeId: "home",
             slotId: "statement",
             variant: "statement",
-            order: 0,
           },
+          { routeId: "home", slotId: "cta", variant: "cta" },
         ],
       },
       ["home"],
@@ -104,11 +102,12 @@ describe("SiteOps provider wire contracts", () => {
       { slotId: "statement", variant: "statement" },
       { slotId: "cta", variant: "cta" },
     ]);
+    expect(design.designSpec.seoPlan.organizationType).toBe("Organization");
 
     const content = pageContentResultFromWire(
       {
         operationToken: "content-token",
-        schemaVersion: 1,
+        schemaVersion: 2,
         routes: [
           {
             routeId: "home",
@@ -142,6 +141,69 @@ describe("SiteOps provider wire contracts", () => {
       sections: [{ slotId: "statement" }, { slotId: "cta" }],
     });
     expect(content.pageContent.routes[0]).not.toHaveProperty("eyebrow");
+  });
+
+  it("treats the Wire V2 routeSlots array as canonical order without accepting legacy fields", () => {
+    const base = {
+      operationToken: "design-token",
+      schemaVersion: 2,
+      layoutArchetype: "split",
+      heroVariant: "split_media",
+      density: "balanced",
+      surfaceStyle: "bordered",
+      typeScale: "display",
+      imageTreatment: "contained",
+      motionLevel: "subtle",
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 1,
+      accentPaletteIndex: 2,
+      siteTitle: "星河智造",
+      description: "经过知识来源核验的企业官网。",
+    } as const;
+    expect(() =>
+      siteDesignResultFromWire(
+        {
+          ...base,
+          routeSlots: [
+            { routeId: "about", slotId: "proof", variant: "proof" },
+            { routeId: "home", slotId: "statement", variant: "statement" },
+          ],
+        },
+        ["home", "about"],
+      ),
+    ).toThrow("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
+    expect(() =>
+      siteDesignResultFromWire(
+        {
+          ...base,
+          organizationType: "Corporation",
+          routeSlots: [
+            {
+              routeId: "home",
+              slotId: "statement",
+              variant: "statement",
+              order: 0,
+            },
+          ],
+        },
+        ["home"],
+      ),
+    ).toThrow();
+  });
+
+  it("rejects legacy PageContentWireV1 instead of weakening the V2 host boundary", () => {
+    expect(() =>
+      pageContentResultFromWire(
+        {
+          operationToken: "content-token",
+          schemaVersion: 1,
+          routes: [],
+          sections: [],
+        },
+        ["home"],
+        ["overview"],
+      ),
+    ).toThrow();
   });
 
   it("deterministically splits an oversized dossier without truncating document content", () => {

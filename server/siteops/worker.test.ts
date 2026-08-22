@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   domainFinancialTerminalProjection,
   exclusiveSiteOpsLiveHeadProjection,
+  knownSiteOpsBuildFailure,
   siteOpsWorkerMayClaimStatus,
+  siteOpsWorkerExecutionPolicy,
+  terminalSiteOpsOperationProjection,
   unexpectedSiteOpsProviderFailure,
 } from "./worker";
 
@@ -50,6 +53,42 @@ describe("SiteOps financial terminal state", () => {
 });
 
 describe("SiteOps worker claim boundary", () => {
+  it("gives Astro build and QA operations a lease longer than their handler timeout", () => {
+    expect(siteOpsWorkerExecutionPolicy("site_build")).toEqual({
+      timeoutMs: 10 * 60_000,
+      leaseMs: 12 * 60_000,
+    });
+    expect(siteOpsWorkerExecutionPolicy("build_revision")).toEqual({
+      timeoutMs: 10 * 60_000,
+      leaseMs: 12 * 60_000,
+    });
+    expect(siteOpsWorkerExecutionPolicy("visual_search")).toEqual({
+      timeoutMs: 90_000,
+      leaseMs: 2 * 60_000,
+    });
+  });
+
+  it("preserves an already-bound provider task and safe progress at terminal finalize", () => {
+    expect(
+      terminalSiteOpsOperationProjection(
+        {
+          providerOperationId: "provider-operation",
+          providerTaskId: "provider-task",
+          result: { stage: "repair_pending", repairAttempt: 3 },
+        } as never,
+        {
+          status: "failed",
+          code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+          message: "FrontMind AI 建站输出无效。",
+        },
+      ),
+    ).toEqual({
+      providerOperationId: "provider-operation",
+      providerTaskId: "provider-task",
+      result: { stage: "repair_pending", repairAttempt: 3 },
+    });
+  });
+
   it("never reclaims a visual operation atomically cancelled by reset", () => {
     expect(siteOpsWorkerMayClaimStatus("queued")).toBe(true);
     expect(siteOpsWorkerMayClaimStatus("running")).toBe(true);
@@ -67,5 +106,24 @@ describe("SiteOps worker claim boundary", () => {
     });
     expect(JSON.stringify(result)).not.toContain(secret);
     expect(result.message).not.toContain("error.message");
+  });
+
+  it("retains a stable known build failure instead of relabeling it as unknown provider work", () => {
+    const error = Object.assign(
+      new Error("同一 FrontMind AI 建站任务修复后仍未通过结构校验。"),
+      { code: "FRONTMIND_BUILD_OUTPUT_INVALID", status: "failed" },
+    );
+    expect(knownSiteOpsBuildFailure(error)).toEqual({
+      status: "failed",
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      message: "同一 FrontMind AI 建站任务修复后仍未通过结构校验。",
+    });
+    expect(
+      knownSiteOpsBuildFailure(
+        Object.assign(new Error("配置不可用"), {
+          code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
+        }),
+      ),
+    ).toMatchObject({ status: "attention_required" });
   });
 });

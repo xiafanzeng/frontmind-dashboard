@@ -16,16 +16,10 @@ export function publicSiteOpsErrorProjection(input: {
 }) {
   const code = String(input.code ?? "").trim();
   const message = String(input.message ?? "").trim();
-  if (code.startsWith("FRONTMIND_")) {
-    return {
-      code,
-      message: sanitizeFrontMindPublicText(
-        message || "FrontMind AI 建站任务未能完成，请稍后重试。",
-      ),
-    };
-  }
   const isBuildProviderError =
     input.forceBuildProvider === true ||
+    code.startsWith("FRONTMIND_BUILD_") ||
+    code.startsWith("FRONTMIND_CUSTOMER_CREDENTIAL_") ||
     VENDOR_CODE.test(code) ||
     /manus/iu.test(message) ||
     code === "invalid_argument";
@@ -47,7 +41,21 @@ export function publicSiteOpsErrorProjection(input: {
       message: "FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。",
     };
   }
-  if (/(?:AUTH|UNAUTHENTICATED|PERMISSION|FORBIDDEN|CREDENTIAL)/iu.test(code)) {
+  if (
+    /(?:QA|AXE|LIGHTHOUSE|ASTRO|MATERIALIZATION|GENERATED_|CONTENT_)/iu.test(
+      code,
+    )
+  ) {
+    return {
+      code: "FRONTMIND_BUILD_QA_FAILED",
+      message: "FrontMind AI 建站未通过网站构建或质量检查，请重置后重新开始。",
+    };
+  }
+  if (
+    /(?:AUTH|UNAUTHENTICATED|PERMISSION|FORBIDDEN|CREDENTIAL|CONFIGURATION)/iu.test(
+      code,
+    )
+  ) {
     return {
       code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
       message: "FrontMind AI 建站服务配置暂不可用，系统已停止继续创建任务。",

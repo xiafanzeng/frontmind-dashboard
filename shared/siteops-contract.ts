@@ -5,6 +5,9 @@ import {
   siteOpsCardSchema,
   siteOpsProjectStatusSchema,
 } from "./siteops";
+import { managedAgentProfileSchema } from "./manus-agent-profile";
+
+export type SiteOpsAgentProfile = z.infer<typeof managedAgentProfileSchema>;
 
 export const siteOpsKnowledgeSnapshotSchema = z
   .object({
@@ -73,6 +76,7 @@ export const siteOpsBuildProjectionSchema = z
     id: z.string().uuid(),
     ordinal: z.number().int().positive(),
     parentBuildId: z.string().uuid().nullable(),
+    agentProfile: managedAgentProfileSchema.nullable().optional(),
     status: siteOpsBuildStatusSchema,
     previewUrl: z.string().max(2_048).nullable().default(null),
     sourceUrl: z.string().max(2_048).nullable().default(null),

@@ -67,6 +67,12 @@ export type SiteOpsProviderResult =
 export type SiteOpsProviderHandler = (input: {
   operation: SiteOperation;
   signal: AbortSignal;
+  /**
+   * Read-only CAS guard supplied by the worker. Long-running local build/QA
+   * implementations may call it before committing artifacts. Existing
+   * providers can ignore it; finalize still performs the authoritative CAS.
+   */
+  assertLeaseActive?: () => Promise<void>;
 }) => Promise<SiteOpsProviderResult>;
 
 const handlers = new Map<SiteOpsProviderName, SiteOpsProviderHandler>();

@@ -69,7 +69,7 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 1.4.0 Hero and attachment contract", async () => {
+  it("has a current deterministic FrontMind 1.5.0 Hero and attachment contract", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
       version: SITEOPS_RUNTIME_VERSION,
@@ -105,17 +105,21 @@ describe("SiteOps runtime workflow package", () => {
       messageCharacterLimit: 3000,
     });
     expect(runtime.providerWire).toMatchObject({
-      phaseOneSchema: "schemas/site-design-wire-v1.schema.json",
+      phaseOneSchema: "schemas/site-design-wire-v2.schema.json",
       phaseOneCanonical: "SiteDesignSpecV1",
-      phaseTwoSchema: "schemas/page-content-wire-v1.schema.json",
+      phaseOneOutputFilename: "frontmind-site-design-wire-v2.json",
+      phaseTwoSchema: "schemas/page-content-wire-v2.schema.json",
       phaseTwoCanonical: "PageContentSpecV1",
+      phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
       maximumSchemaDepth: 5,
     });
     expect(runtime.aiTask).toMatchObject({
       taskCount: 1,
       sameTaskForBothPhases: true,
-      phaseOneOutput: "SiteDesignWireV1",
-      phaseTwoOutput: "PageContentWireV1",
+      phaseOneOutput: "SiteDesignWireV2",
+      phaseOneOutputFilename: "frontmind-site-design-wire-v2.json",
+      phaseTwoOutput: "PageContentWireV2",
+      phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
     });
     const manifestBytes = await readFile(
       `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/MANIFEST.json`,
@@ -135,11 +139,11 @@ describe("SiteOps runtime workflow package", () => {
     const workflowRoot = `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`;
     const [design, content] = await Promise.all([
       readFile(
-        `${workflowRoot}/schemas/site-design-wire-v1.schema.json`,
+        `${workflowRoot}/schemas/site-design-wire-v2.schema.json`,
         "utf8",
       ),
       readFile(
-        `${workflowRoot}/schemas/page-content-wire-v1.schema.json`,
+        `${workflowRoot}/schemas/page-content-wire-v2.schema.json`,
         "utf8",
       ),
     ]);
@@ -147,5 +151,19 @@ describe("SiteOps runtime workflow package", () => {
     expect(assertProviderWireSchema(JSON.parse(content))).toBeLessThanOrEqual(
       5,
     );
+    const designSchema = JSON.parse(design) as {
+      properties: Record<string, unknown>;
+    };
+    const routeSlotSchema = (
+      designSchema.properties.routeSlots as {
+        items: { properties: Record<string, unknown> };
+      }
+    ).items;
+    expect(designSchema.properties).not.toHaveProperty("organizationType");
+    expect(routeSlotSchema.properties).not.toHaveProperty("order");
+    expect(
+      (JSON.parse(content) as { properties: { schemaVersion: unknown } })
+        .properties.schemaVersion,
+    ).toEqual({ type: "number", enum: [2] });
   });
 });

@@ -17,6 +17,7 @@ import {
   loadVerifiedSiteOpsSocialWorkflowPackage,
   loadVerifiedSiteOpsWorkflowPackage,
   messageAskUserWaiting,
+  phaseTerminalTaskState,
   safePublicDocuments,
   resultFailure,
   structuredResultGrace,
@@ -40,9 +41,11 @@ const operation = {
   clientRequestId: "request-1",
   inputHash: "a".repeat(64),
   input: {
+    credentialScope: "customer",
     buildId: "30000000-0000-4000-8000-000000000003",
     manusCredentialId: "40000000-0000-4000-8000-000000000004",
     manusCredentialVersion: 9,
+    agentProfile: "frontmind-pro",
     feedback: "保持事实不变并调整页面表达。".repeat(200),
   },
   provider: "manus",
@@ -63,6 +66,18 @@ const operation = {
 afterEach(() => vi.restoreAllMocks());
 
 describe("Manus SiteOps provider boundary", () => {
+  it("propagates an aborted worker signal instead of projecting a terminal build failure", async () => {
+    const getDb = vi.fn();
+    const handler = createManusSiteOpsProviderHandler({ getDb });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      handler({ operation: operation as never, signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(getDb).not.toHaveBeenCalled();
+  });
+
   it("treats stopped as completion and waits up to 120 seconds for its structured result", () => {
     expect(terminalTaskState("stopped")).toEqual({
       completed: true,
@@ -87,9 +102,21 @@ describe("Manus SiteOps provider boundary", () => {
       completed: true,
       failed: false,
     });
+    expect(combinedTerminalTaskState("stopped", "running")).toEqual({
+      completed: false,
+      failed: false,
+    });
     expect(combinedTerminalTaskState("stopped", "error")).toEqual({
       completed: false,
       failed: true,
+    });
+    expect(phaseTerminalTaskState("stopped", "stopped")).toEqual({
+      completed: true,
+      failed: false,
+    });
+    expect(phaseTerminalTaskState(null, "stopped")).toEqual({
+      completed: false,
+      failed: false,
     });
     const waitingState = {
       schemaVersion: 1 as const,
@@ -246,7 +273,7 @@ describe("Manus SiteOps provider boundary", () => {
     ]);
   });
 
-  it("packages the hash-verified FrontMind 1.4 workflow with SKILL and runtime contract", async () => {
+  it("packages the hash-verified FrontMind 1.5 workflow with SKILL and runtime contract", async () => {
     const bytes = await loadVerifiedSiteOpsWorkflowPackage();
     const zip = await JSZip.loadAsync(bytes, { checkCRC32: true });
 
@@ -271,7 +298,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(xhs.file("runtime-contract.json")).not.toBeNull();
     expect(readiness).toMatchObject({
       ready: true,
-      website: { version: "1.4.0" },
+      website: { version: "1.5.0" },
       workflows: [
         { channel: "wechat", version: "1.0.0" },
         { channel: "xiaohongshu", version: "1.0.0" },
@@ -343,7 +370,7 @@ describe("Manus SiteOps provider boundary", () => {
     const designToken = `siteops-design:${operation.id}`;
     const designResult = {
       operationToken: designToken,
-      schemaVersion: 1,
+      schemaVersion: 2,
       layoutArchetype: "asymmetric",
       heroVariant: "split_media",
       density: "balanced",
@@ -356,10 +383,7 @@ describe("Manus SiteOps provider boundary", () => {
       accentPaletteIndex: 1,
       siteTitle: "星河智造",
       description: "经过知识来源核验的企业官网。",
-      organizationType: "Organization",
-      routeSlots: [
-        { routeId: "home", slotId: "proof", variant: "proof", order: 0 },
-      ],
+      routeSlots: [{ routeId: "home", slotId: "proof", variant: "proof" }],
     };
     const context = {
       build: {
@@ -525,22 +549,38 @@ describe("Manus SiteOps provider boundary", () => {
     const db = {
       select: () => query,
       update: () => ({
-        set: () => ({ where: async () => undefined }),
+        set: () => ({ where: async () => [{ affectedRows: 1 }] }),
       }),
+      transaction: async (callback: (tx: unknown) => unknown) => callback(db),
     };
     const createTask = vi.fn(async () => ({ taskId: "manus-task-1" }));
     const sendMessage = vi.fn(async () => undefined);
+    let taskStatus = "running";
     const client = {
       createTask,
       sendMessage,
       findCreatedTask: vi.fn(),
-      taskDetail: vi.fn(async () => ({ status: "running" })),
+      taskDetail: vi.fn(async () => ({ status: taskStatus })),
       listAllMessages: vi.fn(async () => [
+        {
+          id: "design-marker",
+          type: "user_message",
+          timestamp: 0,
+          user_message: {
+            content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"siteops-design:${operation.id}"}`,
+          },
+        },
         {
           id: "design-result",
           type: "structured_output_result",
           timestamp: 1,
           structured_output_result: { success: true, value: designResult },
+        },
+        {
+          id: "design-stopped",
+          type: "status_update",
+          timestamp: 2,
+          status_update: { agent_status: "stopped" },
         },
       ]),
     };
@@ -574,6 +614,7 @@ describe("Manus SiteOps provider boundary", () => {
       getCredential: async () =>
         ({
           id: operation.input.manusCredentialId,
+          userId: operation.userId,
           version: operation.input.manusCredentialVersion,
           apiKey: "secret-key",
         }) as never,
@@ -592,6 +633,9 @@ describe("Manus SiteOps provider boundary", () => {
       result: { stage: "design_pending", taskId: "manus-task-1" },
     });
     expect(createTask).toHaveBeenCalledTimes(1);
+    expect(createTask.mock.calls[0]![0]).toMatchObject({
+      agentProfile: "manus-1.6-max",
+    });
     expect(createTask.mock.calls[0]![0].attachments).toHaveLength(5);
     expect(createTask.mock.calls[0]![0].attachments[2]).toMatchObject({
       filename: "selected-visual.png",
@@ -602,7 +646,7 @@ describe("Manus SiteOps provider boundary", () => {
         (attachment: { filename: string }) => attachment.filename,
       ),
     ).toEqual([
-      "frontmind-astro-company-site-workflow-1.4.0.zip",
+      "frontmind-astro-company-site-workflow-1.5.0.zip",
       "frontmind-siteops-source-dossier-v1.json",
       "selected-visual.png",
       "support-visual-1.png",
@@ -613,6 +657,10 @@ describe("Manus SiteOps provider boundary", () => {
     ).toBeLessThanOrEqual(3_000);
     expect(createTask.mock.calls[0]![0].prompt).not.toContain(
       "星河智造提供设备服务",
+    );
+    expect(createTask.mock.calls[0]![0].prompt).toContain("SiteDesignWireV2");
+    expect(createTask.mock.calls[0]![0].prompt).toContain(
+      "frontmind-site-design-wire-v2.json",
     );
     const createBody = buildManusV2CreateTaskBody(createTask.mock.calls[0]![0]);
     expect(createBody.message.content).toHaveLength(6);
@@ -634,6 +682,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(dossier.documents).toHaveLength(56);
     expect(dossier.brief.verifiedFacts).toHaveLength(120);
 
+    taskStatus = "stopped";
     const designed = await handler({
       operation: {
         ...operation,
@@ -675,6 +724,10 @@ describe("Manus SiteOps provider boundary", () => {
     expect(
       Array.from(sendMessage.mock.calls[0]![0].prompt).length,
     ).toBeLessThanOrEqual(3_000);
+    expect(sendMessage.mock.calls[0]![0].prompt).toContain("PageContentWireV2");
+    expect(sendMessage.mock.calls[0]![0].prompt).toContain(
+      "frontmind-page-content-wire-v2.json",
+    );
     const sendBody = buildManusV2SendMessageBody(sendMessage.mock.calls[0]![0]);
     expect(sendBody.task_id).toBe("manus-task-1");
     expect(sendBody.message.content).toHaveLength(3);
@@ -694,17 +747,20 @@ describe("Manus SiteOps provider boundary", () => {
 
   it("uses the immutable credential id and version frozen in the operation", async () => {
     const createClient = vi.fn();
+    const getCredential = vi.fn(async () => ({
+      id: operation.input.manusCredentialId,
+      userId: operation.userId,
+      version: 10,
+      apiKey: "secret-key",
+      fingerprint: "fingerprint",
+      status: "active" as const,
+      verifiedAt: new Date(),
+      agentProfile: "frontmind-pro" as const,
+      upstreamModel: "manus-1.6-max" as const,
+    }));
     const handler = createManusSiteOpsProviderHandler({
       getDb: async () => ({}) as never,
-      getCredential: async () => ({
-        id: operation.input.manusCredentialId,
-        version: 10,
-        apiKey: "secret-key",
-        fingerprint: "fingerprint",
-        status: "active",
-        verifiedAt: new Date(),
-        retiredAt: null,
-      }),
+      getCredential,
       createClient,
     });
 
@@ -715,8 +771,12 @@ describe("Manus SiteOps provider boundary", () => {
 
     expect(result).toMatchObject({
       status: "attention_required",
-      code: "MANUS_CREDENTIAL_VERSION_UNAVAILABLE",
+      code: "FRONTMIND_CUSTOMER_CREDENTIAL_VERSION_UNAVAILABLE",
     });
+    expect(getCredential).toHaveBeenCalledWith(
+      operation.userId,
+      operation.input.manusCredentialId,
+    );
     expect(createClient).not.toHaveBeenCalled();
   });
 

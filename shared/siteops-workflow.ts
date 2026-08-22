@@ -692,6 +692,8 @@ const STRONG_HERO_METADATA =
 const CONDITIONAL_HERO_METADATA = /(?:landing[- ]page|landing\s+page)/iu;
 const NON_HERO_METADATA =
   /(?:^|[^a-z0-9])(?:pricing|sidebar|dashboard|admin|settings?|comparison|compare|table|case[- ]?stud(?:y|ies)|testimonial|timeline|activity|tracker|faq|footer|navbar|navigation|log[- ]?in|sign[- ]?up|auth|checkout|cta)(?:$|[^a-z0-9])/iu;
+const STRONG_NON_HERO_METADATA =
+  /(?:^|[^a-z0-9])(?:pricing|sidebar|dashboard|admin|settings?|comparison|compare|table|case[- ]?stud(?:y|ies)|testimonial|timeline|activity|tracker|faq|footer|navbar|navigation|log[- ]?in|sign[- ]?up|auth|checkout)(?:$|[^a-z0-9])/iu;
 
 function heroVariantForMetadata(
   value: string,
@@ -732,6 +734,14 @@ export function classifyHeroEligibility(
     .join(" ")
     .normalize("NFKC");
   const variant = heroVariantForMetadata(metadata, item.queryAxis);
+  if (STRONG_NON_HERO_METADATA.test(metadata)) {
+    return {
+      eligible: false,
+      confidence: null,
+      variant,
+      reasons: ["non-hero-section-marker"],
+    };
+  }
   if (EXPLICIT_HERO_METADATA.test(metadata)) {
     return {
       eligible: true,

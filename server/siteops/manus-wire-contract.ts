@@ -30,12 +30,6 @@ const sectionVariants = [
   "proof",
   "cta",
 ] as const;
-const organizationTypes = [
-  "Organization",
-  "Corporation",
-  "ProfessionalService",
-] as const;
-
 const schemaRecord = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -125,7 +119,7 @@ export function siteDesignWireOutputSchema(input: {
     type: "object",
     properties: {
       operationToken: { type: "string", enum: [input.operationToken] },
-      schemaVersion: { type: "number", enum: [1] },
+      schemaVersion: { type: "number", enum: [2] },
       layoutArchetype: { type: "string", enum: [...layoutArchetypes] },
       heroVariant: { type: "string", enum: [...heroVariants] },
       density: {
@@ -150,10 +144,6 @@ export function siteDesignWireOutputSchema(input: {
       accentPaletteIndex: { type: "number", enum: paletteIndices },
       siteTitle: { type: "string" },
       description: { type: "string" },
-      organizationType: {
-        type: "string",
-        enum: [...organizationTypes],
-      },
       routeSlots: {
         type: "array",
         items: {
@@ -162,9 +152,8 @@ export function siteDesignWireOutputSchema(input: {
             routeId: { type: "string", enum: [...input.routeIds] },
             slotId: { type: "string" },
             variant: { type: "string", enum: [...sectionVariants] },
-            order: { type: "number" },
           },
-          required: ["routeId", "slotId", "variant", "order"],
+          required: ["routeId", "slotId", "variant"],
           additionalProperties: false,
         },
       },
@@ -184,17 +173,16 @@ export function siteDesignWireOutputSchema(input: {
       "accentPaletteIndex",
       "siteTitle",
       "description",
-      "organizationType",
       "routeSlots",
     ],
     additionalProperties: false,
   });
 }
 
-const siteDesignWireV1Schema = z
+const siteDesignWireV2Schema = z
   .object({
     operationToken: z.string().min(1).max(128),
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     layoutArchetype: z.enum(layoutArchetypes),
     heroVariant: z.enum(heroVariants),
     density: z.enum(["compact", "balanced", "spacious"]),
@@ -207,7 +195,6 @@ const siteDesignWireV1Schema = z
     accentPaletteIndex: z.number().int().nonnegative().max(11),
     siteTitle: z.string().trim().min(1).max(80),
     description: z.string().trim().min(1).max(200),
-    organizationType: z.enum(organizationTypes),
     routeSlots: z
       .array(
         z
@@ -218,7 +205,6 @@ const siteDesignWireV1Schema = z
               .trim()
               .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
             variant: z.enum(sectionVariants),
-            order: z.number().int().nonnegative().max(15),
           })
           .strict(),
       )
@@ -231,7 +217,7 @@ export function siteDesignResultFromWire(
   value: unknown,
   routeIds: readonly string[],
 ) {
-  const wire = siteDesignWireV1Schema.parse(value);
+  const wire = siteDesignWireV2Schema.parse(value);
   const expectedRouteIds = new Set(routeIds);
   if (
     wire.routeSlots.some((slot) => !expectedRouteIds.has(slot.routeId)) ||
@@ -239,22 +225,27 @@ export function siteDesignResultFromWire(
   ) {
     throw new Error("SITEOPS_DESIGN_ROUTE_SET_MISMATCH");
   }
+  // Wire V2 removes the redundant `order` field. The array itself is the
+  // canonical order: routes form contiguous groups in frozen SiteBrief order,
+  // and the order within each group becomes the trusted section order.
+  const canonicalSlots = routeIds.flatMap((routeId) =>
+    wire.routeSlots.filter((slot) => slot.routeId === routeId),
+  );
+  if (
+    canonicalSlots.length !== wire.routeSlots.length ||
+    canonicalSlots.some((slot, index) => slot !== wire.routeSlots[index])
+  ) {
+    throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
+  }
   const routeCompositions = routeIds.map((routeId) => ({
     routeId,
     slots: wire.routeSlots
       .filter((slot) => slot.routeId === routeId)
-      .sort((left, right) => left.order - right.order)
       .map(({ slotId, variant }) => ({ slotId, variant })),
   }));
   for (const routeId of routeIds) {
-    const slots = wire.routeSlots
-      .filter((slot) => slot.routeId === routeId)
-      .sort((left, right) => left.order - right.order);
-    if (
-      slots.length < 1 ||
-      new Set(slots.map((slot) => slot.order)).size !== slots.length ||
-      slots.some((slot, index) => slot.order !== index)
-    ) {
+    const slots = wire.routeSlots.filter((slot) => slot.routeId === routeId);
+    if (slots.length < 1) {
       throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
     }
   }
@@ -278,7 +269,8 @@ export function siteDesignResultFromWire(
       seoPlan: {
         siteTitle: wire.siteTitle,
         description: wire.description,
-        organizationType: wire.organizationType,
+        // Organization type is a Dashboard-owned SEO policy, not model input.
+        organizationType: "Organization",
       },
     },
   });
@@ -294,7 +286,7 @@ export function pageContentWireOutputSchema(input: {
     type: "object",
     properties: {
       operationToken: { type: "string", enum: [input.operationToken] },
-      schemaVersion: { type: "number", enum: [1] },
+      schemaVersion: { type: "number", enum: [2] },
       routes: {
         type: "array",
         items: {
@@ -341,10 +333,10 @@ export function pageContentWireOutputSchema(input: {
   });
 }
 
-const pageContentWireV1Schema = z
+const pageContentWireV2Schema = z
   .object({
     operationToken: z.string().min(1).max(128),
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     routes: z
       .array(
         z
@@ -389,7 +381,7 @@ export function pageContentResultFromWire(
   routeIds: readonly string[],
   sourceDocumentIds: readonly string[],
 ) {
-  const wire = pageContentWireV1Schema.parse(value);
+  const wire = pageContentWireV2Schema.parse(value);
   const expectedRouteIds = new Set(routeIds);
   const allowedSourceDocumentIds = new Set(sourceDocumentIds);
   if (

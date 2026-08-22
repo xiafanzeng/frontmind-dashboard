@@ -6,15 +6,19 @@ import {
   assertCurrentVisualWorkflowVersion,
   assertSiteOpsSnapshotChangeState,
   createVisualSearchOperationInput,
+  freezeSiteOpsCustomerAiCredential,
   hashSiteOpsRequest,
   isSiteOpsFailedBuildResettable,
   isSiteOpsOperationReplay,
   isSiteOpsIcpApprovedForCurrentDomain,
+  isSiteOpsStoppedProviderTaskResetSafe,
   normalizeSiteOpsDomain,
   parseSiteOpsActionPayload,
   resolvePinnedTwentyFirstCredentialForBatch,
+  resolveSiteOpsAgentProfile,
   siteBriefFromSnapshot,
   siteOpsActiveFinancialIntentKey,
+  siteOpsResetCredentialScope,
   siteOpsResetCapability,
   SiteOpsServiceError,
 } from "./service";
@@ -25,6 +29,7 @@ import {
   siteOpsAliyunConnectionSetupInputSchema,
   siteOpsSendMessageInputSchema,
 } from "../../shared/siteops";
+import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
 
 describe("SiteOps core contracts", () => {
   it("requires a selected visual board to match the current workflow", () => {
@@ -231,6 +236,100 @@ describe("SiteOps core contracts", () => {
     ).toThrow();
   });
 
+  it("strictly accepts only Base or Pro for visual build selection", () => {
+    const sampleId = "10000000-0000-4000-8000-000000000001";
+    expect(
+      parseSiteOpsActionPayload("select_visual", {
+        sampleId,
+        agentProfile: "frontmind-base",
+      }),
+    ).toEqual({ sampleId, agentProfile: "frontmind-base" });
+    expect(
+      parseSiteOpsActionPayload("delegate_visual", {
+        agentProfile: "frontmind-pro",
+      }),
+    ).toEqual({ agentProfile: "frontmind-pro" });
+    expect(() =>
+      parseSiteOpsActionPayload("select_visual", {
+        sampleId,
+        agentProfile: "frontmind-lite",
+      }),
+    ).toThrow();
+    expect(() =>
+      parseSiteOpsActionPayload("select_visual", { sampleId }),
+    ).toThrow();
+    expect(() => parseSiteOpsActionPayload("delegate_visual", {})).toThrow();
+    expect(() =>
+      parseSiteOpsActionPayload("delegate_visual", {
+        agentProfile: "frontmind-pro",
+        apiKey: "must-not-be-accepted",
+      }),
+    ).toThrow();
+  });
+
+  it("projects the frozen build profile for refresh and cross-device reads", () => {
+    const projected = siteOpsBuildProjectionSchema.parse({
+      id: "10000000-0000-4000-8000-000000000001",
+      ordinal: 2,
+      parentBuildId: null,
+      agentProfile: "frontmind-base",
+      status: "building",
+      previewUrl: null,
+      sourceUrl: null,
+      qaUrl: null,
+      errorCode: null,
+      errorMessage: null,
+      createdAt: "2026-08-22T00:00:00.000Z",
+      updatedAt: "2026-08-22T00:00:00.000Z",
+    });
+    expect(projected.agentProfile).toBe("frontmind-base");
+    expect(() =>
+      siteOpsBuildProjectionSchema.parse({
+        ...projected,
+        agentProfile: "frontmind-lite",
+      }),
+    ).toThrow();
+  });
+
+  it("keeps a parent build profile while rotating to the current customer credential", () => {
+    expect(
+      resolveSiteOpsAgentProfile({
+        requested: "frontmind-base",
+        credentialDefault: "frontmind-pro",
+      }),
+    ).toBe("frontmind-base");
+    expect(
+      resolveSiteOpsAgentProfile({
+        parentOperationInput: { agentProfile: "frontmind-base" },
+        credentialDefault: "frontmind-pro",
+      }),
+    ).toBe("frontmind-base");
+    expect(
+      resolveSiteOpsAgentProfile({ credentialDefault: "frontmind-base" }),
+    ).toBe("frontmind-base");
+    expect(resolveSiteOpsAgentProfile({ credentialDefault: null })).toBe(
+      "frontmind-pro",
+    );
+    expect(
+      freezeSiteOpsCustomerAiCredential({
+        credential: {
+          id: "20000000-0000-4000-8000-000000000002",
+          version: 8,
+          agentProfile: "frontmind-pro",
+        },
+        parentOperationInput: {
+          agentProfile: "frontmind-base",
+          manusCredentialId: "retired-credential",
+        },
+      }),
+    ).toEqual({
+      credentialScope: "customer",
+      manusCredentialId: "20000000-0000-4000-8000-000000000002",
+      manusCredentialVersion: 8,
+      agentProfile: "frontmind-base",
+    });
+  });
+
   it("allows reset only before the first build and outside unresolved work", () => {
     const preBuild = {
       projectStatus: "attention_required",
@@ -279,7 +378,7 @@ describe("SiteOps core contracts", () => {
     ).toMatchObject({ allowed: false });
   });
 
-  it("allows only a first terminal build with no provider task or artifact to reset", () => {
+  it("allows a current terminal root build with no provider task or artifact to reset", () => {
     const failedBeforeCreate = {
       ordinal: 1,
       parentBuildId: null,
@@ -306,7 +405,23 @@ describe("SiteOps core contracts", () => {
     expect(
       isSiteOpsFailedBuildResettable({
         ...failedBeforeCreate,
+        ordinal: 2,
+      }),
+    ).toBe(true);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        ordinal: 2,
         upstreamManusTaskId: "provider-task",
+        hasProviderTask: true,
+        providerTaskStopped: true,
+      }),
+    ).toBe(true);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        upstreamManusTaskId: "provider-task",
+        hasProviderTask: true,
       }),
     ).toBe(false);
     expect(
@@ -327,6 +442,46 @@ describe("SiteOps core contracts", () => {
         status: "building",
       }),
     ).toBe(false);
+  });
+
+  it("accepts a stopped provider task only when transaction ids and states still match", () => {
+    const safe = {
+      buildId: "10000000-0000-4000-8000-000000000001",
+      buildProviderTaskId: "provider-task",
+      operationProviderTaskIds: ["provider-task"],
+      operationStatuses: ["attention_required"],
+      preflight: {
+        buildId: "10000000-0000-4000-8000-000000000001",
+        providerTaskId: "provider-task",
+        state: "stopped" as const,
+      },
+    };
+    expect(isSiteOpsStoppedProviderTaskResetSafe(safe)).toBe(true);
+    expect(
+      isSiteOpsStoppedProviderTaskResetSafe({
+        ...safe,
+        operationStatuses: ["outcome_unknown"],
+      }),
+    ).toBe(false);
+    expect(
+      isSiteOpsStoppedProviderTaskResetSafe({
+        ...safe,
+        preflight: { ...safe.preflight, state: "not_stopped" as const },
+      }),
+    ).toBe(false);
+    expect(
+      isSiteOpsStoppedProviderTaskResetSafe({
+        ...safe,
+        operationProviderTaskIds: ["different-task"],
+      }),
+    ).toBe(false);
+  });
+
+  it("routes new reset inspection to the customer credential and legacy missing scope only to compatibility", () => {
+    expect(siteOpsResetCredentialScope("customer")).toBe("customer");
+    expect(siteOpsResetCredentialScope(undefined)).toBe("legacy_presales");
+    expect(siteOpsResetCredentialScope("website")).toBeNull();
+    expect(siteOpsResetCredentialScope("presales")).toBeNull();
   });
 
   it("keeps existing-domain sync read-only and exact-confirmation shaped", () => {
