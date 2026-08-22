@@ -1192,6 +1192,8 @@ describe("knowledge-base production final-package acceptance", () => {
       .update(apiLogoBytes)
       .digest("hex");
     const apiLogoFileId = "managed-materialized-local-logo";
+    const apiLogoStorageKey = `frontmind-v2:${apiLogoFileId}`;
+    const apiLogoRetainUntil = new Date("2099-01-01T00:00:00.000Z");
     const { Readable } = await import("node:stream");
     const presalesStore = await import("./presales-file-store");
     await presalesStore.recordPresalesFileDescriptor({
@@ -1209,18 +1211,24 @@ describe("knowledge-base production final-package acceptance", () => {
       filename: "api-brand.png",
       mimeType: "image/png",
       uploadedAt: now,
-      contentExpiresAt: new Date(now.getTime() + 86_400_000),
+      contentExpiresAt: apiLogoRetainUntil,
     });
     state.localAssets.push({
       id: apiLogoFileId,
       scope: "managed_user",
       accountUserId: USER_ID,
+      presalesProjectId: null,
       filename: "api-brand.png",
       mimeType: "image/png",
       sizeBytes: apiLogoBytes.length,
       contentSha256: apiLogoSha256,
+      storageKey: apiLogoStorageKey,
+      storageKeyHash: createHash("sha256")
+        .update(apiLogoStorageKey)
+        .digest("hex"),
+      refCount: 1,
+      retainUntil: apiLogoRetainUntil,
       createdAt: now,
-      updatedAt: now,
     });
     let providerRequestCount = 0;
     const provider = express();
