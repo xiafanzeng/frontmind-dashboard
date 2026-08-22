@@ -7,6 +7,7 @@ import {
   assertSiteOpsSnapshotChangeState,
   createVisualSearchOperationInput,
   hashSiteOpsRequest,
+  isSiteOpsFailedBuildResettable,
   isSiteOpsOperationReplay,
   isSiteOpsIcpApprovedForCurrentDomain,
   normalizeSiteOpsDomain,
@@ -162,6 +163,28 @@ describe("SiteOps core contracts", () => {
     expect(JSON.stringify(brief)).not.toContain("不存在的客户案例");
   });
 
+  it("prefers the explicit public brand over a generic overview title", () => {
+    const brief = siteBriefFromSnapshot({
+      sourceFileName: "维他健康-knowledge-base.zip",
+      documents: [
+        {
+          id: "brand-overview",
+          path: "企业与品牌概览.md",
+          title: "企业与品牌概览",
+          content:
+            "维他健康是一家聚焦健康服务的企业，以「天印溯方」为对外品牌。",
+          kind: "overview",
+          evidenceStatus: "verified",
+          customerVisible: true,
+        },
+      ],
+      assets: [],
+    } as never);
+
+    expect(brief.companyName).toBe("天印溯方");
+    expect(brief.companyName).not.toBe("企业与品牌概览");
+  });
+
   it.each(["localhost", "127.0.0.1", "bad domain.com", "-bad.example"])(
     "rejects a non-registrable or unsafe domain: %s",
     (domain) => {
@@ -214,6 +237,7 @@ describe("SiteOps core contracts", () => {
       currentBuild: false,
       liveHead: false,
       hasBuild: false,
+      resettableFailedBuild: false,
       hasDeployment: false,
       hasBlockingOperation: false,
       hasActiveDns: false,
@@ -224,6 +248,14 @@ describe("SiteOps core contracts", () => {
       siteOpsResetCapability({
         ...preBuild,
         projectStatus: "visual_searching",
+      }),
+    ).toEqual({ allowed: true });
+    expect(
+      siteOpsResetCapability({
+        ...preBuild,
+        currentBuild: true,
+        hasBuild: true,
+        resettableFailedBuild: true,
       }),
     ).toEqual({ allowed: true });
 
@@ -245,6 +277,56 @@ describe("SiteOps core contracts", () => {
     expect(
       siteOpsResetCapability({ ...preBuild, projectStatus: "approved" }),
     ).toMatchObject({ allowed: false });
+  });
+
+  it("allows only a first terminal build with no provider task or artifact to reset", () => {
+    const failedBeforeCreate = {
+      ordinal: 1,
+      parentBuildId: null,
+      status: "failed",
+      upstreamManusTaskId: null,
+      contractLocalAssetId: null,
+      contractHash: null,
+      sourceLocalAssetId: null,
+      sourceHash: null,
+      distLocalAssetId: null,
+      distHash: null,
+      qaLocalAssetId: null,
+      provenanceLocalAssetId: null,
+      approvedAt: null,
+      hasProviderTask: false,
+    };
+    expect(isSiteOpsFailedBuildResettable(failedBeforeCreate)).toBe(true);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        status: "attention_required",
+      }),
+    ).toBe(true);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        upstreamManusTaskId: "provider-task",
+      }),
+    ).toBe(false);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        distLocalAssetId: "10000000-0000-4000-8000-000000000001",
+      }),
+    ).toBe(false);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        contractHash: "a".repeat(64),
+      }),
+    ).toBe(false);
+    expect(
+      isSiteOpsFailedBuildResettable({
+        ...failedBeforeCreate,
+        status: "building",
+      }),
+    ).toBe(false);
   });
 
   it("keeps existing-domain sync read-only and exact-confirmation shaped", () => {

@@ -11,7 +11,7 @@ function observation(
     executionKind: "site_ops",
     providerState: {
       twentyFirst: { status: "configured" },
-      manus: { status: "configured" },
+      aiBuilder: { status: "configured" },
       esa: { status: "configured" },
       aliyun: { status: "not_configured" },
     },
@@ -74,8 +74,10 @@ function observation(
         label: "A",
         title: "克制的编辑式布局",
         previewUrl: "/api/local-assets/preview-a",
-        note: "大标题与模块化信息层级",
+        note: "克制的编辑式布局",
         score: 91,
+        heroVariant: "editorial_modular",
+        heroConfidence: "explicit",
         selected: false,
       },
       {
@@ -83,8 +85,10 @@ function observation(
         label: "B",
         title: "精密技术型布局",
         previewUrl: "/api/local-assets/preview-b",
-        note: null,
+        note: "精密技术型布局",
         score: 88,
+        heroVariant: "split_media",
+        heroConfidence: "strong",
         selected: false,
       },
     ],
@@ -99,6 +103,38 @@ function observation(
 }
 
 describe("SiteOpsConversationPanel", () => {
+  it("does not surface the cancelled failed build after a confirmed reset", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "draft",
+            currentKnowledgeSnapshotId: null,
+          },
+          interactionState: "select_snapshot",
+          visualCandidates: [],
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 1,
+              parentBuildId: null,
+              status: "cancelled",
+              previewUrl: null,
+              sourceUrl: null,
+              qaUrl: null,
+              errorCode: "FRONTMIND_BUILD_REQUEST_INVALID",
+              errorMessage: "已重置。",
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+        })}
+      />,
+    );
+    expect(screen.queryByText(/官网版本 1/u)).toBeNull();
+  });
+
   it("requires confirmation before submitting a fresh pre-build reset", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
@@ -219,6 +255,11 @@ describe("SiteOpsConversationPanel", () => {
       "src",
       "/api/local-assets/preview-a",
     );
+    expect(screen.getByText("Hero · 编辑模块")).toBeInTheDocument();
+    expect(screen.queryByText(/匹配度/u)).toBeNull();
+    expect(
+      screen.getByRole("heading", { name: "选择首页 Hero 视觉方向" }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "选择 B" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
@@ -263,12 +304,10 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "已锁定的视觉方向" }),
+      screen.getByRole("heading", { name: "已锁定的首页 Hero 视觉方向" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
-    expect(
-      screen.queryByRole("button", { name: "委托 AI 选择最高分" }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "委托 AI 选择" })).toBeNull();
   });
 
   it("selects an immutable knowledge snapshot through a structured action", async () => {

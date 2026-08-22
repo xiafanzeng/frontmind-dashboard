@@ -9,14 +9,25 @@ import {
 
 import {
   briefWithoutBrandAssets,
+  combinedTerminalTaskState,
+  handledWaitingResolution,
   createManusSiteOpsProviderHandler,
   frozenAssetDecisions,
   getSiteOpsSocialWorkflowReadiness,
   loadVerifiedSiteOpsSocialWorkflowPackage,
   loadVerifiedSiteOpsWorkflowPackage,
+  messageAskUserWaiting,
   safePublicDocuments,
+  resultFailure,
+  structuredResultGrace,
+  terminalTaskState,
   visualPreviewAttachment,
 } from "./manus-provider";
+import {
+  buildManusV2CreateTaskBody,
+  buildManusV2SendMessageBody,
+  ManusV2ApiError,
+} from "../manus-v2-client";
 
 const operation = {
   id: "10000000-0000-4000-8000-000000000001",
@@ -32,6 +43,7 @@ const operation = {
     buildId: "30000000-0000-4000-8000-000000000003",
     manusCredentialId: "40000000-0000-4000-8000-000000000004",
     manusCredentialVersion: 9,
+    feedback: "保持事实不变并调整页面表达。".repeat(200),
   },
   provider: "manus",
   providerOperationId: null,
@@ -51,6 +63,73 @@ const operation = {
 afterEach(() => vi.restoreAllMocks());
 
 describe("Manus SiteOps provider boundary", () => {
+  it("treats stopped as completion and waits up to 120 seconds for its structured result", () => {
+    expect(terminalTaskState("stopped")).toEqual({
+      completed: true,
+      failed: false,
+    });
+    const started = structuredResultGrace(
+      { schemaVersion: 1, stage: "design_pending", taskId: "task-1" },
+      true,
+      1_000,
+    );
+    expect(started).toMatchObject({
+      expired: false,
+      state: { resultPendingSince: new Date(1_000).toISOString() },
+    });
+    expect(structuredResultGrace(started.state, true, 120_999).expired).toBe(
+      false,
+    );
+    expect(structuredResultGrace(started.state, true, 121_000).expired).toBe(
+      true,
+    );
+    expect(combinedTerminalTaskState("running", "stopped")).toEqual({
+      completed: true,
+      failed: false,
+    });
+    expect(combinedTerminalTaskState("stopped", "error")).toEqual({
+      completed: false,
+      failed: true,
+    });
+    const waitingState = {
+      schemaVersion: 1 as const,
+      stage: "repair_pending" as const,
+      taskId: "task-1",
+      repairKind: "design" as const,
+      repairAttempt: 1,
+      handledWaitingEventId: "waiting-1",
+      handledWaitingAt: new Date(5_000).toISOString(),
+    };
+    expect(handledWaitingResolution(waitingState, "waiting-1", 5_001)).toBe(
+      "pending",
+    );
+    expect(handledWaitingResolution(waitingState, "waiting-2", 5_001)).toBe(
+      "new",
+    );
+    expect(handledWaitingResolution(waitingState, "waiting-1", 125_000)).toBe(
+      "expired",
+    );
+  });
+
+  it("allows only a provider question to enter the same-task repair path", () => {
+    expect(
+      messageAskUserWaiting({ eventType: "messageAskUser" } as never),
+    ).toBe(true);
+    expect(messageAskUserWaiting({ eventType: "deploy" } as never)).toBe(false);
+  });
+
+  it("maps an explicit task.create 400 to a known FrontMind rejection", () => {
+    const result = resultFailure(
+      new ManusV2ApiError("task.create", 400, "invalid_argument", false, false),
+    );
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "FRONTMIND_BUILD_REQUEST_INVALID",
+      result: { stage: "create_rejected" },
+    });
+    expect(JSON.stringify(result)).not.toMatch(/manus|invalid_argument/iu);
+  });
+
   it("never sends official Logo identifiers through the Manus SiteBrief", () => {
     const promptBrief = briefWithoutBrandAssets({
       companyName: "星河智造",
@@ -114,6 +193,24 @@ describe("Manus SiteOps provider boundary", () => {
     expect(documents.map((item) => item.id)).toEqual(["1.1"]);
   });
 
+  it("keeps every safe document and its complete content for lossless dossier splitting", () => {
+    const content = "完整知识".repeat(6_000);
+    const documents = safePublicDocuments({
+      documents: Array.from({ length: 81 }, (_, index) => ({
+        id: `doc-${index + 1}`,
+        path: `doc-${index + 1}.md`,
+        title: `资料 ${index + 1}`,
+        content,
+        kind: "leaf",
+        evidenceStatus: "verified_first_party",
+        customerVisible: true,
+      })),
+    } as never);
+
+    expect(documents).toHaveLength(81);
+    expect(documents[0]?.content).toBe(content);
+  });
+
   it("publishes only the selected first-party logo and quarantines other assets", () => {
     const decisions = frozenAssetDecisions(
       {
@@ -149,7 +246,7 @@ describe("Manus SiteOps provider boundary", () => {
     ]);
   });
 
-  it("packages the hash-verified FrontMind 1.3 workflow with SKILL and runtime contract", async () => {
+  it("packages the hash-verified FrontMind 1.4 workflow with SKILL and runtime contract", async () => {
     const bytes = await loadVerifiedSiteOpsWorkflowPackage();
     const zip = await JSZip.loadAsync(bytes, { checkCRC32: true });
 
@@ -174,7 +271,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(xhs.file("runtime-contract.json")).not.toBeNull();
     expect(readiness).toMatchObject({
       ready: true,
-      website: { version: "1.3.0" },
+      website: { version: "1.4.0" },
       workflows: [
         { channel: "wechat", version: "1.0.0" },
         { channel: "xiaohongshu", version: "1.0.0" },
@@ -246,32 +343,23 @@ describe("Manus SiteOps provider boundary", () => {
     const designToken = `siteops-design:${operation.id}`;
     const designResult = {
       operationToken: designToken,
-      designSpec: {
-        schemaVersion: 1,
-        layoutArchetype: "asymmetric",
-        heroVariant: "split_media",
-        density: "balanced",
-        surfaceStyle: "bordered",
-        typeScale: "display",
-        imageTreatment: "contained",
-        motionLevel: "subtle",
-        colorRoles: {
-          backgroundPaletteIndex: 2,
-          textPaletteIndex: 0,
-          accentPaletteIndex: 1,
-        },
-        routeCompositions: [
-          {
-            routeId: "home",
-            slots: [{ slotId: "proof", variant: "proof" }],
-          },
-        ],
-        seoPlan: {
-          siteTitle: "星河智造",
-          description: "经过知识来源核验的企业官网。",
-          organizationType: "Organization",
-        },
-      },
+      schemaVersion: 1,
+      layoutArchetype: "asymmetric",
+      heroVariant: "split_media",
+      density: "balanced",
+      surfaceStyle: "bordered",
+      typeScale: "display",
+      imageTreatment: "contained",
+      motionLevel: "subtle",
+      backgroundPaletteIndex: 2,
+      textPaletteIndex: 0,
+      accentPaletteIndex: 1,
+      siteTitle: "星河智造",
+      description: "经过知识来源核验的企业官网。",
+      organizationType: "Organization",
+      routeSlots: [
+        { routeId: "home", slotId: "proof", variant: "proof", order: 0 },
+      ],
     };
     const context = {
       build: {
@@ -295,12 +383,10 @@ describe("Manus SiteOps provider boundary", () => {
               sourceDocumentIds: ["overview"],
             },
           ],
-          verifiedFacts: [
-            {
-              statement: "提供设备服务",
-              sourceDocumentIds: ["overview"],
-            },
-          ],
+          verifiedFacts: Array.from({ length: 120 }, (_, index) => ({
+            statement: `经过来源核验的企业事实 ${index + 1}`,
+            sourceDocumentIds: ["overview"],
+          })),
           publicAssetIds: [],
           unknowns: [],
         },
@@ -316,17 +402,18 @@ describe("Manus SiteOps provider boundary", () => {
         sourceBuildId: null,
         sourceBuildRevision: null,
         assets: [],
-        documents: [
-          {
-            id: "overview",
-            path: "overview.md",
-            title: "企业简介",
-            content: "星河智造提供设备服务。",
-            kind: "leaf",
-            evidenceStatus: "verified_first_party",
-            customerVisible: true,
-          },
-        ],
+        documents: Array.from({ length: 56 }, (_, index) => ({
+          id: index === 0 ? "overview" : `source-${index + 1}`,
+          path: index === 0 ? "overview.md" : `source-${index + 1}.md`,
+          title: index === 0 ? "企业简介" : `企业资料 ${index + 1}`,
+          content:
+            index === 0
+              ? "星河智造提供设备服务。"
+              : `经过来源核验的企业资料 ${index + 1}。`.repeat(100),
+          kind: "leaf" as const,
+          evidenceStatus: "verified_first_party" as const,
+          customerVisible: true,
+        })),
       },
       sample: {
         id: "60000000-0000-4000-8000-000000000006",
@@ -505,8 +592,8 @@ describe("Manus SiteOps provider boundary", () => {
       result: { stage: "design_pending", taskId: "manus-task-1" },
     });
     expect(createTask).toHaveBeenCalledTimes(1);
-    expect(createTask.mock.calls[0]![0].attachments).toHaveLength(4);
-    expect(createTask.mock.calls[0]![0].attachments[1]).toMatchObject({
+    expect(createTask.mock.calls[0]![0].attachments).toHaveLength(5);
+    expect(createTask.mock.calls[0]![0].attachments[2]).toMatchObject({
       filename: "selected-visual.png",
       mime_type: "image/png",
     });
@@ -515,17 +602,37 @@ describe("Manus SiteOps provider boundary", () => {
         (attachment: { filename: string }) => attachment.filename,
       ),
     ).toEqual([
-      "frontmind-astro-company-site-workflow-1.3.0.zip",
+      "frontmind-astro-company-site-workflow-1.4.0.zip",
+      "frontmind-siteops-source-dossier-v1.json",
       "selected-visual.png",
       "support-visual-1.png",
       "support-visual-2.png",
     ]);
-    expect(createTask.mock.calls[0]![0].prompt).toContain(
+    expect(
+      Array.from(createTask.mock.calls[0]![0].prompt).length,
+    ).toBeLessThanOrEqual(3_000);
+    expect(createTask.mock.calls[0]![0].prompt).not.toContain(
+      "星河智造提供设备服务",
+    );
+    const createBody = buildManusV2CreateTaskBody(createTask.mock.calls[0]![0]);
+    expect(createBody.message.content).toHaveLength(6);
+    expect(JSON.stringify(createBody.structured_output_schema)).not.toMatch(
+      /"(?:pattern|minimum|maximum|minItems|maxItems)"/u,
+    );
+    const dossierAttachment = createTask.mock.calls[0]![0].attachments[1];
+    const dossier = JSON.parse(
+      Buffer.from(
+        dossierAttachment.file_data.split(",", 2)[1],
+        "base64",
+      ).toString("utf8"),
+    );
+    expect(dossier.visualEvidence.supportEvidenceSha256s).toEqual([
       supportOneEvidence.evidenceSha256,
-    );
-    expect(createTask.mock.calls[0]![0].prompt).toContain(
       supportTwoEvidence.evidenceSha256,
-    );
+    ]);
+    expect(dossier.documents[0].content).toBe("星河智造提供设备服务。");
+    expect(dossier.documents).toHaveLength(56);
+    expect(dossier.brief.verifiedFacts).toHaveLength(120);
 
     const designed = await handler({
       operation: {
@@ -555,6 +662,25 @@ describe("Manus SiteOps provider boundary", () => {
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]![0].taskId).toBe("manus-task-1");
+    expect(sendMessage.mock.calls[0]![0].attachments).toEqual([
+      expect.objectContaining({
+        filename: "frontmind-build-contract-v2.json",
+        mime_type: "application/json",
+      }),
+      expect.objectContaining({
+        filename: "frontmind-customer-feedback-v1.json",
+        mime_type: "application/json",
+      }),
+    ]);
+    expect(
+      Array.from(sendMessage.mock.calls[0]![0].prompt).length,
+    ).toBeLessThanOrEqual(3_000);
+    const sendBody = buildManusV2SendMessageBody(sendMessage.mock.calls[0]![0]);
+    expect(sendBody.task_id).toBe("manus-task-1");
+    expect(sendBody.message.content).toHaveLength(3);
+    expect(JSON.stringify(sendBody.structured_output_schema)).not.toMatch(
+      /"(?:pattern|minimum|maximum|minItems|maxItems)"/u,
+    );
     expect(
       readArtifact.mock.calls.filter(([input]) =>
         [

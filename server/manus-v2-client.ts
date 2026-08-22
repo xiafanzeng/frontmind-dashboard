@@ -748,7 +748,13 @@ function assertOk(
 ): Record<string, unknown> {
   const record = upstreamTaskRecord(response.data);
   if (response.status < 200 || response.status >= 300) {
-    const explicitRejection = record?.ok === false;
+    // Receiving an HTTP 4xx response proves the provider rejected this
+    // request, even when its validation-error body omits `ok:false`. Treating
+    // such a response as outcome-unknown would leave a known task.create 400
+    // in reconciliation forever. A 5xx without an explicit rejection remains
+    // ambiguous because the side effect may have happened before the error.
+    const explicitRejection =
+      (response.status >= 400 && response.status < 500) || record?.ok === false;
     const coordinates = record
       ? providerValidationCoordinates(record)
       : { field: null, path: null };

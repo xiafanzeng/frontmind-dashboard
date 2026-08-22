@@ -140,6 +140,25 @@ function providerMessage(observation: SiteOpsObservationV1) {
   );
 }
 
+function visualCandidatePresentation(candidate: SiteOpsPublicVisualCandidate) {
+  const variantLabels = {
+    centered_statement: "居中陈述",
+    split_media: "分屏媒体",
+    editorial_modular: "编辑模块",
+    immersive_visual: "沉浸视觉",
+  } as const;
+  return {
+    badge: candidate.heroVariant
+      ? `Hero · ${variantLabels[candidate.heroVariant]}`
+      : "Hero · 首页视觉",
+    title: candidate.title,
+    note:
+      candidate.note && candidate.note !== candidate.title
+        ? candidate.note
+        : null,
+  };
+}
+
 function VisualCandidateCard({
   candidate,
   disabled,
@@ -149,6 +168,7 @@ function VisualCandidateCard({
   disabled: boolean;
   onSelect: () => void;
 }) {
+  const presentation = visualCandidatePresentation(candidate);
   return (
     <article
       className="siteops-visual-card"
@@ -157,16 +177,16 @@ function VisualCandidateCard({
       <div className="siteops-visual-preview">
         <img
           src={candidate.previewUrl}
-          alt={`${candidate.label}：${candidate.title}`}
+          alt={`${candidate.label}：${presentation.title}`}
         />
         <span>{candidate.label}</span>
       </div>
       <div className="siteops-visual-copy">
         <div>
-          <strong>{candidate.title}</strong>
-          <small>匹配度 {Math.round(candidate.score)}</small>
+          <strong>{presentation.title}</strong>
+          <small className="siteops-hero-badge">{presentation.badge}</small>
         </div>
-        {candidate.note && <p>{candidate.note}</p>}
+        {presentation.note && <p>{presentation.note}</p>}
         <button
           type="button"
           className="siteops-primary-button"
@@ -214,15 +234,18 @@ export default function SiteOpsConversationPanel({
   const [typedDomain, setTypedDomain] = useState("");
   const [registrantProfileId, setRegistrantProfileId] = useState("");
   const [icpNumber, setIcpNumber] = useState("");
-  const latestBuild = useMemo(
-    () =>
-      observation?.builds.reduce(
+  const latestBuild = useMemo(() => {
+    const visibleBuilds = observation?.builds.filter(
+      (build) => build.status !== "cancelled",
+    );
+    return (
+      visibleBuilds?.reduce(
         (latest, build) =>
           !latest || build.ordinal > latest.ordinal ? build : latest,
-        observation.builds[0],
-      ) ?? null,
-    [observation?.builds],
-  );
+        visibleBuilds[0],
+      ) ?? null
+    );
+  }, [observation?.builds]);
 
   async function runAction(key: string, input: SiteOpsActionContext) {
     if (!onAction || busyAction) return;
@@ -881,11 +904,13 @@ export default function SiteOpsConversationPanel({
           <div className="siteops-board-heading">
             <div>
               <h3 id="siteops-visual-title">
-                {visualSelectionOpen ? "选择一个视觉方向" : "已锁定的视觉方向"}
+                {visualSelectionOpen
+                  ? "选择首页 Hero 视觉方向"
+                  : "已锁定的首页 Hero 视觉方向"}
               </h3>
               <p>
-                以下均为 21st
-                目录返回的真实预览。选择只决定视觉语言，不复制组件代码或示例内容。
+                以下均为 21st 目录返回并通过 Hero
+                资格校验的真实预览。选择只决定首页视觉语言，不复制组件代码或示例内容。
               </p>
             </div>
             {visualSelectionOpen && (
@@ -905,7 +930,7 @@ export default function SiteOpsConversationPanel({
                   )
                 }
               >
-                委托 AI 选择最高分
+                委托 AI 选择
               </button>
             )}
           </div>

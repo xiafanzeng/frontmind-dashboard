@@ -685,6 +685,25 @@ describe("ManusV2Client", () => {
     });
   });
 
+  it("treats an HTTP 400 validation body without ok=false as a known rejection", async () => {
+    vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
+      status: 400,
+      data: { code: "invalid_argument" },
+    });
+    const client = new ManusV2Client({
+      baseUrl: "https://api.example.test",
+      apiKey: "secret",
+    });
+    await expect(
+      client.createTask({ prompt: "start", title: "unique title" }),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_argument",
+      outcomeUnknown: false,
+      retryable: false,
+    });
+  });
+
   it("captures only allowlisted request and validation coordinates from an explicit rejection", async () => {
     vi.spyOn(axios.Axios.prototype, "post").mockResolvedValue({
       status: 400,

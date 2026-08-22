@@ -440,6 +440,33 @@ describe("TwentyFirstClient", () => {
     ).toThrow(TwentyFirstToolContractError);
   });
 
+  it("uses Hero tag and recommended sort only when the live schema advertises them", () => {
+    const tool = {
+      name: "search",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          query: { type: "string" },
+          tag: { type: "string", enum: ["hero", "pricing"] },
+          sort: { type: "string", enum: ["recommended", "newest"] },
+        },
+        required: ["query"],
+      },
+    };
+    expect(
+      buildTwentyFirstToolArguments({
+        operation: "search",
+        tool,
+        value: "hero section landing page",
+        searchOptions: { tag: "hero", sort: "recommended" },
+      }),
+    ).toEqual({
+      query: "hero section landing page",
+      tag: "hero",
+      sort: "recommended",
+    });
+  });
+
   it("prefers structured results and uses bounded JSON text only as fallback", () => {
     expect(
       projectTwentyFirstToolPayload({

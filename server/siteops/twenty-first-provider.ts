@@ -424,6 +424,8 @@ async function retrieveFunnel(input: {
         query: query.query,
         type: "component",
         limit: query.limit,
+        ...(query.role === "foundation" ? { tag: "hero" as const } : {}),
+        sort: "recommended",
       }),
     };
     searchEnvelopes.push(envelope);
@@ -670,6 +672,8 @@ async function persistDefaultBoard(
           description: item.candidate.description,
           author: item.candidate.author,
           sourceUrl: item.candidate.sourceUrl,
+          catalogRole: item.candidate.catalogRole,
+          heroEligibility: item.candidate.heroEligibility,
           visualEvidence: item.visualEvidence,
           taxonomy: {
             ...item.taxonomy,
@@ -695,8 +699,8 @@ async function persistDefaultBoard(
       role: "assistant",
       content:
         input.mirroredCandidates.length === 9
-          ? "已准备 9 个真实视觉方向，请选择 A–I，或明确委托 AI 选择最高分。"
-          : `当前目录可用 ${input.mirroredCandidates.length} 个真实视觉方向，已按实际结果展示，未使用假图补齐。`,
+          ? "已准备 9 个真实首页 Hero 视觉方向，请选择 A–I，或明确委托 AI 选择。"
+          : `当前目录可用 ${input.mirroredCandidates.length} 个真实首页 Hero 视觉方向，已按实际结果展示，未使用其他区块或假图补齐。`,
       sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
       metadata: {
         siteOps: {
@@ -884,41 +888,47 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "21st 本轮目录结果没有可安全读取的 HTTPS 视觉预览。",
         );
       }
+      if (funnel.retrievalShortlist.length === 0) {
+        throw new TwentyFirstProviderFailure(
+          "NO_HERO_VISUAL_CANDIDATES",
+          "本轮目录结果中没有可安全展示的首页 Hero 视觉方向，未使用其他区块或假图补位。",
+        );
+      }
       stage = "mirror_previews";
       const mirrored = await mirrorCandidates({
         operation,
         context,
-        candidates: funnel.retrievalShortlist,
+        candidates: [
+          ...funnel.retrievalShortlist,
+          ...funnel.supportingCandidates,
+        ],
         signal,
         fetchPreview,
         persistArtifact,
         diagnostics,
       });
-      if (mirrored.length === 0) {
+      const heroReferences = mirrored.filter(
+        (item) =>
+          item.candidate.catalogRole === "hero" &&
+          item.candidate.heroEligibility.eligible,
+      );
+      if (heroReferences.length === 0) {
         throw new TwentyFirstProviderFailure(
           "PREVIEW_MIRROR_FAILED",
-          "21st 返回了真实预览，但本轮下载、解码或安全保存均未成功。",
+          "目录返回了首页 Hero 预览，但本轮下载、解码或安全保存均未成功。",
         );
       }
-      const foundation = mirrored.filter(
-        (item) => item.candidate.queryRole === "foundation",
+      const supportingReferences = mirrored.filter(
+        (item) => item.candidate.catalogRole === "support",
       );
-      const nonFoundation = mirrored.filter(
-        (item) => item.candidate.queryRole !== "foundation",
-      );
-      const displayReferences = [...foundation, ...nonFoundation].slice(0, 9);
+      const displayReferences = heroReferences.slice(0, 9);
       const mirroredCandidates: MirroredCandidate[] = displayReferences.map(
         (item, index) => ({
           ...item,
           optionLabel: String.fromCharCode(65 + index),
         }),
       );
-      const displayedIds = new Set(
-        displayReferences.map((item) => item.candidate.providerItemKey),
-      );
-      const supportingReferences = nonFoundation
-        .filter((item) => !displayedIds.has(item.candidate.providerItemKey))
-        .slice(0, 2);
+      const selectedSupportingReferences = supportingReferences.slice(0, 2);
       const degradedReasons = funnel.degradedReasons.filter(
         (reason) => !reason.startsWith("PRESENTATION_RESULTS_INSUFFICIENT:"),
       );
@@ -956,7 +966,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           score: item.candidate.score,
           rationale: item.candidate.rationale,
         })),
-        supportingCandidates: supportingReferences.map((item) => ({
+        supportingCandidates: selectedSupportingReferences.map((item) => ({
           id: item.sampleId,
           queryAxis: item.candidate.queryAxis,
           providerItemKey: item.candidate.providerItemKey,
@@ -1022,8 +1032,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
         },
         message:
           mirroredCandidates.length === 9
-            ? "9 个真实视觉方向已准备完成，请选择 A–I。"
-            : `${mirroredCandidates.length} 个真实视觉方向已按实际可用结果展示。`,
+            ? "9 个真实首页 Hero 视觉方向已准备完成，请选择 A–I。"
+            : `${mirroredCandidates.length} 个真实首页 Hero 视觉方向已按实际可用结果展示。`,
       };
     } catch (error) {
       console.error("[SiteOps21st] visual_search_failed", {

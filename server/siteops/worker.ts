@@ -17,6 +17,7 @@ import {
   type SiteOpsProviderResult,
 } from "./providers";
 import { siteOpsQuotaStateForProviderResult } from "./quota-service";
+import { publicSiteOpsProviderResult } from "./public-errors";
 
 const DEFAULT_LEASE_MS = 2 * 60_000;
 const DEFAULT_TIMEOUT_MS = 90_000;
@@ -149,7 +150,7 @@ async function invokeProvider(operation: Claimed) {
 async function finalize(
   db: any,
   operation: Claimed,
-  result: SiteOpsProviderResult,
+  providerResult: SiteOpsProviderResult,
 ) {
   await db.transaction(async (tx: any) => {
     const lockedRows = await tx
@@ -166,6 +167,7 @@ async function finalize(
     ) {
       return;
     }
+    const result = publicSiteOpsProviderResult(locked.provider, providerResult);
     const now = new Date();
     if (result.status === "pending") {
       const nextPollMs = Math.max(

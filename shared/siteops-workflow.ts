@@ -20,8 +20,23 @@ export type TwentyFirstQueryAxis =
 export type TwentyFirstQuery = {
   role: TwentyFirstQueryRole;
   axis: TwentyFirstQueryAxis;
-  limit: 2 | 5 | 6;
+  limit: 2 | 4 | 5 | 6;
   query: string;
+};
+
+export type HeroVisualConfidence = "explicit" | "strong" | "conditional";
+
+export type HeroVisualVariant =
+  | "centered_statement"
+  | "split_media"
+  | "editorial_modular"
+  | "immersive_visual";
+
+export type HeroEligibilityV1 = {
+  eligible: boolean;
+  confidence: HeroVisualConfidence | null;
+  variant: HeroVisualVariant;
+  reasons: string[];
 };
 
 export type TwentyFirstSearchEnvelope = {
@@ -140,6 +155,8 @@ export type TwentyFirstVisualScore = {
 export type NormalizedTwentyFirstCandidate = NormalizedTwentyFirstSearchItem & {
   providerResponseSha256: string;
   normalizedDirectives: SafeVisualDirective[];
+  catalogRole: "hero" | "support" | "rejected";
+  heroEligibility: HeroEligibilityV1;
   score: number;
   scoreBreakdown: TwentyFirstVisualScore;
   rationale: string;
@@ -496,12 +513,12 @@ export function createVisualEvidenceV1(
 export function composeTwentyFirstQueries(
   brief: SiteBrief,
 ): TwentyFirstQuery[] {
+  const genericFragment =
+    /^(?:企业与品牌概览|品牌概览|公司介绍|关于我们|产品与服务|首页|知识库|home|about(?: us)?|products?(?: and services)?|company overview)$/iu;
   const safeFragments = [
     brief.companyName,
-    ...brief.offerings,
-    ...brief.audience,
-    brief.conversionGoal,
-    ...brief.routes.map((route) => route.title),
+    ...brief.offerings.slice(0, 2),
+    ...brief.audience.slice(0, 1),
   ]
     .map((value) =>
       value
@@ -510,38 +527,44 @@ export function composeTwentyFirstQueries(
         .replace(/[^\p{L}\p{N}\s+&._/-]/gu, " ")
         .replace(/\s+/gu, " ")
         .trim()
-        .slice(0, 80),
+        .slice(0, 64),
     )
-    .filter((value) => value && !SENSITIVE_TEXT.test(value));
+    .filter(
+      (value) =>
+        value && !genericFragment.test(value) && !SENSITIVE_TEXT.test(value),
+    );
   const context = Array.from(new Set(safeFragments))
-    .slice(0, 8)
+    .slice(0, 4)
     .join(" ")
-    .slice(0, 320);
+    .slice(0, 180);
+  const suffix = context ? ` for ${context}` : "";
   return [
     {
       role: "foundation",
       axis: "foundation_split",
-      limit: 5,
-      query: `${context} business landing page hero split layout`.trim(),
+      limit: 6,
+      query:
+        `hero section landing page split media product visual${suffix}`.trim(),
     },
     {
       role: "foundation",
       axis: "foundation_editorial_modular",
-      limit: 5,
-      query: `${context} editorial asymmetric modular bento hero`.trim(),
+      limit: 6,
+      query:
+        `hero section landing page editorial asymmetric modular bento${suffix}`.trim(),
     },
     {
       role: "section",
       axis: "section_proof_conversion",
-      limit: 6,
-      query:
-        `${context} services features proof testimonial FAQ contact CTA`.trim(),
+      limit: 4,
+      query: `homepage proof testimonial CTA section${suffix}`.trim(),
     },
     {
       role: "motion",
       axis: "motion_accessible",
       limit: 2,
-      query: `${context} subtle interaction responsive reduced motion`.trim(),
+      query:
+        `hero subtle interaction responsive reduced motion${suffix}`.trim(),
     },
   ];
 }
@@ -662,11 +685,117 @@ function clampScore(value: number) {
   return Math.max(0, Math.min(100, Math.round(value * 100) / 100));
 }
 
+const EXPLICIT_HERO_METADATA =
+  /(?:^|[^a-z0-9])(?:hero(?:\s+section)?|masthead|above[- ]the[- ]fold)(?:$|[^a-z0-9])/iu;
+const STRONG_HERO_METADATA =
+  /(?:landing[- ]page\s+(?:hero|header)|homepage\s+hero)/iu;
+const CONDITIONAL_HERO_METADATA = /(?:landing[- ]page|landing\s+page)/iu;
+const NON_HERO_METADATA =
+  /(?:^|[^a-z0-9])(?:pricing|sidebar|dashboard|admin|settings?|comparison|compare|table|case[- ]?stud(?:y|ies)|testimonial|timeline|activity|tracker|faq|footer|navbar|navigation|log[- ]?in|sign[- ]?up|auth|checkout|cta)(?:$|[^a-z0-9])/iu;
+
+function heroVariantForMetadata(
+  value: string,
+  axis: TwentyFirstQueryAxis,
+): HeroVisualVariant {
+  if (/(?:immersive|cinematic|full[- ]?screen|3d|spatial)/iu.test(value)) {
+    return "immersive_visual";
+  }
+  if (/(?:editorial|asymmetric|magazine|modular|bento|masonry)/iu.test(value)) {
+    return "editorial_modular";
+  }
+  if (
+    /(?:split|two[- ]column|side[- ]by[- ]side|media|product\s+visual)/iu.test(
+      value,
+    )
+  ) {
+    return "split_media";
+  }
+  if (axis === "foundation_split") return "split_media";
+  if (axis === "foundation_editorial_modular") {
+    return "editorial_modular";
+  }
+  return "centered_statement";
+}
+
+/**
+ * Query provenance is not evidence that a catalog item is a Hero. Only the
+ * provider's safe title/description/page coordinate may establish that role.
+ */
+export function classifyHeroEligibility(
+  item: Pick<
+    NormalizedTwentyFirstSearchItem,
+    "title" | "description" | "sourceUrl" | "queryAxis"
+  >,
+): HeroEligibilityV1 {
+  const metadata = [item.title, item.description, item.sourceUrl]
+    .filter(Boolean)
+    .join(" ")
+    .normalize("NFKC");
+  const variant = heroVariantForMetadata(metadata, item.queryAxis);
+  if (EXPLICIT_HERO_METADATA.test(metadata)) {
+    return {
+      eligible: true,
+      confidence: "explicit",
+      variant,
+      reasons: ["explicit-hero-metadata"],
+    };
+  }
+  if (STRONG_HERO_METADATA.test(metadata)) {
+    return {
+      eligible: true,
+      confidence: "strong",
+      variant,
+      reasons: ["landing-page-header-metadata"],
+    };
+  }
+  if (
+    CONDITIONAL_HERO_METADATA.test(metadata) &&
+    !NON_HERO_METADATA.test(metadata)
+  ) {
+    return {
+      eligible: true,
+      confidence: "conditional",
+      variant,
+      reasons: ["landing-page-metadata-without-section-markers"],
+    };
+  }
+  return {
+    eligible: false,
+    confidence: null,
+    variant,
+    reasons: [
+      NON_HERO_METADATA.test(metadata)
+        ? "non-hero-section-marker"
+        : "missing-hero-evidence",
+    ],
+  };
+}
+
+function catalogRoleForCandidate(
+  item: Pick<NormalizedTwentyFirstSearchItem, "queryRole">,
+  heroEligibility: HeroEligibilityV1,
+): NormalizedTwentyFirstCandidate["catalogRole"] {
+  if (item.queryRole !== "foundation") return "support";
+  return heroEligibility.eligible ? "hero" : "rejected";
+}
+
 function defaultScore(
   item: NormalizedTwentyFirstSearchItem,
   directives: readonly SafeVisualDirective[],
+  heroEligibility = classifyHeroEligibility(item),
 ): TwentyFirstVisualScore {
-  const rankSignal = Math.max(4, 15 - (item.searchRank - 1) * 0.45);
+  const confidenceSignal =
+    heroEligibility.confidence === "explicit"
+      ? 5
+      : heroEligibility.confidence === "strong"
+        ? 3
+        : heroEligibility.confidence === "conditional"
+          ? 1
+          : 0;
+  const rankSignal = Math.max(
+    4,
+    15 - (item.queryRank - 1) * 0.65 + confidenceSignal,
+  );
   const hasResponsive = directives.includes("responsive:mobile-reflow");
   const hasReducedMotion = directives.includes(
     "motion:reduced-motion-required",
@@ -785,12 +914,16 @@ export function normalizeTwentyFirstDetail(input: {
     previewPublicCoordinate,
     metadataSha256: canonicalSha256(metadataProjection),
   };
+  const heroEligibility = classifyHeroEligibility(normalizedItem);
   const scoreBreakdown =
-    input.score ?? defaultScore(normalizedItem, normalizedDirectives);
+    input.score ??
+    defaultScore(normalizedItem, normalizedDirectives, heroEligibility);
   return {
     ...normalizedItem,
     providerResponseSha256: canonicalSha256(input.detail.payload),
     normalizedDirectives,
+    catalogRole: catalogRoleForCandidate(normalizedItem, heroEligibility),
+    heroEligibility,
     scoreBreakdown,
     score: scoreTotal(scoreBreakdown),
     rationale: `${input.searchItem.queryRole} 参考；按真实目录排名和安全视觉特征评估。`,
@@ -802,9 +935,13 @@ export type TwentyFirstSearchOnlyFunnelResult = {
   targets: typeof SITEOPS_VISUAL_FUNNEL_TARGETS;
   actual: { searched: number; shortlisted: number };
   searchedCandidates: NormalizedTwentyFirstSearchItem[];
+  /** At most twelve eligible Hero references, ordered for visual diversity. */
   retrievalShortlist: NormalizedTwentyFirstCandidate[];
+  /** Hidden section/motion references; these never fill the A-I board. */
+  supportingCandidates: NormalizedTwentyFirstCandidate[];
   degradedReasons: string[];
   rejectedMetadata: number;
+  rejectedHero: number;
   generateUsed: false;
   providerCodeReuse: false;
 };
@@ -816,7 +953,12 @@ function searchCandidate(
     const normalizedDirectives = extractSafeVisualDirectives(
       [item.title, item.description, item.author].filter(Boolean).join(" "),
     );
-    const scoreBreakdown = defaultScore(item, normalizedDirectives);
+    const heroEligibility = classifyHeroEligibility(item);
+    const scoreBreakdown = defaultScore(
+      item,
+      normalizedDirectives,
+      heroEligibility,
+    );
     return {
       ...item,
       // Hash only the allowlisted catalog projection. The raw MCP response,
@@ -829,6 +971,8 @@ function searchCandidate(
         metadataSha256: item.metadataSha256,
       }),
       normalizedDirectives,
+      catalogRole: catalogRoleForCandidate(item, heroEligibility),
+      heroEligibility,
       scoreBreakdown,
       score: scoreTotal(scoreBreakdown),
       rationale: `${item.queryAxis} 参考；按真实目录排名和安全视觉特征评估。`,
@@ -848,6 +992,59 @@ function interleaveCandidates(
   for (let index = 0; index < length; index += 1) {
     if (left[index]) result.push(left[index]!);
     if (right[index]) result.push(right[index]!);
+  }
+  return result;
+}
+
+const HERO_VARIANT_ORDER: readonly HeroVisualVariant[] = [
+  "centered_statement",
+  "split_media",
+  "editorial_modular",
+  "immersive_visual",
+];
+
+function diverseHeroCandidates(
+  candidates: readonly NormalizedTwentyFirstCandidate[],
+) {
+  const result: NormalizedTwentyFirstCandidate[] = [];
+  const confidenceOrder: readonly HeroVisualConfidence[] = [
+    "explicit",
+    "strong",
+    "conditional",
+  ];
+  for (const confidence of confidenceOrder) {
+    const tier = candidates
+      .filter(
+        (candidate) => candidate.heroEligibility.confidence === confidence,
+      )
+      .sort(
+        (left, right) =>
+          left.queryRank - right.queryRank ||
+          left.searchRank - right.searchRank ||
+          left.providerItemKey.localeCompare(right.providerItemKey),
+      );
+    const buckets = new Map<
+      HeroVisualVariant,
+      NormalizedTwentyFirstCandidate[]
+    >(
+      HERO_VARIANT_ORDER.map((variant) => [
+        variant,
+        tier.filter(
+          (candidate) => candidate.heroEligibility.variant === variant,
+        ),
+      ]),
+    );
+    let added = true;
+    while (added) {
+      added = false;
+      for (const variant of HERO_VARIANT_ORDER) {
+        const candidate = buckets.get(variant)?.shift();
+        if (candidate) {
+          result.push(candidate);
+          added = true;
+        }
+      }
+    }
   }
   return result;
 }
@@ -873,35 +1070,31 @@ export function buildTwentyFirstSearchOnlyFunnel(input: {
     return [normalized];
   });
   const withPreview = candidates.filter((candidate) => candidate.previewUrl);
-  const split = withPreview.filter(
-    (candidate) => candidate.queryAxis === "foundation_split",
+  const eligibleHeroes = diverseHeroCandidates(
+    withPreview.filter(
+      (candidate) =>
+        candidate.catalogRole === "hero" && candidate.heroEligibility.eligible,
+    ),
   );
-  const editorial = withPreview.filter(
-    (candidate) => candidate.queryAxis === "foundation_editorial_modular",
-  );
-  const foundation = interleaveCandidates(split, editorial);
   const section = withPreview.filter(
-    (candidate) => candidate.queryAxis === "section_proof_conversion",
+    (candidate) =>
+      candidate.catalogRole === "support" &&
+      candidate.queryAxis === "section_proof_conversion",
   );
   const motion = withPreview.filter(
-    (candidate) => candidate.queryAxis === "motion_accessible",
+    (candidate) =>
+      candidate.catalogRole === "support" &&
+      candidate.queryAxis === "motion_accessible",
   );
   const supporting = interleaveCandidates(section, motion);
-  const shortlist: NormalizedTwentyFirstCandidate[] = [];
-  const selectedKeys = new Set<string>();
-  const append = (candidate: NormalizedTwentyFirstCandidate | undefined) => {
-    if (
-      candidate &&
-      shortlist.length < SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve &&
-      !selectedKeys.has(candidate.providerItemKey)
-    ) {
-      selectedKeys.add(candidate.providerItemKey);
-      shortlist.push(candidate);
-    }
-  };
-  foundation.slice(0, SITEOPS_VISUAL_FUNNEL_TARGETS.present).forEach(append);
-  supporting.slice(0, 3).forEach(append);
-  [...foundation, ...supporting].forEach(append);
+  const shortlist = eligibleHeroes.slice(
+    0,
+    SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve,
+  );
+  const supportingCandidates = supporting.slice(0, 2);
+  const rejectedHero = candidates.filter(
+    (candidate) => candidate.catalogRole === "rejected",
+  ).length;
   const degradedReasons: string[] = [];
   if (searchedCandidates.length < SITEOPS_VISUAL_FUNNEL_TARGETS.search) {
     degradedReasons.push(
@@ -916,6 +1109,9 @@ export function buildTwentyFirstSearchOnlyFunnel(input: {
   if (rejectedMetadata > 0) {
     degradedReasons.push(`SEARCH_METADATA_REJECTED:${rejectedMetadata}`);
   }
+  if (rejectedHero > 0) {
+    degradedReasons.push(`NON_HERO_RESULTS_REJECTED:${rejectedHero}`);
+  }
   return {
     targets: SITEOPS_VISUAL_FUNNEL_TARGETS,
     actual: {
@@ -924,8 +1120,10 @@ export function buildTwentyFirstSearchOnlyFunnel(input: {
     },
     searchedCandidates,
     retrievalShortlist: shortlist,
+    supportingCandidates,
     degradedReasons,
     rejectedMetadata,
+    rejectedHero,
     generateUsed: false,
     providerCodeReuse: false,
   };
@@ -959,15 +1157,14 @@ export function buildTwentyFirstVisualFunnel(input: {
     });
     if (normalized) retrievalShortlist.push(normalized);
   }
-  const presentedCandidates = retrievalShortlist
-    .filter(
+  const presentedCandidates = diverseHeroCandidates(
+    retrievalShortlist.filter(
       (candidate) =>
-        candidate.queryRole === "foundation" && Boolean(candidate.previewUrl),
-    )
-    .sort(
-      (left, right) =>
-        right.score - left.score || left.searchRank - right.searchRank,
-    )
+        candidate.catalogRole === "hero" &&
+        candidate.heroEligibility.eligible &&
+        Boolean(candidate.previewUrl),
+    ),
+  )
     .slice(0, SITEOPS_VISUAL_FUNNEL_TARGETS.present)
     .map((candidate, index) => ({
       ...candidate,
@@ -975,7 +1172,7 @@ export function buildTwentyFirstVisualFunnel(input: {
       presentationRank: index + 1,
     }));
   const supportingCandidates = retrievalShortlist
-    .filter((candidate) => candidate.queryRole !== "foundation")
+    .filter((candidate) => candidate.catalogRole === "support")
     .sort(
       (left, right) =>
         right.score - left.score || left.searchRank - right.searchRank,

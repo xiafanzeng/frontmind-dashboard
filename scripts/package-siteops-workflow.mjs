@@ -6,6 +6,7 @@ import JSZip from "jszip";
 
 export const SITEOPS_UPSTREAM_SHA256 =
   "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a";
+export const SITEOPS_RUNTIME_VERSION = "1.4.0";
 
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -16,7 +17,10 @@ const upstreamPath = path.join(
   sourceRoot,
   "astro-company-site-workflow-v1.0.0.zip",
 );
-const runtimeRoot = path.join(sourceRoot, "astro-company-site-workflow-v1.3.0");
+const runtimeRoot = path.join(
+  sourceRoot,
+  `astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`,
+);
 const manifestPath = path.join(runtimeRoot, "MANIFEST.json");
 const materializerPath = path.join(
   projectRoot,
@@ -104,7 +108,7 @@ export async function createSiteOpsRuntimeManifest() {
   return {
     schema: "frontmind-runtime-workflow-manifest/v1",
     name: "frontmind-astro-company-site-workflow",
-    version: "1.3.0",
+    version: SITEOPS_RUNTIME_VERSION,
     entrypoint: "SKILL.md",
     upstream: {
       version: "1.0.0",

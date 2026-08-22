@@ -65,6 +65,10 @@ import {
 } from "./aliyun-provider";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import {
+  publicSiteOpsErrorProjection,
+  sanitizeFrontMindPublicText,
+} from "./public-errors";
+import {
   assertSiteOpsServiceEntitlement,
   reserveSiteOpsQuota,
   siteOpsQuotaPeriodIds,
@@ -289,6 +293,73 @@ function compactKnowledgeText(value: unknown, max = 600) {
     .slice(0, max);
 }
 
+const GENERIC_SITE_IDENTITY =
+  /^(?:企业与品牌概览|品牌概览|公司介绍|企业介绍|关于我们|产品与服务|首页|知识库|企业概览)$/u;
+
+function siteIdentityCandidate(value: unknown) {
+  const candidate = compactKnowledgeText(value, 255)
+    .replace(/^[\s「」『』“”"']+|[\s「」『』“”"']+$/gu, "")
+    .replace(/(?:知识库|knowledge[\s_-]*base)$/iu, "")
+    .trim();
+  if (
+    candidate.length < 2 ||
+    candidate.length > 80 ||
+    GENERIC_SITE_IDENTITY.test(candidate)
+  ) {
+    return "";
+  }
+  return candidate;
+}
+
+function companyIdentityFromPublicDocuments(
+  documents: Array<
+    (typeof knowledgeBaseSnapshots.$inferSelect)["documents"][number]
+  >,
+  sourceFileName: string,
+) {
+  const contents = documents.map((document) =>
+    document.content.slice(0, 100_000),
+  );
+  const firstMatch = (patterns: RegExp[]) => {
+    for (const pattern of patterns) {
+      for (const content of contents) {
+        const candidate = siteIdentityCandidate(content.match(pattern)?.[1]);
+        if (candidate) return candidate;
+      }
+    }
+    return "";
+  };
+
+  const publicBrand = firstMatch([
+    /(?:对外品牌|品牌名称|品牌名)\s*[:：为是]\s*[「『“"']?([^「」『』“”"'\n，。；;]{2,80})/u,
+    /(?:以|使用)\s*[「『“"']([^」』”"']{2,80})[」』”"']\s*(?:为|作为)\s*(?:对外)?品牌/u,
+    /(?:以|使用)\s*([\p{L}\p{N}·&（）()\- ]{2,80})\s*(?:为|作为)\s*(?:对外)?品牌/u,
+  ]);
+  if (publicBrand) return { companyName: publicBrand, unresolved: false };
+
+  const legalName = firstMatch([
+    /(?:公司名称|企业名称)\s*[:：为是]\s*[「『“"']?([^「」『』“”"'\n，。；;]{2,80})/u,
+  ]);
+  if (legalName) return { companyName: legalName, unresolved: false };
+
+  const introductoryName = firstMatch([
+    /(?:^|[。！？\n])\s*([\p{L}\p{N}·&（）()\-]{2,80})\s*是一家[^。！？\n]{0,180}(?:公司|企业)/u,
+  ]);
+  if (introductoryName) {
+    return { companyName: introductoryName, unresolved: false };
+  }
+
+  for (const document of documents) {
+    const title = siteIdentityCandidate(document.title);
+    if (title) return { companyName: title, unresolved: false };
+  }
+  const fileName = siteIdentityCandidate(
+    sourceFileName.replace(/\.(?:zip|md)$/iu, ""),
+  );
+  if (fileName) return { companyName: fileName, unresolved: false };
+  return { companyName: "待确认企业名称", unresolved: true };
+}
+
 export function siteBriefFromSnapshot(
   snapshot: typeof knowledgeBaseSnapshots.$inferSelect,
 ): SiteBrief {
@@ -308,18 +379,11 @@ export function siteBriefFromSnapshot(
   const overview =
     publicDocuments.find((document) => document.kind === "overview") ??
     publicDocuments[0];
-  const companyName =
-    compactKnowledgeText(
-      overview?.content.match(
-        /(?:公司名称|企业名称|品牌名称)\s*[:：]\s*([^\n]+)/u,
-      )?.[1],
-      255,
-    ) ||
-    compactKnowledgeText(overview?.title, 255) ||
-    compactKnowledgeText(
-      snapshot.sourceFileName.replace(/\.(zip|md)$/iu, ""),
-      255,
-    );
+  const identity = companyIdentityFromPublicDocuments(
+    publicDocuments,
+    snapshot.sourceFileName,
+  );
+  const companyName = identity.companyName;
   const offeringDocuments = publicDocuments.filter((document) =>
     /(?:产品|服务|解决方案|业务)/u.test(
       `${document.branchTitle ?? ""} ${document.title}`,
@@ -431,6 +495,7 @@ export function siteBriefFromSnapshot(
     verifiedFacts,
     publicAssetIds,
     unknowns: [
+      ...(identity.unresolved ? ["需要确认企业或品牌名称"] : []),
       ...(audience.length > 0 ? [] : ["需要进一步确认核心目标受众"]),
       ...(contacts.length > 0 ? [] : ["知识库中暂无可公开的已验证联系方式"]),
     ],
@@ -517,17 +582,54 @@ const RESETTABLE_PRE_BUILD_STATUSES = new Set([
   "attention_required",
 ]);
 
+const publicHeroEligibilitySchema = z
+  .object({
+    variant: z.enum([
+      "centered_statement",
+      "split_media",
+      "editorial_modular",
+      "immersive_visual",
+    ]),
+    confidence: z.enum(["explicit", "strong", "conditional"]),
+  })
+  .passthrough();
+
+function publicVisualMetadata(value: unknown) {
+  const metadata =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const eligibility = publicHeroEligibilitySchema.safeParse(
+    metadata.heroEligibility,
+  );
+  return {
+    providerTitle:
+      typeof metadata.title === "string" ? metadata.title.trim() : "",
+    score: typeof metadata.score === "number" ? metadata.score : 0,
+    ...(eligibility.success
+      ? {
+          heroVariant: eligibility.data.variant,
+          heroConfidence: eligibility.data.confidence,
+        }
+      : {}),
+  };
+}
+
 export function siteOpsResetCapability(input: {
   projectStatus: string;
   currentBuild: boolean;
   liveHead: boolean;
   hasBuild: boolean;
+  resettableFailedBuild?: boolean;
   hasDeployment: boolean;
   hasBlockingOperation: boolean;
   hasActiveDns: boolean;
   hasUnresolvedFinancialIntent: boolean;
 }) {
-  if (input.currentBuild || input.hasBuild) {
+  if (
+    (input.currentBuild || input.hasBuild) &&
+    input.resettableFailedBuild !== true
+  ) {
     return {
       allowed: false as const,
       reason: "已有官网版本，不能重置为全新首轮任务。请使用版本修改或回滚。",
@@ -570,6 +672,40 @@ export function siteOpsResetCapability(input: {
     };
   }
   return { allowed: true as const };
+}
+
+export function isSiteOpsFailedBuildResettable(input: {
+  ordinal: number;
+  parentBuildId: string | null;
+  status: string;
+  upstreamManusTaskId: string | null;
+  contractLocalAssetId: string | null;
+  contractHash: string | null;
+  sourceLocalAssetId: string | null;
+  sourceHash: string | null;
+  distLocalAssetId: string | null;
+  distHash: string | null;
+  qaLocalAssetId: string | null;
+  provenanceLocalAssetId: string | null;
+  approvedAt: Date | null;
+  hasProviderTask: boolean;
+}) {
+  return (
+    input.ordinal === 1 &&
+    input.parentBuildId === null &&
+    ["failed", "attention_required"].includes(input.status) &&
+    input.upstreamManusTaskId === null &&
+    !input.hasProviderTask &&
+    input.contractLocalAssetId === null &&
+    input.contractHash === null &&
+    input.sourceLocalAssetId === null &&
+    input.sourceHash === null &&
+    input.distLocalAssetId === null &&
+    input.distHash === null &&
+    input.qaLocalAssetId === null &&
+    input.provenanceLocalAssetId === null &&
+    input.approvedAt === null
+  );
 }
 
 async function appendMessage(
@@ -674,7 +810,7 @@ async function loadProviderState(executor: any, projectId: string) {
         ? undefined
         : "系统管理员尚未配置有效的 21st API Key",
     },
-    manus: {
+    aiBuilder: {
       status: slots.has("website")
         ? ("configured" as const)
         : ("not_configured" as const),
@@ -750,6 +886,7 @@ async function projectObservation(
     activeAliyunOperationRows,
     unresolvedFinancialRows,
     resetOperationRows,
+    providerTaskRows,
     activeDnsRecordRows,
   ] = await Promise.all([
     executor
@@ -905,6 +1042,20 @@ async function projectObservation(
       )
       .limit(1),
     executor
+      .select({
+        buildId: siteOperations.buildId,
+        providerTaskId: siteOperations.providerTaskId,
+      })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.project.id),
+          eq(siteOperations.userId, input.userId),
+          isNotNull(siteOperations.providerTaskId),
+        ),
+      )
+      .limit(50),
+    executor
       .select({ id: siteDnsRecords.id })
       .from(siteDnsRecords)
       .where(
@@ -934,15 +1085,38 @@ async function projectObservation(
     (row: typeof messages.$inferSelect) => {
       const metadata = (row.metadata ?? {}) as Record<string, unknown>;
       const siteOps = metadata.siteOps as Record<string, unknown> | undefined;
-      const projectedMetadata =
+      const statusProjectedMetadata =
         siteOps?.status === "active" &&
         Number(siteOps.revision) !== input.project.revision
           ? { ...metadata, siteOps: { ...siteOps, status: "expired" } }
           : metadata;
+      const statusProjectedSiteOps = statusProjectedMetadata.siteOps as
+        | Record<string, unknown>
+        | undefined;
+      const payload = statusProjectedSiteOps?.payload as
+        | Record<string, unknown>
+        | undefined;
+      const publicError = publicSiteOpsErrorProjection({
+        code: typeof payload?.errorCode === "string" ? payload.errorCode : null,
+        message: row.role === "assistant" ? row.content : null,
+      });
+      const projectedMetadata =
+        statusProjectedSiteOps && payload && publicError.code
+          ? {
+              ...statusProjectedMetadata,
+              siteOps: {
+                ...statusProjectedSiteOps,
+                payload: { ...payload, errorCode: publicError.code },
+              },
+            }
+          : statusProjectedMetadata;
       return {
         id: row.id,
         role: row.role,
-        content: row.content,
+        content:
+          row.role === "assistant" && siteOps
+            ? publicError.message || sanitizeFrontMindPublicText(row.content)
+            : row.content,
         sequence: row.sequence,
         metadata: projectedMetadata,
         sentAt: row.sentAt.toISOString(),
@@ -959,6 +1133,25 @@ async function projectObservation(
   const dnsPlanItems = Array.isArray(latestDnsPlanResult?.plan)
     ? latestDnsPlanResult.plan
     : [];
+  const activeBuildRows = buildRows.filter(
+    (row: typeof siteBuilds.$inferSelect) =>
+      !["cancelled", "superseded"].includes(row.status),
+  );
+  const currentBuild = activeBuildRows.find(
+    (row: typeof siteBuilds.$inferSelect) =>
+      row.id === input.project.currentBuildId,
+  );
+  const resettableFailedBuild = Boolean(
+    currentBuild &&
+      activeBuildRows.length === 1 &&
+      isSiteOpsFailedBuildResettable({
+        ...currentBuild,
+        hasProviderTask: providerTaskRows.some(
+          (row: { buildId: string | null; providerTaskId: string | null }) =>
+            row.buildId === currentBuild.id && Boolean(row.providerTaskId),
+        ),
+      }),
+  );
   const resetCapability = siteOpsResetCapability({
     projectStatus: input.project.status,
     currentBuild: Boolean(input.project.currentBuildId),
@@ -966,7 +1159,8 @@ async function projectObservation(
       input.project.globalLiveDeploymentId ||
         input.project.mainlandLiveDeploymentId,
     ),
-    hasBuild: buildRows.length > 0,
+    hasBuild: activeBuildRows.length > 0,
+    resettableFailedBuild,
     hasDeployment: deploymentRows.length > 0,
     hasBlockingOperation: resetOperationRows.length > 0,
     hasActiveDns: activeDnsRecordRows.length > 0,
@@ -1148,37 +1342,52 @@ async function projectObservation(
       })),
     messages: messagesProjected,
     visualCandidates: candidateRows.map(
-      (row: typeof websiteStyleSamples.$inferSelect) => ({
-        id: row.id,
-        label: row.label,
-        title: row.note?.trim() || `视觉方向 ${row.label}`,
-        previewUrl: `/api/site-ops/style-previews/${row.id}`,
-        note: row.note,
-        score: Number(row.sourceMetadata?.score ?? 0),
-        selected: buildRows.some(
-          (build: typeof siteBuilds.$inferSelect) =>
-            build.styleSampleId === row.id &&
-            !["cancelled", "superseded"].includes(build.status),
-        ),
-      }),
+      (row: typeof websiteStyleSamples.$inferSelect) => {
+        const { providerTitle, ...heroMetadata } = publicVisualMetadata(
+          row.sourceMetadata,
+        );
+        return {
+          id: row.id,
+          label: row.label,
+          title: providerTitle || row.note?.trim() || `视觉方向 ${row.label}`,
+          previewUrl: `/api/site-ops/style-previews/${row.id}`,
+          note: row.note,
+          ...heroMetadata,
+          selected: buildRows.some(
+            (build: typeof siteBuilds.$inferSelect) =>
+              build.styleSampleId === row.id &&
+              !["cancelled", "superseded"].includes(build.status),
+          ),
+        };
+      },
     ),
-    builds: buildRows.map((row: typeof siteBuilds.$inferSelect) => ({
-      id: row.id,
-      parentBuildId: row.parentBuildId,
-      ordinal: row.ordinal,
-      status: row.status,
-      previewUrl: row.distLocalAssetId
-        ? `/api/site-ops/builds/${row.id}/preview/`
-        : null,
-      sourceUrl: row.sourceLocalAssetId
-        ? `/api/site-ops/builds/${row.id}/source`
-        : null,
-      qaUrl: row.qaLocalAssetId ? `/api/site-ops/builds/${row.id}/qa` : null,
-      errorCode: row.errorCode,
-      errorMessage: row.errorMessage,
-      createdAt: row.createdAt.toISOString(),
-      updatedAt: row.updatedAt.toISOString(),
-    })),
+    builds: buildRows.map((row: typeof siteBuilds.$inferSelect) => {
+      const publicError = publicSiteOpsErrorProjection({
+        code: row.errorCode,
+        message: row.errorMessage,
+        status:
+          row.status === "failed" || row.status === "attention_required"
+            ? row.status
+            : undefined,
+      });
+      return {
+        id: row.id,
+        parentBuildId: row.parentBuildId,
+        ordinal: row.ordinal,
+        status: row.status,
+        previewUrl: row.distLocalAssetId
+          ? `/api/site-ops/builds/${row.id}/preview/`
+          : null,
+        sourceUrl: row.sourceLocalAssetId
+          ? `/api/site-ops/builds/${row.id}/source`
+          : null,
+        qaUrl: row.qaLocalAssetId ? `/api/site-ops/builds/${row.id}/qa` : null,
+        errorCode: publicError.code || null,
+        errorMessage: publicError.message || null,
+        createdAt: row.createdAt.toISOString(),
+        updatedAt: row.updatedAt.toISOString(),
+      };
+    }),
     deployments: deploymentRows.map(
       (row: typeof siteDeployments.$inferSelect) => ({
         id: row.id,
@@ -1955,7 +2164,7 @@ async function handleResetWorkflow(
     )
     .for("update");
   const buildRows = await tx
-    .select({ id: siteBuilds.id })
+    .select()
     .from(siteBuilds)
     .where(
       and(
@@ -1963,7 +2172,22 @@ async function handleResetWorkflow(
         eq(siteBuilds.userId, input.actor.id),
       ),
     )
-    .limit(1)
+    .limit(50)
+    .for("update");
+  const providerTaskRows = await tx
+    .select({
+      buildId: siteOperations.buildId,
+      providerTaskId: siteOperations.providerTaskId,
+    })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        isNotNull(siteOperations.providerTaskId),
+      ),
+    )
+    .limit(50)
     .for("update");
   const deploymentRows = await tx
     .select({ id: siteDeployments.id })
@@ -2005,6 +2229,25 @@ async function handleResetWorkflow(
     .limit(1)
     .for("update");
 
+  const activeBuildRows = buildRows.filter(
+    (row: typeof siteBuilds.$inferSelect) =>
+      !["cancelled", "superseded"].includes(row.status),
+  );
+  const currentBuild = activeBuildRows.find(
+    (row: typeof siteBuilds.$inferSelect) =>
+      row.id === input.project.currentBuildId,
+  );
+  const resettableFailedBuild = Boolean(
+    currentBuild &&
+      activeBuildRows.length === 1 &&
+      isSiteOpsFailedBuildResettable({
+        ...currentBuild,
+        hasProviderTask: providerTaskRows.some(
+          (row: { buildId: string | null; providerTaskId: string | null }) =>
+            row.buildId === currentBuild.id && Boolean(row.providerTaskId),
+        ),
+      }),
+  );
   const resetCapability = siteOpsResetCapability({
     projectStatus: input.project.status,
     currentBuild: Boolean(input.project.currentBuildId),
@@ -2012,7 +2255,8 @@ async function handleResetWorkflow(
       input.project.globalLiveDeploymentId ||
         input.project.mainlandLiveDeploymentId,
     ),
-    hasBuild: buildRows.length > 0,
+    hasBuild: activeBuildRows.length > 0,
+    resettableFailedBuild,
     hasDeployment: deploymentRows.length > 0,
     hasBlockingOperation: nonterminalOperationRows.some(
       (row: { kind: string; status: string }) =>
@@ -2030,6 +2274,23 @@ async function handleResetWorkflow(
   }
 
   const now = new Date();
+  if (resettableFailedBuild && currentBuild) {
+    await tx
+      .update(siteBuilds)
+      .set({
+        status: "cancelled",
+        ...(currentBuild.quotaState === "reserved"
+          ? { quotaState: "released" as const }
+          : {}),
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(siteBuilds.id, currentBuild.id),
+          inArray(siteBuilds.status, ["failed", "attention_required"]),
+        ),
+      );
+  }
   await tx
     .update(siteOperations)
     .set({
@@ -2055,7 +2316,7 @@ async function handleResetWorkflow(
         eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
         eq(websiteStyleSampleBatches.userId, input.actor.id),
         eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-        eq(websiteStyleSampleBatches.status, "published"),
+        inArray(websiteStyleSampleBatches.status, ["published", "selected"]),
       ),
     );
   await tx

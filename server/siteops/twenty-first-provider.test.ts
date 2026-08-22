@@ -176,7 +176,7 @@ describe("21st SiteOps provider", () => {
     expect(persistBoard).not.toHaveBeenCalled();
   });
 
-  it("runs the real numeric-ID 5/5/6/2 search-only funnel without component code", async () => {
+  it("runs the real numeric-ID 6/6/4/2 Hero-first search-only funnel without component code", async () => {
     const secret = "21st_sk_never-persist-this-secret";
     const rawCode = "RAW_PROVIDER_CODE export default function Secret() {}";
     const searchCalls: Array<{
@@ -186,7 +186,7 @@ describe("21st SiteOps provider", () => {
     }> = [];
     const detailCalls: Array<string | number> = [];
     let searchIndex = 0;
-    const counts = [5, 5, 6, 2];
+    const counts = [6, 6, 4, 2];
     let nextId = 1;
     const session: TwentyFirstReadOnlySession = {
       search: vi.fn(async (input) => {
@@ -303,12 +303,12 @@ describe("21st SiteOps provider", () => {
         actual: {
           searched: 18,
           shortlisted: 12,
-          mirrored: 12,
+          mirrored: 14,
           presented: 9,
         },
       },
     });
-    expect(searchCalls.map((call) => call.limit)).toEqual([5, 5, 6, 2]);
+    expect(searchCalls.map((call) => call.limit)).toEqual([6, 6, 4, 2]);
     expect(searchCalls.every((call) => call.type === "component")).toBe(true);
     expect(searchCalls).toHaveLength(4);
     expect(detailCalls).toHaveLength(0);
@@ -324,6 +324,13 @@ describe("21st SiteOps provider", () => {
       persisted!.selectionBundle.candidates.map((item) => item.label),
     ).toEqual(["A", "B", "C", "D", "E", "F", "G", "H", "I"]);
     expect(persisted!.selectionBundle.supportingCandidates).toHaveLength(2);
+    expect(
+      persisted!.mirroredCandidates.every(
+        (item) =>
+          item.candidate.catalogRole === "hero" &&
+          item.candidate.heroEligibility.eligible,
+      ),
+    ).toBe(true);
     expect(persisted!.selectionBundle.candidates[0]).toMatchObject({
       providerItemKey: "n:1",
       visualEvidence: {
@@ -342,7 +349,7 @@ describe("21st SiteOps provider", () => {
     }
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-visual-preview"),
-    ).toHaveLength(12);
+    ).toHaveLength(14);
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"),
     ).toHaveLength(1);
@@ -489,6 +496,54 @@ describe("21st SiteOps provider", () => {
     });
   });
 
+  it("fails with NO_HERO_VISUAL_CANDIDATES instead of filling A-I with sections", async () => {
+    let searchIndex = 0;
+    const fetchPreview = vi.fn();
+    const persistBoard = vi.fn();
+    const names = ["Pricing", "Sidebar", "Testimonial", "Motion Reference"];
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            search: async () => {
+              const index = searchIndex++;
+              return {
+                results: [
+                  {
+                    id: index + 1,
+                    name: names[index],
+                    previewUrl: `https://cdn.example.test/${index + 1}.png`,
+                  },
+                ],
+              };
+            },
+          }),
+      },
+      fetchPreview,
+      persistBoard,
+    });
+
+    await expect(
+      handler({
+        operation: operation(),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "NO_HERO_VISUAL_CANDIDATES",
+    });
+    expect(fetchPreview).not.toHaveBeenCalled();
+    expect(persistBoard).not.toHaveBeenCalled();
+  });
+
   it("reports aggregate mirror diagnostics without leaking preview URLs", async () => {
     let id = 0;
     const handler = createTwentyFirstSiteOpsProviderHandler({
@@ -509,7 +564,7 @@ describe("21st SiteOps provider", () => {
                 results: [
                   {
                     id: itemId,
-                    name: `Catalog item ${itemId}`,
+                    name: `Hero Catalog item ${itemId}`,
                     previewUrl: `https://cdn.example.test/${itemId}.png?token=secret`,
                   },
                 ],

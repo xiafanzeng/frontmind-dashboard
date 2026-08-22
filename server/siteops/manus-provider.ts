@@ -25,22 +25,20 @@ import {
   type VisualSelectionBundleV1,
   type VisualSelectionBundleV2,
 } from "../../shared/siteops";
-import {
-  canonicalJson,
-  createVisualEvidenceV1,
-} from "../../shared/siteops-workflow";
+import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
   canonicalSiteOpsSha256,
   composeBuildContractV2,
-  pageContentResultV1Schema,
   siteDesignResultV1Schema,
   siteOpsRuntimeVisualEvidenceV1Schema,
   validateDesignAndContentBindings,
 } from "../../shared/siteops-design";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
+import { assertUpstreamPromptBudget } from "../upstream-prompt-budget";
 import {
   classifyManusV2StructuredResultEnvelope,
+  latestManusV2WaitingDetail,
   latestManusV2TaskState,
   ManusV2ApiError,
   ManusV2Client,
@@ -63,6 +61,17 @@ import {
   type SiteOpsProviderResult,
 } from "./providers";
 import { readSelectedOfficialLogoFromKnowledgeArchive } from "./knowledge-brand-asset";
+import {
+  pageContentResultFromWire,
+  pageContentWireOutputSchema,
+  siteDesignResultFromWire,
+  siteDesignWireOutputSchema,
+  siteOpsBuildContractAttachment,
+  siteOpsCustomerFeedbackAttachment,
+  siteOpsSocialSourceAttachment,
+  siteOpsSourceDossierAttachments,
+  socialWireOutputSchema,
+} from "./manus-wire-contract";
 
 const operationInputSchema = z
   .object({
@@ -92,11 +101,15 @@ const providerStateSchema = z
       "repair_send_ready",
       "repair_send_unknown",
       "repair_pending",
+      "create_rejected",
     ]),
     taskId: z.string().min(1).max(255).optional(),
     design: designResultSchema.optional(),
     repairKind: z.enum(["design", "content"]).optional(),
     repairAttempt: z.number().int().min(1).max(3).optional(),
+    resultPendingSince: z.string().datetime().optional(),
+    handledWaitingEventId: z.string().min(1).max(512).optional(),
+    handledWaitingAt: z.string().datetime().optional(),
   })
   .strict();
 
@@ -616,7 +629,9 @@ function operationMarker(token: string) {
 }
 
 function promptWithMarker(prompt: string, token: string) {
-  return `${prompt}\n\n# FrontMind operation contract\n${operationMarker(token)}`;
+  return assertUpstreamPromptBudget(
+    `${prompt}\n\n# FrontMind operation contract\n${operationMarker(token)}`,
+  );
 }
 
 function operationTitle(operation: SiteOperation) {
@@ -657,21 +672,54 @@ function acceptedStructuredValue(
   return null;
 }
 
-function terminalTaskState(value: string | null | undefined) {
+export function terminalTaskState(value: string | null | undefined) {
   const normalized = String(value ?? "")
     .trim()
     .toLowerCase();
   return {
     completed: [
+      "stopped",
       "completed",
       "complete",
       "finished",
       "done",
       "success",
     ].includes(normalized),
-    failed: ["failed", "error", "cancelled", "canceled", "stopped"].includes(
-      normalized,
-    ),
+    failed: ["failed", "error", "cancelled", "canceled"].includes(normalized),
+  };
+}
+
+export function combinedTerminalTaskState(
+  eventStatus: string | null | undefined,
+  detailStatus: string | null | undefined,
+) {
+  const eventState = terminalTaskState(eventStatus);
+  const detailState = terminalTaskState(detailStatus);
+  const failed = eventState.failed || detailState.failed;
+  return {
+    failed,
+    completed: !failed && (eventState.completed || detailState.completed),
+  };
+}
+
+const STRUCTURED_RESULT_GRACE_MS = 120_000;
+
+export function structuredResultGrace(
+  state: ProviderState,
+  completed: boolean,
+  now = Date.now(),
+) {
+  if (!completed) return { expired: false, state };
+  const parsed = state.resultPendingSince
+    ? Date.parse(state.resultPendingSince)
+    : Number.NaN;
+  const since = Number.isFinite(parsed) ? parsed : now;
+  return {
+    expired: now - since >= STRUCTURED_RESULT_GRACE_MS,
+    state: {
+      ...state,
+      resultPendingSince: new Date(since).toISOString(),
+    } satisfies ProviderState,
   };
 }
 
@@ -689,14 +737,13 @@ export function safePublicDocuments(
         // inferred content is excluded from the generation prompt.
         document.evidenceStatus !== "inferred",
     )
-    .slice(0, 80)
     .map((document) => ({
       id: String(document.id || document.path).slice(0, 191),
-      path: document.path,
-      title: document.title,
-      content: document.content.slice(0, 20_000),
+      path: document.path.slice(0, 512),
+      title: document.title.slice(0, 255),
+      content: document.content,
       kind: document.kind,
-      customerVisible: true,
+      customerVisible: true as const,
     }));
 }
 
@@ -753,145 +800,11 @@ function designOutputSchema(
   routeIds: string[],
   paletteSize: number,
 ): ManusV2StructuredOutputSchema {
-  const colorMaximum = Math.max(0, paletteSize - 1);
-  return {
-    type: "object",
-    properties: {
-      operationToken: { type: "string", enum: [token] },
-      designSpec: {
-        type: "object",
-        properties: {
-          schemaVersion: { type: "number", enum: [1] },
-          layoutArchetype: {
-            type: "string",
-            enum: ["hero_led", "editorial", "modular", "split", "asymmetric"],
-          },
-          heroVariant: {
-            type: "string",
-            enum: [
-              "split_media",
-              "centered_statement",
-              "editorial_lede",
-              "proof_grid",
-            ],
-          },
-          density: {
-            type: "string",
-            enum: ["compact", "balanced", "spacious"],
-          },
-          surfaceStyle: {
-            type: "string",
-            enum: ["flat", "bordered", "soft_depth", "layered"],
-          },
-          typeScale: {
-            type: "string",
-            enum: ["restrained", "editorial", "display"],
-          },
-          imageTreatment: {
-            type: "string",
-            enum: ["contained", "wide", "masked", "none"],
-          },
-          motionLevel: { type: "string", enum: ["none", "subtle"] },
-          colorRoles: {
-            type: "object",
-            properties: {
-              backgroundPaletteIndex: {
-                type: "number",
-                minimum: 0,
-                maximum: colorMaximum,
-              },
-              textPaletteIndex: {
-                type: "number",
-                minimum: 0,
-                maximum: colorMaximum,
-              },
-              accentPaletteIndex: {
-                type: "number",
-                minimum: 0,
-                maximum: colorMaximum,
-              },
-            },
-            required: [
-              "backgroundPaletteIndex",
-              "textPaletteIndex",
-              "accentPaletteIndex",
-            ],
-            additionalProperties: false,
-          },
-          routeCompositions: {
-            type: "array",
-            minItems: routeIds.length,
-            maxItems: routeIds.length,
-            items: {
-              type: "object",
-              properties: {
-                routeId: { type: "string", enum: routeIds },
-                slots: {
-                  type: "array",
-                  minItems: 1,
-                  maxItems: 16,
-                  items: {
-                    type: "object",
-                    properties: {
-                      slotId: {
-                        type: "string",
-                        pattern: "^[a-z][a-z0-9_-]{0,63}$",
-                      },
-                      variant: {
-                        type: "string",
-                        enum: [
-                          "statement",
-                          "split",
-                          "cards",
-                          "timeline",
-                          "faq",
-                          "proof",
-                          "cta",
-                        ],
-                      },
-                    },
-                    required: ["slotId", "variant"],
-                    additionalProperties: false,
-                  },
-                },
-              },
-              required: ["routeId", "slots"],
-              additionalProperties: false,
-            },
-          },
-          seoPlan: {
-            type: "object",
-            properties: {
-              siteTitle: { type: "string" },
-              description: { type: "string" },
-              organizationType: {
-                type: "string",
-                enum: ["Organization", "Corporation", "ProfessionalService"],
-              },
-            },
-            required: ["siteTitle", "description", "organizationType"],
-            additionalProperties: false,
-          },
-        },
-        required: [
-          "schemaVersion",
-          "layoutArchetype",
-          "heroVariant",
-          "density",
-          "surfaceStyle",
-          "typeScale",
-          "imageTreatment",
-          "motionLevel",
-          "colorRoles",
-          "routeCompositions",
-          "seoPlan",
-        ],
-        additionalProperties: false,
-      },
-    },
-    required: ["operationToken", "designSpec"],
-    additionalProperties: false,
-  };
+  return siteDesignWireOutputSchema({
+    operationToken: token,
+    routeIds,
+    paletteSize,
+  });
 }
 
 function generatedContentOutputSchema(
@@ -900,74 +813,13 @@ function generatedContentOutputSchema(
     routeId: string;
     slots: Array<{ slotId: string }>;
   }>,
+  sourceDocumentIds: string[],
 ) {
-  const routeIds = routeCompositions.map((route) => route.routeId);
-  return {
-    type: "object",
-    properties: {
-      operationToken: { type: "string", enum: [token] },
-      pageContent: {
-        type: "object",
-        properties: {
-          schemaVersion: { type: "number", enum: [1] },
-          routes: {
-            type: "array",
-            minItems: routeIds.length,
-            maxItems: routeIds.length,
-            items: {
-              type: "object",
-              properties: {
-                routeId: { type: "string", enum: routeIds },
-                eyebrow: { type: "string" },
-                heading: { type: "string" },
-                summary: { type: "string" },
-                sections: {
-                  type: "array",
-                  minItems: 1,
-                  maxItems: 16,
-                  items: {
-                    type: "object",
-                    properties: {
-                      heading: { type: "string" },
-                      slotId: {
-                        type: "string",
-                        pattern: "^[a-z][a-z0-9_-]{0,63}$",
-                      },
-                      paragraphs: {
-                        type: "array",
-                        minItems: 1,
-                        maxItems: 8,
-                        items: { type: "string" },
-                      },
-                      sourceDocumentIds: {
-                        type: "array",
-                        minItems: 1,
-                        maxItems: 30,
-                        items: { type: "string" },
-                      },
-                    },
-                    required: [
-                      "slotId",
-                      "heading",
-                      "paragraphs",
-                      "sourceDocumentIds",
-                    ],
-                    additionalProperties: false,
-                  },
-                },
-              },
-              required: ["routeId", "heading", "summary", "sections"],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ["schemaVersion", "routes"],
-        additionalProperties: false,
-      },
-    },
-    required: ["operationToken", "pageContent"],
-    additionalProperties: false,
-  } satisfies ManusV2StructuredOutputSchema;
+  return pageContentWireOutputSchema({
+    operationToken: token,
+    routeIds: routeCompositions.map((route) => route.routeId),
+    sourceDocumentIds,
+  });
 }
 
 function socialOutputSchema(
@@ -975,65 +827,11 @@ function socialOutputSchema(
   channel: "wechat" | "xiaohongshu",
   sourceDocumentIds: string[],
 ) {
-  return {
-    type: "object",
-    properties: {
-      operationToken: { type: "string", enum: [token] },
-      companyName: { type: "string" },
-      title: { type: "string" },
-      deck: { type: "string" },
-      sourceDocuments: {
-        type: "array",
-        minItems: 1,
-        items: {
-          type: "object",
-          properties: {
-            id: { type: "string", enum: sourceDocumentIds },
-            title: { type: "string" },
-            sha256: { type: "string" },
-          },
-          required: ["id", "title"],
-          additionalProperties: false,
-        },
-      },
-      sections: {
-        type: "array",
-        minItems: channel === "xiaohongshu" ? 8 : 1,
-        maxItems: channel === "xiaohongshu" ? 8 : 20,
-        items: {
-          type: "object",
-          properties: {
-            heading: { type: "string" },
-            paragraphs: {
-              type: "array",
-              minItems: 1,
-              maxItems: 5,
-              items: { type: "string" },
-            },
-            sourceDocumentIds: {
-              type: "array",
-              minItems: 1,
-              maxItems: 20,
-              items: { type: "string", enum: sourceDocumentIds },
-            },
-          },
-          required: ["heading", "paragraphs", "sourceDocumentIds"],
-          additionalProperties: false,
-        },
-      },
-      hashtags: { type: "array", maxItems: 10, items: { type: "string" } },
-    },
-    required: [
-      "operationToken",
-      "companyName",
-      "title",
-      "deck",
-      "sourceDocuments",
-      "sections",
-      "hashtags",
-    ],
-    additionalProperties: false,
-  } satisfies ManusV2StructuredOutputSchema;
+  return socialWireOutputSchema({
+    operationToken: token,
+    channel,
+    sourceDocumentIds,
+  });
 }
 
 async function findUniqueCreatedTask(
@@ -1165,8 +963,35 @@ async function pollEvents(client: ManusV2Client, taskId: string) {
   return {
     detail,
     events,
-    state: terminalTaskState(latestManusV2TaskState(events) ?? detail.status),
+    state: combinedTerminalTaskState(
+      latestManusV2TaskState(events),
+      detail.status,
+    ),
+    waiting: latestManusV2WaitingDetail(events),
   };
+}
+
+export function messageAskUserWaiting(
+  waiting: ReturnType<typeof latestManusV2WaitingDetail>,
+) {
+  return (
+    waiting?.eventType.replace(/[^a-z]/giu, "").toLowerCase() ===
+    "messageaskuser"
+  );
+}
+
+export function handledWaitingResolution(
+  state: ProviderState,
+  waitingEventId: string,
+  now = Date.now(),
+) {
+  if (state.handledWaitingEventId !== waitingEventId) return "new" as const;
+  const handledAt = state.handledWaitingAt
+    ? Date.parse(state.handledWaitingAt)
+    : Number.NaN;
+  return Number.isFinite(handledAt) && now - handledAt < 120_000
+    ? ("pending" as const)
+    : ("expired" as const);
 }
 
 function pending(
@@ -1195,12 +1020,14 @@ async function scheduleRepair(input: {
   taskId: string;
   kind: "design" | "content";
   design?: z.infer<typeof designResultSchema>;
+  handledWaitingEventId?: string;
+  handledWaitingAt?: string;
 }) {
   const attempt = input.build.repairAttempts + 1;
   if (attempt > 3) {
     throw new SiteOpsManusFailure(
-      "MANUS_REPAIR_LIMIT_EXCEEDED",
-      "同一 Manus 建站任务已自动修复 3 次，仍未通过结构或 QA 校验。",
+      "FRONTMIND_BUILD_OUTPUT_INVALID",
+      "同一 FrontMind AI 建站任务已自动修复 3 次，仍未通过结构或 QA 校验。",
       "failed",
     );
   }
@@ -1221,6 +1048,12 @@ async function scheduleRepair(input: {
       design: input.design,
       repairKind: input.kind,
       repairAttempt: attempt,
+      ...(input.handledWaitingEventId
+        ? { handledWaitingEventId: input.handledWaitingEventId }
+        : {}),
+      ...(input.handledWaitingAt
+        ? { handledWaitingAt: input.handledWaitingAt }
+        : {}),
     },
     input.taskId,
     input.kind === "design" ? "design_compiling" : "qa_running",
@@ -1317,23 +1150,55 @@ async function persistBuildArtifacts(
   };
 }
 
-function resultFailure(error: unknown): SiteOpsProviderResult {
+export function resultFailure(error: unknown): SiteOpsProviderResult {
   if (error instanceof SiteOpsManusFailure) {
-    return { status: error.status, code: error.code, message: error.message };
+    return {
+      status: error.status,
+      code: error.code,
+      message: /manus/iu.test(error.message)
+        ? "FrontMind AI 建站任务未能安全推进，请稍后重试或由运营人员处理。"
+        : error.message,
+    };
   }
   if (error instanceof ManusV2ApiError) {
+    if (error.outcomeUnknown) {
+      return {
+        status: "outcome_unknown",
+        code: "FRONTMIND_BUILD_RESULT_PENDING",
+        message: "FrontMind AI 建站操作结果仍在确认中，系统不会重复创建任务。",
+      };
+    }
+    if (error.status === 400 || error.status === 422) {
+      return {
+        status: "failed",
+        code: "FRONTMIND_BUILD_REQUEST_INVALID",
+        message: "FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。",
+        result: {
+          schemaVersion: 1,
+          stage:
+            error.operation === "task.create"
+              ? "create_rejected"
+              : "request_rejected",
+        },
+      };
+    }
+    if (error.status === 401 || error.status === 403) {
+      return {
+        status: "attention_required",
+        code: "FRONTMIND_BUILD_CONFIGURATION_ERROR",
+        message: "FrontMind AI 建站服务配置暂不可用，请由系统管理员检查配置。",
+      };
+    }
     return {
-      status: error.outcomeUnknown ? "outcome_unknown" : "attention_required",
-      code: error.code,
-      message: error.outcomeUnknown
-        ? "Manus 外部操作结果未知，系统已停止重发并等待对账。"
-        : "Manus 暂时无法完成该任务，请稍后重试或由运营人员处理。",
+      status: "failed",
+      code: "FRONTMIND_BUILD_SERVICE_UNAVAILABLE",
+      message: "FrontMind AI 建站服务暂时不可用，请稍后重试。",
     };
   }
   return {
-    status: "attention_required",
-    code: "MANUS_SITEOPS_FAILED",
-    message: "Manus 建站任务未能安全推进，请稍后重试或由运营人员处理。",
+    status: "failed",
+    code: "FRONTMIND_BUILD_FAILED",
+    message: "FrontMind AI 建站任务未能安全完成，请重置后重新开始。",
   };
 }
 
@@ -1419,7 +1284,7 @@ export function createManusSiteOpsProviderHandler(
                 context.package.channel,
               );
             const prompt = promptWithMarker(
-              `你是企业内容编辑。必须遵守附件中经 manifest 校验的 FrontMind ${context.package.channel} 内容包 workflow、SKILL.md 与 runtime-contract.json。仅根据下列已验证知识资料生成${context.package.channel === "wechat" ? "微信公众号文章及三张封面所需文案" : "小红书九页图文（封面加八节）"}。不得编造数字、客户、资质或案例，不得请求账号凭据、排期或执行发布。主题：${input.topic || "基于企业知识库选择最有价值的主题"}\n\n知识资料：\n${JSON.stringify(documents)}`,
+              `你是 FrontMind 企业内容编辑。必须遵守已附加并通过 manifest 校验的 ${context.package.channel} 内容包 workflow，以及 frontmind-social-source-documents-v1.json 中的冻结知识来源。生成${context.package.channel === "wechat" ? "微信公众号文章及三张封面所需文案" : "小红书九页图文（封面加八节）"}；不得编造数字、客户、资质或案例，不得请求账号凭据、排期或执行发布。主题：${input.topic || "基于企业知识库选择最有价值的主题"}。仅返回要求的结构化结果。`,
               token,
             );
             await persistOperationProgress(db, operation, {
@@ -1435,6 +1300,10 @@ export function createManusSiteOpsProviderHandler(
                     context.package.channel,
                     socialWorkflow,
                   ),
+                  siteOpsSocialSourceAttachment({
+                    operationToken: token,
+                    documents,
+                  }),
                 ],
                 locale: "zh-CN",
                 structuredOutputSchema: socialOutputSchema(
@@ -1465,16 +1334,36 @@ export function createManusSiteOpsProviderHandler(
         const polled = await pollEvents(client, taskId);
         const value = acceptedStructuredValue(polled.events, token);
         if (!value) {
+          if (polled.waiting)
+            throw new SiteOpsManusFailure(
+              "FRONTMIND_SOCIAL_UNEXPECTED_WAITING_ACTION",
+              "FrontMind AI 内容任务请求了当前流程不允许的交互，已安全停止。",
+              "failed",
+            );
           if (polled.state.failed)
             throw new SiteOpsManusFailure(
               "MANUS_SOCIAL_TASK_FAILED",
-              "Manus 未生成可验证的社媒结构化内容。",
+              "FrontMind AI 内容任务未生成可验证的结构化内容。",
               "failed",
             );
-          return pending(
-            { schemaVersion: 1, stage: "content_pending", taskId },
-            taskId,
+          const grace = structuredResultGrace(
+            {
+              schemaVersion: 1,
+              stage: "content_pending",
+              taskId,
+              ...(state?.resultPendingSince
+                ? { resultPendingSince: state.resultPendingSince }
+                : {}),
+            },
+            polled.state.completed,
           );
+          if (grace.expired)
+            throw new SiteOpsManusFailure(
+              "FRONTMIND_SOCIAL_OUTPUT_MISSING",
+              "FrontMind AI 内容任务已结束，但未返回可验证的结构化结果。",
+              "failed",
+            );
+          return pending(grace.state, taskId);
         }
         const record = value as Record<string, unknown>;
         const generatedInput = socialPackageInputSchema.parse({
@@ -1746,6 +1635,18 @@ export function createManusSiteOpsProviderHandler(
           );
           const visualAttachments = [
             workflowAttachment(workflowPackage),
+            ...siteOpsSourceDossierAttachments({
+              operationToken: designToken,
+              snapshot: {
+                id: context.snapshot.id,
+                archiveSha256: context.build.knowledgeArchiveHash,
+                sourceBuildId: context.snapshot.sourceBuildId,
+                sourceBuildRevision: context.snapshot.sourceBuildRevision,
+              },
+              brief: promptBrief,
+              visualEvidence: visual,
+              documents,
+            }),
             await visualPreviewAttachment(
               previewArtifact,
               "selected-visual.png",
@@ -1760,7 +1661,7 @@ export function createManusSiteOpsProviderHandler(
             )),
           ];
           const prompt = promptWithMarker(
-            `你是 FrontMind 官网设计与信息架构师。必须遵守附件中经 manifest 校验的 FrontMind Astro Company Site Workflow ${SITEOPS_WORKFLOW.frontMindVersion}、SKILL.md 和 runtime-contract.json。选中的安全视觉预览已作为主参考附件提供；可选 support-visual 附件只用于 section/motion 辅助参考，全部参考图都不是客户网站素材。根据 SiteBrief、视觉 taxonomy、冻结调色板和知识资料输出严格 SiteDesignSpecV1：只使用允许的布局、hero、section slot、视觉 token 与 SEO 字段。每个 route 都必须有唯一 slotId。不要生成源码、HTML、CSS、依赖、脚本或 21st 组件代码；不要扩写未知事实。\n\nSiteBrief：${JSON.stringify(promptBrief)}\n视觉证据：${JSON.stringify(visual)}\n知识资料：${JSON.stringify(documents)}`,
+            `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${SITEOPS_WORKFLOW.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。selected-visual.png 是主视觉参考；support-visual 仅作区块或动效参考，全部参考图都不是客户网站素材。请返回 SiteDesignWireV1：为每个 route 输出有序且唯一的 routeSlots，并使用 dossier 中的冻结调色板。不得输出源码、HTML、CSS、依赖、脚本、21st 组件代码或未知事实。`,
             designToken,
           );
           await persistOperationProgress(db, operation, {
@@ -1841,12 +1742,13 @@ export function createManusSiteOpsProviderHandler(
             : generatedContentOutputSchema(
                 repairToken,
                 state.design?.designSpec.routeCompositions ?? [],
+                documents.map((document) => document.id),
               );
         if (state.stage === "repair_send_ready") {
           const repairPrompt = promptWithMarker(
             state.repairKind === "design"
-              ? `继续同一个 FrontMind 建站任务。上一次 SiteDesignSpecV1 未通过严格契约。第 ${state.repairAttempt}/3 次修复：重新输出完整设计、route slot 与 SEO 结构；继续遵守已附加 workflow，不得输出源码或未知事实。SiteBrief：${JSON.stringify(promptBrief)}\n视觉 taxonomy：${JSON.stringify(taxonomy)}`
-              : `继续同一个 FrontMind 建站任务。上一次 PageContentSpecV1 或 Astro/SEO/视觉 QA 未通过。第 ${state.repairAttempt}/3 次修复：按已冻结 designSpec 的 route/slot 顺序重新输出完整结构化正文，严格使用允许的 sourceDocumentIds，不得输出源码、脚本或未知事实。设计合同：${JSON.stringify(state.design?.designSpec)}\nSiteBrief：${JSON.stringify(promptBrief)}\n知识资料：${JSON.stringify(documents)}`,
+              ? `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV1 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：重新读取已附加 workflow、source dossier 与视觉参考，完整返回 SiteDesignWireV1。不得输出源码、脚本或未知事实。`
+              : `继续同一个 FrontMind AI 建站任务。上一次 PageContentWireV1 或受信 Astro QA 未通过。第 ${state.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 PageContentWireV1，只能引用允许的 sourceDocumentIds。不得输出源码、脚本或未知事实。`,
             repairToken,
           );
           const unknownState: ProviderState = {
@@ -1905,6 +1807,42 @@ export function createManusSiteOpsProviderHandler(
         const repaired = await pollEvents(client, taskId);
         const rawRepair = acceptedStructuredValue(repaired.events, repairToken);
         if (!rawRepair) {
+          if (repaired.waiting) {
+            if (!messageAskUserWaiting(repaired.waiting))
+              throw new SiteOpsManusFailure(
+                "FRONTMIND_BUILD_UNEXPECTED_WAITING_ACTION",
+                "FrontMind AI 建站任务请求了当前流程不允许的外部操作。",
+                "failed",
+              );
+            const resolution = handledWaitingResolution(
+              state,
+              repaired.waiting.eventId,
+            );
+            if (resolution === "pending")
+              return pending(
+                state,
+                taskId,
+                state.repairKind === "design"
+                  ? "design_compiling"
+                  : "qa_running",
+              );
+            if (resolution === "expired")
+              throw new SiteOpsManusFailure(
+                "FRONTMIND_BUILD_WAITING_UNRESOLVED",
+                "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
+                "failed",
+              );
+            return scheduleRepair({
+              db,
+              operation,
+              build: context.build,
+              taskId,
+              kind: state.repairKind,
+              design: state.design,
+              handledWaitingEventId: repaired.waiting.eventId,
+              handledWaitingAt: new Date().toISOString(),
+            });
+          }
           if (repaired.state.failed) {
             return scheduleRepair({
               db,
@@ -1915,15 +1853,29 @@ export function createManusSiteOpsProviderHandler(
               design: state.design,
             });
           }
+          const grace = structuredResultGrace(state, repaired.state.completed);
+          if (grace.expired) {
+            return scheduleRepair({
+              db,
+              operation,
+              build: context.build,
+              taskId,
+              kind: state.repairKind,
+              design: state.design,
+            });
+          }
           return pending(
-            state,
+            grace.state,
             taskId,
             state.repairKind === "design" ? "design_compiling" : "qa_running",
           );
         }
         if (state.repairKind === "design") {
           try {
-            const repairedDesign = designResultSchema.parse(rawRepair);
+            const repairedDesign = siteDesignResultFromWire(
+              rawRepair,
+              brief.routes.map((route) => route.id),
+            );
             validateDesignAndContentBindings({
               routeIds: brief.routes.map((route) => route.id),
               paletteSize: taxonomy.palette.length,
@@ -1956,6 +1908,47 @@ export function createManusSiteOpsProviderHandler(
         const polled = await pollEvents(client, taskId);
         const raw = acceptedStructuredValue(polled.events, designToken);
         if (!raw) {
+          if (polled.waiting) {
+            if (!messageAskUserWaiting(polled.waiting))
+              throw new SiteOpsManusFailure(
+                "FRONTMIND_BUILD_UNEXPECTED_WAITING_ACTION",
+                "FrontMind AI 建站任务请求了当前流程不允许的外部操作。",
+                "failed",
+              );
+            const resolution = handledWaitingResolution(
+              state ?? {
+                schemaVersion: 1,
+                stage: "design_pending",
+                taskId,
+              },
+              polled.waiting.eventId,
+            );
+            if (resolution === "pending")
+              return pending(
+                state ?? {
+                  schemaVersion: 1,
+                  stage: "design_pending",
+                  taskId,
+                },
+                taskId,
+                "design_compiling",
+              );
+            if (resolution === "expired")
+              throw new SiteOpsManusFailure(
+                "FRONTMIND_BUILD_WAITING_UNRESOLVED",
+                "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
+                "failed",
+              );
+            return scheduleRepair({
+              db,
+              operation,
+              build: context.build,
+              taskId,
+              kind: "design",
+              handledWaitingEventId: polled.waiting.eventId,
+              handledWaitingAt: new Date().toISOString(),
+            });
+          }
           if (polled.state.failed) {
             return scheduleRepair({
               db,
@@ -1965,14 +1958,34 @@ export function createManusSiteOpsProviderHandler(
               kind: "design",
             });
           }
-          return pending(
-            { schemaVersion: 1, stage: "design_pending", taskId },
+          const designPendingState: ProviderState = {
+            schemaVersion: 1,
+            stage: "design_pending",
             taskId,
-            "design_compiling",
+            ...(state?.resultPendingSince
+              ? { resultPendingSince: state.resultPendingSince }
+              : {}),
+          };
+          const grace = structuredResultGrace(
+            designPendingState,
+            polled.state.completed,
           );
+          if (grace.expired) {
+            return scheduleRepair({
+              db,
+              operation,
+              build: context.build,
+              taskId,
+              kind: "design",
+            });
+          }
+          return pending(grace.state, taskId, "design_compiling");
         }
         try {
-          design = designResultSchema.parse(raw);
+          design = siteDesignResultFromWire(
+            raw,
+            brief.routes.map((route) => route.id),
+          );
           validateDesignAndContentBindings({
             routeIds: brief.routes.map((route) => route.id),
             paletteSize: taxonomy.palette.length,
@@ -2003,7 +2016,7 @@ export function createManusSiteOpsProviderHandler(
           );
         }
         const revisionInstruction = input.feedback
-          ? `客户本次修改要求：${input.feedback}`
+          ? "客户本次修改要求已作为 frontmind-customer-feedback-v1.json 附件提供，必须在事实与构建合同范围内落实。"
           : "这是首版官网内容。";
         const canonicalContract = composeBuildContractV2({
           schemaVersion: 2,
@@ -2046,7 +2059,7 @@ export function createManusSiteOpsProviderHandler(
           qaPolicyVersion: SITEOPS_WORKFLOW.qaPolicyVersion,
         });
         const prompt = promptWithMarker(
-          `继续同一个建站任务。以下 canonical build-contract.json 已由 Dashboard 根据受信 workflow 和刚才通过校验的 SiteDesignSpecV1 生成，必须遵守：${canonicalJson(canonicalContract)}。请仅输出 PageContentSpecV1；routeId 和 slotId 必须按 designSpec 完全一致且顺序相同，每段关键内容必须引用给定 sourceDocumentIds。不得重复 SEO、生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}\n\nSiteBrief：${JSON.stringify(promptBrief)}\n知识资料：${JSON.stringify(documents)}`,
+          `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV1，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`,
           contentToken,
         );
         await persistOperationProgress(
@@ -2064,9 +2077,16 @@ export function createManusSiteOpsProviderHandler(
           await client.sendMessage({
             taskId,
             prompt,
+            attachments: [
+              siteOpsBuildContractAttachment(canonicalContract),
+              ...(input.feedback
+                ? [siteOpsCustomerFeedbackAttachment(input.feedback)]
+                : []),
+            ],
             structuredOutputSchema: generatedContentOutputSchema(
               contentToken,
               design.designSpec.routeCompositions,
+              documents.map((document) => document.id),
             ),
           });
         } catch (error) {
@@ -2126,6 +2146,50 @@ export function createManusSiteOpsProviderHandler(
         repairedContent ??
         acceptedStructuredValue(polled!.events, contentToken);
       if (!rawContent) {
+        if (polled!.waiting) {
+          if (!messageAskUserWaiting(polled!.waiting))
+            throw new SiteOpsManusFailure(
+              "FRONTMIND_BUILD_UNEXPECTED_WAITING_ACTION",
+              "FrontMind AI 建站任务请求了当前流程不允许的外部操作。",
+              "failed",
+            );
+          const resolution = handledWaitingResolution(
+            state ?? {
+              schemaVersion: 1,
+              stage: "content_pending",
+              taskId,
+              design,
+            },
+            polled!.waiting.eventId,
+          );
+          if (resolution === "pending")
+            return pending(
+              state ?? {
+                schemaVersion: 1,
+                stage: "content_pending",
+                taskId,
+                design,
+              },
+              taskId,
+              "building",
+            );
+          if (resolution === "expired")
+            throw new SiteOpsManusFailure(
+              "FRONTMIND_BUILD_WAITING_UNRESOLVED",
+              "FrontMind AI 建站任务在安全继续后仍未恢复输出。",
+              "failed",
+            );
+          return scheduleRepair({
+            db,
+            operation,
+            build: context.build,
+            taskId,
+            kind: "content",
+            design,
+            handledWaitingEventId: polled!.waiting.eventId,
+            handledWaitingAt: new Date().toISOString(),
+          });
+        }
         if (polled!.state.failed) {
           return scheduleRepair({
             db,
@@ -2136,15 +2200,38 @@ export function createManusSiteOpsProviderHandler(
             design,
           });
         }
-        return pending(
-          { schemaVersion: 1, stage: "content_pending", taskId, design },
+        const contentPendingState: ProviderState = {
+          schemaVersion: 1,
+          stage: "content_pending",
           taskId,
-          "building",
+          design,
+          ...(state?.resultPendingSince
+            ? { resultPendingSince: state.resultPendingSince }
+            : {}),
+        };
+        const grace = structuredResultGrace(
+          contentPendingState,
+          polled!.state.completed,
         );
+        if (grace.expired) {
+          return scheduleRepair({
+            db,
+            operation,
+            build: context.build,
+            taskId,
+            kind: "content",
+            design,
+          });
+        }
+        return pending(grace.state, taskId, "building");
       }
       let generatedContent: z.infer<typeof siteOpsGeneratedContentSchema>;
       try {
-        const contentResult = pageContentResultV1Schema.parse(rawContent);
+        const contentResult = pageContentResultFromWire(
+          rawContent,
+          brief.routes.map((route) => route.id),
+          documents.map((document) => document.id),
+        );
         validateDesignAndContentBindings({
           routeIds: brief.routes.map((route) => route.id),
           paletteSize: taxonomy.palette.length,

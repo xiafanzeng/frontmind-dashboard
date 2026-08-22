@@ -38,7 +38,26 @@ export const SITEOPS_MATERIALIZER_V1_3 = {
   qaPolicyVersion: "siteops-qa-v1",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_3;
+/** FrontMind 1.4 keeps the trusted host materializer while freezing Hero-only
+ * visual evidence, attachment-bound knowledge and flat provider wire output. */
+export const SITEOPS_MATERIALIZER_V1_4 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "1.4.0",
+  runtimeManifestSha256:
+    "a0e52bf6b61c7e1bbd6c506d1b00a6922e2e844f88d9c198b363b04a6c3f4039",
+  starterVersion: "1.4.0",
+  starterSha256:
+    "a7b23f68b51c4a4f3b14ed74a625dfda855817e59c865c9424b9ffd45dcacc4d",
+  componentLibraryVersion: "1.0.0",
+  materializerVersion: "1.0.0",
+  materializerSha256:
+    "981a1af2cc6d9030173b9be0a7ec073e60d0303ab4af3c8769b27293221bdce7",
+  qaPolicyVersion: "siteops-qa-v1",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_4;
 
 export const siteOpsProjectStatusSchema = z.enum([
   "draft",

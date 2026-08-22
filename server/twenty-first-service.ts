@@ -282,6 +282,8 @@ export type TwentyFirstSearchRequest = {
   query: string;
   type: "component";
   limit: number;
+  tag?: "hero";
+  sort?: "recommended";
 };
 
 export type TwentyFirstReadOnlySession = {
@@ -404,6 +406,7 @@ export function buildTwentyFirstToolArguments(input: {
   tool: TwentyFirstAdvertisedTool;
   value: string | TwentyFirstProviderItemId;
   limit?: number;
+  searchOptions?: Pick<TwentyFirstSearchRequest, "tag" | "sort">;
 }) {
   const properties = input.tool.inputSchema.properties ?? {};
   const valueKey =
@@ -455,6 +458,23 @@ export function buildTwentyFirstToolArguments(input: {
       if (!typeValue) throw new TwentyFirstToolContractError();
       assertAdvertisedPrimitive(properties[typeKey], typeValue);
       args[typeKey] = typeValue;
+    }
+    for (const [semanticKey, requested] of [
+      ["tag", input.searchOptions?.tag],
+      ["sort", input.searchOptions?.sort],
+    ] as const) {
+      if (!requested) continue;
+      const advertisedKey = findToolInputKey(input.tool, [semanticKey]);
+      if (!advertisedKey) continue;
+      const property = properties[advertisedKey];
+      const declaredEnum = Array.isArray(
+        (property as { enum?: unknown } | undefined)?.enum,
+      )
+        ? (property as { enum: unknown[] }).enum
+        : null;
+      if (declaredEnum && !declaredEnum.includes(requested)) continue;
+      assertAdvertisedPrimitive(property, requested);
+      args[advertisedKey] = requested;
     }
   }
   const required = new Set(input.tool.inputSchema.required ?? []);
@@ -779,12 +799,14 @@ export class TwentyFirstClient {
         tool: TwentyFirstAdvertisedTool,
         argumentValue: string | TwentyFirstProviderItemId,
         limit?: number,
+        searchOptions?: Pick<TwentyFirstSearchRequest, "tag" | "sort">,
       ) => {
         const args = buildTwentyFirstToolArguments({
           operation,
           tool,
           value: argumentValue,
           limit,
+          searchOptions,
         });
         const result = await client.callTool(
           { name: tool.name, arguments: args },
@@ -809,7 +831,10 @@ export class TwentyFirstClient {
           if (input.type !== "component") {
             throw new TwentyFirstToolContractError();
           }
-          return call("search", search, input.query, input.limit);
+          return call("search", search, input.query, input.limit, {
+            tag: input.tag,
+            sort: input.sort,
+          });
         },
         ...(safeGetComponent
           ? {

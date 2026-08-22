@@ -5,6 +5,7 @@ import {
   buildTwentyFirstSearchOnlyFunnel,
   canonicalJson,
   canonicalSha256,
+  classifyHeroEligibility,
   composeBuildContractV1,
   composeTwentyFirstQueries,
   createVisualEvidenceV1,
@@ -16,6 +17,7 @@ import {
 function result(
   id: string | number,
   role: "foundation" | "section" | "motion",
+  overrides: Record<string, unknown> = {},
 ) {
   return {
     role,
@@ -23,9 +25,15 @@ function result(
       results: [
         {
           id,
-          name: `Candidate ${id}`,
+          name:
+            role === "foundation"
+              ? `Hero Candidate ${id}`
+              : role === "section"
+                ? `Testimonial Section ${id}`
+                : `Motion Reference ${id}`,
           previewUrl: `https://cdn.example.test/${id}.png?token=removed`,
           description: "description must not count as Prompt",
+          ...overrides,
         },
       ],
     },
@@ -56,8 +64,11 @@ describe("siteops workflow", () => {
       "section_proof_conversion",
       "motion_accessible",
     ]);
-    expect(queries.map((item) => item.limit)).toEqual([5, 5, 6, 2]);
+    expect(queries.map((item) => item.limit)).toEqual([6, 6, 4, 2]);
     expect(queries.every((item) => item.query.includes("前智科技"))).toBe(true);
+    expect(queries[0]?.query.startsWith("hero section landing page")).toBe(
+      true,
+    );
     expect(queries.every((item) => !item.query.includes("Verified fact"))).toBe(
       true,
     );
@@ -108,13 +119,13 @@ describe("siteops workflow", () => {
 
   it("builds a 12-item search-only shortlist without component detail", () => {
     const envelopes = [
-      ...Array.from({ length: 5 }, (_, index) =>
+      ...Array.from({ length: 6 }, (_, index) =>
         result(index + 1, "foundation"),
       ),
-      ...Array.from({ length: 5 }, (_, index) =>
-        result(index + 6, "foundation"),
+      ...Array.from({ length: 6 }, (_, index) =>
+        result(index + 7, "foundation"),
       ),
-      ...Array.from({ length: 6 }, (_, index) => result(index + 11, "section")),
+      ...Array.from({ length: 4 }, (_, index) => result(index + 13, "section")),
       ...Array.from({ length: 2 }, (_, index) => result(index + 17, "motion")),
     ];
     const funnel = buildTwentyFirstSearchOnlyFunnel({
@@ -122,7 +133,64 @@ describe("siteops workflow", () => {
     });
     expect(funnel.actual).toEqual({ searched: 18, shortlisted: 12 });
     expect(funnel.retrievalShortlist).toHaveLength(12);
+    expect(
+      funnel.retrievalShortlist.every(
+        (candidate) =>
+          candidate.catalogRole === "hero" &&
+          candidate.heroEligibility.eligible,
+      ),
+    ).toBe(true);
+    expect(funnel.supportingCandidates).toHaveLength(2);
     expect(JSON.stringify(funnel)).not.toContain("componentCode");
+  });
+
+  it("rejects non-Hero production shapes and never uses support as A-I filler", () => {
+    const nonHeroTitles = [
+      "Sidebar",
+      "CaseStudies Pricing Selector",
+      "RuixenPricing_04",
+      "Compare 2",
+      "Chrono Board Activity Dashboard",
+      "ProjectPulseTracker",
+    ];
+    for (const title of nonHeroTitles) {
+      expect(
+        classifyHeroEligibility({
+          title,
+          description: null,
+          sourceUrl: "https://21st.dev/community/components/example",
+          queryAxis: "foundation_split",
+        }).eligible,
+      ).toBe(false);
+    }
+    expect(
+      classifyHeroEligibility({
+        title: "DevTool Landing Page",
+        description: "A modern landing page for developer tools",
+        sourceUrl: "https://21st.dev/community/components/devtool",
+        queryAxis: "foundation_editorial_modular",
+      }),
+    ).toMatchObject({
+      eligible: true,
+      confidence: "conditional",
+      variant: "editorial_modular",
+    });
+
+    const funnel = buildTwentyFirstSearchOnlyFunnel({
+      searchEnvelopes: [
+        result(1, "foundation", { name: "Split Media Hero" }),
+        result(2, "foundation", { name: "Pricing" }),
+        result(3, "section", { name: "Testimonial" }),
+        result(4, "motion", { name: "Hero Motion Reference" }),
+      ],
+    });
+    expect(
+      funnel.retrievalShortlist.map((item) => item.providerItemKey),
+    ).toEqual(["n:1"]);
+    expect(
+      funnel.supportingCandidates.map((item) => item.providerItemKey),
+    ).toEqual(["n:3", "n:4"]);
+    expect(funnel.retrievalShortlist).toHaveLength(1);
   });
 
   it("accepts real no-Prompt detail while never projecting provider code", () => {

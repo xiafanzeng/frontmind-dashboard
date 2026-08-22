@@ -55,6 +55,15 @@ export const siteOpsVisualCandidateProjectionSchema = z
     previewUrl: z.string().min(1).max(2_048),
     note: z.string().trim().max(2_000).nullable().default(null),
     score: z.number().finite().min(0).max(100),
+    heroVariant: z
+      .enum([
+        "centered_statement",
+        "split_media",
+        "editorial_modular",
+        "immersive_visual",
+      ])
+      .optional(),
+    heroConfidence: z.enum(["explicit", "strong", "conditional"]).optional(),
     selected: z.boolean().default(false),
   })
   .strict();
@@ -285,7 +294,7 @@ export const siteOpsObservationV1Schema = z
             reason: z.string().max(1_000).optional(),
           })
           .strict(),
-        manus: z
+        aiBuilder: z
           .object({
             status: z.enum([
               "configured",
