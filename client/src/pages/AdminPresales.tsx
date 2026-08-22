@@ -509,8 +509,8 @@ export default function AdminPresales() {
       <div className="mx-auto w-full max-w-6xl">
         <p className="mb-6 max-w-3xl text-sm leading-7 text-[#716a80]">
           统一管理官网任务积分和 AI 建站所需的 21st MCP 凭据。所有密钥
-          只在服务端验证并加密保存，21st Key 不会传给浏览器缓存、Manus
-          任务或客户网站。
+          只在服务端验证并加密保存，21st Key 不会传给浏览器缓存、上游任务
+          或客户网站。
         </p>
 
         <div className="mb-3">
@@ -959,7 +959,7 @@ export default function AdminPresales() {
             </h2>
             <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
               21st 只用于检索视觉方向。连接验证仅执行 MCP 初始化和工具能力
-              查询，不调用生成、发布或付费工具，也不与 Manus 积分混算。
+              查询，不调用生成、发布或付费工具，也不与官网任务积分混算。
             </p>
           </div>
 
@@ -1170,7 +1170,7 @@ export default function AdminPresales() {
                     />
                   </div>
                   <div className="rounded-xl border border-border/60 bg-background/70 px-4 py-3 text-xs leading-5 text-muted-foreground">
-                    21st 用量与 Manus 积分分开管理。供应商未提供 get_usage
+                    21st 用量与官网任务积分分开管理。供应商未提供 get_usage
                     时，本页不会推算或显示虚假额度。
                   </div>
                   {twentyFirstStatus.status !== null && (

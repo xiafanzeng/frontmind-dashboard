@@ -435,7 +435,7 @@ export function PreviewAdminPresales() {
               </div>
               <p className="mt-2 text-sm leading-6 text-[#716a80]">
                 21st 仅用于视觉方向检索；保存时验证 MCP 初始化、search 与
-                get_component，不与 Manus 积分混算。
+                get_component，不与官网任务积分混算。
               </p>
             </div>
             <Badge
