@@ -509,8 +509,8 @@ export default function AdminPresales() {
       <div className="mx-auto w-full max-w-6xl">
         <p className="mb-6 max-w-3xl text-sm leading-7 text-[#716a80]">
           统一管理官网任务积分和 AI 建站所需的 21st MCP 凭据。所有密钥
-          只在服务端验证并加密保存，21st Key 不会传给浏览器缓存、上游
-          任务或客户网站。
+          只在服务端验证并加密保存，21st Key 不会传给浏览器缓存、上游建站服务
+          或客户网站。
         </p>
 
         <div className="mb-3">
