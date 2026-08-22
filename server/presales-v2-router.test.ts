@@ -2072,6 +2072,318 @@ describe("Presales v2 public contract", () => {
     expect(harness.providerCalls.deleteTask).not.toHaveBeenCalled();
   });
 
+  it("keeps a newly bound running task when listMessages has not propagated yet", async () => {
+    const now = new Date("2026-08-15T13:00:00.000Z");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const providerStartedAt = new Date(now.getTime() - 60_000).toISOString();
+    const harness = reconcileHarness({
+      now,
+      events: [],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        terminalAt: null,
+        providerStartedAt,
+        providerRunDeadlineAt: new Date(
+          Date.parse(providerStartedAt) + 30 * 60_000,
+        ).toISOString(),
+      }),
+    });
+    harness.providerCalls.listAllMessages.mockRejectedValueOnce(
+      new ManusV2ApiError(
+        "task.listMessages",
+        404,
+        "not_found",
+        false,
+        false,
+        "provider-request-must-not-log",
+      ),
+    );
+
+    try {
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({
+        status: "running",
+        errorCode: null,
+        terminalAt: null,
+      });
+      expect(harness.dependencies.updateTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.listAllMessages).toHaveBeenCalledOnce();
+      expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+      expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+
+      const serializedLogs = JSON.stringify(warn.mock.calls);
+      expect(serializedLogs).toContain("not_found");
+      for (const secret of [
+        "provider-task-secret",
+        "provider-request-must-not-log",
+        "secret-operation-marker",
+      ]) {
+        expect(serializedLogs).not.toContain(secret);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps the persisted running state for an explicitly retryable listMessages read", async () => {
+    const now = new Date("2026-08-15T13:00:00.000Z");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const providerStartedAt = new Date(
+      now.getTime() - 10 * 60_000,
+    ).toISOString();
+    const harness = reconcileHarness({
+      now,
+      events: [],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        terminalAt: null,
+        providerStartedAt,
+        providerRunDeadlineAt: new Date(
+          Date.parse(providerStartedAt) + 30 * 60_000,
+        ).toISOString(),
+      }),
+    });
+    harness.providerCalls.listAllMessages.mockRejectedValueOnce(
+      new ManusV2ApiError(
+        "task.listMessages",
+        503,
+        "PROVIDER_BUSY",
+        true,
+        false,
+      ),
+    );
+
+    try {
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({
+        status: "running",
+        errorCode: null,
+        terminalAt: null,
+      });
+      expect(harness.dependencies.updateTask).not.toHaveBeenCalled();
+      expect(harness.providerCalls.listAllMessages).toHaveBeenCalledOnce();
+      expect(harness.providerCalls.sendMessage).not.toHaveBeenCalled();
+      expect(harness.providerCalls.createTask).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        "[Presales v2] transient Provider read deferred",
+        {
+          diagnosticCode: "PRESALES_V2_PROVIDER_READ_DEFERRED",
+          operation: "task.listMessages",
+          providerErrorCode: "provider_busy",
+          status: 503,
+          retryable: true,
+          persistedStateFallback: true,
+        },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not hide stale not-found or non-retryable listMessages failures", async () => {
+    const now = new Date("2026-08-15T13:00:00.000Z");
+    const providerStartedAt = new Date(now.getTime() - 181_000).toISOString();
+    const harness = reconcileHarness({
+      now,
+      events: [],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        providerStartedAt,
+        providerRunDeadlineAt: new Date(
+          Date.parse(providerStartedAt) + 30 * 60_000,
+        ).toISOString(),
+      }),
+    });
+    const staleNotFound = new ManusV2ApiError(
+      "task.listMessages",
+      404,
+      "not_found",
+      true,
+      false,
+    );
+    harness.providerCalls.listAllMessages.mockRejectedValueOnce(staleNotFound);
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).rejects.toBe(staleNotFound);
+    expect(harness.dependencies.updateTask).not.toHaveBeenCalled();
+
+    const credentialFailure = new ManusV2ApiError(
+      "task.listMessages",
+      401,
+      "UNAUTHORIZED",
+      false,
+      false,
+    );
+    harness.providerCalls.listAllMessages.mockRejectedValueOnce(
+      credentialFailure,
+    );
+    harness.setCurrent({
+      ...harness.current(),
+      providerStartedAt: new Date(now.getTime() - 60_000).toISOString(),
+      providerRunDeadlineAt: new Date(
+        now.getTime() + 29 * 60_000,
+      ).toISOString(),
+    });
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).rejects.toBe(credentialFailure);
+    expect(harness.dependencies.updateTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "AUTHENTICATION_REQUIRED",
+    "PERMISSION_DENIED",
+    "CONFIGURATION_INVALID",
+    "CONTRACT_INVALID",
+  ])(
+    "does not hide permanent %s read failures marked retryable",
+    async (code) => {
+      const now = new Date("2026-08-15T13:00:00.000Z");
+      const providerStartedAt = new Date(now.getTime() - 60_000).toISOString();
+      const harness = reconcileHarness({
+        now,
+        events: [],
+        record: taskRecord({
+          status: "running",
+          structuredResult: null,
+          providerStartedAt,
+          providerRunDeadlineAt: new Date(
+            Date.parse(providerStartedAt) + 30 * 60_000,
+          ).toISOString(),
+        }),
+      });
+      const permanentFailure = new ManusV2ApiError(
+        "task.listMessages",
+        503,
+        code,
+        true,
+        false,
+      );
+      harness.providerCalls.listAllMessages.mockRejectedValueOnce(
+        permanentFailure,
+      );
+
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).rejects.toBe(permanentFailure);
+      expect(harness.dependencies.updateTask).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses the actual failure time when a Provider read crosses the run deadline", async () => {
+    const startedAt = new Date("2026-08-15T13:00:00.000Z");
+    const deadlineAt = new Date(startedAt.getTime() + 30 * 60_000);
+    const requestStartedAt = new Date(deadlineAt.getTime() - 1_000);
+    const failureAt = new Date(deadlineAt.getTime() + 1_000);
+    const harness = reconcileHarness({
+      now: requestStartedAt,
+      events: [],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        terminalAt: null,
+        providerStartedAt: startedAt.toISOString(),
+        providerRunDeadlineAt: deadlineAt.toISOString(),
+      }),
+    });
+    harness.providerCalls.listAllMessages.mockImplementationOnce(async () => {
+      harness.setNow(failureAt);
+      throw new ManusV2ApiError(
+        "task.listMessages",
+        503,
+        "PROVIDER_BUSY",
+        true,
+        false,
+      );
+    });
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      errorCode: "PROVIDER_RUN_DEADLINE_EXCEEDED",
+      providerRunDeadlineExceededAt: failureAt.toISOString(),
+      terminalAt: failureAt.toISOString(),
+    });
+    expect(harness.dependencies.updateTask).toHaveBeenCalledOnce();
+    expect(harness.providerCalls.listAllMessages).toHaveBeenCalledOnce();
+  });
+
+  it("does not log a free-form Provider error code", async () => {
+    const now = new Date("2026-08-15T13:00:00.000Z");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const providerStartedAt = new Date(
+      now.getTime() - 10 * 60_000,
+    ).toISOString();
+    const harness = reconcileHarness({
+      now,
+      events: [],
+      record: taskRecord({
+        status: "running",
+        structuredResult: null,
+        providerStartedAt,
+        providerRunDeadlineAt: new Date(
+          Date.parse(providerStartedAt) + 30 * 60_000,
+        ).toISOString(),
+      }),
+    });
+    const secretLikeCode = "customer-secret-token-value";
+    harness.providerCalls.listAllMessages.mockRejectedValueOnce(
+      new ManusV2ApiError(
+        "task.listMessages",
+        503,
+        secretLikeCode,
+        true,
+        false,
+      ),
+    );
+
+    try {
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({ status: "running", errorCode: null });
+      expect(warn).toHaveBeenCalledWith(
+        "[Presales v2] transient Provider read deferred",
+        expect.objectContaining({
+          diagnosticCode: "PRESALES_V2_PROVIDER_READ_DEFERRED",
+          providerErrorCode: "provider_read_failed",
+          persistedStateFallback: true,
+        }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(secretLikeCode);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("persists the real-incident assistant fallback without a repair message", async () => {
     const now = new Date("2026-08-15T13:00:00.000Z");
     const questions = Array.from({ length: 20 }, (_, index) => {

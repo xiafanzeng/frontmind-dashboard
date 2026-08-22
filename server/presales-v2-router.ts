@@ -90,6 +90,7 @@ const MAX_TASK_ASSET_BYTES = 100 * 1024 * 1024;
 const RESULT_GRACE_MS = 120_000;
 const CREATE_RECONCILE_WINDOW_MS = 5 * 60_000;
 const PROVIDER_RUN_DEADLINE_MS = 30 * 60_000;
+const PROVIDER_TASK_VISIBILITY_GRACE_MS = 180_000;
 const MAX_STRUCTURED_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_STRUCTURED_RESULT_DEPTH = 64;
 const MAX_STRUCTURED_RESULT_NODES = 100_000;
@@ -2034,6 +2035,107 @@ function providerTiming(record: PresalesV2TaskRecord, nowMs: number) {
   };
 }
 
+const SAFE_PROVIDER_READ_ERROR_CODES = new Set([
+  "not_found",
+  "provider_busy",
+  "rate_limit_exceeded",
+  "rate_limited",
+  "request_timeout",
+  "service_unavailable",
+  "temporary_unavailable",
+  "timeout",
+  "too_many_requests",
+  "transport_pre_dispatch_retry_exhausted",
+  "transport_unknown",
+  "upstream_unavailable",
+]);
+
+const PERMANENT_PROVIDER_READ_ERROR_CODES = new Set([
+  "invalid_pagination",
+  "invalid_request",
+  "invalid_response",
+  "task_id_conflict",
+]);
+
+function normalizedProviderReadErrorCode(error: ManusV2ApiError) {
+  return error.code.trim().toLowerCase().replaceAll("-", "_");
+}
+
+function safeProviderReadErrorCode(error: ManusV2ApiError) {
+  const code = normalizedProviderReadErrorCode(error);
+  return SAFE_PROVIDER_READ_ERROR_CODES.has(code)
+    ? code
+    : "provider_read_failed";
+}
+
+function permanentProviderReadError(code: string) {
+  return (
+    PERMANENT_PROVIDER_READ_ERROR_CODES.has(code) ||
+    /(?:^|_)(?:auth|authentication|authorization|credential|permission|forbidden|config|configuration|contract|schema|validation)(?:_|$)/u.test(
+      code,
+    )
+  );
+}
+
+function transientProviderReadError(error: ManusV2ApiError, code: string) {
+  if (!error.retryable || permanentProviderReadError(code)) return false;
+  if (
+    error.status === 408 ||
+    error.status === 425 ||
+    error.status === 429 ||
+    (typeof error.status === "number" && error.status >= 500)
+  ) {
+    return true;
+  }
+  if (
+    [
+      "provider_busy",
+      "rate_limit_exceeded",
+      "rate_limited",
+      "request_timeout",
+      "service_unavailable",
+      "temporary_unavailable",
+      "timeout",
+      "too_many_requests",
+      "transport_pre_dispatch_retry_exhausted",
+      "transport_unknown",
+      "upstream_unavailable",
+    ].includes(code)
+  ) {
+    return true;
+  }
+  return [
+    "connection_refused",
+    "connection_reset",
+    "dns_temporary",
+    "host_unreachable",
+    "network_unreachable",
+    "timeout",
+  ].includes(error.transportCause ?? "");
+}
+
+function deferTransientProviderRead(input: {
+  error: unknown;
+  nowMs: number;
+  providerStartedAtMs: number;
+  providerDeadlineExceeded: boolean;
+}) {
+  if (
+    input.providerDeadlineExceeded ||
+    !(input.error instanceof ManusV2ApiError) ||
+    input.error.operation !== "task.listMessages"
+  ) {
+    return false;
+  }
+  const normalizedCode = normalizedProviderReadErrorCode(input.error);
+  const withinVisibilityGrace =
+    input.nowMs >= input.providerStartedAtMs &&
+    input.nowMs - input.providerStartedAtMs <=
+      PROVIDER_TASK_VISIBILITY_GRACE_MS;
+  if (normalizedCode === "not_found") return withinVisibilityGrace;
+  return transientProviderReadError(input.error, normalizedCode);
+}
+
 async function reconcileUnknownCreate(
   record: PresalesV2TaskRecord,
   dependencies: PresalesV2ReconcileDependencies,
@@ -2154,7 +2256,29 @@ async function reconcileTask(
       order: "desc",
     });
   } catch (error) {
-    if (!providerDeadlineExceeded) throw error;
+    const failureNow = dependencies.now();
+    const providerDeadlineExceededAtFailure =
+      providerDeadlineRead || failureNow.getTime() >= timing.deadlineAtMs;
+    if (
+      deferTransientProviderRead({
+        error,
+        nowMs: failureNow.getTime(),
+        providerStartedAtMs: timing.startedAtMs,
+        providerDeadlineExceeded: providerDeadlineExceededAtFailure,
+      })
+    ) {
+      const providerError = error as ManusV2ApiError;
+      console.warn("[Presales v2] transient Provider read deferred", {
+        diagnosticCode: "PRESALES_V2_PROVIDER_READ_DEFERRED",
+        operation: providerError.operation,
+        providerErrorCode: safeProviderReadErrorCode(providerError),
+        status: providerError.status,
+        retryable: providerError.retryable,
+        persistedStateFallback: true,
+      });
+      return record;
+    }
+    if (!providerDeadlineExceededAtFailure) throw error;
     logPresalesV2ResultObservation({
       localTaskId,
       contractName: record.contract.name,
@@ -2175,8 +2299,9 @@ async function reconcileTask(
               status: "attention_required",
               errorCode: "PROVIDER_RUN_DEADLINE_EXCEEDED",
               providerRunDeadlineExceededAt:
-                candidate.providerRunDeadlineExceededAt ?? now.toISOString(),
-              terminalAt: candidate.terminalAt ?? now.toISOString(),
+                candidate.providerRunDeadlineExceededAt ??
+                failureNow.toISOString(),
+              terminalAt: candidate.terminalAt ?? failureNow.toISOString(),
             },
             "attention_required",
           ),
