@@ -2,7 +2,86 @@ import { createHash } from "node:crypto";
 
 import JSZip from "jszip";
 import sharp from "sharp";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+
+const browserQaMocks = vi.hoisted(() => {
+  const screenshot = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const goto = vi.fn(async (url: string) => {
+    const response = await fetch(url);
+    await response.arrayBuffer();
+    return { ok: () => response.ok };
+  });
+  const page = {
+    goto,
+    setViewportSize: vi.fn(async () => undefined),
+    screenshot: vi.fn(async () => screenshot),
+  };
+  const browserLaunch = vi.fn(async () => ({
+    newContext: vi.fn(async () => ({
+      newPage: vi.fn(async () => page),
+    })),
+    close: vi.fn(async () => undefined),
+  }));
+  const axeAnalyze = vi.fn(async () => ({ violations: [] }));
+  const chromeLaunch = vi.fn(async () => ({
+    port: 9222,
+    kill: vi.fn(),
+  }));
+  const lighthouse = vi.fn(async (url: string) => {
+    const response = await fetch(url);
+    await response.arrayBuffer();
+    return {
+      lhr: {
+        categories: {
+          performance: { score: 0.95 },
+          accessibility: { score: 1 },
+          "best-practices": { score: 1 },
+          seo: { score: 1 },
+        },
+        audits: {
+          "cumulative-layout-shift": { numericValue: 0.01 },
+        },
+      },
+    };
+  });
+  return {
+    axeAnalyze,
+    browserLaunch,
+    chromeLaunch,
+    goto,
+    lighthouse,
+  };
+});
+
+vi.mock("playwright", () => ({
+  chromium: {
+    executablePath: () => "/frontmind-test/chromium",
+    launch: browserQaMocks.browserLaunch,
+  },
+}));
+
+vi.mock("@axe-core/playwright", () => ({
+  default: class MockAxeBuilder {
+    withTags() {
+      return this;
+    }
+
+    analyze() {
+      return browserQaMocks.axeAnalyze();
+    }
+  },
+}));
+
+vi.mock("chrome-launcher", () => ({
+  launch: browserQaMocks.chromeLaunch,
+}));
+
+vi.mock("lighthouse", () => ({
+  default: browserQaMocks.lighthouse,
+}));
 
 import { SITEOPS_WORKFLOW } from "../../shared/siteops";
 import {
@@ -230,6 +309,13 @@ describe("SiteOps controlled Astro runtime", () => {
 
   it("builds real no-JavaScript Astro HTML and a private noindex preview", async () => {
     const built = previewBuild;
+    expect(browserQaMocks.browserLaunch).toHaveBeenCalledTimes(1);
+    expect(browserQaMocks.axeAnalyze).toHaveBeenCalled();
+    expect(browserQaMocks.lighthouse).toHaveBeenCalledTimes(1);
+    expect(browserQaMocks.goto).toHaveBeenCalledWith(
+      expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\//u),
+      expect.objectContaining({ waitUntil: "networkidle" }),
+    );
     expect(built.sourceSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(built.distSha256).toMatch(/^[a-f0-9]{64}$/u);
     expect(built.contract.specHash).toMatch(/^[a-f0-9]{64}$/u);
@@ -322,6 +408,15 @@ describe("SiteOps controlled Astro runtime", () => {
     );
     expect(dist.file("sitemap.xml")).toBeNull();
     expect(dist.file("llms.txt")).toBeNull();
+  }, 90_000);
+
+  it("fails closed when the browser QA runtime is unavailable", async () => {
+    browserQaMocks.browserLaunch.mockRejectedValueOnce(
+      new Error("TEST_BROWSER_QA_UNAVAILABLE"),
+    );
+    await expect(materializeAstroSite(buildInput())).rejects.toThrow(
+      "TEST_BROWSER_QA_UNAVAILABLE",
+    );
   }, 90_000);
 
   it("emits exact production discovery metadata without false hreflang", async () => {
