@@ -105,14 +105,14 @@ export const SITEOPS_MATERIALIZER_V2_0 = {
     "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
   frontMindVersion: "2.0.0",
   runtimeManifestSha256:
-    "fe38fafa49b1e0a4565c7ac27e5e0c80ff1109232eb00e3543b60623559c2ca4",
+    "9c27e549fb06d14d6012bdf6ec0b4c64a3cbd0dae2efdb888e8808c8a56630d4",
   starterVersion: "2.0.0",
   starterSha256:
     "9bef440d7d732f384adccd0d2443610010315c43611335c7292bba84937d93ac",
   componentLibraryVersion: "2.0.0",
   materializerVersion: "2.0.0",
   materializerSha256:
-    "e186cbbe63b15b782c9d02e4943da219be0d1ced91f629629e3745f47030b0e0",
+    "03cbc4efa71e3999664c71cf683907fc8a595b79b6a03b8eb5522f1ad809ff9d",
   qaPolicyVersion: "siteops-qa-v3",
 } as const;
 

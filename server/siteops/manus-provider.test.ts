@@ -12,6 +12,8 @@ import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-desig
 import {
   briefWithoutBrandAssets,
   combinedTerminalTaskState,
+  completedSiteBuildMessage,
+  contentRepairPrompt,
   handledWaitingResolution,
   createManusSiteOpsProviderHandler,
   frozenAssetDecisions,
@@ -70,6 +72,21 @@ const operation = {
 afterEach(() => vi.restoreAllMocks());
 
 describe("Manus SiteOps provider boundary", () => {
+  it("keeps customer-facing completion and content repair copy renderer-neutral", () => {
+    const completion = completedSiteBuildMessage();
+    const repair = contentRepairPrompt({
+      repairAttempt: 2,
+      outputFilename: "frontmind-page-content-wire-v2.json",
+    });
+
+    expect(completion).toBe(
+      "FrontMind 静态官网已完成构建和 QA，可以在私有预览中检查并批准。",
+    );
+    expect(completion).not.toMatch(/Astro/u);
+    expect(repair).toContain("受信网站 QA");
+    expect(repair).not.toMatch(/Astro/u);
+  });
+
   it("propagates an aborted worker signal instead of projecting a terminal build failure", async () => {
     const getDb = vi.fn();
     const handler = createManusSiteOpsProviderHandler({ getDb });

@@ -816,16 +816,17 @@ describe("SiteOps trusted React 19 static runtime", () => {
   it("materializes semantic colors that satisfy every text/background contrast contract", async () => {
     const input = buildInput();
     (input.visual as any).taxonomy.palette = [
-      "#080808",
       "#FFFFFF",
-      "#292929",
-      "#161616",
+      "#111111",
+      "#0066CC",
+      "#888888",
     ];
     (input.designSpec as any).colorRoles = {
       backgroundPaletteIndex: 0,
       textPaletteIndex: 1,
       accentPaletteIndex: 2,
     };
+    (input.designSpec as any).surfaceStyle = "layered";
     (input.designSpec as any).routeCompositions[0].slots[0].variant = "cta";
     const built = await materializeAstroSite(input);
     const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
@@ -840,6 +841,12 @@ describe("SiteOps trusted React 19 static runtime", () => {
       4.5,
     );
     expect(ratio(variables.ink, variables.muted)).toBeGreaterThanOrEqual(4.5);
+    expect(ratio(variables.accent, variables.muted)).toBeGreaterThanOrEqual(
+      4.5,
+    );
+    expect(css).toContain(
+      ".surface--soft_depth .section{background:var(--muted)",
+    );
     expect(css).toContain(".source-note{color:var(--ink)");
     expect(css).toContain(".section--cta .source-note{color:var(--canvas)}");
     expect(css).not.toMatch(/\.source-note\{[^}]*opacity/gu);

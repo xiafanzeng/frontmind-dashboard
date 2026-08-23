@@ -93,7 +93,9 @@ function browserIntegrationInput(): MaterializeAstroSiteInput {
       supportEvidenceSha256s: [],
       taxonomy: {
         role: "foundation",
-        palette: ["#F7F2E8", "#173B35", "#9B3A24", "#D9E4DE"],
+        // Regression for the production palette that previously selected a
+        // muted surface readable by ink but unreadable by accent text.
+        palette: ["#FFFFFF", "#111111", "#0066CC", "#888888"],
         typography: ["editorial display"],
         layout: ["centered orbit"],
         motion: ["subtle floating"],
@@ -106,7 +108,7 @@ function browserIntegrationInput(): MaterializeAstroSiteInput {
       referenceBlueprint,
       layoutArchetype: "hero_led",
       density: "spacious",
-      surfaceStyle: "soft_depth",
+      surfaceStyle: "layered",
       typeScale: "display",
       imageTreatment: "none",
       motionLevel: "subtle",

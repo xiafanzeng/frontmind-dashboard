@@ -177,7 +177,7 @@ class SiteOpsManusFailure extends Error {
 }
 
 const SAFE_MATERIALIZATION_DETAIL_KEY =
-  /^(?:durationMs|assetDecisionCount|publishedCount|omittedCount|omittedDuplicateCount|quarantineCount|exitCode|signal|performance|accessibility|bestPractices|seo|cls|axeViolationCount|failedAuditIds|localRetryCount)$/u;
+  /^(?:durationMs|assetDecisionCount|publishedCount|omittedCount|omittedDuplicateCount|quarantineCount|exitCode|signal|performance|accessibility|bestPractices|seo|cls|axeViolationCount|axeViolationIds|failedAuditIds|localRetryCount)$/u;
 
 function untypedMaterializationCode(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");
@@ -1322,6 +1322,17 @@ function pending(
   };
 }
 
+export function completedSiteBuildMessage() {
+  return "FrontMind 静态官网已完成构建和 QA，可以在私有预览中检查并批准。";
+}
+
+export function contentRepairPrompt(input: {
+  repairAttempt: number;
+  outputFilename?: string;
+}) {
+  return `继续同一个 FrontMind AI 建站任务。上一次 PageContentWireV2 或受信网站 QA 未通过。第 ${input.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 PageContentWireV2，只能引用允许的 sourceDocumentIds，并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}。不得输出源码、脚本或未知事实。`;
+}
+
 async function scheduleRepair(input: {
   db: any;
   operation: SiteOperation;
@@ -2191,7 +2202,7 @@ export function createManusSiteOpsProviderHandler(
               ? reactStatic
                 ? `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV3 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：重新读取已附加 workflow、source dossier 与冻结视觉参考，完整返回 SiteDesignWireV3；不得返回或改变 Hero family，并把完全相同的 JSON 对象附加为 ${designOutputFilename}。不得输出源码、脚本或未知事实。`
                 : `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV2 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：完整返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本或未知事实。`
-              : `继续同一个 FrontMind AI 建站任务。上一次 PageContentWireV2 或受信网站 QA 未通过。第 ${state.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 PageContentWireV2，只能引用允许的 sourceDocumentIds，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}。不得输出源码、脚本或未知事实。`,
+              : contentRepairPrompt({ repairAttempt: state.repairAttempt }),
             repairToken,
           );
           const unknownState: ProviderState = {
@@ -2992,9 +3003,7 @@ export function createManusSiteOpsProviderHandler(
             },
           },
         },
-        message: reactStatic
-          ? "React 静态官网已完成构建和 QA，可以在私有预览中检查并批准。"
-          : "原生 Astro 官网已完成构建和 QA，可以在私有预览中检查并批准。",
+        message: completedSiteBuildMessage(),
       };
     } catch (error) {
       if (signal.aborted) throw error;
