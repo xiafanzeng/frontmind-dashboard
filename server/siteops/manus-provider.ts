@@ -16,6 +16,8 @@ import {
   type SiteOperation,
 } from "../../drizzle/schema";
 import {
+  SITEOPS_MATERIALIZER_V2_0,
+  SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   visualEvidenceV1Schema,
@@ -25,6 +27,7 @@ import {
   type VisualSelectionBundle,
   type VisualSelectionBundleV1,
   type VisualSelectionBundleV2,
+  type VisualSelectionBundleV3,
 } from "../../shared/siteops";
 import {
   managedAgentProfileModel,
@@ -35,7 +38,7 @@ import {
   canonicalSiteOpsSha256,
   composeBuildContractV2,
   composeBuildPlanContractV3,
-  referenceBlueprintV2Schema,
+  referenceBlueprintSchema,
   siteDesignResultV1Schema,
   siteDesignResultV2Schema,
   siteOpsRuntimeVisualEvidenceV1Schema,
@@ -116,7 +119,7 @@ const operationInputSchema = z
     channel: z.enum(["wechat", "xiaohongshu"]).optional(),
     packageId: z.string().uuid().optional(),
     topic: z.string().trim().max(500).optional(),
-    referenceBlueprint: referenceBlueprintV2Schema.optional(),
+    referenceBlueprint: referenceBlueprintSchema.optional(),
   })
   .passthrough();
 
@@ -321,6 +324,32 @@ function workflowRoots(workflow: ReturnType<typeof siteOpsWorkflowForVersion>) {
     path.resolve(process.cwd(), "private-workflows", directory),
     path.resolve(process.cwd(), "dist/private-workflows", directory),
   ];
+}
+
+function reactStaticRendererCoordinates(
+  workflow: ReturnType<typeof siteOpsWorkflowForVersion>,
+) {
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_0.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion: SITEOPS_MATERIALIZER_V2_0.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_0.materializerVersion,
+    } as const;
+  }
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_1.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion: SITEOPS_MATERIALIZER_V2_1.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_1.materializerVersion,
+    } as const;
+  }
+  throw new SiteOpsManusFailure(
+    "SITEOPS_REACT_WORKFLOW_VERSION_UNSUPPORTED",
+    "FrontMind React 建站工作流版本不受支持。",
+    "failed",
+  );
 }
 
 export async function loadVerifiedSiteOpsWorkflowPackage(
@@ -568,8 +597,14 @@ function isVisualSelectionBundleV2(
   return "schemaVersion" in bundle && bundle.schemaVersion === 2;
 }
 
+function isVisualSelectionBundleV3(
+  bundle: VisualSelectionBundle,
+): bundle is VisualSelectionBundleV3 {
+  return "schemaVersion" in bundle && bundle.schemaVersion === 3;
+}
+
 function visualSelectionQueryHash(bundle: VisualSelectionBundle) {
-  return isVisualSelectionBundleV2(bundle)
+  return isVisualSelectionBundleV2(bundle) || isVisualSelectionBundleV3(bundle)
     ? bundle.queryPlanHash
     : (bundle as VisualSelectionBundleV1).queryHash;
 }
@@ -1910,9 +1945,15 @@ export function createManusSiteOpsProviderHandler(
       const designOutputFilename = reactStatic
         ? SITEOPS_WIRE_OUTPUT_FILES.designV3
         : SITEOPS_WIRE_OUTPUT_FILES.design;
-      const referenceBlueprint = referenceBlueprintV2Schema.safeParse(
+      const referenceBlueprint = referenceBlueprintSchema.safeParse(
         input.referenceBlueprint,
       );
+      const selectionV3 = isVisualSelectionBundleV3(selection.bundle)
+        ? selection.bundle
+        : null;
+      const selectedV3Blueprint = selectionV3?.candidates.find(
+        (candidate) => candidate.id === context.sample.id,
+      )?.referenceBlueprint;
       if (
         reactStatic &&
         (!referenceBlueprint.success ||
@@ -1920,7 +1961,10 @@ export function createManusSiteOpsProviderHandler(
           referenceBlueprint.data.providerItemKey !==
             visualEvidence.providerItemKey ||
           referenceBlueprint.data.previewSha256 !==
-            visualEvidence.previewSha256)
+            visualEvidence.previewSha256 ||
+          (selectedV3Blueprint &&
+            selectedV3Blueprint.blueprintHash !==
+              referenceBlueprint.data.blueprintHash))
       ) {
         throw new SiteOpsManusFailure(
           "VISUAL_REFERENCE_BLUEPRINT_MISMATCH",
@@ -2068,7 +2112,7 @@ export function createManusSiteOpsProviderHandler(
           ];
           const prompt = promptWithMarker(
             reactStatic
-              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是主视觉参考；support-visual 仅作区块或动效参考，全部参考图都不是客户网站素材。请返回 SiteDesignWireV3：为每个 route 输出按数组顺序排列且唯一的 routeSlots，并使用 dossier 中的冻结调色板；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、21st 组件代码或未知事实。`
+              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，不是客户网站素材。请返回 SiteDesignWireV3：为每个 route 输出按数组顺序排列且唯一的 routeSlots，并使用 dossier 中的冻结调色板；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
               : `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${workflow.frontMindVersion}，并只使用冻结 SiteBrief、视觉证据和知识来源。请返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本、21st 代码或未知事实。`,
             designToken,
           );
@@ -2562,6 +2606,8 @@ export function createManusSiteOpsProviderHandler(
         const canonicalContract =
           reactStatic && referenceBlueprint.success
             ? (() => {
+                const rendererCoordinates =
+                  reactStaticRendererCoordinates(workflow);
                 const parsedVisual =
                   siteOpsRuntimeVisualEvidenceV2Schema.parse(visual);
                 const {
@@ -2576,8 +2622,10 @@ export function createManusSiteOpsProviderHandler(
                   renderer: {
                     kind: "react_static_v1",
                     reactVersion: "19.2.1",
-                    componentLibraryVersion: "2.0.0",
-                    materializerVersion: "2.0.0",
+                    componentLibraryVersion:
+                      rendererCoordinates.componentLibraryVersion,
+                    materializerVersion:
+                      rendererCoordinates.materializerVersion,
                   },
                   visual: visualEvidence,
                   referenceBlueprint: referenceBlueprint.data,
@@ -2599,7 +2647,7 @@ export function createManusSiteOpsProviderHandler(
             : siteOpsBuildContractAttachment(canonicalContract);
         const prompt = promptWithMarker(
           reactStatic
-            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprintV2 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
+            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprint 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
             : `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV2，并严格匹配冻结 route、slot 与 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。${revisionInstruction}`,
           contentToken,
         );

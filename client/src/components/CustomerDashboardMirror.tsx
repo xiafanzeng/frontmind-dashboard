@@ -130,7 +130,7 @@ const CUSTOMER_DASHBOARD_GROUPS: ReadonlyArray<{
     icon: Database,
     items: [
       { value: "content", label: "内容资产运营", icon: Newspaper },
-      { value: "website", label: "AI 友好官网管理", icon: Globe2 },
+      { value: "website", label: "一站式建站", icon: Globe2 },
     ],
   },
 ];
@@ -650,7 +650,7 @@ function CustomerDashboardSection({
         readOnlyPreview
       />
     ) : (
-      <MirrorEmpty title="AI 友好官网管理" />
+      <MirrorEmpty title="一站式建站" />
     );
   }
 

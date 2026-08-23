@@ -94,19 +94,19 @@ import {
 import {
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
-  siteOpsAliyunConnectionSetupInputSchema,
   siteOpsObserveInputSchema,
   siteOpsOpenInputSchema,
   siteOpsSendMessageInputSchema,
 } from "../shared/siteops";
 import {
   actOnSiteOps,
+  beginSiteOpsAliyunOAuth,
   disconnectSiteOpsAliyunConnection,
+  getSiteOpsAliyunAuthorizationGuide,
   getSiteOpsAliyunConnection,
   observeSiteOps,
   openSiteOps,
   sendSiteOpsMessage,
-  setupSiteOpsAliyunConnection,
   SiteOpsServiceError,
   verifySiteOpsAliyunConnection,
 } from "./siteops/service";
@@ -278,16 +278,25 @@ export const workspaceRouter = router({
             toSiteOpsServiceError(error);
           }
         }),
-      setup: protectedProcedure
-        .input(siteOpsAliyunConnectionSetupInputSchema)
+      beginOAuth: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
         .mutation(async ({ ctx, input }) => {
           try {
-            return await setupSiteOpsAliyunConnection(ctx.user, input);
+            return await beginSiteOpsAliyunOAuth(ctx.user, input);
           } catch (error) {
             toSiteOpsServiceError(error);
           }
         }),
-      verify: protectedProcedure
+      authorizationGuide: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
+        .query(async ({ ctx, input }) => {
+          try {
+            return await getSiteOpsAliyunAuthorizationGuide(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+      verifyRole: protectedProcedure
         .input(siteOpsAliyunConnectionInputSchema)
         .mutation(async ({ ctx, input }) => {
           try {

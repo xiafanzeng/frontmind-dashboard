@@ -498,6 +498,7 @@ export const WEBSITE_MANAGEMENT_HISTORY_CATEGORIES = Object.freeze([
   "website_style_samples",
   "website_build",
   "site_check",
+  "site_rebuild",
 ] as const);
 
 export const QUESTION_MANAGEMENT_HISTORY_CATEGORIES = Object.freeze([

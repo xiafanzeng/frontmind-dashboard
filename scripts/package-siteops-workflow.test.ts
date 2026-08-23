@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import {
   SITEOPS_MATERIALIZER_V1_5,
   SITEOPS_MATERIALIZER_V1_6,
+  SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_WORKFLOW,
 } from "../shared/siteops";
 import {
@@ -74,14 +75,14 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 2.0.0 React static contract", async () => {
+  it("has a current deterministic FrontMind 2.1.0 React static contract", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
       version: SITEOPS_RUNTIME_VERSION,
       upstream: { archiveSha256: SITEOPS_UPSTREAM_SHA256 },
       host: {
         starterSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        componentLibraryVersion: "2.0.0",
+        componentLibraryVersion: SITEOPS_RUNTIME_VERSION,
         materializerVersion: SITEOPS_MATERIALIZER_VERSION,
         materializerSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
@@ -99,11 +100,13 @@ describe("SiteOps runtime workflow package", () => {
       requiredTools: ["search"],
       optionalTools: ["get_component"],
       normalPathTools: ["search"],
-      primaryReferenceRole: "hero",
-      supportReferenceRoles: ["section", "motion"],
+      primaryReferenceRole: "inspiration-evidence",
+      supportReferenceRoles: [],
       promptRequired: false,
       providerCodeReuse: false,
       hostFamilyMappingRequired: true,
+      hostRenderedCandidateCount: 9,
+      uniqueHostFamiliesRequired: true,
     });
     expect(runtime.knowledgeInput).toMatchObject({
       transport: "manifest-verified-json-attachments",
@@ -113,7 +116,7 @@ describe("SiteOps runtime workflow package", () => {
     expect(runtime.providerWire).toMatchObject({
       phaseOneSchema: "schemas/site-design-wire-v3.schema.json",
       phaseOneCanonical:
-        "SiteDesignSpecV2-with-host-injected-ReferenceBlueprintV2",
+        "SiteDesignSpecV2-with-host-injected-ReferenceBlueprintV3",
       phaseOneOutputFilename: "frontmind-site-design-wire-v3.json",
       phaseTwoSchema: "schemas/page-content-wire-v2.schema.json",
       phaseTwoCanonical: "PageContentSpecV1",
@@ -149,14 +152,16 @@ describe("SiteOps runtime workflow package", () => {
     });
     expect(runtime.renderer).toMatchObject({
       kind: "react_static_v1",
-      componentLibraryVersion: "2.0.0",
-      materializerVersion: "2.0.0",
+      componentLibraryVersion: SITEOPS_RUNTIME_VERSION,
+      materializerVersion: SITEOPS_RUNTIME_VERSION,
       renderMethod: "renderToStaticMarkup",
       routeDocuments: true,
     });
     expect(runtime.referenceBlueprint).toMatchObject({
-      schema: "ReferenceBlueprintV2",
+      schema: "ReferenceBlueprintV3",
       familyFrozenByDashboard: true,
+      candidatePreviewOwner: "dashboard",
+      candidatePreviewRenderer: "trusted-react-host",
       providerCodeAccepted: false,
     });
     expect(runtime.typedMaterialization).toEqual({
@@ -192,7 +197,7 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("retains immutable Astro coordinates while 2.0 freezes complete React coordinates", async () => {
+  it("retains immutable Astro and React 2.0 coordinates while 2.1 freezes complete React coordinates", async () => {
     const [legacyManifest, envelope, stageSchema, starter] = await Promise.all([
       readFile(
         "private-workflows/astro-company-site-workflow-v1.5.0/MANIFEST.json",
@@ -218,6 +223,12 @@ describe("SiteOps runtime workflow package", () => {
     );
     expect(createHash("sha256").update(astro16Manifest).digest("hex")).toBe(
       SITEOPS_MATERIALIZER_V1_6.runtimeManifestSha256,
+    );
+    const react20Manifest = await readFile(
+      "private-workflows/react-static-company-site-workflow-v2.0.0/MANIFEST.json",
+    );
+    expect(createHash("sha256").update(react20Manifest).digest("hex")).toBe(
+      SITEOPS_MATERIALIZER_V2_0.runtimeManifestSha256,
     );
     for (const version of ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]) {
       const preserved = JSON.parse(
@@ -251,7 +262,7 @@ describe("SiteOps runtime workflow package", () => {
     expect(frozenEnvelope.properties.workflow.properties).toMatchObject({
       version: { const: SITEOPS_RUNTIME_VERSION },
       starterVersion: { const: SITEOPS_RUNTIME_VERSION },
-      componentLibraryVersion: { const: "2.0.0" },
+      componentLibraryVersion: { const: SITEOPS_RUNTIME_VERSION },
       materializerVersion: { const: SITEOPS_MATERIALIZER_VERSION },
       qaPolicyVersion: { const: "siteops-qa-v3" },
     });
@@ -287,6 +298,17 @@ describe("SiteOps runtime workflow package", () => {
         duplicateSha256Allowed: true,
         publishAndOmitSameSha256Allowed: true,
       },
+      heroFamilies: [
+        "floating_orbit",
+        "feature_grid",
+        "bento",
+        "split_media",
+        "editorial",
+        "centered_dual_cta",
+        "immersive_visual",
+        "product_stage",
+        "full_bleed_statement",
+      ],
     });
   });
 

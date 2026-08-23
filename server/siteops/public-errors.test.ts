@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   publicSiteOpsErrorProjection,
+  publicSiteOpsMessageText,
   publicSiteOpsProviderResult,
   sanitizeFrontMindPublicText,
 } from "./public-errors";
@@ -43,7 +44,36 @@ describe("SiteOps public error projection", () => {
 
   it("sanitizes historical server-owned message text", () => {
     expect(sanitizeFrontMindPublicText("Manus 暂时无法完成该任务")).toBe(
-      "FrontMind AI 建站任务未能完成，请根据错误码重置后重新开始。",
+      "FrontMind AI 建站任务未能完成，请提交工单获取协助。",
+    );
+  });
+
+  it("sanitizes technical history at the server observation boundary", () => {
+    for (const content of [
+      "SiteOps 使用 React 静态生成官网。",
+      "21st 视觉候选已完成。",
+      "个人 API Key 与 Pro 已随官网版本锁定。",
+    ]) {
+      const projected = publicSiteOpsMessageText({ content });
+      expect(projected).not.toMatch(/SiteOps|React|21st|API\s*Key|\bPro\b/iu);
+    }
+    expect(
+      publicSiteOpsMessageText({
+        content: "Manus invalid_argument",
+        errorCode: "invalid_argument",
+      }),
+    ).toBe("FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。");
+  });
+
+  it("does not project publishing runtime diagnostics into customer readiness", () => {
+    const projected = sanitizeFrontMindPublicText(
+      "ESA 缺少可用的阿里云标准服务身份（环境 STS/AK、OIDC、凭据文件、ECS RAM Role 或 Credentials URI）",
+    );
+    expect(projected).toBe(
+      "FrontMind 暂未完成网站配置，请稍后重试或提交工单获取协助。",
+    );
+    expect(projected).not.toMatch(
+      /ESA|STS|AK|OIDC|ECS|RAM|Role|Credentials|URI/iu,
     );
   });
 

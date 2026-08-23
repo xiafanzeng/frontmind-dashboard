@@ -9,21 +9,16 @@ function observation(
   return {
     schemaVersion: 1,
     executionKind: "site_ops",
-    providerState: {
-      twentyFirst: { status: "configured" },
-      aiBuilder: { status: "configured" },
-      esa: { status: "configured" },
-      aliyun: { status: "not_configured" },
+    serviceReadiness: {
+      visuals: { status: "configured" },
+      website: { status: "configured" },
+      publishing: { status: "configured" },
+      domain: { status: "not_configured" },
     },
     aliyunConnection: {
       configured: false,
-      accountUid: null,
-      roleArn: null,
-      externalIdFingerprint: null,
-      status: null,
-      capabilities: [],
+      status: "not_connected",
       verifiedAt: null,
-      lastErrorCode: null,
       canRotate: true,
     },
     domainState: null,
@@ -75,9 +70,7 @@ function observation(
         title: "克制的编辑式布局",
         previewUrl: "/api/local-assets/preview-a",
         note: "克制的编辑式布局",
-        score: 91,
-        heroVariant: "editorial_modular",
-        heroConfidence: "explicit",
+        visualFamily: "editorial",
         selected: false,
       },
       {
@@ -86,9 +79,7 @@ function observation(
         title: "精密技术型布局",
         previewUrl: "/api/local-assets/preview-b",
         note: "精密技术型布局",
-        score: 88,
-        heroVariant: "split_media",
-        heroConfidence: "strong",
+        visualFamily: "split_media",
         selected: false,
       },
     ],
@@ -96,6 +87,7 @@ function observation(
     deployments: [],
     socialPackages: [],
     resetCapability: { allowed: true },
+    rebuildRequest: { allowed: false, ticketId: null, status: null },
     interactionState: "awaiting_visual_selection",
     latestSequence: 1,
     ...input,
@@ -122,9 +114,7 @@ describe("SiteOpsConversationPanel", () => {
               status: "cancelled",
               previewUrl: null,
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: "FRONTMIND_BUILD_REQUEST_INVALID",
-              errorMessage: "已重置。",
+              needsHelp: true,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
@@ -144,9 +134,9 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "重置 AI 建站流程" }));
+    fireEvent.click(screen.getByRole("button", { name: "重置建站流程" }));
     expect(
-      screen.getByRole("alertdialog", { name: "确认重置 AI 建站流程？" }),
+      screen.getByRole("alertdialog", { name: "确认重置建站流程？" }),
     ).toBeInTheDocument();
     expect(onAction).not.toHaveBeenCalled();
 
@@ -154,13 +144,13 @@ describe("SiteOpsConversationPanel", () => {
     await waitFor(() =>
       expect(
         screen.queryByRole("alertdialog", {
-          name: "确认重置 AI 建站流程？",
+          name: "确认重置建站流程？",
         }),
       ).not.toBeInTheDocument(),
     );
     expect(onAction).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "重置 AI 建站流程" }));
+    fireEvent.click(screen.getByRole("button", { name: "重置建站流程" }));
     fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
@@ -171,7 +161,7 @@ describe("SiteOpsConversationPanel", () => {
     await waitFor(() =>
       expect(
         screen.queryByRole("alertdialog", {
-          name: "确认重置 AI 建站流程？",
+          name: "确认重置建站流程？",
         }),
       ).not.toBeInTheDocument(),
     );
@@ -191,14 +181,14 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "重置 AI 建站流程" }),
+      screen.getByRole("button", { name: "重置建站流程" }),
     ).toBeDisabled();
     expect(
       screen.getByText("当前仍有任务正在执行或结果待确认，完成后才能重置。"),
     ).toBeInTheDocument();
   });
 
-  it("shows a stable error code and operation id without raw provider errors", () => {
+  it("hides internal error codes and operation ids from customers", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -232,13 +222,11 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(
-      screen.getByText("错误码：VISUAL_OPERATION_CONTRACT_MISMATCH"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("任务编号：operation-safe-id")).toBeInTheDocument();
+    expect(screen.queryByText(/VISUAL_OPERATION_CONTRACT_MISMATCH/u)).toBeNull();
+    expect(screen.queryByText(/operation-safe-id/u)).toBeNull();
   });
 
-  it("shows real A-I candidates and submits a structured selection", async () => {
+  it("shows customer-facing visual candidates and submits only the selection", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -249,43 +237,30 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "对话式 AI 建站" }),
+      screen.getByRole("heading", { name: "一站式建站" }),
     ).toBeInTheDocument();
-    expect(screen.getByAltText("A：克制的编辑式布局")).toHaveAttribute(
+    expect(screen.getByAltText("A：编辑杂志式")).toHaveAttribute(
       "src",
       "/api/local-assets/preview-a",
     );
-    expect(screen.getByText("Hero · 编辑模块")).toBeInTheDocument();
+    expect(screen.getByText("首页 · 编辑杂志式")).toBeInTheDocument();
     expect(screen.queryByText(/匹配度/u)).toBeNull();
     expect(
-      screen.getByRole("heading", { name: "选择首页 Hero 视觉方向" }),
+      screen.getByRole("heading", { name: "9 个视觉候选" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /^Pro/u })).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
-    expect(screen.getByRole("radio", { name: /^Base/u })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
-    expect(
-      screen.getByText(/任务会使用当前账号配置的个人 API Key/u),
-    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/API Key|Base|Pro|Hero/iu);
     fireEvent.click(screen.getByRole("button", { name: "选择 B" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "select_visual",
-        input: {
-          sampleId: "candidate-b",
-          agentProfile: "frontmind-pro",
-        },
+        input: { sampleId: "candidate-b" },
         messageId: "message-1",
         cardKind: "visual_board",
       }),
     );
   });
 
-  it("freezes the selected Base mode when delegating the visual choice", async () => {
+  it("delegates a visual choice without exposing an AI mode", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -294,17 +269,13 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("radio", { name: /^Base/u }));
-    expect(screen.getByRole("radio", { name: /^Base/u })).toHaveAttribute(
-      "aria-checked",
-      "true",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "委托 AI 选择" }));
+    expect(document.body.textContent).not.toMatch(/API Key|Base|Pro/iu);
+    fireEvent.click(screen.getByRole("button", { name: "让 FrontMind 推荐" }));
 
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "delegate_visual",
-        input: { agentProfile: "frontmind-base" },
+        input: {},
         messageId: "message-1",
         cardKind: "visual_board",
       }),
@@ -327,10 +298,7 @@ describe("SiteOpsConversationPanel", () => {
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "select_visual",
-        input: {
-          sampleId: "candidate-a",
-          agentProfile: "frontmind-pro",
-        },
+        input: { sampleId: "candidate-a" },
       }),
     );
   });
@@ -347,16 +315,14 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "已锁定的首页 Hero 视觉方向" }),
+      screen.getByRole("heading", { name: "已选择的视觉方案" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "委托 AI 选择" })).toBeNull();
-    expect(screen.getByText("已随官网版本锁定")).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /^Pro/u })).toBeDisabled();
-    expect(screen.getByRole("radio", { name: /^Base/u })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "让 FrontMind 推荐" })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/已随官网版本锁定|Base|Pro/iu);
   });
 
-  it("restores the build-frozen Base mode after a refresh", async () => {
+  it("does not expose a build-frozen AI mode after refresh", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -367,13 +333,10 @@ describe("SiteOpsConversationPanel", () => {
               id: "33333333-3333-4333-8333-333333333333",
               ordinal: 1,
               parentBuildId: null,
-              agentProfile: "frontmind-base",
               status: "building",
               previewUrl: null,
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
@@ -383,25 +346,16 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    await waitFor(() =>
-      expect(screen.getByRole("radio", { name: /^Base/u })).toHaveAttribute(
-        "aria-checked",
-        "true",
-      ),
-    );
-    expect(screen.getByRole("radio", { name: /^Pro/u })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+    expect(document.body.textContent).not.toMatch(/API Key|Base|Pro/iu);
   });
 
-  it("requires the current customer's personal AI building key before visual selection", () => {
+  it("uses a customer-safe service message when building is not configured", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
-          providerState: {
-            ...observation().providerState,
-            aiBuilder: {
+          serviceReadiness: {
+            ...observation().serviceReadiness,
+            website: {
               status: "not_configured",
               reason: "Upstream provider credential is missing.",
             },
@@ -413,12 +367,12 @@ describe("SiteOpsConversationPanel", () => {
 
     expect(
       screen.getByText(
-        "请先为当前账号配置个人 AI 建站 API Key，配置完成后才能锁定视觉并开始建站。",
+        "AI 建站服务尚未就绪，请联系 FrontMind。",
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "委托 AI 选择" })).toBeDisabled();
-    expect(document.body.textContent).not.toMatch(/21st|Manus|Upstream/iu);
+    expect(screen.getByRole("button", { name: "让 FrontMind 推荐" })).toBeDisabled();
+    expect(document.body.textContent).not.toMatch(/21st|Manus|Upstream|API Key/iu);
   });
 
   it("selects an immutable knowledge snapshot through a structured action", async () => {
@@ -507,9 +461,7 @@ describe("SiteOpsConversationPanel", () => {
               status: "building",
               previewUrl: null,
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
@@ -543,9 +495,9 @@ describe("SiteOpsConversationPanel", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
-          providerState: {
-            ...observation().providerState,
-            twentyFirst: {
+          serviceReadiness: {
+            ...observation().serviceReadiness,
+            visuals: {
               status: "not_configured",
               reason: "请让系统管理员配置 21st API Key。",
             },
@@ -579,10 +531,7 @@ describe("SiteOpsConversationPanel", () => {
                 "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
               sourceUrl:
                 "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/source",
-              qaUrl:
-                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/qa",
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
@@ -593,7 +542,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
     const previewButton = screen.getByRole("button", {
-      name: "在新标签页打开私有预览",
+      name: "在新标签页打开预览",
     });
     fireEvent.click(previewButton);
     fireEvent.click(previewButton);
@@ -609,11 +558,9 @@ describe("SiteOpsConversationPanel", () => {
     );
     expect(focus).toHaveBeenCalledTimes(2);
     expect(
-      screen.getByRole("link", { name: "下载源码 ZIP" }),
+      screen.getByRole("link", { name: "下载网站源码" }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "批准这个版本" }),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/QA 报告|批准这个版本/u)).toBeNull();
     open.mockRestore();
   });
 
@@ -631,9 +578,7 @@ describe("SiteOpsConversationPanel", () => {
               previewUrl:
                 "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
@@ -646,7 +591,7 @@ describe("SiteOpsConversationPanel", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "在新标签页打开私有预览",
+        name: "在新标签页打开预览",
       }),
     );
     expect(
@@ -656,7 +601,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
 
     const retryLink = screen.getByRole("link", {
-      name: "重试打开私有预览",
+      name: "重试打开预览",
     });
     expect(retryLink).toHaveAttribute(
       "href",
@@ -671,11 +616,7 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
-  it("keeps the previous Astro preview available beside a React child build", () => {
-    const focus = vi.fn();
-    const open = vi
-      .spyOn(window, "open")
-      .mockReturnValue({ focus } as unknown as Window);
+  it("does not expose renderer details or historical comparisons", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -684,14 +625,11 @@ describe("SiteOpsConversationPanel", () => {
               id: "33333333-3333-4333-8333-333333333333",
               ordinal: 4,
               parentBuildId: null,
-              renderer: "astro_static",
               status: "approved",
               previewUrl:
                 "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
@@ -699,14 +637,11 @@ describe("SiteOpsConversationPanel", () => {
               id: "44444444-4444-4444-8444-444444444444",
               ordinal: 5,
               parentBuildId: "33333333-3333-4333-8333-333333333333",
-              renderer: "react_static",
               status: "preview_ready",
               previewUrl:
                 "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/preview/",
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-23T00:00:00.000Z",
               updatedAt: "2026-08-23T00:01:00.000Z",
             },
@@ -717,16 +652,59 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.getByText("历史版本对比")).toBeInTheDocument();
-    const historical = screen.getByRole("button", {
-      name: "官网版本 4 · Astro",
-    });
-    fireEvent.click(historical);
+    expect(document.body.textContent).not.toMatch(/Astro|React|历史版本对比/iu);
+  });
+
+  it("keeps the last successful preview available when a child rebuild fails", () => {
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ focus: vi.fn() } as unknown as Window);
+    const currentPreview =
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/";
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 4,
+              parentBuildId: null,
+              status: "approved",
+              previewUrl: currentPreview,
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              ordinal: 5,
+              parentBuildId: "33333333-3333-4333-8333-333333333333",
+              status: "failed",
+              previewUrl: null,
+              sourceUrl: null,
+              needsHelp: true,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: { allowed: true, ticketId: null, status: null },
+          interactionState: "failed",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("最新重制暂未完成，当前官网仍可继续预览和使用。"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    );
     expect(open).toHaveBeenCalledWith(
-      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      currentPreview,
       "frontmind-siteops-preview",
     );
-    expect(focus).toHaveBeenCalledTimes(1);
     open.mockRestore();
   });
 
@@ -738,9 +716,7 @@ describe("SiteOpsConversationPanel", () => {
       status: "approved" as const,
       previewUrl: null,
       sourceUrl: null,
-      qaUrl: null,
-      errorCode: null,
-      errorMessage: null,
+      needsHelp: false,
       createdAt: "2026-08-22T00:00:00.000Z",
       updatedAt: "2026-08-22T00:01:00.000Z",
     };
@@ -769,7 +745,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeDisabled();
   });
 
-  it("starts an explicit visual re-selection without mutating the live build", async () => {
+  it("submits a rebuild ticket instead of directly reselecting visuals", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -782,30 +758,34 @@ describe("SiteOpsConversationPanel", () => {
               status: "approved",
               previewUrl: null,
               sourceUrl: null,
-              qaUrl: null,
-              errorCode: null,
-              errorMessage: null,
+              needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
             },
           ],
           project: { ...observation().project, status: "live" },
           interactionState: "live",
+          rebuildRequest: { allowed: true, ticketId: null, status: null },
         })}
         onAction={onAction}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "重新选择视觉方向" }));
+    expect(screen.queryByRole("button", { name: "重置建站流程" })).toBeNull();
+    fireEvent.click(screen.getAllByRole("button", { name: "提交官网重制需求" })[0]!);
+    fireEvent.change(screen.getByLabelText("重制原因与期望（选填）"), {
+      target: { value: "希望调整品牌风格" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提交需求" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
-        action: "reselect_visual",
-        input: {},
+        action: "request_rebuild",
+        input: { reason: "希望调整品牌风格" },
       }),
     );
   });
 
-  it("offers append-only rollback for a superseded verified deployment", async () => {
+  it("keeps deployment rollback out of the customer workspace", () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -826,56 +806,92 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "回滚海外版本 · 33333333" }),
-    );
-    await waitFor(() =>
-      expect(onAction).toHaveBeenCalledWith({
-        action: "rollback",
-        input: { deploymentId: "55555555-5555-4555-8555-555555555555" },
-      }),
-    );
+    expect(screen.queryByText("历史发布与回滚")).toBeNull();
+    expect(screen.queryByRole("button", { name: /回滚海外版本/u })).toBeNull();
+    expect(onAction).not.toHaveBeenCalled();
   });
 
-  it("shows the one-time ExternalId returned by customer RAM Role setup", async () => {
-    const onSetupAliyun = vi.fn().mockResolvedValue({
-      externalId: "external-id-once",
-      trustedPrincipalArn: "acs:ram::100000000000:role/frontmind",
-      trustPolicy: { Version: "1", Statement: [] },
-      requiredPermissions: { daily: ["domain:CheckDomain"] },
-      permissionPolicy: {
-        Version: "1",
-        Statement: [
-          { Action: ["domain:CheckDomain"], Effect: "Allow", Resource: ["*"] },
-        ],
-      },
+  it("opens official Alibaba authorization without exposing technical fields", async () => {
+    const onBeginAliyun = vi.fn().mockResolvedValue({
+      authorizationUrl: "https://signin.aliyun.com/oauth/authorize",
+      expiresAt: "2026-08-23T01:00:00.000Z",
     });
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
     render(
       <SiteOpsConversationPanel
         observation={observation()}
-        onSetupAliyun={onSetupAliyun}
+        onBeginAliyun={onBeginAliyun}
       />,
     );
-    fireEvent.change(screen.getByPlaceholderText("例如 123456789012"), {
-      target: { value: "123456789012" },
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledOnce());
+    expect(authorizationWindow.location.href).toBe(
+      "https://signin.aliyun.com/oauth/authorize",
+    );
+    expect(document.body.textContent).not.toMatch(
+      /UID|ARN|ExternalId|AccessKey|RAM Role|STS/iu,
+    );
+    open.mockRestore();
+  });
+
+  it("guides an identified account through official authorization", async () => {
+    const onLoadAliyunAuthorizationGuide = vi.fn().mockResolvedValue({
+      available: true,
+      consoleUrl: "https://ram.console.aliyun.com/roles/create",
+      configurationDownloadUrl: "/api/site-ops/aliyun/authorization-config",
+      roleName: "FrontMindSiteOpsAccess",
+      trustPolicyText: '{"trust":true}',
+      permissionPolicyText: '{"permission":true}',
     });
-    fireEvent.change(
-      screen.getByPlaceholderText("acs:ram::账号UID:role/frontmind-siteops"),
-      {
-        target: {
-          value: "acs:ram::123456789012:role/frontmind-siteops",
-        },
-      },
+    const onVerifyAliyun = vi.fn().mockResolvedValue(undefined);
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          aliyunConnection: {
+            configured: false,
+            status: "authorization_required",
+            verifiedAt: null,
+            canRotate: true,
+          },
+        })}
+        onLoadAliyunAuthorizationGuide={onLoadAliyunAuthorizationGuide}
+        onVerifyAliyun={onVerifyAliyun}
+      />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "生成连接配置" }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "前往阿里云完成授权" }),
+    );
     await waitFor(() =>
-      expect(onSetupAliyun).toHaveBeenCalledWith({
-        accountUid: "123456789012",
-        roleArn: "acs:ram::123456789012:role/frontmind-siteops",
-      }),
+      expect(onLoadAliyunAuthorizationGuide).toHaveBeenCalledOnce(),
     );
-    expect(await screen.findByText("external-id-once")).toBeInTheDocument();
-    expect(screen.getByText("复制最小权限策略")).toBeInTheDocument();
+    expect(authorizationWindow.location.href).toBe(
+      "https://ram.console.aliyun.com/roles/create",
+    );
+    expect(
+      await screen.findByRole("link", { name: "下载备用配置" }),
+    ).toHaveAttribute(
+      "href",
+      "/api/site-ops/aliyun/authorization-config",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "我已完成授权" }));
+    await waitFor(() => expect(onVerifyAliyun).toHaveBeenCalledOnce());
+    open.mockRestore();
   });
 
   it("requires exact domain text before submitting a quoted purchase", async () => {
@@ -885,13 +901,8 @@ describe("SiteOpsConversationPanel", () => {
         observation={observation({
           aliyunConnection: {
             configured: true,
-            accountUid: "123456789012",
-            roleArn: "acs:ram::123456789012:role/frontmind-siteops",
-            externalIdFingerprint: "f".repeat(32),
             status: "active",
-            capabilities: ["domain_read"],
             verifiedAt: "2026-08-22T00:00:00.000Z",
-            lastErrorCode: null,
             canRotate: true,
           },
           domainOperations: [
@@ -909,8 +920,7 @@ describe("SiteOpsConversationPanel", () => {
               maskedRegistrantName: "北**司",
               searchResult: null,
               registrantProfiles: [],
-              errorCode: null,
-              errorMessage: null,
+              issue: null,
               createdAt: "2026-08-22T00:00:00.000Z",
             },
           ],
@@ -919,7 +929,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
     const confirm = screen.getByRole("button", {
-      name: "确认并从客户阿里云账号扣费",
+      name: "确认并从已连接的阿里云账号扣费",
     });
     expect(confirm).toBeDisabled();
     fireEvent.change(screen.getByLabelText("完整输入 example.com"), {
@@ -948,13 +958,8 @@ describe("SiteOpsConversationPanel", () => {
         observation={observation({
           aliyunConnection: {
             configured: true,
-            accountUid: "123456789012",
-            roleArn: "acs:ram::123456789012:role/frontmind-siteops",
-            externalIdFingerprint: "f".repeat(32),
             status: "active",
-            capabilities: ["domain_read"],
             verifiedAt: "2026-08-22T00:00:00.000Z",
-            lastErrorCode: null,
             canRotate: true,
           },
         })}
@@ -965,7 +970,7 @@ describe("SiteOpsConversationPanel", () => {
       target: { value: "owned.example.com" },
     });
     const button = screen.getByRole("button", {
-      name: "只读接入已有域名",
+      name: "接入已有域名",
     });
     fireEvent.click(button);
     expect(onAction).not.toHaveBeenCalled();
@@ -988,7 +993,7 @@ describe("SiteOpsConversationPanel", () => {
     confirm.mockRestore();
   });
 
-  it("shows the exact DNS plan and binds apply to its provider snapshot", async () => {
+  it("keeps exact DNS planning details out of the customer view", () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -998,7 +1003,6 @@ describe("SiteOpsConversationPanel", () => {
             displayDomain: "example.com",
             revision: 4,
             registrar: "aliyun",
-            providerAccountUid: "123456789012",
             expiresAt: null,
             realNameStatus: "verified",
             emailStatus: "verified",
@@ -1012,26 +1016,10 @@ describe("SiteOpsConversationPanel", () => {
             icpVerifiedAt: null,
           },
           dnsPlan: {
-            operationId: "55555555-5555-4555-8555-555555555555",
-            domain: "example.com",
-            domainRevision: 4,
-            planHash: "c".repeat(64),
-            providerSnapshotHash: "d".repeat(64),
             canApply: true,
             status: "succeeded",
-            items: [
-              {
-                id: "dns-1",
-                action: "create",
-                rr: "www",
-                type: "CNAME",
-                expectedValue: "edge.example.net",
-                expectedTtl: 600,
-                currentValue: null,
-                currentTtl: null,
-                reason: null,
-              },
-            ],
+            changeCount: 1,
+            conflictCount: 0,
             createdAt: "2026-08-22T00:00:00.000Z",
           },
         })}
@@ -1039,19 +1027,9 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.getByText("edge.example.net")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "应用 FrontMind DNS" }));
-    await waitFor(() =>
-      expect(onAction).toHaveBeenCalledWith({
-        action: "dns_apply",
-        input: {
-          domainRevision: 4,
-          planOperationId: "55555555-5555-4555-8555-555555555555",
-          planHash: "c".repeat(64),
-          providerSnapshotHash: "d".repeat(64),
-        },
-      }),
-    );
+    expect(screen.queryByText("edge.example.net")).toBeNull();
+    expect(screen.queryByText(/DNS 精确差异|供应商快照/u)).toBeNull();
+    expect(onAction).not.toHaveBeenCalled();
   });
 
   it("requires explicit future-charge confirmation before enabling auto-renew", async () => {
@@ -1065,7 +1043,6 @@ describe("SiteOpsConversationPanel", () => {
             displayDomain: "example.com",
             revision: 4,
             registrar: "aliyun",
-            providerAccountUid: "123456789012",
             expiresAt: null,
             realNameStatus: "verified",
             emailStatus: "verified",
@@ -1103,7 +1080,7 @@ describe("SiteOpsConversationPanel", () => {
     confirm.mockRestore();
   });
 
-  it("disables DNS apply when the exact plan contains a conflict", () => {
+  it("does not expose DNS conflict tuples to customers", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -1112,7 +1089,6 @@ describe("SiteOpsConversationPanel", () => {
             displayDomain: "example.com",
             revision: 4,
             registrar: "aliyun",
-            providerAccountUid: "123456789012",
             expiresAt: null,
             realNameStatus: "verified",
             emailStatus: "verified",
@@ -1126,26 +1102,10 @@ describe("SiteOpsConversationPanel", () => {
             icpVerifiedAt: null,
           },
           dnsPlan: {
-            operationId: "66666666-6666-4666-8666-666666666666",
-            domain: "example.com",
-            domainRevision: 4,
-            planHash: "e".repeat(64),
-            providerSnapshotHash: "f".repeat(64),
             canApply: false,
             status: "attention_required",
-            items: [
-              {
-                id: "dns-2",
-                action: "conflict",
-                rr: "www",
-                type: "CNAME",
-                expectedValue: "edge.example.net",
-                expectedTtl: 600,
-                currentValue: "customer.example.org",
-                currentTtl: 600,
-                reason: "相同 RR/type 已有非 FrontMind 记录，拒绝覆盖。",
-              },
-            ],
+            changeCount: 1,
+            conflictCount: 1,
             createdAt: "2026-08-22T00:00:00.000Z",
           },
         })}
@@ -1153,10 +1113,8 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.getByText(/相同 RR\/type/)).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "应用 FrontMind DNS" }),
-    ).toBeDisabled();
+    expect(screen.queryByText(/相同 RR\/type/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /DNS/u })).toBeNull();
   });
 
   it("submits the current domain through the existing ICP filing entry", async () => {
@@ -1169,7 +1127,6 @@ describe("SiteOpsConversationPanel", () => {
             displayDomain: "example.com",
             revision: 7,
             registrar: "aliyun_cn",
-            providerAccountUid: "123456789012",
             expiresAt: null,
             realNameStatus: "verified",
             emailStatus: "verified",

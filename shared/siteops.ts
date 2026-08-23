@@ -116,7 +116,27 @@ export const SITEOPS_MATERIALIZER_V2_0 = {
   qaPolicyVersion: "siteops-qa-v3",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_0;
+/** React Static 2.1 renders nine unique FrontMind-owned visual candidates,
+ * freezes ReferenceBlueprintV3 and removes public provenance labels while
+ * retaining the internal evidence graph. */
+export const SITEOPS_MATERIALIZER_V2_1 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "2.1.0",
+  runtimeManifestSha256:
+    "1888aaea37c68820910264d7a7aa5922cf67198b14f30085f3774dcd790e57e4",
+  starterVersion: "2.1.0",
+  starterSha256:
+    "126c3304e41e3ead775f716098881c3ef254a44d9af8173bdd093e27f1cabbae",
+  componentLibraryVersion: "2.1.0",
+  materializerVersion: "2.1.0",
+  materializerSha256:
+    "b0e3a395902e880dcde8fdc84d04cb171bc5471be10a7c5590365b08787bb148",
+  qaPolicyVersion: "siteops-qa-v3",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_1;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -125,6 +145,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_5.frontMindVersion]: SITEOPS_MATERIALIZER_V1_5,
   [SITEOPS_MATERIALIZER_V1_6.frontMindVersion]: SITEOPS_MATERIALIZER_V1_6,
   [SITEOPS_MATERIALIZER_V2_0.frontMindVersion]: SITEOPS_MATERIALIZER_V2_0,
+  [SITEOPS_MATERIALIZER_V2_1.frontMindVersion]: SITEOPS_MATERIALIZER_V2_1,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {
@@ -480,8 +501,149 @@ export const visualSelectionBundleV2Schema = z
     }
   });
 
-/** Immutable V1 artifacts remain readable; every new visual operation writes V2. */
+const visualHeroFamilyV3Schema = z.enum([
+  "floating_orbit",
+  "split_media",
+  "editorial",
+  "bento",
+  "feature_grid",
+  "centered_dual_cta",
+  "immersive_visual",
+  "product_stage",
+  "full_bleed_statement",
+]);
+
+/** Artifact-side mirror of ReferenceBlueprintV3. The design contract performs
+ * its canonical hash validation; the selection artifact additionally binds it
+ * to the exact candidate, local preview and inspiration hashes. */
+export const visualReferenceBlueprintV3Schema = z
+  .object({
+    schemaVersion: z.literal(3),
+    candidateId: z.string().trim().min(1).max(191),
+    providerItemKey: z
+      .string()
+      .trim()
+      .min(3)
+      .max(514)
+      .regex(/^(?:n:[1-9]\d*|s:.+)$/u),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    previewLocalAssetId: z.string().uuid(),
+    heroFamily: visualHeroFamilyV3Schema,
+    alignment: z.enum(["left", "center", "right"]),
+    contentEmphasis: z.enum(["statement", "balanced", "product", "proof"]),
+    mediaRegion: z.enum(["none", "inline", "split", "surround", "full_bleed"]),
+    mediaRatio: z.enum(["none", "square", "portrait", "landscape", "wide"]),
+    composition: z.enum(["centered", "split", "editorial", "modular", "immersive"]),
+    backgroundStyle: z.enum(["warm_light", "cool_light", "dark", "gradient", "image_stage"]),
+    gradientStyle: z.enum(["none", "soft_radial", "mesh", "spotlight"]),
+    borderStyle: z.enum(["none", "subtle", "defined"]),
+    radiusStyle: z.enum(["none", "soft", "rounded", "pill"]),
+    decorationStyle: z.enum(["none", "orbital", "grid", "glow", "editorial_lines"]),
+    navStyle: z.enum(["minimal", "floating", "bordered"]),
+    ctaStyle: z.enum(["single", "dual", "pill", "text_link"]),
+    cardStyle: z.enum(["flat", "bordered", "soft_depth", "layered"]),
+    containerStyle: z.enum(["contained", "wide", "edge_to_edge"]),
+    typographyStyle: z.enum(["restrained", "editorial", "display", "technical"]),
+    density: z.enum(["compact", "balanced", "spacious"]),
+    responsiveBehavior: z.enum(["stack", "reflow", "crop_safe"]),
+    motionLevel: z.enum(["none", "subtle", "floating_subtle"]),
+    mediaStrategy: z.enum(["customer_asset", "procedural_brand_svg", "none"]),
+    palette: z
+      .object({
+        canvas: z.string().regex(/^#[a-f0-9]{6}$/u),
+        ink: z.string().regex(/^#[a-f0-9]{6}$/u),
+        accent: z.string().regex(/^#[a-f0-9]{6}$/u),
+        muted: z.string().regex(/^#[a-f0-9]{6}$/u),
+      })
+      .strict(),
+    typeSystem: z.enum(["display_sans", "editorial_serif", "technical_sans", "humanist_sans"]),
+    componentManifest: z.array(z.string().trim().min(1).max(96)).min(2).max(16),
+    inspirationEvidenceIds: z
+      .array(z.string().regex(/^[a-f0-9]{64}$/u))
+      .min(1)
+      .max(3),
+    blueprintHash: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
+export const visualCandidateV3Schema = visualCandidateV2BaseSchema
+  .extend({
+    label: z.string().regex(/^[A-I]$/u),
+    referenceBlueprint: visualReferenceBlueprintV3Schema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    validateVisualCandidateCoordinates(value, context);
+    if (
+      value.referenceBlueprint.candidateId !== value.id ||
+      value.referenceBlueprint.providerItemKey !== value.providerItemKey ||
+      value.referenceBlueprint.previewLocalAssetId !==
+        value.previewLocalAssetId ||
+      value.referenceBlueprint.previewSha256 !== value.previewSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["referenceBlueprint"],
+        message: "V3 blueprint does not match its host-rendered candidate",
+      });
+    }
+  });
+
+export const visualSelectionBundleV3Schema = z
+  .object({
+    schemaVersion: z.literal(3),
+    queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    searchTarget: z.literal(18),
+    displayTarget: z.literal(9),
+    candidates: z.array(visualCandidateV3Schema).length(9),
+    selectedCandidateId: z.string().max(191).nullable(),
+    delegated: z.boolean().default(false),
+    degradedReasons: z.array(z.string().max(500)).max(30).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const unique = (coordinates: string[], path: string) => {
+      if (new Set(coordinates).size !== coordinates.length) {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: `V3 visual ${path} coordinates must be unique`,
+        });
+      }
+    };
+    unique(value.candidates.map((candidate) => candidate.id), "candidateId");
+    unique(value.candidates.map((candidate) => candidate.label), "label");
+    unique(
+      value.candidates.map((candidate) => candidate.previewLocalAssetId),
+      "previewLocalAssetId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.previewSha256),
+      "previewSha256",
+    );
+    unique(
+      value.candidates.map(
+        (candidate) => candidate.referenceBlueprint.heroFamily,
+      ),
+      "heroFamily",
+    );
+    if (
+      value.selectedCandidateId !== null &&
+      !value.candidates.some(
+        (candidate) => candidate.id === value.selectedCandidateId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedCandidateId"],
+        message: "Selected visual candidate is absent",
+      });
+    }
+  });
+
+/** Immutable V1/V2 artifacts remain readable; every new visual operation writes V3. */
 export const visualSelectionBundleSchema = z.union([
+  visualSelectionBundleV3Schema,
   visualSelectionBundleV2Schema,
   visualSelectionBundleV1Schema,
 ]);
@@ -586,6 +748,7 @@ export const siteOpsSendMessageInputSchema = z
 
 export const siteOpsActionSchema = z.enum([
   "reset_workflow",
+  "request_rebuild",
   "select_snapshot",
   "change_snapshot",
   "start_visual_search",
@@ -630,6 +793,9 @@ export type VisualSelectionBundleV1 = z.infer<
 >;
 export type VisualSelectionBundleV2 = z.infer<
   typeof visualSelectionBundleV2Schema
+>;
+export type VisualSelectionBundleV3 = z.infer<
+  typeof visualSelectionBundleV3Schema
 >;
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;

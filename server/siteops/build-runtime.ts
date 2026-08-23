@@ -35,12 +35,14 @@ import {
   SITEOPS_MATERIALIZER_V1_4,
   SITEOPS_MATERIALIZER_V1_5,
   SITEOPS_MATERIALIZER_V1_6,
+  SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
 } from "../../shared/siteops";
 import { canonicalJson } from "../../shared/siteops-workflow";
 import {
+  assertVisualPaletteContrastV3,
   canonicalSiteOpsSha256,
   composeBuildContractV3,
   composeBuildPlanContractV3,
@@ -92,6 +94,7 @@ type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V1_4
   | typeof SITEOPS_MATERIALIZER_V1_5
   | typeof SITEOPS_MATERIALIZER_V1_6
+  | typeof SITEOPS_MATERIALIZER_V2_0
   | typeof SITEOPS_WORKFLOW;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
@@ -104,6 +107,27 @@ const ASTRO_VERSION = "7.2.4";
 const TYPESCRIPT_VERSION = "6.0.3";
 const LEGACY_ASTRO_RENDERER = "astro_static_v1" as const;
 type SiteRenderer = typeof LEGACY_ASTRO_RENDERER | typeof REACT_STATIC_RENDERER;
+
+function reactStaticCoordinatesForWorkflow(
+  workflow: SiteOpsMaterializerCoordinates,
+) {
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_0.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_0.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_0.materializerVersion,
+    } as const;
+  }
+  if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
+    return {
+      componentLibraryVersion: REACT_STATIC_COMPONENT_LIBRARY_VERSION,
+      materializerVersion: REACT_STATIC_MATERIALIZER_VERSION,
+    } as const;
+  }
+  throw new Error("SITEOPS_REACT_WORKFLOW_VERSION_UNSUPPORTED");
+}
 const SENSITIVE_TEXT =
   /(?:21st_sk_[A-Za-z0-9_-]{8,}|\bBearer\s+[A-Za-z0-9._~+/-]{12,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:api[_ -]?key|access[_ -]?token|client[_ -]?secret)\s*[:=]\s*[A-Za-z0-9._~+/-]{12,})/iu;
 const FORBIDDEN_DEMO_TEXT =
@@ -685,6 +709,10 @@ function siteDesignMaterializationProjectionFor(
   workflow: SiteOpsMaterializerCoordinates,
   renderer: SiteRenderer,
 ) {
+  const reactCoordinates =
+    renderer === REACT_STATIC_RENDERER
+      ? reactStaticCoordinatesForWorkflow(workflow)
+      : null;
   const design =
     renderer === REACT_STATIC_RENDERER
       ? siteDesignSpecV2Schema.parse(input)
@@ -693,6 +721,8 @@ function siteDesignMaterializationProjectionFor(
     design.schemaVersion === 2
       ? design.referenceBlueprint.heroFamily
       : design.heroVariant;
+  const hasFrozenVisualTokens =
+    design.schemaVersion === 2 && design.referenceBlueprint.schemaVersion === 3;
   const blueprintClasses =
     design.schemaVersion === 2
       ? [
@@ -714,15 +744,21 @@ function siteDesignMaterializationProjectionFor(
           `typography--${design.referenceBlueprint.typographyStyle}`,
           `responsive--${design.referenceBlueprint.responsiveBehavior}`,
           `motion--${design.referenceBlueprint.motionLevel}`,
+          ...(design.referenceBlueprint.schemaVersion === 3
+            ? [
+                `type-system--${design.referenceBlueprint.typeSystem}`,
+                `density--${design.referenceBlueprint.density}`,
+              ]
+            : []),
         ]
       : [];
   return {
     bodyClass: [
       `layout--${design.layoutArchetype}`,
       `surface--${design.surfaceStyle}`,
-      `type--${design.typeScale}`,
+      ...(hasFrozenVisualTokens ? [] : [`type--${design.typeScale}`]),
       `image--${design.imageTreatment}`,
-      `motion--${design.motionLevel}`,
+      ...(hasFrozenVisualTokens ? [] : [`motion--${design.motionLevel}`]),
       ...blueprintClasses,
     ].join(" "),
     heroClass: `hero hero--${heroFamily}`,
@@ -731,9 +767,12 @@ function siteDesignMaterializationProjectionFor(
       schemaVersion: renderer === REACT_STATIC_RENDERER ? 2 : 1,
       componentLibraryVersion:
         renderer === REACT_STATIC_RENDERER
-          ? REACT_STATIC_COMPONENT_LIBRARY_VERSION
+          ? reactCoordinates!.componentLibraryVersion
           : workflow.componentLibraryVersion,
-      materializerVersion: workflow.materializerVersion,
+      materializerVersion:
+        renderer === REACT_STATIC_RENDERER
+          ? reactCoordinates!.materializerVersion
+          : workflow.materializerVersion,
       layoutArchetype: design.layoutArchetype,
       ...(design.schemaVersion === 1
         ? { heroVariant: design.heroVariant }
@@ -753,7 +792,64 @@ export function siteDesignMaterializationProjection(input: unknown) {
   );
 }
 
-function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
+export function siteOpsVisualCssTokens(
+  visual: SiteOpsRuntimeVisual,
+  design: SiteOpsDesignSpec,
+) {
+  if (
+    design.schemaVersion === 2 &&
+    design.referenceBlueprint.schemaVersion === 3
+  ) {
+    const blueprint = design.referenceBlueprint;
+    assertVisualPaletteContrastV3(blueprint.palette);
+    const radius = {
+      none: "0px",
+      soft: "8px",
+      rounded: "22px",
+      pill: "999px",
+    }[blueprint.radiusStyle];
+    const font = {
+      display_sans:
+        "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      editorial_serif: "Georgia, 'Times New Roman', serif",
+      technical_sans:
+        "ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace",
+      humanist_sans: "'Trebuchet MS', ui-sans-serif, system-ui, sans-serif",
+    }[blueprint.typeSystem];
+    const heroSize =
+      blueprint.typographyStyle === "restrained" ||
+      blueprint.typographyStyle === "technical"
+        ? "clamp(2.4rem,6vw,5.2rem)"
+        : blueprint.typographyStyle === "display"
+          ? "clamp(3rem,9vw,7.4rem)"
+          : "clamp(2.7rem,8vw,6.8rem)";
+    const gap =
+      blueprint.density === "compact"
+        ? "12px"
+        : blueprint.density === "spacious"
+          ? "32px"
+          : "20px";
+    const sectionPadding =
+      blueprint.density === "compact"
+        ? "24px"
+        : blueprint.density === "spacious"
+          ? "56px"
+          : "40px";
+    return {
+      ...blueprint.palette,
+      typeSystem: blueprint.typeSystem,
+      density: blueprint.density,
+      radiusStyle: blueprint.radiusStyle,
+      motionLevel: blueprint.motionLevel,
+      typographyStyle: blueprint.typographyStyle,
+      radius,
+      font,
+      heroSize,
+      gap,
+      sectionPadding,
+    };
+  }
+
   const colors = visual.taxonomy.palette.filter((value) =>
     /^#[a-f0-9]{6}$/iu.test(value),
   );
@@ -815,7 +911,38 @@ function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
       : design.density === "spacious"
         ? "56px"
         : "40px";
-  const baseCss = `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${design.motionLevel === "subtle" ? "smooth" : "auto"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:30;backdrop-filter:blur(18px)}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{position:relative;overflow:hidden;padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid color-mix(in srgb,var(--ink) 30%,transparent);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:var(--muted);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--ink)!important;color:var(--canvas);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{color:var(--ink);font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace}.section--cta .source-note,.section--cta .section-index{color:var(--canvas)}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact h2{font-size:clamp(2rem,5vw,4rem);margin:.25em 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
+  return {
+    canvas,
+    ink,
+    accent,
+    muted,
+    typeSystem: null,
+    density: design.density,
+    radiusStyle: null,
+    motionLevel: design.motionLevel,
+    typographyStyle: null,
+    radius,
+    font,
+    heroSize,
+    gap,
+    sectionPadding,
+  };
+}
+
+function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
+  const {
+    canvas,
+    ink,
+    accent,
+    muted,
+    radius,
+    font,
+    heroSize,
+    gap,
+    sectionPadding,
+    motionLevel,
+  } = siteOpsVisualCssTokens(visual, design);
+  const baseCss = `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${motionLevel === "none" ? "auto" : "smooth"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:30;backdrop-filter:blur(18px)}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{position:relative;overflow:hidden;padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid color-mix(in srgb,var(--ink) 30%,transparent);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:var(--muted);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--ink)!important;color:var(--canvas);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{color:var(--ink);font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace}.section--cta .source-note,.section--cta .section-index{color:var(--canvas)}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact h2{font-size:clamp(2rem,5vw,4rem);margin:.25em 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
   const componentCss = `.hero-copy{position:relative;z-index:2}.hero-orbit-layout,.hero-split,.hero-proof{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.82fr);align-items:center;gap:clamp(28px,6vw,88px)}.hero-art{min-width:0}.orbit-art{display:block;width:100%;height:auto;max-height:620px;color:var(--ink)}.orbit-art__halo{fill:color-mix(in srgb,var(--accent) 11%,transparent);stroke:none}.orbit-art__ring{fill:none;stroke:currentColor;stroke-width:1.5;stroke-dasharray:7 12;opacity:.28}.orbit-art__ring--inner{stroke:var(--accent);stroke-dasharray:2 10}.orbit-art__dna,.orbit-art__molecule,.orbit-art__cell,.orbit-art__timeline{fill:none;stroke:currentColor;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}.orbit-art__dna circle,.orbit-art__molecule circle,.orbit-art__cell circle,.orbit-art__timeline circle{fill:var(--canvas);stroke:var(--accent)}.orbit-art__cell{stroke:var(--accent)}.orbit-art__timeline{stroke-width:4}.hero-feature-grid{list-style:none;margin:48px 0 0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);border-block:1px solid color-mix(in srgb,var(--ink) 28%,transparent)}.hero-feature-grid li{display:grid;gap:12px;padding:24px;border-right:1px solid color-mix(in srgb,var(--ink) 28%,transparent)}.hero-feature-grid li:last-child{border:0}.hero-feature-grid span,.section-index{color:var(--accent);font:700 .72rem/1 ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}.hero-bento{display:grid;grid-template-columns:1.45fr .55fr .55fr;grid-template-rows:auto auto;gap:var(--gap)}.hero-bento__copy{grid-row:span 2;padding:clamp(28px,5vw,64px);border:1px solid color-mix(in srgb,var(--ink) 24%,transparent);border-radius:var(--radius)}.hero-bento__signal,.hero-bento__summary,.hero-bento__mark{padding:28px;border-radius:var(--radius);background:var(--muted)}.hero-bento__signal{display:flex;flex-direction:column;justify-content:space-between;gap:64px}.hero-bento__signal span{color:var(--accent)}.hero-bento__mark{display:grid;place-items:center;background:var(--accent);color:var(--canvas);font-size:clamp(3rem,7vw,7rem)}.hero-split__media{aspect-ratio:4/5;position:relative;display:grid;place-items:end start;padding:32px;overflow:hidden;border-radius:var(--radius);background:linear-gradient(145deg,var(--ink),color-mix(in srgb,var(--ink) 72%,var(--accent)));color:var(--canvas)}.hero-split__disc{position:absolute;border-radius:50%;border:1px solid color-mix(in srgb,var(--canvas) 60%,transparent)}.hero-split__disc--one{width:80%;aspect-ratio:1;right:-24%;top:-12%}.hero-split__disc--two{width:45%;aspect-ratio:1;left:10%;bottom:10%;background:color-mix(in srgb,var(--accent) 64%,transparent)}.hero-split__media strong{position:relative;font-size:clamp(1.5rem,3vw,3rem);line-height:1.05}.hero-editorial{border-bottom:1px solid color-mix(in srgb,var(--ink) 28%,transparent)}.hero-editorial{display:grid;grid-template-columns:1fr minmax(0,1120px) 1fr}.hero-editorial>.shell{grid-column:2}.hero-editorial__folio{font:600 .7rem/1 ui-monospace,monospace;letter-spacing:.16em;border-bottom:1px solid currentColor;padding-bottom:16px}.hero-editorial__note{max-width:28ch;margin:48px 0 0 auto;border-left:3px solid var(--accent);padding-left:20px}.hero-centered{text-align:center}.hero-centered .hero-copy>*{margin-inline:auto}.hero-actions{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-top:32px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 22px;border:1px solid currentColor;border-radius:999px;text-decoration:none;font-weight:750}.button--primary{background:var(--ink);color:var(--canvas)}.button--secondary{background:transparent}.button--inverse{background:var(--canvas);color:var(--ink);align-self:center}.hero--immersive_visual{min-height:min(820px,86vh);display:grid;align-items:end;background:var(--ink);color:var(--canvas)}.hero-immersive__field{position:absolute;inset:0;background:radial-gradient(circle at 18% 20%,color-mix(in srgb,var(--accent) 64%,transparent),transparent 28%),radial-gradient(circle at 82% 45%,color-mix(in srgb,var(--canvas) 20%,transparent),transparent 26%)}.hero-immersive__field i{position:absolute;border:1px solid color-mix(in srgb,var(--canvas) 44%,transparent);border-radius:50%;aspect-ratio:1}.hero-immersive__field i:nth-child(1){width:44%;right:4%;top:8%}.hero-immersive__field i:nth-child(2){width:24%;right:27%;top:28%}.hero-immersive__field i:nth-child(3){width:12%;left:12%;top:14%;background:var(--accent)}.hero-immersive__copy{position:relative;padding-bottom:clamp(72px,10vw,136px)}.hero--immersive_visual .eyebrow{color:var(--canvas)}.product-stage{margin-top:56px;border:1px solid color-mix(in srgb,var(--ink) 32%,transparent);border-radius:calc(var(--radius) + 8px);background:color-mix(in srgb,var(--canvas) 82%,white);box-shadow:0 36px 100px color-mix(in srgb,var(--ink) 18%,transparent);overflow:hidden}.product-stage__bar{display:flex;gap:7px;padding:15px 18px;border-bottom:1px solid color-mix(in srgb,var(--ink) 20%,transparent)}.product-stage__bar span{width:10px;height:10px;border-radius:50%;background:var(--accent)}.product-stage__body{min-height:320px;display:grid;grid-template-columns:180px 1fr}.product-stage__body aside{background:color-mix(in srgb,var(--ink) 92%,var(--accent))}.product-stage__body>div{display:grid;gap:18px;align-content:center;padding:clamp(30px,6vw,80px)}.product-stage__body strong{font-size:clamp(1.8rem,4vw,4rem)}.product-stage__body span{height:12px;background:var(--muted);border-radius:99px}.product-stage__body span:last-child{width:62%}.hero-proof__grid{display:grid;grid-template-columns:auto 1fr;margin:0;border-top:1px solid currentColor}.hero-proof__grid dt,.hero-proof__grid dd{margin:0;padding:20px 0;border-bottom:1px solid color-mix(in srgb,var(--ink) 24%,transparent)}.hero-proof__grid dt{padding-right:24px;color:var(--accent);font-family:ui-monospace,monospace}.hero--full_bleed_statement{padding-inline:20px;background:var(--accent);color:var(--canvas)}.hero-statement__rail{position:absolute;inset:0 auto 0 16px;writing-mode:vertical-rl;text-transform:uppercase;letter-spacing:.2em;font-size:.65rem;padding-top:28px}.hero-statement h1{max-width:15ch;font-size:clamp(3.4rem,11vw,9.5rem)}.hero--full_bleed_statement .eyebrow{color:var(--canvas)}.section-index{display:inline-block;margin-bottom:16px}.section blockquote{margin:0;font-size:clamp(1.35rem,2.7vw,2.4rem);line-height:1.25}.section--statement blockquote{max-width:34ch}.section--split{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(0,1.3fr);gap:var(--gap);align-content:start}.section--split .source-note{grid-column:2}.mini-card-grid{display:grid;gap:10px}.mini-card{padding:18px;border:1px solid color-mix(in srgb,var(--ink) 22%,transparent);border-radius:max(4px,calc(var(--radius) / 2))}.mini-card span{color:var(--accent);font:700 .7rem/1 ui-monospace,monospace}.mini-card p{margin:.7em 0 0}.timeline-list{list-style:none;padding:0;margin:28px 0}.timeline-list li{position:relative;display:grid;grid-template-columns:48px 1fr;gap:16px;padding:0 0 28px}.timeline-list li:not(:last-child)::after{content:'';position:absolute;left:15px;top:28px;bottom:0;border-left:1px solid var(--accent)}.timeline-list span{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--canvas);font:700 .65rem/1 ui-monospace,monospace}.timeline-list p{margin:3px 0}.section--faq dl,.section--faq dd{margin:0}.section--faq dt{display:flex;gap:18px;font-size:clamp(1.4rem,3vw,2.5rem);font-weight:750;line-height:1.15}.section--faq dt span{color:var(--accent)}.section--faq dd{padding:20px 0 0 52px}.section--proof figure,.section--proof blockquote{margin:0}.section--proof figcaption{margin-bottom:24px}.section--cta{grid-column:span 12;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center}.section--cta .source-note{grid-column:1/-1}@media(max-width:800px){.hero-orbit-layout,.hero-split,.hero-proof,.hero-bento{grid-template-columns:1fr}.hero-bento__copy{grid-row:auto}.hero-bento__signal{gap:24px}.hero-feature-grid{grid-template-columns:1fr}.hero-feature-grid li{border-right:0;border-bottom:1px solid color-mix(in srgb,var(--ink) 24%,transparent)}.hero-feature-grid li:last-child{border-bottom:0}.hero-art{max-width:620px;margin-inline:auto}.product-stage__body{grid-template-columns:70px 1fr}.section--split,.section--cta{display:block}.section--split .source-note{grid-column:auto}.button--inverse{margin-top:20px}}@media(prefers-reduced-motion:no-preference){.motion--floating_subtle .orbit-art__ring--outer{animation:orbit-spin 32s linear infinite;transform-origin:center}.motion--floating_subtle .orbit-art__cell{animation:orbit-float 6s ease-in-out infinite;transform-origin:center}@keyframes orbit-spin{to{transform:rotate(360deg)}}@keyframes orbit-float{50%{transform:translateY(-12px)}}}@media(prefers-reduced-motion:reduce){.orbit-art *{animation:none!important}}`;
   const orbitCss = `.hero-orbit-stage{position:relative;min-height:clamp(620px,76vw,820px);display:grid;place-items:center}.hero-orbit__copy{position:relative;z-index:4;width:min(720px,72%);text-align:center;padding:56px 36px;border-radius:50%;background:radial-gradient(circle,color-mix(in srgb,var(--canvas) 96%,white) 0 48%,color-mix(in srgb,var(--canvas) 84%,transparent) 68%,transparent 72%)}.hero-orbit__copy .hero-copy>*{margin-inline:auto}.orbit-motif{position:absolute;z-index:2;width:clamp(150px,22vw,260px);aspect-ratio:1;color:var(--ink);filter:drop-shadow(0 22px 36px color-mix(in srgb,var(--ink) 13%,transparent))}.orbit-motif svg{display:block;width:100%;height:100%;overflow:visible}.orbit-motif__halo{fill:color-mix(in srgb,var(--canvas) 82%,white);stroke:color-mix(in srgb,var(--ink) 22%,transparent);stroke-width:1.5}.orbit-motif__drawing{fill:none;stroke:currentColor;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}.orbit-motif__drawing circle{fill:var(--canvas);stroke:var(--accent)}.orbit-motif--dna{left:-2%;top:2%;transform:rotate(-12deg)}.orbit-motif--molecule{right:-1%;top:3%;transform:rotate(9deg)}.orbit-motif--cell{right:4%;bottom:0;transform:rotate(-5deg)}.orbit-motif--cell .orbit-motif__drawing{stroke:var(--accent)}.orbit-motif--timeline{left:1%;bottom:-1%;transform:rotate(6deg)}.orbit-motif--timeline .orbit-motif__drawing{stroke-width:4}@media(max-width:800px){.hero-orbit-stage{min-height:auto;padding:360px 0 330px}.hero-orbit__copy{width:100%;padding:40px 18px}.orbit-motif{width:min(42vw,190px)}.orbit-motif--dna{left:0;top:18px}.orbit-motif--molecule{right:0;top:88px}.orbit-motif--cell{right:2%;bottom:22px}.orbit-motif--timeline{left:0;bottom:86px}}@media(max-width:460px){.hero-orbit-stage{padding:270px 0 250px}.orbit-motif{width:145px}.hero-orbit__copy{background:color-mix(in srgb,var(--canvas) 94%,white);border-radius:var(--radius)}}@media(prefers-reduced-motion:no-preference){.motion--floating_subtle .orbit-motif--dna{animation:motif-dna 7s ease-in-out infinite}.motion--floating_subtle .orbit-motif--molecule{animation:motif-molecule 8s ease-in-out infinite}.motion--floating_subtle .orbit-motif--cell{animation:motif-cell 9s ease-in-out infinite}.motion--floating_subtle .orbit-motif--timeline{animation:motif-timeline 7.5s ease-in-out infinite}@keyframes motif-dna{50%{transform:translate(10px,-14px) rotate(-8deg)}}@keyframes motif-molecule{50%{transform:translate(-12px,10px) rotate(14deg)}}@keyframes motif-cell{50%{transform:translate(-8px,-13px) rotate(-1deg)}}@keyframes motif-timeline{50%{transform:translate(12px,8px) rotate(2deg)}}}@media(prefers-reduced-motion:reduce){.orbit-motif{animation:none!important}}`;
   const blueprintCss = `.contact .eyebrow{color:var(--canvas)}.container--wide .shell{width:min(1360px,calc(100% - 40px))}.container--edge_to_edge .hero>.shell{width:100%;max-width:none}.container--contained .hero--floating_orbit .hero-orbit-stage{width:min(1120px,calc(100% - 40px))}.media-strategy--procedural_brand_svg .orbit-motif{display:block}`;
@@ -884,7 +1011,7 @@ const jsonLdText = jsonLd
       </nav>
     </header>
     <main><slot /></main>
-    <footer class="site-footer"><div class="shell footer-row"><strong>{companyName}</strong><span>内容依据已确认的企业知识库生成</span></div></footer>
+    <footer class="site-footer"><div class="shell footer-row"><strong>{companyName}</strong></div></footer>
   </body>
 </html>
 `;
@@ -942,7 +1069,6 @@ const { data } = Astro.props as { data: PageData };
     <section class={"section section--" + section.variant} data-slot={section.slotId}>
       <h2>{section.heading}</h2>
       {section.paragraphs.map((paragraph) => <p>{paragraph}</p>)}
-      <p class="source-note">知识来源：{section.sourceDocumentIds.join("、")}</p>
     </section>
   ))}
 </div>
@@ -1190,7 +1316,7 @@ function buildTrustedAstroSource(input: {
   addTextFile(
     files,
     "public/social-card.svg",
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="${socialCompany}"><rect width="1200" height="630" fill="${brandCanvas}"/><rect x="0" y="0" width="28" height="630" fill="${brandAccent}"/><circle cx="1060" cy="108" r="150" fill="${brandInk}" opacity=".08"/><text x="92" y="230" font-family="Arial,sans-serif" font-size="72" font-weight="700" fill="${brandInk}">${socialCompany}</text><text x="94" y="325" font-family="Arial,sans-serif" font-size="32" fill="${brandAccent}">${socialDescription}</text><text x="94" y="535" font-family="Arial,sans-serif" font-size="22" fill="${brandInk}" opacity=".72">内容依据已确认的企业知识库生成</text></svg>\n`,
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="${socialCompany}"><rect width="1200" height="630" fill="${brandCanvas}"/><rect x="0" y="0" width="28" height="630" fill="${brandAccent}"/><circle cx="1060" cy="108" r="150" fill="${brandInk}" opacity=".08"/><text x="92" y="230" font-family="Arial,sans-serif" font-size="72" font-weight="700" fill="${brandInk}">${socialCompany}</text><text x="94" y="325" font-family="Arial,sans-serif" font-size="32" fill="${brandAccent}">${socialDescription}</text></svg>\n`,
   );
   addTextFile(
     files,
@@ -1247,6 +1373,7 @@ function buildTrustedReactSource(input: {
   brandAsset: TrustedSiteBrandAsset | null;
   workflow: SiteOpsMaterializerCoordinates;
 }) {
+  const reactCoordinates = reactStaticCoordinatesForWorkflow(input.workflow);
   const files: SourceFile[] = [];
   const projection = siteDesignMaterializationProjectionFor(
     input.designSpec,
@@ -1339,7 +1466,7 @@ function buildTrustedReactSource(input: {
     jsonBuffer({
       schemaVersion: 2,
       renderer: REACT_STATIC_RENDERER,
-      componentLibraryVersion: REACT_STATIC_COMPONENT_LIBRARY_VERSION,
+      componentLibraryVersion: reactCoordinates.componentLibraryVersion,
       packageManager: "host-owned",
       installAtCustomerBuildTime: false,
       node: ">=22.19.0",
@@ -1498,7 +1625,7 @@ function buildTrustedReactSource(input: {
   addTextFile(
     files,
     "public/social-card.svg",
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="${socialCompany}"><rect width="1200" height="630" fill="${brandCanvas}"/><rect x="0" y="0" width="28" height="630" fill="${brandAccent}"/><circle cx="1060" cy="108" r="150" fill="${brandInk}" opacity=".08"/><text x="92" y="230" font-family="Arial,sans-serif" font-size="72" font-weight="700" fill="${brandInk}">${socialCompany}</text><text x="94" y="325" font-family="Arial,sans-serif" font-size="32" fill="${brandAccent}">${socialDescription}</text><text x="94" y="535" font-family="Arial,sans-serif" font-size="22" fill="${brandInk}" opacity=".72">内容依据已确认的企业知识库生成</text></svg>\n`,
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="${socialCompany}"><rect width="1200" height="630" fill="${brandCanvas}"/><rect x="0" y="0" width="28" height="630" fill="${brandAccent}"/><circle cx="1060" cy="108" r="150" fill="${brandInk}" opacity=".08"/><text x="92" y="250" font-family="Arial,sans-serif" font-size="72" font-weight="700" fill="${brandInk}">${socialCompany}</text><text x="94" y="355" font-family="Arial,sans-serif" font-size="32" fill="${brandAccent}">${socialDescription}</text></svg>\n`,
   );
   addTextFile(
     files,
@@ -2257,6 +2384,7 @@ function qaDist(input: {
   assetDecisions: readonly z.infer<typeof siteOpsAssetDecisionSchema>[];
   brandAsset: FrozenSiteBrandAsset | null;
   qaPolicyVersion: string;
+  expectedHeroFamily?: string;
 }) {
   const files = new Map(input.files.map((file) => [file.path, file.bytes]));
   const routeOutputs = input.brief.routes.map((route) =>
@@ -2272,6 +2400,18 @@ function qaDist(input: {
     routeOutputs.every((output) => files.has(output)) && files.has("404.html"),
     `${routeOutputs.length} routes and 404 are present`,
   );
+  if (input.expectedHeroFamily) {
+    requireCheck(
+      "frozen-hero-family",
+      routeOutputs.every((output) =>
+        files
+          .get(output)!
+          .toString("utf8")
+          .includes(`data-hero-family="${input.expectedHeroFamily}"`),
+      ),
+      "every route renders the exact Hero family frozen in the visual blueprint",
+    );
+  }
   const htmlFiles = [...files.entries()].filter(([name]) =>
     name.endsWith(".html"),
   );
@@ -2463,6 +2603,10 @@ async function materializeSiteWithWorkflow(
   renderer: SiteRenderer,
 ): Promise<MaterializedAstroSite> {
   assertNotAborted(input.abortSignal);
+  const reactCoordinates =
+    renderer === REACT_STATIC_RENDERER
+      ? reactStaticCoordinatesForWorkflow(workflow)
+      : null;
   const brandAsset = await materializationStage({
     phase: "input_validation",
     fallbackCode: "SITEOPS_BRAND_ASSET_INVALID",
@@ -2546,15 +2690,15 @@ async function materializeSiteWithWorkflow(
             manifestSha256: workflow.runtimeManifestSha256,
             starterVersion: workflow.starterVersion,
             starterSha256: workflow.starterSha256,
-            componentLibraryVersion: REACT_STATIC_COMPONENT_LIBRARY_VERSION,
-            materializerVersion: REACT_STATIC_MATERIALIZER_VERSION,
+            componentLibraryVersion: reactCoordinates!.componentLibraryVersion,
+            materializerVersion: reactCoordinates!.materializerVersion,
             materializerSha256: workflow.materializerSha256,
           },
           renderer: {
             kind: REACT_STATIC_RENDERER,
             reactVersion: REACT_STATIC_REACT_VERSION,
-            componentLibraryVersion: REACT_STATIC_COMPONENT_LIBRARY_VERSION,
-            materializerVersion: REACT_STATIC_MATERIALIZER_VERSION,
+            componentLibraryVersion: reactCoordinates!.componentLibraryVersion,
+            materializerVersion: reactCoordinates!.materializerVersion,
           },
           identity,
           visual: contractVisual,
@@ -2621,11 +2765,11 @@ async function materializeSiteWithWorkflow(
           starterSha256: workflow.starterSha256,
           componentLibraryVersion:
             renderer === REACT_STATIC_RENDERER
-              ? REACT_STATIC_COMPONENT_LIBRARY_VERSION
+              ? reactCoordinates!.componentLibraryVersion
               : workflow.componentLibraryVersion,
           materializerVersion:
             renderer === REACT_STATIC_RENDERER
-              ? REACT_STATIC_MATERIALIZER_VERSION
+              ? reactCoordinates!.materializerVersion
               : workflow.materializerVersion,
           materializerSha256: workflow.materializerSha256,
           renderer,
@@ -2763,6 +2907,11 @@ async function materializeSiteWithWorkflow(
           assetDecisions: validated.assetDecisions,
           brandAsset: freezeSiteBrandAsset(validated.brandAsset),
           qaPolicyVersion: workflow.qaPolicyVersion,
+          expectedHeroFamily:
+            renderer === REACT_STATIC_RENDERER &&
+            validated.designSpec.schemaVersion === 2
+              ? validated.designSpec.referenceBlueprint.heroFamily
+              : undefined,
         }),
     });
     const browserQa = await materializationStage({
@@ -2861,11 +3010,11 @@ async function materializeSiteWithWorkflow(
         starterSha256: workflow.starterSha256,
         componentLibraryVersion:
           renderer === REACT_STATIC_RENDERER
-            ? REACT_STATIC_COMPONENT_LIBRARY_VERSION
+            ? reactCoordinates!.componentLibraryVersion
             : workflow.componentLibraryVersion,
         materializerVersion:
           renderer === REACT_STATIC_RENDERER
-            ? REACT_STATIC_MATERIALIZER_VERSION
+            ? reactCoordinates!.materializerVersion
             : workflow.materializerVersion,
         materializerSha256: workflow.materializerSha256,
         renderer,
@@ -2965,7 +3114,15 @@ function materializeAstroSiteV1_6(input: MaterializeAstroSiteInput) {
   );
 }
 
-function materializeReactStaticSite(input: MaterializeAstroSiteInput) {
+function materializeReactStaticSiteV2_0(input: MaterializeAstroSiteInput) {
+  return materializeSiteWithWorkflow(
+    input,
+    SITEOPS_MATERIALIZER_V2_0,
+    REACT_STATIC_RENDERER,
+  );
+}
+
+function materializeReactStaticSiteV2_1(input: MaterializeAstroSiteInput) {
   return materializeSiteWithWorkflow(
     input,
     SITEOPS_WORKFLOW,
@@ -3000,9 +3157,14 @@ const productionMaterializerRegistry = [
     materialize: materializeAstroSiteV1_6,
   },
   {
+    workflow: SITEOPS_MATERIALIZER_V2_0,
+    renderer: REACT_STATIC_RENDERER,
+    materialize: materializeReactStaticSiteV2_0,
+  },
+  {
     workflow: SITEOPS_WORKFLOW,
     renderer: REACT_STATIC_RENDERER,
-    materialize: materializeReactStaticSite,
+    materialize: materializeReactStaticSiteV2_1,
   },
 ] as const;
 
@@ -3090,11 +3252,11 @@ export async function materializeProductionSiteFromSource(input: {
       frozen.host.starterSha256 === workflow.starterSha256 &&
       frozen.host.componentLibraryVersion ===
         (renderer === REACT_STATIC_RENDERER
-          ? REACT_STATIC_COMPONENT_LIBRARY_VERSION
+          ? reactStaticCoordinatesForWorkflow(workflow).componentLibraryVersion
           : workflow.componentLibraryVersion) &&
       frozen.host.materializerVersion ===
         (renderer === REACT_STATIC_RENDERER
-          ? REACT_STATIC_MATERIALIZER_VERSION
+          ? reactStaticCoordinatesForWorkflow(workflow).materializerVersion
           : workflow.materializerVersion) &&
       frozen.host.materializerSha256 === workflow.materializerSha256,
   );
@@ -3319,9 +3481,9 @@ async function xiaohongshuPage(input: SocialPackageInput, index: number) {
       : motif === 1
         ? `<path d="M610 210h330v180H610zM760 430h250v150H760z" fill="none" stroke="${ink}" stroke-width="10"/><rect x="660" y="260" width="330" height="180" fill="${muted}"/><circle cx="1015" cy="220" r="55" fill="${accent}"/>`
         : `<path d="M620 260c110-150 330-150 440 0s-20 330-220 330-330-180-220-330z" fill="${muted}"/><path d="M670 520l340-240" stroke="${accent}" stroke-width="38"/><circle cx="690" cy="500" r="52" fill="${ink}"/><circle cx="990" cy="300" r="52" fill="${ink}"/>`;
-  const citations = cover
-    ? "基于企业知识库的可追溯内容"
-    : `来源：${section.sourceDocumentIds.join(" / ")}`;
+  // Evidence coordinates remain in sources.json and the internal QA mapping.
+  // Customer-facing social previews carry only the customer's brand.
+  const citations = input.companyName;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1440" viewBox="0 0 1080 1440"><rect width="1080" height="1440" fill="${canvas}"/><rect x="0" y="0" width="1080" height="26" fill="${accent}"/><text x="70" y="104" font-family="Arial, 'PingFang SC', sans-serif" font-size="26" font-weight="700" fill="${ink}">${escapeXml(input.companyName)}</text><text x="930" y="104" text-anchor="end" font-family="Arial, sans-serif" font-size="24" fill="${ink}">${String(index + 1).padStart(2, "0")} / 09</text>${cover ? visual : ""}${svgText(headingLines, 70, cover ? 760 : 230, { size: cover ? 82 : 68, fill: ink, lineHeight: cover ? 96 : 82, weight: 800 })}${svgText(bodyLines, 70, cover ? 1140 : 540, { size: 31, fill: ink, lineHeight: 49, weight: 500 })}${!cover ? `<g transform="translate(0 720) scale(.65)">${visual}</g>` : ""}<line x1="70" x2="1010" y1="1325" y2="1325" stroke="${ink}" opacity=".25"/><text x="70" y="1372" font-family="Arial, 'PingFang SC', sans-serif" font-size="20" fill="${ink}" opacity=".75">${escapeXml(citations)}</text></svg>`;
   return pngFromSvg(svg, 1080, 1440);
 }
@@ -3370,9 +3532,9 @@ export async function generateSocialPackage(
     const article = `# ${input.title}\n\n${input.deck}\n\n${input.sections
       .map(
         (section) =>
-          `## ${section.heading}\n\n${section.paragraphs.join("\n\n")}\n\n> 来源：${section.sourceDocumentIds.join("、")}`,
+          `## ${section.heading}\n\n${section.paragraphs.join("\n\n")}`,
       )
-      .join("\n\n")}\n\n---\n${input.companyName} · 内容依据企业知识库制作\n`;
+      .join("\n\n")}\n\n---\n${input.companyName}\n`;
     addTextFile(payloadFiles, "article.md", article);
     addTextFile(payloadFiles, "title.txt", `${input.title}\n`);
     addTextFile(payloadFiles, "sources.json", jsonBuffer(sources));
@@ -3401,7 +3563,7 @@ export async function generateSocialPackage(
         sha256: sha256(buffer),
       });
     }
-    const postCopy = `${input.title}\n\n${input.deck}\n\n${input.sections.map((section) => `• ${section.heading}`).join("\n")}\n\n${input.hashtags.map((tag) => `#${tag.replace(/^#/u, "")}`).join(" ")}\n\n${input.companyName} · 内容依据企业知识库制作\n`;
+    const postCopy = `${input.title}\n\n${input.deck}\n\n${input.sections.map((section) => `• ${section.heading}`).join("\n")}\n\n${input.hashtags.map((tag) => `#${tag.replace(/^#/u, "")}`).join(" ")}\n\n${input.companyName}\n`;
     addTextFile(payloadFiles, "post-copy.md", postCopy);
     addTextFile(payloadFiles, "sources.json", jsonBuffer(sources));
   }

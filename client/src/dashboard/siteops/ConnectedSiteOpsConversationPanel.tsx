@@ -78,10 +78,15 @@ export default function ConnectedSiteOpsConversationPanel({
   const actMutation = trpc.workspace.siteOps.act.useMutation({
     onSuccess: setObservation,
   });
-  const aliyunSetupMutation =
-    trpc.workspace.siteOps.aliyunConnection.setup.useMutation();
+  const aliyunBeginMutation =
+    trpc.workspace.siteOps.aliyunConnection.beginOAuth.useMutation();
+  const aliyunAuthorizationGuideQuery =
+    trpc.workspace.siteOps.aliyunConnection.authorizationGuide.useQuery(
+      { conversationId },
+      { enabled: false, retry: false },
+    );
   const aliyunVerifyMutation =
-    trpc.workspace.siteOps.aliyunConnection.verify.useMutation();
+    trpc.workspace.siteOps.aliyunConnection.verifyRole.useMutation();
   const aliyunDisconnectMutation =
     trpc.workspace.siteOps.aliyunConnection.disconnect.useMutation();
 
@@ -100,7 +105,8 @@ export default function ConnectedSiteOpsConversationPanel({
     observeQuery.error?.message ||
     sendMessageMutation.error?.message ||
     actMutation.error?.message ||
-    aliyunSetupMutation.error?.message ||
+    aliyunBeginMutation.error?.message ||
+    aliyunAuthorizationGuideQuery.error?.message ||
     aliyunVerifyMutation.error?.message ||
     aliyunDisconnectMutation.error?.message ||
     null;
@@ -145,16 +151,19 @@ export default function ConnectedSiteOpsConversationPanel({
           }),
         );
       }}
-      onSetupAliyun={async ({ accountUid, roleArn }) => {
-        if (!observation) throw new Error("AI 建站会话尚未就绪。");
-        const setup = await aliyunSetupMutation.mutateAsync({
+      onBeginAliyun={async () => {
+        if (!observation) throw new Error("一站式建站尚未就绪。");
+        return await aliyunBeginMutation.mutateAsync({
           conversationId: observation.project.conversationId,
-          accountUid,
-          roleArn,
         });
-        const refreshed = await observeQuery.refetch();
-        if (refreshed.data) setObservation(refreshed.data);
-        return setup;
+      }}
+      onLoadAliyunAuthorizationGuide={async () => {
+        if (!observation) throw new Error("一站式建站尚未就绪。");
+        const guide = await aliyunAuthorizationGuideQuery.refetch();
+        if (!guide.data) {
+          throw new Error("阿里云授权配置尚未就绪，请联系 FrontMind。");
+        }
+        return guide.data;
       }}
       onVerifyAliyun={async () => {
         if (!observation) return;

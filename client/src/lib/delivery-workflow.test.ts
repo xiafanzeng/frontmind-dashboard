@@ -45,12 +45,14 @@ describe("delivery workflow presentation model", () => {
     );
   });
 
-  it("keeps all 22 executable operations plus the system record in one exhaustive spec", () => {
+  it("keeps every executable operation plus the system record in one exhaustive spec", () => {
     expect(Object.keys(DELIVERY_OPERATION_SPECS)).toEqual([
       ...deliveryWorkflowOperationSchema.options,
       "knowledge_delivery",
     ]);
-    expect(Object.keys(DELIVERY_OPERATION_SPECS)).toHaveLength(23);
+    expect(Object.keys(DELIVERY_OPERATION_SPECS)).toHaveLength(
+      deliveryWorkflowOperationSchema.options.length + 1,
+    );
     expect(Object.keys(DELIVERY_OPERATION_ALLOWED_EVIDENCE)).toEqual(
       Object.keys(DELIVERY_OPERATION_SPECS),
     );

@@ -682,7 +682,7 @@ describe("UserBrandDashboard formal workspace", () => {
       name: "内容资产运营",
     });
     const websiteManagementNavigation = screen.getByRole("button", {
-      name: "AI 友好官网管理",
+      name: "一站式建站",
     });
     expect(contentAssetsNavigation).not.toHaveAttribute("title");
     expect(
@@ -778,7 +778,7 @@ describe("UserBrandDashboard formal workspace", () => {
     authState.marketEdition = "overseas";
     render(<UserBrandDashboard />);
 
-    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
 
     const progress = screen
       .getByRole("heading", { name: "官网开通进度" })
@@ -942,7 +942,7 @@ describe("UserBrandDashboard formal workspace", () => {
     deliveryCreateMutateAsync.mockResolvedValue({ id: "website-ticket-1" });
     render(<UserBrandDashboard />);
 
-    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
     fireEvent.change(screen.getByLabelText("需求类型"), {
       target: { value: "company_facts" },
     });
@@ -1023,7 +1023,7 @@ describe("UserBrandDashboard formal workspace", () => {
     deliveryCreateMutateAsync.mockResolvedValue({ id: "icp-ticket-1" });
 
     render(<UserBrandDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
     fireEvent.change(screen.getByLabelText("已备案域名"), {
       target: { value: "example.com" },
     });
@@ -1097,7 +1097,7 @@ describe("UserBrandDashboard formal workspace", () => {
     });
 
     render(<UserBrandDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
     fireEvent.click(
       screen.getByRole("button", {
         name: "不确定场景，联系服务专员",

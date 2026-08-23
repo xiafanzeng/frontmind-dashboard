@@ -48,8 +48,16 @@ describe("SiteOps financial terminal state", () => {
       status: "failed",
       activeFinancialKey: null,
     });
-    expect(domainFinancialTerminalProjection("attention_required")).toEqual({
+    expect(
+      domainFinancialTerminalProjection("attention_required", true),
+    ).toEqual({
       status: "attention_required",
+    });
+    expect(
+      domainFinancialTerminalProjection("attention_required", false),
+    ).toEqual({
+      status: "attention_required",
+      activeFinancialKey: null,
     });
   });
 });
@@ -186,8 +194,8 @@ describe("SiteOps worker claim boundary", () => {
       leaseMs: 12 * 60_000,
     });
     expect(siteOpsWorkerExecutionPolicy("visual_search")).toEqual({
-      timeoutMs: 90_000,
-      leaseMs: 2 * 60_000,
+      timeoutMs: 4 * 60_000,
+      leaseMs: 5 * 60_000,
     });
   });
 

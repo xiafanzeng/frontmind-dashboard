@@ -1,5 +1,4 @@
 import type {
-  SiteOpsAgentProfile,
   SiteOpsMessageProjection,
   SiteOpsObservationV1,
   SiteOpsPublicVisualCandidate,
@@ -20,7 +19,6 @@ import {
   Bot,
   Check,
   Cloud,
-  Copy,
   Download,
   ExternalLink,
   FileArchive,
@@ -29,8 +27,8 @@ import {
   RotateCcw,
   Send,
   Sparkles,
-  ShieldCheck,
   UserRound,
+  Wrench,
 } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useState } from "react";
 import "./siteops-conversation-panel.css";
@@ -48,12 +46,17 @@ export type SiteOpsConversationPanelProps = {
   onRefresh?: () => Promise<void> | void;
   onSendMessage?: (text: string) => Promise<void> | void;
   onAction?: (input: SiteOpsActionContext) => Promise<void> | void;
-  onSetupAliyun?: (input: { accountUid: string; roleArn: string }) => Promise<{
-    externalId: string;
-    trustedPrincipalArn: string | null;
-    trustPolicy: Record<string, unknown> | null;
-    requiredPermissions: Record<string, readonly string[]>;
-    permissionPolicy: Record<string, unknown>;
+  onBeginAliyun?: () => Promise<{
+    authorizationUrl: string;
+    expiresAt: string;
+  }>;
+  onLoadAliyunAuthorizationGuide?: () => Promise<{
+    available: boolean;
+    consoleUrl: string;
+    configurationDownloadUrl: string;
+    roleName: string;
+    trustPolicyText: string;
+    permissionPolicyText: string;
   }>;
   onVerifyAliyun?: () => Promise<void> | void;
   onDisconnectAliyun?: () => Promise<void> | void;
@@ -64,17 +67,17 @@ export type SiteOpsConversationPanelProps = {
 };
 
 const BUILD_STATUS_LABELS: Record<string, string> = {
-  preparing: "准备构建资料",
-  visual_searching: "检索视觉方向",
-  awaiting_visual_selection: "等待选择视觉方向",
-  design_compiling: "编译视觉与 SEO 契约",
-  contract_ready: "建站契约已就绪",
-  building: "生成原生 Astro 官网",
-  qa_running: "执行静态、SEO 与视觉 QA",
-  preview_ready: "私有预览已就绪",
-  approved: "客户已批准",
-  failed: "构建失败",
-  attention_required: "需要人工处理",
+  preparing: "整理建站资料",
+  visual_searching: "生成视觉候选",
+  awaiting_visual_selection: "等待选择视觉方案",
+  design_compiling: "正在制作官网",
+  contract_ready: "正在制作官网",
+  building: "正在制作官网",
+  qa_running: "正在检查官网",
+  preview_ready: "官网已完成",
+  approved: "官网已完成",
+  failed: "需要协助",
+  attention_required: "需要协助",
   cancelled: "已取消",
   superseded: "已被新版本替代",
 };
@@ -83,9 +86,9 @@ const CARD_LABELS: Record<string, string> = {
   brief_question: "建站资料",
   visual_board: "视觉方向",
   visual_choice: "视觉选择",
-  build_progress: "构建进度",
-  build_preview: "私有预览",
-  qa_failed: "质量检查",
+  build_progress: "制作进度",
+  build_preview: "官网预览",
+  qa_failed: "官网检查",
   publish_options: "发布选择",
   domain_quote: "域名报价",
   domain_status: "域名状态",
@@ -133,7 +136,7 @@ function actionFromCard(
 }
 
 function providerMessage(observation: SiteOpsObservationV1) {
-  const provider = observation.providerState.twentyFirst;
+  const provider = observation.serviceReadiness.visuals;
   if (provider.status === "configured") return null;
   return provider.status === "not_configured"
     ? "视觉参考服务尚未配置，暂时不能检索视觉方向。"
@@ -141,30 +144,78 @@ function providerMessage(observation: SiteOpsObservationV1) {
 }
 
 function aiBuilderMessage(observation: SiteOpsObservationV1) {
-  const provider = observation.providerState.aiBuilder;
+  const provider = observation.serviceReadiness.website;
   if (provider.status === "configured") return null;
   return provider.status === "not_configured"
-    ? "请先为当前账号配置个人 AI 建站 API Key，配置完成后才能锁定视觉并开始建站。"
-    : "当前账号的 AI 建站连接需要处理，恢复后才能锁定视觉并开始建站。";
+    ? "AI 建站服务尚未就绪，请联系 FrontMind。"
+    : "AI 建站服务暂时不可用，请稍后重试或联系 FrontMind。";
 }
 
 function visualCandidatePresentation(candidate: SiteOpsPublicVisualCandidate) {
-  const variantLabels = {
-    centered_statement: "居中陈述",
-    split_media: "分屏媒体",
-    editorial_modular: "编辑模块",
-    immersive_visual: "沉浸视觉",
-  } as const;
+  const family = candidate.visualFamily;
+  const familyLabels: Record<string, string> = {
+    floating_orbit: "浮动轨道式",
+    split_media: "分屏媒体式",
+    editorial: "编辑杂志式",
+    bento: "Bento 模块式",
+    feature_grid: "功能网格式",
+    centered_dual_cta: "极简双按钮式",
+    immersive_visual: "沉浸视觉式",
+    product_stage: "产品舞台式",
+    full_bleed_statement: "全幅宣言式",
+  };
+  const familyLabel = (family ? familyLabels[family] : null) || "首页视觉";
   return {
-    badge: candidate.heroVariant
-      ? `Hero · ${variantLabels[candidate.heroVariant]}`
-      : "Hero · 首页视觉",
-    title: candidate.title,
+    badge: `首页 · ${familyLabel}`,
+    title: family ? familyLabel : candidate.title,
     note:
       candidate.note && candidate.note !== candidate.title
         ? candidate.note
         : null,
   };
+}
+
+function customerFacingMessage(content: string) {
+  const sanitized = content
+    .replace(
+      /(?:错误码|任务编号|operation(?:\s*id)?|task(?:\s*id)?)\s*[:：]\s*[A-Za-z0-9_-]+/giu,
+      "",
+    )
+    .replace(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/gu, "")
+    .replace(/21st/giu, "视觉服务")
+    .replace(/SiteOps/giu, "一站式建站")
+    .replace(/(?:原生\s*)?Astro/giu, "官网")
+    .replace(/React(?:\s*静态)?/giu, "官网")
+    .replace(/API\s*Key/giu, "服务配置")
+    .replace(/frontmind-(?:base|pro)/giu, "建站模式")
+    .replace(/\b(?:Base|Pro)\b/giu, "建站模式")
+    .replace(/[ \t]+\n/gu, "\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+  if (
+    /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu.test(
+      sanitized,
+    )
+  ) {
+    return "FrontMind 正在自动完成网站配置；如长时间未完成，请提交工单获取协助。";
+  }
+  return sanitized || "任务需要协助，请稍后重试或提交工单。";
+}
+
+function customerDomainStateLabel(value: string | null | undefined) {
+  const labels: Record<string, string> = {
+    verified: "已完成",
+    approved: "已通过",
+    active: "正常",
+    pending: "处理中",
+    preparing: "准备中",
+    submitted: "审核中",
+    not_submitted: "未提交",
+    not_verified: "待验证",
+    failed: "需要协助",
+    conflict: "需要协助",
+  };
+  return value ? labels[value] || "处理中" : "待同步";
 }
 
 function VisualCandidateCard({
@@ -217,7 +268,8 @@ export default function SiteOpsConversationPanel({
   onRefresh,
   onSendMessage,
   onAction,
-  onSetupAliyun,
+  onBeginAliyun,
+  onLoadAliyunAuthorizationGuide,
   onVerifyAliyun,
   onDisconnectAliyun,
   onSubmitIcpFiling,
@@ -229,23 +281,23 @@ export default function SiteOpsConversationPanel({
   const [previewOpenError, setPreviewOpenError] = useState<string | null>(null);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
-  const [managedAgentProfile, setManagedAgentProfile] =
-    useState<SiteOpsAgentProfile>("frontmind-pro");
-  const [aliyunAccountUid, setAliyunAccountUid] = useState("");
-  const [aliyunRoleArn, setAliyunRoleArn] = useState("");
-  const [aliyunSetup, setAliyunSetup] = useState<{
-    externalId: string;
-    trustedPrincipalArn: string | null;
-    trustPolicy: Record<string, unknown> | null;
-    requiredPermissions: Record<string, readonly string[]>;
-    permissionPolicy: Record<string, unknown>;
+  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const [rebuildReason, setRebuildReason] = useState("");
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [aliyunGuide, setAliyunGuide] = useState<{
+    consoleUrl: string;
+    configurationDownloadUrl: string;
+    roleName: string;
+    trustPolicyText: string;
+    permissionPolicyText: string;
   } | null>(null);
+  const [copiedAliyunStep, setCopiedAliyunStep] = useState<string | null>(null);
   const [domainInput, setDomainInput] = useState("");
   const [domainYears, setDomainYears] = useState(1);
   const [typedDomain, setTypedDomain] = useState("");
   const [registrantProfileId, setRegistrantProfileId] = useState("");
   const [icpNumber, setIcpNumber] = useState("");
-  const latestBuild = useMemo(() => {
+  const latestAttempt = useMemo(() => {
     const visibleBuilds = observation?.builds.filter(
       (build) => !["cancelled", "superseded"].includes(build.status),
     );
@@ -257,24 +309,28 @@ export default function SiteOpsConversationPanel({
       ) ?? null
     );
   }, [observation?.builds]);
-  const historicalPreviewBuilds = useMemo(
+  const latestBuild = useMemo(() => {
+    if (!latestAttempt || latestAttempt.previewUrl) return latestAttempt;
+    const completedBuilds = observation?.builds.filter(
+      (build) =>
+        Boolean(build.previewUrl) &&
+        ["preview_ready", "approved"].includes(build.status),
+    );
+    return (
+      completedBuilds?.reduce(
+        (latest, build) =>
+          !latest || build.ordinal > latest.ordinal ? build : latest,
+        completedBuilds[0],
+      ) ?? latestAttempt
+    );
+  }, [latestAttempt, observation?.builds]);
+  const hasSuccessfulBuild = useMemo(
     () =>
-      observation?.builds
-        .filter(
-          (build) =>
-            build.id !== latestBuild?.id &&
-            Boolean(build.previewUrl) &&
-            !["cancelled"].includes(build.status),
-        )
-        .sort((left, right) => right.ordinal - left.ordinal) ?? [],
-    [latestBuild?.id, observation?.builds],
+      observation?.builds.some((build) =>
+        ["preview_ready", "approved"].includes(build.status),
+      ) || observation?.deployments.some((item) => item.status === "active"),
+    [observation?.builds, observation?.deployments],
   );
-
-  useEffect(() => {
-    if (latestBuild?.agentProfile) {
-      setManagedAgentProfile(latestBuild.agentProfile);
-    }
-  }, [latestBuild?.agentProfile]);
 
   useEffect(() => {
     setPreviewOpenError(null);
@@ -304,7 +360,7 @@ export default function SiteOpsConversationPanel({
     } catch (actionError) {
       setLocalError(
         actionError instanceof Error
-          ? actionError.message
+          ? customerFacingMessage(actionError.message)
           : "操作没有完成，请刷新后重试。",
       );
     } finally {
@@ -324,7 +380,7 @@ export default function SiteOpsConversationPanel({
     } catch (messageError) {
       setLocalError(
         messageError instanceof Error
-          ? messageError.message
+          ? customerFacingMessage(messageError.message)
           : "消息发送失败，请稍后重试。",
       );
     } finally {
@@ -346,14 +402,13 @@ export default function SiteOpsConversationPanel({
       });
       setMessage("");
       setSelectedSnapshotId("");
-      setManagedAgentProfile("frontmind-pro");
       setLocalError(null);
       setResetDialogOpen(false);
     } catch (resetActionError) {
       const message =
         resetActionError instanceof Error
           ? resetActionError.message
-          : "AI 建站流程没有重置，请刷新后重试。";
+          : "建站流程没有重置，请刷新后重试。";
       setResetError(message);
       setLocalError(message);
     } finally {
@@ -361,26 +416,116 @@ export default function SiteOpsConversationPanel({
     }
   }
 
-  async function setupAliyun(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!onSetupAliyun || busyAction) return;
-    setBusyAction("aliyun_setup");
+  async function requestRebuild() {
+    if (
+      !onAction ||
+      busyAction ||
+      !latestBuild ||
+      !observation?.rebuildRequest.allowed
+    ) {
+      return;
+    }
+    setBusyAction("request_rebuild");
+    setLocalError(null);
+    setRebuildError(null);
+    try {
+      await onAction({
+        action: "request_rebuild",
+        input: {
+          ...(rebuildReason.trim() ? { reason: rebuildReason.trim() } : {}),
+        },
+      });
+      setRebuildReason("");
+      setRebuildDialogOpen(false);
+    } catch (requestError) {
+      const message =
+        requestError instanceof Error
+          ? customerFacingMessage(requestError.message)
+          : "重制需求没有提交成功，请稍后重试。";
+      setRebuildError(message);
+      setLocalError(message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function beginAliyunConnection() {
+    if (!onBeginAliyun || busyAction) return;
+    const authorizationWindow = window.open(
+      "",
+      "frontmind-aliyun-authorization",
+    );
+    setBusyAction("aliyun_begin");
     setLocalError(null);
     try {
-      setAliyunSetup(
-        await onSetupAliyun({
-          accountUid: aliyunAccountUid.trim(),
-          roleArn: aliyunRoleArn.trim(),
-        }),
-      );
-    } catch (setupError) {
+      const result = await onBeginAliyun();
+      if (authorizationWindow) {
+        authorizationWindow.location.href = result.authorizationUrl;
+        authorizationWindow.focus();
+      } else {
+        setLocalError("阿里云授权页面被浏览器阻止，请允许弹窗后重试。");
+      }
+    } catch (connectionError) {
+      authorizationWindow?.close();
       setLocalError(
-        setupError instanceof Error
-          ? setupError.message
-          : "阿里云 RAM Role 连接没有保存。",
+        connectionError instanceof Error
+          ? customerFacingMessage(connectionError.message)
+          : "暂时无法打开阿里云授权页面，请稍后重试。",
       );
     } finally {
       setBusyAction(null);
+    }
+  }
+
+  async function openAliyunAuthorizationGuide() {
+    if (!onLoadAliyunAuthorizationGuide || busyAction) return;
+    const authorizationWindow = window.open(
+      "",
+      "frontmind-aliyun-authorization",
+    );
+    setBusyAction("aliyun_guide");
+    setLocalError(null);
+    try {
+      const guide = await onLoadAliyunAuthorizationGuide();
+      if (!guide.available) {
+        authorizationWindow?.close();
+        setLocalError("阿里云授权配置尚未就绪，请联系 FrontMind。 ");
+        return;
+      }
+      setAliyunGuide({
+        consoleUrl: guide.consoleUrl,
+        configurationDownloadUrl: guide.configurationDownloadUrl,
+        roleName: guide.roleName,
+        trustPolicyText: guide.trustPolicyText,
+        permissionPolicyText: guide.permissionPolicyText,
+      });
+      if (authorizationWindow) {
+        authorizationWindow.location.href = guide.consoleUrl;
+        authorizationWindow.focus();
+      } else {
+        setLocalError("阿里云授权页面被浏览器阻止，请允许弹窗后重试。");
+      }
+    } catch (guideError) {
+      authorizationWindow?.close();
+      setLocalError(
+        guideError instanceof Error
+          ? customerFacingMessage(guideError.message)
+          : "暂时无法打开阿里云授权页面，请稍后重试。",
+      );
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function copyAliyunAuthorizationStep(
+    step: "role" | "trust" | "permission",
+    value: string,
+  ) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedAliyunStep(step);
+    } catch {
+      setLocalError("复制未成功，请使用备用配置下载后按引导完成授权。");
     }
   }
 
@@ -393,11 +538,11 @@ export default function SiteOpsConversationPanel({
     setLocalError(null);
     try {
       await action();
-      if (key === "aliyun_disconnect") setAliyunSetup(null);
+      if (key === "aliyun_disconnect") setAliyunGuide(null);
     } catch (connectionError) {
       setLocalError(
         connectionError instanceof Error
-          ? connectionError.message
+          ? customerFacingMessage(connectionError.message)
           : "阿里云连接操作没有完成。",
       );
     } finally {
@@ -418,7 +563,7 @@ export default function SiteOpsConversationPanel({
     } catch (filingError) {
       setLocalError(
         filingError instanceof Error
-          ? filingError.message
+          ? customerFacingMessage(filingError.message)
           : "ICP 备案结果工单没有提交成功。",
       );
     } finally {
@@ -430,10 +575,10 @@ export default function SiteOpsConversationPanel({
     return (
       <section
         className="siteops-panel siteops-panel-state"
-        aria-label="对话式 AI 建站"
+        aria-label="一站式建站"
       >
         <Loader2 className="siteops-spin" size={22} aria-hidden="true" />
-        正在打开 AI 建站会话…
+        正在打开一站式建站…
       </section>
     );
   }
@@ -442,12 +587,12 @@ export default function SiteOpsConversationPanel({
     return (
       <section
         className="siteops-panel siteops-panel-state"
-        aria-label="对话式 AI 建站"
+        aria-label="一站式建站"
       >
         <AlertCircle size={22} aria-hidden="true" />
         <div>
-          <strong>AI 建站会话暂时不可用</strong>
-          <p>{error || "请稍后刷新重试。"}</p>
+          <strong>一站式建站暂时不可用</strong>
+          <p>{error ? customerFacingMessage(error) : "请稍后刷新重试。"}</p>
         </div>
         {onRefresh && (
           <button type="button" onClick={() => onRefresh()}>
@@ -461,11 +606,10 @@ export default function SiteOpsConversationPanel({
   const upstreamMessage = providerMessage(observation);
   const builderMessage = aiBuilderMessage(observation);
   const aiBuilderConfigured =
-    observation.providerState.aiBuilder.status === "configured";
+    observation.serviceReadiness.website.status === "configured";
   const interactionLocked = Boolean(busyAction || !onAction);
   const visualSelectionOpen =
     observation.interactionState === "awaiting_visual_selection";
-  const agentProfileLocked = interactionLocked || !visualSelectionOpen;
   const visualSelectionDisabled =
     interactionLocked || !visualSelectionOpen || !aiBuilderConfigured;
   const currentSnapshotId = observation.project.currentKnowledgeSnapshotId;
@@ -474,7 +618,7 @@ export default function SiteOpsConversationPanel({
     (item) =>
       (["quoted", "succeeded"].includes(item.status) ||
         (item.status === "attention_required" &&
-          item.errorCode === "QUOTE_CHANGED")) &&
+          item.issue === "quote_changed")) &&
       item.quoteHash &&
       item.quoteExpiresAt &&
       new Date(item.quoteExpiresAt).getTime() > Date.now() &&
@@ -484,13 +628,6 @@ export default function SiteOpsConversationPanel({
     (item) => item.kind === "search" && item.searchResult,
   );
   const managedDomain = observation.domainState?.domain ?? "";
-  const currentDnsPlan =
-    observation.dnsPlan &&
-    observation.domainState &&
-    observation.dnsPlan.domain === observation.domainState.domain &&
-    observation.dnsPlan.domainRevision === observation.domainState.revision
-      ? observation.dnsPlan
-      : null;
   const availableRegistrantProfiles =
     observation.domainOperations.find(
       (item) => item.registrantProfiles.length > 0,
@@ -532,6 +669,14 @@ export default function SiteOpsConversationPanel({
   const resetDisabledReason = !observation.resetCapability.allowed
     ? observation.resetCapability.reason
     : undefined;
+  const rebuildRequestActive = Boolean(
+    observation.rebuildRequest.ticketId &&
+      observation.rebuildRequest.status &&
+      !["completed", "rejected", "cancelled"].includes(
+        observation.rebuildRequest.status,
+      ),
+  );
+  const rebuildInProgress = observation.rebuildRequest.status === "in_progress";
 
   return (
     <section className="siteops-panel" aria-labelledby="siteops-panel-title">
@@ -539,11 +684,11 @@ export default function SiteOpsConversationPanel({
         <div>
           <p>
             <Sparkles size={15} aria-hidden="true" />
-            SiteOps · 原生 Astro
+            一站式建站
           </p>
-          <h2 id="siteops-panel-title">对话式 AI 建站</h2>
+          <h2 id="siteops-panel-title">一站式建站</h2>
           <span>
-            选择知识库版本、确定视觉方向，然后在同一会话中完成构建与预览。
+            选择企业知识库和视觉方案，FrontMind 将完成官网制作与检查。
           </span>
         </div>
         <div className="siteops-header-controls">
@@ -552,7 +697,7 @@ export default function SiteOpsConversationPanel({
               <button
                 type="button"
                 className="siteops-icon-button"
-                aria-label="刷新 AI 建站会话"
+                aria-label="刷新一站式建站"
                 disabled={refreshing}
                 onClick={() => onRefresh()}
               >
@@ -563,26 +708,48 @@ export default function SiteOpsConversationPanel({
                 />
               </button>
             )}
-            <button
-              type="button"
-              className="siteops-icon-button siteops-reset-button"
-              aria-label="重置 AI 建站流程"
-              aria-describedby={
-                resetDisabledReason
-                  ? "siteops-reset-disabled-reason"
-                  : undefined
-              }
-              disabled={resetDisabled}
-              title={resetDisabledReason}
-              onClick={() => {
-                setResetError(null);
-                setResetDialogOpen(true);
-              }}
-            >
-              <RotateCcw size={17} aria-hidden="true" />
-            </button>
+            {hasSuccessfulBuild ? (
+              <button
+                type="button"
+                className="siteops-icon-button"
+                aria-label="提交官网重制需求"
+                disabled={Boolean(
+                  busyAction ||
+                    rebuildRequestActive ||
+                    !observation.rebuildRequest.allowed,
+                )}
+                title={
+                  rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"
+                }
+                onClick={() => {
+                  setRebuildError(null);
+                  setRebuildDialogOpen(true);
+                }}
+              >
+                <Wrench size={17} aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="siteops-icon-button siteops-reset-button"
+                aria-label="重置建站流程"
+                aria-describedby={
+                  resetDisabledReason
+                    ? "siteops-reset-disabled-reason"
+                    : undefined
+                }
+                disabled={resetDisabled}
+                title={resetDisabledReason}
+                onClick={() => {
+                  setResetError(null);
+                  setResetDialogOpen(true);
+                }}
+              >
+                <RotateCcw size={17} aria-hidden="true" />
+              </button>
+            )}
           </div>
-          {resetDisabledReason && (
+          {!hasSuccessfulBuild && resetDisabledReason && (
             <small
               className="siteops-reset-disabled-reason"
               id="siteops-reset-disabled-reason"
@@ -603,7 +770,7 @@ export default function SiteOpsConversationPanel({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>确认重置 AI 建站流程？</AlertDialogTitle>
+            <AlertDialogTitle>确认重置建站流程？</AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="siteops-reset-description">
                 <p>当前未完成的会话会被隐藏，知识库选择和视觉候选会被清空。</p>
@@ -645,6 +812,56 @@ export default function SiteOpsConversationPanel({
         </AlertDialogContent>
       </AlertDialog>
 
+      <AlertDialog
+        open={rebuildDialogOpen}
+        onOpenChange={(open) => {
+          if (busyAction === "request_rebuild") return;
+          setRebuildDialogOpen(open);
+          if (open) setRebuildError(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>提交官网重制需求</AlertDialogTitle>
+            <AlertDialogDescription>
+              提交后将由 FrontMind 人工受理。受理前不会改动当前官网，也不会创建新任务或扣减额度。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <label className="siteops-rebuild-reason">
+            <span>重制原因与期望（选填）</span>
+            <textarea
+              value={rebuildReason}
+              maxLength={2_000}
+              rows={5}
+              placeholder="例如：希望调整品牌风格、页面结构或重新选择知识库。"
+              onChange={(event) => setRebuildReason(event.target.value)}
+            />
+          </label>
+          {rebuildError && (
+            <p className="siteops-reset-error" role="alert">
+              {rebuildError}
+            </p>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busyAction === "request_rebuild"}>
+              取消
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busyAction === "request_rebuild"}
+              onClick={(event) => {
+                event.preventDefault();
+                void requestRebuild();
+              }}
+            >
+              {busyAction === "request_rebuild" && (
+                <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
+              )}
+              提交需求
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {upstreamMessage && (
         <div className="siteops-notice warning" role="status">
           <AlertCircle size={18} aria-hidden="true" />
@@ -654,20 +871,19 @@ export default function SiteOpsConversationPanel({
       {(error || localError) && (
         <div className="siteops-notice error" role="alert">
           <AlertCircle size={18} aria-hidden="true" />
-          <span>{localError || error}</span>
+          <span>{customerFacingMessage(localError || error || "")}</span>
         </div>
       )}
 
       <div className="siteops-stage" data-state={observation.interactionState}>
         <span>当前阶段</span>
         <strong>
-          {latestBuild
-            ? BUILD_STATUS_LABELS[latestBuild.status] || latestBuild.status
+          {latestAttempt
+            ? BUILD_STATUS_LABELS[latestAttempt.status] || "正在处理"
             : observation.interactionState === "select_snapshot"
               ? "选择知识库 ZIP 版本"
               : "整理建站资料"}
         </strong>
-        <small>项目版本 {observation.project.revision}</small>
       </div>
 
       {(observation.interactionState === "select_snapshot" ||
@@ -680,7 +896,7 @@ export default function SiteOpsConversationPanel({
             <FileArchive size={20} aria-hidden="true" />
             <div>
               <h3 id="siteops-snapshot-title">选择知识库 ZIP 版本</h3>
-              <p>建站会冻结所选不可变快照；以后更换知识源会创建新版本。</p>
+              <p>FrontMind 将根据所选知识库整理企业资料并制作官网。</p>
             </div>
           </div>
           {observation.knowledgeSnapshots.length > 0 ? (
@@ -737,7 +953,9 @@ export default function SiteOpsConversationPanel({
         </section>
       )}
 
-      {currentSnapshotId && observation.knowledgeSnapshots.length > 1 && (
+      {currentSnapshotId &&
+        (!hasSuccessfulBuild || rebuildInProgress) &&
+        observation.knowledgeSnapshots.length > 1 && (
         <section
           className="siteops-snapshot-card"
           aria-labelledby="siteops-change-snapshot-title"
@@ -747,8 +965,7 @@ export default function SiteOpsConversationPanel({
             <div>
               <h3 id="siteops-change-snapshot-title">更换知识源</h3>
               <p>
-                新快照会重新生成 SiteBrief
-                与视觉方向；旧源码、预览及线上版本不会被改写。
+                新知识库会重新整理建站资料与视觉方案；旧官网和线上版本不会被改写。
               </p>
             </div>
           </div>
@@ -784,7 +1001,7 @@ export default function SiteOpsConversationPanel({
                 if (
                   !selected ||
                   !window.confirm(
-                    `确认更换为“${selected.label}”并重新整理 SiteBrief？旧官网版本和线上站点会保持不变。`,
+                    `确认更换为“${selected.label}”并重新整理建站资料？旧官网版本和线上站点会保持不变。`,
                   )
                 ) {
                   return;
@@ -820,7 +1037,7 @@ export default function SiteOpsConversationPanel({
             <div>
               <FileArchive size={20} aria-hidden="true" />
               <div>
-                <h3 id="siteops-brief-title">SiteBrief 核对</h3>
+                <h3 id="siteops-brief-title">建站资料核对</h3>
                 <p>
                   {observation.brief
                     ? `${observation.brief.companyName} · ${observation.brief.primaryLanguage}`
@@ -872,9 +1089,9 @@ export default function SiteOpsConversationPanel({
             <div>
               <Sparkles size={20} aria-hidden="true" />
               <div>
-                <h3 id="siteops-visual-search-title">开始检索视觉方向</h3>
+                <h3 id="siteops-visual-search-title">生成视觉候选</h3>
                 <p>
-                  可先在下方补充转化目标；准备好后将从视觉目录检索真实候选。
+                  可先在下方补充转化目标；准备好后将生成九种不同风格的官网方案。
                 </p>
               </div>
             </div>
@@ -901,15 +1118,15 @@ export default function SiteOpsConversationPanel({
                   aria-hidden="true"
                 />
               )}
-              检索 A–I 视觉方向
+              生成 9 个视觉候选
             </button>
           </section>
         )}
 
-      <div className="siteops-message-list" aria-label="AI 建站对话记录">
+      <div className="siteops-message-list" aria-label="一站式建站对话记录">
         {observation.messages.length === 0 ? (
           <div className="siteops-empty-copy">
-            选择知识库版本后，AI 会在这里整理 SiteBrief。
+            选择知识库版本后，FrontMind 会在这里整理建站资料。
           </div>
         ) : (
           observation.messages.map((item) => (
@@ -927,26 +1144,15 @@ export default function SiteOpsConversationPanel({
               </span>
               <div>
                 <div className="siteops-message-meta">
-                  <strong>{item.role === "user" ? "你" : "AI 建站"}</strong>
+                  <strong>{item.role === "user" ? "你" : "一站式建站"}</strong>
                   {item.metadata?.siteOps && (
                     <span data-status={item.metadata.siteOps.status}>
                       {CARD_LABELS[item.metadata.siteOps.kind] ||
-                        item.metadata.siteOps.kind}
+                        "任务状态"}
                     </span>
                   )}
                 </div>
-                <p>{item.content}</p>
-                {item.metadata?.siteOps?.kind === "operation_recovery" && (
-                  <p className="siteops-operation-reference">
-                    {typeof item.metadata.siteOps.payload.errorCode ===
-                      "string" && (
-                      <span>
-                        错误码：{item.metadata.siteOps.payload.errorCode}
-                      </span>
-                    )}
-                    <span>任务编号：{item.metadata.siteOps.subjectId}</span>
-                  </p>
-                )}
+                <p>{customerFacingMessage(item.content)}</p>
               </div>
             </article>
           ))
@@ -961,13 +1167,10 @@ export default function SiteOpsConversationPanel({
           <div className="siteops-board-heading">
             <div>
               <h3 id="siteops-visual-title">
-                {visualSelectionOpen
-                  ? "选择首页 Hero 视觉方向"
-                  : "已锁定的首页 Hero 视觉方向"}
+                {visualSelectionOpen ? "9 个视觉候选" : "已选择的视觉方案"}
               </h3>
               <p>
-                以下均为视觉目录返回并通过 Hero
-                资格校验的真实预览。选择只决定首页视觉语言，不复制组件代码或示例内容。
+                九种方案使用相同的企业资料真实渲染，选择结果将直接用于官网制作。
               </p>
             </div>
             {visualSelectionOpen && (
@@ -982,66 +1185,21 @@ export default function SiteOpsConversationPanel({
                       observation,
                       "visual_board",
                       "delegate_visual",
-                      { agentProfile: managedAgentProfile },
+                      {},
                     ),
                   )
                 }
               >
-                委托 AI 选择
+                让 FrontMind 推荐
               </button>
             )}
           </div>
-          <div className="siteops-agent-profile-card">
-            <div className="siteops-agent-profile-heading">
-              <div>
-                <strong>AI 建站模式</strong>
-                <p>
-                  任务会使用当前账号配置的个人 API Key，并出现在该 Key
-                  对应的私有账号中。
-                </p>
-              </div>
-              {!visualSelectionOpen && <span>已随官网版本锁定</span>}
+          {builderMessage && (
+            <div className="siteops-builder-key-warning" role="status">
+              <AlertCircle size={17} aria-hidden="true" />
+              <span>{builderMessage}</span>
             </div>
-            <div
-              className="siteops-agent-profile-options"
-              role="radiogroup"
-              aria-label="AI 建站模式"
-            >
-              <button
-                type="button"
-                role="radio"
-                aria-checked={managedAgentProfile === "frontmind-pro"}
-                data-selected={
-                  managedAgentProfile === "frontmind-pro" ? "true" : "false"
-                }
-                disabled={agentProfileLocked}
-                onClick={() => setManagedAgentProfile("frontmind-pro")}
-              >
-                <strong>Pro</strong>
-                <span>适合复杂官网的信息架构与表达</span>
-              </button>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={managedAgentProfile === "frontmind-base"}
-                data-selected={
-                  managedAgentProfile === "frontmind-base" ? "true" : "false"
-                }
-                disabled={agentProfileLocked}
-                onClick={() => setManagedAgentProfile("frontmind-base")}
-              >
-                <strong>Base</strong>
-                <span>适合结构清晰的标准企业官网</span>
-              </button>
-            </div>
-            <small>Base / Pro 只对本次不可变官网版本生效。</small>
-            {builderMessage && (
-              <div className="siteops-builder-key-warning" role="status">
-                <AlertCircle size={17} aria-hidden="true" />
-                <span>{builderMessage}</span>
-              </div>
-            )}
-          </div>
+          )}
           <div className="siteops-visual-grid">
             {observation.visualCandidates.map((candidate) => (
               <VisualCandidateCard
@@ -1057,7 +1215,6 @@ export default function SiteOpsConversationPanel({
                       "select_visual",
                       {
                         sampleId: candidate.id,
-                        agentProfile: managedAgentProfile,
                       },
                     ),
                   )
@@ -1068,22 +1225,30 @@ export default function SiteOpsConversationPanel({
         </section>
       )}
 
+      {latestAttempt?.needsHelp && latestBuild?.id !== latestAttempt.id && (
+        <div className="siteops-notice warning" role="status">
+          <AlertCircle size={18} aria-hidden="true" />
+          <span>最新重制暂未完成，当前官网仍可继续预览和使用。</span>
+        </div>
+      )}
+
       {latestBuild && (
         <section
           className="siteops-build-card"
           aria-labelledby="siteops-build-title"
         >
           <div>
-            <span>
-              官网版本 {latestBuild.ordinal}
-              {latestBuild.renderer
-                ? ` · ${latestBuild.renderer === "react_static" ? "React 静态" : "Astro"}`
-                : ""}
-            </span>
+            <span>官网版本 {latestBuild.ordinal}</span>
             <h3 id="siteops-build-title">
-              {BUILD_STATUS_LABELS[latestBuild.status] || latestBuild.status}
+              {BUILD_STATUS_LABELS[latestBuild.status] || "正在处理"}
             </h3>
-            {latestBuild.errorMessage && <p>{latestBuild.errorMessage}</p>}
+            {latestBuild.needsHelp && (
+              <p>
+                {latestBuild.status === "attention_required"
+                  ? "官网制作需要协助，请提交工单。"
+                  : "官网制作暂未完成，请稍后重试或提交工单。"}
+              </p>
+            )}
           </div>
           <div className="siteops-build-actions">
             {latestBuild.previewUrl && (
@@ -1093,64 +1258,31 @@ export default function SiteOpsConversationPanel({
                 onClick={() => openPrivatePreview(latestBuild.previewUrl!)}
               >
                 <ExternalLink size={15} aria-hidden="true" />
-                在新标签页打开私有预览
+                在新标签页打开预览
               </button>
             )}
             {latestBuild.sourceUrl && (
               <a href={latestBuild.sourceUrl}>
                 <Download size={15} aria-hidden="true" />
-                下载源码 ZIP
+                下载网站源码
               </a>
             )}
-            {latestBuild.qaUrl && (
-              <a href={latestBuild.qaUrl}>
-                <Download size={15} aria-hidden="true" />
-                下载 QA 报告
-              </a>
-            )}
-            {latestBuild.status === "preview_ready" && (
-              <button
-                type="button"
-                className="siteops-primary-button"
-                disabled={interactionLocked}
-                onClick={() =>
-                  runAction(
-                    "approve_build",
-                    actionFromCard(
-                      observation,
-                      "build_preview",
-                      "approve_build",
-                      { buildId: latestBuild.id },
-                    ),
-                  )
-                }
-              >
-                批准这个版本
-              </button>
-            )}
-            {[
-              "preview_ready",
-              "approved",
-              "failed",
-              "attention_required",
-            ].includes(latestBuild.status) && (
+            {hasSuccessfulBuild && (
               <button
                 type="button"
                 className="siteops-secondary-button"
-                disabled={interactionLocked}
-                onClick={() =>
-                  runAction(
-                    "reselect_visual",
-                    actionFromCard(
-                      observation,
-                      "visual_choice",
-                      "reselect_visual",
-                      {},
-                    ),
-                  )
-                }
+                disabled={Boolean(
+                  busyAction ||
+                    rebuildRequestActive ||
+                    !observation.rebuildRequest.allowed,
+                )}
+                onClick={() => {
+                  setRebuildError(null);
+                  setRebuildDialogOpen(true);
+                }}
               >
-                重新选择视觉方向
+                <Wrench size={15} aria-hidden="true" />
+                {rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"}
               </button>
             )}
             {previewOpenError && latestBuild.previewUrl && (
@@ -1168,30 +1300,8 @@ export default function SiteOpsConversationPanel({
                     openPrivatePreview(latestBuild.previewUrl!);
                   }}
                 >
-                  重试打开私有预览
+                  重试打开预览
                 </a>
-              </div>
-            )}
-            {historicalPreviewBuilds.length > 0 && (
-              <div
-                className="siteops-preview-history"
-                aria-label="历史官网版本对比"
-              >
-                <strong>历史版本对比</strong>
-                <span>当前版本与旧版本均保持不可变，可在同一预览标签页切换查看。</span>
-                <div>
-                  {historicalPreviewBuilds.map((build) => (
-                    <button
-                      key={build.id}
-                      type="button"
-                      className="siteops-secondary-button"
-                      onClick={() => openPrivatePreview(build.previewUrl!)}
-                    >
-                      <ExternalLink size={15} aria-hidden="true" />
-                      官网版本 {build.ordinal} · {build.renderer === "react_static" ? "React 静态" : "Astro"}
-                    </button>
-                  ))}
-                </div>
               </div>
             )}
             {latestBuild.status === "approved" && (
@@ -1257,39 +1367,6 @@ export default function SiteOpsConversationPanel({
                 </button>
               </>
             )}
-          </div>
-        </section>
-      )}
-
-      {observation.deployments.some(
-        (deployment) => deployment.status === "superseded",
-      ) && (
-        <section className="siteops-build-card" aria-label="历史发布与回滚">
-          <div>
-            <span>已验证版本</span>
-            <h3>历史发布与回滚</h3>
-            <p>回滚会重新验证精确 dist 摘要；失败时当前线上版本保持不变。</p>
-          </div>
-          <div className="siteops-build-actions">
-            {observation.deployments
-              .filter((deployment) => deployment.status === "superseded")
-              .map((deployment) => (
-                <button
-                  type="button"
-                  className="siteops-secondary-button"
-                  key={deployment.id}
-                  disabled={interactionLocked}
-                  onClick={() =>
-                    runAction(`rollback:${deployment.id}`, {
-                      action: "rollback",
-                      input: { deploymentId: deployment.id },
-                    })
-                  }
-                >
-                  回滚{deployment.target === "mainland_cn" ? "大陆" : "海外"}
-                  版本 · {deployment.buildId.slice(0, 8)}
-                </button>
-              ))}
           </div>
         </section>
       )}
@@ -1361,12 +1438,11 @@ export default function SiteOpsConversationPanel({
           <div>
             <p className="siteops-eyebrow">
               <Cloud size={15} aria-hidden="true" />
-              客户自有阿里云账号
+              域名与发布
             </p>
-            <h3 id="siteops-domain-title">域名、续费与 AliDNS</h3>
+            <h3 id="siteops-domain-title">连接阿里云</h3>
             <p>
-              FrontMind 仅通过带唯一 ExternalId 的 RAM Role 获取短期
-              STS；不接收主账号密码或永久 AccessKey。
+              授权完成后，FrontMind 将自动处理域名查询、网站配置与发布。
             </p>
           </div>
           <span
@@ -1374,137 +1450,113 @@ export default function SiteOpsConversationPanel({
             data-status={observation.aliyunConnection.status ?? "none"}
           >
             {observation.aliyunConnection.status === "active"
-              ? "连接已验证"
-              : observation.aliyunConnection.status === "unverified"
-                ? "等待验证"
-                : observation.aliyunConnection.status === "invalid"
-                  ? "验证失败"
+              ? "已连接"
+              : observation.aliyunConnection.status === "authorization_required"
+                ? "等待完成授权"
+                : observation.aliyunConnection.status === "attention_required"
+                  ? "需要协助"
                   : "尚未连接"}
           </span>
         </div>
 
-        {observation.aliyunConnection.configured && (
-          <div className="siteops-connection-summary">
-            <span>账号 UID：{observation.aliyunConnection.accountUid}</span>
-            <span>Role：{observation.aliyunConnection.roleArn}</span>
-            <span>
-              ExternalId 指纹：
-              {observation.aliyunConnection.externalIdFingerprint}
-            </span>
-            <span>
-              能力：
-              {observation.aliyunConnection.capabilities.join("、") ||
-                "尚未验证"}
-            </span>
-          </div>
-        )}
-
-        <form className="siteops-connection-form" onSubmit={setupAliyun}>
-          <label>
-            <span>阿里云账号 UID</span>
-            <input
-              value={aliyunAccountUid}
-              inputMode="numeric"
-              pattern="[0-9]{6,64}"
-              placeholder={
-                observation.aliyunConnection.accountUid ?? "例如 123456789012"
-              }
-              required
-              onChange={(event) => setAliyunAccountUid(event.target.value)}
-            />
-          </label>
-          <label>
-            <span>客户 RAM Role ARN</span>
-            <input
-              value={aliyunRoleArn}
-              placeholder={
-                observation.aliyunConnection.roleArn ??
-                "acs:ram::账号UID:role/frontmind-siteops"
-              }
-              required
-              onChange={(event) => setAliyunRoleArn(event.target.value)}
-            />
-          </label>
-          <button
-            type="submit"
-            className="siteops-secondary-button"
-            disabled={
-              !onSetupAliyun ||
-              !observation.aliyunConnection.canRotate ||
-              Boolean(busyAction)
-            }
-          >
-            {busyAction === "aliyun_setup" && (
-              <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
-            )}
-            {observation.aliyunConnection.configured
-              ? "重新生成 ExternalId"
-              : "生成连接配置"}
-          </button>
-        </form>
-
-        {aliyunSetup && (
-          <div className="siteops-external-id" role="status">
-            <ShieldCheck size={20} aria-hidden="true" />
-            <div>
-              <strong>
-                ExternalId 仅在这里显示一次，请现在写入 Role 信任策略
-              </strong>
-              <code>{aliyunSetup.externalId}</code>
-              <button
-                type="button"
-                className="siteops-inline-button"
-                onClick={() =>
-                  navigator.clipboard.writeText(aliyunSetup.externalId)
-                }
-              >
-                <Copy size={14} aria-hidden="true" />
-                复制 ExternalId
-              </button>
-              {aliyunSetup.trustPolicy ? (
-                <pre>{JSON.stringify(aliyunSetup.trustPolicy, null, 2)}</pre>
-              ) : (
-                <p>
-                  FrontMind 服务身份 ARN
-                  尚未配置，请勿验证；系统不会退回收集永久 AccessKey。
-                </p>
-              )}
-              <strong>Role 最小权限策略</strong>
-              <pre>{JSON.stringify(aliyunSetup.permissionPolicy, null, 2)}</pre>
-              <button
-                type="button"
-                className="siteops-inline-button"
-                onClick={() =>
-                  navigator.clipboard.writeText(
-                    JSON.stringify(aliyunSetup.permissionPolicy, null, 2),
-                  )
-                }
-              >
-                <Copy size={14} aria-hidden="true" />
-                复制最小权限策略
-              </button>
-              <p>
-                日常只读、购买、续费、自动续费和 DNS 写入权限已明确列出；每次
-                AssumeRole 还会叠加本次操作的更窄 session policy。
-              </p>
-            </div>
-          </div>
-        )}
-
         <div className="siteops-domain-actions">
-          <button
-            type="button"
-            className="siteops-primary-button"
-            disabled={
-              !observation.aliyunConnection.configured ||
-              !onVerifyAliyun ||
-              Boolean(busyAction)
-            }
-            onClick={() => runConnectionAction("aliyun_verify", onVerifyAliyun)}
-          >
-            验证 RAM Role
-          </button>
-          {observation.aliyunConnection.configured && (
+          {observation.aliyunConnection.status === "not_connected" && (
+            <button
+              type="button"
+              className="siteops-primary-button"
+              disabled={!onBeginAliyun || Boolean(busyAction)}
+              onClick={() => void beginAliyunConnection()}
+            >
+              {busyAction === "aliyun_begin" && (
+                <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
+              )}
+              连接阿里云
+            </button>
+          )}
+          {observation.aliyunConnection.status === "authorization_required" && (
+              <>
+                <button
+                  type="button"
+                  className="siteops-primary-button"
+                  disabled={!onLoadAliyunAuthorizationGuide || Boolean(busyAction)}
+                  onClick={() => void openAliyunAuthorizationGuide()}
+                >
+                  {busyAction === "aliyun_guide" && (
+                    <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
+                  )}
+                  前往阿里云完成授权
+                </button>
+                <button
+                  type="button"
+                  className="siteops-secondary-button"
+                  disabled={!onVerifyAliyun || Boolean(busyAction)}
+                  onClick={() =>
+                    runConnectionAction("aliyun_verify", onVerifyAliyun)
+                  }
+                >
+                  我已完成授权
+                </button>
+              </>
+            )}
+          {aliyunGuide && (
+            <div className="siteops-aliyun-guide" role="region" aria-label="阿里云授权步骤">
+              <strong>按以下 3 步完成一次授权</strong>
+              <ol>
+                <li>
+                  <span>复制固定角色名称，并在已打开的阿里云页面创建角色。</span>
+                  <button
+                    type="button"
+                    className="siteops-secondary-button"
+                    onClick={() =>
+                      void copyAliyunAuthorizationStep(
+                        "role",
+                        aliyunGuide.roleName,
+                      )
+                    }
+                  >
+                    {copiedAliyunStep === "role" ? "已复制" : "复制角色名称"}
+                  </button>
+                </li>
+                <li>
+                  <span>在角色信任设置中粘贴第 2 步配置。</span>
+                  <button
+                    type="button"
+                    className="siteops-secondary-button"
+                    onClick={() =>
+                      void copyAliyunAuthorizationStep(
+                        "trust",
+                        aliyunGuide.trustPolicyText,
+                      )
+                    }
+                  >
+                    {copiedAliyunStep === "trust" ? "已复制" : "复制第 2 步配置"}
+                  </button>
+                </li>
+                <li>
+                  <span>创建并绑定权限策略，然后返回点击“我已完成授权”。</span>
+                  <button
+                    type="button"
+                    className="siteops-secondary-button"
+                    onClick={() =>
+                      void copyAliyunAuthorizationStep(
+                        "permission",
+                        aliyunGuide.permissionPolicyText,
+                      )
+                    }
+                  >
+                    {copiedAliyunStep === "permission"
+                      ? "已复制"
+                      : "复制第 3 步配置"}
+                  </button>
+                </li>
+              </ol>
+              <a href={aliyunGuide.configurationDownloadUrl}>
+                <Download size={15} aria-hidden="true" />
+                下载备用配置
+              </a>
+            </div>
+          )}
+          {observation.aliyunConnection.status === "active" && (
             <button
               type="button"
               className="siteops-secondary-button"
@@ -1517,21 +1569,24 @@ export default function SiteOpsConversationPanel({
                 runConnectionAction("aliyun_disconnect", onDisconnectAliyun)
               }
             >
-              撤销连接
+              解除连接
             </button>
           )}
         </div>
 
-        {observation.aliyunConnection.status === "unverified" && (
+        {observation.aliyunConnection.status === "authorization_required" && (
           <div className="siteops-notice warning">
-            请先在客户阿里云账号中完成 Role 信任策略与最小权限，再点击“验证 RAM
-            Role”。
+            请在阿里云官方页面完成授权，然后返回这里继续。
+          </div>
+        )}
+        {observation.aliyunConnection.status === "attention_required" && (
+          <div className="siteops-notice warning">
+            阿里云授权需要协助，请稍后重试或提交工单。
           </div>
         )}
         {!observation.aliyunConnection.canRotate && (
           <div className="siteops-notice warning">
-            当前仍有域名扣费或 DNS 操作正在执行/对账；为保留原 Role 与
-            ExternalId，完成前不能重新生成或撤销连接。
+            当前域名操作尚未完成，完成后才能解除连接。
           </div>
         )}
 
@@ -1571,7 +1626,7 @@ export default function SiteOpsConversationPanel({
                 const domain = domainInput.trim();
                 if (
                   !window.confirm(
-                    `确认通过当前客户阿里云 RAM Role 只读查询并接入已有域名 ${domain}？系统会验证它属于该客户账号，不会购买或扣费。`,
+                    `确认接入已有域名 ${domain}？系统会验证它属于您已连接的阿里云账号，不会购买或扣费。`,
                   )
                 ) {
                   return;
@@ -1586,7 +1641,7 @@ export default function SiteOpsConversationPanel({
                 );
               }}
             >
-              只读接入已有域名
+              接入已有域名
             </button>
             <button
               type="button"
@@ -1634,7 +1689,7 @@ export default function SiteOpsConversationPanel({
                 )
               }
             >
-              获取购买精确报价
+              获取购买报价
             </button>
             <button
               type="button"
@@ -1684,8 +1739,7 @@ export default function SiteOpsConversationPanel({
               </select>
             </label>
             <p>
-              Dashboard 只保存模板 ID
-              与掩码名称；证件、地址、电话等材料继续由客户在阿里云控制台管理。
+              证件、地址和电话等实名资料继续由您在阿里云官方页面管理。
             </p>
           </div>
         )}
@@ -1718,7 +1772,7 @@ export default function SiteOpsConversationPanel({
                 {((latestQuote.amountMinor ?? 0) / 100).toFixed(2)} /{" "}
                 {latestQuote.years} 年； 持有人{" "}
                 {latestQuote.maskedRegistrantName || "当前域名持有人"}
-                ；从客户账号 {observation.aliyunConnection.accountUid} 扣费。
+                ；从您已连接的阿里云账号扣费。
               </p>
               <p>
                 报价不锁定库存，操作通常不可撤销。系统不会自动购买，必须由你输入完整域名确认。
@@ -1757,7 +1811,7 @@ export default function SiteOpsConversationPanel({
                 )
               }
             >
-              确认并从客户阿里云账号扣费
+              确认并从已连接的阿里云账号扣费
             </button>
           </div>
         )}
@@ -1768,14 +1822,14 @@ export default function SiteOpsConversationPanel({
               {observation.domainState.displayDomain ||
                 observation.domainState.domain}
             </strong>
-            <span>域名版本 {observation.domainState.revision}</span>
             <span>
-              实名：{observation.domainState.realNameStatus || "待同步"}
+              实名：
+              {customerDomainStateLabel(observation.domainState.realNameStatus)}
             </span>
             <span>
-              所有权：{observation.domainState.ownershipStatus || "待验证"}
+              所有权：
+              {customerDomainStateLabel(observation.domainState.ownershipStatus)}
             </span>
-            <span>DNS：{observation.domainState.dnsStatus || "待规划"}</span>
             <span>
               到期：
               {observation.domainState.expiresAt
@@ -1793,7 +1847,7 @@ export default function SiteOpsConversationPanel({
                   : "已关闭"}
             </span>
             <span>
-              ICP：{observation.domainState.icpStatus}（与域名实名独立）
+              备案：{customerDomainStateLabel(observation.domainState.icpStatus)}
             </span>
             <div className="siteops-domain-actions">
               <button
@@ -1804,7 +1858,7 @@ export default function SiteOpsConversationPanel({
                   const domain = observation.domainState!.domain!;
                   if (
                     !window.confirm(
-                      `确认开启 ${domain} 的自动续费？未来续费将按届时价格从当前客户阿里云账号扣款；开启自动续费不代表本次续费已经成功。`,
+                      `确认开启 ${domain} 的自动续费？未来续费将按届时价格从您已连接的阿里云账号扣款；开启自动续费不代表本次续费已经成功。`,
                     )
                   ) {
                     return;
@@ -1848,105 +1902,7 @@ export default function SiteOpsConversationPanel({
               >
                 关闭自动续费
               </button>
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled={interactionLocked}
-                onClick={() =>
-                  runAction(
-                    "dns_plan",
-                    actionFromCard(
-                      observation,
-                      "domain_status",
-                      "dns_plan",
-                      {},
-                    ),
-                  )
-                }
-              >
-                查看 DNS 精确差异
-              </button>
-              <button
-                type="button"
-                className="siteops-primary-button"
-                disabled={
-                  interactionLocked ||
-                  !currentDnsPlan ||
-                  !currentDnsPlan.canApply
-                }
-                onClick={() =>
-                  runAction(
-                    "dns_apply",
-                    actionFromCard(observation, "domain_status", "dns_apply", {
-                      domainRevision: observation.domainState!.revision,
-                      planOperationId: currentDnsPlan!.operationId,
-                      planHash: currentDnsPlan!.planHash,
-                      providerSnapshotHash:
-                        currentDnsPlan!.providerSnapshotHash,
-                    }),
-                  )
-                }
-              >
-                应用 FrontMind DNS
-              </button>
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled={interactionLocked}
-                onClick={() =>
-                  runAction(
-                    "dns_rollback",
-                    actionFromCard(
-                      observation,
-                      "domain_status",
-                      "dns_rollback",
-                      { domainRevision: observation.domainState!.revision },
-                    ),
-                  )
-                }
-              >
-                回滚 FrontMind DNS
-              </button>
             </div>
-            {currentDnsPlan ? (
-              <div className="siteops-dns-plan" aria-label="DNS 精确差异计划">
-                <div className="siteops-dns-plan-heading">
-                  <strong>DNS 精确差异计划</strong>
-                  <span>
-                    {currentDnsPlan.canApply
-                      ? "供应商快照未写入，确认后才会应用"
-                      : "存在冲突或未知结果，不能应用"}
-                  </span>
-                </div>
-                {currentDnsPlan.items.map((item) => (
-                  <div
-                    className={`siteops-dns-plan-item siteops-dns-plan-item-${item.action}`}
-                    key={item.id}
-                  >
-                    <strong>{item.action}</strong>
-                    <span>
-                      {item.rr} {item.type}
-                    </span>
-                    <code>{item.expectedValue}</code>
-                    {item.currentValue && (
-                      <small>
-                        当前：{item.currentValue} / TTL {item.currentTtl}
-                      </small>
-                    )}
-                    {item.reason && <small>{item.reason}</small>}
-                  </div>
-                ))}
-                <small>
-                  计划 {currentDnsPlan.planHash.slice(0, 12)} · 供应商快照{" "}
-                  {currentDnsPlan.providerSnapshotHash.slice(0, 12)}
-                </small>
-              </div>
-            ) : (
-              <p className="siteops-dns-plan-empty">
-                请先生成当前域名版本的 DNS
-                精确差异；记录或域名版本发生变化时必须重新规划。
-              </p>
-            )}
             {observation.domainState.icpStatus !== "approved" && (
               <div className="siteops-icp-filing">
                 <p className="siteops-icp-note">
@@ -1989,23 +1945,9 @@ export default function SiteOpsConversationPanel({
           </div>
         )}
 
-        {observation.domainOperations.length > 0 && (
-          <div className="siteops-operation-list">
-            {observation.domainOperations.slice(0, 5).map((operation) => (
-              <div key={operation.id}>
-                <span>
-                  {operation.kind} · {operation.domain}
-                </span>
-                <strong>{operation.status}</strong>
-                {operation.errorMessage && (
-                  <small>{operation.errorMessage}</small>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
       </section>
 
+      {(!hasSuccessfulBuild || rebuildInProgress) && (
       <form className="siteops-composer" onSubmit={submitMessage}>
         <label htmlFor="siteops-message-input">继续对话</label>
         <div>
@@ -2031,6 +1973,7 @@ export default function SiteOpsConversationPanel({
           </button>
         </div>
       </form>
+      )}
     </section>
   );
 }

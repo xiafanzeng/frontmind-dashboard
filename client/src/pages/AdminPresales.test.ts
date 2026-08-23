@@ -27,6 +27,23 @@ describe("presalesUsageDisplayState", () => {
     expect(source).toContain("search");
     expect(source).toContain("get_component");
     expect(source).toContain("不与官网任务积分混算");
+    expect(source).toContain("域名与发布平台");
+    expect(source).toContain("1244409121609391");
+  });
+
+  it("never retains Aliyun broker or OAuth plaintext in mutation caches", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
+      "utf8",
+    );
+    expect(source).toContain(
+      "utils.client.admin.presales.aliyun.replaceBroker.mutate",
+    );
+    expect(source).toContain(
+      "utils.client.admin.presales.aliyun.replaceOAuth.mutate",
+    );
+    expect(source).not.toContain("aliyun.replaceBroker.useMutation");
+    expect(source).not.toContain("aliyun.replaceOAuth.useMutation");
   });
 
   it("sends 21st plaintext through the direct tRPC client without retaining mutation variables", () => {

@@ -49,7 +49,12 @@ describe("AiWebsiteManagementWorkspace", () => {
     );
 
     expect(screen.getByText("对话式建站面板已连接")).toBeInTheDocument();
-    expect(screen.getByText(/域名与 ICP 只在对应地区正式发布时校验/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "一站式建站" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/完成官网制作、预览、域名配置与发布/),
+    ).toBeInTheDocument();
     expect(screen.queryByText("阿里云企业域名注册图文教程")).toBeNull();
     expect(screen.queryByText("官网开通进度")).toBeNull();
   });

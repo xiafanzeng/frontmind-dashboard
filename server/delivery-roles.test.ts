@@ -34,6 +34,7 @@ describe("delivery engineer roles", () => {
       "icp_filing",
       "website_style_samples",
       "website_build",
+      "site_rebuild",
       "company_facts",
       "product_case_docs",
       "industry_news",

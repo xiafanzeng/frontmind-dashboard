@@ -40,7 +40,6 @@ import {
   siteBriefSchema,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
-  siteOpsAliyunConnectionSetupInputSchema,
   siteOpsObserveInputSchema,
   siteOpsSendMessageInputSchema,
   visualEvidenceV1Schema,
@@ -51,8 +50,9 @@ import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { siteOpsObservationV1Schema } from "../../shared/siteops-contract";
 import {
   referenceBlueprintForVisualCandidate,
-  referenceBlueprintV2Schema,
-  type ReferenceBlueprintV2,
+  referenceBlueprintSchema,
+  referenceBlueprintV3Schema,
+  type ReferenceBlueprint,
 } from "../../shared/siteops-design";
 import {
   visualSearchOperationInputV1Schema,
@@ -74,14 +74,20 @@ import { getServicePortal } from "../service-entitlement";
 import { siteOpsProviderConfigured } from "./providers";
 import {
   AliyunProviderError,
+  bindAliyunCustomerAccountFromOAuth,
   disconnectAliyunCustomerConnection,
   getAliyunCustomerConnectionStatus,
-  setupAliyunCustomerConnection,
+  getAliyunCustomerRoleAuthorizationPackage,
   verifyAliyunCustomerConnection,
 } from "./aliyun-provider";
+import {
+  createAliyunOAuthAuthorization,
+  getActiveAliyunBrokerCredential,
+} from "./aliyun-platform-service";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import {
-  publicSiteOpsErrorProjection,
+  publicSiteOpsDomainIssue,
+  publicSiteOpsMessageText,
   sanitizeFrontMindPublicText,
 } from "./public-errors";
 import { terminalTaskState } from "./task-terminal-state";
@@ -91,6 +97,11 @@ import {
   siteOpsQuotaPeriodIds,
   SiteOpsQuotaError,
 } from "./quota-service";
+import {
+  createSiteOpsRebuildTicket,
+  loadSiteOpsRebuildRequest,
+  SiteOpsRebuildTicketError,
+} from "./rebuild-ticket";
 
 export type SiteOpsServiceErrorCode =
   | "DATABASE_UNAVAILABLE"
@@ -111,6 +122,18 @@ export class SiteOpsServiceError extends Error {
   ) {
     super(message);
     this.name = "SiteOpsServiceError";
+  }
+}
+
+export function requireAcceptedSiteOpsRebuild(input: {
+  status: string | null;
+}) {
+  if (input.status !== "in_progress") {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "请先提交官网重制需求并等待 FrontMind 受理。",
+      409,
+    );
   }
 }
 
@@ -148,27 +171,6 @@ const domainSchema = z
   .min(1)
   .max(255)
   .refine((value) => !/[\s/@?#\\]/u.test(value), "域名格式不正确");
-
-const ALIYUN_CUSTOMER_ROLE_PERMISSIONS = {
-  daily: [
-    "domain:CheckDomain",
-    "domain:QueryDomainByDomainName",
-    "domain:QueryDomainList",
-    "domain:QueryRegistrantProfiles",
-    "domain:QueryTaskList",
-    "domain:QueryTaskDetailList",
-    "alidns:DescribeDomainRecords",
-  ],
-  purchase: ["domain:SaveSingleTaskForCreatingOrderActivate"],
-  renewal: ["domain:SaveSingleTaskForCreatingOrderRenew"],
-  autoRenew: ["domain:SetupDomainAutoRenew"],
-  dnsWrite: [
-    "alidns:AddDomainRecord",
-    "alidns:UpdateDomainRecord",
-    "alidns:UpdateDomainRecordRemark",
-    "alidns:DeleteDomainRecord",
-  ],
-} as const;
 
 export function normalizeSiteOpsDomain(value: string) {
   const withoutDot = value.trim().replace(/\.$/u, "");
@@ -609,41 +611,34 @@ const RESETTABLE_PRE_BUILD_STATUSES = new Set([
   "attention_required",
 ]);
 
-const publicHeroEligibilitySchema = z
-  .object({
-    variant: z.enum([
-      "centered_statement",
-      "split_media",
-      "editorial_modular",
-      "immersive_visual",
-    ]),
-    confidence: z.enum(["explicit", "strong", "conditional"]),
-  })
-  .passthrough();
+const publicVisualFamilySchema = z.enum([
+  "floating_orbit",
+  "split_media",
+  "editorial",
+  "bento",
+  "feature_grid",
+  "centered_dual_cta",
+  "immersive_visual",
+  "product_stage",
+  "full_bleed_statement",
+]);
 
 function publicVisualMetadata(value: unknown) {
   const metadata =
     value && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : {};
-  const eligibility = publicHeroEligibilitySchema.safeParse(
-    metadata.heroEligibility,
-  );
+  const visualFamily = publicVisualFamilySchema.safeParse(metadata.heroFamily);
   return {
     providerTitle:
       typeof metadata.title === "string" ? metadata.title.trim() : "",
-    score: typeof metadata.score === "number" ? metadata.score : 0,
-    ...(eligibility.success
-      ? {
-          heroVariant: eligibility.data.variant,
-          heroConfidence: eligibility.data.confidence,
-        }
-      : {}),
+    visualFamily: visualFamily.success ? visualFamily.data : null,
   };
 }
 
 export function freezeSiteOpsReferenceBlueprint(input: {
   sampleId: string;
+  previewLocalAssetId?: string | null;
   note: string | null;
   sourceMetadata: unknown;
 }) {
@@ -654,6 +649,9 @@ export function freezeSiteOpsReferenceBlueprint(input: {
       ? (input.sourceMetadata as Record<string, unknown>)
       : {};
   const evidence = visualEvidenceV1Schema.safeParse(metadata.visualEvidence);
+  const frozenV3 = referenceBlueprintV3Schema.safeParse(
+    metadata.referenceBlueprint,
+  );
   const heroEligibility = z
     .object({
       eligible: z.literal(true),
@@ -666,10 +664,9 @@ export function freezeSiteOpsReferenceBlueprint(input: {
     })
     .passthrough()
     .safeParse(metadata.heroEligibility);
-  if (
-    !evidence.success ||
-    !heroEligibility.success ||
-    metadata.providerItemKey !== evidence.data.providerItemKey ||
+  const evidenceIsValid =
+    evidence.success &&
+    metadata.providerItemKey === evidence.data.providerItemKey &&
     createVisualEvidenceV1({
       evidenceKind: evidence.data.evidenceKind,
       providerItemKey: evidence.data.providerItemKey,
@@ -677,8 +674,20 @@ export function freezeSiteOpsReferenceBlueprint(input: {
       providerResponseSha256: evidence.data.providerResponseSha256,
       previewSha256: evidence.data.previewSha256,
       taxonomyDerivationVersion: evidence.data.taxonomyDerivationVersion,
-    }).evidenceSha256 !== evidence.data.evidenceSha256
+    }).evidenceSha256 === evidence.data.evidenceSha256;
+  if (
+    frozenV3.success &&
+    evidence.success &&
+    evidenceIsValid &&
+    frozenV3.data.candidateId === input.sampleId &&
+    frozenV3.data.providerItemKey === evidence.data.providerItemKey &&
+    frozenV3.data.previewSha256 === evidence.data.previewSha256 &&
+    (!input.previewLocalAssetId ||
+      frozenV3.data.previewLocalAssetId === input.previewLocalAssetId)
   ) {
+    return frozenV3.data;
+  }
+  if (!evidence.success || !heroEligibility.success || !evidenceIsValid) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "所选视觉参考无法冻结为可信 Hero 构图合同，请重新检索后选择。",
@@ -699,7 +708,7 @@ export function freezeSiteOpsReferenceBlueprint(input: {
 export function referenceBlueprintForSiteOpsRevision(input: {
   parentWorkflowVersion: string;
   parentOperationInput: unknown;
-  derivedReferenceBlueprint: ReferenceBlueprintV2;
+  derivedReferenceBlueprint: ReferenceBlueprint;
 }) {
   const operationInput =
     input.parentOperationInput &&
@@ -707,7 +716,7 @@ export function referenceBlueprintForSiteOpsRevision(input: {
     !Array.isArray(input.parentOperationInput)
       ? (input.parentOperationInput as Record<string, unknown>)
       : null;
-  const inherited = referenceBlueprintV2Schema.safeParse(
+  const inherited = referenceBlueprintSchema.safeParse(
     operationInput?.referenceBlueprint,
   );
   const inheritedMatches =
@@ -1071,18 +1080,22 @@ async function loadOwnedProject(
   return rows[0] ?? null;
 }
 
-async function loadProviderState(
+async function loadServiceReadiness(
   executor: any,
   input: { projectId: string; userId: number },
 ) {
-  const [twentyFirstCredentials, aiBuilderCredentials, connections] =
+  const [platformCredentials, aiBuilderCredentials, connections] =
     await Promise.all([
       executor
         .select({ slot: presalesApiCredentials.slot })
         .from(presalesApiCredentials)
         .where(
           and(
-            eq(presalesApiCredentials.slot, "site_builder_21st"),
+            inArray(presalesApiCredentials.slot, [
+              "site_builder_21st",
+              "siteops_aliyun_broker",
+              "siteops_aliyun_oauth",
+            ]),
             eq(presalesApiCredentials.status, "active"),
             eq(presalesApiCredentials.validationStatus, "verified"),
           ),
@@ -1112,55 +1125,63 @@ async function loadProviderState(
         )
         .limit(1),
     ]);
-  const hasTwentyFirstCredential = twentyFirstCredentials.length > 0;
+  const hasTwentyFirstCredential = platformCredentials.some(
+    (row: { slot: string }) => row.slot === "site_builder_21st",
+  );
+  const hasAliyunBrokerCredential = platformCredentials.some(
+    (row: { slot: string }) => row.slot === "siteops_aliyun_broker",
+  );
+  const hasAliyunOAuthCredential = platformCredentials.some(
+    (row: { slot: string }) => row.slot === "siteops_aliyun_oauth",
+  );
   const hasAiBuilderCredential = aiBuilderCredentials.length > 0;
   const aliyunFeatureEnabled =
     process.env.FRONTMIND_ALIYUN_DOMAIN_ENABLED?.trim() === "1";
-  const aliyunRolePrincipalConfigured = Boolean(
-    process.env.FRONTMIND_ALIYUN_ROLE_PRINCIPAL_ARN?.trim(),
-  );
   const aliyunConnectionReady = connections[0]?.status === "active";
   const aliyunReady =
     aliyunFeatureEnabled &&
-    aliyunRolePrincipalConfigured &&
+    hasAliyunBrokerCredential &&
+    hasAliyunOAuthCredential &&
     aliyunConnectionReady;
   const esa = inspectEsaRuntimeConfiguration({
     providerRegistered: siteOpsProviderConfigured("aliyun_esa"),
   });
   return {
-    twentyFirst: {
+    visuals: {
       status: hasTwentyFirstCredential
         ? ("configured" as const)
         : ("not_configured" as const),
       reason: hasTwentyFirstCredential
         ? undefined
-        : "系统管理员尚未配置有效的 21st API Key",
+        : "视觉候选服务尚未就绪，请联系 FrontMind",
     },
-    aiBuilder: {
+    website: {
       status: hasAiBuilderCredential
         ? ("configured" as const)
         : ("not_configured" as const),
       reason: hasAiBuilderCredential
         ? undefined
-        : "当前账号尚未配置有效的 AI 建站 API Key",
+        : "AI 建站服务尚未就绪，请联系 FrontMind",
     },
-    esa: {
+    publishing: {
       status: esa.configured
         ? ("configured" as const)
         : ("not_configured" as const),
-      reason: esa.configured ? undefined : esa.reason,
+      reason: esa.configured
+        ? undefined
+        : sanitizeFrontMindPublicText(esa.reason),
     },
-    aliyun: {
+    domain: {
       status: aliyunReady
         ? ("configured" as const)
         : ("not_configured" as const),
       reason: aliyunReady
         ? undefined
         : !aliyunFeatureEnabled
-          ? "阿里云域名与 DNS 功能尚未启用"
-          : !aliyunRolePrincipalConfigured
-            ? "FrontMind RAM 服务身份 ARN 尚未配置"
-            : "客户尚未连接有效的阿里云 RAM Role",
+          ? "域名与发布服务尚未启用"
+          : !hasAliyunBrokerCredential || !hasAliyunOAuthCredential
+            ? "域名与发布平台尚未配置完成"
+            : "请先完成阿里云账号授权",
     },
   };
 }
@@ -1172,7 +1193,7 @@ function requireEsaRuntimeConfigured() {
   if (!configuration.configured) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      `${configuration.reason}，未创建任何虚假的 ESA 操作。`,
+      "发布服务尚未配置完成，请联系 FrontMind。",
       412,
     );
   }
@@ -1202,7 +1223,7 @@ async function projectObservation(
     buildRows,
     deploymentRows,
     packageRows,
-    providerState,
+    serviceReadiness,
     snapshotRows,
     batchRows,
     connectionRows,
@@ -1213,8 +1234,8 @@ async function projectObservation(
     unresolvedFinancialRows,
     resetOperationRows,
     providerTaskRows,
-    buildAgentProfileRows,
     activeDnsRecordRows,
+    rebuildRequest,
   ] = await Promise.all([
     executor
       .select()
@@ -1255,7 +1276,7 @@ async function projectObservation(
       )
       .orderBy(desc(socialPackages.createdAt))
       .limit(50),
-    loadProviderState(executor, {
+    loadServiceReadiness(executor, {
       projectId: input.project.id,
       userId: input.userId,
     }),
@@ -1387,22 +1408,6 @@ async function projectObservation(
       )
       .limit(50),
     executor
-      .select({
-        buildId: siteOperations.buildId,
-        input: siteOperations.input,
-      })
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.userId),
-          inArray(siteOperations.kind, ["site_build", "build_revision"]),
-          isNotNull(siteOperations.buildId),
-        ),
-      )
-      .orderBy(desc(siteOperations.createdAt))
-      .limit(100),
-    executor
       .select({ id: siteDnsRecords.id })
       .from(siteDnsRecords)
       .where(
@@ -1417,6 +1422,11 @@ async function projectObservation(
         ),
       )
       .limit(1),
+    loadSiteOpsRebuildRequest(executor, {
+      userId: input.userId,
+      projectId: input.project.id,
+      currentBuildId: input.project.currentBuildId,
+    }),
   ]);
 
   const candidateRows = batchRows[0]
@@ -1427,22 +1437,6 @@ async function projectObservation(
         .orderBy(asc(websiteStyleSamples.sortOrder))
         .limit(9)
     : [];
-  const buildAgentProfiles = new Map<string, ManagedAgentProfile>();
-  for (const row of buildAgentProfileRows as Array<{
-    buildId: string | null;
-    input: unknown;
-  }>) {
-    if (!row.buildId || buildAgentProfiles.has(row.buildId)) continue;
-    const operationInput =
-      row.input && typeof row.input === "object" && !Array.isArray(row.input)
-        ? (row.input as Record<string, unknown>)
-        : {};
-    const profile = managedAgentProfileSchema.safeParse(
-      operationInput.agentProfile,
-    );
-    if (profile.success) buildAgentProfiles.set(row.buildId, profile.data);
-  }
-
   const messagesProjected = messageRows.map(
     (row: typeof messages.$inferSelect) => {
       const metadata = (row.metadata ?? {}) as Record<string, unknown>;
@@ -1458,26 +1452,28 @@ async function projectObservation(
       const payload = statusProjectedSiteOps?.payload as
         | Record<string, unknown>
         | undefined;
-      const publicError = publicSiteOpsErrorProjection({
-        code: typeof payload?.errorCode === "string" ? payload.errorCode : null,
-        message: row.role === "assistant" ? row.content : null,
-      });
-      const projectedMetadata =
-        statusProjectedSiteOps && payload && publicError.code
-          ? {
-              ...statusProjectedMetadata,
-              siteOps: {
-                ...statusProjectedSiteOps,
-                payload: { ...payload, errorCode: publicError.code },
-              },
-            }
-          : statusProjectedMetadata;
+      const projectedMetadata = statusProjectedSiteOps
+        ? {
+            ...statusProjectedMetadata,
+            siteOps: {
+              ...statusProjectedSiteOps,
+              subjectId: row.id,
+              payload: {},
+            },
+          }
+        : statusProjectedMetadata;
       return {
         id: row.id,
         role: row.role,
         content:
           row.role === "assistant" && siteOps
-            ? publicError.message || sanitizeFrontMindPublicText(row.content)
+            ? publicSiteOpsMessageText({
+                content: row.content,
+                errorCode:
+                  typeof payload?.errorCode === "string"
+                    ? payload.errorCode
+                    : null,
+              })
             : row.content,
         sequence: row.sequence,
         metadata: projectedMetadata,
@@ -1550,30 +1546,27 @@ async function projectObservation(
   const observation = {
     schemaVersion: 1 as const,
     executionKind: "site_ops" as const,
-    providerState,
+    serviceReadiness,
     aliyunConnection: connectionRows[0]
       ? {
-          configured: connectionRows[0].status !== "revoked",
-          accountUid: connectionRows[0].accountUid,
-          roleArn: connectionRows[0].roleArn,
-          externalIdFingerprint: connectionRows[0].externalIdFingerprint,
-          status: connectionRows[0].status,
-          capabilities: connectionRows[0].capabilities,
+          configured: connectionRows[0].status === "active",
+          status:
+            connectionRows[0].status === "active"
+              ? ("active" as const)
+              : connectionRows[0].status === "unverified"
+                ? ("authorization_required" as const)
+                : connectionRows[0].status === "invalid"
+                  ? ("attention_required" as const)
+                  : ("not_connected" as const),
           verifiedAt: connectionRows[0].verifiedAt?.toISOString() ?? null,
-          lastErrorCode: connectionRows[0].lastErrorCode,
           canRotate:
             activeAliyunOperationRows.length === 0 &&
             unresolvedFinancialRows.length === 0,
         }
       : {
           configured: false,
-          accountUid: null,
-          roleArn: null,
-          externalIdFingerprint: null,
-          status: null,
-          capabilities: [],
+          status: "not_connected" as const,
           verifiedAt: null,
-          lastErrorCode: null,
           canRotate: true,
         },
     domainState: profileRows[0]
@@ -1583,7 +1576,6 @@ async function projectObservation(
             profileRows[0].unicodeDisplayDomain ?? profileRows[0].domain,
           revision: profileRows[0].domainRevision,
           registrar: profileRows[0].registrar,
-          providerAccountUid: profileRows[0].providerAccountUid,
           expiresAt: profileRows[0].domainExpiresAt?.toISOString() ?? null,
           realNameStatus: profileRows[0].domainRealNameStatus,
           emailStatus: profileRows[0].domainEmailStatus,
@@ -1617,7 +1609,10 @@ async function projectObservation(
             ? {
                 available: check.available,
                 premium: check.premium === true,
-                reason: typeof check.reason === "string" ? check.reason : null,
+                reason:
+                  check.available === false && typeof check.reason === "string"
+                    ? "当前域名暂不可注册，请尝试其他名称。"
+                    : null,
               }
             : null;
         })(),
@@ -1645,51 +1640,34 @@ async function projectObservation(
             .filter((item) => /^\d{1,191}$/u.test(item.profileId))
             .slice(0, 100);
         })(),
-        errorCode: row.errorCode,
-        errorMessage: row.errorMessage,
+        issue: publicSiteOpsDomainIssue(row.errorCode, row.status),
         createdAt: row.createdAt.toISOString(),
       }),
     ),
     dnsPlan:
-      latestDnsPlanRow &&
-      typeof latestDnsPlanResult?.domain === "string" &&
-      typeof latestDnsPlanResult.revision === "number" &&
-      typeof latestDnsPlanResult.planHash === "string" &&
-      typeof latestDnsPlanResult.providerSnapshotHash === "string"
+      latestDnsPlanRow && latestDnsPlanResult
         ? {
-            operationId: latestDnsPlanRow.id,
-            domain: latestDnsPlanResult.domain,
-            domainRevision: latestDnsPlanResult.revision,
-            planHash: latestDnsPlanResult.planHash,
-            providerSnapshotHash: latestDnsPlanResult.providerSnapshotHash,
             canApply: latestDnsPlanResult.canApply === true,
             status:
               latestDnsPlanRow.status === "succeeded"
                 ? ("succeeded" as const)
                 : ("attention_required" as const),
-            items: dnsPlanItems
-              .filter((item): item is Record<string, unknown> =>
-                Boolean(item && typeof item === "object"),
-              )
-              .map((item) => {
-                const current =
-                  item.current && typeof item.current === "object"
-                    ? (item.current as Record<string, unknown>)
-                    : null;
-                return {
-                  id: String(item.id ?? ""),
-                  action: String(item.action ?? ""),
-                  rr: String(item.rr ?? ""),
-                  type: String(item.type ?? ""),
-                  expectedValue: String(item.expectedValue ?? ""),
-                  expectedTtl: Number(item.expectedTtl ?? 0),
-                  currentValue:
-                    typeof current?.value === "string" ? current.value : null,
-                  currentTtl:
-                    typeof current?.ttl === "number" ? current.ttl : null,
-                  reason: typeof item.reason === "string" ? item.reason : null,
-                };
-              }),
+            changeCount: dnsPlanItems.filter(
+              (item) =>
+                item &&
+                typeof item === "object" &&
+                !["conflict", "unknown", "verify"].includes(
+                  String((item as Record<string, unknown>).action ?? ""),
+                ),
+            ).length,
+            conflictCount: dnsPlanItems.filter(
+              (item) =>
+                item &&
+                typeof item === "object" &&
+                ["conflict", "unknown"].includes(
+                  String((item as Record<string, unknown>).action ?? ""),
+                ),
+            ).length,
             createdAt: latestDnsPlanRow.createdAt.toISOString(),
           }
         : null,
@@ -1743,22 +1721,10 @@ async function projectObservation(
       },
     ),
     builds: buildRows.map((row: typeof siteBuilds.$inferSelect) => {
-      const publicError = publicSiteOpsErrorProjection({
-        code: row.errorCode,
-        message: row.errorMessage,
-        status:
-          row.status === "failed" || row.status === "attention_required"
-            ? row.status
-            : undefined,
-      });
       return {
         id: row.id,
         parentBuildId: row.parentBuildId,
         ordinal: row.ordinal,
-        agentProfile: buildAgentProfiles.get(row.id) ?? null,
-        renderer: row.workflowVersion.startsWith("2.")
-          ? ("react_static" as const)
-          : ("astro_static" as const),
         status: row.status,
         previewUrl: row.distLocalAssetId
           ? `/api/site-ops/builds/${row.id}/preview/`
@@ -1766,9 +1732,8 @@ async function projectObservation(
         sourceUrl: row.sourceLocalAssetId
           ? `/api/site-ops/builds/${row.id}/source`
           : null,
-        qaUrl: row.qaLocalAssetId ? `/api/site-ops/builds/${row.id}/qa` : null,
-        errorCode: publicError.code || null,
-        errorMessage: publicError.message || null,
+        needsHelp:
+          row.status === "failed" || row.status === "attention_required",
         createdAt: row.createdAt.toISOString(),
         updatedAt: row.updatedAt.toISOString(),
       };
@@ -1795,6 +1760,7 @@ async function projectObservation(
       }),
     ),
     resetCapability,
+    rebuildRequest,
     interactionState:
       input.project.status === "draft"
         ? ("select_snapshot" as const)
@@ -1885,9 +1851,18 @@ function translateAliyunConnectionError(error: unknown): never {
       "ACCOUNT_ROLE_MISMATCH",
       "CALLER_ACCOUNT_MISMATCH",
     ].includes(error.code);
+    const authorizationNeeded =
+      publicSiteOpsDomainIssue(error.code, "attention_required") ===
+      "authorization_needed";
     throw new SiteOpsServiceError(
       invalid ? "INVALID_INPUT" : notFound ? "NOT_FOUND" : "STATE_CONFLICT",
-      error.message,
+      error.code === "INVALID_DOMAIN"
+        ? "域名格式不正确，请检查后重试。"
+        : notFound
+          ? "当前项目或连接不存在，请刷新后重试。"
+          : authorizationNeeded
+            ? "阿里云授权尚未完成，请重新前往官方页面完成授权。"
+            : "连接或配置暂未完成，请稍后重试或提交授权协助工单。",
       invalid ? 400 : notFound ? 404 : 409,
     );
   }
@@ -1921,61 +1896,141 @@ export async function getSiteOpsAliyunConnection(
       userId: actor.id,
     });
     return {
-      ...status,
+      configured: status.status === "active",
+      status:
+        status.status === "active"
+          ? ("active" as const)
+          : status.status === "unverified"
+            ? ("authorization_required" as const)
+            : status.status === "invalid"
+              ? ("attention_required" as const)
+              : ("not_connected" as const),
       verifiedAt: status.verifiedAt
         ? new Date(status.verifiedAt).toISOString()
         : null,
+      canRotate: true,
     };
   } catch (error) {
     translateAliyunConnectionError(error);
   }
 }
 
-export async function setupSiteOpsAliyunConnection(
+export async function beginSiteOpsAliyunOAuth(
   actor: AuthenticatedUser,
   value: unknown,
 ) {
-  const input = siteOpsAliyunConnectionSetupInputSchema.parse(value);
+  const input = siteOpsAliyunConnectionInputSchema.parse(value);
   const project = await requireOwnedAliyunProject(actor, input.conversationId);
   try {
-    const result = await setupAliyunCustomerConnection({
+    return await createAliyunOAuthAuthorization({
       projectId: project.id,
       userId: actor.id,
-      accountUid: input.accountUid,
-      roleArn: input.roleArn,
     });
-    const trustedPrincipalArn =
-      process.env.FRONTMIND_ALIYUN_ROLE_PRINCIPAL_ARN?.trim() || null;
+  } catch (error) {
+    translateAliyunConnectionError(error);
+  }
+}
+
+export async function getSiteOpsAliyunAuthorizationGuide(
+  actor: AuthenticatedUser,
+  value: unknown,
+) {
+  const input = siteOpsAliyunConnectionInputSchema.parse(value);
+  const project = await requireOwnedAliyunProject(actor, input.conversationId);
+  try {
+    const [status, broker] = await Promise.all([
+      getAliyunCustomerConnectionStatus({
+        projectId: project.id,
+        userId: actor.id,
+      }),
+      getActiveAliyunBrokerCredential(),
+    ]);
+    const available = Boolean(
+      broker &&
+        status.configured &&
+        status.status !== "revoked" &&
+        status.status !== "active",
+    );
+    const authorization =
+      available && broker
+        ? await getAliyunCustomerRoleAuthorizationPackage({
+            projectId: project.id,
+            userId: actor.id,
+            trustedPrincipalArn: broker.principalArn,
+          })
+        : null;
     return {
-      ...result,
-      trustedPrincipalArn,
-      trustPolicy: trustedPrincipalArn
-        ? {
-            Version: "1",
-            Statement: [
-              {
-                Action: "sts:AssumeRole",
-                Effect: "Allow",
-                Principal: { RAM: [trustedPrincipalArn] },
-                Condition: {
-                  StringEquals: { "sts:ExternalId": result.externalId },
-                },
-              },
-            ],
-          }
-        : null,
-      requiredPermissions: ALIYUN_CUSTOMER_ROLE_PERMISSIONS,
-      permissionPolicy: {
-        Version: "1",
-        Statement: [
-          {
-            Action: Object.values(ALIYUN_CUSTOMER_ROLE_PERMISSIONS).flat(),
-            Effect: "Allow",
-            Resource: ["*"],
-          },
-        ],
-      },
+      available,
+      consoleUrl: available ? "https://ram.console.aliyun.com/roles" : "",
+      configurationDownloadUrl: available
+        ? `/api/site-ops/aliyun/role-configuration?conversationId=${encodeURIComponent(input.conversationId)}`
+        : "",
+      roleName: authorization?.roleName ?? "",
+      trustPolicyText: authorization
+        ? JSON.stringify(authorization.trustPolicyDocument, null, 2)
+        : "",
+      permissionPolicyText: authorization
+        ? JSON.stringify(authorization.permissionPolicyDocument, null, 2)
+        : "",
     };
+  } catch (error) {
+    translateAliyunConnectionError(error);
+  }
+}
+
+export async function completeSiteOpsAliyunOAuth(input: {
+  actor: AuthenticatedUser;
+  projectId: string;
+  accountUid: string;
+}) {
+  assertEnabled();
+  assertCustomer(input.actor);
+  await requireSiteOpsEntitlement(input.actor.id);
+  const db = await requireDb();
+  const rows = await db
+    .select({ id: siteProjects.id })
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.id, z.string().uuid().parse(input.projectId)),
+        eq(siteProjects.userId, input.actor.id),
+      ),
+    )
+    .limit(1);
+  if (!rows[0]) {
+    throw new SiteOpsServiceError("NOT_FOUND", "一站式建站项目不存在。", 404);
+  }
+  try {
+    await bindAliyunCustomerAccountFromOAuth({
+      projectId: input.projectId,
+      userId: input.actor.id,
+      accountUid: input.accountUid,
+    });
+    return { connected: false as const, authorizationRequired: true as const };
+  } catch (error) {
+    translateAliyunConnectionError(error);
+  }
+}
+
+export async function getSiteOpsAliyunRoleConfiguration(
+  actor: AuthenticatedUser,
+  conversationId: string,
+) {
+  const project = await requireOwnedAliyunProject(actor, conversationId);
+  const broker = await getActiveAliyunBrokerCredential();
+  if (!broker) {
+    throw new SiteOpsServiceError(
+      "PROVIDER_NOT_CONFIGURED",
+      "域名与发布平台尚未配置完成。",
+      409,
+    );
+  }
+  try {
+    return await getAliyunCustomerRoleAuthorizationPackage({
+      projectId: project.id,
+      userId: actor.id,
+      trustedPrincipalArn: broker.principalArn,
+    });
   } catch (error) {
     translateAliyunConnectionError(error);
   }
@@ -1988,10 +2043,11 @@ export async function verifySiteOpsAliyunConnection(
   const input = siteOpsAliyunConnectionInputSchema.parse(value);
   const project = await requireOwnedAliyunProject(actor, input.conversationId);
   try {
-    return await verifyAliyunCustomerConnection({
+    await verifyAliyunCustomerConnection({
       projectId: project.id,
       userId: actor.id,
     });
+    return { ok: true as const, connected: true as const };
   } catch (error) {
     translateAliyunConnectionError(error);
   }
@@ -2136,8 +2192,7 @@ export async function sendSiteOpsMessage(
         conversationId: project.conversationId,
         userId: actor.id,
         role: "assistant",
-        content:
-          "已把你明确补充的转化目标、受众或联系方式合并到 SiteBrief；知识库中的既有事实与来源保持不变。准备好后可以开始检索视觉方向。",
+        content: "已记录你补充的信息。资料完整后即可生成视觉候选。",
         turnId,
         siteOps: {
           kind: "brief_question",
@@ -2177,6 +2232,11 @@ export function parseSiteOpsActionPayload(
         .object({ confirmed: z.literal(true) })
         .strict()
         .parse(raw);
+    case "request_rebuild":
+      return z
+        .object({ reason: z.string().trim().max(4_000).optional() })
+        .strict()
+        .parse(raw);
     case "select_snapshot":
     case "change_snapshot":
       return z.object({ knowledgeSnapshotId: uuidSchema }).strict().parse(raw);
@@ -2185,23 +2245,18 @@ export function parseSiteOpsActionPayload(
     case "dns_plan":
       return z.object({}).strict().parse(raw);
     case "select_visual":
-      return z
-        .object({
-          sampleId: uuidSchema,
-          agentProfile: managedAgentProfileSchema,
-        })
-        .strict()
-        .parse(raw);
+      return z.object({ sampleId: uuidSchema }).strict().parse(raw);
     case "delegate_visual":
       // The public observation intentionally does not expose the internal
       // batch id. The server resolves the newest active board for this
       // project and then makes the deterministic highest-score choice.
-      return z
-        .object({ agentProfile: managedAgentProfileSchema })
-        .strict()
-        .parse(raw);
+      return z.object({}).strict().parse(raw);
     case "approve_build":
-      return z.object({ buildId: uuidSchema }).strict().parse(raw);
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "官网制作和检查完成后会自动批准，无需重复操作。",
+        409,
+      );
     case "request_revision":
       return z
         .object({
@@ -2584,6 +2639,102 @@ async function reserveOperation(
     completedAt: input.status === "succeeded" ? new Date() : undefined,
   });
   return id;
+}
+
+async function handleRequestRebuild(
+  tx: any,
+  input: {
+    actor: AuthenticatedUser;
+    project: typeof siteProjects.$inferSelect;
+    entitlement: Awaited<ReturnType<typeof getServicePortal>>;
+    turnId: string;
+    requestId: string;
+    requestHash: string;
+    payload: { reason?: string };
+  },
+) {
+  if (!input.project.currentBuildId) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前还没有可重制的官网版本。",
+      409,
+    );
+  }
+  const now = new Date();
+  let created: { ticketId: string; buildId: string };
+  try {
+    created = await createSiteOpsRebuildTicket(tx, {
+      userId: input.actor.id,
+      projectId: input.project.id,
+      currentBuildId: input.project.currentBuildId,
+      clientRequestId: input.requestId,
+      reason: input.payload.reason,
+      quotaPeriodIds: Array.from(
+        new Set([
+          ...siteOpsQuotaPeriodIds(
+            input.entitlement,
+            "website_content_publish",
+          ),
+          ...siteOpsQuotaPeriodIds(input.entitlement, "content_asset_publish"),
+        ]),
+      ),
+      now,
+    });
+  } catch (error) {
+    if (error instanceof SiteOpsRebuildTicketError) {
+      throw new SiteOpsServiceError(
+        error.code === "DELIVERY_OWNER_NOT_ASSIGNED" ||
+        error.code === "ENTITLEMENT_NOT_FOUND"
+          ? "FORBIDDEN"
+          : "STATE_CONFLICT",
+        error.message,
+        error.code === "DELIVERY_OWNER_NOT_ASSIGNED" ||
+        error.code === "ENTITLEMENT_NOT_FOUND"
+          ? 412
+          : 409,
+      );
+    }
+    throw error;
+  }
+  await reserveOperation(tx, {
+    actor: input.actor,
+    project: input.project,
+    turnId: input.turnId,
+    clientRequestId: input.requestId,
+    requestHash: input.requestHash,
+    payload: {
+      action: "request_rebuild",
+      ticketId: created.ticketId,
+      sourceBuildId: created.buildId,
+    },
+    kind: "brief_message",
+    buildId: created.buildId,
+    status: "succeeded",
+  });
+  await appendMessage(tx, {
+    conversationId: input.project.conversationId,
+    userId: input.actor.id,
+    role: "assistant",
+    turnId: input.turnId,
+    content:
+      "官网重制需求已提交。当前官网保持不变，FrontMind 受理后会在这里开启新版本。",
+    siteOps: {
+      kind: "operation_recovery",
+      subjectId: created.ticketId,
+      revision: input.project.revision + 1,
+      status: "resolved",
+      payload: { rebuildTicketId: created.ticketId, status: "submitted" },
+    },
+  });
+  await tx
+    .update(siteProjects)
+    .set({ revision: input.project.revision + 1, updatedAt: now })
+    .where(
+      and(
+        eq(siteProjects.id, input.project.id),
+        eq(siteProjects.revision, input.project.revision),
+      ),
+    );
 }
 
 async function handleResetWorkflow(
@@ -2991,7 +3142,7 @@ async function handleSelectSnapshot(
     role: "assistant",
     turnId: input.turnId,
     content:
-      "知识库版本已锁定。接下来会基于其中可核验的公司资料整理 SiteBrief；未确认的信息不会被编造成官网事实。",
+      "知识库版本已选择，FrontMind 正在整理建站资料；未确认的信息不会写入官网。",
     siteOps: {
       kind: "brief_question",
       subjectId: input.project.id,
@@ -3030,6 +3181,14 @@ async function handleChangeSnapshot(
       "首次选择知识库请使用当前的知识库选择入口。",
       409,
     );
+  }
+  if (input.project.currentBuildId) {
+    const rebuild = await loadSiteOpsRebuildRequest(tx, {
+      userId: input.actor.id,
+      projectId: input.project.id,
+      currentBuildId: input.project.currentBuildId,
+    });
+    requireAcceptedSiteOpsRebuild(rebuild);
   }
   const activeBuildRows = await tx
     .select({ id: siteBuilds.id })
@@ -3136,8 +3295,7 @@ async function handleChangeSnapshot(
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content:
-      "新的知识库快照已冻结并重新生成 SiteBrief。旧官网版本、源码、预览和线上版本保持不变；完成资料核对与新视觉选择后会创建它的子版本。",
+    content: "已更换知识库并重新整理建站资料。旧官网和线上网站保持不变。",
     siteOps: {
       kind: "brief_question",
       subjectId: input.project.id,
@@ -3179,6 +3337,14 @@ async function handleVisualSearch(
     reselect?: boolean;
   },
 ) {
+  if (input.project.currentBuildId) {
+    const rebuild = await loadSiteOpsRebuildRequest(tx, {
+      userId: input.actor.id,
+      projectId: input.project.id,
+      currentBuildId: input.project.currentBuildId,
+    });
+    requireAcceptedSiteOpsRebuild(rebuild);
+  }
   const allowedStatuses = input.reselect
     ? ["preview_ready", "approved", "live", "failed", "attention_required"]
     : ["collecting_brief"];
@@ -3237,7 +3403,7 @@ async function handleVisualSearch(
     turnId: input.turnId,
     content: input.reselect
       ? "正在重新检索真实视觉参考；当前预览与线上版本会保持不变。"
-      : "正在检索真实视觉参考，完成后会一次展示最多 9 个 A–I 候选。",
+      : "正在生成 9 个视觉候选，完成后会一次展示。",
     siteOps: {
       kind: "build_progress",
       subjectId: operationId,
@@ -3261,13 +3427,13 @@ async function selectVisualSample(
   input: {
     actor: AuthenticatedUser;
     project: typeof siteProjects.$inferSelect;
+    entitlement: Awaited<ReturnType<typeof getServicePortal>>;
     turnId: string;
     requestId: string;
     requestHash: string;
     sampleId?: string;
     batchId?: string;
     delegated: boolean;
-    agentProfile: ManagedAgentProfile;
   },
 ) {
   if (input.project.status !== "awaiting_visual_selection") {
@@ -3399,6 +3565,7 @@ async function selectVisualSample(
   }
   const referenceBlueprint = freezeSiteOpsReferenceBlueprint({
     sampleId: selected.sample.id,
+    previewLocalAssetId: selected.sample.previewLocalAssetId,
     note: selected.sample.note,
     sourceMetadata: selectedMetadataRecord,
   });
@@ -3432,7 +3599,20 @@ async function selectVisualSample(
   );
   const aiCredentialBinding = freezeSiteOpsCustomerAiCredential({
     credential: aiCredential,
-    requestedProfile: input.agentProfile,
+  });
+  const parentBuildId = input.project.currentBuildId;
+  if (parentBuildId) {
+    const rebuild = await loadSiteOpsRebuildRequest(tx, {
+      userId: input.actor.id,
+      projectId: input.project.id,
+      currentBuildId: parentBuildId,
+    });
+    requireAcceptedSiteOpsRebuild(rebuild);
+  }
+  const quotaPeriodId = await reserveSiteOpsDeliveryQuota(tx, {
+    userId: input.actor.id,
+    portal: input.entitlement,
+    quotaPool: "website_content_publish",
   });
   const ordinalRows = await tx
     .select({ ordinal: max(siteBuilds.ordinal) })
@@ -3453,7 +3633,9 @@ async function selectVisualSample(
     id: buildId,
     projectId: input.project.id,
     userId: input.actor.id,
-    parentBuildId: input.project.currentBuildId,
+    parentBuildId,
+    quotaPeriodId,
+    quotaState: "reserved",
     knowledgeSnapshotId: snapshot.id,
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
@@ -3476,13 +3658,14 @@ async function selectVisualSample(
     requestHash: input.requestHash,
     payload: {
       buildId,
+      ...(parentBuildId ? { childBuildId: buildId, parentBuildId } : {}),
       styleSampleId: selected.sample.id,
       delegated: input.delegated,
       workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
       referenceBlueprint,
       ...aiCredentialBinding,
     },
-    kind: "site_build",
+    kind: parentBuildId ? "build_revision" : "site_build",
     buildId,
     provider: "manus",
   });
@@ -3512,7 +3695,7 @@ async function selectVisualSample(
   await tx
     .update(siteProjects)
     .set({
-      currentBuildId: buildId,
+      ...(parentBuildId ? {} : { currentBuildId: buildId }),
       status: "building",
       revision: input.project.revision + 1,
       updatedAt: new Date(),
@@ -3627,10 +3810,16 @@ async function handleRevision(
   if (!parent.styleSampleId) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "当前官网版本缺少可冻结的视觉参考，需重新选择视觉方向。",
+      "当前官网版本缺少可冻结的视觉方案，请提交官网重制需求。",
       409,
     );
   }
+  const rebuild = await loadSiteOpsRebuildRequest(tx, {
+    userId: input.actor.id,
+    projectId: input.project.id,
+    currentBuildId: parent.id,
+  });
+  requireAcceptedSiteOpsRebuild(rebuild);
   const styleRows = await tx
     .select({ sample: websiteStyleSamples })
     .from(websiteStyleSamples)
@@ -3651,12 +3840,13 @@ async function handleRevision(
   if (!styleSample?.previewLocalAssetId || !styleSample.sourceMetadata) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "当前官网版本的视觉证据不完整，需重新选择视觉方向。",
+      "当前官网版本的视觉方案不完整，请提交官网重制需求。",
       409,
     );
   }
   const derivedReferenceBlueprint = freezeSiteOpsReferenceBlueprint({
     sampleId: styleSample.id,
+    previewLocalAssetId: styleSample.previewLocalAssetId,
     note: styleSample.note,
     sourceMetadata: styleSample.sourceMetadata,
   });
@@ -3760,7 +3950,6 @@ async function handleRevision(
   await tx
     .update(siteProjects)
     .set({
-      currentBuildId: buildId,
       status: "building",
       revision: input.project.revision + 1,
       updatedAt: new Date(),
@@ -3822,7 +4011,7 @@ async function handlePublish(
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "域名所有权、DNS 或 TLS 尚未完成验证。",
+      "域名与网站配置尚未完成验证。",
       409,
     );
   }
@@ -4005,7 +4194,7 @@ async function handleRollback(
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content: "已锁定历史 dist 摘要并提交回滚；验证失败时当前线上版本保持不变。",
+    content: "已提交恢复历史官网版本；如验证未完成，当前线上网站不会变化。",
     siteOps: {
       kind: "release_status",
       subjectId: deploymentId,
@@ -4128,7 +4317,7 @@ async function requireAliyunConnection(tx: any, projectId: string) {
   ) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      "阿里云域名适配器尚未配置，未提交任何域名或 DNS 操作。",
+      "域名服务尚未配置完成，请联系 FrontMind。",
       412,
     );
   }
@@ -4193,6 +4382,10 @@ async function handleProviderOperation(
     }
   }
   let referencedQuote: typeof siteDomainOperations.$inferSelect | null = null;
+  let renewalTarget: {
+    expectedCanonicalHostname: string;
+    expectedDomainRevision: number;
+  } | null = null;
   if (
     input.action === "domain_confirm_purchase" ||
     input.action === "domain_confirm_renewal"
@@ -4238,6 +4431,52 @@ async function handleProviderOperation(
         409,
       );
     }
+    if (input.action === "domain_confirm_renewal") {
+      const profileRows = await tx
+        .select({
+          domain: workspaceSiteProfiles.normalizedAsciiDomain,
+          revision: workspaceSiteProfiles.domainRevision,
+        })
+        .from(workspaceSiteProfiles)
+        .where(eq(workspaceSiteProfiles.userId, input.actor.id))
+        .limit(1)
+        .for("update");
+      const profile = profileRows[0];
+      if (!profile?.domain || profile.domain !== input.payload.domain) {
+        throw new SiteOpsServiceError(
+          "STATE_CONFLICT",
+          "当前官网域名已经变化，请重新获取续费报价。",
+          409,
+        );
+      }
+      renewalTarget = {
+        expectedCanonicalHostname: profile.domain,
+        expectedDomainRevision: profile.revision,
+      };
+    }
+  }
+  if (input.action === "domain_set_auto_renew") {
+    const profileRows = await tx
+      .select({
+        domain: workspaceSiteProfiles.normalizedAsciiDomain,
+        revision: workspaceSiteProfiles.domainRevision,
+      })
+      .from(workspaceSiteProfiles)
+      .where(eq(workspaceSiteProfiles.userId, input.actor.id))
+      .limit(1)
+      .for("update");
+    const profile = profileRows[0];
+    if (!profile?.domain || profile.domain !== input.payload.domain) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "当前官网域名已经变化，请刷新后重新确认自动续费设置。",
+        409,
+      );
+    }
+    renewalTarget = {
+      expectedCanonicalHostname: profile.domain,
+      expectedDomainRevision: profile.revision,
+    };
   }
   if (input.action === "dns_apply") {
     const planOperationId = String(input.payload.planOperationId ?? "");
@@ -4284,7 +4523,7 @@ async function handleProviderOperation(
     ) {
       throw new SiteOpsServiceError(
         "STATE_CONFLICT",
-        "DNS 应用必须引用当前项目同一域名版本的可执行精确计划，请重新规划。",
+        "当前域名配置已变化，请重新获取配置方案。",
         409,
       );
     }
@@ -4329,9 +4568,25 @@ async function handleProviderOperation(
     }
   }
   const domainLedgerId = input.action.startsWith("dns_") ? null : randomUUID();
+  const brokerCredential = esaDnsPreparation
+    ? null
+    : await getActiveAliyunBrokerCredential();
+  if (!esaDnsPreparation && !brokerCredential) {
+    throw new SiteOpsServiceError(
+      "PROVIDER_NOT_CONFIGURED",
+      "域名与发布平台尚未配置完成，未提交任何域名或解析操作。",
+      412,
+    );
+  }
   const providerPayload = {
     ...(esaDnsPreparation ?? input.payload),
     connectionId: connection.id,
+    ...(brokerCredential
+      ? {
+          brokerCredentialId: brokerCredential.id,
+          brokerCredentialVersion: brokerCredential.version,
+        }
+      : {}),
     ...(input.action === "domain_sync" ? { domainIntent: "sync" } : {}),
     ...(!esaDnsPreparation && input.action.startsWith("dns_")
       ? {
@@ -4344,6 +4599,7 @@ async function handleProviderOperation(
         }
       : {}),
     ...(domainLedgerId ? { domainLedgerId } : {}),
+    ...(renewalTarget ?? {}),
   };
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
@@ -4422,8 +4678,7 @@ async function handleProviderOperation(
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content:
-      "操作已按请求指纹锁定，worker 只会提交一次并在结果不确定时转为查询对账。",
+    content: "操作已安全提交，FrontMind 会自动确认结果，避免重复执行。",
     siteOps: {
       kind: input.action.startsWith("dns_") ? "domain_status" : "domain_status",
       subjectId: operationId,
@@ -4548,6 +4803,12 @@ export async function actOnSiteOps(
           providerTaskPreflight,
         });
         break;
+      case "request_rebuild":
+        await handleRequestRebuild(tx, {
+          ...common,
+          payload: payload as { reason?: string },
+        });
+        break;
       case "select_snapshot":
         await handleSelectSnapshot(tx, {
           ...common,
@@ -4575,14 +4836,12 @@ export async function actOnSiteOps(
           ...common,
           sampleId: String(payload.sampleId),
           delegated: false,
-          agentProfile: payload.agentProfile as ManagedAgentProfile,
         });
         break;
       case "delegate_visual":
         await selectVisualSample(tx, {
           ...common,
           delegated: true,
-          agentProfile: payload.agentProfile as ManagedAgentProfile,
         });
         break;
       case "approve_build":

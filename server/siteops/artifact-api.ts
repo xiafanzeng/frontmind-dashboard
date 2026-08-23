@@ -13,6 +13,11 @@ import {
 } from "../../drizzle/schema";
 import { getDb } from "../db";
 import { readSiteOpsArtifact } from "./artifact-store";
+import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
+import {
+  completeSiteOpsAliyunOAuth,
+  getSiteOpsAliyunRoleConfiguration,
+} from "./service";
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -21,10 +26,19 @@ function notFound(res: express.Response) {
   res.status(404).json({ error: "NOT_FOUND" });
 }
 
+export function publicSiteOpsArtifactError(error: unknown) {
+  const code = error instanceof Error ? error.message : "";
+  return code === "NOT_FOUND"
+    ? { status: 404, body: { error: "NOT_FOUND" } }
+    : {
+        status: 409,
+        body: { error: "文件暂时无法打开，请稍后重试。" },
+      };
+}
+
 function sendError(res: express.Response, error: unknown) {
-  const code = error instanceof Error ? error.message : "SITEOPS_FILE_ERROR";
-  if (code === "NOT_FOUND") return notFound(res);
-  res.status(409).json({ error: code.slice(0, 128) });
+  const projected = publicSiteOpsArtifactError(error);
+  res.status(projected.status).json(projected.body);
 }
 
 async function requireDb() {
@@ -212,6 +226,66 @@ async function sendOwnedAsset(input: {
 }
 
 export const siteOpsArtifactApi = express.Router();
+
+siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
+  const actor = req.frontmindUser;
+  const code = typeof req.query.code === "string" ? req.query.code : null;
+  const state = typeof req.query.state === "string" ? req.query.state : null;
+  if (!actor || !code || !state) {
+    res.redirect(302, "/?siteOpsAliyun=authorization_failed");
+    return;
+  }
+  try {
+    const identity = await exchangeAliyunOAuthCode({
+      code,
+      state,
+      userId: actor.id,
+    });
+    await completeSiteOpsAliyunOAuth({
+      actor,
+      projectId: identity.projectId,
+      accountUid: identity.accountUid,
+    });
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.redirect(302, "/?siteOpsAliyun=authorization_required");
+  } catch (error) {
+    console.error("[SiteOps Aliyun OAuth] callback_failed", {
+      event: "siteops_aliyun_oauth_callback_failed",
+      userId: actor.id,
+      errorClass: error instanceof Error ? error.name : "UnknownError",
+    });
+    res.redirect(302, "/?siteOpsAliyun=authorization_failed");
+  }
+});
+
+siteOpsArtifactApi.get("/aliyun/role-configuration", async (req, res) => {
+  try {
+    const actor = req.frontmindUser;
+    const conversationId =
+      typeof req.query.conversationId === "string"
+        ? req.query.conversationId.trim()
+        : "";
+    if (!actor || conversationId.length < 1 || conversationId.length > 191) {
+      return notFound(res);
+    }
+    const configuration = await getSiteOpsAliyunRoleConfiguration(
+      actor,
+      conversationId,
+    );
+    const bytes = Buffer.from(JSON.stringify(configuration, null, 2), "utf8");
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=frontmind-aliyun-role-configuration.json",
+    );
+    res.setHeader("Content-Length", String(bytes.length));
+    res.send(bytes);
+  } catch {
+    notFound(res);
+  }
+});
 
 siteOpsArtifactApi.get("/style-previews/:sampleId", async (req, res) => {
   try {

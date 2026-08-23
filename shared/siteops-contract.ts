@@ -5,10 +5,6 @@ import {
   siteOpsCardSchema,
   siteOpsProjectStatusSchema,
 } from "./siteops";
-import { managedAgentProfileSchema } from "./manus-agent-profile";
-
-export type SiteOpsAgentProfile = z.infer<typeof managedAgentProfileSchema>;
-
 export const siteOpsKnowledgeSnapshotSchema = z
   .object({
     id: z.string().uuid(),
@@ -57,16 +53,20 @@ export const siteOpsVisualCandidateProjectionSchema = z
     title: z.string().trim().min(1).max(255),
     previewUrl: z.string().min(1).max(2_048),
     note: z.string().trim().max(2_000).nullable().default(null),
-    score: z.number().finite().min(0).max(100),
-    heroVariant: z
+    visualFamily: z
       .enum([
-        "centered_statement",
+        "floating_orbit",
         "split_media",
-        "editorial_modular",
+        "editorial",
+        "bento",
+        "feature_grid",
+        "centered_dual_cta",
         "immersive_visual",
+        "product_stage",
+        "full_bleed_statement",
       ])
-      .optional(),
-    heroConfidence: z.enum(["explicit", "strong", "conditional"]).optional(),
+      .nullable()
+      .default(null),
     selected: z.boolean().default(false),
   })
   .strict();
@@ -76,14 +76,10 @@ export const siteOpsBuildProjectionSchema = z
     id: z.string().uuid(),
     ordinal: z.number().int().positive(),
     parentBuildId: z.string().uuid().nullable(),
-    agentProfile: managedAgentProfileSchema.nullable().optional(),
-    renderer: z.enum(["astro_static", "react_static"]).optional(),
     status: siteOpsBuildStatusSchema,
     previewUrl: z.string().max(2_048).nullable().default(null),
     sourceUrl: z.string().max(2_048).nullable().default(null),
-    qaUrl: z.string().max(2_048).nullable().default(null),
-    errorCode: z.string().max(128).nullable().default(null),
-    errorMessage: z.string().max(4_000).nullable().default(null),
+    needsHelp: z.boolean().default(false),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
@@ -129,13 +125,13 @@ export const siteOpsSocialPackageProjectionSchema = z
 export const siteOpsAliyunConnectionProjectionSchema = z
   .object({
     configured: z.boolean(),
-    accountUid: z.string().max(128).nullable(),
-    roleArn: z.string().max(512).nullable(),
-    externalIdFingerprint: z.string().max(32).nullable(),
-    status: z.enum(["unverified", "active", "invalid", "revoked"]).nullable(),
-    capabilities: z.array(z.string().max(64)).max(20),
+    status: z.enum([
+      "not_connected",
+      "authorization_required",
+      "active",
+      "attention_required",
+    ]),
     verifiedAt: z.string().datetime().nullable(),
-    lastErrorCode: z.string().max(128).nullable(),
     canRotate: z.boolean().default(true),
   })
   .strict();
@@ -146,7 +142,6 @@ export const siteOpsDomainStateProjectionSchema = z
     displayDomain: z.string().max(255).nullable(),
     revision: z.number().int().positive(),
     registrar: z.string().max(64).nullable(),
-    providerAccountUid: z.string().max(128).nullable(),
     expiresAt: z.string().datetime().nullable(),
     realNameStatus: z.string().max(64).nullable(),
     emailStatus: z.string().max(64).nullable(),
@@ -224,47 +219,26 @@ export const siteOpsDomainOperationProjectionSchema = z
           .strict(),
       )
       .max(100),
-    errorCode: z.string().max(128).nullable(),
-    errorMessage: z.string().max(2_000).nullable(),
+    issue: z
+      .enum([
+        "quote_changed",
+        "authorization_needed",
+        "payment_required",
+        "identity_required",
+        "service_unavailable",
+        "needs_help",
+      ])
+      .nullable(),
     createdAt: z.string().datetime(),
   })
   .strict();
 
 export const siteOpsDnsPlanProjectionSchema = z
   .object({
-    operationId: z.string().uuid(),
-    domain: z.string().max(255),
-    domainRevision: z.number().int().positive(),
-    planHash: z.string().regex(/^[a-f0-9]{64}$/),
-    providerSnapshotHash: z.string().regex(/^[a-f0-9]{64}$/),
     canApply: z.boolean(),
     status: z.enum(["succeeded", "attention_required"]),
-    items: z
-      .array(
-        z
-          .object({
-            id: z.string().max(191),
-            action: z.enum([
-              "create",
-              "update",
-              "adopt",
-              "verify",
-              "rollback_update",
-              "rollback_delete",
-              "conflict",
-              "unknown",
-            ]),
-            rr: z.string().max(255),
-            type: z.string().max(16),
-            expectedValue: z.string().max(2_048),
-            expectedTtl: z.number().int().positive(),
-            currentValue: z.string().max(2_048).nullable(),
-            currentTtl: z.number().int().positive().nullable(),
-            reason: z.string().max(2_000).nullable(),
-          })
-          .strict(),
-      )
-      .max(100),
+    changeCount: z.number().int().nonnegative(),
+    conflictCount: z.number().int().nonnegative(),
     createdAt: z.string().datetime(),
   })
   .strict();
@@ -287,9 +261,9 @@ export const siteOpsObservationV1Schema = z
   .object({
     schemaVersion: z.literal(1).default(1),
     executionKind: z.literal("site_ops"),
-    providerState: z
+    serviceReadiness: z
       .object({
-        twentyFirst: z
+        visuals: z
           .object({
             status: z.enum([
               "configured",
@@ -299,7 +273,7 @@ export const siteOpsObservationV1Schema = z
             reason: z.string().max(1_000).optional(),
           })
           .strict(),
-        aiBuilder: z
+        website: z
           .object({
             status: z.enum([
               "configured",
@@ -309,7 +283,7 @@ export const siteOpsObservationV1Schema = z
             reason: z.string().max(1_000).optional(),
           })
           .strict(),
-        esa: z
+        publishing: z
           .object({
             status: z.enum([
               "configured",
@@ -319,7 +293,7 @@ export const siteOpsObservationV1Schema = z
             reason: z.string().max(1_000).optional(),
           })
           .strict(),
-        aliyun: z
+        domain: z
           .object({
             status: z.enum([
               "configured",
@@ -362,6 +336,23 @@ export const siteOpsObservationV1Schema = z
       .object({
         allowed: z.boolean(),
         reason: z.string().trim().min(1).max(1_000).optional(),
+      })
+      .strict(),
+    rebuildRequest: z
+      .object({
+        allowed: z.boolean(),
+        ticketId: z.string().uuid().nullable(),
+        status: z
+          .enum([
+            "submitted",
+            "needs_information",
+            "scheduled",
+            "in_progress",
+            "completed",
+            "rejected",
+            "cancelled",
+          ])
+          .nullable(),
       })
       .strict(),
     interactionState: siteOpsInteractionStateSchema,

@@ -151,6 +151,7 @@ describe("delivery ticket contract", () => {
       "website_style_samples",
       "website_build",
       "site_check",
+      "site_rebuild",
     ]);
     expect(WEBSITE_MANAGEMENT_HISTORY_CATEGORIES).not.toContain(
       "question_catalog" as any,

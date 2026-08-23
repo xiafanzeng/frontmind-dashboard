@@ -766,11 +766,10 @@ export default function AiWebsiteManagementWorkspace({
         data-workflow="site-ops"
       >
         <header className="ai-website-header">
-          <p className="ai-website-eyebrow">知识库驱动 · 对话式 SiteOps</p>
-          <h1 id="ai-website-title">AI 友好官网管理</h1>
+          <p className="ai-website-eyebrow">企业知识库驱动</p>
+          <h1 id="ai-website-title">一站式建站</h1>
           <p className="ai-website-intro">
-            先选择知识库 ZIP 版本和视觉方向，即可生成、检查并预览官网；域名与
-            ICP 只在对应地区正式发布时校验。
+            选择企业知识库和视觉方案，即可完成官网制作、预览、域名配置与发布。
           </p>
         </header>
         {siteOpsPanel || (
@@ -789,7 +788,7 @@ export default function AiWebsiteManagementWorkspace({
     >
       <header className="ai-website-header">
         <p className="ai-website-eyebrow">AI 友好内容资产</p>
-        <h1 id="ai-website-title">AI 友好官网管理</h1>
+        <h1 id="ai-website-title">一站式建站</h1>
         <p className="ai-website-intro">
           {overseasAccount
             ? "先注册企业实名域名，再回到这里提交域名创建 AI 运维需求。香港或海外节点无需办理工信部 ICP 备案。"

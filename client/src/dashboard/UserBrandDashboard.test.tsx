@@ -193,7 +193,7 @@ describe("UserBrandDashboard service experience", () => {
       "问题监控",
       "进度报告",
       "内容资产运营",
-      "AI 友好官网管理",
+      "一站式建站",
     ]) {
       expect(screen.getByRole("button", { name: item })).toBeInTheDocument();
     }
@@ -250,7 +250,7 @@ describe("UserBrandDashboard service experience", () => {
       name: "内容资产运营",
     });
     const websiteManagement = screen.getByRole("button", {
-      name: "AI 友好官网管理",
+      name: "一站式建站",
     });
     expect(knowledgeAgent.querySelector("svg")).toBeInTheDocument();
     expect(globalKeywords.querySelector("svg")).toBeInTheDocument();
@@ -371,7 +371,7 @@ describe("UserBrandDashboard service experience", () => {
     expect(screen.getByText("剩余 1 次")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
     expect(
       screen.getByRole("region", { name: "官网运营功能未开放" }),
     ).toBeInTheDocument();
@@ -381,10 +381,10 @@ describe("UserBrandDashboard service experience", () => {
     setPreviewPlan("luxury");
     render(<UserBrandDashboard preview />);
 
-    fireEvent.click(screen.getByRole("button", { name: "AI 友好官网管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
 
     expect(
-      screen.getByRole("heading", { name: "AI 友好官网管理" }),
+      screen.getByRole("heading", { name: "一站式建站" }),
     ).toBeInTheDocument();
     expect(screen.getByText("官网开通进度")).toBeInTheDocument();
     expect(
@@ -1080,7 +1080,7 @@ describe("UserBrandDashboard service experience", () => {
         "问题监控",
         "进度报告",
         "内容资产运营",
-        "AI 友好官网管理",
+        "一站式建站",
       ]) {
         const navigationItem = screen.getByRole("button", { name: item });
         expect(navigationItem).not.toBeDisabled();

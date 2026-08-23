@@ -1322,6 +1322,21 @@ describe("delivery execution authorization and settlement", () => {
     ).not.toThrow();
   });
 
+  it("reserves rebuild completion for the successful child build", () => {
+    expect(() =>
+      assertGenericDeliveryTicketTransition({
+        operation: "site_rebuild",
+        nextStatus: "completed",
+      }),
+    ).toThrow("新版本完成后由系统自动关闭");
+    expect(() =>
+      assertGenericDeliveryTicketTransition({
+        operation: "site_rebuild",
+        nextStatus: "in_progress",
+      }),
+    ).not.toThrow();
+  });
+
   it("keeps website build recoverable instead of allowing terminal rejection", () => {
     for (const nextStatus of ["rejected", "cancelled"] as const) {
       expect(() =>

@@ -17,7 +17,10 @@ vi.mock("./artifact-store", () => ({
   readSiteOpsArtifact: mocks.readSiteOpsArtifact,
 }));
 
-import { siteOpsArtifactApi } from "./artifact-api";
+import {
+  publicSiteOpsArtifactError,
+  siteOpsArtifactApi,
+} from "./artifact-api";
 
 const servers: Server[] = [];
 let distZip: Buffer;
@@ -107,6 +110,21 @@ async function startApp() {
 }
 
 describe("SiteOps private preview proxy", () => {
+  it("never projects internal artifact codes to a customer response", () => {
+    expect(
+      publicSiteOpsArtifactError(
+        new Error("SITEOPS_PREVIEW_PATH_INVALID:/private/storage"),
+      ),
+    ).toEqual({
+      status: 409,
+      body: { error: "文件暂时无法打开，请稍后重试。" },
+    });
+    expect(publicSiteOpsArtifactError(new Error("NOT_FOUND"))).toEqual({
+      status: 404,
+      body: { error: "NOT_FOUND" },
+    });
+  });
+
   it("keeps HTML, CSS, favicon and internal navigation under the authenticated preview prefix", async () => {
     const origin = await startApp();
     const prefix = `/api/site-ops/builds/${buildId}/preview/`;

@@ -2,10 +2,69 @@ import type { SiteOpsProviderResult } from "./providers";
 
 const VENDOR_NAME = /manus/iu;
 const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
+const INFRASTRUCTURE_TERM =
+  /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu;
 
 export function sanitizeFrontMindPublicText(value: string) {
-  if (!VENDOR_NAME.test(value)) return value;
-  return "FrontMind AI 建站任务未能完成，请根据错误码重置后重新开始。";
+  if (VENDOR_NAME.test(value)) {
+    return "FrontMind AI 建站任务未能完成，请提交工单获取协助。";
+  }
+  if (
+    /(?:API\s*Key|frontmind-(?:base|pro)|\bBase\b|\bPro\b|已随官网版本锁定|个人(?:建站)?凭据)/iu.test(
+      value,
+    )
+  ) {
+    return /(?:未配置|不可用|失效|缺少|尚未)/u.test(value)
+      ? "AI 建站服务尚未就绪，请联系 FrontMind。"
+      : "FrontMind 已准备好官网制作服务。";
+  }
+  const sanitized = value
+    .replace(/21st/giu, "视觉候选服务")
+    .replace(/SiteOps/giu, "一站式建站")
+    .replace(/(?:原生\s*)?Astro/giu, "官网")
+    .replace(/React(?:\s*静态)?/giu, "官网")
+    .replace(/API\s*Key/giu, "服务配置")
+    .replace(/frontmind-(?:base|pro)/giu, "建站模式")
+    .replace(/\b(?:Base|Pro)\b/giu, "建站模式")
+    .replace(/A[–-]I\s*(?:候选|视觉方向)?/giu, "9 个视觉候选");
+  if (!INFRASTRUCTURE_TERM.test(sanitized)) return sanitized;
+  if (/(?:成功|完成|已在线|已上线|active|succeeded|verified)/iu.test(sanitized)) {
+    return "FrontMind 已完成当前网站配置。";
+  }
+  if (/(?:等待|正在|传播|验证中|pending|running|verifying|reconciling)/iu.test(sanitized)) {
+    return "FrontMind 正在自动完成网站配置，请稍后查看。";
+  }
+  return "FrontMind 暂未完成网站配置，请稍后重试或提交工单获取协助。";
+}
+
+export type SiteOpsCustomerDomainIssue =
+  | "quote_changed"
+  | "authorization_needed"
+  | "payment_required"
+  | "identity_required"
+  | "service_unavailable"
+  | "needs_help";
+
+export function publicSiteOpsDomainIssue(
+  code: string | null | undefined,
+  status: string | null | undefined,
+): SiteOpsCustomerDomainIssue | null {
+  const normalized = String(code ?? "").toUpperCase();
+  if (!normalized && !["failed", "attention_required", "outcome_unknown"].includes(String(status))) {
+    return null;
+  }
+  if (/(?:QUOTE|PRICE|EXPIRED)/u.test(normalized)) return "quote_changed";
+  if (/(?:AUTH|PERMISSION|ROLE|CALLER|ACCOUNT|CREDENTIAL)/u.test(normalized)) {
+    return "authorization_needed";
+  }
+  if (/(?:BALANCE|PAYMENT|FUNDS|CREDIT)/u.test(normalized)) return "payment_required";
+  if (/(?:REGISTRANT|REAL_NAME|IDENTITY|EMAIL)/u.test(normalized)) {
+    return "identity_required";
+  }
+  if (String(status) === "outcome_unknown" || /(?:TIMEOUT|UNAVAILABLE|THROTTL|RATE_LIMIT)/u.test(normalized)) {
+    return "service_unavailable";
+  }
+  return "needs_help";
 }
 
 export function publicSiteOpsErrorProjection(input: {
@@ -102,6 +161,19 @@ export function publicSiteOpsErrorProjection(input: {
     code: "FRONTMIND_BUILD_SERVICE_UNAVAILABLE",
     message: "FrontMind AI 建站服务暂时不可用，请稍后重试。",
   };
+}
+
+export function publicSiteOpsMessageText(input: {
+  content: string;
+  errorCode?: string | null;
+}) {
+  const projected = input.errorCode
+    ? publicSiteOpsErrorProjection({
+        code: input.errorCode,
+        message: input.content,
+      }).message || input.content
+    : input.content;
+  return sanitizeFrontMindPublicText(projected);
 }
 
 export function publicSiteOpsProviderResult(

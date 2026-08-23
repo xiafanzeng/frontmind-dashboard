@@ -85,6 +85,7 @@ vi.mock("lighthouse", () => ({
 
 import {
   SITEOPS_MATERIALIZER_V1_6,
+  SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import {
@@ -416,6 +417,48 @@ async function legacyAstroV1_6Source() {
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+async function legacyReactV2_0Source() {
+  const input = buildInput();
+  const frozen = siteOpsFrozenRuntimeInputSchema.parse({
+    schemaVersion: 2,
+    build: {
+      ...input.build,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_0.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_0.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_0.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_0.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_0.starterVersion,
+    },
+    host: {
+      starterSha256: SITEOPS_MATERIALIZER_V2_0.starterSha256,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_0.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_0.materializerVersion,
+      materializerSha256: SITEOPS_MATERIALIZER_V2_0.materializerSha256,
+      renderer: "react_static_v1",
+    },
+    snapshot: {
+      id: input.snapshot.id,
+      userId: input.snapshot.userId,
+      archiveHash: input.snapshot.archiveHash,
+      sourceBuildId: input.snapshot.sourceBuildId,
+      sourceBuildRevision: input.snapshot.sourceBuildRevision,
+      sourceDocumentIds: input.snapshot.documents.map(
+        (document) => document.id,
+      ),
+    },
+    brief: input.brief,
+    visual: input.visual,
+    designSpec: input.designSpec,
+    generatedContent: input.generatedContent,
+    assetDecisions: [],
+    brandAsset: null,
+  });
+  const zip = new JSZip();
+  zip.file("frontmind-runtime-input.json", `${JSON.stringify(frozen)}\n`);
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
 describe("SiteOps trusted React 19 static runtime", () => {
   let previewBuild: Awaited<ReturnType<typeof materializeAstroSite>>;
   let officialLogo: Buffer;
@@ -514,8 +557,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       renderer: {
         kind: "react_static_v1",
         reactVersion: "19.2.1",
-        componentLibraryVersion: "2.0.0",
-        materializerVersion: "2.0.0",
+        componentLibraryVersion: "2.1.0",
+        materializerVersion: "2.1.0",
       },
       referenceBlueprint: {
         providerItemKey: "n:8435",
@@ -598,6 +641,9 @@ describe("SiteOps trusted React 19 static runtime", () => {
     expect(home).not.toContain('rel="canonical"');
     expect(home).not.toMatch(/<script\b/iu);
     expect(home).not.toMatch(/<div\s+id=["']root["'][^>]*>\s*<\/div>/iu);
+    expect(home).not.toContain("知识来源");
+    expect(home).not.toContain("内容依据已确认");
+    expect(home).not.toContain("source-note");
     expect(Object.keys(dist.files)).not.toContain(
       expect.stringMatching(/\.(?:m?js)$/u),
     );
@@ -928,6 +974,34 @@ describe("SiteOps trusted React 19 static runtime", () => {
     );
   }, 90_000);
 
+  it("keeps historical 2.0 source bundles on their frozen React coordinates", async () => {
+    const sourceZip = await legacyReactV2_0Source();
+    const rebuilt = await materializeProductionSiteFromSource({
+      sourceZip,
+      expectedSourceSha256: H(sourceZip),
+      canonicalOrigin: "https://react20.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    const contract = JSON.parse(rebuilt.contractJson.toString("utf8"));
+    expect(contract).toMatchObject({
+      schemaVersion: 3,
+      workflow: {
+        version: "2.0.0",
+        componentLibraryVersion: "2.0.0",
+        materializerVersion: "2.0.0",
+      },
+      renderer: {
+        kind: "react_static_v1",
+        componentLibraryVersion: "2.0.0",
+        materializerVersion: "2.0.0",
+      },
+    });
+    const dist = await JSZip.loadAsync(rebuilt.distZip, { checkCRC32: true });
+    expect(await dist.file("index.html")!.async("string")).toContain(
+      'rel="canonical" href="https://react20.xinghe.example/"',
+    );
+  }, 90_000);
+
   it("stops production materialization when the deployment signal is aborted", async () => {
     const controller = new AbortController();
     controller.abort();
@@ -1052,8 +1126,11 @@ describe("SiteOps strict social packages", () => {
         sha256: preview.sha256,
       });
     }
-    expect(await zip.file("article.md")!.async("string")).toContain(
-      "来源：overview",
+    const article = await zip.file("article.md")!.async("string");
+    expect(article).not.toContain("来源：");
+    expect(article).not.toContain("内容依据企业知识库");
+    expect(await zip.file("sources.json")!.async("string")).toContain(
+      '"sourceDocumentIds"',
     );
   }, 90_000);
 
@@ -1080,6 +1157,11 @@ describe("SiteOps strict social packages", () => {
         format: "png",
       });
     }
+    const postCopy = await zip.file("post-copy.md")!.async("string");
+    expect(postCopy).not.toContain("内容依据企业知识库");
+    expect(await zip.file("sources.json")!.async("string")).toContain(
+      '"sourceDocumentIds"',
+    );
   }, 90_000);
 
   it("rejects unknown source mappings and a non-nine-page Xiaohongshu input", async () => {

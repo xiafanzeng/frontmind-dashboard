@@ -1,20 +1,55 @@
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { chromium } from "playwright";
+
+import type { SiteBrief } from "../../shared/siteops";
+import type {
+  ReferenceBlueprintV3,
+  TrustedVisualPreviewBlueprintV3,
+} from "../../shared/siteops-design";
+
 export const REACT_STATIC_RENDERER = "react_static_v1" as const;
-export const REACT_STATIC_COMPONENT_LIBRARY_VERSION = "2.0.0" as const;
-export const REACT_STATIC_MATERIALIZER_VERSION = "2.0.0" as const;
+export const REACT_STATIC_COMPONENT_LIBRARY_VERSION = "2.1.0" as const;
+export const REACT_STATIC_MATERIALIZER_VERSION = "2.1.0" as const;
 export const REACT_STATIC_REACT_VERSION = "19.2.1" as const;
+const VISUAL_PREVIEW_RENDER_BUDGET_MS = 75_000;
+const VISUAL_PREVIEW_BROWSER_LAUNCH_TIMEOUT_MS = 20_000;
+
+function abortReason(signal: AbortSignal) {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Aborted", "AbortError");
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal) {
+  if (signal.aborted) return Promise.reject<T>(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 export const REACT_STATIC_HERO_FAMILIES = [
   "floating_orbit",
-  "feature_grid",
-  "bento",
   "split_media",
   "editorial",
+  "bento",
+  "feature_grid",
   "centered_dual_cta",
   "immersive_visual",
   "product_stage",
-  "proof_grid",
   "full_bleed_statement",
-] as const;
+] as const satisfies readonly ReferenceBlueprintV3["heroFamily"][];
 
 /**
  * This is the complete, host-owned component library placed in every trusted
@@ -267,9 +302,7 @@ const HERO_COMPONENTS = Object.freeze({
   full_bleed_statement: FullBleedStatementHero
 });
 
-function SourceNote({ ids }) {
-  return h("p", { className: "source-note" }, "知识来源：", ids.join("、"));
-}
+function SourceNote() { return null; }
 
 function Paragraphs({ values, className }) {
   return h("div", { className: className || "section-prose" }, ...values.map((value, index) => h("p", { key: index }, value)));
@@ -318,7 +351,7 @@ function SiteHeader({ site }) {
 }
 
 function SiteFooter({ site }) {
-  return h("footer", { className: "site-footer" }, h("div", { className: "shell footer-row" }, h("strong", null, site.companyName), h("span", null, "内容依据已确认的企业知识库生成")));
+  return h("footer", { className: "site-footer" }, h("div", { className: "shell footer-row" }, h("strong", null, site.companyName)));
 }
 
 function SitePage({ page }) {
@@ -424,3 +457,299 @@ const notFound = await json(manifest.notFound.dataPath);
 await emit(manifest.notFound.outputPath, React.createElement(NotFoundDocument, { site, page: notFound }));
 process.stdout.write(JSON.stringify({ renderer: "react_static_v1", routes: manifest.routes.length, htmlFiles: manifest.routes.length + 1 }) + "\n");
 `;
+
+type TrustedVisualPreviewBlueprint = TrustedVisualPreviewBlueprintV3;
+
+const PREVIEW_CSS = String.raw`
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--canvas);color:var(--ink)}body.type-system--editorial_serif{font-family:Georgia,"Times New Roman",serif}body.type-system--technical_sans{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}body.type-system--humanist_sans{font-family:"Trebuchet MS",ui-sans-serif,system-ui,sans-serif}.frame{position:relative;width:1200px;height:900px;overflow:hidden;background:var(--canvas)}.radius--none{--radius:0px}.radius--soft{--radius:8px}.radius--rounded{--radius:22px}.radius--pill{--radius:999px}.frame:before{pointer-events:none;position:absolute;inset:0;z-index:0}.decoration--grid:before{content:"";background-image:linear-gradient(color-mix(in srgb,var(--ink) 8%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in srgb,var(--ink) 8%,transparent) 1px,transparent 1px);background-size:46px 46px}.decoration--editorial_lines:before{content:"";left:68px;right:68px;border-inline:1px solid color-mix(in srgb,var(--ink) 12%,transparent)}.decoration--glow:before{content:"";background:radial-gradient(circle at 78% 18%,color-mix(in srgb,var(--accent) 32%,transparent),transparent 34%)}.decoration--orbital:before{content:"";width:520px;height:520px;left:auto;right:-180px;top:120px;border:1px solid color-mix(in srgb,var(--accent) 32%,transparent);border-radius:50%}.nav{height:82px;display:flex;align-items:center;justify-content:space-between;padding:0 68px;border-bottom:1px solid color-mix(in srgb,var(--ink) 16%,transparent);position:relative;z-index:5}.brand{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:-.03em}.brand-mark{width:32px;height:32px;border-radius:10px;background:var(--accent);display:grid;place-items:center;color:var(--canvas)}.links{display:flex;gap:26px;font-size:14px}.hero{position:relative;height:818px;padding:74px 68px}.density--compact .hero{padding-top:48px;padding-bottom:48px}.density--spacious .hero{padding-top:92px;padding-bottom:92px}.eyebrow{font-size:13px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}h1{font-size:76px;line-height:.94;letter-spacing:-.065em;margin:18px 0 24px;max-width:850px}p{font-size:20px;line-height:1.55;max-width:660px;margin:0}.actions{display:flex;gap:12px;margin-top:34px}.button{padding:14px 22px;border-radius:999px;border:1px solid currentColor;font-weight:750}.button.primary{background:var(--ink);color:var(--canvas)}.floating_orbit .copy,.centered_dual_cta .copy{text-align:center;margin:auto}.floating_orbit h1,.floating_orbit p,.centered_dual_cta h1,.centered_dual_cta p{margin-left:auto;margin-right:auto}.floating_orbit .actions,.centered_dual_cta .actions{justify-content:center}.orbit{position:absolute;border:1px solid color-mix(in srgb,var(--ink) 28%,transparent);border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--canvas) 82%,var(--accent));font-size:30px}.o1{width:160px;height:160px;left:55px;top:135px}.o2{width:120px;height:120px;right:95px;top:90px}.o3{width:190px;height:190px;right:55px;bottom:70px}.o4{width:108px;height:108px;left:145px;bottom:110px}.split_media{display:grid;grid-template-columns:1.08fr .92fr;gap:58px;align-items:center}.split-visual{height:610px;border-radius:var(--radius);background:linear-gradient(145deg,var(--ink),var(--accent));position:relative;overflow:hidden}.split-visual:before,.split-visual:after{content:"";position:absolute;border:1px solid color-mix(in srgb,var(--canvas) 65%,transparent);border-radius:50%;aspect-ratio:1}.split-visual:before{width:520px;right:-190px;top:-130px}.split-visual:after{width:250px;left:45px;bottom:50px;background:color-mix(in srgb,var(--accent) 70%,transparent)}.editorial{padding-top:42px}.editorial .folio{font:700 12px ui-monospace,monospace;letter-spacing:.22em;border-bottom:1px solid currentColor;padding-bottom:16px}.editorial h1{font-family:Georgia,serif;font-size:102px;max-width:1040px}.editorial .deck{margin-left:auto;max-width:380px;border-left:4px solid var(--accent);padding-left:22px}.bento{display:grid;grid-template-columns:1.35fr .65fr .65fr;grid-template-rows:1fr 1fr;gap:18px;padding-top:44px}.tile{border-radius:var(--radius);background:var(--muted);padding:30px}.bento .copy{grid-row:span 2;border:1px solid color-mix(in srgb,var(--ink) 18%,transparent);background:var(--canvas)}.bento .signal{display:flex;flex-direction:column;justify-content:space-between}.bento .mark{display:grid;place-items:center;background:var(--accent);color:var(--canvas);font-size:86px}.feature_grid h1{max-width:980px}.feature-row{display:grid;grid-template-columns:repeat(3,1fr);margin-top:62px;border-block:1px solid color-mix(in srgb,var(--ink) 24%,transparent)}.feature{min-height:190px;padding:28px;border-right:1px solid color-mix(in srgb,var(--ink) 24%,transparent)}.feature:last-child{border:0}.feature small{color:var(--accent);font-weight:800}.feature strong{display:block;font-size:24px;margin-top:52px}.centered_dual_cta{display:grid;place-items:center}.centered_dual_cta h1{font-size:92px;max-width:980px}.immersive_visual{background:var(--ink);color:var(--canvas);display:flex;align-items:flex-end}.immersive_visual .eyebrow{color:var(--accent)}.immersive_visual .field{position:absolute;inset:0;background:radial-gradient(circle at 18% 18%,var(--accent),transparent 30%),radial-gradient(circle at 82% 42%,color-mix(in srgb,var(--canvas) 24%,transparent),transparent 28%)}.immersive_visual .sphere{position:absolute;border:1px solid color-mix(in srgb,var(--canvas) 50%,transparent);border-radius:50%;aspect-ratio:1}.immersive_visual .s1{width:430px;right:40px;top:40px}.immersive_visual .s2{width:210px;right:300px;top:230px}.immersive_visual .copy{position:relative;padding-bottom:60px}.product_stage{padding-top:42px;text-align:center}.product_stage h1,.product_stage p{margin-left:auto;margin-right:auto}.stage{height:410px;margin-top:45px;border:1px solid color-mix(in srgb,var(--ink) 24%,transparent);border-radius:var(--radius);overflow:hidden;background:color-mix(in srgb,var(--canvas) 84%,white);box-shadow:0 34px 90px color-mix(in srgb,var(--ink) 18%,transparent);text-align:left}.stage-bar{height:46px;border-bottom:1px solid color-mix(in srgb,var(--ink) 18%,transparent);display:flex;align-items:center;gap:7px;padding:0 18px}.stage-bar i{width:10px;height:10px;border-radius:50%;background:var(--accent)}.stage-body{display:grid;grid-template-columns:180px 1fr;height:364px}.stage-body aside{background:var(--ink)}.stage-content{padding:54px}.stage-content strong{font-size:42px}.line{height:13px;background:var(--muted);border-radius:20px;margin-top:25px}.line.short{width:62%}.full_bleed_statement{background:var(--accent);color:var(--canvas);display:flex;align-items:center}.full_bleed_statement h1{font-size:126px;max-width:1080px}.full_bleed_statement .eyebrow{color:var(--canvas)}.full_bleed_statement .rail{position:absolute;right:28px;top:40px;writing-mode:vertical-rl;letter-spacing:.22em;text-transform:uppercase;font-size:11px}
+`;
+
+function previewCopy(brief: SiteBrief) {
+  const offerings = brief.offerings.filter(Boolean).slice(0, 3);
+  return {
+    eyebrow: offerings[0] || "品牌官网",
+    heading: brief.companyName,
+    summary:
+      brief.conversionGoal ||
+      offerings.join(" · ") ||
+      "用清晰、可信的表达连接企业能力与目标客户。",
+    offerings:
+      offerings.length > 0 ? offerings : ["企业能力", "产品服务", "客户价值"],
+  };
+}
+
+function PreviewHero(input: {
+  brief: SiteBrief;
+  blueprint: TrustedVisualPreviewBlueprint;
+}) {
+  const h = React.createElement;
+  const copy = previewCopy(input.brief);
+  const family = input.blueprint.heroFamily;
+  const copyNode = h(
+    "div",
+    { className: "copy" },
+    h("div", { className: "eyebrow" }, copy.eyebrow),
+    h("h1", null, copy.heading),
+    h("p", null, copy.summary),
+    h(
+      "div",
+      { className: "actions" },
+      h("span", { className: "button primary" }, "了解更多"),
+      h("span", { className: "button" }, "联系我们"),
+    ),
+  );
+  if (family === "floating_orbit") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      copyNode,
+      ...["DNA", "✦", "◎", "↗"].map((value, index) =>
+        h("span", { className: `orbit o${index + 1}`, key: value }, value),
+      ),
+    );
+  }
+  if (family === "split_media") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      copyNode,
+      h("div", { className: "split-visual", "aria-hidden": "true" }),
+    );
+  }
+  if (family === "editorial") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      h("div", { className: "folio" }, "FRONTMIND / EDITION 01"),
+      copyNode,
+      h("p", { className: "deck" }, copy.offerings.join(" · ")),
+    );
+  }
+  if (family === "bento") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      h("div", { className: "tile copy" }, copyNode),
+      h(
+        "div",
+        { className: "tile signal" },
+        h("span", null, "01"),
+        h("strong", null, copy.offerings[0]),
+      ),
+      h("div", { className: "tile" }, copy.summary),
+      h("div", { className: "tile mark", "aria-hidden": "true" }, "✦"),
+    );
+  }
+  if (family === "feature_grid") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      copyNode,
+      h(
+        "div",
+        { className: "feature-row" },
+        ...copy.offerings.map((offering, index) =>
+          h(
+            "div",
+            { className: "feature", key: offering },
+            h("small", null, `0${index + 1}`),
+            h("strong", null, offering),
+          ),
+        ),
+      ),
+    );
+  }
+  if (family === "immersive_visual") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      h(
+        "div",
+        { className: "field", "aria-hidden": "true" },
+        h("i", { className: "sphere s1" }),
+        h("i", { className: "sphere s2" }),
+      ),
+      copyNode,
+    );
+  }
+  if (family === "product_stage") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      copyNode,
+      h(
+        "div",
+        { className: "stage" },
+        h("div", { className: "stage-bar" }, h("i"), h("i"), h("i")),
+        h(
+          "div",
+          { className: "stage-body" },
+          h("aside"),
+          h(
+            "div",
+            { className: "stage-content" },
+            h("strong", null, copy.offerings[0]),
+            h("div", { className: "line" }),
+            h("div", { className: "line short" }),
+          ),
+        ),
+      ),
+    );
+  }
+  if (family === "full_bleed_statement") {
+    return h(
+      "section",
+      { className: `hero ${family}`, "data-hero-family": family },
+      copyNode,
+      h("span", { className: "rail" }, copy.offerings.join(" / ")),
+    );
+  }
+  return h(
+    "section",
+    {
+      className: `hero centered_dual_cta`,
+      "data-hero-family": "centered_dual_cta",
+    },
+    copyNode,
+  );
+}
+
+export function renderTrustedVisualCandidateHtml(input: {
+  brief: SiteBrief;
+  blueprint: TrustedVisualPreviewBlueprint;
+}) {
+  const h = React.createElement;
+  const { palette } = input.blueprint;
+  const companyInitial = Array.from(input.brief.companyName.trim())[0] || "F";
+  const page = h(
+    "html",
+    { lang: input.brief.primaryLanguage },
+    h(
+      "head",
+      null,
+      h("meta", { charSet: "utf-8" }),
+      h("meta", { name: "viewport", content: "width=1200" }),
+      h("style", null, PREVIEW_CSS),
+    ),
+    h(
+      "body",
+      {
+        className: `type-system--${input.blueprint.typeSystem}`,
+        style: {
+          "--canvas": palette.canvas,
+          "--ink": palette.ink,
+          "--accent": palette.accent,
+          "--muted": palette.muted,
+        } as React.CSSProperties,
+      },
+      h(
+        "div",
+        {
+          className: `frame density--${input.blueprint.density} radius--${input.blueprint.radiusStyle} motion--${input.blueprint.motionLevel} decoration--${input.blueprint.decorationStyle} background--${input.blueprint.backgroundStyle}`,
+        },
+        h(
+          "header",
+          { className: "nav" },
+          h(
+            "div",
+            { className: "brand" },
+            h("span", { className: "brand-mark" }, companyInitial),
+            input.brief.companyName,
+          ),
+          h(
+            "nav",
+            { className: "links" },
+            h("span", null, "首页"),
+            h("span", null, "服务"),
+            h("span", null, "关于"),
+            h("span", null, "联系"),
+          ),
+        ),
+        h(PreviewHero, input),
+      ),
+    ),
+  );
+  return `<!doctype html>${renderToStaticMarkup(page)}`;
+}
+
+export async function renderTrustedVisualCandidatePreviews(input: {
+  brief: SiteBrief;
+  blueprints: TrustedVisualPreviewBlueprint[];
+  signal: AbortSignal;
+}) {
+  if (input.signal.aborted) throw new DOMException("Aborted", "AbortError");
+  const renderController = new AbortController();
+  const forwardAbort = () => renderController.abort(abortReason(input.signal));
+  input.signal.addEventListener("abort", forwardAbort, { once: true });
+  const renderTimeout = setTimeout(
+    () =>
+      renderController.abort(
+        new DOMException("Visual preview render timed out", "TimeoutError"),
+      ),
+    VISUAL_PREVIEW_RENDER_BUDGET_MS,
+  );
+  const signal = renderController.signal;
+  const launchPromise = chromium.launch({
+    headless: true,
+    chromiumSandbox: false,
+    timeout: VISUAL_PREVIEW_BROWSER_LAUNCH_TIMEOUT_MS,
+  });
+  let browser: Awaited<typeof launchPromise> | undefined;
+  try {
+    try {
+      browser = await raceWithAbort(launchPromise, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        void launchPromise
+          .then((lateBrowser) => lateBrowser.close())
+          .catch(() => undefined);
+      }
+      throw error;
+    }
+    const closeOnAbort = () => void browser?.close().catch(() => undefined);
+    signal.addEventListener("abort", closeOnAbort, { once: true });
+    const page = await raceWithAbort(
+      browser.newPage({
+        viewport: { width: 1200, height: 900 },
+        deviceScaleFactor: 1,
+      }),
+      signal,
+    );
+    const previews: Array<{
+      heroFamily: ReferenceBlueprintV3["heroFamily"];
+      buffer: Buffer;
+    }> = [];
+    try {
+      for (const blueprint of input.blueprints) {
+        if (signal.aborted) throw abortReason(signal);
+        await raceWithAbort(
+          page.setContent(
+            renderTrustedVisualCandidateHtml({ brief: input.brief, blueprint }),
+            { waitUntil: "domcontentloaded", timeout: 10_000 },
+          ),
+          signal,
+        );
+        const buffer = await raceWithAbort(
+          page.screenshot({
+            type: "png",
+            fullPage: false,
+            animations: "disabled",
+            timeout: 10_000,
+          }),
+          signal,
+        );
+        previews.push({
+          heroFamily: blueprint.heroFamily,
+          buffer: Buffer.from(buffer),
+        });
+      }
+      return previews;
+    } finally {
+      signal.removeEventListener("abort", closeOnAbort);
+    }
+  } finally {
+    clearTimeout(renderTimeout);
+    input.signal.removeEventListener("abort", forwardAbort);
+    await browser?.close().catch(() => undefined);
+  }
+}

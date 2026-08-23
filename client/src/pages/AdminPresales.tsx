@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowLeft,
   CheckCircle2,
+  Cloud,
   Coins,
   Eye,
   EyeOff,
@@ -60,6 +61,16 @@ type TwentyFirstCredentialStatus = CredentialStatus & {
   };
 };
 
+type AliyunPlatformStatus = {
+  platformUid: string;
+  customerRoleName: string;
+  identityConfigured: boolean;
+  ready: boolean;
+  customerCapabilityVerified: boolean;
+  broker: CredentialStatus;
+  oauth: CredentialStatus & { callbackUrl: string | null };
+};
+
 const EMPTY_STATUS: CredentialStatus = {
   configured: false,
   fingerprint: null,
@@ -78,6 +89,16 @@ const EMPTY_TWENTY_FIRST_STATUS: TwentyFirstCredentialStatus = {
     getUsage: null,
     getTheme: null,
   },
+};
+
+const EMPTY_ALIYUN_STATUS: AliyunPlatformStatus = {
+  platformUid: "1244409121609391",
+  customerRoleName: "FrontMindSiteOpsAccess",
+  identityConfigured: false,
+  ready: false,
+  customerCapabilityVerified: false,
+  broker: EMPTY_STATUS,
+  oauth: { ...EMPTY_STATUS, callbackUrl: null },
 };
 
 export const DEFAULT_API_KEY_USAGE_LIMIT = 230_000;
@@ -119,6 +140,15 @@ export default function AdminPresales() {
   const [twentyFirstLatencyMs, setTwentyFirstLatencyMs] = useState<
     number | null
   >(null);
+  const [aliyunAccessKeyId, setAliyunAccessKeyId] = useState("");
+  const [aliyunAccessKeySecret, setAliyunAccessKeySecret] = useState("");
+  const [aliyunPrincipalArn, setAliyunPrincipalArn] = useState("");
+  const [aliyunOAuthClientId, setAliyunOAuthClientId] = useState("");
+  const [aliyunOAuthClientSecret, setAliyunOAuthClientSecret] = useState("");
+  const [aliyunOAuthCallbackUrl, setAliyunOAuthCallbackUrl] = useState("");
+  const [aliyunPending, setAliyunPending] = useState<
+    "broker" | "oauth" | "test" | "delete" | null
+  >(null);
   const [connectionState, setConnectionState] = useState<
     "idle" | "success" | "error"
   >("idle");
@@ -147,6 +177,16 @@ export default function AdminPresales() {
     });
   const twentyFirstStatus = (twentyFirstStatusQuery.data ??
     EMPTY_TWENTY_FIRST_STATUS) as TwentyFirstCredentialStatus;
+  const aliyunStatusQuery = trpc.admin.presales.aliyun.status.useQuery(
+    undefined,
+    {
+      enabled: isAdmin,
+      retry: false,
+      refetchOnWindowFocus: false,
+    },
+  );
+  const aliyunStatus = (aliyunStatusQuery.data ??
+    EMPTY_ALIYUN_STATUS) as AliyunPlatformStatus;
   const policyOverviewQuery = (
     trpc.admin as any
   ).apiKeyUsageAlerts.overview.useQuery(undefined, {
@@ -187,6 +227,7 @@ export default function AdminPresales() {
     await utils.admin.presales.status.invalidate();
     await utils.admin.presales.usage.invalidate();
     await utils.admin.presales.twentyFirst.status.invalidate();
+    await utils.admin.presales.aliyun.status.invalidate();
     await (utils.admin as any).apiKeyUsageAlerts.overview.invalidate();
   };
 
@@ -199,6 +240,13 @@ export default function AdminPresales() {
     setTwentyFirstConnectionState("idle");
     setTwentyFirstLatencyMs(null);
   }, [twentyFirstApiKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setAliyunOAuthCallbackUrl(
+      `${window.location.origin}/api/site-ops/aliyun/oauth/callback`,
+    );
+  }, []);
 
   useEffect(() => {
     if (!websitePolicy) return;
@@ -310,6 +358,93 @@ export default function AdminPresales() {
       });
     } finally {
       setTwentyFirstPending(null);
+    }
+  };
+
+  const handleAliyunBrokerSave = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAliyunPending("broker");
+    try {
+      await utils.client.admin.presales.aliyun.replaceBroker.mutate({
+        accessKeyId: aliyunAccessKeyId.trim(),
+        accessKeySecret: aliyunAccessKeySecret.trim(),
+        principalArn: aliyunPrincipalArn.trim(),
+      });
+      setAliyunAccessKeyId("");
+      setAliyunAccessKeySecret("");
+      await utils.admin.presales.aliyun.status.invalidate();
+      toast.success("阿里云 Broker 身份已验证并保存");
+    } catch (error) {
+      toast.error("无法保存阿里云 Broker 身份", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    } finally {
+      setAliyunPending(null);
+    }
+  };
+
+  const handleAliyunOAuthSave = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAliyunPending("oauth");
+    try {
+      await utils.client.admin.presales.aliyun.replaceOAuth.mutate({
+        clientId: aliyunOAuthClientId.trim(),
+        clientSecret: aliyunOAuthClientSecret.trim(),
+        callbackUrl: aliyunOAuthCallbackUrl.trim(),
+      });
+      setAliyunOAuthClientId("");
+      setAliyunOAuthClientSecret("");
+      await utils.admin.presales.aliyun.status.invalidate();
+      toast.success("阿里云 OAuth 应用已保存", {
+        description: "首次客户授权成功后，系统会验证该应用凭据。",
+      });
+    } catch (error) {
+      toast.error("无法保存阿里云 OAuth 应用", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    } finally {
+      setAliyunPending(null);
+    }
+  };
+
+  const handleAliyunTest = async () => {
+    setAliyunPending("test");
+    try {
+      const result = await utils.client.admin.presales.aliyun.test.mutate({
+        target: "all",
+      });
+      if (!result.customerReadiness?.customerConnectionTested) {
+        toast.info("平台身份验证通过", {
+          description: "尚无已连接的客户账号，暂未执行 Domain/AliDNS 读取。",
+        });
+      } else if (!result.customerReadiness.alidnsRead) {
+        toast.info("Domain 读取验证通过", {
+          description: "客户尚无可供验证的域名，暂未执行 AliDNS 读取。",
+        });
+      } else {
+        toast.success("域名与发布平台只读能力验证通过");
+      }
+    } catch (error) {
+      toast.error("域名与发布平台验证失败", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    } finally {
+      setAliyunPending(null);
+    }
+  };
+
+  const handleAliyunDelete = async () => {
+    setAliyunPending("delete");
+    try {
+      await utils.client.admin.presales.aliyun.delete.mutate({ target: "all" });
+      await utils.admin.presales.aliyun.status.invalidate();
+      toast.success("域名与发布平台凭据已撤销");
+    } catch (error) {
+      toast.error("无法撤销域名与发布平台凭据", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      });
+    } finally {
+      setAliyunPending(null);
     }
   };
 
@@ -500,7 +635,7 @@ export default function AdminPresales() {
           onClick={() => void refreshAll()}
         >
           <RefreshCw
-            className={`h-4 w-4 ${statusQuery.isFetching || usageQuery.isFetching || twentyFirstStatusQuery.isFetching ? "animate-spin" : ""}`}
+            className={`h-4 w-4 ${statusQuery.isFetching || usageQuery.isFetching || twentyFirstStatusQuery.isFetching || aliyunStatusQuery.isFetching ? "animate-spin" : ""}`}
           />
           刷新状态
         </Button>
@@ -1192,6 +1327,285 @@ export default function AdminPresales() {
                       </Button>
                     </div>
                   )}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </section>
+
+        <section className="mt-9" aria-labelledby="aliyun-platform-heading">
+          <div className="mb-3">
+            <h2
+              id="aliyun-platform-heading"
+              className="flex items-center gap-2 text-base font-semibold text-foreground"
+            >
+              <Cloud className="h-4 w-4 text-primary" />
+              域名与发布平台
+            </h2>
+            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+              管理 FrontMind 的阿里云 Broker 服务身份和官方 OAuth
+              应用。客户域名仍归客户账号，系统只使用短期 STS
+              完成域名、解析与发布自动化。
+            </p>
+          </div>
+
+          {aliyunStatusQuery.isLoading ? (
+            <Skeleton className="h-[520px] rounded-2xl" />
+          ) : aliyunStatusQuery.error ? (
+            <Card className="border-destructive/20 bg-card/85">
+              <CardContent className="py-12 text-center">
+                <ShieldAlert className="mx-auto mb-3 h-7 w-7 text-destructive" />
+                <p className="font-medium">域名与发布平台配置加载失败</p>
+                <Button
+                  className="mt-5"
+                  variant="outline"
+                  onClick={() => void aliyunStatusQuery.refetch()}
+                >
+                  重新加载
+                </Button>
+              </CardContent>
+            </Card>
+          ) : (
+            <Card className="overflow-hidden border-border/70 bg-card/88 shadow-sm backdrop-blur-xl">
+              <CardHeader className="border-b border-border/60 pb-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <CardTitle className="flex items-center gap-2 text-lg">
+                      <ShieldCheck className="h-5 w-5 text-primary" />
+                      阿里云跨账号自动化
+                    </CardTitle>
+                    <p className="mt-1.5 text-sm text-muted-foreground">
+                      FrontMind UID {aliyunStatus.platformUid} · 客户固定角色{" "}
+                      {aliyunStatus.customerRoleName}
+                    </p>
+                  </div>
+                  <Badge
+                    variant="secondary"
+                    className={
+                      aliyunStatus.ready
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                        : "border-border bg-muted/60 text-muted-foreground"
+                    }
+                  >
+                    {aliyunStatus.ready ? (
+                      <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
+                    ) : (
+                      <Activity className="mr-1 h-3.5 w-3.5" />
+                    )}
+                    {aliyunStatus.ready
+                      ? "发布平台已验证"
+                      : aliyunStatus.identityConfigured
+                        ? "平台身份已配置"
+                        : "等待配置"}
+                  </Badge>
+                </div>
+              </CardHeader>
+              <CardContent className="grid gap-6 p-5 sm:p-6 lg:grid-cols-2">
+                <form className="space-y-4" onSubmit={handleAliyunBrokerSave}>
+                  <div>
+                    <p className="text-sm font-medium">Broker RAM 身份</p>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                      使用 FrontMind 专用 RAM 用户或角色，不得填写主账号
+                      AccessKey。
+                    </p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <StatusTile
+                      label="凭据标识"
+                      value={
+                        aliyunStatus.broker.fingerprint
+                          ? `•••• ${aliyunStatus.broker.fingerprint.slice(-8)}`
+                          : "尚未配置"
+                      }
+                      mono
+                    />
+                    <StatusTile
+                      label="版本"
+                      value={
+                        aliyunStatus.broker.version
+                          ? `Version ${aliyunStatus.broker.version}`
+                          : "—"
+                      }
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="aliyun-access-key-id">AccessKey ID</Label>
+                    <Input
+                      id="aliyun-access-key-id"
+                      value={aliyunAccessKeyId}
+                      onChange={(event) =>
+                        setAliyunAccessKeyId(event.target.value)
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="aliyun-access-key-secret">
+                      AccessKey Secret
+                    </Label>
+                    <Input
+                      id="aliyun-access-key-secret"
+                      type="password"
+                      value={aliyunAccessKeySecret}
+                      onChange={(event) =>
+                        setAliyunAccessKeySecret(event.target.value)
+                      }
+                      autoComplete="new-password"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="aliyun-principal-arn">
+                      Broker principal ARN
+                    </Label>
+                    <Input
+                      id="aliyun-principal-arn"
+                      value={aliyunPrincipalArn}
+                      onChange={(event) =>
+                        setAliyunPrincipalArn(event.target.value)
+                      }
+                      placeholder="acs:ram::1244409121609391:user/frontmind-siteops"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <Button
+                    type="submit"
+                    disabled={
+                      aliyunPending !== null ||
+                      !aliyunAccessKeyId.trim() ||
+                      !aliyunAccessKeySecret.trim() ||
+                      !aliyunPrincipalArn.trim()
+                    }
+                  >
+                    {aliyunPending === "broker" && (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    )}
+                    验证并保存 Broker
+                  </Button>
+                </form>
+
+                <form className="space-y-4" onSubmit={handleAliyunOAuthSave}>
+                  <div>
+                    <p className="text-sm font-medium">阿里云 OAuth Web 应用</p>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                      仅请求 openid、aliuid 和
+                      profile，用于确认客户所属账号；访问令牌不会持久化。
+                    </p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <StatusTile
+                      label="应用标识"
+                      value={
+                        aliyunStatus.oauth.fingerprint
+                          ? `•••• ${aliyunStatus.oauth.fingerprint.slice(-8)}`
+                          : "尚未配置"
+                      }
+                      mono
+                    />
+                    <StatusTile
+                      label="版本"
+                      value={
+                        aliyunStatus.oauth.version
+                          ? `Version ${aliyunStatus.oauth.version}`
+                          : "—"
+                      }
+                    />
+                  </div>
+                  {aliyunStatus.oauth.fingerprint &&
+                    !aliyunStatus.oauth.verifiedAt && (
+                      <p className="text-xs text-amber-700">
+                        应用已加密保存，等待首次客户授权完成真实凭据验证。
+                      </p>
+                    )}
+                  <div className="space-y-2">
+                    <Label htmlFor="aliyun-oauth-client-id">Client ID</Label>
+                    <Input
+                      id="aliyun-oauth-client-id"
+                      value={aliyunOAuthClientId}
+                      onChange={(event) =>
+                        setAliyunOAuthClientId(event.target.value)
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="aliyun-oauth-client-secret">
+                      Client Secret
+                    </Label>
+                    <Input
+                      id="aliyun-oauth-client-secret"
+                      type="password"
+                      value={aliyunOAuthClientSecret}
+                      onChange={(event) =>
+                        setAliyunOAuthClientSecret(event.target.value)
+                      }
+                      autoComplete="new-password"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="aliyun-oauth-callback">Callback URL</Label>
+                    <Input
+                      id="aliyun-oauth-callback"
+                      value={aliyunOAuthCallbackUrl}
+                      onChange={(event) =>
+                        setAliyunOAuthCallbackUrl(event.target.value)
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <Button
+                    type="submit"
+                    disabled={
+                      aliyunPending !== null ||
+                      !aliyunOAuthClientId.trim() ||
+                      !aliyunOAuthClientSecret.trim() ||
+                      !aliyunOAuthCallbackUrl.trim()
+                    }
+                  >
+                    {aliyunPending === "oauth" && (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    )}
+                    保存 OAuth 应用
+                  </Button>
+                </form>
+
+                <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-5 lg:col-span-2">
+                  <Button
+                    variant="outline"
+                    disabled={
+                      aliyunPending !== null || !aliyunStatus.identityConfigured
+                    }
+                    onClick={() => void handleAliyunTest()}
+                  >
+                    {aliyunPending === "test" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Wifi className="h-4 w-4" />
+                    )}
+                    验证只读能力
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    className="text-destructive hover:text-destructive"
+                    disabled={
+                      aliyunPending !== null ||
+                      (!aliyunStatus.broker.configured &&
+                        !aliyunStatus.oauth.configured)
+                    }
+                    onClick={() => void handleAliyunDelete()}
+                  >
+                    {aliyunPending === "delete" ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-4 w-4" />
+                    )}
+                    撤销平台凭据
+                  </Button>
                 </div>
               </CardContent>
             </Card>

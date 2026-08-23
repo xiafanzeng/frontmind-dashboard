@@ -112,6 +112,32 @@
   font-size: 13px;
 }
 
+.siteops-rebuild-reason {
+  display: grid;
+  gap: 8px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.siteops-rebuild-reason textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  background: #fff;
+  padding: 10px 12px;
+  color: #0f172a;
+  font: inherit;
+  font-weight: 400;
+  line-height: 1.55;
+}
+
+.siteops-rebuild-reason textarea:focus-visible {
+  outline: 2px solid #818cf8;
+  outline-offset: 2px;
+}
+
 .siteops-panel-state {
   min-height: 150px;
   grid-auto-flow: column;
@@ -920,6 +946,30 @@
 
 .siteops-composer textarea {
   resize: vertical;
+}
+
+.siteops-aliyun-guide {
+  display: grid;
+  width: 100%;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #dbe3ef;
+  border-radius: 14px;
+  background: #f8fafc;
+}
+
+.siteops-aliyun-guide ol {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding-left: 22px;
+}
+
+.siteops-aliyun-guide li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .siteops-spin {

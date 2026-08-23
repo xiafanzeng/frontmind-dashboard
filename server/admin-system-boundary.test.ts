@@ -234,6 +234,47 @@ describe("system administrator boundary", () => {
         caller.presales.twentyFirst.delete(),
     ],
     [
+      "read the system-wide Aliyun publishing credentials",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.aliyun.status(),
+    ],
+    [
+      "test the system-wide Aliyun publishing credentials",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.aliyun.test({ target: "all" }),
+    ],
+    [
+      "requeue an unresolved Aliyun financial operation for read-only reconciliation",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.aliyun.reconcileFinancialOperation({
+          operationId: "11111111-1111-4111-8111-111111111111",
+        }),
+    ],
+    [
+      "replace the system-wide Aliyun broker credential",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.aliyun.replaceBroker({
+          accessKeyId: "LTAI5boundarytest",
+          accessKeySecret: "aliyun-boundary-secret-key",
+          principalArn: "acs:ram::1244409121609391:user/frontmind-siteops",
+        }),
+    ],
+    [
+      "replace the system-wide Aliyun OAuth credential",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.aliyun.replaceOAuth({
+          clientId: "aliyun-boundary-client",
+          clientSecret: "aliyun-boundary-client-secret",
+          callbackUrl:
+            "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
+        }),
+    ],
+    [
+      "delete the system-wide Aliyun publishing credentials",
+      (caller: ReturnType<typeof adminRouter.createCaller>) =>
+        caller.presales.aliyun.delete({ target: "all" }),
+    ],
+    [
       "replace a managed API Key from unified management",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.apiKeyUsageAlerts.replaceTargetCredential({

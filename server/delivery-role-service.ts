@@ -91,6 +91,10 @@ import {
 } from "./delivery-ticket-service";
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
 import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
+import {
+  acceptSiteOpsRebuildTicket,
+  SiteOpsRebuildTicketError,
+} from "./siteops/rebuild-ticket";
 import { getQuestionQuotaState } from "./question-quota-service";
 import { questionCategoryForPublic } from "./question-selection-policy";
 import { listResponseLogicEntriesByQuestionIds } from "./response-logic-service";
@@ -3131,6 +3135,12 @@ export function assertGenericDeliveryTicketTransition(input: {
       "官网构建工单不能拒绝或取消；如需客户补充资料，请设为等待补充后继续处理",
     );
   }
+  if (input.operation === "site_rebuild" && input.nextStatus === "completed") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "官网重制工单会在新版本完成后由系统自动关闭。",
+    );
+  }
 }
 
 export function assertDeliveryCompletionSummary(input: {
@@ -4787,6 +4797,20 @@ export async function updateMyDeliveryTicket(input: {
       throw error;
     }
     const now = new Date();
+    if (ticket.operation === "site_rebuild" && input.status === "in_progress") {
+      try {
+        await acceptSiteOpsRebuildTicket(tx, {
+          ticket,
+          actorUserId: input.actor.id,
+          now,
+        });
+      } catch (error) {
+        if (error instanceof SiteOpsRebuildTicketError) {
+          throw new AuthServiceError("CONFLICT", error.message);
+        }
+        throw error;
+      }
+    }
     let currentQuotaScope:
       | Awaited<ReturnType<typeof resolveCurrentServiceQuotaScope>>
       | undefined;

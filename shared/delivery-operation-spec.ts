@@ -366,6 +366,18 @@ export const DELIVERY_OPERATION_SPECS = {
     },
     nextStep: "完成并登记官网公开链接后，系统会开放后续官网内容提交。",
   },
+  site_rebuild: {
+    operation: "site_rebuild",
+    label: "官网重制",
+    ownerRole: "ai_operations_engineer",
+    completion: {
+      mode: "dedicated",
+      fields: [],
+      publicUrl: "hidden",
+      previewVerification: "hidden",
+    },
+    nextStep: "受理后系统开启新的官网子版本；新版本构建完成后自动关闭工单。",
+  },
   company_facts: {
     operation: "company_facts",
     label: "企业事实内容",
@@ -488,6 +500,7 @@ export const DELIVERY_OPERATION_ALLOWED_EVIDENCE = {
   ],
   website_style_samples: [],
   website_build: ["message", "publicUrl", "previewVerified"],
+  site_rebuild: [],
   company_facts: ["message", "publicUrl", "handoff.contentAssetIds"],
   product_case_docs: ["message", "publicUrl", "handoff.contentAssetIds"],
   industry_news: ["message", "publicUrl", "handoff.contentAssetIds"],

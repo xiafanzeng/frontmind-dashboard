@@ -5,8 +5,12 @@ import {
   composeBuildContractV3,
   composeBuildPlanContractV3,
   composeBuildContractV2,
+  FRONTMIND_VISUAL_FAMILIES_V3,
   referenceBlueprintForVisualCandidate,
+  referenceBlueprintV3ForFamily,
   referenceBlueprintV2Schema,
+  referenceBlueprintV3Schema,
+  trustedVisualPreviewBlueprintV3,
   pageContentResultV1Schema,
   siteDesignResultV1Schema,
   validateDesignAndContentBindings,
@@ -206,6 +210,155 @@ describe("SiteOps Manus design and content contracts", () => {
         heroFamily: "centered_dual_cta",
       }),
     ).toThrow("Reference blueprint hash does not match");
+  });
+
+  it("freezes exactly nine distinct FrontMind-owned V3 visual families", () => {
+    const blueprints = FRONTMIND_VISUAL_FAMILIES_V3.map((heroFamily, index) =>
+      referenceBlueprintV3ForFamily({
+        candidateId: `candidate-${index + 1}`,
+        providerItemKey: `s:frontmind:${heroFamily}`,
+        previewLocalAssetId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+        previewSha256: H(`preview-${heroFamily}`),
+        heroFamily,
+        inspirationEvidenceIds: [H("safe-21st-inspiration")],
+      }),
+    );
+    expect(blueprints).toHaveLength(9);
+    expect(new Set(blueprints.map((item) => item.heroFamily)).size).toBe(9);
+    expect(
+      blueprints.every((item) =>
+        item.componentManifest.includes(`hero:${item.heroFamily}`),
+      ),
+    ).toBe(true);
+    expect(() =>
+      referenceBlueprintV3Schema.parse({
+        ...blueprints[0],
+        heroFamily: "proof_grid",
+      }),
+    ).toThrow();
+  });
+
+  it("projects only allowlisted inspiration taxonomy into the frozen V3 blueprint", () => {
+    const darkEditorialPreview = trustedVisualPreviewBlueprintV3(
+      "split_media",
+      [
+        {
+          palette: ["#241238", "dark-canvas", "high-contrast"],
+          typography: ["serif-editorial"],
+          layout: ["editorial-rhythm", "premium-restrained"],
+          motion: ["short-transition"],
+          accessibility: ["reduced-motion-required"],
+        },
+      ],
+    );
+    const lightTechnicalPreview = trustedVisualPreviewBlueprintV3(
+      "split_media",
+      [
+        {
+          palette: ["#dbeafe", "light-canvas", "high-contrast"],
+          typography: ["condensed-technical"],
+          layout: ["modular-grid", "technical-precise"],
+          motion: ["short-transition"],
+          accessibility: ["reduced-motion-required"],
+        },
+      ],
+    );
+
+    expect(darkEditorialPreview).toMatchObject({
+      heroFamily: "split_media",
+      typeSystem: "editorial_serif",
+      typographyStyle: "editorial",
+      density: "spacious",
+      decorationStyle: "editorial_lines",
+      backgroundStyle: "dark",
+      gradientStyle: "spotlight",
+    });
+    expect(lightTechnicalPreview).toMatchObject({
+      heroFamily: "split_media",
+      typeSystem: "technical_sans",
+      typographyStyle: "technical",
+      density: "compact",
+      decorationStyle: "grid",
+      backgroundStyle: "cool_light",
+    });
+    expect(darkEditorialPreview.palette).not.toEqual(
+      lightTechnicalPreview.palette,
+    );
+    expect(Object.values(darkEditorialPreview.palette)).not.toContain(
+      "#241238",
+    );
+
+    const common = {
+      candidateId: "candidate-inspired",
+      providerItemKey: "s:frontmind:split_media",
+      previewLocalAssetId: "00000000-0000-4000-8000-000000000099",
+      previewSha256: H("inspired-preview"),
+      heroFamily: "split_media" as const,
+      inspirationEvidenceIds: [H("safe-21st-inspiration")],
+    };
+    const darkFrozen = referenceBlueprintV3ForFamily({
+      ...common,
+      previewBlueprint: darkEditorialPreview,
+    });
+    const lightFrozen = referenceBlueprintV3ForFamily({
+      ...common,
+      previewBlueprint: lightTechnicalPreview,
+    });
+    expect(darkFrozen.blueprintHash).not.toBe(lightFrozen.blueprintHash);
+    expect(darkFrozen.palette).toEqual(darkEditorialPreview.palette);
+    expect(lightFrozen.palette).toEqual(lightTechnicalPreview.palette);
+  });
+
+  it("uses the family baseline when inspiration contains no qualifying safe tokens", () => {
+    const baseline = trustedVisualPreviewBlueprintV3("floating_orbit");
+    const unqualified = trustedVisualPreviewBlueprintV3("floating_orbit", [
+      {
+        palette: ["provider-secret-palette", "javascript:alert(1)"],
+        typography: ["download-this-provider-font"],
+        layout: ["copy-third-party-component"],
+        motion: ["run-provider-animation-code"],
+        accessibility: ["unknown-provider-directive"],
+      },
+    ]);
+
+    expect(unqualified).toEqual(baseline);
+    expect(baseline).toMatchObject({
+      heroFamily: "floating_orbit",
+      palette: {
+        canvas: "#f7f1e8",
+        ink: "#1f2937",
+        accent: "#a34805",
+        muted: "#eadfce",
+      },
+      typeSystem: "humanist_sans",
+      density: "spacious",
+      decorationStyle: "orbital",
+      backgroundStyle: "warm_light",
+    });
+    expect(JSON.stringify(unqualified)).not.toContain("provider");
+  });
+
+  it("rejects a low-contrast V3 palette before the candidate blueprint is frozen", () => {
+    const previewBlueprint = trustedVisualPreviewBlueprintV3("split_media");
+    expect(() =>
+      referenceBlueprintV3ForFamily({
+        candidateId: "candidate-low-contrast",
+        providerItemKey: "s:frontmind:split_media",
+        previewLocalAssetId: "00000000-0000-4000-8000-000000000088",
+        previewSha256: H("low-contrast-preview"),
+        heroFamily: "split_media",
+        inspirationEvidenceIds: [H("safe-21st-inspiration")],
+        previewBlueprint: {
+          ...previewBlueprint,
+          palette: {
+            canvas: "#ffffff",
+            ink: "#eeeeee",
+            accent: "#dddddd",
+            muted: "#ffffff",
+          },
+        },
+      }),
+    ).toThrow("SITEOPS_VISUAL_PALETTE_CONTRAST_INVALID");
   });
 
   it("keeps pre-materialization plans distinct from final BuildContractV3", () => {

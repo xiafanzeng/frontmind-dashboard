@@ -1,0 +1,392 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const dependencies = vi.hoisted(() => ({
+  getDb: vi.fn(),
+  getServicePortal: vi.fn(async () => ({})),
+  reserveQuota: vi.fn(async () => "50000000-0000-4000-8000-000000000005"),
+  loadRebuild: vi.fn(),
+}));
+
+vi.mock("../db", () => ({ getDb: dependencies.getDb }));
+vi.mock("../service-entitlement", () => ({
+  getServicePortal: dependencies.getServicePortal,
+}));
+vi.mock("./quota-service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./quota-service")>();
+  return {
+    ...actual,
+    assertSiteOpsServiceEntitlement: (portal: unknown) => portal,
+    siteOpsQuotaPeriodIds: () => [
+      "50000000-0000-4000-8000-000000000005",
+    ],
+    reserveSiteOpsQuota: dependencies.reserveQuota,
+  };
+});
+vi.mock("./rebuild-ticket", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./rebuild-ticket")>();
+  return { ...actual, loadSiteOpsRebuildRequest: dependencies.loadRebuild };
+});
+vi.mock("./providers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./providers")>();
+  return { ...actual, siteOpsProviderConfigured: () => false };
+});
+
+import {
+  apiCredentials,
+  conversationTurns,
+  knowledgeBaseSnapshots,
+  messages,
+  presalesApiCredentials,
+  siteBuilds,
+  siteOperations,
+  siteProjects,
+  websiteStyleSampleBatches,
+  websiteStyleSamples,
+} from "../../drizzle/schema";
+import { SITEOPS_WORKFLOW } from "../../shared/siteops";
+import {
+  referenceBlueprintV3ForFamily,
+} from "../../shared/siteops-design";
+import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
+import { actOnSiteOps } from "./service";
+
+type Insert = { table: unknown; values: Record<string, unknown> };
+
+function serviceDatabaseFixture() {
+  const now = new Date("2026-08-23T00:00:00.000Z");
+  const project = {
+    id: "10000000-0000-4000-8000-000000000001",
+    userId: 7,
+    conversationId: "siteops:7",
+    currentKnowledgeSnapshotId: "20000000-0000-4000-8000-000000000002",
+    currentBuildId: "30000000-0000-4000-8000-000000000003",
+    globalLiveDeploymentId: null,
+    mainlandLiveDeploymentId: null,
+    primaryLanguage: "zh-CN",
+    canonicalHostname: null,
+    status: "awaiting_visual_selection",
+    revision: 8,
+    brief: null,
+    updatedAt: now,
+  };
+  const snapshot = {
+    id: project.currentKnowledgeSnapshotId,
+    userId: 7,
+    archiveHash: "a".repeat(64),
+    version: 2,
+    sourceFileName: "knowledge.zip",
+    createdAt: now,
+  };
+  const sampleId = "40000000-0000-4000-8000-000000000004";
+  const previewLocalAssetId = "41000000-0000-4000-8000-000000000004";
+  const visualOperationId = "42000000-0000-4000-8000-000000000004";
+  const platformCredentialId = "43000000-0000-4000-8000-000000000004";
+  const customerCredentialId = "44000000-0000-4000-8000-000000000004";
+  const evidence = createVisualEvidenceV1({
+    evidenceKind: "catalog_metadata_preview_v1",
+    providerItemKey: "n:8435",
+    metadataSha256: "b".repeat(64),
+    providerResponseSha256: "c".repeat(64),
+    previewSha256: "d".repeat(64),
+    taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+  });
+  const referenceBlueprint = referenceBlueprintV3ForFamily({
+    candidateId: sampleId,
+    providerItemKey: evidence.providerItemKey,
+    previewLocalAssetId,
+    previewSha256: evidence.previewSha256,
+    heroFamily: "floating_orbit",
+    inspirationEvidenceIds: [evidence.evidenceSha256],
+  });
+  const batch = {
+    id: "45000000-0000-4000-8000-000000000004",
+    userId: 7,
+    siteProjectId: project.id,
+    sourceKind: "siteops_21st",
+    status: "published",
+    selectionBundleHash: "e".repeat(64),
+    engineerNote: `siteops-21st-operation:${visualOperationId}`,
+  };
+  const sample = {
+    id: sampleId,
+    batchId: batch.id,
+    label: "A",
+    note: "浮动轨道 Hero",
+    previewLocalAssetId,
+    sourceMetadata: {
+      providerItemKey: evidence.providerItemKey,
+      title: "Floating Orbit Hero",
+      sourceUrl: "https://21st.dev/community/components/floating-orbit",
+      visualEvidence: evidence,
+      referenceBlueprint,
+      score: 95,
+    },
+  };
+  const visualOperationInput = {
+    knowledgeSnapshotId: snapshot.id,
+    credentialId: platformCredentialId,
+    credentialVersion: 3,
+    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+  };
+  const customerCredential = {
+    id: customerCredentialId,
+    userId: 7,
+    version: 6,
+    agentProfile: "frontmind-pro",
+    status: "active",
+    validationStatus: "verified",
+    verifiedAt: now,
+    deletedAt: null,
+  };
+
+  const inserts: Insert[] = [];
+  const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+  let inTransaction = false;
+  const rowsFor = (table: unknown, selection: unknown) => {
+    const keys = Object.keys((selection as Record<string, unknown>) ?? {});
+    if (table === siteProjects) return [project];
+    if (table === siteBuilds) {
+      if (inTransaction && keys.includes("id")) return [];
+      if (inTransaction && keys.includes("ordinal")) return [{ ordinal: 1 }];
+      return [];
+    }
+    if (table === websiteStyleSamples) {
+      return inTransaction && keys.includes("sample")
+        ? [{ sample, batch }]
+        : [];
+    }
+    if (table === knowledgeBaseSnapshots) {
+      return inTransaction ? [snapshot] : [];
+    }
+    if (table === siteOperations) {
+      if (inTransaction && keys.includes("input")) {
+        return [{ input: visualOperationInput }];
+      }
+      return [];
+    }
+    if (table === presalesApiCredentials) {
+      if (inTransaction && keys.includes("version")) {
+        return [{ id: platformCredentialId, version: 3 }];
+      }
+      return keys.includes("slot") ? [{ slot: "site_builder_21st" }] : [];
+    }
+    if (table === apiCredentials) {
+      return inTransaction ? [customerCredential] : [{ id: customerCredentialId }];
+    }
+    if (table === messages) {
+      return inTransaction && keys.includes("sequence")
+        ? [{ sequence: 0 }]
+        : [];
+    }
+    if (table === websiteStyleSampleBatches) return [];
+    return [];
+  };
+  const select = (selection?: unknown) => {
+    let table: unknown;
+    const query: any = {
+      from(value: unknown) {
+        table = value;
+        return query;
+      },
+      innerJoin() {
+        return query;
+      },
+      where() {
+        return query;
+      },
+      orderBy() {
+        return query;
+      },
+      limit() {
+        return query;
+      },
+      for() {
+        return Promise.resolve(rowsFor(table, selection));
+      },
+      then(resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) {
+        return Promise.resolve(rowsFor(table, selection)).then(resolve, reject);
+      },
+    };
+    return query;
+  };
+  const tx = {
+    select,
+    insert: (table: unknown) => ({
+      values: async (values: Record<string, unknown>) => {
+        inserts.push({ table, values });
+      },
+    }),
+    update: (table: unknown) => ({
+      set: (values: Record<string, unknown>) => ({
+        where: async () => {
+          updates.push({ table, values });
+          if (table === siteProjects) Object.assign(project, values);
+          if (table === websiteStyleSampleBatches) Object.assign(batch, values);
+          return [{ affectedRows: 1 }];
+        },
+      }),
+    }),
+  };
+  const db = {
+    ...tx,
+    transaction: async <T>(callback: (executor: typeof tx) => Promise<T>) => {
+      inTransaction = true;
+      try {
+        return await callback(tx);
+      } finally {
+        inTransaction = false;
+      }
+    },
+  };
+  return {
+    db,
+    project,
+    sample,
+    batch,
+    inserts,
+    updates,
+    customerCredential,
+  };
+}
+
+const actor = {
+  id: 7,
+  role: "user",
+  username: "customer-7",
+} as const;
+
+function selectVisualInput(revision: number, sampleId: string) {
+  return {
+    conversationId: "siteops:7",
+    action: "select_visual",
+    clientRequestId: "select-visual-rebuild-1",
+    expectedRevision: revision,
+    input: { sampleId },
+  };
+}
+
+beforeEach(() => {
+  dependencies.getDb.mockReset();
+  dependencies.reserveQuota.mockClear();
+  dependencies.loadRebuild.mockReset();
+  dependencies.loadRebuild.mockResolvedValue({
+    allowed: false,
+    ticketId: null,
+    status: null,
+  });
+  dependencies.getServicePortal.mockClear();
+});
+
+describe("SiteOps accepted rebuild visual selection", () => {
+  it("reserves the first website build quota and makes the root build current", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      selectVisualInput(fixture.project.revision, fixture.sample.id),
+    );
+
+    const buildInsert = fixture.inserts.find(
+      (entry) => entry.table === siteBuilds,
+    );
+    const operationInsert = fixture.inserts.find(
+      (entry) => entry.table === siteOperations && entry.values.kind === "site_build",
+    );
+    expect(dependencies.loadRebuild).toHaveBeenCalledOnce();
+    expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
+    expect(buildInsert?.values).toMatchObject({
+      parentBuildId: null,
+      quotaPeriodId: "50000000-0000-4000-8000-000000000005",
+      quotaState: "reserved",
+    });
+    expect(operationInsert?.values).toMatchObject({ kind: "site_build" });
+    expect(fixture.project.currentBuildId).toBe(buildInsert?.values.id);
+  });
+
+  it("creates one reserved child build and build_revision only after site_rebuild is in progress", async () => {
+    const fixture = serviceDatabaseFixture();
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    dependencies.loadRebuild.mockResolvedValue({
+      allowed: false,
+      ticketId: "46000000-0000-4000-8000-000000000004",
+      status: "in_progress",
+    });
+
+    await actOnSiteOps(
+      actor as never,
+      selectVisualInput(fixture.project.revision, fixture.sample.id),
+    );
+
+    const buildInsert = fixture.inserts.find(
+      (entry) => entry.table === siteBuilds,
+    );
+    const operationInsert = fixture.inserts.find(
+      (entry) =>
+        entry.table === siteOperations &&
+        entry.values.kind === "build_revision",
+    );
+    expect(dependencies.reserveQuota).toHaveBeenCalledTimes(1);
+    expect(dependencies.reserveQuota).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        userId: 7,
+        quotaPool: "website_content_publish",
+      }),
+    );
+    expect(buildInsert?.values).toMatchObject({
+      parentBuildId: "30000000-0000-4000-8000-000000000003",
+      quotaPeriodId: "50000000-0000-4000-8000-000000000005",
+      quotaState: "reserved",
+      status: "preparing",
+    });
+    expect(operationInsert?.values).toMatchObject({
+      kind: "build_revision",
+      status: "queued",
+      provider: "manus",
+      buildId: buildInsert?.values.id,
+      input: expect.objectContaining({
+        parentBuildId: "30000000-0000-4000-8000-000000000003",
+        childBuildId: buildInsert?.values.id,
+        credentialScope: "customer",
+        manusCredentialId: fixture.customerCredential.id,
+        manusCredentialVersion: fixture.customerCredential.version,
+      }),
+    });
+    expect(fixture.project).toMatchObject({
+      currentBuildId: "30000000-0000-4000-8000-000000000003",
+      status: "building",
+      revision: 9,
+    });
+  });
+
+  it("does not reserve quota or create a child build while site_rebuild is only submitted", async () => {
+    const fixture = serviceDatabaseFixture();
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    dependencies.loadRebuild.mockResolvedValue({
+      allowed: false,
+      ticketId: "46000000-0000-4000-8000-000000000004",
+      status: "submitted",
+    });
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        selectVisualInput(fixture.project.revision, fixture.sample.id),
+      ),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+
+    expect(dependencies.reserveQuota).not.toHaveBeenCalled();
+    expect(
+      fixture.inserts.some((entry) => entry.table === siteBuilds),
+    ).toBe(false);
+    expect(
+      fixture.inserts.some(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "build_revision",
+      ),
+    ).toBe(false);
+  });
+});

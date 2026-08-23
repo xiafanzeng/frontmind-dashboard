@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SiteDnsRecord } from "../../drizzle/schema";
 import {
+  aliyunDnsExpectedRecordsHash,
+  aliyunFinancialSessionPolicy,
+  assertAliyunDnsTargetCurrent,
+  assertAliyunRenewalTarget,
   bindAliyunDnsPlan,
+  classifyAliyunFinancialReconciliation,
   executeAliyunFinancialMutation,
   openAliyunExternalId,
   planAliyunDnsRecords,
@@ -330,6 +335,398 @@ describe("Aliyun SiteOps provider", () => {
     expect(second.status).toBe("pending");
     expect(submitPurchase).toHaveBeenCalledTimes(1);
     expect(findTaskCandidates).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps account ownership lookup in paid purchase and renewal sessions", () => {
+    for (const kind of ["purchase", "renewal"] as const) {
+      const policy = JSON.parse(aliyunFinancialSessionPolicy(kind)) as {
+        Statement: Array<{ Action: string[] }>;
+      };
+      expect(policy.Statement[0]?.Action).toEqual(
+        expect.arrayContaining([
+          "domain:QueryDomainByDomainName",
+          "domain:QueryDomainList",
+        ]),
+      );
+    }
+  });
+
+  it("verifies customer ownership after a paid purchase task succeeds", async () => {
+    const getDomain = vi.fn(async () => domainDetails());
+    const api = fakeDomainApi({
+      getDomain,
+      getTask: vi.fn(async (taskNo, domain) => ({
+        taskNo,
+        state: "succeeded",
+        domain,
+        taskType: "purchase",
+        message: null,
+        instanceId: "instance-1",
+      })),
+    });
+    const quote = await prepareAliyunDomainQuote({
+      api,
+      kind: "purchase",
+      domain: "example.com",
+      accountUid: "123456789012",
+      years: 1,
+      now: new Date("2026-08-22T00:00:00.000Z"),
+    });
+
+    await expect(
+      executeAliyunFinancialMutation({
+        api,
+        quote,
+        providerTaskNo: "task-purchase",
+        mutationAttempted: true,
+        operationCreatedAt: new Date("2026-08-22T00:00:10.000Z"),
+      }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: {
+        domain: "example.com",
+        instanceId: "instance-1",
+      },
+    });
+    expect(getDomain).toHaveBeenCalledWith("example.com");
+  });
+
+  it("treats an explicitly failed provider task as terminal without submitting again", async () => {
+    const submitPurchase = vi.fn();
+    const getDomain = vi.fn(async () => domainDetails());
+    const api = fakeDomainApi({
+      submitPurchase,
+      getDomain,
+      getTask: vi.fn(async () => ({
+        taskNo: "task-failed",
+        state: "failed" as const,
+        domain: "example.com",
+        taskType: "purchase" as const,
+        message: "provider rejected the order",
+        instanceId: null,
+      })),
+    });
+    const quote = await prepareAliyunDomainQuote({
+      api,
+      kind: "purchase",
+      domain: "example.com",
+      accountUid: "123456789012",
+      years: 1,
+      now: new Date("2026-08-22T00:00:00.000Z"),
+    });
+
+    await expect(
+      executeAliyunFinancialMutation({
+        api,
+        quote,
+        providerTaskNo: "task-failed",
+        mutationAttempted: true,
+        operationCreatedAt: new Date("2026-08-22T00:00:10.000Z"),
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "ALIYUN_DOMAIN_TASK_FAILED",
+      providerTaskId: "task-failed",
+      result: { mutationAttempted: true },
+    });
+    expect(submitPurchase).not.toHaveBeenCalled();
+    expect(getDomain).not.toHaveBeenCalled();
+  });
+
+  it("verifies the exact expiration extension after a paid renewal succeeds", async () => {
+    const currentExpirationDateMs = Date.UTC(2027, 7, 22);
+    const renewedExpirationDateMs = Date.UTC(2028, 7, 22);
+    const getDomain = vi
+      .fn<AliyunDomainApi["getDomain"]>()
+      .mockResolvedValueOnce({
+        ...domainDetails(),
+        expirationDateMs: currentExpirationDateMs,
+      })
+      .mockResolvedValueOnce({
+        ...domainDetails(),
+        expirationDateMs: renewedExpirationDateMs,
+      });
+    const api = fakeDomainApi({
+      getDomain,
+      getTask: vi.fn(async (taskNo, domain) => ({
+        taskNo,
+        state: "succeeded",
+        domain,
+        taskType: "renewal",
+        message: null,
+        instanceId: "instance-1",
+      })),
+    });
+    const quote = await prepareAliyunDomainQuote({
+      api,
+      kind: "renewal",
+      domain: "example.com",
+      accountUid: "123456789012",
+      years: 1,
+      now: new Date("2026-08-22T00:00:00.000Z"),
+    });
+
+    await expect(
+      executeAliyunFinancialMutation({
+        api,
+        quote,
+        providerTaskNo: "task-renewal",
+        mutationAttempted: true,
+        operationCreatedAt: new Date("2026-08-22T00:00:10.000Z"),
+      }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: { expirationDateMs: renewedExpirationDateMs },
+    });
+    expect(getDomain).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks a completed renewal mismatch as an attempted financial mutation", async () => {
+    const current = domainDetails();
+    const getDomain = vi.fn(async () => current);
+    const api = fakeDomainApi({
+      getDomain,
+      getTask: vi.fn(async (taskNo, domain) => ({
+        taskNo,
+        state: "succeeded",
+        domain,
+        taskType: "renewal",
+        message: null,
+        instanceId: current.instanceId,
+      })),
+    });
+    const quote = await prepareAliyunDomainQuote({
+      api,
+      kind: "renewal",
+      domain: "example.com",
+      accountUid: "123456789012",
+      years: 1,
+      now: new Date("2026-08-22T00:00:00.000Z"),
+    });
+
+    await expect(
+      executeAliyunFinancialMutation({
+        api,
+        quote,
+        providerTaskNo: "task-renewal",
+        mutationAttempted: true,
+        operationCreatedAt: new Date("2026-08-22T00:00:10.000Z"),
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "RENEWAL_EXPIRATION_MISMATCH",
+      result: { mutationAttempted: true },
+    });
+  });
+
+  it("freezes renewal to the exact current hostname and domain revision", () => {
+    expect(() =>
+      assertAliyunRenewalTarget({
+        current: {
+          normalizedAsciiDomain: "example.com",
+          domainRevision: 4,
+        },
+        quoteDomain: "example.com",
+        expectedCanonicalHostname: "example.com",
+        expectedDomainRevision: 4,
+        mutationAttempted: false,
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      assertAliyunRenewalTarget({
+        current: {
+          normalizedAsciiDomain: "new.example.com",
+          domainRevision: 5,
+        },
+        quoteDomain: "example.com",
+        expectedCanonicalHostname: "example.com",
+        expectedDomainRevision: 4,
+        mutationAttempted: true,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "RENEWAL_DOMAIN_REVISION_CHANGED",
+        details: { mutationAttempted: true },
+      }),
+    );
+  });
+
+  it("only requeues the exact unresolved financial reservation with mutation evidence", () => {
+    const operation = {
+      id: "operation-1",
+      projectId: "project-1",
+      userId: 7,
+      kind: "domain_purchase" as const,
+      status: "attention_required" as const,
+      provider: "aliyun_domain",
+      providerTaskId: null,
+      result: { mutationAttempted: true },
+    };
+    const ledger = {
+      operationId: "operation-1",
+      projectId: "project-1",
+      userId: 7,
+      kind: "purchase" as const,
+      status: "attention_required" as const,
+      activeFinancialKey: "financial-key",
+      providerTaskNo: null,
+      providerResult: { mutationAttempted: true },
+    };
+
+    expect(
+      classifyAliyunFinancialReconciliation({ operation, ledger }),
+    ).toEqual({ action: "requeue" });
+    expect(() =>
+      classifyAliyunFinancialReconciliation({
+        operation,
+        ledger: { ...ledger, userId: 8 },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "DOMAIN_LEDGER_MISMATCH" }));
+    expect(() =>
+      classifyAliyunFinancialReconciliation({
+        operation: { ...operation, result: null },
+        ledger: { ...ledger, providerResult: null },
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "FINANCIAL_RECONCILIATION_NOT_ALLOWED",
+      }),
+    );
+  });
+
+  it("makes financial reconciliation idempotent while queued and after a verified terminal result", () => {
+    const commonOperation = {
+      id: "operation-1",
+      projectId: "project-1",
+      userId: 7,
+      kind: "domain_renewal" as const,
+      provider: "aliyun_domain",
+      providerTaskId: "task-1",
+      result: { mutationAttempted: true },
+    };
+    const commonLedger = {
+      operationId: "operation-1",
+      projectId: "project-1",
+      userId: 7,
+      kind: "renewal" as const,
+      providerTaskNo: "task-1",
+      providerResult: { mutationAttempted: true },
+    };
+
+    expect(
+      classifyAliyunFinancialReconciliation({
+        operation: { ...commonOperation, status: "queued" as const },
+        ledger: {
+          ...commonLedger,
+          status: "attention_required" as const,
+          activeFinancialKey: "financial-key",
+        },
+      }),
+    ).toEqual({ action: "already_pending" });
+    expect(
+      classifyAliyunFinancialReconciliation({
+        operation: { ...commonOperation, status: "succeeded" as const },
+        ledger: {
+          ...commonLedger,
+          status: "succeeded" as const,
+          activeFinancialKey: null,
+        },
+      }),
+    ).toEqual({ action: "terminal", status: "succeeded" });
+  });
+
+  it("rejects a queued DNS write after the current hostname or domain revision changes", () => {
+    const active = {
+      normalizedAsciiDomain: "example.com",
+      domainRevision: 2,
+      domainStatus: "completed" as const,
+      domainOwnershipStatus: "verified",
+    };
+    expect(() =>
+      assertAliyunDnsTargetCurrent(active, {
+        domain: "EXAMPLE.com",
+        revision: 2,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertAliyunDnsTargetCurrent(active, {
+        domain: "new.example.com",
+        revision: 3,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "DNS_DOMAIN_REVISION_STALE" }),
+    );
+    expect(() =>
+      assertAliyunDnsTargetCurrent(
+        { ...active, domainOwnershipStatus: "pending" },
+        { domain: "example.com", revision: 2 },
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "DNS_DOMAIN_REVISION_STALE" }),
+    );
+  });
+
+  it("freezes desired DNS tuples independently from provider reconciliation state", () => {
+    const expected = expectedDnsRecord();
+    const applyHash = aliyunDnsExpectedRecordsHash({
+      mode: "apply",
+      domain: expected.domainAscii,
+      revision: expected.domainRevision,
+      records: [expected],
+    });
+    const reconciledHash = aliyunDnsExpectedRecordsHash({
+      mode: "apply",
+      domain: expected.domainAscii,
+      revision: expected.domainRevision,
+      records: [
+        {
+          ...expected,
+          providerRecordId: "record-created-after-apply",
+          beforeValue: "customer-before.example.net",
+          beforeTtl: 300,
+          observedValue: expected.expectedValue,
+          observedTtl: expected.expectedTtl,
+          status: "propagating",
+        },
+      ],
+    });
+    const driftedHash = aliyunDnsExpectedRecordsHash({
+      mode: "apply",
+      domain: expected.domainAscii,
+      revision: expected.domainRevision,
+      records: [{ ...expected, expectedValue: "silently-changed.example.net" }],
+    });
+    expect(reconciledHash).toBe(applyHash);
+    expect(driftedHash).not.toBe(applyHash);
+
+    const rollbackHash = aliyunDnsExpectedRecordsHash({
+      mode: "rollback",
+      domain: expected.domainAscii,
+      revision: expected.domainRevision,
+      records: [
+        {
+          ...expected,
+          providerRecordId: "frontmind-record",
+          beforeValue: "customer-before.example.net",
+          beforeTtl: 300,
+        },
+      ],
+    });
+    const rollbackDriftedHash = aliyunDnsExpectedRecordsHash({
+      mode: "rollback",
+      domain: expected.domainAscii,
+      revision: expected.domainRevision,
+      records: [
+        {
+          ...expected,
+          providerRecordId: "different-record",
+          beforeValue: "customer-before.example.net",
+          beforeTtl: 300,
+        },
+      ],
+    });
+    expect(rollbackDriftedHash).not.toBe(rollbackHash);
   });
 
   it("reports a foreign same-RR/type record as conflict", () => {

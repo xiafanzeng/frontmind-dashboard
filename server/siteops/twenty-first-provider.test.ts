@@ -137,6 +137,33 @@ function sha256(buffer: Buffer) {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
+function frontMindBaselineDependencies() {
+  let persisted: TwentyFirstBoardPersistenceInput | null = null;
+  return {
+    renderCandidates: vi.fn(async ({ blueprints }) =>
+      blueprints.map((blueprint: { heroFamily: string }) => ({
+        heroFamily: blueprint.heroFamily,
+        buffer: Buffer.from(`frontmind-baseline:${blueprint.heroFamily}`),
+      })),
+    ),
+    persistArtifact: vi.fn(async (input: { buffer: Buffer }) => ({
+      id: randomUUID(),
+      contentSha256: sha256(input.buffer),
+    })),
+    persistBoard: vi.fn(
+      async (_db: unknown, input: TwentyFirstBoardPersistenceInput) => {
+        persisted = input;
+        return {
+          batchId: "55555555-5555-4555-8555-555555555555",
+          candidateCount: input.mirroredCandidates.length,
+          selectionBundleHash: input.selectionBundleArtifact.contentSha256,
+        };
+      },
+    ),
+    persisted: () => persisted,
+  };
+}
+
 describe("21st SiteOps provider", () => {
   it("reuses a board already committed for the same leased operation", async () => {
     const getCredential = vi.fn();
@@ -265,6 +292,12 @@ describe("21st SiteOps provider", () => {
         };
       },
     );
+    const renderCandidates = vi.fn(async ({ blueprints }) =>
+      blueprints.map((blueprint) => ({
+        heroFamily: blueprint.heroFamily,
+        buffer: Buffer.from(`frontmind:${blueprint.heroFamily}`, "utf8"),
+      })),
+    );
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
       loadContext: async () => providerContext(),
@@ -284,8 +317,14 @@ describe("21st SiteOps provider", () => {
           width: 1200,
           height: 800,
           sha256: sha256(buffer),
+          visualSignals: {
+            dominantHex: "#241238",
+            brightness: 36,
+            contrast: 74,
+          },
         };
       }),
+      renderCandidates,
       persistArtifact: persistArtifact as never,
       persistBoard,
     });
@@ -303,7 +342,7 @@ describe("21st SiteOps provider", () => {
         actual: {
           searched: 18,
           shortlisted: 12,
-          mirrored: 14,
+          mirrored: 12,
           presented: 9,
         },
       },
@@ -314,31 +353,69 @@ describe("21st SiteOps provider", () => {
     expect(detailCalls).toHaveLength(0);
     expect(persisted).not.toBeNull();
     expect(persisted!.mirroredCandidates).toHaveLength(9);
+    expect(renderCandidates).toHaveBeenCalledOnce();
+    const renderedBlueprints = renderCandidates.mock.calls[0]![0].blueprints;
+    expect(renderedBlueprints).toHaveLength(9);
+    expect(
+      renderedBlueprints.every(
+        (blueprint) =>
+          blueprint.palette.canvas === "#100b24" &&
+          blueprint.backgroundStyle === "dark" &&
+          blueprint.density === "compact" &&
+          blueprint.decorationStyle === "grid",
+      ),
+    ).toBe(true);
     expect(persisted!.selectionBundle).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       searchTarget: 18,
-      shortlistTarget: 12,
       displayTarget: 9,
     });
     expect(
       persisted!.selectionBundle.candidates.map((item) => item.label),
     ).toEqual(["A", "B", "C", "D", "E", "F", "G", "H", "I"]);
-    expect(persisted!.selectionBundle.supportingCandidates).toHaveLength(2);
     expect(
       persisted!.mirroredCandidates.every(
         (item) =>
-          item.candidate.catalogRole === "hero" &&
-          item.candidate.heroEligibility.eligible,
+          item.referenceBlueprint.componentManifest.includes(
+            `hero:${item.referenceBlueprint.heroFamily}`,
+          ),
       ),
     ).toBe(true);
     expect(persisted!.selectionBundle.candidates[0]).toMatchObject({
-      providerItemKey: "n:1",
+      providerItemKey: expect.stringMatching(/^s:frontmind:/u),
+      referenceBlueprint: {
+        schemaVersion: 3,
+        heroFamily: "floating_orbit",
+        palette: {
+          canvas: "#100b24",
+          ink: "#f5f3ff",
+          accent: "#c4b5fd",
+          muted: "#2e1a5e",
+        },
+        backgroundStyle: "dark",
+        density: "compact",
+        decorationStyle: "grid",
+      },
       visualEvidence: {
         evidenceKind: "catalog_metadata_preview_v1",
-        providerItemKey: "n:1",
+        providerItemKey: expect.stringMatching(/^s:frontmind:/u),
         taxonomyDerivationVersion: "catalog-metadata-preview-v1",
       },
     });
+    expect(
+      new Set(
+        persisted!.selectionBundle.candidates.map(
+          (candidate) => candidate.referenceBlueprint.heroFamily,
+        ),
+      ).size,
+    ).toBe(9);
+    expect(
+      new Set(
+        persisted!.selectionBundle.candidates.map(
+          (candidate) => candidate.previewSha256,
+        ),
+      ).size,
+    ).toBe(9);
     const persistedText = JSON.stringify(persisted);
     const artifactText = Buffer.concat(
       artifacts.map((artifact) => artifact.buffer),
@@ -349,7 +426,12 @@ describe("21st SiteOps provider", () => {
     }
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-visual-preview"),
-    ).toHaveLength(14);
+    ).toHaveLength(12);
+    expect(
+      artifacts.filter(
+        (artifact) => artifact.kind === "frontmind-visual-preview",
+      ),
+    ).toHaveLength(9);
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"),
     ).toHaveLength(1);
@@ -426,9 +508,8 @@ describe("21st SiteOps provider", () => {
     log.mockRestore();
   });
 
-  it("fails honestly when the real catalog yields no candidate", async () => {
-    const persistArtifact = vi.fn();
-    const persistBoard = vi.fn();
+  it("renders nine trusted FrontMind candidates when the catalog is empty", async () => {
+    const baseline = frontMindBaselineDependencies();
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
       loadContext: async () => providerContext(),
@@ -447,8 +528,7 @@ describe("21st SiteOps provider", () => {
             },
           }),
       },
-      persistArtifact: persistArtifact as never,
-      persistBoard,
+      ...baseline,
     });
 
     await expect(
@@ -457,15 +537,38 @@ describe("21st SiteOps provider", () => {
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({
-      status: "failed",
-      code: "MCP_SEARCH_EMPTY",
+      status: "succeeded",
+      result: {
+        candidateCount: 9,
+        degradedReasons: expect.arrayContaining([
+          "FRONTMIND_BASELINE:CATALOG_EMPTY",
+        ]),
+      },
     });
-    expect(persistArtifact).not.toHaveBeenCalled();
-    expect(persistBoard).not.toHaveBeenCalled();
+    expect(baseline.persistBoard).toHaveBeenCalledOnce();
+    expect(
+      new Set(
+        baseline
+          .persisted()!
+          .selectionBundle.candidates.map(
+            (candidate) => candidate.referenceBlueprint.heroFamily,
+          ),
+      ).size,
+    ).toBe(9);
+    expect(
+      new Set(
+        baseline
+          .persisted()!
+          .selectionBundle.candidates.map(
+            (candidate) => candidate.previewSha256,
+          ),
+      ).size,
+    ).toBe(9);
   });
 
   it("distinguishes missing preview references from an empty catalog", async () => {
     let id = 0;
+    const baseline = frontMindBaselineDependencies();
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
       loadContext: async () => providerContext(),
@@ -483,6 +586,7 @@ describe("21st SiteOps provider", () => {
             }),
           }),
       },
+      ...baseline,
     });
     await expect(
       handler({
@@ -490,16 +594,21 @@ describe("21st SiteOps provider", () => {
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({
-      status: "failed",
-      code: "NO_SAFE_PREVIEW_REFERENCES",
-      result: { normalizedUnique: 4, withPreviewReference: 0 },
+      status: "succeeded",
+      result: {
+        candidateCount: 9,
+        diagnostics: { normalizedUnique: 4, withPreviewReference: 0 },
+        degradedReasons: expect.arrayContaining([
+          "FRONTMIND_BASELINE:NO_SAFE_PREVIEW",
+        ]),
+      },
     });
   });
 
-  it("fails with NO_HERO_VISUAL_CANDIDATES instead of filling A-I with sections", async () => {
+  it("uses nine trusted families instead of filling the board with sections", async () => {
     let searchIndex = 0;
     const fetchPreview = vi.fn();
-    const persistBoard = vi.fn();
+    const baseline = frontMindBaselineDependencies();
     const names = ["Pricing", "Sidebar", "Testimonial", "Motion Reference"];
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
@@ -528,7 +637,7 @@ describe("21st SiteOps provider", () => {
           }),
       },
       fetchPreview,
-      persistBoard,
+      ...baseline,
     });
 
     await expect(
@@ -537,15 +646,21 @@ describe("21st SiteOps provider", () => {
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({
-      status: "failed",
-      code: "NO_HERO_VISUAL_CANDIDATES",
+      status: "succeeded",
+      result: {
+        candidateCount: 9,
+        degradedReasons: expect.arrayContaining([
+          "FRONTMIND_BASELINE:NO_HERO_REFERENCE",
+        ]),
+      },
     });
     expect(fetchPreview).not.toHaveBeenCalled();
-    expect(persistBoard).not.toHaveBeenCalled();
+    expect(baseline.persistBoard).toHaveBeenCalledOnce();
   });
 
   it("reports aggregate mirror diagnostics without leaking preview URLs", async () => {
     let id = 0;
+    const baseline = frontMindBaselineDependencies();
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
       loadContext: async () => providerContext(),
@@ -575,18 +690,24 @@ describe("21st SiteOps provider", () => {
       fetchPreview: vi.fn(async () => {
         throw new Error("PREVIEW_FETCH_FAILED");
       }),
+      ...baseline,
     });
     const result = await handler({
       operation: operation(),
       signal: new AbortController().signal,
     });
     expect(result).toMatchObject({
-      status: "failed",
-      code: "PREVIEW_MIRROR_FAILED",
+      status: "succeeded",
       result: {
-        mirrorAttempted: 4,
-        mirrorSucceeded: 0,
-        rejectedByReason: { http: 4 },
+        candidateCount: 9,
+        diagnostics: {
+          mirrorAttempted: 2,
+          mirrorSucceeded: 0,
+          rejectedByReason: { http: 2 },
+        },
+        degradedReasons: expect.arrayContaining([
+          "FRONTMIND_BASELINE:PREVIEW_MIRROR_FAILED",
+        ]),
       },
     });
     expect(JSON.stringify(result)).not.toContain("token=secret");

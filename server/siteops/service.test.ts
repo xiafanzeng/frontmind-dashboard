@@ -17,6 +17,7 @@ import {
   normalizeSiteOpsDomain,
   parseSiteOpsActionPayload,
   referenceBlueprintForSiteOpsRevision,
+  requireAcceptedSiteOpsRebuild,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
   siteBriefFromSnapshot,
@@ -34,8 +35,21 @@ import {
   siteOpsSendMessageInputSchema,
 } from "../../shared/siteops";
 import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
+import { referenceBlueprintV3ForFamily } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it("requires an accepted rebuild ticket for every child-build admission", () => {
+    expect(() =>
+      requireAcceptedSiteOpsRebuild({ status: "submitted" }),
+    ).toThrowError(SiteOpsServiceError);
+    expect(() =>
+      requireAcceptedSiteOpsRebuild({ status: null }),
+    ).toThrowError(SiteOpsServiceError);
+    expect(() =>
+      requireAcceptedSiteOpsRebuild({ status: "in_progress" }),
+    ).not.toThrow();
+  });
+
   it("freezes the selected production F reference to a hashed floating-orbit blueprint", () => {
     const visualEvidence = createVisualEvidenceV1({
       evidenceKind: "catalog_metadata_preview_v1",
@@ -84,6 +98,52 @@ describe("SiteOps core contracts", () => {
         derivedReferenceBlueprint: frozen,
       }),
     ).toEqual(frozen);
+  });
+
+  it("freezes an exact host-rendered V3 blueprint and local preview", () => {
+    const sampleId = "10000000-0000-4000-8000-000000000001";
+    const previewLocalAssetId = "20000000-0000-4000-8000-000000000002";
+    const providerItemKey = "s:frontmind:editorial:evidence";
+    const visualEvidence = createVisualEvidenceV1({
+      evidenceKind: "catalog_metadata_preview_v1",
+      providerItemKey,
+      metadataSha256: "a".repeat(64),
+      providerResponseSha256: "b".repeat(64),
+      previewSha256: "c".repeat(64),
+      taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+    });
+    const blueprint = referenceBlueprintV3ForFamily({
+      candidateId: sampleId,
+      providerItemKey,
+      previewLocalAssetId,
+      previewSha256: visualEvidence.previewSha256,
+      heroFamily: "editorial",
+      inspirationEvidenceIds: ["d".repeat(64)],
+    });
+    expect(
+      freezeSiteOpsReferenceBlueprint({
+        sampleId,
+        previewLocalAssetId,
+        note: "编辑杂志式",
+        sourceMetadata: {
+          providerItemKey,
+          visualEvidence,
+          referenceBlueprint: blueprint,
+        },
+      }),
+    ).toEqual(blueprint);
+    expect(() =>
+      freezeSiteOpsReferenceBlueprint({
+        sampleId,
+        previewLocalAssetId: "30000000-0000-4000-8000-000000000003",
+        note: "编辑杂志式",
+        sourceMetadata: {
+          providerItemKey,
+          visualEvidence,
+          referenceBlueprint: blueprint,
+        },
+      }),
+    ).toThrow("可信 Hero 构图合同");
   });
 
   it("freezes every new root or revision build to the current complete workflow coordinates", () => {
@@ -300,57 +360,66 @@ describe("SiteOps core contracts", () => {
     ).toThrow();
   });
 
-  it("strictly accepts only Base or Pro for visual build selection", () => {
+  it("keeps the customer build action free of API mode details", () => {
     const sampleId = "10000000-0000-4000-8000-000000000001";
     expect(
+      parseSiteOpsActionPayload("select_visual", { sampleId }),
+    ).toEqual({ sampleId });
+    expect(parseSiteOpsActionPayload("delegate_visual", {})).toEqual({});
+    expect(() =>
       parseSiteOpsActionPayload("select_visual", {
         sampleId,
         agentProfile: "frontmind-base",
       }),
-    ).toEqual({ sampleId, agentProfile: "frontmind-base" });
-    expect(
-      parseSiteOpsActionPayload("delegate_visual", {
-        agentProfile: "frontmind-pro",
-      }),
-    ).toEqual({ agentProfile: "frontmind-pro" });
-    expect(() =>
-      parseSiteOpsActionPayload("select_visual", {
-        sampleId,
-        agentProfile: "frontmind-lite",
-      }),
     ).toThrow();
-    expect(() =>
-      parseSiteOpsActionPayload("select_visual", { sampleId }),
-    ).toThrow();
-    expect(() => parseSiteOpsActionPayload("delegate_visual", {})).toThrow();
     expect(() =>
       parseSiteOpsActionPayload("delegate_visual", {
         agentProfile: "frontmind-pro",
-        apiKey: "must-not-be-accepted",
       }),
     ).toThrow();
   });
 
-  it("projects the frozen build profile for refresh and cross-device reads", () => {
+  it("rejects the legacy manual approval action before it can bypass atomic completion", () => {
+    expect(() =>
+      parseSiteOpsActionPayload("approve_build", {
+        buildId: "10000000-0000-4000-8000-000000000001",
+      }),
+    ).toThrow("官网制作和检查完成后会自动批准");
+  });
+
+  it("accepts a concise rebuild request without technical coordinates", () => {
+    expect(
+      parseSiteOpsActionPayload("request_rebuild", {
+        reason: "希望重新梳理首页叙事。",
+      }),
+    ).toEqual({ reason: "希望重新梳理首页叙事。" });
+    expect(() =>
+      parseSiteOpsActionPayload("request_rebuild", {
+        reason: "重制",
+        buildId: "10000000-0000-4000-8000-000000000001",
+      }),
+    ).toThrow();
+  });
+
+  it("keeps frozen build profiles and QA coordinates out of customer reads", () => {
     const projected = siteOpsBuildProjectionSchema.parse({
       id: "10000000-0000-4000-8000-000000000001",
       ordinal: 2,
       parentBuildId: null,
-      agentProfile: "frontmind-base",
       status: "building",
       previewUrl: null,
       sourceUrl: null,
-      qaUrl: null,
-      errorCode: null,
-      errorMessage: null,
+      needsHelp: false,
       createdAt: "2026-08-22T00:00:00.000Z",
       updatedAt: "2026-08-22T00:00:00.000Z",
     });
-    expect(projected.agentProfile).toBe("frontmind-base");
+    expect(projected).not.toHaveProperty("agentProfile");
+    expect(projected).not.toHaveProperty("qaUrl");
     expect(() =>
       siteOpsBuildProjectionSchema.parse({
         ...projected,
-        agentProfile: "frontmind-lite",
+        agentProfile: "frontmind-base",
+        qaUrl: "/internal/qa",
       }),
     ).toThrow();
   });

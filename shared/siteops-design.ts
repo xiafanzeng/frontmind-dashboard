@@ -29,6 +29,25 @@ export const siteHeroFamilySchema = z.enum([
   "proof_grid",
   "full_bleed_statement",
 ]);
+
+/** The current customer-facing board is intentionally narrower than the
+ * historical React 2.0 component library. `proof_grid` remains readable for
+ * immutable 2.0 builds, but is not a standalone visual family in V3. */
+export const FRONTMIND_VISUAL_FAMILIES_V3 = [
+  "floating_orbit",
+  "split_media",
+  "editorial",
+  "bento",
+  "feature_grid",
+  "centered_dual_cta",
+  "immersive_visual",
+  "product_stage",
+  "full_bleed_statement",
+] as const satisfies readonly z.infer<typeof siteHeroFamilySchema>[];
+
+export const frontMindVisualFamilyV3Schema = z.enum(
+  FRONTMIND_VISUAL_FAMILIES_V3,
+);
 export const siteSectionVariantSchema = z.enum([
   "statement",
   "split",
@@ -166,10 +185,121 @@ export const referenceBlueprintV2Schema = referenceBlueprintV2BaseSchema
     }
   });
 
+const visualPaletteV3Schema = z
+  .object({
+    canvas: z.string().regex(/^#[a-f0-9]{6}$/u),
+    ink: z.string().regex(/^#[a-f0-9]{6}$/u),
+    accent: z.string().regex(/^#[a-f0-9]{6}$/u),
+    muted: z.string().regex(/^#[a-f0-9]{6}$/u),
+  })
+  .strict();
+
+function visualRelativeLuminanceV3(hex: string) {
+  const channels = [1, 3, 5].map(
+    (offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255,
+  );
+  const linear = channels.map((channel) =>
+    channel <= 0.04045
+      ? channel / 12.92
+      : Math.pow((channel + 0.055) / 1.055, 2.4),
+  );
+  return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
+}
+
+function visualContrastRatioV3(left: string, right: string) {
+  const leftLuminance = visualRelativeLuminanceV3(left);
+  const rightLuminance = visualRelativeLuminanceV3(right);
+  return (
+    (Math.max(leftLuminance, rightLuminance) + 0.05) /
+    (Math.min(leftLuminance, rightLuminance) + 0.05)
+  );
+}
+
+export function visualPaletteContrastFailuresV3(
+  palette: z.infer<typeof visualPaletteV3Schema>,
+) {
+  return [
+    ["ink/canvas", palette.ink, palette.canvas, 7],
+    ["accent/canvas", palette.accent, palette.canvas, 4.5],
+    ["ink/muted", palette.ink, palette.muted, 4.5],
+    ["accent/muted", palette.accent, palette.muted, 4.5],
+  ]
+    .filter(
+      ([, foreground, background, minimum]) =>
+        visualContrastRatioV3(foreground as string, background as string) <
+        (minimum as number),
+    )
+    .map(([name]) => name as string);
+}
+
+export function assertVisualPaletteContrastV3(
+  palette: z.infer<typeof visualPaletteV3Schema>,
+) {
+  if (visualPaletteContrastFailuresV3(palette).length > 0) {
+    throw new Error("SITEOPS_VISUAL_PALETTE_CONTRAST_INVALID");
+  }
+}
+
+const referenceBlueprintV3BaseSchema = referenceBlueprintV2BaseSchema
+  .omit({ schemaVersion: true })
+  .extend({
+    schemaVersion: z.literal(3),
+    heroFamily: frontMindVisualFamilyV3Schema,
+    previewLocalAssetId: z.string().uuid(),
+    palette: visualPaletteV3Schema,
+    typeSystem: z.enum([
+      "display_sans",
+      "editorial_serif",
+      "technical_sans",
+      "humanist_sans",
+    ]),
+    componentManifest: z.array(z.string().trim().min(1).max(96)).min(2).max(16),
+    inspirationEvidenceIds: z.array(sha256Schema).min(1).max(3),
+  })
+  .strict();
+
+/** V3 is a host-rendered, WYSIWYG visual contract. The provider evidence is
+ * retained only as inspiration coordinates; the preview and component family
+ * are both produced by FrontMind's trusted React host. */
+export const referenceBlueprintV3Schema = referenceBlueprintV3BaseSchema
+  .extend({ blueprintHash: sha256Schema })
+  .strict()
+  .superRefine((value, context) => {
+    const { blueprintHash: _blueprintHash, ...coordinates } = value;
+    if (blueprintHashForReference(coordinates) !== value.blueprintHash) {
+      context.addIssue({
+        code: "custom",
+        path: ["blueprintHash"],
+        message: "Reference blueprint hash does not match its coordinates",
+      });
+    }
+    const expectedHeroComponent = `hero:${value.heroFamily}`;
+    if (!value.componentManifest.includes(expectedHeroComponent)) {
+      context.addIssue({
+        code: "custom",
+        path: ["componentManifest"],
+        message: "Reference blueprint does not freeze its trusted Hero family",
+      });
+    }
+    const contrastFailures = visualPaletteContrastFailuresV3(value.palette);
+    if (contrastFailures.length > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["palette"],
+        message: `Reference blueprint palette does not meet trusted contrast: ${contrastFailures.join(", ")}`,
+      });
+    }
+  });
+
+export const referenceBlueprintSchema = z.union([
+  referenceBlueprintV3Schema,
+  referenceBlueprintV2Schema,
+]);
+
 export const siteDesignSpecV2Schema = z
   .object({
     schemaVersion: z.literal(2),
-    referenceBlueprint: referenceBlueprintV2Schema,
+    referenceBlueprint: referenceBlueprintSchema,
     layoutArchetype: siteLayoutArchetypeSchema,
     density: z.enum(["compact", "balanced", "spacious"]),
     surfaceStyle: z.enum(["flat", "bordered", "soft_depth", "layered"]),
@@ -287,7 +417,7 @@ export const siteOpsRuntimeVisualEvidenceV2Schema =
   siteOpsRuntimeVisualEvidenceV1Schema
     .extend({
       schemaVersion: z.literal(2),
-      referenceBlueprint: referenceBlueprintV2Schema,
+      referenceBlueprint: referenceBlueprintSchema,
     })
     .strict()
     .superRefine((value, context) => {
@@ -379,13 +509,13 @@ const buildPlanContractV3BaseSchema = z
       .object({
         kind: z.literal("react_static_v1"),
         reactVersion: z.string().trim().min(1).max(32),
-        componentLibraryVersion: z.literal("2.0.0"),
-        materializerVersion: z.literal("2.0.0"),
+        componentLibraryVersion: z.enum(["2.0.0", "2.1.0"]),
+        materializerVersion: z.enum(["2.0.0", "2.1.0"]),
       })
       .strict(),
     identity: buildContractV2Schema.shape.identity,
     visual: siteOpsRuntimeVisualEvidenceV1Schema,
-    referenceBlueprint: referenceBlueprintV2Schema,
+    referenceBlueprint: referenceBlueprintSchema,
     designSpecHash: sha256Schema,
     routes: buildContractV2Schema.shape.routes,
     assets: buildContractV2Schema.shape.assets,
@@ -449,6 +579,8 @@ export const buildContractV3Schema = buildPlanContractV3BaseSchema
 export type SiteDesignSpecV1 = z.infer<typeof siteDesignSpecV1Schema>;
 export type SiteHeroFamily = z.infer<typeof siteHeroFamilySchema>;
 export type ReferenceBlueprintV2 = z.infer<typeof referenceBlueprintV2Schema>;
+export type ReferenceBlueprintV3 = z.infer<typeof referenceBlueprintV3Schema>;
+export type ReferenceBlueprint = z.infer<typeof referenceBlueprintSchema>;
 export type SiteDesignSpecV2 = z.infer<typeof siteDesignSpecV2Schema>;
 export type SiteDesignSpec = SiteDesignSpecV1 | SiteDesignSpecV2;
 export type PageContentSpecV1 = z.infer<typeof pageContentSpecV1Schema>;
@@ -485,9 +617,7 @@ export function canonicalSiteOpsSha256(value: unknown) {
     .digest("hex");
 }
 
-function blueprintHashForReference(
-  value: z.infer<typeof referenceBlueprintV2BaseSchema>,
-) {
+function blueprintHashForReference(value: object) {
   return canonicalSiteOpsSha256(value);
 }
 
@@ -495,6 +625,15 @@ export function composeReferenceBlueprintV2(
   input: z.infer<typeof referenceBlueprintV2BaseSchema>,
 ): ReferenceBlueprintV2 {
   return referenceBlueprintV2Schema.parse({
+    ...input,
+    blueprintHash: blueprintHashForReference(input),
+  });
+}
+
+export function composeReferenceBlueprintV3(
+  input: z.infer<typeof referenceBlueprintV3BaseSchema>,
+): ReferenceBlueprintV3 {
+  return referenceBlueprintV3Schema.parse({
     ...input,
     blueprintHash: blueprintHashForReference(input),
   });
@@ -776,6 +915,419 @@ export function referenceBlueprintForVisualCandidate(input: {
     previewSha256: input.previewSha256,
     heroFamily,
     ...familyCoordinates[heroFamily],
+  });
+}
+
+export const FRONTMIND_VISUAL_FAMILY_LABELS_V3: Record<
+  (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+  string
+> = {
+  floating_orbit: "浮动轨道式",
+  split_media: "分屏媒体式",
+  editorial: "编辑杂志式",
+  bento: "Bento 模块式",
+  feature_grid: "功能网格式",
+  centered_dual_cta: "极简双按钮式",
+  immersive_visual: "沉浸视觉式",
+  product_stage: "产品舞台式",
+  full_bleed_statement: "全幅宣言式",
+};
+
+const FRONTMIND_VISUAL_PALETTES_V3: Record<
+  (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+  z.infer<typeof visualPaletteV3Schema>
+> = {
+  floating_orbit: {
+    canvas: "#f7f1e8",
+    ink: "#1f2937",
+    accent: "#a34805",
+    muted: "#eadfce",
+  },
+  split_media: {
+    canvas: "#f5f7ff",
+    ink: "#111827",
+    accent: "#4338ca",
+    muted: "#e0e7ff",
+  },
+  editorial: {
+    canvas: "#f4efe5",
+    ink: "#171717",
+    accent: "#991b1b",
+    muted: "#e7dccb",
+  },
+  bento: {
+    canvas: "#eff9f4",
+    ink: "#10382e",
+    accent: "#047451",
+    muted: "#d5eee2",
+  },
+  feature_grid: {
+    canvas: "#f1f5f9",
+    ink: "#0f172a",
+    accent: "#0369a1",
+    muted: "#dbeafe",
+  },
+  centered_dual_cta: {
+    canvas: "#fff7ed",
+    ink: "#2d1b14",
+    accent: "#c2410c",
+    muted: "#ffedd5",
+  },
+  immersive_visual: {
+    canvas: "#070b1b",
+    ink: "#f8fafc",
+    accent: "#a78bfa",
+    muted: "#1e1b4b",
+  },
+  product_stage: {
+    canvas: "#f8fafc",
+    ink: "#0b132b",
+    accent: "#1d4ed8",
+    muted: "#dbeafe",
+  },
+  full_bleed_statement: {
+    canvas: "#14110f",
+    ink: "#fff7ed",
+    accent: "#fb7185",
+    muted: "#3f2d32",
+  },
+};
+
+type VisualInspirationTaxonomyV3 = Pick<
+  z.infer<typeof visualTaxonomySchema>,
+  "palette" | "typography" | "layout" | "motion" | "accessibility"
+>;
+
+export type TrustedVisualPreviewBlueprintV3 = Pick<
+  ReferenceBlueprintV3,
+  | "heroFamily"
+  | "palette"
+  | "typeSystem"
+  | "density"
+  | "decorationStyle"
+  | "backgroundStyle"
+  | "gradientStyle"
+  | "typographyStyle"
+  | "radiusStyle"
+  | "motionLevel"
+>;
+
+const INSPIRATION_PALETTE_PACKS_V3 = {
+  light: {
+    warm: {
+      canvas: "#fff7ed",
+      ink: "#2d1b14",
+      accent: "#a34805",
+      muted: "#ffedd5",
+    },
+    cool: {
+      canvas: "#f5f7ff",
+      ink: "#111827",
+      accent: "#4338ca",
+      muted: "#e0e7ff",
+    },
+    green: {
+      canvas: "#f0fdf4",
+      ink: "#102a22",
+      accent: "#047857",
+      muted: "#d1fae5",
+    },
+    violet: {
+      canvas: "#faf5ff",
+      ink: "#2e1065",
+      accent: "#7e22ce",
+      muted: "#f3e8ff",
+    },
+    neutral: {
+      canvas: "#f8fafc",
+      ink: "#0f172a",
+      accent: "#334155",
+      muted: "#e2e8f0",
+    },
+  },
+  dark: {
+    warm: {
+      canvas: "#18110f",
+      ink: "#fff7ed",
+      accent: "#fb923c",
+      muted: "#3f261d",
+    },
+    cool: {
+      canvas: "#071426",
+      ink: "#f8fafc",
+      accent: "#60a5fa",
+      muted: "#172554",
+    },
+    green: {
+      canvas: "#061a14",
+      ink: "#ecfdf5",
+      accent: "#34d399",
+      muted: "#12372d",
+    },
+    violet: {
+      canvas: "#100b24",
+      ink: "#f5f3ff",
+      accent: "#c4b5fd",
+      muted: "#2e1a5e",
+    },
+    neutral: {
+      canvas: "#0f172a",
+      ink: "#f8fafc",
+      accent: "#94a3b8",
+      muted: "#1e293b",
+    },
+  },
+} as const;
+
+type InspirationHueV3 = keyof (typeof INSPIRATION_PALETTE_PACKS_V3)["light"];
+
+function hexHueBucketV3(value: string): InspirationHueV3 {
+  const channels = [1, 3, 5].map(
+    (offset) => Number.parseInt(value.slice(offset, offset + 2), 16) / 255,
+  );
+  const maximum = Math.max(...channels);
+  const minimum = Math.min(...channels);
+  const delta = maximum - minimum;
+  if (delta < 0.12) return "neutral";
+  let hue = 0;
+  if (maximum === channels[0]) {
+    hue = 60 * (((channels[1]! - channels[2]!) / delta) % 6);
+  } else if (maximum === channels[1]) {
+    hue = 60 * ((channels[2]! - channels[0]!) / delta + 2);
+  } else {
+    hue = 60 * ((channels[0]! - channels[1]!) / delta + 4);
+  }
+  if (hue < 0) hue += 360;
+  if (hue < 45 || hue >= 330) return "warm";
+  if (hue < 160) return "green";
+  if (hue < 250) return "cool";
+  return "violet";
+}
+
+function hexIsDarkV3(value: string) {
+  const channels = [1, 3, 5].map(
+    (offset) => Number.parseInt(value.slice(offset, offset + 2), 16) / 255,
+  );
+  const luminance =
+    channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722;
+  return luminance < 0.42;
+}
+
+function projectTrustedInspirationTokensV3(
+  taxonomies: readonly VisualInspirationTaxonomyV3[],
+) {
+  const paletteValues = taxonomies.flatMap((taxonomy) => taxonomy.palette);
+  const typographyValues = new Set(
+    taxonomies.flatMap((taxonomy) => taxonomy.typography),
+  );
+  const layoutValues = new Set(
+    taxonomies.flatMap((taxonomy) => taxonomy.layout),
+  );
+  const dominantHex = paletteValues.find((value) =>
+    /^#[a-f0-9]{6}$/u.test(value),
+  );
+  const paletteTokens = new Set(
+    paletteValues.filter((value) =>
+      [
+        "dark-canvas",
+        "light-canvas",
+        "muted-palette",
+        "high-contrast",
+        "single-accent",
+      ].includes(value),
+    ),
+  );
+  const hasTypographySignal = [
+    "display-led-hierarchy",
+    "condensed-technical",
+    "serif-editorial",
+    "neutral-sans",
+  ].some((value) => typographyValues.has(value));
+  const hasLayoutSignal = [
+    "asymmetric-grid",
+    "modular-grid",
+    "editorial-rhythm",
+    "border-defined",
+    "soft-shadow-depth",
+    "glass-like-layering",
+    "rounded-containers",
+    "illustration-led",
+    "technical-precise",
+    "warm-human",
+    "premium-restrained",
+    "bold-graphic",
+  ].some((value) => layoutValues.has(value));
+  if (
+    !dominantHex &&
+    paletteTokens.size === 0 &&
+    !hasTypographySignal &&
+    !hasLayoutSignal
+  ) {
+    return null;
+  }
+
+  const hasColorSignal =
+    Boolean(dominantHex) ||
+    paletteTokens.size > 0 ||
+    layoutValues.has("warm-human") ||
+    layoutValues.has("technical-precise") ||
+    layoutValues.has("bold-graphic");
+
+  const dark = paletteTokens.has("dark-canvas")
+    ? true
+    : paletteTokens.has("light-canvas")
+      ? false
+      : dominantHex
+        ? hexIsDarkV3(dominantHex)
+        : false;
+  const hue: InspirationHueV3 = dominantHex
+    ? hexHueBucketV3(dominantHex)
+    : layoutValues.has("warm-human")
+      ? "warm"
+      : layoutValues.has("technical-precise")
+        ? "cool"
+        : layoutValues.has("bold-graphic")
+          ? "violet"
+          : "neutral";
+  const typeSystem = typographyValues.has("serif-editorial")
+    ? ("editorial_serif" as const)
+    : typographyValues.has("condensed-technical") ||
+        layoutValues.has("technical-precise")
+      ? ("technical_sans" as const)
+      : layoutValues.has("warm-human")
+        ? ("humanist_sans" as const)
+        : hasTypographySignal
+          ? ("display_sans" as const)
+          : null;
+  const density =
+    layoutValues.has("modular-grid") || layoutValues.has("technical-precise")
+      ? ("compact" as const)
+      : layoutValues.has("editorial-rhythm") ||
+          layoutValues.has("premium-restrained") ||
+          layoutValues.has("warm-human")
+        ? ("spacious" as const)
+        : null;
+  const decorationStyle = layoutValues.has("editorial-rhythm")
+    ? ("editorial_lines" as const)
+    : layoutValues.has("modular-grid") || layoutValues.has("technical-precise")
+      ? ("grid" as const)
+      : dark || layoutValues.has("bold-graphic")
+        ? ("glow" as const)
+        : layoutValues.has("illustration-led") || layoutValues.has("warm-human")
+          ? ("orbital" as const)
+          : null;
+  return {
+    palette: hasColorSignal
+      ? INSPIRATION_PALETTE_PACKS_V3[dark ? "dark" : "light"][hue]
+      : null,
+    backgroundStyle: hasColorSignal
+      ? dark
+        ? ("dark" as const)
+        : hue === "warm"
+          ? ("warm_light" as const)
+          : ("cool_light" as const)
+      : null,
+    gradientStyle: hasColorSignal && dark ? ("spotlight" as const) : null,
+    typographyStyle: typeSystem
+      ? typeSystem === "editorial_serif"
+        ? ("editorial" as const)
+        : typeSystem === "technical_sans"
+          ? ("technical" as const)
+          : typeSystem === "humanist_sans"
+            ? ("restrained" as const)
+            : ("display" as const)
+      : null,
+    typeSystem,
+    density,
+    decorationStyle,
+  };
+}
+
+export function trustedVisualPreviewBlueprintV3(
+  heroFamily: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+  inspirationTaxonomies: readonly VisualInspirationTaxonomyV3[] = [],
+): TrustedVisualPreviewBlueprintV3 {
+  const baselineTypeSystem =
+    heroFamily === "editorial"
+      ? ("editorial_serif" as const)
+      : heroFamily === "feature_grid" || heroFamily === "product_stage"
+        ? ("technical_sans" as const)
+        : heroFamily === "floating_orbit" || heroFamily === "bento"
+          ? ("humanist_sans" as const)
+          : ("display_sans" as const);
+  const baseline = referenceBlueprintForVisualCandidate({
+    candidateId: "frontmind-baseline",
+    providerItemKey: "s:frontmind:baseline",
+    previewSha256: "0".repeat(64),
+    title: heroFamily,
+  });
+  const projected = projectTrustedInspirationTokensV3(inspirationTaxonomies);
+  const previewBlueprint = {
+    heroFamily,
+    palette: projected?.palette ?? FRONTMIND_VISUAL_PALETTES_V3[heroFamily],
+    typeSystem: projected?.typeSystem ?? baselineTypeSystem,
+    density: projected?.density ?? baseline.density,
+    decorationStyle: projected?.decorationStyle ?? baseline.decorationStyle,
+    backgroundStyle: projected?.backgroundStyle ?? baseline.backgroundStyle,
+    gradientStyle: projected?.gradientStyle ?? baseline.gradientStyle,
+    typographyStyle: projected?.typographyStyle ?? baseline.typographyStyle,
+    radiusStyle: baseline.radiusStyle,
+    motionLevel: baseline.motionLevel,
+  };
+  assertVisualPaletteContrastV3(previewBlueprint.palette);
+  return previewBlueprint;
+}
+
+/** Freezes the exact trusted family used to render a V3 candidate preview.
+ * Provider metadata can influence the inspiration ledger but cannot change
+ * this family or supply executable components. */
+export function referenceBlueprintV3ForFamily(input: {
+  candidateId: string;
+  providerItemKey: string;
+  previewLocalAssetId: string;
+  previewSha256: string;
+  heroFamily: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number];
+  inspirationEvidenceIds: string[];
+  previewBlueprint?: TrustedVisualPreviewBlueprintV3;
+}) {
+  const mapped = referenceBlueprintForVisualCandidate({
+    candidateId: input.candidateId,
+    providerItemKey: input.providerItemKey,
+    previewSha256: input.previewSha256,
+    title: input.heroFamily,
+  });
+  const {
+    schemaVersion: _schemaVersion,
+    blueprintHash: _blueprintHash,
+    ...v2
+  } = mapped;
+  const previewBlueprint =
+    input.previewBlueprint ?? trustedVisualPreviewBlueprintV3(input.heroFamily);
+  if (previewBlueprint.heroFamily !== input.heroFamily) {
+    throw new Error("SITEOPS_VISUAL_PREVIEW_FAMILY_MISMATCH");
+  }
+  assertVisualPaletteContrastV3(previewBlueprint.palette);
+  return composeReferenceBlueprintV3({
+    schemaVersion: 3,
+    ...v2,
+    heroFamily: input.heroFamily,
+    previewLocalAssetId: input.previewLocalAssetId,
+    palette: previewBlueprint.palette,
+    typeSystem: previewBlueprint.typeSystem,
+    density: previewBlueprint.density,
+    decorationStyle: previewBlueprint.decorationStyle,
+    backgroundStyle: previewBlueprint.backgroundStyle,
+    gradientStyle: previewBlueprint.gradientStyle,
+    typographyStyle: previewBlueprint.typographyStyle,
+    radiusStyle: previewBlueprint.radiusStyle,
+    motionLevel: previewBlueprint.motionLevel,
+    componentManifest: [
+      `hero:${input.heroFamily}`,
+      `navigation:${mapped.navStyle}`,
+      `sections:${mapped.cardStyle}`,
+      `cta:${mapped.ctaStyle}`,
+    ],
+    inspirationEvidenceIds: input.inspirationEvidenceIds,
   });
 }
 

@@ -7,7 +7,7 @@ import {
   pageContentResultV1Schema,
   siteDesignResultV1Schema,
   siteDesignResultV2Schema,
-  type ReferenceBlueprintV2,
+  type ReferenceBlueprint,
 } from "../../shared/siteops-design";
 
 const layoutArchetypes = [
@@ -407,7 +407,7 @@ function canonicalRouteCompositions(
 export function siteDesignResultV2FromWire(
   value: unknown,
   routeIds: readonly string[],
-  referenceBlueprint: ReferenceBlueprintV2,
+  referenceBlueprint: ReferenceBlueprint,
 ) {
   const wire = siteDesignWireV3Schema.parse(value);
   return siteDesignResultV2Schema.parse({

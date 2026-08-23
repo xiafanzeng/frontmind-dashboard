@@ -19,9 +19,12 @@ import {
 } from "./providers";
 import { siteOpsQuotaStateForProviderResult } from "./quota-service";
 import { publicSiteOpsProviderResult } from "./public-errors";
+import { completeSiteOpsRebuildTicket } from "./rebuild-ticket";
 
 const DEFAULT_LEASE_MS = 2 * 60_000;
 const DEFAULT_TIMEOUT_MS = 90_000;
+const VISUAL_SEARCH_LEASE_MS = 5 * 60_000;
+const VISUAL_SEARCH_TIMEOUT_MS = 4 * 60_000;
 const BUILD_LEASE_MS = 12 * 60_000;
 const BUILD_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_BATCH = 4;
@@ -178,10 +181,13 @@ export function exclusiveSiteOpsLiveHeadProjection(
 
 export function domainFinancialTerminalProjection(
   status: "succeeded" | "failed" | "attention_required",
+  mutationAttempted = false,
 ) {
   return {
     status,
-    ...(status === "succeeded" || status === "failed"
+    ...(status === "succeeded" ||
+    status === "failed" ||
+    (status === "attention_required" && !mutationAttempted)
       ? { activeFinancialKey: null }
       : {}),
   } as const;
@@ -193,9 +199,18 @@ export function siteOpsWorkerMayClaimStatus(status: string) {
 
 export function siteOpsWorkerExecutionPolicy(kind: string) {
   const isBuild = kind === "site_build" || kind === "build_revision";
+  const isVisualSearch = kind === "visual_search";
   return {
-    leaseMs: isBuild ? BUILD_LEASE_MS : DEFAULT_LEASE_MS,
-    timeoutMs: isBuild ? BUILD_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
+    leaseMs: isBuild
+      ? BUILD_LEASE_MS
+      : isVisualSearch
+        ? VISUAL_SEARCH_LEASE_MS
+        : DEFAULT_LEASE_MS,
+    timeoutMs: isBuild
+      ? BUILD_TIMEOUT_MS
+      : isVisualSearch
+        ? VISUAL_SEARCH_TIMEOUT_MS
+        : DEFAULT_TIMEOUT_MS,
   } as const;
 }
 
@@ -500,6 +515,18 @@ async function finalize(
         };
       }
     }
+    if (
+      finalizedResult.status === "succeeded" &&
+      buildArtifactProjection &&
+      ["site_build", "build_revision"].includes(locked.kind)
+    ) {
+      finalizedResult = {
+        ...finalizedResult,
+        buildStatus: "approved",
+        projectStatus: "approved",
+        message: "官网已完成，可以打开预览。",
+      };
+    }
     const result = finalizedResult;
     const now = new Date();
     if (result.status === "pending") {
@@ -618,12 +645,33 @@ async function finalize(
             : {}),
           errorCode: unsuccessful ? result.code : null,
           errorMessage: unsuccessful ? result.message : null,
-          ...(locked.kind === "build_revision"
+          approvedAt:
+            !unsuccessful && result.buildStatus === "approved" ? now : null,
+          ...(["site_build", "build_revision"].includes(locked.kind)
             ? { quotaState: siteOpsQuotaStateForProviderResult(result.status) }
             : {}),
           updatedAt: now,
         })
         .where(eq(siteBuilds.id, locked.buildId));
+    }
+    if (!unsuccessful && locked.buildId && result.buildStatus === "approved") {
+      const completedBuildRows = await tx
+        .select({ parentBuildId: siteBuilds.parentBuildId })
+        .from(siteBuilds)
+        .where(
+          and(
+            eq(siteBuilds.id, locked.buildId),
+            eq(siteBuilds.projectId, locked.projectId),
+            eq(siteBuilds.userId, locked.userId),
+          ),
+        )
+        .limit(1);
+      await completeSiteOpsRebuildTicket(tx, {
+        userId: locked.userId,
+        parentBuildId: completedBuildRows[0]?.parentBuildId ?? null,
+        childBuildId: locked.buildId,
+        now,
+      });
     }
     await tx
       .update(socialPackages)
@@ -657,10 +705,17 @@ async function finalize(
     await tx
       .update(siteDomainOperations)
       .set({
-        // Known failure is terminal and releases the financial intent.
-        // attention_required retains it so neither staff nor a retry can
-        // produce a second charge while the provider outcome is unresolved.
-        ...domainFinancialTerminalProjection(result.status),
+        // Known terminal outcomes and pre-mutation rejections release the
+        // financial intent. Once a provider mutation was attempted, manual
+        // attention keeps the key so neither staff nor a retry can charge twice.
+        ...domainFinancialTerminalProjection(
+          result.status,
+          Boolean(
+            preservedTerminalState.providerTaskId ||
+              (preservedTerminalState.result as Record<string, unknown> | null)
+                ?.mutationAttempted === true,
+          ),
+        ),
         providerTaskNo: preservedTerminalState.providerTaskId,
         providerResult: preservedTerminalState.result,
         errorCode: unsuccessful ? result.code : null,
@@ -821,6 +876,9 @@ async function finalize(
     await tx
       .update(siteProjects)
       .set({
+        ...(!unsuccessful && result.buildStatus === "approved" && locked.buildId
+          ? { currentBuildId: locked.buildId }
+          : {}),
         status: liveHeadConflict
           ? "attention_required"
           : unsuccessful

@@ -320,7 +320,7 @@ const semanticSubpages = [
   {
     id: "website-management",
     section: "semantic",
-    label: "AI 友好官网管理",
+    label: "一站式建站",
     desc: "先购买并提交域名，领取 AI 运维返回的备案服务码后完成 ICP 备案。",
   },
 ];
@@ -1381,7 +1381,7 @@ function UserBrandDashboardContent({
                   : "进度报告"
                 : route.section === "semantic"
                   ? route.sub === "website-management"
-                    ? "AI 友好官网管理"
+                    ? "一站式建站"
                     : "内容资产运营"
                   : "服务页面";
   return (

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq, max } from "drizzle-orm";
 import { z } from "zod";
 
@@ -30,9 +30,16 @@ import {
 } from "../../shared/siteops-workflow";
 import {
   siteBriefSchema,
-  visualSelectionBundleV2Schema,
+  visualSelectionBundleV3Schema,
   type SiteBrief,
 } from "../../shared/siteops";
+import {
+  FRONTMIND_VISUAL_FAMILIES_V3,
+  FRONTMIND_VISUAL_FAMILY_LABELS_V3,
+  referenceBlueprintV3ForFamily,
+  trustedVisualPreviewBlueprintV3,
+  type ReferenceBlueprintV3,
+} from "../../shared/siteops-design";
 import { AuthServiceError } from "../auth-service";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
@@ -45,6 +52,7 @@ import {
 import { persistSiteOpsArtifact } from "./artifact-store";
 import { registerSiteOpsProviderHandler } from "./providers";
 import { fetchSafeVisualPreview } from "./remote-preview";
+import { renderTrustedVisualCandidatePreviews } from "./react-static-runtime";
 import type {
   SiteOpsProviderHandler,
   SiteOpsProviderResult,
@@ -79,7 +87,21 @@ type MirroredReference = {
   visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
 };
 
-type MirroredCandidate = MirroredReference & { optionLabel: string };
+type FrontMindBoardCandidate = {
+  sampleId: string;
+  optionLabel: string;
+  queryAxis: "foundation_split" | "foundation_editorial_modular";
+  providerItemKey: string;
+  title: string;
+  description: string;
+  taxonomy: ReturnType<typeof taxonomyFromDirectives>;
+  previewLocalAssetId: string;
+  previewSha256: string;
+  visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
+  referenceBlueprint: ReferenceBlueprintV3;
+  score: number;
+  rationale: string;
+};
 
 type PreviewRejectionReason =
   | "url"
@@ -109,9 +131,9 @@ export type VisualSearchDiagnostics = {
 export type TwentyFirstBoardPersistenceInput = {
   operation: SiteOperation;
   context: TwentyFirstProviderContext;
-  selectionBundle: z.infer<typeof visualSelectionBundleV2Schema>;
+  selectionBundle: z.infer<typeof visualSelectionBundleV3Schema>;
   selectionBundleArtifact: PreviewArtifact;
-  mirroredCandidates: MirroredCandidate[];
+  mirroredCandidates: FrontMindBoardCandidate[];
 };
 
 export type TwentyFirstProviderDependencies = {
@@ -123,6 +145,7 @@ export type TwentyFirstProviderDependencies = {
   getCredential?: typeof getTwentyFirstCredentialById;
   client?: Pick<TwentyFirstClient, "withReadOnlySession">;
   fetchPreview?: typeof fetchSafeVisualPreview;
+  renderCandidates?: typeof renderTrustedVisualCandidatePreviews;
   persistArtifact?: typeof persistSiteOpsArtifact;
   persistBoard?: (
     db: any,
@@ -147,6 +170,7 @@ type VisualSearchStage =
   | "load_credential"
   | "mcp_retrieval"
   | "mirror_previews"
+  | "render_host_previews"
   | "persist_selection_bundle"
   | "persist_board";
 
@@ -579,6 +603,165 @@ async function mirrorCandidates(input: {
   return mirrored;
 }
 
+function sha256Buffer(buffer: Buffer) {
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
+function legacyHeroVariantForFamily(
+  family: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+) {
+  if (family === "split_media") return "split_media" as const;
+  if (family === "editorial" || family === "bento" || family === "feature_grid") {
+    return "editorial_modular" as const;
+  }
+  if (family === "immersive_visual" || family === "full_bleed_statement") {
+    return "immersive_visual" as const;
+  }
+  return "centered_statement" as const;
+}
+
+async function createFrontMindBoardCandidates(input: {
+  operation: SiteOperation;
+  context: TwentyFirstProviderContext;
+  inspiration: MirroredReference[];
+  signal: AbortSignal;
+  renderCandidates: typeof renderTrustedVisualCandidatePreviews;
+  persistArtifact: typeof persistSiteOpsArtifact;
+}) {
+  const inspirationEvidenceIds = Array.from(
+    new Set(
+      input.inspiration
+        .slice(0, 3)
+        .map((item) => item.visualEvidence.evidenceSha256),
+    ),
+  );
+  if (inspirationEvidenceIds.length < 1) {
+    inspirationEvidenceIds.push(
+      canonicalSha256({
+        evidenceKind: "frontmind_baseline_tokens",
+        componentLibraryVersion: "2.1.0",
+        companyName: input.context.brief.companyName,
+      }),
+    );
+  }
+  const inspirationTaxonomies = input.inspiration
+    .slice(0, 3)
+    .map((item) => item.taxonomy);
+  const previewBlueprints = FRONTMIND_VISUAL_FAMILIES_V3.map((heroFamily) =>
+    trustedVisualPreviewBlueprintV3(heroFamily, inspirationTaxonomies),
+  );
+  const previewBlueprintByFamily = new Map(
+    previewBlueprints.map(
+      (blueprint) => [blueprint.heroFamily, blueprint] as const,
+    ),
+  );
+  const rendered = await input.renderCandidates({
+    brief: input.context.brief,
+    blueprints: previewBlueprints,
+    signal: input.signal,
+  });
+  const renderedByFamily = new Map(
+    rendered.map((item) => [item.heroFamily, item.buffer] as const),
+  );
+  if (
+    rendered.length !== FRONTMIND_VISUAL_FAMILIES_V3.length ||
+    renderedByFamily.size !== FRONTMIND_VISUAL_FAMILIES_V3.length ||
+    FRONTMIND_VISUAL_FAMILIES_V3.some(
+      (family) => !renderedByFamily.has(family),
+    )
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "FRONTMIND_VISUAL_RENDER_INCOMPLETE",
+      "9 个视觉候选未能完整生成，请稍后重试。",
+      "attention_required",
+    );
+  }
+  const candidates: FrontMindBoardCandidate[] = [];
+  const seenPreviewHashes = new Set<string>();
+  for (let index = 0; index < FRONTMIND_VISUAL_FAMILIES_V3.length; index += 1) {
+    const heroFamily = FRONTMIND_VISUAL_FAMILIES_V3[index]!;
+    const buffer = renderedByFamily.get(heroFamily)!;
+    const previewBlueprint = previewBlueprintByFamily.get(heroFamily)!;
+    const previewSha256 = sha256Buffer(buffer);
+    if (seenPreviewHashes.has(previewSha256)) {
+      throw new TwentyFirstProviderFailure(
+        "FRONTMIND_VISUAL_RENDER_DUPLICATE",
+        "视觉候选未形成九种不同构图，请稍后重试。",
+        "attention_required",
+      );
+    }
+    seenPreviewHashes.add(previewSha256);
+    const sampleId = randomUUID();
+    const providerItemKey = `s:frontmind:${heroFamily}:${inspirationEvidenceIds[0]!.slice(0, 12)}`;
+    const asset = await input.persistArtifact({
+      userId: input.operation.userId,
+      projectId: input.context.project.id,
+      kind: "frontmind-visual-preview",
+      filename: `frontmind-${heroFamily}.png`,
+      mimeType: "image/png",
+      buffer,
+      maxBytes: 5 * 1024 * 1024,
+    });
+    if (asset.contentSha256 !== previewSha256) {
+      throw new TwentyFirstProviderFailure(
+        "FRONTMIND_VISUAL_RENDER_HASH_MISMATCH",
+        "视觉候选写入校验失败。",
+        "attention_required",
+      );
+    }
+    const referenceBlueprint = referenceBlueprintV3ForFamily({
+      candidateId: sampleId,
+      providerItemKey,
+      previewLocalAssetId: asset.id,
+      previewSha256,
+      heroFamily,
+      inspirationEvidenceIds,
+      previewBlueprint,
+    });
+    const visualEvidence = createVisualEvidenceV1({
+      evidenceKind: VISUAL_EVIDENCE_KIND,
+      providerItemKey,
+      metadataSha256: canonicalSha256({
+        family: heroFamily,
+        companyName: input.context.brief.companyName,
+        inspirationEvidenceIds,
+      }),
+      providerResponseSha256: canonicalSha256({
+        renderer: "frontmind-react-static-preview-v1",
+        componentManifest: referenceBlueprint.componentManifest,
+      }),
+      previewSha256,
+      taxonomyDerivationVersion: VISUAL_TAXONOMY_DERIVATION_VERSION,
+    });
+    candidates.push({
+      sampleId,
+      optionLabel: String.fromCharCode(65 + index),
+      queryAxis:
+        index % 2 === 0
+          ? "foundation_split"
+          : "foundation_editorial_modular",
+      providerItemKey,
+      title: FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily],
+      description: `${FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily]}首页视觉方向`,
+      taxonomy: {
+        role: "foundation",
+        palette: Object.values(referenceBlueprint.palette),
+        typography: [referenceBlueprint.typeSystem],
+        layout: [heroFamily, referenceBlueprint.composition],
+        motion: [referenceBlueprint.motionLevel],
+        accessibility: ["mobile-reflow", "reduced-motion-required"],
+      },
+      previewLocalAssetId: asset.id,
+      previewSha256,
+      visualEvidence,
+      referenceBlueprint,
+      score: 100 - index,
+      rationale: `使用同一企业资料，由 FrontMind 可信组件渲染为${FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily]}。`,
+    });
+  }
+  return candidates;
+}
+
 async function persistDefaultBoard(
   db: any,
   input: TwentyFirstBoardPersistenceInput,
@@ -666,24 +849,32 @@ async function persistDefaultBoard(
         attachmentId: null,
         previewLocalAssetId: item.previewLocalAssetId,
         sourceMetadata: {
-          providerItemKey: item.candidate.providerItemKey,
-          queryAxis: item.candidate.queryAxis,
-          title: item.candidate.title,
-          description: item.candidate.description,
-          author: item.candidate.author,
-          sourceUrl: item.candidate.sourceUrl,
-          catalogRole: item.candidate.catalogRole,
-          heroEligibility: item.candidate.heroEligibility,
+          providerItemKey: item.providerItemKey,
+          queryAxis: item.queryAxis,
+          title: item.title,
+          description: item.description,
+          author: "FrontMind",
+          sourceUrl: null,
+          catalogRole: "hero",
+          heroFamily: item.referenceBlueprint.heroFamily,
+          heroEligibility: {
+            eligible: true,
+            confidence: "explicit",
+            variant: legacyHeroVariantForFamily(
+              item.referenceBlueprint.heroFamily,
+            ),
+            reasons: ["frontmind-trusted-react-family"],
+          },
           visualEvidence: item.visualEvidence,
+          referenceBlueprint: item.referenceBlueprint,
           taxonomy: {
             ...item.taxonomy,
-            scoreAxes: item.candidate.scoreBreakdown,
           },
-          score: item.candidate.score,
-          rationale: item.candidate.rationale,
+          score: item.score,
+          rationale: item.rationale,
         },
         label: item.optionLabel,
-        note: item.candidate.title,
+        note: item.title,
         sortOrder: index + 1,
       })),
     );
@@ -698,9 +889,7 @@ async function persistDefaultBoard(
       userId: input.operation.userId,
       role: "assistant",
       content:
-        input.mirroredCandidates.length === 9
-          ? "已准备 9 个真实首页 Hero 视觉方向，请选择 A–I，或明确委托 AI 选择。"
-          : `当前目录可用 ${input.mirroredCandidates.length} 个真实首页 Hero 视觉方向，已按实际结果展示，未使用其他区块或假图补齐。`,
+        "已准备 9 个不同风格的视觉候选，请选择一个方向。",
       sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
       metadata: {
         siteOps: {
@@ -711,7 +900,7 @@ async function persistDefaultBoard(
           payload: {
             batchId,
             candidateCount: input.mirroredCandidates.length,
-            targets: [18, 12, 9],
+            targets: [18, 9],
             degradedReasons: input.selectionBundle.degradedReasons,
           },
         },
@@ -802,6 +991,14 @@ function safeProviderFailure(
       result: diagnostics,
     };
   }
+  if (stage === "render_host_previews") {
+    return {
+      status: "attention_required",
+      code: "FRONTMIND_VISUAL_RENDER_FAILED",
+      message: "9 个视觉候选暂未能完整生成，请稍后重试。",
+      result: diagnostics,
+    };
+  }
   return {
     status: "attention_required",
     code: "VISUAL_BOARD_PERSISTENCE_FAILED",
@@ -819,6 +1016,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
     dependencies.getCredential ?? getTwentyFirstCredentialById;
   const client = dependencies.client ?? new TwentyFirstClient();
   const fetchPreview = dependencies.fetchPreview ?? fetchSafeVisualPreview;
+  const renderCandidates =
+    dependencies.renderCandidates ?? renderTrustedVisualCandidatePreviews;
   const persistArtifact =
     dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
@@ -876,110 +1075,74 @@ export function createTwentyFirstSiteOpsProviderHandler(
           }),
         { signal },
       );
-      if (diagnostics.normalizedUnique === 0) {
-        throw new TwentyFirstProviderFailure(
-          "MCP_SEARCH_EMPTY",
-          "21st 本轮没有返回可解析的真实目录结果。",
-        );
-      }
-      if (diagnostics.withPreviewReference === 0) {
-        throw new TwentyFirstProviderFailure(
-          "NO_SAFE_PREVIEW_REFERENCES",
-          "21st 本轮目录结果没有可安全读取的 HTTPS 视觉预览。",
-        );
-      }
-      if (funnel.retrievalShortlist.length === 0) {
-        throw new TwentyFirstProviderFailure(
-          "NO_HERO_VISUAL_CANDIDATES",
-          "本轮目录结果中没有可安全展示的首页 Hero 视觉方向，未使用其他区块或假图补位。",
-        );
-      }
-      stage = "mirror_previews";
-      const mirrored = await mirrorCandidates({
-        operation,
-        context,
-        candidates: [
-          ...funnel.retrievalShortlist,
-          ...funnel.supportingCandidates,
-        ],
-        signal,
-        fetchPreview,
-        persistArtifact,
-        diagnostics,
-      });
-      const heroReferences = mirrored.filter(
-        (item) =>
-          item.candidate.catalogRole === "hero" &&
-          item.candidate.heroEligibility.eligible,
-      );
-      if (heroReferences.length === 0) {
-        throw new TwentyFirstProviderFailure(
-          "PREVIEW_MIRROR_FAILED",
-          "目录返回了首页 Hero 预览，但本轮下载、解码或安全保存均未成功。",
-        );
-      }
-      const supportingReferences = mirrored.filter(
-        (item) => item.candidate.catalogRole === "support",
-      );
-      const displayReferences = heroReferences.slice(0, 9);
-      const mirroredCandidates: MirroredCandidate[] = displayReferences.map(
-        (item, index) => ({
-          ...item,
-          optionLabel: String.fromCharCode(65 + index),
-        }),
-      );
-      const selectedSupportingReferences = supportingReferences.slice(0, 2);
       const degradedReasons = funnel.degradedReasons.filter(
         (reason) => !reason.startsWith("PRESENTATION_RESULTS_INSUFFICIENT:"),
       );
+      if (diagnostics.normalizedUnique === 0) {
+        degradedReasons.push("FRONTMIND_BASELINE:CATALOG_EMPTY");
+      } else if (diagnostics.withPreviewReference === 0) {
+        degradedReasons.push("FRONTMIND_BASELINE:NO_SAFE_PREVIEW");
+      } else if (funnel.retrievalShortlist.length === 0) {
+        degradedReasons.push("FRONTMIND_BASELINE:NO_HERO_REFERENCE");
+      }
+      let heroReferences: MirroredReference[] = [];
+      if (funnel.retrievalShortlist.length > 0) {
+        stage = "mirror_previews";
+        const mirrored = await mirrorCandidates({
+          operation,
+          context,
+          candidates: funnel.retrievalShortlist,
+          signal,
+          fetchPreview,
+          persistArtifact,
+          diagnostics,
+        });
+        heroReferences = mirrored.filter(
+          (item) =>
+            item.candidate.catalogRole === "hero" &&
+            item.candidate.heroEligibility.eligible,
+        );
+        if (heroReferences.length === 0) {
+          degradedReasons.push("FRONTMIND_BASELINE:PREVIEW_MIRROR_FAILED");
+        }
+      }
+      stage = "render_host_previews";
+      const mirroredCandidates = await createFrontMindBoardCandidates({
+        operation,
+        context,
+        inspiration: heroReferences,
+        signal,
+        renderCandidates,
+        persistArtifact,
+      });
       const rejectedPreviews = Object.values(
         diagnostics.rejectedByReason,
       ).reduce((sum, count) => sum + (count ?? 0), 0);
       if (rejectedPreviews > 0) {
         degradedReasons.push(`PREVIEW_RESULTS_REJECTED:${rejectedPreviews}`);
       }
-      if (mirroredCandidates.length < 9) {
-        degradedReasons.push(
-          `PRESENTATION_RESULTS_INSUFFICIENT:${mirroredCandidates.length}/9`,
-        );
-      }
       stage = "persist_selection_bundle";
-      const selectionBundle = visualSelectionBundleV2Schema.parse({
-        schemaVersion: 2,
+      const selectionBundle = visualSelectionBundleV3Schema.parse({
+        schemaVersion: 3,
         queryPlanHash: canonicalSha256(queries),
         searchTarget: 18,
-        shortlistTarget: 12,
         displayTarget: 9,
         candidates: mirroredCandidates.map((item) => ({
           id: item.sampleId,
           label: item.optionLabel,
-          queryAxis: item.candidate.queryAxis,
-          providerItemKey: item.candidate.providerItemKey,
-          title: item.candidate.title,
-          description: item.candidate.description,
-          author: item.candidate.author,
-          sourceUrl: item.candidate.sourceUrl,
+          queryAxis: item.queryAxis,
+          providerItemKey: item.providerItemKey,
+          title: item.title,
+          description: item.description,
+          author: "FrontMind",
+          sourceUrl: null,
           visualEvidence: item.visualEvidence,
           previewLocalAssetId: item.previewLocalAssetId,
           previewSha256: item.previewSha256,
           taxonomy: item.taxonomy,
-          score: item.candidate.score,
-          rationale: item.candidate.rationale,
-        })),
-        supportingCandidates: selectedSupportingReferences.map((item) => ({
-          id: item.sampleId,
-          queryAxis: item.candidate.queryAxis,
-          providerItemKey: item.candidate.providerItemKey,
-          title: item.candidate.title,
-          description: item.candidate.description,
-          author: item.candidate.author,
-          sourceUrl: item.candidate.sourceUrl,
-          visualEvidence: item.visualEvidence,
-          previewLocalAssetId: item.previewLocalAssetId,
-          previewSha256: item.previewSha256,
-          taxonomy: item.taxonomy,
-          score: item.candidate.score,
-          rationale: item.candidate.rationale,
+          score: item.score,
+          rationale: item.rationale,
+          referenceBlueprint: item.referenceBlueprint,
         })),
         selectedCandidateId: null,
         delegated: false,
@@ -1031,9 +1194,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           degradedReasons: selectionBundle.degradedReasons,
         },
         message:
-          mirroredCandidates.length === 9
-            ? "9 个真实首页 Hero 视觉方向已准备完成，请选择 A–I。"
-            : `${mirroredCandidates.length} 个真实首页 Hero 视觉方向已按实际可用结果展示。`,
+          "9 个不同风格的视觉候选已准备完成，请选择一个方向。",
       };
     } catch (error) {
       console.error("[SiteOps21st] visual_search_failed", {
