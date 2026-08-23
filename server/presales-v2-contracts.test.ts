@@ -202,6 +202,7 @@ describe("Presales v2 contracts", () => {
         "dimensionNarratives",
         "limitations",
         "claimGuardrails",
+        "brandMentionRateTarget",
       ],
       "website.monitor-question-translation": [
         "schemaVersion",
@@ -240,6 +241,20 @@ describe("Presales v2 contracts", () => {
       expect(properties.executiveSummary.type).toBe("string");
       expect(properties.dimensionNarratives.type).toBe("object");
     }
+
+    const forecastProperties = PRESALES_V2_STRUCTURED_OUTPUT_SCHEMAS[
+      "website.optimization-forecast"
+    ].properties as Record<string, Record<string, unknown>>;
+    expect(forecastProperties.brandMentionRateTarget).toEqual({
+      type: ["object", "null"],
+      additionalProperties: false,
+      properties: {
+        low: { type: "number" },
+        expected: { type: "number" },
+        high: { type: "number" },
+      },
+      required: ["low", "expected", "high"],
+    });
 
     const serialized = JSON.stringify(PRESALES_V2_STRUCTURED_OUTPUT_SCHEMAS);
     expect(serialized).not.toContain('"payload"');

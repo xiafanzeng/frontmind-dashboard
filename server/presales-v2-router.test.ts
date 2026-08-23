@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +38,9 @@ import {
   type PresalesV2AssetRecord,
   type PresalesV2TaskRecord,
 } from "./presales-v2-store";
+
+const HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH =
+  "96bdf3df50dbabaca2618e198c7599c2fc53b3e41bff9076b21efcc2a79886b2";
 
 function taskRecord(
   overrides: Partial<PresalesV2TaskRecord> = {},
@@ -215,6 +219,90 @@ function sampleRestrictedStructuredValue(schema: Record<string, unknown>): any {
     );
   }
   throw new Error(`unsupported test schema type: ${String(type)}`);
+}
+
+function providerDefaultRestrictedStructuredValue(
+  schema: Record<string, unknown>,
+): any {
+  const allowed = Array.isArray(schema.enum) ? schema.enum : [];
+  if (allowed.length > 0) return allowed[0];
+  const rawTypes = Array.isArray(schema.type) ? schema.type : [schema.type];
+  const type = rawTypes.find((item) => item !== "null") ?? "null";
+  if (type === "null") return null;
+  if (type === "string") return "";
+  if (type === "integer" || type === "number") return 0;
+  if (type === "boolean") return false;
+  if (type === "array") return [];
+  if (type === "object") {
+    const properties = schema.properties as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+    return Object.fromEntries(
+      Object.entries(properties ?? {}).map(([key, child]) => [
+        key,
+        providerDefaultRestrictedStructuredValue(child),
+      ]),
+    );
+  }
+  throw new Error(`unsupported test schema type: ${String(type)}`);
+}
+
+function canonicalTestJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalTestJson).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalTestJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function meaningfulForecastValue(schema: Record<string, unknown>) {
+  const value = providerDefaultRestrictedStructuredValue(schema) as Record<
+    string,
+    any
+  >;
+  value.scenario.actionIds = ["GEO_A1_entity_facts"];
+  value.scenario.assumptions = ["企业按计划执行全部治理动作"];
+  value.scenario.verificationWeeks = [2, 4];
+  for (const dimension of Object.values(value.dimensions) as Array<
+    Record<string, Record<string, any>>
+  >) {
+    for (const indicator of Object.values(dimension)) {
+      indicator.gapClosureLow = 0.1;
+      indicator.gapClosureHigh = 0.2;
+      indicator.confidence = 0.8;
+      indicator.actionIds = ["GEO_A1_entity_facts"];
+      indicator.rationale = "完成实体事实治理后可形成可复测的条件改善";
+      indicator.dependencies = ["按计划完成企业事实资产更新"];
+      indicator.evidenceRefs = ["baseline:semantic-asset"];
+      indicator.timeToSignalWeeks = 2;
+      indicator.verificationMetric = "第 2 周和第 4 周按相同范围复测";
+    }
+  }
+  value.roadmap = [
+    {
+      phase: 1,
+      weeks: "第 1 周",
+      title: "统一企业事实",
+      actions: ["完成实体事实核验"],
+      verificationGate: "事实资产通过内部复核",
+    },
+  ];
+  value.summary = "在完整执行治理动作并保持相同采样范围的条件下复测。";
+  value.executiveSummary = "本预测是四周条件规划，不构成效果保证。";
+  for (const narrative of Object.values(value.dimensionNarratives) as Array<
+    Record<string, string>
+  >) {
+    narrative.currentFinding = "当前基线存在可明确定位的语义资产缺口。";
+    narrative.nextAction = "按路线图执行并在相同采样范围复测。";
+  }
+  value.limitations = ["结果依赖企业按计划执行并保持复测口径一致"];
+  return value;
 }
 
 describe("Presales v2 public contract", () => {
@@ -1507,6 +1595,207 @@ describe("Presales v2 public contract", () => {
     });
   });
 
+  it("rejects only the optimization forecast Provider default skeleton", () => {
+    const forecast = resolvePresalesV2Contract({
+      name: "website.optimization-forecast",
+      revision: 2,
+      schemaHash: PRESALES_V2_CONTRACT_HASHES["website.optimization-forecast"],
+    });
+    const forecastSchema = forecast.structuredOutputSchema! as Record<
+      string,
+      unknown
+    >;
+    const providerDefault = providerDefaultRestrictedStructuredValue(
+      forecastSchema,
+    ) as Record<string, unknown>;
+    const legacyDefault = structuredClone(providerDefault);
+    delete legacyDefault.brandMentionRateTarget;
+    const legacyCanonical = canonicalTestJson(legacyDefault);
+    expect(Buffer.byteLength(legacyCanonical, "utf8")).toBe(4_047);
+    expect(createHash("sha256").update(legacyCanonical).digest("hex")).toBe(
+      "29e03f5d2ba2c7fd327090db388167c8f24840953c041cbd00e9388a4dc80ddd",
+    );
+
+    for (const brandMentionRateTarget of [
+      null,
+      { low: 0.6, expected: 0.75, high: 0.9 },
+    ]) {
+      const skeleton = {
+        ...structuredClone(providerDefault),
+        brandMentionRateTarget,
+      };
+      expect(
+        decodePresalesV2StructuredResultV3(
+          [
+            {
+              id: "forecast-default",
+              type: "structured_output_result",
+              timestamp: 1,
+              structured_output_result: {
+                success: true,
+                value: skeleton,
+                error: null,
+              },
+            },
+            {
+              id: "forecast-stopped",
+              type: "status_update",
+              timestamp: 2,
+              status_update: { agent_status: "stopped" },
+            },
+          ],
+          forecast.name,
+          forecastSchema,
+          { requireStoppedAuthority: true, allowAssistantFallback: true },
+        ),
+      ).toEqual({
+        kind: "missing",
+        structuredEventCount: 1,
+        validCandidateCount: 0,
+      });
+    }
+
+    const assessment = resolvePresalesV2Contract({
+      name: "website.current-state-assessment",
+      revision: 2,
+      schemaHash:
+        PRESALES_V2_CONTRACT_HASHES["website.current-state-assessment"],
+    });
+    expect(
+      decodePresalesV2StructuredResultV3(
+        [
+          {
+            id: "assessment-default",
+            type: "structured_output_result",
+            timestamp: 1,
+            structured_output_result: {
+              success: true,
+              value: providerDefaultRestrictedStructuredValue(
+                assessment.structuredOutputSchema! as Record<string, unknown>,
+              ),
+              error: null,
+            },
+          },
+          {
+            id: "assessment-stopped",
+            type: "status_update",
+            timestamp: 2,
+            status_update: { agent_status: "stopped" },
+          },
+        ],
+        assessment.name,
+        assessment.structuredOutputSchema!,
+        { requireStoppedAuthority: true, allowAssistantFallback: true },
+      ),
+    ).toMatchObject({ kind: "accepted", source: "structured_object" });
+  });
+
+  it("uses meaningful assistant JSON when a forecast structured event is the Provider default", () => {
+    const contract = resolvePresalesV2Contract({
+      name: "website.optimization-forecast",
+      revision: 2,
+      schemaHash: PRESALES_V2_CONTRACT_HASHES["website.optimization-forecast"],
+    });
+    const schema = contract.structuredOutputSchema! as Record<string, unknown>;
+    const providerDefault = providerDefaultRestrictedStructuredValue(schema);
+    const assistantValue = meaningfulForecastValue(schema);
+    assistantValue.brandMentionRateTarget = null;
+    const decoded = decodePresalesV2StructuredResultV3(
+      [
+        {
+          id: "forecast-default",
+          type: "structured_output_result",
+          timestamp: 1,
+          structured_output_result: {
+            success: undefined,
+            value: providerDefault,
+            error: null,
+          },
+        },
+        {
+          id: "forecast-assistant",
+          type: "assistant_message",
+          timestamp: 2,
+          assistant_message: { content: JSON.stringify(assistantValue) },
+        },
+        {
+          id: "forecast-stopped",
+          type: "status_update",
+          timestamp: 3,
+          status_update: { agent_status: "stopped" },
+        },
+      ],
+      contract.name,
+      schema,
+      { requireStoppedAuthority: true, allowAssistantFallback: true },
+    );
+    expect(decoded).toMatchObject({
+      kind: "accepted",
+      source: "assistant_json_fallback",
+      eventId: "forecast-assistant",
+      value: { brandMentionRateTarget: null },
+      validCandidateCount: 1,
+    });
+  });
+
+  it("keeps a meaningful native forecast ahead of assistant fallback", () => {
+    const contract = resolvePresalesV2Contract({
+      name: "website.optimization-forecast",
+      revision: 2,
+      schemaHash: PRESALES_V2_CONTRACT_HASHES["website.optimization-forecast"],
+    });
+    const schema = contract.structuredOutputSchema! as Record<string, unknown>;
+    const nativeValue = meaningfulForecastValue(schema);
+    nativeValue.brandMentionRateTarget = {
+      low: 0.6,
+      expected: 0.75,
+      high: 0.9,
+    };
+    const assistantValue = meaningfulForecastValue(schema);
+    assistantValue.summary = "这是一个不同的、但同样符合传输合同的候选结果。";
+    const decoded = decodePresalesV2StructuredResultV3(
+      [
+        {
+          id: "forecast-native",
+          type: "structured_output_result",
+          timestamp: 1,
+          structured_output_result: {
+            success: true,
+            value: nativeValue,
+            error: null,
+          },
+        },
+        {
+          id: "forecast-assistant",
+          type: "assistant_message",
+          timestamp: 2,
+          assistant_message: { content: JSON.stringify(assistantValue) },
+        },
+        {
+          id: "forecast-stopped",
+          type: "status_update",
+          timestamp: 3,
+          status_update: { agent_status: "stopped" },
+        },
+      ],
+      contract.name,
+      schema,
+      { requireStoppedAuthority: true, allowAssistantFallback: true },
+    );
+    expect(decoded).toMatchObject({
+      kind: "accepted",
+      source: "structured_object",
+      eventId: "forecast-native",
+      value: {
+        brandMentionRateTarget: {
+          low: 0.6,
+          expected: 0.75,
+          high: 0.9,
+        },
+      },
+    });
+  });
+
   it("accepts stopped assistant fallback for all five structured contracts with only allowlisted completion", () => {
     const names = [
       "website.question-recommendation",
@@ -1959,6 +2248,196 @@ describe("Presales v2 public contract", () => {
     expect(failed).not.toHaveProperty("result");
     expect(failed).toMatchObject({
       error: { code: "INVALID_OUTPUT", retryable: false },
+    });
+  });
+
+  it.each(["queued", "running"] as const)(
+    "continues reconciling a historical forecast contract from %s",
+    async (status) => {
+      const now = new Date("2026-08-23T10:00:00.000Z");
+      const harness = reconcileHarness({
+        now,
+        events: [
+          {
+            id: `historical-forecast-${status}`,
+            type: "status_update",
+            timestamp: 1,
+            status_update: { agent_status: "running" },
+          },
+        ],
+        record: taskRecord({
+          contract: {
+            name: "website.optimization-forecast",
+            revision: 2,
+            schemaHash: HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH,
+          },
+          profile: "frontmind-base",
+          status,
+          structuredResult: null,
+          errorCode: null,
+          terminalAt: null,
+          providerStartedAt: new Date(now.getTime() - 60_000).toISOString(),
+          providerRunDeadlineAt: new Date(
+            now.getTime() + 29 * 60_000,
+          ).toISOString(),
+        }),
+      });
+
+      await expect(
+        presalesV2ReconcileTestHooks.reconcileTask(
+          harness.current().localTaskId,
+          harness.dependencies,
+        ),
+      ).resolves.toMatchObject({
+        status: "running",
+        structuredResult: null,
+        errorCode: null,
+      });
+    },
+  );
+
+  it("uses the historical forecast schema only for the exact historical hash", async () => {
+    const now = new Date("2026-08-23T10:00:00.000Z");
+    const currentContract = resolvePresalesV2Contract({
+      name: "website.optimization-forecast",
+      revision: 2,
+      schemaHash: PRESALES_V2_CONTRACT_HASHES["website.optimization-forecast"],
+    });
+    const legacyValue = meaningfulForecastValue(
+      currentContract.structuredOutputSchema! as Record<string, unknown>,
+    );
+    delete legacyValue.brandMentionRateTarget;
+    const legacyDefault = providerDefaultRestrictedStructuredValue(
+      currentContract.structuredOutputSchema! as Record<string, unknown>,
+    );
+    delete legacyDefault.brandMentionRateTarget;
+    const events: ManusV2MessageEvent[] = [
+      {
+        id: "historical-forecast-default",
+        type: "structured_output_result",
+        timestamp: 1,
+        structured_output_result: {
+          success: true,
+          value: legacyDefault,
+          error: null,
+        },
+      },
+      {
+        id: "historical-forecast-assistant",
+        type: "assistant_message",
+        timestamp: 2,
+        assistant_message: { content: JSON.stringify(legacyValue) },
+      },
+      {
+        id: "historical-forecast-stopped",
+        type: "status_update",
+        timestamp: 3,
+        status_update: { agent_status: "stopped" },
+      },
+    ];
+    const baseRecord = {
+      profile: "frontmind-base" as const,
+      status: "result_pending" as const,
+      structuredResult: null,
+      errorCode: null,
+      terminalAt: null,
+      resultDeadlineAt: new Date(now.getTime() + 60_000).toISOString(),
+      providerStartedAt: new Date(now.getTime() - 60_000).toISOString(),
+      providerRunDeadlineAt: new Date(
+        now.getTime() + 29 * 60_000,
+      ).toISOString(),
+    };
+    const historical = reconcileHarness({
+      now,
+      events,
+      record: taskRecord({
+        ...baseRecord,
+        contract: {
+          name: "website.optimization-forecast",
+          revision: 2,
+          schemaHash: HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH,
+        },
+      }),
+    });
+    const current = reconcileHarness({
+      now,
+      events,
+      record: taskRecord({
+        ...baseRecord,
+        contract: {
+          name: "website.optimization-forecast",
+          revision: 2,
+          schemaHash:
+            PRESALES_V2_CONTRACT_HASHES["website.optimization-forecast"],
+        },
+      }),
+    });
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        historical.current().localTaskId,
+        historical.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      structuredResult: legacyValue,
+      resultSource: "assistant_json_fallback",
+    });
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        current.current().localTaskId,
+        current.dependencies,
+      ),
+    ).resolves.toMatchObject({
+      status: "result_pending",
+      structuredResult: null,
+    });
+  });
+
+  it("does not admit the historical forecast hash for task creation or another contract", async () => {
+    expect(() =>
+      resolvePresalesV2Contract({
+        name: "website.optimization-forecast",
+        revision: 2,
+        schemaHash: HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH,
+      }),
+    ).toThrow(/CONTRACT_HASH_MISMATCH/u);
+
+    const now = new Date("2026-08-23T10:00:00.000Z");
+    const harness = reconcileHarness({
+      now,
+      events: [
+        {
+          id: "other-contract-running",
+          type: "status_update",
+          timestamp: 1,
+          status_update: { agent_status: "running" },
+        },
+      ],
+      record: taskRecord({
+        contract: {
+          name: "website.question-recommendation",
+          revision: 2,
+          schemaHash: HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH,
+        },
+        status: "running",
+        structuredResult: null,
+        terminalAt: null,
+        providerStartedAt: new Date(now.getTime() - 60_000).toISOString(),
+        providerRunDeadlineAt: new Date(
+          now.getTime() + 29 * 60_000,
+        ).toISOString(),
+      }),
+    });
+
+    await expect(
+      presalesV2ReconcileTestHooks.reconcileTask(
+        harness.current().localTaskId,
+        harness.dependencies,
+      ),
+    ).rejects.toMatchObject({
+      code: "CONTRACT_HASH_MISMATCH",
+      status: 409,
     });
   });
 

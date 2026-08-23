@@ -352,6 +352,14 @@ const optimizationForecastSchema = object({
     planningAssumptionOnly: literal("boolean", true),
     requiresSameScopeRemeasurement: literal("boolean", true),
   }),
+  brandMentionRateTarget: object(
+    {
+      low: number(),
+      expected: number(),
+      high: number(),
+    },
+    true,
+  ),
 });
 
 const monitorQuestionTranslationSchema = object({
@@ -407,8 +415,7 @@ function canonicalContractJson(value: unknown): string {
   return `{${Object.keys(record)
     .sort()
     .map(
-      (key) =>
-        `${JSON.stringify(key)}:${canonicalContractJson(record[key])}`,
+      (key) => `${JSON.stringify(key)}:${canonicalContractJson(record[key])}`,
     )
     .join(",")}}`;
 }
@@ -424,9 +431,7 @@ export function presalesV2CanonicalContractDescriptor(
   };
 }
 
-export function presalesV2CanonicalContractHash(
-  name: PresalesV2ContractName,
-) {
+export function presalesV2CanonicalContractHash(name: PresalesV2ContractName) {
   return createHash("sha256")
     .update(
       canonicalContractJson(presalesV2CanonicalContractDescriptor(name)),

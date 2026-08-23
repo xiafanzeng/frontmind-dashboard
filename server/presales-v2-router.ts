@@ -36,6 +36,7 @@ import {
   PRESALES_V2_CAPABILITIES,
   PRESALES_V2_CONTRACT_HASHES,
   PRESALES_V2_CONTRACT_VERSION,
+  PRESALES_V2_STRUCTURED_OUTPUT_SCHEMAS,
   PresalesV2ContractError,
   presalesV2ContractSchema,
   presalesV2StructuredPrompt,
@@ -88,6 +89,27 @@ const monitorJsonParser = json({ limit: "32kb" });
 const MAX_ASSET_BYTES = 100 * 1024 * 1024;
 const MAX_TASK_ASSET_BYTES = 100 * 1024 * 1024;
 const RESULT_GRACE_MS = 120_000;
+// Read-only compatibility for tasks already reserved under the immediately
+// preceding forecast transport. New reservations still use the public resolver.
+const HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH =
+  "96bdf3df50dbabaca2618e198c7599c2fc53b3e41bff9076b21efcc2a79886b2";
+
+const historicalOptimizationForecastSchema = (() => {
+  const current = PRESALES_V2_STRUCTURED_OUTPUT_SCHEMAS[
+    "website.optimization-forecast"
+  ] as Record<string, unknown>;
+  const properties = {
+    ...(current.properties as Record<string, unknown>),
+  };
+  delete properties.brandMentionRateTarget;
+  return {
+    ...current,
+    properties,
+    required: Array.isArray(current.required)
+      ? current.required.filter((key) => key !== "brandMentionRateTarget")
+      : current.required,
+  } as NonNullable<PresalesV2Contract["structuredOutputSchema"]>;
+})();
 const CREATE_RECONCILE_WINDOW_MS = 5 * 60_000;
 const PROVIDER_RUN_DEADLINE_MS = 30 * 60_000;
 const PROVIDER_TASK_VISIBILITY_GRACE_MS = 180_000;
@@ -1328,6 +1350,49 @@ function canonicalValuesEqual(left: unknown, right: unknown) {
   }
 }
 
+function providerDefaultStructuredValue(
+  schema: Record<string, unknown>,
+): unknown {
+  const allowed = Array.isArray(schema.enum) ? schema.enum : [];
+  if (allowed.length > 0) return allowed[0];
+  const types = structuredSchemaTypes(schema);
+  const type = types.find((candidate) => candidate !== "null") ?? "null";
+  if (type === "null") return null;
+  if (type === "string") return "";
+  if (type === "number" || type === "integer") return 0;
+  if (type === "boolean") return false;
+  if (type === "array") return [];
+  if (type === "object") {
+    const properties =
+      schema.properties &&
+      typeof schema.properties === "object" &&
+      !Array.isArray(schema.properties)
+        ? (schema.properties as Record<string, Record<string, unknown>>)
+        : {};
+    return Object.fromEntries(
+      Object.entries(properties).map(([key, child]) => [
+        key,
+        providerDefaultStructuredValue(child),
+      ]),
+    );
+  }
+  return undefined;
+}
+
+function isOptimizationForecastProviderDefault(
+  value: Record<string, unknown>,
+  schema: Record<string, unknown>,
+) {
+  const candidate = cloneStructuredRecord(value);
+  const providerDefault = cloneStructuredRecord(
+    providerDefaultStructuredValue(schema),
+  );
+  if (!candidate || !providerDefault) return false;
+  delete candidate.brandMentionRateTarget;
+  delete providerDefault.brandMentionRateTarget;
+  return canonicalValuesEqual(candidate, providerDefault);
+}
+
 function normalizeRecommendationWrapper(value: Record<string, unknown>) {
   const coordinates: unknown[] = [];
   if (Object.hasOwn(value, "questions")) coordinates.push(value.questions);
@@ -1488,6 +1553,12 @@ function acceptedPresalesV2Candidate(input: {
     !completed ||
     hasUnsafeStructuredKey(completed) ||
     !structuredSchemaAccepts(completed, input.schema)
+  ) {
+    return null;
+  }
+  if (
+    input.contractName === "website.optimization-forecast" &&
+    isOptimizationForecastProviderDefault(completed, input.schema)
   ) {
     return null;
   }
@@ -2203,6 +2274,24 @@ async function reconcileUnknownCreate(
   return record;
 }
 
+function resolvePresalesV2ReconciliationContract(
+  input: PresalesV2TaskRecord["contract"],
+): PresalesV2Contract {
+  if (
+    input.name === "website.optimization-forecast" &&
+    input.revision === PRESALES_V2_CONTRACT_VERSION &&
+    input.schemaHash === HISTORICAL_OPTIMIZATION_FORECAST_CONTRACT_HASH
+  ) {
+    return {
+      ...input,
+      profile: "frontmind-base",
+      output: "structured",
+      structuredOutputSchema: historicalOptimizationForecastSchema,
+    };
+  }
+  return resolvePresalesV2Contract(input);
+}
+
 async function reconcileTask(
   localTaskId: string,
   dependencyOverrides: Partial<PresalesV2ReconcileDependencies> = {},
@@ -2375,7 +2464,7 @@ async function reconcileTask(
       );
     }
   } else {
-    const contract = resolvePresalesV2Contract(record.contract);
+    const contract = resolvePresalesV2ReconciliationContract(record.contract);
     const decode = decodePresalesV2StructuredResultV3(
       relevantEvents,
       contract.name as PresalesV2StructuredContractName,
