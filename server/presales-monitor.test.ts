@@ -1525,6 +1525,278 @@ describe("presales monitor payload and reservation", () => {
     expect(calls).toBe(2);
   });
 
+  it("uses a recent same-binding authentication only when a fresh probe is unavailable", async () => {
+    const apiKey = "provider-issued-monitor-recent-attestation-key";
+    const env = {
+      FRONTMIND_MONITOR_API_KEY: apiKey,
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-recent.frontmind.test/api",
+    };
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          status: 200,
+          data: { success: false, message: "任务不存在" },
+        };
+      }
+      throw new Error("temporary provider timeout");
+    };
+
+    const authenticated = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 10_000,
+    });
+    const fallback = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 11_000,
+      forceRefresh: true,
+    });
+
+    expect(authenticated).toMatchObject({
+      authenticated: true,
+      ready: true,
+      status: "authenticated",
+    });
+    expect(fallback).toEqual(authenticated);
+    expect(calls).toBe(2);
+    expect(warning).toHaveBeenCalledWith(
+      "[Presales Monitor] credential readiness used recent authentication",
+      {
+        diagnosticCode: "MONITOR_CREDENTIAL_RECENT_ATTESTATION_FALLBACK",
+        probeStatus: "unavailable",
+        recentAttestationFallback: true,
+      },
+    );
+    const logged = JSON.stringify(warning.mock.calls);
+    expect(logged).not.toContain(apiKey);
+    expect(logged).not.toContain("00000000-0000-4000-8000-000000000000");
+    expect(logged).not.toContain(env.FRONTMIND_MONITOR_API_BASE_URL);
+  });
+
+  it("caches a recent-attestation fallback for at most fifteen seconds", async () => {
+    const env = {
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-monitor-fallback-cache-key",
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-fallback-cache.frontmind.test/api",
+    };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          status: 200,
+          data: { success: false, message: "任务不存在" },
+        };
+      }
+      throw new Error("temporary provider timeout");
+    };
+
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 100_000,
+    });
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 101_000,
+      forceRefresh: true,
+    });
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 115_999,
+    });
+    expect(calls).toBe(2);
+
+    const refreshedFallback = await getDedicatedMonitorCredentialReadiness(
+      env,
+      {
+        request,
+        now: () => 116_001,
+      },
+    );
+    expect(refreshedFallback).toMatchObject({ ready: true });
+    expect(calls).toBe(3);
+  });
+
+  it("does not let fallback caching outlive the thirty-minute attestation", async () => {
+    const env = {
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-monitor-expiring-proof-key",
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-expiring-proof.frontmind.test/api",
+    };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          status: 200,
+          data: { success: false, message: "任务不存在" },
+        };
+      }
+      throw new Error("temporary provider timeout");
+    };
+    const authenticatedAt = 1_000_000;
+
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => authenticatedAt,
+    });
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => authenticatedAt + 30 * 60_000 - 10_000,
+      forceRefresh: true,
+    });
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => authenticatedAt + 30 * 60_000 - 1,
+    });
+    expect(calls).toBe(2);
+
+    const expired = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => authenticatedAt + 30 * 60_000 + 1,
+    });
+    expect(expired).toMatchObject({
+      authenticated: false,
+      ready: false,
+      status: "unavailable",
+    });
+    expect(calls).toBe(3);
+  });
+
+  it("clears recent authentication after an explicit credential rejection", async () => {
+    const env = {
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-monitor-rejected-proof-key",
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-rejected-proof.frontmind.test/api",
+    };
+    let calls = 0;
+    const request = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          status: 200,
+          data: { success: false, message: "任务不存在" },
+        };
+      }
+      if (calls === 2) {
+        return {
+          status: 401,
+          data: { success: false, message: "Token失效" },
+        };
+      }
+      throw new Error("temporary provider timeout");
+    };
+
+    await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 200_000,
+    });
+    const rejected = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 201_000,
+      forceRefresh: true,
+    });
+    const unavailable = await getDedicatedMonitorCredentialReadiness(env, {
+      request,
+      now: () => 202_000,
+      forceRefresh: true,
+    });
+
+    expect(rejected.status).toBe("rejected");
+    expect(unavailable).toMatchObject({
+      authenticated: false,
+      ready: false,
+      status: "unavailable",
+    });
+    expect(calls).toBe(3);
+  });
+
+  it("does not reuse recent authentication across missing or changed credential bindings", async () => {
+    const firstEnv = {
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-monitor-first-binding-key",
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-binding.frontmind.test/api",
+    };
+    const changedKeyEnv = {
+      ...firstEnv,
+      FRONTMIND_MONITOR_API_KEY: "provider-issued-monitor-second-binding-key",
+    };
+    const changedBaseEnv = {
+      ...firstEnv,
+      FRONTMIND_MONITOR_API_BASE_URL:
+        "https://monitor-changed-binding.frontmind.test/api",
+    };
+    const authenticatedRequest = async () => ({
+      status: 200,
+      data: { success: false, message: "任务不存在" },
+    });
+    const unavailableRequest = async () => {
+      throw new Error("temporary provider timeout");
+    };
+
+    await getDedicatedMonitorCredentialReadiness(firstEnv, {
+      request: authenticatedRequest,
+      now: () => 300_000,
+    });
+    const changedKey = await getDedicatedMonitorCredentialReadiness(
+      changedKeyEnv,
+      {
+        request: unavailableRequest,
+        now: () => 301_000,
+        forceRefresh: true,
+      },
+    );
+    expect(changedKey).toMatchObject({ ready: false, status: "unavailable" });
+
+    await getDedicatedMonitorCredentialReadiness(firstEnv, {
+      request: authenticatedRequest,
+      now: () => 302_000,
+      forceRefresh: true,
+    });
+    const changedBase = await getDedicatedMonitorCredentialReadiness(
+      changedBaseEnv,
+      {
+        request: unavailableRequest,
+        now: () => 303_000,
+        forceRefresh: true,
+      },
+    );
+    expect(changedBase).toMatchObject({ ready: false, status: "unavailable" });
+
+    await getDedicatedMonitorCredentialReadiness(firstEnv, {
+      request: authenticatedRequest,
+      now: () => 304_000,
+      forceRefresh: true,
+    });
+    const missing = await getDedicatedMonitorCredentialReadiness(
+      {},
+      {
+        request: unavailableRequest,
+        now: () => 305_000,
+        forceRefresh: true,
+      },
+    );
+    expect(missing).toMatchObject({ ready: false, status: "missing" });
+    const afterMissing = await getDedicatedMonitorCredentialReadiness(
+      firstEnv,
+      {
+        request: unavailableRequest,
+        now: () => 306_000,
+        forceRefresh: true,
+      },
+    );
+    expect(afterMissing).toMatchObject({
+      authenticated: false,
+      ready: false,
+      status: "unavailable",
+    });
+  });
+
   it("does not fall back to an ordinary presales credential in production", async () => {
     const originalNodeEnv = process.env.NODE_ENV;
     const originalMonitorKey = process.env.FRONTMIND_MONITOR_API_KEY;
