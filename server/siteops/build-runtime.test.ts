@@ -848,7 +848,9 @@ describe("SiteOps trusted React 19 static runtime", () => {
       ".surface--soft_depth .section{background:var(--muted)",
     );
     expect(css).toContain(".source-note{color:var(--ink)");
-    expect(css).toContain(".section--cta .source-note{color:var(--canvas)}");
+    expect(css).toContain(
+      ".section--cta .source-note,.section--cta .section-index{color:var(--canvas)}",
+    );
     expect(css).not.toMatch(/\.source-note\{[^}]*opacity/gu);
   }, 90_000);
 

@@ -93,9 +93,9 @@ function browserIntegrationInput(): MaterializeAstroSiteInput {
       supportEvidenceSha256s: [],
       taxonomy: {
         role: "foundation",
-        // Regression for the production palette that previously selected a
-        // muted surface readable by ink but unreadable by accent text.
-        palette: ["#FFFFFF", "#111111", "#0066CC", "#888888"],
+        // Regression for the production shape whose only valid hex color
+        // leaves the selected semantic roles on their deterministic fallbacks.
+        palette: ["#f8f8f8", "warm", "soft", "neutral"],
         typography: ["editorial display"],
         layout: ["centered orbit"],
         motion: ["subtle floating"],
@@ -108,19 +108,19 @@ function browserIntegrationInput(): MaterializeAstroSiteInput {
       referenceBlueprint,
       layoutArchetype: "hero_led",
       density: "spacious",
-      surfaceStyle: "layered",
+      surfaceStyle: "soft_depth",
       typeScale: "display",
       imageTreatment: "none",
       motionLevel: "subtle",
       colorRoles: {
-        backgroundPaletteIndex: 0,
-        textPaletteIndex: 1,
-        accentPaletteIndex: 2,
+        backgroundPaletteIndex: 1,
+        textPaletteIndex: 2,
+        accentPaletteIndex: 3,
       },
       routeCompositions: [
         {
           routeId: "home",
-          slots: [{ slotId: "research-proof", variant: "proof" }],
+          slots: [{ slotId: "research-proof", variant: "cta" }],
         },
       ],
       seoPlan: {
