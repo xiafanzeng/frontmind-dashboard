@@ -376,6 +376,7 @@ describe("DeliveryMemberDashboard project context", () => {
     ["question_maintenance", "questions"],
     ["knowledge_reset", "knowledge-build"],
     ["question_catalog", "keywords"],
+    ["site_rebuild", "website"],
   ] as const)(
     "routes a %s demand to the %s customer-dashboard module",
     (operation, section) => {

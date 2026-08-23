@@ -279,6 +279,38 @@ describe("SiteOps wire output resolver", () => {
     expect(result).toMatchObject({ value, source: "attachment" });
   });
 
+  it("normalizes only the requested PageContentWire V3 attachment stem", async () => {
+    const contentToken = "siteops-content:10000000-0000-4000-8000-000000000001";
+    const value = { operationToken: contentToken, schemaVersion: 3 };
+    const fetchPinned = vi.fn(async () => ({
+      response: jsonResponse(value),
+      finalUrl: new URL("https://files.example.test/content-v3.json"),
+    }));
+
+    await expect(
+      resolveWireOutput({
+        events: [
+          marker(contentToken),
+          rejected(),
+          assistant({
+            attachments: [
+              {
+                filename: "frontmind_page_content_wire_v3_repair_2.json",
+                content_type: "application/json",
+                url: "https://files.example.test/content-v3.json",
+              },
+            ],
+          }),
+        ] as never,
+        operationToken: contentToken,
+        phase: "content",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.contentV3,
+        taskCompleted: true,
+        fetchPinned: fetchPinned as never,
+      }),
+    ).resolves.toMatchObject({ value, source: "attachment" });
+  });
+
   it("requires an explicit rejection in the exact operation-token window", async () => {
     const fetchPinned = vi.fn();
     const body = JSON.stringify({ operationToken: token, schemaVersion: 1 });

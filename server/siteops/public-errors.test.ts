@@ -58,6 +58,9 @@ describe("SiteOps public error projection", () => {
       expect(projected).not.toMatch(/SiteOps|React|21st|API\s*Key|\bPro\b/iu);
     }
     expect(
+      publicSiteOpsMessageText({ content: "SiteOps 项目已打开。" }),
+    ).toContain("AI友好官网管理");
+    expect(
       publicSiteOpsMessageText({
         content: "Manus invalid_argument",
         errorCode: "invalid_argument",

@@ -61,12 +61,12 @@ describe("SiteOps shared delivery quota", () => {
       assertSiteOpsServiceEntitlement(
         portal({ status: "active", planCode: "basic" }),
       ),
-    ).toThrow("升级进阶版或豪华版");
+    ).toThrow("当前服务版本不包含AI友好官网管理");
     expect(() =>
       assertSiteOpsServiceEntitlement(
         portal({ status: "expired", planCode: "luxury" }),
       ),
-    ).toThrow("已到期");
+    ).toThrow("当前AI友好官网管理已到期");
   });
 
   it("counts delivery tickets, website revisions and social packages together", () => {

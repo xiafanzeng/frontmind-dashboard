@@ -1,4 +1,5 @@
 import type { SiteOpsProviderResult } from "./providers";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 
 const VENDOR_NAME = /manus/iu;
 const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
@@ -20,7 +21,7 @@ export function sanitizeFrontMindPublicText(value: string) {
   }
   const sanitized = value
     .replace(/21st/giu, "视觉候选服务")
-    .replace(/SiteOps/giu, "一站式建站")
+    .replace(/SiteOps/giu, SITEOPS_CUSTOMER_DISPLAY_NAME)
     .replace(/(?:原生\s*)?Astro/giu, "官网")
     .replace(/React(?:\s*静态)?/giu, "官网")
     .replace(/API\s*Key/giu, "服务配置")

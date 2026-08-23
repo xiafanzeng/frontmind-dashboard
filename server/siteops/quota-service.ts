@@ -3,6 +3,7 @@ import { and, asc, eq, inArray } from "drizzle-orm";
 import { serviceQuotaPeriods } from "../../drizzle/schema";
 import type { DeliveryTicketQuotaPool } from "../../shared/delivery-ticket";
 import type { ServicePortal } from "../../shared/service-portal";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 import {
   loadUnifiedDeliveryQuotaUsageRows,
   unifiedActiveQuotaCountsByPeriod,
@@ -48,8 +49,8 @@ export function assertSiteOpsServiceEntitlement(portal: ServicePortal) {
     "SITEOPS_ENTITLEMENT_REQUIRED",
     portal.service.status === "expired" ||
       portal.service.status === "cancelled"
-      ? "当前 AI 友好官网服务已到期，请续费后继续使用。"
-      : "当前服务版本不包含官网任务与 AI 建站，请升级进阶版或豪华版。",
+      ? `当前${SITEOPS_CUSTOMER_DISPLAY_NAME}已到期，请续费后继续使用。`
+      : `当前服务版本不包含${SITEOPS_CUSTOMER_DISPLAY_NAME}，请升级进阶版或豪华版。`,
     403,
   );
 }

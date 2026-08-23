@@ -136,7 +136,27 @@ export const SITEOPS_MATERIALIZER_V2_1 = {
   qaPolicyVersion: "siteops-qa-v3",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_1;
+/** React Static 2.2 adds a snapshot-only typed content graph, conditional
+ * knowledge routes and host-owned SEO/GEO projection without changing the
+ * nine frozen visual families. */
+export const SITEOPS_MATERIALIZER_V2_2 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "2.2.0",
+  runtimeManifestSha256:
+    "6d69ef19446654f20be4d78989e1f46d8feb03989aac9de7949bac7fd2241716",
+  starterVersion: "2.2.0",
+  starterSha256:
+    "305686b993e31f544d69d88d7d83a12609724d3ddf118abd6eb50c25ed5fe5e7",
+  componentLibraryVersion: "2.2.0",
+  materializerVersion: "2.2.0",
+  materializerSha256:
+    "5e947cb8526043d65f439eb5e966e9ce78722d7984e496908ce99e2b163684c6",
+  qaPolicyVersion: "siteops-qa-v4",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_2;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -146,6 +166,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_6.frontMindVersion]: SITEOPS_MATERIALIZER_V1_6,
   [SITEOPS_MATERIALIZER_V2_0.frontMindVersion]: SITEOPS_MATERIALIZER_V2_0,
   [SITEOPS_MATERIALIZER_V2_1.frontMindVersion]: SITEOPS_MATERIALIZER_V2_1,
+  [SITEOPS_MATERIALIZER_V2_2.frontMindVersion]: SITEOPS_MATERIALIZER_V2_2,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {
@@ -241,6 +262,52 @@ export const siteOpsCardSchema = z
   })
   .strict();
 
+export const siteContentInventoryKindSchema = z.enum([
+  "product",
+  "service",
+  "application",
+  "case_study",
+  "blog",
+  "company_news",
+  "faq",
+]);
+
+/** Dashboard-owned inventory derived only from customer-visible documents in
+ * the frozen knowledge snapshot. Absence is meaningful: the materializer may
+ * omit a collection route, or render the legal company-news empty state, but
+ * it may never fill a gap with externally acquired or synthetic content. */
+export const siteContentInventorySchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    source: z.literal("frozen_knowledge_snapshot"),
+    entries: z
+      .array(
+        z
+          .object({
+            kind: siteContentInventoryKindSchema,
+            sourceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .min(1)
+              .max(100),
+          })
+          .strict(),
+      )
+      .max(7),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      new Set(value.entries.map((entry) => entry.kind)).size !==
+      value.entries.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["entries"],
+        message: "Content inventory kinds must be unique",
+      });
+    }
+  });
+
 export const siteBriefSchema = z
   .object({
     companyName: z.string().trim().min(1).max(255),
@@ -260,6 +327,11 @@ export const siteBriefSchema = z
     offerings: z.array(z.string().trim().min(1).max(500)).max(50),
     audience: z.array(z.string().trim().min(1).max(500)).max(30),
     conversionGoal: z.string().trim().min(1).max(500),
+    contentInventory: siteContentInventorySchema.default({
+      schemaVersion: 1,
+      source: "frozen_knowledge_snapshot",
+      entries: [],
+    }),
     routes: z
       .array(
         z
@@ -533,17 +605,40 @@ export const visualReferenceBlueprintV3Schema = z
     contentEmphasis: z.enum(["statement", "balanced", "product", "proof"]),
     mediaRegion: z.enum(["none", "inline", "split", "surround", "full_bleed"]),
     mediaRatio: z.enum(["none", "square", "portrait", "landscape", "wide"]),
-    composition: z.enum(["centered", "split", "editorial", "modular", "immersive"]),
-    backgroundStyle: z.enum(["warm_light", "cool_light", "dark", "gradient", "image_stage"]),
+    composition: z.enum([
+      "centered",
+      "split",
+      "editorial",
+      "modular",
+      "immersive",
+    ]),
+    backgroundStyle: z.enum([
+      "warm_light",
+      "cool_light",
+      "dark",
+      "gradient",
+      "image_stage",
+    ]),
     gradientStyle: z.enum(["none", "soft_radial", "mesh", "spotlight"]),
     borderStyle: z.enum(["none", "subtle", "defined"]),
     radiusStyle: z.enum(["none", "soft", "rounded", "pill"]),
-    decorationStyle: z.enum(["none", "orbital", "grid", "glow", "editorial_lines"]),
+    decorationStyle: z.enum([
+      "none",
+      "orbital",
+      "grid",
+      "glow",
+      "editorial_lines",
+    ]),
     navStyle: z.enum(["minimal", "floating", "bordered"]),
     ctaStyle: z.enum(["single", "dual", "pill", "text_link"]),
     cardStyle: z.enum(["flat", "bordered", "soft_depth", "layered"]),
     containerStyle: z.enum(["contained", "wide", "edge_to_edge"]),
-    typographyStyle: z.enum(["restrained", "editorial", "display", "technical"]),
+    typographyStyle: z.enum([
+      "restrained",
+      "editorial",
+      "display",
+      "technical",
+    ]),
     density: z.enum(["compact", "balanced", "spacious"]),
     responsiveBehavior: z.enum(["stack", "reflow", "crop_safe"]),
     motionLevel: z.enum(["none", "subtle", "floating_subtle"]),
@@ -556,7 +651,12 @@ export const visualReferenceBlueprintV3Schema = z
         muted: z.string().regex(/^#[a-f0-9]{6}$/u),
       })
       .strict(),
-    typeSystem: z.enum(["display_sans", "editorial_serif", "technical_sans", "humanist_sans"]),
+    typeSystem: z.enum([
+      "display_sans",
+      "editorial_serif",
+      "technical_sans",
+      "humanist_sans",
+    ]),
     componentManifest: z.array(z.string().trim().min(1).max(96)).min(2).max(16),
     inspirationEvidenceIds: z
       .array(z.string().regex(/^[a-f0-9]{64}$/u))
@@ -611,8 +711,14 @@ export const visualSelectionBundleV3Schema = z
         });
       }
     };
-    unique(value.candidates.map((candidate) => candidate.id), "candidateId");
-    unique(value.candidates.map((candidate) => candidate.label), "label");
+    unique(
+      value.candidates.map((candidate) => candidate.id),
+      "candidateId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.label),
+      "label",
+    );
     unique(
       value.candidates.map((candidate) => candidate.previewLocalAssetId),
       "previewLocalAssetId",
@@ -788,6 +894,7 @@ export const siteOpsActInputSchema = z
 
 export type SiteOpsCard = z.infer<typeof siteOpsCardSchema>;
 export type SiteBrief = z.infer<typeof siteBriefSchema>;
+export type SiteContentInventory = z.infer<typeof siteContentInventorySchema>;
 export type VisualSelectionBundleV1 = z.infer<
   typeof visualSelectionBundleV1Schema
 >;

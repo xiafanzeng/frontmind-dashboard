@@ -9,6 +9,7 @@ import {
   keywordTableDisplayText as safeText,
   type KeywordCategoryKey,
 } from "@shared/keyword-categories";
+import { trpc } from "@/lib/trpc";
 
 export type ManagedKeywordTable = {
   id: string;
@@ -39,10 +40,11 @@ type ManagedKeywordTablesProps = {
     rowIndex: number;
   }) => void;
   quotaAvailability?: ManagedKeywordQuotaAvailability;
+  generationEnabled?: boolean;
 };
 
 const KEYWORD_SOURCE_DESCRIPTION =
-  "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。";
+  "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。";
 
 function normalizedColumnName(value: unknown) {
   return String(value ?? "")
@@ -85,16 +87,23 @@ function KeywordPageHeader({
   eyebrow,
   title,
   desc,
+  actions,
 }: {
   eyebrow: string;
   title: string;
   desc: string;
+  actions?: ReactNode;
 }) {
   return (
     <header className="page-header">
-      <span className="eyebrow">{safeText(eyebrow)}</span>
-      <h2>{safeText(title)}</h2>
-      <p>{safeText(desc)}</p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <span className="eyebrow">{safeText(eyebrow)}</span>
+          <h2>{safeText(title)}</h2>
+          <p>{safeText(desc)}</p>
+        </div>
+        {actions}
+      </div>
     </header>
   );
 }
@@ -102,9 +111,11 @@ function KeywordPageHeader({
 function KeywordEmptyPanel({
   title,
   description,
+  actions,
 }: {
   title: string;
   description: string;
+  actions?: ReactNode;
 }) {
   return (
     <section className="panel">
@@ -114,8 +125,120 @@ function KeywordEmptyPanel({
       <div className="empty-state">
         <Database size={24} />
         <p>{safeText(description)}</p>
+        {actions}
       </div>
     </section>
+  );
+}
+
+function brandQuestionUniverseStatus(
+  observation:
+    | {
+        reason: string;
+        operation: {
+          status: string;
+          repairAttempts: number;
+          publicationOutcome: string | null;
+        } | null;
+      }
+    | undefined,
+) {
+  if (!observation) return "正在检查抓取条件…";
+  const operation = observation.operation;
+  if (operation?.status === "queued") return "任务已排队，正在上传安全知识包。";
+  if (operation?.status === "running") {
+    return operation.repairAttempts > 0
+      ? `正在修复并校验结果（${operation.repairAttempts}/3）。`
+      : "正在抓取并生成 160 条品牌问题。";
+  }
+  if (operation?.status === "result_pending")
+    return "结果已返回，正在校验和发布。";
+  if (operation?.status === "succeeded") {
+    if (operation.publicationOutcome === "engineer_won") {
+      return "工程师正式版本已生效，自动结果未覆盖。";
+    }
+    if (operation.publicationOutcome === "newer_auto_won") {
+      return "更新的自动版本已生效，本次结果未覆盖。";
+    }
+    if (operation.publicationOutcome === "snapshot_superseded") {
+      return "知识库已更新，本次结果未发布；可重新抓取。";
+    }
+    return "品牌全域词库已生成并发布。";
+  }
+  if (operation?.status === "failed") return "本次抓取未完成，请重试。";
+  if (operation?.status === "attention_required") {
+    return "任务需要人工检查，请联系 FrontMind 支持。";
+  }
+  if (observation.reason === "knowledge_required")
+    return "请先完成并发布当前认证知识库。";
+  if (observation.reason === "credential_required")
+    return "自动生成服务尚未就绪，请联系 FrontMind。";
+  if (observation.reason === "engineer_version")
+    return "工程师正式版本已发布，自动抓取已停用。";
+  if (observation.reason === "operation_active")
+    return "品牌全域词库正在抓取。";
+  return "已就绪，可基于当前知识库抓取品牌全域词库。";
+}
+
+function BrandQuestionUniverseGenerationControl() {
+  const utils = trpc.useUtils();
+  const observation = trpc.workspace.brandQuestionUniverse.observe.useQuery(
+    undefined,
+    { refetchInterval: 5_000, refetchOnWindowFocus: true },
+  );
+  const start = trpc.workspace.brandQuestionUniverse.start.useMutation({
+    onSuccess: async () => {
+      await Promise.all([
+        utils.workspace.brandQuestionUniverse.observe.invalidate(),
+        utils.workspace.dashboard.invalidate(),
+      ]);
+    },
+  });
+  const data = observation.data;
+  const disabled = !data?.canStart || start.isPending;
+  const status =
+    start.error?.message ||
+    observation.error?.message ||
+    brandQuestionUniverseStatus(data);
+  return (
+    <BrandQuestionUniverseGenerationAction
+      disabled={disabled}
+      status={status}
+      onStart={() => {
+        if (!data?.knowledgeSnapshotId) return;
+        start.mutate({
+          knowledgeSnapshotId: data.knowledgeSnapshotId,
+          clientRequestId: crypto.randomUUID(),
+          expectedDashboardRevision: data.dashboardRevision,
+        });
+      }}
+    />
+  );
+}
+
+export function BrandQuestionUniverseGenerationAction({
+  disabled,
+  status,
+  onStart,
+}: {
+  disabled: boolean;
+  status: string;
+  onStart: () => void;
+}) {
+  return (
+    <div className="flex max-w-md flex-col items-start gap-2">
+      <button
+        type="button"
+        className="keyword-optimize-button disabled:cursor-not-allowed disabled:opacity-50"
+        disabled={disabled}
+        onClick={onStart}
+      >
+        抓取品牌全域词库
+      </button>
+      <span className="text-xs text-slate-500" role="status">
+        {safeText(status)}
+      </span>
+    </div>
   );
 }
 
@@ -145,6 +268,7 @@ export default function ManagedKeywordTables({
   error,
   onUseQuestion,
   quotaAvailability,
+  generationEnabled = false,
 }: ManagedKeywordTablesProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const [tableFilter, setTableFilter] = useState("all");
@@ -250,6 +374,11 @@ export default function ManagedKeywordTables({
         eyebrow="MindPromise智诺 / 品牌建设"
         title="品牌全域词库"
         desc={KEYWORD_SOURCE_DESCRIPTION}
+        actions={
+          generationEnabled && tables.length > 0 ? (
+            <BrandQuestionUniverseGenerationControl />
+          ) : undefined
+        }
       />
       {loading ? (
         <KeywordEmptyPanel
@@ -265,6 +394,11 @@ export default function ManagedKeywordTables({
         <KeywordEmptyPanel
           title="品牌全域词库正在准备中"
           description="内容发布后会自动显示在这里。"
+          actions={
+            generationEnabled ? (
+              <BrandQuestionUniverseGenerationControl />
+            ) : undefined
+          }
         />
       ) : (
         <>

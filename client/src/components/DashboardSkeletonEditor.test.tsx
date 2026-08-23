@@ -124,7 +124,7 @@ describe("DashboardSkeletonEditor", () => {
       screen.getByRole("tab", { name: "知识库智能体" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("tab", { name: "一站式建站" }),
+      screen.getByRole("tab", { name: "AI友好官网管理" }),
     ).toBeInTheDocument();
     expect(screen.queryByText("更新首页标题与简介")).toBeNull();
     expect(screen.queryByText("修改如何同步给客户")).toBeNull();

@@ -51,6 +51,7 @@ import type {
 } from "@shared/delivery-ticket";
 import type { KnowledgeBaseProgressDto } from "@shared/knowledge-base-progress";
 import { keywordCategoryKey } from "@shared/keyword-categories";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import { sanitizeBrandText } from "@/lib/frontmind-api";
 
 import "@/dashboard/dashboard-styles.css";
@@ -130,7 +131,7 @@ const CUSTOMER_DASHBOARD_GROUPS: ReadonlyArray<{
     icon: Database,
     items: [
       { value: "content", label: "内容资产运营", icon: Newspaper },
-      { value: "website", label: "一站式建站", icon: Globe2 },
+      { value: "website", label: SITEOPS_CUSTOMER_DISPLAY_NAME, icon: Globe2 },
     ],
   },
 ];
@@ -650,7 +651,7 @@ function CustomerDashboardSection({
         readOnlyPreview
       />
     ) : (
-      <MirrorEmpty title="一站式建站" />
+      <MirrorEmpty title={SITEOPS_CUSTOMER_DISPLAY_NAME} />
     );
   }
 

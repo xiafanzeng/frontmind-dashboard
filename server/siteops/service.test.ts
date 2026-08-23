@@ -24,8 +24,10 @@ import {
   siteOpsActiveFinancialIntentKey,
   siteOpsResetCredentialScope,
   siteOpsResetCapability,
+  siteOpsServiceErrorFromQuota,
   SiteOpsServiceError,
 } from "./service";
+import { SiteOpsQuotaError } from "./quota-service";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
   SITEOPS_WORKFLOW,
@@ -38,13 +40,32 @@ import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
 import { referenceBlueprintV3ForFamily } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it.each([
+    ["SITEOPS_ENTITLEMENT_REQUIRED", 403, "FORBIDDEN"],
+    ["SITEOPS_QUOTA_PERIOD_NOT_FOUND", 409, "STATE_CONFLICT"],
+    ["SITEOPS_QUOTA_EXHAUSTED", 409, "STATE_CONFLICT"],
+  ] as const)(
+    "maps %s to its stable SiteOps service boundary",
+    (quotaCode, statusCode, serviceCode) => {
+      const mapped = siteOpsServiceErrorFromQuota(
+        new SiteOpsQuotaError(quotaCode, "配额提示", statusCode),
+      );
+
+      expect(mapped).toMatchObject({
+        code: serviceCode,
+        message: "配额提示",
+        statusCode,
+      });
+    },
+  );
+
   it("requires an accepted rebuild ticket for every child-build admission", () => {
     expect(() =>
       requireAcceptedSiteOpsRebuild({ status: "submitted" }),
     ).toThrowError(SiteOpsServiceError);
-    expect(() =>
-      requireAcceptedSiteOpsRebuild({ status: null }),
-    ).toThrowError(SiteOpsServiceError);
+    expect(() => requireAcceptedSiteOpsRebuild({ status: null })).toThrowError(
+      SiteOpsServiceError,
+    );
     expect(() =>
       requireAcceptedSiteOpsRebuild({ status: "in_progress" }),
     ).not.toThrow();
@@ -143,7 +164,7 @@ describe("SiteOps core contracts", () => {
           referenceBlueprint: blueprint,
         },
       }),
-    ).toThrow("可信 Hero 构图合同");
+    ).toThrow("所选视觉方案已失效");
   });
 
   it("freezes every new root or revision build to the current complete workflow coordinates", () => {
@@ -314,6 +335,74 @@ describe("SiteOps core contracts", () => {
     expect(brief.companyName).not.toBe("企业与品牌概览");
   });
 
+  it("derives conditional content routes only from the frozen public inventory", () => {
+    const documents = [
+      ["overview-source", "企业概览.md", "企业概览", "公司名称：星河智造"],
+      ["product-source", "产品/设备.md", "产品中心", "已确认的设备产品。"],
+      ["service-source", "服务/运维.md", "服务方案", "已确认的运维服务。"],
+      ["application-source", "应用/制造.md", "应用场景", "已确认的制造场景。"],
+      ["case-source", "案例/客户.md", "客户案例", "已确认的客户案例。"],
+      ["blog-source", "知识/指南.md", "知识博客", "已确认的知识指南。"],
+      ["faq-source", "FAQ/问题.md", "常见问题", "已确认的常见问题。"],
+      ["industry-news-source", "新闻/行业.md", "行业新闻", "外部行业新闻。"],
+    ].map(([id, documentPath, title, content]) => ({
+      id,
+      path: documentPath,
+      title,
+      content,
+      kind: id === "overview-source" ? "overview" : "leaf",
+      evidenceStatus: "verified",
+      customerVisible: true,
+    }));
+    documents.push({
+      id: "inferred-company-news",
+      path: "新闻/公司动态.md",
+      title: "公司动态",
+      content: "未经客户确认的动态。",
+      kind: "leaf",
+      evidenceStatus: "inferred",
+      customerVisible: true,
+    });
+
+    const brief = siteBriefFromSnapshot({
+      sourceFileName: "星河智造-knowledge-base.zip",
+      documents,
+      assets: [],
+    } as never);
+    const routeById = new Map(brief.routes.map((route) => [route.id, route]));
+    for (const routeId of [
+      "products",
+      "services",
+      "applications",
+      "cases",
+      "blog",
+      "faq",
+      "news",
+    ]) {
+      expect(routeById.has(routeId)).toBe(true);
+    }
+    expect(routeById.get("news")?.sourceDocumentIds).toEqual([]);
+    expect(
+      brief.contentInventory.entries.find(
+        (entry) => entry.kind === "company_news",
+      ),
+    ).toBeUndefined();
+    expect(JSON.stringify(brief)).not.toContain("inferred-company-news");
+    expect(routeById.get("news")?.sourceDocumentIds).not.toContain(
+      "industry-news-source",
+    );
+    expect(brief.contentInventory.entries.map((entry) => entry.kind)).toEqual(
+      expect.arrayContaining([
+        "product",
+        "service",
+        "application",
+        "case_study",
+        "blog",
+        "faq",
+      ]),
+    );
+  });
+
   it.each(["localhost", "127.0.0.1", "bad domain.com", "-bad.example"])(
     "rejects a non-registrable or unsafe domain: %s",
     (domain) => {
@@ -362,9 +451,9 @@ describe("SiteOps core contracts", () => {
 
   it("keeps the customer build action free of API mode details", () => {
     const sampleId = "10000000-0000-4000-8000-000000000001";
-    expect(
-      parseSiteOpsActionPayload("select_visual", { sampleId }),
-    ).toEqual({ sampleId });
+    expect(parseSiteOpsActionPayload("select_visual", { sampleId })).toEqual({
+      sampleId,
+    });
     expect(parseSiteOpsActionPayload("delegate_visual", {})).toEqual({});
     expect(() =>
       parseSiteOpsActionPayload("select_visual", {

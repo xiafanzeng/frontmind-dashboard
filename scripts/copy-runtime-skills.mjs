@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { packageSocraticKnowledgeBaseSkill } from "./package-socratic-kb-skill.mjs";
 import {
+  SITEOPS_RUNTIME_VERSION,
   verifySiteOpsRuntimeWorkflow,
   verifyUpstreamSiteOpsWorkflow,
 } from "./package-siteops-workflow.mjs";
@@ -19,11 +20,14 @@ await verifyUpstreamSiteOpsWorkflow();
 await verifySiteOpsRuntimeWorkflow();
 await verifyAllSiteOpsSocialWorkflows();
 const exactMaterializedSkill = `socratic-kb-builder-v5-${materializedSkill.contentHash}.skill`;
+const currentSiteOpsWorkflow =
+  `react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`;
 const skillArtifacts = [
   "socratic-kb-builder-v5.skill",
   exactMaterializedSkill,
   "brand-question-portfolio.skill",
   "response-logic-builder.skill",
+  "generate-brand-question-universe",
   "astro-company-site-workflow-v1.0.0.zip",
   "astro-company-site-workflow-v1.0.0.sha256",
   "astro-company-site-workflow-v1.1.0",
@@ -34,6 +38,7 @@ const skillArtifacts = [
   "astro-company-site-workflow-v1.6.0",
   "react-static-company-site-workflow-v2.0.0",
   "react-static-company-site-workflow-v2.1.0",
+  currentSiteOpsWorkflow,
   "siteops-wechat-package-v1.0.0",
   "siteops-xiaohongshu-package-v1.0.0",
 ];
@@ -44,6 +49,11 @@ const requiredFiles = [
   "brand-question-portfolio.skill/references/output-contract.md",
   "response-logic-builder.skill/SKILL.md",
   "response-logic-builder.skill/references/output-contract.md",
+  "generate-brand-question-universe/upstream/MANIFEST.json",
+  "generate-brand-question-universe/upstream/generate-brand-question-universe-final-v2-20260819.zip",
+  "generate-brand-question-universe/frontmind-adapter-v1.0.0/MANIFEST.json",
+  "generate-brand-question-universe/frontmind-adapter-v1.0.0/SKILL.md",
+  "generate-brand-question-universe/frontmind-adapter-v1.0.0/runtime-contract.json",
   "astro-company-site-workflow-v1.0.0.zip",
   "astro-company-site-workflow-v1.0.0.sha256",
   "astro-company-site-workflow-v1.1.0/MANIFEST.json",
@@ -107,6 +117,17 @@ const requiredFiles = [
   "react-static-company-site-workflow-v2.1.0/schemas/page-content-wire-v2.schema.json",
   "react-static-company-site-workflow-v2.1.0/schemas/materialization-stage-v2.schema.json",
   "react-static-company-site-workflow-v2.1.0/assets/host-starter-contract.json",
+  `${currentSiteOpsWorkflow}/MANIFEST.json`,
+  `${currentSiteOpsWorkflow}/SKILL.md`,
+  `${currentSiteOpsWorkflow}/UPSTREAM.json`,
+  `${currentSiteOpsWorkflow}/VERSION`,
+  `${currentSiteOpsWorkflow}/runtime-contract.json`,
+  `${currentSiteOpsWorkflow}/adapters/frontmind-dashboard.md`,
+  `${currentSiteOpsWorkflow}/schemas/frontmind-run-envelope.schema.json`,
+  `${currentSiteOpsWorkflow}/schemas/site-design-wire-v3.schema.json`,
+  `${currentSiteOpsWorkflow}/schemas/page-content-wire-v3.schema.json`,
+  `${currentSiteOpsWorkflow}/schemas/materialization-stage-v2.schema.json`,
+  `${currentSiteOpsWorkflow}/assets/host-starter-contract.json`,
   "siteops-wechat-package-v1.0.0/MANIFEST.json",
   "siteops-wechat-package-v1.0.0/SKILL.md",
   "siteops-wechat-package-v1.0.0/runtime-contract.json",

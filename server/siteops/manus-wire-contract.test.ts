@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertSiteOpsStructuredOutputSchema,
+  pageContentResultV2FromWire,
   pageContentResultFromWire,
   pageContentWireOutputSchema,
+  pageContentWireV3OutputSchema,
   siteDesignResultFromWire,
   siteDesignResultV2FromWire,
   siteDesignWireOutputSchema,
@@ -43,6 +45,11 @@ describe("SiteOps provider wire contracts", () => {
         operationToken: "content-token",
         routeIds: ["home", "about"],
         sourceDocumentIds: ["overview", "about-source"],
+      }),
+      pageContentWireV3OutputSchema({
+        operationToken: "content-token-v3",
+        routeIds: ["home", "news"],
+        sourceDocumentIds: ["kb-overview-poison-001"],
       }),
       socialWireOutputSchema({
         operationToken: "social-token",
@@ -252,6 +259,83 @@ describe("SiteOps provider wire contracts", () => {
         ["overview"],
       ),
     ).toThrow();
+  });
+
+  it("canonicalizes typed Wire V3 and owns the empty-news copy on the host", () => {
+    const wire = {
+      operationToken: "content-token-v3",
+      schemaVersion: 3,
+      routes: [
+        {
+          routeId: "home",
+          eyebrow: null,
+          heading: "可信制造服务",
+          summary: "仅使用冻结知识库。",
+        },
+        {
+          routeId: "news",
+          eyebrow: "provider copy is discarded",
+          heading: "provider copy is discarded",
+          summary: "provider copy is discarded",
+        },
+      ],
+      blocks: [
+        {
+          routeId: "home",
+          slotId: "capabilities",
+          blockType: "feature_list",
+          heading: "服务能力",
+          paragraphs: ["提供设备巡检与状态分析。"],
+          items: ["设备巡检", "状态分析"],
+          entityIds: [],
+          faqIds: [],
+          sourceDocumentIds: ["kb-overview-poison-001"],
+        },
+      ],
+      entities: [],
+      faqs: [],
+      officialLinks: [],
+    } as const;
+    const result = pageContentResultV2FromWire(
+      wire,
+      ["home", "news"],
+      ["kb-overview-poison-001"],
+      ["news"],
+    );
+    expect(result.pageContent).toMatchObject({
+      schemaVersion: 2,
+      routes: [
+        {
+          routeId: "home",
+          sections: [{ blockType: "feature_list" }],
+        },
+        {
+          routeId: "news",
+          heading: "企业动态",
+          summary: "当前知识库暂无可公开的企业动态。",
+          emptyState: "company_news_unavailable",
+          sections: [],
+        },
+      ],
+    });
+    expect(() =>
+      pageContentResultV2FromWire(
+        {
+          ...wire,
+          blocks: [
+            ...wire.blocks,
+            {
+              ...wire.blocks[0],
+              routeId: "news",
+              slotId: "invented-news",
+            },
+          ],
+        },
+        ["home", "news"],
+        ["kb-overview-poison-001"],
+        ["news"],
+      ),
+    ).toThrow("SITEOPS_CONTENT_SOURCE_OR_ROUTE_MISMATCH");
   });
 
   it("deterministically splits an oversized dossier without truncating document content", () => {

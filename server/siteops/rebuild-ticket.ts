@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNotNull, max } from "drizzle-orm";
 import {
   deliveryProjectAssignments,
@@ -42,6 +42,26 @@ export class SiteOpsRebuildTicketError extends Error {
 
 export function siteOpsRebuildDedupeKey(buildId: string) {
   return `site-rebuild:${buildId}`;
+}
+
+export function siteOpsRebuildDeliveryClientRequestId(input: {
+  userId: number;
+  projectId: string;
+  clientRequestId: string;
+}) {
+  const bytes = createHash("sha256")
+    .update("frontmind.siteops-rebuild.delivery-request.v1\0", "utf8")
+    .update(String(input.userId), "utf8")
+    .update("\0", "utf8")
+    .update(input.projectId.trim(), "utf8")
+    .update("\0", "utf8")
+    .update(input.clientRequestId.trim(), "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 export function siteOpsRebuildTargetPage(buildId: string) {
@@ -237,6 +257,11 @@ export async function createSiteOpsRebuildTicket(
   }
   const ticketId = randomUUID();
   const reason = input.reason?.trim().slice(0, 4_000) || "希望重新制作官网。";
+  const deliveryClientRequestId = siteOpsRebuildDeliveryClientRequestId({
+    userId: input.userId,
+    projectId: input.projectId,
+    clientRequestId: input.clientRequestId,
+  });
   await tx.insert(deliveryTickets).values({
     id: ticketId,
     isWorkflowContainer: false,
@@ -247,7 +272,7 @@ export async function createSiteOpsRebuildTicket(
     quotaPool: null,
     quotaState: "consumed",
     ordinal: 0,
-    clientRequestId: input.clientRequestId,
+    clientRequestId: deliveryClientRequestId,
     category: "site_rebuild",
     topic: "官网重制",
     title: "官网重制需求",
@@ -282,7 +307,7 @@ export async function createSiteOpsRebuildTicket(
     actorRole: "user",
     kind: "created",
     visibility: "customer",
-    clientRequestId: input.clientRequestId,
+    clientRequestId: deliveryClientRequestId,
     message: reason,
     toStatus: "submitted",
     createdAt: input.now,

@@ -120,6 +120,7 @@ import { siteOpsArtifactApi } from "../siteops/artifact-api";
 import { startSiteOpsDomainReminderScheduler } from "../siteops/domain-reminders";
 import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
 import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
+import { startBrandQuestionUniverseWorkerScheduler } from "../brand-question-universe-worker";
 
 declare const __FRONTMIND_BUILD_SHA__: string | undefined;
 
@@ -522,6 +523,7 @@ async function startServer() {
       startConversationRetentionScheduler();
       startJenovaBrandTrackingRecoveryScheduler();
       startServiceContractLifecycleReconciliationScheduler();
+      startBrandQuestionUniverseWorkerScheduler();
       startSiteOpsWorkerScheduler();
       startSiteOpsDomainReminderScheduler();
       startFileContentRetentionScheduler({

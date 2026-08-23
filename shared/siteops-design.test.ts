@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalSiteOpsSha256,
+  composeBuildContractV4,
   composeBuildContractV3,
+  composeBuildPlanContractV4,
   composeBuildPlanContractV3,
   composeBuildContractV2,
   FRONTMIND_VISUAL_FAMILIES_V3,
@@ -12,6 +14,7 @@ import {
   referenceBlueprintV3Schema,
   trustedVisualPreviewBlueprintV3,
   pageContentResultV1Schema,
+  pageContentSpecV2Schema,
   siteDesignResultV1Schema,
   validateDesignAndContentBindings,
 } from "./siteops-design";
@@ -121,6 +124,75 @@ describe("SiteOps Manus design and content contracts", () => {
         },
       }),
     ).toThrow("SITEOPS_CONTENT_SLOT_SET_MISMATCH");
+  });
+
+  it("accepts typed content records and only the host-owned news empty state", () => {
+    const typed = {
+      schemaVersion: 2,
+      routes: [
+        {
+          routeId: "home",
+          heading: "可信企业官网",
+          summary: "仅使用冻结知识库。",
+          sections: [
+            {
+              slotId: "services",
+              blockType: "entity_grid",
+              heading: "服务",
+              paragraphs: ["已确认的服务。"],
+              items: [],
+              entityIds: ["service-one"],
+              faqIds: [],
+              sourceDocumentIds: ["kb-service-poison-001"],
+            },
+          ],
+        },
+        {
+          routeId: "news",
+          heading: "企业动态",
+          summary: "当前知识库暂无可公开的企业动态。",
+          emptyState: "company_news_unavailable",
+          sections: [],
+        },
+      ],
+      entities: [
+        {
+          entityId: "service-one",
+          entityType: "service",
+          slug: "service-one",
+          title: "服务一",
+          summary: "已确认的服务。",
+          body: ["服务正文。"],
+          tags: [],
+          publishedAt: null,
+          modifiedAt: null,
+          author: null,
+          sourceName: null,
+          sourceUrl: null,
+          sourceDocumentIds: ["kb-service-poison-001"],
+          relatedEntityIds: [],
+        },
+      ],
+      faqs: [],
+      officialLinks: [],
+    } as const;
+    expect(pageContentSpecV2Schema.parse(typed).routes[1]).toMatchObject({
+      routeId: "news",
+      emptyState: "company_news_unavailable",
+      sections: [],
+    });
+    expect(() =>
+      pageContentSpecV2Schema.parse({
+        ...typed,
+        entities: [],
+      }),
+    ).toThrow("Typed content block references an absent entity or FAQ");
+    expect(() =>
+      pageContentSpecV2Schema.parse({
+        ...typed,
+        routes: [typed.routes[0], { ...typed.routes[1], routeId: "blog" }],
+      }),
+    ).toThrow("Only the company-news route may use the host-owned empty state");
   });
 
   it("pins visual evidence, design and trusted host coordinates in BuildContractV2", () => {
@@ -449,5 +521,119 @@ describe("SiteOps Manus design and content contracts", () => {
     expect(contract.contractKind).toBe("build_contract");
     expect(contract.sourceHash).toHaveLength(64);
     expect(contract.specHash).not.toBe(plan.specHash);
+  });
+
+  it("pins the typed inventory and exact React Static coordinates in BuildContractV4", () => {
+    const referenceBlueprint = referenceBlueprintForVisualCandidate({
+      candidateId: "candidate-F",
+      providerItemKey: "n:8435",
+      previewSha256: H("preview-v4"),
+    });
+    const base = {
+      schemaVersion: 4 as const,
+      source: {
+        knowledgeSnapshotId: "11111111-1111-4111-8111-111111111111",
+        archiveSha256: H("archive-v4"),
+        sourceBuildId: null,
+        sourceBuildRevision: null,
+      },
+      workflow: {
+        upstreamSha256: H("upstream-v4"),
+        version: "2.2.0",
+        manifestSha256: H("manifest-v4"),
+        starterVersion: "2.2.0",
+        starterSha256: H("starter-v4"),
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+        materializerSha256: H("materializer-v4"),
+      },
+      renderer: {
+        kind: "react_static_v2" as const,
+        reactVersion: "19.2.1" as const,
+        componentLibraryVersion: "2.2.0" as const,
+        materializerVersion: "2.2.0" as const,
+      },
+      identity: {
+        companyName: "FrontMind",
+        primaryLanguage: "zh-CN",
+        verifiedContacts: [],
+      },
+      visual: {
+        queryHash: H("query-v4"),
+        selectedCandidateId: "candidate-F",
+        providerItemKey: "n:8435",
+        visualEvidenceSha256: H("visual-evidence-v4"),
+        previewSha256: H("preview-v4"),
+        supportEvidenceSha256s: [],
+        taxonomy: {
+          role: "foundation" as const,
+          palette: ["#F7F1E6", "#17201B", "#C96C3B"],
+          typography: [],
+          layout: [],
+          motion: [],
+          accessibility: [],
+        },
+      },
+      referenceBlueprint,
+      designSpecHash: H("design-v4"),
+      routes: [
+        {
+          id: "home",
+          slug: "/",
+          title: "首页",
+          sourceDocumentIds: ["kb-overview-poison-001"],
+        },
+      ],
+      assets: [],
+      seo: {
+        siteTitle: "FrontMind",
+        description: "可信企业官网",
+        organizationType: "Organization" as const,
+        environment: "preview" as const,
+        canonicalPolicy: "forbidden" as const,
+      },
+      target: { environment: "preview" as const, canonicalOrigin: null },
+      qaPolicyVersion: "siteops-qa-v4",
+      content: {
+        schemaVersion: 2 as const,
+        inventoryHash: H("frozen-content-inventory"),
+        routePolicyVersion: "snapshot-conditional-v1" as const,
+        sourcePolicy: "frozen_snapshot_only" as const,
+        externalAcquisitionAllowed: false as const,
+        publicSourceLabels: "forbidden" as const,
+      },
+    };
+    const plan = composeBuildPlanContractV4({
+      ...base,
+      contractKind: "build_plan",
+    });
+    expect(plan).toMatchObject({
+      schemaVersion: 4,
+      renderer: { kind: "react_static_v2" },
+      content: {
+        sourcePolicy: "frozen_snapshot_only",
+        externalAcquisitionAllowed: false,
+        publicSourceLabels: "forbidden",
+      },
+    });
+    expect(plan).not.toHaveProperty("contentSpecHash");
+    const contract = composeBuildContractV4({
+      ...base,
+      contractKind: "build_contract",
+      contentSpecHash: H("typed-page-content"),
+      sourceHash: H("canonical-source-entries-v4"),
+      distHash: H("dist-v4"),
+    });
+    expect(contract.contentSpecHash).toHaveLength(64);
+    expect(contract.specHash).not.toBe(plan.specHash);
+    expect(() =>
+      composeBuildPlanContractV4({
+        ...base,
+        workflow: { ...base.workflow, componentLibraryVersion: "2.1.0" },
+        contractKind: "build_plan",
+      } as never),
+    ).toThrow(
+      "BuildContractV4 requires the complete immutable 2.2 coordinates",
+    );
   });
 });

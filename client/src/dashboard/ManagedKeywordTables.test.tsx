@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import ManagedKeywordTables from "./ManagedKeywordTables";
+import ManagedKeywordTables, {
+  BrandQuestionUniverseGenerationAction,
+} from "./ManagedKeywordTables";
 
 const tables = [
   {
@@ -26,12 +28,40 @@ const tables = [
 ];
 
 describe("ManagedKeywordTables", () => {
+  it("renders the exact generation action and respects its eligibility fence", () => {
+    const onStart = vi.fn();
+    const { rerender } = render(
+      <BrandQuestionUniverseGenerationAction
+        disabled
+        status="请先完成并发布当前认证知识库。"
+        onStart={onStart}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "抓取品牌全域词库" });
+    expect(button).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "请先完成并发布当前认证知识库。",
+    );
+    fireEvent.click(button);
+    expect(onStart).not.toHaveBeenCalled();
+
+    rerender(
+      <BrandQuestionUniverseGenerationAction
+        disabled={false}
+        status="已就绪，可基于当前知识库抓取品牌全域词库。"
+        onStart={onStart}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "抓取品牌全域词库" }));
+    expect(onStart).toHaveBeenCalledOnce();
+  });
+
   it("renders the customer word bank without internal delivery copy or hidden source columns", () => {
     render(<ManagedKeywordTables tables={tables} />);
 
     expect(
       screen.getByText(
-        "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。",
+        "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。",
       ),
     ).toBeInTheDocument();
     expect(

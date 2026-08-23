@@ -9,6 +9,7 @@ import {
   deliveryCategoryLabel as localizedDeliveryCategoryLabel,
   deliveryTicketPresentationTopic,
 } from "@shared/delivery-ticket-presentation";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import {
   AlertCircle,
   Check,
@@ -767,7 +768,7 @@ export default function AiWebsiteManagementWorkspace({
       >
         <header className="ai-website-header">
           <p className="ai-website-eyebrow">企业知识库驱动</p>
-          <h1 id="ai-website-title">一站式建站</h1>
+          <h1 id="ai-website-title">{SITEOPS_CUSTOMER_DISPLAY_NAME}</h1>
           <p className="ai-website-intro">
             选择企业知识库和视觉方案，即可完成官网制作、预览、域名配置与发布。
           </p>
@@ -788,7 +789,7 @@ export default function AiWebsiteManagementWorkspace({
     >
       <header className="ai-website-header">
         <p className="ai-website-eyebrow">AI 友好内容资产</p>
-        <h1 id="ai-website-title">一站式建站</h1>
+        <h1 id="ai-website-title">{SITEOPS_CUSTOMER_DISPLAY_NAME}</h1>
         <p className="ai-website-intro">
           {overseasAccount
             ? "先注册企业实名域名，再回到这里提交域名创建 AI 运维需求。香港或海外节点无需办理工信部 ICP 备案。"

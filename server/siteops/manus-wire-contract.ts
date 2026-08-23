@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { ManusV2StructuredOutputSchema } from "../manus-v2-client";
 import { canonicalJson } from "../../shared/siteops-workflow";
 import {
+  pageContentResultV2Schema,
   pageContentResultV1Schema,
   siteDesignResultV1Schema,
   siteDesignResultV2Schema,
@@ -31,6 +32,24 @@ const sectionVariants = [
   "faq",
   "proof",
   "cta",
+] as const;
+const contentBlockTypes = [
+  "prose",
+  "feature_list",
+  "steps",
+  "metrics",
+  "quote",
+  "entity_grid",
+  "faq_preview",
+  "cta",
+] as const;
+const contentEntityTypes = [
+  "product",
+  "service",
+  "application",
+  "case_study",
+  "blog",
+  "company_news",
 ] as const;
 const schemaRecord = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -583,6 +602,323 @@ export function pageContentResultFromWire(
   });
 }
 
+/** React Static 2.2 provider wire. Arrays remain flat enough for Manus'
+ * structured-output subset; Dashboard converts them into the canonical typed
+ * content graph only after validating snapshot source bindings. */
+export function pageContentWireV3OutputSchema(input: {
+  operationToken: string;
+  routeIds: readonly string[];
+  sourceDocumentIds: readonly string[];
+}) {
+  void input.sourceDocumentIds;
+  const sourceIds = { type: "array", items: { type: "string" } } as const;
+  const nullableString = {
+    anyOf: [{ type: "string" }, { type: "null" }],
+  } as const;
+  return assertSiteOpsStructuredOutputSchema({
+    type: "object",
+    properties: {
+      operationToken: { type: "string", enum: [input.operationToken] },
+      schemaVersion: { type: "number", enum: [3] },
+      routes: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string", enum: [...input.routeIds] },
+            eyebrow: nullableString,
+            heading: { type: "string" },
+            summary: { type: "string" },
+          },
+          required: ["routeId", "eyebrow", "heading", "summary"],
+          additionalProperties: false,
+        },
+      },
+      blocks: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string", enum: [...input.routeIds] },
+            slotId: { type: "string" },
+            blockType: { type: "string", enum: [...contentBlockTypes] },
+            heading: { type: "string" },
+            paragraphs: { type: "array", items: { type: "string" } },
+            items: { type: "array", items: { type: "string" } },
+            entityIds: { type: "array", items: { type: "string" } },
+            faqIds: { type: "array", items: { type: "string" } },
+            sourceDocumentIds: sourceIds,
+          },
+          required: [
+            "routeId",
+            "slotId",
+            "blockType",
+            "heading",
+            "paragraphs",
+            "items",
+            "entityIds",
+            "faqIds",
+            "sourceDocumentIds",
+          ],
+          additionalProperties: false,
+        },
+      },
+      entities: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            entityId: { type: "string" },
+            entityType: { type: "string", enum: [...contentEntityTypes] },
+            slug: { type: "string" },
+            title: { type: "string" },
+            summary: { type: "string" },
+            body: { type: "array", items: { type: "string" } },
+            tags: { type: "array", items: { type: "string" } },
+            publishedAt: nullableString,
+            modifiedAt: nullableString,
+            author: nullableString,
+            sourceName: nullableString,
+            sourceUrl: nullableString,
+            sourceDocumentIds: sourceIds,
+            relatedEntityIds: { type: "array", items: { type: "string" } },
+          },
+          required: [
+            "entityId",
+            "entityType",
+            "slug",
+            "title",
+            "summary",
+            "body",
+            "tags",
+            "publishedAt",
+            "modifiedAt",
+            "author",
+            "sourceName",
+            "sourceUrl",
+            "sourceDocumentIds",
+            "relatedEntityIds",
+          ],
+          additionalProperties: false,
+        },
+      },
+      faqs: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            faqId: { type: "string" },
+            category: nullableString,
+            question: { type: "string" },
+            answers: { type: "array", items: { type: "string" } },
+            sourceDocumentIds: sourceIds,
+          },
+          required: [
+            "faqId",
+            "category",
+            "question",
+            "answers",
+            "sourceDocumentIds",
+          ],
+          additionalProperties: false,
+        },
+      },
+      officialLinks: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["same_as", "reference"] },
+            label: { type: "string" },
+            url: { type: "string" },
+            sourceDocumentIds: sourceIds,
+          },
+          required: ["kind", "label", "url", "sourceDocumentIds"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: [
+      "operationToken",
+      "schemaVersion",
+      "routes",
+      "blocks",
+      "entities",
+      "faqs",
+      "officialLinks",
+    ],
+    additionalProperties: false,
+  });
+}
+
+const pageContentWireV3Schema = z
+  .object({
+    operationToken: z.string().min(1).max(128),
+    schemaVersion: z.literal(3),
+    routes: pageContentWireV2Schema.shape.routes,
+    blocks: z
+      .array(
+        z
+          .object({
+            routeId: z.string().trim().min(1).max(64),
+            slotId: z
+              .string()
+              .trim()
+              .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+            blockType: z.enum(contentBlockTypes),
+            heading: z.string().trim().min(1).max(160),
+            paragraphs: z
+              .array(z.string().trim().min(1).max(2_000))
+              .min(1)
+              .max(16),
+            items: z.array(z.string().trim().min(1).max(500)).max(24),
+            entityIds: z.array(z.string().trim().min(1).max(64)).max(24),
+            faqIds: z.array(z.string().trim().min(1).max(64)).max(24),
+            sourceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .min(1)
+              .max(50),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(480),
+    entities: z
+      .array(
+        z
+          .object({
+            entityId: z
+              .string()
+              .trim()
+              .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+            entityType: z.enum(contentEntityTypes),
+            slug: z
+              .string()
+              .trim()
+              .regex(/^[a-z0-9](?:[a-z0-9_-]{0,62})$/u),
+            title: z.string().trim().min(1).max(180),
+            summary: z.string().trim().min(1).max(600),
+            body: z.array(z.string().trim().min(1).max(2_000)).min(1).max(24),
+            tags: z.array(z.string().trim().min(1).max(80)).max(20),
+            publishedAt: z.string().trim().min(1).max(64).nullable(),
+            modifiedAt: z.string().trim().min(1).max(64).nullable(),
+            author: z.string().trim().min(1).max(160).nullable(),
+            sourceName: z.string().trim().min(1).max(255).nullable(),
+            sourceUrl: z.string().url().max(2_048).nullable(),
+            sourceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .min(1)
+              .max(50),
+            relatedEntityIds: z.array(z.string().trim().min(1).max(64)).max(20),
+          })
+          .strict(),
+      )
+      .max(120),
+    faqs: z
+      .array(
+        z
+          .object({
+            faqId: z
+              .string()
+              .trim()
+              .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+            category: z.string().trim().min(1).max(100).nullable(),
+            question: z.string().trim().min(1).max(300),
+            answers: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
+            sourceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .min(1)
+              .max(50),
+          })
+          .strict(),
+      )
+      .max(120),
+    officialLinks: z
+      .array(
+        z
+          .object({
+            kind: z.enum(["same_as", "reference"]),
+            label: z.string().trim().min(1).max(120),
+            url: z.string().url().max(2_048),
+            sourceDocumentIds: z
+              .array(z.string().trim().min(1).max(191))
+              .min(1)
+              .max(50),
+          })
+          .strict(),
+      )
+      .max(30),
+  })
+  .strict();
+
+export function pageContentResultV2FromWire(
+  value: unknown,
+  routeIds: readonly string[],
+  sourceDocumentIds: readonly string[],
+  emptyRouteIds: readonly string[] = [],
+) {
+  const wire = pageContentWireV3Schema.parse(value);
+  const expectedRouteIds = new Set(routeIds);
+  const emptyRoutes = new Set(emptyRouteIds);
+  const allowedSourceDocumentIds = new Set(sourceDocumentIds);
+  const sourceSets = [
+    ...wire.blocks.map((item) => item.sourceDocumentIds),
+    ...wire.entities.map((item) => item.sourceDocumentIds),
+    ...wire.faqs.map((item) => item.sourceDocumentIds),
+    ...wire.officialLinks.map((item) => item.sourceDocumentIds),
+  ];
+  if (
+    wire.routes.length !== routeIds.length ||
+    new Set(wire.routes.map((route) => route.routeId)).size !==
+      routeIds.length ||
+    wire.routes.some((route) => !expectedRouteIds.has(route.routeId)) ||
+    wire.blocks.some((block) => !expectedRouteIds.has(block.routeId)) ||
+    [...emptyRoutes].some((routeId) => !expectedRouteIds.has(routeId)) ||
+    wire.blocks.some((block) => emptyRoutes.has(block.routeId)) ||
+    (emptyRoutes.has("news") &&
+      wire.entities.some((entity) => entity.entityType === "company_news")) ||
+    sourceSets.some((ids) =>
+      ids.some((documentId) => !allowedSourceDocumentIds.has(documentId)),
+    )
+  ) {
+    throw new Error("SITEOPS_CONTENT_SOURCE_OR_ROUTE_MISMATCH");
+  }
+  const routesById = new Map(
+    wire.routes.map((route) => [route.routeId, route]),
+  );
+  return pageContentResultV2Schema.parse({
+    operationToken: wire.operationToken,
+    pageContent: {
+      schemaVersion: 2,
+      routes: routeIds.map((routeId) => {
+        const route = routesById.get(routeId);
+        if (!route) throw new Error("SITEOPS_CONTENT_ROUTE_SET_MISMATCH");
+        if (emptyRoutes.has(routeId)) {
+          return {
+            routeId,
+            heading: "企业动态",
+            summary: "当前知识库暂无可公开的企业动态。",
+            emptyState: "company_news_unavailable" as const,
+            sections: [],
+          };
+        }
+        return {
+          routeId,
+          ...(route.eyebrow ? { eyebrow: route.eyebrow } : {}),
+          heading: route.heading,
+          summary: route.summary,
+          sections: wire.blocks
+            .filter((block) => block.routeId === routeId)
+            .map(({ routeId: _routeId, ...block }) => block),
+        };
+      }),
+      entities: wire.entities,
+      faqs: wire.faqs,
+      officialLinks: wire.officialLinks,
+    },
+  });
+}
+
 export function socialWireOutputSchema(input: {
   operationToken: string;
   channel: "wechat" | "xiaohongshu";
@@ -841,6 +1177,10 @@ export function siteOpsBuildContractAttachment(contract: unknown) {
 
 export function siteOpsBuildPlanContractV3Attachment(contract: unknown) {
   return jsonAttachment("frontmind-build-plan-contract-v3.json", contract);
+}
+
+export function siteOpsBuildPlanContractV4Attachment(contract: unknown) {
+  return jsonAttachment("frontmind-build-plan-contract-v4.json", contract);
 }
 
 export function siteOpsCustomerFeedbackAttachment(feedback: string) {

@@ -146,7 +146,7 @@ const DELIVERY_CATEGORY_LABELS: Record<string, string> = Object.freeze({
   verification_code: "验证代码",
   bulk_redirect: "批量重定向",
   technical_diagnosis: "技术诊断",
-  site_rebuild: "站点重建",
+  site_rebuild: "官网重制",
   prelaunch_review: "上线前检查",
   llms_txt_experiment: "llms.txt 实验",
 });

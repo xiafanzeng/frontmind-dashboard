@@ -1,4 +1,5 @@
 import type { SiteOpsObservationV1 } from "@shared/siteops-contract";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import { useEffect, useRef, useState } from "react";
 import { trpc } from "@/lib/trpc";
 import SiteOpsConversationPanel from "./SiteOpsConversationPanel";
@@ -28,8 +29,8 @@ const PENDING_SOCIAL_PACKAGE_STATES = new Set([
   "qa_running",
 ]);
 
-function clientRequestId() {
-  return `siteops-${crypto.randomUUID()}`;
+export function siteOpsClientRequestId() {
+  return crypto.randomUUID();
 }
 
 export default function ConnectedSiteOpsConversationPanel({
@@ -130,7 +131,7 @@ export default function ConnectedSiteOpsConversationPanel({
         setObservation(
           await sendMessageMutation.mutateAsync({
             conversationId: observation.project.conversationId,
-            clientRequestId: clientRequestId(),
+            clientRequestId: siteOpsClientRequestId(),
             text,
             localAssetIds: [],
             expectedProjectRevision: observation.project.revision,
@@ -142,7 +143,7 @@ export default function ConnectedSiteOpsConversationPanel({
         setObservation(
           await actMutation.mutateAsync({
             conversationId: observation.project.conversationId,
-            clientRequestId: clientRequestId(),
+            clientRequestId: siteOpsClientRequestId(),
             expectedRevision: observation.project.revision,
             action: input.action,
             input: input.input,
@@ -152,13 +153,17 @@ export default function ConnectedSiteOpsConversationPanel({
         );
       }}
       onBeginAliyun={async () => {
-        if (!observation) throw new Error("一站式建站尚未就绪。");
+        if (!observation) {
+          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
+        }
         return await aliyunBeginMutation.mutateAsync({
           conversationId: observation.project.conversationId,
         });
       }}
       onLoadAliyunAuthorizationGuide={async () => {
-        if (!observation) throw new Error("一站式建站尚未就绪。");
+        if (!observation) {
+          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
+        }
         const guide = await aliyunAuthorizationGuideQuery.refetch();
         if (!guide.data) {
           throw new Error("阿里云授权配置尚未就绪，请联系 FrontMind。");

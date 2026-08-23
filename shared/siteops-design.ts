@@ -382,6 +382,255 @@ export const pageContentSpecV1Schema = z
   })
   .strict();
 
+export const siteContentBlockTypeSchema = z.enum([
+  "prose",
+  "feature_list",
+  "steps",
+  "metrics",
+  "quote",
+  "entity_grid",
+  "faq_preview",
+  "cta",
+]);
+
+export const siteContentEntityTypeSchema = z.enum([
+  "product",
+  "service",
+  "application",
+  "case_study",
+  "blog",
+  "company_news",
+]);
+
+const sourceBoundIdsSchema = z
+  .array(z.string().trim().min(1).max(191))
+  .min(1)
+  .max(50);
+const optionalSourceBoundIdsSchema = z
+  .array(z.string().trim().min(1).max(191))
+  .max(50);
+
+const nullableContentDateSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/u)
+  .nullable();
+
+/** React Static 2.2 canonical content. Semantic block types and knowledge
+ * entities are kept separate from the frozen visual slot variants, so the
+ * provider cannot turn a content choice into an arbitrary component name. */
+export const pageContentSpecV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    routes: z
+      .array(
+        z
+          .object({
+            routeId: z.string().trim().min(1).max(64),
+            eyebrow: z.string().trim().min(1).max(100).optional(),
+            heading: z.string().trim().min(1).max(180),
+            summary: z.string().trim().min(1).max(600),
+            emptyState: z.literal("company_news_unavailable").optional(),
+            sections: z
+              .array(
+                z
+                  .object({
+                    slotId: z
+                      .string()
+                      .trim()
+                      .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+                    blockType: siteContentBlockTypeSchema,
+                    heading: z.string().trim().min(1).max(160),
+                    paragraphs: z
+                      .array(z.string().trim().min(1).max(2_000))
+                      .min(1)
+                      .max(16),
+                    items: z.array(z.string().trim().min(1).max(500)).max(24),
+                    entityIds: z
+                      .array(z.string().trim().min(1).max(64))
+                      .max(24),
+                    faqIds: z.array(z.string().trim().min(1).max(64)).max(24),
+                    sourceDocumentIds: optionalSourceBoundIdsSchema,
+                  })
+                  .strict(),
+              )
+              .min(0)
+              .max(16),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(30),
+    entities: z
+      .array(
+        z
+          .object({
+            entityId: z
+              .string()
+              .trim()
+              .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+            entityType: siteContentEntityTypeSchema,
+            slug: z
+              .string()
+              .trim()
+              .regex(/^[a-z0-9](?:[a-z0-9_-]{0,62})$/u),
+            title: z.string().trim().min(1).max(180),
+            summary: z.string().trim().min(1).max(600),
+            body: z.array(z.string().trim().min(1).max(2_000)).min(1).max(24),
+            tags: z.array(z.string().trim().min(1).max(80)).max(20),
+            publishedAt: nullableContentDateSchema,
+            modifiedAt: nullableContentDateSchema,
+            author: z.string().trim().min(1).max(160).nullable(),
+            sourceName: z.string().trim().min(1).max(255).nullable(),
+            sourceUrl: z.string().url().max(2_048).nullable(),
+            sourceDocumentIds: sourceBoundIdsSchema,
+            relatedEntityIds: z.array(z.string().trim().min(1).max(64)).max(20),
+          })
+          .strict(),
+      )
+      .max(120),
+    faqs: z
+      .array(
+        z
+          .object({
+            faqId: z
+              .string()
+              .trim()
+              .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+            category: z.string().trim().min(1).max(100).nullable(),
+            question: z.string().trim().min(1).max(300),
+            answers: z.array(z.string().trim().min(1).max(2_000)).min(1).max(8),
+            sourceDocumentIds: sourceBoundIdsSchema,
+          })
+          .strict(),
+      )
+      .max(120),
+    officialLinks: z
+      .array(
+        z
+          .object({
+            kind: z.enum(["same_as", "reference"]),
+            label: z.string().trim().min(1).max(120),
+            url: z.string().url().max(2_048),
+            sourceDocumentIds: sourceBoundIdsSchema,
+          })
+          .strict(),
+      )
+      .max(30),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const routeIds = new Set(value.routes.map((route) => route.routeId));
+    if (routeIds.size !== value.routes.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["routes"],
+        message: "Content route ids must be unique",
+      });
+    }
+    for (const [routeIndex, route] of value.routes.entries()) {
+      const emptyNews = route.emptyState === "company_news_unavailable";
+      if (
+        (emptyNews &&
+          (route.routeId !== "news" || route.sections.length > 0)) ||
+        (!emptyNews && route.sections.length < 1)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["routes", routeIndex],
+          message:
+            "Only the company-news route may use the host-owned empty state",
+        });
+      }
+      if (
+        new Set(route.sections.map((section) => section.slotId)).size !==
+        route.sections.length
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["routes", routeIndex, "sections"],
+          message: "Content block slot ids must be unique within a route",
+        });
+      }
+      if (
+        route.sections.some(
+          (section) => !emptyNews && section.sourceDocumentIds.length < 1,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["routes", routeIndex, "sections", "sourceDocumentIds"],
+          message: "Every factual content block must bind to snapshot sources",
+        });
+      }
+    }
+    const entityIds = new Set(value.entities.map((entity) => entity.entityId));
+    const routeKeys = new Set(
+      value.entities.map((entity) => `${entity.entityType}:${entity.slug}`),
+    );
+    if (
+      entityIds.size !== value.entities.length ||
+      routeKeys.size !== value.entities.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["entities"],
+        message: "Content entity ids and type/slug routes must be unique",
+      });
+    }
+    if (
+      value.entities.some((entity) =>
+        entity.relatedEntityIds.some((id) => !entityIds.has(id)),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["entities", "relatedEntityIds"],
+        message: "Related content entity is absent",
+      });
+    }
+    const faqIds = new Set(value.faqs.map((faq) => faq.faqId));
+    if (faqIds.size !== value.faqs.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["faqs"],
+        message: "FAQ ids must be unique",
+      });
+    }
+    if (
+      value.routes.some((route) =>
+        route.sections.some(
+          (section) =>
+            section.entityIds.some((id) => !entityIds.has(id)) ||
+            section.faqIds.some((id) => !faqIds.has(id)),
+        ),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["routes", "sections"],
+        message: "Typed content block references an absent entity or FAQ",
+      });
+    }
+    if (
+      value.routes.some((route) =>
+        route.sections.some(
+          (section) =>
+            (section.blockType === "entity_grid" &&
+              section.entityIds.length < 1) ||
+            (section.blockType === "faq_preview" && section.faqIds.length < 1),
+        ),
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["routes", "sections", "blockType"],
+        message:
+          "Typed collection blocks must reference their canonical records",
+      });
+    }
+  });
+
 export const siteDesignResultV1Schema = z
   .object({
     operationToken: z.string().min(1).max(128),
@@ -398,6 +647,12 @@ export const pageContentResultV1Schema = z
   .object({
     operationToken: z.string().min(1).max(128),
     pageContent: pageContentSpecV1Schema,
+  })
+  .strict();
+export const pageContentResultV2Schema = z
+  .object({
+    operationToken: z.string().min(1).max(128),
+    pageContent: pageContentSpecV2Schema,
   })
   .strict();
 
@@ -576,6 +831,88 @@ export const buildContractV3Schema = buildPlanContractV3BaseSchema
   .strict()
   .superRefine(validateBuildContractV3Coordinates);
 
+const contentContractCoordinatesV4Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    inventoryHash: sha256Schema,
+    routePolicyVersion: z.literal("snapshot-conditional-v1"),
+    sourcePolicy: z.literal("frozen_snapshot_only"),
+    externalAcquisitionAllowed: z.literal(false),
+    publicSourceLabels: z.literal("forbidden"),
+  })
+  .strict();
+
+const buildPlanContractV4BaseSchema = buildPlanContractV3BaseSchema
+  .omit({ schemaVersion: true, renderer: true })
+  .extend({
+    schemaVersion: z.literal(4),
+    renderer: z
+      .object({
+        kind: z.literal("react_static_v2"),
+        reactVersion: z.literal("19.2.1"),
+        componentLibraryVersion: z.literal("2.2.0"),
+        materializerVersion: z.literal("2.2.0"),
+      })
+      .strict(),
+    content: contentContractCoordinatesV4Schema,
+  })
+  .strict();
+
+function validateBuildContractV4Coordinates(
+  value: Pick<
+    z.infer<typeof buildPlanContractV4BaseSchema>,
+    | "visual"
+    | "referenceBlueprint"
+    | "workflow"
+    | "renderer"
+    | "qaPolicyVersion"
+  >,
+  context: z.RefinementCtx,
+) {
+  if (
+    value.visual.selectedCandidateId !== value.referenceBlueprint.candidateId ||
+    value.visual.providerItemKey !== value.referenceBlueprint.providerItemKey ||
+    value.visual.previewSha256 !== value.referenceBlueprint.previewSha256
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["referenceBlueprint"],
+      message: "Build contract blueprint does not match visual evidence",
+    });
+  }
+  if (
+    value.workflow.version !== "2.2.0" ||
+    value.workflow.starterVersion !== "2.2.0" ||
+    value.workflow.componentLibraryVersion !== "2.2.0" ||
+    value.workflow.materializerVersion !== "2.2.0" ||
+    value.qaPolicyVersion !== "siteops-qa-v4"
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["workflow"],
+      message:
+        "BuildContractV4 requires the complete immutable 2.2 coordinates",
+    });
+  }
+}
+
+/** React Static 2.2 build plan. The frozen inventory hash exists before the
+ * provider content phase; the final content-spec hash is added only after the
+ * typed graph has validated and materialization has completed. */
+export const buildPlanContractV4Schema =
+  buildPlanContractV4BaseSchema.superRefine(validateBuildContractV4Coordinates);
+
+export const buildContractV4Schema = buildPlanContractV4BaseSchema
+  .omit({ contractKind: true })
+  .extend({
+    contractKind: z.literal("build_contract"),
+    contentSpecHash: sha256Schema,
+    sourceHash: sha256Schema,
+    distHash: sha256Schema,
+  })
+  .strict()
+  .superRefine(validateBuildContractV4Coordinates);
+
 export type SiteDesignSpecV1 = z.infer<typeof siteDesignSpecV1Schema>;
 export type SiteHeroFamily = z.infer<typeof siteHeroFamilySchema>;
 export type ReferenceBlueprintV2 = z.infer<typeof referenceBlueprintV2Schema>;
@@ -584,6 +921,8 @@ export type ReferenceBlueprint = z.infer<typeof referenceBlueprintSchema>;
 export type SiteDesignSpecV2 = z.infer<typeof siteDesignSpecV2Schema>;
 export type SiteDesignSpec = SiteDesignSpecV1 | SiteDesignSpecV2;
 export type PageContentSpecV1 = z.infer<typeof pageContentSpecV1Schema>;
+export type PageContentSpecV2 = z.infer<typeof pageContentSpecV2Schema>;
+export type PageContentSpec = PageContentSpecV1 | PageContentSpecV2;
 export type SiteOpsRuntimeVisualEvidenceV1 = z.infer<
   typeof siteOpsRuntimeVisualEvidenceV1Schema
 >;
@@ -593,6 +932,8 @@ export type SiteOpsRuntimeVisualEvidenceV2 = z.infer<
 export type BuildContractV2 = z.infer<typeof buildContractV2Schema>;
 export type BuildPlanContractV3 = z.infer<typeof buildPlanContractV3Schema>;
 export type BuildContractV3 = z.infer<typeof buildContractV3Schema>;
+export type BuildPlanContractV4 = z.infer<typeof buildPlanContractV4Schema>;
+export type BuildContractV4 = z.infer<typeof buildContractV4Schema>;
 
 function canonicalJson(value: unknown): string {
   if (value === null) return "null";
@@ -1355,12 +1696,28 @@ export function composeBuildContractV3(
     specHash: canonicalSiteOpsSha256(input),
   });
 }
+export function composeBuildPlanContractV4(
+  input: Omit<BuildPlanContractV4, "specHash">,
+): BuildPlanContractV4 {
+  return buildPlanContractV4Schema.parse({
+    ...input,
+    specHash: canonicalSiteOpsSha256(input),
+  });
+}
+export function composeBuildContractV4(
+  input: Omit<BuildContractV4, "specHash">,
+): BuildContractV4 {
+  return buildContractV4Schema.parse({
+    ...input,
+    specHash: canonicalSiteOpsSha256(input),
+  });
+}
 
 export function validateDesignAndContentBindings(input: {
   routeIds: readonly string[];
   paletteSize: number;
   designSpec: SiteDesignSpec;
-  pageContent?: PageContentSpecV1;
+  pageContent?: PageContentSpec;
 }) {
   const expectedRoutes = new Set(input.routeIds);
   const compositions = new Map(
@@ -1403,6 +1760,15 @@ export function validateDesignAndContentBindings(input: {
   for (const [routeId, composition] of compositions) {
     const content = contentByRoute.get(routeId);
     if (!content) throw new Error("SITEOPS_CONTENT_ROUTE_SET_MISMATCH");
+    if (
+      "emptyState" in content &&
+      content.emptyState === "company_news_unavailable"
+    ) {
+      if (routeId !== "news" || content.sections.length !== 0) {
+        throw new Error("SITEOPS_CONTENT_EMPTY_STATE_INVALID");
+      }
+      continue;
+    }
     const slots = content.sections.map((section) => section.slotId);
     if (
       composition.slots.length !== slots.length ||

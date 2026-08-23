@@ -8,9 +8,10 @@ import type {
   TrustedVisualPreviewBlueprintV3,
 } from "../../shared/siteops-design";
 
-export const REACT_STATIC_RENDERER = "react_static_v1" as const;
-export const REACT_STATIC_COMPONENT_LIBRARY_VERSION = "2.1.0" as const;
-export const REACT_STATIC_MATERIALIZER_VERSION = "2.1.0" as const;
+export const REACT_STATIC_RENDERER_V1 = "react_static_v1" as const;
+export const REACT_STATIC_RENDERER = "react_static_v2" as const;
+export const REACT_STATIC_COMPONENT_LIBRARY_VERSION = "2.2.0" as const;
+export const REACT_STATIC_MATERIALIZER_VERSION = "2.2.0" as const;
 export const REACT_STATIC_REACT_VERSION = "19.2.1" as const;
 const VISUAL_PREVIEW_RENDER_BUDGET_MS = 75_000;
 const VISUAL_PREVIEW_BROWSER_LAUNCH_TIMEOUT_MS = 20_000;
@@ -336,6 +337,56 @@ function CtaSection({ section }) {
   return h("section", { className: "section section--cta", "data-slot": section.slotId }, h("div", null, h("span", { className: "section-index" }, "下一步"), h("h2", null, section.heading), h(Paragraphs, { values: section.paragraphs })), h("a", { className: "button button--inverse", href: "#contact" }, "开始沟通"), h(SourceNote, { ids: section.sourceDocumentIds }));
 }
 
+function TypedBlock({ section, hasContact }) {
+  const common = { className: "section section--typed section--" + section.blockType, "data-slot": section.slotId, "data-block-type": section.blockType };
+  const heading = h("header", null, h("span", { className: "section-index" }, "内容"), h("h2", null, section.heading));
+  if (section.blockType === "feature_list") {
+    return h("section", common, heading, h("ul", { className: "typed-list" }, ...section.items.map((item, index) => h("li", { key: index }, item))), h(Paragraphs, { values: section.paragraphs }));
+  }
+  if (section.blockType === "steps") {
+    return h("section", common, heading, h("ol", { className: "timeline-list" }, ...section.items.map((item, index) => h("li", { key: index }, h("span", null, String(index + 1).padStart(2, "0")), h("p", null, item)))), h(Paragraphs, { values: section.paragraphs }));
+  }
+  if (section.blockType === "metrics") {
+    return h("section", common, heading, h("ul", { className: "metric-grid" }, ...section.items.map((item, index) => h("li", { key: index }, h("strong", null, item)))), h(Paragraphs, { values: section.paragraphs }));
+  }
+  if (section.blockType === "quote") {
+    return h("section", common, heading, h("blockquote", null, section.paragraphs[0]), section.paragraphs.length > 1 ? h(Paragraphs, { values: section.paragraphs.slice(1) }) : null);
+  }
+  if (section.blockType === "entity_grid") {
+    return h("section", common, heading, h(Paragraphs, { values: section.paragraphs }), h("div", { className: "entity-grid" }, ...section.entities.map((entity) => h("article", { className: "entity-card", key: entity.entityId }, h("h3", null, h("a", { href: entity.href }, entity.title)), h("p", null, entity.summary), entity.tags.length > 0 ? h("ul", { className: "tag-list", "aria-label": "标签" }, ...entity.tags.map((tag) => h("li", { key: tag }, tag))) : null))));
+  }
+  if (section.blockType === "faq_preview") {
+    return h(
+      "section",
+      common,
+      heading,
+      h(Paragraphs, { values: section.paragraphs }),
+      h(
+        "dl",
+        { className: "faq-list" },
+        ...section.faqs.map((faq) =>
+          h(
+            "div",
+            { key: faq.faqId },
+            h("dt", null, faq.question),
+            h(
+              "dd",
+              null,
+              ...faq.answers.map((answer, index) =>
+                h("p", { key: index }, answer)
+              )
+            )
+          )
+        )
+      )
+    );
+  }
+  if (section.blockType === "cta") {
+    return h("section", common, heading, h(Paragraphs, { values: section.paragraphs }), hasContact ? h("a", { className: "button button--inverse", href: "#contact" }, "开始沟通") : h("button", { className: "button button--inverse", type: "button", disabled: true, "aria-disabled": "true" }, "咨询入口待开放"));
+  }
+  return h("section", common, heading, h(Paragraphs, { values: section.paragraphs }), section.items.length > 0 ? h("ul", { className: "typed-list" }, ...section.items.map((item, index) => h("li", { key: index }, item))) : null);
+}
+
 const SECTION_COMPONENTS = Object.freeze({
   statement: StatementSection,
   split: SplitSection,
@@ -354,10 +405,21 @@ function SiteFooter({ site }) {
   return h("footer", { className: "site-footer" }, h("div", { className: "shell footer-row" }, h("strong", null, site.companyName)));
 }
 
-function SitePage({ page }) {
+export function SiteHero({ page }) {
   const family = safeHeroFamily(page.heroFamily);
   const Hero = HERO_COMPONENTS[family];
-  return h(React.Fragment, null, h(Hero, { page }), h("div", { className: "shell facts", id: "content" }, ...page.sections.map((section) => { const Component = SECTION_COMPONENTS[section.variant] || CardsSection; return h(Component, { key: section.slotId, section }); })), page.contacts.length > 0 ? h("section", { className: "contact", id: "contact" }, h("div", { className: "shell" }, h("p", { className: "eyebrow" }, "Contact"), h("h2", null, "联系我们"), h("ul", { className: "contact-list" }, ...page.contacts.map((contact, index) => h("li", { key: index }, contact.href ? h("a", { href: contact.href }, contact.label) : contact.label))))) : h("span", { id: "contact", hidden: true }));
+  return h(Hero, { page });
+}
+
+function SitePage({ page }) {
+  const body = page.emptyState === "company_news_unavailable"
+    ? h("section", { className: "section section--empty", role: "status", "data-content-state": "empty" }, h("h2", null, "暂无企业动态"), h("p", null, "当前知识库暂无可公开的企业动态。"))
+    : page.sections.map((section) => {
+        if (section.blockType) return h(TypedBlock, { key: section.slotId, section, hasContact: page.contacts.length > 0 });
+        const Component = SECTION_COMPONENTS[section.variant] || CardsSection;
+        return h(Component, { key: section.slotId, section });
+      });
+  return h(React.Fragment, null, h(SiteHero, { page }), h("div", { className: "shell facts", id: "content" }, ...(Array.isArray(body) ? body : [body])), page.contacts.length > 0 ? h("section", { className: "contact", id: "contact" }, h("div", { className: "shell" }, h("p", { className: "eyebrow" }, "Contact"), h("h2", null, "联系我们"), h("ul", { className: "contact-list" }, ...page.contacts.map((contact, index) => h("li", { key: index }, contact.href ? h("a", { href: contact.href }, contact.label) : contact.label))))) : h("span", { id: "contact", hidden: true }));
 }
 
 function jsonLdMarkup(value) {
@@ -443,7 +505,7 @@ async function emit(outputPath, element) {
 
 const manifest = await json("route-manifest.json");
 const site = await json("data/site.json");
-if (manifest.schemaVersion !== 1 || manifest.renderer !== "react_static_v1" || !Array.isArray(manifest.routes)) {
+if (![1, 2].includes(manifest.schemaVersion) || !["react_static_v1", "react_static_v2"].includes(manifest.renderer) || !Array.isArray(manifest.routes)) {
   throw new Error("SITEOPS_REACT_PROJECT_MANIFEST_INVALID");
 }
 
@@ -455,7 +517,7 @@ for (const route of manifest.routes) {
 }
 const notFound = await json(manifest.notFound.dataPath);
 await emit(manifest.notFound.outputPath, React.createElement(NotFoundDocument, { site, page: notFound }));
-process.stdout.write(JSON.stringify({ renderer: "react_static_v1", routes: manifest.routes.length, htmlFiles: manifest.routes.length + 1 }) + "\n");
+process.stdout.write(JSON.stringify({ renderer: manifest.renderer, routes: manifest.routes.length, htmlFiles: manifest.routes.length + 1 }) + "\n");
 `;
 
 type TrustedVisualPreviewBlueprint = TrustedVisualPreviewBlueprintV3;

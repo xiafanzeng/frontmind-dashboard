@@ -193,7 +193,7 @@ describe("UserBrandDashboard service experience", () => {
       "问题监控",
       "进度报告",
       "内容资产运营",
-      "一站式建站",
+      "AI友好官网管理",
     ]) {
       expect(screen.getByRole("button", { name: item })).toBeInTheDocument();
     }
@@ -250,7 +250,7 @@ describe("UserBrandDashboard service experience", () => {
       name: "内容资产运营",
     });
     const websiteManagement = screen.getByRole("button", {
-      name: "一站式建站",
+      name: "AI友好官网管理",
     });
     expect(knowledgeAgent.querySelector("svg")).toBeInTheDocument();
     expect(globalKeywords.querySelector("svg")).toBeInTheDocument();
@@ -371,7 +371,7 @@ describe("UserBrandDashboard service experience", () => {
     expect(screen.getByText("剩余 1 次")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
     expect(
       screen.getByRole("region", { name: "官网运营功能未开放" }),
     ).toBeInTheDocument();
@@ -381,10 +381,10 @@ describe("UserBrandDashboard service experience", () => {
     setPreviewPlan("luxury");
     render(<UserBrandDashboard preview />);
 
-    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
 
     expect(
-      screen.getByRole("heading", { name: "一站式建站" }),
+      screen.getByRole("heading", { name: "AI友好官网管理" }),
     ).toBeInTheDocument();
     expect(screen.getByText("官网开通进度")).toBeInTheDocument();
     expect(
@@ -606,7 +606,7 @@ describe("UserBrandDashboard service experience", () => {
 
     expect(
       screen.getAllByText(
-        "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。",
+        "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。",
       ).length,
     ).toBeGreaterThan(0);
     const keywordTable = screen.getByRole("table");
@@ -1080,7 +1080,7 @@ describe("UserBrandDashboard service experience", () => {
         "问题监控",
         "进度报告",
         "内容资产运营",
-        "一站式建站",
+        "AI友好官网管理",
       ]) {
         const navigationItem = screen.getByRole("button", { name: item });
         expect(navigationItem).not.toBeDisabled();

@@ -75,6 +75,12 @@ describe("delivery ticket presentation", () => {
       }),
     ).toBe("站点检查");
     expect(
+      deliveryCategoryLabel({
+        type: "website_operation",
+        category: "site_rebuild",
+      }),
+    ).toBe("官网重制");
+    expect(
       deliveryTicketPresentationTitle({
         type: "website_operation",
         operation: "legacy_operation",

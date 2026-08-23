@@ -402,7 +402,7 @@ describe("CustomerDashboardMirror", () => {
       screen.getByRole("tab", { name: "应答逻辑智能体" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("tab", { name: "一站式建站" }),
+      screen.getByRole("tab", { name: "AI友好官网管理" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "品牌建设" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "舆情监控" })).toBeNull();

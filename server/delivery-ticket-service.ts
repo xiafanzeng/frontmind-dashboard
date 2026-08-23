@@ -82,6 +82,7 @@ import {
   deliveryEventDisplayMessage,
 } from "../shared/delivery-ticket-presentation";
 import { deliverySummaryLooksLikeCredentialSecret } from "../shared/delivery-ticket-security";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../shared/siteops-branding";
 import type { AuthenticatedUser } from "./auth-service";
 import { getDb } from "./db";
 import {
@@ -782,7 +783,7 @@ export function assertDeliveryTicketServiceEligibility(
     throw new DeliveryTicketError(
       "DELIVERY_TICKET_UPGRADE_REQUIRED",
       ticketType === "website_operation"
-        ? "普通版不包含 AI 友好官网管理，请升级进阶版或豪华版。"
+        ? `普通版不包含${SITEOPS_CUSTOMER_DISPLAY_NAME}，请升级进阶版或豪华版。`
         : "当前套餐不包含此需求服务，请升级进阶版或豪华版。",
       403,
     );
@@ -1440,7 +1441,7 @@ async function currentQuota(
           : portal.service.status === "active" &&
               portal.service.planCode === "basic" &&
               pool === "website_content_publish"
-            ? "普通版不包含 AI 友好官网管理。"
+            ? `普通版不包含${SITEOPS_CUSTOMER_DISPLAY_NAME}。`
             : portal.service.status === "expired" ||
                 portal.service.status === "cancelled"
               ? "当前服务已到期，仅可查看历史需求。"

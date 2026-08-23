@@ -2,6 +2,7 @@ import { protectedProcedure, router } from "./_core/trpc";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { toTrpcError } from "./auth-router";
+import { runtimeErrorForLog } from "./_core/runtime-error-log";
 import {
   getDashboardQuestion,
   getDashboardWorkspace,
@@ -110,6 +111,12 @@ import {
   SiteOpsServiceError,
   verifySiteOpsAliyunConnection,
 } from "./siteops/service";
+import { brandQuestionUniverseStartInputSchema } from "../shared/brand-question-universe";
+import {
+  BrandQuestionUniverseServiceError,
+  observeBrandQuestionUniverse,
+  startBrandQuestionUniverse,
+} from "./brand-question-universe-service";
 
 export function projectUserDashboardPayload(input: {
   payload: DashboardPayload;
@@ -134,6 +141,23 @@ export function projectUserDashboardPayload(input: {
 }
 
 function toServiceError(error: unknown): never {
+  if (error instanceof BrandQuestionUniverseServiceError) {
+    const code =
+      error.statusCode === 404
+        ? "NOT_FOUND"
+        : error.statusCode === 403
+          ? "FORBIDDEN"
+          : error.statusCode === 400
+            ? "BAD_REQUEST"
+            : error.statusCode === 412
+              ? "PRECONDITION_FAILED"
+              : error.statusCode === 503
+                ? "SERVICE_UNAVAILABLE"
+                : error.statusCode === 502
+                  ? "BAD_GATEWAY"
+                  : "CONFLICT";
+    throw new TRPCError({ code, message: error.message, cause: error });
+  }
   if (error instanceof DeliveryTicketError) {
     throw new TRPCError({
       code:
@@ -213,8 +237,11 @@ function toBrandTrackingServiceError(error: unknown): never {
   throw new TRPCError({ code: trpcCode, message, cause: error });
 }
 
-function toSiteOpsServiceError(error: unknown): never {
-  if (!(error instanceof SiteOpsServiceError)) throw toTrpcError(error);
+export function toSiteOpsServiceError(error: unknown): never {
+  if (!(error instanceof SiteOpsServiceError)) {
+    console.error("[SiteOps] unexpected_error", runtimeErrorForLog(error));
+    throw toTrpcError(error);
+  }
   const code =
     error.statusCode === 404
       ? "NOT_FOUND"
@@ -231,6 +258,27 @@ function toSiteOpsServiceError(error: unknown): never {
 }
 
 export const workspaceRouter = router({
+  brandQuestionUniverse: router({
+    observe: protectedProcedure.query(async ({ ctx }) => {
+      try {
+        return await observeBrandQuestionUniverse(ctx.user);
+      } catch (error) {
+        toServiceError(error);
+      }
+    }),
+    start: protectedProcedure
+      .input(brandQuestionUniverseStartInputSchema)
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await startBrandQuestionUniverse({
+            actor: ctx.user,
+            value: input,
+          });
+        } catch (error) {
+          toServiceError(error);
+        }
+      }),
+  }),
   siteOps: router({
     open: protectedProcedure
       .input(siteOpsOpenInputSchema)

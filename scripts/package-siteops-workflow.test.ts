@@ -5,6 +5,7 @@ import {
   SITEOPS_MATERIALIZER_V1_5,
   SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_MATERIALIZER_V2_0,
+  SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_WORKFLOW,
 } from "../shared/siteops";
 import {
@@ -75,7 +76,7 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 2.1.0 React static contract", async () => {
+  it("has a current deterministic FrontMind 2.2.0 React static content contract", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
       version: SITEOPS_RUNTIME_VERSION,
@@ -118,9 +119,9 @@ describe("SiteOps runtime workflow package", () => {
       phaseOneCanonical:
         "SiteDesignSpecV2-with-host-injected-ReferenceBlueprintV3",
       phaseOneOutputFilename: "frontmind-site-design-wire-v3.json",
-      phaseTwoSchema: "schemas/page-content-wire-v2.schema.json",
-      phaseTwoCanonical: "PageContentSpecV1",
-      phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
+      phaseTwoSchema: "schemas/page-content-wire-v3.schema.json",
+      phaseTwoCanonical: "PageContentSpecV2",
+      phaseTwoOutputFilename: "frontmind-page-content-wire-v3.json",
       maximumSchemaDepth: 5,
       referenceCoordinatesAcceptedFromProvider: false,
     });
@@ -129,8 +130,8 @@ describe("SiteOps runtime workflow package", () => {
       sameTaskForBothPhases: true,
       phaseOneOutput: "SiteDesignWireV3",
       phaseOneOutputFilename: "frontmind-site-design-wire-v3.json",
-      phaseTwoOutput: "PageContentWireV2",
-      phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
+      phaseTwoOutput: "PageContentWireV3",
+      phaseTwoOutputFilename: "frontmind-page-content-wire-v3.json",
     });
     expect(runtime.host).toMatchObject({
       profile: "react-static-html",
@@ -151,7 +152,7 @@ describe("SiteOps runtime workflow package", () => {
       quarantineConflictPolicy: "reject-emitted-sha256",
     });
     expect(runtime.renderer).toMatchObject({
-      kind: "react_static_v1",
+      kind: "react_static_v2",
       componentLibraryVersion: SITEOPS_RUNTIME_VERSION,
       materializerVersion: SITEOPS_RUNTIME_VERSION,
       renderMethod: "renderToStaticMarkup",
@@ -163,6 +164,16 @@ describe("SiteOps runtime workflow package", () => {
       candidatePreviewOwner: "dashboard",
       candidatePreviewRenderer: "trusted-react-host",
       providerCodeAccepted: false,
+    });
+    expect(runtime.contentSystem).toMatchObject({
+      canonical: "PageContentSpecV2",
+      buildContract: "BuildContractV4",
+      inventorySource: "frozen-knowledge-snapshot-only",
+      companyNewsAbsentPolicy: "host-owned-empty-state-excluded-from-discovery",
+      externalAcquisitionAllowed: false,
+      publicSourceLabels: false,
+      conditionalJsonLd: true,
+      conditionalSitemapAndLlms: true,
     });
     expect(runtime.typedMaterialization).toEqual({
       schema: "schemas/materialization-stage-v2.schema.json",
@@ -193,11 +204,11 @@ describe("SiteOps runtime workflow package", () => {
       starterSha256: generated.host.starterSha256,
       materializerVersion: SITEOPS_MATERIALIZER_VERSION,
       materializerSha256: generated.host.materializerSha256,
-      qaPolicyVersion: "siteops-qa-v3",
+      qaPolicyVersion: "siteops-qa-v4",
     });
   });
 
-  it("retains immutable Astro and React 2.0 coordinates while 2.1 freezes complete React coordinates", async () => {
+  it("retains immutable Astro and React 2.0/2.1 coordinates while 2.2 freezes complete content coordinates", async () => {
     const [legacyManifest, envelope, stageSchema, starter] = await Promise.all([
       readFile(
         "private-workflows/astro-company-site-workflow-v1.5.0/MANIFEST.json",
@@ -230,6 +241,12 @@ describe("SiteOps runtime workflow package", () => {
     expect(createHash("sha256").update(react20Manifest).digest("hex")).toBe(
       SITEOPS_MATERIALIZER_V2_0.runtimeManifestSha256,
     );
+    const react21Manifest = await readFile(
+      "private-workflows/react-static-company-site-workflow-v2.1.0/MANIFEST.json",
+    );
+    expect(createHash("sha256").update(react21Manifest).digest("hex")).toBe(
+      SITEOPS_MATERIALIZER_V2_1.runtimeManifestSha256,
+    );
     for (const version of ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]) {
       const preserved = JSON.parse(
         await readFile(
@@ -246,7 +263,7 @@ describe("SiteOps runtime workflow package", () => {
         workflow: { required: string[]; properties: Record<string, unknown> };
       };
     };
-    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 6 });
+    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 7 });
     expect(frozenEnvelope.properties.workflow.required.sort()).toEqual(
       [
         "version",
@@ -264,7 +281,7 @@ describe("SiteOps runtime workflow package", () => {
       starterVersion: { const: SITEOPS_RUNTIME_VERSION },
       componentLibraryVersion: { const: SITEOPS_RUNTIME_VERSION },
       materializerVersion: { const: SITEOPS_MATERIALIZER_VERSION },
-      qaPolicyVersion: { const: "siteops-qa-v3" },
+      qaPolicyVersion: { const: "siteops-qa-v4" },
     });
 
     const stages = JSON.parse(stageSchema) as {
@@ -287,7 +304,7 @@ describe("SiteOps runtime workflow package", () => {
     );
 
     expect(JSON.parse(starter)).toMatchObject({
-      schema: "frontmind-siteops-host-starter/v3",
+      schema: "frontmind-siteops-host-starter/v4",
       version: SITEOPS_RUNTIME_VERSION,
       contentBoundary: {
         customerAndProviderText: "canonical-json-data-only",
@@ -320,7 +337,7 @@ describe("SiteOps runtime workflow package", () => {
         "utf8",
       ),
       readFile(
-        `${workflowRoot}/schemas/page-content-wire-v2.schema.json`,
+        `${workflowRoot}/schemas/page-content-wire-v3.schema.json`,
         "utf8",
       ),
     ]);
@@ -343,6 +360,6 @@ describe("SiteOps runtime workflow package", () => {
     expect(
       (JSON.parse(content) as { properties: { schemaVersion: unknown } })
         .properties.schemaVersion,
-    ).toEqual({ type: "number", enum: [2] });
+    ).toEqual({ type: "number", enum: [3] });
   });
 });

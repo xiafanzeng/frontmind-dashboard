@@ -38,6 +38,7 @@ import {
   canonicalSiteOpsSha256,
   composeBuildContractV2,
   composeBuildPlanContractV3,
+  composeBuildPlanContractV4,
   referenceBlueprintSchema,
   siteDesignResultV1Schema,
   siteDesignResultV2Schema,
@@ -66,6 +67,7 @@ import {
   generateSocialPackage,
   materializeAstroSite,
   siteOpsGeneratedContentSchema,
+  siteOpsGeneratedContentV2Schema,
   socialPackageInputSchema,
 } from "./build-runtime";
 import {
@@ -84,13 +86,16 @@ import {
 import { readSelectedOfficialLogoFromKnowledgeArchive } from "./knowledge-brand-asset";
 import {
   pageContentResultFromWire,
+  pageContentResultV2FromWire,
   pageContentWireOutputSchema,
+  pageContentWireV3OutputSchema,
   siteDesignResultFromWire,
   siteDesignResultV2FromWire,
   siteDesignWireOutputSchema,
   siteDesignWireV3OutputSchema,
   siteOpsBuildContractAttachment,
   siteOpsBuildPlanContractV3Attachment,
+  siteOpsBuildPlanContractV4Attachment,
   siteOpsCustomerFeedbackAttachment,
   siteOpsSocialSourceAttachment,
   siteOpsSourceDossierAttachments,
@@ -333,7 +338,8 @@ function reactStaticRendererCoordinates(
     workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_0.frontMindVersion
   ) {
     return {
-      componentLibraryVersion: SITEOPS_MATERIALIZER_V2_0.componentLibraryVersion,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_0.componentLibraryVersion,
       materializerVersion: SITEOPS_MATERIALIZER_V2_0.materializerVersion,
     } as const;
   }
@@ -341,8 +347,15 @@ function reactStaticRendererCoordinates(
     workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_1.frontMindVersion
   ) {
     return {
-      componentLibraryVersion: SITEOPS_MATERIALIZER_V2_1.componentLibraryVersion,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_1.componentLibraryVersion,
       materializerVersion: SITEOPS_MATERIALIZER_V2_1.materializerVersion,
+    } as const;
+  }
+  if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
+    return {
+      componentLibraryVersion: SITEOPS_WORKFLOW.componentLibraryVersion,
+      materializerVersion: SITEOPS_WORKFLOW.materializerVersion,
     } as const;
   }
   throw new SiteOpsManusFailure(
@@ -1051,12 +1064,16 @@ function generatedContentOutputSchema(
     slots: Array<{ slotId: string }>;
   }>,
   sourceDocumentIds: string[],
+  workflowVersion: string,
 ) {
-  return pageContentWireOutputSchema({
+  const input = {
     operationToken: token,
     routeIds: routeCompositions.map((route) => route.routeId),
     sourceDocumentIds,
-  });
+  };
+  return workflowVersion === SITEOPS_WORKFLOW.frontMindVersion
+    ? pageContentWireV3OutputSchema(input)
+    : pageContentWireOutputSchema(input);
 }
 
 function socialOutputSchema(
@@ -1364,8 +1381,10 @@ export function completedSiteBuildMessage() {
 export function contentRepairPrompt(input: {
   repairAttempt: number;
   outputFilename?: string;
+  wireVersion?: 2 | 3;
 }) {
-  return `继续同一个 FrontMind AI 建站任务。上一次 PageContentWireV2 或受信网站 QA 未通过。第 ${input.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 PageContentWireV2，只能引用允许的 sourceDocumentIds，并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}。不得输出源码、脚本或未知事实。`;
+  const wire = `PageContentWireV${input.wireVersion ?? 2}`;
+  return `继续同一个 FrontMind AI 建站任务。上一次 ${wire} 或受信网站 QA 未通过。第 ${input.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 ${wire}，只能引用允许的 sourceDocumentIds，并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}。不得浏览或补写外部新闻，不得输出源码、脚本或未知事实。`;
 }
 
 async function scheduleRepair(input: {
@@ -1945,6 +1964,10 @@ export function createManusSiteOpsProviderHandler(
       const designOutputFilename = reactStatic
         ? SITEOPS_WIRE_OUTPUT_FILES.designV3
         : SITEOPS_WIRE_OUTPUT_FILES.design;
+      const contentOutputFilename =
+        workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+          ? SITEOPS_WIRE_OUTPUT_FILES.contentV3
+          : SITEOPS_WIRE_OUTPUT_FILES.content;
       const referenceBlueprint = referenceBlueprintSchema.safeParse(
         input.referenceBlueprint,
       );
@@ -2239,6 +2262,7 @@ export function createManusSiteOpsProviderHandler(
                 repairToken,
                 state.design?.designSpec.routeCompositions ?? [],
                 documents.map((document) => document.id),
+                workflow.frontMindVersion,
               );
         if (state.stage === "repair_send_ready") {
           const repairPrompt = promptWithMarker(
@@ -2246,7 +2270,15 @@ export function createManusSiteOpsProviderHandler(
               ? reactStatic
                 ? `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV3 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：重新读取已附加 workflow、source dossier 与冻结视觉参考，完整返回 SiteDesignWireV3；不得返回或改变 Hero family，并把完全相同的 JSON 对象附加为 ${designOutputFilename}。不得输出源码、脚本或未知事实。`
                 : `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV2 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：完整返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本或未知事实。`
-              : contentRepairPrompt({ repairAttempt: state.repairAttempt }),
+              : contentRepairPrompt({
+                  repairAttempt: state.repairAttempt,
+                  outputFilename: contentOutputFilename,
+                  wireVersion:
+                    workflow.frontMindVersion ===
+                    SITEOPS_WORKFLOW.frontMindVersion
+                      ? 3
+                      : 2,
+                }),
             repairToken,
           );
           const unknownState: ProviderState = {
@@ -2311,7 +2343,7 @@ export function createManusSiteOpsProviderHandler(
           expectedFilename:
             state.repairKind === "design"
               ? designOutputFilename
-              : SITEOPS_WIRE_OUTPUT_FILES.content,
+              : contentOutputFilename,
           taskCompleted: repaired.state.completed,
           signal,
         });
@@ -2615,22 +2647,54 @@ export function createManusSiteOpsProviderHandler(
                   referenceBlueprint: _visualReferenceBlueprint,
                   ...visualEvidence
                 } = parsedVisual;
-                return composeBuildPlanContractV3({
-                  schemaVersion: 3,
-                  contractKind: "build_plan",
-                  ...commonContract,
-                  renderer: {
-                    kind: "react_static_v1",
-                    reactVersion: "19.2.1",
-                    componentLibraryVersion:
-                      rendererCoordinates.componentLibraryVersion,
-                    materializerVersion:
-                      rendererCoordinates.materializerVersion,
-                  },
-                  visual: visualEvidence,
-                  referenceBlueprint: referenceBlueprint.data,
-                  designSpecHash: canonicalSiteOpsSha256(design.designSpec),
-                });
+                const currentContentContract =
+                  workflow.frontMindVersion ===
+                  SITEOPS_WORKFLOW.frontMindVersion;
+                return currentContentContract
+                  ? composeBuildPlanContractV4({
+                      schemaVersion: 4,
+                      contractKind: "build_plan",
+                      ...commonContract,
+                      renderer: {
+                        kind: "react_static_v2",
+                        reactVersion: "19.2.1",
+                        componentLibraryVersion: "2.2.0",
+                        materializerVersion: "2.2.0",
+                      },
+                      content: {
+                        schemaVersion: 2,
+                        inventoryHash: canonicalSiteOpsSha256(
+                          brief.contentInventory,
+                        ),
+                        routePolicyVersion: "snapshot-conditional-v1",
+                        sourcePolicy: "frozen_snapshot_only",
+                        externalAcquisitionAllowed: false,
+                        publicSourceLabels: "forbidden",
+                      },
+                      visual: visualEvidence,
+                      referenceBlueprint: referenceBlueprint.data,
+                      designSpecHash: canonicalSiteOpsSha256(design.designSpec),
+                    })
+                  : composeBuildPlanContractV3({
+                      schemaVersion: 3,
+                      contractKind: "build_plan",
+                      ...commonContract,
+                      renderer: {
+                        kind: "react_static_v1",
+                        reactVersion: "19.2.1",
+                        componentLibraryVersion:
+                          rendererCoordinates.componentLibraryVersion as
+                            | "2.0.0"
+                            | "2.1.0",
+                        materializerVersion:
+                          rendererCoordinates.materializerVersion as
+                            | "2.0.0"
+                            | "2.1.0",
+                      },
+                      visual: visualEvidence,
+                      referenceBlueprint: referenceBlueprint.data,
+                      designSpecHash: canonicalSiteOpsSha256(design.designSpec),
+                    });
               })()
             : composeBuildContractV2({
                 schemaVersion: 2,
@@ -2643,12 +2707,16 @@ export function createManusSiteOpsProviderHandler(
               });
         const contractAttachment =
           reactStatic && referenceBlueprint.success
-            ? siteOpsBuildPlanContractV3Attachment(canonicalContract)
+            ? workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+              ? siteOpsBuildPlanContractV4Attachment(canonicalContract)
+              : siteOpsBuildPlanContractV3Attachment(canonicalContract)
             : siteOpsBuildContractAttachment(canonicalContract);
         const prompt = promptWithMarker(
-          reactStatic
-            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprint 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
-            : `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV2，并严格匹配冻结 route、slot 与 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。${revisionInstruction}`,
+          workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v4.json 是 Dashboard 根据已校验设计与冻结知识库存生成的预物化计划合同；冻结的 ReferenceBlueprint、Hero family、route 与 inventory 不可更改。请返回 PageContentWireV3：使用受支持的 typed blockType，实体、FAQ 与 officialLinks 只能来自 source dossier 且逐项绑定 sourceDocumentIds；不得输出内部来源标签。若 news route 在 inventory 中没有 company_news，必须保留该 route 但不要为它输出 block 或 company_news entity，Dashboard 会渲染可信空状态。不得浏览、抓取或编造行业/企业新闻。把完全相同的 JSON 对象附加为 ${contentOutputFilename}。不得重复 SEO，不得生成源码、HTML、依赖、表单提交或外部脚本。${revisionInstruction}`
+            : reactStatic
+              ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprint 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
+              : `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV2，并严格匹配冻结 route、slot 与 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。${revisionInstruction}`,
           contentToken,
         );
         await persistOperationProgress(
@@ -2677,6 +2745,7 @@ export function createManusSiteOpsProviderHandler(
               contentToken,
               design.designSpec.routeCompositions,
               documents.map((document) => document.id),
+              workflow.frontMindVersion,
             ),
           });
         } catch (error) {
@@ -2739,7 +2808,7 @@ export function createManusSiteOpsProviderHandler(
             events: polled.events,
             operationToken: contentToken,
             phase: "content",
-            expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.content,
+            expectedFilename: contentOutputFilename,
             taskCompleted: polled.state.completed,
             signal,
           })
@@ -2837,21 +2906,39 @@ export function createManusSiteOpsProviderHandler(
       }
       let generatedContent: z.infer<typeof siteOpsGeneratedContentSchema>;
       try {
-        const contentResult = pageContentResultFromWire(
-          rawContent,
-          brief.routes.map((route) => route.id),
-          documents.map((document) => document.id),
-        );
+        const currentContent =
+          workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion;
+        const contentResult = currentContent
+          ? pageContentResultV2FromWire(
+              rawContent,
+              brief.routes.map((route) => route.id),
+              documents.map((document) => document.id),
+              brief.contentInventory.entries.some(
+                (entry) => entry.kind === "company_news",
+              )
+                ? []
+                : ["news"],
+            )
+          : pageContentResultFromWire(
+              rawContent,
+              brief.routes.map((route) => route.id),
+              documents.map((document) => document.id),
+            );
         validateDesignAndContentBindings({
           routeIds: brief.routes.map((route) => route.id),
           paletteSize: taxonomy.palette.length,
           designSpec: design!.designSpec,
           pageContent: contentResult.pageContent,
         });
-        generatedContent = siteOpsGeneratedContentSchema.parse({
-          seo: design!.designSpec.seoPlan,
-          routes: contentResult.pageContent.routes,
-        });
+        generatedContent = currentContent
+          ? siteOpsGeneratedContentV2Schema.parse({
+              seo: design!.designSpec.seoPlan,
+              ...contentResult.pageContent,
+            })
+          : siteOpsGeneratedContentSchema.parse({
+              seo: design!.designSpec.seoPlan,
+              routes: contentResult.pageContent.routes,
+            });
       } catch {
         return await scheduleRepair({
           db,

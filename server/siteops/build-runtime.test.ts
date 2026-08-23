@@ -314,6 +314,239 @@ function buildInput(
   };
 }
 
+const TYPED_SOURCE_IDS = {
+  overview: "kb-overview-poison-001",
+  service: "kb-service-poison-002",
+  faq: "kb-faq-poison-003",
+} as const;
+
+function typedContentInput(): MaterializeAstroSiteInput {
+  const input = buildInput();
+  input.snapshot.documents = [
+    {
+      id: TYPED_SOURCE_IDS.overview,
+      path: "company/overview.md",
+      title: "企业概览",
+      content: "星河智造为制造企业提供设备运维服务。",
+      kind: "overview",
+      customerVisible: true,
+    },
+    {
+      id: TYPED_SOURCE_IDS.service,
+      path: "services/equipment-maintenance.md",
+      title: "设备运维服务",
+      content: "服务覆盖设备巡检、状态分析和维护建议。",
+      kind: "leaf",
+      customerVisible: true,
+    },
+    {
+      id: TYPED_SOURCE_IDS.faq,
+      path: "faq/maintenance.md",
+      title: "设备运维常见问题",
+      content: "设备运维包含巡检、状态分析和维护建议。",
+      kind: "leaf",
+      customerVisible: true,
+    },
+  ];
+  input.brief = {
+    companyName: "星河智造",
+    primaryLanguage: "zh-CN",
+    contacts: [
+      {
+        kind: "email",
+        value: "hello@xinghe.example",
+        sourceDocumentIds: [TYPED_SOURCE_IDS.overview],
+      },
+    ],
+    offerings: ["设备运维", "状态分析"],
+    audience: ["制造企业"],
+    conversionGoal: "联系业务团队",
+    contentInventory: {
+      schemaVersion: 1,
+      source: "frozen_knowledge_snapshot",
+      entries: [
+        {
+          kind: "service",
+          sourceDocumentIds: [TYPED_SOURCE_IDS.service],
+        },
+        {
+          kind: "faq",
+          sourceDocumentIds: [TYPED_SOURCE_IDS.faq],
+        },
+      ],
+    },
+    routes: [
+      {
+        id: "home",
+        slug: "/",
+        title: "首页",
+        sourceDocumentIds: [
+          TYPED_SOURCE_IDS.overview,
+          TYPED_SOURCE_IDS.service,
+          TYPED_SOURCE_IDS.faq,
+        ],
+      },
+      {
+        id: "services",
+        slug: "/services",
+        title: "服务",
+        sourceDocumentIds: [TYPED_SOURCE_IDS.service],
+      },
+      {
+        id: "faq",
+        slug: "/faq",
+        title: "常见问题",
+        sourceDocumentIds: [TYPED_SOURCE_IDS.faq],
+      },
+      {
+        id: "news",
+        slug: "/news",
+        title: "企业动态",
+        sourceDocumentIds: [],
+      },
+    ],
+    verifiedFacts: [
+      {
+        statement: "提供设备运维与状态分析服务",
+        sourceDocumentIds: [
+          TYPED_SOURCE_IDS.overview,
+          TYPED_SOURCE_IDS.service,
+        ],
+      },
+    ],
+    publicAssetIds: [],
+    unknowns: ["当前知识库暂无可公开的企业动态"],
+  };
+  (input.designSpec as SiteDesignSpecV2).routeCompositions = [
+    {
+      routeId: "home",
+      slots: [
+        { slotId: "capabilities", variant: "cards" },
+        { slotId: "faq-preview", variant: "faq" },
+      ],
+    },
+    {
+      routeId: "services",
+      slots: [{ slotId: "service-grid", variant: "cards" }],
+    },
+    {
+      routeId: "faq",
+      slots: [{ slotId: "faq-list", variant: "faq" }],
+    },
+    {
+      routeId: "news",
+      slots: [{ slotId: "news-empty", variant: "statement" }],
+    },
+  ];
+  input.generatedContent = {
+    schemaVersion: 2,
+    seo: (input.designSpec as SiteDesignSpecV2).seoPlan,
+    routes: [
+      {
+        routeId: "home",
+        eyebrow: "可靠的制造服务",
+        heading: "让设备状态更清晰",
+        summary: "展示知识库中已确认的设备运维与状态分析能力。",
+        sections: [
+          {
+            slotId: "capabilities",
+            blockType: "feature_list",
+            heading: "服务能力",
+            paragraphs: ["服务覆盖设备巡检、状态分析和维护建议。"],
+            items: ["设备巡检", "状态分析", "维护建议"],
+            entityIds: [],
+            faqIds: [],
+            sourceDocumentIds: [
+              TYPED_SOURCE_IDS.overview,
+              TYPED_SOURCE_IDS.service,
+            ],
+          },
+          {
+            slotId: "faq-preview",
+            blockType: "faq_preview",
+            heading: "常见问题",
+            paragraphs: ["了解设备运维服务的已确认信息。"],
+            items: [],
+            entityIds: [],
+            faqIds: ["faq-maintenance"],
+            sourceDocumentIds: [TYPED_SOURCE_IDS.faq],
+          },
+        ],
+      },
+      {
+        routeId: "services",
+        heading: "设备服务",
+        summary: "查看知识库中已确认的设备运维服务。",
+        sections: [
+          {
+            slotId: "service-grid",
+            blockType: "entity_grid",
+            heading: "服务范围",
+            paragraphs: ["服务覆盖设备巡检、状态分析和维护建议。"],
+            items: [],
+            entityIds: ["service-maintenance"],
+            faqIds: [],
+            sourceDocumentIds: [TYPED_SOURCE_IDS.service],
+          },
+        ],
+      },
+      {
+        routeId: "faq",
+        heading: "常见问题",
+        summary: "查看知识库中已确认的设备运维问答。",
+        sections: [
+          {
+            slotId: "faq-list",
+            blockType: "faq_preview",
+            heading: "设备运维问答",
+            paragraphs: ["以下回答来自当前冻结知识库。"],
+            items: [],
+            entityIds: [],
+            faqIds: ["faq-maintenance"],
+            sourceDocumentIds: [TYPED_SOURCE_IDS.faq],
+          },
+        ],
+      },
+      {
+        routeId: "news",
+        heading: "企业动态",
+        summary: "当前知识库暂无可公开的企业动态。",
+        emptyState: "company_news_unavailable",
+        sections: [],
+      },
+    ],
+    entities: [
+      {
+        entityId: "service-maintenance",
+        entityType: "service",
+        slug: "equipment-maintenance",
+        title: "设备运维服务",
+        summary: "覆盖设备巡检、状态分析和维护建议。",
+        body: ["团队依据设备状态提供巡检、分析与维护建议。"],
+        tags: ["设备巡检", "状态分析"],
+        publishedAt: null,
+        modifiedAt: null,
+        author: null,
+        sourceName: null,
+        sourceUrl: null,
+        sourceDocumentIds: [TYPED_SOURCE_IDS.service],
+        relatedEntityIds: [],
+      },
+    ],
+    faqs: [
+      {
+        faqId: "faq-maintenance",
+        category: "设备运维",
+        question: "设备运维服务包含哪些内容？",
+        answers: ["服务覆盖设备巡检、状态分析和维护建议。"],
+        sourceDocumentIds: [TYPED_SOURCE_IDS.faq],
+      },
+    ],
+    officialLinks: [],
+  };
+  return input;
+}
+
 const HERO_FAMILY_TITLES = {
   floating_orbit: "floating orbit",
   feature_grid: "feature grid hero",
@@ -552,13 +785,20 @@ describe("SiteOps trusted React 19 static runtime", () => {
     expect(
       JSON.parse(await source.file("build-contract.json")!.async("string")),
     ).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       contractKind: "build_contract",
       renderer: {
-        kind: "react_static_v1",
+        kind: "react_static_v2",
         reactVersion: "19.2.1",
-        componentLibraryVersion: "2.1.0",
-        materializerVersion: "2.1.0",
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+      },
+      content: {
+        schemaVersion: 2,
+        routePolicyVersion: "snapshot-conditional-v1",
+        sourcePolicy: "frozen_snapshot_only",
+        externalAcquisitionAllowed: false,
+        publicSourceLabels: "forbidden",
       },
       referenceBlueprint: {
         providerItemKey: "n:8435",
@@ -950,6 +1190,89 @@ describe("SiteOps trusted React 19 static runtime", () => {
         officialLogo,
       ),
     ).toBe(true);
+  }, 90_000);
+
+  it("materializes typed 2.2 content while keeping empty news and source coordinates out of discovery", async () => {
+    const preview = await materializeAstroSite(typedContentInput());
+    expect(preview.contract).toMatchObject({
+      schemaVersion: 4,
+      renderer: {
+        kind: "react_static_v2",
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+      },
+      content: {
+        schemaVersion: 2,
+        routePolicyVersion: "snapshot-conditional-v1",
+        sourcePolicy: "frozen_snapshot_only",
+        externalAcquisitionAllowed: false,
+        publicSourceLabels: "forbidden",
+      },
+      contentSpecHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+    const previewHome = preview.files.get("index.html")!.toString("utf8");
+    const previewServices = preview.files
+      .get("services/index.html")!
+      .toString("utf8");
+    const previewNews = preview.files.get("news/index.html")!.toString("utf8");
+    expect(previewHome).toContain('data-block-type="feature_list"');
+    expect(previewHome).toContain('data-block-type="faq_preview"');
+    expect(previewServices).toContain(
+      'href="/services/equipment-maintenance/"',
+    );
+    expect(preview.files.has("services/equipment-maintenance/index.html")).toBe(
+      true,
+    );
+    expect(previewNews).toContain("当前知识库暂无可公开的企业动态");
+    expect(previewNews).toContain('data-content-state="empty"');
+    expect(previewNews).not.toContain("<button");
+    expect(previewNews).not.toContain('type="application/ld+json"');
+    expect(preview.files.has("sitemap.xml")).toBe(false);
+    expect(preview.files.has("llms.txt")).toBe(false);
+
+    const production = await materializeProductionSiteFromSource({
+      sourceZip: preview.sourceZip,
+      expectedSourceSha256: preview.sourceSha256,
+      canonicalOrigin: "https://typed.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    const productionDist = await JSZip.loadAsync(production.distZip, {
+      checkCRC32: true,
+    });
+    const sitemap = await productionDist.file("sitemap.xml")!.async("string");
+    const llms = await productionDist.file("llms.txt")!.async("string");
+    const productionNews = await productionDist
+      .file("news/index.html")!
+      .async("string");
+    const faq = await productionDist.file("faq/index.html")!.async("string");
+    const entity = await productionDist
+      .file("services/equipment-maintenance/index.html")!
+      .async("string");
+    expect(productionNews).toContain(
+      'rel="canonical" href="https://typed.xinghe.example/news/"',
+    );
+    expect(productionNews).not.toContain('type="application/ld+json"');
+    expect(sitemap).not.toContain("https://typed.xinghe.example/news/");
+    expect(llms).not.toContain("https://typed.xinghe.example/news/");
+    expect(sitemap).toContain(
+      "https://typed.xinghe.example/services/equipment-maintenance/",
+    );
+    expect(llms).toContain(
+      "https://typed.xinghe.example/services/equipment-maintenance/",
+    );
+    expect(faq).toContain('"@type":"FAQPage"');
+    expect(entity).toContain('"@type":"Service"');
+
+    for (const [name, file] of Object.entries(productionDist.files)) {
+      if (!/\.(?:html|xml|txt)$/u.test(name)) continue;
+      const publiclyEmitted = await file.async("string");
+      expect(publiclyEmitted).not.toMatch(
+        /(?:sourceDocumentIds|source_document_ids|内部来源|来源文档\s*(?:ID|编号))/iu,
+      );
+      for (const poisonId of Object.values(TYPED_SOURCE_IDS)) {
+        expect(publiclyEmitted).not.toContain(poisonId);
+      }
+    }
   }, 90_000);
 
   it("keeps historical 1.6 source bundles on the read-only Astro replay path", async () => {

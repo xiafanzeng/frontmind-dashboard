@@ -15,6 +15,7 @@ export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
   design: "frontmind-site-design-wire-v2.json",
   designV3: "frontmind-site-design-wire-v3.json",
   content: "frontmind-page-content-wire-v2.json",
+  contentV3: "frontmind-page-content-wire-v3.json",
 });
 
 const SITEOPS_WIRE_OUTPUT_MAX_BYTES = Object.freeze({
@@ -200,15 +201,24 @@ function jsonAttachments(
     ) {
       throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
     }
+    const expectedWireVersion = expectedFilename.match(
+      /[-_]wire[-_]v([23])\.json$/u,
+    )?.[1];
+    if (!expectedWireVersion) {
+      throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
+    }
     const phaseStem =
       phase === "design"
-        ? "frontmind[-_]site[-_]design[-_]wire[-_]v2"
-        : "frontmind[-_]page[-_]content[-_]wire[-_]v2";
+        ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
+        : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
     const providerFilenamePattern = new RegExp(
       `^${phaseStem}(?:[-_]repair[-_][1-3])?\\.json$`,
       "u",
     );
-    if (filename !== expectedFilename && !providerFilenamePattern.test(filename))
+    if (
+      filename !== expectedFilename &&
+      !providerFilenamePattern.test(filename)
+    )
       return [];
     const mime = declaredMime?.split(";", 1)[0]?.trim().toLowerCase() ?? null;
     if (mime !== null && mime !== "application/json") {
@@ -322,9 +332,7 @@ async function downloadAttachment(input: {
         code,
       )
     ) {
-      throw new SiteOpsWireOutputResolutionError(
-        "SITEOPS_WIRE_OUTPUT_INVALID",
-      );
+      throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
     }
     throw new SiteOpsWireOutputResolutionError(
       "SITEOPS_WIRE_OUTPUT_UNAVAILABLE",
@@ -363,7 +371,10 @@ export async function resolveSiteOpsWireOutput(input: {
   const allowedFilenames: readonly string[] =
     input.phase === "design"
       ? [SITEOPS_WIRE_OUTPUT_FILES.design, SITEOPS_WIRE_OUTPUT_FILES.designV3]
-      : [SITEOPS_WIRE_OUTPUT_FILES.content];
+      : [
+          SITEOPS_WIRE_OUTPUT_FILES.content,
+          SITEOPS_WIRE_OUTPUT_FILES.contentV3,
+        ];
   const maxBytes = SITEOPS_WIRE_OUTPUT_MAX_BYTES[input.phase];
   if (!allowedFilenames.includes(input.expectedFilename)) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");

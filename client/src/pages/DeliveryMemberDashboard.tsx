@@ -166,6 +166,7 @@ const WORKBENCH_SECTION_BY_OPERATION: Partial<
   icp_filing: "website",
   website_style_samples: "website",
   website_build: "website",
+  site_rebuild: "website",
   company_facts: "website",
   product_case_docs: "website",
   industry_news: "website",

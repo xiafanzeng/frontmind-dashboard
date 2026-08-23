@@ -36,6 +36,7 @@ import {
   SITEOPS_MATERIALIZER_V1_5,
   SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_MATERIALIZER_V2_0,
+  SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
@@ -46,7 +47,10 @@ import {
   canonicalSiteOpsSha256,
   composeBuildContractV3,
   composeBuildPlanContractV3,
+  composeBuildContractV4,
+  composeBuildPlanContractV4,
   composeBuildContractV2,
+  pageContentSpecV2Schema,
   siteDesignSpecV1Schema,
   siteDesignSpecV2Schema,
   siteOpsRuntimeVisualEvidenceV1Schema,
@@ -55,6 +59,8 @@ import {
   type BuildContractV2,
   type BuildContractV3,
   type BuildPlanContractV3,
+  type BuildContractV4,
+  type BuildPlanContractV4,
   type SiteDesignSpecV1,
   type SiteDesignSpecV2,
   type SiteOpsRuntimeVisualEvidenceV1,
@@ -77,6 +83,7 @@ import {
   REACT_STATIC_MATERIALIZER_VERSION,
   REACT_STATIC_REACT_VERSION,
   REACT_STATIC_RENDERER,
+  REACT_STATIC_RENDERER_V1,
   TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE,
   TRUSTED_REACT_RENDERER_SOURCE,
 } from "./react-static-runtime";
@@ -95,6 +102,7 @@ type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V1_5
   | typeof SITEOPS_MATERIALIZER_V1_6
   | typeof SITEOPS_MATERIALIZER_V2_0
+  | typeof SITEOPS_MATERIALIZER_V2_1
   | typeof SITEOPS_WORKFLOW;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
@@ -106,7 +114,16 @@ const DEFAULT_BUILD_TIMEOUT_MS = 60_000;
 const ASTRO_VERSION = "7.2.4";
 const TYPESCRIPT_VERSION = "6.0.3";
 const LEGACY_ASTRO_RENDERER = "astro_static_v1" as const;
-type SiteRenderer = typeof LEGACY_ASTRO_RENDERER | typeof REACT_STATIC_RENDERER;
+type SiteRenderer =
+  | typeof LEGACY_ASTRO_RENDERER
+  | typeof REACT_STATIC_RENDERER_V1
+  | typeof REACT_STATIC_RENDERER;
+
+function isReactStaticRenderer(renderer: SiteRenderer) {
+  return (
+    renderer === REACT_STATIC_RENDERER_V1 || renderer === REACT_STATIC_RENDERER
+  );
+}
 
 function reactStaticCoordinatesForWorkflow(
   workflow: SiteOpsMaterializerCoordinates,
@@ -118,6 +135,15 @@ function reactStaticCoordinatesForWorkflow(
       componentLibraryVersion:
         SITEOPS_MATERIALIZER_V2_0.componentLibraryVersion,
       materializerVersion: SITEOPS_MATERIALIZER_V2_0.materializerVersion,
+    } as const;
+  }
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_1.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_1.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_1.materializerVersion,
     } as const;
   }
   if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
@@ -158,7 +184,7 @@ const generatedRouteSchema = z
   })
   .strict();
 
-export const siteOpsGeneratedContentSchema = z
+export const siteOpsGeneratedContentV1Schema = z
   .object({
     seo: z
       .object({
@@ -172,6 +198,38 @@ export const siteOpsGeneratedContentSchema = z
     routes: z.array(generatedRouteSchema).min(1).max(30),
   })
   .strict();
+
+export const siteOpsGeneratedContentV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    seo: siteOpsGeneratedContentV1Schema.shape.seo,
+    routes: pageContentSpecV2Schema.shape.routes,
+    entities: pageContentSpecV2Schema.shape.entities,
+    faqs: pageContentSpecV2Schema.shape.faqs,
+    officialLinks: pageContentSpecV2Schema.shape.officialLinks,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const parsed = pageContentSpecV2Schema.safeParse({
+      schemaVersion: 2,
+      routes: value.routes,
+      entities: value.entities,
+      faqs: value.faqs,
+      officialLinks: value.officialLinks,
+    });
+    if (!parsed.success) {
+      context.addIssue({
+        code: "custom",
+        path: [],
+        message: "Generated content does not satisfy PageContentSpecV2",
+      });
+    }
+  });
+
+export const siteOpsGeneratedContentSchema = z.union([
+  siteOpsGeneratedContentV2Schema,
+  siteOpsGeneratedContentV1Schema,
+]);
 
 export const siteOpsRuntimeVisualSchema = z.union([
   siteOpsRuntimeVisualEvidenceV2Schema,
@@ -217,7 +275,11 @@ export const siteOpsFrozenRuntimeInputSchema = z
         materializerVersion: z.string().min(1).max(32),
         materializerSha256: z.string().regex(/^[a-f0-9]{64}$/u),
         renderer: z
-          .enum([LEGACY_ASTRO_RENDERER, REACT_STATIC_RENDERER])
+          .enum([
+            LEGACY_ASTRO_RENDERER,
+            REACT_STATIC_RENDERER_V1,
+            REACT_STATIC_RENDERER,
+          ])
           .default(LEGACY_ASTRO_RENDERER),
       })
       .strict(),
@@ -270,6 +332,18 @@ export const siteOpsFrozenRuntimeInputSchema = z
 export type SiteOpsGeneratedContent = z.infer<
   typeof siteOpsGeneratedContentSchema
 >;
+export type SiteOpsGeneratedContentV2 = z.infer<
+  typeof siteOpsGeneratedContentV2Schema
+>;
+
+function isSiteOpsGeneratedContentV2(
+  value: SiteOpsGeneratedContent,
+): value is SiteOpsGeneratedContentV2 {
+  return (
+    "schemaVersion" in value &&
+    (value as { schemaVersion?: unknown }).schemaVersion === 2
+  );
+}
 export type SiteOpsRuntimeVisual =
   | SiteOpsRuntimeVisualEvidenceV1
   | SiteOpsRuntimeVisualEvidenceV2;
@@ -339,7 +413,7 @@ export type SiteOpsQaReport = {
 };
 
 export type MaterializedAstroSite = {
-  contract: BuildContractV2 | BuildContractV3;
+  contract: BuildContractV2 | BuildContractV3 | BuildContractV4;
   contractJson: Buffer;
   contractSha256: string;
   sourceZip: Buffer;
@@ -377,6 +451,13 @@ function escapeHtml(value: string) {
 
 function escapeXml(value: string) {
   return escapeHtml(value);
+}
+
+function plainMetadataText(value: string) {
+  return value
+    .replace(/[\[\]<>]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 function assertNoSensitiveText(label: string, value: string) {
@@ -482,15 +563,13 @@ function validateInput(
       snapshotId: input.snapshot.id,
     });
   const brief = siteBriefSchema.parse(input.brief);
-  const visual =
-    renderer === REACT_STATIC_RENDERER
-      ? siteOpsRuntimeVisualEvidenceV2Schema.parse(input.visual)
-      : siteOpsRuntimeVisualEvidenceV1Schema.parse(input.visual);
-  const designSpec =
-    renderer === REACT_STATIC_RENDERER
-      ? siteDesignSpecV2Schema.parse(input.designSpec)
-      : siteDesignSpecV1Schema.parse(input.designSpec);
-  if (renderer === REACT_STATIC_RENDERER) {
+  const visual = isReactStaticRenderer(renderer)
+    ? siteOpsRuntimeVisualEvidenceV2Schema.parse(input.visual)
+    : siteOpsRuntimeVisualEvidenceV1Schema.parse(input.visual);
+  const designSpec = isReactStaticRenderer(renderer)
+    ? siteDesignSpecV2Schema.parse(input.designSpec)
+    : siteDesignSpecV1Schema.parse(input.designSpec);
+  if (isReactStaticRenderer(renderer)) {
     const visualV2 = siteOpsRuntimeVisualEvidenceV2Schema.parse(visual);
     const designV2 = siteDesignSpecV2Schema.parse(designSpec);
     if (
@@ -500,9 +579,28 @@ function validateInput(
       throw new Error("SITEOPS_REFERENCE_BLUEPRINT_MISMATCH");
     }
   }
-  const generatedContent = siteOpsGeneratedContentSchema.parse(
-    input.generatedContent,
-  );
+  const generatedContent: SiteOpsGeneratedContent =
+    renderer === REACT_STATIC_RENDERER
+      ? (() => {
+          const current = siteOpsGeneratedContentV2Schema.safeParse(
+            input.generatedContent,
+          );
+          if (current.success) return current.data;
+          // Frozen pre-2.2 fixtures and source bundles did not carry the typed
+          // graph. Keep a narrow deterministic compatibility projection only
+          // when the brief itself has no 2.2 inventory/news coordinates.
+          if (
+            brief.routes.some((route) => route.id === "news") ||
+            brief.contentInventory.entries.length > 0
+          ) {
+            throw current.error;
+          }
+          const legacy = siteOpsGeneratedContentV1Schema.parse(
+            input.generatedContent,
+          );
+          return legacy;
+        })()
+      : siteOpsGeneratedContentV1Schema.parse(input.generatedContent);
   const canonicalOrigin = validateCanonicalOrigin(
     input.mode,
     input.canonicalOrigin,
@@ -567,10 +665,15 @@ function validateInput(
     routeIds: routes.map((route) => route.id),
     paletteSize: visual.taxonomy.palette.length,
     designSpec,
-    pageContent: {
-      schemaVersion: 1,
-      routes: generatedContent.routes,
-    },
+    pageContent: isSiteOpsGeneratedContentV2(generatedContent)
+      ? {
+          schemaVersion: 2,
+          routes: generatedContent.routes,
+          entities: generatedContent.entities,
+          faqs: generatedContent.faqs,
+          officialLinks: generatedContent.officialLinks,
+        }
+      : { schemaVersion: 1, routes: generatedContent.routes },
   });
   if (
     canonicalJson(generatedContent.seo) !== canonicalJson(designSpec.seoPlan)
@@ -584,6 +687,60 @@ function validateInput(
       if (section.sourceDocumentIds.some((id) => !allowedSources.has(id))) {
         throw new Error("SITEOPS_GENERATED_SOURCE_MAPPING_INVALID");
       }
+    }
+  }
+  if (isSiteOpsGeneratedContentV2(generatedContent)) {
+    const typedGeneratedByRoute = new Map(
+      generatedContent.routes.map((route) => [route.routeId, route]),
+    );
+    const inventoryByKind = new Map(
+      brief.contentInventory.entries.map((entry) => [entry.kind, entry]),
+    );
+    const newsRoute = typedGeneratedByRoute.get("news");
+    const newsInventory = inventoryByKind.get("company_news");
+    if (
+      brief.routes.some((route) => route.id === "news") &&
+      (!newsRoute ||
+        (newsInventory
+          ? newsRoute.emptyState === "company_news_unavailable"
+          : newsRoute.emptyState !== "company_news_unavailable"))
+    ) {
+      throw new Error("SITEOPS_COMPANY_NEWS_EMPTY_STATE_MISMATCH");
+    }
+    const inventoryKindForEntity = {
+      product: "product",
+      service: "service",
+      application: "application",
+      case_study: "case_study",
+      blog: "blog",
+      company_news: "company_news",
+    } as const;
+    for (const entity of generatedContent.entities) {
+      const inventory = inventoryByKind.get(
+        inventoryKindForEntity[entity.entityType],
+      );
+      const allowed = new Set(inventory?.sourceDocumentIds ?? []);
+      if (
+        !inventory ||
+        entity.sourceDocumentIds.some((documentId) => !allowed.has(documentId))
+      ) {
+        throw new Error("SITEOPS_CONTENT_ENTITY_INVENTORY_MISMATCH");
+      }
+    }
+    const faqSources = new Set(
+      inventoryByKind.get("faq")?.sourceDocumentIds ?? [],
+    );
+    if (
+      generatedContent.faqs.some((faq) =>
+        faq.sourceDocumentIds.some((documentId) => !faqSources.has(documentId)),
+      ) ||
+      generatedContent.officialLinks.some((link) =>
+        link.sourceDocumentIds.some(
+          (documentId) => !sourceDocuments.has(documentId),
+        ),
+      )
+    ) {
+      throw new Error("SITEOPS_CONTENT_RECORD_SOURCE_MAPPING_INVALID");
     }
   }
   const allText = canonicalJson({ brief, designSpec, generatedContent });
@@ -673,6 +830,22 @@ function routeCanonical(origin: string, slug: string) {
   return `${origin}${slug}`;
 }
 
+const contentEntityRoutePrefix = {
+  product: "products",
+  service: "services",
+  application: "applications",
+  case_study: "cases",
+  blog: "blog",
+  company_news: "news",
+} as const;
+
+function contentEntityRouteSlug(input: {
+  entityType: keyof typeof contentEntityRoutePrefix;
+  slug: string;
+}) {
+  return `/${contentEntityRoutePrefix[input.entityType]}/${input.slug}/`;
+}
+
 function safeContactHref(kind: "email" | "phone" | "address", value: string) {
   if (kind === "email" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) {
     return `mailto:${value}`;
@@ -709,14 +882,12 @@ function siteDesignMaterializationProjectionFor(
   workflow: SiteOpsMaterializerCoordinates,
   renderer: SiteRenderer,
 ) {
-  const reactCoordinates =
-    renderer === REACT_STATIC_RENDERER
-      ? reactStaticCoordinatesForWorkflow(workflow)
-      : null;
-  const design =
-    renderer === REACT_STATIC_RENDERER
-      ? siteDesignSpecV2Schema.parse(input)
-      : siteDesignSpecV1Schema.parse(input);
+  const reactCoordinates = isReactStaticRenderer(renderer)
+    ? reactStaticCoordinatesForWorkflow(workflow)
+    : null;
+  const design = isReactStaticRenderer(renderer)
+    ? siteDesignSpecV2Schema.parse(input)
+    : siteDesignSpecV1Schema.parse(input);
   const heroFamily =
     design.schemaVersion === 2
       ? design.referenceBlueprint.heroFamily
@@ -764,15 +935,13 @@ function siteDesignMaterializationProjectionFor(
     heroClass: `hero hero--${heroFamily}`,
     heroFamily,
     componentManifest: {
-      schemaVersion: renderer === REACT_STATIC_RENDERER ? 2 : 1,
-      componentLibraryVersion:
-        renderer === REACT_STATIC_RENDERER
-          ? reactCoordinates!.componentLibraryVersion
-          : workflow.componentLibraryVersion,
-      materializerVersion:
-        renderer === REACT_STATIC_RENDERER
-          ? reactCoordinates!.materializerVersion
-          : workflow.materializerVersion,
+      schemaVersion: isReactStaticRenderer(renderer) ? 2 : 1,
+      componentLibraryVersion: isReactStaticRenderer(renderer)
+        ? reactCoordinates!.componentLibraryVersion
+        : workflow.componentLibraryVersion,
+      materializerVersion: isReactStaticRenderer(renderer)
+        ? reactCoordinates!.materializerVersion
+        : workflow.materializerVersion,
       layoutArchetype: design.layoutArchetype,
       ...(design.schemaVersion === 1
         ? { heroVariant: design.heroVariant }
@@ -1362,12 +1531,13 @@ function buildTrustedAstroSource(input: {
 }
 
 function buildTrustedReactSource(input: {
-  contract: BuildPlanContractV3;
+  contract: BuildPlanContractV3 | BuildPlanContractV4;
   frozenRuntimeInput: z.infer<typeof siteOpsFrozenRuntimeInputSchema>;
   brief: SiteBrief;
   visual: SiteOpsRuntimeVisual;
   designSpec: SiteDesignSpecV2;
   content: SiteOpsGeneratedContent;
+  renderer: typeof REACT_STATIC_RENDERER_V1 | typeof REACT_STATIC_RENDERER;
   canonicalOrigin: string | null;
   mode: "preview" | "production";
   brandAsset: TrustedSiteBrandAsset | null;
@@ -1378,7 +1548,7 @@ function buildTrustedReactSource(input: {
   const projection = siteDesignMaterializationProjectionFor(
     input.designSpec,
     input.workflow,
-    REACT_STATIC_RENDERER,
+    input.renderer,
   );
   const frozenBrandAsset = freezeSiteBrandAsset(input.brandAsset);
   const contacts = input.brief.contacts.map((contact) => ({
@@ -1465,7 +1635,7 @@ function buildTrustedReactSource(input: {
     "frontmind-runtime-lock.json",
     jsonBuffer({
       schemaVersion: 2,
-      renderer: REACT_STATIC_RENDERER,
+      renderer: input.renderer,
       componentLibraryVersion: reactCoordinates.componentLibraryVersion,
       packageManager: "host-owned",
       installAtCustomerBuildTime: false,
@@ -1479,7 +1649,7 @@ function buildTrustedReactSource(input: {
   );
   addTextFile(
     files,
-    "frontmind-build-plan-contract-v3.json",
+    `frontmind-build-plan-contract-v${input.contract.schemaVersion}.json`,
     jsonBuffer(input.contract),
   );
   addTextFile(
@@ -1523,10 +1693,49 @@ function buildTrustedReactSource(input: {
     }),
   );
 
+  const typedContent = isSiteOpsGeneratedContentV2(input.content)
+    ? input.content
+    : null;
+  const entitiesById = new Map(
+    (typedContent?.entities ?? []).map((entity) => [entity.entityId, entity]),
+  );
+  const faqsById = new Map(
+    (typedContent?.faqs ?? []).map((faq) => [faq.faqId, faq]),
+  );
+  const publicPages: Array<{
+    slug: string;
+    title: string;
+    summary: string;
+    lastModified: string | null;
+  }> = [];
+  const projectEntity = (entityId: string) => {
+    const entity = entitiesById.get(entityId);
+    if (!entity) throw new Error("SITEOPS_CONTENT_ENTITY_REFERENCE_MISSING");
+    return {
+      entityId: entity.entityId,
+      href: contentEntityRouteSlug(entity),
+      title: entity.title,
+      summary: entity.summary,
+      tags: entity.tags,
+    };
+  };
+  const projectFaq = (faqId: string) => {
+    const faq = faqsById.get(faqId);
+    if (!faq) throw new Error("SITEOPS_CONTENT_FAQ_REFERENCE_MISSING");
+    return {
+      faqId: faq.faqId,
+      question: faq.question,
+      answers: faq.answers,
+    };
+  };
+
   for (const [index, route] of input.brief.routes.entries()) {
-    const generated = input.content.routes.find(
+    const typedGenerated = typedContent?.routes.find(
       (item) => item.routeId === route.id,
-    )!;
+    );
+    const generated =
+      typedGenerated ??
+      input.content.routes.find((item) => item.routeId === route.id)!;
     const composition = input.designSpec.routeCompositions.find(
       (item) => item.routeId === route.id,
     )!;
@@ -1537,6 +1746,49 @@ function buildTrustedReactSource(input: {
     const canonical = input.canonicalOrigin
       ? routeCanonical(input.canonicalOrigin, route.slug)
       : null;
+    const routeFaqs = typedGenerated
+      ? [
+          ...new Set(
+            typedGenerated.sections.flatMap((section) => section.faqIds),
+          ),
+        ].map(projectFaq)
+      : [];
+    const sameAs = (typedContent?.officialLinks ?? [])
+      .filter((link) => link.kind === "same_as")
+      .map((link) => link.url);
+    const emptyState = typedGenerated?.emptyState;
+    const jsonLd =
+      !canonical || emptyState
+        ? null
+        : route.id === "home"
+          ? {
+              "@context": "https://schema.org",
+              "@type": input.content.seo.organizationType,
+              name: input.brief.companyName,
+              url: canonical,
+              description: input.content.seo.description,
+              ...(sameAs.length > 0 ? { sameAs } : {}),
+            }
+          : route.id === "faq" && routeFaqs.length > 0
+            ? {
+                "@context": "https://schema.org",
+                "@type": "FAQPage",
+                mainEntity: routeFaqs.map((faq) => ({
+                  "@type": "Question",
+                  name: faq.question,
+                  acceptedAnswer: {
+                    "@type": "Answer",
+                    text: faq.answers.join("\n"),
+                  },
+                })),
+              }
+            : {
+                "@context": "https://schema.org",
+                "@type": "CollectionPage",
+                name: generated.heading,
+                description: generated.summary,
+                url: canonical,
+              };
     addTextFile(
       files,
       `src/${dataPath}`,
@@ -1544,28 +1796,31 @@ function buildTrustedReactSource(input: {
         title: `${generated.heading} | ${input.brief.companyName}`,
         description: generated.summary,
         canonical,
-        jsonLd: canonical
-          ? {
-              "@context": "https://schema.org",
-              "@type": input.content.seo.organizationType,
-              name: input.brief.companyName,
-              url: canonical,
-              description: input.content.seo.description,
-            }
-          : null,
+        jsonLd,
         heroFamily: input.designSpec.referenceBlueprint.heroFamily,
         hero: {
           eyebrow: generated.eyebrow ?? input.brief.companyName,
           heading: generated.heading,
           summary: generated.summary,
         },
-        sections: generated.sections.map((section) => ({
-          slotId: section.slotId,
-          variant: variantBySlot.get(section.slotId),
-          heading: section.heading,
-          paragraphs: section.paragraphs,
-          sourceDocumentIds: section.sourceDocumentIds,
-        })),
+        ...(emptyState ? { emptyState } : {}),
+        sections: typedGenerated
+          ? typedGenerated.sections.map((section) => ({
+              slotId: section.slotId,
+              variant: variantBySlot.get(section.slotId),
+              blockType: section.blockType,
+              heading: section.heading,
+              paragraphs: section.paragraphs,
+              items: section.items,
+              entities: section.entityIds.map(projectEntity),
+              faqs: section.faqIds.map(projectFaq),
+            }))
+          : generated.sections.map((section) => ({
+              slotId: section.slotId,
+              variant: variantBySlot.get(section.slotId),
+              heading: section.heading,
+              paragraphs: section.paragraphs,
+            })),
         contacts,
       }),
     );
@@ -1573,6 +1828,101 @@ function buildTrustedReactSource(input: {
       routeId: route.id,
       dataPath,
       outputPath: routeOutputPath(route.slug),
+    });
+    if (!emptyState) {
+      publicPages.push({
+        slug: route.slug,
+        title: generated.heading,
+        summary: generated.summary,
+        lastModified: null,
+      });
+    }
+  }
+
+  for (const [index, entity] of (typedContent?.entities ?? []).entries()) {
+    const slug = contentEntityRouteSlug(entity);
+    const canonical = input.canonicalOrigin
+      ? routeCanonical(input.canonicalOrigin, slug)
+      : null;
+    const dataPath = `data/entity-${String(index + 1).padStart(3, "0")}.json`;
+    const schemaType = {
+      product: "Product",
+      service: "Service",
+      application: "WebPage",
+      case_study: "Article",
+      blog: "Article",
+      company_news: "NewsArticle",
+    }[entity.entityType];
+    const related = entity.relatedEntityIds.map(projectEntity);
+    addTextFile(
+      files,
+      `src/${dataPath}`,
+      jsonBuffer({
+        title: `${entity.title} | ${input.brief.companyName}`,
+        description: entity.summary,
+        canonical,
+        jsonLd: canonical
+          ? {
+              "@context": "https://schema.org",
+              "@type": schemaType,
+              name: entity.title,
+              headline: entity.title,
+              description: entity.summary,
+              url: canonical,
+              ...(entity.publishedAt
+                ? { datePublished: entity.publishedAt }
+                : {}),
+              ...(entity.modifiedAt ? { dateModified: entity.modifiedAt } : {}),
+              ...(entity.author
+                ? { author: { "@type": "Person", name: entity.author } }
+                : {}),
+            }
+          : null,
+        heroFamily: input.designSpec.referenceBlueprint.heroFamily,
+        hero: {
+          eyebrow: input.brief.companyName,
+          heading: entity.title,
+          summary: entity.summary,
+        },
+        sections: [
+          {
+            slotId: "body",
+            variant: "split",
+            blockType: "prose",
+            heading: entity.title,
+            paragraphs: entity.body,
+            items: [],
+            entities: [],
+            faqs: [],
+          },
+          ...(related.length > 0
+            ? [
+                {
+                  slotId: "related",
+                  variant: "cards",
+                  blockType: "entity_grid",
+                  heading: "相关内容",
+                  paragraphs: ["继续浏览知识库中已验证的相关内容。"],
+                  items: [],
+                  entities: related,
+                  faqs: [],
+                },
+              ]
+            : []),
+        ],
+        contacts,
+      }),
+    );
+    routeManifest.push({
+      routeId: `entity:${entity.entityId}`,
+      dataPath,
+      outputPath: routeOutputPath(slug),
+    });
+    publicPages.push({
+      slug,
+      title: entity.title,
+      summary: entity.summary,
+      lastModified: entity.modifiedAt ?? entity.publishedAt,
     });
   }
   addTextFile(
@@ -1587,8 +1937,8 @@ function buildTrustedReactSource(input: {
     files,
     "src/route-manifest.json",
     jsonBuffer({
-      schemaVersion: 1,
-      renderer: REACT_STATIC_RENDERER,
+      schemaVersion: input.renderer === REACT_STATIC_RENDERER ? 2 : 1,
+      renderer: input.renderer,
       routes: routeManifest,
       notFound: { dataPath: "data/not-found.json", outputPath: "404.html" },
     }),
@@ -1635,10 +1985,12 @@ function buildTrustedReactSource(input: {
       : `User-agent: *\nAllow: /\nSitemap: ${input.canonicalOrigin}/sitemap.xml\n`,
   );
   if (input.mode === "production") {
-    const urls = input.brief.routes.map(
-      (route) =>
-        `<url><loc>${escapeXml(routeCanonical(input.canonicalOrigin!, route.slug))}</loc></url>`,
-    );
+    const urls = publicPages.map((page) => {
+      const lastModified = page.lastModified
+        ? `<lastmod>${escapeXml(page.lastModified)}</lastmod>`
+        : "";
+      return `<url><loc>${escapeXml(routeCanonical(input.canonicalOrigin!, page.slug))}</loc>${lastModified}</url>`;
+    });
     addTextFile(
       files,
       "public/sitemap.xml",
@@ -1647,7 +1999,7 @@ function buildTrustedReactSource(input: {
     addTextFile(
       files,
       "public/llms.txt",
-      `# ${input.brief.companyName}\n\n${input.content.seo.description}\n\n${input.brief.routes.map((route) => `- [${route.title}](${routeCanonical(input.canonicalOrigin!, route.slug)})`).join("\n")}\n`,
+      `# ${plainMetadataText(input.brief.companyName)}\n\n${plainMetadataText(input.content.seo.description)}\n\n${publicPages.map((page) => `- [${plainMetadataText(page.title)}](${routeCanonical(input.canonicalOrigin!, page.slug)}): ${plainMetadataText(page.summary)}`).join("\n")}\n`,
     );
   }
 
@@ -2384,6 +2736,7 @@ function qaDist(input: {
   assetDecisions: readonly z.infer<typeof siteOpsAssetDecisionSchema>[];
   brandAsset: FrozenSiteBrandAsset | null;
   qaPolicyVersion: string;
+  sourceDocumentIds: readonly string[];
   expectedHeroFamily?: string;
 }) {
   const files = new Map(input.files.map((file) => [file.path, file.bytes]));
@@ -2415,6 +2768,24 @@ function qaDist(input: {
   const htmlFiles = [...files.entries()].filter(([name]) =>
     name.endsWith(".html"),
   );
+  if (input.qaPolicyVersion === "siteops-qa-v4") {
+    const privateSourceTokens = input.sourceDocumentIds.filter(
+      (documentId) => documentId.length >= 8,
+    );
+    const discoveryAndHtml = [...files.entries()].filter(([name]) =>
+      /\.(?:html|xml|txt)$/iu.test(name),
+    );
+    requireCheck(
+      "no-public-source-identifiers",
+      discoveryAndHtml.every(([, bytes]) => {
+        const text = bytes.toString("utf8");
+        return privateSourceTokens.every(
+          (documentId) => !text.includes(documentId),
+        );
+      }),
+      "frozen source identifiers are absent from public HTML and discovery text",
+    );
+  }
   requireCheck(
     "static-html",
     htmlFiles.length >= routeOutputs.length + 1,
@@ -2479,6 +2850,15 @@ function qaDist(input: {
       !SENSITIVE_TEXT.test(html) && !FORBIDDEN_DEMO_TEXT.test(html),
       "no credential-shaped or demo text is present",
     );
+    if (input.qaPolicyVersion === "siteops-qa-v4") {
+      requireCheck(
+        `no-public-source-labels:${name}`,
+        !/(?:sourceDocumentIds|source_document_ids|内部来源|来源文档\s*(?:ID|编号))/iu.test(
+          html,
+        ),
+        "internal source identifiers and labels are absent from public HTML",
+      );
+    }
     if (expectedBrandPath) {
       requireCheck(
         `brand-logo-rendered:${name}`,
@@ -2551,11 +2931,16 @@ function qaDist(input: {
     requireCheck(
       "production-jsonld",
       routeOutputs.every((output) =>
-        /type="application\/ld\+json"/u.test(
-          files.get(output)!.toString("utf8"),
-        ),
+        (() => {
+          const html = files.get(output)!.toString("utf8");
+          return (
+            /type="application\/ld\+json"/u.test(html) ||
+            (output === "news/index.html" &&
+              html.includes("当前知识库暂无可公开的企业动态"))
+          );
+        })(),
       ),
-      "each public route contains JSON-LD",
+      "eligible public routes contain JSON-LD and empty news remains untyped",
     );
     requireCheck(
       "production-social-image",
@@ -2603,10 +2988,9 @@ async function materializeSiteWithWorkflow(
   renderer: SiteRenderer,
 ): Promise<MaterializedAstroSite> {
   assertNotAborted(input.abortSignal);
-  const reactCoordinates =
-    renderer === REACT_STATIC_RENDERER
-      ? reactStaticCoordinatesForWorkflow(workflow)
-      : null;
+  const reactCoordinates = isReactStaticRenderer(renderer)
+    ? reactStaticCoordinatesForWorkflow(workflow)
+    : null;
   const brandAsset = await materializationStage({
     phase: "input_validation",
     fallbackCode: "SITEOPS_BRAND_ASSET_INVALID",
@@ -2622,14 +3006,12 @@ async function materializeSiteWithWorkflow(
     retryClass: "host_deterministic",
     run: () => validateInput(input, brandAsset, workflow, renderer),
   });
-  const reactDesign =
-    renderer === REACT_STATIC_RENDERER
-      ? siteDesignSpecV2Schema.parse(validated.designSpec)
-      : null;
-  const reactVisual =
-    renderer === REACT_STATIC_RENDERER
-      ? siteOpsRuntimeVisualEvidenceV2Schema.parse(validated.visual)
-      : null;
+  const reactDesign = isReactStaticRenderer(renderer)
+    ? siteDesignSpecV2Schema.parse(validated.designSpec)
+    : null;
+  const reactVisual = isReactStaticRenderer(renderer)
+    ? siteOpsRuntimeVisualEvidenceV2Schema.parse(validated.visual)
+    : null;
   const legacyDesign =
     renderer === LEGACY_ASTRO_RENDERER
       ? siteDesignSpecV1Schema.parse(validated.designSpec)
@@ -2671,7 +3053,7 @@ async function materializeSiteWithWorkflow(
             : (input.target ?? "global_excluding_cn"),
         canonicalOrigin: validated.canonicalOrigin,
       };
-      if (renderer === REACT_STATIC_RENDERER) {
+      if (isReactStaticRenderer(renderer)) {
         if (!reactDesign || !reactVisual) {
           throw new Error("SITEOPS_REACT_V2_CONTRACT_INPUT_MISSING");
         }
@@ -2680,9 +3062,8 @@ async function materializeSiteWithWorkflow(
           referenceBlueprint: _referenceBlueprint,
           ...contractVisual
         } = reactVisual;
-        return composeBuildPlanContractV3({
-          schemaVersion: 3,
-          contractKind: "build_plan",
+        const commonReactContract = {
+          contractKind: "build_plan" as const,
           source,
           workflow: {
             upstreamSha256: workflow.upstreamSha256,
@@ -2695,7 +3076,7 @@ async function materializeSiteWithWorkflow(
             materializerSha256: workflow.materializerSha256,
           },
           renderer: {
-            kind: REACT_STATIC_RENDERER,
+            kind: renderer,
             reactVersion: REACT_STATIC_REACT_VERSION,
             componentLibraryVersion: reactCoordinates!.componentLibraryVersion,
             materializerVersion: reactCoordinates!.materializerVersion,
@@ -2709,7 +3090,41 @@ async function materializeSiteWithWorkflow(
           seo,
           target,
           qaPolicyVersion: workflow.qaPolicyVersion,
-        });
+        };
+        return renderer === REACT_STATIC_RENDERER
+          ? composeBuildPlanContractV4({
+              ...commonReactContract,
+              schemaVersion: 4,
+              renderer: {
+                kind: REACT_STATIC_RENDERER,
+                reactVersion: REACT_STATIC_REACT_VERSION,
+                componentLibraryVersion: "2.2.0",
+                materializerVersion: "2.2.0",
+              },
+              content: {
+                schemaVersion: 2,
+                inventoryHash: canonicalSiteOpsSha256(
+                  validated.brief.contentInventory,
+                ),
+                routePolicyVersion: "snapshot-conditional-v1",
+                sourcePolicy: "frozen_snapshot_only",
+                externalAcquisitionAllowed: false,
+                publicSourceLabels: "forbidden",
+              },
+            })
+          : composeBuildPlanContractV3({
+              ...commonReactContract,
+              schemaVersion: 3,
+              renderer: {
+                kind: REACT_STATIC_RENDERER_V1,
+                reactVersion: REACT_STATIC_REACT_VERSION,
+                componentLibraryVersion: reactCoordinates!
+                  .componentLibraryVersion as "2.0.0" | "2.1.0",
+                materializerVersion: reactCoordinates!.materializerVersion as
+                  | "2.0.0"
+                  | "2.1.0",
+              },
+            });
       }
       if (!legacyDesign || !legacyVisual) {
         throw new Error("SITEOPS_ASTRO_V1_CONTRACT_INPUT_MISSING");
@@ -2763,14 +3178,12 @@ async function materializeSiteWithWorkflow(
         },
         host: {
           starterSha256: workflow.starterSha256,
-          componentLibraryVersion:
-            renderer === REACT_STATIC_RENDERER
-              ? reactCoordinates!.componentLibraryVersion
-              : workflow.componentLibraryVersion,
-          materializerVersion:
-            renderer === REACT_STATIC_RENDERER
-              ? reactCoordinates!.materializerVersion
-              : workflow.materializerVersion,
+          componentLibraryVersion: isReactStaticRenderer(renderer)
+            ? reactCoordinates!.componentLibraryVersion
+            : workflow.componentLibraryVersion,
+          materializerVersion: isReactStaticRenderer(renderer)
+            ? reactCoordinates!.materializerVersion
+            : workflow.materializerVersion,
           materializerSha256: workflow.materializerSha256,
           renderer,
         },
@@ -2804,8 +3217,13 @@ async function materializeSiteWithWorkflow(
         brandAsset: validated.brandAsset,
         workflow,
       };
-      if (renderer === REACT_STATIC_RENDERER) {
-        if (contractSeed.schemaVersion !== 3 || !reactDesign || !reactVisual) {
+      if (isReactStaticRenderer(renderer)) {
+        if (
+          (contractSeed.schemaVersion !== 3 &&
+            contractSeed.schemaVersion !== 4) ||
+          !reactDesign ||
+          !reactVisual
+        ) {
           throw new Error("SITEOPS_REACT_V2_SOURCE_INPUT_MISSING");
         }
         return buildTrustedReactSource({
@@ -2813,6 +3231,7 @@ async function materializeSiteWithWorkflow(
           contract: contractSeed,
           visual: reactVisual,
           designSpec: reactDesign,
+          renderer,
         });
       }
       if (contractSeed.schemaVersion !== 2 || !legacyDesign || !legacyVisual) {
@@ -2860,19 +3279,17 @@ async function materializeSiteWithWorkflow(
       retryClass: "host_deterministic",
       run: () => writeSourceRoot(buildRoot, sourceFiles),
     });
-    const buildPhase =
-      renderer === REACT_STATIC_RENDERER
-        ? ("react_static_build" as const)
-        : ("astro_build" as const);
+    const buildPhase = isReactStaticRenderer(renderer)
+      ? ("react_static_build" as const)
+      : ("astro_build" as const);
     const buildLog = await materializationStage({
       phase: buildPhase,
-      fallbackCode:
-        renderer === REACT_STATIC_RENDERER
-          ? "SITEOPS_REACT_STATIC_BUILD_FAILED"
-          : "SITEOPS_ASTRO_BUILD_FAILED",
+      fallbackCode: isReactStaticRenderer(renderer)
+        ? "SITEOPS_REACT_STATIC_BUILD_FAILED"
+        : "SITEOPS_ASTRO_BUILD_FAILED",
       retryClass: "host_deterministic",
       run: () =>
-        renderer === REACT_STATIC_RENDERER
+        isReactStaticRenderer(renderer)
           ? runReactStaticBuild(
               buildRoot,
               input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
@@ -2887,10 +3304,9 @@ async function materializeSiteWithWorkflow(
     const distRoot = path.join(buildRoot, "dist");
     const distFiles = await materializationStage({
       phase: buildPhase,
-      fallbackCode:
-        renderer === REACT_STATIC_RENDERER
-          ? "SITEOPS_REACT_STATIC_DIST_COLLECTION_FAILED"
-          : "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
+      fallbackCode: isReactStaticRenderer(renderer)
+        ? "SITEOPS_REACT_STATIC_DIST_COLLECTION_FAILED"
+        : "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
       retryClass: "host_deterministic",
       run: () => collectDirectory(distRoot),
     });
@@ -2907,8 +3323,9 @@ async function materializeSiteWithWorkflow(
           assetDecisions: validated.assetDecisions,
           brandAsset: freezeSiteBrandAsset(validated.brandAsset),
           qaPolicyVersion: workflow.qaPolicyVersion,
+          sourceDocumentIds: [...validated.sourceDocuments.keys()],
           expectedHeroFamily:
-            renderer === REACT_STATIC_RENDERER &&
+            isReactStaticRenderer(renderer) &&
             validated.designSpec.schemaVersion === 2
               ? validated.designSpec.referenceBlueprint.heroFamily
               : undefined,
@@ -2957,21 +3374,44 @@ async function materializeSiteWithWorkflow(
       fallbackCode: "SITEOPS_SOURCE_FINALIZATION_FAILED",
       retryClass: "host_deterministic",
       run: async () => {
-        if (renderer === REACT_STATIC_RENDERER) {
-          if (contractSeed.schemaVersion !== 3) {
+        if (isReactStaticRenderer(renderer)) {
+          if (
+            contractSeed.schemaVersion !== 3 &&
+            contractSeed.schemaVersion !== 4
+          ) {
             throw new Error("SITEOPS_REACT_BUILD_PLAN_INVALID");
           }
-          const {
-            contractKind: _contractKind,
-            specHash: _planHash,
-            ...plan
-          } = contractSeed;
-          const finalized = composeBuildContractV3({
-            ...plan,
-            contractKind: "build_contract",
-            sourceHash: trustedSourceTreeHash(sourceFiles),
-            distHash: sha256(distZip),
-          });
+          const finalized =
+            contractSeed.schemaVersion === 4
+              ? (() => {
+                  const {
+                    contractKind: _contractKind,
+                    specHash: _planHash,
+                    ...plan
+                  } = contractSeed;
+                  return composeBuildContractV4({
+                    ...plan,
+                    contractKind: "build_contract",
+                    contentSpecHash: canonicalSiteOpsSha256(
+                      validated.generatedContent,
+                    ),
+                    sourceHash: trustedSourceTreeHash(sourceFiles),
+                    distHash: sha256(distZip),
+                  });
+                })()
+              : (() => {
+                  const {
+                    contractKind: _contractKind,
+                    specHash: _planHash,
+                    ...plan
+                  } = contractSeed;
+                  return composeBuildContractV3({
+                    ...plan,
+                    contractKind: "build_contract",
+                    sourceHash: trustedSourceTreeHash(sourceFiles),
+                    distHash: sha256(distZip),
+                  });
+                })();
           const finalizedJson = jsonBuffer(finalized);
           const finalizedFiles = [
             ...sourceFiles.filter(
@@ -3008,20 +3448,17 @@ async function materializeSiteWithWorkflow(
         version: workflow.frontMindVersion,
         starterVersion: workflow.starterVersion,
         starterSha256: workflow.starterSha256,
-        componentLibraryVersion:
-          renderer === REACT_STATIC_RENDERER
-            ? reactCoordinates!.componentLibraryVersion
-            : workflow.componentLibraryVersion,
-        materializerVersion:
-          renderer === REACT_STATIC_RENDERER
-            ? reactCoordinates!.materializerVersion
-            : workflow.materializerVersion,
+        componentLibraryVersion: isReactStaticRenderer(renderer)
+          ? reactCoordinates!.componentLibraryVersion
+          : workflow.componentLibraryVersion,
+        materializerVersion: isReactStaticRenderer(renderer)
+          ? reactCoordinates!.materializerVersion
+          : workflow.materializerVersion,
         materializerSha256: workflow.materializerSha256,
         renderer,
-        reactVersion:
-          renderer === REACT_STATIC_RENDERER
-            ? REACT_STATIC_REACT_VERSION
-            : null,
+        reactVersion: isReactStaticRenderer(renderer)
+          ? REACT_STATIC_REACT_VERSION
+          : null,
       },
       visual: {
         queryHash: validated.visual.queryHash,
@@ -3118,11 +3555,19 @@ function materializeReactStaticSiteV2_0(input: MaterializeAstroSiteInput) {
   return materializeSiteWithWorkflow(
     input,
     SITEOPS_MATERIALIZER_V2_0,
-    REACT_STATIC_RENDERER,
+    REACT_STATIC_RENDERER_V1,
   );
 }
 
 function materializeReactStaticSiteV2_1(input: MaterializeAstroSiteInput) {
+  return materializeSiteWithWorkflow(
+    input,
+    SITEOPS_MATERIALIZER_V2_1,
+    REACT_STATIC_RENDERER_V1,
+  );
+}
+
+function materializeReactStaticSiteV2_2(input: MaterializeAstroSiteInput) {
   return materializeSiteWithWorkflow(
     input,
     SITEOPS_WORKFLOW,
@@ -3158,13 +3603,18 @@ const productionMaterializerRegistry = [
   },
   {
     workflow: SITEOPS_MATERIALIZER_V2_0,
-    renderer: REACT_STATIC_RENDERER,
+    renderer: REACT_STATIC_RENDERER_V1,
     materialize: materializeReactStaticSiteV2_0,
+  },
+  {
+    workflow: SITEOPS_MATERIALIZER_V2_1,
+    renderer: REACT_STATIC_RENDERER_V1,
+    materialize: materializeReactStaticSiteV2_1,
   },
   {
     workflow: SITEOPS_WORKFLOW,
     renderer: REACT_STATIC_RENDERER,
-    materialize: materializeReactStaticSiteV2_1,
+    materialize: materializeReactStaticSiteV2_2,
   },
 ] as const;
 
@@ -3251,11 +3701,11 @@ export async function materializeProductionSiteFromSource(input: {
       frozen.build.starterVersion === workflow.starterVersion &&
       frozen.host.starterSha256 === workflow.starterSha256 &&
       frozen.host.componentLibraryVersion ===
-        (renderer === REACT_STATIC_RENDERER
+        (isReactStaticRenderer(renderer)
           ? reactStaticCoordinatesForWorkflow(workflow).componentLibraryVersion
           : workflow.componentLibraryVersion) &&
       frozen.host.materializerVersion ===
-        (renderer === REACT_STATIC_RENDERER
+        (isReactStaticRenderer(renderer)
           ? reactStaticCoordinatesForWorkflow(workflow).materializerVersion
           : workflow.materializerVersion) &&
       frozen.host.materializerSha256 === workflow.materializerSha256,

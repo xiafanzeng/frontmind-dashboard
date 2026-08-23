@@ -860,7 +860,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(sendMessage.mock.calls[0]![0].attachments).toEqual([
       expect.objectContaining({
         filename: SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
-          ? "frontmind-build-plan-contract-v3.json"
+          ? "frontmind-build-plan-contract-v4.json"
           : "frontmind-build-contract-v2.json",
         mime_type: "application/json",
       }),
@@ -872,9 +872,9 @@ describe("Manus SiteOps provider boundary", () => {
     expect(
       Array.from(sendMessage.mock.calls[0]![0].prompt).length,
     ).toBeLessThanOrEqual(3_000);
-    expect(sendMessage.mock.calls[0]![0].prompt).toContain("PageContentWireV2");
+    expect(sendMessage.mock.calls[0]![0].prompt).toContain("PageContentWireV3");
     expect(sendMessage.mock.calls[0]![0].prompt).toContain(
-      "frontmind-page-content-wire-v2.json",
+      "frontmind-page-content-wire-v3.json",
     );
     const sendBody = buildManusV2SendMessageBody(sendMessage.mock.calls[0]![0]);
     expect(sendBody.task_id).toBe("manus-task-1");

@@ -4,6 +4,7 @@ import type {
   SiteOpsPublicVisualCandidate,
 } from "@shared/siteops-contract";
 import type { SiteOpsActInput } from "@shared/siteops";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -183,7 +184,7 @@ function customerFacingMessage(content: string) {
     )
     .replace(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/gu, "")
     .replace(/21st/giu, "视觉服务")
-    .replace(/SiteOps/giu, "一站式建站")
+    .replace(/SiteOps/giu, SITEOPS_CUSTOMER_DISPLAY_NAME)
     .replace(/(?:原生\s*)?Astro/giu, "官网")
     .replace(/React(?:\s*静态)?/giu, "官网")
     .replace(/API\s*Key/giu, "服务配置")
@@ -193,11 +194,11 @@ function customerFacingMessage(content: string) {
     .replace(/\n{3,}/gu, "\n\n")
     .trim();
   if (
-    /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu.test(
+    /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|RAM\s*Role|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|canonical\s+hostname|global_excluding_cn|mainland_cn|\bHero\b|归档哈希|\bhash\b|record\s*tuple|remark\s*marker|provider)/iu.test(
       sanitized,
     )
   ) {
-    return "FrontMind 正在自动完成网站配置；如长时间未完成，请提交工单获取协助。";
+    return "FrontMind 正在处理当前任务；如长时间未完成，请提交工单获取协助。";
   }
   return sanitized || "任务需要协助，请稍后重试或提交工单。";
 }
@@ -405,10 +406,11 @@ export default function SiteOpsConversationPanel({
       setLocalError(null);
       setResetDialogOpen(false);
     } catch (resetActionError) {
-      const message =
+      const rawMessage =
         resetActionError instanceof Error
           ? resetActionError.message
           : "建站流程没有重置，请刷新后重试。";
+      const message = customerFacingMessage(rawMessage);
       setResetError(message);
       setLocalError(message);
     } finally {
@@ -575,10 +577,10 @@ export default function SiteOpsConversationPanel({
     return (
       <section
         className="siteops-panel siteops-panel-state"
-        aria-label="一站式建站"
+        aria-label={SITEOPS_CUSTOMER_DISPLAY_NAME}
       >
         <Loader2 className="siteops-spin" size={22} aria-hidden="true" />
-        正在打开一站式建站…
+        正在打开{SITEOPS_CUSTOMER_DISPLAY_NAME}…
       </section>
     );
   }
@@ -587,11 +589,11 @@ export default function SiteOpsConversationPanel({
     return (
       <section
         className="siteops-panel siteops-panel-state"
-        aria-label="一站式建站"
+        aria-label={SITEOPS_CUSTOMER_DISPLAY_NAME}
       >
         <AlertCircle size={22} aria-hidden="true" />
         <div>
-          <strong>一站式建站暂时不可用</strong>
+          <strong>{SITEOPS_CUSTOMER_DISPLAY_NAME}暂时不可用</strong>
           <p>{error ? customerFacingMessage(error) : "请稍后刷新重试。"}</p>
         </div>
         {onRefresh && (
@@ -667,7 +669,9 @@ export default function SiteOpsConversationPanel({
   const resetDisabled =
     !onAction || Boolean(busyAction) || !observation.resetCapability.allowed;
   const resetDisabledReason = !observation.resetCapability.allowed
-    ? observation.resetCapability.reason
+    ? customerFacingMessage(
+        observation.resetCapability.reason || "当前流程暂时不能重置。",
+      )
     : undefined;
   const rebuildRequestActive = Boolean(
     observation.rebuildRequest.ticketId &&
@@ -684,9 +688,9 @@ export default function SiteOpsConversationPanel({
         <div>
           <p>
             <Sparkles size={15} aria-hidden="true" />
-            一站式建站
+            {SITEOPS_CUSTOMER_DISPLAY_NAME}
           </p>
-          <h2 id="siteops-panel-title">一站式建站</h2>
+          <h2 id="siteops-panel-title">{SITEOPS_CUSTOMER_DISPLAY_NAME}</h2>
           <span>
             选择企业知识库和视觉方案，FrontMind 将完成官网制作与检查。
           </span>
@@ -697,7 +701,7 @@ export default function SiteOpsConversationPanel({
               <button
                 type="button"
                 className="siteops-icon-button"
-                aria-label="刷新一站式建站"
+                aria-label={`刷新${SITEOPS_CUSTOMER_DISPLAY_NAME}`}
                 disabled={refreshing}
                 onClick={() => onRefresh()}
               >
@@ -1123,7 +1127,7 @@ export default function SiteOpsConversationPanel({
           </section>
         )}
 
-      <div className="siteops-message-list" aria-label="一站式建站对话记录">
+      <div className="siteops-message-list" aria-label={`${SITEOPS_CUSTOMER_DISPLAY_NAME}对话记录`}>
         {observation.messages.length === 0 ? (
           <div className="siteops-empty-copy">
             选择知识库版本后，FrontMind 会在这里整理建站资料。
@@ -1144,7 +1148,7 @@ export default function SiteOpsConversationPanel({
               </span>
               <div>
                 <div className="siteops-message-meta">
-                  <strong>{item.role === "user" ? "你" : "一站式建站"}</strong>
+                  <strong>{item.role === "user" ? "你" : SITEOPS_CUSTOMER_DISPLAY_NAME}</strong>
                   {item.metadata?.siteOps && (
                     <span data-status={item.metadata.siteOps.status}>
                       {CARD_LABELS[item.metadata.siteOps.kind] ||
@@ -1283,6 +1287,16 @@ export default function SiteOpsConversationPanel({
               >
                 <Wrench size={15} aria-hidden="true" />
                 {rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"}
+              </button>
+            )}
+            {["preview_ready", "approved"].includes(latestBuild.status) && (
+              <button
+                type="button"
+                className="siteops-secondary-button"
+                disabled
+                title="即将上线"
+              >
+                发布博客与行业近况（即将上线）
               </button>
             )}
             {previewOpenError && latestBuild.previewUrl && (

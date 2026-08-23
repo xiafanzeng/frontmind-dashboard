@@ -20,6 +20,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 
 type GuideHotspot = {
   label: string;
@@ -224,7 +225,7 @@ const firstFilingStages: GuideStage[] = [
     title: "回到 FrontMind 提交已购买域名，等待备案服务码",
     summary: "提交域名会自动创建 AI 运维需求；服务码由该需求返回。",
     duration: "提交约 1 分钟，需求处理时间以页面状态为准",
-    path: "FrontMind → 一站式建站 → “已购买域名” → “提交域名，创建 AI 运维需求”",
+    path: `FrontMind → ${SITEOPS_CUSTOMER_DISPLAY_NAME} → “已购买域名” → “提交域名，创建 AI 运维需求”`,
     tasks: [
       "确认阿里云域名列表中的域名状态已经显示“正常”。",
       "回到本页下方的“提交已购买域名”区域，只填写主域名，例如 example.com。",
@@ -628,7 +629,7 @@ const existingFilingStages: GuideStage[] = [
     title: "回到 FrontMind 提交本次域名，等待 AI 运维返回服务码",
     summary: "提交时保留“已有 ICP 备案”标签，需求会记录为新增网站。",
     duration: "提交约 1 分钟，处理时间以需求状态为准",
-    path: "FrontMind → 一站式建站 → 已购买域名 → 提交域名",
+    path: `FrontMind → ${SITEOPS_CUSTOMER_DISPLAY_NAME} → 已购买域名 → 提交域名`,
     tasks: [
       "回到本页下方，只填写本次新增网站使用的主域名。",
       "保持当前教程选择为“国内版 · 已有 ICP 备案”，再提交域名。",

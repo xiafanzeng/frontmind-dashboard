@@ -27,6 +27,7 @@ import {
   type SiteOperation,
   type SiteProviderConnection,
 } from "../../drizzle/schema";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 import {
   decryptCredentialSecret,
   encryptCredentialSecret,
@@ -1512,7 +1513,7 @@ export async function getAliyunCustomerRoleAuthorizationPackage(rawInput: {
   return {
     schemaVersion: 1 as const,
     roleName: ALIYUN_CUSTOMER_ROLE_NAME,
-    description: "FrontMind 一站式建站域名与解析自动化",
+    description: `FrontMind ${SITEOPS_CUSTOMER_DISPLAY_NAME}域名与解析自动化`,
     trustPolicyDocument: {
       Version: "1",
       Statement: [

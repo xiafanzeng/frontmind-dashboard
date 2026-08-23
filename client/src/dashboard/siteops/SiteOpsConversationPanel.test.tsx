@@ -188,6 +188,55 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("sanitizes technical reset reasons and reset failures", async () => {
+    const onAction = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "canonical hostname 的 RAM Role 与 global_excluding_cn 归档哈希不一致",
+        ),
+      );
+    const { rerender } = render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          resetCapability: {
+            allowed: false,
+            reason: "mainland_cn 的 Hero 构图合同缺少归档哈希。",
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    expect(document.body.textContent).not.toMatch(
+      /canonical hostname|RAM Role|global_excluding_cn|mainland_cn|Hero|归档哈希/iu,
+    );
+    expect(
+      screen.getByText(
+        "FrontMind 正在处理当前任务；如长时间未完成，请提交工单获取协助。",
+      ),
+    ).toBeInTheDocument();
+
+    rerender(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onAction={onAction}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "重置建站流程" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "FrontMind 正在处理当前任务；如长时间未完成，请提交工单获取协助。",
+        ).length,
+      ).toBeGreaterThan(0),
+    );
+    expect(document.body.textContent).not.toMatch(
+      /canonical hostname|RAM Role|global_excluding_cn|归档哈希/iu,
+    );
+  });
+
   it("hides internal error codes and operation ids from customers", () => {
     render(
       <SiteOpsConversationPanel
@@ -237,7 +286,7 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "一站式建站" }),
+      screen.getByRole("heading", { name: "AI友好官网管理" }),
     ).toBeInTheDocument();
     expect(screen.getByAltText("A：编辑杂志式")).toHaveAttribute(
       "src",
@@ -562,6 +611,39 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/QA 报告|批准这个版本/u)).toBeNull();
     open.mockRestore();
+  });
+
+  it("shows future blog and industry publishing as disabled on a completed website", () => {
+    const onAction = vi.fn();
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 2,
+              parentBuildId: null,
+              status: "preview_ready",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+          interactionState: "preview_ready",
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    const futurePublishing = screen.getByRole("button", {
+      name: "发布博客与行业近况（即将上线）",
+    });
+    expect(futurePublishing).toBeDisabled();
+    fireEvent.click(futurePublishing);
+    expect(onAction).not.toHaveBeenCalled();
   });
 
   it("shows a safe retry link when the private preview popup is blocked", () => {

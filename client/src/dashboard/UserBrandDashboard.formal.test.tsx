@@ -37,6 +37,9 @@ const {
   deliveryAddMessageMutateAsync,
   deliveryCancelUseMutation,
   deliveryCancelMutateAsync,
+  brandQuestionUniverseObserveUseQuery,
+  brandQuestionUniverseStartUseMutation,
+  trpcUtils,
   uploadFileMock,
   authState,
 } = vi.hoisted(() => ({
@@ -74,6 +77,14 @@ const {
   deliveryAddMessageMutateAsync: vi.fn(),
   deliveryCancelUseMutation: vi.fn(),
   deliveryCancelMutateAsync: vi.fn(),
+  brandQuestionUniverseObserveUseQuery: vi.fn(),
+  brandQuestionUniverseStartUseMutation: vi.fn(),
+  trpcUtils: {
+    workspace: {
+      brandQuestionUniverse: { observe: { invalidate: vi.fn() } },
+      dashboard: { invalidate: vi.fn() },
+    },
+  },
   uploadFileMock: vi.fn(),
   authState: {
     marketEdition: "domestic" as "domestic" | "overseas",
@@ -98,6 +109,7 @@ vi.mock("@/_core/hooks/useAuth", () => ({
 
 vi.mock("@/lib/trpc", () => ({
   trpc: {
+    useUtils: () => trpcUtils,
     auth: {
       changePassword: {
         useMutation: changePasswordUseMutation,
@@ -109,6 +121,10 @@ vi.mock("@/lib/trpc", () => ({
       },
       dashboard: {
         useQuery: dashboardUseQuery,
+      },
+      brandQuestionUniverse: {
+        observe: { useQuery: brandQuestionUniverseObserveUseQuery },
+        start: { useMutation: brandQuestionUniverseStartUseMutation },
       },
       responseLogic: {
         useQuery: responseLogicUseQuery,
@@ -408,6 +424,8 @@ describe("UserBrandDashboard formal workspace", () => {
     deliveryAddMessageMutateAsync.mockReset();
     deliveryCancelUseMutation.mockReset();
     deliveryCancelMutateAsync.mockReset();
+    brandQuestionUniverseObserveUseQuery.mockReset();
+    brandQuestionUniverseStartUseMutation.mockReset();
     uploadFileMock.mockReset();
     requestQuestionSelectionUseMutation.mockReset();
     requestQuestionSelectionMutateAsync.mockReset();
@@ -464,6 +482,24 @@ describe("UserBrandDashboard formal workspace", () => {
     changePasswordUseMutation.mockReturnValue({
       mutateAsync: vi.fn(),
       isPending: false,
+    });
+    brandQuestionUniverseObserveUseQuery.mockReturnValue({
+      data: {
+        canStart: false,
+        reason: "engineer_version",
+        knowledgeSnapshotId: null,
+        knowledgeVersion: null,
+        dashboardRevision: 1,
+        credentialReady: true,
+        engineerVersionPresent: true,
+        operation: null,
+      },
+      error: null,
+    });
+    brandQuestionUniverseStartUseMutation.mockReturnValue({
+      mutate: vi.fn(),
+      isPending: false,
+      error: null,
     });
     deliveryWorkspaceUseQuery.mockReturnValue({
       data: {
@@ -682,7 +718,7 @@ describe("UserBrandDashboard formal workspace", () => {
       name: "内容资产运营",
     });
     const websiteManagementNavigation = screen.getByRole("button", {
-      name: "一站式建站",
+      name: "AI友好官网管理",
     });
     expect(contentAssetsNavigation).not.toHaveAttribute("title");
     expect(
@@ -778,7 +814,7 @@ describe("UserBrandDashboard formal workspace", () => {
     authState.marketEdition = "overseas";
     render(<UserBrandDashboard />);
 
-    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
 
     const progress = screen
       .getByRole("heading", { name: "官网开通进度" })
@@ -942,7 +978,7 @@ describe("UserBrandDashboard formal workspace", () => {
     deliveryCreateMutateAsync.mockResolvedValue({ id: "website-ticket-1" });
     render(<UserBrandDashboard />);
 
-    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
     fireEvent.change(screen.getByLabelText("需求类型"), {
       target: { value: "company_facts" },
     });
@@ -1023,7 +1059,7 @@ describe("UserBrandDashboard formal workspace", () => {
     deliveryCreateMutateAsync.mockResolvedValue({ id: "icp-ticket-1" });
 
     render(<UserBrandDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
     fireEvent.change(screen.getByLabelText("已备案域名"), {
       target: { value: "example.com" },
     });
@@ -1097,7 +1133,7 @@ describe("UserBrandDashboard formal workspace", () => {
     });
 
     render(<UserBrandDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "一站式建站" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
     fireEvent.click(
       screen.getByRole("button", {
         name: "不确定场景，联系服务专员",
@@ -1409,7 +1445,7 @@ describe("UserBrandDashboard formal workspace", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。",
+        "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。",
       ),
     ).toBeInTheDocument();
     expect(

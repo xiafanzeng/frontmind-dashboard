@@ -61,6 +61,7 @@ import {
   keywordCategoryTone,
 } from "@shared/keyword-categories";
 import { WEBSITE_MANAGEMENT_HISTORY_CATEGORIES } from "@shared/delivery-ticket";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
 import {
   getCapability,
   getPreviewPlanCode,
@@ -265,7 +266,7 @@ const brandSubpages = [
   {
     id: "global-keywords",
     label: "品牌全域词库",
-    desc: "自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。",
+    desc: "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。",
   },
 ];
 
@@ -320,7 +321,7 @@ const semanticSubpages = [
   {
     id: "website-management",
     section: "semantic",
-    label: "一站式建站",
+    label: SITEOPS_CUSTOMER_DISPLAY_NAME,
     desc: "先购买并提交域名，领取 AI 运维返回的备案服务码后完成 ICP 备案。",
   },
 ];
@@ -1381,7 +1382,7 @@ function UserBrandDashboardContent({
                   : "进度报告"
                 : route.section === "semantic"
                   ? route.sub === "website-management"
-                    ? "一站式建站"
+                    ? SITEOPS_CUSTOMER_DISPLAY_NAME
                     : "内容资产运营"
                   : "服务页面";
   return (
@@ -1506,6 +1507,7 @@ function UserBrandDashboardContent({
                     error={dashboardError}
                     onUseQuestion={useBrandQuestion}
                     quotaAvailability={keywordQuotaAvailability}
+                    generationEnabled
                   />
                 ))}
               {route.section === "intent" && (
@@ -2518,7 +2520,7 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
       <PageHeader
         eyebrow="MindPromise智诺 / 品牌建设"
         title="品牌全域词库"
-        desc="自上而下热度降序排列，基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题。"
+        desc="基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。"
       />
 
       {/* SaaS化：多维筛选工具栏 */}

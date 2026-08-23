@@ -46,6 +46,7 @@ import {
   type SiteOpsActInput,
   type SiteBrief,
 } from "../../shared/siteops";
+import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { siteOpsObservationV1Schema } from "../../shared/siteops-contract";
 import {
@@ -123,6 +124,16 @@ export class SiteOpsServiceError extends Error {
     super(message);
     this.name = "SiteOpsServiceError";
   }
+}
+
+export function siteOpsServiceErrorFromQuota(error: SiteOpsQuotaError) {
+  return new SiteOpsServiceError(
+    error.code === "SITEOPS_ENTITLEMENT_REQUIRED"
+      ? "FORBIDDEN"
+      : "STATE_CONFLICT",
+    error.message,
+    error.statusCode,
+  );
 }
 
 export function requireAcceptedSiteOpsRebuild(input: {
@@ -264,11 +275,7 @@ async function requireSiteOpsEntitlement(userId: number) {
     return assertSiteOpsServiceEntitlement(await getServicePortal(userId));
   } catch (error) {
     if (error instanceof SiteOpsQuotaError) {
-      throw new SiteOpsServiceError(
-        "FORBIDDEN",
-        error.message,
-        error.statusCode,
-      );
+      throw siteOpsServiceErrorFromQuota(error);
     }
     throw error;
   }
@@ -290,13 +297,7 @@ async function reserveSiteOpsDeliveryQuota(
     });
   } catch (error) {
     if (error instanceof SiteOpsQuotaError) {
-      throw new SiteOpsServiceError(
-        error.code === "SITEOPS_ENTITLEMENT_REQUIRED"
-          ? "FORBIDDEN"
-          : "STATE_CONFLICT",
-        error.message,
-        error.statusCode,
-      );
+      throw siteOpsServiceErrorFromQuota(error);
     }
     throw error;
   }
@@ -463,6 +464,53 @@ export function siteBriefFromSnapshot(
   const offeringIds = (
     offeringDocuments.length ? offeringDocuments : publicDocuments.slice(0, 8)
   ).map(idFor);
+  const routeDocuments = (pattern: RegExp) =>
+    publicDocuments.filter((document) =>
+      pattern.test(
+        `${document.branchTitle ?? ""} ${document.title} ${document.path}`,
+      ),
+    );
+  const inventoryDocuments = {
+    product: routeDocuments(/(?:产品|设备|软件|平台)/u),
+    service: routeDocuments(/(?:服务|解决方案|业务)/u),
+    application: routeDocuments(/(?:应用|场景|行业方案)/u),
+    case_study: routeDocuments(/(?:案例|客户故事|实践)/u),
+    blog: routeDocuments(/(?:博客|知识|科普|指南|洞察|白皮书)/u),
+    company_news: routeDocuments(
+      /(?:企业新闻|公司新闻|企业动态|公司动态|新闻中心)/u,
+    ),
+    faq: routeDocuments(/(?:FAQ|常见问题|问答|Q&A)/iu),
+  } as const;
+  const contentInventory: SiteBrief["contentInventory"] = {
+    schemaVersion: 1,
+    source: "frozen_knowledge_snapshot",
+    entries: Object.entries(inventoryDocuments).flatMap(([kind, documents]) =>
+      documents.length > 0
+        ? [
+            {
+              kind: kind as keyof typeof inventoryDocuments,
+              sourceDocumentIds: [
+                ...new Set(documents.slice(0, 100).map(idFor)),
+              ],
+            },
+          ]
+        : [],
+    ),
+  };
+  const conditionalRoute = (input: {
+    id: string;
+    slug: string;
+    title: string;
+    documents: typeof publicDocuments;
+  }): SiteBrief["routes"][number] | null =>
+    input.documents.length > 0
+      ? {
+          id: input.id,
+          slug: input.slug,
+          title: input.title,
+          sourceDocumentIds: input.documents.slice(0, 100).map(idFor),
+        }
+      : null;
   const routes: SiteBrief["routes"] = [
     { id: "home", slug: "/", title: "首页", sourceDocumentIds: aboutIds },
     {
@@ -478,6 +526,57 @@ export function siteBriefFromSnapshot(
       sourceDocumentIds: offeringIds,
     },
   ];
+  for (const route of [
+    conditionalRoute({
+      id: "products",
+      slug: "/products",
+      title: "产品",
+      documents: inventoryDocuments.product,
+    }),
+    conditionalRoute({
+      id: "services",
+      slug: "/services",
+      title: "服务",
+      documents: inventoryDocuments.service,
+    }),
+    conditionalRoute({
+      id: "applications",
+      slug: "/applications",
+      title: "应用场景",
+      documents: inventoryDocuments.application,
+    }),
+    conditionalRoute({
+      id: "cases",
+      slug: "/cases",
+      title: "案例",
+      documents: inventoryDocuments.case_study,
+    }),
+    conditionalRoute({
+      id: "blog",
+      slug: "/blog",
+      title: "知识库",
+      documents: inventoryDocuments.blog,
+    }),
+    conditionalRoute({
+      id: "faq",
+      slug: "/faq",
+      title: "常见问题",
+      documents: inventoryDocuments.faq,
+    }),
+  ]) {
+    if (route && !routes.some((existing) => existing.slug === route.slug)) {
+      routes.push(route);
+    }
+  }
+  // Enterprise news is the sole always-addressable collection. An empty
+  // snapshot inventory renders the host-owned legal empty state; it never
+  // authorizes the provider to browse for or synthesize industry news.
+  routes.push({
+    id: "news",
+    slug: "/news",
+    title: "企业动态",
+    sourceDocumentIds: [...new Set(inventoryDocuments.company_news.map(idFor))],
+  });
   if (contacts.length > 0) {
     routes.push({
       id: "contact",
@@ -520,6 +619,7 @@ export function siteBriefFromSnapshot(
     conversionGoal: contacts.length
       ? "帮助访客了解企业与产品，并通过已验证的联系方式进一步咨询"
       : "帮助访客准确了解企业与产品",
+    contentInventory,
     routes,
     verifiedFacts,
     publicAssetIds,
@@ -690,7 +790,7 @@ export function freezeSiteOpsReferenceBlueprint(input: {
   if (!evidence.success || !heroEligibility.success || !evidenceIsValid) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "所选视觉参考无法冻结为可信 Hero 构图合同，请重新检索后选择。",
+      "所选视觉方案已失效，请重新生成视觉候选后选择。",
       409,
     );
   }
@@ -1998,7 +2098,11 @@ export async function completeSiteOpsAliyunOAuth(input: {
     )
     .limit(1);
   if (!rows[0]) {
-    throw new SiteOpsServiceError("NOT_FOUND", "一站式建站项目不存在。", 404);
+    throw new SiteOpsServiceError(
+      "NOT_FOUND",
+      `${SITEOPS_CUSTOMER_DISPLAY_NAME}项目不存在。`,
+      404,
+    );
   }
   try {
     await bindAliyunCustomerAccountFromOAuth({
@@ -2681,6 +2785,9 @@ async function handleRequestRebuild(
       now,
     });
   } catch (error) {
+    if (error instanceof SiteOpsQuotaError) {
+      throw siteOpsServiceErrorFromQuota(error);
+    }
     if (error instanceof SiteOpsRebuildTicketError) {
       throw new SiteOpsServiceError(
         error.code === "DELIVERY_OWNER_NOT_ASSIGNED" ||
@@ -3073,7 +3180,7 @@ export async function assertSiteOpsDeploymentTargetAvailable(
   if (rows[0]) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      `当前 canonical hostname 已有${rows[0].intent === "rollback" ? "回滚" : "发布"}任务正在${rows[0].status === "verifying" ? "验活" : "处理"}；大陆与海外模式互斥，不能同时进入 ${input.target}。`,
+      `当前域名已有${rows[0].intent === "rollback" ? "回滚" : "发布"}任务正在${rows[0].status === "verifying" ? "验证" : "处理"}，不同发布区域不能同时操作。`,
       409,
     );
   }
@@ -3583,7 +3690,7 @@ async function selectVisualSample(
   if (!snapshot?.archiveHash) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "知识库 ZIP 缺少已验证的归档哈希，不能开始构建。",
+      "知识库版本校验尚未完成，暂时不能开始制作官网。",
       409,
     );
   }
@@ -4306,7 +4413,7 @@ async function requireAliyunConnection(tx: any, projectId: string) {
   if (!rows[0]) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      "客户尚未连接有效的阿里云 RAM Role。",
+      "阿里云授权尚未完成，请按页面指引完成授权。",
       412,
     );
   }
