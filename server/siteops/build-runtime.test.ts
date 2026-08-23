@@ -88,11 +88,33 @@ import {
   generateSocialPackage,
   materializeAstroSite,
   materializeProductionSiteFromSource,
+  SiteOpsMaterializationError,
   type MaterializeAstroSiteInput,
   type SocialPackageInput,
 } from "./build-runtime";
 
 const H = (value: string) => createHash("sha256").update(value).digest("hex");
+
+function luminance(hex: string) {
+  const channels = [1, 3, 5].map(
+    (offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255,
+  );
+  const linear = channels.map((channel) =>
+    channel <= 0.04045
+      ? channel / 12.92
+      : Math.pow((channel + 0.055) / 1.055, 2.4),
+  );
+  return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
+}
+
+function ratio(left: string, right: string) {
+  const leftLuminance = luminance(left);
+  const rightLuminance = luminance(right);
+  return (
+    (Math.max(leftLuminance, rightLuminance) + 0.05) /
+    (Math.min(leftLuminance, rightLuminance) + 0.05)
+  );
+}
 
 function buildInput(
   mode: "preview" | "production" = "preview",
@@ -291,7 +313,11 @@ describe("SiteOps controlled Astro runtime", () => {
     const input = buildInput();
     input.assetDecisions = [
       { id: "official-logo", sha256: H(officialLogo), decision: "publish" },
-      { id: "private-evidence", sha256: H("private-evidence"), decision: "quarantine" },
+      {
+        id: "private-evidence",
+        sha256: H("private-evidence"),
+        decision: "quarantine",
+      },
     ];
     input.brandAsset = {
       schemaVersion: 1,
@@ -381,9 +407,7 @@ describe("SiteOps controlled Astro runtime", () => {
     const dist = await JSZip.loadAsync(built.distZip, { checkCRC32: true });
     const home = await dist.file("index.html")!.async("string");
     expect(home).toContain("让设备状态更清晰");
-    expect(home).toContain(
-      'class="hero hero--split_media"',
-    );
+    expect(home).toContain('class="hero hero--split_media"');
     expect(home).toContain(
       'class="section section--proof" data-slot="service-proof"',
     );
@@ -410,13 +434,195 @@ describe("SiteOps controlled Astro runtime", () => {
     expect(dist.file("llms.txt")).toBeNull();
   }, 90_000);
 
+  it("allows a duplicate official-logo SHA only when the alias is omitted", async () => {
+    const input = buildInput();
+    const logoSha256 = H(officialLogo);
+    input.assetDecisions = [
+      { id: "official-logo", sha256: logoSha256, decision: "publish" },
+      { id: "official-logo-alias", sha256: logoSha256, decision: "omit" },
+    ];
+    input.brandAsset = {
+      schemaVersion: 1,
+      assetId: "official-logo",
+      sha256: logoSha256,
+      mimeType: "image/png",
+      publicPath: "public/brand-logo.png",
+      sizeBytes: officialLogo.length,
+      width: 160,
+      height: 80,
+      bytes: officialLogo,
+    };
+
+    const built = await materializeAstroSite(input);
+    expect(built.contract.assets).toEqual([
+      { id: "official-logo", sha256: logoSha256, decision: "publish" },
+      { id: "official-logo-alias", sha256: logoSha256, decision: "omit" },
+    ]);
+  }, 90_000);
+
+  it("rejects publish and quarantine decisions for the same physical bytes at asset projection", async () => {
+    const input = buildInput();
+    const logoSha256 = H(officialLogo);
+    input.assetDecisions = [
+      { id: "official-logo", sha256: logoSha256, decision: "publish" },
+      {
+        id: "official-logo-conflict",
+        sha256: logoSha256,
+        decision: "quarantine",
+      },
+    ];
+    input.brandAsset = {
+      schemaVersion: 1,
+      assetId: "official-logo",
+      sha256: logoSha256,
+      mimeType: "image/png",
+      publicPath: "public/brand-logo.png",
+      sizeBytes: officialLogo.length,
+      width: 160,
+      height: 80,
+      bytes: officialLogo,
+    };
+
+    await expect(materializeAstroSite(input)).rejects.toMatchObject({
+      name: "SiteOpsMaterializationError",
+      phase: "asset_projection",
+      code: "SITEOPS_ASSET_DECISION_HASH_CONFLICT",
+      retryClass: "host_deterministic",
+      safeDetails: {
+        assetDecisionCount: 2,
+        publishedCount: 1,
+        omittedDuplicateCount: 0,
+        quarantineCount: 1,
+      },
+    });
+  });
+
+  it("keeps all provider/customer text in JSON data and renders syntax sentinels as inert text", async () => {
+    const sentinels = [
+      "{A}",
+      "{{x}}",
+      "${process.env.SECRET}",
+      "孤立 { 和 }",
+      "`反引号` ---",
+      "<script>alert(1)</script>",
+      "</section><img src=x onerror=alert(1)>",
+      '\"><script>alert(2)</script>',
+    ];
+    const payload = sentinels.join(" | ");
+    const sourceId = `source-${payload}`;
+    const input = buildInput();
+    input.snapshot.documents[1]!.id = sourceId;
+    (input.brief as any).contacts = [
+      {
+        kind: "address",
+        value: payload,
+        sourceDocumentIds: ["overview"],
+      },
+    ];
+    (input.brief as any).routes[0].sourceDocumentIds = ["overview", sourceId];
+    (input.brief as any).routes[1].sourceDocumentIds = [sourceId];
+    (input.brief as any).verifiedFacts[0].sourceDocumentIds = [
+      "overview",
+      sourceId,
+    ];
+    (input.generatedContent as any).routes[0].heading = payload;
+    (input.generatedContent as any).routes[0].summary = payload;
+    (input.generatedContent as any).routes[0].sections[0].heading = payload;
+    (input.generatedContent as any).routes[0].sections[0].paragraphs = [
+      payload,
+    ];
+    (input.generatedContent as any).routes[0].sections[0].sourceDocumentIds = [
+      sourceId,
+    ];
+    (input.generatedContent as any).routes[1].sections[0].sourceDocumentIds = [
+      sourceId,
+    ];
+
+    const built = await materializeAstroSite(input);
+    const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
+    const astroFiles = await Promise.all(
+      Object.values(source.files)
+        .filter((entry) => !entry.dir && entry.name.endsWith(".astro"))
+        .map((entry) => entry.async("string")),
+    );
+    for (const sentinel of sentinels) {
+      expect(astroFiles.join("\n")).not.toContain(sentinel);
+    }
+    const dataFiles = await Promise.all(
+      Object.values(source.files)
+        .filter(
+          (entry) =>
+            !entry.dir &&
+            entry.name.startsWith("src/data/") &&
+            entry.name.endsWith(".json"),
+        )
+        .map((entry) => entry.async("string")),
+    );
+    for (const sentinel of sentinels) {
+      expect(dataFiles.join("\n")).toContain(sentinel);
+    }
+    const dist = await JSZip.loadAsync(built.distZip, { checkCRC32: true });
+    const home = await dist.file("index.html")!.async("string");
+    const body = home.slice(home.indexOf("<body"));
+    expect(body).toContain("{A}");
+    expect(body).toContain("{{x}}");
+    expect(body).toContain("${process.env.SECRET}");
+    expect(body).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(body).not.toContain("<script>alert(1)</script>");
+    expect(body).not.toContain("<script>alert(2)</script>");
+    expect(body).not.toContain("<img src=x onerror=alert(1)>");
+  }, 90_000);
+
+  it("materializes semantic colors that satisfy every text/background contrast contract", async () => {
+    const input = buildInput();
+    (input.visual as any).taxonomy.palette = [
+      "#080808",
+      "#FFFFFF",
+      "#292929",
+      "#161616",
+    ];
+    (input.designSpec as any).colorRoles = {
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 1,
+      accentPaletteIndex: 2,
+    };
+    (input.designSpec as any).routeCompositions[0].slots[0].variant = "cta";
+    const built = await materializeAstroSite(input);
+    const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
+    const css = await source.file("public/styles.css")!.async("string");
+    const variables = Object.fromEntries(
+      [...css.matchAll(/--(ink|accent|canvas|muted):(#[A-Fa-f0-9]{6})/gu)].map(
+        (match) => [match[1], match[2]],
+      ),
+    ) as Record<"ink" | "accent" | "canvas" | "muted", string>;
+    expect(ratio(variables.ink, variables.canvas)).toBeGreaterThanOrEqual(7);
+    expect(ratio(variables.accent, variables.canvas)).toBeGreaterThanOrEqual(
+      4.5,
+    );
+    expect(ratio(variables.ink, variables.muted)).toBeGreaterThanOrEqual(4.5);
+    expect(css).toContain(".source-note{color:var(--ink)");
+    expect(css).toContain(
+      ".section--cta .source-note{color:var(--canvas)}",
+    );
+    expect(css).not.toMatch(/\.source-note\{[^}]*opacity/gu);
+  }, 90_000);
+
   it("fails closed when the browser QA runtime is unavailable", async () => {
     browserQaMocks.browserLaunch.mockRejectedValueOnce(
       new Error("TEST_BROWSER_QA_UNAVAILABLE"),
     );
-    await expect(materializeAstroSite(buildInput())).rejects.toThrow(
-      "TEST_BROWSER_QA_UNAVAILABLE",
-    );
+    try {
+      await materializeAstroSite(buildInput());
+      throw new Error("TEST_EXPECTED_MATERIALIZATION_REJECTION");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SiteOpsMaterializationError);
+      expect(error).toMatchObject({
+        phase: "browser_qa",
+        code: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+        retryClass: "host_transient",
+        safeDetails: {},
+      });
+    }
   }, 90_000);
 
   it("emits exact production discovery metadata without false hreflang", async () => {
@@ -452,6 +658,24 @@ describe("SiteOps controlled Astro runtime", () => {
       ),
     ).toBe(true);
   }, 90_000);
+
+  it("stops production materialization when the deployment signal is aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      materializeProductionSiteFromSource({
+        sourceZip: previewBuild.sourceZip,
+        expectedSourceSha256: previewBuild.sourceSha256,
+        canonicalOrigin: "https://www.xinghe.example",
+        target: "global_excluding_cn",
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({
+      phase: "input_validation",
+      code: "SITEOPS_MATERIALIZATION_ABORTED",
+      retryClass: "host_transient",
+    });
+  });
 
   it("rejects a source ZIP whose frozen official logo bytes were replaced", async () => {
     const source = await JSZip.loadAsync(previewBuild.sourceZip, {

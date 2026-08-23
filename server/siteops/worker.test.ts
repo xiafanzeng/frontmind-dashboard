@@ -4,6 +4,8 @@ import {
   domainFinancialTerminalProjection,
   exclusiveSiteOpsLiveHeadProjection,
   knownSiteOpsBuildFailure,
+  parseSiteOpsBuildArtifactBindings,
+  siteOpsBuildArtifactProjection,
   siteOpsWorkerMayClaimStatus,
   siteOpsWorkerExecutionPolicy,
   terminalSiteOpsOperationProjection,
@@ -53,6 +55,127 @@ describe("SiteOps financial terminal state", () => {
 });
 
 describe("SiteOps worker claim boundary", () => {
+  it("verifies all five tenant-owned artifact coordinates before atomic build binding", () => {
+    const ids = {
+      contract: "10000000-0000-4000-8000-000000000001",
+      source: "10000000-0000-4000-8000-000000000002",
+      dist: "10000000-0000-4000-8000-000000000003",
+      qa: "10000000-0000-4000-8000-000000000004",
+      provenance: "10000000-0000-4000-8000-000000000005",
+    } as const;
+    const mimeTypes = {
+      contract: "application/json",
+      source: "application/zip",
+      dist: "application/zip",
+      qa: "application/zip",
+      provenance: "application/json",
+    } as const;
+    const raw = Object.fromEntries(
+      Object.entries(ids).map(([kind, id], index) => [
+        kind,
+        {
+          id,
+          sha256: String(index + 1).repeat(64),
+          bytes: index + 10,
+          mimeType: mimeTypes[kind as keyof typeof mimeTypes],
+        },
+      ]),
+    );
+    const bindings = parseSiteOpsBuildArtifactBindings(raw);
+    const rows = Object.entries(bindings).map(([, binding]) => ({
+      id: binding.id,
+      scope: "managed_user",
+      accountUserId: 7,
+      presalesProjectId: null,
+      mimeType: binding.mimeType,
+      sizeBytes: binding.bytes,
+      contentSha256: binding.sha256,
+      storageKey: "",
+    }));
+    const projectId = "20000000-0000-4000-8000-000000000001";
+    const storageKinds = {
+      contract: "site-contract",
+      source: "site-source",
+      dist: "site-dist",
+      qa: "site-qa",
+      provenance: "site-provenance",
+    } as const;
+    for (const [kind, binding] of Object.entries(bindings)) {
+      rows.find((row) => row.id === binding.id)!.storageKey =
+        `siteops:${projectId}:${storageKinds[kind as keyof typeof storageKinds]}:${binding.id}`;
+    }
+    expect(
+      siteOpsBuildArtifactProjection({
+        bindings,
+        rows,
+        userId: 7,
+        projectId,
+      }),
+    ).toEqual({
+      contractLocalAssetId: ids.contract,
+      contractHash: "1".repeat(64),
+      sourceLocalAssetId: ids.source,
+      sourceHash: "2".repeat(64),
+      distLocalAssetId: ids.dist,
+      distHash: "3".repeat(64),
+      qaLocalAssetId: ids.qa,
+      provenanceLocalAssetId: ids.provenance,
+    });
+    expect(() =>
+      siteOpsBuildArtifactProjection({
+        bindings,
+        rows: rows.map((row, index) =>
+          index === 2 ? { ...row, accountUserId: 8 } : row,
+        ),
+        userId: 7,
+        projectId,
+      }),
+    ).toThrow("SITEOPS_BUILD_ARTIFACT_VERIFICATION_FAILED");
+  });
+
+  it("rejects missing, duplicate, extra, or wrong-MIME build artifact bindings", () => {
+    const binding = (id: string, mimeType: string) => ({
+      id,
+      sha256: "a".repeat(64),
+      bytes: 10,
+      mimeType,
+    });
+    const valid = {
+      contract: binding(
+        "10000000-0000-4000-8000-000000000001",
+        "application/json",
+      ),
+      source: binding(
+        "10000000-0000-4000-8000-000000000002",
+        "application/zip",
+      ),
+      dist: binding("10000000-0000-4000-8000-000000000003", "application/zip"),
+      qa: binding("10000000-0000-4000-8000-000000000004", "application/zip"),
+      provenance: binding(
+        "10000000-0000-4000-8000-000000000005",
+        "application/json",
+      ),
+    };
+    expect(() =>
+      parseSiteOpsBuildArtifactBindings({ ...valid, qa: undefined }),
+    ).toThrow("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+    expect(() =>
+      parseSiteOpsBuildArtifactBindings({
+        ...valid,
+        qa: { ...valid.qa, id: valid.dist.id },
+      }),
+    ).toThrow("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+    expect(() =>
+      parseSiteOpsBuildArtifactBindings({ ...valid, extra: valid.contract }),
+    ).toThrow("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+    expect(() =>
+      parseSiteOpsBuildArtifactBindings({
+        ...valid,
+        contract: { ...valid.contract, mimeType: "application/zip" },
+      }),
+    ).toThrow("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+  });
+
   it("gives Astro build and QA operations a lease longer than their handler timeout", () => {
     expect(siteOpsWorkerExecutionPolicy("site_build")).toEqual({
       timeoutMs: 10 * 60_000,

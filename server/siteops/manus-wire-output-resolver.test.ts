@@ -47,6 +47,18 @@ function rejected(timestamp = 2) {
   };
 }
 
+function rejectedWithoutValue(timestamp = 2) {
+  return {
+    id: `rejected-no-value-${timestamp}`,
+    type: "structured_output_result",
+    timestamp,
+    structured_output_result: {
+      success: false,
+      error: "structured extraction failed",
+    },
+  };
+}
+
 function assistant(
   input: { content?: unknown; attachments?: unknown[] },
   timestamp = 3,
@@ -81,6 +93,38 @@ function jsonResponse(value: unknown, headers: Record<string, string> = {}) {
 }
 
 describe("SiteOps wire output resolver", () => {
+  it("uses the strict attachment fallback after rejection without a value", async () => {
+    const value = {
+      operationToken: token,
+      schemaVersion: 2,
+      siteTitle: "可信",
+    };
+    const fetchPinned = vi.fn(async () => ({
+      response: jsonResponse(value),
+      finalUrl: new URL("https://files.example.test/result.json"),
+    }));
+    await expect(
+      resolveSiteOpsWireOutput({
+        events: [
+          marker(),
+          rejectedWithoutValue(),
+          assistant({
+            attachments: [
+              {
+                filename: SITEOPS_WIRE_OUTPUT_FILES.design,
+                content_type: "application/json",
+                url: "https://files.example.test/result.json",
+              },
+            ],
+          }),
+        ] as never,
+        operationToken: token,
+        taskCompleted: true,
+        fetchPinned: fetchPinned as never,
+      }),
+    ).resolves.toMatchObject({ value, source: "attachment" });
+  });
+
   it("waits for phase completion before accepting an explicit structured success", async () => {
     const fetchPinned = vi.fn();
     const value = {

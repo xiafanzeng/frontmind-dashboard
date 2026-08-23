@@ -34,6 +34,7 @@ import {
   SITEOPS_MATERIALIZER_V1_3,
   SITEOPS_MATERIALIZER_V1_4,
   SITEOPS_MATERIALIZER_V1_5,
+  SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
@@ -56,12 +57,26 @@ import {
   type FrozenSiteBrandAsset,
   type TrustedSiteBrandAsset,
 } from "./knowledge-brand-asset";
+import {
+  materializationStage,
+  SiteOpsMaterializationError,
+  toSiteOpsMaterializationError,
+  type SiteOpsMaterializationSafeDetails,
+} from "./materialization-error";
+
+export {
+  SiteOpsMaterializationError,
+  type SiteOpsMaterializationPhase,
+  type SiteOpsMaterializationRetryClass,
+  type SiteOpsMaterializationSafeDetails,
+} from "./materialization-error";
 
 type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V1_2
   | typeof SITEOPS_MATERIALIZER_V1_3
   | typeof SITEOPS_MATERIALIZER_V1_4
-  | typeof SITEOPS_MATERIALIZER_V1_5;
+  | typeof SITEOPS_MATERIALIZER_V1_5
+  | typeof SITEOPS_MATERIALIZER_V1_6;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
 const MAX_SOURCE_BYTES = 12 * 1024 * 1024;
@@ -244,6 +259,7 @@ export type MaterializeAstroSiteInput = {
   assetDecisions?: z.infer<typeof siteOpsAssetDecisionSchema>[];
   brandAsset?: TrustedSiteBrandAsset | null;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 };
 
 export type SiteOpsQaReport = {
@@ -312,6 +328,19 @@ function escapeXml(value: string) {
 function assertNoSensitiveText(label: string, value: string) {
   if (SENSITIVE_TEXT.test(value) || FORBIDDEN_DEMO_TEXT.test(value)) {
     throw new Error(`SITEOPS_SENSITIVE_OR_DEMO_TEXT_REJECTED:${label}`);
+  }
+}
+
+function assertNotAborted(
+  signal?: AbortSignal,
+  phase: "input_validation" | "astro_build" | "browser_qa" = "input_validation",
+) {
+  if (signal?.aborted) {
+    throw new SiteOpsMaterializationError({
+      phase,
+      code: "SITEOPS_MATERIALIZATION_ABORTED",
+      retryClass: "host_transient",
+    });
   }
 }
 
@@ -497,6 +526,38 @@ function validateInput(
   ) {
     throw new Error("SITEOPS_ASSET_DECISION_DUPLICATE");
   }
+  const decisionsByHash = new Map<
+    string,
+    Set<(typeof assetDecisions)[number]["decision"]>
+  >();
+  for (const decision of assetDecisions) {
+    const decisions = decisionsByHash.get(decision.sha256) ?? new Set();
+    decisions.add(decision.decision);
+    decisionsByHash.set(decision.sha256, decisions);
+  }
+  if (
+    [...decisionsByHash.values()].some(
+      (decisions) => decisions.has("publish") && decisions.has("quarantine"),
+    )
+  ) {
+    throw new SiteOpsMaterializationError({
+      phase: "asset_projection",
+      code: "SITEOPS_ASSET_DECISION_HASH_CONFLICT",
+      retryClass: "host_deterministic",
+      safeDetails: {
+        assetDecisionCount: assetDecisions.length,
+        publishedCount: assetDecisions.filter(
+          (item) => item.decision === "publish",
+        ).length,
+        omittedDuplicateCount: assetDecisions.filter(
+          (item) => item.decision === "omit",
+        ).length,
+        quarantineCount: assetDecisions.filter(
+          (item) => item.decision === "quarantine",
+        ).length,
+      },
+    });
+  }
   const publishedAssets = assetDecisions.filter(
     (item) => item.decision === "publish",
   );
@@ -604,16 +665,26 @@ function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteDesignSpecV1) {
   const canvasCandidate =
     colors[design.colorRoles.backgroundPaletteIndex] ?? "#F5F2EA";
   const inkCandidate = colors[design.colorRoles.textPaletteIndex] ?? "#10212B";
-  const accessiblePair =
-    contrastRatio(inkCandidate, canvasCandidate) >= 7
-      ? { canvas: canvasCandidate, ink: inkCandidate }
-      : { canvas: "#F5F2EA", ink: "#10212B" };
+  const accessiblePair = [
+    { canvas: canvasCandidate, ink: inkCandidate },
+    { canvas: "#F5F2EA", ink: "#10212B" },
+    { canvas: "#FFFFFF", ink: "#000000" },
+  ].find(({ canvas, ink }) => contrastRatio(ink, canvas) >= 7);
+  if (!accessiblePair) {
+    throw new Error("SITEOPS_ACCESSIBLE_COLOR_PAIR_UNAVAILABLE");
+  }
   const { canvas, ink } = accessiblePair;
   const accentCandidate =
     colors[design.colorRoles.accentPaletteIndex] ?? "#A33A1B";
-  const accent =
-    contrastRatio(accentCandidate, canvas) >= 4.5 ? accentCandidate : "#A33A1B";
-  const muted = colors[3] ?? "#DDE7E8";
+  const accent = [accentCandidate, ...colors, ink].find(
+    (candidate) => contrastRatio(candidate, canvas) >= 4.5,
+  );
+  const muted = [colors[3], ...colors, canvas]
+    .filter((candidate): candidate is string => Boolean(candidate))
+    .find((candidate) => contrastRatio(ink, candidate) >= 4.5);
+  if (!accent || !muted) {
+    throw new Error("SITEOPS_ACCESSIBLE_SEMANTIC_COLOR_UNAVAILABLE");
+  }
   const radius =
     design.surfaceStyle === "soft_depth" || design.surfaceStyle === "layered"
       ? "22px"
@@ -642,23 +713,12 @@ function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteDesignSpecV1) {
       : design.density === "spacious"
         ? "56px"
         : "40px";
-  return `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${design.motionLevel === "subtle" ? "smooth" : "auto"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:3}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid color-mix(in srgb,var(--ink) 30%,transparent);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:color-mix(in srgb,var(--canvas) 88%,white);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--ink)!important;color:var(--canvas);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;opacity:.62}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
+  return `:root{color-scheme:light;--ink:${ink};--accent:${accent};--canvas:${canvas};--muted:${muted};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${design.motionLevel === "subtle" ? "smooth" : "auto"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid color-mix(in srgb,var(--ink) 22%,transparent);background:color-mix(in srgb,var(--canvas) 94%,white);position:sticky;top:0;z-index:3}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid color-mix(in srgb,var(--ink) 30%,transparent);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:color-mix(in srgb,var(--canvas) 88%,white);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--ink)!important;color:var(--canvas);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{color:var(--ink);font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace}.section--cta .source-note{color:var(--canvas)}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--ink);color:var(--canvas);padding:56px 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid color-mix(in srgb,var(--ink) 22%,transparent);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
 }
 
-function renderLayoutSource(input: {
-  brief: SiteBrief;
-  routes: Array<{ slug: string; title: string }>;
-  designSpec: SiteDesignSpecV1;
-  mode: "preview" | "production";
-  canonicalOrigin: string | null;
-  brandAsset: FrozenSiteBrandAsset | null;
-}) {
-  const projection = siteDesignMaterializationProjection(input.designSpec);
-  const nav = input.routes.map((route) => ({
-    href: route.slug,
-    title: route.title,
-  }));
+function renderLayoutSource(input: { mode: "preview" | "production" }) {
   return `---
+import siteData from "../data/site.json";
 interface Props {
   title: string;
   description: string;
@@ -666,14 +726,16 @@ interface Props {
   jsonLd: Record<string, unknown> | null;
 }
 const { title, description, canonical, jsonLd } = Astro.props;
-const navigation = ${JSON.stringify(nav)};
-const companyName = ${JSON.stringify(input.brief.companyName)};
-const language = ${JSON.stringify(input.brief.primaryLanguage)};
-const socialImage = ${JSON.stringify(input.canonicalOrigin ? `${input.canonicalOrigin}/social-card.svg` : null)};
-const brandLogo = ${JSON.stringify(input.brandAsset ? `/${input.brandAsset.publicPath.slice("public/".length)}` : null)};
-const brandLogoWidth = ${JSON.stringify(input.brandAsset?.width ?? null)};
-const brandLogoHeight = ${JSON.stringify(input.brandAsset?.height ?? null)};
-const bodyClass = ${JSON.stringify(projection.bodyClass)};
+const {
+  navigation,
+  companyName,
+  language,
+  socialImage,
+  brandLogo,
+  brandLogoWidth,
+  brandLogoHeight,
+  bodyClass,
+} = siteData;
 // JSON-LD is raw script text, so JSON escaping alone is insufficient: a
 // customer/provider value containing </script> would otherwise close the
 // element in the HTML parser. Emit JSON-safe unicode escapes for every less-
@@ -722,72 +784,67 @@ const jsonLdText = jsonLd
 `;
 }
 
-function renderPageSource(input: {
-  sourcePath: string;
-  route: SiteBrief["routes"][number];
-  generated: z.infer<typeof generatedRouteSchema>;
-  composition: SiteDesignSpecV1["routeCompositions"][number];
-  designSpec: SiteDesignSpecV1;
-  brief: SiteBrief;
-  siteDescription: string;
-  organizationType: string;
-  canonical: string | null;
-}) {
-  const projection = siteDesignMaterializationProjection(input.designSpec);
+function renderPageSource(input: { sourcePath: string; dataPath: string }) {
   const sourceDir = path.posix.dirname(input.sourcePath);
   let layoutImport = path.posix.relative(
     sourceDir,
     "src/layouts/SiteLayout.astro",
   );
   if (!layoutImport.startsWith(".")) layoutImport = `./${layoutImport}`;
-  const jsonLd = input.canonical
-    ? {
-        "@context": "https://schema.org",
-        "@type": input.organizationType,
-        name: input.brief.companyName,
-        url: input.canonical,
-        description: input.siteDescription,
-      }
-    : null;
-  const variantBySlot = new Map(
-    input.composition.slots.map((slot) => [slot.slotId, slot.variant]),
+  let pageImport = path.posix.relative(sourceDir, input.dataPath);
+  if (!pageImport.startsWith(".")) pageImport = `./${pageImport}`;
+  let contentImport = path.posix.relative(
+    sourceDir,
+    "src/components/SitePage.astro",
   );
-  const sections = input.generated.sections
-    .map(
-      (
-        section,
-      ) => `<section class="section section--${variantBySlot.get(section.slotId)}" data-slot="${escapeHtml(section.slotId)}">
-        <h2>${escapeHtml(section.heading)}</h2>
-        ${section.paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("\n        ")}
-        <p class="source-note">知识来源：${section.sourceDocumentIds.map(escapeHtml).join("、")}</p>
-      </section>`,
-    )
-    .join("\n");
-  const contacts = input.brief.contacts
-    .map((contact) => {
-      const href = safeContactHref(contact.kind, contact.value);
-      const label = escapeHtml(contact.value);
-      return href
-        ? `<li><a href="${escapeHtml(href)}">${label}</a></li>`
-        : `<li>${label}</li>`;
-    })
-    .join("\n          ");
+  if (!contentImport.startsWith(".")) contentImport = `./${contentImport}`;
   return `---
 import SiteLayout from ${JSON.stringify(layoutImport)};
-const title = ${JSON.stringify(`${input.generated.heading} | ${input.brief.companyName}`)};
-const description = ${JSON.stringify(input.generated.summary)};
-const canonical = ${JSON.stringify(input.canonical)};
-const jsonLd = ${JSON.stringify(jsonLd)};
+import SitePage from ${JSON.stringify(contentImport)};
+import pageData from ${JSON.stringify(pageImport)};
+const { title, description, canonical, jsonLd } = pageData;
 ---
 <SiteLayout {title} {description} {canonical} {jsonLd}>
-  <section class="${projection.heroClass}"><div class="shell">
-    <p class="eyebrow">${escapeHtml(input.generated.eyebrow ?? input.brief.companyName)}</p>
-    <h1>${escapeHtml(input.generated.heading)}</h1>
-    <p class="lede">${escapeHtml(input.generated.summary)}</p>
-  </div></section>
-  <div class="shell facts">${sections}</div>
-  ${contacts ? `<section class="contact"><div class="shell"><h2>联系我们</h2><ul class="contact-list">${contacts}</ul></div></section>` : ""}
+  <SitePage data={pageData} />
 </SiteLayout>
+`;
+}
+
+function renderSitePageComponent() {
+  return `---
+interface PageData {
+  heroClass: string;
+  hero: { eyebrow: string; heading: string; summary: string };
+  sections: Array<{
+    slotId: string;
+    variant: string;
+    heading: string;
+    paragraphs: string[];
+    sourceDocumentIds: string[];
+  }>;
+  contacts: Array<{ href: string | null; label: string }>;
+}
+const { data } = Astro.props as { data: PageData };
+---
+<section class={data.heroClass}><div class="shell">
+  <p class="eyebrow">{data.hero.eyebrow}</p>
+  <h1>{data.hero.heading}</h1>
+  <p class="lede">{data.hero.summary}</p>
+</div></section>
+<div class="shell facts">
+  {data.sections.map((section) => (
+    <section class={"section section--" + section.variant} data-slot={section.slotId}>
+      <h2>{section.heading}</h2>
+      {section.paragraphs.map((paragraph) => <p>{paragraph}</p>)}
+      <p class="source-note">知识来源：{section.sourceDocumentIds.join("、")}</p>
+    </section>
+  ))}
+</div>
+{data.contacts.length > 0 && (
+  <section class="contact"><div class="shell"><h2>联系我们</h2><ul class="contact-list">
+    {data.contacts.map((contact) => <li>{contact.href ? <a href={contact.href}>{contact.label}</a> : contact.label}</li>)}
+  </ul></div></section>
+)}
 `;
 }
 
@@ -824,8 +881,9 @@ function buildTrustedSource(input: {
   workflow: SiteOpsMaterializerCoordinates;
 }) {
   const files: SourceFile[] = [];
-  const routePairs = input.brief.routes.map((route) => ({
+  const routePairs = input.brief.routes.map((route, index) => ({
     route,
+    index,
     generated: input.content.routes.find((item) => item.routeId === route.id)!,
   }));
   addTextFile(
@@ -873,37 +931,95 @@ function buildTrustedSource(input: {
     "frontmind-runtime-input.json",
     jsonBuffer(input.frozenRuntimeInput),
   );
+  const projection = siteDesignMaterializationProjection(input.designSpec);
+  const frozenBrandAsset = freezeSiteBrandAsset(input.brandAsset);
+  addTextFile(
+    files,
+    "src/data/site.json",
+    jsonBuffer({
+      navigation: input.brief.routes.map((route) => ({
+        href: route.slug,
+        title: route.title,
+      })),
+      companyName: input.brief.companyName,
+      language: input.brief.primaryLanguage,
+      socialImage: input.canonicalOrigin
+        ? `${input.canonicalOrigin}/social-card.svg`
+        : null,
+      brandLogo: frozenBrandAsset
+        ? `/${frozenBrandAsset.publicPath.slice("public/".length)}`
+        : null,
+      brandLogoWidth: frozenBrandAsset?.width ?? null,
+      brandLogoHeight: frozenBrandAsset?.height ?? null,
+      bodyClass: projection.bodyClass,
+    }),
+  );
   addTextFile(
     files,
     "src/layouts/SiteLayout.astro",
     renderLayoutSource({
-      brief: input.brief,
-      routes: input.brief.routes,
-      designSpec: input.designSpec,
       mode: input.mode,
-      canonicalOrigin: input.canonicalOrigin,
-      brandAsset: freezeSiteBrandAsset(input.brandAsset),
     }),
   );
-  for (const { route, generated } of routePairs) {
+  addTextFile(
+    files,
+    "src/components/SitePage.astro",
+    renderSitePageComponent(),
+  );
+  const contacts = input.brief.contacts.map((contact) => ({
+    href: safeContactHref(contact.kind, contact.value),
+    label: contact.value,
+  }));
+  for (const { route, generated, index } of routePairs) {
     const sourcePath = routeSourcePath(route.slug);
+    const dataPath = `src/data/route-${String(index + 1).padStart(3, "0")}.json`;
+    const canonical = input.canonicalOrigin
+      ? routeCanonical(input.canonicalOrigin, route.slug)
+      : null;
+    const composition = input.designSpec.routeCompositions.find(
+      (item) => item.routeId === route.id,
+    )!;
+    const variantBySlot = new Map(
+      composition.slots.map((slot) => [slot.slotId, slot.variant]),
+    );
+    addTextFile(
+      files,
+      dataPath,
+      jsonBuffer({
+        title: `${generated.heading} | ${input.brief.companyName}`,
+        description: generated.summary,
+        canonical,
+        jsonLd: canonical
+          ? {
+              "@context": "https://schema.org",
+              "@type": input.content.seo.organizationType,
+              name: input.brief.companyName,
+              url: canonical,
+              description: input.content.seo.description,
+            }
+          : null,
+        heroClass: projection.heroClass,
+        hero: {
+          eyebrow: generated.eyebrow ?? input.brief.companyName,
+          heading: generated.heading,
+          summary: generated.summary,
+        },
+        sections: generated.sections.map((section) => ({
+          slotId: section.slotId,
+          variant: variantBySlot.get(section.slotId),
+          heading: section.heading,
+          paragraphs: section.paragraphs,
+          sourceDocumentIds: section.sourceDocumentIds,
+        })),
+        contacts,
+      }),
+    );
     addTextFile(
       files,
       sourcePath,
       renderPageSource({
         sourcePath,
-        route,
-        generated,
-        composition: input.designSpec.routeCompositions.find(
-          (item) => item.routeId === route.id,
-        )!,
-        designSpec: input.designSpec,
-        brief: input.brief,
-        siteDescription: input.content.seo.description,
-        organizationType: input.content.seo.organizationType,
-        canonical: input.canonicalOrigin
-          ? routeCanonical(input.canonicalOrigin, route.slug)
-          : null,
+        dataPath,
       }),
     );
   }
@@ -917,8 +1033,18 @@ function buildTrustedSource(input: {
   );
   addTextFile(
     files,
+    "src/data/not-found.json",
+    jsonBuffer({
+      title: `页面未找到 | ${input.brief.companyName}`,
+      description: "请求的页面不存在。",
+      canonical: null,
+      jsonLd: null,
+    }),
+  );
+  addTextFile(
+    files,
     "src/pages/404.astro",
-    `---\nimport SiteLayout from "../layouts/SiteLayout.astro";\nconst title = ${JSON.stringify(`页面未找到 | ${input.brief.companyName}`)};\nconst description = "请求的页面不存在。";\nconst canonical = null;\nconst jsonLd = null;\n---\n<SiteLayout {title} {description} {canonical} {jsonLd}><section class="hero"><div class="shell"><p class="eyebrow">404</p><h1>页面未找到</h1><p class="lede"><a href="/">返回首页</a></p></div></section></SiteLayout>\n`,
+    `---\nimport SiteLayout from "../layouts/SiteLayout.astro";\nimport pageData from "../data/not-found.json";\nconst { title, description, canonical, jsonLd } = pageData;\n---\n<SiteLayout {title} {description} {canonical} {jsonLd}><section class="hero"><div class="shell"><p class="eyebrow">404</p><h1>页面未找到</h1><p class="lede"><a href="/">返回首页</a></p></div></section></SiteLayout>\n`,
   );
   addTextFile(
     files,
@@ -1064,7 +1190,12 @@ async function writeSourceRoot(root: string, files: readonly SourceFile[]) {
   }
 }
 
-async function runAstroBuild(root: string, timeoutMs: number) {
+async function runAstroBuild(
+  root: string,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+) {
+  assertNotAborted(abortSignal, "astro_build");
   const require = createRequire(import.meta.url);
   const astroPackage = require.resolve("astro/package.json");
   const astroPackageRoot = path.dirname(astroPackage);
@@ -1115,23 +1246,62 @@ async function runAstroBuild(root: string, timeoutMs: number) {
     };
     child.stdout.on("data", collect);
     child.stderr.on("data", collect);
-    const timer = setTimeout(() => child.kill("SIGKILL"), boundedTimeout);
+    const abort = () => child.kill("SIGKILL");
+    abortSignal?.addEventListener("abort", abort, { once: true });
+    const cleanup = () => abortSignal?.removeEventListener("abort", abort);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, boundedTimeout);
     child.once("error", (error) => {
       clearTimeout(timer);
-      reject(error);
+      cleanup();
+      reject(
+        toSiteOpsMaterializationError({
+          error,
+          phase: "astro_build",
+          fallbackCode: "SITEOPS_ASTRO_RUNTIME_UNAVAILABLE",
+          retryClass: "host_transient",
+        }),
+      );
     });
     child.once("exit", (code, signal) => {
       clearTimeout(timer);
+      cleanup();
+      if (abortSignal?.aborted) {
+        return reject(
+          new SiteOpsMaterializationError({
+            phase: "astro_build",
+            code: "SITEOPS_MATERIALIZATION_ABORTED",
+            retryClass: "host_transient",
+          }),
+        );
+      }
+      if (timedOut) {
+        return reject(
+          new SiteOpsMaterializationError({
+            phase: "astro_build",
+            code: "SITEOPS_ASTRO_BUILD_TIMEOUT",
+            retryClass: "host_transient",
+            safeDetails: { timeoutMs: boundedTimeout },
+          }),
+        );
+      }
       const log = Buffer.concat(chunks, Math.min(bytes, MAX_BUILD_LOG_BYTES));
       if (overflow)
         return reject(new Error("SITEOPS_BUILD_LOG_LIMIT_EXCEEDED"));
       if (code !== 0) {
-        const suffix = log
-          .toString("utf8")
-          .slice(-2_000)
-          .replace(SENSITIVE_TEXT, "[redacted]");
         return reject(
-          new Error(`SITEOPS_ASTRO_BUILD_FAILED:${signal ?? code}:${suffix}`),
+          new SiteOpsMaterializationError({
+            phase: "astro_build",
+            code: "SITEOPS_ASTRO_BUILD_FAILED",
+            retryClass: "host_deterministic",
+            safeDetails: {
+              exitCode: code,
+              signal: signal ?? null,
+            },
+          }),
         );
       }
       resolve(log);
@@ -1209,7 +1379,9 @@ async function runBrowserQa(input: {
   routes: SiteBrief["routes"];
   mode: "preview" | "production";
   workRoot: string;
+  abortSignal?: AbortSignal;
 }) {
+  assertNotAborted(input.abortSignal, "browser_qa");
   const files = new Map(input.files.map((file) => [file.path, file.bytes]));
   const server = createServer((request, response) => {
     try {
@@ -1281,7 +1453,12 @@ async function runBrowserQa(input: {
     })
     .catch(async (error) => {
       await closeServer();
-      throw error;
+      throw toSiteOpsMaterializationError({
+        error,
+        phase: "browser_qa",
+        fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+        retryClass: "host_transient",
+      });
     });
   try {
     const context = await browser.newContext({
@@ -1292,6 +1469,7 @@ async function runBrowserQa(input: {
     const page = await context.newPage();
     const inspectedRoutes = input.routes.slice(0, 3);
     for (const route of inspectedRoutes) {
+      assertNotAborted(input.abortSignal, "browser_qa");
       const routeUrl = `${origin}${route.slug}`;
       const response = await page.goto(routeUrl, {
         waitUntil: "networkidle",
@@ -1330,6 +1508,7 @@ async function runBrowserQa(input: {
   }
 
   const chromeRoot = path.join(input.workRoot, "chrome");
+  assertNotAborted(input.abortSignal, "browser_qa");
   await mkdir(chromeRoot, { recursive: true, mode: 0o700 });
   const chromeProfile = path.join(chromeRoot, "profile");
   await mkdir(chromeProfile, { recursive: false, mode: 0o700 });
@@ -1357,9 +1536,23 @@ async function runBrowserQa(input: {
     },
   }).catch(async (error) => {
     await closeServer();
-    throw error;
+    throw toSiteOpsMaterializationError({
+      error,
+      phase: "lighthouse",
+      fallbackCode: "SITEOPS_LIGHTHOUSE_RUNTIME_UNAVAILABLE",
+      retryClass: "host_transient",
+    });
   });
+  const abortChrome = () => {
+    try {
+      launched.kill();
+    } catch {
+      // Chrome may have already stopped.
+    }
+  };
+  input.abortSignal?.addEventListener("abort", abortChrome, { once: true });
   try {
+    assertNotAborted(input.abortSignal, "browser_qa");
     const result = await lighthouse(
       `${origin}/`,
       {
@@ -1376,7 +1569,13 @@ async function runBrowserQa(input: {
       },
       undefined,
     );
-    if (!result?.lhr) throw new Error("SITEOPS_LIGHTHOUSE_NO_RESULT");
+    if (!result?.lhr) {
+      throw new SiteOpsMaterializationError({
+        phase: "lighthouse",
+        code: "SITEOPS_LIGHTHOUSE_NO_RESULT",
+        retryClass: "host_transient",
+      });
+    }
     const score = (category: string) =>
       Math.round((result.lhr.categories[category]?.score ?? 0) * 100);
     const lighthouseScores = {
@@ -1388,23 +1587,30 @@ async function runBrowserQa(input: {
         result.lhr.audits["cumulative-layout-shift"]?.numericValue ?? 1,
       ),
     };
-    if (
+    const lighthouseFailed =
       lighthouseScores.performance < 85 ||
       lighthouseScores.accessibility < 95 ||
       lighthouseScores.bestPractices < 90 ||
       lighthouseScores.seo < 95 ||
-      lighthouseScores.cls >= 0.1
-    ) {
-      const failedAudits = Object.entries(result.lhr.audits)
-        .filter(([, audit]) => audit.score !== null && audit.score < 1)
-        .map(([id, audit]) => `${id}:${audit.score}`)
-        .slice(0, 30);
-      throw new Error(
-        `SITEOPS_LIGHTHOUSE_THRESHOLD_FAILED:${JSON.stringify(lighthouseScores)}:${failedAudits.join(",")}`,
-      );
-    }
-    if (axeViolationCount > 0) {
-      throw new Error(`SITEOPS_AXE_BLOCKING_VIOLATIONS:${axeViolationCount}`);
+      lighthouseScores.cls >= 0.1;
+    const failedAuditIds = Object.entries(result.lhr.audits)
+      .filter(([, audit]) => audit.score !== null && audit.score < 1)
+      .map(([id]) => id)
+      .slice(0, 30);
+    if (lighthouseFailed || axeViolationCount > 0) {
+      const safeDetails: SiteOpsMaterializationSafeDetails = {
+        ...lighthouseScores,
+        axeViolationCount,
+        failedAuditIds: failedAuditIds.join(","),
+      };
+      throw new SiteOpsMaterializationError({
+        phase: lighthouseFailed ? "lighthouse" : "browser_qa",
+        code: lighthouseFailed
+          ? "SITEOPS_LIGHTHOUSE_THRESHOLD_FAILED"
+          : "SITEOPS_AXE_BLOCKING_VIOLATIONS",
+        retryClass: "host_deterministic",
+        safeDetails,
+      });
     }
     return {
       summary: {
@@ -1415,6 +1621,7 @@ async function runBrowserQa(input: {
       screenshotFiles,
     };
   } finally {
+    input.abortSignal?.removeEventListener("abort", abortChrome);
     try {
       launched.kill();
     } catch {
@@ -1432,6 +1639,35 @@ function htmlText(html: string) {
     .replace(/&(?:amp|lt|gt|quot|#39);/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
+}
+
+function hasExecutableScriptTag(html: string) {
+  for (let index = 0; index < html.length; index += 1) {
+    if (html[index] !== "<") continue;
+    let quote: '"' | "'" | null = null;
+    let end = index + 1;
+    for (; end < html.length; end += 1) {
+      const character = html[end]!;
+      if (quote) {
+        if (character === quote) quote = null;
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+        continue;
+      }
+      if (character === ">") break;
+    }
+    if (end >= html.length) return true;
+    const tag = html.slice(index, end + 1);
+    index = end;
+    if (!/^<script\b/iu.test(tag)) continue;
+    if (/\bsrc\s*=/iu.test(tag)) return true;
+    if (!/\btype\s*=\s*["']application\/ld\+json["']/iu.test(tag)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function qaDist(input: {
@@ -1516,8 +1752,7 @@ function qaDist(input: {
     );
     requireCheck(
       `no-executable-script:${name}`,
-      !/<script\b(?![^>]*type=["']application\/ld\+json["'])/iu.test(html) &&
-        !/<script\b[^>]*\bsrc=/iu.test(html),
+      !hasExecutableScriptTag(html),
       "no executable or external script is present",
     );
     requireCheck(
@@ -1647,152 +1882,247 @@ async function materializeAstroSiteWithWorkflow(
   input: MaterializeAstroSiteInput,
   workflow: SiteOpsMaterializerCoordinates,
 ): Promise<MaterializedAstroSite> {
-  const brandAsset = input.brandAsset
-    ? await validateTrustedSiteBrandAsset(input.brandAsset)
-    : null;
-  const validated = validateInput(input, brandAsset, workflow);
-  const contract = composeBuildContractV2({
-    schemaVersion: 2,
-    source: {
-      knowledgeSnapshotId: input.snapshot.id,
-      archiveSha256: input.build.knowledgeArchiveHash,
-      sourceBuildId: input.snapshot.sourceBuildId,
-      sourceBuildRevision: input.snapshot.sourceBuildRevision,
-    },
-    workflow: {
-      upstreamSha256: workflow.upstreamSha256,
-      version: workflow.frontMindVersion,
-      manifestSha256: workflow.runtimeManifestSha256,
-      starterVersion: workflow.starterVersion,
-      starterSha256: workflow.starterSha256,
-      componentLibraryVersion: workflow.componentLibraryVersion,
-      materializerVersion: workflow.materializerVersion,
-      materializerSha256: workflow.materializerSha256,
-    },
-    identity: {
-      companyName: validated.brief.companyName,
-      primaryLanguage: validated.brief.primaryLanguage,
-      verifiedContacts: validated.brief.contacts.map(
-        (contact) => `${contact.kind}:${contact.value}`,
-      ),
-    },
-    visual: {
-      ...validated.visual,
-      designSpecHash: canonicalSiteOpsSha256(validated.designSpec),
-      componentLibraryVersion: workflow.componentLibraryVersion,
-    },
-    routes: validated.brief.routes,
-    assets: validated.assetDecisions,
-    seo: {
-      ...validated.designSpec.seoPlan,
-      environment: input.mode,
-      canonicalPolicy:
-        input.mode === "preview" ? "forbidden" : "exact_https_origin",
-    },
-    target: {
-      environment:
-        input.mode === "preview"
-          ? "preview"
-          : (input.target ?? "global_excluding_cn"),
-      canonicalOrigin: validated.canonicalOrigin,
-    },
-    qaPolicyVersion: workflow.qaPolicyVersion,
+  assertNotAborted(input.abortSignal);
+  const brandAsset = await materializationStage({
+    phase: "input_validation",
+    fallbackCode: "SITEOPS_BRAND_ASSET_INVALID",
+    retryClass: "host_deterministic",
+    run: async () =>
+      input.brandAsset
+        ? await validateTrustedSiteBrandAsset(input.brandAsset)
+        : null,
   });
-  const frozenRuntimeInput = siteOpsFrozenRuntimeInputSchema.parse({
-    schemaVersion: 2,
-    build: {
-      id: input.build.id,
-      projectId: input.build.projectId,
-      userId: input.build.userId,
-      knowledgeSnapshotId: input.build.knowledgeSnapshotId,
-      knowledgeArchiveHash: input.build.knowledgeArchiveHash,
-      workflowUpstreamVersion: input.build.workflowUpstreamVersion,
-      workflowUpstreamHash: input.build.workflowUpstreamHash,
-      workflowVersion: input.build.workflowVersion,
-      workflowPackageHash: input.build.workflowPackageHash,
-      starterVersion: input.build.starterVersion,
-      selectionHash: input.build.selectionHash,
-    },
-    host: {
-      starterSha256: workflow.starterSha256,
-      componentLibraryVersion: workflow.componentLibraryVersion,
-      materializerVersion: workflow.materializerVersion,
-      materializerSha256: workflow.materializerSha256,
-    },
-    snapshot: {
-      id: input.snapshot.id,
-      userId: input.snapshot.userId,
-      archiveHash: input.snapshot.archiveHash,
-      sourceBuildId: input.snapshot.sourceBuildId,
-      sourceBuildRevision: input.snapshot.sourceBuildRevision,
-      sourceDocumentIds: [...validated.sourceDocuments.keys()].sort(),
-    },
-    brief: validated.brief,
-    visual: validated.visual,
-    designSpec: validated.designSpec,
-    generatedContent: validated.generatedContent,
-    assetDecisions: validated.assetDecisions,
-    brandAsset: freezeSiteBrandAsset(validated.brandAsset),
+  const validated = await materializationStage({
+    phase: "input_validation",
+    fallbackCode: "SITEOPS_MATERIALIZATION_INPUT_INVALID",
+    retryClass: "host_deterministic",
+    run: () => validateInput(input, brandAsset, workflow),
+  });
+  const contract = await materializationStage({
+    phase: "source_generation",
+    fallbackCode: "SITEOPS_BUILD_CONTRACT_GENERATION_FAILED",
+    retryClass: "host_deterministic",
+    run: () =>
+      composeBuildContractV2({
+        schemaVersion: 2,
+        source: {
+          knowledgeSnapshotId: input.snapshot.id,
+          archiveSha256: input.build.knowledgeArchiveHash,
+          sourceBuildId: input.snapshot.sourceBuildId,
+          sourceBuildRevision: input.snapshot.sourceBuildRevision,
+        },
+        workflow: {
+          upstreamSha256: workflow.upstreamSha256,
+          version: workflow.frontMindVersion,
+          manifestSha256: workflow.runtimeManifestSha256,
+          starterVersion: workflow.starterVersion,
+          starterSha256: workflow.starterSha256,
+          componentLibraryVersion: workflow.componentLibraryVersion,
+          materializerVersion: workflow.materializerVersion,
+          materializerSha256: workflow.materializerSha256,
+        },
+        identity: {
+          companyName: validated.brief.companyName,
+          primaryLanguage: validated.brief.primaryLanguage,
+          verifiedContacts: validated.brief.contacts.map(
+            (contact) => `${contact.kind}:${contact.value}`,
+          ),
+        },
+        visual: {
+          ...validated.visual,
+          designSpecHash: canonicalSiteOpsSha256(validated.designSpec),
+          componentLibraryVersion: workflow.componentLibraryVersion,
+        },
+        routes: validated.brief.routes,
+        assets: validated.assetDecisions,
+        seo: {
+          ...validated.designSpec.seoPlan,
+          environment: input.mode,
+          canonicalPolicy:
+            input.mode === "preview" ? "forbidden" : "exact_https_origin",
+        },
+        target: {
+          environment:
+            input.mode === "preview"
+              ? "preview"
+              : (input.target ?? "global_excluding_cn"),
+          canonicalOrigin: validated.canonicalOrigin,
+        },
+        qaPolicyVersion: workflow.qaPolicyVersion,
+      }),
+  });
+  const frozenRuntimeInput = await materializationStage({
+    phase: "source_generation",
+    fallbackCode: "SITEOPS_FROZEN_RUNTIME_INPUT_INVALID",
+    retryClass: "host_deterministic",
+    run: () =>
+      siteOpsFrozenRuntimeInputSchema.parse({
+        schemaVersion: 2,
+        build: {
+          id: input.build.id,
+          projectId: input.build.projectId,
+          userId: input.build.userId,
+          knowledgeSnapshotId: input.build.knowledgeSnapshotId,
+          knowledgeArchiveHash: input.build.knowledgeArchiveHash,
+          workflowUpstreamVersion: input.build.workflowUpstreamVersion,
+          workflowUpstreamHash: input.build.workflowUpstreamHash,
+          workflowVersion: input.build.workflowVersion,
+          workflowPackageHash: input.build.workflowPackageHash,
+          starterVersion: input.build.starterVersion,
+          selectionHash: input.build.selectionHash,
+        },
+        host: {
+          starterSha256: workflow.starterSha256,
+          componentLibraryVersion: workflow.componentLibraryVersion,
+          materializerVersion: workflow.materializerVersion,
+          materializerSha256: workflow.materializerSha256,
+        },
+        snapshot: {
+          id: input.snapshot.id,
+          userId: input.snapshot.userId,
+          archiveHash: input.snapshot.archiveHash,
+          sourceBuildId: input.snapshot.sourceBuildId,
+          sourceBuildRevision: input.snapshot.sourceBuildRevision,
+          sourceDocumentIds: [...validated.sourceDocuments.keys()].sort(),
+        },
+        brief: validated.brief,
+        visual: validated.visual,
+        designSpec: validated.designSpec,
+        generatedContent: validated.generatedContent,
+        assetDecisions: validated.assetDecisions,
+        brandAsset: freezeSiteBrandAsset(validated.brandAsset),
+      }),
   });
   const contractJson = jsonBuffer(contract);
-  const sourceFiles = buildTrustedSource({
-    contract,
-    frozenRuntimeInput,
-    brief: validated.brief,
-    visual: validated.visual,
-    designSpec: validated.designSpec,
-    content: validated.generatedContent,
-    canonicalOrigin: validated.canonicalOrigin,
-    mode: input.mode,
-    brandAsset: validated.brandAsset,
-    workflow,
+  const sourceFiles = await materializationStage({
+    phase: "source_generation",
+    fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
+    retryClass: "host_deterministic",
+    run: () =>
+      buildTrustedSource({
+        contract,
+        frozenRuntimeInput,
+        brief: validated.brief,
+        visual: validated.visual,
+        designSpec: validated.designSpec,
+        content: validated.generatedContent,
+        canonicalOrigin: validated.canonicalOrigin,
+        mode: input.mode,
+        brandAsset: validated.brandAsset,
+        workflow,
+      }),
   });
-  assertTrustedSourceAssetIsolation({
-    files: sourceFiles,
-    assetDecisions: validated.assetDecisions,
-    brandAsset: validated.brandAsset,
+  await materializationStage({
+    phase: "asset_projection",
+    fallbackCode: "SITEOPS_SOURCE_ASSET_ISOLATION_FAILED",
+    retryClass: "host_deterministic",
+    safeDetails: {
+      assetDecisionCount: validated.assetDecisions.length,
+      publishedCount: validated.assetDecisions.filter(
+        (item) => item.decision === "publish",
+      ).length,
+      omittedDuplicateCount: validated.assetDecisions.filter(
+        (item) => item.decision === "omit",
+      ).length,
+      quarantineCount: validated.assetDecisions.filter(
+        (item) => item.decision === "quarantine",
+      ).length,
+    },
+    run: () =>
+      assertTrustedSourceAssetIsolation({
+        files: sourceFiles,
+        assetDecisions: validated.assetDecisions,
+        brandAsset: validated.brandAsset,
+      }),
   });
-  const sourceZip = await deterministicZip(sourceFiles, MAX_SOURCE_BYTES);
+  const sourceZip = await materializationStage({
+    phase: "source_generation",
+    fallbackCode: "SITEOPS_SOURCE_PACKAGING_FAILED",
+    retryClass: "host_deterministic",
+    run: () => deterministicZip(sourceFiles, MAX_SOURCE_BYTES),
+  });
   const nonce = randomBytes(8).toString("hex");
   const buildRoot = await mkdtemp(
     path.join(tmpdir(), `frontmind-siteops-${input.build.id}-${nonce}-`),
   );
   try {
-    await writeSourceRoot(buildRoot, sourceFiles);
-    const buildLog = await runAstroBuild(
-      buildRoot,
-      input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
-    );
-    const distRoot = path.join(buildRoot, "dist");
-    const distFiles = await collectDirectory(distRoot);
-    const staticQa = qaDist({
-      files: distFiles,
-      brief: validated.brief,
-      mode: input.mode,
-      canonicalOrigin: validated.canonicalOrigin,
-      assetDecisions: validated.assetDecisions,
-      brandAsset: freezeSiteBrandAsset(validated.brandAsset),
-      qaPolicyVersion: workflow.qaPolicyVersion,
+    await materializationStage({
+      phase: "source_generation",
+      fallbackCode: "SITEOPS_SOURCE_WRITE_FAILED",
+      retryClass: "host_deterministic",
+      run: () => writeSourceRoot(buildRoot, sourceFiles),
     });
-    const browserQa = await runBrowserQa({
-      files: distFiles,
-      routes: validated.brief.routes,
-      mode: input.mode,
-      workRoot: buildRoot,
+    const buildLog = await materializationStage({
+      phase: "astro_build",
+      fallbackCode: "SITEOPS_ASTRO_BUILD_FAILED",
+      retryClass: "host_deterministic",
+      run: () =>
+        runAstroBuild(
+          buildRoot,
+          input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
+          input.abortSignal,
+        ),
+    });
+    const distRoot = path.join(buildRoot, "dist");
+    const distFiles = await materializationStage({
+      phase: "astro_build",
+      fallbackCode: "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
+      retryClass: "host_deterministic",
+      run: () => collectDirectory(distRoot),
+    });
+    const staticQa = await materializationStage({
+      phase: "static_qa",
+      fallbackCode: "SITEOPS_STATIC_QA_FAILED",
+      retryClass: "host_deterministic",
+      run: () =>
+        qaDist({
+          files: distFiles,
+          brief: validated.brief,
+          mode: input.mode,
+          canonicalOrigin: validated.canonicalOrigin,
+          assetDecisions: validated.assetDecisions,
+          brandAsset: freezeSiteBrandAsset(validated.brandAsset),
+          qaPolicyVersion: workflow.qaPolicyVersion,
+        }),
+    });
+    const browserQa = await materializationStage({
+      phase: "browser_qa",
+      fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+      retryClass: "host_transient",
+      run: () =>
+        runBrowserQa({
+          files: distFiles,
+          routes: validated.brief.routes,
+          mode: input.mode,
+          workRoot: buildRoot,
+          abortSignal: input.abortSignal,
+        }),
     });
     const qa: SiteOpsQaReport = {
       ...staticQa,
       browser: browserQa.summary,
     };
-    const distZip = await deterministicZip(distFiles, MAX_DIST_BYTES);
-    const qaJson = jsonBuffer(qa);
-    const visualQaZip = await deterministicZip(
-      [
-        { path: "visual-qa/report.json", bytes: qaJson },
-        ...browserQa.screenshotFiles,
-      ],
-      MAX_DIST_BYTES,
-    );
+    const { distZip, qaJson, visualQaZip } = await materializationStage({
+      phase: "qa_packaging",
+      fallbackCode: "SITEOPS_QA_PACKAGING_FAILED",
+      retryClass: "host_deterministic",
+      run: async () => {
+        const packagedDist = await deterministicZip(distFiles, MAX_DIST_BYTES);
+        const packagedQa = jsonBuffer(qa);
+        const packagedVisualQa = await deterministicZip(
+          [
+            { path: "visual-qa/report.json", bytes: packagedQa },
+            ...browserQa.screenshotFiles,
+          ],
+          MAX_DIST_BYTES,
+        );
+        return {
+          distZip: packagedDist,
+          qaJson: packagedQa,
+          visualQaZip: packagedVisualQa,
+        };
+      },
+    });
     const provenance = {
       schemaVersion: 1,
       buildId: input.build.id,
@@ -1872,6 +2202,10 @@ function materializeAstroSiteV1_5(input: MaterializeAstroSiteInput) {
   return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_5);
 }
 
+function materializeAstroSiteV1_6(input: MaterializeAstroSiteInput) {
+  return materializeAstroSiteWithWorkflow(input, SITEOPS_MATERIALIZER_V1_6);
+}
+
 const productionMaterializerRegistry = [
   {
     workflow: SITEOPS_MATERIALIZER_V1_2,
@@ -1889,6 +2223,10 @@ const productionMaterializerRegistry = [
     workflow: SITEOPS_MATERIALIZER_V1_5,
     materialize: materializeAstroSiteV1_5,
   },
+  {
+    workflow: SITEOPS_MATERIALIZER_V1_6,
+    materialize: materializeAstroSiteV1_6,
+  },
 ] as const;
 
 /**
@@ -1902,7 +2240,9 @@ export async function materializeProductionSiteFromSource(input: {
   canonicalOrigin: string;
   target: "global_excluding_cn" | "mainland_cn";
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 }) {
+  assertNotAborted(input.abortSignal);
   if (
     input.sourceZip.length < 1 ||
     input.sourceZip.length > MAX_SOURCE_BYTES ||
@@ -2021,6 +2361,7 @@ export async function materializeProductionSiteFromSource(input: {
     target: input.target,
     canonicalOrigin,
     timeoutMs: input.timeoutMs,
+    abortSignal: input.abortSignal,
   });
   return {
     contractJson: materialized.contractJson,

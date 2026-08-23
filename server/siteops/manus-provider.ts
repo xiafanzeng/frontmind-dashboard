@@ -60,6 +60,13 @@ import {
   siteOpsGeneratedContentSchema,
   socialPackageInputSchema,
 } from "./build-runtime";
+import {
+  SiteOpsMaterializationError,
+  toSiteOpsMaterializationError,
+  type SiteOpsMaterializationPhase,
+  type SiteOpsMaterializationRetryClass,
+  type SiteOpsMaterializationSafeDetails,
+} from "./materialization-error";
 import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
 import {
   registerSiteOpsProviderHandler,
@@ -84,6 +91,9 @@ import {
   SiteOpsWireOutputResolutionError,
   type SiteOpsWireOutputPhase,
 } from "./manus-wire-output-resolver";
+import { terminalTaskState } from "./task-terminal-state";
+
+export { terminalTaskState } from "./task-terminal-state";
 
 const operationInputSchema = z
   .object({
@@ -148,9 +158,135 @@ class SiteOpsManusFailure extends Error {
     readonly code: string,
     message: string,
     readonly status: "failed" | "attention_required" = "attention_required",
+    readonly result?: Record<string, unknown>,
   ) {
     super(message);
   }
+}
+
+const SAFE_MATERIALIZATION_DETAIL_KEY =
+  /^(?:durationMs|assetDecisionCount|publishedCount|omittedCount|omittedDuplicateCount|quarantineCount|exitCode|signal|performance|accessibility|bestPractices|seo|cls|axeViolationCount|failedAuditIds|localRetryCount)$/u;
+
+function untypedMaterializationCode(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    message.match(/^SITEOPS_[A-Z0-9_]+/u)?.[0] ??
+    "SITEOPS_HOST_MATERIALIZATION_FAILED"
+  );
+}
+
+export function classifySiteOpsMaterializationFailure(
+  error: unknown,
+): SiteOpsMaterializationError {
+  if (error instanceof SiteOpsMaterializationError) return error;
+  const code = untypedMaterializationCode(error);
+  let phase: SiteOpsMaterializationPhase = "source_generation";
+  let retryClass: SiteOpsMaterializationRetryClass = "host_deterministic";
+  if (/(?:ASSET|QUARANTIN)/u.test(code)) phase = "asset_projection";
+  else if (/ASTRO_BUILD/u.test(code)) phase = "astro_build";
+  else if (/LIGHTHOUSE/u.test(code)) phase = "lighthouse";
+  else if (/AXE|BROWSER|PLAYWRIGHT/u.test(code)) phase = "browser_qa";
+  else if (/QA_PACKAG|ARCHIVE|ARTIFACT_HASH/u.test(code)) {
+    phase = "qa_packaging";
+  } else if (/_QA_|QA_FAILED/u.test(code)) phase = "static_qa";
+  if (/(?:GENERATED_|CONTENT_|SENSITIVE_OR_DEMO_TEXT)/u.test(code)) {
+    retryClass = "content_repair";
+  } else if (
+    /(?:BROWSER_LAUNCH|CHROME|ECONNREFUSED|ETIMEDOUT|LIGHTHOUSE_NO_RESULT)/u.test(
+      `${code}:${error instanceof Error ? error.message : ""}`,
+    )
+  ) {
+    retryClass = "host_transient";
+  }
+  return toSiteOpsMaterializationError({
+    error,
+    phase,
+    fallbackCode: code,
+    retryClass,
+  });
+}
+
+function safeMaterializationDetails(
+  error: SiteOpsMaterializationError,
+  base: SiteOpsMaterializationSafeDetails,
+) {
+  const details: SiteOpsMaterializationSafeDetails = { ...base };
+  for (const [key, value] of Object.entries(error.safeDetails)) {
+    if (!SAFE_MATERIALIZATION_DETAIL_KEY.test(key)) continue;
+    if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      details[key] = typeof value === "string" ? value.slice(0, 512) : value;
+    }
+  }
+  return details;
+}
+
+export async function materializeWithSingleHostRetry<T>(input: {
+  run: () => Promise<T>;
+  signal: AbortSignal;
+}) {
+  let localRetryCount = 0;
+  while (true) {
+    input.signal.throwIfAborted();
+    try {
+      return {
+        value: await input.run(),
+        localRetryCount,
+      };
+    } catch (error) {
+      input.signal.throwIfAborted();
+      const classified = classifySiteOpsMaterializationFailure(error);
+      if (classified.retryClass !== "host_transient" || localRetryCount >= 1) {
+        throw classified;
+      }
+      localRetryCount += 1;
+    }
+  }
+}
+
+function publicMaterializationFailure(
+  error: SiteOpsMaterializationError,
+  taskId: string,
+  diagnostics: Record<string, unknown>,
+): SiteOpsProviderResult {
+  if (error.retryClass === "host_transient") {
+    return {
+      status: "failed",
+      code: "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE",
+      message: "FrontMind AI 建站运行环境暂时不可用，请稍后重试或重置流程。",
+      providerTaskId: taskId,
+      result: diagnostics,
+    };
+  }
+  if (error.phase === "asset_projection") {
+    return {
+      status: "failed",
+      code: "FRONTMIND_BUILD_ASSET_CONFLICT",
+      message: "FrontMind AI 建站检测到知识资产冲突，请重置后重新开始。",
+      providerTaskId: taskId,
+      result: diagnostics,
+    };
+  }
+  if (error.phase === "astro_build") {
+    return {
+      status: "failed",
+      code: "FRONTMIND_BUILD_COMPILE_FAILED",
+      message: "FrontMind AI 建站未能完成可信网站编译，请重置后重新开始。",
+      providerTaskId: taskId,
+      result: diagnostics,
+    };
+  }
+  return {
+    status: "failed",
+    code: "FRONTMIND_BUILD_QA_FAILED",
+    message: "FrontMind AI 建站未通过网站质量检查，请重置后重新开始。",
+    providerTaskId: taskId,
+    result: diagnostics,
+  };
 }
 
 function sha256(value: Buffer | string) {
@@ -686,23 +822,6 @@ function acceptedSocialStructuredValue(
   return null;
 }
 
-export function terminalTaskState(value: string | null | undefined) {
-  const normalized = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  return {
-    completed: [
-      "stopped",
-      "completed",
-      "complete",
-      "finished",
-      "done",
-      "success",
-    ].includes(normalized),
-    failed: ["failed", "error", "cancelled", "canceled"].includes(normalized),
-  };
-}
-
 export function combinedTerminalTaskState(
   eventStatus: string | null | undefined,
   detailStatus: string | null | undefined,
@@ -730,7 +849,8 @@ export function combinedTerminalTaskState(
   const failed = detailIsTerminal ? detailState.failed : eventState.failed;
   return {
     failed,
-    completed: !failed &&
+    completed:
+      !failed &&
       (detailIsTerminal ? detailState.completed : eventState.completed),
   };
 }
@@ -800,9 +920,7 @@ export function frozenAssetDecisions(
   snapshot: typeof knowledgeBaseSnapshots.$inferSelect,
   brief: z.infer<typeof siteBriefSchema>,
 ) {
-  const publish = new Set(brief.publicAssetIds);
-  let publishedOfficialLogo = false;
-  return snapshot.assets.flatMap((asset) => {
+  const validAssets = snapshot.assets.flatMap((asset) => {
     if (!asset.id || !asset.sha256 || !/^[a-f0-9]{64}$/iu.test(asset.sha256)) {
       return [];
     }
@@ -810,19 +928,30 @@ export function frozenAssetDecisions(
       asset.sourceKind === "official_logo_upload" ||
       (asset.ownership === "first_party" &&
         /logo/iu.test(`${asset.key} ${asset.path}`));
-    const shouldPublish =
-      isOfficialLogo && publish.has(asset.id) && !publishedOfficialLogo;
-    if (shouldPublish) publishedOfficialLogo = true;
     return [
       {
         id: asset.id,
         sha256: asset.sha256.toLowerCase(),
-        decision: shouldPublish
-          ? ("publish" as const)
-          : ("quarantine" as const),
+        isOfficialLogo,
       },
     ];
   });
+  const selectedLogo = brief.publicAssetIds
+    .map((id) =>
+      validAssets.find((asset) => asset.id === id && asset.isOfficialLogo),
+    )
+    .find((asset) => asset?.isOfficialLogo);
+
+  return validAssets.map((asset) => ({
+    id: asset.id,
+    sha256: asset.sha256,
+    decision:
+      asset === selectedLogo
+        ? ("publish" as const)
+        : selectedLogo && asset.sha256 === selectedLogo.sha256
+          ? ("omit" as const)
+          : ("quarantine" as const),
+  }));
 }
 
 export function briefWithoutBrandAssets(
@@ -1010,8 +1139,7 @@ async function persistOperationProgress(
   const affectedRows = Number(
     (Array.isArray(updated)
       ? (updated[0] as { affectedRows?: unknown } | undefined)?.affectedRows
-      : (updated as { affectedRows?: unknown } | undefined)?.affectedRows) ??
-      0,
+      : (updated as { affectedRows?: unknown } | undefined)?.affectedRows) ?? 0,
   );
   if (affectedRows !== 1) {
     throw new Error("SITEOPS_OPERATION_LEASE_LOST");
@@ -1219,7 +1347,6 @@ async function scheduleRepair(input: {
 }
 
 async function persistBuildArtifacts(
-  db: any,
   operation: SiteOperation,
   materialized: Awaited<ReturnType<typeof materializeAstroSite>>,
   persist: typeof persistSiteOpsArtifact,
@@ -1271,33 +1398,13 @@ async function persistBuildArtifacts(
     qa.contentSha256 !== materialized.visualQaSha256 ||
     provenance.contentSha256 !== materialized.provenanceSha256
   ) {
-    throw new SiteOpsManusFailure(
-      "BUILD_ARTIFACT_HASH_MISMATCH",
-      "官网产物写入后的哈希校验失败。",
-      "failed",
-    );
+    throw new SiteOpsMaterializationError({
+      phase: "artifact_persistence",
+      code: "SITEOPS_BUILD_ARTIFACT_HASH_MISMATCH",
+      retryClass: "host_deterministic",
+    });
   }
   await assertExecutionActive();
-  await db
-    .update(siteBuilds)
-    .set({
-      contractLocalAssetId: contract.id,
-      contractHash: materialized.contractSha256,
-      sourceLocalAssetId: source.id,
-      sourceHash: materialized.sourceSha256,
-      distLocalAssetId: dist.id,
-      distHash: materialized.distSha256,
-      qaLocalAssetId: qa.id,
-      provenanceLocalAssetId: provenance.id,
-      status: "preview_ready",
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(siteBuilds.id, operation.buildId!),
-        eq(siteBuilds.userId, operation.userId),
-      ),
-    );
   return {
     contract,
     source,
@@ -1319,6 +1426,7 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
       message: /manus/iu.test(error.message)
         ? "FrontMind AI 建站任务未能安全推进，请稍后重试或由运营人员处理。"
         : error.message,
+      ...(error.result ? { result: error.result } : {}),
     };
   }
   if (error instanceof ManusV2ApiError) {
@@ -1821,11 +1929,7 @@ export function createManusSiteOpsProviderHandler(
               "design_compiling",
             );
           }
-          return pending(
-            designPendingState,
-            taskId,
-            "design_compiling",
-          );
+          return pending(designPendingState, taskId, "design_compiling");
         } else {
           const workflowPackage = await loadVerifiedSiteOpsWorkflowPackage();
           const previewArtifact = await readArtifact({
@@ -1959,11 +2063,7 @@ export function createManusSiteOpsProviderHandler(
               "design_compiling",
             );
           }
-          return pending(
-            designPendingState,
-            taskId,
-            "design_compiling",
-          );
+          return pending(designPendingState, taskId, "design_compiling");
         }
       }
 
@@ -2594,27 +2694,33 @@ export function createManusSiteOpsProviderHandler(
         .set({ status: "qa_running", updatedAt: new Date() })
         .where(eq(siteBuilds.id, context.build.id));
       let materialized: Awaited<ReturnType<typeof materializeAstroSite>>;
+      const materializationStartedAt = Date.now();
+      let localRetryCount = 0;
       try {
         await assertExecutionActive();
-        materialized = await materialize({
-          build: context.build,
-          snapshot: { ...context.snapshot, documents },
-          brief,
-          visual,
-          designSpec: design!.designSpec,
-          generatedContent,
-          assetDecisions,
-          brandAsset,
-          mode: "preview",
+        const attempt = await materializeWithSingleHostRetry({
+          signal,
+          run: () =>
+            materialize({
+              build: context.build,
+              snapshot: { ...context.snapshot, documents },
+              brief,
+              visual,
+              designSpec: design!.designSpec,
+              generatedContent,
+              assetDecisions,
+              brandAsset,
+              mode: "preview",
+              abortSignal: signal,
+            }),
         });
+        materialized = attempt.value;
+        localRetryCount = attempt.localRetryCount;
         await assertExecutionActive();
       } catch (error) {
-        const code = error instanceof Error ? error.message : "";
-        if (
-          /^(?:SITEOPS_GENERATED_|SITEOPS_CONTENT_|SITEOPS_SENSITIVE_OR_DEMO_TEXT_REJECTED|SITEOPS_QA_FAILED|SITEOPS_AXE_BLOCKING_VIOLATIONS)/u.test(
-            code,
-          )
-        ) {
+        signal.throwIfAborted();
+        const classified = classifySiteOpsMaterializationFailure(error);
+        if (classified.retryClass === "content_repair") {
           return await scheduleRepair({
             db,
             operation,
@@ -2624,19 +2730,104 @@ export function createManusSiteOpsProviderHandler(
             design,
           });
         }
-        throw new SiteOpsManusFailure(
-          "SITEOPS_HOST_MATERIALIZATION_FAILED",
-          "受信 Astro 构建或 QA 运行环境未能安全完成本次任务。",
-          "attention_required",
-        );
+        const safeDetails = safeMaterializationDetails(classified, {
+          durationMs: Date.now() - materializationStartedAt,
+          assetDecisionCount: assetDecisions.length,
+          publishedCount: assetDecisions.filter(
+            (decision) => decision.decision === "publish",
+          ).length,
+          omittedDuplicateCount: assetDecisions.filter(
+            (decision) => decision.decision === "omit",
+          ).length,
+          quarantineCount: assetDecisions.filter(
+            (decision) => decision.decision === "quarantine",
+          ).length,
+          localRetryCount:
+            classified.retryClass === "host_transient" ? 1 : localRetryCount,
+        });
+        const diagnostics = {
+          schemaVersion: 1,
+          stage: "materialization_failed",
+          taskId,
+          materialization: {
+            phase: classified.phase,
+            internalCode: classified.code,
+            retryClass: classified.retryClass,
+            safeDetails,
+          },
+        } satisfies Record<string, unknown>;
+        console.error("[siteops-manus] materialization_failed", {
+          event: "siteops_materialization_failed",
+          operationId: operation.id,
+          projectId: operation.projectId,
+          buildId: context.build.id,
+          providerTaskId: taskId,
+          workflowVersion: context.build.workflowVersion,
+          phase: classified.phase,
+          internalCode: classified.code,
+          retryClass: classified.retryClass,
+          ...safeDetails,
+        });
+        return publicMaterializationFailure(classified, taskId, diagnostics);
       }
-      const artifacts = await persistBuildArtifacts(
-        db,
-        operation,
-        materialized,
-        persist,
-        assertExecutionActive,
-      );
+      let artifacts: Awaited<ReturnType<typeof persistBuildArtifacts>>;
+      try {
+        artifacts = await persistBuildArtifacts(
+          operation,
+          materialized,
+          persist,
+          assertExecutionActive,
+        );
+      } catch (error) {
+        signal.throwIfAborted();
+        const classified =
+          error instanceof SiteOpsMaterializationError
+            ? error
+            : new SiteOpsMaterializationError({
+                phase: "artifact_persistence",
+                code: "SITEOPS_BUILD_ARTIFACT_PERSISTENCE_FAILED",
+                retryClass: "host_deterministic",
+                cause: error,
+              });
+        const safeDetails = safeMaterializationDetails(classified, {
+          durationMs: Date.now() - materializationStartedAt,
+          assetDecisionCount: assetDecisions.length,
+          publishedCount: assetDecisions.filter(
+            (decision) => decision.decision === "publish",
+          ).length,
+          omittedDuplicateCount: assetDecisions.filter(
+            (decision) => decision.decision === "omit",
+          ).length,
+          quarantineCount: assetDecisions.filter(
+            (decision) => decision.decision === "quarantine",
+          ).length,
+          localRetryCount,
+        });
+        const diagnostics = {
+          schemaVersion: 1,
+          stage: "materialization_failed",
+          taskId,
+          materialization: {
+            phase: classified.phase,
+            internalCode: classified.code,
+            retryClass: classified.retryClass,
+            safeDetails,
+          },
+        } satisfies Record<string, unknown>;
+        console.error("[siteops-manus] materialization_failed", {
+          event: "siteops_materialization_failed",
+          operationId: operation.id,
+          projectId: operation.projectId,
+          buildId: context.build.id,
+          providerTaskId: taskId,
+          workflowVersion: context.build.workflowVersion,
+          phase: classified.phase,
+          internalCode: classified.code,
+          retryClass: classified.retryClass,
+          ...safeDetails,
+        });
+        return publicMaterializationFailure(classified, taskId, diagnostics);
+      }
       return {
         status: "succeeded",
         providerTaskId: taskId,
@@ -2653,6 +2844,38 @@ export function createManusSiteOpsProviderHandler(
             dist: artifacts.dist.id,
             qa: artifacts.qa.id,
             provenance: artifacts.provenance.id,
+          },
+          artifactBindings: {
+            contract: {
+              id: artifacts.contract.id,
+              sha256: materialized.contractSha256,
+              bytes: materialized.contractJson.length,
+              mimeType: "application/json",
+            },
+            source: {
+              id: artifacts.source.id,
+              sha256: materialized.sourceSha256,
+              bytes: materialized.sourceZip.length,
+              mimeType: "application/zip",
+            },
+            dist: {
+              id: artifacts.dist.id,
+              sha256: materialized.distSha256,
+              bytes: materialized.distZip.length,
+              mimeType: "application/zip",
+            },
+            qa: {
+              id: artifacts.qa.id,
+              sha256: materialized.visualQaSha256,
+              bytes: materialized.visualQaZip.length,
+              mimeType: "application/zip",
+            },
+            provenance: {
+              id: artifacts.provenance.id,
+              sha256: materialized.provenanceSha256,
+              bytes: materialized.provenanceJson.length,
+              mimeType: "application/json",
+            },
           },
         },
         message: "原生 Astro 官网已完成构建和 QA，可以在私有预览中检查并批准。",

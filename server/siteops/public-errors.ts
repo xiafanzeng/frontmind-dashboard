@@ -41,6 +41,30 @@ export function publicSiteOpsErrorProjection(input: {
       message: "FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。",
     };
   }
+  if (code === "FRONTMIND_BUILD_ASSET_CONFLICT") {
+    return {
+      code,
+      message: "FrontMind AI 建站检测到知识资产冲突，请重置后重新开始。",
+    };
+  }
+  if (code === "FRONTMIND_BUILD_COMPILE_FAILED") {
+    return {
+      code,
+      message: "FrontMind AI 建站未能完成可信网站编译，请重置后重新开始。",
+    };
+  }
+  if (code === "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE") {
+    return {
+      code,
+      message: "FrontMind AI 建站运行环境暂时不可用，请稍后重试或重置流程。",
+    };
+  }
+  if (code === "FRONTMIND_BUILD_OUTPUT_INVALID") {
+    return {
+      code,
+      message: "FrontMind AI 建站输出连续未通过结构校验，请重置后重新开始。",
+    };
+  }
   if (
     /(?:QA|AXE|LIGHTHOUSE|ASTRO|MATERIALIZATION|GENERATED_|CONTENT_)/iu.test(
       code,

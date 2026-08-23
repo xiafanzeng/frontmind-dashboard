@@ -6,6 +6,7 @@ import {
   canonicalJson,
   createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
+import { SITEOPS_WORKFLOW } from "../../shared/siteops";
 
 import {
   briefWithoutBrandAssets,
@@ -16,6 +17,8 @@ import {
   getSiteOpsSocialWorkflowReadiness,
   loadVerifiedSiteOpsSocialWorkflowPackage,
   loadVerifiedSiteOpsWorkflowPackage,
+  materializeWithSingleHostRetry,
+  classifySiteOpsMaterializationFailure,
   messageAskUserWaiting,
   phaseTerminalTaskState,
   safePublicDocuments,
@@ -83,6 +86,24 @@ describe("Manus SiteOps provider boundary", () => {
       completed: true,
       failed: false,
     });
+    for (const status of [
+      "completed",
+      "complete",
+      "finished",
+      "done",
+      "success",
+    ]) {
+      expect(terminalTaskState(status)).toEqual({
+        completed: true,
+        failed: false,
+      });
+    }
+    for (const status of ["failed", "error", "cancelled", "canceled"]) {
+      expect(terminalTaskState(status)).toEqual({
+        completed: false,
+        failed: true,
+      });
+    }
     const started = structuredResultGrace(
       { schemaVersion: 1, stage: "design_pending", taskId: "task-1" },
       true,
@@ -273,6 +294,92 @@ describe("Manus SiteOps provider boundary", () => {
     ]);
   });
 
+  it("publishes the first requested valid logo and omits duplicate bytes", () => {
+    const duplicateSha = "a".repeat(64);
+    const decisions = frozenAssetDecisions(
+      {
+        assets: [
+          {
+            id: "logo-first-in-archive",
+            key: "logo-a.png",
+            path: "assets/logo-a.png",
+            sha256: duplicateSha,
+            sourceKind: "official_logo_upload",
+            ownership: "first_party",
+          },
+          {
+            id: "logo-selected-first",
+            key: "logo-b.png",
+            path: "assets/logo-b.png",
+            sha256: duplicateSha.toUpperCase(),
+            sourceKind: "official_logo_upload",
+            ownership: "first_party",
+          },
+          {
+            id: "license",
+            key: "license.jpg",
+            path: "assets/license.jpg",
+            sha256: "b".repeat(64),
+            sourceKind: "official_document",
+            ownership: "unknown",
+          },
+        ],
+      } as never,
+      {
+        publicAssetIds: ["logo-selected-first", "logo-first-in-archive"],
+      } as never,
+    );
+
+    expect(decisions).toEqual([
+      {
+        id: "logo-first-in-archive",
+        sha256: duplicateSha,
+        decision: "omit",
+      },
+      {
+        id: "logo-selected-first",
+        sha256: duplicateSha,
+        decision: "publish",
+      },
+      { id: "license", sha256: "b".repeat(64), decision: "quarantine" },
+    ]);
+  });
+
+  it("retries only one host-transient materialization without invoking content repair", async () => {
+    const run = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("ECONNREFUSED"), {
+          phase: "browser_qa",
+        }),
+      )
+      .mockResolvedValueOnce("ok");
+    const result = await materializeWithSingleHostRetry({
+      run,
+      signal: new AbortController().signal,
+    });
+    expect(result).toEqual({ value: "ok", localRetryCount: 1 });
+    expect(run).toHaveBeenCalledTimes(2);
+
+    const deterministic = classifySiteOpsMaterializationFailure(
+      new Error("SITEOPS_SOURCE_QUARANTINED_ASSET_PRESENT"),
+    );
+    expect(deterministic).toMatchObject({
+      phase: "asset_projection",
+      retryClass: "host_deterministic",
+    });
+    const deterministicRun = vi.fn(async () => {
+      throw deterministic;
+    });
+    await expect(
+      materializeWithSingleHostRetry({
+        run: deterministicRun,
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toBe(deterministic);
+    expect(deterministicRun).toHaveBeenCalledTimes(1);
+  });
+
   it("packages the hash-verified FrontMind 1.5 workflow with SKILL and runtime contract", async () => {
     const bytes = await loadVerifiedSiteOpsWorkflowPackage();
     const zip = await JSZip.loadAsync(bytes, { checkCRC32: true });
@@ -298,7 +405,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(xhs.file("runtime-contract.json")).not.toBeNull();
     expect(readiness).toMatchObject({
       ready: true,
-      website: { version: "1.5.0" },
+      website: { version: SITEOPS_WORKFLOW.frontMindVersion },
       workflows: [
         { channel: "wechat", version: "1.0.0" },
         { channel: "xiaohongshu", version: "1.0.0" },
@@ -646,7 +753,7 @@ describe("Manus SiteOps provider boundary", () => {
         (attachment: { filename: string }) => attachment.filename,
       ),
     ).toEqual([
-      "frontmind-astro-company-site-workflow-1.5.0.zip",
+      `frontmind-astro-company-site-workflow-${SITEOPS_WORKFLOW.frontMindVersion}.zip`,
       "frontmind-siteops-source-dossier-v1.json",
       "selected-visual.png",
       "support-visual-1.png",

@@ -2358,6 +2358,18 @@ describe("ManusV2Client", () => {
     ).toMatchObject({ kind: "rejected" });
   });
 
+  it("classifies success false plus an error as rejected even without value", () => {
+    expect(
+      classifyManusV2StructuredResultEnvelope({
+        success: false,
+        error: "structured extraction failed",
+      }),
+    ).toEqual({
+      kind: "rejected",
+      code: "STRUCTURED_OUTPUT_REJECTED",
+    });
+  });
+
   it("accepts only an explicit successful envelope with no provider error", () => {
     expect(
       classifyManusV2StructuredResultEnvelope({

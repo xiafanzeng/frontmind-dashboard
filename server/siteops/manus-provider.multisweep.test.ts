@@ -7,6 +7,7 @@ import {
   canonicalJson,
   createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
+import { SITEOPS_WORKFLOW } from "../../shared/siteops";
 
 const remotePreview = vi.hoisted(() => ({
   fetchPinnedPublicHttps: vi.fn(),
@@ -17,6 +18,7 @@ vi.mock("./remote-preview", () => ({
 }));
 
 import { createManusSiteOpsProviderHandler } from "./manus-provider";
+import { SiteOpsMaterializationError } from "./materialization-error";
 
 const sha256 = (value: Buffer | string) =>
   createHash("sha256").update(value).digest("hex");
@@ -77,7 +79,7 @@ function operationMarker(operationToken: string, timestamp: number) {
 }
 
 describe("SiteOps personal-key build multi-sweep integration", () => {
-  it("waits for each stopped phase, resolves content from its owned attachment, materializes, and persists one preview-ready build", async () => {
+  it("waits for each stopped phase, resolves content, and returns one verified artifact set for atomic worker finalization", async () => {
     const taskId = "customer-private-task-1";
     const designToken = `siteops-design:${baseOperation.id}`;
     const contentToken = `siteops-content:${baseOperation.id}`;
@@ -106,9 +108,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       accentPaletteIndex: 1,
       siteTitle: "星河智造",
       description: "经过知识来源核验的企业官网。",
-      routeSlots: [
-        { routeId: "home", slotId: "proof", variant: "proof" },
-      ],
+      routeSlots: [{ routeId: "home", slotId: "proof", variant: "proof" }],
     } as const;
     const contentWire = {
       operationToken: contentToken,
@@ -141,9 +141,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         knowledgeArchiveHash: "a".repeat(64),
         workflowUpstreamVersion: "1.0.0",
         workflowUpstreamHash: "b".repeat(64),
-        workflowVersion: "1.5.0",
+        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
         workflowPackageHash: "c".repeat(64),
-        starterVersion: "1.5.0",
+        starterVersion: SITEOPS_WORKFLOW.starterVersion,
         brief: {
           companyName: "星河智造",
           primaryLanguage: "zh-CN",
@@ -214,8 +214,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         },
       },
       batch: {
-        selectionBundleLocalAssetId:
-          "90000000-0000-4000-8000-000000000009",
+        selectionBundleLocalAssetId: "90000000-0000-4000-8000-000000000009",
         selectionBundleHash: "",
       },
     };
@@ -268,9 +267,8 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
             if (!("result" in values)) {
               buildWrites.push(values);
               Object.assign(context.build, values);
-              if (values.status === "preview_ready") {
-                timeline.push("db:preview_ready");
-              }
+              if (values.status === "qa_running")
+                timeline.push("db:qa_running");
             }
             return [{ affectedRows: 1 }];
           },
@@ -338,6 +336,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       buildLog: Buffer.from("ok", "utf8"),
       files: new Map<string, Buffer>(),
     };
+    let materializeAttempts = 0;
     const materializeSite = vi.fn(async (input: unknown) => {
       timeline.push("materialize");
       expect(input).toMatchObject({
@@ -351,6 +350,14 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
           ],
         },
       });
+      materializeAttempts += 1;
+      if (materializeAttempts === 1) {
+        throw new SiteOpsMaterializationError({
+          phase: "browser_qa",
+          code: "SITEOPS_BROWSER_RUNTIME_UNAVAILABLE",
+          retryClass: "host_transient",
+        });
+      }
       return materialized as never;
     });
     const persistArtifact = vi.fn(
@@ -538,31 +545,39 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
           qa: "asset-site-qa",
           provenance: "asset-site-provenance",
         },
+        artifactBindings: {
+          contract: {
+            id: "asset-site-contract",
+            sha256: materialized.contractSha256,
+            bytes: contractJson.length,
+            mimeType: "application/json",
+          },
+          source: {
+            id: "asset-site-source",
+            sha256: materialized.sourceSha256,
+            bytes: sourceZip.length,
+            mimeType: "application/zip",
+          },
+        },
       },
     });
     expect(remotePreview.fetchPinnedPublicHttps).toHaveBeenCalledTimes(1);
-    expect(materializeSite).toHaveBeenCalledTimes(1);
+    expect(materializeSite).toHaveBeenCalledTimes(2);
     expect(persistArtifact).toHaveBeenCalledTimes(5);
-    expect(
-      persistArtifact.mock.calls.map(([input]) => input.kind),
-    ).toEqual([
+    expect(persistArtifact.mock.calls.map(([input]) => input.kind)).toEqual([
       "site-contract",
       "site-source",
       "site-dist",
       "site-qa",
       "site-provenance",
     ]);
-    expect(buildWrites.at(-1)).toMatchObject({
-      status: "preview_ready",
-      contractLocalAssetId: "asset-site-contract",
-      sourceLocalAssetId: "asset-site-source",
-      distLocalAssetId: "asset-site-dist",
-      qaLocalAssetId: "asset-site-qa",
-      provenanceLocalAssetId: "asset-site-provenance",
-    });
+    expect(buildWrites.some((write) => "contractLocalAssetId" in write)).toBe(
+      false,
+    );
 
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(context.build.repairAttempts).toBe(0);
     expect(getCredential).toHaveBeenCalledTimes(6);
     expect(
       getCredential.mock.calls.every(
@@ -590,10 +605,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       ),
     );
     const finalLeaseIndex = timeline.lastIndexOf("lease");
-    const previewReadyIndex = timeline.indexOf("db:preview_ready");
     expect(firstLeaseIndex).toBeGreaterThanOrEqual(0);
     expect(materializeIndex).toBeGreaterThan(firstLeaseIndex);
     expect(finalLeaseIndex).toBeGreaterThan(lastPersistIndex);
-    expect(previewReadyIndex).toBeGreaterThan(finalLeaseIndex);
+    expect(timeline).toContain("db:qa_running");
   });
 });

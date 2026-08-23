@@ -678,6 +678,7 @@ async function ensureProductionMaterialization(input: {
       canonicalOrigin: input.canonicalOrigin,
       target: input.context.deployment.target,
       timeoutMs: 70_000,
+      abortSignal: input.signal,
     });
   } catch (error) {
     throw new EsaProviderFailure(

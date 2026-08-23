@@ -97,4 +97,28 @@ describe("SiteOps public error projection", () => {
       message: "FrontMind AI 建站服务配置暂不可用，系统已停止继续创建任务。",
     });
   });
+
+  it.each([
+    [
+      "FRONTMIND_BUILD_ASSET_CONFLICT",
+      "FrontMind AI 建站检测到知识资产冲突，请重置后重新开始。",
+    ],
+    [
+      "FRONTMIND_BUILD_COMPILE_FAILED",
+      "FrontMind AI 建站未能完成可信网站编译，请重置后重新开始。",
+    ],
+    [
+      "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE",
+      "FrontMind AI 建站运行环境暂时不可用，请稍后重试或重置流程。",
+    ],
+  ] as const)("keeps %s as a distinct FrontMind error", (code, message) => {
+    expect(
+      publicSiteOpsErrorProjection({
+        code,
+        message: "provider internals",
+        status: "failed",
+        forceBuildProvider: true,
+      }),
+    ).toEqual({ code, message });
+  });
 });

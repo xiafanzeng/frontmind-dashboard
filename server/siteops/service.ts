@@ -79,6 +79,7 @@ import {
   publicSiteOpsErrorProjection,
   sanitizeFrontMindPublicText,
 } from "./public-errors";
+import { terminalTaskState } from "./task-terminal-state";
 import {
   assertSiteOpsServiceEntitlement,
   reserveSiteOpsQuota,
@@ -106,6 +107,16 @@ export class SiteOpsServiceError extends Error {
     super(message);
     this.name = "SiteOpsServiceError";
   }
+}
+
+export function currentSiteOpsBuildWorkflowCoordinates() {
+  return {
+    workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
+    workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
+    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+    workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
+    starterVersion: SITEOPS_WORKFLOW.starterVersion,
+  } as const;
 }
 
 export function isSiteOpsOperationReplay(
@@ -794,7 +805,8 @@ async function defaultResetProviderTaskInspector(input: {
       timeoutMs: 30_000,
     });
     const detail = await client.taskDetail(input.providerTaskId);
-    return detail.status?.trim().toLowerCase() === "stopped"
+    const terminal = terminalTaskState(detail.status);
+    return terminal.completed || terminal.failed
       ? ("stopped" as const)
       : ("not_stopped" as const);
   } catch {
@@ -3336,11 +3348,7 @@ async function selectVisualSample(
     knowledgeSnapshotId: snapshot.id,
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
-    workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
-    workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
-    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-    workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
-    starterVersion: SITEOPS_WORKFLOW.starterVersion,
+    ...currentSiteOpsBuildWorkflowCoordinates(),
     twentyFirstCredentialId: credential.id,
     twentyFirstCredentialVersion: credential.version,
     styleSampleId: selected.sample.id,
@@ -3547,11 +3555,10 @@ async function handleRevision(
     quotaPeriodId,
     quotaState: "reserved",
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
-    workflowUpstreamVersion: parent.workflowUpstreamVersion,
-    workflowUpstreamHash: parent.workflowUpstreamHash,
-    workflowVersion: parent.workflowVersion,
-    workflowPackageHash: parent.workflowPackageHash,
-    starterVersion: parent.starterVersion,
+    // A revision is a new immutable build. Freeze the current workflow,
+    // starter and materializer as one coordinate set instead of pairing the
+    // current host runtime with a historical parent's contract.
+    ...currentSiteOpsBuildWorkflowCoordinates(),
     twentyFirstCredentialId: parent.twentyFirstCredentialId,
     twentyFirstCredentialVersion: parent.twentyFirstCredentialVersion,
     styleSampleId: parent.styleSampleId,
@@ -3569,6 +3576,7 @@ async function handleRevision(
     payload: {
       ...input.payload,
       childBuildId: buildId,
+      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
       ...aiCredentialBinding,
     },
     kind: "build_revision",

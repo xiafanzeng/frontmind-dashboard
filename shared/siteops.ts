@@ -76,7 +76,27 @@ export const SITEOPS_MATERIALIZER_V1_5 = {
   qaPolicyVersion: "siteops-qa-v1",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_5;
+/** FrontMind 1.6 freezes Dashboard-owned JSON-data/Astro-template
+ * materialization, SHA-alias asset decisions, semantic contrast roles and
+ * typed host materialization stages while retaining Wire V2 provider output. */
+export const SITEOPS_MATERIALIZER_V1_6 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "1.6.0",
+  runtimeManifestSha256:
+    "89d3b2986f82c460dc5115405b1d2204dff8820a5b15eeeab489e7e2ae806cd3",
+  starterVersion: "1.6.0",
+  starterSha256:
+    "cdb266816ee05d32f57a697ea4e9f54575d84715af63eb231c0c7516cd653c2d",
+  componentLibraryVersion: "1.0.0",
+  materializerVersion: "1.6.0",
+  materializerSha256:
+    "fc2a878a5880cd1a66a487dff5feccc8188389dc643088f25881340fc157f2c7",
+  qaPolicyVersion: "siteops-qa-v2",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_6;
 
 export const siteOpsProjectStatusSchema = z.enum([
   "draft",

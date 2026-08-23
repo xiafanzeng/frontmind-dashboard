@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, lt, max, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
 import {
+  localAssets,
   messages,
   siteBuilds,
   siteDeployments,
@@ -26,6 +27,143 @@ const BUILD_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_BATCH = 4;
 
 type Claimed = typeof siteOperations.$inferSelect & { leaseOwner: string };
+
+const BUILD_ARTIFACT_KINDS = [
+  "contract",
+  "source",
+  "dist",
+  "qa",
+  "provenance",
+] as const;
+
+type BuildArtifactKind = (typeof BUILD_ARTIFACT_KINDS)[number];
+type BuildArtifactBinding = {
+  id: string;
+  sha256: string;
+  bytes: number;
+  mimeType: "application/json" | "application/zip";
+};
+type BuildArtifactBindings = Record<BuildArtifactKind, BuildArtifactBinding>;
+
+const BUILD_ARTIFACT_MIME: Record<
+  BuildArtifactKind,
+  BuildArtifactBinding["mimeType"]
+> = {
+  contract: "application/json",
+  source: "application/zip",
+  dist: "application/zip",
+  qa: "application/zip",
+  provenance: "application/json",
+};
+
+const BUILD_ARTIFACT_STORAGE_KIND: Record<BuildArtifactKind, string> = {
+  contract: "site-contract",
+  source: "site-source",
+  dist: "site-dist",
+  qa: "site-qa",
+  provenance: "site-provenance",
+};
+
+function workerArtifactError(code: string) {
+  return Object.assign(new Error(code), { code });
+}
+
+export function parseSiteOpsBuildArtifactBindings(
+  value: unknown,
+): BuildArtifactBindings {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDINGS_MISSING");
+  }
+  const record = value as Record<string, unknown>;
+  const result = {} as BuildArtifactBindings;
+  const ids = new Set<string>();
+  for (const kind of BUILD_ARTIFACT_KINDS) {
+    const raw = record[kind];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+    }
+    const binding = raw as Record<string, unknown>;
+    const id = typeof binding.id === "string" ? binding.id : "";
+    const sha256 =
+      typeof binding.sha256 === "string"
+        ? binding.sha256.trim().toLowerCase()
+        : "";
+    const bytes = Number(binding.bytes);
+    const mimeType = binding.mimeType;
+    if (
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
+        id,
+      ) ||
+      !/^[a-f0-9]{64}$/u.test(sha256) ||
+      !Number.isSafeInteger(bytes) ||
+      bytes < 1 ||
+      mimeType !== BUILD_ARTIFACT_MIME[kind] ||
+      ids.has(id)
+    ) {
+      throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+    }
+    ids.add(id);
+    result[kind] = {
+      id,
+      sha256,
+      bytes,
+      mimeType: BUILD_ARTIFACT_MIME[kind],
+    };
+  }
+  if (
+    Object.keys(record).some(
+      (key) => !BUILD_ARTIFACT_KINDS.includes(key as BuildArtifactKind),
+    )
+  ) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDINGS_INVALID");
+  }
+  return result;
+}
+
+export function siteOpsBuildArtifactProjection(input: {
+  bindings: BuildArtifactBindings;
+  rows: Array<{
+    id: string;
+    scope: string;
+    accountUserId: number | null;
+    presalesProjectId: string | null;
+    mimeType: string;
+    sizeBytes: number;
+    contentSha256: string;
+    storageKey: string;
+  }>;
+  userId: number;
+  projectId: string;
+}) {
+  const rows = new Map(input.rows.map((row) => [row.id, row]));
+  for (const kind of BUILD_ARTIFACT_KINDS) {
+    const binding = input.bindings[kind];
+    const row = rows.get(binding.id);
+    if (
+      !row ||
+      row.scope !== "managed_user" ||
+      row.accountUserId !== input.userId ||
+      row.presalesProjectId !== null ||
+      row.mimeType !== binding.mimeType ||
+      row.sizeBytes !== binding.bytes ||
+      row.contentSha256.toLowerCase() !== binding.sha256 ||
+      row.storageKey !==
+        `siteops:${input.projectId}:${BUILD_ARTIFACT_STORAGE_KIND[kind]}:${binding.id}`
+    ) {
+      throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_VERIFICATION_FAILED");
+    }
+  }
+  return {
+    contractLocalAssetId: input.bindings.contract.id,
+    contractHash: input.bindings.contract.sha256,
+    sourceLocalAssetId: input.bindings.source.id,
+    sourceHash: input.bindings.source.sha256,
+    distLocalAssetId: input.bindings.dist.id,
+    distHash: input.bindings.dist.sha256,
+    qaLocalAssetId: input.bindings.qa.id,
+    provenanceLocalAssetId: input.bindings.provenance.id,
+  } as const;
+}
 
 export function exclusiveSiteOpsLiveHeadProjection(
   target: "global_excluding_cn" | "mainland_cn",
@@ -232,12 +370,78 @@ async function invokeProvider(db: any, operation: Claimed) {
   }
 }
 
+async function verifiedBuildArtifactProjection(
+  tx: any,
+  operation: Claimed,
+  result: Extract<SiteOpsProviderResult, { status: "succeeded" }>,
+) {
+  if (
+    !operation.buildId ||
+    !["site_build", "build_revision"].includes(operation.kind)
+  ) {
+    return null;
+  }
+  const buildRows = await tx
+    .select()
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.id, operation.buildId),
+        eq(siteBuilds.projectId, operation.projectId),
+        eq(siteBuilds.userId, operation.userId),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const build = buildRows[0];
+  if (
+    !build ||
+    build.status !== "qa_running" ||
+    build.contractLocalAssetId !== null ||
+    build.sourceLocalAssetId !== null ||
+    build.distLocalAssetId !== null ||
+    build.qaLocalAssetId !== null ||
+    build.provenanceLocalAssetId !== null
+  ) {
+    throw workerArtifactError("SITEOPS_BUILD_ARTIFACT_BINDING_CONFLICT");
+  }
+  const bindings = parseSiteOpsBuildArtifactBindings(
+    result.result?.artifactBindings,
+  );
+  const ids = BUILD_ARTIFACT_KINDS.map((kind) => bindings[kind].id);
+  const rows = await tx
+    .select({
+      id: localAssets.id,
+      scope: localAssets.scope,
+      accountUserId: localAssets.accountUserId,
+      presalesProjectId: localAssets.presalesProjectId,
+      mimeType: localAssets.mimeType,
+      sizeBytes: localAssets.sizeBytes,
+      contentSha256: localAssets.contentSha256,
+      storageKey: localAssets.storageKey,
+    })
+    .from(localAssets)
+    .where(
+      and(
+        inArray(localAssets.id, ids),
+        eq(localAssets.scope, "managed_user"),
+        eq(localAssets.accountUserId, operation.userId),
+      ),
+    );
+  return siteOpsBuildArtifactProjection({
+    bindings,
+    rows,
+    userId: operation.userId,
+    projectId: operation.projectId,
+  });
+}
+
 async function finalize(
   db: any,
   operation: Claimed,
   providerResult: SiteOpsProviderResult,
 ) {
-  await db.transaction(async (tx: any) => {
+  return db.transaction(async (tx: any) => {
     const lockedRows = await tx
       .select()
       .from(siteOperations)
@@ -250,9 +454,53 @@ async function finalize(
       locked.status !== "running" ||
       locked.leaseOwner !== operation.leaseOwner
     ) {
-      return;
+      return providerResult.status;
     }
-    const result = publicSiteOpsProviderResult(locked.provider, providerResult);
+    const publicResult = publicSiteOpsProviderResult(
+      locked.provider,
+      providerResult,
+    );
+    let finalizedResult: SiteOpsProviderResult = publicResult;
+    let buildArtifactProjection: ReturnType<
+      typeof siteOpsBuildArtifactProjection
+    > | null = null;
+    if (
+      finalizedResult.status === "succeeded" &&
+      ["site_build", "build_revision"].includes(locked.kind)
+    ) {
+      try {
+        buildArtifactProjection = await verifiedBuildArtifactProjection(
+          tx,
+          locked,
+          finalizedResult,
+        );
+      } catch (error) {
+        const internalCode =
+          typeof (error as { code?: unknown })?.code === "string"
+            ? String((error as { code: string }).code)
+            : "SITEOPS_BUILD_ARTIFACT_VERIFICATION_FAILED";
+        console.error("[SiteOpsWorker] build_artifact_binding_failed", {
+          event: "siteops_build_artifact_binding_failed",
+          operationId: locked.id,
+          projectId: locked.projectId,
+          buildId: locked.buildId,
+          internalCode,
+        });
+        finalizedResult = {
+          status: "failed",
+          code: "FRONTMIND_BUILD_QA_FAILED",
+          message: "FrontMind AI 建站产物未通过完整性校验，请重置后重新开始。",
+          providerTaskId:
+            providerResult.providerTaskId ?? locked.providerTaskId ?? undefined,
+          result: {
+            schemaVersion: 1,
+            stage: "artifact_binding_failed",
+            internalCode,
+          },
+        };
+      }
+    }
+    const result = finalizedResult;
     const now = new Date();
     if (result.status === "pending") {
       const nextPollMs = Math.max(
@@ -291,7 +539,7 @@ async function finalize(
           .set({ status: result.projectStatus, updatedAt: now })
           .where(eq(siteProjects.id, locked.projectId));
       }
-      return;
+      return result.status;
     }
     if (result.status === "outcome_unknown") {
       // A timeout after a provider mutation is not a terminal failure. Keep
@@ -329,7 +577,7 @@ async function finalize(
           updatedAt: now,
         })
         .where(eq(siteDomainOperations.operationId, locked.id));
-      return;
+      return result.status;
     }
     const terminalStatus = result.status;
     const preservedTerminalState = terminalSiteOpsOperationProjection(
@@ -365,6 +613,9 @@ async function finalize(
               ? "failed"
               : "attention_required"
             : result.buildStatus,
+          ...(!unsuccessful && buildArtifactProjection
+            ? buildArtifactProjection
+            : {}),
           errorCode: unsuccessful ? result.code : null,
           errorMessage: unsuccessful ? result.message : null,
           ...(locked.kind === "build_revision"
@@ -426,7 +677,7 @@ async function finalize(
       .limit(1)
       .for("update");
     const project = projectRows[0];
-    if (!project) return;
+    if (!project) return result.status;
     let liveHeadConflict = false;
     if (!unsuccessful && result.projectStatus === "live") {
       const deploymentRows = await tx
@@ -581,6 +832,7 @@ async function finalize(
         updatedAt: now,
       })
       .where(eq(siteProjects.id, project.id));
+    return liveHeadConflict ? "attention_required" : result.status;
   });
 }
 
@@ -608,10 +860,10 @@ export async function runSiteOpsWorkerSweep(options?: { max?: number }) {
     if (!operation) break;
     summary.claimed += 1;
     const result = await invokeProvider(db, operation);
-    await finalize(db, operation, result);
-    if (result.status === "pending") summary.deferred += 1;
-    else if (result.status === "succeeded") summary.succeeded += 1;
-    else if (result.status === "failed") summary.failed += 1;
+    const finalizedStatus = await finalize(db, operation, result);
+    if (finalizedStatus === "pending") summary.deferred += 1;
+    else if (finalizedStatus === "succeeded") summary.succeeded += 1;
+    else if (finalizedStatus === "failed") summary.failed += 1;
     else summary.attentionRequired += 1;
   }
   await finalizePendingTwentyFirstCredentialRevocations().catch((error) => {

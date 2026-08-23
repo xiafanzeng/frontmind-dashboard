@@ -18,7 +18,7 @@ export function classifyManusV2StructuredResultEnvelope(
   input: unknown,
 ): ManusV2StructuredResultEnvelope {
   const result = record(input);
-  if (!result || result.value === undefined) {
+  if (!result) {
     return { kind: "missing", code: "STRUCTURED_OUTPUT_MISSING" };
   }
   const error = result.error;
@@ -26,7 +26,16 @@ export function classifyManusV2StructuredResultEnvelope(
     error !== undefined &&
     error !== null &&
     (typeof error !== "string" || error.trim().length > 0);
-  if (result.success !== true || hasNonemptyError) {
+  // A provider-declared extraction rejection is authoritative even when the
+  // result omits `value`. SiteOps uses this explicit rejection to unlock its
+  // strict, token-bound JSON attachment fallback.
+  if (result.success === false || hasNonemptyError) {
+    return { kind: "rejected", code: "STRUCTURED_OUTPUT_REJECTED" };
+  }
+  if (result.value === undefined) {
+    return { kind: "missing", code: "STRUCTURED_OUTPUT_MISSING" };
+  }
+  if (result.success !== true) {
     return { kind: "rejected", code: "STRUCTURED_OUTPUT_REJECTED" };
   }
   return { kind: "accepted", value: result.value };

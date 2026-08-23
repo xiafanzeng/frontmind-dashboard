@@ -342,9 +342,10 @@ describe("direct ESA SiteOps provider", () => {
       materializeProduction,
     });
 
+    const signal = new AbortController().signal;
     const result = await handler({
       operation: { ...operation, attempt: 1 } as never,
-      signal: new AbortController().signal,
+      signal,
     });
 
     expect(result).toMatchObject({
@@ -359,6 +360,7 @@ describe("direct ESA SiteOps provider", () => {
         expectedSourceSha256: sourceHash,
         canonicalOrigin: "https://example.com",
         target: "global_excluding_cn",
+        abortSignal: signal,
       }),
     );
     expect(persistArtifact).toHaveBeenCalledTimes(5);

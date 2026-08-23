@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { SITEOPS_WORKFLOW } from "../shared/siteops";
+import { SITEOPS_MATERIALIZER_V1_5, SITEOPS_WORKFLOW } from "../shared/siteops";
 import {
+  SITEOPS_MATERIALIZER_VERSION,
   SITEOPS_UPSTREAM_SHA256,
   SITEOPS_RUNTIME_VERSION,
   createSiteOpsRuntimeManifest,
@@ -69,7 +70,7 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 1.5.0 Hero and attachment contract", async () => {
+  it("has a current deterministic FrontMind 1.6.0 host materialization contract", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
       version: SITEOPS_RUNTIME_VERSION,
@@ -77,7 +78,7 @@ describe("SiteOps runtime workflow package", () => {
       host: {
         starterSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
         componentLibraryVersion: "1.0.0",
-        materializerVersion: "1.0.0",
+        materializerVersion: SITEOPS_MATERIALIZER_VERSION,
         materializerSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
     });
@@ -121,6 +122,51 @@ describe("SiteOps runtime workflow package", () => {
       phaseTwoOutput: "PageContentWireV2",
       phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
     });
+    expect(runtime.host).toMatchObject({
+      sourceDataOwner: "dashboard",
+      sourceDataFormat: "canonical-json",
+      templateOwner: "dashboard",
+      templateRuntime: "astro",
+      providerTextInterpolationIntoTemplate: false,
+    });
+    expect(runtime.assetProjection).toEqual({
+      decisionIdentity: "asset-id",
+      contentIdentity: "sha256",
+      duplicateSha256Allowed: true,
+      publishAndOmitSameSha256Allowed: true,
+      publishedBrandBinding: "exact-asset-id-and-sha256",
+      quarantineConflictPolicy: "reject-emitted-sha256",
+    });
+    expect(runtime.semanticColors).toMatchObject({
+      owner: "dashboard",
+      roles: ["canvas", "ink", "accent", "muted"],
+      mutedUsage: "decorative-surface-only",
+      failurePolicy: "deterministic-host-fallback",
+      providerOwnsFinalCssColors: false,
+    });
+    expect(runtime.semanticColors.requiredContrastPairs).toEqual([
+      { foreground: "ink", background: "canvas", minimumRatio: 7 },
+      { foreground: "accent", background: "canvas", minimumRatio: 4.5 },
+      { foreground: "canvas", background: "ink", minimumRatio: 7 },
+      { foreground: "ink", background: "muted", minimumRatio: 4.5 },
+    ]);
+    expect(runtime.typedMaterialization).toEqual({
+      schema: "schemas/materialization-stage-v1.schema.json",
+      phases: [
+        "input_validation",
+        "asset_projection",
+        "source_generation",
+        "astro_build",
+        "static_qa",
+        "browser_qa",
+        "lighthouse",
+        "qa_packaging",
+        "artifact_persistence",
+      ],
+      retryClasses: ["content_repair", "host_transient", "host_deterministic"],
+      contentRepairOwner: "ai-task-output",
+      hostFailureRepairByAiAllowed: false,
+    });
     const manifestBytes = await readFile(
       `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/MANIFEST.json`,
     );
@@ -131,7 +177,101 @@ describe("SiteOps runtime workflow package", () => {
         .digest("hex"),
       starterVersion: SITEOPS_RUNTIME_VERSION,
       starterSha256: generated.host.starterSha256,
+      materializerVersion: SITEOPS_MATERIALIZER_VERSION,
       materializerSha256: generated.host.materializerSha256,
+      qaPolicyVersion: "siteops-qa-v2",
+    });
+  });
+
+  it("retains immutable 1.5 coordinates while 1.6 freezes complete coordinates", async () => {
+    const [legacyManifest, envelope, stageSchema, starter] = await Promise.all([
+      readFile(
+        "private-workflows/astro-company-site-workflow-v1.5.0/MANIFEST.json",
+      ),
+      readFile(
+        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/schemas/frontmind-run-envelope.schema.json`,
+        "utf8",
+      ),
+      readFile(
+        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/schemas/materialization-stage-v1.schema.json`,
+        "utf8",
+      ),
+      readFile(
+        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/assets/host-starter-contract.json`,
+        "utf8",
+      ),
+    ]);
+    expect(createHash("sha256").update(legacyManifest).digest("hex")).toBe(
+      SITEOPS_MATERIALIZER_V1_5.runtimeManifestSha256,
+    );
+    for (const version of ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]) {
+      const preserved = JSON.parse(
+        await readFile(
+          `private-workflows/astro-company-site-workflow-v${version}/MANIFEST.json`,
+          "utf8",
+        ),
+      );
+      expect(preserved.version).toBe(version);
+    }
+
+    const frozenEnvelope = JSON.parse(envelope) as {
+      properties: {
+        schemaVersion: unknown;
+        workflow: { required: string[]; properties: Record<string, unknown> };
+      };
+    };
+    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 5 });
+    expect(frozenEnvelope.properties.workflow.required.sort()).toEqual(
+      [
+        "version",
+        "manifestSha256",
+        "starterVersion",
+        "starterSha256",
+        "componentLibraryVersion",
+        "materializerVersion",
+        "materializerSha256",
+        "qaPolicyVersion",
+      ].sort(),
+    );
+    expect(frozenEnvelope.properties.workflow.properties).toMatchObject({
+      version: { const: SITEOPS_RUNTIME_VERSION },
+      starterVersion: { const: SITEOPS_RUNTIME_VERSION },
+      componentLibraryVersion: { const: "1.0.0" },
+      materializerVersion: { const: SITEOPS_MATERIALIZER_VERSION },
+      qaPolicyVersion: { const: "siteops-qa-v2" },
+    });
+
+    const stages = JSON.parse(stageSchema) as {
+      properties: {
+        phase: { enum: string[] };
+        retryClass: { enum: string[] };
+      };
+    };
+    const runtime = JSON.parse(
+      await readFile(
+        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/runtime-contract.json`,
+        "utf8",
+      ),
+    );
+    expect(stages.properties.phase.enum).toEqual(
+      runtime.typedMaterialization.phases,
+    );
+    expect(stages.properties.retryClass.enum).toEqual(
+      runtime.typedMaterialization.retryClasses,
+    );
+
+    expect(JSON.parse(starter)).toMatchObject({
+      schema: "frontmind-siteops-host-starter/v2",
+      version: SITEOPS_RUNTIME_VERSION,
+      contentBoundary: {
+        customerAndProviderText: "canonical-json-data-only",
+        astroTemplates: "host-owned-only",
+        textInterpolationIntoAstroSource: false,
+      },
+      assetDecisionPolicy: {
+        duplicateSha256Allowed: true,
+        publishAndOmitSameSha256Allowed: true,
+      },
     });
   });
 

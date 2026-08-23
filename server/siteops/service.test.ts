@@ -6,6 +6,7 @@ import {
   assertCurrentVisualWorkflowVersion,
   assertSiteOpsSnapshotChangeState,
   createVisualSearchOperationInput,
+  currentSiteOpsBuildWorkflowCoordinates,
   freezeSiteOpsCustomerAiCredential,
   hashSiteOpsRequest,
   isSiteOpsFailedBuildResettable,
@@ -32,6 +33,16 @@ import {
 import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
 
 describe("SiteOps core contracts", () => {
+  it("freezes every new root or revision build to the current complete workflow coordinates", () => {
+    expect(currentSiteOpsBuildWorkflowCoordinates()).toEqual({
+      workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
+      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
+      starterVersion: SITEOPS_WORKFLOW.starterVersion,
+    });
+  });
+
   it("requires a selected visual board to match the current workflow", () => {
     expect(() => assertCurrentVisualWorkflowVersion("0.0.0")).toThrow(
       "视觉检索使用的建站合同已升级",
