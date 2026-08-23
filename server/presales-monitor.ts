@@ -92,6 +92,7 @@ const MONITOR_CREDENTIAL_PROBE_TIMEOUT_MS = 1_500;
 const MONITOR_CREDENTIAL_PROBE_TASK_ID = "00000000-0000-4000-8000-000000000000";
 const MONITOR_CREDENTIAL_READY_CACHE_MS = 5 * 60_000;
 const MONITOR_CREDENTIAL_FAILED_CACHE_MS = 15_000;
+const MONITOR_CREDENTIAL_RECENT_ATTESTATION_MS = 30 * 60_000;
 const MAX_MONITOR_RESPONSE_BYTES = 12 * 1024 * 1024;
 const MAX_ANSWER_CHARACTERS = 200_000;
 const MAX_SOURCE_ITEMS = 200;
@@ -722,6 +723,12 @@ let monitorCredentialReadinessCache:
       value: DedicatedMonitorCredentialReadiness;
     }
   | undefined;
+let monitorCredentialRecentAttestation:
+  | {
+      binding: string;
+      authenticatedAt: number;
+    }
+  | undefined;
 
 export async function getDedicatedMonitorCredentialReadiness(
   env: NodeJS.ProcessEnv = process.env,
@@ -732,10 +739,19 @@ export async function getDedicatedMonitorCredentialReadiness(
   } = {},
 ) {
   const credential = monitorCredentialFromEnv(env);
-  if (!credential)
+  if (!credential) {
+    monitorCredentialReadinessCache = undefined;
+    monitorCredentialRecentAttestation = undefined;
     return probeDedicatedMonitorCredential({ env, request: options.request });
+  }
   const binding = `${credential.id}:${credential.version}:${env.FRONTMIND_MONITOR_API_BASE_URL ?? "default"}`;
   const now = (options.now ?? Date.now)();
+  if (
+    monitorCredentialRecentAttestation &&
+    monitorCredentialRecentAttestation.binding !== binding
+  ) {
+    monitorCredentialRecentAttestation = undefined;
+  }
   if (
     options.forceRefresh !== true &&
     monitorCredentialReadinessCache?.binding === binding &&
@@ -747,6 +763,50 @@ export async function getDedicatedMonitorCredentialReadiness(
     env,
     request: options.request,
   });
+  if (value.status === "authenticated") {
+    monitorCredentialRecentAttestation = {
+      binding,
+      authenticatedAt: now,
+    };
+  } else if (value.status === "rejected") {
+    monitorCredentialRecentAttestation = undefined;
+  } else if (
+    value.status === "unavailable" &&
+    monitorCredentialRecentAttestation?.binding === binding
+  ) {
+    const attestationExpiresAt =
+      monitorCredentialRecentAttestation.authenticatedAt +
+      MONITOR_CREDENTIAL_RECENT_ATTESTATION_MS;
+    if (
+      monitorCredentialRecentAttestation.authenticatedAt <= now &&
+      attestationExpiresAt > now
+    ) {
+      const fallbackValue: DedicatedMonitorCredentialReadiness = {
+        configured: true,
+        authenticated: true,
+        ready: true,
+        status: "authenticated",
+      };
+      console.warn(
+        "[Presales Monitor] credential readiness used recent authentication",
+        {
+          diagnosticCode: "MONITOR_CREDENTIAL_RECENT_ATTESTATION_FALLBACK",
+          probeStatus: "unavailable",
+          recentAttestationFallback: true,
+        },
+      );
+      monitorCredentialReadinessCache = {
+        binding,
+        expiresAt: Math.min(
+          now + MONITOR_CREDENTIAL_FAILED_CACHE_MS,
+          attestationExpiresAt,
+        ),
+        value: fallbackValue,
+      };
+      return fallbackValue;
+    }
+    monitorCredentialRecentAttestation = undefined;
+  }
   monitorCredentialReadinessCache = {
     binding,
     expiresAt:
