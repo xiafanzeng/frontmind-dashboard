@@ -83,11 +83,20 @@ vi.mock("lighthouse", () => ({
   default: browserQaMocks.lighthouse,
 }));
 
-import { SITEOPS_WORKFLOW } from "../../shared/siteops";
+import {
+  SITEOPS_MATERIALIZER_V1_6,
+  SITEOPS_WORKFLOW,
+} from "../../shared/siteops";
+import {
+  referenceBlueprintForVisualCandidate,
+  type SiteDesignSpecV2,
+  type SiteOpsRuntimeVisualEvidenceV2,
+} from "../../shared/siteops-design";
 import {
   generateSocialPackage,
   materializeAstroSite,
   materializeProductionSiteFromSource,
+  siteOpsFrozenRuntimeInputSchema,
   SiteOpsMaterializationError,
   type MaterializeAstroSiteInput,
   type SocialPackageInput,
@@ -121,6 +130,13 @@ function buildInput(
 ): MaterializeAstroSiteInput {
   const snapshotId = "10000000-0000-4000-8000-000000000001";
   const archiveHash = H("knowledge-archive");
+  const previewSha256 = H("same-origin-preview");
+  const referenceBlueprint = referenceBlueprintForVisualCandidate({
+    candidateId: "candidate-F",
+    providerItemKey: "n:8435",
+    previewSha256,
+    title: "Floating orbit life science hero",
+  });
   return {
     build: {
       id: "20000000-0000-4000-8000-000000000002",
@@ -197,11 +213,12 @@ function buildInput(
       unknowns: [],
     },
     visual: {
+      schemaVersion: 2,
       queryHash: H("queries"),
-      selectedCandidateId: "candidate-B",
-      providerItemKey: "n:143",
+      selectedCandidateId: "candidate-F",
+      providerItemKey: "n:8435",
       visualEvidenceSha256: H("visual-evidence"),
-      previewSha256: H("same-origin-preview"),
+      previewSha256,
       supportEvidenceSha256s: [],
       taxonomy: {
         role: "foundation",
@@ -211,11 +228,12 @@ function buildInput(
         motion: ["reduced motion"],
         accessibility: ["high contrast"],
       },
+      referenceBlueprint,
     },
     designSpec: {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      referenceBlueprint,
       layoutArchetype: "asymmetric",
-      heroVariant: "split_media",
       density: "balanced",
       surfaceStyle: "bordered",
       typeScale: "display",
@@ -295,7 +313,110 @@ function buildInput(
   };
 }
 
-describe("SiteOps controlled Astro runtime", () => {
+const HERO_FAMILY_TITLES = {
+  floating_orbit: "floating orbit",
+  feature_grid: "feature grid hero",
+  bento: "bento modular hero",
+  split_media: "split two column hero",
+  editorial: "editorial magazine hero",
+  centered_dual_cta: "quiet centered hero",
+  immersive_visual: "immersive spatial hero",
+  product_stage: "product stage showcase",
+  proof_grid: "proof grid trust hero",
+  full_bleed_statement: "full bleed fullscreen hero",
+} as const;
+
+type HeroFamily = keyof typeof HERO_FAMILY_TITLES;
+
+function useHeroFamily(
+  input: MaterializeAstroSiteInput,
+  family: HeroFamily,
+  index: number,
+) {
+  const visual = input.visual as SiteOpsRuntimeVisualEvidenceV2;
+  const blueprint = referenceBlueprintForVisualCandidate({
+    candidateId: `candidate-${index}`,
+    providerItemKey:
+      family === "floating_orbit" ? "n:8435" : `n:${9000 + index}`,
+    previewSha256: visual.previewSha256,
+    title: HERO_FAMILY_TITLES[family],
+  });
+  expect(blueprint.heroFamily).toBe(family);
+  input.visual = {
+    ...visual,
+    selectedCandidateId: blueprint.candidateId,
+    providerItemKey: blueprint.providerItemKey,
+    referenceBlueprint: blueprint,
+  };
+  (input.designSpec as SiteDesignSpecV2).referenceBlueprint = blueprint;
+}
+
+async function legacyAstroV1_6Source() {
+  const input = buildInput();
+  const visualV2 = input.visual as SiteOpsRuntimeVisualEvidenceV2;
+  const {
+    schemaVersion: _schemaVersion,
+    referenceBlueprint: _blueprint,
+    ...visual
+  } = visualV2;
+  const legacyDesign = {
+    schemaVersion: 1 as const,
+    layoutArchetype: "asymmetric" as const,
+    heroVariant: "split_media" as const,
+    density: "balanced" as const,
+    surfaceStyle: "bordered" as const,
+    typeScale: "display" as const,
+    imageTreatment: "contained" as const,
+    motionLevel: "subtle" as const,
+    colorRoles: {
+      backgroundPaletteIndex: 2,
+      textPaletteIndex: 0,
+      accentPaletteIndex: 1,
+    },
+    routeCompositions: (input.designSpec as SiteDesignSpecV2).routeCompositions,
+    seoPlan: (input.designSpec as SiteDesignSpecV2).seoPlan,
+  };
+  const frozen = siteOpsFrozenRuntimeInputSchema.parse({
+    schemaVersion: 2,
+    build: {
+      ...input.build,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V1_6.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V1_6.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V1_6.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V1_6.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V1_6.starterVersion,
+    },
+    host: {
+      starterSha256: SITEOPS_MATERIALIZER_V1_6.starterSha256,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V1_6.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V1_6.materializerVersion,
+      materializerSha256: SITEOPS_MATERIALIZER_V1_6.materializerSha256,
+      // Historical bundles did not carry a renderer discriminator.
+    },
+    snapshot: {
+      id: input.snapshot.id,
+      userId: input.snapshot.userId,
+      archiveHash: input.snapshot.archiveHash,
+      sourceBuildId: input.snapshot.sourceBuildId,
+      sourceBuildRevision: input.snapshot.sourceBuildRevision,
+      sourceDocumentIds: input.snapshot.documents.map(
+        (document) => document.id,
+      ),
+    },
+    brief: input.brief,
+    visual,
+    designSpec: legacyDesign,
+    generatedContent: input.generatedContent,
+    assetDecisions: [],
+    brandAsset: null,
+  });
+  const zip = new JSZip();
+  zip.file("frontmind-runtime-input.json", `${JSON.stringify(frozen)}\n`);
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
+describe("SiteOps trusted React 19 static runtime", () => {
   let previewBuild: Awaited<ReturnType<typeof materializeAstroSite>>;
   let officialLogo: Buffer;
 
@@ -333,7 +454,7 @@ describe("SiteOps controlled Astro runtime", () => {
     previewBuild = await materializeAstroSite(input);
   }, 90_000);
 
-  it("builds real no-JavaScript Astro HTML and a private noindex preview", async () => {
+  it("builds complete React static HTML and a private noindex preview without runtime JavaScript", async () => {
     const built = previewBuild;
     expect(browserQaMocks.browserLaunch).toHaveBeenCalledTimes(1);
     expect(browserQaMocks.axeAnalyze).toHaveBeenCalled();
@@ -370,7 +491,10 @@ describe("SiteOps controlled Astro runtime", () => {
 
     const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
     const sourceNames = Object.keys(source.files);
-    expect(sourceNames).toContain("astro.config.mjs");
+    expect(sourceNames).not.toContain("astro.config.mjs");
+    expect(sourceNames).toContain("package-lock.json");
+    expect(sourceNames).toContain("src/component-library.mjs");
+    expect(sourceNames).toContain("src/render.mjs");
     expect(sourceNames).toContain("frontmind-runtime-lock.json");
     expect(sourceNames).toContain("frontmind-runtime-input.json");
     expect(sourceNames).toContain("build-contract.json");
@@ -385,11 +509,17 @@ describe("SiteOps controlled Astro runtime", () => {
     expect(
       JSON.parse(await source.file("build-contract.json")!.async("string")),
     ).toMatchObject({
-      schemaVersion: 2,
-      visual: {
-        providerItemKey: "n:143",
-        visualEvidenceSha256: H("visual-evidence"),
-        componentLibraryVersion: "1.0.0",
+      schemaVersion: 3,
+      contractKind: "build_contract",
+      renderer: {
+        kind: "react_static_v1",
+        reactVersion: "19.2.1",
+        componentLibraryVersion: "2.0.0",
+        materializerVersion: "2.0.0",
+      },
+      referenceBlueprint: {
+        providerItemKey: "n:8435",
+        heroFamily: "floating_orbit",
       },
       assets: [
         {
@@ -400,14 +530,52 @@ describe("SiteOps controlled Astro runtime", () => {
         { id: "private-evidence", decision: "quarantine" },
       ],
     });
-    expect(await source.file("package.json")!.async("string")).toContain(
-      `\"astro\": \"7.2.4\"`,
+    const sourcePackage = JSON.parse(
+      await source.file("package.json")!.async("string"),
+    );
+    expect(sourcePackage).toMatchObject({
+      scripts: { build: "node ./src/render.mjs" },
+      dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+    });
+    const sourceLock = JSON.parse(
+      await source.file("package-lock.json")!.async("string"),
+    );
+    expect(sourceLock).toMatchObject({
+      lockfileVersion: 3,
+      packages: {
+        "node_modules/react": { version: "19.2.1" },
+        "node_modules/react-dom": { version: "19.2.1" },
+        "node_modules/scheduler": { version: "0.27.0" },
+      },
+    });
+    const componentCss = await source
+      .file("public/styles.css")!
+      .async("string");
+    expect(componentCss).toContain(
+      ".hero-orbit-stage{position:relative;min-height:",
+    );
+    expect(componentCss).toContain(".orbit-motif{position:absolute");
+    expect(componentCss).toContain(
+      ".container--contained .hero--floating_orbit .hero-orbit-stage",
+    );
+    expect(componentCss).toContain(
+      ".media-strategy--procedural_brand_svg .orbit-motif",
+    );
+    expect(componentCss).toContain(".contact .eyebrow{color:var(--canvas)}");
+    expect(componentCss).toContain(
+      "@media(prefers-reduced-motion:reduce){.orbit-motif{animation:none!important}}",
     );
 
     const dist = await JSZip.loadAsync(built.distZip, { checkCRC32: true });
     const home = await dist.file("index.html")!.async("string");
     expect(home).toContain("让设备状态更清晰");
-    expect(home).toContain('class="hero hero--split_media"');
+    expect(home).toContain(
+      'class="hero hero--floating_orbit" data-hero-family="floating_orbit"',
+    );
+    expect(home).toContain('data-motif="dna"');
+    expect(home).toContain('data-motif="molecule"');
+    expect(home).toContain('data-motif="cell"');
+    expect(home).toContain('data-motif="timeline"');
     expect(home).toContain(
       'class="section section--proof" data-slot="service-proof"',
     );
@@ -415,8 +583,10 @@ describe("SiteOps controlled Astro runtime", () => {
       'class="section section--split" data-slot="audience"',
     );
     expect(home).toContain(
-      'class="layout--asymmetric surface--bordered type--display image--contained motion--subtle"',
+      "layout--asymmetric surface--bordered type--display image--contained motion--subtle align--center",
     );
+    expect(home).toContain("media-strategy--procedural_brand_svg");
+    expect(home).toContain("container--contained");
     expect(home).toContain('class="brand-logo"');
     expect(home).toContain('src="/brand-logo.png"');
     expect(
@@ -427,11 +597,81 @@ describe("SiteOps controlled Astro runtime", () => {
     expect(home).toContain('name="robots" content="noindex,nofollow"');
     expect(home).not.toContain('rel="canonical"');
     expect(home).not.toMatch(/<script\b/iu);
+    expect(home).not.toMatch(/<div\s+id=["']root["'][^>]*>\s*<\/div>/iu);
+    expect(Object.keys(dist.files)).not.toContain(
+      expect.stringMatching(/\.(?:m?js)$/u),
+    );
     expect(await dist.file("robots.txt")!.async("string")).toContain(
       "Disallow: /",
     );
     expect(dist.file("sitemap.xml")).toBeNull();
     expect(dist.file("llms.txt")).toBeNull();
+  }, 90_000);
+
+  it("renders ten allowlisted Hero families as distinct server-rendered DOM", async () => {
+    const selectors: Record<HeroFamily, string> = {
+      floating_orbit: 'class="shell hero-orbit-stage"',
+      feature_grid: 'class="hero-feature-grid"',
+      bento: 'class="shell hero-bento"',
+      split_media: 'class="shell hero-split"',
+      editorial: 'class="shell hero-editorial"',
+      centered_dual_cta: 'class="shell hero-centered"',
+      immersive_visual: 'class="hero-immersive__field"',
+      product_stage: 'class="product-stage"',
+      proof_grid: 'class="hero-proof__grid"',
+      full_bleed_statement: 'class="hero-statement__rail"',
+    };
+    for (const [index, family] of Object.keys(HERO_FAMILY_TITLES).entries()) {
+      const typedFamily = family as HeroFamily;
+      const input = buildInput();
+      useHeroFamily(input, typedFamily, index + 1);
+      const built = await materializeAstroSite(input);
+      const home = built.files.get("index.html")!.toString("utf8");
+      expect(home).toContain(`data-hero-family="${typedFamily}"`);
+      expect(home).toContain(selectors[typedFamily]);
+      expect(home).toMatch(/^<!doctype html><html\b/u);
+      expect(home).toContain("<head>");
+      expect(home).toContain("<body");
+      expect(home).toContain("<main>");
+      expect(home).toContain("<footer");
+    }
+  }, 90_000);
+
+  it("renders all seven section variants with differentiated semantic DOM", async () => {
+    const input = buildInput();
+    const variants = [
+      "statement",
+      "split",
+      "cards",
+      "timeline",
+      "faq",
+      "proof",
+      "cta",
+    ] as const;
+    const design = input.designSpec as SiteDesignSpecV2;
+    design.routeCompositions[0]!.slots = variants.map((variant, index) => ({
+      slotId: `section-${index + 1}`,
+      variant,
+    }));
+    const content = input.generatedContent as any;
+    content.routes[0].sections = variants.map((variant, index) => ({
+      slotId: `section-${index + 1}`,
+      heading: `${variant} 结构`,
+      paragraphs: [`${variant} 第一段`, `${variant} 第二段`],
+      sourceDocumentIds: [index % 2 === 0 ? "overview" : "service"],
+    }));
+    const built = await materializeAstroSite(input);
+    const home = built.files.get("index.html")!.toString("utf8");
+    expect(home).toContain('<section class="section section--statement"');
+    expect(home).toContain("<blockquote>");
+    expect(home).toContain('class="section-split__header"');
+    expect(home).toContain('class="mini-card-grid"');
+    expect(home).toContain('<ol class="timeline-list">');
+    expect(home).toContain('<section class="section section--faq"');
+    expect(home).toContain("<dl>");
+    expect(home).toContain('<section class="section section--proof"');
+    expect(home).toContain("<figure>");
+    expect(home).toContain('class="button button--inverse"');
   }, 90_000);
 
   it("allows a duplicate official-logo SHA only when the alias is omitted", async () => {
@@ -540,13 +780,13 @@ describe("SiteOps controlled Astro runtime", () => {
 
     const built = await materializeAstroSite(input);
     const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
-    const astroFiles = await Promise.all(
+    const trustedModules = await Promise.all(
       Object.values(source.files)
-        .filter((entry) => !entry.dir && entry.name.endsWith(".astro"))
+        .filter((entry) => !entry.dir && entry.name.endsWith(".mjs"))
         .map((entry) => entry.async("string")),
     );
     for (const sentinel of sentinels) {
-      expect(astroFiles.join("\n")).not.toContain(sentinel);
+      expect(trustedModules.join("\n")).not.toContain(sentinel);
     }
     const dataFiles = await Promise.all(
       Object.values(source.files)
@@ -601,9 +841,7 @@ describe("SiteOps controlled Astro runtime", () => {
     );
     expect(ratio(variables.ink, variables.muted)).toBeGreaterThanOrEqual(4.5);
     expect(css).toContain(".source-note{color:var(--ink)");
-    expect(css).toContain(
-      ".section--cta .source-note{color:var(--canvas)}",
-    );
+    expect(css).toContain(".section--cta .source-note{color:var(--canvas)}");
     expect(css).not.toMatch(/\.source-note\{[^}]*opacity/gu);
   }, 90_000);
 
@@ -657,6 +895,28 @@ describe("SiteOps controlled Astro runtime", () => {
         officialLogo,
       ),
     ).toBe(true);
+  }, 90_000);
+
+  it("keeps historical 1.6 source bundles on the read-only Astro replay path", async () => {
+    const sourceZip = await legacyAstroV1_6Source();
+    const rebuilt = await materializeProductionSiteFromSource({
+      sourceZip,
+      expectedSourceSha256: H(sourceZip),
+      canonicalOrigin: "https://legacy.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    const source = await JSZip.loadAsync(rebuilt.sourceZip, {
+      checkCRC32: true,
+    });
+    expect(source.file("astro.config.mjs")).not.toBeNull();
+    expect(source.file("src/layouts/SiteLayout.astro")).not.toBeNull();
+    expect(source.file("src/render.mjs")).toBeNull();
+    const contract = JSON.parse(rebuilt.contractJson.toString("utf8"));
+    expect(contract.schemaVersion).toBe(2);
+    const dist = await JSZip.loadAsync(rebuilt.distZip, { checkCRC32: true });
+    expect(await dist.file("index.html")!.async("string")).toContain(
+      'rel="canonical" href="https://legacy.xinghe.example/"',
+    );
   }, 90_000);
 
   it("stops production materialization when the deployment signal is aborted", async () => {

@@ -3,6 +3,7 @@ export type SiteOpsMaterializationPhase =
   | "asset_projection"
   | "source_generation"
   | "astro_build"
+  | "react_static_build"
   | "static_qa"
   | "browser_qa"
   | "lighthouse"

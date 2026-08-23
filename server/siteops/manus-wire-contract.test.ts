@@ -5,10 +5,13 @@ import {
   pageContentResultFromWire,
   pageContentWireOutputSchema,
   siteDesignResultFromWire,
+  siteDesignResultV2FromWire,
   siteDesignWireOutputSchema,
+  siteDesignWireV3OutputSchema,
   siteOpsSourceDossierAttachments,
   socialWireOutputSchema,
 } from "./manus-wire-contract";
+import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
 
 function visitSchema(value: unknown, found = new Set<string>()) {
   if (!value || typeof value !== "object") return found;
@@ -28,6 +31,11 @@ describe("SiteOps provider wire contracts", () => {
     const schemas = [
       siteDesignWireOutputSchema({
         operationToken: "design-token",
+        routeIds: ["home", "about"],
+        paletteSize: 3,
+      }),
+      siteDesignWireV3OutputSchema({
+        operationToken: "design-token-v3",
         routeIds: ["home", "about"],
         paletteSize: 3,
       }),
@@ -187,6 +195,46 @@ describe("SiteOps provider wire contracts", () => {
           ],
         },
         ["home"],
+      ),
+    ).toThrow();
+  });
+
+  it("injects the frozen Hero blueprint into SiteDesignSpecV2 and rejects provider overrides", () => {
+    const blueprint = referenceBlueprintForVisualCandidate({
+      candidateId: "candidate-F",
+      providerItemKey: "n:8435",
+      previewSha256: "a".repeat(64),
+      title: "Hero Section 7",
+    });
+    const wire = {
+      operationToken: "design-token-v3",
+      schemaVersion: 3,
+      layoutArchetype: "hero_led",
+      density: "spacious",
+      surfaceStyle: "soft_depth",
+      typeScale: "display",
+      imageTreatment: "wide",
+      motionLevel: "subtle",
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 1,
+      accentPaletteIndex: 2,
+      siteTitle: "天印溯方",
+      description: "可测量、可解释、可干预的健康服务。",
+      routeSlots: [
+        { routeId: "home", slotId: "proof", variant: "proof" },
+        { routeId: "home", slotId: "cta", variant: "cta" },
+      ],
+    };
+    const design = siteDesignResultV2FromWire(wire, ["home"], blueprint);
+    expect(design.designSpec.referenceBlueprint).toEqual(blueprint);
+    expect(design.designSpec.referenceBlueprint.heroFamily).toBe(
+      "floating_orbit",
+    );
+    expect(() =>
+      siteDesignResultV2FromWire(
+        { ...wire, heroFamily: "centered_dual_cta" },
+        ["home"],
+        blueprint,
       ),
     ).toThrow();
   });

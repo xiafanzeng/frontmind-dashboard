@@ -96,7 +96,46 @@ export const SITEOPS_MATERIALIZER_V1_6 = {
   qaPolicyVersion: "siteops-qa-v2",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V1_6;
+/** React Static 2.0 freezes the high-fidelity ReferenceBlueprintV2, renders
+ * host-owned React 19 components to complete static HTML and finalizes an
+ * immutable BuildContractV3 only after source/dist digests exist. */
+export const SITEOPS_MATERIALIZER_V2_0 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "2.0.0",
+  runtimeManifestSha256:
+    "fe38fafa49b1e0a4565c7ac27e5e0c80ff1109232eb00e3543b60623559c2ca4",
+  starterVersion: "2.0.0",
+  starterSha256:
+    "9bef440d7d732f384adccd0d2443610010315c43611335c7292bba84937d93ac",
+  componentLibraryVersion: "2.0.0",
+  materializerVersion: "2.0.0",
+  materializerSha256:
+    "e186cbbe63b15b782c9d02e4943da219be0d1ced91f629629e3745f47030b0e0",
+  qaPolicyVersion: "siteops-qa-v3",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_0;
+
+const SITEOPS_WORKFLOWS_BY_VERSION = {
+  [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
+  [SITEOPS_MATERIALIZER_V1_3.frontMindVersion]: SITEOPS_MATERIALIZER_V1_3,
+  [SITEOPS_MATERIALIZER_V1_4.frontMindVersion]: SITEOPS_MATERIALIZER_V1_4,
+  [SITEOPS_MATERIALIZER_V1_5.frontMindVersion]: SITEOPS_MATERIALIZER_V1_5,
+  [SITEOPS_MATERIALIZER_V1_6.frontMindVersion]: SITEOPS_MATERIALIZER_V1_6,
+  [SITEOPS_MATERIALIZER_V2_0.frontMindVersion]: SITEOPS_MATERIALIZER_V2_0,
+} as const;
+
+export function siteOpsWorkflowForVersion(version: string) {
+  const workflow =
+    SITEOPS_WORKFLOWS_BY_VERSION[
+      version as keyof typeof SITEOPS_WORKFLOWS_BY_VERSION
+    ];
+  if (!workflow)
+    throw new Error(`SITEOPS_WORKFLOW_VERSION_UNSUPPORTED:${version}`);
+  return workflow;
+}
 
 export const siteOpsProjectStatusSchema = z.enum([
   "draft",

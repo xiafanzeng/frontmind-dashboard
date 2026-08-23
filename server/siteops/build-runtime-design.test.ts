@@ -1,12 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+vi.mock("@axe-core/playwright", () => ({ default: class MockAxeBuilder {} }));
+vi.mock("chrome-launcher", () => ({ launch: vi.fn() }));
+vi.mock("lighthouse", () => ({ default: vi.fn() }));
+vi.mock("playwright", () => ({ chromium: {} }));
+
+import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
 import { siteDesignMaterializationProjection } from "./build-runtime";
 
 function design(overrides: Record<string, unknown> = {}) {
+  const referenceBlueprint = referenceBlueprintForVisualCandidate({
+    candidateId: "candidate-F",
+    providerItemKey: "n:8435",
+    previewSha256:
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    title: "Floating orbit",
+  });
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    referenceBlueprint,
     layoutArchetype: "asymmetric",
-    heroVariant: "split_media",
     density: "balanced",
     surfaceStyle: "bordered",
     typeScale: "display",
@@ -38,20 +51,25 @@ describe("trusted SiteOps component projection", () => {
     const editorial = siteDesignMaterializationProjection(
       design({
         layoutArchetype: "editorial",
-        heroVariant: "editorial_lede",
         surfaceStyle: "flat",
         typeScale: "editorial",
       }),
     );
 
     expect(asymmetric.bodyClass).toContain("layout--asymmetric");
-    expect(asymmetric.heroClass).toBe("hero hero--split_media");
+    expect(asymmetric.heroClass).toBe("hero hero--floating_orbit");
+    expect(asymmetric.heroFamily).toBe("floating_orbit");
+    expect(asymmetric.bodyClass).toContain("decoration--orbital");
+    expect(asymmetric.bodyClass).toContain("container--contained");
+    expect(asymmetric.bodyClass).toContain(
+      "media-strategy--procedural_brand_svg",
+    );
     expect(asymmetric.componentManifest.routes[0]?.slots[0]).toEqual({
       slotId: "proof",
       variant: "proof",
     });
     expect(editorial.bodyClass).toContain("layout--editorial");
-    expect(editorial.heroClass).toBe("hero hero--editorial_lede");
+    expect(editorial.heroClass).toBe("hero hero--floating_orbit");
     expect(editorial.componentManifest).not.toEqual(
       asymmetric.componentManifest,
     );

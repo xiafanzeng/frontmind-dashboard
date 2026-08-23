@@ -872,6 +872,40 @@
   gap: 8px;
 }
 
+.siteops-preview-open-error {
+  flex-basis: 100%;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.siteops-build-actions .siteops-preview-open-error a {
+  min-height: auto;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  text-decoration: underline;
+}
+
+.siteops-preview-history {
+  flex: 1 1 100%;
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 12px;
+}
+
+.siteops-preview-history > span {
+  color: #64748b;
+  font-size: 0.84rem;
+}
+
+.siteops-preview-history > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .siteops-composer {
   border-top: 1px solid #e2e8f0;
   padding-top: 16px;

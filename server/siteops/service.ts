@@ -50,6 +50,11 @@ import {
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { siteOpsObservationV1Schema } from "../../shared/siteops-contract";
 import {
+  referenceBlueprintForVisualCandidate,
+  referenceBlueprintV2Schema,
+  type ReferenceBlueprintV2,
+} from "../../shared/siteops-design";
+import {
   visualSearchOperationInputV1Schema,
   type VisualSearchOperationInputV1,
 } from "../../shared/siteops-workflow";
@@ -635,6 +640,98 @@ function publicVisualMetadata(value: unknown) {
         }
       : {}),
   };
+}
+
+export function freezeSiteOpsReferenceBlueprint(input: {
+  sampleId: string;
+  note: string | null;
+  sourceMetadata: unknown;
+}) {
+  const metadata =
+    input.sourceMetadata &&
+    typeof input.sourceMetadata === "object" &&
+    !Array.isArray(input.sourceMetadata)
+      ? (input.sourceMetadata as Record<string, unknown>)
+      : {};
+  const evidence = visualEvidenceV1Schema.safeParse(metadata.visualEvidence);
+  const heroEligibility = z
+    .object({
+      eligible: z.literal(true),
+      variant: z.enum([
+        "centered_statement",
+        "split_media",
+        "editorial_modular",
+        "immersive_visual",
+      ]),
+    })
+    .passthrough()
+    .safeParse(metadata.heroEligibility);
+  if (
+    !evidence.success ||
+    !heroEligibility.success ||
+    metadata.providerItemKey !== evidence.data.providerItemKey ||
+    createVisualEvidenceV1({
+      evidenceKind: evidence.data.evidenceKind,
+      providerItemKey: evidence.data.providerItemKey,
+      metadataSha256: evidence.data.metadataSha256,
+      providerResponseSha256: evidence.data.providerResponseSha256,
+      previewSha256: evidence.data.previewSha256,
+      taxonomyDerivationVersion: evidence.data.taxonomyDerivationVersion,
+    }).evidenceSha256 !== evidence.data.evidenceSha256
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "所选视觉参考无法冻结为可信 Hero 构图合同，请重新检索后选择。",
+      409,
+    );
+  }
+  return referenceBlueprintForVisualCandidate({
+    candidateId: input.sampleId,
+    providerItemKey: evidence.data.providerItemKey,
+    previewSha256: evidence.data.previewSha256,
+    title: typeof metadata.title === "string" ? metadata.title : input.note,
+    sourceUrl:
+      typeof metadata.sourceUrl === "string" ? metadata.sourceUrl : null,
+    heroEligibility: heroEligibility.data,
+  });
+}
+
+export function referenceBlueprintForSiteOpsRevision(input: {
+  parentWorkflowVersion: string;
+  parentOperationInput: unknown;
+  derivedReferenceBlueprint: ReferenceBlueprintV2;
+}) {
+  const operationInput =
+    input.parentOperationInput &&
+    typeof input.parentOperationInput === "object" &&
+    !Array.isArray(input.parentOperationInput)
+      ? (input.parentOperationInput as Record<string, unknown>)
+      : null;
+  const inherited = referenceBlueprintV2Schema.safeParse(
+    operationInput?.referenceBlueprint,
+  );
+  const inheritedMatches =
+    inherited.success &&
+    inherited.data.candidateId ===
+      input.derivedReferenceBlueprint.candidateId &&
+    inherited.data.providerItemKey ===
+      input.derivedReferenceBlueprint.providerItemKey &&
+    inherited.data.previewSha256 ===
+      input.derivedReferenceBlueprint.previewSha256;
+  if (input.parentWorkflowVersion.startsWith("2.") && !inheritedMatches) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前官网版本的冻结视觉构图合同不完整，不能静默改变视觉方向。",
+      409,
+    );
+  }
+  // A 2.x child inherits the exact immutable Blueprint, rather than running
+  // its selection back through a mapping algorithm that may have evolved.
+  // Legacy Astro parents have no Blueprint and are upgraded once from their
+  // frozen selected visual evidence.
+  return inherited.success && inheritedMatches
+    ? inherited.data
+    : input.derivedReferenceBlueprint;
 }
 
 export function siteOpsResetCapability(input: {
@@ -1659,6 +1756,9 @@ async function projectObservation(
         parentBuildId: row.parentBuildId,
         ordinal: row.ordinal,
         agentProfile: buildAgentProfiles.get(row.id) ?? null,
+        renderer: row.workflowVersion.startsWith("2.")
+          ? ("react_static" as const)
+          : ("astro_static" as const),
         status: row.status,
         previewUrl: row.distLocalAssetId
           ? `/api/site-ops/builds/${row.id}/preview/`
@@ -3270,6 +3370,10 @@ async function selectVisualSample(
     );
   }
   const selectedMetadata = selected.sample.sourceMetadata;
+  const selectedMetadataRecord = selectedMetadata as unknown as Record<
+    string,
+    unknown
+  >;
   const selectedEvidence = visualEvidenceV1Schema.safeParse(
     selectedMetadata.visualEvidence,
   );
@@ -3293,6 +3397,11 @@ async function selectVisualSample(
       409,
     );
   }
+  const referenceBlueprint = freezeSiteOpsReferenceBlueprint({
+    sampleId: selected.sample.id,
+    note: selected.sample.note,
+    sourceMetadata: selectedMetadataRecord,
+  });
   const snapshotRows = await tx
     .select()
     .from(knowledgeBaseSnapshots)
@@ -3370,6 +3479,7 @@ async function selectVisualSample(
       styleSampleId: selected.sample.id,
       delegated: input.delegated,
       workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      referenceBlueprint,
       ...aiCredentialBinding,
     },
     kind: "site_build",
@@ -3514,6 +3624,42 @@ async function handleRevision(
       409,
     );
   }
+  if (!parent.styleSampleId) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前官网版本缺少可冻结的视觉参考，需重新选择视觉方向。",
+      409,
+    );
+  }
+  const styleRows = await tx
+    .select({ sample: websiteStyleSamples })
+    .from(websiteStyleSamples)
+    .innerJoin(
+      websiteStyleSampleBatches,
+      eq(websiteStyleSampleBatches.id, websiteStyleSamples.batchId),
+    )
+    .where(
+      and(
+        eq(websiteStyleSamples.id, parent.styleSampleId),
+        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+        eq(websiteStyleSampleBatches.userId, input.actor.id),
+        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+      ),
+    )
+    .limit(1);
+  const styleSample = styleRows[0]?.sample;
+  if (!styleSample?.previewLocalAssetId || !styleSample.sourceMetadata) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前官网版本的视觉证据不完整，需重新选择视觉方向。",
+      409,
+    );
+  }
+  const derivedReferenceBlueprint = freezeSiteOpsReferenceBlueprint({
+    sampleId: styleSample.id,
+    note: styleSample.note,
+    sourceMetadata: styleSample.sourceMetadata,
+  });
   const aiCredential = await ensureActiveCustomerAiCredential(
     tx,
     input.actor.id,
@@ -3531,9 +3677,15 @@ async function handleRevision(
     )
     .orderBy(desc(siteOperations.createdAt))
     .limit(1);
+  const parentOperationInput = parentOperationRows[0]?.input;
+  const referenceBlueprint = referenceBlueprintForSiteOpsRevision({
+    parentWorkflowVersion: parent.workflowVersion,
+    parentOperationInput,
+    derivedReferenceBlueprint,
+  });
   const aiCredentialBinding = freezeSiteOpsCustomerAiCredential({
     credential: aiCredential,
-    parentOperationInput: parentOperationRows[0]?.input,
+    parentOperationInput,
   });
   const quotaPeriodId = await reserveSiteOpsDeliveryQuota(tx, {
     userId: input.actor.id,
@@ -3577,6 +3729,7 @@ async function handleRevision(
       ...input.payload,
       childBuildId: buildId,
       workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      referenceBlueprint,
       ...aiCredentialBinding,
     },
     kind: "build_revision",

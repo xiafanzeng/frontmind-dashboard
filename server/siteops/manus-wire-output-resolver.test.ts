@@ -93,6 +93,23 @@ function jsonResponse(value: unknown, headers: Record<string, string> = {}) {
 }
 
 describe("SiteOps wire output resolver", () => {
+  it("accepts the exact V3 design filename when the React workflow requests it", async () => {
+    const value = {
+      operationToken: token,
+      schemaVersion: 3,
+      siteTitle: "可信 React 静态官网",
+    };
+    await expect(
+      resolveWireOutput({
+        events: [accepted(value)] as never,
+        operationToken: token,
+        phase: "design",
+        expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.designV3,
+        taskCompleted: true,
+      }),
+    ).resolves.toMatchObject({ value, source: "structured" });
+  });
+
   it("uses the strict attachment fallback after rejection without a value", async () => {
     const value = {
       operationToken: token,

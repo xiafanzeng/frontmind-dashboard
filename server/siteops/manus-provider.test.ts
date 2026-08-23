@@ -7,6 +7,7 @@ import {
   createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
 import { SITEOPS_WORKFLOW } from "../../shared/siteops";
+import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
 
 import {
   briefWithoutBrandAssets,
@@ -477,9 +478,11 @@ describe("Manus SiteOps provider boundary", () => {
     const designToken = `siteops-design:${operation.id}`;
     const designResult = {
       operationToken: designToken,
-      schemaVersion: 2,
+      schemaVersion: SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.") ? 3 : 2,
       layoutArchetype: "asymmetric",
-      heroVariant: "split_media",
+      ...(SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
+        ? {}
+        : { heroVariant: "split_media" }),
       density: "balanced",
       surfaceStyle: "bordered",
       typeScale: "display",
@@ -499,6 +502,7 @@ describe("Manus SiteOps provider boundary", () => {
         userId: operation.userId,
         knowledgeSnapshotId: "50000000-0000-4000-8000-000000000005",
         knowledgeArchiveHash: "a".repeat(64),
+        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
         brief: {
           companyName: "星河智造",
           primaryLanguage: "zh-CN",
@@ -648,6 +652,18 @@ describe("Manus SiteOps provider boundary", () => {
     context.batch.selectionBundleHash = createHash("sha256")
       .update(selectionBytes)
       .digest("hex");
+    const referenceBlueprint = referenceBlueprintForVisualCandidate({
+      candidateId: context.sample.id,
+      providerItemKey: visualEvidence.providerItemKey,
+      previewSha256: previewHash,
+      title: "Split hero",
+      sourceUrl: "https://21st.dev/community/components/split-hero",
+      heroEligibility: { variant: "split_media" },
+    });
+    const buildOperation = {
+      ...operation,
+      input: { ...operation.input, referenceBlueprint },
+    };
     const query: any = {};
     query.from = () => query;
     query.innerJoin = () => query;
@@ -731,7 +747,7 @@ describe("Manus SiteOps provider boundary", () => {
     });
 
     const created = await handler({
-      operation: operation as never,
+      operation: buildOperation as never,
       signal: new AbortController().signal,
     });
     expect(created).toMatchObject({
@@ -753,7 +769,7 @@ describe("Manus SiteOps provider boundary", () => {
         (attachment: { filename: string }) => attachment.filename,
       ),
     ).toEqual([
-      `frontmind-astro-company-site-workflow-${SITEOPS_WORKFLOW.frontMindVersion}.zip`,
+      `frontmind-${SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.") ? "react-static-company-site-workflow" : "astro-company-site-workflow"}-${SITEOPS_WORKFLOW.frontMindVersion}.zip`,
       "frontmind-siteops-source-dossier-v1.json",
       "selected-visual.png",
       "support-visual-1.png",
@@ -765,9 +781,15 @@ describe("Manus SiteOps provider boundary", () => {
     expect(createTask.mock.calls[0]![0].prompt).not.toContain(
       "星河智造提供设备服务",
     );
-    expect(createTask.mock.calls[0]![0].prompt).toContain("SiteDesignWireV2");
     expect(createTask.mock.calls[0]![0].prompt).toContain(
-      "frontmind-site-design-wire-v2.json",
+      SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
+        ? "SiteDesignWireV3"
+        : "SiteDesignWireV2",
+    );
+    expect(createTask.mock.calls[0]![0].prompt).toContain(
+      SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
+        ? "frontmind-site-design-wire-v3.json"
+        : "frontmind-site-design-wire-v2.json",
     );
     const createBody = buildManusV2CreateTaskBody(createTask.mock.calls[0]![0]);
     expect(createBody.message.content).toHaveLength(6);
@@ -792,7 +814,7 @@ describe("Manus SiteOps provider boundary", () => {
     taskStatus = "stopped";
     const designed = await handler({
       operation: {
-        ...operation,
+        ...buildOperation,
         providerTaskId: "manus-task-1",
         result: created.result,
       } as never,
@@ -805,7 +827,7 @@ describe("Manus SiteOps provider boundary", () => {
 
     const continued = await handler({
       operation: {
-        ...operation,
+        ...buildOperation,
         providerTaskId: "manus-task-1",
         result: designed.result,
       } as never,
@@ -820,7 +842,9 @@ describe("Manus SiteOps provider boundary", () => {
     expect(sendMessage.mock.calls[0]![0].taskId).toBe("manus-task-1");
     expect(sendMessage.mock.calls[0]![0].attachments).toEqual([
       expect.objectContaining({
-        filename: "frontmind-build-contract-v2.json",
+        filename: SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
+          ? "frontmind-build-plan-contract-v3.json"
+          : "frontmind-build-contract-v2.json",
         mime_type: "application/json",
       }),
       expect.objectContaining({

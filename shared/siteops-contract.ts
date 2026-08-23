@@ -77,6 +77,7 @@ export const siteOpsBuildProjectionSchema = z
     ordinal: z.number().int().positive(),
     parentBuildId: z.string().uuid().nullable(),
     agentProfile: managedAgentProfileSchema.nullable().optional(),
+    renderer: z.enum(["astro_static", "react_static"]).optional(),
     status: siteOpsBuildStatusSchema,
     previewUrl: z.string().max(2_048).nullable().default(null),
     sourceUrl: z.string().max(2_048).nullable().default(null),

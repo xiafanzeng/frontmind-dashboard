@@ -6,8 +6,9 @@ import JSZip from "jszip";
 
 export const SITEOPS_UPSTREAM_SHA256 =
   "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a";
-export const SITEOPS_RUNTIME_VERSION = "1.6.0";
-export const SITEOPS_MATERIALIZER_VERSION = "1.6.0";
+export const SITEOPS_RUNTIME_VERSION = "2.0.0";
+export const SITEOPS_MATERIALIZER_VERSION = "2.0.0";
+export const SITEOPS_COMPONENT_LIBRARY_VERSION = "2.0.0";
 
 const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -20,13 +21,16 @@ const upstreamPath = path.join(
 );
 const runtimeRoot = path.join(
   sourceRoot,
-  `astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`,
+  `react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`,
 );
 const manifestPath = path.join(runtimeRoot, "MANIFEST.json");
-const materializerPath = path.join(
-  projectRoot,
+const materializerPaths = [
   "server/siteops/build-runtime.ts",
-);
+  "server/siteops/react-static-runtime.ts",
+].map((relativePath) => ({
+  relativePath,
+  absolutePath: path.join(projectRoot, relativePath),
+}));
 const starterContractPath = path.join(
   runtimeRoot,
   "assets/host-starter-contract.json",
@@ -102,13 +106,20 @@ export async function createSiteOpsRuntimeManifest() {
       sha256: sha256(bytes),
     });
   }
-  const [starterContract, materializer] = await Promise.all([
+  const [starterContract, ...materializerSources] = await Promise.all([
     fs.readFile(starterContractPath),
-    fs.readFile(materializerPath),
+    ...materializerPaths.map(({ absolutePath }) => fs.readFile(absolutePath)),
   ]);
+  const materializer = Buffer.concat(
+    materializerSources.flatMap((bytes, index) => [
+      Buffer.from(`${materializerPaths[index].relativePath}\0`, "utf8"),
+      bytes,
+      Buffer.from("\0", "utf8"),
+    ]),
+  );
   return {
     schema: "frontmind-runtime-workflow-manifest/v1",
-    name: "frontmind-astro-company-site-workflow",
+    name: "frontmind-react-static-company-site-workflow",
     version: SITEOPS_RUNTIME_VERSION,
     entrypoint: "SKILL.md",
     upstream: {
@@ -118,7 +129,7 @@ export async function createSiteOpsRuntimeManifest() {
     hashScope: "all regular files except MANIFEST.json",
     host: {
       starterSha256: sha256(starterContract),
-      componentLibraryVersion: "1.0.0",
+      componentLibraryVersion: SITEOPS_COMPONENT_LIBRARY_VERSION,
       materializerVersion: SITEOPS_MATERIALIZER_VERSION,
       materializerSha256: sha256(materializer),
     },

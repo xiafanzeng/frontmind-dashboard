@@ -6,6 +6,8 @@ import { canonicalJson } from "../../shared/siteops-workflow";
 import {
   pageContentResultV1Schema,
   siteDesignResultV1Schema,
+  siteDesignResultV2Schema,
+  type ReferenceBlueprintV2,
 } from "../../shared/siteops-design";
 
 const layoutArchetypes = [
@@ -270,6 +272,164 @@ export function siteDesignResultFromWire(
         siteTitle: wire.siteTitle,
         description: wire.description,
         // Organization type is a Dashboard-owned SEO policy, not model input.
+        organizationType: "Organization",
+      },
+    },
+  });
+}
+
+/** React Static 2.0 wire contract deliberately omits Hero family and all
+ * reference geometry. Those coordinates are frozen by Dashboard before the
+ * task is created and injected after provider output validation. */
+export function siteDesignWireV3OutputSchema(input: {
+  operationToken: string;
+  routeIds: readonly string[];
+  paletteSize: number;
+}) {
+  const paletteIndices = Array.from(
+    { length: Math.max(1, input.paletteSize) },
+    (_, index) => index,
+  );
+  return assertSiteOpsStructuredOutputSchema({
+    type: "object",
+    properties: {
+      operationToken: { type: "string", enum: [input.operationToken] },
+      schemaVersion: { type: "number", enum: [3] },
+      layoutArchetype: { type: "string", enum: [...layoutArchetypes] },
+      density: { type: "string", enum: ["compact", "balanced", "spacious"] },
+      surfaceStyle: {
+        type: "string",
+        enum: ["flat", "bordered", "soft_depth", "layered"],
+      },
+      typeScale: {
+        type: "string",
+        enum: ["restrained", "editorial", "display"],
+      },
+      imageTreatment: {
+        type: "string",
+        enum: ["contained", "wide", "masked", "none"],
+      },
+      motionLevel: { type: "string", enum: ["none", "subtle"] },
+      backgroundPaletteIndex: { type: "number", enum: paletteIndices },
+      textPaletteIndex: { type: "number", enum: paletteIndices },
+      accentPaletteIndex: { type: "number", enum: paletteIndices },
+      siteTitle: { type: "string" },
+      description: { type: "string" },
+      routeSlots: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string", enum: [...input.routeIds] },
+            slotId: { type: "string" },
+            variant: { type: "string", enum: [...sectionVariants] },
+          },
+          required: ["routeId", "slotId", "variant"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: [
+      "operationToken",
+      "schemaVersion",
+      "layoutArchetype",
+      "density",
+      "surfaceStyle",
+      "typeScale",
+      "imageTreatment",
+      "motionLevel",
+      "backgroundPaletteIndex",
+      "textPaletteIndex",
+      "accentPaletteIndex",
+      "siteTitle",
+      "description",
+      "routeSlots",
+    ],
+    additionalProperties: false,
+  });
+}
+
+const siteDesignWireV3Schema = z
+  .object({
+    operationToken: z.string().min(1).max(128),
+    schemaVersion: z.literal(3),
+    layoutArchetype: z.enum(layoutArchetypes),
+    density: z.enum(["compact", "balanced", "spacious"]),
+    surfaceStyle: z.enum(["flat", "bordered", "soft_depth", "layered"]),
+    typeScale: z.enum(["restrained", "editorial", "display"]),
+    imageTreatment: z.enum(["contained", "wide", "masked", "none"]),
+    motionLevel: z.enum(["none", "subtle"]),
+    backgroundPaletteIndex: z.number().int().nonnegative().max(11),
+    textPaletteIndex: z.number().int().nonnegative().max(11),
+    accentPaletteIndex: z.number().int().nonnegative().max(11),
+    siteTitle: z.string().trim().min(1).max(80),
+    description: z.string().trim().min(1).max(200),
+    routeSlots: siteDesignWireV2Schema.shape.routeSlots,
+  })
+  .strict();
+
+function canonicalRouteCompositions(
+  routeIds: readonly string[],
+  routeSlots: Array<{
+    routeId: string;
+    slotId: string;
+    variant: (typeof sectionVariants)[number];
+  }>,
+) {
+  const expectedRouteIds = new Set(routeIds);
+  if (
+    routeSlots.some((slot) => !expectedRouteIds.has(slot.routeId)) ||
+    new Set(routeIds).size !== routeIds.length
+  ) {
+    throw new Error("SITEOPS_DESIGN_ROUTE_SET_MISMATCH");
+  }
+  const canonicalSlots = routeIds.flatMap((routeId) =>
+    routeSlots.filter((slot) => slot.routeId === routeId),
+  );
+  if (
+    canonicalSlots.length !== routeSlots.length ||
+    canonicalSlots.some((slot, index) => slot !== routeSlots[index])
+  ) {
+    throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
+  }
+  const routeCompositions = routeIds.map((routeId) => ({
+    routeId,
+    slots: routeSlots
+      .filter((slot) => slot.routeId === routeId)
+      .map(({ slotId, variant }) => ({ slotId, variant })),
+  }));
+  if (routeCompositions.some((route) => route.slots.length < 1)) {
+    throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
+  }
+  return routeCompositions;
+}
+
+export function siteDesignResultV2FromWire(
+  value: unknown,
+  routeIds: readonly string[],
+  referenceBlueprint: ReferenceBlueprintV2,
+) {
+  const wire = siteDesignWireV3Schema.parse(value);
+  return siteDesignResultV2Schema.parse({
+    operationToken: wire.operationToken,
+    designSpec: {
+      schemaVersion: 2,
+      referenceBlueprint,
+      layoutArchetype: wire.layoutArchetype,
+      density: wire.density,
+      surfaceStyle: wire.surfaceStyle,
+      typeScale: wire.typeScale,
+      imageTreatment: wire.imageTreatment,
+      motionLevel: wire.motionLevel,
+      colorRoles: {
+        backgroundPaletteIndex: wire.backgroundPaletteIndex,
+        textPaletteIndex: wire.textPaletteIndex,
+        accentPaletteIndex: wire.accentPaletteIndex,
+      },
+      routeCompositions: canonicalRouteCompositions(routeIds, wire.routeSlots),
+      seoPlan: {
+        siteTitle: wire.siteTitle,
+        description: wire.description,
         organizationType: "Organization",
       },
     },
@@ -677,6 +837,10 @@ export function siteOpsSourceDossierAttachments(input: {
 
 export function siteOpsBuildContractAttachment(contract: unknown) {
   return jsonAttachment("frontmind-build-contract-v2.json", contract);
+}
+
+export function siteOpsBuildPlanContractV3Attachment(contract: unknown) {
+  return jsonAttachment("frontmind-build-plan-contract-v3.json", contract);
 }
 
 export function siteOpsCustomerFeedbackAttachment(feedback: string) {

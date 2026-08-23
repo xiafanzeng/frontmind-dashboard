@@ -561,7 +561,11 @@ describe("SiteOpsConversationPanel", () => {
     expect(screen.queryByRole("button", { name: /^选择 [A-I]$/u })).toBeNull();
   });
 
-  it("renders private preview and source actions for a ready build", () => {
+  it("opens and focuses private preview in the reusable named tab", () => {
+    const focus = vi.fn();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ focus } as unknown as Window);
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -588,16 +592,142 @@ describe("SiteOpsConversationPanel", () => {
         onAction={vi.fn()}
       />,
     );
-    expect(screen.getByRole("link", { name: "打开私有预览" })).toHaveAttribute(
-      "href",
+    const previewButton = screen.getByRole("button", {
+      name: "在新标签页打开私有预览",
+    });
+    fireEvent.click(previewButton);
+    fireEvent.click(previewButton);
+    expect(open).toHaveBeenNthCalledWith(
+      1,
       "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      "frontmind-siteops-preview",
     );
+    expect(open).toHaveBeenNthCalledWith(
+      2,
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      "frontmind-siteops-preview",
+    );
+    expect(focus).toHaveBeenCalledTimes(2);
     expect(
       screen.getByRole("link", { name: "下载源码 ZIP" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "批准这个版本" }),
     ).toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it("shows a safe retry link when the private preview popup is blocked", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 2,
+              parentBuildId: null,
+              status: "preview_ready",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              qaUrl: null,
+              errorCode: null,
+              errorMessage: null,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+          interactionState: "preview_ready",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "在新标签页打开私有预览",
+      }),
+    );
+    expect(
+      screen.getByText(
+        "预览标签页被浏览器阻止，请允许此站点打开弹窗后重试。",
+      ),
+    ).toBeInTheDocument();
+
+    const retryLink = screen.getByRole("link", {
+      name: "重试打开私有预览",
+    });
+    expect(retryLink).toHaveAttribute(
+      "href",
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+    );
+    expect(retryLink).toHaveAttribute(
+      "target",
+      "frontmind-siteops-preview",
+    );
+    fireEvent.click(retryLink);
+    expect(open).toHaveBeenCalledTimes(2);
+    open.mockRestore();
+  });
+
+  it("keeps the previous Astro preview available beside a React child build", () => {
+    const focus = vi.fn();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ focus } as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 4,
+              parentBuildId: null,
+              renderer: "astro_static",
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              qaUrl: null,
+              errorCode: null,
+              errorMessage: null,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              ordinal: 5,
+              parentBuildId: "33333333-3333-4333-8333-333333333333",
+              renderer: "react_static",
+              status: "preview_ready",
+              previewUrl:
+                "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/preview/",
+              sourceUrl: null,
+              qaUrl: null,
+              errorCode: null,
+              errorMessage: null,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          interactionState: "preview_ready",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("历史版本对比")).toBeInTheDocument();
+    const historical = screen.getByRole("button", {
+      name: "官网版本 4 · Astro",
+    });
+    fireEvent.click(historical);
+    expect(open).toHaveBeenCalledWith(
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      "frontmind-siteops-preview",
+    );
+    expect(focus).toHaveBeenCalledTimes(1);
+    open.mockRestore();
   });
 
   it("does not offer a duplicate publish while the same target is pending", () => {

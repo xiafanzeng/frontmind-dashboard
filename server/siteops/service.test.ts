@@ -8,6 +8,7 @@ import {
   createVisualSearchOperationInput,
   currentSiteOpsBuildWorkflowCoordinates,
   freezeSiteOpsCustomerAiCredential,
+  freezeSiteOpsReferenceBlueprint,
   hashSiteOpsRequest,
   isSiteOpsFailedBuildResettable,
   isSiteOpsOperationReplay,
@@ -15,6 +16,7 @@ import {
   isSiteOpsStoppedProviderTaskResetSafe,
   normalizeSiteOpsDomain,
   parseSiteOpsActionPayload,
+  referenceBlueprintForSiteOpsRevision,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
   siteBriefFromSnapshot,
@@ -23,6 +25,7 @@ import {
   siteOpsResetCapability,
   SiteOpsServiceError,
 } from "./service";
+import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
   SITEOPS_WORKFLOW,
   siteOpsActInputSchema,
@@ -33,6 +36,56 @@ import {
 import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
 
 describe("SiteOps core contracts", () => {
+  it("freezes the selected production F reference to a hashed floating-orbit blueprint", () => {
+    const visualEvidence = createVisualEvidenceV1({
+      evidenceKind: "catalog_metadata_preview_v1",
+      providerItemKey: "n:8435",
+      metadataSha256: "a".repeat(64),
+      providerResponseSha256: "b".repeat(64),
+      previewSha256: "c".repeat(64),
+      taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+    });
+    const frozen = freezeSiteOpsReferenceBlueprint({
+      sampleId: "10000000-0000-4000-8000-000000000001",
+      note: "Hero Section 7",
+      sourceMetadata: {
+        providerItemKey: "n:8435",
+        title: "Hero Section 7",
+        sourceUrl: "https://21st.dev/@ravikatiyar162/components/hero-section-7",
+        heroEligibility: {
+          eligible: true,
+          confidence: "explicit",
+          variant: "centered_statement",
+        },
+        visualEvidence,
+      },
+    });
+    expect(frozen.heroFamily).toBe("floating_orbit");
+    expect(frozen.mediaStrategy).toBe("procedural_brand_svg");
+    expect(frozen.blueprintHash).toHaveLength(64);
+
+    const inherited = referenceBlueprintForSiteOpsRevision({
+      parentWorkflowVersion: "2.0.0",
+      parentOperationInput: { referenceBlueprint: frozen },
+      derivedReferenceBlueprint: frozen,
+    });
+    expect(inherited).toEqual(frozen);
+    expect(() =>
+      referenceBlueprintForSiteOpsRevision({
+        parentWorkflowVersion: "2.0.0",
+        parentOperationInput: {},
+        derivedReferenceBlueprint: frozen,
+      }),
+    ).toThrow("不能静默改变视觉方向");
+    expect(
+      referenceBlueprintForSiteOpsRevision({
+        parentWorkflowVersion: "1.6.0",
+        parentOperationInput: {},
+        derivedReferenceBlueprint: frozen,
+      }),
+    ).toEqual(frozen);
+  });
+
   it("freezes every new root or revision build to the current complete workflow coordinates", () => {
     expect(currentSiteOpsBuildWorkflowCoordinates()).toEqual({
       workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,

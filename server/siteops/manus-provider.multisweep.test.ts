@@ -141,9 +141,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         knowledgeArchiveHash: "a".repeat(64),
         workflowUpstreamVersion: "1.0.0",
         workflowUpstreamHash: "b".repeat(64),
-        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+        workflowVersion: "1.6.0",
         workflowPackageHash: "c".repeat(64),
-        starterVersion: SITEOPS_WORKFLOW.starterVersion,
+        starterVersion: "1.6.0",
         brief: {
           companyName: "星河智造",
           primaryLanguage: "zh-CN",

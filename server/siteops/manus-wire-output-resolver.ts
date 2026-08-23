@@ -13,6 +13,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 
 export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
   design: "frontmind-site-design-wire-v2.json",
+  designV3: "frontmind-site-design-wire-v3.json",
   content: "frontmind-page-content-wire-v2.json",
 });
 
@@ -21,7 +22,7 @@ const SITEOPS_WIRE_OUTPUT_MAX_BYTES = Object.freeze({
   content: 2 * 1024 * 1024,
 });
 
-export type SiteOpsWireOutputPhase = keyof typeof SITEOPS_WIRE_OUTPUT_FILES;
+export type SiteOpsWireOutputPhase = "design" | "content";
 
 type JsonObject = Record<string, unknown>;
 
@@ -359,11 +360,15 @@ export async function resolveSiteOpsWireOutput(input: {
   signal?: AbortSignal;
   fetchPinned?: FetchPinnedPublicHttps;
 }): Promise<SiteOpsWireOutputResolution | null> {
-  const expectedFilename = SITEOPS_WIRE_OUTPUT_FILES[input.phase];
+  const allowedFilenames: readonly string[] =
+    input.phase === "design"
+      ? [SITEOPS_WIRE_OUTPUT_FILES.design, SITEOPS_WIRE_OUTPUT_FILES.designV3]
+      : [SITEOPS_WIRE_OUTPUT_FILES.content];
   const maxBytes = SITEOPS_WIRE_OUTPUT_MAX_BYTES[input.phase];
-  if (input.expectedFilename !== expectedFilename) {
+  if (!allowedFilenames.includes(input.expectedFilename)) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
+  const expectedFilename = input.expectedFilename;
   // A structured result is phase output only after the task has stopped for
   // that phase. Accepting it while running can send the next message into the
   // same task before the current response is complete.

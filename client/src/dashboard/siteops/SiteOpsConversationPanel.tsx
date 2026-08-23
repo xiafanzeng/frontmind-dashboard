@@ -96,6 +96,8 @@ const CARD_LABELS: Record<string, string> = {
   release_status: "发布状态",
 };
 
+const PRIVATE_PREVIEW_WINDOW_NAME = "frontmind-siteops-preview";
+
 function activeCardMessage(
   messages: SiteOpsMessageProjection[],
   kind: SiteOpsActionContext["cardKind"],
@@ -224,6 +226,7 @@ export default function SiteOpsConversationPanel({
   const [selectedSnapshotId, setSelectedSnapshotId] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [previewOpenError, setPreviewOpenError] = useState<string | null>(null);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
   const [managedAgentProfile, setManagedAgentProfile] =
@@ -254,12 +257,43 @@ export default function SiteOpsConversationPanel({
       ) ?? null
     );
   }, [observation?.builds]);
+  const historicalPreviewBuilds = useMemo(
+    () =>
+      observation?.builds
+        .filter(
+          (build) =>
+            build.id !== latestBuild?.id &&
+            Boolean(build.previewUrl) &&
+            !["cancelled"].includes(build.status),
+        )
+        .sort((left, right) => right.ordinal - left.ordinal) ?? [],
+    [latestBuild?.id, observation?.builds],
+  );
 
   useEffect(() => {
     if (latestBuild?.agentProfile) {
       setManagedAgentProfile(latestBuild.agentProfile);
     }
   }, [latestBuild?.agentProfile]);
+
+  useEffect(() => {
+    setPreviewOpenError(null);
+  }, [latestBuild?.previewUrl]);
+
+  function openPrivatePreview(previewUrl: string) {
+    setPreviewOpenError(null);
+    const previewWindow = window.open(
+      previewUrl,
+      PRIVATE_PREVIEW_WINDOW_NAME,
+    );
+    if (!previewWindow) {
+      setPreviewOpenError(
+        "预览标签页被浏览器阻止，请允许此站点打开弹窗后重试。",
+      );
+      return;
+    }
+    previewWindow.focus();
+  }
 
   async function runAction(key: string, input: SiteOpsActionContext) {
     if (!onAction || busyAction) return;
@@ -1040,7 +1074,12 @@ export default function SiteOpsConversationPanel({
           aria-labelledby="siteops-build-title"
         >
           <div>
-            <span>官网版本 {latestBuild.ordinal}</span>
+            <span>
+              官网版本 {latestBuild.ordinal}
+              {latestBuild.renderer
+                ? ` · ${latestBuild.renderer === "react_static" ? "React 静态" : "Astro"}`
+                : ""}
+            </span>
             <h3 id="siteops-build-title">
               {BUILD_STATUS_LABELS[latestBuild.status] || latestBuild.status}
             </h3>
@@ -1048,10 +1087,14 @@ export default function SiteOpsConversationPanel({
           </div>
           <div className="siteops-build-actions">
             {latestBuild.previewUrl && (
-              <a href={latestBuild.previewUrl} target="_blank" rel="noreferrer">
+              <button
+                type="button"
+                className="siteops-secondary-button"
+                onClick={() => openPrivatePreview(latestBuild.previewUrl!)}
+              >
                 <ExternalLink size={15} aria-hidden="true" />
-                打开私有预览
-              </a>
+                在新标签页打开私有预览
+              </button>
             )}
             {latestBuild.sourceUrl && (
               <a href={latestBuild.sourceUrl}>
@@ -1109,6 +1152,47 @@ export default function SiteOpsConversationPanel({
               >
                 重新选择视觉方向
               </button>
+            )}
+            {previewOpenError && latestBuild.previewUrl && (
+              <div
+                className="siteops-notice error siteops-preview-open-error"
+                role="alert"
+              >
+                <AlertCircle size={18} aria-hidden="true" />
+                <span>{previewOpenError}</span>
+                <a
+                  href={latestBuild.previewUrl}
+                  target={PRIVATE_PREVIEW_WINDOW_NAME}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    openPrivatePreview(latestBuild.previewUrl!);
+                  }}
+                >
+                  重试打开私有预览
+                </a>
+              </div>
+            )}
+            {historicalPreviewBuilds.length > 0 && (
+              <div
+                className="siteops-preview-history"
+                aria-label="历史官网版本对比"
+              >
+                <strong>历史版本对比</strong>
+                <span>当前版本与旧版本均保持不可变，可在同一预览标签页切换查看。</span>
+                <div>
+                  {historicalPreviewBuilds.map((build) => (
+                    <button
+                      key={build.id}
+                      type="button"
+                      className="siteops-secondary-button"
+                      onClick={() => openPrivatePreview(build.previewUrl!)}
+                    >
+                      <ExternalLink size={15} aria-hidden="true" />
+                      官网版本 {build.ordinal} · {build.renderer === "react_static" ? "React 静态" : "Astro"}
+                    </button>
+                  ))}
+                </div>
+              </div>
             )}
             {latestBuild.status === "approved" && (
               <>

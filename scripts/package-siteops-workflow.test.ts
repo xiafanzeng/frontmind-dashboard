@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { SITEOPS_MATERIALIZER_V1_5, SITEOPS_WORKFLOW } from "../shared/siteops";
+import {
+  SITEOPS_MATERIALIZER_V1_5,
+  SITEOPS_MATERIALIZER_V1_6,
+  SITEOPS_WORKFLOW,
+} from "../shared/siteops";
 import {
   SITEOPS_MATERIALIZER_VERSION,
   SITEOPS_UPSTREAM_SHA256,
@@ -70,14 +74,14 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 1.6.0 host materialization contract", async () => {
+  it("has a current deterministic FrontMind 2.0.0 React static contract", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
       version: SITEOPS_RUNTIME_VERSION,
       upstream: { archiveSha256: SITEOPS_UPSTREAM_SHA256 },
       host: {
         starterSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        componentLibraryVersion: "1.0.0",
+        componentLibraryVersion: "2.0.0",
         materializerVersion: SITEOPS_MATERIALIZER_VERSION,
         materializerSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
@@ -85,7 +89,7 @@ describe("SiteOps runtime workflow package", () => {
     await expect(verifySiteOpsRuntimeWorkflow()).resolves.toEqual(generated);
     const runtime = JSON.parse(
       await readFile(
-        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/runtime-contract.json`,
+        `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/runtime-contract.json`,
         "utf8",
       ),
     );
@@ -99,6 +103,7 @@ describe("SiteOps runtime workflow package", () => {
       supportReferenceRoles: ["section", "motion"],
       promptRequired: false,
       providerCodeReuse: false,
+      hostFamilyMappingRequired: true,
     });
     expect(runtime.knowledgeInput).toMatchObject({
       transport: "manifest-verified-json-attachments",
@@ -106,28 +111,33 @@ describe("SiteOps runtime workflow package", () => {
       messageCharacterLimit: 3000,
     });
     expect(runtime.providerWire).toMatchObject({
-      phaseOneSchema: "schemas/site-design-wire-v2.schema.json",
-      phaseOneCanonical: "SiteDesignSpecV1",
-      phaseOneOutputFilename: "frontmind-site-design-wire-v2.json",
+      phaseOneSchema: "schemas/site-design-wire-v3.schema.json",
+      phaseOneCanonical:
+        "SiteDesignSpecV2-with-host-injected-ReferenceBlueprintV2",
+      phaseOneOutputFilename: "frontmind-site-design-wire-v3.json",
       phaseTwoSchema: "schemas/page-content-wire-v2.schema.json",
       phaseTwoCanonical: "PageContentSpecV1",
       phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
       maximumSchemaDepth: 5,
+      referenceCoordinatesAcceptedFromProvider: false,
     });
     expect(runtime.aiTask).toMatchObject({
       taskCount: 1,
       sameTaskForBothPhases: true,
-      phaseOneOutput: "SiteDesignWireV2",
-      phaseOneOutputFilename: "frontmind-site-design-wire-v2.json",
+      phaseOneOutput: "SiteDesignWireV3",
+      phaseOneOutputFilename: "frontmind-site-design-wire-v3.json",
       phaseTwoOutput: "PageContentWireV2",
       phaseTwoOutputFilename: "frontmind-page-content-wire-v2.json",
     });
     expect(runtime.host).toMatchObject({
+      profile: "react-static-html",
       sourceDataOwner: "dashboard",
       sourceDataFormat: "canonical-json",
       templateOwner: "dashboard",
-      templateRuntime: "astro",
-      providerTextInterpolationIntoTemplate: false,
+      templateRuntime: "react-dom/server",
+      hydrationAllowed: false,
+      runtimeJavaScriptAllowed: false,
+      providerTextInterpolationIntoSource: false,
     });
     expect(runtime.assetProjection).toEqual({
       decisionIdentity: "asset-id",
@@ -137,26 +147,25 @@ describe("SiteOps runtime workflow package", () => {
       publishedBrandBinding: "exact-asset-id-and-sha256",
       quarantineConflictPolicy: "reject-emitted-sha256",
     });
-    expect(runtime.semanticColors).toMatchObject({
-      owner: "dashboard",
-      roles: ["canvas", "ink", "accent", "muted"],
-      mutedUsage: "decorative-surface-only",
-      failurePolicy: "deterministic-host-fallback",
-      providerOwnsFinalCssColors: false,
+    expect(runtime.renderer).toMatchObject({
+      kind: "react_static_v1",
+      componentLibraryVersion: "2.0.0",
+      materializerVersion: "2.0.0",
+      renderMethod: "renderToStaticMarkup",
+      routeDocuments: true,
     });
-    expect(runtime.semanticColors.requiredContrastPairs).toEqual([
-      { foreground: "ink", background: "canvas", minimumRatio: 7 },
-      { foreground: "accent", background: "canvas", minimumRatio: 4.5 },
-      { foreground: "canvas", background: "ink", minimumRatio: 7 },
-      { foreground: "ink", background: "muted", minimumRatio: 4.5 },
-    ]);
+    expect(runtime.referenceBlueprint).toMatchObject({
+      schema: "ReferenceBlueprintV2",
+      familyFrozenByDashboard: true,
+      providerCodeAccepted: false,
+    });
     expect(runtime.typedMaterialization).toEqual({
-      schema: "schemas/materialization-stage-v1.schema.json",
+      schema: "schemas/materialization-stage-v2.schema.json",
       phases: [
         "input_validation",
         "asset_projection",
         "source_generation",
-        "astro_build",
+        "react_static_build",
         "static_qa",
         "browser_qa",
         "lighthouse",
@@ -168,7 +177,7 @@ describe("SiteOps runtime workflow package", () => {
       hostFailureRepairByAiAllowed: false,
     });
     const manifestBytes = await readFile(
-      `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/MANIFEST.json`,
+      `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/MANIFEST.json`,
     );
     expect(SITEOPS_WORKFLOW).toMatchObject({
       frontMindVersion: SITEOPS_RUNTIME_VERSION,
@@ -179,30 +188,36 @@ describe("SiteOps runtime workflow package", () => {
       starterSha256: generated.host.starterSha256,
       materializerVersion: SITEOPS_MATERIALIZER_VERSION,
       materializerSha256: generated.host.materializerSha256,
-      qaPolicyVersion: "siteops-qa-v2",
+      qaPolicyVersion: "siteops-qa-v3",
     });
   });
 
-  it("retains immutable 1.5 coordinates while 1.6 freezes complete coordinates", async () => {
+  it("retains immutable Astro coordinates while 2.0 freezes complete React coordinates", async () => {
     const [legacyManifest, envelope, stageSchema, starter] = await Promise.all([
       readFile(
         "private-workflows/astro-company-site-workflow-v1.5.0/MANIFEST.json",
       ),
       readFile(
-        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/schemas/frontmind-run-envelope.schema.json`,
+        `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/schemas/frontmind-run-envelope.schema.json`,
         "utf8",
       ),
       readFile(
-        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/schemas/materialization-stage-v1.schema.json`,
+        `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/schemas/materialization-stage-v2.schema.json`,
         "utf8",
       ),
       readFile(
-        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/assets/host-starter-contract.json`,
+        `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/assets/host-starter-contract.json`,
         "utf8",
       ),
     ]);
     expect(createHash("sha256").update(legacyManifest).digest("hex")).toBe(
       SITEOPS_MATERIALIZER_V1_5.runtimeManifestSha256,
+    );
+    const astro16Manifest = await readFile(
+      "private-workflows/astro-company-site-workflow-v1.6.0/MANIFEST.json",
+    );
+    expect(createHash("sha256").update(astro16Manifest).digest("hex")).toBe(
+      SITEOPS_MATERIALIZER_V1_6.runtimeManifestSha256,
     );
     for (const version of ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]) {
       const preserved = JSON.parse(
@@ -220,7 +235,7 @@ describe("SiteOps runtime workflow package", () => {
         workflow: { required: string[]; properties: Record<string, unknown> };
       };
     };
-    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 5 });
+    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 6 });
     expect(frozenEnvelope.properties.workflow.required.sort()).toEqual(
       [
         "version",
@@ -236,9 +251,9 @@ describe("SiteOps runtime workflow package", () => {
     expect(frozenEnvelope.properties.workflow.properties).toMatchObject({
       version: { const: SITEOPS_RUNTIME_VERSION },
       starterVersion: { const: SITEOPS_RUNTIME_VERSION },
-      componentLibraryVersion: { const: "1.0.0" },
+      componentLibraryVersion: { const: "2.0.0" },
       materializerVersion: { const: SITEOPS_MATERIALIZER_VERSION },
-      qaPolicyVersion: { const: "siteops-qa-v2" },
+      qaPolicyVersion: { const: "siteops-qa-v3" },
     });
 
     const stages = JSON.parse(stageSchema) as {
@@ -249,7 +264,7 @@ describe("SiteOps runtime workflow package", () => {
     };
     const runtime = JSON.parse(
       await readFile(
-        `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/runtime-contract.json`,
+        `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}/runtime-contract.json`,
         "utf8",
       ),
     );
@@ -261,12 +276,12 @@ describe("SiteOps runtime workflow package", () => {
     );
 
     expect(JSON.parse(starter)).toMatchObject({
-      schema: "frontmind-siteops-host-starter/v2",
+      schema: "frontmind-siteops-host-starter/v3",
       version: SITEOPS_RUNTIME_VERSION,
       contentBoundary: {
         customerAndProviderText: "canonical-json-data-only",
-        astroTemplates: "host-owned-only",
-        textInterpolationIntoAstroSource: false,
+        reactComponents: "host-owned-only",
+        providerTextInterpolationIntoSource: false,
       },
       assetDecisionPolicy: {
         duplicateSha256Allowed: true,
@@ -276,10 +291,10 @@ describe("SiteOps runtime workflow package", () => {
   });
 
   it("ships provider-compatible flat wire schemas", async () => {
-    const workflowRoot = `private-workflows/astro-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`;
+    const workflowRoot = `private-workflows/react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`;
     const [design, content] = await Promise.all([
       readFile(
-        `${workflowRoot}/schemas/site-design-wire-v2.schema.json`,
+        `${workflowRoot}/schemas/site-design-wire-v3.schema.json`,
         "utf8",
       ),
       readFile(
@@ -300,6 +315,8 @@ describe("SiteOps runtime workflow package", () => {
       }
     ).items;
     expect(designSchema.properties).not.toHaveProperty("organizationType");
+    expect(designSchema.properties).not.toHaveProperty("heroFamily");
+    expect(designSchema.properties).not.toHaveProperty("referenceBlueprint");
     expect(routeSlotSchema.properties).not.toHaveProperty("order");
     expect(
       (JSON.parse(content) as { properties: { schemaVersion: unknown } })
