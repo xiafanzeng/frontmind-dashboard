@@ -71,6 +71,7 @@ import {
   type ManagedAgentProfile,
 } from "../../shared/manus-agent-profile";
 import {
+  AuthServiceError,
   getDecryptedCredentialForUser,
   type AuthenticatedUser,
 } from "../auth-service";
@@ -2372,6 +2373,25 @@ export async function observeSiteOps(actor: AuthenticatedUser, value: unknown) {
 
 function translateAliyunConnectionError(error: unknown): never {
   if (error instanceof SiteOpsServiceError) throw error;
+  if (error instanceof AuthServiceError) {
+    if (error.code === "INVALID_CREDENTIAL" || error.code === "NOT_FOUND") {
+      throw new SiteOpsServiceError(
+        "PROVIDER_NOT_CONFIGURED",
+        "阿里云连接配置需要 FrontMind 管理员更新。",
+        409,
+      );
+    }
+    if (
+      error.code === "RATE_LIMITED" ||
+      error.code === "UPSTREAM_UNAVAILABLE"
+    ) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "阿里云授权服务暂时不可用，请稍后重试。",
+        503,
+      );
+    }
+  }
   if (error instanceof AliyunProviderError) {
     const notFound = error.code === "NOT_FOUND";
     const invalid = [

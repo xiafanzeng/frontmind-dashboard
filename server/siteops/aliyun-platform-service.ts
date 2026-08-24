@@ -78,6 +78,57 @@ const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const noControlCharacters = (value: string) =>
   !/[\u0000-\u001f\u007f]/u.test(value);
 
+const aliyunOAuthCallbackUrlSchema = z
+  .string()
+  .url()
+  .max(2_048)
+  .transform((value, context) => {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.search ||
+      url.hash ||
+      url.pathname !== "/api/site-ops/aliyun/oauth/callback"
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "阿里云 OAuth 回调必须是无查询参数的 HTTPS SiteOps 回调地址。",
+      });
+      return z.NEVER;
+    }
+    return url.toString();
+  });
+
+const appSecretIdPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
+
+export const aliyunOAuthApplicationIdSchema = z
+  .string()
+  .trim()
+  .superRefine((value, context) => {
+    if (appSecretIdPattern.test(value)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "当前填写的是应用密钥 ID，请改填 OAuth 应用基本信息中的应用 ID。",
+      });
+      return;
+    }
+    if (
+      value.length < 6 ||
+      value.length > 64 ||
+      !/^\d+$/u.test(value) ||
+      !noControlCharacters(value)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。",
+      });
+    }
+  });
+
 export const aliyunBrokerCredentialInputSchema = z
   .object({
     accessKeyId: z.string().trim().min(8).max(128).refine(noControlCharacters),
@@ -96,6 +147,23 @@ export const aliyunBrokerCredentialInputSchema = z
 
 export const aliyunOAuthCredentialInputSchema = z
   .object({
+    clientId: aliyunOAuthApplicationIdSchema,
+    clientSecret: z
+      .string()
+      .trim()
+      .min(16)
+      .max(4_096)
+      .refine(noControlCharacters),
+    callbackUrl: aliyunOAuthCallbackUrlSchema,
+  })
+  .strict();
+
+// Historical encrypted rows used a looser client-id contract. They remain
+// readable so an administrator can inspect and replace them without a data
+// rewrite, but all new writes and authorization attempts use the strict schema
+// above.
+const aliyunOAuthStoredCredentialSchema = z
+  .object({
     clientId: z.string().trim().min(4).max(256).refine(noControlCharacters),
     clientSecret: z
       .string()
@@ -103,30 +171,7 @@ export const aliyunOAuthCredentialInputSchema = z
       .min(16)
       .max(4_096)
       .refine(noControlCharacters),
-    callbackUrl: z
-      .string()
-      .url()
-      .max(2_048)
-      .transform((value, context) => {
-        const url = new URL(value);
-        if (
-          url.protocol !== "https:" ||
-          url.username ||
-          url.password ||
-          url.port ||
-          url.search ||
-          url.hash ||
-          url.pathname !== "/api/site-ops/aliyun/oauth/callback"
-        ) {
-          context.addIssue({
-            code: z.ZodIssueCode.custom,
-            message:
-              "阿里云 OAuth 回调必须是无查询参数的 HTTPS SiteOps 回调地址。",
-          });
-          return z.NEVER;
-        }
-        return url.toString();
-      }),
+    callbackUrl: aliyunOAuthCallbackUrlSchema,
   })
   .strict();
 
@@ -135,6 +180,9 @@ export type AliyunBrokerCredential = z.infer<
 >;
 export type AliyunOAuthCredential = z.infer<
   typeof aliyunOAuthCredentialInputSchema
+>;
+export type AliyunOAuthStoredCredential = z.infer<
+  typeof aliyunOAuthStoredCredentialSchema
 >;
 
 type PlatformCredentialSlot =
@@ -172,7 +220,7 @@ function canonicalCredentialJson(value: unknown) {
 export function encryptAliyunPlatformCredential(
   slot: PlatformCredentialSlot,
   credentialId: string,
-  value: AliyunBrokerCredential | AliyunOAuthCredential,
+  value: AliyunBrokerCredential | AliyunOAuthStoredCredential,
 ) {
   return encryptCredentialSecret(
     credentialAad(slot, credentialId),
@@ -326,16 +374,235 @@ async function boundedJson(
   return value as Record<string, unknown>;
 }
 
-export async function inspectAliyunOAuthConfiguration(
-  _credential: AliyunOAuthCredential,
+async function boundedText(response: Response) {
+  const length = Number(response.headers.get("content-length") ?? "0");
+  if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "阿里云身份服务响应超过安全上限",
+    );
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "阿里云身份服务响应超过安全上限",
+    );
+  }
+  return text;
+}
+
+async function fetchAliyunIdentityResponse(
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit,
+) {
+  try {
+    return await fetchImpl(url, init);
+  } catch (error) {
+    if (error instanceof AuthServiceError) throw error;
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "阿里云身份服务暂时不可用，请稍后重试；现有平台配置未被覆盖。",
+    );
+  }
+}
+
+function throwForTransientOAuthStatus(status: number) {
+  if (status === 429) {
+    throw new AuthServiceError(
+      "RATE_LIMITED",
+      "阿里云身份服务请求过于频繁，请稍后重试；现有平台配置未被覆盖。",
+    );
+  }
+  if (status >= 500) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "阿里云身份服务暂时不可用，请稍后重试；现有平台配置未被覆盖。",
+    );
+  }
+}
+
+function requireCurrentAliyunOAuthCredential(
+  credential: AliyunOAuthStoredCredential,
+) {
+  const parsed = aliyunOAuthCredentialInputSchema.safeParse(credential);
+  if (parsed.success) return parsed.data;
+  if (appSecretIdPattern.test(credential.clientId)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "当前填写的是应用密钥 ID，请改填 OAuth 应用基本信息中的应用 ID。",
+    );
+  }
+  throw new AuthServiceError(
+    "INVALID_CREDENTIAL",
+    "OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。",
+  );
+}
+
+export function buildAliyunOAuthAuthorizationUrl(
+  credential: Pick<AliyunOAuthStoredCredential, "clientId" | "callbackUrl">,
+  state: string,
+) {
+  const url = new URL(ALIYUN_OAUTH_AUTHORIZE_ENDPOINT);
+  url.searchParams.set("client_id", credential.clientId);
+  url.searchParams.set("redirect_uri", credential.callbackUrl);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", "openid aliuid profile");
+  url.searchParams.set("access_type", "online");
+  url.searchParams.set("prompt", "admin_consent");
+  url.searchParams.set("state", state);
+  return url;
+}
+
+function oauthAuthorizationErrorPayload(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const payload = value as Record<string, unknown>;
+  const error = typeof payload.error === "string" ? payload.error : "";
+  const description =
+    typeof payload.error_description === "string"
+      ? payload.error_description
+      : typeof payload.errorDescription === "string"
+        ? payload.errorDescription
+        : "";
+  return error || description ? { error, description } : null;
+}
+
+function throwAliyunOAuthAuthorizationError(value: unknown) {
+  const payload = oauthAuthorizationErrorPayload(value);
+  if (!payload) return;
+  const error = payload.error.toLowerCase();
+  const description = payload.description.toLowerCase();
+  if (error === "invalid_client" || description.includes("app not exists")) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "阿里云无法识别该 OAuth 应用 ID；请填写应用基本信息中的数字型 AppId。",
+    );
+  }
+  if (
+    error === "invalid_scope" ||
+    (description.includes("scope") &&
+      /invalid|unsupported|not (?:allowed|support)/u.test(description))
+  ) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "阿里云 OAuth 应用未启用 FrontMind 所需的 openid、aliuid 和 profile 范围。",
+    );
+  }
+  if (
+    error.includes("redirect") ||
+    description.includes("redirect_uri") ||
+    description.includes("redirect uri") ||
+    description.includes("callback")
+  ) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "阿里云 OAuth 应用的回调地址与 FrontMind 配置不一致。",
+    );
+  }
+  throw new AuthServiceError(
+    "INVALID_CREDENTIAL",
+    "阿里云 OAuth 应用配置无效，请核对应用 ID、回调地址和授权范围。",
+  );
+}
+
+function parseOAuthAuthorizationErrorText(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || trimmed.length > MAX_RESPONSE_BYTES) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+export async function probeAliyunOAuthAuthorization(
+  storedCredential: AliyunOAuthStoredCredential,
   fetchImpl: typeof fetch = fetch,
 ) {
-  const response = await fetchImpl(ALIYUN_OIDC_DISCOVERY_ENDPOINT, {
-    method: "GET",
-    redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    headers: { Accept: "application/json" },
-  });
+  const credential = requireCurrentAliyunOAuthCredential(storedCredential);
+  const state = randomBytes(18).toString("base64url");
+  const url = buildAliyunOAuthAuthorizationUrl(credential, state);
+  const response = await fetchAliyunIdentityResponse(
+    fetchImpl,
+    url.toString(),
+    {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: { Accept: "text/html, application/json" },
+    },
+  );
+  throwForTransientOAuthStatus(response.status);
+
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  const redirectLocation = response.headers.get("location");
+  if (redirectLocation) {
+    try {
+      const redirectUrl = new URL(redirectLocation, url);
+      throwAliyunOAuthAuthorizationError({
+        error: redirectUrl.searchParams.get("error") ?? "",
+        error_description:
+          redirectUrl.searchParams.get("error_description") ?? "",
+      });
+    } catch (error) {
+      if (error instanceof AuthServiceError) throw error;
+    }
+    if (response.status >= 300 && response.status < 400) {
+      return { ok: true as const };
+    }
+  }
+
+  if (
+    contentType.includes("text/html") &&
+    response.status >= 200 &&
+    response.status < 400
+  ) {
+    return { ok: true as const };
+  }
+
+  const text = await boundedText(response);
+  if (contentType.includes("json") || text.trim().startsWith("{")) {
+    const payload = parseOAuthAuthorizationErrorText(text);
+    if (payload !== null) {
+      throwAliyunOAuthAuthorizationError(payload);
+    }
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "阿里云身份服务返回了无法确认的授权响应；现有平台配置未被覆盖。",
+    );
+  }
+
+  if (response.status >= 400) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "阿里云 OAuth 应用配置无效，请核对应用 ID、回调地址和授权范围。",
+    );
+  }
+  throw new AuthServiceError(
+    "UPSTREAM_UNAVAILABLE",
+    "阿里云身份服务暂时不可用，请稍后重试；现有平台配置未被覆盖。",
+  );
+}
+
+export async function inspectAliyunOAuthConfiguration(
+  storedCredential: AliyunOAuthStoredCredential,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const credential = requireCurrentAliyunOAuthCredential(storedCredential);
+  const response = await fetchAliyunIdentityResponse(
+    fetchImpl,
+    ALIYUN_OIDC_DISCOVERY_ENDPOINT,
+    {
+      method: "GET",
+      redirect: "error",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      headers: { Accept: "application/json" },
+    },
+  );
+  throwForTransientOAuthStatus(response.status);
   const document = await boundedJson(response);
   if (
     document.authorization_endpoint !== ALIYUN_OAUTH_AUTHORIZE_ENDPOINT ||
@@ -358,14 +625,13 @@ export async function inspectAliyunOAuthConfiguration(
       "阿里云 OAuth 未提供所需账号身份范围",
     );
   }
+  await probeAliyunOAuthAuthorization(credential, fetchImpl);
   return { ok: true as const, scopes: ["openid", "aliuid", "profile"] };
 }
 
 export async function inspectAliyunBrokerCredential(
   credential: AliyunBrokerCredential,
-  getCallerIdentity: (
-    value: AliyunBrokerCredential,
-  ) => Promise<{
+  getCallerIdentity: (value: AliyunBrokerCredential) => Promise<{
     body?: { accountId?: string; arn?: string };
   }> = requestAliyunBrokerCallerIdentity,
 ) {
@@ -679,8 +945,8 @@ export async function getActiveAliyunOAuthCredential() {
     id: credential.id,
     version: credential.version,
     fingerprint: credential.fingerprint,
-    ...aliyunOAuthCredentialInputSchema.parse(
-      decryptAliyunPlatformCredential<AliyunOAuthCredential>(
+    ...aliyunOAuthStoredCredentialSchema.parse(
+      decryptAliyunPlatformCredential<AliyunOAuthStoredCredential>(
         ALIYUN_OAUTH_CREDENTIAL_SLOT,
         credential,
       ),
@@ -697,13 +963,22 @@ async function getAliyunOAuthCredentialById(credentialId: string) {
   return {
     id: credential.id,
     version: credential.version,
-    ...aliyunOAuthCredentialInputSchema.parse(
-      decryptAliyunPlatformCredential<AliyunOAuthCredential>(
+    ...aliyunOAuthStoredCredentialSchema.parse(
+      decryptAliyunPlatformCredential<AliyunOAuthStoredCredential>(
         ALIYUN_OAUTH_CREDENTIAL_SLOT,
         credential,
       ),
     ),
   };
+}
+
+export function aliyunOAuthApplicationIdTail(value: unknown) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!normalized || !noControlCharacters(normalized)) return null;
+  if (appSecretIdPattern.test(normalized)) return normalized.slice(-4);
+  if (/^\d{6,64}$/u.test(normalized)) return normalized.slice(-8);
+  return null;
 }
 
 export async function getAliyunPlatformCredentialStatus() {
@@ -745,6 +1020,7 @@ export async function getAliyunPlatformCredentialStatus() {
     oauth: {
       ...oauthStatus,
       callbackUrl: oauthValue?.callbackUrl ?? null,
+      applicationIdTail: aliyunOAuthApplicationIdTail(oauthValue?.clientId),
     },
   };
 }
@@ -878,27 +1154,23 @@ export async function createAliyunOAuthAuthorization(input: {
   projectId: string;
   userId: number;
   nowMs?: number;
+  fetchImpl?: typeof fetch;
 }) {
-  const credential = await getActiveAliyunOAuthCredential();
-  if (!credential) {
+  const storedCredential = await getActiveAliyunOAuthCredential();
+  if (!storedCredential) {
     throw new AuthServiceError("NOT_FOUND", "域名与发布平台尚未配置完成");
   }
+  const credential = requireCurrentAliyunOAuthCredential(storedCredential);
+  await probeAliyunOAuthAuthorization(credential, input.fetchImpl ?? fetch);
   const nowMs = input.nowMs ?? Date.now();
   const state = buildAliyunOAuthState({
-    credentialId: credential.id,
+    credentialId: storedCredential.id,
     projectId: input.projectId,
     userId: input.userId,
     clientSecret: credential.clientSecret,
     expiresAt: nowMs + OAUTH_STATE_TTL_MS,
   });
-  const url = new URL(ALIYUN_OAUTH_AUTHORIZE_ENDPOINT);
-  url.searchParams.set("client_id", credential.clientId);
-  url.searchParams.set("redirect_uri", credential.callbackUrl);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", "openid aliuid profile");
-  url.searchParams.set("access_type", "online");
-  url.searchParams.set("prompt", "admin_consent");
-  url.searchParams.set("state", state);
+  const url = buildAliyunOAuthAuthorizationUrl(credential, state);
   return {
     authorizationUrl: url.toString(),
     expiresAt: new Date(nowMs + OAUTH_STATE_TTL_MS).toISOString(),

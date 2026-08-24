@@ -28,14 +28,22 @@ import {
   ALIYUN_OAUTH_TOKEN_ENDPOINT,
   ALIYUN_OAUTH_USERINFO_ENDPOINT,
   aliyunBrokerCredentialInputSchema,
+  aliyunOAuthApplicationIdSchema,
   aliyunOAuthCredentialInputSchema,
+  aliyunOAuthApplicationIdTail,
   assertAliyunOAuthScopes,
+  buildAliyunOAuthAuthorizationUrl,
   buildAliyunOAuthState,
+  createAliyunOAuthAuthorization,
   decryptAliyunPlatformCredential,
   encryptAliyunPlatformCredential,
   exchangeAliyunOAuthCode,
+  getActiveAliyunOAuthCredential,
+  getAliyunPlatformCredentialStatus,
   inspectAliyunBrokerCredential,
   inspectAliyunOAuthConfiguration,
+  probeAliyunOAuthAuthorization,
+  replaceAliyunOAuthCredential,
   verifyAliyunOAuthState,
 } from "./aliyun-platform-service";
 
@@ -43,7 +51,7 @@ const originalMasterKey = process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
 const originalSiteOpsEnabled = process.env.FRONTMIND_SITEOPS_ENABLED;
 
 const oauthCredential = {
-  clientId: "frontmind-oauth",
+  clientId: "4724570903440411234",
   clientSecret: "frontmind-oauth-client-secret",
   callbackUrl:
     "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
@@ -78,7 +86,14 @@ describe("Aliyun customer role permissions", () => {
   });
 });
 
-function storedOAuthCredential(id = randomUUID()) {
+function storedOAuthCredential(
+  id = randomUUID(),
+  value: {
+    clientId: string;
+    clientSecret: string;
+    callbackUrl: string;
+  } = oauthCredential,
+) {
   return {
     id,
     slot: ALIYUN_OAUTH_CREDENTIAL_SLOT,
@@ -86,11 +101,7 @@ function storedOAuthCredential(id = randomUUID()) {
     status: "active",
     validationStatus: "unverified",
     fingerprint: "sha256:test-oauth",
-    ...encryptAliyunPlatformCredential(
-      ALIYUN_OAUTH_CREDENTIAL_SLOT,
-      id,
-      oauthCredential,
-    ),
+    ...encryptAliyunPlatformCredential(ALIYUN_OAUTH_CREDENTIAL_SLOT, id, value),
   };
 }
 
@@ -150,6 +161,14 @@ const validTokenResponse = () =>
   jsonResponse({
     access_token: "oauth-access-token-never-persist",
     scope: "openid aliuid profile",
+  });
+
+const validDiscoveryResponse = () =>
+  jsonResponse({
+    authorization_endpoint: ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
+    token_endpoint: ALIYUN_OAUTH_TOKEN_ENDPOINT,
+    userinfo_endpoint: ALIYUN_OAUTH_USERINFO_ENDPOINT,
+    scopes_supported: ["openid", "aliuid", "profile"],
   });
 
 describe("Aliyun platform credentials", () => {
@@ -215,7 +234,7 @@ describe("Aliyun platform credentials", () => {
     ).toThrow();
     expect(() =>
       aliyunOAuthCredentialInputSchema.parse({
-        clientId: "frontmind-oauth",
+        clientId: oauthCredential.clientId,
         clientSecret: "frontmind-oauth-client-secret",
         callbackUrl:
           "http://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
@@ -223,7 +242,7 @@ describe("Aliyun platform credentials", () => {
     ).toThrow();
     expect(
       aliyunOAuthCredentialInputSchema.parse({
-        clientId: "frontmind-oauth",
+        clientId: oauthCredential.clientId,
         clientSecret: "frontmind-oauth-client-secret",
         callbackUrl:
           "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
@@ -231,6 +250,97 @@ describe("Aliyun platform credentials", () => {
     ).toBe(
       "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
     );
+  });
+
+  it("accepts numeric AppId values and identifies an AppSecretId UUID", () => {
+    expect(aliyunOAuthApplicationIdSchema.parse(oauthCredential.clientId)).toBe(
+      oauthCredential.clientId,
+    );
+    const appSecretId = "5be78a96-6d64-42a0-b764-49474a8d5e04";
+    const result = aliyunOAuthApplicationIdSchema.safeParse(appSecretId);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.message)).toContain(
+        "当前填写的是应用密钥 ID，请改填 OAuth 应用基本信息中的应用 ID。",
+      );
+    }
+    expect(() =>
+      aliyunOAuthApplicationIdSchema.parse("frontmind-oauth"),
+    ).toThrow("OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。");
+    expect(aliyunOAuthApplicationIdTail(oauthCredential.clientId)).toBe(
+      "40411234",
+    );
+    expect(aliyunOAuthApplicationIdTail(appSecretId)).toBe("5e04");
+  });
+
+  it("keeps a legacy UUID credential visible but blocks authorization before fetch", async () => {
+    const legacyClientId = "5be78a96-6d64-42a0-b764-49474a8d5e04";
+    const legacyCredential = storedOAuthCredential(randomUUID(), {
+      ...oauthCredential,
+      clientId: legacyClientId,
+    });
+    const activeDb = {
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(() => ({
+              limit: vi.fn(async () => [legacyCredential]),
+            })),
+          })),
+        })),
+      })),
+    };
+    dependencies.getDb.mockResolvedValue(activeDb);
+    await expect(getActiveAliyunOAuthCredential()).resolves.toMatchObject({
+      clientId: legacyClientId,
+      version: 1,
+    });
+
+    let credentialSelectCall = 0;
+    const statusDb = {
+      select: vi.fn((selection?: unknown) => {
+        if (selection) {
+          return {
+            from: vi.fn(() => ({ where: vi.fn(async () => []) })),
+          };
+        }
+        credentialSelectCall += 1;
+        const rows =
+          credentialSelectCall === 2 || credentialSelectCall === 3
+            ? [legacyCredential]
+            : [];
+        return {
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({
+              orderBy: vi.fn(() => ({ limit: vi.fn(async () => rows) })),
+            })),
+          })),
+        };
+      }),
+    };
+    dependencies.getDb.mockResolvedValue(statusDb);
+    await expect(getAliyunPlatformCredentialStatus()).resolves.toMatchObject({
+      oauth: {
+        configured: true,
+        version: 1,
+        callbackUrl: oauthCredential.callbackUrl,
+        applicationIdTail: "5e04",
+      },
+    });
+
+    dependencies.getDb.mockResolvedValue(activeDb);
+    const fetchImpl = vi.fn();
+    await expect(
+      createAliyunOAuthAuthorization({
+        projectId: randomUUID(),
+        userId: 42,
+        fetchImpl: fetchImpl as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      code: "INVALID_CREDENTIAL",
+      message: expect.stringContaining("应用密钥 ID"),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("accepts only the exact broker account and RAM user ARN returned by STS", async () => {
@@ -356,9 +466,10 @@ describe("Aliyun platform credentials", () => {
     },
   );
 
-  it("accepts only the locked official OIDC discovery contract", async () => {
-    const fetchImpl = vi.fn(
-      async () =>
+  it("accepts only the locked discovery contract and a normal authorization page", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
             authorization_endpoint: ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
@@ -371,19 +482,214 @@ describe("Aliyun platform credentials", () => {
             headers: { "content-type": "application/json" },
           },
         ),
-    );
+      )
+      .mockResolvedValueOnce(
+        new Response("<!doctype html><title>Alibaba Cloud sign in</title>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+      );
     await expect(
       inspectAliyunOAuthConfiguration(
-        {
-          clientId: "frontmind-oauth",
-          clientSecret: "frontmind-oauth-client-secret",
-          callbackUrl:
-            "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
-        },
+        oauthCredential,
         fetchImpl as typeof fetch,
       ),
     ).resolves.toMatchObject({ ok: true });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const authorizationUrl = new URL(String(fetchImpl.mock.calls[1]?.[0]));
+    expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(
+      ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
+    );
+    expect(authorizationUrl.searchParams.get("client_id")).toBe(
+      oauthCredential.clientId,
+    );
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+      oauthCredential.callbackUrl,
+    );
+    expect(authorizationUrl.searchParams.get("scope")).toBe(
+      "openid aliuid profile",
+    );
+  });
+
+  it("builds the authorization URL from the locked OAuth contract", () => {
+    const url = buildAliyunOAuthAuthorizationUrl(
+      oauthCredential,
+      "probe-state-never-logged",
+    );
+    expect(url.origin + url.pathname).toBe(ALIYUN_OAUTH_AUTHORIZE_ENDPOINT);
+    expect(url.searchParams.get("client_id")).toBe(oauthCredential.clientId);
+    expect(url.searchParams.get("redirect_uri")).toBe(
+      oauthCredential.callbackUrl,
+    );
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.get("scope")).toBe("openid aliuid profile");
+    expect(url.searchParams.get("access_type")).toBe("online");
+    expect(url.searchParams.get("prompt")).toBe("admin_consent");
+    expect(url.searchParams.get("state")).toBe("probe-state-never-logged");
+  });
+
+  it("rejects an HTTP 200 invalid_client response without echoing the AppId", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        error: "invalid_client",
+        error_description: `App not exists:${oauthCredential.clientId}`,
+      }),
+    );
+    let caught: unknown;
+    try {
+      await probeAliyunOAuthAuthorization(
+        oauthCredential,
+        fetchImpl as typeof fetch,
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({
+      code: "INVALID_CREDENTIAL",
+      message: expect.stringContaining("无法识别该 OAuth 应用 ID"),
+    });
+    expect(String((caught as Error).message)).not.toContain(
+      oauthCredential.clientId,
+    );
+  });
+
+  it.each([
+    {
+      label: "callback mismatch",
+      payload: {
+        error: "redirect_uri_mismatch",
+        error_description: "",
+      },
+      message: "回调地址",
+    },
+    {
+      label: "unsupported scope",
+      payload: {
+        error: "invalid_scope",
+        error_description: "unsupported scope",
+      },
+      message: "openid、aliuid 和 profile",
+    },
+  ])("rejects $label before saving", async ({ payload, message }) => {
+    await expect(
+      probeAliyunOAuthAuthorization(
+        oauthCredential,
+        vi.fn(async () => jsonResponse(payload)) as typeof fetch,
+      ),
+    ).rejects.toMatchObject({
+      code: "INVALID_CREDENTIAL",
+      message: expect.stringContaining(message),
+    });
+  });
+
+  it("accepts a normal login redirect without following it", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://signin.aliyun.com/login.htm" },
+        }),
+    );
+    await expect(
+      probeAliyunOAuthAuthorization(oauthCredential, fetchImpl as typeof fetch),
+    ).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.stringContaining(ALIYUN_OAUTH_AUTHORIZE_ENDPOINT),
+      expect.objectContaining({ redirect: "manual" }),
+    );
+  });
+
+  it.each([
+    {
+      label: "an empty JSON object",
+      response: jsonResponse({}),
+    },
+    {
+      label: "malformed JSON",
+      response: new Response("{not-json", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    },
+    {
+      label: "plain text",
+      response: new Response("unexpected authorization response", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    },
+  ])(
+    "rejects $label instead of treating it as a login page",
+    async ({ response }) => {
+      await expect(
+        probeAliyunOAuthAuthorization(
+          oauthCredential,
+          vi.fn(async () => response) as typeof fetch,
+        ),
+      ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    },
+  );
+
+  it.each([
+    {
+      label: "rate limiting",
+      response: jsonResponse({}, { status: 429 }),
+      expectedCode: "RATE_LIMITED",
+    },
+    {
+      label: "provider failure",
+      response: jsonResponse({}, { status: 503 }),
+      expectedCode: "UPSTREAM_UNAVAILABLE",
+    },
+  ])(
+    "maps authorization $label to a retryable error",
+    async ({ response, expectedCode }) => {
+      await expect(
+        probeAliyunOAuthAuthorization(
+          oauthCredential,
+          vi.fn(async () => response) as typeof fetch,
+        ),
+      ).rejects.toMatchObject({ code: expectedCode });
+    },
+  );
+
+  it("maps authorization transport failure without leaking request values", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error(
+        `timeout ${oauthCredential.clientId} ${oauthCredential.clientSecret}`,
+      );
+    });
+    let caught: unknown;
+    try {
+      await probeAliyunOAuthAuthorization(
+        oauthCredential,
+        fetchImpl as typeof fetch,
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    const message = String((caught as Error).message);
+    expect(message).not.toContain(oauthCredential.clientId);
+    expect(message).not.toContain(oauthCredential.clientSecret);
+  });
+
+  it("does not access the database or retire the old version when preflight fails", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(validDiscoveryResponse())
+      .mockResolvedValueOnce(
+        jsonResponse({
+          error: "invalid_client",
+          error_description: `App not exists:${oauthCredential.clientId}`,
+        }),
+      );
+    await expect(
+      replaceAliyunOAuthCredential(42, oauthCredential, (credential) =>
+        inspectAliyunOAuthConfiguration(credential, fetchImpl as typeof fetch),
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
+    expect(dependencies.getDb).not.toHaveBeenCalled();
   });
 
   it("signs OAuth state without embedding the client secret", () => {

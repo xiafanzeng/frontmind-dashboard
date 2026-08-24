@@ -68,7 +68,10 @@ type AliyunPlatformStatus = {
   ready: boolean;
   customerCapabilityVerified: boolean;
   broker: CredentialStatus;
-  oauth: CredentialStatus & { callbackUrl: string | null };
+  oauth: CredentialStatus & {
+    callbackUrl: string | null;
+    applicationIdTail: string | null;
+  };
 };
 
 const EMPTY_STATUS: CredentialStatus = {
@@ -98,7 +101,7 @@ const EMPTY_ALIYUN_STATUS: AliyunPlatformStatus = {
   ready: false,
   customerCapabilityVerified: false,
   broker: EMPTY_STATUS,
-  oauth: { ...EMPTY_STATUS, callbackUrl: null },
+  oauth: { ...EMPTY_STATUS, callbackUrl: null, applicationIdTail: null },
 };
 
 export const DEFAULT_API_KEY_USAGE_LIMIT = 230_000;
@@ -385,10 +388,24 @@ export default function AdminPresales() {
 
   const handleAliyunOAuthSave = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const clientId = aliyunOAuthClientId.trim();
+    if (/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(clientId)) {
+      toast.error("无法保存阿里云 OAuth 应用", {
+        description:
+          "当前填写的是应用密钥 ID，请改填 OAuth 应用基本信息中的应用 ID。",
+      });
+      return;
+    }
+    if (!/^\d{6,64}$/u.test(clientId)) {
+      toast.error("无法保存阿里云 OAuth 应用", {
+        description: "OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。",
+      });
+      return;
+    }
     setAliyunPending("oauth");
     try {
       await utils.client.admin.presales.aliyun.replaceOAuth.mutate({
-        clientId: aliyunOAuthClientId.trim(),
+        clientId,
         clientSecret: aliyunOAuthClientSecret.trim(),
         callbackUrl: aliyunOAuthCallbackUrl.trim(),
       });
@@ -1494,9 +1511,18 @@ export default function AdminPresales() {
                       profile，用于确认客户所属账号；访问令牌不会持久化。
                     </p>
                   </div>
-                  <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-3 sm:grid-cols-3">
                     <StatusTile
-                      label="应用标识"
+                      label="OAuth 应用 ID"
+                      value={
+                        aliyunStatus.oauth.applicationIdTail
+                          ? `•••• ${aliyunStatus.oauth.applicationIdTail}`
+                          : "尚未配置"
+                      }
+                      mono
+                    />
+                    <StatusTile
+                      label="凭据指纹"
                       value={
                         aliyunStatus.oauth.fingerprint
                           ? `•••• ${aliyunStatus.oauth.fingerprint.slice(-8)}`
@@ -1516,13 +1542,22 @@ export default function AdminPresales() {
                   {aliyunStatus.oauth.fingerprint &&
                     !aliyunStatus.oauth.verifiedAt && (
                       <p className="text-xs text-amber-700">
-                        应用已加密保存，等待首次客户授权完成真实凭据验证。
+                        应用配置已检查，等待首次客户授权验证应用密钥。
                       </p>
                     )}
+                  {aliyunStatus.oauth.verifiedAt && (
+                    <p className="text-xs text-emerald-700">
+                      已完成真实 OAuth 授权验证。
+                    </p>
+                  )}
                   <div className="space-y-2">
-                    <Label htmlFor="aliyun-oauth-client-id">Client ID</Label>
+                    <Label htmlFor="aliyun-oauth-client-id">
+                      OAuth 应用 ID（Client ID）
+                    </Label>
                     <Input
                       id="aliyun-oauth-client-id"
+                      aria-describedby="aliyun-oauth-client-id-help"
+                      inputMode="numeric"
                       value={aliyunOAuthClientId}
                       onChange={(event) =>
                         setAliyunOAuthClientId(event.target.value)
@@ -1530,13 +1565,21 @@ export default function AdminPresales() {
                       autoComplete="off"
                       spellCheck={false}
                     />
+                    <p
+                      id="aliyun-oauth-client-id-help"
+                      className="text-xs leading-5 text-muted-foreground"
+                    >
+                      来自 OAuth 应用“基本信息”中的数字型应用 ID，不是应用密钥
+                      ID。
+                    </p>
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="aliyun-oauth-client-secret">
-                      Client Secret
+                      应用密钥内容（Client Secret）
                     </Label>
                     <Input
                       id="aliyun-oauth-client-secret"
+                      aria-describedby="aliyun-oauth-client-secret-help"
                       type="password"
                       value={aliyunOAuthClientSecret}
                       onChange={(event) =>
@@ -1545,6 +1588,13 @@ export default function AdminPresales() {
                       autoComplete="new-password"
                       spellCheck={false}
                     />
+                    <p
+                      id="aliyun-oauth-client-secret-help"
+                      className="text-xs leading-5 text-muted-foreground"
+                    >
+                      填写创建密钥时仅显示一次的 AppSecretValue，不是
+                      AppSecretId。
+                    </p>
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="aliyun-oauth-callback">Callback URL</Label>

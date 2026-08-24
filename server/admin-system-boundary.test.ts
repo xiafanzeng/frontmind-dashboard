@@ -263,7 +263,7 @@ describe("system administrator boundary", () => {
       "replace the system-wide Aliyun OAuth credential",
       (caller: ReturnType<typeof adminRouter.createCaller>) =>
         caller.presales.aliyun.replaceOAuth({
-          clientId: "aliyun-boundary-client",
+          clientId: "4724570903440410001",
           clientSecret: "aliyun-boundary-client-secret",
           callbackUrl:
             "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",

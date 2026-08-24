@@ -8,7 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const buildId = "123e4567-e89b-42d3-a456-426614174000";
 
 const mocks = vi.hoisted(() => ({
+  completeSiteOpsAliyunOAuth: vi.fn(),
+  exchangeAliyunOAuthCode: vi.fn(),
   getDb: vi.fn(),
+  getSiteOpsAliyunRoleConfiguration: vi.fn(),
   readSiteOpsArtifact: vi.fn(),
 }));
 
@@ -16,11 +19,15 @@ vi.mock("../db", () => ({ getDb: mocks.getDb }));
 vi.mock("./artifact-store", () => ({
   readSiteOpsArtifact: mocks.readSiteOpsArtifact,
 }));
+vi.mock("./aliyun-platform-service", () => ({
+  exchangeAliyunOAuthCode: mocks.exchangeAliyunOAuthCode,
+}));
+vi.mock("./service", () => ({
+  completeSiteOpsAliyunOAuth: mocks.completeSiteOpsAliyunOAuth,
+  getSiteOpsAliyunRoleConfiguration: mocks.getSiteOpsAliyunRoleConfiguration,
+}));
 
-import {
-  publicSiteOpsArtifactError,
-  siteOpsArtifactApi,
-} from "./artifact-api";
+import { publicSiteOpsArtifactError, siteOpsArtifactApi } from "./artifact-api";
 
 const servers: Server[] = [];
 let distZip: Buffer;
@@ -80,6 +87,12 @@ beforeEach(async () => {
     },
     stored: { createReadStream: () => Readable.from([distZip]) },
   });
+  mocks.exchangeAliyunOAuthCode.mockReset().mockResolvedValue({
+    projectId: "project-1",
+    accountUid: "1234567890123456",
+  });
+  mocks.completeSiteOpsAliyunOAuth.mockReset().mockResolvedValue(undefined);
+  mocks.getSiteOpsAliyunRoleConfiguration.mockReset();
 });
 
 afterEach(async () => {
@@ -95,10 +108,12 @@ afterEach(async () => {
   );
 });
 
-async function startApp() {
+async function startApp(options: { authenticated?: boolean } = {}) {
   const app = express();
   app.use((req: any, _res, next) => {
-    req.frontmindUser = { id: 42, username: "site-owner", role: "user" };
+    if (options.authenticated !== false) {
+      req.frontmindUser = { id: 42, username: "site-owner", role: "user" };
+    }
     next();
   });
   app.use("/api/site-ops", siteOpsArtifactApi);
@@ -108,6 +123,118 @@ async function startApp() {
   const address = server.address() as AddressInfo;
   return `http://127.0.0.1:${address.port}`;
 }
+
+function expectSecureOAuthCompletionPage(
+  response: Response,
+  html: string,
+  status: "success" | "cancelled" | "failed",
+) {
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toContain("text/html");
+  expect(response.headers.get("cache-control")).toContain("no-store");
+  expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+  expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+
+  const csp = response.headers.get("content-security-policy") ?? "";
+  expect(csp).toContain("default-src 'none'");
+  expect(csp).toContain("base-uri 'none'");
+  expect(csp).toContain("frame-ancestors 'none'");
+  const nonce = csp.match(/script-src 'nonce-([^']+)'/)?.[1];
+  expect(nonce).toBeTruthy();
+  expect(csp).toContain(`style-src 'nonce-${nonce}'`);
+  expect(html).toContain(`<script nonce="${nonce}">`);
+  expect(html).toContain(`<style nonce="${nonce}">`);
+  expect(html).toContain('type: "frontmind:siteops:aliyun-oauth"');
+  expect(html).toContain(`status: "${status}"`);
+  expect(html).toContain(
+    "window.opener.postMessage(message, window.location.origin)",
+  );
+  expect(html).toContain("window.close()");
+  expect(html).toContain('href="/"');
+}
+
+describe("SiteOps Aliyun OAuth callback", () => {
+  it("completes authorization and returns a secure same-origin success page", async () => {
+    const origin = await startApp();
+    const response = await fetch(
+      `${origin}/api/site-ops/aliyun/oauth/callback?code=secret-code-sentinel&state=secret-state-sentinel`,
+    );
+    const html = await response.text();
+
+    expectSecureOAuthCompletionPage(response, html, "success");
+    expect(mocks.exchangeAliyunOAuthCode).toHaveBeenCalledWith({
+      code: "secret-code-sentinel",
+      state: "secret-state-sentinel",
+      userId: 42,
+    });
+    expect(mocks.completeSiteOpsAliyunOAuth).toHaveBeenCalledWith({
+      actor: { id: 42, username: "site-owner", role: "user" },
+      projectId: "project-1",
+      accountUid: "1234567890123456",
+    });
+    expect(html).not.toContain("secret-code-sentinel");
+    expect(html).not.toContain("secret-state-sentinel");
+  });
+
+  it("projects access_denied as a cancelled page without exposing provider input", async () => {
+    const origin = await startApp();
+    const response = await fetch(
+      `${origin}/api/site-ops/aliyun/oauth/callback?error=access_denied&error_description=${encodeURIComponent("customer-secret-provider-description")}&state=secret-state-sentinel`,
+    );
+    const html = await response.text();
+
+    expectSecureOAuthCompletionPage(response, html, "cancelled");
+    expect(mocks.exchangeAliyunOAuthCode).not.toHaveBeenCalled();
+    expect(mocks.completeSiteOpsAliyunOAuth).not.toHaveBeenCalled();
+    expect(html).not.toContain("access_denied");
+    expect(html).not.toContain("customer-secret-provider-description");
+    expect(html).not.toContain("secret-state-sentinel");
+  });
+
+  it("projects other provider failures as a safe failed page", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    try {
+      const origin = await startApp();
+      const response = await fetch(
+        `${origin}/api/site-ops/aliyun/oauth/callback?error=invalid_client&error_description=${encodeURIComponent("App not exists: client-id-secret-sentinel")}&state=secret-state-sentinel`,
+      );
+      const html = await response.text();
+
+      expectSecureOAuthCompletionPage(response, html, "failed");
+      expect(mocks.exchangeAliyunOAuthCode).not.toHaveBeenCalled();
+      expect(mocks.completeSiteOpsAliyunOAuth).not.toHaveBeenCalled();
+      expect(html).not.toContain("invalid_client");
+      expect(html).not.toContain("client-id-secret-sentinel");
+      expect(html).not.toContain("secret-state-sentinel");
+      expect(consoleError).toHaveBeenCalledWith(
+        "[SiteOps Aliyun OAuth] provider_authorization_failed",
+        {
+          event: "siteops_aliyun_oauth_provider_authorization_failed",
+          userId: 42,
+          errorClass: "OAuthProviderAuthorizationError",
+        },
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("returns a safe failed page when the callback has no authenticated user", async () => {
+    const origin = await startApp({ authenticated: false });
+    const response = await fetch(
+      `${origin}/api/site-ops/aliyun/oauth/callback?code=secret-code-sentinel&state=secret-state-sentinel`,
+    );
+    const html = await response.text();
+
+    expectSecureOAuthCompletionPage(response, html, "failed");
+    expect(mocks.exchangeAliyunOAuthCode).not.toHaveBeenCalled();
+    expect(mocks.completeSiteOpsAliyunOAuth).not.toHaveBeenCalled();
+    expect(html).not.toContain("secret-code-sentinel");
+    expect(html).not.toContain("secret-state-sentinel");
+  });
+});
 
 describe("SiteOps private preview proxy", () => {
   it("never projects internal artifact codes to a customer response", () => {

@@ -117,6 +117,30 @@ const CARD_LABELS: Record<string, string> = {
 };
 
 const PRIVATE_PREVIEW_WINDOW_NAME = "frontmind-siteops-preview";
+const ALIYUN_AUTHORIZATION_WINDOW_NAME = "frontmind-aliyun-authorization";
+const ALIYUN_OAUTH_COMPLETION_MESSAGE =
+  "frontmind:siteops:aliyun-oauth" as const;
+
+type AliyunOAuthCompletionStatus = "success" | "cancelled" | "failed";
+
+function aliyunOAuthCompletionStatus(
+  event: MessageEvent,
+  authorizationWindow: Window | null,
+): AliyunOAuthCompletionStatus | null {
+  if (
+    event.origin !== window.location.origin ||
+    !authorizationWindow ||
+    event.source !== authorizationWindow ||
+    typeof event.data !== "object" ||
+    event.data === null ||
+    event.data.type !== ALIYUN_OAUTH_COMPLETION_MESSAGE
+  ) {
+    return null;
+  }
+  return ["success", "cancelled", "failed"].includes(event.data.status)
+    ? (event.data.status as AliyunOAuthCompletionStatus)
+    : null;
+}
 
 function activeCardMessage(
   messages: SiteOpsMessageProjection[],
@@ -193,6 +217,13 @@ function visualCandidatePresentation(candidate: SiteOpsPublicVisualCandidate) {
 }
 
 function customerFacingMessage(content: string) {
+  if (
+    /(?:invalid_client|app\s+not\s+exists|appsecret|client[\s_-]*id)/iu.test(
+      content,
+    )
+  ) {
+    return "阿里云连接配置需要 FrontMind 管理员更新。";
+  }
   const sanitized = content
     .replace(
       /(?:错误码|任务编号|operation(?:\s*id)?|task(?:\s*id)?)\s*[:：]\s*[A-Za-z0-9_-]+/giu,
@@ -466,6 +497,7 @@ export default function SiteOpsConversationPanel({
   const [registrantProfileId, setRegistrantProfileId] = useState("");
   const [icpNumber, setIcpNumber] = useState("");
   const [activeVisualPage, setActiveVisualPage] = useState(1);
+  const aliyunAuthorizationWindow = useRef<Window | null>(null);
   const previousVisualPageCount = useRef(0);
   const latestAttempt = useMemo(() => {
     const visibleBuilds = observation?.builds.filter(
@@ -531,6 +563,38 @@ export default function SiteOpsConversationPanel({
   useEffect(() => {
     setPreviewOpenError(null);
   }, [latestBuild?.previewUrl]);
+
+  useEffect(() => {
+    function handleAliyunOAuthCompletion(event: MessageEvent) {
+      const status = aliyunOAuthCompletionStatus(
+        event,
+        aliyunAuthorizationWindow.current,
+      );
+      if (!status) return;
+
+      aliyunAuthorizationWindow.current?.close();
+      aliyunAuthorizationWindow.current = null;
+      if (status === "success") {
+        setLocalError(null);
+        void Promise.resolve()
+          .then(() => onRefresh?.())
+          .catch(() => {
+            setLocalError("阿里云连接状态暂时无法刷新，请稍后点击刷新。");
+          });
+        return;
+      }
+      setLocalError(
+        status === "cancelled"
+          ? "你已取消阿里云授权，未产生任何连接。"
+          : "阿里云连接配置需要 FrontMind 管理员更新。",
+      );
+    }
+
+    window.addEventListener("message", handleAliyunOAuthCompletion);
+    return () => {
+      window.removeEventListener("message", handleAliyunOAuthCompletion);
+    };
+  }, [onRefresh]);
 
   function openPrivatePreview(previewUrl: string) {
     setPreviewOpenError(null);
@@ -642,8 +706,9 @@ export default function SiteOpsConversationPanel({
     if (!onBeginAliyun || busyAction) return;
     const authorizationWindow = window.open(
       "",
-      "frontmind-aliyun-authorization",
+      ALIYUN_AUTHORIZATION_WINDOW_NAME,
     );
+    aliyunAuthorizationWindow.current = authorizationWindow;
     setBusyAction("aliyun_begin");
     setLocalError(null);
     try {
@@ -656,6 +721,9 @@ export default function SiteOpsConversationPanel({
       }
     } catch (connectionError) {
       authorizationWindow?.close();
+      if (aliyunAuthorizationWindow.current === authorizationWindow) {
+        aliyunAuthorizationWindow.current = null;
+      }
       setLocalError(
         connectionError instanceof Error
           ? customerFacingMessage(connectionError.message)
@@ -670,7 +738,7 @@ export default function SiteOpsConversationPanel({
     if (!onLoadAliyunAuthorizationGuide || busyAction) return;
     const authorizationWindow = window.open(
       "",
-      "frontmind-aliyun-authorization",
+      ALIYUN_AUTHORIZATION_WINDOW_NAME,
     );
     setBusyAction("aliyun_guide");
     setLocalError(null);

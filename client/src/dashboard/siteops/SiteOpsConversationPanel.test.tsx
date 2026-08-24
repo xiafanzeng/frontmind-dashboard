@@ -1462,6 +1462,203 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
+  it("does not expose an upstream invalid_client response", async () => {
+    const onBeginAliyun = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          "invalid_client: App not exists:5be78a96-6d64-42a0-b764-49474a8d5e04",
+        ),
+      );
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onBeginAliyun={onBeginAliyun}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+
+    expect(
+      await screen.findByText("阿里云连接配置需要 FrontMind 管理员更新。"),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("invalid_client");
+    expect(document.body.textContent).not.toContain(
+      "5be78a96-6d64-42a0-b764-49474a8d5e04",
+    );
+    expect(authorizationWindow.close).toHaveBeenCalledOnce();
+    open.mockRestore();
+  });
+
+  it("refreshes after a verified same-origin OAuth popup completion", async () => {
+    const onBeginAliyun = vi.fn().mockResolvedValue({
+      authorizationUrl: "https://signin.aliyun.com/oauth/authorize",
+      expiresAt: "2026-08-23T01:00:00.000Z",
+    });
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onBeginAliyun={onBeginAliyun}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledOnce());
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: window.location.origin,
+          source: authorizationWindow as unknown as Window,
+          data: {
+            type: "frontmind:siteops:aliyun-oauth",
+            status: "success",
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
+    expect(authorizationWindow.close).toHaveBeenCalledOnce();
+    open.mockRestore();
+  });
+
+  it("ignores OAuth completion messages from another origin or window", async () => {
+    const onBeginAliyun = vi.fn().mockResolvedValue({
+      authorizationUrl: "https://signin.aliyun.com/oauth/authorize",
+      expiresAt: "2026-08-23T01:00:00.000Z",
+    });
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onBeginAliyun={onBeginAliyun}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledOnce());
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: "https://attacker.example",
+          source: authorizationWindow as unknown as Window,
+          data: {
+            type: "frontmind:siteops:aliyun-oauth",
+            status: "success",
+          },
+        }),
+      );
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: window.location.origin,
+          source: window,
+          data: {
+            type: "frontmind:siteops:aliyun-oauth",
+            status: "success",
+          },
+        }),
+      );
+    });
+
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(authorizationWindow.close).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("projects OAuth cancellation and configuration failure without internals", async () => {
+    const onBeginAliyun = vi.fn().mockResolvedValue({
+      authorizationUrl: "https://signin.aliyun.com/oauth/authorize",
+      expiresAt: "2026-08-23T01:00:00.000Z",
+    });
+    const firstWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const secondWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValueOnce(firstWindow as unknown as Window)
+      .mockReturnValueOnce(secondWindow as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onBeginAliyun={onBeginAliyun}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledTimes(1));
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: window.location.origin,
+          source: firstWindow as unknown as Window,
+          data: {
+            type: "frontmind:siteops:aliyun-oauth",
+            status: "cancelled",
+          },
+        }),
+      );
+    });
+    expect(
+      await screen.findByText("你已取消阿里云授权，未产生任何连接。"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledTimes(2));
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: window.location.origin,
+          source: secondWindow as unknown as Window,
+          data: {
+            type: "frontmind:siteops:aliyun-oauth",
+            status: "failed",
+          },
+        }),
+      );
+    });
+    expect(
+      await screen.findByText("阿里云连接配置需要 FrontMind 管理员更新。"),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(
+      /invalid_client|AppId|Secret/iu,
+    );
+    open.mockRestore();
+  });
+
   it("guides an identified account through official authorization", async () => {
     const onLoadAliyunAuthorizationGuide = vi.fn().mockResolvedValue({
       available: true,

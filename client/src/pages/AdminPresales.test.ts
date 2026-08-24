@@ -46,6 +46,28 @@ describe("presalesUsageDisplayState", () => {
     expect(source).not.toContain("aliyun.replaceOAuth.useMutation");
   });
 
+  it("distinguishes the OAuth application ID from its secret identifiers", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
+      "utf8",
+    );
+    expect(source).toContain("OAuth 应用 ID（Client ID）");
+    expect(source).toContain("不是应用密钥");
+    expect(source).toContain("应用密钥内容（Client Secret）");
+    expect(source).toContain("AppSecretValue");
+    expect(source).toContain("AppSecretId");
+    expect(source).toContain(
+      "当前填写的是应用密钥 ID，请改填 OAuth 应用基本信息中的应用 ID。",
+    );
+    expect(source).toContain(
+      "OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。",
+    );
+    expect(source).toContain('inputMode="numeric"');
+    expect(source).toContain("applicationIdTail");
+    expect(source).toContain('label="凭据指纹"');
+    expect(source).not.toContain('label="应用标识"');
+  });
+
   it("sends 21st plaintext through the direct tRPC client without retaining mutation variables", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),

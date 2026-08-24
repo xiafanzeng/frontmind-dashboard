@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { Readable } from "node:stream";
 import express from "express";
@@ -21,6 +22,83 @@ import {
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 2_000;
+
+type AliyunOAuthCompletionStatus = "success" | "cancelled" | "failed";
+
+const ALIYUN_OAUTH_COMPLETION_COPY: Record<
+  AliyunOAuthCompletionStatus,
+  { title: string; description: string }
+> = {
+  success: {
+    title: "阿里云授权已完成",
+    description: "可以返回 AI友好官网管理继续完成账号授权配置。",
+  },
+  cancelled: {
+    title: "已取消阿里云授权",
+    description: "未保存新的客户账号连接，可以返回后重新发起授权。",
+  },
+  failed: {
+    title: "阿里云授权暂时无法完成",
+    description: "请返回 AI友好官网管理后重试，或联系 FrontMind 协助处理。",
+  },
+};
+
+function sendAliyunOAuthCompletionPage(
+  res: express.Response,
+  status: AliyunOAuthCompletionStatus,
+) {
+  const nonce = randomBytes(18).toString("base64url");
+  const copy = ALIYUN_OAUTH_COMPLETION_COPY[status];
+  const html = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${copy.title}</title>
+    <style nonce="${nonce}">
+      :root { color-scheme: light; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #f7f5fb; color: #25222d; }
+      main { width: min(32rem, calc(100vw - 3rem)); padding: 2rem; border: 1px solid #e4deed; border-radius: 1.25rem; background: #fff; box-shadow: 0 1rem 3rem rgba(43, 34, 59, .08); }
+      h1 { margin: 0 0 .75rem; font-size: 1.35rem; }
+      p { margin: 0 0 1.25rem; color: #625b6d; line-height: 1.65; }
+      a { display: inline-flex; padding: .7rem 1rem; border-radius: .75rem; background: #493b64; color: #fff; text-decoration: none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${copy.title}</h1>
+      <p>${copy.description}</p>
+      <a href="/">返回 AI友好官网管理</a>
+    </main>
+    <script nonce="${nonce}">
+      (() => {
+        const message = Object.freeze({
+          type: "frontmind:siteops:aliyun-oauth",
+          status: "${status}"
+        });
+        if (window.opener && !window.opener.closed) {
+          try {
+            window.opener.postMessage(message, window.location.origin);
+          } finally {
+            window.close();
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>`;
+
+  res.status(200);
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader(
+    "Content-Security-Policy",
+    `default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'`,
+  );
+  res.send(html);
+}
 
 function notFound(res: express.Response) {
   res.status(404).json({ error: "NOT_FOUND" });
@@ -229,10 +307,30 @@ export const siteOpsArtifactApi = express.Router();
 
 siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
   const actor = req.frontmindUser;
+  const providerError =
+    typeof req.query.error === "string" ? req.query.error : null;
   const code = typeof req.query.code === "string" ? req.query.code : null;
   const state = typeof req.query.state === "string" ? req.query.state : null;
-  if (!actor || !code || !state) {
-    res.redirect(302, "/?siteOpsAliyun=authorization_failed");
+
+  if (!actor) {
+    sendAliyunOAuthCompletionPage(res, "failed");
+    return;
+  }
+  if (providerError) {
+    if (providerError === "access_denied") {
+      sendAliyunOAuthCompletionPage(res, "cancelled");
+      return;
+    }
+    console.error("[SiteOps Aliyun OAuth] provider_authorization_failed", {
+      event: "siteops_aliyun_oauth_provider_authorization_failed",
+      userId: actor.id,
+      errorClass: "OAuthProviderAuthorizationError",
+    });
+    sendAliyunOAuthCompletionPage(res, "failed");
+    return;
+  }
+  if (!code || !state) {
+    sendAliyunOAuthCompletionPage(res, "failed");
     return;
   }
   try {
@@ -246,15 +344,14 @@ siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
       projectId: identity.projectId,
       accountUid: identity.accountUid,
     });
-    res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.redirect(302, "/?siteOpsAliyun=authorization_required");
-  } catch (error) {
+    sendAliyunOAuthCompletionPage(res, "success");
+  } catch {
     console.error("[SiteOps Aliyun OAuth] callback_failed", {
       event: "siteops_aliyun_oauth_callback_failed",
       userId: actor.id,
-      errorClass: error instanceof Error ? error.name : "UnknownError",
+      errorClass: "OAuthExchangeOrCompletionError",
     });
-    res.redirect(302, "/?siteOpsAliyun=authorization_failed");
+    sendAliyunOAuthCompletionPage(res, "failed");
   }
 });
 
