@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => ({
   adjustQuestionQuotaMutation: vi.fn(),
   updateBrandTrackingLimitMutation: vi.fn(),
   updateTicketMutation: vi.fn(),
+  approveSiteRebuildMutation: vi.fn(),
   decideQuestionMaintenanceMutation: vi.fn(),
   ticketsData: {
     items: [],
@@ -161,6 +162,12 @@ vi.mock("@/lib/trpc", () => ({
           useMutation: () => ({
             isPending: false,
             mutateAsync: mocks.updateTicketMutation,
+          }),
+        },
+        approveSiteRebuild: {
+          useMutation: () => ({
+            isPending: false,
+            mutateAsync: mocks.approveSiteRebuildMutation,
           }),
         },
         decideQuestionMaintenance: {
@@ -336,6 +343,10 @@ describe("DeliveryMemberDashboard project context", () => {
     mocks.updateTicketMutation.mockResolvedValue({
       success: true,
       handoffTicketIds: [],
+    });
+    mocks.approveSiteRebuildMutation.mockResolvedValue({
+      success: true,
+      resetApplied: true,
     });
     mocks.decideQuestionMaintenanceMutation.mockResolvedValue({
       decision: "approved",
@@ -650,6 +661,241 @@ describe("DeliveryMemberDashboard project context", () => {
     );
     expect(mocks.updateTicketMutation).not.toHaveBeenCalled();
   });
+
+  it.each([
+    "submitted",
+    "needs_information",
+    "scheduled",
+    "in_progress",
+  ] as const)(
+    "shows only the dedicated site-rebuild approval for %s tickets",
+    (status) => {
+      mocks.assignments = [aiOperationsAssignment];
+      mocks.ticketsData = {
+        items: [
+          {
+            id: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+            userId: 101,
+            customerName: "示例客户",
+            customerUsername: "example.customer",
+            title: "重新制作官网",
+            operation: "site_rebuild",
+            status,
+            statusGroup: "pending",
+            dependencySatisfied: true,
+            dependencyBlockReason: null,
+            assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+            revision: 7,
+            siteRebuildResetApplied: false,
+          },
+        ],
+        filters: {
+          customers: [
+            { id: 101, name: "示例客户", username: "example.customer" },
+          ],
+        },
+        counts: { pending: 1, completed: 0 },
+        nextPending: null,
+        nextCursor: null,
+        limit: 50,
+      };
+
+      render(<DeliveryMemberDashboard customerWorkbench />);
+
+      expect(
+        screen.getByRole("button", { name: "通过重置需求" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "开始处理" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "等待用户补充" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "填写交付结果" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("confirms a site rebuild through the dedicated backend action", async () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+          userId: 101,
+          customerName: "示例客户",
+          customerUsername: "example.customer",
+          title: "重新制作官网",
+          operation: "site_rebuild",
+          status: "submitted",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+          revision: 7,
+          siteRebuildResetApplied: false,
+        },
+      ],
+      filters: {
+        customers: [
+          { id: 101, name: "示例客户", username: "example.customer" },
+        ],
+      },
+      counts: { pending: 1, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    fireEvent.click(screen.getByRole("button", { name: "通过重置需求" }));
+    expect(
+      screen.getByRole("heading", { name: "通过官网重置需求？" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "确认后，客户当前轮次的知识库选择、视觉候选和建站对话将被清空，并重新选择知识库；旧官网预览与已上线版本保持不变。",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认通过" }));
+
+    await waitFor(() =>
+      expect(mocks.approveSiteRebuildMutation).toHaveBeenCalledWith({
+        projectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+        ticketId: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+        expectedRevision: 7,
+      }),
+    );
+    expect(mocks.updateTicketMutation).not.toHaveBeenCalled();
+  });
+
+  it("shows an applied site rebuild as static status without actions", () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+          userId: 101,
+          customerName: "示例客户",
+          customerUsername: "example.customer",
+          title: "重新制作官网",
+          operation: "site_rebuild",
+          status: "in_progress",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+          revision: 8,
+          siteRebuildResetApplied: true,
+        },
+      ],
+      filters: {
+        customers: [
+          { id: 101, name: "示例客户", username: "example.customer" },
+        ],
+      },
+      counts: { pending: 1, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    expect(screen.getByText("重置需求已通过")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "通过重置需求" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "开始处理" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "等待用户补充" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "填写交付结果" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [false, "当前需求状态：待通过重置。"],
+    [true, "当前需求状态：重置已通过，等待客户制作新版本。"],
+  ] as const)(
+    "projects the real site-rebuild state in the focused customer card (applied: %s)",
+    (resetApplied, expectedState) => {
+      const ticketId = "5f47e445-37bb-45ed-9268-4ca9437e4d91";
+      mocks.assignments = [aiOperationsAssignment];
+      mocks.ticketsData = {
+        items: [
+          {
+            id: ticketId,
+            userId: 101,
+            customerName: "示例客户",
+            customerUsername: "example.customer",
+            title: "重新制作官网",
+            operation: "site_rebuild",
+            status: "in_progress",
+            statusGroup: "pending",
+            dependencySatisfied: true,
+            dependencyBlockReason: null,
+            assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+            revision: 8,
+            siteRebuildResetApplied: resetApplied,
+          },
+        ],
+        filters: {
+          customers: [
+            { id: 101, name: "示例客户", username: "example.customer" },
+          ],
+        },
+        counts: { pending: 1, completed: 0 },
+        nextPending: null,
+        nextCursor: null,
+        limit: 50,
+      };
+      window.history.replaceState(
+        {},
+        "",
+        `/delivery/workbench?projectAssignmentId=${AI_OPERATIONS_PROJECT_ID}&section=website&ticketId=${ticketId}&focus=1`,
+      );
+
+      render(<DeliveryMemberDashboard customerWorkbench />);
+
+      const focusedCard = screen.getByTestId("focused-customer-demand");
+      expect(within(focusedCard).getByText(expectedState)).toBeInTheDocument();
+      if (resetApplied) {
+        expect(
+          within(focusedCard).queryByRole("button", {
+            name: "通过重置需求",
+          }),
+        ).not.toBeInTheDocument();
+        expect(
+          within(focusedCard).getByText("重置需求已通过"),
+        ).toBeInTheDocument();
+      } else {
+        expect(
+          within(focusedCard).getByRole("button", {
+            name: "通过重置需求",
+          }),
+        ).toBeInTheDocument();
+      }
+      expect(
+        within(focusedCard).queryByRole("button", { name: "开始处理" }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(focusedCard).queryByRole("button", {
+          name: "等待用户补充",
+        }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(focusedCard).queryByRole("button", {
+          name: "填写交付结果",
+        }),
+      ).not.toBeInTheDocument();
+    },
+  );
 
   it("loads subsequent current-project ticket pages", async () => {
     mocks.assignments = [monitoringAssignment];

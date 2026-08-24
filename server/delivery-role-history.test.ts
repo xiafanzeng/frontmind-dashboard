@@ -37,6 +37,7 @@ import {
   questionCatalogReviewAllowed,
   resolveAssignedWorkflowBillingScope,
   reusableInitialMonitoringTicketScope,
+  siteOpsRebuildApprovalDisposition,
   visibleInitialMonitoringTicketScope,
   workflowChildAttachmentMetadataRows,
   workflowContainerChildrenScope,
@@ -1322,19 +1323,68 @@ describe("delivery execution authorization and settlement", () => {
     ).not.toThrow();
   });
 
-  it("reserves rebuild completion for the successful child build", () => {
-    expect(() =>
-      assertGenericDeliveryTicketTransition({
-        operation: "site_rebuild",
-        nextStatus: "completed",
+  it("reserves every rebuild transition for the dedicated reset approval", () => {
+    for (const nextStatus of [
+      "in_progress",
+      "needs_information",
+      "completed",
+      "rejected",
+      "cancelled",
+    ] as const) {
+      expect(() =>
+        assertGenericDeliveryTicketTransition({
+          operation: "site_rebuild",
+          nextStatus,
+        }),
+      ).toThrow("通过重置需求");
+    }
+  });
+
+  it("approves recoverable rebuild states and replays an applied marker", () => {
+    for (const status of [
+      "submitted",
+      "needs_information",
+      "scheduled",
+      "in_progress",
+    ]) {
+      expect(
+        siteOpsRebuildApprovalDisposition({
+          status,
+          resetApplied: false,
+          revision: 4,
+          expectedRevision: 4,
+        }),
+      ).toBe("approve");
+    }
+    expect(
+      siteOpsRebuildApprovalDisposition({
+        status: "in_progress",
+        resetApplied: true,
+        revision: 5,
+        expectedRevision: 4,
       }),
-    ).toThrow("新版本完成后由系统自动关闭");
+    ).toBe("replay");
+  });
+
+  it("rejects terminal or stale rebuild approval state", () => {
+    for (const status of ["completed", "rejected", "cancelled"]) {
+      expect(() =>
+        siteOpsRebuildApprovalDisposition({
+          status,
+          resetApplied: false,
+          revision: 4,
+          expectedRevision: 4,
+        }),
+      ).toThrow("已经结束");
+    }
     expect(() =>
-      assertGenericDeliveryTicketTransition({
-        operation: "site_rebuild",
-        nextStatus: "in_progress",
+      siteOpsRebuildApprovalDisposition({
+        status: "needs_information",
+        resetApplied: false,
+        revision: 5,
+        expectedRevision: 4,
       }),
-    ).not.toThrow();
+    ).toThrow("请刷新后重试");
   });
 
   it("keeps website build recoverable instead of allowing terminal rejection", () => {

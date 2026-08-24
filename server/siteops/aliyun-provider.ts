@@ -36,6 +36,10 @@ import { getDb } from "../db";
 import {
   ALIYUN_CUSTOMER_ROLE_ACTIONS,
   ALIYUN_CUSTOMER_ROLE_NAME,
+  ALIYUN_DOMAIN_AUTO_RENEW_ACTIONS,
+  ALIYUN_DOMAIN_PURCHASE_ACTIONS,
+  ALIYUN_DOMAIN_READ_ACTIONS,
+  ALIYUN_DOMAIN_RENEW_ACTIONS,
   getActiveAliyunBrokerCredential,
   getPinnedAliyunBrokerCredential,
 } from "./aliyun-platform-service";
@@ -441,45 +445,23 @@ function operationPolicy(actions: string[]) {
     Statement: [
       {
         Effect: "Allow",
-        Action: ["sts:GetCallerIdentity", ...actions],
+        Action: actions,
         Resource: ["*"],
       },
     ],
   });
 }
 
-const DOMAIN_READ_POLICY = operationPolicy([
-  "domain:CheckDomain",
-  "domain:QueryDomainByDomainName",
-  "domain:QueryDomainList",
-  "domain:QueryRegistrantProfiles",
-  "domain:QueryTaskList",
-  "domain:QueryTaskDetailList",
-]);
+const DOMAIN_READ_POLICY = operationPolicy([...ALIYUN_DOMAIN_READ_ACTIONS]);
 
 const DOMAIN_PURCHASE_POLICY = operationPolicy([
-  "domain:CheckDomain",
-  "domain:QueryDomainByDomainName",
-  "domain:QueryDomainList",
-  "domain:QueryRegistrantProfiles",
-  "domain:QueryTaskList",
-  "domain:QueryTaskDetailList",
-  "domain:SaveSingleTaskForCreatingOrderActivate",
+  ...ALIYUN_DOMAIN_PURCHASE_ACTIONS,
 ]);
 
-const DOMAIN_RENEW_POLICY = operationPolicy([
-  "domain:CheckDomain",
-  "domain:QueryDomainByDomainName",
-  "domain:QueryDomainList",
-  "domain:QueryTaskList",
-  "domain:QueryTaskDetailList",
-  "domain:SaveSingleTaskForCreatingOrderRenew",
-]);
+const DOMAIN_RENEW_POLICY = operationPolicy([...ALIYUN_DOMAIN_RENEW_ACTIONS]);
 
 const DOMAIN_AUTO_RENEW_POLICY = operationPolicy([
-  "domain:QueryDomainByDomainName",
-  "domain:QueryDomainList",
-  "domain:SetupDomainAutoRenew",
+  ...ALIYUN_DOMAIN_AUTO_RENEW_ACTIONS,
 ]);
 
 export function aliyunFinancialSessionPolicy(kind: "purchase" | "renewal") {

@@ -16,9 +16,7 @@ vi.mock("./quota-service", async (importOriginal) => {
   return {
     ...actual,
     assertSiteOpsServiceEntitlement: (portal: unknown) => portal,
-    siteOpsQuotaPeriodIds: () => [
-      "50000000-0000-4000-8000-000000000005",
-    ],
+    siteOpsQuotaPeriodIds: () => ["50000000-0000-4000-8000-000000000005"],
     reserveSiteOpsQuota: dependencies.reserveQuota,
   };
 });
@@ -44,9 +42,7 @@ import {
   websiteStyleSamples,
 } from "../../drizzle/schema";
 import { SITEOPS_WORKFLOW } from "../../shared/siteops";
-import {
-  referenceBlueprintV3ForFamily,
-} from "../../shared/siteops-design";
+import { referenceBlueprintV3ForFamily } from "../../shared/siteops-design";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { actOnSiteOps } from "./service";
 
@@ -140,7 +136,8 @@ function serviceDatabaseFixture() {
   };
 
   const inserts: Insert[] = [];
-  const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+  const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
+    [];
   let inTransaction = false;
   const rowsFor = (table: unknown, selection: unknown) => {
     const keys = Object.keys((selection as Record<string, unknown>) ?? {});
@@ -171,7 +168,9 @@ function serviceDatabaseFixture() {
       return keys.includes("slot") ? [{ slot: "site_builder_21st" }] : [];
     }
     if (table === apiCredentials) {
-      return inTransaction ? [customerCredential] : [{ id: customerCredentialId }];
+      return inTransaction
+        ? [customerCredential]
+        : [{ id: customerCredentialId }];
     }
     if (table === messages) {
       return inTransaction && keys.includes("sequence")
@@ -203,7 +202,10 @@ function serviceDatabaseFixture() {
       for() {
         return Promise.resolve(rowsFor(table, selection));
       },
-      then(resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) {
+      then(
+        resolve: (value: unknown) => unknown,
+        reject: (error: unknown) => unknown,
+      ) {
         return Promise.resolve(rowsFor(table, selection)).then(resolve, reject);
       },
     };
@@ -273,6 +275,7 @@ beforeEach(() => {
     allowed: false,
     ticketId: null,
     status: null,
+    resetApplied: false,
   });
   dependencies.getServicePortal.mockClear();
 });
@@ -292,7 +295,8 @@ describe("SiteOps accepted rebuild visual selection", () => {
       (entry) => entry.table === siteBuilds,
     );
     const operationInsert = fixture.inserts.find(
-      (entry) => entry.table === siteOperations && entry.values.kind === "site_build",
+      (entry) =>
+        entry.table === siteOperations && entry.values.kind === "site_build",
     );
     expect(dependencies.loadRebuild).toHaveBeenCalledOnce();
     expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
@@ -312,6 +316,7 @@ describe("SiteOps accepted rebuild visual selection", () => {
       allowed: false,
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "in_progress",
+      resetApplied: true,
     });
 
     await actOnSiteOps(
@@ -368,6 +373,7 @@ describe("SiteOps accepted rebuild visual selection", () => {
       allowed: false,
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "submitted",
+      resetApplied: false,
     });
 
     await expect(
@@ -378,9 +384,9 @@ describe("SiteOps accepted rebuild visual selection", () => {
     ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
 
     expect(dependencies.reserveQuota).not.toHaveBeenCalled();
-    expect(
-      fixture.inserts.some((entry) => entry.table === siteBuilds),
-    ).toBe(false);
+    expect(fixture.inserts.some((entry) => entry.table === siteBuilds)).toBe(
+      false,
+    );
     expect(
       fixture.inserts.some(
         (entry) =>
@@ -388,5 +394,28 @@ describe("SiteOps accepted rebuild visual selection", () => {
           entry.values.kind === "build_revision",
       ),
     ).toBe(false);
+  });
+
+  it("does not trust a legacy in-progress rebuild until the reset marker exists", async () => {
+    const fixture = serviceDatabaseFixture();
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    dependencies.loadRebuild.mockResolvedValue({
+      allowed: false,
+      ticketId: "46000000-0000-4000-8000-000000000004",
+      status: "in_progress",
+      resetApplied: false,
+    });
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        selectVisualInput(fixture.project.revision, fixture.sample.id),
+      ),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+
+    expect(dependencies.reserveQuota).not.toHaveBeenCalled();
+    expect(fixture.inserts.some((entry) => entry.table === siteBuilds)).toBe(
+      false,
+    );
   });
 });

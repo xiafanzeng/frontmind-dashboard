@@ -35,15 +35,30 @@ export const ALIYUN_OAUTH_USERINFO_ENDPOINT =
   "https://oauth.aliyun.com/v1/userinfo";
 export const ALIYUN_OIDC_DISCOVERY_ENDPOINT =
   "https://oauth.aliyun.com/.well-known/openid-configuration";
+export const ALIYUN_DOMAIN_READ_ACTIONS = [
+  "domain:QueryDomain",
+  "domain:QueryCommonInfo",
+  "domain:QueryRegistrantProfile",
+  "domain:QueryDomainTask",
+] as const;
+export const ALIYUN_DOMAIN_PURCHASE_ACTIONS = [
+  ...ALIYUN_DOMAIN_READ_ACTIONS,
+  "domain:CreateOrderActivate",
+] as const;
+export const ALIYUN_DOMAIN_RENEW_ACTIONS = [
+  "domain:QueryDomain",
+  "domain:QueryCommonInfo",
+  "domain:QueryDomainTask",
+  "domain:CreateOrderRenew",
+] as const;
+export const ALIYUN_DOMAIN_AUTO_RENEW_ACTIONS = [
+  "domain:QueryCommonInfo",
+  "domain:SetupDomainAutoRenew",
+] as const;
 export const ALIYUN_CUSTOMER_ROLE_ACTIONS = [
-  "domain:CheckDomain",
-  "domain:QueryDomainByDomainName",
-  "domain:QueryDomainList",
-  "domain:QueryRegistrantProfiles",
-  "domain:QueryTaskList",
-  "domain:QueryTaskDetailList",
-  "domain:SaveSingleTaskForCreatingOrderActivate",
-  "domain:SaveSingleTaskForCreatingOrderRenew",
+  ...ALIYUN_DOMAIN_READ_ACTIONS,
+  "domain:CreateOrderActivate",
+  "domain:CreateOrderRenew",
   "domain:SetupDomainAutoRenew",
   "alidns:DescribeDomains",
   "alidns:DescribeDomainRecords",
@@ -574,7 +589,9 @@ export async function getAliyunPlatformCredentialStatus() {
   const oauthStatus = {
     ...toStatus(oauth),
     configured: Boolean(
-      oauth && oauth.status === "active" && oauth.validationStatus !== "invalid",
+      oauth &&
+        oauth.status === "active" &&
+        oauth.validationStatus !== "invalid",
     ),
   };
   const oauthValue = oauthStatus.configured
@@ -643,10 +660,7 @@ export async function deleteAliyunPlatformCredentials(
       .from(siteOperations)
       .where(
         and(
-          inArray(siteOperations.provider, [
-            "aliyun_domain",
-            "aliyun_alidns",
-          ]),
+          inArray(siteOperations.provider, ["aliyun_domain", "aliyun_alidns"]),
           inArray(siteOperations.status, [
             "queued",
             "running",

@@ -87,7 +87,12 @@ function observation(
     deployments: [],
     socialPackages: [],
     resetCapability: { allowed: true },
-    rebuildRequest: { allowed: false, ticketId: null, status: null },
+    rebuildRequest: {
+      allowed: false,
+      ticketId: null,
+      status: null,
+      resetApplied: false,
+    },
     interactionState: "awaiting_visual_selection",
     latestSequence: 1,
     ...input,
@@ -180,9 +185,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(
-      screen.getByRole("button", { name: "重置建站流程" }),
-    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重置建站流程" })).toBeDisabled();
     expect(
       screen.getByText("当前仍有任务正在执行或结果待确认，完成后才能重置。"),
     ).toBeInTheDocument();
@@ -271,7 +274,9 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.queryByText(/VISUAL_OPERATION_CONTRACT_MISMATCH/u)).toBeNull();
+    expect(
+      screen.queryByText(/VISUAL_OPERATION_CONTRACT_MISMATCH/u),
+    ).toBeNull();
     expect(screen.queryByText(/operation-safe-id/u)).toBeNull();
   });
 
@@ -367,8 +372,12 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByRole("heading", { name: "已选择的视觉方案" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "让 FrontMind 推荐" })).toBeNull();
-    expect(document.body.textContent).not.toMatch(/已随官网版本锁定|Base|Pro/iu);
+    expect(
+      screen.queryByRole("button", { name: "让 FrontMind 推荐" }),
+    ).toBeNull();
+    expect(document.body.textContent).not.toMatch(
+      /已随官网版本锁定|Base|Pro/iu,
+    );
   });
 
   it("does not expose a build-frozen AI mode after refresh", () => {
@@ -415,13 +424,15 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByText(
-        "AI 建站服务尚未就绪，请联系 FrontMind。",
-      ),
+      screen.getByText("AI 建站服务尚未就绪，请联系 FrontMind。"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "让 FrontMind 推荐" })).toBeDisabled();
-    expect(document.body.textContent).not.toMatch(/21st|Manus|Upstream|API Key/iu);
+    expect(
+      screen.getByRole("button", { name: "让 FrontMind 推荐" }),
+    ).toBeDisabled();
+    expect(document.body.textContent).not.toMatch(
+      /21st|Manus|Upstream|API Key/iu,
+    );
   });
 
   it("selects an immutable knowledge snapshot through a structured action", async () => {
@@ -677,9 +688,7 @@ describe("SiteOpsConversationPanel", () => {
       }),
     );
     expect(
-      screen.getByText(
-        "预览标签页被浏览器阻止，请允许此站点打开弹窗后重试。",
-      ),
+      screen.getByText("预览标签页被浏览器阻止，请允许此站点打开弹窗后重试。"),
     ).toBeInTheDocument();
 
     const retryLink = screen.getByRole("link", {
@@ -689,10 +698,7 @@ describe("SiteOpsConversationPanel", () => {
       "href",
       "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
     );
-    expect(retryLink).toHaveAttribute(
-      "target",
-      "frontmind-siteops-preview",
-    );
+    expect(retryLink).toHaveAttribute("target", "frontmind-siteops-preview");
     fireEvent.click(retryLink);
     expect(open).toHaveBeenCalledTimes(2);
     open.mockRestore();
@@ -770,7 +776,12 @@ describe("SiteOpsConversationPanel", () => {
               updatedAt: "2026-08-23T00:01:00.000Z",
             },
           ],
-          rebuildRequest: { allowed: true, ticketId: null, status: null },
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+          },
           interactionState: "failed",
         })}
         onAction={vi.fn()}
@@ -780,9 +791,7 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       screen.getByText("最新重制暂未完成，当前官网仍可继续预览和使用。"),
     ).toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", { name: "在新标签页打开预览" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "在新标签页打开预览" }));
     expect(open).toHaveBeenCalledWith(
       currentPreview,
       "frontmind-siteops-preview",
@@ -847,14 +856,21 @@ describe("SiteOpsConversationPanel", () => {
           ],
           project: { ...observation().project, status: "live" },
           interactionState: "live",
-          rebuildRequest: { allowed: true, ticketId: null, status: null },
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+          },
         })}
         onAction={onAction}
       />,
     );
 
     expect(screen.queryByRole("button", { name: "重置建站流程" })).toBeNull();
-    fireEvent.click(screen.getAllByRole("button", { name: "提交官网重制需求" })[0]!);
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "提交官网重制需求" })[0]!,
+    );
     fireEvent.change(screen.getByLabelText("重制原因与期望（选填）"), {
       target: { value: "希望调整品牌风格" },
     });
@@ -866,6 +882,104 @@ describe("SiteOpsConversationPanel", () => {
       }),
     );
   });
+
+  it("prioritizes knowledge selection after an approved reset while preserving the old preview", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "draft",
+            currentKnowledgeSnapshotId: null,
+          },
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 2,
+              parentBuildId: null,
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: false,
+            ticketId: "77777777-7777-4777-8777-777777777777",
+            status: "in_progress",
+            resetApplied: true,
+          },
+          interactionState: "select_snapshot",
+        })}
+        onAction={vi.fn()}
+        onSendMessage={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "选择知识库 ZIP 版本" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("当前阶段").parentElement).toHaveTextContent(
+      "选择知识库 ZIP 版本",
+    );
+    expect(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("继续对话")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["collecting_brief", "整理建站资料"],
+    ["visual_searching", "生成视觉候选"],
+    ["awaiting_visual_selection", "等待选择视觉方案"],
+  ] as const)(
+    "keeps the approved rebuild on the current %s stage before its child build exists",
+    (interactionState, stageLabel) => {
+      render(
+        <SiteOpsConversationPanel
+          observation={observation({
+            project: {
+              ...observation().project,
+              status: interactionState,
+            },
+            builds: [
+              {
+                id: "33333333-3333-4333-8333-333333333333",
+                ordinal: 2,
+                parentBuildId: null,
+                status: "approved",
+                previewUrl:
+                  "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+                sourceUrl: null,
+                needsHelp: false,
+                createdAt: "2026-08-22T00:00:00.000Z",
+                updatedAt: "2026-08-22T00:01:00.000Z",
+              },
+            ],
+            rebuildRequest: {
+              allowed: false,
+              ticketId: "77777777-7777-4777-8777-777777777777",
+              status: "in_progress",
+              resetApplied: true,
+            },
+            interactionState,
+          })}
+          onAction={vi.fn()}
+          onSendMessage={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText("当前阶段").parentElement).toHaveTextContent(
+        stageLabel,
+      );
+      expect(screen.getByText("当前阶段").parentElement).not.toHaveTextContent(
+        "官网已完成",
+      );
+    },
+  );
 
   it("keeps deployment rollback out of the customer workspace", () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
@@ -956,9 +1070,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "前往阿里云完成授权" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "前往阿里云完成授权" }));
     await waitFor(() =>
       expect(onLoadAliyunAuthorizationGuide).toHaveBeenCalledOnce(),
     );
@@ -967,10 +1079,7 @@ describe("SiteOpsConversationPanel", () => {
     );
     expect(
       await screen.findByRole("link", { name: "下载备用配置" }),
-    ).toHaveAttribute(
-      "href",
-      "/api/site-ops/aliyun/authorization-config",
-    );
+    ).toHaveAttribute("href", "/api/site-ops/aliyun/authorization-config");
     fireEvent.click(screen.getByRole("button", { name: "我已完成授权" }));
     await waitFor(() => expect(onVerifyAliyun).toHaveBeenCalledOnce());
     open.mockRestore();

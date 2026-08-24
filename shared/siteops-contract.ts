@@ -353,6 +353,7 @@ export const siteOpsObservationV1Schema = z
             "cancelled",
           ])
           .nullable(),
+        resetApplied: z.boolean(),
       })
       .strict(),
     interactionState: siteOpsInteractionStateSchema,

@@ -138,11 +138,12 @@ export function siteOpsServiceErrorFromQuota(error: SiteOpsQuotaError) {
 
 export function requireAcceptedSiteOpsRebuild(input: {
   status: string | null;
+  resetApplied: boolean;
 }) {
-  if (input.status !== "in_progress") {
+  if (input.status !== "in_progress" || !input.resetApplied) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "请先提交官网重制需求并等待 FrontMind 受理。",
+      "请先提交官网重制需求并等待 FrontMind 通过重置。",
       409,
     );
   }

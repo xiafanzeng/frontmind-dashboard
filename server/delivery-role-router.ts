@@ -12,6 +12,7 @@ import {
 } from "../shared/service-portal";
 import { toTrpcError } from "./auth-router";
 import {
+  approveMySiteOpsRebuild,
   approveMyCustomerQuestionSelection,
   getMyCustomerBrandTrackingUsage,
   getMyDeliveryHistory,
@@ -294,6 +295,21 @@ export const deliveryRoleRouter = router({
       .mutation(({ ctx, input }) =>
         serviceCall(() =>
           decideQuestionMaintenance({ actor: ctx.user, ...input }),
+        ),
+      ),
+    approveSiteRebuild: protectedProcedure
+      .input(
+        z
+          .object({
+            projectAssignmentId: z.string().uuid(),
+            ticketId: z.string().uuid(),
+            expectedRevision: z.number().int().positive(),
+          })
+          .strict(),
+      )
+      .mutation(({ ctx, input }) =>
+        serviceCall(() =>
+          approveMySiteOpsRebuild({ actor: ctx.user, ...input }),
         ),
       ),
     updateTicket: protectedProcedure

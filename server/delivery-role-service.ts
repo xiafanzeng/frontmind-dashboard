@@ -92,7 +92,8 @@ import {
 import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
 import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
 import {
-  acceptSiteOpsRebuildTicket,
+  approveSiteOpsRebuildTicket,
+  siteOpsRebuildResetApplied,
   SiteOpsRebuildTicketError,
 } from "./siteops/rebuild-ticket";
 import { getQuestionQuotaState } from "./question-quota-service";
@@ -1352,6 +1353,9 @@ export async function getMyDeliveryTickets(input: {
         websiteStyleWorkflowRevision: styleWorkflow?.revision ?? 0,
         websiteStyleState: styleWorkflow?.status ?? null,
         marketEdition: customerMarketEdition ?? null,
+        siteRebuildResetApplied:
+          ticket.operation === "site_rebuild" &&
+          siteOpsRebuildResetApplied(ticket.internalNote),
         ...dependencyForTicket(ticket),
       };
     },
@@ -1369,6 +1373,9 @@ export async function getMyDeliveryTickets(input: {
           title: nextPendingRow.ticket.title,
           operation: nextPendingRow.ticket.operation,
           status: nextPendingRow.ticket.status,
+          siteRebuildResetApplied:
+            nextPendingRow.ticket.operation === "site_rebuild" &&
+            siteOpsRebuildResetApplied(nextPendingRow.ticket.internalNote),
           customerName:
             nextPendingRow.customerName ||
             nextPendingRow.customerUsername ||
@@ -2054,6 +2061,9 @@ export async function getMyDeliveryTicketDetail(input: {
   return {
     ticket: {
       ...row.ticket,
+      siteRebuildResetApplied:
+        row.ticket.operation === "site_rebuild" &&
+        siteOpsRebuildResetApplied(row.ticket.internalNote),
       createdAt: row.ticket.createdAt.getTime(),
       updatedAt: row.ticket.updatedAt.getTime(),
       resolvedAt: row.ticket.resolvedAt?.getTime() ?? null,
@@ -3102,6 +3112,12 @@ export function assertGenericDeliveryTicketTransition(input: {
   operation: string | null;
   nextStatus: DeliveryExecutionTransitionStatus;
 }) {
+  if (input.operation === "site_rebuild") {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "官网重制需求必须使用“通过重置需求”专用操作。",
+    );
+  }
   if (
     input.operation === "brand_tracking_setup" &&
     ["rejected", "cancelled"].includes(input.nextStatus)
@@ -3133,12 +3149,6 @@ export function assertGenericDeliveryTicketTransition(input: {
     throw new AuthServiceError(
       "CONFLICT",
       "官网构建工单不能拒绝或取消；如需客户补充资料，请设为等待补充后继续处理",
-    );
-  }
-  if (input.operation === "site_rebuild" && input.nextStatus === "completed") {
-    throw new AuthServiceError(
-      "CONFLICT",
-      "官网重制工单会在新版本完成后由系统自动关闭。",
     );
   }
 }
@@ -4650,6 +4660,168 @@ async function ensureWebsiteStyleWorkflowTicket(input: {
   return ticketId;
 }
 
+const SITE_REBUILD_APPROVABLE_STATUSES = [
+  "submitted",
+  "needs_information",
+  "scheduled",
+  "in_progress",
+] as const;
+
+export function siteOpsRebuildApprovalDisposition(input: {
+  status: string;
+  resetApplied: boolean;
+  revision: number;
+  expectedRevision: number;
+}) {
+  if (
+    !SITE_REBUILD_APPROVABLE_STATUSES.includes(
+      input.status as (typeof SITE_REBUILD_APPROVABLE_STATUSES)[number],
+    )
+  ) {
+    throw new AuthServiceError(
+      "CONFLICT",
+      "当前官网重制需求已经结束，不能再次通过重置。",
+    );
+  }
+  if (input.resetApplied && input.status === "in_progress") {
+    return "replay" as const;
+  }
+  if (input.revision !== input.expectedRevision) {
+    throw new AuthServiceError("CONFLICT", "需求已被更新，请刷新后重试");
+  }
+  return "approve" as const;
+}
+
+export async function approveMySiteOpsRebuild(input: {
+  actor: AuthenticatedUser;
+  projectAssignmentId: string;
+  ticketId: string;
+  expectedRevision: number;
+}) {
+  const eventActorRole = deliveryExecutionActorRole(input.actor);
+  if (!eventActorRole) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "需要工程师或系统管理员权限",
+    );
+  }
+  const systemAdmin = eventActorRole === "admin";
+  const db = await requireDb();
+  return db.transaction(async (tx) => {
+    const ticketRows = await tx
+      .select()
+      .from(deliveryTickets)
+      .where(eq(deliveryTickets.id, input.ticketId))
+      .limit(1)
+      .for("update");
+    const ticket = ticketRows[0];
+    if (
+      !ticket ||
+      ticket.operation !== "site_rebuild" ||
+      ticket.workflowDomain !== "ai_operations_engineer" ||
+      !ticket.assignedProjectAssignmentId ||
+      (!systemAdmin && ticket.assignedMemberId !== input.actor.id)
+    ) {
+      throw new AuthServiceError(
+        "NOT_FOUND",
+        "官网重制需求不属于当前项目岗位或无权处理",
+      );
+    }
+    if (ticket.assignedProjectAssignmentId !== input.projectAssignmentId) {
+      throw new AuthServiceError("NOT_FOUND", "需求不属于当前客户项目岗位");
+    }
+    const role = await assertDeliveryProjectContext({
+      actor: input.actor,
+      projectAssignmentId: ticket.assignedProjectAssignmentId,
+      customerUserId: ticket.userId,
+      expectedRoleType: "ai_operations_engineer",
+      executor: tx,
+    });
+    if (
+      ticket.assignedProjectAssignmentId !== role.projectAssignmentId ||
+      !deliveryRoleOwnsOperation(role.roleType, "site_rebuild")
+    ) {
+      throw new AuthServiceError("NOT_FOUND", "需求不属于当前客户项目岗位");
+    }
+    const approvalDisposition = siteOpsRebuildApprovalDisposition({
+      status: ticket.status,
+      resetApplied: siteOpsRebuildResetApplied(ticket.internalNote),
+      revision: ticket.revision,
+      expectedRevision: input.expectedRevision,
+    });
+    if (approvalDisposition === "replay") {
+      return {
+        success: true as const,
+        ticketId: ticket.id,
+        status: "in_progress" as const,
+        revision: ticket.revision,
+        resetApplied: true as const,
+      };
+    }
+    const now = new Date();
+    let approval: Awaited<ReturnType<typeof approveSiteOpsRebuildTicket>>;
+    try {
+      approval = await approveSiteOpsRebuildTicket(tx, {
+        ticket,
+        actorUserId: input.actor.id,
+        now,
+      });
+    } catch (error) {
+      if (error instanceof SiteOpsRebuildTicketError) {
+        throw new AuthServiceError("CONFLICT", error.message);
+      }
+      throw error;
+    }
+    if (!approval?.resetApplied) {
+      throw new AuthServiceError("CONFLICT", "官网重制需求无法执行重置。");
+    }
+    const message = "官网重制需求已通过，等待客户重新选择知识库并制作新版本。";
+    await tx
+      .update(deliveryTickets)
+      .set({
+        status: "in_progress",
+        publicSummary: message,
+        internalNote: approval.internalNote,
+        resolvedAt: null,
+        revision: ticket.revision + 1,
+        updatedByUserId: input.actor.id,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(deliveryTickets.id, ticket.id),
+          eq(deliveryTickets.revision, ticket.revision),
+        ),
+      );
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      actorUserId: input.actor.id,
+      actorRole: eventActorRole,
+      kind: "status_change",
+      visibility: "customer",
+      message,
+      fromStatus: ticket.status,
+      toStatus: "in_progress",
+      actorContext: {
+        projectAssignmentId: input.projectAssignmentId,
+        customerUserId: role.customerUserId,
+        roleType: role.roleType,
+      },
+      createdAt: now,
+    });
+    return {
+      success: true as const,
+      ticketId: ticket.id,
+      status: "in_progress" as const,
+      revision: ticket.revision + 1,
+      resetApplied: true as const,
+      resetAppliedProjectRevision: approval.resetAppliedProjectRevision,
+    };
+  });
+}
+
 export async function updateMyDeliveryTicket(input: {
   actor: AuthenticatedUser;
   projectAssignmentId: string;
@@ -4797,20 +4969,6 @@ export async function updateMyDeliveryTicket(input: {
       throw error;
     }
     const now = new Date();
-    if (ticket.operation === "site_rebuild" && input.status === "in_progress") {
-      try {
-        await acceptSiteOpsRebuildTicket(tx, {
-          ticket,
-          actorUserId: input.actor.id,
-          now,
-        });
-      } catch (error) {
-        if (error instanceof SiteOpsRebuildTicketError) {
-          throw new AuthServiceError("CONFLICT", error.message);
-        }
-        throw error;
-      }
-    }
     let currentQuotaScope:
       | Awaited<ReturnType<typeof resolveCurrentServiceQuotaScope>>
       | undefined;

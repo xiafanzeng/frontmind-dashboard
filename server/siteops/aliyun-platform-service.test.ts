@@ -22,6 +22,7 @@ vi.mock("./quota-service", async (importOriginal) => {
 import { AuthServiceError } from "../auth-service";
 import {
   ALIYUN_BROKER_CREDENTIAL_SLOT,
+  ALIYUN_CUSTOMER_ROLE_ACTIONS,
   ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
   ALIYUN_OAUTH_CREDENTIAL_SLOT,
   ALIYUN_OAUTH_TOKEN_ENDPOINT,
@@ -46,6 +47,29 @@ const oauthCredential = {
   callbackUrl:
     "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
 };
+
+describe("Aliyun customer role permissions", () => {
+  it("uses Alibaba Cloud RAM actions rather than Domain API method names", () => {
+    expect(ALIYUN_CUSTOMER_ROLE_ACTIONS).toEqual(
+      expect.arrayContaining([
+        "domain:QueryDomain",
+        "domain:QueryCommonInfo",
+        "domain:QueryRegistrantProfile",
+        "domain:QueryDomainTask",
+        "domain:CreateOrderActivate",
+        "domain:CreateOrderRenew",
+        "domain:SetupDomainAutoRenew",
+      ]),
+    );
+    expect(ALIYUN_CUSTOMER_ROLE_ACTIONS).not.toEqual(
+      expect.arrayContaining([
+        "domain:CheckDomain",
+        "domain:QueryDomainList",
+        "domain:SaveSingleTaskForCreatingOrderActivate",
+      ]),
+    );
+  });
+});
 
 function storedOAuthCredential(id = randomUUID()) {
   return {
@@ -318,23 +342,27 @@ describe("Aliyun platform credentials", () => {
         jsonResponse({ aid: "123456789012" }, { contentLength: 64 * 1024 + 1 }),
       ],
     },
-  ])("rejects $label without verifying the credential", async ({ responses }) => {
-    const credential = storedOAuthCredential();
-    const fixture = oauthDatabase(credential);
-    dependencies.getDb.mockResolvedValue(fixture.db);
-    const fetchImpl = vi.fn();
-    for (const response of responses) fetchImpl.mockResolvedValueOnce(response);
+  ])(
+    "rejects $label without verifying the credential",
+    async ({ responses }) => {
+      const credential = storedOAuthCredential();
+      const fixture = oauthDatabase(credential);
+      dependencies.getDb.mockResolvedValue(fixture.db);
+      const fetchImpl = vi.fn();
+      for (const response of responses)
+        fetchImpl.mockResolvedValueOnce(response);
 
-    await expect(
-      exchangeAliyunOAuthCode({
-        code: "oauth-code-1234",
-        state: signedOAuthState({ credentialId: credential.id }),
-        userId: 42,
-        fetchImpl: fetchImpl as typeof fetch,
-      }),
-    ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
-    expect(fixture.updates).toEqual([]);
-  });
+      await expect(
+        exchangeAliyunOAuthCode({
+          code: "oauth-code-1234",
+          state: signedOAuthState({ credentialId: credential.id }),
+          userId: 42,
+          fetchImpl: fetchImpl as typeof fetch,
+        }),
+      ).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+      expect(fixture.updates).toEqual([]);
+    },
+  );
 
   it("rejects missing scopes and an invalid account UID without persistence", async () => {
     const credential = storedOAuthCredential();

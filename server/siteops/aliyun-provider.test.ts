@@ -344,9 +344,12 @@ describe("Aliyun SiteOps provider", () => {
       };
       expect(policy.Statement[0]?.Action).toEqual(
         expect.arrayContaining([
-          "domain:QueryDomainByDomainName",
-          "domain:QueryDomainList",
+          "domain:QueryDomain",
+          "domain:QueryCommonInfo",
         ]),
+      );
+      expect(policy.Statement[0]?.Action).not.toContain(
+        "sts:GetCallerIdentity",
       );
     }
   });

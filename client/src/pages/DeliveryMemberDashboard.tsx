@@ -1441,7 +1441,11 @@ function CustomerWorkbenchView({
             {deliveryTicketPresentationTitle(focusedTicket)}
           </CardTitle>
           <p className="text-sm text-muted-foreground">
-            当前需求状态：待处理。请在本客户看板内完成处理。
+            {focusedTicket.operation === "site_rebuild"
+              ? focusedTicket.siteRebuildResetApplied === true
+                ? "当前需求状态：重置已通过，等待客户制作新版本。"
+                : "当前需求状态：待通过重置。"
+              : "当前需求状态：待处理。请在本客户看板内完成处理。"}
           </p>
         </CardHeader>
         <CardContent>
@@ -2377,6 +2381,8 @@ function DeliveryTicketActions({
   onOpenCustomerDashboard: () => void;
 }) {
   const update = trpc.delivery.mine.updateTicket.useMutation();
+  const approveSiteRebuild =
+    trpc.delivery.mine.approveSiteRebuild.useMutation();
   const publishStyleSamples =
     trpc.delivery.mine.publishWebsiteStyleSamples.useMutation();
   const operation = String(ticket.operation || "");
@@ -2410,8 +2416,101 @@ function DeliveryTicketActions({
   ]);
   const [styleNote, setStyleNote] = useState("");
   const [uploadingStyles, setUploadingStyles] = useState(false);
+  const [siteRebuildApprovalOpen, setSiteRebuildApprovalOpen] = useState(false);
   const moduleImports = TICKET_MODULE_IMPORTS[ticket.operation] ?? [];
   const completionMode = deliveryCompletionMode(operation);
+
+  const confirmSiteRebuildApproval = async () => {
+    try {
+      await approveSiteRebuild.mutateAsync({
+        projectAssignmentId,
+        ticketId: ticket.id,
+        expectedRevision: ticket.revision,
+      });
+      setSiteRebuildApprovalOpen(false);
+      await onDone();
+      toast.success("官网重置需求已通过", {
+        description: "客户现在可以重新选择知识库，旧官网与当前预览保持不变。",
+      });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "通过重置需求失败");
+    }
+  };
+
+  if (operation === "site_rebuild") {
+    if (ticket.siteRebuildResetApplied === true) {
+      return (
+        <div className="mt-3 rounded-xl border bg-muted/25 px-4 py-3 text-sm leading-6">
+          <strong>重置需求已通过</strong>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            客户可以重新选择知识库；旧官网与当前预览保持不变。
+          </p>
+        </div>
+      );
+    }
+
+    const approvalAvailable = [
+      "submitted",
+      "needs_information",
+      "scheduled",
+      "in_progress",
+    ].includes(String(ticket.status || ""));
+
+    return (
+      <div className="mt-3">
+        {approvalAvailable && (
+          <Button
+            type="button"
+            size="sm"
+            disabled={approveSiteRebuild.isPending}
+            onClick={() => setSiteRebuildApprovalOpen(true)}
+          >
+            {approveSiteRebuild.isPending && (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            )}
+            通过重置需求
+          </Button>
+        )}
+        <Dialog
+          open={siteRebuildApprovalOpen}
+          onOpenChange={(open) => {
+            if (!approveSiteRebuild.isPending) {
+              setSiteRebuildApprovalOpen(open);
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>通过官网重置需求？</DialogTitle>
+              <DialogDescription>
+                确认后，客户当前轮次的知识库选择、视觉候选和建站对话将被清空，并重新选择知识库；旧官网预览与已上线版本保持不变。
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={approveSiteRebuild.isPending}
+                onClick={() => setSiteRebuildApprovalOpen(false)}
+              >
+                取消
+              </Button>
+              <Button
+                type="button"
+                disabled={approveSiteRebuild.isPending}
+                onClick={() => void confirmSiteRebuildApproval()}
+              >
+                {approveSiteRebuild.isPending && (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                )}
+                确认通过
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    );
+  }
 
   if (deliveryTicketWaitsForAdminCredential(completionTicket)) {
     return (

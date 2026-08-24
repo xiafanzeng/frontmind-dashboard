@@ -83,6 +83,15 @@ const BUILD_STATUS_LABELS: Record<string, string> = {
   superseded: "已被新版本替代",
 };
 
+const REBUILD_INTERACTION_LABELS: Partial<
+  Record<SiteOpsObservationV1["interactionState"], string>
+> = {
+  select_snapshot: "选择知识库 ZIP 版本",
+  collecting_brief: "整理建站资料",
+  visual_searching: "生成视觉候选",
+  awaiting_visual_selection: "等待选择视觉方案",
+};
+
 const CARD_LABELS: Record<string, string> = {
   brief_question: "建站资料",
   visual_board: "视觉方向",
@@ -339,10 +348,7 @@ export default function SiteOpsConversationPanel({
 
   function openPrivatePreview(previewUrl: string) {
     setPreviewOpenError(null);
-    const previewWindow = window.open(
-      previewUrl,
-      PRIVATE_PREVIEW_WINDOW_NAME,
-    );
+    const previewWindow = window.open(previewUrl, PRIVATE_PREVIEW_WINDOW_NAME);
     if (!previewWindow) {
       setPreviewOpenError(
         "预览标签页被浏览器阻止，请允许此站点打开弹窗后重试。",
@@ -681,6 +687,12 @@ export default function SiteOpsConversationPanel({
       ),
   );
   const rebuildInProgress = observation.rebuildRequest.status === "in_progress";
+  const rebuildNeedsKnowledgeSnapshot = Boolean(
+    observation.rebuildRequest.resetApplied && !currentSnapshotId,
+  );
+  const rebuildInteractionLabel = observation.rebuildRequest.resetApplied
+    ? REBUILD_INTERACTION_LABELS[observation.interactionState]
+    : undefined;
 
   return (
     <section className="siteops-panel" aria-labelledby="siteops-panel-title">
@@ -828,7 +840,8 @@ export default function SiteOpsConversationPanel({
           <AlertDialogHeader>
             <AlertDialogTitle>提交官网重制需求</AlertDialogTitle>
             <AlertDialogDescription>
-              提交后将由 FrontMind 人工受理。受理前不会改动当前官网，也不会创建新任务或扣减额度。
+              提交后将由 FrontMind
+              人工受理。受理前不会改动当前官网，也不会创建新任务或扣减额度。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <label className="siteops-rebuild-reason">
@@ -858,7 +871,11 @@ export default function SiteOpsConversationPanel({
               }}
             >
               {busyAction === "request_rebuild" && (
-                <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
+                <Loader2
+                  className="siteops-spin"
+                  size={15}
+                  aria-hidden="true"
+                />
               )}
               提交需求
             </AlertDialogAction>
@@ -882,11 +899,13 @@ export default function SiteOpsConversationPanel({
       <div className="siteops-stage" data-state={observation.interactionState}>
         <span>当前阶段</span>
         <strong>
-          {latestAttempt
-            ? BUILD_STATUS_LABELS[latestAttempt.status] || "正在处理"
-            : observation.interactionState === "select_snapshot"
-              ? "选择知识库 ZIP 版本"
-              : "整理建站资料"}
+          {rebuildInteractionLabel
+            ? rebuildInteractionLabel
+            : latestAttempt
+              ? BUILD_STATUS_LABELS[latestAttempt.status] || "正在处理"
+              : observation.interactionState === "select_snapshot"
+                ? "选择知识库 ZIP 版本"
+                : "整理建站资料"}
         </strong>
       </div>
 
@@ -960,77 +979,79 @@ export default function SiteOpsConversationPanel({
       {currentSnapshotId &&
         (!hasSuccessfulBuild || rebuildInProgress) &&
         observation.knowledgeSnapshots.length > 1 && (
-        <section
-          className="siteops-snapshot-card"
-          aria-labelledby="siteops-change-snapshot-title"
-        >
-          <div>
-            <FileArchive size={20} aria-hidden="true" />
+          <section
+            className="siteops-snapshot-card"
+            aria-labelledby="siteops-change-snapshot-title"
+          >
             <div>
-              <h3 id="siteops-change-snapshot-title">更换知识源</h3>
-              <p>
-                新知识库会重新整理建站资料与视觉方案；旧官网和线上版本不会被改写。
-              </p>
+              <FileArchive size={20} aria-hidden="true" />
+              <div>
+                <h3 id="siteops-change-snapshot-title">更换知识源</h3>
+                <p>
+                  新知识库会重新整理建站资料与视觉方案；旧官网和线上版本不会被改写。
+                </p>
+              </div>
             </div>
-          </div>
-          <div className="siteops-snapshot-actions">
-            <label>
-              <span>更换知识库 ZIP 版本</span>
-              <select
-                aria-label="更换知识库 ZIP 版本"
-                value={effectiveSnapshotId}
-                onChange={(event) => setSelectedSnapshotId(event.target.value)}
-              >
-                {observation.knowledgeSnapshots.map((snapshot) => (
-                  <option key={snapshot.id} value={snapshot.id}>
-                    {snapshot.label}
-                    {snapshot.id === currentSnapshotId ? "（当前）" : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              className="siteops-secondary-button"
-              disabled={
-                !effectiveSnapshotId ||
-                effectiveSnapshotId === currentSnapshotId ||
-                interactionLocked ||
-                sourceChangeBlocked
-              }
-              onClick={() => {
-                const selected = observation.knowledgeSnapshots.find(
-                  (snapshot) => snapshot.id === effectiveSnapshotId,
-                );
-                if (
-                  !selected ||
-                  !window.confirm(
-                    `确认更换为“${selected.label}”并重新整理建站资料？旧官网版本和线上站点会保持不变。`,
-                  )
-                ) {
-                  return;
+            <div className="siteops-snapshot-actions">
+              <label>
+                <span>更换知识库 ZIP 版本</span>
+                <select
+                  aria-label="更换知识库 ZIP 版本"
+                  value={effectiveSnapshotId}
+                  onChange={(event) =>
+                    setSelectedSnapshotId(event.target.value)
+                  }
+                >
+                  {observation.knowledgeSnapshots.map((snapshot) => (
+                    <option key={snapshot.id} value={snapshot.id}>
+                      {snapshot.label}
+                      {snapshot.id === currentSnapshotId ? "（当前）" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="siteops-secondary-button"
+                disabled={
+                  !effectiveSnapshotId ||
+                  effectiveSnapshotId === currentSnapshotId ||
+                  interactionLocked ||
+                  sourceChangeBlocked
                 }
-                void runAction(
-                  "change_snapshot",
-                  actionFromCard(
-                    observation,
-                    "brief_question",
+                onClick={() => {
+                  const selected = observation.knowledgeSnapshots.find(
+                    (snapshot) => snapshot.id === effectiveSnapshotId,
+                  );
+                  if (
+                    !selected ||
+                    !window.confirm(
+                      `确认更换为“${selected.label}”并重新整理建站资料？旧官网版本和线上站点会保持不变。`,
+                    )
+                  ) {
+                    return;
+                  }
+                  void runAction(
                     "change_snapshot",
-                    { knowledgeSnapshotId: effectiveSnapshotId },
-                  ),
-                );
-              }}
-            >
-              更换知识源并重新整理
-            </button>
-          </div>
-          {sourceChangeBlocked && (
-            <p className="siteops-empty-copy">
-              当前视觉、建站或发布任务尚未结束，完成后才能更换知识源。
-            </p>
-          )}
-        </section>
-      )}
+                    actionFromCard(
+                      observation,
+                      "brief_question",
+                      "change_snapshot",
+                      { knowledgeSnapshotId: effectiveSnapshotId },
+                    ),
+                  );
+                }}
+              >
+                更换知识源并重新整理
+              </button>
+            </div>
+            {sourceChangeBlocked && (
+              <p className="siteops-empty-copy">
+                当前视觉、建站或发布任务尚未结束，完成后才能更换知识源。
+              </p>
+            )}
+          </section>
+        )}
 
       {currentSnapshotId &&
         observation.interactionState === "collecting_brief" && (
@@ -1127,7 +1148,10 @@ export default function SiteOpsConversationPanel({
           </section>
         )}
 
-      <div className="siteops-message-list" aria-label={`${SITEOPS_CUSTOMER_DISPLAY_NAME}对话记录`}>
+      <div
+        className="siteops-message-list"
+        aria-label={`${SITEOPS_CUSTOMER_DISPLAY_NAME}对话记录`}
+      >
         {observation.messages.length === 0 ? (
           <div className="siteops-empty-copy">
             选择知识库版本后，FrontMind 会在这里整理建站资料。
@@ -1148,11 +1172,14 @@ export default function SiteOpsConversationPanel({
               </span>
               <div>
                 <div className="siteops-message-meta">
-                  <strong>{item.role === "user" ? "你" : SITEOPS_CUSTOMER_DISPLAY_NAME}</strong>
+                  <strong>
+                    {item.role === "user"
+                      ? "你"
+                      : SITEOPS_CUSTOMER_DISPLAY_NAME}
+                  </strong>
                   {item.metadata?.siteOps && (
                     <span data-status={item.metadata.siteOps.status}>
-                      {CARD_LABELS[item.metadata.siteOps.kind] ||
-                        "任务状态"}
+                      {CARD_LABELS[item.metadata.siteOps.kind] || "任务状态"}
                     </span>
                   )}
                 </div>
@@ -1455,9 +1482,7 @@ export default function SiteOpsConversationPanel({
               域名与发布
             </p>
             <h3 id="siteops-domain-title">连接阿里云</h3>
-            <p>
-              授权完成后，FrontMind 将自动处理域名查询、网站配置与发布。
-            </p>
+            <p>授权完成后，FrontMind 将自动处理域名查询、网站配置与发布。</p>
           </div>
           <span
             className="siteops-status-pill"
@@ -1482,42 +1507,58 @@ export default function SiteOpsConversationPanel({
               onClick={() => void beginAliyunConnection()}
             >
               {busyAction === "aliyun_begin" && (
-                <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
+                <Loader2
+                  className="siteops-spin"
+                  size={15}
+                  aria-hidden="true"
+                />
               )}
               连接阿里云
             </button>
           )}
           {observation.aliyunConnection.status === "authorization_required" && (
-              <>
-                <button
-                  type="button"
-                  className="siteops-primary-button"
-                  disabled={!onLoadAliyunAuthorizationGuide || Boolean(busyAction)}
-                  onClick={() => void openAliyunAuthorizationGuide()}
-                >
-                  {busyAction === "aliyun_guide" && (
-                    <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
-                  )}
-                  前往阿里云完成授权
-                </button>
-                <button
-                  type="button"
-                  className="siteops-secondary-button"
-                  disabled={!onVerifyAliyun || Boolean(busyAction)}
-                  onClick={() =>
-                    runConnectionAction("aliyun_verify", onVerifyAliyun)
-                  }
-                >
-                  我已完成授权
-                </button>
-              </>
-            )}
+            <>
+              <button
+                type="button"
+                className="siteops-primary-button"
+                disabled={
+                  !onLoadAliyunAuthorizationGuide || Boolean(busyAction)
+                }
+                onClick={() => void openAliyunAuthorizationGuide()}
+              >
+                {busyAction === "aliyun_guide" && (
+                  <Loader2
+                    className="siteops-spin"
+                    size={15}
+                    aria-hidden="true"
+                  />
+                )}
+                前往阿里云完成授权
+              </button>
+              <button
+                type="button"
+                className="siteops-secondary-button"
+                disabled={!onVerifyAliyun || Boolean(busyAction)}
+                onClick={() =>
+                  runConnectionAction("aliyun_verify", onVerifyAliyun)
+                }
+              >
+                我已完成授权
+              </button>
+            </>
+          )}
           {aliyunGuide && (
-            <div className="siteops-aliyun-guide" role="region" aria-label="阿里云授权步骤">
+            <div
+              className="siteops-aliyun-guide"
+              role="region"
+              aria-label="阿里云授权步骤"
+            >
               <strong>按以下 3 步完成一次授权</strong>
               <ol>
                 <li>
-                  <span>复制固定角色名称，并在已打开的阿里云页面创建角色。</span>
+                  <span>
+                    复制固定角色名称，并在已打开的阿里云页面创建角色。
+                  </span>
                   <button
                     type="button"
                     className="siteops-secondary-button"
@@ -1543,7 +1584,9 @@ export default function SiteOpsConversationPanel({
                       )
                     }
                   >
-                    {copiedAliyunStep === "trust" ? "已复制" : "复制第 2 步配置"}
+                    {copiedAliyunStep === "trust"
+                      ? "已复制"
+                      : "复制第 2 步配置"}
                   </button>
                 </li>
                 <li>
@@ -1752,9 +1795,7 @@ export default function SiteOpsConversationPanel({
                 ))}
               </select>
             </label>
-            <p>
-              证件、地址和电话等实名资料继续由您在阿里云官方页面管理。
-            </p>
+            <p>证件、地址和电话等实名资料继续由您在阿里云官方页面管理。</p>
           </div>
         )}
 
@@ -1842,7 +1883,9 @@ export default function SiteOpsConversationPanel({
             </span>
             <span>
               所有权：
-              {customerDomainStateLabel(observation.domainState.ownershipStatus)}
+              {customerDomainStateLabel(
+                observation.domainState.ownershipStatus,
+              )}
             </span>
             <span>
               到期：
@@ -1861,7 +1904,8 @@ export default function SiteOpsConversationPanel({
                   : "已关闭"}
             </span>
             <span>
-              备案：{customerDomainStateLabel(observation.domainState.icpStatus)}
+              备案：
+              {customerDomainStateLabel(observation.domainState.icpStatus)}
             </span>
             <div className="siteops-domain-actions">
               <button
@@ -1958,36 +2002,42 @@ export default function SiteOpsConversationPanel({
             )}
           </div>
         )}
-
       </section>
 
-      {(!hasSuccessfulBuild || rebuildInProgress) && (
-      <form className="siteops-composer" onSubmit={submitMessage}>
-        <label htmlFor="siteops-message-input">继续对话</label>
-        <div>
-          <textarea
-            id="siteops-message-input"
-            rows={3}
-            value={message}
-            disabled={!onSendMessage}
-            onChange={(event) => setMessage(event.target.value)}
-            placeholder="补充公司信息，或说明需要修改的文案、布局与内容…"
-          />
-          <button
-            type="submit"
-            className="siteops-primary-button"
-            disabled={!message.trim() || !onSendMessage || Boolean(busyAction)}
-          >
-            {busyAction === "message" ? (
-              <Loader2 className="siteops-spin" size={16} aria-hidden="true" />
-            ) : (
-              <Send size={16} aria-hidden="true" />
-            )}
-            发送
-          </button>
-        </div>
-      </form>
-      )}
+      {(!hasSuccessfulBuild || rebuildInProgress) &&
+        !rebuildNeedsKnowledgeSnapshot && (
+          <form className="siteops-composer" onSubmit={submitMessage}>
+            <label htmlFor="siteops-message-input">继续对话</label>
+            <div>
+              <textarea
+                id="siteops-message-input"
+                rows={3}
+                value={message}
+                disabled={!onSendMessage}
+                onChange={(event) => setMessage(event.target.value)}
+                placeholder="补充公司信息，或说明需要修改的文案、布局与内容…"
+              />
+              <button
+                type="submit"
+                className="siteops-primary-button"
+                disabled={
+                  !message.trim() || !onSendMessage || Boolean(busyAction)
+                }
+              >
+                {busyAction === "message" ? (
+                  <Loader2
+                    className="siteops-spin"
+                    size={16}
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <Send size={16} aria-hidden="true" />
+                )}
+                发送
+              </button>
+            </div>
+          </form>
+        )}
     </section>
   );
 }
