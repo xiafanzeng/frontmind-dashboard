@@ -291,10 +291,126 @@ export const referenceBlueprintV3Schema = referenceBlueprintV3BaseSchema
     }
   });
 
+const TRUSTED_VISUAL_RENDER_COORDINATES_V4 = [
+  "heroFamily",
+  "palette",
+  "typeSystem",
+  "alignment",
+  "contentEmphasis",
+  "mediaRegion",
+  "mediaRatio",
+  "composition",
+  "backgroundStyle",
+  "gradientStyle",
+  "borderStyle",
+  "radiusStyle",
+  "decorationStyle",
+  "navStyle",
+  "ctaStyle",
+  "cardStyle",
+  "containerStyle",
+  "typographyStyle",
+  "density",
+  "responsiveBehavior",
+  "motionLevel",
+  "mediaStrategy",
+] as const;
+
+function visualStyleSignatureFromObjectV4(blueprint: Record<string, unknown>) {
+  return canonicalSiteOpsSha256(
+    Object.fromEntries(
+      TRUSTED_VISUAL_RENDER_COORDINATES_V4.map((coordinate) => [
+        coordinate,
+        blueprint[coordinate],
+      ]),
+    ),
+  );
+}
+
+const referenceBlueprintV4BaseSchema = referenceBlueprintV3BaseSchema
+  .omit({ schemaVersion: true })
+  .extend({
+    schemaVersion: z.literal(4),
+    /** The immutable provider image shown as the 21st reference. The inherited
+     * `preview*` coordinates point to the separately rendered FrontMind
+     * realization. Keeping both pairs in the blueprint prevents either image
+     * from being silently substituted for the other. */
+    referencePreviewLocalAssetId: z.string().uuid(),
+    referencePreviewSha256: sha256Schema,
+    inspirationTaxonomySha256: sha256Schema,
+    styleSignature: sha256Schema,
+  })
+  .strict();
+
+/** V4 closes over one provider reference, one independently rendered
+ * realization, and one taxonomy. V3 remains in the read union below for
+ * immutable historical builds, while newly generated boards use V4. */
+export const referenceBlueprintV4Schema = referenceBlueprintV4BaseSchema
+  .extend({ blueprintHash: sha256Schema })
+  .strict()
+  .superRefine((value, context) => {
+    const { blueprintHash: _blueprintHash, ...coordinates } = value;
+    if (blueprintHashForReference(coordinates) !== value.blueprintHash) {
+      context.addIssue({
+        code: "custom",
+        path: ["blueprintHash"],
+        message: "Reference blueprint hash does not match its coordinates",
+      });
+    }
+    if (!value.componentManifest.includes(`hero:${value.heroFamily}`)) {
+      context.addIssue({
+        code: "custom",
+        path: ["componentManifest"],
+        message: "Reference blueprint does not freeze its trusted Hero family",
+      });
+    }
+    if (value.inspirationEvidenceIds.length !== 1) {
+      context.addIssue({
+        code: "custom",
+        path: ["inspirationEvidenceIds"],
+        message: "V4 reference blueprint must bind exactly one inspiration",
+      });
+    }
+    if (
+      value.referencePreviewLocalAssetId === value.previewLocalAssetId ||
+      value.referencePreviewSha256 === value.previewSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["referencePreviewSha256"],
+        message: "V4 reference and realization previews must be independent",
+      });
+    }
+    const contrastFailures = visualPaletteContrastFailuresV3(value.palette);
+    if (contrastFailures.length > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["palette"],
+        message: `Reference blueprint palette does not meet trusted contrast: ${contrastFailures.join(", ")}`,
+      });
+    }
+    if (visualStyleSignatureFromObjectV4(value) !== value.styleSignature) {
+      context.addIssue({
+        code: "custom",
+        path: ["styleSignature"],
+        message: "V4 style signature does not match its render coordinates",
+      });
+    }
+  });
+
 export const referenceBlueprintSchema = z.union([
+  referenceBlueprintV4Schema,
   referenceBlueprintV3Schema,
   referenceBlueprintV2Schema,
 ]);
+
+function immutableReferencePreviewSha256(
+  blueprint: z.infer<typeof referenceBlueprintSchema>,
+) {
+  return blueprint.schemaVersion === 4
+    ? blueprint.referencePreviewSha256
+    : blueprint.previewSha256;
+}
 
 export const siteDesignSpecV2Schema = z
   .object({
@@ -679,7 +795,8 @@ export const siteOpsRuntimeVisualEvidenceV2Schema =
       if (
         value.selectedCandidateId !== value.referenceBlueprint.candidateId ||
         value.providerItemKey !== value.referenceBlueprint.providerItemKey ||
-        value.previewSha256 !== value.referenceBlueprint.previewSha256
+        value.previewSha256 !==
+          immutableReferencePreviewSha256(value.referenceBlueprint)
       ) {
         context.addIssue({
           code: "custom",
@@ -791,7 +908,8 @@ function validateBuildContractV3Coordinates(
   if (
     value.visual.selectedCandidateId !== value.referenceBlueprint.candidateId ||
     value.visual.providerItemKey !== value.referenceBlueprint.providerItemKey ||
-    value.visual.previewSha256 !== value.referenceBlueprint.previewSha256
+    value.visual.previewSha256 !==
+      immutableReferencePreviewSha256(value.referenceBlueprint)
   ) {
     context.addIssue({
       code: "custom",
@@ -850,8 +968,8 @@ const buildPlanContractV4BaseSchema = buildPlanContractV3BaseSchema
       .object({
         kind: z.literal("react_static_v2"),
         reactVersion: z.literal("19.2.1"),
-        componentLibraryVersion: z.literal("2.2.0"),
-        materializerVersion: z.literal("2.2.0"),
+        componentLibraryVersion: z.enum(["2.2.0", "2.3.0"]),
+        materializerVersion: z.enum(["2.2.0", "2.3.0"]),
       })
       .strict(),
     content: contentContractCoordinatesV4Schema,
@@ -872,7 +990,8 @@ function validateBuildContractV4Coordinates(
   if (
     value.visual.selectedCandidateId !== value.referenceBlueprint.candidateId ||
     value.visual.providerItemKey !== value.referenceBlueprint.providerItemKey ||
-    value.visual.previewSha256 !== value.referenceBlueprint.previewSha256
+    value.visual.previewSha256 !==
+      immutableReferencePreviewSha256(value.referenceBlueprint)
   ) {
     context.addIssue({
       code: "custom",
@@ -880,18 +999,21 @@ function validateBuildContractV4Coordinates(
       message: "Build contract blueprint does not match visual evidence",
     });
   }
+  const workflowVersion = value.workflow.version;
   if (
-    value.workflow.version !== "2.2.0" ||
-    value.workflow.starterVersion !== "2.2.0" ||
-    value.workflow.componentLibraryVersion !== "2.2.0" ||
-    value.workflow.materializerVersion !== "2.2.0" ||
+    !["2.2.0", "2.3.0"].includes(workflowVersion) ||
+    value.workflow.starterVersion !== workflowVersion ||
+    value.workflow.componentLibraryVersion !== workflowVersion ||
+    value.workflow.materializerVersion !== workflowVersion ||
+    value.renderer.componentLibraryVersion !== workflowVersion ||
+    value.renderer.materializerVersion !== workflowVersion ||
     value.qaPolicyVersion !== "siteops-qa-v4"
   ) {
     context.addIssue({
       code: "custom",
       path: ["workflow"],
       message:
-        "BuildContractV4 requires the complete immutable 2.2 coordinates",
+        "BuildContractV4 requires the complete immutable 2.2 coordinates or matching immutable 2.3 coordinates",
     });
   }
 }
@@ -917,6 +1039,7 @@ export type SiteDesignSpecV1 = z.infer<typeof siteDesignSpecV1Schema>;
 export type SiteHeroFamily = z.infer<typeof siteHeroFamilySchema>;
 export type ReferenceBlueprintV2 = z.infer<typeof referenceBlueprintV2Schema>;
 export type ReferenceBlueprintV3 = z.infer<typeof referenceBlueprintV3Schema>;
+export type ReferenceBlueprintV4 = z.infer<typeof referenceBlueprintV4Schema>;
 export type ReferenceBlueprint = z.infer<typeof referenceBlueprintSchema>;
 export type SiteDesignSpecV2 = z.infer<typeof siteDesignSpecV2Schema>;
 export type SiteDesignSpec = SiteDesignSpecV1 | SiteDesignSpecV2;
@@ -975,6 +1098,15 @@ export function composeReferenceBlueprintV3(
   input: z.infer<typeof referenceBlueprintV3BaseSchema>,
 ): ReferenceBlueprintV3 {
   return referenceBlueprintV3Schema.parse({
+    ...input,
+    blueprintHash: blueprintHashForReference(input),
+  });
+}
+
+export function composeReferenceBlueprintV4(
+  input: z.infer<typeof referenceBlueprintV4BaseSchema>,
+): ReferenceBlueprintV4 {
+  return referenceBlueprintV4Schema.parse({
     ...input,
     blueprintHash: blueprintHashForReference(input),
   });
@@ -1353,6 +1485,375 @@ export type TrustedVisualPreviewBlueprintV3 = Pick<
   | "motionLevel"
 >;
 
+/** Every V4 preview coordinate is render-authoritative. Identifiers, hashes,
+ * evidence pointers and component manifests are deliberately excluded. */
+export type TrustedVisualPreviewBlueprintV4 = Pick<
+  ReferenceBlueprintV4,
+  (typeof TRUSTED_VISUAL_RENDER_COORDINATES_V4)[number]
+>;
+
+export type VisualInspirationTaxonomyV4 = z.infer<typeof visualTaxonomySchema>;
+
+/** A semantic signature of the complete visual language. Asset ids, provider
+ * ids and evidence hashes cannot make two otherwise identical styles appear
+ * distinct. */
+export function visualStyleSignatureV4(
+  blueprint: TrustedVisualPreviewBlueprintV4,
+) {
+  return visualStyleSignatureFromObjectV4(blueprint);
+}
+
+export const FRONTMIND_VISUAL_DIVERSITY_MINIMUMS_V4 = {
+  backgrounds: 3,
+  typeSystems: 3,
+  palettes: 4,
+  compositions: 4,
+} as const;
+
+function paletteSignatureV4(
+  palette: TrustedVisualPreviewBlueprintV4["palette"],
+) {
+  return [palette.canvas, palette.ink, palette.accent, palette.muted].join(":");
+}
+
+/** Returns diagnostics suitable for both the provider boundary and tests.
+ * This helper intentionally evaluates semantic coordinates, not PNG hashes. */
+export function visualBlueprintDiversityReportV4(
+  blueprints: readonly TrustedVisualPreviewBlueprintV4[],
+) {
+  const uniqueFamilies = new Set(
+    blueprints.map((blueprint) => blueprint.heroFamily),
+  ).size;
+  const uniqueStyleSignatures = new Set(blueprints.map(visualStyleSignatureV4))
+    .size;
+  const uniqueBackgrounds = new Set(
+    blueprints.map((blueprint) => blueprint.backgroundStyle),
+  ).size;
+  const uniqueTypeSystems = new Set(
+    blueprints.map((blueprint) => blueprint.typeSystem),
+  ).size;
+  const uniquePalettes = new Set(
+    blueprints.map((blueprint) => paletteSignatureV4(blueprint.palette)),
+  ).size;
+  const uniqueCompositions = new Set(
+    blueprints.map((blueprint) => blueprint.composition),
+  ).size;
+  const violations: string[] = [];
+  if (blueprints.length !== FRONTMIND_VISUAL_FAMILIES_V3.length) {
+    violations.push("candidate_count");
+  }
+  if (uniqueFamilies !== blueprints.length) violations.push("hero_family");
+  if (uniqueStyleSignatures !== blueprints.length) {
+    violations.push("style_signature");
+  }
+  if (uniqueBackgrounds < FRONTMIND_VISUAL_DIVERSITY_MINIMUMS_V4.backgrounds) {
+    violations.push("background_style");
+  }
+  if (uniqueTypeSystems < FRONTMIND_VISUAL_DIVERSITY_MINIMUMS_V4.typeSystems) {
+    violations.push("type_system");
+  }
+  if (uniquePalettes < FRONTMIND_VISUAL_DIVERSITY_MINIMUMS_V4.palettes) {
+    violations.push("palette");
+  }
+  if (
+    uniqueCompositions < FRONTMIND_VISUAL_DIVERSITY_MINIMUMS_V4.compositions
+  ) {
+    violations.push("composition");
+  }
+  return {
+    candidateCount: blueprints.length,
+    uniqueFamilies,
+    uniqueStyleSignatures,
+    uniqueBackgrounds,
+    uniqueTypeSystems,
+    uniquePalettes,
+    uniqueCompositions,
+    violations,
+    isDiverse: violations.length === 0,
+  };
+}
+
+export function assertVisualBlueprintDiversityV4(
+  blueprints: readonly TrustedVisualPreviewBlueprintV4[],
+) {
+  const report = visualBlueprintDiversityReportV4(blueprints);
+  if (!report.isDiverse) {
+    throw new Error(
+      `SITEOPS_VISUAL_DIVERSITY_INVALID:${report.violations.join(",")}`,
+    );
+  }
+  return report;
+}
+
+/** The nine locally approved directions, expressed as complete coordinates
+ * rather than a shared theme plus nine superficial layout names. */
+const FRONTMIND_TRUSTED_VISUAL_BASELINES_V4 = {
+  floating_orbit: {
+    heroFamily: "floating_orbit",
+    palette: {
+      canvas: "#050916",
+      ink: "#f4f6ff",
+      accent: "#5eead4",
+      muted: "#172554",
+    },
+    typeSystem: "display_sans",
+    alignment: "center",
+    contentEmphasis: "statement",
+    mediaRegion: "surround",
+    mediaRatio: "square",
+    composition: "centered",
+    backgroundStyle: "dark",
+    gradientStyle: "mesh",
+    borderStyle: "subtle",
+    radiusStyle: "rounded",
+    decorationStyle: "orbital",
+    navStyle: "floating",
+    ctaStyle: "pill",
+    cardStyle: "soft_depth",
+    containerStyle: "contained",
+    typographyStyle: "display",
+    density: "spacious",
+    responsiveBehavior: "reflow",
+    motionLevel: "floating_subtle",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  split_media: {
+    heroFamily: "split_media",
+    palette: {
+      canvas: "#f0e8da",
+      ink: "#1a1612",
+      accent: "#8f2019",
+      muted: "#e8ddcc",
+    },
+    typeSystem: "editorial_serif",
+    alignment: "left",
+    contentEmphasis: "balanced",
+    mediaRegion: "split",
+    mediaRatio: "portrait",
+    composition: "split",
+    backgroundStyle: "warm_light",
+    gradientStyle: "none",
+    borderStyle: "defined",
+    radiusStyle: "none",
+    decorationStyle: "editorial_lines",
+    navStyle: "bordered",
+    ctaStyle: "dual",
+    cardStyle: "flat",
+    containerStyle: "wide",
+    typographyStyle: "editorial",
+    density: "spacious",
+    responsiveBehavior: "stack",
+    motionLevel: "none",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  editorial: {
+    heroFamily: "editorial",
+    palette: {
+      canvas: "#f7f7f2",
+      ink: "#11110f",
+      accent: "#b9250c",
+      muted: "#e5e5df",
+    },
+    typeSystem: "technical_sans",
+    alignment: "left",
+    contentEmphasis: "proof",
+    mediaRegion: "inline",
+    mediaRatio: "landscape",
+    composition: "modular",
+    backgroundStyle: "cool_light",
+    gradientStyle: "none",
+    borderStyle: "defined",
+    radiusStyle: "none",
+    decorationStyle: "grid",
+    navStyle: "bordered",
+    ctaStyle: "dual",
+    cardStyle: "bordered",
+    containerStyle: "edge_to_edge",
+    typographyStyle: "technical",
+    density: "compact",
+    responsiveBehavior: "stack",
+    motionLevel: "none",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  bento: {
+    heroFamily: "bento",
+    palette: {
+      canvas: "#e5efe4",
+      ink: "#19332a",
+      accent: "#83351f",
+      muted: "#f1ddcd",
+    },
+    typeSystem: "humanist_sans",
+    alignment: "left",
+    contentEmphasis: "balanced",
+    mediaRegion: "surround",
+    mediaRatio: "portrait",
+    composition: "modular",
+    backgroundStyle: "warm_light",
+    gradientStyle: "soft_radial",
+    borderStyle: "subtle",
+    radiusStyle: "rounded",
+    decorationStyle: "orbital",
+    navStyle: "minimal",
+    ctaStyle: "pill",
+    cardStyle: "soft_depth",
+    containerStyle: "wide",
+    typographyStyle: "restrained",
+    density: "spacious",
+    responsiveBehavior: "reflow",
+    motionLevel: "subtle",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  feature_grid: {
+    heroFamily: "feature_grid",
+    palette: {
+      canvas: "#e9e8ff",
+      ink: "#19182b",
+      accent: "#5038ce",
+      muted: "#f8f7ff",
+    },
+    typeSystem: "technical_sans",
+    alignment: "left",
+    contentEmphasis: "product",
+    mediaRegion: "split",
+    mediaRatio: "landscape",
+    composition: "split",
+    backgroundStyle: "gradient",
+    gradientStyle: "mesh",
+    borderStyle: "subtle",
+    radiusStyle: "rounded",
+    decorationStyle: "glow",
+    navStyle: "floating",
+    ctaStyle: "pill",
+    cardStyle: "layered",
+    containerStyle: "wide",
+    typographyStyle: "technical",
+    density: "balanced",
+    responsiveBehavior: "reflow",
+    motionLevel: "subtle",
+    mediaStrategy: "customer_asset",
+  },
+  centered_dual_cta: {
+    heroFamily: "centered_dual_cta",
+    palette: {
+      canvas: "#fbfaf5",
+      ink: "#25211c",
+      accent: "#922a20",
+      muted: "#eeeae0",
+    },
+    typeSystem: "editorial_serif",
+    alignment: "left",
+    contentEmphasis: "statement",
+    mediaRegion: "surround",
+    mediaRatio: "square",
+    composition: "editorial",
+    backgroundStyle: "warm_light",
+    gradientStyle: "none",
+    borderStyle: "subtle",
+    radiusStyle: "none",
+    decorationStyle: "editorial_lines",
+    navStyle: "minimal",
+    ctaStyle: "text_link",
+    cardStyle: "flat",
+    containerStyle: "contained",
+    typographyStyle: "editorial",
+    density: "spacious",
+    responsiveBehavior: "reflow",
+    motionLevel: "none",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  immersive_visual: {
+    heroFamily: "immersive_visual",
+    palette: {
+      canvas: "#1738d1",
+      ink: "#ffffff",
+      accent: "#f2fa00",
+      muted: "#0b1b64",
+    },
+    typeSystem: "display_sans",
+    alignment: "left",
+    contentEmphasis: "statement",
+    mediaRegion: "split",
+    mediaRatio: "landscape",
+    composition: "immersive",
+    backgroundStyle: "gradient",
+    gradientStyle: "spotlight",
+    borderStyle: "defined",
+    radiusStyle: "none",
+    decorationStyle: "grid",
+    navStyle: "bordered",
+    ctaStyle: "dual",
+    cardStyle: "bordered",
+    containerStyle: "edge_to_edge",
+    typographyStyle: "display",
+    density: "compact",
+    responsiveBehavior: "crop_safe",
+    motionLevel: "subtle",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  product_stage: {
+    heroFamily: "product_stage",
+    palette: {
+      canvas: "#0d0c0b",
+      ink: "#f4ecd9",
+      accent: "#d6ad5d",
+      muted: "#281b0d",
+    },
+    typeSystem: "editorial_serif",
+    alignment: "left",
+    contentEmphasis: "product",
+    mediaRegion: "split",
+    mediaRatio: "square",
+    composition: "split",
+    backgroundStyle: "dark",
+    gradientStyle: "spotlight",
+    borderStyle: "subtle",
+    radiusStyle: "pill",
+    decorationStyle: "orbital",
+    navStyle: "floating",
+    ctaStyle: "pill",
+    cardStyle: "layered",
+    containerStyle: "wide",
+    typographyStyle: "editorial",
+    density: "spacious",
+    responsiveBehavior: "crop_safe",
+    motionLevel: "floating_subtle",
+    mediaStrategy: "procedural_brand_svg",
+  },
+  full_bleed_statement: {
+    heroFamily: "full_bleed_statement",
+    palette: {
+      canvas: "#eafcff",
+      ink: "#082c36",
+      accent: "#006374",
+      muted: "#d4f1f4",
+    },
+    typeSystem: "display_sans",
+    alignment: "left",
+    contentEmphasis: "balanced",
+    mediaRegion: "split",
+    mediaRatio: "landscape",
+    composition: "immersive",
+    backgroundStyle: "cool_light",
+    gradientStyle: "soft_radial",
+    borderStyle: "subtle",
+    radiusStyle: "pill",
+    decorationStyle: "grid",
+    navStyle: "floating",
+    ctaStyle: "pill",
+    cardStyle: "soft_depth",
+    containerStyle: "edge_to_edge",
+    typographyStyle: "display",
+    density: "balanced",
+    responsiveBehavior: "reflow",
+    motionLevel: "subtle",
+    mediaStrategy: "procedural_brand_svg",
+  },
+} as const satisfies Record<
+  (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+  TrustedVisualPreviewBlueprintV4
+>;
+
 const INSPIRATION_PALETTE_PACKS_V3 = {
   light: {
     warm: {
@@ -1617,6 +2118,86 @@ export function trustedVisualPreviewBlueprintV3(
   };
   assertVisualPaletteContrastV3(previewBlueprint.palette);
   return previewBlueprint;
+}
+
+/** Projects one safe taxonomy into one family baseline. The singular argument
+ * is intentional: V4 removed the V3 board-wide taxonomy merge that could turn
+ * nine structures into one repeated visual theme. */
+export function trustedVisualPreviewBlueprintV4(
+  heroFamily: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+  inspirationTaxonomy?: VisualInspirationTaxonomyV4,
+): TrustedVisualPreviewBlueprintV4 {
+  const baseline = FRONTMIND_TRUSTED_VISUAL_BASELINES_V4[heroFamily];
+  const projected = inspirationTaxonomy
+    ? projectTrustedInspirationTokensV3([inspirationTaxonomy])
+    : null;
+  const previewBlueprint: TrustedVisualPreviewBlueprintV4 = {
+    ...baseline,
+    // The family baseline is the trusted diversity floor. A provider
+    // reference may refine decorative treatment, but it must not collapse
+    // nine independently designed families into one shared colour, type and
+    // density system (the production V3 failure mode).
+    palette: { ...baseline.palette },
+    typeSystem: baseline.typeSystem,
+    density: baseline.density,
+    decorationStyle: projected?.decorationStyle ?? baseline.decorationStyle,
+    backgroundStyle: baseline.backgroundStyle,
+    gradientStyle: projected?.gradientStyle ?? baseline.gradientStyle,
+    typographyStyle: projected?.typographyStyle ?? baseline.typographyStyle,
+  };
+  assertVisualPaletteContrastV3(previewBlueprint.palette);
+  return previewBlueprint;
+}
+
+/** Freezes a real provider reference and its host-rendered realization. The
+ * provider taxonomy is required and hashed here, so the factory cannot accept
+ * a board-wide theme or an unbound styling summary. */
+export function referenceBlueprintV4ForFamily(input: {
+  candidateId: string;
+  providerItemKey: string;
+  referencePreviewLocalAssetId: string;
+  referencePreviewSha256: string;
+  realizationPreviewLocalAssetId: string;
+  realizationPreviewSha256: string;
+  heroFamily: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number];
+  inspirationEvidenceId: string;
+  inspirationTaxonomy: VisualInspirationTaxonomyV4;
+  previewBlueprint?: TrustedVisualPreviewBlueprintV4;
+}) {
+  const previewBlueprint =
+    input.previewBlueprint ??
+    trustedVisualPreviewBlueprintV4(
+      input.heroFamily,
+      input.inspirationTaxonomy,
+    );
+  if (previewBlueprint.heroFamily !== input.heroFamily) {
+    throw new Error("SITEOPS_VISUAL_PREVIEW_FAMILY_MISMATCH");
+  }
+  assertVisualPaletteContrastV3(previewBlueprint.palette);
+  const styleSignature = visualStyleSignatureV4(previewBlueprint);
+  return composeReferenceBlueprintV4({
+    schemaVersion: 4,
+    candidateId: input.candidateId,
+    providerItemKey: input.providerItemKey,
+    referencePreviewLocalAssetId: input.referencePreviewLocalAssetId,
+    referencePreviewSha256: input.referencePreviewSha256,
+    previewLocalAssetId: input.realizationPreviewLocalAssetId,
+    previewSha256: input.realizationPreviewSha256,
+    ...previewBlueprint,
+    componentManifest: [
+      `hero:${input.heroFamily}`,
+      `navigation:${previewBlueprint.navStyle}`,
+      `sections:${previewBlueprint.cardStyle}`,
+      `cta:${previewBlueprint.ctaStyle}`,
+      `container:${previewBlueprint.containerStyle}`,
+      `media:${previewBlueprint.mediaRegion}`,
+    ],
+    inspirationEvidenceIds: [input.inspirationEvidenceId],
+    inspirationTaxonomySha256: canonicalSiteOpsSha256(
+      input.inspirationTaxonomy,
+    ),
+    styleSignature,
+  });
 }
 
 /** Freezes the exact trusted family used to render a V3 candidate preview.

@@ -86,10 +86,14 @@ vi.mock("lighthouse", () => ({
 import {
   SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_MATERIALIZER_V2_0,
+  SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import {
+  FRONTMIND_VISUAL_FAMILIES_V3,
   referenceBlueprintForVisualCandidate,
+  referenceBlueprintV3ForFamily,
+  referenceBlueprintV4ForFamily,
   type SiteDesignSpecV2,
   type SiteOpsRuntimeVisualEvidenceV2,
 } from "../../shared/siteops-design";
@@ -493,13 +497,13 @@ function typedContentInput(): MaterializeAstroSiteInput {
       {
         routeId: "faq",
         heading: "常见问题",
-        summary: "查看知识库中已确认的设备运维问答。",
+        summary: "查看常见的设备运维问答。",
         sections: [
           {
             slotId: "faq-list",
             blockType: "faq_preview",
             heading: "设备运维问答",
-            paragraphs: ["以下回答来自当前冻结知识库。"],
+            paragraphs: ["以下为常见设备运维问题。"],
             items: [],
             entityIds: [],
             faqIds: ["faq-maintenance"],
@@ -510,7 +514,7 @@ function typedContentInput(): MaterializeAstroSiteInput {
       {
         routeId: "news",
         heading: "企业动态",
-        summary: "当前知识库暂无可公开的企业动态。",
+        summary: "暂无企业动态。",
         emptyState: "company_news_unavailable",
         sections: [],
       },
@@ -583,6 +587,45 @@ function useHeroFamily(
     referenceBlueprint: blueprint,
   };
   (input.designSpec as SiteDesignSpecV2).referenceBlueprint = blueprint;
+}
+
+function useV4HeroFamily(
+  input: MaterializeAstroSiteInput,
+  family: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+  index: number,
+) {
+  const visual = input.visual as SiteOpsRuntimeVisualEvidenceV2;
+  const referenceSha256 = H(`21st-reference-${family}`);
+  const realizationSha256 = H(`frontmind-realization-${family}`);
+  const evidenceSha256 = H(`visual-evidence-${family}`);
+  const blueprint = referenceBlueprintV4ForFamily({
+    candidateId: `candidate-v4-${family}`,
+    providerItemKey: `n:${10_000 + index}`,
+    referencePreviewLocalAssetId: `00000000-0000-4000-8000-${String(100_000_000_000 + index).slice(-12)}`,
+    referencePreviewSha256: referenceSha256,
+    realizationPreviewLocalAssetId: `00000000-0000-4000-8000-${String(200_000_000_000 + index).slice(-12)}`,
+    realizationPreviewSha256: realizationSha256,
+    heroFamily: family,
+    inspirationEvidenceId: evidenceSha256,
+    inspirationTaxonomy: {
+      role: "foundation",
+      palette: [],
+      typography: [],
+      layout: [`${family}-layout`],
+      motion: [],
+      accessibility: ["reduced-motion"],
+    },
+  });
+  input.visual = {
+    ...visual,
+    selectedCandidateId: blueprint.candidateId,
+    providerItemKey: blueprint.providerItemKey,
+    previewSha256: referenceSha256,
+    visualEvidenceSha256: evidenceSha256,
+    referenceBlueprint: blueprint,
+  };
+  (input.designSpec as SiteDesignSpecV2).referenceBlueprint = blueprint;
+  return blueprint;
 }
 
 async function legacyAstroV1_6Source() {
@@ -692,6 +735,64 @@ async function legacyReactV2_0Source() {
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+async function legacyReactV2_2Source() {
+  const input = buildInput();
+  const visual = input.visual as SiteOpsRuntimeVisualEvidenceV2;
+  const referenceBlueprint = referenceBlueprintV3ForFamily({
+    candidateId: "60000000-0000-4000-8000-000000000006",
+    providerItemKey: visual.providerItemKey,
+    previewLocalAssetId: "80000000-0000-4000-8000-000000000008",
+    previewSha256: visual.previewSha256,
+    heroFamily: "floating_orbit",
+    inspirationEvidenceIds: [visual.visualEvidenceSha256],
+  });
+  const frozen = siteOpsFrozenRuntimeInputSchema.parse({
+    schemaVersion: 2,
+    build: {
+      ...input.build,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_2.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_2.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_2.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_2.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_2.starterVersion,
+    },
+    host: {
+      starterSha256: SITEOPS_MATERIALIZER_V2_2.starterSha256,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_2.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_2.materializerVersion,
+      materializerSha256: SITEOPS_MATERIALIZER_V2_2.materializerSha256,
+      renderer: "react_static_v2",
+    },
+    snapshot: {
+      id: input.snapshot.id,
+      userId: input.snapshot.userId,
+      archiveHash: input.snapshot.archiveHash,
+      sourceBuildId: input.snapshot.sourceBuildId,
+      sourceBuildRevision: input.snapshot.sourceBuildRevision,
+      sourceDocumentIds: input.snapshot.documents.map(
+        (document) => document.id,
+      ),
+    },
+    brief: input.brief,
+    visual: {
+      ...visual,
+      selectedCandidateId: referenceBlueprint.candidateId,
+      referenceBlueprint,
+    },
+    designSpec: {
+      ...(input.designSpec as SiteDesignSpecV2),
+      referenceBlueprint,
+    },
+    generatedContent: input.generatedContent,
+    assetDecisions: [],
+    brandAsset: null,
+  });
+  const zip = new JSZip();
+  zip.file("frontmind-runtime-input.json", `${JSON.stringify(frozen)}\n`);
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
 describe("SiteOps trusted React 19 static runtime", () => {
   let previewBuild: Awaited<ReturnType<typeof materializeAstroSite>>;
   let officialLogo: Buffer;
@@ -790,8 +891,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       renderer: {
         kind: "react_static_v2",
         reactVersion: "19.2.1",
-        componentLibraryVersion: "2.2.0",
-        materializerVersion: "2.2.0",
+        componentLibraryVersion: "2.3.0",
+        materializerVersion: "2.3.0",
       },
       content: {
         schemaVersion: 2,
@@ -921,6 +1022,105 @@ describe("SiteOps trusted React 19 static runtime", () => {
       expect(home).toContain("<main>");
       expect(home).toContain("<footer");
     }
+  }, 90_000);
+
+  it("materializes all nine V4 candidate blueprints into matching formal source and dist", async () => {
+    const visualLanguages: Record<
+      (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
+      string
+    > = {
+      floating_orbit: "aurora-orbit",
+      split_media: "atelier-editorial",
+      editorial: "swiss-evidence",
+      bento: "organic-human",
+      feature_grid: "chrome-product",
+      centered_dual_cta: "eastern-minimal",
+      immersive_visual: "electric-brutalist",
+      product_stage: "nocturne-luxury",
+      full_bleed_statement: "neural-glass",
+    };
+    const renderedLanguages = new Set<string>();
+    for (const [index, family] of FRONTMIND_VISUAL_FAMILIES_V3.entries()) {
+      const input = buildInput();
+      const blueprint = useV4HeroFamily(input, family, index + 1);
+      const built = await materializeAstroSite(input);
+      const source = await JSZip.loadAsync(built.sourceZip, {
+        checkCRC32: true,
+      });
+      const manifest = JSON.parse(
+        await source.file("frontmind-component-manifest.json")!.async("string"),
+      );
+      const page = JSON.parse(
+        await source.file("src/data/route-001.json")!.async("string"),
+      );
+      const styles = await source.file("public/styles.css")!.async("string");
+      const home = built.files.get("index.html")!.toString("utf8");
+      const language = visualLanguages[family];
+
+      expect(manifest).toMatchObject({
+        componentLibraryVersion: "2.3.0",
+        materializerVersion: "2.3.0",
+        heroFamily: family,
+        referenceBlueprint: {
+          schemaVersion: 4,
+          heroFamily: family,
+          blueprintHash: blueprint.blueprintHash,
+          styleSignature: blueprint.styleSignature,
+        },
+      });
+      expect(page.visualContract).toMatchObject({
+        schemaVersion: 4,
+        heroFamily: family,
+        blueprintHash: blueprint.blueprintHash,
+        styleSignature: blueprint.styleSignature,
+        alignment: blueprint.alignment,
+        backgroundStyle: blueprint.backgroundStyle,
+        gradientStyle: blueprint.gradientStyle,
+        navStyle: blueprint.navStyle,
+        ctaStyle: blueprint.ctaStyle,
+        cardStyle: blueprint.cardStyle,
+        typographyStyle: blueprint.typographyStyle,
+        responsiveBehavior: blueprint.responsiveBehavior,
+      });
+      expect(home).toContain(`data-hero-family="${family}"`);
+      expect(home).toContain(`data-visual-language="${language}"`);
+      expect(home).toContain(
+        `data-visual-blueprint="${blueprint.blueprintHash}"`,
+      );
+      expect(home).toContain(
+        `data-visual-style-signature="${blueprint.styleSignature}"`,
+      );
+      expect(home).not.toMatch(/FrontMind|21st/iu);
+      for (const coordinateClass of [
+        `align--${blueprint.alignment}`,
+        `background--${blueprint.backgroundStyle}`,
+        `gradient--${blueprint.gradientStyle}`,
+        `nav-style--${blueprint.navStyle}`,
+        `cta-style--${blueprint.ctaStyle}`,
+        `card-style--${blueprint.cardStyle}`,
+        `typography--${blueprint.typographyStyle}`,
+        `responsive--${blueprint.responsiveBehavior}`,
+      ]) {
+        expect(home).toContain(coordinateClass);
+      }
+      expect(styles).toContain(".preview-contract--v4.nav-style--floating");
+      expect(styles).toContain(".preview-contract--v4.card-style--layered");
+      expect(styles).toContain("body.preview-contract--v4 .hero{height:auto");
+      expect(built.contract).toMatchObject({
+        schemaVersion: 4,
+        renderer: {
+          componentLibraryVersion: "2.3.0",
+          materializerVersion: "2.3.0",
+        },
+        referenceBlueprint: {
+          heroFamily: family,
+          blueprintHash: blueprint.blueprintHash,
+          styleSignature: blueprint.styleSignature,
+        },
+      });
+      renderedLanguages.add(language);
+    }
+    expect(renderedLanguages.size).toBe(9);
   }, 90_000);
 
   it("renders all seven section variants with differentiated semantic DOM", async () => {
@@ -1192,14 +1392,14 @@ describe("SiteOps trusted React 19 static runtime", () => {
     ).toBe(true);
   }, 90_000);
 
-  it("materializes typed 2.2 content while keeping empty news and source coordinates out of discovery", async () => {
+  it("materializes current typed content while keeping empty news and source coordinates out of discovery", async () => {
     const preview = await materializeAstroSite(typedContentInput());
     expect(preview.contract).toMatchObject({
       schemaVersion: 4,
       renderer: {
         kind: "react_static_v2",
-        componentLibraryVersion: "2.2.0",
-        materializerVersion: "2.2.0",
+        componentLibraryVersion: "2.3.0",
+        materializerVersion: "2.3.0",
       },
       content: {
         schemaVersion: 2,
@@ -1223,7 +1423,7 @@ describe("SiteOps trusted React 19 static runtime", () => {
     expect(preview.files.has("services/equipment-maintenance/index.html")).toBe(
       true,
     );
-    expect(previewNews).toContain("当前知识库暂无可公开的企业动态");
+    expect(previewNews).toContain("新的企业动态将在这里发布");
     expect(previewNews).toContain('data-content-state="empty"');
     expect(previewNews).not.toContain("<button");
     expect(previewNews).not.toContain('type="application/ld+json"');
@@ -1267,7 +1467,7 @@ describe("SiteOps trusted React 19 static runtime", () => {
       if (!/\.(?:html|xml|txt)$/u.test(name)) continue;
       const publiclyEmitted = await file.async("string");
       expect(publiclyEmitted).not.toMatch(
-        /(?:sourceDocumentIds|source_document_ids|内部来源|来源文档\s*(?:ID|编号))/iu,
+        /(?:sourceDocumentIds|source_document_ids|内部来源|来源文档\s*(?:ID|编号)|知识来源|内容依据已确认|当前知识库|冻结知识库)/iu,
       );
       for (const poisonId of Object.values(TYPED_SOURCE_IDS)) {
         expect(publiclyEmitted).not.toContain(poisonId);
@@ -1322,6 +1522,57 @@ describe("SiteOps trusted React 19 static runtime", () => {
     const dist = await JSZip.loadAsync(rebuilt.distZip, { checkCRC32: true });
     expect(await dist.file("index.html")!.async("string")).toContain(
       'rel="canonical" href="https://react20.xinghe.example/"',
+    );
+  }, 90_000);
+
+  it("keeps historical 2.2 production source bundles on exact 2.2 coordinates", async () => {
+    const sourceZip = await legacyReactV2_2Source();
+    const rebuilt = await materializeProductionSiteFromSource({
+      sourceZip,
+      expectedSourceSha256: H(sourceZip),
+      canonicalOrigin: "https://react22.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    const contract = JSON.parse(rebuilt.contractJson.toString("utf8"));
+    expect(contract).toMatchObject({
+      schemaVersion: 4,
+      workflow: {
+        version: "2.2.0",
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+      },
+      renderer: {
+        kind: "react_static_v2",
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+      },
+    });
+    const source = await JSZip.loadAsync(rebuilt.sourceZip, {
+      checkCRC32: true,
+    });
+    const frozen = JSON.parse(
+      await source.file("frontmind-runtime-input.json")!.async("string"),
+    );
+    expect(frozen).toMatchObject({
+      build: { workflowVersion: "2.2.0" },
+      host: {
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+      },
+    });
+    const frozenComponentSource = await source
+      .file("src/component-library.mjs")!
+      .async("string");
+    expect(H(frozenComponentSource)).toBe(
+      "b5778f2a5042f474e1ae649eb977358a91602185dc0d360daa3e630b33d5915f",
+    );
+    expect(frozenComponentSource).not.toContain("V4SiteHero");
+    expect(
+      await source.file("src/data/route-001.json")!.async("string"),
+    ).not.toContain("visualContract");
+    const dist = await JSZip.loadAsync(rebuilt.distZip, { checkCRC32: true });
+    expect(await dist.file("index.html")!.async("string")).toContain(
+      'rel="canonical" href="https://react22.xinghe.example/"',
     );
   }, 90_000);
 

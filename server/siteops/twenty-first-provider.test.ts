@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
@@ -9,6 +9,7 @@ import type {
   SiteProject,
 } from "../../drizzle/schema";
 import type { SiteBrief } from "../../shared/siteops";
+import { FRONTMIND_VISUAL_FAMILIES_V3 } from "../../shared/siteops-design";
 import {
   TwentyFirstToolContractError,
   type TwentyFirstReadOnlySession,
@@ -137,6 +138,85 @@ function sha256(buffer: Buffer) {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
+function patternHash(seed: number) {
+  return createHash("sha256")
+    .update(`siteops-visual-pattern:${seed}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+async function perceptuallyDistinctPng(seed: number) {
+  const bits = BigInt(`0x${patternHash(seed)}`);
+  const pixels = Buffer.alloc(9 * 8);
+  for (let row = 0; row < 8; row += 1) {
+    let value = 128;
+    pixels[row * 9] = value;
+    for (let column = 0; column < 8; column += 1) {
+      const offset = BigInt(63 - (row * 8 + column));
+      const descending = ((bits >> offset) & 1n) === 1n;
+      value += descending ? -8 : 8;
+      pixels[row * 9 + column + 1] = value;
+    }
+  }
+  return sharp(pixels, {
+    raw: { width: 9, height: 8, channels: 1 },
+  })
+    .png()
+    .toBuffer();
+}
+
+const FAMILY_CATALOG_METADATA = [
+  {
+    name: "Orbital Hero Section",
+    description:
+      "Animated space hero background with planets trailing orbital wakes.",
+  },
+  {
+    name: "Split Hero With Image Cards",
+    description:
+      "A split hero section with a serif headline and two image cards.",
+  },
+  {
+    name: "Editorial Image Hero",
+    description:
+      "A hero section with a full-width image and a right-aligned serif headline.",
+  },
+  {
+    name: "Feature Bento",
+    description:
+      "A responsive bento-grid feature section with a hero card and stat tiles.",
+  },
+  {
+    name: "Feature Hero",
+    description:
+      "A centered hero section with a grid of icon-based feature cards highlighting product capabilities.",
+  },
+  {
+    name: "Hero 03",
+    description:
+      "A centered hero section with a serif headline and dual call-to-action buttons.",
+  },
+  {
+    name: "PrismaHero",
+    description:
+      "A full-screen cinematic hero section with a background video and strong visual storytelling.",
+  },
+  {
+    name: "Hero with Mockup",
+    description:
+      "A modern animated hero section with mockup display and gradient effects.",
+  },
+  {
+    name: "Illuminated Hero",
+    description:
+      "A striking hero section with glowing animated text for bold headlines.",
+  },
+] as const;
+
+function familyMetadata(index: number) {
+  return FAMILY_CATALOG_METADATA[index % FAMILY_CATALOG_METADATA.length]!;
+}
+
 function frontMindBaselineDependencies() {
   let persisted: TwentyFirstBoardPersistenceInput | null = null;
   return {
@@ -203,7 +283,7 @@ describe("21st SiteOps provider", () => {
     expect(persistBoard).not.toHaveBeenCalled();
   });
 
-  it("runs the real numeric-ID 6/6/4/2 Hero-first search-only funnel without component code", async () => {
+  it("binds nine directed families 1:1 to distinct real search-only 21st references", async () => {
     const secret = "21st_sk_never-persist-this-secret";
     const rawCode = "RAW_PROVIDER_CODE export default function Secret() {}";
     const searchCalls: Array<{
@@ -212,21 +292,19 @@ describe("21st SiteOps provider", () => {
       limit: number;
     }> = [];
     const detailCalls: Array<string | number> = [];
-    let searchIndex = 0;
-    const counts = [6, 6, 4, 2];
     let nextId = 1;
     const session: TwentyFirstReadOnlySession = {
       search: vi.fn(async (input) => {
-        const count = counts[searchIndex]!;
-        searchIndex += 1;
         searchCalls.push(input);
+        const familyIndex = Math.floor((nextId - 1) / 4);
+        const metadata = familyMetadata(familyIndex);
         return {
-          results: Array.from({ length: count }, (_, index) => {
+          results: Array.from({ length: 4 }, () => {
             const id = nextId++;
             return {
               id,
-              name: `Responsive modular hero ${id}`,
-              description: "Light canvas, neutral sans, short transition",
+              name: `${metadata.name} ${id}`,
+              description: metadata.description,
               previewUrl: `https://cdn.example.test/${id}.png`,
               videoUrl: `https://cdn.example.test/${id}.mp4`,
               installCommand: "npx 21st add forbidden",
@@ -293,10 +371,14 @@ describe("21st SiteOps provider", () => {
       },
     );
     const renderCandidates = vi.fn(async ({ blueprints }) =>
-      blueprints.map((blueprint) => ({
-        heroFamily: blueprint.heroFamily,
-        buffer: Buffer.from(`frontmind:${blueprint.heroFamily}`, "utf8"),
-      })),
+      Promise.all(
+        blueprints.map(async (blueprint) => ({
+          heroFamily: blueprint.heroFamily,
+          buffer: await perceptuallyDistinctPng(
+            100 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+          ),
+        })),
+      ),
     );
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
@@ -309,7 +391,20 @@ describe("21st SiteOps provider", () => {
       }),
       client,
       fetchPreview: vi.fn(async ({ url }) => {
-        const buffer = Buffer.from(`safe-preview:${url}`, "utf8");
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        const familyIndex = Math.floor((id - 1) / 4);
+        const visualSignals = [
+          { dominantHex: "#241238", brightness: 36, contrast: 74 },
+          { dominantHex: "#f5d6b3", brightness: 210, contrast: 68 },
+          { dominantHex: "#d9f0ff", brightness: 220, contrast: 64 },
+          { dominantHex: "#d9f3df", brightness: 215, contrast: 62 },
+          { dominantHex: "#131b4d", brightness: 42, contrast: 76 },
+          { dominantHex: "#f7e8d2", brightness: 218, contrast: 66 },
+          { dominantHex: "#122f28", brightness: 48, contrast: 72 },
+          { dominantHex: "#e8e8e8", brightness: 225, contrast: 61 },
+          { dominantHex: "#2d124a", brightness: 40, contrast: 78 },
+        ][familyIndex]!;
         return {
           finalUrl: url,
           mimeType: "image/png",
@@ -317,11 +412,7 @@ describe("21st SiteOps provider", () => {
           width: 1200,
           height: 800,
           sha256: sha256(buffer),
-          visualSignals: {
-            dominantHex: "#241238",
-            brightness: 36,
-            contrast: 74,
-          },
+          visualSignals,
         };
       }),
       renderCandidates,
@@ -340,16 +431,24 @@ describe("21st SiteOps provider", () => {
       result: {
         candidateCount: 9,
         actual: {
-          searched: 18,
-          shortlisted: 12,
-          mirrored: 12,
+          searched: 36,
+          shortlisted: 36,
+          mirrored: 36,
           presented: 9,
+        },
+        diversity: {
+          assignedFamilies: 9,
+          distinctProviderItems: 9,
+          distinctReferenceHashes: 9,
+          distinctRealizationHashes: 9,
+          distinctStyleSignatures: 9,
         },
       },
     });
-    expect(searchCalls.map((call) => call.limit)).toEqual([6, 6, 4, 2]);
+    expect(searchCalls.map((call) => call.limit)).toEqual(Array(9).fill(4));
     expect(searchCalls.every((call) => call.type === "component")).toBe(true);
-    expect(searchCalls).toHaveLength(4);
+    expect(searchCalls).toHaveLength(9);
+    expect(new Set(searchCalls.map((call) => call.query)).size).toBe(9);
     expect(detailCalls).toHaveLength(0);
     expect(persisted).not.toBeNull();
     expect(persisted!.mirroredCandidates).toHaveLength(9);
@@ -357,48 +456,41 @@ describe("21st SiteOps provider", () => {
     const renderedBlueprints = renderCandidates.mock.calls[0]![0].blueprints;
     expect(renderedBlueprints).toHaveLength(9);
     expect(
-      renderedBlueprints.every(
-        (blueprint) =>
-          blueprint.palette.canvas === "#100b24" &&
-          blueprint.backgroundStyle === "dark" &&
-          blueprint.density === "compact" &&
-          blueprint.decorationStyle === "grid",
-      ),
-    ).toBe(true);
+      new Set(renderedBlueprints.map((item) => item.palette.canvas)).size,
+    ).toBeGreaterThanOrEqual(4);
+    expect(
+      new Set(renderedBlueprints.map((item) => item.typeSystem)).size,
+    ).toBeGreaterThanOrEqual(3);
     expect(persisted!.selectionBundle).toMatchObject({
-      schemaVersion: 3,
-      searchTarget: 18,
+      schemaVersion: 4,
+      searchTarget: 36,
+      referenceTarget: 9,
       displayTarget: 9,
     });
     expect(
       persisted!.selectionBundle.candidates.map((item) => item.label),
     ).toEqual(["A", "B", "C", "D", "E", "F", "G", "H", "I"]);
     expect(
-      persisted!.mirroredCandidates.every(
-        (item) =>
-          item.referenceBlueprint.componentManifest.includes(
-            `hero:${item.referenceBlueprint.heroFamily}`,
-          ),
+      persisted!.mirroredCandidates.every((item) =>
+        item.referenceBlueprint.componentManifest.includes(
+          `hero:${item.referenceBlueprint.heroFamily}`,
+        ),
       ),
     ).toBe(true);
     expect(persisted!.selectionBundle.candidates[0]).toMatchObject({
-      providerItemKey: expect.stringMatching(/^s:frontmind:/u),
+      providerItemKey: expect.stringMatching(/^n:/u),
+      referencePerceptualHash: expect.stringMatching(/^[a-f0-9]{16}$/u),
+      realizationPerceptualHash: expect.stringMatching(/^[a-f0-9]{16}$/u),
       referenceBlueprint: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         heroFamily: "floating_orbit",
-        palette: {
-          canvas: "#100b24",
-          ink: "#f5f3ff",
-          accent: "#c4b5fd",
-          muted: "#2e1a5e",
-        },
-        backgroundStyle: "dark",
-        density: "compact",
-        decorationStyle: "grid",
+        inspirationEvidenceIds: [expect.stringMatching(/^[a-f0-9]{64}$/u)],
+        referencePreviewSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        styleSignature: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
       visualEvidence: {
         evidenceKind: "catalog_metadata_preview_v1",
-        providerItemKey: expect.stringMatching(/^s:frontmind:/u),
+        providerItemKey: expect.stringMatching(/^n:/u),
         taxonomyDerivationVersion: "catalog-metadata-preview-v1",
       },
     });
@@ -416,6 +508,16 @@ describe("21st SiteOps provider", () => {
         ),
       ).size,
     ).toBe(9);
+    expect(
+      persisted!.selectionBundle.candidates.every(
+        (candidate) =>
+          candidate.previewLocalAssetId ===
+            candidate.referenceBlueprint.referencePreviewLocalAssetId &&
+          candidate.realizationPreviewLocalAssetId ===
+            candidate.referenceBlueprint.previewLocalAssetId &&
+          candidate.previewSha256 !== candidate.realizationPreviewSha256,
+      ),
+    ).toBe(true);
     const persistedText = JSON.stringify(persisted);
     const artifactText = Buffer.concat(
       artifacts.map((artifact) => artifact.buffer),
@@ -426,7 +528,7 @@ describe("21st SiteOps provider", () => {
     }
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-visual-preview"),
-    ).toHaveLength(12);
+    ).toHaveLength(36);
     expect(
       artifacts.filter(
         (artifact) => artifact.kind === "frontmind-visual-preview",
@@ -435,6 +537,141 @@ describe("21st SiteOps provider", () => {
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"),
     ).toHaveLength(1);
+  });
+
+  it("rejects generic primary Heroes and succeeds only after family-specific supplemental search", async () => {
+    let searchIndex = 0;
+    let nextId = 1;
+    const baseline = frontMindBaselineDependencies();
+    const search = vi.fn(async () => {
+      const callIndex = searchIndex++;
+      const familyIndex = callIndex % 9;
+      const supplemental = callIndex >= 9;
+      const metadata = familyMetadata(familyIndex);
+      return {
+        results: Array.from({ length: 4 }, () => {
+          const id = nextId++;
+          return {
+            id,
+            name: supplemental
+              ? `${metadata.name} ${id}`
+              : `Responsive Hero section ${id}`,
+            description: supplemental
+              ? metadata.description
+              : "A polished responsive landing-page Hero section.",
+            previewUrl: `https://cdn.example.test/${id}.png`,
+          };
+        }),
+      };
+    });
+    const renderCandidates = vi.fn(async ({ blueprints }) =>
+      Promise.all(
+        blueprints.map(async (blueprint) => ({
+          heroFamily: blueprint.heroFamily,
+          buffer: await perceptuallyDistinctPng(
+            300 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+          ),
+        })),
+      ),
+    );
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) => use({ search }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+        };
+      }),
+      renderCandidates,
+      persistArtifact: baseline.persistArtifact as never,
+      persistBoard: baseline.persistBoard,
+    });
+
+    await expect(
+      handler({
+        operation: operation(),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: {
+        candidateCount: 9,
+        actual: { searched: 72, shortlisted: 36, mirrored: 36, presented: 9 },
+        diversity: { familyQueriesRun: 18, assignedFamilies: 9 },
+      },
+    });
+    expect(search).toHaveBeenCalledTimes(18);
+    expect(renderCandidates).toHaveBeenCalledOnce();
+    expect(baseline.persistBoard).toHaveBeenCalledOnce();
+  });
+
+  it("never labels generic Hero metadata as nine different visual families", async () => {
+    let id = 0;
+    const fetchPreview = vi.fn();
+    const baseline = frontMindBaselineDependencies();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            search: async () => ({
+              results: Array.from({ length: 4 }, () => ({
+                id: ++id,
+                name: `Responsive Hero section ${id}`,
+                description: "A polished responsive landing-page Hero.",
+                previewUrl: `https://cdn.example.test/${id}.png`,
+              })),
+            }),
+          }),
+      },
+      fetchPreview,
+      ...baseline,
+    });
+
+    await expect(
+      handler({
+        operation: operation(),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
+      result: {
+        normalizedUnique: 72,
+        shortlistCount: 0,
+        diversity: {
+          familyQueriesRun: 18,
+          eligibleReferences: 0,
+          assignedFamilies: 0,
+        },
+      },
+    });
+    expect(fetchPreview).not.toHaveBeenCalled();
+    expect(baseline.renderCandidates).not.toHaveBeenCalled();
+    expect(baseline.persistBoard).not.toHaveBeenCalled();
   });
 
   it("rejects producer drift before database or provider access", async () => {
@@ -508,7 +745,7 @@ describe("21st SiteOps provider", () => {
     log.mockRestore();
   });
 
-  it("renders nine trusted FrontMind candidates when the catalog is empty", async () => {
+  it("fails truthfully instead of synthesizing nine candidates for an empty catalog", async () => {
     const baseline = frontMindBaselineDependencies();
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
@@ -537,33 +774,19 @@ describe("21st SiteOps provider", () => {
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({
-      status: "succeeded",
+      status: "attention_required",
+      code: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
       result: {
-        candidateCount: 9,
-        degradedReasons: expect.arrayContaining([
-          "FRONTMIND_BASELINE:CATALOG_EMPTY",
-        ]),
+        normalizedUnique: 0,
+        diversity: {
+          familyQueriesRun: 18,
+          eligibleReferences: 0,
+          assignedFamilies: 0,
+        },
       },
     });
-    expect(baseline.persistBoard).toHaveBeenCalledOnce();
-    expect(
-      new Set(
-        baseline
-          .persisted()!
-          .selectionBundle.candidates.map(
-            (candidate) => candidate.referenceBlueprint.heroFamily,
-          ),
-      ).size,
-    ).toBe(9);
-    expect(
-      new Set(
-        baseline
-          .persisted()!
-          .selectionBundle.candidates.map(
-            (candidate) => candidate.previewSha256,
-          ),
-      ).size,
-    ).toBe(9);
+    expect(baseline.renderCandidates).not.toHaveBeenCalled();
+    expect(baseline.persistBoard).not.toHaveBeenCalled();
   });
 
   it("distinguishes missing preview references from an empty catalog", async () => {
@@ -582,7 +805,7 @@ describe("21st SiteOps provider", () => {
         withReadOnlySession: async (_apiKey, use) =>
           use({
             search: async () => ({
-              results: [{ id: ++id, name: `Catalog item ${id}` }],
+              results: [{ id: ++id, name: `Hero Catalog item ${id}` }],
             }),
           }),
       },
@@ -594,15 +817,15 @@ describe("21st SiteOps provider", () => {
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({
-      status: "succeeded",
+      status: "attention_required",
+      code: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
       result: {
-        candidateCount: 9,
-        diagnostics: { normalizedUnique: 4, withPreviewReference: 0 },
-        degradedReasons: expect.arrayContaining([
-          "FRONTMIND_BASELINE:NO_SAFE_PREVIEW",
-        ]),
+        normalizedUnique: 18,
+        withPreviewReference: 0,
+        diversity: { assignedFamilies: 0 },
       },
     });
+    expect(baseline.persistBoard).not.toHaveBeenCalled();
   });
 
   it("uses nine trusted families instead of filling the board with sections", async () => {
@@ -628,7 +851,7 @@ describe("21st SiteOps provider", () => {
                 results: [
                   {
                     id: index + 1,
-                    name: names[index],
+                    name: names[index % names.length],
                     previewUrl: `https://cdn.example.test/${index + 1}.png`,
                   },
                 ],
@@ -646,16 +869,15 @@ describe("21st SiteOps provider", () => {
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({
-      status: "succeeded",
+      status: "attention_required",
+      code: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
       result: {
-        candidateCount: 9,
-        degradedReasons: expect.arrayContaining([
-          "FRONTMIND_BASELINE:NO_HERO_REFERENCE",
-        ]),
+        shortlistCount: 0,
+        diversity: { assignedFamilies: 0 },
       },
     });
     expect(fetchPreview).not.toHaveBeenCalled();
-    expect(baseline.persistBoard).toHaveBeenCalledOnce();
+    expect(baseline.persistBoard).not.toHaveBeenCalled();
   });
 
   it("reports aggregate mirror diagnostics without leaking preview URLs", async () => {
@@ -675,11 +897,13 @@ describe("21st SiteOps provider", () => {
           use({
             search: async () => {
               const itemId = ++id;
+              const metadata = familyMetadata((itemId - 1) % 9);
               return {
                 results: [
                   {
                     id: itemId,
-                    name: `Hero Catalog item ${itemId}`,
+                    name: `${metadata.name} ${itemId}`,
+                    description: metadata.description,
                     previewUrl: `https://cdn.example.test/${itemId}.png?token=secret`,
                   },
                 ],
@@ -697,17 +921,13 @@ describe("21st SiteOps provider", () => {
       signal: new AbortController().signal,
     });
     expect(result).toMatchObject({
-      status: "succeeded",
+      status: "attention_required",
+      code: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
       result: {
-        candidateCount: 9,
-        diagnostics: {
-          mirrorAttempted: 2,
-          mirrorSucceeded: 0,
-          rejectedByReason: { http: 2 },
-        },
-        degradedReasons: expect.arrayContaining([
-          "FRONTMIND_BASELINE:PREVIEW_MIRROR_FAILED",
-        ]),
+        mirrorAttempted: 18,
+        mirrorSucceeded: 0,
+        rejectedByReason: { http: 18 },
+        diversity: { assignedFamilies: 0 },
       },
     });
     expect(JSON.stringify(result)).not.toContain("token=secret");
@@ -891,6 +1111,90 @@ describe("21st SiteOps provider", () => {
     expect(result.sha256).toBe(sha256(result.buffer));
     expect(result.visualSignals.dominantHex).toMatch(/^#[a-f0-9]{6}$/u);
     expect(result.visualSignals.brightness).toBeLessThan(96);
+  });
+
+  it("accepts a bounded large source image when its normalized asset is below 5 MiB", async () => {
+    const smallPng = await sharp({
+      create: {
+        width: 3840,
+        height: 2880,
+        channels: 3,
+        background: { r: 248, g: 248, b: 248 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const upstream = Buffer.concat([
+      smallPng,
+      Buffer.alloc(6 * 1024 * 1024, 0x20),
+    ]);
+    expect(upstream.byteLength).toBeGreaterThan(5 * 1024 * 1024);
+    expect(upstream.byteLength).toBeLessThan(12 * 1024 * 1024);
+
+    const result = await fetchSafeVisualPreview({
+      url: "https://preview.example.com/large-source.png",
+      resolveImpl: vi
+        .fn()
+        .mockResolvedValue([{ address: "93.184.216.34", family: 4 }]) as never,
+      fetchImpl: vi.fn().mockResolvedValue(
+        new Response(upstream, {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        }),
+      ) as unknown as typeof fetch,
+    });
+
+    expect(result.width).toBe(2400);
+    expect(result.height).toBe(1800);
+    expect(result.buffer.byteLength).toBeLessThan(5 * 1024 * 1024);
+  });
+
+  it("rejects source images above 12 MiB before decoding", async () => {
+    const upstream = Buffer.alloc(12 * 1024 * 1024 + 1, 0x20);
+    await expect(
+      fetchSafeVisualPreview({
+        url: "https://preview.example.com/oversized-source.png",
+        resolveImpl: vi
+          .fn()
+          .mockResolvedValue([
+            { address: "93.184.216.34", family: 4 },
+          ]) as never,
+        fetchImpl: vi.fn().mockResolvedValue(
+          new Response(upstream, {
+            status: 200,
+            headers: { "content-type": "image/png" },
+          }),
+        ) as unknown as typeof fetch,
+      }),
+    ).rejects.toThrow("PREVIEW_TOO_LARGE");
+  });
+
+  it("rejects a normalized preview above 5 MiB", async () => {
+    const noisyPixels = randomBytes(1600 * 1600 * 3);
+    const upstream = await sharp(noisyPixels, {
+      raw: { width: 1600, height: 1600, channels: 3 },
+    })
+      .png({ compressionLevel: 0 })
+      .toBuffer();
+    expect(upstream.byteLength).toBeGreaterThan(5 * 1024 * 1024);
+    expect(upstream.byteLength).toBeLessThan(12 * 1024 * 1024);
+
+    await expect(
+      fetchSafeVisualPreview({
+        url: "https://preview.example.com/noisy.png",
+        resolveImpl: vi
+          .fn()
+          .mockResolvedValue([
+            { address: "93.184.216.34", family: 4 },
+          ]) as never,
+        fetchImpl: vi.fn().mockResolvedValue(
+          new Response(upstream, {
+            status: 200,
+            headers: { "content-type": "image/png" },
+          }),
+        ) as unknown as typeof fetch,
+      }),
+    ).rejects.toThrow("PREVIEW_TOO_LARGE");
   });
 
   it("rejects embedded private IPv4 across IPv6 transition formats", () => {

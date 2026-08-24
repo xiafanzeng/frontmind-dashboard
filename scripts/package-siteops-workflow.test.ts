@@ -6,6 +6,7 @@ import {
   SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_1,
+  SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_WORKFLOW,
 } from "../shared/siteops";
 import {
@@ -76,7 +77,7 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("has a current deterministic FrontMind 2.2.0 React static content contract", async () => {
+  it("has a current deterministic FrontMind 2.3.0 React static visual contract", async () => {
     const generated = await createSiteOpsRuntimeManifest();
     expect(generated).toMatchObject({
       version: SITEOPS_RUNTIME_VERSION,
@@ -101,11 +102,16 @@ describe("SiteOps runtime workflow package", () => {
       requiredTools: ["search"],
       optionalTools: ["get_component"],
       normalPathTools: ["search"],
-      primaryReferenceRole: "inspiration-evidence",
+      primaryReferenceRole: "one-real-provider-reference-per-candidate",
       supportReferenceRoles: [],
       promptRequired: false,
       providerCodeReuse: false,
       hostFamilyMappingRequired: true,
+      providerReferenceCount: 9,
+      uniqueProviderItemRequired: true,
+      uniqueProviderPreviewRequired: true,
+      perceptualDiversityRequired: true,
+      globalTaxonomyMergeAllowed: false,
       hostRenderedCandidateCount: 9,
       uniqueHostFamiliesRequired: true,
     });
@@ -117,7 +123,7 @@ describe("SiteOps runtime workflow package", () => {
     expect(runtime.providerWire).toMatchObject({
       phaseOneSchema: "schemas/site-design-wire-v3.schema.json",
       phaseOneCanonical:
-        "SiteDesignSpecV2-with-host-injected-ReferenceBlueprintV3",
+        "SiteDesignSpecV2-with-host-injected-ReferenceBlueprintV4",
       phaseOneOutputFilename: "frontmind-site-design-wire-v3.json",
       phaseTwoSchema: "schemas/page-content-wire-v3.schema.json",
       phaseTwoCanonical: "PageContentSpecV2",
@@ -159,10 +165,12 @@ describe("SiteOps runtime workflow package", () => {
       routeDocuments: true,
     });
     expect(runtime.referenceBlueprint).toMatchObject({
-      schema: "ReferenceBlueprintV3",
+      schema: "ReferenceBlueprintV4",
       familyFrozenByDashboard: true,
-      candidatePreviewOwner: "dashboard",
-      candidatePreviewRenderer: "trusted-react-host",
+      candidateReferencePreviewOwner: "provider-safe-mirror",
+      candidateRealizationPreviewOwner: "dashboard",
+      candidateRealizationPreviewRenderer: "trusted-react-host",
+      oneReferencePerBlueprint: true,
       providerCodeAccepted: false,
     });
     expect(runtime.contentSystem).toMatchObject({
@@ -208,7 +216,7 @@ describe("SiteOps runtime workflow package", () => {
     });
   });
 
-  it("retains immutable Astro and React 2.0/2.1 coordinates while 2.2 freezes complete content coordinates", async () => {
+  it("retains immutable historical coordinates while 2.3 freezes complete visual coordinates", async () => {
     const [legacyManifest, envelope, stageSchema, starter] = await Promise.all([
       readFile(
         "private-workflows/astro-company-site-workflow-v1.5.0/MANIFEST.json",
@@ -247,6 +255,12 @@ describe("SiteOps runtime workflow package", () => {
     expect(createHash("sha256").update(react21Manifest).digest("hex")).toBe(
       SITEOPS_MATERIALIZER_V2_1.runtimeManifestSha256,
     );
+    const react22Manifest = await readFile(
+      "private-workflows/react-static-company-site-workflow-v2.2.0/MANIFEST.json",
+    );
+    expect(createHash("sha256").update(react22Manifest).digest("hex")).toBe(
+      SITEOPS_MATERIALIZER_V2_2.runtimeManifestSha256,
+    );
     for (const version of ["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"]) {
       const preserved = JSON.parse(
         await readFile(
@@ -263,7 +277,7 @@ describe("SiteOps runtime workflow package", () => {
         workflow: { required: string[]; properties: Record<string, unknown> };
       };
     };
-    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 7 });
+    expect(frozenEnvelope.properties.schemaVersion).toEqual({ const: 8 });
     expect(frozenEnvelope.properties.workflow.required.sort()).toEqual(
       [
         "version",

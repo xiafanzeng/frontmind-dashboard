@@ -266,7 +266,7 @@ const brandSubpages = [
   {
     id: "global-keywords",
     label: "品牌全域词库",
-    desc: "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。",
+    desc: "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。",
   },
 ];
 
@@ -2520,7 +2520,7 @@ function BrandGlobalKeywords({ onUseQuestion, quotaAvailability, bank }) {
       <PageHeader
         eyebrow="MindPromise智诺 / 品牌建设"
         title="品牌全域词库"
-        desc="基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。"
+        desc="基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。"
       />
 
       {/* SaaS化：多维筛选工具栏 */}

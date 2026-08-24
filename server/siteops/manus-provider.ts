@@ -18,6 +18,7 @@ import {
 import {
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_1,
+  SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   visualEvidenceV1Schema,
@@ -28,6 +29,7 @@ import {
   type VisualSelectionBundleV1,
   type VisualSelectionBundleV2,
   type VisualSelectionBundleV3,
+  type VisualSelectionBundleV4,
 } from "../../shared/siteops";
 import {
   managedAgentProfileModel,
@@ -352,6 +354,15 @@ function reactStaticRendererCoordinates(
       materializerVersion: SITEOPS_MATERIALIZER_V2_1.materializerVersion,
     } as const;
   }
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_2.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_2.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_2.materializerVersion,
+    } as const;
+  }
   if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
     return {
       componentLibraryVersion: SITEOPS_WORKFLOW.componentLibraryVersion,
@@ -362,6 +373,13 @@ function reactStaticRendererCoordinates(
     "SITEOPS_REACT_WORKFLOW_VERSION_UNSUPPORTED",
     "FrontMind React 建站工作流版本不受支持。",
     "failed",
+  );
+}
+
+export function usesBuildPlanContractV4(workflowVersion: string) {
+  return (
+    workflowVersion === SITEOPS_MATERIALIZER_V2_2.frontMindVersion ||
+    workflowVersion === SITEOPS_WORKFLOW.frontMindVersion
   );
 }
 
@@ -616,10 +634,76 @@ function isVisualSelectionBundleV3(
   return "schemaVersion" in bundle && bundle.schemaVersion === 3;
 }
 
+function isVisualSelectionBundleV4(
+  bundle: VisualSelectionBundle,
+): bundle is VisualSelectionBundleV4 {
+  return "schemaVersion" in bundle && bundle.schemaVersion === 4;
+}
+
 function visualSelectionQueryHash(bundle: VisualSelectionBundle) {
-  return isVisualSelectionBundleV2(bundle) || isVisualSelectionBundleV3(bundle)
+  return isVisualSelectionBundleV2(bundle) ||
+    isVisualSelectionBundleV3(bundle) ||
+    isVisualSelectionBundleV4(bundle)
     ? bundle.queryPlanHash
     : (bundle as VisualSelectionBundleV1).queryHash;
+}
+
+export function selectedVisualPreviewCoordinates(input: {
+  bundle: VisualSelectionBundle;
+  candidateId: string;
+  samplePreviewLocalAssetId: string;
+  evidencePreviewSha256: string;
+}) {
+  const candidate = input.bundle.candidates.find(
+    (item) => item.id === input.candidateId,
+  );
+  if (
+    !candidate ||
+    candidate.previewLocalAssetId !== input.samplePreviewLocalAssetId ||
+    candidate.previewSha256 !== input.evidencePreviewSha256
+  ) {
+    throw new SiteOpsManusFailure(
+      "VISUAL_SELECTION_COORDINATES_MISMATCH",
+      "冻结的视觉候选与选择合同坐标不一致。",
+      "failed",
+    );
+  }
+  if (isVisualSelectionBundleV4(input.bundle)) {
+    const v4Candidate = input.bundle.candidates.find(
+      (item) => item.id === input.candidateId,
+    );
+    if (
+      !v4Candidate ||
+      v4Candidate.referenceBlueprint.referencePreviewLocalAssetId !==
+        candidate.previewLocalAssetId ||
+      v4Candidate.referenceBlueprint.referencePreviewSha256 !==
+        candidate.previewSha256 ||
+      v4Candidate.referenceBlueprint.previewLocalAssetId !==
+        v4Candidate.realizationPreviewLocalAssetId ||
+      v4Candidate.referenceBlueprint.previewSha256 !==
+        v4Candidate.realizationPreviewSha256
+    ) {
+      throw new SiteOpsManusFailure(
+        "VISUAL_SELECTION_COORDINATES_MISMATCH",
+        "冻结的视觉参考与可实现预览坐标不一致。",
+        "failed",
+      );
+    }
+    return {
+      referenceLocalAssetId: candidate.previewLocalAssetId,
+      referenceSha256: candidate.previewSha256,
+      realizationLocalAssetId: v4Candidate.realizationPreviewLocalAssetId,
+      realizationSha256: v4Candidate.realizationPreviewSha256,
+      hasIndependentRealization: true,
+    } as const;
+  }
+  return {
+    referenceLocalAssetId: candidate.previewLocalAssetId,
+    referenceSha256: candidate.previewSha256,
+    realizationLocalAssetId: candidate.previewLocalAssetId,
+    realizationSha256: candidate.previewSha256,
+    hasIndependentRealization: false,
+  } as const;
 }
 
 function assertProjectVisualArtifact(
@@ -1071,7 +1155,7 @@ function generatedContentOutputSchema(
     routeIds: routeCompositions.map((route) => route.routeId),
     sourceDocumentIds,
   };
-  return workflowVersion === SITEOPS_WORKFLOW.frontMindVersion
+  return usesBuildPlanContractV4(workflowVersion)
     ? pageContentWireV3OutputSchema(input)
     : pageContentWireOutputSchema(input);
 }
@@ -1938,14 +2022,17 @@ export function createManusSiteOpsProviderHandler(
         artifact: selectionArtifact,
         expectedCandidateId: context.sample.id,
       });
+      const previewCoordinates = selectedVisualPreviewCoordinates({
+        bundle: selection.bundle,
+        candidateId: context.sample.id,
+        samplePreviewLocalAssetId: context.sample.previewLocalAssetId,
+        evidencePreviewSha256: visualEvidence.previewSha256,
+      });
       if (
         selection.candidate.providerItemKey !==
           visualEvidence.providerItemKey ||
         selection.candidate.visualEvidence.evidenceSha256 !==
-          visualEvidence.evidenceSha256 ||
-        selection.candidate.previewSha256 !== visualEvidence.previewSha256 ||
-        selection.candidate.previewLocalAssetId !==
-          context.sample.previewLocalAssetId
+          visualEvidence.evidenceSha256
       ) {
         throw new SiteOpsManusFailure(
           "VISUAL_SELECTION_COORDINATES_MISMATCH",
@@ -1964,30 +2051,56 @@ export function createManusSiteOpsProviderHandler(
       const designOutputFilename = reactStatic
         ? SITEOPS_WIRE_OUTPUT_FILES.designV3
         : SITEOPS_WIRE_OUTPUT_FILES.design;
-      const contentOutputFilename =
-        workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
-          ? SITEOPS_WIRE_OUTPUT_FILES.contentV3
-          : SITEOPS_WIRE_OUTPUT_FILES.content;
+      const contentOutputFilename = usesBuildPlanContractV4(
+        workflow.frontMindVersion,
+      )
+        ? SITEOPS_WIRE_OUTPUT_FILES.contentV3
+        : SITEOPS_WIRE_OUTPUT_FILES.content;
       const referenceBlueprint = referenceBlueprintSchema.safeParse(
         input.referenceBlueprint,
       );
       const selectionV3 = isVisualSelectionBundleV3(selection.bundle)
         ? selection.bundle
         : null;
+      const selectionV4 = isVisualSelectionBundleV4(selection.bundle)
+        ? selection.bundle
+        : null;
       const selectedV3Blueprint = selectionV3?.candidates.find(
         (candidate) => candidate.id === context.sample.id,
       )?.referenceBlueprint;
+      const selectedV4Candidate = selectionV4?.candidates.find(
+        (candidate) => candidate.id === context.sample.id,
+      );
+      const selectedV4Blueprint = selectedV4Candidate?.referenceBlueprint;
+      const blueprintCoordinatesMatch = referenceBlueprint.success
+        ? referenceBlueprint.data.schemaVersion === 4
+          ? Boolean(
+              selectedV4Candidate &&
+                selectedV4Blueprint &&
+                referenceBlueprint.data.referencePreviewLocalAssetId ===
+                  context.sample.previewLocalAssetId &&
+                referenceBlueprint.data.referencePreviewSha256 ===
+                  visualEvidence.previewSha256 &&
+                referenceBlueprint.data.previewLocalAssetId ===
+                  selectedV4Candidate.realizationPreviewLocalAssetId &&
+                referenceBlueprint.data.previewSha256 ===
+                  selectedV4Candidate.realizationPreviewSha256 &&
+                selectedV4Blueprint.blueprintHash ===
+                  referenceBlueprint.data.blueprintHash,
+            )
+          : referenceBlueprint.data.previewSha256 ===
+              visualEvidence.previewSha256 &&
+            (!selectedV3Blueprint ||
+              selectedV3Blueprint.blueprintHash ===
+                referenceBlueprint.data.blueprintHash)
+        : false;
       if (
         reactStatic &&
         (!referenceBlueprint.success ||
           referenceBlueprint.data.candidateId !== context.sample.id ||
           referenceBlueprint.data.providerItemKey !==
             visualEvidence.providerItemKey ||
-          referenceBlueprint.data.previewSha256 !==
-            visualEvidence.previewSha256 ||
-          (selectedV3Blueprint &&
-            selectedV3Blueprint.blueprintHash !==
-              referenceBlueprint.data.blueprintHash))
+          !blueprintCoordinatesMatch)
       ) {
         throw new SiteOpsManusFailure(
           "VISUAL_REFERENCE_BLUEPRINT_MISMATCH",
@@ -2067,20 +2180,40 @@ export function createManusSiteOpsProviderHandler(
         } else {
           const workflowPackage =
             await loadVerifiedSiteOpsWorkflowPackage(workflow);
-          const previewArtifact = await readArtifact({
+          const referencePreviewArtifact = await readArtifact({
             userId: operation.userId,
-            localAssetId: context.sample.previewLocalAssetId,
-            expectedSha256: visualEvidence.previewSha256,
+            localAssetId: previewCoordinates.referenceLocalAssetId,
+            expectedSha256: previewCoordinates.referenceSha256,
             expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
           });
-          if (!previewArtifact) {
+          if (!referencePreviewArtifact) {
             throw new SiteOpsManusFailure(
               "VISUAL_PREVIEW_NOT_FOUND",
-              "视觉预览资产不存在。",
+              "视觉参考资产不存在。",
               "failed",
             );
           }
-          assertProjectVisualArtifact(previewArtifact, {
+          assertProjectVisualArtifact(referencePreviewArtifact, {
+            userId: operation.userId,
+            projectId: context.project.id,
+          });
+          const realizationPreviewArtifact =
+            previewCoordinates.hasIndependentRealization
+              ? await readArtifact({
+                  userId: operation.userId,
+                  localAssetId: previewCoordinates.realizationLocalAssetId,
+                  expectedSha256: previewCoordinates.realizationSha256,
+                  expectedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+                })
+              : referencePreviewArtifact;
+          if (!realizationPreviewArtifact) {
+            throw new SiteOpsManusFailure(
+              "VISUAL_REALIZATION_PREVIEW_NOT_FOUND",
+              "视觉实现预览资产不存在。",
+              "failed",
+            );
+          }
+          assertProjectVisualArtifact(realizationPreviewArtifact, {
             userId: operation.userId,
             projectId: context.project.id,
           });
@@ -2121,9 +2254,17 @@ export function createManusSiteOpsProviderHandler(
               documents,
             }),
             await visualPreviewAttachment(
-              previewArtifact,
+              realizationPreviewArtifact,
               "selected-visual.png",
             ),
+            ...(previewCoordinates.hasIndependentRealization
+              ? [
+                  await visualPreviewAttachment(
+                    referencePreviewArtifact,
+                    "selected-reference.png",
+                  ),
+                ]
+              : []),
             ...(await Promise.all(
               supportArtifacts.map((artifact, index) =>
                 visualPreviewAttachment(
@@ -2135,7 +2276,7 @@ export function createManusSiteOpsProviderHandler(
           ];
           const prompt = promptWithMarker(
             reactStatic
-              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，不是客户网站素材。请返回 SiteDesignWireV3：为每个 route 输出按数组顺序排列且唯一的 routeSlots，并使用 dossier 中的冻结调色板；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
+              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，selected-reference.png（若附加）是与该方案一对一绑定的真实视觉灵感参考；二者都不是客户网站素材。请返回 SiteDesignWireV3：为每个 route 输出按数组顺序排列且唯一的 routeSlots，并使用 dossier 中的冻结调色板；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
               : `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${workflow.frontMindVersion}，并只使用冻结 SiteBrief、视觉证据和知识来源。请返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本、21st 代码或未知事实。`,
             designToken,
           );
@@ -2273,11 +2414,11 @@ export function createManusSiteOpsProviderHandler(
               : contentRepairPrompt({
                   repairAttempt: state.repairAttempt,
                   outputFilename: contentOutputFilename,
-                  wireVersion:
-                    workflow.frontMindVersion ===
-                    SITEOPS_WORKFLOW.frontMindVersion
-                      ? 3
-                      : 2,
+                  wireVersion: usesBuildPlanContractV4(
+                    workflow.frontMindVersion,
+                  )
+                    ? 3
+                    : 2,
                 }),
             repairToken,
           );
@@ -2647,10 +2788,10 @@ export function createManusSiteOpsProviderHandler(
                   referenceBlueprint: _visualReferenceBlueprint,
                   ...visualEvidence
                 } = parsedVisual;
-                const currentContentContract =
-                  workflow.frontMindVersion ===
-                  SITEOPS_WORKFLOW.frontMindVersion;
-                return currentContentContract
+                const buildPlanContractV4 = usesBuildPlanContractV4(
+                  workflow.frontMindVersion,
+                );
+                return buildPlanContractV4
                   ? composeBuildPlanContractV4({
                       schemaVersion: 4,
                       contractKind: "build_plan",
@@ -2658,8 +2799,11 @@ export function createManusSiteOpsProviderHandler(
                       renderer: {
                         kind: "react_static_v2",
                         reactVersion: "19.2.1",
-                        componentLibraryVersion: "2.2.0",
-                        materializerVersion: "2.2.0",
+                        componentLibraryVersion:
+                          workflow.componentLibraryVersion as "2.2.0" | "2.3.0",
+                        materializerVersion: workflow.materializerVersion as
+                          | "2.2.0"
+                          | "2.3.0",
                       },
                       content: {
                         schemaVersion: 2,
@@ -2707,12 +2851,12 @@ export function createManusSiteOpsProviderHandler(
               });
         const contractAttachment =
           reactStatic && referenceBlueprint.success
-            ? workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+            ? usesBuildPlanContractV4(workflow.frontMindVersion)
               ? siteOpsBuildPlanContractV4Attachment(canonicalContract)
               : siteOpsBuildPlanContractV3Attachment(canonicalContract)
             : siteOpsBuildContractAttachment(canonicalContract);
         const prompt = promptWithMarker(
-          workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+          usesBuildPlanContractV4(workflow.frontMindVersion)
             ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v4.json 是 Dashboard 根据已校验设计与冻结知识库存生成的预物化计划合同；冻结的 ReferenceBlueprint、Hero family、route 与 inventory 不可更改。请返回 PageContentWireV3：使用受支持的 typed blockType，实体、FAQ 与 officialLinks 只能来自 source dossier 且逐项绑定 sourceDocumentIds；不得输出内部来源标签。若 news route 在 inventory 中没有 company_news，必须保留该 route 但不要为它输出 block 或 company_news entity，Dashboard 会渲染可信空状态。不得浏览、抓取或编造行业/企业新闻。把完全相同的 JSON 对象附加为 ${contentOutputFilename}。不得重复 SEO，不得生成源码、HTML、依赖、表单提交或外部脚本。${revisionInstruction}`
             : reactStatic
               ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprint 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
@@ -2906,8 +3050,9 @@ export function createManusSiteOpsProviderHandler(
       }
       let generatedContent: z.infer<typeof siteOpsGeneratedContentSchema>;
       try {
-        const currentContent =
-          workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion;
+        const currentContent = usesBuildPlanContractV4(
+          workflow.frontMindVersion,
+        );
         const contentResult = currentContent
           ? pageContentResultV2FromWire(
               rawContent,

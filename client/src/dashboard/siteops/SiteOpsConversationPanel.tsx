@@ -686,6 +686,9 @@ export default function SiteOpsConversationPanel({
         observation.rebuildRequest.status,
       ),
   );
+  const hideExistingBuildDuringActiveRebuild = Boolean(
+    rebuildRequestActive && observation.rebuildRequest.resetApplied,
+  );
   const rebuildInProgress = observation.rebuildRequest.status === "in_progress";
   const rebuildNeedsKnowledgeSnapshot = Boolean(
     observation.rebuildRequest.resetApplied && !currentSnapshotId,
@@ -725,25 +728,27 @@ export default function SiteOpsConversationPanel({
               </button>
             )}
             {hasSuccessfulBuild ? (
-              <button
-                type="button"
-                className="siteops-icon-button"
-                aria-label="提交官网重制需求"
-                disabled={Boolean(
-                  busyAction ||
-                    rebuildRequestActive ||
-                    !observation.rebuildRequest.allowed,
-                )}
-                title={
-                  rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"
-                }
-                onClick={() => {
-                  setRebuildError(null);
-                  setRebuildDialogOpen(true);
-                }}
-              >
-                <Wrench size={17} aria-hidden="true" />
-              </button>
+              !hideExistingBuildDuringActiveRebuild && (
+                <button
+                  type="button"
+                  className="siteops-icon-button"
+                  aria-label="提交官网重制需求"
+                  disabled={Boolean(
+                    busyAction ||
+                      rebuildRequestActive ||
+                      !observation.rebuildRequest.allowed,
+                  )}
+                  title={
+                    rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"
+                  }
+                  onClick={() => {
+                    setRebuildError(null);
+                    setRebuildDialogOpen(true);
+                  }}
+                >
+                  <Wrench size={17} aria-hidden="true" />
+                </button>
+              )
             ) : (
               <button
                 type="button"
@@ -1201,28 +1206,49 @@ export default function SiteOpsConversationPanel({
                 {visualSelectionOpen ? "9 个视觉候选" : "已选择的视觉方案"}
               </h3>
               <p>
-                九种方案使用相同的企业资料真实渲染，选择结果将直接用于官网制作。
+                以下为真实视觉参考；示例图片与文案不会复制到官网，FrontMind
+                将按所选构图与视觉语言使用企业资料完成制作。
               </p>
             </div>
             {visualSelectionOpen && (
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled={visualSelectionDisabled}
-                onClick={() =>
-                  runAction(
-                    "delegate_visual",
-                    actionFromCard(
-                      observation,
-                      "visual_board",
+              <div className="siteops-inline-actions">
+                <button
+                  type="button"
+                  className="siteops-secondary-button"
+                  disabled={visualSelectionDisabled}
+                  onClick={() =>
+                    runAction(
+                      "reselect_visual",
+                      actionFromCard(
+                        observation,
+                        "visual_board",
+                        "reselect_visual",
+                        {},
+                      ),
+                    )
+                  }
+                >
+                  重新生成 9 个视觉候选
+                </button>
+                <button
+                  type="button"
+                  className="siteops-secondary-button"
+                  disabled={visualSelectionDisabled}
+                  onClick={() =>
+                    runAction(
                       "delegate_visual",
-                      {},
-                    ),
-                  )
-                }
-              >
-                让 FrontMind 推荐
-              </button>
+                      actionFromCard(
+                        observation,
+                        "visual_board",
+                        "delegate_visual",
+                        {},
+                      ),
+                    )
+                  }
+                >
+                  让 FrontMind 推荐
+                </button>
+              </div>
             )}
           </div>
           {builderMessage && (
@@ -1256,14 +1282,16 @@ export default function SiteOpsConversationPanel({
         </section>
       )}
 
-      {latestAttempt?.needsHelp && latestBuild?.id !== latestAttempt.id && (
-        <div className="siteops-notice warning" role="status">
-          <AlertCircle size={18} aria-hidden="true" />
-          <span>最新重制暂未完成，当前官网仍可继续预览和使用。</span>
-        </div>
-      )}
+      {!hideExistingBuildDuringActiveRebuild &&
+        latestAttempt?.needsHelp &&
+        latestBuild?.id !== latestAttempt.id && (
+          <div className="siteops-notice warning" role="status">
+            <AlertCircle size={18} aria-hidden="true" />
+            <span>最新重制暂未完成，当前官网仍可继续预览和使用。</span>
+          </div>
+        )}
 
-      {latestBuild && (
+      {latestBuild && !hideExistingBuildDuringActiveRebuild && (
         <section
           className="siteops-build-card"
           aria-labelledby="siteops-build-title"

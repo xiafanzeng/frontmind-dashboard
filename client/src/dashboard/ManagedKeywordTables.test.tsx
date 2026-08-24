@@ -5,6 +5,42 @@ import ManagedKeywordTables, {
   BrandQuestionUniverseGenerationAction,
 } from "./ManagedKeywordTables";
 
+vi.mock("@/lib/trpc", () => ({
+  trpc: {
+    useUtils: () => ({
+      workspace: {
+        brandQuestionUniverse: {
+          observe: { invalidate: async () => undefined },
+        },
+        dashboard: { invalidate: async () => undefined },
+      },
+    }),
+    workspace: {
+      brandQuestionUniverse: {
+        observe: {
+          useQuery: () => ({
+            data: {
+              canStart: true,
+              knowledgeSnapshotId: "22222222-2222-4222-8222-222222222222",
+              dashboardRevision: 3,
+              reason: "ready",
+              operation: null,
+            },
+            error: null,
+          }),
+        },
+        start: {
+          useMutation: () => ({
+            mutate: () => undefined,
+            isPending: false,
+            error: null,
+          }),
+        },
+      },
+    },
+  },
+}));
+
 const tables = [
   {
     id: "question-list-1",
@@ -61,7 +97,7 @@ describe("ManagedKeywordTables", () => {
 
     expect(
       screen.getByText(
-        "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。",
+        "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。",
       ),
     ).toBeInTheDocument();
     expect(
@@ -233,5 +269,37 @@ describe("ManagedKeywordTables", () => {
     expect(
       screen.queryByText(/工单|AI 监控与优化工程师|候选问题目录/),
     ).not.toBeInTheDocument();
+  });
+
+  it("hides the generation action after the published 160-row word bank exists", () => {
+    const publishedRows = Array.from({ length: 160 }, (_, index) => [
+      String(index + 1),
+      `品牌问题 ${index + 1}`,
+      "品牌",
+      "品牌核心词",
+      String(160 - index),
+      "2026-08-24",
+      "品牌认知",
+    ]);
+
+    render(
+      <ManagedKeywordTables
+        tables={[{ ...tables[0]!, rows: publishedRows }]}
+        generationEnabled
+      />,
+    );
+
+    expect(screen.getByText(/共/)).toHaveTextContent("共 160 条词库记录");
+    expect(
+      screen.queryByRole("button", { name: "抓取品牌全域词库" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the generation action available until a word bank is published", () => {
+    render(<ManagedKeywordTables tables={[]} generationEnabled />);
+
+    expect(
+      screen.getByRole("button", { name: "抓取品牌全域词库" }),
+    ).toBeInTheDocument();
   });
 });

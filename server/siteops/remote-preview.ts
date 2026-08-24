@@ -6,8 +6,15 @@ import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
 import sharp from "sharp";
 
-const MAX_PREVIEW_BYTES = 5 * 1024 * 1024;
+// Provider previews can be large, minimally-compressed source PNGs. Keep the
+// network boundary bounded independently from the immutable normalized asset:
+// accept enough source bytes to decode real 21st catalog previews, then require
+// the metadata-free PNG that we persist to remain within the tighter limit.
+const MAX_PREVIEW_INPUT_BYTES = 12 * 1024 * 1024;
+const MAX_PREVIEW_OUTPUT_BYTES = 5 * 1024 * 1024;
 const MAX_PREVIEW_PIXELS = 20_000_000;
+const MAX_NORMALIZED_PREVIEW_WIDTH = 2400;
+const MAX_NORMALIZED_PREVIEW_HEIGHT = 1800;
 const MAX_REDIRECTS = 3;
 const MAX_PINNED_ADDRESSES = 3;
 const ALLOWED_MIME_TYPES = new Set([
@@ -484,7 +491,7 @@ export async function fetchSafeVisualPreview(input: {
   if (!ALLOWED_MIME_TYPES.has(mimeType)) {
     throw new Error("PREVIEW_MIME_INVALID");
   }
-  const buffer = await readBoundedBody(response, MAX_PREVIEW_BYTES);
+  const buffer = await readBoundedBody(response, MAX_PREVIEW_INPUT_BYTES);
   const image = sharp(buffer, {
     failOn: "error",
     limitInputPixels: MAX_PREVIEW_PIXELS,
@@ -503,9 +510,15 @@ export async function fetchSafeVisualPreview(input: {
   const normalizedBuffer = await image
     .clone()
     .rotate()
+    .resize({
+      width: MAX_NORMALIZED_PREVIEW_WIDTH,
+      height: MAX_NORMALIZED_PREVIEW_HEIGHT,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
     .png({ compressionLevel: 9, adaptiveFiltering: false })
     .toBuffer();
-  if (normalizedBuffer.byteLength > MAX_PREVIEW_BYTES) {
+  if (normalizedBuffer.byteLength > MAX_PREVIEW_OUTPUT_BYTES) {
     throw new Error("PREVIEW_TOO_LARGE");
   }
   const normalizedImage = sharp(normalizedBuffer, {

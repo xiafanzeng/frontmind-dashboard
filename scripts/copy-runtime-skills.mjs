@@ -20,8 +20,7 @@ await verifyUpstreamSiteOpsWorkflow();
 await verifySiteOpsRuntimeWorkflow();
 await verifyAllSiteOpsSocialWorkflows();
 const exactMaterializedSkill = `socratic-kb-builder-v5-${materializedSkill.contentHash}.skill`;
-const currentSiteOpsWorkflow =
-  `react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`;
+const currentSiteOpsWorkflow = `react-static-company-site-workflow-v${SITEOPS_RUNTIME_VERSION}`;
 const skillArtifacts = [
   "socratic-kb-builder-v5.skill",
   exactMaterializedSkill,
@@ -38,6 +37,7 @@ const skillArtifacts = [
   "astro-company-site-workflow-v1.6.0",
   "react-static-company-site-workflow-v2.0.0",
   "react-static-company-site-workflow-v2.1.0",
+  "react-static-company-site-workflow-v2.2.0",
   currentSiteOpsWorkflow,
   "siteops-wechat-package-v1.0.0",
   "siteops-xiaohongshu-package-v1.0.0",
@@ -117,6 +117,15 @@ const requiredFiles = [
   "react-static-company-site-workflow-v2.1.0/schemas/page-content-wire-v2.schema.json",
   "react-static-company-site-workflow-v2.1.0/schemas/materialization-stage-v2.schema.json",
   "react-static-company-site-workflow-v2.1.0/assets/host-starter-contract.json",
+  "react-static-company-site-workflow-v2.2.0/MANIFEST.json",
+  "react-static-company-site-workflow-v2.2.0/SKILL.md",
+  "react-static-company-site-workflow-v2.2.0/runtime-contract.json",
+  "react-static-company-site-workflow-v2.2.0/adapters/frontmind-dashboard.md",
+  "react-static-company-site-workflow-v2.2.0/schemas/frontmind-run-envelope.schema.json",
+  "react-static-company-site-workflow-v2.2.0/schemas/site-design-wire-v3.schema.json",
+  "react-static-company-site-workflow-v2.2.0/schemas/page-content-wire-v3.schema.json",
+  "react-static-company-site-workflow-v2.2.0/schemas/materialization-stage-v2.schema.json",
+  "react-static-company-site-workflow-v2.2.0/assets/host-starter-contract.json",
   `${currentSiteOpsWorkflow}/MANIFEST.json`,
   `${currentSiteOpsWorkflow}/SKILL.md`,
   `${currentSiteOpsWorkflow}/UPSTREAM.json`,

@@ -53,6 +53,7 @@ import {
   referenceBlueprintForVisualCandidate,
   referenceBlueprintSchema,
   referenceBlueprintV3Schema,
+  referenceBlueprintV4Schema,
   type ReferenceBlueprint,
 } from "../../shared/siteops-design";
 import {
@@ -803,6 +804,9 @@ export function freezeSiteOpsReferenceBlueprint(input: {
       ? (input.sourceMetadata as Record<string, unknown>)
       : {};
   const evidence = visualEvidenceV1Schema.safeParse(metadata.visualEvidence);
+  const frozenV4 = referenceBlueprintV4Schema.safeParse(
+    metadata.referenceBlueprint,
+  );
   const frozenV3 = referenceBlueprintV3Schema.safeParse(
     metadata.referenceBlueprint,
   );
@@ -829,6 +833,44 @@ export function freezeSiteOpsReferenceBlueprint(input: {
       previewSha256: evidence.data.previewSha256,
       taxonomyDerivationVersion: evidence.data.taxonomyDerivationVersion,
     }).evidenceSha256 === evidence.data.evidenceSha256;
+  const metadataRealizationPreviewLocalAssetId = z
+    .string()
+    .uuid()
+    .safeParse(metadata.realizationPreviewLocalAssetId);
+  const metadataRealizationPreviewSha256 = z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .safeParse(metadata.realizationPreviewSha256);
+  if (
+    frozenV4.success &&
+    evidence.success &&
+    evidenceIsValid &&
+    metadataRealizationPreviewLocalAssetId.success &&
+    metadataRealizationPreviewSha256.success &&
+    frozenV4.data.candidateId === input.sampleId &&
+    frozenV4.data.providerItemKey === evidence.data.providerItemKey &&
+    frozenV4.data.referencePreviewSha256 === evidence.data.previewSha256 &&
+    (!input.previewLocalAssetId ||
+      frozenV4.data.referencePreviewLocalAssetId ===
+        input.previewLocalAssetId) &&
+    frozenV4.data.previewLocalAssetId ===
+      metadataRealizationPreviewLocalAssetId.data &&
+    frozenV4.data.previewSha256 === metadataRealizationPreviewSha256.data
+  ) {
+    return frozenV4.data;
+  }
+  if (
+    metadata.referenceBlueprint &&
+    typeof metadata.referenceBlueprint === "object" &&
+    !Array.isArray(metadata.referenceBlueprint) &&
+    (metadata.referenceBlueprint as Record<string, unknown>).schemaVersion === 4
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "所选视觉方案已失效，请重新生成视觉候选后选择。",
+      409,
+    );
+  }
   if (
     frozenV3.success &&
     evidence.success &&
@@ -880,7 +922,17 @@ export function referenceBlueprintForSiteOpsRevision(input: {
     inherited.data.providerItemKey ===
       input.derivedReferenceBlueprint.providerItemKey &&
     inherited.data.previewSha256 ===
-      input.derivedReferenceBlueprint.previewSha256;
+      input.derivedReferenceBlueprint.previewSha256 &&
+    (inherited.data.schemaVersion !== 4 ||
+      (input.derivedReferenceBlueprint.schemaVersion === 4 &&
+        inherited.data.referencePreviewLocalAssetId ===
+          input.derivedReferenceBlueprint.referencePreviewLocalAssetId &&
+        inherited.data.referencePreviewSha256 ===
+          input.derivedReferenceBlueprint.referencePreviewSha256 &&
+        inherited.data.inspirationTaxonomySha256 ===
+          input.derivedReferenceBlueprint.inspirationTaxonomySha256 &&
+        inherited.data.styleSignature ===
+          input.derivedReferenceBlueprint.styleSignature));
   if (input.parentWorkflowVersion.startsWith("2.") && !inheritedMatches) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -3486,6 +3538,24 @@ async function handleChangeSnapshot(
     );
 }
 
+export function visualSearchAllowedForProjectStatus(
+  status: string,
+  reselect = false,
+) {
+  return (
+    reselect
+      ? [
+          "awaiting_visual_selection",
+          "preview_ready",
+          "approved",
+          "live",
+          "failed",
+          "attention_required",
+        ]
+      : ["collecting_brief"]
+  ).includes(status);
+}
+
 async function handleVisualSearch(
   tx: any,
   input: {
@@ -3506,10 +3576,9 @@ async function handleVisualSearch(
     });
     requireAcceptedSiteOpsRebuild(rebuild);
   }
-  const allowedStatuses = input.reselect
-    ? ["preview_ready", "approved", "live", "failed", "attention_required"]
-    : ["collecting_brief"];
-  if (!allowedStatuses.includes(input.project.status)) {
+  if (
+    !visualSearchAllowedForProjectStatus(input.project.status, input.reselect)
+  ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       input.reselect
@@ -3554,6 +3623,19 @@ async function handleVisualSearch(
     credentialVersion: credential.version,
     workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
   });
+  if (input.reselect) {
+    await tx
+      .update(websiteStyleSampleBatches)
+      .set({ status: "superseded", updatedAt: new Date() })
+      .where(
+        and(
+          eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+          eq(websiteStyleSampleBatches.userId, input.actor.id),
+          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+          eq(websiteStyleSampleBatches.status, "published"),
+        ),
+      );
+  }
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
     project: input.project,

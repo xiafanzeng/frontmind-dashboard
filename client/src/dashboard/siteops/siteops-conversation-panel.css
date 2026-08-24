@@ -881,6 +881,13 @@
   opacity: 0.55;
 }
 
+.siteops-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .siteops-build-card {
   align-items: center;
 }

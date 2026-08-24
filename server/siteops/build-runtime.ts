@@ -37,6 +37,7 @@ import {
   SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_1,
+  SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
@@ -85,7 +86,9 @@ import {
   REACT_STATIC_RENDERER,
   REACT_STATIC_RENDERER_V1,
   TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE,
+  TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE_V2_2,
   TRUSTED_REACT_RENDERER_SOURCE,
+  TRUSTED_REACT_VISUAL_CONTRACT_V4_CSS,
 } from "./react-static-runtime";
 
 export {
@@ -103,6 +106,7 @@ type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V1_6
   | typeof SITEOPS_MATERIALIZER_V2_0
   | typeof SITEOPS_MATERIALIZER_V2_1
+  | typeof SITEOPS_MATERIALIZER_V2_2
   | typeof SITEOPS_WORKFLOW;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
@@ -144,6 +148,15 @@ function reactStaticCoordinatesForWorkflow(
       componentLibraryVersion:
         SITEOPS_MATERIALIZER_V2_1.componentLibraryVersion,
       materializerVersion: SITEOPS_MATERIALIZER_V2_1.materializerVersion,
+    } as const;
+  }
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_2.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_2.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_2.materializerVersion,
     } as const;
   }
   if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
@@ -892,11 +905,17 @@ function siteDesignMaterializationProjectionFor(
     design.schemaVersion === 2
       ? design.referenceBlueprint.heroFamily
       : design.heroVariant;
+  const referenceBlueprint =
+    design.schemaVersion === 2 ? design.referenceBlueprint : null;
   const hasFrozenVisualTokens =
-    design.schemaVersion === 2 && design.referenceBlueprint.schemaVersion === 3;
+    referenceBlueprint?.schemaVersion === 3 ||
+    referenceBlueprint?.schemaVersion === 4;
   const blueprintClasses =
     design.schemaVersion === 2
       ? [
+          ...(design.referenceBlueprint.schemaVersion === 4
+            ? ["preview-contract--v4"]
+            : []),
           `align--${design.referenceBlueprint.alignment}`,
           `emphasis--${design.referenceBlueprint.contentEmphasis}`,
           `media-region--${design.referenceBlueprint.mediaRegion}`,
@@ -915,7 +934,8 @@ function siteDesignMaterializationProjectionFor(
           `typography--${design.referenceBlueprint.typographyStyle}`,
           `responsive--${design.referenceBlueprint.responsiveBehavior}`,
           `motion--${design.referenceBlueprint.motionLevel}`,
-          ...(design.referenceBlueprint.schemaVersion === 3
+          ...(design.referenceBlueprint.schemaVersion === 3 ||
+          design.referenceBlueprint.schemaVersion === 4
             ? [
                 `type-system--${design.referenceBlueprint.typeSystem}`,
                 `density--${design.referenceBlueprint.density}`,
@@ -953,6 +973,39 @@ function siteDesignMaterializationProjectionFor(
   };
 }
 
+function trustedVisualContractV4(design: SiteDesignSpecV2) {
+  const blueprint = design.referenceBlueprint;
+  if (blueprint.schemaVersion !== 4) return null;
+  return {
+    schemaVersion: 4 as const,
+    blueprintHash: blueprint.blueprintHash,
+    styleSignature: blueprint.styleSignature,
+    heroFamily: blueprint.heroFamily,
+    palette: blueprint.palette,
+    typeSystem: blueprint.typeSystem,
+    alignment: blueprint.alignment,
+    contentEmphasis: blueprint.contentEmphasis,
+    mediaRegion: blueprint.mediaRegion,
+    mediaRatio: blueprint.mediaRatio,
+    mediaStrategy: blueprint.mediaStrategy,
+    composition: blueprint.composition,
+    backgroundStyle: blueprint.backgroundStyle,
+    gradientStyle: blueprint.gradientStyle,
+    borderStyle: blueprint.borderStyle,
+    radiusStyle: blueprint.radiusStyle,
+    decorationStyle: blueprint.decorationStyle,
+    navStyle: blueprint.navStyle,
+    ctaStyle: blueprint.ctaStyle,
+    cardStyle: blueprint.cardStyle,
+    containerStyle: blueprint.containerStyle,
+    typographyStyle: blueprint.typographyStyle,
+    density: blueprint.density,
+    responsiveBehavior: blueprint.responsiveBehavior,
+    motionLevel: blueprint.motionLevel,
+    componentManifest: blueprint.componentManifest,
+  };
+}
+
 export function siteDesignMaterializationProjection(input: unknown) {
   return siteDesignMaterializationProjectionFor(
     input,
@@ -967,7 +1020,8 @@ export function siteOpsVisualCssTokens(
 ) {
   if (
     design.schemaVersion === 2 &&
-    design.referenceBlueprint.schemaVersion === 3
+    (design.referenceBlueprint.schemaVersion === 3 ||
+      design.referenceBlueprint.schemaVersion === 4)
   ) {
     const blueprint = design.referenceBlueprint;
     assertVisualPaletteContrastV3(blueprint.palette);
@@ -1115,7 +1169,11 @@ function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
   const componentCss = `.hero-copy{position:relative;z-index:2}.hero-orbit-layout,.hero-split,.hero-proof{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.82fr);align-items:center;gap:clamp(28px,6vw,88px)}.hero-art{min-width:0}.orbit-art{display:block;width:100%;height:auto;max-height:620px;color:var(--ink)}.orbit-art__halo{fill:color-mix(in srgb,var(--accent) 11%,transparent);stroke:none}.orbit-art__ring{fill:none;stroke:currentColor;stroke-width:1.5;stroke-dasharray:7 12;opacity:.28}.orbit-art__ring--inner{stroke:var(--accent);stroke-dasharray:2 10}.orbit-art__dna,.orbit-art__molecule,.orbit-art__cell,.orbit-art__timeline{fill:none;stroke:currentColor;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}.orbit-art__dna circle,.orbit-art__molecule circle,.orbit-art__cell circle,.orbit-art__timeline circle{fill:var(--canvas);stroke:var(--accent)}.orbit-art__cell{stroke:var(--accent)}.orbit-art__timeline{stroke-width:4}.hero-feature-grid{list-style:none;margin:48px 0 0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);border-block:1px solid color-mix(in srgb,var(--ink) 28%,transparent)}.hero-feature-grid li{display:grid;gap:12px;padding:24px;border-right:1px solid color-mix(in srgb,var(--ink) 28%,transparent)}.hero-feature-grid li:last-child{border:0}.hero-feature-grid span,.section-index{color:var(--accent);font:700 .72rem/1 ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}.hero-bento{display:grid;grid-template-columns:1.45fr .55fr .55fr;grid-template-rows:auto auto;gap:var(--gap)}.hero-bento__copy{grid-row:span 2;padding:clamp(28px,5vw,64px);border:1px solid color-mix(in srgb,var(--ink) 24%,transparent);border-radius:var(--radius)}.hero-bento__signal,.hero-bento__summary,.hero-bento__mark{padding:28px;border-radius:var(--radius);background:var(--muted)}.hero-bento__signal{display:flex;flex-direction:column;justify-content:space-between;gap:64px}.hero-bento__signal span{color:var(--accent)}.hero-bento__mark{display:grid;place-items:center;background:var(--accent);color:var(--canvas);font-size:clamp(3rem,7vw,7rem)}.hero-split__media{aspect-ratio:4/5;position:relative;display:grid;place-items:end start;padding:32px;overflow:hidden;border-radius:var(--radius);background:linear-gradient(145deg,var(--ink),color-mix(in srgb,var(--ink) 72%,var(--accent)));color:var(--canvas)}.hero-split__disc{position:absolute;border-radius:50%;border:1px solid color-mix(in srgb,var(--canvas) 60%,transparent)}.hero-split__disc--one{width:80%;aspect-ratio:1;right:-24%;top:-12%}.hero-split__disc--two{width:45%;aspect-ratio:1;left:10%;bottom:10%;background:color-mix(in srgb,var(--accent) 64%,transparent)}.hero-split__media strong{position:relative;font-size:clamp(1.5rem,3vw,3rem);line-height:1.05}.hero-editorial{border-bottom:1px solid color-mix(in srgb,var(--ink) 28%,transparent)}.hero-editorial{display:grid;grid-template-columns:1fr minmax(0,1120px) 1fr}.hero-editorial>.shell{grid-column:2}.hero-editorial__folio{font:600 .7rem/1 ui-monospace,monospace;letter-spacing:.16em;border-bottom:1px solid currentColor;padding-bottom:16px}.hero-editorial__note{max-width:28ch;margin:48px 0 0 auto;border-left:3px solid var(--accent);padding-left:20px}.hero-centered{text-align:center}.hero-centered .hero-copy>*{margin-inline:auto}.hero-actions{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-top:32px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 22px;border:1px solid currentColor;border-radius:999px;text-decoration:none;font-weight:750}.button--primary{background:var(--ink);color:var(--canvas)}.button--secondary{background:transparent}.button--inverse{background:var(--canvas);color:var(--ink);align-self:center}.hero--immersive_visual{min-height:min(820px,86vh);display:grid;align-items:end;background:var(--ink);color:var(--canvas)}.hero-immersive__field{position:absolute;inset:0;background:radial-gradient(circle at 18% 20%,color-mix(in srgb,var(--accent) 64%,transparent),transparent 28%),radial-gradient(circle at 82% 45%,color-mix(in srgb,var(--canvas) 20%,transparent),transparent 26%)}.hero-immersive__field i{position:absolute;border:1px solid color-mix(in srgb,var(--canvas) 44%,transparent);border-radius:50%;aspect-ratio:1}.hero-immersive__field i:nth-child(1){width:44%;right:4%;top:8%}.hero-immersive__field i:nth-child(2){width:24%;right:27%;top:28%}.hero-immersive__field i:nth-child(3){width:12%;left:12%;top:14%;background:var(--accent)}.hero-immersive__copy{position:relative;padding-bottom:clamp(72px,10vw,136px)}.hero--immersive_visual .eyebrow{color:var(--canvas)}.product-stage{margin-top:56px;border:1px solid color-mix(in srgb,var(--ink) 32%,transparent);border-radius:calc(var(--radius) + 8px);background:color-mix(in srgb,var(--canvas) 82%,white);box-shadow:0 36px 100px color-mix(in srgb,var(--ink) 18%,transparent);overflow:hidden}.product-stage__bar{display:flex;gap:7px;padding:15px 18px;border-bottom:1px solid color-mix(in srgb,var(--ink) 20%,transparent)}.product-stage__bar span{width:10px;height:10px;border-radius:50%;background:var(--accent)}.product-stage__body{min-height:320px;display:grid;grid-template-columns:180px 1fr}.product-stage__body aside{background:color-mix(in srgb,var(--ink) 92%,var(--accent))}.product-stage__body>div{display:grid;gap:18px;align-content:center;padding:clamp(30px,6vw,80px)}.product-stage__body strong{font-size:clamp(1.8rem,4vw,4rem)}.product-stage__body span{height:12px;background:var(--muted);border-radius:99px}.product-stage__body span:last-child{width:62%}.hero-proof__grid{display:grid;grid-template-columns:auto 1fr;margin:0;border-top:1px solid currentColor}.hero-proof__grid dt,.hero-proof__grid dd{margin:0;padding:20px 0;border-bottom:1px solid color-mix(in srgb,var(--ink) 24%,transparent)}.hero-proof__grid dt{padding-right:24px;color:var(--accent);font-family:ui-monospace,monospace}.hero--full_bleed_statement{padding-inline:20px;background:var(--accent);color:var(--canvas)}.hero-statement__rail{position:absolute;inset:0 auto 0 16px;writing-mode:vertical-rl;text-transform:uppercase;letter-spacing:.2em;font-size:.65rem;padding-top:28px}.hero-statement h1{max-width:15ch;font-size:clamp(3.4rem,11vw,9.5rem)}.hero--full_bleed_statement .eyebrow{color:var(--canvas)}.section-index{display:inline-block;margin-bottom:16px}.section blockquote{margin:0;font-size:clamp(1.35rem,2.7vw,2.4rem);line-height:1.25}.section--statement blockquote{max-width:34ch}.section--split{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(0,1.3fr);gap:var(--gap);align-content:start}.section--split .source-note{grid-column:2}.mini-card-grid{display:grid;gap:10px}.mini-card{padding:18px;border:1px solid color-mix(in srgb,var(--ink) 22%,transparent);border-radius:max(4px,calc(var(--radius) / 2))}.mini-card span{color:var(--accent);font:700 .7rem/1 ui-monospace,monospace}.mini-card p{margin:.7em 0 0}.timeline-list{list-style:none;padding:0;margin:28px 0}.timeline-list li{position:relative;display:grid;grid-template-columns:48px 1fr;gap:16px;padding:0 0 28px}.timeline-list li:not(:last-child)::after{content:'';position:absolute;left:15px;top:28px;bottom:0;border-left:1px solid var(--accent)}.timeline-list span{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--canvas);font:700 .65rem/1 ui-monospace,monospace}.timeline-list p{margin:3px 0}.section--faq dl,.section--faq dd{margin:0}.section--faq dt{display:flex;gap:18px;font-size:clamp(1.4rem,3vw,2.5rem);font-weight:750;line-height:1.15}.section--faq dt span{color:var(--accent)}.section--faq dd{padding:20px 0 0 52px}.section--proof figure,.section--proof blockquote{margin:0}.section--proof figcaption{margin-bottom:24px}.section--cta{grid-column:span 12;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center}.section--cta .source-note{grid-column:1/-1}@media(max-width:800px){.hero-orbit-layout,.hero-split,.hero-proof,.hero-bento{grid-template-columns:1fr}.hero-bento__copy{grid-row:auto}.hero-bento__signal{gap:24px}.hero-feature-grid{grid-template-columns:1fr}.hero-feature-grid li{border-right:0;border-bottom:1px solid color-mix(in srgb,var(--ink) 24%,transparent)}.hero-feature-grid li:last-child{border-bottom:0}.hero-art{max-width:620px;margin-inline:auto}.product-stage__body{grid-template-columns:70px 1fr}.section--split,.section--cta{display:block}.section--split .source-note{grid-column:auto}.button--inverse{margin-top:20px}}@media(prefers-reduced-motion:no-preference){.motion--floating_subtle .orbit-art__ring--outer{animation:orbit-spin 32s linear infinite;transform-origin:center}.motion--floating_subtle .orbit-art__cell{animation:orbit-float 6s ease-in-out infinite;transform-origin:center}@keyframes orbit-spin{to{transform:rotate(360deg)}}@keyframes orbit-float{50%{transform:translateY(-12px)}}}@media(prefers-reduced-motion:reduce){.orbit-art *{animation:none!important}}`;
   const orbitCss = `.hero-orbit-stage{position:relative;min-height:clamp(620px,76vw,820px);display:grid;place-items:center}.hero-orbit__copy{position:relative;z-index:4;width:min(720px,72%);text-align:center;padding:56px 36px;border-radius:50%;background:radial-gradient(circle,color-mix(in srgb,var(--canvas) 96%,white) 0 48%,color-mix(in srgb,var(--canvas) 84%,transparent) 68%,transparent 72%)}.hero-orbit__copy .hero-copy>*{margin-inline:auto}.orbit-motif{position:absolute;z-index:2;width:clamp(150px,22vw,260px);aspect-ratio:1;color:var(--ink);filter:drop-shadow(0 22px 36px color-mix(in srgb,var(--ink) 13%,transparent))}.orbit-motif svg{display:block;width:100%;height:100%;overflow:visible}.orbit-motif__halo{fill:color-mix(in srgb,var(--canvas) 82%,white);stroke:color-mix(in srgb,var(--ink) 22%,transparent);stroke-width:1.5}.orbit-motif__drawing{fill:none;stroke:currentColor;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}.orbit-motif__drawing circle{fill:var(--canvas);stroke:var(--accent)}.orbit-motif--dna{left:-2%;top:2%;transform:rotate(-12deg)}.orbit-motif--molecule{right:-1%;top:3%;transform:rotate(9deg)}.orbit-motif--cell{right:4%;bottom:0;transform:rotate(-5deg)}.orbit-motif--cell .orbit-motif__drawing{stroke:var(--accent)}.orbit-motif--timeline{left:1%;bottom:-1%;transform:rotate(6deg)}.orbit-motif--timeline .orbit-motif__drawing{stroke-width:4}@media(max-width:800px){.hero-orbit-stage{min-height:auto;padding:360px 0 330px}.hero-orbit__copy{width:100%;padding:40px 18px}.orbit-motif{width:min(42vw,190px)}.orbit-motif--dna{left:0;top:18px}.orbit-motif--molecule{right:0;top:88px}.orbit-motif--cell{right:2%;bottom:22px}.orbit-motif--timeline{left:0;bottom:86px}}@media(max-width:460px){.hero-orbit-stage{padding:270px 0 250px}.orbit-motif{width:145px}.hero-orbit__copy{background:color-mix(in srgb,var(--canvas) 94%,white);border-radius:var(--radius)}}@media(prefers-reduced-motion:no-preference){.motion--floating_subtle .orbit-motif--dna{animation:motif-dna 7s ease-in-out infinite}.motion--floating_subtle .orbit-motif--molecule{animation:motif-molecule 8s ease-in-out infinite}.motion--floating_subtle .orbit-motif--cell{animation:motif-cell 9s ease-in-out infinite}.motion--floating_subtle .orbit-motif--timeline{animation:motif-timeline 7.5s ease-in-out infinite}@keyframes motif-dna{50%{transform:translate(10px,-14px) rotate(-8deg)}}@keyframes motif-molecule{50%{transform:translate(-12px,10px) rotate(14deg)}}@keyframes motif-cell{50%{transform:translate(-8px,-13px) rotate(-1deg)}}@keyframes motif-timeline{50%{transform:translate(12px,8px) rotate(2deg)}}}@media(prefers-reduced-motion:reduce){.orbit-motif{animation:none!important}}`;
   const blueprintCss = `.contact .eyebrow{color:var(--canvas)}.container--wide .shell{width:min(1360px,calc(100% - 40px))}.container--edge_to_edge .hero>.shell{width:100%;max-width:none}.container--contained .hero--floating_orbit .hero-orbit-stage{width:min(1120px,calc(100% - 40px))}.media-strategy--procedural_brand_svg .orbit-motif{display:block}`;
-  return `${baseCss}${componentCss}${orbitCss}${blueprintCss}`;
+  const visualContractCss =
+    design.schemaVersion === 2 && design.referenceBlueprint.schemaVersion === 4
+      ? TRUSTED_REACT_VISUAL_CONTRACT_V4_CSS
+      : "";
+  return `${baseCss}${componentCss}${orbitCss}${blueprintCss}${visualContractCss}`;
 }
 
 function renderLayoutSource(input: { mode: "preview" | "production" }) {
@@ -1550,6 +1608,7 @@ function buildTrustedReactSource(input: {
     input.workflow,
     input.renderer,
   );
+  const visualContract = trustedVisualContractV4(input.designSpec);
   const frozenBrandAsset = freezeSiteBrandAsset(input.brandAsset);
   const contacts = input.brief.contacts.map((contact) => ({
     href: safeContactHref(contact.kind, contact.value),
@@ -1667,7 +1726,9 @@ function buildTrustedReactSource(input: {
   addTextFile(
     files,
     "src/component-library.mjs",
-    TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE,
+    input.workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+      ? TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE
+      : TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE_V2_2,
   );
   addTextFile(files, "src/render.mjs", TRUSTED_REACT_RENDERER_SOURCE);
   addTextFile(
@@ -1757,6 +1818,10 @@ function buildTrustedReactSource(input: {
       .filter((link) => link.kind === "same_as")
       .map((link) => link.url);
     const emptyState = typedGenerated?.emptyState;
+    const publicSummary =
+      emptyState === "company_news_unavailable"
+        ? "暂无企业动态。"
+        : generated.summary;
     const jsonLd =
       !canonical || emptyState
         ? null
@@ -1794,14 +1859,15 @@ function buildTrustedReactSource(input: {
       `src/${dataPath}`,
       jsonBuffer({
         title: `${generated.heading} | ${input.brief.companyName}`,
-        description: generated.summary,
+        description: publicSummary,
         canonical,
         jsonLd,
         heroFamily: input.designSpec.referenceBlueprint.heroFamily,
+        ...(visualContract ? { visualContract } : {}),
         hero: {
           eyebrow: generated.eyebrow ?? input.brief.companyName,
           heading: generated.heading,
-          summary: generated.summary,
+          summary: publicSummary,
         },
         ...(emptyState ? { emptyState } : {}),
         sections: typedGenerated
@@ -1879,6 +1945,7 @@ function buildTrustedReactSource(input: {
             }
           : null,
         heroFamily: input.designSpec.referenceBlueprint.heroFamily,
+        ...(visualContract ? { visualContract } : {}),
         hero: {
           eyebrow: input.brief.companyName,
           heading: entity.title,
@@ -1902,7 +1969,7 @@ function buildTrustedReactSource(input: {
                   variant: "cards",
                   blockType: "entity_grid",
                   heading: "相关内容",
-                  paragraphs: ["继续浏览知识库中已验证的相关内容。"],
+                  paragraphs: ["继续浏览相关内容。"],
                   items: [],
                   entities: related,
                   faqs: [],
@@ -2936,7 +3003,7 @@ function qaDist(input: {
           return (
             /type="application\/ld\+json"/u.test(html) ||
             (output === "news/index.html" &&
-              html.includes("当前知识库暂无可公开的企业动态"))
+              html.includes('data-content-state="empty"'))
           );
         })(),
       ),
@@ -3098,8 +3165,11 @@ async function materializeSiteWithWorkflow(
               renderer: {
                 kind: REACT_STATIC_RENDERER,
                 reactVersion: REACT_STATIC_REACT_VERSION,
-                componentLibraryVersion: "2.2.0",
-                materializerVersion: "2.2.0",
+                componentLibraryVersion: reactCoordinates!
+                  .componentLibraryVersion as "2.2.0" | "2.3.0",
+                materializerVersion: reactCoordinates!.materializerVersion as
+                  | "2.2.0"
+                  | "2.3.0",
               },
               content: {
                 schemaVersion: 2,
@@ -3570,6 +3640,14 @@ function materializeReactStaticSiteV2_1(input: MaterializeAstroSiteInput) {
 function materializeReactStaticSiteV2_2(input: MaterializeAstroSiteInput) {
   return materializeSiteWithWorkflow(
     input,
+    SITEOPS_MATERIALIZER_V2_2,
+    REACT_STATIC_RENDERER,
+  );
+}
+
+function materializeReactStaticSiteV2_3(input: MaterializeAstroSiteInput) {
+  return materializeSiteWithWorkflow(
+    input,
     SITEOPS_WORKFLOW,
     REACT_STATIC_RENDERER,
   );
@@ -3612,9 +3690,14 @@ const productionMaterializerRegistry = [
     materialize: materializeReactStaticSiteV2_1,
   },
   {
-    workflow: SITEOPS_WORKFLOW,
+    workflow: SITEOPS_MATERIALIZER_V2_2,
     renderer: REACT_STATIC_RENDERER,
     materialize: materializeReactStaticSiteV2_2,
+  },
+  {
+    workflow: SITEOPS_WORKFLOW,
+    renderer: REACT_STATIC_RENDERER,
+    materialize: materializeReactStaticSiteV2_3,
   },
 ] as const;
 

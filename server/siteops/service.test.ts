@@ -26,6 +26,7 @@ import {
   siteOpsResetCapability,
   siteOpsServiceErrorFromQuota,
   SiteOpsServiceError,
+  visualSearchAllowedForProjectStatus,
   visualSearchReadiness,
 } from "./service";
 import { SiteOpsQuotaError } from "./quota-service";
@@ -38,9 +39,24 @@ import {
   siteOpsSendMessageInputSchema,
 } from "../../shared/siteops";
 import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
-import { referenceBlueprintV3ForFamily } from "../../shared/siteops-design";
+import {
+  referenceBlueprintV3ForFamily,
+  referenceBlueprintV4ForFamily,
+} from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it("allows an unselected visual board to be replaced without resetting the website", () => {
+    expect(
+      visualSearchAllowedForProjectStatus("awaiting_visual_selection", true),
+    ).toBe(true);
+    expect(
+      visualSearchAllowedForProjectStatus("awaiting_visual_selection", false),
+    ).toBe(false);
+    expect(visualSearchAllowedForProjectStatus("collecting_brief", false)).toBe(
+      true,
+    );
+  });
+
   it.each([
     ["SITEOPS_ENTITLEMENT_REQUIRED", 403, "FORBIDDEN"],
     ["SITEOPS_QUOTA_PERIOD_NOT_FOUND", 409, "STATE_CONFLICT"],
@@ -175,6 +191,69 @@ describe("SiteOps core contracts", () => {
           providerItemKey,
           visualEvidence,
           referenceBlueprint: blueprint,
+        },
+      }),
+    ).toThrow("所选视觉方案已失效");
+  });
+
+  it("freezes a V4 provider reference separately from its trusted realization", () => {
+    const sampleId = "10000000-0000-4000-8000-000000000001";
+    const referencePreviewLocalAssetId = "20000000-0000-4000-8000-000000000002";
+    const realizationPreviewLocalAssetId =
+      "30000000-0000-4000-8000-000000000003";
+    const providerItemKey = "n:18898";
+    const visualEvidence = createVisualEvidenceV1({
+      evidenceKind: "catalog_metadata_preview_v1",
+      providerItemKey,
+      metadataSha256: "a".repeat(64),
+      providerResponseSha256: "b".repeat(64),
+      previewSha256: "c".repeat(64),
+      taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+    });
+    const blueprint = referenceBlueprintV4ForFamily({
+      candidateId: sampleId,
+      providerItemKey,
+      referencePreviewLocalAssetId,
+      referencePreviewSha256: visualEvidence.previewSha256,
+      realizationPreviewLocalAssetId,
+      realizationPreviewSha256: "d".repeat(64),
+      heroFamily: "split_media",
+      inspirationEvidenceId: visualEvidence.evidenceSha256,
+      inspirationTaxonomy: {
+        role: "foundation",
+        palette: [],
+        typography: [],
+        layout: ["split-layout"],
+        motion: [],
+        accessibility: ["reduced-motion"],
+      },
+    });
+
+    expect(
+      freezeSiteOpsReferenceBlueprint({
+        sampleId,
+        previewLocalAssetId: referencePreviewLocalAssetId,
+        note: "分屏媒体式",
+        sourceMetadata: {
+          providerItemKey,
+          visualEvidence,
+          referenceBlueprint: blueprint,
+          realizationPreviewLocalAssetId,
+          realizationPreviewSha256: blueprint.previewSha256,
+        },
+      }),
+    ).toEqual(blueprint);
+    expect(() =>
+      freezeSiteOpsReferenceBlueprint({
+        sampleId,
+        previewLocalAssetId: referencePreviewLocalAssetId,
+        note: "分屏媒体式",
+        sourceMetadata: {
+          providerItemKey,
+          visualEvidence,
+          referenceBlueprint: blueprint,
+          realizationPreviewLocalAssetId,
+          realizationPreviewSha256: "e".repeat(64),
         },
       }),
     ).toThrow("所选视觉方案已失效");

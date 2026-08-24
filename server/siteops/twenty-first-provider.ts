@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, max } from "drizzle-orm";
+import sharp from "sharp";
 import { z } from "zod";
 
 import {
@@ -16,7 +17,6 @@ import {
   canonicalJson,
   canonicalSha256,
   buildTwentyFirstSearchOnlyFunnel,
-  composeTwentyFirstQueries,
   createVisualEvidenceV1,
   normalizeTwentyFirstSearchResults,
   visualSearchOperationInputV1Schema,
@@ -30,15 +30,16 @@ import {
 } from "../../shared/siteops-workflow";
 import {
   siteBriefSchema,
-  visualSelectionBundleV3Schema,
+  visualSelectionBundleV4Schema,
   type SiteBrief,
 } from "../../shared/siteops";
 import {
   FRONTMIND_VISUAL_FAMILIES_V3,
   FRONTMIND_VISUAL_FAMILY_LABELS_V3,
-  referenceBlueprintV3ForFamily,
-  trustedVisualPreviewBlueprintV3,
-  type ReferenceBlueprintV3,
+  assertVisualBlueprintDiversityV4,
+  referenceBlueprintV4ForFamily,
+  trustedVisualPreviewBlueprintV4,
+  type ReferenceBlueprintV4,
 } from "../../shared/siteops-design";
 import { AuthServiceError } from "../auth-service";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
@@ -59,6 +60,8 @@ import type {
 } from "./providers";
 
 const OPERATION_MARKER_PREFIX = "siteops-21st-operation:";
+const SENSITIVE_SEARCH_CONTEXT =
+  /(?:21st_sk_[A-Za-z0-9_-]{8,}|\bBearer\s+[A-Za-z0-9._~+/-]{8,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/iu;
 
 type ExistingBoard = {
   batchId: string;
@@ -84,6 +87,7 @@ type MirroredReference = {
   taxonomy: ReturnType<typeof taxonomyFromDirectives>;
   previewLocalAssetId: string;
   previewSha256: string;
+  perceptualHash: string;
   visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
 };
 
@@ -93,12 +97,18 @@ type FrontMindBoardCandidate = {
   queryAxis: "foundation_split" | "foundation_editorial_modular";
   providerItemKey: string;
   title: string;
-  description: string;
+  description: string | null;
   taxonomy: ReturnType<typeof taxonomyFromDirectives>;
+  author: string | null;
+  sourceUrl: string | null;
   previewLocalAssetId: string;
   previewSha256: string;
+  realizationPreviewLocalAssetId: string;
+  realizationPreviewSha256: string;
+  referencePerceptualHash: string;
+  realizationPerceptualHash: string;
   visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
-  referenceBlueprint: ReferenceBlueprintV3;
+  referenceBlueprint: ReferenceBlueprintV4;
   score: number;
   rationale: string;
 };
@@ -126,12 +136,34 @@ export type VisualSearchDiagnostics = {
   mirrorAttempted: number;
   mirrorSucceeded: number;
   rejectedByReason: Partial<Record<PreviewRejectionReason, number>>;
+  diversity: SafeVisualDiversitySummary;
+};
+
+export type SafeVisualDiversitySummary = {
+  summaryVersion: 1;
+  requestedFamilies: 9;
+  familyQueriesRun: number;
+  eligibleReferences: number;
+  mirroredReferences: number;
+  assignedFamilies: number;
+  distinctProviderItems: number;
+  distinctReferenceHashes: number;
+  distinctReferencePerceptualHashes: number;
+  distinctRealizationHashes: number;
+  distinctRealizationPerceptualHashes: number;
+  distinctStyleSignatures: number;
+  paletteVariants: number;
+  backgroundVariants: number;
+  typographyVariants: number;
+  compositionVariants: number;
+  minimumReferenceHammingDistance: number | null;
+  minimumRealizationHammingDistance: number | null;
 };
 
 export type TwentyFirstBoardPersistenceInput = {
   operation: SiteOperation;
   context: TwentyFirstProviderContext;
-  selectionBundle: z.infer<typeof visualSelectionBundleV3Schema>;
+  selectionBundle: z.infer<typeof visualSelectionBundleV4Schema>;
   selectionBundleArtifact: PreviewArtifact;
   mirroredCandidates: FrontMindBoardCandidate[];
 };
@@ -189,6 +221,26 @@ function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
     mirrorAttempted: 0,
     mirrorSucceeded: 0,
     rejectedByReason: {},
+    diversity: {
+      summaryVersion: 1,
+      requestedFamilies: 9,
+      familyQueriesRun: 0,
+      eligibleReferences: 0,
+      mirroredReferences: 0,
+      assignedFamilies: 0,
+      distinctProviderItems: 0,
+      distinctReferenceHashes: 0,
+      distinctReferencePerceptualHashes: 0,
+      distinctRealizationHashes: 0,
+      distinctRealizationPerceptualHashes: 0,
+      distinctStyleSignatures: 0,
+      paletteVariants: 0,
+      backgroundVariants: 0,
+      typographyVariants: 0,
+      compositionVariants: 0,
+      minimumReferenceHammingDistance: null,
+      minimumRealizationHammingDistance: null,
+    },
   };
 }
 
@@ -285,7 +337,7 @@ async function loadDefaultContext(
   if (operation.kind !== "visual_search" || operation.provider !== "21st") {
     throw new TwentyFirstProviderFailure(
       "INVALID_OPERATION",
-      "该操作不是有效的 21st 视觉检索任务。",
+      "该操作不是有效的 FrontMind 视觉检索任务。",
     );
   }
   const input = visualSearchOperationInputV1Schema.parse(operation.input);
@@ -425,21 +477,355 @@ function taxonomyFromDirectives(
   };
 }
 
-async function retrieveFunnel(input: {
+type FrontMindVisualFamily = (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number];
+
+type FamilySearchRound = "primary" | "supplemental";
+
+type FamilySearchQuery = {
+  family: FrontMindVisualFamily;
+  round: FamilySearchRound;
+  role: "foundation";
+  axis: "foundation_split" | "foundation_editorial_modular";
+  limit: 4;
+  query: string;
+};
+
+type FamilyReferencePools = Map<
+  FrontMindVisualFamily,
+  NormalizedTwentyFirstCandidate[]
+>;
+
+const FAMILY_SEARCH_TERMS: Record<
+  FrontMindVisualFamily,
+  readonly [string, string]
+> = {
+  floating_orbit: [
+    "floating orbital geometric hero section organic circles",
+    "playful abstract orbit landing page hero particles",
+  ],
+  split_media: [
+    "split layout hero section product media two column",
+    "split screen landing page hero image product visual",
+  ],
+  editorial: [
+    "editorial hero section magazine typography asymmetric",
+    "editorial landing page hero serif oversized headline",
+  ],
+  bento: [
+    "bento hero section modular card grid landing page",
+    "bento landing page hero dashboard modular cards",
+  ],
+  feature_grid: [
+    "feature grid hero section product capabilities landing page",
+    "feature cards grid landing page hero technical",
+  ],
+  centered_dual_cta: [
+    "centered hero section dual CTA minimal landing page",
+    "centered statement landing page hero two buttons",
+  ],
+  immersive_visual: [
+    "immersive hero section cinematic visual 3d landing page",
+    "spatial full screen landing page hero interactive visual",
+  ],
+  product_stage: [
+    "product showcase hero section UI mockup stage landing page",
+    "SaaS landing page hero product screenshot interface",
+  ],
+  full_bleed_statement: [
+    "full bleed hero section bold statement oversized typography",
+    "full screen landing page hero big headline minimal",
+  ],
+};
+
+type FamilyEligibilityRule = {
+  /** Query provenance is never a positive signal. These expressions run only
+   * against provider-owned, sanitized title/description/page coordinates. */
+  positiveMetadata: readonly RegExp[];
+  negativeMetadata: readonly RegExp[];
+  positiveDirectives: readonly SafeVisualDirective[];
+  negativeDirectives: readonly SafeVisualDirective[];
+};
+
+/**
+ * A real 21st Hero may only represent one FrontMind family when its own safe
+ * catalog metadata describes that composition. The search query that happened
+ * to return an item is deliberately absent from this contract: a generic
+ * "Hero section" returned for a Bento query is still generic, not Bento.
+ *
+ * Directives are supporting/contradicting evidence derived from the same safe
+ * metadata. Explicit family metadata is always required so broad directives
+ * such as `structure:modular-grid` cannot collapse Bento and Feature Grid into
+ * the same visual reference pool.
+ */
+const FAMILY_ELIGIBILITY_RULES: Record<
+  FrontMindVisualFamily,
+  FamilyEligibilityRule
+> = {
+  floating_orbit: {
+    positiveMetadata: [
+      /\b(?:floating|orbital?|orbiting|particle|radial)\b/iu,
+      /\borganic[- ](?:circle|shape|blob)s?\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:split[- ](?:screen|layout)|two[- ]column|editorial|magazine|bento|masonry|feature[- ]grid|product[- ](?:stage|showcase)|full[- ]bleed)\b/iu,
+    ],
+    positiveDirectives: [
+      "imagery:illustration-led",
+      "motion:hover-depth",
+      "motion:scroll-triggered",
+    ],
+    negativeDirectives: [
+      "structure:split-layout",
+      "structure:editorial-rhythm",
+      "structure:modular-grid",
+      "imagery:product-ui-led",
+    ],
+  },
+  split_media: {
+    positiveMetadata: [
+      /\b(?:split[- ](?:screen|layout|media|image|hero)|two[- ]column|side[- ]by[- ]side)\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:bento|masonry|editorial|magazine|feature[- ]grid|full[- ]bleed|centered[- ]statement)\b/iu,
+    ],
+    positiveDirectives: ["structure:split-layout", "imagery:masked-media"],
+    negativeDirectives: [
+      "structure:modular-grid",
+      "structure:editorial-rhythm",
+    ],
+  },
+  editorial: {
+    positiveMetadata: [
+      /\b(?:editorial|magazine|newspaper|publication|serif[- ]led)\b/iu,
+      /\b(?:asymmetric|typographic)\s+(?:editorial|headline|layout)\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:bento|masonry|feature[- ]grid|product[- ](?:stage|showcase)|ui[- ]mockup|full[- ]bleed)\b/iu,
+    ],
+    positiveDirectives: [
+      "structure:editorial-rhythm",
+      "typography:serif-editorial",
+      "structure:asymmetric-grid",
+    ],
+    negativeDirectives: ["structure:split-layout", "imagery:product-ui-led"],
+  },
+  bento: {
+    positiveMetadata: [
+      /\b(?:bento|masonry|modular[- ]card[- ]grid|modular\s+(?:cards?|tiles?))\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:editorial|magazine|feature[- ]grid|capabilit(?:y|ies)[- ]grid|split[- ]layout|product[- ](?:stage|showcase))\b/iu,
+    ],
+    positiveDirectives: [
+      "structure:modular-grid",
+      "surface:rounded-containers",
+    ],
+    negativeDirectives: [
+      "structure:split-layout",
+      "structure:editorial-rhythm",
+      "imagery:product-ui-led",
+    ],
+  },
+  feature_grid: {
+    positiveMetadata: [
+      /\b(?:feature|capabilit(?:y|ies))[- ](?:card[- ])?grid\b/iu,
+      /\b(?:feature|capabilit(?:y|ies))\s+cards?\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:bento|masonry|pricing|dashboard|sidebar|editorial|magazine|product[- ](?:stage|showcase))\b/iu,
+    ],
+    positiveDirectives: ["structure:modular-grid", "surface:border-defined"],
+    negativeDirectives: [
+      "structure:split-layout",
+      "structure:editorial-rhythm",
+      "imagery:product-ui-led",
+    ],
+  },
+  centered_dual_cta: {
+    positiveMetadata: [
+      /\b(?:dual|two)[- ](?:cta|call[- ]to[- ]action|buttons?)s?\b/iu,
+      /\bcentered\b[^.]{0,80}\b(?:cta|call[- ]to[- ]action|buttons?)s?\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:split[- ]layout|bento|masonry|feature[- ]grid|immersive|cinematic|product[- ](?:stage|showcase)|full[- ]bleed)\b/iu,
+    ],
+    positiveDirectives: [
+      "structure:hero-led-hierarchy",
+      "typography:display-led-hierarchy",
+    ],
+    negativeDirectives: [
+      "structure:split-layout",
+      "structure:modular-grid",
+      "imagery:product-ui-led",
+    ],
+  },
+  immersive_visual: {
+    positiveMetadata: [
+      /\b(?:immersive|cinematic|spatial|three[- ]dimensional|3d|parallax)\b/iu,
+      /\bfull[- ]screen\b[^.]{0,80}\b(?:visual|scene|image|video|experience)\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:full[- ]bleed[- ]statement|oversized[- ]headline|minimal[- ]statement|product[- ](?:stage|showcase)|ui[- ]mockup|bento|feature[- ]grid)\b/iu,
+    ],
+    positiveDirectives: [
+      "imagery:wide-crop",
+      "motion:scroll-triggered",
+      "motion:controlled-reveal",
+    ],
+    negativeDirectives: ["structure:modular-grid", "imagery:product-ui-led"],
+  },
+  product_stage: {
+    positiveMetadata: [
+      /\b(?:product[- ]stage|product[- ]showcase|ui[- ]mockup|product[- ]screenshot|interface[- ]preview|app(?:lication)?[- ]preview|device[- ]mockup|software[- ]demo)\b/iu,
+      /\b(?:hero\s+with\s+mockup|mockup[- ]display|dashboard[- ]preview(?:[- ]mockup)?)\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:pricing|sidebar|admin|settings?|bento|masonry|editorial|magazine|full[- ]bleed|immersive)\b/iu,
+    ],
+    positiveDirectives: ["imagery:product-ui-led", "surface:soft-shadow-depth"],
+    negativeDirectives: [
+      "structure:editorial-rhythm",
+      "typography:serif-editorial",
+    ],
+  },
+  full_bleed_statement: {
+    positiveMetadata: [
+      /\bfull[- ]bleed\b[^.]{0,80}\b(?:statement|headline|typography|type)\b/iu,
+      /\bfull[- ]screen\b[^.]{0,80}\b(?:statement|big[- ]headline|oversized[- ]headline|typography)\b/iu,
+      /\b(?:oversized|big)[- ]headline\b[^.]{0,80}\b(?:statement|minimal|full[- ]screen)\b/iu,
+      /\b(?:bold|large|minimal(?:ist)?)\b[^.]{0,80}\b(?:headline|typography|text)\b/iu,
+      /\b(?:headline|typography|text)\b[^.]{0,80}\b(?:bold|large|minimal(?:ist)?|dramatic)\b/iu,
+    ],
+    negativeMetadata: [
+      /\b(?:immersive|cinematic|spatial|3d|parallax|product[- ](?:stage|showcase)|ui[- ]mockup|bento|feature[- ]grid|split[- ]layout|collage|overlapping[- ]images?)\b/iu,
+    ],
+    positiveDirectives: [
+      "typography:display-led-hierarchy",
+      "tone:bold-graphic",
+    ],
+    negativeDirectives: [
+      "structure:modular-grid",
+      "structure:split-layout",
+      "imagery:product-ui-led",
+    ],
+  },
+};
+
+function familyEligibleReference(
+  family: FrontMindVisualFamily,
+  candidate: NormalizedTwentyFirstCandidate,
+) {
+  if (!candidate.heroEligibility.eligible) return false;
+  const metadata = [candidate.title, candidate.description, candidate.sourceUrl]
+    .filter(Boolean)
+    .join(" ")
+    .normalize("NFKC");
+  const rule = FAMILY_ELIGIBILITY_RULES[family];
+  if (!rule.positiveMetadata.some((pattern) => pattern.test(metadata))) {
+    return false;
+  }
+  if (rule.negativeMetadata.some((pattern) => pattern.test(metadata))) {
+    return false;
+  }
+  const directives = new Set(candidate.normalizedDirectives);
+  if (rule.negativeDirectives.some((directive) => directives.has(directive))) {
+    return false;
+  }
+  // Positive directives strengthen an explicit metadata match. Some families
+  // (for example floating orbit and centered dual CTA) have no dedicated
+  // directive in the narrow allowlist, so an explicit family phrase remains
+  // sufficient when no contradictory directive is present.
+  return (
+    rule.positiveDirectives.some((directive) => directives.has(directive)) ||
+    candidate.heroEligibility.confidence === "explicit"
+  );
+}
+
+function familyQueryAxis(
+  family: FrontMindVisualFamily,
+): FamilySearchQuery["axis"] {
+  return family === "split_media" || family === "product_stage"
+    ? "foundation_split"
+    : "foundation_editorial_modular";
+}
+
+function safeFamilySearchContext(brief: SiteBrief) {
+  const genericFragment =
+    /^(?:企业与品牌概览|品牌概览|公司介绍|关于我们|产品与服务|首页|知识库|home|about(?: us)?|products?(?: and services)?|company overview)$/iu;
+  return Array.from(
+    new Set(
+      [brief.companyName, ...brief.offerings.slice(0, 2)]
+        .map((value) =>
+          value
+            .normalize("NFKC")
+            .replace(/[\u0000-\u001f\u007f]/gu, " ")
+            .replace(/[^\p{L}\p{N}\s+&._/-]/gu, " ")
+            .replace(/\s+/gu, " ")
+            .trim()
+            .slice(0, 64),
+        )
+        .filter(
+          (value) =>
+            value &&
+            !genericFragment.test(value) &&
+            !SENSITIVE_SEARCH_CONTEXT.test(value),
+        ),
+    ),
+  )
+    .slice(0, 3)
+    .join(" ")
+    .slice(0, 160);
+}
+
+function composeFamilySearchQuery(input: {
+  family: FrontMindVisualFamily;
+  round: FamilySearchRound;
+  brief: SiteBrief;
+}): FamilySearchQuery {
+  const terms = FAMILY_SEARCH_TERMS[input.family];
+  const context = safeFamilySearchContext(input.brief);
+  return {
+    family: input.family,
+    round: input.round,
+    role: "foundation",
+    axis: familyQueryAxis(input.family),
+    limit: 4,
+    query: `${terms[input.round === "primary" ? 0 : 1]}${context ? ` for ${context}` : ""}`,
+  };
+}
+
+function emptyFamilyReferencePools(): FamilyReferencePools {
+  return new Map(
+    FRONTMIND_VISUAL_FAMILIES_V3.map((family) => [family, []] as const),
+  );
+}
+
+async function searchFamilyRound(input: {
   session: TwentyFirstReadOnlySession;
   brief: SiteBrief;
+  families: readonly FrontMindVisualFamily[];
+  round: FamilySearchRound;
+  pools: FamilyReferencePools;
+  queries: FamilySearchQuery[];
+  searchedCandidates: Map<
+    string,
+    ReturnType<typeof normalizeTwentyFirstSearchResults>[number]
+  >;
   signal: AbortSignal;
   diagnostics: VisualSearchDiagnostics;
 }) {
-  const queries = composeTwentyFirstQueries(input.brief);
-  const searchEnvelopes: TwentyFirstSearchEnvelope[] = [];
-  for (const query of queries) {
+  for (const family of input.families) {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
         "视觉检索已超时，请重置后重新开始。",
       );
     }
+    const query = composeFamilySearchQuery({
+      family,
+      round: input.round,
+      brief: input.brief,
+    });
     const envelope: TwentyFirstSearchEnvelope = {
       role: query.role,
       axis: query.axis,
@@ -448,21 +834,99 @@ async function retrieveFunnel(input: {
         query: query.query,
         type: "component",
         limit: query.limit,
-        ...(query.role === "foundation" ? { tag: "hero" as const } : {}),
+        tag: "hero",
         sort: "recommended",
       }),
     };
-    searchEnvelopes.push(envelope);
-    input.diagnostics.searchedByAxis[query.axis] =
-      normalizeTwentyFirstSearchResults([envelope]).length;
+    input.queries.push(query);
+    input.diagnostics.diversity.familyQueriesRun += 1;
+    const normalized = normalizeTwentyFirstSearchResults([envelope]);
+    input.diagnostics.searchedByAxis[query.axis] += normalized.length;
+    for (const candidate of normalized) {
+      input.searchedCandidates.set(candidate.providerItemKey, candidate);
+    }
+    const funnel = buildTwentyFirstSearchOnlyFunnel({
+      searchEnvelopes: [envelope],
+    });
+    const pool = input.pools.get(family)!;
+    const existingKeys = new Set(pool.map((item) => item.providerItemKey));
+    for (const candidate of funnel.retrievalShortlist) {
+      if (
+        familyEligibleReference(family, candidate) &&
+        !existingKeys.has(candidate.providerItemKey)
+      ) {
+        pool.push(candidate);
+        existingKeys.add(candidate.providerItemKey);
+      }
+    }
   }
-  const funnel = buildTwentyFirstSearchOnlyFunnel({ searchEnvelopes });
-  input.diagnostics.normalizedUnique = funnel.searchedCandidates.length;
-  input.diagnostics.shortlistCount = funnel.retrievalShortlist.length;
-  input.diagnostics.withPreviewReference = funnel.searchedCandidates.filter(
-    (candidate) => candidate.previewUrl,
-  ).length;
-  return { queries, funnel };
+}
+
+function maximumKeyAssignment(pools: FamilyReferencePools) {
+  const assignment = new Map<FrontMindVisualFamily, string>();
+  const ownerByProviderKey = new Map<string, FrontMindVisualFamily>();
+  const visit = (
+    family: FrontMindVisualFamily,
+    visited: Set<string>,
+  ): boolean => {
+    for (const candidate of pools.get(family) ?? []) {
+      const key = candidate.providerItemKey;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      const owner = ownerByProviderKey.get(key);
+      if (!owner || visit(owner, visited)) {
+        ownerByProviderKey.set(key, family);
+        assignment.set(family, key);
+        return true;
+      }
+    }
+    return false;
+  };
+  for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+    visit(family, new Set());
+  }
+  return assignment;
+}
+
+function refreshRetrievalDiagnostics(input: {
+  pools: FamilyReferencePools;
+  searchedCandidates: Map<
+    string,
+    ReturnType<typeof normalizeTwentyFirstSearchResults>[number]
+  >;
+  mirrored: readonly MirroredReference[];
+  assigned: ReadonlyMap<FrontMindVisualFamily, MirroredReference>;
+  diagnostics: VisualSearchDiagnostics;
+}) {
+  const eligibleKeys = new Set(
+    [...input.pools.values()].flatMap((pool) =>
+      pool.map((candidate) => candidate.providerItemKey),
+    ),
+  );
+  input.diagnostics.normalizedUnique = input.searchedCandidates.size;
+  input.diagnostics.withPreviewReference = [
+    ...input.searchedCandidates.values(),
+  ].filter((candidate) => candidate.previewUrl).length;
+  input.diagnostics.shortlistCount = eligibleKeys.size;
+  input.diagnostics.diversity.eligibleReferences = eligibleKeys.size;
+  input.diagnostics.diversity.mirroredReferences = input.mirrored.length;
+  input.diagnostics.diversity.assignedFamilies = input.assigned.size;
+  input.diagnostics.diversity.distinctProviderItems = new Set(
+    [...input.assigned.values()].map(
+      (reference) => reference.candidate.providerItemKey,
+    ),
+  ).size;
+  input.diagnostics.diversity.distinctReferenceHashes = new Set(
+    [...input.assigned.values()].map((reference) => reference.previewSha256),
+  ).size;
+  const perceptualHashes = [...input.assigned.values()].map(
+    (reference) => reference.perceptualHash,
+  );
+  input.diagnostics.diversity.distinctReferencePerceptualHashes = new Set(
+    perceptualHashes,
+  ).size;
+  input.diagnostics.diversity.minimumReferenceHammingDistance =
+    minimumPerceptualDistance(perceptualHashes);
 }
 
 function extensionForMimeType(mimeType: string) {
@@ -478,7 +942,7 @@ function extensionForMimeType(mimeType: string) {
     default:
       throw new TwentyFirstProviderFailure(
         "PREVIEW_MIME_INVALID",
-        "21st 预览图片格式不受支持。",
+        "视觉参考图片格式不受支持。",
       );
   }
 }
@@ -513,9 +977,10 @@ async function mirrorCandidates(input: {
   fetchPreview: typeof fetchSafeVisualPreview;
   persistArtifact: typeof persistSiteOpsArtifact;
   diagnostics: VisualSearchDiagnostics;
+  seenPreviewHashes?: Set<string>;
 }) {
   const mirrored: MirroredReference[] = [];
-  const seenPreviewHashes = new Set<string>();
+  const seenPreviewHashes = input.seenPreviewHashes ?? new Set<string>();
   const budget = AbortSignal.timeout(45_000);
   const mirrorSignal = AbortSignal.any([input.signal, budget]);
   for (let offset = 0; offset < input.candidates.length; offset += 3) {
@@ -534,7 +999,8 @@ async function mirrorCandidates(input: {
             url: candidate.previewUrl!,
             signal: mirrorSignal,
           });
-          return { candidate, preview } as const;
+          const perceptualHash = await perceptualHash64(preview.buffer);
+          return { candidate, preview, perceptualHash } as const;
         } catch (error) {
           if (mirrorSignal.aborted) {
             throw new TwentyFirstProviderFailure(
@@ -549,7 +1015,7 @@ async function mirrorCandidates(input: {
     );
     for (const downloadedItem of downloaded) {
       if (!downloadedItem) continue;
-      const { candidate, preview } = downloadedItem;
+      const { candidate, preview, perceptualHash } = downloadedItem;
       if (seenPreviewHashes.has(preview.sha256)) {
         rejectDiagnostic(input.diagnostics, "duplicate");
         continue;
@@ -588,6 +1054,7 @@ async function mirrorCandidates(input: {
         ),
         previewLocalAssetId: asset.id,
         previewSha256: preview.sha256,
+        perceptualHash,
         visualEvidence: createVisualEvidenceV1({
           evidenceKind: VISUAL_EVIDENCE_KIND,
           providerItemKey: candidate.providerItemKey,
@@ -607,11 +1074,147 @@ function sha256Buffer(buffer: Buffer) {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
+async function perceptualHash64(buffer: Buffer) {
+  const { data, info } = await sharp(buffer)
+    .removeAlpha()
+    .grayscale()
+    .resize(9, 8, { fit: "fill", kernel: sharp.kernel.nearest })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  if (info.width !== 9 || info.height !== 8 || info.channels !== 1) {
+    throw new Error("PREVIEW_IMAGE_DECODE_FAILED");
+  }
+  let hash = 0n;
+  let bit = 63n;
+  for (let row = 0; row < 8; row += 1) {
+    for (let column = 0; column < 8; column += 1) {
+      const left = data[row * 9 + column]!;
+      const right = data[row * 9 + column + 1]!;
+      if (left > right) hash |= 1n << bit;
+      bit -= 1n;
+    }
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function perceptualHashDistance(left: string, right: string) {
+  let bits = BigInt(`0x${left}`) ^ BigInt(`0x${right}`);
+  let distance = 0;
+  while (bits > 0n) {
+    distance += Number(bits & 1n);
+    bits >>= 1n;
+  }
+  return distance;
+}
+
+function minimumPerceptualDistance(hashes: readonly string[]) {
+  if (hashes.length < 2) return null;
+  let minimum = 64;
+  for (let left = 0; left < hashes.length; left += 1) {
+    for (let right = left + 1; right < hashes.length; right += 1) {
+      minimum = Math.min(
+        minimum,
+        perceptualHashDistance(hashes[left]!, hashes[right]!),
+      );
+    }
+  }
+  return minimum;
+}
+
+function assignDistinctMirroredReferences(input: {
+  pools: FamilyReferencePools;
+  mirrored: readonly MirroredReference[];
+}) {
+  const mirroredByKey = new Map(
+    input.mirrored.map(
+      (item) => [item.candidate.providerItemKey, item] as const,
+    ),
+  );
+  const choices = new Map(
+    FRONTMIND_VISUAL_FAMILIES_V3.map(
+      (family) =>
+        [
+          family,
+          (input.pools.get(family) ?? []).flatMap((candidate) => {
+            const mirrored = mirroredByKey.get(candidate.providerItemKey);
+            return mirrored ? [mirrored] : [];
+          }),
+        ] as const,
+    ),
+  );
+  const familyOrder = [...FRONTMIND_VISUAL_FAMILIES_V3].sort(
+    (left, right) =>
+      choices.get(left)!.length - choices.get(right)!.length ||
+      FRONTMIND_VISUAL_FAMILIES_V3.indexOf(left) -
+        FRONTMIND_VISUAL_FAMILIES_V3.indexOf(right),
+  );
+  let best = new Map<FrontMindVisualFamily, MirroredReference>();
+  let explored = 0;
+  const visit = (
+    index: number,
+    assigned: Map<FrontMindVisualFamily, MirroredReference>,
+    providerKeys: Set<string>,
+    hashes: string[],
+  ): boolean => {
+    explored += 1;
+    if (assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) {
+      try {
+        assertVisualBlueprintDiversityV4(
+          FRONTMIND_VISUAL_FAMILIES_V3.map((family) =>
+            trustedVisualPreviewBlueprintV4(
+              family,
+              assigned.get(family)!.taxonomy,
+            ),
+          ),
+        );
+        best = new Map(assigned);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    if (assigned.size > best.size) best = new Map(assigned);
+    if (index >= familyOrder.length || explored > 25_000) return false;
+    if (assigned.size + familyOrder.length - index <= best.size) return false;
+    const family = familyOrder[index]!;
+    for (const reference of choices.get(family) ?? []) {
+      const key = reference.candidate.providerItemKey;
+      if (
+        providerKeys.has(key) ||
+        hashes.some(
+          (hash) => perceptualHashDistance(hash, reference.perceptualHash) < 6,
+        )
+      ) {
+        continue;
+      }
+      assigned.set(family, reference);
+      providerKeys.add(key);
+      hashes.push(reference.perceptualHash);
+      if (visit(index + 1, assigned, providerKeys, hashes)) return true;
+      hashes.pop();
+      providerKeys.delete(key);
+      assigned.delete(family);
+    }
+    return visit(index + 1, assigned, providerKeys, hashes);
+  };
+  visit(0, new Map(), new Set(), []);
+  return new Map(
+    FRONTMIND_VISUAL_FAMILIES_V3.flatMap((family) => {
+      const reference = best.get(family);
+      return reference ? [[family, reference] as const] : [];
+    }),
+  );
+}
+
 function legacyHeroVariantForFamily(
   family: (typeof FRONTMIND_VISUAL_FAMILIES_V3)[number],
 ) {
   if (family === "split_media") return "split_media" as const;
-  if (family === "editorial" || family === "bento" || family === "feature_grid") {
+  if (
+    family === "editorial" ||
+    family === "bento" ||
+    family === "feature_grid"
+  ) {
     return "editorial_modular" as const;
   }
   if (family === "immersive_visual" || family === "full_bleed_statement") {
@@ -623,33 +1226,39 @@ function legacyHeroVariantForFamily(
 async function createFrontMindBoardCandidates(input: {
   operation: SiteOperation;
   context: TwentyFirstProviderContext;
-  inspiration: MirroredReference[];
+  inspirationByFamily: ReadonlyMap<FrontMindVisualFamily, MirroredReference>;
   signal: AbortSignal;
   renderCandidates: typeof renderTrustedVisualCandidatePreviews;
   persistArtifact: typeof persistSiteOpsArtifact;
+  diagnostics: VisualSearchDiagnostics;
 }) {
-  const inspirationEvidenceIds = Array.from(
-    new Set(
-      input.inspiration
-        .slice(0, 3)
-        .map((item) => item.visualEvidence.evidenceSha256),
-    ),
-  );
-  if (inspirationEvidenceIds.length < 1) {
-    inspirationEvidenceIds.push(
-      canonicalSha256({
-        evidenceKind: "frontmind_baseline_tokens",
-        componentLibraryVersion: "2.1.0",
-        companyName: input.context.brief.companyName,
-      }),
+  if (
+    input.inspirationByFamily.size !== FRONTMIND_VISUAL_FAMILIES_V3.length ||
+    FRONTMIND_VISUAL_FAMILIES_V3.some(
+      (family) => !input.inspirationByFamily.has(family),
+    )
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
+      "FrontMind 未能为 9 个视觉方向逐一绑定真实 Hero 参考。",
+      "attention_required",
     );
   }
-  const inspirationTaxonomies = input.inspiration
-    .slice(0, 3)
-    .map((item) => item.taxonomy);
-  const previewBlueprints = FRONTMIND_VISUAL_FAMILIES_V3.map((heroFamily) =>
-    trustedVisualPreviewBlueprintV3(heroFamily, inspirationTaxonomies),
-  );
+  const previewBlueprints = FRONTMIND_VISUAL_FAMILIES_V3.map((heroFamily) => {
+    const reference = input.inspirationByFamily.get(heroFamily)!;
+    return trustedVisualPreviewBlueprintV4(heroFamily, reference.taxonomy);
+  });
+  const semanticDiversity = assertVisualBlueprintDiversityV4(previewBlueprints);
+  input.diagnostics.diversity.distinctStyleSignatures =
+    semanticDiversity.uniqueStyleSignatures;
+  input.diagnostics.diversity.paletteVariants =
+    semanticDiversity.uniquePalettes;
+  input.diagnostics.diversity.backgroundVariants =
+    semanticDiversity.uniqueBackgrounds;
+  input.diagnostics.diversity.typographyVariants =
+    semanticDiversity.uniqueTypeSystems;
+  input.diagnostics.diversity.compositionVariants =
+    semanticDiversity.uniqueCompositions;
   const previewBlueprintByFamily = new Map(
     previewBlueprints.map(
       (blueprint) => [blueprint.heroFamily, blueprint] as const,
@@ -666,9 +1275,7 @@ async function createFrontMindBoardCandidates(input: {
   if (
     rendered.length !== FRONTMIND_VISUAL_FAMILIES_V3.length ||
     renderedByFamily.size !== FRONTMIND_VISUAL_FAMILIES_V3.length ||
-    FRONTMIND_VISUAL_FAMILIES_V3.some(
-      (family) => !renderedByFamily.has(family),
-    )
+    FRONTMIND_VISUAL_FAMILIES_V3.some((family) => !renderedByFamily.has(family))
   ) {
     throw new TwentyFirstProviderFailure(
       "FRONTMIND_VISUAL_RENDER_INCOMPLETE",
@@ -677,22 +1284,36 @@ async function createFrontMindBoardCandidates(input: {
     );
   }
   const candidates: FrontMindBoardCandidate[] = [];
-  const seenPreviewHashes = new Set<string>();
+  const seenRealizationHashes = new Set<string>();
+  const realizationPerceptualHashes: string[] = [];
   for (let index = 0; index < FRONTMIND_VISUAL_FAMILIES_V3.length; index += 1) {
     const heroFamily = FRONTMIND_VISUAL_FAMILIES_V3[index]!;
+    const inspiration = input.inspirationByFamily.get(heroFamily)!;
     const buffer = renderedByFamily.get(heroFamily)!;
     const previewBlueprint = previewBlueprintByFamily.get(heroFamily)!;
-    const previewSha256 = sha256Buffer(buffer);
-    if (seenPreviewHashes.has(previewSha256)) {
+    const realizationPreviewSha256 = sha256Buffer(buffer);
+    const realizationPerceptualHash = await perceptualHash64(buffer);
+    if (seenRealizationHashes.has(realizationPreviewSha256)) {
       throw new TwentyFirstProviderFailure(
         "FRONTMIND_VISUAL_RENDER_DUPLICATE",
         "视觉候选未形成九种不同构图，请稍后重试。",
         "attention_required",
       );
     }
-    seenPreviewHashes.add(previewSha256);
+    if (
+      realizationPerceptualHashes.some(
+        (hash) => perceptualHashDistance(hash, realizationPerceptualHash) < 4,
+      )
+    ) {
+      throw new TwentyFirstProviderFailure(
+        "FRONTMIND_VISUAL_RENDER_PERCEPTUALLY_DUPLICATE",
+        "视觉候选在感知上过于相似，请稍后重试。",
+        "attention_required",
+      );
+    }
+    seenRealizationHashes.add(realizationPreviewSha256);
+    realizationPerceptualHashes.push(realizationPerceptualHash);
     const sampleId = randomUUID();
-    const providerItemKey = `s:frontmind:${heroFamily}:${inspirationEvidenceIds[0]!.slice(0, 12)}`;
     const asset = await input.persistArtifact({
       userId: input.operation.userId,
       projectId: input.context.project.id,
@@ -702,63 +1323,55 @@ async function createFrontMindBoardCandidates(input: {
       buffer,
       maxBytes: 5 * 1024 * 1024,
     });
-    if (asset.contentSha256 !== previewSha256) {
+    if (asset.contentSha256 !== realizationPreviewSha256) {
       throw new TwentyFirstProviderFailure(
         "FRONTMIND_VISUAL_RENDER_HASH_MISMATCH",
         "视觉候选写入校验失败。",
         "attention_required",
       );
     }
-    const referenceBlueprint = referenceBlueprintV3ForFamily({
+    const referenceBlueprint = referenceBlueprintV4ForFamily({
       candidateId: sampleId,
-      providerItemKey,
-      previewLocalAssetId: asset.id,
-      previewSha256,
+      providerItemKey: inspiration.candidate.providerItemKey,
+      referencePreviewLocalAssetId: inspiration.previewLocalAssetId,
+      referencePreviewSha256: inspiration.previewSha256,
+      realizationPreviewLocalAssetId: asset.id,
+      realizationPreviewSha256,
       heroFamily,
-      inspirationEvidenceIds,
+      inspirationEvidenceId: inspiration.visualEvidence.evidenceSha256,
+      inspirationTaxonomy: inspiration.taxonomy,
       previewBlueprint,
-    });
-    const visualEvidence = createVisualEvidenceV1({
-      evidenceKind: VISUAL_EVIDENCE_KIND,
-      providerItemKey,
-      metadataSha256: canonicalSha256({
-        family: heroFamily,
-        companyName: input.context.brief.companyName,
-        inspirationEvidenceIds,
-      }),
-      providerResponseSha256: canonicalSha256({
-        renderer: "frontmind-react-static-preview-v1",
-        componentManifest: referenceBlueprint.componentManifest,
-      }),
-      previewSha256,
-      taxonomyDerivationVersion: VISUAL_TAXONOMY_DERIVATION_VERSION,
     });
     candidates.push({
       sampleId,
       optionLabel: String.fromCharCode(65 + index),
-      queryAxis:
-        index % 2 === 0
-          ? "foundation_split"
-          : "foundation_editorial_modular",
-      providerItemKey,
+      queryAxis: familyQueryAxis(heroFamily),
+      providerItemKey: inspiration.candidate.providerItemKey,
       title: FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily],
-      description: `${FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily]}首页视觉方向`,
-      taxonomy: {
-        role: "foundation",
-        palette: Object.values(referenceBlueprint.palette),
-        typography: [referenceBlueprint.typeSystem],
-        layout: [heroFamily, referenceBlueprint.composition],
-        motion: [referenceBlueprint.motionLevel],
-        accessibility: ["mobile-reflow", "reduced-motion-required"],
-      },
-      previewLocalAssetId: asset.id,
-      previewSha256,
-      visualEvidence,
+      description:
+        inspiration.candidate.description ?? inspiration.candidate.title,
+      taxonomy: inspiration.taxonomy,
+      author: inspiration.candidate.author,
+      sourceUrl: inspiration.candidate.sourceUrl,
+      previewLocalAssetId: inspiration.previewLocalAssetId,
+      previewSha256: inspiration.previewSha256,
+      realizationPreviewLocalAssetId: asset.id,
+      realizationPreviewSha256,
+      referencePerceptualHash: inspiration.perceptualHash,
+      realizationPerceptualHash,
+      visualEvidence: inspiration.visualEvidence,
       referenceBlueprint,
-      score: 100 - index,
-      rationale: `使用同一企业资料，由 FrontMind 可信组件渲染为${FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily]}。`,
+      score: inspiration.candidate.score,
+      rationale: `独立绑定 21st 真实 Hero 参考，并由 FrontMind 可信组件实现为${FRONTMIND_VISUAL_FAMILY_LABELS_V3[heroFamily]}。`,
     });
   }
+  input.diagnostics.diversity.distinctRealizationHashes =
+    seenRealizationHashes.size;
+  input.diagnostics.diversity.distinctRealizationPerceptualHashes = new Set(
+    realizationPerceptualHashes,
+  ).size;
+  input.diagnostics.diversity.minimumRealizationHammingDistance =
+    minimumPerceptualDistance(realizationPerceptualHashes);
   return candidates;
 }
 
@@ -853,8 +1466,8 @@ async function persistDefaultBoard(
           queryAxis: item.queryAxis,
           title: item.title,
           description: item.description,
-          author: "FrontMind",
-          sourceUrl: null,
+          author: item.author,
+          sourceUrl: item.sourceUrl,
           catalogRole: "hero",
           heroFamily: item.referenceBlueprint.heroFamily,
           heroEligibility: {
@@ -867,6 +1480,10 @@ async function persistDefaultBoard(
           },
           visualEvidence: item.visualEvidence,
           referenceBlueprint: item.referenceBlueprint,
+          realizationPreviewLocalAssetId: item.realizationPreviewLocalAssetId,
+          realizationPreviewSha256: item.realizationPreviewSha256,
+          referencePerceptualHash: item.referencePerceptualHash,
+          realizationPerceptualHash: item.realizationPerceptualHash,
           taxonomy: {
             ...item.taxonomy,
           },
@@ -888,8 +1505,7 @@ async function persistDefaultBoard(
       turnId: input.operation.conversationTurnId,
       userId: input.operation.userId,
       role: "assistant",
-      content:
-        "已准备 9 个不同风格的视觉候选，请选择一个方向。",
+      content: "已准备 9 个不同风格的视觉候选，请选择一个方向。",
       sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
       metadata: {
         siteOps: {
@@ -965,7 +1581,7 @@ function safeProviderFailure(
     return {
       status: "attention_required",
       code: "MCP_CONTRACT_INCOMPATIBLE",
-      message: "21st 目录工具参数协议暂不兼容，请稍后重试。",
+      message: "FrontMind 视觉目录暂不兼容，请稍后重试。",
       result: diagnostics,
     };
   }
@@ -978,8 +1594,8 @@ function safeProviderFailure(
           : "MCP_UNAVAILABLE",
       message:
         error.code === "INVALID_CREDENTIAL"
-          ? "21st API Key 无效，或当前连接缺少必要的只读目录能力。"
-          : "21st 目录服务暂时不可用，请稍后重试。",
+          ? "FrontMind 视觉目录连接无效，或缺少必要的只读能力。"
+          : "FrontMind 视觉目录暂时不可用，请稍后重试。",
       result: diagnostics,
     };
   }
@@ -987,7 +1603,7 @@ function safeProviderFailure(
     return {
       status: "attention_required",
       code: "MCP_UNAVAILABLE",
-      message: "21st 目录服务暂时不可用，请稍后重试。",
+      message: "FrontMind 视觉目录暂时不可用，请稍后重试。",
       result: diagnostics,
     };
   }
@@ -1058,62 +1674,140 @@ export function createTwentyFirstSiteOpsProviderHandler(
       if (!credential || credential.version !== parsedInput.credentialVersion) {
         throw new TwentyFirstProviderFailure(
           "PINNED_CREDENTIAL_UNAVAILABLE",
-          "该视觉检索固定的 21st API Key 版本不可用。",
+          "该视觉检索固定的 FrontMind 目录连接版本不可用。",
           "attention_required",
         );
       }
       activeApiKey = credential.apiKey;
       stage = "mcp_retrieval";
-      const { queries, funnel } = await client.withReadOnlySession(
+      const retrieval = await client.withReadOnlySession(
         credential.apiKey,
-        (session) =>
-          retrieveFunnel({
+        async (session) => {
+          const pools = emptyFamilyReferencePools();
+          const queries: FamilySearchQuery[] = [];
+          const searchedCandidates = new Map<
+            string,
+            ReturnType<typeof normalizeTwentyFirstSearchResults>[number]
+          >();
+          const mirrored: MirroredReference[] = [];
+          const attemptedProviderKeys = new Set<string>();
+          const seenPreviewHashes = new Set<string>();
+          const supplementedFamilies = new Set<FrontMindVisualFamily>();
+          const mirrorNewCandidates = async () => {
+            const unique = new Map<string, NormalizedTwentyFirstCandidate>();
+            for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+              for (const candidate of pools.get(family) ?? []) {
+                if (!attemptedProviderKeys.has(candidate.providerItemKey)) {
+                  unique.set(candidate.providerItemKey, candidate);
+                }
+              }
+            }
+            const candidates = [...unique.values()];
+            for (const candidate of candidates) {
+              attemptedProviderKeys.add(candidate.providerItemKey);
+            }
+            if (candidates.length < 1) return;
+            stage = "mirror_previews";
+            mirrored.push(
+              ...(await mirrorCandidates({
+                operation,
+                context,
+                candidates,
+                signal,
+                fetchPreview,
+                persistArtifact,
+                diagnostics,
+                seenPreviewHashes,
+              })),
+            );
+          };
+
+          stage = "mcp_retrieval";
+          await searchFamilyRound({
             session,
             brief: context.brief,
+            families: FRONTMIND_VISUAL_FAMILIES_V3,
+            round: "primary",
+            pools,
+            queries,
+            searchedCandidates,
             signal,
             diagnostics,
-          }),
+          });
+          const provisional = maximumKeyAssignment(pools);
+          const provisionallyMissing = FRONTMIND_VISUAL_FAMILIES_V3.filter(
+            (family) => !provisional.has(family),
+          );
+          if (provisionallyMissing.length > 0) {
+            stage = "mcp_retrieval";
+            await searchFamilyRound({
+              session,
+              brief: context.brief,
+              families: provisionallyMissing,
+              round: "supplemental",
+              pools,
+              queries,
+              searchedCandidates,
+              signal,
+              diagnostics,
+            });
+            provisionallyMissing.forEach((family) =>
+              supplementedFamilies.add(family),
+            );
+          }
+          await mirrorNewCandidates();
+          let assigned = assignDistinctMirroredReferences({ pools, mirrored });
+          const missingAfterMirror = FRONTMIND_VISUAL_FAMILIES_V3.filter(
+            (family) =>
+              !assigned.has(family) && !supplementedFamilies.has(family),
+          );
+          if (missingAfterMirror.length > 0) {
+            stage = "mcp_retrieval";
+            await searchFamilyRound({
+              session,
+              brief: context.brief,
+              families: missingAfterMirror,
+              round: "supplemental",
+              pools,
+              queries,
+              searchedCandidates,
+              signal,
+              diagnostics,
+            });
+            missingAfterMirror.forEach((family) =>
+              supplementedFamilies.add(family),
+            );
+            await mirrorNewCandidates();
+            assigned = assignDistinctMirroredReferences({ pools, mirrored });
+          }
+          refreshRetrievalDiagnostics({
+            pools,
+            searchedCandidates,
+            mirrored,
+            assigned,
+            diagnostics,
+          });
+          return { queries, pools, mirrored, assigned };
+        },
         { signal },
       );
-      const degradedReasons = funnel.degradedReasons.filter(
-        (reason) => !reason.startsWith("PRESENTATION_RESULTS_INSUFFICIENT:"),
-      );
-      if (diagnostics.normalizedUnique === 0) {
-        degradedReasons.push("FRONTMIND_BASELINE:CATALOG_EMPTY");
-      } else if (diagnostics.withPreviewReference === 0) {
-        degradedReasons.push("FRONTMIND_BASELINE:NO_SAFE_PREVIEW");
-      } else if (funnel.retrievalShortlist.length === 0) {
-        degradedReasons.push("FRONTMIND_BASELINE:NO_HERO_REFERENCE");
-      }
-      let heroReferences: MirroredReference[] = [];
-      if (funnel.retrievalShortlist.length > 0) {
-        stage = "mirror_previews";
-        const mirrored = await mirrorCandidates({
-          operation,
-          context,
-          candidates: funnel.retrievalShortlist,
-          signal,
-          fetchPreview,
-          persistArtifact,
-          diagnostics,
-        });
-        heroReferences = mirrored.filter(
-          (item) =>
-            item.candidate.catalogRole === "hero" &&
-            item.candidate.heroEligibility.eligible,
+      if (retrieval.assigned.size !== FRONTMIND_VISUAL_FAMILIES_V3.length) {
+        throw new TwentyFirstProviderFailure(
+          "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
+          `FrontMind 当前仅找到 ${retrieval.assigned.size}/9 个可安全区分的真实 Hero 参考，请稍后重试。`,
+          "attention_required",
         );
-        if (heroReferences.length === 0) {
-          degradedReasons.push("FRONTMIND_BASELINE:PREVIEW_MIRROR_FAILED");
-        }
       }
+      const degradedReasons: string[] = [];
       stage = "render_host_previews";
       const mirroredCandidates = await createFrontMindBoardCandidates({
         operation,
         context,
-        inspiration: heroReferences,
+        inspirationByFamily: retrieval.assigned,
         signal,
         renderCandidates,
         persistArtifact,
+        diagnostics,
       });
       const rejectedPreviews = Object.values(
         diagnostics.rejectedByReason,
@@ -1122,10 +1816,14 @@ export function createTwentyFirstSiteOpsProviderHandler(
         degradedReasons.push(`PREVIEW_RESULTS_REJECTED:${rejectedPreviews}`);
       }
       stage = "persist_selection_bundle";
-      const selectionBundle = visualSelectionBundleV3Schema.parse({
-        schemaVersion: 3,
-        queryPlanHash: canonicalSha256(queries),
-        searchTarget: 18,
+      const selectionBundle = visualSelectionBundleV4Schema.parse({
+        schemaVersion: 4,
+        queryPlanHash: canonicalSha256(retrieval.queries),
+        searchTarget: retrieval.queries.reduce(
+          (sum, query) => sum + query.limit,
+          0,
+        ),
+        referenceTarget: 9,
         displayTarget: 9,
         candidates: mirroredCandidates.map((item) => ({
           id: item.sampleId,
@@ -1134,11 +1832,15 @@ export function createTwentyFirstSiteOpsProviderHandler(
           providerItemKey: item.providerItemKey,
           title: item.title,
           description: item.description,
-          author: "FrontMind",
-          sourceUrl: null,
+          author: item.author,
+          sourceUrl: item.sourceUrl,
           visualEvidence: item.visualEvidence,
           previewLocalAssetId: item.previewLocalAssetId,
           previewSha256: item.previewSha256,
+          realizationPreviewLocalAssetId: item.realizationPreviewLocalAssetId,
+          realizationPreviewSha256: item.realizationPreviewSha256,
+          referencePerceptualHash: item.referencePerceptualHash,
+          realizationPerceptualHash: item.realizationPerceptualHash,
           taxonomy: item.taxonomy,
           score: item.score,
           rationale: item.rationale,
@@ -1185,16 +1887,16 @@ export function createTwentyFirstSiteOpsProviderHandler(
           candidateCount: board.candidateCount,
           selectionBundleHash: board.selectionBundleHash ?? undefined,
           actual: {
-            searched: funnel.actual.searched,
-            shortlisted: funnel.actual.shortlisted,
+            searched: diagnostics.normalizedUnique,
+            shortlisted: diagnostics.shortlistCount,
             mirrored: diagnostics.mirrorSucceeded,
             presented: mirroredCandidates.length,
           },
           diagnostics,
+          diversity: diagnostics.diversity,
           degradedReasons: selectionBundle.degradedReasons,
         },
-        message:
-          "9 个不同风格的视觉候选已准备完成，请选择一个方向。",
+        message: "9 个不同风格的视觉候选已准备完成，请选择一个方向。",
       };
     } catch (error) {
       console.error("[SiteOps21st] visual_search_failed", {

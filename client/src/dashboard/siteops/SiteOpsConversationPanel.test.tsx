@@ -302,7 +302,23 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       screen.getByRole("heading", { name: "9 个视觉候选" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(/示例图片与文案不会复制到官网/u),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/相同的企业资料真实渲染/u)).toBeNull();
     expect(document.body.textContent).not.toMatch(/API Key|Base|Pro|Hero/iu);
+    fireEvent.click(
+      screen.getByRole("button", { name: "重新生成 9 个视觉候选" }),
+    );
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "reselect_visual",
+        input: {},
+        messageId: "message-1",
+        cardKind: "visual_board",
+      }),
+    );
+    onAction.mockClear();
     fireEvent.click(screen.getByRole("button", { name: "选择 B" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
@@ -883,7 +899,7 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
-  it("prioritizes knowledge selection after an approved reset while preserving the old preview", () => {
+  it("hides the previous website surface after an approved rebuild reset", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -900,7 +916,8 @@ describe("SiteOpsConversationPanel", () => {
               status: "approved",
               previewUrl:
                 "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
-              sourceUrl: null,
+              sourceUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/source",
               needsHelp: false,
               createdAt: "2026-08-22T00:00:00.000Z",
               updatedAt: "2026-08-22T00:01:00.000Z",
@@ -925,10 +942,130 @@ describe("SiteOpsConversationPanel", () => {
     expect(screen.getByText("当前阶段").parentElement).toHaveTextContent(
       "选择知识库 ZIP 版本",
     );
+    expect(screen.queryByText("官网版本 2")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "在新标签页打开预览" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "下载网站源码" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "提交官网重制需求" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("重制需求处理中")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: "发布博客与行业近况（即将上线）",
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("继续对话")).not.toBeInTheDocument();
+  });
+
+  it("keeps the existing website visible before a submitted rebuild is approved", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "live" },
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 2,
+              parentBuildId: null,
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/source",
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: false,
+            ticketId: "77777777-7777-4777-8777-777777777777",
+            status: "submitted",
+            resetApplied: false,
+          },
+          interactionState: "live",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("官网版本 2")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "在新标签页打开预览" }),
     ).toBeInTheDocument();
-    expect(screen.queryByText("继续对话")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "下载网站源码" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "发布博客与行业近况（即将上线）",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重制需求处理中" }),
+    ).toBeDisabled();
+  });
+
+  it("restores the completed replacement website after the rebuild ticket completes", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "approved" },
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 2,
+              parentBuildId: null,
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              ordinal: 3,
+              parentBuildId: "33333333-3333-4333-8333-333333333333",
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/preview/",
+              sourceUrl:
+                "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/source",
+              needsHelp: false,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: "77777777-7777-4777-8777-777777777777",
+            status: "completed",
+            resetApplied: true,
+          },
+          interactionState: "approved",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("官网版本 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "下载网站源码" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "发布博客与行业近况（即将上线）",
+      }),
+    ).toBeInTheDocument();
   });
 
   it.each([

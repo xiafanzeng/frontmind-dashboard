@@ -44,7 +44,7 @@ type ManagedKeywordTablesProps = {
 };
 
 const KEYWORD_SOURCE_DESCRIPTION =
-  "基于当前企业知识库与公开信息研究生成，并按行业、竞品、品牌评价和产品场景分类整理。";
+  "基于百度营销、小红书蒲公英、抖音巨量指数等平台数据综合整理 GEO 优化问题，支持按主分类与问题细分筛选。";
 
 function normalizedColumnName(value: unknown) {
   return String(value ?? "")
@@ -378,11 +378,6 @@ export default function ManagedKeywordTables({
         eyebrow="MindPromise智诺 / 品牌建设"
         title="品牌全域词库"
         desc={KEYWORD_SOURCE_DESCRIPTION}
-        actions={
-          generationEnabled && tables.length > 0 ? (
-            <BrandQuestionUniverseGenerationControl />
-          ) : undefined
-        }
       />
       {loading ? (
         <KeywordEmptyPanel

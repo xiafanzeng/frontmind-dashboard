@@ -156,7 +156,26 @@ export const SITEOPS_MATERIALIZER_V2_2 = {
   qaPolicyVersion: "siteops-qa-v4",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_2;
+/** React Static 2.3 binds nine distinct real provider references one-to-one
+ * with nine independently rendered trusted visual blueprints. */
+export const SITEOPS_MATERIALIZER_V2_3 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "2.3.0",
+  runtimeManifestSha256:
+    "30b90fa1cd5339e7d30013be24dc9ad4e36069a2d8673f410d06487fd2720e49",
+  starterVersion: "2.3.0",
+  starterSha256:
+    "ad8f0d7c8e2cdbab0480ea4065a48bf8da0e536dcc5348b34eadbe527e7163f2",
+  componentLibraryVersion: "2.3.0",
+  materializerVersion: "2.3.0",
+  materializerSha256:
+    "9822b8c2da2ab1d336c0837c1fe464adf171f74572552dd78b9045ba58abd9d7",
+  qaPolicyVersion: "siteops-qa-v4",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_3;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -167,6 +186,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_0.frontMindVersion]: SITEOPS_MATERIALIZER_V2_0,
   [SITEOPS_MATERIALIZER_V2_1.frontMindVersion]: SITEOPS_MATERIALIZER_V2_1,
   [SITEOPS_MATERIALIZER_V2_2.frontMindVersion]: SITEOPS_MATERIALIZER_V2_2,
+  [SITEOPS_MATERIALIZER_V2_3.frontMindVersion]: SITEOPS_MATERIALIZER_V2_3,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {
@@ -747,8 +767,241 @@ export const visualSelectionBundleV3Schema = z
     }
   });
 
-/** Immutable V1/V2 artifacts remain readable; every new visual operation writes V3. */
+/** V4 keeps the provider's immutable 21st preview as the customer-facing
+ * reference while binding a separate host-rendered realization to the exact
+ * trusted component blueprint. One reference may influence exactly one
+ * candidate; no global theme projection is permitted. */
+export const visualReferenceBlueprintV4Schema = visualReferenceBlueprintV3Schema
+  .omit({ schemaVersion: true })
+  .extend({
+    schemaVersion: z.literal(4),
+    referencePreviewLocalAssetId: z.string().uuid(),
+    referencePreviewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    inspirationTaxonomySha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    styleSignature: z.string().regex(/^[a-f0-9]{64}$/u),
+  })
+  .strict();
+
+function visualHashHammingDistance(left: string, right: string) {
+  let distance = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    let bits =
+      Number.parseInt(left[index]!, 16) ^ Number.parseInt(right[index]!, 16);
+    while (bits > 0) {
+      distance += bits & 1;
+      bits >>>= 1;
+    }
+  }
+  return distance;
+}
+
+export const visualCandidateV4Schema = visualCandidateV2BaseSchema
+  .extend({
+    label: z.string().regex(/^[A-I]$/u),
+    realizationPreviewLocalAssetId: z.string().uuid(),
+    realizationPreviewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    referencePerceptualHash: z.string().regex(/^[a-f0-9]{16}$/u),
+    realizationPerceptualHash: z.string().regex(/^[a-f0-9]{16}$/u),
+    referenceBlueprint: visualReferenceBlueprintV4Schema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    validateVisualCandidateCoordinates(value, context);
+    if (value.providerItemKey.startsWith("s:frontmind:")) {
+      context.addIssue({
+        code: "custom",
+        path: ["providerItemKey"],
+        message: "V4 candidates must bind a real provider item",
+      });
+    }
+    if (
+      value.referenceBlueprint.candidateId !== value.id ||
+      value.referenceBlueprint.providerItemKey !== value.providerItemKey ||
+      value.referenceBlueprint.referencePreviewLocalAssetId !==
+        value.previewLocalAssetId ||
+      value.referenceBlueprint.referencePreviewSha256 !== value.previewSha256 ||
+      value.referenceBlueprint.previewLocalAssetId !==
+        value.realizationPreviewLocalAssetId ||
+      value.referenceBlueprint.previewSha256 !==
+        value.realizationPreviewSha256 ||
+      value.referenceBlueprint.inspirationEvidenceIds.length !== 1 ||
+      value.referenceBlueprint.inspirationEvidenceIds[0] !==
+        value.visualEvidence.evidenceSha256
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["referenceBlueprint"],
+        message:
+          "V4 blueprint does not close over its reference and realization",
+      });
+    }
+  });
+
+export const visualSelectionBundleV4Schema = z
+  .object({
+    schemaVersion: z.literal(4),
+    queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    searchTarget: z.number().int().min(9).max(72),
+    referenceTarget: z.literal(9),
+    displayTarget: z.literal(9),
+    candidates: z.array(visualCandidateV4Schema).length(9),
+    selectedCandidateId: z.string().max(191).nullable(),
+    delegated: z.boolean().default(false),
+    degradedReasons: z.array(z.string().max(500)).max(30).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const unique = (coordinates: string[], path: string) => {
+      if (new Set(coordinates).size !== coordinates.length) {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: `V4 visual ${path} coordinates must be unique`,
+        });
+      }
+    };
+    const candidates = value.candidates;
+    unique(
+      candidates.map((candidate) => candidate.id),
+      "candidateId",
+    );
+    unique(
+      candidates.map((candidate) => candidate.label),
+      "label",
+    );
+    unique(
+      candidates.map((candidate) => candidate.providerItemKey),
+      "providerItemKey",
+    );
+    unique(
+      candidates.map((candidate) => candidate.previewLocalAssetId),
+      "referencePreviewLocalAssetId",
+    );
+    unique(
+      candidates.map((candidate) => candidate.previewSha256),
+      "referencePreviewSha256",
+    );
+    unique(
+      candidates.map((candidate) => candidate.visualEvidence.evidenceSha256),
+      "evidenceSha256",
+    );
+    unique(
+      candidates.map((candidate) => candidate.realizationPreviewLocalAssetId),
+      "realizationPreviewLocalAssetId",
+    );
+    unique(
+      candidates.map((candidate) => candidate.realizationPreviewSha256),
+      "realizationPreviewSha256",
+    );
+    unique(
+      candidates.map((candidate) => candidate.referenceBlueprint.heroFamily),
+      "heroFamily",
+    );
+    unique(
+      candidates.map(
+        (candidate) => candidate.referenceBlueprint.styleSignature,
+      ),
+      "styleSignature",
+    );
+    unique(
+      candidates.map((candidate) => candidate.referenceBlueprint.blueprintHash),
+      "blueprintHash",
+    );
+
+    const paletteFingerprints = new Set(
+      candidates.map(({ referenceBlueprint: blueprint }) =>
+        [
+          blueprint.palette.canvas,
+          blueprint.palette.ink,
+          blueprint.palette.accent,
+          blueprint.palette.muted,
+        ].join(":"),
+      ),
+    );
+    for (const [coordinate, actual, minimum] of [
+      [
+        "backgroundStyle",
+        new Set(
+          candidates.map(
+            (candidate) => candidate.referenceBlueprint.backgroundStyle,
+          ),
+        ).size,
+        3,
+      ],
+      [
+        "typeSystem",
+        new Set(
+          candidates.map(
+            (candidate) => candidate.referenceBlueprint.typeSystem,
+          ),
+        ).size,
+        3,
+      ],
+      [
+        "composition",
+        new Set(
+          candidates.map(
+            (candidate) => candidate.referenceBlueprint.composition,
+          ),
+        ).size,
+        4,
+      ],
+      ["palette", paletteFingerprints.size, 4],
+    ] as const) {
+      if (actual < minimum) {
+        context.addIssue({
+          code: "custom",
+          path: ["candidates"],
+          message: `V4 visual diversity requires at least ${minimum} ${coordinate} variants`,
+        });
+      }
+    }
+
+    for (let left = 0; left < candidates.length; left += 1) {
+      for (let right = left + 1; right < candidates.length; right += 1) {
+        if (
+          visualHashHammingDistance(
+            candidates[left]!.referencePerceptualHash,
+            candidates[right]!.referencePerceptualHash,
+          ) < 6
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["candidates", right, "referencePerceptualHash"],
+            message: "V4 provider references are perceptually too similar",
+          });
+        }
+        if (
+          visualHashHammingDistance(
+            candidates[left]!.realizationPerceptualHash,
+            candidates[right]!.realizationPerceptualHash,
+          ) < 4
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["candidates", right, "realizationPerceptualHash"],
+            message: "V4 realizations are perceptually too similar",
+          });
+        }
+      }
+    }
+    if (
+      value.selectedCandidateId !== null &&
+      !candidates.some(
+        (candidate) => candidate.id === value.selectedCandidateId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedCandidateId"],
+        message: "Selected visual candidate is absent",
+      });
+    }
+  });
+
+/** Immutable V1/V2/V3 artifacts remain readable; every new visual operation writes V4. */
 export const visualSelectionBundleSchema = z.union([
+  visualSelectionBundleV4Schema,
   visualSelectionBundleV3Schema,
   visualSelectionBundleV2Schema,
   visualSelectionBundleV1Schema,
@@ -903,6 +1156,9 @@ export type VisualSelectionBundleV2 = z.infer<
 >;
 export type VisualSelectionBundleV3 = z.infer<
   typeof visualSelectionBundleV3Schema
+>;
+export type VisualSelectionBundleV4 = z.infer<
+  typeof visualSelectionBundleV4Schema
 >;
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;

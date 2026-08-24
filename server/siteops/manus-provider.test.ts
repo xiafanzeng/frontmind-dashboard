@@ -6,7 +6,11 @@ import {
   canonicalJson,
   createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
-import { SITEOPS_WORKFLOW } from "../../shared/siteops";
+import {
+  SITEOPS_MATERIALIZER_V2_1,
+  SITEOPS_MATERIALIZER_V2_2,
+  SITEOPS_WORKFLOW,
+} from "../../shared/siteops";
 import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
 
 import {
@@ -26,8 +30,10 @@ import {
   phaseTerminalTaskState,
   safePublicDocuments,
   resultFailure,
+  selectedVisualPreviewCoordinates,
   structuredResultGrace,
   terminalTaskState,
+  usesBuildPlanContractV4,
   visualPreviewAttachment,
 } from "./manus-provider";
 import {
@@ -72,6 +78,104 @@ const operation = {
 afterEach(() => vi.restoreAllMocks());
 
 describe("Manus SiteOps provider boundary", () => {
+  it("keeps frozen 2.2 tasks on BuildContractV4 and PageContentWireV3", async () => {
+    expect(
+      usesBuildPlanContractV4(SITEOPS_MATERIALIZER_V2_2.frontMindVersion),
+    ).toBe(true);
+    expect(usesBuildPlanContractV4(SITEOPS_WORKFLOW.frontMindVersion)).toBe(
+      true,
+    );
+    expect(
+      usesBuildPlanContractV4(SITEOPS_MATERIALIZER_V2_1.frontMindVersion),
+    ).toBe(false);
+
+    const workflow = await JSZip.loadAsync(
+      await loadVerifiedSiteOpsWorkflowPackage(SITEOPS_MATERIALIZER_V2_2),
+      { checkCRC32: true },
+    );
+    const runtime = JSON.parse(
+      await workflow.file("runtime-contract.json")!.async("string"),
+    );
+    expect(runtime).toMatchObject({
+      adapterVersion: "2.2.0",
+      providerWire: {
+        phaseTwoCanonical: "PageContentSpecV2",
+        phaseTwoOutputFilename: "frontmind-page-content-wire-v3.json",
+      },
+      aiTask: { phaseTwoOutput: "PageContentWireV3" },
+      renderer: {
+        kind: "react_static_v2",
+        componentLibraryVersion: "2.2.0",
+        materializerVersion: "2.2.0",
+      },
+      contentSystem: { buildContract: "BuildContractV4" },
+    });
+  });
+
+  it("keeps the provider reference and host realization as two exact V4 preview coordinates", () => {
+    const candidateId = "60000000-0000-4000-8000-000000000006";
+    const referenceLocalAssetId = "80000000-0000-4000-8000-000000000008";
+    const realizationLocalAssetId = "81000000-0000-4000-8000-000000000008";
+    const referenceSha256 = "a".repeat(64);
+    const realizationSha256 = "b".repeat(64);
+    const coordinates = selectedVisualPreviewCoordinates({
+      bundle: {
+        schemaVersion: 4,
+        candidates: [
+          {
+            id: candidateId,
+            previewLocalAssetId: referenceLocalAssetId,
+            previewSha256: referenceSha256,
+            realizationPreviewLocalAssetId: realizationLocalAssetId,
+            realizationPreviewSha256: realizationSha256,
+            referenceBlueprint: {
+              referencePreviewLocalAssetId: referenceLocalAssetId,
+              referencePreviewSha256: referenceSha256,
+              previewLocalAssetId: realizationLocalAssetId,
+              previewSha256: realizationSha256,
+            },
+          },
+        ],
+      } as never,
+      candidateId,
+      samplePreviewLocalAssetId: referenceLocalAssetId,
+      evidencePreviewSha256: referenceSha256,
+    });
+
+    expect(coordinates).toEqual({
+      referenceLocalAssetId,
+      referenceSha256,
+      realizationLocalAssetId,
+      realizationSha256,
+      hasIndependentRealization: true,
+    });
+    expect(() =>
+      selectedVisualPreviewCoordinates({
+        bundle: {
+          schemaVersion: 4,
+          candidates: [
+            {
+              id: candidateId,
+              previewLocalAssetId: referenceLocalAssetId,
+              previewSha256: referenceSha256,
+              realizationPreviewLocalAssetId: realizationLocalAssetId,
+              realizationPreviewSha256: realizationSha256,
+              referenceBlueprint: {
+                referencePreviewLocalAssetId: referenceLocalAssetId,
+                referencePreviewSha256: referenceSha256,
+                previewLocalAssetId: realizationLocalAssetId,
+                previewSha256: "c".repeat(64),
+              },
+            },
+          ],
+        } as never,
+        candidateId,
+        samplePreviewLocalAssetId: referenceLocalAssetId,
+        evidencePreviewSha256: referenceSha256,
+      }),
+    ).toThrow("视觉参考与可实现预览坐标不一致");
+  });
+
   it("keeps customer-facing completion and content repair copy renderer-neutral", () => {
     const completion = completedSiteBuildMessage();
     const repair = contentRepairPrompt({

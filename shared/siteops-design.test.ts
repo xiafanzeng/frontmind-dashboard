@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertVisualBlueprintDiversityV4,
   canonicalSiteOpsSha256,
   composeBuildContractV4,
   composeBuildContractV3,
@@ -10,9 +11,14 @@ import {
   FRONTMIND_VISUAL_FAMILIES_V3,
   referenceBlueprintForVisualCandidate,
   referenceBlueprintV3ForFamily,
+  referenceBlueprintV4ForFamily,
   referenceBlueprintV2Schema,
   referenceBlueprintV3Schema,
+  referenceBlueprintV4Schema,
   trustedVisualPreviewBlueprintV3,
+  trustedVisualPreviewBlueprintV4,
+  visualBlueprintDiversityReportV4,
+  visualStyleSignatureV4,
   pageContentResultV1Schema,
   pageContentSpecV2Schema,
   siteDesignResultV1Schema,
@@ -431,6 +437,105 @@ describe("SiteOps Manus design and content contracts", () => {
         },
       }),
     ).toThrow("SITEOPS_VISUAL_PALETTE_CONTRAST_INVALID");
+  });
+
+  it("freezes nine materially different V4 visual languages", () => {
+    const blueprints = FRONTMIND_VISUAL_FAMILIES_V3.map((heroFamily) =>
+      trustedVisualPreviewBlueprintV4(heroFamily),
+    );
+    const report = visualBlueprintDiversityReportV4(blueprints);
+
+    expect(report).toMatchObject({
+      candidateCount: 9,
+      uniqueFamilies: 9,
+      uniqueStyleSignatures: 9,
+      uniqueBackgrounds: 4,
+      uniqueTypeSystems: 4,
+      uniquePalettes: 9,
+      uniqueCompositions: 5,
+      violations: [],
+      isDiverse: true,
+    });
+    expect(() => assertVisualBlueprintDiversityV4(blueprints)).not.toThrow();
+    expect(() =>
+      assertVisualBlueprintDiversityV4(blueprints.map(() => blueprints[0]!)),
+    ).toThrow("SITEOPS_VISUAL_DIVERSITY_INVALID");
+  });
+
+  it("lets one inspiration taxonomy influence only its assigned V4 family", () => {
+    const taxonomy = {
+      role: "foundation" as const,
+      palette: ["#241238", "dark-canvas", "high-contrast"],
+      typography: ["serif-editorial"],
+      layout: ["editorial-rhythm", "premium-restrained"],
+      motion: ["short-transition"],
+      accessibility: ["reduced-motion-required"],
+    };
+    const baselines = FRONTMIND_VISUAL_FAMILIES_V3.map((heroFamily) =>
+      trustedVisualPreviewBlueprintV4(heroFamily),
+    );
+    const independentlyProjected = FRONTMIND_VISUAL_FAMILIES_V3.map(
+      (heroFamily) =>
+        trustedVisualPreviewBlueprintV4(
+          heroFamily,
+          heroFamily === "split_media" ? taxonomy : undefined,
+        ),
+    );
+    expect(
+      independentlyProjected
+        .map((blueprint, index) =>
+          blueprint === baselines[index] ||
+          JSON.stringify(blueprint) === JSON.stringify(baselines[index])
+            ? null
+            : blueprint.heroFamily,
+        )
+        .filter(Boolean),
+    ).toEqual(["split_media"]);
+
+    const frozen = referenceBlueprintV4ForFamily({
+      candidateId: "candidate-v4",
+      providerItemKey: "n:9281",
+      referencePreviewLocalAssetId: "00000000-0000-4000-8000-000000000041",
+      referencePreviewSha256: H("21st-reference"),
+      realizationPreviewLocalAssetId: "00000000-0000-4000-8000-000000000042",
+      realizationPreviewSha256: H("frontmind-realization"),
+      heroFamily: "split_media",
+      inspirationEvidenceId: H("reference-evidence"),
+      inspirationTaxonomy: taxonomy,
+      previewBlueprint: independentlyProjected[1],
+    });
+    expect(frozen).toMatchObject({
+      schemaVersion: 4,
+      referencePreviewSha256: H("21st-reference"),
+      previewSha256: H("frontmind-realization"),
+      inspirationTaxonomySha256: canonicalSiteOpsSha256(taxonomy),
+      styleSignature: visualStyleSignatureV4(independentlyProjected[1]!),
+      inspirationEvidenceIds: [H("reference-evidence")],
+    });
+    expect(referenceBlueprintV4Schema.parse(frozen)).toEqual(frozen);
+  });
+
+  it("includes every render-authoritative V4 coordinate in the style signature", () => {
+    const baseline = trustedVisualPreviewBlueprintV4("split_media");
+    const mutations = [
+      { palette: { ...baseline.palette, accent: "#702018" } },
+      { typeSystem: "display_sans" as const },
+      { alignment: "right" as const },
+      { mediaRegion: "surround" as const },
+      { navStyle: "floating" as const },
+      { ctaStyle: "text_link" as const },
+      { containerStyle: "contained" as const },
+      { cardStyle: "layered" as const },
+      { backgroundStyle: "dark" as const },
+      { gradientStyle: "mesh" as const },
+      { decorationStyle: "glow" as const },
+    ];
+    const signature = visualStyleSignatureV4(baseline);
+    for (const mutation of mutations) {
+      expect(visualStyleSignatureV4({ ...baseline, ...mutation })).not.toBe(
+        signature,
+      );
+    }
   });
 
   it("keeps pre-materialization plans distinct from final BuildContractV3", () => {
