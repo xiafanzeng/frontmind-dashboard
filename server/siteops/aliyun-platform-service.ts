@@ -22,6 +22,7 @@ import {
   encryptCredentialSecret,
   getApiKeyFingerprint,
 } from "../auth-service";
+import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
 
 export const ALIYUN_PLATFORM_UID = "1244409121609391";
@@ -89,7 +90,7 @@ export const aliyunBrokerCredentialInputSchema = z
     principalArn: z
       .string()
       .trim()
-      .regex(/^acs:ram::1244409121609391:(?:user|role)\/[A-Za-z0-9.@_-]+$/),
+      .regex(/^acs:ram::1244409121609391:user\/[A-Za-z0-9.@_-]+$/),
   })
   .strict();
 
@@ -362,6 +363,41 @@ export async function inspectAliyunOAuthConfiguration(
 
 export async function inspectAliyunBrokerCredential(
   credential: AliyunBrokerCredential,
+  getCallerIdentity: (
+    value: AliyunBrokerCredential,
+  ) => Promise<{
+    body?: { accountId?: string; arn?: string };
+  }> = requestAliyunBrokerCallerIdentity,
+) {
+  let response: { body?: { accountId?: string; arn?: string } };
+  try {
+    response = await getCallerIdentity(credential);
+  } catch (error) {
+    throwAliyunBrokerInspectionError(error, credential);
+  }
+  const accountId = response.body?.accountId;
+  const arn = response.body?.arn ?? null;
+  if (accountId !== ALIYUN_PLATFORM_UID) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "Broker 服务身份不属于 FrontMind 锁定阿里云账号",
+    );
+  }
+  if (!arn || arn.toLowerCase() !== credential.principalArn.toLowerCase()) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "Broker principal ARN 与阿里云返回身份不一致",
+    );
+  }
+  return {
+    ok: true as const,
+    accountId,
+    principalArn: credential.principalArn,
+  };
+}
+
+async function requestAliyunBrokerCallerIdentity(
+  credential: AliyunBrokerCredential,
 ) {
   const client = new Sts(
     new OpenApi.Config({
@@ -375,26 +411,121 @@ export async function inspectAliyunBrokerCredential(
       userAgent: "frontmind-siteops/2.1",
     }),
   );
-  const response = await client.getCallerIdentity();
-  const accountId = response.body?.accountId;
-  const arn = response.body?.arn ?? null;
-  if (accountId !== ALIYUN_PLATFORM_UID) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "Broker 服务身份不属于 FrontMind 锁定阿里云账号",
-    );
+  return client.getCallerIdentity();
+}
+
+type AliyunSdkErrorDetails = {
+  errorClass: string;
+  providerCode: string | null;
+  statusCode: number | null;
+  requestId: string | null;
+};
+
+function safeProviderCoordinate(value: unknown, maxLength = 160) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maxLength) return null;
+  return /^[A-Za-z0-9._:/-]+$/u.test(normalized) ? normalized : null;
+}
+
+export function aliyunSdkErrorDetails(error: unknown): AliyunSdkErrorDetails {
+  if (!error || typeof error !== "object") {
+    return {
+      errorClass: "UnknownError",
+      providerCode: null,
+      statusCode: null,
+      requestId: null,
+    };
   }
-  if (arn && arn.toLowerCase() !== credential.principalArn.toLowerCase()) {
-    throw new AuthServiceError(
-      "INVALID_CREDENTIAL",
-      "Broker principal ARN 与阿里云返回身份不一致",
-    );
-  }
-  return {
-    ok: true as const,
-    accountId,
-    principalArn: credential.principalArn,
+  const candidate = error as {
+    name?: unknown;
+    code?: unknown;
+    statusCode?: unknown;
+    data?: unknown;
   };
+  const data =
+    candidate.data && typeof candidate.data === "object"
+      ? (candidate.data as Record<string, unknown>)
+      : {};
+  const statusCandidate = candidate.statusCode ?? data.statusCode;
+  const statusCode =
+    typeof statusCandidate === "number" && Number.isInteger(statusCandidate)
+      ? statusCandidate
+      : typeof statusCandidate === "string" && /^\d{3}$/u.test(statusCandidate)
+        ? Number(statusCandidate)
+        : null;
+  return {
+    errorClass: safeProviderCoordinate(candidate.name) ?? "Error",
+    providerCode: safeProviderCoordinate(candidate.code),
+    statusCode,
+    requestId: safeProviderCoordinate(data.RequestId ?? data.requestId),
+  };
+}
+
+export function throwAliyunBrokerInspectionError(
+  error: unknown,
+  credential: AliyunBrokerCredential,
+): never {
+  if (error instanceof AuthServiceError) throw error;
+  const details = aliyunSdkErrorDetails(error);
+  console.error("[SiteOps Aliyun] broker_identity_check_failed", {
+    event: "siteops_aliyun_broker_identity_check_failed",
+    stage: "get_caller_identity",
+    ...details,
+    error: runtimeErrorForLog(error, {
+      additionalSecrets: [credential.accessKeyId, credential.accessKeySecret],
+    }),
+  });
+
+  const providerCode = details.providerCode ?? "";
+  if (/SignatureDoesNotMatch/iu.test(providerCode)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "AccessKey ID 与 AccessKey Secret 不匹配；请使用同一次创建时保存的一对值后重试。",
+    );
+  }
+  if (/InvalidAccessKeyId|InvalidCredentials/iu.test(providerCode)) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "AccessKey ID 不存在、已删除或已停用；请在 frontmind-siteops RAM 用户下重新创建 AccessKey 后重试。",
+    );
+  }
+  if (
+    /(?:AccessKey|User).*(?:Disabled|Inactive)|Forbidden\.(?:RAM|AccessKey|User)/iu.test(
+      providerCode,
+    ) ||
+    details.statusCode === 401 ||
+    details.statusCode === 403
+  ) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "frontmind-siteops RAM 用户或 AccessKey 已停用，无法通过阿里云身份验证。",
+    );
+  }
+  if (
+    details.statusCode === 429 ||
+    /^(?:Throttling.*|TooManyRequests)$/iu.test(providerCode)
+  ) {
+    throw new AuthServiceError(
+      "RATE_LIMITED",
+      "阿里云 STS 请求过于频繁，请稍后重试；现有平台配置未被覆盖。",
+    );
+  }
+  if (
+    (details.statusCode !== null && details.statusCode >= 500) ||
+    /^(?:ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|TimeoutError|UnretryableError)$/iu.test(
+      providerCode || details.errorClass,
+    )
+  ) {
+    throw new AuthServiceError(
+      "UPSTREAM_UNAVAILABLE",
+      "阿里云 STS 暂时不可用，请稍后重试；现有平台配置未被覆盖。",
+    );
+  }
+  throw new AuthServiceError(
+    "UPSTREAM_UNAVAILABLE",
+    "阿里云暂时无法验证 Broker 身份，请稍后重试；现有平台配置未被覆盖。",
+  );
 }
 
 async function replaceCredential<

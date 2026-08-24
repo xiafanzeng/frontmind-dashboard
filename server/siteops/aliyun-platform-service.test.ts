@@ -34,6 +34,7 @@ import {
   decryptAliyunPlatformCredential,
   encryptAliyunPlatformCredential,
   exchangeAliyunOAuthCode,
+  inspectAliyunBrokerCredential,
   inspectAliyunOAuthConfiguration,
   verifyAliyunOAuthState,
 } from "./aliyun-platform-service";
@@ -46,6 +47,12 @@ const oauthCredential = {
   clientSecret: "frontmind-oauth-client-secret",
   callbackUrl:
     "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
+};
+
+const brokerCredential = {
+  accessKeyId: "LTAI5frontmindtest",
+  accessKeySecret: "frontmind-test-access-key-secret",
+  principalArn: "acs:ram::1244409121609391:user/frontmind-siteops",
 };
 
 describe("Aliyun customer role permissions", () => {
@@ -170,25 +177,20 @@ describe("Aliyun platform credentials", () => {
 
   it("round-trips encrypted JSON without crossing broker and OAuth AAD slots", () => {
     const id = randomUUID();
-    const broker = {
-      accessKeyId: "LTAI5frontmindtest",
-      accessKeySecret: "frontmind-test-access-key-secret",
-      principalArn: "acs:ram::1244409121609391:user/frontmind-siteops",
-    };
     const sealed = encryptAliyunPlatformCredential(
       ALIYUN_BROKER_CREDENTIAL_SLOT,
       id,
-      broker,
+      brokerCredential,
     );
     expect(Object.values(sealed).join(" ")).not.toContain(
-      broker.accessKeySecret,
+      brokerCredential.accessKeySecret,
     );
     expect(
       decryptAliyunPlatformCredential(ALIYUN_BROKER_CREDENTIAL_SLOT, {
         id,
         ...sealed,
       }),
-    ).toEqual(broker);
+    ).toEqual(brokerCredential);
     expect(() =>
       decryptAliyunPlatformCredential(ALIYUN_OAUTH_CREDENTIAL_SLOT, {
         id,
@@ -203,6 +205,12 @@ describe("Aliyun platform credentials", () => {
         accessKeyId: "LTAI5frontmindtest",
         accessKeySecret: "frontmind-test-access-key-secret",
         principalArn: "acs:ram::999999999999:user/not-frontmind",
+      }),
+    ).toThrow();
+    expect(() =>
+      aliyunBrokerCredentialInputSchema.parse({
+        ...brokerCredential,
+        principalArn: "acs:ram::1244409121609391:role/FrontMindSiteOpsAccess",
       }),
     ).toThrow();
     expect(() =>
@@ -224,6 +232,129 @@ describe("Aliyun platform credentials", () => {
       "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
     );
   });
+
+  it("accepts only the exact broker account and RAM user ARN returned by STS", async () => {
+    await expect(
+      inspectAliyunBrokerCredential(brokerCredential, async () => ({
+        body: {
+          accountId: "1244409121609391",
+          arn: brokerCredential.principalArn,
+        },
+      })),
+    ).resolves.toEqual({
+      ok: true,
+      accountId: "1244409121609391",
+      principalArn: brokerCredential.principalArn,
+    });
+    await expect(
+      inspectAliyunBrokerCredential(brokerCredential, async () => ({
+        body: {
+          accountId: "9999999999999999",
+          arn: brokerCredential.principalArn,
+        },
+      })),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
+    await expect(
+      inspectAliyunBrokerCredential(brokerCredential, async () => ({
+        body: {
+          accountId: "1244409121609391",
+          arn: "acs:ram::1244409121609391:user/another-user",
+        },
+      })),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
+  });
+
+  it.each([
+    {
+      label: "AccessKey and secret mismatch",
+      error: {
+        name: "ResponseError",
+        code: "SignatureDoesNotMatch",
+        statusCode: 400,
+        data: { RequestId: "broker-request-1" },
+      },
+      expectedCode: "INVALID_CREDENTIAL",
+      expectedMessage: "不匹配",
+    },
+    {
+      label: "AccessKey missing",
+      error: {
+        name: "ResponseError",
+        code: "InvalidAccessKeyId.NotFound",
+        statusCode: 404,
+        data: { RequestId: "broker-request-2" },
+      },
+      expectedCode: "INVALID_CREDENTIAL",
+      expectedMessage: "不存在",
+    },
+    {
+      label: "AccessKey disabled",
+      error: {
+        name: "ResponseError",
+        code: "Forbidden.AccessKeyDisabled",
+        statusCode: 403,
+        data: { RequestId: "broker-request-3" },
+      },
+      expectedCode: "INVALID_CREDENTIAL",
+      expectedMessage: "已停用",
+    },
+    {
+      label: "STS throttled",
+      error: {
+        name: "ResponseError",
+        code: "Throttling.User",
+        statusCode: 429,
+        data: { RequestId: "broker-request-4" },
+      },
+      expectedCode: "RATE_LIMITED",
+      expectedMessage: "请求过于频繁",
+    },
+    {
+      label: "STS unavailable",
+      error: {
+        name: "ResponseError",
+        code: "ServiceUnavailable",
+        statusCode: 503,
+        data: { RequestId: "broker-request-5" },
+      },
+      expectedCode: "UPSTREAM_UNAVAILABLE",
+      expectedMessage: "暂时不可用",
+    },
+    {
+      label: "network retries exhausted",
+      error: {
+        name: "UnretryableError",
+        code: "UnretryableError",
+        data: {
+          lastRequest: {
+            headers: {
+              authorization: `Bearer ${brokerCredential.accessKeySecret}`,
+            },
+          },
+        },
+      },
+      expectedCode: "UPSTREAM_UNAVAILABLE",
+      expectedMessage: "暂时不可用",
+    },
+  ])(
+    "maps $label without exposing credentials",
+    async ({ error, expectedCode, expectedMessage }) => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      await expect(
+        inspectAliyunBrokerCredential(brokerCredential, async () => {
+          throw error;
+        }),
+      ).rejects.toMatchObject({
+        code: expectedCode,
+        message: expect.stringContaining(expectedMessage),
+      });
+      expect(log).toHaveBeenCalledTimes(1);
+      const serializedLog = JSON.stringify(log.mock.calls);
+      expect(serializedLog).not.toContain(brokerCredential.accessKeyId);
+      expect(serializedLog).not.toContain(brokerCredential.accessKeySecret);
+      expect(serializedLog.toLowerCase()).not.toContain("authorization");
+    },
+  );
 
   it("accepts only the locked official OIDC discovery contract", async () => {
     const fetchImpl = vi.fn(

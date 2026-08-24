@@ -1405,7 +1405,7 @@ export default function AdminPresales() {
                   <div>
                     <p className="text-sm font-medium">Broker RAM 身份</p>
                     <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                      使用 FrontMind 专用 RAM 用户或角色，不得填写主账号
+                      使用 FrontMind 专用 RAM 用户，不得填写主账号或 RAM 角色的
                       AccessKey。
                     </p>
                   </div>
