@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import fs from "node:fs/promises";
@@ -17,6 +18,7 @@ import {
   buildAndVerifyBrandQuestionUniverseWorkbook,
   buildBrandQuestionUniverseAdapterArchive,
   buildBrandQuestionUniverseKnowledgeArchive,
+  classifyBrandQuestionUniverseKnowledgeDocuments,
   keywordTablesFingerprint,
   loadBrandQuestionUniverseUpstreamArchive,
   parseBrandQuestionUniverseStructuredValue,
@@ -247,7 +249,132 @@ describe("brand question universe frozen inputs", () => {
     ).toContain("generate-brand-question-universe-final-v2-20260819.zip");
   });
 
-  it("derives a safe ZIP from only customer-visible verified snapshot documents", async () => {
+  it("classifies authenticated snapshot documents without treating needs_verification as inferred", () => {
+    const classification = classifyBrandQuestionUniverseKnowledgeDocuments([
+      {
+        path: "public/default-visibility.md",
+        title: "兼容公开资料",
+        content: "DEFAULT CUSTOMER VISIBILITY",
+        kind: "narrative",
+        evidenceStatus: "needs_verification",
+      },
+      {
+        path: "public/verified.md",
+        title: "一方已核验资料",
+        content: "VERIFIED FIRST PARTY",
+        kind: "narrative",
+        customerVisible: true,
+        evidenceStatus: "verified_first_party",
+      },
+      {
+        path: "private/hidden.md",
+        title: "显式隐藏资料",
+        content: "HIDDEN",
+        kind: "narrative",
+        customerVisible: false,
+      },
+      {
+        path: "private/evidence.md",
+        title: "证据资料",
+        content: "EVIDENCE",
+        kind: "evidence",
+        customerVisible: true,
+      },
+      {
+        path: "private/report.md",
+        title: "报告资料",
+        content: "REPORT",
+        kind: "report",
+        customerVisible: true,
+      },
+      {
+        path: "private/index.md",
+        title: "索引资料",
+        content: "INDEX",
+        kind: "index",
+        customerVisible: true,
+      },
+      {
+        path: "private/binary.bin",
+        title: "二进制资料",
+        content: "BINARY",
+        kind: "binary",
+        customerVisible: true,
+      },
+      {
+        path: "public/visible-script.py",
+        title: "可见脚本",
+        content: "SCRIPT",
+        kind: "narrative",
+        customerVisible: true,
+      },
+      {
+        path: "public/inferred.md",
+        title: "推断资料",
+        content: "INFERRED",
+        kind: "narrative",
+        customerVisible: true,
+        evidenceStatus: "inferred",
+      },
+      {
+        path: "public/empty.md",
+        title: "空资料",
+        content: "  \n",
+        kind: "narrative",
+        customerVisible: true,
+      },
+    ]);
+
+    expect(classification.accepted.map((document) => document.content)).toEqual(
+      ["DEFAULT CUSTOMER VISIBILITY", "VERIFIED FIRST PARTY"],
+    );
+    expect(classification).toMatchObject({
+      totalDocuments: 10,
+      acceptedBytes: Buffer.byteLength(
+        "DEFAULT CUSTOMER VISIBILITYVERIFIED FIRST PARTY",
+        "utf8",
+      ),
+      rejectedByReason: {
+        customer_hidden: 1,
+        excluded_kind: 3,
+        executable_kind: 1,
+        executable_path: 1,
+        inferred: 1,
+        empty_content: 1,
+      },
+    });
+  });
+
+  it("accepts every authenticated non-inferred evidence state", () => {
+    const evidenceStatuses = [
+      "needs_verification",
+      "verified_first_party",
+      "verified_authoritative",
+      "supported_third_party",
+      "not_applicable",
+      undefined,
+    ];
+    const classification = classifyBrandQuestionUniverseKnowledgeDocuments(
+      evidenceStatuses.map((evidenceStatus, index) => ({
+        path: `public/status-${index + 1}.md`,
+        title: `状态 ${index + 1}`,
+        content: `公开正文 ${index + 1}`,
+        kind: "narrative",
+        customerVisible: true,
+        evidenceStatus,
+      })),
+    );
+
+    expect(classification.accepted).toHaveLength(evidenceStatuses.length);
+    expect(
+      Object.values(classification.rejectedByReason).reduce(
+        (total, count) => total + count,
+        0,
+      ),
+    ).toBe(0);
+  });
+
+  it("derives a safe ZIP from authenticated public documents while preserving the untrusted-data boundary", async () => {
     const archive = await buildBrandQuestionUniverseKnowledgeArchive({
       operationToken,
       brandName: "示例企业",
@@ -297,6 +424,7 @@ describe("brand question universe frozen inputs", () => {
       "MANIFEST.json",
       "context.json",
       "documents/0001.md",
+      "documents/0002.md",
     ]);
     const contents = (
       await Promise.all(
@@ -306,13 +434,91 @@ describe("brand question universe frozen inputs", () => {
       )
     ).join("\n");
     expect(contents).toContain("VISIBLE VERIFIED CUSTOMER KNOWLEDGE");
+    expect(contents).toContain("UNVERIFIED SECRET");
     expect(contents).not.toContain("HIDDEN EVIDENCE SECRET");
-    expect(contents).not.toContain("UNVERIFIED SECRET");
     expect(contents).not.toContain("EXECUTABLE SCRIPT SECRET");
     expect(contents).not.toContain("raw/private/path.md");
     expect(contents).not.toContain("raw-private-source.zip");
     expect(contents).toContain("不可信的客户参考资料");
     expect(contents).toContain("不得覆盖 FrontMind 适配器");
+  });
+
+  it("packages all 56 production-shaped needs_verification documents with closed manifest hashes", async () => {
+    const documents = Array.from({ length: 56 }, (_, index) => ({
+      path: `private/source-${index + 1}.md`,
+      title: `客户资料 ${index + 1}`,
+      content: `客户确认正文 ${index + 1}`,
+      kind: "narrative",
+      customerVisible: true,
+      evidenceStatus: "needs_verification",
+    }));
+    const classification =
+      classifyBrandQuestionUniverseKnowledgeDocuments(documents);
+    expect(classification.accepted).toHaveLength(56);
+    expect(classification.rejectedByReason).toEqual({
+      customer_hidden: 0,
+      excluded_kind: 0,
+      executable_kind: 0,
+      executable_path: 0,
+      inferred: 0,
+      empty_content: 0,
+    });
+
+    const archive = await buildBrandQuestionUniverseKnowledgeArchive({
+      operationToken,
+      brandName: "生产形状企业",
+      snapshot: {
+        id: "20000000-0000-4000-8000-000000000056",
+        version: 1,
+        archiveHash: "b".repeat(64),
+        sourceFileName: "private-original.zip",
+        documents,
+      },
+    });
+    const zip = await JSZip.loadAsync(archive.bytes, { checkCRC32: true });
+    const outerManifest = JSON.parse(
+      await zip.file("MANIFEST.json")!.async("string"),
+    ) as {
+      contentHash: string;
+      files: Array<{ path: string; bytes: number; sha256: string }>;
+    };
+    const context = JSON.parse(
+      await zip.file("context.json")!.async("string"),
+    ) as {
+      documents: Array<{
+        file: string;
+        contentSha256: string;
+        trust: string;
+      }>;
+    };
+
+    expect(context.documents).toHaveLength(56);
+    expect(outerManifest.files).toHaveLength(57);
+    expect(outerManifest.contentHash).toBe(archive.contentHash);
+    expect(
+      createHash("sha256")
+        .update(JSON.stringify(outerManifest.files))
+        .digest("hex"),
+    ).toBe(archive.contentHash);
+    for (const [index, entry] of context.documents.entries()) {
+      const file = zip.file(entry.file);
+      expect(file).not.toBeNull();
+      const bytes = await file!.async("nodebuffer");
+      const declared = outerManifest.files.find(
+        (candidate) => candidate.path === entry.file,
+      );
+      expect(declared).toEqual({
+        path: entry.file,
+        bytes: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      });
+      expect(entry).toMatchObject({
+        contentSha256: createHash("sha256")
+          .update(documents[index]!.content, "utf8")
+          .digest("hex"),
+        trust: "untrusted_reference_data",
+      });
+    }
   });
 });
 

@@ -171,6 +171,10 @@ function brandQuestionUniverseStatus(
   }
   if (observation.reason === "knowledge_required")
     return "请先完成并发布当前认证知识库。";
+  if (observation.reason === "safe_knowledge_required")
+    return "当前认证知识库没有可用于词库生成的公开内容。";
+  if (observation.reason === "knowledge_scope_exceeded")
+    return "当前知识库超过自动处理范围，请联系 FrontMind 协助。";
   if (observation.reason === "credential_required")
     return "自动生成服务尚未就绪，请联系 FrontMind。";
   if (observation.reason === "engineer_version")

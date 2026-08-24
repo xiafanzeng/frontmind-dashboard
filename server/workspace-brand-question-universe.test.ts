@@ -23,6 +23,7 @@ vi.mock("./brand-question-universe-service", () => ({
 }));
 
 import { workspaceRouter } from "./workspace-router";
+import { BrandQuestionUniverseServiceError } from "./brand-question-universe-service";
 
 const now = new Date("2026-08-24T00:00:00.000Z");
 
@@ -90,4 +91,33 @@ describe("workspace brand question universe router", () => {
     ).rejects.toBeDefined();
     expect(mocks.startBrandQuestionUniverse).not.toHaveBeenCalled();
   });
+
+  it.each([
+    [
+      412,
+      "PRECONDITION_FAILED",
+      "当前认证知识库没有可用于词库生成的公开内容。",
+    ],
+    [503, "SERVICE_UNAVAILABLE", "品牌全域词库服务暂时不可用。"],
+    [500, "INTERNAL_SERVER_ERROR", "请求暂时无法完成，请稍后重试。"],
+  ] as const)(
+    "projects service status %s without exposing internal preparation errors",
+    async (statusCode, trpcCode, message) => {
+      mocks.startBrandQuestionUniverse.mockRejectedValueOnce(
+        new BrandQuestionUniverseServiceError(
+          "SAFE_PUBLIC_ERROR",
+          statusCode,
+          message,
+        ),
+      );
+      const caller = workspaceRouter.createCaller(context());
+      await expect(
+        caller.brandQuestionUniverse.start({
+          knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+          clientRequestId: "20000000-0000-4000-8000-000000000001",
+          expectedDashboardRevision: 9,
+        }),
+      ).rejects.toMatchObject({ code: trpcCode, message });
+    },
+  );
 });

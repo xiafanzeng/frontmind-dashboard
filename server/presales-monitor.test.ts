@@ -163,6 +163,32 @@ function resultResponse(
   };
 }
 
+function recoveringResult(
+  platform: MonitorPlatform,
+  completed: number,
+  failed: number,
+  status:
+    | "completed"
+    | "partial_completed"
+    | "processing" = "partial_completed",
+) {
+  const payload = resultResponse([platform]) as any;
+  payload.data.status = status;
+  payload.data.subTaskList.forEach((child: any, index: number) => {
+    if (index < completed) return;
+    child.answerContent = "";
+    delete child.time;
+    if (index < completed + failed) {
+      child.status = "failed";
+      child.errorMessage = "provider retrying";
+      return;
+    }
+    child.status = "processing";
+    delete child.errorMessage;
+  });
+  return payload;
+}
+
 class MemoryMonitorRepository implements MonitorRepository {
   readonly runs = new Map<string, PresalesMonitorRun>();
   readonly keyToRun = new Map<string, string>();
@@ -396,7 +422,28 @@ class MemoryMonitorRepository implements MonitorRepository {
     const run = this.runs.get(runId);
     if (
       !run ||
-      !["submitted", "polling"].includes(run.status) ||
+      !(
+        ["submitted", "polling"].includes(run.status) ||
+        (["completed", "partial_review_required", "remote_failed"].includes(
+          run.status,
+        ) &&
+          Boolean(run.upstreamTaskId) &&
+          Boolean(run.submittedAt) &&
+          Boolean(run.completedAt) &&
+          ["completed", "partial_completed"].includes(
+            String(run.remoteStatus || "").toLowerCase(),
+          ) &&
+          run.completedAt!.getTime() <
+            run.submittedAt!.getTime() + 6 * 60 * 60_000 &&
+          run.completedAt!.getTime() <= now.getTime() &&
+          ((run.checkpoint as any)?.items ?? []).length > 0 &&
+          ((run.checkpoint as any)?.items ?? []).filter(
+            (item: any) =>
+              item.status === "completed" &&
+              String(item.answerText || "").trim() &&
+              !item.error,
+          ).length < run.expectedItems)
+      ) ||
       !run.upstreamTaskId ||
       (run.nextPollAt && run.nextPollAt.getTime() > now.getTime()) ||
       (run.pollLeaseId &&
@@ -405,9 +452,19 @@ class MemoryMonitorRepository implements MonitorRepository {
     ) {
       return null;
     }
+    const reopening = !["submitted", "polling"].includes(run.status);
     const leaseId = `lease-${runId}`;
     const next = this.patch(runId, {
       status: "polling",
+      ...(reopening
+        ? {
+            finalResult: null,
+            completedAt: null,
+            lastError: null,
+            terminalSnapshotHash: null,
+            terminalStableCount: 0,
+          }
+        : {}),
       lastPollStartedAt: now,
       nextPollAt: new Date(now.getTime() + MONITOR_POLL_INTERVAL_MS),
       pollLeaseId: leaseId,
@@ -669,7 +726,7 @@ describe("presales monitor transport configuration", () => {
     });
   });
 
-  it("downloads only an official HTTPS screenshot with an image MIME", async () => {
+  it("downloads only exact domestic or overseas HTTPS screenshot hosts", async () => {
     const request = vi.fn(async (input: { url: string }) => ({
       status: 200,
       data: Buffer.from("image-bytes"),
@@ -687,6 +744,23 @@ describe("presales monitor transport configuration", () => {
     expect(request).toHaveBeenCalledWith(
       expect.objectContaining({ url, maxContentLength: 8 * 1024 * 1024 }),
     );
+
+    request.mockResolvedValueOnce({
+      status: 206,
+      data: Buffer.from("overseas-image-bytes"),
+      headers: { "content-type": "image/png" },
+      requestedUrl:
+        "https://aigeo-jp.oss-ap-northeast-1.aliyuncs.com/signed/answer.png?token=preserved",
+    });
+    const overseasUrl =
+      "https://aigeo-jp.oss-ap-northeast-1.aliyuncs.com/signed/answer.png?token=preserved";
+    await expect(transport.fetch(overseasUrl)).resolves.toEqual({
+      contentType: "image/png",
+      data: Buffer.from("overseas-image-bytes"),
+    });
+    expect(request).toHaveBeenLastCalledWith(
+      expect.objectContaining({ url: overseasUrl }),
+    );
   });
 
   it("rejects unsafe, redirected, oversized or non-image screenshots", async () => {
@@ -699,6 +773,26 @@ describe("presales monitor transport configuration", () => {
 
     await expect(
       transport.fetch("https://other.invalid/signed/render?id=1"),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
+    await expect(
+      transport.fetch(
+        "https://aigeo-jp.oss-ap-northeast-1.aliyuncs.com.evil.invalid/render?id=1",
+      ),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
+    await expect(
+      transport.fetch(
+        "https://another-bucket.oss-ap-northeast-1.aliyuncs.com/render?id=1",
+      ),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
+    await expect(
+      transport.fetch(
+        "https://user:password@aigeo-jp.oss-ap-northeast-1.aliyuncs.com/render?id=1",
+      ),
+    ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
+    await expect(
+      transport.fetch(
+        "http://aigeo-jp.oss-ap-northeast-1.aliyuncs.com/render?id=1",
+      ),
     ).rejects.toMatchObject({ code: "SCREENSHOT_NOT_AVAILABLE" });
     expect(request).not.toHaveBeenCalled();
 
@@ -2856,7 +2950,210 @@ describe("presales monitor polling and public result", () => {
     );
   });
 
-  it("requires two stable terminal snapshots before exposing partial results", async () => {
+  it("recovers failed child slots on the same task until all answers succeed", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create(createInput(["chatgpt"]));
+    harness.transport.statusValues = [
+      statusResponse(5, 3, 2, "partial_completed"),
+      statusResponse(5, 4, 0, "processing"),
+      statusResponse(5, 5, 0, "completed"),
+    ];
+    harness.transport.resultValues = [
+      recoveringResult("chatgpt", 3, 2),
+      recoveringResult("chatgpt", 4, 0, "processing"),
+      recoveringResult("chatgpt", 5, 0, "completed"),
+    ];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    await expect(
+      harness.service.result(created.run.runId),
+    ).resolves.toMatchObject({
+      status: "polling",
+      completedItems: 3,
+      failedItems: 2,
+    });
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    await expect(
+      harness.service.result(created.run.runId),
+    ).resolves.toMatchObject({
+      status: "polling",
+      completedItems: 4,
+      failedItems: 0,
+    });
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const completed = await harness.service.result(created.run.runId);
+    expect(completed).toMatchObject({
+      status: "completed",
+      completedItems: 5,
+      failedItems: 0,
+      complete: true,
+    });
+    expect(completed.records).toHaveLength(5);
+    expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("recovers a one-success four-failure snapshot without a second POST", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create(createInput(["chatgpt"]));
+    harness.transport.statusValues = [
+      statusResponse(5, 1, 4, "partial_completed"),
+      statusResponse(5, 5, 0, "completed"),
+    ];
+    harness.transport.resultValues = [
+      recoveringResult("chatgpt", 1, 4),
+      recoveringResult("chatgpt", 5, 0, "completed"),
+    ];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    expect((await harness.service.result(created.run.runId)).status).toBe(
+      "polling",
+    );
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    expect((await harness.service.result(created.run.runId)).status).toBe(
+      "completed",
+    );
+    expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("keeps completed answers monotonic while other failed slots recover", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create({
+      ...createInput(["chatgpt"]),
+      screenshot: 1,
+    });
+    const first = recoveringResult("chatgpt", 1, 4);
+    const second = recoveringResult("chatgpt", 2, 3);
+    second.data.subTaskList[0].status = "failed";
+    second.data.subTaskList[0].answerContent = "";
+    second.data.subTaskList[0].errorMessage = "late stale failure";
+    second.data.subTaskList[0].pageScreenshot =
+      "https://aigeo-jp.oss-ap-northeast-1.aliyuncs.com/signed/answer.png?token=late";
+    harness.transport.statusValues = [
+      statusResponse(5, 1, 4, "partial_completed"),
+      statusResponse(5, 1, 4, "partial_completed"),
+    ];
+    harness.transport.resultValues = [first, second];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    await harness.service.result(created.run.runId);
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    const recovering = await harness.service.result(created.run.runId);
+
+    expect(recovering).toMatchObject({
+      status: "polling",
+      completedItems: 2,
+      failedItems: 3,
+    });
+    expect(recovering.records?.[0]).toMatchObject({
+      status: "completed",
+      answerText: "第 1 次纯文字答案",
+      screenshot: { available: true },
+    });
+    expect(recovering.records?.[0]).not.toHaveProperty("error");
+  });
+
+  it("reconciles one prematurely terminal historical run without resubmitting", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create(createInput(["chatgpt"]));
+    harness.transport.statusValues = [
+      statusResponse(5, 3, 2, "partial_completed"),
+      statusResponse(5, 5, 0, "completed"),
+    ];
+    harness.transport.resultValues = [
+      recoveringResult("chatgpt", 3, 2),
+      recoveringResult("chatgpt", 5, 0, "completed"),
+    ];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    await harness.service.result(created.run.runId);
+    const frozen = harness.repository.runs.get(created.run.runId)!;
+    Object.assign(frozen, {
+      status: "completed",
+      remoteStatus: "partial_completed",
+      completedAt: new Date(frozen.submittedAt!.getTime() + 30_000),
+      finalResult: { complete: false, partial: true, records: [] },
+      terminalSnapshotHash: "a".repeat(64),
+      terminalStableCount: 2,
+      lastError: "stale terminal error",
+    });
+    harness.advance(6 * 60 * 60_000);
+
+    const recovered = await harness.service.result(created.run.runId);
+    expect(recovered).toMatchObject({
+      status: "completed",
+      completedItems: 5,
+      failedItems: 0,
+    });
+    expect(harness.transport.submitCalls).toBe(1);
+    expect(harness.transport.statusCalls).toBe(2);
+
+    await harness.service.result(created.run.runId);
+    expect(harness.transport.statusCalls).toBe(2);
+  });
+
+  it("does not reopen a historical terminal after its credential version changes", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create(createInput(["chatgpt"]));
+    harness.transport.statusValues = [
+      statusResponse(5, 3, 2, "partial_completed"),
+    ];
+    harness.transport.resultValues = [recoveringResult("chatgpt", 3, 2)];
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    await harness.service.result(created.run.runId);
+    const frozen = harness.repository.runs.get(created.run.runId)!;
+    const frozenResult = { complete: false, partial: true, records: [] };
+    Object.assign(frozen, {
+      status: "completed",
+      remoteStatus: "partial_completed",
+      completedAt: new Date(frozen.submittedAt!.getTime() + 30_000),
+      finalResult: frozenResult,
+    });
+    const rotatedCredential = { ...credential, version: 2 };
+    const recoveryService = new PresalesMonitorService(
+      harness.repository,
+      harness.transport,
+      async () => rotatedCredential,
+      async () => rotatedCredential,
+      () => new Date("2026-01-01T07:00:00Z"),
+    );
+
+    const unchanged = await recoveryService.result(created.run.runId);
+
+    expect(unchanged.status).toBe("completed");
+    expect(harness.repository.runs.get(created.run.runId)?.finalResult).toBe(
+      frozenResult,
+    );
+    expect(harness.transport.statusCalls).toBe(1);
+    expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("does not reopen an explicitly stopped provider task", async () => {
+    const harness = makeHarness(["chatgpt"]);
+    const created = await harness.service.create(createInput(["chatgpt"]));
+    harness.transport.statusValues = [
+      statusResponse(5, 3, 2, "stopped"),
+      statusResponse(5, 3, 2, "stopped"),
+    ];
+    const stopped = recoveringResult("chatgpt", 3, 2);
+    stopped.data.status = "stopped";
+    harness.transport.resultValues = [stopped, stopped];
+
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    expect((await harness.service.result(created.run.runId)).status).toBe(
+      "polling",
+    );
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    expect((await harness.service.result(created.run.runId)).status).toBe(
+      "partial_review_required",
+    );
+    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    await harness.service.result(created.run.runId);
+
+    expect(harness.transport.statusCalls).toBe(2);
+    expect(harness.transport.submitCalls).toBe(1);
+  });
+
+  it("keeps a soft terminal polling until the recovery window expires", async () => {
     const harness = makeHarness(["deepseek"]);
     const created = await harness.service.create(createInput());
     harness.transport.statusValues = [
@@ -2872,10 +3169,16 @@ describe("presales monitor polling and public result", () => {
     expect(first.status).toBe("polling");
     expect(first.complete).toBe(false);
     expect(first.records).toHaveLength(4);
-    harness.advance(MONITOR_POLL_INTERVAL_MS);
+    harness.advance(6 * 60 * 60_000);
     const second = await harness.service.result(created.run.runId);
     expect(second.status).toBe("partial_review_required");
-    expect(second.records).toHaveLength(4);
+    expect(second).toMatchObject({ completedItems: 4, failedItems: 1 });
+    expect(second.records).toHaveLength(5);
+    expect(second.records?.[4]).toMatchObject({
+      status: "failed",
+      error: "自动补采窗口内未返回有效回答",
+    });
+    expect(second.records?.[4]).not.toHaveProperty("answerText");
   });
 });
 

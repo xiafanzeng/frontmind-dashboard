@@ -632,6 +632,59 @@ export function siteBriefFromSnapshot(
   });
 }
 
+export type VisualSearchReadiness =
+  | { ready: true; brief: SiteBrief }
+  | {
+      ready: false;
+      reason: "invalid_brief" | "no_public_facts" | "source_contract_mismatch";
+      routeId?: string;
+    };
+
+/**
+ * Validates the frozen SiteBrief immediately before visual-search reservation.
+ * Company news is the only always-addressable collection with a legal empty
+ * state: /news may have no sources only when the frozen inventory itself has
+ * no company_news entry. Every other route remains source-bound.
+ */
+export function visualSearchReadiness(value: unknown): VisualSearchReadiness {
+  const parsed = siteBriefSchema.safeParse(value);
+  if (!parsed.success) {
+    return { ready: false, reason: "invalid_brief" };
+  }
+  if (parsed.data.verifiedFacts.length === 0) {
+    return { ready: false, reason: "no_public_facts" };
+  }
+
+  const hasCompanyNews = parsed.data.contentInventory.entries.some(
+    (entry) => entry.kind === "company_news",
+  );
+  if (
+    hasCompanyNews &&
+    !parsed.data.routes.some(
+      (route) => route.id === "news" && route.sourceDocumentIds.length > 0,
+    )
+  ) {
+    return {
+      ready: false,
+      reason: "source_contract_mismatch",
+      routeId: "news",
+    };
+  }
+  const invalidRoute = parsed.data.routes.find((route) => {
+    if (route.sourceDocumentIds.length > 0) return false;
+    return !(route.id === "news" && route.slug === "/news" && !hasCompanyNews);
+  });
+  if (invalidRoute) {
+    return {
+      ready: false,
+      reason: "source_contract_mismatch",
+      routeId: invalidRoute.id,
+    };
+  }
+
+  return { ready: true, brief: parsed.data };
+}
+
 function mergeCustomerBriefMessage(brief: SiteBrief, text: string): SiteBrief {
   const normalized = text.replace(/\r\n?/gu, "\n").trim();
   const nextContacts = [...brief.contacts];
@@ -3472,15 +3525,22 @@ async function handleVisualSearch(
       409,
     );
   }
-  const brief = siteBriefSchema.safeParse(input.project.brief);
-  if (
-    !brief.success ||
-    brief.data.verifiedFacts.length === 0 ||
-    brief.data.routes.some((route) => route.sourceDocumentIds.length === 0)
-  ) {
+  const readiness = visualSearchReadiness(input.project.brief);
+  if (!readiness.ready) {
+    if (readiness.reason !== "no_public_facts") {
+      console.error("[SiteOps] visual_search_readiness_failed", {
+        event: "siteops_visual_search_readiness_failed",
+        projectId: input.project.id,
+        projectRevision: input.project.revision,
+        reason: readiness.reason,
+        routeId: readiness.routeId ?? null,
+      });
+    }
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "当前知识库没有足够的可公开事实与来源，需先补齐知识库后再检索视觉方向。",
+      readiness.reason === "no_public_facts"
+        ? "当前知识库没有足够的可公开事实与来源，需先补齐知识库后再检索视觉方向。"
+        : "FrontMind暂时无法整理建站资料，请刷新后重试。",
       409,
     );
   }
