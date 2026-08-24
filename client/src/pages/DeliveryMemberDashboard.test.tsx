@@ -819,6 +819,45 @@ describe("DeliveryMemberDashboard project context", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("lets staff approve a second reset request on the same rebuild ticket", () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+          userId: 101,
+          customerName: "示例客户",
+          customerUsername: "example.customer",
+          title: "重新制作官网",
+          operation: "site_rebuild",
+          status: "submitted",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+          revision: 9,
+          siteRebuildResetApplied: true,
+        },
+      ],
+      filters: {
+        customers: [
+          { id: 101, name: "示例客户", username: "example.customer" },
+        ],
+      },
+      counts: { pending: 1, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    expect(
+      screen.getByRole("button", { name: "通过重置需求" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("重置需求已通过")).not.toBeInTheDocument();
+  });
+
   it.each([
     [false, "当前需求状态：待通过重置。"],
     [true, "当前需求状态：重置已通过，等待客户制作新版本。"],

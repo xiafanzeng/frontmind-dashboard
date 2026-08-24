@@ -425,12 +425,7 @@ export default function SiteOpsConversationPanel({
   }
 
   async function requestRebuild() {
-    if (
-      !onAction ||
-      busyAction ||
-      !latestBuild ||
-      !observation?.rebuildRequest.allowed
-    ) {
+    if (!onAction || busyAction || !observation?.rebuildRequest.allowed) {
       return;
     }
     setBusyAction("request_rebuild");
@@ -686,8 +681,18 @@ export default function SiteOpsConversationPanel({
         observation.rebuildRequest.status,
       ),
   );
+  const rebuildRequestPending = Boolean(
+    rebuildRequestActive && !observation.rebuildRequest.allowed,
+  );
+  const rebuildRequestLabel = rebuildRequestPending
+    ? "重制需求处理中"
+    : rebuildRequestActive && observation.rebuildRequest.resetApplied
+      ? "再次提交官网重制需求"
+      : "提交官网重制需求";
   const hideExistingBuildDuringActiveRebuild = Boolean(
-    rebuildRequestActive && observation.rebuildRequest.resetApplied,
+    rebuildRequestActive &&
+      observation.rebuildRequest.resetApplied &&
+      latestBuild?.id === observation.rebuildRequest.resetSourceBuildId,
   );
   const rebuildInProgress = observation.rebuildRequest.status === "in_progress";
   const rebuildNeedsKnowledgeSnapshot = Boolean(
@@ -727,29 +732,24 @@ export default function SiteOpsConversationPanel({
                 />
               </button>
             )}
-            {hasSuccessfulBuild ? (
-              !hideExistingBuildDuringActiveRebuild && (
-                <button
-                  type="button"
-                  className="siteops-icon-button"
-                  aria-label="提交官网重制需求"
-                  disabled={Boolean(
-                    busyAction ||
-                      rebuildRequestActive ||
-                      !observation.rebuildRequest.allowed,
-                  )}
-                  title={
-                    rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"
-                  }
-                  onClick={() => {
-                    setRebuildError(null);
-                    setRebuildDialogOpen(true);
-                  }}
-                >
-                  <Wrench size={17} aria-hidden="true" />
-                </button>
-              )
-            ) : (
+            {(observation.rebuildRequest.allowed || rebuildRequestActive) && (
+              <button
+                type="button"
+                className="siteops-icon-button"
+                aria-label={rebuildRequestLabel}
+                disabled={Boolean(
+                  busyAction || !observation.rebuildRequest.allowed,
+                )}
+                title={rebuildRequestLabel}
+                onClick={() => {
+                  setRebuildError(null);
+                  setRebuildDialogOpen(true);
+                }}
+              >
+                <Wrench size={17} aria-hidden="true" />
+              </button>
+            )}
+            {!hasSuccessfulBuild && (
               <button
                 type="button"
                 className="siteops-icon-button siteops-reset-button"
@@ -843,10 +843,10 @@ export default function SiteOpsConversationPanel({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>提交官网重制需求</AlertDialogTitle>
+            <AlertDialogTitle>{rebuildRequestLabel}</AlertDialogTitle>
             <AlertDialogDescription>
               提交后将由 FrontMind
-              人工受理。受理前不会改动当前官网，也不会创建新任务或扣减额度。
+              人工受理。受理前不会改动当前官网或中断当前制作，也不会创建新任务或扣减额度。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <label className="siteops-rebuild-reason">
@@ -1331,9 +1331,7 @@ export default function SiteOpsConversationPanel({
                 type="button"
                 className="siteops-secondary-button"
                 disabled={Boolean(
-                  busyAction ||
-                    rebuildRequestActive ||
-                    !observation.rebuildRequest.allowed,
+                  busyAction || !observation.rebuildRequest.allowed,
                 )}
                 onClick={() => {
                   setRebuildError(null);
@@ -1341,7 +1339,7 @@ export default function SiteOpsConversationPanel({
                 }}
               >
                 <Wrench size={15} aria-hidden="true" />
-                {rebuildRequestActive ? "重制需求处理中" : "提交官网重制需求"}
+                {rebuildRequestLabel}
               </button>
             )}
             {["preview_ready", "approved"].includes(latestBuild.status) && (

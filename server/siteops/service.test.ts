@@ -79,23 +79,12 @@ describe("SiteOps core contracts", () => {
   it("requires an accepted rebuild ticket for every child-build admission", () => {
     expect(() =>
       requireAcceptedSiteOpsRebuild({
-        status: "submitted",
-        resetApplied: false,
-      }),
-    ).toThrowError(SiteOpsServiceError);
-    expect(() =>
-      requireAcceptedSiteOpsRebuild({ status: null, resetApplied: false }),
-    ).toThrowError(SiteOpsServiceError);
-    expect(() =>
-      requireAcceptedSiteOpsRebuild({
-        status: "in_progress",
-        resetApplied: false,
+        acceptedForCurrentCycle: false,
       }),
     ).toThrowError(SiteOpsServiceError);
     expect(() =>
       requireAcceptedSiteOpsRebuild({
-        status: "in_progress",
-        resetApplied: true,
+        acceptedForCurrentCycle: true,
       }),
     ).not.toThrow();
   });

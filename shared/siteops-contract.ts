@@ -354,6 +354,7 @@ export const siteOpsObservationV1Schema = z
           ])
           .nullable(),
         resetApplied: z.boolean(),
+        resetSourceBuildId: z.string().uuid().nullable(),
       })
       .strict(),
     interactionState: siteOpsInteractionStateSchema,

@@ -276,6 +276,8 @@ beforeEach(() => {
     ticketId: null,
     status: null,
     resetApplied: false,
+    resetSourceBuildId: null,
+    acceptedForCurrentCycle: false,
   });
   dependencies.getServicePortal.mockClear();
 });
@@ -317,6 +319,8 @@ describe("SiteOps accepted rebuild visual selection", () => {
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "in_progress",
       resetApplied: true,
+      resetSourceBuildId: fixture.project.currentBuildId,
+      acceptedForCurrentCycle: true,
     });
 
     await actOnSiteOps(
@@ -374,6 +378,8 @@ describe("SiteOps accepted rebuild visual selection", () => {
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "submitted",
       resetApplied: false,
+      resetSourceBuildId: fixture.project.currentBuildId,
+      acceptedForCurrentCycle: false,
     });
 
     await expect(
@@ -396,6 +402,33 @@ describe("SiteOps accepted rebuild visual selection", () => {
     ).toBe(false);
   });
 
+  it("keeps the accepted rebuild cycle usable while a second reset request is submitted", async () => {
+    const fixture = serviceDatabaseFixture();
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    dependencies.loadRebuild.mockResolvedValue({
+      allowed: false,
+      ticketId: "46000000-0000-4000-8000-000000000004",
+      status: "submitted",
+      resetApplied: true,
+      resetSourceBuildId: fixture.project.currentBuildId,
+      acceptedForCurrentCycle: true,
+    });
+
+    await actOnSiteOps(
+      actor as never,
+      selectVisualInput(fixture.project.revision, fixture.sample.id),
+    );
+
+    expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
+    expect(
+      fixture.inserts.some(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "build_revision",
+      ),
+    ).toBe(true);
+  });
+
   it("does not trust a legacy in-progress rebuild until the reset marker exists", async () => {
     const fixture = serviceDatabaseFixture();
     dependencies.getDb.mockResolvedValue(fixture.db);
@@ -404,6 +437,8 @@ describe("SiteOps accepted rebuild visual selection", () => {
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "in_progress",
       resetApplied: false,
+      resetSourceBuildId: fixture.project.currentBuildId,
+      acceptedForCurrentCycle: false,
     });
 
     await expect(

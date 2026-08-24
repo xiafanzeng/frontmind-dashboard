@@ -13,8 +13,14 @@ import {
 import {
   approveSiteOpsRebuildTicket,
   siteOpsRebuildBuildId,
+  siteOpsRebuildAcceptedForCurrentCycle,
   siteOpsRebuildDeliveryClientRequestId,
   siteOpsRebuildDedupeKey,
+  siteOpsRebuildProjectDedupeKey,
+  siteOpsRebuildProjectId,
+  siteOpsRebuildProjectTargetPage,
+  siteOpsRebuildRequestDisposition,
+  siteOpsRebuildResubmissionProjection,
   siteOpsRebuildResetApplied,
   siteOpsRebuildTargetPage,
   SiteOpsRebuildTicketError,
@@ -37,6 +43,89 @@ describe("SiteOps rebuild ticket coordinates", () => {
       null,
     );
     expect(siteOpsRebuildBuildId("/siteops/builds/not-a-uuid")).toBe(null);
+  });
+
+  it("binds an any-stage reset request to the project before a build exists", () => {
+    const projectId = "20000000-0000-4000-8000-000000000002";
+    expect(siteOpsRebuildProjectDedupeKey(projectId)).toBe(
+      `site-rebuild-project:${projectId}`,
+    );
+    expect(
+      siteOpsRebuildProjectId(siteOpsRebuildProjectTargetPage(projectId)),
+    ).toBe(projectId);
+    expect(siteOpsRebuildProjectId("/siteops/projects/not-a-uuid")).toBeNull();
+  });
+
+  it.each([
+    [true, null, false, "create"],
+    [true, "submitted", false, "pending"],
+    [true, "in_progress", true, "resubmit"],
+    [false, null, false, "unavailable"],
+  ] as const)(
+    "projects requestability without interrupting the workflow (%s, %s, %s)",
+    (hasWorkflowProgress, ticketStatus, resetApplied, expected) => {
+      expect(
+        siteOpsRebuildRequestDisposition({
+          hasWorkflowProgress,
+          ticketStatus,
+          resetApplied,
+        }),
+      ).toBe(expected);
+    },
+  );
+
+  it("keeps a prior reset authorization valid only until its replacement becomes current", () => {
+    const sourceBuildId = "30000000-0000-4000-8000-000000000003";
+    const internalNote = JSON.stringify({
+      schemaVersion: 3,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId: "20000000-0000-4000-8000-000000000002",
+      sourceBuildId,
+      knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      resetAppliedAt: "2026-08-24T08:00:00.000Z",
+      resetAppliedProjectRevision: 12,
+    });
+
+    expect(
+      siteOpsRebuildAcceptedForCurrentCycle({
+        internalNote,
+        currentBuildId: sourceBuildId,
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsRebuildAcceptedForCurrentCycle({
+        internalNote,
+        currentBuildId: "50000000-0000-4000-8000-000000000005",
+      }),
+    ).toBe(false);
+  });
+
+  it("upgrades a production-shaped V2 build ticket to a stable project coordinate on resubmission", () => {
+    const projectId = "20000000-0000-4000-8000-000000000002";
+    const sourceBuildId = "30000000-0000-4000-8000-000000000003";
+    const projection = siteOpsRebuildResubmissionProjection({
+      projectId,
+      internalNote: JSON.stringify({
+        schemaVersion: 2,
+        kind: "frontmind.siteops-rebuild.v1",
+        projectId,
+        sourceBuildId,
+        knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+        resetAppliedAt: "2026-08-24T08:00:00.000Z",
+        resetAppliedProjectRevision: 12,
+      }),
+    });
+
+    expect(projection).toMatchObject({
+      targetPage: `/siteops/projects/${projectId}`,
+      technicalDedupeKey: `site-rebuild-project:${projectId}`,
+    });
+    expect(JSON.parse(projection!.internalNote)).toMatchObject({
+      schemaVersion: 3,
+      projectId,
+      sourceBuildId,
+      resetAppliedProjectRevision: 12,
+    });
   });
 
   it("maps every accepted SiteOps request id to one deterministic delivery UUID", () => {
@@ -97,6 +186,9 @@ function rebuildNoteV1() {
 function fixture(options?: {
   activeOperation?: boolean;
   internalNote?: string;
+  projectOverrides?: Record<string, unknown>;
+  targetPage?: string;
+  ticketStatus?: string;
 }) {
   const project = {
     id: projectId,
@@ -109,6 +201,7 @@ function fixture(options?: {
     brief: { companyName: "FrontMind" },
     status: "approved",
     revision: 12,
+    ...options?.projectOverrides,
   };
   const build = {
     id: buildId,
@@ -126,8 +219,9 @@ function fixture(options?: {
     id: ticketId,
     userId: 9,
     operation: "site_rebuild",
-    targetPage: `/siteops/builds/${buildId}`,
+    targetPage: options?.targetPage ?? `/siteops/builds/${buildId}`,
     internalNote: options?.internalNote ?? rebuildNoteV1(),
+    status: options?.ticketStatus ?? "submitted",
   } as any;
   const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
@@ -262,6 +356,81 @@ describe("site rebuild reset approval", () => {
     });
     expect(replay.updates).toHaveLength(0);
     expect(replay.inserts).toHaveLength(0);
+  });
+
+  it("approves a project-scoped request before any build exists", async () => {
+    const projectNote = JSON.stringify({
+      schemaVersion: 3,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: null,
+      knowledgeSnapshotId: snapshotId,
+    });
+    const state = fixture({
+      internalNote: projectNote,
+      targetPage: `/siteops/projects/${projectId}`,
+      projectOverrides: {
+        currentBuildId: null,
+        status: "awaiting_visual_selection",
+      },
+    });
+
+    const result = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:30:00.000Z"),
+    });
+
+    expect(result).toMatchObject({
+      projectId,
+      sourceBuildId: null,
+      resetApplied: true,
+      resetAppliedProjectRevision: 13,
+    });
+    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
+    expect(state.project).toMatchObject({
+      currentBuildId: null,
+      currentKnowledgeSnapshotId: null,
+      status: "draft",
+      revision: 13,
+    });
+  });
+
+  it("reapplies an approved project reset after the customer requests again", async () => {
+    const first = fixture({
+      internalNote: JSON.stringify({
+        schemaVersion: 3,
+        kind: "frontmind.siteops-rebuild.v1",
+        projectId,
+        sourceBuildId: buildId,
+        knowledgeSnapshotId: snapshotId,
+      }),
+      targetPage: `/siteops/projects/${projectId}`,
+    });
+    const marker = await approveSiteOpsRebuildTicket(first.tx, {
+      ticket: first.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+    const repeated = fixture({
+      internalNote: marker!.internalNote,
+      targetPage: `/siteops/projects/${projectId}`,
+      ticketStatus: "submitted",
+    });
+
+    await expect(
+      approveSiteOpsRebuildTicket(repeated.tx, {
+        ticket: repeated.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T09:00:00.000Z"),
+        reapply: true,
+      }),
+    ).resolves.toMatchObject({
+      resetApplied: true,
+      resetAppliedProjectRevision: 13,
+    });
+    expect(repeated.updates.length).toBeGreaterThan(0);
+    expect(repeated.inserts).toHaveLength(1);
   });
 
   it("does not hide messages or clear the snapshot while an operation is active", async () => {

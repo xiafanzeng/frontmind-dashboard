@@ -92,6 +92,7 @@ function observation(
       ticketId: null,
       status: null,
       resetApplied: false,
+      resetSourceBuildId: null,
     },
     interactionState: "awaiting_visual_selection",
     latestSequence: 1,
@@ -797,6 +798,7 @@ describe("SiteOpsConversationPanel", () => {
             ticketId: null,
             status: null,
             resetApplied: false,
+            resetSourceBuildId: null,
           },
           interactionState: "failed",
         })}
@@ -877,6 +879,7 @@ describe("SiteOpsConversationPanel", () => {
             ticketId: null,
             status: null,
             resetApplied: false,
+            resetSourceBuildId: null,
           },
         })}
         onAction={onAction}
@@ -924,10 +927,11 @@ describe("SiteOpsConversationPanel", () => {
             },
           ],
           rebuildRequest: {
-            allowed: false,
+            allowed: true,
             ticketId: "77777777-7777-4777-8777-777777777777",
             status: "in_progress",
             resetApplied: true,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
           },
           interactionState: "select_snapshot",
         })}
@@ -950,8 +954,8 @@ describe("SiteOpsConversationPanel", () => {
       screen.queryByRole("link", { name: "下载网站源码" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "提交官网重制需求" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "再次提交官网重制需求" }),
+    ).toBeEnabled();
     expect(screen.queryByText("重制需求处理中")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", {
@@ -959,6 +963,81 @@ describe("SiteOpsConversationPanel", () => {
       }),
     ).not.toBeInTheDocument();
     expect(screen.queryByText("继续对话")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    "visual_searching",
+    "awaiting_visual_selection",
+    "building",
+  ] as const)(
+    "allows a reset request while the first workflow is %s",
+    (status) => {
+      render(
+        <SiteOpsConversationPanel
+          observation={observation({
+            project: { ...observation().project, status },
+            builds:
+              status === "building"
+                ? [
+                    {
+                      id: "33333333-3333-4333-8333-333333333333",
+                      ordinal: 1,
+                      parentBuildId: null,
+                      status: "building",
+                      previewUrl: null,
+                      sourceUrl: null,
+                      needsHelp: false,
+                      createdAt: "2026-08-22T00:00:00.000Z",
+                      updatedAt: "2026-08-22T00:01:00.000Z",
+                    },
+                  ]
+                : [],
+            interactionState: status,
+            rebuildRequest: {
+              allowed: true,
+              ticketId: null,
+              status: null,
+              resetApplied: false,
+              resetSourceBuildId: null,
+            },
+          })}
+          onAction={vi.fn()}
+        />,
+      );
+
+      expect(
+        screen.getByRole("button", { name: "提交官网重制需求" }),
+      ).toBeEnabled();
+    },
+  );
+
+  it("submits a reset request before a completed website exists", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: false,
+            resetSourceBuildId: null,
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "提交官网重制需求" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交需求" }));
+
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "request_rebuild",
+        input: {},
+      }),
+    );
   });
 
   it("keeps the existing website visible before a submitted rebuild is approved", () => {
@@ -986,6 +1065,7 @@ describe("SiteOpsConversationPanel", () => {
             ticketId: "77777777-7777-4777-8777-777777777777",
             status: "submitted",
             resetApplied: false,
+            resetSourceBuildId: null,
           },
           interactionState: "live",
         })}
@@ -1005,9 +1085,68 @@ describe("SiteOpsConversationPanel", () => {
         name: "发布博客与行业近况（即将上线）",
       }),
     ).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重制需求处理中" })).toEqual(
+      expect.arrayContaining([expect.any(HTMLButtonElement)]),
+    );
     expect(
-      screen.getByRole("button", { name: "重制需求处理中" }),
-    ).toBeDisabled();
+      screen
+        .getAllByRole("button", { name: "重制需求处理中" })
+        .every((button) => button.hasAttribute("disabled")),
+    ).toBe(true);
+  });
+
+  it("keeps a newly completed replacement visible while a second reset request awaits approval", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "approved" },
+          builds: [
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              ordinal: 2,
+              parentBuildId: null,
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-22T00:00:00.000Z",
+              updatedAt: "2026-08-22T00:01:00.000Z",
+            },
+            {
+              id: "44444444-4444-4444-8444-444444444444",
+              ordinal: 3,
+              parentBuildId: "33333333-3333-4333-8333-333333333333",
+              status: "approved",
+              previewUrl:
+                "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/preview/",
+              sourceUrl:
+                "/api/site-ops/builds/44444444-4444-4444-8444-444444444444/source",
+              needsHelp: false,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          rebuildRequest: {
+            allowed: false,
+            ticketId: "77777777-7777-4777-8777-777777777777",
+            status: "submitted",
+            resetApplied: true,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
+          },
+          interactionState: "approved",
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("官网版本 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重制需求处理中" })).toEqual(
+      expect.arrayContaining([expect.any(HTMLButtonElement)]),
+    );
   });
 
   it("restores the completed replacement website after the rebuild ticket completes", () => {
@@ -1047,6 +1186,7 @@ describe("SiteOpsConversationPanel", () => {
             ticketId: "77777777-7777-4777-8777-777777777777",
             status: "completed",
             resetApplied: true,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
           },
           interactionState: "approved",
         })}
@@ -1101,6 +1241,7 @@ describe("SiteOpsConversationPanel", () => {
               ticketId: "77777777-7777-4777-8777-777777777777",
               status: "in_progress",
               resetApplied: true,
+              resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
             },
             interactionState,
           })}

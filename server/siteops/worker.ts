@@ -668,6 +668,7 @@ async function finalize(
         .limit(1);
       await completeSiteOpsRebuildTicket(tx, {
         userId: locked.userId,
+        projectId: locked.projectId,
         parentBuildId: completedBuildRows[0]?.parentBuildId ?? null,
         childBuildId: locked.buildId,
         now,

@@ -1442,7 +1442,8 @@ function CustomerWorkbenchView({
           </CardTitle>
           <p className="text-sm text-muted-foreground">
             {focusedTicket.operation === "site_rebuild"
-              ? focusedTicket.siteRebuildResetApplied === true
+              ? focusedTicket.siteRebuildResetApplied === true &&
+                focusedTicket.status === "in_progress"
                 ? "当前需求状态：重置已通过，等待客户制作新版本。"
                 : "当前需求状态：待通过重置。"
               : "当前需求状态：待处理。请在本客户看板内完成处理。"}
@@ -2438,7 +2439,10 @@ function DeliveryTicketActions({
   };
 
   if (operation === "site_rebuild") {
-    if (ticket.siteRebuildResetApplied === true) {
+    if (
+      ticket.siteRebuildResetApplied === true &&
+      ticket.status === "in_progress"
+    ) {
       return (
         <div className="mt-3 rounded-xl border bg-muted/25 px-4 py-3 text-sm leading-6">
           <strong>重置需求已通过</strong>

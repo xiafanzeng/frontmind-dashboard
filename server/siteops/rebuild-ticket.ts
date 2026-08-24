@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNotNull, isNull, max } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, max, or } from "drizzle-orm";
 import {
   deliveryProjectAssignments,
   deliveryTicketEvents,
@@ -17,6 +17,7 @@ import {
 } from "../../drizzle/schema";
 
 const REBUILD_TARGET_PREFIX = "/siteops/builds/";
+const REBUILD_PROJECT_TARGET_PREFIX = "/siteops/projects/";
 const REBUILD_NOTE_KIND = "frontmind.siteops-rebuild.v1";
 const ACTIVE_TICKET_STATUSES = [
   "submitted",
@@ -39,7 +40,20 @@ type SiteOpsRebuildNoteV2 = Omit<SiteOpsRebuildNoteV1, "schemaVersion"> & {
   resetAppliedProjectRevision: number;
 };
 
-type SiteOpsRebuildNote = SiteOpsRebuildNoteV1 | SiteOpsRebuildNoteV2;
+type SiteOpsRebuildNoteV3 = {
+  schemaVersion: 3;
+  kind: typeof REBUILD_NOTE_KIND;
+  projectId: string;
+  sourceBuildId: string | null;
+  knowledgeSnapshotId: string | null;
+  resetAppliedAt?: string;
+  resetAppliedProjectRevision?: number;
+};
+
+type SiteOpsRebuildNote =
+  | SiteOpsRebuildNoteV1
+  | SiteOpsRebuildNoteV2
+  | SiteOpsRebuildNoteV3;
 
 function parseSiteOpsRebuildNote(
   value: string | null | undefined,
@@ -49,10 +63,12 @@ function parseSiteOpsRebuildNote(
     const parsed = JSON.parse(value) as Record<string, unknown>;
     if (
       parsed.kind !== REBUILD_NOTE_KIND ||
-      ![1, 2].includes(Number(parsed.schemaVersion)) ||
+      ![1, 2, 3].includes(Number(parsed.schemaVersion)) ||
       typeof parsed.projectId !== "string" ||
-      typeof parsed.sourceBuildId !== "string" ||
-      typeof parsed.knowledgeSnapshotId !== "string"
+      (typeof parsed.sourceBuildId !== "string" &&
+        !(parsed.schemaVersion === 3 && parsed.sourceBuildId === null)) ||
+      (typeof parsed.knowledgeSnapshotId !== "string" &&
+        !(parsed.schemaVersion === 3 && parsed.knowledgeSnapshotId === null))
     ) {
       return null;
     }
@@ -66,6 +82,14 @@ function parseSiteOpsRebuildNote(
       }
       return parsed as SiteOpsRebuildNoteV2;
     }
+    if (parsed.schemaVersion === 3) {
+      const hasResetTimestamp = typeof parsed.resetAppliedAt === "string";
+      const hasResetRevision =
+        Number.isInteger(parsed.resetAppliedProjectRevision) &&
+        Number(parsed.resetAppliedProjectRevision) > 0;
+      if (hasResetTimestamp !== hasResetRevision) return null;
+      return parsed as SiteOpsRebuildNoteV3;
+    }
     return parsed as SiteOpsRebuildNoteV1;
   } catch {
     return null;
@@ -73,7 +97,37 @@ function parseSiteOpsRebuildNote(
 }
 
 export function siteOpsRebuildResetApplied(value: string | null | undefined) {
-  return parseSiteOpsRebuildNote(value)?.schemaVersion === 2;
+  const note = parseSiteOpsRebuildNote(value);
+  return Boolean(
+    note &&
+      (note.schemaVersion === 2 ||
+        (note.schemaVersion === 3 && note.resetAppliedAt)),
+  );
+}
+
+export function siteOpsRebuildAcceptedForCurrentCycle(input: {
+  internalNote: string | null | undefined;
+  currentBuildId: string | null;
+}) {
+  const note = parseSiteOpsRebuildNote(input.internalNote);
+  return Boolean(
+    note &&
+      siteOpsRebuildResetApplied(input.internalNote) &&
+      note.sourceBuildId === input.currentBuildId,
+  );
+}
+
+export function siteOpsRebuildRequestDisposition(input: {
+  hasWorkflowProgress: boolean;
+  ticketStatus: string | null;
+  resetApplied: boolean;
+}) {
+  if (!input.hasWorkflowProgress) return "unavailable" as const;
+  if (!input.ticketStatus) return "create" as const;
+  if (input.ticketStatus === "in_progress" && input.resetApplied) {
+    return "resubmit" as const;
+  }
+  return "pending" as const;
 }
 
 export class SiteOpsRebuildTicketError extends Error {
@@ -94,6 +148,10 @@ export class SiteOpsRebuildTicketError extends Error {
 
 export function siteOpsRebuildDedupeKey(buildId: string) {
   return `site-rebuild:${buildId}`;
+}
+
+export function siteOpsRebuildProjectDedupeKey(projectId: string) {
+  return `site-rebuild-project:${projectId}`;
 }
 
 export function siteOpsRebuildDeliveryClientRequestId(input: {
@@ -118,6 +176,51 @@ export function siteOpsRebuildDeliveryClientRequestId(input: {
 
 export function siteOpsRebuildTargetPage(buildId: string) {
   return `${REBUILD_TARGET_PREFIX}${buildId}`;
+}
+
+export function siteOpsRebuildProjectTargetPage(projectId: string) {
+  return `${REBUILD_PROJECT_TARGET_PREFIX}${projectId}`;
+}
+
+export function siteOpsRebuildProjectId(targetPage: string | null | undefined) {
+  const value = targetPage?.trim() ?? "";
+  const projectId = value.startsWith(REBUILD_PROJECT_TARGET_PREFIX)
+    ? value.slice(REBUILD_PROJECT_TARGET_PREFIX.length)
+    : "";
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(
+    projectId,
+  )
+    ? projectId
+    : null;
+}
+
+export function siteOpsRebuildResubmissionProjection(input: {
+  projectId: string;
+  internalNote: string | null | undefined;
+}) {
+  const note = parseSiteOpsRebuildNote(input.internalNote);
+  if (
+    !note ||
+    note.schemaVersion === 1 ||
+    !note.resetAppliedAt ||
+    !note.resetAppliedProjectRevision
+  ) {
+    return null;
+  }
+  const projectScopedNote: SiteOpsRebuildNoteV3 = {
+    schemaVersion: 3,
+    kind: REBUILD_NOTE_KIND,
+    projectId: input.projectId,
+    sourceBuildId: note.sourceBuildId,
+    knowledgeSnapshotId: note.knowledgeSnapshotId,
+    resetAppliedAt: note.resetAppliedAt,
+    resetAppliedProjectRevision: note.resetAppliedProjectRevision,
+  };
+  return {
+    targetPage: siteOpsRebuildProjectTargetPage(input.projectId),
+    technicalDedupeKey: siteOpsRebuildProjectDedupeKey(input.projectId),
+    internalNote: JSON.stringify(projectScopedNote),
+  };
 }
 
 export function siteOpsRebuildBuildId(targetPage: string | null | undefined) {
@@ -148,28 +251,42 @@ function buildHasCompletePreview(
 
 export async function loadSiteOpsRebuildRequest(
   executor: any,
-  input: { userId: number; projectId: string; currentBuildId: string | null },
+  input: {
+    userId: number;
+    projectId: string;
+    currentBuildId: string | null;
+    hasWorkflowProgress?: boolean;
+  },
 ) {
-  if (!input.currentBuildId) {
-    return {
-      allowed: false,
-      ticketId: null,
-      status: null,
-      resetApplied: false,
-    } as const;
-  }
-  const [buildRows, ticketRows] = await Promise.all([
-    executor
-      .select()
-      .from(siteBuilds)
-      .where(
-        and(
-          eq(siteBuilds.id, input.currentBuildId),
-          eq(siteBuilds.projectId, input.projectId),
-          eq(siteBuilds.userId, input.userId),
+  const ticketDedupePredicate = input.currentBuildId
+    ? or(
+        eq(
+          deliveryTickets.technicalDedupeKey,
+          siteOpsRebuildDedupeKey(input.currentBuildId),
+        ),
+        eq(
+          deliveryTickets.technicalDedupeKey,
+          siteOpsRebuildProjectDedupeKey(input.projectId),
         ),
       )
-      .limit(1),
+    : eq(
+        deliveryTickets.technicalDedupeKey,
+        siteOpsRebuildProjectDedupeKey(input.projectId),
+      );
+  const [buildRows, ticketRows] = await Promise.all([
+    input.currentBuildId
+      ? executor
+          .select()
+          .from(siteBuilds)
+          .where(
+            and(
+              eq(siteBuilds.id, input.currentBuildId),
+              eq(siteBuilds.projectId, input.projectId),
+              eq(siteBuilds.userId, input.userId),
+            ),
+          )
+          .limit(1)
+      : Promise.resolve([]),
     executor
       .select({
         id: deliveryTickets.id,
@@ -181,10 +298,7 @@ export async function loadSiteOpsRebuildRequest(
         and(
           eq(deliveryTickets.userId, input.userId),
           eq(deliveryTickets.operation, "site_rebuild"),
-          eq(
-            deliveryTickets.technicalDedupeKey,
-            siteOpsRebuildDedupeKey(input.currentBuildId),
-          ),
+          ticketDedupePredicate,
           inArray(deliveryTickets.status, ACTIVE_TICKET_STATUSES),
         ),
       )
@@ -192,11 +306,25 @@ export async function loadSiteOpsRebuildRequest(
       .limit(1),
   ]);
   const ticket = ticketRows[0];
+  const resetApplied = siteOpsRebuildResetApplied(ticket?.internalNote);
+  const parsedNote = parseSiteOpsRebuildNote(ticket?.internalNote);
+  const disposition = siteOpsRebuildRequestDisposition({
+    hasWorkflowProgress:
+      input.hasWorkflowProgress ??
+      Boolean(input.currentBuildId || buildRows[0] || ticket),
+    ticketStatus: ticket?.status ?? null,
+    resetApplied,
+  });
   return {
-    allowed: buildHasCompletePreview(buildRows[0]) && !ticket,
+    allowed: disposition === "create" || disposition === "resubmit",
     ticketId: ticket?.id ?? null,
     status: ticket?.status ?? null,
-    resetApplied: siteOpsRebuildResetApplied(ticket?.internalNote),
+    resetApplied,
+    resetSourceBuildId: parsedNote?.sourceBuildId ?? null,
+    acceptedForCurrentCycle: siteOpsRebuildAcceptedForCurrentCycle({
+      internalNote: ticket?.internalNote,
+      currentBuildId: input.currentBuildId,
+    }),
   };
 }
 
@@ -205,7 +333,7 @@ export async function createSiteOpsRebuildTicket(
   input: {
     userId: number;
     projectId: string;
-    currentBuildId: string;
+    currentBuildId: string | null;
     clientRequestId: string;
     reason?: string;
     quotaPeriodIds: string[];
@@ -230,39 +358,74 @@ export async function createSiteOpsRebuildTicket(
       "当前官网版本已变化，请刷新后重试。",
     );
   }
-  const buildRows = await tx
-    .select()
-    .from(siteBuilds)
-    .where(
-      and(
-        eq(siteBuilds.id, input.currentBuildId),
-        eq(siteBuilds.projectId, input.projectId),
-        eq(siteBuilds.userId, input.userId),
-      ),
-    )
-    .limit(1)
-    .for("update");
-  const build = buildRows[0];
-  if (!buildHasCompletePreview(build)) {
+  if (
+    !project.currentBuildId &&
+    !project.currentKnowledgeSnapshotId &&
+    project.status === "draft"
+  ) {
     throw new SiteOpsRebuildTicketError(
       "BUILD_NOT_READY",
-      "官网尚未完成，暂时不能提交重制需求。",
+      "当前尚未开始建站流程，无需提交重置需求。",
     );
   }
-  const technicalDedupeKey = siteOpsRebuildDedupeKey(build.id);
+  const buildRows = input.currentBuildId
+    ? await tx
+        .select()
+        .from(siteBuilds)
+        .where(
+          and(
+            eq(siteBuilds.id, input.currentBuildId),
+            eq(siteBuilds.projectId, input.projectId),
+            eq(siteBuilds.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    : [];
+  const build = buildRows[0];
+  if (input.currentBuildId && !build) {
+    throw new SiteOpsRebuildTicketError(
+      "BUILD_NOT_READY",
+      "当前建站版本已变化，请刷新后重试。",
+    );
+  }
+  const completedSourceBuild = buildHasCompletePreview(build) ? build : null;
+  const technicalDedupeKey = completedSourceBuild
+    ? siteOpsRebuildDedupeKey(completedSourceBuild.id)
+    : siteOpsRebuildProjectDedupeKey(project.id);
+  const activeDedupeKeys = Array.from(
+    new Set([
+      technicalDedupeKey,
+      siteOpsRebuildProjectDedupeKey(project.id),
+      ...(input.currentBuildId
+        ? [siteOpsRebuildDedupeKey(input.currentBuildId)]
+        : []),
+    ]),
+  );
   const openRows = await tx
-    .select({ id: deliveryTickets.id })
+    .select({
+      id: deliveryTickets.id,
+      status: deliveryTickets.status,
+      internalNote: deliveryTickets.internalNote,
+      revision: deliveryTickets.revision,
+    })
     .from(deliveryTickets)
     .where(
       and(
         eq(deliveryTickets.userId, input.userId),
-        eq(deliveryTickets.technicalDedupeKey, technicalDedupeKey),
+        inArray(deliveryTickets.technicalDedupeKey, activeDedupeKeys),
         inArray(deliveryTickets.status, ACTIVE_TICKET_STATUSES),
       ),
     )
     .limit(1)
     .for("update");
-  if (openRows[0]) {
+  const openTicket = openRows[0];
+  const openTicketDisposition = siteOpsRebuildRequestDisposition({
+    hasWorkflowProgress: true,
+    ticketStatus: openTicket?.status ?? null,
+    resetApplied: siteOpsRebuildResetApplied(openTicket?.internalNote),
+  });
+  if (openTicket && openTicketDisposition !== "resubmit") {
     throw new SiteOpsRebuildTicketError(
       "TICKET_ALREADY_OPEN",
       "当前官网版本已有一张重制工单。",
@@ -324,6 +487,56 @@ export async function createSiteOpsRebuildTicket(
     projectId: input.projectId,
     clientRequestId: input.clientRequestId,
   });
+  if (openTicket) {
+    const resubmission = siteOpsRebuildResubmissionProjection({
+      projectId: project.id,
+      internalNote: openTicket.internalNote,
+    });
+    if (!resubmission) {
+      throw new SiteOpsRebuildTicketError(
+        "INVALID_TICKET",
+        "官网重制工单缺少有效的重置记录。",
+      );
+    }
+    const message = "客户再次提交官网重制需求，等待 FrontMind 通过重置。";
+    await tx
+      .update(deliveryTickets)
+      .set({
+        status: "submitted",
+        ...resubmission,
+        description: reason,
+        publicSummary: message,
+        resolvedAt: null,
+        revision: openTicket.revision + 1,
+        updatedByUserId: input.userId,
+        updatedAt: input.now,
+      })
+      .where(
+        and(
+          eq(deliveryTickets.id, openTicket.id),
+          eq(deliveryTickets.revision, openTicket.revision),
+        ),
+      );
+    await tx.insert(deliveryTicketEvents).values({
+      id: randomUUID(),
+      ticketId: openTicket.id,
+      userId: input.userId,
+      actorUserId: input.userId,
+      actorRole: "user",
+      kind: "status_change",
+      visibility: "customer",
+      clientRequestId: deliveryClientRequestId,
+      message: reason,
+      fromStatus: openTicket.status,
+      toStatus: "submitted",
+      createdAt: input.now,
+    });
+    return {
+      ticketId: openTicket.id,
+      buildId: completedSourceBuild?.id ?? input.currentBuildId,
+      resubmitted: true,
+    };
+  }
   await tx.insert(deliveryTickets).values({
     id: ticketId,
     isWorkflowContainer: false,
@@ -339,19 +552,27 @@ export async function createSiteOpsRebuildTicket(
     topic: "官网重制",
     title: "官网重制需求",
     description: reason,
-    targetPage: siteOpsRebuildTargetPage(build.id),
-    knowledgeSnapshotId: build.knowledgeSnapshotId,
+    targetPage: completedSourceBuild
+      ? siteOpsRebuildTargetPage(completedSourceBuild.id)
+      : siteOpsRebuildProjectTargetPage(project.id),
+    knowledgeSnapshotId:
+      project.currentKnowledgeSnapshotId ??
+      completedSourceBuild?.knowledgeSnapshotId ??
+      null,
     workflowDomain: "ai_operations_engineer",
     operation: "site_rebuild",
     assignedProjectAssignmentId: owner.projectAssignmentId,
     assignedMemberId: owner.memberId,
     technicalDedupeKey,
     internalNote: JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 3,
       kind: REBUILD_NOTE_KIND,
       projectId: project.id,
-      sourceBuildId: build.id,
-      knowledgeSnapshotId: build.knowledgeSnapshotId,
+      sourceBuildId: completedSourceBuild?.id ?? null,
+      knowledgeSnapshotId:
+        project.currentKnowledgeSnapshotId ??
+        completedSourceBuild?.knowledgeSnapshotId ??
+        null,
     }),
     materialUrls: [],
     status: "submitted",
@@ -374,7 +595,11 @@ export async function createSiteOpsRebuildTicket(
     toStatus: "submitted",
     createdAt: input.now,
   });
-  return { ticketId, buildId: build.id };
+  return {
+    ticketId,
+    buildId: completedSourceBuild?.id ?? input.currentBuildId,
+    resubmitted: false,
+  };
 }
 
 export async function approveSiteOpsRebuildTicket(
@@ -383,62 +608,90 @@ export async function approveSiteOpsRebuildTicket(
     ticket: typeof deliveryTickets.$inferSelect;
     actorUserId: number;
     now: Date;
+    reapply?: boolean;
   },
 ) {
   if (input.ticket.operation !== "site_rebuild") return null;
-  const sourceBuildId = siteOpsRebuildBuildId(input.ticket.targetPage);
-  if (!sourceBuildId) {
+  const existingNote = parseSiteOpsRebuildNote(input.ticket.internalNote);
+  const targetBuildId = siteOpsRebuildBuildId(input.ticket.targetPage);
+  const targetProjectId = siteOpsRebuildProjectId(input.ticket.targetPage);
+  if (
+    !existingNote ||
+    (existingNote.schemaVersion === 3
+      ? targetProjectId !== existingNote.projectId &&
+        targetBuildId !== existingNote.sourceBuildId
+      : targetBuildId !== existingNote.sourceBuildId)
+  ) {
     throw new SiteOpsRebuildTicketError(
       "INVALID_TICKET",
-      "官网重制工单缺少有效的原版本坐标。",
+      "官网重制工单缺少有效的项目或原版本坐标。",
     );
   }
   const projectRows = await tx
     .select()
     .from(siteProjects)
-    .where(eq(siteProjects.userId, input.ticket.userId))
-    .limit(1)
-    .for("update");
-  const project = projectRows[0];
-  const buildRows = await tx
-    .select()
-    .from(siteBuilds)
     .where(
       and(
-        eq(siteBuilds.id, sourceBuildId),
-        eq(siteBuilds.userId, input.ticket.userId),
+        eq(siteProjects.id, existingNote.projectId),
+        eq(siteProjects.userId, input.ticket.userId),
       ),
     )
     .limit(1)
     .for("update");
-  const sourceBuild = buildRows[0];
-  if (
-    !project ||
-    project.currentBuildId !== sourceBuildId ||
-    sourceBuild?.projectId !== project.id ||
-    !buildHasCompletePreview(sourceBuild)
-  ) {
+  const project = projectRows[0];
+  if (!project) {
     throw new SiteOpsRebuildTicketError(
       "BUILD_NOT_READY",
-      "原官网版本已变化或不再满足重制条件。",
+      "当前建站项目已变化或不再满足重制条件。",
     );
   }
-  const existingNote = parseSiteOpsRebuildNote(input.ticket.internalNote);
-  if (
-    !existingNote ||
-    existingNote.projectId !== project.id ||
-    existingNote.sourceBuildId !== sourceBuildId ||
-    existingNote.knowledgeSnapshotId !== sourceBuild.knowledgeSnapshotId
-  ) {
+  const currentBuildRows = project.currentBuildId
+    ? await tx
+        .select()
+        .from(siteBuilds)
+        .where(
+          and(
+            eq(siteBuilds.id, project.currentBuildId),
+            eq(siteBuilds.projectId, project.id),
+            eq(siteBuilds.userId, input.ticket.userId),
+          ),
+        )
+        .limit(1)
+        .for("update")
+    : [];
+  const currentBuild = currentBuildRows[0];
+  if (project.currentBuildId && !currentBuild) {
     throw new SiteOpsRebuildTicketError(
-      "INVALID_TICKET",
-      "官网重制工单的原版本记录无效。",
+      "BUILD_NOT_READY",
+      "当前建站版本已变化，请刷新后重试。",
     );
   }
-  if (existingNote.schemaVersion === 2) {
+  if (existingNote.schemaVersion !== 3) {
+    if (
+      !currentBuild ||
+      currentBuild.id !== existingNote.sourceBuildId ||
+      currentBuild.knowledgeSnapshotId !== existingNote.knowledgeSnapshotId ||
+      !buildHasCompletePreview(currentBuild)
+    ) {
+      throw new SiteOpsRebuildTicketError(
+        "BUILD_NOT_READY",
+        "原官网版本已变化或不再满足重制条件。",
+      );
+    }
+  }
+  if (siteOpsRebuildResetApplied(input.ticket.internalNote) && !input.reapply) {
+    if (
+      existingNote.schemaVersion === 1 ||
+      !existingNote.resetAppliedProjectRevision
+    ) {
+      throw new SiteOpsRebuildTicketError(
+        "INVALID_TICKET",
+        "官网重制工单缺少有效的重置记录。",
+      );
+    }
     return {
       projectId: project.id,
-      sourceBuildId,
+      sourceBuildId: existingNote.sourceBuildId,
       resetApplied: true as const,
       resetAppliedProjectRevision: existingNote.resetAppliedProjectRevision,
       internalNote: JSON.stringify(existingNote),
@@ -520,6 +773,7 @@ export async function approveSiteOpsRebuildTicket(
     .from(messages)
     .where(eq(messages.conversationId, project.conversationId));
   const now = input.now;
+  const preservedBuildId = project.currentBuildId ?? existingNote.sourceBuildId;
   await tx
     .update(messages)
     .set({ deletedAt: now, updatedAt: now })
@@ -557,7 +811,7 @@ export async function approveSiteOpsRebuildTicket(
         status: "active",
         payload: {
           rebuildTicketId: input.ticket.id,
-          sourceBuildId,
+          sourceBuildId: preservedBuildId,
           requested: "knowledge_snapshot",
           reset: true,
         },
@@ -579,15 +833,27 @@ export async function approveSiteOpsRebuildTicket(
         eq(siteProjects.revision, project.revision),
       ),
     );
-  const upgradedNote: SiteOpsRebuildNoteV2 = {
-    ...existingNote,
-    schemaVersion: 2,
-    resetAppliedAt: now.toISOString(),
-    resetAppliedProjectRevision: nextRevision,
-  };
+  const upgradedNote: SiteOpsRebuildNoteV2 | SiteOpsRebuildNoteV3 =
+    existingNote.schemaVersion === 3
+      ? {
+          ...existingNote,
+          sourceBuildId: preservedBuildId,
+          knowledgeSnapshotId:
+            project.currentKnowledgeSnapshotId ??
+            currentBuild?.knowledgeSnapshotId ??
+            existingNote.knowledgeSnapshotId,
+          resetAppliedAt: now.toISOString(),
+          resetAppliedProjectRevision: nextRevision,
+        }
+      : {
+          ...existingNote,
+          schemaVersion: 2,
+          resetAppliedAt: now.toISOString(),
+          resetAppliedProjectRevision: nextRevision,
+        };
   return {
     projectId: project.id,
-    sourceBuildId,
+    sourceBuildId: preservedBuildId,
     resetApplied: true as const,
     resetAppliedProjectRevision: nextRevision,
     internalNote: JSON.stringify(upgradedNote),
@@ -598,12 +864,27 @@ export async function completeSiteOpsRebuildTicket(
   tx: any,
   input: {
     userId: number;
+    projectId: string;
     parentBuildId: string | null;
     childBuildId: string;
     now: Date;
   },
 ) {
-  if (!input.parentBuildId) return null;
+  const dedupePredicate = input.parentBuildId
+    ? or(
+        eq(
+          deliveryTickets.technicalDedupeKey,
+          siteOpsRebuildDedupeKey(input.parentBuildId),
+        ),
+        eq(
+          deliveryTickets.technicalDedupeKey,
+          siteOpsRebuildProjectDedupeKey(input.projectId),
+        ),
+      )
+    : eq(
+        deliveryTickets.technicalDedupeKey,
+        siteOpsRebuildProjectDedupeKey(input.projectId),
+      );
   const ticketRows = await tx
     .select()
     .from(deliveryTickets)
@@ -611,17 +892,20 @@ export async function completeSiteOpsRebuildTicket(
       and(
         eq(deliveryTickets.userId, input.userId),
         eq(deliveryTickets.operation, "site_rebuild"),
-        eq(
-          deliveryTickets.technicalDedupeKey,
-          siteOpsRebuildDedupeKey(input.parentBuildId),
-        ),
+        dedupePredicate,
         eq(deliveryTickets.status, "in_progress"),
       ),
     )
     .limit(1)
     .for("update");
   const ticket = ticketRows[0];
-  if (!ticket) return null;
+  if (
+    !ticket ||
+    !siteOpsRebuildResetApplied(ticket.internalNote) ||
+    parseSiteOpsRebuildNote(ticket.internalNote)?.projectId !== input.projectId
+  ) {
+    return null;
+  }
   const message = "新的官网版本已完成，原官网与历史版本仍可继续使用。";
   await tx
     .update(deliveryTickets)

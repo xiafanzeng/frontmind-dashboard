@@ -138,10 +138,9 @@ export function siteOpsServiceErrorFromQuota(error: SiteOpsQuotaError) {
 }
 
 export function requireAcceptedSiteOpsRebuild(input: {
-  status: string | null;
-  resetApplied: boolean;
+  acceptedForCurrentCycle: boolean;
 }) {
-  if (input.status !== "in_progress" || !input.resetApplied) {
+  if (!input.acceptedForCurrentCycle) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "请先提交官网重制需求并等待 FrontMind 通过重置。",
@@ -1632,6 +1631,11 @@ async function projectObservation(
       userId: input.userId,
       projectId: input.project.id,
       currentBuildId: input.project.currentBuildId,
+      hasWorkflowProgress: Boolean(
+        input.project.currentBuildId ||
+          input.project.currentKnowledgeSnapshotId ||
+          input.project.status !== "draft",
+      ),
     }),
   ]);
 
@@ -1966,7 +1970,13 @@ async function projectObservation(
       }),
     ),
     resetCapability,
-    rebuildRequest,
+    rebuildRequest: {
+      allowed: rebuildRequest.allowed,
+      ticketId: rebuildRequest.ticketId,
+      status: rebuildRequest.status,
+      resetApplied: rebuildRequest.resetApplied,
+      resetSourceBuildId: rebuildRequest.resetSourceBuildId,
+    },
     interactionState:
       input.project.status === "draft"
         ? ("select_snapshot" as const)
@@ -2863,15 +2873,12 @@ async function handleRequestRebuild(
     payload: { reason?: string };
   },
 ) {
-  if (!input.project.currentBuildId) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "当前还没有可重制的官网版本。",
-      409,
-    );
-  }
   const now = new Date();
-  let created: { ticketId: string; buildId: string };
+  let created: {
+    ticketId: string;
+    buildId: string | null;
+    resubmitted: boolean;
+  };
   try {
     created = await createSiteOpsRebuildTicket(tx, {
       userId: input.actor.id,
@@ -2918,10 +2925,10 @@ async function handleRequestRebuild(
     payload: {
       action: "request_rebuild",
       ticketId: created.ticketId,
-      sourceBuildId: created.buildId,
+      ...(created.buildId ? { sourceBuildId: created.buildId } : {}),
     },
     kind: "brief_message",
-    buildId: created.buildId,
+    ...(created.buildId ? { buildId: created.buildId } : {}),
     status: "succeeded",
   });
   await appendMessage(tx, {
@@ -2929,25 +2936,17 @@ async function handleRequestRebuild(
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content:
-      "官网重制需求已提交。当前官网保持不变，FrontMind 受理后会在这里开启新版本。",
+    content: created.resubmitted
+      ? "官网重制需求已再次提交。当前制作流程暂不受影响，FrontMind 通过后会重新开启全新流程。"
+      : "官网重制需求已提交。当前制作流程暂不受影响，FrontMind 通过后会重新开启全新流程。",
     siteOps: {
       kind: "operation_recovery",
       subjectId: created.ticketId,
-      revision: input.project.revision + 1,
+      revision: input.project.revision,
       status: "resolved",
       payload: { rebuildTicketId: created.ticketId, status: "submitted" },
     },
   });
-  await tx
-    .update(siteProjects)
-    .set({ revision: input.project.revision + 1, updatedAt: now })
-    .where(
-      and(
-        eq(siteProjects.id, input.project.id),
-        eq(siteProjects.revision, input.project.revision),
-      ),
-    );
 }
 
 async function handleResetWorkflow(

@@ -4765,6 +4765,7 @@ export async function approveMySiteOpsRebuild(input: {
         ticket,
         actorUserId: input.actor.id,
         now,
+        reapply: siteOpsRebuildResetApplied(ticket.internalNote),
       });
     } catch (error) {
       if (error instanceof SiteOpsRebuildTicketError) {
