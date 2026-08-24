@@ -38,6 +38,7 @@ const capabilityKeys: ServiceCapabilityKey[] = [
   "channelDistribution",
   "progressReport",
   "contentAssets",
+  "brandTracking",
 ];
 
 function workflowPortal() {
@@ -186,6 +187,34 @@ describe("service workflow UI gates", () => {
       />,
     );
     expect(screen.queryByText("舆情监控")).not.toBeInTheDocument();
+  });
+
+  it("keeps overseas brand tracking visible but non-interactive on Basic", () => {
+    const portal = workflowPortal();
+    portal.plan.code = "basic";
+    portal.plan.name = "普通版";
+    portal.capabilities.brandTracking = {
+      allowed: false,
+      effectiveStatus: "locked",
+      reason: "普通版不包含品牌舆情追踪。",
+    };
+    const onNavigate = vi.fn();
+    render(
+      <ServiceHome
+        portal={portal}
+        marketEdition="overseas"
+        onNavigate={onNavigate}
+      />,
+    );
+
+    const entry = screen.getByText("舆情监控").closest("article");
+    expect(entry).not.toBeNull();
+    expect(within(entry!).getByText("未解锁")).toBeInTheDocument();
+    const button = within(entry!).getByRole("button", { name: "进入" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(button);
+    expect(onNavigate).not.toHaveBeenCalled();
   });
 
   it("uses only unlocked and locked labels throughout the intelligent service path", () => {

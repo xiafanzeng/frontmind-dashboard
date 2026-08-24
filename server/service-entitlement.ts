@@ -1091,6 +1091,7 @@ function deriveCapabilities(
     "monitoring",
     "channelDistribution",
     "progressReport",
+    "brandTracking",
     "contentAssets",
   ]);
   for (const key of serviceCapabilityKeySchema.options) {
@@ -2511,6 +2512,16 @@ export async function assertServiceCapability(
   const portal = assertWritableServicePortal(
     await getServicePortal(userId, options),
   );
+  if (
+    capability === "contentAssets" &&
+    portal.capabilities[capability].effectiveStatus === "not_in_plan"
+  ) {
+    throw new ServiceEntitlementError(
+      "CAPABILITY_UPGRADE_REQUIRED",
+      "当前版本不包含此能力，可升级进阶版或豪华版解锁。",
+      403,
+    );
+  }
   if (
     capability === "contentAssets" &&
     !servicePortalHasRequiredKnowledge(portal)

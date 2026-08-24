@@ -5,7 +5,6 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 
-import Sts from "@alicloud/sts20150401";
 import * as OpenApi from "@alicloud/openapi-client";
 import { and, desc, eq, inArray, ne } from "drizzle-orm";
 import { z } from "zod";
@@ -24,6 +23,7 @@ import {
 } from "../auth-service";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
+import { AliyunStsClient } from "./aliyun-sdk-constructors";
 
 export const ALIYUN_PLATFORM_UID = "1244409121609391";
 export const ALIYUN_CUSTOMER_ROLE_NAME = "FrontMindSiteOpsAccess";
@@ -399,7 +399,7 @@ export async function inspectAliyunBrokerCredential(
 async function requestAliyunBrokerCallerIdentity(
   credential: AliyunBrokerCredential,
 ) {
-  const client = new Sts(
+  const client = new AliyunStsClient(
     new OpenApi.Config({
       accessKeyId: credential.accessKeyId,
       accessKeySecret: credential.accessKeySecret,

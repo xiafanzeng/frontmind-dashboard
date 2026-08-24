@@ -66,8 +66,15 @@ JSON value as `frontmind-page-content-wire-v3.json`:
 - every frozen route exactly once in `routes`;
 - every non-empty design slot exactly once in `blocks`;
 - only the allowlisted semantic block types;
+- non-empty `items` for feature-list, steps and metrics blocks, and non-empty
+  canonical references for entity-grid and FAQ-preview blocks; these
+  data-driven blocks may leave `paragraphs` empty, while prose, quote and CTA
+  blocks must provide at least one paragraph;
 - typed product, service, application, case-study, blog and company-news
   entities only where the frozen inventory contains that collection;
+- URL-safe lowercase ASCII entity slugs whenever possible; Dashboard may
+  deterministically substitute the already validated unique entity id for a
+  non-URL-safe provider slug;
 - FAQ records and official links only where the dossier proves them;
 - sourceDocumentIds for every factual block, entity, FAQ and official link;
 - no repeated SEO plan and no facts outside the supplied dossier.
@@ -80,8 +87,10 @@ but no block or company-news entity for it. Dashboard owns the legal empty
 state. Internal document ids, source labels and verification notes are never
 public website copy.
 
-Dashboard strictly validates the result. Repair messages continue this same
-task at most three times. Do not return arbitrary prose in place of JSON.
+Dashboard strictly validates the result. The identical JSON attachment is the
+formal recovery copy when structured extraction fails. Repair messages
+continue this same task at most three times. Do not return arbitrary prose in
+place of JSON.
 
 ## Trusted host materialization
 

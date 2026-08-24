@@ -518,6 +518,16 @@ export const siteContentEntityTypeSchema = z.enum([
   "company_news",
 ]);
 
+export const siteContentEntitySlugSchema = z
+  .string()
+  .trim()
+  .regex(/^[a-z0-9](?:[a-z0-9_-]{0,62})$/u);
+
+export function canonicalSiteContentEntitySlug(slug: string, entityId: string) {
+  const parsed = siteContentEntitySlugSchema.safeParse(slug);
+  return parsed.success ? parsed.data : entityId;
+}
+
 const sourceBoundIdsSchema = z
   .array(z.string().trim().min(1).max(191))
   .min(1)
@@ -559,7 +569,6 @@ export const pageContentSpecV2Schema = z
                     heading: z.string().trim().min(1).max(160),
                     paragraphs: z
                       .array(z.string().trim().min(1).max(2_000))
-                      .min(1)
                       .max(16),
                     items: z.array(z.string().trim().min(1).max(500)).max(24),
                     entityIds: z
@@ -586,10 +595,7 @@ export const pageContentSpecV2Schema = z
               .trim()
               .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
             entityType: siteContentEntityTypeSchema,
-            slug: z
-              .string()
-              .trim()
-              .regex(/^[a-z0-9](?:[a-z0-9_-]{0,62})$/u),
+            slug: siteContentEntitySlugSchema,
             title: z.string().trim().min(1).max(180),
             summary: z.string().trim().min(1).max(600),
             body: z.array(z.string().trim().min(1).max(2_000)).min(1).max(24),
@@ -678,6 +684,34 @@ export const pageContentSpecV2Schema = z
           path: ["routes", routeIndex, "sections", "sourceDocumentIds"],
           message: "Every factual content block must bind to snapshot sources",
         });
+      }
+      for (const [sectionIndex, section] of route.sections.entries()) {
+        if (
+          ["prose", "quote", "cta"].includes(section.blockType) &&
+          section.paragraphs.length < 1
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: [
+              "routes",
+              routeIndex,
+              "sections",
+              sectionIndex,
+              "paragraphs",
+            ],
+            message: "Text-led content blocks require canonical paragraphs",
+          });
+        }
+        if (
+          ["feature_list", "steps", "metrics"].includes(section.blockType) &&
+          section.items.length < 1
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["routes", routeIndex, "sections", sectionIndex, "items"],
+            message: "Item-led content blocks require canonical items",
+          });
+        }
       }
     }
     const entityIds = new Set(value.entities.map((entity) => entity.entityId));

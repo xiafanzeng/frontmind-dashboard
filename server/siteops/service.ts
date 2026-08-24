@@ -37,6 +37,8 @@ import {
 } from "../../drizzle/schema";
 import {
   SITEOPS_WORKFLOW,
+  SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+  SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   siteBriefSchema,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
@@ -48,7 +50,10 @@ import {
 } from "../../shared/siteops";
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
-import { siteOpsObservationV1Schema } from "../../shared/siteops-contract";
+import {
+  siteOpsObservationV1Schema,
+  type SiteOpsExecutionStep,
+} from "../../shared/siteops-contract";
 import {
   referenceBlueprintForVisualCandidate,
   referenceBlueprintSchema,
@@ -1404,6 +1409,192 @@ function requireEsaRuntimeConfigured() {
   }
 }
 
+const SITEOPS_EXECUTION_STAGE_LABELS = {
+  visual_searching: "视觉候选搜索",
+  preparing: "项目准备",
+  design_compiling: "设计合同生成",
+  content_building: "页面内容生成",
+  qa_running: "质量校验",
+  completed: "完成",
+} as const;
+
+type SiteOpsExecutionStage = keyof typeof SITEOPS_EXECUTION_STAGE_LABELS;
+
+function publicExecutionStage(value: unknown): SiteOpsExecutionStage | null {
+  if (value === "contract_ready" || value === "building") {
+    return "content_building";
+  }
+  return [
+    "visual_searching",
+    "preparing",
+    "design_compiling",
+    "content_building",
+    "qa_running",
+    "completed",
+  ].includes(String(value))
+    ? (value as SiteOpsExecutionStage)
+    : null;
+}
+
+function publicExecutionStatus(status: string) {
+  if (status === "queued") return "queued" as const;
+  if (status === "running" || status === "outcome_unknown") {
+    return "running" as const;
+  }
+  if (status === "succeeded") return "succeeded" as const;
+  if (status === "failed") return "failed" as const;
+  if (status === "cancelled") return "cancelled" as const;
+  return "attention_required" as const;
+}
+
+export function projectSiteOpsExecutionSteps(input: {
+  operations: Array<{
+    id: string;
+    buildId: string | null;
+    kind: string;
+    status: string;
+    startedAt: Date | null;
+    completedAt: Date | null;
+    createdAt: Date;
+  }>;
+  timelineMessages: Array<{
+    id: string;
+    metadata: unknown;
+    sentAt: Date;
+  }>;
+}): SiteOpsExecutionStep[] {
+  const events = input.timelineMessages.flatMap((row) => {
+    const metadata = (row.metadata ?? {}) as Record<string, unknown>;
+    const siteOps = (metadata.siteOps ?? {}) as Record<string, unknown>;
+    const payload = (siteOps.payload ?? {}) as Record<string, unknown>;
+    const stage = publicExecutionStage(payload.stage);
+    return stage && typeof siteOps.subjectId === "string"
+      ? [
+          {
+            id: row.id,
+            operationId: siteOps.subjectId,
+            buildId:
+              typeof payload.buildId === "string" ? payload.buildId : null,
+            stage,
+            startedAt:
+              typeof payload.occurredAt === "string" &&
+              Number.isFinite(Date.parse(payload.occurredAt))
+                ? new Date(payload.occurredAt)
+                : row.sentAt,
+          },
+        ]
+      : [];
+  });
+  return input.operations.flatMap((operation) => {
+    if (
+      !["visual_search", "site_build", "build_revision", "deploy"].includes(
+        operation.kind,
+      )
+    ) {
+      return [];
+    }
+    const operationKind = operation.kind as
+      | "visual_search"
+      | "site_build"
+      | "build_revision"
+      | "deploy";
+    if (operationKind === "visual_search") {
+      const startedAt = operation.startedAt ?? operation.createdAt;
+      return [
+        {
+          id: `${operation.id}:visual_searching`,
+          operationKind,
+          buildId: null,
+          stage: "visual_searching" as const,
+          label: SITEOPS_EXECUTION_STAGE_LABELS.visual_searching,
+          status: publicExecutionStatus(operation.status),
+          startedAt: startedAt.toISOString(),
+          completedAt: operation.completedAt?.toISOString() ?? null,
+        },
+      ];
+    }
+    if (operationKind === "deploy") return [];
+    const operationEvents = events
+      .filter((item) => item.operationId === operation.id)
+      .sort(
+        (left, right) => left.startedAt.getTime() - right.startedAt.getTime(),
+      );
+    if (operationEvents.length === 0) {
+      const startedAt = operation.startedAt ?? operation.createdAt;
+      return [
+        {
+          id: `${operation.id}:legacy-total`,
+          operationKind,
+          buildId: operation.buildId,
+          stage:
+            operation.status === "succeeded"
+              ? ("completed" as const)
+              : ("preparing" as const),
+          label: operation.status === "succeeded" ? "官网制作" : "官网制作中",
+          status: publicExecutionStatus(operation.status),
+          startedAt: startedAt.toISOString(),
+          completedAt: operation.completedAt?.toISOString() ?? null,
+        },
+      ];
+    }
+    const byStage = new Map<SiteOpsExecutionStage, (typeof events)[number]>();
+    for (const event of operationEvents) {
+      if (!byStage.has(event.stage)) byStage.set(event.stage, event);
+    }
+    if (!byStage.has("preparing")) {
+      byStage.set("preparing", {
+        id: `${operation.id}:preparing:fallback`,
+        operationId: operation.id,
+        buildId: operation.buildId,
+        stage: "preparing",
+        startedAt: operation.startedAt ?? operation.createdAt,
+      });
+    }
+    const ordered = [
+      "preparing",
+      "design_compiling",
+      "content_building",
+      "qa_running",
+    ].flatMap((stage) => {
+      const event = byStage.get(stage as SiteOpsExecutionStage);
+      return event ? [event] : [];
+    });
+    const projected: SiteOpsExecutionStep[] = ordered.map((event, index) => {
+      const next = ordered[index + 1];
+      const completedAt =
+        next?.startedAt ??
+        (operation.completedAt && operation.status !== "running"
+          ? operation.completedAt
+          : null);
+      return {
+        id: `${operation.id}:${event.stage}`,
+        operationKind,
+        buildId: operation.buildId,
+        stage: event.stage,
+        label: SITEOPS_EXECUTION_STAGE_LABELS[event.stage],
+        status: next
+          ? ("succeeded" as const)
+          : publicExecutionStatus(operation.status),
+        startedAt: event.startedAt.toISOString(),
+        completedAt: completedAt?.toISOString() ?? null,
+      };
+    });
+    if (operation.status === "succeeded" && operation.completedAt) {
+      projected.push({
+        id: `${operation.id}:completed`,
+        operationKind,
+        buildId: operation.buildId,
+        stage: "completed",
+        label: SITEOPS_EXECUTION_STAGE_LABELS.completed,
+        status: "succeeded",
+        startedAt: operation.completedAt.toISOString(),
+        completedAt: operation.completedAt.toISOString(),
+      });
+    }
+    return projected;
+  });
+}
+
 async function projectObservation(
   executor: any,
   input: {
@@ -1425,12 +1616,14 @@ async function projectObservation(
         );
   const [
     messageRows,
+    timelineMessageRows,
     buildRows,
     deploymentRows,
     packageRows,
     serviceReadiness,
     snapshotRows,
     batchRows,
+    timelineOperationRows,
     connectionRows,
     profileRows,
     domainOperationRows,
@@ -1446,6 +1639,21 @@ async function projectObservation(
       .select()
       .from(messages)
       .where(messagePredicate)
+      .orderBy(asc(messages.sequence))
+      .limit(500),
+    executor
+      .select({
+        id: messages.id,
+        metadata: messages.metadata,
+        sentAt: messages.sentAt,
+      })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, input.project.conversationId),
+          isNull(messages.deletedAt),
+        ),
+      )
       .orderBy(asc(messages.sequence))
       .limit(500),
     executor
@@ -1508,7 +1716,32 @@ async function projectObservation(
         ),
       )
       .orderBy(desc(websiteStyleSampleBatches.ordinal))
-      .limit(1),
+      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES + 1),
+    executor
+      .select({
+        id: siteOperations.id,
+        buildId: siteOperations.buildId,
+        kind: siteOperations.kind,
+        status: siteOperations.status,
+        startedAt: siteOperations.startedAt,
+        completedAt: siteOperations.completedAt,
+        createdAt: siteOperations.createdAt,
+      })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.project.id),
+          eq(siteOperations.userId, input.userId),
+          inArray(siteOperations.kind, [
+            "visual_search",
+            "site_build",
+            "build_revision",
+            "deploy",
+          ]),
+        ),
+      )
+      .orderBy(desc(siteOperations.createdAt))
+      .limit(50),
     executor
       .select()
       .from(siteProviderConnections)
@@ -1639,18 +1872,51 @@ async function projectObservation(
     }),
   ]);
 
-  const candidateRows = batchRows[0]
-    ? await executor
-        .select()
-        .from(websiteStyleSamples)
-        .where(eq(websiteStyleSamples.batchId, batchRows[0].id))
-        .orderBy(asc(websiteStyleSamples.sortOrder))
-        .limit(9)
-    : [];
-  const messagesProjected = messageRows.map(
+  const publishedBatchRows = batchRows
+    .filter(
+      (row: typeof websiteStyleSampleBatches.$inferSelect) =>
+        row.status === "published",
+    )
+    .sort(
+      (
+        left: typeof websiteStyleSampleBatches.$inferSelect,
+        right: typeof websiteStyleSampleBatches.$inferSelect,
+      ) => left.ordinal - right.ordinal,
+    )
+    .slice(0, SITEOPS_VISUAL_CANDIDATE_MAX_PAGES);
+  const visibleBatchRows =
+    publishedBatchRows.length > 0
+      ? publishedBatchRows
+      : batchRows
+          .filter(
+            (row: typeof websiteStyleSampleBatches.$inferSelect) =>
+              row.status === "selected",
+          )
+          .slice(0, 1);
+  const visibleBatchIds = visibleBatchRows.map(
+    (row: typeof websiteStyleSampleBatches.$inferSelect) => row.id,
+  );
+  const candidateRows =
+    visibleBatchIds.length > 0
+      ? await executor
+          .select()
+          .from(websiteStyleSamples)
+          .where(inArray(websiteStyleSamples.batchId, visibleBatchIds))
+          .limit(SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL)
+      : [];
+  const messagesProjected = messageRows.flatMap(
     (row: typeof messages.$inferSelect) => {
       const metadata = (row.metadata ?? {}) as Record<string, unknown>;
       const siteOps = metadata.siteOps as Record<string, unknown> | undefined;
+      const originalPayload = siteOps?.payload as
+        | Record<string, unknown>
+        | undefined;
+      if (
+        originalPayload?.visibility === "timeline" ||
+        originalPayload?.timelineOnly === true
+      ) {
+        return [];
+      }
       const statusProjectedMetadata =
         siteOps?.status === "active" &&
         Number(siteOps.revision) !== input.project.revision
@@ -1672,23 +1938,25 @@ async function projectObservation(
             },
           }
         : statusProjectedMetadata;
-      return {
-        id: row.id,
-        role: row.role,
-        content:
-          row.role === "assistant" && siteOps
-            ? publicSiteOpsMessageText({
-                content: row.content,
-                errorCode:
-                  typeof payload?.errorCode === "string"
-                    ? payload.errorCode
-                    : null,
-              })
-            : row.content,
-        sequence: row.sequence,
-        metadata: projectedMetadata,
-        sentAt: row.sentAt.toISOString(),
-      };
+      return [
+        {
+          id: row.id,
+          role: row.role,
+          content:
+            row.role === "assistant" && siteOps
+              ? publicSiteOpsMessageText({
+                  content: row.content,
+                  errorCode:
+                    typeof payload?.errorCode === "string"
+                      ? payload.errorCode
+                      : null,
+                })
+              : row.content,
+          sequence: row.sequence,
+          metadata: projectedMetadata,
+          sentAt: row.sentAt.toISOString(),
+        },
+      ];
     },
   );
   const latestDnsPlanRow = dnsOperationRows.find(
@@ -1753,6 +2021,56 @@ async function projectObservation(
     hasActiveDns: activeDnsRecordRows.length > 0,
     hasUnresolvedFinancialIntent: unresolvedFinancialRows.length > 0,
   });
+  const selectedSampleIds = new Set(
+    buildRows
+      .filter(
+        (build: typeof siteBuilds.$inferSelect) =>
+          !["cancelled", "superseded"].includes(build.status),
+      )
+      .flatMap((build: typeof siteBuilds.$inferSelect) =>
+        build.styleSampleId ? [build.styleSampleId] : [],
+      ),
+  );
+  const projectVisualCandidate = (
+    row: typeof websiteStyleSamples.$inferSelect,
+  ) => {
+    const { providerTitle, ...heroMetadata } = publicVisualMetadata(
+      row.sourceMetadata,
+    );
+    return {
+      id: row.id,
+      label: row.label,
+      title: providerTitle || row.note?.trim() || `视觉方向 ${row.label}`,
+      previewUrl: `/api/site-ops/style-previews/${row.id}`,
+      note: row.note,
+      ...heroMetadata,
+      selected: selectedSampleIds.has(row.id),
+    };
+  };
+  const visualCandidatePages = visibleBatchRows.flatMap(
+    (
+      batch: typeof websiteStyleSampleBatches.$inferSelect,
+      pageIndex: number,
+    ) => {
+      const candidates = candidateRows
+        .filter(
+          (row: typeof websiteStyleSamples.$inferSelect) =>
+            row.batchId === batch.id,
+        )
+        .sort(
+          (
+            left: typeof websiteStyleSamples.$inferSelect,
+            right: typeof websiteStyleSamples.$inferSelect,
+          ) => left.sortOrder - right.sortOrder,
+        )
+        .map(projectVisualCandidate);
+      return candidates.length === 9
+        ? [{ batchId: batch.id, page: pageIndex + 1, candidates }]
+        : [];
+    },
+  );
+  const visualCandidates =
+    visualCandidatePages[visualCandidatePages.length - 1]?.candidates ?? [];
   const observation = {
     schemaVersion: 1 as const,
     executionKind: "site_ops" as const,
@@ -1910,26 +2228,20 @@ async function projectObservation(
         active: row.id === input.project.currentKnowledgeSnapshotId,
       })),
     messages: messagesProjected,
-    visualCandidates: candidateRows.map(
-      (row: typeof websiteStyleSamples.$inferSelect) => {
-        const { providerTitle, ...heroMetadata } = publicVisualMetadata(
-          row.sourceMetadata,
-        );
-        return {
-          id: row.id,
-          label: row.label,
-          title: providerTitle || row.note?.trim() || `视觉方向 ${row.label}`,
-          previewUrl: `/api/site-ops/style-previews/${row.id}`,
-          note: row.note,
-          ...heroMetadata,
-          selected: buildRows.some(
-            (build: typeof siteBuilds.$inferSelect) =>
-              build.styleSampleId === row.id &&
-              !["cancelled", "superseded"].includes(build.status),
-          ),
-        };
-      },
-    ),
+    visualCandidates,
+    visualCandidatePages,
+    visualGeneration: {
+      generatedPages: visualCandidatePages.length,
+      maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+      canGenerateMore:
+        input.project.status === "awaiting_visual_selection" &&
+        publishedBatchRows.length > 0 &&
+        publishedBatchRows.length < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+    },
+    executionSteps: projectSiteOpsExecutionSteps({
+      operations: timelineOperationRows,
+      timelineMessages: timelineMessageRows,
+    }),
     builds: buildRows.map((row: typeof siteBuilds.$inferSelect) => {
       return {
         id: row.id,
@@ -1983,7 +2295,7 @@ async function projectObservation(
         : input.project.status,
     latestSequence: Math.max(
       input.afterSequence ?? 0,
-      ...messagesProjected.map((row: { sequence: number }) => row.sequence),
+      ...messageRows.map((row: typeof messages.$inferSelect) => row.sequence),
     ),
   };
   return siteOpsObservationV1Schema.parse(observation);
@@ -3593,6 +3905,29 @@ async function handleVisualSearch(
       409,
     );
   }
+  const currentPublishedBatches = await tx
+    .select({ id: websiteStyleSampleBatches.id })
+    .from(websiteStyleSampleBatches)
+    .where(
+      and(
+        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+        eq(websiteStyleSampleBatches.userId, input.actor.id),
+        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+        eq(websiteStyleSampleBatches.status, "published"),
+      ),
+    )
+    .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+    .for("update");
+  if (
+    input.reselect &&
+    currentPublishedBatches.length >= SITEOPS_VISUAL_CANDIDATE_MAX_PAGES
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "本轮已生成全部 27 个视觉候选，请从三个候选组中选择一个方向。",
+      409,
+    );
+  }
   const readiness = visualSearchReadiness(input.project.brief);
   if (!readiness.ready) {
     if (readiness.reason !== "no_public_facts") {
@@ -3622,19 +3957,6 @@ async function handleVisualSearch(
     credentialVersion: credential.version,
     workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
   });
-  if (input.reselect) {
-    await tx
-      .update(websiteStyleSampleBatches)
-      .set({ status: "superseded", updatedAt: new Date() })
-      .where(
-        and(
-          eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
-          eq(websiteStyleSampleBatches.userId, input.actor.id),
-          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-          eq(websiteStyleSampleBatches.status, "published"),
-        ),
-      );
-  }
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
     project: input.project,
@@ -3651,7 +3973,7 @@ async function handleVisualSearch(
     role: "assistant",
     turnId: input.turnId,
     content: input.reselect
-      ? "正在重新检索真实视觉参考；当前预览与线上版本会保持不变。"
+      ? `正在生成第 ${currentPublishedBatches.length + 1} 组全新视觉候选；前面展示过的参考不会重复。`
       : "正在生成 9 个视觉候选，完成后会一次展示。",
     siteOps: {
       kind: "build_progress",
@@ -3725,23 +4047,7 @@ async function selectVisualSample(
       409,
     );
   }
-  let batchId = input.batchId;
-  if (input.delegated && !batchId) {
-    const batchRows = await tx
-      .select({ id: websiteStyleSampleBatches.id })
-      .from(websiteStyleSampleBatches)
-      .where(
-        and(
-          eq(websiteStyleSampleBatches.userId, input.actor.id),
-          eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
-          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-          eq(websiteStyleSampleBatches.status, "published"),
-        ),
-      )
-      .orderBy(desc(websiteStyleSampleBatches.publishedAt))
-      .limit(1);
-    batchId = batchRows[0]?.id;
-  }
+  const batchId = input.batchId;
   const sampleRows = await tx
     .select({ sample: websiteStyleSamples, batch: websiteStyleSampleBatches })
     .from(websiteStyleSamples)
@@ -3753,14 +4059,19 @@ async function selectVisualSample(
       and(
         input.sampleId
           ? eq(websiteStyleSamples.id, input.sampleId)
-          : eq(websiteStyleSamples.batchId, batchId!),
+          : batchId
+            ? eq(websiteStyleSamples.batchId, batchId)
+            : eq(websiteStyleSampleBatches.status, "published"),
         eq(websiteStyleSampleBatches.userId, input.actor.id),
         eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
         eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
         eq(websiteStyleSampleBatches.status, "published"),
       ),
     );
-  if (sampleRows.length < 1 || sampleRows.length > 9) {
+  if (
+    sampleRows.length < 1 ||
+    sampleRows.length > SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL
+  ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "视觉候选尚未准备完成，请刷新后重试。",
@@ -3876,6 +4187,18 @@ async function selectVisualSample(
         eq(websiteStyleSampleBatches.id, selected.batch.id),
         eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
         eq(websiteStyleSampleBatches.status, "published"),
+      ),
+    );
+  await tx
+    .update(websiteStyleSampleBatches)
+    .set({ status: "superseded", updatedAt: new Date() })
+    .where(
+      and(
+        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+        eq(websiteStyleSampleBatches.userId, input.actor.id),
+        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+        eq(websiteStyleSampleBatches.status, "published"),
+        ne(websiteStyleSampleBatches.id, selected.batch.id),
       ),
     );
   await tx.insert(siteBuilds).values({

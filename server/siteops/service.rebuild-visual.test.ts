@@ -44,7 +44,7 @@ import {
 import { SITEOPS_WORKFLOW } from "../../shared/siteops";
 import { referenceBlueprintV3ForFamily } from "../../shared/siteops-design";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
-import { actOnSiteOps } from "./service";
+import { actOnSiteOps, siteBriefFromSnapshot } from "./service";
 
 type Insert = { table: unknown; values: Record<string, unknown> };
 
@@ -118,6 +118,8 @@ function serviceDatabaseFixture() {
       score: 95,
     },
   };
+  const visualRows = [{ sample, batch }];
+  const publishedBatches: Array<{ id: string }> = [];
   const visualOperationInput = {
     knowledgeSnapshotId: snapshot.id,
     credentialId: platformCredentialId,
@@ -148,9 +150,7 @@ function serviceDatabaseFixture() {
       return [];
     }
     if (table === websiteStyleSamples) {
-      return inTransaction && keys.includes("sample")
-        ? [{ sample, batch }]
-        : [];
+      return inTransaction && keys.includes("sample") ? visualRows : [];
     }
     if (table === knowledgeBaseSnapshots) {
       return inTransaction ? [snapshot] : [];
@@ -177,7 +177,7 @@ function serviceDatabaseFixture() {
         ? [{ sequence: 0 }]
         : [];
     }
-    if (table === websiteStyleSampleBatches) return [];
+    if (table === websiteStyleSampleBatches) return publishedBatches;
     return [];
   };
   const select = (selection?: unknown) => {
@@ -248,6 +248,8 @@ function serviceDatabaseFixture() {
     inserts,
     updates,
     customerCredential,
+    visualRows,
+    publishedBatches,
   };
 }
 
@@ -267,6 +269,16 @@ function selectVisualInput(revision: number, sampleId: string) {
   };
 }
 
+function delegateVisualInput(revision: number) {
+  return {
+    conversationId: "siteops:7",
+    action: "delegate_visual",
+    clientRequestId: "delegate-visual-across-pages-1",
+    expectedRevision: revision,
+    input: {},
+  } as const;
+}
+
 beforeEach(() => {
   dependencies.getDb.mockReset();
   dependencies.reserveQuota.mockClear();
@@ -283,6 +295,105 @@ beforeEach(() => {
 });
 
 describe("SiteOps accepted rebuild visual selection", () => {
+  it("rejects a fourth visual page before reserving another operation", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    Object.assign(fixture.project, {
+      brief: siteBriefFromSnapshot({
+        sourceFileName: "knowledge.zip",
+        documents: [
+          {
+            id: "overview-source",
+            path: "企业概览.md",
+            title: "企业概览",
+            content: "星河智造提供经过来源核验的设备巡检服务。",
+            kind: "overview",
+            evidenceStatus: "verified_first_party",
+            customerVisible: true,
+          },
+        ],
+        assets: [],
+      } as never),
+    });
+    fixture.publishedBatches.push(
+      { id: "45000000-0000-4000-8000-000000000001" },
+      { id: "45000000-0000-4000-8000-000000000002" },
+      { id: "45000000-0000-4000-8000-000000000003" },
+    );
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(actor as never, {
+        conversationId: "siteops:7",
+        action: "reselect_visual",
+        clientRequestId: "reselect-visual-page-four",
+        expectedRevision: fixture.project.revision,
+        input: {},
+      }),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+    expect(
+      fixture.inserts.some((entry) => entry.table === siteOperations),
+    ).toBe(false);
+  });
+
+  it("recommends the highest score across all 27 published candidates", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    fixture.visualRows.splice(
+      0,
+      fixture.visualRows.length,
+      ...Array.from({ length: 27 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0");
+        const sampleId = `40000000-0000-4000-8000-${suffix}`;
+        const previewLocalAssetId = `41000000-0000-4000-8000-${suffix}`;
+        const digest = ((index % 15) + 1).toString(16).repeat(64);
+        const visualEvidence = createVisualEvidenceV1({
+          evidenceKind: "catalog_metadata_preview_v1",
+          providerItemKey: `n:${index + 1}`,
+          metadataSha256: digest,
+          providerResponseSha256: digest,
+          previewSha256: digest,
+          taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+        });
+        const referenceBlueprint = referenceBlueprintV3ForFamily({
+          candidateId: sampleId,
+          providerItemKey: visualEvidence.providerItemKey,
+          previewLocalAssetId,
+          previewSha256: visualEvidence.previewSha256,
+          heroFamily: "floating_orbit",
+          inspirationEvidenceIds: [visualEvidence.evidenceSha256],
+        });
+        return {
+          batch: fixture.batch,
+          sample: {
+            ...fixture.sample,
+            id: sampleId,
+            previewLocalAssetId,
+            sourceMetadata: {
+              ...fixture.sample.sourceMetadata,
+              providerItemKey: visualEvidence.providerItemKey,
+              visualEvidence,
+              referenceBlueprint,
+              score: index,
+            },
+          },
+        };
+      }),
+    );
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      delegateVisualInput(fixture.project.revision),
+    );
+
+    expect(
+      fixture.inserts.find((entry) => entry.table === siteBuilds)?.values,
+    ).toMatchObject({
+      styleSampleId: "40000000-0000-4000-8000-000000000027",
+    });
+  });
+
   it("reserves the first website build quota and makes the root build current", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;

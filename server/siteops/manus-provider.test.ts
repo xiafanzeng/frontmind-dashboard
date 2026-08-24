@@ -181,6 +181,7 @@ describe("Manus SiteOps provider boundary", () => {
     const repair = contentRepairPrompt({
       repairAttempt: 2,
       outputFilename: "frontmind-page-content-wire-v2.json",
+      repairReason: "EMPTY_TYPED_BLOCK_BODY",
     });
 
     expect(completion).toBe(
@@ -188,6 +189,8 @@ describe("Manus SiteOps provider boundary", () => {
     );
     expect(completion).not.toMatch(/Astro/u);
     expect(repair).toContain("受信网站 QA");
+    expect(repair).toContain("数据驱动");
+    expect(repair).toContain("正式恢复副本");
     expect(repair).not.toMatch(/Astro/u);
   });
 

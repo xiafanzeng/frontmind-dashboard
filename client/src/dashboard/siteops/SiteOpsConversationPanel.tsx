@@ -1,4 +1,5 @@
 import type {
+  SiteOpsExecutionStep,
   SiteOpsMessageProjection,
   SiteOpsObservationV1,
   SiteOpsPublicVisualCandidate,
@@ -15,11 +16,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import MarkdownRenderer from "@/components/MarkdownRenderer";
+import { copyToClipboard } from "@/lib/utils";
 import {
   AlertCircle,
   Bot,
   Check,
+  ChevronLeft,
+  ChevronRight,
+  Clock3,
   Cloud,
+  Copy,
   Download,
   ExternalLink,
   FileArchive,
@@ -31,7 +38,7 @@ import {
   UserRound,
   Wrench,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./siteops-conversation-panel.css";
 
 type SiteOpsActionContext = Pick<
@@ -212,6 +219,157 @@ function customerFacingMessage(content: string) {
   return sanitized || "任务需要协助，请稍后重试或提交工单。";
 }
 
+const SITEOPS_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+function formatSiteOpsDuration(
+  startedAt: string,
+  completedAt: string | null,
+  now: number,
+) {
+  const started = Date.parse(startedAt);
+  const completed = completedAt ? Date.parse(completedAt) : now;
+  const totalSeconds = Math.max(0, Math.floor((completed - started) / 1_000));
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes} 分 ${seconds} 秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 小时 ${minutes % 60} 分`;
+}
+
+function SiteOpsMessageBubble({ item }: { item: SiteOpsMessageProjection }) {
+  const [copied, setCopied] = useState(false);
+  const content = customerFacingMessage(item.content);
+  return (
+    <article className="siteops-message" data-role={item.role}>
+      <span className="siteops-message-avatar" aria-hidden="true">
+        {item.role === "user" ? <UserRound size={17} /> : <Bot size={17} />}
+      </span>
+      <div className="siteops-message-bubble">
+        <div className="siteops-message-meta">
+          <strong>
+            {item.role === "user" ? "你" : SITEOPS_CUSTOMER_DISPLAY_NAME}
+          </strong>
+          {item.metadata?.siteOps && (
+            <span data-status={item.metadata.siteOps.status}>
+              {CARD_LABELS[item.metadata.siteOps.kind] || "任务状态"}
+            </span>
+          )}
+        </div>
+        {item.role === "assistant" ? (
+          <MarkdownRenderer
+            content={content}
+            className="siteops-message-markdown"
+          />
+        ) : (
+          <p>{content}</p>
+        )}
+        <footer className="siteops-message-footer">
+          <time dateTime={item.sentAt}>
+            {SITEOPS_TIME_FORMATTER.format(new Date(item.sentAt))}
+          </time>
+          {item.role === "assistant" && (
+            <button
+              type="button"
+              aria-label={copied ? "已复制消息" : "复制消息"}
+              title={copied ? "已复制" : "复制"}
+              onClick={() => {
+                void copyToClipboard(content).then((ok) => setCopied(ok));
+              }}
+            >
+              {copied ? (
+                <Check size={13} aria-hidden="true" />
+              ) : (
+                <Copy size={13} aria-hidden="true" />
+              )}
+            </button>
+          )}
+        </footer>
+      </div>
+    </article>
+  );
+}
+
+function SiteOpsExecutionTimeline({
+  steps,
+}: {
+  steps: SiteOpsExecutionStep[];
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  const operationId = useMemo(() => {
+    const active = steps.find((step) =>
+      ["queued", "running"].includes(step.status),
+    );
+    const selected = active ?? steps[0];
+    return selected?.id.split(":", 1)[0] ?? null;
+  }, [steps]);
+  const visibleSteps = useMemo(
+    () =>
+      operationId
+        ? steps.filter((step) => step.id.startsWith(`${operationId}:`))
+        : [],
+    [operationId, steps],
+  );
+  const isRunning = visibleSteps.some((step) => step.status === "running");
+
+  useEffect(() => {
+    if (!isRunning) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [isRunning, operationId]);
+
+  if (visibleSteps.length === 0) return null;
+  return (
+    <section
+      className="siteops-execution-timeline"
+      aria-labelledby="siteops-timeline-title"
+    >
+      <div className="siteops-timeline-heading">
+        <div>
+          <Clock3 size={17} aria-hidden="true" />
+          <h3 id="siteops-timeline-title">执行时间线</h3>
+        </div>
+        {isRunning && <span>运行中 · 每秒更新</span>}
+      </div>
+      <ol>
+        {visibleSteps.map((step) => (
+          <li key={step.id} data-status={step.status}>
+            <span className="siteops-timeline-icon" aria-hidden="true">
+              {step.status === "running" ? (
+                <Loader2 className="siteops-spin" size={15} />
+              ) : step.status === "succeeded" ? (
+                <Check size={15} />
+              ) : ["failed", "attention_required"].includes(step.status) ? (
+                <AlertCircle size={15} />
+              ) : (
+                <Clock3 size={14} />
+              )}
+            </span>
+            <div>
+              <strong>{step.label}</strong>
+              <time dateTime={step.startedAt}>
+                {SITEOPS_TIME_FORMATTER.format(new Date(step.startedAt))}
+              </time>
+            </div>
+            <span className="siteops-timeline-duration">
+              {step.status === "queued"
+                ? "等待开始"
+                : formatSiteOpsDuration(step.startedAt, step.completedAt, now)}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function customerDomainStateLabel(value: string | null | undefined) {
   const labels: Record<string, string> = {
     verified: "已完成",
@@ -307,6 +465,8 @@ export default function SiteOpsConversationPanel({
   const [typedDomain, setTypedDomain] = useState("");
   const [registrantProfileId, setRegistrantProfileId] = useState("");
   const [icpNumber, setIcpNumber] = useState("");
+  const [activeVisualPage, setActiveVisualPage] = useState(1);
+  const previousVisualPageCount = useRef(0);
   const latestAttempt = useMemo(() => {
     const visibleBuilds = observation?.builds.filter(
       (build) => !["cancelled", "superseded"].includes(build.status),
@@ -341,6 +501,32 @@ export default function SiteOpsConversationPanel({
       ) || observation?.deployments.some((item) => item.status === "active"),
     [observation?.builds, observation?.deployments],
   );
+  const visualPages = useMemo(() => {
+    if (observation?.visualCandidatePages?.length) {
+      return observation.visualCandidatePages;
+    }
+    return observation?.visualCandidates.length
+      ? [
+          {
+            batchId: "legacy-current-page",
+            page: 1,
+            candidates: observation.visualCandidates,
+          },
+        ]
+      : [];
+  }, [observation?.visualCandidatePages, observation?.visualCandidates]);
+
+  useEffect(() => {
+    const count = visualPages.length;
+    if (count > previousVisualPageCount.current) {
+      setActiveVisualPage(count);
+    } else if (count === 0) {
+      setActiveVisualPage(1);
+    } else {
+      setActiveVisualPage((current) => Math.min(Math.max(current, 1), count));
+    }
+    previousVisualPageCount.current = count;
+  }, [visualPages.length]);
 
   useEffect(() => {
     setPreviewOpenError(null);
@@ -615,6 +801,14 @@ export default function SiteOpsConversationPanel({
     observation.interactionState === "awaiting_visual_selection";
   const visualSelectionDisabled =
     interactionLocked || !visualSelectionOpen || !aiBuilderConfigured;
+  const currentVisualPage =
+    visualPages.find((page) => page.page === activeVisualPage) ??
+    visualPages[visualPages.length - 1];
+  const visualGeneration = observation.visualGeneration ?? {
+    generatedPages: visualPages.length,
+    maxPages: 3,
+    canGenerateMore: visualPages.length < 3,
+  };
   const currentSnapshotId = observation.project.currentKnowledgeSnapshotId;
   const effectiveSnapshotId = selectedSnapshotId || currentSnapshotId || "";
   const latestQuote = observation.domainOperations.find(
@@ -914,6 +1108,8 @@ export default function SiteOpsConversationPanel({
         </strong>
       </div>
 
+      <SiteOpsExecutionTimeline steps={observation.executionSteps ?? []} />
+
       {(observation.interactionState === "select_snapshot" ||
         !currentSnapshotId) && (
         <section
@@ -1163,39 +1359,12 @@ export default function SiteOpsConversationPanel({
           </div>
         ) : (
           observation.messages.map((item) => (
-            <article
-              className="siteops-message"
-              data-role={item.role}
-              key={item.id}
-            >
-              <span className="siteops-message-avatar" aria-hidden="true">
-                {item.role === "user" ? (
-                  <UserRound size={16} />
-                ) : (
-                  <Bot size={16} />
-                )}
-              </span>
-              <div>
-                <div className="siteops-message-meta">
-                  <strong>
-                    {item.role === "user"
-                      ? "你"
-                      : SITEOPS_CUSTOMER_DISPLAY_NAME}
-                  </strong>
-                  {item.metadata?.siteOps && (
-                    <span data-status={item.metadata.siteOps.status}>
-                      {CARD_LABELS[item.metadata.siteOps.kind] || "任务状态"}
-                    </span>
-                  )}
-                </div>
-                <p>{customerFacingMessage(item.content)}</p>
-              </div>
-            </article>
+            <SiteOpsMessageBubble item={item} key={item.id} />
           ))
         )}
       </div>
 
-      {observation.visualCandidates.length > 0 && (
+      {visualPages.length > 0 && currentVisualPage && (
         <section
           className="siteops-visual-board"
           aria-labelledby="siteops-visual-title"
@@ -1203,7 +1372,9 @@ export default function SiteOpsConversationPanel({
           <div className="siteops-board-heading">
             <div>
               <h3 id="siteops-visual-title">
-                {visualSelectionOpen ? "9 个视觉候选" : "已选择的视觉方案"}
+                {visualSelectionOpen
+                  ? `${visualPages.length * 9} 个视觉候选`
+                  : "已选择的视觉方案"}
               </h3>
               <p>
                 以下为真实视觉参考；示例图片与文案不会复制到官网，FrontMind
@@ -1215,7 +1386,9 @@ export default function SiteOpsConversationPanel({
                 <button
                   type="button"
                   className="siteops-secondary-button"
-                  disabled={visualSelectionDisabled}
+                  disabled={
+                    visualSelectionDisabled || !visualGeneration.canGenerateMore
+                  }
                   onClick={() =>
                     runAction(
                       "reselect_visual",
@@ -1228,7 +1401,9 @@ export default function SiteOpsConversationPanel({
                     )
                   }
                 >
-                  重新生成 9 个视觉候选
+                  {visualGeneration.canGenerateMore
+                    ? "重新生成 9 个视觉候选"
+                    : "已生成全部 27 个候选"}
                 </button>
                 <button
                   type="button"
@@ -1257,8 +1432,57 @@ export default function SiteOpsConversationPanel({
               <span>{builderMessage}</span>
             </div>
           )}
+          {visualSelectionOpen && (
+            <div
+              className="siteops-visual-pagination"
+              aria-label="视觉候选分组"
+            >
+              <button
+                type="button"
+                aria-label="上一组视觉候选"
+                disabled={activeVisualPage <= 1}
+                onClick={() =>
+                  setActiveVisualPage((page) => Math.max(1, page - 1))
+                }
+              >
+                <ChevronLeft size={16} aria-hidden="true" />
+              </button>
+              <div>
+                {visualPages.map((page) => (
+                  <button
+                    type="button"
+                    key={page.batchId}
+                    data-active={page.page === activeVisualPage}
+                    aria-current={
+                      page.page === activeVisualPage ? "page" : undefined
+                    }
+                    onClick={() => setActiveVisualPage(page.page)}
+                  >
+                    第 {page.page} 组
+                  </button>
+                ))}
+              </div>
+              <span>
+                {visualGeneration.canGenerateMore
+                  ? `还可生成 ${visualGeneration.maxPages - visualGeneration.generatedPages} 组`
+                  : "27 选 1"}
+              </span>
+              <button
+                type="button"
+                aria-label="下一组视觉候选"
+                disabled={activeVisualPage >= visualPages.length}
+                onClick={() =>
+                  setActiveVisualPage((page) =>
+                    Math.min(visualPages.length, page + 1),
+                  )
+                }
+              >
+                <ChevronRight size={16} aria-hidden="true" />
+              </button>
+            </div>
+          )}
           <div className="siteops-visual-grid">
-            {observation.visualCandidates.map((candidate) => (
+            {currentVisualPage.candidates.map((candidate) => (
               <VisualCandidateCard
                 key={candidate.id}
                 candidate={candidate}

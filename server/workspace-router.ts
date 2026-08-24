@@ -369,15 +369,19 @@ export const workspaceRouter = router({
   brandTracking: router({
     overview: protectedProcedure.query(async ({ ctx }) => {
       try {
+        await assertServiceCapability(ctx.user.id, "brandTracking");
         return await getJenovaBrandTrackingOverview(ctx.user);
       } catch (error) {
+        if (error instanceof ServiceEntitlementError) toServiceError(error);
         toBrandTrackingServiceError(error);
       }
     }),
     listSessions: protectedProcedure.query(async ({ ctx }) => {
       try {
+        await assertServiceCapability(ctx.user.id, "brandTracking");
         return await listJenovaBrandTrackingSessions(ctx.user);
       } catch (error) {
+        if (error instanceof ServiceEntitlementError) toServiceError(error);
         toBrandTrackingServiceError(error);
       }
     }),
@@ -385,8 +389,10 @@ export const workspaceRouter = router({
       .input(z.object({ sessionId: z.string().uuid() }).strict())
       .query(async ({ ctx, input }) => {
         try {
+          await assertServiceCapability(ctx.user.id, "brandTracking");
           return await getJenovaBrandTrackingSession(ctx.user, input.sessionId);
         } catch (error) {
+          if (error instanceof ServiceEntitlementError) toServiceError(error);
           toBrandTrackingServiceError(error);
         }
       }),

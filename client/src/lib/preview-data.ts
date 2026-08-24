@@ -520,6 +520,7 @@ function capabilitySet(
     channelDistribution: values.channelDistribution || unavailable,
     progressReport: values.progressReport || unavailable,
     contentAssets: values.contentAssets || unavailable,
+    brandTracking: values.brandTracking || unavailable,
   };
 }
 

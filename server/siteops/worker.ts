@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
 import {
   localAssets,
   messages,
@@ -254,6 +254,99 @@ export function knownSiteOpsBuildFailure(
         ? error.message
         : "FrontMind AI 建站任务未能安全完成，请重置后重新开始。",
   };
+}
+
+type PublicBuildStage = "design_compiling" | "content_building" | "qa_running";
+
+type ProviderBuildStatus =
+  | "design_compiling"
+  | "contract_ready"
+  | "building"
+  | "qa_running"
+  | "preview_ready"
+  | "approved";
+
+function publicBuildStage(status: ProviderBuildStatus) {
+  if (status === "design_compiling") return "design_compiling" as const;
+  if (status === "contract_ready" || status === "building") {
+    return "content_building" as const;
+  }
+  if (status === "qa_running") return "qa_running" as const;
+  return null;
+}
+
+const PUBLIC_BUILD_STAGE_LABELS: Record<PublicBuildStage, string> = {
+  design_compiling: "设计合同生成",
+  content_building: "页面内容生成",
+  qa_running: "质量校验",
+};
+
+export async function appendBuildTimelineEvent(
+  tx: any,
+  input: {
+    operation: Claimed;
+    buildStatus: ProviderBuildStatus;
+    now: Date;
+  },
+) {
+  if (!input.operation.buildId) return;
+  const stage = publicBuildStage(input.buildStatus);
+  if (!stage) return;
+  const projectRows = await tx
+    .select({
+      conversationId: siteProjects.conversationId,
+      revision: siteProjects.revision,
+    })
+    .from(siteProjects)
+    .where(eq(siteProjects.id, input.operation.projectId))
+    .limit(1);
+  const project = projectRows[0];
+  if (!project) return;
+  const existingRows = await tx
+    .select({ metadata: messages.metadata })
+    .from(messages)
+    .where(eq(messages.conversationId, project.conversationId))
+    .orderBy(desc(messages.sequence))
+    .limit(500);
+  const duplicate = existingRows.some((row: { metadata: unknown }) => {
+    const metadata = (row.metadata ?? {}) as Record<string, unknown>;
+    const siteOps = (metadata.siteOps ?? {}) as Record<string, unknown>;
+    const payload = (siteOps.payload ?? {}) as Record<string, unknown>;
+    return (
+      siteOps.subjectId === input.operation.id &&
+      (payload.visibility === "timeline" || payload.timelineOnly === true) &&
+      payload.stage === stage &&
+      payload.buildId === input.operation.buildId
+    );
+  });
+  if (duplicate) return;
+  const sequenceRows = await tx
+    .select({ sequence: max(messages.sequence) })
+    .from(messages)
+    .where(eq(messages.conversationId, project.conversationId));
+  await tx.insert(messages).values({
+    id: randomUUID(),
+    conversationId: project.conversationId,
+    userId: input.operation.userId,
+    role: "assistant",
+    content: PUBLIC_BUILD_STAGE_LABELS[stage],
+    sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
+    metadata: {
+      siteOps: {
+        kind: "build_progress",
+        subjectId: input.operation.id,
+        revision: project.revision,
+        status: "active",
+        payload: {
+          visibility: "timeline",
+          timelineOnly: true,
+          stage,
+          buildId: input.operation.buildId,
+          occurredAt: input.now.toISOString(),
+        },
+      },
+    },
+  });
 }
 
 async function claimOne(db: any): Promise<Claimed | null> {
@@ -555,6 +648,11 @@ async function finalize(
           ),
         );
       if (locked.buildId && result.buildStatus) {
+        await appendBuildTimelineEvent(tx, {
+          operation: locked as Claimed,
+          buildStatus: result.buildStatus,
+          now,
+        });
         await tx
           .update(siteBuilds)
           .set({ status: result.buildStatus, updatedAt: now })

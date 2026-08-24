@@ -20,6 +20,11 @@ SiteDesignSpecV2 plus a pre-materialization BuildPlanContractV4 whose content
 coordinates bind the frozen snapshot inventory. Phase two on the same task
 emits PageContentWireV3. Repairs reuse that task. After typed content, source
 and dist validate, Dashboard creates the final non-null BuildContractV4 hashes.
+Data-driven typed blocks may omit duplicate paragraphs when their canonical
+items or references are complete. Dashboard normalizes a non-URL-safe entity
+slug to its already validated unique entity id before canonical validation;
+the attached JSON remains the supported fallback when structured extraction
+does not yield an object.
 
 ## 3. React static materialization
 

@@ -51,7 +51,9 @@ import { keywordCategoryKey } from "@shared/keyword-categories";
 
 import {
   getCapability,
+  getRouteCapability,
   getWorkflowStepAccess,
+  isCapabilityIncludedInPlan,
   type ServiceAction,
   type ServiceCapability,
   type ServiceCapabilityKey,
@@ -682,11 +684,7 @@ export function ServiceHome({
               "通过 FrontMind 品牌追踪智能体监测品牌评价、舆情趋势与潜在风险。",
             route: { section: "public-opinion", sub: "brand-tracking" },
             step: null,
-            access: {
-              allowed: true,
-              reason: null,
-              nextAction: null,
-            },
+            access: getCapability(portal, "brandTracking"),
           },
         ]
       : workflowJourneyItems;
@@ -897,6 +895,13 @@ export function ServiceHome({
           </div>
           {journeyItems.map((item, index) => {
             const { access } = item;
+            const capabilityKey = item.route
+              ? getRouteCapability(item.route.section, item.route.sub)
+              : null;
+            const planLocked = Boolean(
+              capabilityKey &&
+                !isCapabilityIncludedInPlan(portal.plan.code, capabilityKey),
+            );
             return (
               <article
                 key={item.id}
@@ -938,8 +943,13 @@ export function ServiceHome({
                     size="sm"
                     variant="ghost"
                     className="justify-self-start text-[#5b2a86] sm:justify-self-end"
-                    onClick={() =>
-                      onNavigate(item.route!.section, item.route!.sub)
+                    disabled={planLocked}
+                    aria-disabled={planLocked}
+                    title={planLocked ? access.reason : undefined}
+                    onClick={
+                      planLocked
+                        ? undefined
+                        : () => onNavigate(item.route!.section, item.route!.sub)
                     }
                   >
                     {item.step?.status === "complete"
@@ -988,7 +998,22 @@ export function ServiceHome({
               size="sm"
               variant="ghost"
               className="justify-self-start text-[#5b2a86] sm:justify-self-end"
-              onClick={() => onNavigate("semantic", "content-assets")}
+              disabled={
+                !isCapabilityIncludedInPlan(portal.plan.code, "contentAssets")
+              }
+              aria-disabled={
+                !isCapabilityIncludedInPlan(portal.plan.code, "contentAssets")
+              }
+              title={
+                !isCapabilityIncludedInPlan(portal.plan.code, "contentAssets")
+                  ? contentOperationsAccess.reason
+                  : undefined
+              }
+              onClick={
+                isCapabilityIncludedInPlan(portal.plan.code, "contentAssets")
+                  ? () => onNavigate("semantic", "content-assets")
+                  : undefined
+              }
             >
               {contentOperationsAccess.allowed ? "管理" : "查看原因"}
               <ChevronRight className="h-4 w-4" />

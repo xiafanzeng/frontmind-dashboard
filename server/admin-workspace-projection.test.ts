@@ -221,6 +221,7 @@ const portal = servicePortalSchema.parse({
     channelDistribution: capability,
     progressReport: capability,
     contentAssets: capability,
+    brandTracking: capability,
   },
   workflowSteps: [],
   nextAction: {

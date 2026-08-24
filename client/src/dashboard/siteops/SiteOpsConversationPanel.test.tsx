@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { SiteOpsObservationV1 } from "@shared/siteops-contract";
 import SiteOpsConversationPanel from "./SiteOpsConversationPanel";
@@ -83,6 +89,13 @@ function observation(
         selected: false,
       },
     ],
+    visualCandidatePages: [],
+    visualGeneration: {
+      generatedPages: 0,
+      maxPages: 3,
+      canGenerateMore: true,
+    },
+    executionSteps: [],
     builds: [],
     deployments: [],
     socialPackages: [],
@@ -98,6 +111,25 @@ function observation(
     latestSequence: 1,
     ...input,
   };
+}
+
+function visualPage(page: 1 | 2 | 3) {
+  return {
+    batchId: `batch-${page}`,
+    page,
+    candidates: Array.from({ length: 9 }, (_, index) => {
+      const letter = String.fromCharCode(65 + index);
+      return {
+        id: `candidate-${page}-${letter}`,
+        label: `P${page}-${letter}`,
+        title: `第 ${page} 组 ${letter}`,
+        previewUrl: `/api/local-assets/page-${page}-${letter}`,
+        note: null,
+        visualFamily: null,
+        selected: false,
+      };
+    }),
+  } as const;
 }
 
 describe("SiteOpsConversationPanel", () => {
@@ -329,6 +361,121 @@ describe("SiteOpsConversationPanel", () => {
         cardKind: "visual_board",
       }),
     );
+  });
+
+  it("keeps three complete visual pages navigable and allows a choice from any page", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    const pages = [visualPage(1), visualPage(2), visualPage(3)];
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          visualCandidates: pages[2].candidates.slice(),
+          visualCandidatePages: pages.map((page) => ({
+            ...page,
+            candidates: page.candidates.slice(),
+          })),
+          visualGeneration: {
+            generatedPages: 3,
+            maxPages: 3,
+            canGenerateMore: false,
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "27 个视觉候选" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "已生成全部 27 个候选" }),
+    ).toBeDisabled();
+    expect(screen.getByText("27 选 1")).toBeInTheDocument();
+    expect(screen.getByAltText("P3-A：第 3 组 A")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "第 1 组" }));
+    expect(screen.getByAltText("P1-A：第 1 组 A")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "选择 P1-A" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "select_visual",
+        input: { sampleId: "candidate-1-A" },
+        messageId: "message-1",
+        cardKind: "visual_board",
+      }),
+    );
+  });
+
+  it("renders Markdown messages with timestamps and freezes completed stage durations", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          messages: [
+            {
+              id: "markdown-message",
+              role: "assistant",
+              content: "已完成 **质量校验**。",
+              sequence: 2,
+              metadata: null,
+              sentAt: "2026-08-22T00:01:05.000Z",
+            },
+          ],
+          executionSteps: [
+            {
+              id: "build-operation:qa_running",
+              operationKind: "site_build",
+              buildId: "33333333-3333-4333-8333-333333333333",
+              stage: "qa_running",
+              label: "质量校验",
+              status: "succeeded",
+              startedAt: "2026-08-22T00:00:00.000Z",
+              completedAt: "2026-08-22T00:01:05.000Z",
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(
+      document.querySelector(".siteops-message-markdown strong"),
+    ).toHaveTextContent("质量校验");
+    expect(
+      screen.getByRole("button", { name: "复制消息" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("1 分 5 秒")).toBeInTheDocument();
+    expect(
+      document.querySelector(".siteops-message-footer time"),
+    ).toHaveAttribute("datetime", "2026-08-22T00:01:05.000Z");
+  });
+
+  it("updates a running stage timer every second", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-08-22T00:00:05.000Z"));
+      render(
+        <SiteOpsConversationPanel
+          observation={observation({
+            executionSteps: [
+              {
+                id: "build-operation:design_compiling",
+                operationKind: "site_build",
+                buildId: "33333333-3333-4333-8333-333333333333",
+                stage: "design_compiling",
+                label: "设计合同生成",
+                status: "running",
+                startedAt: "2026-08-22T00:00:00.000Z",
+                completedAt: null,
+              },
+            ],
+          })}
+        />,
+      );
+      expect(screen.getByText("5 秒")).toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(screen.getByText("6 秒")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("delegates a visual choice without exposing an AI mode", async () => {

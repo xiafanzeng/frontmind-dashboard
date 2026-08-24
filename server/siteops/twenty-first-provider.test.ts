@@ -253,7 +253,7 @@ describe("21st SiteOps provider", () => {
     const context = providerContext();
     context.existingBoard = {
       batchId: "55555555-5555-4555-8555-555555555555",
-      candidateCount: 7,
+      candidateCount: 9,
       selectionBundleHash: "c".repeat(64),
     };
     const handler = createTwentyFirstSiteOpsProviderHandler({
@@ -274,7 +274,7 @@ describe("21st SiteOps provider", () => {
       status: "succeeded",
       result: {
         batchId: "55555555-5555-4555-8555-555555555555",
-        candidateCount: 7,
+        candidateCount: 9,
       },
     });
     expect(getCredential).not.toHaveBeenCalled();
@@ -380,9 +380,15 @@ describe("21st SiteOps provider", () => {
         })),
       ),
     );
+    const context = providerContext();
+    context.previousReferences = {
+      providerItemKeys: ["n:1"],
+      previewSha256s: [sha256(await perceptuallyDistinctPng(2))],
+      perceptualHashes: [patternHash(3)],
+    };
     const handler = createTwentyFirstSiteOpsProviderHandler({
       getDb: async () => ({ fake: "db" }),
-      loadContext: async () => providerContext(),
+      loadContext: async () => context,
       getCredential: async () => ({
         id: credentialId,
         version: 3,
@@ -432,8 +438,8 @@ describe("21st SiteOps provider", () => {
         candidateCount: 9,
         actual: {
           searched: 36,
-          shortlisted: 36,
-          mirrored: 36,
+          shortlisted: 35,
+          mirrored: 33,
           presented: 9,
         },
         diversity: {
@@ -495,6 +501,14 @@ describe("21st SiteOps provider", () => {
       },
     });
     expect(
+      persisted!.selectionBundle.candidates.some((candidate) =>
+        ["n:1", "n:2", "n:3"].includes(candidate.providerItemKey),
+      ),
+    ).toBe(false);
+    expect(persisted!.selectionBundle.degradedReasons).toContain(
+      "PREVIEW_RESULTS_REJECTED:2",
+    );
+    expect(
       new Set(
         persisted!.selectionBundle.candidates.map(
           (candidate) => candidate.referenceBlueprint.heroFamily,
@@ -528,7 +542,7 @@ describe("21st SiteOps provider", () => {
     }
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-visual-preview"),
-    ).toHaveLength(36);
+    ).toHaveLength(33);
     expect(
       artifacts.filter(
         (artifact) => artifact.kind === "frontmind-visual-preview",

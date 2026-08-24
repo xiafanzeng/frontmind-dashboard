@@ -7,10 +7,10 @@ import {
 } from "node:dns/promises";
 import { domainToASCII, domainToUnicode } from "node:url";
 
-import AliDns, * as AliDnsModels from "@alicloud/alidns20150109";
-import Domain, * as DomainModels from "@alicloud/domain20180129";
+import * as AliDnsModels from "@alicloud/alidns20150109";
+import * as DomainModels from "@alicloud/domain20180129";
 import * as OpenApi from "@alicloud/openapi-client";
-import Sts, * as StsModels from "@alicloud/sts20150401";
+import * as StsModels from "@alicloud/sts20150401";
 import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
 import { z } from "zod";
 
@@ -43,6 +43,11 @@ import {
   getActiveAliyunBrokerCredential,
   getPinnedAliyunBrokerCredential,
 } from "./aliyun-platform-service";
+import {
+  AliyunDnsClient,
+  AliyunDomainClient,
+  AliyunStsClient,
+} from "./aliyun-sdk-constructors";
 import {
   registerSiteOpsProviderHandler,
   type SiteOpsProviderHandler,
@@ -592,10 +597,12 @@ function mapTaskState(
 }
 
 class OfficialAliyunDomainApi implements AliyunDomainApi {
-  private readonly client: Domain;
+  private readonly client: InstanceType<typeof AliyunDomainClient>;
 
   constructor(credentials: AssumedCredentials) {
-    this.client = new Domain(temporaryConfig(credentials, DOMAIN_ENDPOINT));
+    this.client = new AliyunDomainClient(
+      temporaryConfig(credentials, DOMAIN_ENDPOINT),
+    );
   }
 
   async checkDomain(input: {
@@ -850,10 +857,12 @@ class OfficialAliyunDomainApi implements AliyunDomainApi {
 }
 
 class OfficialAliyunDnsApi implements AliyunDnsApi {
-  private readonly client: AliDns;
+  private readonly client: InstanceType<typeof AliyunDnsClient>;
 
   constructor(credentials: AssumedCredentials) {
-    this.client = new AliDns(temporaryConfig(credentials, ALIDNS_ENDPOINT));
+    this.client = new AliyunDnsClient(
+      temporaryConfig(credentials, ALIDNS_ENDPOINT),
+    );
   }
 
   async listDomains() {
@@ -998,7 +1007,7 @@ export class OfficialAliyunProviderSdkFactory
           : "FrontMind 服务身份未配置，无法 AssumeRole；未提交任何客户账号操作。",
       );
     }
-    const sts = new Sts(
+    const sts = new AliyunStsClient(
       new OpenApi.Config({
         accessKeyId: platformCredential.accessKeyId,
         accessKeySecret: platformCredential.accessKeySecret,
@@ -1040,7 +1049,9 @@ export class OfficialAliyunProviderSdkFactory
   }
 
   async getCallerAccount(credentials: AssumedCredentials) {
-    const client = new Sts(temporaryConfig(credentials, STS_ENDPOINT));
+    const client = new AliyunStsClient(
+      temporaryConfig(credentials, STS_ENDPOINT),
+    );
     const response = await client.getCallerIdentity();
     const accountId = response.body?.accountId;
     if (!accountId) {

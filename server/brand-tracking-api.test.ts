@@ -1,10 +1,11 @@
 import express from "express";
 import { createServer, request as httpRequest, type Server } from "node:http";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const serviceMocks = vi.hoisted(() => ({
   start: vi.fn(),
   send: vi.fn(),
+  assertCapability: vi.fn(),
 }));
 
 vi.mock("./jenova-brand-tracking-service", async (importOriginal) => {
@@ -14,6 +15,13 @@ vi.mock("./jenova-brand-tracking-service", async (importOriginal) => {
     ...actual,
     startJenovaBrandTrackingSession: serviceMocks.start,
     sendJenovaBrandTrackingMessage: serviceMocks.send,
+  };
+});
+vi.mock("./service-entitlement", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./service-entitlement")>();
+  return {
+    ...actual,
+    assertServiceCapability: serviceMocks.assertCapability,
   };
 });
 
@@ -26,9 +34,14 @@ const alternatePrivateProvider = ["Ma", "nus"].join("");
 
 let server: Server | null = null;
 
+beforeEach(() => {
+  serviceMocks.assertCapability.mockResolvedValue({});
+});
+
 afterEach(async () => {
   serviceMocks.start.mockReset();
   serviceMocks.send.mockReset();
+  serviceMocks.assertCapability.mockReset();
   if (server)
     await new Promise<void>((resolve) => server!.close(() => resolve()));
   server = null;
@@ -76,6 +89,35 @@ function paidPostHeaders(baseUrl: string) {
 }
 
 describe("Jenova brand tracking SSE API", () => {
+  it("rejects direct session creation when the plan does not include brand tracking", async () => {
+    const { ServiceEntitlementError } = await import("./service-entitlement");
+    serviceMocks.assertCapability.mockRejectedValueOnce(
+      new ServiceEntitlementError(
+        "CAPABILITY_UPGRADE_REQUIRED",
+        "当前版本不包含此能力，可升级进阶版或豪华版解锁。",
+        403,
+      ),
+    );
+    const baseUrl = await appUrl();
+    const response = await fetch(`${baseUrl}/api/brand-tracking/sessions`, {
+      method: "POST",
+      headers: paidPostHeaders(baseUrl),
+      body: JSON.stringify({
+        clientRequestId: "11111111-1111-4111-8111-111111111111",
+      }),
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "CAPABILITY_UPGRADE_REQUIRED" },
+    });
+    expect(serviceMocks.assertCapability).toHaveBeenCalledWith(
+      7,
+      "brandTracking",
+    );
+    expect(serviceMocks.start).not.toHaveBeenCalled();
+  });
+
   it("relays the normalized session/delta/progress/usage/end contract", async () => {
     serviceMocks.start.mockImplementation(async ({ emit }) => {
       await emit({

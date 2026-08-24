@@ -364,7 +364,8 @@ describe("service plan catalogue", () => {
       monitoring: true,
       channelDistribution: true,
       progressReport: true,
-      contentAssets: true,
+      contentAssets: false,
+      brandTracking: false,
     });
   });
 
@@ -2219,22 +2220,19 @@ describe("capability assertions", () => {
     });
   });
 
-  it("blocks content assets until the plan-specific knowledge publication exists", async () => {
+  it("blocks Basic content assets by plan and higher plans until knowledge publication", async () => {
     await expect(
       assertServiceCapability(7, "contentAssets", {
         now: NOW,
         repository: repository(state("basic")),
       }),
-    ).rejects.toMatchObject({ code: "KNOWLEDGE_SNAPSHOT_NOT_FOUND" });
+    ).rejects.toMatchObject({ code: "CAPABILITY_UPGRADE_REQUIRED" });
     await expect(
       assertServiceCapability(7, "contentAssets", {
         now: NOW,
         repository: repository(state("basic", { knowledgeVersion: 1 })),
       }),
-    ).resolves.toMatchObject({
-      service: { planCode: "basic" },
-      capabilities: { contentAssets: { allowed: true } },
-    });
+    ).rejects.toMatchObject({ code: "CAPABILITY_UPGRADE_REQUIRED" });
     await expect(
       assertServiceCapability(7, "contentAssets", {
         now: NOW,
@@ -2246,6 +2244,24 @@ describe("capability assertions", () => {
         ),
       }),
     ).rejects.toMatchObject({ code: "KNOWLEDGE_SNAPSHOT_NOT_FOUND" });
+  });
+
+  it("blocks brand tracking for Basic while keeping it in higher-plan service scope", async () => {
+    await expect(
+      assertServiceCapability(7, "brandTracking", {
+        now: NOW,
+        repository: repository(state("basic", { knowledgeVersion: 1 })),
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_UPGRADE_REQUIRED" });
+    await expect(
+      assertServiceCapability(7, "brandTracking", {
+        now: NOW,
+        repository: repository(state("advanced", { knowledgeVersion: 1 })),
+      }),
+    ).resolves.toMatchObject({
+      service: { planCode: "advanced" },
+      capabilities: { brandTracking: { allowed: true } },
+    });
   });
 });
 

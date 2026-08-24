@@ -17,8 +17,8 @@
   "files": [
     {
       "path": "adapters/frontmind-dashboard.md",
-      "bytes": 2899,
-      "sha256": "a68eff1abc5f6a18b16bac1d54338d5deca57c8bfb1890515ad072797e2e23a1"
+      "bytes": 3230,
+      "sha256": "80653f942dc8a66bef9a224529f52b93acd16837cf3f9c783cded58b24c02c68"
     },
     {
       "path": "assets/host-starter-contract.json",
@@ -52,8 +52,8 @@
     },
     {
       "path": "SKILL.md",
-      "bytes": 5714,
-      "sha256": "4adb95440b1e4d0603d980b7ca7b87e803c418d6ccb7b54f29e3677013d0637c"
+      "bytes": 6256,
+      "sha256": "7451e479b8afb1aef72fe06f02088d9790429724fffaf41521a0b2b0f8613413"
     },
     {
       "path": "UPSTREAM.json",

@@ -4,6 +4,8 @@ import {
   siteOpsBuildStatusSchema,
   siteOpsCardSchema,
   siteOpsProjectStatusSchema,
+  SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+  SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
 } from "./siteops";
 export const siteOpsKnowledgeSnapshotSchema = z
   .object({
@@ -71,6 +73,28 @@ export const siteOpsVisualCandidateProjectionSchema = z
   })
   .strict();
 
+export const siteOpsVisualCandidatePageProjectionSchema = z
+  .object({
+    batchId: z.string().uuid(),
+    page: z.number().int().min(1).max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+    candidates: z
+      .array(siteOpsVisualCandidateProjectionSchema)
+      .length(SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE),
+  })
+  .strict();
+
+export const siteOpsVisualGenerationProjectionSchema = z
+  .object({
+    generatedPages: z
+      .number()
+      .int()
+      .min(0)
+      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+    maxPages: z.literal(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
+    canGenerateMore: z.boolean(),
+  })
+  .strict();
+
 export const siteOpsBuildProjectionSchema = z
   .object({
     id: z.string().uuid(),
@@ -82,6 +106,38 @@ export const siteOpsBuildProjectionSchema = z
     needsHelp: z.boolean().default(false),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+export const siteOpsExecutionStepProjectionSchema = z
+  .object({
+    id: z.string().trim().min(1).max(255),
+    operationKind: z.enum([
+      "visual_search",
+      "site_build",
+      "build_revision",
+      "deploy",
+    ]),
+    buildId: z.string().uuid().nullable(),
+    stage: z.enum([
+      "visual_searching",
+      "preparing",
+      "design_compiling",
+      "content_building",
+      "qa_running",
+      "completed",
+    ]),
+    label: z.string().trim().min(1).max(100),
+    status: z.enum([
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "attention_required",
+      "cancelled",
+    ]),
+    startedAt: z.string().datetime(),
+    completedAt: z.string().datetime().nullable(),
   })
   .strict();
 
@@ -323,6 +379,19 @@ export const siteOpsObservationV1Schema = z
       .array(siteOpsVisualCandidateProjectionSchema)
       .max(9)
       .default([]),
+    visualCandidatePages: z
+      .array(siteOpsVisualCandidatePageProjectionSchema)
+      .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .default([]),
+    visualGeneration: siteOpsVisualGenerationProjectionSchema.default({
+      generatedPages: 0,
+      maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+      canGenerateMore: false,
+    }),
+    executionSteps: z
+      .array(siteOpsExecutionStepProjectionSchema)
+      .max(300)
+      .default([]),
     builds: z.array(siteOpsBuildProjectionSchema).max(100).default([]),
     deployments: z
       .array(siteOpsDeploymentProjectionSchema)
@@ -374,7 +443,13 @@ export type SiteOpsMessageProjection = z.infer<
 export type SiteOpsPublicVisualCandidate = z.infer<
   typeof siteOpsVisualCandidateProjectionSchema
 >;
+export type SiteOpsVisualCandidatePage = z.infer<
+  typeof siteOpsVisualCandidatePageProjectionSchema
+>;
 export type SiteOpsBuildProjection = z.infer<
   typeof siteOpsBuildProjectionSchema
+>;
+export type SiteOpsExecutionStep = z.infer<
+  typeof siteOpsExecutionStepProjectionSchema
 >;
 export type SiteOpsObservationV1 = z.infer<typeof siteOpsObservationV1Schema>;

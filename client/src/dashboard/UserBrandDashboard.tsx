@@ -1887,7 +1887,13 @@ function SubNav({ items, section, route, onNavigate, portal }) {
           <button
             className={active ? "active" : ""}
             key={`${targetSection}-${item.id}`}
-            onClick={() => onNavigate(targetSection, item.id)}
+            onClick={
+              showPlanLock
+                ? undefined
+                : () => onNavigate(targetSection, item.id)
+            }
+            disabled={showPlanLock}
+            aria-disabled={showPlanLock}
             title={showPlanLock ? access?.reason : undefined}
             style={
               showPlanLock

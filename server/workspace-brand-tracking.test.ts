@@ -7,9 +7,17 @@ const mocks = vi.hoisted(() => ({
   getJenovaBrandTrackingOverview: vi.fn(),
   listJenovaBrandTrackingSessions: vi.fn(),
   getJenovaBrandTrackingSession: vi.fn(),
+  assertServiceCapability: vi.fn(),
 }));
 
 vi.mock("./jenova-brand-tracking-service", () => mocks);
+vi.mock("./service-entitlement", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./service-entitlement")>();
+  return {
+    ...actual,
+    assertServiceCapability: mocks.assertServiceCapability,
+  };
+});
 
 import { workspaceRouter } from "./workspace-router";
 
@@ -44,6 +52,7 @@ function context(): TrpcContext {
 describe("workspace Jenova brand-tracking router", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.assertServiceCapability.mockResolvedValue({});
     mocks.getJenovaBrandTrackingOverview.mockResolvedValue({
       eligible: true,
       keyConfigured: true,
@@ -93,6 +102,10 @@ describe("workspace Jenova brand-tracking router", () => {
     expect(mocks.getJenovaBrandTrackingOverview).toHaveBeenCalledWith(
       expect.objectContaining({ id: 7, marketEdition: "overseas" }),
     );
+    expect(mocks.assertServiceCapability).toHaveBeenCalledWith(
+      7,
+      "brandTracking",
+    );
   });
 
   it("lists local sessions and scopes a transcript lookup to the actor", async () => {
@@ -111,6 +124,7 @@ describe("workspace Jenova brand-tracking router", () => {
       expect.objectContaining({ id: 7 }),
       sessionId,
     );
+    expect(mocks.assertServiceCapability).toHaveBeenCalledTimes(2);
   });
 
   it("rejects malformed local session identifiers before the service", async () => {

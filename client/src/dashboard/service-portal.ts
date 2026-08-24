@@ -12,6 +12,7 @@ export type ServiceCapabilityKey =
   | "monitoring"
   | "channelDistribution"
   | "progressReport"
+  | "brandTracking"
   | "contentAssets";
 
 export type ServiceAction = {
@@ -150,6 +151,7 @@ const CAPABILITY_KEYS: ServiceCapabilityKey[] = [
   "monitoring",
   "channelDistribution",
   "progressReport",
+  "brandTracking",
   "contentAssets",
 ];
 
@@ -201,6 +203,12 @@ const CAPABILITY_ALIASES: Record<ServiceCapabilityKey, string[]> = {
     "progress_report",
     "optimizationReport",
     "optimization_report",
+  ],
+  brandTracking: [
+    "brandTracking",
+    "brand_tracking",
+    "publicOpinion",
+    "public_opinion",
   ],
   contentAssets: [
     "contentAssets",
@@ -1199,6 +1207,9 @@ export function getRouteCapability(
   }
   if (section === "progress" && sub === "optimization") {
     return "progressReport";
+  }
+  if (section === "public-opinion" && sub === "brand-tracking") {
+    return "brandTracking";
   }
   if (section === "semantic") return "contentAssets";
   return null;

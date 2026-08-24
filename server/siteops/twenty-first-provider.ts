@@ -30,6 +30,8 @@ import {
 } from "../../shared/siteops-workflow";
 import {
   siteBriefSchema,
+  SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+  SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
   visualSelectionBundleV4Schema,
   type SiteBrief,
 } from "../../shared/siteops";
@@ -74,6 +76,11 @@ export type TwentyFirstProviderContext = {
   snapshot: KnowledgeBaseSnapshot;
   brief: SiteBrief;
   existingBoard: ExistingBoard | null;
+  previousReferences?: {
+    providerItemKeys: string[];
+    previewSha256s: string[];
+    perceptualHashes: string[];
+  };
 };
 
 type PreviewArtifact = {
@@ -390,6 +397,28 @@ async function loadDefaultContext(
       selectionBundleHash: existingRows[0].selectionBundleHash,
     };
   }
+  const priorSampleRows = await db
+    .select({ sourceMetadata: websiteStyleSamples.sourceMetadata })
+    .from(websiteStyleSamples)
+    .innerJoin(
+      websiteStyleSampleBatches,
+      eq(websiteStyleSampleBatches.id, websiteStyleSamples.batchId),
+    )
+    .where(
+      and(
+        eq(websiteStyleSampleBatches.siteProjectId, project.id),
+        eq(websiteStyleSampleBatches.userId, operation.userId),
+        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+        eq(websiteStyleSampleBatches.status, "published"),
+      ),
+    );
+  const priorMetadata: Array<Record<string, unknown>> = priorSampleRows.map(
+    (row: { sourceMetadata: unknown }) =>
+      (row.sourceMetadata ?? {}) as Record<string, unknown>,
+  );
+  const priorEvidence: Array<Record<string, unknown>> = priorMetadata.map(
+    (metadata) => (metadata.visualEvidence ?? {}) as Record<string, unknown>,
+  );
   const snapshotRows = await db
     .select()
     .from(knowledgeBaseSnapshots)
@@ -412,6 +441,23 @@ async function loadDefaultContext(
     snapshot,
     brief: resolveSiteBrief(project, snapshot),
     existingBoard,
+    previousReferences: {
+      providerItemKeys: priorMetadata.flatMap((metadata) =>
+        typeof metadata.providerItemKey === "string"
+          ? [metadata.providerItemKey]
+          : [],
+      ),
+      previewSha256s: priorEvidence.flatMap((evidence) =>
+        typeof evidence.previewSha256 === "string"
+          ? [evidence.previewSha256]
+          : [],
+      ),
+      perceptualHashes: priorMetadata.flatMap((metadata) =>
+        typeof metadata.referencePerceptualHash === "string"
+          ? [metadata.referencePerceptualHash]
+          : [],
+      ),
+    },
   };
 }
 
@@ -813,6 +859,7 @@ async function searchFamilyRound(input: {
   >;
   signal: AbortSignal;
   diagnostics: VisualSearchDiagnostics;
+  excludedProviderKeys?: ReadonlySet<string>;
 }) {
   for (const family of input.families) {
     if (input.signal.aborted) {
@@ -853,6 +900,7 @@ async function searchFamilyRound(input: {
     for (const candidate of funnel.retrievalShortlist) {
       if (
         familyEligibleReference(family, candidate) &&
+        !input.excludedProviderKeys?.has(candidate.providerItemKey) &&
         !existingKeys.has(candidate.providerItemKey)
       ) {
         pool.push(candidate);
@@ -978,9 +1026,11 @@ async function mirrorCandidates(input: {
   persistArtifact: typeof persistSiteOpsArtifact;
   diagnostics: VisualSearchDiagnostics;
   seenPreviewHashes?: Set<string>;
+  seenPerceptualHashes?: Set<string>;
 }) {
   const mirrored: MirroredReference[] = [];
   const seenPreviewHashes = input.seenPreviewHashes ?? new Set<string>();
+  const seenPerceptualHashes = input.seenPerceptualHashes ?? new Set<string>();
   const budget = AbortSignal.timeout(45_000);
   const mirrorSignal = AbortSignal.any([input.signal, budget]);
   for (let offset = 0; offset < input.candidates.length; offset += 3) {
@@ -1016,11 +1066,17 @@ async function mirrorCandidates(input: {
     for (const downloadedItem of downloaded) {
       if (!downloadedItem) continue;
       const { candidate, preview, perceptualHash } = downloadedItem;
-      if (seenPreviewHashes.has(preview.sha256)) {
+      if (
+        seenPreviewHashes.has(preview.sha256) ||
+        [...seenPerceptualHashes].some(
+          (hash) => perceptualHashDistance(hash, perceptualHash) < 6,
+        )
+      ) {
         rejectDiagnostic(input.diagnostics, "duplicate");
         continue;
       }
       seenPreviewHashes.add(preview.sha256);
+      seenPerceptualHashes.add(perceptualHash);
       let asset: Awaited<ReturnType<typeof input.persistArtifact>>;
       try {
         asset = await input.persistArtifact({
@@ -1379,6 +1435,17 @@ async function persistDefaultBoard(
   db: any,
   input: TwentyFirstBoardPersistenceInput,
 ) {
+  if (
+    input.mirroredCandidates.length !== SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE ||
+    input.selectionBundle.candidates.length !==
+      SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_PAGE_INCOMPLETE",
+      "本组视觉候选未完整生成，请稍后重试。",
+      "attention_required",
+    );
+  }
   return db.transaction(async (tx: any): Promise<ExistingBoard> => {
     const lockedRows = await tx
       .select()
@@ -1429,16 +1496,26 @@ async function persistDefaultBoard(
       .select({ ordinal: max(websiteStyleSampleBatches.ordinal) })
       .from(websiteStyleSampleBatches)
       .where(eq(websiteStyleSampleBatches.userId, input.operation.userId));
-    await tx
-      .update(websiteStyleSampleBatches)
-      .set({ status: "superseded", updatedAt: new Date() })
+    const currentPublishedRows = await tx
+      .select({ id: websiteStyleSampleBatches.id })
+      .from(websiteStyleSampleBatches)
       .where(
         and(
           eq(websiteStyleSampleBatches.siteProjectId, project.id),
+          eq(websiteStyleSampleBatches.userId, input.operation.userId),
           eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
           eq(websiteStyleSampleBatches.status, "published"),
         ),
+      )
+      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .for("update");
+    if (currentPublishedRows.length >= SITEOPS_VISUAL_CANDIDATE_MAX_PAGES) {
+      throw new TwentyFirstProviderFailure(
+        "VISUAL_CANDIDATE_PAGE_LIMIT_REACHED",
+        "本轮已生成全部 27 个视觉候选，请直接选择视觉方向。",
+        "attention_required",
       );
+    }
     const batchId = randomUUID();
     const now = new Date();
     await tx.insert(websiteStyleSampleBatches).values({
@@ -1657,6 +1734,16 @@ export function createTwentyFirstSiteOpsProviderHandler(
       }
       const context = await loadContext(db, operation);
       if (context.existingBoard) {
+        if (
+          context.existingBoard.candidateCount !==
+          SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE
+        ) {
+          throw new TwentyFirstProviderFailure(
+            "VISUAL_CANDIDATE_PAGE_INCOMPLETE",
+            "已保存的视觉候选不完整，请稍后重试。",
+            "attention_required",
+          );
+        }
         return {
           status: "succeeded",
           projectStatus: "awaiting_visual_selection",
@@ -1691,7 +1778,15 @@ export function createTwentyFirstSiteOpsProviderHandler(
           >();
           const mirrored: MirroredReference[] = [];
           const attemptedProviderKeys = new Set<string>();
-          const seenPreviewHashes = new Set<string>();
+          const excludedProviderKeys = new Set(
+            context.previousReferences?.providerItemKeys ?? [],
+          );
+          const seenPreviewHashes = new Set(
+            context.previousReferences?.previewSha256s ?? [],
+          );
+          const seenPerceptualHashes = new Set(
+            context.previousReferences?.perceptualHashes ?? [],
+          );
           const supplementedFamilies = new Set<FrontMindVisualFamily>();
           const mirrorNewCandidates = async () => {
             const unique = new Map<string, NormalizedTwentyFirstCandidate>();
@@ -1718,6 +1813,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
                 persistArtifact,
                 diagnostics,
                 seenPreviewHashes,
+                seenPerceptualHashes,
               })),
             );
           };
@@ -1733,6 +1829,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
             searchedCandidates,
             signal,
             diagnostics,
+            excludedProviderKeys,
           });
           const provisional = maximumKeyAssignment(pools);
           const provisionallyMissing = FRONTMIND_VISUAL_FAMILIES_V3.filter(
@@ -1750,6 +1847,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
               searchedCandidates,
               signal,
               diagnostics,
+              excludedProviderKeys,
             });
             provisionallyMissing.forEach((family) =>
               supplementedFamilies.add(family),
@@ -1773,6 +1871,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
               searchedCandidates,
               signal,
               diagnostics,
+              excludedProviderKeys,
             });
             missingAfterMirror.forEach((family) =>
               supplementedFamilies.add(family),

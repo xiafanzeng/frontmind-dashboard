@@ -19,6 +19,7 @@ const capabilityKeys: ServiceCapabilityKey[] = [
   "channelDistribution",
   "progressReport",
   "contentAssets",
+  "brandTracking",
 ];
 
 function availableCapabilities() {
@@ -39,6 +40,9 @@ describe("service portal adapter", () => {
       "globalKeywords",
     );
     expect(getRouteCapability("progress", "monitor")).toBe("monitoring");
+    expect(getRouteCapability("public-opinion", "brand-tracking")).toBe(
+      "brandTracking",
+    );
   });
 
   it("normalizes the authoritative direct workspace.portal DTO", () => {
@@ -355,7 +359,10 @@ describe("service portal adapter", () => {
     expect(isCapabilityIncludedInPlan("basic", "knowledgeBuild")).toBe(false);
     expect(isCapabilityIncludedInPlan("basic", "globalKeywords")).toBe(false);
     expect(isCapabilityIncludedInPlan("basic", "knowledgeDisplay")).toBe(true);
-    expect(isCapabilityIncludedInPlan("basic", "contentAssets")).toBe(true);
+    expect(isCapabilityIncludedInPlan("basic", "contentAssets")).toBe(false);
+    expect(isCapabilityIncludedInPlan("basic", "brandTracking")).toBe(false);
+    expect(isCapabilityIncludedInPlan("advanced", "contentAssets")).toBe(true);
+    expect(isCapabilityIncludedInPlan("advanced", "brandTracking")).toBe(true);
     expect(isCapabilityIncludedInPlan("unknown", "knowledgeBuild")).toBe(true);
   });
 

@@ -135,6 +135,16 @@ const designResultSchema = z.union([
   siteDesignResultV1Schema,
 ]);
 
+const repairReasonSchema = z.enum([
+  "STRUCTURED_OUTPUT_UNAVAILABLE",
+  "EMPTY_TYPED_BLOCK_BODY",
+  "INVALID_ENTITY_SLUG",
+  "SOURCE_OR_ROUTE_MISMATCH",
+  "CONTENT_BINDING_MISMATCH",
+  "CONTENT_CONTRACT_MISMATCH",
+]);
+type RepairReason = z.infer<typeof repairReasonSchema>;
+
 const providerStateSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -153,6 +163,7 @@ const providerStateSchema = z
     design: designResultSchema.optional(),
     repairKind: z.enum(["design", "content"]).optional(),
     repairAttempt: z.number().int().min(1).max(3).optional(),
+    repairReason: repairReasonSchema.optional(),
     resultPendingSince: z.string().datetime().optional(),
     handledWaitingEventId: z.string().min(1).max(512).optional(),
     handledWaitingAt: z.string().datetime().optional(),
@@ -1466,9 +1477,54 @@ export function contentRepairPrompt(input: {
   repairAttempt: number;
   outputFilename?: string;
   wireVersion?: 2 | 3;
+  repairReason?: RepairReason;
 }) {
   const wire = `PageContentWireV${input.wireVersion ?? 2}`;
-  return `继续同一个 FrontMind AI 建站任务。上一次 ${wire} 或受信网站 QA 未通过。第 ${input.repairAttempt}/3 次修复：重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 ${wire}，只能引用允许的 sourceDocumentIds，并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}。不得浏览或补写外部新闻，不得输出源码、脚本或未知事实。`;
+  const reasonInstruction: Partial<Record<RepairReason, string>> = {
+    STRUCTURED_OUTPUT_UNAVAILABLE:
+      "结构化抽取未产生可用对象，请确保回复正文与附件是完全相同的单一 JSON 对象。",
+    EMPTY_TYPED_BLOCK_BODY:
+      "prose、quote、cta 必须有 paragraphs；feature_list、steps、metrics 应使用非空 items，entity_grid 与 faq_preview 应使用非空引用。",
+    INVALID_ENTITY_SLUG:
+      "实体 slug 请使用小写 ASCII 字母、数字、连字符或下划线。",
+    SOURCE_OR_ROUTE_MISMATCH:
+      "routeId、slotId 与 sourceDocumentIds 必须严格来自冻结合同。",
+    CONTENT_BINDING_MISMATCH: "实体、FAQ 与区块引用必须全部存在并保持唯一。",
+    CONTENT_CONTRACT_MISMATCH:
+      "请逐字段核对 PageContentWire 合同并返回完整对象。",
+  };
+  return `继续同一个 FrontMind AI 建站任务。上一次 ${wire} 或受信网站 QA 未通过。第 ${input.repairAttempt}/3 次修复：${input.repairReason ? (reasonInstruction[input.repairReason] ?? "") : ""}重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 ${wire}，只能引用允许的 sourceDocumentIds。数据驱动的 feature_list、steps、metrics、entity_grid、faq_preview 在 items 或引用完整时可以使用空 paragraphs；prose、quote、cta 必须有正文。实体 slug 优先使用 URL 安全的 ASCII。并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}，附件是结构化抽取失败时的正式恢复副本。不得浏览或补写外部新闻，不得输出源码、脚本或未知事实。`;
+}
+
+export function contentRepairReason(error: unknown): RepairReason {
+  if (error instanceof z.ZodError) {
+    const paths = error.issues.map((issue) => issue.path.join("."));
+    if (
+      paths.some(
+        (path) => path.endsWith("paragraphs") || path.endsWith("items"),
+      )
+    ) {
+      return "EMPTY_TYPED_BLOCK_BODY";
+    }
+    if (paths.some((path) => path.endsWith("slug"))) {
+      return "INVALID_ENTITY_SLUG";
+    }
+    if (
+      paths.some((path) =>
+        /(?:entityIds|faqIds|relatedEntityIds|entities|faqs)/u.test(path),
+      )
+    ) {
+      return "CONTENT_BINDING_MISMATCH";
+    }
+  }
+  const message = error instanceof Error ? error.message : "";
+  if (/(?:SOURCE|ROUTE)_.*MISMATCH/u.test(message)) {
+    return "SOURCE_OR_ROUTE_MISMATCH";
+  }
+  if (/(?:BIND|REFERENCE|ENTITY|FAQ)/iu.test(message)) {
+    return "CONTENT_BINDING_MISMATCH";
+  }
+  return "CONTENT_CONTRACT_MISMATCH";
 }
 
 async function scheduleRepair(input: {
@@ -1478,6 +1534,7 @@ async function scheduleRepair(input: {
   taskId: string;
   kind: "design" | "content";
   design?: z.infer<typeof designResultSchema>;
+  repairReason?: RepairReason;
   handledWaitingEventId?: string;
   handledWaitingAt?: string;
 }) {
@@ -1507,6 +1564,7 @@ async function scheduleRepair(input: {
       design: input.design,
       repairKind: input.kind,
       repairAttempt: attempt,
+      ...(input.repairReason ? { repairReason: input.repairReason } : {}),
       ...(input.handledWaitingEventId
         ? { handledWaitingEventId: input.handledWaitingEventId }
         : {}),
@@ -2414,6 +2472,7 @@ export function createManusSiteOpsProviderHandler(
               : contentRepairPrompt({
                   repairAttempt: state.repairAttempt,
                   outputFilename: contentOutputFilename,
+                  repairReason: state.repairReason,
                   wireVersion: usesBuildPlanContractV4(
                     workflow.frontMindVersion,
                   )
@@ -2857,7 +2916,7 @@ export function createManusSiteOpsProviderHandler(
             : siteOpsBuildContractAttachment(canonicalContract);
         const prompt = promptWithMarker(
           usesBuildPlanContractV4(workflow.frontMindVersion)
-            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v4.json 是 Dashboard 根据已校验设计与冻结知识库存生成的预物化计划合同；冻结的 ReferenceBlueprint、Hero family、route 与 inventory 不可更改。请返回 PageContentWireV3：使用受支持的 typed blockType，实体、FAQ 与 officialLinks 只能来自 source dossier 且逐项绑定 sourceDocumentIds；不得输出内部来源标签。若 news route 在 inventory 中没有 company_news，必须保留该 route 但不要为它输出 block 或 company_news entity，Dashboard 会渲染可信空状态。不得浏览、抓取或编造行业/企业新闻。把完全相同的 JSON 对象附加为 ${contentOutputFilename}。不得重复 SEO，不得生成源码、HTML、依赖、表单提交或外部脚本。${revisionInstruction}`
+            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v4.json 是 Dashboard 根据已校验设计与冻结知识库存生成的预物化计划合同；冻结的 ReferenceBlueprint、Hero family、route 与 inventory 不可更改。请返回 PageContentWireV3：使用受支持的 typed blockType，实体、FAQ 与 officialLinks 只能来自 source dossier 且逐项绑定 sourceDocumentIds；不得输出内部来源标签。feature_list、steps、metrics 必须使用非空 items，entity_grid 与 faq_preview 必须使用非空引用；这些数据驱动区块可使用空 paragraphs，prose、quote、cta 则必须有正文。实体 slug 请优先使用小写 ASCII 字母、数字、连字符或下划线。若 news route 在 inventory 中没有 company_news，必须保留该 route 但不要为它输出 block 或 company_news entity，Dashboard 会渲染可信空状态。不得浏览、抓取或编造行业/企业新闻。把完全相同的 JSON 对象附加为 ${contentOutputFilename}，附件是结构化抽取失败时的正式恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交或外部脚本。${revisionInstruction}`
             : reactStatic
               ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprint 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
               : `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV2，并严格匹配冻结 route、slot 与 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。${revisionInstruction}`,
@@ -2965,6 +3024,7 @@ export function createManusSiteOpsProviderHandler(
           taskId,
           kind: "content",
           design,
+          repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
         });
       }
       const rawContent = repairedContent ?? contentResolution?.value ?? null;
@@ -3084,7 +3144,7 @@ export function createManusSiteOpsProviderHandler(
               seo: design!.designSpec.seoPlan,
               routes: contentResult.pageContent.routes,
             });
-      } catch {
+      } catch (error) {
         return await scheduleRepair({
           db,
           operation,
@@ -3092,6 +3152,7 @@ export function createManusSiteOpsProviderHandler(
           taskId,
           kind: "content",
           design,
+          repairReason: contentRepairReason(error),
         });
       }
       await db

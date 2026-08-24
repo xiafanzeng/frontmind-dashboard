@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import Esa, * as EsaModels from "@alicloud/esa20240910";
-import Credential from "@alicloud/credentials";
+import * as EsaModels from "@alicloud/esa20240910";
 import * as OpenApi from "@alicloud/openapi-client";
 import { and, eq } from "drizzle-orm";
 import JSZip from "jszip";
@@ -23,6 +22,10 @@ import {
   persistSiteOpsArtifact,
   readSiteOpsArtifact,
 } from "./artifact-store";
+import {
+  AliyunCredential,
+  AliyunEsaClient,
+} from "./aliyun-sdk-constructors";
 import { materializeProductionSiteFromSource } from "./build-runtime";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import { fetchPinnedPublicHttps } from "./remote-preview";
@@ -247,11 +250,11 @@ function mapSite(body: any): EsaSiteView | null {
 }
 
 class OfficialEsaDirectApi implements EsaDirectApi {
-  private readonly client: Esa;
+  private readonly client: InstanceType<typeof AliyunEsaClient>;
 
   constructor() {
-    const credential = new Credential();
-    this.client = new Esa(
+    const credential = new AliyunCredential();
+    this.client = new AliyunEsaClient(
       new OpenApi.Config({
         credential,
         endpoint: ESA_ENDPOINT,

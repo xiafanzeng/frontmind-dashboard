@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { ManusV2StructuredOutputSchema } from "../manus-v2-client";
 import { canonicalJson } from "../../shared/siteops-workflow";
 import {
+  canonicalSiteContentEntitySlug,
   pageContentResultV2Schema,
   pageContentResultV1Schema,
   siteDesignResultV1Schema,
@@ -767,10 +768,7 @@ const pageContentWireV3Schema = z
               .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
             blockType: z.enum(contentBlockTypes),
             heading: z.string().trim().min(1).max(160),
-            paragraphs: z
-              .array(z.string().trim().min(1).max(2_000))
-              .min(1)
-              .max(16),
+            paragraphs: z.array(z.string().trim().min(1).max(2_000)).max(16),
             items: z.array(z.string().trim().min(1).max(500)).max(24),
             entityIds: z.array(z.string().trim().min(1).max(64)).max(24),
             faqIds: z.array(z.string().trim().min(1).max(64)).max(24),
@@ -792,10 +790,7 @@ const pageContentWireV3Schema = z
               .trim()
               .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
             entityType: z.enum(contentEntityTypes),
-            slug: z
-              .string()
-              .trim()
-              .regex(/^[a-z0-9](?:[a-z0-9_-]{0,62})$/u),
+            slug: z.string().trim().min(1).max(191),
             title: z.string().trim().min(1).max(180),
             summary: z.string().trim().min(1).max(600),
             body: z.array(z.string().trim().min(1).max(2_000)).min(1).max(24),
@@ -912,7 +907,10 @@ export function pageContentResultV2FromWire(
             .map(({ routeId: _routeId, ...block }) => block),
         };
       }),
-      entities: wire.entities,
+      entities: wire.entities.map((entity) => ({
+        ...entity,
+        slug: canonicalSiteContentEntitySlug(entity.slug, entity.entityId),
+      })),
       faqs: wire.faqs,
       officialLinks: wire.officialLinks,
     },

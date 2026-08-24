@@ -16,6 +16,7 @@ import {
   isSiteOpsStoppedProviderTaskResetSafe,
   normalizeSiteOpsDomain,
   parseSiteOpsActionPayload,
+  projectSiteOpsExecutionSteps,
   referenceBlueprintForSiteOpsRevision,
   requireAcceptedSiteOpsRebuild,
   resolvePinnedTwentyFirstCredentialForBatch,
@@ -45,6 +46,126 @@ import {
 } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it("projects real build stages once and preserves terminal elapsed time", () => {
+    const steps = projectSiteOpsExecutionSteps({
+      operations: [
+        {
+          id: "operation-build",
+          buildId: "build-1",
+          kind: "site_build",
+          status: "failed",
+          startedAt: new Date("2026-08-22T00:00:00.000Z"),
+          completedAt: new Date("2026-08-22T00:04:00.000Z"),
+          createdAt: new Date("2026-08-22T00:00:00.000Z"),
+        },
+      ],
+      timelineMessages: [
+        {
+          id: "message-design-first",
+          sentAt: new Date("2026-08-22T00:00:20.000Z"),
+          metadata: {
+            siteOps: {
+              subjectId: "operation-build",
+              payload: {
+                stage: "design_compiling",
+                buildId: "build-1",
+                occurredAt: "2026-08-22T00:00:20.000Z",
+              },
+            },
+          },
+        },
+        {
+          id: "message-design-duplicate",
+          sentAt: new Date("2026-08-22T00:00:40.000Z"),
+          metadata: {
+            siteOps: {
+              subjectId: "operation-build",
+              payload: {
+                stage: "design_compiling",
+                buildId: "build-1",
+                occurredAt: "2026-08-22T00:00:40.000Z",
+              },
+            },
+          },
+        },
+        {
+          id: "message-content",
+          sentAt: new Date("2026-08-22T00:01:00.000Z"),
+          metadata: {
+            siteOps: {
+              subjectId: "operation-build",
+              payload: {
+                stage: "content_building",
+                buildId: "build-1",
+                occurredAt: "2026-08-22T00:01:00.000Z",
+              },
+            },
+          },
+        },
+        {
+          id: "message-qa",
+          sentAt: new Date("2026-08-22T00:03:00.000Z"),
+          metadata: {
+            siteOps: {
+              subjectId: "operation-build",
+              payload: {
+                stage: "qa_running",
+                buildId: "build-1",
+                occurredAt: "2026-08-22T00:03:00.000Z",
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    expect(steps.map((step) => step.stage)).toEqual([
+      "preparing",
+      "design_compiling",
+      "content_building",
+      "qa_running",
+    ]);
+    expect(steps[0]).toMatchObject({
+      status: "succeeded",
+      startedAt: "2026-08-22T00:00:00.000Z",
+      completedAt: "2026-08-22T00:00:20.000Z",
+    });
+    expect(steps[3]).toMatchObject({
+      status: "failed",
+      completedAt: "2026-08-22T00:04:00.000Z",
+    });
+  });
+
+  it("uses one total-duration row for a historical build without stage events", () => {
+    expect(
+      projectSiteOpsExecutionSteps({
+        operations: [
+          {
+            id: "legacy-operation",
+            buildId: "legacy-build",
+            kind: "build_revision",
+            status: "succeeded",
+            startedAt: new Date("2026-08-22T00:00:00.000Z"),
+            completedAt: new Date("2026-08-22T00:05:00.000Z"),
+            createdAt: new Date("2026-08-22T00:00:00.000Z"),
+          },
+        ],
+        timelineMessages: [],
+      }),
+    ).toEqual([
+      {
+        id: "legacy-operation:legacy-total",
+        operationKind: "build_revision",
+        buildId: "legacy-build",
+        stage: "completed",
+        label: "官网制作",
+        status: "succeeded",
+        startedAt: "2026-08-22T00:00:00.000Z",
+        completedAt: "2026-08-22T00:05:00.000Z",
+      },
+    ]);
+  });
+
   it("allows an unselected visual board to be replaced without resetting the website", () => {
     expect(
       visualSearchAllowedForProjectStatus("awaiting_visual_selection", true),

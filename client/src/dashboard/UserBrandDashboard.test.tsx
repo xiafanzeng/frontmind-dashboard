@@ -255,8 +255,10 @@ describe("UserBrandDashboard service experience", () => {
     expect(knowledgeAgent.querySelector("svg")).toBeInTheDocument();
     expect(globalKeywords.querySelector("svg")).toBeInTheDocument();
     expect(knowledgeDisplay.querySelector("svg")).not.toBeInTheDocument();
-    expect(contentAssets.querySelector("svg")).not.toBeInTheDocument();
-    expect(websiteManagement.querySelector("svg")).not.toBeInTheDocument();
+    expect(contentAssets.querySelector("svg")).toBeInTheDocument();
+    expect(websiteManagement.querySelector("svg")).toBeInTheDocument();
+    expect(contentAssets).toBeDisabled();
+    expect(websiteManagement).toBeDisabled();
     expect(
       knowledgeAgent.compareDocumentPosition(knowledgeDisplay) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -356,25 +358,26 @@ describe("UserBrandDashboard service experience", () => {
     ).toBeInTheDocument();
   });
 
-  it("gives the basic plan one content request while keeping website management locked", () => {
+  it("locks content assets and website management for the basic plan", () => {
     setPreviewPlan("basic");
     render(<UserBrandDashboard preview />);
 
-    fireEvent.click(screen.getByRole("button", { name: "内容资产运营" }));
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "本周期剩余额度1次内容需求",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "选择品牌聚合榜单" }));
+    const contentAssets = screen.getByRole("button", {
+      name: "内容资产运营",
+    });
+    const websiteManagement = screen.getByRole("button", {
+      name: "AI友好官网管理",
+    });
+    expect(contentAssets).toBeDisabled();
+    expect(websiteManagement).toBeDisabled();
+    fireEvent.click(contentAssets);
+    fireEvent.click(websiteManagement);
     expect(
-      screen.getByRole("heading", { name: "提交内容需求" }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("剩余 1 次")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
+      screen.queryByRole("heading", { name: "提交内容需求" }),
+    ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("region", { name: "官网运营功能未开放" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("region", { name: "官网运营功能未开放" }),
+    ).not.toBeInTheDocument();
   });
 
   it("opens the server-gated AI-friendly website workflow without technical check cards", () => {
@@ -405,22 +408,14 @@ describe("UserBrandDashboard service experience", () => {
     expect(screen.queryByText("检查与合规检查")).not.toBeInTheDocument();
   });
 
-  it("never mounts the conversational knowledge builder for the basic plan", async () => {
+  it("keeps the basic knowledge builder locked and never mounts it", async () => {
     render(<UserBrandDashboard preview />);
 
-    fireEvent.click(screen.getByRole("button", { name: "知识库智能体" }));
-
-    expect(
-      screen.getByRole("heading", { name: "知识库智能体" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "普通版不包含知识库智能体；知识库由 Website 流程自动同步至本账号，服务团队可补录。升级进阶版或豪华版后可解锁知识库智能体。",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "升级进阶版" }),
-    ).toBeInTheDocument();
+    const knowledgeAgent = screen.getByRole("button", {
+      name: "知识库智能体",
+    });
+    expect(knowledgeAgent).toBeDisabled();
+    fireEvent.click(knowledgeAgent);
     expect(
       screen.queryByTestId("embedded-knowledge-base-panel"),
     ).not.toBeInTheDocument();
@@ -570,11 +565,13 @@ describe("UserBrandDashboard service experience", () => {
       screen.queryByRole("heading", { name: "美誉舆情" }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "品牌全域词库" }));
+    const globalKeywords = screen.getByRole("button", {
+      name: "品牌全域词库",
+    });
+    expect(globalKeywords).toBeDisabled();
+    fireEvent.click(globalKeywords);
     expect(
-      screen.getByText(
-        /品牌全域词库属于进阶版与豪华版服务范围，普通版只围绕已购的单个问题/,
-      ),
+      screen.getByRole("heading", { name: "尚未形成已确认的应答逻辑" }),
     ).toBeInTheDocument();
   });
 

@@ -42,6 +42,7 @@ export const serviceCapabilityKeySchema = z.enum([
   "monitoring",
   "channelDistribution",
   "progressReport",
+  "brandTracking",
   "contentAssets",
 ]);
 export type ServiceCapabilityKey = z.infer<typeof serviceCapabilityKeySchema>;
@@ -148,6 +149,7 @@ const FULL_SERVICE_CAPABILITIES: IncludedServiceCapabilities = Object.freeze({
   monitoring: true,
   channelDistribution: true,
   progressReport: true,
+  brandTracking: true,
   contentAssets: true,
 });
 
@@ -182,7 +184,8 @@ export const SERVICE_PLAN_CATALOG: Readonly<
       monitoring: true,
       channelDistribution: true,
       progressReport: true,
-      contentAssets: true,
+      brandTracking: false,
+      contentAssets: false,
     },
   },
   advanced: {
@@ -271,6 +274,7 @@ export const serviceCapabilitiesSchema = z.object({
   monitoring: serviceCapabilityAccessSchema,
   channelDistribution: serviceCapabilityAccessSchema,
   progressReport: serviceCapabilityAccessSchema,
+  brandTracking: serviceCapabilityAccessSchema,
   contentAssets: serviceCapabilityAccessSchema,
 });
 export type ServiceCapabilities = z.infer<typeof serviceCapabilitiesSchema>;

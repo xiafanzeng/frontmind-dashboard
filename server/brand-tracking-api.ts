@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 
 import type { FrontMindRequest } from "./_core/express-auth";
+import type { AuthenticatedUser } from "./auth-service";
 import { toBrandTrackingPublicEvent } from "./brand-tracking-public-projection";
 import {
   JenovaBrandTrackingError,
@@ -9,6 +10,10 @@ import {
   startJenovaBrandTrackingSession,
   type BrandTrackingSseEvent,
 } from "./jenova-brand-tracking-service";
+import {
+  assertServiceCapability,
+  ServiceEntitlementError,
+} from "./service-entitlement";
 
 const router = Router();
 
@@ -75,6 +80,30 @@ function sendJsonError(res: Response, error: unknown) {
   });
 }
 
+async function requireBrandTrackingCapability(
+  actor: AuthenticatedUser,
+  response: Response,
+) {
+  try {
+    await assertServiceCapability(actor.id, "brandTracking");
+    return true;
+  } catch (error) {
+    if (error instanceof ServiceEntitlementError) {
+      response.status(error.statusCode).json({
+        error: { code: error.code, message: error.message },
+      });
+      return false;
+    }
+    response.status(503).json({
+      error: {
+        code: "SERVICE_UNAVAILABLE",
+        message: "品牌追踪服务暂时不可用，请稍后重试",
+      },
+    });
+    return false;
+  }
+}
+
 function createSseChannel(res: Response) {
   let initialized = false;
   let disconnected = false;
@@ -129,6 +158,7 @@ router.post("/sessions", async (request, response) => {
     return;
   }
   if (rejectUnsafePaidPost(request, response)) return;
+  if (!(await requireBrandTrackingCapability(actor, response))) return;
   const channel = createSseChannel(response);
   try {
     await startJenovaBrandTrackingSession({
@@ -170,6 +200,7 @@ router.post("/sessions/:sessionId/messages", async (request, response) => {
     return;
   }
   if (rejectUnsafePaidPost(request, response)) return;
+  if (!(await requireBrandTrackingCapability(actor, response))) return;
   const channel = createSseChannel(response);
   try {
     await sendJenovaBrandTrackingMessage({

@@ -338,6 +338,154 @@ describe("SiteOps provider wire contracts", () => {
     ).toThrow("SITEOPS_CONTENT_SOURCE_OR_ROUTE_MISMATCH");
   });
 
+  it("accepts item-driven blocks without duplicate prose and normalizes non-ASCII slugs", () => {
+    const sourceDocumentId = "kb-overview-poison-001";
+    const wire = {
+      operationToken: "content-token-v3-data-blocks",
+      schemaVersion: 3,
+      routes: [
+        {
+          routeId: "home",
+          eyebrow: null,
+          heading: "可信制造服务",
+          summary: "仅使用冻结知识库。",
+        },
+      ],
+      blocks: [
+        {
+          routeId: "home",
+          slotId: "features",
+          blockType: "feature_list",
+          heading: "服务能力",
+          paragraphs: [],
+          items: ["设备巡检", "状态分析"],
+          entityIds: [],
+          faqIds: [],
+          sourceDocumentIds: [sourceDocumentId],
+        },
+        {
+          routeId: "home",
+          slotId: "process",
+          blockType: "steps",
+          heading: "服务步骤",
+          paragraphs: [],
+          items: ["需求确认", "方案实施"],
+          entityIds: [],
+          faqIds: [],
+          sourceDocumentIds: [sourceDocumentId],
+        },
+        {
+          routeId: "home",
+          slotId: "metrics",
+          blockType: "metrics",
+          heading: "服务指标",
+          paragraphs: [],
+          items: ["7×24 小时状态监测"],
+          entityIds: [],
+          faqIds: [],
+          sourceDocumentIds: [sourceDocumentId],
+        },
+        {
+          routeId: "home",
+          slotId: "services",
+          blockType: "entity_grid",
+          heading: "服务实体",
+          paragraphs: [],
+          items: [],
+          entityIds: ["equipment-service"],
+          faqIds: [],
+          sourceDocumentIds: [sourceDocumentId],
+        },
+        {
+          routeId: "home",
+          slotId: "questions",
+          blockType: "faq_preview",
+          heading: "常见问题",
+          paragraphs: [],
+          items: [],
+          entityIds: [],
+          faqIds: ["service-faq"],
+          sourceDocumentIds: [sourceDocumentId],
+        },
+      ],
+      entities: [
+        {
+          entityId: "equipment-service",
+          entityType: "service",
+          slug: "设备巡检服务",
+          title: "设备巡检服务",
+          summary: "经过来源核验的设备巡检服务。",
+          body: ["提供状态采集与巡检建议。"],
+          tags: ["设备巡检"],
+          publishedAt: null,
+          modifiedAt: null,
+          author: null,
+          sourceName: null,
+          sourceUrl: null,
+          sourceDocumentIds: [sourceDocumentId],
+          relatedEntityIds: [],
+        },
+      ],
+      faqs: [
+        {
+          faqId: "service-faq",
+          category: "服务",
+          question: "如何开始？",
+          answers: ["先核对需求与可用资料。"],
+          sourceDocumentIds: [sourceDocumentId],
+        },
+      ],
+      officialLinks: [],
+    };
+
+    const result = pageContentResultV2FromWire(
+      wire,
+      ["home"],
+      [sourceDocumentId],
+    );
+    expect(result.pageContent.routes[0]?.sections).toHaveLength(5);
+    expect(
+      result.pageContent.routes[0]?.sections.every(
+        (section) => section.paragraphs.length === 0,
+      ),
+    ).toBe(true);
+    expect(result.pageContent.entities[0]?.slug).toBe("equipment-service");
+
+    const ascii = structuredClone(wire);
+    ascii.entities[0]!.slug = "verified-service";
+    expect(
+      pageContentResultV2FromWire(ascii, ["home"], [sourceDocumentId])
+        .pageContent.entities[0]?.slug,
+    ).toBe("verified-service");
+
+    const emptyProse = structuredClone(wire);
+    emptyProse.blocks[0] = {
+      ...emptyProse.blocks[0]!,
+      blockType: "prose",
+      items: [],
+    };
+    expect(() =>
+      pageContentResultV2FromWire(emptyProse, ["home"], [sourceDocumentId]),
+    ).toThrow("Text-led content blocks require canonical paragraphs");
+
+    const missingItems = structuredClone(wire);
+    missingItems.blocks[0]!.items = [];
+    expect(() =>
+      pageContentResultV2FromWire(missingItems, ["home"], [sourceDocumentId]),
+    ).toThrow("Item-led content blocks require canonical items");
+
+    const collision = structuredClone(wire);
+    collision.entities.push({
+      ...collision.entities[0]!,
+      entityId: "second-service",
+      slug: "equipment-service",
+      title: "第二项服务",
+    });
+    expect(() =>
+      pageContentResultV2FromWire(collision, ["home"], [sourceDocumentId]),
+    ).toThrow("Content entity ids and type/slug routes must be unique");
+  });
+
   it("deterministically splits an oversized dossier without truncating document content", () => {
     const contents = ["甲", "乙", "丙"].map((character) =>
       character.repeat(3_000_000),

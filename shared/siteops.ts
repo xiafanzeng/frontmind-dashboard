@@ -164,7 +164,7 @@ export const SITEOPS_MATERIALIZER_V2_3 = {
     "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
   frontMindVersion: "2.3.0",
   runtimeManifestSha256:
-    "30b90fa1cd5339e7d30013be24dc9ad4e36069a2d8673f410d06487fd2720e49",
+    "8b184d606d593a88f74e5298bb7149e253694cdc0d09aaf7a24ede3612e6ed16",
   starterVersion: "2.3.0",
   starterSha256:
     "ad8f0d7c8e2cdbab0480ea4065a48bf8da0e536dcc5348b34eadbe527e7163f2",
@@ -410,6 +410,11 @@ export const visualEvidenceV1Schema = z
     evidenceSha256: z.string().regex(/^[a-f0-9]{64}$/),
   })
   .strict();
+
+export const SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE = 9;
+export const SITEOPS_VISUAL_CANDIDATE_MAX_PAGES = 3;
+export const SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL =
+  SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE * SITEOPS_VISUAL_CANDIDATE_MAX_PAGES;
 
 export const visualCandidateSchema = z
   .object({

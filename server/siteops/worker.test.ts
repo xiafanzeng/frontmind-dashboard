@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  appendBuildTimelineEvent,
   domainFinancialTerminalProjection,
   exclusiveSiteOpsLiveHeadProjection,
   knownSiteOpsBuildFailure,
@@ -63,6 +64,72 @@ describe("SiteOps financial terminal state", () => {
 });
 
 describe("SiteOps worker claim boundary", () => {
+  it("records each build timeline stage at most once", async () => {
+    const inserted: Array<Record<string, any>> = [];
+    const tx = {
+      select(selection: Record<string, unknown>) {
+        const keys = Object.keys(selection);
+        const rows = keys.includes("conversationId")
+          ? [{ conversationId: "siteops:7", revision: 4 }]
+          : keys.includes("metadata")
+            ? inserted.map((row) => ({ metadata: row.metadata }))
+            : [{ sequence: inserted.length }];
+        const query: any = {
+          from: () => query,
+          where: () => query,
+          orderBy: () => query,
+          limit: () => query,
+          then: (
+            resolve: (value: unknown) => unknown,
+            reject: (reason: unknown) => unknown,
+          ) => Promise.resolve(rows).then(resolve, reject),
+        };
+        return query;
+      },
+      insert: () => ({
+        values: async (value: Record<string, any>) => {
+          inserted.push(value);
+        },
+      }),
+    };
+    const operation = {
+      id: "operation-build",
+      projectId: "project-1",
+      userId: 7,
+      buildId: "build-1",
+    } as never;
+    const now = new Date("2026-08-22T00:01:00.000Z");
+
+    await appendBuildTimelineEvent(tx, {
+      operation,
+      buildStatus: "design_compiling",
+      now,
+    });
+    await appendBuildTimelineEvent(tx, {
+      operation,
+      buildStatus: "design_compiling",
+      now: new Date("2026-08-22T00:02:00.000Z"),
+    });
+
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({
+      content: "设计合同生成",
+      sequence: 1,
+      metadata: {
+        siteOps: {
+          subjectId: "operation-build",
+          payload: {
+            visibility: "timeline",
+            timelineOnly: true,
+            stage: "design_compiling",
+            buildId: "build-1",
+            occurredAt: "2026-08-22T00:01:00.000Z",
+          },
+        },
+      },
+    });
+  });
+
   it("verifies all five tenant-owned artifact coordinates before atomic build binding", () => {
     const ids = {
       contract: "10000000-0000-4000-8000-000000000001",
