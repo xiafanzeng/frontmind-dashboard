@@ -7,8 +7,11 @@ import {
   brandQuestionUniverseCreateFailureDisposition,
   brandQuestionUniverseFirstDispatchAction,
   brandQuestionUniverseFrozenRequestHash,
+  brandQuestionUniverseKnowledgeReadiness,
+  brandQuestionUniversePreparationServiceError,
   brandQuestionUniverseReplayMatches,
   brandQuestionUniverseStatusFencesStart,
+  observeBrandQuestionUniverse,
   projectBrandQuestionUniversePublicOperation,
   startBrandQuestionUniverse,
 } from "./brand-question-universe-service";
@@ -133,6 +136,101 @@ describe("brand question universe public API boundary", () => {
     );
     expect(brandQuestionUniverseStatusFencesStart("result_pending")).toBe(true);
     expect(brandQuestionUniverseStatusFencesStart("failed")).toBe(false);
+  });
+
+  it("uses one lightweight safe-knowledge readiness contract for observe and start", () => {
+    expect(
+      brandQuestionUniverseKnowledgeReadiness({
+        accepted: Array.from({ length: 56 }, () => ({}) as never),
+        acceptedBytes: 1024,
+      }),
+    ).toEqual({
+      ready: true,
+      acceptedDocuments: 56,
+      acceptedBytes: 1024,
+    });
+    expect(
+      brandQuestionUniverseKnowledgeReadiness({
+        accepted: [],
+        acceptedBytes: 0,
+      }),
+    ).toEqual({
+      ready: false,
+      reason: "safe_knowledge_required",
+      acceptedDocuments: 0,
+      acceptedBytes: 0,
+    });
+    expect(
+      brandQuestionUniverseKnowledgeReadiness({
+        accepted: Array.from({ length: 501 }, () => ({}) as never),
+        acceptedBytes: 1024,
+      }),
+    ).toMatchObject({
+      ready: false,
+      reason: "knowledge_scope_exceeded",
+    });
+    expect(
+      brandQuestionUniverseKnowledgeReadiness({
+        accepted: [{} as never],
+        acceptedBytes: 16 * 1024 * 1024 + 1,
+      }),
+    ).toMatchObject({
+      ready: false,
+      reason: "knowledge_scope_exceeded",
+    });
+
+    const observeSource = observeBrandQuestionUniverse.toString();
+    const startSource = startBrandQuestionUniverse.toString();
+    expect(observeSource).toContain(
+      "classifyBrandQuestionUniverseKnowledgeDocuments",
+    );
+    expect(startSource).toContain(
+      "classifyBrandQuestionUniverseKnowledgeDocuments",
+    );
+    expect(
+      startSource.indexOf("brandQuestionUniverseKnowledgeReadiness"),
+    ).toBeLessThan(startSource.indexOf("reserveOperation"));
+  });
+
+  it("maps preparation failures to stable customer-safe service errors", () => {
+    const empty = brandQuestionUniversePreparationServiceError(
+      "safe_knowledge_archive",
+      new Error("BRAND_QUESTION_UNIVERSE_SAFE_KNOWLEDGE_EMPTY"),
+    );
+    expect(empty).toMatchObject({
+      code: "SAFE_KNOWLEDGE_REQUIRED",
+      statusCode: 412,
+      message: "当前认证知识库没有可用于词库生成的公开内容。",
+    });
+    const oversized = brandQuestionUniversePreparationServiceError(
+      "safe_knowledge_archive",
+      new Error("BRAND_QUESTION_UNIVERSE_KNOWLEDGE_TOO_LARGE"),
+    );
+    expect(oversized).toMatchObject({
+      code: "KNOWLEDGE_SCOPE_EXCEEDED",
+      statusCode: 412,
+    });
+    const workflow = brandQuestionUniversePreparationServiceError(
+      "upstream_workflow",
+      Object.assign(new Error("missing"), { code: "ENOENT" }),
+    );
+    expect(workflow).toMatchObject({
+      code: "WORKFLOW_UNAVAILABLE",
+      statusCode: 503,
+      message: "品牌全域词库服务暂时不可用。",
+    });
+    expect(
+      brandQuestionUniversePreparationServiceError(
+        "upstream_workflow",
+        new TypeError("unexpected"),
+      ),
+    ).toBeNull();
+    expect(
+      brandQuestionUniversePreparationServiceError(
+        "safe_knowledge_archive",
+        new TypeError("unexpected"),
+      ),
+    ).toBeNull();
   });
 
   it("dispatches only send-ready rows and reconciles unknown outcomes by reads", () => {

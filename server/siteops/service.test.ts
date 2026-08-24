@@ -26,6 +26,7 @@ import {
   siteOpsResetCapability,
   siteOpsServiceErrorFromQuota,
   SiteOpsServiceError,
+  visualSearchReadiness,
 } from "./service";
 import { SiteOpsQuotaError } from "./quota-service";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
@@ -413,6 +414,131 @@ describe("SiteOps core contracts", () => {
         "faq",
       ]),
     );
+  });
+
+  it("allows the host-owned empty company-news route to start visual search", () => {
+    const brief = siteBriefFromSnapshot({
+      sourceFileName: "天印溯方-knowledge-base.zip",
+      documents: [
+        {
+          id: "overview-source",
+          path: "企业概览.md",
+          title: "企业概览",
+          content:
+            "公司名称：天印溯方。天印溯方提供有来源记录的健康管理与检测服务。",
+          kind: "overview",
+          evidenceStatus: "needs_verification",
+          customerVisible: true,
+        },
+      ],
+      assets: [],
+    } as never);
+
+    expect(brief.routes.find((route) => route.id === "news")).toMatchObject({
+      slug: "/news",
+      sourceDocumentIds: [],
+    });
+    expect(
+      brief.contentInventory.entries.some(
+        (entry) => entry.kind === "company_news",
+      ),
+    ).toBe(false);
+    expect(visualSearchReadiness(brief)).toEqual({ ready: true, brief });
+  });
+
+  it("rejects an empty news route when frozen company-news inventory exists", () => {
+    const brief = siteBriefFromSnapshot({
+      sourceFileName: "天印溯方-knowledge-base.zip",
+      documents: [
+        {
+          id: "overview-source",
+          path: "企业概览.md",
+          title: "企业概览",
+          content: "公司名称：天印溯方。企业提供有来源记录的健康管理服务。",
+          kind: "overview",
+          evidenceStatus: "verified_authoritative",
+          customerVisible: true,
+        },
+        {
+          id: "company-news-source",
+          path: "新闻/企业动态.md",
+          title: "企业动态",
+          content: "天印溯方发布了有来源和日期记录的企业动态。",
+          kind: "leaf",
+          evidenceStatus: "verified_first_party",
+          customerVisible: true,
+        },
+      ],
+      assets: [],
+    } as never);
+    const broken = {
+      ...brief,
+      routes: brief.routes.map((route) =>
+        route.id === "news" ? { ...route, sourceDocumentIds: [] } : route,
+      ),
+    };
+
+    expect(visualSearchReadiness(broken)).toEqual({
+      ready: false,
+      reason: "source_contract_mismatch",
+      routeId: "news",
+    });
+  });
+
+  it("rejects an ordinary source-less route", () => {
+    const brief = siteBriefFromSnapshot({
+      sourceFileName: "天印溯方-knowledge-base.zip",
+      documents: [
+        {
+          id: "overview-source",
+          path: "企业概览.md",
+          title: "企业概览",
+          content: "公司名称：天印溯方。企业提供有来源记录的健康管理服务。",
+          kind: "overview",
+          evidenceStatus: "verified_first_party",
+          customerVisible: true,
+        },
+      ],
+      assets: [],
+    } as never);
+    const broken = {
+      ...brief,
+      routes: brief.routes.map((route) =>
+        route.id === "about" ? { ...route, sourceDocumentIds: [] } : route,
+      ),
+    };
+
+    expect(visualSearchReadiness(broken)).toEqual({
+      ready: false,
+      reason: "source_contract_mismatch",
+      routeId: "about",
+    });
+  });
+
+  it("distinguishes true public-fact absence from a malformed SiteBrief", () => {
+    const brief = siteBriefFromSnapshot({
+      sourceFileName: "天印溯方-knowledge-base.zip",
+      documents: [
+        {
+          id: "overview-source",
+          path: "企业概览.md",
+          title: "企业概览",
+          content: "公司名称：天印溯方。企业提供有来源记录的健康管理服务。",
+          kind: "overview",
+          evidenceStatus: "verified_first_party",
+          customerVisible: true,
+        },
+      ],
+      assets: [],
+    } as never);
+
+    expect(visualSearchReadiness({ ...brief, verifiedFacts: [] })).toEqual({
+      ready: false,
+      reason: "no_public_facts",
+    });
+    expect(
+      visualSearchReadiness({ ...brief, unexpectedProviderField: true }),
+    ).toEqual({ ready: false, reason: "invalid_brief" });
   });
 
   it.each(["localhost", "127.0.0.1", "bad domain.com", "-bad.example"])(

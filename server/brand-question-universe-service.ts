@@ -31,6 +31,8 @@ import { getLatestAuthenticatedKnowledgeSnapshot } from "./authenticated-knowled
 import {
   BRAND_QUESTION_UNIVERSE_ADAPTER_FILENAME,
   BRAND_QUESTION_UNIVERSE_KNOWLEDGE_FILENAME,
+  BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_BYTES,
+  BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_DOCUMENTS,
   BRAND_QUESTION_UNIVERSE_UPSTREAM_FILENAME,
   BRAND_QUESTION_UNIVERSE_WIRE_SCHEMA,
   brandQuestionUniverseDashboardTable,
@@ -39,6 +41,7 @@ import {
   buildBrandQuestionUniverseAdapterArchive,
   buildBrandQuestionUniverseKnowledgeArchive,
   buildBrandQuestionUniversePrompt,
+  classifyBrandQuestionUniverseKnowledgeDocuments,
   keywordTablesAreAutomaticallyManaged,
   keywordTablesFingerprint,
   loadBrandQuestionUniverseUpstreamArchive,
@@ -222,6 +225,190 @@ export class BrandQuestionUniverseServiceError extends Error {
   ) {
     super(message);
     this.name = "BrandQuestionUniverseServiceError";
+  }
+}
+
+type KnowledgeClassification = ReturnType<
+  typeof classifyBrandQuestionUniverseKnowledgeDocuments
+>;
+
+export type BrandQuestionUniverseKnowledgeReadiness =
+  | { ready: true; acceptedDocuments: number; acceptedBytes: number }
+  | {
+      ready: false;
+      reason: "safe_knowledge_required" | "knowledge_scope_exceeded";
+      acceptedDocuments: number;
+      acceptedBytes: number;
+    };
+
+/**
+ * Lightweight eligibility contract shared by observe and start. Building the
+ * deterministic ZIP remains a start-only operation.
+ */
+export function brandQuestionUniverseKnowledgeReadiness(
+  classification: Pick<KnowledgeClassification, "accepted" | "acceptedBytes">,
+): BrandQuestionUniverseKnowledgeReadiness {
+  const acceptedDocuments = classification.accepted.length;
+  if (acceptedDocuments === 0) {
+    return {
+      ready: false,
+      reason: "safe_knowledge_required",
+      acceptedDocuments,
+      acceptedBytes: classification.acceptedBytes,
+    };
+  }
+  if (
+    acceptedDocuments > BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_DOCUMENTS ||
+    classification.acceptedBytes > BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_BYTES
+  ) {
+    return {
+      ready: false,
+      reason: "knowledge_scope_exceeded",
+      acceptedDocuments,
+      acceptedBytes: classification.acceptedBytes,
+    };
+  }
+  return {
+    ready: true,
+    acceptedDocuments,
+    acceptedBytes: classification.acceptedBytes,
+  };
+}
+
+function knowledgeReadinessError(
+  readiness: Exclude<BrandQuestionUniverseKnowledgeReadiness, { ready: true }>,
+) {
+  return readiness.reason === "safe_knowledge_required"
+    ? new BrandQuestionUniverseServiceError(
+        "SAFE_KNOWLEDGE_REQUIRED",
+        412,
+        "当前认证知识库没有可用于词库生成的公开内容。",
+      )
+    : new BrandQuestionUniverseServiceError(
+        "KNOWLEDGE_SCOPE_EXCEEDED",
+        412,
+        "当前知识库超过自动处理范围，请联系 FrontMind 协助。",
+      );
+}
+
+type PreparationStage =
+  | "upstream_workflow"
+  | "frontmind_adapter"
+  | "safe_knowledge_archive";
+
+function errorCodeForPreparation(error: unknown) {
+  return error instanceof Error ? error.message : "";
+}
+
+function isKnownWorkflowPreparationFailure(error: unknown) {
+  const filesystemCode =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : null;
+  if (filesystemCode === "ENOENT") return true;
+  return new Set([
+    "BRAND_QUESTION_UNIVERSE_WORKFLOW_MISSING",
+    "BRAND_QUESTION_UNIVERSE_UPSTREAM_INTEGRITY_FAILED",
+    "BRAND_QUESTION_UNIVERSE_ADAPTER_MANIFEST_INVALID",
+    "BRAND_QUESTION_UNIVERSE_ADAPTER_INTEGRITY_FAILED",
+  ]).has(errorCodeForPreparation(error));
+}
+
+export function brandQuestionUniversePreparationServiceError(
+  stage: PreparationStage,
+  error: unknown,
+) {
+  if (error instanceof BrandQuestionUniverseServiceError) return error;
+  if (
+    (stage === "upstream_workflow" || stage === "frontmind_adapter") &&
+    isKnownWorkflowPreparationFailure(error)
+  ) {
+    return new BrandQuestionUniverseServiceError(
+      "WORKFLOW_UNAVAILABLE",
+      503,
+      "品牌全域词库服务暂时不可用。",
+    );
+  }
+  const code = errorCodeForPreparation(error);
+  if (code === "BRAND_QUESTION_UNIVERSE_SAFE_KNOWLEDGE_EMPTY") {
+    return knowledgeReadinessError({
+      ready: false,
+      reason: "safe_knowledge_required",
+      acceptedDocuments: 0,
+      acceptedBytes: 0,
+    });
+  }
+  if (
+    code === "BRAND_QUESTION_UNIVERSE_KNOWLEDGE_DOCUMENT_LIMIT" ||
+    code === "BRAND_QUESTION_UNIVERSE_KNOWLEDGE_TOO_LARGE"
+  ) {
+    return knowledgeReadinessError({
+      ready: false,
+      reason: "knowledge_scope_exceeded",
+      acceptedDocuments: 0,
+      acceptedBytes: 0,
+    });
+  }
+  return null;
+}
+
+function preparationErrorClass(error: unknown) {
+  if (error instanceof Error && error.name.trim()) return error.name;
+  return typeof error;
+}
+
+function logUnknownPreparationError(input: {
+  actorId: number;
+  knowledgeSnapshotId: string;
+  stage: PreparationStage;
+  error: unknown;
+  classification: KnowledgeClassification;
+}) {
+  console.error("[BrandQuestionUniverse] start_failed", {
+    event: "brand_question_universe_start_failed",
+    userId: input.actorId,
+    knowledgeSnapshotId: input.knowledgeSnapshotId,
+    stage: input.stage,
+    errorClass: preparationErrorClass(input.error),
+    totalDocuments: input.classification.totalDocuments,
+    acceptedDocuments: input.classification.accepted.length,
+    rejectedByReason: input.classification.rejectedByReason,
+  });
+}
+
+async function prepareBrandQuestionUniverseArchives(input: {
+  actorId: number;
+  runtimeContext: BrandQuestionUniverseRuntimeContext;
+  classification: KnowledgeClassification;
+}): Promise<PreparedArchives> {
+  let stage: PreparationStage = "upstream_workflow";
+  try {
+    const upstream = await loadBrandQuestionUniverseUpstreamArchive();
+    stage = "frontmind_adapter";
+    const adapter = await buildBrandQuestionUniverseAdapterArchive();
+    stage = "safe_knowledge_archive";
+    const knowledge = await buildBrandQuestionUniverseKnowledgeArchive(
+      input.runtimeContext,
+    );
+    return { upstream, adapter, knowledge };
+  } catch (error) {
+    const serviceError = brandQuestionUniversePreparationServiceError(
+      stage,
+      error,
+    );
+    if (serviceError) throw serviceError;
+    logUnknownPreparationError({
+      actorId: input.actorId,
+      knowledgeSnapshotId: input.runtimeContext.snapshot.id,
+      stage,
+      error,
+      classification: input.classification,
+    });
+    throw new BrandQuestionUniverseServiceError(
+      "INPUT_PREPARATION_FAILED",
+      500,
+      "请求暂时无法完成，请稍后重试。",
+    );
   }
 }
 
@@ -1925,6 +2112,11 @@ export async function observeBrandQuestionUniverse(actor: AuthenticatedUser) {
   const engineerVersionPresent = !keywordTablesAreAutomaticallyManaged(
     workspace.payload.keywordTables,
   );
+  const knowledgeReadiness = snapshot
+    ? brandQuestionUniverseKnowledgeReadiness(
+        classifyBrandQuestionUniverseKnowledgeDocuments(snapshot.documents),
+      )
+    : null;
   const reason = operationActive
     ? "operation_active"
     : !snapshot
@@ -1933,7 +2125,9 @@ export async function observeBrandQuestionUniverse(actor: AuthenticatedUser) {
         ? "credential_required"
         : engineerVersionPresent
           ? "engineer_version"
-          : "ready";
+          : knowledgeReadiness && !knowledgeReadiness.ready
+            ? knowledgeReadiness.reason
+            : "ready";
   return {
     canStart: reason === "ready",
     reason,
@@ -2004,6 +2198,14 @@ export async function startBrandQuestionUniverse(input: {
       "当前知识库缺少认证归档哈希，请重新发布知识库。",
     );
   }
+  const classification = classifyBrandQuestionUniverseKnowledgeDocuments(
+    snapshot.documents,
+  );
+  const knowledgeReadiness =
+    brandQuestionUniverseKnowledgeReadiness(classification);
+  if (!knowledgeReadiness.ready) {
+    throw knowledgeReadinessError(knowledgeReadiness);
+  }
   const operationId = deterministicUuid(
     `${BRAND_QUESTION_UNIVERSE_OPERATION_TYPE}:${input.actor.id}:${value.clientRequestId}`,
   );
@@ -2019,11 +2221,12 @@ export async function startBrandQuestionUniverse(input: {
       documents: snapshot.documents,
     },
   };
-  const [upstream, adapter, knowledge] = await Promise.all([
-    loadBrandQuestionUniverseUpstreamArchive(),
-    buildBrandQuestionUniverseAdapterArchive(),
-    buildBrandQuestionUniverseKnowledgeArchive(runtimeContext),
-  ]);
+  const { upstream, adapter, knowledge } =
+    await prepareBrandQuestionUniverseArchives({
+      actorId: input.actor.id,
+      runtimeContext,
+      classification,
+    });
   const context = operationContextSchema.parse({
     schemaVersion: 1,
     kind: "brand_question_universe_context",

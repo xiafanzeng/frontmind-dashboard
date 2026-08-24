@@ -27,9 +27,11 @@ export const BRAND_QUESTION_UNIVERSE_KNOWLEDGE_FILENAME =
 export const BRAND_QUESTION_UNIVERSE_UPSTREAM_SHA256 =
   "25a656870a2786ae265112860424d902f87fb4486ce8007e306eb832795c164f";
 export const BRAND_QUESTION_UNIVERSE_ADAPTER_VERSION = "1.0.0";
+export const BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_DOCUMENTS = 500;
+export const BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_BYTES = 16 * 1024 * 1024;
 export { BRAND_QUESTION_UNIVERSE_WIRE_SCHEMA };
 
-type SnapshotDocument = {
+export type SnapshotDocument = {
   path: string;
   title: string;
   content: string;
@@ -37,6 +39,14 @@ type SnapshotDocument = {
   customerVisible?: boolean;
   evidenceStatus?: string;
 };
+
+export type BrandQuestionUniverseDocumentRejectionReason =
+  | "customer_hidden"
+  | "excluded_kind"
+  | "executable_kind"
+  | "executable_path"
+  | "inferred"
+  | "empty_content";
 
 export type BrandQuestionUniverseRuntimeContext = {
   operationToken: string;
@@ -277,7 +287,9 @@ export async function buildBrandQuestionUniverseAdapterArchive() {
   return adapterArchiveCache;
 }
 
-function safeDocuments(documents: SnapshotDocument[]) {
+export function classifyBrandQuestionUniverseKnowledgeDocuments(
+  documents: readonly SnapshotDocument[],
+) {
   const executableKind = new Set([
     "archive",
     "binary",
@@ -287,23 +299,57 @@ function safeDocuments(documents: SnapshotDocument[]) {
   ]);
   const executablePath =
     /\.(?:bat|bash|cjs|cmd|com|dll|dylib|exe|jar|js|mjs|ps1|py|sh|so|ts|tsx|zsh)$/iu;
-  const safe = documents.filter(
-    (document) =>
-      document.customerVisible === true &&
-      !["evidence", "report", "index"].includes(document.kind || "") &&
-      !executableKind.has((document.kind || "").toLocaleLowerCase("en-US")) &&
-      !executablePath.test(document.path.trim()) &&
-      !["inferred", "needs_verification"].includes(
-        document.evidenceStatus || "",
-      ) &&
-      document.content.trim().length > 0,
-  );
-  if (safe.length > 500) {
-    throw new Error("BRAND_QUESTION_UNIVERSE_KNOWLEDGE_DOCUMENT_LIMIT");
+  const rejectedByReason: Record<
+    BrandQuestionUniverseDocumentRejectionReason,
+    number
+  > = {
+    customer_hidden: 0,
+    excluded_kind: 0,
+    executable_kind: 0,
+    executable_path: 0,
+    inferred: 0,
+    empty_content: 0,
+  };
+  const accepted: SnapshotDocument[] = [];
+  let acceptedBytes = 0;
+
+  for (const document of documents) {
+    const normalizedKind = (document.kind || "")
+      .trim()
+      .toLocaleLowerCase("en-US");
+    const normalizedEvidenceStatus = (document.evidenceStatus || "")
+      .trim()
+      .toLocaleLowerCase("en-US");
+    let rejectedReason: BrandQuestionUniverseDocumentRejectionReason | null =
+      null;
+    if (document.customerVisible === false) {
+      rejectedReason = "customer_hidden";
+    } else if (["evidence", "report", "index"].includes(normalizedKind)) {
+      rejectedReason = "excluded_kind";
+    } else if (executableKind.has(normalizedKind)) {
+      rejectedReason = "executable_kind";
+    } else if (executablePath.test(document.path.trim())) {
+      rejectedReason = "executable_path";
+    } else if (normalizedEvidenceStatus === "inferred") {
+      rejectedReason = "inferred";
+    } else if (!document.content.trim()) {
+      rejectedReason = "empty_content";
+    }
+
+    if (rejectedReason) {
+      rejectedByReason[rejectedReason] += 1;
+      continue;
+    }
+    accepted.push(document);
+    acceptedBytes += Buffer.byteLength(document.content, "utf8");
   }
-  if (!safe.length)
-    throw new Error("BRAND_QUESTION_UNIVERSE_SAFE_KNOWLEDGE_EMPTY");
-  return safe;
+
+  return {
+    accepted,
+    totalDocuments: documents.length,
+    acceptedBytes,
+    rejectedByReason,
+  };
 }
 
 function safeDocumentFilename(index: number) {
@@ -316,12 +362,19 @@ export async function buildBrandQuestionUniverseKnowledgeArchive(
   if (!context.snapshot.archiveHash) {
     throw new Error("BRAND_QUESTION_UNIVERSE_KNOWLEDGE_HASH_REQUIRED");
   }
-  const documents = safeDocuments(context.snapshot.documents);
-  const contentBytes = documents.reduce(
-    (total, document) => total + Buffer.byteLength(document.content, "utf8"),
-    0,
+  const classification = classifyBrandQuestionUniverseKnowledgeDocuments(
+    context.snapshot.documents,
   );
-  if (contentBytes > 16 * 1024 * 1024) {
+  const documents = classification.accepted;
+  if (documents.length > BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_DOCUMENTS) {
+    throw new Error("BRAND_QUESTION_UNIVERSE_KNOWLEDGE_DOCUMENT_LIMIT");
+  }
+  if (!documents.length) {
+    throw new Error("BRAND_QUESTION_UNIVERSE_SAFE_KNOWLEDGE_EMPTY");
+  }
+  if (
+    classification.acceptedBytes > BRAND_QUESTION_UNIVERSE_MAX_KNOWLEDGE_BYTES
+  ) {
     throw new Error("BRAND_QUESTION_UNIVERSE_KNOWLEDGE_TOO_LARGE");
   }
   const manifest = {

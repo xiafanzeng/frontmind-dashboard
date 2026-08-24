@@ -111,9 +111,13 @@ const MAX_REGION_CATALOG_BYTES = 512 * 1024;
 const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
 const MONITOR_CATALOG_HTTP_TIMEOUT_MS = 5_000;
 const MONITOR_SCREENSHOT_HTTP_TIMEOUT_MS = 15_000;
+const MONITOR_RECOVERY_WINDOW_MS = 6 * 60 * 60_000;
 const DEFAULT_MONITOR_BASE_URL_B64 =
   "aHR0cHM6Ly9idXNpbmVzcy1hcGkubW9saXpoaXNodS5jb20vYXBpL2J1c2luZXNzL21vbml0b3I=";
-const MONITOR_SCREENSHOT_HOST_B64 = "aW1nLm1vbGl6aGlzaHUuY29t";
+const MONITOR_SCREENSHOT_HOSTS_B64 = [
+  "aW1nLm1vbGl6aGlzaHUuY29t",
+  "YWlnZW8tanAub3NzLWFwLW5vcnRoZWFzdC0xLmFsaXl1bmNzLmNvbQ==",
+] as const;
 const ENV_MONITOR_CREDENTIAL_PREFIX = "env-";
 const MONITOR_CREDENTIAL_PLACEHOLDER_MARKERS = [
   "replace-with",
@@ -142,6 +146,10 @@ const TERMINAL_LOCAL_STATUSES = new Set<PresalesMonitorRun["status"]>([
   "remote_failed",
   "shape_mismatch",
 ]);
+const RECOVERABLE_TERMINAL_LOCAL_STATUSES = new Set<
+  PresalesMonitorRun["status"]
+>(["completed", "partial_review_required", "remote_failed"]);
+const RECOVERABLE_REMOTE_STATUSES = new Set(["completed", "partial_completed"]);
 // Provider submission is bounded by MONITOR_HTTP_TIMEOUT_MS. Keep the local
 // reservation for an additional full timeout so project deletion never drops
 // the only retry target while a normal submit request can still return.
@@ -2131,19 +2139,43 @@ function mergeCheckpoints(
       byId.set(next.subTaskId, next);
       continue;
     }
-    const priorFinal = CHILD_FINAL_STATUSES.has(prior.status);
     const nextFinal = CHILD_FINAL_STATUSES.has(next.status);
+    const priorSuccessful = isSuccessful(prior);
+    const nextSuccessful = isSuccessful(next);
     const priorCitations = checkpointItemCitationList(prior);
     const nextCitations = checkpointItemCitationList(next);
     const priorReferences = checkpointItemReferenceList(prior);
     const nextReferences = checkpointItemReferenceList(next);
+    const answerText =
+      priorSuccessful && nextSuccessful
+        ? (next.answerText?.length ?? 0) > (prior.answerText?.length ?? 0)
+          ? next.answerText
+          : prior.answerText
+        : nextSuccessful
+          ? next.answerText
+          : priorSuccessful
+            ? prior.answerText
+            : nextFinal
+              ? (next.answerText ?? prior.answerText)
+              : next.answerText;
+    const error =
+      priorSuccessful || nextSuccessful || !nextFinal
+        ? undefined
+        : (next.error ?? prior.error);
+    const completedAt = priorSuccessful
+      ? prior.completedAt
+      : nextSuccessful
+        ? (next.completedAt ?? prior.completedAt)
+        : nextFinal
+          ? (next.completedAt ?? prior.completedAt)
+          : undefined;
     byId.set(next.subTaskId, {
       ...prior,
-      status: priorFinal ? prior.status : next.status || prior.status,
-      answerText:
-        (next.answerText?.length ?? 0) > (prior.answerText?.length ?? 0)
-          ? next.answerText
-          : prior.answerText,
+      status:
+        priorSuccessful && !nextSuccessful
+          ? prior.status
+          : next.status || prior.status,
+      answerText,
       media: mergeMedia(prior.media, next.media),
       sources: mergeUnifiedSources(
         checkpointItemSources(prior),
@@ -2219,9 +2251,8 @@ function mergeCheckpoints(
       ...(next.pageScreenshot || prior.pageScreenshot
         ? { pageScreenshot: next.pageScreenshot ?? prior.pageScreenshot }
         : {}),
-      error:
-        priorFinal && nextFinal ? prior.error : (next.error ?? prior.error),
-      completedAt: next.completedAt ?? prior.completedAt,
+      error,
+      completedAt,
     });
   }
   const request = existing.request ?? incoming.request;
@@ -2305,6 +2336,117 @@ function isSuccessful(item: MonitorCheckpointItem) {
     item.status === "completed" &&
     Boolean(item.answerText?.trim()) &&
     !item.error
+  );
+}
+
+function isFailedCheckpointItem(item: MonitorCheckpointItem) {
+  return (
+    ["failed", "error", "stopped"].includes(item.status) ||
+    (item.status === "completed" && !isSuccessful(item))
+  );
+}
+
+function checkpointProgress(
+  run: PresalesMonitorRun,
+  checkpoint: MonitorCheckpoint,
+) {
+  const initialIds = new Set(jsonStringArray(run.initialSubtaskIds));
+  const items = checkpoint.items.filter(
+    (item) => initialIds.size === 0 || initialIds.has(item.subTaskId),
+  );
+  return {
+    successfulItems: items.filter(isSuccessful).length,
+    failedItems: items.filter(isFailedCheckpointItem).length,
+  };
+}
+
+function finalizeIncompleteCheckpoint(
+  run: PresalesMonitorRun,
+  checkpoint: MonitorCheckpoint,
+  now: Date,
+): MonitorCheckpoint {
+  const byId = new Map(checkpoint.items.map((item) => [item.subTaskId, item]));
+  const scopes = jsonScopeMap(run.subtaskScopes);
+  const items = jsonStringArray(run.initialSubtaskIds).flatMap(
+    (subTaskId): MonitorCheckpointItem[] => {
+      const existing = byId.get(subTaskId);
+      if (existing && isSuccessful(existing)) return [existing];
+      if (
+        existing &&
+        ["failed", "error", "stopped"].includes(existing.status)
+      ) {
+        return [
+          {
+            ...existing,
+            error: existing.error ?? "自动补采窗口内未返回有效回答",
+            completedAt: existing.completedAt ?? now.toISOString(),
+          },
+        ];
+      }
+      const scope = scopes[subTaskId];
+      if (!scope) return [];
+      const { answerText: _incompleteAnswer, ...retained } = existing ?? {
+        subTaskId,
+        prompt: run.question,
+        platform: scope.platform,
+        mode: "search" as const,
+        media: [],
+        sources: [],
+      };
+      return [
+        {
+          ...retained,
+          subTaskId,
+          prompt: run.question,
+          platform: scope.platform,
+          mode: "search",
+          status: "failed",
+          error: "自动补采窗口内未返回有效回答",
+          completedAt: now.toISOString(),
+        },
+      ];
+    },
+  );
+  return {
+    ...(checkpoint.request ? { request: checkpoint.request } : {}),
+    items,
+  };
+}
+
+function monitorRecoveryDeadline(run: PresalesMonitorRun) {
+  return run.submittedAt
+    ? new Date(run.submittedAt.getTime() + MONITOR_RECOVERY_WINDOW_MS)
+    : null;
+}
+
+function isPrematureMonitorTerminal(run: PresalesMonitorRun, now: Date) {
+  if (
+    !RECOVERABLE_TERMINAL_LOCAL_STATUSES.has(run.status) ||
+    !run.upstreamTaskId ||
+    !run.submittedAt ||
+    !run.completedAt ||
+    !RECOVERABLE_REMOTE_STATUSES.has(
+      normalizedText(run.remoteStatus).toLowerCase(),
+    )
+  ) {
+    return false;
+  }
+  const deadline = monitorRecoveryDeadline(run);
+  if (!deadline || run.completedAt.getTime() >= deadline.getTime()) {
+    return false;
+  }
+  const checkpoint = monitorCheckpoint(run.checkpoint);
+  if (checkpoint.items.length === 0) return false;
+  const successful = checkpointProgress(run, checkpoint).successfulItems;
+  return (
+    successful < run.expectedItems && now.getTime() >= run.completedAt.getTime()
+  );
+}
+
+function isMonitorPollEligible(run: PresalesMonitorRun, now: Date) {
+  return (
+    POLLABLE_LOCAL_STATUSES.has(run.status) ||
+    isPrematureMonitorTerminal(run, now)
   );
 }
 
@@ -3256,7 +3398,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       }
       if (
         !run ||
-        !POLLABLE_LOCAL_STATUSES.has(run.status) ||
+        !isMonitorPollEligible(run, now) ||
         !run.upstreamTaskId ||
         (run.nextPollAt && run.nextPollAt.getTime() > now.getTime()) ||
         (run.pollLeaseId &&
@@ -3265,6 +3407,7 @@ export class DrizzleMonitorRepository implements MonitorRepository {
       ) {
         return null;
       }
+      const reopening = !POLLABLE_LOCAL_STATUSES.has(run.status);
       const leaseId = randomUUID();
       const nextPollAt = new Date(now.getTime() + MONITOR_POLL_INTERVAL_MS);
       const pollLeaseExpiresAt = new Date(
@@ -3274,6 +3417,15 @@ export class DrizzleMonitorRepository implements MonitorRepository {
         .update(presalesMonitorRuns)
         .set({
           status: "polling",
+          ...(reopening
+            ? {
+                finalResult: null,
+                completedAt: null,
+                lastError: null,
+                terminalSnapshotHash: null,
+                terminalStableCount: 0,
+              }
+            : {}),
           lastPollStartedAt: now,
           nextPollAt,
           pollLeaseId: leaseId,
@@ -3286,6 +3438,15 @@ export class DrizzleMonitorRepository implements MonitorRepository {
         run: {
           ...run,
           status: "polling",
+          ...(reopening
+            ? {
+                finalResult: null,
+                completedAt: null,
+                lastError: null,
+                terminalSnapshotHash: null,
+                terminalStableCount: 0,
+              }
+            : {}),
           lastPollStartedAt: now,
           nextPollAt,
           pollLeaseId: leaseId,
@@ -3635,13 +3796,14 @@ function safeMonitorScreenshotUrl(value: unknown) {
   if (!text || text.length > 4_096) return undefined;
   try {
     const url = new URL(text);
-    const allowedHost = Buffer.from(
-      MONITOR_SCREENSHOT_HOST_B64,
-      "base64",
-    ).toString("utf8");
+    const allowedHosts = new Set(
+      MONITOR_SCREENSHOT_HOSTS_B64.map((value) =>
+        Buffer.from(value, "base64").toString("utf8"),
+      ),
+    );
     if (
       url.protocol !== "https:" ||
-      url.hostname.toLowerCase() !== allowedHost ||
+      !allowedHosts.has(url.hostname.toLowerCase()) ||
       url.username ||
       url.password
     ) {
@@ -4382,13 +4544,24 @@ export class PresalesMonitorService {
   }
 
   private async refreshIfDue(run: PresalesMonitorRun) {
-    if (!POLLABLE_LOCAL_STATUSES.has(run.status)) return run;
-    const lease = await this.repository.acquirePoll(run.id, this.now());
+    const pollStartedAt = this.now();
+    if (!isMonitorPollEligible(run, pollStartedAt)) return run;
+    if (!POLLABLE_LOCAL_STATUSES.has(run.status)) {
+      const recoveryCredential = await this.credentialById(run.apiCredentialId);
+      if (
+        !recoveryCredential ||
+        recoveryCredential.version !== run.credentialVersion
+      ) {
+        return run;
+      }
+    }
+    const lease = await this.repository.acquirePoll(run.id, pollStartedAt);
     if (!lease) return (await this.repository.get(run.id)) ?? run;
     const credential = await this.credentialById(lease.run.apiCredentialId);
     if (!credential || credential.version !== lease.run.credentialVersion) {
       return this.repository.finishPoll(run.id, lease.leaseId, {
         status: "remote_failed",
+        remoteStatus: "credential_changed",
         lastError: "创建任务时使用的监控凭据已变更，任务已停止自动查询",
         completedAt: this.now(),
       });
@@ -4400,11 +4573,23 @@ export class PresalesMonitorService {
         credential,
       );
       const status = statusData(statusPayload, lease.run);
-      const previousDone = lease.run.completedItems + lease.run.failedItems;
-      const currentDone = status.completedItems + status.failedItems;
+      const recoveryDeadline = monitorRecoveryDeadline(lease.run);
+      const recoveryExpired = Boolean(
+        recoveryDeadline &&
+          pollStartedAt.getTime() >= recoveryDeadline.getTime(),
+      );
+      const existingCheckpoint = monitorCheckpoint(lease.run.checkpoint);
+      const statusChanged =
+        status.remoteStatus !==
+          normalizedText(lease.run.remoteStatus).toLowerCase() ||
+        status.totalItems !== lease.run.totalItems ||
+        status.completedItems !== lease.run.completedItems ||
+        status.failedItems !== lease.run.failedItems;
       const shouldFetchResult =
-        currentDone > previousDone ||
-        MAIN_FINAL_STATUSES.has(status.remoteStatus);
+        statusChanged ||
+        MAIN_FINAL_STATUSES.has(status.remoteStatus) ||
+        recoveryExpired ||
+        existingCheckpoint.items.length === 0;
       if (!shouldFetchResult) {
         return this.repository.finishPoll(run.id, lease.leaseId, {
           status: "polling",
@@ -4432,17 +4617,15 @@ export class PresalesMonitorService {
       const exactIds =
         checkpointIds.size === initialIds.size &&
         [...checkpointIds].every((id) => initialIds.has(id));
-      const allTerminal = checkpoint.items.every((item) =>
-        CHILD_FINAL_STATUSES.has(item.status),
-      );
       const remoteTerminal =
         MAIN_FINAL_STATUSES.has(status.remoteStatus) &&
         MAIN_FINAL_STATUSES.has(snapshot.remoteStatus);
+      const progress = checkpointProgress(lease.run, checkpoint);
       const complete =
         remoteTerminal &&
         exactIds &&
         checkpoint.items.length === lease.run.expectedItems &&
-        allTerminal;
+        progress.successfulItems === lease.run.expectedItems;
       const signature = checkpointSignature(checkpoint);
       const stableCount =
         remoteTerminal && signature === lease.run.terminalSnapshotHash
@@ -4450,48 +4633,77 @@ export class PresalesMonitorService {
           : remoteTerminal
             ? 1
             : 0;
-      const successful = checkpoint.items.filter(isSuccessful).length;
       if (complete) {
         const finalResult = buildFinalResult(lease.run, checkpoint, false);
         return this.repository.finishPoll(run.id, lease.leaseId, {
-          status: successful > 0 ? "completed" : "remote_failed",
+          status: "completed",
           remoteStatus: snapshot.remoteStatus || status.remoteStatus,
           totalItems: status.totalItems,
-          completedItems: status.completedItems,
-          failedItems: status.failedItems,
+          completedItems: progress.successfulItems,
+          failedItems: Math.max(
+            progress.failedItems,
+            lease.run.expectedItems - progress.successfulItems,
+          ),
           checkpoint,
           finalResult,
           terminalSnapshotHash: signature,
           terminalStableCount: stableCount,
-          lastError: successful > 0 ? null : "监控任务没有返回成功文字答案",
+          lastError: null,
           completedAt: this.now(),
         });
       }
-      if (remoteTerminal && stableCount >= 2) {
-        const finalResult = buildFinalResult(lease.run, checkpoint, true);
-        return this.repository.finishPoll(run.id, lease.leaseId, {
-          status: successful > 0 ? "partial_review_required" : "remote_failed",
-          remoteStatus: snapshot.remoteStatus || status.remoteStatus,
-          totalItems: status.totalItems,
-          completedItems: status.completedItems,
-          failedItems: status.failedItems,
+      const hardRemoteStatus = ["stopped", "failed"].find(
+        (candidate) =>
+          status.remoteStatus === candidate ||
+          snapshot.remoteStatus === candidate,
+      );
+      const hardRemoteTerminal = remoteTerminal && Boolean(hardRemoteStatus);
+      if (recoveryExpired || (hardRemoteTerminal && stableCount >= 2)) {
+        const completedAt = this.now();
+        const terminalCheckpoint = finalizeIncompleteCheckpoint(
+          lease.run,
           checkpoint,
+          completedAt,
+        );
+        const terminalProgress = checkpointProgress(
+          lease.run,
+          terminalCheckpoint,
+        );
+        const finalResult = buildFinalResult(
+          lease.run,
+          terminalCheckpoint,
+          true,
+        );
+        return this.repository.finishPoll(run.id, lease.leaseId, {
+          status:
+            terminalProgress.successfulItems > 0
+              ? "partial_review_required"
+              : "remote_failed",
+          remoteStatus:
+            hardRemoteStatus ?? snapshot.remoteStatus ?? status.remoteStatus,
+          totalItems: status.totalItems,
+          completedItems: terminalProgress.successfulItems,
+          failedItems: Math.max(
+            terminalProgress.failedItems,
+            lease.run.expectedItems - terminalProgress.successfulItems,
+          ),
+          checkpoint: terminalCheckpoint,
           finalResult,
-          terminalSnapshotHash: signature,
+          terminalSnapshotHash: checkpointSignature(terminalCheckpoint),
           terminalStableCount: stableCount,
           lastError:
-            successful > 0
-              ? "远端终态结果连续两次仍未覆盖全部初始子任务"
+            terminalProgress.successfulItems > 0
+              ? "自动补采窗口结束，仍有回答未成功返回"
               : "监控任务没有返回成功文字答案",
-          completedAt: this.now(),
+          completedAt,
         });
       }
       return this.repository.finishPoll(run.id, lease.leaseId, {
         status: "polling",
         remoteStatus: snapshot.remoteStatus || status.remoteStatus,
         totalItems: status.totalItems,
-        completedItems: status.completedItems,
-        failedItems: status.failedItems,
+        completedItems: progress.successfulItems,
+        failedItems: progress.failedItems,
         checkpoint,
         terminalSnapshotHash: remoteTerminal ? signature : null,
         terminalStableCount: stableCount,
@@ -4514,6 +4726,7 @@ export class PresalesMonitorService {
       }
       return this.repository.finishPoll(run.id, lease.leaseId, {
         status: "remote_failed",
+        remoteStatus: "failed",
         lastError:
           error instanceof Error
             ? safeError(error.message)

@@ -153,9 +153,11 @@ function toServiceError(error: unknown): never {
               ? "PRECONDITION_FAILED"
               : error.statusCode === 503
                 ? "SERVICE_UNAVAILABLE"
-                : error.statusCode === 502
-                  ? "BAD_GATEWAY"
-                  : "CONFLICT";
+                : error.statusCode === 500
+                  ? "INTERNAL_SERVER_ERROR"
+                  : error.statusCode === 502
+                    ? "BAD_GATEWAY"
+                    : "CONFLICT";
     throw new TRPCError({ code, message: error.message, cause: error });
   }
   if (error instanceof DeliveryTicketError) {
