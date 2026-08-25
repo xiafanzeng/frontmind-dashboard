@@ -605,7 +605,11 @@ export function buildAliyunOAuthAuthorizationUrl(
   url.searchParams.set("response_type", "code");
   url.searchParams.set("scope", "openid aliuid profile");
   url.searchParams.set("access_type", "online");
-  url.searchParams.set("prompt", "admin_consent");
+  // First-time third-party access already triggers Alibaba Cloud's install and
+  // consent flow. Forcing admin_consent here turns an ordinary sign-in from
+  // the application's owning directory into an invalid attempt to install its
+  // own enterprise application ("本目录创建的应用不允许被安装"). Reserve that
+  // provider-specific prompt for an explicit re-authorization flow.
   url.searchParams.set("state", state);
   return url;
 }

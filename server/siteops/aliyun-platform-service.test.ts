@@ -478,6 +478,7 @@ describe("Aliyun platform credentials", () => {
     expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
       oauthCredential.callbackUrl,
     );
+    expect(authorizationUrl.searchParams.has("prompt")).toBe(false);
     expect(result.authorizationUrl).not.toContain(oauthCredential.clientSecret);
     expect(result.expiresAt).toBe(new Date(1_000 + 10 * 60_000).toISOString());
 
@@ -677,6 +678,7 @@ describe("Aliyun platform credentials", () => {
     expect(authorizationUrl.searchParams.get("scope")).toBe(
       "openid aliuid profile",
     );
+    expect(authorizationUrl.searchParams.has("prompt")).toBe(false);
   });
 
   it("builds the authorization URL from the locked OAuth contract", () => {
@@ -692,7 +694,7 @@ describe("Aliyun platform credentials", () => {
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.get("scope")).toBe("openid aliuid profile");
     expect(url.searchParams.get("access_type")).toBe("online");
-    expect(url.searchParams.get("prompt")).toBe("admin_consent");
+    expect(url.searchParams.has("prompt")).toBe(false);
     expect(url.searchParams.get("state")).toBe("probe-state-never-logged");
   });
 
