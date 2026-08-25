@@ -428,6 +428,74 @@ describe("SiteOps wire output resolver", () => {
     expect(prose).toBeNull();
   });
 
+  it("normalizes BOM, CRLF JSON fences and one stringified JSON layer", async () => {
+    const value = { operationToken: token, schemaVersion: 1 };
+    const bom = await resolveSiteOpsWireOutput({
+      events: [
+        marker(),
+        assistant({ content: `\uFEFF${JSON.stringify(value)}` }),
+      ] as never,
+      operationToken: token,
+      taskCompleted: true,
+    });
+    const fenced = await resolveSiteOpsWireOutput({
+      events: [
+        marker(),
+        assistant({
+          content: `\`\`\`json\r\n${JSON.stringify(value)}\r\n\`\`\``,
+        }),
+      ] as never,
+      operationToken: token,
+      taskCompleted: true,
+    });
+    const doubleEncoded = await resolveSiteOpsWireOutput({
+      events: [
+        marker(),
+        assistant({ content: JSON.stringify(JSON.stringify(value)) }),
+      ] as never,
+      operationToken: token,
+      taskCompleted: true,
+    });
+
+    expect(bom).toMatchObject({ value, normalizations: ["bom"] });
+    expect(fenced).toMatchObject({
+      value,
+      normalizations: ["json_fence"],
+    });
+    expect(doubleEncoded).toMatchObject({
+      value,
+      normalizations: ["double_encoded"],
+    });
+  });
+
+  it("repairs only bounded JSON transport damage before token validation", async () => {
+    const damaged = `{operationToken:${JSON.stringify(token)},"schemaVersion":1,"siteTitle":"line one
+line two\\q",}`;
+    const result = await resolveSiteOpsWireOutput({
+      events: [marker(), assistant({ content: damaged })] as never,
+      operationToken: token,
+      taskCompleted: true,
+    });
+
+    expect(result).toMatchObject({
+      value: {
+        operationToken: token,
+        schemaVersion: 1,
+        siteTitle: "line one\nline two\\q",
+      },
+      normalizations: ["json_repair"],
+    });
+
+    const wrongToken = damaged.replace(token, "siteops-design:other");
+    await expect(
+      resolveSiteOpsWireOutput({
+        events: [marker(), assistant({ content: wrongToken })] as never,
+        operationToken: token,
+        taskCompleted: true,
+      }),
+    ).rejects.toMatchObject({ code: "SITEOPS_WIRE_OUTPUT_INVALID" });
+  });
+
   it("validates rejected structured values and merges identical production fallback sources", async () => {
     const value = {
       operationToken: token,
@@ -511,7 +579,7 @@ describe("SiteOps wire output resolver", () => {
     expect(resolution).toMatchObject({ value: valid, source: "attachment" });
   });
 
-  it("does not let an accepted structured result bypass a conflicting attachment", async () => {
+  it("treats a locally valid accepted structured result as authoritative", async () => {
     const first = { operationToken: token, schemaVersion: 1, siteTitle: "A" };
     const second = { operationToken: token, schemaVersion: 1, siteTitle: "B" };
     const fetchPinned = vi.fn(async () => ({
@@ -538,7 +606,36 @@ describe("SiteOps wire output resolver", () => {
         taskCompleted: true,
         fetchPinned: fetchPinned as never,
       }),
-    ).rejects.toMatchObject({ code: "SITEOPS_WIRE_OUTPUT_CONFLICT" });
+    ).resolves.toMatchObject({ value: first, source: "structured" });
+    expect(fetchPinned).not.toHaveBeenCalled();
+  });
+
+  it("returns a safe fallback signal when non-authoritative valid sources conflict", async () => {
+    const first = { operationToken: token, schemaVersion: 1, siteTitle: "A" };
+    const second = { operationToken: token, schemaVersion: 1, siteTitle: "B" };
+
+    await expect(
+      resolveSiteOpsWireOutput({
+        events: [
+          marker(),
+          {
+            id: "rejected-with-value",
+            type: "structured_output_result",
+            timestamp: 2,
+            structured_output_result: {
+              success: false,
+              value: first,
+              error: "structured extraction failed",
+            },
+          },
+          assistant({ content: second }),
+        ] as never,
+        operationToken: token,
+        taskCompleted: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "SITEOPS_WIRE_OUTPUT_FALLBACK_REQUIRED",
+    });
   });
 
   it("enforces response MIME, root object, UTF-8 and a declared raw hash", async () => {

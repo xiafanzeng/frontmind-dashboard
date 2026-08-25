@@ -38,6 +38,7 @@ import {
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_MATERIALIZER_V2_2,
+  SITEOPS_MATERIALIZER_V2_3,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   type SiteBrief,
@@ -107,6 +108,7 @@ type SiteOpsMaterializerCoordinates =
   | typeof SITEOPS_MATERIALIZER_V2_0
   | typeof SITEOPS_MATERIALIZER_V2_1
   | typeof SITEOPS_MATERIALIZER_V2_2
+  | typeof SITEOPS_MATERIALIZER_V2_3
   | typeof SITEOPS_WORKFLOW;
 
 const FIXED_ZIP_DATE = new Date("2000-01-01T00:00:00.000Z");
@@ -157,6 +159,15 @@ function reactStaticCoordinatesForWorkflow(
       componentLibraryVersion:
         SITEOPS_MATERIALIZER_V2_2.componentLibraryVersion,
       materializerVersion: SITEOPS_MATERIALIZER_V2_2.materializerVersion,
+    } as const;
+  }
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_3.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_3.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_3.materializerVersion,
     } as const;
   }
   if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
@@ -411,18 +422,34 @@ export type SiteOpsQaReport = {
   routes: string[];
   checks: Array<{ id: string; passed: true; detail: string }>;
   browser: {
+    available: boolean;
     lighthouse: {
-      performance: number;
-      accessibility: number;
-      bestPractices: number;
-      seo: number;
-      cls: number;
+      performance: number | null;
+      accessibility: number | null;
+      bestPractices: number | null;
+      seo: number | null;
+      cls: number | null;
     };
     axeViolationCount: number;
+    axeViolationIds: string[];
     screenshotFiles: string[];
   };
+  buildDelivery: SiteOpsBuildDelivery;
+  warnings: SiteOpsQaWarning[];
   fileCount: number;
   totalBytes: number;
+};
+
+export type SiteOpsQaWarning = {
+  phase: "react_static_build" | "browser_qa" | "lighthouse";
+  code: string;
+  checkId: string;
+};
+
+export type SiteOpsBuildDelivery = {
+  renderMode: "primary" | "trusted_fallback";
+  qaStatus: "passed" | "passed_with_warnings" | "partial";
+  warningCodes: string[];
 };
 
 export type MaterializedAstroSite = {
@@ -441,6 +468,7 @@ export type MaterializedAstroSite = {
   provenanceSha256: string;
   buildLog: Buffer;
   files: ReadonlyMap<string, Buffer>;
+  buildDelivery: SiteOpsBuildDelivery;
 };
 
 type SourceFile = { path: string; bytes: Buffer };
@@ -890,6 +918,46 @@ function contrastRatio(left: string, right: string) {
   );
 }
 
+function accessibleTextColor(
+  background: string,
+  preferred: readonly string[],
+  minimum = 4.5,
+) {
+  const candidates = [...new Set([...preferred, "#000000", "#FFFFFF"])].filter(
+    (candidate) => /^#[a-f0-9]{6}$/iu.test(candidate),
+  );
+  return (
+    candidates.find(
+      (candidate) => contrastRatio(candidate, background) >= minimum,
+    ) ?? "#000000"
+  );
+}
+
+function semanticColorTokens(input: {
+  canvas: string;
+  ink: string;
+  accent: string;
+  muted: string;
+}) {
+  const accentText = accessibleTextColor(input.accent, [
+    input.canvas,
+    input.ink,
+  ]);
+  const inverseText = accessibleTextColor(input.ink, [input.canvas, "#FFFFFF"]);
+  const focus = [input.accent, input.ink, "#000000", "#FFFFFF"].find(
+    (candidate) => contrastRatio(candidate, input.canvas) >= 3,
+  )!;
+  return {
+    ...input,
+    subtleText: accessibleTextColor(input.canvas, [input.ink]),
+    accentText,
+    inverseSurface: input.ink,
+    inverseText,
+    border: accessibleTextColor(input.canvas, [input.ink], 3),
+    focus,
+  };
+}
+
 function siteDesignMaterializationProjectionFor(
   input: unknown,
   workflow: SiteOpsMaterializerCoordinates,
@@ -1059,7 +1127,7 @@ export function siteOpsVisualCssTokens(
           ? "56px"
           : "40px";
     return {
-      ...blueprint.palette,
+      ...semanticColorTokens(blueprint.palette),
       typeSystem: blueprint.typeSystem,
       density: blueprint.density,
       radiusStyle: blueprint.radiusStyle,
@@ -1135,10 +1203,7 @@ export function siteOpsVisualCssTokens(
         ? "56px"
         : "40px";
   return {
-    canvas,
-    ink,
-    accent,
-    muted,
+    ...semanticColorTokens({ canvas, ink, accent, muted }),
     typeSystem: null,
     density: design.density,
     radiusStyle: null,
@@ -1152,7 +1217,10 @@ export function siteOpsVisualCssTokens(
   };
 }
 
-function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
+function cssForVisualLegacy(
+  visual: SiteOpsRuntimeVisual,
+  design: SiteOpsDesignSpec,
+) {
   const {
     canvas,
     ink,
@@ -1174,6 +1242,45 @@ function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
       ? TRUSTED_REACT_VISUAL_CONTRACT_V4_CSS
       : "";
   return `${baseCss}${componentCss}${orbitCss}${blueprintCss}${visualContractCss}`;
+}
+
+function cssForVisual(visual: SiteOpsRuntimeVisual, design: SiteOpsDesignSpec) {
+  const {
+    canvas,
+    ink,
+    accent,
+    muted,
+    accentText,
+    inverseSurface,
+    inverseText,
+    border,
+    focus,
+    radius,
+    font,
+    heroSize,
+    gap,
+    sectionPadding,
+    motionLevel,
+  } = siteOpsVisualCssTokens(visual, design);
+  const baseCss = `:root{color-scheme:light;--ink:${ink};--accent:${accent};--accent-text:${accentText};--canvas:${canvas};--muted:${muted};--inverse-surface:${inverseSurface};--inverse-text:${inverseText};--border:${border};--focus:${focus};--radius:${radius};--gap:${gap};--section-pad:${sectionPadding};font-family:${font}}*{box-sizing:border-box}html{background:var(--canvas);color:var(--ink);scroll-behavior:${motionLevel === "none" ? "auto" : "smooth"}}body{margin:0;min-width:320px;line-height:1.65}a{color:inherit;text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--focus);outline-offset:4px}.shell{width:min(1120px,calc(100% - 40px));margin-inline:auto}.site-header{border-bottom:1px solid var(--border);background:var(--canvas);position:sticky;top:0;z-index:30}.nav{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px}.brand{display:inline-flex;align-items:center;gap:12px;text-decoration:none;font-weight:800;letter-spacing:-.025em}.brand-logo{display:block;width:auto;height:40px;max-width:180px;object-fit:contain}.nav-links{display:flex;gap:20px;flex-wrap:wrap;justify-content:flex-end}.nav-links a{text-decoration:none;font-size:.94rem}.hero{position:relative;overflow:hidden;padding:clamp(72px,10vw,144px) 0 64px}.hero--centered_statement .shell{text-align:center}.hero--centered_statement .lede,.hero--centered_statement h1{margin-inline:auto}.hero--split_media .shell,.hero--proof_grid .shell{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(220px,.65fr);gap:var(--gap);align-items:end}.hero--split_media .lede,.hero--proof_grid .lede{border-left:3px solid var(--accent);padding-left:24px}.hero--editorial_lede h1{max-width:18ch}.eyebrow{color:var(--accent);font:700 .78rem/1.2 ui-sans-serif,system-ui;letter-spacing:.14em;text-transform:uppercase}.hero h1{max-width:900px;margin:.35em 0 .32em;font-size:${heroSize};line-height:.95;letter-spacing:-.06em;text-wrap:balance}.lede{max-width:720px;font-size:clamp(1.1rem,2vw,1.36rem)}.facts{display:grid;grid-template-columns:repeat(12,1fr);gap:var(--gap);padding:28px 0 100px}.layout--editorial .facts{display:block;max-width:820px}.layout--modular .section{grid-column:span 4}.layout--split .section{grid-column:span 6}.layout--asymmetric .section:nth-child(3n+1){grid-column:span 7}.layout--asymmetric .section:nth-child(3n+2){grid-column:span 5}.section{grid-column:span 6;padding:24px 20px var(--section-pad)}.surface--bordered .section{border:1px solid var(--border);border-top:3px solid var(--ink);border-radius:var(--radius)}.surface--soft_depth .section{background:var(--muted);border-radius:var(--radius);box-shadow:0 18px 48px color-mix(in srgb,var(--ink) 10%,transparent)}.surface--layered .section{background:var(--muted);border-radius:var(--radius)}.surface--flat .section{border-top:3px solid var(--ink)}.section--statement{grid-column:span 12}.section--cta{background:var(--inverse-surface)!important;color:var(--inverse-text);border-radius:var(--radius)}.section--timeline{border-left:4px solid var(--accent)}.section--faq h2::before{content:'Q ';color:var(--accent)}.section--proof{border-top-color:var(--accent)}.section h2{font-size:clamp(1.5rem,3vw,2.5rem);line-height:1.1;margin:0 0 18px}.section p{max-width:64ch}.source-note{color:var(--ink);font:600 .72rem/1.4 ui-monospace,SFMono-Regular,Consolas,monospace}.section--cta .source-note,.section--cta .section-index{color:var(--inverse-text)}.motion--subtle .section{transition:transform .18s ease,box-shadow .18s ease}.motion--subtle .section:hover{transform:translateY(-2px)}.image--masked .brand-logo{border-radius:50%}.image--contained .brand-logo{object-fit:contain}.image--wide .brand-logo{max-width:240px}.contact{background:var(--inverse-surface);color:var(--inverse-text);padding:56px 0}.contact h2{font-size:clamp(2rem,5vw,4rem);margin:.25em 0}.contact-list{list-style:none;padding:0;display:grid;gap:10px}.site-footer{border-top:1px solid var(--border);padding:28px 0 48px;font-size:.85rem}.footer-row{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}@media(max-width:720px){.nav{align-items:flex-start;padding:18px 0}.nav-links{gap:10px 14px}.brand-logo{height:34px;max-width:132px}.facts,.hero--split_media .shell,.hero--proof_grid .shell{display:block}.section{padding-block:28px;margin-bottom:var(--gap)}.hero h1{letter-spacing:-.045em}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.motion--subtle .section{transition:none}.motion--subtle .section:hover{transform:none}}`;
+  const componentCss = `.hero-copy{position:relative;z-index:2}.hero-orbit-layout,.hero-split,.hero-proof{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.82fr);align-items:center;gap:clamp(28px,6vw,88px)}.hero-art{min-width:0}.orbit-art{display:block;width:100%;height:auto;max-height:620px;color:var(--ink)}.orbit-art__halo{fill:color-mix(in srgb,var(--accent) 11%,transparent);stroke:none}.orbit-art__ring{fill:none;stroke:currentColor;stroke-width:1.5;stroke-dasharray:7 12;opacity:.28}.orbit-art__ring--inner{stroke:var(--accent);stroke-dasharray:2 10}.orbit-art__dna,.orbit-art__molecule,.orbit-art__cell,.orbit-art__timeline{fill:none;stroke:currentColor;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}.orbit-art__dna circle,.orbit-art__molecule circle,.orbit-art__cell circle,.orbit-art__timeline circle{fill:var(--canvas);stroke:var(--accent)}.orbit-art__cell{stroke:var(--accent)}.orbit-art__timeline{stroke-width:4}.hero-feature-grid{list-style:none;margin:48px 0 0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);border-block:1px solid var(--border)}.hero-feature-grid li{display:grid;gap:12px;padding:24px;border-right:1px solid var(--border)}.hero-feature-grid li:last-child{border:0}.hero-feature-grid span,.section-index{color:var(--accent);font:700 .72rem/1 ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}.hero-bento{display:grid;grid-template-columns:1.45fr .55fr .55fr;grid-template-rows:auto auto;gap:var(--gap)}.hero-bento__copy{grid-row:span 2;padding:clamp(28px,5vw,64px);border:1px solid var(--border);border-radius:var(--radius)}.hero-bento__signal,.hero-bento__summary,.hero-bento__mark{padding:28px;border-radius:var(--radius);background:var(--muted)}.hero-bento__signal{display:flex;flex-direction:column;justify-content:space-between;gap:64px}.hero-bento__signal span{color:var(--accent)}.hero-bento__mark{display:grid;place-items:center;background:var(--accent);color:var(--accent-text);font-size:clamp(3rem,7vw,7rem)}.hero-split__media{aspect-ratio:4/5;position:relative;display:grid;place-items:end start;padding:32px;overflow:hidden;border-radius:var(--radius);background:var(--inverse-surface);color:var(--inverse-text)}.hero-split__disc{position:absolute;border-radius:50%;border:1px solid var(--inverse-text)}.hero-split__disc--one{width:80%;aspect-ratio:1;right:-24%;top:-12%}.hero-split__disc--two{width:45%;aspect-ratio:1;left:10%;bottom:10%;background:var(--accent)}.hero-split__media strong{position:relative;font-size:clamp(1.5rem,3vw,3rem);line-height:1.05}.hero-editorial{border-bottom:1px solid var(--border)}.hero-editorial{display:grid;grid-template-columns:1fr minmax(0,1120px) 1fr}.hero-editorial>.shell{grid-column:2}.hero-editorial__folio{font:600 .7rem/1 ui-monospace,monospace;letter-spacing:.16em;border-bottom:1px solid currentColor;padding-bottom:16px}.hero-editorial__note{max-width:28ch;margin:48px 0 0 auto;border-left:3px solid var(--accent);padding-left:20px}.hero-centered{text-align:center}.hero-centered .hero-copy>*{margin-inline:auto}.hero-actions{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-top:32px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 22px;border:1px solid currentColor;border-radius:999px;text-decoration:none;font-weight:750}.button--primary{background:var(--inverse-surface);color:var(--inverse-text)}.button--secondary{background:transparent}.button--inverse{background:var(--canvas);color:var(--ink);align-self:center}.hero--immersive_visual{min-height:min(820px,86vh);display:grid;align-items:end;background:var(--inverse-surface);color:var(--inverse-text)}.hero-immersive__field{position:absolute;inset:0;background:var(--inverse-surface)}.hero-immersive__field i{position:absolute;border:1px solid var(--inverse-text);border-radius:50%;aspect-ratio:1}.hero-immersive__field i:nth-child(1){width:44%;right:4%;top:8%}.hero-immersive__field i:nth-child(2){width:24%;right:27%;top:28%}.hero-immersive__field i:nth-child(3){width:12%;left:12%;top:14%;background:var(--accent)}.hero-immersive__copy{position:relative;padding-bottom:clamp(72px,10vw,136px)}.hero--immersive_visual .eyebrow{color:var(--inverse-text)}.product-stage{margin-top:56px;border:1px solid var(--border);border-radius:calc(var(--radius) + 8px);background:var(--canvas);box-shadow:0 36px 100px color-mix(in srgb,var(--ink) 18%,transparent);overflow:hidden}.product-stage__bar{display:flex;gap:7px;padding:15px 18px;border-bottom:1px solid var(--border)}.product-stage__bar span{width:10px;height:10px;border-radius:50%;background:var(--accent)}.product-stage__body{min-height:320px;display:grid;grid-template-columns:180px 1fr}.product-stage__body aside{background:var(--inverse-surface)}.product-stage__body>div{display:grid;gap:18px;align-content:center;padding:clamp(30px,6vw,80px)}.product-stage__body strong{font-size:clamp(1.8rem,4vw,4rem)}.product-stage__body span{height:12px;background:var(--muted);border-radius:99px}.product-stage__body span:last-child{width:62%}.hero-proof__grid{display:grid;grid-template-columns:auto 1fr;margin:0;border-top:1px solid currentColor}.hero-proof__grid dt,.hero-proof__grid dd{margin:0;padding:20px 0;border-bottom:1px solid var(--border)}.hero-proof__grid dt{padding-right:24px;color:var(--accent);font-family:ui-monospace,monospace}.hero--full_bleed_statement{padding-inline:20px;background:var(--accent);color:var(--accent-text)}.hero-statement__rail{position:absolute;inset:0 auto 0 16px;writing-mode:vertical-rl;text-transform:uppercase;letter-spacing:.2em;font-size:.65rem;padding-top:28px}.hero-statement h1{max-width:15ch;font-size:clamp(3.4rem,11vw,9.5rem)}.hero--full_bleed_statement .eyebrow{color:var(--accent-text)}.section-index{display:inline-block;margin-bottom:16px}.section blockquote{margin:0;font-size:clamp(1.35rem,2.7vw,2.4rem);line-height:1.25}.section--statement blockquote{max-width:34ch}.section--split{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(0,1.3fr);gap:var(--gap);align-content:start}.section--split .source-note{grid-column:2}.mini-card-grid{display:grid;gap:10px}.mini-card{padding:18px;border:1px solid var(--border);border-radius:max(4px,calc(var(--radius) / 2))}.mini-card span{color:var(--accent);font:700 .7rem/1 ui-monospace,monospace}.mini-card p{margin:.7em 0 0}.timeline-list{list-style:none;padding:0;margin:28px 0}.timeline-list li{position:relative;display:grid;grid-template-columns:48px 1fr;gap:16px;padding:0 0 28px}.timeline-list li:not(:last-child)::after{content:'';position:absolute;left:15px;top:28px;bottom:0;border-left:1px solid var(--accent)}.timeline-list span{display:grid;place-items:center;width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--accent-text);font:700 .65rem/1 ui-monospace,monospace}.timeline-list p{margin:3px 0}.section--faq dl,.section--faq dd{margin:0}.section--faq dt{display:flex;gap:18px;font-size:clamp(1.4rem,3vw,2.5rem);font-weight:750;line-height:1.15}.section--faq dt span{color:var(--accent)}.section--faq dd{padding:20px 0 0 52px}.section--proof figure,.section--proof blockquote{margin:0}.section--proof figcaption{margin-bottom:24px}.section--cta{grid-column:span 12;display:grid;grid-template-columns:1fr auto;gap:32px;align-items:center}.section--cta .source-note{grid-column:1/-1}@media(max-width:800px){.hero-orbit-layout,.hero-split,.hero-proof,.hero-bento{grid-template-columns:1fr}.hero-bento__copy{grid-row:auto}.hero-bento__signal{gap:24px}.hero-feature-grid{grid-template-columns:1fr}.hero-feature-grid li{border-right:0;border-bottom:1px solid var(--border)}.hero-feature-grid li:last-child{border-bottom:0}.hero-art{max-width:620px;margin-inline:auto}.product-stage__body{grid-template-columns:70px 1fr}.section--split,.section--cta{display:block}.section--split .source-note{grid-column:auto}.button--inverse{margin-top:20px}}@media(prefers-reduced-motion:no-preference){.motion--floating_subtle .orbit-art__ring--outer{animation:orbit-spin 32s linear infinite;transform-origin:center}.motion--floating_subtle .orbit-art__cell{animation:orbit-float 6s ease-in-out infinite;transform-origin:center}@keyframes orbit-spin{to{transform:rotate(360deg)}}@keyframes orbit-float{50%{transform:translateY(-12px)}}}@media(prefers-reduced-motion:reduce){.orbit-art *{animation:none!important}}`;
+  const orbitCss = `.hero-orbit-stage{position:relative;min-height:clamp(620px,76vw,820px);display:grid;place-items:center}.hero-orbit__copy{position:relative;z-index:4;width:min(720px,72%);text-align:center;padding:56px 36px;border-radius:50%;background:radial-gradient(circle,color-mix(in srgb,var(--canvas) 96%,white) 0 48%,color-mix(in srgb,var(--canvas) 84%,transparent) 68%,transparent 72%)}.hero-orbit__copy .hero-copy>*{margin-inline:auto}.orbit-motif{position:absolute;z-index:2;width:clamp(150px,22vw,260px);aspect-ratio:1;color:var(--ink);filter:drop-shadow(0 22px 36px color-mix(in srgb,var(--ink) 13%,transparent))}.orbit-motif svg{display:block;width:100%;height:100%;overflow:visible}.orbit-motif__halo{fill:color-mix(in srgb,var(--canvas) 82%,white);stroke:color-mix(in srgb,var(--ink) 22%,transparent);stroke-width:1.5}.orbit-motif__drawing{fill:none;stroke:currentColor;stroke-width:5;stroke-linecap:round;stroke-linejoin:round}.orbit-motif__drawing circle{fill:var(--canvas);stroke:var(--accent)}.orbit-motif--dna{left:-2%;top:2%;transform:rotate(-12deg)}.orbit-motif--molecule{right:-1%;top:3%;transform:rotate(9deg)}.orbit-motif--cell{right:4%;bottom:0;transform:rotate(-5deg)}.orbit-motif--cell .orbit-motif__drawing{stroke:var(--accent)}.orbit-motif--timeline{left:1%;bottom:-1%;transform:rotate(6deg)}.orbit-motif--timeline .orbit-motif__drawing{stroke-width:4}@media(max-width:800px){.hero-orbit-stage{min-height:auto;padding:360px 0 330px}.hero-orbit__copy{width:100%;padding:40px 18px}.orbit-motif{width:min(42vw,190px)}.orbit-motif--dna{left:0;top:18px}.orbit-motif--molecule{right:0;top:88px}.orbit-motif--cell{right:2%;bottom:22px}.orbit-motif--timeline{left:0;bottom:86px}}@media(max-width:460px){.hero-orbit-stage{padding:270px 0 250px}.orbit-motif{width:145px}.hero-orbit__copy{background:color-mix(in srgb,var(--canvas) 94%,white);border-radius:var(--radius)}}@media(prefers-reduced-motion:no-preference){.motion--floating_subtle .orbit-motif--dna{animation:motif-dna 7s ease-in-out infinite}.motion--floating_subtle .orbit-motif--molecule{animation:motif-molecule 8s ease-in-out infinite}.motion--floating_subtle .orbit-motif--cell{animation:motif-cell 9s ease-in-out infinite}.motion--floating_subtle .orbit-motif--timeline{animation:motif-timeline 7.5s ease-in-out infinite}@keyframes motif-dna{50%{transform:translate(10px,-14px) rotate(-8deg)}}@keyframes motif-molecule{50%{transform:translate(-12px,10px) rotate(14deg)}}@keyframes motif-cell{50%{transform:translate(-8px,-13px) rotate(-1deg)}}@keyframes motif-timeline{50%{transform:translate(12px,8px) rotate(2deg)}}}@media(prefers-reduced-motion:reduce){.orbit-motif{animation:none!important}}`;
+  const blueprintCss = `.contact .eyebrow{color:var(--canvas)}.container--wide .shell{width:min(1360px,calc(100% - 40px))}.container--edge_to_edge .hero>.shell{width:100%;max-width:none}.container--contained .hero--floating_orbit .hero-orbit-stage{width:min(1120px,calc(100% - 40px))}.media-strategy--procedural_brand_svg .orbit-motif{display:block}`;
+  const visualContractCss =
+    design.schemaVersion === 2 && design.referenceBlueprint.schemaVersion === 4
+      ? TRUSTED_REACT_VISUAL_CONTRACT_V4_CSS
+      : "";
+  return `${baseCss}${componentCss}${orbitCss}${blueprintCss}${visualContractCss}`;
+}
+
+function cssForMaterializer(
+  visual: SiteOpsRuntimeVisual,
+  design: SiteOpsDesignSpec,
+  workflow: SiteOpsMaterializerCoordinates,
+) {
+  return workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+    ? cssForVisual(visual, design)
+    : cssForVisualLegacy(visual, design);
 }
 
 function renderLayoutSource(input: { mode: "preview" | "production" }) {
@@ -1515,7 +1622,7 @@ function buildTrustedAstroSource(input: {
   addTextFile(
     files,
     "public/styles.css",
-    `${cssForVisual(input.visual, input.designSpec)}\n`,
+    `${cssForMaterializer(input.visual, input.designSpec, input.workflow)}\n`,
   );
   if (input.brandAsset) {
     addTextFile(files, input.brandAsset.publicPath, input.brandAsset.bytes);
@@ -1726,7 +1833,9 @@ function buildTrustedReactSource(input: {
   addTextFile(
     files,
     "src/component-library.mjs",
-    input.workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion
+    input.workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion ||
+    input.workflow.frontMindVersion ===
+      SITEOPS_MATERIALIZER_V2_3.frontMindVersion
       ? TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE
       : TRUSTED_REACT_COMPONENT_LIBRARY_SOURCE_V2_2,
   );
@@ -2013,7 +2122,7 @@ function buildTrustedReactSource(input: {
   addTextFile(
     files,
     "public/styles.css",
-    `${cssForVisual(input.visual, input.designSpec)}\n`,
+    `${cssForMaterializer(input.visual, input.designSpec, input.workflow)}\n`,
   );
   if (input.brandAsset) {
     addTextFile(files, input.brandAsset.publicPath, input.brandAsset.bytes);
@@ -2086,6 +2195,179 @@ function buildTrustedReactSource(input: {
     paths.length
   ) {
     throw new Error("SITEOPS_SOURCE_PATH_COLLISION");
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function safeJsonLdText(value: Record<string, unknown>) {
+  return JSON.stringify(value)
+    .replaceAll("<", "\\u003c")
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
+}
+
+function buildTrustedFallbackSource(input: {
+  frozenRuntimeInput: z.infer<typeof siteOpsFrozenRuntimeInputSchema>;
+  contract: BuildPlanContractV3 | BuildPlanContractV4;
+  brandAsset: TrustedSiteBrandAsset | null;
+  primaryFailureCode: string;
+}) {
+  const files: SourceFile[] = [
+    {
+      path: "frontmind-runtime-input.json",
+      bytes: jsonBuffer(input.frozenRuntimeInput),
+    },
+    {
+      path: `frontmind-build-plan-contract-v${input.contract.schemaVersion}.json`,
+      bytes: jsonBuffer(input.contract),
+    },
+    {
+      path: "frontmind-trusted-fallback.json",
+      bytes: jsonBuffer({
+        schemaVersion: 1,
+        renderer: "trusted_static_fallback_v1",
+        primaryFailureCode: input.primaryFailureCode,
+      }),
+    },
+  ];
+  if (input.brandAsset) {
+    files.push({
+      path: input.brandAsset.publicPath,
+      bytes: input.brandAsset.bytes,
+    });
+  }
+  return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+/**
+ * Last-resort host renderer for already validated frozen input. It accepts no
+ * provider HTML, CSS, JavaScript, paths or URLs: every route and byte is
+ * projected by the host into a fixed, high-contrast, no-JavaScript document.
+ */
+function buildTrustedFallbackDist(input: {
+  brief: SiteBrief;
+  content: SiteOpsGeneratedContent;
+  designSpec: SiteDesignSpecV2;
+  mode: "preview" | "production";
+  canonicalOrigin: string | null;
+  brandAsset: TrustedSiteBrandAsset | null;
+}) {
+  const files: SourceFile[] = [];
+  const generatedByRoute = new Map(
+    input.content.routes.map((route) => [route.routeId, route]),
+  );
+  const typedContent = isSiteOpsGeneratedContentV2(input.content)
+    ? input.content
+    : null;
+  const heroFamily = input.designSpec.referenceBlueprint.heroFamily;
+  const brandPath = input.brandAsset
+    ? input.brandAsset.publicPath.slice("public/".length)
+    : null;
+  const navigation = input.brief.routes
+    .map(
+      (route) =>
+        `<a href="${escapeHtml(route.slug)}">${escapeHtml(route.title)}</a>`,
+    )
+    .join("");
+  const brand = brandPath
+    ? `<img class="brand-logo" src="/${escapeHtml(brandPath)}" width="${input.brandAsset!.width}" height="${input.brandAsset!.height}" alt="${escapeHtml(input.brief.companyName)}">`
+    : "";
+  const robots =
+    input.mode === "preview"
+      ? '<meta name="robots" content="noindex,nofollow">'
+      : '<meta name="robots" content="index,follow">';
+  const style = `:root{color-scheme:light;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#fff;color:#111}*{box-sizing:border-box}body{margin:0;min-width:320px;line-height:1.65}a{color:#0645ad;text-underline-offset:.18em}a:focus-visible{outline:3px solid #005fcc;outline-offset:3px}.shell{width:min(70rem,calc(100% - 2rem));margin-inline:auto}.site-header{border-bottom:2px solid #111;background:#fff}.nav{min-height:4.5rem;display:flex;align-items:center;justify-content:space-between;gap:1.5rem}.brand{display:flex;align-items:center;gap:.75rem;color:#111;font-weight:800;text-decoration:none}.brand-logo{display:block;width:auto;height:2.5rem;max-width:11rem;object-fit:contain}.nav-links{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:.75rem 1.25rem}.hero{padding:5rem 0 3rem;background:#111;color:#fff}.eyebrow{font-size:.8rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}.hero h1{max-width:20ch;margin:.3em 0;font-size:clamp(2.5rem,7vw,5.5rem);line-height:1}.lede{max-width:65ch;font-size:1.15rem}.content{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;padding-block:3rem 5rem}.section{border:2px solid #111;padding:1.5rem}.section h2{margin-top:0;line-height:1.15}.contact{padding:3rem 0;background:#111;color:#fff}.contact a{color:#fff}.site-footer{padding:2rem 0;border-top:2px solid #111}.empty{grid-column:1/-1}.empty p{font-size:1.1rem}@media(max-width:44rem){.nav{align-items:flex-start;padding-block:1rem}.nav-links{gap:.5rem}.content{grid-template-columns:1fr}.hero{padding-top:3.5rem}}`;
+  addTextFile(files, "styles.css", `${style}\n`);
+
+  const sharedHead = (inputValue: {
+    title: string;
+    description: string;
+    canonical: string | null;
+    jsonLd: Record<string, unknown> | null;
+  }) =>
+    `<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${robots}<title>${escapeHtml(inputValue.title)}</title><meta name="description" content="${escapeHtml(inputValue.description)}"><link rel="stylesheet" href="/styles.css"><link rel="icon" href="/favicon.svg">${inputValue.canonical ? `<link rel="canonical" href="${escapeHtml(inputValue.canonical)}"><meta property="og:image" content="${escapeHtml(input.canonicalOrigin!)}/social-card.svg">` : ""}${inputValue.jsonLd ? `<script type="application/ld+json">${safeJsonLdText(inputValue.jsonLd)}</script>` : ""}`;
+  const sharedHeader = `<header class="site-header"><div class="shell nav"><a class="brand" href="/">${brand}<span>${escapeHtml(input.brief.companyName)}</span></a><nav class="nav-links" aria-label="主导航">${navigation}</nav></div></header>`;
+  const sharedFooter = `<footer class="site-footer"><div class="shell"><strong>${escapeHtml(input.brief.companyName)}</strong></div></footer>`;
+  const contacts = input.brief.contacts
+    .map((contact) => {
+      const href = safeContactHref(contact.kind, contact.value);
+      return `<li>${href ? `<a href="${escapeHtml(href)}">${escapeHtml(contact.value)}</a>` : escapeHtml(contact.value)}</li>`;
+    })
+    .join("");
+
+  for (const route of input.brief.routes) {
+    const generated = generatedByRoute.get(route.id);
+    if (!generated) throw new Error("SITEOPS_FALLBACK_ROUTE_CONTENT_MISSING");
+    const typedRoute = typedContent?.routes.find(
+      (candidate) => candidate.routeId === route.id,
+    );
+    const emptyState = typedRoute?.emptyState;
+    const summary =
+      emptyState === "company_news_unavailable"
+        ? "当前知识库暂无可公开的企业动态。"
+        : generated.summary;
+    const sections = generated.sections
+      .map(
+        (section) =>
+          `<section class="section"><h2>${escapeHtml(section.heading)}</h2>${section.paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join("")}</section>`,
+      )
+      .join("");
+    const canonical = input.canonicalOrigin
+      ? routeCanonical(input.canonicalOrigin, route.slug)
+      : null;
+    const jsonLd =
+      canonical && !emptyState
+        ? {
+            "@context": "https://schema.org",
+            "@type": route.id === "home" ? "Organization" : "WebPage",
+            name: generated.heading,
+            description: summary,
+            url: canonical,
+          }
+        : null;
+    const content = emptyState
+      ? `<section class="section empty" data-content-state="empty"><h2>${escapeHtml(generated.heading)}</h2><p>${escapeHtml(summary)}</p></section>`
+      : sections;
+    const html = `<!doctype html><html lang="${escapeHtml(input.brief.primaryLanguage)}"><head>${sharedHead({ title: `${generated.heading} | ${input.brief.companyName}`, description: summary, canonical, jsonLd })}</head><body>${sharedHeader}<main><section class="hero" data-hero-family="${escapeHtml(heroFamily)}"><div class="shell"><p class="eyebrow">${escapeHtml(input.brief.companyName)}</p><h1>${escapeHtml(generated.heading)}</h1><p class="lede">${escapeHtml(summary)}</p></div></section><div class="shell content">${content}</div>${contacts ? `<section class="contact"><div class="shell"><h2>联系我们</h2><ul>${contacts}</ul></div></section>` : ""}</main>${sharedFooter}</body></html>`;
+    addTextFile(files, routeOutputPath(route.slug), `${html}\n`);
+  }
+
+  const notFound = `<!doctype html><html lang="${escapeHtml(input.brief.primaryLanguage)}"><head>${sharedHead({ title: `页面未找到 | ${input.brief.companyName}`, description: "请求的页面不存在。", canonical: null, jsonLd: null })}</head><body>${sharedHeader}<main><section class="hero"><div class="shell"><p class="eyebrow">404</p><h1>页面未找到</h1><p><a href="/">返回首页</a></p></div></section></main>${sharedFooter}</body></html>`;
+  addTextFile(files, "404.html", `${notFound}\n`);
+  if (input.brandAsset && brandPath) {
+    addTextFile(files, brandPath, input.brandAsset.bytes);
+  }
+  const glyph = escapeXml(
+    Array.from(input.brief.companyName.trim()).slice(0, 1).join("") || "•",
+  );
+  addTextFile(
+    files,
+    "favicon.svg",
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="${escapeXml(input.brief.companyName)}"><rect width="64" height="64" rx="12" fill="#111"/><text x="32" y="43" text-anchor="middle" font-family="Arial,sans-serif" font-size="34" font-weight="700" fill="#fff">${glyph}</text></svg>\n`,
+  );
+  addTextFile(
+    files,
+    "social-card.svg",
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="${escapeXml(input.brief.companyName)}"><rect width="1200" height="630" fill="#fff"/><rect width="28" height="630" fill="#111"/><text x="80" y="310" font-family="Arial,sans-serif" font-size="70" font-weight="700" fill="#111">${escapeXml(Array.from(input.brief.companyName).slice(0, 32).join(""))}</text></svg>\n`,
+  );
+  addTextFile(
+    files,
+    "robots.txt",
+    input.mode === "preview"
+      ? "User-agent: *\nDisallow: /\n"
+      : `User-agent: *\nAllow: /\nSitemap: ${input.canonicalOrigin}/sitemap.xml\n`,
+  );
+  if (input.mode === "production") {
+    addTextFile(
+      files,
+      "sitemap.xml",
+      `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${input.brief.routes.map((route) => `<url><loc>${escapeXml(routeCanonical(input.canonicalOrigin!, route.slug))}</loc></url>`).join("")}</urlset>\n`,
+    );
+    addTextFile(
+      files,
+      "llms.txt",
+      `# ${plainMetadataText(input.brief.companyName)}\n\n${plainMetadataText(input.content.seo.description)}\n\n${input.brief.routes.map((route) => `- [${plainMetadataText(route.title)}](${routeCanonical(input.canonicalOrigin!, route.slug)})`).join("\n")}\n`,
+    );
   }
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
@@ -2496,7 +2778,25 @@ function servedMimeType(filename: string) {
   );
 }
 
-async function runBrowserQa(input: {
+function safeQaCheckId(value: string, fallback: string) {
+  return /^[a-z0-9][a-z0-9:_-]{0,95}$/u.test(value) ? value : fallback;
+}
+
+function browserQaWarning(input: {
+  phase: SiteOpsQaWarning["phase"];
+  code: string;
+  checkId: string;
+}): SiteOpsQaWarning {
+  return {
+    phase: input.phase,
+    code: /^SITEOPS_[A-Z0-9_]+$/u.test(input.code)
+      ? input.code
+      : "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+    checkId: safeQaCheckId(input.checkId, "browser-qa"),
+  };
+}
+
+async function runBrowserQaLegacy(input: {
   files: readonly SourceFile[];
   routes: SiteBrief["routes"];
   mode: "preview" | "production";
@@ -2756,6 +3056,328 @@ async function runBrowserQa(input: {
   }
 }
 
+async function runBrowserQaStrict(input: {
+  files: readonly SourceFile[];
+  routes: SiteBrief["routes"];
+  mode: "preview" | "production";
+  workRoot: string;
+  abortSignal?: AbortSignal;
+}) {
+  assertNotAborted(input.abortSignal, "browser_qa");
+  const files = new Map(input.files.map((file) => [file.path, file.bytes]));
+  const server = createServer((request, response) => {
+    try {
+      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      const decoded = decodeURIComponent(url.pathname);
+      if (
+        decoded.includes("\\") ||
+        decoded.includes("\0") ||
+        decoded
+          .split("/")
+          .some((segment) => segment === "." || segment === "..")
+      ) {
+        response.writeHead(400).end();
+        return;
+      }
+      const clean = decoded.replace(/^\/+|\/+$/gu, "");
+      const candidates = clean
+        ? path.posix.extname(clean)
+          ? [clean]
+          : [`${clean}/index.html`, clean]
+        : ["index.html"];
+      const filename = candidates.find((candidate) => files.has(candidate));
+      const bytes = filename ? files.get(filename) : files.get("404.html");
+      if (!bytes) {
+        response.writeHead(404).end();
+        return;
+      }
+      const headers: Record<string, string | number> = {
+        "Cache-Control": "no-store",
+        "Content-Type": servedMimeType(filename ?? "404.html"),
+        "Content-Length": bytes.length,
+        "Content-Security-Policy":
+          "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+      };
+      if (input.mode === "preview") {
+        headers["X-Robots-Tag"] = "noindex, nofollow, noarchive";
+      }
+      response.writeHead(filename ? 200 : 404, headers);
+      response.end(bytes);
+    } catch {
+      response.writeHead(400).end();
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("SITEOPS_VISUAL_QA_SERVER_FAILED");
+  }
+  const origin = `http://127.0.0.1:${address.port}`;
+  const closeServer = async () => {
+    if (!server.listening) return;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  };
+  const screenshotFiles: SourceFile[] = [];
+  let axeViolationCount = 0;
+  const axeViolationIds = new Set<string>();
+  const browser = await chromium
+    .launch({
+      headless: true,
+      chromiumSandbox: false,
+      args: ["--disable-background-networking", "--disable-sync"],
+      env: {
+        HOME: input.workRoot,
+        LANG: "C.UTF-8",
+        TZ: "UTC",
+        PATH: path.dirname(process.execPath),
+      },
+    })
+    .catch(async (error) => {
+      await closeServer();
+      throw toSiteOpsMaterializationError({
+        error,
+        phase: "browser_qa",
+        fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+        retryClass: "host_transient",
+      });
+    });
+  try {
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 1000 },
+      reducedMotion: "reduce",
+      serviceWorkers: "block",
+    });
+    const page = await context.newPage();
+    const inspectedRoutes = input.routes.slice(0, 3);
+    for (const route of inspectedRoutes) {
+      assertNotAborted(input.abortSignal, "browser_qa");
+      const routeUrl = `${origin}${route.slug}`;
+      const response = await page.goto(routeUrl, {
+        waitUntil: "networkidle",
+        timeout: 15_000,
+      });
+      if (!response?.ok()) throw new Error("SITEOPS_VISUAL_QA_ROUTE_FAILED");
+      const axe = await new AxeBuilder({ page })
+        .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+        .analyze();
+      const blocking = axe.violations.filter((violation) =>
+        ["critical", "serious"].includes(violation.impact ?? ""),
+      );
+      axeViolationCount += blocking.length;
+      for (const violation of blocking) axeViolationIds.add(violation.id);
+      for (const viewport of [
+        { label: "390", width: 390, height: 844 },
+        { label: "768", width: 768, height: 1024 },
+        { label: "1440", width: 1440, height: 1000 },
+      ] as const) {
+        await page.setViewportSize({
+          width: viewport.width,
+          height: viewport.height,
+        });
+        const png = await page.screenshot({ fullPage: true, type: "png" });
+        const routeName = route.slug === "/" ? "home" : route.id;
+        screenshotFiles.push({
+          path: `screenshots/${routeName}-${viewport.label}.png`,
+          bytes: Buffer.from(png),
+        });
+      }
+    }
+  } catch (error) {
+    await closeServer();
+    throw error;
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+
+  const chromeRoot = path.join(input.workRoot, "chrome");
+  assertNotAborted(input.abortSignal, "browser_qa");
+  await mkdir(chromeRoot, { recursive: true, mode: 0o700 });
+  const chromeProfile = path.join(chromeRoot, "profile");
+  await mkdir(chromeProfile, { recursive: false, mode: 0o700 });
+  const launched = await launchChrome({
+    chromePath: chromium.executablePath(),
+    chromeFlags: [
+      "--headless=new",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--no-first-run",
+      "--no-sandbox",
+    ],
+    userDataDir: chromeProfile,
+    handleSIGINT: false,
+    logLevel: "silent",
+    envVars: {
+      HOME: chromeRoot,
+      LANG: "C.UTF-8",
+      TZ: "UTC",
+      PATH: path.dirname(process.execPath),
+    },
+  }).catch(async (error) => {
+    await closeServer();
+    throw toSiteOpsMaterializationError({
+      error,
+      phase: "lighthouse",
+      fallbackCode: "SITEOPS_LIGHTHOUSE_RUNTIME_UNAVAILABLE",
+      retryClass: "host_transient",
+    });
+  });
+  const abortChrome = () => {
+    try {
+      launched.kill();
+    } catch {
+      // Chrome may have already stopped.
+    }
+  };
+  input.abortSignal?.addEventListener("abort", abortChrome, { once: true });
+  try {
+    assertNotAborted(input.abortSignal, "browser_qa");
+    const result = await lighthouse(
+      `${origin}/`,
+      {
+        port: launched.port,
+        output: "json",
+        logLevel: "silent",
+        onlyCategories: [
+          "performance",
+          "accessibility",
+          "best-practices",
+          "seo",
+        ],
+        skipAudits: input.mode === "preview" ? ["is-crawlable"] : undefined,
+      },
+      undefined,
+    );
+    if (!result?.lhr) {
+      throw new SiteOpsMaterializationError({
+        phase: "lighthouse",
+        code: "SITEOPS_LIGHTHOUSE_NO_RESULT",
+        retryClass: "host_transient",
+      });
+    }
+    const score = (category: string) =>
+      Math.round((result.lhr.categories[category]?.score ?? 0) * 100);
+    const lighthouseScores = {
+      performance: score("performance"),
+      accessibility: score("accessibility"),
+      bestPractices: score("best-practices"),
+      seo: score("seo"),
+      cls: Number(
+        result.lhr.audits["cumulative-layout-shift"]?.numericValue ?? 1,
+      ),
+    };
+    const lighthouseFailed =
+      lighthouseScores.performance < 85 ||
+      lighthouseScores.accessibility < 95 ||
+      lighthouseScores.bestPractices < 90 ||
+      lighthouseScores.seo < 95 ||
+      lighthouseScores.cls >= 0.1;
+    const failedAuditIds = Object.entries(result.lhr.audits)
+      .filter(([, audit]) => audit.score !== null && audit.score < 1)
+      .map(([id]) => id)
+      .slice(0, 30);
+    const warnings: SiteOpsQaWarning[] = [];
+    if (lighthouseFailed) {
+      warnings.push(
+        browserQaWarning({
+          phase: "lighthouse",
+          code: "SITEOPS_LIGHTHOUSE_THRESHOLD_FAILED",
+          checkId: "lighthouse:threshold",
+        }),
+      );
+      for (const auditId of failedAuditIds) {
+        warnings.push(
+          browserQaWarning({
+            phase: "lighthouse",
+            code: "SITEOPS_LIGHTHOUSE_THRESHOLD_FAILED",
+            checkId: `lighthouse:${auditId}`,
+          }),
+        );
+      }
+    }
+    for (const violationId of [...axeViolationIds].sort()) {
+      warnings.push(
+        browserQaWarning({
+          phase: "browser_qa",
+          code: "SITEOPS_AXE_BLOCKING_VIOLATIONS",
+          checkId: `axe:${violationId}`,
+        }),
+      );
+    }
+    return {
+      summary: {
+        available: true,
+        lighthouse: lighthouseScores,
+        axeViolationCount,
+        axeViolationIds: [...axeViolationIds].sort(),
+        screenshotFiles: screenshotFiles.map((file) => file.path),
+      },
+      screenshotFiles,
+      warnings,
+    };
+  } finally {
+    input.abortSignal?.removeEventListener("abort", abortChrome);
+    try {
+      launched.kill();
+    } catch {
+      // The process may already have exited after Lighthouse completion.
+    }
+    await closeServer();
+  }
+}
+
+async function runBrowserQa(input: Parameters<typeof runBrowserQaStrict>[0]) {
+  try {
+    return await runBrowserQaStrict(input);
+  } catch (error) {
+    const normalized = toSiteOpsMaterializationError({
+      error,
+      phase: "browser_qa",
+      fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+      retryClass: "host_transient",
+    });
+    if (
+      input.abortSignal?.aborted ||
+      normalized.code === "SITEOPS_MATERIALIZATION_ABORTED"
+    ) {
+      throw normalized;
+    }
+    const phase =
+      normalized.phase === "lighthouse" ? "lighthouse" : "browser_qa";
+    return {
+      summary: {
+        available: false,
+        lighthouse: {
+          performance: null,
+          accessibility: null,
+          bestPractices: null,
+          seo: null,
+          cls: null,
+        },
+        axeViolationCount: 0,
+        axeViolationIds: [],
+        screenshotFiles: [],
+      },
+      screenshotFiles: [] as SourceFile[],
+      warnings: [
+        browserQaWarning({
+          phase,
+          code: normalized.code,
+          checkId:
+            phase === "lighthouse"
+              ? "lighthouse:runtime"
+              : "browser-qa:runtime",
+        }),
+      ],
+    };
+  }
+}
+
 function htmlText(html: string) {
   return html
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/giu, " ")
@@ -2812,7 +3434,16 @@ function qaDist(input: {
   );
   const checks: SiteOpsQaReport["checks"] = [];
   const requireCheck = (id: string, condition: boolean, detail: string) => {
-    if (!condition) throw new Error(`SITEOPS_QA_FAILED:${id}`);
+    if (!condition) {
+      throw new SiteOpsMaterializationError({
+        phase: "static_qa",
+        code: "SITEOPS_STATIC_QA_FAILED",
+        retryClass: "host_deterministic",
+        safeDetails: {
+          checkId: safeQaCheckId(id.split(":", 1)[0] ?? "", "static-qa"),
+        },
+      });
+    }
     checks.push({ id, passed: true, detail });
   };
   requireCheck(
@@ -2835,7 +3466,7 @@ function qaDist(input: {
   const htmlFiles = [...files.entries()].filter(([name]) =>
     name.endsWith(".html"),
   );
-  if (input.qaPolicyVersion === "siteops-qa-v4") {
+  if (["siteops-qa-v4", "siteops-qa-v5"].includes(input.qaPolicyVersion)) {
     const privateSourceTokens = input.sourceDocumentIds.filter(
       (documentId) => documentId.length >= 8,
     );
@@ -2917,7 +3548,7 @@ function qaDist(input: {
       !SENSITIVE_TEXT.test(html) && !FORBIDDEN_DEMO_TEXT.test(html),
       "no credential-shaped or demo text is present",
     );
-    if (input.qaPolicyVersion === "siteops-qa-v4") {
+    if (["siteops-qa-v4", "siteops-qa-v5"].includes(input.qaPolicyVersion)) {
       requireCheck(
         `no-public-source-labels:${name}`,
         !/(?:sourceDocumentIds|source_document_ids|内部来源|来源文档\s*(?:ID|编号))/iu.test(
@@ -3046,7 +3677,7 @@ function qaDist(input: {
       (total, file) => total + file.bytes.length,
       0,
     ),
-  } satisfies Omit<SiteOpsQaReport, "browser">;
+  } satisfies Omit<SiteOpsQaReport, "browser" | "buildDelivery" | "warnings">;
 }
 
 async function materializeSiteWithWorkflow(
@@ -3166,10 +3797,14 @@ async function materializeSiteWithWorkflow(
                 kind: REACT_STATIC_RENDERER,
                 reactVersion: REACT_STATIC_REACT_VERSION,
                 componentLibraryVersion: reactCoordinates!
-                  .componentLibraryVersion as "2.2.0" | "2.3.0",
+                  .componentLibraryVersion as
+                    | "2.2.0"
+                    | "2.3.0"
+                    | "2.4.0",
                 materializerVersion: reactCoordinates!.materializerVersion as
                   | "2.2.0"
-                  | "2.3.0",
+                  | "2.3.0"
+                  | "2.4.0",
               },
               content: {
                 schemaVersion: 2,
@@ -3273,48 +3908,88 @@ async function materializeSiteWithWorkflow(
         brandAsset: freezeSiteBrandAsset(validated.brandAsset),
       }),
   });
-  const sourceFiles = await materializationStage({
-    phase: "source_generation",
-    fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
-    retryClass: "host_deterministic",
-    run: () => {
-      const common = {
-        frozenRuntimeInput,
-        brief: validated.brief,
-        content: validated.generatedContent,
-        canonicalOrigin: validated.canonicalOrigin,
-        mode: input.mode,
-        brandAsset: validated.brandAsset,
-        workflow,
-      };
-      if (isReactStaticRenderer(renderer)) {
-        if (
-          (contractSeed.schemaVersion !== 3 &&
-            contractSeed.schemaVersion !== 4) ||
-          !reactDesign ||
-          !reactVisual
-        ) {
-          throw new Error("SITEOPS_REACT_V2_SOURCE_INPUT_MISSING");
+  let renderMode: SiteOpsBuildDelivery["renderMode"] = "primary";
+  const renderWarnings: SiteOpsQaWarning[] = [];
+  let sourceFiles: SourceFile[];
+  try {
+    sourceFiles = await materializationStage({
+      phase: "source_generation",
+      fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
+      retryClass: "host_deterministic",
+      run: () => {
+        const common = {
+          frozenRuntimeInput,
+          brief: validated.brief,
+          content: validated.generatedContent,
+          canonicalOrigin: validated.canonicalOrigin,
+          mode: input.mode,
+          brandAsset: validated.brandAsset,
+          workflow,
+        };
+        if (isReactStaticRenderer(renderer)) {
+          if (
+            (contractSeed.schemaVersion !== 3 &&
+              contractSeed.schemaVersion !== 4) ||
+            !reactDesign ||
+            !reactVisual
+          ) {
+            throw new Error("SITEOPS_REACT_V2_SOURCE_INPUT_MISSING");
+          }
+          return buildTrustedReactSource({
+            ...common,
+            contract: contractSeed,
+            visual: reactVisual,
+            designSpec: reactDesign,
+            renderer,
+          });
         }
-        return buildTrustedReactSource({
+        if (
+          contractSeed.schemaVersion !== 2 ||
+          !legacyDesign ||
+          !legacyVisual
+        ) {
+          throw new Error("SITEOPS_ASTRO_V1_SOURCE_INPUT_MISSING");
+        }
+        return buildTrustedAstroSource({
           ...common,
           contract: contractSeed,
-          visual: reactVisual,
-          designSpec: reactDesign,
-          renderer,
+          visual: legacyVisual,
+          designSpec: legacyDesign,
         });
-      }
-      if (contractSeed.schemaVersion !== 2 || !legacyDesign || !legacyVisual) {
-        throw new Error("SITEOPS_ASTRO_V1_SOURCE_INPUT_MISSING");
-      }
-      return buildTrustedAstroSource({
-        ...common,
-        contract: contractSeed,
-        visual: legacyVisual,
-        designSpec: legacyDesign,
-      });
-    },
-  });
+      },
+    });
+  } catch (error) {
+    const normalized = toSiteOpsMaterializationError({
+      error,
+      phase: "source_generation",
+      fallbackCode: "SITEOPS_SOURCE_GENERATION_FAILED",
+      retryClass: "host_deterministic",
+    });
+    if (
+      workflow.frontMindVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
+      !isReactStaticRenderer(renderer) ||
+      input.abortSignal?.aborted ||
+      normalized.code === "SITEOPS_MATERIALIZATION_ABORTED" ||
+      !reactDesign ||
+      contractSeed.schemaVersion !== 4
+    ) {
+      throw normalized;
+    }
+    renderMode = "trusted_fallback";
+    renderWarnings.push(
+      browserQaWarning({
+        phase: "react_static_build",
+        code: normalized.code,
+        checkId: "primary-source:fallback",
+      }),
+    );
+    sourceFiles = buildTrustedFallbackSource({
+      frozenRuntimeInput,
+      contract: contractSeed,
+      brandAsset: validated.brandAsset,
+      primaryFailureCode: normalized.code,
+    });
+  }
   await materializationStage({
     phase: "asset_projection",
     fallbackCode: "SITEOPS_SOURCE_ASSET_ISOLATION_FAILED",
@@ -3343,43 +4018,132 @@ async function materializeSiteWithWorkflow(
     path.join(tmpdir(), `frontmind-siteops-${input.build.id}-${nonce}-`),
   );
   try {
-    await materializationStage({
-      phase: "source_generation",
-      fallbackCode: "SITEOPS_SOURCE_WRITE_FAILED",
-      retryClass: "host_deterministic",
-      run: () => writeSourceRoot(buildRoot, sourceFiles),
-    });
     const buildPhase = isReactStaticRenderer(renderer)
       ? ("react_static_build" as const)
       : ("astro_build" as const);
-    const buildLog = await materializationStage({
-      phase: buildPhase,
-      fallbackCode: isReactStaticRenderer(renderer)
-        ? "SITEOPS_REACT_STATIC_BUILD_FAILED"
-        : "SITEOPS_ASTRO_BUILD_FAILED",
-      retryClass: "host_deterministic",
-      run: () =>
-        isReactStaticRenderer(renderer)
-          ? runReactStaticBuild(
-              buildRoot,
-              input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
-              input.abortSignal,
-            )
-          : runAstroBuild(
-              buildRoot,
-              input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
-              input.abortSignal,
-            ),
-    });
-    const distRoot = path.join(buildRoot, "dist");
-    const distFiles = await materializationStage({
-      phase: buildPhase,
-      fallbackCode: isReactStaticRenderer(renderer)
-        ? "SITEOPS_REACT_STATIC_DIST_COLLECTION_FAILED"
-        : "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
-      retryClass: "host_deterministic",
-      run: () => collectDirectory(distRoot),
-    });
+    let buildLog: Buffer;
+    let distFiles: SourceFile[];
+    if (renderMode === "trusted_fallback") {
+      distFiles = await materializationStage({
+        phase: "react_static_build",
+        fallbackCode: "SITEOPS_TRUSTED_FALLBACK_RENDER_FAILED",
+        retryClass: "host_deterministic",
+        run: () =>
+          buildTrustedFallbackDist({
+            brief: validated.brief,
+            content: validated.generatedContent,
+            designSpec: reactDesign!,
+            mode: input.mode,
+            canonicalOrigin: validated.canonicalOrigin,
+            brandAsset: validated.brandAsset,
+          }),
+      });
+      buildLog = jsonBuffer({
+        schemaVersion: 1,
+        renderMode,
+        warningCode: renderWarnings[0]!.code,
+      });
+    } else try {
+      await materializationStage({
+        phase: "source_generation",
+        fallbackCode: "SITEOPS_SOURCE_WRITE_FAILED",
+        retryClass: "host_deterministic",
+        run: () => writeSourceRoot(buildRoot, sourceFiles),
+      });
+      buildLog = await materializationStage({
+        phase: buildPhase,
+        fallbackCode: isReactStaticRenderer(renderer)
+          ? "SITEOPS_REACT_STATIC_BUILD_FAILED"
+          : "SITEOPS_ASTRO_BUILD_FAILED",
+        retryClass: "host_deterministic",
+        run: () =>
+          isReactStaticRenderer(renderer)
+            ? runReactStaticBuild(
+                buildRoot,
+                input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
+                input.abortSignal,
+              )
+            : runAstroBuild(
+                buildRoot,
+                input.timeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS,
+                input.abortSignal,
+              ),
+      });
+      const distRoot = path.join(buildRoot, "dist");
+      distFiles = await materializationStage({
+        phase: buildPhase,
+        fallbackCode: isReactStaticRenderer(renderer)
+          ? "SITEOPS_REACT_STATIC_DIST_COLLECTION_FAILED"
+          : "SITEOPS_ASTRO_DIST_COLLECTION_FAILED",
+        retryClass: "host_deterministic",
+        run: () => collectDirectory(distRoot),
+      });
+    } catch (error) {
+      const normalized = toSiteOpsMaterializationError({
+        error,
+        phase: buildPhase,
+        fallbackCode: "SITEOPS_REACT_STATIC_BUILD_FAILED",
+        retryClass: "host_deterministic",
+      });
+      if (
+        workflow.frontMindVersion !== SITEOPS_WORKFLOW.frontMindVersion ||
+        !isReactStaticRenderer(renderer) ||
+        input.abortSignal?.aborted ||
+        normalized.code === "SITEOPS_MATERIALIZATION_ABORTED" ||
+        !reactDesign
+      ) {
+        throw normalized;
+      }
+      renderMode = "trusted_fallback";
+      renderWarnings.push(
+        browserQaWarning({
+          phase: "react_static_build",
+          code: normalized.code,
+          checkId: "primary-render:fallback",
+        }),
+      );
+      sourceFiles = [
+        ...sourceFiles,
+        {
+          path: "frontmind-trusted-fallback.json",
+          bytes: jsonBuffer({
+            schemaVersion: 1,
+            renderer: "trusted_static_fallback_v1",
+            primaryFailureCode: normalized.code,
+          }),
+        },
+      ].sort((left, right) => left.path.localeCompare(right.path));
+      await materializationStage({
+        phase: "asset_projection",
+        fallbackCode: "SITEOPS_FALLBACK_ASSET_ISOLATION_FAILED",
+        retryClass: "host_deterministic",
+        run: () =>
+          assertTrustedSourceAssetIsolation({
+            files: sourceFiles,
+            assetDecisions: validated.assetDecisions,
+            brandAsset: validated.brandAsset,
+          }),
+      });
+      distFiles = await materializationStage({
+        phase: "react_static_build",
+        fallbackCode: "SITEOPS_TRUSTED_FALLBACK_RENDER_FAILED",
+        retryClass: "host_deterministic",
+        run: () =>
+          buildTrustedFallbackDist({
+            brief: validated.brief,
+            content: validated.generatedContent,
+            designSpec: reactDesign,
+            mode: input.mode,
+            canonicalOrigin: validated.canonicalOrigin,
+            brandAsset: validated.brandAsset,
+          }),
+      });
+      buildLog = jsonBuffer({
+        schemaVersion: 1,
+        renderMode,
+        warningCode: normalized.code,
+      });
+    }
     const staticQa = await materializationStage({
       phase: "static_qa",
       fallbackCode: "SITEOPS_STATIC_QA_FAILED",
@@ -3401,23 +4165,73 @@ async function materializeSiteWithWorkflow(
               : undefined,
         }),
     });
-    const browserQa = await materializationStage({
-      phase: "browser_qa",
-      fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
-      retryClass: "host_transient",
-      run: () =>
-        runBrowserQa({
-          files: distFiles,
-          routes: validated.brief.routes,
-          mode: input.mode,
-          workRoot: buildRoot,
-          abortSignal: input.abortSignal,
-        }),
-    });
-    const qa: SiteOpsQaReport = {
-      ...staticQa,
-      browser: browserQa.summary,
-    };
+    const currentDeliveryWorkflow =
+      workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion;
+    const browserQa = currentDeliveryWorkflow
+      ? await materializationStage({
+          phase: "browser_qa",
+          fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+          retryClass: "host_transient",
+          run: () =>
+            runBrowserQa({
+              files: distFiles,
+              routes: validated.brief.routes,
+              mode: input.mode,
+              workRoot: buildRoot,
+              abortSignal: input.abortSignal,
+            }),
+        })
+      : await materializationStage({
+          phase: "browser_qa",
+          fallbackCode: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+          retryClass: "host_transient",
+          run: () =>
+            runBrowserQaLegacy({
+              files: distFiles,
+              routes: validated.brief.routes,
+              mode: input.mode,
+              workRoot: buildRoot,
+              abortSignal: input.abortSignal,
+            }),
+        });
+    const warnings = currentDeliveryWorkflow
+      ? [
+          ...renderWarnings,
+          ...(browserQa as Awaited<ReturnType<typeof runBrowserQa>>).warnings,
+        ]
+      : [];
+    const warningCodes = [...new Set(warnings.map((warning) => warning.code))];
+    const buildDelivery: SiteOpsBuildDelivery = currentDeliveryWorkflow
+      ? {
+          renderMode,
+          qaStatus:
+            renderMode === "trusted_fallback" ||
+            !(browserQa as Awaited<ReturnType<typeof runBrowserQa>>).summary
+              .available
+              ? "partial"
+              : warnings.length > 0
+                ? "passed_with_warnings"
+                : "passed",
+          warningCodes,
+        }
+      : {
+          renderMode: "primary",
+          qaStatus: "passed",
+          warningCodes: [],
+        };
+    const qa = currentDeliveryWorkflow
+      ? ({
+          ...staticQa,
+          browser: (
+            browserQa as Awaited<ReturnType<typeof runBrowserQa>>
+          ).summary,
+          buildDelivery,
+          warnings,
+        } satisfies SiteOpsQaReport)
+      : {
+          ...staticQa,
+          browser: browserQa.summary,
+        };
     const { distZip, qaJson, visualQaZip } = await materializationStage({
       phase: "qa_packaging",
       fallbackCode: "SITEOPS_QA_PACKAGING_FAILED",
@@ -3539,6 +4353,7 @@ async function materializeSiteWithWorkflow(
         supportEvidenceSha256s: validated.visual.supportEvidenceSha256s,
         designSpecHash: canonicalSiteOpsSha256(validated.designSpec),
       },
+      ...(currentDeliveryWorkflow ? { buildDelivery } : {}),
       brandAsset: freezeSiteBrandAsset(validated.brandAsset),
       contractSha256: sha256(contractJson),
       sourceSha256: sha256(sourceZip),
@@ -3565,6 +4380,7 @@ async function materializeSiteWithWorkflow(
       provenanceSha256: sha256(provenanceJson),
       buildLog,
       files: new Map(distFiles.map((file) => [file.path, file.bytes])),
+      buildDelivery,
     };
   } finally {
     await rm(buildRoot, { recursive: true, force: true }).catch(
@@ -3648,6 +4464,14 @@ function materializeReactStaticSiteV2_2(input: MaterializeAstroSiteInput) {
 function materializeReactStaticSiteV2_3(input: MaterializeAstroSiteInput) {
   return materializeSiteWithWorkflow(
     input,
+    SITEOPS_MATERIALIZER_V2_3,
+    REACT_STATIC_RENDERER,
+  );
+}
+
+function materializeReactStaticSiteV2_4(input: MaterializeAstroSiteInput) {
+  return materializeSiteWithWorkflow(
+    input,
     SITEOPS_WORKFLOW,
     REACT_STATIC_RENDERER,
   );
@@ -3695,9 +4519,14 @@ const productionMaterializerRegistry = [
     materialize: materializeReactStaticSiteV2_2,
   },
   {
-    workflow: SITEOPS_WORKFLOW,
+    workflow: SITEOPS_MATERIALIZER_V2_3,
     renderer: REACT_STATIC_RENDERER,
     materialize: materializeReactStaticSiteV2_3,
+  },
+  {
+    workflow: SITEOPS_WORKFLOW,
+    renderer: REACT_STATIC_RENDERER,
+    materialize: materializeReactStaticSiteV2_4,
   },
 ] as const;
 
@@ -3853,6 +4682,7 @@ export async function materializeProductionSiteFromSource(input: {
     qaReport: JSON.parse(
       materialized.qaJson.toString("utf8"),
     ) as SiteOpsQaReport,
+    buildDelivery: materialized.buildDelivery,
     provenanceJson: materialized.provenanceJson,
     provenanceSha256: materialized.provenanceSha256,
   };

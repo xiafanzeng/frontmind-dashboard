@@ -8,6 +8,10 @@ import {
   createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
 import { SITEOPS_WORKFLOW } from "../../shared/siteops";
+import {
+  FRONTMIND_VISUAL_FAMILIES_V3,
+  referenceBlueprintV4ForFamily,
+} from "../../shared/siteops-design";
 
 const remotePreview = vi.hoisted(() => ({
   fetchPinnedPublicHttps: vi.fn(),
@@ -19,6 +23,7 @@ vi.mock("./remote-preview", () => ({
 
 import { createManusSiteOpsProviderHandler } from "./manus-provider";
 import { SiteOpsMaterializationError } from "./materialization-error";
+import { ManusV2ApiError } from "../manus-v2-client";
 
 const sha256 = (value: Buffer | string) =>
   createHash("sha256").update(value).digest("hex");
@@ -79,12 +84,14 @@ function operationMarker(operationToken: string, timestamp: number) {
 }
 
 describe("SiteOps personal-key build multi-sweep integration", () => {
-  it("waits for each stopped phase, resolves content, and returns one verified artifact set for atomic worker finalization", async () => {
-    const taskId = "customer-private-task-1";
-    const designToken = `siteops-design:${baseOperation.id}`;
-    const contentToken = `siteops-content:${baseOperation.id}`;
+  it("uses the trusted 2.4 brief fallback when the single content-draft task is unavailable", async () => {
     const preview = Buffer.from("frozen-hero-preview", "utf8");
+    const realizationPreview = Buffer.from(
+      "frozen-host-realization-preview",
+      "utf8",
+    );
     const previewSha256 = sha256(preview);
+    const realizationPreviewSha256 = sha256(realizationPreview);
     const visualEvidence = createVisualEvidenceV1({
       evidenceKind: "catalog_metadata_preview_v1",
       providerItemKey: "n:143",
@@ -93,43 +100,27 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       previewSha256,
       taxonomyDerivationVersion: "catalog-metadata-preview-v1",
     });
-    const designWire = {
-      operationToken: designToken,
-      schemaVersion: 2,
-      layoutArchetype: "split",
-      heroVariant: "split_media",
-      density: "balanced",
-      surfaceStyle: "bordered",
-      typeScale: "display",
-      imageTreatment: "contained",
-      motionLevel: "subtle",
-      backgroundPaletteIndex: 2,
-      textPaletteIndex: 0,
-      accentPaletteIndex: 1,
-      siteTitle: "星河智造",
-      description: "经过知识来源核验的企业官网。",
-      routeSlots: [{ routeId: "home", slotId: "proof", variant: "proof" }],
-    } as const;
-    const contentWire = {
-      operationToken: contentToken,
-      schemaVersion: 2,
-      routes: [
-        {
-          routeId: "home",
-          eyebrow: "可信制造",
-          heading: "让设备服务更可靠",
-          summary: "基于经过核验的企业资料呈现服务能力。",
-        },
-      ],
-      sections: [
-        {
-          routeId: "home",
-          slotId: "proof",
-          heading: "设备服务能力",
-          paragraphs: ["星河智造提供经过知识来源核验的设备服务。"],
-          sourceDocumentIds: ["overview"],
-        },
-      ],
+    const referenceBlueprint = referenceBlueprintV4ForFamily({
+      candidateId: "60000000-0000-4000-8000-000000000006",
+      providerItemKey: visualEvidence.providerItemKey,
+      referencePreviewLocalAssetId: "80000000-0000-4000-8000-000000000008",
+      referencePreviewSha256: previewSha256,
+      realizationPreviewLocalAssetId: "81000000-0000-4000-8000-000000000008",
+      realizationPreviewSha256,
+      heroFamily: "split_media",
+      inspirationEvidenceId: visualEvidence.evidenceSha256,
+      inspirationTaxonomy: {
+        role: "foundation",
+        palette: [],
+        typography: [],
+        layout: ["split-layout"],
+        motion: [],
+        accessibility: ["reduced-motion"],
+      },
+    });
+    const buildOperation = {
+      ...baseOperation,
+      input: { ...baseOperation.input, referenceBlueprint },
     } as const;
 
     const context = {
@@ -139,11 +130,11 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         userId: baseOperation.userId,
         knowledgeSnapshotId: "50000000-0000-4000-8000-000000000005",
         knowledgeArchiveHash: "a".repeat(64),
-        workflowUpstreamVersion: "1.0.0",
-        workflowUpstreamHash: "b".repeat(64),
-        workflowVersion: "1.6.0",
-        workflowPackageHash: "c".repeat(64),
-        starterVersion: "1.6.0",
+        workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
+        workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
+        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+        workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
+        starterVersion: SITEOPS_WORKFLOW.starterVersion,
         brief: {
           companyName: "星河智造",
           primaryLanguage: "zh-CN",
@@ -218,31 +209,102 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         selectionBundleHash: "",
       },
     };
+    const perceptualHashes = [
+      "0000000000000000",
+      "ffffffffffffffff",
+      "aaaaaaaaaaaaaaaa",
+      "5555555555555555",
+      "cccccccccccccccc",
+      "3333333333333333",
+      "f0f0f0f0f0f0f0f0",
+      "0f0f0f0f0f0f0f0f",
+      "9696969696969696",
+    ] as const;
+    const families = [
+      "split_media",
+      ...FRONTMIND_VISUAL_FAMILIES_V3.filter(
+        (family) => family !== "split_media",
+      ),
+    ] as const;
+    const selectionCandidates = families.map((heroFamily, index) => {
+      const selected = index === 0;
+      const suffix = String(index + 10).padStart(12, "0");
+      const candidateId = selected
+        ? context.sample.id
+        : `60000000-0000-4000-8000-${suffix}`;
+      const providerItemKey = selected ? "n:143" : `n:${200 + index}`;
+      const referencePreviewLocalAssetId = selected
+        ? context.sample.previewLocalAssetId
+        : `80000000-0000-4000-8000-${suffix}`;
+      const realizationPreviewLocalAssetId = selected
+        ? referenceBlueprint.previewLocalAssetId
+        : `81000000-0000-4000-8000-${suffix}`;
+      const referenceSha = selected
+        ? previewSha256
+        : sha256(`provider-reference-${index}`);
+      const realizationSha = selected
+        ? realizationPreviewSha256
+        : sha256(`host-realization-${index}`);
+      const candidateEvidence = selected
+        ? visualEvidence
+        : createVisualEvidenceV1({
+            evidenceKind: "catalog_metadata_preview_v1",
+            providerItemKey,
+            metadataSha256: sha256(`metadata-${index}`),
+            providerResponseSha256: sha256(`response-${index}`),
+            previewSha256: referenceSha,
+            taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+          });
+      const candidateTaxonomy = {
+        role: "foundation" as const,
+        palette: [] as string[],
+        typography: [] as string[],
+        layout: [`${heroFamily}-layout`],
+        motion: [] as string[],
+        accessibility: ["reduced-motion"],
+      };
+      const blueprint = selected
+        ? referenceBlueprint
+        : referenceBlueprintV4ForFamily({
+            candidateId,
+            providerItemKey,
+            referencePreviewLocalAssetId,
+            referencePreviewSha256: referenceSha,
+            realizationPreviewLocalAssetId,
+            realizationPreviewSha256: realizationSha,
+            heroFamily,
+            inspirationEvidenceId: candidateEvidence.evidenceSha256,
+            inspirationTaxonomy: candidateTaxonomy,
+          });
+      return {
+        id: candidateId,
+        label: String.fromCharCode(65 + index),
+        queryAxis: "foundation_split" as const,
+        providerItemKey,
+        title: `${heroFamily} Hero`,
+        description: "Enterprise hero reference",
+        author: "21st",
+        sourceUrl: `https://21st.dev/community/components/${heroFamily}`,
+        visualEvidence: candidateEvidence,
+        previewLocalAssetId: referencePreviewLocalAssetId,
+        previewSha256: referenceSha,
+        realizationPreviewLocalAssetId,
+        realizationPreviewSha256: realizationSha,
+        referencePerceptualHash: perceptualHashes[index]!,
+        realizationPerceptualHash: perceptualHashes[(index + 4) % 9]!,
+        referenceBlueprint: blueprint,
+        taxonomy: candidateTaxonomy,
+        score: 90 - index,
+        rationale: "合格 Hero 视觉证据",
+      };
+    });
     const selectionBundle = {
-      schemaVersion: 2,
+      schemaVersion: 4,
       queryPlanHash: "f".repeat(64),
-      searchTarget: 18,
-      shortlistTarget: 12,
+      searchTarget: 162,
+      referenceTarget: 9,
       displayTarget: 9,
-      candidates: [
-        {
-          id: context.sample.id,
-          label: "A",
-          queryAxis: "foundation_split",
-          providerItemKey: "n:143",
-          title: "Split Hero",
-          description: "Enterprise split hero",
-          author: "21st",
-          sourceUrl: "https://21st.dev/community/components/split-hero",
-          visualEvidence,
-          previewLocalAssetId: context.sample.previewLocalAssetId,
-          previewSha256,
-          taxonomy: context.sample.sourceMetadata.taxonomy,
-          score: 90,
-          rationale: "合格 Hero 视觉证据",
-        },
-      ],
-      supportingCandidates: [],
+      candidates: selectionCandidates,
       selectedCandidateId: context.sample.id,
       delegated: false,
       degradedReasons: [],
@@ -279,7 +341,13 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     const readArtifact = vi.fn(async (input: { localAssetId: string }) => {
       const isSelection =
         input.localAssetId === context.batch.selectionBundleLocalAssetId;
-      const bytes = isSelection ? selectionBytes : preview;
+      const isRealization =
+        input.localAssetId === referenceBlueprint.previewLocalAssetId;
+      const bytes = isSelection
+        ? selectionBytes
+        : isRealization
+          ? realizationPreview
+          : preview;
       return {
         row: {
           id: input.localAssetId,
@@ -296,11 +364,10 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       };
     });
 
-    let upstreamStatus = "running";
-    let upstreamEvents: unknown[] = [];
+    const fallbackTaskId = `frontmind-host-fallback:${baseOperation.id}`;
     const createTask = vi.fn(async () => {
       timeline.push("provider:create");
-      return { taskId };
+      throw new ManusV2ApiError("task.create", 503, "HTTP_503", true, false);
     });
     const sendMessage = vi.fn(async () => {
       timeline.push("provider:send");
@@ -309,8 +376,12 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       createTask,
       sendMessage,
       findCreatedTask: vi.fn(),
-      taskDetail: vi.fn(async () => ({ status: upstreamStatus })),
-      listAllMessages: vi.fn(async () => upstreamEvents),
+      taskDetail: vi.fn(async () => {
+        throw new Error("fallback must not poll a provider task");
+      }),
+      listAllMessages: vi.fn(async () => {
+        throw new Error("fallback must not read provider messages");
+      }),
     };
 
     const contractJson = Buffer.from('{"contract":true}', "utf8");
@@ -321,6 +392,11 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     const provenanceJson = Buffer.from('{"provenance":true}', "utf8");
     const materialized = {
       contract: { specHash: "9".repeat(64) },
+      buildDelivery: {
+        renderMode: "primary",
+        qaStatus: "passed",
+        warningCodes: [],
+      },
       contractJson,
       contractSha256: sha256(contractJson),
       sourceZip,
@@ -345,7 +421,13 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
           routes: [
             {
               routeId: "home",
-              sections: [{ slotId: "proof" }],
+              sections: expect.arrayContaining([
+                expect.objectContaining({
+                  slotId: "overview",
+                  paragraphs: ["星河智造提供设备服务。"],
+                  sourceDocumentIds: ["overview"],
+                }),
+              ]),
             },
           ],
         },
@@ -380,22 +462,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       timeline.push("lease");
     });
 
-    remotePreview.fetchPinnedPublicHttps.mockImplementation(
-      async (input: { url: string }) => {
-        timeline.push("fetch:content-attachment");
-        const body = JSON.stringify(contentWire);
-        return {
-          response: new Response(body, {
-            status: 200,
-            headers: {
-              "content-type": "application/json; charset=utf-8",
-              "content-length": String(Buffer.byteLength(body)),
-            },
-          }),
-          finalUrl: new URL(input.url),
-        };
-      },
-    );
+    remotePreview.fetchPinnedPublicHttps.mockReset();
 
     const handler = createManusSiteOpsProviderHandler({
       getDb: async () => db as never,
@@ -406,132 +473,54 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
       materializeSite,
       persistArtifact: persistArtifact as never,
     });
-    const sweep = (operation: typeof baseOperation) =>
+    const sweep = (operation: typeof buildOperation) =>
       handler({
         operation: operation as never,
         signal: new AbortController().signal,
         assertLeaseActive,
       });
 
-    const created = await sweep(baseOperation);
+    const created = await sweep(buildOperation);
     expect(created).toMatchObject({
       status: "pending",
-      providerTaskId: taskId,
-      result: { stage: "design_pending", taskId },
+      providerTaskId: fallbackTaskId,
+      result: {
+        stage: "content_pending",
+        taskId: fallbackTaskId,
+        providerDraftUnavailable: true,
+        design: {
+          designSpec: {
+            schemaVersion: 2,
+            routeCompositions: [expect.objectContaining({ routeId: "home" })],
+          },
+        },
+      },
     });
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(createTask.mock.calls[0]![0]).toMatchObject({
       agentProfile: "manus-1.6",
     });
-
-    upstreamEvents = [
-      operationMarker(designToken, 1),
-      {
-        id: "design-result",
-        type: "structured_output_result",
-        timestamp: 2,
-        structured_output_result: { success: true, value: designWire },
-      },
-      {
-        id: "design-stopped",
-        type: "status_update",
-        timestamp: 3,
-        status_update: { agent_status: "stopped" },
-      },
-    ];
-    upstreamStatus = "running";
-    const designStillRunning = await sweep(
-      operationWithState(baseOperation, taskId, created.result) as never,
-    );
-    expect(designStillRunning).toMatchObject({
-      status: "pending",
-      result: { stage: "design_pending", taskId },
-    });
+    expect(createTask.mock.calls[0]![0].prompt).toContain("SiteContentDraftV1");
+    expect(createTask.mock.calls[0]![0].prompt).not.toContain("SiteDesignWire");
+    expect(
+      JSON.stringify(createTask.mock.calls[0]![0].structuredOutputSchema),
+    ).not.toMatch(/(?:layoutArchetype|routeSlots|palette|component)/u);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(materializeSite).not.toHaveBeenCalled();
 
-    upstreamStatus = "stopped";
-    const designStopped = await sweep(
-      operationWithState(
-        baseOperation,
-        taskId,
-        designStillRunning.result,
-      ) as never,
-    );
-    expect(designStopped).toMatchObject({
-      status: "pending",
-      result: { stage: "content_send_ready", taskId },
-    });
-
-    const contentSent = await sweep(
-      operationWithState(baseOperation, taskId, designStopped.result) as never,
-    );
-    expect(contentSent).toMatchObject({
-      status: "pending",
-      result: { stage: "content_pending", taskId },
-    });
-    expect(createTask).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage.mock.calls[0]![0]).toMatchObject({ taskId });
-
-    upstreamEvents = [
-      operationMarker(contentToken, 10),
-      {
-        id: "content-extraction-rejected",
-        type: "structured_output_result",
-        timestamp: 11,
-        structured_output_result: {
-          error: "structured extraction failed",
-          value: 0,
-        },
-      },
-      {
-        id: "content-attachment",
-        type: "assistant_message",
-        timestamp: 12,
-        assistant_message: {
-          attachments: [
-            {
-              filename: "frontmind_page_content_wire_v2.json",
-              content_type: "application/json; charset=utf-8",
-              url: "https://files.example.test/content.json?signature=private",
-            },
-          ],
-        },
-      },
-      {
-        id: "content-stopped",
-        type: "status_update",
-        timestamp: 13,
-        status_update: { agent_status: "stopped" },
-      },
-    ];
-    upstreamStatus = "running";
-    const contentStillRunning = await sweep(
-      operationWithState(baseOperation, taskId, contentSent.result) as never,
-    );
-    expect(contentStillRunning).toMatchObject({
-      status: "pending",
-      result: { stage: "content_pending", taskId },
-    });
-    expect(remotePreview.fetchPinnedPublicHttps).not.toHaveBeenCalled();
-    expect(materializeSite).not.toHaveBeenCalled();
-    expect(persistArtifact).not.toHaveBeenCalled();
-
     timeline.length = 0;
     const leaseCallsBeforeFinal = assertLeaseActive.mock.calls.length;
-    upstreamStatus = "stopped";
     const finished = await sweep(
       operationWithState(
-        baseOperation,
-        taskId,
-        contentStillRunning.result,
+        buildOperation,
+        fallbackTaskId,
+        created.result,
       ) as never,
     );
 
     expect(finished).toMatchObject({
       status: "succeeded",
-      providerTaskId: taskId,
+      providerTaskId: fallbackTaskId,
       projectStatus: "preview_ready",
       buildStatus: "preview_ready",
       result: {
@@ -561,7 +550,7 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
         },
       },
     });
-    expect(remotePreview.fetchPinnedPublicHttps).toHaveBeenCalledTimes(1);
+    expect(remotePreview.fetchPinnedPublicHttps).not.toHaveBeenCalled();
     expect(materializeSite).toHaveBeenCalledTimes(2);
     expect(persistArtifact).toHaveBeenCalledTimes(5);
     expect(persistArtifact.mock.calls.map(([input]) => input.kind)).toEqual([
@@ -576,9 +565,9 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     );
 
     expect(createTask).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
     expect(context.build.repairAttempts).toBe(0);
-    expect(getCredential).toHaveBeenCalledTimes(6);
+    expect(getCredential).toHaveBeenCalledTimes(2);
     expect(
       getCredential.mock.calls.every(
         ([userId, credentialId]) =>

@@ -96,6 +96,482 @@ describe("direct ESA SiteOps provider", () => {
     expect(result.message).not.toContain("provider payload");
   });
 
+  it("deletes the exact related record and Routine for an approved reset, then verifies absence", async () => {
+    enableEsaTestRuntime();
+    const project = {
+      id: operation.projectId,
+      userId: operation.userId,
+      revision: 9,
+      currentBuildId: "30000000-0000-4000-8000-000000000003",
+      currentKnowledgeSnapshotId:
+        "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId:
+        "50000000-0000-4000-8000-000000000005",
+      mainlandLiveDeploymentId: null,
+      canonicalHostname: "example.com",
+    };
+    const routine = {
+      name: "frontmind-20000000000040008000000000000002",
+      hasAssets: true,
+      defaultRelatedRecord: "example.com",
+      production: null,
+    };
+    const query: any = {
+      from: vi.fn(() => query),
+      where: vi.fn(() => query),
+      limit: vi.fn().mockResolvedValue([project]),
+    };
+    const db = {
+      select: vi.fn(() => query),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue([{ affectedRows: 1 }]),
+        })),
+      })),
+    };
+    const api = {
+      getRoutine: vi
+        .fn()
+        .mockResolvedValueOnce(routine)
+        .mockResolvedValueOnce(routine)
+        .mockResolvedValueOnce(null),
+      createRoutine: vi.fn(),
+      listCodeVersions: vi.fn(),
+      getCodeVersion: vi.fn(),
+      createAssetsCodeVersion: vi.fn(),
+      createProductionDeployment: vi.fn(),
+      listSites: vi.fn(),
+      createSite: vi.fn(),
+      updateSiteCoverage: vi.fn(),
+      verifySite: vi.fn(),
+      getMatchSite: vi.fn(),
+      listRelatedRecords: vi
+        .fn()
+        .mockResolvedValueOnce([
+          { recordId: 199, recordName: "example.com", siteId: 99 },
+        ])
+        .mockResolvedValueOnce([]),
+      createRelatedRecord: vi.fn(),
+      deleteRelatedRecord: vi.fn().mockResolvedValue(undefined),
+      deleteRoutine: vi.fn().mockResolvedValue(undefined),
+      listEdgeRoutineRecords: vi.fn(),
+    } satisfies EsaDirectApi;
+    const publicHttpsFetch = vi.fn().mockResolvedValue({
+      response: new Response(null, { status: 404 }),
+      finalUrl: new URL(
+        "https://example.com/frontmind-deployment.json",
+      ),
+    });
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+      publicHttpsFetch: publicHttpsFetch as never,
+    });
+
+    const result = await handler({
+      operation: {
+        ...operation,
+        kind: "rollback",
+        attempt: 1,
+        input: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+          expectedProjectRevision: 9,
+          expectedCurrentBuildId: project.currentBuildId,
+          expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId,
+          expectedGlobalLiveDeploymentId: project.globalLiveDeploymentId,
+          expectedMainlandLiveDeploymentId: null,
+          expectedCanonicalHostname: "example.com",
+        },
+      } as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "succeeded",
+      result: {
+        intent: "approved_reset_unpublish",
+        stage: "exposure_removed",
+      },
+    });
+    expect(api.deleteRelatedRecord).toHaveBeenCalledWith({
+      name: routine.name,
+      recordId: 199,
+      recordName: "example.com",
+      siteId: 99,
+    });
+    expect(api.deleteRoutine).toHaveBeenCalledWith(routine.name);
+    expect(publicHttpsFetch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://example.com/frontmind-deployment.json",
+        allowedOrigin: "https://example.com",
+      }),
+    );
+  });
+
+  it("does not finalize reset while the previous public deployment marker remains", async () => {
+    enableEsaTestRuntime();
+    const previousDeploymentId =
+      "50000000-0000-4000-8000-000000000005";
+    const project = {
+      id: operation.projectId,
+      userId: operation.userId,
+      revision: 9,
+      currentBuildId: "30000000-0000-4000-8000-000000000003",
+      currentKnowledgeSnapshotId:
+        "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId: previousDeploymentId,
+      mainlandLiveDeploymentId: null,
+      canonicalHostname: "example.com",
+    };
+    const query: any = {
+      from: vi.fn(() => query),
+      where: vi.fn(() => query),
+      limit: vi.fn().mockResolvedValue([project]),
+    };
+    const api = {
+      getRoutine: vi.fn().mockResolvedValue(null),
+      createRoutine: vi.fn(),
+      listCodeVersions: vi.fn(),
+      getCodeVersion: vi.fn(),
+      createAssetsCodeVersion: vi.fn(),
+      createProductionDeployment: vi.fn(),
+      listSites: vi.fn(),
+      createSite: vi.fn(),
+      updateSiteCoverage: vi.fn(),
+      verifySite: vi.fn(),
+      getMatchSite: vi.fn(),
+      listRelatedRecords: vi.fn(),
+      createRelatedRecord: vi.fn(),
+      deleteRelatedRecord: vi.fn(),
+      deleteRoutine: vi.fn(),
+      listEdgeRoutineRecords: vi.fn(),
+    } satisfies EsaDirectApi;
+    const publicHttpsFetch = vi.fn().mockImplementation(async () => ({
+      response: new Response(
+        JSON.stringify({
+          schemaVersion: 2,
+          deploymentId: previousDeploymentId,
+          distSha256: "a".repeat(64),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      finalUrl: new URL(
+        "https://example.com/frontmind-deployment.json",
+      ),
+    }));
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi
+        .fn()
+        .mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      api,
+      publicHttpsFetch: publicHttpsFetch as never,
+    });
+
+    const result = await handler({
+      operation: {
+        ...operation,
+        kind: "rollback",
+        attempt: 2,
+        input: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+          expectedProjectRevision: 9,
+          expectedCurrentBuildId: project.currentBuildId,
+          expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId,
+          expectedGlobalLiveDeploymentId: previousDeploymentId,
+          expectedMainlandLiveDeploymentId: null,
+          expectedCanonicalHostname: "example.com",
+        },
+      } as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "pending",
+      result: {
+        intent: "approved_reset_unpublish",
+        stage: "public_marker_propagating",
+        stageStartedAttempt: 2,
+      },
+    });
+    expect(api.deleteRoutine).not.toHaveBeenCalled();
+
+    const reconciledLater = await handler({
+      operation: {
+        ...operation,
+        kind: "rollback",
+        attempt: 12,
+        result: result.result,
+        input: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+          expectedProjectRevision: 9,
+          expectedCurrentBuildId: project.currentBuildId,
+          expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId,
+          expectedGlobalLiveDeploymentId: previousDeploymentId,
+          expectedMainlandLiveDeploymentId: null,
+          expectedCanonicalHostname: "example.com",
+        },
+      } as never,
+      signal: new AbortController().signal,
+    });
+    expect(reconciledLater).toMatchObject({
+      status: "outcome_unknown",
+      code: "RESET_UNPUBLISH_OUTCOME_UNKNOWN",
+      result: {
+        stage: "public_marker_propagating",
+        stageStartedAttempt: 2,
+      },
+    });
+  });
+
+  it("does not treat a transient public verification failure as marker absence", async () => {
+    enableEsaTestRuntime();
+    const project = {
+      id: operation.projectId,
+      userId: operation.userId,
+      revision: 9,
+      currentBuildId: "30000000-0000-4000-8000-000000000003",
+      currentKnowledgeSnapshotId:
+        "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId:
+        "50000000-0000-4000-8000-000000000005",
+      mainlandLiveDeploymentId: null,
+      canonicalHostname: "example.com",
+    };
+    const query: any = {
+      from: vi.fn(() => query),
+      where: vi.fn(() => query),
+      limit: vi.fn().mockResolvedValue([project]),
+    };
+    const api = {
+      getRoutine: vi.fn().mockResolvedValue(null),
+      createRoutine: vi.fn(),
+      listCodeVersions: vi.fn(),
+      getCodeVersion: vi.fn(),
+      createAssetsCodeVersion: vi.fn(),
+      createProductionDeployment: vi.fn(),
+      listSites: vi.fn(),
+      createSite: vi.fn(),
+      updateSiteCoverage: vi.fn(),
+      verifySite: vi.fn(),
+      getMatchSite: vi.fn(),
+      listRelatedRecords: vi.fn(),
+      createRelatedRecord: vi.fn(),
+      deleteRelatedRecord: vi.fn(),
+      deleteRoutine: vi.fn(),
+      listEdgeRoutineRecords: vi.fn(),
+    } satisfies EsaDirectApi;
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi
+        .fn()
+        .mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      api,
+      publicHttpsFetch: vi.fn().mockResolvedValue({
+        response: new Response("temporary", { status: 503 }),
+        finalUrl: new URL(
+          "https://example.com/frontmind-deployment.json",
+        ),
+      }) as never,
+    });
+
+    const result = await handler({
+      operation: {
+        ...operation,
+        kind: "rollback",
+        attempt: 4,
+        input: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+          expectedProjectRevision: 9,
+          expectedCurrentBuildId: project.currentBuildId,
+          expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId,
+          expectedGlobalLiveDeploymentId: project.globalLiveDeploymentId,
+          expectedMainlandLiveDeploymentId: null,
+          expectedCanonicalHostname: "example.com",
+        },
+      } as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "pending",
+      result: {
+        stage: "public_marker_verification_retry",
+        stageStartedAttempt: 4,
+      },
+    });
+  });
+
+  it.each([
+    ["missing marker id", JSON.stringify({ schemaVersion: 2 })],
+    ["malformed marker", "not-json"],
+    [
+      "unknown marker id",
+      JSON.stringify({
+        schemaVersion: 2,
+        deploymentId: "50000000-0000-4000-8000-000000000099",
+      }),
+    ],
+  ])("requires an explicit not-found response for %s", async (_label, body) => {
+    enableEsaTestRuntime();
+    const project = {
+      id: operation.projectId,
+      userId: operation.userId,
+      revision: 9,
+      currentBuildId: "30000000-0000-4000-8000-000000000003",
+      currentKnowledgeSnapshotId:
+        "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId:
+        "50000000-0000-4000-8000-000000000005",
+      mainlandLiveDeploymentId: null,
+      canonicalHostname: "example.com",
+    };
+    const query: any = {
+      from: vi.fn(() => query),
+      where: vi.fn(() => query),
+      limit: vi.fn().mockResolvedValue([project]),
+    };
+    const api = {
+      getRoutine: vi.fn().mockResolvedValue(null),
+      createRoutine: vi.fn(),
+      listCodeVersions: vi.fn(),
+      getCodeVersion: vi.fn(),
+      createAssetsCodeVersion: vi.fn(),
+      createProductionDeployment: vi.fn(),
+      listSites: vi.fn(),
+      createSite: vi.fn(),
+      updateSiteCoverage: vi.fn(),
+      verifySite: vi.fn(),
+      getMatchSite: vi.fn(),
+      listRelatedRecords: vi.fn(),
+      createRelatedRecord: vi.fn(),
+      deleteRelatedRecord: vi.fn(),
+      deleteRoutine: vi.fn(),
+      listEdgeRoutineRecords: vi.fn(),
+    } satisfies EsaDirectApi;
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi
+        .fn()
+        .mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      api,
+      publicHttpsFetch: vi.fn().mockResolvedValue({
+        response: new Response(body, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        finalUrl: new URL(
+          "https://example.com/frontmind-deployment.json",
+        ),
+      }) as never,
+    });
+
+    const result = await handler({
+      operation: {
+        ...operation,
+        kind: "rollback",
+        attempt: 3,
+        input: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+          expectedProjectRevision: 9,
+          expectedCurrentBuildId: project.currentBuildId,
+          expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId,
+          expectedGlobalLiveDeploymentId: project.globalLiveDeploymentId,
+          expectedMainlandLiveDeploymentId: null,
+          expectedCanonicalHostname: "example.com",
+        },
+      } as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "pending",
+      result: {
+        stage: "public_marker_verification_retry",
+        stageStartedAttempt: 3,
+      },
+    });
+  });
+
+  it("invalidates a stale approved reset before any ESA deletion", async () => {
+    enableEsaTestRuntime();
+    const project = {
+      id: operation.projectId,
+      userId: operation.userId,
+      revision: 10,
+      currentBuildId: null,
+      currentKnowledgeSnapshotId: null,
+      globalLiveDeploymentId: null,
+      mainlandLiveDeploymentId: null,
+      canonicalHostname: "example.com",
+    };
+    const query: any = {
+      from: vi.fn(() => query),
+      where: vi.fn(() => query),
+      limit: vi.fn().mockResolvedValue([project]),
+    };
+    const api = {
+      getRoutine: vi.fn(),
+      createRoutine: vi.fn(),
+      listCodeVersions: vi.fn(),
+      getCodeVersion: vi.fn(),
+      createAssetsCodeVersion: vi.fn(),
+      createProductionDeployment: vi.fn(),
+      listSites: vi.fn(),
+      createSite: vi.fn(),
+      updateSiteCoverage: vi.fn(),
+      verifySite: vi.fn(),
+      getMatchSite: vi.fn(),
+      listRelatedRecords: vi.fn(),
+      createRelatedRecord: vi.fn(),
+      deleteRelatedRecord: vi.fn(),
+      deleteRoutine: vi.fn(),
+      listEdgeRoutineRecords: vi.fn(),
+    } satisfies EsaDirectApi;
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      api,
+    });
+
+    const result = await handler({
+      operation: {
+        ...operation,
+        kind: "rollback",
+        attempt: 1,
+        input: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+          expectedProjectRevision: 9,
+          expectedCurrentBuildId:
+            "30000000-0000-4000-8000-000000000003",
+          expectedKnowledgeSnapshotId:
+            "40000000-0000-4000-8000-000000000004",
+          expectedGlobalLiveDeploymentId:
+            "50000000-0000-4000-8000-000000000005",
+          expectedMainlandLiveDeploymentId: null,
+          expectedCanonicalHostname: "example.com",
+        },
+      } as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "SITEOPS_RESET_INVALIDATED",
+    });
+    expect(api.getRoutine).not.toHaveBeenCalled();
+    expect(api.deleteRelatedRecord).not.toHaveBeenCalled();
+    expect(api.deleteRoutine).not.toHaveBeenCalled();
+  });
+
   it("repackages a frozen dist as ESA assets and adds an exact digest marker", async () => {
     const dist = new JSZip();
     dist.file("index.html", "<!doctype html><title>FrontMind</title>");
@@ -317,6 +793,8 @@ describe("direct ESA SiteOps provider", () => {
       getMatchSite: vi.fn(),
       listRelatedRecords: vi.fn(),
       createRelatedRecord: vi.fn(),
+      deleteRelatedRecord: vi.fn(),
+      deleteRoutine: vi.fn(),
       listEdgeRoutineRecords: vi.fn(),
     } satisfies EsaDirectApi;
     const artifactIds = [
@@ -376,7 +854,7 @@ describe("direct ESA SiteOps provider", () => {
     expect(api.createAssetsCodeVersion).not.toHaveBeenCalled();
   });
 
-  it("reconciles an exact production code version without submitting it again", async () => {
+  it("recreates a deleted Routine, deploys the frozen version, and restores the exact relation", async () => {
     enableEsaTestRuntime();
     const distHash = "c".repeat(64);
     const sourceHash = "d".repeat(64);
@@ -429,16 +907,28 @@ describe("direct ESA SiteOps provider", () => {
       sourceLocalAssetId,
       sourceHash,
     };
-    const getRoutine = vi.fn().mockResolvedValue({
-      name: "frontmind-20000000000040008000000000000000",
+    const emptyRoutine = {
+      name: "frontmind-20000000000040008000000000000002",
       hasAssets: true,
       defaultRelatedRecord: null,
+      production: null,
+    };
+    const liveRoutine = {
+      ...emptyRoutine,
       production: {
         deploymentId: "esa-deployment-9",
         codeVersions: [{ codeVersion: "version-9", percentage: 100 }],
       },
-    });
-    const createProductionDeployment = vi.fn();
+    };
+    const getRoutine = vi
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(emptyRoutine)
+      .mockResolvedValueOnce(emptyRoutine)
+      .mockResolvedValue(liveRoutine);
+    const createProductionDeployment = vi
+      .fn()
+      .mockResolvedValue({ deploymentId: "esa-deployment-9" });
     const materializeProduction = vi.fn();
     const updateSiteCoverage = vi.fn();
     const matchedSite = {
@@ -452,7 +942,7 @@ describe("direct ESA SiteOps provider", () => {
     };
     const api = {
       getRoutine,
-      createRoutine: vi.fn(),
+      createRoutine: vi.fn().mockResolvedValue(undefined),
       listCodeVersions: vi.fn(),
       getCodeVersion: vi.fn().mockResolvedValue({
         codeVersion: "version-9",
@@ -473,8 +963,13 @@ describe("direct ESA SiteOps provider", () => {
         .mockResolvedValue({ ...matchedSite, coverage: "overseas" }),
       listRelatedRecords: vi
         .fn()
-        .mockResolvedValue([{ recordName: "example.com", siteId: 99 }]),
-      createRelatedRecord: vi.fn(),
+        .mockResolvedValueOnce([])
+        .mockResolvedValue([
+          { recordId: 199, recordName: "example.com", siteId: 99 },
+        ]),
+      createRelatedRecord: vi.fn().mockResolvedValue(undefined),
+      deleteRelatedRecord: vi.fn(),
+      deleteRoutine: vi.fn(),
       listEdgeRoutineRecords: vi.fn(),
     } satisfies EsaDirectApi;
     const updateWhere = vi.fn().mockResolvedValue(undefined);
@@ -543,7 +1038,16 @@ describe("direct ESA SiteOps provider", () => {
       providerOperationId: "esa-deployment-9",
       result: { distHash, codeVersion: "version-9" },
     });
-    expect(createProductionDeployment).not.toHaveBeenCalled();
+    expect(api.createRoutine).toHaveBeenCalledTimes(1);
+    expect(createProductionDeployment).toHaveBeenCalledWith({
+      name: "frontmind-20000000000040008000000000000002",
+      codeVersion: "version-9",
+    });
+    expect(api.createRelatedRecord).toHaveBeenCalledWith({
+      name: "frontmind-20000000000040008000000000000002",
+      recordName: "example.com",
+      siteId: 99,
+    });
     expect(updateSiteCoverage).toHaveBeenCalledWith({
       siteId: 99,
       coverage: "overseas",

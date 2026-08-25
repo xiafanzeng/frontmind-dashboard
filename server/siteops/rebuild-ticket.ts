@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, isNotNull, isNull, max, or } from "drizzle-orm";
+import { z } from "zod";
 import {
   deliveryProjectAssignments,
   deliveryTicketEvents,
   deliveryTickets,
+  knowledgeBaseSnapshots,
   messages,
   serviceQuotaPeriods,
   siteBuilds,
@@ -19,6 +21,7 @@ import {
 const REBUILD_TARGET_PREFIX = "/siteops/builds/";
 const REBUILD_PROJECT_TARGET_PREFIX = "/siteops/projects/";
 const REBUILD_NOTE_KIND = "frontmind.siteops-rebuild.v1";
+export const APPROVED_RESET_UNPUBLISH = "approved_reset_unpublish";
 const ACTIVE_TICKET_STATUSES = [
   "submitted",
   "needs_information",
@@ -50,10 +53,76 @@ type SiteOpsRebuildNoteV3 = {
   resetAppliedProjectRevision?: number;
 };
 
+type SiteOpsRebuildNoteV4 = {
+  schemaVersion: 4;
+  kind: typeof REBUILD_NOTE_KIND;
+  projectId: string;
+  sourceBuildId: string | null;
+  knowledgeSnapshotId: string | null;
+  resetIntent: typeof APPROVED_RESET_UNPUBLISH;
+  resetOperationId: string;
+  resetApprovedAt: string;
+  resetExpectedProjectRevision: number;
+  minimumKnowledgeSnapshotVersion: number;
+  resetAppliedAt?: string;
+  resetAppliedProjectRevision?: number;
+  freshRootApplied?: true;
+  unpublishOperationId?: string;
+};
+
 type SiteOpsRebuildNote =
   | SiteOpsRebuildNoteV1
   | SiteOpsRebuildNoteV2
-  | SiteOpsRebuildNoteV3;
+  | SiteOpsRebuildNoteV3
+  | SiteOpsRebuildNoteV4;
+
+export const approvedResetUnpublishInputSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    intent: z.literal(APPROVED_RESET_UNPUBLISH),
+    rebuildTicketId: z.string().uuid(),
+    expectedProjectRevision: z.number().int().positive(),
+    expectedCurrentBuildId: z.string().uuid().nullable(),
+    expectedKnowledgeSnapshotId: z.string().uuid().nullable(),
+    expectedGlobalLiveDeploymentId: z.string().uuid().nullable(),
+    expectedMainlandLiveDeploymentId: z.string().uuid().nullable(),
+    expectedCanonicalHostname: z.string().trim().min(1).max(255).nullable(),
+  })
+  .strict();
+
+export type ApprovedResetUnpublishInput = z.infer<
+  typeof approvedResetUnpublishInputSchema
+>;
+
+export function parseApprovedResetUnpublishInput(value: unknown) {
+  const parsed = approvedResetUnpublishInputSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+export function approvedResetUnpublishProjectMatches(
+  input: ApprovedResetUnpublishInput,
+  project: Pick<
+    typeof siteProjects.$inferSelect,
+    | "revision"
+    | "currentBuildId"
+    | "currentKnowledgeSnapshotId"
+    | "globalLiveDeploymentId"
+    | "mainlandLiveDeploymentId"
+    | "canonicalHostname"
+  >,
+) {
+  return (
+    project.revision === input.expectedProjectRevision &&
+    project.currentBuildId === input.expectedCurrentBuildId &&
+    project.currentKnowledgeSnapshotId ===
+      input.expectedKnowledgeSnapshotId &&
+    project.globalLiveDeploymentId ===
+      input.expectedGlobalLiveDeploymentId &&
+    project.mainlandLiveDeploymentId ===
+      input.expectedMainlandLiveDeploymentId &&
+    project.canonicalHostname === input.expectedCanonicalHostname
+  );
+}
 
 function parseSiteOpsRebuildNote(
   value: string | null | undefined,
@@ -63,12 +132,14 @@ function parseSiteOpsRebuildNote(
     const parsed = JSON.parse(value) as Record<string, unknown>;
     if (
       parsed.kind !== REBUILD_NOTE_KIND ||
-      ![1, 2, 3].includes(Number(parsed.schemaVersion)) ||
+      ![1, 2, 3, 4].includes(Number(parsed.schemaVersion)) ||
       typeof parsed.projectId !== "string" ||
       (typeof parsed.sourceBuildId !== "string" &&
-        !(parsed.schemaVersion === 3 && parsed.sourceBuildId === null)) ||
+        !([3, 4].includes(Number(parsed.schemaVersion)) &&
+          parsed.sourceBuildId === null)) ||
       (typeof parsed.knowledgeSnapshotId !== "string" &&
-        !(parsed.schemaVersion === 3 && parsed.knowledgeSnapshotId === null))
+        !([3, 4].includes(Number(parsed.schemaVersion)) &&
+          parsed.knowledgeSnapshotId === null))
     ) {
       return null;
     }
@@ -90,6 +161,32 @@ function parseSiteOpsRebuildNote(
       if (hasResetTimestamp !== hasResetRevision) return null;
       return parsed as SiteOpsRebuildNoteV3;
     }
+    if (parsed.schemaVersion === 4) {
+      const hasResetTimestamp = typeof parsed.resetAppliedAt === "string";
+      const hasResetRevision =
+        Number.isInteger(parsed.resetAppliedProjectRevision) &&
+        Number(parsed.resetAppliedProjectRevision) > 0;
+      if (
+        parsed.resetIntent !== APPROVED_RESET_UNPUBLISH ||
+        typeof parsed.resetOperationId !== "string" ||
+        !z.string().uuid().safeParse(parsed.resetOperationId).success ||
+        typeof parsed.resetApprovedAt !== "string" ||
+        !Number.isInteger(parsed.resetExpectedProjectRevision) ||
+        Number(parsed.resetExpectedProjectRevision) < 1 ||
+        !Number.isInteger(parsed.minimumKnowledgeSnapshotVersion) ||
+        Number(parsed.minimumKnowledgeSnapshotVersion) < 1 ||
+        (hasResetTimestamp &&
+          (parsed.freshRootApplied !== true ||
+            parsed.unpublishOperationId !== parsed.resetOperationId)) ||
+        (!hasResetTimestamp &&
+          (parsed.freshRootApplied !== undefined ||
+            parsed.unpublishOperationId !== undefined)) ||
+        hasResetTimestamp !== hasResetRevision
+      ) {
+        return null;
+      }
+      return parsed as SiteOpsRebuildNoteV4;
+    }
     return parsed as SiteOpsRebuildNoteV1;
   } catch {
     return null;
@@ -101,8 +198,25 @@ export function siteOpsRebuildResetApplied(value: string | null | undefined) {
   return Boolean(
     note &&
       (note.schemaVersion === 2 ||
-        (note.schemaVersion === 3 && note.resetAppliedAt)),
+        ((note.schemaVersion === 3 || note.schemaVersion === 4) &&
+          note.resetAppliedAt)),
   );
+}
+
+export function siteOpsRebuildResetPending(value: string | null | undefined) {
+  const note = parseSiteOpsRebuildNote(value);
+  return Boolean(
+    note && note.schemaVersion === 4 && !note.resetAppliedAt,
+  );
+}
+
+export function siteOpsRebuildMinimumSnapshotVersion(
+  value: string | null | undefined,
+) {
+  const note = parseSiteOpsRebuildNote(value);
+  return note?.schemaVersion === 4
+    ? note.minimumKnowledgeSnapshotVersion
+    : null;
 }
 
 export function siteOpsRebuildAcceptedForCurrentCycle(input: {
@@ -207,15 +321,18 @@ export function siteOpsRebuildResubmissionProjection(input: {
   ) {
     return null;
   }
-  const projectScopedNote: SiteOpsRebuildNoteV3 = {
-    schemaVersion: 3,
-    kind: REBUILD_NOTE_KIND,
-    projectId: input.projectId,
-    sourceBuildId: note.sourceBuildId,
-    knowledgeSnapshotId: note.knowledgeSnapshotId,
-    resetAppliedAt: note.resetAppliedAt,
-    resetAppliedProjectRevision: note.resetAppliedProjectRevision,
-  };
+  const projectScopedNote: SiteOpsRebuildNoteV3 | SiteOpsRebuildNoteV4 =
+    note.schemaVersion === 4
+      ? { ...note, projectId: input.projectId }
+      : {
+          schemaVersion: 3,
+          kind: REBUILD_NOTE_KIND,
+          projectId: input.projectId,
+          sourceBuildId: note.sourceBuildId,
+          knowledgeSnapshotId: note.knowledgeSnapshotId,
+          resetAppliedAt: note.resetAppliedAt,
+          resetAppliedProjectRevision: note.resetAppliedProjectRevision,
+        };
   return {
     targetPage: siteOpsRebuildProjectTargetPage(input.projectId),
     technicalDedupeKey: siteOpsRebuildProjectDedupeKey(input.projectId),
@@ -320,6 +437,9 @@ export async function loadSiteOpsRebuildRequest(
     ticketId: ticket?.id ?? null,
     status: ticket?.status ?? null,
     resetApplied,
+    resetPending: siteOpsRebuildResetPending(ticket?.internalNote),
+    minimumKnowledgeSnapshotVersion:
+      siteOpsRebuildMinimumSnapshotVersion(ticket?.internalNote),
     resetSourceBuildId: parsedNote?.sourceBuildId ?? null,
     acceptedForCurrentCycle: siteOpsRebuildAcceptedForCurrentCycle({
       internalNote: ticket?.internalNote,
@@ -617,7 +737,7 @@ export async function approveSiteOpsRebuildTicket(
   const targetProjectId = siteOpsRebuildProjectId(input.ticket.targetPage);
   if (
     !existingNote ||
-    (existingNote.schemaVersion === 3
+    ([3, 4].includes(existingNote.schemaVersion)
       ? targetProjectId !== existingNote.projectId &&
         targetBuildId !== existingNote.sourceBuildId
       : targetBuildId !== existingNote.sourceBuildId)
@@ -667,7 +787,10 @@ export async function approveSiteOpsRebuildTicket(
     );
   }
   if (existingNote.schemaVersion !== 3) {
-    if (
+    if (existingNote.schemaVersion === 4) {
+      // V4 is already project-scoped and carries its own immutable approval
+      // coordinate. The operation/finalizer below performs the strict CAS.
+    } else if (
       !currentBuild ||
       currentBuild.id !== existingNote.sourceBuildId ||
       currentBuild.knowledgeSnapshotId !== existingNote.knowledgeSnapshotId ||
@@ -678,6 +801,22 @@ export async function approveSiteOpsRebuildTicket(
         "原官网版本已变化或不再满足重制条件。",
       );
     }
+  }
+  if (
+    existingNote.schemaVersion === 4 &&
+    !existingNote.resetAppliedAt &&
+    !input.reapply
+  ) {
+    return {
+      projectId: project.id,
+      sourceBuildId: existingNote.sourceBuildId,
+      resetApplied: true as const,
+      resetPending: true as const,
+      resetOperationId: existingNote.resetOperationId,
+      resetAppliedProjectRevision:
+        existingNote.resetExpectedProjectRevision,
+      internalNote: JSON.stringify(existingNote),
+    };
   }
   if (siteOpsRebuildResetApplied(input.ticket.internalNote) && !input.reapply) {
     if (
@@ -767,16 +906,246 @@ export async function approveSiteOpsRebuildTicket(
       "当前仍有建站、发布、域名或 DNS 操作执行中，暂时不能开启重制。",
     );
   }
+  const now = input.now;
+  const snapshotVersionRows = await tx
+    .select({ version: max(knowledgeBaseSnapshots.version) })
+    .from(knowledgeBaseSnapshots)
+    .where(eq(knowledgeBaseSnapshots.userId, project.userId));
+  const minimumKnowledgeSnapshotVersion =
+    Number(snapshotVersionRows[0]?.version ?? 0) + 1;
+  const preservedBuildId = project.currentBuildId ?? existingNote.sourceBuildId;
+  const resetOperationId = randomUUID();
+  const resetInput = approvedResetUnpublishInputSchema.parse({
+    schemaVersion: 1,
+    intent: APPROVED_RESET_UNPUBLISH,
+    rebuildTicketId: input.ticket.id,
+    expectedProjectRevision: project.revision,
+    expectedCurrentBuildId: project.currentBuildId ?? null,
+    expectedKnowledgeSnapshotId: project.currentKnowledgeSnapshotId ?? null,
+    expectedGlobalLiveDeploymentId: project.globalLiveDeploymentId ?? null,
+    expectedMainlandLiveDeploymentId: project.mainlandLiveDeploymentId ?? null,
+    expectedCanonicalHostname: project.canonicalHostname ?? null,
+  });
+  const resetInputHash = createHash("sha256")
+    .update(JSON.stringify(resetInput), "utf8")
+    .digest("hex");
+  await tx.insert(siteOperations).values({
+    id: resetOperationId,
+    projectId: project.id,
+    userId: project.userId,
+    conversationTurnId: null,
+    buildId: preservedBuildId,
+    kind: "rollback",
+    status: "queued",
+    clientRequestId: `site-rebuild-unpublish:${input.ticket.id}:${project.revision}`,
+    inputHash: resetInputHash,
+    input: resetInput,
+    provider: "aliyun_esa",
+    attempt: 0,
+    createdAt: now,
+    updatedAt: now,
+  });
+  const upgradedNote: SiteOpsRebuildNoteV4 = {
+    schemaVersion: 4,
+    kind: REBUILD_NOTE_KIND,
+    projectId: project.id,
+    sourceBuildId: preservedBuildId,
+    knowledgeSnapshotId:
+      project.currentKnowledgeSnapshotId ??
+      currentBuild?.knowledgeSnapshotId ??
+      existingNote.knowledgeSnapshotId,
+    resetIntent: APPROVED_RESET_UNPUBLISH,
+    resetOperationId,
+    resetApprovedAt: now.toISOString(),
+    resetExpectedProjectRevision: project.revision,
+    minimumKnowledgeSnapshotVersion,
+  };
+  return {
+    projectId: project.id,
+    sourceBuildId: preservedBuildId,
+    resetApplied: true as const,
+    resetPending: true as const,
+    resetOperationId,
+    // Compatibility for the delivery approval response. The durable V4 note
+    // does not claim completion until the worker stores resetAppliedAt.
+    resetAppliedProjectRevision: project.revision,
+    internalNote: JSON.stringify(upgradedNote),
+  };
+}
+
+function affectedRows(result: unknown) {
+  return Number(
+    (Array.isArray(result)
+      ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+      0,
+  );
+}
+
+function nullableCoordinate(column: any, value: string | null) {
+  return value === null ? isNull(column) : eq(column, value);
+}
+
+/**
+ * Completes an approved reset only after ESA has read-only reconciled the
+ * related-record and Routine deletions. All customer workflow coordinates are
+ * cleared in the same transaction; immutable builds, deployments and ticket
+ * events remain as audit history.
+ */
+export async function finalizeApprovedSiteOpsReset(
+  tx: any,
+  input: {
+    operation: typeof siteOperations.$inferSelect;
+    now: Date;
+  },
+) {
+  const reset = parseApprovedResetUnpublishInput(input.operation.input);
+  if (
+    input.operation.kind !== "rollback" ||
+    input.operation.provider !== "aliyun_esa" ||
+    !reset
+  ) {
+    return { status: "not_applicable" as const };
+  }
+  const projectRows = await tx
+    .select()
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.id, input.operation.projectId),
+        eq(siteProjects.userId, input.operation.userId),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const project = projectRows[0];
+  if (!project || !approvedResetUnpublishProjectMatches(reset, project)) {
+    return { status: "invalidated" as const };
+  }
+  const ticketRows = await tx
+    .select()
+    .from(deliveryTickets)
+    .where(
+      and(
+        eq(deliveryTickets.id, reset.rebuildTicketId),
+        eq(deliveryTickets.userId, input.operation.userId),
+        eq(deliveryTickets.operation, "site_rebuild"),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  const ticket = ticketRows[0];
+  const note = parseSiteOpsRebuildNote(ticket?.internalNote);
+  if (
+    !ticket ||
+    !note ||
+    note.schemaVersion !== 4 ||
+    note.projectId !== project.id ||
+    note.resetOperationId !== input.operation.id ||
+    note.resetExpectedProjectRevision !== project.revision
+  ) {
+    return { status: "invalidated" as const };
+  }
+  if (note.resetAppliedAt && note.resetAppliedProjectRevision) {
+    return {
+      status: "applied" as const,
+      projectRevision: note.resetAppliedProjectRevision,
+      internalNote: JSON.stringify(note),
+    };
+  }
+
   const nextRevision = project.revision + 1;
   const sequenceRows = await tx
     .select({ sequence: max(messages.sequence) })
     .from(messages)
     .where(eq(messages.conversationId, project.conversationId));
-  const now = input.now;
-  const preservedBuildId = project.currentBuildId ?? existingNote.sourceBuildId;
+  const projectUpdate = await tx
+    .update(siteProjects)
+    .set({
+      currentKnowledgeSnapshotId: null,
+      currentBuildId: null,
+      globalLiveDeploymentId: null,
+      mainlandLiveDeploymentId: null,
+      brief: null,
+      status: "draft",
+      revision: nextRevision,
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(siteProjects.id, project.id),
+        eq(siteProjects.userId, project.userId),
+        eq(siteProjects.revision, reset.expectedProjectRevision),
+        nullableCoordinate(
+          siteProjects.currentBuildId,
+          reset.expectedCurrentBuildId,
+        ),
+        nullableCoordinate(
+          siteProjects.currentKnowledgeSnapshotId,
+          reset.expectedKnowledgeSnapshotId,
+        ),
+        nullableCoordinate(
+          siteProjects.globalLiveDeploymentId,
+          reset.expectedGlobalLiveDeploymentId,
+        ),
+        nullableCoordinate(
+          siteProjects.mainlandLiveDeploymentId,
+          reset.expectedMainlandLiveDeploymentId,
+        ),
+        nullableCoordinate(
+          siteProjects.canonicalHostname,
+          reset.expectedCanonicalHostname,
+        ),
+      ),
+    );
+  if (affectedRows(projectUpdate) !== 1) {
+    return { status: "invalidated" as const };
+  }
+
+  await tx
+    .update(siteBuilds)
+    .set({ status: "cancelled", updatedAt: input.now })
+    .where(
+      and(
+        eq(siteBuilds.projectId, project.id),
+        eq(siteBuilds.userId, project.userId),
+        inArray(siteBuilds.status, [
+          "preparing",
+          "visual_searching",
+          "awaiting_visual_selection",
+          "design_compiling",
+          "contract_ready",
+          "building",
+          "qa_running",
+          "failed",
+          "attention_required",
+        ]),
+      ),
+    );
+  await tx
+    .update(siteBuilds)
+    .set({ status: "superseded", updatedAt: input.now })
+    .where(
+      and(
+        eq(siteBuilds.projectId, project.id),
+        eq(siteBuilds.userId, project.userId),
+        inArray(siteBuilds.status, ["preview_ready", "approved"]),
+      ),
+    );
+  await tx
+    .update(siteBuilds)
+    .set({ quotaState: "released", updatedAt: input.now })
+    .where(
+      and(
+        eq(siteBuilds.projectId, project.id),
+        eq(siteBuilds.userId, project.userId),
+        eq(siteBuilds.quotaState, "reserved"),
+      ),
+    );
+
   await tx
     .update(messages)
-    .set({ deletedAt: now, updatedAt: now })
+    .set({ deletedAt: input.now, updatedAt: input.now })
     .where(
       and(
         eq(messages.conversationId, project.conversationId),
@@ -786,7 +1155,7 @@ export async function approveSiteOpsRebuildTicket(
     );
   await tx
     .update(websiteStyleSampleBatches)
-    .set({ status: "superseded", updatedAt: now })
+    .set({ status: "superseded", updatedAt: input.now })
     .where(
       and(
         eq(websiteStyleSampleBatches.siteProjectId, project.id),
@@ -795,68 +1164,115 @@ export async function approveSiteOpsRebuildTicket(
         inArray(websiteStyleSampleBatches.status, ["published", "selected"]),
       ),
     );
+  const previousHeads = [
+    reset.expectedGlobalLiveDeploymentId,
+    reset.expectedMainlandLiveDeploymentId,
+  ].filter((value): value is string => Boolean(value));
+  const previousHeadIds = new Set(previousHeads);
+  const deploymentRows = await tx
+    .select({
+      id: siteDeployments.id,
+      status: siteDeployments.status,
+      verification: siteDeployments.verification,
+    })
+    .from(siteDeployments)
+    .where(
+      and(
+        eq(siteDeployments.projectId, project.id),
+        eq(siteDeployments.userId, project.userId),
+      ),
+    )
+    .for("update");
+  for (const deployment of deploymentRows) {
+    await tx
+      .update(siteDeployments)
+      .set({
+        status: previousHeadIds.has(deployment.id)
+          ? "superseded"
+          : deployment.status,
+        verification: {
+          ...(deployment.verification ?? {}),
+          resetInvalidated: true,
+          resetInvalidatedAt: input.now.toISOString(),
+          resetOperationId: input.operation.id,
+        },
+        updatedAt: input.now,
+      })
+      .where(eq(siteDeployments.id, deployment.id));
+  }
   await tx.insert(messages).values({
     id: randomUUID(),
     conversationId: project.conversationId,
     userId: project.userId,
     role: "assistant",
     content:
-      "官网重制需求已通过。旧官网和线上网站保持不变，请重新上传或选择知识库版本。",
+      "旧官网已下线，重置已完成，请全新上传知识库。",
     sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
     metadata: {
       siteOps: {
         kind: "brief_question",
-        subjectId: input.ticket.id,
+        subjectId: ticket.id,
         revision: nextRevision,
         status: "active",
         payload: {
-          rebuildTicketId: input.ticket.id,
-          sourceBuildId: preservedBuildId,
+          rebuildTicketId: ticket.id,
           requested: "knowledge_snapshot",
           reset: true,
+          unpublishCompleted: true,
         },
       },
     },
   });
-  await tx
-    .update(siteProjects)
+  const appliedNote: SiteOpsRebuildNoteV4 = {
+    ...note,
+    resetAppliedAt: input.now.toISOString(),
+    resetAppliedProjectRevision: nextRevision,
+    freshRootApplied: true,
+    unpublishOperationId: input.operation.id,
+  };
+  const ticketUpdate = await tx
+    .update(deliveryTickets)
     .set({
-      currentKnowledgeSnapshotId: null,
-      brief: null,
-      status: "draft",
-      revision: nextRevision,
-      updatedAt: now,
+      status: "in_progress",
+      publicSummary:
+        "旧网站已安全下线，等待客户全新上传知识资料并创建全新任务。",
+      internalNote: JSON.stringify(appliedNote),
+      resolvedAt: null,
+      revision: ticket.revision + 1,
+      updatedAt: input.now,
     })
     .where(
       and(
-        eq(siteProjects.id, project.id),
-        eq(siteProjects.revision, project.revision),
+        eq(deliveryTickets.id, ticket.id),
+        eq(deliveryTickets.revision, ticket.revision),
       ),
     );
-  const upgradedNote: SiteOpsRebuildNoteV2 | SiteOpsRebuildNoteV3 =
-    existingNote.schemaVersion === 3
-      ? {
-          ...existingNote,
-          sourceBuildId: preservedBuildId,
-          knowledgeSnapshotId:
-            project.currentKnowledgeSnapshotId ??
-            currentBuild?.knowledgeSnapshotId ??
-            existingNote.knowledgeSnapshotId,
-          resetAppliedAt: now.toISOString(),
-          resetAppliedProjectRevision: nextRevision,
-        }
-      : {
-          ...existingNote,
-          schemaVersion: 2,
-          resetAppliedAt: now.toISOString(),
-          resetAppliedProjectRevision: nextRevision,
-        };
+  if (affectedRows(ticketUpdate) !== 1) {
+    throw new Error("SITEOPS_RESET_TICKET_CAS_CONFLICT");
+  }
+  await tx.insert(deliveryTicketEvents).values({
+    id: randomUUID(),
+    ticketId: ticket.id,
+    userId: ticket.userId,
+    actorUserId: null,
+    actorRole: "system",
+    kind: "delivery_result",
+    visibility: "customer",
+    message:
+      "旧网站已安全下线，旧流程已清空，请全新上传资料并创建全新任务。",
+    fromStatus: ticket.status,
+    toStatus: "in_progress",
+    actorContext: {
+      projectAssignmentId: ticket.assignedProjectAssignmentId!,
+      customerUserId: ticket.userId,
+      roleType: "ai_operations_engineer",
+    },
+    createdAt: input.now,
+  });
   return {
-    projectId: project.id,
-    sourceBuildId: preservedBuildId,
-    resetApplied: true as const,
-    resetAppliedProjectRevision: nextRevision,
-    internalNote: JSON.stringify(upgradedNote),
+    status: "applied" as const,
+    projectRevision: nextRevision,
+    internalNote: JSON.stringify(appliedNote),
   };
 }
 
@@ -906,8 +1322,9 @@ export async function completeSiteOpsRebuildTicket(
   ) {
     return null;
   }
-  const message = "新的官网版本已完成，原官网与历史版本仍可继续使用。";
-  await tx
+  const message =
+    "全新官网预览已完成；旧官网与旧任务保持下线和隔离，不会被再次发布。";
+  const completed = await tx
     .update(deliveryTickets)
     .set({
       status: "completed",
@@ -924,6 +1341,9 @@ export async function completeSiteOpsRebuildTicket(
         eq(deliveryTickets.revision, ticket.revision),
       ),
     );
+  if (affectedRows(completed) !== 1) {
+    throw new Error("SITEOPS_REBUILD_COMPLETION_CAS_CONFLICT");
+  }
   await tx.insert(deliveryTicketEvents).values({
     id: randomUUID(),
     ticketId: ticket.id,

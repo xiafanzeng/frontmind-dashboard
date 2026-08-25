@@ -13,7 +13,6 @@ import {
   max,
   ne,
   notInArray,
-  or,
 } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -78,8 +77,6 @@ import {
   type AuthenticatedUser,
 } from "../auth-service";
 import { getDb } from "../db";
-import { ManusV2Client } from "../manus-v2-client";
-import { getPresalesCredentialById } from "../presales-service";
 import { getServicePortal } from "../service-entitlement";
 import { siteOpsProviderConfigured } from "./providers";
 import {
@@ -112,7 +109,6 @@ import {
   publicSiteOpsMessageText,
   sanitizeFrontMindPublicText,
 } from "./public-errors";
-import { terminalTaskState } from "./task-terminal-state";
 import {
   assertSiteOpsServiceEntitlement,
   reserveSiteOpsQuota,
@@ -777,15 +773,6 @@ export function hashSiteOpsRequest(value: unknown) {
     .digest("hex");
 }
 
-const RESETTABLE_PRE_BUILD_STATUSES = new Set([
-  "draft",
-  "collecting_brief",
-  "visual_searching",
-  "awaiting_visual_selection",
-  "failed",
-  "attention_required",
-]);
-
 const publicVisualFamilySchema = z.enum([
   "floating_orbit",
   "split_media",
@@ -967,550 +954,6 @@ export function referenceBlueprintForSiteOpsRevision(input: {
   return inherited.success && inheritedMatches
     ? inherited.data
     : input.derivedReferenceBlueprint;
-}
-
-export function siteOpsResetCapability(input: {
-  projectStatus: string;
-  currentBuild: boolean;
-  liveHead: boolean;
-  hasBuild: boolean;
-  resettableFailedBuild?: boolean;
-  hasDeployment: boolean;
-  hasBlockingOperation: boolean;
-  hasActiveDns: boolean;
-  hasUnresolvedFinancialIntent: boolean;
-}) {
-  if (
-    (input.currentBuild || input.hasBuild) &&
-    input.resettableFailedBuild !== true
-  ) {
-    return {
-      allowed: false as const,
-      reason: "已有官网版本，不能重置为全新首轮任务。请使用版本修改或回滚。",
-    };
-  }
-  if (input.liveHead) {
-    return {
-      allowed: false as const,
-      reason: "已有线上官网，不能通过首轮重置清空当前项目。",
-    };
-  }
-  if (input.hasDeployment) {
-    return {
-      allowed: false as const,
-      reason: "已有发布记录，不能通过首轮重置清空当前项目。",
-    };
-  }
-  if (input.hasBlockingOperation) {
-    return {
-      allowed: false as const,
-      reason: "当前仍有任务正在执行或结果待确认，完成后才能重置。",
-    };
-  }
-  if (input.hasActiveDns) {
-    return {
-      allowed: false as const,
-      reason: "当前仍有 DNS 变更待完成或对账，完成后才能重置。",
-    };
-  }
-  if (input.hasUnresolvedFinancialIntent) {
-    return {
-      allowed: false as const,
-      reason: "当前仍有域名付费操作待确认，完成对账后才能重置。",
-    };
-  }
-  if (!RESETTABLE_PRE_BUILD_STATUSES.has(input.projectStatus)) {
-    return {
-      allowed: false as const,
-      reason: "当前阶段不能使用首轮重置，请使用对应的版本管理操作。",
-    };
-  }
-  return { allowed: true as const };
-}
-
-const ACTIVE_BUILD_RECOVERY_OPERATION_STATUSES = new Set([
-  "queued",
-  "running",
-  "outcome_unknown",
-]);
-const RECOVERABLE_BUILD_OUTPUT_ERROR_CODES = new Set([
-  "FRONTMIND_BUILD_OUTPUT_INVALID",
-]);
-
-type SiteOpsBuildRecoveryBuild = {
-  id: string;
-  ordinal: number;
-  status: string;
-  knowledgeSnapshotId: string;
-  workflowVersion: string;
-  styleSampleId: string | null;
-  selectionHash: string | null;
-  upstreamManusTaskId: string | null;
-  quotaState: string | null;
-  contractLocalAssetId: string | null;
-  sourceLocalAssetId: string | null;
-  distLocalAssetId: string | null;
-  qaLocalAssetId: string | null;
-  provenanceLocalAssetId: string | null;
-  errorCode: string | null;
-};
-
-type SiteOpsBuildRecoveryOperation = {
-  id: string;
-  buildId: string | null;
-  kind: string;
-  status: string;
-  input: unknown;
-  provider: string | null;
-  providerTaskId: string | null;
-  errorCode: string | null;
-  createdAt: Date;
-};
-
-function recordValue(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-export function createSiteOpsResumeBuildOperationInput(input: {
-  frozenInput: Record<string, unknown>;
-  sourceOperationId: string;
-  providerTaskId: string;
-}) {
-  return {
-    ...input.frozenInput,
-    resumeSourceOperationId: input.sourceOperationId,
-    resumeProviderTaskId: input.providerTaskId,
-    resumeMode: "recover_design_output" as const,
-  };
-}
-
-function frozenBuildRecoveryInputMatches(input: {
-  currentKnowledgeSnapshotId: string | null;
-  build: SiteOpsBuildRecoveryBuild;
-  operation: SiteOpsBuildRecoveryOperation;
-}) {
-  const frozen = recordValue(input.operation.input);
-  return Boolean(
-    frozen &&
-      input.currentKnowledgeSnapshotId === input.build.knowledgeSnapshotId &&
-      input.build.styleSampleId &&
-      input.build.selectionHash &&
-      input.build.upstreamManusTaskId &&
-      input.operation.provider === "manus" &&
-      input.operation.providerTaskId === input.build.upstreamManusTaskId &&
-      frozen.buildId === input.build.id &&
-      frozen.styleSampleId === input.build.styleSampleId &&
-      frozen.workflowVersion === input.build.workflowVersion &&
-      typeof frozen.manusCredentialId === "string" &&
-      typeof frozen.manusCredentialVersion === "number" &&
-      Number.isInteger(frozen.manusCredentialVersion) &&
-      Number(frozen.manusCredentialVersion) > 0 &&
-      recordValue(frozen.referenceBlueprint) &&
-      ["released", "reserved"].includes(String(input.build.quotaState)) &&
-      input.build.contractLocalAssetId === null &&
-      input.build.sourceLocalAssetId === null &&
-      input.build.distLocalAssetId === null &&
-      input.build.qaLocalAssetId === null &&
-      input.build.provenanceLocalAssetId === null,
-  );
-}
-
-function latestSiteOpsBuildAttempt(
-  builds: SiteOpsBuildRecoveryBuild[],
-): SiteOpsBuildRecoveryBuild | null {
-  return (
-    builds
-      .filter((build) => !["cancelled", "superseded"].includes(build.status))
-      .sort((left, right) => right.ordinal - left.ordinal)[0] ?? null
-  );
-}
-
-export function siteOpsResumeBuildTargetsLatestAttempt(input: {
-  requestedBuildId: string;
-  builds: SiteOpsBuildRecoveryBuild[];
-}) {
-  return latestSiteOpsBuildAttempt(input.builds)?.id === input.requestedBuildId;
-}
-
-function originalBuildRecoverySource(input: {
-  latestTerminalOperation: SiteOpsBuildRecoveryOperation;
-  relatedOperations: SiteOpsBuildRecoveryOperation[];
-}) {
-  const byId = new Map(
-    input.relatedOperations.map((operation) => [operation.id, operation]),
-  );
-  const visited = new Set<string>();
-  let current: SiteOpsBuildRecoveryOperation | undefined =
-    input.latestTerminalOperation;
-  while (current) {
-    if (
-      visited.has(current.id) ||
-      current.provider !== "manus" ||
-      !current.providerTaskId ||
-      !["failed", "attention_required"].includes(current.status) ||
-      !RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(String(current.errorCode))
-    ) {
-      return null;
-    }
-    visited.add(current.id);
-    const frozen = recordValue(current.input);
-    if (frozen?.resumeMode !== "recover_design_output") return current;
-    const sourceOperationId = frozen.resumeSourceOperationId;
-    const resumeProviderTaskId = frozen.resumeProviderTaskId;
-    if (
-      typeof sourceOperationId !== "string" ||
-      typeof resumeProviderTaskId !== "string" ||
-      resumeProviderTaskId !== current.providerTaskId
-    ) {
-      return null;
-    }
-    const source = byId.get(sourceOperationId);
-    if (
-      !source ||
-      source.buildId !== current.buildId ||
-      source.provider !== "manus" ||
-      source.providerTaskId !== resumeProviderTaskId ||
-      source.createdAt.getTime() > current.createdAt.getTime()
-    ) {
-      return null;
-    }
-    current = source;
-  }
-  return null;
-}
-
-function buildRecoveryDecision(input: {
-  projectStatus: string;
-  currentKnowledgeSnapshotId: string | null;
-  build: SiteOpsBuildRecoveryBuild | null;
-  operations: SiteOpsBuildRecoveryOperation[];
-}) {
-  const unavailable = {
-    allowed: false as const,
-    buildId: input.build?.id ?? null,
-    reason: null,
-    sourceOperation: null,
-  };
-  if (!input.build) return unavailable;
-  const related = input.operations
-    .filter(
-      (operation) =>
-        operation.buildId === input.build!.id &&
-        ["site_build", "build_revision"].includes(operation.kind),
-    )
-    .sort(
-      (left, right) => right.createdAt.getTime() - left.createdAt.getTime(),
-    );
-  const activeOperation = related.find((operation) =>
-    ACTIVE_BUILD_RECOVERY_OPERATION_STATUSES.has(operation.status),
-  );
-  const hasRecoveryHistory =
-    RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(String(input.build.errorCode)) ||
-    related.some(
-      (operation) =>
-        RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(String(operation.errorCode)) ||
-        recordValue(operation.input)?.resumeMode === "recover_design_output",
-    );
-  if (activeOperation && hasRecoveryHistory) {
-    return {
-      allowed: false as const,
-      buildId: input.build.id,
-      reason: "active_operation" as const,
-      sourceOperation: null,
-    };
-  }
-  if (activeOperation) return unavailable;
-  if (
-    !["failed", "attention_required"].includes(input.projectStatus) ||
-    !["failed", "attention_required"].includes(input.build.status)
-  ) {
-    return unavailable;
-  }
-  const latestTerminalOperation = related.find((operation) =>
-    ["failed", "attention_required", "succeeded", "cancelled"].includes(
-      operation.status,
-    ),
-  );
-  const recoverableTerminalOperation =
-    latestTerminalOperation &&
-    ["failed", "attention_required"].includes(latestTerminalOperation.status) &&
-    RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(
-      String(latestTerminalOperation.errorCode),
-    )
-      ? latestTerminalOperation
-      : undefined;
-  const sourceOperation = recoverableTerminalOperation
-    ? originalBuildRecoverySource({
-        latestTerminalOperation: recoverableTerminalOperation,
-        relatedOperations: related,
-      })
-    : null;
-  const hasRecoverableOutputFailure = Boolean(recoverableTerminalOperation);
-  if (!hasRecoverableOutputFailure) return unavailable;
-  if (
-    !sourceOperation ||
-    !frozenBuildRecoveryInputMatches({
-      currentKnowledgeSnapshotId: input.currentKnowledgeSnapshotId,
-      build: input.build,
-      operation: sourceOperation,
-    })
-  ) {
-    return {
-      allowed: false as const,
-      buildId: input.build.id,
-      reason: "frozen_input_changed" as const,
-      sourceOperation: null,
-    };
-  }
-  return {
-    allowed: true as const,
-    buildId: input.build.id,
-    reason: "output_recoverable" as const,
-    sourceOperation,
-  };
-}
-
-export function projectSiteOpsBuildRecovery(input: {
-  projectStatus: string;
-  currentKnowledgeSnapshotId: string | null;
-  builds: SiteOpsBuildRecoveryBuild[];
-  operations: SiteOpsBuildRecoveryOperation[];
-}) {
-  const { sourceOperation: _sourceOperation, ...projection } =
-    buildRecoveryDecision({
-      projectStatus: input.projectStatus,
-      currentKnowledgeSnapshotId: input.currentKnowledgeSnapshotId,
-      build: latestSiteOpsBuildAttempt(input.builds),
-      operations: input.operations,
-    });
-  return projection;
-}
-
-export function isSiteOpsFailedBuildResettable(input: {
-  ordinal: number;
-  parentBuildId: string | null;
-  status: string;
-  upstreamManusTaskId: string | null;
-  contractLocalAssetId: string | null;
-  contractHash: string | null;
-  sourceLocalAssetId: string | null;
-  sourceHash: string | null;
-  distLocalAssetId: string | null;
-  distHash: string | null;
-  qaLocalAssetId: string | null;
-  provenanceLocalAssetId: string | null;
-  approvedAt: Date | null;
-  hasProviderTask: boolean;
-  providerTaskStopped?: boolean;
-}) {
-  const providerTaskIsSafe = input.hasProviderTask
-    ? input.providerTaskStopped === true && input.upstreamManusTaskId !== null
-    : input.upstreamManusTaskId === null;
-  return (
-    input.ordinal >= 1 &&
-    input.parentBuildId === null &&
-    ["failed", "attention_required"].includes(input.status) &&
-    providerTaskIsSafe &&
-    input.contractLocalAssetId === null &&
-    input.contractHash === null &&
-    input.sourceLocalAssetId === null &&
-    input.sourceHash === null &&
-    input.distLocalAssetId === null &&
-    input.distHash === null &&
-    input.qaLocalAssetId === null &&
-    input.provenanceLocalAssetId === null &&
-    input.approvedAt === null
-  );
-}
-
-type ResetProviderTaskPreflight = {
-  buildId: string;
-  providerTaskId: string;
-  state: "stopped" | "not_stopped" | "unavailable";
-};
-
-export function siteOpsResetCredentialScope(
-  value: unknown,
-): "customer" | "legacy_presales" | null {
-  if (value === "customer") return "customer";
-  // Only operations written before credentialScope existed may use the
-  // service-wide credential for read-only reset inspection.
-  if (value === undefined) return "legacy_presales";
-  return null;
-}
-
-export type SiteOpsResetProviderTaskInspector = (input: {
-  actorId: number;
-  providerTaskId: string;
-  credentialId: string;
-  credentialVersion: number;
-  credentialScope: "customer" | "legacy_presales";
-}) => Promise<"stopped" | "not_stopped" | "unavailable">;
-
-export function isSiteOpsStoppedProviderTaskResetSafe(input: {
-  buildId: string;
-  buildProviderTaskId: string | null;
-  operationProviderTaskIds: string[];
-  operationStatuses: string[];
-  preflight?: ResetProviderTaskPreflight | null;
-}) {
-  if (
-    !input.buildProviderTaskId ||
-    input.operationProviderTaskIds.length === 0 ||
-    input.operationProviderTaskIds.some(
-      (taskId) => taskId !== input.buildProviderTaskId,
-    ) ||
-    input.operationStatuses.some((status) =>
-      ["queued", "running", "outcome_unknown"].includes(status),
-    )
-  ) {
-    return false;
-  }
-  return Boolean(
-    input.preflight?.state === "stopped" &&
-      input.preflight.buildId === input.buildId &&
-      input.preflight.providerTaskId === input.buildProviderTaskId,
-  );
-}
-
-async function defaultResetProviderTaskInspector(input: {
-  actorId: number;
-  providerTaskId: string;
-  credentialId: string;
-  credentialVersion: number;
-  credentialScope: "customer" | "legacy_presales";
-}) {
-  try {
-    const credential =
-      input.credentialScope === "customer"
-        ? await getDecryptedCredentialForUser(input.actorId, input.credentialId)
-        : await getPresalesCredentialById(input.credentialId);
-    if (!credential || credential.version !== input.credentialVersion) {
-      return "unavailable" as const;
-    }
-    const client = new ManusV2Client({
-      baseUrl: process.env.MANUS_API_BASE_URL?.trim() || "https://api.manus.ai",
-      apiKey: credential.apiKey,
-      rateLimitScope: credential.id,
-      timeoutMs: 30_000,
-    });
-    const detail = await client.taskDetail(input.providerTaskId);
-    const terminal = terminalTaskState(detail.status);
-    return terminal.completed || terminal.failed
-      ? ("stopped" as const)
-      : ("not_stopped" as const);
-  } catch {
-    return "unavailable" as const;
-  }
-}
-
-async function prepareResetProviderTaskPreflight(
-  db: any,
-  input: {
-    actorId: number;
-    conversationId: string;
-    inspect: SiteOpsResetProviderTaskInspector;
-  },
-): Promise<ResetProviderTaskPreflight | null> {
-  const projectRows = await db
-    .select({
-      id: siteProjects.id,
-      currentBuildId: siteProjects.currentBuildId,
-    })
-    .from(siteProjects)
-    .where(
-      and(
-        eq(siteProjects.userId, input.actorId),
-        eq(siteProjects.conversationId, input.conversationId),
-      ),
-    )
-    .limit(1);
-  const project = projectRows[0];
-  if (!project?.currentBuildId) return null;
-  const buildRows = await db
-    .select({
-      id: siteBuilds.id,
-      upstreamTaskId: siteBuilds.upstreamManusTaskId,
-    })
-    .from(siteBuilds)
-    .where(
-      and(
-        eq(siteBuilds.id, project.currentBuildId),
-        eq(siteBuilds.projectId, project.id),
-        eq(siteBuilds.userId, input.actorId),
-      ),
-    )
-    .limit(1);
-  const build = buildRows[0];
-  if (!build?.upstreamTaskId) return null;
-  const operationRows = await db
-    .select({
-      providerTaskId: siteOperations.providerTaskId,
-      status: siteOperations.status,
-      operationInput: siteOperations.input,
-    })
-    .from(siteOperations)
-    .where(
-      and(
-        eq(siteOperations.projectId, project.id),
-        eq(siteOperations.userId, input.actorId),
-        eq(siteOperations.buildId, build.id),
-        isNotNull(siteOperations.providerTaskId),
-      ),
-    )
-    .orderBy(desc(siteOperations.createdAt))
-    .limit(10);
-  const matching = operationRows.filter(
-    (row: { providerTaskId: string | null }) =>
-      row.providerTaskId === build.upstreamTaskId,
-  );
-  if (
-    matching.length === 0 ||
-    operationRows.some(
-      (row: { providerTaskId: string | null }) =>
-        row.providerTaskId !== build.upstreamTaskId,
-    ) ||
-    matching.some((row: { status: string }) =>
-      ["queued", "running", "outcome_unknown"].includes(row.status),
-    )
-  ) {
-    return {
-      buildId: build.id,
-      providerTaskId: build.upstreamTaskId,
-      state: "not_stopped",
-    };
-  }
-  const frozen = (matching[0]?.operationInput ?? {}) as Record<string, unknown>;
-  const credentialId =
-    typeof frozen.manusCredentialId === "string"
-      ? frozen.manusCredentialId
-      : "";
-  const credentialVersion = Number(frozen.manusCredentialVersion);
-  const credentialScope = siteOpsResetCredentialScope(frozen.credentialScope);
-  if (
-    !credentialId ||
-    !Number.isSafeInteger(credentialVersion) ||
-    !credentialScope
-  ) {
-    return {
-      buildId: build.id,
-      providerTaskId: build.upstreamTaskId,
-      state: "unavailable",
-    };
-  }
-  return {
-    buildId: build.id,
-    providerTaskId: build.upstreamTaskId,
-    state: await input.inspect({
-      actorId: input.actorId,
-      providerTaskId: build.upstreamTaskId,
-      credentialId,
-      credentialVersion,
-      credentialScope,
-    }),
-  };
 }
 
 async function appendMessage(
@@ -2046,9 +1489,6 @@ async function projectObservation(
     dnsOperationRows,
     activeAliyunOperationRows,
     unresolvedFinancialRows,
-    resetOperationRows,
-    providerTaskRows,
-    activeDnsRecordRows,
     rebuildRequest,
   ] = await Promise.all([
     executor
@@ -2142,6 +1582,7 @@ async function projectObservation(
         input: siteOperations.input,
         provider: siteOperations.provider,
         providerTaskId: siteOperations.providerTaskId,
+        result: siteOperations.result,
         errorCode: siteOperations.errorCode,
         startedAt: siteOperations.startedAt,
         completedAt: siteOperations.completedAt,
@@ -2227,56 +1668,6 @@ async function projectObservation(
           eq(siteDomainOperations.projectId, input.project.id),
           eq(siteDomainOperations.userId, input.userId),
           isNotNull(siteDomainOperations.activeFinancialKey),
-        ),
-      )
-      .limit(1),
-    executor
-      .select({
-        kind: siteOperations.kind,
-        status: siteOperations.status,
-      })
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.userId),
-          or(
-            inArray(siteOperations.status, ["running", "outcome_unknown"]),
-            and(
-              eq(siteOperations.status, "queued"),
-              ne(siteOperations.kind, "visual_search"),
-            ),
-          ),
-        ),
-      )
-      .limit(1),
-    executor
-      .select({
-        buildId: siteOperations.buildId,
-        providerTaskId: siteOperations.providerTaskId,
-        status: siteOperations.status,
-      })
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.userId),
-          isNotNull(siteOperations.providerTaskId),
-        ),
-      )
-      .limit(50),
-    executor
-      .select({ id: siteDnsRecords.id })
-      .from(siteDnsRecords)
-      .where(
-        and(
-          eq(siteDnsRecords.projectId, input.project.id),
-          eq(siteDnsRecords.userId, input.userId),
-          inArray(siteDnsRecords.status, [
-            "applying",
-            "propagating",
-            "outcome_unknown",
-          ]),
         ),
       )
       .limit(1),
@@ -2416,64 +1807,6 @@ async function projectObservation(
   const dnsPlanItems = Array.isArray(latestDnsPlanResult?.plan)
     ? latestDnsPlanResult.plan
     : [];
-  const activeBuildRows = buildRows.filter(
-    (row: typeof siteBuilds.$inferSelect) =>
-      !["cancelled", "superseded"].includes(row.status),
-  );
-  const currentBuild = activeBuildRows.find(
-    (row: typeof siteBuilds.$inferSelect) =>
-      row.id === input.project.currentBuildId,
-  );
-  const currentProviderTaskRows = currentBuild
-    ? providerTaskRows.filter(
-        (row: {
-          buildId: string | null;
-          providerTaskId: string | null;
-          status: string;
-        }) => row.buildId === currentBuild.id && Boolean(row.providerTaskId),
-      )
-    : [];
-  const providerTaskCanBeCheckedBeforeReset = Boolean(
-    currentBuild?.upstreamManusTaskId &&
-      currentProviderTaskRows.length > 0 &&
-      currentProviderTaskRows.every(
-        (row: { providerTaskId: string | null; status: string }) =>
-          row.providerTaskId === currentBuild.upstreamManusTaskId &&
-          !["queued", "running", "outcome_unknown"].includes(row.status),
-      ),
-  );
-  const resettableFailedBuild = Boolean(
-    currentBuild &&
-      activeBuildRows.length === 1 &&
-      isSiteOpsFailedBuildResettable({
-        ...currentBuild,
-        hasProviderTask: providerTaskRows.some(
-          (row: { buildId: string | null; providerTaskId: string | null }) =>
-            row.buildId === currentBuild.id && Boolean(row.providerTaskId),
-        ),
-        providerTaskStopped: providerTaskCanBeCheckedBeforeReset,
-      }),
-  );
-  const buildRecovery = projectSiteOpsBuildRecovery({
-    projectStatus: input.project.status,
-    currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-    builds: buildRows,
-    operations: timelineOperationRows,
-  });
-  const resetCapability = siteOpsResetCapability({
-    projectStatus: input.project.status,
-    currentBuild: Boolean(input.project.currentBuildId),
-    liveHead: Boolean(
-      input.project.globalLiveDeploymentId ||
-        input.project.mainlandLiveDeploymentId,
-    ),
-    hasBuild: activeBuildRows.length > 0,
-    resettableFailedBuild,
-    hasDeployment: deploymentRows.length > 0,
-    hasBlockingOperation: resetOperationRows.length > 0,
-    hasActiveDns: activeDnsRecordRows.length > 0,
-    hasUnresolvedFinancialIntent: unresolvedFinancialRows.length > 0,
-  });
   const selectedSampleIds = new Set(
     buildRows
       .filter(
@@ -2691,7 +2024,9 @@ async function projectObservation(
       .filter(
         (row: typeof knowledgeBaseSnapshots.$inferSelect) =>
           typeof row.archiveHash === "string" &&
-          /^[a-f0-9]{64}$/u.test(row.archiveHash),
+          /^[a-f0-9]{64}$/u.test(row.archiveHash) &&
+          row.version >=
+            (rebuildRequest.minimumKnowledgeSnapshotVersion ?? 0),
       )
       .map((row: typeof knowledgeBaseSnapshots.$inferSelect) => ({
         id: row.id,
@@ -2712,12 +2047,45 @@ async function projectObservation(
       canGenerateMore: visualGeneration.canGenerateMore,
       canSelectExisting: visualGeneration.canSelectExisting,
     },
-    buildRecovery,
     executionSteps: projectSiteOpsExecutionSteps({
       operations: timelineOperationRows,
       timelineMessages: timelineMessageRows,
     }),
     builds: buildRows.map((row: typeof siteBuilds.$inferSelect) => {
+      const operation = timelineOperationRows.find(
+        (candidate: { buildId: string | null; status: string }) =>
+          candidate.buildId === row.id && candidate.status === "succeeded",
+      ) as
+        | { result?: Record<string, unknown> | null }
+        | undefined;
+      const rawDelivery = operation?.result?.buildDelivery;
+      const delivery =
+        rawDelivery && typeof rawDelivery === "object" && !Array.isArray(rawDelivery)
+          ? (rawDelivery as Record<string, unknown>)
+          : null;
+      const warningCodes = Array.isArray(delivery?.warningCodes)
+        ? delivery.warningCodes.filter(
+            (value): value is string =>
+              typeof value === "string" && value.length > 0 && value.length <= 128,
+          )
+        : [];
+      const buildDelivery =
+        delivery &&
+        ["primary", "trusted_fallback"].includes(String(delivery.renderMode)) &&
+        ["passed", "passed_with_warnings", "partial"].includes(
+          String(delivery.qaStatus),
+        )
+          ? {
+              renderMode: delivery.renderMode as
+                | "primary"
+                | "trusted_fallback",
+              qaStatus: delivery.qaStatus as
+                | "passed"
+                | "passed_with_warnings"
+                | "partial",
+              warningCodes: Array.from(new Set(warningCodes)).slice(0, 100),
+            }
+          : null;
       return {
         id: row.id,
         parentBuildId: row.parentBuildId,
@@ -2729,6 +2097,7 @@ async function projectObservation(
         sourceUrl: row.sourceLocalAssetId
           ? `/api/site-ops/builds/${row.id}/source`
           : null,
+        buildDelivery,
         needsHelp:
           row.status === "failed" || row.status === "attention_required",
         createdAt: row.createdAt.toISOString(),
@@ -2756,12 +2125,12 @@ async function projectObservation(
         createdAt: row.createdAt.toISOString(),
       }),
     ),
-    resetCapability,
     rebuildRequest: {
       allowed: rebuildRequest.allowed,
       ticketId: rebuildRequest.ticketId,
       status: rebuildRequest.status,
       resetApplied: rebuildRequest.resetApplied,
+      resetPending: rebuildRequest.resetPending,
       resetSourceBuildId: rebuildRequest.resetSourceBuildId,
     },
     interactionState: projectedStatuses.interactionState,
@@ -3378,6 +2747,19 @@ export async function sendSiteOpsMessage(
     if (!project) {
       throw new SiteOpsServiceError("NOT_FOUND", "AI 建站会话不存在。", 404);
     }
+    const resetGate = await loadSiteOpsRebuildRequest(tx, {
+      userId: actor.id,
+      projectId: project.id,
+      currentBuildId: project.currentBuildId,
+      hasWorkflowProgress: true,
+    });
+    if (resetGate.resetPending) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "旧网站正在安全下线；重置完成前不能启动新的建站、发布或域名操作。",
+        409,
+      );
+    }
     const existing = await tx
       .select()
       .from(siteOperations)
@@ -3512,12 +2894,12 @@ export function parseSiteOpsActionPayload(
 ) {
   switch (action) {
     case "reset_workflow":
-      return z
-        .object({ confirmed: z.literal(true) })
-        .strict()
-        .parse(raw);
     case "resume_build":
-      return z.object({ buildId: uuidSchema }).strict().parse(raw);
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，请全新上传知识库并重新生成。",
+        409,
+      );
     case "request_rebuild":
       return z
         .object({ reason: z.string().trim().max(4_000).optional() })
@@ -3934,184 +3316,6 @@ function siteOpsMutationAffectedRows(value: unknown) {
   return Number(header?.affectedRows ?? 0);
 }
 
-export async function handleResumeBuild(
-  tx: any,
-  input: {
-    actor: AuthenticatedUser;
-    project: typeof siteProjects.$inferSelect;
-    turnId: string;
-    requestId: string;
-    requestHash: string;
-    payload: { buildId: string };
-  },
-) {
-  const buildRows = await tx
-    .select()
-    .from(siteBuilds)
-    .where(
-      and(
-        eq(siteBuilds.projectId, input.project.id),
-        eq(siteBuilds.userId, input.actor.id),
-        notInArray(siteBuilds.status, ["cancelled", "superseded"]),
-      ),
-    )
-    .orderBy(desc(siteBuilds.ordinal))
-    .limit(1)
-    .for("update");
-  const build = buildRows[0];
-  if (
-    !build ||
-    !siteOpsResumeBuildTargetsLatestAttempt({
-      requestedBuildId: input.payload.buildId,
-      builds: buildRows,
-    })
-  ) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "官网版本已更新，请刷新后再继续。",
-      409,
-    );
-  }
-  const operationRows = await tx
-    .select()
-    .from(siteOperations)
-    .where(
-      and(
-        eq(siteOperations.projectId, input.project.id),
-        eq(siteOperations.userId, input.actor.id),
-        eq(siteOperations.buildId, input.payload.buildId),
-        inArray(siteOperations.kind, ["site_build", "build_revision"]),
-      ),
-    )
-    .orderBy(desc(siteOperations.createdAt))
-    .limit(50)
-    .for("update");
-  const decision = buildRecoveryDecision({
-    projectStatus: input.project.status,
-    currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-    build,
-    operations: operationRows,
-  });
-  if (!decision.allowed || !build || !decision.sourceOperation) {
-    const message =
-      decision.reason === "active_operation"
-        ? "官网正在继续生成，请勿重复提交。"
-        : decision.reason === "frozen_input_changed"
-          ? "保留的知识库或视觉方案已发生变化，无法安全续跑，请提交工单获取协助。"
-          : "当前官网版本不能原地继续生成，请刷新后查看可用操作。";
-    throw new SiteOpsServiceError("STATE_CONFLICT", message, 409);
-  }
-  const sourceOperation = decision.sourceOperation;
-  const frozenInput = recordValue(sourceOperation.input);
-  const providerTaskId = sourceOperation.providerTaskId;
-  const quotaState = build.quotaState;
-  if (
-    !frozenInput ||
-    !providerTaskId ||
-    (quotaState !== "released" && quotaState !== "reserved")
-  ) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "保留的生成任务坐标不完整，无法安全续跑，请提交工单获取协助。",
-      409,
-    );
-  }
-  const now = new Date();
-  const operationId = randomUUID();
-  const buildUpdated = await tx
-    .update(siteBuilds)
-    .set({
-      status: "design_compiling",
-      repairAttempts: 0,
-      quotaState: "reserved",
-      errorCode: null,
-      errorMessage: null,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(siteBuilds.id, build.id),
-        eq(siteBuilds.projectId, input.project.id),
-        eq(siteBuilds.userId, input.actor.id),
-        eq(siteBuilds.status, build.status),
-        eq(siteBuilds.repairAttempts, build.repairAttempts),
-        eq(siteBuilds.quotaState, quotaState),
-        eq(siteBuilds.knowledgeSnapshotId, build.knowledgeSnapshotId),
-        eq(siteBuilds.workflowVersion, build.workflowVersion),
-        eq(siteBuilds.styleSampleId, build.styleSampleId!),
-        eq(siteBuilds.selectionHash, build.selectionHash!),
-        eq(siteBuilds.upstreamManusTaskId, providerTaskId),
-      ),
-    );
-  if (siteOpsMutationAffectedRows(buildUpdated) !== 1) {
-    throw new SiteOpsServiceError(
-      "REVISION_CONFLICT",
-      "官网恢复状态已更新，请刷新后重试。",
-      409,
-    );
-  }
-  await tx.insert(siteOperations).values({
-    id: operationId,
-    projectId: input.project.id,
-    userId: input.actor.id,
-    conversationTurnId: input.turnId,
-    buildId: build.id,
-    kind: "build_revision",
-    status: "queued",
-    clientRequestId: input.requestId,
-    inputHash: input.requestHash,
-    input: createSiteOpsResumeBuildOperationInput({
-      frozenInput,
-      sourceOperationId: sourceOperation.id,
-      providerTaskId,
-    }),
-    provider: "manus",
-    providerTaskId,
-  });
-  await appendMessage(tx, {
-    conversationId: input.project.conversationId,
-    userId: input.actor.id,
-    role: "assistant",
-    turnId: input.turnId,
-    content:
-      "已保留知识库资料和所选视觉方案，FrontMind 正在从中断处继续生成官网；无需重新选择，也不会重复扣减本次官网额度。",
-    siteOps: {
-      kind: "build_progress",
-      subjectId: operationId,
-      revision: input.project.revision + 1,
-      status: "active",
-      payload: {
-        stage: "design_compiling",
-        buildId: build.id,
-        resumed: true,
-      },
-    },
-  });
-  const projectUpdated = await tx
-    .update(siteProjects)
-    .set({
-      status: "building",
-      revision: input.project.revision + 1,
-      updatedAt: now,
-    })
-    .where(
-        and(
-          eq(siteProjects.id, input.project.id),
-          eq(siteProjects.revision, input.project.revision),
-          input.project.currentBuildId
-            ? eq(siteProjects.currentBuildId, input.project.currentBuildId)
-            : isNull(siteProjects.currentBuildId),
-        ),
-      );
-  if (siteOpsMutationAffectedRows(projectUpdated) !== 1) {
-    throw new SiteOpsServiceError(
-      "REVISION_CONFLICT",
-      "官网项目已更新，请刷新后重试。",
-      409,
-    );
-  }
-}
-
 async function handleRequestRebuild(
   tx: any,
   input: {
@@ -4196,272 +3400,6 @@ async function handleRequestRebuild(
       revision: input.project.revision,
       status: "resolved",
       payload: { rebuildTicketId: created.ticketId, status: "submitted" },
-    },
-  });
-}
-
-async function handleResetWorkflow(
-  tx: any,
-  input: {
-    actor: AuthenticatedUser;
-    project: typeof siteProjects.$inferSelect;
-    turnId: string;
-    requestId: string;
-    requestHash: string;
-    payload: { confirmed: true };
-    providerTaskPreflight: ResetProviderTaskPreflight | null;
-  },
-) {
-  const nonterminalOperationRows = await tx
-    .select({
-      id: siteOperations.id,
-      kind: siteOperations.kind,
-      status: siteOperations.status,
-    })
-    .from(siteOperations)
-    .where(
-      and(
-        eq(siteOperations.projectId, input.project.id),
-        eq(siteOperations.userId, input.actor.id),
-        inArray(siteOperations.status, [
-          "queued",
-          "running",
-          "outcome_unknown",
-        ]),
-      ),
-    )
-    .for("update");
-  const buildRows = await tx
-    .select()
-    .from(siteBuilds)
-    .where(
-      and(
-        eq(siteBuilds.projectId, input.project.id),
-        eq(siteBuilds.userId, input.actor.id),
-      ),
-    )
-    .limit(50)
-    .for("update");
-  const providerTaskRows = await tx
-    .select({
-      buildId: siteOperations.buildId,
-      providerTaskId: siteOperations.providerTaskId,
-      status: siteOperations.status,
-    })
-    .from(siteOperations)
-    .where(
-      and(
-        eq(siteOperations.projectId, input.project.id),
-        eq(siteOperations.userId, input.actor.id),
-        isNotNull(siteOperations.providerTaskId),
-      ),
-    )
-    .limit(50)
-    .for("update");
-  const deploymentRows = await tx
-    .select({ id: siteDeployments.id })
-    .from(siteDeployments)
-    .where(
-      and(
-        eq(siteDeployments.projectId, input.project.id),
-        eq(siteDeployments.userId, input.actor.id),
-      ),
-    )
-    .limit(1)
-    .for("update");
-  const activeDnsRows = await tx
-    .select({ id: siteDnsRecords.id })
-    .from(siteDnsRecords)
-    .where(
-      and(
-        eq(siteDnsRecords.projectId, input.project.id),
-        eq(siteDnsRecords.userId, input.actor.id),
-        inArray(siteDnsRecords.status, [
-          "applying",
-          "propagating",
-          "outcome_unknown",
-        ]),
-      ),
-    )
-    .limit(1)
-    .for("update");
-  const unresolvedFinancialRows = await tx
-    .select({ id: siteDomainOperations.id })
-    .from(siteDomainOperations)
-    .where(
-      and(
-        eq(siteDomainOperations.projectId, input.project.id),
-        eq(siteDomainOperations.userId, input.actor.id),
-        isNotNull(siteDomainOperations.activeFinancialKey),
-      ),
-    )
-    .limit(1)
-    .for("update");
-
-  const activeBuildRows = buildRows.filter(
-    (row: typeof siteBuilds.$inferSelect) =>
-      !["cancelled", "superseded"].includes(row.status),
-  );
-  const currentBuild = activeBuildRows.find(
-    (row: typeof siteBuilds.$inferSelect) =>
-      row.id === input.project.currentBuildId,
-  );
-  const currentProviderTaskRows = currentBuild
-    ? providerTaskRows.filter(
-        (row: {
-          buildId: string | null;
-          providerTaskId: string | null;
-          status: string;
-        }) => row.buildId === currentBuild.id && Boolean(row.providerTaskId),
-      )
-    : [];
-  const providerTaskStopped = currentBuild
-    ? isSiteOpsStoppedProviderTaskResetSafe({
-        buildId: currentBuild.id,
-        buildProviderTaskId: currentBuild.upstreamManusTaskId,
-        operationProviderTaskIds: currentProviderTaskRows.flatMap(
-          (row: { providerTaskId: string | null }) =>
-            row.providerTaskId ? [row.providerTaskId] : [],
-        ),
-        operationStatuses: currentProviderTaskRows.map(
-          (row: { status: string }) => row.status,
-        ),
-        preflight: input.providerTaskPreflight,
-      })
-    : false;
-  const resettableFailedBuild = Boolean(
-    currentBuild &&
-      activeBuildRows.length === 1 &&
-      isSiteOpsFailedBuildResettable({
-        ...currentBuild,
-        hasProviderTask: providerTaskRows.some(
-          (row: { buildId: string | null; providerTaskId: string | null }) =>
-            row.buildId === currentBuild.id && Boolean(row.providerTaskId),
-        ),
-        providerTaskStopped,
-      }),
-  );
-  const resetCapability = siteOpsResetCapability({
-    projectStatus: input.project.status,
-    currentBuild: Boolean(input.project.currentBuildId),
-    liveHead: Boolean(
-      input.project.globalLiveDeploymentId ||
-        input.project.mainlandLiveDeploymentId,
-    ),
-    hasBuild: activeBuildRows.length > 0,
-    resettableFailedBuild,
-    hasDeployment: deploymentRows.length > 0,
-    hasBlockingOperation: nonterminalOperationRows.some(
-      (row: { kind: string; status: string }) =>
-        row.status !== "queued" || row.kind !== "visual_search",
-    ),
-    hasActiveDns: activeDnsRows.length > 0,
-    hasUnresolvedFinancialIntent: unresolvedFinancialRows.length > 0,
-  });
-  if (!resetCapability.allowed) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      resetCapability.reason,
-      409,
-    );
-  }
-
-  const now = new Date();
-  if (resettableFailedBuild && currentBuild) {
-    await tx
-      .update(siteBuilds)
-      .set({
-        status: "cancelled",
-        ...(currentBuild.quotaState === "reserved"
-          ? { quotaState: "released" as const }
-          : {}),
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(siteBuilds.id, currentBuild.id),
-          inArray(siteBuilds.status, ["failed", "attention_required"]),
-        ),
-      );
-  }
-  await tx
-    .update(siteOperations)
-    .set({
-      status: "cancelled",
-      leaseOwner: null,
-      leaseExpiresAt: null,
-      completedAt: now,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(siteOperations.projectId, input.project.id),
-        eq(siteOperations.userId, input.actor.id),
-        eq(siteOperations.kind, "visual_search"),
-        eq(siteOperations.status, "queued"),
-      ),
-    );
-  await tx
-    .update(websiteStyleSampleBatches)
-    .set({ status: "superseded", updatedAt: now })
-    .where(
-      and(
-        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
-        eq(websiteStyleSampleBatches.userId, input.actor.id),
-        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-        inArray(websiteStyleSampleBatches.status, ["published", "selected"]),
-      ),
-    );
-  await tx
-    .update(messages)
-    .set({ deletedAt: now, updatedAt: now })
-    .where(
-      and(
-        eq(messages.conversationId, input.project.conversationId),
-        eq(messages.userId, input.actor.id),
-        isNull(messages.deletedAt),
-      ),
-    );
-  await reserveOperation(tx, {
-    actor: input.actor,
-    project: input.project,
-    turnId: input.turnId,
-    clientRequestId: input.requestId,
-    requestHash: input.requestHash,
-    payload: { action: "reset_workflow", confirmed: input.payload.confirmed },
-    kind: "brief_message",
-    status: "succeeded",
-  });
-  const nextRevision = input.project.revision + 1;
-  await tx
-    .update(siteProjects)
-    .set({
-      currentKnowledgeSnapshotId: null,
-      currentBuildId: null,
-      brief: null,
-      status: "draft",
-      revision: nextRevision,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(siteProjects.id, input.project.id),
-        eq(siteProjects.revision, input.project.revision),
-      ),
-    );
-  await appendMessage(tx, {
-    conversationId: input.project.conversationId,
-    userId: input.actor.id,
-    role: "assistant",
-    turnId: input.turnId,
-    content:
-      "已重置 AI 建站流程。请先全新上传知识库 ZIP，或选择一个已完成的知识库版本；旧任务不会恢复或续跑。",
-    siteOps: {
-      kind: "brief_question",
-      subjectId: input.project.id,
-      revision: nextRevision,
-      status: "active",
-      payload: { requested: "knowledge_snapshot", reset: true },
     },
   });
 }
@@ -4579,6 +3517,22 @@ async function handleSelectSnapshot(
       "NOT_FOUND",
       "所选知识库 ZIP 版本不存在或不可用。",
       404,
+    );
+  }
+  const rebuild = await loadSiteOpsRebuildRequest(tx, {
+    userId: input.actor.id,
+    projectId: input.project.id,
+    currentBuildId: input.project.currentBuildId,
+    hasWorkflowProgress: true,
+  });
+  if (
+    rebuild.minimumKnowledgeSnapshotVersion !== null &&
+    rows[0].version < rebuild.minimumKnowledgeSnapshotVersion
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      `重置后必须全新上传知识库；请选择 v${rebuild.minimumKnowledgeSnapshotVersion} 或更高版本。`,
+      409,
     );
   }
   const brief = siteBriefFromSnapshot(rows[0]);
@@ -5225,6 +4179,22 @@ async function selectVisualSample(
       409,
     );
   }
+  const resetCycle = await loadSiteOpsRebuildRequest(tx, {
+    userId: input.actor.id,
+    projectId: input.project.id,
+    currentBuildId: input.project.currentBuildId,
+    hasWorkflowProgress: true,
+  });
+  if (
+    resetCycle.minimumKnowledgeSnapshotVersion !== null &&
+    snapshot.version < resetCycle.minimumKnowledgeSnapshotVersion
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "旧知识库版本已被本轮重置隔离，请全新上传知识库后再开始建站。",
+      409,
+    );
+  }
   const credential = await resolvePinnedTwentyFirstCredentialForBatch(tx, {
     engineerNote: selected.batch.engineerNote,
     projectId: input.project.id,
@@ -5319,6 +4289,21 @@ async function selectVisualSample(
     buildId,
     provider: "manus",
   });
+  if (
+    parentBuildId === null &&
+    resetCycle.minimumKnowledgeSnapshotVersion !== null
+  ) {
+    const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
+    console.info("[siteops] fresh_root_created", {
+      event: "siteops_fresh_root_created",
+      stage: "fresh_root_created",
+      projectId: input.project.id,
+      buildId,
+      operationId,
+      projectRevision: input.project.revision,
+      releaseSha: /^[a-f0-9]{40}$/u.test(release) ? release : null,
+    });
+  }
   await appendMessage(tx, {
     conversationId: input.project.conversationId,
     userId: input.actor.id,
@@ -5642,6 +4627,7 @@ async function handlePublish(
   const profile = profileRows[0];
   if (
     !build ||
+    build.id !== input.project.currentBuildId ||
     build.status !== "approved" ||
     !build.distLocalAssetId ||
     !build.distHash
@@ -5761,7 +4747,14 @@ async function handleRollback(
     )
     .limit(1);
   const targetDeployment = rows[0];
-  if (!targetDeployment) {
+  const resetInvalidated = Boolean(
+    targetDeployment?.verification &&
+      typeof targetDeployment.verification === "object" &&
+      !Array.isArray(targetDeployment.verification) &&
+      (targetDeployment.verification as Record<string, unknown>)
+        .resetInvalidated,
+  );
+  if (!targetDeployment || resetInvalidated) {
     throw new SiteOpsServiceError(
       "NOT_FOUND",
       "可回滚的历史发布版本不存在。",
@@ -6346,34 +5339,24 @@ async function handleProviderOperation(
 export async function actOnSiteOps(
   actor: AuthenticatedUser,
   value: unknown,
-  options: {
-    inspectResetProviderTask?: SiteOpsResetProviderTaskInspector;
-  } = {},
 ) {
   assertEnabled();
   assertCustomer(actor);
-  const entitlement = await requireSiteOpsEntitlement(actor.id);
   const input = siteOpsActInputSchema.parse(value);
+  if (input.action === "resume_build" || input.action === "reset_workflow") {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，请全新上传知识库并重新生成。",
+      409,
+    );
+  }
+  const entitlement = await requireSiteOpsEntitlement(actor.id);
   const payload = parseSiteOpsActionPayload(
     input.action,
     input.input,
   ) as Record<string, unknown>;
   const requestHash = hashSiteOpsRequest({ action: input.action, payload });
   const db = await requireDb();
-  // A provider task is inspected before the transaction. The transaction then
-  // rechecks the exact build/task ids and every local in-flight boundary before
-  // accepting the immutable stopped result. No network call is made while DB
-  // locks are held.
-  const providerTaskPreflight =
-    input.action === "reset_workflow"
-      ? await prepareResetProviderTaskPreflight(db, {
-          actorId: actor.id,
-          conversationId: input.conversationId,
-          inspect:
-            options.inspectResetProviderTask ??
-            defaultResetProviderTaskInspector,
-        })
-      : null;
   await db.transaction(async (tx: any) => {
     const project = await loadOwnedProject(
       tx,
@@ -6383,6 +5366,19 @@ export async function actOnSiteOps(
     );
     if (!project) {
       throw new SiteOpsServiceError("NOT_FOUND", "AI 建站会话不存在。", 404);
+    }
+    const resetGate = await loadSiteOpsRebuildRequest(tx, {
+      userId: actor.id,
+      projectId: project.id,
+      currentBuildId: project.currentBuildId,
+      hasWorkflowProgress: true,
+    });
+    if (resetGate.resetPending) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "旧网站正在安全下线；重置完成前不能启动新的建站、发布或域名操作。",
+        409,
+      );
     }
     const existing = await tx
       .select()
@@ -6446,19 +5442,6 @@ export async function actOnSiteOps(
       requestHash,
     };
     switch (input.action) {
-      case "reset_workflow":
-        await handleResetWorkflow(tx, {
-          ...common,
-          payload: payload as { confirmed: true },
-          providerTaskPreflight,
-        });
-        break;
-      case "resume_build":
-        await handleResumeBuild(tx, {
-          ...common,
-          payload: payload as { buildId: string },
-        });
-        break;
       case "request_rebuild":
         await handleRequestRebuild(tx, {
           ...common,

@@ -1364,6 +1364,15 @@ describe("delivery execution authorization and settlement", () => {
         expectedRevision: 4,
       }),
     ).toBe("replay");
+    expect(
+      siteOpsRebuildApprovalDisposition({
+        status: "in_progress",
+        resetApplied: false,
+        resetPending: true,
+        revision: 5,
+        expectedRevision: 4,
+      }),
+    ).toBe("pending_replay");
   });
 
   it("rejects terminal or stale rebuild approval state", () => {

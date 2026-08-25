@@ -16,6 +16,7 @@ export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
   designV3: "frontmind-site-design-wire-v3.json",
   content: "frontmind-page-content-wire-v2.json",
   contentV3: "frontmind-page-content-wire-v3.json",
+  contentDraftV1: "frontmind-site-content-draft-v1.json",
 });
 
 const SITEOPS_WIRE_OUTPUT_MAX_BYTES = Object.freeze({
@@ -34,6 +35,7 @@ export class SiteOpsWireOutputResolutionError extends Error {
     readonly code:
       | "SITEOPS_WIRE_OUTPUT_INVALID"
       | "SITEOPS_WIRE_OUTPUT_CONFLICT"
+      | "SITEOPS_WIRE_OUTPUT_FALLBACK_REQUIRED"
       | "SITEOPS_WIRE_OUTPUT_UNAVAILABLE",
     readonly validationError?: unknown,
     readonly validationCandidate?: Pick<
@@ -51,7 +53,12 @@ export type SiteOpsWireOutputResolution = {
   byteCount: number;
   source: "structured" | "attachment" | "assistant_json";
   sources: Array<"structured" | "attachment" | "assistant_json">;
+  normalizations: Array<
+    "bom" | "json_fence" | "double_encoded" | "json_repair"
+  >;
 };
+
+type JsonNormalization = SiteOpsWireOutputResolution["normalizations"][number];
 
 function isRecord(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -79,15 +86,214 @@ function canonicalJsonValue(value: unknown): string {
     .join(",")}}`;
 }
 
-function candidate(value: unknown, operationToken: string, maxBytes: number) {
-  let parsed = value;
-  if (typeof parsed === "string") {
-    try {
-      parsed = JSON.parse(parsed);
-    } catch {
-      return null;
-    }
+function byteLengthWithin(value: string, maxBytes: number) {
+  return Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function stripOneJsonEnvelope(
+  input: string,
+  normalizations: JsonNormalization[],
+) {
+  let text = input;
+  if (text.startsWith("\uFEFF")) {
+    text = text.slice(1);
+    normalizations.push("bom");
   }
+  text = text.trim();
+  const fence = /^```json[ \t]*\r?\n([\s\S]*?)\r?\n```[ \t]*$/iu.exec(text);
+  if (fence) {
+    normalizations.push("json_fence");
+    return fence[1]!.trim();
+  }
+  // A fence is an envelope only when it contains the entire response. Never
+  // search prose for a plausible object because that would blur the causal
+  // boundary between provider instructions and provider data.
+  if (text.includes("```")) return null;
+  return text;
+}
+
+/**
+ * Repair only a deliberately small, linear-time subset of common transport
+ * damage. This is not JSON5 and never evaluates expressions. The caller still
+ * performs JSON.parse, operation-token validation and the strict business
+ * schema after repair.
+ */
+function repairJsonText(input: string) {
+  let text = "";
+  let inString = false;
+  let escaped = false;
+  const closers: string[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index]!;
+    if (inString) {
+      if (escaped) {
+        if ('"\\/bfnrt'.includes(character)) {
+          text += `\\${character}`;
+        } else if (
+          character === "u" &&
+          /^[a-f0-9]{4}$/iu.test(input.slice(index + 1, index + 5))
+        ) {
+          text += `\\u${input.slice(index + 1, index + 5)}`;
+          index += 4;
+        } else {
+          // Preserve an unknown escape as literal text rather than assigning
+          // it a new JSON meaning.
+          text += `\\\\${character}`;
+        }
+        escaped = false;
+        continue;
+      }
+      if (character === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (character === '"') {
+        inString = false;
+        text += character;
+        continue;
+      }
+      const code = character.charCodeAt(0);
+      if (code <= 0x1f) {
+        text += `\\u${code.toString(16).padStart(4, "0")}`;
+      } else {
+        text += character;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      text += character;
+      continue;
+    }
+    if (character === "{" || character === "[") {
+      closers.push(character === "{" ? "}" : "]");
+      text += character;
+      continue;
+    }
+    if (character === "}" || character === "]") {
+      if (closers.at(-1) !== character) return null;
+      closers.pop();
+      text += character;
+      continue;
+    }
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f && !/[\t\n\r ]/u.test(character)) continue;
+    text += character;
+  }
+  if (escaped) text += "\\\\";
+  if (inString) text += '"';
+  text += closers.reverse().join("");
+
+  // Remove trailing commas without touching string contents.
+  let withoutTrailingCommas = "";
+  inString = false;
+  escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (inString) {
+      withoutTrailingCommas += character;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      withoutTrailingCommas += character;
+      continue;
+    }
+    if (character === ",") {
+      let cursor = index + 1;
+      while (cursor < text.length && /\s/u.test(text[cursor]!)) cursor += 1;
+      if (text[cursor] === "}" || text[cursor] === "]") continue;
+    }
+    withoutTrailingCommas += character;
+  }
+
+  // Quote only ASCII bare object keys in an object-member coordinate. Values,
+  // comments, functions and arbitrary JSON5 syntax remain unsupported.
+  let quotedKeys = "";
+  inString = false;
+  escaped = false;
+  for (let index = 0; index < withoutTrailingCommas.length; index += 1) {
+    const character = withoutTrailingCommas[index]!;
+    if (inString) {
+      quotedKeys += character;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      quotedKeys += character;
+      continue;
+    }
+    quotedKeys += character;
+    if (character !== "{" && character !== ",") continue;
+    let cursor = index + 1;
+    let whitespace = "";
+    while (
+      cursor < withoutTrailingCommas.length &&
+      /\s/u.test(withoutTrailingCommas[cursor]!)
+    ) {
+      whitespace += withoutTrailingCommas[cursor]!;
+      cursor += 1;
+    }
+    const keyMatch = /^([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/u.exec(
+      withoutTrailingCommas.slice(cursor),
+    );
+    if (!keyMatch) continue;
+    quotedKeys += `${whitespace}${JSON.stringify(keyMatch[1])}${keyMatch[2]}`;
+    index = cursor + keyMatch[0].length - 1;
+  }
+  return quotedKeys;
+}
+
+function parseJsonText(input: string, maxBytes: number) {
+  const normalizations: JsonNormalization[] = [];
+  if (!byteLengthWithin(input, maxBytes)) return null;
+  let text = stripOneJsonEnvelope(input, normalizations);
+  if (text === null || !byteLengthWithin(text, maxBytes)) return null;
+  let repaired = false;
+  const parseLayer = (layer: string) => {
+    try {
+      return { ok: true as const, value: JSON.parse(layer) as unknown };
+    } catch {
+      if (repaired) return { ok: false as const };
+      const candidate = repairJsonText(layer);
+      if (candidate === null || candidate === layer)
+        return { ok: false as const };
+      try {
+        const value = JSON.parse(candidate) as unknown;
+        repaired = true;
+        normalizations.push("json_repair");
+        return { ok: true as const, value };
+      } catch {
+        return { ok: false as const };
+      }
+    }
+  };
+  let parsed = parseLayer(text);
+  if (!parsed.ok) return null;
+  if (typeof parsed.value === "string") {
+    normalizations.push("double_encoded");
+    text = parsed.value;
+    if (!byteLengthWithin(text, maxBytes)) return null;
+    const decoded = parseLayer(text);
+    if (!decoded.ok || typeof decoded.value === "string") return null;
+    parsed = decoded;
+  }
+  return { value: parsed.value, normalizations };
+}
+
+function candidate(value: unknown, operationToken: string, maxBytes: number) {
+  const decoded =
+    typeof value === "string"
+      ? parseJsonText(value, maxBytes)
+      : { value, normalizations: [] as JsonNormalization[] };
+  if (!decoded) return null;
+  const parsed = decoded.value;
   if (!isRecord(parsed) || parsed.operationToken !== operationToken)
     return null;
   const canonical = canonicalJsonValue(parsed);
@@ -105,22 +311,29 @@ function candidate(value: unknown, operationToken: string, maxBytes: number) {
       .update(canonicalJsonValue(semanticCandidate), "utf8")
       .digest("hex"),
     byteCount: Buffer.byteLength(canonical, "utf8"),
+    normalizations: decoded.normalizations,
   };
 }
 
 function assertOneCandidate(
   values: ReadonlyArray<SiteOpsWireOutputResolution>,
+  conflictCode:
+    | "SITEOPS_WIRE_OUTPUT_CONFLICT"
+    | "SITEOPS_WIRE_OUTPUT_FALLBACK_REQUIRED",
 ) {
   if (values.length === 0) return null;
   if (new Set(values.map((value) => value.sha256)).size !== 1) {
-    throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_CONFLICT");
+    throw new SiteOpsWireOutputResolutionError(conflictCode);
   }
   const sourceOrder = ["structured", "assistant_json", "attachment"] as const;
   const sources = sourceOrder.filter((source) =>
     values.some((value) => value.source === source),
   );
   const selected = values.find((value) => value.source === sources[0])!;
-  return { ...selected, sources };
+  const normalizations = [
+    ...new Set(values.flatMap((value) => value.normalizations)),
+  ];
+  return { ...selected, sources, normalizations };
 }
 
 function currentOperationWindow(
@@ -160,16 +373,20 @@ function assistantJsonBody(message: JsonObject) {
   if (typeof message.content !== "string") return null;
   const text = message.content.trim();
   if (!text) return null;
-  let jsonText = text;
-  const fence = /^```json\s*\n([\s\S]*?)\n```$/iu.exec(text);
-  if (fence) jsonText = fence[1]!.trim();
-  else if (text.startsWith("```") || text.includes("```")) return null;
-  try {
-    const value = JSON.parse(jsonText);
-    return isRecord(value) ? value : null;
-  } catch {
-    return null;
+  const withoutBom = text.startsWith("\uFEFF")
+    ? text.slice(1).trimStart()
+    : text;
+  if (withoutBom.includes("```")) {
+    return /^```json[ \t]*\r?\n[\s\S]*\r?\n```[ \t]*$/iu.test(withoutBom)
+      ? message.content
+      : null;
   }
+  // Keep ordinary assistant prose out of the candidate set. Objects and one
+  // stringified object are the only non-fenced forms the bounded decoder can
+  // accept.
+  return withoutBom.startsWith("{") || withoutBom.startsWith('"')
+    ? message.content
+    : null;
 }
 
 function optionalString(record: JsonObject, aliases: readonly string[]) {
@@ -199,11 +416,16 @@ function jsonAttachments(
   const expectedWireVersion = expectedFilename.match(
     /[-_]wire[-_]v([23])\.json$/u,
   )?.[1];
-  if (!expectedWireVersion) {
+  const contentDraftV1 =
+    phase === "content" &&
+    expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1;
+  if (!expectedWireVersion && !contentDraftV1) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
   const phaseStem =
-    phase === "design"
+    contentDraftV1
+      ? "frontmind[-_]site[-_]content[-_]draft[-_]v1"
+      : phase === "design"
       ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
       : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
   const providerFilenamePattern = new RegExp(
@@ -314,17 +536,8 @@ async function readBoundedJsonResponse(response: Response, maxBytes: number) {
   } catch {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
-  }
-  if (!isRecord(value)) {
-    throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
-  }
   return {
-    value,
+    value: text,
     rawSha256: createHash("sha256").update(buffer).digest("hex"),
   };
 }
@@ -405,6 +618,7 @@ export async function resolveSiteOpsWireOutput(input: {
       : [
           SITEOPS_WIRE_OUTPUT_FILES.content,
           SITEOPS_WIRE_OUTPUT_FILES.contentV3,
+          SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1,
         ];
   const maxBytes = SITEOPS_WIRE_OUTPUT_MAX_BYTES[input.phase];
   if (!allowedFilenames.includes(input.expectedFilename)) {
@@ -417,7 +631,8 @@ export async function resolveSiteOpsWireOutput(input: {
   if (!input.taskCompleted) return null;
   const window = currentOperationWindow(input.events, input.operationToken);
   if (!window) return null;
-  const candidates: SiteOpsWireOutputResolution[] = [];
+  const acceptedCandidates: SiteOpsWireOutputResolution[] = [];
+  const fallbackCandidates: SiteOpsWireOutputResolution[] = [];
   let sawInvalid = false;
   let sawUnavailable = false;
   let validationError: unknown;
@@ -427,6 +642,7 @@ export async function resolveSiteOpsWireOutput(input: {
   const addCandidate = (
     value: unknown,
     source: SiteOpsWireOutputResolution["source"],
+    acceptedStructured = false,
   ) => {
     let parsed: ReturnType<typeof candidate> = null;
     try {
@@ -448,7 +664,10 @@ export async function resolveSiteOpsWireOutput(input: {
       validationCandidate ??= { sha256: parsed.sha256, source };
       return;
     }
-    candidates.push({ ...parsed, source, sources: [source] });
+    const resolution = { ...parsed, source, sources: [source] };
+    (acceptedStructured ? acceptedCandidates : fallbackCandidates).push(
+      resolution,
+    );
   };
   for (const event of window) {
     if (event.type !== "structured_output_result") continue;
@@ -456,7 +675,7 @@ export async function resolveSiteOpsWireOutput(input: {
       event.structured_output_result,
     );
     if (envelope.kind === "accepted") {
-      addCandidate(envelope.value, "structured");
+      addCandidate(envelope.value, "structured", true);
       continue;
     }
     const raw = isRecord(event.structured_output_result)
@@ -466,6 +685,14 @@ export async function resolveSiteOpsWireOutput(input: {
       addCandidate(raw.value, "structured");
     }
   }
+  // A locally valid, explicitly accepted structured value is authoritative.
+  // Do not fetch signed fallback attachments merely to compare a provider's
+  // recovery copies with its accepted result.
+  const accepted = assertOneCandidate(
+    acceptedCandidates,
+    "SITEOPS_WIRE_OUTPUT_CONFLICT",
+  );
+  if (accepted) return accepted;
   for (const event of window) {
     const message = assistantMessage(event);
     if (!message) continue;
@@ -502,7 +729,10 @@ export async function resolveSiteOpsWireOutput(input: {
       }
     }
   }
-  const resolved = assertOneCandidate(candidates);
+  const resolved = assertOneCandidate(
+    fallbackCandidates,
+    "SITEOPS_WIRE_OUTPUT_FALLBACK_REQUIRED",
+  );
   if (resolved) return resolved;
   if (sawInvalid) {
     throw new SiteOpsWireOutputResolutionError(

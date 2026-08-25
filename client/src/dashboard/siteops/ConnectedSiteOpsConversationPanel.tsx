@@ -29,8 +29,64 @@ const PENDING_SOCIAL_PACKAGE_STATES = new Set([
   "qa_running",
 ]);
 
+const PENDING_REBUILD_REQUEST_STATES = new Set([
+  "submitted",
+  "scheduled",
+  "in_progress",
+]);
+
+const REBUILD_REQUEST_TRANSITIONS: Readonly<
+  Record<string, ReadonlySet<string>>
+> = {
+  submitted: new Set([
+    "needs_information",
+    "scheduled",
+    "in_progress",
+    "completed",
+    "rejected",
+    "cancelled",
+  ]),
+  needs_information: new Set([
+    "submitted",
+    "scheduled",
+    "in_progress",
+    "completed",
+    "rejected",
+    "cancelled",
+  ]),
+  scheduled: new Set(["in_progress", "completed", "rejected", "cancelled"]),
+  in_progress: new Set(["completed", "rejected", "cancelled"]),
+  completed: new Set(),
+  rejected: new Set(),
+  cancelled: new Set(),
+};
+
 export function siteOpsClientRequestId() {
   return crypto.randomUUID();
+}
+
+export function shouldPollSiteOpsObservation(
+  observation: SiteOpsObservationV1 | null,
+) {
+  return Boolean(
+    observation &&
+      (POLLING_STATES.has(observation.interactionState) ||
+        observation.rebuildRequest.resetPending === true ||
+        (observation.rebuildRequest.status !== null &&
+          PENDING_REBUILD_REQUEST_STATES.has(
+            observation.rebuildRequest.status,
+          )) ||
+        observation.visualGeneration.status === "generating" ||
+        observation.deployments.some((item) =>
+          PENDING_DEPLOYMENT_STATES.has(item.status),
+        ) ||
+        observation.domainOperations.some((item) =>
+          PENDING_DOMAIN_OPERATION_STATES.has(item.status),
+        ) ||
+        observation.socialPackages.some((item) =>
+          PENDING_SOCIAL_PACKAGE_STATES.has(item.status),
+        )),
+  );
 }
 
 export function newestSiteOpsObservation(
@@ -54,19 +110,41 @@ export function newestSiteOpsObservation(
   const incomingVisualGenerating =
     incoming.visualGeneration.status === "generating";
   if (currentVisualGenerating && !incomingVisualGenerating) return incoming;
-  // Claiming the resumed build does not need another project revision or
-  // customer message. At an equal cursor, accept only the one-way transition
-  // from a clickable recovery to the active operation and reject a late poll
-  // that would make the primary action clickable again.
-  const currentRecoveryAvailable = current.buildRecovery?.allowed === true;
-  const incomingRecoveryActive =
-    incoming.buildRecovery?.reason === "active_operation";
-  if (currentRecoveryAvailable && incomingRecoveryActive) return incoming;
+  // Rebuild-ticket processing is updated by the administrative worker and
+  // does not need to append a customer message or bump the project revision.
+  // At an equal cursor accept only forward ticket/reset transitions so a late
+  // response cannot restore an earlier actionable state.
+  const currentRebuild = current.rebuildRequest;
+  const incomingRebuild = incoming.rebuildRequest;
+  if (!currentRebuild.resetApplied && incomingRebuild.resetApplied) {
+    return incoming;
+  }
+  if (currentRebuild.resetApplied && !incomingRebuild.resetApplied) {
+    return current;
+  }
+  if (!currentRebuild.resetPending && incomingRebuild.resetPending) {
+    return incoming;
+  }
   if (
-    current.buildRecovery?.reason === "active_operation" &&
-    incoming.buildRecovery?.allowed === true
+    currentRebuild.resetPending &&
+    !incomingRebuild.resetPending &&
+    !incomingRebuild.resetApplied
   ) {
     return current;
+  }
+  if (currentRebuild.status !== incomingRebuild.status) {
+    if (currentRebuild.status === null && incomingRebuild.status !== null) {
+      return incoming;
+    }
+    if (
+      currentRebuild.status !== null &&
+      incomingRebuild.status !== null &&
+      REBUILD_REQUEST_TRANSITIONS[currentRebuild.status]?.has(
+        incomingRebuild.status,
+      )
+    ) {
+      return incoming;
+    }
   }
   return current;
 }
@@ -91,20 +169,7 @@ export default function ConnectedSiteOpsConversationPanel({
   });
   const conversationId =
     observation?.project.conversationId ?? "siteops:pending";
-  const shouldPoll = Boolean(
-    observation &&
-      (POLLING_STATES.has(observation.interactionState) ||
-        observation.visualGeneration.status === "generating" ||
-        observation.deployments.some((item) =>
-          PENDING_DEPLOYMENT_STATES.has(item.status),
-        ) ||
-        observation.domainOperations.some((item) =>
-          PENDING_DOMAIN_OPERATION_STATES.has(item.status),
-        ) ||
-        observation.socialPackages.some((item) =>
-          PENDING_SOCIAL_PACKAGE_STATES.has(item.status),
-        )),
-  );
+  const shouldPoll = shouldPollSiteOpsObservation(observation);
   const observeQuery = trpc.workspace.siteOps.observe.useQuery(
     { conversationId },
     {

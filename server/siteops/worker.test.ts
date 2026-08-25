@@ -8,6 +8,7 @@ import {
   parseSiteOpsBuildArtifactBindings,
   siteOpsBuildArtifactProjection,
   siteOpsInitialVisualSupersededMayStaySilent,
+  siteOpsRemovedResumeOperation,
   siteOpsSupplementalVisualFailureMayRecover,
   siteOpsVisualOperationCoordinates,
   siteOpsWorkerMayClaimStatus,
@@ -295,6 +296,20 @@ describe("SiteOps worker claim boundary", () => {
     expect(siteOpsWorkerMayClaimStatus("running")).toBe(true);
     expect(siteOpsWorkerMayClaimStatus("cancelled")).toBe(false);
     expect(siteOpsWorkerMayClaimStatus("failed")).toBe(false);
+  });
+
+  it("tombstones historical recover_design_output operations before provider invocation", () => {
+    expect(
+      siteOpsRemovedResumeOperation({
+        resumeMode: "recover_design_output",
+        resumeProviderTaskId: "historical-task",
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsRemovedResumeOperation({
+        intent: "approved_reset_unpublish",
+      }),
+    ).toBe(false);
   });
 
   it("reads V2 visual coordinates and infers historical supplemental operations", () => {

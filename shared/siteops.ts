@@ -175,7 +175,28 @@ export const SITEOPS_MATERIALIZER_V2_3 = {
   qaPolicyVersion: "siteops-qa-v4",
 } as const;
 
-export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_3;
+/** React Static 2.4 removes provider-owned design entirely. Manus returns one
+ * lossy SiteContentDraftV1; Dashboard creates every route, slot, palette and
+ * responsive coordinate, canonicalizes content and owns both the primary and
+ * no-JavaScript trusted fallback renderers. */
+export const SITEOPS_MATERIALIZER_V2_4 = {
+  upstreamVersion: "1.0.0",
+  upstreamSha256:
+    "ca9387c9f0c7915a443e0a11449adf36f35037825d40643d12b9958d2e32856a",
+  frontMindVersion: "2.4.0",
+  runtimeManifestSha256:
+    "0ae65d6c67c85ba3ce92a8d693cd69a60fadbd46a3c369afb0a2ddfd0d1dd206",
+  starterVersion: "2.4.0",
+  starterSha256:
+    "9b1c9a41b28e64aae8531afca48592c317a32484f98a6185ea3245f37296f74b",
+  componentLibraryVersion: "2.4.0",
+  materializerVersion: "2.4.0",
+  materializerSha256:
+    "949477cfc3428d551a85adecf91c75442a9098f89796b3bb52b7253d634be77a",
+  qaPolicyVersion: "siteops-qa-v5",
+} as const;
+
+export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_4;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V1_2.frontMindVersion]: SITEOPS_MATERIALIZER_V1_2,
@@ -187,6 +208,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_1.frontMindVersion]: SITEOPS_MATERIALIZER_V2_1,
   [SITEOPS_MATERIALIZER_V2_2.frontMindVersion]: SITEOPS_MATERIALIZER_V2_2,
   [SITEOPS_MATERIALIZER_V2_3.frontMindVersion]: SITEOPS_MATERIALIZER_V2_3,
+  [SITEOPS_MATERIALIZER_V2_4.frontMindVersion]: SITEOPS_MATERIALIZER_V2_4,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {

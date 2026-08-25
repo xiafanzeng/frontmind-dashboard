@@ -5,6 +5,8 @@ const VENDOR_NAME = /manus/iu;
 const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
 const INFRASTRUCTURE_TERM =
   /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu;
+const FRESH_RESET_MESSAGE =
+  "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。";
 
 export function sanitizeFrontMindPublicText(value: string) {
   if (VENDOR_NAME.test(value)) {
@@ -113,32 +115,42 @@ export function publicSiteOpsErrorProjection(input: {
   ) {
     return {
       code: "FRONTMIND_BUILD_REQUEST_INVALID",
-      message: "FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。",
+      message: FRESH_RESET_MESSAGE,
     };
   }
   if (code === "FRONTMIND_BUILD_ASSET_CONFLICT") {
     return {
       code,
-      message: "FrontMind AI 建站检测到知识资产冲突，请重置后重新开始。",
+      message: FRESH_RESET_MESSAGE,
     };
   }
   if (code === "FRONTMIND_BUILD_COMPILE_FAILED") {
     return {
       code,
-      message: "FrontMind AI 建站未能完成可信网站编译，请重置后重新开始。",
+      message: FRESH_RESET_MESSAGE,
     };
   }
   if (code === "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE") {
     return {
       code,
-      message: "FrontMind AI 建站运行环境暂时不可用，请稍后重试或重置流程。",
+      message:
+        "FrontMind AI 建站运行环境暂时不可用；若任务已经结束，可申请重置，批准后全新开始。",
     };
   }
   if (code === "FRONTMIND_BUILD_OUTPUT_INVALID") {
     return {
       code,
-      message:
-        "FrontMind AI 建站输出未通过结构校验，知识库资料和视觉方案已保留，可继续生成官网。",
+      message: FRESH_RESET_MESSAGE,
+    };
+  }
+  if (
+    /^(?:BUILD_INPUT_UNSAFE|BUILD_CANONICALIZATION_FAILED|BUILD_PRIMARY_RENDER_FAILED|BUILD_FALLBACK_RENDER_FAILED|BUILD_ARTIFACT_PERSIST_FAILED|BUILD_ARTIFACT_BINDING_FAILED)$/u.test(
+      code,
+    )
+  ) {
+    return {
+      code,
+      message: FRESH_RESET_MESSAGE,
     };
   }
   if (
@@ -148,7 +160,7 @@ export function publicSiteOpsErrorProjection(input: {
   ) {
     return {
       code: "FRONTMIND_BUILD_QA_FAILED",
-      message: "FrontMind AI 建站未通过网站构建或质量检查，请重置后重新开始。",
+      message: FRESH_RESET_MESSAGE,
     };
   }
   if (
@@ -164,15 +176,13 @@ export function publicSiteOpsErrorProjection(input: {
   if (/(?:OUTPUT|EXTRACT|CONTENT|DESIGN|VALIDATION)/iu.test(code)) {
     return {
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
-      message:
-        "FrontMind AI 建站输出未通过结构校验，知识库资料和视觉方案已保留，可继续生成官网。",
+      message: FRESH_RESET_MESSAGE,
     };
   }
   if (input.status === "attention_required") {
     return {
       code: "FRONTMIND_BUILD_REQUIRES_ATTENTION",
-      message:
-        "FrontMind AI 建站任务需要处理后才能继续，请稍后重试或重置流程。",
+      message: FRESH_RESET_MESSAGE,
     };
   }
   return {

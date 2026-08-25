@@ -27,7 +27,11 @@ import {
 } from "./providers";
 import { siteOpsQuotaStateForProviderResult } from "./quota-service";
 import { publicSiteOpsProviderResult } from "./public-errors";
-import { completeSiteOpsRebuildTicket } from "./rebuild-ticket";
+import {
+  completeSiteOpsRebuildTicket,
+  finalizeApprovedSiteOpsReset,
+  parseApprovedResetUnpublishInput,
+} from "./rebuild-ticket";
 
 const DEFAULT_LEASE_MS = 2 * 60_000;
 const DEFAULT_TIMEOUT_MS = 90_000;
@@ -77,6 +81,15 @@ const BUILD_ARTIFACT_STORAGE_KIND: Record<BuildArtifactKind, string> = {
 
 function workerArtifactError(code: string) {
   return Object.assign(new Error(code), { code });
+}
+
+function affectedRows(result: unknown) {
+  return Number(
+    (Array.isArray(result)
+      ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+      0,
+  );
 }
 
 export function parseSiteOpsBuildArtifactBindings(
@@ -331,7 +344,7 @@ export function knownSiteOpsBuildFailure(
     message:
       error instanceof Error && error.message.trim()
         ? error.message
-        : "FrontMind AI 建站任务未能安全完成，请重置后重新开始。",
+        : "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
   };
 }
 
@@ -481,11 +494,13 @@ async function claimOne(db: any): Promise<Claimed | null> {
   });
 }
 
-function failureResult(
-  status: "failed" | "attention_required" | "outcome_unknown",
+function failureResult<
+  TStatus extends "failed" | "attention_required" | "outcome_unknown",
+>(
+  status: TStatus,
   code: string,
   message: string,
-): SiteOpsProviderResult {
+): { status: TStatus; code: string; message: string } {
   return { status, code, message };
 }
 
@@ -513,6 +528,13 @@ async function assertClaimLeaseActive(db: any, operation: Claimed) {
 }
 
 async function invokeProvider(db: any, operation: Claimed) {
+  if (siteOpsRemovedResumeOperation(operation.input)) {
+    return failureResult(
+      "failed",
+      "FRONTMIND_BUILD_RESUME_REMOVED",
+      "历史建站恢复任务已停用，请通过批准重置后创建全新任务。",
+    );
+  }
   const handler = getSiteOpsProviderHandler(operation.provider);
   if (!handler) {
     return failureResult(
@@ -562,6 +584,16 @@ async function invokeProvider(db: any, operation: Claimed) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export function siteOpsRemovedResumeOperation(value: unknown) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      (value as Record<string, unknown>).resumeMode ===
+        "recover_design_output",
+  );
 }
 
 async function verifiedBuildArtifactProjection(
@@ -682,8 +714,9 @@ async function finalize(
         });
         finalizedResult = {
           status: "failed",
-          code: "FRONTMIND_BUILD_QA_FAILED",
-          message: "FrontMind AI 建站产物未通过完整性校验，请重置后重新开始。",
+          code: "BUILD_ARTIFACT_BINDING_FAILED",
+          message:
+            "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
           providerTaskId:
             providerResult.providerTaskId ?? locked.providerTaskId ?? undefined,
           result: {
@@ -790,12 +823,56 @@ async function finalize(
         .where(eq(siteDomainOperations.operationId, locked.id));
       return result.status;
     }
+    const approvedReset = parseApprovedResetUnpublishInput(locked.input);
+    if (approvedReset) {
+      let resetResult: Exclude<SiteOpsProviderResult, { status: "pending" }> =
+        result;
+      if (result.status === "succeeded") {
+        const resetFinalization = await finalizeApprovedSiteOpsReset(tx, {
+          operation: locked,
+          now,
+        });
+        if (resetFinalization.status !== "applied") {
+          resetResult = failureResult(
+            "failed",
+            "SITEOPS_RESET_INVALIDATED",
+            "官网重置坐标已变化，系统未清除当前流程。",
+          );
+        }
+      }
+      const resetTerminalUpdate = await tx
+        .update(siteOperations)
+        .set({
+          status: resetResult.status,
+          ...terminalSiteOpsOperationProjection(locked, resetResult),
+          errorCode:
+            resetResult.status === "succeeded" ? null : resetResult.code,
+          errorMessage:
+            resetResult.status === "succeeded" ? null : resetResult.message,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(siteOperations.id, locked.id),
+            eq(siteOperations.leaseOwner, operation.leaseOwner),
+          ),
+        );
+      if (affectedRows(resetTerminalUpdate) !== 1) {
+        throw new Error("SITEOPS_RESET_OPERATION_CAS_CONFLICT");
+      }
+      // This operation has no site_deployments reservation. Its project and
+      // ticket writes are owned exclusively by finalizeApprovedSiteOpsReset.
+      return resetResult.status;
+    }
     const terminalStatus = result.status;
     const preservedTerminalState = terminalSiteOpsOperationProjection(
       locked,
       result,
     );
-    await tx
+    const terminalUpdate = await tx
       .update(siteOperations)
       .set({
         status: terminalStatus,
@@ -813,6 +890,7 @@ async function finalize(
           eq(siteOperations.leaseOwner, operation.leaseOwner),
         ),
       );
+    void terminalUpdate;
 
     if (locked.kind === "visual_search") {
       const projectRows = await tx

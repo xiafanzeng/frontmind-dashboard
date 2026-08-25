@@ -56,6 +56,39 @@ const browserQaMocks = vi.hoisted(() => {
   };
 });
 
+const buildProcessMocks = vi.hoisted(() => ({
+  failNextReactBuild: false,
+}));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const { EventEmitter } = await import("node:events");
+  return {
+    ...actual,
+    spawn: ((...args: Parameters<typeof actual.spawn>) => {
+      const commandArguments = args[1];
+      const isReactRenderer =
+        Array.isArray(commandArguments) &&
+        commandArguments.some(
+          (argument) =>
+            typeof argument === "string" && argument.endsWith("/render.mjs"),
+        );
+      if (!buildProcessMocks.failNextReactBuild || !isReactRenderer) {
+        return actual.spawn(...args);
+      }
+      buildProcessMocks.failNextReactBuild = false;
+      const child = new EventEmitter() as ReturnType<typeof actual.spawn>;
+      Object.assign(child, {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        kill: vi.fn(() => true),
+      });
+      queueMicrotask(() => child.emit("exit", 1, null));
+      return child;
+    }) as typeof actual.spawn,
+  };
+});
+
 vi.mock("playwright", () => ({
   chromium: {
     executablePath: () => "/frontmind-test/chromium",
@@ -87,6 +120,7 @@ import {
   SITEOPS_MATERIALIZER_V1_6,
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_2,
+  SITEOPS_MATERIALIZER_V2_3,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import {
@@ -793,6 +827,48 @@ async function legacyReactV2_2Source() {
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+async function legacyReactV2_3Source() {
+  const input = buildInput();
+  const frozen = siteOpsFrozenRuntimeInputSchema.parse({
+    schemaVersion: 2,
+    build: {
+      ...input.build,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_3.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_3.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_3.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_3.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_3.starterVersion,
+    },
+    host: {
+      starterSha256: SITEOPS_MATERIALIZER_V2_3.starterSha256,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_3.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_3.materializerVersion,
+      materializerSha256: SITEOPS_MATERIALIZER_V2_3.materializerSha256,
+      renderer: "react_static_v2",
+    },
+    snapshot: {
+      id: input.snapshot.id,
+      userId: input.snapshot.userId,
+      archiveHash: input.snapshot.archiveHash,
+      sourceBuildId: input.snapshot.sourceBuildId,
+      sourceBuildRevision: input.snapshot.sourceBuildRevision,
+      sourceDocumentIds: input.snapshot.documents.map(
+        (document) => document.id,
+      ),
+    },
+    brief: input.brief,
+    visual: input.visual,
+    designSpec: input.designSpec,
+    generatedContent: input.generatedContent,
+    assetDecisions: [],
+    brandAsset: null,
+  });
+  const zip = new JSZip();
+  zip.file("frontmind-runtime-input.json", `${JSON.stringify(frozen)}\n`);
+  return zip.generateAsync({ type: "nodebuffer" });
+}
+
 describe("SiteOps trusted React 19 static runtime", () => {
   let previewBuild: Awaited<ReturnType<typeof materializeAstroSite>>;
   let officialLogo: Buffer;
@@ -891,8 +967,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       renderer: {
         kind: "react_static_v2",
         reactVersion: "19.2.1",
-        componentLibraryVersion: "2.3.0",
-        materializerVersion: "2.3.0",
+        componentLibraryVersion: "2.4.0",
+        materializerVersion: "2.4.0",
       },
       content: {
         schemaVersion: 2,
@@ -1058,8 +1134,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       const language = visualLanguages[family];
 
       expect(manifest).toMatchObject({
-        componentLibraryVersion: "2.3.0",
-        materializerVersion: "2.3.0",
+        componentLibraryVersion: "2.4.0",
+        materializerVersion: "2.4.0",
         heroFamily: family,
         referenceBlueprint: {
           schemaVersion: 4,
@@ -1109,8 +1185,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       expect(built.contract).toMatchObject({
         schemaVersion: 4,
         renderer: {
-          componentLibraryVersion: "2.3.0",
-          materializerVersion: "2.3.0",
+          componentLibraryVersion: "2.4.0",
+          materializerVersion: "2.4.0",
         },
         referenceBlueprint: {
           heroFamily: family,
@@ -1335,27 +1411,146 @@ describe("SiteOps trusted React 19 static runtime", () => {
     );
     expect(css).toContain(".source-note{color:var(--ink)");
     expect(css).toContain(
-      ".section--cta .source-note,.section--cta .section-index{color:var(--canvas)}",
+      ".section--cta .source-note,.section--cta .section-index{color:var(--inverse-text)}",
     );
+    const semanticVariables = Object.fromEntries(
+      [
+        ...css.matchAll(
+          /--(accent-text|inverse-surface|inverse-text|border|focus):(#[A-Fa-f0-9]{6})/gu,
+        ),
+      ].map((match) => [match[1], match[2]]),
+    ) as Record<string, string>;
+    expect(
+      ratio(semanticVariables["accent-text"]!, variables.accent),
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      ratio(
+        semanticVariables["inverse-text"]!,
+        semanticVariables["inverse-surface"]!,
+      ),
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      ratio(semanticVariables.focus!, variables.canvas),
+    ).toBeGreaterThanOrEqual(3);
     expect(css).not.toMatch(/\.source-note\{[^}]*opacity/gu);
   }, 90_000);
 
-  it("fails closed when the browser QA runtime is unavailable", async () => {
+  it("keeps the private preview when the browser QA runtime is unavailable", async () => {
     browserQaMocks.browserLaunch.mockRejectedValueOnce(
       new Error("TEST_BROWSER_QA_UNAVAILABLE"),
     );
-    try {
-      await materializeAstroSite(buildInput());
-      throw new Error("TEST_EXPECTED_MATERIALIZATION_REJECTION");
-    } catch (error) {
-      expect(error).toBeInstanceOf(SiteOpsMaterializationError);
-      expect(error).toMatchObject({
-        phase: "browser_qa",
-        code: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
-        retryClass: "host_transient",
-        safeDetails: {},
-      });
-    }
+    const built = await materializeAstroSite(buildInput());
+    const qa = JSON.parse(built.qaJson.toString("utf8"));
+    expect(built.buildDelivery).toEqual({
+      renderMode: "primary",
+      qaStatus: "partial",
+      warningCodes: ["SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE"],
+    });
+    expect(qa).toMatchObject({
+      passed: true,
+      browser: { available: false, axeViolationCount: 0 },
+      buildDelivery: built.buildDelivery,
+      warnings: [
+        {
+          phase: "browser_qa",
+          code: "SITEOPS_BROWSER_QA_RUNTIME_UNAVAILABLE",
+          checkId: "browser-qa:runtime",
+        },
+      ],
+    });
+    expect(built.files.get("index.html")?.toString("utf8")).toContain(
+      "星河智造",
+    );
+  }, 90_000);
+
+  it("reports production-shaped Axe contrast findings without discarding the preview", async () => {
+    browserQaMocks.axeAnalyze.mockResolvedValueOnce({
+      violations: [{ id: "color-contrast", impact: "serious" }],
+    });
+    const built = await materializeAstroSite(buildInput());
+    const qa = JSON.parse(built.qaJson.toString("utf8"));
+    expect(built.buildDelivery).toEqual({
+      renderMode: "primary",
+      qaStatus: "passed_with_warnings",
+      warningCodes: ["SITEOPS_AXE_BLOCKING_VIOLATIONS"],
+    });
+    expect(qa.browser).toMatchObject({
+      available: true,
+      axeViolationCount: 1,
+      axeViolationIds: ["color-contrast"],
+    });
+    expect(qa.warnings).toContainEqual({
+      phase: "browser_qa",
+      code: "SITEOPS_AXE_BLOCKING_VIOLATIONS",
+      checkId: "axe:color-contrast",
+    });
+    expect(built.files.has("index.html")).toBe(true);
+  }, 90_000);
+
+  it("reports Lighthouse and CLS thresholds as non-blocking warnings", async () => {
+    browserQaMocks.lighthouse.mockResolvedValueOnce({
+      lhr: {
+        categories: {
+          performance: { score: 0.8 },
+          accessibility: { score: 0.94 },
+          "best-practices": { score: 0.89 },
+          seo: { score: 0.94 },
+        },
+        audits: {
+          "cumulative-layout-shift": { numericValue: 0.12, score: 0.5 },
+        },
+      },
+    });
+    const built = await materializeAstroSite(buildInput());
+    const qa = JSON.parse(built.qaJson.toString("utf8"));
+    expect(built.buildDelivery.qaStatus).toBe("passed_with_warnings");
+    expect(built.buildDelivery.warningCodes).toEqual([
+      "SITEOPS_LIGHTHOUSE_THRESHOLD_FAILED",
+    ]);
+    expect(qa.browser.lighthouse).toMatchObject({
+      performance: 80,
+      accessibility: 94,
+      bestPractices: 89,
+      seo: 94,
+      cls: 0.12,
+    });
+    expect(qa.warnings).toContainEqual({
+      phase: "lighthouse",
+      code: "SITEOPS_LIGHTHOUSE_THRESHOLD_FAILED",
+      checkId: "lighthouse:threshold",
+    });
+    expect(built.files.has("index.html")).toBe(true);
+  }, 90_000);
+
+  it("uses the trusted no-JavaScript fallback when the primary React renderer fails", async () => {
+    buildProcessMocks.failNextReactBuild = true;
+    const built = await materializeAstroSite(buildInput());
+    expect(built.buildDelivery).toEqual({
+      renderMode: "trusted_fallback",
+      qaStatus: "partial",
+      warningCodes: ["SITEOPS_REACT_STATIC_BUILD_FAILED"],
+    });
+    const source = await JSZip.loadAsync(built.sourceZip, { checkCRC32: true });
+    expect(source.file("frontmind-trusted-fallback.json")).not.toBeNull();
+    const dist = await JSZip.loadAsync(built.distZip, { checkCRC32: true });
+    const home = await dist.file("index.html")!.async("string");
+    expect(home).toContain("星河智造");
+    expect(home).toContain('data-hero-family="floating_orbit"');
+    expect(home).not.toContain("<script");
+    expect(Object.keys(dist.files).some((name) => /\.m?js$/u.test(name))).toBe(
+      false,
+    );
+    expect(JSON.parse(built.qaJson.toString("utf8"))).toMatchObject({
+      passed: true,
+      buildDelivery: built.buildDelivery,
+      warnings: [
+        {
+          phase: "react_static_build",
+          code: "SITEOPS_REACT_STATIC_BUILD_FAILED",
+          checkId: "primary-render:fallback",
+        },
+      ],
+    });
   }, 90_000);
 
   it("emits exact production discovery metadata without false hreflang", async () => {
@@ -1398,8 +1593,8 @@ describe("SiteOps trusted React 19 static runtime", () => {
       schemaVersion: 4,
       renderer: {
         kind: "react_static_v2",
-        componentLibraryVersion: "2.3.0",
-        materializerVersion: "2.3.0",
+        componentLibraryVersion: "2.4.0",
+        materializerVersion: "2.4.0",
       },
       content: {
         schemaVersion: 2,
@@ -1574,6 +1769,38 @@ describe("SiteOps trusted React 19 static runtime", () => {
     expect(await dist.file("index.html")!.async("string")).toContain(
       'rel="canonical" href="https://react22.xinghe.example/"',
     );
+  }, 90_000);
+
+  it("keeps historical 2.3 product CSS on its frozen pre-2.4 materializer", async () => {
+    const sourceZip = await legacyReactV2_3Source();
+    const rebuilt = await materializeProductionSiteFromSource({
+      sourceZip,
+      expectedSourceSha256: H(sourceZip),
+      canonicalOrigin: "https://react23.xinghe.example",
+      target: "global_excluding_cn",
+    });
+    const contract = JSON.parse(rebuilt.contractJson.toString("utf8"));
+    expect(contract).toMatchObject({
+      workflow: {
+        version: "2.3.0",
+        componentLibraryVersion: "2.3.0",
+        materializerVersion: "2.3.0",
+      },
+      renderer: {
+        kind: "react_static_v2",
+        componentLibraryVersion: "2.3.0",
+        materializerVersion: "2.3.0",
+      },
+    });
+    const source = await JSZip.loadAsync(rebuilt.sourceZip, {
+      checkCRC32: true,
+    });
+    const css = await source.file("public/styles.css")!.async("string");
+    expect(css).toContain(
+      "color-mix(in srgb,var(--ink) 22%,transparent)",
+    );
+    expect(css).not.toContain("--accent-text:");
+    expect(css).not.toContain("--inverse-surface:");
   }, 90_000);
 
   it("stops production materialization when the deployment signal is aborted", async () => {

@@ -19,6 +19,8 @@ import {
   SITEOPS_MATERIALIZER_V2_0,
   SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_MATERIALIZER_V2_2,
+  SITEOPS_MATERIALIZER_V2_3,
+  SITEOPS_MATERIALIZER_V2_4,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   visualEvidenceV1Schema,
@@ -31,6 +33,7 @@ import {
   type VisualSelectionBundleV3,
   type VisualSelectionBundleV4,
 } from "../../shared/siteops";
+import { createHostOwnedSiteDesignResultV2 } from "../../shared/siteops-host-design";
 import {
   managedAgentProfileModel,
   managedAgentProfileSchema,
@@ -101,6 +104,7 @@ import {
   siteOpsSocialSourceAttachment,
   siteOpsSourceDossierAttachments,
   socialWireOutputSchema,
+  assertSiteOpsStructuredOutputSchema,
 } from "./manus-wire-contract";
 import {
   resolveSiteOpsWireOutput,
@@ -108,6 +112,11 @@ import {
   SiteOpsWireOutputResolutionError,
   type SiteOpsWireOutputPhase,
 } from "./manus-wire-output-resolver";
+import {
+  canonicalizeSiteContentDraft,
+  canonicalPreviewToGeneratedContent,
+  draftFromPageContentWire,
+} from "./site-content-draft";
 import { terminalTaskState } from "./task-terminal-state";
 
 export { terminalTaskState } from "./task-terminal-state";
@@ -126,9 +135,6 @@ const operationInputSchema = z
     packageId: z.string().uuid().optional(),
     topic: z.string().trim().max(500).optional(),
     referenceBlueprint: referenceBlueprintSchema.optional(),
-    resumeSourceOperationId: z.string().uuid().optional(),
-    resumeProviderTaskId: z.string().min(1).max(512).optional(),
-    resumeMode: z.literal("recover_design_output").optional(),
   })
   .passthrough();
 
@@ -190,6 +196,7 @@ const providerStateV1Schema = z
     resultPendingSince: z.string().datetime().optional(),
     handledWaitingEventId: z.string().min(1).max(512).optional(),
     handledWaitingAt: z.string().datetime().optional(),
+    providerDraftUnavailable: z.boolean().optional(),
   })
   .strict();
 
@@ -231,11 +238,18 @@ type ProviderState = z.infer<typeof providerStateSchema>;
 type ProviderStateV2 = z.infer<typeof providerStateV2Schema>;
 
 type ManusBuildLogStage =
+  | "wire_intake"
+  | "wire_repaired"
   | "wire_resolution"
   | "wire_validation"
   | "wire_normalized"
+  | "content_canonicalized"
+  | "palette_normalized"
+  | "primary_render"
+  | "fallback_render"
   | "repair_scheduled"
-  | "build_resumed"
+  | "qa_completed"
+  | "preview_persisted"
   | "build_preview_ready";
 
 function logManusBuildStage(input: {
@@ -252,6 +266,9 @@ function logManusBuildStage(input: {
   reason?: string;
   signature?: string;
   latencyMs?: number;
+  renderMode?: "primary" | "trusted_fallback";
+  qaStatus?: "passed" | "passed_with_warnings" | "partial";
+  warningCount?: number;
 }) {
   const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
   console.info("[siteops-manus] build_stage", {
@@ -273,6 +290,11 @@ function logManusBuildStage(input: {
     ...(input.reason ? { reason: input.reason } : {}),
     ...(input.signature ? { signature: input.signature } : {}),
     ...(input.latencyMs !== undefined ? { latencyMs: input.latencyMs } : {}),
+    ...(input.renderMode ? { renderMode: input.renderMode } : {}),
+    ...(input.qaStatus ? { qaStatus: input.qaStatus } : {}),
+    ...(input.warningCount !== undefined
+      ? { warningCount: input.warningCount }
+      : {}),
     releaseSha: /^[a-f0-9]{40}$/u.test(release) ? release : null,
   });
 }
@@ -305,6 +327,7 @@ function providerStateV2(state: ProviderState | null): ProviderStateV2 {
     resultPendingSince: state?.resultPendingSince,
     handledWaitingEventId: state?.handledWaitingEventId,
     handledWaitingAt: state?.handledWaitingAt,
+    providerDraftUnavailable: state?.providerDraftUnavailable,
     attempts,
   });
 }
@@ -352,7 +375,7 @@ class SiteOpsManusFailure extends Error {
 }
 
 const SAFE_MATERIALIZATION_DETAIL_KEY =
-  /^(?:durationMs|assetDecisionCount|publishedCount|omittedCount|omittedDuplicateCount|quarantineCount|exitCode|signal|performance|accessibility|bestPractices|seo|cls|axeViolationCount|axeViolationIds|failedAuditIds|localRetryCount)$/u;
+  /^(?:durationMs|assetDecisionCount|publishedCount|omittedCount|omittedDuplicateCount|quarantineCount|exitCode|signal|performance|accessibility|bestPractices|seo|cls|axeViolationCount|axeViolationIds|failedAuditIds|localRetryCount|checkId)$/u;
 
 function untypedMaterializationCode(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");
@@ -443,8 +466,8 @@ function publicMaterializationFailure(
   if (error.retryClass === "host_transient") {
     return {
       status: "failed",
-      code: "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE",
-      message: "FrontMind AI 建站运行环境暂时不可用，请稍后重试或重置流程。",
+      code: "BUILD_FALLBACK_RENDER_FAILED",
+      message: "主渲染与可信基础模板均未能完成，请申请重置并全新开始。",
       providerTaskId: taskId,
       result: diagnostics,
     };
@@ -452,8 +475,8 @@ function publicMaterializationFailure(
   if (error.phase === "asset_projection") {
     return {
       status: "failed",
-      code: "FRONTMIND_BUILD_ASSET_CONFLICT",
-      message: "FrontMind AI 建站检测到知识资产冲突，请重置后重新开始。",
+      code: "BUILD_INPUT_UNSAFE",
+      message: "冻结输入包含无法安全发布的资产，请申请重置并全新开始。",
       providerTaskId: taskId,
       result: diagnostics,
     };
@@ -461,16 +484,28 @@ function publicMaterializationFailure(
   if (["astro_build", "react_static_build"].includes(String(error.phase))) {
     return {
       status: "failed",
-      code: "FRONTMIND_BUILD_COMPILE_FAILED",
-      message: "FrontMind AI 建站未能完成可信网站编译，请重置后重新开始。",
+      code: "BUILD_FALLBACK_RENDER_FAILED",
+      message: "主渲染与可信基础模板均未能完成，请申请重置并全新开始。",
+      providerTaskId: taskId,
+      result: diagnostics,
+    };
+  }
+  if (error.phase === "artifact_persistence") {
+    const bindingFailure = /(?:HASH_MISMATCH|BINDING)/u.test(error.code);
+    return {
+      status: "failed",
+      code: bindingFailure
+        ? "BUILD_ARTIFACT_BINDING_FAILED"
+        : "BUILD_ARTIFACT_PERSIST_FAILED",
+      message: "预览产物保存或摘要校验失败，请申请重置并全新开始。",
       providerTaskId: taskId,
       result: diagnostics,
     };
   }
   return {
     status: "failed",
-    code: "FRONTMIND_BUILD_QA_FAILED",
-    message: "FrontMind AI 建站未通过网站质量检查，请重置后重新开始。",
+    code: "BUILD_INPUT_UNSAFE",
+    message: "冻结输入未通过安全校验，请申请重置并全新开始。",
     providerTaskId: taskId,
     result: diagnostics,
   };
@@ -528,10 +563,22 @@ function reactStaticRendererCoordinates(
       materializerVersion: SITEOPS_MATERIALIZER_V2_2.materializerVersion,
     } as const;
   }
-  if (workflow.frontMindVersion === SITEOPS_WORKFLOW.frontMindVersion) {
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_3.frontMindVersion
+  ) {
     return {
-      componentLibraryVersion: SITEOPS_WORKFLOW.componentLibraryVersion,
-      materializerVersion: SITEOPS_WORKFLOW.materializerVersion,
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_3.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_3.materializerVersion,
+    } as const;
+  }
+  if (
+    workflow.frontMindVersion === SITEOPS_MATERIALIZER_V2_4.frontMindVersion
+  ) {
+    return {
+      componentLibraryVersion:
+        SITEOPS_MATERIALIZER_V2_4.componentLibraryVersion,
+      materializerVersion: SITEOPS_MATERIALIZER_V2_4.materializerVersion,
     } as const;
   }
   throw new SiteOpsManusFailure(
@@ -544,8 +591,18 @@ function reactStaticRendererCoordinates(
 export function usesBuildPlanContractV4(workflowVersion: string) {
   return (
     workflowVersion === SITEOPS_MATERIALIZER_V2_2.frontMindVersion ||
+    workflowVersion === SITEOPS_MATERIALIZER_V2_3.frontMindVersion ||
+    workflowVersion === SITEOPS_MATERIALIZER_V2_4.frontMindVersion ||
     workflowVersion === SITEOPS_WORKFLOW.frontMindVersion
   );
+}
+
+/** Workflow 2.4 removes provider-owned design coordinates. The host accepts a
+ * deliberately lossy content draft and deterministically fills every frozen
+ * route and slot from trusted input. Keep the explicit version boundary so
+ * historical 2.3 tasks retain their immutable two-phase contract. */
+export function usesHostOwnedContentDraft(workflowVersion: string) {
+  return workflowVersion === SITEOPS_MATERIALIZER_V2_4.frontMindVersion;
 }
 
 export async function loadVerifiedSiteOpsWorkflowPackage(
@@ -1343,6 +1400,69 @@ function generatedContentOutputSchema(
     : pageContentWireOutputSchema(input);
 }
 
+function siteContentDraftOutputSchema(input: {
+  operationToken: string;
+  routeIds: readonly string[];
+  sourceDocumentIds: readonly string[];
+}) {
+  const nullableString = {
+    anyOf: [{ type: "string" }, { type: "null" }],
+  } as const;
+  return assertSiteOpsStructuredOutputSchema({
+    type: "object",
+    properties: {
+      operationToken: { type: "string", enum: [input.operationToken] },
+      routes: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string", enum: [...input.routeIds] },
+            heading: nullableString,
+            summary: nullableString,
+          },
+          required: ["routeId", "heading", "summary"],
+          additionalProperties: false,
+        },
+      },
+      // Manus structured output is limited to five schema levels. Keep the
+      // provider transport flat, then project these records into the nested
+      // host-only SiteContentDraftV1 before canonicalization.
+      sections: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            routeId: { type: "string", enum: [...input.routeIds] },
+            heading: nullableString,
+            paragraphs: { type: "array", items: { type: "string" } },
+            bullets: { type: "array", items: { type: "string" } },
+            sourceIds: {
+              type: "array",
+              items: {
+                type: "string",
+                ...(input.sourceDocumentIds.length > 0
+                  ? { enum: [...input.sourceDocumentIds] }
+                  : {}),
+              },
+            },
+          },
+          required: [
+            "routeId",
+            "heading",
+            "paragraphs",
+            "bullets",
+            "sourceIds",
+          ],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["operationToken", "routes", "sections"],
+    additionalProperties: false,
+  });
+}
+
 function socialOutputSchema(
   token: string,
   channel: "wechat" | "xiaohongshu",
@@ -1426,71 +1546,6 @@ async function loadBuildContext(db: any, operation: SiteOperation) {
     );
   }
   return context;
-}
-
-async function loadResumeDesignCoordinate(input: {
-  db: any;
-  operation: SiteOperation;
-  frozenInput: z.infer<typeof operationInputSchema>;
-}) {
-  if (input.frozenInput.resumeMode !== "recover_design_output") return null;
-  if (
-    !input.frozenInput.resumeSourceOperationId ||
-    !input.frozenInput.resumeProviderTaskId ||
-    input.operation.providerTaskId !== input.frozenInput.resumeProviderTaskId ||
-    !input.operation.buildId
-  ) {
-    throw new SiteOpsManusFailure(
-      "FRONTMIND_BUILD_RESUME_COORDINATE_INVALID",
-      "保留的建站恢复坐标不完整。",
-      "failed",
-    );
-  }
-  const source = await input.db.transaction(async (tx: any) => {
-    const rows = await tx
-      .select()
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.id, input.frozenInput.resumeSourceOperationId!),
-          eq(siteOperations.userId, input.operation.userId),
-          eq(siteOperations.projectId, input.operation.projectId),
-          eq(siteOperations.buildId, input.operation.buildId!),
-          eq(siteOperations.provider, "manus"),
-          inArray(siteOperations.kind, ["site_build", "build_revision"]),
-          eq(
-            siteOperations.providerTaskId,
-            input.frozenInput.resumeProviderTaskId!,
-          ),
-          inArray(siteOperations.status, ["failed", "attention_required"]),
-          eq(siteOperations.errorCode, "FRONTMIND_BUILD_OUTPUT_INVALID"),
-        ),
-      )
-      .limit(1)
-      .for("update");
-    return rows[0] ?? null;
-  });
-  if (!source) {
-    throw new SiteOpsManusFailure(
-      "FRONTMIND_BUILD_RESUME_SOURCE_INVALID",
-      "原建站任务已变化，无法安全继续。",
-      "failed",
-    );
-  }
-  const sourceState = stateFromOperation(source);
-  const repairAttempt =
-    sourceState?.repairKind === "design" ? sourceState.repairAttempt : null;
-  const repairCategory =
-    sourceState?.schemaVersion === 2 ? sourceState.repairCategory : undefined;
-  const operationToken = repairAttempt
-    ? repairCategory
-      ? `siteops-repair:${source.id}:design:${repairCategory}:${repairAttempt}`
-      : `siteops-repair:${source.id}:design:${repairAttempt}`
-    : `siteops-design:${source.id}`;
-  return {
-    operationToken,
-    providerTaskId: input.frozenInput.resumeProviderTaskId,
-  };
 }
 
 async function assertFrozenCredential(
@@ -1660,6 +1715,29 @@ async function resolveBuildWireValue(input: {
     const resolved = await resolveSiteOpsWireOutput(input);
     if (resolved) {
       logManusBuildStage({
+        stage: "wire_intake",
+        operationId: input.operationId,
+        buildId: input.buildId,
+        phase: input.phase,
+        source: resolved.source,
+        byteCount: resolved.byteCount,
+        candidateSha256: resolved.sha256,
+        latencyMs: Date.now() - startedAt,
+      });
+      if (resolved.normalizations.length > 0) {
+        logManusBuildStage({
+          stage: "wire_repaired",
+          operationId: input.operationId,
+          buildId: input.buildId,
+          phase: input.phase,
+          source: resolved.source,
+          byteCount: resolved.byteCount,
+          candidateSha256: resolved.sha256,
+          reason: resolved.normalizations.slice().sort().join(","),
+          latencyMs: Date.now() - startedAt,
+        });
+      }
+      logManusBuildStage({
         stage: "wire_resolution",
         operationId: input.operationId,
         buildId: input.buildId,
@@ -1675,6 +1753,7 @@ async function resolveBuildWireValue(input: {
       candidateSha256: resolved?.sha256 ?? null,
       candidateByteCount: resolved?.byteCount ?? null,
       source: resolved?.source ?? null,
+      normalizations: resolved?.normalizations ?? [],
       invalid: false as const,
       invalidCode: null,
       validationError: null,
@@ -1697,6 +1776,7 @@ async function resolveBuildWireValue(input: {
           candidateSha256: null,
           candidateByteCount: null,
           source: null,
+          normalizations: [],
           invalid: false as const,
           invalidCode: error.code,
           validationError: error.validationError ?? null,
@@ -1719,6 +1799,7 @@ async function resolveBuildWireValue(input: {
         candidateSha256: null,
         candidateByteCount: null,
         source: null,
+        normalizations: [],
         invalid: true as const,
         invalidCode: error.code,
         validationError: error.validationError ?? null,
@@ -2208,7 +2289,8 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
       return {
         status: "failed",
         code: "FRONTMIND_BUILD_REQUEST_INVALID",
-        message: "FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。",
+        message:
+          "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
         result: {
           schemaVersion: 1,
           stage:
@@ -2235,7 +2317,8 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
   return {
     status: "failed",
     code: "FRONTMIND_BUILD_FAILED",
-    message: "FrontMind AI 建站任务未能安全完成，请重置后重新开始。",
+    message:
+      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
   };
 }
 
@@ -2269,6 +2352,19 @@ export function createManusSiteOpsProviderHandler(
         signal.throwIfAborted();
       };
       await assertExecutionActive();
+      if (
+        operation.input &&
+        typeof operation.input === "object" &&
+        !Array.isArray(operation.input) &&
+        (operation.input as Record<string, unknown>).resumeMode ===
+          "recover_design_output"
+      ) {
+        throw new SiteOpsManusFailure(
+          "FRONTMIND_BUILD_RESUME_REMOVED",
+          "历史建站恢复已停用；请通过批准重置后的全新任务重新生成。",
+          "failed",
+        );
+      }
       const db = await dbGetter();
       if (!db)
         throw new SiteOpsManusFailure(
@@ -2522,19 +2618,6 @@ export function createManusSiteOpsProviderHandler(
           "Manus SiteOps 适配器不支持该操作。",
           "failed",
         );
-      const resumeCoordinate = await loadResumeDesignCoordinate({
-        db,
-        operation,
-        frozenInput: input,
-      });
-      if (resumeCoordinate) {
-        logManusBuildStage({
-          stage: "build_resumed",
-          operationId: operation.id,
-          buildId: operation.buildId!,
-          phase: "design",
-        });
-      }
       const context = await loadBuildContext(db, operation);
       const archiveBytes = await readArchive({
         userId: operation.userId,
@@ -2656,6 +2739,9 @@ export function createManusSiteOpsProviderHandler(
       );
       const workflow = siteOpsWorkflowForVersion(context.build.workflowVersion);
       const reactStatic = workflow.frontMindVersion.startsWith("2.");
+      const hostOwnedContentDraft = usesHostOwnedContentDraft(
+        workflow.frontMindVersion,
+      );
       const emptyRouteIds = usesBuildPlanContractV4(workflow.frontMindVersion)
         ? hostEmptyCandidates
         : [];
@@ -2678,7 +2764,9 @@ export function createManusSiteOpsProviderHandler(
       const contentOutputFilename = usesBuildPlanContractV4(
         workflow.frontMindVersion,
       )
-        ? SITEOPS_WIRE_OUTPUT_FILES.contentV3
+        ? usesHostOwnedContentDraft(workflow.frontMindVersion)
+          ? SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1
+          : SITEOPS_WIRE_OUTPUT_FILES.contentV3
         : SITEOPS_WIRE_OUTPUT_FILES.content;
       const referenceBlueprint = referenceBlueprintSchema.safeParse(
         input.referenceBlueprint,
@@ -2752,9 +2840,28 @@ export function createManusSiteOpsProviderHandler(
               : undefined,
           })
         : siteOpsRuntimeVisualEvidenceV1Schema.parse(visualEvidenceInput);
-      const designToken =
-        resumeCoordinate?.operationToken ?? `siteops-design:${operation.id}`;
       const contentToken = `siteops-content:${operation.id}`;
+      const designToken = hostOwnedContentDraft
+        ? contentToken
+        : `siteops-design:${operation.id}`;
+      const hostOwnedDesign = hostOwnedContentDraft
+        ? createHostOwnedSiteDesignResultV2({
+            operationToken: contentToken,
+            brief,
+            referenceBlueprint:
+              referenceBlueprint.success &&
+              referenceBlueprint.data.schemaVersion === 4
+                ? referenceBlueprint.data
+                : (() => {
+                    throw new SiteOpsManusFailure(
+                      "VISUAL_REFERENCE_BLUEPRINT_MISMATCH",
+                      "冻结的视觉构图合同无效，请重新选择视觉方向。",
+                      "failed",
+                    );
+                  })(),
+            taxonomy,
+          })
+        : null;
       const parseDesignCandidate = (value: unknown) => {
         const parsed =
           reactStatic && referenceBlueprint.success
@@ -2804,7 +2911,6 @@ export function createManusSiteOpsProviderHandler(
       };
       let taskId =
         state?.taskId ??
-        resumeCoordinate?.providerTaskId ??
         operation.providerTaskId ??
         undefined;
 
@@ -2817,14 +2923,18 @@ export function createManusSiteOpsProviderHandler(
           );
           if (!found)
             return pending(
-              transitionProviderState(state, { stage: "create_unknown" }),
+              transitionProviderState(state, {
+                stage: "create_unknown",
+                ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
+              }),
               undefined,
-              "design_compiling",
+              hostOwnedContentDraft ? "building" : "design_compiling",
             );
           taskId = found.id;
-          const designPendingState = transitionProviderState(state, {
-            stage: "design_pending",
+          const taskPendingState = transitionProviderState(state, {
+            stage: hostOwnedContentDraft ? "content_pending" : "design_pending",
             taskId,
+            ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
           });
           try {
             await bindCreatedBuildTask({
@@ -2832,7 +2942,7 @@ export function createManusSiteOpsProviderHandler(
               operation,
               buildId: context.build.id,
               taskId,
-              state: designPendingState,
+              state: taskPendingState,
             });
           } catch (error) {
             const code = error instanceof Error ? error.message : "";
@@ -2846,12 +2956,19 @@ export function createManusSiteOpsProviderHandler(
               );
             }
             return pending(
-              transitionProviderState(state, { stage: "create_unknown" }),
+              transitionProviderState(state, {
+                stage: "create_unknown",
+                ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
+              }),
               undefined,
-              "design_compiling",
+              hostOwnedContentDraft ? "building" : "design_compiling",
             );
           }
-          return pending(designPendingState, taskId, "design_compiling");
+          return pending(
+            taskPendingState,
+            taskId,
+            hostOwnedContentDraft ? "building" : "design_compiling",
+          );
         } else {
           const workflowPackage =
             await loadVerifiedSiteOpsWorkflowPackage(workflow);
@@ -2950,13 +3067,16 @@ export function createManusSiteOpsProviderHandler(
             )),
           ];
           const prompt = promptWithMarker(
-            reactStatic
-              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，selected-reference.png（若附加）是与该方案一对一绑定的真实视觉灵感参考；二者都不是客户网站素材。请返回 SiteDesignWireV3：只为 provider-owned route 输出按冻结顺序分组且唯一的 routeSlots；${emptyRouteIds.length ? `不得返回 Dashboard 自有空状态 route：${emptyRouteIds.join(",")}；` : ""}缺少模型区块时为该 route 返回 overview/statement。使用结构化合同允许的调色板索引；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
-              : `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${workflow.frontMindVersion}，并只使用冻结 SiteBrief、视觉证据和知识来源。请返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本、21st 代码或未知事实。`,
+            hostOwnedContentDraft
+              ? `你是 FrontMind 官网内容编辑。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}；frontmind-siteops-source-dossier-v1.json 是唯一事实来源。Dashboard 已冻结全部 route、路径、slot、组件、响应式布局、调色板和空状态；你不得输出或控制这些设计坐标。只返回 SiteContentDraftV1 的扁平传输：routes 只含 routeId、heading、summary；sections 是独立数组，每项只含 routeId、heading、paragraphs、bullets、sourceIds。每个事实 section 仅引用所附 source dossier 中真实存在的 sourceIds。${emptyRouteIds.length ? `不得返回宿主空状态 route：${emptyRouteIds.join(",")}；` : ""}不得输出 HTML、CSS、JavaScript、文件路径、组件名、外部资源 URL、调色板、未知事实或解释性长文。把完全相同的 JSON 对象附加为 ${contentOutputFilename}；即使资料不足也返回可验证的空 routes 与 sections 数组，Dashboard 会从冻结资料生成基础预览。`
+              : reactStatic
+                ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，selected-reference.png（若附加）是与该方案一对一绑定的真实视觉灵感参考；二者都不是客户网站素材。请返回 SiteDesignWireV3：只为 provider-owned route 输出按冻结顺序分组且唯一的 routeSlots；${emptyRouteIds.length ? `不得返回 Dashboard 自有空状态 route：${emptyRouteIds.join(",")}；` : ""}缺少模型区块时为该 route 返回 overview/statement。使用结构化合同允许的调色板索引；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
+                : `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${workflow.frontMindVersion}，并只使用冻结 SiteBrief、视觉证据和知识来源。请返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本、21st 代码或未知事实。`,
             designToken,
           );
           const createUnknownState = transitionProviderState(state, {
             stage: "create_unknown",
+            ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
           });
           await persistOperationProgress(db, operation, createUnknownState);
           try {
@@ -2967,33 +3087,54 @@ export function createManusSiteOpsProviderHandler(
               attachments: visualAttachments,
               locale: brief.primaryLanguage,
               agentProfile: managedAgentProfileModel(input.agentProfile),
-              structuredOutputSchema: designOutputSchema(
-                designToken,
-                providerRouteIds,
-                taxonomy.palette.length,
-                reactStatic ? "react_static" : "legacy_astro",
-              ),
+              structuredOutputSchema: hostOwnedContentDraft
+                ? siteContentDraftOutputSchema({
+                    operationToken: contentToken,
+                    routeIds: providerRouteIds,
+                    sourceDocumentIds: documents.map((document) => document.id),
+                  })
+                : designOutputSchema(
+                    designToken,
+                    providerRouteIds,
+                    taxonomy.palette.length,
+                    reactStatic ? "react_static" : "legacy_astro",
+                  ),
             });
             taskId = created.taskId;
           } catch (error) {
             if (error instanceof ManusV2ApiError && error.outcomeUnknown)
-              return pending(createUnknownState, undefined, "design_compiling");
-            throw error;
+              return pending(
+                createUnknownState,
+                undefined,
+                hostOwnedContentDraft ? "building" : "design_compiling",
+              );
+            if (!hostOwnedContentDraft || !(error instanceof ManusV2ApiError)) {
+              throw error;
+            }
+            taskId = `frontmind-host-fallback:${operation.id}`;
+            logManusBuildStage({
+              stage: "wire_resolution",
+              operationId: operation.id,
+              buildId: context.build.id,
+              phase: "content",
+              reason: "provider_draft_unavailable",
+            });
           }
-          const designPendingState = transitionProviderState(
-            createUnknownState,
-            {
-              stage: "design_pending",
-              taskId,
-            },
-          );
+          const taskPendingState = transitionProviderState(createUnknownState, {
+            stage: hostOwnedContentDraft ? "content_pending" : "design_pending",
+            taskId,
+            ...(hostOwnedDesign ? { design: hostOwnedDesign } : {}),
+            ...(taskId.startsWith("frontmind-host-fallback:")
+              ? { providerDraftUnavailable: true }
+              : {}),
+          });
           try {
             await bindCreatedBuildTask({
               db,
               operation,
               buildId: context.build.id,
               taskId,
-              state: designPendingState,
+              state: taskPendingState,
             });
           } catch (error) {
             const code = error instanceof Error ? error.message : "";
@@ -3009,9 +3150,17 @@ export function createManusSiteOpsProviderHandler(
             // create_unknown was durably reserved before task.create. A
             // transient post-ack DB failure therefore reconciles by the exact
             // operation token instead of creating a second private task.
-            return pending(createUnknownState, undefined, "design_compiling");
+            return pending(
+              createUnknownState,
+              undefined,
+              hostOwnedContentDraft ? "building" : "design_compiling",
+            );
           }
-          return pending(designPendingState, taskId, "design_compiling");
+          return pending(
+            taskPendingState,
+            taskId,
+            hostOwnedContentDraft ? "building" : "design_compiling",
+          );
         }
       }
 
@@ -3056,13 +3205,6 @@ export function createManusSiteOpsProviderHandler(
         state?.stage === "repair_send_unknown" ||
         state?.stage === "repair_pending"
       ) {
-        if (resumeCoordinate) {
-          throw new SiteOpsManusFailure(
-            "FRONTMIND_BUILD_RESUME_STATE_INVALID",
-            "建站恢复任务不能再次进入模型修复阶段。",
-            "failed",
-          );
-        }
         if (!state.repairKind || !state.repairAttempt) {
           throw new SiteOpsManusFailure(
             "MANUS_REPAIR_STATE_INVALID",
@@ -3199,13 +3341,18 @@ export function createManusSiteOpsProviderHandler(
               : contentOutputFilename,
           taskCompleted: repaired.state.completed,
           signal,
-          validateCandidate: (value) => {
-            if (state.repairKind === "design") {
-              parseDesignCandidate(value);
-            } else {
-              parseContentCandidate(value, state.design!);
-            }
-          },
+          ...(!usesHostOwnedContentDraft(workflow.frontMindVersion) ||
+          state.repairKind === "design"
+            ? {
+                validateCandidate: (value: Record<string, unknown>) => {
+                  if (state.repairKind === "design") {
+                    parseDesignCandidate(value);
+                  } else {
+                    parseContentCandidate(value, state.design!);
+                  }
+                },
+              }
+            : {}),
         });
         if (repairResolution.invalid) {
           const designFailure =
@@ -3359,7 +3506,7 @@ export function createManusSiteOpsProviderHandler(
           };
         }
       }
-      let design = state?.design;
+      let design = state?.design ?? hostOwnedDesign ?? undefined;
       if (!design && repairedContent === null) {
         const polled = await pollEvents(client, taskId, designToken);
         const designResolution = await resolveBuildWireValue({
@@ -3375,16 +3522,6 @@ export function createManusSiteOpsProviderHandler(
             parseDesignCandidate(value);
           },
         });
-        if (
-          resumeCoordinate !== null &&
-          (designResolution.invalid || designResolution.value === null)
-        ) {
-          throw new SiteOpsManusFailure(
-            "FRONTMIND_BUILD_OUTPUT_INVALID",
-            "原 FrontMind AI 建站任务的设计输出仍未通过严格合同，未再次调用模型。",
-            "failed",
-          );
-        }
         if (designResolution.invalid) {
           const failure = designResolution.validationError
             ? designValidationFailure(designResolution.validationError)
@@ -3582,10 +3719,14 @@ export function createManusSiteOpsProviderHandler(
                         kind: "react_static_v2",
                         reactVersion: "19.2.1",
                         componentLibraryVersion:
-                          workflow.componentLibraryVersion as "2.2.0" | "2.3.0",
+                          workflow.componentLibraryVersion as
+                            | "2.2.0"
+                            | "2.3.0"
+                            | "2.4.0",
                         materializerVersion: workflow.materializerVersion as
                           | "2.2.0"
-                          | "2.3.0",
+                          | "2.3.0"
+                          | "2.4.0",
                       },
                       content: {
                         schemaVersion: 2,
@@ -3725,9 +3866,39 @@ export function createManusSiteOpsProviderHandler(
         );
       }
 
+      const unavailableProviderDraft = () => ({
+        events: [] as ManusV2MessageEvent[],
+        state: { failed: true, completed: false },
+        waiting: null,
+      });
       const polled =
         repairedContent === null
-          ? await pollEvents(client, taskId, contentToken)
+          ? state?.providerDraftUnavailable
+            ? unavailableProviderDraft()
+            : await (async () => {
+                try {
+                  return await pollEvents(client, taskId, contentToken);
+                } catch (error) {
+                  // In 2.4 Manus is an optional content-draft supplier, not
+                  // the owner of a deliverable site. A read-side provider
+                  // outage must therefore degrade to the frozen-brief
+                  // canonical preview instead of discarding valid input.
+                  if (
+                    !hostOwnedContentDraft ||
+                    !(error instanceof ManusV2ApiError)
+                  ) {
+                    throw error;
+                  }
+                  logManusBuildStage({
+                    stage: "wire_resolution",
+                    operationId: operation.id,
+                    buildId: context.build.id,
+                    phase: "content",
+                    reason: "provider_draft_unavailable",
+                  });
+                  return unavailableProviderDraft();
+                }
+              })()
           : null;
       const contentResolution = polled
         ? await resolveBuildWireValue({
@@ -3739,12 +3910,19 @@ export function createManusSiteOpsProviderHandler(
             expectedFilename: contentOutputFilename,
             taskCompleted: polled.state.completed,
             signal,
-            validateCandidate: (value) => {
-              parseContentCandidate(value, design!);
-            },
+            ...(!usesHostOwnedContentDraft(workflow.frontMindVersion)
+              ? {
+                  validateCandidate: (value: Record<string, unknown>) => {
+                    parseContentCandidate(value, design!);
+                  },
+                }
+              : {}),
           })
         : null;
-      if (contentResolution?.invalid) {
+      const hostCanonicalContent = usesHostOwnedContentDraft(
+        workflow.frontMindVersion,
+      );
+      if (contentResolution?.invalid && !hostCanonicalContent) {
         const repairReason = contentResolution.validationError
           ? contentRepairReason(contentResolution.validationError)
           : contentResolution.invalidCode === "SITEOPS_WIRE_OUTPUT_CONFLICT"
@@ -3771,8 +3949,16 @@ export function createManusSiteOpsProviderHandler(
             : null,
         });
       }
-      const rawContent = repairedContent ?? contentResolution?.value ?? null;
-      if (!rawContent) {
+      const rawContent = contentResolution?.invalid
+        ? null
+        : (repairedContent ?? contentResolution?.value ?? null);
+      const canUseTrustedContentFallback =
+        hostCanonicalContent &&
+        (contentResolution?.invalid === true ||
+          polled?.state.failed === true ||
+          polled?.state.completed === true ||
+          Boolean(polled?.waiting));
+      if (!rawContent && !canUseTrustedContentFallback) {
         if (polled!.waiting) {
           if (!messageAskUserWaiting(polled!.waiting))
             throw new SiteOpsManusFailure(
@@ -3857,34 +4043,90 @@ export function createManusSiteOpsProviderHandler(
       }
       let generatedContent: z.infer<typeof siteOpsGeneratedContentSchema>;
       try {
+        let canonicalizedFromProvider = false;
         const currentContent = usesBuildPlanContractV4(
           workflow.frontMindVersion,
         );
-        const contentResult = parseContentCandidate(rawContent, design!);
-        generatedContent = currentContent
-          ? siteOpsGeneratedContentV2Schema.parse({
-              seo: design!.designSpec.seoPlan,
-              ...contentResult.pageContent,
-            })
-          : siteOpsGeneratedContentSchema.parse({
-              seo: design!.designSpec.seoPlan,
-              routes: contentResult.pageContent.routes,
-            });
+        const contentResult = hostCanonicalContent
+          ? null
+          : parseContentCandidate(rawContent, design!);
+        if (hostCanonicalContent) {
+          let draft: ReturnType<typeof draftFromPageContentWire> | null = null;
+          if (rawContent) {
+            try {
+              draft = draftFromPageContentWire(rawContent, contentToken);
+              canonicalizedFromProvider = true;
+            } catch {
+              // A malformed provider draft is data loss, not a site loss. The
+              // canonicalizer below still produces a complete preview from
+              // the frozen Brief and verified knowledge coordinates.
+              draft = null;
+            }
+          }
+          const canonical = canonicalizeSiteContentDraft({
+            draft,
+            operationToken: contentToken,
+            brief,
+            seo: design!.designSpec.seoPlan,
+          });
+          generatedContent = siteOpsGeneratedContentV2Schema.parse(
+            canonicalPreviewToGeneratedContent({
+              canonical,
+              designRouteCompositions: design!.designSpec.routeCompositions.map(
+                (route) => ({
+                  routeId: route.routeId,
+                  slots: route.slots.map((slot) => ({
+                    slotId: slot.slotId,
+                    variant: slot.variant,
+                  })),
+                }),
+              ),
+              fallbackSourceDocumentIds: Object.fromEntries(
+                brief.routes.map((route) => [
+                  route.id,
+                  route.sourceDocumentIds,
+                ]),
+              ),
+            }),
+          );
+        } else {
+          generatedContent = currentContent
+            ? siteOpsGeneratedContentV2Schema.parse({
+                seo: design!.designSpec.seoPlan,
+                ...contentResult!.pageContent,
+              })
+            : siteOpsGeneratedContentSchema.parse({
+                seo: design!.designSpec.seoPlan,
+                routes: contentResult!.pageContent.routes,
+              });
+        }
         logManusBuildStage({
-          stage: "wire_normalized",
+          stage: hostCanonicalContent
+            ? "content_canonicalized"
+            : "wire_normalized",
           operationId: operation.id,
           buildId: context.build.id,
           phase: "content",
-          routeCount: contentResult.pageContent.routes.length,
-          slotCount: contentResult.pageContent.routes.reduce(
+          routeCount: generatedContent.routes.length,
+          slotCount: generatedContent.routes.reduce(
             (total, route) => total + route.sections.length,
             0,
           ),
-          missingCount: contentResult.pageContent.routes.filter(
+          missingCount: generatedContent.routes.filter(
             (route) => "emptyState" in route,
           ).length,
+          ...(hostCanonicalContent && !canonicalizedFromProvider
+            ? { reason: "trusted_frozen_input_fallback" }
+            : {}),
         });
       } catch (error) {
+        if (hostCanonicalContent) {
+          throw new SiteOpsManusFailure(
+            "BUILD_CANONICALIZATION_FAILED",
+            "冻结知识资料无法形成安全预览，请申请重置后全新上传。",
+            "failed",
+          );
+        }
         const repairReason = contentRepairReason(error);
         const coordinate =
           repairedContentCoordinate ??
@@ -3936,10 +4178,42 @@ export function createManusSiteOpsProviderHandler(
         materialized = attempt.value;
         localRetryCount = attempt.localRetryCount;
         await assertExecutionActive();
+        logManusBuildStage({
+          stage: "palette_normalized",
+          operationId: operation.id,
+          buildId: context.build.id,
+        });
+        logManusBuildStage({
+          stage:
+            materialized.buildDelivery.renderMode === "trusted_fallback"
+              ? "fallback_render"
+              : "primary_render",
+          operationId: operation.id,
+          buildId: context.build.id,
+          renderMode: materialized.buildDelivery.renderMode,
+          qaStatus: materialized.buildDelivery.qaStatus,
+          warningCount: materialized.buildDelivery.warningCodes.length,
+        });
+        logManusBuildStage({
+          stage: "qa_completed",
+          operationId: operation.id,
+          buildId: context.build.id,
+          renderMode: materialized.buildDelivery.renderMode,
+          qaStatus: materialized.buildDelivery.qaStatus,
+          warningCount: materialized.buildDelivery.warningCodes.length,
+          latencyMs: Date.now() - materializationStartedAt,
+        });
       } catch (error) {
         signal.throwIfAborted();
         const classified = classifySiteOpsMaterializationFailure(error);
         if (classified.retryClass === "content_repair") {
+          if (hostCanonicalContent) {
+            throw new SiteOpsManusFailure(
+              "BUILD_CANONICALIZATION_FAILED",
+              "冻结知识资料无法形成安全预览，请申请重置后全新上传。",
+              "failed",
+            );
+          }
           const repairReason = contentRepairReason(error);
           const coordinate =
             repairedContentCoordinate ??
@@ -4014,6 +4288,15 @@ export function createManusSiteOpsProviderHandler(
           persist,
           assertExecutionActive,
         );
+        logManusBuildStage({
+          stage: "preview_persisted",
+          operationId: operation.id,
+          buildId: context.build.id,
+          renderMode: materialized.buildDelivery.renderMode,
+          qaStatus: materialized.buildDelivery.qaStatus,
+          warningCount: materialized.buildDelivery.warningCodes.length,
+          latencyMs: Date.now() - materializationStartedAt,
+        });
       } catch (error) {
         signal.throwIfAborted();
         const classified =
@@ -4081,6 +4364,7 @@ export function createManusSiteOpsProviderHandler(
           buildId: context.build.id,
           specHash: materialized.contract.specHash,
           distHash: materialized.distSha256,
+          buildDelivery: materialized.buildDelivery,
           qaSummary: artifacts.qaSummary,
           artifactIds: {
             contract: artifacts.contract.id,

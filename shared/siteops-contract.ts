@@ -105,16 +105,6 @@ export const siteOpsVisualGenerationProjectionSchema = z
  * project's frozen knowledge snapshot, visual selection and provider task.
  * Optional on reads so a new client can still consume an observation emitted
  * during a rolling deployment by the previous server release. */
-export const siteOpsBuildRecoveryProjectionSchema = z
-  .object({
-    allowed: z.boolean(),
-    buildId: z.string().uuid().nullable(),
-    reason: z
-      .enum(["output_recoverable", "active_operation", "frozen_input_changed"])
-      .nullable(),
-  })
-  .strict();
-
 export const siteOpsBuildProjectionSchema = z
   .object({
     id: z.string().uuid(),
@@ -123,6 +113,15 @@ export const siteOpsBuildProjectionSchema = z
     status: siteOpsBuildStatusSchema,
     previewUrl: z.string().max(2_048).nullable().default(null),
     sourceUrl: z.string().max(2_048).nullable().default(null),
+    buildDelivery: z
+      .object({
+        renderMode: z.enum(["primary", "trusted_fallback"]),
+        qaStatus: z.enum(["passed", "passed_with_warnings", "partial"]),
+        warningCodes: z.array(z.string().trim().min(1).max(128)).max(100),
+      })
+      .strict()
+      .nullable()
+      .default(null),
     needsHelp: z.boolean().default(false),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
@@ -411,7 +410,6 @@ export const siteOpsObservationV1Schema = z
       canGenerateMore: false,
       canSelectExisting: true,
     }),
-    buildRecovery: siteOpsBuildRecoveryProjectionSchema.optional(),
     executionSteps: z
       .array(siteOpsExecutionStepProjectionSchema)
       .max(300)
@@ -425,12 +423,6 @@ export const siteOpsObservationV1Schema = z
       .array(siteOpsSocialPackageProjectionSchema)
       .max(100)
       .default([]),
-    resetCapability: z
-      .object({
-        allowed: z.boolean(),
-        reason: z.string().trim().min(1).max(1_000).optional(),
-      })
-      .strict(),
     rebuildRequest: z
       .object({
         allowed: z.boolean(),
@@ -447,6 +439,9 @@ export const siteOpsObservationV1Schema = z
           ])
           .nullable(),
         resetApplied: z.boolean(),
+        // Optional for one rolling-release window; the server always emits it
+        // and older cached observations safely behave as `false`.
+        resetPending: z.boolean().optional(),
         resetSourceBuildId: z.string().uuid().nullable(),
       })
       .strict(),

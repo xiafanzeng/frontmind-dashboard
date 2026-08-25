@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  deliveryTicketEvents,
+  deliveryTickets,
   messages,
   siteBuilds,
   siteDeployments,
@@ -12,6 +14,7 @@ import {
 } from "../../drizzle/schema";
 import {
   approveSiteOpsRebuildTicket,
+  finalizeApprovedSiteOpsReset,
   siteOpsRebuildBuildId,
   siteOpsRebuildAcceptedForCurrentCycle,
   siteOpsRebuildDeliveryClientRequestId,
@@ -22,6 +25,7 @@ import {
   siteOpsRebuildRequestDisposition,
   siteOpsRebuildResubmissionProjection,
   siteOpsRebuildResetApplied,
+  siteOpsRebuildResetPending,
   siteOpsRebuildTargetPage,
   SiteOpsRebuildTicketError,
 } from "./rebuild-ticket";
@@ -190,14 +194,17 @@ function fixture(options?: {
   targetPage?: string;
   ticketStatus?: string;
 }) {
+  const initialGlobalLiveDeploymentId =
+    "50000000-0000-4000-8000-000000000005";
   const project = {
     id: projectId,
     userId: 9,
     conversationId: "siteops:9",
     currentKnowledgeSnapshotId: snapshotId,
     currentBuildId: buildId,
-    globalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
+    globalLiveDeploymentId: initialGlobalLiveDeploymentId,
     mainlandLiveDeploymentId: null,
+    canonicalHostname: null,
     brief: { companyName: "FrontMind" },
     status: "approved",
     revision: 12,
@@ -222,28 +229,47 @@ function fixture(options?: {
     targetPage: options?.targetPage ?? `/siteops/builds/${buildId}`,
     internalNote: options?.internalNote ?? rebuildNoteV1(),
     status: options?.ticketStatus ?? "submitted",
+    revision: 5,
+    assignedProjectAssignmentId:
+      "60000000-0000-4000-8000-000000000006",
   } as any;
   const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
   const inserts: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
-  const rowsFor = (table: unknown) => {
+  const rowsFor = (
+    table: unknown,
+    fields?: Record<string, unknown>,
+  ) => {
     if (table === siteProjects) return [project];
     if (table === siteBuilds) return [build];
+    if (table === deliveryTickets) return [ticket];
     if (table === siteOperations) {
       return options?.activeOperation ? [{ id: "running-operation" }] : [];
     }
-    if (
-      table === siteDeployments ||
-      table === siteDnsRecords ||
-      table === siteDomainOperations
-    ) {
+    if (table === siteDeployments) {
+      return fields && "verification" in fields
+        ? [
+            {
+              id: initialGlobalLiveDeploymentId,
+              status: "active",
+              verification: null,
+            },
+            {
+              id: "50000000-0000-4000-8000-000000000099",
+              status: "superseded",
+              verification: { priorCheck: "passed" },
+            },
+          ]
+        : [];
+    }
+    if (table === siteDnsRecords || table === siteDomainOperations) {
       return [];
     }
     if (table === messages) return [{ sequence: 7 }];
     return [];
   };
-  const select = () => {
+  const select = (fields?: Record<string, unknown>) => {
     let table: unknown;
     const query: any = {
       from(value: unknown) {
@@ -257,13 +283,13 @@ function fixture(options?: {
         return query;
       },
       for() {
-        return Promise.resolve(rowsFor(table));
+        return Promise.resolve(rowsFor(table, fields));
       },
       then(
         resolve: (value: unknown) => unknown,
         reject: (error: unknown) => unknown,
       ) {
-        return Promise.resolve(rowsFor(table)).then(resolve, reject);
+        return Promise.resolve(rowsFor(table, fields)).then(resolve, reject);
       },
     };
     return query;
@@ -275,6 +301,7 @@ function fixture(options?: {
         where: async () => {
           updates.push({ table, values });
           if (table === siteProjects) Object.assign(project, values);
+          if (table === deliveryTickets) Object.assign(ticket, values);
           return [{ affectedRows: 1 }];
         },
       }),
@@ -289,7 +316,7 @@ function fixture(options?: {
 }
 
 describe("site rebuild reset approval", () => {
-  it("opens a fresh knowledge selection while retaining the existing build and live head", async () => {
+  it("queues one strict unpublish operation without clearing customer state early", async () => {
     const state = fixture();
     const result = await approveSiteOpsRebuildTicket(state.tx, {
       ticket: state.ticket,
@@ -301,35 +328,36 @@ describe("site rebuild reset approval", () => {
       projectId,
       sourceBuildId: buildId,
       resetApplied: true,
-      resetAppliedProjectRevision: 13,
+      resetPending: true,
+      resetAppliedProjectRevision: 12,
     });
-    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
+    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(false);
+    expect(siteOpsRebuildResetPending(result!.internalNote)).toBe(true);
+    expect(JSON.parse(result!.internalNote)).toMatchObject({
+      schemaVersion: 4,
+      resetIntent: "approved_reset_unpublish",
+      resetExpectedProjectRevision: 12,
+    });
     expect(state.project).toMatchObject({
-      currentKnowledgeSnapshotId: null,
+      currentKnowledgeSnapshotId: snapshotId,
       currentBuildId: buildId,
       globalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
-      brief: null,
-      status: "draft",
-      revision: 13,
+      brief: { companyName: "FrontMind" },
+      status: "approved",
+      revision: 12,
     });
-    expect(state.updates).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          table: messages,
-          values: expect.objectContaining({ deletedAt: expect.any(Date) }),
-        }),
-        expect.objectContaining({
-          table: websiteStyleSampleBatches,
-          values: expect.objectContaining({ status: "superseded" }),
-        }),
-      ]),
-    );
+    expect(state.updates).toHaveLength(0);
     expect(state.inserts).toEqual([
       expect.objectContaining({
-        table: messages,
+        table: siteOperations,
         values: expect.objectContaining({
-          sequence: 8,
-          content: expect.stringContaining("旧官网和线上网站保持不变"),
+          kind: "rollback",
+          status: "queued",
+          provider: "aliyun_esa",
+          input: expect.objectContaining({
+            intent: "approved_reset_unpublish",
+            expectedProjectRevision: 12,
+          }),
         }),
       }),
     ]);
@@ -352,7 +380,8 @@ describe("site rebuild reset approval", () => {
       }),
     ).resolves.toMatchObject({
       resetApplied: true,
-      resetAppliedProjectRevision: 13,
+      resetPending: true,
+      resetAppliedProjectRevision: 12,
     });
     expect(replay.updates).toHaveLength(0);
     expect(replay.inserts).toHaveLength(0);
@@ -385,14 +414,15 @@ describe("site rebuild reset approval", () => {
       projectId,
       sourceBuildId: null,
       resetApplied: true,
-      resetAppliedProjectRevision: 13,
+      resetPending: true,
+      resetAppliedProjectRevision: 12,
     });
-    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(true);
+    expect(siteOpsRebuildResetApplied(result!.internalNote)).toBe(false);
     expect(state.project).toMatchObject({
       currentBuildId: null,
-      currentKnowledgeSnapshotId: null,
-      status: "draft",
-      revision: 13,
+      currentKnowledgeSnapshotId: snapshotId,
+      status: "awaiting_visual_selection",
+      revision: 12,
     });
   });
 
@@ -427,9 +457,10 @@ describe("site rebuild reset approval", () => {
       }),
     ).resolves.toMatchObject({
       resetApplied: true,
-      resetAppliedProjectRevision: 13,
+      resetPending: true,
+      resetAppliedProjectRevision: 12,
     });
-    expect(repeated.updates.length).toBeGreaterThan(0);
+    expect(repeated.updates).toHaveLength(0);
     expect(repeated.inserts).toHaveLength(1);
   });
 
@@ -446,5 +477,96 @@ describe("site rebuild reset approval", () => {
     expect(state.updates).toHaveLength(0);
     expect(state.inserts).toHaveLength(0);
     expect(state.project.currentKnowledgeSnapshotId).toBe(snapshotId);
+  });
+
+  it("atomically clears live heads, build, snapshot, visual board and messages only after ESA success", async () => {
+    const state = fixture();
+    const approval = await approveSiteOpsRebuildTicket(state.tx, {
+      ticket: state.ticket,
+      actorUserId: 1,
+      now: new Date("2026-08-24T08:00:00.000Z"),
+    });
+    const operation = state.inserts.find(
+      (entry) => entry.table === siteOperations,
+    )!.values;
+    Object.assign(state.ticket, {
+      status: "in_progress",
+      internalNote: approval!.internalNote,
+      revision: 6,
+    });
+
+    const finalized = await finalizeApprovedSiteOpsReset(state.tx, {
+      operation: operation as never,
+      now: new Date("2026-08-24T08:05:00.000Z"),
+    });
+
+    expect(finalized).toMatchObject({
+      status: "applied",
+      projectRevision: 13,
+    });
+    expect(state.project).toMatchObject({
+      currentKnowledgeSnapshotId: null,
+      currentBuildId: null,
+      globalLiveDeploymentId: null,
+      mainlandLiveDeploymentId: null,
+      brief: null,
+      status: "draft",
+      revision: 13,
+    });
+    expect(siteOpsRebuildResetApplied(state.ticket.internalNote)).toBe(true);
+    expect(siteOpsRebuildResetPending(state.ticket.internalNote)).toBe(false);
+    expect(state.updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: messages,
+          values: expect.objectContaining({ deletedAt: expect.any(Date) }),
+        }),
+        expect.objectContaining({
+          table: websiteStyleSampleBatches,
+          values: expect.objectContaining({ status: "superseded" }),
+        }),
+        expect.objectContaining({
+          table: siteDeployments,
+          values: expect.objectContaining({
+            status: "superseded",
+            verification: expect.objectContaining({
+              resetInvalidated: true,
+            }),
+          }),
+        }),
+      ]),
+    );
+    expect(
+      state.updates.filter((entry) => entry.table === siteDeployments),
+    ).toEqual([
+      expect.objectContaining({
+        values: expect.objectContaining({
+          status: "superseded",
+          verification: expect.objectContaining({
+            resetInvalidated: true,
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        values: expect.objectContaining({
+          status: "superseded",
+          verification: expect.objectContaining({
+            priorCheck: "passed",
+            resetInvalidated: true,
+          }),
+        }),
+      }),
+    ]);
+    expect(state.inserts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: messages,
+          values: expect.objectContaining({
+            content: expect.stringContaining("旧官网已下线"),
+          }),
+        }),
+        expect.objectContaining({ table: deliveryTicketEvents }),
+      ]),
+    );
   });
 });

@@ -1187,7 +1187,7 @@ async function searchFamilyRound(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉检索已超时，请重置后重新开始。",
+        "视觉检索已超时；可申请重置，批准后请全新上传并从头生成。",
       );
     }
     const composedQuery = composeFamilySearchQuery({
@@ -1556,7 +1556,7 @@ async function mirrorCandidates(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉预览镜像已超时，请重置后重新开始。",
+        "视觉预览镜像已超时；可申请重置，批准后请全新上传并从头生成。",
       );
     }
     const batch = input.candidates.slice(offset, offset + MIRROR_CONCURRENCY);
@@ -1574,7 +1574,7 @@ async function mirrorCandidates(input: {
           if (input.signal.aborted) {
             throw new TwentyFirstProviderFailure(
               "VISUAL_SEARCH_TIMEOUT",
-              "视觉预览镜像已超时，请重置后重新开始。",
+              "视觉预览镜像已超时；可申请重置，批准后请全新上传并从头生成。",
             );
           }
           rejectDiagnostic(input.diagnostics, previewRejectionReason(error));
@@ -2239,7 +2239,8 @@ function safeProviderFailure(
     return {
       status: "failed",
       code: "VISUAL_SEARCH_TIMEOUT",
-      message: "视觉检索已超时，请重置后重新开始。",
+      message:
+        "视觉检索已超时；可申请重置，批准后请全新上传并从头生成。",
       result: diagnostics,
     };
   }
@@ -2267,7 +2268,8 @@ function safeProviderFailure(
     return {
       status: "failed",
       code: "VISUAL_OPERATION_CONTRACT_MISMATCH",
-      message: "视觉检索任务合同不一致，请重置后重新开始。",
+      message:
+        "视觉检索任务合同不一致；可申请重置，批准后请全新上传并从头生成。",
       result: diagnostics,
     };
   }

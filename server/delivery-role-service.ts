@@ -94,6 +94,7 @@ import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection
 import {
   approveSiteOpsRebuildTicket,
   siteOpsRebuildResetApplied,
+  siteOpsRebuildResetPending,
   SiteOpsRebuildTicketError,
 } from "./siteops/rebuild-ticket";
 import { getQuestionQuotaState } from "./question-quota-service";
@@ -4667,9 +4668,19 @@ const SITE_REBUILD_APPROVABLE_STATUSES = [
   "in_progress",
 ] as const;
 
+function deliveryMutationAffectedRows(result: unknown) {
+  return Number(
+    (Array.isArray(result)
+      ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+      0,
+  );
+}
+
 export function siteOpsRebuildApprovalDisposition(input: {
   status: string;
   resetApplied: boolean;
+  resetPending?: boolean;
   revision: number;
   expectedRevision: number;
 }) {
@@ -4685,6 +4696,9 @@ export function siteOpsRebuildApprovalDisposition(input: {
   }
   if (input.resetApplied && input.status === "in_progress") {
     return "replay" as const;
+  }
+  if (input.resetPending && input.status === "in_progress") {
+    return "pending_replay" as const;
   }
   if (input.revision !== input.expectedRevision) {
     throw new AuthServiceError("CONFLICT", "需求已被更新，请刷新后重试");
@@ -4746,6 +4760,7 @@ export async function approveMySiteOpsRebuild(input: {
     const approvalDisposition = siteOpsRebuildApprovalDisposition({
       status: ticket.status,
       resetApplied: siteOpsRebuildResetApplied(ticket.internalNote),
+      resetPending: siteOpsRebuildResetPending(ticket.internalNote),
       revision: ticket.revision,
       expectedRevision: input.expectedRevision,
     });
@@ -4756,6 +4771,16 @@ export async function approveMySiteOpsRebuild(input: {
         status: "in_progress" as const,
         revision: ticket.revision,
         resetApplied: true as const,
+      };
+    }
+    if (approvalDisposition === "pending_replay") {
+      return {
+        success: true as const,
+        ticketId: ticket.id,
+        status: "in_progress" as const,
+        revision: ticket.revision,
+        resetApplied: false as const,
+        resetPending: true as const,
       };
     }
     const now = new Date();
@@ -4773,11 +4798,14 @@ export async function approveMySiteOpsRebuild(input: {
       }
       throw error;
     }
-    if (!approval?.resetApplied) {
+    if (!approval) {
       throw new AuthServiceError("CONFLICT", "官网重制需求无法执行重置。");
     }
-    const message = "官网重制需求已通过，等待客户重新选择知识库并制作新版本。";
-    await tx
+    const resetPending = approval.resetPending === true;
+    const message = resetPending
+      ? "官网重制需求已通过，正在安全下线旧网站；完成前不会清空线上坐标。"
+      : "官网重制需求已通过，旧网站已下线，请全新上传知识库。";
+    const ticketUpdate = await tx
       .update(deliveryTickets)
       .set({
         status: "in_progress",
@@ -4794,6 +4822,12 @@ export async function approveMySiteOpsRebuild(input: {
           eq(deliveryTickets.revision, ticket.revision),
         ),
       );
+    if (deliveryMutationAffectedRows(ticketUpdate) !== 1) {
+      throw new AuthServiceError(
+        "CONFLICT",
+        "需求已被更新，官网重置下线未排队，请刷新后重试",
+      );
+    }
     await tx.insert(deliveryTicketEvents).values({
       id: randomUUID(),
       ticketId: ticket.id,
@@ -4817,8 +4851,14 @@ export async function approveMySiteOpsRebuild(input: {
       ticketId: ticket.id,
       status: "in_progress" as const,
       revision: ticket.revision + 1,
-      resetApplied: true as const,
-      resetAppliedProjectRevision: approval.resetAppliedProjectRevision,
+      resetApplied: !resetPending,
+      resetPending,
+      ...(!resetPending
+        ? {
+            resetAppliedProjectRevision:
+              approval.resetAppliedProjectRevision,
+          }
+        : {}),
     };
   });
 }

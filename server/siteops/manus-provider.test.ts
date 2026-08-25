@@ -9,6 +9,7 @@ import {
 import {
   SITEOPS_MATERIALIZER_V2_1,
   SITEOPS_MATERIALIZER_V2_2,
+  SITEOPS_MATERIALIZER_V2_3,
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
@@ -38,6 +39,7 @@ import {
   structuredResultGrace,
   terminalTaskState,
   usesBuildPlanContractV4,
+  usesHostOwnedContentDraft,
   visualPreviewAttachment,
 } from "./manus-provider";
 import {
@@ -113,6 +115,36 @@ describe("Manus SiteOps provider boundary", () => {
         materializerVersion: "2.2.0",
       },
       contentSystem: { buildContract: "BuildContractV4" },
+    });
+  });
+
+  it("keeps 2.3 on the historical two-phase contract and 2.4 content-only", async () => {
+    expect(
+      usesHostOwnedContentDraft(SITEOPS_MATERIALIZER_V2_3.frontMindVersion),
+    ).toBe(false);
+    expect(usesHostOwnedContentDraft(SITEOPS_WORKFLOW.frontMindVersion)).toBe(
+      true,
+    );
+
+    const workflow = await JSZip.loadAsync(
+      await loadVerifiedSiteOpsWorkflowPackage(SITEOPS_MATERIALIZER_V2_3),
+      { checkCRC32: true },
+    );
+    const runtime = JSON.parse(
+      await workflow.file("runtime-contract.json")!.async("string"),
+    );
+    expect(runtime).toMatchObject({
+      adapterVersion: "2.3.0",
+      aiTask: {
+        taskCount: 1,
+        sameTaskForBothPhases: true,
+        phaseOneOutput: "SiteDesignWireV3",
+        phaseTwoOutput: "PageContentWireV3",
+      },
+      renderer: {
+        componentLibraryVersion: "2.3.0",
+        materializerVersion: "2.3.0",
+      },
     });
   });
 
@@ -599,7 +631,7 @@ describe("Manus SiteOps provider boundary", () => {
     });
   });
 
-  it("creates one task with workflow and visual, then sends phase two to that same task", async () => {
+  it("keeps a historical 2.3 task on the immutable two-phase contract", async () => {
     const infoLog = vi
       .spyOn(console, "info")
       .mockImplementation(() => undefined);
@@ -646,11 +678,8 @@ describe("Manus SiteOps provider boundary", () => {
     const designToken = `siteops-design:${operation.id}`;
     const designResult = {
       operationToken: designToken,
-      schemaVersion: SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.") ? 3 : 2,
+      schemaVersion: 3,
       layoutArchetype: "asymmetric",
-      ...(SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
-        ? {}
-        : { heroVariant: "split_media" }),
       density: "balanced",
       surfaceStyle: "bordered",
       typeScale: "display",
@@ -670,7 +699,7 @@ describe("Manus SiteOps provider boundary", () => {
         userId: operation.userId,
         knowledgeSnapshotId: "50000000-0000-4000-8000-000000000005",
         knowledgeArchiveHash: "a".repeat(64),
-        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+        workflowVersion: SITEOPS_MATERIALIZER_V2_3.frontMindVersion,
         brief: {
           companyName: "星河智造",
           primaryLanguage: "zh-CN",
@@ -840,17 +869,11 @@ describe("Manus SiteOps provider boundary", () => {
       ...operation,
       input: { ...operation.input, referenceBlueprint },
     };
-    let resumeSourceOperation: Record<string, unknown> | null = null;
     const db = {
       select: () => {
         let selectedTable: unknown;
         const query: any = {};
-        const rows = () =>
-          selectedTable === siteOperations
-            ? resumeSourceOperation
-              ? [resumeSourceOperation]
-              : []
-            : [context];
+        const rows = () => (selectedTable === siteOperations ? [] : [context]);
         query.from = (table: unknown) => {
           selectedTable = table;
           return query;
@@ -973,7 +996,7 @@ describe("Manus SiteOps provider boundary", () => {
         (attachment: { filename: string }) => attachment.filename,
       ),
     ).toEqual([
-      `frontmind-${SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.") ? "react-static-company-site-workflow" : "astro-company-site-workflow"}-${SITEOPS_WORKFLOW.frontMindVersion}.zip`,
+      `frontmind-react-static-company-site-workflow-${SITEOPS_MATERIALIZER_V2_3.frontMindVersion}.zip`,
       "frontmind-siteops-source-dossier-v1.json",
       "selected-visual.png",
       "support-visual-1.png",
@@ -985,15 +1008,9 @@ describe("Manus SiteOps provider boundary", () => {
     expect(createTask.mock.calls[0]![0].prompt).not.toContain(
       "星河智造提供设备服务",
     );
+    expect(createTask.mock.calls[0]![0].prompt).toContain("SiteDesignWireV3");
     expect(createTask.mock.calls[0]![0].prompt).toContain(
-      SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
-        ? "SiteDesignWireV3"
-        : "SiteDesignWireV2",
-    );
-    expect(createTask.mock.calls[0]![0].prompt).toContain(
-      SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
-        ? "frontmind-site-design-wire-v3.json"
-        : "frontmind-site-design-wire-v2.json",
+      "frontmind-site-design-wire-v3.json",
     );
     const createBody = buildManusV2CreateTaskBody(createTask.mock.calls[0]![0]);
     expect(createBody.message.content).toHaveLength(6);
@@ -1175,9 +1192,7 @@ describe("Manus SiteOps provider boundary", () => {
     expect(sendMessage.mock.calls[0]![0].taskId).toBe("manus-task-1");
     expect(sendMessage.mock.calls[0]![0].attachments).toEqual([
       expect.objectContaining({
-        filename: SITEOPS_WORKFLOW.frontMindVersion.startsWith("2.")
-          ? "frontmind-build-plan-contract-v4.json"
-          : "frontmind-build-contract-v2.json",
+        filename: "frontmind-build-plan-contract-v4.json",
         mime_type: "application/json",
       }),
       expect.objectContaining({
@@ -1212,50 +1227,6 @@ describe("Manus SiteOps provider boundary", () => {
     ).toHaveLength(3);
 
     const sourceOperationId = "11000000-0000-4000-8000-000000000011";
-    const recoveredToken = `siteops-repair:${sourceOperationId}:design:3`;
-    resumeSourceOperation = {
-      ...buildOperation,
-      id: sourceOperationId,
-      providerTaskId: "manus-task-1",
-      status: "failed",
-      result: {
-        schemaVersion: 1,
-        stage: "repair_pending",
-        taskId: "manus-task-1",
-        repairKind: "design",
-        repairAttempt: 3,
-      },
-      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
-    };
-    client.listAllMessages.mockImplementation(
-      async () =>
-        [
-          {
-            id: "resume-design-marker",
-            type: "user_message",
-            timestamp: 10,
-            user_message: {
-              content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({ operationToken: recoveredToken })}`,
-            },
-          },
-          {
-            id: "resume-design-result",
-            type: "structured_output_result",
-            timestamp: 11,
-            structured_output_result: {
-              success: false,
-              value: { ...designResult, operationToken: recoveredToken },
-              error: { code: "structured_extraction_failed" },
-            },
-          },
-          {
-            id: "resume-design-stopped",
-            type: "status_update",
-            timestamp: 12,
-            status_update: { agent_status: "stopped" },
-          },
-        ] as never,
-    );
     createTask.mockClear();
     sendMessage.mockClear();
     const resumeOperation = {
@@ -1276,54 +1247,8 @@ describe("Manus SiteOps provider boundary", () => {
       signal: new AbortController().signal,
     });
     expect(resumed).toMatchObject({
-      status: "pending",
-      result: { stage: "content_send_ready", taskId: "manus-task-1" },
-    });
-    expect(createTask).not.toHaveBeenCalled();
-    expect(sendMessage).not.toHaveBeenCalled();
-
-    client.listAllMessages.mockImplementation(
-      async () =>
-        [
-          {
-            id: "resume-invalid-marker",
-            type: "user_message",
-            timestamp: 20,
-            user_message: {
-              content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({ operationToken: recoveredToken })}`,
-            },
-          },
-          {
-            id: "resume-invalid-result",
-            type: "structured_output_result",
-            timestamp: 21,
-            structured_output_result: {
-              success: true,
-              value: {
-                ...designResult,
-                operationToken: recoveredToken,
-                siteTitle: "",
-              },
-            },
-          },
-          {
-            id: "resume-invalid-stopped",
-            type: "status_update",
-            timestamp: 22,
-            status_update: { agent_status: "stopped" },
-          },
-        ] as never,
-    );
-    const resumeFailed = await handler({
-      operation: {
-        ...resumeOperation,
-        id: "13000000-0000-4000-8000-000000000013",
-      } as never,
-      signal: new AbortController().signal,
-    });
-    expect(resumeFailed).toMatchObject({
       status: "failed",
-      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      code: "FRONTMIND_BUILD_RESUME_REMOVED",
     });
     expect(createTask).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
@@ -1334,7 +1259,6 @@ describe("Manus SiteOps provider boundary", () => {
     ]);
     expect(safeLogs).toContain("wire_resolution");
     expect(safeLogs).toContain("wire_normalized");
-    expect(safeLogs).toContain("build_resumed");
     expect(safeLogs).not.toContain("星河智造");
     expect(safeLogs).not.toContain("secret-key");
     expect(safeLogs).not.toContain("siteops-repair:");

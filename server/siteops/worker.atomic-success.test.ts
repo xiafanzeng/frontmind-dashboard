@@ -5,6 +5,10 @@ const dependencies = vi.hoisted(() => ({
   getProvider: vi.fn(),
   finalizeCredentialRevocations: vi.fn(async () => undefined),
   completeRebuildTicket: vi.fn(async () => null),
+  parseApprovedReset: vi.fn(() => null as Record<string, unknown> | null),
+  finalizeApprovedReset: vi.fn(async () => ({
+    status: "not_applicable" as const,
+  })),
 }));
 
 vi.mock("../db", () => ({ getDb: dependencies.getDb }));
@@ -17,6 +21,8 @@ vi.mock("../twenty-first-service", () => ({
 }));
 vi.mock("./rebuild-ticket", () => ({
   completeSiteOpsRebuildTicket: dependencies.completeRebuildTicket,
+  parseApprovedResetUnpublishInput: dependencies.parseApprovedReset,
+  finalizeApprovedSiteOpsReset: dependencies.finalizeApprovedReset,
 }));
 
 import {
@@ -207,6 +213,10 @@ beforeEach(() => {
   dependencies.getProvider.mockReset();
   dependencies.completeRebuildTicket.mockClear();
   dependencies.finalizeCredentialRevocations.mockClear();
+  dependencies.parseApprovedReset.mockReset().mockReturnValue(null);
+  dependencies.finalizeApprovedReset
+    .mockReset()
+    .mockResolvedValue({ status: "not_applicable" });
 });
 
 describe("SiteOps React/QA terminal transaction", () => {
@@ -317,5 +327,70 @@ describe("SiteOps React/QA terminal transaction", () => {
       status: "approved",
       currentBuildId: fixture.build.id,
     });
+  });
+
+  it("finalizes an approved reset without entering the generic rollback finalizer", async () => {
+    const fixture = databaseFixture();
+    const reset = {
+      schemaVersion: 1,
+      intent: "approved_reset_unpublish",
+      rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+      expectedProjectRevision: 4,
+      expectedCurrentBuildId: fixture.project.currentBuildId,
+      expectedKnowledgeSnapshotId: null,
+      expectedGlobalLiveDeploymentId: null,
+      expectedMainlandLiveDeploymentId: null,
+      expectedCanonicalHostname: null,
+    };
+    fixture.operation.kind = "rollback";
+    fixture.operation.provider = "aliyun_esa";
+    fixture.operation.input = reset;
+    dependencies.parseApprovedReset.mockReturnValue(reset);
+    dependencies.finalizeApprovedReset.mockResolvedValue({
+      status: "applied",
+      projectRevision: 5,
+      internalNote: "safe-marker",
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    dependencies.getProvider.mockReturnValue(
+      vi.fn(async () => ({
+        status: "succeeded",
+        result: {
+          schemaVersion: 1,
+          intent: "approved_reset_unpublish",
+          stage: "exposure_removed",
+        },
+        message: "旧网站已下线。",
+      })),
+    );
+
+    await expect(runSiteOpsWorkerSweep({ max: 1 })).resolves.toEqual({
+      claimed: 1,
+      succeeded: 1,
+      deferred: 0,
+      attentionRequired: 0,
+      failed: 0,
+    });
+
+    expect(dependencies.finalizeApprovedReset).toHaveBeenCalledTimes(1);
+    expect(dependencies.finalizeApprovedReset).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        operation: expect.objectContaining({
+          id: fixture.operation.id,
+          kind: "rollback",
+        }),
+      }),
+    );
+    expect(fixture.operation.status).toBe("succeeded");
+    const terminalWrites = fixture.writes.filter(
+      (write) => write.transactionId === 2,
+    );
+    expect(
+      terminalWrites.some(
+        (write) =>
+          write.table === siteBuilds || write.table === siteProjects,
+      ),
+    ).toBe(false);
   });
 });

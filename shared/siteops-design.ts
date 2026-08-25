@@ -576,6 +576,7 @@ export const pageContentSpecV2Schema = z
                       .max(24),
                     faqIds: z.array(z.string().trim().min(1).max(64)).max(24),
                     sourceDocumentIds: optionalSourceBoundIdsSchema,
+                    grounding: z.literal("host_placeholder").optional(),
                   })
                   .strict(),
               )
@@ -675,14 +676,29 @@ export const pageContentSpecV2Schema = z
         });
       }
       if (
-        route.sections.some(
-          (section) => !emptyNews && section.sourceDocumentIds.length < 1,
-        )
+        route.sections.some((section) => {
+          if (emptyNews) return false;
+          if (section.grounding !== "host_placeholder") {
+            return section.sourceDocumentIds.length < 1;
+          }
+          return !(
+            section.sourceDocumentIds.length === 0 &&
+            section.blockType === "prose" &&
+            section.heading === route.heading &&
+            section.paragraphs.length === 1 &&
+            section.paragraphs[0] ===
+              "本页面暂无可由已验证资料公开展示的内容。" &&
+            section.items.length === 0 &&
+            section.entityIds.length === 0 &&
+            section.faqIds.length === 0
+          );
+        })
       ) {
         context.addIssue({
           code: "custom",
           path: ["routes", routeIndex, "sections", "sourceDocumentIds"],
-          message: "Every factual content block must bind to snapshot sources",
+          message:
+            "Every factual content block must bind to snapshot sources; host placeholders must use the fixed non-factual form",
         });
       }
       for (const [sectionIndex, section] of route.sections.entries()) {
@@ -1002,8 +1018,8 @@ const buildPlanContractV4BaseSchema = buildPlanContractV3BaseSchema
       .object({
         kind: z.literal("react_static_v2"),
         reactVersion: z.literal("19.2.1"),
-        componentLibraryVersion: z.enum(["2.2.0", "2.3.0"]),
-        materializerVersion: z.enum(["2.2.0", "2.3.0"]),
+        componentLibraryVersion: z.enum(["2.2.0", "2.3.0", "2.4.0"]),
+        materializerVersion: z.enum(["2.2.0", "2.3.0", "2.4.0"]),
       })
       .strict(),
     content: contentContractCoordinatesV4Schema,
@@ -1034,20 +1050,22 @@ function validateBuildContractV4Coordinates(
     });
   }
   const workflowVersion = value.workflow.version;
+  const expectedQaPolicyVersion =
+    workflowVersion === "2.4.0" ? "siteops-qa-v5" : "siteops-qa-v4";
   if (
-    !["2.2.0", "2.3.0"].includes(workflowVersion) ||
+    !["2.2.0", "2.3.0", "2.4.0"].includes(workflowVersion) ||
     value.workflow.starterVersion !== workflowVersion ||
     value.workflow.componentLibraryVersion !== workflowVersion ||
     value.workflow.materializerVersion !== workflowVersion ||
     value.renderer.componentLibraryVersion !== workflowVersion ||
     value.renderer.materializerVersion !== workflowVersion ||
-    value.qaPolicyVersion !== "siteops-qa-v4"
+    value.qaPolicyVersion !== expectedQaPolicyVersion
   ) {
     context.addIssue({
       code: "custom",
       path: ["workflow"],
       message:
-        "BuildContractV4 requires the complete immutable 2.2 coordinates or matching immutable 2.3 coordinates",
+        "BuildContractV4 requires complete, matching immutable workflow and QA coordinates",
     });
   }
 }

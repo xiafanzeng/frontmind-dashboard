@@ -30,6 +30,12 @@ import { materializeProductionSiteFromSource } from "./build-runtime";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import { fetchPinnedPublicHttps } from "./remote-preview";
 import {
+  APPROVED_RESET_UNPUBLISH,
+  approvedResetUnpublishProjectMatches,
+  parseApprovedResetUnpublishInput,
+  type ApprovedResetUnpublishInput,
+} from "./rebuild-ticket";
+import {
   registerSiteOpsProviderHandler,
   type SiteOpsProviderHandler,
   type SiteOpsProviderResult,
@@ -139,8 +145,15 @@ export interface EsaDirectApi {
   }): Promise<void>;
   verifySite(siteId: number): Promise<boolean>;
   getMatchSite(recordName: string): Promise<EsaSiteView | null>;
-  listRelatedRecords(input: { name: string; recordName: string }): Promise<Array<{ recordName: string; siteId: number }>>;
+  listRelatedRecords(input: { name: string; recordName: string }): Promise<Array<{ recordId: number; recordName: string; siteId: number }>>;
   createRelatedRecord(input: { name: string; recordName: string; siteId: number }): Promise<void>;
+  deleteRelatedRecord(input: {
+    name: string;
+    recordId: number;
+    recordName: string;
+    siteId: number;
+  }): Promise<void>;
+  deleteRoutine(name: string): Promise<void>;
   listEdgeRoutineRecords(input: { siteId: number; recordName: string }): Promise<Array<{ recordName: string; recordCname: string }>>;
 }
 
@@ -404,8 +417,17 @@ class OfficialEsaDirectApi implements EsaDirectApi {
       new EsaModels.ListRoutineRelatedRecordsRequest({ name: input.name, pageNumber: 1, pageSize: 20, searchKeyWord: input.recordName }),
     );
     return (response.body?.relatedRecords ?? [])
-      .filter((entry) => entry.recordName === input.recordName && entry.siteId)
-      .map((entry) => ({ recordName: String(entry.recordName), siteId: Number(entry.siteId) }));
+      .filter(
+        (entry) =>
+          entry.recordName === input.recordName &&
+          entry.siteId &&
+          entry.recordId,
+      )
+      .map((entry) => ({
+        recordId: Number(entry.recordId),
+        recordName: String(entry.recordName),
+        siteId: Number(entry.siteId),
+      }));
   }
 
   async createRelatedRecord(input: { name: string; recordName: string; siteId: number }) {
@@ -413,6 +435,39 @@ class OfficialEsaDirectApi implements EsaDirectApi {
       new EsaModels.CreateRoutineRelatedRecordRequest(input),
     );
     if (response.body?.status !== "OK") throw new Error("ESA_RELATED_RECORD_REJECTED");
+  }
+
+  async deleteRelatedRecord(input: {
+    name: string;
+    recordId: number;
+    recordName: string;
+    siteId: number;
+  }) {
+    try {
+      const response = await this.client.deleteRoutineRelatedRecord(
+        new EsaModels.DeleteRoutineRelatedRecordRequest(input),
+      );
+      if (response.body?.status !== "OK") {
+        throw new Error("ESA_RELATED_RECORD_DELETE_REJECTED");
+      }
+    } catch (error) {
+      if (isNotFound(error)) return;
+      throw error;
+    }
+  }
+
+  async deleteRoutine(name: string) {
+    try {
+      const response = await this.client.deleteRoutine(
+        new EsaModels.DeleteRoutineRequest({ name }),
+      );
+      if (response.body?.status !== "OK") {
+        throw new Error("ESA_ROUTINE_DELETE_REJECTED");
+      }
+    } catch (error) {
+      if (isNotFound(error)) return;
+      throw error;
+    }
   }
 
   async listEdgeRoutineRecords(input: { siteId: number; recordName: string }) {
@@ -515,6 +570,376 @@ async function persistBoundary(
         eq(siteOperations.leaseOwner, operation.leaseOwner),
       ),
     );
+}
+
+function mutationAffectedRows(result: unknown) {
+  return Number(
+    (Array.isArray(result)
+      ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+      0,
+  );
+}
+
+async function persistApprovedResetBoundary(
+  db: DbExecutor,
+  operation: SiteOperation,
+  result: Record<string, unknown>,
+) {
+  if (!operation.leaseOwner) {
+    throw new EsaProviderFailure(
+      "ESA_OPERATION_LEASE_MISSING",
+      "ESA 操作缺少有效租约，未提交外部变更。",
+    );
+  }
+  const updated = await db
+    .update(siteOperations)
+    .set({ result, updatedAt: new Date() })
+    .where(
+      and(
+        eq(siteOperations.id, operation.id),
+        eq(siteOperations.status, "running"),
+        eq(siteOperations.leaseOwner, operation.leaseOwner),
+      ),
+    );
+  if (mutationAffectedRows(updated) !== 1) {
+    throw new EsaProviderFailure(
+      "ESA_OPERATION_LEASE_LOST",
+      "ESA 操作租约已变化，未提交外部变更。",
+      "failed",
+    );
+  }
+}
+
+async function loadApprovedResetProject(
+  db: DbExecutor,
+  operation: SiteOperation,
+  reset: ApprovedResetUnpublishInput,
+) {
+  const rows = await db
+    .select()
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.id, operation.projectId),
+        eq(siteProjects.userId, operation.userId),
+      ),
+    )
+    .limit(1);
+  const project = rows[0];
+  if (!project || !approvedResetUnpublishProjectMatches(reset, project)) {
+    throw new EsaProviderFailure(
+      "SITEOPS_RESET_INVALIDATED",
+      "官网重置坐标已变化，未向 ESA 提交下线操作。",
+      "failed",
+    );
+  }
+  return project;
+}
+
+function logApprovedResetStage(input: {
+  operation: SiteOperation;
+  status: "started" | SiteOpsProviderResult["status"];
+  stage?: string;
+  latencyMs?: number;
+}) {
+  const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
+  console.info("[siteops-esa] reset_unpublish", {
+    event: "siteops_reset_unpublish",
+    stage: input.stage ?? "reset_unpublish",
+    status: input.status,
+    operationId: input.operation.id,
+    projectId: input.operation.projectId,
+    ...(input.latencyMs === undefined ? {} : { latencyMs: input.latencyMs }),
+    releaseSha: /^[a-f0-9]{40}$/u.test(release) ? release : null,
+  });
+}
+
+async function approvedResetExposureRemoved(input: {
+  publicHttpsFetch: typeof fetchPinnedPublicHttps;
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+  signal: AbortSignal;
+  state: Record<string, unknown>;
+}) {
+  const hostname = input.reset.expectedCanonicalHostname;
+  if (hostname) {
+    const origin = `https://${normalizeHostname(hostname)}`;
+    const attempt = input.operation.attempt ?? 0;
+    const retryPublicVerification = (
+      stage: "public_marker_propagating" | "public_marker_verification_retry",
+      terminalCode: string,
+      terminalMessage: string,
+    ) => {
+      const started =
+        input.state.stage === stage
+          ? Number(input.state.stageStartedAttempt ?? attempt)
+          : attempt;
+      const retryState = {
+        schemaVersion: 1,
+        intent: APPROVED_RESET_UNPUBLISH,
+        stage,
+        stageStartedAttempt: started,
+      };
+      if (input.state.stage === stage && attempt - started >= 10) {
+        throw new EsaProviderFailure(
+          terminalCode,
+          terminalMessage,
+          "outcome_unknown",
+          retryState,
+        );
+      }
+      return pendingState(retryState);
+    };
+    try {
+      const { response } = await input.publicHttpsFetch({
+        url: `${origin}/${FRONTMIND_MARKER_PATH}`,
+        signal: input.signal,
+        headers: { accept: "application/json" },
+        maxRedirects: 2,
+        allowedOrigin: origin,
+      });
+      if (response.status === 404 || response.status === 410) {
+        await response.body?.cancel().catch(() => undefined);
+      } else if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        return retryPublicVerification(
+          "public_marker_verification_retry",
+          "RESET_PUBLIC_MARKER_VERIFICATION_UNAVAILABLE",
+          "旧网站公开标记暂时无法确认，数据库重置尚未执行。",
+        );
+      } else {
+        const body = await readResponseTextBounded(response, 4_096);
+        let marker: unknown = null;
+        try {
+          marker = JSON.parse(body);
+        } catch {
+          marker = null;
+        }
+        const deploymentId =
+          marker && typeof marker === "object"
+            ? String((marker as Record<string, unknown>).deploymentId ?? "")
+            : "";
+        const previousHeads = new Set(
+          [
+            input.reset.expectedGlobalLiveDeploymentId,
+            input.reset.expectedMainlandLiveDeploymentId,
+          ].filter((value): value is string => Boolean(value)),
+        );
+        if (deploymentId && previousHeads.has(deploymentId)) {
+          return retryPublicVerification(
+            "public_marker_propagating",
+            "RESET_UNPUBLISH_OUTCOME_UNKNOWN",
+            "旧网站公开标记长时间未消失，数据库重置尚未执行。",
+          );
+        }
+        // A successful marker response is proof that some FrontMind marker is
+        // still publicly reachable, not proof that the old exposure vanished.
+        // Only an explicit 404/410 can advance the destructive DB finalize.
+        return retryPublicVerification(
+          "public_marker_verification_retry",
+          "RESET_PUBLIC_MARKER_VERIFICATION_UNAVAILABLE",
+          "旧网站公开标记暂时无法确认，数据库重置尚未执行。",
+        );
+      }
+    } catch (error) {
+      if (error instanceof EsaProviderFailure) throw error;
+      input.signal.throwIfAborted();
+      // A DNS/TLS/socket failure can be transient. It is not positive proof
+      // that every public edge stopped serving the old FrontMind marker.
+      return retryPublicVerification(
+        "public_marker_verification_retry",
+        "RESET_PUBLIC_MARKER_VERIFICATION_UNAVAILABLE",
+        "旧网站公开标记暂时无法确认，数据库重置尚未执行。",
+      );
+    }
+  }
+  return {
+    status: "succeeded",
+    result: {
+      schemaVersion: 1,
+      intent: APPROVED_RESET_UNPUBLISH,
+      stage: "exposure_removed",
+    },
+    message: "旧网站已从 ESA 安全下线。",
+  } satisfies SiteOpsProviderResult;
+}
+
+async function handleApprovedResetUnpublish(input: {
+  db: DbExecutor;
+  api: EsaDirectApi;
+  publicHttpsFetch: typeof fetchPinnedPublicHttps;
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+  signal: AbortSignal;
+}) {
+  const project = await loadApprovedResetProject(
+    input.db,
+    input.operation,
+    input.reset,
+  );
+  const state = (input.operation.result ?? {}) as Record<string, unknown>;
+  const name = routineName(project.id);
+  let routine = await input.api.getRoutine(name);
+  if (!routine) {
+    return await approvedResetExposureRemoved({
+      publicHttpsFetch: input.publicHttpsFetch,
+      operation: input.operation,
+      reset: input.reset,
+      signal: input.signal,
+      state,
+    });
+  }
+
+  const hostname = input.reset.expectedCanonicalHostname;
+  if (hostname) {
+    const related = await input.api.listRelatedRecords({
+      name,
+      recordName: hostname,
+    });
+    const pendingRecordId = Number(state.relatedRecordId);
+    const stageStartedAttempt = Number(state.stageStartedAttempt ?? 0);
+    const pendingRelation = related.find(
+      (entry) => entry.recordId === pendingRecordId,
+    );
+    if (
+      pendingRelation &&
+      state.stage === "related_record_delete_unknown"
+    ) {
+      if ((input.operation.attempt ?? 0) - stageStartedAttempt < 5) {
+        return pendingState(state);
+      }
+      throw new EsaProviderFailure(
+        "ESA_RELATED_RECORD_DELETE_OUTCOME_UNKNOWN",
+        "ESA 域名关联删除结果无法确认，系统没有重复提交删除。",
+        "outcome_unknown",
+        state,
+      );
+    }
+    if (
+      pendingRelation &&
+      state.stage === "related_record_delete_propagating"
+    ) {
+      if ((input.operation.attempt ?? 0) - stageStartedAttempt < 10) {
+        return pendingState(state);
+      }
+      throw new EsaProviderFailure(
+        "ESA_RELATED_RECORD_DELETE_TIMEOUT",
+        "ESA 域名关联删除长时间未在只读结果中生效。",
+        "outcome_unknown",
+        state,
+      );
+    }
+    const relation = related[0];
+    if (relation) {
+      const boundary = {
+        schemaVersion: 1,
+        intent: APPROVED_RESET_UNPUBLISH,
+        stage: "related_record_delete_unknown",
+        stageStartedAttempt: input.operation.attempt ?? 0,
+        relatedRecordId: relation.recordId,
+        siteId: relation.siteId,
+      };
+      await persistApprovedResetBoundary(
+        input.db,
+        input.operation,
+        boundary,
+      );
+      input.signal.throwIfAborted();
+      try {
+        await input.api.deleteRelatedRecord({
+          name,
+          recordId: relation.recordId,
+          recordName: hostname,
+          siteId: relation.siteId,
+        });
+      } catch {
+        return pendingState(boundary);
+      }
+      const observed = await input.api.listRelatedRecords({
+        name,
+        recordName: hostname,
+      });
+      if (observed.some((entry) => entry.recordId === relation.recordId)) {
+        return pendingState({
+          ...boundary,
+          stage: "related_record_delete_propagating",
+          stageStartedAttempt: input.operation.attempt ?? 0,
+        });
+      }
+      // A Routine may contain more than one exact historical binding. Remove
+      // one observed coordinate per lease and reconcile again before deleting
+      // the Routine itself.
+      if (observed.length > 0) {
+        return pendingState({
+          schemaVersion: 1,
+          intent: APPROVED_RESET_UNPUBLISH,
+          stage: "related_record_reconciling",
+        });
+      }
+    }
+  }
+
+  routine = await input.api.getRoutine(name);
+  if (!routine) {
+    return await approvedResetExposureRemoved({
+      publicHttpsFetch: input.publicHttpsFetch,
+      operation: input.operation,
+      reset: input.reset,
+      signal: input.signal,
+      state,
+    });
+  }
+  if (state.stage === "routine_delete_unknown") {
+    if ((input.operation.attempt ?? 0) - Number(state.stageStartedAttempt ?? 0) < 5) {
+      return pendingState(state);
+    }
+    throw new EsaProviderFailure(
+      "ESA_ROUTINE_DELETE_OUTCOME_UNKNOWN",
+      "ESA Routine 删除结果无法确认，系统没有重复提交删除。",
+      "outcome_unknown",
+      state,
+    );
+  }
+  if (state.stage === "routine_delete_propagating") {
+    if ((input.operation.attempt ?? 0) - Number(state.stageStartedAttempt ?? 0) < 10) {
+      return pendingState(state);
+    }
+    throw new EsaProviderFailure(
+      "ESA_ROUTINE_DELETE_TIMEOUT",
+      "ESA Routine 删除长时间未在只读结果中生效。",
+      "outcome_unknown",
+      state,
+    );
+  }
+  const boundary = {
+    schemaVersion: 1,
+    intent: APPROVED_RESET_UNPUBLISH,
+    stage: "routine_delete_unknown",
+    stageStartedAttempt: input.operation.attempt ?? 0,
+  };
+  await persistApprovedResetBoundary(input.db, input.operation, boundary);
+  input.signal.throwIfAborted();
+  try {
+    await input.api.deleteRoutine(name);
+  } catch {
+    return pendingState(boundary);
+  }
+  routine = await input.api.getRoutine(name);
+  if (routine) {
+    return pendingState({
+      ...boundary,
+      stage: "routine_delete_propagating",
+      stageStartedAttempt: input.operation.attempt ?? 0,
+    });
+  }
+  return await approvedResetExposureRemoved({
+    publicHttpsFetch: input.publicHttpsFetch,
+    operation: input.operation,
+    reset: input.reset,
+    signal: input.signal,
+    state,
+  });
 }
 
 async function loadDeploymentContext(db: DbExecutor, operation: SiteOperation) {
@@ -1539,6 +1964,36 @@ export function createEsaSiteOpsProviderHandler(
       if (prepare.success) {
         return await handlePrepareDomainBinding({ db, api, operation, parsed: prepare.data });
       }
+      const approvedReset = parseApprovedResetUnpublishInput(operation.input);
+      if (approvedReset) {
+        if (operation.kind !== "rollback") {
+          throw new EsaProviderFailure(
+            "SITEOPS_RESET_OPERATION_KIND_INVALID",
+            "官网重置下线只能由专用 rollback 操作执行。",
+            "failed",
+          );
+        }
+        const startedAt = Date.now();
+        logApprovedResetStage({ operation, status: "started" });
+        const resetResult = await handleApprovedResetUnpublish({
+          db,
+          api,
+          publicHttpsFetch,
+          operation,
+          reset: approvedReset,
+          signal,
+        });
+        logApprovedResetStage({
+          operation,
+          status: resetResult.status,
+          stage:
+            resetResult.result && typeof resetResult.result.stage === "string"
+              ? resetResult.result.stage
+              : undefined,
+          latencyMs: Date.now() - startedAt,
+        });
+        return resetResult;
+      }
 
       let context = await loadDeploymentContext(db, operation);
       const state = (operation.result ?? {}) as Record<string, unknown>;
@@ -1597,13 +2052,6 @@ export function createEsaSiteOpsProviderHandler(
         );
       }
       matchedSite = coveredSite;
-      const related = await api.listRelatedRecords({ name, recordName: hostname });
-      if (related.length !== 1 || related[0].siteId !== matchedSite.siteId) {
-        throw new EsaProviderFailure(
-          "ESA_DOMAIN_BINDING_NOT_READY",
-          "canonical hostname 尚未精确绑定到当前 SiteOps Routine。",
-        );
-      }
       const codeVersion = await resolveCodeVersion({
         db,
         api,
@@ -1672,6 +2120,82 @@ export function createEsaSiteOpsProviderHandler(
           return pendingState({ ...deployState, stage: "deployment_verifying" }, providerDeploymentId ?? undefined);
         }
         providerDeploymentId = routine!.production!.deploymentId;
+      }
+      let related = await api.listRelatedRecords({
+        name,
+        recordName: hostname,
+      });
+      if (related.length === 0) {
+        const stageStartedAttempt = Number(state.stageStartedAttempt ?? 0);
+        if (state.stage === "related_record_create_unknown") {
+          if (
+            (operation.attempt ?? 0) - stageStartedAttempt < 5
+          ) {
+            return pendingState(state, providerDeploymentId ?? undefined);
+          }
+          throw new EsaProviderFailure(
+            "ESA_RELATED_RECORD_OUTCOME_UNKNOWN",
+            "ESA custom domain 绑定响应丢失且只读查询未找到结果；系统没有重复绑定。",
+          );
+        }
+        if (state.stage === "related_record_propagating") {
+          if (
+            (operation.attempt ?? 0) - stageStartedAttempt < 10
+          ) {
+            return pendingState(state, providerDeploymentId ?? undefined);
+          }
+          throw new EsaProviderFailure(
+            "ESA_RELATED_RECORD_PROPAGATION_TIMEOUT",
+            "ESA custom domain 绑定长时间未出现在只读结果中。",
+          );
+        }
+        const relationState = {
+          ...state,
+          stage: "related_record_create_unknown",
+          stageStartedAttempt: operation.attempt ?? 0,
+          siteId: matchedSite.siteId,
+        };
+        await persistBoundary(
+          db,
+          operation,
+          relationState,
+          providerDeploymentId ?? undefined,
+        );
+        try {
+          await api.createRelatedRecord({
+            name,
+            recordName: hostname,
+            siteId: matchedSite.siteId,
+          });
+        } catch {
+          return pendingState(
+            relationState,
+            providerDeploymentId ?? undefined,
+          );
+        }
+        related = await api.listRelatedRecords({
+          name,
+          recordName: hostname,
+        });
+        if (related.length === 0) {
+          return pendingState(
+            {
+              ...relationState,
+              stage: "related_record_propagating",
+              stageStartedAttempt: operation.attempt ?? 0,
+            },
+            providerDeploymentId ?? undefined,
+          );
+        }
+      }
+      if (
+        related.length !== 1 ||
+        related[0].siteId !== matchedSite.siteId
+      ) {
+        throw new EsaProviderFailure(
+          "ESA_DOMAIN_BINDING_NOT_READY",
+          "canonical hostname 未形成唯一精确的 SiteOps Routine 绑定。",
+        );
       }
       const publicVerification = await verifyLiveSite({
         publicHttpsFetch,

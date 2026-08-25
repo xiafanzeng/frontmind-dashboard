@@ -15,7 +15,8 @@ describe("SiteOps public error projection", () => {
     });
     expect(projected).toEqual({
       code: "FRONTMIND_BUILD_REQUEST_INVALID",
-      message: "FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。",
+      message:
+        "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
     });
     expect(JSON.stringify(projected)).not.toMatch(/manus|invalid_argument/iu);
   });
@@ -65,7 +66,9 @@ describe("SiteOps public error projection", () => {
         content: "Manus invalid_argument",
         errorCode: "invalid_argument",
       }),
-    ).toBe("FrontMind AI 建站输入未通过上游协议校验，请重置后重新开始。");
+    ).toBe(
+      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+    );
   });
 
   it("does not project publishing runtime diagnostics into customer readiness", () => {
@@ -89,7 +92,7 @@ describe("SiteOps public error projection", () => {
     expect(projected).toEqual({
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
       message:
-        "FrontMind AI 建站输出未通过结构校验，知识库资料和视觉方案已保留，可继续生成官网。",
+        "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
     });
     expect(JSON.stringify(projected)).not.toMatch(/manus/iu);
   });
@@ -117,7 +120,8 @@ describe("SiteOps public error projection", () => {
       }),
     ).toEqual({
       code: "FRONTMIND_BUILD_QA_FAILED",
-      message: "FrontMind AI 建站未通过网站构建或质量检查，请重置后重新开始。",
+      message:
+        "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
     });
     expect(
       publicSiteOpsErrorProjection({
@@ -135,15 +139,15 @@ describe("SiteOps public error projection", () => {
   it.each([
     [
       "FRONTMIND_BUILD_ASSET_CONFLICT",
-      "FrontMind AI 建站检测到知识资产冲突，请重置后重新开始。",
+      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
     ],
     [
       "FRONTMIND_BUILD_COMPILE_FAILED",
-      "FrontMind AI 建站未能完成可信网站编译，请重置后重新开始。",
+      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
     ],
     [
       "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE",
-      "FrontMind AI 建站运行环境暂时不可用，请稍后重试或重置流程。",
+      "FrontMind AI 建站运行环境暂时不可用；若任务已经结束，可申请重置，批准后全新开始。",
     ],
   ] as const)("keeps %s as a distinct FrontMind error", (code, message) => {
     expect(
