@@ -28,6 +28,7 @@ import { AliyunStsClient } from "./aliyun-sdk-constructors";
 
 export const ALIYUN_PLATFORM_UID = "1244409121609391";
 export const ALIYUN_CUSTOMER_ROLE_NAME = "FrontMindSiteOpsAccess";
+export const ALIYUN_CUSTOMER_ROLE_NAME_PATTERN = "FrontMindSiteOps-<连接标识>";
 export const ALIYUN_BROKER_CREDENTIAL_SLOT = "siteops_aliyun_broker";
 export const ALIYUN_OAUTH_CREDENTIAL_SLOT = "siteops_aliyun_oauth";
 export const ALIYUN_OAUTH_AUTHORIZE_ENDPOINT =
@@ -603,7 +604,7 @@ export function buildAliyunOAuthAuthorizationUrl(
   url.searchParams.set("client_id", credential.clientId);
   url.searchParams.set("redirect_uri", credential.callbackUrl);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", "openid aliuid profile");
+  url.searchParams.set("scope", "openid aliuid");
   url.searchParams.set("access_type", "online");
   // First-time third-party access already triggers Alibaba Cloud's install and
   // consent flow. Forcing admin_consent here turns an ordinary sign-in from
@@ -645,7 +646,7 @@ function throwAliyunOAuthAuthorizationError(value: unknown) {
   ) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
-      "阿里云 OAuth 应用未启用 FrontMind 所需的 openid、aliuid 和 profile 范围。",
+      "阿里云 OAuth 应用未启用 FrontMind 所需的 openid 和 aliuid 范围。",
     );
   }
   if (
@@ -778,14 +779,14 @@ export async function inspectAliyunOAuthConfiguration(
         (item): item is string => typeof item === "string",
       )
     : [];
-  if (!["openid", "aliuid", "profile"].every((item) => scopes.includes(item))) {
+  if (!["openid", "aliuid"].every((item) => scopes.includes(item))) {
     throw new AuthServiceError(
       "UPSTREAM_UNAVAILABLE",
       "阿里云 OAuth 未提供所需账号身份范围",
     );
   }
   await probeAliyunOAuthAuthorization(credential, fetchImpl);
-  return { ok: true as const, scopes: ["openid", "aliuid", "profile"] };
+  return { ok: true as const, scopes: ["openid", "aliuid"] };
 }
 
 export async function inspectAliyunBrokerCredential(
@@ -1196,7 +1197,7 @@ export async function getAliyunPlatformCredentialStatus() {
   );
   return {
     platformUid: ALIYUN_PLATFORM_UID,
-    customerRoleName: ALIYUN_CUSTOMER_ROLE_NAME,
+    customerRoleName: ALIYUN_CUSTOMER_ROLE_NAME_PATTERN,
     identityConfigured,
     ready: identityConfigured && customerCapabilityVerified,
     customerCapabilityVerified,
@@ -1542,11 +1543,7 @@ export function assertAliyunOAuthScopes(value: unknown) {
     .parse(value)
     .split(/\s+/u)
     .filter(Boolean);
-  if (
-    !["openid", "aliuid", "profile"].every((scope) =>
-      grantedScopes.includes(scope),
-    )
-  ) {
+  if (!["openid", "aliuid"].every((scope) => grantedScopes.includes(scope))) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
       "阿里云 OAuth 授权未包含所需账号身份范围",

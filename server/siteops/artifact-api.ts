@@ -17,6 +17,7 @@ import { readSiteOpsArtifact } from "./artifact-store";
 import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
 import {
   completeSiteOpsAliyunOAuth,
+  getPublicSiteOpsAliyunRosTemplate,
   getSiteOpsAliyunRoleConfiguration,
 } from "./service";
 
@@ -128,9 +129,8 @@ function sendAliyunOAuthCompletionPage(
           status: "${status}"
         });
         if (window.opener && !window.opener.closed) {
-          try {
-            window.opener.postMessage(message, window.location.origin);
-          } finally {
+          window.opener.postMessage(message, window.location.origin);
+          if (message.status === "cancelled") {
             window.close();
           }
         }
@@ -355,6 +355,39 @@ async function sendOwnedAsset(input: {
 }
 
 export const siteOpsArtifactApi = express.Router();
+
+export const siteOpsAliyunRosTemplateApi = express.Router();
+
+siteOpsAliyunRosTemplateApi.use((req, res, next) => {
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+  if (req.method !== "GET") {
+    notFound(res);
+    return;
+  }
+  next();
+});
+
+siteOpsAliyunRosTemplateApi.get(
+  /^\/(ar1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{32,1900}\.[A-Za-z0-9_-]{22})\/?$/u,
+  async (req, res) => {
+    try {
+      const template = await getPublicSiteOpsAliyunRosTemplate(req.params[0]);
+      const bytes = Buffer.from(JSON.stringify(template), "utf8");
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Length", String(bytes.length));
+      res.status(200).send(bytes);
+    } catch {
+      notFound(res);
+    }
+  },
+);
+
+siteOpsAliyunRosTemplateApi.use((_req, res) => {
+  notFound(res);
+});
 
 siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
   const startedAt = Date.now();

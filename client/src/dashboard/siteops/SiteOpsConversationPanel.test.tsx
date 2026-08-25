@@ -133,6 +133,23 @@ function visualPage(page: 1 | 2 | 3) {
 }
 
 describe("SiteOpsConversationPanel", () => {
+  it("uses structured workflow actions without a persistent conversation composer", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("继续对话")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: "继续对话" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^发送$/u }),
+    ).not.toBeInTheDocument();
+  });
+
   it("does not surface the cancelled failed build after a confirmed reset", () => {
     render(
       <SiteOpsConversationPanel
@@ -319,7 +336,6 @@ describe("SiteOpsConversationPanel", () => {
       <SiteOpsConversationPanel
         observation={observation()}
         onAction={onAction}
-        onSendMessage={vi.fn()}
       />,
     );
 
@@ -340,9 +356,15 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/相同的企业资料真实渲染/u)).toBeNull();
     expect(document.body.textContent).not.toMatch(/API Key|Base|Pro|Hero/iu);
-    fireEvent.click(
-      screen.getByRole("button", { name: "重新生成 9 个视觉候选" }),
-    );
+    const regenerateButton = screen.getByRole("button", {
+      name: "重新生成 9 个视觉候选",
+    });
+    expect(regenerateButton).toHaveClass("siteops-primary-button");
+    expect(regenerateButton).not.toHaveClass("siteops-secondary-button");
+    expect(
+      screen.queryByRole("button", { name: "让 FrontMind 推荐" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(regenerateButton);
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "reselect_visual",
@@ -478,38 +500,12 @@ describe("SiteOpsConversationPanel", () => {
     }
   });
 
-  it("delegates a visual choice without exposing an AI mode", async () => {
-    const onAction = vi.fn().mockResolvedValue(undefined);
-    render(
-      <SiteOpsConversationPanel
-        observation={observation()}
-        onAction={onAction}
-      />,
-    );
-
-    expect(document.body.textContent).not.toMatch(/API Key|Base|Pro/iu);
-    fireEvent.click(screen.getByRole("button", { name: "让 FrontMind 推荐" }));
-
-    await waitFor(() =>
-      expect(onAction).toHaveBeenCalledWith({
-        action: "delegate_visual",
-        input: {},
-        messageId: "message-1",
-        cardKind: "visual_board",
-      }),
-    );
-  });
-
   it("does not attach a stale action card after the worker advances revision", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     const stale = observation();
     stale.messages[0]!.metadata!.siteOps!.revision = 2;
     render(
-      <SiteOpsConversationPanel
-        observation={stale}
-        onAction={onAction}
-        onSendMessage={vi.fn()}
-      />,
+      <SiteOpsConversationPanel observation={stale} onAction={onAction} />,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "选择 A" }));
@@ -591,9 +587,14 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByText("AI 建站服务尚未就绪，请联系 FrontMind。"),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "选择 A" })).toBeDisabled();
+    const regenerateButton = screen.getByRole("button", {
+      name: "重新生成 9 个视觉候选",
+    });
+    expect(regenerateButton).toBeDisabled();
+    expect(regenerateButton).toHaveClass("siteops-primary-button");
     expect(
-      screen.getByRole("button", { name: "让 FrontMind 推荐" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "让 FrontMind 推荐" }),
+    ).not.toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(
       /21st|Manus|Upstream|API Key/iu,
     );
@@ -1083,7 +1084,6 @@ describe("SiteOpsConversationPanel", () => {
           interactionState: "select_snapshot",
         })}
         onAction={vi.fn()}
-        onSendMessage={vi.fn()}
       />,
     );
 
@@ -1393,7 +1393,6 @@ describe("SiteOpsConversationPanel", () => {
             interactionState,
           })}
           onAction={vi.fn()}
-          onSendMessage={vi.fn()}
         />,
       );
 
@@ -1451,13 +1450,16 @@ describe("SiteOpsConversationPanel", () => {
         onBeginAliyun={onBeginAliyun}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
     await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledOnce());
     expect(authorizationWindow.location.href).toBe(
       "https://signin.aliyun.com/oauth/authorize",
     );
+    expect(document.body.textContent).toContain(
+      "需阿里云主账号或具备 ROS、RAM 创建权限的管理员确认一次；FrontMind 不会获取客户 AccessKey。",
+    );
     expect(document.body.textContent).not.toMatch(
-      /UID|ARN|ExternalId|AccessKey|RAM Role|STS/iu,
+      /UID|ARN|ExternalId|AccessKey (?:ID|Secret)|RAM Role|STS/iu,
     );
     open.mockRestore();
   });
@@ -1484,7 +1486,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
 
     expect(onBeginAliyun).toHaveBeenCalledOnce();
     expect(popupDocument.title).toBe("正在检查阿里云授权配置");
@@ -1508,7 +1510,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
 
     expect(onBeginAliyun).not.toHaveBeenCalled();
     const alert = await screen.findByRole("alert");
@@ -1547,7 +1549,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
 
     expect(
       await screen.findByText("阿里云连接配置需要 FrontMind 管理员更新。"),
@@ -1571,16 +1573,34 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
-  it("refreshes after a verified same-origin OAuth popup completion", async () => {
+  it("continues from OAuth to ROS in the same popup without closing it", async () => {
     const onBeginAliyun = vi.fn().mockResolvedValue({
       authorizationUrl: "https://signin.aliyun.com/oauth/authorize",
       expiresAt: "2026-08-23T01:00:00.000Z",
     });
     const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const onStartAliyunRoleProvisioning = vi.fn().mockResolvedValue({
+      status: "ready" as const,
+      connected: false as const,
+      rosAuthorizationUrl:
+        "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
+      expiresAt: "2099-08-23T01:00:00.000Z",
+      retryAfterMs: 0,
+    });
+    const onProbeAliyunRole = vi.fn(
+      () =>
+        new Promise<{
+          status: "pending";
+          connected: false;
+          reason: "role_not_ready";
+          retryAfterMs: number;
+        }>(() => undefined),
+    );
     const authorizationWindow = {
       location: { href: "" },
       focus: vi.fn(),
       close: vi.fn(),
+      opener: window,
     };
     const open = vi
       .spyOn(window, "open")
@@ -1590,10 +1610,12 @@ describe("SiteOpsConversationPanel", () => {
         observation={observation()}
         onBeginAliyun={onBeginAliyun}
         onRefresh={onRefresh}
+        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
+        onProbeAliyunRole={onProbeAliyunRole}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
     await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledOnce());
     act(() => {
       window.dispatchEvent(
@@ -1608,9 +1630,182 @@ describe("SiteOpsConversationPanel", () => {
       );
     });
 
-    await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
-    expect(authorizationWindow.close).toHaveBeenCalledOnce();
+    await waitFor(() =>
+      expect(onStartAliyunRoleProvisioning).toHaveBeenCalledOnce(),
+    );
+    expect(onRefresh).toHaveBeenCalledOnce();
+    expect(authorizationWindow.location.href).toBe(
+      "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
+    );
+    expect(authorizationWindow.opener).toBeNull();
+    expect(authorizationWindow.close).not.toHaveBeenCalled();
     open.mockRestore();
+  });
+
+  it("polls 2/3/5/8/13/20/30 seconds until the role is active", async () => {
+    vi.useFakeTimers();
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const onStartAliyunRoleProvisioning = vi.fn().mockResolvedValue({
+      status: "ready" as const,
+      connected: false as const,
+      rosAuthorizationUrl:
+        "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
+      expiresAt: "2099-08-23T01:00:00.000Z",
+      retryAfterMs: 0,
+    });
+    const pendingReasons = [
+      "role_not_ready",
+      "permission_propagating",
+      "provider_retry",
+      "role_not_ready",
+      "permission_propagating",
+      "provider_retry",
+    ] as const;
+    const onProbeAliyunRole = vi.fn().mockImplementation(() => {
+      const reason = pendingReasons[onProbeAliyunRole.mock.calls.length - 1];
+      return Promise.resolve(
+        reason
+          ? {
+              status: "pending" as const,
+              connected: false as const,
+              reason,
+              retryAfterMs: 0,
+            }
+          : { status: "active" as const, connected: true as const },
+      );
+    });
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+      opener: window,
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    const view = render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          aliyunConnection: {
+            configured: false,
+            status: "authorization_required",
+            verifiedAt: null,
+            canRotate: true,
+          },
+        })}
+        onRefresh={onRefresh}
+        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
+        onProbeAliyunRole={onProbeAliyunRole}
+      />,
+    );
+
+    try {
+      fireEvent.click(
+        screen.getByRole("button", { name: "继续阿里云一键授权" }),
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(onStartAliyunRoleProvisioning).toHaveBeenCalledOnce();
+      expect(authorizationWindow.location.href).toContain(
+        "https://ros.console.aliyun.com/",
+      );
+      expect(authorizationWindow.close).not.toHaveBeenCalled();
+
+      const delays = [2_000, 3_000, 5_000, 8_000, 13_000, 20_000, 30_000];
+      for (const [index, delay] of delays.entries()) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(delay);
+        });
+        expect(onProbeAliyunRole).toHaveBeenCalledTimes(index + 1);
+        if (index < delays.length - 1) {
+          expect(authorizationWindow.close).not.toHaveBeenCalled();
+        }
+      }
+
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(authorizationWindow.close).toHaveBeenCalledOnce();
+    } finally {
+      view.unmount();
+      open.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("probes again when the customer returns focus from the ROS popup", async () => {
+    vi.useFakeTimers();
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const onStartAliyunRoleProvisioning = vi.fn().mockResolvedValue({
+      status: "ready" as const,
+      connected: false as const,
+      rosAuthorizationUrl:
+        "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
+      expiresAt: "2099-08-23T01:00:00.000Z",
+      retryAfterMs: 0,
+    });
+    const onProbeAliyunRole = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "pending" as const,
+        connected: false as const,
+        reason: "permission_propagating" as const,
+        retryAfterMs: 0,
+      })
+      .mockResolvedValueOnce({
+        status: "active" as const,
+        connected: true as const,
+      });
+    const authorizationWindow = {
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+      opener: window,
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    const view = render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          aliyunConnection: {
+            configured: false,
+            status: "authorization_required",
+            verifiedAt: null,
+            canRotate: true,
+          },
+        })}
+        onRefresh={onRefresh}
+        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
+        onProbeAliyunRole={onProbeAliyunRole}
+      />,
+    );
+
+    try {
+      fireEvent.click(
+        screen.getByRole("button", { name: "继续阿里云一键授权" }),
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+      act(() => window.dispatchEvent(new Event("focus")));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(onProbeAliyunRole).toHaveBeenCalledOnce();
+      expect(authorizationWindow.close).not.toHaveBeenCalled();
+
+      act(() => window.dispatchEvent(new Event("focus")));
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(onProbeAliyunRole).toHaveBeenCalledTimes(2);
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(authorizationWindow.close).toHaveBeenCalledOnce();
+    } finally {
+      view.unmount();
+      open.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("ignores OAuth completion messages from another origin or window", async () => {
@@ -1635,7 +1830,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
     await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledOnce());
     act(() => {
       window.dispatchEvent(
@@ -1691,7 +1886,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
     await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledTimes(1));
     act(() => {
       window.dispatchEvent(
@@ -1708,8 +1903,9 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       await screen.findByText("你已取消阿里云授权，未产生任何连接。"),
     ).toBeInTheDocument();
+    expect(firstWindow.close).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+    fireEvent.click(screen.getByRole("button", { name: "一键连接阿里云" }));
     await waitFor(() => expect(onBeginAliyun).toHaveBeenCalledTimes(2));
     act(() => {
       window.dispatchEvent(
@@ -1729,10 +1925,36 @@ describe("SiteOpsConversationPanel", () => {
     expect(document.body.textContent).not.toMatch(
       /invalid_client|AppId|Secret/iu,
     );
+    expect(secondWindow.close).not.toHaveBeenCalled();
     open.mockRestore();
   });
 
-  it("guides an identified account through official authorization", async () => {
+  it("shows one one-click recovery action when authorization needs attention", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          aliyunConnection: {
+            configured: false,
+            status: "attention_required",
+            verifiedAt: null,
+            canRotate: true,
+          },
+        })}
+        onStartAliyunRoleProvisioning={vi.fn()}
+        onProbeAliyunRole={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("button", { name: "继续阿里云一键授权" }),
+    ).toHaveLength(1);
+    expect(screen.queryByText("我已完成授权")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "当前授权需要重新确认，请使用上方一键授权修复。",
+    );
+  });
+
+  it("keeps one-click provisioning errors in the popup and manual steps advanced", async () => {
     const onLoadAliyunAuthorizationGuide = vi.fn().mockResolvedValue({
       available: true,
       consoleUrl: "https://ram.console.aliyun.com/roles/create",
@@ -1741,8 +1963,13 @@ describe("SiteOpsConversationPanel", () => {
       trustPolicyText: '{"trust":true}',
       permissionPolicyText: '{"permission":true}',
     });
-    const onVerifyAliyun = vi.fn().mockResolvedValue(undefined);
+    const onStartAliyunRoleProvisioning = vi
+      .fn()
+      .mockRejectedValue(new Error("sensitive provider detail"));
+    const onProbeAliyunRole = vi.fn();
+    const popupDocument = document.implementation.createHTMLDocument();
     const authorizationWindow = {
+      document: popupDocument,
       location: { href: "" },
       focus: vi.fn(),
       close: vi.fn(),
@@ -1761,22 +1988,34 @@ describe("SiteOpsConversationPanel", () => {
           },
         })}
         onLoadAliyunAuthorizationGuide={onLoadAliyunAuthorizationGuide}
-        onVerifyAliyun={onVerifyAliyun}
+        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
+        onProbeAliyunRole={onProbeAliyunRole}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "前往阿里云完成授权" }));
+    expect(screen.queryByText("备用手动配置（3 步）")).toBeNull();
+    expect(screen.queryByText("我已完成授权")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "继续阿里云一键授权" }));
+    expect(
+      await screen.findByText(
+        "暂时无法准备阿里云一键授权，请保留当前页面并稍后重试。",
+      ),
+    ).toBeInTheDocument();
+    expect(authorizationWindow.close).not.toHaveBeenCalled();
+    expect(popupDocument.querySelector("button")?.textContent).toBe("关闭窗口");
+
+    fireEvent.click(screen.getByText("高级：手动配置"));
+    fireEvent.click(screen.getByRole("button", { name: "载入手动配置" }));
     await waitFor(() =>
       expect(onLoadAliyunAuthorizationGuide).toHaveBeenCalledOnce(),
-    );
-    expect(authorizationWindow.location.href).toBe(
-      "https://ram.console.aliyun.com/roles/create",
     );
     expect(
       await screen.findByRole("link", { name: "下载备用配置" }),
     ).toHaveAttribute("href", "/api/site-ops/aliyun/authorization-config");
-    fireEvent.click(screen.getByRole("button", { name: "我已完成授权" }));
-    await waitFor(() => expect(onVerifyAliyun).toHaveBeenCalledOnce());
+    expect(
+      screen.getByRole("link", { name: "打开 RAM 控制台" }),
+    ).toHaveAttribute("href", "https://ram.console.aliyun.com/roles/create");
+    expect(open).toHaveBeenCalledOnce();
     open.mockRestore();
   });
 

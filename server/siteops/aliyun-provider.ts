@@ -40,6 +40,7 @@ import {
   ALIYUN_DOMAIN_PURCHASE_ACTIONS,
   ALIYUN_DOMAIN_READ_ACTIONS,
   ALIYUN_DOMAIN_RENEW_ACTIONS,
+  aliyunSdkErrorDetails,
   getActiveAliyunBrokerCredential,
   getPinnedAliyunBrokerCredential,
 } from "./aliyun-platform-service";
@@ -61,7 +62,11 @@ const ALIYUN_REQUEST_TIMEOUT_MS = 12_000;
 const QUOTE_TTL_MS = 60_000;
 const RESPONSE_LOSS_RECONCILE_MS = 10 * 60_000;
 const DNS_PROPAGATION_TIMEOUT_MS = 15 * 60_000;
+const ALIYUN_PERMISSION_PROPAGATION_GRACE_MS = 2 * 60_000;
 const DEFAULT_DNS_TTL = 600;
+
+export const ALIYUN_ROLE_MIGRATION_DEFERRED_CODE =
+  "ALIYUN_ROLE_MIGRATION_DEFERRED" as const;
 
 const connectionInputSchema = z
   .object({
@@ -346,7 +351,7 @@ export interface AliyunDnsApi {
 export interface AliyunProviderSdkFactory {
   assumeRole(input: {
     roleArn: string;
-    externalId: string;
+    externalId?: string;
     sessionName: string;
     policy: string;
     brokerCredentialId?: string;
@@ -443,6 +448,42 @@ export function openAliyunExternalId(
 
 function roleAccount(roleArn: string) {
   return /^acs:ram::(\d+):role\//.exec(roleArn)?.[1] ?? null;
+}
+
+function roleName(roleArn: string) {
+  return /^acs:ram::\d+:role\/([A-Za-z0-9.@_-]+)$/u.exec(roleArn)?.[1] ?? null;
+}
+
+const MANAGED_ALIYUN_DYNAMIC_ROLE_PATTERN = /^FrontMindSiteOps-[a-f0-9]{12}$/u;
+
+export function aliyunCustomerRoleName(connectionId: string) {
+  const normalizedId = z.string().uuid().parse(connectionId).toLowerCase();
+  return `FrontMindSiteOps-${normalizedId.replaceAll("-", "").slice(0, 12)}`;
+}
+
+function aliyunCustomerRoleArn(accountUid: string, connectionId: string) {
+  return `acs:ram::${accountUid}:role/${aliyunCustomerRoleName(connectionId)}`;
+}
+
+function legacyAliyunCustomerRoleArn(accountUid: string) {
+  return `acs:ram::${accountUid}:role/${ALIYUN_CUSTOMER_ROLE_NAME}`;
+}
+
+function aliyunRepairRoleName(connectionId: string, currentRoleArn: string) {
+  const normalizedId = z.string().uuid().parse(connectionId).toLowerCase();
+  const currentName = roleName(currentRoleArn);
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const seed =
+      attempt === 0
+        ? `${normalizedId}/${currentRoleArn}`
+        : `${normalizedId}/${currentRoleArn}/${attempt}`;
+    const candidate = `FrontMindSiteOps-${sha256(seed).slice(0, 12)}`;
+    if (candidate !== currentName) return candidate;
+  }
+  throw new AliyunProviderError(
+    "ALIYUN_ROLE_NAME_DERIVATION_FAILED",
+    "无法派生新的阿里云修复角色名称。",
+  );
 }
 
 function operationPolicy(actions: string[]) {
@@ -987,7 +1028,7 @@ export class OfficialAliyunProviderSdkFactory
 {
   async assumeRole(input: {
     roleArn: string;
-    externalId: string;
+    externalId?: string;
     sessionName: string;
     policy: string;
     brokerCredentialId?: string;
@@ -1084,6 +1125,212 @@ export type AliyunConnectionStatus = {
   verifiedAt: number | null;
   lastErrorCode: string | null;
 };
+
+export type AliyunCustomerConnectionProbe =
+  | {
+      status: "active";
+      connected: true;
+      accountUid: string;
+      capabilities: string[];
+    }
+  | {
+      status: "pending";
+      connected: false;
+      reason: "role_not_ready" | "permission_propagating" | "provider_retry";
+      retryAfterMs: number;
+    }
+  | {
+      status: "attention_required";
+      connected: false;
+      reason:
+        | "account_mismatch"
+        | "permission_incomplete"
+        | "external_id_not_enforced";
+      retryable: false;
+    };
+
+type AliyunConnectionProbeStage =
+  | "assume_role"
+  | "external_id_enforcement"
+  | "caller_identity"
+  | "domain_permission"
+  | "dns_assume_role"
+  | "dns_caller_identity"
+  | "dns_permission";
+
+function providerErrorCode(error: unknown) {
+  if (error instanceof AliyunProviderError) return error.code;
+  return aliyunSdkErrorDetails(error).providerCode ?? "";
+}
+
+function isAliyunProviderRetry(error: unknown) {
+  if (error instanceof AliyunProviderError) {
+    if (error.outcomeUnknown) return true;
+    if (
+      /^(?:PROVIDER_TIMEOUT|RATE_LIMITED|UPSTREAM_UNAVAILABLE|ALIYUN_PROVIDER_RETRY)$/u.test(
+        error.code,
+      )
+    ) {
+      return true;
+    }
+  }
+  const details = aliyunSdkErrorDetails(error);
+  const coordinate = details.providerCode ?? details.errorClass;
+  return (
+    details.statusCode === 408 ||
+    details.statusCode === 425 ||
+    details.statusCode === 429 ||
+    (details.statusCode !== null && details.statusCode >= 500) ||
+    /^(?:Throttling.*|TooManyRequests|RequestTimeout|ServiceUnavailable|InternalError|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|TimeoutError|UnretryableError)$/iu.test(
+      coordinate,
+    )
+  );
+}
+
+function isAliyunRoleNotReady(error: unknown) {
+  const code = providerErrorCode(error);
+  return /(?:EntityNotExist\.Role|RoleNotExist|NoSuchEntity(?:\.Role)?|Role.*Not.*(?:Exist|Found)|InvalidParameter\.RoleArn)/iu.test(
+    code,
+  );
+}
+
+function isAliyunAccessDenied(error: unknown) {
+  const details = aliyunSdkErrorDetails(error);
+  const code = providerErrorCode(error);
+  return (
+    details.statusCode === 401 ||
+    details.statusCode === 403 ||
+    /(?:AccessDenied|Forbidden|NoPermission|PermissionDenied|Unauthorized|ExternalId)/iu.test(
+      code,
+    )
+  );
+}
+
+function isExpectedExternalIdDenial(error: unknown) {
+  if (providerErrorCode(error) === "ALIYUN_EXTERNAL_ID_NOT_ENFORCED") {
+    return false;
+  }
+  if (isAliyunProviderRetry(error) || isAliyunRoleNotReady(error)) return false;
+  const details = aliyunSdkErrorDetails(error);
+  const code = providerErrorCode(error);
+  return (
+    details.statusCode === 401 ||
+    details.statusCode === 403 ||
+    /(?:AccessDenied|Forbidden|NoPermission|PermissionDenied|Unauthorized)/iu.test(
+      code,
+    )
+  );
+}
+
+function classifyAliyunConnectionProbeError(input: {
+  error: unknown;
+  stage: AliyunConnectionProbeStage;
+  wasActive: boolean;
+  permissionGraceExpired: boolean;
+}): Exclude<AliyunCustomerConnectionProbe, { status: "active" }> {
+  const code = providerErrorCode(input.error);
+  if (/^(?:CALLER_ACCOUNT_MISMATCH|ACCOUNT_ROLE_MISMATCH)$/u.test(code)) {
+    return {
+      status: "attention_required",
+      connected: false,
+      reason: "account_mismatch",
+      retryable: false,
+    };
+  }
+  if (code === "ALIYUN_EXTERNAL_ID_NOT_ENFORCED") {
+    return {
+      status: "attention_required",
+      connected: false,
+      reason: "external_id_not_enforced",
+      retryable: false,
+    };
+  }
+  if (/^(?:PERMISSION_INCOMPLETE|ALIYUN_PERMISSION_INCOMPLETE)$/u.test(code)) {
+    return {
+      status: "attention_required",
+      connected: false,
+      reason: "permission_incomplete",
+      retryable: false,
+    };
+  }
+  if (code === "PERMISSION_PROPAGATING") {
+    return {
+      status: "pending",
+      connected: false,
+      reason: "permission_propagating",
+      retryAfterMs: 2_000,
+    };
+  }
+  if (isAliyunProviderRetry(input.error)) {
+    return {
+      status: "pending",
+      connected: false,
+      reason: "provider_retry",
+      retryAfterMs: 5_000,
+    };
+  }
+  if (input.stage === "assume_role") {
+    if (isAliyunRoleNotReady(input.error)) {
+      return input.wasActive
+        ? {
+            status: "attention_required",
+            connected: false,
+            reason: "permission_incomplete",
+            retryable: false,
+          }
+        : {
+            status: "pending",
+            connected: false,
+            reason: "role_not_ready",
+            retryAfterMs: 2_000,
+          };
+    }
+    if (isAliyunAccessDenied(input.error)) {
+      return input.wasActive || input.permissionGraceExpired
+        ? {
+            status: "attention_required",
+            connected: false,
+            reason: "permission_incomplete",
+            retryable: false,
+          }
+        : {
+            status: "pending",
+            connected: false,
+            reason: "permission_propagating",
+            retryAfterMs: 2_000,
+          };
+    }
+  }
+  if (
+    input.stage === "domain_permission" ||
+    input.stage === "dns_assume_role" ||
+    input.stage === "dns_permission"
+  ) {
+    if (isAliyunAccessDenied(input.error)) {
+      return input.wasActive || input.permissionGraceExpired
+        ? {
+            status: "attention_required",
+            connected: false,
+            reason: "permission_incomplete",
+            retryable: false,
+          }
+        : {
+            status: "pending",
+            connected: false,
+            reason: "permission_propagating",
+            retryAfterMs: 2_000,
+          };
+    }
+  }
+  // Unknown SDK/network shapes are not sufficient evidence to invalidate a
+  // customer connection. A later bounded probe can make the determination.
+  return {
+    status: "pending",
+    connected: false,
+    reason: "provider_retry",
+    retryAfterMs: 5_000,
+  };
+}
 
 async function loadOwnedConnection(
   db: DbQueryExecutor,
@@ -1426,12 +1673,16 @@ export async function bindAliyunCustomerAccountFromOAuth(
   const db = transaction ?? (await requireDb());
   await assertOwnedProject(db, input);
   const existing = await loadOwnedConnection(db, input);
-  const roleArn = `acs:ram::${input.accountUid}:role/${ALIYUN_CUSTOMER_ROLE_NAME}`;
+  const connectionId = existing?.id ?? randomUUID();
+  const roleArn = aliyunCustomerRoleArn(input.accountUid, connectionId);
+  const legacyRoleArn = legacyAliyunCustomerRoleArn(input.accountUid);
   if (
     existing &&
     existing.status !== "revoked" &&
     existing.accountUid === input.accountUid &&
-    existing.roleArn.toLowerCase() === roleArn.toLowerCase()
+    [roleArn, legacyRoleArn].some(
+      (candidate) => candidate.toLowerCase() === existing.roleArn.toLowerCase(),
+    )
   ) {
     return {
       connectionId: existing.id,
@@ -1440,7 +1691,6 @@ export async function bindAliyunCustomerAccountFromOAuth(
     } as const;
   }
   if (existing) await assertAliyunConnectionMutable(db, input);
-  const connectionId = existing?.id ?? randomUUID();
   const sealed = sealAliyunExternalId(connectionId, randomUUID());
   if (existing) {
     await db
@@ -1481,6 +1731,143 @@ export async function bindAliyunCustomerAccountFromOAuth(
   };
 }
 
+/**
+ * Probes every managed, non-active role before deciding what ROS may create.
+ * A missing legacy role moves to its connection-scoped name so the strict ROS
+ * template can create it; a missing dynamic role retains its current name.
+ * Working roles activate in place, and inconclusive provider/propagation
+ * failures defer without changing the ARN. A deterministically unsafe legacy
+ * role also moves to its connection-scoped name; an unsafe dynamic role
+ * advances to a deterministic repair name. The ExternalId ciphertext and
+ * fingerprint are never rotated here.
+ */
+export async function prepareAliyunCustomerRoleProvisioning(
+  rawInput: z.input<typeof ownedConnectionInputSchema>,
+  factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
+) {
+  const input = ownedConnectionInputSchema.parse(rawInput);
+  const db = await requireDb();
+  await assertOwnedProject(db, input);
+  const connection = await loadOwnedConnection(db, input);
+  if (!connection || connection.status === "revoked") {
+    throw new AliyunProviderError(
+      "PROVIDER_NOT_CONFIGURED",
+      "请先完成阿里云账号授权。",
+    );
+  }
+  const currentRoleName = roleName(connection.roleArn);
+  if (
+    roleAccount(connection.roleArn) !== connection.accountUid ||
+    !currentRoleName ||
+    (currentRoleName !== ALIYUN_CUSTOMER_ROLE_NAME &&
+      !MANAGED_ALIYUN_DYNAMIC_ROLE_PATTERN.test(currentRoleName))
+  ) {
+    throw new AliyunProviderError(
+      "ACCOUNT_ROLE_MISMATCH",
+      "RAM Role ARN 与客户阿里云账号 UID 不一致。",
+    );
+  }
+  if (connection.status === "active") {
+    return {
+      connectionId: connection.id,
+      accountUid: connection.accountUid,
+      roleArn: connection.roleArn,
+      roleName: currentRoleName,
+      status: "active" as const,
+      roleChanged: false,
+    };
+  }
+
+  const legacyRoleArn = legacyAliyunCustomerRoleArn(connection.accountUid);
+  const isLegacyRole = connection.roleArn === legacyRoleArn;
+  const probe = await probeAliyunCustomerConnection(input, factory);
+  if (probe.status === "active") {
+    return {
+      connectionId: connection.id,
+      accountUid: connection.accountUid,
+      roleArn: connection.roleArn,
+      roleName: currentRoleName,
+      status: "active" as const,
+      roleChanged: false,
+    };
+  }
+  if (
+    probe.status === "attention_required" &&
+    probe.reason === "account_mismatch"
+  ) {
+    throw new AliyunProviderError(
+      "CALLER_ACCOUNT_MISMATCH",
+      "现有 RAM Role 返回的账号与已授权阿里云账号不一致。",
+    );
+  }
+  if (probe.status === "pending" && probe.reason !== "role_not_ready") {
+    throw new AliyunProviderError(
+      ALIYUN_ROLE_MIGRATION_DEFERRED_CODE,
+      "现有 RAM Role 暂时无法完成安全检查，尚未更改角色配置。",
+      false,
+      { reason: probe.reason, retryAfterMs: probe.retryAfterMs },
+    );
+  }
+
+  const refreshed = await loadOwnedConnection(db, input);
+  if (
+    !refreshed ||
+    refreshed.status === "revoked" ||
+    refreshed.roleArn !== connection.roleArn
+  ) {
+    throw new AliyunProviderError(
+      "ALIYUN_CONNECTION_CHANGED",
+      "阿里云连接已在角色检查期间发生变更，请刷新后重试。",
+    );
+  }
+  if (refreshed.status === "active") {
+    return {
+      connectionId: refreshed.id,
+      accountUid: refreshed.accountUid,
+      roleArn: refreshed.roleArn,
+      roleName: currentRoleName,
+      status: "active" as const,
+      roleChanged: false,
+    };
+  }
+  if (probe.status === "pending" && !isLegacyRole) {
+    return {
+      connectionId: refreshed.id,
+      accountUid: refreshed.accountUid,
+      roleArn: refreshed.roleArn,
+      roleName: currentRoleName,
+      status: "unverified" as const,
+      roleChanged: false,
+    };
+  }
+
+  const replacementRoleName = isLegacyRole
+    ? aliyunCustomerRoleName(refreshed.id)
+    : aliyunRepairRoleName(refreshed.id, refreshed.roleArn);
+  const replacementRoleArn = `acs:ram::${refreshed.accountUid}:role/${replacementRoleName}`;
+  await assertAliyunConnectionMutable(db, input);
+  await updateAliyunConnectionAfterVerification({
+    db,
+    connection: refreshed,
+    values: {
+      roleArn: replacementRoleArn,
+      status: "unverified",
+      capabilities: [],
+      verifiedAt: null,
+      lastErrorCode: null,
+      updatedAt: new Date(),
+    },
+  });
+  return {
+    connectionId: refreshed.id,
+    accountUid: refreshed.accountUid,
+    roleArn: replacementRoleArn,
+    roleName: replacementRoleName,
+    status: "unverified" as const,
+    roleChanged: true,
+  };
+}
+
 /** Server-owned RAM package. It is served only as an authenticated attachment. */
 export async function getAliyunCustomerRoleAuthorizationPackage(rawInput: {
   projectId: string;
@@ -1507,9 +1894,16 @@ export async function getAliyunCustomerRoleAuthorizationPackage(rawInput: {
     );
   }
   const externalId = openAliyunExternalId(connection);
+  const currentRoleName = roleName(connection.roleArn);
+  if (!currentRoleName) {
+    throw new AliyunProviderError(
+      "ACCOUNT_ROLE_MISMATCH",
+      "当前 RAM Role ARN 无效。",
+    );
+  }
   return {
     schemaVersion: 1 as const,
-    roleName: ALIYUN_CUSTOMER_ROLE_NAME,
+    roleName: currentRoleName,
     description: `FrontMind ${SITEOPS_CUSTOMER_DISPLAY_NAME}域名与解析自动化`,
     trustPolicyDocument: {
       Version: "1",
@@ -1568,10 +1962,73 @@ export async function getAliyunCustomerConnectionStatus(
   };
 }
 
-export async function verifyAliyunCustomerConnection(
+function aliyunProbeLastErrorCode(
+  result: Exclude<AliyunCustomerConnectionProbe, { status: "active" }>,
+) {
+  if (result.status === "pending") {
+    return {
+      role_not_ready: "ALIYUN_ROLE_NOT_READY",
+      permission_propagating: "ALIYUN_PERMISSION_PROPAGATING",
+      provider_retry: "ALIYUN_PROVIDER_RETRY",
+    }[result.reason];
+  }
+  return {
+    account_mismatch: "CALLER_ACCOUNT_MISMATCH",
+    permission_incomplete: "ALIYUN_PERMISSION_INCOMPLETE",
+    external_id_not_enforced: "ALIYUN_EXTERNAL_ID_NOT_ENFORCED",
+  }[result.reason];
+}
+
+async function persistAliyunConnectionProbeResult(input: {
+  db: DbExecutor;
+  connection: SiteProviderConnection;
+  result: AliyunCustomerConnectionProbe;
+}) {
+  if (input.result.status === "active") {
+    await updateAliyunConnectionAfterVerification({
+      db: input.db,
+      connection: input.connection,
+      values: {
+        status: "active",
+        capabilities: input.result.capabilities,
+        verifiedAt: new Date(),
+        lastErrorCode: null,
+        updatedAt: new Date(),
+      },
+    });
+    return;
+  }
+  const preserveActive =
+    input.connection.status === "active" && input.result.status === "pending";
+  const lastErrorCode = aliyunProbeLastErrorCode(input.result);
+  if (
+    input.result.status === "pending" &&
+    input.connection.lastErrorCode === lastErrorCode &&
+    (input.connection.status === "unverified" || preserveActive)
+  ) {
+    return;
+  }
+  await updateAliyunConnectionAfterVerification({
+    db: input.db,
+    connection: input.connection,
+    values: {
+      status: preserveActive
+        ? "active"
+        : input.result.status === "pending"
+          ? "unverified"
+          : "invalid",
+      capabilities: preserveActive ? input.connection.capabilities : [],
+      verifiedAt: preserveActive ? input.connection.verifiedAt : null,
+      lastErrorCode,
+      updatedAt: new Date(),
+    },
+  });
+}
+
+export async function probeAliyunCustomerConnection(
   rawInput: z.input<typeof ownedConnectionInputSchema>,
   factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
-) {
+): Promise<AliyunCustomerConnectionProbe> {
   const input = ownedConnectionInputSchema.parse(rawInput);
   const db = await requireDb();
   await assertOwnedProject(db, input);
@@ -1582,7 +2039,14 @@ export async function verifyAliyunCustomerConnection(
       "客户尚未配置阿里云 RAM Role 连接。",
     );
   }
+  let stage: AliyunConnectionProbeStage = "assume_role";
   try {
+    if (roleAccount(connection.roleArn) !== connection.accountUid) {
+      throw new AliyunProviderError(
+        "ACCOUNT_ROLE_MISMATCH",
+        "RAM Role ARN 与客户阿里云账号 UID 不一致。",
+      );
+    }
     const externalId = openAliyunExternalId(connection);
     const credentials = await factory.assumeRole({
       roleArn: connection.roleArn,
@@ -1590,47 +2054,61 @@ export async function verifyAliyunCustomerConnection(
       sessionName: `frontmind-verify-${connection.id.slice(0, 8)}`,
       policy: DOMAIN_READ_POLICY,
     });
+
+    stage = "external_id_enforcement";
+    try {
+      await factory.assumeRole({
+        roleArn: connection.roleArn,
+        sessionName: `frontmind-negative-${connection.id.slice(0, 8)}`,
+        policy: DOMAIN_READ_POLICY,
+      });
+      throw new AliyunProviderError(
+        "ALIYUN_EXTERNAL_ID_NOT_ENFORCED",
+        "RAM Role 未强制校验 ExternalId。",
+      );
+    } catch (error) {
+      if (!isExpectedExternalIdDenial(error)) throw error;
+    }
+
+    stage = "caller_identity";
     const callerAccount = await factory.getCallerAccount(credentials);
-    if (
-      callerAccount !== connection.accountUid ||
-      roleAccount(connection.roleArn) !== connection.accountUid
-    ) {
+    if (callerAccount !== connection.accountUid) {
       throw new AliyunProviderError(
         "CALLER_ACCOUNT_MISMATCH",
         "AssumeRole 临时身份不属于所声明的客户账号。",
       );
     }
+    stage = "domain_permission";
     await factory.domain(credentials).listVerifiedRegistrantProfiles();
+    stage = "dns_assume_role";
     const dnsCredentials = await factory.assumeRole({
       roleArn: connection.roleArn,
       externalId,
       sessionName: `frontmind-dns-${connection.id.slice(0, 8)}`,
       policy: DNS_READ_POLICY,
     });
+    stage = "dns_caller_identity";
     if ((await factory.getCallerAccount(dnsCredentials)) !== callerAccount) {
       throw new AliyunProviderError(
         "CALLER_ACCOUNT_MISMATCH",
         "AliDNS 临时身份不属于所声明的客户账号。",
       );
     }
+    stage = "dns_permission";
     await factory.dns(dnsCredentials).listDomains();
     const capabilities = ["sts_assume_role", "domain_read", "alidns_read"];
-    await updateAliyunConnectionAfterVerification({
-      db,
-      connection,
-      values: {
-        status: "active",
-        capabilities,
-        verifiedAt: new Date(),
-        lastErrorCode: null,
-        updatedAt: new Date(),
-      },
-    });
-    return {
-      ok: true as const,
+    const result = {
+      status: "active" as const,
+      connected: true as const,
       accountUid: callerAccount,
       capabilities,
     };
+    await persistAliyunConnectionProbeResult({
+      db,
+      connection,
+      result,
+    });
+    return result;
   } catch (error) {
     if (
       error instanceof AliyunProviderError &&
@@ -1638,32 +2116,43 @@ export async function verifyAliyunCustomerConnection(
     ) {
       throw error;
     }
-    const code =
-      error instanceof AliyunProviderError
-        ? error.code
-        : "ALIYUN_CONNECTION_VERIFICATION_FAILED";
-    const definitelyInvalid = [
-      "CALLER_ACCOUNT_MISMATCH",
-      "ACCOUNT_ROLE_MISMATCH",
-      "CALLER_IDENTITY_MISSING",
-    ].includes(code);
-    const preserveActive = connection.status === "active" && !definitelyInvalid;
-    await updateAliyunConnectionAfterVerification({
+    const result = classifyAliyunConnectionProbeError({
+      error,
+      stage,
+      wasActive: connection.status === "active",
+      permissionGraceExpired:
+        connection.lastErrorCode === "ALIYUN_PERMISSION_PROPAGATING" &&
+        Date.now() - (asDate(connection.updatedAt)?.getTime() ?? 0) >=
+          ALIYUN_PERMISSION_PROPAGATION_GRACE_MS,
+    });
+    await persistAliyunConnectionProbeResult({
       db,
       connection,
-      values: {
-        // A transient platform/provider outage must not destroy a previously
-        // verified customer connection. New/unverified connections remain
-        // invalid until a complete verification succeeds.
-        status: preserveActive ? "active" : "invalid",
-        capabilities: preserveActive ? connection.capabilities : [],
-        verifiedAt: preserveActive ? connection.verifiedAt : null,
-        lastErrorCode: code,
-        updatedAt: new Date(),
-      },
+      result,
     });
-    throw error;
+    return result;
   }
+}
+
+/** Compatibility wrapper for existing server callers that expect throw/retry. */
+export async function verifyAliyunCustomerConnection(
+  rawInput: z.input<typeof ownedConnectionInputSchema>,
+  factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
+) {
+  const result = await probeAliyunCustomerConnection(rawInput, factory);
+  if (result.status === "active") {
+    return {
+      ok: true as const,
+      accountUid: result.accountUid,
+      capabilities: result.capabilities,
+    };
+  }
+  throw new AliyunProviderError(
+    aliyunProbeLastErrorCode(result),
+    result.status === "pending"
+      ? "阿里云授权尚未生效，请稍后重试。"
+      : "阿里云授权配置需要修复。",
+  );
 }
 
 /**

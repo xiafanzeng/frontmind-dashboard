@@ -33,7 +33,6 @@ import {
   Loader2,
   RefreshCw,
   RotateCcw,
-  Send,
   Sparkles,
   UserRound,
   Wrench,
@@ -52,7 +51,6 @@ export type SiteOpsConversationPanelProps = {
   refreshing?: boolean;
   error?: string | null;
   onRefresh?: () => Promise<void> | void;
-  onSendMessage?: (text: string) => Promise<void> | void;
   onAction?: (input: SiteOpsActionContext) => Promise<void> | void;
   onBeginAliyun?: () => Promise<{
     authorizationUrl: string;
@@ -66,7 +64,34 @@ export type SiteOpsConversationPanelProps = {
     trustPolicyText: string;
     permissionPolicyText: string;
   }>;
-  onVerifyAliyun?: () => Promise<void> | void;
+  onStartAliyunRoleProvisioning?: () => Promise<
+    | { status: "active"; connected: true }
+    | {
+        status: "ready";
+        connected: false;
+        rosAuthorizationUrl: string;
+        expiresAt: string;
+        retryAfterMs: number;
+      }
+  >;
+  onProbeAliyunRole?: () => Promise<
+    | { status: "active"; connected: true }
+    | {
+        status: "pending";
+        connected: false;
+        reason: "role_not_ready" | "permission_propagating" | "provider_retry";
+        retryAfterMs: number;
+      }
+    | {
+        status: "attention_required";
+        connected: false;
+        reason:
+          | "account_mismatch"
+          | "permission_incomplete"
+          | "external_id_not_enforced";
+        retryable: false;
+      }
+  >;
   onDisconnectAliyun?: () => Promise<void> | void;
   onSubmitIcpFiling?: (input: {
     domain: string;
@@ -120,10 +145,16 @@ const PRIVATE_PREVIEW_WINDOW_NAME = "frontmind-siteops-preview";
 const ALIYUN_AUTHORIZATION_WINDOW_NAME = "frontmind-aliyun-authorization";
 const ALIYUN_OAUTH_COMPLETION_MESSAGE =
   "frontmind:siteops:aliyun-oauth" as const;
+const ALIYUN_ROLE_POLL_DELAYS_MS = [
+  2_000, 3_000, 5_000, 8_000, 13_000, 20_000, 30_000,
+] as const;
+const ALIYUN_ROLE_POLL_MAX_DURATION_MS = 10 * 60 * 1_000;
 
 type AliyunOAuthCompletionStatus = "success" | "cancelled" | "failed";
 
-type AliyunOAuthWindowState = "checking" | "failed";
+type AliyunOAuthWindowState = "checking" | "provisioning" | "failed";
+
+type AliyunFlowPhase = "idle" | "oauth" | "starting" | "waiting";
 
 const ALIYUN_OAUTH_WINDOW_COPY: Record<
   AliyunOAuthWindowState,
@@ -133,11 +164,31 @@ const ALIYUN_OAUTH_WINDOW_COPY: Record<
     title: "正在检查阿里云授权配置",
     description: "请稍候，FrontMind 正在确认安全的授权入口。",
   },
+  provisioning: {
+    title: "正在准备安全角色",
+    description:
+      "请在即将打开的阿里云官方页面审阅并确认创建；FrontMind 会自动检查结果。",
+  },
   failed: {
     title: "暂时无法打开阿里云授权",
     description: "请返回 FrontMind 页面查看处理提示，配置更新后再重试。",
   },
 };
+
+const ALIYUN_PENDING_COPY = {
+  role_not_ready: "等待阿里云完成创建",
+  permission_propagating: "等待阿里云完成创建",
+  provider_retry: "等待阿里云完成创建",
+} as const;
+
+const ALIYUN_ATTENTION_COPY = {
+  account_mismatch:
+    "当前阿里云登录账号与已连接账号不一致，请切换到正确账号后重试。",
+  permission_incomplete:
+    "阿里云授权权限不完整，请重新打开一键授权并确认完整权限。",
+  external_id_not_enforced:
+    "阿里云授权的安全校验未完整生效，请重新执行一键授权。",
+} as const;
 
 function renderAliyunOAuthWindowState(
   authorizationWindow: Window,
@@ -205,6 +256,29 @@ function aliyunOAuthCompletionStatus(
   return ["success", "cancelled", "failed"].includes(event.data.status)
     ? (event.data.status as AliyunOAuthCompletionStatus)
     : null;
+}
+
+function isTrustedAliyunOAuthUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      ["signin.aliyun.com", "oauth.aliyun.com"].includes(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedAliyunRosUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" && url.hostname === "ros.console.aliyun.com"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function activeCardMessage(
@@ -530,21 +604,25 @@ export default function SiteOpsConversationPanel({
   refreshing = false,
   error = null,
   onRefresh,
-  onSendMessage,
   onAction,
   onBeginAliyun,
   onLoadAliyunAuthorizationGuide,
-  onVerifyAliyun,
+  onStartAliyunRoleProvisioning,
+  onProbeAliyunRole,
   onDisconnectAliyun,
   onSubmitIcpFiling,
 }: SiteOpsConversationPanelProps) {
-  const [message, setMessage] = useState("");
   const [selectedSnapshotId, setSelectedSnapshotId] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [aliyunConnectionError, setAliyunConnectionError] = useState<
     string | null
   >(null);
+  const [aliyunProvisioningMessage, setAliyunProvisioningMessage] = useState<
+    string | null
+  >(null);
+  const [aliyunFlowPhase, setAliyunFlowPhase] =
+    useState<AliyunFlowPhase>("idle");
   const [previewOpenError, setPreviewOpenError] = useState<string | null>(null);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
@@ -566,6 +644,28 @@ export default function SiteOpsConversationPanel({
   const [icpNumber, setIcpNumber] = useState("");
   const [activeVisualPage, setActiveVisualPage] = useState(1);
   const aliyunAuthorizationWindow = useRef<Window | null>(null);
+  const aliyunFlowPhaseRef = useRef<AliyunFlowPhase>("idle");
+  const aliyunFlowGenerationRef = useRef(0);
+  const aliyunPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const aliyunPollDeadlineRef = useRef(0);
+  const aliyunPollDelayIndexRef = useRef(0);
+  const aliyunProbeInFlightGenerationRef = useRef<number | null>(null);
+  const continueAliyunProvisioningRef = useRef<() => void>(() => undefined);
+  const probeAliyunRoleRef = useRef<() => void>(() => undefined);
+  const stopAliyunFlowRef = useRef<
+    (generation: number, authorizationWindow: Window, message: string) => void
+  >(() => undefined);
+  const clearAliyunPollTimerRef = useRef<() => void>(() => undefined);
+  const aliyunCallbacksRef = useRef({
+    onRefresh,
+    onStartAliyunRoleProvisioning,
+    onProbeAliyunRole,
+  });
+  aliyunCallbacksRef.current = {
+    onRefresh,
+    onStartAliyunRoleProvisioning,
+    onProbeAliyunRole,
+  };
   const previousVisualPageCount = useRef(0);
   const latestAttempt = useMemo(() => {
     const visibleBuilds = observation?.builds.filter(
@@ -632,41 +732,6 @@ export default function SiteOpsConversationPanel({
     setPreviewOpenError(null);
   }, [latestBuild?.previewUrl]);
 
-  useEffect(() => {
-    function handleAliyunOAuthCompletion(event: MessageEvent) {
-      const status = aliyunOAuthCompletionStatus(
-        event,
-        aliyunAuthorizationWindow.current,
-      );
-      if (!status) return;
-
-      aliyunAuthorizationWindow.current?.close();
-      aliyunAuthorizationWindow.current = null;
-      if (status === "success") {
-        setAliyunConnectionError(null);
-        setLocalError(null);
-        void Promise.resolve()
-          .then(() => onRefresh?.())
-          .catch(() => {
-            setAliyunConnectionError(
-              "阿里云连接状态暂时无法刷新，请稍后点击刷新。",
-            );
-          });
-        return;
-      }
-      setAliyunConnectionError(
-        status === "cancelled"
-          ? "你已取消阿里云授权，未产生任何连接。"
-          : "阿里云连接配置需要 FrontMind 管理员更新。",
-      );
-    }
-
-    window.addEventListener("message", handleAliyunOAuthCompletion);
-    return () => {
-      window.removeEventListener("message", handleAliyunOAuthCompletion);
-    };
-  }, [onRefresh]);
-
   function openPrivatePreview(previewUrl: string) {
     setPreviewOpenError(null);
     const previewWindow = window.open(previewUrl, PRIVATE_PREVIEW_WINDOW_NAME);
@@ -696,26 +761,6 @@ export default function SiteOpsConversationPanel({
     }
   }
 
-  async function submitMessage(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const text = message.trim();
-    if (!text || !onSendMessage || busyAction) return;
-    setBusyAction("message");
-    setLocalError(null);
-    try {
-      await onSendMessage(text);
-      setMessage("");
-    } catch (messageError) {
-      setLocalError(
-        messageError instanceof Error
-          ? customerFacingMessage(messageError.message)
-          : "消息发送失败，请稍后重试。",
-      );
-    } finally {
-      setBusyAction(null);
-    }
-  }
-
   async function resetWorkflow() {
     if (!onAction || busyAction || !observation?.resetCapability.allowed) {
       return;
@@ -728,7 +773,6 @@ export default function SiteOpsConversationPanel({
         action: "reset_workflow",
         input: { confirmed: true },
       });
-      setMessage("");
       setSelectedSnapshotId("");
       setLocalError(null);
       setResetDialogOpen(false);
@@ -773,8 +817,327 @@ export default function SiteOpsConversationPanel({
     }
   }
 
+  function setAliyunPhase(phase: AliyunFlowPhase) {
+    aliyunFlowPhaseRef.current = phase;
+    setAliyunFlowPhase(phase);
+  }
+
+  function clearAliyunPollTimer() {
+    if (aliyunPollTimerRef.current !== null) {
+      clearTimeout(aliyunPollTimerRef.current);
+      aliyunPollTimerRef.current = null;
+    }
+  }
+
+  function isCurrentAliyunFlow(
+    generation: number,
+    authorizationWindow: Window,
+  ) {
+    return (
+      aliyunFlowGenerationRef.current === generation &&
+      aliyunAuthorizationWindow.current === authorizationWindow
+    );
+  }
+
+  function beginAliyunFlow(
+    phase: Exclude<AliyunFlowPhase, "idle">,
+    authorizationWindow: Window,
+  ) {
+    clearAliyunPollTimer();
+    aliyunProbeInFlightGenerationRef.current = null;
+    const generation = aliyunFlowGenerationRef.current + 1;
+    aliyunFlowGenerationRef.current = generation;
+    aliyunAuthorizationWindow.current = authorizationWindow;
+    setAliyunPhase(phase);
+    setAliyunConnectionError(null);
+    setAliyunProvisioningMessage(null);
+    setLocalError(null);
+    return generation;
+  }
+
+  function stopAliyunFlow(
+    generation: number,
+    authorizationWindow: Window,
+    message: string,
+  ) {
+    if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+    clearAliyunPollTimer();
+    aliyunProbeInFlightGenerationRef.current = null;
+    setAliyunPhase("idle");
+    setAliyunProvisioningMessage(null);
+    setAliyunConnectionError(message);
+    renderAliyunOAuthWindowState(authorizationWindow, "failed");
+    if (authorizationWindow.closed === true) {
+      aliyunAuthorizationWindow.current = null;
+    }
+  }
+
+  async function completeAliyunRoleProvisioning(
+    generation: number,
+    authorizationWindow: Window,
+  ) {
+    if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+    clearAliyunPollTimer();
+    setAliyunPhase("starting");
+    setAliyunProvisioningMessage("阿里云已连接");
+    try {
+      await aliyunCallbacksRef.current.onRefresh?.();
+    } catch {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "阿里云授权已生效，但连接状态暂时无法刷新，请稍后重试。",
+      );
+      return;
+    }
+    if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+    try {
+      authorizationWindow.close();
+    } catch {
+      // The connection is already active. A browser denying close is harmless.
+    }
+    aliyunAuthorizationWindow.current = null;
+    aliyunProbeInFlightGenerationRef.current = null;
+    setAliyunPhase("idle");
+    setAliyunConnectionError(null);
+    setAliyunProvisioningMessage("阿里云已连接");
+  }
+
+  function aliyunRolePollDelay(retryAfterMs: number) {
+    const index = Math.min(
+      aliyunPollDelayIndexRef.current,
+      ALIYUN_ROLE_POLL_DELAYS_MS.length - 1,
+    );
+    const sequenceDelay = ALIYUN_ROLE_POLL_DELAYS_MS[index];
+    aliyunPollDelayIndexRef.current = Math.min(
+      index + 1,
+      ALIYUN_ROLE_POLL_DELAYS_MS.length - 1,
+    );
+    const providerDelay = Number.isFinite(retryAfterMs)
+      ? Math.min(Math.max(0, retryAfterMs), 30_000)
+      : 0;
+    return Math.max(sequenceDelay, providerDelay);
+  }
+
+  function scheduleAliyunRoleProbe(
+    generation: number,
+    authorizationWindow: Window,
+    retryAfterMs: number,
+  ) {
+    if (
+      !isCurrentAliyunFlow(generation, authorizationWindow) ||
+      aliyunFlowPhaseRef.current !== "waiting"
+    ) {
+      return;
+    }
+    clearAliyunPollTimer();
+    const remainingMs = aliyunPollDeadlineRef.current - Date.now();
+    if (remainingMs <= 0) {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "尚未检测到安全角色，可重新打开阿里云继续",
+      );
+      return;
+    }
+    const delayMs = aliyunRolePollDelay(retryAfterMs);
+    aliyunPollTimerRef.current = setTimeout(
+      () => {
+        aliyunPollTimerRef.current = null;
+        if (Date.now() >= aliyunPollDeadlineRef.current) {
+          stopAliyunFlow(
+            generation,
+            authorizationWindow,
+            "尚未检测到安全角色，可重新打开阿里云继续",
+          );
+          return;
+        }
+        probeAliyunRoleRef.current();
+      },
+      Math.min(delayMs, remainingMs),
+    );
+  }
+
+  async function probeAliyunRoleNow() {
+    const generation = aliyunFlowGenerationRef.current;
+    const authorizationWindow = aliyunAuthorizationWindow.current;
+    if (
+      !authorizationWindow ||
+      aliyunFlowPhaseRef.current !== "waiting" ||
+      aliyunProbeInFlightGenerationRef.current === generation
+    ) {
+      return;
+    }
+    const probe = aliyunCallbacksRef.current.onProbeAliyunRole;
+    if (!probe) {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "暂时无法检查阿里云授权结果，请稍后重试。",
+      );
+      return;
+    }
+    clearAliyunPollTimer();
+    aliyunProbeInFlightGenerationRef.current = generation;
+    try {
+      const result = await probe();
+      if (
+        !isCurrentAliyunFlow(generation, authorizationWindow) ||
+        aliyunFlowPhaseRef.current !== "waiting"
+      ) {
+        return;
+      }
+      if (result.status === "active") {
+        await completeAliyunRoleProvisioning(generation, authorizationWindow);
+        return;
+      }
+      if (result.status === "attention_required") {
+        stopAliyunFlow(
+          generation,
+          authorizationWindow,
+          ALIYUN_ATTENTION_COPY[result.reason],
+        );
+        return;
+      }
+      setAliyunProvisioningMessage(ALIYUN_PENDING_COPY[result.reason]);
+      scheduleAliyunRoleProbe(
+        generation,
+        authorizationWindow,
+        result.retryAfterMs,
+      );
+    } catch {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "暂时无法检查阿里云授权结果，请保留当前页面并稍后重试。",
+      );
+    } finally {
+      if (aliyunProbeInFlightGenerationRef.current === generation) {
+        aliyunProbeInFlightGenerationRef.current = null;
+      }
+    }
+  }
+
+  async function requestAliyunRoleProvisioning(
+    generation: number,
+    authorizationWindow: Window,
+  ) {
+    const start = aliyunCallbacksRef.current.onStartAliyunRoleProvisioning;
+    if (!start) {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "阿里云一键授权暂时不可用，请稍后重试。",
+      );
+      return;
+    }
+    let result: Awaited<ReturnType<typeof start>>;
+    try {
+      result = await start();
+    } catch {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "暂时无法准备阿里云一键授权，请保留当前页面并稍后重试。",
+      );
+      return;
+    }
+    if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+    if (result.status === "active") {
+      await completeAliyunRoleProvisioning(generation, authorizationWindow);
+      return;
+    }
+    if (!isTrustedAliyunRosUrl(result.rosAuthorizationUrl)) {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "暂时无法打开安全的阿里云授权页面，请稍后重试。",
+      );
+      return;
+    }
+    if (authorizationWindow.closed === true) {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "阿里云授权窗口已关闭，请重新执行一键授权。",
+      );
+      return;
+    }
+    const now = Date.now();
+    const parsedExpiry = Date.parse(result.expiresAt);
+    const expiry =
+      Number.isFinite(parsedExpiry) && parsedExpiry > now
+        ? parsedExpiry
+        : now + ALIYUN_ROLE_POLL_MAX_DURATION_MS;
+    aliyunPollDeadlineRef.current = Math.min(
+      now + ALIYUN_ROLE_POLL_MAX_DURATION_MS,
+      expiry,
+    );
+    aliyunPollDelayIndexRef.current = 0;
+    setAliyunPhase("waiting");
+    setAliyunProvisioningMessage(ALIYUN_PENDING_COPY.role_not_ready);
+    renderAliyunOAuthWindowState(authorizationWindow, "provisioning");
+    try {
+      authorizationWindow.opener = null;
+    } catch {
+      // The callback has completed; severing opener is best-effort hardening.
+    }
+    try {
+      authorizationWindow.location.href = result.rosAuthorizationUrl;
+      authorizationWindow.focus();
+    } catch {
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
+        "暂时无法打开阿里云一键授权页面，请保留当前页面并稍后重试。",
+      );
+      return;
+    }
+    scheduleAliyunRoleProbe(
+      generation,
+      authorizationWindow,
+      result.retryAfterMs,
+    );
+  }
+
+  async function continueAliyunProvisioningAfterOAuth() {
+    const generation = aliyunFlowGenerationRef.current;
+    const authorizationWindow = aliyunAuthorizationWindow.current;
+    if (
+      !authorizationWindow ||
+      aliyunFlowPhaseRef.current !== "oauth" ||
+      !isCurrentAliyunFlow(generation, authorizationWindow)
+    ) {
+      return;
+    }
+    setAliyunPhase("starting");
+    setAliyunProvisioningMessage("正在准备安全角色");
+    renderAliyunOAuthWindowState(authorizationWindow, "provisioning");
+    setBusyAction("aliyun_start");
+    try {
+      try {
+        await aliyunCallbacksRef.current.onRefresh?.();
+      } catch {
+        stopAliyunFlow(
+          generation,
+          authorizationWindow,
+          "账号身份已确认，但连接状态暂时无法刷新，请稍后重试。",
+        );
+        return;
+      }
+      if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+      await requestAliyunRoleProvisioning(generation, authorizationWindow);
+    } finally {
+      if (aliyunFlowGenerationRef.current === generation) {
+        setBusyAction(null);
+      }
+    }
+  }
+
   async function beginAliyunConnection() {
-    if (!onBeginAliyun || busyAction) return;
+    if (!onBeginAliyun || busyAction || aliyunFlowPhaseRef.current !== "idle") {
+      return;
+    }
     const authorizationWindow = window.open(
       "",
       ALIYUN_AUTHORIZATION_WINDOW_NAME,
@@ -787,40 +1150,90 @@ export default function SiteOpsConversationPanel({
       );
       return;
     }
-    aliyunAuthorizationWindow.current = authorizationWindow;
+    const generation = beginAliyunFlow("oauth", authorizationWindow);
     renderAliyunOAuthWindowState(authorizationWindow, "checking");
     authorizationWindow.focus();
     setBusyAction("aliyun_begin");
     try {
       const result = await onBeginAliyun();
+      if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+      if (!isTrustedAliyunOAuthUrl(result.authorizationUrl)) {
+        stopAliyunFlow(
+          generation,
+          authorizationWindow,
+          "暂时无法打开安全的阿里云授权页面，请稍后重试。",
+        );
+        return;
+      }
+      if (authorizationWindow.closed === true) {
+        stopAliyunFlow(
+          generation,
+          authorizationWindow,
+          "阿里云授权窗口已关闭，请重新连接。",
+        );
+        return;
+      }
       authorizationWindow.location.href = result.authorizationUrl;
       authorizationWindow.focus();
     } catch (connectionError) {
-      renderAliyunOAuthWindowState(authorizationWindow, "failed");
-      authorizationWindow.focus();
-      setAliyunConnectionError(
+      if (!isCurrentAliyunFlow(generation, authorizationWindow)) return;
+      stopAliyunFlow(
+        generation,
+        authorizationWindow,
         connectionError instanceof Error
           ? customerFacingMessage(connectionError.message)
           : "暂时无法打开阿里云授权页面，请稍后重试。",
       );
+      authorizationWindow.focus();
     } finally {
-      setBusyAction(null);
+      if (aliyunFlowGenerationRef.current === generation) {
+        setBusyAction(null);
+      }
+    }
+  }
+
+  async function startAliyunOneClickAuthorization() {
+    if (
+      !onStartAliyunRoleProvisioning ||
+      busyAction ||
+      aliyunFlowPhaseRef.current !== "idle"
+    ) {
+      return;
+    }
+    const authorizationWindow = window.open(
+      "",
+      ALIYUN_AUTHORIZATION_WINDOW_NAME,
+    );
+    setAliyunConnectionError(null);
+    setLocalError(null);
+    if (!authorizationWindow) {
+      setAliyunConnectionError(
+        "阿里云授权页面被浏览器阻止，请允许此站点打开弹窗后重试。",
+      );
+      return;
+    }
+    const generation = beginAliyunFlow("starting", authorizationWindow);
+    setAliyunProvisioningMessage("正在准备安全角色");
+    renderAliyunOAuthWindowState(authorizationWindow, "provisioning");
+    authorizationWindow.focus();
+    setBusyAction("aliyun_start");
+    try {
+      await requestAliyunRoleProvisioning(generation, authorizationWindow);
+    } finally {
+      if (aliyunFlowGenerationRef.current === generation) {
+        setBusyAction(null);
+      }
     }
   }
 
   async function openAliyunAuthorizationGuide() {
     if (!onLoadAliyunAuthorizationGuide || busyAction) return;
-    const authorizationWindow = window.open(
-      "",
-      ALIYUN_AUTHORIZATION_WINDOW_NAME,
-    );
     setBusyAction("aliyun_guide");
     setLocalError(null);
     try {
       const guide = await onLoadAliyunAuthorizationGuide();
       if (!guide.available) {
-        authorizationWindow?.close();
-        setLocalError("阿里云授权配置尚未就绪，请联系 FrontMind。 ");
+        setLocalError("阿里云授权配置尚未就绪，请联系 FrontMind。");
         return;
       }
       setAliyunGuide({
@@ -830,18 +1243,11 @@ export default function SiteOpsConversationPanel({
         trustPolicyText: guide.trustPolicyText,
         permissionPolicyText: guide.permissionPolicyText,
       });
-      if (authorizationWindow) {
-        authorizationWindow.location.href = guide.consoleUrl;
-        authorizationWindow.focus();
-      } else {
-        setLocalError("阿里云授权页面被浏览器阻止，请允许弹窗后重试。");
-      }
     } catch (guideError) {
-      authorizationWindow?.close();
       setLocalError(
         guideError instanceof Error
           ? customerFacingMessage(guideError.message)
-          : "暂时无法打开阿里云授权页面，请稍后重试。",
+          : "暂时无法载入阿里云手动配置，请稍后重试。",
       );
     } finally {
       setBusyAction(null);
@@ -869,7 +1275,10 @@ export default function SiteOpsConversationPanel({
     setLocalError(null);
     try {
       await action();
-      if (key === "aliyun_disconnect") setAliyunGuide(null);
+      if (key === "aliyun_disconnect") {
+        setAliyunGuide(null);
+        setAliyunProvisioningMessage(null);
+      }
     } catch (connectionError) {
       setLocalError(
         connectionError instanceof Error
@@ -901,6 +1310,73 @@ export default function SiteOpsConversationPanel({
       setBusyAction(null);
     }
   }
+
+  continueAliyunProvisioningRef.current = () => {
+    void continueAliyunProvisioningAfterOAuth();
+  };
+  probeAliyunRoleRef.current = () => {
+    void probeAliyunRoleNow();
+  };
+  stopAliyunFlowRef.current = stopAliyunFlow;
+  clearAliyunPollTimerRef.current = clearAliyunPollTimer;
+
+  useEffect(() => {
+    function handleAliyunOAuthCompletion(event: MessageEvent) {
+      const authorizationWindow = aliyunAuthorizationWindow.current;
+      const status = aliyunOAuthCompletionStatus(event, authorizationWindow);
+      if (
+        !status ||
+        !authorizationWindow ||
+        aliyunFlowPhaseRef.current !== "oauth"
+      ) {
+        return;
+      }
+      const generation = aliyunFlowGenerationRef.current;
+      if (status === "success") {
+        setAliyunConnectionError(null);
+        setLocalError(null);
+        continueAliyunProvisioningRef.current();
+        return;
+      }
+      stopAliyunFlowRef.current(
+        generation,
+        authorizationWindow,
+        status === "cancelled"
+          ? "你已取消阿里云授权，未产生任何连接。"
+          : "阿里云连接配置需要 FrontMind 管理员更新。",
+      );
+    }
+
+    function handleWindowFocus() {
+      const authorizationWindow = aliyunAuthorizationWindow.current;
+      if (!authorizationWindow) return;
+      if (
+        aliyunFlowPhaseRef.current === "oauth" &&
+        authorizationWindow.closed === true
+      ) {
+        stopAliyunFlowRef.current(
+          aliyunFlowGenerationRef.current,
+          authorizationWindow,
+          "你已关闭阿里云授权窗口，未产生任何连接。",
+        );
+        return;
+      }
+      if (aliyunFlowPhaseRef.current === "waiting") {
+        probeAliyunRoleRef.current();
+      }
+    }
+
+    window.addEventListener("message", handleAliyunOAuthCompletion);
+    window.addEventListener("focus", handleWindowFocus);
+    return () => {
+      window.removeEventListener("message", handleAliyunOAuthCompletion);
+      window.removeEventListener("focus", handleWindowFocus);
+      clearAliyunPollTimerRef.current();
+      aliyunFlowGenerationRef.current += 1;
+      aliyunProbeInFlightGenerationRef.current = null;
+      aliyunFlowPhaseRef.current = "idle";
+    };
+  }, []);
 
   if (loading && !observation) {
     return (
@@ -1527,7 +2003,7 @@ export default function SiteOpsConversationPanel({
               <div className="siteops-inline-actions">
                 <button
                   type="button"
-                  className="siteops-secondary-button"
+                  className="siteops-primary-button"
                   disabled={
                     visualSelectionDisabled || !visualGeneration.canGenerateMore
                   }
@@ -1546,24 +2022,6 @@ export default function SiteOpsConversationPanel({
                   {visualGeneration.canGenerateMore
                     ? "重新生成 9 个视觉候选"
                     : "已生成全部 27 个候选"}
-                </button>
-                <button
-                  type="button"
-                  className="siteops-secondary-button"
-                  disabled={visualSelectionDisabled}
-                  onClick={() =>
-                    runAction(
-                      "delegate_visual",
-                      actionFromCard(
-                        observation,
-                        "visual_board",
-                        "delegate_visual",
-                        {},
-                      ),
-                    )
-                  }
-                >
-                  让 FrontMind 推荐
                 </button>
               </div>
             )}
@@ -1875,13 +2333,18 @@ export default function SiteOpsConversationPanel({
             </p>
             <h3 id="siteops-domain-title">连接阿里云</h3>
             <p>授权完成后，FrontMind 将自动处理域名查询、网站配置与发布。</p>
+            <p className="siteops-aliyun-security-note">
+              {
+                "需阿里云主账号或具备 ROS、RAM 创建权限的管理员确认一次；FrontMind 不会获取客户 AccessKey。"
+              }
+            </p>
           </div>
           <span
             className="siteops-status-pill"
             data-status={observation.aliyunConnection.status ?? "none"}
           >
             {observation.aliyunConnection.status === "active"
-              ? "已连接"
+              ? "阿里云已连接"
               : observation.aliyunConnection.status === "authorization_required"
                 ? "等待完成授权"
                 : observation.aliyunConnection.status === "attention_required"
@@ -1901,12 +2364,31 @@ export default function SiteOpsConversationPanel({
           </div>
         )}
 
+        {aliyunProvisioningMessage && !aliyunConnectionError && (
+          <div
+            className="siteops-notice siteops-aliyun-progress"
+            role="status"
+            aria-live="polite"
+          >
+            {aliyunProvisioningMessage === "阿里云已连接" ? (
+              <Check size={18} aria-hidden="true" />
+            ) : (
+              <Loader2 className="siteops-spin" size={18} aria-hidden="true" />
+            )}
+            <span>{aliyunProvisioningMessage}</span>
+          </div>
+        )}
+
         <div className="siteops-domain-actions">
           {observation.aliyunConnection.status === "not_connected" && (
             <button
               type="button"
               className="siteops-primary-button"
-              disabled={!onBeginAliyun || Boolean(busyAction)}
+              disabled={
+                !onBeginAliyun ||
+                Boolean(busyAction) ||
+                aliyunFlowPhase !== "idle"
+              }
               onClick={() => void beginAliyunConnection()}
             >
               {busyAction === "aliyun_begin" && (
@@ -1916,105 +2398,32 @@ export default function SiteOpsConversationPanel({
                   aria-hidden="true"
                 />
               )}
-              连接阿里云
+              一键连接阿里云
             </button>
           )}
-          {observation.aliyunConnection.status === "authorization_required" && (
-            <>
-              <button
-                type="button"
-                className="siteops-primary-button"
-                disabled={
-                  !onLoadAliyunAuthorizationGuide || Boolean(busyAction)
-                }
-                onClick={() => void openAliyunAuthorizationGuide()}
-              >
-                {busyAction === "aliyun_guide" && (
-                  <Loader2
-                    className="siteops-spin"
-                    size={15}
-                    aria-hidden="true"
-                  />
-                )}
-                前往阿里云完成授权
-              </button>
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled={!onVerifyAliyun || Boolean(busyAction)}
-                onClick={() =>
-                  runConnectionAction("aliyun_verify", onVerifyAliyun)
-                }
-              >
-                我已完成授权
-              </button>
-            </>
-          )}
-          {aliyunGuide && (
-            <div
-              className="siteops-aliyun-guide"
-              role="region"
-              aria-label="阿里云授权步骤"
+          {["authorization_required", "attention_required"].includes(
+            observation.aliyunConnection.status,
+          ) && (
+            <button
+              type="button"
+              className="siteops-primary-button"
+              disabled={
+                !onStartAliyunRoleProvisioning ||
+                !onProbeAliyunRole ||
+                Boolean(busyAction) ||
+                aliyunFlowPhase !== "idle"
+              }
+              onClick={() => void startAliyunOneClickAuthorization()}
             >
-              <strong>按以下 3 步完成一次授权</strong>
-              <ol>
-                <li>
-                  <span>
-                    复制固定角色名称，并在已打开的阿里云页面创建角色。
-                  </span>
-                  <button
-                    type="button"
-                    className="siteops-secondary-button"
-                    onClick={() =>
-                      void copyAliyunAuthorizationStep(
-                        "role",
-                        aliyunGuide.roleName,
-                      )
-                    }
-                  >
-                    {copiedAliyunStep === "role" ? "已复制" : "复制角色名称"}
-                  </button>
-                </li>
-                <li>
-                  <span>在角色信任设置中粘贴第 2 步配置。</span>
-                  <button
-                    type="button"
-                    className="siteops-secondary-button"
-                    onClick={() =>
-                      void copyAliyunAuthorizationStep(
-                        "trust",
-                        aliyunGuide.trustPolicyText,
-                      )
-                    }
-                  >
-                    {copiedAliyunStep === "trust"
-                      ? "已复制"
-                      : "复制第 2 步配置"}
-                  </button>
-                </li>
-                <li>
-                  <span>创建并绑定权限策略，然后返回点击“我已完成授权”。</span>
-                  <button
-                    type="button"
-                    className="siteops-secondary-button"
-                    onClick={() =>
-                      void copyAliyunAuthorizationStep(
-                        "permission",
-                        aliyunGuide.permissionPolicyText,
-                      )
-                    }
-                  >
-                    {copiedAliyunStep === "permission"
-                      ? "已复制"
-                      : "复制第 3 步配置"}
-                  </button>
-                </li>
-              </ol>
-              <a href={aliyunGuide.configurationDownloadUrl}>
-                <Download size={15} aria-hidden="true" />
-                下载备用配置
-              </a>
-            </div>
+              {["starting", "waiting"].includes(aliyunFlowPhase) && (
+                <Loader2
+                  className="siteops-spin"
+                  size={15}
+                  aria-hidden="true"
+                />
+              )}
+              继续阿里云一键授权
+            </button>
           )}
           {observation.aliyunConnection.status === "active" && (
             <button
@@ -2035,14 +2444,126 @@ export default function SiteOpsConversationPanel({
         </div>
 
         {observation.aliyunConnection.status === "authorization_required" && (
-          <div className="siteops-notice warning">
-            请在阿里云官方页面完成授权，然后返回这里继续。
+          <div className="siteops-notice warning" role="status">
+            点击上方按钮后，只需在阿里云官方页面审阅并确认；FrontMind
+            会自动检查授权结果。
           </div>
         )}
         {observation.aliyunConnection.status === "attention_required" && (
-          <div className="siteops-notice warning">
-            阿里云授权需要协助，请稍后重试或提交工单。
+          <div
+            className="siteops-notice warning"
+            role="alert"
+            aria-live="assertive"
+          >
+            当前授权需要重新确认，请使用上方一键授权修复。
           </div>
+        )}
+        {["authorization_required", "attention_required"].includes(
+          observation.aliyunConnection.status,
+        ) && (
+          <details className="siteops-aliyun-manual">
+            <summary>高级：手动配置</summary>
+            <div className="siteops-aliyun-manual-content">
+              <p>仅在一键授权无法使用时，按以下备用方式手动配置。</p>
+              {!aliyunGuide && (
+                <button
+                  type="button"
+                  className="siteops-secondary-button"
+                  disabled={
+                    !onLoadAliyunAuthorizationGuide || Boolean(busyAction)
+                  }
+                  onClick={() => void openAliyunAuthorizationGuide()}
+                >
+                  {busyAction === "aliyun_guide" && (
+                    <Loader2
+                      className="siteops-spin"
+                      size={15}
+                      aria-hidden="true"
+                    />
+                  )}
+                  载入手动配置
+                </button>
+              )}
+              {aliyunGuide && (
+                <div
+                  className="siteops-aliyun-guide"
+                  role="region"
+                  aria-label="阿里云手动授权步骤"
+                >
+                  <strong>备用手动配置（3 步）</strong>
+                  <ol>
+                    <li>
+                      <span>在阿里云 RAM 控制台创建指定名称的角色。</span>
+                      <button
+                        type="button"
+                        className="siteops-secondary-button"
+                        onClick={() =>
+                          void copyAliyunAuthorizationStep(
+                            "role",
+                            aliyunGuide.roleName,
+                          )
+                        }
+                      >
+                        {copiedAliyunStep === "role"
+                          ? "已复制"
+                          : "复制角色名称"}
+                      </button>
+                    </li>
+                    <li>
+                      <span>在角色信任设置中粘贴信任配置。</span>
+                      <button
+                        type="button"
+                        className="siteops-secondary-button"
+                        onClick={() =>
+                          void copyAliyunAuthorizationStep(
+                            "trust",
+                            aliyunGuide.trustPolicyText,
+                          )
+                        }
+                      >
+                        {copiedAliyunStep === "trust"
+                          ? "已复制"
+                          : "复制信任配置"}
+                      </button>
+                    </li>
+                    <li>
+                      <span>
+                        创建并绑定权限策略；FrontMind 会继续自动检查结果。
+                      </span>
+                      <button
+                        type="button"
+                        className="siteops-secondary-button"
+                        onClick={() =>
+                          void copyAliyunAuthorizationStep(
+                            "permission",
+                            aliyunGuide.permissionPolicyText,
+                          )
+                        }
+                      >
+                        {copiedAliyunStep === "permission"
+                          ? "已复制"
+                          : "复制权限配置"}
+                      </button>
+                    </li>
+                  </ol>
+                  <div className="siteops-aliyun-guide-links">
+                    <a
+                      href={aliyunGuide.consoleUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <ExternalLink size={15} aria-hidden="true" />
+                      打开 RAM 控制台
+                    </a>
+                    <a href={aliyunGuide.configurationDownloadUrl}>
+                      <Download size={15} aria-hidden="true" />
+                      下载备用配置
+                    </a>
+                  </div>
+                </div>
+              )}
+            </div>
+          </details>
         )}
         {!observation.aliyunConnection.canRotate && (
           <div className="siteops-notice warning">
@@ -2406,41 +2927,6 @@ export default function SiteOpsConversationPanel({
           </div>
         )}
       </section>
-
-      {(!hasSuccessfulBuild || rebuildInProgress) &&
-        !rebuildNeedsKnowledgeSnapshot && (
-          <form className="siteops-composer" onSubmit={submitMessage}>
-            <label htmlFor="siteops-message-input">继续对话</label>
-            <div>
-              <textarea
-                id="siteops-message-input"
-                rows={3}
-                value={message}
-                disabled={!onSendMessage}
-                onChange={(event) => setMessage(event.target.value)}
-                placeholder="补充公司信息，或说明需要修改的文案、布局与内容…"
-              />
-              <button
-                type="submit"
-                className="siteops-primary-button"
-                disabled={
-                  !message.trim() || !onSendMessage || Boolean(busyAction)
-                }
-              >
-                {busyAction === "message" ? (
-                  <Loader2
-                    className="siteops-spin"
-                    size={16}
-                    aria-hidden="true"
-                  />
-                ) : (
-                  <Send size={16} aria-hidden="true" />
-                )}
-                发送
-              </button>
-            </div>
-          </form>
-        )}
     </section>
   );
 }

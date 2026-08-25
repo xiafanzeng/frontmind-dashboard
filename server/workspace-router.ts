@@ -107,8 +107,10 @@ import {
   getSiteOpsAliyunConnection,
   observeSiteOps,
   openSiteOps,
+  probeSiteOpsAliyunRole,
   sendSiteOpsMessage,
   SiteOpsServiceError,
+  startSiteOpsAliyunRoleProvisioning,
   verifySiteOpsAliyunConnection,
 } from "./siteops/service";
 import { brandQuestionUniverseStartInputSchema } from "../shared/brand-question-universe";
@@ -342,6 +344,24 @@ export const workspaceRouter = router({
         .query(async ({ ctx, input }) => {
           try {
             return await getSiteOpsAliyunAuthorizationGuide(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+      startRoleProvisioning: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
+        .mutation(async ({ ctx, input }) => {
+          try {
+            return await startSiteOpsAliyunRoleProvisioning(ctx.user, input);
+          } catch (error) {
+            toSiteOpsServiceError(error);
+          }
+        }),
+      probeRole: protectedProcedure
+        .input(siteOpsAliyunConnectionInputSchema)
+        .mutation(async ({ ctx, input }) => {
+          try {
+            return await probeSiteOpsAliyunRole(ctx.user, input);
           } catch (error) {
             toSiteOpsServiceError(error);
           }

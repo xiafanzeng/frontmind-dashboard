@@ -7,6 +7,7 @@ import {
 } from "../../drizzle/schema";
 import {
   aliyunDnsExpectedRecordsHash,
+  aliyunCustomerRoleName,
   aliyunFinancialSessionPolicy,
   assertAliyunDnsTargetCurrent,
   assertAliyunRenewalTarget,
@@ -188,16 +189,15 @@ describe("Aliyun SiteOps provider", () => {
       update: vi.fn(),
     };
 
-    await expect(
-      bindAliyunCustomerAccountFromOAuth(
-        {
-          projectId,
-          userId: 42,
-          accountUid: "1234567890123456",
-        },
-        transaction as never,
-      ),
-    ).resolves.toMatchObject({
+    const binding = await bindAliyunCustomerAccountFromOAuth(
+      {
+        projectId,
+        userId: 42,
+        accountUid: "1234567890123456",
+      },
+      transaction as never,
+    );
+    expect(binding).toMatchObject({
       status: "unverified",
       requiresRoleAuthorization: true,
     });
@@ -210,7 +210,7 @@ describe("Aliyun SiteOps provider", () => {
       userId: 42,
       provider: "aliyun_cn",
       accountUid: "1234567890123456",
-      roleArn: "acs:ram::1234567890123456:role/FrontMindSiteOpsAccess",
+      roleArn: `acs:ram::1234567890123456:role/${aliyunCustomerRoleName(binding.connectionId)}`,
       capabilities: [],
       status: "unverified",
     });

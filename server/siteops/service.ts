@@ -86,6 +86,8 @@ import {
   disconnectAliyunCustomerConnection,
   getAliyunCustomerConnectionStatus,
   getAliyunCustomerRoleAuthorizationPackage,
+  prepareAliyunCustomerRoleProvisioning,
+  probeAliyunCustomerConnection,
   verifyAliyunCustomerConnection,
 } from "./aliyun-provider";
 import {
@@ -93,6 +95,15 @@ import {
   createAliyunOAuthAuthorization,
   getActiveAliyunBrokerCredential,
 } from "./aliyun-platform-service";
+import {
+  ALIYUN_ROS_TEMPLATE_VERSION,
+  buildAliyunRosAuthorizationUrl,
+  buildAliyunRosRoleTemplate,
+  fingerprintAliyunProvisioningValue,
+  issueAliyunRosTemplateCapability,
+  readAliyunRosTemplateCapability,
+  type AliyunRosCapabilityClaims,
+} from "./aliyun-ros-provisioning";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import {
   publicSiteOpsDomainIssue,
@@ -2526,6 +2537,222 @@ export async function getSiteOpsAliyunAuthorizationGuide(
   } catch (error) {
     translateAliyunConnectionError(error);
   }
+}
+
+function logAliyunProvisioningStage(input: {
+  event:
+    | "ros_capability_issue"
+    | "ros_template_fetch"
+    | "role_probe"
+    | "role_verified";
+  projectId?: string | null;
+  connectionId?: string | null;
+  correlationId: string;
+  templateVersion: number;
+  errorCode?: string | null;
+  startedAt: number;
+}) {
+  const buildSha = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
+  console.info("[SiteOps Aliyun] provisioning_stage", {
+    event: input.event,
+    projectId: input.projectId ?? null,
+    connectionId: input.connectionId ?? null,
+    correlationId: input.correlationId,
+    templateVersion: input.templateVersion,
+    errorCode: input.errorCode ?? null,
+    latencyMs: Math.max(0, Date.now() - input.startedAt),
+    releaseSha: /^[a-f0-9]{40}$/u.test(buildSha) ? buildSha : null,
+  });
+}
+
+export async function startSiteOpsAliyunRoleProvisioning(
+  actor: AuthenticatedUser,
+  value: unknown,
+) {
+  const startedAt = Date.now();
+  const input = siteOpsAliyunConnectionInputSchema.parse(value);
+  const project = await requireOwnedAliyunProject(actor, input.conversationId);
+  try {
+    const prepared = await prepareAliyunCustomerRoleProvisioning({
+      projectId: project.id,
+      userId: actor.id,
+    });
+    if (prepared.status === "active") {
+      return { status: "active" as const, connected: true as const };
+    }
+    const [status, broker] = await Promise.all([
+      getAliyunCustomerConnectionStatus({
+        projectId: project.id,
+        userId: actor.id,
+      }),
+      getActiveAliyunBrokerCredential(),
+    ]);
+    if (
+      !broker ||
+      !status.configured ||
+      !status.connectionId ||
+      !status.roleArn ||
+      !status.externalIdFingerprint ||
+      (status.status !== "unverified" && status.status !== "invalid")
+    ) {
+      throw new SiteOpsServiceError(
+        "PROVIDER_NOT_CONFIGURED",
+        "阿里云一键授权配置尚未就绪，请联系 FrontMind。",
+        409,
+      );
+    }
+    const roleName = status.roleArn.split("/").at(-1) ?? "";
+    const issued = issueAliyunRosTemplateCapability({
+      connectionId: status.connectionId,
+      projectId: project.id,
+      userId: actor.id,
+      externalIdFingerprint: status.externalIdFingerprint,
+      roleArnFingerprint: fingerprintAliyunProvisioningValue(status.roleArn),
+      brokerCredentialId: broker.id,
+      brokerCredentialVersion: broker.version,
+      brokerPrincipalFingerprint: fingerprintAliyunProvisioningValue(
+        broker.principalArn,
+      ),
+    });
+    const rosAuthorizationUrl = buildAliyunRosAuthorizationUrl({
+      capability: issued.token,
+      roleName,
+    });
+    logAliyunProvisioningStage({
+      event: "ros_capability_issue",
+      projectId: project.id,
+      connectionId: status.connectionId,
+      correlationId: issued.correlationId,
+      templateVersion: issued.templateVersion,
+      startedAt,
+    });
+    return {
+      status: "ready" as const,
+      connected: false as const,
+      rosAuthorizationUrl,
+      expiresAt: issued.expiresAt,
+      retryAfterMs: 2_000,
+    };
+  } catch (error) {
+    if (error instanceof SiteOpsServiceError) throw error;
+    translateAliyunConnectionError(error);
+  }
+}
+
+export async function probeSiteOpsAliyunRole(
+  actor: AuthenticatedUser,
+  value: unknown,
+) {
+  const startedAt = Date.now();
+  const correlationId = randomUUID();
+  const input = siteOpsAliyunConnectionInputSchema.parse(value);
+  const project = await requireOwnedAliyunProject(actor, input.conversationId);
+  try {
+    const result = await probeAliyunCustomerConnection({
+      projectId: project.id,
+      userId: actor.id,
+    });
+    logAliyunProvisioningStage({
+      event: result.status === "active" ? "role_verified" : "role_probe",
+      projectId: project.id,
+      connectionId: null,
+      correlationId,
+      templateVersion: ALIYUN_ROS_TEMPLATE_VERSION,
+      errorCode: result.status === "active" ? null : result.reason,
+      startedAt,
+    });
+    return result.status === "active"
+      ? { status: "active" as const, connected: true as const }
+      : result;
+  } catch (error) {
+    translateAliyunConnectionError(error);
+  }
+}
+
+function aliyunRosCapabilityBindingMatches(input: {
+  claims: AliyunRosCapabilityClaims;
+  status: Awaited<ReturnType<typeof getAliyunCustomerConnectionStatus>>;
+  broker: Awaited<ReturnType<typeof getActiveAliyunBrokerCredential>>;
+}) {
+  const { broker, claims, status } = input;
+  return Boolean(
+    broker &&
+      status.configured &&
+      status.connectionId &&
+      status.roleArn &&
+      status.externalIdFingerprint &&
+      status.connectionId === claims.connectionId &&
+      (status.status === "unverified" || status.status === "invalid") &&
+      status.externalIdFingerprint === claims.externalIdFingerprint &&
+      fingerprintAliyunProvisioningValue(status.roleArn) ===
+        claims.roleArnFingerprint &&
+      broker.id === claims.brokerCredentialId &&
+      broker.version === claims.brokerCredentialVersion &&
+      fingerprintAliyunProvisioningValue(broker.principalArn) ===
+        claims.brokerPrincipalFingerprint,
+  );
+}
+
+export async function getPublicSiteOpsAliyunRosTemplate(
+  rawCapability: unknown,
+) {
+  const startedAt = Date.now();
+  const capability = z.string().min(40).max(2_048).parse(rawCapability);
+  const claims = readAliyunRosTemplateCapability(capability);
+  const [status, broker] = await Promise.all([
+    getAliyunCustomerConnectionStatus({
+      projectId: claims.projectId,
+      userId: claims.userId,
+    }),
+    getActiveAliyunBrokerCredential(),
+  ]);
+  if (
+    !broker ||
+    !aliyunRosCapabilityBindingMatches({ claims, status, broker })
+  ) {
+    throw new SiteOpsServiceError("NOT_FOUND", "阿里云授权模板不存在。", 404);
+  }
+  const authorization = await getAliyunCustomerRoleAuthorizationPackage({
+    projectId: claims.projectId,
+    userId: claims.userId,
+    trustedPrincipalArn: broker.principalArn,
+  });
+  const [recheckedStatus, recheckedBroker] = await Promise.all([
+    getAliyunCustomerConnectionStatus({
+      projectId: claims.projectId,
+      userId: claims.userId,
+    }),
+    getActiveAliyunBrokerCredential(),
+  ]);
+  const expectedRoleName = recheckedStatus.roleArn?.split("/").at(-1) ?? "";
+  const trustStatement = authorization.trustPolicyDocument.Statement[0];
+  const authorizationExternalId =
+    trustStatement?.Condition.StringEquals["sts:ExternalId"] ?? "";
+  const authorizationPrincipal = trustStatement?.Principal.RAM[0] ?? "";
+  if (
+    !aliyunRosCapabilityBindingMatches({
+      claims,
+      status: recheckedStatus,
+      broker: recheckedBroker,
+    }) ||
+    authorization.roleName !== expectedRoleName ||
+    fingerprintAliyunProvisioningValue(authorizationExternalId).slice(0, 32) !==
+      claims.externalIdFingerprint ||
+    fingerprintAliyunProvisioningValue(authorizationPrincipal) !==
+      claims.brokerPrincipalFingerprint
+  ) {
+    throw new SiteOpsServiceError("NOT_FOUND", "阿里云授权模板不存在。", 404);
+  }
+  const template = buildAliyunRosRoleTemplate(authorization);
+  logAliyunProvisioningStage({
+    event: "ros_template_fetch",
+    projectId: claims.projectId,
+    connectionId: claims.connectionId,
+    correlationId: claims.correlationId,
+    templateVersion: claims.templateVersion,
+    startedAt,
+  });
+  return template;
 }
 
 export async function completeSiteOpsAliyunOAuth(input: {

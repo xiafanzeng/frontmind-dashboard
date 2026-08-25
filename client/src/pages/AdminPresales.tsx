@@ -104,7 +104,7 @@ const EMPTY_TWENTY_FIRST_STATUS: TwentyFirstCredentialStatus = {
 
 const EMPTY_ALIYUN_STATUS: AliyunPlatformStatus = {
   platformUid: "1244409121609391",
-  customerRoleName: "FrontMindSiteOpsAccess",
+  customerRoleName: "FrontMindSiteOps-<连接标识>",
   identityConfigured: false,
   ready: false,
   customerCapabilityVerified: false,
@@ -1417,7 +1417,7 @@ export default function AdminPresales() {
                       阿里云跨账号自动化
                     </CardTitle>
                     <p className="mt-1.5 text-sm text-muted-foreground">
-                      FrontMind UID {aliyunStatus.platformUid} · 客户固定角色{" "}
+                      FrontMind UID {aliyunStatus.platformUid} · 客户角色命名{" "}
                       {aliyunStatus.customerRoleName}
                     </p>
                   </div>
@@ -1448,7 +1448,10 @@ export default function AdminPresales() {
                     <p className="text-sm font-medium">Broker RAM 身份</p>
                     <p className="mt-1 text-xs leading-5 text-muted-foreground">
                       使用 FrontMind 专用 RAM 用户，不得填写主账号或 RAM 角色的
-                      AccessKey。
+                      AccessKey。该用户的 sts:AssumeRole
+                      权限必须同时保留历史角色
+                      FrontMindSiteOpsAccess，并允许连接级角色
+                      FrontMindSiteOps-*。
                     </p>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
@@ -1532,8 +1535,9 @@ export default function AdminPresales() {
                   <div>
                     <p className="text-sm font-medium">阿里云 OAuth Web 应用</p>
                     <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                      仅请求 openid、aliuid 和
-                      profile，用于确认客户所属账号；访问令牌不会持久化。
+                      {
+                        "仅请求 openid 和 aliuid，用于确认客户所属账号；请在阿里云将 aliuid 设为必需并删除 profile，访问令牌不会持久化。"
+                      }
                     </p>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-3">

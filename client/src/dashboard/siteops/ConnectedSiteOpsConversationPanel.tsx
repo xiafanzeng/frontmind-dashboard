@@ -73,9 +73,6 @@ export default function ConnectedSiteOpsConversationPanel({
       refetchInterval: shouldPoll ? 3_000 : false,
     },
   );
-  const sendMessageMutation = trpc.workspace.siteOps.sendMessage.useMutation({
-    onSuccess: setObservation,
-  });
   const actMutation = trpc.workspace.siteOps.act.useMutation({
     onSuccess: setObservation,
   });
@@ -86,8 +83,10 @@ export default function ConnectedSiteOpsConversationPanel({
       { conversationId },
       { enabled: false, retry: false },
     );
-  const aliyunVerifyMutation =
-    trpc.workspace.siteOps.aliyunConnection.verifyRole.useMutation();
+  const aliyunStartRoleProvisioningMutation =
+    trpc.workspace.siteOps.aliyunConnection.startRoleProvisioning.useMutation();
+  const aliyunProbeRoleMutation =
+    trpc.workspace.siteOps.aliyunConnection.probeRole.useMutation();
   const aliyunDisconnectMutation =
     trpc.workspace.siteOps.aliyunConnection.disconnect.useMutation();
 
@@ -104,11 +103,9 @@ export default function ConnectedSiteOpsConversationPanel({
   const requestError =
     openMutation.error?.message ||
     observeQuery.error?.message ||
-    sendMessageMutation.error?.message ||
     actMutation.error?.message ||
     aliyunBeginMutation.error?.message ||
     aliyunAuthorizationGuideQuery.error?.message ||
-    aliyunVerifyMutation.error?.message ||
     aliyunDisconnectMutation.error?.message ||
     null;
 
@@ -125,18 +122,6 @@ export default function ConnectedSiteOpsConversationPanel({
           return;
         }
         setObservation(await openMutation.mutateAsync(undefined));
-      }}
-      onSendMessage={async (text) => {
-        if (!observation) return;
-        setObservation(
-          await sendMessageMutation.mutateAsync({
-            conversationId: observation.project.conversationId,
-            clientRequestId: siteOpsClientRequestId(),
-            text,
-            localAssetIds: [],
-            expectedProjectRevision: observation.project.revision,
-          }),
-        );
       }}
       onAction={async (input) => {
         if (!observation) return;
@@ -170,13 +155,21 @@ export default function ConnectedSiteOpsConversationPanel({
         }
         return guide.data;
       }}
-      onVerifyAliyun={async () => {
-        if (!observation) return;
-        await aliyunVerifyMutation.mutateAsync({
+      onStartAliyunRoleProvisioning={async () => {
+        if (!observation) {
+          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
+        }
+        return await aliyunStartRoleProvisioningMutation.mutateAsync({
           conversationId: observation.project.conversationId,
         });
-        const refreshed = await observeQuery.refetch();
-        if (refreshed.data) setObservation(refreshed.data);
+      }}
+      onProbeAliyunRole={async () => {
+        if (!observation) {
+          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
+        }
+        return await aliyunProbeRoleMutation.mutateAsync({
+          conversationId: observation.project.conversationId,
+        });
       }}
       onDisconnectAliyun={async () => {
         if (!observation) return;

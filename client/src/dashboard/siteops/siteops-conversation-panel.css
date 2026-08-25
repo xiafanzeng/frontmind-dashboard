@@ -552,20 +552,17 @@
   overflow-wrap: anywhere;
 }
 
-.siteops-snapshot-actions label,
-.siteops-composer {
+.siteops-snapshot-actions label {
   display: grid;
   gap: 7px;
 }
 
-.siteops-snapshot-actions label span,
-.siteops-composer > label {
+.siteops-snapshot-actions label span {
   font-size: 13px;
   font-weight: 700;
 }
 
-.siteops-snapshot-actions select,
-.siteops-composer textarea {
+.siteops-snapshot-actions select {
   width: 100%;
   border: 1px solid #cbd5e1;
   border-radius: 12px;
@@ -1072,6 +1069,16 @@
   border: 1px solid #4f46e5;
   background: #4f46e5;
   color: #fff;
+  transition: filter 150ms ease;
+}
+
+.siteops-primary-button:not(:disabled):hover {
+  filter: brightness(0.9) saturate(1.05);
+}
+
+.siteops-primary-button:focus-visible {
+  outline: 3px solid Highlight;
+  outline-offset: 2px;
 }
 
 .siteops-secondary-button,
@@ -1146,34 +1153,6 @@
   gap: 8px;
 }
 
-.siteops-composer {
-  position: sticky;
-  z-index: 5;
-  bottom: 12px;
-  width: min(100%, 920px);
-  justify-self: center;
-  border: 1px solid rgba(199, 210, 254, 0.9);
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.94);
-  padding: 12px 14px;
-  box-shadow: 0 16px 44px rgba(15, 23, 42, 0.13);
-  backdrop-filter: blur(16px);
-}
-
-.siteops-composer > div {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 10px;
-}
-
-.siteops-composer textarea {
-  min-height: 72px;
-  resize: vertical;
-  border-radius: 15px;
-  background: #f8fafc;
-}
-
 .siteops-aliyun-guide {
   display: grid;
   width: 100%;
@@ -1182,6 +1161,44 @@
   border: 1px solid #dbe3ef;
   border-radius: 14px;
   background: #f8fafc;
+}
+
+.siteops-aliyun-progress {
+  width: 100%;
+}
+
+.siteops-domain-heading .siteops-aliyun-security-note {
+  max-width: 46rem;
+  color: #475569;
+  font-size: 0.82rem;
+}
+
+.siteops-aliyun-manual {
+  width: 100%;
+  border: 1px solid #dbe3ef;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.siteops-aliyun-manual summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  color: #475569;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.siteops-aliyun-manual-content {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid #e2e8f0;
+  padding: 14px;
+}
+
+.siteops-aliyun-manual-content > p {
+  margin: 0;
+  color: #64748b;
+  font-size: 0.86rem;
 }
 
 .siteops-aliyun-guide ol {
@@ -1196,6 +1213,18 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.siteops-aliyun-guide-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.siteops-aliyun-guide-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .siteops-spin {
@@ -1227,8 +1256,7 @@
   .siteops-agent-profile-options,
   .siteops-snapshot-actions,
   .siteops-connection-form,
-  .siteops-domain-form,
-  .siteops-composer > div {
+  .siteops-domain-form {
     grid-template-columns: 1fr;
   }
 
@@ -1270,5 +1298,10 @@
 
   .siteops-stage {
     grid-template-columns: 1fr;
+  }
+
+  .siteops-aliyun-guide li {
+    align-items: stretch;
+    flex-direction: column;
   }
 }

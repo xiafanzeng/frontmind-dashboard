@@ -195,7 +195,7 @@ function jsonResponse(
 const validTokenResponse = () =>
   jsonResponse({
     access_token: "oauth-access-token-never-persist",
-    scope: "openid aliuid profile",
+    scope: "openid aliuid",
   });
 
 const validDiscoveryResponse = () =>
@@ -203,7 +203,7 @@ const validDiscoveryResponse = () =>
     authorization_endpoint: ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
     token_endpoint: ALIYUN_OAUTH_TOKEN_ENDPOINT,
     userinfo_endpoint: ALIYUN_OAUTH_USERINFO_ENDPOINT,
-    scopes_supported: ["openid", "aliuid", "profile"],
+    scopes_supported: ["openid", "aliuid"],
   });
 
 describe("Aliyun platform credentials", () => {
@@ -644,7 +644,7 @@ describe("Aliyun platform credentials", () => {
             authorization_endpoint: ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
             token_endpoint: ALIYUN_OAUTH_TOKEN_ENDPOINT,
             userinfo_endpoint: ALIYUN_OAUTH_USERINFO_ENDPOINT,
-            scopes_supported: ["openid", "aliuid", "profile"],
+            scopes_supported: ["openid", "aliuid"],
           }),
           {
             status: 200,
@@ -675,9 +675,7 @@ describe("Aliyun platform credentials", () => {
     expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
       oauthCredential.callbackUrl,
     );
-    expect(authorizationUrl.searchParams.get("scope")).toBe(
-      "openid aliuid profile",
-    );
+    expect(authorizationUrl.searchParams.get("scope")).toBe("openid aliuid");
     expect(authorizationUrl.searchParams.has("prompt")).toBe(false);
   });
 
@@ -692,7 +690,7 @@ describe("Aliyun platform credentials", () => {
       oauthCredential.callbackUrl,
     );
     expect(url.searchParams.get("response_type")).toBe("code");
-    expect(url.searchParams.get("scope")).toBe("openid aliuid profile");
+    expect(url.searchParams.get("scope")).toBe("openid aliuid");
     expect(url.searchParams.get("access_type")).toBe("online");
     expect(url.searchParams.has("prompt")).toBe(false);
     expect(url.searchParams.get("state")).toBe("probe-state-never-logged");
@@ -738,7 +736,7 @@ describe("Aliyun platform credentials", () => {
         error: "invalid_scope",
         error_description: "unsupported scope",
       },
-      message: "openid、aliuid 和 profile",
+      message: "openid 和 aliuid",
     },
   ])("rejects $label before saving", async ({ payload, message }) => {
     await expect(
@@ -932,12 +930,11 @@ describe("Aliyun platform credentials", () => {
   });
 
   it("rejects a token response that omits any locked identity scope", () => {
-    expect(assertAliyunOAuthScopes("openid aliuid profile")).toEqual([
+    expect(assertAliyunOAuthScopes("openid aliuid")).toEqual([
       "openid",
       "aliuid",
-      "profile",
     ]);
-    expect(() => assertAliyunOAuthScopes("openid profile")).toThrowError(
+    expect(() => assertAliyunOAuthScopes("openid")).toThrowError(
       AuthServiceError,
     );
   });
@@ -1033,7 +1030,7 @@ describe("Aliyun platform credentials", () => {
     const missingScopeFetch = vi.fn(async () =>
       jsonResponse({
         access_token: "oauth-access-token-never-persist",
-        scope: "openid profile",
+        scope: "openid",
       }),
     );
     await expect(

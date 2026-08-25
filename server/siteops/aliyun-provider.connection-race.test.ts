@@ -77,7 +77,15 @@ function successfulFactory(): AliyunProviderSdkFactory {
     assumedRoleArn: null,
   };
   return {
-    assumeRole: vi.fn(async () => credentials),
+    assumeRole: vi.fn(async (input) => {
+      if (input.externalId == null) {
+        throw Object.assign(new Error("access denied"), {
+          code: "NoPermission",
+          statusCode: 403,
+        });
+      }
+      return credentials;
+    }),
     getCallerAccount: vi.fn(async () => ACCOUNT_UID),
     domain: vi.fn(
       () =>
@@ -138,7 +146,7 @@ describe("Aliyun connection verification CAS", () => {
     expect(database.updateValues).toHaveLength(1);
     expect(database.updateValues[0]).toMatchObject({
       status: "active",
-      lastErrorCode: "ALIYUN_CONNECTION_VERIFICATION_FAILED",
+      lastErrorCode: "ALIYUN_PROVIDER_RETRY",
     });
   });
 });

@@ -116,7 +116,10 @@ import {
   validateReleaseRuntimeEnvironment,
 } from "./release-channel-adapter";
 import { startSiteOpsWorkerScheduler } from "../siteops/worker";
-import { siteOpsArtifactApi } from "../siteops/artifact-api";
+import {
+  siteOpsAliyunRosTemplateApi,
+  siteOpsArtifactApi,
+} from "../siteops/artifact-api";
 import { startSiteOpsDomainReminderScheduler } from "../siteops/domain-reminders";
 import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
 import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
@@ -269,6 +272,10 @@ async function startServer() {
     }
     next();
   });
+  // ROS fetches this short-lived encrypted-capability template without a
+  // FrontMind browser session. Mount before all body parsers so malformed or
+  // oversized bodies cannot create a distinguishable public response.
+  app.use("/api/site-ops/aliyun/ros-template", siteOpsAliyunRosTemplateApi);
   // Authenticate private service routes before the global JSON parser.
   app.use("/api/internal/presales/v2", presalesV2Router);
   app.use("/api/internal/provisioning", provisioningRouter);

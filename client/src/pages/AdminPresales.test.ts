@@ -55,6 +55,12 @@ describe("presalesUsageDisplayState", () => {
       "utf8",
     );
     expect(source).toContain("OAuth 应用 ID（Client ID）");
+    expect(source).toContain("仅请求 openid 和 aliuid");
+    expect(source).toContain("aliuid 设为必需并删除 profile");
+    expect(source).toContain("客户角色命名");
+    expect(source).toContain("FrontMindSiteOps-<连接标识>");
+    expect(source).toContain("FrontMindSiteOpsAccess");
+    expect(source).toContain("FrontMindSiteOps-*");
     expect(source).toContain("不是应用密钥");
     expect(source).toContain("应用密钥内容（Client Secret）");
     expect(source).toContain("AppSecretValue");
