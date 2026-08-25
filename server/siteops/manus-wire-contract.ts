@@ -57,6 +57,103 @@ const schemaRecord = (value: unknown): Record<string, unknown> | null =>
     ? (value as Record<string, unknown>)
     : null;
 
+const SITEOPS_SLOT_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
+
+function assertedHostOwnedEmptyRoutes(
+  routeIds: readonly string[],
+  hostOwnedEmptyRouteIds: readonly string[],
+) {
+  const expected = new Set(routeIds);
+  const empty = new Set(hostOwnedEmptyRouteIds);
+  if (
+    empty.size !== hostOwnedEmptyRouteIds.length ||
+    [...empty].some((routeId) => routeId !== "news" || !expected.has(routeId))
+  ) {
+    throw new Error("SITEOPS_HOST_EMPTY_ROUTE_SET_INVALID");
+  }
+  return empty;
+}
+
+/**
+ * Slot ids and route grouping are host-owned technical coordinates. Normalize
+ * those two coordinates deterministically while leaving all semantic design
+ * choices and every unknown field untouched for the strict Zod boundary.
+ */
+export function normalizeSiteDesignWire(
+  value: unknown,
+  routeIds: readonly string[],
+  paletteSize = 12,
+) {
+  const record = schemaRecord(value);
+  if (!record || !Array.isArray(record.routeSlots)) return value;
+  const routeRank = new Map(routeIds.map((routeId, index) => [routeId, index]));
+  const seenSlots = new Set<string>();
+  const slots = record.routeSlots.flatMap((rawSlot) => {
+    const slot = schemaRecord(rawSlot);
+    if (!slot) return [rawSlot];
+    const routeId =
+      typeof slot.routeId === "string" ? slot.routeId.trim() : slot.routeId;
+    if (typeof routeId !== "string") return [rawSlot];
+    // Unknown model-owned routes are not allowed to expand the frozen site
+    // map. Drop them before canonical grouping; the host fills only routes
+    // already frozen in SiteBrief.
+    if (!routeRank.has(routeId)) return [];
+    const variant =
+      typeof slot.variant === "string" ? slot.variant.trim() : null;
+    const supplied = typeof slot.slotId === "string" ? slot.slotId.trim() : "";
+    if (
+      !SITEOPS_SLOT_ID.test(supplied) ||
+      !variant ||
+      !sectionVariants.includes(variant as (typeof sectionVariants)[number])
+    ) {
+      return [];
+    }
+    const slotKey = `${routeId}\0${supplied}`;
+    // A repeated technical coordinate is not a second semantic section.
+    // Preserve the first stable slot and drop later duplicates so content can
+    // bind exactly to the frozen design coordinate.
+    if (seenSlots.has(slotKey)) return [];
+    seenSlots.add(slotKey);
+    return [{ ...slot, routeId, slotId: supplied, variant }];
+  });
+  const ordered = slots
+    .map((slot, originalIndex) => ({ slot, originalIndex }))
+    .sort((left, right) => {
+      const leftRecord = schemaRecord(left.slot);
+      const rightRecord = schemaRecord(right.slot);
+      const leftRank =
+        typeof leftRecord?.routeId === "string"
+          ? (routeRank.get(leftRecord.routeId) ?? Number.MAX_SAFE_INTEGER)
+          : Number.MAX_SAFE_INTEGER;
+      const rightRank =
+        typeof rightRecord?.routeId === "string"
+          ? (routeRank.get(rightRecord.routeId) ?? Number.MAX_SAFE_INTEGER)
+          : Number.MAX_SAFE_INTEGER;
+      return leftRank - rightRank || left.originalIndex - right.originalIndex;
+    })
+    .map(({ slot }) => slot);
+  const paletteFallbacks = {
+    backgroundPaletteIndex: 0,
+    textPaletteIndex: 1,
+    accentPaletteIndex: 2,
+  } as const;
+  const normalizedPalette = Object.fromEntries(
+    Object.entries(paletteFallbacks).map(([key, fallback]) => {
+      const index = record[key];
+      return [
+        key,
+        Number.isInteger(index) &&
+        Number.isSafeInteger(paletteSize) &&
+        paletteSize > 0 &&
+        ((index as number) < 0 || (index as number) >= paletteSize)
+          ? Math.min(fallback, paletteSize - 1)
+          : index,
+      ];
+    }),
+  );
+  return { ...record, ...normalizedPalette, routeSlots: ordered };
+}
+
 const MANUS_STRUCTURED_SCHEMA_KEYS = new Set([
   "type",
   "enum",
@@ -230,7 +327,6 @@ const siteDesignWireV2Schema = z
           })
           .strict(),
       )
-      .min(1)
       .max(480),
   })
   .strict();
@@ -238,19 +334,30 @@ const siteDesignWireV2Schema = z
 export function siteDesignResultFromWire(
   value: unknown,
   routeIds: readonly string[],
+  hostOwnedEmptyRouteIds: readonly string[] = [],
+  paletteSize = 12,
 ) {
-  const wire = siteDesignWireV2Schema.parse(value);
-  const expectedRouteIds = new Set(routeIds);
+  const emptyRoutes = assertedHostOwnedEmptyRoutes(
+    routeIds,
+    hostOwnedEmptyRouteIds,
+  );
+  const providerRouteIds = routeIds.filter(
+    (routeId) => !emptyRoutes.has(routeId),
+  );
+  const wire = siteDesignWireV2Schema.parse(
+    normalizeSiteDesignWire(value, providerRouteIds, paletteSize),
+  );
+  const expectedRouteIds = new Set(providerRouteIds);
   if (
     wire.routeSlots.some((slot) => !expectedRouteIds.has(slot.routeId)) ||
-    new Set(routeIds).size !== routeIds.length
+    new Set(providerRouteIds).size !== providerRouteIds.length
   ) {
     throw new Error("SITEOPS_DESIGN_ROUTE_SET_MISMATCH");
   }
   // Wire V2 removes the redundant `order` field. The array itself is the
   // canonical order: routes form contiguous groups in frozen SiteBrief order,
   // and the order within each group becomes the trusted section order.
-  const canonicalSlots = routeIds.flatMap((routeId) =>
+  const canonicalSlots = providerRouteIds.flatMap((routeId) =>
     wire.routeSlots.filter((slot) => slot.routeId === routeId),
   );
   if (
@@ -259,18 +366,25 @@ export function siteDesignResultFromWire(
   ) {
     throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
   }
-  const routeCompositions = routeIds.map((routeId) => ({
+  const providerCompositions = providerRouteIds.map((routeId) => ({
     routeId,
-    slots: wire.routeSlots
-      .filter((slot) => slot.routeId === routeId)
-      .map(({ slotId, variant }) => ({ slotId, variant })),
+    slots: (() => {
+      const slots = wire.routeSlots
+        .filter((slot) => slot.routeId === routeId)
+        .map(({ slotId, variant }) => ({ slotId, variant }));
+      return slots.length > 0
+        ? slots
+        : [{ slotId: "overview", variant: "statement" as const }];
+    })(),
   }));
-  for (const routeId of routeIds) {
-    const slots = wire.routeSlots.filter((slot) => slot.routeId === routeId);
-    if (slots.length < 1) {
-      throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
-    }
-  }
+  const routeCompositions = routeIds.map((routeId) =>
+    emptyRoutes.has(routeId)
+      ? {
+          routeId,
+          slots: [{ slotId: "news-empty", variant: "statement" as const }],
+        }
+      : providerCompositions.find((route) => route.routeId === routeId)!,
+  );
   return siteDesignResultV1Schema.parse({
     operationToken: wire.operationToken,
     designSpec: {
@@ -282,11 +396,7 @@ export function siteDesignResultFromWire(
       typeScale: wire.typeScale,
       imageTreatment: wire.imageTreatment,
       motionLevel: wire.motionLevel,
-      colorRoles: {
-        backgroundPaletteIndex: wire.backgroundPaletteIndex,
-        textPaletteIndex: wire.textPaletteIndex,
-        accentPaletteIndex: wire.accentPaletteIndex,
-      },
+      colorRoles: canonicalPaletteRoles(wire, paletteSize),
       routeCompositions,
       seoPlan: {
         siteTitle: wire.siteTitle,
@@ -412,24 +522,66 @@ function canonicalRouteCompositions(
   ) {
     throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
   }
-  const routeCompositions = routeIds.map((routeId) => ({
-    routeId,
-    slots: routeSlots
+  const routeCompositions = routeIds.map((routeId) => {
+    const slots = routeSlots
       .filter((slot) => slot.routeId === routeId)
-      .map(({ slotId, variant }) => ({ slotId, variant })),
-  }));
-  if (routeCompositions.some((route) => route.slots.length < 1)) {
-    throw new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
-  }
+      .map(({ slotId, variant }) => ({ slotId, variant }));
+    return {
+      routeId,
+      slots:
+        slots.length > 0
+          ? slots
+          : [{ slotId: "overview", variant: "statement" as const }],
+    };
+  });
   return routeCompositions;
+}
+
+function canonicalPaletteRoles(
+  wire: {
+    backgroundPaletteIndex: number;
+    textPaletteIndex: number;
+    accentPaletteIndex: number;
+  },
+  paletteSize: number,
+) {
+  if (
+    !Number.isSafeInteger(paletteSize) ||
+    paletteSize < 1 ||
+    paletteSize > 12
+  ) {
+    throw new Error("SITEOPS_DESIGN_PALETTE_SIZE_INVALID");
+  }
+  const safe = (index: number, fallback: number) =>
+    index < paletteSize ? index : Math.min(fallback, paletteSize - 1);
+  return {
+    backgroundPaletteIndex: safe(wire.backgroundPaletteIndex, 0),
+    textPaletteIndex: safe(wire.textPaletteIndex, 1),
+    accentPaletteIndex: safe(wire.accentPaletteIndex, 2),
+  };
 }
 
 export function siteDesignResultV2FromWire(
   value: unknown,
   routeIds: readonly string[],
   referenceBlueprint: ReferenceBlueprint,
+  hostOwnedEmptyRouteIds: readonly string[] = [],
+  paletteSize = 12,
 ) {
-  const wire = siteDesignWireV3Schema.parse(value);
+  const emptyRoutes = assertedHostOwnedEmptyRoutes(
+    routeIds,
+    hostOwnedEmptyRouteIds,
+  );
+  const providerRouteIds = routeIds.filter(
+    (routeId) => !emptyRoutes.has(routeId),
+  );
+  const wire = siteDesignWireV3Schema.parse(
+    normalizeSiteDesignWire(value, providerRouteIds, paletteSize),
+  );
+  const providerCompositions = canonicalRouteCompositions(
+    providerRouteIds,
+    wire.routeSlots,
+  );
   return siteDesignResultV2Schema.parse({
     operationToken: wire.operationToken,
     designSpec: {
@@ -441,12 +593,15 @@ export function siteDesignResultV2FromWire(
       typeScale: wire.typeScale,
       imageTreatment: wire.imageTreatment,
       motionLevel: wire.motionLevel,
-      colorRoles: {
-        backgroundPaletteIndex: wire.backgroundPaletteIndex,
-        textPaletteIndex: wire.textPaletteIndex,
-        accentPaletteIndex: wire.accentPaletteIndex,
-      },
-      routeCompositions: canonicalRouteCompositions(routeIds, wire.routeSlots),
+      colorRoles: canonicalPaletteRoles(wire, paletteSize),
+      routeCompositions: routeIds.map((routeId) =>
+        emptyRoutes.has(routeId)
+          ? {
+              routeId,
+              slots: [{ slotId: "news-empty", variant: "statement" as const }],
+            }
+          : providerCompositions.find((route) => route.routeId === routeId)!,
+      ),
       seoPlan: {
         siteTitle: wire.siteTitle,
         description: wire.description,
@@ -853,8 +1008,11 @@ export function pageContentResultV2FromWire(
   emptyRouteIds: readonly string[] = [],
 ) {
   const wire = pageContentWireV3Schema.parse(value);
-  const expectedRouteIds = new Set(routeIds);
-  const emptyRoutes = new Set(emptyRouteIds);
+  const emptyRoutes = assertedHostOwnedEmptyRoutes(routeIds, emptyRouteIds);
+  const providerRouteIds = routeIds.filter(
+    (routeId) => !emptyRoutes.has(routeId),
+  );
+  const expectedRouteIds = new Set(providerRouteIds);
   const allowedSourceDocumentIds = new Set(sourceDocumentIds);
   const sourceSets = [
     ...wire.blocks.map((item) => item.sourceDocumentIds),
@@ -863,13 +1021,11 @@ export function pageContentResultV2FromWire(
     ...wire.officialLinks.map((item) => item.sourceDocumentIds),
   ];
   if (
-    wire.routes.length !== routeIds.length ||
+    wire.routes.length !== providerRouteIds.length ||
     new Set(wire.routes.map((route) => route.routeId)).size !==
-      routeIds.length ||
+      providerRouteIds.length ||
     wire.routes.some((route) => !expectedRouteIds.has(route.routeId)) ||
     wire.blocks.some((block) => !expectedRouteIds.has(block.routeId)) ||
-    [...emptyRoutes].some((routeId) => !expectedRouteIds.has(routeId)) ||
-    wire.blocks.some((block) => emptyRoutes.has(block.routeId)) ||
     (emptyRoutes.has("news") &&
       wire.entities.some((entity) => entity.entityType === "company_news")) ||
     sourceSets.some((ids) =>
@@ -886,8 +1042,6 @@ export function pageContentResultV2FromWire(
     pageContent: {
       schemaVersion: 2,
       routes: routeIds.map((routeId) => {
-        const route = routesById.get(routeId);
-        if (!route) throw new Error("SITEOPS_CONTENT_ROUTE_SET_MISMATCH");
         if (emptyRoutes.has(routeId)) {
           return {
             routeId,
@@ -897,6 +1051,8 @@ export function pageContentResultV2FromWire(
             sections: [],
           };
         }
+        const route = routesById.get(routeId);
+        if (!route) throw new Error("SITEOPS_CONTENT_ROUTE_SET_MISMATCH");
         return {
           routeId,
           ...(route.eyebrow ? { eyebrow: route.eyebrow } : {}),

@@ -12,6 +12,7 @@ import {
   isNull,
   max,
   ne,
+  notInArray,
   or,
 } from "drizzle-orm";
 import { z } from "zod";
@@ -1027,6 +1028,266 @@ export function siteOpsResetCapability(input: {
   return { allowed: true as const };
 }
 
+const ACTIVE_BUILD_RECOVERY_OPERATION_STATUSES = new Set([
+  "queued",
+  "running",
+  "outcome_unknown",
+]);
+const RECOVERABLE_BUILD_OUTPUT_ERROR_CODES = new Set([
+  "FRONTMIND_BUILD_OUTPUT_INVALID",
+]);
+
+type SiteOpsBuildRecoveryBuild = {
+  id: string;
+  ordinal: number;
+  status: string;
+  knowledgeSnapshotId: string;
+  workflowVersion: string;
+  styleSampleId: string | null;
+  selectionHash: string | null;
+  upstreamManusTaskId: string | null;
+  quotaState: string | null;
+  contractLocalAssetId: string | null;
+  sourceLocalAssetId: string | null;
+  distLocalAssetId: string | null;
+  qaLocalAssetId: string | null;
+  provenanceLocalAssetId: string | null;
+  errorCode: string | null;
+};
+
+type SiteOpsBuildRecoveryOperation = {
+  id: string;
+  buildId: string | null;
+  kind: string;
+  status: string;
+  input: unknown;
+  provider: string | null;
+  providerTaskId: string | null;
+  errorCode: string | null;
+  createdAt: Date;
+};
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+export function createSiteOpsResumeBuildOperationInput(input: {
+  frozenInput: Record<string, unknown>;
+  sourceOperationId: string;
+  providerTaskId: string;
+}) {
+  return {
+    ...input.frozenInput,
+    resumeSourceOperationId: input.sourceOperationId,
+    resumeProviderTaskId: input.providerTaskId,
+    resumeMode: "recover_design_output" as const,
+  };
+}
+
+function frozenBuildRecoveryInputMatches(input: {
+  currentKnowledgeSnapshotId: string | null;
+  build: SiteOpsBuildRecoveryBuild;
+  operation: SiteOpsBuildRecoveryOperation;
+}) {
+  const frozen = recordValue(input.operation.input);
+  return Boolean(
+    frozen &&
+      input.currentKnowledgeSnapshotId === input.build.knowledgeSnapshotId &&
+      input.build.styleSampleId &&
+      input.build.selectionHash &&
+      input.build.upstreamManusTaskId &&
+      input.operation.provider === "manus" &&
+      input.operation.providerTaskId === input.build.upstreamManusTaskId &&
+      frozen.buildId === input.build.id &&
+      frozen.styleSampleId === input.build.styleSampleId &&
+      frozen.workflowVersion === input.build.workflowVersion &&
+      typeof frozen.manusCredentialId === "string" &&
+      typeof frozen.manusCredentialVersion === "number" &&
+      Number.isInteger(frozen.manusCredentialVersion) &&
+      Number(frozen.manusCredentialVersion) > 0 &&
+      recordValue(frozen.referenceBlueprint) &&
+      ["released", "reserved"].includes(String(input.build.quotaState)) &&
+      input.build.contractLocalAssetId === null &&
+      input.build.sourceLocalAssetId === null &&
+      input.build.distLocalAssetId === null &&
+      input.build.qaLocalAssetId === null &&
+      input.build.provenanceLocalAssetId === null,
+  );
+}
+
+function latestSiteOpsBuildAttempt(
+  builds: SiteOpsBuildRecoveryBuild[],
+): SiteOpsBuildRecoveryBuild | null {
+  return (
+    builds
+      .filter((build) => !["cancelled", "superseded"].includes(build.status))
+      .sort((left, right) => right.ordinal - left.ordinal)[0] ?? null
+  );
+}
+
+export function siteOpsResumeBuildTargetsLatestAttempt(input: {
+  requestedBuildId: string;
+  builds: SiteOpsBuildRecoveryBuild[];
+}) {
+  return latestSiteOpsBuildAttempt(input.builds)?.id === input.requestedBuildId;
+}
+
+function originalBuildRecoverySource(input: {
+  latestTerminalOperation: SiteOpsBuildRecoveryOperation;
+  relatedOperations: SiteOpsBuildRecoveryOperation[];
+}) {
+  const byId = new Map(
+    input.relatedOperations.map((operation) => [operation.id, operation]),
+  );
+  const visited = new Set<string>();
+  let current: SiteOpsBuildRecoveryOperation | undefined =
+    input.latestTerminalOperation;
+  while (current) {
+    if (
+      visited.has(current.id) ||
+      current.provider !== "manus" ||
+      !current.providerTaskId ||
+      !["failed", "attention_required"].includes(current.status) ||
+      !RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(String(current.errorCode))
+    ) {
+      return null;
+    }
+    visited.add(current.id);
+    const frozen = recordValue(current.input);
+    if (frozen?.resumeMode !== "recover_design_output") return current;
+    const sourceOperationId = frozen.resumeSourceOperationId;
+    const resumeProviderTaskId = frozen.resumeProviderTaskId;
+    if (
+      typeof sourceOperationId !== "string" ||
+      typeof resumeProviderTaskId !== "string" ||
+      resumeProviderTaskId !== current.providerTaskId
+    ) {
+      return null;
+    }
+    const source = byId.get(sourceOperationId);
+    if (
+      !source ||
+      source.buildId !== current.buildId ||
+      source.provider !== "manus" ||
+      source.providerTaskId !== resumeProviderTaskId ||
+      source.createdAt.getTime() > current.createdAt.getTime()
+    ) {
+      return null;
+    }
+    current = source;
+  }
+  return null;
+}
+
+function buildRecoveryDecision(input: {
+  projectStatus: string;
+  currentKnowledgeSnapshotId: string | null;
+  build: SiteOpsBuildRecoveryBuild | null;
+  operations: SiteOpsBuildRecoveryOperation[];
+}) {
+  const unavailable = {
+    allowed: false as const,
+    buildId: input.build?.id ?? null,
+    reason: null,
+    sourceOperation: null,
+  };
+  if (!input.build) return unavailable;
+  const related = input.operations
+    .filter(
+      (operation) =>
+        operation.buildId === input.build!.id &&
+        ["site_build", "build_revision"].includes(operation.kind),
+    )
+    .sort(
+      (left, right) => right.createdAt.getTime() - left.createdAt.getTime(),
+    );
+  const activeOperation = related.find((operation) =>
+    ACTIVE_BUILD_RECOVERY_OPERATION_STATUSES.has(operation.status),
+  );
+  const hasRecoveryHistory =
+    RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(String(input.build.errorCode)) ||
+    related.some(
+      (operation) =>
+        RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(String(operation.errorCode)) ||
+        recordValue(operation.input)?.resumeMode === "recover_design_output",
+    );
+  if (activeOperation && hasRecoveryHistory) {
+    return {
+      allowed: false as const,
+      buildId: input.build.id,
+      reason: "active_operation" as const,
+      sourceOperation: null,
+    };
+  }
+  if (activeOperation) return unavailable;
+  if (
+    !["failed", "attention_required"].includes(input.projectStatus) ||
+    !["failed", "attention_required"].includes(input.build.status)
+  ) {
+    return unavailable;
+  }
+  const latestTerminalOperation = related.find((operation) =>
+    ["failed", "attention_required", "succeeded", "cancelled"].includes(
+      operation.status,
+    ),
+  );
+  const recoverableTerminalOperation =
+    latestTerminalOperation &&
+    ["failed", "attention_required"].includes(latestTerminalOperation.status) &&
+    RECOVERABLE_BUILD_OUTPUT_ERROR_CODES.has(
+      String(latestTerminalOperation.errorCode),
+    )
+      ? latestTerminalOperation
+      : undefined;
+  const sourceOperation = recoverableTerminalOperation
+    ? originalBuildRecoverySource({
+        latestTerminalOperation: recoverableTerminalOperation,
+        relatedOperations: related,
+      })
+    : null;
+  const hasRecoverableOutputFailure = Boolean(recoverableTerminalOperation);
+  if (!hasRecoverableOutputFailure) return unavailable;
+  if (
+    !sourceOperation ||
+    !frozenBuildRecoveryInputMatches({
+      currentKnowledgeSnapshotId: input.currentKnowledgeSnapshotId,
+      build: input.build,
+      operation: sourceOperation,
+    })
+  ) {
+    return {
+      allowed: false as const,
+      buildId: input.build.id,
+      reason: "frozen_input_changed" as const,
+      sourceOperation: null,
+    };
+  }
+  return {
+    allowed: true as const,
+    buildId: input.build.id,
+    reason: "output_recoverable" as const,
+    sourceOperation,
+  };
+}
+
+export function projectSiteOpsBuildRecovery(input: {
+  projectStatus: string;
+  currentKnowledgeSnapshotId: string | null;
+  builds: SiteOpsBuildRecoveryBuild[];
+  operations: SiteOpsBuildRecoveryOperation[];
+}) {
+  const { sourceOperation: _sourceOperation, ...projection } =
+    buildRecoveryDecision({
+      projectStatus: input.projectStatus,
+      currentKnowledgeSnapshotId: input.currentKnowledgeSnapshotId,
+      build: latestSiteOpsBuildAttempt(input.builds),
+      operations: input.operations,
+    });
+  return projection;
+}
+
 export function isSiteOpsFailedBuildResettable(input: {
   ordinal: number;
   parentBuildId: string | null;
@@ -1501,6 +1762,7 @@ export function siteOpsVisualSelectionRecovery(input: {
   latestVisualOperationStatus: string | null;
   hasActiveVisualOperation: boolean;
   hasActiveBuild: boolean;
+  hasBuildAttempt: boolean;
 }) {
   return (
     ["visual_searching", "failed", "attention_required"].includes(
@@ -1514,7 +1776,8 @@ export function siteOpsVisualSelectionRecovery(input: {
         ),
     ) &&
     !input.hasActiveVisualOperation &&
-    !input.hasActiveBuild
+    !input.hasActiveBuild &&
+    !input.hasBuildAttempt
   );
 }
 
@@ -1543,6 +1806,7 @@ export function projectSiteOpsVisualGeneration(input: {
   latestVisualOperation?: VisualOperationProjectionRow | null;
   hasActiveVisualOperation: boolean;
   hasActiveBuild: boolean;
+  hasBuildAttempt: boolean;
 }) {
   const latestStatus = input.latestVisualOperation?.status ?? null;
   const recoveredSelection = siteOpsVisualSelectionRecovery({
@@ -1551,6 +1815,7 @@ export function projectSiteOpsVisualGeneration(input: {
     latestVisualOperationStatus: latestStatus,
     hasActiveVisualOperation: input.hasActiveVisualOperation,
     hasActiveBuild: input.hasActiveBuild,
+    hasBuildAttempt: input.hasBuildAttempt,
   });
   const selectableStatus =
     input.projectStatus === "awaiting_visual_selection" || recoveredSelection;
@@ -1875,6 +2140,8 @@ async function projectObservation(
         kind: siteOperations.kind,
         status: siteOperations.status,
         input: siteOperations.input,
+        provider: siteOperations.provider,
+        providerTaskId: siteOperations.providerTaskId,
         errorCode: siteOperations.errorCode,
         startedAt: siteOperations.startedAt,
         completedAt: siteOperations.completedAt,
@@ -2187,6 +2454,12 @@ async function projectObservation(
         providerTaskStopped: providerTaskCanBeCheckedBeforeReset,
       }),
   );
+  const buildRecovery = projectSiteOpsBuildRecovery({
+    projectStatus: input.project.status,
+    currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+    builds: buildRows,
+    operations: timelineOperationRows,
+  });
   const resetCapability = siteOpsResetCapability({
     projectStatus: input.project.status,
     currentBuild: Boolean(input.project.currentBuildId),
@@ -2256,12 +2529,17 @@ async function projectObservation(
       row.status as (typeof NONTERMINAL_BUILD_STATUSES)[number],
     ),
   );
+  const hasBuildAttempt = buildRows.some(
+    (row: typeof siteBuilds.$inferSelect) =>
+      !["cancelled", "superseded"].includes(row.status),
+  );
   const visualGeneration = projectSiteOpsVisualGeneration({
     projectStatus: input.project.status,
     generatedPages: completePublishedPages,
     latestVisualOperation,
     hasActiveVisualOperation: activeVisualOperationRows.length > 0,
     hasActiveBuild,
+    hasBuildAttempt,
   });
   const projectedStatuses = projectSiteOpsObservationStatuses({
     projectStatus: input.project.status,
@@ -2434,6 +2712,7 @@ async function projectObservation(
       canGenerateMore: visualGeneration.canGenerateMore,
       canSelectExisting: visualGeneration.canSelectExisting,
     },
+    buildRecovery,
     executionSteps: projectSiteOpsExecutionSteps({
       operations: timelineOperationRows,
       timelineMessages: timelineMessageRows,
@@ -3237,6 +3516,8 @@ export function parseSiteOpsActionPayload(
         .object({ confirmed: z.literal(true) })
         .strict()
         .parse(raw);
+    case "resume_build":
+      return z.object({ buildId: uuidSchema }).strict().parse(raw);
     case "request_rebuild":
       return z
         .object({ reason: z.string().trim().max(4_000).optional() })
@@ -3644,6 +3925,191 @@ async function reserveOperation(
     completedAt: input.status === "succeeded" ? new Date() : undefined,
   });
   return id;
+}
+
+function siteOpsMutationAffectedRows(value: unknown) {
+  const header = Array.isArray(value)
+    ? (value[0] as { affectedRows?: unknown } | undefined)
+    : (value as { affectedRows?: unknown } | undefined);
+  return Number(header?.affectedRows ?? 0);
+}
+
+export async function handleResumeBuild(
+  tx: any,
+  input: {
+    actor: AuthenticatedUser;
+    project: typeof siteProjects.$inferSelect;
+    turnId: string;
+    requestId: string;
+    requestHash: string;
+    payload: { buildId: string };
+  },
+) {
+  const buildRows = await tx
+    .select()
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.projectId, input.project.id),
+        eq(siteBuilds.userId, input.actor.id),
+        notInArray(siteBuilds.status, ["cancelled", "superseded"]),
+      ),
+    )
+    .orderBy(desc(siteBuilds.ordinal))
+    .limit(1)
+    .for("update");
+  const build = buildRows[0];
+  if (
+    !build ||
+    !siteOpsResumeBuildTargetsLatestAttempt({
+      requestedBuildId: input.payload.buildId,
+      builds: buildRows,
+    })
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "官网版本已更新，请刷新后再继续。",
+      409,
+    );
+  }
+  const operationRows = await tx
+    .select()
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        eq(siteOperations.buildId, input.payload.buildId),
+        inArray(siteOperations.kind, ["site_build", "build_revision"]),
+      ),
+    )
+    .orderBy(desc(siteOperations.createdAt))
+    .limit(50)
+    .for("update");
+  const decision = buildRecoveryDecision({
+    projectStatus: input.project.status,
+    currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
+    build,
+    operations: operationRows,
+  });
+  if (!decision.allowed || !build || !decision.sourceOperation) {
+    const message =
+      decision.reason === "active_operation"
+        ? "官网正在继续生成，请勿重复提交。"
+        : decision.reason === "frozen_input_changed"
+          ? "保留的知识库或视觉方案已发生变化，无法安全续跑，请提交工单获取协助。"
+          : "当前官网版本不能原地继续生成，请刷新后查看可用操作。";
+    throw new SiteOpsServiceError("STATE_CONFLICT", message, 409);
+  }
+  const sourceOperation = decision.sourceOperation;
+  const frozenInput = recordValue(sourceOperation.input);
+  const providerTaskId = sourceOperation.providerTaskId;
+  const quotaState = build.quotaState;
+  if (
+    !frozenInput ||
+    !providerTaskId ||
+    (quotaState !== "released" && quotaState !== "reserved")
+  ) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "保留的生成任务坐标不完整，无法安全续跑，请提交工单获取协助。",
+      409,
+    );
+  }
+  const now = new Date();
+  const operationId = randomUUID();
+  const buildUpdated = await tx
+    .update(siteBuilds)
+    .set({
+      status: "design_compiling",
+      repairAttempts: 0,
+      quotaState: "reserved",
+      errorCode: null,
+      errorMessage: null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(siteBuilds.id, build.id),
+        eq(siteBuilds.projectId, input.project.id),
+        eq(siteBuilds.userId, input.actor.id),
+        eq(siteBuilds.status, build.status),
+        eq(siteBuilds.repairAttempts, build.repairAttempts),
+        eq(siteBuilds.quotaState, quotaState),
+        eq(siteBuilds.knowledgeSnapshotId, build.knowledgeSnapshotId),
+        eq(siteBuilds.workflowVersion, build.workflowVersion),
+        eq(siteBuilds.styleSampleId, build.styleSampleId!),
+        eq(siteBuilds.selectionHash, build.selectionHash!),
+        eq(siteBuilds.upstreamManusTaskId, providerTaskId),
+      ),
+    );
+  if (siteOpsMutationAffectedRows(buildUpdated) !== 1) {
+    throw new SiteOpsServiceError(
+      "REVISION_CONFLICT",
+      "官网恢复状态已更新，请刷新后重试。",
+      409,
+    );
+  }
+  await tx.insert(siteOperations).values({
+    id: operationId,
+    projectId: input.project.id,
+    userId: input.actor.id,
+    conversationTurnId: input.turnId,
+    buildId: build.id,
+    kind: "build_revision",
+    status: "queued",
+    clientRequestId: input.requestId,
+    inputHash: input.requestHash,
+    input: createSiteOpsResumeBuildOperationInput({
+      frozenInput,
+      sourceOperationId: sourceOperation.id,
+      providerTaskId,
+    }),
+    provider: "manus",
+    providerTaskId,
+  });
+  await appendMessage(tx, {
+    conversationId: input.project.conversationId,
+    userId: input.actor.id,
+    role: "assistant",
+    turnId: input.turnId,
+    content:
+      "已保留知识库资料和所选视觉方案，FrontMind 正在从中断处继续生成官网；无需重新选择，也不会重复扣减本次官网额度。",
+    siteOps: {
+      kind: "build_progress",
+      subjectId: operationId,
+      revision: input.project.revision + 1,
+      status: "active",
+      payload: {
+        stage: "design_compiling",
+        buildId: build.id,
+        resumed: true,
+      },
+    },
+  });
+  const projectUpdated = await tx
+    .update(siteProjects)
+    .set({
+      status: "building",
+      revision: input.project.revision + 1,
+      updatedAt: now,
+    })
+    .where(
+        and(
+          eq(siteProjects.id, input.project.id),
+          eq(siteProjects.revision, input.project.revision),
+          input.project.currentBuildId
+            ? eq(siteProjects.currentBuildId, input.project.currentBuildId)
+            : isNull(siteProjects.currentBuildId),
+        ),
+      );
+  if (siteOpsMutationAffectedRows(projectUpdated) !== 1) {
+    throw new SiteOpsServiceError(
+      "REVISION_CONFLICT",
+      "官网项目已更新，请刷新后重试。",
+      409,
+    );
+  }
 }
 
 async function handleRequestRebuild(
@@ -4539,26 +5005,26 @@ async function selectVisualSample(
       409,
     );
   }
-  const activeBuildRows = await tx
-    .select({ id: siteBuilds.id })
+  const buildAttemptRows = await tx
+    .select({ id: siteBuilds.id, status: siteBuilds.status })
     .from(siteBuilds)
     .where(
       and(
         eq(siteBuilds.projectId, input.project.id),
-        inArray(siteBuilds.status, [
-          "preparing",
-          "visual_searching",
-          "awaiting_visual_selection",
-          "design_compiling",
-          "contract_ready",
-          "building",
-          "qa_running",
-        ]),
+        eq(siteBuilds.userId, input.actor.id),
+        notInArray(siteBuilds.status, ["cancelled", "superseded"]),
       ),
     )
-    .limit(1)
+    .orderBy(desc(siteBuilds.ordinal))
+    .limit(50)
     .for("update");
-  if (activeBuildRows[0]) {
+  if (
+    buildAttemptRows.some((row: { status: string }) =>
+      NONTERMINAL_BUILD_STATUSES.includes(
+        row.status as (typeof NONTERMINAL_BUILD_STATUSES)[number],
+      ),
+    )
+  ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "当前已有建站任务在运行，不能并行创建第二个根版本。",
@@ -4641,6 +5107,7 @@ async function selectVisualSample(
       latestVisualOperationStatus: latestVisualRows[0]?.status ?? null,
       hasActiveVisualOperation: false,
       hasActiveBuild: false,
+      hasBuildAttempt: buildAttemptRows.length > 0,
     });
     if (!recoveredSelection) {
       throw new SiteOpsServiceError(
@@ -5984,6 +6451,12 @@ export async function actOnSiteOps(
           ...common,
           payload: payload as { confirmed: true },
           providerTaskPreflight,
+        });
+        break;
+      case "resume_build":
+        await handleResumeBuild(tx, {
+          ...common,
+          payload: payload as { buildId: string },
         });
         break;
       case "request_rebuild":

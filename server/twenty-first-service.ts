@@ -287,6 +287,8 @@ export type TwentyFirstSearchRequest = {
 };
 
 export type TwentyFirstReadOnlySession = {
+  /** Maximum search depth actually accepted by the live advertised schema. */
+  effectiveSearchLimit?: number;
   search(input: TwentyFirstSearchRequest): Promise<unknown>;
   getComponent?: (
     providerItemId: TwentyFirstProviderItemId,
@@ -794,6 +796,18 @@ export class TwentyFirstClient {
         getComponent?.annotations?.destructiveHint === true
           ? undefined
           : getComponent;
+      const searchLimitKey = findToolInputKey(search, [
+        "limit",
+        "take",
+        "pageSize",
+        "page_size",
+      ]);
+      const effectiveSearchLimit = searchLimitKey
+        ? boundedSearchLimit(
+            search.inputSchema.properties?.[searchLimitKey],
+            18,
+          )
+        : 18;
       const call = async (
         operation: "search" | "get_component",
         tool: TwentyFirstAdvertisedTool,
@@ -827,6 +841,7 @@ export class TwentyFirstClient {
         return payload;
       };
       return await use({
+        effectiveSearchLimit,
         search: (input) => {
           if (input.type !== "component") {
             throw new TwentyFirstToolContractError();

@@ -846,9 +846,10 @@ export const visualSelectionBundleV4Schema = z
   .object({
     schemaVersion: z.literal(4),
     queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/u),
-    // Nine primary top-four queries plus nine bounded depth-eighteen
-    // supplemental queries. Persist the truthful requested search budget.
-    searchTarget: z.number().int().min(9).max(198),
+    // Nine base queries at the live limit (up to eighteen) plus at most nine
+    // Hall-deficiency rescue queries at that same limit. Persist the truthful
+    // effective search budget rather than a truncated legacy target.
+    searchTarget: z.number().int().min(9).max(324),
     referenceTarget: z.literal(9),
     displayTarget: z.literal(9),
     candidates: z.array(visualCandidateV4Schema).length(9),
@@ -1114,6 +1115,7 @@ export const siteOpsSendMessageInputSchema = z
 
 export const siteOpsActionSchema = z.enum([
   "reset_workflow",
+  "resume_build",
   "request_rebuild",
   "select_snapshot",
   "change_snapshot",

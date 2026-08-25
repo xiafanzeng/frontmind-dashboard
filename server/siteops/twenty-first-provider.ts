@@ -46,7 +46,6 @@ import {
   type ReferenceBlueprintV4,
 } from "../../shared/siteops-design";
 import { AuthServiceError } from "../auth-service";
-import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
 import {
   TwentyFirstClient,
@@ -146,7 +145,7 @@ type PreviewRejectionReason =
   | "aborted";
 
 export type VisualSearchDiagnostics = {
-  diagnosticsVersion: 1;
+  diagnosticsVersion: 2;
   searchedByAxis: Record<TwentyFirstQueryAxis, number>;
   normalizedUnique: number;
   shortlistCount: number;
@@ -154,6 +153,27 @@ export type VisualSearchDiagnostics = {
   mirrorAttempted: number;
   mirrorSucceeded: number;
   rejectedByReason: Partial<Record<PreviewRejectionReason, number>>;
+  /** Safe aggregate graph diagnostics. Family names, queries and URLs are
+   * deliberately absent so this object can be returned and logged. */
+  eligibilityEdgeCount: number;
+  exactEligibilityEdgeCount: number;
+  safeFallbackEdgeCount: number;
+  keyMatchingCardinality: number;
+  compatibleMatchingCardinality: number;
+  deficientFamilyCount: number;
+  queryCalls: number;
+  maximumQueryLimit: number;
+  effectiveSearchLimit: number;
+  generalHeroEligibleCount: number;
+  exactEligibilityEdges: number;
+  safeFallbackEdges: number;
+  mirrorAttempts: number;
+  terminalReason:
+    | "complete"
+    | "catalog_insufficient"
+    | "matching_budget_exhausted"
+    | "preview_failures"
+    | null;
   diversity: SafeVisualDiversitySummary;
 };
 
@@ -225,9 +245,84 @@ type VisualSearchStage =
   | "persist_selection_bundle"
   | "persist_board";
 
+type SafeVisualStructuredStage =
+  | "visual_query_capability"
+  | "visual_matching"
+  | "visual_mirror"
+  | "visual_page_published";
+
+/**
+ * Deliberately closed structured log contract. Callers can report only
+ * internal coordinates, opaque variant identifiers, numeric aggregates and
+ * the safe terminal classification. Provider queries, family names, URLs,
+ * customer prose and credentials cannot enter this helper.
+ */
+function logSafeVisualStage(input: {
+  event: SafeVisualStructuredStage;
+  operationId: string;
+  projectId: string;
+  page: 1 | 2 | 3;
+  latencyMs: number;
+  variantId?: string;
+  actualLimit?: number;
+  queryCalls?: number;
+  normalizedUnique?: number;
+  eligibilityEdges?: number;
+  keyMatchingCardinality?: number;
+  compatibleMatchingCardinality?: number;
+  mirrorAttempts?: number;
+  mirrorSucceeded?: number;
+  rejectedPreviews?: number;
+  candidateCount?: number;
+  terminalReason?: VisualSearchDiagnostics["terminalReason"];
+}) {
+  console.info("[SiteOps21st] visual_stage", {
+    event: input.event,
+    operationId: input.operationId,
+    projectId: input.projectId,
+    page: input.page,
+    latencyMs: Math.max(0, Math.trunc(input.latencyMs)),
+    ...(input.variantId ? { variantId: input.variantId } : {}),
+    ...(input.actualLimit === undefined
+      ? {}
+      : { actualLimit: input.actualLimit }),
+    ...(input.queryCalls === undefined ? {} : { queryCalls: input.queryCalls }),
+    ...(input.normalizedUnique === undefined
+      ? {}
+      : { normalizedUnique: input.normalizedUnique }),
+    ...(input.eligibilityEdges === undefined
+      ? {}
+      : { eligibilityEdges: input.eligibilityEdges }),
+    ...(input.keyMatchingCardinality === undefined
+      ? {}
+      : { keyMatchingCardinality: input.keyMatchingCardinality }),
+    ...(input.compatibleMatchingCardinality === undefined
+      ? {}
+      : {
+          compatibleMatchingCardinality:
+            input.compatibleMatchingCardinality,
+        }),
+    ...(input.mirrorAttempts === undefined
+      ? {}
+      : { mirrorAttempts: input.mirrorAttempts }),
+    ...(input.mirrorSucceeded === undefined
+      ? {}
+      : { mirrorSucceeded: input.mirrorSucceeded }),
+    ...(input.rejectedPreviews === undefined
+      ? {}
+      : { rejectedPreviews: input.rejectedPreviews }),
+    ...(input.candidateCount === undefined
+      ? {}
+      : { candidateCount: input.candidateCount }),
+    ...(input.terminalReason === undefined
+      ? {}
+      : { terminalReason: input.terminalReason }),
+  });
+}
+
 function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
   return {
-    diagnosticsVersion: 1,
+    diagnosticsVersion: 2,
     searchedByAxis: {
       foundation_split: 0,
       foundation_editorial_modular: 0,
@@ -240,6 +335,20 @@ function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
     mirrorAttempted: 0,
     mirrorSucceeded: 0,
     rejectedByReason: {},
+    eligibilityEdgeCount: 0,
+    exactEligibilityEdgeCount: 0,
+    safeFallbackEdgeCount: 0,
+    keyMatchingCardinality: 0,
+    compatibleMatchingCardinality: 0,
+    deficientFamilyCount: FRONTMIND_VISUAL_FAMILIES_V3.length,
+    queryCalls: 0,
+    maximumQueryLimit: 0,
+    effectiveSearchLimit: 0,
+    generalHeroEligibleCount: 0,
+    exactEligibilityEdges: 0,
+    safeFallbackEdges: 0,
+    mirrorAttempts: 0,
+    terminalReason: null,
     diversity: {
       summaryVersion: 1,
       requestedFamilies: 9,
@@ -614,14 +723,28 @@ type FamilySearchQuery = {
   page: 1 | 2 | 3;
   role: "foundation";
   axis: "foundation_split" | "foundation_editorial_modular";
-  limit: 4 | 18;
+  limit: number;
   query: string;
+};
+
+type FamilyReferenceEvidence = "exact" | "safe_fallback";
+
+type FamilyReferenceEdge = {
+  candidate: NormalizedTwentyFirstCandidate;
+  /** `exact` is proved by family-positive provider metadata.
+   * `safe_fallback` passed the general Hero gate without contradicting the
+   * target family. Query provenance never creates or upgrades an edge. */
+  evidence: FamilyReferenceEvidence;
 };
 
 type FamilyReferencePools = Map<
   FrontMindVisualFamily,
-  NormalizedTwentyFirstCandidate[]
+  FamilyReferenceEdge[]
 >;
+
+const MAX_FAMILY_SEARCH_CALLS = 18;
+const MAX_MIRROR_ATTEMPTS = 36;
+const MIRROR_CONCURRENCY = 3;
 
 const FAMILY_SEARCH_TERMS: Record<
   FrontMindVisualFamily,
@@ -666,22 +789,60 @@ const FAMILY_SEARCH_TERMS: Record<
 };
 
 /**
- * Fixed provider-safe variants prevent a supplemental page from replaying the
- * exact first-page query. These fragments are code-owned allowlist values;
- * neither provider output nor customer prose can select a new query strategy.
+ * Fixed family-specific variants prevent later pages from replaying the same
+ * recommendation window. These are structural synonyms rather than generic
+ * "fresh" suffixes. Provider output and customer prose cannot select a query.
  */
-const FAMILY_PAGE_QUERY_VARIANTS: Record<1 | 2 | 3, readonly [string, string]> =
-  {
+const FAMILY_PAGE_QUERY_VARIANTS: Record<
+  FrontMindVisualFamily,
+  Record<1 | 2 | 3, readonly [string, string]>
+> = {
+  floating_orbit: {
     1: ["", ""],
-    2: [
-      "alternative original composition reference",
-      "distinct less common composition reference",
-    ],
-    3: [
-      "fresh independent composition reference",
-      "uncommon experimental composition reference",
-    ],
-  };
+    2: ["kinetic radial constellation", "layered circular motion geometry"],
+    3: ["generative particle field", "concentric spatial illustration"],
+  },
+  split_media: {
+    1: ["", ""],
+    2: ["asymmetric two panel masthead", "side by side image copy layout"],
+    3: ["offset media text diptych", "dual column visual narrative"],
+  },
+  editorial: {
+    1: ["", ""],
+    2: ["publication cover typography", "art directed serif masthead"],
+    3: ["newspaper inspired hierarchy", "asymmetric type image composition"],
+  },
+  bento: {
+    1: ["", ""],
+    2: ["masonry product story tiles", "modular card mosaic masthead"],
+    3: ["nested information tile canvas", "irregular rounded panel collage"],
+  },
+  feature_grid: {
+    1: ["", ""],
+    2: ["capability card matrix", "technical benefit tile system"],
+    3: ["icon feature matrix masthead", "structured product benefit cards"],
+  },
+  centered_dual_cta: {
+    1: ["", ""],
+    2: ["symmetrical conversion masthead", "centered two action statement"],
+    3: ["minimal paired action header", "balanced headline button pair"],
+  },
+  immersive_visual: {
+    1: ["", ""],
+    2: ["cinematic spatial scene", "full viewport depth experience"],
+    3: ["parallax environment masthead", "three dimensional visual canvas"],
+  },
+  product_stage: {
+    1: ["", ""],
+    2: ["software interface pedestal", "device mockup spotlight composition"],
+    3: ["application preview theater", "layered product screen showcase"],
+  },
+  full_bleed_statement: {
+    1: ["", ""],
+    2: ["edge to edge typographic declaration", "oversized minimal type canvas"],
+    3: ["dramatic headline only masthead", "full viewport bold type statement"],
+  },
+};
 
 type FamilyEligibilityRule = {
   /** Query provenance is never a positive signal. These expressions run only
@@ -857,34 +1018,41 @@ const FAMILY_ELIGIBILITY_RULES: Record<
   },
 };
 
-function familyEligibleReference(
+function familyReferenceEvidence(
   family: FrontMindVisualFamily,
   candidate: NormalizedTwentyFirstCandidate,
-) {
-  if (!candidate.heroEligibility.eligible) return false;
+): FamilyReferenceEvidence | null {
+  if (
+    !candidate.heroEligibility.eligible ||
+    candidate.catalogRole !== "hero" ||
+    !candidate.previewUrl
+  ) {
+    return null;
+  }
   const metadata = [candidate.title, candidate.description, candidate.sourceUrl]
     .filter(Boolean)
     .join(" ")
     .normalize("NFKC");
   const rule = FAMILY_ELIGIBILITY_RULES[family];
-  if (!rule.positiveMetadata.some((pattern) => pattern.test(metadata))) {
-    return false;
-  }
   if (rule.negativeMetadata.some((pattern) => pattern.test(metadata))) {
-    return false;
+    return null;
   }
   const directives = new Set(candidate.normalizedDirectives);
   if (rule.negativeDirectives.some((directive) => directives.has(directive))) {
-    return false;
+    return null;
   }
-  // Positive directives strengthen an explicit metadata match. Some families
-  // (for example floating orbit and centered dual CTA) have no dedicated
-  // directive in the narrow allowlist, so an explicit family phrase remains
-  // sufficient when no contradictory directive is present.
-  return (
-    rule.positiveDirectives.some((directive) => directives.has(directive)) ||
-    candidate.heroEligibility.confidence === "explicit"
+  const hasPositiveMetadata = rule.positiveMetadata.some((pattern) =>
+    pattern.test(metadata),
   );
+  if (hasPositiveMetadata) {
+    // Exact family edges are proved only by the provider item's own metadata.
+    // Query provenance is deliberately absent from this decision.
+    return "exact";
+  }
+  // A catalog item that has independently passed the generic Hero classifier,
+  // has a real preview and contradicts none of this family's safety rules may
+  // fill a sparse family only as a lower-priority safe fallback.
+  return "safe_fallback";
 }
 
 function familyQueryAxis(
@@ -931,7 +1099,7 @@ function composeFamilySearchQuery(input: {
 }): FamilySearchQuery {
   const terms = FAMILY_SEARCH_TERMS[input.family];
   const termIndex = input.round === "primary" ? 0 : 1;
-  const pageVariant = FAMILY_PAGE_QUERY_VARIANTS[input.page][termIndex];
+  const pageVariant = FAMILY_PAGE_QUERY_VARIANTS[input.family][input.page][termIndex];
   const context = safeFamilySearchContext(input.brief);
   return {
     family: input.family,
@@ -939,9 +1107,11 @@ function composeFamilySearchQuery(input: {
     page: input.page,
     role: "foundation",
     axis: familyQueryAxis(input.family),
-    // Supplemental pages first make the same bounded top-four probe, then only
-    // missing families expand through the page-specific fallback to depth 18.
-    limit: input.page === 1 || input.round === "primary" ? 4 : 18,
+    // The live client clamps this request to the advertised provider maximum.
+    // Asking for eighteen immediately avoids replaying only the recommendation
+    // head on supplemental pages; the number of calls remains independently
+    // bounded below.
+    limit: 18,
     query: `${terms[termIndex]}${pageVariant ? ` ${pageVariant}` : ""}${context ? ` for ${context}` : ""}`,
   };
 }
@@ -950,6 +1120,48 @@ function emptyFamilyReferencePools(): FamilyReferencePools {
   return new Map(
     FRONTMIND_VISUAL_FAMILIES_V3.map((family) => [family, []] as const),
   );
+}
+
+function compareFamilyEdges(left: FamilyReferenceEdge, right: FamilyReferenceEdge) {
+  return (
+    (left.evidence === right.evidence
+      ? 0
+      : left.evidence === "exact"
+        ? -1
+        : 1) ||
+    left.candidate.queryRank - right.candidate.queryRank ||
+    left.candidate.searchRank - right.candidate.searchRank ||
+    right.candidate.score - left.candidate.score ||
+    left.candidate.providerItemKey.localeCompare(
+      right.candidate.providerItemKey,
+    )
+  );
+}
+
+function addCandidateToFamilyGraph(input: {
+  pools: FamilyReferencePools;
+  candidate: NormalizedTwentyFirstCandidate;
+  excludedProviderKeys?: ReadonlySet<string>;
+}) {
+  if (input.excludedProviderKeys?.has(input.candidate.providerItemKey)) return;
+  for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+    const evidence = familyReferenceEvidence(family, input.candidate);
+    if (!evidence) continue;
+    const pool = input.pools.get(family)!;
+    const existingIndex = pool.findIndex(
+      (edge) =>
+        edge.candidate.providerItemKey === input.candidate.providerItemKey,
+    );
+    if (existingIndex < 0) {
+      pool.push({ candidate: input.candidate, evidence });
+    } else if (
+      evidence === "exact" &&
+      pool[existingIndex]!.evidence === "safe_fallback"
+    ) {
+      pool[existingIndex] = { candidate: input.candidate, evidence };
+    }
+    pool.sort(compareFamilyEdges);
+  }
 }
 
 async function searchFamilyRound(input: {
@@ -967,20 +1179,30 @@ async function searchFamilyRound(input: {
   signal: AbortSignal;
   diagnostics: VisualSearchDiagnostics;
   excludedProviderKeys?: ReadonlySet<string>;
+  generalHeroEligibleKeys: Set<string>;
+  effectiveSearchLimit: number;
 }) {
   for (const family of input.families) {
+    if (input.queries.length >= MAX_FAMILY_SEARCH_CALLS) break;
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
         "视觉检索已超时，请重置后重新开始。",
       );
     }
-    const query = composeFamilySearchQuery({
+    const composedQuery = composeFamilySearchQuery({
       family,
       round: input.round,
       page: input.page,
       brief: input.brief,
     });
+    const query: FamilySearchQuery = {
+      ...composedQuery,
+      limit: Math.max(
+        1,
+        Math.min(composedQuery.limit, Math.trunc(input.effectiveSearchLimit)),
+      ),
+    };
     const envelope: TwentyFirstSearchEnvelope = {
       role: query.role,
       axis: query.axis,
@@ -1004,36 +1226,35 @@ async function searchFamilyRound(input: {
       searchEnvelopes: [envelope],
       retrievalLimit: query.limit,
     });
-    const pool = input.pools.get(family)!;
-    const existingKeys = new Set(pool.map((item) => item.providerItemKey));
     for (const candidate of funnel.retrievalShortlist) {
-      if (
-        familyEligibleReference(family, candidate) &&
-        !input.excludedProviderKeys?.has(candidate.providerItemKey) &&
-        !existingKeys.has(candidate.providerItemKey)
-      ) {
-        pool.push(candidate);
-        existingKeys.add(candidate.providerItemKey);
-      }
+      input.generalHeroEligibleKeys.add(candidate.providerItemKey);
+      addCandidateToFamilyGraph({
+        pools: input.pools,
+        candidate,
+        excludedProviderKeys: input.excludedProviderKeys,
+      });
     }
   }
 }
 
-function maximumKeyAssignment(pools: FamilyReferencePools) {
-  const assignment = new Map<FrontMindVisualFamily, string>();
+function maximumKeyAssignment(
+  pools: FamilyReferencePools,
+  unavailableProviderKeys: ReadonlySet<string> = new Set(),
+) {
+  const assignment = new Map<FrontMindVisualFamily, FamilyReferenceEdge>();
   const ownerByProviderKey = new Map<string, FrontMindVisualFamily>();
   const visit = (
     family: FrontMindVisualFamily,
     visited: Set<string>,
   ): boolean => {
-    for (const candidate of pools.get(family) ?? []) {
-      const key = candidate.providerItemKey;
-      if (visited.has(key)) continue;
+    for (const edge of pools.get(family) ?? []) {
+      const key = edge.candidate.providerItemKey;
+      if (unavailableProviderKeys.has(key) || visited.has(key)) continue;
       visited.add(key);
       const owner = ownerByProviderKey.get(key);
       if (!owner || visit(owner, visited)) {
         ownerByProviderKey.set(key, family);
-        assignment.set(family, key);
+        assignment.set(family, edge);
         return true;
       }
     }
@@ -1045,6 +1266,154 @@ function maximumKeyAssignment(pools: FamilyReferencePools) {
   return assignment;
 }
 
+function hallDeficiencyFamilyClosure(input: {
+  pools: FamilyReferencePools;
+  assignment: ReadonlyMap<FrontMindVisualFamily, FamilyReferenceEdge>;
+  unavailableProviderKeys?: ReadonlySet<string>;
+}) {
+  const unavailable = input.unavailableProviderKeys ?? new Set<string>();
+  const ownerByProviderKey = new Map(
+    [...input.assignment].map(
+      ([family, edge]) => [edge.candidate.providerItemKey, family] as const,
+    ),
+  );
+  const pending = FRONTMIND_VISUAL_FAMILIES_V3.filter(
+    (family) => !input.assignment.has(family),
+  );
+  const closure = new Set<FrontMindVisualFamily>(pending);
+  while (pending.length > 0) {
+    const family = pending.shift()!;
+    for (const edge of input.pools.get(family) ?? []) {
+      const key = edge.candidate.providerItemKey;
+      if (unavailable.has(key)) continue;
+      const owner = ownerByProviderKey.get(key);
+      if (owner && !closure.has(owner)) {
+        closure.add(owner);
+        pending.push(owner);
+      }
+    }
+  }
+  return closure;
+}
+
+function nextMirrorCandidates(input: {
+  pools: FamilyReferencePools;
+  keyAssignment: ReadonlyMap<FrontMindVisualFamily, FamilyReferenceEdge>;
+  compatibleAssignment: ReadonlyMap<FrontMindVisualFamily, MirroredReference>;
+  attemptedProviderKeys: ReadonlySet<string>;
+  unavailableProviderKeys: ReadonlySet<string>;
+  limit: number;
+}) {
+  const selected = new Map<string, NormalizedTwentyFirstCandidate>();
+  const add = (edge: FamilyReferenceEdge) => {
+    const key = edge.candidate.providerItemKey;
+    if (
+      selected.size >= input.limit ||
+      input.attemptedProviderKeys.has(key) ||
+      input.unavailableProviderKeys.has(key)
+    ) {
+      return;
+    }
+    selected.set(key, edge.candidate);
+  };
+  for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+    const edge = input.keyAssignment.get(family);
+    if (edge) add(edge);
+    if (selected.size >= input.limit) return [...selected.values()];
+  }
+  if (selected.size > 0) return [...selected.values()];
+
+  // A full provider-key assignment can still be incompatible after preview
+  // SHA/pHash checks. Rank unmirrored alternatives by how many currently
+  // deficient families they can safely serve, then prefer exact metadata.
+  const deficient = new Set(
+    FRONTMIND_VISUAL_FAMILIES_V3.filter(
+      (family) => !input.compatibleAssignment.has(family),
+    ),
+  );
+  const edgeByKey = new Map<string, FamilyReferenceEdge>();
+  const supportByKey = new Map<string, number>();
+  const exactByKey = new Map<string, number>();
+  for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+    for (const edge of input.pools.get(family) ?? []) {
+      const key = edge.candidate.providerItemKey;
+      if (
+        input.attemptedProviderKeys.has(key) ||
+        input.unavailableProviderKeys.has(key)
+      ) {
+        continue;
+      }
+      const existing = edgeByKey.get(key);
+      if (!existing || compareFamilyEdges(edge, existing) < 0) {
+        edgeByKey.set(key, edge);
+      }
+      if (deficient.has(family)) {
+        supportByKey.set(key, (supportByKey.get(key) ?? 0) + 1);
+      }
+      if (edge.evidence === "exact") {
+        exactByKey.set(key, (exactByKey.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  const ranked = [...edgeByKey.values()].sort(
+    (left, right) =>
+      (supportByKey.get(right.candidate.providerItemKey) ?? 0) -
+        (supportByKey.get(left.candidate.providerItemKey) ?? 0) ||
+      (exactByKey.get(right.candidate.providerItemKey) ?? 0) -
+        (exactByKey.get(left.candidate.providerItemKey) ?? 0) ||
+      compareFamilyEdges(left, right),
+  );
+  for (const edge of ranked) {
+    add(edge);
+    if (selected.size >= input.limit) break;
+  }
+  return [...selected.values()];
+}
+
+function nextHallRescueFamily(input: {
+  pools: FamilyReferencePools;
+  assignment: ReadonlyMap<FrontMindVisualFamily, FamilyReferenceEdge>;
+  queried: ReadonlySet<FrontMindVisualFamily>;
+}) {
+  const closure = hallDeficiencyFamilyClosure({
+    pools: input.pools,
+    assignment: input.assignment,
+  });
+  const index = (family: FrontMindVisualFamily) =>
+    FRONTMIND_VISUAL_FAMILIES_V3.indexOf(family);
+  const choose = (families: readonly FrontMindVisualFamily[]) =>
+    [...families]
+      .filter((family) => !input.queried.has(family))
+      .sort(
+        (left, right) =>
+          Number(input.assignment.has(left)) -
+            Number(input.assignment.has(right)) ||
+          (input.pools.get(left)?.length ?? 0) -
+            (input.pools.get(right)?.length ?? 0) ||
+          index(left) - index(right),
+      )[0];
+  // Query the alternating deficiency closure first. If all of it has already
+  // been explored, use the remaining family allowlist; this makes the bound
+  // complete even when a rescue query introduces a new cross-family edge.
+  return choose([...closure]) ?? choose(FRONTMIND_VISUAL_FAMILIES_V3);
+}
+
+function compatibleKeyEdges(input: {
+  pools: FamilyReferencePools;
+  assignment: ReadonlyMap<FrontMindVisualFamily, MirroredReference>;
+}) {
+  const edges = new Map<FrontMindVisualFamily, FamilyReferenceEdge>();
+  for (const [family, reference] of input.assignment) {
+    const edge = (input.pools.get(family) ?? []).find(
+      (candidateEdge) =>
+        candidateEdge.candidate.providerItemKey ===
+        reference.candidate.providerItemKey,
+    );
+    if (edge) edges.set(family, edge);
+  }
+  return edges;
+}
+
 function refreshRetrievalDiagnostics(input: {
   pools: FamilyReferencePools;
   searchedCandidates: Map<
@@ -1054,17 +1423,54 @@ function refreshRetrievalDiagnostics(input: {
   mirrored: readonly MirroredReference[];
   assigned: ReadonlyMap<FrontMindVisualFamily, MirroredReference>;
   diagnostics: VisualSearchDiagnostics;
+  queries?: readonly FamilySearchQuery[];
+  keyMatchingCardinality?: number;
+  generalHeroEligibleKeys?: ReadonlySet<string>;
+  effectiveSearchLimit?: number;
 }) {
   const eligibleKeys = new Set(
     [...input.pools.values()].flatMap((pool) =>
-      pool.map((candidate) => candidate.providerItemKey),
+      pool.map((edge) => edge.candidate.providerItemKey),
     ),
   );
+  const edges = [...input.pools.values()].flat();
   input.diagnostics.normalizedUnique = input.searchedCandidates.size;
   input.diagnostics.withPreviewReference = [
     ...input.searchedCandidates.values(),
   ].filter((candidate) => candidate.previewUrl).length;
   input.diagnostics.shortlistCount = eligibleKeys.size;
+  input.diagnostics.eligibilityEdgeCount = edges.length;
+  input.diagnostics.exactEligibilityEdgeCount = edges.filter(
+    (edge) => edge.evidence === "exact",
+  ).length;
+  input.diagnostics.safeFallbackEdgeCount = edges.filter(
+    (edge) => edge.evidence === "safe_fallback",
+  ).length;
+  input.diagnostics.keyMatchingCardinality =
+    input.keyMatchingCardinality ?? maximumKeyAssignment(input.pools).size;
+  input.diagnostics.compatibleMatchingCardinality = input.assigned.size;
+  input.diagnostics.deficientFamilyCount = Math.max(
+    0,
+    FRONTMIND_VISUAL_FAMILIES_V3.length - input.assigned.size,
+  );
+  input.diagnostics.queryCalls =
+    input.queries?.length ?? input.diagnostics.diversity.familyQueriesRun;
+  input.diagnostics.maximumQueryLimit = Math.max(
+    0,
+    ...(input.queries ?? []).map((query) => query.limit),
+  );
+  input.diagnostics.effectiveSearchLimit = Math.max(
+    0,
+    Math.trunc(
+      input.effectiveSearchLimit ?? input.diagnostics.maximumQueryLimit,
+    ),
+  );
+  input.diagnostics.generalHeroEligibleCount =
+    input.generalHeroEligibleKeys?.size ?? eligibleKeys.size;
+  input.diagnostics.exactEligibilityEdges =
+    input.diagnostics.exactEligibilityEdgeCount;
+  input.diagnostics.safeFallbackEdges = input.diagnostics.safeFallbackEdgeCount;
+  input.diagnostics.mirrorAttempts = input.diagnostics.mirrorAttempted;
   input.diagnostics.diversity.eligibleReferences = eligibleKeys.size;
   input.diagnostics.diversity.mirroredReferences = input.mirrored.length;
   input.diagnostics.diversity.assignedFamilies = input.assigned.size;
@@ -1134,40 +1540,45 @@ async function mirrorCandidates(input: {
   fetchPreview: typeof fetchSafeVisualPreview;
   persistArtifact: typeof persistSiteOpsArtifact;
   diagnostics: VisualSearchDiagnostics;
-  seenPreviewHashes?: Set<string>;
-  seenPerceptualHashes?: Set<string>;
+  priorPreviewHashes?: ReadonlySet<string>;
+  priorPerceptualHashes?: ReadonlySet<string>;
 }) {
   const mirrored: MirroredReference[] = [];
-  const seenPreviewHashes = input.seenPreviewHashes ?? new Set<string>();
-  const seenPerceptualHashes = input.seenPerceptualHashes ?? new Set<string>();
-  const budget = AbortSignal.timeout(45_000);
-  const mirrorSignal = AbortSignal.any([input.signal, budget]);
-  for (let offset = 0; offset < input.candidates.length; offset += 3) {
-    if (mirrorSignal.aborted) {
+  const rejectedProviderKeys = new Set<string>();
+  const priorPreviewHashes = input.priorPreviewHashes ?? new Set<string>();
+  const priorPerceptualHashes =
+    input.priorPerceptualHashes ?? new Set<string>();
+  for (
+    let offset = 0;
+    offset < input.candidates.length;
+    offset += MIRROR_CONCURRENCY
+  ) {
+    if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
         "视觉预览镜像已超时，请重置后重新开始。",
       );
     }
-    const batch = input.candidates.slice(offset, offset + 3);
+    const batch = input.candidates.slice(offset, offset + MIRROR_CONCURRENCY);
     const downloaded = await Promise.all(
       batch.map(async (candidate) => {
         input.diagnostics.mirrorAttempted += 1;
         try {
           const preview = await input.fetchPreview({
             url: candidate.previewUrl!,
-            signal: mirrorSignal,
+            signal: input.signal,
           });
           const perceptualHash = await perceptualHash64(preview.buffer);
           return { candidate, preview, perceptualHash } as const;
         } catch (error) {
-          if (mirrorSignal.aborted) {
+          if (input.signal.aborted) {
             throw new TwentyFirstProviderFailure(
               "VISUAL_SEARCH_TIMEOUT",
               "视觉预览镜像已超时，请重置后重新开始。",
             );
           }
           rejectDiagnostic(input.diagnostics, previewRejectionReason(error));
+          rejectedProviderKeys.add(candidate.providerItemKey);
           return null;
         }
       }),
@@ -1176,16 +1587,15 @@ async function mirrorCandidates(input: {
       if (!downloadedItem) continue;
       const { candidate, preview, perceptualHash } = downloadedItem;
       if (
-        seenPreviewHashes.has(preview.sha256) ||
-        [...seenPerceptualHashes].some(
+        priorPreviewHashes.has(preview.sha256) ||
+        [...priorPerceptualHashes].some(
           (hash) => perceptualHashDistance(hash, perceptualHash) < 6,
         )
       ) {
         rejectDiagnostic(input.diagnostics, "duplicate");
+        rejectedProviderKeys.add(candidate.providerItemKey);
         continue;
       }
-      seenPreviewHashes.add(preview.sha256);
-      seenPerceptualHashes.add(perceptualHash);
       let asset: Awaited<ReturnType<typeof input.persistArtifact>>;
       try {
         asset = await input.persistArtifact({
@@ -1199,10 +1609,12 @@ async function mirrorCandidates(input: {
         });
       } catch {
         rejectDiagnostic(input.diagnostics, "persist");
+        rejectedProviderKeys.add(candidate.providerItemKey);
         continue;
       }
       if (asset.contentSha256 !== preview.sha256) {
         rejectDiagnostic(input.diagnostics, "hash");
+        rejectedProviderKeys.add(candidate.providerItemKey);
         continue;
       }
       mirrored.push({
@@ -1232,7 +1644,7 @@ async function mirrorCandidates(input: {
       input.diagnostics.mirrorSucceeded += 1;
     }
   }
-  return mirrored;
+  return { mirrored, rejectedProviderKeys };
 }
 
 function sha256Buffer(buffer: Buffer) {
@@ -1300,10 +1712,14 @@ function assignDistinctMirroredReferences(input: {
       (family) =>
         [
           family,
-          (input.pools.get(family) ?? []).flatMap((candidate) => {
-            const mirrored = mirroredByKey.get(candidate.providerItemKey);
-            return mirrored ? [mirrored] : [];
-          }),
+          (input.pools.get(family) ?? [])
+            .flatMap((edge) => {
+              const mirrored = mirroredByKey.get(
+                edge.candidate.providerItemKey,
+              );
+              return mirrored ? [{ edge, mirrored }] : [];
+            })
+            .sort((left, right) => compareFamilyEdges(left.edge, right.edge)),
         ] as const,
     ),
   );
@@ -1315,38 +1731,44 @@ function assignDistinctMirroredReferences(input: {
   );
   let best = new Map<FrontMindVisualFamily, MirroredReference>();
   let explored = 0;
+  const solverBudget = 250_000;
+  const deadStates = new Set<string>();
   const visit = (
     index: number,
     assigned: Map<FrontMindVisualFamily, MirroredReference>,
     providerKeys: Set<string>,
-    hashes: string[],
+    previewHashes: Set<string>,
+    perceptualHashes: string[],
   ): boolean => {
     explored += 1;
+    if (explored > solverBudget) {
+      throw new TwentyFirstProviderFailure(
+        "VISUAL_MATCHING_BUDGET_EXHAUSTED",
+        "视觉参考组合计算暂时超出安全上限，请稍后重试。",
+        "attention_required",
+      );
+    }
     if (assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) {
-      try {
-        assertVisualBlueprintDiversityV4(
-          FRONTMIND_VISUAL_FAMILIES_V3.map((family) =>
-            trustedVisualPreviewBlueprintV4(
-              family,
-              assigned.get(family)!.taxonomy,
-            ),
-          ),
-        );
-        best = new Map(assigned);
-        return true;
-      } catch {
-        return false;
-      }
+      // The family-owned V4 baselines are asserted once when the final board
+      // is rendered. Reference feasibility depends only on the processed
+      // family index and selected provider keys/SHA/pHashes, which lets this
+      // search memoize equivalent permutations safely.
+      best = new Map(assigned);
+      return true;
     }
     if (assigned.size > best.size) best = new Map(assigned);
-    if (index >= familyOrder.length || explored > 25_000) return false;
+    if (index >= familyOrder.length) return false;
     if (assigned.size + familyOrder.length - index <= best.size) return false;
+    const stateKey = `${index}:${[...providerKeys].sort().join(",")}`;
+    if (deadStates.has(stateKey)) return false;
     const family = familyOrder[index]!;
-    for (const reference of choices.get(family) ?? []) {
+    for (const choice of choices.get(family) ?? []) {
+      const reference = choice.mirrored;
       const key = reference.candidate.providerItemKey;
       if (
         providerKeys.has(key) ||
-        hashes.some(
+        previewHashes.has(reference.previewSha256) ||
+        perceptualHashes.some(
           (hash) => perceptualHashDistance(hash, reference.perceptualHash) < 6,
         )
       ) {
@@ -1354,15 +1776,35 @@ function assignDistinctMirroredReferences(input: {
       }
       assigned.set(family, reference);
       providerKeys.add(key);
-      hashes.push(reference.perceptualHash);
-      if (visit(index + 1, assigned, providerKeys, hashes)) return true;
-      hashes.pop();
+      previewHashes.add(reference.previewSha256);
+      perceptualHashes.push(reference.perceptualHash);
+      if (
+        visit(
+          index + 1,
+          assigned,
+          providerKeys,
+          previewHashes,
+          perceptualHashes,
+        )
+      ) {
+        return true;
+      }
+      perceptualHashes.pop();
+      previewHashes.delete(reference.previewSha256);
       providerKeys.delete(key);
       assigned.delete(family);
     }
-    return visit(index + 1, assigned, providerKeys, hashes);
+    const completed = visit(
+      index + 1,
+      assigned,
+      providerKeys,
+      previewHashes,
+      perceptualHashes,
+    );
+    if (!completed) deadStates.add(stateKey);
+    return completed;
   };
-  visit(0, new Map(), new Set(), []);
+  visit(0, new Map(), new Set(), new Set(), []);
   return new Map(
     FRONTMIND_VISUAL_FAMILIES_V3.flatMap((family) => {
       const reference = best.get(family);
@@ -1750,7 +2192,7 @@ async function persistDefaultBoard(
         },
       },
     });
-    await tx
+    const projectUpdated = await tx
       .update(siteProjects)
       .set({
         brief: input.context.brief,
@@ -1764,6 +2206,14 @@ async function persistDefaultBoard(
           eq(siteProjects.revision, project.revision),
         ),
       );
+    const affectedRows = Number(
+      (Array.isArray(projectUpdated)
+        ? (projectUpdated[0] as { affectedRows?: unknown } | undefined)
+            ?.affectedRows
+        : (projectUpdated as { affectedRows?: unknown } | undefined)
+            ?.affectedRows) ?? 0,
+    );
+    if (affectedRows !== 1) throw visualSearchSuperseded();
     return {
       batchId,
       candidateCount: input.mirroredCandidates.length,
@@ -1778,6 +2228,13 @@ function safeProviderFailure(
   diagnostics: VisualSearchDiagnostics,
   signal: AbortSignal,
 ): SiteOpsProviderResult {
+  diagnostics.queryCalls = Math.max(
+    diagnostics.queryCalls,
+    diagnostics.diversity.familyQueriesRun,
+  );
+  diagnostics.mirrorAttempts = diagnostics.mirrorAttempted;
+  diagnostics.exactEligibilityEdges = diagnostics.exactEligibilityEdgeCount;
+  diagnostics.safeFallbackEdges = diagnostics.safeFallbackEdgeCount;
   if (signal.aborted || abortLike(error)) {
     return {
       status: "failed",
@@ -1787,6 +2244,10 @@ function safeProviderFailure(
     };
   }
   if (error instanceof TwentyFirstProviderFailure) {
+    if (error.code === "VISUAL_MATCHING_BUDGET_EXHAUSTED") {
+      diagnostics.terminalReason = "matching_budget_exhausted";
+    }
+    diagnostics.mirrorAttempts = diagnostics.mirrorAttempted;
     return {
       status: error.status,
       code: error.code,
@@ -1883,8 +2344,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
 
   return async ({ operation, signal, assertLeaseActive }) => {
+    const providerStartedAt = Date.now();
     let stage: VisualSearchStage = "validate_operation";
-    let activeApiKey: string | undefined;
     const diagnostics = createVisualSearchDiagnostics();
     try {
       const parsedInput = visualSearchOperationInputSchema.parse(
@@ -1933,7 +2394,6 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "attention_required",
         );
       }
-      activeApiKey = credential.apiKey;
       stage = "mcp_retrieval";
       const retrieval = await client.withReadOnlySession(
         credential.apiKey,
@@ -1944,18 +2404,57 @@ export function createTwentyFirstSiteOpsProviderHandler(
             string,
             ReturnType<typeof normalizeTwentyFirstSearchResults>[number]
           >();
+          const generalHeroEligibleKeys = new Set<string>();
           const mirrored: MirroredReference[] = [];
           const attemptedProviderKeys = new Set<string>();
+          const unavailableProviderKeys = new Set<string>();
           const excludedProviderKeys = new Set(
             context.previousReferences?.providerItemKeys ?? [],
           );
-          const seenPreviewHashes = new Set(
+          const priorPreviewHashes = new Set(
             context.previousReferences?.previewSha256s ?? [],
           );
-          const seenPerceptualHashes = new Set(
+          const priorPerceptualHashes = new Set(
             context.previousReferences?.perceptualHashes ?? [],
           );
-          const supplementedFamilies = new Set<FrontMindVisualFamily>();
+          const rescueQueriedFamilies = new Set<FrontMindVisualFamily>();
+          const effectiveSearchLimit = Math.max(
+            1,
+            Math.min(
+              18,
+              Math.trunc(session.effectiveSearchLimit ?? 18),
+            ),
+          );
+          let queryLatencyMs = 0;
+          const runSearchRound = async (input: {
+            families: readonly FrontMindVisualFamily[];
+            round: FamilySearchRound;
+          }) => {
+            const startedAt = Date.now();
+            try {
+              await searchFamilyRound({
+                session,
+                brief: context.brief,
+                families: input.families,
+                round: input.round,
+                page: searchPlan.page,
+                pools,
+                queries,
+                searchedCandidates,
+                signal,
+                diagnostics,
+                excludedProviderKeys,
+                generalHeroEligibleKeys,
+                effectiveSearchLimit,
+              });
+            } finally {
+              queryLatencyMs += Date.now() - startedAt;
+            }
+          };
+          const mirrorSignal = AbortSignal.any([
+            signal,
+            AbortSignal.timeout(45_000),
+          ]);
           const mirrorCandidateSet = async (
             candidates: NormalizedTwentyFirstCandidate[],
           ) => {
@@ -1965,149 +2464,200 @@ export function createTwentyFirstSiteOpsProviderHandler(
             if (candidates.length < 1) return;
             await assertCommitLeaseActive(assertLeaseActive);
             stage = "mirror_previews";
-            mirrored.push(
-              ...(await mirrorCandidates({
-                operation,
-                context,
-                candidates,
-                signal,
-                fetchPreview,
-                persistArtifact,
-                diagnostics,
-                seenPreviewHashes,
-                seenPerceptualHashes,
-              })),
-            );
-          };
-          const mirrorAllNewCandidates = async () => {
-            const unique = new Map<string, NormalizedTwentyFirstCandidate>();
-            for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
-              for (const candidate of pools.get(family) ?? []) {
-                if (!attemptedProviderKeys.has(candidate.providerItemKey)) {
-                  unique.set(candidate.providerItemKey, candidate);
-                }
-              }
-            }
-            await mirrorCandidateSet([...unique.values()]);
-            return assignDistinctMirroredReferences({ pools, mirrored });
-          };
-          let supplementalMirrorAttempts = 0;
-          const mirrorSupplementalUntil = async (attemptBudget: number) => {
-            let assigned = assignDistinctMirroredReferences({
-              pools,
-              mirrored,
+            const result = await mirrorCandidates({
+              operation,
+              context,
+              candidates,
+              signal: mirrorSignal,
+              fetchPreview,
+              persistArtifact,
+              diagnostics,
+              priorPreviewHashes,
+              priorPerceptualHashes,
             });
-            while (
-              supplementalMirrorAttempts < attemptBudget &&
-              assigned.size < FRONTMIND_VISUAL_FAMILIES_V3.length
-            ) {
-              const scheduledKeys = new Set<string>();
-              const candidates: NormalizedTwentyFirstCandidate[] = [];
-              for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
-                if (assigned.has(family)) continue;
-                const candidate = (pools.get(family) ?? []).find(
-                  (item) =>
-                    !attemptedProviderKeys.has(item.providerItemKey) &&
-                    !scheduledKeys.has(item.providerItemKey),
-                );
-                if (!candidate) continue;
-                scheduledKeys.add(candidate.providerItemKey);
-                candidates.push(candidate);
-                if (
-                  supplementalMirrorAttempts + candidates.length >=
-                  attemptBudget
-                ) {
-                  break;
-                }
-              }
-              if (candidates.length < 1) break;
-              await mirrorCandidateSet(candidates);
-              supplementalMirrorAttempts += candidates.length;
-              assigned = assignDistinctMirroredReferences({ pools, mirrored });
-            }
-            return assigned;
+            mirrored.push(...result.mirrored);
+            result.rejectedProviderKeys.forEach((key) =>
+              unavailableProviderKeys.add(key),
+            );
           };
 
           stage = "mcp_retrieval";
-          await searchFamilyRound({
-            session,
-            brief: context.brief,
+          await runSearchRound({
             families: FRONTMIND_VISUAL_FAMILIES_V3,
             round: "primary",
-            page: searchPlan.page,
-            pools,
-            queries,
-            searchedCandidates,
-            signal,
-            diagnostics,
-            excludedProviderKeys,
           });
-          const provisional = maximumKeyAssignment(pools);
-          const provisionallyMissing = FRONTMIND_VISUAL_FAMILIES_V3.filter(
-            (family) => !provisional.has(family),
+          const matchingStartedAt = Date.now();
+          let keyAssignment = maximumKeyAssignment(
+            pools,
+            unavailableProviderKeys,
           );
-          if (provisionallyMissing.length > 0) {
+          const searchRescueFamily = async (
+            family: FrontMindVisualFamily,
+          ) => {
+            rescueQueriedFamilies.add(family);
             stage = "mcp_retrieval";
-            await searchFamilyRound({
-              session,
-              brief: context.brief,
-              families: provisionallyMissing,
+            await runSearchRound({
+              families: [family],
               round: "supplemental",
-              page: searchPlan.page,
-              pools,
-              queries,
-              searchedCandidates,
-              signal,
-              diagnostics,
-              excludedProviderKeys,
             });
-            provisionallyMissing.forEach((family) =>
-              supplementedFamilies.add(family),
-            );
-          }
-          let assigned =
-            searchPlan.mode === "supplemental"
-              ? await mirrorSupplementalUntil(18)
-              : await mirrorAllNewCandidates();
-          const missingAfterMirror = FRONTMIND_VISUAL_FAMILIES_V3.filter(
-            (family) =>
-              !assigned.has(family) && !supplementedFamilies.has(family),
-          );
-          if (missingAfterMirror.length > 0) {
-            stage = "mcp_retrieval";
-            await searchFamilyRound({
-              session,
-              brief: context.brief,
-              families: missingAfterMirror,
-              round: "supplemental",
-              page: searchPlan.page,
+            keyAssignment = maximumKeyAssignment(
               pools,
-              queries,
-              searchedCandidates,
-              signal,
-              diagnostics,
-              excludedProviderKeys,
-            });
-            missingAfterMirror.forEach((family) =>
-              supplementedFamilies.add(family),
+              unavailableProviderKeys,
             );
+          };
+          const rescueUntilCompleteKeyMatching = async () => {
+            while (
+              keyAssignment.size < FRONTMIND_VISUAL_FAMILIES_V3.length &&
+              queries.length < MAX_FAMILY_SEARCH_CALLS
+            ) {
+              const family = nextHallRescueFamily({
+                pools,
+                assignment: keyAssignment,
+                queried: rescueQueriedFamilies,
+              });
+              if (!family) break;
+              await searchRescueFamily(family);
+            }
+          };
+          await rescueUntilCompleteKeyMatching();
+
+          const mirrorStartedAt = Date.now();
+          let assigned = new Map<
+            FrontMindVisualFamily,
+            MirroredReference
+          >();
+          while (
+            keyAssignment.size === FRONTMIND_VISUAL_FAMILIES_V3.length &&
+            diagnostics.mirrorAttempted < MAX_MIRROR_ATTEMPTS
+          ) {
+            assigned = assignDistinctMirroredReferences({ pools, mirrored });
+            if (assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) break;
+            const remaining = Math.min(
+              MIRROR_CONCURRENCY,
+              MAX_MIRROR_ATTEMPTS - diagnostics.mirrorAttempted,
+            );
+            const next = nextMirrorCandidates({
+              pools,
+              keyAssignment,
+              compatibleAssignment: assigned,
+              attemptedProviderKeys,
+              unavailableProviderKeys,
+              limit: remaining,
+            });
+            if (next.length < 1) {
+              if (queries.length >= MAX_FAMILY_SEARCH_CALLS) break;
+              const compatibleAssignment = compatibleKeyEdges({
+                pools,
+                assignment: assigned,
+              });
+              const rescueFamily = nextHallRescueFamily({
+                pools,
+                assignment: compatibleAssignment,
+                queried: rescueQueriedFamilies,
+              });
+              if (!rescueFamily) break;
+              await searchRescueFamily(rescueFamily);
+              continue;
+            }
+            await mirrorCandidateSet(next);
+            keyAssignment = maximumKeyAssignment(
+              pools,
+              unavailableProviderKeys,
+            );
+            if (keyAssignment.size < FRONTMIND_VISUAL_FAMILIES_V3.length) {
+              await rescueUntilCompleteKeyMatching();
+            }
           }
-          assigned =
-            searchPlan.mode === "supplemental"
-              ? await mirrorSupplementalUntil(36)
-              : await mirrorAllNewCandidates();
+          assigned = assignDistinctMirroredReferences({ pools, mirrored });
+          const previewFailureCount = Object.values(
+            diagnostics.rejectedByReason,
+          ).reduce((sum, count) => sum + (count ?? 0), 0);
+          if (assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) {
+            diagnostics.terminalReason = "complete";
+          } else if (diagnostics.mirrorAttempted >= MAX_MIRROR_ATTEMPTS) {
+            diagnostics.terminalReason = "matching_budget_exhausted";
+          } else if (previewFailureCount > 0) {
+            diagnostics.terminalReason = "preview_failures";
+          } else if (
+            keyAssignment.size < FRONTMIND_VISUAL_FAMILIES_V3.length
+          ) {
+            diagnostics.terminalReason = "catalog_insufficient";
+          } else {
+            diagnostics.terminalReason = "catalog_insufficient";
+          }
           refreshRetrievalDiagnostics({
             pools,
             searchedCandidates,
             mirrored,
             assigned,
             diagnostics,
+            queries,
+            keyMatchingCardinality: keyAssignment.size,
+            generalHeroEligibleKeys,
+            effectiveSearchLimit,
+          });
+          logSafeVisualStage({
+            event: "visual_query_capability",
+            operationId: operation.id,
+            projectId: operation.projectId,
+            page: searchPlan.page,
+            // The identifier selects the fixed, allowlisted page variant. It
+            // carries no family name or query material.
+            variantId: `visual-query-v2-page-${searchPlan.page}`,
+            actualLimit: effectiveSearchLimit,
+            queryCalls: diagnostics.queryCalls,
+            normalizedUnique: diagnostics.normalizedUnique,
+            latencyMs: queryLatencyMs,
+          });
+          const rejectedPreviews = Object.values(
+            diagnostics.rejectedByReason,
+          ).reduce((sum, count) => sum + (count ?? 0), 0);
+          logSafeVisualStage({
+            event: "visual_matching",
+            operationId: operation.id,
+            projectId: operation.projectId,
+            page: searchPlan.page,
+            queryCalls: diagnostics.queryCalls,
+            normalizedUnique: diagnostics.normalizedUnique,
+            eligibilityEdges: diagnostics.eligibilityEdgeCount,
+            keyMatchingCardinality: diagnostics.keyMatchingCardinality,
+            compatibleMatchingCardinality:
+              diagnostics.compatibleMatchingCardinality,
+            terminalReason: diagnostics.terminalReason,
+            latencyMs: Date.now() - matchingStartedAt,
+          });
+          logSafeVisualStage({
+            event: "visual_mirror",
+            operationId: operation.id,
+            projectId: operation.projectId,
+            page: searchPlan.page,
+            mirrorAttempts: diagnostics.mirrorAttempts,
+            mirrorSucceeded: diagnostics.mirrorSucceeded,
+            rejectedPreviews,
+            compatibleMatchingCardinality:
+              diagnostics.compatibleMatchingCardinality,
+            terminalReason: diagnostics.terminalReason,
+            latencyMs: Date.now() - mirrorStartedAt,
           });
           return { queries, pools, mirrored, assigned };
         },
         { signal },
       );
       if (retrieval.assigned.size !== FRONTMIND_VISUAL_FAMILIES_V3.length) {
+        if (diagnostics.terminalReason === "matching_budget_exhausted") {
+          throw new TwentyFirstProviderFailure(
+            "VISUAL_MATCHING_BUDGET_EXHAUSTED",
+            "视觉参考组合计算达到本次安全上限，请稍后重试。",
+            "attention_required",
+          );
+        }
+        if (diagnostics.terminalReason === "preview_failures") {
+          throw new TwentyFirstProviderFailure(
+            "VISUAL_PREVIEW_REFERENCES_UNAVAILABLE",
+            "部分真实 Hero 参考暂时无法安全读取，请稍后重试。",
+            "attention_required",
+          );
+        }
         throw new TwentyFirstProviderFailure(
           "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
           `FrontMind 当前仅找到 ${retrieval.assigned.size}/9 个可安全区分的真实 Hero 参考，请稍后重试。`,
@@ -2199,6 +2749,18 @@ export function createTwentyFirstSiteOpsProviderHandler(
         selectionBundleArtifact,
         mirroredCandidates,
       });
+      logSafeVisualStage({
+        event: "visual_page_published",
+        operationId: operation.id,
+        projectId: operation.projectId,
+        page: searchPlan.page,
+        queryCalls: diagnostics.queryCalls,
+        mirrorAttempts: diagnostics.mirrorAttempts,
+        mirrorSucceeded: diagnostics.mirrorSucceeded,
+        candidateCount: board.candidateCount,
+        terminalReason: "complete",
+        latencyMs: Date.now() - providerStartedAt,
+      });
       return {
         status: "succeeded",
         projectStatus: "awaiting_visual_selection",
@@ -2221,15 +2783,15 @@ export function createTwentyFirstSiteOpsProviderHandler(
         message: "9 个不同风格的视觉候选已准备完成，请选择一个方向。",
       };
     } catch (error) {
+      const failure = safeProviderFailure(error, stage, diagnostics, signal);
       console.error("[SiteOps21st] visual_search_failed", {
         operationId: operation.id,
         projectId: operation.projectId,
         stage,
-        error: runtimeErrorForLog(error, {
-          additionalSecrets: activeApiKey ? [activeApiKey] : [],
-        }),
+        operationStatus: failure.status,
+        errorCode: "code" in failure ? failure.code : "PROVIDER_ERROR",
       });
-      return safeProviderFailure(error, stage, diagnostics, signal);
+      return failure;
     }
   };
 }

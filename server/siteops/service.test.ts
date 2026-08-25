@@ -6,17 +6,20 @@ import {
   assertCurrentVisualWorkflowVersion,
   assertSiteOpsSnapshotChangeState,
   completePublishedVisualPageCount,
+  createSiteOpsResumeBuildOperationInput,
   createVisualSearchOperationInput,
   currentSiteOpsBuildWorkflowCoordinates,
   freezeSiteOpsCustomerAiCredential,
   freezeSiteOpsReferenceBlueprint,
   hashSiteOpsRequest,
+  handleResumeBuild,
   isSiteOpsFailedBuildResettable,
   isSiteOpsOperationReplay,
   isSiteOpsIcpApprovedForCurrentDomain,
   isSiteOpsStoppedProviderTaskResetSafe,
   normalizeSiteOpsDomain,
   parseSiteOpsActionPayload,
+  projectSiteOpsBuildRecovery,
   projectSiteOpsVisualGeneration,
   projectSiteOpsObservationStatuses,
   projectSiteOpsExecutionSteps,
@@ -28,6 +31,7 @@ import {
   siteOpsActiveFinancialIntentKey,
   siteOpsResetCredentialScope,
   siteOpsResetCapability,
+  siteOpsResumeBuildTargetsLatestAttempt,
   siteOpsServiceErrorFromQuota,
   siteOpsVisualSelectionRecovery,
   SiteOpsServiceError,
@@ -43,7 +47,10 @@ import {
   siteOpsAliyunConnectionSetupInputSchema,
   siteOpsSendMessageInputSchema,
 } from "../../shared/siteops";
-import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
+import {
+  siteOpsBuildProjectionSchema,
+  siteOpsBuildRecoveryProjectionSchema,
+} from "../../shared/siteops-contract";
 import {
   referenceBlueprintV3ForFamily,
   referenceBlueprintV4ForFamily,
@@ -464,6 +471,7 @@ describe("SiteOps core contracts", () => {
         latestVisualOperation: { status: "running", input: operationInput },
         hasActiveVisualOperation: true,
         hasActiveBuild: false,
+        hasBuildAttempt: false,
       }),
     ).toMatchObject({
       status: "generating",
@@ -481,6 +489,7 @@ describe("SiteOps core contracts", () => {
         },
         hasActiveVisualOperation: false,
         hasActiveBuild: false,
+        hasBuildAttempt: false,
       }),
     ).toMatchObject({
       status: "retryable_error",
@@ -498,6 +507,7 @@ describe("SiteOps core contracts", () => {
       latestVisualOperationStatus: "failed",
       hasActiveVisualOperation: false,
       hasActiveBuild: false,
+      hasBuildAttempt: false,
     };
     expect(siteOpsVisualSelectionRecovery(recoverable)).toBe(true);
     expect(
@@ -510,6 +520,12 @@ describe("SiteOps core contracts", () => {
       siteOpsVisualSelectionRecovery({
         ...recoverable,
         completePublishedPages: 0,
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsVisualSelectionRecovery({
+        ...recoverable,
+        hasBuildAttempt: true,
       }),
     ).toBe(false);
   });
@@ -532,6 +548,7 @@ describe("SiteOps core contracts", () => {
           latestVisualOperation: { status: "succeeded" },
           hasActiveVisualOperation: false,
           hasActiveBuild: false,
+          hasBuildAttempt: true,
         }),
       ).toMatchObject({
         status: "idle",
@@ -928,6 +945,429 @@ describe("SiteOps core contracts", () => {
         rebuildOldConversation: true,
       }),
     ).toThrow();
+  });
+
+  it("keeps resume_build strict and bound to the projected build", () => {
+    const buildId = "10000000-0000-4000-8000-000000000001";
+    expect(parseSiteOpsActionPayload("resume_build", { buildId })).toEqual({
+      buildId,
+    });
+    expect(() =>
+      parseSiteOpsActionPayload("resume_build", {
+        buildId,
+        createNewBuild: true,
+      }),
+    ).toThrow();
+
+    const frozenInput = {
+      buildId,
+      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      immutableMarker: "keep-me",
+    };
+    expect(
+      createSiteOpsResumeBuildOperationInput({
+        frozenInput,
+        sourceOperationId: "20000000-0000-4000-8000-000000000002",
+        providerTaskId: "provider-task-safe",
+      }),
+    ).toEqual({
+      ...frozenInput,
+      resumeSourceOperationId: "20000000-0000-4000-8000-000000000002",
+      resumeProviderTaskId: "provider-task-safe",
+      resumeMode: "recover_design_output",
+    });
+    expect(frozenInput).not.toHaveProperty("resumeMode");
+
+    expect(
+      siteOpsBuildRecoveryProjectionSchema.parse({
+        allowed: true,
+        buildId,
+        reason: "output_recoverable",
+      }),
+    ).toEqual({ allowed: true, buildId, reason: "output_recoverable" });
+    expect(() =>
+      siteOpsBuildRecoveryProjectionSchema.parse({
+        allowed: true,
+        buildId,
+        reason: "output_recoverable",
+        providerTaskId: "must-not-be-public",
+      }),
+    ).toThrow();
+  });
+
+  it("projects only an intact output failure as an in-place build recovery", () => {
+    const buildId = "10000000-0000-4000-8000-000000000001";
+    const snapshotId = "20000000-0000-4000-8000-000000000002";
+    const styleSampleId = "30000000-0000-4000-8000-000000000003";
+    const providerTaskId = "provider-task-safe";
+    const build = {
+      id: buildId,
+      ordinal: 1,
+      status: "failed",
+      knowledgeSnapshotId: snapshotId,
+      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      styleSampleId,
+      selectionHash: "a".repeat(64),
+      upstreamManusTaskId: providerTaskId,
+      quotaState: "released",
+      contractLocalAssetId: null,
+      sourceLocalAssetId: null,
+      distLocalAssetId: null,
+      qaLocalAssetId: null,
+      provenanceLocalAssetId: null,
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+    };
+    const failedOperation = {
+      id: "40000000-0000-4000-8000-000000000004",
+      buildId,
+      kind: "site_build",
+      status: "failed",
+      input: {
+        buildId,
+        styleSampleId,
+        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+        manusCredentialId: "50000000-0000-4000-8000-000000000005",
+        manusCredentialVersion: 2,
+        referenceBlueprint: { schemaVersion: 4 },
+      },
+      provider: "manus",
+      providerTaskId,
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      createdAt: new Date("2026-08-25T00:00:00.000Z"),
+    };
+    const base = {
+      projectStatus: "failed",
+      currentKnowledgeSnapshotId: snapshotId,
+      builds: [build],
+      operations: [failedOperation],
+    };
+
+    expect(projectSiteOpsBuildRecovery(base)).toEqual({
+      allowed: true,
+      buildId,
+      reason: "output_recoverable",
+    });
+    const failedResumeOperation = {
+      ...failedOperation,
+      id: "80000000-0000-4000-8000-000000000008",
+      kind: "build_revision",
+      input: createSiteOpsResumeBuildOperationInput({
+        frozenInput: failedOperation.input,
+        sourceOperationId: failedOperation.id,
+        providerTaskId,
+      }),
+      createdAt: new Date("2026-08-25T00:02:00.000Z"),
+    };
+    expect(
+      projectSiteOpsBuildRecovery({
+        ...base,
+        operations: [failedResumeOperation, failedOperation],
+      }),
+    ).toEqual({
+      allowed: true,
+      buildId,
+      reason: "output_recoverable",
+    });
+    expect(
+      projectSiteOpsBuildRecovery({
+        ...base,
+        operations: [
+          {
+            ...failedResumeOperation,
+            input: {
+              ...failedResumeOperation.input,
+              resumeProviderTaskId: "different-provider-task",
+            },
+          },
+          failedOperation,
+        ],
+      }),
+    ).toEqual({
+      allowed: false,
+      buildId,
+      reason: "frozen_input_changed",
+    });
+    expect(
+      projectSiteOpsBuildRecovery({
+        ...base,
+        operations: [
+          {
+            ...failedOperation,
+            id: "60000000-0000-4000-8000-000000000006",
+            kind: "build_revision",
+            status: "queued",
+            errorCode: null,
+            createdAt: new Date("2026-08-25T00:01:00.000Z"),
+          },
+          failedOperation,
+        ],
+      }),
+    ).toEqual({
+      allowed: false,
+      buildId,
+      reason: "active_operation",
+    });
+    expect(
+      projectSiteOpsBuildRecovery({
+        ...base,
+        currentKnowledgeSnapshotId: "70000000-0000-4000-8000-000000000007",
+      }),
+    ).toEqual({
+      allowed: false,
+      buildId,
+      reason: "frozen_input_changed",
+    });
+    expect(
+      projectSiteOpsBuildRecovery({
+        ...base,
+        projectStatus: "building",
+        builds: [{ ...build, status: "building", errorCode: null }],
+        operations: [
+          {
+            ...failedOperation,
+            status: "running",
+            errorCode: null,
+            input: {
+              ...failedOperation.input,
+              resumeMode: undefined,
+            },
+          },
+        ],
+      }),
+    ).toEqual({ allowed: false, buildId, reason: null });
+  });
+
+  it("recovers the latest failed revision without replacing the successful head", () => {
+    const parentBuildId = "10000000-0000-4000-8000-000000000001";
+    const childBuildId = "20000000-0000-4000-8000-000000000002";
+    const snapshotId = "30000000-0000-4000-8000-000000000003";
+    const styleSampleId = "40000000-0000-4000-8000-000000000004";
+    const providerTaskId = "provider-revision-task";
+    const parent = {
+      id: parentBuildId,
+      ordinal: 1,
+      status: "approved",
+      knowledgeSnapshotId: snapshotId,
+      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      styleSampleId,
+      selectionHash: "a".repeat(64),
+      upstreamManusTaskId: "provider-parent-task",
+      quotaState: "consumed",
+      contractLocalAssetId: "50000000-0000-4000-8000-000000000005",
+      sourceLocalAssetId: "60000000-0000-4000-8000-000000000006",
+      distLocalAssetId: "70000000-0000-4000-8000-000000000007",
+      qaLocalAssetId: "80000000-0000-4000-8000-000000000008",
+      provenanceLocalAssetId: "90000000-0000-4000-8000-000000000009",
+      errorCode: null,
+    };
+    const child = {
+      ...parent,
+      id: childBuildId,
+      ordinal: 2,
+      status: "failed",
+      upstreamManusTaskId: providerTaskId,
+      quotaState: "released",
+      contractLocalAssetId: null,
+      sourceLocalAssetId: null,
+      distLocalAssetId: null,
+      qaLocalAssetId: null,
+      provenanceLocalAssetId: null,
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+    };
+    const operation = {
+      id: "a0000000-0000-4000-8000-00000000000a",
+      buildId: childBuildId,
+      kind: "build_revision",
+      status: "failed",
+      input: {
+        buildId: childBuildId,
+        childBuildId,
+        styleSampleId,
+        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+        manusCredentialId: "b0000000-0000-4000-8000-00000000000b",
+        manusCredentialVersion: 3,
+        referenceBlueprint: { schemaVersion: 4 },
+      },
+      provider: "manus",
+      providerTaskId,
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      createdAt: new Date("2026-08-25T01:00:00.000Z"),
+    };
+
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "failed",
+        generatedPages: 1,
+        latestVisualOperation: { status: "failed" },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: true,
+      }),
+    ).toMatchObject({
+      status: "idle",
+      canSelectExisting: false,
+      recoveredSelection: false,
+    });
+    expect(
+      projectSiteOpsBuildRecovery({
+        projectStatus: "failed",
+        currentKnowledgeSnapshotId: snapshotId,
+        builds: [parent, child],
+        operations: [operation],
+      }),
+    ).toEqual({
+      allowed: true,
+      buildId: childBuildId,
+      reason: "output_recoverable",
+    });
+    expect(
+      siteOpsResumeBuildTargetsLatestAttempt({
+        requestedBuildId: childBuildId,
+        builds: [parent, child],
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsResumeBuildTargetsLatestAttempt({
+        requestedBuildId: parentBuildId,
+        builds: [parent, child],
+      }),
+    ).toBe(false);
+  });
+
+  it("retries a failed child resume from the original task source while preserving the successful head", async () => {
+    const parentBuildId = "10000000-0000-4000-8000-000000000001";
+    const childBuildId = "20000000-0000-4000-8000-000000000002";
+    const snapshotId = "30000000-0000-4000-8000-000000000003";
+    const sampleId = "40000000-0000-4000-8000-000000000004";
+    const operationId = "50000000-0000-4000-8000-000000000005";
+    const failedResumeOperationId = "90000000-0000-4000-8000-000000000009";
+    const providerTaskId = "provider-revision-task";
+    const child = {
+      id: childBuildId,
+      projectId: "60000000-0000-4000-8000-000000000006",
+      userId: 42,
+      ordinal: 2,
+      status: "failed",
+      repairAttempts: 2,
+      knowledgeSnapshotId: snapshotId,
+      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+      styleSampleId: sampleId,
+      selectionHash: "a".repeat(64),
+      upstreamManusTaskId: providerTaskId,
+      quotaState: "released",
+      contractLocalAssetId: null,
+      sourceLocalAssetId: null,
+      distLocalAssetId: null,
+      qaLocalAssetId: null,
+      provenanceLocalAssetId: null,
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+    };
+    const sourceOperation = {
+      id: operationId,
+      buildId: childBuildId,
+      kind: "build_revision",
+      status: "failed",
+      input: {
+        buildId: childBuildId,
+        childBuildId,
+        styleSampleId: sampleId,
+        workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+        manusCredentialId: "70000000-0000-4000-8000-000000000007",
+        manusCredentialVersion: 4,
+        referenceBlueprint: { schemaVersion: 4 },
+      },
+      provider: "manus",
+      providerTaskId,
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      createdAt: new Date("2026-08-25T01:00:00.000Z"),
+    };
+    const failedResumeOperation = {
+      ...sourceOperation,
+      id: failedResumeOperationId,
+      input: createSiteOpsResumeBuildOperationInput({
+        frozenInput: sourceOperation.input,
+        sourceOperationId: operationId,
+        providerTaskId,
+      }),
+      createdAt: new Date("2026-08-25T01:05:00.000Z"),
+    };
+    const inserted: Array<{ table: unknown; value: Record<string, unknown> }> = [];
+    const updates: Array<Record<string, unknown>> = [];
+    let selectCall = 0;
+    const tx = {
+      select: vi.fn(() => {
+        const call = selectCall++;
+        const chain: Record<string, any> = {};
+        chain.from = vi.fn(() => chain);
+        chain.where = vi.fn(() => {
+          if (call === 2) return Promise.resolve([{ sequence: 9 }]);
+          return chain;
+        });
+        chain.orderBy = vi.fn(() => chain);
+        chain.limit = vi.fn(() => chain);
+        chain.for = vi.fn(async () =>
+          call === 0
+            ? [child]
+            : [failedResumeOperation, sourceOperation],
+        );
+        return chain;
+      }),
+      update: vi.fn(() => ({
+        set: vi.fn((value: Record<string, unknown>) => {
+          updates.push(value);
+          return {
+            where: vi.fn(async () => [{ affectedRows: 1 }]),
+          };
+        }),
+      })),
+      insert: vi.fn((table: unknown) => ({
+        values: vi.fn(async (value: Record<string, unknown>) => {
+          inserted.push({ table, value });
+        }),
+      })),
+    };
+
+    await expect(
+      handleResumeBuild(tx as never, {
+        actor: { id: 42 } as never,
+        project: {
+          id: child.projectId,
+          userId: 42,
+          conversationId: "siteops:42",
+          currentBuildId: parentBuildId,
+          currentKnowledgeSnapshotId: snapshotId,
+          status: "failed",
+          revision: 11,
+        } as never,
+        turnId: "80000000-0000-4000-8000-000000000008",
+        requestId: "resume-child-request",
+        requestHash: "b".repeat(64),
+        payload: { buildId: childBuildId },
+      }),
+    ).resolves.toBeUndefined();
+
+    const resumedOperation = inserted.find(
+      ({ value }) => value.kind === "build_revision",
+    )?.value;
+    expect(resumedOperation).toMatchObject({
+      buildId: childBuildId,
+      provider: "manus",
+      providerTaskId,
+      status: "queued",
+      input: expect.objectContaining({
+        buildId: childBuildId,
+        resumeSourceOperationId: operationId,
+        resumeProviderTaskId: providerTaskId,
+        resumeMode: "recover_design_output",
+      }),
+    });
+    expect(updates[0]).toMatchObject({
+      status: "design_compiling",
+      quotaState: "reserved",
+      repairAttempts: 0,
+    });
+    expect(updates.at(-1)).toMatchObject({ status: "building", revision: 12 });
+    expect(updates.at(-1)).not.toHaveProperty("currentBuildId");
   });
 
   it("keeps the customer build action free of API mode details", () => {

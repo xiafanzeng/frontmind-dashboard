@@ -101,7 +101,7 @@ describe("SiteOps wire output resolver", () => {
     };
     await expect(
       resolveWireOutput({
-        events: [accepted(value)] as never,
+        events: [marker(), accepted(value)] as never,
         operationToken: token,
         phase: "design",
         expectedFilename: SITEOPS_WIRE_OUTPUT_FILES.designV3,
@@ -150,7 +150,7 @@ describe("SiteOps wire output resolver", () => {
       siteTitle: "可信",
     };
     const result = await resolveSiteOpsWireOutput({
-      events: [accepted(value)] as never,
+      events: [marker(), accepted(value)] as never,
       operationToken: token,
       taskCompleted: false,
       fetchPinned: fetchPinned as never,
@@ -168,7 +168,7 @@ describe("SiteOps wire output resolver", () => {
       siteTitle: "可信",
     };
     const result = await resolveSiteOpsWireOutput({
-      events: [accepted(value)] as never,
+      events: [marker(), accepted(value)] as never,
       operationToken: token,
       taskCompleted: true,
       fetchPinned: fetchPinned as never,
@@ -311,7 +311,7 @@ describe("SiteOps wire output resolver", () => {
     ).resolves.toMatchObject({ value, source: "attachment" });
   });
 
-  it("requires an explicit rejection in the exact operation-token window", async () => {
+  it("accepts valid assistant JSON without requiring provider rejection but keeps the exact token window", async () => {
     const fetchPinned = vi.fn();
     const body = JSON.stringify({ operationToken: token, schemaVersion: 1 });
     const resultWithoutRejection = await resolveSiteOpsWireOutput({
@@ -332,7 +332,10 @@ describe("SiteOps wire output resolver", () => {
       fetchPinned: fetchPinned as never,
     });
 
-    expect(resultWithoutRejection).toBeNull();
+    expect(resultWithoutRejection).toMatchObject({
+      source: "assistant_json",
+      value: JSON.parse(body),
+    });
     expect(resultFromOldWindow).toBeNull();
     expect(fetchPinned).not.toHaveBeenCalled();
   });
@@ -373,7 +376,7 @@ describe("SiteOps wire output resolver", () => {
         resolveSiteOpsWireOutput({
           events: [
             marker(),
-            rejected(),
+            rejectedWithoutValue(),
             assistant({ attachments: [attachment] }),
           ] as never,
           operationToken: token,
@@ -390,7 +393,6 @@ describe("SiteOps wire output resolver", () => {
     const whole = await resolveSiteOpsWireOutput({
       events: [
         marker(),
-        rejected(),
         assistant({ content: JSON.stringify(value) }),
       ] as never,
       operationToken: token,
@@ -399,16 +401,19 @@ describe("SiteOps wire output resolver", () => {
     const fenced = await resolveSiteOpsWireOutput({
       events: [
         marker(),
-        rejected(),
         assistant({ content: `\`\`\`json\n${JSON.stringify(value)}\n\`\`\`` }),
       ] as never,
+      operationToken: token,
+      taskCompleted: true,
+    });
+    const directObject = await resolveSiteOpsWireOutput({
+      events: [marker(), assistant({ content: value })] as never,
       operationToken: token,
       taskCompleted: true,
     });
     const prose = await resolveSiteOpsWireOutput({
       events: [
         marker(),
-        rejected(),
         assistant({
           content: `结果如下：\n\`\`\`json\n${JSON.stringify(value)}\n\`\`\``,
         }),
@@ -419,10 +424,94 @@ describe("SiteOps wire output resolver", () => {
 
     expect(whole?.source).toBe("assistant_json");
     expect(fenced?.source).toBe("assistant_json");
+    expect(directObject?.source).toBe("assistant_json");
     expect(prose).toBeNull();
   });
 
-  it("rejects conflicting fallback candidates", async () => {
+  it("validates rejected structured values and merges identical production fallback sources", async () => {
+    const value = {
+      operationToken: token,
+      schemaVersion: 2,
+      siteTitle: "可信",
+    };
+    const fetchPinned = vi.fn(async () => ({
+      response: jsonResponse(value),
+      finalUrl: new URL("https://files.example.test/result.json"),
+    }));
+    const resolution = await resolveSiteOpsWireOutput({
+      events: [
+        marker(),
+        {
+          id: "production-rejected-value",
+          type: "structured_output_result",
+          timestamp: 2,
+          structured_output_result: {
+            success: false,
+            value,
+            error: { code: "schema_extraction_failed" },
+          },
+        },
+        assistant({
+          content: value,
+          attachments: [
+            {
+              filename: SITEOPS_WIRE_OUTPUT_FILES.design,
+              content_type: "application/json",
+              url: "https://files.example.test/result.json",
+            },
+          ],
+        }),
+      ] as never,
+      operationToken: token,
+      taskCompleted: true,
+      fetchPinned: fetchPinned as never,
+      validateCandidate: (candidate) => {
+        if (candidate.schemaVersion !== 2) throw new Error("invalid");
+      },
+    });
+
+    expect(resolution).toMatchObject({
+      value,
+      source: "structured",
+      sources: ["structured", "assistant_json", "attachment"],
+    });
+    expect(resolution?.byteCount).toBeGreaterThan(0);
+  });
+
+  it("drops schema-invalid sources before conflict comparison", async () => {
+    const invalid = { operationToken: token, schemaVersion: 1, siteTitle: "A" };
+    const valid = { operationToken: token, schemaVersion: 2, siteTitle: "B" };
+    const fetchPinned = vi.fn(async () => ({
+      response: jsonResponse(valid),
+      finalUrl: new URL("https://files.example.test/result.json"),
+    }));
+    const resolution = await resolveSiteOpsWireOutput({
+      events: [
+        marker(),
+        accepted(invalid),
+        assistant({
+          attachments: [
+            {
+              filename: SITEOPS_WIRE_OUTPUT_FILES.design,
+              content_type: "application/json",
+              url: "https://files.example.test/result.json",
+            },
+          ],
+        }),
+      ] as never,
+      operationToken: token,
+      taskCompleted: true,
+      fetchPinned: fetchPinned as never,
+      validateCandidate: (candidate) => {
+        if (candidate.schemaVersion !== 2)
+          throw new Error("WIRE_SCHEMA_INVALID");
+      },
+    });
+
+    expect(resolution).toMatchObject({ value: valid, source: "attachment" });
+  });
+
+  it("does not let an accepted structured result bypass a conflicting attachment", async () => {
     const first = { operationToken: token, schemaVersion: 1, siteTitle: "A" };
     const second = { operationToken: token, schemaVersion: 1, siteTitle: "B" };
     const fetchPinned = vi.fn(async () => ({
@@ -434,9 +523,8 @@ describe("SiteOps wire output resolver", () => {
       resolveSiteOpsWireOutput({
         events: [
           marker(),
-          rejected(),
+          accepted(first),
           assistant({
-            content: JSON.stringify(first),
             attachments: [
               {
                 filename: SITEOPS_WIRE_OUTPUT_FILES.design,

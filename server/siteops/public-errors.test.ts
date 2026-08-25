@@ -88,7 +88,8 @@ describe("SiteOps public error projection", () => {
     });
     expect(projected).toEqual({
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
-      message: "FrontMind AI 建站输出连续未通过结构校验，请重置后重新开始。",
+      message:
+        "FrontMind AI 建站输出未通过结构校验，知识库资料和视觉方案已保留，可继续生成官网。",
     });
     expect(JSON.stringify(projected)).not.toMatch(/manus/iu);
   });

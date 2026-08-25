@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import JSZip from "jszip";
 import { z } from "zod";
 
@@ -48,7 +48,6 @@ import {
   siteOpsRuntimeVisualEvidenceV2Schema,
   validateDesignAndContentBindings,
 } from "../../shared/siteops-design";
-import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDecryptedCredentialForUser } from "../auth-service";
 import { getDb } from "../db";
 import { assertUpstreamPromptBudget } from "../upstream-prompt-budget";
@@ -127,6 +126,9 @@ const operationInputSchema = z
     packageId: z.string().uuid().optional(),
     topic: z.string().trim().max(500).optional(),
     referenceBlueprint: referenceBlueprintSchema.optional(),
+    resumeSourceOperationId: z.string().uuid().optional(),
+    resumeProviderTaskId: z.string().min(1).max(512).optional(),
+    resumeMode: z.literal("recover_design_output").optional(),
   })
   .passthrough();
 
@@ -135,8 +137,24 @@ const designResultSchema = z.union([
   siteDesignResultV1Schema,
 ]);
 
-const repairReasonSchema = z.enum([
+const designValidationReasonSchema = z.enum([
   "STRUCTURED_OUTPUT_UNAVAILABLE",
+  "DESIGN_WIRE_SCHEMA_MISMATCH",
+  "SLOT_ID_FORMAT",
+  "ROUTE_SET_MISMATCH",
+  "ROUTE_MISSING",
+  "SLOT_ORDER_INVALID",
+  "SLOT_DUPLICATE",
+  "PALETTE_INDEX_INVALID",
+  "TEXT_LIMIT",
+  "OUTPUT_CONFLICT",
+]);
+export type DesignValidationReason = z.infer<
+  typeof designValidationReasonSchema
+>;
+
+const repairReasonSchema = z.enum([
+  ...designValidationReasonSchema.options,
   "EMPTY_TYPED_BLOCK_BODY",
   "INVALID_ENTITY_SLUG",
   "SOURCE_OR_ROUTE_MISMATCH",
@@ -145,23 +163,28 @@ const repairReasonSchema = z.enum([
 ]);
 type RepairReason = z.infer<typeof repairReasonSchema>;
 
-const providerStateSchema = z
+const providerStageSchema = z.enum([
+  "create_unknown",
+  "design_pending",
+  "content_send_ready",
+  "content_send_unknown",
+  "content_pending",
+  "repair_send_ready",
+  "repair_send_unknown",
+  "repair_pending",
+  "create_rejected",
+]);
+
+const providerStateV1Schema = z
   .object({
     schemaVersion: z.literal(1),
-    stage: z.enum([
-      "create_unknown",
-      "design_pending",
-      "content_send_ready",
-      "content_send_unknown",
-      "content_pending",
-      "repair_send_ready",
-      "repair_send_unknown",
-      "repair_pending",
-      "create_rejected",
-    ]),
+    stage: providerStageSchema,
     taskId: z.string().min(1).max(255).optional(),
     design: designResultSchema.optional(),
     repairKind: z.enum(["design", "content"]).optional(),
+    repairCategory: z
+      .enum(["extraction", "design", "content", "materialization"])
+      .optional(),
     repairAttempt: z.number().int().min(1).max(3).optional(),
     repairReason: repairReasonSchema.optional(),
     resultPendingSince: z.string().datetime().optional(),
@@ -170,7 +193,138 @@ const providerStateSchema = z
   })
   .strict();
 
+const providerAttemptsSchema = z
+  .object({
+    extraction: z.number().int().min(0).max(1),
+    design: z.number().int().min(0).max(2),
+    content: z.number().int().min(0).max(3),
+    materialization: z.number().int().min(0).max(1),
+  })
+  .strict();
+
+const providerValidationSchema = z
+  .object({
+    phase: z.enum(["design", "content"]),
+    source: z.enum(["structured", "attachment", "assistant_json"]),
+    candidateSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    signature: z.string().regex(/^[a-f0-9]{64}$/u),
+    reason: repairReasonSchema,
+    repeatCount: z.number().int().min(0).max(3),
+  })
+  .strict();
+
+const providerStateV2Schema = providerStateV1Schema
+  .omit({ schemaVersion: true })
+  .extend({
+    schemaVersion: z.literal(2),
+    attempts: providerAttemptsSchema,
+    validation: providerValidationSchema.optional(),
+  })
+  .strict();
+
+const providerStateSchema = z.union([
+  providerStateV2Schema,
+  providerStateV1Schema,
+]);
+
 type ProviderState = z.infer<typeof providerStateSchema>;
+type ProviderStateV2 = z.infer<typeof providerStateV2Schema>;
+
+type ManusBuildLogStage =
+  | "wire_resolution"
+  | "wire_validation"
+  | "wire_normalized"
+  | "repair_scheduled"
+  | "build_resumed"
+  | "build_preview_ready";
+
+function logManusBuildStage(input: {
+  stage: ManusBuildLogStage;
+  operationId: string;
+  buildId: string;
+  phase?: "design" | "content";
+  source?: "structured" | "attachment" | "assistant_json";
+  byteCount?: number;
+  candidateSha256?: string;
+  routeCount?: number;
+  slotCount?: number;
+  missingCount?: number;
+  reason?: string;
+  signature?: string;
+  latencyMs?: number;
+}) {
+  const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
+  console.info("[siteops-manus] build_stage", {
+    event: "siteops_manus_build_stage",
+    stage: input.stage,
+    operationId: input.operationId,
+    buildId: input.buildId,
+    ...(input.phase ? { phase: input.phase } : {}),
+    ...(input.source ? { source: input.source } : {}),
+    ...(input.byteCount !== undefined ? { byteCount: input.byteCount } : {}),
+    ...(input.candidateSha256
+      ? { candidateSha256: input.candidateSha256 }
+      : {}),
+    ...(input.routeCount !== undefined ? { routeCount: input.routeCount } : {}),
+    ...(input.slotCount !== undefined ? { slotCount: input.slotCount } : {}),
+    ...(input.missingCount !== undefined
+      ? { missingCount: input.missingCount }
+      : {}),
+    ...(input.reason ? { reason: input.reason } : {}),
+    ...(input.signature ? { signature: input.signature } : {}),
+    ...(input.latencyMs !== undefined ? { latencyMs: input.latencyMs } : {}),
+    releaseSha: /^[a-f0-9]{40}$/u.test(release) ? release : null,
+  });
+}
+
+const emptyProviderAttempts = () => ({
+  extraction: 0,
+  design: 0,
+  content: 0,
+  materialization: 0,
+});
+
+function providerStateV2(state: ProviderState | null): ProviderStateV2 {
+  if (state?.schemaVersion === 2) return state;
+  const attempts = emptyProviderAttempts();
+  if (state?.repairKind && state.repairAttempt) {
+    attempts[state.repairKind] = Math.min(
+      state.repairAttempt,
+      state.repairKind === "design" ? 2 : 3,
+    );
+  }
+  return providerStateV2Schema.parse({
+    schemaVersion: 2,
+    stage: state?.stage ?? "create_unknown",
+    taskId: state?.taskId,
+    design: state?.design,
+    repairKind: state?.repairKind,
+    repairCategory: state?.repairCategory,
+    repairAttempt: state?.repairAttempt,
+    repairReason: state?.repairReason,
+    resultPendingSince: state?.resultPendingSince,
+    handledWaitingEventId: state?.handledWaitingEventId,
+    handledWaitingAt: state?.handledWaitingAt,
+    attempts,
+  });
+}
+
+function transitionProviderState(
+  state: ProviderState | null,
+  patch: Partial<
+    Omit<ProviderStateV2, "schemaVersion" | "attempts" | "validation">
+  > &
+    Pick<ProviderStateV2, "stage">,
+): ProviderStateV2 {
+  const current = providerStateV2(state);
+  return providerStateV2Schema.parse({
+    ...current,
+    ...patch,
+    schemaVersion: 2,
+    attempts: current.attempts,
+    validation: current.validation,
+  });
+}
 
 type ManusProviderDependencies = {
   getDb?: typeof getDb;
@@ -1123,6 +1277,20 @@ export function briefWithoutBrandAssets(
   return { ...brief, publicAssetIds: [] };
 }
 
+/** Routes whose public copy is determined by absence in the frozen snapshot
+ * are excluded from every provider contract and materialized by Dashboard. */
+export function hostOwnedEmptyRouteIds(
+  brief: Pick<z.infer<typeof siteBriefSchema>, "routes" | "contentInventory">,
+) {
+  const routes = new Set(brief.routes.map((route) => route.id));
+  const inventory = new Set(
+    brief.contentInventory.entries.map((entry) => entry.kind),
+  );
+  return routes.has("news") && !inventory.has("company_news")
+    ? (["news"] as const)
+    : ([] as const);
+}
+
 function accessibleRuntimePalette(values: readonly string[]) {
   return Array.from(
     new Set(
@@ -1160,10 +1328,14 @@ function generatedContentOutputSchema(
   }>,
   sourceDocumentIds: string[],
   workflowVersion: string,
+  hostOwnedEmptyRouteIds: readonly string[] = [],
 ) {
+  const emptyRoutes = new Set(hostOwnedEmptyRouteIds);
   const input = {
     operationToken: token,
-    routeIds: routeCompositions.map((route) => route.routeId),
+    routeIds: routeCompositions
+      .map((route) => route.routeId)
+      .filter((routeId) => !emptyRoutes.has(routeId)),
     sourceDocumentIds,
   };
   return usesBuildPlanContractV4(workflowVersion)
@@ -1254,6 +1426,71 @@ async function loadBuildContext(db: any, operation: SiteOperation) {
     );
   }
   return context;
+}
+
+async function loadResumeDesignCoordinate(input: {
+  db: any;
+  operation: SiteOperation;
+  frozenInput: z.infer<typeof operationInputSchema>;
+}) {
+  if (input.frozenInput.resumeMode !== "recover_design_output") return null;
+  if (
+    !input.frozenInput.resumeSourceOperationId ||
+    !input.frozenInput.resumeProviderTaskId ||
+    input.operation.providerTaskId !== input.frozenInput.resumeProviderTaskId ||
+    !input.operation.buildId
+  ) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_RESUME_COORDINATE_INVALID",
+      "保留的建站恢复坐标不完整。",
+      "failed",
+    );
+  }
+  const source = await input.db.transaction(async (tx: any) => {
+    const rows = await tx
+      .select()
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.id, input.frozenInput.resumeSourceOperationId!),
+          eq(siteOperations.userId, input.operation.userId),
+          eq(siteOperations.projectId, input.operation.projectId),
+          eq(siteOperations.buildId, input.operation.buildId!),
+          eq(siteOperations.provider, "manus"),
+          inArray(siteOperations.kind, ["site_build", "build_revision"]),
+          eq(
+            siteOperations.providerTaskId,
+            input.frozenInput.resumeProviderTaskId!,
+          ),
+          inArray(siteOperations.status, ["failed", "attention_required"]),
+          eq(siteOperations.errorCode, "FRONTMIND_BUILD_OUTPUT_INVALID"),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    return rows[0] ?? null;
+  });
+  if (!source) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_RESUME_SOURCE_INVALID",
+      "原建站任务已变化，无法安全继续。",
+      "failed",
+    );
+  }
+  const sourceState = stateFromOperation(source);
+  const repairAttempt =
+    sourceState?.repairKind === "design" ? sourceState.repairAttempt : null;
+  const repairCategory =
+    sourceState?.schemaVersion === 2 ? sourceState.repairCategory : undefined;
+  const operationToken = repairAttempt
+    ? repairCategory
+      ? `siteops-repair:${source.id}:design:${repairCategory}:${repairAttempt}`
+      : `siteops-repair:${source.id}:design:${repairAttempt}`
+    : `siteops-design:${source.id}`;
+  return {
+    operationToken,
+    providerTaskId: input.frozenInput.resumeProviderTaskId,
+  };
 }
 
 async function assertFrozenCredential(
@@ -1406,22 +1643,88 @@ async function pollEvents(
 }
 
 async function resolveBuildWireValue(input: {
+  operationId: string;
+  buildId: string;
   events: readonly ManusV2MessageEvent[];
   operationToken: string;
   phase: SiteOpsWireOutputPhase;
   expectedFilename: string;
   taskCompleted: boolean;
   signal: AbortSignal;
+  validateCandidate?: Parameters<
+    typeof resolveSiteOpsWireOutput
+  >[0]["validateCandidate"];
 }) {
+  const startedAt = Date.now();
   try {
     const resolved = await resolveSiteOpsWireOutput(input);
-    return { value: resolved?.value ?? null, invalid: false as const };
+    if (resolved) {
+      logManusBuildStage({
+        stage: "wire_resolution",
+        operationId: input.operationId,
+        buildId: input.buildId,
+        phase: input.phase,
+        source: resolved.source,
+        byteCount: resolved.byteCount,
+        candidateSha256: resolved.sha256,
+        latencyMs: Date.now() - startedAt,
+      });
+    }
+    return {
+      value: resolved?.value ?? null,
+      candidateSha256: resolved?.sha256 ?? null,
+      candidateByteCount: resolved?.byteCount ?? null,
+      source: resolved?.source ?? null,
+      invalid: false as const,
+      invalidCode: null,
+      validationError: null,
+      invalidCandidateSha256: null,
+      invalidCandidateSource: null,
+    };
   } catch (error) {
     if (error instanceof SiteOpsWireOutputResolutionError) {
       if (error.code === "SITEOPS_WIRE_OUTPUT_UNAVAILABLE") {
-        return { value: null, invalid: false as const };
+        logManusBuildStage({
+          stage: "wire_resolution",
+          operationId: input.operationId,
+          buildId: input.buildId,
+          phase: input.phase,
+          reason: error.code,
+          latencyMs: Date.now() - startedAt,
+        });
+        return {
+          value: null,
+          candidateSha256: null,
+          candidateByteCount: null,
+          source: null,
+          invalid: false as const,
+          invalidCode: error.code,
+          validationError: error.validationError ?? null,
+          invalidCandidateSha256: error.validationCandidate?.sha256 ?? null,
+          invalidCandidateSource: error.validationCandidate?.source ?? null,
+        };
       }
-      return { value: null, invalid: true as const };
+      logManusBuildStage({
+        stage: "wire_resolution",
+        operationId: input.operationId,
+        buildId: input.buildId,
+        phase: input.phase,
+        reason: error.code,
+        candidateSha256: error.validationCandidate?.sha256,
+        source: error.validationCandidate?.source,
+        latencyMs: Date.now() - startedAt,
+      });
+      return {
+        value: null,
+        candidateSha256: null,
+        candidateByteCount: null,
+        source: null,
+        invalid: true as const,
+        invalidCode: error.code,
+        validationError: error.validationError ?? null,
+        invalidCandidateSha256: error.validationCandidate?.sha256 ?? null,
+        invalidCandidateSource: error.validationCandidate?.source ?? null,
+      };
     }
     throw error;
   }
@@ -1473,16 +1776,117 @@ export function completedSiteBuildMessage() {
   return "FrontMind 静态官网已完成构建和 QA，可以在私有预览中检查并批准。";
 }
 
+export function designValidationFailure(error: unknown): {
+  reason: DesignValidationReason;
+  signature: string;
+} {
+  const issues =
+    error instanceof z.ZodError
+      ? error.issues.map((issue) => ({
+          code: issue.code,
+          path: issue.path.map(String).join("."),
+        }))
+      : [];
+  const messageCode =
+    error instanceof Error
+      ? (error.message.match(/^SITEOPS_[A-Z0-9_]+/u)?.[0] ?? null)
+      : null;
+  let reason: DesignValidationReason = "DESIGN_WIRE_SCHEMA_MISMATCH";
+  if (messageCode === "SITEOPS_DESIGN_ROUTE_SET_MISMATCH") {
+    reason = "ROUTE_SET_MISMATCH";
+  } else if (messageCode === "SITEOPS_DESIGN_SLOT_ORDER_INVALID") {
+    reason = "SLOT_ORDER_INVALID";
+  } else if (messageCode === "SITEOPS_DESIGN_SLOT_DUPLICATE") {
+    reason = "SLOT_DUPLICATE";
+  } else if (messageCode === "SITEOPS_DESIGN_PALETTE_INDEX_INVALID") {
+    reason = "PALETTE_INDEX_INVALID";
+  } else if (messageCode === "SITEOPS_HOST_EMPTY_ROUTE_SET_INVALID") {
+    reason = "ROUTE_SET_MISMATCH";
+  } else if (issues.some((issue) => issue.path.endsWith("slotId"))) {
+    reason = "SLOT_ID_FORMAT";
+  } else if (issues.some((issue) => issue.path.endsWith("PaletteIndex"))) {
+    reason = "PALETTE_INDEX_INVALID";
+  } else if (
+    issues.some(
+      (issue) => issue.path === "siteTitle" || issue.path === "description",
+    )
+  ) {
+    reason = "TEXT_LIMIT";
+  } else if (
+    issues.some((issue) =>
+      /(?:routeSlots|routeCompositions).*routeId/u.test(issue.path),
+    )
+  ) {
+    reason = "ROUTE_SET_MISMATCH";
+  }
+  const signature = createHash("sha256")
+    .update(
+      JSON.stringify({
+        reason,
+        messageCode,
+        issues: issues
+          .slice()
+          .sort((left, right) =>
+            `${left.path}:${left.code}`.localeCompare(
+              `${right.path}:${right.code}`,
+            ),
+          ),
+      }),
+      "utf8",
+    )
+    .digest("hex");
+  return { reason, signature };
+}
+
+export function designRepairPrompt(input: {
+  repairAttempt: number;
+  maxAttempts?: 1 | 2;
+  outputFilename: string;
+  wireVersion: 2 | 3;
+  repairReason?: RepairReason;
+  repeatedSignatureCount?: number;
+  hostOwnedEmptyRouteIds?: readonly string[];
+}) {
+  const reasonInstruction: Partial<Record<RepairReason, string>> = {
+    STRUCTURED_OUTPUT_UNAVAILABLE:
+      "只返回一个完整 JSON 对象，并让回复正文与 JSON 附件完全一致。",
+    DESIGN_WIRE_SCHEMA_MISMATCH:
+      "逐字段遵守严格 wire 合同，不要增加字段、旧版字段或 Hero family。",
+    ROUTE_SET_MISMATCH:
+      "只使用冻结的 provider-owned routeId，每个 route 恰好形成一个连续分组。",
+    ROUTE_MISSING:
+      "每个 provider-owned route 至少返回一个 overview/statement 坐标。",
+    SLOT_ORDER_INVALID:
+      "routeSlots 必须按冻结 route 顺序分组，同一路由内保持预期展示顺序。",
+    SLOT_ID_FORMAT:
+      "slotId 只能使用小写 ASCII 字母开头以及数字、连字符、下划线。",
+    SLOT_DUPLICATE: "同一路由内每个 slotId 必须唯一。",
+    PALETTE_INDEX_INVALID: "调色板索引只能使用结构化合同枚举中允许的整数。",
+    TEXT_LIMIT: "siteTitle 必须为 1–80 字符，description 必须为 1–200 字符。",
+    OUTPUT_CONFLICT: "结构化结果、JSON 正文与附件必须是完全相同的单一对象。",
+  };
+  const hostOwned = input.hostOwnedEmptyRouteIds?.length
+    ? `不要返回这些 Dashboard 自有空状态 route：${input.hostOwnedEmptyRouteIds.join(",")}；Dashboard 会注入可信空内容。`
+    : "";
+  const repeated = input.repeatedSignatureCount
+    ? "本次输出与上一次无效结果具有相同结构签名，必须重新构造对象，不能原样重复。"
+    : "";
+  return `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV${input.wireVersion} 未通过 Dashboard 严格合同。第 ${input.repairAttempt}/${input.maxAttempts ?? 2} 次修复：${input.repairReason ? (reasonInstruction[input.repairReason] ?? "") : ""}${hostOwned}${repeated}重新读取已附加 workflow、source dossier 与冻结视觉参考，为每个 provider-owned route 返回 routeSlots；缺少内容时至少返回 overview/statement。不得返回或改变 Hero family。回复正文必须是单一 JSON 对象，并把完全相同的对象附加为 ${input.outputFilename}。不得输出源码、脚本或未知事实。`;
+}
+
 export function contentRepairPrompt(input: {
   repairAttempt: number;
+  maxAttempts?: number;
   outputFilename?: string;
   wireVersion?: 2 | 3;
   repairReason?: RepairReason;
+  hostOwnedEmptyRouteIds?: readonly string[];
 }) {
   const wire = `PageContentWireV${input.wireVersion ?? 2}`;
   const reasonInstruction: Partial<Record<RepairReason, string>> = {
     STRUCTURED_OUTPUT_UNAVAILABLE:
       "结构化抽取未产生可用对象，请确保回复正文与附件是完全相同的单一 JSON 对象。",
+    OUTPUT_CONFLICT: "结构化结果、JSON 正文与附件必须是完全相同的单一对象。",
     EMPTY_TYPED_BLOCK_BODY:
       "prose、quote、cta 必须有 paragraphs；feature_list、steps、metrics 应使用非空 items，entity_grid 与 faq_preview 应使用非空引用。",
     INVALID_ENTITY_SLUG:
@@ -1493,7 +1897,10 @@ export function contentRepairPrompt(input: {
     CONTENT_CONTRACT_MISMATCH:
       "请逐字段核对 PageContentWire 合同并返回完整对象。",
   };
-  return `继续同一个 FrontMind AI 建站任务。上一次 ${wire} 或受信网站 QA 未通过。第 ${input.repairAttempt}/3 次修复：${input.repairReason ? (reasonInstruction[input.repairReason] ?? "") : ""}重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 ${wire}，只能引用允许的 sourceDocumentIds。数据驱动的 feature_list、steps、metrics、entity_grid、faq_preview 在 items 或引用完整时可以使用空 paragraphs；prose、quote、cta 必须有正文。实体 slug 优先使用 URL 安全的 ASCII。并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}，附件是结构化抽取失败时的正式恢复副本。不得浏览或补写外部新闻，不得输出源码、脚本或未知事实。`;
+  const hostOwned = input.hostOwnedEmptyRouteIds?.length
+    ? `不要返回 Dashboard 自有空状态 route：${input.hostOwnedEmptyRouteIds.join(",")}，也不要生成对应 block 或 company_news entity。`
+    : "";
+  return `继续同一个 FrontMind AI 建站任务。上一次 ${wire} 或受信网站 QA 未通过。第 ${input.repairAttempt}/${input.maxAttempts ?? 3} 次修复：${input.repairReason ? (reasonInstruction[input.repairReason] ?? "") : ""}${hostOwned}重新读取已附加 source dossier 与 build contract，按冻结 route/slot 顺序完整返回 ${wire}，只能引用允许的 sourceDocumentIds。数据驱动的 feature_list、steps、metrics、entity_grid、faq_preview 在 items 或引用完整时可以使用空 paragraphs；prose、quote、cta 必须有正文。实体 slug 优先使用 URL 安全的 ASCII。并把完全相同的 JSON 对象附加为 ${input.outputFilename ?? SITEOPS_WIRE_OUTPUT_FILES.content}，附件是结构化抽取失败时的正式恢复副本。不得浏览或补写外部新闻，不得输出源码、脚本或未知事实。`;
 }
 
 export function contentRepairReason(error: unknown): RepairReason {
@@ -1527,51 +1934,180 @@ export function contentRepairReason(error: unknown): RepairReason {
   return "CONTENT_CONTRACT_MISMATCH";
 }
 
+function contentValidationSignature(error: unknown, reason: RepairReason) {
+  const issues =
+    error instanceof z.ZodError
+      ? error.issues.map((issue) => ({
+          code: issue.code,
+          path: issue.path.map(String).join("."),
+        }))
+      : [];
+  const messageCode =
+    error instanceof Error
+      ? (error.message.match(/^SITEOPS_[A-Z0-9_]+/u)?.[0] ?? null)
+      : null;
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        reason,
+        messageCode,
+        issues: issues
+          .slice()
+          .sort((left, right) =>
+            `${left.path}:${left.code}`.localeCompare(
+              `${right.path}:${right.code}`,
+            ),
+          ),
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 async function scheduleRepair(input: {
   db: any;
   operation: SiteOperation;
   build: typeof siteBuilds.$inferSelect;
   taskId: string;
   kind: "design" | "content";
+  category?: "extraction" | "design" | "content" | "materialization";
   design?: z.infer<typeof designResultSchema>;
   repairReason?: RepairReason;
+  candidateSha256?: string | null;
+  source?: "structured" | "attachment" | "assistant_json" | null;
+  validationSignature?: string | null;
   handledWaitingEventId?: string;
   handledWaitingAt?: string;
 }) {
-  const attempt = input.build.repairAttempts + 1;
-  if (attempt > 3)
+  const state = providerStateV2(stateFromOperation(input.operation));
+  const category = input.category ?? input.kind;
+  const budgets = {
+    extraction: 1,
+    design: 2,
+    content: 3,
+    materialization: 1,
+  } as const;
+  let validation = state.validation;
+  if (
+    input.candidateSha256 &&
+    input.source &&
+    input.validationSignature &&
+    input.repairReason
+  ) {
+    const repeated =
+      state.validation?.candidateSha256 === input.candidateSha256 &&
+      state.validation.signature === input.validationSignature;
+    validation = {
+      phase: input.kind,
+      source: input.source,
+      candidateSha256: input.candidateSha256,
+      signature: input.validationSignature,
+      reason: input.repairReason,
+      repeatCount: repeated ? state.validation!.repeatCount + 1 : 0,
+    };
+    if (repeated) {
+      logManusBuildStage({
+        stage: "wire_validation",
+        operationId: input.operation.id,
+        buildId: input.build.id,
+        phase: input.kind,
+        source: input.source,
+        candidateSha256: input.candidateSha256,
+        reason: input.repairReason,
+        signature: input.validationSignature,
+      });
+      return {
+        status: "failed",
+        code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+        message:
+          "同一 FrontMind AI 建站任务重复返回相同的无效结构，已停止重复修复。",
+        providerTaskId: input.taskId,
+        result: providerStateV2Schema.parse({ ...state, validation }),
+      } satisfies SiteOpsProviderResult;
+    }
+  }
+  if (input.repairReason) {
+    logManusBuildStage({
+      stage: "wire_validation",
+      operationId: input.operation.id,
+      buildId: input.build.id,
+      phase: input.kind,
+      source: input.source ?? undefined,
+      candidateSha256: input.candidateSha256 ?? undefined,
+      reason: input.repairReason,
+      signature: input.validationSignature ?? undefined,
+    });
+  }
+  const attempt = state.attempts[category] + 1;
+  if (attempt > budgets[category])
     return {
       status: "failed",
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
-      message:
-        "同一 FrontMind AI 建站任务已自动修复 3 次，仍未通过结构或 QA 校验。",
+      message: `同一 FrontMind AI 建站任务已完成当前阶段允许的 ${budgets[category]} 次自动修复，仍未通过结构或 QA 校验。`,
       providerTaskId: input.taskId,
+      result: providerStateV2Schema.parse({ ...state, validation }),
     } satisfies SiteOpsProviderResult;
-  await input.db
-    .update(siteBuilds)
-    .set({ repairAttempts: attempt, updatedAt: new Date() })
-    .where(
-      and(
-        eq(siteBuilds.id, input.build.id),
-        eq(siteBuilds.repairAttempts, input.build.repairAttempts),
-      ),
+  const attempts = { ...state.attempts, [category]: attempt };
+  const nextState = providerStateV2Schema.parse({
+    ...state,
+    schemaVersion: 2,
+    stage: "repair_send_ready",
+    taskId: input.taskId,
+    design: input.design,
+    repairKind: input.kind,
+    repairCategory: category,
+    repairAttempt: attempt,
+    repairReason: input.repairReason,
+    attempts,
+    validation,
+    ...(input.handledWaitingEventId
+      ? { handledWaitingEventId: input.handledWaitingEventId }
+      : {}),
+    ...(input.handledWaitingAt
+      ? { handledWaitingAt: input.handledWaitingAt }
+      : {}),
+  });
+  await input.db.transaction(async (tx: any) => {
+    const updated = await tx
+      .update(siteBuilds)
+      .set({
+        repairAttempts: input.build.repairAttempts + 1,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(siteBuilds.id, input.build.id),
+          eq(siteBuilds.repairAttempts, input.build.repairAttempts),
+        ),
+      );
+    const affectedRows = Number(
+      (Array.isArray(updated)
+        ? (updated[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+        : (updated as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+        0,
     );
+    if (affectedRows !== 1) {
+      throw new Error("SITEOPS_BUILD_REPAIR_CAS_CONFLICT");
+    }
+    await persistOperationProgress(
+      tx,
+      input.operation,
+      nextState,
+      input.taskId,
+    );
+  });
+  logManusBuildStage({
+    stage: "repair_scheduled",
+    operationId: input.operation.id,
+    buildId: input.build.id,
+    phase: input.kind,
+    source: input.source ?? undefined,
+    candidateSha256: input.candidateSha256 ?? undefined,
+    reason: input.repairReason ?? category,
+    signature: input.validationSignature ?? undefined,
+  });
   return pending(
-    {
-      schemaVersion: 1,
-      stage: "repair_send_ready",
-      taskId: input.taskId,
-      design: input.design,
-      repairKind: input.kind,
-      repairAttempt: attempt,
-      ...(input.repairReason ? { repairReason: input.repairReason } : {}),
-      ...(input.handledWaitingEventId
-        ? { handledWaitingEventId: input.handledWaitingEventId }
-        : {}),
-      ...(input.handledWaitingAt
-        ? { handledWaitingAt: input.handledWaitingAt }
-        : {}),
-    },
+    nextState,
     input.taskId,
     input.kind === "design" ? "design_compiling" : "qa_running",
   );
@@ -1986,6 +2522,19 @@ export function createManusSiteOpsProviderHandler(
           "Manus SiteOps 适配器不支持该操作。",
           "failed",
         );
+      const resumeCoordinate = await loadResumeDesignCoordinate({
+        db,
+        operation,
+        frozenInput: input,
+      });
+      if (resumeCoordinate) {
+        logManusBuildStage({
+          stage: "build_resumed",
+          operationId: operation.id,
+          buildId: operation.buildId!,
+          phase: "design",
+        });
+      }
       const context = await loadBuildContext(db, operation);
       const archiveBytes = await readArchive({
         userId: operation.userId,
@@ -1994,7 +2543,8 @@ export function createManusSiteOpsProviderHandler(
         expectedBytes: context.snapshot.totalBytes,
       });
       const brief = siteBriefSchema.parse(context.build.brief);
-      const promptBrief = briefWithoutBrandAssets(brief);
+      const frozenRouteIds = brief.routes.map((route) => route.id);
+      const hostEmptyCandidates = hostOwnedEmptyRouteIds(brief);
       const assetDecisions = frozenAssetDecisions(context.snapshot, brief);
       const brandAsset = await readSelectedOfficialLogoFromKnowledgeArchive({
         archiveBytes,
@@ -2106,6 +2656,22 @@ export function createManusSiteOpsProviderHandler(
       );
       const workflow = siteOpsWorkflowForVersion(context.build.workflowVersion);
       const reactStatic = workflow.frontMindVersion.startsWith("2.");
+      const emptyRouteIds = usesBuildPlanContractV4(workflow.frontMindVersion)
+        ? hostEmptyCandidates
+        : [];
+      const emptyRouteSet = new Set<string>(emptyRouteIds);
+      const providerRouteIds = frozenRouteIds.filter(
+        (routeId) => !emptyRouteSet.has(routeId),
+      );
+      // Manus receives only the routes it owns. The persisted SiteBrief stays
+      // frozen and complete; Dashboard injects host-owned empty routes after
+      // the provider output crosses the local strict contract.
+      const promptBrief = {
+        ...briefWithoutBrandAssets(brief),
+        routes: brief.routes.filter((route) =>
+          providerRouteIds.includes(route.id),
+        ),
+      };
       const designOutputFilename = reactStatic
         ? SITEOPS_WIRE_OUTPUT_FILES.designV3
         : SITEOPS_WIRE_OUTPUT_FILES.design;
@@ -2186,9 +2752,61 @@ export function createManusSiteOpsProviderHandler(
               : undefined,
           })
         : siteOpsRuntimeVisualEvidenceV1Schema.parse(visualEvidenceInput);
-      const designToken = `siteops-design:${operation.id}`;
+      const designToken =
+        resumeCoordinate?.operationToken ?? `siteops-design:${operation.id}`;
       const contentToken = `siteops-content:${operation.id}`;
-      let taskId = state?.taskId ?? operation.providerTaskId ?? undefined;
+      const parseDesignCandidate = (value: unknown) => {
+        const parsed =
+          reactStatic && referenceBlueprint.success
+            ? siteDesignResultV2FromWire(
+                value,
+                frozenRouteIds,
+                referenceBlueprint.data,
+                emptyRouteIds,
+                taxonomy.palette.length,
+              )
+            : siteDesignResultFromWire(
+                value,
+                frozenRouteIds,
+                emptyRouteIds,
+                taxonomy.palette.length,
+              );
+        validateDesignAndContentBindings({
+          routeIds: frozenRouteIds,
+          paletteSize: taxonomy.palette.length,
+          designSpec: parsed.designSpec,
+        });
+        return parsed;
+      };
+      const parseContentCandidate = (
+        value: unknown,
+        validatedDesign: z.infer<typeof designResultSchema>,
+      ) => {
+        const parsed = usesBuildPlanContractV4(workflow.frontMindVersion)
+          ? pageContentResultV2FromWire(
+              value,
+              frozenRouteIds,
+              documents.map((document) => document.id),
+              emptyRouteIds,
+            )
+          : pageContentResultFromWire(
+              value,
+              frozenRouteIds,
+              documents.map((document) => document.id),
+            );
+        validateDesignAndContentBindings({
+          routeIds: frozenRouteIds,
+          paletteSize: taxonomy.palette.length,
+          designSpec: validatedDesign.designSpec,
+          pageContent: parsed.pageContent,
+        });
+        return parsed;
+      };
+      let taskId =
+        state?.taskId ??
+        resumeCoordinate?.providerTaskId ??
+        operation.providerTaskId ??
+        undefined;
 
       if (!taskId) {
         if (state?.stage === "create_unknown") {
@@ -2199,16 +2817,15 @@ export function createManusSiteOpsProviderHandler(
           );
           if (!found)
             return pending(
-              { schemaVersion: 1, stage: "create_unknown" },
+              transitionProviderState(state, { stage: "create_unknown" }),
               undefined,
               "design_compiling",
             );
           taskId = found.id;
-          const designPendingState: ProviderState = {
-            schemaVersion: 1,
+          const designPendingState = transitionProviderState(state, {
             stage: "design_pending",
             taskId,
-          };
+          });
           try {
             await bindCreatedBuildTask({
               db,
@@ -2229,7 +2846,7 @@ export function createManusSiteOpsProviderHandler(
               );
             }
             return pending(
-              { schemaVersion: 1, stage: "create_unknown" },
+              transitionProviderState(state, { stage: "create_unknown" }),
               undefined,
               "design_compiling",
             );
@@ -2334,14 +2951,14 @@ export function createManusSiteOpsProviderHandler(
           ];
           const prompt = promptWithMarker(
             reactStatic
-              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，selected-reference.png（若附加）是与该方案一对一绑定的真实视觉灵感参考；二者都不是客户网站素材。请返回 SiteDesignWireV3：为每个 route 输出按数组顺序排列且唯一的 routeSlots，并使用 dossier 中的冻结调色板；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
+              ? `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 React Static Company Site Workflow ${workflow.frontMindVersion}，并只使用 frontmind-siteops-source-dossier-v1.json 中冻结的 SiteBrief、视觉证据和知识来源。referenceBlueprint 是 Dashboard 已冻结的主视觉合同，不得替换 Hero family；selected-visual.png 是 FrontMind 可信宿主实际可生成的主视觉预览，selected-reference.png（若附加）是与该方案一对一绑定的真实视觉灵感参考；二者都不是客户网站素材。请返回 SiteDesignWireV3：只为 provider-owned route 输出按冻结顺序分组且唯一的 routeSlots；${emptyRouteIds.length ? `不得返回 Dashboard 自有空状态 route：${emptyRouteIds.join(",")}；` : ""}缺少模型区块时为该 route 返回 overview/statement。使用结构化合同允许的调色板索引；同时把完全相同的 JSON 对象附加为 ${designOutputFilename}，作为结构化抽取失败时的受控恢复副本。不得输出 Hero family、源码、HTML、CSS、依赖、脚本、第三方组件代码或未知事实。`
               : `你是 FrontMind 官网设计与信息架构师。严格遵守已附加且通过 manifest 校验的 Astro Company Site Workflow ${workflow.frontMindVersion}，并只使用冻结 SiteBrief、视觉证据和知识来源。请返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本、21st 代码或未知事实。`,
             designToken,
           );
-          await persistOperationProgress(db, operation, {
-            schemaVersion: 1,
+          const createUnknownState = transitionProviderState(state, {
             stage: "create_unknown",
           });
+          await persistOperationProgress(db, operation, createUnknownState);
           try {
             await assertExecutionActive();
             const created = await client.createTask({
@@ -2352,7 +2969,7 @@ export function createManusSiteOpsProviderHandler(
               agentProfile: managedAgentProfileModel(input.agentProfile),
               structuredOutputSchema: designOutputSchema(
                 designToken,
-                brief.routes.map((route) => route.id),
+                providerRouteIds,
                 taxonomy.palette.length,
                 reactStatic ? "react_static" : "legacy_astro",
               ),
@@ -2360,18 +2977,16 @@ export function createManusSiteOpsProviderHandler(
             taskId = created.taskId;
           } catch (error) {
             if (error instanceof ManusV2ApiError && error.outcomeUnknown)
-              return pending(
-                { schemaVersion: 1, stage: "create_unknown" },
-                undefined,
-                "design_compiling",
-              );
+              return pending(createUnknownState, undefined, "design_compiling");
             throw error;
           }
-          const designPendingState: ProviderState = {
-            schemaVersion: 1,
-            stage: "design_pending",
-            taskId,
-          };
+          const designPendingState = transitionProviderState(
+            createUnknownState,
+            {
+              stage: "design_pending",
+              taskId,
+            },
+          );
           try {
             await bindCreatedBuildTask({
               db,
@@ -2394,11 +3009,7 @@ export function createManusSiteOpsProviderHandler(
             // create_unknown was durably reserved before task.create. A
             // transient post-ack DB failure therefore reconciles by the exact
             // operation token instead of creating a second private task.
-            return pending(
-              { schemaVersion: 1, stage: "create_unknown" },
-              undefined,
-              "design_compiling",
-            );
+            return pending(createUnknownState, undefined, "design_compiling");
           }
           return pending(designPendingState, taskId, "design_compiling");
         }
@@ -2436,11 +3047,22 @@ export function createManusSiteOpsProviderHandler(
         }
       }
       let repairedContent: unknown = null;
+      let repairedContentCoordinate: {
+        candidateSha256: string;
+        source: "structured" | "attachment" | "assistant_json";
+      } | null = null;
       if (
         state?.stage === "repair_send_ready" ||
         state?.stage === "repair_send_unknown" ||
         state?.stage === "repair_pending"
       ) {
+        if (resumeCoordinate) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_RESUME_STATE_INVALID",
+            "建站恢复任务不能再次进入模型修复阶段。",
+            "failed",
+          );
+        }
         if (!state.repairKind || !state.repairAttempt) {
           throw new SiteOpsManusFailure(
             "MANUS_REPAIR_STATE_INVALID",
@@ -2448,12 +3070,25 @@ export function createManusSiteOpsProviderHandler(
             "failed",
           );
         }
-        const repairToken = `siteops-repair:${operation.id}:${state.repairKind}:${state.repairAttempt}`;
+        if (state.repairKind === "content" && !state.design) {
+          throw new SiteOpsManusFailure(
+            "MANUS_DESIGN_STATE_MISSING",
+            "同一 Manus 任务缺少已校验的设计合同。",
+            "failed",
+          );
+        }
+        const repairCategory =
+          state.schemaVersion === 2
+            ? (state.repairCategory ?? state.repairKind)
+            : null;
+        const repairToken = repairCategory
+          ? `siteops-repair:${operation.id}:${state.repairKind}:${repairCategory}:${state.repairAttempt}`
+          : `siteops-repair:${operation.id}:${state.repairKind}:${state.repairAttempt}`;
         const repairSchema =
           state.repairKind === "design"
             ? designOutputSchema(
                 repairToken,
-                brief.routes.map((route) => route.id),
+                providerRouteIds,
                 taxonomy.palette.length,
                 reactStatic ? "react_static" : "legacy_astro",
               )
@@ -2462,17 +3097,33 @@ export function createManusSiteOpsProviderHandler(
                 state.design?.designSpec.routeCompositions ?? [],
                 documents.map((document) => document.id),
                 workflow.frontMindVersion,
+                emptyRouteIds,
               );
         if (state.stage === "repair_send_ready") {
           const repairPrompt = promptWithMarker(
             state.repairKind === "design"
-              ? reactStatic
-                ? `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV3 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：重新读取已附加 workflow、source dossier 与冻结视觉参考，完整返回 SiteDesignWireV3；不得返回或改变 Hero family，并把完全相同的 JSON 对象附加为 ${designOutputFilename}。不得输出源码、脚本或未知事实。`
-                : `继续同一个 FrontMind AI 建站任务。上一次 SiteDesignWireV2 未通过 Dashboard 严格合同。第 ${state.repairAttempt}/3 次修复：完整返回 SiteDesignWireV2，并把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.design}。不得输出源码、脚本或未知事实。`
+              ? designRepairPrompt({
+                  repairAttempt: state.repairAttempt,
+                  maxAttempts: repairCategory === "extraction" ? 1 : 2,
+                  outputFilename: designOutputFilename,
+                  repairReason: state.repairReason,
+                  repeatedSignatureCount:
+                    state.schemaVersion === 2
+                      ? state.validation?.repeatCount
+                      : 0,
+                  hostOwnedEmptyRouteIds: emptyRouteIds,
+                  wireVersion: reactStatic ? 3 : 2,
+                })
               : contentRepairPrompt({
                   repairAttempt: state.repairAttempt,
+                  maxAttempts:
+                    repairCategory === "materialization" ||
+                    repairCategory === "extraction"
+                      ? 1
+                      : 3,
                   outputFilename: contentOutputFilename,
                   repairReason: state.repairReason,
+                  hostOwnedEmptyRouteIds: emptyRouteIds,
                   wireVersion: usesBuildPlanContractV4(
                     workflow.frontMindVersion,
                   )
@@ -2537,6 +3188,8 @@ export function createManusSiteOpsProviderHandler(
         }
         const repaired = await pollEvents(client, taskId, repairToken);
         const repairResolution = await resolveBuildWireValue({
+          operationId: operation.id,
+          buildId: context.build.id,
           events: repaired.events,
           operationToken: repairToken,
           phase: state.repairKind,
@@ -2546,15 +3199,50 @@ export function createManusSiteOpsProviderHandler(
               : contentOutputFilename,
           taskCompleted: repaired.state.completed,
           signal,
+          validateCandidate: (value) => {
+            if (state.repairKind === "design") {
+              parseDesignCandidate(value);
+            } else {
+              parseContentCandidate(value, state.design!);
+            }
+          },
         });
         if (repairResolution.invalid) {
+          const designFailure =
+            state.repairKind === "design" && repairResolution.validationError
+              ? designValidationFailure(repairResolution.validationError)
+              : null;
+          const contentReason =
+            state.repairKind === "content" && repairResolution.validationError
+              ? contentRepairReason(repairResolution.validationError)
+              : null;
+          const repairReason =
+            designFailure?.reason ??
+            contentReason ??
+            (repairResolution.invalidCode === "SITEOPS_WIRE_OUTPUT_CONFLICT"
+              ? "OUTPUT_CONFLICT"
+              : "STRUCTURED_OUTPUT_UNAVAILABLE");
           return await scheduleRepair({
             db,
             operation,
             build: context.build,
             taskId,
             kind: state.repairKind,
+            category: repairResolution.validationError
+              ? state.repairKind
+              : "extraction",
             design: state.design,
+            repairReason,
+            candidateSha256: repairResolution.invalidCandidateSha256,
+            source: repairResolution.invalidCandidateSource,
+            validationSignature:
+              designFailure?.signature ??
+              (contentReason
+                ? contentValidationSignature(
+                    repairResolution.validationError,
+                    contentReason,
+                  )
+                : null),
           });
         }
         const rawRepair = repairResolution.value;
@@ -2590,7 +3278,9 @@ export function createManusSiteOpsProviderHandler(
               build: context.build,
               taskId,
               kind: state.repairKind,
+              category: "extraction",
               design: state.design,
+              repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
               handledWaitingEventId: repaired.waiting.eventId,
               handledWaitingAt: new Date().toISOString(),
             });
@@ -2602,7 +3292,9 @@ export function createManusSiteOpsProviderHandler(
               build: context.build,
               taskId,
               kind: state.repairKind,
+              category: "extraction",
               design: state.design,
+              repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
             });
           }
           const grace = structuredResultGrace(state, repaired.state.completed);
@@ -2613,7 +3305,9 @@ export function createManusSiteOpsProviderHandler(
               build: context.build,
               taskId,
               kind: state.repairKind,
+              category: "extraction",
               design: state.design,
+              repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
             });
           }
           return pending(
@@ -2623,63 +3317,93 @@ export function createManusSiteOpsProviderHandler(
           );
         }
         if (state.repairKind === "design") {
-          try {
-            const repairedDesign =
-              reactStatic && referenceBlueprint.success
-                ? siteDesignResultV2FromWire(
-                    rawRepair,
-                    brief.routes.map((route) => route.id),
-                    referenceBlueprint.data,
-                  )
-                : siteDesignResultFromWire(
-                    rawRepair,
-                    brief.routes.map((route) => route.id),
-                  );
-            validateDesignAndContentBindings({
-              routeIds: brief.routes.map((route) => route.id),
-              paletteSize: taxonomy.palette.length,
-              designSpec: repairedDesign.designSpec,
-            });
-            return pending(
-              {
-                schemaVersion: 1,
-                stage: "content_send_ready",
-                taskId,
-                design: repairedDesign,
-              },
+          const repairedDesign = parseDesignCandidate(rawRepair);
+          logManusBuildStage({
+            stage: "wire_normalized",
+            operationId: operation.id,
+            buildId: context.build.id,
+            phase: "design",
+            routeCount: repairedDesign.designSpec.routeCompositions.length,
+            slotCount: repairedDesign.designSpec.routeCompositions.reduce(
+              (total, route) => total + route.slots.length,
+              0,
+            ),
+            missingCount: repairedDesign.designSpec.routeCompositions.filter(
+              (route) =>
+                route.slots.length === 1 &&
+                ["overview", "news-empty"].includes(
+                  route.slots[0]?.slotId ?? "",
+                ),
+            ).length,
+          });
+          return pending(
+            transitionProviderState(state, {
+              stage: "content_send_ready",
               taskId,
-              "contract_ready",
-            );
-          } catch {
-            return await scheduleRepair({
-              db,
-              operation,
-              build: context.build,
-              taskId,
-              kind: "design",
-            });
-          }
+              design: repairedDesign,
+              repairKind: undefined,
+              repairCategory: undefined,
+              repairAttempt: undefined,
+              repairReason: undefined,
+              resultPendingSince: undefined,
+            }),
+            taskId,
+            "contract_ready",
+          );
         }
         repairedContent = rawRepair;
+        if (repairResolution.candidateSha256 && repairResolution.source) {
+          repairedContentCoordinate = {
+            candidateSha256: repairResolution.candidateSha256,
+            source: repairResolution.source,
+          };
+        }
       }
       let design = state?.design;
       if (!design && repairedContent === null) {
         const polled = await pollEvents(client, taskId, designToken);
         const designResolution = await resolveBuildWireValue({
+          operationId: operation.id,
+          buildId: context.build.id,
           events: polled.events,
           operationToken: designToken,
           phase: "design",
           expectedFilename: designOutputFilename,
           taskCompleted: polled.state.completed,
           signal,
+          validateCandidate: (value) => {
+            parseDesignCandidate(value);
+          },
         });
+        if (
+          resumeCoordinate !== null &&
+          (designResolution.invalid || designResolution.value === null)
+        ) {
+          throw new SiteOpsManusFailure(
+            "FRONTMIND_BUILD_OUTPUT_INVALID",
+            "原 FrontMind AI 建站任务的设计输出仍未通过严格合同，未再次调用模型。",
+            "failed",
+          );
+        }
         if (designResolution.invalid) {
+          const failure = designResolution.validationError
+            ? designValidationFailure(designResolution.validationError)
+            : null;
           return await scheduleRepair({
             db,
             operation,
             build: context.build,
             taskId,
             kind: "design",
+            category: failure ? "design" : "extraction",
+            repairReason:
+              failure?.reason ??
+              (designResolution.invalidCode === "SITEOPS_WIRE_OUTPUT_CONFLICT"
+                ? "OUTPUT_CONFLICT"
+                : "STRUCTURED_OUTPUT_UNAVAILABLE"),
+            candidateSha256: designResolution.invalidCandidateSha256,
+            source: designResolution.invalidCandidateSource,
+            validationSignature: failure?.signature,
           });
         }
         const raw = designResolution.value;
@@ -2692,20 +3416,20 @@ export function createManusSiteOpsProviderHandler(
                 "failed",
               );
             const resolution = handledWaitingResolution(
-              state ?? {
-                schemaVersion: 1,
-                stage: "design_pending",
-                taskId,
-              },
+              state ??
+                transitionProviderState(null, {
+                  stage: "design_pending",
+                  taskId,
+                }),
               polled.waiting.eventId,
             );
             if (resolution === "pending")
               return pending(
-                state ?? {
-                  schemaVersion: 1,
-                  stage: "design_pending",
-                  taskId,
-                },
+                state ??
+                  transitionProviderState(null, {
+                    stage: "design_pending",
+                    taskId,
+                  }),
                 taskId,
                 "design_compiling",
               );
@@ -2721,6 +3445,8 @@ export function createManusSiteOpsProviderHandler(
               build: context.build,
               taskId,
               kind: "design",
+              category: "extraction",
+              repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
               handledWaitingEventId: polled.waiting.eventId,
               handledWaitingAt: new Date().toISOString(),
             });
@@ -2732,16 +3458,15 @@ export function createManusSiteOpsProviderHandler(
               build: context.build,
               taskId,
               kind: "design",
+              category: "extraction",
+              repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
             });
           }
-          const designPendingState: ProviderState = {
-            schemaVersion: 1,
+          const designPendingState = transitionProviderState(state, {
             stage: "design_pending",
             taskId,
-            ...(state?.resultPendingSince
-              ? { resultPendingSince: state.resultPendingSince }
-              : {}),
-          };
+            resultPendingSince: state?.resultPendingSince,
+          });
           const grace = structuredResultGrace(
             designPendingState,
             polled.state.completed,
@@ -2753,38 +3478,36 @@ export function createManusSiteOpsProviderHandler(
               build: context.build,
               taskId,
               kind: "design",
+              category: "extraction",
+              repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
             });
           }
           return pending(grace.state, taskId, "design_compiling");
         }
-        try {
-          design =
-            reactStatic && referenceBlueprint.success
-              ? siteDesignResultV2FromWire(
-                  raw,
-                  brief.routes.map((route) => route.id),
-                  referenceBlueprint.data,
-                )
-              : siteDesignResultFromWire(
-                  raw,
-                  brief.routes.map((route) => route.id),
-                );
-          validateDesignAndContentBindings({
-            routeIds: brief.routes.map((route) => route.id),
-            paletteSize: taxonomy.palette.length,
-            designSpec: design.designSpec,
-          });
-        } catch {
-          return await scheduleRepair({
-            db,
-            operation,
-            build: context.build,
-            taskId,
-            kind: "design",
-          });
-        }
+        design = parseDesignCandidate(raw);
+        logManusBuildStage({
+          stage: "wire_normalized",
+          operationId: operation.id,
+          buildId: context.build.id,
+          phase: "design",
+          routeCount: design.designSpec.routeCompositions.length,
+          slotCount: design.designSpec.routeCompositions.reduce(
+            (total, route) => total + route.slots.length,
+            0,
+          ),
+          missingCount: design.designSpec.routeCompositions.filter(
+            (route) =>
+              route.slots.length === 1 &&
+              ["overview", "news-empty"].includes(route.slots[0]?.slotId ?? ""),
+          ).length,
+        });
         return pending(
-          { schemaVersion: 1, stage: "content_send_ready", taskId, design },
+          transitionProviderState(state, {
+            stage: "content_send_ready",
+            taskId,
+            design,
+            resultPendingSince: undefined,
+          }),
           taskId,
           "contract_ready",
         );
@@ -2916,21 +3639,26 @@ export function createManusSiteOpsProviderHandler(
             : siteOpsBuildContractAttachment(canonicalContract);
         const prompt = promptWithMarker(
           usesBuildPlanContractV4(workflow.frontMindVersion)
-            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v4.json 是 Dashboard 根据已校验设计与冻结知识库存生成的预物化计划合同；冻结的 ReferenceBlueprint、Hero family、route 与 inventory 不可更改。请返回 PageContentWireV3：使用受支持的 typed blockType，实体、FAQ 与 officialLinks 只能来自 source dossier 且逐项绑定 sourceDocumentIds；不得输出内部来源标签。feature_list、steps、metrics 必须使用非空 items，entity_grid 与 faq_preview 必须使用非空引用；这些数据驱动区块可使用空 paragraphs，prose、quote、cta 则必须有正文。实体 slug 请优先使用小写 ASCII 字母、数字、连字符或下划线。若 news route 在 inventory 中没有 company_news，必须保留该 route 但不要为它输出 block 或 company_news entity，Dashboard 会渲染可信空状态。不得浏览、抓取或编造行业/企业新闻。把完全相同的 JSON 对象附加为 ${contentOutputFilename}，附件是结构化抽取失败时的正式恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交或外部脚本。${revisionInstruction}`
+            ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v4.json 是 Dashboard 根据已校验设计与冻结知识库存生成的预物化计划合同；冻结的 ReferenceBlueprint、Hero family、route 与 inventory 不可更改。请返回 PageContentWireV3：只返回 provider-owned route；${emptyRouteIds.length ? `不得返回 Dashboard 自有空状态 route：${emptyRouteIds.join(",")}，也不得输出对应 block 或 company_news entity；` : ""}Dashboard 会注入可信空状态。使用受支持的 typed blockType，实体、FAQ 与 officialLinks 只能来自 source dossier 且逐项绑定 sourceDocumentIds；不得输出内部来源标签。feature_list、steps、metrics 必须使用非空 items，entity_grid 与 faq_preview 必须使用非空引用；这些数据驱动区块可使用空 paragraphs，prose、quote、cta 则必须有正文。实体 slug 请优先使用小写 ASCII 字母、数字、连字符或下划线。不得浏览、抓取或编造行业/企业新闻。把完全相同的 JSON 对象附加为 ${contentOutputFilename}，附件是结构化抽取失败时的正式恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交或外部脚本。${revisionInstruction}`
             : reactStatic
               ? `继续同一个 FrontMind AI 建站任务。frontmind-build-plan-contract-v3.json 是 Dashboard 根据已校验设计生成的预物化计划合同；冻结的 ReferenceBlueprint 与 Hero family 不可更改，source dossier 仍是唯一事实来源。请返回 PageContentWireV2，routeId 与 slotId 必须按合同完全一致，每段关键内容必须引用允许的 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。不得重复 SEO，不得生成源码、HTML、依赖、表单提交、外部脚本或未知事实。${revisionInstruction}`
               : `继续同一个 FrontMind AI 建站任务。frontmind-build-contract-v2.json 是 Dashboard 根据已校验设计生成的唯一构建合同；source dossier 仍是唯一事实来源。请返回 PageContentWireV2，并严格匹配冻结 route、slot 与 sourceDocumentIds；同时把完全相同的 JSON 对象附加为 ${SITEOPS_WIRE_OUTPUT_FILES.content}，作为结构化抽取失败时的受控恢复副本。${revisionInstruction}`,
           contentToken,
         );
+        const contentSendUnknownState = transitionProviderState(state, {
+          stage: "content_send_unknown",
+          taskId,
+          design,
+          repairKind: undefined,
+          repairCategory: undefined,
+          repairAttempt: undefined,
+          repairReason: undefined,
+          resultPendingSince: undefined,
+        });
         await persistOperationProgress(
           db,
           operation,
-          {
-            schemaVersion: 1,
-            stage: "content_send_unknown",
-            taskId,
-            design,
-          },
+          contentSendUnknownState,
           taskId,
         );
         try {
@@ -2949,38 +3677,25 @@ export function createManusSiteOpsProviderHandler(
               design.designSpec.routeCompositions,
               documents.map((document) => document.id),
               workflow.frontMindVersion,
+              emptyRouteIds,
             ),
           });
         } catch (error) {
           if (error instanceof ManusV2ApiError && error.outcomeUnknown)
-            return pending(
-              {
-                schemaVersion: 1,
-                stage: "content_send_unknown",
-                taskId,
-                design,
-              },
-              taskId,
-              "building",
-            );
+            return pending(contentSendUnknownState, taskId, "building");
           throw error;
         }
+        const contentPendingState = transitionProviderState(
+          contentSendUnknownState,
+          { stage: "content_pending", taskId, design },
+        );
         await persistOperationProgress(
           db,
           operation,
-          {
-            schemaVersion: 1,
-            stage: "content_pending",
-            taskId,
-            design,
-          },
+          contentPendingState,
           taskId,
         );
-        return pending(
-          { schemaVersion: 1, stage: "content_pending", taskId, design },
-          taskId,
-          "building",
-        );
+        return pending(contentPendingState, taskId, "building");
       }
 
       if (state?.stage === "content_send_unknown") {
@@ -2991,12 +3706,20 @@ export function createManusSiteOpsProviderHandler(
         });
         if (!manusV2EventsContainOperationToken(events, contentToken))
           return pending(
-            { schemaVersion: 1, stage: "content_send_unknown", taskId, design },
+            transitionProviderState(state, {
+              stage: "content_send_unknown",
+              taskId,
+              design,
+            }),
             taskId,
             "building",
           );
         return pending(
-          { schemaVersion: 1, stage: "content_pending", taskId, design },
+          transitionProviderState(state, {
+            stage: "content_pending",
+            taskId,
+            design,
+          }),
           taskId,
           "building",
         );
@@ -3008,23 +3731,44 @@ export function createManusSiteOpsProviderHandler(
           : null;
       const contentResolution = polled
         ? await resolveBuildWireValue({
+            operationId: operation.id,
+            buildId: context.build.id,
             events: polled.events,
             operationToken: contentToken,
             phase: "content",
             expectedFilename: contentOutputFilename,
             taskCompleted: polled.state.completed,
             signal,
+            validateCandidate: (value) => {
+              parseContentCandidate(value, design!);
+            },
           })
         : null;
       if (contentResolution?.invalid) {
+        const repairReason = contentResolution.validationError
+          ? contentRepairReason(contentResolution.validationError)
+          : contentResolution.invalidCode === "SITEOPS_WIRE_OUTPUT_CONFLICT"
+            ? "OUTPUT_CONFLICT"
+            : "STRUCTURED_OUTPUT_UNAVAILABLE";
         return await scheduleRepair({
           db,
           operation,
           build: context.build,
           taskId,
           kind: "content",
+          category: contentResolution.validationError
+            ? "content"
+            : "extraction",
           design,
-          repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
+          repairReason,
+          candidateSha256: contentResolution.invalidCandidateSha256,
+          source: contentResolution.invalidCandidateSource,
+          validationSignature: contentResolution.validationError
+            ? contentValidationSignature(
+                contentResolution.validationError,
+                repairReason,
+              )
+            : null,
         });
       }
       const rawContent = repairedContent ?? contentResolution?.value ?? null;
@@ -3037,22 +3781,22 @@ export function createManusSiteOpsProviderHandler(
               "failed",
             );
           const resolution = handledWaitingResolution(
-            state ?? {
-              schemaVersion: 1,
-              stage: "content_pending",
-              taskId,
-              design,
-            },
+            state ??
+              transitionProviderState(null, {
+                stage: "content_pending",
+                taskId,
+                design,
+              }),
             polled!.waiting.eventId,
           );
           if (resolution === "pending")
             return pending(
-              state ?? {
-                schemaVersion: 1,
-                stage: "content_pending",
-                taskId,
-                design,
-              },
+              state ??
+                transitionProviderState(null, {
+                  stage: "content_pending",
+                  taskId,
+                  design,
+                }),
               taskId,
               "building",
             );
@@ -3068,7 +3812,9 @@ export function createManusSiteOpsProviderHandler(
             build: context.build,
             taskId,
             kind: "content",
+            category: "extraction",
             design,
+            repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
             handledWaitingEventId: polled!.waiting.eventId,
             handledWaitingAt: new Date().toISOString(),
           });
@@ -3080,18 +3826,17 @@ export function createManusSiteOpsProviderHandler(
             build: context.build,
             taskId,
             kind: "content",
+            category: "extraction",
             design,
+            repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
           });
         }
-        const contentPendingState: ProviderState = {
-          schemaVersion: 1,
+        const contentPendingState = transitionProviderState(state, {
           stage: "content_pending",
           taskId,
           design,
-          ...(state?.resultPendingSince
-            ? { resultPendingSince: state.resultPendingSince }
-            : {}),
-        };
+          resultPendingSince: state?.resultPendingSince,
+        });
         const grace = structuredResultGrace(
           contentPendingState,
           polled!.state.completed,
@@ -3103,7 +3848,9 @@ export function createManusSiteOpsProviderHandler(
             build: context.build,
             taskId,
             kind: "content",
+            category: "extraction",
             design,
+            repairReason: "STRUCTURED_OUTPUT_UNAVAILABLE",
           });
         }
         return pending(grace.state, taskId, "building");
@@ -3113,28 +3860,7 @@ export function createManusSiteOpsProviderHandler(
         const currentContent = usesBuildPlanContractV4(
           workflow.frontMindVersion,
         );
-        const contentResult = currentContent
-          ? pageContentResultV2FromWire(
-              rawContent,
-              brief.routes.map((route) => route.id),
-              documents.map((document) => document.id),
-              brief.contentInventory.entries.some(
-                (entry) => entry.kind === "company_news",
-              )
-                ? []
-                : ["news"],
-            )
-          : pageContentResultFromWire(
-              rawContent,
-              brief.routes.map((route) => route.id),
-              documents.map((document) => document.id),
-            );
-        validateDesignAndContentBindings({
-          routeIds: brief.routes.map((route) => route.id),
-          paletteSize: taxonomy.palette.length,
-          designSpec: design!.designSpec,
-          pageContent: contentResult.pageContent,
-        });
+        const contentResult = parseContentCandidate(rawContent, design!);
         generatedContent = currentContent
           ? siteOpsGeneratedContentV2Schema.parse({
               seo: design!.designSpec.seoPlan,
@@ -3144,15 +3870,42 @@ export function createManusSiteOpsProviderHandler(
               seo: design!.designSpec.seoPlan,
               routes: contentResult.pageContent.routes,
             });
+        logManusBuildStage({
+          stage: "wire_normalized",
+          operationId: operation.id,
+          buildId: context.build.id,
+          phase: "content",
+          routeCount: contentResult.pageContent.routes.length,
+          slotCount: contentResult.pageContent.routes.reduce(
+            (total, route) => total + route.sections.length,
+            0,
+          ),
+          missingCount: contentResult.pageContent.routes.filter(
+            (route) => "emptyState" in route,
+          ).length,
+        });
       } catch (error) {
+        const repairReason = contentRepairReason(error);
+        const coordinate =
+          repairedContentCoordinate ??
+          (contentResolution?.candidateSha256 && contentResolution.source
+            ? {
+                candidateSha256: contentResolution.candidateSha256,
+                source: contentResolution.source,
+              }
+            : null);
         return await scheduleRepair({
           db,
           operation,
           build: context.build,
           taskId,
           kind: "content",
+          category: "content",
           design,
-          repairReason: contentRepairReason(error),
+          repairReason,
+          candidateSha256: coordinate?.candidateSha256,
+          source: coordinate?.source,
+          validationSignature: contentValidationSignature(error, repairReason),
         });
       }
       await db
@@ -3187,13 +3940,30 @@ export function createManusSiteOpsProviderHandler(
         signal.throwIfAborted();
         const classified = classifySiteOpsMaterializationFailure(error);
         if (classified.retryClass === "content_repair") {
+          const repairReason = contentRepairReason(error);
+          const coordinate =
+            repairedContentCoordinate ??
+            (contentResolution?.candidateSha256 && contentResolution.source
+              ? {
+                  candidateSha256: contentResolution.candidateSha256,
+                  source: contentResolution.source,
+                }
+              : null);
           return await scheduleRepair({
             db,
             operation,
             build: context.build,
             taskId,
             kind: "content",
+            category: "materialization",
             design,
+            repairReason,
+            candidateSha256: coordinate?.candidateSha256,
+            source: coordinate?.source,
+            validationSignature: contentValidationSignature(
+              error,
+              repairReason,
+            ),
           });
         }
         const safeDetails = safeMaterializationDetails(classified, {
@@ -3294,6 +4064,14 @@ export function createManusSiteOpsProviderHandler(
         });
         return publicMaterializationFailure(classified, taskId, diagnostics);
       }
+      logManusBuildStage({
+        stage: "build_preview_ready",
+        operationId: operation.id,
+        buildId: context.build.id,
+        candidateSha256: materialized.distSha256,
+        byteCount: materialized.distZip.length,
+        latencyMs: Date.now() - materializationStartedAt,
+      });
       return {
         status: "succeeded",
         providerTaskId: taskId,
@@ -3354,14 +4132,16 @@ export function createManusSiteOpsProviderHandler(
       ) {
         throw error;
       }
+      const failure = resultFailure(error);
       console.error("[siteops-manus] provider_failed", {
         event: "siteops_manus_provider_failed",
         operationId: operation.id,
         projectId: operation.projectId,
         kind: operation.kind,
-        error: runtimeErrorForLog(error),
+        status: failure.status,
+        code: "code" in failure ? failure.code : "FRONTMIND_BUILD_FAILED",
       });
-      return resultFailure(error);
+      return failure;
     }
   };
 }

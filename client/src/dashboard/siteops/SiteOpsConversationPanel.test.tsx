@@ -218,6 +218,31 @@ describe("SiteOpsConversationPanel", () => {
     expect(newestSiteOpsObservation(finalized, generating)).toBe(finalized);
   });
 
+  it("does not let an equal-cursor poll reopen a resumed build action", () => {
+    const buildId = "33333333-3333-4333-8333-333333333333";
+    const available = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 10,
+      buildRecovery: {
+        allowed: true,
+        buildId,
+        reason: "output_recoverable",
+      },
+    });
+    const active = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 10,
+      buildRecovery: {
+        allowed: false,
+        buildId,
+        reason: "active_operation",
+      },
+    });
+
+    expect(newestSiteOpsObservation(available, active)).toBe(active);
+    expect(newestSiteOpsObservation(active, available)).toBe(active);
+  });
+
   it("uses structured workflow actions without a persistent conversation composer", () => {
     render(
       <SiteOpsConversationPanel
@@ -274,6 +299,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
+    fireEvent.click(screen.getByText("高级选项"));
     fireEvent.click(screen.getByRole("button", { name: "重置建站流程" }));
     expect(
       screen.getByRole("alertdialog", { name: "确认重置建站流程？" }),
@@ -320,6 +346,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
+    fireEvent.click(screen.getByText("高级选项"));
     expect(screen.getByRole("button", { name: "重置建站流程" })).toBeDisabled();
     expect(
       screen.getByText("当前仍有任务正在执行或结果待确认，完成后才能重置。"),
@@ -361,6 +388,7 @@ describe("SiteOpsConversationPanel", () => {
         onAction={onAction}
       />,
     );
+    fireEvent.click(screen.getByText("高级选项"));
     fireEvent.click(screen.getByRole("button", { name: "重置建站流程" }));
     fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
     await waitFor(() =>
@@ -1204,6 +1232,86 @@ describe("SiteOpsConversationPanel", () => {
       "frontmind-siteops-preview",
     );
     open.mockRestore();
+  });
+
+  it("continues an output-invalid build without discarding knowledge or visuals", async () => {
+    const buildId = "33333333-3333-4333-8333-333333333333";
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "failed" },
+          interactionState: "failed",
+          builds: [
+            {
+              id: buildId,
+              ordinal: 1,
+              parentBuildId: null,
+              status: "failed",
+              previewUrl: null,
+              sourceUrl: null,
+              needsHelp: true,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          buildRecovery: {
+            allowed: true,
+            buildId,
+            reason: "output_recoverable",
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    expect(
+      screen.getByText(/知识库资料和所选视觉方案均已保留/u),
+    ).toHaveTextContent("不会重复扣减本次官网额度");
+    fireEvent.click(screen.getByRole("button", { name: "继续生成官网" }));
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "resume_build",
+        input: { buildId },
+      }),
+    );
+    expect(screen.getByText("高级选项")).toBeInTheDocument();
+  });
+
+  it("keeps a resumed build action disabled when an operation is active", () => {
+    const buildId = "33333333-3333-4333-8333-333333333333";
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "building" },
+          interactionState: "building",
+          builds: [
+            {
+              id: buildId,
+              ordinal: 1,
+              parentBuildId: null,
+              status: "design_compiling",
+              previewUrl: null,
+              sourceUrl: null,
+              needsHelp: false,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+          buildRecovery: {
+            allowed: false,
+            buildId,
+            reason: "active_operation",
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "正在继续生成官网" }),
+    ).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "继续生成官网" })).toBeNull();
   });
 
   it("does not offer a duplicate publish while the same target is pending", () => {

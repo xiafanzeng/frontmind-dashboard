@@ -35,6 +35,11 @@ export class SiteOpsWireOutputResolutionError extends Error {
       | "SITEOPS_WIRE_OUTPUT_INVALID"
       | "SITEOPS_WIRE_OUTPUT_CONFLICT"
       | "SITEOPS_WIRE_OUTPUT_UNAVAILABLE",
+    readonly validationError?: unknown,
+    readonly validationCandidate?: Pick<
+      SiteOpsWireOutputResolution,
+      "sha256" | "source"
+    >,
   ) {
     super(code);
   }
@@ -43,7 +48,9 @@ export class SiteOpsWireOutputResolutionError extends Error {
 export type SiteOpsWireOutputResolution = {
   value: JsonObject;
   sha256: string;
+  byteCount: number;
   source: "structured" | "attachment" | "assistant_json";
+  sources: Array<"structured" | "attachment" | "assistant_json">;
 };
 
 function isRecord(value: unknown): value is JsonObject {
@@ -87,9 +94,17 @@ function candidate(value: unknown, operationToken: string, maxBytes: number) {
   if (Buffer.byteLength(canonical, "utf8") > maxBytes) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
+  const semanticCandidate = { ...parsed };
+  delete semanticCandidate.operationToken;
   return {
     value: parsed,
-    sha256: createHash("sha256").update(canonical, "utf8").digest("hex"),
+    // The operation token is a causal boundary, not model content. Excluding
+    // it keeps the validation coordinate stable across repair attempts so an
+    // otherwise identical invalid payload cannot consume the next budget.
+    sha256: createHash("sha256")
+      .update(canonicalJsonValue(semanticCandidate), "utf8")
+      .digest("hex"),
+    byteCount: Buffer.byteLength(canonical, "utf8"),
   };
 }
 
@@ -100,7 +115,12 @@ function assertOneCandidate(
   if (new Set(values.map((value) => value.sha256)).size !== 1) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_CONFLICT");
   }
-  return values[0]!;
+  const sourceOrder = ["structured", "assistant_json", "attachment"] as const;
+  const sources = sourceOrder.filter((source) =>
+    values.some((value) => value.source === source),
+  );
+  const selected = values.find((value) => value.source === sources[0])!;
+  return { ...selected, sources };
 }
 
 function currentOperationWindow(
@@ -136,6 +156,7 @@ function assistantMessage(event: ManusV2MessageEvent) {
 }
 
 function assistantJsonBody(message: JsonObject) {
+  if (isRecord(message.content)) return message.content;
   if (typeof message.content !== "string") return null;
   const text = message.content.trim();
   if (!text) return null;
@@ -168,15 +189,31 @@ function jsonAttachments(
   message: JsonObject,
   phase: SiteOpsWireOutputPhase,
   expectedFilename: string,
-): JsonAttachment[] {
+): { attachments: JsonAttachment[]; invalid: boolean } {
   const raw = [
     ...(Array.isArray(message.attachments) ? message.attachments : []),
     ...(Array.isArray(message.content) ? message.content : []),
   ];
-  return raw.flatMap((value) => {
-    if (!isRecord(value)) return [];
+  const attachments: JsonAttachment[] = [];
+  let invalid = false;
+  const expectedWireVersion = expectedFilename.match(
+    /[-_]wire[-_]v([23])\.json$/u,
+  )?.[1];
+  if (!expectedWireVersion) {
+    throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
+  }
+  const phaseStem =
+    phase === "design"
+      ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
+      : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
+  const providerFilenamePattern = new RegExp(
+    `^${phaseStem}(?:[-_]repair[-_][1-3])?\\.json$`,
+    "u",
+  );
+  for (const value of raw) {
+    if (!isRecord(value)) continue;
     const url = optionalString(value, ["url", "file_url", "fileUrl"]);
-    if (!url) return [];
+    if (!url) continue;
     const filename = optionalString(value, [
       "filename",
       "file_name",
@@ -193,36 +230,24 @@ function jsonAttachments(
     // ordinal, so accept that narrow provider form without accepting an
     // arbitrary JSON attachment. The operation token and local wire schema
     // remain the business authority.
-    if (!filename) return [];
+    if (!filename) continue;
     if (
       filename !== filename.normalize("NFKC") ||
       filename.length > 255 ||
       /[\\/\u0000-\u001f\u007f]/u.test(filename)
     ) {
-      throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
+      invalid = true;
+      continue;
     }
-    const expectedWireVersion = expectedFilename.match(
-      /[-_]wire[-_]v([23])\.json$/u,
-    )?.[1];
-    if (!expectedWireVersion) {
-      throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
-    }
-    const phaseStem =
-      phase === "design"
-        ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
-        : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
-    const providerFilenamePattern = new RegExp(
-      `^${phaseStem}(?:[-_]repair[-_][1-3])?\\.json$`,
-      "u",
-    );
     if (
       filename !== expectedFilename &&
       !providerFilenamePattern.test(filename)
     )
-      return [];
+      continue;
     const mime = declaredMime?.split(";", 1)[0]?.trim().toLowerCase() ?? null;
     if (mime !== null && mime !== "application/json") {
-      throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
+      invalid = true;
+      continue;
     }
     const declaredHash = optionalString(value, [
       "sha256",
@@ -230,10 +255,12 @@ function jsonAttachments(
       "contentSha256",
     ]);
     if (declaredHash !== null && !SHA256_PATTERN.test(declaredHash)) {
-      throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
+      invalid = true;
+      continue;
     }
-    return [{ url, expectedSha256: declaredHash }];
-  });
+    attachments.push({ url, expectedSha256: declaredHash });
+  }
+  return { attachments, invalid };
 }
 
 async function readBoundedJsonResponse(response: Response, maxBytes: number) {
@@ -355,9 +382,9 @@ async function downloadAttachment(input: {
 
 /**
  * Resolve one task phase without weakening the internal Zod contract.
- * Structured-output success wins. Provider message/attachment recovery is
- * permitted only after completion and an explicit extraction rejection in
- * the exact operation-token window.
+ * Every valid source in the exact operation-token window participates in one
+ * canonical decision. Identical candidates merge; distinct valid candidates
+ * fail closed. A malformed or unavailable source cannot hide a valid sibling.
  */
 export async function resolveSiteOpsWireOutput(input: {
   events: readonly ManusV2MessageEvent[];
@@ -367,6 +394,10 @@ export async function resolveSiteOpsWireOutput(input: {
   taskCompleted: boolean;
   signal?: AbortSignal;
   fetchPinned?: FetchPinnedPublicHttps;
+  validateCandidate?: (
+    value: JsonObject,
+    source: SiteOpsWireOutputResolution["source"],
+  ) => void;
 }): Promise<SiteOpsWireOutputResolution | null> {
   const allowedFilenames: readonly string[] =
     input.phase === "design"
@@ -384,65 +415,106 @@ export async function resolveSiteOpsWireOutput(input: {
   // that phase. Accepting it while running can send the next message into the
   // same task before the current response is complete.
   if (!input.taskCompleted) return null;
-  const structured: SiteOpsWireOutputResolution[] = [];
-  for (const event of input.events) {
+  const window = currentOperationWindow(input.events, input.operationToken);
+  if (!window) return null;
+  const candidates: SiteOpsWireOutputResolution[] = [];
+  let sawInvalid = false;
+  let sawUnavailable = false;
+  let validationError: unknown;
+  let validationCandidate:
+    | Pick<SiteOpsWireOutputResolution, "sha256" | "source">
+    | undefined;
+  const addCandidate = (
+    value: unknown,
+    source: SiteOpsWireOutputResolution["source"],
+  ) => {
+    let parsed: ReturnType<typeof candidate> = null;
+    try {
+      parsed = candidate(value, input.operationToken, maxBytes);
+    } catch (error) {
+      sawInvalid = true;
+      validationError ??= error;
+      return;
+    }
+    if (!parsed) {
+      sawInvalid = true;
+      return;
+    }
+    try {
+      input.validateCandidate?.(parsed.value, source);
+    } catch (error) {
+      sawInvalid = true;
+      validationError ??= error;
+      validationCandidate ??= { sha256: parsed.sha256, source };
+      return;
+    }
+    candidates.push({ ...parsed, source, sources: [source] });
+  };
+  for (const event of window) {
     if (event.type !== "structured_output_result") continue;
     const envelope = classifyManusV2StructuredResultEnvelope(
       event.structured_output_result,
     );
-    if (envelope.kind !== "accepted") continue;
-    const parsed = candidate(envelope.value, input.operationToken, maxBytes);
-    if (parsed) structured.push({ ...parsed, source: "structured" });
+    if (envelope.kind === "accepted") {
+      addCandidate(envelope.value, "structured");
+      continue;
+    }
+    const raw = isRecord(event.structured_output_result)
+      ? event.structured_output_result
+      : null;
+    if (raw && Object.prototype.hasOwnProperty.call(raw, "value")) {
+      addCandidate(raw.value, "structured");
+    }
   }
-  const accepted = assertOneCandidate(structured);
-  if (accepted) return accepted;
-
-  // Never inspect assistant prose or output URLs while an upstream task is
-  // still active. This prevents partial files from becoming durable input.
-  const window = currentOperationWindow(input.events, input.operationToken);
-  if (!window) return null;
-  const explicitlyRejected = window.some((event) => {
-    if (event.type !== "structured_output_result") return false;
-    return (
-      classifyManusV2StructuredResultEnvelope(event.structured_output_result)
-        .kind === "rejected"
-    );
-  });
-  if (!explicitlyRejected) return null;
-
-  const fallback: SiteOpsWireOutputResolution[] = [];
   for (const event of window) {
     const message = assistantMessage(event);
     if (!message) continue;
     const body = assistantJsonBody(message);
     if (body) {
-      const parsed = candidate(body, input.operationToken, maxBytes);
-      if (!parsed) {
-        throw new SiteOpsWireOutputResolutionError(
-          "SITEOPS_WIRE_OUTPUT_INVALID",
-        );
-      }
-      fallback.push({ ...parsed, source: "assistant_json" });
+      addCandidate(body, "assistant_json");
     }
-    for (const attachment of jsonAttachments(
+    const attachmentSet = jsonAttachments(
       message,
       input.phase,
       expectedFilename,
-    )) {
-      const value = await downloadAttachment({
-        attachment,
-        maxBytes,
-        signal: input.signal,
-        fetchPinned: input.fetchPinned ?? fetchPinnedPublicHttps,
-      });
-      const parsed = candidate(value, input.operationToken, maxBytes);
-      if (!parsed) {
-        throw new SiteOpsWireOutputResolutionError(
-          "SITEOPS_WIRE_OUTPUT_INVALID",
-        );
+    );
+    sawInvalid ||= attachmentSet.invalid;
+    for (const attachment of attachmentSet.attachments) {
+      try {
+        const value = await downloadAttachment({
+          attachment,
+          maxBytes,
+          signal: input.signal,
+          fetchPinned: input.fetchPinned ?? fetchPinnedPublicHttps,
+        });
+        addCandidate(value, "attachment");
+      } catch (error) {
+        if (
+          error instanceof SiteOpsWireOutputResolutionError &&
+          error.code === "SITEOPS_WIRE_OUTPUT_UNAVAILABLE"
+        ) {
+          sawUnavailable = true;
+        } else if (error instanceof SiteOpsWireOutputResolutionError) {
+          sawInvalid = true;
+        } else {
+          throw error;
+        }
       }
-      fallback.push({ ...parsed, source: "attachment" });
     }
   }
-  return assertOneCandidate(fallback);
+  const resolved = assertOneCandidate(candidates);
+  if (resolved) return resolved;
+  if (sawInvalid) {
+    throw new SiteOpsWireOutputResolutionError(
+      "SITEOPS_WIRE_OUTPUT_INVALID",
+      validationError,
+      validationCandidate,
+    );
+  }
+  if (sawUnavailable) {
+    throw new SiteOpsWireOutputResolutionError(
+      "SITEOPS_WIRE_OUTPUT_UNAVAILABLE",
+    );
+  }
+  return null;
 }

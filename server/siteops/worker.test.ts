@@ -341,6 +341,18 @@ describe("SiteOps worker claim boundary", () => {
     expect(
       siteOpsSupplementalVisualFailureMayRecover({
         ...recoverable,
+        errorCode: "VISUAL_MATCHING_BUDGET_EXHAUSTED",
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsSupplementalVisualFailureMayRecover({
+        ...recoverable,
+        errorCode: "VISUAL_PREVIEW_REFERENCES_UNAVAILABLE",
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsSupplementalVisualFailureMayRecover({
+        ...recoverable,
         projectRevision: 10,
       }),
     ).toBe(false);

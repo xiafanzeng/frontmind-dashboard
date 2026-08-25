@@ -54,6 +54,20 @@ export function newestSiteOpsObservation(
   const incomingVisualGenerating =
     incoming.visualGeneration.status === "generating";
   if (currentVisualGenerating && !incomingVisualGenerating) return incoming;
+  // Claiming the resumed build does not need another project revision or
+  // customer message. At an equal cursor, accept only the one-way transition
+  // from a clickable recovery to the active operation and reject a late poll
+  // that would make the primary action clickable again.
+  const currentRecoveryAvailable = current.buildRecovery?.allowed === true;
+  const incomingRecoveryActive =
+    incoming.buildRecovery?.reason === "active_operation";
+  if (currentRecoveryAvailable && incomingRecoveryActive) return incoming;
+  if (
+    current.buildRecovery?.reason === "active_operation" &&
+    incoming.buildRecovery?.allowed === true
+  ) {
+    return current;
+  }
   return current;
 }
 

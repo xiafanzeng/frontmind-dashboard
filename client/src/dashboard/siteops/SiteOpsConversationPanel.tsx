@@ -1437,6 +1437,11 @@ export default function SiteOpsConversationPanel({
     canGenerateMore: visualPages.length < 3,
     canSelectExisting: true,
   };
+  const buildRecovery = observation.buildRecovery ?? {
+    allowed: false,
+    buildId: null,
+    reason: null,
+  };
   const visualGenerationPending =
     visualGeneration.status === "generating" ||
     busyAction === "reselect_visual";
@@ -1605,35 +1610,7 @@ export default function SiteOpsConversationPanel({
                 <Wrench size={17} aria-hidden="true" />
               </button>
             )}
-            {!hasSuccessfulBuild && (
-              <button
-                type="button"
-                className="siteops-icon-button siteops-reset-button"
-                aria-label="重置建站流程"
-                aria-describedby={
-                  resetDisabledReason
-                    ? "siteops-reset-disabled-reason"
-                    : undefined
-                }
-                disabled={resetDisabled}
-                title={resetDisabledReason}
-                onClick={() => {
-                  setResetError(null);
-                  setResetDialogOpen(true);
-                }}
-              >
-                <RotateCcw size={17} aria-hidden="true" />
-              </button>
-            )}
           </div>
-          {!hasSuccessfulBuild && resetDisabledReason && (
-            <small
-              className="siteops-reset-disabled-reason"
-              id="siteops-reset-disabled-reason"
-            >
-              {resetDisabledReason}
-            </small>
-          )}
         </div>
       </header>
 
@@ -2179,152 +2156,215 @@ export default function SiteOpsConversationPanel({
           </div>
         )}
 
-      {latestBuild && !hideExistingBuildDuringActiveRebuild && (
-        <section
-          className="siteops-build-card"
-          aria-labelledby="siteops-build-title"
-        >
-          <div>
-            <span>官网版本 {latestBuild.ordinal}</span>
-            <h3 id="siteops-build-title">
-              {BUILD_STATUS_LABELS[latestBuild.status] || "正在处理"}
-            </h3>
-            {latestBuild.needsHelp && (
+      {latestAttempt &&
+        buildRecovery.buildId === latestAttempt.id &&
+        (buildRecovery.allowed || buildRecovery.reason !== null) && (
+          <section
+            className="siteops-build-card"
+            aria-labelledby="siteops-build-recovery-title"
+          >
+            <div>
+              <span>官网版本 {latestAttempt.ordinal}</span>
+              <h3 id="siteops-build-recovery-title">
+                {buildRecovery.reason === "active_operation"
+                  ? "正在继续生成官网"
+                  : buildRecovery.reason === "frozen_input_changed"
+                    ? "需要协助核对保留资料"
+                    : "可以继续生成官网"}
+              </h3>
               <p>
-                {latestBuild.status === "attention_required"
-                  ? "官网制作需要协助，请提交工单。"
-                  : "官网制作暂未完成，请稍后重试或提交工单。"}
+                {buildRecovery.reason === "frozen_input_changed"
+                  ? "保留的知识库资料或视觉方案无法安全核对，FrontMind 不会静默更换，请提交工单获取协助。"
+                  : "知识库资料和所选视觉方案均已保留；继续后会从中断处恢复，无需重新选择，也不会重复扣减本次官网额度。"}
               </p>
-            )}
-          </div>
-          <div className="siteops-build-actions">
-            {latestBuild.previewUrl && (
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                onClick={() => openPrivatePreview(latestBuild.previewUrl!)}
-              >
-                <ExternalLink size={15} aria-hidden="true" />
-                在新标签页打开预览
-              </button>
-            )}
-            {latestBuild.sourceUrl && (
-              <a href={latestBuild.sourceUrl}>
-                <Download size={15} aria-hidden="true" />
-                下载网站源码
-              </a>
-            )}
-            {hasSuccessfulBuild && (
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled={Boolean(
-                  busyAction || !observation.rebuildRequest.allowed,
-                )}
-                onClick={() => {
-                  setRebuildError(null);
-                  setRebuildDialogOpen(true);
-                }}
-              >
-                <Wrench size={15} aria-hidden="true" />
-                {rebuildRequestLabel}
-              </button>
-            )}
-            {["preview_ready", "approved"].includes(latestBuild.status) && (
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled
-                title="即将上线"
-              >
-                发布博客与行业近况（即将上线）
-              </button>
-            )}
-            {previewOpenError && latestBuild.previewUrl && (
-              <div
-                className="siteops-notice error siteops-preview-open-error"
-                role="alert"
-              >
-                <AlertCircle size={18} aria-hidden="true" />
-                <span>{previewOpenError}</span>
-                <a
-                  href={latestBuild.previewUrl}
-                  target={PRIVATE_PREVIEW_WINDOW_NAME}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    openPrivatePreview(latestBuild.previewUrl!);
-                  }}
-                >
-                  重试打开预览
-                </a>
-              </div>
-            )}
-            {latestBuild.status === "approved" && (
-              <>
+            </div>
+            <div className="siteops-build-actions">
+              {(buildRecovery.allowed ||
+                buildRecovery.reason === "active_operation") && (
                 <button
                   type="button"
                   className="siteops-primary-button"
                   disabled={
                     interactionLocked ||
-                    Boolean(globalDeployment.pending) ||
-                    globalDeployment.active?.buildId === latestBuild.id
+                    !buildRecovery.allowed ||
+                    busyAction === "resume_build"
                   }
                   onClick={() =>
-                    runAction(
-                      "publish_global",
-                      actionFromCard(
-                        observation,
-                        "publish_options",
-                        "publish_global",
-                        {
-                          buildId: latestBuild.id,
-                          expectedHeadDeploymentId: globalDeployment.active?.id,
-                        },
-                      ),
-                    )
+                    runAction("resume_build", {
+                      action: "resume_build",
+                      input: { buildId: latestAttempt.id },
+                    })
                   }
                 >
-                  {globalDeployment.pending
-                    ? "海外站点发布中"
-                    : globalDeployment.active?.buildId === latestBuild.id
-                      ? "海外站点已在线"
-                      : "发布海外站点"}
+                  {(busyAction === "resume_build" ||
+                    buildRecovery.reason === "active_operation") && (
+                    <Loader2
+                      className="siteops-spin"
+                      size={15}
+                      aria-hidden="true"
+                    />
+                  )}
+                  {buildRecovery.reason === "active_operation"
+                    ? "正在继续生成官网"
+                    : "继续生成官网"}
                 </button>
+              )}
+            </div>
+          </section>
+        )}
+
+      {latestBuild &&
+        !hideExistingBuildDuringActiveRebuild &&
+        !(
+          buildRecovery.buildId === latestBuild.id &&
+          (buildRecovery.allowed || buildRecovery.reason !== null)
+        ) && (
+          <section
+            className="siteops-build-card"
+            aria-labelledby="siteops-build-title"
+          >
+            <div>
+              <span>官网版本 {latestBuild.ordinal}</span>
+              <h3 id="siteops-build-title">
+                {BUILD_STATUS_LABELS[latestBuild.status] || "正在处理"}
+              </h3>
+              {latestBuild.needsHelp && (
+                <p>
+                  {latestBuild.status === "attention_required"
+                    ? "官网制作需要协助，请提交工单。"
+                    : "官网制作暂未完成，请稍后重试或提交工单。"}
+                </p>
+              )}
+            </div>
+            <div className="siteops-build-actions">
+              {latestBuild.previewUrl && (
                 <button
                   type="button"
                   className="siteops-secondary-button"
-                  disabled={
-                    interactionLocked ||
-                    Boolean(mainlandDeployment.pending) ||
-                    mainlandDeployment.active?.buildId === latestBuild.id
-                  }
-                  onClick={() =>
-                    runAction(
-                      "publish_mainland",
-                      actionFromCard(
-                        observation,
-                        "publish_options",
-                        "publish_mainland",
-                        {
-                          buildId: latestBuild.id,
-                          expectedHeadDeploymentId:
-                            mainlandDeployment.active?.id,
-                        },
-                      ),
-                    )
-                  }
+                  onClick={() => openPrivatePreview(latestBuild.previewUrl!)}
                 >
-                  {mainlandDeployment.pending
-                    ? "大陆站点发布中"
-                    : mainlandDeployment.active?.buildId === latestBuild.id
-                      ? "大陆站点已在线"
-                      : "发布大陆站点"}
+                  <ExternalLink size={15} aria-hidden="true" />
+                  在新标签页打开预览
                 </button>
-              </>
-            )}
-          </div>
-        </section>
-      )}
+              )}
+              {latestBuild.sourceUrl && (
+                <a href={latestBuild.sourceUrl}>
+                  <Download size={15} aria-hidden="true" />
+                  下载网站源码
+                </a>
+              )}
+              {hasSuccessfulBuild && (
+                <button
+                  type="button"
+                  className="siteops-secondary-button"
+                  disabled={Boolean(
+                    busyAction || !observation.rebuildRequest.allowed,
+                  )}
+                  onClick={() => {
+                    setRebuildError(null);
+                    setRebuildDialogOpen(true);
+                  }}
+                >
+                  <Wrench size={15} aria-hidden="true" />
+                  {rebuildRequestLabel}
+                </button>
+              )}
+              {["preview_ready", "approved"].includes(latestBuild.status) && (
+                <button
+                  type="button"
+                  className="siteops-secondary-button"
+                  disabled
+                  title="即将上线"
+                >
+                  发布博客与行业近况（即将上线）
+                </button>
+              )}
+              {previewOpenError && latestBuild.previewUrl && (
+                <div
+                  className="siteops-notice error siteops-preview-open-error"
+                  role="alert"
+                >
+                  <AlertCircle size={18} aria-hidden="true" />
+                  <span>{previewOpenError}</span>
+                  <a
+                    href={latestBuild.previewUrl}
+                    target={PRIVATE_PREVIEW_WINDOW_NAME}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      openPrivatePreview(latestBuild.previewUrl!);
+                    }}
+                  >
+                    重试打开预览
+                  </a>
+                </div>
+              )}
+              {latestBuild.status === "approved" && (
+                <>
+                  <button
+                    type="button"
+                    className="siteops-primary-button"
+                    disabled={
+                      interactionLocked ||
+                      Boolean(globalDeployment.pending) ||
+                      globalDeployment.active?.buildId === latestBuild.id
+                    }
+                    onClick={() =>
+                      runAction(
+                        "publish_global",
+                        actionFromCard(
+                          observation,
+                          "publish_options",
+                          "publish_global",
+                          {
+                            buildId: latestBuild.id,
+                            expectedHeadDeploymentId:
+                              globalDeployment.active?.id,
+                          },
+                        ),
+                      )
+                    }
+                  >
+                    {globalDeployment.pending
+                      ? "海外站点发布中"
+                      : globalDeployment.active?.buildId === latestBuild.id
+                        ? "海外站点已在线"
+                        : "发布海外站点"}
+                  </button>
+                  <button
+                    type="button"
+                    className="siteops-secondary-button"
+                    disabled={
+                      interactionLocked ||
+                      Boolean(mainlandDeployment.pending) ||
+                      mainlandDeployment.active?.buildId === latestBuild.id
+                    }
+                    onClick={() =>
+                      runAction(
+                        "publish_mainland",
+                        actionFromCard(
+                          observation,
+                          "publish_options",
+                          "publish_mainland",
+                          {
+                            buildId: latestBuild.id,
+                            expectedHeadDeploymentId:
+                              mainlandDeployment.active?.id,
+                          },
+                        ),
+                      )
+                    }
+                  >
+                    {mainlandDeployment.pending
+                      ? "大陆站点发布中"
+                      : mainlandDeployment.active?.buildId === latestBuild.id
+                        ? "大陆站点已在线"
+                        : "发布大陆站点"}
+                  </button>
+                </>
+              )}
+            </div>
+          </section>
+        )}
 
       {currentSnapshotId &&
         ["preview_ready", "approved", "live"].includes(
@@ -2384,6 +2424,50 @@ export default function SiteOpsConversationPanel({
             </div>
           </section>
         )}
+
+      {!hasSuccessfulBuild && (
+        <details className="siteops-snapshot-card">
+          <summary>高级选项</summary>
+          <div>
+            <RotateCcw size={18} aria-hidden="true" />
+            <div>
+              <h3>重新开始整个建站流程</h3>
+              <p>
+                仅在确实需要放弃现有资料和视觉方案时使用；一般生成失败请优先继续生成官网。
+              </p>
+            </div>
+          </div>
+          <div className="siteops-snapshot-actions">
+            <button
+              type="button"
+              className="siteops-secondary-button"
+              aria-label="重置建站流程"
+              aria-describedby={
+                resetDisabledReason
+                  ? "siteops-reset-disabled-reason"
+                  : undefined
+              }
+              disabled={resetDisabled}
+              title={resetDisabledReason}
+              onClick={() => {
+                setResetError(null);
+                setResetDialogOpen(true);
+              }}
+            >
+              <RotateCcw size={15} aria-hidden="true" />
+              重置建站流程
+            </button>
+          </div>
+          {resetDisabledReason && (
+            <small
+              className="siteops-reset-disabled-reason"
+              id="siteops-reset-disabled-reason"
+            >
+              {resetDisabledReason}
+            </small>
+          )}
+        </details>
+      )}
 
       <section
         className="siteops-domain-card"

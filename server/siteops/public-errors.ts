@@ -29,10 +29,16 @@ export function sanitizeFrontMindPublicText(value: string) {
     .replace(/\b(?:Base|Pro)\b/giu, "建站模式")
     .replace(/A[–-]I\s*(?:候选|视觉方向)?/giu, "9 个视觉候选");
   if (!INFRASTRUCTURE_TERM.test(sanitized)) return sanitized;
-  if (/(?:成功|完成|已在线|已上线|active|succeeded|verified)/iu.test(sanitized)) {
+  if (
+    /(?:成功|完成|已在线|已上线|active|succeeded|verified)/iu.test(sanitized)
+  ) {
     return "FrontMind 已完成当前网站配置。";
   }
-  if (/(?:等待|正在|传播|验证中|pending|running|verifying|reconciling)/iu.test(sanitized)) {
+  if (
+    /(?:等待|正在|传播|验证中|pending|running|verifying|reconciling)/iu.test(
+      sanitized,
+    )
+  ) {
     return "FrontMind 正在自动完成网站配置，请稍后查看。";
   }
   return "FrontMind 暂未完成网站配置，请稍后重试或提交工单获取协助。";
@@ -51,18 +57,27 @@ export function publicSiteOpsDomainIssue(
   status: string | null | undefined,
 ): SiteOpsCustomerDomainIssue | null {
   const normalized = String(code ?? "").toUpperCase();
-  if (!normalized && !["failed", "attention_required", "outcome_unknown"].includes(String(status))) {
+  if (
+    !normalized &&
+    !["failed", "attention_required", "outcome_unknown"].includes(
+      String(status),
+    )
+  ) {
     return null;
   }
   if (/(?:QUOTE|PRICE|EXPIRED)/u.test(normalized)) return "quote_changed";
   if (/(?:AUTH|PERMISSION|ROLE|CALLER|ACCOUNT|CREDENTIAL)/u.test(normalized)) {
     return "authorization_needed";
   }
-  if (/(?:BALANCE|PAYMENT|FUNDS|CREDIT)/u.test(normalized)) return "payment_required";
+  if (/(?:BALANCE|PAYMENT|FUNDS|CREDIT)/u.test(normalized))
+    return "payment_required";
   if (/(?:REGISTRANT|REAL_NAME|IDENTITY|EMAIL)/u.test(normalized)) {
     return "identity_required";
   }
-  if (String(status) === "outcome_unknown" || /(?:TIMEOUT|UNAVAILABLE|THROTTL|RATE_LIMIT)/u.test(normalized)) {
+  if (
+    String(status) === "outcome_unknown" ||
+    /(?:TIMEOUT|UNAVAILABLE|THROTTL|RATE_LIMIT)/u.test(normalized)
+  ) {
     return "service_unavailable";
   }
   return "needs_help";
@@ -122,7 +137,8 @@ export function publicSiteOpsErrorProjection(input: {
   if (code === "FRONTMIND_BUILD_OUTPUT_INVALID") {
     return {
       code,
-      message: "FrontMind AI 建站输出连续未通过结构校验，请重置后重新开始。",
+      message:
+        "FrontMind AI 建站输出未通过结构校验，知识库资料和视觉方案已保留，可继续生成官网。",
     };
   }
   if (
@@ -148,7 +164,8 @@ export function publicSiteOpsErrorProjection(input: {
   if (/(?:OUTPUT|EXTRACT|CONTENT|DESIGN|VALIDATION)/iu.test(code)) {
     return {
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
-      message: "FrontMind AI 建站输出连续未通过结构校验，请重置后重新开始。",
+      message:
+        "FrontMind AI 建站输出未通过结构校验，知识库资料和视觉方案已保留，可继续生成官网。",
     };
   }
   if (input.status === "attention_required") {

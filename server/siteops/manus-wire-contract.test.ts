@@ -158,7 +158,7 @@ describe("SiteOps provider wire contracts", () => {
     expect(content.pageContent.routes[0]).not.toHaveProperty("eyebrow");
   });
 
-  it("treats the Wire V2 routeSlots array as canonical order without accepting legacy fields", () => {
+  it("normalizes host-owned design coordinates without accepting legacy semantic fields", () => {
     const base = {
       operationToken: "design-token",
       schemaVersion: 2,
@@ -175,18 +175,45 @@ describe("SiteOps provider wire contracts", () => {
       siteTitle: "星河智造",
       description: "经过知识来源核验的企业官网。",
     } as const;
-    expect(() =>
-      siteDesignResultFromWire(
-        {
-          ...base,
-          routeSlots: [
-            { routeId: "about", slotId: "proof", variant: "proof" },
-            { routeId: "home", slotId: "statement", variant: "statement" },
-          ],
-        },
-        ["home", "about"],
-      ),
-    ).toThrow("SITEOPS_DESIGN_SLOT_ORDER_INVALID");
+    const normalized = siteDesignResultFromWire(
+      {
+        ...base,
+        backgroundPaletteIndex: 99,
+        textPaletteIndex: -2,
+        accentPaletteIndex: 12,
+        routeSlots: [
+          { routeId: "about", slotId: "proof", variant: "proof" },
+          { routeId: "unknown", slotId: "ignored", variant: "proof" },
+          { routeId: "home", slotId: "hero-title", variant: "statement" },
+          { routeId: "home", slotId: "hero-title", variant: "cta" },
+          { routeId: "home", slotId: "Hero title", variant: "cta" },
+          { routeId: "home", slotId: "ignored", variant: "invented" },
+        ],
+      },
+      ["home", "about", "contact", "news"],
+      ["news"],
+      2,
+    );
+    expect(normalized.designSpec.routeCompositions).toEqual([
+      {
+        routeId: "home",
+        slots: [{ slotId: "hero-title", variant: "statement" }],
+      },
+      { routeId: "about", slots: [{ slotId: "proof", variant: "proof" }] },
+      {
+        routeId: "contact",
+        slots: [{ slotId: "overview", variant: "statement" }],
+      },
+      {
+        routeId: "news",
+        slots: [{ slotId: "news-empty", variant: "statement" }],
+      },
+    ]);
+    expect(normalized.designSpec.colorRoles).toEqual({
+      backgroundPaletteIndex: 0,
+      textPaletteIndex: 1,
+      accentPaletteIndex: 1,
+    });
     expect(() =>
       siteDesignResultFromWire(
         {
@@ -204,6 +231,17 @@ describe("SiteOps provider wire contracts", () => {
         ["home"],
       ),
     ).toThrow();
+    expect(
+      siteDesignResultFromWire(
+        {
+          ...base,
+          routeSlots: [
+            { routeId: "home", slotId: "hero", variant: "invented" },
+          ],
+        },
+        ["home"],
+      ).designSpec.routeCompositions[0]?.slots,
+    ).toEqual([{ slotId: "overview", variant: "statement" }]);
   });
 
   it("injects the frozen Hero blueprint into SiteDesignSpecV2 and rejects provider overrides", () => {
@@ -261,62 +299,59 @@ describe("SiteOps provider wire contracts", () => {
     ).toThrow();
   });
 
-  it("canonicalizes typed Wire V3 and owns the empty-news copy on the host", () => {
+  it("canonicalizes eight provider routes and injects host-owned empty news", () => {
+    const providerRouteIds = [
+      "home",
+      "about",
+      "products",
+      "services",
+      "solutions",
+      "cases",
+      "faq",
+      "contact",
+    ] as const;
     const wire = {
       operationToken: "content-token-v3",
       schemaVersion: 3,
-      routes: [
-        {
-          routeId: "home",
-          eyebrow: null,
-          heading: "可信制造服务",
-          summary: "仅使用冻结知识库。",
-        },
-        {
-          routeId: "news",
-          eyebrow: "provider copy is discarded",
-          heading: "provider copy is discarded",
-          summary: "provider copy is discarded",
-        },
-      ],
-      blocks: [
-        {
-          routeId: "home",
-          slotId: "capabilities",
-          blockType: "feature_list",
-          heading: "服务能力",
-          paragraphs: ["提供设备巡检与状态分析。"],
-          items: ["设备巡检", "状态分析"],
-          entityIds: [],
-          faqIds: [],
-          sourceDocumentIds: ["kb-overview-poison-001"],
-        },
-      ],
+      routes: providerRouteIds.map((routeId) => ({
+        routeId,
+        eyebrow: null,
+        heading: `${routeId} 可信内容`,
+        summary: "仅使用冻结知识库。",
+      })),
+      blocks: providerRouteIds.map((routeId) => ({
+        routeId,
+        slotId: `${routeId}-overview`,
+        blockType: routeId === "home" ? "feature_list" : "prose",
+        heading: `${routeId} 内容`,
+        paragraphs: ["提供经过来源核验的内容。"],
+        items: routeId === "home" ? ["设备巡检", "状态分析"] : [],
+        entityIds: [],
+        faqIds: [],
+        sourceDocumentIds: ["kb-overview-poison-001"],
+      })),
       entities: [],
       faqs: [],
       officialLinks: [],
     } as const;
     const result = pageContentResultV2FromWire(
       wire,
-      ["home", "news"],
+      [...providerRouteIds, "news"],
       ["kb-overview-poison-001"],
       ["news"],
     );
-    expect(result.pageContent).toMatchObject({
-      schemaVersion: 2,
-      routes: [
-        {
-          routeId: "home",
-          sections: [{ blockType: "feature_list" }],
-        },
-        {
-          routeId: "news",
-          heading: "企业动态",
-          summary: "当前知识库暂无可公开的企业动态。",
-          emptyState: "company_news_unavailable",
-          sections: [],
-        },
-      ],
+    expect(result.pageContent.schemaVersion).toBe(2);
+    expect(result.pageContent.routes).toHaveLength(9);
+    expect(
+      result.pageContent.routes.find((route) => route.routeId === "home"),
+    ).toMatchObject({ sections: [{ blockType: "feature_list" }] });
+    expect(
+      result.pageContent.routes.find((route) => route.routeId === "news"),
+    ).toMatchObject({
+      heading: "企业动态",
+      summary: "当前知识库暂无可公开的企业动态。",
+      emptyState: "company_news_unavailable",
+      sections: [],
     });
     expect(() =>
       pageContentResultV2FromWire(
@@ -331,7 +366,26 @@ describe("SiteOps provider wire contracts", () => {
             },
           ],
         },
-        ["home", "news"],
+        [...providerRouteIds, "news"],
+        ["kb-overview-poison-001"],
+        ["news"],
+      ),
+    ).toThrow("SITEOPS_CONTENT_SOURCE_OR_ROUTE_MISMATCH");
+    expect(() =>
+      pageContentResultV2FromWire(
+        {
+          ...wire,
+          routes: [
+            ...wire.routes,
+            {
+              routeId: "news",
+              eyebrow: null,
+              heading: "模型生成的新闻",
+              summary: "不得接纳。",
+            },
+          ],
+        },
+        [...providerRouteIds, "news"],
         ["kb-overview-poison-001"],
         ["news"],
       ),

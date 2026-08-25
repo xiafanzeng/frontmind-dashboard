@@ -101,6 +101,20 @@ export const siteOpsVisualGenerationProjectionSchema = z
   })
   .strict();
 
+/** Public recovery state for the one failed build that remains bound to the
+ * project's frozen knowledge snapshot, visual selection and provider task.
+ * Optional on reads so a new client can still consume an observation emitted
+ * during a rolling deployment by the previous server release. */
+export const siteOpsBuildRecoveryProjectionSchema = z
+  .object({
+    allowed: z.boolean(),
+    buildId: z.string().uuid().nullable(),
+    reason: z
+      .enum(["output_recoverable", "active_operation", "frozen_input_changed"])
+      .nullable(),
+  })
+  .strict();
+
 export const siteOpsBuildProjectionSchema = z
   .object({
     id: z.string().uuid(),
@@ -397,6 +411,7 @@ export const siteOpsObservationV1Schema = z
       canGenerateMore: false,
       canSelectExisting: true,
     }),
+    buildRecovery: siteOpsBuildRecoveryProjectionSchema.optional(),
     executionSteps: z
       .array(siteOpsExecutionStepProjectionSchema)
       .max(300)

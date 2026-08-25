@@ -12,13 +12,17 @@ import {
   SITEOPS_WORKFLOW,
 } from "../../shared/siteops";
 import { referenceBlueprintForVisualCandidate } from "../../shared/siteops-design";
+import { siteOperations } from "../../drizzle/schema";
 
 import {
   briefWithoutBrandAssets,
   combinedTerminalTaskState,
   completedSiteBuildMessage,
   contentRepairPrompt,
+  designRepairPrompt,
+  designValidationFailure,
   handledWaitingResolution,
+  hostOwnedEmptyRouteIds,
   createManusSiteOpsProviderHandler,
   frozenAssetDecisions,
   getSiteOpsSocialWorkflowReadiness,
@@ -192,6 +196,40 @@ describe("Manus SiteOps provider boundary", () => {
     expect(repair).toContain("数据驱动");
     expect(repair).toContain("正式恢复副本");
     expect(repair).not.toMatch(/Astro/u);
+  });
+
+  it("uses one host-empty route policy and precise design repair reasons", () => {
+    expect(
+      hostOwnedEmptyRouteIds({
+        routes: [{ id: "home" }, { id: "news" }],
+        contentInventory: {
+          entries: [{ kind: "service" }],
+        },
+      } as never),
+    ).toEqual(["news"]);
+    expect(
+      hostOwnedEmptyRouteIds({
+        routes: [{ id: "home" }, { id: "news" }],
+        contentInventory: {
+          entries: [{ kind: "company_news" }],
+        },
+      } as never),
+    ).toEqual([]);
+    const failure = designValidationFailure(
+      new Error("SITEOPS_DESIGN_SLOT_ORDER_INVALID"),
+    );
+    expect(failure).toMatchObject({ reason: "SLOT_ORDER_INVALID" });
+    expect(failure.signature).toMatch(/^[a-f0-9]{64}$/u);
+    expect(
+      designRepairPrompt({
+        repairAttempt: 2,
+        maxAttempts: 2,
+        outputFilename: "frontmind-site-design-wire-v3.json",
+        wireVersion: 3,
+        repairReason: failure.reason,
+        hostOwnedEmptyRouteIds: ["news"],
+      }),
+    ).toContain("第 2/2 次修复");
   });
 
   it("propagates an aborted worker signal instead of projecting a terminal build failure", async () => {
@@ -562,6 +600,12 @@ describe("Manus SiteOps provider boundary", () => {
   });
 
   it("creates one task with workflow and visual, then sends phase two to that same task", async () => {
+    const infoLog = vi
+      .spyOn(console, "info")
+      .mockImplementation(() => undefined);
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     const preview = Buffer.from("frozen-preview", "utf8");
     const previewHash = createHash("sha256").update(preview).digest("hex");
     const visualEvidence = createVisualEvidenceV1({
@@ -635,13 +679,21 @@ describe("Manus SiteOps provider boundary", () => {
           audience: ["制造企业"],
           conversionGoal: "联系咨询",
           routes: [
-            {
-              id: "home",
-              slug: "/",
-              title: "首页",
-              sourceDocumentIds: ["overview"],
-            },
-          ],
+            ["home", "/", "首页"],
+            ["about", "/about", "关于我们"],
+            ["products", "/products", "产品"],
+            ["services", "/services", "服务"],
+            ["solutions", "/solutions", "解决方案"],
+            ["cases", "/cases", "案例"],
+            ["faq", "/faq", "常见问题"],
+            ["contact", "/contact", "联系我们"],
+            ["news", "/news", "企业动态"],
+          ].map(([id, slug, title]) => ({
+            id,
+            slug,
+            title,
+            sourceDocumentIds: ["overview"],
+          })),
           verifiedFacts: Array.from({ length: 120 }, (_, index) => ({
             statement: `经过来源核验的企业事实 ${index + 1}`,
             sourceDocumentIds: ["overview"],
@@ -788,13 +840,31 @@ describe("Manus SiteOps provider boundary", () => {
       ...operation,
       input: { ...operation.input, referenceBlueprint },
     };
-    const query: any = {};
-    query.from = () => query;
-    query.innerJoin = () => query;
-    query.where = () => query;
-    query.limit = async () => [context];
+    let resumeSourceOperation: Record<string, unknown> | null = null;
     const db = {
-      select: () => query,
+      select: () => {
+        let selectedTable: unknown;
+        const query: any = {};
+        const rows = () =>
+          selectedTable === siteOperations
+            ? resumeSourceOperation
+              ? [resumeSourceOperation]
+              : []
+            : [context];
+        query.from = (table: unknown) => {
+          selectedTable = table;
+          return query;
+        };
+        query.innerJoin = () => query;
+        query.where = () => query;
+        query.limit = () => query;
+        query.for = async () => rows();
+        query.then = (
+          resolve: (value: unknown[]) => unknown,
+          reject: (error: unknown) => unknown,
+        ) => Promise.resolve(rows()).then(resolve, reject);
+        return query;
+      },
       update: () => ({
         set: () => ({ where: async () => [{ affectedRows: 1 }] }),
       }),
@@ -877,7 +947,17 @@ describe("Manus SiteOps provider boundary", () => {
     expect(created).toMatchObject({
       status: "pending",
       providerTaskId: "manus-task-1",
-      result: { stage: "design_pending", taskId: "manus-task-1" },
+      result: {
+        schemaVersion: 2,
+        stage: "design_pending",
+        taskId: "manus-task-1",
+        attempts: {
+          extraction: 0,
+          design: 0,
+          content: 0,
+          materialization: 0,
+        },
+      },
     });
     expect(createTask).toHaveBeenCalledTimes(1);
     expect(createTask.mock.calls[0]![0]).toMatchObject({
@@ -934,8 +1014,123 @@ describe("Manus SiteOps provider boundary", () => {
     expect(dossier.documents[0].content).toBe("星河智造提供设备服务。");
     expect(dossier.documents).toHaveLength(56);
     expect(dossier.brief.verifiedFacts).toHaveLength(120);
+    expect(
+      dossier.brief.routes.map((route: { id: string }) => route.id),
+    ).toEqual([
+      "home",
+      "about",
+      "products",
+      "services",
+      "solutions",
+      "cases",
+      "faq",
+      "contact",
+    ]);
+    expect(
+      JSON.stringify(createTask.mock.calls[0]![0].structuredOutputSchema),
+    ).not.toContain('"news"');
 
     taskStatus = "stopped";
+    client.listAllMessages.mockResolvedValueOnce([
+      {
+        id: "invalid-design-marker",
+        type: "user_message",
+        timestamp: 0,
+        user_message: {
+          content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT={"operationToken":"siteops-design:${operation.id}"}`,
+        },
+      },
+      {
+        id: "invalid-design-result",
+        type: "structured_output_result",
+        timestamp: 1,
+        structured_output_result: {
+          success: true,
+          value: { ...designResult, siteTitle: "" },
+        },
+      },
+      {
+        id: "invalid-design-stopped",
+        type: "status_update",
+        timestamp: 2,
+        status_update: { agent_status: "stopped" },
+      },
+    ] as never);
+    const repairScheduled = await handler({
+      operation: {
+        ...buildOperation,
+        providerTaskId: "manus-task-1",
+        result: created.result,
+      } as never,
+      signal: new AbortController().signal,
+    });
+    expect(repairScheduled).toMatchObject({
+      status: "pending",
+      result: {
+        schemaVersion: 2,
+        stage: "repair_send_ready",
+        repairKind: "design",
+        repairCategory: "design",
+        repairAttempt: 1,
+        attempts: {
+          extraction: 0,
+          design: 1,
+          content: 0,
+          materialization: 0,
+        },
+        validation: {
+          phase: "design",
+          source: "structured",
+          reason: "TEXT_LIMIT",
+          repeatCount: 0,
+        },
+      },
+    });
+    const repairToken = `siteops-repair:${operation.id}:design:design:1`;
+    client.listAllMessages.mockResolvedValueOnce([
+      {
+        id: "repeat-invalid-design-marker",
+        type: "user_message",
+        timestamp: 0,
+        user_message: {
+          content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({ operationToken: repairToken })}`,
+        },
+      },
+      {
+        id: "repeat-invalid-design-result",
+        type: "structured_output_result",
+        timestamp: 1,
+        structured_output_result: {
+          success: true,
+          value: {
+            ...designResult,
+            operationToken: repairToken,
+            siteTitle: "",
+          },
+        },
+      },
+      {
+        id: "repeat-invalid-design-stopped",
+        type: "status_update",
+        timestamp: 2,
+        status_update: { agent_status: "stopped" },
+      },
+    ] as never);
+    const sendCountBeforeRepeat = sendMessage.mock.calls.length;
+    const repeatedInvalid = await handler({
+      operation: {
+        ...buildOperation,
+        providerTaskId: "manus-task-1",
+        result: { ...repairScheduled.result, stage: "repair_pending" },
+      } as never,
+      signal: new AbortController().signal,
+    });
+    expect(repeatedInvalid).toMatchObject({
+      status: "failed",
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+      result: { validation: { repeatCount: 1 } },
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(sendCountBeforeRepeat);
     const designed = await handler({
       operation: {
         ...buildOperation,
@@ -948,6 +1143,20 @@ describe("Manus SiteOps provider boundary", () => {
       status: "pending",
       result: { stage: "content_send_ready", taskId: "manus-task-1" },
     });
+    expect(
+      (
+        designed.result as {
+          design?: { designSpec: { routeCompositions: unknown[] } };
+        }
+      ).design?.designSpec.routeCompositions,
+    ).toEqual(
+      expect.arrayContaining([
+        {
+          routeId: "news",
+          slots: [{ slotId: "news-empty", variant: "statement" }],
+        },
+      ]),
+    );
 
     const continued = await handler({
       operation: {
@@ -983,6 +1192,9 @@ describe("Manus SiteOps provider boundary", () => {
     expect(sendMessage.mock.calls[0]![0].prompt).toContain(
       "frontmind-page-content-wire-v3.json",
     );
+    expect(
+      JSON.stringify(sendMessage.mock.calls[0]![0].structuredOutputSchema),
+    ).not.toContain('"news"');
     const sendBody = buildManusV2SendMessageBody(sendMessage.mock.calls[0]![0]);
     expect(sendBody.task_id).toBe("manus-task-1");
     expect(sendBody.message.content).toHaveLength(3);
@@ -998,6 +1210,135 @@ describe("Manus SiteOps provider boundary", () => {
         ].includes(input.localAssetId),
       ),
     ).toHaveLength(3);
+
+    const sourceOperationId = "11000000-0000-4000-8000-000000000011";
+    const recoveredToken = `siteops-repair:${sourceOperationId}:design:3`;
+    resumeSourceOperation = {
+      ...buildOperation,
+      id: sourceOperationId,
+      providerTaskId: "manus-task-1",
+      status: "failed",
+      result: {
+        schemaVersion: 1,
+        stage: "repair_pending",
+        taskId: "manus-task-1",
+        repairKind: "design",
+        repairAttempt: 3,
+      },
+      errorCode: "FRONTMIND_BUILD_OUTPUT_INVALID",
+    };
+    client.listAllMessages.mockImplementation(
+      async () =>
+        [
+          {
+            id: "resume-design-marker",
+            type: "user_message",
+            timestamp: 10,
+            user_message: {
+              content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({ operationToken: recoveredToken })}`,
+            },
+          },
+          {
+            id: "resume-design-result",
+            type: "structured_output_result",
+            timestamp: 11,
+            structured_output_result: {
+              success: false,
+              value: { ...designResult, operationToken: recoveredToken },
+              error: { code: "structured_extraction_failed" },
+            },
+          },
+          {
+            id: "resume-design-stopped",
+            type: "status_update",
+            timestamp: 12,
+            status_update: { agent_status: "stopped" },
+          },
+        ] as never,
+    );
+    createTask.mockClear();
+    sendMessage.mockClear();
+    const resumeOperation = {
+      ...buildOperation,
+      id: "12000000-0000-4000-8000-000000000012",
+      kind: "build_revision",
+      providerTaskId: "manus-task-1",
+      result: null,
+      input: {
+        ...buildOperation.input,
+        resumeSourceOperationId: sourceOperationId,
+        resumeProviderTaskId: "manus-task-1",
+        resumeMode: "recover_design_output",
+      },
+    };
+    const resumed = await handler({
+      operation: resumeOperation as never,
+      signal: new AbortController().signal,
+    });
+    expect(resumed).toMatchObject({
+      status: "pending",
+      result: { stage: "content_send_ready", taskId: "manus-task-1" },
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    client.listAllMessages.mockImplementation(
+      async () =>
+        [
+          {
+            id: "resume-invalid-marker",
+            type: "user_message",
+            timestamp: 20,
+            user_message: {
+              content: `FRONTMIND_MANUS_V2_OPERATION_CONTRACT=${JSON.stringify({ operationToken: recoveredToken })}`,
+            },
+          },
+          {
+            id: "resume-invalid-result",
+            type: "structured_output_result",
+            timestamp: 21,
+            structured_output_result: {
+              success: true,
+              value: {
+                ...designResult,
+                operationToken: recoveredToken,
+                siteTitle: "",
+              },
+            },
+          },
+          {
+            id: "resume-invalid-stopped",
+            type: "status_update",
+            timestamp: 22,
+            status_update: { agent_status: "stopped" },
+          },
+        ] as never,
+    );
+    const resumeFailed = await handler({
+      operation: {
+        ...resumeOperation,
+        id: "13000000-0000-4000-8000-000000000013",
+      } as never,
+      signal: new AbortController().signal,
+    });
+    expect(resumeFailed).toMatchObject({
+      status: "failed",
+      code: "FRONTMIND_BUILD_OUTPUT_INVALID",
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    const safeLogs = JSON.stringify([
+      ...infoLog.mock.calls,
+      ...errorLog.mock.calls,
+    ]);
+    expect(safeLogs).toContain("wire_resolution");
+    expect(safeLogs).toContain("wire_normalized");
+    expect(safeLogs).toContain("build_resumed");
+    expect(safeLogs).not.toContain("星河智造");
+    expect(safeLogs).not.toContain("secret-key");
+    expect(safeLogs).not.toContain("siteops-repair:");
+    expect(safeLogs).not.toContain("files.example.test");
   });
 
   it("uses the immutable credential id and version frozen in the operation", async () => {
