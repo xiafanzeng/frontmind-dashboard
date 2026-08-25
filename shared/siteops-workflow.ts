@@ -61,6 +61,51 @@ export type VisualSearchOperationInputV1 = z.infer<
   typeof visualSearchOperationInputV1Schema
 >;
 
+/**
+ * V2 freezes whether a visual search creates the first page or supplements an
+ * already published board. `admissionRevision` is the project revision after
+ * the action was admitted; the provider compares it immediately before the
+ * atomic board commit so a late lease can never overwrite a newer workflow.
+ */
+export const visualSearchOperationInputV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    knowledgeSnapshotId: z.string().uuid(),
+    credentialId: z.string().uuid(),
+    credentialVersion: z.number().int().positive(),
+    workflowVersion: z.string().trim().min(1).max(32),
+    mode: z.enum(["initial", "supplemental"]),
+    page: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+    admissionRevision: z.number().int().nonnegative(),
+  })
+  .strict()
+  .superRefine((input, context) => {
+    const validPage =
+      (input.mode === "initial" && input.page === 1) ||
+      (input.mode === "supplemental" && input.page >= 2);
+    if (!validPage) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["page"],
+        message: "视觉检索模式与候选页码不一致",
+      });
+    }
+  });
+
+export type VisualSearchOperationInputV2 = z.infer<
+  typeof visualSearchOperationInputV2Schema
+>;
+
+/** V1 remains readable for immutable historical operations. */
+export const visualSearchOperationInputSchema = z.union([
+  visualSearchOperationInputV2Schema,
+  visualSearchOperationInputV1Schema,
+]);
+
+export type VisualSearchOperationInput = z.infer<
+  typeof visualSearchOperationInputSchema
+>;
+
 export type TwentyFirstProviderItemId = string | number;
 
 export function providerItemKey(value: TwentyFirstProviderItemId) {
@@ -1066,6 +1111,12 @@ function diverseHeroCandidates(
  */
 export function buildTwentyFirstSearchOnlyFunnel(input: {
   searchEnvelopes: readonly TwentyFirstSearchEnvelope[];
+  /**
+   * A single family-specific supplemental query may deliberately inspect all
+   * eighteen provider results. Callers that omit this retain the historical
+   * twelve-reference funnel.
+   */
+  retrievalLimit?: number;
 }): TwentyFirstSearchOnlyFunnelResult {
   const searchedCandidates = normalizeTwentyFirstSearchResults(
     input.searchEnvelopes,
@@ -1097,10 +1148,16 @@ export function buildTwentyFirstSearchOnlyFunnel(input: {
       candidate.queryAxis === "motion_accessible",
   );
   const supporting = interleaveCandidates(section, motion);
-  const shortlist = eligibleHeroes.slice(
-    0,
-    SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve,
+  const retrievalLimit = Math.max(
+    1,
+    Math.min(
+      Math.trunc(
+        input.retrievalLimit ?? SITEOPS_VISUAL_FUNNEL_TARGETS.retrieve,
+      ),
+      SITEOPS_VISUAL_FUNNEL_TARGETS.search,
+    ),
   );
+  const shortlist = eligibleHeroes.slice(0, retrievalLimit);
   const supportingCandidates = supporting.slice(0, 2);
   const rejectedHero = candidates.filter(
     (candidate) => candidate.catalogRole === "rejected",

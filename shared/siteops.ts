@@ -846,7 +846,9 @@ export const visualSelectionBundleV4Schema = z
   .object({
     schemaVersion: z.literal(4),
     queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/u),
-    searchTarget: z.number().int().min(9).max(72),
+    // Nine primary top-four queries plus nine bounded depth-eighteen
+    // supplemental queries. Persist the truthful requested search budget.
+    searchTarget: z.number().int().min(9).max(198),
     referenceTarget: z.literal(9),
     displayTarget: z.literal(9),
     candidates: z.array(visualCandidateV4Schema).length(9),

@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   knowledgeBaseSnapshots,
   messages,
+  siteOperations,
   siteProjects,
   websiteStyleSampleBatches,
   websiteStyleSamples,
@@ -19,7 +20,7 @@ import {
   buildTwentyFirstSearchOnlyFunnel,
   createVisualEvidenceV1,
   normalizeTwentyFirstSearchResults,
-  visualSearchOperationInputV1Schema,
+  visualSearchOperationInputSchema,
   VISUAL_EVIDENCE_KIND,
   VISUAL_TAXONOMY_DERIVATION_VERSION,
   type NormalizedTwentyFirstCandidate,
@@ -27,6 +28,7 @@ import {
   type TwentyFirstQueryAxis,
   type TwentyFirstQueryRole,
   type TwentyFirstSearchEnvelope,
+  type VisualSearchOperationInput,
 } from "../../shared/siteops-workflow";
 import {
   siteBriefSchema,
@@ -76,6 +78,8 @@ export type TwentyFirstProviderContext = {
   snapshot: KnowledgeBaseSnapshot;
   brief: SiteBrief;
   existingBoard: ExistingBoard | null;
+  /** Complete published pages observed while the operation context is loaded. */
+  publishedPageCount?: number;
   previousReferences?: {
     providerItemKeys: string[];
     previewSha256s: string[];
@@ -118,6 +122,13 @@ type FrontMindBoardCandidate = {
   referenceBlueprint: ReferenceBlueprintV4;
   score: number;
   rationale: string;
+};
+
+export type ResolvedVisualSearchPlan = {
+  schemaVersion: 1 | 2;
+  mode: "initial" | "supplemental";
+  page: 1 | 2 | 3;
+  admissionRevision: number;
 };
 
 type PreviewRejectionReason =
@@ -169,6 +180,7 @@ export type SafeVisualDiversitySummary = {
 
 export type TwentyFirstBoardPersistenceInput = {
   operation: SiteOperation;
+  searchPlan: ResolvedVisualSearchPlan;
   context: TwentyFirstProviderContext;
   selectionBundle: z.infer<typeof visualSelectionBundleV4Schema>;
   selectionBundleArtifact: PreviewArtifact;
@@ -337,6 +349,62 @@ function operationMarker(operationId: string) {
   return `${OPERATION_MARKER_PREFIX}${operationId}`;
 }
 
+function visualSearchSuperseded() {
+  return new TwentyFirstProviderFailure(
+    "VISUAL_SEARCH_SUPERSEDED",
+    "本次视觉候选生成已被更新的流程替代。",
+    "failed",
+  );
+}
+
+export function resolveVisualSearchPlan(
+  input: VisualSearchOperationInput,
+  context: TwentyFirstProviderContext,
+): ResolvedVisualSearchPlan {
+  if ("schemaVersion" in input) {
+    if (
+      context.project.revision !== input.admissionRevision ||
+      (context.publishedPageCount !== undefined &&
+        context.publishedPageCount !== input.page - 1)
+    ) {
+      throw visualSearchSuperseded();
+    }
+    return {
+      schemaVersion: 2,
+      mode: input.mode,
+      page: input.page,
+      admissionRevision: input.admissionRevision,
+    };
+  }
+
+  // Immutable V1 tasks did not freeze page coordinates. Default contexts can
+  // recover them from already published complete pages; injected legacy test
+  // contexts fall back to the durable reference count.
+  const publishedPages =
+    context.publishedPageCount ??
+    Math.floor(
+      (context.previousReferences?.providerItemKeys.length ?? 0) /
+        SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+    );
+  if (publishedPages >= SITEOPS_VISUAL_CANDIDATE_MAX_PAGES) {
+    throw new TwentyFirstProviderFailure(
+      "VISUAL_CANDIDATE_PAGE_LIMIT_REACHED",
+      "本轮已生成全部 27 个视觉候选，请直接选择视觉方向。",
+      "attention_required",
+    );
+  }
+  const page = (publishedPages + 1) as 1 | 2 | 3;
+  return {
+    schemaVersion: 1,
+    mode: page === 1 ? "initial" : "supplemental",
+    page,
+    // V1 did not persist an admission revision. Freeze the revision observed
+    // for this invocation so a historical lease cannot overwrite a project
+    // that advances while provider work is in flight.
+    admissionRevision: context.project.revision,
+  };
+}
+
 async function loadDefaultContext(
   db: any,
   operation: SiteOperation,
@@ -347,7 +415,7 @@ async function loadDefaultContext(
       "该操作不是有效的 FrontMind 视觉检索任务。",
     );
   }
-  const input = visualSearchOperationInputV1Schema.parse(operation.input);
+  const input = visualSearchOperationInputSchema.parse(operation.input);
   const projectRows = await db
     .select()
     .from(siteProjects)
@@ -398,7 +466,10 @@ async function loadDefaultContext(
     };
   }
   const priorSampleRows = await db
-    .select({ sourceMetadata: websiteStyleSamples.sourceMetadata })
+    .select({
+      batchId: websiteStyleSamples.batchId,
+      sourceMetadata: websiteStyleSamples.sourceMetadata,
+    })
     .from(websiteStyleSamples)
     .innerJoin(
       websiteStyleSampleBatches,
@@ -436,11 +507,21 @@ async function loadDefaultContext(
       "知识库 ZIP 快照缺少有效归档哈希。",
     );
   }
+  const publishedSamplesByBatch = new Map<string, number>();
+  for (const row of priorSampleRows as Array<{ batchId: string }>) {
+    publishedSamplesByBatch.set(
+      row.batchId,
+      (publishedSamplesByBatch.get(row.batchId) ?? 0) + 1,
+    );
+  }
   return {
     project,
     snapshot,
     brief: resolveSiteBrief(project, snapshot),
     existingBoard,
+    publishedPageCount: [...publishedSamplesByBatch.values()].filter(
+      (sampleCount) => sampleCount === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+    ).length,
     previousReferences: {
       providerItemKeys: priorMetadata.flatMap((metadata) =>
         typeof metadata.providerItemKey === "string"
@@ -530,9 +611,10 @@ type FamilySearchRound = "primary" | "supplemental";
 type FamilySearchQuery = {
   family: FrontMindVisualFamily;
   round: FamilySearchRound;
+  page: 1 | 2 | 3;
   role: "foundation";
   axis: "foundation_split" | "foundation_editorial_modular";
-  limit: 4;
+  limit: 4 | 18;
   query: string;
 };
 
@@ -582,6 +664,24 @@ const FAMILY_SEARCH_TERMS: Record<
     "full screen landing page hero big headline minimal",
   ],
 };
+
+/**
+ * Fixed provider-safe variants prevent a supplemental page from replaying the
+ * exact first-page query. These fragments are code-owned allowlist values;
+ * neither provider output nor customer prose can select a new query strategy.
+ */
+const FAMILY_PAGE_QUERY_VARIANTS: Record<1 | 2 | 3, readonly [string, string]> =
+  {
+    1: ["", ""],
+    2: [
+      "alternative original composition reference",
+      "distinct less common composition reference",
+    ],
+    3: [
+      "fresh independent composition reference",
+      "uncommon experimental composition reference",
+    ],
+  };
 
 type FamilyEligibilityRule = {
   /** Query provenance is never a positive signal. These expressions run only
@@ -826,17 +926,23 @@ function safeFamilySearchContext(brief: SiteBrief) {
 function composeFamilySearchQuery(input: {
   family: FrontMindVisualFamily;
   round: FamilySearchRound;
+  page: 1 | 2 | 3;
   brief: SiteBrief;
 }): FamilySearchQuery {
   const terms = FAMILY_SEARCH_TERMS[input.family];
+  const termIndex = input.round === "primary" ? 0 : 1;
+  const pageVariant = FAMILY_PAGE_QUERY_VARIANTS[input.page][termIndex];
   const context = safeFamilySearchContext(input.brief);
   return {
     family: input.family,
     round: input.round,
+    page: input.page,
     role: "foundation",
     axis: familyQueryAxis(input.family),
-    limit: 4,
-    query: `${terms[input.round === "primary" ? 0 : 1]}${context ? ` for ${context}` : ""}`,
+    // Supplemental pages first make the same bounded top-four probe, then only
+    // missing families expand through the page-specific fallback to depth 18.
+    limit: input.page === 1 || input.round === "primary" ? 4 : 18,
+    query: `${terms[termIndex]}${pageVariant ? ` ${pageVariant}` : ""}${context ? ` for ${context}` : ""}`,
   };
 }
 
@@ -851,6 +957,7 @@ async function searchFamilyRound(input: {
   brief: SiteBrief;
   families: readonly FrontMindVisualFamily[];
   round: FamilySearchRound;
+  page: 1 | 2 | 3;
   pools: FamilyReferencePools;
   queries: FamilySearchQuery[];
   searchedCandidates: Map<
@@ -871,6 +978,7 @@ async function searchFamilyRound(input: {
     const query = composeFamilySearchQuery({
       family,
       round: input.round,
+      page: input.page,
       brief: input.brief,
     });
     const envelope: TwentyFirstSearchEnvelope = {
@@ -894,6 +1002,7 @@ async function searchFamilyRound(input: {
     }
     const funnel = buildTwentyFirstSearchOnlyFunnel({
       searchEnvelopes: [envelope],
+      retrievalLimit: query.limit,
     });
     const pool = input.pools.get(family)!;
     const existingKeys = new Set(pool.map((item) => item.providerItemKey));
@@ -1447,6 +1556,9 @@ async function persistDefaultBoard(
     );
   }
   return db.transaction(async (tx: any): Promise<ExistingBoard> => {
+    // Keep the same lock order as customer actions: project, published visual
+    // batches, then the active operation. This avoids a project↔operation
+    // deadlock when a click races the final board commit.
     const lockedRows = await tx
       .select()
       .from(siteProjects)
@@ -1461,13 +1573,24 @@ async function persistDefaultBoard(
     const project = lockedRows[0];
     if (
       !project ||
-      project.currentKnowledgeSnapshotId !== input.context.snapshot.id
+      project.currentKnowledgeSnapshotId !== input.context.snapshot.id ||
+      project.revision !== input.searchPlan.admissionRevision
     ) {
-      throw new TwentyFirstProviderFailure(
-        "STALE_KNOWLEDGE_SNAPSHOT",
-        "知识库版本已变化，请重新开始视觉检索。",
-      );
+      throw visualSearchSuperseded();
     }
+    const currentPublishedRows = await tx
+      .select({ id: websiteStyleSampleBatches.id })
+      .from(websiteStyleSampleBatches)
+      .where(
+        and(
+          eq(websiteStyleSampleBatches.siteProjectId, project.id),
+          eq(websiteStyleSampleBatches.userId, input.operation.userId),
+          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+          eq(websiteStyleSampleBatches.status, "published"),
+        ),
+      )
+      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .for("update");
     const marker = operationMarker(input.operation.id);
     const existingRows = await tx
       .select()
@@ -1481,6 +1604,39 @@ async function persistDefaultBoard(
       )
       .limit(1)
       .for("update");
+    const operationRows = await tx
+      .select()
+      .from(siteOperations)
+      .where(eq(siteOperations.id, input.operation.id))
+      .limit(1)
+      .for("update");
+    const leasedOperation = operationRows[0];
+    if (
+      !leasedOperation ||
+      leasedOperation.status !== "running" ||
+      !input.operation.leaseOwner ||
+      leasedOperation.leaseOwner !== input.operation.leaseOwner ||
+      !leasedOperation.leaseExpiresAt ||
+      leasedOperation.leaseExpiresAt.getTime() <= Date.now()
+    ) {
+      throw visualSearchSuperseded();
+    }
+    const frozenOperationInput = visualSearchOperationInputSchema.safeParse(
+      leasedOperation.input,
+    );
+    if (
+      !frozenOperationInput.success ||
+      frozenOperationInput.data.knowledgeSnapshotId !==
+        input.context.snapshot.id ||
+      canonicalSha256(frozenOperationInput.data) !==
+        canonicalSha256(input.operation.input) ||
+      leasedOperation.projectId !== input.context.project.id ||
+      leasedOperation.userId !== input.operation.userId ||
+      leasedOperation.kind !== "visual_search" ||
+      leasedOperation.provider !== "21st"
+    ) {
+      throw visualSearchSuperseded();
+    }
     if (existingRows[0]) {
       const sampleRows = await tx
         .select({ id: websiteStyleSamples.id })
@@ -1496,19 +1652,9 @@ async function persistDefaultBoard(
       .select({ ordinal: max(websiteStyleSampleBatches.ordinal) })
       .from(websiteStyleSampleBatches)
       .where(eq(websiteStyleSampleBatches.userId, input.operation.userId));
-    const currentPublishedRows = await tx
-      .select({ id: websiteStyleSampleBatches.id })
-      .from(websiteStyleSampleBatches)
-      .where(
-        and(
-          eq(websiteStyleSampleBatches.siteProjectId, project.id),
-          eq(websiteStyleSampleBatches.userId, input.operation.userId),
-          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-          eq(websiteStyleSampleBatches.status, "published"),
-        ),
-      )
-      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
-      .for("update");
+    if (currentPublishedRows.length !== input.searchPlan.page - 1) {
+      throw visualSearchSuperseded();
+    }
     if (currentPublishedRows.length >= SITEOPS_VISUAL_CANDIDATE_MAX_PAGES) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_CANDIDATE_PAGE_LIMIT_REACHED",
@@ -1582,7 +1728,10 @@ async function persistDefaultBoard(
       turnId: input.operation.conversationTurnId,
       userId: input.operation.userId,
       role: "assistant",
-      content: "已准备 9 个不同风格的视觉候选，请选择一个方向。",
+      content:
+        input.searchPlan.page === 1
+          ? "已准备 9 个不同风格的视觉候选，请选择一个方向。"
+          : `第 ${input.searchPlan.page} 组 9 个全新视觉候选已准备完成，请选择一个方向。`,
       sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
       metadata: {
         siteOps: {
@@ -1592,6 +1741,8 @@ async function persistDefaultBoard(
           status: "active",
           payload: {
             batchId,
+            mode: input.searchPlan.mode,
+            page: input.searchPlan.page,
             candidateCount: input.mirroredCandidates.length,
             targets: [18, 9],
             degradedReasons: input.selectionBundle.degradedReasons,
@@ -1607,7 +1758,12 @@ async function persistDefaultBoard(
         revision: project.revision + 1,
         updatedAt: now,
       })
-      .where(eq(siteProjects.id, project.id));
+      .where(
+        and(
+          eq(siteProjects.id, project.id),
+          eq(siteProjects.revision, project.revision),
+        ),
+      );
     return {
       batchId,
       candidateCount: input.mirroredCandidates.length,
@@ -1700,6 +1856,17 @@ function safeProviderFailure(
   };
 }
 
+async function assertCommitLeaseActive(
+  assertLeaseActive: (() => Promise<void>) | undefined,
+) {
+  if (!assertLeaseActive) return;
+  try {
+    await assertLeaseActive();
+  } catch {
+    throw visualSearchSuperseded();
+  }
+}
+
 export function createTwentyFirstSiteOpsProviderHandler(
   dependencies: TwentyFirstProviderDependencies = {},
 ): SiteOpsProviderHandler {
@@ -1715,12 +1882,12 @@ export function createTwentyFirstSiteOpsProviderHandler(
     dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
 
-  return async ({ operation, signal }) => {
+  return async ({ operation, signal, assertLeaseActive }) => {
     let stage: VisualSearchStage = "validate_operation";
     let activeApiKey: string | undefined;
     const diagnostics = createVisualSearchDiagnostics();
     try {
-      const parsedInput = visualSearchOperationInputV1Schema.parse(
+      const parsedInput = visualSearchOperationInputSchema.parse(
         operation.input,
       );
       stage = "load_context";
@@ -1756,6 +1923,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           message: "视觉方向已恢复，可继续选择。",
         };
       }
+      const searchPlan = resolveVisualSearchPlan(parsedInput, context);
       stage = "load_credential";
       const credential = await getCredential(parsedInput.credentialId);
       if (!credential || credential.version !== parsedInput.credentialVersion) {
@@ -1788,20 +1956,14 @@ export function createTwentyFirstSiteOpsProviderHandler(
             context.previousReferences?.perceptualHashes ?? [],
           );
           const supplementedFamilies = new Set<FrontMindVisualFamily>();
-          const mirrorNewCandidates = async () => {
-            const unique = new Map<string, NormalizedTwentyFirstCandidate>();
-            for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
-              for (const candidate of pools.get(family) ?? []) {
-                if (!attemptedProviderKeys.has(candidate.providerItemKey)) {
-                  unique.set(candidate.providerItemKey, candidate);
-                }
-              }
-            }
-            const candidates = [...unique.values()];
+          const mirrorCandidateSet = async (
+            candidates: NormalizedTwentyFirstCandidate[],
+          ) => {
             for (const candidate of candidates) {
               attemptedProviderKeys.add(candidate.providerItemKey);
             }
             if (candidates.length < 1) return;
+            await assertCommitLeaseActive(assertLeaseActive);
             stage = "mirror_previews";
             mirrored.push(
               ...(await mirrorCandidates({
@@ -1817,6 +1979,54 @@ export function createTwentyFirstSiteOpsProviderHandler(
               })),
             );
           };
+          const mirrorAllNewCandidates = async () => {
+            const unique = new Map<string, NormalizedTwentyFirstCandidate>();
+            for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+              for (const candidate of pools.get(family) ?? []) {
+                if (!attemptedProviderKeys.has(candidate.providerItemKey)) {
+                  unique.set(candidate.providerItemKey, candidate);
+                }
+              }
+            }
+            await mirrorCandidateSet([...unique.values()]);
+            return assignDistinctMirroredReferences({ pools, mirrored });
+          };
+          let supplementalMirrorAttempts = 0;
+          const mirrorSupplementalUntil = async (attemptBudget: number) => {
+            let assigned = assignDistinctMirroredReferences({
+              pools,
+              mirrored,
+            });
+            while (
+              supplementalMirrorAttempts < attemptBudget &&
+              assigned.size < FRONTMIND_VISUAL_FAMILIES_V3.length
+            ) {
+              const scheduledKeys = new Set<string>();
+              const candidates: NormalizedTwentyFirstCandidate[] = [];
+              for (const family of FRONTMIND_VISUAL_FAMILIES_V3) {
+                if (assigned.has(family)) continue;
+                const candidate = (pools.get(family) ?? []).find(
+                  (item) =>
+                    !attemptedProviderKeys.has(item.providerItemKey) &&
+                    !scheduledKeys.has(item.providerItemKey),
+                );
+                if (!candidate) continue;
+                scheduledKeys.add(candidate.providerItemKey);
+                candidates.push(candidate);
+                if (
+                  supplementalMirrorAttempts + candidates.length >=
+                  attemptBudget
+                ) {
+                  break;
+                }
+              }
+              if (candidates.length < 1) break;
+              await mirrorCandidateSet(candidates);
+              supplementalMirrorAttempts += candidates.length;
+              assigned = assignDistinctMirroredReferences({ pools, mirrored });
+            }
+            return assigned;
+          };
 
           stage = "mcp_retrieval";
           await searchFamilyRound({
@@ -1824,6 +2034,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
             brief: context.brief,
             families: FRONTMIND_VISUAL_FAMILIES_V3,
             round: "primary",
+            page: searchPlan.page,
             pools,
             queries,
             searchedCandidates,
@@ -1842,6 +2053,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
               brief: context.brief,
               families: provisionallyMissing,
               round: "supplemental",
+              page: searchPlan.page,
               pools,
               queries,
               searchedCandidates,
@@ -1853,8 +2065,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
               supplementedFamilies.add(family),
             );
           }
-          await mirrorNewCandidates();
-          let assigned = assignDistinctMirroredReferences({ pools, mirrored });
+          let assigned =
+            searchPlan.mode === "supplemental"
+              ? await mirrorSupplementalUntil(18)
+              : await mirrorAllNewCandidates();
           const missingAfterMirror = FRONTMIND_VISUAL_FAMILIES_V3.filter(
             (family) =>
               !assigned.has(family) && !supplementedFamilies.has(family),
@@ -1866,6 +2080,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
               brief: context.brief,
               families: missingAfterMirror,
               round: "supplemental",
+              page: searchPlan.page,
               pools,
               queries,
               searchedCandidates,
@@ -1876,9 +2091,11 @@ export function createTwentyFirstSiteOpsProviderHandler(
             missingAfterMirror.forEach((family) =>
               supplementedFamilies.add(family),
             );
-            await mirrorNewCandidates();
-            assigned = assignDistinctMirroredReferences({ pools, mirrored });
           }
+          assigned =
+            searchPlan.mode === "supplemental"
+              ? await mirrorSupplementalUntil(36)
+              : await mirrorAllNewCandidates();
           refreshRetrievalDiagnostics({
             pools,
             searchedCandidates,
@@ -1898,6 +2115,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
         );
       }
       const degradedReasons: string[] = [];
+      await assertCommitLeaseActive(assertLeaseActive);
       stage = "render_host_previews";
       const mirroredCandidates = await createFrontMindBoardCandidates({
         operation,
@@ -1914,6 +2132,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
       if (rejectedPreviews > 0) {
         degradedReasons.push(`PREVIEW_RESULTS_REJECTED:${rejectedPreviews}`);
       }
+      await assertCommitLeaseActive(assertLeaseActive);
       stage = "persist_selection_bundle";
       const selectionBundle = visualSelectionBundleV4Schema.parse({
         schemaVersion: 4,
@@ -1970,9 +2189,11 @@ export function createTwentyFirstSiteOpsProviderHandler(
           "attention_required",
         );
       }
+      await assertCommitLeaseActive(assertLeaseActive);
       stage = "persist_board";
       const board = await persistBoard(db, {
         operation,
+        searchPlan,
         context,
         selectionBundle,
         selectionBundleArtifact,
@@ -1983,6 +2204,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
         projectStatus: "awaiting_visual_selection",
         result: {
           batchId: board.batchId,
+          mode: searchPlan.mode,
+          page: searchPlan.page,
           candidateCount: board.candidateCount,
           selectionBundleHash: board.selectionBundleHash ?? undefined,
           actual: {

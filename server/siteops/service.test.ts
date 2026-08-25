@@ -5,6 +5,7 @@ import {
   assertSiteOpsDeploymentTargetAvailable,
   assertCurrentVisualWorkflowVersion,
   assertSiteOpsSnapshotChangeState,
+  completePublishedVisualPageCount,
   createVisualSearchOperationInput,
   currentSiteOpsBuildWorkflowCoordinates,
   freezeSiteOpsCustomerAiCredential,
@@ -16,6 +17,8 @@ import {
   isSiteOpsStoppedProviderTaskResetSafe,
   normalizeSiteOpsDomain,
   parseSiteOpsActionPayload,
+  projectSiteOpsVisualGeneration,
+  projectSiteOpsObservationStatuses,
   projectSiteOpsExecutionSteps,
   referenceBlueprintForSiteOpsRevision,
   requireAcceptedSiteOpsRebuild,
@@ -26,6 +29,7 @@ import {
   siteOpsResetCredentialScope,
   siteOpsResetCapability,
   siteOpsServiceErrorFromQuota,
+  siteOpsVisualSelectionRecovery,
   SiteOpsServiceError,
   visualSearchAllowedForProjectStatus,
   visualSearchReadiness,
@@ -408,6 +412,156 @@ describe("SiteOps core contracts", () => {
       "knowledgeSnapshotId",
       "workflowVersion",
     ]);
+  });
+
+  it("creates a strict V2 supplemental visual operation pinned to the admitted revision", () => {
+    expect(
+      createVisualSearchOperationInput({
+        schemaVersion: 2,
+        knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+        credentialId: "20000000-0000-4000-8000-000000000002",
+        credentialVersion: 7,
+        workflowVersion: "1.2.0",
+        mode: "supplemental",
+        page: 2,
+        admissionRevision: 9,
+      }),
+    ).toMatchObject({
+      schemaVersion: 2,
+      mode: "supplemental",
+      page: 2,
+      admissionRevision: 9,
+    });
+    expect(() =>
+      createVisualSearchOperationInput({
+        schemaVersion: 2,
+        knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+        credentialId: "20000000-0000-4000-8000-000000000002",
+        credentialVersion: 7,
+        workflowVersion: "1.2.0",
+        mode: "initial",
+        page: 2,
+        admissionRevision: 9,
+      }),
+    ).toThrow();
+  });
+
+  it("separates supplemental generation from selection and recovers a terminal legacy board", () => {
+    const operationInput = {
+      schemaVersion: 2,
+      knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+      credentialId: "20000000-0000-4000-8000-000000000002",
+      credentialVersion: 7,
+      workflowVersion: "1.2.0",
+      mode: "supplemental",
+      page: 2,
+      admissionRevision: 9,
+    };
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "awaiting_visual_selection",
+        generatedPages: 1,
+        latestVisualOperation: { status: "running", input: operationInput },
+        hasActiveVisualOperation: true,
+        hasActiveBuild: false,
+      }),
+    ).toMatchObject({
+      status: "generating",
+      targetPage: 2,
+      canGenerateMore: false,
+      canSelectExisting: false,
+    });
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "attention_required",
+        generatedPages: 1,
+        latestVisualOperation: {
+          status: "attention_required",
+          input: operationInput,
+        },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+      }),
+    ).toMatchObject({
+      status: "retryable_error",
+      targetPage: null,
+      canGenerateMore: true,
+      canSelectExisting: true,
+      recoveredSelection: true,
+    });
+  });
+
+  it("requires a complete board, terminal visual operation and no active work for compatibility selection", () => {
+    const recoverable = {
+      projectStatus: "failed",
+      completePublishedPages: 1,
+      latestVisualOperationStatus: "failed",
+      hasActiveVisualOperation: false,
+      hasActiveBuild: false,
+    };
+    expect(siteOpsVisualSelectionRecovery(recoverable)).toBe(true);
+    expect(
+      siteOpsVisualSelectionRecovery({
+        ...recoverable,
+        hasActiveVisualOperation: true,
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsVisualSelectionRecovery({
+        ...recoverable,
+        completePublishedPages: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not recover visual selection from a selected display fallback after a terminal build failure", () => {
+    const selectedBatchId = "selected-batch";
+    const generatedPages = completePublishedVisualPageCount({
+      batches: [{ id: selectedBatchId, status: "selected" }],
+      candidates: Array.from({ length: 9 }, () => ({
+        batchId: selectedBatchId,
+      })),
+    });
+
+    expect(generatedPages).toBe(0);
+    for (const projectStatus of ["failed", "attention_required"]) {
+      expect(
+        projectSiteOpsVisualGeneration({
+          projectStatus,
+          generatedPages,
+          latestVisualOperation: { status: "succeeded" },
+          hasActiveVisualOperation: false,
+          hasActiveBuild: false,
+        }),
+      ).toMatchObject({
+        status: "idle",
+        generatedPages: 0,
+        canGenerateMore: false,
+        canSelectExisting: false,
+        recoveredSelection: false,
+      });
+    }
+  });
+
+  it("projects both the project and interaction state when a legacy board is recovered", () => {
+    expect(
+      projectSiteOpsObservationStatuses({
+        projectStatus: "attention_required",
+        recoveredSelection: true,
+      }),
+    ).toEqual({
+      projectStatus: "awaiting_visual_selection",
+      interactionState: "awaiting_visual_selection",
+    });
+    expect(
+      projectSiteOpsObservationStatuses({
+        projectStatus: "draft",
+        recoveredSelection: false,
+      }),
+    ).toEqual({
+      projectStatus: "draft",
+      interactionState: "select_snapshot",
+    });
   });
 
   it("hashes canonical object keys while preserving meaningful array order", () => {

@@ -6,7 +6,11 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { SiteOpsObservationV1 } from "@shared/siteops-contract";
+import {
+  siteOpsVisualGenerationProjectionSchema,
+  type SiteOpsObservationV1,
+} from "@shared/siteops-contract";
+import { newestSiteOpsObservation } from "./ConnectedSiteOpsConversationPanel";
 import SiteOpsConversationPanel from "./SiteOpsConversationPanel";
 
 function observation(
@@ -91,9 +95,12 @@ function observation(
     ],
     visualCandidatePages: [],
     visualGeneration: {
+      status: "idle",
+      targetPage: null,
       generatedPages: 0,
       maxPages: 3,
       canGenerateMore: true,
+      canSelectExisting: true,
     },
     executionSteps: [],
     builds: [],
@@ -133,6 +140,84 @@ function visualPage(page: 1 | 2 | 3) {
 }
 
 describe("SiteOpsConversationPanel", () => {
+  it("defaults legacy visual generation observations to the idle selectable state", () => {
+    expect(
+      siteOpsVisualGenerationProjectionSchema.parse({
+        generatedPages: 1,
+        maxPages: 3,
+        canGenerateMore: true,
+      }),
+    ).toEqual({
+      status: "idle",
+      targetPage: null,
+      generatedPages: 1,
+      maxPages: 3,
+      canGenerateMore: true,
+      canSelectExisting: true,
+    });
+  });
+
+  it("accepts observations monotonically by project revision then message sequence", () => {
+    const current = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 10,
+    });
+    const olderRevision = observation({
+      project: { ...observation().project, revision: 4 },
+      latestSequence: 100,
+    });
+    const olderSequence = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 9,
+    });
+    const equalCursor = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 10,
+      interactionState: "failed",
+    });
+    const newerRevision = observation({
+      project: { ...observation().project, revision: 6 },
+      latestSequence: 1,
+    });
+
+    expect(newestSiteOpsObservation(current, olderRevision)).toBe(current);
+    expect(newestSiteOpsObservation(current, olderSequence)).toBe(current);
+    expect(newestSiteOpsObservation(current, equalCursor)).toBe(current);
+    expect(newestSiteOpsObservation(current, newerRevision)).toBe(
+      newerRevision,
+    );
+  });
+
+  it("accepts only the terminal visual transition at an equal project and message cursor", () => {
+    const generating = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 10,
+      visualGeneration: {
+        status: "generating",
+        targetPage: 2,
+        generatedPages: 1,
+        maxPages: 3,
+        canGenerateMore: false,
+        canSelectExisting: false,
+      },
+    });
+    const finalized = observation({
+      project: { ...observation().project, revision: 5 },
+      latestSequence: 10,
+      visualGeneration: {
+        status: "idle",
+        targetPage: null,
+        generatedPages: 2,
+        maxPages: 3,
+        canGenerateMore: true,
+        canSelectExisting: true,
+      },
+    });
+
+    expect(newestSiteOpsObservation(generating, finalized)).toBe(finalized);
+    expect(newestSiteOpsObservation(finalized, generating)).toBe(finalized);
+  });
+
   it("uses structured workflow actions without a persistent conversation composer", () => {
     render(
       <SiteOpsConversationPanel
@@ -397,9 +482,12 @@ describe("SiteOpsConversationPanel", () => {
             candidates: page.candidates.slice(),
           })),
           visualGeneration: {
+            status: "idle",
+            targetPage: null,
             generatedPages: 3,
             maxPages: 3,
             canGenerateMore: false,
+            canSelectExisting: true,
           },
         })}
         onAction={onAction}
@@ -426,6 +514,159 @@ describe("SiteOpsConversationPanel", () => {
         cardKind: "visual_board",
       }),
     );
+  });
+
+  it("keeps existing visual pages visible but locked while a supplemental page generates", () => {
+    const page = visualPage(1);
+    const progressMessage = {
+      id: "visual-progress-2",
+      role: "assistant" as const,
+      content: "正在生成第 2 组全新视觉候选；前面展示过的参考不会重复。",
+      sequence: 2,
+      metadata: {
+        siteOps: {
+          kind: "build_progress" as const,
+          subjectId: "visual-operation-2",
+          revision: 3,
+          status: "active" as const,
+          payload: { stage: "visual_searching" },
+        },
+      },
+      sentAt: "2026-08-22T00:01:00.000Z",
+    };
+
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          messages: [...observation().messages, progressMessage],
+          visualCandidates: page.candidates.slice(),
+          visualCandidatePages: [
+            { ...page, candidates: page.candidates.slice() },
+          ],
+          visualGeneration: {
+            status: "generating",
+            targetPage: 2,
+            generatedPages: 1,
+            maxPages: 3,
+            canGenerateMore: true,
+            canSelectExisting: false,
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "9 个视觉候选" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "第 1 组" })).toBeEnabled();
+    expect(screen.getByAltText("P1-A：第 1 组 A")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "选择 P1-A" })).toBeDisabled();
+    const generatingButton = screen.getByRole("button", {
+      name: "正在生成第 2 组",
+    });
+    expect(generatingButton).toBeDisabled();
+    expect(generatingButton.querySelector(".siteops-spin")).not.toBeNull();
+    expect(screen.getByText(progressMessage.content)).toBeInTheDocument();
+  });
+
+  it("unlocks existing candidates after a retryable supplemental failure and hides stale progress", () => {
+    const page = visualPage(1);
+    const progressMessage = {
+      id: "visual-progress-failed",
+      role: "assistant" as const,
+      content: "正在生成第 2 组全新视觉候选；前面展示过的参考不会重复。",
+      sequence: 2,
+      metadata: {
+        siteOps: {
+          kind: "build_progress" as const,
+          subjectId: "visual-operation-failed",
+          revision: 3,
+          status: "active" as const,
+          payload: { stage: "visual_searching" },
+        },
+      },
+      sentAt: "2026-08-22T00:01:00.000Z",
+    };
+
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          messages: [...observation().messages, progressMessage],
+          visualCandidates: page.candidates.slice(),
+          visualCandidatePages: [
+            { ...page, candidates: page.candidates.slice() },
+          ],
+          visualGeneration: {
+            status: "retryable_error",
+            targetPage: null,
+            generatedPages: 1,
+            maxPages: 3,
+            canGenerateMore: true,
+            canSelectExisting: true,
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText(progressMessage.content)).toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain(
+      "本次未能生成完整的新一组",
+    );
+    expect(screen.getByRole("button", { name: "选择 P1-A" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "重新生成 9 个视觉候选" }),
+    ).toBeEnabled();
+  });
+
+  it("switches to a newly completed visual page and unlocks its candidates", () => {
+    const first = visualPage(1);
+    const second = visualPage(2);
+    const { rerender } = render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          visualCandidates: first.candidates.slice(),
+          visualCandidatePages: [
+            { ...first, candidates: first.candidates.slice() },
+          ],
+          visualGeneration: {
+            status: "generating",
+            targetPage: 2,
+            generatedPages: 1,
+            maxPages: 3,
+            canGenerateMore: true,
+            canSelectExisting: false,
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    rerender(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, revision: 4 },
+          visualCandidates: second.candidates.slice(),
+          visualCandidatePages: [
+            { ...first, candidates: first.candidates.slice() },
+            { ...second, candidates: second.candidates.slice() },
+          ],
+          visualGeneration: {
+            status: "idle",
+            targetPage: null,
+            generatedPages: 2,
+            maxPages: 3,
+            canGenerateMore: true,
+            canSelectExisting: true,
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByAltText("P2-A：第 2 组 A")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "选择 P2-A" })).toBeEnabled();
   });
 
   it("renders Markdown messages with timestamps and freezes completed stage durations", () => {

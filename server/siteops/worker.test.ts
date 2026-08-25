@@ -7,6 +7,9 @@ import {
   knownSiteOpsBuildFailure,
   parseSiteOpsBuildArtifactBindings,
   siteOpsBuildArtifactProjection,
+  siteOpsInitialVisualSupersededMayStaySilent,
+  siteOpsSupplementalVisualFailureMayRecover,
+  siteOpsVisualOperationCoordinates,
   siteOpsWorkerMayClaimStatus,
   siteOpsWorkerExecutionPolicy,
   terminalSiteOpsOperationProjection,
@@ -292,6 +295,95 @@ describe("SiteOps worker claim boundary", () => {
     expect(siteOpsWorkerMayClaimStatus("running")).toBe(true);
     expect(siteOpsWorkerMayClaimStatus("cancelled")).toBe(false);
     expect(siteOpsWorkerMayClaimStatus("failed")).toBe(false);
+  });
+
+  it("reads V2 visual coordinates and infers historical supplemental operations", () => {
+    expect(
+      siteOpsVisualOperationCoordinates({
+        operationInput: {
+          schemaVersion: 2,
+          knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+          credentialId: "20000000-0000-4000-8000-000000000002",
+          credentialVersion: 3,
+          workflowVersion: "1.2.0",
+          mode: "supplemental",
+          page: 2,
+          admissionRevision: 9,
+        },
+        completePublishedPages: 1,
+      }),
+    ).toEqual({ mode: "supplemental", page: 2, admissionRevision: 9 });
+    expect(
+      siteOpsVisualOperationCoordinates({
+        operationInput: {
+          knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+          credentialId: "20000000-0000-4000-8000-000000000002",
+          credentialVersion: 3,
+          workflowVersion: "1.2.0",
+        },
+        completePublishedPages: 1,
+      }),
+    ).toEqual({ mode: "supplemental", page: 2, admissionRevision: null });
+  });
+
+  it("recovers only a current supplemental failure with a complete existing board", () => {
+    const recoverable = {
+      mode: "supplemental" as const,
+      completePublishedPages: 1,
+      projectStatus: "awaiting_visual_selection",
+      projectRevision: 9,
+      admissionRevision: 9,
+      hasActiveVisualOperation: false,
+      hasActiveBuild: false,
+      errorCode: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
+    };
+    expect(siteOpsSupplementalVisualFailureMayRecover(recoverable)).toBe(true);
+    expect(
+      siteOpsSupplementalVisualFailureMayRecover({
+        ...recoverable,
+        projectRevision: 10,
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsSupplementalVisualFailureMayRecover({
+        ...recoverable,
+        errorCode: "VISUAL_SEARCH_SUPERSEDED",
+      }),
+    ).toBe(false);
+    expect(
+      siteOpsSupplementalVisualFailureMayRecover({
+        ...recoverable,
+        mode: "initial",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps an initial superseded failure silent only after the project advanced", () => {
+    const admitted = {
+      mode: "initial" as const,
+      projectStatus: "visual_searching",
+      projectRevision: 9,
+      admissionRevision: 9,
+    };
+    expect(siteOpsInitialVisualSupersededMayStaySilent(admitted)).toBe(false);
+    expect(
+      siteOpsInitialVisualSupersededMayStaySilent({
+        ...admitted,
+        projectRevision: 10,
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsInitialVisualSupersededMayStaySilent({
+        ...admitted,
+        projectStatus: "collecting_brief",
+      }),
+    ).toBe(true);
+    expect(
+      siteOpsInitialVisualSupersededMayStaySilent({
+        ...admitted,
+        mode: "supplemental",
+      }),
+    ).toBe(false);
   });
 
   it("never persists or reflects an unexpected provider exception", () => {

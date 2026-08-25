@@ -466,6 +466,20 @@ function SiteOpsMessageBubble({ item }: { item: SiteOpsMessageProjection }) {
   );
 }
 
+function visualGenerationProgressPage(item: SiteOpsMessageProjection) {
+  const card = item.metadata?.siteOps;
+  if (
+    item.role !== "assistant" ||
+    card?.kind !== "build_progress" ||
+    card.payload.stage !== "visual_searching"
+  ) {
+    return null;
+  }
+  const numberedPage = item.content.match(/正在生成第\s*(\d+)\s*组/u);
+  if (numberedPage) return Number(numberedPage[1]);
+  return item.content.includes("正在生成 9 个视觉候选") ? 1 : null;
+}
+
 function SiteOpsExecutionTimeline({
   steps,
 }: {
@@ -1415,18 +1429,48 @@ export default function SiteOpsConversationPanel({
   const aiBuilderConfigured =
     observation.serviceReadiness.website.status === "configured";
   const interactionLocked = Boolean(busyAction || !onAction);
+  const visualGeneration = observation.visualGeneration ?? {
+    status: "idle" as const,
+    targetPage: null,
+    generatedPages: visualPages.length,
+    maxPages: 3 as const,
+    canGenerateMore: visualPages.length < 3,
+    canSelectExisting: true,
+  };
+  const visualGenerationPending =
+    visualGeneration.status === "generating" ||
+    busyAction === "reselect_visual";
+  const visualGenerationTargetPage =
+    visualGeneration.targetPage ??
+    Math.min(visualGeneration.generatedPages + 1, visualGeneration.maxPages);
   const visualSelectionOpen =
     observation.interactionState === "awaiting_visual_selection";
   const visualSelectionDisabled =
-    interactionLocked || !visualSelectionOpen || !aiBuilderConfigured;
+    interactionLocked ||
+    visualGenerationPending ||
+    !visualGeneration.canSelectExisting ||
+    !visualSelectionOpen ||
+    !aiBuilderConfigured;
   const currentVisualPage =
     visualPages.find((page) => page.page === activeVisualPage) ??
     visualPages[visualPages.length - 1];
-  const visualGeneration = observation.visualGeneration ?? {
-    generatedPages: visualPages.length,
-    maxPages: 3,
-    canGenerateMore: visualPages.length < 3,
-  };
+  const currentVisualGenerationMessage = observation.messages
+    .filter(
+      (item) =>
+        visualGenerationProgressPage(item) === visualGeneration.targetPage,
+    )
+    .reduce<SiteOpsMessageProjection | null>(
+      (latest, item) =>
+        !latest || item.sequence > latest.sequence ? item : latest,
+      null,
+    );
+  const visibleMessages = observation.messages.filter((item) => {
+    if (visualGenerationProgressPage(item) === null) return true;
+    return (
+      visualGeneration.status === "generating" &&
+      item.id === currentVisualGenerationMessage?.id
+    );
+  });
   const currentSnapshotId = observation.project.currentKnowledgeSnapshotId;
   const effectiveSnapshotId = selectedSnapshotId || currentSnapshotId || "";
   const latestQuote = observation.domainOperations.find(
@@ -1971,12 +2015,12 @@ export default function SiteOpsConversationPanel({
         className="siteops-message-list"
         aria-label={`${SITEOPS_CUSTOMER_DISPLAY_NAME}对话记录`}
       >
-        {observation.messages.length === 0 ? (
+        {visibleMessages.length === 0 ? (
           <div className="siteops-empty-copy">
             选择知识库版本后，FrontMind 会在这里整理建站资料。
           </div>
         ) : (
-          observation.messages.map((item) => (
+          visibleMessages.map((item) => (
             <SiteOpsMessageBubble item={item} key={item.id} />
           ))
         )}
@@ -2005,7 +2049,10 @@ export default function SiteOpsConversationPanel({
                   type="button"
                   className="siteops-primary-button"
                   disabled={
-                    visualSelectionDisabled || !visualGeneration.canGenerateMore
+                    interactionLocked ||
+                    visualGenerationPending ||
+                    !aiBuilderConfigured ||
+                    !visualGeneration.canGenerateMore
                   }
                   onClick={() =>
                     runAction(
@@ -2019,13 +2066,30 @@ export default function SiteOpsConversationPanel({
                     )
                   }
                 >
-                  {visualGeneration.canGenerateMore
-                    ? "重新生成 9 个视觉候选"
-                    : "已生成全部 27 个候选"}
+                  {visualGenerationPending && (
+                    <Loader2
+                      className="siteops-spin"
+                      size={15}
+                      aria-hidden="true"
+                    />
+                  )}
+                  {visualGenerationPending
+                    ? `正在生成第 ${visualGenerationTargetPage} 组`
+                    : visualGeneration.canGenerateMore
+                      ? "重新生成 9 个视觉候选"
+                      : "已生成全部 27 个候选"}
                 </button>
               </div>
             )}
           </div>
+          {visualGeneration.status === "retryable_error" && (
+            <div className="siteops-notice error" role="alert">
+              <AlertCircle size={17} aria-hidden="true" />
+              <span>
+                本次未能生成完整的新一组，当前候选仍可选择，也可稍后重试。
+              </span>
+            </div>
+          )}
           {builderMessage && (
             <div className="siteops-builder-key-warning" role="status">
               <AlertCircle size={17} aria-hidden="true" />

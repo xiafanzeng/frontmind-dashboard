@@ -9,7 +9,15 @@ import {
   siteOperations,
   siteProjects,
   socialPackages,
+  websiteStyleSampleBatches,
+  websiteStyleSamples,
 } from "../../drizzle/schema";
+import { visualSearchOperationInputSchema } from "../../shared/siteops-workflow";
+import {
+  SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+  SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
+  SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+} from "../../shared/siteops";
 import { getDb } from "../db";
 import { finalizePendingTwentyFirstCredentialRevocations } from "../twenty-first-service";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
@@ -224,6 +232,77 @@ export function terminalSiteOpsOperationProjection(
       result.providerOperationId ?? locked.providerOperationId,
     providerTaskId: result.providerTaskId ?? locked.providerTaskId,
   };
+}
+
+export function siteOpsVisualOperationCoordinates(input: {
+  operationInput: unknown;
+  completePublishedPages: number;
+}) {
+  const parsed = visualSearchOperationInputSchema.safeParse(
+    input.operationInput,
+  );
+  if (parsed.success && "schemaVersion" in parsed.data) {
+    return {
+      mode: parsed.data.mode,
+      page: parsed.data.page,
+      admissionRevision: parsed.data.admissionRevision,
+    } as const;
+  }
+  return {
+    mode:
+      input.completePublishedPages > 0
+        ? ("supplemental" as const)
+        : ("initial" as const),
+    page: Math.max(
+      1,
+      Math.min(
+        SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+        input.completePublishedPages + 1,
+      ),
+    ) as 1 | 2 | 3,
+    admissionRevision: null,
+  } as const;
+}
+
+export function siteOpsSupplementalVisualFailureMayRecover(input: {
+  mode: "initial" | "supplemental";
+  completePublishedPages: number;
+  projectStatus: string;
+  projectRevision: number;
+  admissionRevision: number | null;
+  hasActiveVisualOperation: boolean;
+  hasActiveBuild: boolean;
+  errorCode: string;
+}) {
+  return (
+    input.mode === "supplemental" &&
+    input.completePublishedPages > 0 &&
+    [
+      "awaiting_visual_selection",
+      "visual_searching",
+      "failed",
+      "attention_required",
+    ].includes(input.projectStatus) &&
+    (input.admissionRevision === null ||
+      input.projectRevision === input.admissionRevision) &&
+    !input.hasActiveVisualOperation &&
+    !input.hasActiveBuild &&
+    input.errorCode !== "VISUAL_SEARCH_SUPERSEDED"
+  );
+}
+
+export function siteOpsInitialVisualSupersededMayStaySilent(input: {
+  mode: "initial" | "supplemental";
+  projectStatus: string;
+  projectRevision: number;
+  admissionRevision: number | null;
+}) {
+  if (input.mode !== "initial") return false;
+  return (
+    input.projectStatus !== "visual_searching" ||
+    (input.admissionRevision !== null &&
+      input.projectRevision !== input.admissionRevision)
+  );
 }
 
 export function unexpectedSiteOpsProviderFailure(): SiteOpsProviderResult {
@@ -458,6 +537,13 @@ async function invokeProvider(db: any, operation: Claimed) {
     });
   } catch (error) {
     if (controller.signal.aborted) {
+      if (operation.kind === "visual_search") {
+        return failureResult(
+          "failed",
+          "VISUAL_SEARCH_TIMEOUT",
+          "视觉候选生成已超时，请稍后重试。",
+        );
+      }
       return failureResult(
         "outcome_unknown",
         "PROVIDER_TIMEOUT",
@@ -727,6 +813,190 @@ async function finalize(
           eq(siteOperations.leaseOwner, operation.leaseOwner),
         ),
       );
+
+    if (locked.kind === "visual_search") {
+      const projectRows = await tx
+        .select()
+        .from(siteProjects)
+        .where(eq(siteProjects.id, locked.projectId))
+        .limit(1)
+        .for("update");
+      const project = projectRows[0];
+      if (!project) return result.status;
+
+      const publishedRows = await tx
+        .select({ id: websiteStyleSampleBatches.id })
+        .from(websiteStyleSampleBatches)
+        .where(
+          and(
+            eq(websiteStyleSampleBatches.siteProjectId, locked.projectId),
+            eq(websiteStyleSampleBatches.userId, locked.userId),
+            eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+            eq(websiteStyleSampleBatches.status, "published"),
+          ),
+        )
+        .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+        .for("update");
+      const publishedIds = publishedRows.map((row: { id: string }) => row.id);
+      const sampleRows =
+        publishedIds.length > 0
+          ? await tx
+              .select({ batchId: websiteStyleSamples.batchId })
+              .from(websiteStyleSamples)
+              .where(inArray(websiteStyleSamples.batchId, publishedIds))
+              .limit(SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL)
+          : [];
+      const samplesPerBatch = new Map<string, number>();
+      for (const row of sampleRows as Array<{ batchId: string }>) {
+        samplesPerBatch.set(
+          row.batchId,
+          (samplesPerBatch.get(row.batchId) ?? 0) + 1,
+        );
+      }
+      const completePublishedPages = publishedIds.filter(
+        (id: string) =>
+          samplesPerBatch.get(id) === SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+      ).length;
+      const coordinates = siteOpsVisualOperationCoordinates({
+        operationInput: locked.input,
+        completePublishedPages,
+      });
+
+      if (result.status === "succeeded") {
+        console.info("[SiteOpsWorker] visual_search_finalized", {
+          event: "siteops_visual_search_finalized",
+          operationId: locked.id,
+          projectId: locked.projectId,
+          mode: coordinates.mode,
+          page: coordinates.page,
+          operationStatus: result.status,
+        });
+        // The visual provider commits the complete board, success message and
+        // project revision atomically. The worker owns only the terminal
+        // operation row and must not repeat those writes.
+        return result.status;
+      }
+
+      const activeVisualRows = await tx
+        .select({ id: siteOperations.id })
+        .from(siteOperations)
+        .where(
+          and(
+            eq(siteOperations.projectId, locked.projectId),
+            eq(siteOperations.userId, locked.userId),
+            eq(siteOperations.kind, "visual_search"),
+            inArray(siteOperations.status, [
+              "queued",
+              "running",
+              "outcome_unknown",
+            ]),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const activeBuildRows = await tx
+        .select({ id: siteBuilds.id })
+        .from(siteBuilds)
+        .where(
+          and(
+            eq(siteBuilds.projectId, locked.projectId),
+            eq(siteBuilds.userId, locked.userId),
+            inArray(siteBuilds.status, [
+              "preparing",
+              "visual_searching",
+              "awaiting_visual_selection",
+              "design_compiling",
+              "contract_ready",
+              "building",
+              "qa_running",
+            ]),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const recoverable = siteOpsSupplementalVisualFailureMayRecover({
+        mode: coordinates.mode,
+        completePublishedPages,
+        projectStatus: project.status,
+        projectRevision: project.revision,
+        admissionRevision: coordinates.admissionRevision,
+        hasActiveVisualOperation: activeVisualRows.length > 0,
+        hasActiveBuild: activeBuildRows.length > 0,
+        errorCode: result.code,
+      });
+      console.warn("[SiteOpsWorker] visual_search_terminal", {
+        event: "siteops_visual_search_terminal",
+        operationId: locked.id,
+        projectId: locked.projectId,
+        mode: coordinates.mode,
+        page: coordinates.page,
+        operationStatus: result.status,
+        errorCode: result.code,
+        completePublishedPages,
+        recoverable,
+      });
+      if (recoverable) {
+        const sequenceRows = await tx
+          .select({ sequence: max(messages.sequence) })
+          .from(messages)
+          .where(eq(messages.conversationId, project.conversationId));
+        await tx.insert(messages).values({
+          id: randomUUID(),
+          conversationId: project.conversationId,
+          userId: project.userId,
+          role: "assistant",
+          content: "本次未能生成完整的新一组，当前候选仍可选择，也可稍后重试。",
+          sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
+          metadata: {
+            siteOps: {
+              kind: "operation_recovery",
+              subjectId: locked.id,
+              revision: project.revision,
+              status: "active",
+              payload: {
+                operationKind: "visual_search",
+                operationStatus: result.status,
+                errorCode: result.code,
+                page: coordinates.page,
+                retryable: true,
+              },
+            },
+          },
+        });
+        await tx
+          .update(siteProjects)
+          .set({
+            status: "awaiting_visual_selection",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(siteProjects.id, project.id),
+              eq(siteProjects.revision, project.revision),
+            ),
+          );
+        return result.status;
+      }
+      const initialSupersededMayStaySilent =
+        result.code === "VISUAL_SEARCH_SUPERSEDED" &&
+        siteOpsInitialVisualSupersededMayStaySilent({
+          mode: coordinates.mode,
+          projectStatus: project.status,
+          projectRevision: project.revision,
+          admissionRevision: coordinates.admissionRevision,
+        });
+      if (
+        coordinates.mode === "supplemental" ||
+        initialSupersededMayStaySilent
+      ) {
+        // A stale or otherwise unrecoverable supplemental result may finalize
+        // its own operation, but it must never regress a newer project state.
+        // An initial superseded result is silent only after the project has
+        // observably advanced; otherwise the generic failure path below must
+        // release the project from visual_searching.
+        return result.status;
+      }
+    }
 
     const unsuccessful = result.status !== "succeeded";
     if (locked.buildId) {

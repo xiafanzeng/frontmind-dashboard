@@ -85,6 +85,11 @@ export const siteOpsVisualCandidatePageProjectionSchema = z
 
 export const siteOpsVisualGenerationProjectionSchema = z
   .object({
+    status: z.enum(["idle", "generating", "retryable_error"]).default("idle"),
+    targetPage: z
+      .union([z.literal(1), z.literal(2), z.literal(3)])
+      .nullable()
+      .default(null),
     generatedPages: z
       .number()
       .int()
@@ -92,6 +97,7 @@ export const siteOpsVisualGenerationProjectionSchema = z
       .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
     maxPages: z.literal(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
     canGenerateMore: z.boolean(),
+    canSelectExisting: z.boolean().default(true),
   })
   .strict();
 
@@ -384,9 +390,12 @@ export const siteOpsObservationV1Schema = z
       .max(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
       .default([]),
     visualGeneration: siteOpsVisualGenerationProjectionSchema.default({
+      status: "idle",
+      targetPage: null,
       generatedPages: 0,
       maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
       canGenerateMore: false,
+      canSelectExisting: true,
     }),
     executionSteps: z
       .array(siteOpsExecutionStepProjectionSchema)

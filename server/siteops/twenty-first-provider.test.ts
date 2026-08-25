@@ -16,6 +16,7 @@ import {
 } from "../twenty-first-service";
 import {
   createTwentyFirstSiteOpsProviderHandler,
+  resolveVisualSearchPlan,
   type TwentyFirstBoardPersistenceInput,
   type TwentyFirstProviderContext,
 } from "./twenty-first-provider";
@@ -66,6 +67,43 @@ function operation(): SiteOperation {
     completedAt: null,
     createdAt: now,
     updatedAt: now,
+  };
+}
+
+function supplementalOperation(
+  page: 2 | 3 = 2,
+  admissionRevision = 4,
+): SiteOperation {
+  const row = operation();
+  return {
+    ...row,
+    input: {
+      schemaVersion: 2,
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "1.3.0",
+      mode: "supplemental",
+      page,
+      admissionRevision,
+    },
+  };
+}
+
+function initialV2Operation(admissionRevision = 4): SiteOperation {
+  const row = operation();
+  return {
+    ...row,
+    input: {
+      schemaVersion: 2,
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "1.3.0",
+      mode: "initial",
+      page: 1,
+      admissionRevision,
+    },
   };
 }
 
@@ -245,6 +283,29 @@ function frontMindBaselineDependencies() {
 }
 
 describe("21st SiteOps provider", () => {
+  it("freezes V1 supplemental revision and page coordinates for commit CAS", () => {
+    const context = providerContext();
+    context.project.revision = 11;
+    context.publishedPageCount = 1;
+
+    expect(
+      resolveVisualSearchPlan(
+        {
+          knowledgeSnapshotId: snapshotId,
+          credentialId,
+          credentialVersion: 3,
+          workflowVersion: "1.3.0",
+        },
+        context,
+      ),
+    ).toEqual({
+      schemaVersion: 1,
+      mode: "supplemental",
+      page: 2,
+      admissionRevision: 11,
+    });
+  });
+
   it("reuses a board already committed for the same leased operation", async () => {
     const getCredential = vi.fn();
     const client = { withReadOnlySession: vi.fn() };
@@ -457,6 +518,12 @@ describe("21st SiteOps provider", () => {
     expect(new Set(searchCalls.map((call) => call.query)).size).toBe(9);
     expect(detailCalls).toHaveLength(0);
     expect(persisted).not.toBeNull();
+    expect(persisted!.searchPlan).toEqual({
+      schemaVersion: 1,
+      mode: "initial",
+      page: 1,
+      admissionRevision: 4,
+    });
     expect(persisted!.mirroredCandidates).toHaveLength(9);
     expect(renderCandidates).toHaveBeenCalledOnce();
     const renderedBlueprints = renderCandidates.mock.calls[0]![0].blueprints;
@@ -551,6 +618,324 @@ describe("21st SiteOps provider", () => {
     expect(
       artifacts.filter((artifact) => artifact.kind === "21st-selection-bundle"),
     ).toHaveLength(1);
+  });
+
+  it("uses fresh V2 supplemental references from ranks thirteen through eighteen", async () => {
+    let familyIndex = 0;
+    const search = vi.fn(async (input: { limit: number; query: string }) => {
+      const currentFamily = familyIndex++;
+      const metadata = familyMetadata(currentFamily);
+      return {
+        results: Array.from({ length: input.limit }, (_, resultIndex) => {
+          const isPublishedTopResult = resultIndex < 9;
+          const isFirstFreshResult = resultIndex === 12;
+          const exercisesDynamicRetryBudget =
+            currentFamily % FRONTMIND_VISUAL_FAMILIES_V3.length === 0 &&
+            resultIndex >= 9 &&
+            resultIndex <= 13;
+          const id = isPublishedTopResult
+            ? resultIndex + 1
+            : 100 + currentFamily * 20 + resultIndex;
+          return {
+            id,
+            name:
+              isPublishedTopResult ||
+              isFirstFreshResult ||
+              exercisesDynamicRetryBudget
+                ? `${metadata.name} ${id}`
+                : `Responsive Hero section ${id}`,
+            description:
+              isPublishedTopResult ||
+              isFirstFreshResult ||
+              exercisesDynamicRetryBudget
+                ? metadata.description
+                : "A polished responsive landing-page Hero section.",
+            previewUrl: `https://cdn.example.test/${id}.png`,
+          };
+        }),
+      };
+    });
+    const context = providerContext();
+    context.project.status = "awaiting_visual_selection";
+    context.publishedPageCount = 1;
+    context.previousReferences = {
+      providerItemKeys: Array.from(
+        { length: 9 },
+        (_, index) => `n:${index + 1}`,
+      ),
+      previewSha256s: [],
+      perceptualHashes: [],
+    };
+    const baseline = frontMindBaselineDependencies();
+    const renderCandidates = vi.fn(async ({ blueprints }) =>
+      Promise.all(
+        blueprints.map(async (blueprint) => ({
+          heroFamily: blueprint.heroFamily,
+          buffer: await perceptuallyDistinctPng(
+            500 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+          ),
+        })),
+      ),
+    );
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) => use({ search }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        if (id >= 289 && id <= 292) {
+          throw new Error("PREVIEW_FETCH_FAILED");
+        }
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+        };
+      }),
+      renderCandidates,
+      persistArtifact: baseline.persistArtifact as never,
+      persistBoard: baseline.persistBoard,
+    });
+
+    const result = await handler({
+      operation: supplementalOperation(),
+      signal: new AbortController().signal,
+    });
+    expect(result).toMatchObject({
+      status: "succeeded",
+      result: {
+        mode: "supplemental",
+        page: 2,
+        candidateCount: 9,
+        diversity: { assignedFamilies: 9 },
+      },
+    });
+    expect(search).toHaveBeenCalledTimes(18);
+    expect(
+      search.mock.calls.slice(0, 9).every(([input]) => input.limit === 4),
+    ).toBe(true);
+    expect(
+      search.mock.calls.slice(9).every(([input]) => input.limit === 18),
+    ).toBe(true);
+    expect(
+      search.mock.calls
+        .slice(0, 9)
+        .every(([input]) =>
+          input.query.includes("alternative original composition reference"),
+        ),
+    ).toBe(true);
+    expect(
+      search.mock.calls
+        .slice(9)
+        .every(([input]) =>
+          input.query.includes("distinct less common composition reference"),
+        ),
+    ).toBe(true);
+    expect(baseline.persisted()).toMatchObject({
+      searchPlan: { schemaVersion: 2, mode: "supplemental", page: 2 },
+      selectionBundle: { searchTarget: 198 },
+    });
+    expect(
+      baseline
+        .persisted()!
+        .mirroredCandidates.some((candidate) =>
+          Array.from({ length: 9 }, (_, index) => `n:${index + 1}`).includes(
+            candidate.providerItemKey,
+          ),
+        ),
+    ).toBe(false);
+    expect(baseline.persisted()!.selectionBundle.candidates).toHaveLength(9);
+    expect(
+      new Set(
+        baseline
+          .persisted()!
+          .selectionBundle.candidates.map(
+            (candidate) => candidate.providerItemKey,
+          ),
+      ),
+    ).toEqual(
+      new Set([
+        "n:293",
+        ...Array.from({ length: 8 }, (_, index) => `n:${312 + index * 20}`),
+      ]),
+    );
+    expect(
+      (
+        result.result as {
+          diagnostics: { mirrorAttempted: number };
+        }
+      ).diagnostics.mirrorAttempted,
+    ).toBe(13);
+  });
+
+  it("uses the separate bounded query allowlist for a third visual page", async () => {
+    const search = vi.fn(async (_input: { limit: number; query: string }) => ({
+      results: [],
+    }));
+    const context = providerContext();
+    context.project.status = "awaiting_visual_selection";
+    context.publishedPageCount = 2;
+    const baseline = frontMindBaselineDependencies();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) => use({ search }),
+      },
+      ...baseline,
+    });
+
+    await expect(
+      handler({
+        operation: supplementalOperation(3),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
+    });
+    expect(search).toHaveBeenCalledTimes(18);
+    expect(
+      search.mock.calls.slice(0, 9).every(([input]) => input.limit === 4),
+    ).toBe(true);
+    expect(
+      search.mock.calls.slice(9).every(([input]) => input.limit === 18),
+    ).toBe(true);
+    expect(
+      search.mock.calls
+        .slice(0, 9)
+        .every(([input]) =>
+          input.query.includes("fresh independent composition reference"),
+        ),
+    ).toBe(true);
+    expect(
+      search.mock.calls
+        .slice(9)
+        .every(([input]) =>
+          input.query.includes("uncommon experimental composition reference"),
+        ),
+    ).toBe(true);
+    expect(baseline.persistBoard).not.toHaveBeenCalled();
+  });
+
+  it("fails a stale V2 admission before credential or provider access", async () => {
+    const context = providerContext();
+    context.project.revision = 5;
+    context.publishedPageCount = 0;
+    const getCredential = vi.fn();
+    const client = { withReadOnlySession: vi.fn() };
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      getCredential,
+      client,
+    });
+
+    await expect(
+      handler({
+        operation: initialV2Operation(4),
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "VISUAL_SEARCH_SUPERSEDED",
+    });
+    expect(getCredential).not.toHaveBeenCalled();
+    expect(client.withReadOnlySession).not.toHaveBeenCalled();
+  });
+
+  it("checks the worker lease before persisting a completed V2 board", async () => {
+    let familyIndex = 0;
+    const context = providerContext();
+    context.publishedPageCount = 0;
+    const baseline = frontMindBaselineDependencies();
+    const assertLeaseActive = vi.fn(async () => {
+      throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+    });
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => context,
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            search: async () => {
+              const index = familyIndex++;
+              const metadata = familyMetadata(index);
+              return {
+                results: [
+                  {
+                    id: 700 + index,
+                    name: `${metadata.name} ${index}`,
+                    description: metadata.description,
+                    previewUrl: `https://cdn.example.test/${700 + index}.png`,
+                  },
+                ],
+              };
+            },
+          }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+        };
+      }),
+      renderCandidates: vi.fn(async ({ blueprints }) =>
+        Promise.all(
+          blueprints.map(async (blueprint) => ({
+            heroFamily: blueprint.heroFamily,
+            buffer: await perceptuallyDistinctPng(
+              800 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+            ),
+          })),
+        ),
+      ),
+      persistArtifact: baseline.persistArtifact as never,
+      persistBoard: baseline.persistBoard,
+    });
+
+    await expect(
+      handler({
+        operation: initialV2Operation(),
+        signal: new AbortController().signal,
+        assertLeaseActive,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      code: "VISUAL_SEARCH_SUPERSEDED",
+    });
+    expect(assertLeaseActive).toHaveBeenCalledOnce();
+    expect(baseline.persistBoard).not.toHaveBeenCalled();
   });
 
   it("rejects generic primary Heroes and succeeds only after family-specific supplemental search", async () => {

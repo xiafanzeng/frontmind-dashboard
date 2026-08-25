@@ -120,6 +120,7 @@ function serviceDatabaseFixture() {
   };
   const visualRows = [{ sample, batch }];
   const publishedBatches: Array<{ id: string }> = [];
+  const activeVisualOperations: Array<{ id: string }> = [];
   const visualOperationInput = {
     knowledgeSnapshotId: snapshot.id,
     credentialId: platformCredentialId,
@@ -158,6 +159,9 @@ function serviceDatabaseFixture() {
     if (table === siteOperations) {
       if (inTransaction && keys.includes("input")) {
         return [{ input: visualOperationInput }];
+      }
+      if (inTransaction && keys.includes("id")) {
+        return activeVisualOperations;
       }
       return [];
     }
@@ -250,6 +254,7 @@ function serviceDatabaseFixture() {
     customerCredential,
     visualRows,
     publishedBatches,
+    activeVisualOperations,
   };
 }
 
@@ -295,6 +300,50 @@ beforeEach(() => {
 });
 
 describe("SiteOps accepted rebuild visual selection", () => {
+  it("rejects a second supplemental visual operation while one is active", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    Object.assign(fixture.project, {
+      brief: siteBriefFromSnapshot({
+        sourceFileName: "knowledge.zip",
+        documents: [
+          {
+            id: "overview-source",
+            path: "企业概览.md",
+            title: "企业概览",
+            content: "星河智造提供经过来源核验的设备巡检服务。",
+            kind: "overview",
+            evidenceStatus: "verified_first_party",
+            customerVisible: true,
+          },
+        ],
+        assets: [],
+      } as never),
+    });
+    fixture.publishedBatches.push({ id: fixture.batch.id });
+    fixture.activeVisualOperations.push({
+      id: "47000000-0000-4000-8000-000000000004",
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(actor as never, {
+        conversationId: "siteops:7",
+        action: "reselect_visual",
+        clientRequestId: "reselect-visual-while-active",
+        expectedRevision: fixture.project.revision,
+        input: {},
+      }),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+    expect(
+      fixture.inserts.some(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "visual_search",
+      ),
+    ).toBe(false);
+  });
+
   it("rejects a fourth visual page before reserving another operation", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;

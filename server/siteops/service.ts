@@ -39,6 +39,7 @@ import {
   SITEOPS_WORKFLOW,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
+  SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
   siteBriefSchema,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
@@ -62,8 +63,8 @@ import {
   type ReferenceBlueprint,
 } from "../../shared/siteops-design";
 import {
-  visualSearchOperationInputV1Schema,
-  type VisualSearchOperationInputV1,
+  visualSearchOperationInputSchema,
+  type VisualSearchOperationInput,
 } from "../../shared/siteops-workflow";
 import {
   managedAgentProfileSchema,
@@ -1461,6 +1462,142 @@ function publicExecutionStatus(status: string) {
   return "attention_required" as const;
 }
 
+const ACTIVE_VISUAL_OPERATION_STATUSES = new Set([
+  "queued",
+  "running",
+  "outcome_unknown",
+]);
+
+const TERMINAL_VISUAL_OPERATION_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "attention_required",
+  "cancelled",
+]);
+
+type VisualOperationProjectionRow = {
+  status: string;
+  input?: unknown;
+};
+
+function projectedVisualTargetPage(
+  operation: VisualOperationProjectionRow | null | undefined,
+  generatedPages: number,
+): 1 | 2 | 3 | null {
+  if (!operation) return null;
+  const parsed = visualSearchOperationInputSchema.safeParse(operation.input);
+  if (parsed.success && "schemaVersion" in parsed.data) {
+    return parsed.data.page;
+  }
+  return Math.max(
+    1,
+    Math.min(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES, generatedPages + 1),
+  ) as 1 | 2 | 3;
+}
+
+export function siteOpsVisualSelectionRecovery(input: {
+  projectStatus: string;
+  completePublishedPages: number;
+  latestVisualOperationStatus: string | null;
+  hasActiveVisualOperation: boolean;
+  hasActiveBuild: boolean;
+}) {
+  return (
+    ["visual_searching", "failed", "attention_required"].includes(
+      input.projectStatus,
+    ) &&
+    input.completePublishedPages > 0 &&
+    Boolean(
+      input.latestVisualOperationStatus &&
+        TERMINAL_VISUAL_OPERATION_STATUSES.has(
+          input.latestVisualOperationStatus,
+        ),
+    ) &&
+    !input.hasActiveVisualOperation &&
+    !input.hasActiveBuild
+  );
+}
+
+export function completePublishedVisualPageCount(input: {
+  batches: Array<{ id: string; status: string }>;
+  candidates: Array<{ batchId: string }>;
+}) {
+  const candidateCountByBatch = new Map<string, number>();
+  for (const candidate of input.candidates) {
+    candidateCountByBatch.set(
+      candidate.batchId,
+      (candidateCountByBatch.get(candidate.batchId) ?? 0) + 1,
+    );
+  }
+  return input.batches.filter(
+    (batch) =>
+      batch.status === "published" &&
+      candidateCountByBatch.get(batch.id) ===
+        SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
+  ).length;
+}
+
+export function projectSiteOpsVisualGeneration(input: {
+  projectStatus: string;
+  generatedPages: number;
+  latestVisualOperation?: VisualOperationProjectionRow | null;
+  hasActiveVisualOperation: boolean;
+  hasActiveBuild: boolean;
+}) {
+  const latestStatus = input.latestVisualOperation?.status ?? null;
+  const recoveredSelection = siteOpsVisualSelectionRecovery({
+    projectStatus: input.projectStatus,
+    completePublishedPages: input.generatedPages,
+    latestVisualOperationStatus: latestStatus,
+    hasActiveVisualOperation: input.hasActiveVisualOperation,
+    hasActiveBuild: input.hasActiveBuild,
+  });
+  const selectableStatus =
+    input.projectStatus === "awaiting_visual_selection" || recoveredSelection;
+  const canSelectExisting =
+    input.generatedPages > 0 &&
+    selectableStatus &&
+    !input.hasActiveVisualOperation &&
+    !input.hasActiveBuild;
+  const retryableError =
+    canSelectExisting &&
+    (latestStatus === "failed" || latestStatus === "attention_required");
+  return {
+    status: input.hasActiveVisualOperation
+      ? ("generating" as const)
+      : retryableError
+        ? ("retryable_error" as const)
+        : ("idle" as const),
+    targetPage: input.hasActiveVisualOperation
+      ? projectedVisualTargetPage(
+          input.latestVisualOperation,
+          input.generatedPages,
+        )
+      : null,
+    generatedPages: input.generatedPages,
+    maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+    canGenerateMore:
+      canSelectExisting &&
+      input.generatedPages < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+    canSelectExisting,
+    recoveredSelection,
+  } as const;
+}
+
+export function projectSiteOpsObservationStatuses(input: {
+  projectStatus: string;
+  recoveredSelection: boolean;
+}) {
+  const projectStatus = input.recoveredSelection
+    ? ("awaiting_visual_selection" as const)
+    : input.projectStatus;
+  return {
+    projectStatus,
+    interactionState:
+      projectStatus === "draft" ? ("select_snapshot" as const) : projectStatus,
+  };
+}
+
 export function projectSiteOpsExecutionSteps(input: {
   operations: Array<{
     id: string;
@@ -1737,6 +1874,8 @@ async function projectObservation(
         buildId: siteOperations.buildId,
         kind: siteOperations.kind,
         status: siteOperations.status,
+        input: siteOperations.input,
+        errorCode: siteOperations.errorCode,
         startedAt: siteOperations.startedAt,
         completedAt: siteOperations.completedAt,
         createdAt: siteOperations.createdAt,
@@ -1918,6 +2057,25 @@ async function projectObservation(
           .where(inArray(websiteStyleSamples.batchId, visibleBatchIds))
           .limit(SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL)
       : [];
+  const completePublishedPages = completePublishedVisualPageCount({
+    batches: publishedBatchRows,
+    candidates: candidateRows,
+  });
+  const visualOperationRows = timelineOperationRows.filter(
+    (row: { kind: string }) => row.kind === "visual_search",
+  );
+  const latestVisualOperation = visualOperationRows[0] ?? null;
+  const activeVisualOperationRows = visualOperationRows.filter(
+    (row: { status: string }) =>
+      ACTIVE_VISUAL_OPERATION_STATUSES.has(row.status),
+  );
+  const terminalVisualOperationIds = new Set(
+    visualOperationRows
+      .filter((row: { status: string }) =>
+        TERMINAL_VISUAL_OPERATION_STATUSES.has(row.status),
+      )
+      .map((row: { id: string }) => row.id),
+  );
   const messagesProjected = messageRows.flatMap(
     (row: typeof messages.$inferSelect) => {
       const metadata = (row.metadata ?? {}) as Record<string, unknown>;
@@ -1928,6 +2086,14 @@ async function projectObservation(
       if (
         originalPayload?.visibility === "timeline" ||
         originalPayload?.timelineOnly === true
+      ) {
+        return [];
+      }
+      if (
+        siteOps?.kind === "build_progress" &&
+        originalPayload?.stage === "visual_searching" &&
+        typeof siteOps.subjectId === "string" &&
+        terminalVisualOperationIds.has(siteOps.subjectId)
       ) {
         return [];
       }
@@ -2085,6 +2251,22 @@ async function projectObservation(
   );
   const visualCandidates =
     visualCandidatePages[visualCandidatePages.length - 1]?.candidates ?? [];
+  const hasActiveBuild = buildRows.some((row: typeof siteBuilds.$inferSelect) =>
+    NONTERMINAL_BUILD_STATUSES.includes(
+      row.status as (typeof NONTERMINAL_BUILD_STATUSES)[number],
+    ),
+  );
+  const visualGeneration = projectSiteOpsVisualGeneration({
+    projectStatus: input.project.status,
+    generatedPages: completePublishedPages,
+    latestVisualOperation,
+    hasActiveVisualOperation: activeVisualOperationRows.length > 0,
+    hasActiveBuild,
+  });
+  const projectedStatuses = projectSiteOpsObservationStatuses({
+    projectStatus: input.project.status,
+    recoveredSelection: visualGeneration.recoveredSelection,
+  });
   const observation = {
     schemaVersion: 1 as const,
     executionKind: "site_ops" as const,
@@ -2219,7 +2401,7 @@ async function projectObservation(
       currentKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
       primaryLanguage: input.project.primaryLanguage,
       canonicalHostname: input.project.canonicalHostname,
-      status: input.project.status,
+      status: projectedStatuses.projectStatus,
       revision: input.project.revision,
       updatedAt: input.project.updatedAt.toISOString(),
     },
@@ -2245,12 +2427,12 @@ async function projectObservation(
     visualCandidates,
     visualCandidatePages,
     visualGeneration: {
-      generatedPages: visualCandidatePages.length,
-      maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
-      canGenerateMore:
-        input.project.status === "awaiting_visual_selection" &&
-        publishedBatchRows.length > 0 &&
-        publishedBatchRows.length < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
+      status: visualGeneration.status,
+      targetPage: visualGeneration.targetPage,
+      generatedPages: visualGeneration.generatedPages,
+      maxPages: visualGeneration.maxPages,
+      canGenerateMore: visualGeneration.canGenerateMore,
+      canSelectExisting: visualGeneration.canSelectExisting,
     },
     executionSteps: projectSiteOpsExecutionSteps({
       operations: timelineOperationRows,
@@ -2303,10 +2485,7 @@ async function projectObservation(
       resetApplied: rebuildRequest.resetApplied,
       resetSourceBuildId: rebuildRequest.resetSourceBuildId,
     },
-    interactionState:
-      input.project.status === "draft"
-        ? ("select_snapshot" as const)
-        : input.project.status,
+    interactionState: projectedStatuses.interactionState,
     latestSequence: Math.max(
       input.afterSequence ?? 0,
       ...messageRows.map((row: typeof messages.$inferSelect) => row.sequence),
@@ -3350,7 +3529,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
       ),
     )
     .limit(1);
-  const frozen = visualSearchOperationInputV1Schema.safeParse(
+  const frozen = visualSearchOperationInputSchema.safeParse(
     operationRows[0]?.input,
   );
   if (
@@ -3399,9 +3578,9 @@ export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
 }
 
 export function createVisualSearchOperationInput(
-  input: VisualSearchOperationInputV1,
+  input: VisualSearchOperationInput,
 ) {
-  return visualSearchOperationInputV1Schema.parse(input);
+  return visualSearchOperationInputSchema.parse(input);
 }
 
 async function createActionTurn(
@@ -4044,8 +4223,7 @@ async function handleChangeSnapshot(
         ]),
       ),
     )
-    .limit(1)
-    .for("update");
+    .limit(1);
   assertSiteOpsSnapshotChangeState({
     sameSnapshot:
       input.project.currentKnowledgeSnapshotId ===
@@ -4212,6 +4390,29 @@ async function handleVisualSearch(
     )
     .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
     .for("update");
+  const activeVisualRows = await tx
+    .select({ id: siteOperations.id })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        eq(siteOperations.kind, "visual_search"),
+        inArray(siteOperations.status, [
+          "queued",
+          "running",
+          "outcome_unknown",
+        ]),
+      ),
+    )
+    .limit(1);
+  if (activeVisualRows[0]) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前视觉候选仍在生成，请等待本次生成完成后再试。",
+      409,
+    );
+  }
   if (
     input.reselect &&
     currentPublishedBatches.length >= SITEOPS_VISUAL_CANDIDATE_MAX_PAGES
@@ -4245,11 +4446,24 @@ async function handleVisualSearch(
     tx,
     "site_builder_21st",
   );
+  const mode =
+    currentPublishedBatches.length > 0
+      ? ("supplemental" as const)
+      : ("initial" as const);
+  const page = (mode === "initial" ? 1 : currentPublishedBatches.length + 1) as
+    | 1
+    | 2
+    | 3;
+  const admissionRevision = input.project.revision + 1;
   const operationPayload = createVisualSearchOperationInput({
+    schemaVersion: 2,
     knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
     credentialId: credential.id,
     credentialVersion: credential.version,
     workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+    mode,
+    page,
+    admissionRevision,
   });
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
@@ -4266,25 +4480,42 @@ async function handleVisualSearch(
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content: input.reselect
-      ? `正在生成第 ${currentPublishedBatches.length + 1} 组全新视觉候选；前面展示过的参考不会重复。`
-      : "正在生成 9 个视觉候选，完成后会一次展示。",
+    content:
+      mode === "supplemental"
+        ? `正在生成第 ${page} 组全新视觉候选；前面展示过的参考不会重复。`
+        : "正在生成 9 个视觉候选，完成后会一次展示。",
     siteOps: {
       kind: "build_progress",
       subjectId: operationId,
-      revision: input.project.revision + 1,
+      revision: admissionRevision,
       status: "active",
-      payload: { stage: "visual_searching", targets: [18, 12, 9] },
+      payload: {
+        stage: "visual_searching",
+        targets: [18, 12, 9],
+        page,
+        mode,
+      },
     },
   });
   await tx
     .update(siteProjects)
     .set({
-      status: "visual_searching",
-      revision: input.project.revision + 1,
+      status:
+        mode === "supplemental"
+          ? "awaiting_visual_selection"
+          : "visual_searching",
+      revision: admissionRevision,
       updatedAt: new Date(),
     })
     .where(eq(siteProjects.id, input.project.id));
+  console.info("[SiteOps] visual_generation_admitted", {
+    event: "siteops_visual_generation_admitted",
+    operationId,
+    projectId: input.project.id,
+    mode,
+    page,
+    admissionRevision,
+  });
 }
 
 async function selectVisualSample(
@@ -4301,13 +4532,6 @@ async function selectVisualSample(
     delegated: boolean;
   },
 ) {
-  if (input.project.status !== "awaiting_visual_selection") {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "当前阶段不能再次选择视觉方向；需要重选时请先创建新的视觉检索。",
-      409,
-    );
-  }
   if (!input.project.currentKnowledgeSnapshotId) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -4340,6 +4564,99 @@ async function selectVisualSample(
       "当前已有建站任务在运行，不能并行创建第二个根版本。",
       409,
     );
+  }
+  const activeVisualRows = await tx
+    .select({ id: siteOperations.id })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.project.id),
+        eq(siteOperations.userId, input.actor.id),
+        eq(siteOperations.kind, "visual_search"),
+        inArray(siteOperations.status, [
+          "queued",
+          "running",
+          "outcome_unknown",
+        ]),
+      ),
+    )
+    .limit(1);
+  if (activeVisualRows[0]) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "新的视觉候选仍在生成，完成后即可选择。",
+      409,
+    );
+  }
+  let recoveredSelection = false;
+  if (input.project.status !== "awaiting_visual_selection") {
+    const latestVisualRows = await tx
+      .select({ status: siteOperations.status })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.project.id),
+          eq(siteOperations.userId, input.actor.id),
+          eq(siteOperations.kind, "visual_search"),
+        ),
+      )
+      .orderBy(desc(siteOperations.createdAt))
+      .limit(1)
+      .for("update");
+    const publishedRows = await tx
+      .select({ id: websiteStyleSampleBatches.id })
+      .from(websiteStyleSampleBatches)
+      .where(
+        and(
+          eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
+          eq(websiteStyleSampleBatches.userId, input.actor.id),
+          eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+          eq(websiteStyleSampleBatches.status, "published"),
+        ),
+      )
+      .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
+      .for("update");
+    const publishedIds = publishedRows.map((row: { id: string }) => row.id);
+    const publishedSamples =
+      publishedIds.length > 0
+        ? await tx
+            .select({ batchId: websiteStyleSamples.batchId })
+            .from(websiteStyleSamples)
+            .where(inArray(websiteStyleSamples.batchId, publishedIds))
+            .limit(SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL)
+        : [];
+    const samplesPerBatch = new Map<string, number>();
+    for (const row of publishedSamples as Array<{ batchId: string }>) {
+      samplesPerBatch.set(
+        row.batchId,
+        (samplesPerBatch.get(row.batchId) ?? 0) + 1,
+      );
+    }
+    const completePublishedPages = publishedIds.filter(
+      (id: string) => samplesPerBatch.get(id) === 9,
+    ).length;
+    recoveredSelection = siteOpsVisualSelectionRecovery({
+      projectStatus: input.project.status,
+      completePublishedPages,
+      latestVisualOperationStatus: latestVisualRows[0]?.status ?? null,
+      hasActiveVisualOperation: false,
+      hasActiveBuild: false,
+    });
+    if (!recoveredSelection) {
+      throw new SiteOpsServiceError(
+        "STATE_CONFLICT",
+        "当前阶段不能再次选择视觉方向；需要重选时请先创建新的视觉检索。",
+        409,
+      );
+    }
+  }
+  if (recoveredSelection) {
+    console.info("[SiteOps] visual_selection_recovered", {
+      event: "siteops_visual_selection_recovered",
+      projectId: input.project.id,
+      projectStatus: input.project.status,
+      projectRevision: input.project.revision,
+    });
   }
   const batchId = input.batchId;
   const sampleRows = await tx

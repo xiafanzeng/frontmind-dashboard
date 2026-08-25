@@ -1,6 +1,6 @@
 import type { SiteOpsObservationV1 } from "@shared/siteops-contract";
 import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "@shared/siteops-branding";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { trpc } from "@/lib/trpc";
 import SiteOpsConversationPanel from "./SiteOpsConversationPanel";
 
@@ -33,6 +33,30 @@ export function siteOpsClientRequestId() {
   return crypto.randomUUID();
 }
 
+export function newestSiteOpsObservation(
+  current: SiteOpsObservationV1 | null,
+  incoming: SiteOpsObservationV1,
+) {
+  if (!current) return incoming;
+  if (incoming.project.revision > current.project.revision) return incoming;
+  if (incoming.project.revision < current.project.revision) return current;
+  if (incoming.latestSequence > current.latestSequence) return incoming;
+  if (incoming.latestSequence < current.latestSequence) return current;
+
+  // The visual provider commits the board, success message and project
+  // revision before the worker owns the operation's terminal transition. A
+  // poll may therefore observe the new board while the operation is still
+  // running, followed by an idle/retryable projection with the exact same
+  // project/message cursor. Accept that one-way terminal transition while
+  // continuing to reject a late running response after terminal state won.
+  const currentVisualGenerating =
+    current.visualGeneration.status === "generating";
+  const incomingVisualGenerating =
+    incoming.visualGeneration.status === "generating";
+  if (currentVisualGenerating && !incomingVisualGenerating) return incoming;
+  return current;
+}
+
 export default function ConnectedSiteOpsConversationPanel({
   onSubmitIcpFiling,
 }: {
@@ -45,14 +69,18 @@ export default function ConnectedSiteOpsConversationPanel({
   const [observation, setObservation] = useState<SiteOpsObservationV1 | null>(
     null,
   );
+  const acceptObservation = useCallback((incoming: SiteOpsObservationV1) => {
+    setObservation((current) => newestSiteOpsObservation(current, incoming));
+  }, []);
   const openMutation = trpc.workspace.siteOps.open.useMutation({
-    onSuccess: setObservation,
+    onSuccess: acceptObservation,
   });
   const conversationId =
     observation?.project.conversationId ?? "siteops:pending";
   const shouldPoll = Boolean(
     observation &&
       (POLLING_STATES.has(observation.interactionState) ||
+        observation.visualGeneration.status === "generating" ||
         observation.deployments.some((item) =>
           PENDING_DEPLOYMENT_STATES.has(item.status),
         ) ||
@@ -74,7 +102,7 @@ export default function ConnectedSiteOpsConversationPanel({
     },
   );
   const actMutation = trpc.workspace.siteOps.act.useMutation({
-    onSuccess: setObservation,
+    onSuccess: acceptObservation,
   });
   const aliyunBeginMutation =
     trpc.workspace.siteOps.aliyunConnection.beginOAuth.useMutation();
@@ -97,8 +125,8 @@ export default function ConnectedSiteOpsConversationPanel({
   }, [openMutation]);
 
   useEffect(() => {
-    if (observeQuery.data) setObservation(observeQuery.data);
-  }, [observeQuery.data]);
+    if (observeQuery.data) acceptObservation(observeQuery.data);
+  }, [acceptObservation, observeQuery.data]);
 
   const requestError =
     openMutation.error?.message ||
@@ -118,14 +146,14 @@ export default function ConnectedSiteOpsConversationPanel({
       onRefresh={async () => {
         if (observation) {
           const refreshed = await observeQuery.refetch();
-          if (refreshed.data) setObservation(refreshed.data);
+          if (refreshed.data) acceptObservation(refreshed.data);
           return;
         }
-        setObservation(await openMutation.mutateAsync(undefined));
+        acceptObservation(await openMutation.mutateAsync(undefined));
       }}
       onAction={async (input) => {
         if (!observation) return;
-        setObservation(
+        acceptObservation(
           await actMutation.mutateAsync({
             conversationId: observation.project.conversationId,
             clientRequestId: siteOpsClientRequestId(),
@@ -177,14 +205,14 @@ export default function ConnectedSiteOpsConversationPanel({
           conversationId: observation.project.conversationId,
         });
         const refreshed = await observeQuery.refetch();
-        if (refreshed.data) setObservation(refreshed.data);
+        if (refreshed.data) acceptObservation(refreshed.data);
       }}
       onSubmitIcpFiling={
         onSubmitIcpFiling
           ? async (input) => {
               await onSubmitIcpFiling(input);
               const refreshed = await observeQuery.refetch();
-              if (refreshed.data) setObservation(refreshed.data);
+              if (refreshed.data) acceptObservation(refreshed.data);
             }
           : undefined
       }
