@@ -1444,8 +1444,10 @@ function CustomerWorkbenchView({
             {focusedTicket.operation === "site_rebuild"
               ? focusedTicket.siteRebuildResetApplied === true &&
                 focusedTicket.status === "in_progress"
-                ? "当前需求状态：重置已通过，等待客户制作新版本。"
-                : "当前需求状态：待通过重置。"
+                ? "当前需求状态：旧官网已下线，等待客户全新上传。"
+                : focusedTicket.siteRebuildResetPending === true
+                  ? "当前需求状态：旧官网下线尚未完成；完成后客户需全新上传。"
+                  : "当前需求状态：待通过重置。"
               : "当前需求状态：待处理。请在本客户看板内完成处理。"}
           </p>
         </CardHeader>
@@ -2431,7 +2433,8 @@ function DeliveryTicketActions({
       setSiteRebuildApprovalOpen(false);
       await onDone();
       toast.success("官网重置需求已通过", {
-        description: "客户现在可以重新选择知识库，旧官网与当前预览保持不变。",
+        description:
+          "旧官网正在安全下线；完成后客户需全新上传知识库并创建全新任务。",
       });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "通过重置需求失败");
@@ -2447,7 +2450,7 @@ function DeliveryTicketActions({
         <div className="mt-3 rounded-xl border bg-muted/25 px-4 py-3 text-sm leading-6">
           <strong>重置需求已通过</strong>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            客户可以重新选择知识库；旧官网与当前预览保持不变。
+            旧官网已下线；客户需全新上传知识库并创建全新任务。
           </p>
         </div>
       );
@@ -2462,6 +2465,14 @@ function DeliveryTicketActions({
 
     return (
       <div className="mt-3">
+        {ticket.siteRebuildResetPending === true && (
+          <div className="mb-3 rounded-xl border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950">
+            <strong>旧官网下线尚未完成</strong>
+            <p className="mt-1 text-xs leading-5 text-amber-800">
+              可再次批准以安全检查并重新排队；正在执行或结果未知的任务不会重复执行。下线完成后，客户需全新上传知识库。
+            </p>
+          </div>
+        )}
         {approvalAvailable && (
           <Button
             type="button"
@@ -2472,7 +2483,9 @@ function DeliveryTicketActions({
             {approveSiteRebuild.isPending && (
               <Loader2 className="h-4 w-4 animate-spin" />
             )}
-            通过重置需求
+            {ticket.siteRebuildResetPending === true
+              ? "重新检查并下线"
+              : "通过重置需求"}
           </Button>
         )}
         <Dialog
@@ -2485,9 +2498,15 @@ function DeliveryTicketActions({
         >
           <DialogContent className="sm:max-w-lg">
             <DialogHeader>
-              <DialogTitle>通过官网重置需求？</DialogTitle>
+              <DialogTitle>
+                {ticket.siteRebuildResetPending === true
+                  ? "重新检查官网下线？"
+                  : "通过官网重置需求？"}
+              </DialogTitle>
               <DialogDescription>
-                确认后，客户当前轮次的知识库选择、视觉候选和建站对话将被清空，并重新选择知识库；旧官网预览与已上线版本保持不变。
+                {ticket.siteRebuildResetPending === true
+                  ? "确认后，系统只会检查原下线任务；仅当其在外部变更前因可重试配置问题失败时，才重新排队同一任务。完成下线后，客户需全新上传知识库。"
+                  : "确认后，旧官网将进入安全下线流程；下线确认完成后，当前轮次将重置，客户需全新上传知识库并创建全新任务。"}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

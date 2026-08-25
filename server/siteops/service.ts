@@ -3947,6 +3947,9 @@ async function selectVisualSample(
     turnId: string;
     requestId: string;
     requestHash: string;
+    rebuildRequest: Awaited<
+      ReturnType<typeof loadSiteOpsRebuildRequest>
+    >;
     sampleId?: string;
     batchId?: string;
     delegated: boolean;
@@ -4179,15 +4182,9 @@ async function selectVisualSample(
       409,
     );
   }
-  const resetCycle = await loadSiteOpsRebuildRequest(tx, {
-    userId: input.actor.id,
-    projectId: input.project.id,
-    currentBuildId: input.project.currentBuildId,
-    hasWorkflowProgress: true,
-  });
   if (
-    resetCycle.minimumKnowledgeSnapshotVersion !== null &&
-    snapshot.version < resetCycle.minimumKnowledgeSnapshotVersion
+    input.rebuildRequest.minimumKnowledgeSnapshotVersion !== null &&
+    snapshot.version < input.rebuildRequest.minimumKnowledgeSnapshotVersion
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
@@ -4210,12 +4207,7 @@ async function selectVisualSample(
   });
   const parentBuildId = input.project.currentBuildId;
   if (parentBuildId) {
-    const rebuild = await loadSiteOpsRebuildRequest(tx, {
-      userId: input.actor.id,
-      projectId: input.project.id,
-      currentBuildId: parentBuildId,
-    });
-    requireAcceptedSiteOpsRebuild(rebuild);
+    requireAcceptedSiteOpsRebuild(input.rebuildRequest);
   }
   const quotaPeriodId = await reserveSiteOpsDeliveryQuota(tx, {
     userId: input.actor.id,
@@ -4291,7 +4283,7 @@ async function selectVisualSample(
   });
   if (
     parentBuildId === null &&
-    resetCycle.minimumKnowledgeSnapshotVersion !== null
+    input.rebuildRequest.minimumKnowledgeSnapshotVersion !== null
   ) {
     const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
     console.info("[siteops] fresh_root_created", {
@@ -5473,6 +5465,7 @@ export async function actOnSiteOps(
       case "select_visual":
         await selectVisualSample(tx, {
           ...common,
+          rebuildRequest: resetGate,
           sampleId: String(payload.sampleId),
           delegated: false,
         });
@@ -5480,6 +5473,7 @@ export async function actOnSiteOps(
       case "delegate_visual":
         await selectVisualSample(tx, {
           ...common,
+          rebuildRequest: resetGate,
           delegated: true,
         });
         break;

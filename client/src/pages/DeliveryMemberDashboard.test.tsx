@@ -756,7 +756,7 @@ describe("DeliveryMemberDashboard project context", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "确认后，客户当前轮次的知识库选择、视觉候选和建站对话将被清空，并重新选择知识库；旧官网预览与已上线版本保持不变。",
+        "确认后，旧官网将进入安全下线流程；下线确认完成后，当前轮次将重置，客户需全新上传知识库并创建全新任务。",
       ),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "确认通过" }));
@@ -805,6 +805,11 @@ describe("DeliveryMemberDashboard project context", () => {
     render(<DeliveryMemberDashboard customerWorkbench />);
 
     expect(screen.getByText("重置需求已通过")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "旧官网已下线；客户需全新上传知识库并创建全新任务。",
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "通过重置需求" }),
     ).not.toBeInTheDocument();
@@ -858,9 +863,50 @@ describe("DeliveryMemberDashboard project context", () => {
     expect(screen.queryByText("重置需求已通过")).not.toBeInTheDocument();
   });
 
+  it("keeps a pending reset visibly incomplete and retryable", () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+          userId: 101,
+          customerName: "示例客户",
+          customerUsername: "example.customer",
+          title: "重新制作官网",
+          operation: "site_rebuild",
+          status: "in_progress",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+          revision: 8,
+          siteRebuildResetApplied: false,
+          siteRebuildResetPending: true,
+        },
+      ],
+      filters: {
+        customers: [
+          { id: 101, name: "示例客户", username: "example.customer" },
+        ],
+      },
+      counts: { pending: 1, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench />);
+
+    expect(screen.getByText("旧官网下线尚未完成")).toBeInTheDocument();
+    expect(screen.queryByText("重置需求已通过")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重新检查并下线" }),
+    ).toBeInTheDocument();
+  });
+
   it.each([
     [false, "当前需求状态：待通过重置。"],
-    [true, "当前需求状态：重置已通过，等待客户制作新版本。"],
+    [true, "当前需求状态：旧官网已下线，等待客户全新上传。"],
   ] as const)(
     "projects the real site-rebuild state in the focused customer card (applied: %s)",
     (resetApplied, expectedState) => {

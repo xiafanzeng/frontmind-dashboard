@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import * as EsaModels from "@alicloud/esa20240910";
 import * as OpenApi from "@alicloud/openapi-client";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import JSZip from "jszip";
 import { z } from "zod";
 
@@ -635,6 +635,55 @@ async function loadApprovedResetProject(
     );
   }
   return project;
+}
+
+/**
+ * A disabled ESA runtime may acknowledge a reset only when the database proves
+ * that this project has never had an ESA exposure to remove. Any historical
+ * deployment or ESA operation is evidence that requires the normal configured
+ * delete and read-only reconciliation path.
+ */
+async function approvedResetHasNoExternalExposureHistory(input: {
+  db: DbExecutor;
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+}) {
+  if (input.operation.provider !== "aliyun_esa") return false;
+  const project = await loadApprovedResetProject(
+    input.db,
+    input.operation,
+    input.reset,
+  );
+  if (
+    project.globalLiveDeploymentId !== null ||
+    project.mainlandLiveDeploymentId !== null
+  ) {
+    return false;
+  }
+  const deploymentRows = await input.db
+    .select({ id: siteDeployments.id })
+    .from(siteDeployments)
+    .where(
+      and(
+        eq(siteDeployments.projectId, input.operation.projectId),
+        eq(siteDeployments.userId, input.operation.userId),
+      ),
+    )
+    .limit(1);
+  if (deploymentRows[0]) return false;
+  const priorEsaOperationRows = await input.db
+    .select({ id: siteOperations.id })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, input.operation.projectId),
+        eq(siteOperations.userId, input.operation.userId),
+        eq(siteOperations.provider, "aliyun_esa"),
+        ne(siteOperations.id, input.operation.id),
+      ),
+    )
+    .limit(1);
+  return !priorEsaOperationRows[0];
 }
 
 function logApprovedResetStage(input: {
@@ -1948,31 +1997,72 @@ export function createEsaSiteOpsProviderHandler(
   let api = dependencies.api;
   return async ({ operation, signal }) => {
     try {
+      const approvedReset = parseApprovedResetUnpublishInput(operation.input);
+      if (approvedReset && operation.kind !== "rollback") {
+        throw new EsaProviderFailure(
+          "SITEOPS_RESET_OPERATION_KIND_INVALID",
+          "官网重置下线只能由专用 rollback 操作执行。",
+          "failed",
+        );
+      }
       const runtimeConfiguration = inspectEsaRuntimeConfiguration({
         providerRegistered: true,
       });
+      let db: Awaited<ReturnType<typeof dbGetter>> | null | undefined;
+      if (approvedReset) {
+        db = await dbGetter();
+        if (!db) {
+          throw new EsaProviderFailure(
+            "DATABASE_UNAVAILABLE",
+            "ESA 发布数据库暂时不可用。",
+          );
+        }
+        if (!runtimeConfiguration.configured) {
+          const startedAt = Date.now();
+          logApprovedResetStage({ operation, status: "started" });
+          const safeNoop = await approvedResetHasNoExternalExposureHistory({
+            db,
+            operation,
+            reset: approvedReset,
+          });
+          if (!safeNoop) {
+            throw new EsaProviderFailure(
+              runtimeConfiguration.code,
+              `${runtimeConfiguration.reason}；存在 ESA 暴露历史，未执行未经核验的重置。`,
+            );
+          }
+          const resetResult = {
+            status: "succeeded",
+            result: {
+              schemaVersion: 1,
+              intent: APPROVED_RESET_UNPUBLISH,
+              stage: "exposure_removed",
+            },
+            message: "未发现 ESA 暴露历史，已安全确认无需下线。",
+          } satisfies SiteOpsProviderResult;
+          logApprovedResetStage({
+            operation,
+            status: resetResult.status,
+            stage: "exposure_removed",
+            latencyMs: Date.now() - startedAt,
+          });
+          return resetResult;
+        }
+      }
       if (!runtimeConfiguration.configured) {
         throw new EsaProviderFailure(
           runtimeConfiguration.code,
           `${runtimeConfiguration.reason}；没有创建虚假发布。`,
         );
       }
-      const db = await dbGetter();
+      db ??= await dbGetter();
       if (!db) throw new EsaProviderFailure("DATABASE_UNAVAILABLE", "ESA 发布数据库暂时不可用。");
       api ??= new OfficialEsaDirectApi();
       const prepare = prepareInputSchema.safeParse(operation.input);
       if (prepare.success) {
         return await handlePrepareDomainBinding({ db, api, operation, parsed: prepare.data });
       }
-      const approvedReset = parseApprovedResetUnpublishInput(operation.input);
       if (approvedReset) {
-        if (operation.kind !== "rollback") {
-          throw new EsaProviderFailure(
-            "SITEOPS_RESET_OPERATION_KIND_INVALID",
-            "官网重置下线只能由专用 rollback 操作执行。",
-            "failed",
-          );
-        }
         const startedAt = Date.now();
         logApprovedResetStage({ operation, status: "started" });
         const resetResult = await handleApprovedResetUnpublish({

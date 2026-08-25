@@ -14,7 +14,9 @@ import {
 } from "../../drizzle/schema";
 import {
   approveSiteOpsRebuildTicket,
+  completeSiteOpsRebuildTicket,
   finalizeApprovedSiteOpsReset,
+  loadSiteOpsRebuildRequest,
   siteOpsRebuildBuildId,
   siteOpsRebuildAcceptedForCurrentCycle,
   siteOpsRebuildDeliveryClientRequestId,
@@ -102,6 +104,250 @@ describe("SiteOps rebuild ticket coordinates", () => {
         currentBuildId: "50000000-0000-4000-8000-000000000005",
       }),
     ).toBe(false);
+  });
+
+  it("keeps the completed fresh-root snapshot floor without projecting an active ticket", async () => {
+    const projectId = "20000000-0000-4000-8000-000000000002";
+    const sourceBuildId = "30000000-0000-4000-8000-000000000003";
+    const resetOperationId = "50000000-0000-4000-8000-000000000005";
+    const completedNote = JSON.stringify({
+      schemaVersion: 4,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId,
+      knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      resetIntent: "approved_reset_unpublish",
+      resetOperationId,
+      resetApprovedAt: "2026-08-24T07:55:00.000Z",
+      resetExpectedProjectRevision: 12,
+      minimumKnowledgeSnapshotVersion: 9,
+      resetAppliedAt: "2026-08-24T08:00:00.000Z",
+      resetAppliedProjectRevision: 13,
+      freshRootApplied: true,
+      unpublishOperationId: resetOperationId,
+    });
+    let selectCall = 0;
+    const executor = {
+      select: () => {
+        const call = selectCall++;
+        const rows =
+          call === 0
+            ? []
+            : [
+                {
+                  id: "61000000-0000-4000-8000-000000000006",
+                  status: "completed",
+                  internalNote: JSON.stringify({
+                    ...JSON.parse(completedNote),
+                    projectId: "21000000-0000-4000-8000-000000000002",
+                  }),
+                },
+                {
+                  id: "62000000-0000-4000-8000-000000000006",
+                  status: "completed",
+                  internalNote: JSON.stringify({
+                    ...JSON.parse(completedNote),
+                    untrustedFutureField: true,
+                  }),
+                },
+                {
+                  id: "60000000-0000-4000-8000-000000000006",
+                  status: "completed",
+                  internalNote: completedNote,
+                },
+                {
+                  id: "63000000-0000-4000-8000-000000000006",
+                  status: "completed",
+                  internalNote: JSON.stringify({
+                    ...JSON.parse(completedNote),
+                    minimumKnowledgeSnapshotVersion: 11,
+                  }),
+                },
+              ];
+        const query: any = {
+          from: () => query,
+          where: () => query,
+          orderBy: () => query,
+          limit: () => query,
+          then: (
+            resolve: (value: unknown) => unknown,
+            reject: (error: unknown) => unknown,
+          ) => Promise.resolve(rows).then(resolve, reject),
+        };
+        return query;
+      },
+    };
+
+    await expect(
+      loadSiteOpsRebuildRequest(executor, {
+        userId: 7,
+        projectId,
+        currentBuildId: null,
+        hasWorkflowProgress: true,
+      }),
+    ).resolves.toEqual({
+      allowed: true,
+      ticketId: null,
+      status: null,
+      resetApplied: true,
+      resetPending: false,
+      minimumKnowledgeSnapshotVersion: 11,
+      resetSourceBuildId: sourceBuildId,
+      acceptedForCurrentCycle: false,
+    });
+  });
+
+  it("keeps active ticket state authoritative while inheriting an older completed floor", async () => {
+    const projectId = "20000000-0000-4000-8000-000000000002";
+    const currentBuildId = "70000000-0000-4000-8000-000000000007";
+    const resetOperationId = "50000000-0000-4000-8000-000000000005";
+    const activeNote = JSON.stringify({
+      schemaVersion: 3,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: currentBuildId,
+      knowledgeSnapshotId: "80000000-0000-4000-8000-000000000008",
+    });
+    const completedNote = JSON.stringify({
+      schemaVersion: 4,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: "30000000-0000-4000-8000-000000000003",
+      knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      resetIntent: "approved_reset_unpublish",
+      resetOperationId,
+      resetApprovedAt: "2026-08-24T07:55:00.000Z",
+      resetExpectedProjectRevision: 12,
+      minimumKnowledgeSnapshotVersion: 9,
+      resetAppliedAt: "2026-08-24T08:00:00.000Z",
+      resetAppliedProjectRevision: 13,
+      freshRootApplied: true,
+      unpublishOperationId: resetOperationId,
+    });
+    const rows = [
+      [{ id: currentBuildId }],
+      [
+        {
+          id: "90000000-0000-4000-8000-000000000009",
+          status: "submitted",
+          internalNote: activeNote,
+        },
+      ],
+      [
+        {
+          id: "60000000-0000-4000-8000-000000000006",
+          status: "completed",
+          internalNote: completedNote,
+        },
+      ],
+    ];
+    let selectCall = 0;
+    const executor = {
+      select: () => {
+        const result = rows[selectCall++] ?? [];
+        const query: any = {
+          from: () => query,
+          where: () => query,
+          orderBy: () => query,
+          limit: () => query,
+          then: (
+            resolve: (value: unknown) => unknown,
+            reject: (error: unknown) => unknown,
+          ) => Promise.resolve(result).then(resolve, reject),
+        };
+        return query;
+      },
+    };
+
+    await expect(
+      loadSiteOpsRebuildRequest(executor, {
+        userId: 7,
+        projectId,
+        currentBuildId,
+        hasWorkflowProgress: true,
+      }),
+    ).resolves.toEqual({
+      allowed: false,
+      ticketId: "90000000-0000-4000-8000-000000000009",
+      status: "submitted",
+      resetApplied: false,
+      resetPending: false,
+      minimumKnowledgeSnapshotVersion: 9,
+      resetSourceBuildId: currentBuildId,
+      acceptedForCurrentCycle: false,
+    });
+  });
+
+  it("recovers the permanent snapshot floor from a succeeded reset operation after ticket retention", async () => {
+    const projectId = "20000000-0000-4000-8000-000000000002";
+    const resetOperationId = "50000000-0000-4000-8000-000000000005";
+    const rows = [
+      [],
+      [],
+      [
+        {
+          id: resetOperationId,
+          input: {
+            schemaVersion: 1,
+            intent: "approved_reset_unpublish",
+            rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+            expectedProjectRevision: 12,
+            expectedCurrentBuildId:
+              "30000000-0000-4000-8000-000000000003",
+            expectedKnowledgeSnapshotId:
+              "40000000-0000-4000-8000-000000000004",
+            expectedGlobalLiveDeploymentId: null,
+            expectedMainlandLiveDeploymentId: null,
+            expectedCanonicalHostname: null,
+          },
+          result: {
+            schemaVersion: 2,
+            intent: "approved_reset_unpublish",
+            stage: "exposure_removed",
+            resetOperationId,
+            projectId,
+            freshRootApplied: true,
+            minimumKnowledgeSnapshotVersion: 14,
+            resetAppliedProjectRevision: 13,
+          },
+        },
+      ],
+    ];
+    let selectCall = 0;
+    const executor = {
+      select: () => {
+        const result = rows[selectCall++] ?? [];
+        const query: any = {
+          from: () => query,
+          where: () => query,
+          orderBy: () => query,
+          limit: () => query,
+          then: (
+            resolve: (value: unknown) => unknown,
+            reject: (error: unknown) => unknown,
+          ) => Promise.resolve(result).then(resolve, reject),
+        };
+        return query;
+      },
+    };
+
+    await expect(
+      loadSiteOpsRebuildRequest(executor, {
+        userId: 7,
+        projectId,
+        currentBuildId: null,
+        hasWorkflowProgress: true,
+      }),
+    ).resolves.toEqual({
+      allowed: true,
+      ticketId: null,
+      status: null,
+      resetApplied: true,
+      resetPending: false,
+      minimumKnowledgeSnapshotVersion: 14,
+      resetSourceBuildId: null,
+      acceptedForCurrentCycle: false,
+    });
   });
 
   it("upgrades a production-shaped V2 build ticket to a stable project coordinate on resubmission", () => {
@@ -193,6 +439,7 @@ function fixture(options?: {
   projectOverrides?: Record<string, unknown>;
   targetPage?: string;
   ticketStatus?: string;
+  resetOperation?: Record<string, unknown>;
 }) {
   const initialGlobalLiveDeploymentId =
     "50000000-0000-4000-8000-000000000005";
@@ -245,6 +492,7 @@ function fixture(options?: {
     if (table === siteBuilds) return [build];
     if (table === deliveryTickets) return [ticket];
     if (table === siteOperations) {
+      if (options?.resetOperation) return [options.resetOperation];
       return options?.activeOperation ? [{ id: "running-operation" }] : [];
     }
     if (table === siteDeployments) {
@@ -315,6 +563,34 @@ function fixture(options?: {
   return { tx, ticket, project, updates, inserts };
 }
 
+async function pendingResetFixture(
+  operationOverrides: Record<string, unknown>,
+) {
+  const first = fixture();
+  const marker = await approveSiteOpsRebuildTicket(first.tx, {
+    ticket: first.ticket,
+    actorUserId: 1,
+    now: new Date("2026-08-24T08:00:00.000Z"),
+  });
+  const operation = first.inserts.find(
+    (entry) => entry.table === siteOperations,
+  )!.values;
+  return fixture({
+    internalNote: marker!.internalNote,
+    ticketStatus: "in_progress",
+    resetOperation: {
+      ...operation,
+      result: null,
+      errorCode: null,
+      errorMessage: null,
+      providerOperationId: null,
+      providerTaskId: null,
+      attempt: 1,
+      ...operationOverrides,
+    },
+  });
+}
+
 describe("site rebuild reset approval", () => {
   it("queues one strict unpublish operation without clearing customer state early", async () => {
     const state = fixture();
@@ -370,7 +646,12 @@ describe("site rebuild reset approval", () => {
       actorUserId: 1,
       now: new Date("2026-08-24T08:00:00.000Z"),
     });
-    const replay = fixture({ internalNote: marker!.internalNote });
+    const replay = fixture({
+      internalNote: marker!.internalNote,
+      resetOperation: first.inserts.find(
+        (entry) => entry.table === siteOperations,
+      )!.values,
+    });
 
     await expect(
       approveSiteOpsRebuildTicket(replay.tx, {
@@ -385,6 +666,133 @@ describe("site rebuild reset approval", () => {
     });
     expect(replay.updates).toHaveLength(0);
     expect(replay.inserts).toHaveLength(0);
+  });
+
+  it.each([
+    "queued",
+    "running",
+    "outcome_unknown",
+  ] as const)(
+    "idempotently replays the exact active reset operation in %s",
+    async (status) => {
+      const state = await pendingResetFixture({ status });
+
+      await expect(
+        approveSiteOpsRebuildTicket(state.tx, {
+          ticket: state.ticket,
+          actorUserId: 1,
+          now: new Date("2026-08-24T09:00:00.000Z"),
+        }),
+      ).resolves.toMatchObject({
+        resetPending: true,
+        pendingReplay: true,
+      });
+      expect(state.updates).toHaveLength(0);
+      expect(state.inserts).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    "ESA_RUNTIME_DISABLED",
+    "ESA_INSTANCE_NOT_CONFIGURED",
+    "ESA_SERVICE_IDENTITY_NOT_CONFIGURED",
+    "DATABASE_UNAVAILABLE",
+  ])(
+    "CAS-requeues the same pre-mutation reset operation for %s",
+    async (errorCode) => {
+      const state = await pendingResetFixture({
+        status: "attention_required",
+        errorCode,
+      });
+
+      await expect(
+        approveSiteOpsRebuildTicket(state.tx, {
+          ticket: state.ticket,
+          actorUserId: 1,
+          now: new Date("2026-08-24T09:00:00.000Z"),
+          allowPendingRetry: true,
+        }),
+      ).resolves.toMatchObject({
+        resetPending: true,
+        resetRequeued: true,
+      });
+      expect(state.updates).toEqual([
+        expect.objectContaining({
+          table: siteOperations,
+          values: expect.objectContaining({
+            status: "queued",
+            errorCode: null,
+            errorMessage: null,
+            completedAt: null,
+          }),
+        }),
+      ]);
+      expect(state.inserts).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    {
+      name: "non-whitelisted provider failure",
+      operation: {
+        status: "attention_required",
+        errorCode: "ESA_PROVIDER_FAILED",
+      },
+    },
+    {
+      name: "persisted mutation boundary",
+      operation: {
+        status: "failed",
+        errorCode: "DATABASE_UNAVAILABLE",
+        result: { stage: "related_record_delete_unknown" },
+      },
+    },
+    {
+      name: "provider operation coordinate",
+      operation: {
+        status: "failed",
+        errorCode: "DATABASE_UNAVAILABLE",
+        providerOperationId: "esa-operation-1",
+      },
+    },
+    {
+      name: "exhausted bounded attempts",
+      operation: {
+        status: "attention_required",
+        errorCode: "ESA_RUNTIME_DISABLED",
+        attempt: 3,
+      },
+    },
+  ])("rejects $name without requeueing", async ({ operation }) => {
+    const state = await pendingResetFixture(operation);
+
+    await expect(
+      approveSiteOpsRebuildTicket(state.tx, {
+        ticket: state.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T09:00:00.000Z"),
+        allowPendingRetry: true,
+      }),
+    ).rejects.toThrow("不能盲目重新执行");
+    expect(state.updates).toHaveLength(0);
+    expect(state.inserts).toHaveLength(0);
+  });
+
+  it("requires a current ticket revision before requeueing a terminal reset", async () => {
+    const state = await pendingResetFixture({
+      status: "attention_required",
+      errorCode: "ESA_RUNTIME_DISABLED",
+    });
+
+    await expect(
+      approveSiteOpsRebuildTicket(state.tx, {
+        ticket: state.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T09:00:00.000Z"),
+        allowPendingRetry: false,
+      }),
+    ).rejects.toThrow("请刷新后重试");
+    expect(state.updates).toHaveLength(0);
   });
 
   it("approves a project-scoped request before any build exists", async () => {
@@ -515,6 +923,12 @@ describe("site rebuild reset approval", () => {
     });
     expect(siteOpsRebuildResetApplied(state.ticket.internalNote)).toBe(true);
     expect(siteOpsRebuildResetPending(state.ticket.internalNote)).toBe(false);
+    expect(state.ticket).toMatchObject({
+      status: "completed",
+      quotaState: "consumed",
+      technicalDedupeKey: null,
+      resolvedAt: new Date("2026-08-24T08:05:00.000Z"),
+    });
     expect(state.updates).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -568,5 +982,29 @@ describe("site rebuild reset approval", () => {
         expect.objectContaining({ table: deliveryTicketEvents }),
       ]),
     );
+    expect(
+      state.inserts.filter((entry) => entry.table === messages),
+    ).toHaveLength(1);
+    expect(
+      state.inserts.find((entry) => entry.table === deliveryTicketEvents)
+        ?.values,
+    ).toMatchObject({
+      fromStatus: "in_progress",
+      toStatus: "completed",
+    });
+
+    const updateCount = state.updates.length;
+    const insertCount = state.inserts.length;
+    await expect(
+      completeSiteOpsRebuildTicket(state.tx, {
+        userId: 9,
+        projectId,
+        parentBuildId: null,
+        childBuildId: "70000000-0000-4000-8000-000000000007",
+        now: new Date("2026-08-24T09:00:00.000Z"),
+      }),
+    ).resolves.toBeNull();
+    expect(state.updates).toHaveLength(updateCount);
+    expect(state.inserts).toHaveLength(insertCount);
   });
 });

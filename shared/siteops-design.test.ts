@@ -738,7 +738,7 @@ describe("SiteOps Manus design and content contracts", () => {
         contractKind: "build_plan",
       } as never),
     ).toThrow(
-      "BuildContractV4 requires the complete immutable 2.2 coordinates",
+      "BuildContractV4 requires complete, matching immutable workflow and QA coordinates",
     );
   });
 });

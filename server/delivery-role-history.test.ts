@@ -1372,7 +1372,7 @@ describe("delivery execution authorization and settlement", () => {
         revision: 5,
         expectedRevision: 4,
       }),
-    ).toBe("pending_replay");
+    ).toBe("pending_inspect");
   });
 
   it("rejects terminal or stale rebuild approval state", () => {

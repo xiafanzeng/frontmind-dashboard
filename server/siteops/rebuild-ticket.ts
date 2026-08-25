@@ -1,5 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNotNull, isNull, max, or } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  max,
+  or,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
   deliveryProjectAssignments,
@@ -69,6 +79,100 @@ type SiteOpsRebuildNoteV4 = {
   freshRootApplied?: true;
   unpublishOperationId?: string;
 };
+
+const completedFreshRootResetNoteV4Schema = z
+  .object({
+    schemaVersion: z.literal(4),
+    kind: z.literal(REBUILD_NOTE_KIND),
+    projectId: z.string().uuid(),
+    sourceBuildId: z.string().uuid().nullable(),
+    knowledgeSnapshotId: z.string().uuid().nullable(),
+    resetIntent: z.literal(APPROVED_RESET_UNPUBLISH),
+    resetOperationId: z.string().uuid(),
+    resetApprovedAt: z.string().datetime(),
+    resetExpectedProjectRevision: z.number().int().positive(),
+    minimumKnowledgeSnapshotVersion: z.number().int().positive(),
+    resetAppliedAt: z.string().datetime(),
+    resetAppliedProjectRevision: z.number().int().positive(),
+    freshRootApplied: z.literal(true),
+    unpublishOperationId: z.string().uuid(),
+  })
+  .strict()
+  .refine(
+    (note) => note.unpublishOperationId === note.resetOperationId,
+    "reset operation coordinate mismatch",
+  );
+
+const completedFreshRootResetOperationResultV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    intent: z.literal(APPROVED_RESET_UNPUBLISH),
+    stage: z.literal("exposure_removed"),
+    resetOperationId: z.string().uuid(),
+    projectId: z.string().uuid(),
+    freshRootApplied: z.literal(true),
+    minimumKnowledgeSnapshotVersion: z.number().int().positive(),
+    resetAppliedProjectRevision: z.number().int().positive(),
+  })
+  .strict();
+
+function completedFreshRootResetOperationResult(input: {
+  operationId: string;
+  projectId: string;
+  operationInput: unknown;
+  result: unknown;
+}) {
+  const resetInput = parseApprovedResetUnpublishInput(input.operationInput);
+  const parsed = completedFreshRootResetOperationResultV2Schema.safeParse(
+    input.result,
+  );
+  if (
+    !resetInput ||
+    !parsed.success ||
+    parsed.data.resetOperationId !== input.operationId ||
+    parsed.data.projectId !== input.projectId ||
+    parsed.data.resetAppliedProjectRevision !==
+      resetInput.expectedProjectRevision + 1
+  ) {
+    return null;
+  }
+  return parsed.data;
+}
+
+function completedFreshRootResetOperationProjection(input: {
+  operationId: string;
+  projectId: string;
+  minimumKnowledgeSnapshotVersion: number;
+  resetAppliedProjectRevision: number;
+}) {
+  return completedFreshRootResetOperationResultV2Schema.parse({
+    schemaVersion: 2,
+    intent: APPROVED_RESET_UNPUBLISH,
+    stage: "exposure_removed",
+    resetOperationId: input.operationId,
+    projectId: input.projectId,
+    freshRootApplied: true,
+    minimumKnowledgeSnapshotVersion: input.minimumKnowledgeSnapshotVersion,
+    resetAppliedProjectRevision: input.resetAppliedProjectRevision,
+  });
+}
+
+function completedFreshRootResetNote(
+  value: string | null | undefined,
+  projectId: string,
+): SiteOpsRebuildNoteV4 | null {
+  if (!value) return null;
+  try {
+    const parsed = completedFreshRootResetNoteV4Schema.safeParse(
+      JSON.parse(value),
+    );
+    return parsed.success && parsed.data.projectId === projectId
+      ? parsed.data
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 type SiteOpsRebuildNote =
   | SiteOpsRebuildNoteV1
@@ -390,7 +494,12 @@ export async function loadSiteOpsRebuildRequest(
         deliveryTickets.technicalDedupeKey,
         siteOpsRebuildProjectDedupeKey(input.projectId),
       );
-  const [buildRows, ticketRows] = await Promise.all([
+  const [
+    buildRows,
+    ticketRows,
+    completedTicketRows,
+    completedResetOperationRows,
+  ] = await Promise.all([
     input.currentBuildId
       ? executor
           .select()
@@ -421,10 +530,105 @@ export async function loadSiteOpsRebuildRequest(
       )
       .orderBy(asc(deliveryTickets.createdAt))
       .limit(1),
+    executor
+      .select({
+        id: deliveryTickets.id,
+        status: deliveryTickets.status,
+        internalNote: deliveryTickets.internalNote,
+      })
+      .from(deliveryTickets)
+      .where(
+        and(
+          eq(deliveryTickets.userId, input.userId),
+          eq(deliveryTickets.operation, "site_rebuild"),
+          eq(deliveryTickets.status, "completed"),
+          isNotNull(deliveryTickets.internalNote),
+        ),
+      )
+      .orderBy(desc(deliveryTickets.updatedAt)),
+    executor
+      .select({
+        id: siteOperations.id,
+        input: siteOperations.input,
+        result: siteOperations.result,
+      })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.userId, input.userId),
+          eq(siteOperations.projectId, input.projectId),
+          eq(siteOperations.kind, "rollback"),
+          eq(siteOperations.provider, "aliyun_esa"),
+          eq(siteOperations.status, "succeeded"),
+          isNotNull(siteOperations.result),
+        ),
+      )
+      .orderBy(desc(siteOperations.updatedAt)),
   ]);
   const ticket = ticketRows[0];
-  const resetApplied = siteOpsRebuildResetApplied(ticket?.internalNote);
-  const parsedNote = parseSiteOpsRebuildNote(ticket?.internalNote);
+  const activeNote = parseSiteOpsRebuildNote(ticket?.internalNote);
+  let completedTicket:
+    | { id: string; status: string; internalNote: string | null }
+    | undefined;
+  let completedNote: SiteOpsRebuildNoteV4 | null = null;
+  let completedFloor: number | null = null;
+  for (const candidate of completedTicketRows as Array<{
+    id: string;
+    status: string;
+    internalNote: string | null;
+  }>) {
+    if (candidate.status !== "completed") continue;
+    const note = completedFreshRootResetNote(
+      candidate.internalNote,
+      input.projectId,
+    );
+    if (!note) continue;
+    completedFloor = Math.max(
+      completedFloor ?? 0,
+      note.minimumKnowledgeSnapshotVersion,
+    );
+    // Rows are newest-first. Preserve the newest valid completed coordinate
+    // for display, but scan every valid reset so the permanent isolation floor
+    // can never move backwards after multiple fresh-root cycles.
+    if (!completedTicket) {
+      completedTicket = candidate;
+      completedNote = note;
+    }
+  }
+  let completedOperationFloor: number | null = null;
+  for (const candidate of completedResetOperationRows as Array<{
+    id: string;
+    input: unknown;
+    result: unknown;
+  }>) {
+    const result = completedFreshRootResetOperationResult({
+      operationId: candidate.id,
+      projectId: input.projectId,
+      operationInput: candidate.input,
+      result: candidate.result,
+    });
+    if (!result) continue;
+    completedOperationFloor = Math.max(
+      completedOperationFloor ?? 0,
+      result.minimumKnowledgeSnapshotVersion,
+    );
+  }
+  const activeFloor = siteOpsRebuildMinimumSnapshotVersion(
+    ticket?.internalNote,
+  );
+  const floorCandidates = [
+    activeFloor,
+    completedFloor,
+    completedOperationFloor,
+  ].filter((value): value is number => value !== null);
+  const minimumKnowledgeSnapshotVersion = floorCandidates.length
+    ? Math.max(...floorCandidates)
+    : null;
+  const resetApplied = ticket
+    ? siteOpsRebuildResetApplied(ticket.internalNote)
+    : siteOpsRebuildResetApplied(completedTicket?.internalNote) ||
+      completedOperationFloor !== null;
+  const coordinateNote = ticket ? activeNote : completedNote;
   const disposition = siteOpsRebuildRequestDisposition({
     hasWorkflowProgress:
       input.hasWorkflowProgress ??
@@ -438,10 +642,11 @@ export async function loadSiteOpsRebuildRequest(
     status: ticket?.status ?? null,
     resetApplied,
     resetPending: siteOpsRebuildResetPending(ticket?.internalNote),
-    minimumKnowledgeSnapshotVersion:
-      siteOpsRebuildMinimumSnapshotVersion(ticket?.internalNote),
-    resetSourceBuildId: parsedNote?.sourceBuildId ?? null,
+    minimumKnowledgeSnapshotVersion,
+    resetSourceBuildId: coordinateNote?.sourceBuildId ?? null,
     acceptedForCurrentCycle: siteOpsRebuildAcceptedForCurrentCycle({
+      // A completed ticket contributes only the permanent isolation floor.
+      // It must never authorize another child build after its cycle closed.
       internalNote: ticket?.internalNote,
       currentBuildId: input.currentBuildId,
     }),
@@ -729,6 +934,7 @@ export async function approveSiteOpsRebuildTicket(
     actorUserId: number;
     now: Date;
     reapply?: boolean;
+    allowPendingRetry?: boolean;
   },
 ) {
   if (input.ticket.operation !== "site_rebuild") return null;
@@ -807,7 +1013,40 @@ export async function approveSiteOpsRebuildTicket(
     !existingNote.resetAppliedAt &&
     !input.reapply
   ) {
-    return {
+    const resetOperationRows = await tx
+      .select()
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.id, existingNote.resetOperationId),
+          eq(siteOperations.projectId, project.id),
+          eq(siteOperations.userId, project.userId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    const resetOperation = resetOperationRows[0];
+    const resetInput = resetOperation
+      ? parseApprovedResetUnpublishInput(resetOperation.input)
+      : null;
+    if (
+      !resetOperation ||
+      resetOperation.id !== existingNote.resetOperationId ||
+      resetOperation.projectId !== project.id ||
+      resetOperation.userId !== project.userId ||
+      resetOperation.kind !== "rollback" ||
+      resetOperation.provider !== "aliyun_esa" ||
+      !resetInput ||
+      resetInput.rebuildTicketId !== input.ticket.id ||
+      resetInput.expectedProjectRevision !==
+        existingNote.resetExpectedProjectRevision
+    ) {
+      throw new SiteOpsRebuildTicketError(
+        "INVALID_TICKET",
+        "官网重置下线任务坐标不一致，不能重放或重新排队。",
+      );
+    }
+    const pendingResult = {
       projectId: project.id,
       sourceBuildId: existingNote.sourceBuildId,
       resetApplied: true as const,
@@ -817,6 +1056,84 @@ export async function approveSiteOpsRebuildTicket(
         existingNote.resetExpectedProjectRevision,
       internalNote: JSON.stringify(existingNote),
     };
+    if (
+      ["queued", "running", "outcome_unknown"].includes(
+        resetOperation.status,
+      )
+    ) {
+      return { ...pendingResult, pendingReplay: true as const };
+    }
+    if (
+      !["failed", "attention_required"].includes(resetOperation.status)
+    ) {
+      throw new SiteOpsRebuildTicketError(
+        "INVALID_TICKET",
+        "官网重置下线任务已结束且不能安全重试。",
+      );
+    }
+    if (!input.allowPendingRetry) {
+      throw new SiteOpsRebuildTicketError(
+        "INVALID_TICKET",
+        "需求已被更新，请刷新后重试。",
+      );
+    }
+    const retryErrorCode = resetOperation.errorCode;
+    const retryablePreMutationCode =
+      typeof retryErrorCode === "string" &&
+      (retryErrorCode === "ESA_RUNTIME_DISABLED" ||
+        retryErrorCode === "DATABASE_UNAVAILABLE" ||
+        /^ESA_[A-Z0-9_]+_NOT_CONFIGURED$/u.test(retryErrorCode));
+    const hasMutationBoundary =
+      resetOperation.result != null ||
+      resetOperation.providerOperationId != null ||
+      resetOperation.providerTaskId != null;
+    const attempt = Number(resetOperation.attempt ?? 0);
+    if (
+      typeof retryErrorCode !== "string" ||
+      !retryablePreMutationCode ||
+      hasMutationBoundary ||
+      !Number.isInteger(attempt) ||
+      attempt < 0 ||
+      attempt >= 3
+    ) {
+      throw new SiteOpsRebuildTicketError(
+        "INVALID_TICKET",
+        "官网重置下线任务已失败，因已触达外部变更边界、错误不可重试或重试次数已用尽，不能盲目重新执行。",
+      );
+    }
+    const retryUpdate = await tx
+      .update(siteOperations)
+      .set({
+        status: "queued",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        errorCode: null,
+        errorMessage: null,
+        completedAt: null,
+        updatedAt: input.now,
+      })
+      .where(
+        and(
+          eq(siteOperations.id, existingNote.resetOperationId),
+          eq(siteOperations.projectId, project.id),
+          eq(siteOperations.userId, project.userId),
+          eq(siteOperations.kind, "rollback"),
+          eq(siteOperations.provider, "aliyun_esa"),
+          eq(siteOperations.status, resetOperation.status),
+          eq(siteOperations.errorCode, retryErrorCode),
+          eq(siteOperations.attempt, attempt),
+          isNull(siteOperations.result),
+          isNull(siteOperations.providerOperationId),
+          isNull(siteOperations.providerTaskId),
+        ),
+      );
+    if (affectedRows(retryUpdate) !== 1) {
+      throw new SiteOpsRebuildTicketError(
+        "IN_FLIGHT_OPERATION",
+        "官网重置下线任务已变化，未重新排队，请刷新后重试。",
+      );
+    }
+    return { ...pendingResult, resetRequeued: true as const };
   }
   if (siteOpsRebuildResetApplied(input.ticket.internalNote) && !input.reapply) {
     if (
@@ -1051,6 +1368,13 @@ export async function finalizeApprovedSiteOpsReset(
       status: "applied" as const,
       projectRevision: note.resetAppliedProjectRevision,
       internalNote: JSON.stringify(note),
+      operationResult: completedFreshRootResetOperationProjection({
+        operationId: input.operation.id,
+        projectId: project.id,
+        minimumKnowledgeSnapshotVersion:
+          note.minimumKnowledgeSnapshotVersion,
+        resetAppliedProjectRevision: note.resetAppliedProjectRevision,
+      }),
     };
   }
 
@@ -1230,14 +1554,17 @@ export async function finalizeApprovedSiteOpsReset(
     freshRootApplied: true,
     unpublishOperationId: input.operation.id,
   };
+  const priorTicketStatus = ticket.status;
   const ticketUpdate = await tx
     .update(deliveryTickets)
     .set({
-      status: "in_progress",
+      status: "completed",
       publicSummary:
-        "旧网站已安全下线，等待客户全新上传知识资料并创建全新任务。",
+        "旧网站已安全下线，重置已完成；请全新上传知识资料并创建独立的新任务。",
       internalNote: JSON.stringify(appliedNote),
-      resolvedAt: null,
+      quotaState: "consumed",
+      technicalDedupeKey: null,
+      resolvedAt: input.now,
       revision: ticket.revision + 1,
       updatedAt: input.now,
     })
@@ -1260,8 +1587,8 @@ export async function finalizeApprovedSiteOpsReset(
     visibility: "customer",
     message:
       "旧网站已安全下线，旧流程已清空，请全新上传资料并创建全新任务。",
-    fromStatus: ticket.status,
-    toStatus: "in_progress",
+    fromStatus: priorTicketStatus,
+    toStatus: "completed",
     actorContext: {
       projectAssignmentId: ticket.assignedProjectAssignmentId!,
       customerUserId: ticket.userId,
@@ -1273,6 +1600,13 @@ export async function finalizeApprovedSiteOpsReset(
     status: "applied" as const,
     projectRevision: nextRevision,
     internalNote: JSON.stringify(appliedNote),
+    operationResult: completedFreshRootResetOperationProjection({
+      operationId: input.operation.id,
+      projectId: project.id,
+      minimumKnowledgeSnapshotVersion:
+        appliedNote.minimumKnowledgeSnapshotVersion,
+      resetAppliedProjectRevision: nextRevision,
+    }),
   };
 }
 
@@ -1317,6 +1651,7 @@ export async function completeSiteOpsRebuildTicket(
   const ticket = ticketRows[0];
   if (
     !ticket ||
+    ticket.status !== "in_progress" ||
     !siteOpsRebuildResetApplied(ticket.internalNote) ||
     parseSiteOpsRebuildNote(ticket.internalNote)?.projectId !== input.projectId
   ) {

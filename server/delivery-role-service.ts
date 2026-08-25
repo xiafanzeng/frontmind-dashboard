@@ -1357,6 +1357,9 @@ export async function getMyDeliveryTickets(input: {
         siteRebuildResetApplied:
           ticket.operation === "site_rebuild" &&
           siteOpsRebuildResetApplied(ticket.internalNote),
+        siteRebuildResetPending:
+          ticket.operation === "site_rebuild" &&
+          siteOpsRebuildResetPending(ticket.internalNote),
         ...dependencyForTicket(ticket),
       };
     },
@@ -1377,6 +1380,9 @@ export async function getMyDeliveryTickets(input: {
           siteRebuildResetApplied:
             nextPendingRow.ticket.operation === "site_rebuild" &&
             siteOpsRebuildResetApplied(nextPendingRow.ticket.internalNote),
+          siteRebuildResetPending:
+            nextPendingRow.ticket.operation === "site_rebuild" &&
+            siteOpsRebuildResetPending(nextPendingRow.ticket.internalNote),
           customerName:
             nextPendingRow.customerName ||
             nextPendingRow.customerUsername ||
@@ -2065,6 +2071,9 @@ export async function getMyDeliveryTicketDetail(input: {
       siteRebuildResetApplied:
         row.ticket.operation === "site_rebuild" &&
         siteOpsRebuildResetApplied(row.ticket.internalNote),
+      siteRebuildResetPending:
+        row.ticket.operation === "site_rebuild" &&
+        siteOpsRebuildResetPending(row.ticket.internalNote),
       createdAt: row.ticket.createdAt.getTime(),
       updatedAt: row.ticket.updatedAt.getTime(),
       resolvedAt: row.ticket.resolvedAt?.getTime() ?? null,
@@ -4698,7 +4707,10 @@ export function siteOpsRebuildApprovalDisposition(input: {
     return "replay" as const;
   }
   if (input.resetPending && input.status === "in_progress") {
-    return "pending_replay" as const;
+    // The exact V4 operation must be inspected under lock: active states are
+    // idempotent replays, while a narrowly retryable pre-mutation failure may
+    // be CAS-requeued by a current administrator approval.
+    return "pending_inspect" as const;
   }
   if (input.revision !== input.expectedRevision) {
     throw new AuthServiceError("CONFLICT", "需求已被更新，请刷新后重试");
@@ -4773,16 +4785,6 @@ export async function approveMySiteOpsRebuild(input: {
         resetApplied: true as const,
       };
     }
-    if (approvalDisposition === "pending_replay") {
-      return {
-        success: true as const,
-        ticketId: ticket.id,
-        status: "in_progress" as const,
-        revision: ticket.revision,
-        resetApplied: false as const,
-        resetPending: true as const,
-      };
-    }
     const now = new Date();
     let approval: Awaited<ReturnType<typeof approveSiteOpsRebuildTicket>>;
     try {
@@ -4791,6 +4793,7 @@ export async function approveMySiteOpsRebuild(input: {
         actorUserId: input.actor.id,
         now,
         reapply: siteOpsRebuildResetApplied(ticket.internalNote),
+        allowPendingRetry: ticket.revision === input.expectedRevision,
       });
     } catch (error) {
       if (error instanceof SiteOpsRebuildTicketError) {
@@ -4801,9 +4804,23 @@ export async function approveMySiteOpsRebuild(input: {
     if (!approval) {
       throw new AuthServiceError("CONFLICT", "官网重制需求无法执行重置。");
     }
+    if ("pendingReplay" in approval && approval.pendingReplay) {
+      return {
+        success: true as const,
+        ticketId: ticket.id,
+        status: "in_progress" as const,
+        revision: ticket.revision,
+        resetApplied: false as const,
+        resetPending: true as const,
+      };
+    }
     const resetPending = approval.resetPending === true;
+    const resetRequeued =
+      "resetRequeued" in approval && approval.resetRequeued === true;
     const message = resetPending
-      ? "官网重制需求已通过，正在安全下线旧网站；完成前不会清空线上坐标。"
+      ? resetRequeued
+        ? "官网重置下线已重新排队；下线完成后，客户需全新上传知识库。"
+        : "官网重制需求已通过，正在安全下线旧网站；完成后客户需全新上传知识库。"
       : "官网重制需求已通过，旧网站已下线，请全新上传知识库。";
     const ticketUpdate = await tx
       .update(deliveryTickets)
@@ -4853,6 +4870,7 @@ export async function approveMySiteOpsRebuild(input: {
       revision: ticket.revision + 1,
       resetApplied: !resetPending,
       resetPending,
+      ...(resetRequeued ? { resetRequeued: true as const } : {}),
       ...(!resetPending
         ? {
             resetAppliedProjectRevision:

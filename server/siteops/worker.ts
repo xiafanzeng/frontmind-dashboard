@@ -28,7 +28,6 @@ import {
 import { siteOpsQuotaStateForProviderResult } from "./quota-service";
 import { publicSiteOpsProviderResult } from "./public-errors";
 import {
-  completeSiteOpsRebuildTicket,
   finalizeApprovedSiteOpsReset,
   parseApprovedResetUnpublishInput,
 } from "./rebuild-ticket";
@@ -838,6 +837,15 @@ async function finalize(
             "SITEOPS_RESET_INVALIDATED",
             "官网重置坐标已变化，系统未清除当前流程。",
           );
+        } else {
+          // Persist the permanent fresh-root floor on the immutable reset
+          // operation as well as the delivery ticket. Terminal tickets may be
+          // removed by retention, while this audit result remains the trusted
+          // source that prevents an old knowledge snapshot from reappearing.
+          resetResult = {
+            ...result,
+            result: resetFinalization.operationResult,
+          };
         }
       }
       const resetTerminalUpdate = await tx
@@ -1099,26 +1107,6 @@ async function finalize(
           updatedAt: now,
         })
         .where(eq(siteBuilds.id, locked.buildId));
-    }
-    if (!unsuccessful && locked.buildId && result.buildStatus === "approved") {
-      const completedBuildRows = await tx
-        .select({ parentBuildId: siteBuilds.parentBuildId })
-        .from(siteBuilds)
-        .where(
-          and(
-            eq(siteBuilds.id, locked.buildId),
-            eq(siteBuilds.projectId, locked.projectId),
-            eq(siteBuilds.userId, locked.userId),
-          ),
-        )
-        .limit(1);
-      await completeSiteOpsRebuildTicket(tx, {
-        userId: locked.userId,
-        projectId: locked.projectId,
-        parentBuildId: completedBuildRows[0]?.parentBuildId ?? null,
-        childBuildId: locked.buildId,
-        now,
-      });
     }
     await tx
       .update(socialPackages)

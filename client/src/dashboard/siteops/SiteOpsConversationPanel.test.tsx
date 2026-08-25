@@ -1454,6 +1454,33 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
+  it("does not present a completed reset coordinate as an active reset", () => {
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: true,
+            resetPending: false,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "申请重置并全新开始" }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByRole("button", {
+        name: "重置已批准，请全新上传知识库",
+      }),
+    ).toBeNull();
+  });
+
   it("hides the previous website surface after an approved rebuild reset", () => {
     render(
       <SiteOpsConversationPanel

@@ -290,14 +290,7 @@ describe("SiteOps React/QA terminal transaction", () => {
     });
     expect(fixture.project.status).toBe("approved");
     expect(fixture.project.currentBuildId).toBe(fixture.build.id);
-    expect(dependencies.completeRebuildTicket).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        userId: 7,
-        parentBuildId: "40000000-0000-4000-8000-000000000004",
-        childBuildId: fixture.build.id,
-      }),
-    );
+    expect(dependencies.completeRebuildTicket).not.toHaveBeenCalled();
   });
 
   it("consumes the reserved quota for a successful root website build", async () => {
@@ -350,6 +343,16 @@ describe("SiteOps React/QA terminal transaction", () => {
       status: "applied",
       projectRevision: 5,
       internalNote: "safe-marker",
+      operationResult: {
+        schemaVersion: 2,
+        intent: "approved_reset_unpublish",
+        stage: "exposure_removed",
+        resetOperationId: fixture.operation.id,
+        projectId: fixture.project.id,
+        freshRootApplied: true,
+        minimumKnowledgeSnapshotVersion: 8,
+        resetAppliedProjectRevision: 5,
+      },
     });
     dependencies.getDb.mockResolvedValue(fixture.db);
     dependencies.getProvider.mockReturnValue(
@@ -383,6 +386,13 @@ describe("SiteOps React/QA terminal transaction", () => {
       }),
     );
     expect(fixture.operation.status).toBe("succeeded");
+    expect(fixture.operation.result).toMatchObject({
+      schemaVersion: 2,
+      resetOperationId: fixture.operation.id,
+      projectId: fixture.project.id,
+      minimumKnowledgeSnapshotVersion: 8,
+      resetAppliedProjectRevision: 5,
+    });
     const terminalWrites = fixture.writes.filter(
       (write) => write.transactionId === 2,
     );
