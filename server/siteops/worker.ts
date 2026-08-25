@@ -343,7 +343,7 @@ export function knownSiteOpsBuildFailure(
     message:
       error instanceof Error && error.message.trim()
         ? error.message
-        : "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+        : "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
   };
 }
 
@@ -715,7 +715,7 @@ async function finalize(
           status: "failed",
           code: "BUILD_ARTIFACT_BINDING_FAILED",
           message:
-            "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+            "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
           providerTaskId:
             providerResult.providerTaskId ?? locked.providerTaskId ?? undefined,
           result: {

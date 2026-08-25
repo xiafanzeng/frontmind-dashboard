@@ -312,7 +312,12 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByText("批准后，当前线上官网会进入下线流程。"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("旧知识库、视觉方案和生成任务不会继续使用。"),
+      screen.getByText(
+        "当前企业知识库会保留，并作为全新建站的资料来源。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("旧视觉方案和生成任务不会继续使用。"),
     ).toBeInTheDocument();
     expect(onAction).not.toHaveBeenCalled();
 
@@ -868,7 +873,7 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
-  it("selects an immutable knowledge snapshot through a structured action", async () => {
+  it("starts from the current knowledge base without exposing version controls", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
@@ -878,6 +883,17 @@ describe("SiteOpsConversationPanel", () => {
             currentKnowledgeSnapshotId: null,
             status: "draft",
           },
+          knowledgeSnapshots: [
+            ...observation().knowledgeSnapshots,
+            {
+              id: "99999999-9999-4999-8999-999999999999",
+              label: "知识库 ZIP · 第 4 版",
+              archiveSha256: "b".repeat(64),
+              sourceProfile: "dashboard-core-v1",
+              createdAt: "2026-08-22T01:00:00.000Z",
+              active: false,
+            },
+          ],
           messages: [],
           visualCandidates: [],
           interactionState: "select_snapshot",
@@ -886,102 +902,81 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    fireEvent.change(screen.getByLabelText("知识库 ZIP 版本"), {
-      target: { value: "22222222-2222-4222-8222-222222222222" },
+    expect(
+      screen.getByRole("heading", { name: "从知识库开始建站" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("知识库 ZIP 版本"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("更换知识库 ZIP 版本"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/知识库 ZIP · 第/u)).not.toBeInTheDocument();
+    const startButton = screen.getByRole("button", {
+      name: "从知识库开始建站",
     });
-    fireEvent.click(screen.getByRole("button", { name: "使用此版本" }));
+    expect(startButton).toHaveClass("siteops-primary-button");
+    fireEvent.click(startButton);
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "select_snapshot",
-        input: {
-          knowledgeSnapshotId: "22222222-2222-4222-8222-222222222222",
-        },
+        input: {},
       }),
     );
   });
 
-  it("changes to another owned snapshot explicitly without rewriting the old build", async () => {
+  it("keeps the start action available for a stale empty snapshot projection after reset", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(
       <SiteOpsConversationPanel
         observation={observation({
-          project: { ...observation().project, status: "live" },
-          interactionState: "live",
-          knowledgeSnapshots: [
-            ...observation().knowledgeSnapshots,
-            {
-              id: "99999999-9999-4999-8999-999999999999",
-              label: "知识库 ZIP · 第 4 版",
-              archiveSha256: "b".repeat(64),
-              sourceProfile: "dashboard-core-v1",
-              createdAt: "2026-08-22T01:00:00.000Z",
-              active: false,
-            },
-          ],
+          project: {
+            ...observation().project,
+            currentKnowledgeSnapshotId: null,
+            status: "draft",
+          },
+          knowledgeSnapshots: [],
+          messages: [],
+          visualCandidates: [],
+          rebuildRequest: {
+            allowed: true,
+            ticketId: null,
+            status: null,
+            resetApplied: true,
+            resetPending: false,
+            resetSourceBuildId: "33333333-3333-4333-8333-333333333333",
+          },
+          interactionState: "select_snapshot",
         })}
         onAction={onAction}
       />,
     );
 
-    fireEvent.change(screen.getByLabelText("更换知识库 ZIP 版本"), {
-      target: { value: "99999999-9999-4999-8999-999999999999" },
+    expect(
+      screen.getByText(
+        "FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("知识库 ZIP 版本"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("更换知识库 ZIP 版本"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /上传/u }),
+    ).not.toBeInTheDocument();
+    const startButton = screen.getByRole("button", {
+      name: "从知识库开始建站",
     });
-    fireEvent.click(
-      screen.getByRole("button", { name: "更换知识源并重新整理" }),
-    );
+    expect(startButton).toBeEnabled();
+    fireEvent.click(startButton);
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
-        action: "change_snapshot",
-        input: {
-          knowledgeSnapshotId: "99999999-9999-4999-8999-999999999999",
-        },
+        action: "select_snapshot",
+        input: {},
       }),
     );
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("旧官网版本"));
-    confirm.mockRestore();
-  });
-
-  it("disables a knowledge-source change while a build is nonterminal", () => {
-    render(
-      <SiteOpsConversationPanel
-        observation={observation({
-          builds: [
-            {
-              id: "33333333-3333-4333-8333-333333333333",
-              ordinal: 2,
-              parentBuildId: null,
-              status: "building",
-              previewUrl: null,
-              sourceUrl: null,
-              needsHelp: false,
-              createdAt: "2026-08-22T00:00:00.000Z",
-              updatedAt: "2026-08-22T00:01:00.000Z",
-            },
-          ],
-          project: { ...observation().project, status: "building" },
-          interactionState: "building",
-          knowledgeSnapshots: [
-            ...observation().knowledgeSnapshots,
-            {
-              id: "99999999-9999-4999-8999-999999999999",
-              label: "知识库 ZIP · 第 4 版",
-              archiveSha256: "b".repeat(64),
-              sourceProfile: "dashboard-core-v1",
-              createdAt: "2026-08-22T01:00:00.000Z",
-              active: false,
-            },
-          ],
-        })}
-        onAction={vi.fn()}
-      />,
-    );
-    fireEvent.change(screen.getByLabelText("更换知识库 ZIP 版本"), {
-      target: { value: "99999999-9999-4999-8999-999999999999" },
-    });
-    expect(
-      screen.getByRole("button", { name: "更换知识源并重新整理" }),
-    ).toBeDisabled();
   });
 
   it("keeps provider configuration failures visible without inventing candidates", () => {
@@ -1476,7 +1471,7 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeEnabled();
     expect(
       screen.queryByRole("button", {
-        name: "重置已批准，请全新上传知识库",
+        name: "重置已批准，可从当前知识库重新开始",
       }),
     ).toBeNull();
   });
@@ -1519,10 +1514,10 @@ describe("SiteOpsConversationPanel", () => {
     );
 
     expect(
-      screen.getByRole("heading", { name: "选择知识库 ZIP 版本" }),
+      screen.getByRole("heading", { name: "从知识库开始建站" }),
     ).toBeInTheDocument();
     expect(screen.getByText("当前阶段").parentElement).toHaveTextContent(
-      "选择知识库 ZIP 版本",
+      "从知识库开始建站",
     );
     expect(screen.queryByText("官网版本 2")).not.toBeInTheDocument();
     expect(
@@ -1533,7 +1528,7 @@ describe("SiteOpsConversationPanel", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "重置已批准，请全新上传知识库",
+        name: "重置已批准，可从当前知识库重新开始",
       }),
     ).toBeEnabled();
     expect(screen.queryByText("重置申请处理中")).not.toBeInTheDocument();

@@ -1776,6 +1776,11 @@ async function projectObservation(
             },
           }
         : statusProjectedMetadata;
+      const projectedContent =
+        originalPayload?.reset === true &&
+        originalPayload?.unpublishCompleted === true
+          ? "旧官网已下线，官网重置已完成；企业知识库保持不变，可从当前知识库重新开始建站。"
+          : row.content;
       return [
         {
           id: row.id,
@@ -1783,13 +1788,13 @@ async function projectObservation(
           content:
             row.role === "assistant" && siteOps
               ? publicSiteOpsMessageText({
-                  content: row.content,
+                  content: projectedContent,
                   errorCode:
                     typeof payload?.errorCode === "string"
                       ? payload.errorCode
                       : null,
                 })
-              : row.content,
+              : projectedContent,
           sequence: row.sequence,
           metadata: projectedMetadata,
           sentAt: row.sentAt.toISOString(),
@@ -2024,9 +2029,7 @@ async function projectObservation(
       .filter(
         (row: typeof knowledgeBaseSnapshots.$inferSelect) =>
           typeof row.archiveHash === "string" &&
-          /^[a-f0-9]{64}$/u.test(row.archiveHash) &&
-          row.version >=
-            (rebuildRequest.minimumKnowledgeSnapshotVersion ?? 0),
+          /^[a-f0-9]{64}$/u.test(row.archiveHash),
       )
       .map((row: typeof knowledgeBaseSnapshots.$inferSelect) => ({
         id: row.id,
@@ -2178,13 +2181,13 @@ export async function openSiteOps(actor: AuthenticatedUser) {
       userId: actor.id,
       role: "assistant",
       content:
-        "请选择一个已完成的知识库 ZIP 版本。我会先核对公司资料，只询问真正缺失且会影响官网的内容。",
+        "点击下方按钮，FrontMind 将自动连接当前企业知识库并开始整理建站资料。",
       siteOps: {
         kind: "brief_question",
         subjectId: projectId,
         revision: 1,
         status: "active",
-        payload: { requested: "knowledge_snapshot" },
+        payload: { requested: "current_knowledge" },
       },
     });
     const inserted = await loadOwnedProject(tx, actor.id, conversationId);
@@ -2783,7 +2786,7 @@ export async function sendSiteOpsMessage(
       // does not copy arbitrary bytes into the build contract from chat input.
       throw new SiteOpsServiceError(
         "INVALID_INPUT",
-        "当前建站会话暂不接受游离附件，请先更新知识库 ZIP。",
+        "当前建站会话不接收临时附件；请先在企业知识库中更新资料，再返回官网流程。",
         400,
       );
     }
@@ -2897,7 +2900,7 @@ export function parseSiteOpsActionPayload(
     case "resume_build":
       throw new SiteOpsServiceError(
         "STATE_CONFLICT",
-        "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，请全新上传知识库并重新生成。",
+        "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，可从当前企业知识库重新开始建站。",
         409,
       );
     case "request_rebuild":
@@ -2906,6 +2909,10 @@ export function parseSiteOpsActionPayload(
         .strict()
         .parse(raw);
     case "select_snapshot":
+      return z
+        .object({ knowledgeSnapshotId: uuidSchema.optional() })
+        .strict()
+        .parse(raw);
     case "change_snapshot":
       return z.object({ knowledgeSnapshotId: uuidSchema }).strict().parse(raw);
     case "start_visual_search":
@@ -3436,7 +3443,7 @@ export function assertSiteOpsSnapshotChangeState(input: {
   if (input.activeBuild || input.activeDeployment || input.activeVisualSearch) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "当前仍有视觉检索、建站或发布任务在运行；完成后才能更换知识源。",
+      "当前仍有视觉检索、建站或发布任务在运行；完成后才能重新连接知识库。",
       409,
     );
   }
@@ -3488,7 +3495,7 @@ async function handleSelectSnapshot(
     turnId: string;
     requestId: string;
     requestHash: string;
-    payload: { knowledgeSnapshotId: string };
+    payload: { knowledgeSnapshotId?: string };
   },
 ) {
   if (
@@ -3497,8 +3504,21 @@ async function handleSelectSnapshot(
   ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "知识库版本已经冻结；更换知识源必须从当前版本创建新的建站版本。",
+      "当前官网任务已经连接知识库；如需重新开始，请先提交官网重置申请。",
       409,
+    );
+  }
+  const lockedUsers = await tx
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.id, input.actor.id))
+    .limit(1)
+    .for("update");
+  if (!lockedUsers[0]) {
+    throw new SiteOpsServiceError(
+      "NOT_FOUND",
+      "当前账号不可用，请刷新后重新登录。",
+      404,
     );
   }
   const rows = await tx
@@ -3506,43 +3526,50 @@ async function handleSelectSnapshot(
     .from(knowledgeBaseSnapshots)
     .where(
       and(
-        eq(knowledgeBaseSnapshots.id, input.payload.knowledgeSnapshotId),
         eq(knowledgeBaseSnapshots.userId, input.actor.id),
         eq(knowledgeBaseSnapshots.status, "active"),
       ),
     )
-    .limit(1);
-  if (!rows[0]) {
+    .orderBy(
+      desc(knowledgeBaseSnapshots.version),
+      desc(knowledgeBaseSnapshots.createdAt),
+      desc(knowledgeBaseSnapshots.id),
+    )
+    .limit(200)
+    .for("update");
+  const snapshot = rows.find(
+    (row: typeof knowledgeBaseSnapshots.$inferSelect) =>
+      typeof row.archiveHash === "string" &&
+      /^[a-f0-9]{64}$/u.test(row.archiveHash),
+  );
+  if (!snapshot) {
     throw new SiteOpsServiceError(
       "NOT_FOUND",
-      "所选知识库 ZIP 版本不存在或不可用。",
+      "当前账号还没有可用于建站的已发布知识库，请先完成知识库后重试。",
       404,
     );
   }
-  const rebuild = await loadSiteOpsRebuildRequest(tx, {
-    userId: input.actor.id,
-    projectId: input.project.id,
-    currentBuildId: input.project.currentBuildId,
-    hasWorkflowProgress: true,
-  });
   if (
-    rebuild.minimumKnowledgeSnapshotVersion !== null &&
-    rows[0].version < rebuild.minimumKnowledgeSnapshotVersion
+    input.payload.knowledgeSnapshotId &&
+    input.payload.knowledgeSnapshotId !== snapshot.id
   ) {
     throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      `重置后必须全新上传知识库；请选择 v${rebuild.minimumKnowledgeSnapshotVersion} 或更高版本。`,
+      "REVISION_CONFLICT",
+      "当前知识库已更新，请刷新后从当前知识库开始建站。",
       409,
     );
   }
-  const brief = siteBriefFromSnapshot(rows[0]);
+  const brief = siteBriefFromSnapshot(snapshot);
   await reserveOperation(tx, {
     actor: input.actor,
     project: input.project,
     turnId: input.turnId,
     clientRequestId: input.requestId,
     requestHash: input.requestHash,
-    payload: input.payload,
+    payload: {
+      knowledgeSnapshotId: snapshot.id,
+      knowledgeArchiveHash: snapshot.archiveHash,
+    },
     kind: "brief_message",
     status: "succeeded",
   });
@@ -3551,7 +3578,7 @@ async function handleSelectSnapshot(
     userId: input.actor.id,
     role: "user",
     turnId: input.turnId,
-    content: `已选择知识库 ZIP 版本：v${rows[0].version}`,
+    content: "从当前企业知识库开始建站",
   });
   await appendMessage(tx, {
     conversationId: input.project.conversationId,
@@ -3559,19 +3586,19 @@ async function handleSelectSnapshot(
     role: "assistant",
     turnId: input.turnId,
     content:
-      "知识库版本已选择，FrontMind 正在整理建站资料；未确认的信息不会写入官网。",
+      "已连接当前企业知识库，FrontMind 正在整理建站资料；未确认的信息不会写入官网。",
     siteOps: {
       kind: "brief_question",
       subjectId: input.project.id,
       revision: input.project.revision + 1,
       status: "active",
-      payload: { knowledgeSnapshotId: rows[0].id },
+      payload: { knowledgeSnapshotId: snapshot.id },
     },
   });
   await tx
     .update(siteProjects)
     .set({
-      currentKnowledgeSnapshotId: rows[0].id,
+      currentKnowledgeSnapshotId: snapshot.id,
       brief,
       primaryLanguage: brief.primaryLanguage,
       status: "collecting_brief",
@@ -3793,7 +3820,7 @@ async function handleVisualSearch(
   if (!input.project.currentKnowledgeSnapshotId) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "请先选择知识库 ZIP 版本。",
+      "请先从当前企业知识库开始建站。",
       409,
     );
   }
@@ -3958,7 +3985,7 @@ async function selectVisualSample(
   if (!input.project.currentKnowledgeSnapshotId) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "请先选择知识库 ZIP 版本。",
+      "请先从当前企业知识库开始建站。",
       409,
     );
   }
@@ -4178,17 +4205,7 @@ async function selectVisualSample(
   if (!snapshot?.archiveHash) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "知识库版本校验尚未完成，暂时不能开始制作官网。",
-      409,
-    );
-  }
-  if (
-    input.rebuildRequest.minimumKnowledgeSnapshotVersion !== null &&
-    snapshot.version < input.rebuildRequest.minimumKnowledgeSnapshotVersion
-  ) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "旧知识库版本已被本轮重置隔离，请全新上传知识库后再开始建站。",
+      "当前企业知识库校验尚未完成，暂时不能开始制作官网。",
       409,
     );
   }
@@ -4283,7 +4300,7 @@ async function selectVisualSample(
   });
   if (
     parentBuildId === null &&
-    input.rebuildRequest.minimumKnowledgeSnapshotVersion !== null
+    input.rebuildRequest.resetApplied
   ) {
     const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
     console.info("[siteops] fresh_root_created", {
@@ -4860,7 +4877,7 @@ async function handleSocialPackage(
   if (!input.project.currentKnowledgeSnapshotId) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "请先选择知识库 ZIP 版本。",
+      "请先从当前企业知识库开始建站。",
       409,
     );
   }
@@ -5335,10 +5352,16 @@ export async function actOnSiteOps(
   assertEnabled();
   assertCustomer(actor);
   const input = siteOpsActInputSchema.parse(value);
-  if (input.action === "resume_build" || input.action === "reset_workflow") {
+  if (
+    input.action === "resume_build" ||
+    input.action === "reset_workflow" ||
+    input.action === "change_snapshot"
+  ) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
-      "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，请全新上传知识库并重新生成。",
+      input.action === "change_snapshot"
+        ? "官网流程不再支持手动选择知识库版本；如需重新连接，请先重置官网任务，再点击“从知识库开始建站”。"
+        : "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，可从当前企业知识库重新开始建站。",
       409,
     );
   }
@@ -5443,7 +5466,7 @@ export async function actOnSiteOps(
       case "select_snapshot":
         await handleSelectSnapshot(tx, {
           ...common,
-          payload: payload as { knowledgeSnapshotId: string },
+          payload: payload as { knowledgeSnapshotId?: string },
         });
         break;
       case "change_snapshot":

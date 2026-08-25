@@ -1444,9 +1444,9 @@ function CustomerWorkbenchView({
             {focusedTicket.operation === "site_rebuild"
               ? focusedTicket.siteRebuildResetApplied === true &&
                 focusedTicket.status === "in_progress"
-                ? "当前需求状态：旧官网已下线，等待客户全新上传。"
+                ? "当前需求状态：旧官网已下线，企业知识库保持不变；客户可点击“从知识库开始建站”。"
                 : focusedTicket.siteRebuildResetPending === true
-                  ? "当前需求状态：旧官网下线尚未完成；完成后客户需全新上传。"
+                  ? "当前需求状态：旧官网下线尚未完成；完成后企业知识库保持不变，客户可点击“从知识库开始建站”。"
                   : "当前需求状态：待通过重置。"
               : "当前需求状态：待处理。请在本客户看板内完成处理。"}
           </p>
@@ -2434,7 +2434,7 @@ function DeliveryTicketActions({
       await onDone();
       toast.success("官网重置需求已通过", {
         description:
-          "旧官网正在安全下线；完成后客户需全新上传知识库并创建全新任务。",
+          "旧官网正在安全下线；企业知识库保持不变。完成后客户可点击“从知识库开始建站”。",
       });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "通过重置需求失败");
@@ -2450,7 +2450,7 @@ function DeliveryTicketActions({
         <div className="mt-3 rounded-xl border bg-muted/25 px-4 py-3 text-sm leading-6">
           <strong>重置需求已通过</strong>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            旧官网已下线；客户需全新上传知识库并创建全新任务。
+            旧官网已下线；企业知识库保持不变，客户可点击“从知识库开始建站”。
           </p>
         </div>
       );
@@ -2469,7 +2469,7 @@ function DeliveryTicketActions({
           <div className="mb-3 rounded-xl border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950">
             <strong>旧官网下线尚未完成</strong>
             <p className="mt-1 text-xs leading-5 text-amber-800">
-              可再次批准以安全检查并重新排队；正在执行或结果未知的任务不会重复执行。下线完成后，客户需全新上传知识库。
+              可再次批准以安全检查并重新排队；正在执行或结果未知的任务不会重复执行。下线完成后企业知识库保持不变，客户可点击“从知识库开始建站”。
             </p>
           </div>
         )}
@@ -2505,8 +2505,8 @@ function DeliveryTicketActions({
               </DialogTitle>
               <DialogDescription>
                 {ticket.siteRebuildResetPending === true
-                  ? "确认后，系统只会检查原下线任务；仅当其在外部变更前因可重试配置问题失败时，才重新排队同一任务。完成下线后，客户需全新上传知识库。"
-                  : "确认后，旧官网将进入安全下线流程；下线确认完成后，当前轮次将重置，客户需全新上传知识库并创建全新任务。"}
+                  ? "确认后，系统只会检查原下线任务；仅当其在外部变更前因可重试配置问题失败时，才重新排队同一任务。完成下线后企业知识库保持不变，客户可点击“从知识库开始建站”。"
+                  : "确认后，旧官网将进入安全下线流程；下线确认完成后，当前官网轮次将重置，企业知识库保持不变，客户可点击“从知识库开始建站”创建全新官网任务。"}
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>

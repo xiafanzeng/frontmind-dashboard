@@ -1530,7 +1530,7 @@ export async function finalizeApprovedSiteOpsReset(
     userId: project.userId,
     role: "assistant",
     content:
-      "旧官网已下线，重置已完成，请全新上传知识库。",
+      "旧官网已下线，官网重置已完成；企业知识库保持不变，可从当前知识库重新开始建站。",
     sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
     metadata: {
       siteOps: {
@@ -1540,7 +1540,7 @@ export async function finalizeApprovedSiteOpsReset(
         status: "active",
         payload: {
           rebuildTicketId: ticket.id,
-          requested: "knowledge_snapshot",
+          requested: "current_knowledge",
           reset: true,
           unpublishCompleted: true,
         },
@@ -1560,7 +1560,7 @@ export async function finalizeApprovedSiteOpsReset(
     .set({
       status: "completed",
       publicSummary:
-        "旧网站已安全下线，重置已完成；请全新上传知识资料并创建独立的新任务。",
+        "旧网站已安全下线，官网重置已完成；企业知识库保持不变，可创建独立的新建站任务。",
       internalNote: JSON.stringify(appliedNote),
       quotaState: "consumed",
       technicalDedupeKey: null,
@@ -1586,7 +1586,7 @@ export async function finalizeApprovedSiteOpsReset(
     kind: "delivery_result",
     visibility: "customer",
     message:
-      "旧网站已安全下线，旧流程已清空，请全新上传资料并创建全新任务。",
+      "旧网站已安全下线，旧建站流程已清空；企业知识库保持不变，可从当前知识库创建全新官网任务。",
     fromStatus: priorTicketStatus,
     toStatus: "completed",
     actorContext: {

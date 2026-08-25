@@ -1541,7 +1541,7 @@ async function loadBuildContext(db: any, operation: SiteOperation) {
   if (context.snapshot.archiveHash !== context.build.knowledgeArchiveHash) {
     throw new SiteOpsManusFailure(
       "KNOWLEDGE_ARCHIVE_HASH_MISMATCH",
-      "知识库 ZIP 哈希与冻结版本不一致。",
+      "当前企业知识库与本次建站任务的冻结资料不一致，请重新开始官网任务。",
       "failed",
     );
   }
@@ -2290,7 +2290,7 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
         status: "failed",
         code: "FRONTMIND_BUILD_REQUEST_INVALID",
         message:
-          "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+          "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
         result: {
           schemaVersion: 1,
           stage:
@@ -2318,7 +2318,7 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
     status: "failed",
     code: "FRONTMIND_BUILD_FAILED",
     message:
-      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+      "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
   };
 }
 
@@ -4123,7 +4123,7 @@ export function createManusSiteOpsProviderHandler(
         if (hostCanonicalContent) {
           throw new SiteOpsManusFailure(
             "BUILD_CANONICALIZATION_FAILED",
-            "冻结知识资料无法形成安全预览，请申请重置后全新上传。",
+            "冻结知识资料无法形成安全预览，请申请重置后从当前企业知识库重新开始。",
             "failed",
           );
         }
@@ -4210,7 +4210,7 @@ export function createManusSiteOpsProviderHandler(
           if (hostCanonicalContent) {
             throw new SiteOpsManusFailure(
               "BUILD_CANONICALIZATION_FAILED",
-              "冻结知识资料无法形成安全预览，请申请重置后全新上传。",
+              "冻结知识资料无法形成安全预览，请申请重置后从当前企业知识库重新开始。",
               "failed",
             );
           }

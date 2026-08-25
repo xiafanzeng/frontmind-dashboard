@@ -613,7 +613,7 @@ async function loadDefaultContext(
   if (!snapshot || !/^[a-f0-9]{64}$/u.test(snapshot.archiveHash ?? "")) {
     throw new TwentyFirstProviderFailure(
       "KNOWLEDGE_SNAPSHOT_INVALID",
-      "知识库 ZIP 快照缺少有效归档哈希。",
+      "当前企业知识库校验未完成，请先完成知识库后重试。",
     );
   }
   const publishedSamplesByBatch = new Map<string, number>();
@@ -1187,7 +1187,7 @@ async function searchFamilyRound(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉检索已超时；可申请重置，批准后请全新上传并从头生成。",
+        "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
       );
     }
     const composedQuery = composeFamilySearchQuery({
@@ -1556,7 +1556,7 @@ async function mirrorCandidates(input: {
     if (input.signal.aborted) {
       throw new TwentyFirstProviderFailure(
         "VISUAL_SEARCH_TIMEOUT",
-        "视觉预览镜像已超时；可申请重置，批准后请全新上传并从头生成。",
+        "视觉预览镜像已超时；可申请重置，批准后可从当前企业知识库重新开始。",
       );
     }
     const batch = input.candidates.slice(offset, offset + MIRROR_CONCURRENCY);
@@ -1574,7 +1574,7 @@ async function mirrorCandidates(input: {
           if (input.signal.aborted) {
             throw new TwentyFirstProviderFailure(
               "VISUAL_SEARCH_TIMEOUT",
-              "视觉预览镜像已超时；可申请重置，批准后请全新上传并从头生成。",
+              "视觉预览镜像已超时；可申请重置，批准后可从当前企业知识库重新开始。",
             );
           }
           rejectDiagnostic(input.diagnostics, previewRejectionReason(error));
@@ -2240,7 +2240,7 @@ function safeProviderFailure(
       status: "failed",
       code: "VISUAL_SEARCH_TIMEOUT",
       message:
-        "视觉检索已超时；可申请重置，批准后请全新上传并从头生成。",
+        "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
       result: diagnostics,
     };
   }
@@ -2269,7 +2269,7 @@ function safeProviderFailure(
       status: "failed",
       code: "VISUAL_OPERATION_CONTRACT_MISMATCH",
       message:
-        "视觉检索任务合同不一致；可申请重置，批准后请全新上传并从头生成。",
+        "视觉检索任务合同不一致；可申请重置，批准后可从当前企业知识库重新开始。",
       result: diagnostics,
     };
   }

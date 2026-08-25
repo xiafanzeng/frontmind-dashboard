@@ -106,7 +106,7 @@ describe("SiteOps rebuild ticket coordinates", () => {
     ).toBe(false);
   });
 
-  it("keeps the completed fresh-root snapshot floor without projecting an active ticket", async () => {
+  it("keeps the completed fresh-root snapshot version marker for audit without projecting an active ticket", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
     const sourceBuildId = "30000000-0000-4000-8000-000000000003";
     const resetOperationId = "50000000-0000-4000-8000-000000000005";
@@ -278,7 +278,7 @@ describe("SiteOps rebuild ticket coordinates", () => {
     });
   });
 
-  it("recovers the permanent snapshot floor from a succeeded reset operation after ticket retention", async () => {
+  it("recovers the snapshot version audit marker from a succeeded reset operation after ticket retention", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
     const resetOperationId = "50000000-0000-4000-8000-000000000005";
     const rows = [
@@ -976,7 +976,17 @@ describe("site rebuild reset approval", () => {
         expect.objectContaining({
           table: messages,
           values: expect.objectContaining({
-            content: expect.stringContaining("旧官网已下线"),
+            content:
+              "旧官网已下线，官网重置已完成；企业知识库保持不变，可从当前知识库重新开始建站。",
+            metadata: expect.objectContaining({
+              siteOps: expect.objectContaining({
+                payload: expect.objectContaining({
+                  requested: "current_knowledge",
+                  reset: true,
+                  unpublishCompleted: true,
+                }),
+              }),
+            }),
           }),
         }),
         expect.objectContaining({ table: deliveryTicketEvents }),

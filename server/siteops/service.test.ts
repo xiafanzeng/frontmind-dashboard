@@ -921,7 +921,7 @@ describe("SiteOps core contracts", () => {
     ).toThrow();
   });
 
-  it("keeps removed build recovery actions as fixed pre-entitlement tombstones", async () => {
+  it("keeps removed recovery and manual snapshot actions as pre-entitlement tombstones", async () => {
     for (const [action, input] of [
       ["resume_build", { buildId: "10000000-0000-4000-8000-000000000001" }],
       ["reset_workflow", { confirmed: true }],
@@ -941,15 +941,24 @@ describe("SiteOps core contracts", () => {
       path.join(process.cwd(), "server/siteops/service.ts"),
       "utf8",
     );
+    const actionEntry = source.indexOf("export async function actOnSiteOps");
     const tombstone = source.indexOf(
-      'if (input.action === "resume_build" || input.action === "reset_workflow")',
+      'input.action === "resume_build"',
+      actionEntry,
+    );
+    const legacySnapshotChoice = source.indexOf(
+      'input.action === "change_snapshot"',
+      tombstone,
     );
     const entitlement = source.indexOf(
       "const entitlement = await requireSiteOpsEntitlement(actor.id);",
       tombstone,
     );
     const database = source.indexOf("const db = await requireDb();", tombstone);
+    expect(actionEntry).toBeGreaterThan(-1);
     expect(tombstone).toBeGreaterThan(-1);
+    expect(legacySnapshotChoice).toBeGreaterThan(tombstone);
+    expect(legacySnapshotChoice).toBeLessThan(entitlement);
     expect(entitlement).toBeGreaterThan(tombstone);
     expect(database).toBeGreaterThan(tombstone);
   });
@@ -969,6 +978,22 @@ describe("SiteOps core contracts", () => {
     expect(() =>
       parseSiteOpsActionPayload("delegate_visual", {
         agentProfile: "frontmind-pro",
+      }),
+    ).toThrow();
+  });
+
+  it("accepts server-selected knowledge binding while keeping old clients strict", () => {
+    const snapshotId = "10000000-0000-4000-8000-000000000001";
+    expect(parseSiteOpsActionPayload("select_snapshot", {})).toEqual({});
+    expect(
+      parseSiteOpsActionPayload("select_snapshot", {
+        knowledgeSnapshotId: snapshotId,
+      }),
+    ).toEqual({ knowledgeSnapshotId: snapshotId });
+    expect(() =>
+      parseSiteOpsActionPayload("select_snapshot", {
+        knowledgeSnapshotId: snapshotId,
+        snapshotVersion: 7,
       }),
     ).toThrow();
   });
@@ -1087,7 +1112,7 @@ describe("SiteOps core contracts", () => {
     ).toThrow();
   });
 
-  it("admits a knowledge-source change only without active build work", () => {
+  it("keeps the retired snapshot-change parser strict for rolling clients", () => {
     expect(() =>
       assertSiteOpsSnapshotChangeState({
         sameSnapshot: false,
@@ -1119,6 +1144,12 @@ describe("SiteOps core contracts", () => {
     ).toEqual({
       knowledgeSnapshotId: "30000000-0000-4000-8000-000000000003",
     });
+    expect(() =>
+      parseSiteOpsActionPayload("change_snapshot", {
+        knowledgeSnapshotId: "30000000-0000-4000-8000-000000000003",
+        selectArchivedVersion: true,
+      }),
+    ).toThrow();
   });
 
   it("keeps the customer RAM Role boundary strict", () => {

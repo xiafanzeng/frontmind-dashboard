@@ -16,7 +16,7 @@ describe("SiteOps public error projection", () => {
     expect(projected).toEqual({
       code: "FRONTMIND_BUILD_REQUEST_INVALID",
       message:
-        "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+        "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
     });
     expect(JSON.stringify(projected)).not.toMatch(/manus|invalid_argument/iu);
   });
@@ -67,7 +67,7 @@ describe("SiteOps public error projection", () => {
         errorCode: "invalid_argument",
       }),
     ).toBe(
-      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+      "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
     );
   });
 
@@ -92,7 +92,7 @@ describe("SiteOps public error projection", () => {
     expect(projected).toEqual({
       code: "FRONTMIND_BUILD_OUTPUT_INVALID",
       message:
-        "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+        "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
     });
     expect(JSON.stringify(projected)).not.toMatch(/manus/iu);
   });
@@ -121,7 +121,7 @@ describe("SiteOps public error projection", () => {
     ).toEqual({
       code: "FRONTMIND_BUILD_QA_FAILED",
       message:
-        "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+        "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
     });
     expect(
       publicSiteOpsErrorProjection({
@@ -139,11 +139,11 @@ describe("SiteOps public error projection", () => {
   it.each([
     [
       "FRONTMIND_BUILD_ASSET_CONFLICT",
-      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+      "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
     ],
     [
       "FRONTMIND_BUILD_COMPILE_FAILED",
-      "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。",
+      "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。",
     ],
     [
       "FRONTMIND_BUILD_RUNTIME_UNAVAILABLE",

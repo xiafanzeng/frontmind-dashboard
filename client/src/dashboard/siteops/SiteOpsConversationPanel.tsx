@@ -117,7 +117,7 @@ const BUILD_STATUS_LABELS: Record<string, string> = {
 const REBUILD_INTERACTION_LABELS: Partial<
   Record<SiteOpsObservationV1["interactionState"], string>
 > = {
-  select_snapshot: "选择知识库 ZIP 版本",
+  select_snapshot: "从知识库开始建站",
   collecting_brief: "整理建站资料",
   visual_searching: "生成视觉候选",
   awaiting_visual_selection: "等待选择视觉方案",
@@ -625,7 +625,6 @@ export default function SiteOpsConversationPanel({
   onDisconnectAliyun,
   onSubmitIcpFiling,
 }: SiteOpsConversationPanelProps) {
-  const [selectedSnapshotId, setSelectedSnapshotId] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [aliyunConnectionError, setAliyunConnectionError] = useState<
@@ -1443,7 +1442,6 @@ export default function SiteOpsConversationPanel({
     );
   });
   const currentSnapshotId = observation.project.currentKnowledgeSnapshotId;
-  const effectiveSnapshotId = selectedSnapshotId || currentSnapshotId || "";
   const latestQuote = observation.domainOperations.find(
     (item) =>
       (["quoted", "succeeded"].includes(item.status) ||
@@ -1478,22 +1476,6 @@ export default function SiteOpsConversationPanel({
   };
   const globalDeployment = deploymentStateFor("global_excluding_cn");
   const mainlandDeployment = deploymentStateFor("mainland_cn");
-  const sourceChangeBlocked =
-    observation.interactionState === "visual_searching" ||
-    observation.builds.some((build) =>
-      [
-        "preparing",
-        "visual_searching",
-        "awaiting_visual_selection",
-        "design_compiling",
-        "contract_ready",
-        "building",
-        "qa_running",
-      ].includes(build.status),
-    ) ||
-    observation.deployments.some((deployment) =>
-      ["reserved", "deploying", "verifying"].includes(deployment.status),
-    );
   const rebuildRequestActive = Boolean(
     observation.rebuildRequest.ticketId &&
       observation.rebuildRequest.status &&
@@ -1509,16 +1491,12 @@ export default function SiteOpsConversationPanel({
     : rebuildRequestPending
       ? "重置申请处理中"
       : rebuildRequestActive && observation.rebuildRequest.resetApplied
-        ? "重置已批准，请全新上传知识库"
+        ? "重置已批准，可从当前知识库重新开始"
         : "申请重置并全新开始";
   const hideExistingBuildDuringActiveRebuild = Boolean(
     rebuildRequestActive &&
       observation.rebuildRequest.resetApplied &&
       latestBuild?.id === observation.rebuildRequest.resetSourceBuildId,
-  );
-  const rebuildInProgress = observation.rebuildRequest.status === "in_progress";
-  const rebuildNeedsKnowledgeSnapshot = Boolean(
-    observation.rebuildRequest.resetApplied && !currentSnapshotId,
   );
   const rebuildInteractionLabel = observation.rebuildRequest.resetPending
     ? "正在下线旧官网"
@@ -1536,7 +1514,7 @@ export default function SiteOpsConversationPanel({
           </p>
           <h2 id="siteops-panel-title">{SITEOPS_CUSTOMER_DISPLAY_NAME}</h2>
           <span>
-            选择企业知识库和视觉方案，FrontMind 将完成官网制作与检查。
+            从企业知识库开始，选择视觉方案后由 FrontMind 完成官网制作与检查。
           </span>
         </div>
         <div className="siteops-header-controls">
@@ -1593,8 +1571,8 @@ export default function SiteOpsConversationPanel({
                 <p>提交后将由 FrontMind 人工受理；受理前不会改动当前官网。</p>
                 <ul>
                   <li>批准后，当前线上官网会进入下线流程。</li>
-                  <li>旧知识库、视觉方案和生成任务不会继续使用。</li>
-                  <li>重置完成后必须全新上传知识库并重新生成。</li>
+                  <li>当前企业知识库会保留，并作为全新建站的资料来源。</li>
+                  <li>旧视觉方案和生成任务不会继续使用。</li>
                   <li>域名、备案和阿里云连接会保留。</li>
                 </ul>
               </div>
@@ -1606,7 +1584,7 @@ export default function SiteOpsConversationPanel({
               value={rebuildReason}
               maxLength={2_000}
               rows={5}
-              placeholder="例如：希望全新上传知识库并重新生成官网。"
+              placeholder="例如：希望保留当前企业知识库并重新生成官网。"
               onChange={(event) => setRebuildReason(event.target.value)}
             />
           </label>
@@ -1660,15 +1638,14 @@ export default function SiteOpsConversationPanel({
             : latestAttempt
               ? BUILD_STATUS_LABELS[latestAttempt.status] || "正在处理"
               : observation.interactionState === "select_snapshot"
-                ? "选择知识库 ZIP 版本"
+                ? "从知识库开始建站"
                 : "整理建站资料"}
         </strong>
       </div>
 
       <SiteOpsExecutionTimeline steps={observation.executionSteps ?? []} />
 
-      {(observation.interactionState === "select_snapshot" ||
-        !currentSnapshotId) && (
+      {observation.project.status === "draft" && !currentSnapshotId && (
         <section
           className="siteops-snapshot-card"
           aria-labelledby="siteops-snapshot-title"
@@ -1676,140 +1653,39 @@ export default function SiteOpsConversationPanel({
           <div>
             <FileArchive size={20} aria-hidden="true" />
             <div>
-              <h3 id="siteops-snapshot-title">选择知识库 ZIP 版本</h3>
-              <p>FrontMind 将根据所选知识库整理企业资料并制作官网。</p>
+              <h3 id="siteops-snapshot-title">从知识库开始建站</h3>
+              <p>
+                FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。
+              </p>
             </div>
           </div>
-          {observation.knowledgeSnapshots.length > 0 ? (
-            <div className="siteops-snapshot-actions">
-              <label>
-                <span>知识库版本</span>
-                <select
-                  aria-label="知识库 ZIP 版本"
-                  value={effectiveSnapshotId}
-                  onChange={(event) =>
-                    setSelectedSnapshotId(event.target.value)
-                  }
-                >
-                  <option value="">请选择</option>
-                  {observation.knowledgeSnapshots.map((snapshot) => (
-                    <option key={snapshot.id} value={snapshot.id}>
-                      {snapshot.label}
-                      {snapshot.active ? "（当前）" : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="button"
-                className="siteops-primary-button"
-                disabled={!effectiveSnapshotId || interactionLocked}
-                onClick={() =>
-                  runAction(
-                    "select_snapshot",
-                    actionFromCard(
-                      observation,
-                      "brief_question",
-                      "select_snapshot",
-                      { knowledgeSnapshotId: effectiveSnapshotId },
-                    ),
-                  )
-                }
-              >
-                {busyAction === "select_snapshot" && (
-                  <Loader2
-                    className="siteops-spin"
-                    size={15}
-                    aria-hidden="true"
-                  />
-                )}
-                使用此版本
-              </button>
-            </div>
-          ) : (
-            <p className="siteops-empty-copy">
-              当前没有可用于建站的知识库快照。
-            </p>
-          )}
+          <button
+            type="button"
+            className="siteops-primary-button"
+            disabled={interactionLocked}
+            onClick={() =>
+              runAction(
+                "select_snapshot",
+                actionFromCard(
+                  observation,
+                  "brief_question",
+                  "select_snapshot",
+                  {},
+                ),
+              )
+            }
+          >
+            {busyAction === "select_snapshot" && (
+              <Loader2
+                className="siteops-spin"
+                size={15}
+                aria-hidden="true"
+              />
+            )}
+            从知识库开始建站
+          </button>
         </section>
       )}
-
-      {currentSnapshotId &&
-        (!hasSuccessfulBuild || rebuildInProgress) &&
-        observation.knowledgeSnapshots.length > 1 && (
-          <section
-            className="siteops-snapshot-card"
-            aria-labelledby="siteops-change-snapshot-title"
-          >
-            <div>
-              <FileArchive size={20} aria-hidden="true" />
-              <div>
-                <h3 id="siteops-change-snapshot-title">更换知识源</h3>
-                <p>
-                  新知识库会重新整理建站资料与视觉方案；旧官网和线上版本不会被改写。
-                </p>
-              </div>
-            </div>
-            <div className="siteops-snapshot-actions">
-              <label>
-                <span>更换知识库 ZIP 版本</span>
-                <select
-                  aria-label="更换知识库 ZIP 版本"
-                  value={effectiveSnapshotId}
-                  onChange={(event) =>
-                    setSelectedSnapshotId(event.target.value)
-                  }
-                >
-                  {observation.knowledgeSnapshots.map((snapshot) => (
-                    <option key={snapshot.id} value={snapshot.id}>
-                      {snapshot.label}
-                      {snapshot.id === currentSnapshotId ? "（当前）" : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="button"
-                className="siteops-secondary-button"
-                disabled={
-                  !effectiveSnapshotId ||
-                  effectiveSnapshotId === currentSnapshotId ||
-                  interactionLocked ||
-                  sourceChangeBlocked
-                }
-                onClick={() => {
-                  const selected = observation.knowledgeSnapshots.find(
-                    (snapshot) => snapshot.id === effectiveSnapshotId,
-                  );
-                  if (
-                    !selected ||
-                    !window.confirm(
-                      `确认更换为“${selected.label}”并重新整理建站资料？旧官网版本和线上站点会保持不变。`,
-                    )
-                  ) {
-                    return;
-                  }
-                  void runAction(
-                    "change_snapshot",
-                    actionFromCard(
-                      observation,
-                      "brief_question",
-                      "change_snapshot",
-                      { knowledgeSnapshotId: effectiveSnapshotId },
-                    ),
-                  );
-                }}
-              >
-                更换知识源并重新整理
-              </button>
-            </div>
-            {sourceChangeBlocked && (
-              <p className="siteops-empty-copy">
-                当前视觉、建站或发布任务尚未结束，完成后才能更换知识源。
-              </p>
-            )}
-          </section>
-        )}
 
       {currentSnapshotId &&
         observation.interactionState === "collecting_brief" && (
@@ -1912,7 +1788,7 @@ export default function SiteOpsConversationPanel({
       >
         {visibleMessages.length === 0 ? (
           <div className="siteops-empty-copy">
-            选择知识库版本后，FrontMind 会在这里整理建站资料。
+            点击“从知识库开始建站”后，FrontMind 会在这里整理建站资料。
           </div>
         ) : (
           visibleMessages.map((item) => (
@@ -2102,7 +1978,7 @@ export default function SiteOpsConversationPanel({
               )}
             {latestBuild.needsHelp && !latestBuild.previewUrl && (
               <p>
-                本次没有生成可安全展示的版本。可以申请重置；批准并完成旧站下线后，请全新上传知识库并重新生成。
+                本次没有生成可安全展示的版本。可以申请重置；批准并完成旧站下线后，可从当前企业知识库重新开始建站。
               </p>
             )}
           </div>

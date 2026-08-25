@@ -38,6 +38,7 @@ import {
   siteBuilds,
   siteOperations,
   siteProjects,
+  users,
   websiteStyleSampleBatches,
   websiteStyleSamples,
 } from "../../drizzle/schema";
@@ -71,8 +72,23 @@ function serviceDatabaseFixture() {
     archiveHash: "a".repeat(64),
     version: 2,
     sourceFileName: "knowledge.zip",
+    documents: [
+      {
+        id: "overview-source",
+        path: "企业概览.md",
+        title: "企业概览",
+        content: "星河智造提供经过来源核验的设备巡检服务。",
+        kind: "overview",
+        evidenceStatus: "verified_first_party",
+        customerVisible: true,
+      },
+    ],
+    assets: [],
+    status: "active",
     createdAt: now,
   };
+  const snapshots = [snapshot];
+  const userRows: Array<{ id: number }> = [{ id: 7 }];
   const sampleId = "40000000-0000-4000-8000-000000000004";
   const previewLocalAssetId = "41000000-0000-4000-8000-000000000004";
   const visualOperationId = "42000000-0000-4000-8000-000000000004";
@@ -153,9 +169,8 @@ function serviceDatabaseFixture() {
     if (table === websiteStyleSamples) {
       return inTransaction && keys.includes("sample") ? visualRows : [];
     }
-    if (table === knowledgeBaseSnapshots) {
-      return inTransaction ? [snapshot] : [];
-    }
+    if (table === knowledgeBaseSnapshots) return snapshots;
+    if (table === users) return userRows;
     if (table === siteOperations) {
       if (inTransaction && keys.includes("input")) {
         return [{ input: visualOperationInput }];
@@ -255,6 +270,8 @@ function serviceDatabaseFixture() {
     visualRows,
     publishedBatches,
     activeVisualOperations,
+    snapshots,
+    userRows,
   };
 }
 
@@ -284,6 +301,19 @@ function delegateVisualInput(revision: number) {
   } as const;
 }
 
+function connectKnowledgeInput(
+  revision: number,
+  knowledgeSnapshotId?: string,
+) {
+  return {
+    conversationId: "siteops:7",
+    action: "select_snapshot",
+    clientRequestId: "connect-current-knowledge-1",
+    expectedRevision: revision,
+    input: knowledgeSnapshotId ? { knowledgeSnapshotId } : {},
+  } as const;
+}
+
 beforeEach(() => {
   dependencies.getDb.mockReset();
   dependencies.reserveQuota.mockClear();
@@ -302,6 +332,138 @@ beforeEach(() => {
 });
 
 describe("SiteOps accepted rebuild visual selection", () => {
+  it("rejects the legacy snapshot-change action before entitlement or database access", async () => {
+    await expect(
+      actOnSiteOps(actor as never, {
+        conversationId: "siteops:7",
+        action: "change_snapshot",
+        clientRequestId: "legacy-change-snapshot-1",
+        expectedRevision: 8,
+        input: {
+          knowledgeSnapshotId: "20000000-0000-4000-8000-000000000002",
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "STATE_CONFLICT",
+      statusCode: 409,
+      message:
+        "官网流程不再支持手动选择知识库版本；如需重新连接，请先重置官网任务，再点击“从知识库开始建站”。",
+    });
+
+    expect(dependencies.getServicePortal).not.toHaveBeenCalled();
+    expect(dependencies.getDb).not.toHaveBeenCalled();
+    expect(dependencies.loadRebuild).not.toHaveBeenCalled();
+  });
+
+  it("locks the account and binds the newest valid active snapshot without a client-selected id", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    const validSnapshot = fixture.snapshots[0]!;
+    fixture.snapshots.unshift({
+      ...validSnapshot,
+      id: "21000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "not-a-valid-digest",
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    dependencies.loadRebuild.mockResolvedValue({
+      allowed: true,
+      ticketId: null,
+      status: null,
+      resetApplied: true,
+      resetPending: false,
+      minimumKnowledgeSnapshotVersion: 99,
+      resetSourceBuildId: "30000000-0000-4000-8000-000000000003",
+      acceptedForCurrentCycle: false,
+    });
+
+    await actOnSiteOps(
+      actor as never,
+      connectKnowledgeInput(fixture.project.revision),
+    );
+
+    expect(fixture.project).toMatchObject({
+      currentKnowledgeSnapshotId: validSnapshot.id,
+      status: "collecting_brief",
+      revision: 9,
+    });
+    expect(
+      fixture.inserts.find(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "brief_message",
+      )?.values,
+    ).toMatchObject({
+      status: "succeeded",
+      input: {
+        knowledgeSnapshotId: validSnapshot.id,
+        knowledgeArchiveHash: validSnapshot.archiveHash,
+      },
+    });
+  });
+
+  it("accepts an old client id only when it equals the newest valid active snapshot", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    const currentSnapshot = fixture.snapshots[0]!;
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      connectKnowledgeInput(fixture.project.revision, currentSnapshot.id),
+    );
+
+    expect(fixture.project.currentKnowledgeSnapshotId).toBe(
+      currentSnapshot.id,
+    );
+  });
+
+  it("rejects an old client snapshot id when it is not the newest valid active snapshot", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    const currentSnapshot = fixture.snapshots[0]!;
+    fixture.snapshots.unshift({
+      ...currentSnapshot,
+      id: "21000000-0000-4000-8000-000000000002",
+      version: 3,
+      archiveHash: "b".repeat(64),
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
+    });
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        connectKnowledgeInput(fixture.project.revision, currentSnapshot.id),
+      ),
+    ).rejects.toMatchObject({ code: "REVISION_CONFLICT", statusCode: 409 });
+    expect(fixture.project.currentKnowledgeSnapshotId).toBeNull();
+  });
+
+  it("fails closed before reading knowledge snapshots when the account lock is missing", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentKnowledgeSnapshotId = null;
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    fixture.userRows.splice(0);
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        connectKnowledgeInput(fixture.project.revision),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", statusCode: 404 });
+    expect(fixture.project.currentKnowledgeSnapshotId).toBeNull();
+  });
+
   it("rejects a second supplemental visual operation while one is active", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;
@@ -462,8 +624,8 @@ describe("SiteOps accepted rebuild visual selection", () => {
       (entry) =>
         entry.table === siteOperations && entry.values.kind === "site_build",
     );
-    // One transaction-local read enforces resetPending/snapshot-floor before
-    // reserving quota; the second read projects the committed observation.
+    // One transaction-local read enforces resetPending before reserving quota;
+    // the second read projects the committed observation.
     expect(dependencies.loadRebuild).toHaveBeenCalledTimes(2);
     expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
     expect(buildInsert?.values).toMatchObject({
@@ -475,7 +637,7 @@ describe("SiteOps accepted rebuild visual selection", () => {
     expect(fixture.project.currentBuildId).toBe(buildInsert?.values.id);
   });
 
-  it("rejects a root build whose snapshot is below the completed reset floor", async () => {
+  it("allows a new root build to reuse an immutable snapshot below the legacy reset floor", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;
     dependencies.getDb.mockResolvedValue(fixture.db);
@@ -490,17 +652,19 @@ describe("SiteOps accepted rebuild visual selection", () => {
       acceptedForCurrentCycle: false,
     });
 
-    await expect(
-      actOnSiteOps(
-        actor as never,
-        selectVisualInput(fixture.project.revision, fixture.sample.id),
-      ),
-    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+    await actOnSiteOps(
+      actor as never,
+      selectVisualInput(fixture.project.revision, fixture.sample.id),
+    );
 
-    expect(dependencies.reserveQuota).not.toHaveBeenCalled();
+    expect(dependencies.reserveQuota).toHaveBeenCalledOnce();
     expect(
-      fixture.inserts.some((entry) => entry.table === siteBuilds),
-    ).toBe(false);
+      fixture.inserts.find((entry) => entry.table === siteBuilds)?.values,
+    ).toMatchObject({
+      parentBuildId: null,
+      knowledgeSnapshotId: fixture.snapshots[0]!.id,
+      knowledgeArchiveHash: fixture.snapshots[0]!.archiveHash,
+    });
   });
 
   it("creates one reserved child build and build_revision only after site_rebuild is in progress", async () => {

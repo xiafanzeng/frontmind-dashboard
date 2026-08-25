@@ -6,7 +6,7 @@ const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
 const INFRASTRUCTURE_TERM =
   /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu;
 const FRESH_RESET_MESSAGE =
-  "本次没有生成可安全展示的版本；可申请重置，批准后请全新上传并从头生成。";
+  "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。";
 
 export function sanitizeFrontMindPublicText(value: string) {
   if (VENDOR_NAME.test(value)) {
