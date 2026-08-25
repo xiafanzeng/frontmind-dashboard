@@ -123,6 +123,71 @@ const ALIYUN_OAUTH_COMPLETION_MESSAGE =
 
 type AliyunOAuthCompletionStatus = "success" | "cancelled" | "failed";
 
+type AliyunOAuthWindowState = "checking" | "failed";
+
+const ALIYUN_OAUTH_WINDOW_COPY: Record<
+  AliyunOAuthWindowState,
+  { title: string; description: string }
+> = {
+  checking: {
+    title: "正在检查阿里云授权配置",
+    description: "请稍候，FrontMind 正在确认安全的授权入口。",
+  },
+  failed: {
+    title: "暂时无法打开阿里云授权",
+    description: "请返回 FrontMind 页面查看处理提示，配置更新后再重试。",
+  },
+};
+
+function renderAliyunOAuthWindowState(
+  authorizationWindow: Window,
+  state: AliyunOAuthWindowState,
+) {
+  try {
+    const copy = ALIYUN_OAUTH_WINDOW_COPY[state];
+    const popupDocument = authorizationWindow.document;
+    popupDocument.documentElement.lang = "zh-CN";
+    popupDocument.title = copy.title;
+
+    const main = popupDocument.createElement("main");
+    main.setAttribute("role", state === "failed" ? "alert" : "status");
+    main.setAttribute("aria-live", state === "failed" ? "assertive" : "polite");
+    main.style.fontFamily =
+      'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    main.style.maxWidth = "32rem";
+    main.style.margin = "12vh auto";
+    main.style.padding = "2rem";
+    main.style.lineHeight = "1.65";
+    main.style.color = "#25222d";
+
+    const heading = popupDocument.createElement("h1");
+    heading.textContent = copy.title;
+    heading.style.fontSize = "1.35rem";
+    heading.style.margin = "0 0 .75rem";
+    main.appendChild(heading);
+
+    const description = popupDocument.createElement("p");
+    description.textContent = copy.description;
+    description.style.margin = "0";
+    main.appendChild(description);
+
+    if (state === "failed") {
+      const closeButton = popupDocument.createElement("button");
+      closeButton.type = "button";
+      closeButton.textContent = "关闭窗口";
+      closeButton.style.marginTop = "1.25rem";
+      closeButton.style.padding = ".65rem 1rem";
+      closeButton.addEventListener("click", () => authorizationWindow.close());
+      main.appendChild(closeButton);
+    }
+
+    popupDocument.body.replaceChildren(main);
+  } catch {
+    // A popup may be closed between window.open and rendering. The parent page
+    // remains the authoritative, accessible error surface in that case.
+  }
+}
+
 function aliyunOAuthCompletionStatus(
   event: MessageEvent,
   authorizationWindow: Window | null,
@@ -477,6 +542,9 @@ export default function SiteOpsConversationPanel({
   const [selectedSnapshotId, setSelectedSnapshotId] = useState("");
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [aliyunConnectionError, setAliyunConnectionError] = useState<
+    string | null
+  >(null);
   const [previewOpenError, setPreviewOpenError] = useState<string | null>(null);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
@@ -575,15 +643,18 @@ export default function SiteOpsConversationPanel({
       aliyunAuthorizationWindow.current?.close();
       aliyunAuthorizationWindow.current = null;
       if (status === "success") {
+        setAliyunConnectionError(null);
         setLocalError(null);
         void Promise.resolve()
           .then(() => onRefresh?.())
           .catch(() => {
-            setLocalError("阿里云连接状态暂时无法刷新，请稍后点击刷新。");
+            setAliyunConnectionError(
+              "阿里云连接状态暂时无法刷新，请稍后点击刷新。",
+            );
           });
         return;
       }
-      setLocalError(
+      setAliyunConnectionError(
         status === "cancelled"
           ? "你已取消阿里云授权，未产生任何连接。"
           : "阿里云连接配置需要 FrontMind 管理员更新。",
@@ -708,23 +779,26 @@ export default function SiteOpsConversationPanel({
       "",
       ALIYUN_AUTHORIZATION_WINDOW_NAME,
     );
-    aliyunAuthorizationWindow.current = authorizationWindow;
-    setBusyAction("aliyun_begin");
+    setAliyunConnectionError(null);
     setLocalError(null);
+    if (!authorizationWindow) {
+      setAliyunConnectionError(
+        "阿里云授权页面被浏览器阻止，请允许此站点打开弹窗后重试。",
+      );
+      return;
+    }
+    aliyunAuthorizationWindow.current = authorizationWindow;
+    renderAliyunOAuthWindowState(authorizationWindow, "checking");
+    authorizationWindow.focus();
+    setBusyAction("aliyun_begin");
     try {
       const result = await onBeginAliyun();
-      if (authorizationWindow) {
-        authorizationWindow.location.href = result.authorizationUrl;
-        authorizationWindow.focus();
-      } else {
-        setLocalError("阿里云授权页面被浏览器阻止，请允许弹窗后重试。");
-      }
+      authorizationWindow.location.href = result.authorizationUrl;
+      authorizationWindow.focus();
     } catch (connectionError) {
-      authorizationWindow?.close();
-      if (aliyunAuthorizationWindow.current === authorizationWindow) {
-        aliyunAuthorizationWindow.current = null;
-      }
-      setLocalError(
+      renderAliyunOAuthWindowState(authorizationWindow, "failed");
+      authorizationWindow.focus();
+      setAliyunConnectionError(
         connectionError instanceof Error
           ? customerFacingMessage(connectionError.message)
           : "暂时无法打开阿里云授权页面，请稍后重试。",
@@ -1815,6 +1889,17 @@ export default function SiteOpsConversationPanel({
                   : "尚未连接"}
           </span>
         </div>
+
+        {aliyunConnectionError && (
+          <div
+            className="siteops-notice error"
+            role="alert"
+            aria-live="assertive"
+          >
+            <AlertCircle size={18} aria-hidden="true" />
+            <span>{aliyunConnectionError}</span>
+          </div>
+        )}
 
         <div className="siteops-domain-actions">
           {observation.aliyunConnection.status === "not_connected" && (

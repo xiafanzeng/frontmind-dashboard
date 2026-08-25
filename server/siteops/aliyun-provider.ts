@@ -187,9 +187,10 @@ const dnsOperationInputSchema = z
   });
 
 type DbExecutor = NonNullable<Awaited<ReturnType<typeof getDb>>>;
+type DbQueryExecutor = Pick<DbExecutor, "select" | "insert" | "update">;
 
 async function assertAliyunConnectionMutable(
-  db: DbExecutor,
+  db: DbQueryExecutor,
   input: { projectId: string; userId: number },
 ) {
   const [running, unresolvedFinancial] = await Promise.all([
@@ -1085,7 +1086,7 @@ export type AliyunConnectionStatus = {
 };
 
 async function loadOwnedConnection(
-  db: DbExecutor,
+  db: DbQueryExecutor,
   input: { projectId: string; userId: number },
 ) {
   const rows = await db
@@ -1315,7 +1316,7 @@ async function updateAliyunConnectionAfterVerification(input: {
 }
 
 async function assertOwnedProject(
-  db: DbExecutor,
+  db: DbQueryExecutor,
   input: { projectId: string; userId: number },
 ) {
   const rows = await db
@@ -1403,11 +1404,14 @@ export async function setupAliyunCustomerConnection(
  * retained for an idempotent callback, so replaying an already-consumed browser
  * navigation cannot silently invalidate a completed RAM trust configuration.
  */
-export async function bindAliyunCustomerAccountFromOAuth(rawInput: {
-  projectId: string;
-  userId: number;
-  accountUid: string;
-}) {
+export async function bindAliyunCustomerAccountFromOAuth(
+  rawInput: {
+    projectId: string;
+    userId: number;
+    accountUid: string;
+  },
+  transaction?: DbQueryExecutor,
+) {
   const input = z
     .object({
       projectId: z.string().uuid(),
@@ -1419,7 +1423,7 @@ export async function bindAliyunCustomerAccountFromOAuth(rawInput: {
     })
     .strict()
     .parse(rawInput);
-  const db = await requireDb();
+  const db = transaction ?? (await requireDb());
   await assertOwnedProject(db, input);
   const existing = await loadOwnedConnection(db, input);
   const roleArn = `acs:ram::${input.accountUid}:role/${ALIYUN_CUSTOMER_ROLE_NAME}`;

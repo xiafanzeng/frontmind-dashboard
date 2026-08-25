@@ -24,6 +24,57 @@ const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 2_000;
 
 type AliyunOAuthCompletionStatus = "success" | "cancelled" | "failed";
+type AliyunOAuthCallbackStage =
+  | "session"
+  | "provider_authorization"
+  | "oauth_exchange"
+  | "account_bind";
+
+const SAFE_ALIYUN_OAUTH_ERROR_CODES = new Set([
+  "CREDENTIAL_ROTATED",
+  "DATABASE_UNAVAILABLE",
+  "FORBIDDEN",
+  "INVALID_CALLBACK",
+  "INVALID_CREDENTIAL",
+  "NOT_FOUND",
+  "PROVIDER_AUTHORIZATION_FAILED",
+  "PROVIDER_NOT_CONFIGURED",
+  "RATE_LIMITED",
+  "STATE_CONFLICT",
+  "UNAUTHENTICATED",
+  "UPSTREAM_UNAVAILABLE",
+]);
+
+function safeAliyunOAuthErrorCode(error: unknown) {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : null;
+  return typeof code === "string" && SAFE_ALIYUN_OAUTH_ERROR_CODES.has(code)
+    ? code
+    : "UNEXPECTED_ERROR";
+}
+
+function logAliyunOAuthCallbackFailure(input: {
+  correlationId: string;
+  stage: AliyunOAuthCallbackStage;
+  userId: number | null;
+  errorCode: string;
+  startedAt: number;
+}) {
+  const buildSha = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
+  console.error("[SiteOps Aliyun OAuth] callback_stage_failed", {
+    event: "siteops_aliyun_oauth_callback_stage_failed",
+    correlationId: input.correlationId,
+    stage: input.stage,
+    userId: input.userId,
+    errorCode: SAFE_ALIYUN_OAUTH_ERROR_CODES.has(input.errorCode)
+      ? input.errorCode
+      : "UNEXPECTED_ERROR",
+    latencyMs: Math.max(0, Date.now() - input.startedAt),
+    releaseSha: /^[a-f0-9]{40}$/u.test(buildSha) ? buildSha : null,
+  });
+}
 
 const ALIYUN_OAUTH_COMPLETION_COPY: Record<
   AliyunOAuthCompletionStatus,
@@ -306,6 +357,8 @@ async function sendOwnedAsset(input: {
 export const siteOpsArtifactApi = express.Router();
 
 siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
+  const startedAt = Date.now();
+  const correlationId = randomBytes(12).toString("hex");
   const actor = req.frontmindUser;
   const providerError =
     typeof req.query.error === "string" ? req.query.error : null;
@@ -313,6 +366,13 @@ siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
   const state = typeof req.query.state === "string" ? req.query.state : null;
 
   if (!actor) {
+    logAliyunOAuthCallbackFailure({
+      correlationId,
+      stage: "session",
+      userId: null,
+      errorCode: "UNAUTHENTICATED",
+      startedAt,
+    });
     sendAliyunOAuthCompletionPage(res, "failed");
     return;
   }
@@ -321,35 +381,49 @@ siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
       sendAliyunOAuthCompletionPage(res, "cancelled");
       return;
     }
-    console.error("[SiteOps Aliyun OAuth] provider_authorization_failed", {
-      event: "siteops_aliyun_oauth_provider_authorization_failed",
+    logAliyunOAuthCallbackFailure({
+      correlationId,
+      stage: "provider_authorization",
       userId: actor.id,
-      errorClass: "OAuthProviderAuthorizationError",
+      errorCode: "PROVIDER_AUTHORIZATION_FAILED",
+      startedAt,
     });
     sendAliyunOAuthCompletionPage(res, "failed");
     return;
   }
   if (!code || !state) {
+    logAliyunOAuthCallbackFailure({
+      correlationId,
+      stage: "provider_authorization",
+      userId: actor.id,
+      errorCode: "INVALID_CALLBACK",
+      startedAt,
+    });
     sendAliyunOAuthCompletionPage(res, "failed");
     return;
   }
+  let stage: AliyunOAuthCallbackStage = "oauth_exchange";
   try {
     const identity = await exchangeAliyunOAuthCode({
       code,
       state,
       userId: actor.id,
     });
+    stage = "account_bind";
     await completeSiteOpsAliyunOAuth({
       actor,
+      credentialId: identity.credentialId,
       projectId: identity.projectId,
       accountUid: identity.accountUid,
     });
     sendAliyunOAuthCompletionPage(res, "success");
-  } catch {
-    console.error("[SiteOps Aliyun OAuth] callback_failed", {
-      event: "siteops_aliyun_oauth_callback_failed",
+  } catch (error) {
+    logAliyunOAuthCallbackFailure({
+      correlationId,
+      stage,
       userId: actor.id,
-      errorClass: "OAuthExchangeOrCompletionError",
+      errorCode: safeAliyunOAuthErrorCode(error),
+      startedAt,
     });
     sendAliyunOAuthCompletionPage(res, "failed");
   }

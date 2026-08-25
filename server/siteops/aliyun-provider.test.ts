@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { SiteDnsRecord } from "../../drizzle/schema";
+import {
+  siteProjects,
+  siteProviderConnections,
+  type SiteDnsRecord,
+} from "../../drizzle/schema";
 import {
   aliyunDnsExpectedRecordsHash,
   aliyunFinancialSessionPolicy,
   assertAliyunDnsTargetCurrent,
   assertAliyunRenewalTarget,
+  bindAliyunCustomerAccountFromOAuth,
   bindAliyunDnsPlan,
   classifyAliyunFinancialReconciliation,
   executeAliyunFinancialMutation,
@@ -152,6 +157,63 @@ describe("Aliyun SiteOps provider", () => {
         ...sealed,
       }),
     ).toThrow();
+  });
+
+  it("binds an OAuth account through the caller transaction executor", async () => {
+    const projectId = "11111111-1111-4111-8111-111111111111";
+    const insertedValues: unknown[] = [];
+    const select = vi.fn(() => ({
+      from: vi.fn((table: unknown) => {
+        const rows =
+          table === siteProjects
+            ? [{ id: projectId }]
+            : table === siteProviderConnections
+              ? []
+              : [];
+        const query = {
+          where: vi.fn(() => query),
+          limit: vi.fn(async () => rows),
+        };
+        return query;
+      }),
+    }));
+    const insert = vi.fn(() => ({
+      values: vi.fn(async (values: unknown) => {
+        insertedValues.push(values);
+      }),
+    }));
+    const transaction = {
+      select,
+      insert,
+      update: vi.fn(),
+    };
+
+    await expect(
+      bindAliyunCustomerAccountFromOAuth(
+        {
+          projectId,
+          userId: 42,
+          accountUid: "1234567890123456",
+        },
+        transaction as never,
+      ),
+    ).resolves.toMatchObject({
+      status: "unverified",
+      requiresRoleAuthorization: true,
+    });
+
+    expect(select).toHaveBeenCalledTimes(2);
+    expect(insert).toHaveBeenCalledWith(siteProviderConnections);
+    expect(insertedValues).toHaveLength(1);
+    expect(insertedValues[0]).toMatchObject({
+      projectId,
+      userId: 42,
+      provider: "aliyun_cn",
+      accountUid: "1234567890123456",
+      roleArn: "acs:ram::1234567890123456:role/FrontMindSiteOpsAccess",
+      capabilities: [],
+      status: "unverified",
+    });
   });
 
   it("changes the exact quote hash when the provider price changes", async () => {

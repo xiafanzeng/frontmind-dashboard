@@ -89,6 +89,7 @@ import {
   verifyAliyunCustomerConnection,
 } from "./aliyun-provider";
 import {
+  ALIYUN_OAUTH_CREDENTIAL_SLOT,
   createAliyunOAuthAuthorization,
   getActiveAliyunBrokerCredential,
 } from "./aliyun-platform-service";
@@ -112,6 +113,7 @@ import {
 } from "./rebuild-ticket";
 
 export type SiteOpsServiceErrorCode =
+  | "CREDENTIAL_ROTATED"
   | "DATABASE_UNAVAILABLE"
   | "FEATURE_DISABLED"
   | "FORBIDDEN"
@@ -2528,6 +2530,7 @@ export async function getSiteOpsAliyunAuthorizationGuide(
 
 export async function completeSiteOpsAliyunOAuth(input: {
   actor: AuthenticatedUser;
+  credentialId: string;
   projectId: string;
   accountUid: string;
 }) {
@@ -2535,28 +2538,72 @@ export async function completeSiteOpsAliyunOAuth(input: {
   assertCustomer(input.actor);
   await requireSiteOpsEntitlement(input.actor.id);
   const db = await requireDb();
-  const rows = await db
-    .select({ id: siteProjects.id })
-    .from(siteProjects)
-    .where(
-      and(
-        eq(siteProjects.id, z.string().uuid().parse(input.projectId)),
-        eq(siteProjects.userId, input.actor.id),
-      ),
-    )
-    .limit(1);
-  if (!rows[0]) {
-    throw new SiteOpsServiceError(
-      "NOT_FOUND",
-      `${SITEOPS_CUSTOMER_DISPLAY_NAME}项目不存在。`,
-      404,
-    );
-  }
+  const credentialId = z.string().uuid().parse(input.credentialId);
+  const projectId = z.string().uuid().parse(input.projectId);
   try {
-    await bindAliyunCustomerAccountFromOAuth({
-      projectId: input.projectId,
-      userId: input.actor.id,
-      accountUid: input.accountUid,
+    await db.transaction(async (tx) => {
+      const projectRows = await tx
+        .select({ id: siteProjects.id })
+        .from(siteProjects)
+        .where(
+          and(
+            eq(siteProjects.id, projectId),
+            eq(siteProjects.userId, input.actor.id),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!projectRows[0]) {
+        throw new SiteOpsServiceError(
+          "NOT_FOUND",
+          `${SITEOPS_CUSTOMER_DISPLAY_NAME}项目不存在。`,
+          404,
+        );
+      }
+
+      const credentialRows = await tx
+        .select({ id: presalesApiCredentials.id })
+        .from(presalesApiCredentials)
+        .where(
+          and(
+            eq(presalesApiCredentials.id, credentialId),
+            eq(presalesApiCredentials.slot, ALIYUN_OAUTH_CREDENTIAL_SLOT),
+            eq(presalesApiCredentials.status, "active"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!credentialRows[0]) {
+        throw new SiteOpsServiceError(
+          "CREDENTIAL_ROTATED",
+          "阿里云 OAuth 配置已在授权期间更新，请重新发起连接。",
+          409,
+        );
+      }
+
+      const now = new Date();
+      await tx
+        .update(presalesApiCredentials)
+        .set({
+          validationStatus: "verified",
+          verifiedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(presalesApiCredentials.id, credentialId),
+            eq(presalesApiCredentials.slot, ALIYUN_OAUTH_CREDENTIAL_SLOT),
+            eq(presalesApiCredentials.status, "active"),
+          ),
+        );
+      await bindAliyunCustomerAccountFromOAuth(
+        {
+          projectId,
+          userId: input.actor.id,
+          accountUid: input.accountUid,
+        },
+        tx,
+      );
     });
     return { connected: false as const, authorizationRequired: true as const };
   } catch (error) {

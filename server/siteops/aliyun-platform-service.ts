@@ -23,6 +23,7 @@ import {
 } from "../auth-service";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
+import { assertFrontMindPublicUrlConfigured } from "../public-url";
 import { AliyunStsClient } from "./aliyun-sdk-constructors";
 
 export const ALIYUN_PLATFORM_UID = "1244409121609391";
@@ -36,6 +37,7 @@ export const ALIYUN_OAUTH_USERINFO_ENDPOINT =
   "https://oauth.aliyun.com/v1/userinfo";
 export const ALIYUN_OIDC_DISCOVERY_ENDPOINT =
   "https://oauth.aliyun.com/.well-known/openid-configuration";
+export const ALIYUN_OAUTH_CALLBACK_PATH = "/api/site-ops/aliyun/oauth/callback";
 export const ALIYUN_DOMAIN_READ_ACTIONS = [
   "domain:QueryDomain",
   "domain:QueryCommonInfo",
@@ -91,7 +93,7 @@ const aliyunOAuthCallbackUrlSchema = z
       url.port ||
       url.search ||
       url.hash ||
-      url.pathname !== "/api/site-ops/aliyun/oauth/callback"
+      url.pathname !== ALIYUN_OAUTH_CALLBACK_PATH
     ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -154,6 +156,22 @@ export const aliyunOAuthCredentialInputSchema = z
       .min(16)
       .max(4_096)
       .refine(noControlCharacters),
+    // Older admin clients still submit the callback. The service derives the
+    // canonical value from FRONTMIND_PUBLIC_URL and only accepts a submitted
+    // value when it is exactly the same.
+    callbackUrl: aliyunOAuthCallbackUrlSchema.optional(),
+  })
+  .strict();
+
+const aliyunOAuthCredentialSchema = z
+  .object({
+    clientId: aliyunOAuthApplicationIdSchema,
+    clientSecret: z
+      .string()
+      .trim()
+      .min(16)
+      .max(4_096)
+      .refine(noControlCharacters),
     callbackUrl: aliyunOAuthCallbackUrlSchema,
   })
   .strict();
@@ -178,12 +196,130 @@ const aliyunOAuthStoredCredentialSchema = z
 export type AliyunBrokerCredential = z.infer<
   typeof aliyunBrokerCredentialInputSchema
 >;
-export type AliyunOAuthCredential = z.infer<
+export type AliyunOAuthCredentialInput = z.infer<
   typeof aliyunOAuthCredentialInputSchema
 >;
+export type AliyunOAuthCredential = z.infer<typeof aliyunOAuthCredentialSchema>;
 export type AliyunOAuthStoredCredential = z.infer<
   typeof aliyunOAuthStoredCredentialSchema
 >;
+
+export type AliyunOAuthConfigurationIssue =
+  | "application_id_is_secret_id"
+  | "invalid_application_id"
+  | "callback_mismatch";
+
+export function canonicalAliyunOAuthCallbackUrl(
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const publicUrl = assertFrontMindPublicUrlConfigured(env);
+  return aliyunOAuthCallbackUrlSchema.parse(
+    new URL(ALIYUN_OAUTH_CALLBACK_PATH, `${publicUrl}/`).toString(),
+  );
+}
+
+export function aliyunOAuthConfigurationIssue(
+  credential: Pick<AliyunOAuthStoredCredential, "clientId" | "callbackUrl">,
+  env: NodeJS.ProcessEnv = process.env,
+): AliyunOAuthConfigurationIssue | null {
+  if (appSecretIdPattern.test(credential.clientId)) {
+    return "application_id_is_secret_id";
+  }
+  if (!aliyunOAuthApplicationIdSchema.safeParse(credential.clientId).success) {
+    return "invalid_application_id";
+  }
+  return credential.callbackUrl === canonicalAliyunOAuthCallbackUrl(env)
+    ? null
+    : "callback_mismatch";
+}
+
+type AliyunOAuthPhase = "begin" | "callback";
+type AliyunOAuthStage =
+  | "credential_load"
+  | "credential_contract"
+  | "authorization_probe"
+  | "authorization_issued"
+  | "state_verify"
+  | "token_exchange"
+  | "scope_verify"
+  | "userinfo";
+
+function safeAliyunOAuthError(error: unknown) {
+  const errorCode =
+    error instanceof AuthServiceError
+      ? error.code
+      : error instanceof z.ZodError
+        ? "INVALID_RESPONSE"
+        : "UNEXPECTED_ERROR";
+  return {
+    errorCode,
+    retryable:
+      errorCode === "RATE_LIMITED" ||
+      errorCode === "UPSTREAM_UNAVAILABLE" ||
+      errorCode === "DATABASE_UNAVAILABLE",
+  };
+}
+
+function logAliyunOAuthStage(input: {
+  phase: AliyunOAuthPhase;
+  stage: AliyunOAuthStage;
+  outcome: "success" | "failed";
+  correlationId: string;
+  userId: number;
+  projectId?: string;
+  credentialVersion?: number;
+  latencyMs: number;
+  error?: unknown;
+}) {
+  const entry = {
+    event: "siteops_aliyun_oauth_stage",
+    phase: input.phase,
+    stage: input.stage,
+    outcome: input.outcome,
+    correlationId: input.correlationId,
+    userId: input.userId,
+    ...(input.projectId ? { projectId: input.projectId } : {}),
+    ...(input.credentialVersion !== undefined
+      ? { credentialVersion: input.credentialVersion }
+      : {}),
+    latencyMs: input.latencyMs,
+    ...(input.error ? safeAliyunOAuthError(input.error) : {}),
+  };
+  if (input.outcome === "failed") {
+    console.error("[SiteOps Aliyun OAuth] stage_failed", entry);
+    return;
+  }
+  console.info("[SiteOps Aliyun OAuth] stage_succeeded", entry);
+}
+
+async function runAliyunOAuthStage<T>(input: {
+  phase: AliyunOAuthPhase;
+  stage: AliyunOAuthStage;
+  correlationId: string;
+  userId: number;
+  projectId?: string;
+  credentialVersion?: number;
+  operation: () => Promise<T> | T;
+}) {
+  const startedAt = Date.now();
+  try {
+    const result = await input.operation();
+    logAliyunOAuthStage({
+      ...input,
+      outcome: "success",
+      latencyMs: Date.now() - startedAt,
+    });
+    return result;
+  } catch (error) {
+    logAliyunOAuthStage({
+      ...input,
+      outcome: "failed",
+      latencyMs: Date.now() - startedAt,
+      error,
+    });
+    throw error;
+  }
+}
 
 type PlatformCredentialSlot =
   | typeof ALIYUN_BROKER_CREDENTIAL_SLOT
@@ -424,20 +560,39 @@ function throwForTransientOAuthStatus(status: number) {
 }
 
 function requireCurrentAliyunOAuthCredential(
-  credential: AliyunOAuthStoredCredential,
+  credential: Pick<
+    AliyunOAuthStoredCredential,
+    "clientId" | "clientSecret" | "callbackUrl"
+  >,
 ) {
-  const parsed = aliyunOAuthCredentialInputSchema.safeParse(credential);
-  if (parsed.success) return parsed.data;
+  // Storage readers add id/version/fingerprint metadata. Project only the
+  // encrypted payload before strict validation so internal metadata cannot be
+  // mistaken for untrusted credential input.
+  const payload = {
+    clientId: credential.clientId,
+    clientSecret: credential.clientSecret,
+    callbackUrl: credential.callbackUrl,
+  };
+  const parsed = aliyunOAuthCredentialSchema.safeParse(payload);
   if (appSecretIdPattern.test(credential.clientId)) {
     throw new AuthServiceError(
       "INVALID_CREDENTIAL",
       "当前填写的是应用密钥 ID，请改填 OAuth 应用基本信息中的应用 ID。",
     );
   }
-  throw new AuthServiceError(
-    "INVALID_CREDENTIAL",
-    "OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。",
-  );
+  if (!parsed.success) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "OAuth 应用 ID 必须填写应用基本信息中的数字型 AppId。",
+    );
+  }
+  if (aliyunOAuthConfigurationIssue(parsed.data) === "callback_mismatch") {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "阿里云 OAuth 应用的回调地址与 FrontMind 规范地址不一致。",
+    );
+  }
+  return parsed.data;
 }
 
 export function buildAliyunOAuthAuthorizationUrl(
@@ -885,12 +1040,27 @@ export async function replaceAliyunBrokerCredential(
 
 export async function replaceAliyunOAuthCredential(
   actorUserId: number,
-  rawInput: AliyunOAuthCredential,
+  rawInput: AliyunOAuthCredentialInput,
   inspect: (
     value: AliyunOAuthCredential,
   ) => Promise<unknown> = inspectAliyunOAuthConfiguration,
 ) {
-  const value = aliyunOAuthCredentialInputSchema.parse(rawInput);
+  const submitted = aliyunOAuthCredentialInputSchema.parse(rawInput);
+  const callbackUrl = canonicalAliyunOAuthCallbackUrl();
+  if (
+    submitted.callbackUrl !== undefined &&
+    submitted.callbackUrl !== callbackUrl
+  ) {
+    throw new AuthServiceError(
+      "INVALID_CREDENTIAL",
+      "提交的阿里云 OAuth 回调地址与 FrontMind 规范地址不一致。",
+    );
+  }
+  const value = aliyunOAuthCredentialSchema.parse({
+    clientId: submitted.clientId,
+    clientSecret: submitted.clientSecret,
+    callbackUrl,
+  });
   return replaceCredential({
     actorUserId,
     slot: ALIYUN_OAUTH_CREDENTIAL_SLOT,
@@ -992,19 +1162,29 @@ export async function getAliyunPlatformCredentialStatus() {
       .where(eq(siteProviderConnections.status, "active")),
   ]);
   const brokerStatus = toStatus(broker);
-  const oauthStatus = {
-    ...toStatus(oauth),
-    configured: Boolean(
-      oauth &&
-        oauth.status === "active" &&
-        oauth.validationStatus !== "invalid",
-    ),
-  };
-  const oauthValue = oauthStatus.configured
+  const oauthActive = Boolean(
+    oauth && oauth.status === "active" && oauth.validationStatus !== "invalid",
+  );
+  const oauthValue = oauthActive
     ? await getActiveAliyunOAuthCredential()
     : null;
+  const configurationIssue = oauthValue
+    ? aliyunOAuthConfigurationIssue(oauthValue)
+    : null;
+  const usableForAuthorization = Boolean(
+    oauthActive && oauthValue && configurationIssue === null,
+  );
+  const oauthStatus = {
+    ...toStatus(oauth),
+    // Preserve the long-standing meaning of `configured`: an active,
+    // non-invalid row exists. New callers use `usableForAuthorization` when
+    // deciding whether it is safe to begin a flow.
+    configured: oauthActive,
+  };
   const identityConfigured =
-    brokerStatus.configured && Boolean(oauthStatus.verifiedAt);
+    brokerStatus.configured &&
+    usableForAuthorization &&
+    Boolean(oauthStatus.verifiedAt);
   const customerCapabilityVerified = verifiedConnections.some(
     (row: { capabilities: string[] }) =>
       row.capabilities.includes("domain_read") &&
@@ -1019,8 +1199,11 @@ export async function getAliyunPlatformCredentialStatus() {
     broker: brokerStatus,
     oauth: {
       ...oauthStatus,
-      callbackUrl: oauthValue?.callbackUrl ?? null,
+      callbackUrl: canonicalAliyunOAuthCallbackUrl(),
       applicationIdTail: aliyunOAuthApplicationIdTail(oauthValue?.clientId),
+      usableForAuthorization,
+      requiresReplacement: oauthActive && configurationIssue !== null,
+      configurationIssue,
     },
   };
 }
@@ -1156,25 +1339,56 @@ export async function createAliyunOAuthAuthorization(input: {
   nowMs?: number;
   fetchImpl?: typeof fetch;
 }) {
-  const storedCredential = await getActiveAliyunOAuthCredential();
-  if (!storedCredential) {
-    throw new AuthServiceError("NOT_FOUND", "域名与发布平台尚未配置完成");
-  }
-  const credential = requireCurrentAliyunOAuthCredential(storedCredential);
-  await probeAliyunOAuthAuthorization(credential, input.fetchImpl ?? fetch);
-  const nowMs = input.nowMs ?? Date.now();
-  const state = buildAliyunOAuthState({
-    credentialId: storedCredential.id,
-    projectId: input.projectId,
+  const stageContext = {
+    phase: "begin" as const,
+    correlationId: randomUUID(),
     userId: input.userId,
-    clientSecret: credential.clientSecret,
-    expiresAt: nowMs + OAUTH_STATE_TTL_MS,
-  });
-  const url = buildAliyunOAuthAuthorizationUrl(credential, state);
-  return {
-    authorizationUrl: url.toString(),
-    expiresAt: new Date(nowMs + OAUTH_STATE_TTL_MS).toISOString(),
+    projectId: input.projectId,
   };
+  const storedCredential = await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "credential_load",
+    operation: async () => {
+      const stored = await getActiveAliyunOAuthCredential();
+      if (!stored) {
+        throw new AuthServiceError("NOT_FOUND", "域名与发布平台尚未配置完成");
+      }
+      return stored;
+    },
+  });
+  const credential = await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "credential_contract",
+    credentialVersion: storedCredential.version,
+    operation: () => requireCurrentAliyunOAuthCredential(storedCredential),
+  });
+  await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "authorization_probe",
+    credentialVersion: storedCredential.version,
+    operation: () =>
+      probeAliyunOAuthAuthorization(credential, input.fetchImpl ?? fetch),
+  });
+  return runAliyunOAuthStage({
+    ...stageContext,
+    stage: "authorization_issued",
+    credentialVersion: storedCredential.version,
+    operation: () => {
+      const nowMs = input.nowMs ?? Date.now();
+      const state = buildAliyunOAuthState({
+        credentialId: storedCredential.id,
+        projectId: input.projectId,
+        userId: input.userId,
+        clientSecret: credential.clientSecret,
+        expiresAt: nowMs + OAUTH_STATE_TTL_MS,
+      });
+      const url = buildAliyunOAuthAuthorizationUrl(credential, state);
+      return {
+        authorizationUrl: url.toString(),
+        expiresAt: new Date(nowMs + OAUTH_STATE_TTL_MS).toISOString(),
+      };
+    },
+  });
 }
 
 export async function verifyAliyunOAuthState(input: {
@@ -1223,6 +1437,11 @@ export async function exchangeAliyunOAuthCode(input: {
   fetchImpl?: typeof fetch;
   nowMs?: number;
 }) {
+  const stageContext = {
+    phase: "callback" as const,
+    correlationId: randomUUID(),
+    userId: input.userId,
+  };
   const code = z
     .string()
     .trim()
@@ -1230,58 +1449,82 @@ export async function exchangeAliyunOAuthCode(input: {
     .max(4_096)
     .refine(noControlCharacters)
     .parse(input.code);
-  const { payload, credential } = await verifyAliyunOAuthState(input);
+  const { payload, credential } = await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "state_verify",
+    operation: () => verifyAliyunOAuthState(input),
+  });
   const fetchImpl = input.fetchImpl ?? fetch;
-  const tokenResponse = await fetchImpl(ALIYUN_OAUTH_TOKEN_ENDPOINT, {
-    method: "POST",
-    redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
+  const token = await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "token_exchange",
+    projectId: payload.projectId,
+    credentialVersion: credential.version,
+    operation: async () => {
+      const tokenResponse = await fetchAliyunIdentityResponse(
+        fetchImpl,
+        ALIYUN_OAUTH_TOKEN_ENDPOINT,
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: new URLSearchParams({
+            code,
+            client_id: credential.clientId,
+            client_secret: credential.clientSecret,
+            redirect_uri: credential.callbackUrl,
+            grant_type: "authorization_code",
+          }),
+        },
+      );
+      throwForTransientOAuthStatus(tokenResponse.status);
+      const value = await boundedJson(tokenResponse);
+      return {
+        accessToken: z.string().min(8).max(16_384).parse(value.access_token),
+        scope: value.scope,
+      };
     },
-    body: new URLSearchParams({
-      code,
-      client_id: credential.clientId,
-      client_secret: credential.clientSecret,
-      redirect_uri: credential.callbackUrl,
-      grant_type: "authorization_code",
-    }),
   });
-  const token = await boundedJson(tokenResponse);
-  const accessToken = z.string().min(8).max(16_384).parse(token.access_token);
-  assertAliyunOAuthScopes(token.scope);
-  const userResponse = await fetchImpl(ALIYUN_OAUTH_USERINFO_ENDPOINT, {
-    method: "GET",
-    redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${accessToken}`,
+  await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "scope_verify",
+    projectId: payload.projectId,
+    credentialVersion: credential.version,
+    operation: () => assertAliyunOAuthScopes(token.scope),
+  });
+  const accountUid = await runAliyunOAuthStage({
+    ...stageContext,
+    stage: "userinfo",
+    projectId: payload.projectId,
+    credentialVersion: credential.version,
+    operation: async () => {
+      const userResponse = await fetchAliyunIdentityResponse(
+        fetchImpl,
+        ALIYUN_OAUTH_USERINFO_ENDPOINT,
+        {
+          method: "GET",
+          redirect: "error",
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${token.accessToken}`,
+          },
+        },
+      );
+      throwForTransientOAuthStatus(userResponse.status);
+      const userInfo = await boundedJson(userResponse);
+      return z
+        .string()
+        .regex(/^\d{6,64}$/)
+        .parse(userInfo.aid);
     },
   });
-  const userInfo = await boundedJson(userResponse);
-  const accountUid = z
-    .string()
-    .regex(/^\d{6,64}$/)
-    .parse(userInfo.aid);
-  const db = await requireDb();
-  const now = new Date();
-  await db
-    .update(presalesApiCredentials)
-    .set({
-      validationStatus: "verified",
-      verifiedAt: now,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(presalesApiCredentials.id, credential.id),
-        eq(presalesApiCredentials.slot, ALIYUN_OAUTH_CREDENTIAL_SLOT),
-        ne(presalesApiCredentials.status, "deleted"),
-      ),
-    );
   return {
+    credentialId: credential.id,
     projectId: payload.projectId,
     userId: payload.userId,
     accountUid,

@@ -61,6 +61,11 @@ type TwentyFirstCredentialStatus = CredentialStatus & {
   };
 };
 
+type AliyunOAuthConfigurationIssue =
+  | "application_id_is_secret_id"
+  | "invalid_application_id"
+  | "callback_mismatch";
+
 type AliyunPlatformStatus = {
   platformUid: string;
   customerRoleName: string;
@@ -71,6 +76,9 @@ type AliyunPlatformStatus = {
   oauth: CredentialStatus & {
     callbackUrl: string | null;
     applicationIdTail: string | null;
+    usableForAuthorization?: boolean;
+    requiresReplacement?: boolean;
+    configurationIssue?: AliyunOAuthConfigurationIssue | null;
   };
 };
 
@@ -101,11 +109,32 @@ const EMPTY_ALIYUN_STATUS: AliyunPlatformStatus = {
   ready: false,
   customerCapabilityVerified: false,
   broker: EMPTY_STATUS,
-  oauth: { ...EMPTY_STATUS, callbackUrl: null, applicationIdTail: null },
+  oauth: {
+    ...EMPTY_STATUS,
+    callbackUrl: null,
+    applicationIdTail: null,
+    usableForAuthorization: false,
+    requiresReplacement: false,
+    configurationIssue: null,
+  },
 };
 
 export const DEFAULT_API_KEY_USAGE_LIMIT = 230_000;
 export const DEFAULT_API_KEY_WARNING_RATIO = 0.8;
+
+export function aliyunOAuthConfigurationDisplayState(input: {
+  configured: boolean;
+  applicationIdTail?: string | null;
+  usableForAuthorization?: boolean;
+  requiresReplacement?: boolean;
+  configurationIssue?: AliyunOAuthConfigurationIssue | null;
+}) {
+  return {
+    configurationIssue: input.configurationIssue ?? null,
+    requiresReplacement: input.requiresReplacement ?? false,
+    usableForAuthorization: input.usableForAuthorization ?? input.configured,
+  };
+}
 
 export function presalesUsageDisplayState(input: {
   keyPoolTotalUsed: number | null;
@@ -148,7 +177,6 @@ export default function AdminPresales() {
   const [aliyunPrincipalArn, setAliyunPrincipalArn] = useState("");
   const [aliyunOAuthClientId, setAliyunOAuthClientId] = useState("");
   const [aliyunOAuthClientSecret, setAliyunOAuthClientSecret] = useState("");
-  const [aliyunOAuthCallbackUrl, setAliyunOAuthCallbackUrl] = useState("");
   const [aliyunPending, setAliyunPending] = useState<
     "broker" | "oauth" | "test" | "delete" | null
   >(null);
@@ -190,6 +218,11 @@ export default function AdminPresales() {
   );
   const aliyunStatus = (aliyunStatusQuery.data ??
     EMPTY_ALIYUN_STATUS) as AliyunPlatformStatus;
+  const {
+    configurationIssue: aliyunOAuthConfigurationIssue,
+    requiresReplacement: aliyunOAuthRequiresReplacement,
+    usableForAuthorization: aliyunOAuthUsableForAuthorization,
+  } = aliyunOAuthConfigurationDisplayState(aliyunStatus.oauth);
   const policyOverviewQuery = (
     trpc.admin as any
   ).apiKeyUsageAlerts.overview.useQuery(undefined, {
@@ -243,13 +276,6 @@ export default function AdminPresales() {
     setTwentyFirstConnectionState("idle");
     setTwentyFirstLatencyMs(null);
   }, [twentyFirstApiKey]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    setAliyunOAuthCallbackUrl(
-      `${window.location.origin}/api/site-ops/aliyun/oauth/callback`,
-    );
-  }, []);
 
   useEffect(() => {
     if (!websitePolicy) return;
@@ -407,7 +433,6 @@ export default function AdminPresales() {
       await utils.client.admin.presales.aliyun.replaceOAuth.mutate({
         clientId,
         clientSecret: aliyunOAuthClientSecret.trim(),
-        callbackUrl: aliyunOAuthCallbackUrl.trim(),
       });
       setAliyunOAuthClientId("");
       setAliyunOAuthClientSecret("");
@@ -1539,17 +1564,34 @@ export default function AdminPresales() {
                       }
                     />
                   </div>
-                  {aliyunStatus.oauth.fingerprint &&
+                  {aliyunOAuthRequiresReplacement && (
+                    <div
+                      className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900"
+                      role="alert"
+                    >
+                      {aliyunOAuthConfigurationIssue ===
+                      "application_id_is_secret_id"
+                        ? "当前版本保存的是 AppSecretId，不能发起客户授权。请改填 OAuth 应用“基本信息”中的数字 AppId，并使用新的 AppSecretValue 替换。"
+                        : aliyunOAuthConfigurationIssue === "callback_mismatch"
+                          ? "当前版本保存的回调地址与本环境不一致，不能发起客户授权。请在阿里云同步下方只读回调地址后重新保存应用。"
+                          : "当前 OAuth 应用 ID 不符合数字 AppId 要求，不能发起客户授权。请重新填写并保存。"}
+                    </div>
+                  )}
+                  {!aliyunOAuthRequiresReplacement &&
+                    aliyunOAuthUsableForAuthorization &&
+                    aliyunStatus.oauth.fingerprint &&
                     !aliyunStatus.oauth.verifiedAt && (
                       <p className="text-xs text-amber-700">
                         应用配置已检查，等待首次客户授权验证应用密钥。
                       </p>
                     )}
-                  {aliyunStatus.oauth.verifiedAt && (
-                    <p className="text-xs text-emerald-700">
-                      已完成真实 OAuth 授权验证。
-                    </p>
-                  )}
+                  {!aliyunOAuthRequiresReplacement &&
+                    aliyunOAuthUsableForAuthorization &&
+                    aliyunStatus.oauth.verifiedAt && (
+                      <p className="text-xs text-emerald-700">
+                        已完成真实 OAuth 授权验证。
+                      </p>
+                    )}
                   <div className="space-y-2">
                     <Label htmlFor="aliyun-oauth-client-id">
                       OAuth 应用 ID（Client ID）
@@ -1600,21 +1642,25 @@ export default function AdminPresales() {
                     <Label htmlFor="aliyun-oauth-callback">Callback URL</Label>
                     <Input
                       id="aliyun-oauth-callback"
-                      value={aliyunOAuthCallbackUrl}
-                      onChange={(event) =>
-                        setAliyunOAuthCallbackUrl(event.target.value)
-                      }
+                      value={aliyunStatus.oauth.callbackUrl ?? ""}
+                      placeholder="由 FrontMind 服务端生成"
+                      readOnly
+                      aria-readonly="true"
                       autoComplete="off"
                       spellCheck={false}
                     />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      由当前 FrontMind
+                      环境在服务端生成；请将此地址逐字配置到阿里云 OAuth Web
+                      应用，不能在此手动修改。
+                    </p>
                   </div>
                   <Button
                     type="submit"
                     disabled={
                       aliyunPending !== null ||
                       !aliyunOAuthClientId.trim() ||
-                      !aliyunOAuthClientSecret.trim() ||
-                      !aliyunOAuthCallbackUrl.trim()
+                      !aliyunOAuthClientSecret.trim()
                     }
                   >
                     {aliyunPending === "oauth" && (
@@ -1628,7 +1674,9 @@ export default function AdminPresales() {
                   <Button
                     variant="outline"
                     disabled={
-                      aliyunPending !== null || !aliyunStatus.identityConfigured
+                      aliyunPending !== null ||
+                      !aliyunStatus.identityConfigured ||
+                      !aliyunOAuthUsableForAuthorization
                     }
                     onClick={() => void handleAliyunTest()}
                   >

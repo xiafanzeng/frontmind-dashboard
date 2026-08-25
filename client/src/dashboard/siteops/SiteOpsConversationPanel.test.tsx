@@ -1462,6 +1462,66 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
+  it("shows a safe checking page synchronously while the authorization URL is prepared", async () => {
+    const popupDocument = document.implementation.createHTMLDocument();
+    const onBeginAliyun = vi.fn(
+      () =>
+        new Promise<{ authorizationUrl: string; expiresAt: string }>(() => {}),
+    );
+    const authorizationWindow = {
+      document: popupDocument,
+      location: { href: "" },
+      focus: vi.fn(),
+      close: vi.fn(),
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(authorizationWindow as unknown as Window);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onBeginAliyun={onBeginAliyun}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+
+    expect(onBeginAliyun).toHaveBeenCalledOnce();
+    expect(popupDocument.title).toBe("正在检查阿里云授权配置");
+    expect(popupDocument.body.textContent).toContain(
+      "请稍候，FrontMind 正在确认安全的授权入口。",
+    );
+    expect(popupDocument.querySelector("main")?.getAttribute("aria-live")).toBe(
+      "polite",
+    );
+    expect(popupDocument.querySelector("button")).toBeNull();
+    open.mockRestore();
+  });
+
+  it("keeps the error on the Aliyun card when the popup is blocked", async () => {
+    const onBeginAliyun = vi.fn();
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation()}
+        onBeginAliyun={onBeginAliyun}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "连接阿里云" }));
+
+    expect(onBeginAliyun).not.toHaveBeenCalled();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "阿里云授权页面被浏览器阻止，请允许此站点打开弹窗后重试。",
+    );
+    expect(alert).toHaveAttribute("aria-live", "assertive");
+    expect(
+      screen.getByRole("heading", { name: "连接阿里云" }).closest("section"),
+    ).toContainElement(alert);
+    open.mockRestore();
+  });
+
   it("does not expose an upstream invalid_client response", async () => {
     const onBeginAliyun = vi
       .fn()
@@ -1470,7 +1530,9 @@ describe("SiteOpsConversationPanel", () => {
           "invalid_client: App not exists:5be78a96-6d64-42a0-b764-49474a8d5e04",
         ),
       );
+    const popupDocument = document.implementation.createHTMLDocument();
     const authorizationWindow = {
+      document: popupDocument,
       location: { href: "" },
       focus: vi.fn(),
       close: vi.fn(),
@@ -1494,6 +1556,17 @@ describe("SiteOpsConversationPanel", () => {
     expect(document.body.textContent).not.toContain(
       "5be78a96-6d64-42a0-b764-49474a8d5e04",
     );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "阿里云连接配置需要 FrontMind 管理员更新。",
+    );
+    expect(popupDocument.title).toBe("暂时无法打开阿里云授权");
+    expect(popupDocument.body.textContent).not.toMatch(
+      /invalid_client|5be78a96|AppId|Secret/iu,
+    );
+    expect(authorizationWindow.close).not.toHaveBeenCalled();
+    const closeButton = popupDocument.querySelector("button");
+    expect(closeButton?.textContent).toBe("关闭窗口");
+    closeButton?.click();
     expect(authorizationWindow.close).toHaveBeenCalledOnce();
     open.mockRestore();
   });

@@ -6,6 +6,7 @@ import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const buildId = "123e4567-e89b-42d3-a456-426614174000";
+const oauthCredentialId = "223e4567-e89b-42d3-a456-426614174000";
 
 const mocks = vi.hoisted(() => ({
   completeSiteOpsAliyunOAuth: vi.fn(),
@@ -88,6 +89,7 @@ beforeEach(async () => {
     stored: { createReadStream: () => Readable.from([distZip]) },
   });
   mocks.exchangeAliyunOAuthCode.mockReset().mockResolvedValue({
+    credentialId: oauthCredentialId,
     projectId: "project-1",
     accountUid: "1234567890123456",
   });
@@ -169,6 +171,7 @@ describe("SiteOps Aliyun OAuth callback", () => {
     });
     expect(mocks.completeSiteOpsAliyunOAuth).toHaveBeenCalledWith({
       actor: { id: 42, username: "site-owner", role: "user" },
+      credentialId: oauthCredentialId,
       projectId: "project-1",
       accountUid: "1234567890123456",
     });
@@ -209,12 +212,20 @@ describe("SiteOps Aliyun OAuth callback", () => {
       expect(html).not.toContain("client-id-secret-sentinel");
       expect(html).not.toContain("secret-state-sentinel");
       expect(consoleError).toHaveBeenCalledWith(
-        "[SiteOps Aliyun OAuth] provider_authorization_failed",
-        {
-          event: "siteops_aliyun_oauth_provider_authorization_failed",
+        "[SiteOps Aliyun OAuth] callback_stage_failed",
+        expect.objectContaining({
+          event: "siteops_aliyun_oauth_callback_stage_failed",
+          stage: "provider_authorization",
           userId: 42,
-          errorClass: "OAuthProviderAuthorizationError",
-        },
+          errorCode: "PROVIDER_AUTHORIZATION_FAILED",
+          releaseSha: null,
+        }),
+      );
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+        "client-id-secret-sentinel",
+      );
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+        "secret-state-sentinel",
       );
     } finally {
       consoleError.mockRestore();
@@ -222,17 +233,96 @@ describe("SiteOps Aliyun OAuth callback", () => {
   });
 
   it("returns a safe failed page when the callback has no authenticated user", async () => {
-    const origin = await startApp({ authenticated: false });
-    const response = await fetch(
-      `${origin}/api/site-ops/aliyun/oauth/callback?code=secret-code-sentinel&state=secret-state-sentinel`,
-    );
-    const html = await response.text();
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    try {
+      const origin = await startApp({ authenticated: false });
+      const response = await fetch(
+        `${origin}/api/site-ops/aliyun/oauth/callback?code=secret-code-sentinel&state=secret-state-sentinel`,
+      );
+      const html = await response.text();
 
-    expectSecureOAuthCompletionPage(response, html, "failed");
-    expect(mocks.exchangeAliyunOAuthCode).not.toHaveBeenCalled();
-    expect(mocks.completeSiteOpsAliyunOAuth).not.toHaveBeenCalled();
-    expect(html).not.toContain("secret-code-sentinel");
-    expect(html).not.toContain("secret-state-sentinel");
+      expectSecureOAuthCompletionPage(response, html, "failed");
+      expect(mocks.exchangeAliyunOAuthCode).not.toHaveBeenCalled();
+      expect(mocks.completeSiteOpsAliyunOAuth).not.toHaveBeenCalled();
+      expect(html).not.toContain("secret-code-sentinel");
+      expect(html).not.toContain("secret-state-sentinel");
+      expect(consoleError).toHaveBeenCalledWith(
+        "[SiteOps Aliyun OAuth] callback_stage_failed",
+        expect.objectContaining({
+          stage: "session",
+          userId: null,
+          errorCode: "UNAUTHENTICATED",
+        }),
+      );
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+        "secret-code-sentinel",
+      );
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain(
+        "secret-state-sentinel",
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("classifies exchange and bind failures by safe stage without logging OAuth material", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    try {
+      const exchangeError = Object.assign(
+        new Error("secret-code-sentinel secret-state-sentinel"),
+        { code: "INVALID_CREDENTIAL" },
+      );
+      mocks.exchangeAliyunOAuthCode.mockRejectedValueOnce(exchangeError);
+      const exchangeOrigin = await startApp();
+      const exchangeResponse = await fetch(
+        `${exchangeOrigin}/api/site-ops/aliyun/oauth/callback?code=secret-code-sentinel&state=secret-state-sentinel`,
+      );
+      expectSecureOAuthCompletionPage(
+        exchangeResponse,
+        await exchangeResponse.text(),
+        "failed",
+      );
+      expect(consoleError).toHaveBeenCalledWith(
+        "[SiteOps Aliyun OAuth] callback_stage_failed",
+        expect.objectContaining({
+          stage: "oauth_exchange",
+          errorCode: "INVALID_CREDENTIAL",
+        }),
+      );
+
+      mocks.completeSiteOpsAliyunOAuth.mockRejectedValueOnce(
+        Object.assign(new Error("account-uid-secret-sentinel"), {
+          code: "STATE_CONFLICT",
+        }),
+      );
+      const bindOrigin = await startApp();
+      const bindResponse = await fetch(
+        `${bindOrigin}/api/site-ops/aliyun/oauth/callback?code=secret-code-sentinel&state=secret-state-sentinel`,
+      );
+      expectSecureOAuthCompletionPage(
+        bindResponse,
+        await bindResponse.text(),
+        "failed",
+      );
+      expect(consoleError).toHaveBeenCalledWith(
+        "[SiteOps Aliyun OAuth] callback_stage_failed",
+        expect.objectContaining({
+          stage: "account_bind",
+          errorCode: "STATE_CONFLICT",
+        }),
+      );
+
+      const serializedLogs = JSON.stringify(consoleError.mock.calls);
+      expect(serializedLogs).not.toContain("secret-code-sentinel");
+      expect(serializedLogs).not.toContain("secret-state-sentinel");
+      expect(serializedLogs).not.toContain("account-uid-secret-sentinel");
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });
 

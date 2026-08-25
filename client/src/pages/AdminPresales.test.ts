@@ -3,7 +3,10 @@ import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { presalesUsageDisplayState } from "./AdminPresales";
+import {
+  aliyunOAuthConfigurationDisplayState,
+  presalesUsageDisplayState,
+} from "./AdminPresales";
 
 describe("presalesUsageDisplayState", () => {
   it("does not contain the retired attribution or emergency-replacement gates", () => {
@@ -66,6 +69,49 @@ describe("presalesUsageDisplayState", () => {
     expect(source).toContain("applicationIdTail");
     expect(source).toContain('label="凭据指纹"');
     expect(source).not.toContain('label="应用标识"');
+  });
+
+  it("uses the server-owned callback and surfaces unusable historical OAuth versions", () => {
+    const source = readFileSync(
+      resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
+      "utf8",
+    );
+    expect(source).toContain("usableForAuthorization");
+    expect(source).toContain("requiresReplacement");
+    expect(source).toContain("configurationIssue");
+    expect(source).toContain("application_id_is_secret_id");
+    expect(source).toContain(
+      "当前版本保存的是 AppSecretId，不能发起客户授权。",
+    );
+    expect(source).toContain('value={aliyunStatus.oauth.callbackUrl ?? ""}');
+    expect(source).toContain("readOnly");
+    expect(source).not.toContain("setAliyunOAuthCallbackUrl");
+    expect(source).not.toContain("callbackUrl: aliyunOAuthCallbackUrl");
+  });
+
+  it("preserves a valid legacy status without guessing from a short numeric tail", () => {
+    expect(
+      aliyunOAuthConfigurationDisplayState({
+        configured: true,
+        applicationIdTail: "1234",
+      }),
+    ).toEqual({
+      configurationIssue: null,
+      requiresReplacement: false,
+      usableForAuthorization: true,
+    });
+    expect(
+      aliyunOAuthConfigurationDisplayState({
+        configured: false,
+        usableForAuthorization: false,
+        requiresReplacement: true,
+        configurationIssue: "application_id_is_secret_id",
+      }),
+    ).toEqual({
+      configurationIssue: "application_id_is_secret_id",
+      requiresReplacement: true,
+      usableForAuthorization: false,
+    });
   });
 
   it("sends 21st plaintext through the direct tRPC client without retaining mutation variables", () => {

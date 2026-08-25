@@ -31,9 +31,11 @@ import {
   aliyunOAuthApplicationIdSchema,
   aliyunOAuthCredentialInputSchema,
   aliyunOAuthApplicationIdTail,
+  aliyunOAuthConfigurationIssue,
   assertAliyunOAuthScopes,
   buildAliyunOAuthAuthorizationUrl,
   buildAliyunOAuthState,
+  canonicalAliyunOAuthCallbackUrl,
   createAliyunOAuthAuthorization,
   decryptAliyunPlatformCredential,
   encryptAliyunPlatformCredential,
@@ -48,6 +50,7 @@ import {
 } from "./aliyun-platform-service";
 
 const originalMasterKey = process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY;
+const originalPublicUrl = process.env.FRONTMIND_PUBLIC_URL;
 const originalSiteOpsEnabled = process.env.FRONTMIND_SITEOPS_ENABLED;
 
 const oauthCredential = {
@@ -127,6 +130,38 @@ function oauthDatabase(row: ReturnType<typeof storedOAuthCredential> | null) {
   return { db, updates };
 }
 
+function oauthReplacementDatabase() {
+  const inserted: Array<Record<string, unknown>> = [];
+  const transaction = {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          orderBy: vi.fn(() => ({
+            limit: vi.fn(() => ({
+              for: vi.fn(async () => []),
+            })),
+          })),
+        })),
+      })),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({ where: vi.fn(async () => ({ affectedRows: 0 })) })),
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(async (row: Record<string, unknown>) => {
+        inserted.push(row);
+      }),
+    })),
+  };
+  const db = {
+    transaction: vi.fn(
+      async (operation: (tx: typeof transaction) => Promise<unknown>) =>
+        operation(transaction),
+    ),
+  };
+  return { db, inserted };
+}
+
 function signedOAuthState(input: {
   credentialId: string;
   projectId?: string;
@@ -175,8 +210,11 @@ describe("Aliyun platform credentials", () => {
   beforeEach(() => {
     dependencies.getDb.mockReset();
     dependencies.getServicePortal.mockClear();
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
     process.env.FRONTMIND_CREDENTIAL_ENCRYPTION_KEY =
       randomBytes(32).toString("base64");
+    process.env.FRONTMIND_PUBLIC_URL = "https://dashboard.frontmind.net";
     process.env.FRONTMIND_SITEOPS_ENABLED = "1";
   });
 
@@ -191,6 +229,11 @@ describe("Aliyun platform credentials", () => {
       delete process.env.FRONTMIND_SITEOPS_ENABLED;
     } else {
       process.env.FRONTMIND_SITEOPS_ENABLED = originalSiteOpsEnabled;
+    }
+    if (originalPublicUrl === undefined) {
+      delete process.env.FRONTMIND_PUBLIC_URL;
+    } else {
+      process.env.FRONTMIND_PUBLIC_URL = originalPublicUrl;
     }
   });
 
@@ -250,6 +293,52 @@ describe("Aliyun platform credentials", () => {
     ).toBe(
       "https://dashboard.frontmind.net/api/site-ops/aliyun/oauth/callback",
     );
+    expect(
+      aliyunOAuthCredentialInputSchema.parse({
+        clientId: oauthCredential.clientId,
+        clientSecret: oauthCredential.clientSecret,
+      }),
+    ).toEqual({
+      clientId: oauthCredential.clientId,
+      clientSecret: oauthCredential.clientSecret,
+    });
+    expect(() =>
+      aliyunOAuthCredentialInputSchema.parse({
+        clientId: oauthCredential.clientId,
+        clientSecret: oauthCredential.clientSecret,
+        unexpected: "not-accepted",
+      }),
+    ).toThrow();
+  });
+
+  it("derives one canonical callback and classifies historical configuration issues", () => {
+    expect(canonicalAliyunOAuthCallbackUrl()).toBe(oauthCredential.callbackUrl);
+    expect(
+      canonicalAliyunOAuthCallbackUrl({
+        ...process.env,
+        FRONTMIND_PUBLIC_URL: "https://console.frontmind.net/",
+      }),
+    ).toBe("https://console.frontmind.net/api/site-ops/aliyun/oauth/callback");
+    expect(aliyunOAuthConfigurationIssue(oauthCredential)).toBeNull();
+    expect(
+      aliyunOAuthConfigurationIssue({
+        ...oauthCredential,
+        clientId: "5be78a96-6d64-42a0-b764-49474a8d5e04",
+      }),
+    ).toBe("application_id_is_secret_id");
+    expect(
+      aliyunOAuthConfigurationIssue({
+        ...oauthCredential,
+        clientId: "frontmind-oauth",
+      }),
+    ).toBe("invalid_application_id");
+    expect(
+      aliyunOAuthConfigurationIssue({
+        ...oauthCredential,
+        callbackUrl:
+          "https://other.frontmind.net/api/site-ops/aliyun/oauth/callback",
+      }),
+    ).toBe("callback_mismatch");
   });
 
   it("accepts numeric AppId values and identifies an AppSecretId UUID", () => {
@@ -325,11 +414,15 @@ describe("Aliyun platform credentials", () => {
         version: 1,
         callbackUrl: oauthCredential.callbackUrl,
         applicationIdTail: "5e04",
+        usableForAuthorization: false,
+        requiresReplacement: true,
+        configurationIssue: "application_id_is_secret_id",
       },
     });
 
     dependencies.getDb.mockResolvedValue(activeDb);
     const fetchImpl = vi.fn();
+    vi.spyOn(console, "error").mockImplementation(() => {});
     await expect(
       createAliyunOAuthAuthorization({
         projectId: randomUUID(),
@@ -341,6 +434,81 @@ describe("Aliyun platform credentials", () => {
       message: expect.stringContaining("应用密钥 ID"),
     });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("projects enriched stored metadata before beginning one authorization flow", async () => {
+    const credential = storedOAuthCredential();
+    const activeDb = {
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(() => ({
+              limit: vi.fn(async () => [credential]),
+            })),
+          })),
+        })),
+      })),
+    };
+    dependencies.getDb.mockResolvedValue(activeDb);
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response("<!doctype html><title>Alibaba Cloud sign in</title>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+    );
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => {});
+    const projectId = randomUUID();
+
+    const result = await createAliyunOAuthAuthorization({
+      projectId,
+      userId: 42,
+      nowMs: 1_000,
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const authorizationUrl = new URL(result.authorizationUrl);
+    expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(
+      ALIYUN_OAUTH_AUTHORIZE_ENDPOINT,
+    );
+    expect(authorizationUrl.searchParams.get("client_id")).toBe(
+      oauthCredential.clientId,
+    );
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+      oauthCredential.callbackUrl,
+    );
+    expect(result.authorizationUrl).not.toContain(oauthCredential.clientSecret);
+    expect(result.expiresAt).toBe(new Date(1_000 + 10 * 60_000).toISOString());
+
+    const entries = infoLog.mock.calls
+      .map((call) => call[1])
+      .filter((entry): entry is Record<string, unknown> =>
+        Boolean(
+          entry &&
+            typeof entry === "object" &&
+            "event" in entry &&
+            entry.event === "siteops_aliyun_oauth_stage",
+        ),
+      );
+    expect(entries.map((entry) => entry.stage)).toEqual([
+      "credential_load",
+      "credential_contract",
+      "authorization_probe",
+      "authorization_issued",
+    ]);
+    expect(new Set(entries.map((entry) => entry.correlationId)).size).toBe(1);
+    expect(entries[0]?.correlationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    const serializedLog = JSON.stringify(infoLog.mock.calls);
+    expect(serializedLog).not.toContain(oauthCredential.clientId);
+    expect(serializedLog).not.toContain(oauthCredential.clientSecret);
+    expect(serializedLog).not.toContain(oauthCredential.callbackUrl);
+    expect(serializedLog).not.toContain(result.authorizationUrl);
+    const state = authorizationUrl.searchParams.get("state") ?? "";
+    expect(state).not.toBe("");
+    expect(serializedLog).not.toContain(state);
   });
 
   it("accepts only the exact broker account and RAM user ARN returned by STS", async () => {
@@ -674,6 +842,60 @@ describe("Aliyun platform credentials", () => {
     expect(message).not.toContain(oauthCredential.clientSecret);
   });
 
+  it("derives and persists the canonical callback when replacement omits it", async () => {
+    const fixture = oauthReplacementDatabase();
+    dependencies.getDb.mockResolvedValue(fixture.db);
+    const inspect = vi.fn(async () => ({ ok: true }));
+
+    await expect(
+      replaceAliyunOAuthCredential(
+        42,
+        {
+          clientId: oauthCredential.clientId,
+          clientSecret: oauthCredential.clientSecret,
+        },
+        inspect,
+      ),
+    ).resolves.toMatchObject({
+      configured: false,
+      status: "active",
+      version: 1,
+    });
+
+    expect(inspect).toHaveBeenCalledTimes(1);
+    expect(inspect).toHaveBeenCalledWith(oauthCredential);
+    expect(fixture.inserted).toHaveLength(1);
+    expect(
+      decryptAliyunPlatformCredential(ALIYUN_OAUTH_CREDENTIAL_SLOT, {
+        id: String(fixture.inserted[0]?.id),
+        encryptionVersion: Number(fixture.inserted[0]?.encryptionVersion),
+        encryptedKey: String(fixture.inserted[0]?.encryptedKey),
+        encryptionIv: String(fixture.inserted[0]?.encryptionIv),
+        encryptionAuthTag: String(fixture.inserted[0]?.encryptionAuthTag),
+      }),
+    ).toEqual(oauthCredential);
+  });
+
+  it("rejects a legacy submitted callback unless it matches the canonical URL", async () => {
+    const inspect = vi.fn(async () => ({ ok: true }));
+
+    await expect(
+      replaceAliyunOAuthCredential(
+        42,
+        {
+          clientId: oauthCredential.clientId,
+          clientSecret: oauthCredential.clientSecret,
+          callbackUrl:
+            "https://other.frontmind.net/api/site-ops/aliyun/oauth/callback",
+        },
+        inspect,
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
+
+    expect(inspect).not.toHaveBeenCalled();
+    expect(dependencies.getDb).not.toHaveBeenCalled();
+  });
+
   it("does not access the database or retire the old version when preflight fails", async () => {
     const fetchImpl = vi
       .fn()
@@ -836,28 +1058,31 @@ describe("Aliyun platform credentials", () => {
     expect(fixture.updates).toEqual([]);
   });
 
-  it("returns the signed tenant identity and persists verification without the access token", async () => {
+  it("returns the frozen credential identity without directly persisting verification", async () => {
     const projectId = randomUUID();
     const credential = storedOAuthCredential();
     const fixture = oauthDatabase(credential);
     dependencies.getDb.mockResolvedValue(fixture.db);
+    const state = signedOAuthState({
+      credentialId: credential.id,
+      projectId,
+      userId: 42,
+    });
     const fetchImpl = vi
       .fn()
       .mockResolvedValueOnce(validTokenResponse())
       .mockResolvedValueOnce(jsonResponse({ aid: "1234567890123456" }));
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => {});
 
     await expect(
       exchangeAliyunOAuthCode({
         code: "oauth-code-success",
-        state: signedOAuthState({
-          credentialId: credential.id,
-          projectId,
-          userId: 42,
-        }),
+        state,
         userId: 42,
         fetchImpl: fetchImpl as typeof fetch,
       }),
     ).resolves.toEqual({
+      credentialId: credential.id,
       projectId,
       userId: 42,
       accountUid: "1234567890123456",
@@ -872,25 +1097,56 @@ describe("Aliyun platform credentials", () => {
         }),
       }),
     );
-    expect(fixture.updates).toHaveLength(1);
-    expect(fixture.updates[0]).toMatchObject({
-      validationStatus: "verified",
-      verifiedAt: expect.any(Date),
-      updatedAt: expect.any(Date),
-    });
-    expect(JSON.stringify(fixture.updates)).not.toContain(
-      "oauth-access-token-never-persist",
-    );
+    expect(fixture.updates).toEqual([]);
+
+    const entries = infoLog.mock.calls
+      .map((call) => call[1])
+      .filter((entry): entry is Record<string, unknown> =>
+        Boolean(
+          entry &&
+            typeof entry === "object" &&
+            "event" in entry &&
+            entry.event === "siteops_aliyun_oauth_stage",
+        ),
+      );
+    expect(entries.map((entry) => entry.stage)).toEqual([
+      "state_verify",
+      "token_exchange",
+      "scope_verify",
+      "userinfo",
+    ]);
+    expect(new Set(entries.map((entry) => entry.correlationId)).size).toBe(1);
+    const serializedLog = JSON.stringify(infoLog.mock.calls);
+    expect(serializedLog).not.toContain("oauth-code-success");
+    expect(serializedLog).not.toContain(state);
+    expect(serializedLog).not.toContain(oauthCredential.clientId);
+    expect(serializedLog).not.toContain(oauthCredential.clientSecret);
+    expect(serializedLog).not.toContain("oauth-access-token-never-persist");
+    expect(serializedLog).not.toContain("1234567890123456");
   });
 
   it("refuses callback completion for a project owned by another tenant", async () => {
-    const fixture = oauthDatabase(null);
-    dependencies.getDb.mockResolvedValue(fixture.db);
+    const transaction = {
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            limit: vi.fn(() => ({ for: vi.fn(async () => []) })),
+          })),
+        })),
+      })),
+    };
+    dependencies.getDb.mockResolvedValue({
+      transaction: vi.fn(
+        async (operation: (tx: typeof transaction) => Promise<unknown>) =>
+          operation(transaction),
+      ),
+    });
     const { completeSiteOpsAliyunOAuth } = await import("./service");
 
     await expect(
       completeSiteOpsAliyunOAuth({
         actor: { id: 42, role: "user", username: "customer-42" } as never,
+        credentialId: randomUUID(),
         projectId: randomUUID(),
         accountUid: "1234567890123456",
       }),
