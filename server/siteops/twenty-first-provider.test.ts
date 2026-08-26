@@ -16,11 +16,13 @@ import {
 } from "../twenty-first-service";
 import {
   createTwentyFirstSiteOpsProviderHandler,
+  nativeSourceProviderErrorCode,
   resolveVisualSearchPlan,
   type TwentyFirstBoardPersistenceInput,
   type TwentyFirstProviderContext,
 } from "./twenty-first-provider";
 import {
+  NativeVisualSourceError,
   createNativeSourceArchive,
   normalizeTwentyFirstNativeSource,
   readVisualSelectionBundleArtifact,
@@ -40,6 +42,18 @@ const credentialId = "11111111-1111-4111-8111-111111111111";
 const snapshotId = "22222222-2222-4222-8222-222222222222";
 const projectId = "33333333-3333-4333-8333-333333333333";
 const operationId = "44444444-4444-4444-8444-444444444444";
+
+it("keeps native browser, render and hard-safety provider codes distinct", () => {
+  expect(nativeSourceProviderErrorCode("browser_unavailable")).toBe(
+    "NATIVE_SOURCE_BROWSER_UNAVAILABLE",
+  );
+  expect(nativeSourceProviderErrorCode("render_failed")).toBe(
+    "NATIVE_SOURCE_RENDER_UNAVAILABLE",
+  );
+  expect(nativeSourceProviderErrorCode("source_unsafe")).toBe(
+    "NATIVE_SOURCE_UNSAFE",
+  );
+});
 
 function operation(): SiteOperation {
   const now = new Date();
@@ -899,6 +913,272 @@ describe("21st SiteOps provider", () => {
     expect(persistBoard).not.toHaveBeenCalled();
   });
 
+  it("reports 18 source-contract rejections instead of the 36-preview matching budget", async () => {
+    const row = operation();
+    row.input = {
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "2.5.0",
+    };
+    let nextId = 1;
+    const search = vi.fn(async () => {
+      const familyIndex = Math.floor((nextId - 1) / 4);
+      const metadata = familyMetadata(familyIndex);
+      return {
+        results: Array.from({ length: 4 }, () => {
+          const id = nextId++;
+          return {
+            id,
+            name: `${metadata.name} ${id}`,
+            description: metadata.description,
+            previewUrl: `https://cdn.example.test/${id}.png`,
+          };
+        }),
+      };
+    });
+    const getComponent = vi.fn(async () => ({
+      contractKind: "twenty_first_get_component_v1",
+      status: { found: false, locked: false },
+      sourceText: "Component not found.",
+    }));
+    const prepareNativeCandidate = vi.fn();
+    const persistBoard = vi.fn();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({ effectiveSearchLimit: 18, search, getComponent }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+        };
+      }),
+      prepareNativeCandidate,
+      persistArtifact: vi.fn(async (input) => ({
+        id: randomUUID(),
+        contentSha256: sha256(input.buffer),
+      })) as never,
+      persistBoard,
+    });
+
+    await expect(
+      handler({
+        operation: row,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE",
+      result: {
+        mirrorAttempted: 18,
+        sourceFetchAttempts: 18,
+        sourceFetchSucceeded: 0,
+        sourcePreparationAttempts: 0,
+        nativeFailureCategory: "source_incomplete",
+        terminalReason: "source_failures",
+      },
+    });
+    expect(getComponent).toHaveBeenCalledTimes(18);
+    expect(prepareNativeCandidate).not.toHaveBeenCalled();
+    expect(persistBoard).not.toHaveBeenCalled();
+  });
+
+  it("classifies the production-shaped 68-result compile failure after closing the MCP session", async () => {
+    const row = operation();
+    row.input = {
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "2.5.0",
+    };
+    let searchCall = 0;
+    let nextId = 1;
+    const search = vi.fn(async () => {
+      const currentCall = searchCall++;
+      const metadata = familyMetadata(currentCall);
+      const resultCount = currentCall < 5 ? 8 : 7;
+      return {
+        results: Array.from({ length: resultCount }, () => {
+          const id = nextId++;
+          return {
+            id,
+            name: `${metadata.name} ${id}`,
+            description: metadata.description,
+            previewUrl: `https://cdn.example.test/${id}.png`,
+          };
+        }),
+      };
+    });
+    const getComponent = vi.fn(async (providerItemId: string | number) => ({
+      data: { id: providerItemId, componentCode: "source payload" },
+    }));
+    let sessionOpen = false;
+    const prepareNativeCandidate = vi.fn(async () => {
+      expect(sessionOpen).toBe(false);
+      throw new NativeVisualSourceError("NATIVE_SOURCE_COMPILE_FAILED");
+    });
+    const persistBoard = vi.fn();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) => {
+          sessionOpen = true;
+          try {
+            return await use({
+              effectiveSearchLimit: 18,
+              search,
+              getComponent,
+            });
+          } finally {
+            sessionOpen = false;
+          }
+        },
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+        };
+      }),
+      prepareNativeCandidate,
+      persistArtifact: vi.fn(async (input) => ({
+        id: randomUUID(),
+        contentSha256: sha256(input.buffer),
+      })) as never,
+      persistBoard,
+    });
+
+    await expect(
+      handler({
+        operation: row,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "NATIVE_SOURCE_COMPILE_UNAVAILABLE",
+      result: {
+        queryCalls: 9,
+        normalizedUnique: 68,
+        mirrorAttempted: 18,
+        mirrorSucceeded: 18,
+        sourceFetchAttempts: 18,
+        sourceFetchSucceeded: 18,
+        sourcePreparationAttempts: 18,
+        sourcePrepared: 0,
+        nativeFailureCategory: "compile_failed",
+        terminalReason: "source_failures",
+      },
+    });
+    expect(getComponent).toHaveBeenCalledTimes(18);
+    expect(prepareNativeCandidate).toHaveBeenCalledTimes(18);
+    expect(persistBoard).not.toHaveBeenCalled();
+  });
+
+  it("fast-fuses a locked source contract as quota unavailable", async () => {
+    const row = operation();
+    row.input = {
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "2.5.0",
+    };
+    let nextId = 1;
+    const search = vi.fn(async () => {
+      const familyIndex = Math.floor((nextId - 1) / 4);
+      const metadata = familyMetadata(familyIndex);
+      return {
+        results: Array.from({ length: 4 }, () => {
+          const id = nextId++;
+          return {
+            id,
+            name: `${metadata.name} ${id}`,
+            description: metadata.description,
+            previewUrl: `https://cdn.example.test/${id}.png`,
+          };
+        }),
+      };
+    });
+    const getComponent = vi.fn(async () => ({
+      contractKind: "twenty_first_get_component_v1",
+      status: { found: true, locked: true },
+      sourceText: "Upgrade required.",
+    }));
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({ effectiveSearchLimit: 18, search, getComponent }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+        };
+      }),
+      persistArtifact: vi.fn(async (input) => ({
+        id: randomUUID(),
+        contentSha256: sha256(input.buffer),
+      })) as never,
+      persistBoard: vi.fn(),
+    });
+
+    await expect(
+      handler({
+        operation: row,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "NATIVE_SOURCE_QUOTA_UNAVAILABLE",
+      result: {
+        nativeFailureCategory: "provider_quota",
+      },
+    });
+    expect(getComponent.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
   it("uses fresh V2 supplemental references from ranks thirteen through eighteen", async () => {
     let familyIndex = 0;
     const search = vi.fn(async (input: { limit: number; query: string }) => {
@@ -1713,7 +1993,7 @@ describe("21st SiteOps provider", () => {
     structuredLog.mockRestore();
   });
 
-  it("stops at the 36-preview matching budget with a distinct terminal code", async () => {
+  it("reports the 36-preview I/O cap as preview admission failure, not solver exhaustion", async () => {
     let nextId = 1;
     const baseline = frontMindBaselineDependencies();
     const commonPixels = await perceptuallyDistinctPng(42);
@@ -1765,13 +2045,13 @@ describe("21st SiteOps provider", () => {
       }),
     ).resolves.toMatchObject({
       status: "attention_required",
-      code: "VISUAL_MATCHING_BUDGET_EXHAUSTED",
+      code: "VISUAL_PREVIEW_REFERENCES_UNAVAILABLE",
       result: {
         mirrorAttempted: 36,
         mirrorAttempts: 36,
         mirrorSucceeded: 36,
         compatibleMatchingCardinality: 1,
-        terminalReason: "matching_budget_exhausted",
+        terminalReason: "preview_failures",
       },
     });
     expect(search).toHaveBeenCalledTimes(9);

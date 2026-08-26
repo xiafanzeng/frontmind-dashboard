@@ -9,6 +9,8 @@ import type { NormalizedTwentyFirstCandidate } from "../../shared/siteops-workfl
 import { validateNativeReactSourceArchive } from "./native-react-source";
 import { materializeNativeReactSource } from "./native-react-build-runtime";
 import {
+  NativeVisualSourceError,
+  classifyNativeVisualFailure,
   createNativeSourceArchive,
   createVisualSelectionBundleV5Artifact,
   normalizeTwentyFirstNativeSource,
@@ -39,7 +41,7 @@ function payload(id: number, suffix = "") {
       version: `v${id}`,
       componentCode: [
         'import React from "react";',
-        `export default function NativeHero${suffix}(){return <main className="min-h-screen bg-white text-slate-950"><h1>Native ${id}</h1></main>}`,
+        `export default function NativeHero${suffix}(){return <div className="min-h-screen bg-white text-slate-950"><header><nav>FrontMind</nav></header><main><section><h1>Native ${id}</h1></section><section><h2>Capabilities</h2><p>Page-level candidate</p></section></main><footer>Contact</footer></div>}`,
       ].join("\n"),
       demoCode: [
         'import React from "react";',
@@ -86,6 +88,150 @@ describe("21st native visual source", () => {
       "src/provider/demo.tsx",
       "src/provider/globals.css",
     ]);
+  });
+
+  it("normalizes the official bounded sourceText contract and aligns its demo import", () => {
+    const source = normalizeTwentyFirstNativeSource({
+      candidate: searchCandidate(143),
+      payload: {
+        contractKind: "twenty_first_get_component_v1",
+        status: { found: true, locked: false },
+        sourceText: [
+          "## Component",
+          "```tsx",
+          'import React from "react";',
+          "export default function Hero(){return <main><h1>Native contract</h1></main>}",
+          "```",
+          "## Demo",
+          "```tsx",
+          'import React from "react";',
+          'import Hero from "./hero";',
+          "export default function Demo(){return <Hero />}",
+          "```",
+          "## Styles",
+          "```css",
+          "body{font-family:system-ui,sans-serif}",
+          "```",
+        ].join("\n"),
+      },
+    });
+    expect(source.entrypoint).toBe("src/provider/hero.tsx");
+    expect(source.demoEntrypoint).toBe("src/provider/demo.tsx");
+    expect(source.files.map((file) => file.path)).toEqual(
+      expect.arrayContaining([
+        "src/provider/hero.tsx",
+        "src/provider/demo.tsx",
+        "src/provider/globals.css",
+      ]),
+    );
+    expect(source.dependencies).toEqual(
+      expect.arrayContaining([{ name: "react", installedVersion: "19.2.1" }]),
+    );
+  });
+
+  it("fails fast for a locked or missing official source contract", () => {
+    expect(() =>
+      normalizeTwentyFirstNativeSource({
+        candidate: searchCandidate(143),
+        payload: {
+          contractKind: "twenty_first_get_component_v1",
+          status: { found: true, locked: true },
+          sourceText: "upgrade required",
+        },
+      }),
+    ).toThrow("NATIVE_SOURCE_PROVIDER_QUOTA");
+    expect(() =>
+      normalizeTwentyFirstNativeSource({
+        candidate: searchCandidate(143),
+        payload: {
+          contractKind: "twenty_first_get_component_v1",
+          status: { found: false, locked: false },
+          sourceText: "not found",
+        },
+      }),
+    ).toThrow("NATIVE_SOURCE_FILES_INCOMPLETE");
+  });
+
+  it("merges inline registry dependency files before validating local imports", () => {
+    const source = normalizeTwentyFirstNativeSource({
+      candidate: searchCandidate(144),
+      payload: {
+        data: {
+          id: 144,
+          entrypoint: "src/provider/page.tsx",
+          demoEntrypoint: "src/provider/demo.tsx",
+          files: {
+            "src/provider/page.tsx": [
+              'import { Button } from "@/components/ui/button";',
+              "export default function Page(){return <main><h1>Registry page</h1><Button>Start</Button></main>}",
+            ].join("\n"),
+            "src/provider/demo.tsx":
+              'import Page from "./page"; export default function Demo(){return <Page />}',
+          },
+          registryDependencies: [
+            {
+              slug: "button",
+              files: [
+                {
+                  path: "src/components/ui/button.tsx",
+                  content:
+                    "export function Button(props: React.ButtonHTMLAttributes<HTMLButtonElement>){return <button {...props} />}",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    expect(source.files.map((file) => file.path)).toContain(
+      "src/components/ui/button.tsx",
+    );
+  });
+
+  it("classifies an advertised registry slug without its files as an unsupported dependency", () => {
+    let failure: unknown;
+    try {
+      normalizeTwentyFirstNativeSource({
+        candidate: searchCandidate(145),
+        payload: {
+          data: {
+            id: 145,
+            componentCode: [
+              'import { Button } from "@/components/ui/button";',
+              "export default function Page(){return <main><h1>Missing registry file</h1><Button /></main>}",
+            ].join("\n"),
+            demoCode:
+              'import Page from "./component"; export default function Demo(){return <Page />}',
+            registryDependencies: ["button"],
+          },
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect(String((failure as Error).message)).toContain(
+      "NATIVE_SOURCE_REGISTRY_DEPENDENCY_UNRESOLVED",
+    );
+    expect(classifyNativeVisualFailure(failure)).toBe("dependency_unsupported");
+  });
+
+  it("keeps browser, render and hard-safety failures in distinct categories", () => {
+    expect(
+      classifyNativeVisualFailure(
+        new NativeVisualSourceError("NATIVE_PREVIEW_BROWSER_UNAVAILABLE"),
+      ),
+    ).toBe("browser_unavailable");
+    expect(
+      classifyNativeVisualFailure(
+        new NativeVisualSourceError("NATIVE_PREVIEW_RENDER_FAILED"),
+      ),
+    ).toBe("render_failed");
+    expect(
+      classifyNativeVisualFailure(
+        new NativeVisualSourceError("NATIVE_SOURCE_EXECUTION_UNSAFE"),
+      ),
+    ).toBe("source_unsafe");
   });
 
   it("rejects traversal, dynamic execution and unapproved dependencies", () => {
@@ -160,6 +306,32 @@ describe("21st native visual source", () => {
           signal: new AbortController().signal,
         }),
       ).rejects.toThrow("NATIVE_PREVIEW_RENDER_FAILED");
+    },
+    30_000,
+  );
+
+  browserIt(
+    "rejects a locally rendered component that is not a page-level baseline",
+    async () => {
+      const source = normalizeTwentyFirstNativeSource({
+        candidate: searchCandidate(9),
+        payload: {
+          data: {
+            ...payload(9).data,
+            componentCode:
+              'export default function Button(){return <button type="button">Continue</button>}',
+            demoCode:
+              'import Button from "./component"; export default function Demo(){return <Button />}',
+          },
+        },
+      });
+      const sourceArchive = await createNativeSourceArchive(source);
+      await expect(
+        renderNativeReactSourcePreview({
+          sourceArchive,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow("NATIVE_SOURCE_PAGE_LEVEL_REQUIRED");
     },
     30_000,
   );

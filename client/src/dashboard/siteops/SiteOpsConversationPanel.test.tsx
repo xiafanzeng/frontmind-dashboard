@@ -188,6 +188,24 @@ describe("SiteOpsConversationPanel", () => {
     });
   });
 
+  it("accepts the public retry action and safe native-source failure category", () => {
+    expect(
+      siteOpsVisualGenerationProjectionSchema.parse({
+        status: "retryable_error",
+        targetPage: null,
+        generatedPages: 0,
+        maxPages: 3,
+        canGenerateMore: true,
+        canSelectExisting: false,
+        retryAction: "start",
+        failureCategory: "compile_failed",
+      }),
+    ).toMatchObject({
+      retryAction: "start",
+      failureCategory: "compile_failed",
+    });
+  });
+
   it("accepts observations monotonically by project revision then message sequence", () => {
     const current = observation({
       project: { ...observation().project, revision: 5 },
@@ -657,6 +675,70 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       screen.getByRole("button", { name: "重新生成 9 个视觉候选" }),
     ).toBeEnabled();
+  });
+
+  it("retries a terminal first-page visual failure without resetting the project", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    const progressMessage = {
+      id: "visual-progress-first-failed",
+      role: "assistant" as const,
+      content: "正在生成 9 个视觉候选，完成后会一次展示。",
+      sequence: 2,
+      metadata: {
+        siteOps: {
+          kind: "build_progress" as const,
+          subjectId: "visual-operation-first-failed",
+          revision: 3,
+          status: "active" as const,
+          payload: { stage: "visual_searching" },
+        },
+      },
+      sentAt: "2026-08-22T00:01:00.000Z",
+    };
+
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "attention_required",
+          },
+          interactionState: "attention_required",
+          messages: [...observation().messages, progressMessage],
+          visualCandidates: [],
+          visualCandidatePages: [],
+          visualGeneration: {
+            status: "retryable_error",
+            targetPage: null,
+            generatedPages: 0,
+            maxPages: 3,
+            canGenerateMore: true,
+            canSelectExisting: false,
+            retryAction: "start",
+            failureCategory: "compile_failed",
+          },
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    expect(screen.queryByText(progressMessage.content)).toBeNull();
+    expect(
+      screen.getByRole("heading", { name: "视觉候选生成未完成" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/无需重置/u)).toBeInTheDocument();
+    const retryButton = screen.getByRole("button", {
+      name: "重新生成 9 个视觉候选",
+    });
+    expect(retryButton).toHaveClass("siteops-primary-button");
+    expect(retryButton).toBeEnabled();
+    fireEvent.click(retryButton);
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "reselect_visual",
+        input: {},
+      }),
+    );
   });
 
   it("switches to a newly completed visual page and unlocks its candidates", () => {

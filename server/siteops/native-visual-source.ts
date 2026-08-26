@@ -7,6 +7,7 @@ import path from "node:path";
 
 import JSZip from "jszip";
 import { chromium, type Page } from "playwright";
+import sharp from "sharp";
 import { z } from "zod";
 
 import {
@@ -20,10 +21,15 @@ import {
   type NormalizedTwentyFirstCandidate,
 } from "../../shared/siteops-workflow";
 import {
+  NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
   installedNativeSourceDependencyVersion,
   validateNativeReactSourceArchive,
 } from "./native-react-source";
-import { compileValidatedNativeReactSource } from "./native-react-build-runtime";
+import {
+  NativeReactBuildError,
+  compileValidatedNativeReactSource,
+} from "./native-react-build-runtime";
+import { fetchSafeVisualPreview } from "./remote-preview";
 
 export const SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION = "2.5.0" as const;
 export const VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE = "application/zip" as const;
@@ -38,6 +44,8 @@ const MAX_SOURCE_FILES = 160;
 const MAX_SOURCE_FILE_BYTES = 512_000;
 const MAX_SOURCE_TOTAL_BYTES = 2_000_000;
 const MAX_DEPENDENCIES = 80;
+const MAX_GET_COMPONENT_SOURCE_TEXT_BYTES = 1024 * 1024;
+const MAX_STATIC_MEDIA_ASSETS = 16;
 const FIXED_ZIP_DATE = new Date("1980-01-01T00:00:00.000Z");
 const CONTROLLED_HTML_ENTRYPOINT = "index.html";
 const CONTROLLED_APP_ENTRYPOINT = "src/main.tsx";
@@ -145,7 +153,18 @@ type BoundedZipEntry = JSZip.JSZipObject & {
   _data?: { uncompressedSize?: number };
 };
 
-class NativeVisualSourceError extends Error {
+export type NativeVisualFailureCategory =
+  | "provider_quota"
+  | "get_component_contract"
+  | "source_incomplete"
+  | "dependency_unsupported"
+  | "source_unsafe"
+  | "compile_failed"
+  | "browser_unavailable"
+  | "render_failed"
+  | "deadline_exhausted";
+
+export class NativeVisualSourceError extends Error {
   constructor(
     public readonly code: string,
     cause?: unknown,
@@ -153,6 +172,69 @@ class NativeVisualSourceError extends Error {
     super(code, cause === undefined ? undefined : { cause });
     this.name = "NativeVisualSourceError";
   }
+}
+
+function safeErrorCode(error: unknown) {
+  if (!error || typeof error !== "object" || !("code" in error)) return "";
+  const code = String(error.code);
+  return /^[A-Z0-9_]{1,96}$/u.test(code) ? code : "";
+}
+
+/** Reduce implementation errors to the closed, customer-safe provider
+ * contract. Messages, source paths and Provider payload values never cross
+ * this boundary. */
+export function classifyNativeVisualFailure(
+  error: unknown,
+): NativeVisualFailureCategory {
+  const values = new Set<string>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth += 1) {
+    const code = safeErrorCode(current);
+    if (code) values.add(code);
+    if (current instanceof Error) values.add(current.message);
+    current =
+      current && typeof current === "object" && "cause" in current
+        ? current.cause
+        : null;
+  }
+  const joined = [...values].join(":");
+  if (/(?:ABORT|TIMEOUT|DEADLINE)/u.test(joined)) {
+    return "deadline_exhausted";
+  }
+  if (
+    /(?:PROVIDER_QUOTA|QUOTA|RATE_LIMIT|USAGE_EXHAUSTED|CREDITS_EXHAUSTED)/u.test(
+      joined,
+    )
+  ) {
+    return "provider_quota";
+  }
+  if (/(?:SOURCE_CONTRACT|GET_COMPONENT_CONTRACT)/u.test(joined)) {
+    return "get_component_contract";
+  }
+  if (
+    /(?:BROWSER_UNAVAILABLE|Executable doesn't exist|browserType\.launch)/u.test(
+      joined,
+    )
+  ) {
+    return "browser_unavailable";
+  }
+  if (/(?:PREVIEW|RENDER|ROUTE_FAILED)/u.test(joined)) {
+    return "render_failed";
+  }
+  if (/(?:COMPILE|BUILD_RUNTIME|BUILD_LOG)/u.test(joined)) {
+    return "compile_failed";
+  }
+  if (/(?:DEPENDENCY|PACKAGE|LIFECYCLE)/u.test(joined)) {
+    return "dependency_unsupported";
+  }
+  if (
+    /(?:UNSAFE|FORBIDDEN|SECRET|NETWORK|EXECUTION|TRAVERSAL|SYMLINK|PATH_COLLISION|PATH_INVALID)/u.test(
+      joined,
+    )
+  ) {
+    return "source_unsafe";
+  }
+  return "source_incomplete";
 }
 
 function sha256(bytes: Uint8Array | string) {
@@ -221,6 +303,23 @@ function collectRecords(
   ]) {
     collectRecords(record[key], depth + 1, records);
   }
+  // Registry dependencies may be returned as nested objects keyed by a
+  // registry slug. Traverse only the documented source-bearing containers;
+  // arbitrary Provider fields remain opaque.
+  for (const key of [
+    "registryDependencies",
+    "registry_dependencies",
+    "supportFiles",
+    "support_files",
+  ]) {
+    const nested = record[key];
+    collectRecords(nested, depth + 1, records);
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      Object.values(nested as PayloadRecord)
+        .slice(0, 160)
+        .forEach((item) => collectRecords(item, depth + 1, records));
+    }
+  }
   return records;
 }
 
@@ -250,60 +349,24 @@ function parseDependencyName(value: string) {
   return versionAt > 0 ? trimmed.slice(0, versionAt) : trimmed;
 }
 
-const ALLOWED_NATIVE_DEPENDENCIES = new Set([
-  "@tailwindcss/vite",
-  "@vitejs/plugin-react",
-  "@radix-ui/react-accordion",
-  "@radix-ui/react-aspect-ratio",
-  "@radix-ui/react-avatar",
-  "@radix-ui/react-checkbox",
-  "@radix-ui/react-collapsible",
-  "@radix-ui/react-context-menu",
-  "@radix-ui/react-dialog",
-  "@radix-ui/react-dropdown-menu",
-  "@radix-ui/react-hover-card",
-  "@radix-ui/react-label",
-  "@radix-ui/react-menubar",
-  "@radix-ui/react-navigation-menu",
-  "@radix-ui/react-popover",
-  "@radix-ui/react-progress",
-  "@radix-ui/react-radio-group",
-  "@radix-ui/react-scroll-area",
-  "@radix-ui/react-select",
-  "@radix-ui/react-separator",
-  "@radix-ui/react-slider",
-  "@radix-ui/react-slot",
-  "@radix-ui/react-switch",
-  "@radix-ui/react-tabs",
-  "@radix-ui/react-toggle",
-  "@radix-ui/react-toggle-group",
-  "@radix-ui/react-tooltip",
-  "class-variance-authority",
-  "clsx",
-  "embla-carousel-react",
-  "framer-motion",
-  "lucide-react",
-  "react",
-  "react-dom",
-  "tailwind-merge",
-  "tailwindcss",
-  "vite",
-]);
+// Keep candidate admission and the final source-archive validator on one
+// pinned dependency allowlist. This includes the common 21st/shadcn packages
+// already installed in the controlled compiler image.
+const ALLOWED_NATIVE_DEPENDENCIES: ReadonlySet<string> = new Set<string>(
+  NATIVE_SOURCE_ALLOWED_DEPENDENCIES,
+);
 
-function collectDependencies(records: readonly PayloadRecord[]) {
+function collectDependencies(
+  records: readonly PayloadRecord[],
+  providerFiles: ReadonlyMap<string, Buffer>,
+) {
   const names = new Set<string>([
     "react",
     "react-dom",
     ...CONTROLLED_COMPILER_DEPENDENCIES,
   ]);
   for (const record of records) {
-    for (const key of [
-      "dependencies",
-      "dependency",
-      "registryDependencies",
-      "registry_dependencies",
-      "npmDependencies",
-    ]) {
+    for (const key of ["dependencies", "dependency", "npmDependencies"]) {
       const value = record[key];
       const candidates = Array.isArray(value)
         ? value
@@ -317,6 +380,16 @@ function collectDependencies(records: readonly PayloadRecord[]) {
         const name = parseDependencyName(candidate);
         if (name) names.add(name);
       }
+    }
+  }
+  // The official text response carries code and demos but may omit a separate
+  // dependency array. Imports are safe to use only as names: every inferred
+  // package must still pass the closed allowlist and installed-version pin.
+  for (const [filename, bytes] of providerFiles) {
+    if (!isTextSourcePath(filename)) continue;
+    for (const specifier of sourceImports(bytes.toString("utf8"))) {
+      const name = packageNameForImport(specifier);
+      if (name) names.add(name);
     }
   }
   const dependencies = [...names].sort();
@@ -335,7 +408,7 @@ function collectDependencies(records: readonly PayloadRecord[]) {
 }
 
 function isTextSourcePath(filename: string) {
-  return /\.(?:[cm]?[jt]sx?|css|json|svg)$/u.test(filename);
+  return /\.(?:[cm]?[jt]sx?|css|html|json|svg)$/u.test(filename);
 }
 
 function bytesFromFileValue(value: unknown, filename: string) {
@@ -359,32 +432,191 @@ function bytesFromFileValue(value: unknown, filename: string) {
 function collectProviderFiles(records: readonly PayloadRecord[]) {
   const files = new Map<string, Buffer>();
   for (const record of records) {
-    const raw = record.files ?? record.sourceFiles ?? record.source_files;
-    if (Array.isArray(raw)) {
-      for (const item of raw.slice(0, MAX_SOURCE_FILES)) {
-        if (!item || typeof item !== "object") continue;
-        const row = item as PayloadRecord;
-        const filename = normalizedSourcePath(
-          row.path ?? row.filename ?? row.name,
-        );
-        if (!filename)
-          throw new NativeVisualSourceError("NATIVE_SOURCE_PATH_UNSAFE");
-        const bytes = bytesFromFileValue(row, filename);
-        if (!bytes) continue;
-        files.set(filename, bytes);
-      }
-    } else if (raw && typeof raw === "object") {
-      for (const [rawPath, value] of Object.entries(raw as PayloadRecord).slice(
-        0,
-        MAX_SOURCE_FILES,
-      )) {
-        const filename = normalizedSourcePath(rawPath);
-        if (!filename)
-          throw new NativeVisualSourceError("NATIVE_SOURCE_PATH_UNSAFE");
-        const bytes = bytesFromFileValue(value, filename);
-        if (bytes) files.set(filename, bytes);
+    for (const raw of [
+      record.files,
+      record.sourceFiles,
+      record.source_files,
+      record.supportFiles,
+      record.support_files,
+    ]) {
+      if (Array.isArray(raw)) {
+        for (const item of raw.slice(0, MAX_SOURCE_FILES)) {
+          if (!item || typeof item !== "object") continue;
+          const row = item as PayloadRecord;
+          const filename = normalizedSourcePath(
+            row.path ?? row.filename ?? row.name,
+          );
+          if (!filename)
+            throw new NativeVisualSourceError("NATIVE_SOURCE_PATH_UNSAFE");
+          const bytes = bytesFromFileValue(row, filename);
+          if (!bytes) continue;
+          files.set(filename, bytes);
+        }
+      } else if (raw && typeof raw === "object") {
+        for (const [rawPath, value] of Object.entries(
+          raw as PayloadRecord,
+        ).slice(0, MAX_SOURCE_FILES)) {
+          const filename = normalizedSourcePath(rawPath);
+          if (!filename)
+            throw new NativeVisualSourceError("NATIVE_SOURCE_PATH_UNSAFE");
+          const bytes = bytesFromFileValue(value, filename);
+          if (bytes) files.set(filename, bytes);
+        }
       }
     }
+  }
+  return files;
+}
+
+const OFFICIAL_GET_COMPONENT_CONTRACT =
+  "twenty_first_get_component_v1" as const;
+
+function officialGetComponentStatus(records: readonly PayloadRecord[]) {
+  const envelope = records.find(
+    (record) => record.contractKind === OFFICIAL_GET_COMPONENT_CONTRACT,
+  );
+  if (!envelope) return null;
+  const status =
+    envelope.status &&
+    typeof envelope.status === "object" &&
+    !Array.isArray(envelope.status)
+      ? (envelope.status as PayloadRecord)
+      : null;
+  if (!status) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_CONTRACT_INVALID");
+  }
+  const reason =
+    typeof status.reason === "string"
+      ? status.reason.trim().toLocaleLowerCase("en-US")
+      : "";
+  if (
+    status.locked === true ||
+    [
+      "locked",
+      "quota_exceeded",
+      "usage_exhausted",
+      "credits_exhausted",
+      "upgrade_required",
+    ].includes(reason)
+  ) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_PROVIDER_QUOTA");
+  }
+  if (
+    status.found === false ||
+    ["not_found", "missing", "deleted"].includes(reason)
+  ) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_FILES_INCOMPLETE");
+  }
+  if (status.found !== true || status.locked !== false) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_CONTRACT_INVALID");
+  }
+  if (
+    typeof envelope.sourceText !== "string" ||
+    Buffer.byteLength(envelope.sourceText, "utf8") >
+      MAX_GET_COMPONENT_SOURCE_TEXT_BYTES
+  ) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_CONTRACT_INVALID");
+  }
+  return { envelope, sourceText: envelope.sourceText };
+}
+
+/** Validate the metered get_component availability envelope before any local
+ * compilation work is queued. Legacy structured payloads intentionally pass
+ * through and remain subject to the full normalizer. */
+export function assertTwentyFirstNativeSourcePayloadAvailable(
+  payload: unknown,
+) {
+  officialGetComponentStatus(collectRecords(payload));
+}
+
+function sourcePathFromFenceContext(value: string) {
+  const matches = value.match(
+    /(?:^|[\s`"'])([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)*\.(?:[cm]?[jt]sx?|css|svg|json))(?:$|[\s`"'])/u,
+  );
+  return normalizedSourcePath(matches?.[1]);
+}
+
+/** Parse only the bounded, documented get_component fenced-code response.
+ * It deliberately does not scrape arbitrary prose or treat the whole response
+ * as TSX. Explicit file labels win; otherwise the first two React fences are
+ * the component and demo, followed by a single optional CSS fence. */
+function collectOfficialFencedSource(sourceText: string) {
+  const files = new Map<string, Buffer>();
+  const reactBlocks: Array<{ context: string; bytes: Buffer }> = [];
+  const cssBlocks: Array<{ context: string; bytes: Buffer }> = [];
+  const fence = /```([a-zA-Z0-9_-]*)([^\r\n]*)\r?\n([\s\S]*?)\r?\n```/gu;
+  let match: RegExpExecArray | null;
+  while ((match = fence.exec(sourceText))) {
+    const language = match[1]!.toLocaleLowerCase("en-US");
+    if (!new Set(["tsx", "jsx", "ts", "js", "css"]).has(language)) {
+      continue;
+    }
+    const body = match[3]!;
+    if (!body.trim()) continue;
+    const previousLine =
+      sourceText
+        .slice(Math.max(0, match.index - 240), match.index)
+        .split(/\r?\n/u)
+        .reverse()
+        .find((line) => line.trim()) ?? "";
+    const context = `${previousLine}\n${match[2] ?? ""}`;
+    const explicitPath = sourcePathFromFenceContext(context);
+    const bytes = Buffer.from(body, "utf8");
+    if (bytes.length > MAX_SOURCE_FILE_BYTES) {
+      throw new NativeVisualSourceError("NATIVE_SOURCE_SIZE_EXCEEDED");
+    }
+    if (explicitPath) {
+      if (files.has(explicitPath)) {
+        throw new NativeVisualSourceError("NATIVE_SOURCE_PATH_COLLISION");
+      }
+      files.set(explicitPath, bytes);
+    } else if (language === "css") {
+      cssBlocks.push({ context, bytes });
+    } else {
+      reactBlocks.push({ context, bytes });
+    }
+  }
+  for (const block of reactBlocks) {
+    const normalized = block.context.toLocaleLowerCase("en-US");
+    const fallback = /\bdemo|preview|example\b/u.test(normalized)
+      ? "src/provider/demo.tsx"
+      : files.has("src/provider/component.tsx")
+        ? "src/provider/demo.tsx"
+        : "src/provider/component.tsx";
+    if (files.has(fallback)) {
+      throw new NativeVisualSourceError("NATIVE_SOURCE_CONTRACT_INVALID");
+    }
+    files.set(fallback, block.bytes);
+  }
+  for (const block of cssBlocks) {
+    const fallback = "src/provider/globals.css";
+    if (files.has(fallback)) {
+      throw new NativeVisualSourceError("NATIVE_SOURCE_CONTRACT_INVALID");
+    }
+    files.set(fallback, block.bytes);
+  }
+  const fallbackComponent = files.get("src/provider/component.tsx");
+  const fallbackDemo = files.get("src/provider/demo.tsx");
+  if (fallbackComponent && fallbackDemo) {
+    const missingLocalImports = sourceImports(fallbackDemo.toString("utf8"))
+      .filter((specifier) => specifier.startsWith("."))
+      .flatMap((specifier) =>
+        localImportCandidates("src/provider/demo.tsx", specifier),
+      )
+      .filter((candidate) => !files.has(candidate));
+    const inferredComponentPath =
+      missingLocalImports.find((candidate) => candidate.endsWith(".tsx")) ??
+      missingLocalImports.find((candidate) => candidate.endsWith(".jsx")) ??
+      missingLocalImports.find((candidate) => /\.[cm]?[jt]s$/u.test(candidate));
+    if (inferredComponentPath) {
+      files.delete("src/provider/component.tsx");
+      files.set(inferredComponentPath, fallbackComponent);
+    }
+  }
+  if (
+    ![...files.keys()].some((filename) => /\.[cm]?[jt]sx?$/u.test(filename))
+  ) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_CONTRACT_INVALID");
   }
   return files;
 }
@@ -414,6 +646,25 @@ function sourceImports(text: string) {
   ].map((match) => match[1]!);
 }
 
+function staticRemoteMediaPattern() {
+  return /(?:\b(?:src|poster)\s*=\s*["'](https:\/\/[^"'\s]+)["']|\burl\(\s*["']?(https:\/\/[^"')\s]+)["']?\s*\))/giu;
+}
+
+function staticRemoteMediaUrls(text: string) {
+  const urls = new Set<string>();
+  for (const match of text.matchAll(staticRemoteMediaPattern())) {
+    const value = match[1] ?? match[2];
+    if (value) urls.add(value);
+  }
+  return [...urls];
+}
+
+function withoutAllowedStaticRemoteMedia(text: string) {
+  return text.replace(staticRemoteMediaPattern(), (matched, first, second) =>
+    matched.replace(String(first ?? second ?? ""), ""),
+  );
+}
+
 function packageNameForImport(specifier: string) {
   if (specifier.startsWith("@/")) return null;
   if (specifier.startsWith(".")) return null;
@@ -422,9 +673,55 @@ function packageNameForImport(specifier: string) {
   return specifier.split("/")[0]!;
 }
 
+function localImportCandidates(from: string, specifier: string) {
+  const roots = specifier.startsWith("@/")
+    ? [specifier.slice(2), `src/${specifier.slice(2)}`]
+    : [
+        path.posix.normalize(
+          path.posix.join(path.posix.dirname(from), specifier),
+        ),
+      ];
+  return roots.flatMap((root) => {
+    if (/\.[a-zA-Z0-9]+$/u.test(root)) return [root];
+    return [
+      root,
+      ...["ts", "tsx", "js", "jsx", "css", "json", "svg"].map(
+        (extension) => `${root}.${extension}`,
+      ),
+      ...["ts", "tsx", "js", "jsx"].map(
+        (extension) => `${root}/index.${extension}`,
+      ),
+    ];
+  });
+}
+
+function assertLocalSourceImportClosure(
+  providerFiles: ReadonlyMap<string, Buffer>,
+) {
+  const paths = new Set(providerFiles.keys());
+  for (const [filename, bytes] of providerFiles) {
+    if (!/\.[cm]?[jt]sx?$/u.test(filename)) continue;
+    for (const specifier of sourceImports(bytes.toString("utf8"))) {
+      if (!specifier.startsWith(".") && !specifier.startsWith("@/")) continue;
+      if (
+        !localImportCandidates(filename, specifier).some((candidate) =>
+          paths.has(candidate),
+        )
+      ) {
+        throw new NativeVisualSourceError(
+          specifier.startsWith("@/")
+            ? "NATIVE_SOURCE_REGISTRY_DEPENDENCY_UNRESOLVED"
+            : "NATIVE_SOURCE_FILES_INCOMPLETE",
+        );
+      }
+    }
+  }
+}
+
 function assertHardSourceSafety(
   files: readonly NativeSourceFile[],
   dependencies: readonly NativeSourceDependency[],
+  options: { allowStaticRemoteMedia?: boolean } = {},
 ) {
   const declared = new Set(dependencies.map((dependency) => dependency.name));
   const declaredVersions = new Map(
@@ -436,32 +733,44 @@ function assertHardSourceSafety(
   for (const file of files) {
     if (!isTextSourcePath(file.path)) continue;
     const text = file.bytes.toString("utf8");
+    const withoutControlledShellScript =
+      file.path === CONTROLLED_HTML_ENTRYPOINT
+        ? text.replace(
+            '<script type="module" src="/src/main.tsx"></script>',
+            "",
+          )
+        : text;
+    const safetyText = options.allowStaticRemoteMedia
+      ? withoutAllowedStaticRemoteMedia(withoutControlledShellScript)
+      : withoutControlledShellScript;
     if (Buffer.from(text, "utf8").length !== file.bytes.length) {
       throw new NativeVisualSourceError("NATIVE_SOURCE_TEXT_ENCODING_INVALID");
     }
     if (
       /-----BEGIN (?:EC |OPENSSH |RSA )?PRIVATE KEY-----|\bAKIA[A-Z0-9]{16}\b|\bLTAI[A-Za-z0-9]{12,}\b|\bsk-(?:live|proj)?-?[A-Za-z0-9_-]{20,}\b/u.test(
-        text,
+        safetyText,
       ) ||
       /\b(?:eval|Function)\s*\(|\bnew\s+Function\b|\bimport\s*\(|\brequire\s*\([^"']/u.test(
-        text,
+        safetyText,
       ) ||
       /\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\s*\(|navigator\.sendBeacon\s*\(/u.test(
-        text,
+        safetyText,
       ) ||
       /dangerouslySetInnerHTML|\b(?:node:)?(?:fs|child_process|worker_threads|vm|net|tls|dgram|cluster)\b/u.test(
-        text,
+        safetyText,
       ) ||
-      /<\s*(?:script|iframe|object|embed)\b/iu.test(text) ||
-      /(?:javascript|vbscript|data\s*:\s*text\/html)\s*:/iu.test(text) ||
-      /https?:\/\//iu.test(text) ||
-      /\bprocess\s*\.|\bglobalThis\s*\[|\bdocument\.cookie\b/u.test(text)
+      /<\s*(?:script|iframe|object|embed)\b/iu.test(safetyText) ||
+      /(?:javascript|vbscript|data\s*:\s*text\/html)\s*:/iu.test(safetyText) ||
+      /https?:\/\//iu.test(safetyText) ||
+      /\bprocess\s*\.|\bglobalThis\s*\[|\bdocument\.cookie\b/u.test(safetyText)
     ) {
       throw new NativeVisualSourceError("NATIVE_SOURCE_EXECUTION_UNSAFE");
     }
     if (
       file.path.endsWith(".css") &&
-      /(?:@import\s+|url\s*\()\s*["']?(?:\.\.\/|\/\/|https?:)/iu.test(text)
+      /(?:@import\s+|url\s*\()\s*["']?(?:\.\.\/|\/\/|https?:)/iu.test(
+        safetyText,
+      )
     ) {
       throw new NativeVisualSourceError("NATIVE_SOURCE_IMPORT_UNSAFE");
     }
@@ -680,8 +989,12 @@ export function normalizeTwentyFirstNativeSource(input: {
     "providerItemId" | "providerItemKey"
   >;
   payload: unknown;
+  /** Only the preparation pipeline may defer static media checks while it
+   * mirrors those URLs through the pinned SSRF-safe image transport. */
+  allowStaticRemoteMedia?: boolean;
 }): NormalizedTwentyFirstNativeSource {
   const records = collectRecords(input.payload);
+  const official = officialGetComponentStatus(records);
   const responseId = firstString(records, ["providerItemKey"]);
   if (responseId && responseId !== input.candidate.providerItemKey) {
     throw new NativeVisualSourceError("NATIVE_SOURCE_PROVIDER_ID_MISMATCH");
@@ -732,7 +1045,9 @@ export function normalizeTwentyFirstNativeSource(input: {
     throw new NativeVisualSourceError("NATIVE_SOURCE_PROVIDER_ID_MISMATCH");
   }
 
-  const files = collectProviderFiles(records);
+  const files = official
+    ? collectOfficialFencedSource(official.sourceText)
+    : collectProviderFiles(records);
   const component = inferCodePath({
     records,
     keys: ["componentCode", "component_code", "sourceCode", "source_code"],
@@ -790,8 +1105,21 @@ export function normalizeTwentyFirstNativeSource(input: {
   const entrypoint =
     advertisedEntrypoint ??
     component?.path ??
+    providerFiles.find((file) =>
+      /(?:^|\/)component\.[cm]?[jt]sx?$/u.test(file.path),
+    )?.path ??
+    providerFiles.find(
+      (file) =>
+        /\.[cm]?[jt]sx?$/u.test(file.path) &&
+        !/(?:^|\/)(?:demo|preview|example)\.[cm]?[jt]sx?$/u.test(file.path),
+    )?.path ??
     providerFiles.find((file) => /\.[jt]sx$/u.test(file.path))?.path;
-  const demoEntrypoint = advertisedDemo ?? demo?.path ?? entrypoint;
+  const demoEntrypoint =
+    advertisedDemo ??
+    demo?.path ??
+    providerFiles.find((file) => /(?:^|\/)demo\.[cm]?[jt]sx?$/u.test(file.path))
+      ?.path ??
+    entrypoint;
   if (
     !entrypoint ||
     !demoEntrypoint ||
@@ -800,7 +1128,8 @@ export function normalizeTwentyFirstNativeSource(input: {
   ) {
     throw new NativeVisualSourceError("NATIVE_SOURCE_ENTRYPOINT_MISSING");
   }
-  const dependencies = collectDependencies(records);
+  const dependencies = collectDependencies(records, files);
+  assertLocalSourceImportClosure(files);
   const projectFiles = controlledSourceProject({
     providerFiles,
     demoEntrypoint,
@@ -820,7 +1149,9 @@ export function normalizeTwentyFirstNativeSource(input: {
   ) {
     throw new NativeVisualSourceError("NATIVE_SOURCE_SIZE_EXCEEDED");
   }
-  assertHardSourceSafety(projectFiles, dependencies);
+  assertHardSourceSafety(projectFiles, dependencies, {
+    allowStaticRemoteMedia: input.allowStaticRemoteMedia,
+  });
   return {
     providerItemKey: input.candidate.providerItemKey,
     providerVersion: cleanVersion(
@@ -838,6 +1169,98 @@ export function normalizeTwentyFirstNativeSource(input: {
     appEntrypoint: CONTROLLED_APP_ENTRYPOINT,
     files: projectFiles,
     sourceTreeSha256: nativeSourceTreeSha256(projectFiles),
+  };
+}
+
+async function mirrorNativeStaticMedia(input: {
+  source: NormalizedTwentyFirstNativeSource;
+  signal: AbortSignal;
+  fetchRemoteAsset: typeof fetchSafeVisualPreview;
+}) {
+  const urls = new Set<string>();
+  for (const file of input.source.files) {
+    if (!isTextSourcePath(file.path)) continue;
+    staticRemoteMediaUrls(file.bytes.toString("utf8")).forEach((url) =>
+      urls.add(url),
+    );
+  }
+  if (urls.size === 0) return input.source;
+  if (urls.size > MAX_STATIC_MEDIA_ASSETS) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+  }
+  const replacements = new Map<string, string>();
+  const assets: NativeSourceFile[] = [];
+  for (const url of [...urls].sort()) {
+    if (input.signal.aborted) throw input.signal.reason;
+    let fetched: Awaited<ReturnType<typeof fetchSafeVisualPreview>>;
+    try {
+      fetched = await input.fetchRemoteAsset({
+        url,
+        signal: input.signal,
+      });
+    } catch (error) {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_STATIC_MEDIA_UNAVAILABLE",
+        error,
+      );
+    }
+    let bytes = await sharp(fetched.buffer)
+      .rotate()
+      .resize({
+        width: 1600,
+        height: 1200,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .webp({ quality: 80, effort: 4 })
+      .toBuffer();
+    if (bytes.length > MAX_SOURCE_FILE_BYTES) {
+      bytes = await sharp(fetched.buffer)
+        .rotate()
+        .resize({
+          width: 1280,
+          height: 960,
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .webp({ quality: 62, effort: 4 })
+        .toBuffer();
+    }
+    if (bytes.length < 1 || bytes.length > MAX_SOURCE_FILE_BYTES) {
+      throw new NativeVisualSourceError("NATIVE_SOURCE_STATIC_MEDIA_LIMIT");
+    }
+    const filename = `public/frontmind-native-media/${sha256(bytes)}.webp`;
+    replacements.set(url, `/${filename.slice("public/".length)}`);
+    if (!assets.some((asset) => asset.path === filename)) {
+      assets.push({ path: filename, bytes });
+    }
+  }
+  const files = input.source.files.map((file) => {
+    if (!isTextSourcePath(file.path)) return file;
+    let text = file.bytes.toString("utf8");
+    for (const [url, replacement] of replacements) {
+      text = text.replaceAll(url, replacement);
+    }
+    return { path: file.path, bytes: Buffer.from(text, "utf8") };
+  });
+  files.push(...assets);
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  const totalBytes = files.reduce((sum, file) => sum + file.bytes.length, 0);
+  if (
+    files.length > MAX_SOURCE_FILES ||
+    totalBytes > MAX_SOURCE_TOTAL_BYTES ||
+    files.some(
+      (file) =>
+        file.bytes.length < 1 || file.bytes.length > MAX_SOURCE_FILE_BYTES,
+    )
+  ) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_SIZE_EXCEEDED");
+  }
+  assertHardSourceSafety(files, input.source.dependencies);
+  return {
+    ...input.source,
+    files,
+    sourceTreeSha256: nativeSourceTreeSha256(files),
   };
 }
 
@@ -1062,6 +1485,9 @@ async function assertNativePreviewRendered(
         hasContent: false,
         hasLayout: false,
         hasVisibleContent: false,
+        viewportCoverage: 0,
+        pageRegionCount: 0,
+        headingCount: 0,
       };
     }
     const visible = (element: Element) => {
@@ -1094,6 +1520,21 @@ async function assertNativePreviewRendered(
       hasVisibleContent:
         (hasDirectText && visible(root)) ||
         [...root.querySelectorAll("*")].some(visible),
+      viewportCoverage: Math.min(
+        1,
+        Math.max(
+          0,
+          (rootBounds.width / Math.max(1, window.innerWidth)) *
+            (rootBounds.height / Math.max(1, window.innerHeight)),
+        ),
+      ),
+      pageRegionCount: [
+        ...root.querySelectorAll(
+          "header,nav,main,section,article,footer,[role=banner],[role=navigation],[role=main],[role=contentinfo]",
+        ),
+      ].filter(visible).length,
+      headingCount: [...root.querySelectorAll("h1,h2,h3")].filter(visible)
+        .length,
     };
   });
   if (
@@ -1104,6 +1545,13 @@ async function assertNativePreviewRendered(
     !rootState.hasVisibleContent
   ) {
     throw new NativeVisualSourceError("NATIVE_PREVIEW_RENDER_FAILED");
+  }
+  if (
+    rootState.viewportCoverage < 0.85 ||
+    rootState.pageRegionCount < 2 ||
+    rootState.headingCount < 1
+  ) {
+    throw new NativeVisualSourceError("NATIVE_SOURCE_PAGE_LEVEL_REQUIRED");
   }
 }
 
@@ -1132,6 +1580,7 @@ export async function renderNativeReactSourcePreview(input: {
   const outputRoot = path.join(root, "dist");
   let server: ReturnType<typeof createServer> | null = null;
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  let runtimeStage: "compile" | "browser" | "render" = "compile";
   try {
     await compileValidatedNativeReactSource({
       root,
@@ -1140,20 +1589,29 @@ export async function renderNativeReactSourcePreview(input: {
       abortSignal: input.signal,
     });
     if (input.signal.aborted) throw input.signal.reason;
+    runtimeStage = "browser";
     const served = await serveDirectory(outputRoot);
     server = served.server;
-    browser = await chromium.launch({
-      headless: true,
-      chromiumSandbox: false,
-      timeout: 15_000,
-      args: ["--disable-background-networking", "--disable-sync"],
-      env: {
-        HOME: root,
-        LANG: "C.UTF-8",
-        TZ: "UTC",
-        PATH: path.dirname(process.execPath),
-      },
-    });
+    try {
+      browser = await chromium.launch({
+        headless: true,
+        chromiumSandbox: false,
+        timeout: 15_000,
+        args: ["--disable-background-networking", "--disable-sync"],
+        env: {
+          HOME: root,
+          LANG: "C.UTF-8",
+          TZ: "UTC",
+          PATH: path.dirname(process.execPath),
+        },
+      });
+    } catch (error) {
+      throw new NativeVisualSourceError(
+        "NATIVE_PREVIEW_BROWSER_UNAVAILABLE",
+        error,
+      );
+    }
+    runtimeStage = "render";
     const context = await browser.newContext({
       viewport: { width: 1440, height: 1000 },
       reducedMotion: "no-preference",
@@ -1223,7 +1681,43 @@ export async function renderNativeReactSourcePreview(input: {
     return Buffer.from(screenshot);
   } catch (error) {
     if (error instanceof NativeVisualSourceError) throw error;
-    throw new NativeVisualSourceError("NATIVE_SOURCE_COMPILE_FAILED", error);
+    if (input.signal.aborted) {
+      throw new NativeVisualSourceError(
+        "NATIVE_SOURCE_DEADLINE_EXHAUSTED",
+        error,
+      );
+    }
+    if (error instanceof NativeReactBuildError) {
+      if (
+        error.code === "NATIVE_BUILD_ABORTED" ||
+        error.code === "NATIVE_BUILD_TIMEOUT"
+      ) {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_DEADLINE_EXHAUSTED",
+          error,
+        );
+      }
+      if (error.code === "NATIVE_BUILD_DEPENDENCY_UNAVAILABLE") {
+        throw new NativeVisualSourceError(
+          "NATIVE_SOURCE_DEPENDENCY_UNAVAILABLE",
+          error,
+        );
+      }
+      if (error.code === "NATIVE_BUILD_RENDER_FAILED") {
+        throw new NativeVisualSourceError(
+          "NATIVE_PREVIEW_RENDER_FAILED",
+          error,
+        );
+      }
+    }
+    throw new NativeVisualSourceError(
+      runtimeStage === "render"
+        ? "NATIVE_PREVIEW_RENDER_FAILED"
+        : runtimeStage === "browser"
+          ? "NATIVE_PREVIEW_BROWSER_UNAVAILABLE"
+          : "NATIVE_SOURCE_COMPILE_FAILED",
+      error,
+    );
   } finally {
     await browser?.close().catch(() => undefined);
     if (server?.listening)
@@ -1236,10 +1730,17 @@ export async function prepareNativeVisualCandidate(input: {
   candidate: NormalizedTwentyFirstCandidate;
   payload: unknown;
   signal: AbortSignal;
+  fetchRemoteAsset?: typeof fetchSafeVisualPreview;
 }): Promise<PreparedNativeVisualCandidate> {
-  const source = normalizeTwentyFirstNativeSource({
+  const normalized = normalizeTwentyFirstNativeSource({
     candidate: input.candidate,
     payload: input.payload,
+    allowStaticRemoteMedia: true,
+  });
+  const source = await mirrorNativeStaticMedia({
+    source: normalized,
+    signal: input.signal,
+    fetchRemoteAsset: input.fetchRemoteAsset ?? fetchSafeVisualPreview,
   });
   const sourceArchive = await createNativeSourceArchive(source);
   const preview = await renderNativeReactSourcePreview({

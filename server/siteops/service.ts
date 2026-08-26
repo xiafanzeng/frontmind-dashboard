@@ -48,6 +48,7 @@ import {
   siteOpsObserveInputSchema,
   siteOpsSendMessageInputSchema,
   visualEvidenceV1Schema,
+  type SiteOpsNativeVisualFailureCategory,
   type SiteOpsActInput,
   type SiteBrief,
 } from "../../shared/siteops";
@@ -1146,7 +1147,34 @@ const TERMINAL_VISUAL_OPERATION_STATUSES = new Set([
 type VisualOperationProjectionRow = {
   status: string;
   input?: unknown;
+  errorCode?: string | null;
 };
+
+const VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE: Readonly<
+  Record<string, SiteOpsNativeVisualFailureCategory>
+> = {
+  NATIVE_SOURCE_QUOTA_UNAVAILABLE: "provider_quota",
+  NATIVE_SOURCE_CONTRACT_UNAVAILABLE: "get_component_contract",
+  MCP_GET_COMPONENT_REQUIRED: "get_component_contract",
+  MCP_CONTRACT_INCOMPATIBLE: "get_component_contract",
+  NATIVE_SOURCE_CANDIDATES_UNAVAILABLE: "source_incomplete",
+  NATIVE_SOURCE_CANDIDATE_PAGE_INCOMPLETE: "source_incomplete",
+  NATIVE_SOURCE_DEPENDENCIES_UNAVAILABLE: "dependency_unsupported",
+  NATIVE_SOURCE_UNSAFE: "source_unsafe",
+  NATIVE_SOURCE_COMPILE_UNAVAILABLE: "compile_failed",
+  NATIVE_SOURCE_BROWSER_UNAVAILABLE: "browser_unavailable",
+  NATIVE_SOURCE_RENDER_UNAVAILABLE: "render_failed",
+  VISUAL_SEARCH_DEADLINE_EXHAUSTED: "deadline_exhausted",
+  VISUAL_SEARCH_TIMEOUT: "deadline_exhausted",
+};
+
+function projectNativeVisualFailureCategory(
+  errorCode: string | null | undefined,
+) {
+  return errorCode
+    ? (VISUAL_FAILURE_CATEGORY_BY_ERROR_CODE[errorCode] ?? null)
+    : null;
+}
 
 function projectedVisualTargetPage(
   operation: VisualOperationProjectionRow | null | undefined,
@@ -1231,9 +1259,21 @@ export function projectSiteOpsVisualGeneration(input: {
     selectableStatus &&
     !input.hasActiveVisualOperation &&
     !input.hasActiveBuild;
+  const terminalRetryableFailure =
+    (latestStatus === "failed" || latestStatus === "attention_required") &&
+    !input.hasActiveVisualOperation &&
+    !input.hasActiveBuild &&
+    !input.hasBuildAttempt;
+  const retryableInitialFailure =
+    input.generatedPages === 0 &&
+    terminalRetryableFailure &&
+    ["visual_searching", "failed", "attention_required"].includes(
+      input.projectStatus,
+    );
+  const retryableSupplementalFailure =
+    canSelectExisting && terminalRetryableFailure;
   const retryableError =
-    canSelectExisting &&
-    (latestStatus === "failed" || latestStatus === "attention_required");
+    retryableInitialFailure || retryableSupplementalFailure;
   return {
     status: input.hasActiveVisualOperation
       ? ("generating" as const)
@@ -1249,9 +1289,19 @@ export function projectSiteOpsVisualGeneration(input: {
     generatedPages: input.generatedPages,
     maxPages: SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
     canGenerateMore:
-      canSelectExisting &&
+      (canSelectExisting || retryableInitialFailure) &&
       input.generatedPages < SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
     canSelectExisting,
+    retryAction: retryableError
+      ? input.generatedPages === 0
+        ? ("start" as const)
+        : ("supplemental" as const)
+      : null,
+    failureCategory: retryableError
+      ? projectNativeVisualFailureCategory(
+          input.latestVisualOperation?.errorCode,
+        )
+      : null,
     recoveredSelection,
   } as const;
 }
@@ -2056,6 +2106,8 @@ async function projectObservation(
       maxPages: visualGeneration.maxPages,
       canGenerateMore: visualGeneration.canGenerateMore,
       canSelectExisting: visualGeneration.canSelectExisting,
+      retryAction: visualGeneration.retryAction,
+      failureCategory: visualGeneration.failureCategory,
     },
     executionSteps: projectSiteOpsExecutionSteps({
       operations: timelineOperationRows,
@@ -3137,6 +3189,7 @@ export function visualSearchAllowedForProjectStatus(
           "preview_ready",
           "approved",
           "live",
+          "visual_searching",
           "failed",
           "attention_required",
         ]

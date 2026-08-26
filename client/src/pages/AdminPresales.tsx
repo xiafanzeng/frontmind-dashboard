@@ -53,6 +53,12 @@ type CredentialStatus = {
 
 type TwentyFirstCredentialStatus = CredentialStatus & {
   revocationPending: boolean;
+  nativeVisualReadiness:
+    | "ready"
+    | "missing_get_component"
+    | "source_contract_incompatible"
+    | "usage_unavailable"
+    | "unverified";
   capabilities: {
     search: boolean;
     getComponent: boolean;
@@ -89,6 +95,7 @@ const EMPTY_STATUS: CredentialStatus = {
 const EMPTY_TWENTY_FIRST_STATUS: TwentyFirstCredentialStatus = {
   ...EMPTY_STATUS,
   revocationPending: false,
+  nativeVisualReadiness: "unverified",
   capabilities: {
     search: false,
     getComponent: false,
@@ -332,9 +339,22 @@ export default function AdminPresales() {
         });
       utils.admin.presales.twentyFirst.status.setData(undefined, (current) =>
         current
-          ? { ...current, capabilities: connection.capabilities }
+          ? {
+              ...current,
+              capabilities: connection.capabilities,
+              nativeVisualReadiness: connection.nativeVisualReadiness,
+            }
           : current,
       );
+      if (connection.nativeVisualReadiness !== "ready") {
+        throw new Error(
+          connection.nativeVisualReadiness === "usage_unavailable"
+            ? "21st 原生源码读取额度当前不可用"
+            : connection.nativeVisualReadiness === "missing_get_component"
+              ? "当前连接缺少 get_component 能力"
+              : "21st 原生源码合同尚未通过验证",
+        );
+      }
       const latency = Math.max(1, Math.round(performance.now() - startedAt));
       setTwentyFirstLatencyMs(latency);
       setTwentyFirstConnectionState("success");
@@ -1115,9 +1135,11 @@ export default function AdminPresales() {
                   <Badge
                     variant="secondary"
                     className={
-                      twentyFirstStatus.configured
+                      twentyFirstStatus.configured &&
+                      twentyFirstStatus.nativeVisualReadiness === "ready"
                         ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                        : twentyFirstStatus.revocationPending
+                        : twentyFirstStatus.configured ||
+                            twentyFirstStatus.revocationPending
                           ? "border-amber-200 bg-amber-50 text-amber-800"
                           : "border-border bg-muted/60 text-muted-foreground"
                     }
@@ -1127,11 +1149,20 @@ export default function AdminPresales() {
                     ) : (
                       <Activity className="mr-1 h-3.5 w-3.5" />
                     )}
-                    {twentyFirstStatus.configured
-                      ? "AI 建站就绪"
-                      : twentyFirstStatus.revocationPending
-                        ? "等待安全撤销"
-                        : "等待配置"}
+                    {twentyFirstStatus.configured &&
+                    twentyFirstStatus.nativeVisualReadiness === "ready"
+                      ? "原生视觉已验证"
+                      : twentyFirstStatus.configured
+                        ? twentyFirstStatus.nativeVisualReadiness ===
+                          "usage_unavailable"
+                          ? "源码额度不可用"
+                          : twentyFirstStatus.nativeVisualReadiness ===
+                              "missing_get_component"
+                            ? "缺少源码读取能力"
+                            : "等待源码能力复验"
+                        : twentyFirstStatus.revocationPending
+                          ? "等待安全撤销"
+                          : "等待配置"}
                   </Badge>
                 </div>
               </CardHeader>
@@ -1275,6 +1306,12 @@ export default function AdminPresales() {
                     <CapabilityTile
                       label="get_component"
                       available={twentyFirstStatus.capabilities.getComponent}
+                    />
+                    <CapabilityTile
+                      label="原生源码可构建"
+                      available={
+                        twentyFirstStatus.nativeVisualReadiness === "ready"
+                      }
                     />
                     <CapabilityTile
                       label="get_usage"

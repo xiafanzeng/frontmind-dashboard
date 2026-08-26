@@ -3,6 +3,7 @@ import {
   siteBriefSchema,
   siteOpsBuildStatusSchema,
   siteOpsCardSchema,
+  siteOpsNativeVisualFailureCategorySchema,
   siteOpsProjectStatusSchema,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
@@ -97,6 +98,10 @@ export const siteOpsVisualGenerationProjectionSchema = z
     maxPages: z.literal(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES),
     canGenerateMore: z.boolean(),
     canSelectExisting: z.boolean().default(true),
+    retryAction: z.enum(["start", "supplemental"]).nullable().optional(),
+    failureCategory: siteOpsNativeVisualFailureCategorySchema
+      .nullable()
+      .optional(),
   })
   .strict();
 

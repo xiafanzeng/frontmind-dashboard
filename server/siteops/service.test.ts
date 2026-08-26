@@ -280,6 +280,9 @@ describe("SiteOps core contracts", () => {
     expect(visualSearchAllowedForProjectStatus("collecting_brief", false)).toBe(
       true,
     );
+    expect(visualSearchAllowedForProjectStatus("visual_searching", true)).toBe(
+      true,
+    );
   });
 
   it.each([
@@ -578,7 +581,62 @@ describe("SiteOps core contracts", () => {
       targetPage: null,
       canGenerateMore: true,
       canSelectExisting: true,
+      retryAction: "supplemental",
       recoveredSelection: true,
+    });
+  });
+
+  it("makes a terminal first-page visual failure directly retryable without a reset", () => {
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "attention_required",
+        generatedPages: 0,
+        latestVisualOperation: {
+          status: "attention_required",
+          errorCode: "NATIVE_SOURCE_COMPILE_UNAVAILABLE",
+          input: {
+            schemaVersion: 2,
+            knowledgeSnapshotId: "10000000-0000-4000-8000-000000000001",
+            credentialId: "20000000-0000-4000-8000-000000000002",
+            credentialVersion: 7,
+            workflowVersion: "2.5.0",
+            mode: "initial",
+            page: 1,
+            admissionRevision: 9,
+          },
+        },
+        hasActiveVisualOperation: false,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+      }),
+    ).toMatchObject({
+      status: "retryable_error",
+      targetPage: null,
+      generatedPages: 0,
+      canGenerateMore: true,
+      canSelectExisting: false,
+      retryAction: "start",
+      failureCategory: "compile_failed",
+      recoveredSelection: false,
+    });
+  });
+
+  it("does not expose a retry while a first-page visual operation is still active", () => {
+    expect(
+      projectSiteOpsVisualGeneration({
+        projectStatus: "visual_searching",
+        generatedPages: 0,
+        latestVisualOperation: { status: "running" },
+        hasActiveVisualOperation: true,
+        hasActiveBuild: false,
+        hasBuildAttempt: false,
+      }),
+    ).toMatchObject({
+      status: "generating",
+      canGenerateMore: false,
+      canSelectExisting: false,
+      retryAction: null,
+      failureCategory: null,
     });
   });
 

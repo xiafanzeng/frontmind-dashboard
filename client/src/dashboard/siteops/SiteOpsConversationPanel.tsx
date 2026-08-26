@@ -1058,6 +1058,8 @@ export default function SiteOpsConversationPanel({
     maxPages: 3 as const,
     canGenerateMore: visualPages.length < 3,
     canSelectExisting: true,
+    retryAction: null,
+    failureCategory: null,
   };
   const visualGenerationPending =
     visualGeneration.status === "generating" ||
@@ -1265,42 +1267,46 @@ export default function SiteOpsConversationPanel({
 
       {observation.project.status === "draft" &&
         observation.interactionState === "select_snapshot" && (
-        <section
-          className="siteops-snapshot-card"
-          aria-labelledby="siteops-snapshot-title"
-        >
-          <div>
-            <FileArchive size={20} aria-hidden="true" />
-            <div>
-              <h3 id="siteops-snapshot-title">从知识库开始建站</h3>
-              <p>
-                FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            className="siteops-primary-button"
-            disabled={interactionLocked}
-            onClick={() =>
-              runAction(
-                "select_snapshot",
-                actionFromCard(
-                  observation,
-                  "brief_question",
-                  "select_snapshot",
-                  {},
-                ),
-              )
-            }
+          <section
+            className="siteops-snapshot-card"
+            aria-labelledby="siteops-snapshot-title"
           >
-            {busyAction === "select_snapshot" && (
-              <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
-            )}
-            从知识库开始建站
-          </button>
-        </section>
-      )}
+            <div>
+              <FileArchive size={20} aria-hidden="true" />
+              <div>
+                <h3 id="siteops-snapshot-title">从知识库开始建站</h3>
+                <p>
+                  FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="siteops-primary-button"
+              disabled={interactionLocked}
+              onClick={() =>
+                runAction(
+                  "select_snapshot",
+                  actionFromCard(
+                    observation,
+                    "brief_question",
+                    "select_snapshot",
+                    {},
+                  ),
+                )
+              }
+            >
+              {busyAction === "select_snapshot" && (
+                <Loader2
+                  className="siteops-spin"
+                  size={15}
+                  aria-hidden="true"
+                />
+              )}
+              从知识库开始建站
+            </button>
+          </section>
+        )}
 
       {currentSnapshotId &&
         observation.interactionState === "collecting_brief" && (
@@ -1411,6 +1417,50 @@ export default function SiteOpsConversationPanel({
           ))
         )}
       </div>
+
+      {visualPages.length === 0 &&
+        visualGeneration.status === "retryable_error" &&
+        visualGeneration.retryAction === "start" && (
+          <section
+            className="siteops-snapshot-card"
+            aria-labelledby="siteops-visual-retry-title"
+          >
+            <div>
+              <AlertCircle size={20} aria-hidden="true" />
+              <div>
+                <h3 id="siteops-visual-retry-title">视觉候选生成未完成</h3>
+                <p>
+                  本次未能生成完整的 9
+                  个视觉候选，建站资料已保留，可以直接重试，无需重置。
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="siteops-primary-button"
+              disabled={
+                interactionLocked ||
+                visualGenerationPending ||
+                Boolean(upstreamMessage)
+              }
+              onClick={() =>
+                runAction("reselect_visual", {
+                  action: "reselect_visual",
+                  input: {},
+                })
+              }
+            >
+              {visualGenerationPending && (
+                <Loader2
+                  className="siteops-spin"
+                  size={15}
+                  aria-hidden="true"
+                />
+              )}
+              重新生成 9 个视觉候选
+            </button>
+          </section>
+        )}
 
       {visualPages.length > 0 && currentVisualPage && (
         <section

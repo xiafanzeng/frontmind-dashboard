@@ -61,8 +61,11 @@ import {
   SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
   VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES,
   VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
+  assertTwentyFirstNativeSourcePayloadAvailable,
   createVisualSelectionBundleV5Artifact,
+  classifyNativeVisualFailure,
   prepareNativeVisualCandidate,
+  type NativeVisualFailureCategory,
   type PreparedNativeVisualCandidate,
 } from "./native-visual-source";
 import { registerSiteOpsProviderHandler } from "./providers";
@@ -211,11 +214,20 @@ export type VisualSearchDiagnostics = {
   exactEligibilityEdges: number;
   safeFallbackEdges: number;
   mirrorAttempts: number;
+  previewFetchAttempts: number;
+  sourceFetchAttempts: number;
+  sourceFetchSucceeded: number;
+  sourcePreparationAttempts: number;
+  sourcePrepared: number;
+  sourceRejectedByReason: Partial<Record<NativeVisualFailureCategory, number>>;
+  nativeFailureCategory: NativeVisualFailureCategory | null;
   terminalReason:
     | "complete"
     | "catalog_insufficient"
     | "matching_budget_exhausted"
     | "preview_failures"
+    | "source_failures"
+    | "deadline_exhausted"
     | null;
   diversity: SafeVisualDiversitySummary;
 };
@@ -318,6 +330,9 @@ function logSafeVisualStage(input: {
   compatibleMatchingCardinality?: number;
   mirrorAttempts?: number;
   mirrorSucceeded?: number;
+  sourceAttempts?: number;
+  sourceSucceeded?: number;
+  nativeFailureCategory?: NativeVisualFailureCategory | null;
   rejectedPreviews?: number;
   candidateCount?: number;
   terminalReason?: VisualSearchDiagnostics["terminalReason"];
@@ -353,6 +368,15 @@ function logSafeVisualStage(input: {
     ...(input.mirrorSucceeded === undefined
       ? {}
       : { mirrorSucceeded: input.mirrorSucceeded }),
+    ...(input.sourceAttempts === undefined
+      ? {}
+      : { sourceAttempts: input.sourceAttempts }),
+    ...(input.sourceSucceeded === undefined
+      ? {}
+      : { sourceSucceeded: input.sourceSucceeded }),
+    ...(input.nativeFailureCategory === undefined
+      ? {}
+      : { nativeFailureCategory: input.nativeFailureCategory }),
     ...(input.rejectedPreviews === undefined
       ? {}
       : { rejectedPreviews: input.rejectedPreviews }),
@@ -393,6 +417,13 @@ function createVisualSearchDiagnostics(): VisualSearchDiagnostics {
     exactEligibilityEdges: 0,
     safeFallbackEdges: 0,
     mirrorAttempts: 0,
+    previewFetchAttempts: 0,
+    sourceFetchAttempts: 0,
+    sourceFetchSucceeded: 0,
+    sourcePreparationAttempts: 0,
+    sourcePrepared: 0,
+    sourceRejectedByReason: {},
+    nativeFailureCategory: null,
     terminalReason: null,
     diversity: {
       summaryVersion: 1,
@@ -425,6 +456,33 @@ function rejectDiagnostic(
     (diagnostics.rejectedByReason[reason] ?? 0) + 1;
 }
 
+const NATIVE_FAILURE_PRIORITY: readonly NativeVisualFailureCategory[] = [
+  "provider_quota",
+  "get_component_contract",
+  "deadline_exhausted",
+  "browser_unavailable",
+  "dependency_unsupported",
+  "source_unsafe",
+  "source_incomplete",
+  "compile_failed",
+  "render_failed",
+];
+
+function rejectNativeSource(
+  diagnostics: VisualSearchDiagnostics,
+  category: NativeVisualFailureCategory,
+) {
+  diagnostics.sourceRejectedByReason[category] =
+    (diagnostics.sourceRejectedByReason[category] ?? 0) + 1;
+  diagnostics.nativeFailureCategory =
+    NATIVE_FAILURE_PRIORITY.find(
+      (candidate) => (diagnostics.sourceRejectedByReason[candidate] ?? 0) > 0,
+    ) ?? category;
+  // Preserve the V2 aggregate field for old readers while new code uses the
+  // source-specific counters above.
+  rejectDiagnostic(diagnostics, "source");
+}
+
 function abortLike(error: unknown) {
   if (!error || typeof error !== "object") return false;
   const name = "name" in error ? String(error.name) : "";
@@ -434,6 +492,98 @@ function abortLike(error: unknown) {
     name === "TimeoutError" ||
     code === "ABORT_ERR" ||
     code === "ETIMEDOUT"
+  );
+}
+
+function getComponentFailureCategory(
+  error: unknown,
+): NativeVisualFailureCategory {
+  if (abortLike(error)) return "deadline_exhausted";
+  const nativeCode =
+    error && typeof error === "object" && "nativeCode" in error
+      ? String(error.nativeCode)
+      : "";
+  const nativeCodeCategory: Partial<
+    Record<string, NativeVisualFailureCategory>
+  > = {
+    NATIVE_SOURCE_QUOTA_UNAVAILABLE: "provider_quota",
+    NATIVE_SOURCE_CONTRACT_UNAVAILABLE: "get_component_contract",
+    NATIVE_SOURCE_CANDIDATES_UNAVAILABLE: "source_incomplete",
+  };
+  if (nativeCodeCategory[nativeCode]) {
+    return nativeCodeCategory[nativeCode]!;
+  }
+  if (
+    ["provider_quota", "get_component_contract", "source_incomplete"].includes(
+      nativeCode,
+    )
+  ) {
+    return nativeCode as NativeVisualFailureCategory;
+  }
+  if (error instanceof TwentyFirstToolContractError) {
+    return "get_component_contract";
+  }
+  if (error instanceof AuthServiceError) {
+    return "get_component_contract";
+  }
+  return classifyNativeVisualFailure(error);
+}
+
+const NATIVE_SOURCE_FAILURE_CONTRACT = {
+  provider_quota: {
+    code: "NATIVE_SOURCE_QUOTA_UNAVAILABLE",
+    message:
+      "21st 原生源码读取额度当前不可用，请更新 FrontMind 目录连接后重试。",
+  },
+  get_component_contract: {
+    code: "NATIVE_SOURCE_CONTRACT_UNAVAILABLE",
+    message: "21st 原生源码读取合同当前不兼容，请稍后重试。",
+  },
+  source_incomplete: {
+    code: "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE",
+    message: "本次未能凑齐 9 个可安全编译的完整 React 源码候选，请稍后重试。",
+  },
+  dependency_unsupported: {
+    code: "NATIVE_SOURCE_DEPENDENCIES_UNAVAILABLE",
+    message: "本次候选的原生源码依赖未能安全解析，请稍后重试。",
+  },
+  source_unsafe: {
+    code: "NATIVE_SOURCE_UNSAFE",
+    message: "本次候选源码未通过硬安全检查，已安全丢弃；可重新生成视觉候选。",
+  },
+  compile_failed: {
+    code: "NATIVE_SOURCE_COMPILE_UNAVAILABLE",
+    message: "本次候选的原生 React 源码未能完成编译，请稍后重试。",
+  },
+  browser_unavailable: {
+    code: "NATIVE_SOURCE_BROWSER_UNAVAILABLE",
+    message: "原生 React 预览浏览器当前不可用，请稍后重试。",
+  },
+  render_failed: {
+    code: "NATIVE_SOURCE_RENDER_UNAVAILABLE",
+    message: "本次候选的原生 React 预览未能安全渲染，请稍后重试。",
+  },
+  deadline_exhausted: {
+    code: "VISUAL_SEARCH_DEADLINE_EXHAUSTED",
+    message: "本次原生视觉候选处理已达到时间上限，请稍后重试。",
+  },
+} as const satisfies Record<
+  NativeVisualFailureCategory,
+  { code: string; message: string }
+>;
+
+export function nativeSourceProviderErrorCode(
+  category: NativeVisualFailureCategory,
+) {
+  return NATIVE_SOURCE_FAILURE_CONTRACT[category].code;
+}
+
+function nativeSourceProviderFailure(category: NativeVisualFailureCategory) {
+  const contract = NATIVE_SOURCE_FAILURE_CONTRACT[category];
+  return new TwentyFirstProviderFailure(
+    contract.code,
+    contract.message,
+    "attention_required",
   );
 }
 
@@ -797,6 +947,7 @@ type FamilyReferencePools = Map<FrontMindVisualFamily, FamilyReferenceEdge[]>;
 
 const MAX_FAMILY_SEARCH_CALLS = 18;
 const MAX_MIRROR_ATTEMPTS = 36;
+const MAX_NATIVE_SOURCE_ATTEMPTS = 18;
 const MIRROR_CONCURRENCY = 3;
 
 const FAMILY_SEARCH_TERMS: Record<
@@ -1243,6 +1394,18 @@ async function searchFamilyRound(input: {
   effectiveSearchLimit: number;
   nativeSourceMode?: boolean;
 }) {
+  const preferredNativeSearchType = (
+    input.session as TwentyFirstReadOnlySession & {
+      preferredSearchType?: "template" | "component";
+    }
+  ).preferredSearchType;
+  const search = input.session.search as unknown as (request: {
+    query: string;
+    type: "template" | "component";
+    limit: number;
+    tag?: "hero";
+    sort?: "recommended";
+  }) => Promise<unknown>;
   for (const family of input.families) {
     if (input.queries.length >= MAX_FAMILY_SEARCH_CALLS) break;
     if (input.signal.aborted) {
@@ -1271,9 +1434,11 @@ async function searchFamilyRound(input: {
       role: query.role,
       axis: query.axis,
       limit: query.limit,
-      payload: await input.session.search({
+      payload: await search({
         query: query.query,
-        type: "component",
+        type: input.nativeSourceMode
+          ? (preferredNativeSearchType ?? "component")
+          : "component",
         limit: query.limit,
         ...(input.nativeSourceMode ? {} : { tag: "hero" as const }),
         sort: "recommended",
@@ -1627,6 +1792,7 @@ async function mirrorCandidates(input: {
     const downloaded = await Promise.all(
       batch.map(async (candidate) => {
         input.diagnostics.mirrorAttempted += 1;
+        input.diagnostics.previewFetchAttempts += 1;
         try {
           const preview = await input.fetchPreview({
             url: candidate.previewUrl!,
@@ -2409,7 +2575,8 @@ function safeProviderFailure(
     return {
       status: "failed",
       code: "VISUAL_SEARCH_TIMEOUT",
-      message: "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
+      message:
+        "视觉检索已超时；当前知识库和建站资料已保留，可直接重新生成视觉候选。",
       result: diagnostics,
     };
   }
@@ -2437,8 +2604,7 @@ function safeProviderFailure(
     return {
       status: "failed",
       code: "VISUAL_OPERATION_CONTRACT_MISMATCH",
-      message:
-        "视觉检索任务合同不一致；可申请重置，批准后可从当前企业知识库重新开始。",
+      message: "视觉检索任务合同不一致，请联系 FrontMind 管理员处理。",
       result: diagnostics,
     };
   }
@@ -2620,6 +2786,11 @@ export function createTwentyFirstSiteOpsProviderHandler(
             string,
             PreparedNativeVisualCandidate
           >();
+          const pendingNativeSources: Array<{
+            reference: MirroredReference;
+            payload: unknown;
+          }> = [];
+          let nativeFatalCategory: NativeVisualFailureCategory | null = null;
           const attemptedProviderKeys = new Set<string>();
           const unavailableProviderKeys = new Set<string>();
           const excludedProviderKeys = new Set(
@@ -2701,74 +2872,41 @@ export function createTwentyFirstSiteOpsProviderHandler(
               return;
             }
             stage = "retrieve_native_sources";
-            // Each native preparation launches a bounded Vite build and one
-            // isolated Chromium render. Keep this limit local even if a future
-            // mirror implementation returns more than today's three-item
-            // batches; an unbounded Promise.all would exhaust container memory.
-            const prepared = await mapWithBoundedConcurrency({
+            // Fetch all metered Provider source payloads while the MCP session
+            // is open, but never compile inside that session. Local Vite and
+            // Chromium work begins only after withReadOnlySession returns.
+            const fetched = await mapWithBoundedConcurrency({
               values: result.mirrored,
               concurrency: MIRROR_CONCURRENCY,
               map: async (reference) => {
+                if (nativeFatalCategory) return null;
+                diagnostics.sourceFetchAttempts += 1;
                 try {
                   const detail = await session.getComponent!(
                     reference.candidate.providerItemId,
                   );
-                  stage = "render_native_previews";
-                  const native = await prepareNativeCandidate({
-                    candidate: reference.candidate,
-                    payload: detail,
-                    signal: mirrorSignal,
-                  });
-                  if (
-                    priorSourceTreeSha256s.has(native.sourceTreeSha256) ||
-                    priorNativePreviewSha256s.has(native.previewSha256) ||
-                    [...preparedNativeByProviderKey.values()].some(
-                      (existing) =>
-                        existing.sourceTreeSha256 === native.sourceTreeSha256 ||
-                        existing.previewSha256 === native.previewSha256,
-                    )
-                  ) {
-                    throw new Error("NATIVE_SOURCE_DUPLICATE");
-                  }
-                  return { reference, native } as const;
-                } catch {
-                  rejectDiagnostic(diagnostics, "source");
+                  assertTwentyFirstNativeSourcePayloadAvailable(detail);
+                  diagnostics.sourceFetchSucceeded += 1;
+                  return { reference, payload: detail } as const;
+                } catch (error) {
+                  const category = getComponentFailureCategory(error);
+                  rejectNativeSource(diagnostics, category);
                   unavailableProviderKeys.add(
                     reference.candidate.providerItemKey,
                   );
+                  if (
+                    category === "provider_quota" ||
+                    category === "get_component_contract" ||
+                    category === "deadline_exhausted"
+                  ) {
+                    nativeFatalCategory = category;
+                  }
                   return null;
                 }
               },
             });
-            const acceptedSourceTrees = new Set(
-              [...preparedNativeByProviderKey.values()].map(
-                (item) => item.sourceTreeSha256,
-              ),
-            );
-            const acceptedNativePreviews = new Set(
-              [...preparedNativeByProviderKey.values()].map(
-                (item) => item.previewSha256,
-              ),
-            );
-            for (const item of prepared) {
-              if (!item) continue;
-              if (
-                acceptedSourceTrees.has(item.native.sourceTreeSha256) ||
-                acceptedNativePreviews.has(item.native.previewSha256)
-              ) {
-                rejectDiagnostic(diagnostics, "source");
-                unavailableProviderKeys.add(
-                  item.reference.candidate.providerItemKey,
-                );
-                continue;
-              }
-              acceptedSourceTrees.add(item.native.sourceTreeSha256);
-              acceptedNativePreviews.add(item.native.previewSha256);
-              mirrored.push(item.reference);
-              preparedNativeByProviderKey.set(
-                item.reference.candidate.providerItemKey,
-                item.native,
-              );
+            for (const item of fetched) {
+              if (item) pendingNativeSources.push(item);
             }
           };
 
@@ -2814,13 +2952,19 @@ export function createTwentyFirstSiteOpsProviderHandler(
           let assigned = new Map<FrontMindVisualFamily, MirroredReference>();
           while (
             keyAssignment.size === FRONTMIND_VISUAL_FAMILIES_V3.length &&
-            diagnostics.mirrorAttempted < MAX_MIRROR_ATTEMPTS
+            diagnostics.mirrorAttempted < MAX_MIRROR_ATTEMPTS &&
+            !nativeFatalCategory &&
+            (!nativeSourceMode ||
+              diagnostics.sourceFetchAttempts < MAX_NATIVE_SOURCE_ATTEMPTS)
           ) {
             assigned = assignDistinctMirroredReferences({ pools, mirrored });
             if (assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) break;
             const remaining = Math.min(
               MIRROR_CONCURRENCY,
               MAX_MIRROR_ATTEMPTS - diagnostics.mirrorAttempted,
+              ...(nativeSourceMode
+                ? [MAX_NATIVE_SOURCE_ATTEMPTS - diagnostics.sourceFetchAttempts]
+                : []),
             );
             const next = nextMirrorCandidates({
               pools,
@@ -2855,13 +2999,34 @@ export function createTwentyFirstSiteOpsProviderHandler(
             }
           }
           assigned = assignDistinctMirroredReferences({ pools, mirrored });
+          if (nativeSourceMode) {
+            return {
+              queries,
+              pools,
+              mirrored,
+              assigned,
+              preparedNativeByProviderKey,
+              pendingNativeSources,
+              searchedCandidates,
+              generalHeroEligibleKeys,
+              effectiveSearchLimit,
+              priorSourceTreeSha256s,
+              priorNativePreviewSha256s,
+              queryLatencyMs,
+              matchingStartedAt,
+              mirrorStartedAt,
+              nativeFatalCategory,
+            };
+          }
           const previewFailureCount = Object.values(
             diagnostics.rejectedByReason,
           ).reduce((sum, count) => sum + (count ?? 0), 0);
           if (assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) {
             diagnostics.terminalReason = "complete";
           } else if (diagnostics.mirrorAttempted >= MAX_MIRROR_ATTEMPTS) {
-            diagnostics.terminalReason = "matching_budget_exhausted";
+            // This is an I/O admission budget, not a matching solver budget.
+            // Do not mislabel duplicate/failed previews as graph exhaustion.
+            diagnostics.terminalReason = "preview_failures";
           } else if (previewFailureCount > 0) {
             diagnostics.terminalReason = "preview_failures";
           } else if (keyAssignment.size < FRONTMIND_VISUAL_FAMILIES_V3.length) {
@@ -2929,10 +3094,163 @@ export function createTwentyFirstSiteOpsProviderHandler(
             mirrored,
             assigned,
             preparedNativeByProviderKey,
+            pendingNativeSources,
+            searchedCandidates,
+            generalHeroEligibleKeys,
+            effectiveSearchLimit,
+            priorSourceTreeSha256s,
+            priorNativePreviewSha256s,
+            queryLatencyMs,
+            matchingStartedAt,
+            mirrorStartedAt,
+            nativeFatalCategory,
           };
         },
         { signal },
       );
+      if (nativeSourceMode) {
+        if (retrieval.nativeFatalCategory) {
+          throw nativeSourceProviderFailure(retrieval.nativeFatalCategory);
+        }
+        stage = "render_native_previews";
+        const preparationSignal = AbortSignal.any([
+          signal,
+          AbortSignal.timeout(300_000),
+        ]);
+        const prepared = await mapWithBoundedConcurrency({
+          values: retrieval.pendingNativeSources,
+          concurrency: MIRROR_CONCURRENCY,
+          map: async (item) => {
+            if (preparationSignal.aborted) return null;
+            diagnostics.sourcePreparationAttempts += 1;
+            try {
+              const native = await prepareNativeCandidate({
+                candidate: item.reference.candidate,
+                payload: item.payload,
+                signal: preparationSignal,
+                fetchRemoteAsset: fetchPreview,
+              });
+              diagnostics.sourcePrepared += 1;
+              return { ...item, native } as const;
+            } catch (error) {
+              const category = classifyNativeVisualFailure(error);
+              rejectNativeSource(diagnostics, category);
+              return { ...item, category } as const;
+            }
+          },
+        });
+        if (preparationSignal.aborted) {
+          rejectNativeSource(diagnostics, "deadline_exhausted");
+          throw nativeSourceProviderFailure("deadline_exhausted");
+        }
+        const acceptedSourceTrees = new Set(retrieval.priorSourceTreeSha256s);
+        const acceptedNativePreviews = new Set(
+          retrieval.priorNativePreviewSha256s,
+        );
+        for (const item of prepared) {
+          if (!item || !("native" in item)) {
+            if (item) {
+              retrieval.mirrored.splice(
+                0,
+                retrieval.mirrored.length,
+                ...retrieval.mirrored.filter(
+                  (reference) =>
+                    reference.candidate.providerItemKey !==
+                    item.reference.candidate.providerItemKey,
+                ),
+              );
+            }
+            continue;
+          }
+          if (
+            acceptedSourceTrees.has(item.native.sourceTreeSha256) ||
+            acceptedNativePreviews.has(item.native.previewSha256)
+          ) {
+            rejectNativeSource(diagnostics, "source_incomplete");
+            continue;
+          }
+          acceptedSourceTrees.add(item.native.sourceTreeSha256);
+          acceptedNativePreviews.add(item.native.previewSha256);
+          retrieval.mirrored.push(item.reference);
+          retrieval.preparedNativeByProviderKey.set(
+            item.reference.candidate.providerItemKey,
+            item.native,
+          );
+        }
+        retrieval.assigned = assignDistinctMirroredReferences({
+          pools: retrieval.pools,
+          mirrored: retrieval.mirrored,
+        });
+        const previewFailureCount = Object.entries(
+          diagnostics.rejectedByReason,
+        ).reduce(
+          (sum, [reason, count]) =>
+            sum + (reason === "source" ? 0 : (count ?? 0)),
+          0,
+        );
+        const sourceFailureCount = Object.values(
+          diagnostics.sourceRejectedByReason,
+        ).reduce((sum, count) => sum + (count ?? 0), 0);
+        if (retrieval.assigned.size === FRONTMIND_VISUAL_FAMILIES_V3.length) {
+          diagnostics.terminalReason = "complete";
+        } else if (sourceFailureCount > 0) {
+          diagnostics.terminalReason = "source_failures";
+        } else if (previewFailureCount > 0) {
+          diagnostics.terminalReason = "preview_failures";
+        } else {
+          diagnostics.terminalReason = "catalog_insufficient";
+        }
+        refreshRetrievalDiagnostics({
+          pools: retrieval.pools,
+          searchedCandidates: retrieval.searchedCandidates,
+          mirrored: retrieval.mirrored,
+          assigned: retrieval.assigned,
+          diagnostics,
+          queries: retrieval.queries,
+          generalHeroEligibleKeys: retrieval.generalHeroEligibleKeys,
+          effectiveSearchLimit: retrieval.effectiveSearchLimit,
+        });
+        logSafeVisualStage({
+          event: "visual_query_capability",
+          operationId: operation.id,
+          projectId: operation.projectId,
+          page: searchPlan.page,
+          variantId: `visual-query-v2-page-${searchPlan.page}`,
+          actualLimit: retrieval.effectiveSearchLimit,
+          queryCalls: diagnostics.queryCalls,
+          normalizedUnique: diagnostics.normalizedUnique,
+          latencyMs: retrieval.queryLatencyMs,
+        });
+        logSafeVisualStage({
+          event: "visual_matching",
+          operationId: operation.id,
+          projectId: operation.projectId,
+          page: searchPlan.page,
+          queryCalls: diagnostics.queryCalls,
+          normalizedUnique: diagnostics.normalizedUnique,
+          eligibilityEdges: diagnostics.eligibilityEdgeCount,
+          keyMatchingCardinality: diagnostics.keyMatchingCardinality,
+          compatibleMatchingCardinality:
+            diagnostics.compatibleMatchingCardinality,
+          terminalReason: diagnostics.terminalReason,
+          latencyMs: Date.now() - retrieval.matchingStartedAt,
+        });
+        logSafeVisualStage({
+          event: "visual_mirror",
+          operationId: operation.id,
+          projectId: operation.projectId,
+          page: searchPlan.page,
+          mirrorAttempts: diagnostics.mirrorAttempts,
+          mirrorSucceeded: diagnostics.mirrorSucceeded,
+          sourceAttempts: diagnostics.sourceFetchAttempts,
+          sourceSucceeded: diagnostics.sourcePrepared,
+          nativeFailureCategory: diagnostics.nativeFailureCategory,
+          compatibleMatchingCardinality:
+            diagnostics.compatibleMatchingCardinality,
+          terminalReason: diagnostics.terminalReason,
+          latencyMs: Date.now() - retrieval.mirrorStartedAt,
+        });
+      }
       if (retrieval.assigned.size !== FRONTMIND_VISUAL_FAMILIES_V3.length) {
         if (diagnostics.terminalReason === "matching_budget_exhausted") {
           throw new TwentyFirstProviderFailure(
@@ -2942,21 +3260,17 @@ export function createTwentyFirstSiteOpsProviderHandler(
           );
         }
         if (diagnostics.terminalReason === "preview_failures") {
-          if (
-            nativeSourceMode &&
-            (diagnostics.rejectedByReason.source ?? 0) > 0
-          ) {
-            throw new TwentyFirstProviderFailure(
-              "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE",
-              "部分 21st 候选未提供可安全编译的完整 React 源码，已跳过并完成深层检索；本次仍不足 9 个，请稍后重试。",
-              "attention_required",
-            );
-          }
           throw new TwentyFirstProviderFailure(
             "VISUAL_PREVIEW_REFERENCES_UNAVAILABLE",
             "部分真实 Hero 参考暂时无法安全读取，请稍后重试。",
             "attention_required",
           );
+        }
+        if (
+          diagnostics.terminalReason === "source_failures" &&
+          diagnostics.nativeFailureCategory
+        ) {
+          throw nativeSourceProviderFailure(diagnostics.nativeFailureCategory);
         }
         throw new TwentyFirstProviderFailure(
           "INSUFFICIENT_DISTINCT_21ST_HERO_REFERENCES",
@@ -2966,11 +3280,23 @@ export function createTwentyFirstSiteOpsProviderHandler(
       }
       const degradedReasons: string[] = [];
       await assertCommitLeaseActive(assertLeaseActive);
-      const rejectedPreviews = Object.values(
+      const rejectedPreviews = Object.entries(
         diagnostics.rejectedByReason,
-      ).reduce((sum, count) => sum + (count ?? 0), 0);
+      ).reduce(
+        (sum, [reason, count]) =>
+          sum + (reason === "source" ? 0 : (count ?? 0)),
+        0,
+      );
       if (rejectedPreviews > 0) {
         degradedReasons.push(`PREVIEW_RESULTS_REJECTED:${rejectedPreviews}`);
+      }
+      const rejectedSources = Object.values(
+        diagnostics.sourceRejectedByReason,
+      ).reduce((sum, count) => sum + (count ?? 0), 0);
+      if (rejectedSources > 0) {
+        degradedReasons.push(
+          `NATIVE_SOURCE_RESULTS_REJECTED:${rejectedSources}`,
+        );
       }
       let mirroredCandidates: BoardCandidate[];
       let selectionBundle: VisualSelectionBundleV4 | VisualSelectionBundleV5;

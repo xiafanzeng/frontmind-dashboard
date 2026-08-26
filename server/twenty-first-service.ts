@@ -40,6 +40,13 @@ export type TwentyFirstCapabilities = {
   getTheme: boolean | null;
 };
 
+export type TwentyFirstNativeVisualReadiness =
+  | "ready"
+  | "missing_get_component"
+  | "source_contract_incompatible"
+  | "usage_unavailable"
+  | "unverified";
+
 export type TwentyFirstCredentialStatus = {
   configured: boolean;
   revocationPending: boolean;
@@ -49,12 +56,14 @@ export type TwentyFirstCredentialStatus = {
   verifiedAt: number | null;
   updatedAt: number | null;
   capabilities: TwentyFirstCapabilities;
+  nativeVisualReadiness: TwentyFirstNativeVisualReadiness;
 };
 
 export type TwentyFirstConnectionResult = {
   ok: true;
   endpoint: typeof TWENTY_FIRST_MCP_ENDPOINT;
   capabilities: TwentyFirstCapabilities;
+  nativeVisualReadiness: TwentyFirstNativeVisualReadiness;
   server: { name: string; version: string } | null;
 };
 
@@ -280,7 +289,7 @@ export type TwentyFirstProviderItemId = string | number;
 
 export type TwentyFirstSearchRequest = {
   query: string;
-  type: "component";
+  type: "template" | "component";
   limit: number;
   tag?: "hero";
   sort?: "recommended";
@@ -289,6 +298,8 @@ export type TwentyFirstSearchRequest = {
 export type TwentyFirstReadOnlySession = {
   /** Maximum search depth actually accepted by the live advertised schema. */
   effectiveSearchLimit?: number;
+  /** Prefer complete page/template sources when the live catalog supports them. */
+  preferredSearchType?: TwentyFirstSearchRequest["type"];
   search(input: TwentyFirstSearchRequest): Promise<unknown>;
   getComponent?: (
     providerItemId: TwentyFirstProviderItemId,
@@ -299,6 +310,31 @@ export class TwentyFirstToolContractError extends AuthServiceError {
   constructor() {
     super("UPSTREAM_UNAVAILABLE", "21st 工具参数协议暂不兼容");
     this.name = "TwentyFirstToolContractError";
+  }
+}
+
+export type TwentyFirstNativeSourceContractCode =
+  | "NATIVE_SOURCE_CONTRACT_UNAVAILABLE"
+  | "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE"
+  | "NATIVE_SOURCE_QUOTA_UNAVAILABLE";
+
+/**
+ * A stable, non-reflective classification for get_component failures. The
+ * AuthServiceError code remains part of the existing transport contract while
+ * nativeCode lets the SiteOps provider distinguish quota, catalog misses and
+ * a changed MCP payload without inspecting provider text.
+ */
+export class TwentyFirstNativeSourceContractError extends AuthServiceError {
+  constructor(public readonly nativeCode: TwentyFirstNativeSourceContractCode) {
+    super(
+      "UPSTREAM_UNAVAILABLE",
+      nativeCode === "NATIVE_SOURCE_QUOTA_UNAVAILABLE"
+        ? "21st 原生源码读取额度暂不可用"
+        : nativeCode === "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE"
+          ? "21st 原生源码候选暂不可用"
+          : "21st 原生源码返回协议暂不兼容",
+    );
+    this.name = "TwentyFirstNativeSourceContractError";
   }
 }
 
@@ -398,6 +434,29 @@ function assertAdvertisedPrimitive(
   }
 }
 
+function adaptProviderItemIdToAdvertisedSchema(
+  property: object | undefined,
+  value: TwentyFirstProviderItemId,
+) {
+  const types = advertisedJsonTypes(property);
+  if (types.size === 0) return value;
+  const acceptsString = types.has("string");
+  const acceptsNumber = types.has("number") || types.has("integer");
+  if (
+    typeof value === "string" &&
+    !acceptsString &&
+    acceptsNumber &&
+    /^(?:0|[1-9][0-9]*)$/u.test(value)
+  ) {
+    const numeric = Number(value);
+    if (Number.isSafeInteger(numeric)) return numeric;
+  }
+  if (typeof value === "number" && !acceptsNumber && acceptsString) {
+    return String(value);
+  }
+  return value;
+}
+
 /**
  * Builds arguments from the server-advertised JSON schema. Only exact,
  * allowlisted semantic fields are populated; an incompatible schema fails
@@ -408,6 +467,7 @@ export function buildTwentyFirstToolArguments(input: {
   tool: TwentyFirstAdvertisedTool;
   value: string | TwentyFirstProviderItemId;
   limit?: number;
+  searchType?: TwentyFirstSearchRequest["type"];
   searchOptions?: Pick<TwentyFirstSearchRequest, "tag" | "sort">;
 }) {
   const properties = input.tool.inputSchema.properties ?? {};
@@ -436,8 +496,15 @@ export function buildTwentyFirstToolArguments(input: {
   if (input.operation === "search" && typeof input.value !== "string") {
     throw new TwentyFirstToolContractError();
   }
-  assertAdvertisedPrimitive(properties[valueKey], input.value);
-  const args: Record<string, unknown> = { [valueKey]: input.value };
+  const advertisedValue =
+    input.operation === "get_component"
+      ? adaptProviderItemIdToAdvertisedSchema(
+          properties[valueKey],
+          input.value as TwentyFirstProviderItemId,
+        )
+      : input.value;
+  assertAdvertisedPrimitive(properties[valueKey], advertisedValue);
+  const args: Record<string, unknown> = { [valueKey]: advertisedValue };
   if (input.operation === "search") {
     const limitKey = findToolInputKey(input.tool, [
       "limit",
@@ -452,11 +519,13 @@ export function buildTwentyFirstToolArguments(input: {
     }
     const typeKey = findToolInputKey(input.tool, ["type", "kind"]);
     if (typeKey) {
-      const typeValue = compatibleEnumValue(properties[typeKey], [
-        "component",
-        "components",
-        "c",
-      ]);
+      const requestedType = input.searchType ?? "component";
+      const typeValue = compatibleEnumValue(
+        properties[typeKey],
+        requestedType === "template"
+          ? ["template", "templates", "page", "pages"]
+          : ["component", "components", "c"],
+      );
       if (!typeValue) throw new TwentyFirstToolContractError();
       assertAdvertisedPrimitive(properties[typeKey], typeValue);
       args[typeKey] = typeValue;
@@ -489,6 +558,74 @@ export function buildTwentyFirstToolArguments(input: {
   return args;
 }
 
+function preferredSearchTypeForTool(
+  _tool: TwentyFirstAdvertisedTool,
+): TwentyFirstSearchRequest["type"] {
+  // The live get_component contract accepts component search IDs. A search
+  // enum advertising template/page does not imply that those IDs can be read
+  // through get_component; template preference can be enabled only alongside
+  // a separately advertised and implemented read-only source tool.
+  return "component";
+}
+
+function getComponentContractProbeValue(tool: TwentyFirstAdvertisedTool) {
+  const key = findToolInputKey(tool, [
+    "id",
+    "componentId",
+    "component_id",
+    "itemId",
+    "item_id",
+    "slug",
+    "name",
+  ]);
+  if (!key) throw new TwentyFirstToolContractError();
+  const property = tool.inputSchema.properties?.[key];
+  const types = advertisedJsonTypes(property);
+  const enumValues = Array.isArray(
+    (property as { enum?: unknown } | undefined)?.enum,
+  )
+    ? (property as { enum: unknown[] }).enum
+    : [];
+  const advertisedValue = enumValues.find(
+    (value): value is string | number =>
+      typeof value === "string" || typeof value === "number",
+  );
+  if (advertisedValue !== undefined) return advertisedValue;
+  if (types.has("number") || types.has("integer")) return 1;
+  if (types.has("string")) return "frontmind-contract-probe";
+  // MCP schemas sometimes omit a primitive type. Preserve compatibility with
+  // the official numeric get_component coordinate while still validating all
+  // required fields through buildTwentyFirstToolArguments below.
+  return 1;
+}
+
+function nativeVisualReadinessForTools(
+  search: TwentyFirstAdvertisedTool,
+  getComponent: TwentyFirstAdvertisedTool | undefined,
+): TwentyFirstNativeVisualReadiness {
+  if (!getComponent || getComponent.annotations?.destructiveHint === true) {
+    return "missing_get_component";
+  }
+  try {
+    const searchType = preferredSearchTypeForTool(search);
+    buildTwentyFirstToolArguments({
+      operation: "search",
+      tool: search,
+      value: "frontmind contract probe",
+      limit: 1,
+      searchType,
+    });
+    buildTwentyFirstToolArguments({
+      operation: "get_component",
+      tool: getComponent,
+      value: getComponentContractProbeValue(getComponent),
+    });
+    return "ready";
+  } catch {
+    return "source_contract_incompatible";
+  }
+}
+
 function parseToolTextPayload(text: string) {
   const value = text.trim();
   if (
@@ -502,6 +639,155 @@ function parseToolTextPayload(text: string) {
   } catch {
     return null;
   }
+}
+
+function boundedProviderSourceText(text: string) {
+  if (
+    !text.trim() ||
+    Buffer.byteLength(text, "utf8") > TWENTY_FIRST_MAX_RESPONSE_BYTES ||
+    // Source may legitimately contain tabs and newlines. Other literal C0
+    // controls cannot be valid TSX/CSS source and are rejected before the
+    // value crosses the MCP boundary.
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(text)
+  ) {
+    return null;
+  }
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+function payloadRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function sourcePayloadProjection(value: unknown, depth = 0): unknown | null {
+  const record = payloadRecord(value);
+  if (!record) return null;
+  if (
+    [
+      "files",
+      "sourceFiles",
+      "source_files",
+      "componentCode",
+      "component_code",
+      "sourceCode",
+      "source_code",
+      "demoCode",
+      "demo_code",
+      "previewCode",
+      "preview_code",
+    ].some((key) => Object.prototype.hasOwnProperty.call(record, key))
+  ) {
+    return value;
+  }
+  if (depth >= 4) return null;
+  for (const key of [
+    "data",
+    "result",
+    "payload",
+    "output",
+    "component",
+    "structuredContent",
+  ]) {
+    const nested = sourcePayloadProjection(record[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function safeProviderItemId(value: unknown): TwentyFirstProviderItemId | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+  if (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 191 &&
+    !/[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function firstProviderItemId(value: unknown) {
+  const projection = resultsProjection(value);
+  for (const item of projection?.results ?? []) {
+    const record = payloadRecord(item);
+    if (!record) continue;
+    for (const key of [
+      "id",
+      "componentId",
+      "component_id",
+      "itemId",
+      "item_id",
+      "providerItemId",
+      "provider_item_id",
+      "slug",
+    ]) {
+      const candidate = safeProviderItemId(record[key]);
+      if (candidate !== null) return candidate;
+    }
+  }
+  return null;
+}
+
+const QUOTA_EXHAUSTED_VALUES = new Set([
+  "credits_exhausted",
+  "insufficient_credits",
+  "locked",
+  "quota_exceeded",
+  "usage_exhausted",
+  "upgrade_required",
+]);
+
+function isExplicitQuotaExhaustion(value: unknown, depth = 0): boolean {
+  const record = payloadRecord(value);
+  if (!record || depth > 3) return false;
+  if (record.locked === true) return true;
+  for (const key of ["code", "reason", "status"]) {
+    const candidate = record[key];
+    if (
+      typeof candidate === "string" &&
+      QUOTA_EXHAUSTED_VALUES.has(candidate.trim().toLocaleLowerCase("en-US"))
+    ) {
+      return true;
+    }
+  }
+  for (const key of [
+    "remaining",
+    "creditsRemaining",
+    "credits_remaining",
+    "sourceReadsRemaining",
+    "source_reads_remaining",
+  ]) {
+    if (typeof record[key] === "number" && record[key] <= 0) return true;
+  }
+  return ["data", "result", "payload", "usage", "quota"].some((key) =>
+    isExplicitQuotaExhaustion(record[key], depth + 1),
+  );
+}
+
+function usageResultShowsExhaustion(result: Record<string, unknown>) {
+  if (isExplicitQuotaExhaustion(result.structuredContent)) return true;
+  const content = Array.isArray(result.content) ? result.content : [];
+  return content.some((item) => {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      (item as { type?: unknown }).type !== "text" ||
+      typeof (item as { text?: unknown }).text !== "string"
+    ) {
+      return false;
+    }
+    const parsed = parseToolTextPayload((item as { text: string }).text);
+    return parsed !== null && isExplicitQuotaExhaustion(parsed);
+  });
+}
+
+function supportsZeroArgumentCall(tool: TwentyFirstAdvertisedTool) {
+  return (tool.inputSchema.required?.length ?? 0) === 0;
 }
 
 function resultsProjection(
@@ -538,7 +824,68 @@ function resultsProjection(
 }
 
 /** Returns the provider payload only to the current bounded request. */
-export function projectTwentyFirstToolPayload(result: Record<string, unknown>) {
+export function projectTwentyFirstToolPayload(
+  result: Record<string, unknown>,
+  operation?: "search" | "get_component",
+) {
+  if (operation === "get_component") {
+    const status = payloadRecord(result.structuredContent);
+    if (isExplicitQuotaExhaustion(status)) {
+      throw new TwentyFirstNativeSourceContractError(
+        "NATIVE_SOURCE_QUOTA_UNAVAILABLE",
+      );
+    }
+    if (status?.found === false) {
+      throw new TwentyFirstNativeSourceContractError(
+        "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE",
+      );
+    }
+    if (result.isError === true) {
+      throw new TwentyFirstNativeSourceContractError(
+        "NATIVE_SOURCE_CONTRACT_UNAVAILABLE",
+      );
+    }
+    const structuredSource = sourcePayloadProjection(result.structuredContent);
+    if (structuredSource) return structuredSource;
+    const content = Array.isArray(result.content) ? result.content : [];
+    const textItems = content.filter(
+      (item): item is { type: "text"; text: string } =>
+        Boolean(
+          item &&
+            typeof item === "object" &&
+            (item as { type?: unknown }).type === "text" &&
+            typeof (item as { text?: unknown }).text === "string",
+        ),
+    );
+    const totalTextBytes = textItems.reduce(
+      (sum, item) => sum + Buffer.byteLength(item.text, "utf8"),
+      0,
+    );
+    if (totalTextBytes <= TWENTY_FIRST_MAX_RESPONSE_BYTES) {
+      for (const item of textItems) {
+        const parsed = parseToolTextPayload(item.text);
+        const projected = sourcePayloadProjection(parsed);
+        if (projected) return projected;
+      }
+      const rawItems = textItems
+        .filter((item) => parseToolTextPayload(item.text) === null)
+        .map((item) => boundedProviderSourceText(item.text))
+        .filter((item): item is string => item !== null);
+      if (rawItems.length === 1) {
+        return {
+          contractKind: "twenty_first_get_component_v1" as const,
+          status: {
+            found: status?.found !== false,
+            locked: false,
+          },
+          sourceText: rawItems[0],
+        };
+      }
+    }
+    throw new TwentyFirstNativeSourceContractError(
+      "NATIVE_SOURCE_CONTRACT_UNAVAILABLE",
+    );
+  }
   const structuredResults = resultsProjection(result.structuredContent);
   if (structuredResults) return structuredResults;
   const textItems = Array.isArray(result.content)
@@ -565,6 +912,9 @@ export function projectTwentyFirstToolPayload(result: Record<string, unknown>) {
     (item) => resultsProjection(item)?.results ?? [],
   );
   if (textResults.length > 0) return { results: textResults };
+  if (operation === "search") {
+    throw new TwentyFirstToolContractError();
+  }
   if (parsed.length === 1) return parsed[0];
   if (parsed.length > 1) return { items: parsed };
   return result.structuredContent &&
@@ -616,9 +966,9 @@ export function assertTwentyFirstJsonDepth(
 }
 
 /**
- * A deliberately narrow MCP client. It only performs the MCP initialization
- * handshake and tools/list; credential validation never invokes a paid or
- * mutating provider tool.
+ * A deliberately narrow MCP client. Credential validation discovers the live
+ * schema and performs one bounded, non-customer, read-only source probe. It
+ * never invokes a mutating or generative provider tool.
  */
 export class TwentyFirstClient {
   constructor(
@@ -700,6 +1050,111 @@ export class TwentyFirstClient {
     return tools;
   }
 
+  private async probeNativeVisualReadiness(input: {
+    client: Client;
+    totalSignal: AbortSignal;
+    search: TwentyFirstAdvertisedTool;
+    getComponent: TwentyFirstAdvertisedTool | undefined;
+    getUsage: TwentyFirstAdvertisedTool | undefined;
+  }): Promise<TwentyFirstNativeVisualReadiness> {
+    const advertisedReadiness = nativeVisualReadinessForTools(
+      input.search,
+      input.getComponent,
+    );
+    if (advertisedReadiness !== "ready" || !input.getComponent) {
+      return advertisedReadiness;
+    }
+    const call = async (
+      tool: TwentyFirstAdvertisedTool,
+      args: Record<string, unknown>,
+    ) => {
+      const result = await input.client.callTool(
+        { name: tool.name, arguments: args },
+        undefined,
+        this.requestOptions(input.totalSignal),
+      );
+      assertTwentyFirstJsonDepth(result);
+      return result as Record<string, unknown>;
+    };
+
+    if (
+      input.getUsage &&
+      input.getUsage.annotations?.destructiveHint !== true &&
+      supportsZeroArgumentCall(input.getUsage)
+    ) {
+      try {
+        const usage = await call(input.getUsage, {});
+        if (usageResultShowsExhaustion(usage)) return "usage_unavailable";
+        // Human-readable/unknown usage text is deliberately not interpreted.
+        // The source probe below remains the authoritative readiness check.
+      } catch {
+        // get_usage is optional and its output contract is not stable. A
+        // failed usage read must not replace the concrete source probe.
+      }
+    }
+
+    try {
+      const searchType = preferredSearchTypeForTool(input.search);
+      const searchArgs = buildTwentyFirstToolArguments({
+        operation: "search",
+        tool: input.search,
+        value: "responsive enterprise landing page",
+        limit: 1,
+        searchType,
+      });
+      const searchResult = await call(input.search, searchArgs);
+      if (searchResult.isError === true) return "unverified";
+      const searchPayload = projectTwentyFirstToolPayload(
+        searchResult,
+        "search",
+      );
+      const providerItemId = firstProviderItemId(searchPayload);
+      if (providerItemId === null) return "unverified";
+      const componentArgs = buildTwentyFirstToolArguments({
+        operation: "get_component",
+        tool: input.getComponent,
+        value: providerItemId,
+      });
+      const componentResult = await call(input.getComponent, componentArgs);
+      const sourcePayload = projectTwentyFirstToolPayload(
+        componentResult,
+        "get_component",
+      );
+      if (
+        sourcePayload &&
+        typeof sourcePayload === "object" &&
+        !Array.isArray(sourcePayload) &&
+        "sourceText" in sourcePayload
+      ) {
+        const sourceText = (sourcePayload as { sourceText?: unknown })
+          .sourceText;
+        if (
+          typeof sourceText !== "string" ||
+          !/```(?:tsx|jsx|ts|js)(?:[^\r\n]*)\r?\n[\s\S]+?\r?\n```/u.test(
+            sourceText,
+          )
+        ) {
+          return "source_contract_incompatible";
+        }
+      }
+      return "ready";
+    } catch (error) {
+      if (error instanceof TwentyFirstNativeSourceContractError) {
+        if (error.nativeCode === "NATIVE_SOURCE_QUOTA_UNAVAILABLE") {
+          return "usage_unavailable";
+        }
+        if (error.nativeCode === "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE") {
+          return "unverified";
+        }
+        return "source_contract_incompatible";
+      }
+      if (error instanceof TwentyFirstToolContractError) {
+        return "source_contract_incompatible";
+      }
+      return "unverified";
+    }
+  }
+
   async inspectCapabilities(
     apiKey: string,
   ): Promise<TwentyFirstConnectionResult> {
@@ -711,7 +1166,9 @@ export class TwentyFirstClient {
     );
     const transport = this.createTransport(value);
     try {
-      const totalSignal = AbortSignal.timeout(timeoutMs);
+      const totalSignal = AbortSignal.timeout(
+        this.options.totalTimeoutMs ?? TWENTY_FIRST_TOTAL_TIMEOUT_MS,
+      );
       await client.connect(transport, this.requestOptions(totalSignal));
       const tools = await this.listAdvertisedTools(client, totalSignal);
       const byName = new Map<string, TwentyFirstAdvertisedTool>();
@@ -725,6 +1182,14 @@ export class TwentyFirstClient {
           "当前 21st 连接缺少安全的 search 能力",
         );
       }
+      const getComponent = byName.get("get_component");
+      const nativeVisualReadiness = await this.probeNativeVisualReadiness({
+        client,
+        totalSignal,
+        getComponent,
+        getUsage: byName.get("get_usage"),
+        search,
+      });
       const optionalCapability = (name: string) => {
         const tool = byName.get(name);
         return Boolean(tool && tool.annotations?.destructiveHint !== true);
@@ -739,6 +1204,7 @@ export class TwentyFirstClient {
           getUsage: optionalCapability("get_usage"),
           getTheme: optionalCapability("get_theme"),
         },
+        nativeVisualReadiness,
         server: server ? { name: server.name, version: server.version } : null,
       };
     } catch (error) {
@@ -798,6 +1264,7 @@ export class TwentyFirstClient {
         getComponent?.annotations?.destructiveHint === true
           ? undefined
           : getComponent;
+      const preferredSearchType = preferredSearchTypeForTool(search);
       const searchLimitKey = findToolInputKey(search, [
         "limit",
         "take",
@@ -816,12 +1283,14 @@ export class TwentyFirstClient {
         argumentValue: string | TwentyFirstProviderItemId,
         limit?: number,
         searchOptions?: Pick<TwentyFirstSearchRequest, "tag" | "sort">,
+        searchType?: TwentyFirstSearchRequest["type"],
       ) => {
         const args = buildTwentyFirstToolArguments({
           operation,
           tool,
           value: argumentValue,
           limit,
+          searchType,
           searchOptions,
         });
         const result = await client.callTool(
@@ -830,7 +1299,7 @@ export class TwentyFirstClient {
           this.requestOptions(totalSignal),
         );
         assertTwentyFirstJsonDepth(result);
-        if (result.isError === true) {
+        if (result.isError === true && operation === "search") {
           throw new AuthServiceError(
             "UPSTREAM_UNAVAILABLE",
             "21st 目录查询暂时不可用",
@@ -838,20 +1307,23 @@ export class TwentyFirstClient {
         }
         const payload = projectTwentyFirstToolPayload(
           result as Record<string, unknown>,
+          operation,
         );
         assertTwentyFirstJsonDepth(payload);
         return payload;
       };
       return await use({
         effectiveSearchLimit,
+        preferredSearchType,
         search: (input) => {
-          if (input.type !== "component") {
-            throw new TwentyFirstToolContractError();
-          }
-          return call("search", search, input.query, input.limit, {
-            tag: input.tag,
-            sort: input.sort,
-          });
+          return call(
+            "search",
+            search,
+            input.query,
+            input.limit,
+            { tag: input.tag, sort: input.sort },
+            input.type,
+          );
         },
         ...(safeGetComponent
           ? {
@@ -871,6 +1343,7 @@ export class TwentyFirstClient {
 function toCredentialStatus(
   credential?: PresalesApiCredential | null,
   capabilities?: TwentyFirstCapabilities,
+  nativeVisualReadiness: TwentyFirstNativeVisualReadiness = "unverified",
 ): TwentyFirstCredentialStatus {
   const visible = Boolean(credential && credential.status !== "deleted");
   const configured = Boolean(
@@ -896,6 +1369,7 @@ function toCredentialStatus(
     version: visible ? (credential?.version ?? null) : null,
     verifiedAt: visible ? (credential?.verifiedAt?.getTime() ?? null) : null,
     updatedAt: visible ? (credential?.updatedAt?.getTime() ?? null) : null,
+    nativeVisualReadiness,
     capabilities:
       capabilities ??
       (configured
@@ -938,6 +1412,18 @@ export async function replaceTwentyFirstApiCredential(
 ) {
   const value = validateTwentyFirstApiKeyInput(apiKey);
   const connection = await inspect(value);
+  if (connection.nativeVisualReadiness !== "ready") {
+    throw new AuthServiceError(
+      connection.nativeVisualReadiness === "missing_get_component"
+        ? "INVALID_CREDENTIAL"
+        : "UPSTREAM_UNAVAILABLE",
+      connection.nativeVisualReadiness === "missing_get_component"
+        ? "当前 21st 连接缺少安全的 get_component 能力"
+        : connection.nativeVisualReadiness === "usage_unavailable"
+          ? "当前 21st 原生源码读取额度暂不可用"
+          : "当前 21st 原生源码工具协议暂不兼容",
+    );
+  }
   const db = await requireDb();
   const existingRows = await db
     .select()
@@ -1010,7 +1496,11 @@ export async function replaceTwentyFirstApiCredential(
     await tx.insert(presalesApiCredentials).values(credential);
     return credential;
   });
-  return toCredentialStatus(inserted, connection.capabilities);
+  return toCredentialStatus(
+    inserted,
+    connection.capabilities,
+    connection.nativeVisualReadiness,
+  );
 }
 
 export async function getActiveTwentyFirstCredential() {

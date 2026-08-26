@@ -7,6 +7,7 @@ import { AuthServiceError } from "./auth-service";
 import { encryptPresalesApiKey } from "./presales-service";
 import {
   TwentyFirstClient,
+  TwentyFirstNativeSourceContractError,
   TwentyFirstToolContractError,
   TWENTY_FIRST_ACTIVE_OPERATION_STATUSES,
   assertTwentyFirstJsonDepth,
@@ -17,6 +18,7 @@ import {
   encryptTwentyFirstApiKey,
   hasActiveTwentyFirstConsumers,
   projectTwentyFirstToolPayload,
+  replaceTwentyFirstApiCredential,
   validateTwentyFirstApiKeyInput,
 } from "./twenty-first-service";
 
@@ -123,16 +125,151 @@ function createMcpFetch(tools: string[]) {
       return jsonRpcResponse(body.id!, {
         tools: tools.map((name) => ({
           name,
-          inputSchema: { type: "object", properties: {} },
+          inputSchema:
+            name === "search"
+              ? {
+                  type: "object",
+                  properties: {
+                    query: { type: "string" },
+                    type: {
+                      type: "string",
+                      enum: ["template", "component"],
+                    },
+                    limit: { type: "integer", minimum: 1, maximum: 18 },
+                  },
+                  required: ["query"],
+                }
+              : name === "get_component"
+                ? {
+                    type: "object",
+                    properties: { id: { type: "number" } },
+                    required: ["id"],
+                  }
+                : { type: "object", properties: {} },
         })),
       });
+    }
+    if (body.method === "tools/call") {
+      const call = body as unknown as {
+        id: string | number;
+        params: { name: string };
+      };
+      if (call.params.name === "get_usage") {
+        return jsonRpcResponse(call.id, {
+          content: [{ type: "text", text: "Usage is available." }],
+          isError: false,
+        });
+      }
+      if (call.params.name === "search") {
+        return jsonRpcResponse(call.id, {
+          structuredContent: { results: [{ id: 143 }] },
+          content: [],
+          isError: false,
+        });
+      }
+      if (call.params.name === "get_component") {
+        return jsonRpcResponse(call.id, {
+          structuredContent: { found: true, locked: false },
+          content: [
+            {
+              type: "text",
+              text: [
+                "Component Code:",
+                "```tsx",
+                "export default function Hero() { return <main />; }",
+                "```",
+              ].join("\n"),
+            },
+          ],
+          isError: false,
+        });
+      }
     }
     throw new Error(`unexpected MCP method: ${body.method}`);
   });
 }
 
+function createNativeProbeFetch(input: {
+  usageResult?: Record<string, unknown>;
+  searchResult: Record<string, unknown>;
+  componentResult?: Record<string, unknown>;
+}) {
+  const calls: string[] = [];
+  const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as {
+      id?: string | number;
+      method: string;
+      params?: { name: string };
+    };
+    if (body.method === "initialize") {
+      return jsonRpcResponse(body.id!, {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: {} },
+        serverInfo: { name: "21st-test", version: "1.0.0" },
+      });
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+    if (body.method === "tools/list") {
+      return jsonRpcResponse(body.id!, {
+        tools: [
+          {
+            name: "search",
+            inputSchema: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
+                limit: { type: "integer", minimum: 1, maximum: 18 },
+                type: { type: "string", enum: ["component"] },
+              },
+              required: ["query", "type"],
+            },
+          },
+          {
+            name: "get_component",
+            inputSchema: {
+              type: "object",
+              properties: { id: { type: "number" } },
+              required: ["id"],
+            },
+          },
+          {
+            name: "get_usage",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
+      });
+    }
+    if (body.method === "tools/call" && body.params) {
+      calls.push(body.params.name);
+      const result =
+        body.params.name === "get_usage"
+          ? (input.usageResult ?? {
+              content: [{ type: "text", text: "Usage available." }],
+              isError: false,
+            })
+          : body.params.name === "search"
+            ? input.searchResult
+            : (input.componentResult ?? {
+                structuredContent: { found: true, locked: false },
+                content: [
+                  {
+                    type: "text",
+                    text: "```tsx\nexport default function Page(){ return <main />; }\n```",
+                  },
+                ],
+                isError: false,
+              });
+      return jsonRpcResponse(body.id!, result);
+    }
+    throw new Error(`unexpected MCP method: ${body.method}`);
+  });
+  return { calls, fetchImpl };
+}
+
 describe("TwentyFirstClient", () => {
-  it("only initializes and lists tools with x-api-key, then projects capabilities", async () => {
+  it("discovers tools and performs one bounded native-source readiness probe", async () => {
     const fetchImpl = createMcpFetch(["search", "get_component", "get_usage"]);
     const result = await new TwentyFirstClient({
       fetchImpl: fetchImpl as unknown as typeof fetch,
@@ -148,6 +285,7 @@ describe("TwentyFirstClient", () => {
         getUsage: true,
         getTheme: false,
       },
+      nativeVisualReadiness: "ready",
       server: { name: "21st-test", version: "1.0.0" },
     });
     const methods = fetchImpl.mock.calls
@@ -157,8 +295,29 @@ describe("TwentyFirstClient", () => {
       "initialize",
       "notifications/initialized",
       "tools/list",
+      "tools/call",
+      "tools/call",
+      "tools/call",
     ]);
-    expect(methods).not.toContain("tools/call");
+    const toolCalls = fetchImpl.mock.calls
+      .filter(([, init]) => {
+        if (init?.body === undefined) return false;
+        const body = JSON.parse(String(init?.body));
+        return body.method === "tools/call";
+      })
+      .map(([, init]) => JSON.parse(String(init?.body)).params);
+    expect(toolCalls).toEqual([
+      { name: "get_usage", arguments: {} },
+      {
+        name: "search",
+        arguments: {
+          query: "responsive enterprise landing page",
+          type: "component",
+          limit: 1,
+        },
+      },
+      { name: "get_component", arguments: { id: 143 } },
+    ]);
     for (const [, init] of fetchImpl.mock.calls) {
       expect(new Headers(init?.headers).get("x-api-key")).toBe(
         "21st_sk_test_secret",
@@ -209,7 +368,7 @@ describe("TwentyFirstClient", () => {
     expect(cursors).toEqual([undefined, "cursor-1", "cursor-2"]);
   });
 
-  it("accepts a search-only catalog connection and projects optional tools honestly", async () => {
+  it("marks a search-only catalog connection unusable for native visuals", async () => {
     const fetchImpl = createMcpFetch(["search"]);
     await expect(
       new TwentyFirstClient({
@@ -224,6 +383,173 @@ describe("TwentyFirstClient", () => {
         getUsage: false,
         getTheme: false,
       },
+      nativeVisualReadiness: "missing_get_component",
+    });
+  });
+
+  it("reports an incompatible advertised get_component schema without calling it", async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        id?: string | number;
+        method: string;
+      };
+      if (body.method === "initialize") {
+        return jsonRpcResponse(body.id!, {
+          protocolVersion: "2025-03-26",
+          capabilities: { tools: {} },
+          serverInfo: { name: "21st-test", version: "1.0.0" },
+        });
+      }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "tools/list") {
+        return jsonRpcResponse(body.id!, {
+          tools: [
+            {
+              name: "search",
+              inputSchema: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+              },
+            },
+            {
+              name: "get_component",
+              inputSchema: {
+                type: "object",
+                properties: { opaque: { type: "object" } },
+                required: ["opaque"],
+              },
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected MCP method: ${body.method}`);
+    });
+
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({
+      capabilities: { search: true, getComponent: true },
+      nativeVisualReadiness: "source_contract_incompatible",
+    });
+    expect(
+      fetchImpl.mock.calls.some(([, init]) =>
+        String(init?.body).includes('"tools/call"'),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps an empty fixed-query catalog unverified without fabricating an ID", async () => {
+    const { calls, fetchImpl } = createNativeProbeFetch({
+      searchResult: {
+        structuredContent: { results: [] },
+        content: [],
+        isError: false,
+      },
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({ nativeVisualReadiness: "unverified" });
+    expect(calls).toEqual(["get_usage", "search"]);
+  });
+
+  it("stops before source reads when structured usage explicitly reports exhaustion", async () => {
+    const { calls, fetchImpl } = createNativeProbeFetch({
+      usageResult: {
+        structuredContent: {
+          usage: { sourceReadsRemaining: 0 },
+        },
+        content: [],
+        isError: false,
+      },
+      searchResult: {
+        structuredContent: { results: [{ id: 143 }] },
+        content: [],
+        isError: false,
+      },
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({ nativeVisualReadiness: "usage_unavailable" });
+    expect(calls).toEqual(["get_usage"]);
+  });
+
+  it("classifies an explicitly locked source probe as usage unavailable", async () => {
+    const { calls, fetchImpl } = createNativeProbeFetch({
+      searchResult: {
+        structuredContent: { results: [{ id: 143 }] },
+        content: [],
+        isError: false,
+      },
+      componentResult: {
+        structuredContent: { found: true, locked: true },
+        content: [{ type: "text", text: "private provider detail" }],
+        isError: true,
+      },
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({ nativeVisualReadiness: "usage_unavailable" });
+    expect(calls).toEqual(["get_usage", "search", "get_component"]);
+  });
+
+  it("classifies a changed successful source payload as contract incompatible", async () => {
+    const { fetchImpl } = createNativeProbeFetch({
+      searchResult: {
+        structuredContent: { results: [{ id: 143 }] },
+        content: [],
+        isError: false,
+      },
+      componentResult: {
+        structuredContent: { found: true, locked: false },
+        content: [{ type: "text", text: '{"status":"ok"}' }],
+        isError: false,
+      },
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({
+      nativeVisualReadiness: "source_contract_incompatible",
+    });
+  });
+
+  it("requires official source text to contain a bounded code block", async () => {
+    const { fetchImpl } = createNativeProbeFetch({
+      searchResult: {
+        structuredContent: { results: [{ id: 143 }] },
+        content: [],
+        isError: false,
+      },
+      componentResult: {
+        structuredContent: { found: true, locked: false },
+        content: [{ type: "text", text: "Component source is unavailable." }],
+        isError: false,
+      },
+    });
+    await expect(
+      new TwentyFirstClient({
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+      }).inspectCapabilities("21st_sk_test_secret"),
+    ).resolves.toMatchObject({
+      nativeVisualReadiness: "source_contract_incompatible",
     });
   });
 
@@ -375,7 +701,85 @@ describe("TwentyFirstClient", () => {
     }
   });
 
-  it("preserves provider ID primitives required by the advertised schema", () => {
+  it("keeps component search IDs when template search lacks a matching source tool", async () => {
+    const calls: Array<{ name: string; arguments: Record<string, unknown> }> =
+      [];
+    const fetchImpl = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        id?: string | number;
+        method: string;
+        params?: { name: string; arguments: Record<string, unknown> };
+      };
+      if (body.method === "initialize") {
+        return jsonRpcResponse(body.id!, {
+          protocolVersion: "2025-03-26",
+          capabilities: { tools: {} },
+          serverInfo: { name: "21st-test", version: "1.0.0" },
+        });
+      }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      if (body.method === "tools/list") {
+        return jsonRpcResponse(body.id!, {
+          tools: [
+            {
+              name: "search",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  query: { type: "string" },
+                  kind: { type: "string", enum: ["page", "component"] },
+                },
+                required: ["query", "kind"],
+              },
+            },
+            {
+              name: "get_component",
+              inputSchema: {
+                type: "object",
+                properties: { componentId: { type: "integer" } },
+                required: ["componentId"],
+              },
+            },
+          ],
+        });
+      }
+      if (body.method === "tools/call" && body.params) {
+        calls.push(body.params);
+        return jsonRpcResponse(body.id!, {
+          structuredContent: { results: [] },
+          content: [],
+          isError: false,
+        });
+      }
+      throw new Error(`unexpected MCP method: ${body.method}`);
+    });
+
+    const client = new TwentyFirstClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 1_000,
+    });
+    await client.withReadOnlySession("21st_sk_test_secret", async (session) => {
+      expect(session.preferredSearchType).toBe("component");
+      await session.search({
+        query: "enterprise landing page",
+        type: session.preferredSearchType!,
+        limit: 9,
+      });
+    });
+    expect(calls).toEqual([
+      {
+        name: "search",
+        arguments: {
+          query: "enterprise landing page",
+          kind: "component",
+        },
+      },
+    ]);
+  });
+
+  it("adapts numeric and string provider IDs to the advertised schema", () => {
     const numericTool = {
       name: "get_component",
       inputSchema: {
@@ -391,13 +795,33 @@ describe("TwentyFirstClient", () => {
         value: 143,
       }),
     ).toEqual({ id: 143 });
-    expect(() =>
+    expect(
       buildTwentyFirstToolArguments({
         operation: "get_component",
         tool: numericTool,
         value: "143",
       }),
+    ).toEqual({ id: 143 });
+    expect(() =>
+      buildTwentyFirstToolArguments({
+        operation: "get_component",
+        tool: numericTool,
+        value: "not-a-number",
+      }),
     ).toThrow(TwentyFirstToolContractError);
+    expect(
+      buildTwentyFirstToolArguments({
+        operation: "get_component",
+        tool: {
+          ...numericTool,
+          inputSchema: {
+            ...numericTool.inputSchema,
+            properties: { id: { type: "string" } },
+          },
+        },
+        value: 143,
+      }),
+    ).toEqual({ id: "143" });
   });
 
   it("derives required component type and bounded limit from the live search schema", () => {
@@ -438,6 +862,28 @@ describe("TwentyFirstClient", () => {
         limit: 5,
       }),
     ).toThrow(TwentyFirstToolContractError);
+
+    expect(
+      buildTwentyFirstToolArguments({
+        operation: "search",
+        tool: {
+          ...tool,
+          inputSchema: {
+            ...tool.inputSchema,
+            properties: {
+              ...tool.inputSchema.properties,
+              type: {
+                type: "string",
+                enum: ["page", "component"],
+              },
+            },
+          },
+        },
+        value: "landing page",
+        limit: 5,
+        searchType: "template",
+      }),
+    ).toEqual({ query: "landing page", type: "page", limit: 5 });
   });
 
   it("uses Hero tag and recommended sort only when the live schema advertises them", () => {
@@ -505,6 +951,90 @@ describe("TwentyFirstClient", () => {
         content: [{ type: "text", text: "x".repeat(1_000_001) }],
       }),
     ).toEqual({ status: "safe-fallback" });
+  });
+
+  it("projects the official bounded non-JSON get_component source envelope", () => {
+    const sourceText = [
+      "Component Code:",
+      "```tsx",
+      "export default function Hero() { return <main>企业官网</main>; }",
+      "```",
+      "Demo:",
+      "```tsx",
+      "import Hero from './hero'; export default () => <Hero />;",
+      "```",
+    ].join("\n");
+    expect(
+      projectTwentyFirstToolPayload(
+        {
+          structuredContent: { found: true, locked: false },
+          content: [{ type: "text", text: sourceText }],
+          isError: false,
+        },
+        "get_component",
+      ),
+    ).toEqual({
+      contractKind: "twenty_first_get_component_v1",
+      status: { found: true, locked: false },
+      sourceText,
+    });
+  });
+
+  it("classifies locked, missing and unknown get_component responses without reflecting text", () => {
+    for (const [structuredContent, nativeCode] of [
+      [{ found: true, locked: true }, "NATIVE_SOURCE_QUOTA_UNAVAILABLE"],
+      [{ found: false, locked: false }, "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE"],
+    ] as const) {
+      const error = (() => {
+        try {
+          projectTwentyFirstToolPayload(
+            {
+              structuredContent,
+              content: [{ type: "text", text: "provider-private-detail" }],
+            },
+            "get_component",
+          );
+        } catch (value) {
+          return value;
+        }
+      })();
+      expect(error).toBeInstanceOf(TwentyFirstNativeSourceContractError);
+      expect(error).toMatchObject({ nativeCode });
+      expect(String((error as Error).message)).not.toContain(
+        "provider-private-detail",
+      );
+    }
+
+    expect(() =>
+      projectTwentyFirstToolPayload(
+        {
+          structuredContent: { found: true, locked: false },
+          content: [{ type: "text", text: "unsafe\u0000source" }],
+        },
+        "get_component",
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        nativeCode: "NATIVE_SOURCE_CONTRACT_UNAVAILABLE",
+      }),
+    );
+  });
+
+  it("rejects saving a search-only credential before any database access", async () => {
+    await expect(
+      replaceTwentyFirstApiCredential(1, "21st_sk_test_secret", async () => ({
+        ok: true,
+        endpoint: "https://21st.dev/api/mcp",
+        capabilities: {
+          search: true,
+          getComponent: false,
+          getUsage: false,
+          getTheme: false,
+        },
+        nativeVisualReadiness: "missing_get_component",
+        server: null,
+      })),
+    ).rejects.toMatchObject({ code: "INVALID_CREDENTIAL" });
   });
 
   it("honors Retry-After once with a bounded delay for a read-only request", async () => {

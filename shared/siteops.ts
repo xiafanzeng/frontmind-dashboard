@@ -312,6 +312,22 @@ export const siteOpsCardKindSchema = z.enum([
   "release_status",
 ]);
 
+export const siteOpsNativeVisualFailureCategorySchema = z.enum([
+  "provider_quota",
+  "get_component_contract",
+  "source_incomplete",
+  "dependency_unsupported",
+  "source_unsafe",
+  "compile_failed",
+  "browser_unavailable",
+  "render_failed",
+  "deadline_exhausted",
+]);
+
+export type SiteOpsNativeVisualFailureCategory = z.infer<
+  typeof siteOpsNativeVisualFailureCategorySchema
+>;
+
 export const siteOpsCardSchema = z
   .object({
     kind: siteOpsCardKindSchema,
