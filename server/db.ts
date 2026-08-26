@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import { createPool } from "mysql2";
 import { InsertUser, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
@@ -9,7 +10,20 @@ let _db: ReturnType<typeof drizzle> | null = null;
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      const pool = createPool({
+        uri: process.env.DATABASE_URL,
+        timezone: "Z",
+      });
+      pool.on("connection", (connection) => {
+        connection.query("SET SESSION time_zone = '+00:00'", (error) => {
+          if (!error) return;
+          console.error("[Database] UTC session initialization failed", {
+            code: "DATABASE_UTC_SESSION_INIT_FAILED",
+          });
+          connection.destroy();
+        });
+      });
+      _db = drizzle(pool);
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;

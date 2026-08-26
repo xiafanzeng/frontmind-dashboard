@@ -750,9 +750,11 @@ export class TwentyFirstClient {
 
   /**
    * Opens one bounded read-only MCP session. The callback can invoke only the
-   * exact existing-catalog search tool discovered from tools/list. Optional
-   * catalog capabilities are exposed only when the server advertises them as
-   * non-destructive; SiteOps' normal path never needs component code.
+   * exact existing-catalog tools discovered from tools/list. Optional catalog
+   * capabilities are exposed only when the server advertises them as
+   * non-destructive. SiteOps workflow 2.5 requires get_component to retrieve
+   * the source behind a candidate; immutable older workflows remain
+   * search-preview based.
    */
   async withReadOnlySession<T>(
     apiKey: string,

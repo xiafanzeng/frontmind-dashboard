@@ -15,20 +15,17 @@ import {
   workspaceSiteProfiles,
   type SiteOperation,
 } from "../../drizzle/schema";
+import { SITEOPS_MATERIALIZER_V2_5 } from "../../shared/siteops";
 import { buildContractV2Schema } from "../../shared/siteops-design";
 import { runtimeErrorForLog } from "../_core/runtime-error-log";
 import { getDb } from "../db";
-import {
-  persistSiteOpsArtifact,
-  readSiteOpsArtifact,
-} from "./artifact-store";
-import {
-  AliyunCredential,
-  AliyunEsaClient,
-} from "./aliyun-sdk-constructors";
+import { persistSiteOpsArtifact, readSiteOpsArtifact } from "./artifact-store";
+import { AliyunCredential, AliyunEsaClient } from "./aliyun-sdk-constructors";
 import { materializeProductionSiteFromSource } from "./build-runtime";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import { fetchPinnedPublicHttps } from "./remote-preview";
+import { rebuildNativeReactProductionFromSource } from "./native-react-build-runtime";
+import { validateNativeReactSourceArchive } from "./native-react-source";
 import {
   APPROVED_RESET_UNPUBLISH,
   approvedResetUnpublishProjectMatches,
@@ -125,14 +122,23 @@ export type EsaOssPostConfig = {
 export interface EsaDirectApi {
   getRoutine(name: string): Promise<EsaRoutineView | null>;
   createRoutine(input: { name: string; description: string }): Promise<void>;
-  listCodeVersions(input: { name: string; marker: string }): Promise<EsaCodeVersionView[]>;
-  getCodeVersion(input: { name: string; codeVersion: string }): Promise<EsaCodeVersionView | null>;
+  listCodeVersions(input: {
+    name: string;
+    marker: string;
+  }): Promise<EsaCodeVersionView[]>;
+  getCodeVersion(input: {
+    name: string;
+    codeVersion: string;
+  }): Promise<EsaCodeVersionView | null>;
   createAssetsCodeVersion(input: {
     name: string;
     description: string;
     extraInfo: string;
   }): Promise<{ codeVersion: string; upload: EsaOssPostConfig }>;
-  createProductionDeployment(input: { name: string; codeVersion: string }): Promise<{ deploymentId: string }>;
+  createProductionDeployment(input: {
+    name: string;
+    codeVersion: string;
+  }): Promise<{ deploymentId: string }>;
   listSites(siteName: string): Promise<EsaSiteView[]>;
   createSite(input: {
     siteName: string;
@@ -145,8 +151,15 @@ export interface EsaDirectApi {
   }): Promise<void>;
   verifySite(siteId: number): Promise<boolean>;
   getMatchSite(recordName: string): Promise<EsaSiteView | null>;
-  listRelatedRecords(input: { name: string; recordName: string }): Promise<Array<{ recordId: number; recordName: string; siteId: number }>>;
-  createRelatedRecord(input: { name: string; recordName: string; siteId: number }): Promise<void>;
+  listRelatedRecords(input: {
+    name: string;
+    recordName: string;
+  }): Promise<Array<{ recordId: number; recordName: string; siteId: number }>>;
+  createRelatedRecord(input: {
+    name: string;
+    recordName: string;
+    siteId: number;
+  }): Promise<void>;
   deleteRelatedRecord(input: {
     name: string;
     recordId: number;
@@ -154,7 +167,10 @@ export interface EsaDirectApi {
     siteId: number;
   }): Promise<void>;
   deleteRoutine(name: string): Promise<void>;
-  listEdgeRoutineRecords(input: { siteId: number; recordName: string }): Promise<Array<{ recordName: string; recordCname: string }>>;
+  listEdgeRoutineRecords(input: {
+    siteId: number;
+    recordName: string;
+  }): Promise<Array<{ recordName: string; recordCname: string }>>;
 }
 
 type EsaProviderDependencies = {
@@ -162,6 +178,7 @@ type EsaProviderDependencies = {
   persistArtifact?: typeof persistSiteOpsArtifact;
   readArtifact?: typeof readSiteOpsArtifact;
   materializeProduction?: typeof materializeProductionSiteFromSource;
+  materializeNativeProduction?: typeof rebuildNativeReactProductionFromSource;
   fetch?: typeof globalThis.fetch;
   api?: EsaDirectApi;
   publicHttpsFetch?: typeof fetchPinnedPublicHttps;
@@ -171,7 +188,10 @@ class EsaProviderFailure extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly status: "failed" | "attention_required" | "outcome_unknown" = "attention_required",
+    readonly status:
+      | "failed"
+      | "attention_required"
+      | "outcome_unknown" = "attention_required",
     readonly result?: Record<string, unknown>,
   ) {
     super(message);
@@ -186,7 +206,9 @@ function errorText(error: unknown) {
 }
 
 function isNotFound(error: unknown) {
-  return /not.?found|does not exist|不存在|routine.*invalid/i.test(errorText(error));
+  return /not.?found|does not exist|不存在|routine.*invalid/i.test(
+    errorText(error),
+  );
 }
 
 function normalizeHostname(value: string) {
@@ -194,9 +216,15 @@ function normalizeHostname(value: string) {
   if (
     !hostname ||
     hostname.length > 253 ||
-    !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(hostname)
+    !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(
+      hostname,
+    )
   ) {
-    throw new EsaProviderFailure("ESA_HOSTNAME_INVALID", "ESA 绑定的 hostname 不是规范化 ASCII 域名。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_HOSTNAME_INVALID",
+      "ESA 绑定的 hostname 不是规范化 ASCII 域名。",
+      "failed",
+    );
   }
   return hostname;
 }
@@ -213,7 +241,11 @@ function dnsRr(hostname: string, zone: string) {
   if (hostname === zone) return "@";
   const suffix = `.${zone}`;
   if (!hostname.endsWith(suffix)) {
-    throw new EsaProviderFailure("ESA_HOSTNAME_ZONE_MISMATCH", "canonical hostname 不属于当前客户域名版本。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_HOSTNAME_ZONE_MISMATCH",
+      "canonical hostname 不属于当前客户域名版本。",
+      "failed",
+    );
   }
   return hostname.slice(0, -suffix.length);
 }
@@ -282,7 +314,9 @@ class OfficialEsaDirectApi implements EsaDirectApi {
 
   async getRoutine(name: string) {
     try {
-      const response = await this.client.getRoutine(new EsaModels.GetRoutineRequest({ name }));
+      const response = await this.client.getRoutine(
+        new EsaModels.GetRoutineRequest({ name }),
+      );
       return response.body ? mapRoutine(name, response.body) : null;
     } catch (error) {
       if (isNotFound(error)) return null;
@@ -292,19 +326,33 @@ class OfficialEsaDirectApi implements EsaDirectApi {
 
   async createRoutine(input: { name: string; description: string }) {
     const response = await this.client.createRoutine(
-      new EsaModels.CreateRoutineRequest({ name: input.name, description: input.description, hasAssets: true }),
+      new EsaModels.CreateRoutineRequest({
+        name: input.name,
+        description: input.description,
+        hasAssets: true,
+      }),
     );
-    if (response.body?.status !== "OK") throw new Error("ESA_CREATE_ROUTINE_REJECTED");
+    if (response.body?.status !== "OK")
+      throw new Error("ESA_CREATE_ROUTINE_REJECTED");
   }
 
   async listCodeVersions(input: { name: string; marker: string }) {
     const response = await this.client.listRoutineCodeVersions(
-      new EsaModels.ListRoutineCodeVersionsRequest({ name: input.name, pageNumber: 1, pageSize: 20, searchKeyWord: input.marker }),
+      new EsaModels.ListRoutineCodeVersionsRequest({
+        name: input.name,
+        pageNumber: 1,
+        pageSize: 20,
+        searchKeyWord: input.marker,
+      }),
     );
     return (response.body?.codeVersions ?? [])
       .map(mapVersion)
       .filter((entry): entry is EsaCodeVersionView => Boolean(entry))
-      .filter((entry) => entry.description === input.marker || entry.extraInfo?.includes(input.marker) === true);
+      .filter(
+        (entry) =>
+          entry.description === input.marker ||
+          entry.extraInfo?.includes(input.marker) === true,
+      );
   }
 
   async getCodeVersion(input: { name: string; codeVersion: string }) {
@@ -319,18 +367,32 @@ class OfficialEsaDirectApi implements EsaDirectApi {
     }
   }
 
-  async createAssetsCodeVersion(input: { name: string; description: string; extraInfo: string }) {
+  async createAssetsCodeVersion(input: {
+    name: string;
+    description: string;
+    extraInfo: string;
+  }) {
     const response = await this.client.createRoutineWithAssetsCodeVersion(
       new EsaModels.CreateRoutineWithAssetsCodeVersionRequest({
         name: input.name,
         codeDescription: input.description,
         extraInfo: input.extraInfo,
-        confOptions: new EsaModels.CreateRoutineWithAssetsCodeVersionRequestConfOptions({ notFoundStrategy: "404Page" }),
+        confOptions:
+          new EsaModels.CreateRoutineWithAssetsCodeVersionRequestConfOptions({
+            notFoundStrategy: "404Page",
+          }),
       }),
     );
     const body = response.body;
     const upload = body?.ossPostConfig;
-    if (!body?.codeVersion || !upload?.url || !upload.key || !upload.OSSAccessKeyId || !upload.policy || !upload.signature) {
+    if (
+      !body?.codeVersion ||
+      !upload?.url ||
+      !upload.key ||
+      !upload.OSSAccessKeyId ||
+      !upload.policy ||
+      !upload.signature
+    ) {
       throw new Error("ESA_UPLOAD_CONFIGURATION_INCOMPLETE");
     }
     return {
@@ -346,22 +408,36 @@ class OfficialEsaDirectApi implements EsaDirectApi {
     };
   }
 
-  async createProductionDeployment(input: { name: string; codeVersion: string }) {
+  async createProductionDeployment(input: {
+    name: string;
+    codeVersion: string;
+  }) {
     const response = await this.client.createRoutineCodeDeployment(
       new EsaModels.CreateRoutineCodeDeploymentRequest({
         name: input.name,
         env: "production",
         strategy: "percentage",
-        codeVersions: [new EsaModels.CreateRoutineCodeDeploymentRequestCodeVersions({ codeVersion: input.codeVersion, percentage: 100 })],
+        codeVersions: [
+          new EsaModels.CreateRoutineCodeDeploymentRequestCodeVersions({
+            codeVersion: input.codeVersion,
+            percentage: 100,
+          }),
+        ],
       }),
     );
-    if (!response.body?.deploymentId) throw new Error("ESA_DEPLOYMENT_ID_MISSING");
+    if (!response.body?.deploymentId)
+      throw new Error("ESA_DEPLOYMENT_ID_MISSING");
     return { deploymentId: response.body.deploymentId };
   }
 
   async listSites(siteName: string) {
     const response = await this.client.listSites(
-      new EsaModels.ListSitesRequest({ siteName, siteSearchType: "exact", pageNumber: 1, pageSize: 20 }),
+      new EsaModels.ListSitesRequest({
+        siteName,
+        siteSearchType: "exact",
+        pageNumber: 1,
+        pageSize: 20,
+      }),
     );
     return (response.body?.sites ?? [])
       .map(mapSite)
@@ -383,7 +459,10 @@ class OfficialEsaDirectApi implements EsaDirectApi {
       }),
     );
     if (!response.body?.siteId) throw new Error("ESA_SITE_ID_MISSING");
-    return { siteId: response.body.siteId, verifyCode: response.body.verifyCode ?? null };
+    return {
+      siteId: response.body.siteId,
+      verifyCode: response.body.verifyCode ?? null,
+    };
   }
 
   async updateSiteCoverage(input: {
@@ -396,16 +475,22 @@ class OfficialEsaDirectApi implements EsaDirectApi {
   }
 
   async verifySite(siteId: number) {
-    const response = await this.client.verifySite(new EsaModels.VerifySiteRequest({ siteId }));
+    const response = await this.client.verifySite(
+      new EsaModels.VerifySiteRequest({ siteId }),
+    );
     return response.body?.passed === true;
   }
 
   async getMatchSite(recordName: string) {
     try {
-      const response = await this.client.getMatchSite(new EsaModels.GetMatchSiteRequest({ recordName }));
+      const response = await this.client.getMatchSite(
+        new EsaModels.GetMatchSiteRequest({ recordName }),
+      );
       if (!response.body?.siteId || !response.body.siteName) return null;
       const sites = await this.listSites(response.body.siteName);
-      return sites.find((site) => site.siteId === response.body?.siteId) ?? null;
+      return (
+        sites.find((site) => site.siteId === response.body?.siteId) ?? null
+      );
     } catch (error) {
       if (isNotFound(error)) return null;
       throw error;
@@ -414,7 +499,12 @@ class OfficialEsaDirectApi implements EsaDirectApi {
 
   async listRelatedRecords(input: { name: string; recordName: string }) {
     const response = await this.client.listRoutineRelatedRecords(
-      new EsaModels.ListRoutineRelatedRecordsRequest({ name: input.name, pageNumber: 1, pageSize: 20, searchKeyWord: input.recordName }),
+      new EsaModels.ListRoutineRelatedRecordsRequest({
+        name: input.name,
+        pageNumber: 1,
+        pageSize: 20,
+        searchKeyWord: input.recordName,
+      }),
     );
     return (response.body?.relatedRecords ?? [])
       .filter(
@@ -430,11 +520,16 @@ class OfficialEsaDirectApi implements EsaDirectApi {
       }));
   }
 
-  async createRelatedRecord(input: { name: string; recordName: string; siteId: number }) {
+  async createRelatedRecord(input: {
+    name: string;
+    recordName: string;
+    siteId: number;
+  }) {
     const response = await this.client.createRoutineRelatedRecord(
       new EsaModels.CreateRoutineRelatedRecordRequest(input),
     );
-    if (response.body?.status !== "OK") throw new Error("ESA_RELATED_RECORD_REJECTED");
+    if (response.body?.status !== "OK")
+      throw new Error("ESA_RELATED_RECORD_REJECTED");
   }
 
   async deleteRelatedRecord(input: {
@@ -472,27 +567,50 @@ class OfficialEsaDirectApi implements EsaDirectApi {
 
   async listEdgeRoutineRecords(input: { siteId: number; recordName: string }) {
     const response = await this.client.listEdgeRoutineRecords(
-      new EsaModels.ListEdgeRoutineRecordsRequest({ siteId: input.siteId, recordName: input.recordName, recordMatchType: "exact", pageNumber: 1, pageSize: 20 }),
+      new EsaModels.ListEdgeRoutineRecordsRequest({
+        siteId: input.siteId,
+        recordName: input.recordName,
+        recordMatchType: "exact",
+        pageNumber: 1,
+        pageSize: 20,
+      }),
     );
     return (response.body?.records ?? [])
-      .filter((entry) => entry.recordName === input.recordName && Boolean(entry.recordCname))
-      .map((entry) => ({ recordName: String(entry.recordName), recordCname: String(entry.recordCname) }));
+      .filter(
+        (entry) =>
+          entry.recordName === input.recordName && Boolean(entry.recordCname),
+      )
+      .map((entry) => ({
+        recordName: String(entry.recordName),
+        recordCname: String(entry.recordCname),
+      }));
   }
 }
 
-async function streamToBuffer(stream: NodeJS.ReadableStream, expectedBytes: number) {
+async function streamToBuffer(
+  stream: NodeJS.ReadableStream,
+  expectedBytes: number,
+) {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of stream) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buffer.length;
     if (total > expectedBytes || total > MAX_DIST_ZIP_BYTES) {
-      throw new EsaProviderFailure("ESA_DIST_SIZE_INVALID", "官网 dist ZIP 大小与冻结产物不一致。", "failed");
+      throw new EsaProviderFailure(
+        "ESA_DIST_SIZE_INVALID",
+        "官网 dist ZIP 大小与冻结产物不一致。",
+        "failed",
+      );
     }
     chunks.push(buffer);
   }
   if (total !== expectedBytes) {
-    throw new EsaProviderFailure("ESA_DIST_SIZE_INVALID", "官网 dist ZIP 大小与冻结产物不一致。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_DIST_SIZE_INVALID",
+      "官网 dist ZIP 大小与冻结产物不一致。",
+      "failed",
+    );
   }
   return Buffer.concat(chunks, total);
 }
@@ -503,20 +621,40 @@ export async function packageEsaStaticAssets(input: {
   deploymentId: string;
   distHash: string;
 }) {
-  if (input.distZip.byteLength === 0 || input.distZip.byteLength > MAX_DIST_ZIP_BYTES || !/^[a-f0-9]{64}$/u.test(input.distHash)) {
-    throw new EsaProviderFailure("ESA_DIST_SIZE_INVALID", "冻结的官网 dist ZIP 无效。", "failed");
+  if (
+    input.distZip.byteLength === 0 ||
+    input.distZip.byteLength > MAX_DIST_ZIP_BYTES ||
+    !/^[a-f0-9]{64}$/u.test(input.distHash)
+  ) {
+    throw new EsaProviderFailure(
+      "ESA_DIST_SIZE_INVALID",
+      "冻结的官网 dist ZIP 无效。",
+      "failed",
+    );
   }
-  const source = await JSZip.loadAsync(input.distZip, { checkCRC32: true, createFolders: false });
+  const source = await JSZip.loadAsync(input.distZip, {
+    checkCRC32: true,
+    createFolders: false,
+  });
   const files = Object.values(source.files).filter((entry) => !entry.dir);
   if (files.length === 0 || files.length > MAX_DIST_FILES) {
-    throw new EsaProviderFailure("ESA_DIST_FILE_COUNT_INVALID", "官网 dist ZIP 文件数量超出允许范围。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_DIST_FILE_COUNT_INVALID",
+      "官网 dist ZIP 文件数量超出允许范围。",
+      "failed",
+    );
   }
   const target = new JSZip();
   const stableDate = new Date("2000-01-01T00:00:00.000Z");
   let expanded = 0;
-  for (const entry of files.sort((left, right) => left.name.localeCompare(right.name))) {
-    const original = (entry as typeof entry & { unsafeOriginalName?: string }).unsafeOriginalName;
-    const unixPermissions = (entry as typeof entry & { unixPermissions?: number }).unixPermissions;
+  for (const entry of files.sort((left, right) =>
+    left.name.localeCompare(right.name),
+  )) {
+    const original = (entry as typeof entry & { unsafeOriginalName?: string })
+      .unsafeOriginalName;
+    const unixPermissions = (
+      entry as typeof entry & { unixPermissions?: number }
+    ).unixPermissions;
     const name = entry.name.normalize("NFKC").replace(/^\/+|\/+$/gu, "");
     if (
       !name ||
@@ -528,12 +666,20 @@ export async function packageEsaStaticAssets(input: {
         (unixPermissions & 0o170000) === 0o120000) ||
       name === FRONTMIND_MARKER_PATH
     ) {
-      throw new EsaProviderFailure("ESA_DIST_PATH_INVALID", "官网 dist ZIP 包含不安全路径或保留文件名。", "failed");
+      throw new EsaProviderFailure(
+        "ESA_DIST_PATH_INVALID",
+        "官网 dist ZIP 包含不安全路径或保留文件名。",
+        "failed",
+      );
     }
     const bytes = await entry.async("nodebuffer");
     expanded += bytes.byteLength;
     if (expanded > MAX_DIST_EXPANDED_BYTES) {
-      throw new EsaProviderFailure("ESA_DIST_EXPANDED_SIZE_INVALID", "官网 dist ZIP 解压后超过安全上限。", "failed");
+      throw new EsaProviderFailure(
+        "ESA_DIST_EXPANDED_SIZE_INVALID",
+        "官网 dist ZIP 解压后超过安全上限。",
+        "failed",
+      );
     }
     target.file(`assets/${name}`, bytes, { date: stableDate });
   }
@@ -558,11 +704,18 @@ async function persistBoundary(
   providerOperationId?: string,
 ) {
   if (!operation.leaseOwner) {
-    throw new EsaProviderFailure("ESA_OPERATION_LEASE_MISSING", "ESA 操作缺少有效租约，未提交外部变更。");
+    throw new EsaProviderFailure(
+      "ESA_OPERATION_LEASE_MISSING",
+      "ESA 操作缺少有效租约，未提交外部变更。",
+    );
   }
   await db
     .update(siteOperations)
-    .set({ result, ...(providerOperationId ? { providerOperationId } : {}), updatedAt: new Date() })
+    .set({
+      result,
+      ...(providerOperationId ? { providerOperationId } : {}),
+      updatedAt: new Date(),
+    })
     .where(
       and(
         eq(siteOperations.id, operation.id),
@@ -576,8 +729,7 @@ function mutationAffectedRows(result: unknown) {
   return Number(
     (Array.isArray(result)
       ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
-      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
-      0,
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ?? 0,
   );
 }
 
@@ -851,10 +1003,7 @@ async function handleApprovedResetUnpublish(input: {
     const pendingRelation = related.find(
       (entry) => entry.recordId === pendingRecordId,
     );
-    if (
-      pendingRelation &&
-      state.stage === "related_record_delete_unknown"
-    ) {
+    if (pendingRelation && state.stage === "related_record_delete_unknown") {
       if ((input.operation.attempt ?? 0) - stageStartedAttempt < 5) {
         return pendingState(state);
       }
@@ -889,11 +1038,7 @@ async function handleApprovedResetUnpublish(input: {
         relatedRecordId: relation.recordId,
         siteId: relation.siteId,
       };
-      await persistApprovedResetBoundary(
-        input.db,
-        input.operation,
-        boundary,
-      );
+      await persistApprovedResetBoundary(input.db, input.operation, boundary);
       input.signal.throwIfAborted();
       try {
         await input.api.deleteRelatedRecord({
@@ -940,7 +1085,10 @@ async function handleApprovedResetUnpublish(input: {
     });
   }
   if (state.stage === "routine_delete_unknown") {
-    if ((input.operation.attempt ?? 0) - Number(state.stageStartedAttempt ?? 0) < 5) {
+    if (
+      (input.operation.attempt ?? 0) - Number(state.stageStartedAttempt ?? 0) <
+      5
+    ) {
       return pendingState(state);
     }
     throw new EsaProviderFailure(
@@ -951,7 +1099,10 @@ async function handleApprovedResetUnpublish(input: {
     );
   }
   if (state.stage === "routine_delete_propagating") {
-    if ((input.operation.attempt ?? 0) - Number(state.stageStartedAttempt ?? 0) < 10) {
+    if (
+      (input.operation.attempt ?? 0) - Number(state.stageStartedAttempt ?? 0) <
+      10
+    ) {
       return pendingState(state);
     }
     throw new EsaProviderFailure(
@@ -1008,10 +1159,19 @@ async function loadDeploymentContext(db: DbExecutor, operation: SiteOperation) {
         eq(siteBuilds.userId, siteDeployments.userId),
       ),
     )
-    .where(and(eq(siteDeployments.operationId, operation.id), eq(siteDeployments.userId, operation.userId)))
+    .where(
+      and(
+        eq(siteDeployments.operationId, operation.id),
+        eq(siteDeployments.userId, operation.userId),
+      ),
+    )
     .limit(1);
   if (!rows[0]) {
-    throw new EsaProviderFailure("ESA_DEPLOYMENT_CONTEXT_NOT_FOUND", "ESA 发布记录不存在。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_DEPLOYMENT_CONTEXT_NOT_FOUND",
+      "ESA 发布记录不存在。",
+      "failed",
+    );
   }
   return rows[0];
 }
@@ -1044,8 +1204,7 @@ function assertFrozenProductionMaterialization(input: {
     materialization.target !== context.deployment.target ||
     materialization.sourceLocalAssetId !== context.build.sourceLocalAssetId ||
     materialization.sourceSha256 !== context.build.sourceHash ||
-    materialization.distLocalAssetId !==
-      context.deployment.distLocalAssetId ||
+    materialization.distLocalAssetId !== context.deployment.distLocalAssetId ||
     materialization.distSha256 !== context.deployment.distHash
   ) {
     throw new EsaProviderFailure(
@@ -1089,6 +1248,83 @@ async function persistCheckedArtifact(input: {
  * first ESA mutation. A retry either consumes this exact record or fails
  * closed; it can never fall back to the build's preview/noindex dist.
  */
+export async function materializeSiteOpsProductionSource(input: {
+  sourceZip: Buffer;
+  sourceSha256: string;
+  build: Pick<
+    typeof siteBuilds.$inferSelect,
+    | "id"
+    | "projectId"
+    | "knowledgeSnapshotId"
+    | "workflowVersion"
+    | "selectionHash"
+    | "brief"
+  >;
+  target: "global_excluding_cn" | "mainland_cn";
+  canonicalOrigin: string;
+  materializeProduction: typeof materializeProductionSiteFromSource;
+  materializeNativeProduction: typeof rebuildNativeReactProductionFromSource;
+  signal: AbortSignal;
+}) {
+  if (
+    input.build.workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion
+  ) {
+    return await input.materializeProduction({
+      sourceZip: input.sourceZip,
+      expectedSourceSha256: input.sourceSha256,
+      canonicalOrigin: input.canonicalOrigin,
+      target: input.target,
+      timeoutMs: 70_000,
+      abortSignal: input.signal,
+    });
+  }
+  const archive = await JSZip.loadAsync(input.sourceZip, { checkCRC32: true });
+  const fileCount = Object.values(archive.files).filter(
+    (entry) => !entry.dir,
+  ).length;
+  const validatedSource = await validateNativeReactSourceArchive({
+    archive: input.sourceZip,
+    receipt: {
+      operationToken: "frontmind-production-rebuild",
+      baseSourceSha256: input.sourceSha256,
+      archiveSha256: input.sourceSha256,
+      fileCount,
+    },
+    expectedOperationToken: "frontmind-production-rebuild",
+    expectedBaseSourceSha256: input.sourceSha256,
+  });
+  const native = await input.materializeNativeProduction({
+    sourceZip: input.sourceZip,
+    validatedSource,
+    build: {
+      id: input.build.id,
+      projectId: input.build.projectId,
+      knowledgeSnapshotId: input.build.knowledgeSnapshotId,
+      workflowVersion: input.build.workflowVersion,
+      selectionHash: input.build.selectionHash,
+    },
+    brief: input.build.brief,
+    canonicalOrigin: input.canonicalOrigin,
+    target: input.target,
+    timeoutMs: 70_000,
+    abortSignal: input.signal,
+  });
+  return {
+    contractJson: native.contractJson,
+    contractSha256: native.contractSha256,
+    sourceZip: native.sourceZip,
+    sourceSha256: native.sourceSha256,
+    distZip: native.distZip,
+    distSha256: native.distSha256,
+    qaZip: native.visualQaZip,
+    qaSha256: native.visualQaSha256,
+    qaReport: JSON.parse(native.qaJson.toString("utf8")),
+    buildDelivery: native.buildDelivery as never,
+    provenanceJson: native.provenanceJson,
+    provenanceSha256: native.provenanceSha256,
+  } satisfies Awaited<ReturnType<typeof materializeProductionSiteFromSource>>;
+}
+
 async function ensureProductionMaterialization(input: {
   db: DbExecutor;
   operation: SiteOperation;
@@ -1097,6 +1333,7 @@ async function ensureProductionMaterialization(input: {
   readArtifact: typeof readSiteOpsArtifact;
   persistArtifact: typeof persistSiteOpsArtifact;
   materializeProduction: typeof materializeProductionSiteFromSource;
+  materializeNativeProduction: typeof rebuildNativeReactProductionFromSource;
   signal: AbortSignal;
 }) {
   const existing = materializationFromVerification(
@@ -1149,13 +1386,15 @@ async function ensureProductionMaterialization(input: {
   );
   let output: Awaited<ReturnType<typeof materializeProductionSiteFromSource>>;
   try {
-    output = await input.materializeProduction({
+    output = await materializeSiteOpsProductionSource({
       sourceZip,
-      expectedSourceSha256: input.context.build.sourceHash,
-      canonicalOrigin: input.canonicalOrigin,
+      sourceSha256: input.context.build.sourceHash,
+      build: input.context.build,
       target: input.context.deployment.target,
-      timeoutMs: 70_000,
-      abortSignal: input.signal,
+      canonicalOrigin: input.canonicalOrigin,
+      materializeProduction: input.materializeProduction,
+      materializeNativeProduction: input.materializeNativeProduction,
+      signal: input.signal,
     });
   } catch (error) {
     throw new EsaProviderFailure(
@@ -1164,13 +1403,29 @@ async function ensureProductionMaterialization(input: {
       "failed",
     );
   }
-  const contract = buildContractV2Schema.parse(
-    JSON.parse(output.contractJson.toString("utf8")),
-  );
+  const contractValue = JSON.parse(
+    output.contractJson.toString("utf8"),
+  ) as Record<string, unknown>;
+  const nativeContract =
+    contractValue.contractKind === "twenty_first_native_build_contract";
+  const contractValid = nativeContract
+    ? contractValue.renderer === "twenty_first_native_react_v1" &&
+      contractValue.buildId === input.context.build.id &&
+      contractValue.projectId === input.context.build.projectId &&
+      contractValue.mode === "production" &&
+      contractValue.canonicalOrigin === input.canonicalOrigin &&
+      contractValue.target === input.context.deployment.target &&
+      contractValue.sourceSha256 === input.context.build.sourceHash
+    : (() => {
+        const contract = buildContractV2Schema.parse(contractValue);
+        return (
+          contract.seo.environment === "production" &&
+          contract.target.environment === input.context.deployment.target &&
+          contract.target.canonicalOrigin === input.canonicalOrigin
+        );
+      })();
   if (
-    contract.seo.environment !== "production" ||
-    contract.target.environment !== input.context.deployment.target ||
-    contract.target.canonicalOrigin !== input.canonicalOrigin ||
+    !contractValid ||
     output.qaReport.mode !== "production" ||
     output.qaReport.passed !== true
   ) {
@@ -1305,7 +1560,11 @@ async function ensureRoutine(input: {
   const existing = await input.api.getRoutine(input.name);
   if (existing) {
     if (!existing.hasAssets) {
-      throw new EsaProviderFailure("ESA_ROUTINE_TYPE_MISMATCH", "同名 ESA Routine 不是静态资产项目。", "failed");
+      throw new EsaProviderFailure(
+        "ESA_ROUTINE_TYPE_MISMATCH",
+        "同名 ESA Routine 不是静态资产项目。",
+        "failed",
+      );
     }
     return existing;
   }
@@ -1316,7 +1575,11 @@ async function ensureRoutine(input: {
       "ESA Routine 创建响应丢失且只读查询未找到唯一结果；系统没有重复创建。",
     );
   }
-  const next = { ...input.state, stage: "routine_create_unknown", routineName: input.name };
+  const next = {
+    ...input.state,
+    stage: "routine_create_unknown",
+    routineName: input.name,
+  };
   await persistBoundary(input.db, input.operation, next);
   try {
     await input.api.createRoutine({
@@ -1401,16 +1664,30 @@ async function uploadOssForm(input: {
       ossHostname.endsWith(".aliyuncs.com.cn")
     )
   ) {
-    throw new EsaProviderFailure("ESA_OSS_UPLOAD_URL_UNSAFE", "ESA 返回了不安全的 OSS 上传地址。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_OSS_UPLOAD_URL_UNSAFE",
+      "ESA 返回了不安全的 OSS 上传地址。",
+      "failed",
+    );
   }
   const form = new FormData();
   form.set("OSSAccessKeyId", input.upload.accessKeyId);
   form.set("Signature", input.upload.signature);
-  if (input.upload.securityToken) form.set("x-oss-security-token", input.upload.securityToken);
+  if (input.upload.securityToken)
+    form.set("x-oss-security-token", input.upload.securityToken);
   form.set("policy", input.upload.policy);
   form.set("key", input.upload.key);
-  form.set("file", new Blob([new Uint8Array(input.packageBytes)], { type: "application/zip" }), "siteops-assets.zip");
-  const response = await input.fetchImpl(url, { method: "POST", body: form, redirect: "error", signal: input.signal });
+  form.set(
+    "file",
+    new Blob([new Uint8Array(input.packageBytes)], { type: "application/zip" }),
+    "siteops-assets.zip",
+  );
+  const response = await input.fetchImpl(url, {
+    method: "POST",
+    body: form,
+    redirect: "error",
+    signal: input.signal,
+  });
   if (response.status !== 200 && response.status !== 204) {
     throw new EsaProviderFailure(
       `ESA_OSS_UPLOAD_HTTP_${response.status}`,
@@ -1422,7 +1699,11 @@ async function uploadOssForm(input: {
 async function readResponseTextBounded(response: Response, maxBytes: number) {
   const declared = Number(response.headers.get("content-length") ?? 0);
   if (Number.isFinite(declared) && declared > maxBytes) {
-    throw new EsaProviderFailure("ESA_PUBLIC_RESPONSE_TOO_LARGE", "ESA 线上验证响应超过安全上限。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_PUBLIC_RESPONSE_TOO_LARGE",
+      "ESA 线上验证响应超过安全上限。",
+      "failed",
+    );
   }
   if (!response.body) return "";
   const reader = response.body.getReader();
@@ -1436,7 +1717,11 @@ async function readResponseTextBounded(response: Response, maxBytes: number) {
       total += value.byteLength;
       if (total > maxBytes) {
         await reader.cancel();
-        throw new EsaProviderFailure("ESA_PUBLIC_RESPONSE_TOO_LARGE", "ESA 线上验证响应超过安全上限。", "failed");
+        throw new EsaProviderFailure(
+          "ESA_PUBLIC_RESPONSE_TOO_LARGE",
+          "ESA 线上验证响应超过安全上限。",
+          "failed",
+        );
       }
       text += decoder.decode(value, { stream: true });
     }
@@ -1452,7 +1737,9 @@ function available(status: string) {
 }
 
 function initializing(status: string) {
-  return ["", "init", "initializing", "processing", "pending"].includes(status.trim().toLowerCase());
+  return ["", "init", "initializing", "processing", "pending"].includes(
+    status.trim().toLowerCase(),
+  );
 }
 
 async function resolveCodeVersion(input: {
@@ -1466,10 +1753,19 @@ async function resolveCodeVersion(input: {
   readArtifact: typeof readSiteOpsArtifact;
   signal: AbortSignal;
 }) {
-  const marker = versionMarker(input.context.deployment.id, input.context.deployment.distHash);
-  let codeVersion = typeof input.state.codeVersion === "string" ? input.state.codeVersion : null;
+  const marker = versionMarker(
+    input.context.deployment.id,
+    input.context.deployment.distHash,
+  );
+  let codeVersion =
+    typeof input.state.codeVersion === "string"
+      ? input.state.codeVersion
+      : null;
   if (!codeVersion && input.state.stage === "version_create_unknown") {
-    const matches = await input.api.listCodeVersions({ name: input.name, marker });
+    const matches = await input.api.listCodeVersions({
+      name: input.name,
+      marker,
+    });
     if (matches.length === 0 && (input.operation.attempt ?? 0) < 5) return null;
     if (matches.length !== 1) {
       throw new EsaProviderFailure(
@@ -1482,8 +1778,15 @@ async function resolveCodeVersion(input: {
     codeVersion = matches[0].codeVersion;
   }
   if (codeVersion) {
-    const info = await input.api.getCodeVersion({ name: input.name, codeVersion });
-    if (!info) throw new EsaProviderFailure("ESA_CODE_VERSION_NOT_FOUND", "已冻结的 ESA 代码版本不存在。");
+    const info = await input.api.getCodeVersion({
+      name: input.name,
+      codeVersion,
+    });
+    if (!info)
+      throw new EsaProviderFailure(
+        "ESA_CODE_VERSION_NOT_FOUND",
+        "已冻结的 ESA 代码版本不存在。",
+      );
     if (available(info.status)) return codeVersion;
     if (initializing(info.status)) {
       if ((input.operation.attempt ?? 0) < 30) return null;
@@ -1492,7 +1795,11 @@ async function resolveCodeVersion(input: {
         "ESA 静态资产版本长时间未完成；系统没有重复上传。",
       );
     }
-    throw new EsaProviderFailure("ESA_CODE_VERSION_FAILED", `ESA 静态资产版本处理失败：${info.status || "unknown"}`, "failed");
+    throw new EsaProviderFailure(
+      "ESA_CODE_VERSION_FAILED",
+      `ESA 静态资产版本处理失败：${info.status || "unknown"}`,
+      "failed",
+    );
   }
   const artifact = await input.readArtifact({
     userId: input.operation.userId,
@@ -1500,14 +1807,27 @@ async function resolveCodeVersion(input: {
     expectedSha256: input.context.deployment.distHash,
     expectedMimeTypes: ["application/zip"],
   });
-  if (!artifact) throw new EsaProviderFailure("ESA_DIST_NOT_FOUND", "冻结的官网 dist ZIP 不存在。", "failed");
-  const dist = await streamToBuffer(artifact.stored.createReadStream(), artifact.row.sizeBytes);
+  if (!artifact)
+    throw new EsaProviderFailure(
+      "ESA_DIST_NOT_FOUND",
+      "冻结的官网 dist ZIP 不存在。",
+      "failed",
+    );
+  const dist = await streamToBuffer(
+    artifact.stored.createReadStream(),
+    artifact.row.sizeBytes,
+  );
   const packageBytes = await packageEsaStaticAssets({
     distZip: dist,
     deploymentId: input.context.deployment.id,
     distHash: input.context.deployment.distHash,
   });
-  const createState = { ...input.state, stage: "version_create_unknown", routineName: input.name, marker };
+  const createState = {
+    ...input.state,
+    stage: "version_create_unknown",
+    routineName: input.name,
+    marker,
+  };
   await persistBoundary(input.db, input.operation, createState);
   let created: Awaited<ReturnType<EsaDirectApi["createAssetsCodeVersion"]>>;
   try {
@@ -1524,15 +1844,27 @@ async function resolveCodeVersion(input: {
   } catch {
     return null;
   }
-  const uploadState = { ...createState, stage: "upload_unknown", codeVersion: created.codeVersion };
+  const uploadState = {
+    ...createState,
+    stage: "upload_unknown",
+    codeVersion: created.codeVersion,
+  };
   await persistBoundary(input.db, input.operation, uploadState);
   try {
-    await uploadOssForm({ fetchImpl: input.fetchImpl, upload: created.upload, packageBytes, signal: input.signal });
+    await uploadOssForm({
+      fetchImpl: input.fetchImpl,
+      upload: created.upload,
+      packageBytes,
+      signal: input.signal,
+    });
   } catch (error) {
     if (error instanceof EsaProviderFailure) throw error;
     return null;
   }
-  await persistBoundary(input.db, input.operation, { ...uploadState, stage: "version_processing" });
+  await persistBoundary(input.db, input.operation, {
+    ...uploadState,
+    stage: "version_processing",
+  });
   return null;
 }
 
@@ -1575,7 +1907,11 @@ async function verifyLiveSite(input: {
     (marker as any).deploymentId !== input.deploymentId ||
     (marker as any).distSha256 !== input.expectedDistHash
   ) {
-    throw new EsaProviderFailure("ESA_PUBLIC_FINGERPRINT_INVALID", "线上静态标记与冻结 dist 摘要不一致，当前 live head 保持不变。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_PUBLIC_FINGERPRINT_INVALID",
+      "线上静态标记与冻结 dist 摘要不一致，当前 live head 保持不变。",
+      "failed",
+    );
   }
   try {
     ({ response } = await input.publicHttpsFetch({
@@ -1593,10 +1929,24 @@ async function verifyLiveSite(input: {
     );
   }
   const html = await readResponseTextBounded(response, 5 * 1024 * 1024);
-  if (!response.ok || !response.headers.get("content-type")?.toLowerCase().includes("text/html") || html.length < 100) {
-    throw new EsaProviderFailure("ESA_PUBLIC_HTML_INVALID", "ESA 线上首页未通过 HTTPS/HTML 验证。", "failed");
+  if (
+    !response.ok ||
+    !response.headers
+      .get("content-type")
+      ?.toLowerCase()
+      .includes("text/html") ||
+    html.length < 100
+  ) {
+    throw new EsaProviderFailure(
+      "ESA_PUBLIC_HTML_INVALID",
+      "ESA 线上首页未通过 HTTPS/HTML 验证。",
+      "failed",
+    );
   }
-  const escaped = input.expectedHostname.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const escaped = input.expectedHostname.replace(
+    /[.*+?^${}()|[\]\\]/gu,
+    "\\$&",
+  );
   const canonicalPatterns = [
     new RegExp(
       `<link[^>]+rel=["']canonical["'][^>]+href=["']https://${escaped}/?["']`,
@@ -1608,7 +1958,11 @@ async function verifyLiveSite(input: {
     ),
   ];
   if (!canonicalPatterns.some((pattern) => pattern.test(html))) {
-    throw new EsaProviderFailure("ESA_CANONICAL_INVALID", "线上首页 canonical 与当前 hostname 不一致。", "failed");
+    throw new EsaProviderFailure(
+      "ESA_CANONICAL_INVALID",
+      "线上首页 canonical 与当前 hostname 不一致。",
+      "failed",
+    );
   }
   return {
     https: true,
@@ -1659,9 +2013,15 @@ async function upsertDnsExpectation(input: {
     return;
   }
   if (current.domainAscii !== input.domain || current.remarkMarker !== marker) {
-    throw new EsaProviderFailure("ESA_DNS_EXPECTATION_CONFLICT", "当前域名版本已有不同所有权的 DNS 期望记录。");
+    throw new EsaProviderFailure(
+      "ESA_DNS_EXPECTATION_CONFLICT",
+      "当前域名版本已有不同所有权的 DNS 期望记录。",
+    );
   }
-  if (current.expectedValue !== input.value || current.expectedTtl !== DNS_TTL) {
+  if (
+    current.expectedValue !== input.value ||
+    current.expectedTtl !== DNS_TTL
+  ) {
     await input.db
       .update(siteDnsRecords)
       .set({
@@ -1692,7 +2052,12 @@ async function handlePrepareDomainBinding(input: {
     input.db
       .select()
       .from(siteProjects)
-      .where(and(eq(siteProjects.id, input.operation.projectId), eq(siteProjects.userId, input.operation.userId)))
+      .where(
+        and(
+          eq(siteProjects.id, input.operation.projectId),
+          eq(siteProjects.userId, input.operation.userId),
+        ),
+      )
       .limit(1),
   ]);
   const profile = profileRows[0];
@@ -1706,14 +2071,20 @@ async function handlePrepareDomainBinding(input: {
     profile.domainOwnershipStatus !== "verified" ||
     profile.domainStatus !== "completed"
   ) {
-    throw new EsaProviderFailure("ESA_DOMAIN_REVISION_INVALID", "ESA DNS 计划不属于当前已验证域名版本。");
+    throw new EsaProviderFailure(
+      "ESA_DOMAIN_REVISION_INVALID",
+      "ESA DNS 计划不属于当前已验证域名版本。",
+    );
   }
   const hostname = normalizeHostname(project.canonicalHostname ?? domain);
   const rr = dnsRr(hostname, domain);
   const state = (input.operation.result ?? {}) as Record<string, unknown>;
   let sites = await input.api.listSites(domain);
   if (sites.length > 1) {
-    throw new EsaProviderFailure("ESA_SITE_AMBIGUOUS", "FrontMind ESA 账号中存在多个同名站点，拒绝猜测。");
+    throw new EsaProviderFailure(
+      "ESA_SITE_AMBIGUOUS",
+      "FrontMind ESA 账号中存在多个同名站点，拒绝猜测。",
+    );
   }
   if (sites.length === 0) {
     if (state.stage === "site_create_unknown") {
@@ -1731,9 +2102,16 @@ async function handlePrepareDomainBinding(input: {
     }
     const instanceId = process.env.FRONTMIND_ESA_INSTANCE_ID?.trim();
     if (!instanceId) {
-      throw new EsaProviderFailure("ESA_INSTANCE_NOT_CONFIGURED", "FrontMind 托管 ESA 套餐实例尚未配置。");
+      throw new EsaProviderFailure(
+        "ESA_INSTANCE_NOT_CONFIGURED",
+        "FrontMind 托管 ESA 套餐实例尚未配置。",
+      );
     }
-    const pending = { stage: "site_create_unknown", domain, domainRevision: input.parsed.domainRevision };
+    const pending = {
+      stage: "site_create_unknown",
+      domain,
+      domainRevision: input.parsed.domainRevision,
+    };
     await persistBoundary(input.db, input.operation, pending);
     try {
       const created = await input.api.createSite({
@@ -1761,14 +2139,20 @@ async function handlePrepareDomainBinding(input: {
   }
   let site = sites[0];
   if (site.accessType.toUpperCase() !== "CNAME") {
-    throw new EsaProviderFailure("ESA_SITE_ACCESS_TYPE_MISMATCH", "当前 ESA 站点不是 CNAME 接入，FrontMind 不会修改 NS。");
+    throw new EsaProviderFailure(
+      "ESA_SITE_ACCESS_TYPE_MISMATCH",
+      "当前 ESA 站点不是 CNAME 接入，FrontMind 不会修改 NS。",
+    );
   }
   if (!site.verifyCode && site.status.toLowerCase() !== "active") {
     site = (await input.api.listSites(domain))[0] ?? site;
   }
   if (site.status.toLowerCase() !== "active") {
     if (!site.verifyCode) {
-      throw new EsaProviderFailure("ESA_SITE_VERIFY_CODE_MISSING", "ESA 未返回站点所有权 TXT 验证值。");
+      throw new EsaProviderFailure(
+        "ESA_SITE_VERIFY_CODE_MISSING",
+        "ESA 未返回站点所有权 TXT 验证值。",
+      );
     }
     await upsertDnsExpectation({
       db: input.db,
@@ -1863,7 +2247,13 @@ async function handlePrepareDomainBinding(input: {
     }
   }
   const name = routineName(project.id);
-  const ensured = await ensureRoutine({ db: input.db, api: input.api, operation: input.operation, name, state });
+  const ensured = await ensureRoutine({
+    db: input.db,
+    api: input.api,
+    operation: input.operation,
+    name,
+    state,
+  });
   if (!ensured) {
     return {
       status: "pending",
@@ -1871,7 +2261,10 @@ async function handlePrepareDomainBinding(input: {
       result: { stage: "routine_create_unknown", routineName: name },
     };
   }
-  let related = await input.api.listRelatedRecords({ name, recordName: hostname });
+  let related = await input.api.listRelatedRecords({
+    name,
+    recordName: hostname,
+  });
   if (related.length === 0) {
     if (state.stage === "related_record_propagating") {
       if ((input.operation.attempt ?? 0) < 10) {
@@ -1899,11 +2292,18 @@ async function handlePrepareDomainBinding(input: {
     };
     await persistBoundary(input.db, input.operation, pending);
     try {
-      await input.api.createRelatedRecord({ name, recordName: hostname, siteId: site.siteId });
+      await input.api.createRelatedRecord({
+        name,
+        recordName: hostname,
+        siteId: site.siteId,
+      });
     } catch {
       return { status: "pending", nextPollMs: 15_000, result: pending };
     }
-    related = await input.api.listRelatedRecords({ name, recordName: hostname });
+    related = await input.api.listRelatedRecords({
+      name,
+      recordName: hostname,
+    });
     if (related.length === 0) {
       return {
         status: "pending",
@@ -1913,9 +2313,15 @@ async function handlePrepareDomainBinding(input: {
     }
   }
   if (related.length !== 1 || related[0].siteId !== site.siteId) {
-    throw new EsaProviderFailure("ESA_RELATED_RECORD_AMBIGUOUS", "ESA custom domain 绑定未形成唯一精确结果。");
+    throw new EsaProviderFailure(
+      "ESA_RELATED_RECORD_AMBIGUOUS",
+      "ESA custom domain 绑定未形成唯一精确结果。",
+    );
   }
-  const records = await input.api.listEdgeRoutineRecords({ siteId: site.siteId, recordName: hostname });
+  const records = await input.api.listEdgeRoutineRecords({
+    siteId: site.siteId,
+    recordName: hostname,
+  });
   if (records.length !== 1) {
     return {
       status: "pending",
@@ -1953,11 +2359,15 @@ async function handlePrepareDomainBinding(input: {
       routineName: name,
       cname,
     },
-    message: "ESA custom domain 已绑定，并生成精确 CNAME；请查看差异后应用 AliDNS。",
+    message:
+      "ESA custom domain 已绑定，并生成精确 CNAME；请查看差异后应用 AliDNS。",
   };
 }
 
-function pendingState(state: Record<string, unknown>, providerOperationId?: string): SiteOpsProviderResult {
+function pendingState(
+  state: Record<string, unknown>,
+  providerOperationId?: string,
+): SiteOpsProviderResult {
   return {
     status: "pending",
     result: state,
@@ -1991,6 +2401,9 @@ export function createEsaSiteOpsProviderHandler(
   const readArtifact = dependencies.readArtifact ?? readSiteOpsArtifact;
   const materializeProduction =
     dependencies.materializeProduction ?? materializeProductionSiteFromSource;
+  const materializeNativeProduction =
+    dependencies.materializeNativeProduction ??
+    rebuildNativeReactProductionFromSource;
   const fetchImpl = dependencies.fetch ?? globalThis.fetch;
   const publicHttpsFetch =
     dependencies.publicHttpsFetch ?? fetchPinnedPublicHttps;
@@ -2056,11 +2469,20 @@ export function createEsaSiteOpsProviderHandler(
         );
       }
       db ??= await dbGetter();
-      if (!db) throw new EsaProviderFailure("DATABASE_UNAVAILABLE", "ESA 发布数据库暂时不可用。");
+      if (!db)
+        throw new EsaProviderFailure(
+          "DATABASE_UNAVAILABLE",
+          "ESA 发布数据库暂时不可用。",
+        );
       api ??= new OfficialEsaDirectApi();
       const prepare = prepareInputSchema.safeParse(operation.input);
       if (prepare.success) {
-        return await handlePrepareDomainBinding({ db, api, operation, parsed: prepare.data });
+        return await handlePrepareDomainBinding({
+          db,
+          api,
+          operation,
+          parsed: prepare.data,
+        });
       }
       if (approvedReset) {
         const startedAt = Date.now();
@@ -2088,7 +2510,9 @@ export function createEsaSiteOpsProviderHandler(
       let context = await loadDeploymentContext(db, operation);
       const state = (operation.result ?? {}) as Record<string, unknown>;
       const name = routineName(context.project.id);
-      const hostname = normalizeHostname(context.project.canonicalHostname ?? "");
+      const hostname = normalizeHostname(
+        context.project.canonicalHostname ?? "",
+      );
       const production = await ensureProductionMaterialization({
         db,
         operation,
@@ -2097,6 +2521,7 @@ export function createEsaSiteOpsProviderHandler(
         readArtifact,
         persistArtifact,
         materializeProduction,
+        materializeNativeProduction,
         signal,
       });
       context = production.context;
@@ -2113,7 +2538,11 @@ export function createEsaSiteOpsProviderHandler(
       }
       const ensured = await ensureRoutine({ db, api, operation, name, state });
       if (!ensured) {
-        return pendingState({ ...state, stage: "routine_create_unknown", routineName: name });
+        return pendingState({
+          ...state,
+          stage: "routine_create_unknown",
+          routineName: name,
+        });
       }
       let matchedSite = await api.getMatchSite(hostname);
       if (!matchedSite || matchedSite.status.toLowerCase() !== "active") {
@@ -2159,7 +2588,9 @@ export function createEsaSiteOpsProviderHandler(
           .from(siteOperations)
           .where(eq(siteOperations.id, operation.id))
           .limit(1);
-        return pendingState((rows[0]?.result as Record<string, unknown> | null) ?? state);
+        return pendingState(
+          (rows[0]?.result as Record<string, unknown> | null) ?? state,
+        );
       }
       let routine = await api.getRoutine(name);
       const exactProduction =
@@ -2190,7 +2621,10 @@ export function createEsaSiteOpsProviderHandler(
         };
         await persistBoundary(db, operation, deployState);
         try {
-          const deployment = await api.createProductionDeployment({ name, codeVersion });
+          const deployment = await api.createProductionDeployment({
+            name,
+            codeVersion,
+          });
           providerDeploymentId = deployment.deploymentId;
           await persistBoundary(
             db,
@@ -2207,7 +2641,10 @@ export function createEsaSiteOpsProviderHandler(
           routine.production.codeVersions[0].codeVersion === codeVersion &&
           routine.production.codeVersions[0].percentage === 100;
         if (!observed) {
-          return pendingState({ ...deployState, stage: "deployment_verifying" }, providerDeploymentId ?? undefined);
+          return pendingState(
+            { ...deployState, stage: "deployment_verifying" },
+            providerDeploymentId ?? undefined,
+          );
         }
         providerDeploymentId = routine!.production!.deploymentId;
       }
@@ -2218,9 +2655,7 @@ export function createEsaSiteOpsProviderHandler(
       if (related.length === 0) {
         const stageStartedAttempt = Number(state.stageStartedAttempt ?? 0);
         if (state.stage === "related_record_create_unknown") {
-          if (
-            (operation.attempt ?? 0) - stageStartedAttempt < 5
-          ) {
+          if ((operation.attempt ?? 0) - stageStartedAttempt < 5) {
             return pendingState(state, providerDeploymentId ?? undefined);
           }
           throw new EsaProviderFailure(
@@ -2229,9 +2664,7 @@ export function createEsaSiteOpsProviderHandler(
           );
         }
         if (state.stage === "related_record_propagating") {
-          if (
-            (operation.attempt ?? 0) - stageStartedAttempt < 10
-          ) {
+          if ((operation.attempt ?? 0) - stageStartedAttempt < 10) {
             return pendingState(state, providerDeploymentId ?? undefined);
           }
           throw new EsaProviderFailure(
@@ -2258,10 +2691,7 @@ export function createEsaSiteOpsProviderHandler(
             siteId: matchedSite.siteId,
           });
         } catch {
-          return pendingState(
-            relationState,
-            providerDeploymentId ?? undefined,
-          );
+          return pendingState(relationState, providerDeploymentId ?? undefined);
         }
         related = await api.listRelatedRecords({
           name,
@@ -2278,10 +2708,7 @@ export function createEsaSiteOpsProviderHandler(
           );
         }
       }
-      if (
-        related.length !== 1 ||
-        related[0].siteId !== matchedSite.siteId
-      ) {
+      if (related.length !== 1 || related[0].siteId !== matchedSite.siteId) {
         throw new EsaProviderFailure(
           "ESA_DOMAIN_BINDING_NOT_READY",
           "canonical hostname 未形成唯一精确的 SiteOps Routine 绑定。",
@@ -2344,7 +2771,9 @@ export function createEsaSiteOpsProviderHandler(
 
 let registered = false;
 
-export function registerEsaSiteOpsProvider(dependencies: EsaProviderDependencies = {}) {
+export function registerEsaSiteOpsProvider(
+  dependencies: EsaProviderDependencies = {},
+) {
   if (registered) return () => undefined;
   const unregister = registerSiteOpsProviderHandler(
     "aliyun_esa",

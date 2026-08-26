@@ -48,6 +48,7 @@ beforeEach(async () => {
     `<!doctype html><html><head>
       <link rel="icon" href="/favicon.svg">
       <link rel="stylesheet" href="/styles.css">
+      <script type="module" src="/assets/app.js"></script>
       <style>.hero{background:url('/images/hero.png')}</style>
     </head><body>
       <a href="/">首页</a><a href="/about/">关于</a>
@@ -60,9 +61,14 @@ beforeEach(async () => {
     "styles.css",
     `.hero{background-image:url(/images/hero.png)}\n@import "/fonts/site.css";`,
   );
+  archive.file("fonts/site.css", "body{font-family:system-ui}");
   archive.file("favicon.svg", '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
   archive.file("images/hero.png", Buffer.from("preview-image"));
   archive.file("images/hero@2x.png", Buffer.from("preview-image-2x"));
+  archive.file(
+    "assets/app.js",
+    'const routes={"/":"home","/about/":"about"};const logo="/images/hero.png";const product=(slug)=>`/products/${slug}/`;document.body.dataset.route=routes[location.pathname]??"missing";document.body.dataset.logo=logo;document.body.dataset.product=product("demo");',
+  );
   distZip = await archive.generateAsync({ type: "nodebuffer" });
 
   mocks.getDb.mockReset().mockResolvedValue({
@@ -455,39 +461,56 @@ describe("SiteOps private preview proxy", () => {
     });
   });
 
-  it("keeps HTML, CSS, favicon and internal navigation under the authenticated preview prefix", async () => {
+  it("serves one opaque-origin self-contained document without authenticated subresources", async () => {
     const origin = await startApp();
     const prefix = `/api/site-ops/builds/${buildId}/preview/`;
     const response = await fetch(`${origin}${prefix}`);
 
     expect(response.status).toBe(200);
     expect(response.headers.get("x-robots-tag")).toContain("noindex");
+    expect(response.headers.get("cross-origin-opener-policy")).toBe(
+      "same-origin",
+    );
+    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
     const html = await response.text();
-    expect(html).toContain(`href="${prefix}favicon.svg"`);
-    expect(html).toContain(`href="${prefix}styles.css"`);
+    expect(html).toContain('href="data:image/svg+xml;base64,');
+    expect(html).not.toContain(`href="${prefix}styles.css"`);
+    expect(html).not.toContain(`src="${prefix}assets/app.js"`);
+    expect(html).toContain('<script nonce="');
+    expect(html).toContain('type="module"');
+    expect(html).toContain("document.body.dataset.route");
     expect(html).toContain(`href="${prefix}"`);
     expect(html).toContain(`href="${prefix}about/"`);
-    expect(html).toContain(`src="${prefix}images/hero.png"`);
-    expect(html).toContain(
-      `srcset="${prefix}images/hero.png 1x, ${prefix}images/hero@2x.png 2x"`,
-    );
-    expect(html).toContain(`url('${prefix}images/hero.png')`);
+    expect(html).toContain('src="data:image/png;base64,');
+    expect(html).toContain("url('data:image/png;base64,");
+    expect(html).toContain("body{font-family:system-ui}");
     expect(html).toContain('href="https://example.com/"');
 
-    const [cssResponse, faviconResponse, aboutResponse] = await Promise.all([
-      fetch(`${origin}${prefix}styles.css`),
-      fetch(`${origin}${prefix}favicon.svg`),
-      fetch(`${origin}${prefix}about/`),
-    ]);
-    expect(cssResponse.status).toBe(200);
-    expect(await cssResponse.text()).toBe(
-      `.hero{background-image:url(${prefix}images/hero.png)}\n@import "${prefix}fonts/site.css";`,
-    );
-    expect(faviconResponse.status).toBe(200);
-    expect(faviconResponse.headers.get("content-type")).toContain(
-      "image/svg+xml",
-    );
+    const [cssResponse, faviconResponse, aboutResponse, jsResponse] =
+      await Promise.all([
+        fetch(`${origin}${prefix}styles.css`),
+        fetch(`${origin}${prefix}favicon.svg`),
+        fetch(`${origin}${prefix}about/`),
+        fetch(`${origin}${prefix}assets/app.js`),
+      ]);
+    expect(cssResponse.status).toBe(404);
+    expect(faviconResponse.status).toBe(404);
     expect(aboutResponse.status).toBe(200);
     expect(await aboutResponse.text()).toContain(`href="${prefix}"`);
+    expect(jsResponse.status).toBe(404);
+    const csp = response.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("sandbox allow-scripts");
+    expect(csp).not.toContain("allow-same-origin");
+    expect(csp).not.toContain("allow-forms");
+    expect(csp).not.toContain("allow-top-navigation");
+    expect(csp).toMatch(/script-src 'nonce-[A-Za-z0-9_-]+'/u);
+    expect(csp).toMatch(/style-src 'nonce-[A-Za-z0-9_-]+'/u);
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("connect-src 'none'");
+    expect(csp).toContain("worker-src 'none'");
+    expect(csp).toContain("frame-src 'none'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("base-uri 'none'");
   });
 });

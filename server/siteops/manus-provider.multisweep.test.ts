@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 
+import JSZip from "jszip";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   canonicalJson,
   createVisualEvidenceV1,
 } from "../../shared/siteops-workflow";
-import { SITEOPS_WORKFLOW } from "../../shared/siteops";
+import {
+  SITEOPS_MATERIALIZER_V2_5,
+  SITEOPS_WORKFLOW,
+  visualSelectionBundleV5Schema,
+} from "../../shared/siteops";
 import {
   FRONTMIND_VISUAL_FAMILIES_V3,
   referenceBlueprintV4ForFamily,
@@ -24,6 +29,11 @@ vi.mock("./remote-preview", () => ({
 import { createManusSiteOpsProviderHandler } from "./manus-provider";
 import { SiteOpsMaterializationError } from "./materialization-error";
 import { ManusV2ApiError } from "../manus-v2-client";
+import {
+  createNativeSourceArchive,
+  createVisualSelectionBundleV5Artifact,
+  normalizeTwentyFirstNativeSource,
+} from "./native-visual-source";
 
 const sha256 = (value: Buffer | string) =>
   createHash("sha256").update(value).digest("hex");
@@ -598,5 +608,368 @@ describe("SiteOps personal-key build multi-sweep integration", () => {
     expect(materializeIndex).toBeGreaterThan(firstLeaseIndex);
     expect(finalLeaseIndex).toBeGreaterThan(lastPersistIndex);
     expect(timeline).toContain("db:qa_running");
+  });
+
+  it("binds the selected V5 source ZIP through Manus receipt, native materialization, and persisted preview", async () => {
+    const selectedIndex = 7;
+    const sourceArchives = new Map<string, Buffer>();
+    const candidates = [];
+    for (let index = 0; index < 9; index += 1) {
+      const label = String.fromCharCode(65 + index);
+      const candidateId = `60000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+      const providerItemKey = `n:${index + 1}`;
+      const source = normalizeTwentyFirstNativeSource({
+        candidate: { providerItemId: index + 1, providerItemKey } as never,
+        payload: {
+          id: index + 1,
+          version: `v${index + 1}`,
+          componentCode: `import React from "react";export default function Native${label}(){return <main>Native ${label}</main>}`,
+          demoCode: `import React from "react";import Native from "./component";export default function Demo${label}(){return <Native/>}`,
+          globalsCss: `body{--candidate:${index + 1}}`,
+          dependencies: ["react@19.2.1", "react-dom@19.2.1"],
+        },
+      });
+      const sourceArchive = await createNativeSourceArchive(source);
+      sourceArchives.set(candidateId, sourceArchive);
+      const referencePreviewSha256 = sha256(`reference-${label}`);
+      const evidence = createVisualEvidenceV1({
+        evidenceKind: "catalog_metadata_preview_v1",
+        providerItemKey,
+        metadataSha256: sha256(`metadata-${label}`),
+        providerResponseSha256: sha256(`response-${label}`),
+        previewSha256: referencePreviewSha256,
+        taxonomyDerivationVersion: "catalog-metadata-preview-v1",
+      });
+      candidates.push({
+        id: candidateId,
+        label,
+        queryAxis: "foundation_split" as const,
+        providerItemId: String(index + 1),
+        providerItemKey,
+        providerVersion: `v${index + 1}`,
+        title: `Native ${label}`,
+        description: null,
+        author: null,
+        sourceUrl: `https://21st.dev/community/components/${index + 1}`,
+        visualEvidence: evidence,
+        referencePreviewLocalAssetId: `70000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+        referencePreviewSha256,
+        referencePerceptualHash: sha256(`phash-${label}`).slice(0, 16),
+        previewLocalAssetId: `80000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+        previewSha256: sha256(`native-preview-${label}`),
+        taxonomy: {
+          role: "foundation" as const,
+          palette: ["#ffffff", "#111111"],
+          typography: [],
+          layout: [],
+          motion: [],
+          accessibility: [],
+        },
+        score: 90 - index,
+        rationale: "真实原生源码候选",
+        sourceTreeSha256: source.sourceTreeSha256,
+        sourceArchiveSha256: sha256(sourceArchive),
+        sourceArchivePath: `candidates/${label}/source.zip`,
+        entrypoint: source.entrypoint,
+        demoEntrypoint: source.demoEntrypoint,
+        sourceDirectory: "source" as const,
+      });
+    }
+    const selected = candidates[selectedIndex]!;
+    const bundle = visualSelectionBundleV5Schema.parse({
+      schemaVersion: 5,
+      renderer: "twenty_first_native_react_v1",
+      queryPlanHash: sha256("native-query-plan"),
+      searchTarget: 162,
+      displayTarget: 9,
+      candidates,
+      selectedCandidateId: null,
+      delegated: false,
+      degradedReasons: [],
+    });
+    const selectionBytes = await createVisualSelectionBundleV5Artifact({
+      bundle,
+      sourceArchives,
+    });
+
+    const finalZip = new JSZip();
+    finalZip.file(
+      "package.json",
+      JSON.stringify({
+        type: "module",
+        dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+      }),
+    );
+    finalZip.file(
+      "index.html",
+      '<!doctype html><div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+    );
+    finalZip.file(
+      "src/main.tsx",
+      'import React from "react";import{createRoot}from"react-dom/client";createRoot(document.getElementById("root")!).render(<main>企业官网</main>);',
+    );
+    const finalSourceZip = await finalZip.generateAsync({ type: "nodebuffer" });
+    const finalSourceSha256 = sha256(finalSourceZip);
+    const operationToken = `siteops-native-source:${baseOperation.id}:0`;
+    const selectedBaseSha256 = selected.sourceArchiveSha256;
+    const receipt = {
+      operationToken,
+      baseSourceSha256: selectedBaseSha256,
+      archiveSha256: finalSourceSha256,
+      fileCount: 3,
+    };
+    const context = {
+      build: {
+        id: baseOperation.buildId,
+        projectId: baseOperation.projectId,
+        userId: baseOperation.userId,
+        knowledgeSnapshotId: "50000000-0000-4000-8000-000000000005",
+        knowledgeArchiveHash: "a".repeat(64),
+        workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_5.upstreamVersion,
+        workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_5.upstreamSha256,
+        workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+        workflowPackageHash: SITEOPS_MATERIALIZER_V2_5.runtimeManifestSha256,
+        starterVersion: SITEOPS_MATERIALIZER_V2_5.starterVersion,
+        brief: {
+          companyName: "星河智造",
+          primaryLanguage: "zh-CN",
+          contacts: [],
+          offerings: ["设备服务"],
+          audience: ["制造企业"],
+          conversionGoal: "联系咨询",
+          routes: [
+            {
+              id: "home",
+              slug: "/",
+              title: "首页",
+              sourceDocumentIds: ["overview"],
+            },
+          ],
+          verifiedFacts: [
+            {
+              statement: "星河智造提供设备服务。",
+              sourceDocumentIds: ["overview"],
+            },
+          ],
+          publicAssetIds: [],
+          unknowns: [],
+        },
+        selectionHash: sha256("native-selection"),
+        repairAttempts: 0,
+        upstreamManusTaskId: null as string | null,
+        status: "queued",
+      },
+      project: { id: baseOperation.projectId },
+      snapshot: {
+        id: "50000000-0000-4000-8000-000000000005",
+        userId: baseOperation.userId,
+        archiveHash: "a".repeat(64),
+        totalBytes: 1,
+        sourceBuildId: null,
+        sourceBuildRevision: null,
+        assets: [],
+        documents: [
+          {
+            id: "overview",
+            path: "overview.md",
+            title: "企业简介",
+            content: "星河智造提供设备服务。",
+            kind: "leaf" as const,
+            evidenceStatus: "verified_first_party" as const,
+            customerVisible: true,
+          },
+        ],
+      },
+      sample: {
+        id: selected.id,
+        batchId: "70000000-0000-4000-8000-000000000007",
+        previewLocalAssetId: selected.previewLocalAssetId,
+        sourceMetadata: {
+          schemaVersion: 5,
+          renderer: "twenty_first_native_react_v1",
+          providerItemKey: selected.providerItemKey,
+          providerVersion: selected.providerVersion,
+          sourceTreeSha256: selected.sourceTreeSha256,
+          sourceArchiveSha256: selected.sourceArchiveSha256,
+          visualEvidence: selected.visualEvidence,
+          taxonomy: selected.taxonomy,
+        },
+      },
+      batch: {
+        selectionBundleLocalAssetId: "90000000-0000-4000-8000-000000000009",
+        selectionBundleHash: sha256(selectionBytes),
+      },
+    };
+    const query: any = {};
+    query.from = () => query;
+    query.innerJoin = () => query;
+    query.where = () => query;
+    query.limit = async () => [context];
+    const db = {
+      select: () => query,
+      transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
+        callback(db),
+      update: () => ({
+        set: (values: Record<string, unknown>) => ({
+          where: async () => {
+            if (!("result" in values)) Object.assign(context.build, values);
+            return [{ affectedRows: 1 }];
+          },
+        }),
+      }),
+    };
+    const taskId = "native-manus-task";
+    const createTask = vi.fn(async () => ({ taskId }));
+    const client = {
+      createTask,
+      sendMessage: vi.fn(),
+      findCreatedTask: vi.fn(),
+      taskDetail: vi.fn(async () => ({ status: "stopped" })),
+      listAllMessages: vi.fn(async () => [
+        operationMarker(operationToken, 0),
+        {
+          id: "native-receipt",
+          type: "structured_output_result",
+          timestamp: 1,
+          structured_output_result: { success: true, value: receipt },
+        },
+        {
+          id: "native-source",
+          type: "assistant_message",
+          timestamp: 2,
+          assistant_message: {
+            content: "完整源码已返回。",
+            attachments: [
+              {
+                filename: "frontmind-site-source-v1.zip",
+                content_type: "application/zip",
+                url: `data:application/zip;base64,${finalSourceZip.toString("base64")}`,
+              },
+            ],
+          },
+        },
+        {
+          id: "native-stopped",
+          type: "status_update",
+          timestamp: 3,
+          status_update: { agent_status: "stopped" },
+        },
+      ]),
+    };
+    const contractJson = Buffer.from(
+      JSON.stringify({ contractKind: "twenty_first_native_build_contract" }),
+    );
+    const distZip = Buffer.from("native-dist");
+    const qaJson = Buffer.from(
+      JSON.stringify({ passed: true, mode: "preview" }),
+    );
+    const qaZip = Buffer.from("native-qa");
+    const provenanceJson = Buffer.from("{}\n");
+    const materialized = {
+      contractJson,
+      contractSha256: sha256(contractJson),
+      sourceZip: finalSourceZip,
+      sourceSha256: finalSourceSha256,
+      distZip,
+      distSha256: sha256(distZip),
+      qaJson,
+      qaSha256: sha256(qaJson),
+      visualQaZip: qaZip,
+      visualQaSha256: sha256(qaZip),
+      provenanceJson,
+      provenanceSha256: sha256(provenanceJson),
+      buildLog: Buffer.from("ok"),
+      files: new Map<string, Buffer>(),
+      buildDelivery: {
+        renderMode: "twenty_first_native" as const,
+        qaStatus: "passed" as const,
+        warningCodes: [],
+      },
+    };
+    const materializeNativeSite = vi.fn(async (input: any) => {
+      expect(input.sourceZip.equals(finalSourceZip)).toBe(true);
+      expect(input.mode).toBe("preview");
+      return materialized as never;
+    });
+    const persistArtifact = vi.fn(
+      async (input: { kind: string; buffer: Buffer }) => ({
+        id: `asset-${input.kind}`,
+        contentSha256: sha256(input.buffer),
+      }),
+    );
+    const readArtifact = vi.fn(async () => ({
+      row: {
+        id: context.batch.selectionBundleLocalAssetId,
+        scope: "managed_user",
+        accountUserId: baseOperation.userId,
+        storageKey: `siteops:${baseOperation.projectId}:native-selection`,
+        mimeType: "application/zip",
+        contentSha256: context.batch.selectionBundleHash,
+        sizeBytes: selectionBytes.length,
+      },
+      stored: {
+        sizeBytes: selectionBytes.length,
+        createReadStream: () => Readable.from([selectionBytes]),
+      },
+    }));
+    const handler = createManusSiteOpsProviderHandler({
+      getDb: async () => db as never,
+      getCredential: vi.fn(async () => ({
+        id: baseOperation.input.manusCredentialId,
+        userId: baseOperation.userId,
+        version: baseOperation.input.manusCredentialVersion,
+        apiKey: "customer-personal-key",
+      })) as never,
+      createClient: () => client as never,
+      readSnapshotArchive: async () => Buffer.from("x"),
+      readArtifact: readArtifact as never,
+      materializeNativeSite,
+      persistArtifact: persistArtifact as never,
+    });
+    const assertLeaseActive = vi.fn(async () => undefined);
+    const created = await handler({
+      operation: baseOperation as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(created).toMatchObject({
+      status: "pending",
+      providerTaskId: taskId,
+      result: { stage: "native_source_pending", nativeRepairAttempt: 0 },
+    });
+    const createInput = createTask.mock.calls[0]![0] as any;
+    expect(createInput.prompt).toContain("不是视觉设计师");
+    expect(createInput.prompt).toContain(selectedBaseSha256);
+    const baseAttachment = createInput.attachments.find(
+      (item: any) => item.filename === "frontmind-selected-21st-source-v1.zip",
+    );
+    expect(
+      Buffer.from(baseAttachment.file_data.split(",", 2)[1], "base64").equals(
+        sourceArchives.get(selected.id)!,
+      ),
+    ).toBe(true);
+
+    const finished = await handler({
+      operation: operationWithState(
+        baseOperation,
+        taskId,
+        created.result,
+      ) as never,
+      signal: new AbortController().signal,
+      assertLeaseActive,
+    });
+    expect(finished).toMatchObject({
+      status: "succeeded",
+      projectStatus: "preview_ready",
+      buildStatus: "preview_ready",
+      result: {
+        buildId: baseOperation.buildId,
+        distHash: materialized.distSha256,
+        buildDelivery: { renderMode: "twenty_first_native" },
+      },
+    });
+    expect(materializeNativeSite).toHaveBeenCalledTimes(1);
+    expect(persistArtifact).toHaveBeenCalledTimes(5);
+    expect(client.sendMessage).not.toHaveBeenCalled();
   });
 });

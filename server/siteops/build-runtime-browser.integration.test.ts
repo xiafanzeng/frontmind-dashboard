@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:http";
 
+import JSZip from "jszip";
+import { chromium } from "playwright";
 import { describe, expect, it } from "vitest";
 
 import { SITEOPS_WORKFLOW } from "../../shared/siteops";
@@ -9,8 +13,15 @@ import {
   type MaterializeAstroSiteInput,
   type SiteOpsQaReport,
 } from "./build-runtime";
+import { materializeNativeReactSource } from "./native-react-build-runtime";
+import { validateNativeReactSourceArchive } from "./native-react-source";
+import {
+  createSandboxedPreviewDocument,
+  sandboxedPreviewContentSecurityPolicy,
+} from "./artifact-api";
 
-const H = (value: string) => createHash("sha256").update(value).digest("hex");
+const H = (value: string | Buffer) =>
+  createHash("sha256").update(value).digest("hex");
 
 function browserIntegrationInput(): MaterializeAstroSiteInput {
   const snapshotId = "70000000-0000-4000-8000-000000000007";
@@ -167,6 +178,81 @@ const browserIntegration =
     : describe.skip;
 
 browserIntegration("SiteOps React static real-browser integration", () => {
+  it("runs a native preview as an opaque document without Dashboard storage or API authority", async () => {
+    const zip = new JSZip();
+    zip.file(
+      "index.html",
+      '<!doctype html><html><body><div id="root"></div><script type="module" src="/assets/app.js"></script></body></html>',
+    );
+    zip.file(
+      "assets/app.js",
+      `const probe=(name,read)=>{try{read();document.body.dataset[name]="available"}catch{document.body.dataset[name]="blocked"}};
+probe("cookie",()=>document.cookie);
+probe("local",()=>localStorage.getItem("frontmind"));
+probe("session",()=>sessionStorage.getItem("frontmind"));
+fetch("/api/private-sentinel",{credentials:"include"}).then(()=>{document.body.dataset.api="available"}).catch(()=>{document.body.dataset.api="blocked"}).finally(()=>{document.getElementById("root").textContent="原生预览已渲染";document.body.dataset.ready="yes"});`,
+    );
+    const previewDocument = await createSandboxedPreviewDocument({
+      zip,
+      entryName: "index.html",
+      previewPrefix: "/preview/",
+    });
+    let privateApiHits = 0;
+    const server = createServer((request, response) => {
+      if (request.url === "/preview/") {
+        response.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Content-Length": previewDocument.bytes.length,
+          "Content-Security-Policy": sandboxedPreviewContentSecurityPolicy(
+            previewDocument.nonce,
+          ),
+          "Set-Cookie":
+            "frontmind_session=private-sentinel; Path=/; HttpOnly; SameSite=Lax",
+        });
+        response.end(previewDocument.bytes);
+        return;
+      }
+      privateApiHits += 1;
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("private-api-sentinel");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      server.close();
+      throw new Error("PREVIEW_TEST_SERVER_UNAVAILABLE");
+    }
+    const browser = await chromium.launch({
+      headless: true,
+      chromiumSandbox: false,
+    });
+    try {
+      const page = await browser.newPage();
+      await page.goto(`http://127.0.0.1:${address.port}/preview/`);
+      await page.waitForFunction(() => document.body.dataset.ready === "yes");
+      expect(
+        await page.evaluate(() => ({
+          text: document.querySelector("#root")?.textContent,
+          cookie: document.body.dataset.cookie,
+          local: document.body.dataset.local,
+          session: document.body.dataset.session,
+          api: document.body.dataset.api,
+        })),
+      ).toEqual({
+        text: "原生预览已渲染",
+        cookie: "blocked",
+        local: "blocked",
+        session: "blocked",
+        api: "blocked",
+      });
+      expect(privateApiHits).toBe(0);
+    } finally {
+      await browser.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 30_000);
+
   it("passes real Chromium, axe and Lighthouse QA at 390/768/1440", async () => {
     const built = await materializeAstroSite(browserIntegrationInput());
     const qa = JSON.parse(built.qaJson.toString("utf8")) as SiteOpsQaReport;
@@ -189,4 +275,82 @@ browserIntegration("SiteOps React static real-browser integration", () => {
     expect(qa.browser.lighthouse.seo).toBeGreaterThanOrEqual(95);
     expect(qa.browser.lighthouse.cls).toBeLessThan(0.1);
   }, 180_000);
+
+  it("keeps a real native React preview available when axe reports contrast warnings", async () => {
+    const files = new Map<string, Buffer>([
+      [
+        "package.json",
+        Buffer.from(
+          JSON.stringify({
+            type: "module",
+            dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+          }),
+        ),
+      ],
+      [
+        "index.html",
+        Buffer.from(
+          '<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>原生官网</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>',
+        ),
+      ],
+      [
+        "src/main.tsx",
+        Buffer.from(`import React from "react";
+import { createRoot } from "react-dom/client";
+import "./style.css";
+function App(){return <main><h1>原生 21st 企业官网</h1><p>经过核验的企业介绍内容</p><button>联系企业</button></main>}
+createRoot(document.getElementById("root")!).render(<App />);`),
+      ],
+      [
+        "src/style.css",
+        Buffer.from(
+          "body{margin:0;font-family:system-ui;background:#fff}main{min-height:100vh;display:grid;place-content:center}p,button{color:#eee;background:#fff}button{border:0;padding:16px}",
+        ),
+      ],
+    ]);
+    const archive = new JSZip();
+    for (const [filename, bytes] of files) archive.file(filename, bytes);
+    const sourceZip = await archive.generateAsync({ type: "nodebuffer" });
+    const operationToken = "native-browser-integration-token";
+    const baseSourceSha256 = H("native-browser-base-source");
+    const validatedSource = await validateNativeReactSourceArchive({
+      archive: sourceZip,
+      receipt: {
+        operationToken,
+        baseSourceSha256,
+        archiveSha256: H(sourceZip),
+        fileCount: files.size,
+      },
+      expectedOperationToken: operationToken,
+      expectedBaseSourceSha256: baseSourceSha256,
+    });
+    const input = browserIntegrationInput();
+    const built = await materializeNativeReactSource({
+      sourceZip,
+      validatedSource,
+      build: {
+        id: input.build.id,
+        projectId: input.build.projectId,
+        knowledgeSnapshotId: input.build.knowledgeSnapshotId,
+        workflowVersion: "2.5.0",
+        selectionHash: input.build.selectionHash,
+      },
+      brief: input.brief,
+      mode: "preview",
+      lighthouseQa: false,
+    });
+    expect(built.sourceZip.equals(sourceZip)).toBe(true);
+    expect(built.buildDelivery).toMatchObject({
+      renderMode: "twenty_first_native",
+      qaStatus: "passed_with_warnings",
+    });
+    expect(built.buildDelivery.warningCodes).toContain("NATIVE_AXE_WARNING");
+    const qa = JSON.parse(built.qaJson.toString("utf8"));
+    expect(qa.passed).toBe(true);
+    expect(qa.browser.axeViolationIds).toContain("color-contrast");
+    expect(qa.browser.screenshotFiles).toEqual([
+      "screenshots/home-1440.png",
+      "screenshots/home-390.png",
+    ]);
+  }, 120_000);
 });

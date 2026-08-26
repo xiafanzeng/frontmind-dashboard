@@ -42,8 +42,7 @@ import {
   websiteStyleSampleBatches,
   websiteStyleSamples,
 } from "../../drizzle/schema";
-import { SITEOPS_WORKFLOW } from "../../shared/siteops";
-import { referenceBlueprintV3ForFamily } from "../../shared/siteops-design";
+import { SITEOPS_MATERIALIZER_V2_5 } from "../../shared/siteops";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import { actOnSiteOps, siteBriefFromSnapshot } from "./service";
 
@@ -102,14 +101,7 @@ function serviceDatabaseFixture() {
     previewSha256: "d".repeat(64),
     taxonomyDerivationVersion: "catalog-metadata-preview-v1",
   });
-  const referenceBlueprint = referenceBlueprintV3ForFamily({
-    candidateId: sampleId,
-    providerItemKey: evidence.providerItemKey,
-    previewLocalAssetId,
-    previewSha256: evidence.previewSha256,
-    heroFamily: "floating_orbit",
-    inspirationEvidenceIds: [evidence.evidenceSha256],
-  });
+  const referencePreviewLocalAssetId = "41100000-0000-4000-8000-000000000004";
   const batch = {
     id: "45000000-0000-4000-8000-000000000004",
     userId: 7,
@@ -126,11 +118,22 @@ function serviceDatabaseFixture() {
     note: "浮动轨道 Hero",
     previewLocalAssetId,
     sourceMetadata: {
+      schemaVersion: 5,
+      renderer: "twenty_first_native_react_v1",
+      providerItemId: "8435",
       providerItemKey: evidence.providerItemKey,
+      providerVersion: "v1",
       title: "Floating Orbit Hero",
       sourceUrl: "https://21st.dev/community/components/floating-orbit",
       visualEvidence: evidence,
-      referenceBlueprint,
+      referencePreviewLocalAssetId,
+      referencePreviewSha256: evidence.previewSha256,
+      referencePerceptualHash: "1".repeat(16),
+      previewSha256: "e".repeat(64),
+      sourceTreeSha256: "f".repeat(64),
+      sourceArchiveSha256: "1".repeat(64),
+      entrypoint: "src/App.tsx",
+      demoEntrypoint: "src/App.tsx",
       score: 95,
     },
   };
@@ -141,7 +144,7 @@ function serviceDatabaseFixture() {
     knowledgeSnapshotId: snapshot.id,
     credentialId: platformCredentialId,
     credentialVersion: 3,
-    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+    workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
   };
   const customerCredential = {
     id: customerCredentialId,
@@ -301,10 +304,7 @@ function delegateVisualInput(revision: number) {
   } as const;
 }
 
-function connectKnowledgeInput(
-  revision: number,
-  knowledgeSnapshotId?: string,
-) {
+function connectKnowledgeInput(revision: number, knowledgeSnapshotId?: string) {
   return {
     conversationId: "siteops:7",
     action: "select_snapshot",
@@ -418,9 +418,7 @@ describe("SiteOps accepted rebuild visual selection", () => {
       connectKnowledgeInput(fixture.project.revision, currentSnapshot.id),
     );
 
-    expect(fixture.project.currentKnowledgeSnapshotId).toBe(
-      currentSnapshot.id,
-    );
+    expect(fixture.project.currentKnowledgeSnapshotId).toBe(currentSnapshot.id);
   });
 
   it("rejects an old client snapshot id when it is not the newest valid active snapshot", async () => {
@@ -568,14 +566,6 @@ describe("SiteOps accepted rebuild visual selection", () => {
           previewSha256: digest,
           taxonomyDerivationVersion: "catalog-metadata-preview-v1",
         });
-        const referenceBlueprint = referenceBlueprintV3ForFamily({
-          candidateId: sampleId,
-          providerItemKey: visualEvidence.providerItemKey,
-          previewLocalAssetId,
-          previewSha256: visualEvidence.previewSha256,
-          heroFamily: "floating_orbit",
-          inspirationEvidenceIds: [visualEvidence.evidenceSha256],
-        });
         return {
           batch: fixture.batch,
           sample: {
@@ -584,9 +574,22 @@ describe("SiteOps accepted rebuild visual selection", () => {
             previewLocalAssetId,
             sourceMetadata: {
               ...fixture.sample.sourceMetadata,
+              providerItemId: String(index + 1),
               providerItemKey: visualEvidence.providerItemKey,
+              providerVersion: `v${index + 1}`,
               visualEvidence,
-              referenceBlueprint,
+              referencePreviewLocalAssetId: `41100000-0000-4000-8000-${suffix}`,
+              referencePreviewSha256: visualEvidence.previewSha256,
+              referencePerceptualHash: index.toString(16).padStart(16, "0"),
+              previewSha256: (index + 16).toString(16).repeat(64).slice(0, 64),
+              sourceTreeSha256: (index + 32)
+                .toString(16)
+                .repeat(64)
+                .slice(0, 64),
+              sourceArchiveSha256: (index + 48)
+                .toString(16)
+                .repeat(64)
+                .slice(0, 64),
               score: index,
             },
           },
@@ -780,9 +783,9 @@ describe("SiteOps accepted rebuild visual selection", () => {
     ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
 
     expect(dependencies.reserveQuota).not.toHaveBeenCalled();
-    expect(
-      fixture.inserts.some((entry) => entry.table === siteBuilds),
-    ).toBe(false);
+    expect(fixture.inserts.some((entry) => entry.table === siteBuilds)).toBe(
+      false,
+    );
   });
 
   it("keeps the accepted rebuild cycle usable while a second reset request is submitted", async () => {

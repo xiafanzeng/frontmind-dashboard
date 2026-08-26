@@ -36,7 +36,8 @@ import {
   workspaceSiteProfiles,
 } from "../../drizzle/schema";
 import {
-  SITEOPS_WORKFLOW,
+  SITEOPS_MATERIALIZER_V2_4,
+  SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_MAX_TOTAL,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
@@ -166,14 +167,20 @@ export function requireAcceptedSiteOpsRebuild(input: {
   }
 }
 
-export function currentSiteOpsBuildWorkflowCoordinates() {
+function siteOpsBuildWorkflowCoordinates(
+  workflow: typeof SITEOPS_MATERIALIZER_V2_4 | typeof SITEOPS_MATERIALIZER_V2_5,
+) {
   return {
-    workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
-    workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
-    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-    workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
-    starterVersion: SITEOPS_WORKFLOW.starterVersion,
+    workflowUpstreamVersion: workflow.upstreamVersion,
+    workflowUpstreamHash: workflow.upstreamSha256,
+    workflowVersion: workflow.frontMindVersion,
+    workflowPackageHash: workflow.runtimeManifestSha256,
+    starterVersion: workflow.starterVersion,
   } as const;
+}
+
+export function currentSiteOpsBuildWorkflowCoordinates() {
+  return siteOpsBuildWorkflowCoordinates(SITEOPS_MATERIALIZER_V2_5);
 }
 
 export function isSiteOpsOperationReplay(
@@ -1454,6 +1461,55 @@ export function projectSiteOpsExecutionSteps(input: {
   });
 }
 
+export function projectSiteOpsBuildDelivery(input: {
+  buildId: string;
+  operations: readonly {
+    buildId: string | null;
+    status: string;
+    kind: string;
+    result?: Record<string, unknown> | null;
+  }[];
+}) {
+  const operation = input.operations.find(
+    (candidate) =>
+      candidate.buildId === input.buildId &&
+      candidate.status === "succeeded" &&
+      (candidate.kind === "site_build" || candidate.kind === "build_revision"),
+  );
+  const rawDelivery = operation?.result?.buildDelivery;
+  const delivery =
+    rawDelivery &&
+    typeof rawDelivery === "object" &&
+    !Array.isArray(rawDelivery)
+      ? (rawDelivery as Record<string, unknown>)
+      : null;
+  const warningCodes = Array.isArray(delivery?.warningCodes)
+    ? delivery.warningCodes.filter(
+        (value): value is string =>
+          typeof value === "string" && value.length > 0 && value.length <= 128,
+      )
+    : [];
+  return delivery &&
+    ["primary", "trusted_fallback", "twenty_first_native"].includes(
+      String(delivery.renderMode),
+    ) &&
+    ["passed", "passed_with_warnings", "partial"].includes(
+      String(delivery.qaStatus),
+    )
+    ? {
+        renderMode: delivery.renderMode as
+          | "primary"
+          | "trusted_fallback"
+          | "twenty_first_native",
+        qaStatus: delivery.qaStatus as
+          | "passed"
+          | "passed_with_warnings"
+          | "partial",
+        warningCodes: Array.from(new Set(warningCodes)).slice(0, 100),
+      }
+    : null;
+}
+
 async function projectObservation(
   executor: any,
   input: {
@@ -2055,40 +2111,10 @@ async function projectObservation(
       timelineMessages: timelineMessageRows,
     }),
     builds: buildRows.map((row: typeof siteBuilds.$inferSelect) => {
-      const operation = timelineOperationRows.find(
-        (candidate: { buildId: string | null; status: string }) =>
-          candidate.buildId === row.id && candidate.status === "succeeded",
-      ) as
-        | { result?: Record<string, unknown> | null }
-        | undefined;
-      const rawDelivery = operation?.result?.buildDelivery;
-      const delivery =
-        rawDelivery && typeof rawDelivery === "object" && !Array.isArray(rawDelivery)
-          ? (rawDelivery as Record<string, unknown>)
-          : null;
-      const warningCodes = Array.isArray(delivery?.warningCodes)
-        ? delivery.warningCodes.filter(
-            (value): value is string =>
-              typeof value === "string" && value.length > 0 && value.length <= 128,
-          )
-        : [];
-      const buildDelivery =
-        delivery &&
-        ["primary", "trusted_fallback"].includes(String(delivery.renderMode)) &&
-        ["passed", "passed_with_warnings", "partial"].includes(
-          String(delivery.qaStatus),
-        )
-          ? {
-              renderMode: delivery.renderMode as
-                | "primary"
-                | "trusted_fallback",
-              qaStatus: delivery.qaStatus as
-                | "passed"
-                | "passed_with_warnings"
-                | "partial",
-              warningCodes: Array.from(new Set(warningCodes)).slice(0, 100),
-            }
-          : null;
+      const buildDelivery = projectSiteOpsBuildDelivery({
+        buildId: row.id,
+        operations: timelineOperationRows,
+      });
       return {
         id: row.id,
         parentBuildId: row.parentBuildId,
@@ -3238,7 +3264,7 @@ export async function resolvePinnedTwentyFirstCredentialForBatch(
 }
 
 export function assertCurrentVisualWorkflowVersion(workflowVersion: string) {
-  if (workflowVersion !== SITEOPS_WORKFLOW.frontMindVersion) {
+  if (workflowVersion !== SITEOPS_MATERIALIZER_V2_5.frontMindVersion) {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "视觉检索使用的建站合同已升级，请重新检索视觉方向后再继续。",
@@ -3907,7 +3933,7 @@ async function handleVisualSearch(
     knowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
     credentialId: credential.id,
     credentialVersion: credential.version,
-    workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+    workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
     mode,
     page,
     admissionRevision,
@@ -3974,9 +4000,7 @@ async function selectVisualSample(
     turnId: string;
     requestId: string;
     requestHash: string;
-    rebuildRequest: Awaited<
-      ReturnType<typeof loadSiteOpsRebuildRequest>
-    >;
+    rebuildRequest: Awaited<ReturnType<typeof loadSiteOpsRebuildRequest>>;
     sampleId?: string;
     batchId?: string;
     delegated: boolean;
@@ -4185,12 +4209,17 @@ async function selectVisualSample(
       409,
     );
   }
-  const referenceBlueprint = freezeSiteOpsReferenceBlueprint({
-    sampleId: selected.sample.id,
-    previewLocalAssetId: selected.sample.previewLocalAssetId,
-    note: selected.sample.note,
-    sourceMetadata: selectedMetadataRecord,
-  });
+  const nativeVisual =
+    selectedMetadataRecord.schemaVersion === 5 &&
+    selectedMetadataRecord.renderer === "twenty_first_native_react_v1";
+  const referenceBlueprint = nativeVisual
+    ? null
+    : freezeSiteOpsReferenceBlueprint({
+        sampleId: selected.sample.id,
+        previewLocalAssetId: selected.sample.previewLocalAssetId,
+        note: selected.sample.note,
+        sourceMetadata: selectedMetadataRecord,
+      });
   const snapshotRows = await tx
     .select()
     .from(knowledgeBaseSnapshots)
@@ -4268,7 +4297,9 @@ async function selectVisualSample(
     knowledgeSnapshotId: snapshot.id,
     knowledgeArchiveHash: snapshot.archiveHash,
     ordinal: Number(ordinalRows[0]?.ordinal ?? 0) + 1,
-    ...currentSiteOpsBuildWorkflowCoordinates(),
+    ...siteOpsBuildWorkflowCoordinates(
+      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_4,
+    ),
     twentyFirstCredentialId: credential.id,
     twentyFirstCredentialVersion: credential.version,
     styleSampleId: selected.sample.id,
@@ -4290,18 +4321,17 @@ async function selectVisualSample(
       ...(parentBuildId ? { childBuildId: buildId, parentBuildId } : {}),
       styleSampleId: selected.sample.id,
       delegated: input.delegated,
-      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-      referenceBlueprint,
+      workflowVersion: nativeVisual
+        ? SITEOPS_MATERIALIZER_V2_5.frontMindVersion
+        : SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
+      ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },
     kind: parentBuildId ? "build_revision" : "site_build",
     buildId,
     provider: "manus",
   });
-  if (
-    parentBuildId === null &&
-    input.rebuildRequest.resetApplied
-  ) {
+  if (parentBuildId === null && input.rebuildRequest.resetApplied) {
     const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
     console.info("[siteops] fresh_root_created", {
       event: "siteops_fresh_root_created",
@@ -4488,12 +4518,21 @@ async function handleRevision(
       409,
     );
   }
-  const derivedReferenceBlueprint = freezeSiteOpsReferenceBlueprint({
-    sampleId: styleSample.id,
-    previewLocalAssetId: styleSample.previewLocalAssetId,
-    note: styleSample.note,
-    sourceMetadata: styleSample.sourceMetadata,
-  });
+  const styleMetadata = styleSample.sourceMetadata as unknown as Record<
+    string,
+    unknown
+  >;
+  const nativeVisual =
+    styleMetadata.schemaVersion === 5 &&
+    styleMetadata.renderer === "twenty_first_native_react_v1";
+  const derivedReferenceBlueprint = nativeVisual
+    ? null
+    : freezeSiteOpsReferenceBlueprint({
+        sampleId: styleSample.id,
+        previewLocalAssetId: styleSample.previewLocalAssetId,
+        note: styleSample.note,
+        sourceMetadata: styleSample.sourceMetadata,
+      });
   const aiCredential = await ensureActiveCustomerAiCredential(
     tx,
     input.actor.id,
@@ -4512,11 +4551,13 @@ async function handleRevision(
     .orderBy(desc(siteOperations.createdAt))
     .limit(1);
   const parentOperationInput = parentOperationRows[0]?.input;
-  const referenceBlueprint = referenceBlueprintForSiteOpsRevision({
-    parentWorkflowVersion: parent.workflowVersion,
-    parentOperationInput,
-    derivedReferenceBlueprint,
-  });
+  const referenceBlueprint = derivedReferenceBlueprint
+    ? referenceBlueprintForSiteOpsRevision({
+        parentWorkflowVersion: parent.workflowVersion,
+        parentOperationInput,
+        derivedReferenceBlueprint,
+      })
+    : null;
   const aiCredentialBinding = freezeSiteOpsCustomerAiCredential({
     credential: aiCredential,
     parentOperationInput,
@@ -4544,7 +4585,9 @@ async function handleRevision(
     // A revision is a new immutable build. Freeze the current workflow,
     // starter and materializer as one coordinate set instead of pairing the
     // current host runtime with a historical parent's contract.
-    ...currentSiteOpsBuildWorkflowCoordinates(),
+    ...siteOpsBuildWorkflowCoordinates(
+      nativeVisual ? SITEOPS_MATERIALIZER_V2_5 : SITEOPS_MATERIALIZER_V2_4,
+    ),
     twentyFirstCredentialId: parent.twentyFirstCredentialId,
     twentyFirstCredentialVersion: parent.twentyFirstCredentialVersion,
     styleSampleId: parent.styleSampleId,
@@ -4562,8 +4605,10 @@ async function handleRevision(
     payload: {
       ...input.payload,
       childBuildId: buildId,
-      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-      referenceBlueprint,
+      workflowVersion: nativeVisual
+        ? SITEOPS_MATERIALIZER_V2_5.frontMindVersion
+        : SITEOPS_MATERIALIZER_V2_4.frontMindVersion,
+      ...(referenceBlueprint ? { referenceBlueprint } : {}),
       ...aiCredentialBinding,
     },
     kind: "build_revision",
@@ -5345,10 +5390,7 @@ async function handleProviderOperation(
     .where(eq(siteProjects.id, input.project.id));
 }
 
-export async function actOnSiteOps(
-  actor: AuthenticatedUser,
-  value: unknown,
-) {
+export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
   assertEnabled();
   assertCustomer(actor);
   const input = siteOpsActInputSchema.parse(value);

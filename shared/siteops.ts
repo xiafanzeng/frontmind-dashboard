@@ -196,6 +196,28 @@ export const SITEOPS_MATERIALIZER_V2_4 = {
   qaPolicyVersion: "siteops-qa-v5",
 } as const;
 
+/** Native React 2.5 freezes the complete 21st source/Demo/CSS/dependency
+ * bundle, asks Manus for one complete source archive, and compiles that
+ * archive directly. It deliberately has no host-owned visual renderer. */
+export const SITEOPS_MATERIALIZER_V2_5 = {
+  upstreamVersion: "21st-native-react-v1",
+  upstreamSha256:
+    "18cb8afc97cc07b75a8189dbddb04afa2dc705da585d65a773f340965543991c",
+  frontMindVersion: "2.5.0",
+  runtimeManifestSha256:
+    "20269281a2dccad71186be8aa4c2d96b54d89d0235b119faa31319930acd6b94",
+  starterVersion: "twenty-first-native-react-v1",
+  starterSha256:
+    "18cb8afc97cc07b75a8189dbddb04afa2dc705da585d65a773f340965543991c",
+  componentLibraryVersion: "twenty-first-native-react-v1",
+  materializerVersion: "2.5.0",
+  materializerSha256:
+    "f799c987dd62dc3c0dfa55aeb8f9ffb62b30e34870aaec6410d6031d84bc00df",
+  qaPolicyVersion: "siteops-native-qa-v1",
+} as const;
+
+/** Host-rendered historical default retained for immutable V1-V4 readers.
+ * New SiteOps roots are explicitly pinned to V2.5 by the service boundary. */
 export const SITEOPS_WORKFLOW = SITEOPS_MATERIALIZER_V2_4;
 
 const SITEOPS_WORKFLOWS_BY_VERSION = {
@@ -209,6 +231,7 @@ const SITEOPS_WORKFLOWS_BY_VERSION = {
   [SITEOPS_MATERIALIZER_V2_2.frontMindVersion]: SITEOPS_MATERIALIZER_V2_2,
   [SITEOPS_MATERIALIZER_V2_3.frontMindVersion]: SITEOPS_MATERIALIZER_V2_3,
   [SITEOPS_MATERIALIZER_V2_4.frontMindVersion]: SITEOPS_MATERIALIZER_V2_4,
+  [SITEOPS_MATERIALIZER_V2_5.frontMindVersion]: SITEOPS_MATERIALIZER_V2_5,
 } as const;
 
 export function siteOpsWorkflowForVersion(version: string) {
@@ -1029,8 +1052,141 @@ export const visualSelectionBundleV4Schema = z
     }
   });
 
-/** Immutable V1/V2/V3 artifacts remain readable; every new visual operation writes V4. */
+/**
+ * V5 is the first source-backed visual contract. The customer-facing preview
+ * is rendered from the exact frozen React source archive; the provider's
+ * catalog preview remains separate evidence and is never substituted for the
+ * local render. The manifest lives inside a bounded application/zip artifact
+ * together with one nested source archive per candidate.
+ */
+export const visualCandidateV5Schema = visualCandidateV2BaseSchema
+  .omit({ previewLocalAssetId: true, previewSha256: true })
+  .extend({
+    label: z.string().regex(/^[A-I]$/u),
+    providerItemId: z.string().trim().min(1).max(191),
+    providerVersion: z.string().trim().min(1).max(191).nullable(),
+    referencePreviewLocalAssetId: z.string().uuid(),
+    referencePreviewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    referencePerceptualHash: z.string().regex(/^[a-f0-9]{16}$/u),
+    previewLocalAssetId: z.string().uuid(),
+    previewSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceTreeSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchiveSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    sourceArchivePath: z.string().regex(/^candidates\/[A-I]\/source\.zip$/u),
+    entrypoint: z
+      .string()
+      .trim()
+      .min(1)
+      .max(240)
+      .regex(/^(?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+\.[cm]?[jt]sx?$/u),
+    demoEntrypoint: z
+      .string()
+      .trim()
+      .min(1)
+      .max(240)
+      .regex(/^(?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+\.[cm]?[jt]sx?$/u),
+    sourceDirectory: z.literal("source"),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.providerItemKey !== value.visualEvidence.providerItemKey) {
+      context.addIssue({
+        code: "custom",
+        path: ["visualEvidence", "providerItemKey"],
+        message: "V5 provider evidence does not match candidate",
+      });
+    }
+    if (value.referencePreviewSha256 !== value.visualEvidence.previewSha256) {
+      context.addIssue({
+        code: "custom",
+        path: ["visualEvidence", "previewSha256"],
+        message: "V5 provider evidence does not match reference preview",
+      });
+    }
+    if (value.taxonomy.role !== expectedRoleForVisualAxis(value.queryAxis)) {
+      context.addIssue({
+        code: "custom",
+        path: ["taxonomy", "role"],
+        message: "V5 visual taxonomy role does not match query axis",
+      });
+    }
+    if (value.sourceArchivePath !== `candidates/${value.label}/source.zip`) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourceArchivePath"],
+        message: "V5 source archive path does not match candidate label",
+      });
+    }
+  });
+
+export const visualSelectionBundleV5Schema = z
+  .object({
+    schemaVersion: z.literal(5),
+    renderer: z.literal("twenty_first_native_react_v1"),
+    queryPlanHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    searchTarget: z.number().int().min(9).max(324),
+    displayTarget: z.literal(9),
+    candidates: z.array(visualCandidateV5Schema).length(9),
+    selectedCandidateId: z.string().max(191).nullable(),
+    delegated: z.boolean().default(false),
+    degradedReasons: z.array(z.string().max(500)).max(30).default([]),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const unique = (coordinates: string[], path: string) => {
+      if (new Set(coordinates).size !== coordinates.length) {
+        context.addIssue({
+          code: "custom",
+          path: [path],
+          message: `V5 visual ${path} coordinates must be unique`,
+        });
+      }
+    };
+    unique(
+      value.candidates.map((candidate) => candidate.id),
+      "candidateId",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.label),
+      "label",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.providerItemKey),
+      "providerItemKey",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.referencePreviewSha256),
+      "referencePreviewSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.previewSha256),
+      "previewSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sourceTreeSha256),
+      "sourceTreeSha256",
+    );
+    unique(
+      value.candidates.map((candidate) => candidate.sourceArchivePath),
+      "sourceArchivePath",
+    );
+    if (
+      value.selectedCandidateId !== null &&
+      !value.candidates.some(
+        (candidate) => candidate.id === value.selectedCandidateId,
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["selectedCandidateId"],
+        message: "Selected visual candidate is absent",
+      });
+    }
+  });
+
+/** Immutable V1/V2/V3/V4 artifacts remain readable; workflow 2.5 writes V5. */
 export const visualSelectionBundleSchema = z.union([
+  visualSelectionBundleV5Schema,
   visualSelectionBundleV4Schema,
   visualSelectionBundleV3Schema,
   visualSelectionBundleV2Schema,
@@ -1190,6 +1346,9 @@ export type VisualSelectionBundleV3 = z.infer<
 >;
 export type VisualSelectionBundleV4 = z.infer<
   typeof visualSelectionBundleV4Schema
+>;
+export type VisualSelectionBundleV5 = z.infer<
+  typeof visualSelectionBundleV5Schema
 >;
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;

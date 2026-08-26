@@ -7,9 +7,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   coverageForTarget,
   createEsaSiteOpsProviderHandler,
+  materializeSiteOpsProductionSource,
   packageEsaStaticAssets,
   type EsaDirectApi,
 } from "./esa-provider";
+import { SITEOPS_MATERIALIZER_V2_5 } from "../../shared/siteops";
 
 const operation = {
   id: "10000000-0000-4000-8000-000000000001",
@@ -50,8 +52,7 @@ function disabledResetOperation(input: {
       expectedProjectRevision: input.revision ?? 9,
       expectedCurrentBuildId: null,
       expectedKnowledgeSnapshotId: null,
-      expectedGlobalLiveDeploymentId:
-        input.globalLiveDeploymentId ?? null,
+      expectedGlobalLiveDeploymentId: input.globalLiveDeploymentId ?? null,
       expectedMainlandLiveDeploymentId: null,
       expectedCanonicalHostname: "example.com",
     },
@@ -199,21 +200,17 @@ describe("direct ESA SiteOps provider", () => {
     {
       label: "a historical ESA operation",
       db: {
-        priorEsaOperations: [
-          { id: "80000000-0000-4000-8000-000000000008" },
-        ],
+        priorEsaOperations: [{ id: "80000000-0000-4000-8000-000000000008" }],
       },
       operation: {},
     },
     {
       label: "a live head",
       db: {
-        globalLiveDeploymentId:
-          "90000000-0000-4000-8000-000000000009",
+        globalLiveDeploymentId: "90000000-0000-4000-8000-000000000009",
       },
       operation: {
-        globalLiveDeploymentId:
-          "90000000-0000-4000-8000-000000000009",
+        globalLiveDeploymentId: "90000000-0000-4000-8000-000000000009",
       },
     },
   ])(
@@ -292,10 +289,8 @@ describe("direct ESA SiteOps provider", () => {
       userId: operation.userId,
       revision: 9,
       currentBuildId: "30000000-0000-4000-8000-000000000003",
-      currentKnowledgeSnapshotId:
-        "40000000-0000-4000-8000-000000000004",
-      globalLiveDeploymentId:
-        "50000000-0000-4000-8000-000000000005",
+      currentKnowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
       mainlandLiveDeploymentId: null,
       canonicalHostname: "example.com",
     };
@@ -347,9 +342,7 @@ describe("direct ESA SiteOps provider", () => {
     } satisfies EsaDirectApi;
     const publicHttpsFetch = vi.fn().mockResolvedValue({
       response: new Response(null, { status: 404 }),
-      finalUrl: new URL(
-        "https://example.com/frontmind-deployment.json",
-      ),
+      finalUrl: new URL("https://example.com/frontmind-deployment.json"),
     });
     const handler = createEsaSiteOpsProviderHandler({
       getDb: vi.fn().mockResolvedValue(db) as never,
@@ -401,15 +394,13 @@ describe("direct ESA SiteOps provider", () => {
 
   it("does not finalize reset while the previous public deployment marker remains", async () => {
     enableEsaTestRuntime();
-    const previousDeploymentId =
-      "50000000-0000-4000-8000-000000000005";
+    const previousDeploymentId = "50000000-0000-4000-8000-000000000005";
     const project = {
       id: operation.projectId,
       userId: operation.userId,
       revision: 9,
       currentBuildId: "30000000-0000-4000-8000-000000000003",
-      currentKnowledgeSnapshotId:
-        "40000000-0000-4000-8000-000000000004",
+      currentKnowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
       globalLiveDeploymentId: previousDeploymentId,
       mainlandLiveDeploymentId: null,
       canonicalHostname: "example.com",
@@ -446,14 +437,10 @@ describe("direct ESA SiteOps provider", () => {
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       ),
-      finalUrl: new URL(
-        "https://example.com/frontmind-deployment.json",
-      ),
+      finalUrl: new URL("https://example.com/frontmind-deployment.json"),
     }));
     const handler = createEsaSiteOpsProviderHandler({
-      getDb: vi
-        .fn()
-        .mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      getDb: vi.fn().mockResolvedValue({ select: vi.fn(() => query) }) as never,
       api,
       publicHttpsFetch: publicHttpsFetch as never,
     });
@@ -525,10 +512,8 @@ describe("direct ESA SiteOps provider", () => {
       userId: operation.userId,
       revision: 9,
       currentBuildId: "30000000-0000-4000-8000-000000000003",
-      currentKnowledgeSnapshotId:
-        "40000000-0000-4000-8000-000000000004",
-      globalLiveDeploymentId:
-        "50000000-0000-4000-8000-000000000005",
+      currentKnowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
       mainlandLiveDeploymentId: null,
       canonicalHostname: "example.com",
     };
@@ -556,15 +541,11 @@ describe("direct ESA SiteOps provider", () => {
       listEdgeRoutineRecords: vi.fn(),
     } satisfies EsaDirectApi;
     const handler = createEsaSiteOpsProviderHandler({
-      getDb: vi
-        .fn()
-        .mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      getDb: vi.fn().mockResolvedValue({ select: vi.fn(() => query) }) as never,
       api,
       publicHttpsFetch: vi.fn().mockResolvedValue({
         response: new Response("temporary", { status: 503 }),
-        finalUrl: new URL(
-          "https://example.com/frontmind-deployment.json",
-        ),
+        finalUrl: new URL("https://example.com/frontmind-deployment.json"),
       }) as never,
     });
 
@@ -614,10 +595,8 @@ describe("direct ESA SiteOps provider", () => {
       userId: operation.userId,
       revision: 9,
       currentBuildId: "30000000-0000-4000-8000-000000000003",
-      currentKnowledgeSnapshotId:
-        "40000000-0000-4000-8000-000000000004",
-      globalLiveDeploymentId:
-        "50000000-0000-4000-8000-000000000005",
+      currentKnowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      globalLiveDeploymentId: "50000000-0000-4000-8000-000000000005",
       mainlandLiveDeploymentId: null,
       canonicalHostname: "example.com",
     };
@@ -645,18 +624,14 @@ describe("direct ESA SiteOps provider", () => {
       listEdgeRoutineRecords: vi.fn(),
     } satisfies EsaDirectApi;
     const handler = createEsaSiteOpsProviderHandler({
-      getDb: vi
-        .fn()
-        .mockResolvedValue({ select: vi.fn(() => query) }) as never,
+      getDb: vi.fn().mockResolvedValue({ select: vi.fn(() => query) }) as never,
       api,
       publicHttpsFetch: vi.fn().mockResolvedValue({
         response: new Response(body, {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
-        finalUrl: new URL(
-          "https://example.com/frontmind-deployment.json",
-        ),
+        finalUrl: new URL("https://example.com/frontmind-deployment.json"),
       }) as never,
     });
 
@@ -739,10 +714,8 @@ describe("direct ESA SiteOps provider", () => {
           intent: "approved_reset_unpublish",
           rebuildTicketId: "60000000-0000-4000-8000-000000000006",
           expectedProjectRevision: 9,
-          expectedCurrentBuildId:
-            "30000000-0000-4000-8000-000000000003",
-          expectedKnowledgeSnapshotId:
-            "40000000-0000-4000-8000-000000000004",
+          expectedCurrentBuildId: "30000000-0000-4000-8000-000000000003",
+          expectedKnowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
           expectedGlobalLiveDeploymentId:
             "50000000-0000-4000-8000-000000000005",
           expectedMainlandLiveDeploymentId: null,
@@ -787,9 +760,7 @@ describe("direct ESA SiteOps provider", () => {
     );
     expect(
       JSON.parse(
-        await parsed
-          .file("assets/frontmind-deployment.json")!
-          .async("string"),
+        await parsed.file("assets/frontmind-deployment.json")!.async("string"),
       ),
     ).toEqual({
       schemaVersion: 2,
@@ -952,9 +923,9 @@ describe("direct ESA SiteOps provider", () => {
     const joinedQuery: any = {
       innerJoin: vi.fn(),
       where: vi.fn(() => ({
-        limit: vi.fn().mockImplementation(async () => [
-          { deployment, project, build },
-        ]),
+        limit: vi
+          .fn()
+          .mockImplementation(async () => [{ deployment, project, build }]),
       })),
     };
     joinedQuery.innerJoin.mockReturnValue(joinedQuery);
@@ -1043,6 +1014,90 @@ describe("direct ESA SiteOps provider", () => {
     expect(api.createAssetsCodeVersion).not.toHaveBeenCalled();
   });
 
+  it("rebuilds a V5 source with the native production runtime", async () => {
+    const digest = (value: Buffer | string) =>
+      createHash("sha256").update(value).digest("hex");
+    const archive = new JSZip();
+    archive.file(
+      "package.json",
+      JSON.stringify({
+        type: "module",
+        dependencies: { react: "19.2.1", "react-dom": "19.2.1" },
+      }),
+    );
+    archive.file(
+      "index.html",
+      '<!doctype html><div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+    );
+    archive.file(
+      "src/main.tsx",
+      'import React from "react";import{createRoot}from"react-dom/client";createRoot(document.getElementById("root")!).render(<main>官网</main>);',
+    );
+    const sourceZip = await archive.generateAsync({ type: "nodebuffer" });
+    const sourceSha256 = digest(sourceZip);
+    const contractJson = Buffer.from(
+      JSON.stringify({
+        contractKind: "twenty_first_native_build_contract",
+        renderer: "twenty_first_native_react_v1",
+      }),
+    );
+    const qaJson = Buffer.from(
+      JSON.stringify({ passed: true, mode: "production" }),
+    );
+    const nativeOutput = {
+      contractJson,
+      contractSha256: digest(contractJson),
+      sourceZip,
+      sourceSha256,
+      distZip: Buffer.from("native-production-dist"),
+      distSha256: digest("native-production-dist"),
+      qaJson,
+      qaSha256: digest(qaJson),
+      visualQaZip: Buffer.from("native-production-qa"),
+      visualQaSha256: digest("native-production-qa"),
+      provenanceJson: Buffer.from("{}\n"),
+      provenanceSha256: digest("{}\n"),
+      buildDelivery: {
+        renderMode: "twenty_first_native",
+        qaStatus: "passed",
+        warningCodes: [],
+      },
+    };
+    const materializeNativeProduction = vi.fn(async (input: any) => {
+      expect(input.validatedSource.sourceZip.equals(sourceZip)).toBe(true);
+      expect(input.canonicalOrigin).toBe("https://example.com");
+      expect(input.target).toBe("global_excluding_cn");
+      return nativeOutput as never;
+    });
+    const materializeProduction = vi.fn();
+
+    const output = await materializeSiteOpsProductionSource({
+      sourceZip,
+      sourceSha256,
+      build: {
+        id: "13000000-0000-4000-8000-000000000013",
+        projectId: operation.projectId,
+        knowledgeSnapshotId: "11000000-0000-4000-8000-000000000011",
+        workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+        selectionHash: "a".repeat(64),
+        brief: {},
+      },
+      target: "global_excluding_cn",
+      canonicalOrigin: "https://example.com",
+      materializeProduction: materializeProduction as never,
+      materializeNativeProduction: materializeNativeProduction as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(materializeProduction).not.toHaveBeenCalled();
+    expect(materializeNativeProduction).toHaveBeenCalledTimes(1);
+    expect(output).toMatchObject({
+      sourceSha256,
+      distSha256: nativeOutput.distSha256,
+      qaSha256: nativeOutput.visualQaSha256,
+    });
+  });
+
   it("recreates a deleted Routine, deploys the frozen version, and restores the exact relation", async () => {
     enableEsaTestRuntime();
     const distHash = "c".repeat(64);
@@ -1066,18 +1121,15 @@ describe("direct ESA SiteOps provider", () => {
           target: "global_excluding_cn",
           sourceLocalAssetId,
           sourceSha256: sourceHash,
-          contractLocalAssetId:
-            "70000000-0000-4000-8000-000000000007",
+          contractLocalAssetId: "70000000-0000-4000-8000-000000000007",
           contractSha256: "e".repeat(64),
-          productionSourceLocalAssetId:
-            "80000000-0000-4000-8000-000000000008",
+          productionSourceLocalAssetId: "80000000-0000-4000-8000-000000000008",
           productionSourceSha256: "f".repeat(64),
           distLocalAssetId,
           distSha256: distHash,
           qaLocalAssetId: "90000000-0000-4000-8000-000000000009",
           qaSha256: "1".repeat(64),
-          provenanceLocalAssetId:
-            "a0000000-0000-4000-8000-00000000000a",
+          provenanceLocalAssetId: "a0000000-0000-4000-8000-00000000000a",
           provenanceSha256: "2".repeat(64),
           qaPolicyVersion: "siteops-qa-v1",
           materializedAt: "2026-08-22T00:00:00.000Z",
@@ -1165,9 +1217,7 @@ describe("direct ESA SiteOps provider", () => {
     const joinedQuery: any = {
       innerJoin: vi.fn(),
       where: vi.fn(() => ({
-        limit: vi
-          .fn()
-          .mockResolvedValue([{ deployment, project, build }]),
+        limit: vi.fn().mockResolvedValue([{ deployment, project, build }]),
       })),
     };
     joinedQuery.innerJoin.mockReturnValue(joinedQuery);
@@ -1182,30 +1232,24 @@ describe("direct ESA SiteOps provider", () => {
     const html = `${" ".repeat(120)}<link href="https://example.com/" rel="canonical">`;
     const publicHttpsFetch = vi
       .fn()
-      .mockResolvedValueOnce(
-        {
-          response: new Response(
-            JSON.stringify({
-              schemaVersion: 2,
-              deploymentId: deployment.id,
-              distSha256: distHash,
-            }),
-            { status: 200, headers: { "content-type": "application/json" } },
-          ),
-          finalUrl: new URL(
-            `https://example.com/frontmind-deployment.json`,
-          ),
-        },
-      )
-      .mockResolvedValueOnce(
-        {
-          response: new Response(html, {
-            status: 200,
-            headers: { "content-type": "text/html; charset=utf-8" },
+      .mockResolvedValueOnce({
+        response: new Response(
+          JSON.stringify({
+            schemaVersion: 2,
+            deploymentId: deployment.id,
+            distSha256: distHash,
           }),
-          finalUrl: new URL("https://example.com/"),
-        },
-      );
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+        finalUrl: new URL(`https://example.com/frontmind-deployment.json`),
+      })
+      .mockResolvedValueOnce({
+        response: new Response(html, {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+        finalUrl: new URL("https://example.com/"),
+      });
     const handler = createEsaSiteOpsProviderHandler({
       getDb: vi.fn().mockResolvedValue(db) as never,
       api,

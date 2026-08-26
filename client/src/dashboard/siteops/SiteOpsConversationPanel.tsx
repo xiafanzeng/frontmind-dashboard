@@ -114,15 +114,6 @@ const BUILD_STATUS_LABELS: Record<string, string> = {
   superseded: "已被新版本替代",
 };
 
-const REBUILD_INTERACTION_LABELS: Partial<
-  Record<SiteOpsObservationV1["interactionState"], string>
-> = {
-  select_snapshot: "从知识库开始建站",
-  collecting_brief: "整理建站资料",
-  visual_searching: "生成视觉候选",
-  awaiting_visual_selection: "等待选择视觉方案",
-};
-
 const CARD_LABELS: Record<string, string> = {
   brief_question: "建站资料",
   visual_board: "视觉方向",
@@ -394,6 +385,7 @@ const SITEOPS_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit",
   minute: "2-digit",
   hour12: false,
+  timeZone: "Asia/Shanghai",
 });
 
 function formatSiteOpsDuration(
@@ -744,14 +736,27 @@ export default function SiteOpsConversationPanel({
 
   function openPrivatePreview(previewUrl: string) {
     setPreviewOpenError(null);
-    const previewWindow = window.open(previewUrl, PRIVATE_PREVIEW_WINDOW_NAME);
+    const previewWindow = window.open(
+      "about:blank",
+      PRIVATE_PREVIEW_WINDOW_NAME,
+    );
     if (!previewWindow) {
       setPreviewOpenError(
         "预览标签页被浏览器阻止，请允许此站点打开弹窗后重试。",
       );
       return;
     }
-    previewWindow.focus();
+    try {
+      previewWindow.opener = null;
+      if (previewWindow.opener !== null) {
+        previewWindow.close();
+        throw new Error("SITEOPS_PREVIEW_OPENER_NOT_SEVERED");
+      }
+      previewWindow.location.replace(previewUrl);
+      previewWindow.focus();
+    } catch {
+      setPreviewOpenError("预览标签页未能安全打开，请使用下方安全链接重试。");
+    }
   }
 
   async function runAction(key: string, input: SiteOpsActionContext) {
@@ -1498,21 +1503,14 @@ export default function SiteOpsConversationPanel({
       observation.rebuildRequest.resetApplied &&
       latestBuild?.id === observation.rebuildRequest.resetSourceBuildId,
   );
-  const rebuildInteractionLabel = observation.rebuildRequest.resetPending
-    ? "正在下线旧官网"
-    : observation.rebuildRequest.resetApplied
-      ? REBUILD_INTERACTION_LABELS[observation.interactionState]
-      : undefined;
-
   return (
     <section className="siteops-panel" aria-labelledby="siteops-panel-title">
       <header className="siteops-panel-header">
         <div>
-          <p>
+          <h2 id="siteops-panel-title" className="siteops-panel-title">
             <Sparkles size={15} aria-hidden="true" />
             {SITEOPS_CUSTOMER_DISPLAY_NAME}
-          </p>
-          <h2 id="siteops-panel-title">{SITEOPS_CUSTOMER_DISPLAY_NAME}</h2>
+          </h2>
           <span>
             从企业知识库开始，选择视觉方案后由 FrontMind 完成官网制作与检查。
           </span>
@@ -1630,19 +1628,6 @@ export default function SiteOpsConversationPanel({
         </div>
       )}
 
-      <div className="siteops-stage" data-state={observation.interactionState}>
-        <span>当前阶段</span>
-        <strong>
-          {rebuildInteractionLabel
-            ? rebuildInteractionLabel
-            : latestAttempt
-              ? BUILD_STATUS_LABELS[latestAttempt.status] || "正在处理"
-              : observation.interactionState === "select_snapshot"
-                ? "从知识库开始建站"
-                : "整理建站资料"}
-        </strong>
-      </div>
-
       <SiteOpsExecutionTimeline steps={observation.executionSteps ?? []} />
 
       {observation.project.status === "draft" && !currentSnapshotId && (
@@ -1676,11 +1661,7 @@ export default function SiteOpsConversationPanel({
             }
           >
             {busyAction === "select_snapshot" && (
-              <Loader2
-                className="siteops-spin"
-                size={15}
-                aria-hidden="true"
-              />
+              <Loader2 className="siteops-spin" size={15} aria-hidden="true" />
             )}
             从知识库开始建站
           </button>
@@ -1958,7 +1939,6 @@ export default function SiteOpsConversationPanel({
           aria-labelledby="siteops-build-title"
         >
           <div>
-            <span>官网版本 {latestBuild.ordinal}</span>
             <h3 id="siteops-build-title">
               {BUILD_STATUS_LABELS[latestBuild.status] || "正在处理"}
             </h3>
@@ -1970,7 +1950,8 @@ export default function SiteOpsConversationPanel({
                 </p>
               )}
             {latestBuild.previewUrl &&
-              latestBuild.buildDelivery?.renderMode === "primary" &&
+              latestBuild.buildDelivery &&
+              latestBuild.buildDelivery.renderMode !== "trusted_fallback" &&
               latestBuild.buildDelivery.qaStatus !== "passed" && (
                 <p>
                   官网预览已生成，质量检查中的非阻断建议已记录，不影响查看和后续发布。

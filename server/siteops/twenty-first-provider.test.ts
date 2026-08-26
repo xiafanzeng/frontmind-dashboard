@@ -21,6 +21,11 @@ import {
   type TwentyFirstProviderContext,
 } from "./twenty-first-provider";
 import {
+  createNativeSourceArchive,
+  normalizeTwentyFirstNativeSource,
+  readVisualSelectionBundleArtifact,
+} from "./native-visual-source";
+import {
   fetchPinnedPublicHttps,
   fetchSafeVisualPreview,
   isPublicPreviewAddress,
@@ -637,6 +642,263 @@ describe("21st SiteOps provider", () => {
     ).toHaveLength(1);
   });
 
+  it("writes a V5 source-backed board for workflow 2.5 and uses local React renders as previews", async () => {
+    const row = operation();
+    row.input = {
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "2.5.0",
+    };
+    let nextId = 1;
+    const search = vi.fn(async () => {
+      const familyIndex = Math.floor((nextId - 1) / 4);
+      const metadata = familyMetadata(familyIndex);
+      return {
+        results: Array.from({ length: 4 }, () => {
+          const id = nextId++;
+          return {
+            id,
+            name: `${metadata.name} ${id}`,
+            description: metadata.description,
+            previewUrl: `https://cdn.example.test/${id}.png`,
+          };
+        }),
+      };
+    });
+    const getComponent = vi.fn(async (providerItemId: string | number) => ({
+      data: {
+        id: providerItemId,
+        version: `v${providerItemId}`,
+        componentCode: `import React from "react";export default function Native${providerItemId}(){return <main>Native ${providerItemId}</main>}`,
+        demoCode: `import React from "react";import Native from "./component";export default function Demo${providerItemId}(){return <Native/>}`,
+        dependencies: ["react@19.2.1", "react-dom@19.2.1"],
+      },
+    }));
+    const selectionArtifacts: Array<{
+      buffer: Buffer;
+      mimeType: string;
+      maxBytes: number;
+    }> = [];
+    let persisted: TwentyFirstBoardPersistenceInput | null = null;
+    const renderCandidates = vi.fn();
+    let activeNativePreparations = 0;
+    let maximumNativePreparations = 0;
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            effectiveSearchLimit: 18,
+            search,
+            getComponent,
+          }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+          visualSignals: {
+            dominantHex: "#f5f5f5",
+            brightness: 220,
+            contrast: 70,
+          },
+        };
+      }),
+      prepareNativeCandidate: vi.fn(async ({ candidate, payload }) => {
+        activeNativePreparations += 1;
+        maximumNativePreparations = Math.max(
+          maximumNativePreparations,
+          activeNativePreparations,
+        );
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+          if (candidate.providerItemId === 1) {
+            throw new Error("provider source is incomplete");
+          }
+          const source = normalizeTwentyFirstNativeSource({
+            candidate,
+            payload,
+          });
+          const sourceArchive = await createNativeSourceArchive(source);
+          const preview = await perceptuallyDistinctPng(
+            100 + Number(candidate.providerItemId),
+          );
+          return {
+            ...source,
+            sourceArchive,
+            sourceArchiveSha256: sha256(sourceArchive),
+            preview,
+            previewSha256: sha256(preview),
+          };
+        } finally {
+          activeNativePreparations -= 1;
+        }
+      }),
+      renderCandidates,
+      persistArtifact: vi.fn(async (input) => {
+        if (input.kind === "21st-selection-bundle") {
+          selectionArtifacts.push({
+            buffer: Buffer.from(input.buffer),
+            mimeType: input.mimeType,
+            maxBytes: input.maxBytes,
+          });
+        }
+        return {
+          id: randomUUID(),
+          contentSha256: sha256(input.buffer),
+        } as never;
+      }),
+      persistBoard: vi.fn(async (_db, input) => {
+        persisted = input;
+        return {
+          batchId: "55555555-5555-4555-8555-555555555555",
+          candidateCount: input.mirroredCandidates.length,
+          selectionBundleHash: input.selectionBundleArtifact.contentSha256,
+        };
+      }),
+    });
+
+    await expect(
+      handler({
+        operation: row,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "succeeded",
+      result: { candidateCount: 9, actual: { presented: 9 } },
+    });
+    expect(renderCandidates).not.toHaveBeenCalled();
+    // A source-level rejection must remove only that catalog item and follow
+    // the existing matching graph to a deeper, source-backed replacement.
+    expect(getComponent.mock.calls.length).toBeGreaterThan(9);
+    expect(maximumNativePreparations).toBeLessThanOrEqual(3);
+    expect(search).toHaveBeenCalledTimes(9);
+    expect(
+      search.mock.calls.every(
+        ([input]) =>
+          input.tag === undefined &&
+          input.query.includes(
+            "complete responsive landing page homepage source",
+          ),
+      ),
+    ).toBe(true);
+    expect(persisted!.selectionBundle).toMatchObject({
+      schemaVersion: 5,
+      renderer: "twenty_first_native_react_v1",
+      displayTarget: 9,
+    });
+    expect(
+      persisted!.mirroredCandidates.every(
+        (candidate) =>
+          "sourceTreeSha256" in candidate &&
+          candidate.previewLocalAssetId !==
+            candidate.referencePreviewLocalAssetId,
+      ),
+    ).toBe(true);
+    expect(selectionArtifacts).toHaveLength(1);
+    expect(selectionArtifacts[0]).toMatchObject({
+      mimeType: "application/zip",
+      maxBytes: 25 * 1024 * 1024,
+    });
+    const restored = await readVisualSelectionBundleArtifact(
+      selectionArtifacts[0]!.buffer,
+    );
+    expect(restored.bundle.candidates).toHaveLength(9);
+    expect(restored.archives.size).toBe(9);
+  });
+
+  it("requires the advertised get_component capability before a V5 board can be published", async () => {
+    const row = operation();
+    row.input = {
+      knowledgeSnapshotId: snapshotId,
+      credentialId,
+      credentialVersion: 3,
+      workflowVersion: "2.5.0",
+    };
+    let nextId = 1;
+    const persistArtifact = vi.fn();
+    const persistBoard = vi.fn();
+    const prepareNativeCandidate = vi.fn();
+    const handler = createTwentyFirstSiteOpsProviderHandler({
+      getDb: async () => ({ fake: "db" }),
+      loadContext: async () => providerContext(),
+      getCredential: async () => ({
+        id: credentialId,
+        version: 3,
+        fingerprint: "fingerprint",
+        apiKey: "21st_sk_test_secret",
+      }),
+      client: {
+        withReadOnlySession: async (_apiKey, use) =>
+          use({
+            effectiveSearchLimit: 18,
+            search: async () => {
+              const familyIndex = Math.floor((nextId - 1) / 4);
+              const metadata = familyMetadata(familyIndex);
+              return {
+                results: Array.from({ length: 4 }, () => {
+                  const id = nextId++;
+                  return {
+                    id,
+                    name: `${metadata.name} ${id}`,
+                    description: metadata.description,
+                    previewUrl: `https://cdn.example.test/${id}.png`,
+                  };
+                }),
+              };
+            },
+          }),
+      },
+      fetchPreview: vi.fn(async ({ url }) => {
+        const id = Number(new URL(url).pathname.replace(/\D/gu, ""));
+        const buffer = await perceptuallyDistinctPng(id);
+        return {
+          finalUrl: url,
+          mimeType: "image/png",
+          buffer,
+          width: 1200,
+          height: 800,
+          sha256: sha256(buffer),
+          visualSignals: {
+            dominantHex: "#f5f5f5",
+            brightness: 220,
+            contrast: 70,
+          },
+        };
+      }),
+      prepareNativeCandidate,
+      persistArtifact: persistArtifact as never,
+      persistBoard,
+    });
+
+    await expect(
+      handler({
+        operation: row,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "attention_required",
+      code: "MCP_GET_COMPONENT_REQUIRED",
+    });
+    expect(prepareNativeCandidate).not.toHaveBeenCalled();
+    expect(persistArtifact).not.toHaveBeenCalled();
+    expect(persistBoard).not.toHaveBeenCalled();
+  });
+
   it("uses fresh V2 supplemental references from ranks thirteen through eighteen", async () => {
     let familyIndex = 0;
     const search = vi.fn(async (input: { limit: number; query: string }) => {
@@ -766,7 +1028,7 @@ describe("21st SiteOps provider", () => {
         result.result as {
           diagnostics: { mirrorAttempted: number };
         }
-    ).diagnostics.mirrorAttempted,
+      ).diagnostics.mirrorAttempted,
     ).toBe(9);
   });
 
@@ -813,8 +1075,7 @@ describe("21st SiteOps provider", () => {
           blueprints.map(async (blueprint) => ({
             heroFamily: blueprint.heroFamily,
             buffer: await perceptuallyDistinctPng(
-              600 +
-                FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+              600 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
             ),
           })),
         ),
@@ -901,8 +1162,7 @@ describe("21st SiteOps provider", () => {
           blueprints.map(async (blueprint) => ({
             heroFamily: blueprint.heroFamily,
             buffer: await perceptuallyDistinctPng(
-              650 +
-                FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+              650 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
             ),
           })),
         ),
@@ -1169,7 +1429,8 @@ describe("21st SiteOps provider", () => {
     const search = vi.fn(async () => {
       const currentCall = callIndex++;
       const id =
-        currentCall === 0 || currentCall === 1 ||
+        currentCall === 0 ||
+        currentCall === 1 ||
         (currentCall >= 9 && currentCall < 17)
           ? 1
           : currentCall < 9
@@ -1215,8 +1476,7 @@ describe("21st SiteOps provider", () => {
           blueprints.map(async (blueprint) => ({
             heroFamily: blueprint.heroFamily,
             buffer: await perceptuallyDistinctPng(
-              900 +
-                FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+              900 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
             ),
           })),
         ),
@@ -1313,8 +1573,7 @@ describe("21st SiteOps provider", () => {
           blueprints.map(async (blueprint) => ({
             heroFamily: blueprint.heroFamily,
             buffer: await perceptuallyDistinctPng(
-              950 +
-                FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+              950 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
             ),
           })),
         ),
@@ -1404,8 +1663,7 @@ describe("21st SiteOps provider", () => {
           blueprints.map(async (blueprint) => ({
             heroFamily: blueprint.heroFamily,
             buffer: await perceptuallyDistinctPng(
-              980 +
-                FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
+              980 + FRONTMIND_VISUAL_FAMILIES_V3.indexOf(blueprint.heroFamily),
             ),
           })),
         ),

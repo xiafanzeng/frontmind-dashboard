@@ -275,13 +275,250 @@ function rewriteCssRootUrls(value: string, prefix: string) {
     );
 }
 
+function localPreviewAssetPath(raw: string, from: string) {
+  const decoded = raw.trim();
+  if (
+    !decoded ||
+    decoded.startsWith("#") ||
+    /^(?:data:|blob:|mailto:|tel:|https?:|\/\/)/iu.test(decoded)
+  ) {
+    return null;
+  }
+  const withoutSuffix = decoded.split(/[?#]/u, 1)[0]!;
+  const resolved = withoutSuffix.startsWith("/")
+    ? withoutSuffix.slice(1)
+    : path.posix.normalize(
+        path.posix.join(path.posix.dirname(from), withoutSuffix),
+      );
+  if (
+    !resolved ||
+    resolved.startsWith("../") ||
+    resolved.includes("\\") ||
+    resolved.split("/").some((part) => part === "." || part === "..")
+  ) {
+    throw new Error("SITEOPS_PREVIEW_PATH_INVALID");
+  }
+  return resolved;
+}
+
+async function replaceAsync(
+  value: string,
+  expression: RegExp,
+  replacer: (...groups: string[]) => Promise<string>,
+) {
+  const matches = [...value.matchAll(expression)];
+  if (matches.length === 0) return value;
+  const replacements = await Promise.all(
+    matches.map((match) =>
+      replacer(match[0], ...match.slice(1).map((part) => part ?? "")),
+    ),
+  );
+  let cursor = 0;
+  let result = "";
+  matches.forEach((match, index) => {
+    result += value.slice(cursor, match.index) + replacements[index];
+    cursor = (match.index ?? 0) + match[0].length;
+  });
+  return result + value.slice(cursor);
+}
+
+export async function createSandboxedPreviewDocument(input: {
+  zip: JSZip;
+  entryName: string;
+  previewPrefix: string;
+}) {
+  const files = new Map(
+    Object.values(input.zip.files)
+      .filter((entry) => !entry.dir)
+      .map((entry) => [entry.name, entry] as const),
+  );
+  const bytesCache = new Map<string, Buffer>();
+  let expandedBytes = 0;
+  const fileBytes = async (filename: string) => {
+    const cached = bytesCache.get(filename);
+    if (cached) return cached;
+    const entry = files.get(filename);
+    if (!entry || entry.name.includes("\\") || entry.name.includes("..")) {
+      throw new Error("SITEOPS_PREVIEW_ASSET_MISSING");
+    }
+    const mode = Number(entry.unixPermissions ?? 0);
+    if (mode && (mode & 0o170000) === 0o120000) {
+      throw new Error("SITEOPS_DIST_SYMLINK_REJECTED");
+    }
+    const bytes = await entry.async("nodebuffer");
+    expandedBytes += bytes.length;
+    if (bytes.length > 20 * 1024 * 1024 || expandedBytes > MAX_ARCHIVE_BYTES) {
+      throw new Error("SITEOPS_PREVIEW_FILE_TOO_LARGE");
+    }
+    bytesCache.set(filename, bytes);
+    return bytes;
+  };
+  const dataUrl = async (filename: string) => {
+    const mimeType = previewMimeType(filename).split(";", 1)[0];
+    return `data:${mimeType};base64,${(await fileBytes(filename)).toString("base64")}`;
+  };
+  const embedCssUrls = async (css: string, filename: string) =>
+    await replaceAsync(
+      css,
+      /url\(\s*(?:(["'])([^"']+)\1|([^)'"\s]+))\s*\)/giu,
+      async (match, quote, quoted, bare) => {
+        const raw = quoted || bare;
+        const local = localPreviewAssetPath(raw, filename);
+        if (!local) return match;
+        const embedded = await dataUrl(local);
+        return `url(${quote || '"'}${embedded}${quote || '"'})`;
+      },
+    );
+  const inlineCss = async (filename: string, visiting = new Set<string>()) => {
+    if (visiting.has(filename)) {
+      throw new Error("SITEOPS_PREVIEW_STYLE_CYCLE");
+    }
+    const nextVisiting = new Set(visiting).add(filename);
+    let css = (await fileBytes(filename)).toString("utf8");
+    css = await replaceAsync(
+      css,
+      /@import\s+(?:url\(\s*)?(["'])([^"']+)\1\s*\)?\s*;/giu,
+      async (_match, _quote, raw) => {
+        const local = localPreviewAssetPath(raw, filename);
+        if (!local) throw new Error("SITEOPS_PREVIEW_STYLE_INVALID");
+        return await inlineCss(local, nextVisiting);
+      },
+    );
+    return await embedCssUrls(css, filename);
+  };
+  const embedAssetReferences = async (text: string, from: string) => {
+    const assetPaths = [...files.keys()]
+      .filter((filename) => filename !== input.entryName)
+      .sort((left, right) => right.length - left.length);
+    let result = text;
+    for (const filename of assetPaths) {
+      const embedded = await dataUrl(filename);
+      for (const reference of [
+        `/${filename}`,
+        path.posix.relative(path.posix.dirname(from), filename),
+      ]) {
+        if (reference && reference !== ".") {
+          result = result.split(reference).join(embedded);
+        }
+      }
+    }
+    return result;
+  };
+
+  const nonce = randomBytes(18).toString("base64url");
+  let html = (await fileBytes(input.entryName)).toString("utf8");
+  html = await replaceAsync(
+    html,
+    /<link\b(?=[^>]*\brel=["']stylesheet["'])[^>]*\bhref=["']([^"']+)["'][^>]*>/giu,
+    async (_match, raw) => {
+      const local = localPreviewAssetPath(raw, input.entryName);
+      if (!local) throw new Error("SITEOPS_PREVIEW_STYLE_INVALID");
+      return `<style nonce="${nonce}">${await inlineCss(local)}</style>`;
+    },
+  );
+  html = html.replace(
+    /<link\b(?=[^>]*\brel=["'](?:modulepreload|preload)["'])[^>]*>/giu,
+    "",
+  );
+  html = await replaceAsync(
+    html,
+    /<script\b([^>]*)\bsrc=["']([^"']+)["']([^>]*)>\s*<\/script>/giu,
+    async (_match, before, raw, after) => {
+      const local = localPreviewAssetPath(raw, input.entryName);
+      if (!local) throw new Error("SITEOPS_PREVIEW_SCRIPT_INVALID");
+      const embeddedSource = await embedAssetReferences(
+        (await fileBytes(local)).toString("utf8"),
+        local,
+      );
+      const source = rewriteSiteOpsPreviewDocument({
+        bytes: Buffer.from(embeddedSource, "utf8"),
+        mimeType: "text/javascript; charset=utf-8",
+        previewPrefix: input.previewPrefix,
+      }).toString("utf8");
+      const attributes = `${before} ${after}`
+        .replace(/\s(?:crossorigin|integrity)(?:=["'][^"']*["'])?/giu, "")
+        .trim();
+      return `<script nonce="${nonce}"${attributes ? ` ${attributes}` : ""}>${source.replace(/<\/script/giu, "<\\/script")}</script>`;
+    },
+  );
+  html = await replaceAsync(
+    html,
+    /\b(src|poster)(\s*=\s*)(["'])([^"']+)\3/giu,
+    async (match, name, equals, quote, raw) => {
+      const local = localPreviewAssetPath(raw, input.entryName);
+      if (!local) return match;
+      return `${name}${equals}${quote}${await dataUrl(local)}${quote}`;
+    },
+  );
+  html = await replaceAsync(
+    html,
+    /\bsrcset(\s*=\s*)(["'])([^"']*)\2/giu,
+    async (_match, equals, quote, value) => {
+      const candidates = await Promise.all(
+        value.split(",").map(async (candidate) => {
+          const [raw, ...descriptor] = candidate.trim().split(/\s+/u);
+          const local = raw
+            ? localPreviewAssetPath(raw, input.entryName)
+            : null;
+          return [local ? await dataUrl(local) : raw, ...descriptor]
+            .filter(Boolean)
+            .join(" ");
+        }),
+      );
+      return `srcset${equals}${quote}${candidates.join(", ")}${quote}`;
+    },
+  );
+  html = await replaceAsync(
+    html,
+    /<link\b(?=[^>]*\brel=["']icon["'])[^>]*\bhref=["']([^"']+)["'][^>]*>/giu,
+    async (match, raw) => {
+      const local = localPreviewAssetPath(raw, input.entryName);
+      if (!local) return match;
+      return match.replace(raw, await dataUrl(local));
+    },
+  );
+  html = await replaceAsync(
+    html,
+    /<style\b([^>]*)>([\s\S]*?)<\/style>/giu,
+    async (_match, attributes, css) =>
+      `<style${attributes}>${await embedCssUrls(css, input.entryName)}</style>`,
+  );
+  html = html
+    .replace(
+      /<style\b(?![^>]*\bnonce=)([^>]*)>/giu,
+      `<style nonce="${nonce}"$1>`,
+    )
+    .replace(
+      /<script\b(?![^>]*\bnonce=)([^>]*)>/giu,
+      `<script nonce="${nonce}"$1>`,
+    )
+    .replace(
+      /\bhref(\s*=\s*)(["'])(\/(?!\/)[^"']*)\2/giu,
+      (_match, equals: string, quote: string, url: string) =>
+        `href${equals}${quote}${prefixPreviewRootUrl(url, input.previewPrefix)}${quote}`,
+    );
+  return { bytes: Buffer.from(html, "utf8"), nonce };
+}
+
+export function sandboxedPreviewContentSecurityPolicy(nonce: string) {
+  if (!/^[A-Za-z0-9_-]{16,64}$/u.test(nonce)) {
+    throw new Error("SITEOPS_PREVIEW_NONCE_INVALID");
+  }
+  return `sandbox allow-scripts; default-src 'none'; img-src data: blob:; font-src data:; style-src 'nonce-${nonce}'; style-src-attr 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'none'; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; media-src data: blob:; manifest-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`;
+}
+
 export function rewriteSiteOpsPreviewDocument(input: {
   bytes: Buffer;
   mimeType: string;
   previewPrefix: string;
 }) {
   const mediaType = input.mimeType.split(";", 1)[0]?.trim().toLowerCase();
-  if (mediaType !== "text/html" && mediaType !== "text/css") {
+  if (
+    mediaType !== "text/html" &&
+    mediaType !== "text/css" &&
+    mediaType !== "text/javascript" &&
+    mediaType !== "application/javascript"
+  ) {
     return input.bytes;
   }
   let text = input.bytes.toString("utf8");
@@ -308,6 +545,22 @@ export function rewriteSiteOpsPreviewDocument(input: {
           );
           return `${name}${equals}${quote}${rewritten}${quote}`;
         },
+      );
+  }
+  if (
+    mediaType === "text/javascript" ||
+    mediaType === "application/javascript"
+  ) {
+    text = text
+      .replace(
+        /(["'`])(\/(?!\/)[A-Za-z0-9._~!$&()*+,;=:@%/?#-]*)\1/gu,
+        (_match, quote: string, url: string) =>
+          `${quote}${prefixPreviewRootUrl(url, input.previewPrefix)}${quote}`,
+      )
+      .replace(
+        /(`)(\/(?!\/)(?=[A-Za-z0-9._~!$&()*+,;=:@%/?#${}-]))/gu,
+        (_match, quote: string, root: string) =>
+          `${quote}${prefixPreviewRootUrl(root, input.previewPrefix)}`,
       );
   }
   return Buffer.from(rewriteCssRootUrls(text, input.previewPrefix), "utf8");
@@ -592,32 +845,39 @@ siteOpsArtifactApi.get("/builds/:buildId/preview/*", async (req, res) => {
     const entry = candidates
       .map((candidate) => zip.file(candidate))
       .find(Boolean);
-    if (!entry || entry.name.includes("\\") || entry.name.includes("..")) {
+    if (
+      !entry ||
+      !entry.name.endsWith(".html") ||
+      entry.name.includes("\\") ||
+      entry.name.includes("..")
+    ) {
       return notFound(res);
     }
     const mode = Number(entry.unixPermissions ?? 0);
     if (mode && (mode & 0o170000) === 0o120000) {
       throw new Error("SITEOPS_DIST_SYMLINK_REJECTED");
     }
-    let bytes = await entry.async("nodebuffer");
-    if (bytes.length > 20 * 1024 * 1024) {
-      throw new Error("SITEOPS_PREVIEW_FILE_TOO_LARGE");
-    }
-    const mimeType = previewMimeType(entry.name);
-    bytes = rewriteSiteOpsPreviewDocument({
-      bytes,
-      mimeType,
+    const document = await createSandboxedPreviewDocument({
+      zip,
+      entryName: entry.name,
       previewPrefix: `/api/site-ops/builds/${encodeURIComponent(req.params.buildId)}/preview/`,
     });
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader(
+      "Permissions-Policy",
+      "camera=(), geolocation=(), microphone=()",
+    );
+    res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+    res.setHeader("X-Frame-Options", "DENY");
     res.setHeader(
       "Content-Security-Policy",
-      "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'",
+      sandboxedPreviewContentSecurityPolicy(document.nonce),
     );
-    res.setHeader("Content-Length", String(bytes.length));
-    res.send(bytes);
+    res.setHeader("Content-Length", String(document.bytes.length));
+    res.send(document.bytes);
   } catch (error) {
     sendError(res, error);
   }

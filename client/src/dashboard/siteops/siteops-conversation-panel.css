@@ -24,7 +24,7 @@
   gap: 16px;
 }
 
-.siteops-panel-header p {
+.siteops-panel-title {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -169,24 +169,6 @@
   border: 1px solid #fecaca;
   background: #fef2f2;
   color: #991b1b;
-}
-
-.siteops-stage {
-  display: grid;
-  width: min(100%, 920px);
-  justify-self: center;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 12px;
-  border-radius: 14px;
-  background: #f8fafc;
-  padding: 13px 15px;
-}
-
-.siteops-stage span,
-.siteops-stage small {
-  color: #64748b;
-  font-size: 12px;
 }
 
 .siteops-snapshot-card,
@@ -1106,12 +1088,6 @@
   align-items: center;
 }
 
-.siteops-build-card > div:first-child > span {
-  color: #6366f1;
-  font-size: 12px;
-  font-weight: 800;
-}
-
 .siteops-build-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1294,10 +1270,6 @@
 
   .siteops-timeline-duration {
     grid-column: 2;
-  }
-
-  .siteops-stage {
-    grid-template-columns: 1fr;
   }
 
   .siteops-aliyun-guide li {

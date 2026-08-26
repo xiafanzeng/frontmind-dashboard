@@ -162,6 +162,18 @@ function visualPage(page: 1 | 2 | 3) {
 }
 
 describe("SiteOpsConversationPanel", () => {
+  it("renders one accessible workspace title without the removed stage strip", () => {
+    render(<SiteOpsConversationPanel observation={observation()} />);
+
+    const titles = screen.getAllByRole("heading", {
+      name: "AI友好官网管理",
+    });
+    expect(titles).toHaveLength(1);
+    expect(titles[0]?.tagName).toBe("H2");
+    expect(document.querySelector(".siteops-panel-header p")).toBeNull();
+    expect(screen.queryByText("当前阶段")).not.toBeInTheDocument();
+  });
+
   it("defaults legacy visual generation observations to the idle selectable state", () => {
     expect(
       siteOpsVisualGenerationProjectionSchema.parse({
@@ -312,9 +324,7 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByText("批准后，当前线上官网会进入下线流程。"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        "当前企业知识库会保留，并作为全新建站的资料来源。",
-      ),
+      screen.getByText("当前企业知识库会保留，并作为全新建站的资料来源。"),
     ).toBeInTheDocument();
     expect(
       screen.getByText("旧视觉方案和生成任务不会继续使用。"),
@@ -738,9 +748,14 @@ describe("SiteOpsConversationPanel", () => {
       screen.getByRole("button", { name: "复制消息" }),
     ).toBeInTheDocument();
     expect(screen.getByText("1 分 5 秒")).toBeInTheDocument();
+    expect(screen.getByText("08/22 08:00")).toBeInTheDocument();
+    expect(screen.getByText("08/22 08:01")).toBeInTheDocument();
     expect(
       document.querySelector(".siteops-message-footer time"),
     ).toHaveAttribute("datetime", "2026-08-22T00:01:05.000Z");
+    expect(
+      document.querySelector(".siteops-execution-timeline time"),
+    ).toHaveAttribute("datetime", "2026-08-22T00:00:00.000Z");
   });
 
   it("updates a running stage timer every second", () => {
@@ -905,9 +920,7 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       screen.getByRole("heading", { name: "从知识库开始建站" }),
     ).toBeInTheDocument();
-    expect(
-      screen.queryByLabelText("知识库 ZIP 版本"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("知识库 ZIP 版本")).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("更换知识库 ZIP 版本"),
     ).not.toBeInTheDocument();
@@ -957,9 +970,7 @@ describe("SiteOpsConversationPanel", () => {
         "FrontMind 将自动读取当前企业知识库，无需选择或重新上传版本。",
       ),
     ).toBeInTheDocument();
-    expect(
-      screen.queryByLabelText("知识库 ZIP 版本"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("知识库 ZIP 版本")).not.toBeInTheDocument();
     expect(
       screen.queryByLabelText("更换知识库 ZIP 版本"),
     ).not.toBeInTheDocument();
@@ -1001,11 +1012,16 @@ describe("SiteOpsConversationPanel", () => {
     expect(screen.queryByRole("button", { name: /^选择 [A-I]$/u })).toBeNull();
   });
 
-  it("opens and focuses private preview in the reusable named tab", () => {
+  it("severs opener before navigating and focusing the reusable preview tab", () => {
     const focus = vi.fn();
-    const open = vi
-      .spyOn(window, "open")
-      .mockReturnValue({ focus } as unknown as Window);
+    const replace = vi.fn();
+    const previewWindow = {
+      opener: window,
+      location: { replace },
+      focus,
+      close: vi.fn(),
+    } as unknown as Window;
+    const open = vi.spyOn(window, "open").mockReturnValue(previewWindow);
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -1036,13 +1052,22 @@ describe("SiteOpsConversationPanel", () => {
     fireEvent.click(previewButton);
     expect(open).toHaveBeenNthCalledWith(
       1,
-      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      "about:blank",
       "frontmind-siteops-preview",
     );
     expect(open).toHaveBeenNthCalledWith(
       2,
-      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+      "about:blank",
       "frontmind-siteops-preview",
+    );
+    expect(previewWindow.opener).toBeNull();
+    expect(replace).toHaveBeenNthCalledWith(
+      1,
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
+    );
+    expect(replace).toHaveBeenNthCalledWith(
+      2,
+      "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/",
     );
     expect(focus).toHaveBeenCalledTimes(2);
     expect(
@@ -1172,9 +1197,13 @@ describe("SiteOpsConversationPanel", () => {
   });
 
   it("keeps the last successful preview available when a child rebuild fails", () => {
-    const open = vi
-      .spyOn(window, "open")
-      .mockReturnValue({ focus: vi.fn() } as unknown as Window);
+    const replace = vi.fn();
+    const open = vi.spyOn(window, "open").mockReturnValue({
+      opener: window,
+      location: { replace },
+      focus: vi.fn(),
+      close: vi.fn(),
+    } as unknown as Window);
     const currentPreview =
       "/api/site-ops/builds/33333333-3333-4333-8333-333333333333/preview/";
     render(
@@ -1224,9 +1253,10 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "在新标签页打开预览" }));
     expect(open).toHaveBeenCalledWith(
-      currentPreview,
+      "about:blank",
       "frontmind-siteops-preview",
     );
+    expect(replace).toHaveBeenCalledWith(currentPreview);
     open.mockRestore();
   });
 
@@ -1362,6 +1392,45 @@ describe("SiteOpsConversationPanel", () => {
     expect(document.body.textContent).not.toContain(
       "SITEOPS_AXE_BLOCKING_VIOLATIONS",
     );
+  });
+
+  it("shows native React QA findings as non-blocking preview advice", () => {
+    const buildId = "33333333-3333-4333-8333-333333333333";
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: { ...observation().project, status: "preview_ready" },
+          interactionState: "preview_ready",
+          builds: [
+            {
+              id: buildId,
+              ordinal: 1,
+              parentBuildId: null,
+              status: "preview_ready",
+              previewUrl: `/api/site-ops/builds/${buildId}/preview/`,
+              sourceUrl: null,
+              buildDelivery: {
+                renderMode: "twenty_first_native",
+                qaStatus: "passed_with_warnings",
+                warningCodes: ["NATIVE_AXE_FINDINGS"],
+              },
+              needsHelp: false,
+              createdAt: "2026-08-23T00:00:00.000Z",
+              updatedAt: "2026-08-23T00:01:00.000Z",
+            },
+          ],
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(/质量检查中的非阻断建议已记录/u),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "在新标签页打开预览" }),
+    ).toBeEnabled();
+    expect(document.body.textContent).not.toContain("NATIVE_AXE_FINDINGS");
   });
 
   it("does not offer a duplicate publish while the same target is pending", () => {
@@ -1516,9 +1585,7 @@ describe("SiteOpsConversationPanel", () => {
     expect(
       screen.getByRole("heading", { name: "从知识库开始建站" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("当前阶段").parentElement).toHaveTextContent(
-      "从知识库开始建站",
-    );
+    expect(screen.queryByText("当前阶段")).not.toBeInTheDocument();
     expect(screen.queryByText("官网版本 2")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "在新标签页打开预览" }),
@@ -1648,7 +1715,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.getByText("官网版本 2")).toBeInTheDocument();
+    expect(screen.queryByText("官网版本 2")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "在新标签页打开预览" }),
     ).toBeInTheDocument();
@@ -1715,7 +1782,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.getByText("官网版本 3")).toBeInTheDocument();
+    expect(screen.queryByText("官网版本 3")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "在新标签页打开预览" }),
     ).toBeInTheDocument();
@@ -1769,7 +1836,7 @@ describe("SiteOpsConversationPanel", () => {
       />,
     );
 
-    expect(screen.getByText("官网版本 3")).toBeInTheDocument();
+    expect(screen.queryByText("官网版本 3")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "在新标签页打开预览" }),
     ).toBeInTheDocument();
@@ -1784,12 +1851,12 @@ describe("SiteOpsConversationPanel", () => {
   });
 
   it.each([
-    ["collecting_brief", "整理建站资料"],
-    ["visual_searching", "生成视觉候选"],
-    ["awaiting_visual_selection", "等待选择视觉方案"],
+    "collecting_brief",
+    "visual_searching",
+    "awaiting_visual_selection",
   ] as const)(
-    "keeps the approved rebuild on the current %s stage before its child build exists",
-    (interactionState, stageLabel) => {
+    "does not render the removed current-stage strip while an approved rebuild is %s",
+    (interactionState) => {
       render(
         <SiteOpsConversationPanel
           observation={observation({
@@ -1824,12 +1891,7 @@ describe("SiteOpsConversationPanel", () => {
         />,
       );
 
-      expect(screen.getByText("当前阶段").parentElement).toHaveTextContent(
-        stageLabel,
-      );
-      expect(screen.getByText("当前阶段").parentElement).not.toHaveTextContent(
-        "官网已完成",
-      );
+      expect(screen.queryByText("当前阶段")).not.toBeInTheDocument();
     },
   );
 

@@ -35,7 +35,10 @@ import {
   SITEOPS_VISUAL_CANDIDATE_MAX_PAGES,
   SITEOPS_VISUAL_CANDIDATE_PAGE_SIZE,
   visualSelectionBundleV4Schema,
+  visualSelectionBundleV5Schema,
   type SiteBrief,
+  type VisualSelectionBundleV4,
+  type VisualSelectionBundleV5,
 } from "../../shared/siteops";
 import {
   FRONTMIND_VISUAL_FAMILIES_V3,
@@ -54,6 +57,14 @@ import {
   type TwentyFirstReadOnlySession,
 } from "../twenty-first-service";
 import { persistSiteOpsArtifact } from "./artifact-store";
+import {
+  SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
+  VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES,
+  VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
+  createVisualSelectionBundleV5Artifact,
+  prepareNativeVisualCandidate,
+  type PreparedNativeVisualCandidate,
+} from "./native-visual-source";
 import { registerSiteOpsProviderHandler } from "./providers";
 import { fetchSafeVisualPreview } from "./remote-preview";
 import { renderTrustedVisualCandidatePreviews } from "./react-static-runtime";
@@ -83,6 +94,8 @@ export type TwentyFirstProviderContext = {
     providerItemKeys: string[];
     previewSha256s: string[];
     perceptualHashes: string[];
+    sourceTreeSha256s?: string[];
+    nativePreviewSha256s?: string[];
   };
 };
 
@@ -123,6 +136,35 @@ type FrontMindBoardCandidate = {
   rationale: string;
 };
 
+type NativeBoardCandidate = {
+  sampleId: string;
+  optionLabel: string;
+  queryAxis: "foundation_split" | "foundation_editorial_modular";
+  providerItemId: string;
+  providerItemKey: string;
+  providerVersion: string | null;
+  title: string;
+  description: string | null;
+  taxonomy: ReturnType<typeof taxonomyFromDirectives>;
+  author: string | null;
+  sourceUrl: string | null;
+  referencePreviewLocalAssetId: string;
+  referencePreviewSha256: string;
+  referencePerceptualHash: string;
+  previewLocalAssetId: string;
+  previewSha256: string;
+  visualEvidence: ReturnType<typeof createVisualEvidenceV1>;
+  sourceTreeSha256: string;
+  sourceArchiveSha256: string;
+  sourceArchive: Buffer;
+  entrypoint: string;
+  demoEntrypoint: string;
+  score: number;
+  rationale: string;
+};
+
+type BoardCandidate = FrontMindBoardCandidate | NativeBoardCandidate;
+
 export type ResolvedVisualSearchPlan = {
   schemaVersion: 1 | 2;
   mode: "initial" | "supplemental";
@@ -142,6 +184,7 @@ type PreviewRejectionReason =
   | "duplicate"
   | "persist"
   | "hash"
+  | "source"
   | "aborted";
 
 export type VisualSearchDiagnostics = {
@@ -202,9 +245,9 @@ export type TwentyFirstBoardPersistenceInput = {
   operation: SiteOperation;
   searchPlan: ResolvedVisualSearchPlan;
   context: TwentyFirstProviderContext;
-  selectionBundle: z.infer<typeof visualSelectionBundleV4Schema>;
+  selectionBundle: VisualSelectionBundleV4 | VisualSelectionBundleV5;
   selectionBundleArtifact: PreviewArtifact;
-  mirroredCandidates: FrontMindBoardCandidate[];
+  mirroredCandidates: BoardCandidate[];
 };
 
 export type TwentyFirstProviderDependencies = {
@@ -217,6 +260,7 @@ export type TwentyFirstProviderDependencies = {
   client?: Pick<TwentyFirstClient, "withReadOnlySession">;
   fetchPreview?: typeof fetchSafeVisualPreview;
   renderCandidates?: typeof renderTrustedVisualCandidatePreviews;
+  prepareNativeCandidate?: typeof prepareNativeVisualCandidate;
   persistArtifact?: typeof persistSiteOpsArtifact;
   persistBoard?: (
     db: any,
@@ -241,6 +285,8 @@ type VisualSearchStage =
   | "load_credential"
   | "mcp_retrieval"
   | "mirror_previews"
+  | "retrieve_native_sources"
+  | "render_native_previews"
   | "render_host_previews"
   | "persist_selection_bundle"
   | "persist_board";
@@ -299,8 +345,7 @@ function logSafeVisualStage(input: {
     ...(input.compatibleMatchingCardinality === undefined
       ? {}
       : {
-          compatibleMatchingCardinality:
-            input.compatibleMatchingCardinality,
+          compatibleMatchingCardinality: input.compatibleMatchingCardinality,
         }),
     ...(input.mirrorAttempts === undefined
       ? {}
@@ -647,6 +692,17 @@ async function loadDefaultContext(
           ? [metadata.referencePerceptualHash]
           : [],
       ),
+      sourceTreeSha256s: priorMetadata.flatMap((metadata) =>
+        typeof metadata.sourceTreeSha256 === "string"
+          ? [metadata.sourceTreeSha256]
+          : [],
+      ),
+      nativePreviewSha256s: priorMetadata.flatMap((metadata) =>
+        metadata.renderer === "twenty_first_native_react_v1" &&
+        typeof metadata.previewSha256 === "string"
+          ? [metadata.previewSha256]
+          : [],
+      ),
     },
   };
 }
@@ -737,10 +793,7 @@ type FamilyReferenceEdge = {
   evidence: FamilyReferenceEvidence;
 };
 
-type FamilyReferencePools = Map<
-  FrontMindVisualFamily,
-  FamilyReferenceEdge[]
->;
+type FamilyReferencePools = Map<FrontMindVisualFamily, FamilyReferenceEdge[]>;
 
 const MAX_FAMILY_SEARCH_CALLS = 18;
 const MAX_MIRROR_ATTEMPTS = 36;
@@ -839,7 +892,10 @@ const FAMILY_PAGE_QUERY_VARIANTS: Record<
   },
   full_bleed_statement: {
     1: ["", ""],
-    2: ["edge to edge typographic declaration", "oversized minimal type canvas"],
+    2: [
+      "edge to edge typographic declaration",
+      "oversized minimal type canvas",
+    ],
     3: ["dramatic headline only masthead", "full viewport bold type statement"],
   },
 };
@@ -1099,7 +1155,8 @@ function composeFamilySearchQuery(input: {
 }): FamilySearchQuery {
   const terms = FAMILY_SEARCH_TERMS[input.family];
   const termIndex = input.round === "primary" ? 0 : 1;
-  const pageVariant = FAMILY_PAGE_QUERY_VARIANTS[input.family][input.page][termIndex];
+  const pageVariant =
+    FAMILY_PAGE_QUERY_VARIANTS[input.family][input.page][termIndex];
   const context = safeFamilySearchContext(input.brief);
   return {
     family: input.family,
@@ -1122,7 +1179,10 @@ function emptyFamilyReferencePools(): FamilyReferencePools {
   );
 }
 
-function compareFamilyEdges(left: FamilyReferenceEdge, right: FamilyReferenceEdge) {
+function compareFamilyEdges(
+  left: FamilyReferenceEdge,
+  right: FamilyReferenceEdge,
+) {
   return (
     (left.evidence === right.evidence
       ? 0
@@ -1181,6 +1241,7 @@ async function searchFamilyRound(input: {
   excludedProviderKeys?: ReadonlySet<string>;
   generalHeroEligibleKeys: Set<string>;
   effectiveSearchLimit: number;
+  nativeSourceMode?: boolean;
 }) {
   for (const family of input.families) {
     if (input.queries.length >= MAX_FAMILY_SEARCH_CALLS) break;
@@ -1198,6 +1259,9 @@ async function searchFamilyRound(input: {
     });
     const query: FamilySearchQuery = {
       ...composedQuery,
+      query: input.nativeSourceMode
+        ? `${composedQuery.query} complete responsive landing page homepage source`
+        : composedQuery.query,
       limit: Math.max(
         1,
         Math.min(composedQuery.limit, Math.trunc(input.effectiveSearchLimit)),
@@ -1211,7 +1275,7 @@ async function searchFamilyRound(input: {
         query: query.query,
         type: "component",
         limit: query.limit,
-        tag: "hero",
+        ...(input.nativeSourceMode ? {} : { tag: "hero" as const }),
         sort: "recommended",
       }),
     };
@@ -1982,6 +2046,94 @@ async function createFrontMindBoardCandidates(input: {
   return candidates;
 }
 
+async function createNativeBoardCandidates(input: {
+  operation: SiteOperation;
+  context: TwentyFirstProviderContext;
+  inspirationByFamily: ReadonlyMap<FrontMindVisualFamily, MirroredReference>;
+  preparedByProviderKey: ReadonlyMap<string, PreparedNativeVisualCandidate>;
+  persistArtifact: typeof persistSiteOpsArtifact;
+}) {
+  if (
+    input.inspirationByFamily.size !== FRONTMIND_VISUAL_FAMILIES_V3.length ||
+    FRONTMIND_VISUAL_FAMILIES_V3.some(
+      (family) => !input.inspirationByFamily.has(family),
+    )
+  ) {
+    throw new TwentyFirstProviderFailure(
+      "NATIVE_SOURCE_CANDIDATE_PAGE_INCOMPLETE",
+      "9 个原生源码视觉候选未能完整生成，请稍后重试。",
+      "attention_required",
+    );
+  }
+  const candidates: NativeBoardCandidate[] = [];
+  const seenSourceTrees = new Set<string>();
+  const seenPreviewHashes = new Set<string>();
+  for (let index = 0; index < FRONTMIND_VISUAL_FAMILIES_V3.length; index += 1) {
+    const family = FRONTMIND_VISUAL_FAMILIES_V3[index]!;
+    const reference = input.inspirationByFamily.get(family)!;
+    const prepared = input.preparedByProviderKey.get(
+      reference.candidate.providerItemKey,
+    );
+    if (
+      !prepared ||
+      seenSourceTrees.has(prepared.sourceTreeSha256) ||
+      seenPreviewHashes.has(prepared.previewSha256)
+    ) {
+      throw new TwentyFirstProviderFailure(
+        "NATIVE_SOURCE_CANDIDATE_PAGE_INCOMPLETE",
+        "9 个原生源码视觉候选未能完整生成，请稍后重试。",
+        "attention_required",
+      );
+    }
+    seenSourceTrees.add(prepared.sourceTreeSha256);
+    seenPreviewHashes.add(prepared.previewSha256);
+    const previewAsset = await input.persistArtifact({
+      userId: input.operation.userId,
+      projectId: input.context.project.id,
+      kind: "21st-native-react-preview",
+      filename: `21st-native-${reference.candidate.candidateId.slice(0, 120)}.png`,
+      mimeType: "image/png",
+      buffer: prepared.preview,
+      maxBytes: 5 * 1024 * 1024,
+    });
+    if (previewAsset.contentSha256 !== prepared.previewSha256) {
+      throw new TwentyFirstProviderFailure(
+        "NATIVE_PREVIEW_HASH_MISMATCH",
+        "原生源码视觉候选写入校验失败。",
+        "attention_required",
+      );
+    }
+    candidates.push({
+      sampleId: reference.sampleId,
+      optionLabel: String.fromCharCode(65 + index),
+      queryAxis: familyQueryAxis(family),
+      providerItemId: String(reference.candidate.providerItemId),
+      providerItemKey: reference.candidate.providerItemKey,
+      providerVersion: prepared.providerVersion,
+      title: reference.candidate.title,
+      description: reference.candidate.description,
+      taxonomy: reference.taxonomy,
+      author: reference.candidate.author,
+      sourceUrl: reference.candidate.sourceUrl,
+      referencePreviewLocalAssetId: reference.previewLocalAssetId,
+      referencePreviewSha256: reference.previewSha256,
+      referencePerceptualHash: reference.perceptualHash,
+      previewLocalAssetId: previewAsset.id,
+      previewSha256: prepared.previewSha256,
+      visualEvidence: reference.visualEvidence,
+      sourceTreeSha256: prepared.sourceTreeSha256,
+      sourceArchiveSha256: prepared.sourceArchiveSha256,
+      sourceArchive: prepared.sourceArchive,
+      entrypoint: prepared.entrypoint,
+      demoEntrypoint: prepared.demoEntrypoint,
+      score: reference.candidate.score,
+      rationale:
+        "该候选直接运行 21st 原生 React 源码；选择后以同一源码作为官网制作基线。",
+    });
+  }
+  return candidates;
+}
+
 async function persistDefaultBoard(
   db: any,
   input: TwentyFirstBoardPersistenceInput,
@@ -2127,6 +2279,38 @@ async function persistDefaultBoard(
         attachmentId: null,
         previewLocalAssetId: item.previewLocalAssetId,
         sourceMetadata: {
+          ...("sourceTreeSha256" in item
+            ? {
+                schemaVersion: 5,
+                renderer: "twenty_first_native_react_v1" as const,
+                providerItemId: item.providerItemId,
+                providerVersion: item.providerVersion,
+                sourceTreeSha256: item.sourceTreeSha256,
+                sourceArchiveSha256: item.sourceArchiveSha256,
+                entrypoint: item.entrypoint,
+                demoEntrypoint: item.demoEntrypoint,
+                referencePreviewLocalAssetId: item.referencePreviewLocalAssetId,
+                referencePreviewSha256: item.referencePreviewSha256,
+                referencePerceptualHash: item.referencePerceptualHash,
+                previewSha256: item.previewSha256,
+              }
+            : {
+                heroFamily: item.referenceBlueprint.heroFamily,
+                heroEligibility: {
+                  eligible: true,
+                  confidence: "explicit",
+                  variant: legacyHeroVariantForFamily(
+                    item.referenceBlueprint.heroFamily,
+                  ),
+                  reasons: ["frontmind-trusted-react-family"],
+                },
+                referenceBlueprint: item.referenceBlueprint,
+                realizationPreviewLocalAssetId:
+                  item.realizationPreviewLocalAssetId,
+                realizationPreviewSha256: item.realizationPreviewSha256,
+                referencePerceptualHash: item.referencePerceptualHash,
+                realizationPerceptualHash: item.realizationPerceptualHash,
+              }),
           providerItemKey: item.providerItemKey,
           queryAxis: item.queryAxis,
           title: item.title,
@@ -2134,21 +2318,7 @@ async function persistDefaultBoard(
           author: item.author,
           sourceUrl: item.sourceUrl,
           catalogRole: "hero",
-          heroFamily: item.referenceBlueprint.heroFamily,
-          heroEligibility: {
-            eligible: true,
-            confidence: "explicit",
-            variant: legacyHeroVariantForFamily(
-              item.referenceBlueprint.heroFamily,
-            ),
-            reasons: ["frontmind-trusted-react-family"],
-          },
           visualEvidence: item.visualEvidence,
-          referenceBlueprint: item.referenceBlueprint,
-          realizationPreviewLocalAssetId: item.realizationPreviewLocalAssetId,
-          realizationPreviewSha256: item.realizationPreviewSha256,
-          referencePerceptualHash: item.referencePerceptualHash,
-          realizationPerceptualHash: item.realizationPerceptualHash,
           taxonomy: {
             ...item.taxonomy,
           },
@@ -2239,8 +2409,7 @@ function safeProviderFailure(
     return {
       status: "failed",
       code: "VISUAL_SEARCH_TIMEOUT",
-      message:
-        "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
+      message: "视觉检索已超时；可申请重置，批准后可从当前企业知识库重新开始。",
       result: diagnostics,
     };
   }
@@ -2330,6 +2499,34 @@ async function assertCommitLeaseActive(
   }
 }
 
+async function mapWithBoundedConcurrency<T, R>(input: {
+  values: readonly T[];
+  concurrency: number;
+  map: (value: T, index: number) => Promise<R>;
+}) {
+  const results = new Array<R>(input.values.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < input.values.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await input.map(input.values[index]!, index);
+    }
+  };
+  await Promise.all(
+    Array.from(
+      {
+        length: Math.min(
+          input.values.length,
+          Math.max(1, Math.trunc(input.concurrency)),
+        ),
+      },
+      worker,
+    ),
+  );
+  return results;
+}
+
 export function createTwentyFirstSiteOpsProviderHandler(
   dependencies: TwentyFirstProviderDependencies = {},
 ): SiteOpsProviderHandler {
@@ -2341,6 +2538,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
   const fetchPreview = dependencies.fetchPreview ?? fetchSafeVisualPreview;
   const renderCandidates =
     dependencies.renderCandidates ?? renderTrustedVisualCandidatePreviews;
+  const prepareNativeCandidate =
+    dependencies.prepareNativeCandidate ?? prepareNativeVisualCandidate;
   const persistArtifact =
     dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const persistBoard = dependencies.persistBoard ?? persistDefaultBoard;
@@ -2353,6 +2552,8 @@ export function createTwentyFirstSiteOpsProviderHandler(
       const parsedInput = visualSearchOperationInputSchema.parse(
         operation.input,
       );
+      const nativeSourceMode =
+        parsedInput.workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION;
       stage = "load_context";
       const db = await dbGetter();
       if (!db) {
@@ -2400,6 +2601,13 @@ export function createTwentyFirstSiteOpsProviderHandler(
       const retrieval = await client.withReadOnlySession(
         credential.apiKey,
         async (session) => {
+          if (nativeSourceMode && !session.getComponent) {
+            throw new TwentyFirstProviderFailure(
+              "MCP_GET_COMPONENT_REQUIRED",
+              "当前 21st 连接缺少原生源码读取能力。",
+              "attention_required",
+            );
+          }
           const pools = emptyFamilyReferencePools();
           const queries: FamilySearchQuery[] = [];
           const searchedCandidates = new Map<
@@ -2408,6 +2616,10 @@ export function createTwentyFirstSiteOpsProviderHandler(
           >();
           const generalHeroEligibleKeys = new Set<string>();
           const mirrored: MirroredReference[] = [];
+          const preparedNativeByProviderKey = new Map<
+            string,
+            PreparedNativeVisualCandidate
+          >();
           const attemptedProviderKeys = new Set<string>();
           const unavailableProviderKeys = new Set<string>();
           const excludedProviderKeys = new Set(
@@ -2419,13 +2631,16 @@ export function createTwentyFirstSiteOpsProviderHandler(
           const priorPerceptualHashes = new Set(
             context.previousReferences?.perceptualHashes ?? [],
           );
+          const priorSourceTreeSha256s = new Set(
+            context.previousReferences?.sourceTreeSha256s ?? [],
+          );
+          const priorNativePreviewSha256s = new Set(
+            context.previousReferences?.nativePreviewSha256s ?? [],
+          );
           const rescueQueriedFamilies = new Set<FrontMindVisualFamily>();
           const effectiveSearchLimit = Math.max(
             1,
-            Math.min(
-              18,
-              Math.trunc(session.effectiveSearchLimit ?? 18),
-            ),
+            Math.min(18, Math.trunc(session.effectiveSearchLimit ?? 18)),
           );
           let queryLatencyMs = 0;
           const runSearchRound = async (input: {
@@ -2448,6 +2663,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
                 excludedProviderKeys,
                 generalHeroEligibleKeys,
                 effectiveSearchLimit,
+                nativeSourceMode,
               });
             } finally {
               queryLatencyMs += Date.now() - startedAt;
@@ -2455,7 +2671,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           };
           const mirrorSignal = AbortSignal.any([
             signal,
-            AbortSignal.timeout(45_000),
+            AbortSignal.timeout(nativeSourceMode ? 180_000 : 45_000),
           ]);
           const mirrorCandidateSet = async (
             candidates: NormalizedTwentyFirstCandidate[],
@@ -2477,10 +2693,83 @@ export function createTwentyFirstSiteOpsProviderHandler(
               priorPreviewHashes,
               priorPerceptualHashes,
             });
-            mirrored.push(...result.mirrored);
             result.rejectedProviderKeys.forEach((key) =>
               unavailableProviderKeys.add(key),
             );
+            if (!nativeSourceMode) {
+              mirrored.push(...result.mirrored);
+              return;
+            }
+            stage = "retrieve_native_sources";
+            // Each native preparation launches a bounded Vite build and one
+            // isolated Chromium render. Keep this limit local even if a future
+            // mirror implementation returns more than today's three-item
+            // batches; an unbounded Promise.all would exhaust container memory.
+            const prepared = await mapWithBoundedConcurrency({
+              values: result.mirrored,
+              concurrency: MIRROR_CONCURRENCY,
+              map: async (reference) => {
+                try {
+                  const detail = await session.getComponent!(
+                    reference.candidate.providerItemId,
+                  );
+                  stage = "render_native_previews";
+                  const native = await prepareNativeCandidate({
+                    candidate: reference.candidate,
+                    payload: detail,
+                    signal: mirrorSignal,
+                  });
+                  if (
+                    priorSourceTreeSha256s.has(native.sourceTreeSha256) ||
+                    priorNativePreviewSha256s.has(native.previewSha256) ||
+                    [...preparedNativeByProviderKey.values()].some(
+                      (existing) =>
+                        existing.sourceTreeSha256 === native.sourceTreeSha256 ||
+                        existing.previewSha256 === native.previewSha256,
+                    )
+                  ) {
+                    throw new Error("NATIVE_SOURCE_DUPLICATE");
+                  }
+                  return { reference, native } as const;
+                } catch {
+                  rejectDiagnostic(diagnostics, "source");
+                  unavailableProviderKeys.add(
+                    reference.candidate.providerItemKey,
+                  );
+                  return null;
+                }
+              },
+            });
+            const acceptedSourceTrees = new Set(
+              [...preparedNativeByProviderKey.values()].map(
+                (item) => item.sourceTreeSha256,
+              ),
+            );
+            const acceptedNativePreviews = new Set(
+              [...preparedNativeByProviderKey.values()].map(
+                (item) => item.previewSha256,
+              ),
+            );
+            for (const item of prepared) {
+              if (!item) continue;
+              if (
+                acceptedSourceTrees.has(item.native.sourceTreeSha256) ||
+                acceptedNativePreviews.has(item.native.previewSha256)
+              ) {
+                rejectDiagnostic(diagnostics, "source");
+                unavailableProviderKeys.add(
+                  item.reference.candidate.providerItemKey,
+                );
+                continue;
+              }
+              acceptedSourceTrees.add(item.native.sourceTreeSha256);
+              acceptedNativePreviews.add(item.native.previewSha256);
+              mirrored.push(item.reference);
+              preparedNativeByProviderKey.set(
+                item.reference.candidate.providerItemKey,
+                item.native,
+              );
+            }
           };
 
           stage = "mcp_retrieval";
@@ -2493,9 +2782,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
             pools,
             unavailableProviderKeys,
           );
-          const searchRescueFamily = async (
-            family: FrontMindVisualFamily,
-          ) => {
+          const searchRescueFamily = async (family: FrontMindVisualFamily) => {
             rescueQueriedFamilies.add(family);
             stage = "mcp_retrieval";
             await runSearchRound({
@@ -2524,10 +2811,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
           await rescueUntilCompleteKeyMatching();
 
           const mirrorStartedAt = Date.now();
-          let assigned = new Map<
-            FrontMindVisualFamily,
-            MirroredReference
-          >();
+          let assigned = new Map<FrontMindVisualFamily, MirroredReference>();
           while (
             keyAssignment.size === FRONTMIND_VISUAL_FAMILIES_V3.length &&
             diagnostics.mirrorAttempted < MAX_MIRROR_ATTEMPTS
@@ -2580,9 +2864,7 @@ export function createTwentyFirstSiteOpsProviderHandler(
             diagnostics.terminalReason = "matching_budget_exhausted";
           } else if (previewFailureCount > 0) {
             diagnostics.terminalReason = "preview_failures";
-          } else if (
-            keyAssignment.size < FRONTMIND_VISUAL_FAMILIES_V3.length
-          ) {
+          } else if (keyAssignment.size < FRONTMIND_VISUAL_FAMILIES_V3.length) {
             diagnostics.terminalReason = "catalog_insufficient";
           } else {
             diagnostics.terminalReason = "catalog_insufficient";
@@ -2641,7 +2923,13 @@ export function createTwentyFirstSiteOpsProviderHandler(
             terminalReason: diagnostics.terminalReason,
             latencyMs: Date.now() - mirrorStartedAt,
           });
-          return { queries, pools, mirrored, assigned };
+          return {
+            queries,
+            pools,
+            mirrored,
+            assigned,
+            preparedNativeByProviderKey,
+          };
         },
         { signal },
       );
@@ -2654,6 +2942,16 @@ export function createTwentyFirstSiteOpsProviderHandler(
           );
         }
         if (diagnostics.terminalReason === "preview_failures") {
+          if (
+            nativeSourceMode &&
+            (diagnostics.rejectedByReason.source ?? 0) > 0
+          ) {
+            throw new TwentyFirstProviderFailure(
+              "NATIVE_SOURCE_CANDIDATES_UNAVAILABLE",
+              "部分 21st 候选未提供可安全编译的完整 React 源码，已跳过并完成深层检索；本次仍不足 9 个，请稍后重试。",
+              "attention_required",
+            );
+          }
           throw new TwentyFirstProviderFailure(
             "VISUAL_PREVIEW_REFERENCES_UNAVAILABLE",
             "部分真实 Hero 参考暂时无法安全读取，请稍后重试。",
@@ -2668,72 +2966,145 @@ export function createTwentyFirstSiteOpsProviderHandler(
       }
       const degradedReasons: string[] = [];
       await assertCommitLeaseActive(assertLeaseActive);
-      stage = "render_host_previews";
-      const mirroredCandidates = await createFrontMindBoardCandidates({
-        operation,
-        context,
-        inspirationByFamily: retrieval.assigned,
-        signal,
-        renderCandidates,
-        persistArtifact,
-        diagnostics,
-      });
       const rejectedPreviews = Object.values(
         diagnostics.rejectedByReason,
       ).reduce((sum, count) => sum + (count ?? 0), 0);
       if (rejectedPreviews > 0) {
         degradedReasons.push(`PREVIEW_RESULTS_REJECTED:${rejectedPreviews}`);
       }
+      let mirroredCandidates: BoardCandidate[];
+      let selectionBundle: VisualSelectionBundleV4 | VisualSelectionBundleV5;
+      let selectionBuffer: Buffer;
+      let selectionFilename: string;
+      let selectionMimeType: string;
+      let selectionMaxBytes: number;
+      let expectedSelectionHash: string;
+      if (nativeSourceMode) {
+        stage = "render_native_previews";
+        const nativeCandidates = await createNativeBoardCandidates({
+          operation,
+          context,
+          inspirationByFamily: retrieval.assigned,
+          preparedByProviderKey: retrieval.preparedNativeByProviderKey,
+          persistArtifact,
+        });
+        mirroredCandidates = nativeCandidates;
+        selectionBundle = visualSelectionBundleV5Schema.parse({
+          schemaVersion: 5,
+          renderer: "twenty_first_native_react_v1",
+          queryPlanHash: canonicalSha256(retrieval.queries),
+          searchTarget: retrieval.queries.reduce(
+            (sum, query) => sum + query.limit,
+            0,
+          ),
+          displayTarget: 9,
+          candidates: nativeCandidates.map((item) => ({
+            id: item.sampleId,
+            label: item.optionLabel,
+            queryAxis: item.queryAxis,
+            providerItemId: item.providerItemId,
+            providerItemKey: item.providerItemKey,
+            providerVersion: item.providerVersion,
+            title: item.title,
+            description: item.description,
+            author: item.author,
+            sourceUrl: item.sourceUrl,
+            visualEvidence: item.visualEvidence,
+            referencePreviewLocalAssetId: item.referencePreviewLocalAssetId,
+            referencePreviewSha256: item.referencePreviewSha256,
+            referencePerceptualHash: item.referencePerceptualHash,
+            previewLocalAssetId: item.previewLocalAssetId,
+            previewSha256: item.previewSha256,
+            taxonomy: item.taxonomy,
+            score: item.score,
+            rationale: item.rationale,
+            sourceTreeSha256: item.sourceTreeSha256,
+            sourceArchiveSha256: item.sourceArchiveSha256,
+            sourceArchivePath: `candidates/${item.optionLabel}/source.zip`,
+            entrypoint: item.entrypoint,
+            demoEntrypoint: item.demoEntrypoint,
+            sourceDirectory: "source",
+          })),
+          selectedCandidateId: null,
+          delegated: false,
+          degradedReasons: Array.from(new Set(degradedReasons)),
+        });
+        selectionBuffer = await createVisualSelectionBundleV5Artifact({
+          bundle: selectionBundle,
+          sourceArchives: new Map(
+            nativeCandidates.map((candidate) => [
+              candidate.sampleId,
+              candidate.sourceArchive,
+            ]),
+          ),
+        });
+        selectionFilename = `visual-selection-${operation.id}.zip`;
+        selectionMimeType = VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE;
+        selectionMaxBytes = VISUAL_SELECTION_BUNDLE_V5_MAX_BYTES;
+        expectedSelectionHash = sha256Buffer(selectionBuffer);
+      } else {
+        stage = "render_host_previews";
+        const frontMindCandidates = await createFrontMindBoardCandidates({
+          operation,
+          context,
+          inspirationByFamily: retrieval.assigned,
+          signal,
+          renderCandidates,
+          persistArtifact,
+          diagnostics,
+        });
+        mirroredCandidates = frontMindCandidates;
+        selectionBundle = visualSelectionBundleV4Schema.parse({
+          schemaVersion: 4,
+          queryPlanHash: canonicalSha256(retrieval.queries),
+          searchTarget: retrieval.queries.reduce(
+            (sum, query) => sum + query.limit,
+            0,
+          ),
+          referenceTarget: 9,
+          displayTarget: 9,
+          candidates: frontMindCandidates.map((item) => ({
+            id: item.sampleId,
+            label: item.optionLabel,
+            queryAxis: item.queryAxis,
+            providerItemKey: item.providerItemKey,
+            title: item.title,
+            description: item.description,
+            author: item.author,
+            sourceUrl: item.sourceUrl,
+            visualEvidence: item.visualEvidence,
+            previewLocalAssetId: item.previewLocalAssetId,
+            previewSha256: item.previewSha256,
+            realizationPreviewLocalAssetId: item.realizationPreviewLocalAssetId,
+            realizationPreviewSha256: item.realizationPreviewSha256,
+            referencePerceptualHash: item.referencePerceptualHash,
+            realizationPerceptualHash: item.realizationPerceptualHash,
+            taxonomy: item.taxonomy,
+            score: item.score,
+            rationale: item.rationale,
+            referenceBlueprint: item.referenceBlueprint,
+          })),
+          selectedCandidateId: null,
+          delegated: false,
+          degradedReasons: Array.from(new Set(degradedReasons)),
+        });
+        selectionBuffer = Buffer.from(canonicalJson(selectionBundle), "utf8");
+        selectionFilename = `visual-selection-${operation.id}.json`;
+        selectionMimeType = "application/json";
+        selectionMaxBytes = 1_000_000;
+        expectedSelectionHash = canonicalSha256(selectionBundle);
+      }
       await assertCommitLeaseActive(assertLeaseActive);
       stage = "persist_selection_bundle";
-      const selectionBundle = visualSelectionBundleV4Schema.parse({
-        schemaVersion: 4,
-        queryPlanHash: canonicalSha256(retrieval.queries),
-        searchTarget: retrieval.queries.reduce(
-          (sum, query) => sum + query.limit,
-          0,
-        ),
-        referenceTarget: 9,
-        displayTarget: 9,
-        candidates: mirroredCandidates.map((item) => ({
-          id: item.sampleId,
-          label: item.optionLabel,
-          queryAxis: item.queryAxis,
-          providerItemKey: item.providerItemKey,
-          title: item.title,
-          description: item.description,
-          author: item.author,
-          sourceUrl: item.sourceUrl,
-          visualEvidence: item.visualEvidence,
-          previewLocalAssetId: item.previewLocalAssetId,
-          previewSha256: item.previewSha256,
-          realizationPreviewLocalAssetId: item.realizationPreviewLocalAssetId,
-          realizationPreviewSha256: item.realizationPreviewSha256,
-          referencePerceptualHash: item.referencePerceptualHash,
-          realizationPerceptualHash: item.realizationPerceptualHash,
-          taxonomy: item.taxonomy,
-          score: item.score,
-          rationale: item.rationale,
-          referenceBlueprint: item.referenceBlueprint,
-        })),
-        selectedCandidateId: null,
-        delegated: false,
-        degradedReasons: Array.from(new Set(degradedReasons)),
-      });
-      const selectionBuffer = Buffer.from(
-        canonicalJson(selectionBundle),
-        "utf8",
-      );
       const selectionBundleArtifact = await persistArtifact({
         userId: operation.userId,
         projectId: context.project.id,
         kind: "21st-selection-bundle",
-        filename: `visual-selection-${operation.id}.json`,
-        mimeType: "application/json",
+        filename: selectionFilename,
+        mimeType: selectionMimeType,
         buffer: selectionBuffer,
-        maxBytes: 1_000_000,
+        maxBytes: selectionMaxBytes,
       });
-      const expectedSelectionHash = canonicalSha256(selectionBundle);
       if (selectionBundleArtifact.contentSha256 !== expectedSelectionHash) {
         throw new TwentyFirstProviderFailure(
           "SELECTION_BUNDLE_HASH_MISMATCH",

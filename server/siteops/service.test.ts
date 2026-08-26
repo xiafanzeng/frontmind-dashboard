@@ -18,6 +18,7 @@ import {
   projectSiteOpsVisualGeneration,
   projectSiteOpsObservationStatuses,
   projectSiteOpsExecutionSteps,
+  projectSiteOpsBuildDelivery,
   referenceBlueprintForSiteOpsRevision,
   requireAcceptedSiteOpsRebuild,
   resolvePinnedTwentyFirstCredentialForBatch,
@@ -33,6 +34,7 @@ import {
 import { SiteOpsQuotaError } from "./quota-service";
 import { createVisualEvidenceV1 } from "../../shared/siteops-workflow";
 import {
+  SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_WORKFLOW,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
@@ -46,6 +48,38 @@ import {
 } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it("keeps native build delivery visible after a later deploy succeeds", () => {
+    expect(
+      projectSiteOpsBuildDelivery({
+        buildId: "build-1",
+        operations: [
+          {
+            buildId: "build-1",
+            kind: "deploy",
+            status: "succeeded",
+            result: { stage: "deployed" },
+          },
+          {
+            buildId: "build-1",
+            kind: "site_build",
+            status: "succeeded",
+            result: {
+              buildDelivery: {
+                renderMode: "twenty_first_native",
+                qaStatus: "passed_with_warnings",
+                warningCodes: ["AXE_COLOR_CONTRAST"],
+              },
+            },
+          },
+        ],
+      }),
+    ).toEqual({
+      renderMode: "twenty_first_native",
+      qaStatus: "passed_with_warnings",
+      warningCodes: ["AXE_COLOR_CONTRAST"],
+    });
+  });
+
   it("projects real build stages once and preserves terminal elapsed time", () => {
     const steps = projectSiteOpsExecutionSteps({
       operations: [
@@ -371,11 +405,11 @@ describe("SiteOps core contracts", () => {
 
   it("freezes every new root or revision build to the current complete workflow coordinates", () => {
     expect(currentSiteOpsBuildWorkflowCoordinates()).toEqual({
-      workflowUpstreamVersion: SITEOPS_WORKFLOW.upstreamVersion,
-      workflowUpstreamHash: SITEOPS_WORKFLOW.upstreamSha256,
-      workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
-      workflowPackageHash: SITEOPS_WORKFLOW.runtimeManifestSha256,
-      starterVersion: SITEOPS_WORKFLOW.starterVersion,
+      workflowUpstreamVersion: SITEOPS_MATERIALIZER_V2_5.upstreamVersion,
+      workflowUpstreamHash: SITEOPS_MATERIALIZER_V2_5.upstreamSha256,
+      workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+      workflowPackageHash: SITEOPS_MATERIALIZER_V2_5.runtimeManifestSha256,
+      starterVersion: SITEOPS_MATERIALIZER_V2_5.starterVersion,
     });
   });
 
@@ -384,7 +418,9 @@ describe("SiteOps core contracts", () => {
       "视觉检索使用的建站合同已升级",
     );
     expect(() =>
-      assertCurrentVisualWorkflowVersion(SITEOPS_WORKFLOW.frontMindVersion),
+      assertCurrentVisualWorkflowVersion(
+        SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
+      ),
     ).not.toThrow();
   });
 
@@ -1188,7 +1224,7 @@ describe("SiteOps core contracts", () => {
             knowledgeSnapshotId: snapshotId,
             credentialId: pinnedCredentialId,
             credentialVersion: 7,
-            workflowVersion: SITEOPS_WORKFLOW.frontMindVersion,
+            workflowVersion: SITEOPS_MATERIALIZER_V2_5.frontMindVersion,
           },
         },
       ],

@@ -21,6 +21,7 @@ import {
   SITEOPS_MATERIALIZER_V2_2,
   SITEOPS_MATERIALIZER_V2_3,
   SITEOPS_MATERIALIZER_V2_4,
+  SITEOPS_MATERIALIZER_V2_5,
   SITEOPS_WORKFLOW,
   siteBriefSchema,
   visualEvidenceV1Schema,
@@ -32,6 +33,7 @@ import {
   type VisualSelectionBundleV2,
   type VisualSelectionBundleV3,
   type VisualSelectionBundleV4,
+  type VisualSelectionBundleV5,
 } from "../../shared/siteops";
 import { createHostOwnedSiteDesignResultV2 } from "../../shared/siteops-host-design";
 import {
@@ -118,6 +120,26 @@ import {
   draftFromPageContentWire,
 } from "./site-content-draft";
 import { terminalTaskState } from "./task-terminal-state";
+import {
+  FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME,
+  FRONTMIND_SITE_SOURCE_ARCHIVE_MIME,
+  FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
+  NativeReactSourceError,
+  TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT,
+  readNativeSourceAttachment,
+  siteSourceReceiptV1Schema,
+  validateNativeReactSourceArchive,
+} from "./native-react-source";
+import {
+  SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION,
+  VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
+  selectedNativeSourceArchive,
+} from "./native-visual-source";
+import {
+  NativeReactBuildError,
+  materializeNativeReactSource,
+  type MaterializedNativeReactSite,
+} from "./native-react-build-runtime";
 
 export { terminalTaskState } from "./task-terminal-state";
 
@@ -171,6 +193,9 @@ type RepairReason = z.infer<typeof repairReasonSchema>;
 
 const providerStageSchema = z.enum([
   "create_unknown",
+  "native_source_pending",
+  "native_repair_send_unknown",
+  "native_repair_pending",
   "design_pending",
   "content_send_ready",
   "content_send_unknown",
@@ -197,6 +222,11 @@ const providerStateV1Schema = z
     handledWaitingEventId: z.string().min(1).max(512).optional(),
     handledWaitingAt: z.string().datetime().optional(),
     providerDraftUnavailable: z.boolean().optional(),
+    nativeRepairAttempt: z.number().int().min(0).max(2).optional(),
+    nativeLastErrorSignature: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
   })
   .strict();
 
@@ -244,6 +274,9 @@ type ManusBuildLogStage =
   | "wire_validation"
   | "wire_normalized"
   | "content_canonicalized"
+  | "native_source_intake"
+  | "native_compile"
+  | "native_repair_scheduled"
   | "palette_normalized"
   | "primary_render"
   | "fallback_render"
@@ -266,7 +299,7 @@ function logManusBuildStage(input: {
   reason?: string;
   signature?: string;
   latencyMs?: number;
-  renderMode?: "primary" | "trusted_fallback";
+  renderMode?: "primary" | "trusted_fallback" | "twenty_first_native";
   qaStatus?: "passed" | "passed_with_warnings" | "partial";
   warningCount?: number;
 }) {
@@ -328,6 +361,8 @@ function providerStateV2(state: ProviderState | null): ProviderStateV2 {
     handledWaitingEventId: state?.handledWaitingEventId,
     handledWaitingAt: state?.handledWaitingAt,
     providerDraftUnavailable: state?.providerDraftUnavailable,
+    nativeRepairAttempt: state?.nativeRepairAttempt,
+    nativeLastErrorSignature: state?.nativeLastErrorSignature,
     attempts,
   });
 }
@@ -360,6 +395,7 @@ type ManusProviderDependencies = {
   persistArtifact?: typeof persistSiteOpsArtifact;
   readArtifact?: typeof readSiteOpsArtifact;
   materializeSite?: typeof materializeAstroSite;
+  materializeNativeSite?: typeof materializeNativeReactSource;
   generateSocial?: typeof generateSocialPackage;
 };
 
@@ -763,11 +799,9 @@ function workflowAttachment(
 
 async function storedArtifactBytes(
   artifact: NonNullable<Awaited<ReturnType<typeof readSiteOpsArtifact>>>,
+  maxBytes = 8 * 1024 * 1024,
 ) {
-  if (
-    artifact.stored.sizeBytes < 1 ||
-    artifact.stored.sizeBytes > 8 * 1024 * 1024
-  ) {
+  if (artifact.stored.sizeBytes < 1 || artifact.stored.sizeBytes > maxBytes) {
     throw new SiteOpsManusFailure(
       "VISUAL_PREVIEW_ATTACHMENT_INVALID",
       "冻结的视觉预览超过建站任务附件上限。",
@@ -779,7 +813,7 @@ async function storedArtifactBytes(
   for await (const chunk of artifact.stored.createReadStream()) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += bytes.length;
-    if (total > artifact.stored.sizeBytes || total > 8 * 1024 * 1024) {
+    if (total > artifact.stored.sizeBytes || total > maxBytes) {
       throw new SiteOpsManusFailure(
         "VISUAL_PREVIEW_ATTACHMENT_INVALID",
         "冻结的视觉预览读取结果不一致。",
@@ -862,10 +896,17 @@ function isVisualSelectionBundleV4(
   return "schemaVersion" in bundle && bundle.schemaVersion === 4;
 }
 
+function isVisualSelectionBundleV5(
+  bundle: VisualSelectionBundle,
+): bundle is VisualSelectionBundleV5 {
+  return "schemaVersion" in bundle && bundle.schemaVersion === 5;
+}
+
 function visualSelectionQueryHash(bundle: VisualSelectionBundle) {
   return isVisualSelectionBundleV2(bundle) ||
     isVisualSelectionBundleV3(bundle) ||
-    isVisualSelectionBundleV4(bundle)
+    isVisualSelectionBundleV4(bundle) ||
+    isVisualSelectionBundleV5(bundle)
     ? bundle.queryPlanHash
     : (bundle as VisualSelectionBundleV1).queryHash;
 }
@@ -1697,6 +1738,671 @@ async function pollEvents(
   };
 }
 
+function nativeSourceReceiptOutputSchema(input: {
+  operationToken: string;
+  baseSourceSha256: string;
+}): ManusV2StructuredOutputSchema {
+  return assertSiteOpsStructuredOutputSchema({
+    type: "object",
+    properties: {
+      operationToken: { type: "string", enum: [input.operationToken] },
+      baseSourceSha256: {
+        type: "string",
+        enum: [input.baseSourceSha256],
+      },
+      archiveSha256: { type: "string" },
+      fileCount: { type: "integer" },
+    },
+    required: [
+      "operationToken",
+      "baseSourceSha256",
+      "archiveSha256",
+      "fileCount",
+    ],
+    additionalProperties: false,
+  });
+}
+
+function nativeSourceOutputAttachment(
+  events: readonly ManusV2MessageEvent[],
+  operationToken: string,
+) {
+  const candidates: Array<{
+    filename: string;
+    contentType: string;
+    url: string;
+  }> = [];
+  for (const event of currentPhaseEvents(events, operationToken)) {
+    if (event.type !== "assistant_message") continue;
+    const message = event.assistant_message;
+    if (!message || typeof message !== "object" || Array.isArray(message))
+      continue;
+    const attachments = Array.isArray(
+      (message as Record<string, unknown>).attachments,
+    )
+      ? ((message as Record<string, unknown>).attachments as unknown[])
+      : [];
+    for (const attachment of attachments) {
+      if (
+        !attachment ||
+        typeof attachment !== "object" ||
+        Array.isArray(attachment)
+      )
+        continue;
+      const record = attachment as Record<string, unknown>;
+      const filename =
+        record.filename ?? record.file_name ?? record.fileName ?? "";
+      const contentType =
+        record.content_type ?? record.mime_type ?? record.mimeType ?? "";
+      const url = record.url ?? record.file_url ?? record.fileUrl ?? "";
+      if (
+        filename === FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME &&
+        contentType === FRONTMIND_SITE_SOURCE_ARCHIVE_MIME &&
+        typeof url === "string" &&
+        url.length > 0
+      ) {
+        candidates.push({
+          filename: String(filename),
+          contentType: String(contentType),
+          url,
+        });
+      }
+    }
+  }
+  const unique = new Map(
+    candidates.map((candidate) => [candidate.url, candidate]),
+  );
+  if (unique.size > 1) {
+    throw new SiteOpsManusFailure(
+      "SITEOPS_NATIVE_SOURCE_OUTPUT_CONFLICT",
+      "AI 建站返回了多个不同的完整源码包，已停止采用以避免版本混淆。",
+      "failed",
+    );
+  }
+  return [...unique.values()][0] ?? null;
+}
+
+type NativeSelection = Awaited<ReturnType<typeof selectedNativeSourceArchive>>;
+
+function nativeSourceInputAttachment(source: NativeSelection) {
+  return {
+    filename: "frontmind-selected-21st-source-v1.zip",
+    mime_type: "application/zip",
+    file_data: `data:application/zip;base64,${source.archiveBytes.toString(
+      "base64",
+    )}`,
+  } as const;
+}
+
+function nativeBrandAttachment(
+  brandAsset: Awaited<
+    ReturnType<typeof readSelectedOfficialLogoFromKnowledgeArchive>
+  >,
+) {
+  if (!brandAsset) return [];
+  const extension =
+    brandAsset.mimeType === "image/jpeg"
+      ? "jpg"
+      : brandAsset.mimeType === "image/svg+xml"
+        ? "svg"
+        : brandAsset.mimeType.split("/")[1];
+  return [
+    {
+      filename: `verified-company-logo.${extension}`,
+      mime_type: brandAsset.mimeType,
+      file_data: `data:${brandAsset.mimeType};base64,${brandAsset.bytes.toString(
+        "base64",
+      )}`,
+    },
+  ];
+}
+
+function nativeSourcePrompt(input: {
+  operationToken: string;
+  baseSourceSha256: string;
+  hasCustomerFeedback?: boolean;
+  repair?: {
+    attempt: number;
+    kind: "compile" | "hard_safety";
+    diagnostics: readonly {
+      code: string;
+      file: string | null;
+      line: number | null;
+      column: number | null;
+    }[];
+  };
+}) {
+  const repair = input.repair
+    ? `\n\n${
+        input.repair.kind === "hard_safety"
+          ? "上一份完整源码未通过硬安全检查。不得复用或修改该失败输出；必须从本消息重新附加的原始 21st 源码开始生成，不得重新设计。"
+          : "上一份完整源码未通过本地编译。只修复下列编译坐标，不得重新设计。"
+      }完成后仍返回完整源码 ZIP：\n${input.repair.diagnostics
+        .slice(0, 8)
+        .map(
+          (item) =>
+            `- ${item.code} ${item.file ?? "unknown"}:${item.line ?? 0}:${item.column ?? 0}`,
+        )
+        .join("\n")}`
+    : "";
+  return promptWithMarker(
+    `${TWENTY_FIRST_NATIVE_SOURCE_SYSTEM_PROMPT}
+
+frontmind-siteops-source-dossier-v1.json 是唯一企业事实来源；源码 ZIP 是唯一视觉与组件基线。不得采用附件之外的企业事实、媒体、依赖或外部资源。
+
+${input.hasCustomerFeedback ? "本次客户修改要求位于 frontmind-customer-feedback-v1.json；只能在知识事实和原生样式边界内落实。" : ""}
+
+Receipt 必须严格包含当前 operationToken、baseSourceSha256=${input.baseSourceSha256}、最终 ZIP 的 archiveSha256 以及实际 fileCount。源码包必须命名为 ${FRONTMIND_SITE_SOURCE_ARCHIVE_FILENAME}，Receipt 必须命名为 ${FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME}。${repair}`,
+    input.operationToken,
+  );
+}
+
+function nativeCompileSignature(error: NativeReactBuildError) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        code: error.code,
+        diagnostics: error.diagnostics.slice(0, 8).map((item) => ({
+          code: item.code,
+          file: item.file,
+          line: item.line,
+          column: item.column,
+        })),
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+async function handleNativeReactSiteBuild(input: {
+  db: any;
+  operation: SiteOperation;
+  signal: AbortSignal;
+  assertExecutionActive: () => Promise<void>;
+  client: ManusV2Client;
+  input: z.infer<typeof operationInputSchema>;
+  state: ProviderState | null;
+  context: Awaited<ReturnType<typeof loadBuildContext>>;
+  brief: z.infer<typeof siteBriefSchema>;
+  documents: ReturnType<typeof safePublicDocuments>;
+  visualEvidence: z.infer<typeof visualEvidenceV1Schema>;
+  taxonomy: z.infer<typeof visualTaxonomySchema>;
+  brandAsset: Awaited<
+    ReturnType<typeof readSelectedOfficialLogoFromKnowledgeArchive>
+  >;
+  nativeSelection: NativeSelection;
+  materializeNative: typeof materializeNativeReactSource;
+  persist: typeof persistSiteOpsArtifact;
+}): Promise<SiteOpsProviderResult> {
+  const attempt = input.state?.nativeRepairAttempt ?? 0;
+  const operationToken = `siteops-native-source:${input.operation.id}:${attempt}`;
+  const baseSourceSha256 = input.nativeSelection.archiveSha256;
+  const runtimeVisual = siteOpsRuntimeVisualEvidenceV1Schema.parse({
+    queryHash: input.nativeSelection.bundle.queryPlanHash,
+    selectedCandidateId: input.context.sample.id,
+    providerItemKey: input.visualEvidence.providerItemKey,
+    visualEvidenceSha256: input.visualEvidence.evidenceSha256,
+    previewSha256: input.visualEvidence.previewSha256,
+    supportEvidenceSha256s: [],
+    taxonomy: input.taxonomy,
+  });
+  const sourceAttachments = (token: string) => [
+    ...siteOpsSourceDossierAttachments({
+      operationToken: token,
+      snapshot: {
+        id: input.context.snapshot.id,
+        archiveSha256: input.context.build.knowledgeArchiveHash,
+        sourceBuildId: input.context.snapshot.sourceBuildId,
+        sourceBuildRevision: input.context.snapshot.sourceBuildRevision,
+      },
+      brief: briefWithoutBrandAssets(input.brief),
+      visualEvidence: runtimeVisual,
+      documents: input.documents,
+    }),
+    nativeSourceInputAttachment(input.nativeSelection),
+    ...nativeBrandAttachment(input.brandAsset),
+    ...(input.input.feedback
+      ? [siteOpsCustomerFeedbackAttachment(input.input.feedback)]
+      : []),
+  ];
+  let taskId =
+    input.state?.taskId ?? input.operation.providerTaskId ?? undefined;
+  if (!taskId) {
+    if (input.state?.stage === "create_unknown") {
+      const found = await findUniqueCreatedTask(
+        input.client,
+        input.operation,
+        operationToken,
+      );
+      if (!found) return pending(input.state, undefined, "design_compiling");
+      taskId = found.id;
+    } else {
+      const createUnknownState = transitionProviderState(input.state, {
+        stage: "create_unknown",
+        nativeRepairAttempt: 0,
+      });
+      await persistOperationProgress(
+        input.db,
+        input.operation,
+        createUnknownState,
+      );
+      try {
+        await input.assertExecutionActive();
+        const created = await input.client.createTask({
+          title: operationTitle(input.operation),
+          prompt: nativeSourcePrompt({
+            operationToken,
+            baseSourceSha256,
+            hasCustomerFeedback: Boolean(input.input.feedback),
+          }),
+          attachments: sourceAttachments(operationToken),
+          locale: input.brief.primaryLanguage,
+          agentProfile: managedAgentProfileModel(input.input.agentProfile),
+          structuredOutputSchema: nativeSourceReceiptOutputSchema({
+            operationToken,
+            baseSourceSha256,
+          }),
+        });
+        taskId = created.taskId;
+      } catch (error) {
+        if (error instanceof ManusV2ApiError && error.outcomeUnknown) {
+          return pending(createUnknownState, undefined, "design_compiling");
+        }
+        throw error;
+      }
+    }
+    const pendingState = transitionProviderState(input.state, {
+      stage: "native_source_pending",
+      taskId,
+      nativeRepairAttempt: 0,
+      resultPendingSince: undefined,
+    });
+    await bindCreatedBuildTask({
+      db: input.db,
+      operation: input.operation,
+      buildId: input.context.build.id,
+      taskId,
+      state: pendingState,
+    });
+    return pending(pendingState, taskId, "design_compiling");
+  }
+
+  if (
+    input.context.build.upstreamManusTaskId !== null &&
+    input.context.build.upstreamManusTaskId !== taskId
+  ) {
+    throw new SiteOpsManusFailure(
+      "FRONTMIND_BUILD_RESULT_PENDING",
+      "FrontMind AI 建站任务坐标仍在确认中，系统不会混用源码。",
+      "failed",
+    );
+  }
+  if (input.context.build.upstreamManusTaskId === null) {
+    const rebound = await input.db
+      .update(siteBuilds)
+      .set({
+        upstreamManusTaskId: taskId,
+        status: "design_compiling",
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(siteBuilds.id, input.context.build.id),
+          eq(siteBuilds.userId, input.operation.userId),
+          isNull(siteBuilds.upstreamManusTaskId),
+        ),
+      );
+    const affectedRows = Number(
+      (Array.isArray(rebound)
+        ? (rebound[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+        : (rebound as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+        0,
+    );
+    if (affectedRows !== 1) {
+      throw new SiteOpsManusFailure(
+        "FRONTMIND_BUILD_RESULT_PENDING",
+        "FrontMind AI 建站任务坐标仍在确认中，系统不会混用源码。",
+        "failed",
+      );
+    }
+  }
+  const scheduleNativeRepair = async (repairInput: {
+    kind: "compile" | "hard_safety";
+    signature: string;
+    diagnostics: readonly {
+      code: string;
+      file: string | null;
+      line: number | null;
+      column: number | null;
+    }[];
+  }) => {
+    if (
+      attempt >= 2 ||
+      input.state?.nativeLastErrorSignature === repairInput.signature
+    ) {
+      return null;
+    }
+    const nextAttempt = attempt + 1;
+    const nextToken = `siteops-native-source:${input.operation.id}:${nextAttempt}`;
+    const unknownState = transitionProviderState(input.state, {
+      stage: "native_repair_send_unknown",
+      taskId,
+      nativeRepairAttempt: nextAttempt,
+      nativeLastErrorSignature: repairInput.signature,
+      resultPendingSince: undefined,
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      unknownState,
+      taskId,
+    );
+    try {
+      await input.assertExecutionActive();
+      await input.client.sendMessage({
+        taskId,
+        prompt: nativeSourcePrompt({
+          operationToken: nextToken,
+          baseSourceSha256,
+          hasCustomerFeedback: Boolean(input.input.feedback),
+          repair: {
+            attempt: nextAttempt,
+            kind: repairInput.kind,
+            diagnostics: repairInput.diagnostics,
+          },
+        }),
+        attachments: sourceAttachments(nextToken),
+        structuredOutputSchema: nativeSourceReceiptOutputSchema({
+          operationToken: nextToken,
+          baseSourceSha256,
+        }),
+      });
+    } catch (sendError) {
+      if (sendError instanceof ManusV2ApiError && sendError.outcomeUnknown) {
+        return pending(unknownState, taskId, "qa_running");
+      }
+      throw sendError;
+    }
+    const repairState = transitionProviderState(unknownState, {
+      stage: "native_repair_pending",
+    });
+    await persistOperationProgress(
+      input.db,
+      input.operation,
+      repairState,
+      taskId,
+    );
+    logManusBuildStage({
+      stage: "native_repair_scheduled",
+      operationId: input.operation.id,
+      buildId: input.context.build.id,
+      reason: repairInput.kind,
+      signature: repairInput.signature,
+    });
+    return pending(repairState, taskId, "qa_running");
+  };
+  if (input.state?.stage === "native_repair_send_unknown") {
+    const events = await input.client.listAllMessages({
+      taskId,
+      order: "asc",
+      stopAfterOperationToken: operationToken,
+    });
+    if (!manusV2EventsContainOperationToken(events, operationToken)) {
+      return pending(input.state, taskId, "qa_running");
+    }
+    const pendingState = transitionProviderState(input.state, {
+      stage: "native_repair_pending",
+    });
+    return pending(pendingState, taskId, "qa_running");
+  }
+
+  const polled = await pollEvents(input.client, taskId, operationToken);
+  const receiptResolution = await resolveBuildWireValue({
+    operationId: input.operation.id,
+    buildId: input.context.build.id,
+    events: polled.events,
+    operationToken,
+    phase: "design",
+    expectedFilename: FRONTMIND_SITE_SOURCE_RECEIPT_FILENAME,
+    taskCompleted: polled.state.completed,
+    signal: input.signal,
+    validateCandidate: (value) => {
+      siteSourceReceiptV1Schema.parse(value);
+    },
+  });
+  if (receiptResolution.invalid) {
+    throw new SiteOpsManusFailure(
+      "SITEOPS_NATIVE_SOURCE_RECEIPT_INVALID",
+      "AI 建站源码回执未通过结构与任务绑定校验。",
+      "failed",
+    );
+  }
+  const attachment = nativeSourceOutputAttachment(
+    polled.events,
+    operationToken,
+  );
+  if (!receiptResolution.value || !attachment) {
+    if (polled.waiting || polled.state.failed) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_NATIVE_SOURCE_OUTPUT_UNAVAILABLE",
+        "AI 建站未返回完整源码包和回执。",
+        "failed",
+      );
+    }
+    const pendingState = transitionProviderState(input.state, {
+      stage: attempt > 0 ? "native_repair_pending" : "native_source_pending",
+      taskId,
+      nativeRepairAttempt: attempt,
+      resultPendingSince: input.state?.resultPendingSince,
+    });
+    const grace = structuredResultGrace(pendingState, polled.state.completed);
+    if (grace.expired) {
+      throw new SiteOpsManusFailure(
+        "SITEOPS_NATIVE_SOURCE_OUTPUT_UNAVAILABLE",
+        "AI 建站未返回完整源码包和回执。",
+        "failed",
+      );
+    }
+    return pending(
+      grace.state,
+      taskId,
+      attempt > 0 ? "qa_running" : "building",
+    );
+  }
+  const receipt = siteSourceReceiptV1Schema.parse(receiptResolution.value);
+  let validated: Awaited<ReturnType<typeof validateNativeReactSourceArchive>>;
+  try {
+    const archive = await readNativeSourceAttachment({
+      attachment,
+      signal: input.signal,
+    });
+    validated = await validateNativeReactSourceArchive({
+      archive,
+      receipt,
+      expectedOperationToken: operationToken,
+      expectedBaseSourceSha256: baseSourceSha256,
+    });
+  } catch (error) {
+    if (error instanceof NativeReactSourceError) {
+      const signature = createHash("sha256")
+        .update(JSON.stringify({ code: error.code }), "utf8")
+        .digest("hex");
+      const scheduled = await scheduleNativeRepair({
+        kind: "hard_safety",
+        signature,
+        diagnostics: [
+          { code: error.code, file: null, line: null, column: null },
+        ],
+      });
+      if (scheduled) return scheduled;
+      throw new SiteOpsManusFailure(
+        error.code,
+        "AI 建站返回的源码包未通过硬安全校验。",
+        "failed",
+      );
+    }
+    throw error;
+  }
+  logManusBuildStage({
+    stage: "native_source_intake",
+    operationId: input.operation.id,
+    buildId: input.context.build.id,
+    candidateSha256: validated.archiveSha256,
+    byteCount: validated.sourceZip.length,
+  });
+  const qaUpdated = await input.db
+    .update(siteBuilds)
+    .set({ status: "qa_running", updatedAt: new Date() })
+    .where(
+      and(
+        eq(siteBuilds.id, input.context.build.id),
+        eq(siteBuilds.userId, input.operation.userId),
+        eq(siteBuilds.upstreamManusTaskId, taskId),
+      ),
+    );
+  const qaAffectedRows = Number(
+    (Array.isArray(qaUpdated)
+      ? (qaUpdated[0] as { affectedRows?: unknown } | undefined)?.affectedRows
+      : (qaUpdated as { affectedRows?: unknown } | undefined)?.affectedRows) ??
+      0,
+  );
+  if (qaAffectedRows !== 1) {
+    throw new Error("SITEOPS_OPERATION_LEASE_LOST");
+  }
+  let materialized: MaterializedNativeReactSite;
+  const materializationStartedAt = Date.now();
+  try {
+    await input.assertExecutionActive();
+    materialized = await input.materializeNative({
+      sourceZip: validated.sourceZip,
+      validatedSource: validated,
+      build: {
+        id: input.context.build.id,
+        projectId: input.context.build.projectId,
+        knowledgeSnapshotId: input.context.build.knowledgeSnapshotId,
+        workflowVersion: input.context.build.workflowVersion,
+        selectionHash: input.context.build.selectionHash,
+      },
+      brief: input.brief,
+      mode: "preview",
+      abortSignal: input.signal,
+    });
+    await input.assertExecutionActive();
+  } catch (error) {
+    if (
+      error instanceof NativeReactBuildError &&
+      error.code === "NATIVE_BUILD_COMPILE_FAILED"
+    ) {
+      const signature = nativeCompileSignature(error);
+      const scheduled = await scheduleNativeRepair({
+        kind: "compile",
+        signature,
+        diagnostics: error.diagnostics,
+      });
+      if (!scheduled) {
+        throw new SiteOpsManusFailure(
+          "BUILD_PRIMARY_RENDER_FAILED",
+          "原生 21st 源码连续未能编译，请申请重置后重新生成。",
+          "failed",
+        );
+      }
+      return scheduled;
+    }
+    if (error instanceof NativeReactSourceError) {
+      throw new SiteOpsManusFailure(
+        error.code,
+        "AI 建站返回的源码包未通过硬安全校验。",
+        "failed",
+      );
+    }
+    if (error instanceof NativeReactBuildError) {
+      throw new SiteOpsManusFailure(
+        error.code,
+        "原生 21st 源码未能通过构建或硬安全检查。",
+        "failed",
+      );
+    }
+    throw error;
+  }
+  logManusBuildStage({
+    stage: "native_compile",
+    operationId: input.operation.id,
+    buildId: input.context.build.id,
+    renderMode: materialized.buildDelivery.renderMode,
+    qaStatus: materialized.buildDelivery.qaStatus,
+    warningCount: materialized.buildDelivery.warningCodes.length,
+    latencyMs: Date.now() - materializationStartedAt,
+  });
+  const artifacts = await persistBuildArtifacts(
+    input.operation,
+    materialized,
+    input.persist,
+    input.assertExecutionActive,
+  );
+  logManusBuildStage({
+    stage: "preview_persisted",
+    operationId: input.operation.id,
+    buildId: input.context.build.id,
+    renderMode: materialized.buildDelivery.renderMode,
+    qaStatus: materialized.buildDelivery.qaStatus,
+    warningCount: materialized.buildDelivery.warningCodes.length,
+    latencyMs: Date.now() - materializationStartedAt,
+  });
+  return {
+    status: "succeeded",
+    providerTaskId: taskId,
+    projectStatus: "preview_ready",
+    buildStatus: "preview_ready",
+    result: {
+      buildId: input.context.build.id,
+      specHash: materialized.contractSha256,
+      distHash: materialized.distSha256,
+      buildDelivery: materialized.buildDelivery,
+      qaSummary: artifacts.qaSummary,
+      artifactIds: {
+        contract: artifacts.contract.id,
+        source: artifacts.source.id,
+        dist: artifacts.dist.id,
+        qa: artifacts.qa.id,
+        provenance: artifacts.provenance.id,
+      },
+      artifactBindings: {
+        contract: {
+          id: artifacts.contract.id,
+          sha256: materialized.contractSha256,
+          bytes: materialized.contractJson.length,
+          mimeType: "application/json",
+        },
+        source: {
+          id: artifacts.source.id,
+          sha256: materialized.sourceSha256,
+          bytes: materialized.sourceZip.length,
+          mimeType: "application/zip",
+        },
+        dist: {
+          id: artifacts.dist.id,
+          sha256: materialized.distSha256,
+          bytes: materialized.distZip.length,
+          mimeType: "application/zip",
+        },
+        qa: {
+          id: artifacts.qa.id,
+          sha256: materialized.visualQaSha256,
+          bytes: materialized.visualQaZip.length,
+          mimeType: "application/zip",
+        },
+        provenance: {
+          id: artifacts.provenance.id,
+          sha256: materialized.provenanceSha256,
+          bytes: materialized.provenanceJson.length,
+          mimeType: "application/json",
+        },
+      },
+    },
+    message: completedSiteBuildMessage(),
+  };
+}
+
 async function resolveBuildWireValue(input: {
   operationId: string;
   buildId: string;
@@ -2196,7 +2902,9 @@ async function scheduleRepair(input: {
 
 async function persistBuildArtifacts(
   operation: SiteOperation,
-  materialized: Awaited<ReturnType<typeof materializeAstroSite>>,
+  materialized:
+    | Awaited<ReturnType<typeof materializeAstroSite>>
+    | MaterializedNativeReactSite,
   persist: typeof persistSiteOpsArtifact,
   assertExecutionActive: () => Promise<void>,
 ) {
@@ -2322,6 +3030,46 @@ export function resultFailure(error: unknown): SiteOpsProviderResult {
   };
 }
 
+function safeProviderInternalCode(error: unknown) {
+  if (error instanceof SiteOpsManusFailure) return error.code;
+  if (error instanceof NativeReactSourceError) return error.code;
+  if (error instanceof NativeReactBuildError) return error.code;
+  if (error instanceof SiteOpsMaterializationError) return error.code;
+  if (error instanceof SiteOpsWireOutputResolutionError) return error.code;
+  if (error instanceof z.ZodError) return "ZOD_VALIDATION_FAILED";
+  if (
+    error instanceof Error &&
+    /^(?:SITEOPS|FRONTMIND)_[A-Z0-9_:-]+$/u.test(error.message)
+  ) {
+    return error.message;
+  }
+  if (error instanceof TypeError) return "TYPE_ERROR";
+  return "UNCLASSIFIED_PROVIDER_ERROR";
+}
+
+function safeProviderValidationDetails(error: unknown) {
+  if (!(error instanceof z.ZodError)) return undefined;
+  return error.issues.slice(0, 8).map((issue) => ({
+    code: issue.code,
+    path: issue.path.map((segment) =>
+      typeof segment === "number" ? segment : String(segment),
+    ),
+    ...(issue.code === "unrecognized_keys"
+      ? {
+          keys: issue.keys
+            .filter((key) => /^[A-Za-z][A-Za-z0-9_]{0,63}$/u.test(key))
+            .slice(0, 8)
+            .join(","),
+        }
+      : {}),
+  }));
+}
+
+function safeProviderErrorName(error: unknown) {
+  if (!(error instanceof Error)) return "NonError";
+  return /^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(error.name) ? error.name : "Error";
+}
+
 export function createManusSiteOpsProviderHandler(
   dependencies: ManusProviderDependencies = {},
 ): SiteOpsProviderHandler {
@@ -2342,6 +3090,8 @@ export function createManusSiteOpsProviderHandler(
   const persist = dependencies.persistArtifact ?? persistSiteOpsArtifact;
   const readArtifact = dependencies.readArtifact ?? readSiteOpsArtifact;
   const materialize = dependencies.materializeSite ?? materializeAstroSite;
+  const materializeNative =
+    dependencies.materializeNativeSite ?? materializeNativeReactSource;
   const socialGenerate = dependencies.generateSocial ?? generateSocialPackage;
 
   return async ({ operation, signal, assertLeaseActive }) => {
@@ -2700,12 +3450,79 @@ export function createManusSiteOpsProviderHandler(
         userId: operation.userId,
         localAssetId: context.batch.selectionBundleLocalAssetId,
         expectedSha256: context.batch.selectionBundleHash,
-        expectedMimeTypes: ["application/json"],
+        expectedMimeTypes: [
+          "application/json",
+          VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE,
+        ],
       });
       if (!selectionArtifact) {
         throw new SiteOpsManusFailure(
           "VISUAL_SELECTION_BUNDLE_MISSING",
           "冻结的视觉选择合同不存在。",
+          "failed",
+        );
+      }
+      if (
+        selectionArtifact.row.mimeType === VISUAL_SELECTION_BUNDLE_V5_MIME_TYPE
+      ) {
+        if (
+          context.build.workflowVersion !==
+          SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION
+        ) {
+          throw new SiteOpsManusFailure(
+            "VISUAL_SELECTION_COORDINATES_MISMATCH",
+            "原生视觉源码与建站工作流版本不一致。",
+            "failed",
+          );
+        }
+        const artifactBytes = await storedArtifactBytes(
+          selectionArtifact,
+          25 * 1024 * 1024,
+        );
+        const nativeSelection = await selectedNativeSourceArchive({
+          artifactBytes,
+          selectedCandidateId: context.sample.id,
+        });
+        if (
+          metadataRecord.renderer !== "twenty_first_native_react_v1" ||
+          metadataRecord.schemaVersion !== 5 ||
+          metadataRecord.sourceTreeSha256 !==
+            nativeSelection.candidate.sourceTreeSha256 ||
+          metadataRecord.sourceArchiveSha256 !==
+            nativeSelection.candidate.sourceArchiveSha256 ||
+          metadataProviderItemKey !== nativeSelection.candidate.providerItemKey
+        ) {
+          throw new SiteOpsManusFailure(
+            "VISUAL_SELECTION_COORDINATES_MISMATCH",
+            "冻结的原生源码与所选视觉候选不一致。",
+            "failed",
+          );
+        }
+        return await handleNativeReactSiteBuild({
+          db,
+          operation,
+          signal,
+          assertExecutionActive,
+          client,
+          input,
+          state,
+          context,
+          brief,
+          documents,
+          visualEvidence,
+          taxonomy,
+          brandAsset,
+          nativeSelection,
+          materializeNative,
+          persist,
+        });
+      }
+      if (
+        context.build.workflowVersion === SITEOPS_NATIVE_VISUAL_WORKFLOW_VERSION
+      ) {
+        throw new SiteOpsManusFailure(
+          "VISUAL_SELECTION_BUNDLE_INVALID",
+          "当前原生源码候选缺少 V5 选择包。",
           "failed",
         );
       }
@@ -2909,10 +3726,7 @@ export function createManusSiteOpsProviderHandler(
         });
         return parsed;
       };
-      let taskId =
-        state?.taskId ??
-        operation.providerTaskId ??
-        undefined;
+      let taskId = state?.taskId ?? operation.providerTaskId ?? undefined;
 
       if (!taskId) {
         if (state?.stage === "create_unknown") {
@@ -4424,6 +5238,9 @@ export function createManusSiteOpsProviderHandler(
         kind: operation.kind,
         status: failure.status,
         code: "code" in failure ? failure.code : "FRONTMIND_BUILD_FAILED",
+        internalCode: safeProviderInternalCode(error),
+        errorName: safeProviderErrorName(error),
+        validation: safeProviderValidationDetails(error),
       });
       return failure;
     }

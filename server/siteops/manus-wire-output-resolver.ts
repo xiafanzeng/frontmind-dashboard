@@ -17,6 +17,7 @@ export const SITEOPS_WIRE_OUTPUT_FILES = Object.freeze({
   content: "frontmind-page-content-wire-v2.json",
   contentV3: "frontmind-page-content-wire-v3.json",
   contentDraftV1: "frontmind-site-content-draft-v1.json",
+  sourceReceiptV1: "frontmind-site-source-receipt-v1.json",
 });
 
 const SITEOPS_WIRE_OUTPUT_MAX_BYTES = Object.freeze({
@@ -419,15 +420,19 @@ function jsonAttachments(
   const contentDraftV1 =
     phase === "content" &&
     expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.contentDraftV1;
-  if (!expectedWireVersion && !contentDraftV1) {
+  const sourceReceiptV1 =
+    phase === "design" &&
+    expectedFilename === SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1;
+  if (!expectedWireVersion && !contentDraftV1 && !sourceReceiptV1) {
     throw new SiteOpsWireOutputResolutionError("SITEOPS_WIRE_OUTPUT_INVALID");
   }
-  const phaseStem =
-    contentDraftV1
+  const phaseStem = sourceReceiptV1
+    ? "frontmind[-_]site[-_]source[-_]receipt[-_]v1"
+    : contentDraftV1
       ? "frontmind[-_]site[-_]content[-_]draft[-_]v1"
       : phase === "design"
-      ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
-      : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
+        ? `frontmind[-_]site[-_]design[-_]wire[-_]v${expectedWireVersion}`
+        : `frontmind[-_]page[-_]content[-_]wire[-_]v${expectedWireVersion}`;
   const providerFilenamePattern = new RegExp(
     `^${phaseStem}(?:[-_]repair[-_][1-3])?\\.json$`,
     "u",
@@ -614,7 +619,11 @@ export async function resolveSiteOpsWireOutput(input: {
 }): Promise<SiteOpsWireOutputResolution | null> {
   const allowedFilenames: readonly string[] =
     input.phase === "design"
-      ? [SITEOPS_WIRE_OUTPUT_FILES.design, SITEOPS_WIRE_OUTPUT_FILES.designV3]
+      ? [
+          SITEOPS_WIRE_OUTPUT_FILES.design,
+          SITEOPS_WIRE_OUTPUT_FILES.designV3,
+          SITEOPS_WIRE_OUTPUT_FILES.sourceReceiptV1,
+        ]
       : [
           SITEOPS_WIRE_OUTPUT_FILES.content,
           SITEOPS_WIRE_OUTPUT_FILES.contentV3,

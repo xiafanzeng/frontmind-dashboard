@@ -115,7 +115,11 @@ export const siteOpsBuildProjectionSchema = z
     sourceUrl: z.string().max(2_048).nullable().default(null),
     buildDelivery: z
       .object({
-        renderMode: z.enum(["primary", "trusted_fallback"]),
+        renderMode: z.enum([
+          "primary",
+          "trusted_fallback",
+          "twenty_first_native",
+        ]),
         qaStatus: z.enum(["passed", "passed_with_warnings", "partial"]),
         warningCodes: z.array(z.string().trim().min(1).max(128)).max(100),
       })
