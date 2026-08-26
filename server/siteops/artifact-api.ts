@@ -15,11 +15,7 @@ import {
 import { getDb } from "../db";
 import { readSiteOpsArtifact } from "./artifact-store";
 import { exchangeAliyunOAuthCode } from "./aliyun-platform-service";
-import {
-  completeSiteOpsAliyunOAuth,
-  getPublicSiteOpsAliyunRosTemplate,
-  getSiteOpsAliyunRoleConfiguration,
-} from "./service";
+import { completeSiteOpsAliyunOAuth } from "./service";
 
 const MAX_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 2_000;
@@ -83,7 +79,7 @@ const ALIYUN_OAUTH_COMPLETION_COPY: Record<
 > = {
   success: {
     title: "阿里云授权已完成",
-    description: "可以返回 AI友好官网管理继续完成账号授权配置。",
+    description: "账号已经连接，可以返回 AI友好官网管理选择并配置域名。",
   },
   cancelled: {
     title: "已取消阿里云授权",
@@ -609,39 +605,6 @@ async function sendOwnedAsset(input: {
 
 export const siteOpsArtifactApi = express.Router();
 
-export const siteOpsAliyunRosTemplateApi = express.Router();
-
-siteOpsAliyunRosTemplateApi.use((req, res, next) => {
-  res.setHeader("Cache-Control", "private, no-store, max-age=0");
-  res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
-  if (req.method !== "GET") {
-    notFound(res);
-    return;
-  }
-  next();
-});
-
-siteOpsAliyunRosTemplateApi.get(
-  /^\/(ar1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{32,1900}\.[A-Za-z0-9_-]{22})\/?$/u,
-  async (req, res) => {
-    try {
-      const template = await getPublicSiteOpsAliyunRosTemplate(req.params[0]);
-      const bytes = Buffer.from(JSON.stringify(template), "utf8");
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      res.setHeader("Content-Length", String(bytes.length));
-      res.status(200).send(bytes);
-    } catch {
-      notFound(res);
-    }
-  },
-);
-
-siteOpsAliyunRosTemplateApi.use((_req, res) => {
-  notFound(res);
-});
-
 siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
   const startedAt = Date.now();
   const correlationId = randomBytes(12).toString("hex");
@@ -701,6 +664,7 @@ siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
       credentialId: identity.credentialId,
       projectId: identity.projectId,
       accountUid: identity.accountUid,
+      refreshToken: identity.refreshToken,
     });
     sendAliyunOAuthCompletionPage(res, "success");
   } catch (error) {
@@ -712,35 +676,6 @@ siteOpsArtifactApi.get("/aliyun/oauth/callback", async (req, res) => {
       startedAt,
     });
     sendAliyunOAuthCompletionPage(res, "failed");
-  }
-});
-
-siteOpsArtifactApi.get("/aliyun/role-configuration", async (req, res) => {
-  try {
-    const actor = req.frontmindUser;
-    const conversationId =
-      typeof req.query.conversationId === "string"
-        ? req.query.conversationId.trim()
-        : "";
-    if (!actor || conversationId.length < 1 || conversationId.length > 191) {
-      return notFound(res);
-    }
-    const configuration = await getSiteOpsAliyunRoleConfiguration(
-      actor,
-      conversationId,
-    );
-    const bytes = Buffer.from(JSON.stringify(configuration, null, 2), "utf8");
-    res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader(
-      "Content-Disposition",
-      "attachment; filename=frontmind-aliyun-role-configuration.json",
-    );
-    res.setHeader("Content-Length", String(bytes.length));
-    res.send(bytes);
-  } catch {
-    notFound(res);
   }
 });
 

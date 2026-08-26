@@ -4,7 +4,6 @@ export type SiteOpsProviderName =
   | "21st"
   | "manus"
   | "aliyun_esa"
-  | "aliyun_domain"
   | "aliyun_alidns";
 
 export type SiteOpsProviderResult =

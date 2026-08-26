@@ -1,16 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
 import {
   localAssets,
   messages,
   siteBuilds,
   siteDeployments,
-  siteDomainOperations,
   siteOperations,
   siteProjects,
   socialPackages,
   websiteStyleSampleBatches,
   websiteStyleSamples,
+  workspaceSiteProfiles,
 } from "../../drizzle/schema";
 import { visualSearchOperationInputSchema } from "../../shared/siteops-workflow";
 import {
@@ -28,6 +28,7 @@ import {
 import { siteOpsQuotaStateForProviderResult } from "./quota-service";
 import { publicSiteOpsProviderResult } from "./public-errors";
 import {
+  advanceApprovedSiteOpsResetAfterDnsRollback,
   finalizeApprovedSiteOpsReset,
   parseApprovedResetUnpublishInput,
 } from "./rebuild-ticket";
@@ -86,8 +87,7 @@ function affectedRows(result: unknown) {
   return Number(
     (Array.isArray(result)
       ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
-      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
-      0,
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ?? 0,
   );
 }
 
@@ -196,20 +196,6 @@ export function exclusiveSiteOpsLiveHeadProjection(
     globalLiveDeploymentId:
       target === "global_excluding_cn" ? deploymentId : null,
     mainlandLiveDeploymentId: target === "mainland_cn" ? deploymentId : null,
-  } as const;
-}
-
-export function domainFinancialTerminalProjection(
-  status: "succeeded" | "failed" | "attention_required",
-  mutationAttempted = false,
-) {
-  return {
-    status,
-    ...(status === "succeeded" ||
-    status === "failed" ||
-    (status === "attention_required" && !mutationAttempted)
-      ? { activeFinancialKey: null }
-      : {}),
   } as const;
 }
 
@@ -527,12 +513,31 @@ async function assertClaimLeaseActive(db: any, operation: Claimed) {
 }
 
 async function invokeProvider(db: any, operation: Claimed) {
-  if (siteOpsRemovedResumeOperation(operation.input)) {
-    return failureResult(
-      "failed",
-      "FRONTMIND_BUILD_RESUME_REMOVED",
-      "历史建站恢复任务已停用，请通过批准重置后创建全新任务。",
-    );
+  if (approvedResetFromOperationInput(operation.input)) {
+    const activeProviderRows = await db
+      .select({ id: siteOperations.id })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, operation.projectId),
+          inArray(siteOperations.provider, ["aliyun_esa", "aliyun_alidns"]),
+          inArray(siteOperations.status, [
+            "queued",
+            "running",
+            "outcome_unknown",
+          ]),
+        ),
+      )
+      .limit(20);
+    if (
+      activeProviderRows.some((row: { id: string }) => row.id !== operation.id)
+    ) {
+      return {
+        status: "pending" as const,
+        result: operation.result ?? undefined,
+        nextPollMs: 15_000,
+      };
+    }
   }
   const handler = getSiteOpsProviderHandler(operation.provider);
   if (!handler) {
@@ -585,14 +590,218 @@ async function invokeProvider(db: any, operation: Claimed) {
   }
 }
 
-export function siteOpsRemovedResumeOperation(value: unknown) {
-  return Boolean(
-    value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      (value as Record<string, unknown>).resumeMode ===
-        "recover_design_output",
+function approvedResetFromOperationInput(value: unknown) {
+  const direct = parseApprovedResetUnpublishInput(value);
+  if (direct) return direct;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return parseApprovedResetUnpublishInput(
+    (value as Record<string, unknown>).approvedReset,
   );
+}
+
+export function siteOpsDeterministicSuccessorId(
+  parentId: string,
+  stage: string,
+) {
+  const bytes = createHash("sha256")
+    .update("frontmind.siteops-successor.v1\0", "utf8")
+    .update(parentId, "utf8")
+    .update("\0", "utf8")
+    .update(stage, "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function enqueueSuccessor(
+  tx: any,
+  parent: Claimed,
+  input: {
+    stage: string;
+    kind: "dns_apply" | "dns_rollback" | "rollback";
+    provider: "aliyun_alidns" | "aliyun_esa";
+    payload: Record<string, unknown>;
+  },
+) {
+  const id = siteOpsDeterministicSuccessorId(parent.id, input.stage);
+  const existing = await tx
+    .select({ id: siteOperations.id })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, parent.projectId),
+        eq(siteOperations.clientRequestId, id),
+      ),
+    )
+    .limit(1);
+  if (existing[0]) return existing[0].id;
+  const inputHash = createHash("sha256")
+    .update(JSON.stringify(input.payload), "utf8")
+    .digest("hex");
+  const now = new Date();
+  await tx.insert(siteOperations).values({
+    id,
+    projectId: parent.projectId,
+    userId: parent.userId,
+    conversationTurnId: parent.conversationTurnId,
+    buildId: null,
+    kind: input.kind,
+    status: "queued",
+    clientRequestId: id,
+    inputHash,
+    input: input.payload,
+    provider: input.provider,
+    attempt: 0,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return id;
+}
+
+export async function enqueueAutomaticDomainSuccessor(
+  tx: any,
+  operation: Claimed,
+  result: Extract<SiteOpsProviderResult, { status: "succeeded" }>,
+  now: Date,
+) {
+  const operationInput =
+    operation.input && typeof operation.input === "object"
+      ? (operation.input as Record<string, unknown>)
+      : {};
+  const resultData = result.result ?? {};
+  const connectionId = String(operationInput.connectionId ?? "");
+  const domain = String(resultData.domain ?? operationInput.domain ?? "");
+  const domainRevision = Number(
+    resultData.domainRevision ??
+      resultData.revision ??
+      operationInput.domainRevision,
+  );
+  if (
+    operation.kind === "domain_sync" &&
+    operation.provider === "aliyun_alidns" &&
+    connectionId &&
+    domain &&
+    Number.isInteger(domainRevision) &&
+    domainRevision > 0
+  ) {
+    await enqueueSuccessor(tx, operation, {
+      stage: "domain-sync:esa-prepare",
+      kind: "dns_apply",
+      provider: "aliyun_esa",
+      payload: {
+        prepareDomainBinding: true,
+        domain,
+        domainRevision,
+        connectionId,
+      },
+    });
+    return;
+  }
+  if (
+    operation.kind === "dns_apply" &&
+    operation.provider === "aliyun_esa" &&
+    ["esa_site_verification_dns_ready", "esa_cname_ready"].includes(
+      String(resultData.phase ?? ""),
+    ) &&
+    connectionId &&
+    Number.isInteger(domainRevision) &&
+    domainRevision > 0
+  ) {
+    await enqueueSuccessor(tx, operation, {
+      stage: `${String(resultData.phase)}:dns-plan`,
+      kind: "dns_apply",
+      provider: "aliyun_alidns",
+      payload: {
+        connectionId,
+        domainRevision,
+        dnsIntent: "plan",
+      },
+    });
+    return;
+  }
+  if (
+    operation.kind === "dns_apply" &&
+    operation.provider === "aliyun_alidns" &&
+    operationInput.dnsIntent === "plan" &&
+    resultData.canApply === true &&
+    connectionId &&
+    Number.isInteger(domainRevision) &&
+    domainRevision > 0 &&
+    typeof resultData.planHash === "string" &&
+    typeof resultData.providerSnapshotHash === "string"
+  ) {
+    await enqueueSuccessor(tx, operation, {
+      stage: "dns-plan:apply",
+      kind: "dns_apply",
+      provider: "aliyun_alidns",
+      payload: {
+        connectionId,
+        domainRevision,
+        dnsIntent: "apply",
+        planOperationId: operation.id,
+        planHash: resultData.planHash,
+        providerSnapshotHash: resultData.providerSnapshotHash,
+      },
+    });
+    return;
+  }
+  if (
+    operation.kind === "dns_apply" &&
+    operation.provider === "aliyun_alidns" &&
+    operationInput.dnsIntent === "apply" &&
+    connectionId
+  ) {
+    const profileRows = await tx
+      .select({
+        domain: workspaceSiteProfiles.normalizedAsciiDomain,
+        revision: workspaceSiteProfiles.domainRevision,
+        dnsStatus: workspaceSiteProfiles.dnsStatus,
+      })
+      .from(workspaceSiteProfiles)
+      .where(eq(workspaceSiteProfiles.userId, operation.userId))
+      .limit(1);
+    const profile = profileRows[0];
+    if (
+      profile?.dnsStatus === "pending_esa_binding" &&
+      profile.domain &&
+      profile.revision === domainRevision
+    ) {
+      await enqueueSuccessor(tx, operation, {
+        stage: "dns-apply:esa-followup",
+        kind: "dns_apply",
+        provider: "aliyun_esa",
+        payload: {
+          prepareDomainBinding: true,
+          domain: profile.domain,
+          domainRevision: profile.revision,
+          connectionId,
+        },
+      });
+    }
+    return;
+  }
+  const approvedReset = approvedResetFromOperationInput(operation.input);
+  if (
+    operation.kind === "dns_rollback" &&
+    operation.provider === "aliyun_alidns" &&
+    operationInput.dnsIntent === "rollback" &&
+    approvedReset
+  ) {
+    const successorId = await enqueueSuccessor(tx, operation, {
+      stage: "approved-reset:esa-unpublish",
+      kind: "rollback",
+      provider: "aliyun_esa",
+      payload: approvedReset,
+    });
+    await advanceApprovedSiteOpsResetAfterDnsRollback(tx, {
+      operation,
+      successorOperationId: successorId,
+      now,
+    });
+  }
 }
 
 async function verifiedBuildArtifactProjection(
@@ -809,17 +1018,6 @@ async function finalize(
             eq(siteOperations.leaseOwner, operation.leaseOwner),
           ),
         );
-      await tx
-        .update(siteDomainOperations)
-        .set({
-          status: "outcome_unknown",
-          providerTaskNo: result.providerTaskId ?? locked.providerTaskId,
-          providerResult: result.result,
-          errorCode: result.code,
-          errorMessage: result.message,
-          updatedAt: now,
-        })
-        .where(eq(siteDomainOperations.operationId, locked.id));
       return result.status;
     }
     const approvedReset = parseApprovedResetUnpublishInput(locked.input);
@@ -899,6 +1097,10 @@ async function finalize(
         ),
       );
     void terminalUpdate;
+
+    if (result.status === "succeeded") {
+      await enqueueAutomaticDomainSuccessor(tx, locked, result, now);
+    }
 
     if (locked.kind === "visual_search") {
       const projectRows = await tx
@@ -1035,7 +1237,7 @@ async function finalize(
           sequence: Number(sequenceRows[0]?.sequence ?? 0) + 1,
           metadata: {
             siteOps: {
-              kind: "operation_recovery",
+              kind: "build_progress",
               subjectId: locked.id,
               revision: project.revision,
               status: "active",
@@ -1137,29 +1339,6 @@ async function finalize(
         })
         .where(eq(siteDeployments.operationId, locked.id));
     }
-    await tx
-      .update(siteDomainOperations)
-      .set({
-        // Known terminal outcomes and pre-mutation rejections release the
-        // financial intent. Once a provider mutation was attempted, manual
-        // attention keeps the key so neither staff nor a retry can charge twice.
-        ...domainFinancialTerminalProjection(
-          result.status,
-          Boolean(
-            preservedTerminalState.providerTaskId ||
-              (preservedTerminalState.result as Record<string, unknown> | null)
-                ?.mutationAttempted === true,
-          ),
-        ),
-        providerTaskNo: preservedTerminalState.providerTaskId,
-        providerResult: preservedTerminalState.result,
-        errorCode: unsuccessful ? result.code : null,
-        errorMessage: unsuccessful ? result.message : null,
-        completedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(siteDomainOperations.operationId, locked.id));
-
     const projectRows = await tx
       .select()
       .from(siteProjects)
@@ -1280,16 +1459,14 @@ async function finalize(
         metadata: {
           siteOps: {
             kind:
-              unsuccessful || liveHeadConflict
-                ? "operation_recovery"
-                : locked.kind === "deploy" || locked.kind === "rollback"
-                  ? "release_status"
-                  : locked.kind === "social_package"
-                    ? "social_package"
-                    : locked.kind.startsWith("domain_") ||
-                        locked.kind.startsWith("dns_")
-                      ? "domain_status"
-                      : "build_progress",
+              locked.kind === "deploy" || locked.kind === "rollback"
+                ? "release_status"
+                : locked.kind === "social_package"
+                  ? "social_package"
+                  : locked.kind.startsWith("domain_") ||
+                      locked.kind.startsWith("dns_")
+                    ? "domain_status"
+                    : "build_progress",
             subjectId: locked.id,
             revision: project.revision + 1,
             status: unsuccessful || liveHeadConflict ? "active" : "resolved",

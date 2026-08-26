@@ -1226,33 +1226,6 @@ describe("Manus SiteOps provider boundary", () => {
       ),
     ).toHaveLength(3);
 
-    const sourceOperationId = "11000000-0000-4000-8000-000000000011";
-    createTask.mockClear();
-    sendMessage.mockClear();
-    const resumeOperation = {
-      ...buildOperation,
-      id: "12000000-0000-4000-8000-000000000012",
-      kind: "build_revision",
-      providerTaskId: "manus-task-1",
-      result: null,
-      input: {
-        ...buildOperation.input,
-        resumeSourceOperationId: sourceOperationId,
-        resumeProviderTaskId: "manus-task-1",
-        resumeMode: "recover_design_output",
-      },
-    };
-    const resumed = await handler({
-      operation: resumeOperation as never,
-      signal: new AbortController().signal,
-    });
-    expect(resumed).toMatchObject({
-      status: "failed",
-      code: "FRONTMIND_BUILD_RESUME_REMOVED",
-    });
-    expect(createTask).not.toHaveBeenCalled();
-    expect(sendMessage).not.toHaveBeenCalled();
-
     const safeLogs = JSON.stringify([
       ...infoLog.mock.calls,
       ...errorLog.mock.calls,

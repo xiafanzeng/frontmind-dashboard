@@ -63,6 +63,8 @@ function serviceDatabaseFixture() {
     status: "awaiting_visual_selection",
     revision: 8,
     brief: null,
+    currentTaskStartedAt: now,
+    minimumKnowledgeSnapshotVersion: null as number | null,
     updatedAt: now,
   };
   const snapshot = {
@@ -331,30 +333,7 @@ beforeEach(() => {
   dependencies.getServicePortal.mockClear();
 });
 
-describe("SiteOps accepted rebuild visual selection", () => {
-  it("rejects the legacy snapshot-change action before entitlement or database access", async () => {
-    await expect(
-      actOnSiteOps(actor as never, {
-        conversationId: "siteops:7",
-        action: "change_snapshot",
-        clientRequestId: "legacy-change-snapshot-1",
-        expectedRevision: 8,
-        input: {
-          knowledgeSnapshotId: "20000000-0000-4000-8000-000000000002",
-        },
-      }),
-    ).rejects.toMatchObject({
-      code: "STATE_CONFLICT",
-      statusCode: 409,
-      message:
-        "官网流程不再支持手动选择知识库版本；如需重新连接，请先重置官网任务，再点击“从知识库开始建站”。",
-    });
-
-    expect(dependencies.getServicePortal).not.toHaveBeenCalled();
-    expect(dependencies.getDb).not.toHaveBeenCalled();
-    expect(dependencies.loadRebuild).not.toHaveBeenCalled();
-  });
-
+describe("SiteOps visual selection and current-task revisions", () => {
   it("locks the account and binds the newest valid active snapshot without a client-selected id", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentKnowledgeSnapshotId = null;
@@ -369,17 +348,6 @@ describe("SiteOps accepted rebuild visual selection", () => {
       createdAt: new Date("2026-08-24T00:00:00.000Z"),
     });
     dependencies.getDb.mockResolvedValue(fixture.db);
-    dependencies.loadRebuild.mockResolvedValue({
-      allowed: true,
-      ticketId: null,
-      status: null,
-      resetApplied: true,
-      resetPending: false,
-      minimumKnowledgeSnapshotVersion: 99,
-      resetSourceBuildId: "30000000-0000-4000-8000-000000000003",
-      acceptedForCurrentCycle: false,
-    });
-
     await actOnSiteOps(
       actor as never,
       connectKnowledgeInput(fixture.project.revision),
@@ -640,20 +608,11 @@ describe("SiteOps accepted rebuild visual selection", () => {
     expect(fixture.project.currentBuildId).toBe(buildInsert?.values.id);
   });
 
-  it("allows a new root build to reuse an immutable snapshot below the legacy reset floor", async () => {
+  it("creates a fresh root build from a snapshot at the post-reset floor", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentBuildId = null;
+    fixture.project.minimumKnowledgeSnapshotVersion = 2;
     dependencies.getDb.mockResolvedValue(fixture.db);
-    dependencies.loadRebuild.mockResolvedValue({
-      allowed: true,
-      ticketId: null,
-      status: null,
-      resetApplied: true,
-      resetPending: false,
-      minimumKnowledgeSnapshotVersion: 3,
-      resetSourceBuildId: "30000000-0000-4000-8000-000000000003",
-      acceptedForCurrentCycle: false,
-    });
 
     await actOnSiteOps(
       actor as never,
@@ -678,6 +637,8 @@ describe("SiteOps accepted rebuild visual selection", () => {
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "in_progress",
       resetApplied: true,
+      resetPending: false,
+      minimumKnowledgeSnapshotVersion: null,
       resetSourceBuildId: fixture.project.currentBuildId,
       acceptedForCurrentCycle: true,
     });
@@ -822,9 +783,10 @@ describe("SiteOps accepted rebuild visual selection", () => {
       allowed: false,
       ticketId: "46000000-0000-4000-8000-000000000004",
       status: "in_progress",
-      resetApplied: false,
+      resetApplied: true,
+      resetPending: true,
+      minimumKnowledgeSnapshotVersion: 3,
       resetSourceBuildId: fixture.project.currentBuildId,
-      acceptedForCurrentCycle: false,
     });
 
     await expect(
@@ -838,5 +800,12 @@ describe("SiteOps accepted rebuild visual selection", () => {
     expect(fixture.inserts.some((entry) => entry.table === siteBuilds)).toBe(
       false,
     );
+    expect(
+      fixture.inserts.some(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "build_revision",
+      ),
+    ).toBe(false);
   });
 });

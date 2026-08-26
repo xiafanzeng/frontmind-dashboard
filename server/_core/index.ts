@@ -116,11 +116,7 @@ import {
   validateReleaseRuntimeEnvironment,
 } from "./release-channel-adapter";
 import { startSiteOpsWorkerScheduler } from "../siteops/worker";
-import {
-  siteOpsAliyunRosTemplateApi,
-  siteOpsArtifactApi,
-} from "../siteops/artifact-api";
-import { startSiteOpsDomainReminderScheduler } from "../siteops/domain-reminders";
+import { siteOpsArtifactApi } from "../siteops/artifact-api";
 import { registerSiteOpsRuntimeProviders } from "../siteops/runtime-providers";
 import { getSiteOpsSocialWorkflowReadiness } from "../siteops/manus-provider";
 import { startBrandQuestionUniverseWorkerScheduler } from "../brand-question-universe-worker";
@@ -272,10 +268,6 @@ async function startServer() {
     }
     next();
   });
-  // ROS fetches this short-lived encrypted-capability template without a
-  // FrontMind browser session. Mount before all body parsers so malformed or
-  // oversized bodies cannot create a distinguishable public response.
-  app.use("/api/site-ops/aliyun/ros-template", siteOpsAliyunRosTemplateApi);
   // Authenticate private service routes before the global JSON parser.
   app.use("/api/internal/presales/v2", presalesV2Router);
   app.use("/api/internal/provisioning", provisioningRouter);
@@ -532,7 +524,6 @@ async function startServer() {
       startServiceContractLifecycleReconciliationScheduler();
       startBrandQuestionUniverseWorkerScheduler();
       startSiteOpsWorkerScheduler();
-      startSiteOpsDomainReminderScheduler();
       startFileContentRetentionScheduler({
         // Let the conversation transaction finish its initial pass before the
         // file worker reconciles newly orphaned resources.

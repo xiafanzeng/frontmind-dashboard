@@ -44,11 +44,9 @@ function observation(
       configured: false,
       status: "not_connected",
       verifiedAt: null,
-      canRotate: true,
+      canDisconnect: true,
     },
     domainState: null,
-    domainOperations: [],
-    dnsPlan: null,
     project: {
       id: "11111111-1111-4111-8111-111111111111",
       conversationId: "siteops:1",
@@ -64,7 +62,6 @@ function observation(
       {
         id: "22222222-2222-4222-8222-222222222222",
         label: "知识库 ZIP · 第 3 版",
-        archiveSha256: "a".repeat(64),
         sourceProfile: "dashboard-core-v1",
         createdAt: "2026-08-22T00:00:00.000Z",
         active: true,
@@ -434,7 +431,7 @@ describe("SiteOpsConversationPanel", () => {
               sequence: 2,
               metadata: {
                 siteOps: {
-                  kind: "operation_recovery",
+                  kind: "qa_failed",
                   subjectId: "operation-safe-id",
                   revision: 3,
                   status: "active",
@@ -903,7 +900,6 @@ describe("SiteOpsConversationPanel", () => {
             {
               id: "99999999-9999-4999-8999-999999999999",
               label: "知识库 ZIP · 第 4 版",
-              archiveSha256: "b".repeat(64),
               sourceProfile: "dashboard-core-v1",
               createdAt: "2026-08-22T01:00:00.000Z",
               active: false,
@@ -1470,6 +1466,74 @@ describe("SiteOpsConversationPanel", () => {
     ).toBeDisabled();
   });
 
+  it("enables the final publish click only after DNS and mainland ICP are ready", () => {
+    const approvedBuild = {
+      id: "33333333-3333-4333-8333-333333333333",
+      ordinal: 2,
+      parentBuildId: null,
+      status: "approved" as const,
+      previewUrl: null,
+      sourceUrl: null,
+      needsHelp: false,
+      createdAt: "2026-08-22T00:00:00.000Z",
+      updatedAt: "2026-08-22T00:01:00.000Z",
+    };
+    const domainState = {
+      domain: "example.com",
+      displayDomain: "example.com",
+      revision: 4,
+      ownershipStatus: "verified",
+      dnsStatus: "pending",
+      icpStatus: "not_submitted" as const,
+      icpDomainRevision: null,
+      icpVerifiedAt: null,
+    };
+    const view = render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [approvedBuild],
+          interactionState: "approved",
+          domainState,
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "发布海外站点" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发布大陆站点" })).toBeDisabled();
+
+    view.rerender(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [approvedBuild],
+          interactionState: "approved",
+          domainState: { ...domainState, dnsStatus: "active" },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "发布海外站点" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "发布大陆站点" })).toBeDisabled();
+
+    view.rerender(
+      <SiteOpsConversationPanel
+        observation={observation({
+          builds: [approvedBuild],
+          interactionState: "approved",
+          domainState: {
+            ...domainState,
+            dnsStatus: "active",
+            icpStatus: "approved",
+            icpDomainRevision: 4,
+            icpVerifiedAt: "2026-08-22T00:02:00.000Z",
+          },
+        })}
+        onAction={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "发布大陆站点" })).toBeEnabled();
+  });
+
   it("submits a rebuild ticket instead of directly reselecting visuals", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
     render(
@@ -1946,7 +2010,7 @@ describe("SiteOpsConversationPanel", () => {
       "https://signin.aliyun.com/oauth/authorize",
     );
     expect(document.body.textContent).toContain(
-      "需阿里云主账号或具备 ROS、RAM 创建权限的管理员确认一次；FrontMind 不会获取客户 AccessKey。",
+      "FrontMind 只管理域名解析，不会购买、续费或从阿里云账号扣款。",
     );
     expect(document.body.textContent).not.toMatch(
       /UID|ARN|ExternalId|AccessKey (?:ID|Secret)|RAM Role|STS/iu,
@@ -2063,34 +2127,16 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
-  it("continues from OAuth to ROS in the same popup without closing it", async () => {
+  it("completes OAuth in the same popup and refreshes the connected account", async () => {
     const onBeginAliyun = vi.fn().mockResolvedValue({
       authorizationUrl: "https://signin.aliyun.com/oauth/authorize",
       expiresAt: "2026-08-23T01:00:00.000Z",
     });
     const onRefresh = vi.fn().mockResolvedValue(undefined);
-    const onStartAliyunRoleProvisioning = vi.fn().mockResolvedValue({
-      status: "ready" as const,
-      connected: false as const,
-      rosAuthorizationUrl:
-        "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
-      expiresAt: "2099-08-23T01:00:00.000Z",
-      retryAfterMs: 0,
-    });
-    const onProbeAliyunRole = vi.fn(
-      () =>
-        new Promise<{
-          status: "pending";
-          connected: false;
-          reason: "role_not_ready";
-          retryAfterMs: number;
-        }>(() => undefined),
-    );
     const authorizationWindow = {
       location: { href: "" },
       focus: vi.fn(),
       close: vi.fn(),
-      opener: window,
     };
     const open = vi
       .spyOn(window, "open")
@@ -2100,8 +2146,6 @@ describe("SiteOpsConversationPanel", () => {
         observation={observation()}
         onBeginAliyun={onBeginAliyun}
         onRefresh={onRefresh}
-        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
-        onProbeAliyunRole={onProbeAliyunRole}
       />,
     );
 
@@ -2120,182 +2164,10 @@ describe("SiteOpsConversationPanel", () => {
       );
     });
 
-    await waitFor(() =>
-      expect(onStartAliyunRoleProvisioning).toHaveBeenCalledOnce(),
-    );
-    expect(onRefresh).toHaveBeenCalledOnce();
-    expect(authorizationWindow.location.href).toBe(
-      "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
-    );
-    expect(authorizationWindow.opener).toBeNull();
-    expect(authorizationWindow.close).not.toHaveBeenCalled();
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
+    expect(authorizationWindow.close).toHaveBeenCalledOnce();
+    expect(document.body.textContent).not.toMatch(/ROS|RAM Role|ExternalId/u);
     open.mockRestore();
-  });
-
-  it("polls 2/3/5/8/13/20/30 seconds until the role is active", async () => {
-    vi.useFakeTimers();
-    const onRefresh = vi.fn().mockResolvedValue(undefined);
-    const onStartAliyunRoleProvisioning = vi.fn().mockResolvedValue({
-      status: "ready" as const,
-      connected: false as const,
-      rosAuthorizationUrl:
-        "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
-      expiresAt: "2099-08-23T01:00:00.000Z",
-      retryAfterMs: 0,
-    });
-    const pendingReasons = [
-      "role_not_ready",
-      "permission_propagating",
-      "provider_retry",
-      "role_not_ready",
-      "permission_propagating",
-      "provider_retry",
-    ] as const;
-    const onProbeAliyunRole = vi.fn().mockImplementation(() => {
-      const reason = pendingReasons[onProbeAliyunRole.mock.calls.length - 1];
-      return Promise.resolve(
-        reason
-          ? {
-              status: "pending" as const,
-              connected: false as const,
-              reason,
-              retryAfterMs: 0,
-            }
-          : { status: "active" as const, connected: true as const },
-      );
-    });
-    const authorizationWindow = {
-      location: { href: "" },
-      focus: vi.fn(),
-      close: vi.fn(),
-      opener: window,
-    };
-    const open = vi
-      .spyOn(window, "open")
-      .mockReturnValue(authorizationWindow as unknown as Window);
-    const view = render(
-      <SiteOpsConversationPanel
-        observation={observation({
-          aliyunConnection: {
-            configured: false,
-            status: "authorization_required",
-            verifiedAt: null,
-            canRotate: true,
-          },
-        })}
-        onRefresh={onRefresh}
-        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
-        onProbeAliyunRole={onProbeAliyunRole}
-      />,
-    );
-
-    try {
-      fireEvent.click(
-        screen.getByRole("button", { name: "继续阿里云一键授权" }),
-      );
-      await act(async () => {
-        await Promise.resolve();
-      });
-      expect(onStartAliyunRoleProvisioning).toHaveBeenCalledOnce();
-      expect(authorizationWindow.location.href).toContain(
-        "https://ros.console.aliyun.com/",
-      );
-      expect(authorizationWindow.close).not.toHaveBeenCalled();
-
-      const delays = [2_000, 3_000, 5_000, 8_000, 13_000, 20_000, 30_000];
-      for (const [index, delay] of delays.entries()) {
-        await act(async () => {
-          await vi.advanceTimersByTimeAsync(delay);
-        });
-        expect(onProbeAliyunRole).toHaveBeenCalledTimes(index + 1);
-        if (index < delays.length - 1) {
-          expect(authorizationWindow.close).not.toHaveBeenCalled();
-        }
-      }
-
-      expect(onRefresh).toHaveBeenCalledOnce();
-      expect(authorizationWindow.close).toHaveBeenCalledOnce();
-    } finally {
-      view.unmount();
-      open.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it("probes again when the customer returns focus from the ROS popup", async () => {
-    vi.useFakeTimers();
-    const onRefresh = vi.fn().mockResolvedValue(undefined);
-    const onStartAliyunRoleProvisioning = vi.fn().mockResolvedValue({
-      status: "ready" as const,
-      connected: false as const,
-      rosAuthorizationUrl:
-        "https://ros.console.aliyun.com/cn-hangzhou/stacks/create?template=frontmind",
-      expiresAt: "2099-08-23T01:00:00.000Z",
-      retryAfterMs: 0,
-    });
-    const onProbeAliyunRole = vi
-      .fn()
-      .mockResolvedValueOnce({
-        status: "pending" as const,
-        connected: false as const,
-        reason: "permission_propagating" as const,
-        retryAfterMs: 0,
-      })
-      .mockResolvedValueOnce({
-        status: "active" as const,
-        connected: true as const,
-      });
-    const authorizationWindow = {
-      location: { href: "" },
-      focus: vi.fn(),
-      close: vi.fn(),
-      opener: window,
-    };
-    const open = vi
-      .spyOn(window, "open")
-      .mockReturnValue(authorizationWindow as unknown as Window);
-    const view = render(
-      <SiteOpsConversationPanel
-        observation={observation({
-          aliyunConnection: {
-            configured: false,
-            status: "authorization_required",
-            verifiedAt: null,
-            canRotate: true,
-          },
-        })}
-        onRefresh={onRefresh}
-        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
-        onProbeAliyunRole={onProbeAliyunRole}
-      />,
-    );
-
-    try {
-      fireEvent.click(
-        screen.getByRole("button", { name: "继续阿里云一键授权" }),
-      );
-      await act(async () => {
-        await Promise.resolve();
-      });
-      act(() => window.dispatchEvent(new Event("focus")));
-      await act(async () => {
-        await Promise.resolve();
-      });
-      expect(onProbeAliyunRole).toHaveBeenCalledOnce();
-      expect(authorizationWindow.close).not.toHaveBeenCalled();
-
-      act(() => window.dispatchEvent(new Event("focus")));
-      await act(async () => {
-        await Promise.resolve();
-      });
-      expect(onProbeAliyunRole).toHaveBeenCalledTimes(2);
-      expect(onRefresh).toHaveBeenCalledOnce();
-      expect(authorizationWindow.close).toHaveBeenCalledOnce();
-    } finally {
-      view.unmount();
-      open.mockRestore();
-      vi.useRealTimers();
-    }
   });
 
   it("ignores OAuth completion messages from another origin or window", async () => {
@@ -2419,7 +2291,7 @@ describe("SiteOpsConversationPanel", () => {
     open.mockRestore();
   });
 
-  it("shows one one-click recovery action when authorization needs attention", () => {
+  it("offers one OAuth reauthorization action without RAM or manual setup", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -2427,90 +2299,26 @@ describe("SiteOpsConversationPanel", () => {
             configured: false,
             status: "attention_required",
             verifiedAt: null,
-            canRotate: true,
+            canDisconnect: true,
           },
         })}
-        onStartAliyunRoleProvisioning={vi.fn()}
-        onProbeAliyunRole={vi.fn()}
+        onBeginAliyun={vi.fn()}
       />,
     );
 
     expect(
-      screen.getAllByRole("button", { name: "继续阿里云一键授权" }),
-    ).toHaveLength(1);
-    expect(screen.queryByText("我已完成授权")).toBeNull();
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "当前授权需要重新确认，请使用上方一键授权修复。",
-    );
-  });
-
-  it("keeps one-click provisioning errors in the popup and manual steps advanced", async () => {
-    const onLoadAliyunAuthorizationGuide = vi.fn().mockResolvedValue({
-      available: true,
-      consoleUrl: "https://ram.console.aliyun.com/roles/create",
-      configurationDownloadUrl: "/api/site-ops/aliyun/authorization-config",
-      roleName: "FrontMindSiteOpsAccess",
-      trustPolicyText: '{"trust":true}',
-      permissionPolicyText: '{"permission":true}',
-    });
-    const onStartAliyunRoleProvisioning = vi
-      .fn()
-      .mockRejectedValue(new Error("sensitive provider detail"));
-    const onProbeAliyunRole = vi.fn();
-    const popupDocument = document.implementation.createHTMLDocument();
-    const authorizationWindow = {
-      document: popupDocument,
-      location: { href: "" },
-      focus: vi.fn(),
-      close: vi.fn(),
-    };
-    const open = vi
-      .spyOn(window, "open")
-      .mockReturnValue(authorizationWindow as unknown as Window);
-    render(
-      <SiteOpsConversationPanel
-        observation={observation({
-          aliyunConnection: {
-            configured: false,
-            status: "authorization_required",
-            verifiedAt: null,
-            canRotate: true,
-          },
-        })}
-        onLoadAliyunAuthorizationGuide={onLoadAliyunAuthorizationGuide}
-        onStartAliyunRoleProvisioning={onStartAliyunRoleProvisioning}
-        onProbeAliyunRole={onProbeAliyunRole}
-      />,
-    );
-
-    expect(screen.queryByText("备用手动配置（3 步）")).toBeNull();
-    expect(screen.queryByText("我已完成授权")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "继续阿里云一键授权" }));
-    expect(
-      await screen.findByText(
-        "暂时无法准备阿里云一键授权，请保留当前页面并稍后重试。",
-      ),
+      screen.getByRole("button", { name: "重新授权阿里云" }),
     ).toBeInTheDocument();
-    expect(authorizationWindow.close).not.toHaveBeenCalled();
-    expect(popupDocument.querySelector("button")?.textContent).toBe("关闭窗口");
-
-    fireEvent.click(screen.getByText("高级：手动配置"));
-    fireEvent.click(screen.getByRole("button", { name: "载入手动配置" }));
-    await waitFor(() =>
-      expect(onLoadAliyunAuthorizationGuide).toHaveBeenCalledOnce(),
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "阿里云授权已失效，请重新授权。域名无需重复购买或重新填写。",
     );
-    expect(
-      await screen.findByRole("link", { name: "下载备用配置" }),
-    ).toHaveAttribute("href", "/api/site-ops/aliyun/authorization-config");
-    expect(
-      screen.getByRole("link", { name: "打开 RAM 控制台" }),
-    ).toHaveAttribute("href", "https://ram.console.aliyun.com/roles/create");
-    expect(open).toHaveBeenCalledOnce();
-    open.mockRestore();
+    expect(document.body.textContent).not.toMatch(
+      /手动配置|RAM 控制台|安全角色|ExternalId|ROS/u,
+    );
   });
 
-  it("requires exact domain text before submitting a quoted purchase", async () => {
-    const onAction = vi.fn().mockResolvedValue(undefined);
+  it("sends customers with zero domains to Alibaba Cloud and refreshes without reconnecting", async () => {
+    const onRefreshAliyunDomains = vi.fn().mockResolvedValue(undefined);
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -2518,184 +2326,140 @@ describe("SiteOpsConversationPanel", () => {
             configured: true,
             status: "active",
             verifiedAt: "2026-08-22T00:00:00.000Z",
-            canRotate: true,
+            canDisconnect: true,
           },
-          domainOperations: [
-            {
-              id: "44444444-4444-4444-8444-444444444444",
-              kind: "purchase",
-              domain: "example.com",
-              displayDomain: "example.com",
-              status: "succeeded",
-              quoteHash: "b".repeat(64),
-              quoteExpiresAt: "2099-08-22T00:01:00.000Z",
-              amountMinor: 8_800,
-              currency: "CNY",
-              years: 1,
-              maskedRegistrantName: "北**司",
-              searchResult: null,
-              registrantProfiles: [],
-              issue: null,
-              createdAt: "2026-08-22T00:00:00.000Z",
-            },
-          ],
         })}
-        onAction={onAction}
+        aliyunDomains={[]}
+        onRefreshAliyunDomains={onRefreshAliyunDomains}
       />,
     );
-    const confirm = screen.getByRole("button", {
-      name: "确认并从已连接的阿里云账号扣费",
-    });
-    expect(confirm).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("完整输入 example.com"), {
-      target: { value: "example.com" },
-    });
-    expect(confirm).toBeEnabled();
-    fireEvent.click(confirm);
-    await waitFor(() =>
-      expect(onAction).toHaveBeenCalledWith({
-        action: "domain_confirm_purchase",
-        input: {
-          domain: "example.com",
-          typedDomain: "example.com",
-          quoteHash: "b".repeat(64),
-          domainOperationId: "44444444-4444-4444-8444-444444444444",
-        },
-      }),
-    );
+
+    expect(
+      screen.getByText("这个阿里云账号中还没有可接入的域名"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "前往阿里云购买域名" }),
+    ).toHaveAttribute("href", "https://wanwang.aliyun.com/domain/");
+    fireEvent.click(screen.getByRole("button", { name: "已购买，刷新域名" }));
+    await waitFor(() => expect(onRefreshAliyunDomains).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "一键连接阿里云" })).toBeNull();
   });
 
-  it("explicitly confirms a read-only sync for a domain already in the customer account", async () => {
+  it("automatically connects the only domain exactly once", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
-    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
-    render(
+    const view = render(
       <SiteOpsConversationPanel
         observation={observation({
           aliyunConnection: {
             configured: true,
             status: "active",
             verifiedAt: "2026-08-22T00:00:00.000Z",
-            canRotate: true,
+            canDisconnect: true,
           },
         })}
+        aliyunDomains={[
+          { domain: "example.com", displayDomain: "example.com" },
+        ]}
         onAction={onAction}
       />,
     );
-    fireEvent.change(screen.getByPlaceholderText("example.com"), {
-      target: { value: "owned.example.com" },
-    });
-    const button = screen.getByRole("button", {
-      name: "接入已有域名",
-    });
-    fireEvent.click(button);
-    expect(onAction).not.toHaveBeenCalled();
-    expect(confirm).toHaveBeenCalledWith(
-      expect.stringContaining("不会购买或扣费"),
-    );
 
-    confirm.mockReturnValueOnce(true);
-    fireEvent.click(button);
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
         action: "domain_sync",
-        input: {
-          domain: "owned.example.com",
-          typedDomain: "owned.example.com",
-          customerConfirmed: true,
-        },
+        input: { domain: "example.com" },
       }),
     );
-    confirm.mockRestore();
+    view.rerender(
+      <SiteOpsConversationPanel
+        observation={observation({
+          aliyunConnection: {
+            configured: true,
+            status: "active",
+            verifiedAt: "2026-08-22T00:00:00.000Z",
+            canDisconnect: true,
+          },
+        })}
+        aliyunDomains={[
+          { domain: "example.com", displayDomain: "example.com" },
+        ]}
+        onAction={onAction}
+      />,
+    );
+    expect(onAction).toHaveBeenCalledOnce();
   });
 
-  it("keeps exact DNS planning details out of the customer view", () => {
-    const onAction = vi.fn().mockResolvedValue(undefined);
+  it("offers a safe retry when automatic single-domain connection fails", async () => {
+    const onAction = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("域名自动接入暂时不可用。"))
+      .mockResolvedValueOnce(undefined);
     render(
       <SiteOpsConversationPanel
         observation={observation({
-          domainState: {
-            domain: "example.com",
-            displayDomain: "example.com",
-            revision: 4,
-            registrar: "aliyun",
-            expiresAt: null,
-            realNameStatus: "verified",
-            emailStatus: "verified",
-            clientHold: false,
-            ownershipStatus: "verified",
-            dnsStatus: "planned",
-            autoRenewDesired: false,
-            autoRenewObserved: false,
-            icpStatus: "not_submitted",
-            icpDomainRevision: null,
-            icpVerifiedAt: null,
-          },
-          dnsPlan: {
-            canApply: true,
-            status: "succeeded",
-            changeCount: 1,
-            conflictCount: 0,
-            createdAt: "2026-08-22T00:00:00.000Z",
+          aliyunConnection: {
+            configured: true,
+            status: "active",
+            verifiedAt: "2026-08-22T00:00:00.000Z",
+            canDisconnect: true,
           },
         })}
+        aliyunDomains={[
+          { domain: "example.com", displayDomain: "example.com" },
+        ]}
         onAction={onAction}
       />,
     );
 
-    expect(screen.queryByText("edge.example.net")).toBeNull();
-    expect(screen.queryByText(/DNS 精确差异|供应商快照/u)).toBeNull();
-    expect(onAction).not.toHaveBeenCalled();
+    expect(
+      await screen.findByRole("button", { name: "重试接入" }),
+    ).toBeEnabled();
+    expect(onAction).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试接入" }));
+    await waitFor(() => expect(onAction).toHaveBeenCalledTimes(2));
+    expect(onAction).toHaveBeenLastCalledWith({
+      action: "domain_sync",
+      input: { domain: "example.com" },
+    });
   });
 
-  it("requires explicit future-charge confirmation before enabling auto-renew", async () => {
+  it("lets the customer choose one of multiple purchased domains", async () => {
     const onAction = vi.fn().mockResolvedValue(undefined);
-    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
     render(
       <SiteOpsConversationPanel
         observation={observation({
-          domainState: {
-            domain: "example.com",
-            displayDomain: "example.com",
-            revision: 4,
-            registrar: "aliyun",
-            expiresAt: null,
-            realNameStatus: "verified",
-            emailStatus: "verified",
-            clientHold: false,
-            ownershipStatus: "verified",
-            dnsStatus: "active",
-            autoRenewDesired: false,
-            autoRenewObserved: false,
-            icpStatus: "not_submitted",
-            icpDomainRevision: null,
-            icpVerifiedAt: null,
+          aliyunConnection: {
+            configured: true,
+            status: "active",
+            verifiedAt: "2026-08-22T00:00:00.000Z",
+            canDisconnect: true,
           },
         })}
+        aliyunDomains={[
+          { domain: "first.example", displayDomain: "first.example" },
+          { domain: "xn--fiqs8s.example", displayDomain: "中国.example" },
+        ]}
         onAction={onAction}
       />,
     );
 
-    const button = screen.getByRole("button", { name: "开启自动续费" });
-    fireEvent.click(button);
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("按届时价格"));
-    expect(onAction).not.toHaveBeenCalled();
-
-    confirm.mockReturnValueOnce(true);
-    fireEvent.click(button);
+    fireEvent.change(screen.getByLabelText("选择要上线的域名"), {
+      target: { value: "xn--fiqs8s.example" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "连接并配置解析" }));
     await waitFor(() =>
       expect(onAction).toHaveBeenCalledWith({
-        action: "domain_set_auto_renew",
-        input: {
-          domain: "example.com",
-          enabled: true,
-          customerConfirmed: true,
-        },
+        action: "domain_sync",
+        input: { domain: "xn--fiqs8s.example" },
       }),
     );
-    confirm.mockRestore();
+    expect(
+      screen.queryByRole("button", { name: /查询可注册性|购买报价|自动续费/u }),
+    ).toBeNull();
   });
 
-  it("does not expose DNS conflict tuples to customers", () => {
+  it("shows only customer-facing domain and DNS state", () => {
     render(
       <SiteOpsConversationPanel
         observation={observation({
@@ -2703,33 +2467,21 @@ describe("SiteOpsConversationPanel", () => {
             domain: "example.com",
             displayDomain: "example.com",
             revision: 4,
-            registrar: "aliyun",
-            expiresAt: null,
-            realNameStatus: "verified",
-            emailStatus: "verified",
-            clientHold: false,
             ownershipStatus: "verified",
-            dnsStatus: "conflict",
-            autoRenewDesired: false,
-            autoRenewObserved: false,
-            icpStatus: "not_submitted",
-            icpDomainRevision: null,
-            icpVerifiedAt: null,
-          },
-          dnsPlan: {
-            canApply: false,
-            status: "attention_required",
-            changeCount: 1,
-            conflictCount: 1,
-            createdAt: "2026-08-22T00:00:00.000Z",
+            dnsStatus: "active",
+            icpStatus: "approved",
+            icpDomainRevision: 4,
+            icpVerifiedAt: "2026-08-22T00:00:00.000Z",
           },
         })}
         onAction={vi.fn()}
       />,
     );
 
-    expect(screen.queryByText(/相同 RR\/type/)).toBeNull();
-    expect(screen.queryByRole("button", { name: /DNS/u })).toBeNull();
+    expect(screen.getByText(/解析：已生效/u)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(
+      /RecordId|CNAME|TXT|供应商快照|DNS 精确差异/u,
+    );
   });
 
   it("submits the current domain through the existing ICP filing entry", async () => {
@@ -2741,15 +2493,8 @@ describe("SiteOpsConversationPanel", () => {
             domain: "example.com",
             displayDomain: "example.com",
             revision: 7,
-            registrar: "aliyun_cn",
-            expiresAt: null,
-            realNameStatus: "verified",
-            emailStatus: "verified",
-            clientHold: false,
             ownershipStatus: "verified",
             dnsStatus: "active",
-            autoRenewDesired: false,
-            autoRenewObserved: false,
             icpStatus: "not_submitted",
             icpDomainRevision: null,
             icpVerifiedAt: null,

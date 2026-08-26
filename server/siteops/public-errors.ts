@@ -4,7 +4,7 @@ import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
 const VENDOR_NAME = /manus/iu;
 const VENDOR_CODE = /(?:^|_)MANUS(?:_|$)/iu;
 const INFRASTRUCTURE_TERM =
-  /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|\bSTS\b|ExternalId|Role\s*ARN|principal\s*ARN|\bARN\b|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu;
+  /(?:\bESA\b|AliDNS|\bDNS\b|RecordId|\bCNAME\b|\bTXT\b|\bTLS\b|(?:access|refresh)\s*token|\bUID\b|record\s*tuple|remark\s*marker|provider)/iu;
 const FRESH_RESET_MESSAGE =
   "本次没有生成可安全展示的版本；可申请重置，批准后可从当前企业知识库重新开始。";
 
@@ -47,10 +47,7 @@ export function sanitizeFrontMindPublicText(value: string) {
 }
 
 export type SiteOpsCustomerDomainIssue =
-  | "quote_changed"
   | "authorization_needed"
-  | "payment_required"
-  | "identity_required"
   | "service_unavailable"
   | "needs_help";
 
@@ -67,14 +64,12 @@ export function publicSiteOpsDomainIssue(
   ) {
     return null;
   }
-  if (/(?:QUOTE|PRICE|EXPIRED)/u.test(normalized)) return "quote_changed";
-  if (/(?:AUTH|PERMISSION|ROLE|CALLER|ACCOUNT|CREDENTIAL)/u.test(normalized)) {
+  if (
+    /(?:INVALID_GRANT|OAUTH|AUTH|PERMISSION|ACCOUNT|CREDENTIAL|TOKEN|EXPIRED)/u.test(
+      normalized,
+    )
+  ) {
     return "authorization_needed";
-  }
-  if (/(?:BALANCE|PAYMENT|FUNDS|CREDIT)/u.test(normalized))
-    return "payment_required";
-  if (/(?:REGISTRANT|REAL_NAME|IDENTITY|EMAIL)/u.test(normalized)) {
-    return "identity_required";
   }
   if (
     String(status) === "outcome_unknown" ||

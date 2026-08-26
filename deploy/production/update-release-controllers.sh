@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly CONTROLLER_VERSION="5"
+readonly CONTROLLER_VERSION="6"
 readonly VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"
 readonly CONTROLLER_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-controller"
 readonly FORCED_TEMPLATE="${SCRIPT_DIR}/controller/frontmind-deploy-forced-command"
@@ -46,6 +46,18 @@ validate_controller() {
     && grep -Fq -- 'project-business-owner' "$target" \
     && grep -Fq -- 'PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH' "$target" \
     && grep -Fq -- 'COUPLED_STACK_RECOVERY_MUST_FINISH_BEFORE_INCIDENT_ACKNOWLEDGEMENT' "$target" \
+    && grep -Fq -- 'siteops_alidns_oauth_contract_plan_matches' "$target" \
+    && grep -Fq -- 'contract-0065-migration-started' "$target" \
+    && grep -Fq -- '60b3ba7ba8fb92bbb2ecc2a62db1c13f549f26cc375d44eb2ee218459e50bc5f' "$target" \
+    && grep -Fq -- '00c5395ab580f7dddef1ad743445561943b9fc28c0858a3c72eea5417cb7c52f' "$target" \
+    && grep -Fq -- 'e71230f0691ddd2a7d3d7b1a19d069775720ff999b445e86f60be902137a17db' "$target" \
+    && grep -Fq -- 'e4a5de422fac9b970a82a925a2de36a4e7f133a93ec35e026ea0c0494fe93c74' "$target" \
+    && grep -Fq -- '47053769bdbf83b7b496da7ffc9f10042d746af4cb05baa7c91f1ec85a7a3a6d' "$target" \
+    && grep -Fq -- 'restore_contract_0065_release' "$target" \
+    && grep -Fq -- 'run_contract_0065_migration_json' "$target" \
+    && grep -Fq -- 'contract_0065_migration_container_identity_is_exact' "$target" \
+    && grep -Fq -- 'com.docker.compose.project' "$target" \
+    && grep -Fq -- 'setsid --fork --wait' "$target" \
     && grep -Fq -- '/app/dist/private-workflows/socratic-kb-builder-v5.skill' "$target" \
     && grep -Fq -- '/api/internal/presales/v2' "$target" \
     && ! grep -Fq -- '--kb-manus-v2-rollout' "$target" \

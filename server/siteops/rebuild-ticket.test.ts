@@ -7,14 +7,14 @@ import {
   siteBuilds,
   siteDeployments,
   siteDnsRecords,
-  siteDomainOperations,
   siteOperations,
   siteProjects,
+  socialPackages,
   websiteStyleSampleBatches,
+  workspaceSiteProfiles,
 } from "../../drizzle/schema";
 import {
   approveSiteOpsRebuildTicket,
-  completeSiteOpsRebuildTicket,
   finalizeApprovedSiteOpsReset,
   loadSiteOpsRebuildRequest,
   siteOpsRebuildBuildId,
@@ -29,7 +29,6 @@ import {
   siteOpsRebuildResetApplied,
   siteOpsRebuildResetPending,
   siteOpsRebuildTargetPage,
-  SiteOpsRebuildTicketError,
 } from "./rebuild-ticket";
 
 describe("SiteOps rebuild ticket coordinates", () => {
@@ -106,64 +105,13 @@ describe("SiteOps rebuild ticket coordinates", () => {
     ).toBe(false);
   });
 
-  it("keeps the completed fresh-root snapshot version marker for audit without projecting an active ticket", async () => {
+  it("reads the permanent fresh-root floor from the project without reviving completed tickets", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
-    const sourceBuildId = "30000000-0000-4000-8000-000000000003";
-    const resetOperationId = "50000000-0000-4000-8000-000000000005";
-    const completedNote = JSON.stringify({
-      schemaVersion: 4,
-      kind: "frontmind.siteops-rebuild.v1",
-      projectId,
-      sourceBuildId,
-      knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
-      resetIntent: "approved_reset_unpublish",
-      resetOperationId,
-      resetApprovedAt: "2026-08-24T07:55:00.000Z",
-      resetExpectedProjectRevision: 12,
-      minimumKnowledgeSnapshotVersion: 9,
-      resetAppliedAt: "2026-08-24T08:00:00.000Z",
-      resetAppliedProjectRevision: 13,
-      freshRootApplied: true,
-      unpublishOperationId: resetOperationId,
-    });
+    const rows = [[], [{ minimumKnowledgeSnapshotVersion: 11 }]];
     let selectCall = 0;
     const executor = {
       select: () => {
-        const call = selectCall++;
-        const rows =
-          call === 0
-            ? []
-            : [
-                {
-                  id: "61000000-0000-4000-8000-000000000006",
-                  status: "completed",
-                  internalNote: JSON.stringify({
-                    ...JSON.parse(completedNote),
-                    projectId: "21000000-0000-4000-8000-000000000002",
-                  }),
-                },
-                {
-                  id: "62000000-0000-4000-8000-000000000006",
-                  status: "completed",
-                  internalNote: JSON.stringify({
-                    ...JSON.parse(completedNote),
-                    untrustedFutureField: true,
-                  }),
-                },
-                {
-                  id: "60000000-0000-4000-8000-000000000006",
-                  status: "completed",
-                  internalNote: completedNote,
-                },
-                {
-                  id: "63000000-0000-4000-8000-000000000006",
-                  status: "completed",
-                  internalNote: JSON.stringify({
-                    ...JSON.parse(completedNote),
-                    minimumKnowledgeSnapshotVersion: 11,
-                  }),
-                },
-              ];
+        const result = rows[selectCall++] ?? [];
         const query: any = {
           from: () => query,
           where: () => query,
@@ -172,7 +120,7 @@ describe("SiteOps rebuild ticket coordinates", () => {
           then: (
             resolve: (value: unknown) => unknown,
             reject: (error: unknown) => unknown,
-          ) => Promise.resolve(rows).then(resolve, reject),
+          ) => Promise.resolve(result).then(resolve, reject),
         };
         return query;
       },
@@ -192,37 +140,21 @@ describe("SiteOps rebuild ticket coordinates", () => {
       resetApplied: true,
       resetPending: false,
       minimumKnowledgeSnapshotVersion: 11,
-      resetSourceBuildId: sourceBuildId,
+      resetSourceBuildId: null,
       acceptedForCurrentCycle: false,
     });
+    expect(selectCall).toBe(2);
   });
 
-  it("keeps active ticket state authoritative while inheriting an older completed floor", async () => {
+  it("keeps active ticket state while taking the reset floor from the project", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
     const currentBuildId = "70000000-0000-4000-8000-000000000007";
-    const resetOperationId = "50000000-0000-4000-8000-000000000005";
     const activeNote = JSON.stringify({
       schemaVersion: 3,
       kind: "frontmind.siteops-rebuild.v1",
       projectId,
       sourceBuildId: currentBuildId,
       knowledgeSnapshotId: "80000000-0000-4000-8000-000000000008",
-    });
-    const completedNote = JSON.stringify({
-      schemaVersion: 4,
-      kind: "frontmind.siteops-rebuild.v1",
-      projectId,
-      sourceBuildId: "30000000-0000-4000-8000-000000000003",
-      knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
-      resetIntent: "approved_reset_unpublish",
-      resetOperationId,
-      resetApprovedAt: "2026-08-24T07:55:00.000Z",
-      resetExpectedProjectRevision: 12,
-      minimumKnowledgeSnapshotVersion: 9,
-      resetAppliedAt: "2026-08-24T08:00:00.000Z",
-      resetAppliedProjectRevision: 13,
-      freshRootApplied: true,
-      unpublishOperationId: resetOperationId,
     });
     const rows = [
       [{ id: currentBuildId }],
@@ -233,13 +165,7 @@ describe("SiteOps rebuild ticket coordinates", () => {
           internalNote: activeNote,
         },
       ],
-      [
-        {
-          id: "60000000-0000-4000-8000-000000000006",
-          status: "completed",
-          internalNote: completedNote,
-        },
-      ],
+      [{ minimumKnowledgeSnapshotVersion: 9 }],
     ];
     let selectCall = 0;
     const executor = {
@@ -270,45 +196,25 @@ describe("SiteOps rebuild ticket coordinates", () => {
       allowed: false,
       ticketId: "90000000-0000-4000-8000-000000000009",
       status: "submitted",
-      resetApplied: false,
+      resetApplied: true,
       resetPending: false,
       minimumKnowledgeSnapshotVersion: 9,
       resetSourceBuildId: currentBuildId,
       acceptedForCurrentCycle: false,
     });
+    expect(selectCall).toBe(3);
   });
 
-  it("recovers the snapshot version audit marker from a succeeded reset operation after ticket retention", async () => {
+  it("does not reconstruct a missing project floor from retained operations", async () => {
     const projectId = "20000000-0000-4000-8000-000000000002";
-    const resetOperationId = "50000000-0000-4000-8000-000000000005";
     const rows = [
       [],
-      [],
+      [{ minimumKnowledgeSnapshotVersion: null }],
       [
         {
-          id: resetOperationId,
-          input: {
-            schemaVersion: 1,
-            intent: "approved_reset_unpublish",
-            rebuildTicketId: "60000000-0000-4000-8000-000000000006",
-            expectedProjectRevision: 12,
-            expectedCurrentBuildId:
-              "30000000-0000-4000-8000-000000000003",
-            expectedKnowledgeSnapshotId:
-              "40000000-0000-4000-8000-000000000004",
-            expectedGlobalLiveDeploymentId: null,
-            expectedMainlandLiveDeploymentId: null,
-            expectedCanonicalHostname: null,
-          },
+          id: "50000000-0000-4000-8000-000000000005",
           result: {
-            schemaVersion: 2,
-            intent: "approved_reset_unpublish",
-            stage: "exposure_removed",
-            resetOperationId,
-            projectId,
-            freshRootApplied: true,
             minimumKnowledgeSnapshotVersion: 14,
-            resetAppliedProjectRevision: 13,
           },
         },
       ],
@@ -342,12 +248,13 @@ describe("SiteOps rebuild ticket coordinates", () => {
       allowed: true,
       ticketId: null,
       status: null,
-      resetApplied: true,
+      resetApplied: false,
       resetPending: false,
-      minimumKnowledgeSnapshotVersion: 14,
+      minimumKnowledgeSnapshotVersion: null,
       resetSourceBuildId: null,
       acceptedForCurrentCycle: false,
     });
+    expect(selectCall).toBe(2);
   });
 
   it("upgrades a production-shaped V2 build ticket to a stable project coordinate on resubmission", () => {
@@ -434,15 +341,14 @@ function rebuildNoteV1() {
 }
 
 function fixture(options?: {
-  activeOperation?: boolean;
+  activeOperation?: boolean | Record<string, unknown>;
   internalNote?: string;
   projectOverrides?: Record<string, unknown>;
   targetPage?: string;
   ticketStatus?: string;
   resetOperation?: Record<string, unknown>;
 }) {
-  const initialGlobalLiveDeploymentId =
-    "50000000-0000-4000-8000-000000000005";
+  const initialGlobalLiveDeploymentId = "50000000-0000-4000-8000-000000000005";
   const project = {
     id: projectId,
     userId: 9,
@@ -456,6 +362,25 @@ function fixture(options?: {
     status: "approved",
     revision: 12,
     ...options?.projectOverrides,
+  };
+  const profile = {
+    userId: 9,
+    domain: "example.com",
+    normalizedAsciiDomain: "example.com",
+    unicodeDisplayDomain: "example.com",
+    domainRevision: 4,
+    providerAccountUid: "aliyun-account-1",
+    domainOwnershipStatus: "verified",
+    dnsStatus: "active",
+    domainStatus: "completed",
+    domainVerifiedAt: new Date("2026-08-20T08:00:00.000Z"),
+    siteMode: "managed",
+    icpDomainRevision: 4,
+    icpProvince: "浙",
+    icpNumber: "浙ICP备00000000号",
+    icpStatus: "approved",
+    icpVerifiedAt: new Date("2026-08-21T08:00:00.000Z"),
+    revision: 2,
   };
   const build = {
     id: buildId,
@@ -477,23 +402,36 @@ function fixture(options?: {
     internalNote: options?.internalNote ?? rebuildNoteV1(),
     status: options?.ticketStatus ?? "submitted",
     revision: 5,
-    assignedProjectAssignmentId:
-      "60000000-0000-4000-8000-000000000006",
+    assignedProjectAssignmentId: "60000000-0000-4000-8000-000000000006",
   } as any;
   const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
   const inserts: Array<{ table: unknown; values: Record<string, unknown> }> =
     [];
-  const rowsFor = (
-    table: unknown,
-    fields?: Record<string, unknown>,
-  ) => {
+  const deletes: Array<{ table: unknown }> = [];
+  const rowsFor = (table: unknown, fields?: Record<string, unknown>) => {
     if (table === siteProjects) return [project];
     if (table === siteBuilds) return [build];
     if (table === deliveryTickets) return [ticket];
     if (table === siteOperations) {
       if (options?.resetOperation) return [options.resetOperation];
-      return options?.activeOperation ? [{ id: "running-operation" }] : [];
+      return options?.activeOperation
+        ? [
+            {
+              id: "running-operation",
+              kind: "site_build",
+              provider: "manus",
+              status: "queued",
+              attempt: 0,
+              result: null,
+              providerOperationId: null,
+              providerTaskId: null,
+              ...(typeof options.activeOperation === "object"
+                ? options.activeOperation
+                : {}),
+            },
+          ]
+        : [];
     }
     if (table === siteDeployments) {
       return fields && "verification" in fields
@@ -511,9 +449,8 @@ function fixture(options?: {
           ]
         : [];
     }
-    if (table === siteDnsRecords || table === siteDomainOperations) {
-      return [];
-    }
+    if (table === siteDnsRecords) return [];
+    if (table === workspaceSiteProfiles) return [profile];
     if (table === messages) return [{ sequence: 7 }];
     return [];
   };
@@ -550,6 +487,7 @@ function fixture(options?: {
           updates.push({ table, values });
           if (table === siteProjects) Object.assign(project, values);
           if (table === deliveryTickets) Object.assign(ticket, values);
+          if (table === workspaceSiteProfiles) Object.assign(profile, values);
           return [{ affectedRows: 1 }];
         },
       }),
@@ -559,8 +497,13 @@ function fixture(options?: {
         inserts.push({ table, values });
       },
     }),
+    delete: (table: unknown) => ({
+      where: async () => {
+        deletes.push({ table });
+      },
+    }),
   };
-  return { tx, ticket, project, updates, inserts };
+  return { tx, ticket, project, profile, updates, inserts, deletes };
 }
 
 async function pendingResetFixture(
@@ -668,11 +611,7 @@ describe("site rebuild reset approval", () => {
     expect(replay.inserts).toHaveLength(0);
   });
 
-  it.each([
-    "queued",
-    "running",
-    "outcome_unknown",
-  ] as const)(
+  it.each(["queued", "running", "outcome_unknown"] as const)(
     "idempotently replays the exact active reset operation in %s",
     async (status) => {
       const state = await pendingResetFixture({ status });
@@ -872,7 +811,7 @@ describe("site rebuild reset approval", () => {
     expect(repeated.inserts).toHaveLength(1);
   });
 
-  it("does not hide messages or clear the snapshot while an operation is active", async () => {
+  it("CAS-cancels a local Manus task and queues the approved reset", async () => {
     const state = fixture({ activeOperation: true });
 
     await expect(
@@ -881,10 +820,91 @@ describe("site rebuild reset approval", () => {
         actorUserId: 1,
         now: new Date("2026-08-24T08:00:00.000Z"),
       }),
-    ).rejects.toBeInstanceOf(SiteOpsRebuildTicketError);
+    ).resolves.toMatchObject({
+      resetApplied: true,
+      resetPending: true,
+    });
+    expect(state.updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: siteOperations,
+          values: expect.objectContaining({
+            status: "cancelled",
+            errorCode: "SITEOPS_RESET_APPROVED",
+          }),
+        }),
+        expect.objectContaining({
+          table: siteBuilds,
+          values: expect.objectContaining({
+            status: "cancelled",
+            quotaState: "released",
+          }),
+        }),
+        expect.objectContaining({
+          table: socialPackages,
+          values: expect.objectContaining({
+            status: "cancelled",
+            quotaState: "released",
+          }),
+        }),
+      ]),
+    );
+    expect(state.inserts).toEqual([
+      expect.objectContaining({
+        table: siteOperations,
+        values: expect.objectContaining({
+          kind: "rollback",
+          provider: "aliyun_esa",
+          status: "queued",
+        }),
+      }),
+    ]);
+    expect(state.project.currentKnowledgeSnapshotId).toBe(snapshotId);
+  });
+
+  it.each([
+    { status: "running" },
+    { status: "outcome_unknown" },
+    { status: "queued", providerTaskId: "manus-task-already-created" },
+    { status: "queued", attempt: 1 },
+    { status: "queued", provider: null },
+    { status: "queued", provider: "unexpected-provider" },
+  ])(
+    "waits for a local task beyond its external boundary: $status",
+    async (activeOperation) => {
+      const state = fixture({ activeOperation });
+
+      await expect(
+        approveSiteOpsRebuildTicket(state.tx, {
+          ticket: state.ticket,
+          actorUserId: 1,
+          now: new Date("2026-08-24T08:00:00.000Z"),
+        }),
+      ).rejects.toMatchObject({ code: "IN_FLIGHT_OPERATION" });
+      expect(state.updates).toHaveLength(0);
+      expect(state.inserts).toHaveLength(0);
+    },
+  );
+
+  it("waits for the original AliDNS operation before approving reset", async () => {
+    const state = fixture({
+      activeOperation: {
+        provider: "aliyun_alidns",
+        kind: "dns_apply",
+        status: "outcome_unknown",
+        attempt: 1,
+      },
+    });
+
+    await expect(
+      approveSiteOpsRebuildTicket(state.tx, {
+        ticket: state.ticket,
+        actorUserId: 1,
+        now: new Date("2026-08-24T08:00:00.000Z"),
+      }),
+    ).rejects.toMatchObject({ code: "IN_FLIGHT_OPERATION" });
     expect(state.updates).toHaveLength(0);
     expect(state.inserts).toHaveLength(0);
-    expect(state.project.currentKnowledgeSnapshotId).toBe(snapshotId);
   });
 
   it("atomically clears live heads, build, snapshot, visual board and messages only after ESA success", async () => {
@@ -917,10 +937,31 @@ describe("site rebuild reset approval", () => {
       currentBuildId: null,
       globalLiveDeploymentId: null,
       mainlandLiveDeploymentId: null,
+      canonicalHostname: null,
+      currentTaskStartedAt: new Date("2026-08-24T08:05:00.000Z"),
+      minimumKnowledgeSnapshotVersion: 1,
       brief: null,
       status: "draft",
       revision: 13,
     });
+    expect(state.profile).toMatchObject({
+      domain: null,
+      normalizedAsciiDomain: null,
+      unicodeDisplayDomain: null,
+      providerAccountUid: null,
+      domainOwnershipStatus: null,
+      dnsStatus: null,
+      domainStatus: "not_started",
+      domainVerifiedAt: null,
+      siteMode: "unknown",
+      icpDomainRevision: null,
+      icpProvince: null,
+      icpNumber: null,
+      icpStatus: "not_submitted",
+      icpVerifiedAt: null,
+      revision: 3,
+    });
+    expect(state.deletes).toEqual([{ table: siteDnsRecords }]);
     expect(siteOpsRebuildResetApplied(state.ticket.internalNote)).toBe(true);
     expect(siteOpsRebuildResetPending(state.ticket.internalNote)).toBe(false);
     expect(state.ticket).toMatchObject({
@@ -977,11 +1018,11 @@ describe("site rebuild reset approval", () => {
           table: messages,
           values: expect.objectContaining({
             content:
-              "旧官网已下线，官网重置已完成；企业知识库保持不变，可从当前知识库重新开始建站。",
+              "旧官网已下线，官网重置已完成。请重新上传并发布知识库后开始全新的建站任务。",
             metadata: expect.objectContaining({
               siteOps: expect.objectContaining({
                 payload: expect.objectContaining({
-                  requested: "current_knowledge",
+                  requested: "new_knowledge_upload",
                   reset: true,
                   unpublishCompleted: true,
                 }),
@@ -1002,19 +1043,5 @@ describe("site rebuild reset approval", () => {
       fromStatus: "in_progress",
       toStatus: "completed",
     });
-
-    const updateCount = state.updates.length;
-    const insertCount = state.inserts.length;
-    await expect(
-      completeSiteOpsRebuildTicket(state.tx, {
-        userId: 9,
-        projectId,
-        parentBuildId: null,
-        childBuildId: "70000000-0000-4000-8000-000000000007",
-        now: new Date("2026-08-24T09:00:00.000Z"),
-      }),
-    ).resolves.toBeNull();
-    expect(state.updates).toHaveLength(updateCount);
-    expect(state.inserts).toHaveLength(insertCount);
   });
 });

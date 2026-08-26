@@ -103,15 +103,12 @@ import {
   actOnSiteOps,
   beginSiteOpsAliyunOAuth,
   disconnectSiteOpsAliyunConnection,
-  getSiteOpsAliyunAuthorizationGuide,
   getSiteOpsAliyunConnection,
+  listSiteOpsAliyunDomains,
   observeSiteOps,
   openSiteOps,
-  probeSiteOpsAliyunRole,
   sendSiteOpsMessage,
   SiteOpsServiceError,
-  startSiteOpsAliyunRoleProvisioning,
-  verifySiteOpsAliyunConnection,
 } from "./siteops/service";
 import { brandQuestionUniverseStartInputSchema } from "../shared/brand-question-universe";
 import {
@@ -339,38 +336,11 @@ export const workspaceRouter = router({
             toSiteOpsServiceError(error);
           }
         }),
-      authorizationGuide: protectedProcedure
+      listDomains: protectedProcedure
         .input(siteOpsAliyunConnectionInputSchema)
         .query(async ({ ctx, input }) => {
           try {
-            return await getSiteOpsAliyunAuthorizationGuide(ctx.user, input);
-          } catch (error) {
-            toSiteOpsServiceError(error);
-          }
-        }),
-      startRoleProvisioning: protectedProcedure
-        .input(siteOpsAliyunConnectionInputSchema)
-        .mutation(async ({ ctx, input }) => {
-          try {
-            return await startSiteOpsAliyunRoleProvisioning(ctx.user, input);
-          } catch (error) {
-            toSiteOpsServiceError(error);
-          }
-        }),
-      probeRole: protectedProcedure
-        .input(siteOpsAliyunConnectionInputSchema)
-        .mutation(async ({ ctx, input }) => {
-          try {
-            return await probeSiteOpsAliyunRole(ctx.user, input);
-          } catch (error) {
-            toSiteOpsServiceError(error);
-          }
-        }),
-      verifyRole: protectedProcedure
-        .input(siteOpsAliyunConnectionInputSchema)
-        .mutation(async ({ ctx, input }) => {
-          try {
-            return await verifySiteOpsAliyunConnection(ctx.user, input);
+            return await listSiteOpsAliyunDomains(ctx.user, input);
           } catch (error) {
             toSiteOpsServiceError(error);
           }

@@ -24,7 +24,7 @@ describe("connected SiteOps request identity", () => {
         rebuildRequest: { resetPending: true },
         visualGeneration: { status: "idle" },
         deployments: [],
-        domainOperations: [],
+        domainState: null,
         socialPackages: [],
       } as never),
     ).toBe(true);
@@ -39,12 +39,44 @@ describe("connected SiteOps request identity", () => {
           rebuildRequest: { status, resetPending: false },
           visualGeneration: { status: "idle" },
           deployments: [],
-          domainOperations: [],
+          domainState: null,
           socialPackages: [],
         } as never),
       ).toBe(true);
     },
   );
+
+  it("polls the initial domain sync from the current customer-facing card", () => {
+    const pending = {
+      interactionState: "approved",
+      project: { revision: 9 },
+      rebuildRequest: { status: null, resetPending: false },
+      visualGeneration: { status: "idle" },
+      deployments: [],
+      messages: [
+        {
+          metadata: {
+            siteOps: {
+              kind: "domain_status",
+              status: "active",
+              revision: 9,
+              payload: { action: "domain_sync" },
+            },
+          },
+        },
+      ],
+      domainState: null,
+      socialPackages: [],
+    } as never;
+
+    expect(shouldPollSiteOpsObservation(pending)).toBe(true);
+    expect(
+      shouldPollSiteOpsObservation({
+        ...pending,
+        project: { revision: 10 },
+      } as never),
+    ).toBe(false);
+  });
 
   it("accepts only forward rebuild transitions at an equal cursor", () => {
     const observation = (status: "submitted" | "scheduled" | "in_progress") =>

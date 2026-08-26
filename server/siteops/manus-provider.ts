@@ -3102,19 +3102,6 @@ export function createManusSiteOpsProviderHandler(
         signal.throwIfAborted();
       };
       await assertExecutionActive();
-      if (
-        operation.input &&
-        typeof operation.input === "object" &&
-        !Array.isArray(operation.input) &&
-        (operation.input as Record<string, unknown>).resumeMode ===
-          "recover_design_output"
-      ) {
-        throw new SiteOpsManusFailure(
-          "FRONTMIND_BUILD_RESUME_REMOVED",
-          "历史建站恢复已停用；请通过批准重置后的全新任务重新生成。",
-          "failed",
-        );
-      }
       const db = await dbGetter();
       if (!db)
         throw new SiteOpsManusFailure(

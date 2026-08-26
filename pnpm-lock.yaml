@@ -28,18 +28,12 @@ importers:
       '@alicloud/credentials':
         specifier: 2.4.7
         version: 2.4.7
-      '@alicloud/domain20180129':
-        specifier: 5.1.0
-        version: 5.1.0
       '@alicloud/esa20240910':
         specifier: 3.14.0
         version: 3.14.0
       '@alicloud/openapi-client':
         specifier: 0.4.15
         version: 0.4.15
-      '@alicloud/sts20150401':
-        specifier: 1.2.0
-        version: 1.2.0
       '@astrojs/check':
         specifier: 0.9.10
         version: 0.9.10(prettier@3.6.2)(typescript@5.9.3)
@@ -392,9 +386,6 @@ packages:
   '@alicloud/darabonba-string@1.0.3':
     resolution: {integrity: sha512-NyWwrU8cAIesWk3uHL1Q7pTDTqLkCI/0PmJXC4/4A0MFNAZ9Ouq0iFBsRqvfyUujSSM+WhYLuTfakQXiVLkTMA==}
 
-  '@alicloud/domain20180129@5.1.0':
-    resolution: {integrity: sha512-IFcBHLTdCyrZlhLp+j0g2aXfw+2w8j5JjWCJa/ApwhB0oEyseZk/f7AylKOh+bfuAvht9GoK4+7LFxaY1t+/qQ==}
-
   '@alicloud/endpoint-util@0.0.1':
     resolution: {integrity: sha512-+pH7/KEXup84cHzIL6UJAaPqETvln4yXlD9JzlrqioyCSaWxbug5FUobsiI6fuUOpw5WwoB3fWAtGbFnJ1K3Yg==}
 
@@ -415,9 +406,6 @@ packages:
 
   '@alicloud/openapi-util@0.3.3':
     resolution: {integrity: sha512-vf0cQ/q8R2U7ZO88X5hDiu1yV3t/WexRj+YycWxRutkH/xVXfkmpRgps8lmNEk7Ar+0xnY8+daN2T+2OyB9F4A==}
-
-  '@alicloud/sts20150401@1.2.0':
-    resolution: {integrity: sha512-QAO+W8dDbY7uS6YS/NyGgMupo5sNzf0QrJs8FiRX7Bm49c56S29f4iJUjJozfnrFph1AGHEQoN9RlwT/Jz/cGg==}
 
   '@alicloud/tea-typescript@1.8.0':
     resolution: {integrity: sha512-CWXWaquauJf0sW30mgJRVu9aaXyBth5uMBCUc+5vKTK1zlgf3hIqRUjJZbjlwHwQ5y9anwcu18r48nOZb7l2QQ==}
@@ -6734,15 +6722,6 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@alicloud/domain20180129@5.1.0':
-    dependencies:
-      '@alicloud/openapi-core': 1.0.8
-      '@darabonba/typescript': 1.0.5
-    transitivePeerDependencies:
-      - bufferutil
-      - supports-color
-      - utf-8-validate
-
   '@alicloud/endpoint-util@0.0.1':
     dependencies:
       '@alicloud/tea-typescript': 1.8.0
@@ -6815,15 +6794,6 @@ snapshots:
       sm3: 1.0.3
     transitivePeerDependencies:
       - supports-color
-
-  '@alicloud/sts20150401@1.2.0':
-    dependencies:
-      '@alicloud/openapi-core': 1.0.8
-      '@darabonba/typescript': 1.0.5
-    transitivePeerDependencies:
-      - bufferutil
-      - supports-color
-      - utf-8-validate
 
   '@alicloud/tea-typescript@1.8.0':
     dependencies:

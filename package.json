@@ -54,10 +54,8 @@
   "dependencies": {
     "@alicloud/alidns20150109": "4.6.0",
     "@alicloud/credentials": "2.4.7",
-    "@alicloud/domain20180129": "5.1.0",
     "@alicloud/esa20240910": "3.14.0",
     "@alicloud/openapi-client": "0.4.15",
-    "@alicloud/sts20150401": "1.2.0",
     "@astrojs/check": "0.9.10",
     "@astrojs/sitemap": "3.7.3",
     "@axe-core/playwright": "4.13.0",

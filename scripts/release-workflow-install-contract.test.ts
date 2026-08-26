@@ -114,15 +114,18 @@ describe("release workflow source-ordering contracts", () => {
     expect(updater).toContain(
       'VERSION_ARGUMENT="--apply-version=${CONTROLLER_VERSION}"',
     );
-    expect(updater).toContain('readonly CONTROLLER_VERSION="5"');
-    expect(releaseManual).toContain("production-owned v5 controller");
-    expect(releaseManual).toContain("--apply-version=5");
-    expect(releaseManual).not.toMatch(/--apply-version=[0-4](?:\D|$)/u);
+    expect(updater).toContain('readonly CONTROLLER_VERSION="6"');
+    expect(releaseManual).toContain("production-owned v6 controller");
+    expect(releaseManual).toContain("--apply-version=6");
+    expect(releaseManual).not.toMatch(/--apply-version=[0-5](?:\D|$)/u);
     expect(updater).toContain("PRODUCTION_CONTROLLER_UPDATE_ROLLED_BACK");
     expect(updater).toContain("project-business-owner");
     expect(updater).toContain(
       "PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH",
     );
+    expect(updater).toContain("siteops_alidns_oauth_contract_plan_matches");
+    expect(updater).toContain("contract-0065-migration-started");
+    expect(releaseManual).toContain("forced command 不暴露 0065");
     expect(installerSource).not.toContain(
       "frontmind-update-release-controllers",
     );

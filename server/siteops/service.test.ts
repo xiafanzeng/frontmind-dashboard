@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   assertSiteOpsDeploymentTargetAvailable,
   assertCurrentVisualWorkflowVersion,
-  assertSiteOpsSnapshotChangeState,
   completePublishedVisualPageCount,
   createVisualSearchOperationInput,
   currentSiteOpsBuildWorkflowCoordinates,
@@ -20,11 +19,9 @@ import {
   projectSiteOpsExecutionSteps,
   projectSiteOpsBuildDelivery,
   referenceBlueprintForSiteOpsRevision,
-  requireAcceptedSiteOpsRebuild,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
   siteBriefFromSnapshot,
-  siteOpsActiveFinancialIntentKey,
   siteOpsServiceErrorFromQuota,
   siteOpsVisualSelectionRecovery,
   SiteOpsServiceError,
@@ -38,7 +35,6 @@ import {
   SITEOPS_WORKFLOW,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
-  siteOpsAliyunConnectionSetupInputSchema,
   siteOpsSendMessageInputSchema,
 } from "../../shared/siteops";
 import { siteOpsBuildProjectionSchema } from "../../shared/siteops-contract";
@@ -230,19 +226,6 @@ describe("SiteOps core contracts", () => {
       });
     },
   );
-
-  it("requires an accepted rebuild ticket for every child-build admission", () => {
-    expect(() =>
-      requireAcceptedSiteOpsRebuild({
-        acceptedForCurrentCycle: false,
-      }),
-    ).toThrowError(SiteOpsServiceError);
-    expect(() =>
-      requireAcceptedSiteOpsRebuild({
-        acceptedForCurrentCycle: true,
-      }),
-    ).not.toThrow();
-  });
 
   it("freezes the selected production F reference to a hashed floating-orbit blueprint", () => {
     const visualEvidence = createVisualEvidenceV1({
@@ -635,27 +618,6 @@ describe("SiteOps core contracts", () => {
     expect(domain.domainUnicode).toBe("例子.公司");
   });
 
-  it("deduplicates active financial intents across client request ids", () => {
-    const base = {
-      projectId: "30000000-0000-4000-8000-000000000003",
-      accountUid: "123456789012",
-      domain: "example.com",
-      kind: "purchase" as const,
-    };
-    expect(siteOpsActiveFinancialIntentKey(base)).toBe(
-      siteOpsActiveFinancialIntentKey({ ...base, domain: "EXAMPLE.COM" }),
-    );
-    expect(siteOpsActiveFinancialIntentKey(base)).not.toBe(
-      siteOpsActiveFinancialIntentKey({ ...base, kind: "renewal" }),
-    );
-    expect(siteOpsActiveFinancialIntentKey(base)).not.toBe(
-      siteOpsActiveFinancialIntentKey({
-        ...base,
-        accountUid: "123456789013",
-      }),
-    );
-  });
-
   it("accepts ICP approval only for the exact current domain revision", () => {
     const profile = {
       icpStatus: "approved",
@@ -957,48 +919,6 @@ describe("SiteOps core contracts", () => {
     ).toThrow();
   });
 
-  it("keeps removed recovery and manual snapshot actions as pre-entitlement tombstones", async () => {
-    for (const [action, input] of [
-      ["resume_build", { buildId: "10000000-0000-4000-8000-000000000001" }],
-      ["reset_workflow", { confirmed: true }],
-    ] as const) {
-      try {
-        parseSiteOpsActionPayload(action, input);
-        throw new Error("expected tombstone");
-      } catch (error) {
-        expect(error).toMatchObject({
-          code: "STATE_CONFLICT",
-          statusCode: 409,
-        });
-      }
-    }
-
-    const source = await readFile(
-      path.join(process.cwd(), "server/siteops/service.ts"),
-      "utf8",
-    );
-    const actionEntry = source.indexOf("export async function actOnSiteOps");
-    const tombstone = source.indexOf(
-      'input.action === "resume_build"',
-      actionEntry,
-    );
-    const legacySnapshotChoice = source.indexOf(
-      'input.action === "change_snapshot"',
-      tombstone,
-    );
-    const entitlement = source.indexOf(
-      "const entitlement = await requireSiteOpsEntitlement(actor.id);",
-      tombstone,
-    );
-    const database = source.indexOf("const db = await requireDb();", tombstone);
-    expect(actionEntry).toBeGreaterThan(-1);
-    expect(tombstone).toBeGreaterThan(-1);
-    expect(legacySnapshotChoice).toBeGreaterThan(tombstone);
-    expect(legacySnapshotChoice).toBeLessThan(entitlement);
-    expect(entitlement).toBeGreaterThan(tombstone);
-    expect(database).toBeGreaterThan(tombstone);
-  });
-
   it("keeps the customer build action free of API mode details", () => {
     const sampleId = "10000000-0000-4000-8000-000000000001";
     expect(parseSiteOpsActionPayload("select_visual", { sampleId })).toEqual({
@@ -1118,93 +1038,33 @@ describe("SiteOps core contracts", () => {
     });
   });
 
-  it("keeps existing-domain sync read-only and exact-confirmation shaped", () => {
+  it("accepts only a selected Aliyun domain and normalizes its IDN identity", () => {
     expect(
       parseSiteOpsActionPayload("domain_sync", {
         domain: "例子.公司",
-        typedDomain: "例子.公司",
-        customerConfirmed: true,
       }),
     ).toEqual({
       domain: "xn--fsqu00a.xn--55qx5d",
       domainUnicode: "例子.公司",
-      typedDomain: "xn--fsqu00a.xn--55qx5d",
-      customerConfirmed: true,
     });
     expect(() =>
       parseSiteOpsActionPayload("domain_sync", {
         domain: "example.com",
-        typedDomain: "other.example.com",
-        customerConfirmed: true,
+        typedDomain: "example.com",
       }),
-    ).toThrow("必须完整输入");
+    ).toThrow();
     expect(() =>
       parseSiteOpsActionPayload("domain_sync", {
         domain: "example.com",
-        typedDomain: "example.com",
-        customerConfirmed: true,
         accessKeySecret: "must-not-be-accepted",
       }),
     ).toThrow();
   });
 
-  it("keeps the retired snapshot-change parser strict for rolling clients", () => {
+  it("keeps the Aliyun OAuth connection boundary free of account secrets", () => {
     expect(() =>
-      assertSiteOpsSnapshotChangeState({
-        sameSnapshot: false,
-        activeBuild: false,
-        activeDeployment: false,
-        activeVisualSearch: false,
-      }),
-    ).not.toThrow();
-    expect(() =>
-      assertSiteOpsSnapshotChangeState({
-        sameSnapshot: false,
-        activeBuild: true,
-        activeDeployment: false,
-        activeVisualSearch: false,
-      }),
-    ).toThrow("任务在运行");
-    expect(() =>
-      assertSiteOpsSnapshotChangeState({
-        sameSnapshot: true,
-        activeBuild: false,
-        activeDeployment: false,
-        activeVisualSearch: false,
-      }),
-    ).toThrow("已经是当前版本");
-    expect(
-      parseSiteOpsActionPayload("change_snapshot", {
-        knowledgeSnapshotId: "30000000-0000-4000-8000-000000000003",
-      }),
-    ).toEqual({
-      knowledgeSnapshotId: "30000000-0000-4000-8000-000000000003",
-    });
-    expect(() =>
-      parseSiteOpsActionPayload("change_snapshot", {
-        knowledgeSnapshotId: "30000000-0000-4000-8000-000000000003",
-        selectArchivedVersion: true,
-      }),
-    ).toThrow();
-  });
-
-  it("keeps the customer RAM Role boundary strict", () => {
-    expect(
-      siteOpsAliyunConnectionSetupInputSchema.parse({
+      siteOpsAliyunConnectionInputSchema.parse({
         conversationId: "siteops:7",
-        accountUid: "123456789012",
-        roleArn: "acs:ram::123456789012:role/frontmind-siteops",
-      }),
-    ).toEqual({
-      conversationId: "siteops:7",
-      accountUid: "123456789012",
-      roleArn: "acs:ram::123456789012:role/frontmind-siteops",
-    });
-    expect(() =>
-      siteOpsAliyunConnectionSetupInputSchema.parse({
-        conversationId: "siteops:7",
-        accountUid: "123456789012",
-        roleArn: "acs:ram::123456789012:role/frontmind-siteops",
         accessKeySecret: "must-not-be-accepted",
       }),
     ).toThrow();
@@ -1307,36 +1167,19 @@ describe("SiteOps core contracts", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("ships one additive migration with the eight SiteOps tables", async () => {
+  it("ships one contract migration that removes commerce and rebuilds the OAuth connection", async () => {
     const sql = await readFile(
-      path.join(process.cwd(), "drizzle/0064_siteops_v1.sql"),
+      path.join(process.cwd(), "drizzle/0065_siteops_alidns_oauth.sql"),
       "utf8",
     );
-    for (const table of [
-      "site_projects",
-      "site_operations",
-      "site_builds",
-      "site_deployments",
-      "social_packages",
-      "site_provider_connections",
-      "site_domain_operations",
-      "site_dns_records",
-    ]) {
-      expect(sql).toContain(`CREATE TABLE \`${table}\``);
-    }
-    expect(sql).not.toMatch(/\bDROP\s+(?:TABLE|COLUMN|INDEX)\b/iu);
-    expect(sql).toContain("website_style_samples_source_ck");
-    expect(sql).toContain("workspace_site_profiles_ascii_domain_idx");
-    expect(sql).toContain("`active_financial_key` varchar(64)");
-    expect(sql).toContain(
-      "site_domain_operations_active_financial_uq` UNIQUE(`active_financial_key`)",
-    );
-    expect(sql).toContain("`quota_period_id` varchar(36)");
-    expect(sql).toContain(
-      "site_builds_quota_period_state_idx` ON `site_builds` (`quota_period_id`,`quota_state`)",
-    );
-    expect(sql).toContain(
-      "social_packages_quota_period_state_idx` ON `social_packages` (`quota_period_id`,`quota_state`)",
-    );
+    expect(sql).toContain("DROP TABLE `site_domain_operations`");
+    expect(sql).toContain("DROP TABLE `site_provider_connections`");
+    expect(sql).toContain("'domain_sync','dns_apply','dns_rollback'");
+    expect(sql).toContain("`oauth_credential_id` varchar(36) NOT NULL");
+    expect(sql).toContain("`encrypted_refresh_token` text NOT NULL");
+    expect(sql).toContain("`status` enum('active','invalid','revoked')");
+    expect(sql).toContain("`current_task_started_at` timestamp NOT NULL");
+    expect(sql).toContain("`minimum_knowledge_snapshot_version` int unsigned");
+    expect(sql).not.toContain("`active_financial_key`");
   });
 });

@@ -1,14 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { presalesApiCredentials, siteProjects } from "../../drizzle/schema";
-
 const mocks = vi.hoisted(() => ({
   bindAliyunCustomerAccountFromOAuth: vi.fn(),
-  getDb: vi.fn(),
   getServicePortal: vi.fn(),
 }));
 
-vi.mock("../db", () => ({ getDb: mocks.getDb }));
 vi.mock("../service-entitlement", () => ({
   getServicePortal: mocks.getServicePortal,
 }));
@@ -32,79 +28,17 @@ const actor = {
   username: "customer-42",
 } as const;
 
-function databaseFixture(
-  input: {
-    credentialActive?: boolean;
-    projectOwned?: boolean;
-  } = {},
-) {
-  const committed: Array<{ table: unknown; values: unknown }> = [];
-  let pending: Array<{ table: unknown; values: unknown }> = [];
-  let rolledBack = false;
-
-  const tx = {
-    select: vi.fn(() => ({
-      from: vi.fn((table: unknown) => {
-        const rows =
-          table === siteProjects
-            ? input.projectOwned === false
-              ? []
-              : [{ id: projectId }]
-            : table === presalesApiCredentials
-              ? input.credentialActive === false
-                ? []
-                : [{ id: credentialId }]
-              : [];
-        const query = {
-          where: vi.fn(() => query),
-          limit: vi.fn(() => query),
-          for: vi.fn(async () => rows),
-        };
-        return query;
-      }),
-    })),
-    update: vi.fn((table: unknown) => ({
-      set: vi.fn((values: unknown) => ({
-        where: vi.fn(async () => {
-          pending.push({ table, values });
-          return [{ affectedRows: 1 }];
-        }),
-      })),
-    })),
-  };
-  const db = {
-    transaction: vi.fn(async (callback: (executor: typeof tx) => unknown) => {
-      pending = [];
-      try {
-        const result = await callback(tx);
-        committed.push(...pending);
-        return result;
-      } catch (error) {
-        rolledBack = true;
-        pending = [];
-        throw error;
-      }
-    }),
-  };
-  return {
-    db,
-    tx,
-    committed,
-    wasRolledBack: () => rolledBack,
-  };
-}
-
-describe("SiteOps Aliyun OAuth atomic completion", () => {
+describe("SiteOps Aliyun OAuth completion", () => {
   const originalEnabled = process.env.FRONTMIND_SITEOPS_ENABLED;
 
   beforeEach(() => {
     delete process.env.FRONTMIND_SITEOPS_ENABLED;
     mocks.bindAliyunCustomerAccountFromOAuth.mockReset().mockResolvedValue({
       connectionId: "33333333-3333-4333-8333-333333333333",
-      status: "unverified",
-      requiresRoleAuthorization: true,
+      accountUid: "1234567890123456",
+      status: "active",
+      capabilities: ["alidns_read", "alidns_write"],
     });
-    mocks.getDb.mockReset();
     mocks.getServicePortal.mockReset().mockResolvedValue({
       service: { status: "unconfigured" },
       entitlementRollout: { mode: "compatibility" },
@@ -119,89 +53,55 @@ describe("SiteOps Aliyun OAuth atomic completion", () => {
     }
   });
 
-  it("verifies the exact active credential and binds through one transaction", async () => {
-    const fixture = databaseFixture();
-    mocks.getDb.mockResolvedValue(fixture.db);
-
+  it("passes the probed refresh grant to one atomic provider bind", async () => {
     await expect(
       completeSiteOpsAliyunOAuth({
         actor: actor as never,
         credentialId,
         projectId,
         accountUid: "1234567890123456",
+        refreshToken: "refresh-token-to-seal",
       }),
-    ).resolves.toEqual({
-      connected: false,
-      authorizationRequired: true,
-    });
+    ).resolves.toEqual({ connected: true });
 
-    expect(fixture.db.transaction).toHaveBeenCalledTimes(1);
-    expect(mocks.bindAliyunCustomerAccountFromOAuth).toHaveBeenCalledWith(
-      {
-        projectId,
-        userId: 42,
-        accountUid: "1234567890123456",
-      },
-      fixture.tx,
-    );
-    expect(fixture.committed).toHaveLength(1);
-    expect(fixture.committed[0]).toMatchObject({
-      table: presalesApiCredentials,
-      values: {
-        validationStatus: "verified",
-        verifiedAt: expect.any(Date),
-        updatedAt: expect.any(Date),
-      },
+    expect(mocks.bindAliyunCustomerAccountFromOAuth).toHaveBeenCalledTimes(1);
+    expect(mocks.bindAliyunCustomerAccountFromOAuth).toHaveBeenCalledWith({
+      projectId,
+      userId: 42,
+      credentialId,
+      accountUid: "1234567890123456",
+      refreshToken: "refresh-token-to-seal",
     });
-    expect(fixture.wasRolledBack()).toBe(false);
   });
 
-  it("rejects a callback pinned to a credential that was rotated", async () => {
-    const fixture = databaseFixture({ credentialActive: false });
-    mocks.getDb.mockResolvedValue(fixture.db);
-
-    await expect(
-      completeSiteOpsAliyunOAuth({
-        actor: actor as never,
-        credentialId,
-        projectId,
-        accountUid: "1234567890123456",
-      }),
-    ).rejects.toMatchObject({
-      code: "CREDENTIAL_ROTATED",
-      statusCode: 409,
-    });
-
-    expect(mocks.bindAliyunCustomerAccountFromOAuth).not.toHaveBeenCalled();
-    expect(fixture.committed).toEqual([]);
-    expect(fixture.wasRolledBack()).toBe(true);
-  });
-
-  it("rolls back credential verification when account binding fails", async () => {
-    const fixture = databaseFixture();
-    mocks.getDb.mockResolvedValue(fixture.db);
+  it("translates a provider bind conflict without returning provider details", async () => {
     mocks.bindAliyunCustomerAccountFromOAuth.mockRejectedValueOnce(
       new AliyunProviderError(
         "CONNECTION_IN_USE",
         "provider-message-must-not-escape",
       ),
     );
-
     await expect(
       completeSiteOpsAliyunOAuth({
         actor: actor as never,
         credentialId,
         projectId,
         accountUid: "1234567890123456",
+        refreshToken: "refresh-token-to-seal",
       }),
-    ).rejects.toMatchObject({
-      code: "STATE_CONFLICT",
-      statusCode: 409,
-    });
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+  });
 
-    expect(fixture.tx.update).toHaveBeenCalledWith(presalesApiCredentials);
-    expect(mocks.bindAliyunCustomerAccountFromOAuth).toHaveBeenCalledTimes(1);
-    expect(fixture.committed).toEqual([]);
-    expect(fixture.wasRolledBack()).toBe(true);
+  it("rejects malformed callback coordinates before binding", async () => {
+    await expect(
+      completeSiteOpsAliyunOAuth({
+        actor: actor as never,
+        credentialId: "not-a-credential-id",
+        projectId,
+        accountUid: "1234567890123456",
+        refreshToken: "refresh-token-to-seal",
+      }),
+    ).rejects.toBeDefined();
+    expect(mocks.bindAliyunCustomerAccountFromOAuth).not.toHaveBeenCalled();
   });
 });

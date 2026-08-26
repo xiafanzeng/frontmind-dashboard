@@ -23,18 +23,12 @@ import {
   testTwentyFirstApiCredential,
 } from "./twenty-first-service";
 import {
-  aliyunBrokerCredentialInputSchema,
   aliyunOAuthCredentialInputSchema,
   deleteAliyunPlatformCredentials,
   getAliyunPlatformCredentialStatus,
-  replaceAliyunBrokerCredential,
   replaceAliyunOAuthCredential,
   testAliyunPlatformCredentials,
 } from "./siteops/aliyun-platform-service";
-import {
-  inspectActiveAliyunCustomerReadCapabilities,
-  reconcileAliyunFinancialOperation,
-} from "./siteops/aliyun-provider";
 import {
   assertDashboardEnterpriseIdentity,
   getDashboardContentRevision,
@@ -1901,94 +1895,14 @@ export const adminRouter = router({
         }
       }),
 
-      test: adminProcedure
-        .input(
-          z
-            .object({
-              target: z.enum(["broker", "oauth", "all"]).default("all"),
-            })
-            .strict()
-            .optional(),
-        )
-        .mutation(async ({ ctx, input }) => {
-          requireSystemAdmin(ctx.user);
-          try {
-            const target = input?.target ?? "all";
-            const identity = await testAliyunPlatformCredentials(target);
-            const customerReadiness =
-              target === "oauth"
-                ? null
-                : await inspectActiveAliyunCustomerReadCapabilities();
-            return { ...identity, customerReadiness };
-          } catch (error) {
-            throw toTrpcError(error);
-          }
-        }),
-
-      reconcileFinancialOperation: adminProcedure
-        .input(
-          z
-            .object({
-              operationId: z.string().uuid(),
-              reason: z.string().trim().max(2_000).optional(),
-            })
-            .strict(),
-        )
-        .mutation(async ({ ctx, input }) => {
-          requireSystemAdmin(ctx.user);
-          try {
-            const result = await reconcileAliyunFinancialOperation({
-              operationId: input.operationId,
-            });
-            await writeWorkspaceAuditEvent({
-              actor: ctx.user,
-              action: "siteops.aliyun_financial_operation.reconcile_requested",
-              targetType: "site_operation",
-              targetId: input.operationId,
-              reason: input.reason,
-              metadata: {
-                requeued: result.requeued,
-                status: result.status,
-              },
-            });
-            return result;
-          } catch (error) {
-            throw toTrpcError(error);
-          }
-        }),
-
-      replaceBroker: adminProcedure
-        .input(
-          aliyunBrokerCredentialInputSchema
-            .extend({
-              reason: z.string().trim().max(2_000).optional(),
-            })
-            .strict(),
-        )
-        .mutation(async ({ ctx, input }) => {
-          requireSystemAdmin(ctx.user);
-          try {
-            const { reason, ...credentialInput } = input;
-            const credential = await replaceAliyunBrokerCredential(
-              ctx.user.id,
-              credentialInput,
-            );
-            await writeWorkspaceAuditEvent({
-              actor: ctx.user,
-              action: "siteops.aliyun_broker_credential.replaced",
-              targetType: "presales_api_credential",
-              targetId: "siteops_aliyun_broker",
-              reason,
-              metadata: {
-                fingerprint: credential.fingerprint,
-                version: credential.version,
-              },
-            });
-            return credential;
-          } catch (error) {
-            throw toTrpcError(error);
-          }
-        }),
+      test: adminProcedure.mutation(async ({ ctx }) => {
+        requireSystemAdmin(ctx.user);
+        try {
+          return await testAliyunPlatformCredentials();
+        } catch (error) {
+          throw toTrpcError(error);
+        }
+      }),
 
       replaceOAuth: adminProcedure
         .input(
@@ -2027,7 +1941,6 @@ export const adminRouter = router({
         .input(
           z
             .object({
-              target: z.enum(["broker", "oauth", "all"]).default("all"),
               reason: z.string().trim().max(2_000).optional(),
             })
             .strict()
@@ -2036,13 +1949,12 @@ export const adminRouter = router({
         .mutation(async ({ ctx, input }) => {
           requireSystemAdmin(ctx.user);
           try {
-            const target = input?.target ?? "all";
-            const result = await deleteAliyunPlatformCredentials(target);
+            const result = await deleteAliyunPlatformCredentials();
             await writeWorkspaceAuditEvent({
               actor: ctx.user,
               action: "siteops.aliyun_platform_credential.deleted",
               targetType: "presales_api_credential",
-              targetId: `siteops_aliyun_${target}`,
+              targetId: "siteops_aliyun_oauth",
               reason: input?.reason,
             });
             return { success: result.deleted };

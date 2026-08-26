@@ -122,6 +122,7 @@ describe("service portal migration chain", () => {
       "0062_hard_glorian",
       "0063_lean_blue_marvel",
       "0064_siteops_v1",
+      "0065_siteops_alidns_oauth",
     ]);
   });
 

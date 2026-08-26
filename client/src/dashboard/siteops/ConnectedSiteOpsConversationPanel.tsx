@@ -16,13 +16,6 @@ const PENDING_DEPLOYMENT_STATES = new Set([
   "verifying",
 ]);
 
-const PENDING_DOMAIN_OPERATION_STATES = new Set([
-  "reserved",
-  "submitted",
-  "reconciling",
-  "outcome_unknown",
-]);
-
 const PENDING_SOCIAL_PACKAGE_STATES = new Set([
   "queued",
   "building",
@@ -80,9 +73,19 @@ export function shouldPollSiteOpsObservation(
         observation.deployments.some((item) =>
           PENDING_DEPLOYMENT_STATES.has(item.status),
         ) ||
-        observation.domainOperations.some((item) =>
-          PENDING_DOMAIN_OPERATION_STATES.has(item.status),
-        ) ||
+        (observation.messages ?? []).some((item) => {
+          const card = item.metadata?.siteOps;
+          return Boolean(
+            card?.kind === "domain_status" &&
+              card.status === "active" &&
+              card.revision === observation.project.revision &&
+              card.payload?.action === "domain_sync",
+          );
+        }) ||
+        (Boolean(observation.domainState?.domain) &&
+          !["active", "attention_required"].includes(
+            observation.domainState?.dnsStatus ?? "",
+          )) ||
         observation.socialPackages.some((item) =>
           PENDING_SOCIAL_PACKAGE_STATES.has(item.status),
         )),
@@ -185,15 +188,15 @@ export default function ConnectedSiteOpsConversationPanel({
   });
   const aliyunBeginMutation =
     trpc.workspace.siteOps.aliyunConnection.beginOAuth.useMutation();
-  const aliyunAuthorizationGuideQuery =
-    trpc.workspace.siteOps.aliyunConnection.authorizationGuide.useQuery(
+  const aliyunDomainsQuery =
+    trpc.workspace.siteOps.aliyunConnection.listDomains.useQuery(
       { conversationId },
-      { enabled: false, retry: false },
+      {
+        enabled: observation?.aliyunConnection.status === "active",
+        retry: false,
+        refetchOnWindowFocus: true,
+      },
     );
-  const aliyunStartRoleProvisioningMutation =
-    trpc.workspace.siteOps.aliyunConnection.startRoleProvisioning.useMutation();
-  const aliyunProbeRoleMutation =
-    trpc.workspace.siteOps.aliyunConnection.probeRole.useMutation();
   const aliyunDisconnectMutation =
     trpc.workspace.siteOps.aliyunConnection.disconnect.useMutation();
 
@@ -212,7 +215,6 @@ export default function ConnectedSiteOpsConversationPanel({
     observeQuery.error?.message ||
     actMutation.error?.message ||
     aliyunBeginMutation.error?.message ||
-    aliyunAuthorizationGuideQuery.error?.message ||
     aliyunDisconnectMutation.error?.message ||
     null;
 
@@ -252,31 +254,11 @@ export default function ConnectedSiteOpsConversationPanel({
           conversationId: observation.project.conversationId,
         });
       }}
-      onLoadAliyunAuthorizationGuide={async () => {
-        if (!observation) {
-          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
-        }
-        const guide = await aliyunAuthorizationGuideQuery.refetch();
-        if (!guide.data) {
-          throw new Error("阿里云授权配置尚未就绪，请联系 FrontMind。");
-        }
-        return guide.data;
-      }}
-      onStartAliyunRoleProvisioning={async () => {
-        if (!observation) {
-          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
-        }
-        return await aliyunStartRoleProvisioningMutation.mutateAsync({
-          conversationId: observation.project.conversationId,
-        });
-      }}
-      onProbeAliyunRole={async () => {
-        if (!observation) {
-          throw new Error(`${SITEOPS_CUSTOMER_DISPLAY_NAME}尚未就绪。`);
-        }
-        return await aliyunProbeRoleMutation.mutateAsync({
-          conversationId: observation.project.conversationId,
-        });
+      aliyunDomains={aliyunDomainsQuery.data?.domains ?? []}
+      aliyunDomainsLoading={aliyunDomainsQuery.isLoading}
+      aliyunDomainsError={aliyunDomainsQuery.error?.message ?? null}
+      onRefreshAliyunDomains={async () => {
+        await aliyunDomainsQuery.refetch();
       }}
       onDisconnectAliyun={async () => {
         if (!observation) return;

@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
@@ -8,14 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const buildId = "123e4567-e89b-42d3-a456-426614174000";
 const oauthCredentialId = "223e4567-e89b-42d3-a456-426614174000";
-const rosCapability = `ar1.${"a".repeat(16)}.${"b".repeat(32)}.${"c".repeat(22)}`;
 
 const mocks = vi.hoisted(() => ({
   completeSiteOpsAliyunOAuth: vi.fn(),
   exchangeAliyunOAuthCode: vi.fn(),
   getDb: vi.fn(),
-  getPublicSiteOpsAliyunRosTemplate: vi.fn(),
-  getSiteOpsAliyunRoleConfiguration: vi.fn(),
   readSiteOpsArtifact: vi.fn(),
 }));
 
@@ -28,15 +24,9 @@ vi.mock("./aliyun-platform-service", () => ({
 }));
 vi.mock("./service", () => ({
   completeSiteOpsAliyunOAuth: mocks.completeSiteOpsAliyunOAuth,
-  getPublicSiteOpsAliyunRosTemplate: mocks.getPublicSiteOpsAliyunRosTemplate,
-  getSiteOpsAliyunRoleConfiguration: mocks.getSiteOpsAliyunRoleConfiguration,
 }));
 
-import {
-  publicSiteOpsArtifactError,
-  siteOpsAliyunRosTemplateApi,
-  siteOpsArtifactApi,
-} from "./artifact-api";
+import { publicSiteOpsArtifactError, siteOpsArtifactApi } from "./artifact-api";
 
 const servers: Server[] = [];
 let distZip: Buffer;
@@ -106,13 +96,9 @@ beforeEach(async () => {
     credentialId: oauthCredentialId,
     projectId: "project-1",
     accountUid: "1234567890123456",
+    refreshToken: "refresh-token-secret-sentinel",
   });
   mocks.completeSiteOpsAliyunOAuth.mockReset().mockResolvedValue(undefined);
-  mocks.getPublicSiteOpsAliyunRosTemplate.mockReset().mockResolvedValue({
-    ROSTemplateFormatVersion: "2015-09-01",
-    Resources: { FrontMindSiteOpsRole: { Type: "ALIYUN::RAM::Role" } },
-  });
-  mocks.getSiteOpsAliyunRoleConfiguration.mockReset();
 });
 
 afterEach(async () => {
@@ -137,16 +123,6 @@ async function startApp(options: { authenticated?: boolean } = {}) {
     next();
   });
   app.use("/api/site-ops", siteOpsArtifactApi);
-  const server = createServer(app);
-  servers.push(server);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address() as AddressInfo;
-  return `http://127.0.0.1:${address.port}`;
-}
-
-async function startRosTemplateApp() {
-  const app = express();
-  app.use("/api/site-ops/aliyun/ros-template", siteOpsAliyunRosTemplateApi);
   const server = createServer(app);
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -203,6 +179,7 @@ describe("SiteOps Aliyun OAuth callback", () => {
       credentialId: oauthCredentialId,
       projectId: "project-1",
       accountUid: "1234567890123456",
+      refreshToken: "refresh-token-secret-sentinel",
     });
     expect(html).not.toContain("secret-code-sentinel");
     expect(html).not.toContain("secret-state-sentinel");
@@ -353,95 +330,6 @@ describe("SiteOps Aliyun OAuth callback", () => {
     } finally {
       consoleError.mockRestore();
     }
-  });
-});
-
-describe("SiteOps public Aliyun ROS template", () => {
-  it("mounts before global body parsers so malformed public requests stay uniform", async () => {
-    const coreSource = await readFile(
-      new URL("../_core/index.ts", import.meta.url),
-      "utf8",
-    );
-    const mountIndex = coreSource.indexOf(
-      '"/api/site-ops/aliyun/ros-template"',
-    );
-    expect(mountIndex).toBeGreaterThan(-1);
-    expect(mountIndex).toBeLessThan(
-      coreSource.indexOf('express.json({ limit: "50mb" })'),
-    );
-  });
-
-  it("serves a capability-bound template without a FrontMind session", async () => {
-    const origin = await startRosTemplateApp();
-    const response = await fetch(
-      `${origin}/api/site-ops/aliyun/ros-template/${rosCapability}`,
-    );
-
-    expect(response.status).toBe(200);
-    expect(response.headers.get("cache-control")).toBe(
-      "private, no-store, max-age=0",
-    );
-    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-    expect(response.headers.get("x-robots-tag")).toBe(
-      "noindex, nofollow, noarchive",
-    );
-    expect(await response.json()).toEqual({
-      ROSTemplateFormatVersion: "2015-09-01",
-      Resources: { FrontMindSiteOpsRole: { Type: "ALIYUN::RAM::Role" } },
-    });
-    expect(mocks.getPublicSiteOpsAliyunRosTemplate).toHaveBeenCalledWith(
-      rosCapability,
-    );
-  });
-
-  it("makes invalid and expired capabilities indistinguishable", async () => {
-    mocks.getPublicSiteOpsAliyunRosTemplate.mockRejectedValueOnce(
-      new Error("secret-token-sentinel"),
-    );
-    const origin = await startRosTemplateApp();
-    const response = await fetch(
-      `${origin}/api/site-ops/aliyun/ros-template/${rosCapability}`,
-    );
-
-    expect(response.status).toBe(404);
-    expect(await response.json()).toEqual({ error: "NOT_FOUND" });
-    expect(response.headers.get("cache-control")).toBe(
-      "private, no-store, max-age=0",
-    );
-    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-    expect(response.headers.get("x-robots-tag")).toBe(
-      "noindex, nofollow, noarchive",
-    );
-  });
-
-  it("returns the same secure 404 for missing, extra-path, and non-GET requests", async () => {
-    const origin = await startRosTemplateApp();
-    const requests = [
-      fetch(`${origin}/api/site-ops/aliyun/ros-template`),
-      fetch(
-        `${origin}/api/site-ops/aliyun/ros-template/${rosCapability}/extra`,
-      ),
-      fetch(`${origin}/api/site-ops/aliyun/ros-template/${rosCapability}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{malformed-json",
-      }),
-    ];
-    for (const response of await Promise.all(requests)) {
-      expect(response.status).toBe(404);
-      expect(await response.json()).toEqual({ error: "NOT_FOUND" });
-      expect(response.headers.get("cache-control")).toBe(
-        "private, no-store, max-age=0",
-      );
-      expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-      expect(response.headers.get("x-robots-tag")).toBe(
-        "noindex, nofollow, noarchive",
-      );
-    }
-    expect(mocks.getPublicSiteOpsAliyunRosTemplate).not.toHaveBeenCalled();
   });
 });
 

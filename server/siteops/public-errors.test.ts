@@ -24,10 +24,13 @@ describe("SiteOps public error projection", () => {
   it("keeps non-build provider errors unchanged", () => {
     expect(
       publicSiteOpsErrorProjection({
-        code: "QUOTE_CHANGED",
-        message: "报价已变化。",
+        code: "ALIYUN_REAUTHORIZE_REQUIRED",
+        message: "阿里云连接需要重新授权。",
       }),
-    ).toEqual({ code: "QUOTE_CHANGED", message: "报价已变化。" });
+    ).toEqual({
+      code: "ALIYUN_REAUTHORIZE_REQUIRED",
+      message: "阿里云连接需要重新授权。",
+    });
   });
 
   it("projects provider results before persistence", () => {
@@ -73,14 +76,12 @@ describe("SiteOps public error projection", () => {
 
   it("does not project publishing runtime diagnostics into customer readiness", () => {
     const projected = sanitizeFrontMindPublicText(
-      "ESA 缺少可用的阿里云标准服务身份（环境 STS/AK、OIDC、凭据文件、ECS RAM Role 或 Credentials URI）",
+      "ESA 无法使用当前 AliDNS access token 验证 CNAME",
     );
     expect(projected).toBe(
       "FrontMind 暂未完成网站配置，请稍后重试或提交工单获取协助。",
     );
-    expect(projected).not.toMatch(
-      /ESA|STS|AK|OIDC|ECS|RAM|Role|Credentials|URI/iu,
-    );
+    expect(projected).not.toMatch(/ESA|AliDNS|access\s*token|CNAME/iu);
   });
 
   it("keeps the stable output-invalid code after three FrontMind repairs", () => {

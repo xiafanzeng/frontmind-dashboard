@@ -136,7 +136,7 @@ exec /usr/bin/stat "$@"
   await writeFile(path.join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n", {
     mode: 0o755,
   });
-  const result = spawnSync("bash", [updaterFile, "--apply-version=5"], {
+  const result = spawnSync("bash", [updaterFile, "--apply-version=6"], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -154,15 +154,15 @@ exec /usr/bin/stat "$@"
 }
 
 describe("production controller atomic updater", () => {
-  it("installs the reviewed v5 coupled controller and forced command atomically", async () => {
+  it("installs the reviewed v6 coupled controller and exact 0065 boundary atomically", async () => {
     const test = await harness();
     expect(test.result.status, test.result.stderr).toBe(0);
     expect(test.result.stdout).toContain(
-      "PRODUCTION_CONTROLLER_UPDATE_OK version=5",
+      "PRODUCTION_CONTROLLER_UPDATE_OK version=6",
     );
     const installedController = await readFile(test.controllerTarget, "utf8");
     expect(installedController).toContain(
-      "frontmind-production-controller-version: 5",
+      "frontmind-production-controller-version: 6",
     );
     expect(installedController).toContain("--coupled-stack");
     expect(installedController).toContain(
@@ -188,6 +188,14 @@ describe("production controller atomic updater", () => {
     );
     expect(installedController).toContain("/api/internal/presales/v2");
     expect(installedController).toContain("project-business-owner");
+    expect(installedController).toContain(
+      "siteops_alidns_oauth_contract_plan_matches",
+    );
+    expect(installedController).toContain("contract-0065-migration-started");
+    expect(installedController).toContain(
+      "e71230f0691ddd2a7d3d7b1a19d069775720ff999b445e86f60be902137a17db",
+    );
+    expect(installedController).toContain("restore_contract_0065_release");
     expect(installedController).toContain(
       "PRODUCTION_COUPLED_DASHBOARD_PRESALES_SURFACE_MISMATCH",
     );
@@ -228,7 +236,7 @@ describe("production controller atomic updater", () => {
         "recovered-forced\n",
         { mode: 0o600 },
       ),
-      writeFile(path.join(test.recoveryRoot, "pending"), "version=5\n", {
+      writeFile(path.join(test.recoveryRoot, "pending"), "version=6\n", {
         mode: 0o600,
       }),
       writeFile(test.controllerTarget, "mixed-new-controller\n", {
@@ -236,7 +244,7 @@ describe("production controller atomic updater", () => {
       }),
       writeFile(test.forcedTarget, "mixed-old-forced\n", { mode: 0o755 }),
     ]);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=5"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=6"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
@@ -245,7 +253,7 @@ describe("production controller atomic updater", () => {
       "PRODUCTION_CONTROLLER_UPDATE_RECOVERED_PREVIOUS",
     );
     expect(await readFile(test.controllerTarget, "utf8")).toContain(
-      "frontmind-production-controller-version: 5",
+      "frontmind-production-controller-version: 6",
     );
   });
 
@@ -267,11 +275,11 @@ describe("production controller atomic updater", () => {
         "recoverable-controller\n",
         { mode: 0o600 },
       ),
-      writeFile(path.join(test.recoveryRoot, "pending"), "version=5\n", {
+      writeFile(path.join(test.recoveryRoot, "pending"), "version=6\n", {
         mode: 0o600,
       }),
     ]);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=5"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=6"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });
@@ -288,7 +296,7 @@ describe("production controller atomic updater", () => {
     await writeFile(unsafeController, "unsafe-controller\n", { mode: 0o755 });
     await rm(test.controllerTarget);
     await symlink(unsafeController, test.controllerTarget);
-    const result = spawnSync("bash", [test.updaterFile, "--apply-version=5"], {
+    const result = spawnSync("bash", [test.updaterFile, "--apply-version=6"], {
       encoding: "utf8",
       env: { ...process.env, PATH: test.commandPath },
     });

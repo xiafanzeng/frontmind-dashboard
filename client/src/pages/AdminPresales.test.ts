@@ -31,20 +31,21 @@ describe("presalesUsageDisplayState", () => {
     expect(source).toContain("get_component");
     expect(source).toContain("不与官网任务积分混算");
     expect(source).toContain("域名与发布平台");
-    expect(source).toContain("1244409121609391");
+    expect(source).toContain("阿里云 OAuth 与 ESA 发布");
   });
 
-  it("never retains Aliyun broker or OAuth plaintext in mutation caches", () => {
+  it("keeps only the OAuth app credential in the Aliyun administrator surface", () => {
     const source = readFileSync(
       resolve(process.cwd(), "client/src/pages/AdminPresales.tsx"),
       "utf8",
     );
     expect(source).toContain(
-      "utils.client.admin.presales.aliyun.replaceBroker.mutate",
-    );
-    expect(source).toContain(
       "utils.client.admin.presales.aliyun.replaceOAuth.mutate",
     );
+    expect(source).not.toContain("replaceBroker");
+    expect(source).not.toContain("Broker RAM 身份");
+    expect(source).not.toContain("AccessKey ID");
+    expect(source).not.toContain("principal ARN");
     expect(source).not.toContain("aliyun.replaceBroker.useMutation");
     expect(source).not.toContain("aliyun.replaceOAuth.useMutation");
   });
@@ -55,12 +56,9 @@ describe("presalesUsageDisplayState", () => {
       "utf8",
     );
     expect(source).toContain("OAuth 应用 ID（Client ID）");
-    expect(source).toContain("仅请求 openid 和 aliuid");
-    expect(source).toContain("aliuid 设为必需并删除 profile");
-    expect(source).toContain("客户角色命名");
-    expect(source).toContain("FrontMindSiteOps-<连接标识>");
-    expect(source).toContain("FrontMindSiteOpsAccess");
-    expect(source).toContain("FrontMindSiteOps-*");
+    expect(source).toContain("openid、aliuid 与 /acs/alidns");
+    expect(source).toContain("Access token 不持久化");
+    expect(source).toContain("不调用域名购买、续费、RAM 或 ROS API");
     expect(source).toContain("不是应用密钥");
     expect(source).toContain("应用密钥内容（Client Secret）");
     expect(source).toContain("AppSecretValue");

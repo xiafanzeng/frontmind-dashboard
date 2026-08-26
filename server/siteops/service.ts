@@ -6,6 +6,7 @@ import {
   asc,
   desc,
   eq,
+  gte,
   gt,
   inArray,
   isNotNull,
@@ -25,7 +26,6 @@ import {
   siteBuilds,
   siteDeployments,
   siteDnsRecords,
-  siteDomainOperations,
   siteOperations,
   siteProjects,
   siteProviderConnections,
@@ -44,6 +44,7 @@ import {
   siteBriefSchema,
   siteOpsActInputSchema,
   siteOpsAliyunConnectionInputSchema,
+  siteOpsAliyunDomainListSchema,
   siteOpsObserveInputSchema,
   siteOpsSendMessageInputSchema,
   visualEvidenceV1Schema,
@@ -85,28 +86,11 @@ import {
   bindAliyunCustomerAccountFromOAuth,
   disconnectAliyunCustomerConnection,
   getAliyunCustomerConnectionStatus,
-  getAliyunCustomerRoleAuthorizationPackage,
-  prepareAliyunCustomerRoleProvisioning,
-  probeAliyunCustomerConnection,
-  verifyAliyunCustomerConnection,
+  listAliyunCustomerDomains,
 } from "./aliyun-provider";
-import {
-  ALIYUN_OAUTH_CREDENTIAL_SLOT,
-  createAliyunOAuthAuthorization,
-  getActiveAliyunBrokerCredential,
-} from "./aliyun-platform-service";
-import {
-  ALIYUN_ROS_TEMPLATE_VERSION,
-  buildAliyunRosAuthorizationUrl,
-  buildAliyunRosRoleTemplate,
-  fingerprintAliyunProvisioningValue,
-  issueAliyunRosTemplateCapability,
-  readAliyunRosTemplateCapability,
-  type AliyunRosCapabilityClaims,
-} from "./aliyun-ros-provisioning";
+import { createAliyunOAuthAuthorization } from "./aliyun-platform-service";
 import { inspectEsaRuntimeConfiguration } from "./esa-config";
 import {
-  publicSiteOpsDomainIssue,
   publicSiteOpsMessageText,
   sanitizeFrontMindPublicText,
 } from "./public-errors";
@@ -228,26 +212,6 @@ export function normalizeSiteOpsDomain(value: string) {
     throw new SiteOpsServiceError("INVALID_INPUT", "域名格式不正确。", 400);
   }
   return { domain: ascii, domainUnicode: domainToUnicode(ascii) || withoutDot };
-}
-
-export function siteOpsActiveFinancialIntentKey(input: {
-  projectId: string;
-  accountUid: string;
-  domain: string;
-  kind: "purchase" | "renewal";
-}) {
-  return createHash("sha256")
-    .update(
-      JSON.stringify({
-        schemaVersion: 1,
-        projectId: input.projectId,
-        accountUid: input.accountUid,
-        domain: input.domain.toLowerCase(),
-        kind: input.kind,
-      }),
-      "utf8",
-    )
-    .digest("hex");
 }
 
 export function isSiteOpsIcpApprovedForCurrentDomain(input: {
@@ -1029,7 +993,6 @@ async function loadServiceReadiness(
           and(
             inArray(presalesApiCredentials.slot, [
               "site_builder_21st",
-              "siteops_aliyun_broker",
               "siteops_aliyun_oauth",
             ]),
             eq(presalesApiCredentials.status, "active"),
@@ -1064,9 +1027,6 @@ async function loadServiceReadiness(
   const hasTwentyFirstCredential = platformCredentials.some(
     (row: { slot: string }) => row.slot === "site_builder_21st",
   );
-  const hasAliyunBrokerCredential = platformCredentials.some(
-    (row: { slot: string }) => row.slot === "siteops_aliyun_broker",
-  );
   const hasAliyunOAuthCredential = platformCredentials.some(
     (row: { slot: string }) => row.slot === "siteops_aliyun_oauth",
   );
@@ -1075,10 +1035,7 @@ async function loadServiceReadiness(
     process.env.FRONTMIND_ALIYUN_DOMAIN_ENABLED?.trim() === "1";
   const aliyunConnectionReady = connections[0]?.status === "active";
   const aliyunReady =
-    aliyunFeatureEnabled &&
-    hasAliyunBrokerCredential &&
-    hasAliyunOAuthCredential &&
-    aliyunConnectionReady;
+    aliyunFeatureEnabled && hasAliyunOAuthCredential && aliyunConnectionReady;
   const esa = inspectEsaRuntimeConfiguration({
     providerRegistered: siteOpsProviderConfigured("aliyun_esa"),
   });
@@ -1115,7 +1072,7 @@ async function loadServiceReadiness(
         ? undefined
         : !aliyunFeatureEnabled
           ? "域名与发布服务尚未启用"
-          : !hasAliyunBrokerCredential || !hasAliyunOAuthCredential
+          : !hasAliyunOAuthCredential
             ? "域名与发布平台尚未配置完成"
             : "请先完成阿里云账号授权",
     },
@@ -1523,10 +1480,12 @@ async function projectObservation(
       ? and(
           eq(messages.conversationId, input.project.conversationId),
           isNull(messages.deletedAt),
+          gte(messages.sentAt, input.project.currentTaskStartedAt),
         )
       : and(
           eq(messages.conversationId, input.project.conversationId),
           isNull(messages.deletedAt),
+          gte(messages.sentAt, input.project.currentTaskStartedAt),
           gt(messages.sequence, input.afterSequence),
         );
   const [
@@ -1541,10 +1500,7 @@ async function projectObservation(
     timelineOperationRows,
     connectionRows,
     profileRows,
-    domainOperationRows,
-    dnsOperationRows,
     activeAliyunOperationRows,
-    unresolvedFinancialRows,
     rebuildRequest,
   ] = await Promise.all([
     executor
@@ -1564,6 +1520,7 @@ async function projectObservation(
         and(
           eq(messages.conversationId, input.project.conversationId),
           isNull(messages.deletedAt),
+          gte(messages.sentAt, input.project.currentTaskStartedAt),
         ),
       )
       .orderBy(asc(messages.sequence))
@@ -1575,6 +1532,7 @@ async function projectObservation(
         and(
           eq(siteBuilds.projectId, input.project.id),
           eq(siteBuilds.userId, input.userId),
+          gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
         ),
       )
       .orderBy(desc(siteBuilds.ordinal))
@@ -1586,6 +1544,7 @@ async function projectObservation(
         and(
           eq(siteDeployments.projectId, input.project.id),
           eq(siteDeployments.userId, input.userId),
+          gte(siteDeployments.createdAt, input.project.currentTaskStartedAt),
         ),
       )
       .orderBy(desc(siteDeployments.createdAt))
@@ -1597,6 +1556,7 @@ async function projectObservation(
         and(
           eq(socialPackages.projectId, input.project.id),
           eq(socialPackages.userId, input.userId),
+          gte(socialPackages.createdAt, input.project.currentTaskStartedAt),
         ),
       )
       .orderBy(desc(socialPackages.createdAt))
@@ -1612,6 +1572,10 @@ async function projectObservation(
         and(
           eq(knowledgeBaseSnapshots.userId, input.userId),
           eq(knowledgeBaseSnapshots.status, "active"),
+          gte(
+            knowledgeBaseSnapshots.version,
+            input.project.minimumKnowledgeSnapshotVersion ?? 1,
+          ),
         ),
       )
       .orderBy(desc(knowledgeBaseSnapshots.version))
@@ -1624,6 +1588,10 @@ async function projectObservation(
           eq(websiteStyleSampleBatches.userId, input.userId),
           eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
           eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+          gte(
+            websiteStyleSampleBatches.createdAt,
+            input.project.currentTaskStartedAt,
+          ),
           inArray(websiteStyleSampleBatches.status, ["published", "selected"]),
         ),
       )
@@ -1649,6 +1617,7 @@ async function projectObservation(
         and(
           eq(siteOperations.projectId, input.project.id),
           eq(siteOperations.userId, input.userId),
+          gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
           inArray(siteOperations.kind, [
             "visual_search",
             "site_build",
@@ -1676,54 +1645,18 @@ async function projectObservation(
       .where(eq(workspaceSiteProfiles.userId, input.userId))
       .limit(1),
     executor
-      .select()
-      .from(siteDomainOperations)
-      .where(
-        and(
-          eq(siteDomainOperations.projectId, input.project.id),
-          eq(siteDomainOperations.userId, input.userId),
-        ),
-      )
-      .orderBy(desc(siteDomainOperations.createdAt))
-      .limit(20),
-    executor
-      .select()
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.userId),
-          eq(siteOperations.provider, "aliyun_alidns"),
-          eq(siteOperations.kind, "dns_apply"),
-          inArray(siteOperations.status, ["succeeded", "attention_required"]),
-        ),
-      )
-      .orderBy(desc(siteOperations.createdAt))
-      .limit(20),
-    executor
       .select({ id: siteOperations.id })
       .from(siteOperations)
       .where(
         and(
           eq(siteOperations.projectId, input.project.id),
           eq(siteOperations.userId, input.userId),
-          inArray(siteOperations.provider, ["aliyun_domain", "aliyun_alidns"]),
+          inArray(siteOperations.provider, ["aliyun_esa", "aliyun_alidns"]),
           inArray(siteOperations.status, [
             "queued",
             "running",
             "outcome_unknown",
           ]),
-        ),
-      )
-      .limit(1),
-    executor
-      .select({ id: siteDomainOperations.id })
-      .from(siteDomainOperations)
-      .where(
-        and(
-          eq(siteDomainOperations.projectId, input.project.id),
-          eq(siteDomainOperations.userId, input.userId),
-          isNotNull(siteDomainOperations.activeFinancialKey),
         ),
       )
       .limit(1),
@@ -1835,7 +1768,7 @@ async function projectObservation(
       const projectedContent =
         originalPayload?.reset === true &&
         originalPayload?.unpublishCompleted === true
-          ? "旧官网已下线，官网重置已完成；企业知识库保持不变，可从当前知识库重新开始建站。"
+          ? "旧官网已下线，官网重置已完成；请重新上传并发布知识库后开始全新的建站任务。"
           : row.content;
       return [
         {
@@ -1858,16 +1791,6 @@ async function projectObservation(
       ];
     },
   );
-  const latestDnsPlanRow = dnsOperationRows.find(
-    (row: typeof siteOperations.$inferSelect) =>
-      (row.input as Record<string, unknown> | null)?.dnsIntent === "plan",
-  ) as typeof siteOperations.$inferSelect | undefined;
-  const latestDnsPlanResult = latestDnsPlanRow?.result as
-    | Record<string, unknown>
-    | undefined;
-  const dnsPlanItems = Array.isArray(latestDnsPlanResult?.plan)
-    ? latestDnsPlanResult.plan
-    : [];
   const selectedSampleIds = new Set(
     buildRows
       .filter(
@@ -1949,21 +1872,17 @@ async function projectObservation(
           status:
             connectionRows[0].status === "active"
               ? ("active" as const)
-              : connectionRows[0].status === "unverified"
-                ? ("authorization_required" as const)
-                : connectionRows[0].status === "invalid"
-                  ? ("attention_required" as const)
-                  : ("not_connected" as const),
+              : connectionRows[0].status === "invalid"
+                ? ("attention_required" as const)
+                : ("not_connected" as const),
           verifiedAt: connectionRows[0].verifiedAt?.toISOString() ?? null,
-          canRotate:
-            activeAliyunOperationRows.length === 0 &&
-            unresolvedFinancialRows.length === 0,
+          canDisconnect: activeAliyunOperationRows.length === 0,
         }
       : {
           configured: false,
           status: "not_connected" as const,
           verifiedAt: null,
-          canRotate: true,
+          canDisconnect: true,
         },
     domainState: profileRows[0]
       ? {
@@ -1971,102 +1890,13 @@ async function projectObservation(
           displayDomain:
             profileRows[0].unicodeDisplayDomain ?? profileRows[0].domain,
           revision: profileRows[0].domainRevision,
-          registrar: profileRows[0].registrar,
-          expiresAt: profileRows[0].domainExpiresAt?.toISOString() ?? null,
-          realNameStatus: profileRows[0].domainRealNameStatus,
-          emailStatus: profileRows[0].domainEmailStatus,
-          clientHold: profileRows[0].domainClientHold,
           ownershipStatus: profileRows[0].domainOwnershipStatus,
           dnsStatus: profileRows[0].dnsStatus,
-          autoRenewDesired: profileRows[0].autoRenewDesired,
-          autoRenewObserved: profileRows[0].autoRenewObserved,
           icpStatus: profileRows[0].icpStatus,
           icpDomainRevision: profileRows[0].icpDomainRevision,
           icpVerifiedAt: profileRows[0].icpVerifiedAt?.toISOString() ?? null,
         }
       : null,
-    domainOperations: domainOperationRows.map(
-      (row: typeof siteDomainOperations.$inferSelect) => ({
-        id: row.id,
-        kind: row.kind,
-        domain: row.domainAscii,
-        displayDomain: row.domainUnicode,
-        status: row.status,
-        quoteHash: row.quoteHash,
-        quoteExpiresAt: row.quoteExpiresAt?.toISOString() ?? null,
-        amountMinor: row.amountMinor,
-        currency: row.currency,
-        years: row.years,
-        maskedRegistrantName: row.maskedRegistrantName,
-        searchResult: (() => {
-          const check = (row.providerResult as Record<string, unknown> | null)
-            ?.check as Record<string, unknown> | undefined;
-          return check && typeof check.available === "boolean"
-            ? {
-                available: check.available,
-                premium: check.premium === true,
-                reason:
-                  check.available === false && typeof check.reason === "string"
-                    ? "当前域名暂不可注册，请尝试其他名称。"
-                    : null,
-              }
-            : null;
-        })(),
-        registrantProfiles: (() => {
-          const profiles = (
-            row.providerResult as Record<string, unknown> | null
-          )?.availableRegistrantProfiles;
-          if (!Array.isArray(profiles)) return [];
-          return profiles
-            .filter((item): item is Record<string, unknown> =>
-              Boolean(item && typeof item === "object"),
-            )
-            .map((item) => ({
-              profileId: String(item.profileId ?? ""),
-              holderType: ["individual", "enterprise"].includes(
-                String(item.holderType),
-              )
-                ? (String(item.holderType) as "individual" | "enterprise")
-                : ("unknown" as const),
-              maskedName: String(item.maskedName ?? "***").slice(0, 255),
-              realNameVerified: item.realNameVerified === true,
-              emailVerified: item.emailVerified === true,
-              isDefault: item.isDefault === true,
-            }))
-            .filter((item) => /^\d{1,191}$/u.test(item.profileId))
-            .slice(0, 100);
-        })(),
-        issue: publicSiteOpsDomainIssue(row.errorCode, row.status),
-        createdAt: row.createdAt.toISOString(),
-      }),
-    ),
-    dnsPlan:
-      latestDnsPlanRow && latestDnsPlanResult
-        ? {
-            canApply: latestDnsPlanResult.canApply === true,
-            status:
-              latestDnsPlanRow.status === "succeeded"
-                ? ("succeeded" as const)
-                : ("attention_required" as const),
-            changeCount: dnsPlanItems.filter(
-              (item) =>
-                item &&
-                typeof item === "object" &&
-                !["conflict", "unknown", "verify"].includes(
-                  String((item as Record<string, unknown>).action ?? ""),
-                ),
-            ).length,
-            conflictCount: dnsPlanItems.filter(
-              (item) =>
-                item &&
-                typeof item === "object" &&
-                ["conflict", "unknown"].includes(
-                  String((item as Record<string, unknown>).action ?? ""),
-                ),
-            ).length,
-            createdAt: latestDnsPlanRow.createdAt.toISOString(),
-          }
-        : null,
     project: {
       id: input.project.id,
       conversationId: input.project.conversationId,
@@ -2090,7 +1920,6 @@ async function projectObservation(
       .map((row: typeof knowledgeBaseSnapshots.$inferSelect) => ({
         id: row.id,
         label: `v${row.version} · ${row.sourceFileName}`,
-        archiveSha256: row.archiveHash!,
         sourceProfile: null,
         createdAt: row.createdAt.toISOString(),
         active: row.id === input.project.currentKnowledgeSnapshotId,
@@ -2262,24 +2091,28 @@ function translateAliyunConnectionError(error: unknown): never {
     }
   }
   if (error instanceof AliyunProviderError) {
-    const notFound = error.code === "NOT_FOUND";
-    const invalid = [
-      "INVALID_DOMAIN",
-      "ACCOUNT_ROLE_MISMATCH",
-      "CALLER_ACCOUNT_MISMATCH",
+    const notFound = [
+      "PROJECT_NOT_FOUND",
+      "ALIYUN_CONNECTION_NOT_FOUND",
     ].includes(error.code);
-    const authorizationNeeded =
-      publicSiteOpsDomainIssue(error.code, "attention_required") ===
-      "authorization_needed";
+    const invalid = ["INVALID_DOMAIN", "ALIYUN_DOMAIN_NOT_OWNED"].includes(
+      error.code,
+    );
+    const authorizationNeeded = [
+      "ALIYUN_REAUTHORIZATION_REQUIRED",
+      "ALIYUN_OAUTH_CREDENTIAL_RETIRED",
+    ].includes(error.code);
     throw new SiteOpsServiceError(
       invalid ? "INVALID_INPUT" : notFound ? "NOT_FOUND" : "STATE_CONFLICT",
       error.code === "INVALID_DOMAIN"
         ? "域名格式不正确，请检查后重试。"
-        : notFound
-          ? "当前项目或连接不存在，请刷新后重试。"
-          : authorizationNeeded
-            ? "阿里云授权尚未完成，请重新前往官方页面完成授权。"
-            : "连接或配置暂未完成，请稍后重试或提交授权协助工单。",
+        : error.code === "ALIYUN_DOMAIN_NOT_OWNED"
+          ? "该域名不属于当前阿里云账号，请选择账号内已购买的域名。"
+          : notFound
+            ? "当前项目或连接不存在，请刷新后重试。"
+            : authorizationNeeded
+              ? "阿里云授权已失效，请重新连接后继续。"
+              : error.message,
       invalid ? 400 : notFound ? 404 : 409,
     );
   }
@@ -2317,15 +2150,13 @@ export async function getSiteOpsAliyunConnection(
       status:
         status.status === "active"
           ? ("active" as const)
-          : status.status === "unverified"
-            ? ("authorization_required" as const)
-            : status.status === "invalid"
-              ? ("attention_required" as const)
-              : ("not_connected" as const),
+          : status.status === "invalid"
+            ? ("attention_required" as const)
+            : ("not_connected" as const),
       verifiedAt: status.verifiedAt
         ? new Date(status.verifiedAt).toISOString()
         : null,
-      canRotate: true,
+      canDisconnect: status.canDisconnect,
     };
   } catch (error) {
     translateAliyunConnectionError(error);
@@ -2348,267 +2179,22 @@ export async function beginSiteOpsAliyunOAuth(
   }
 }
 
-export async function getSiteOpsAliyunAuthorizationGuide(
+export async function listSiteOpsAliyunDomains(
   actor: AuthenticatedUser,
   value: unknown,
 ) {
   const input = siteOpsAliyunConnectionInputSchema.parse(value);
   const project = await requireOwnedAliyunProject(actor, input.conversationId);
   try {
-    const [status, broker] = await Promise.all([
-      getAliyunCustomerConnectionStatus({
+    return siteOpsAliyunDomainListSchema.parse(
+      await listAliyunCustomerDomains({
         projectId: project.id,
         userId: actor.id,
       }),
-      getActiveAliyunBrokerCredential(),
-    ]);
-    const available = Boolean(
-      broker &&
-        status.configured &&
-        status.status !== "revoked" &&
-        status.status !== "active",
     );
-    const authorization =
-      available && broker
-        ? await getAliyunCustomerRoleAuthorizationPackage({
-            projectId: project.id,
-            userId: actor.id,
-            trustedPrincipalArn: broker.principalArn,
-          })
-        : null;
-    return {
-      available,
-      consoleUrl: available ? "https://ram.console.aliyun.com/roles" : "",
-      configurationDownloadUrl: available
-        ? `/api/site-ops/aliyun/role-configuration?conversationId=${encodeURIComponent(input.conversationId)}`
-        : "",
-      roleName: authorization?.roleName ?? "",
-      trustPolicyText: authorization
-        ? JSON.stringify(authorization.trustPolicyDocument, null, 2)
-        : "",
-      permissionPolicyText: authorization
-        ? JSON.stringify(authorization.permissionPolicyDocument, null, 2)
-        : "",
-    };
   } catch (error) {
     translateAliyunConnectionError(error);
   }
-}
-
-function logAliyunProvisioningStage(input: {
-  event:
-    | "ros_capability_issue"
-    | "ros_template_fetch"
-    | "role_probe"
-    | "role_verified";
-  projectId?: string | null;
-  connectionId?: string | null;
-  correlationId: string;
-  templateVersion: number;
-  errorCode?: string | null;
-  startedAt: number;
-}) {
-  const buildSha = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
-  console.info("[SiteOps Aliyun] provisioning_stage", {
-    event: input.event,
-    projectId: input.projectId ?? null,
-    connectionId: input.connectionId ?? null,
-    correlationId: input.correlationId,
-    templateVersion: input.templateVersion,
-    errorCode: input.errorCode ?? null,
-    latencyMs: Math.max(0, Date.now() - input.startedAt),
-    releaseSha: /^[a-f0-9]{40}$/u.test(buildSha) ? buildSha : null,
-  });
-}
-
-export async function startSiteOpsAliyunRoleProvisioning(
-  actor: AuthenticatedUser,
-  value: unknown,
-) {
-  const startedAt = Date.now();
-  const input = siteOpsAliyunConnectionInputSchema.parse(value);
-  const project = await requireOwnedAliyunProject(actor, input.conversationId);
-  try {
-    const prepared = await prepareAliyunCustomerRoleProvisioning({
-      projectId: project.id,
-      userId: actor.id,
-    });
-    if (prepared.status === "active") {
-      return { status: "active" as const, connected: true as const };
-    }
-    const [status, broker] = await Promise.all([
-      getAliyunCustomerConnectionStatus({
-        projectId: project.id,
-        userId: actor.id,
-      }),
-      getActiveAliyunBrokerCredential(),
-    ]);
-    if (
-      !broker ||
-      !status.configured ||
-      !status.connectionId ||
-      !status.roleArn ||
-      !status.externalIdFingerprint ||
-      (status.status !== "unverified" && status.status !== "invalid")
-    ) {
-      throw new SiteOpsServiceError(
-        "PROVIDER_NOT_CONFIGURED",
-        "阿里云一键授权配置尚未就绪，请联系 FrontMind。",
-        409,
-      );
-    }
-    const roleName = status.roleArn.split("/").at(-1) ?? "";
-    const issued = issueAliyunRosTemplateCapability({
-      connectionId: status.connectionId,
-      projectId: project.id,
-      userId: actor.id,
-      externalIdFingerprint: status.externalIdFingerprint,
-      roleArnFingerprint: fingerprintAliyunProvisioningValue(status.roleArn),
-      brokerCredentialId: broker.id,
-      brokerCredentialVersion: broker.version,
-      brokerPrincipalFingerprint: fingerprintAliyunProvisioningValue(
-        broker.principalArn,
-      ),
-    });
-    const rosAuthorizationUrl = buildAliyunRosAuthorizationUrl({
-      capability: issued.token,
-      roleName,
-    });
-    logAliyunProvisioningStage({
-      event: "ros_capability_issue",
-      projectId: project.id,
-      connectionId: status.connectionId,
-      correlationId: issued.correlationId,
-      templateVersion: issued.templateVersion,
-      startedAt,
-    });
-    return {
-      status: "ready" as const,
-      connected: false as const,
-      rosAuthorizationUrl,
-      expiresAt: issued.expiresAt,
-      retryAfterMs: 2_000,
-    };
-  } catch (error) {
-    if (error instanceof SiteOpsServiceError) throw error;
-    translateAliyunConnectionError(error);
-  }
-}
-
-export async function probeSiteOpsAliyunRole(
-  actor: AuthenticatedUser,
-  value: unknown,
-) {
-  const startedAt = Date.now();
-  const correlationId = randomUUID();
-  const input = siteOpsAliyunConnectionInputSchema.parse(value);
-  const project = await requireOwnedAliyunProject(actor, input.conversationId);
-  try {
-    const result = await probeAliyunCustomerConnection({
-      projectId: project.id,
-      userId: actor.id,
-    });
-    logAliyunProvisioningStage({
-      event: result.status === "active" ? "role_verified" : "role_probe",
-      projectId: project.id,
-      connectionId: null,
-      correlationId,
-      templateVersion: ALIYUN_ROS_TEMPLATE_VERSION,
-      errorCode: result.status === "active" ? null : result.reason,
-      startedAt,
-    });
-    return result.status === "active"
-      ? { status: "active" as const, connected: true as const }
-      : result;
-  } catch (error) {
-    translateAliyunConnectionError(error);
-  }
-}
-
-function aliyunRosCapabilityBindingMatches(input: {
-  claims: AliyunRosCapabilityClaims;
-  status: Awaited<ReturnType<typeof getAliyunCustomerConnectionStatus>>;
-  broker: Awaited<ReturnType<typeof getActiveAliyunBrokerCredential>>;
-}) {
-  const { broker, claims, status } = input;
-  return Boolean(
-    broker &&
-      status.configured &&
-      status.connectionId &&
-      status.roleArn &&
-      status.externalIdFingerprint &&
-      status.connectionId === claims.connectionId &&
-      (status.status === "unverified" || status.status === "invalid") &&
-      status.externalIdFingerprint === claims.externalIdFingerprint &&
-      fingerprintAliyunProvisioningValue(status.roleArn) ===
-        claims.roleArnFingerprint &&
-      broker.id === claims.brokerCredentialId &&
-      broker.version === claims.brokerCredentialVersion &&
-      fingerprintAliyunProvisioningValue(broker.principalArn) ===
-        claims.brokerPrincipalFingerprint,
-  );
-}
-
-export async function getPublicSiteOpsAliyunRosTemplate(
-  rawCapability: unknown,
-) {
-  const startedAt = Date.now();
-  const capability = z.string().min(40).max(2_048).parse(rawCapability);
-  const claims = readAliyunRosTemplateCapability(capability);
-  const [status, broker] = await Promise.all([
-    getAliyunCustomerConnectionStatus({
-      projectId: claims.projectId,
-      userId: claims.userId,
-    }),
-    getActiveAliyunBrokerCredential(),
-  ]);
-  if (
-    !broker ||
-    !aliyunRosCapabilityBindingMatches({ claims, status, broker })
-  ) {
-    throw new SiteOpsServiceError("NOT_FOUND", "阿里云授权模板不存在。", 404);
-  }
-  const authorization = await getAliyunCustomerRoleAuthorizationPackage({
-    projectId: claims.projectId,
-    userId: claims.userId,
-    trustedPrincipalArn: broker.principalArn,
-  });
-  const [recheckedStatus, recheckedBroker] = await Promise.all([
-    getAliyunCustomerConnectionStatus({
-      projectId: claims.projectId,
-      userId: claims.userId,
-    }),
-    getActiveAliyunBrokerCredential(),
-  ]);
-  const expectedRoleName = recheckedStatus.roleArn?.split("/").at(-1) ?? "";
-  const trustStatement = authorization.trustPolicyDocument.Statement[0];
-  const authorizationExternalId =
-    trustStatement?.Condition.StringEquals["sts:ExternalId"] ?? "";
-  const authorizationPrincipal = trustStatement?.Principal.RAM[0] ?? "";
-  if (
-    !aliyunRosCapabilityBindingMatches({
-      claims,
-      status: recheckedStatus,
-      broker: recheckedBroker,
-    }) ||
-    authorization.roleName !== expectedRoleName ||
-    fingerprintAliyunProvisioningValue(authorizationExternalId).slice(0, 32) !==
-      claims.externalIdFingerprint ||
-    fingerprintAliyunProvisioningValue(authorizationPrincipal) !==
-      claims.brokerPrincipalFingerprint
-  ) {
-    throw new SiteOpsServiceError("NOT_FOUND", "阿里云授权模板不存在。", 404);
-  }
-  const template = buildAliyunRosRoleTemplate(authorization);
-  logAliyunProvisioningStage({
-    event: "ros_template_fetch",
-    projectId: claims.projectId,
-    connectionId: claims.connectionId,
-    correlationId: claims.correlationId,
-    templateVersion: claims.templateVersion,
-    startedAt,
-  });
-  return template;
 }
 
 export async function completeSiteOpsAliyunOAuth(input: {
@@ -2616,120 +2202,22 @@ export async function completeSiteOpsAliyunOAuth(input: {
   credentialId: string;
   projectId: string;
   accountUid: string;
+  refreshToken: string;
 }) {
   assertEnabled();
   assertCustomer(input.actor);
   await requireSiteOpsEntitlement(input.actor.id);
-  const db = await requireDb();
   const credentialId = z.string().uuid().parse(input.credentialId);
   const projectId = z.string().uuid().parse(input.projectId);
   try {
-    await db.transaction(async (tx) => {
-      const projectRows = await tx
-        .select({ id: siteProjects.id })
-        .from(siteProjects)
-        .where(
-          and(
-            eq(siteProjects.id, projectId),
-            eq(siteProjects.userId, input.actor.id),
-          ),
-        )
-        .limit(1)
-        .for("update");
-      if (!projectRows[0]) {
-        throw new SiteOpsServiceError(
-          "NOT_FOUND",
-          `${SITEOPS_CUSTOMER_DISPLAY_NAME}项目不存在。`,
-          404,
-        );
-      }
-
-      const credentialRows = await tx
-        .select({ id: presalesApiCredentials.id })
-        .from(presalesApiCredentials)
-        .where(
-          and(
-            eq(presalesApiCredentials.id, credentialId),
-            eq(presalesApiCredentials.slot, ALIYUN_OAUTH_CREDENTIAL_SLOT),
-            eq(presalesApiCredentials.status, "active"),
-          ),
-        )
-        .limit(1)
-        .for("update");
-      if (!credentialRows[0]) {
-        throw new SiteOpsServiceError(
-          "CREDENTIAL_ROTATED",
-          "阿里云 OAuth 配置已在授权期间更新，请重新发起连接。",
-          409,
-        );
-      }
-
-      const now = new Date();
-      await tx
-        .update(presalesApiCredentials)
-        .set({
-          validationStatus: "verified",
-          verifiedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(presalesApiCredentials.id, credentialId),
-            eq(presalesApiCredentials.slot, ALIYUN_OAUTH_CREDENTIAL_SLOT),
-            eq(presalesApiCredentials.status, "active"),
-          ),
-        );
-      await bindAliyunCustomerAccountFromOAuth(
-        {
-          projectId,
-          userId: input.actor.id,
-          accountUid: input.accountUid,
-        },
-        tx,
-      );
+    await bindAliyunCustomerAccountFromOAuth({
+      projectId,
+      userId: input.actor.id,
+      credentialId,
+      accountUid: input.accountUid,
+      refreshToken: input.refreshToken,
     });
-    return { connected: false as const, authorizationRequired: true as const };
-  } catch (error) {
-    translateAliyunConnectionError(error);
-  }
-}
-
-export async function getSiteOpsAliyunRoleConfiguration(
-  actor: AuthenticatedUser,
-  conversationId: string,
-) {
-  const project = await requireOwnedAliyunProject(actor, conversationId);
-  const broker = await getActiveAliyunBrokerCredential();
-  if (!broker) {
-    throw new SiteOpsServiceError(
-      "PROVIDER_NOT_CONFIGURED",
-      "域名与发布平台尚未配置完成。",
-      409,
-    );
-  }
-  try {
-    return await getAliyunCustomerRoleAuthorizationPackage({
-      projectId: project.id,
-      userId: actor.id,
-      trustedPrincipalArn: broker.principalArn,
-    });
-  } catch (error) {
-    translateAliyunConnectionError(error);
-  }
-}
-
-export async function verifySiteOpsAliyunConnection(
-  actor: AuthenticatedUser,
-  value: unknown,
-) {
-  const input = siteOpsAliyunConnectionInputSchema.parse(value);
-  const project = await requireOwnedAliyunProject(actor, input.conversationId);
-  try {
-    await verifyAliyunCustomerConnection({
-      projectId: project.id,
-      userId: actor.id,
-    });
-    return { ok: true as const, connected: true as const };
+    return { connected: true as const };
   } catch (error) {
     translateAliyunConnectionError(error);
   }
@@ -2796,6 +2284,7 @@ export async function sendSiteOpsMessage(
         and(
           eq(siteOperations.projectId, project.id),
           eq(siteOperations.clientRequestId, input.clientRequestId),
+          gte(siteOperations.createdAt, project.currentTaskStartedAt),
         ),
       )
       .limit(1);
@@ -2922,13 +2411,6 @@ export function parseSiteOpsActionPayload(
   raw: unknown,
 ) {
   switch (action) {
-    case "reset_workflow":
-    case "resume_build":
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，可从当前企业知识库重新开始建站。",
-        409,
-      );
     case "request_rebuild":
       return z
         .object({ reason: z.string().trim().max(4_000).optional() })
@@ -2939,11 +2421,8 @@ export function parseSiteOpsActionPayload(
         .object({ knowledgeSnapshotId: uuidSchema.optional() })
         .strict()
         .parse(raw);
-    case "change_snapshot":
-      return z.object({ knowledgeSnapshotId: uuidSchema }).strict().parse(raw);
     case "start_visual_search":
     case "reselect_visual":
-    case "dns_plan":
       return z.object({}).strict().parse(raw);
     case "select_visual":
       return z.object({ sampleId: uuidSchema }).strict().parse(raw);
@@ -2983,122 +2462,10 @@ export function parseSiteOpsActionPayload(
         .object({ topic: z.string().trim().min(1).max(500).optional() })
         .strict()
         .parse(raw);
-    case "domain_search":
-      return normalizeSiteOpsDomain(
-        z.object({ domain: domainSchema }).strict().parse(raw).domain,
-      );
     case "domain_sync": {
-      const parsed = z
-        .object({
-          domain: domainSchema,
-          typedDomain: domainSchema,
-          customerConfirmed: z.literal(true),
-        })
-        .strict()
-        .parse(raw);
-      const domain = normalizeSiteOpsDomain(parsed.domain);
-      const typed = normalizeSiteOpsDomain(parsed.typedDomain);
-      if (domain.domain !== typed.domain) {
-        throw new SiteOpsServiceError(
-          "INVALID_INPUT",
-          "必须完整输入并确认要接入的已有域名。",
-          400,
-        );
-      }
-      return {
-        ...domain,
-        typedDomain: typed.domain,
-        customerConfirmed: true as const,
-      };
+      const parsed = z.object({ domain: domainSchema }).strict().parse(raw);
+      return normalizeSiteOpsDomain(parsed.domain);
     }
-    case "domain_prepare_purchase": {
-      const parsed = z
-        .object({
-          domain: domainSchema,
-          years: z.number().int().min(1).max(10),
-          registrantProfileId: z
-            .string()
-            .trim()
-            .regex(/^\d{1,191}$/)
-            .optional(),
-        })
-        .strict()
-        .parse(raw);
-      return {
-        ...normalizeSiteOpsDomain(parsed.domain),
-        years: parsed.years,
-        ...(parsed.registrantProfileId
-          ? { registrantProfileId: parsed.registrantProfileId }
-          : {}),
-      };
-    }
-    case "domain_prepare_renewal": {
-      const parsed = z
-        .object({
-          domain: domainSchema,
-          years: z.number().int().min(1).max(10),
-        })
-        .strict()
-        .parse(raw);
-      return { ...normalizeSiteOpsDomain(parsed.domain), years: parsed.years };
-    }
-    case "domain_confirm_purchase":
-    case "domain_confirm_renewal": {
-      const parsed = z
-        .object({
-          domain: domainSchema,
-          typedDomain: domainSchema,
-          quoteHash: z.string().regex(/^[a-f0-9]{64}$/),
-          domainOperationId: uuidSchema,
-        })
-        .strict()
-        .parse(raw);
-      const domain = normalizeSiteOpsDomain(parsed.domain);
-      const typed = normalizeSiteOpsDomain(parsed.typedDomain);
-      if (domain.domain !== typed.domain) {
-        throw new SiteOpsServiceError(
-          "INVALID_INPUT",
-          "必须完整输入所确认的域名。",
-          400,
-        );
-      }
-      return {
-        ...domain,
-        typedDomain: typed.domain,
-        quoteHash: parsed.quoteHash,
-        domainOperationId: parsed.domainOperationId,
-      };
-    }
-    case "domain_set_auto_renew": {
-      const parsed = z
-        .object({
-          domain: domainSchema,
-          enabled: z.boolean(),
-          customerConfirmed: z.literal(true),
-        })
-        .strict()
-        .parse(raw);
-      return {
-        ...normalizeSiteOpsDomain(parsed.domain),
-        enabled: parsed.enabled,
-        customerConfirmed: parsed.customerConfirmed,
-      };
-    }
-    case "dns_apply":
-      return z
-        .object({
-          domainRevision: z.number().int().positive(),
-          planOperationId: uuidSchema,
-          planHash: z.string().regex(/^[a-f0-9]{64}$/),
-          providerSnapshotHash: z.string().regex(/^[a-f0-9]{64}$/),
-        })
-        .strict()
-        .parse(raw);
-    case "dns_rollback":
-      return z
-        .object({ domainRevision: z.number().int().positive() })
-        .strict()
-        .parse(raw);
   }
 }
 
@@ -3428,7 +2795,7 @@ async function handleRequestRebuild(
       ? "官网重制需求已再次提交。当前制作流程暂不受影响，FrontMind 通过后会重新开启全新流程。"
       : "官网重制需求已提交。当前制作流程暂不受影响，FrontMind 通过后会重新开启全新流程。",
     siteOps: {
-      kind: "operation_recovery",
+      kind: "build_progress",
       subjectId: created.ticketId,
       revision: input.project.revision,
       status: "resolved",
@@ -3554,6 +2921,10 @@ async function handleSelectSnapshot(
       and(
         eq(knowledgeBaseSnapshots.userId, input.actor.id),
         eq(knowledgeBaseSnapshots.status, "active"),
+        gte(
+          knowledgeBaseSnapshots.version,
+          input.project.minimumKnowledgeSnapshotVersion ?? 1,
+        ),
       ),
     )
     .orderBy(
@@ -3571,7 +2942,9 @@ async function handleSelectSnapshot(
   if (!snapshot) {
     throw new SiteOpsServiceError(
       "NOT_FOUND",
-      "当前账号还没有可用于建站的已发布知识库，请先完成知识库后重试。",
+      input.project.minimumKnowledgeSnapshotVersion
+        ? "官网重置后必须重新上传并发布一份新知识库，请完成后再开始建站。"
+        : "当前账号还没有可用于建站的已发布知识库，请先完成知识库后重试。",
       404,
     );
   }
@@ -3634,166 +3007,6 @@ async function handleSelectSnapshot(
     .where(eq(siteProjects.id, input.project.id));
 }
 
-async function handleChangeSnapshot(
-  tx: any,
-  input: {
-    actor: AuthenticatedUser;
-    project: typeof siteProjects.$inferSelect;
-    turnId: string;
-    requestId: string;
-    requestHash: string;
-    payload: { knowledgeSnapshotId: string };
-  },
-) {
-  if (!input.project.currentKnowledgeSnapshotId) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      "首次选择知识库请使用当前的知识库选择入口。",
-      409,
-    );
-  }
-  if (input.project.currentBuildId) {
-    const rebuild = await loadSiteOpsRebuildRequest(tx, {
-      userId: input.actor.id,
-      projectId: input.project.id,
-      currentBuildId: input.project.currentBuildId,
-    });
-    requireAcceptedSiteOpsRebuild(rebuild);
-  }
-  const activeBuildRows = await tx
-    .select({ id: siteBuilds.id })
-    .from(siteBuilds)
-    .where(
-      and(
-        eq(siteBuilds.projectId, input.project.id),
-        inArray(siteBuilds.status, NONTERMINAL_BUILD_STATUSES),
-      ),
-    )
-    .limit(1)
-    .for("update");
-  const activeDeploymentRows = await tx
-    .select({ id: siteDeployments.id })
-    .from(siteDeployments)
-    .where(
-      and(
-        eq(siteDeployments.projectId, input.project.id),
-        inArray(siteDeployments.status, IN_FLIGHT_DEPLOYMENT_STATUSES),
-      ),
-    )
-    .limit(1)
-    .for("update");
-  const activeVisualRows = await tx
-    .select({ id: siteOperations.id })
-    .from(siteOperations)
-    .where(
-      and(
-        eq(siteOperations.projectId, input.project.id),
-        eq(siteOperations.kind, "visual_search"),
-        inArray(siteOperations.status, [
-          "queued",
-          "running",
-          "outcome_unknown",
-        ]),
-      ),
-    )
-    .limit(1);
-  assertSiteOpsSnapshotChangeState({
-    sameSnapshot:
-      input.project.currentKnowledgeSnapshotId ===
-      input.payload.knowledgeSnapshotId,
-    activeBuild: activeBuildRows.length > 0,
-    activeDeployment: activeDeploymentRows.length > 0,
-    activeVisualSearch: activeVisualRows.length > 0,
-  });
-  const snapshotRows = await tx
-    .select()
-    .from(knowledgeBaseSnapshots)
-    .where(
-      and(
-        eq(knowledgeBaseSnapshots.id, input.payload.knowledgeSnapshotId),
-        eq(knowledgeBaseSnapshots.userId, input.actor.id),
-        eq(knowledgeBaseSnapshots.status, "active"),
-      ),
-    )
-    .limit(1);
-  const snapshot = snapshotRows[0];
-  if (!snapshot?.archiveHash) {
-    throw new SiteOpsServiceError(
-      "NOT_FOUND",
-      "所选知识库 ZIP 版本不存在、已归档或缺少已验证哈希。",
-      404,
-    );
-  }
-  const brief = siteBriefFromSnapshot(snapshot);
-  await reserveOperation(tx, {
-    actor: input.actor,
-    project: input.project,
-    turnId: input.turnId,
-    clientRequestId: input.requestId,
-    requestHash: input.requestHash,
-    payload: {
-      ...input.payload,
-      previousKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-      parentBuildId: input.project.currentBuildId,
-    },
-    kind: "brief_message",
-    status: "succeeded",
-  });
-  // A completed but unselected board belongs to the previous snapshot and may
-  // no longer be acted upon. Selected batches remain historical provenance for
-  // their immutable builds.
-  await tx
-    .update(websiteStyleSampleBatches)
-    .set({ status: "superseded", updatedAt: new Date() })
-    .where(
-      and(
-        eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
-        eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
-        eq(websiteStyleSampleBatches.status, "published"),
-      ),
-    );
-  await appendMessage(tx, {
-    conversationId: input.project.conversationId,
-    userId: input.actor.id,
-    role: "user",
-    turnId: input.turnId,
-    content: `已将知识源更换为知识库 ZIP v${snapshot.version}。`,
-  });
-  await appendMessage(tx, {
-    conversationId: input.project.conversationId,
-    userId: input.actor.id,
-    role: "assistant",
-    turnId: input.turnId,
-    content: "已更换知识库并重新整理建站资料。旧官网和线上网站保持不变。",
-    siteOps: {
-      kind: "brief_question",
-      subjectId: input.project.id,
-      revision: input.project.revision + 1,
-      status: "active",
-      payload: {
-        knowledgeSnapshotId: snapshot.id,
-        previousKnowledgeSnapshotId: input.project.currentKnowledgeSnapshotId,
-      },
-    },
-  });
-  await tx
-    .update(siteProjects)
-    .set({
-      currentKnowledgeSnapshotId: snapshot.id,
-      brief,
-      primaryLanguage: brief.primaryLanguage,
-      status: "collecting_brief",
-      revision: input.project.revision + 1,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(siteProjects.id, input.project.id),
-        eq(siteProjects.revision, input.project.revision),
-      ),
-    );
-}
-
 export function visualSearchAllowedForProjectStatus(
   status: string,
   reselect = false,
@@ -3824,14 +3037,6 @@ async function handleVisualSearch(
     reselect?: boolean;
   },
 ) {
-  if (input.project.currentBuildId) {
-    const rebuild = await loadSiteOpsRebuildRequest(tx, {
-      userId: input.actor.id,
-      projectId: input.project.id,
-      currentBuildId: input.project.currentBuildId,
-    });
-    requireAcceptedSiteOpsRebuild(rebuild);
-  }
   if (
     !visualSearchAllowedForProjectStatus(input.project.status, input.reselect)
   ) {
@@ -3859,6 +3064,10 @@ async function handleVisualSearch(
         eq(websiteStyleSampleBatches.userId, input.actor.id),
         eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
         eq(websiteStyleSampleBatches.status, "published"),
+        gte(
+          websiteStyleSampleBatches.createdAt,
+          input.project.currentTaskStartedAt,
+        ),
       ),
     )
     .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
@@ -3871,6 +3080,7 @@ async function handleVisualSearch(
         eq(siteOperations.projectId, input.project.id),
         eq(siteOperations.userId, input.actor.id),
         eq(siteOperations.kind, "visual_search"),
+        gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
         inArray(siteOperations.status, [
           "queued",
           "running",
@@ -4020,6 +3230,7 @@ async function selectVisualSample(
       and(
         eq(siteBuilds.projectId, input.project.id),
         eq(siteBuilds.userId, input.actor.id),
+        gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
         notInArray(siteBuilds.status, ["cancelled", "superseded"]),
       ),
     )
@@ -4047,6 +3258,7 @@ async function selectVisualSample(
         eq(siteOperations.projectId, input.project.id),
         eq(siteOperations.userId, input.actor.id),
         eq(siteOperations.kind, "visual_search"),
+        gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
         inArray(siteOperations.status, [
           "queued",
           "running",
@@ -4072,6 +3284,7 @@ async function selectVisualSample(
           eq(siteOperations.projectId, input.project.id),
           eq(siteOperations.userId, input.actor.id),
           eq(siteOperations.kind, "visual_search"),
+          gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
         ),
       )
       .orderBy(desc(siteOperations.createdAt))
@@ -4086,6 +3299,10 @@ async function selectVisualSample(
           eq(websiteStyleSampleBatches.userId, input.actor.id),
           eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
           eq(websiteStyleSampleBatches.status, "published"),
+          gte(
+            websiteStyleSampleBatches.createdAt,
+            input.project.currentTaskStartedAt,
+          ),
         ),
       )
       .limit(SITEOPS_VISUAL_CANDIDATE_MAX_PAGES)
@@ -4152,6 +3369,10 @@ async function selectVisualSample(
         eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
         eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
         eq(websiteStyleSampleBatches.status, "published"),
+        gte(
+          websiteStyleSampleBatches.createdAt,
+          input.project.currentTaskStartedAt,
+        ),
       ),
     );
   if (
@@ -4331,7 +3552,11 @@ async function selectVisualSample(
     buildId,
     provider: "manus",
   });
-  if (parentBuildId === null && input.rebuildRequest.resetApplied) {
+  if (
+    parentBuildId === null &&
+    input.rebuildRequest.resetApplied &&
+    input.project.minimumKnowledgeSnapshotVersion !== null
+  ) {
     const release = process.env.FRONTMIND_BUILD_SHA?.trim() ?? "";
     console.info("[siteops] fresh_root_created", {
       event: "siteops_fresh_root_created",
@@ -4396,6 +3621,7 @@ async function handleApproveBuild(
         eq(siteBuilds.id, input.payload.buildId),
         eq(siteBuilds.projectId, input.project.id),
         eq(siteBuilds.userId, input.actor.id),
+        gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
       ),
     )
     .limit(1)
@@ -4464,6 +3690,7 @@ async function handleRevision(
         eq(siteBuilds.id, input.payload.buildId),
         eq(siteBuilds.projectId, input.project.id),
         eq(siteBuilds.userId, input.actor.id),
+        gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
       ),
     )
     .limit(1)
@@ -4488,12 +3715,6 @@ async function handleRevision(
       409,
     );
   }
-  const rebuild = await loadSiteOpsRebuildRequest(tx, {
-    userId: input.actor.id,
-    projectId: input.project.id,
-    currentBuildId: parent.id,
-  });
-  requireAcceptedSiteOpsRebuild(rebuild);
   const styleRows = await tx
     .select({ sample: websiteStyleSamples })
     .from(websiteStyleSamples)
@@ -4507,6 +3728,10 @@ async function handleRevision(
         eq(websiteStyleSampleBatches.siteProjectId, input.project.id),
         eq(websiteStyleSampleBatches.userId, input.actor.id),
         eq(websiteStyleSampleBatches.sourceKind, "siteops_21st"),
+        gte(
+          websiteStyleSampleBatches.createdAt,
+          input.project.currentTaskStartedAt,
+        ),
       ),
     )
     .limit(1);
@@ -4545,6 +3770,7 @@ async function handleRevision(
         eq(siteOperations.projectId, input.project.id),
         eq(siteOperations.userId, input.actor.id),
         eq(siteOperations.buildId, parent.id),
+        gte(siteOperations.createdAt, input.project.currentTaskStartedAt),
         inArray(siteOperations.kind, ["site_build", "build_revision"]),
       ),
     )
@@ -4668,6 +3894,7 @@ async function handlePublish(
           eq(siteBuilds.id, input.payload.buildId),
           eq(siteBuilds.projectId, input.project.id),
           eq(siteBuilds.userId, input.actor.id),
+          gte(siteBuilds.createdAt, input.project.currentTaskStartedAt),
         ),
       )
       .limit(1),
@@ -4796,6 +4023,7 @@ async function handleRollback(
         eq(siteDeployments.id, input.payload.deploymentId),
         eq(siteDeployments.projectId, input.project.id),
         eq(siteDeployments.userId, input.actor.id),
+        gte(siteDeployments.createdAt, input.project.currentTaskStartedAt),
         inArray(siteDeployments.status, ["active", "superseded"]),
       ),
     )
@@ -5003,25 +4231,24 @@ async function requireAliyunConnection(tx: any, projectId: string) {
   if (!rows[0]) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      "阿里云授权尚未完成，请按页面指引完成授权。",
+      "请先一键连接阿里云账号。",
       412,
     );
   }
   if (
     process.env.FRONTMIND_ALIYUN_DOMAIN_ENABLED?.trim() !== "1" ||
-    (!siteOpsProviderConfigured("aliyun_domain") &&
-      !siteOpsProviderConfigured("aliyun_alidns"))
+    !siteOpsProviderConfigured("aliyun_alidns")
   ) {
     throw new SiteOpsServiceError(
       "PROVIDER_NOT_CONFIGURED",
-      "域名服务尚未配置完成，请联系 FrontMind。",
+      "域名解析服务尚未配置完成，请联系 FrontMind。",
       412,
     );
   }
   return rows[0];
 }
 
-async function handleProviderOperation(
+async function handleDomainSync(
   tx: any,
   input: {
     actor: AuthenticatedUser;
@@ -5029,274 +4256,82 @@ async function handleProviderOperation(
     turnId: string;
     requestId: string;
     requestHash: string;
-    action: SiteOpsActInput["action"];
-    payload: Record<string, unknown>;
+    payload: { domain: string; domainUnicode: string };
   },
 ) {
   const connection = await requireAliyunConnection(tx, input.project.id);
-  let esaDnsPreparation: {
-    prepareDomainBinding: true;
-    domain: string;
-    domainRevision: number;
-  } | null = null;
-  if (input.action === "dns_plan") {
-    const profiles = await tx
-      .select()
+  const [activeRows, profileRows, dnsEvidence] = await Promise.all([
+    tx
+      .select({ id: siteOperations.id })
+      .from(siteOperations)
+      .where(
+        and(
+          eq(siteOperations.projectId, input.project.id),
+          eq(siteOperations.userId, input.actor.id),
+          inArray(siteOperations.provider, ["aliyun_alidns", "aliyun_esa"]),
+          inArray(siteOperations.status, [
+            "queued",
+            "running",
+            "outcome_unknown",
+          ]),
+        ),
+      )
+      .limit(1),
+    tx
+      .select({
+        domain: workspaceSiteProfiles.domain,
+        normalizedAsciiDomain: workspaceSiteProfiles.normalizedAsciiDomain,
+        providerAccountUid: workspaceSiteProfiles.providerAccountUid,
+        domainOwnershipStatus: workspaceSiteProfiles.domainOwnershipStatus,
+        dnsStatus: workspaceSiteProfiles.dnsStatus,
+      })
       .from(workspaceSiteProfiles)
       .where(eq(workspaceSiteProfiles.userId, input.actor.id))
-      .limit(1);
-    const profile = profiles[0];
-    if (
-      !profile?.normalizedAsciiDomain ||
-      profile.domainStatus !== "completed" ||
-      profile.domainOwnershipStatus !== "verified"
-    ) {
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "请先完成当前域名版本的购买或所有权验证。",
-        409,
-      );
-    }
-    const cnameRows = await tx
+      .limit(1),
+    tx
       .select({ id: siteDnsRecords.id })
       .from(siteDnsRecords)
       .where(
         and(
           eq(siteDnsRecords.projectId, input.project.id),
           eq(siteDnsRecords.userId, input.actor.id),
-          eq(siteDnsRecords.domainRevision, profile.domainRevision),
-          eq(siteDnsRecords.recordType, "CNAME"),
         ),
       )
-      .limit(1);
-    if (cnameRows.length === 0) {
-      requireEsaRuntimeConfigured();
-      esaDnsPreparation = {
-        prepareDomainBinding: true,
-        domain: profile.normalizedAsciiDomain,
-        domainRevision: profile.domainRevision,
-      };
-    }
-  }
-  let referencedQuote: typeof siteDomainOperations.$inferSelect | null = null;
-  let renewalTarget: {
-    expectedCanonicalHostname: string;
-    expectedDomainRevision: number;
-  } | null = null;
-  if (
-    input.action === "domain_confirm_purchase" ||
-    input.action === "domain_confirm_renewal"
-  ) {
-    const referenceId = String(input.payload.domainOperationId ?? "");
-    const references = await tx
-      .select()
-      .from(siteDomainOperations)
-      .where(
-        and(
-          eq(siteDomainOperations.id, referenceId),
-          eq(siteDomainOperations.projectId, input.project.id),
-          eq(siteDomainOperations.userId, input.actor.id),
-          eq(siteDomainOperations.connectionId, connection.id),
-        ),
-      )
-      .limit(1);
-    referencedQuote = references[0] ?? null;
-    const referencedQuotePayload = (
-      referencedQuote?.providerResult as Record<string, unknown> | null
-    )?.quote as Record<string, unknown> | undefined;
-    const expectedKind =
-      input.action === "domain_confirm_purchase" ? "purchase" : "renewal";
-    if (
-      !referencedQuote ||
-      referencedQuote.kind !== expectedKind ||
-      !(
-        ["quoted", "succeeded"].includes(referencedQuote.status) ||
-        (referencedQuote.status === "attention_required" &&
-          referencedQuote.errorCode === "QUOTE_CHANGED")
-      ) ||
-      referencedQuote.domainAscii !== input.payload.domain ||
-      referencedQuote.quoteHash !== input.payload.quoteHash ||
-      referencedQuotePayload?.quoteHash !== input.payload.quoteHash ||
-      referencedQuotePayload?.domain !== input.payload.domain ||
-      referencedQuotePayload?.accountUid !== connection.accountUid ||
-      !referencedQuote.quoteExpiresAt ||
-      referencedQuote.quoteExpiresAt.getTime() <= Date.now()
-    ) {
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "该精确报价不存在、已过期或已变化，请重新获取报价后确认。",
-        409,
-      );
-    }
-    if (input.action === "domain_confirm_renewal") {
-      const profileRows = await tx
-        .select({
-          domain: workspaceSiteProfiles.normalizedAsciiDomain,
-          revision: workspaceSiteProfiles.domainRevision,
-        })
-        .from(workspaceSiteProfiles)
-        .where(eq(workspaceSiteProfiles.userId, input.actor.id))
-        .limit(1)
-        .for("update");
-      const profile = profileRows[0];
-      if (!profile?.domain || profile.domain !== input.payload.domain) {
-        throw new SiteOpsServiceError(
-          "STATE_CONFLICT",
-          "当前官网域名已经变化，请重新获取续费报价。",
-          409,
-        );
-      }
-      renewalTarget = {
-        expectedCanonicalHostname: profile.domain,
-        expectedDomainRevision: profile.revision,
-      };
-    }
-  }
-  if (input.action === "domain_set_auto_renew") {
-    const profileRows = await tx
-      .select({
-        domain: workspaceSiteProfiles.normalizedAsciiDomain,
-        revision: workspaceSiteProfiles.domainRevision,
-      })
-      .from(workspaceSiteProfiles)
-      .where(eq(workspaceSiteProfiles.userId, input.actor.id))
-      .limit(1)
-      .for("update");
-    const profile = profileRows[0];
-    if (!profile?.domain || profile.domain !== input.payload.domain) {
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "当前官网域名已经变化，请刷新后重新确认自动续费设置。",
-        409,
-      );
-    }
-    renewalTarget = {
-      expectedCanonicalHostname: profile.domain,
-      expectedDomainRevision: profile.revision,
-    };
-  }
-  if (input.action === "dns_apply") {
-    const planOperationId = String(input.payload.planOperationId ?? "");
-    const planRows = await tx
-      .select()
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.id, planOperationId),
-          eq(siteOperations.projectId, input.project.id),
-          eq(siteOperations.userId, input.actor.id),
-          eq(siteOperations.kind, "dns_apply"),
-          eq(siteOperations.provider, "aliyun_alidns"),
-          eq(siteOperations.status, "succeeded"),
-        ),
-      )
-      .limit(1);
-    const planOperation = planRows[0];
-    const planInput = planOperation?.input as
-      | Record<string, unknown>
-      | undefined;
-    const planResult = planOperation?.result as
-      | Record<string, unknown>
-      | undefined;
-    const currentProfiles = await tx
-      .select({
-        domain: workspaceSiteProfiles.normalizedAsciiDomain,
-        revision: workspaceSiteProfiles.domainRevision,
-      })
-      .from(workspaceSiteProfiles)
-      .where(eq(workspaceSiteProfiles.userId, input.actor.id))
-      .limit(1);
-    const currentProfile = currentProfiles[0];
-    if (
-      !planOperation ||
-      planInput?.dnsIntent !== "plan" ||
-      planInput.connectionId !== connection.id ||
-      planResult?.canApply !== true ||
-      planResult?.revision !== input.payload.domainRevision ||
-      currentProfile?.revision !== input.payload.domainRevision ||
-      currentProfile?.domain !== planResult?.domain ||
-      planResult?.planHash !== input.payload.planHash ||
-      planResult?.providerSnapshotHash !== input.payload.providerSnapshotHash
-    ) {
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "当前域名配置已变化，请重新获取配置方案。",
-        409,
-      );
-    }
-  }
-  const kind = input.action.startsWith("dns_")
-    ? input.action === "dns_rollback"
-      ? "dns_rollback"
-      : "dns_apply"
-    : input.action.includes("purchase")
-      ? "domain_purchase"
-      : input.action.includes("renewal")
-        ? "domain_renewal"
-        : input.action.includes("auto_renew")
-          ? "domain_auto_renew"
-          : "domain_search";
-  const financialIntentKind =
-    input.action === "domain_confirm_purchase"
-      ? ("purchase" as const)
-      : input.action === "domain_confirm_renewal"
-        ? ("renewal" as const)
-        : null;
-  const activeFinancialKey = financialIntentKind
-    ? siteOpsActiveFinancialIntentKey({
-        projectId: input.project.id,
-        accountUid: connection.accountUid,
-        domain: String(input.payload.domain ?? ""),
-        kind: financialIntentKind,
-      })
-    : null;
-  if (activeFinancialKey) {
-    const activeRows = await tx
-      .select({ id: siteDomainOperations.id })
-      .from(siteDomainOperations)
-      .where(eq(siteDomainOperations.activeFinancialKey, activeFinancialKey))
-      .limit(1);
-    if (activeRows.length > 0) {
-      throw new SiteOpsServiceError(
-        "STATE_CONFLICT",
-        "该客户账号与域名已有同类型财务操作正在提交或对账，请等待其得到确定结果。",
-        409,
-      );
-    }
-  }
-  const domainLedgerId = input.action.startsWith("dns_") ? null : randomUUID();
-  const brokerCredential = esaDnsPreparation
-    ? null
-    : await getActiveAliyunBrokerCredential();
-  if (!esaDnsPreparation && !brokerCredential) {
+      .limit(1),
+  ]);
+  if (activeRows.length > 0) {
     throw new SiteOpsServiceError(
-      "PROVIDER_NOT_CONFIGURED",
-      "域名与发布平台尚未配置完成，未提交任何域名或解析操作。",
-      412,
+      "STATE_CONFLICT",
+      "当前域名正在自动接入或等待解析确认，请稍后刷新。",
+      409,
+    );
+  }
+  const profile = profileRows[0];
+  const sameDomain =
+    profile?.normalizedAsciiDomain === input.payload.domain &&
+    profile?.providerAccountUid === connection.accountUid;
+  const hasExistingDomainState = Boolean(
+    profile?.domain ||
+      profile?.normalizedAsciiDomain ||
+      profile?.providerAccountUid ||
+      profile?.domainOwnershipStatus ||
+      profile?.dnsStatus ||
+      input.project.canonicalHostname ||
+      input.project.globalLiveDeploymentId ||
+      input.project.mainlandLiveDeploymentId ||
+      dnsEvidence.length > 0,
+  );
+  if (!sameDomain && hasExistingDomainState) {
+    throw new SiteOpsServiceError(
+      "STATE_CONFLICT",
+      "当前项目已接入其他域名，请先申请重置并完成安全下线。",
+      409,
     );
   }
   const providerPayload = {
-    ...(esaDnsPreparation ?? input.payload),
     connectionId: connection.id,
-    ...(brokerCredential
-      ? {
-          brokerCredentialId: brokerCredential.id,
-          brokerCredentialVersion: brokerCredential.version,
-        }
-      : {}),
-    ...(input.action === "domain_sync" ? { domainIntent: "sync" } : {}),
-    ...(!esaDnsPreparation && input.action.startsWith("dns_")
-      ? {
-          dnsIntent:
-            input.action === "dns_plan"
-              ? "plan"
-              : input.action === "dns_rollback"
-                ? "rollback"
-                : "apply",
-        }
-      : {}),
-    ...(domainLedgerId ? { domainLedgerId } : {}),
-    ...(renewalTarget ?? {}),
+    domainIntent: "sync" as const,
+    domain: input.payload.domain,
   };
   const operationId = await reserveOperation(tx, {
     actor: input.actor,
@@ -5305,83 +4340,26 @@ async function handleProviderOperation(
     clientRequestId: input.requestId,
     requestHash: input.requestHash,
     payload: providerPayload,
-    kind,
-    provider: esaDnsPreparation
-      ? "aliyun_esa"
-      : input.action.startsWith("dns_")
-        ? "aliyun_alidns"
-        : "aliyun_domain",
+    kind: "domain_sync",
+    provider: "aliyun_alidns",
   });
-  if (!input.action.startsWith("dns_")) {
-    const domain = String(input.payload.domain ?? "").toLowerCase();
-    const domainKind = input.action.includes("purchase")
-      ? "purchase"
-      : input.action.includes("renewal")
-        ? "renewal"
-        : input.action.includes("auto_renew")
-          ? input.payload.enabled === false
-            ? "cancel_auto_renew"
-            : "set_auto_renew"
-          : input.action === "domain_sync"
-            ? "sync"
-            : "search";
-    await tx.insert(siteDomainOperations).values({
-      id: domainLedgerId!,
-      projectId: input.project.id,
-      userId: input.actor.id,
-      connectionId: connection.id,
-      operationId,
-      kind: domainKind,
-      domainAscii: domain,
-      domainUnicode:
-        typeof input.payload.domainUnicode === "string"
-          ? input.payload.domainUnicode
-          : domain,
-      clientRequestId: input.requestId,
-      requestFingerprint: input.requestHash,
-      customerConfirmedAt:
-        input.action.includes("confirm") ||
-        input.action === "domain_set_auto_renew" ||
-        input.action === "domain_sync"
-          ? new Date()
-          : undefined,
-      customerConfirmationHash:
-        input.action.includes("confirm") ||
-        input.action === "domain_set_auto_renew" ||
-        input.action === "domain_sync"
-          ? input.requestHash
-          : undefined,
-      activeFinancialKey,
-      status: "reserved",
-    });
-    if (referencedQuote) {
-      await tx
-        .update(siteDomainOperations)
-        .set({ status: "cancelled", updatedAt: new Date() })
-        .where(
-          and(
-            eq(siteDomainOperations.id, referencedQuote.id),
-            inArray(siteDomainOperations.status, [
-              "quoted",
-              "succeeded",
-              "attention_required",
-            ]),
-          ),
-        );
-    }
-  }
   await appendMessage(tx, {
     conversationId: input.project.conversationId,
     userId: input.actor.id,
     role: "assistant",
     turnId: input.turnId,
-    content: "操作已安全提交，FrontMind 会自动确认结果，避免重复执行。",
+    content:
+      "已选中域名，FrontMind 正在自动验证并配置解析；遇到已有记录冲突时会停止，不会覆盖。",
     siteOps: {
-      kind: input.action.startsWith("dns_") ? "domain_status" : "domain_status",
+      kind: "domain_status",
       subjectId: operationId,
       revision: input.project.revision + 1,
       status: "active",
-      payload: { action: input.action, status: "reserved" },
+      payload: {
+        action: "domain_sync",
+        domain: input.payload.domain,
+        status: "reserved",
+      },
     },
   });
   await tx
@@ -5394,19 +4372,6 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
   assertEnabled();
   assertCustomer(actor);
   const input = siteOpsActInputSchema.parse(value);
-  if (
-    input.action === "resume_build" ||
-    input.action === "reset_workflow" ||
-    input.action === "change_snapshot"
-  ) {
-    throw new SiteOpsServiceError(
-      "STATE_CONFLICT",
-      input.action === "change_snapshot"
-        ? "官网流程不再支持手动选择知识库版本；如需重新连接，请先重置官网任务，再点击“从知识库开始建站”。"
-        : "该操作已停用。请提交官网重置申请；批准并完成旧站下线后，可从当前企业知识库重新开始建站。",
-      409,
-    );
-  }
   const entitlement = await requireSiteOpsEntitlement(actor.id);
   const payload = parseSiteOpsActionPayload(
     input.action,
@@ -5444,6 +4409,7 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         and(
           eq(siteOperations.projectId, project.id),
           eq(siteOperations.clientRequestId, input.clientRequestId),
+          gte(siteOperations.createdAt, project.currentTaskStartedAt),
         ),
       )
       .limit(1);
@@ -5464,6 +4430,8 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
             eq(messages.id, input.messageId),
             eq(messages.conversationId, project.conversationId),
             eq(messages.userId, actor.id),
+            isNull(messages.deletedAt),
+            gte(messages.sentAt, project.currentTaskStartedAt),
           ),
         )
         .limit(1);
@@ -5509,12 +4477,6 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
         await handleSelectSnapshot(tx, {
           ...common,
           payload: payload as { knowledgeSnapshotId?: string },
-        });
-        break;
-      case "change_snapshot":
-        await handleChangeSnapshot(tx, {
-          ...common,
-          payload: payload as { knowledgeSnapshotId: string },
         });
         break;
       case "start_visual_search":
@@ -5583,12 +4545,12 @@ export async function actOnSiteOps(actor: AuthenticatedUser, value: unknown) {
           payload: payload as { deploymentId: string },
         });
         break;
-      default:
-        await handleProviderOperation(tx, {
+      case "domain_sync":
+        await handleDomainSync(tx, {
           ...common,
-          action: input.action,
-          payload,
+          payload: payload as { domain: string; domainUnicode: string },
         });
+        break;
     }
   });
   return observeSiteOps(actor, { conversationId: input.conversationId });

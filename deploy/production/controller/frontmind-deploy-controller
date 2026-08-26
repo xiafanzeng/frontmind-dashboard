@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# frontmind-production-controller-version: 5
+# frontmind-production-controller-version: 6
 set -Eeuo pipefail
 umask 077
 
@@ -9,6 +9,14 @@ readonly DEPLOY_TIMEOUT_SECONDS=120
 readonly CANDIDATE_READY_BUDGET_SECONDS=90
 readonly RELEASE_DB_READ_TIMEOUT_SECONDS=90
 readonly RELEASE_DB_MIGRATE_TIMEOUT_SECONDS=1800
+readonly SITEOPS_ALIDNS_OAUTH_CONTRACT_JOURNAL_HASH="60b3ba7ba8fb92bbb2ecc2a62db1c13f549f26cc375d44eb2ee218459e50bc5f"
+readonly SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH="00c5395ab580f7dddef1ad743445561943b9fc28c0858a3c72eea5417cb7c52f"
+readonly SITEOPS_ALIDNS_OAUTH_FINAL_APPLIED_JOURNAL_HASH="e71230f0691ddd2a7d3d7b1a19d069775720ff999b445e86f60be902137a17db"
+readonly SITEOPS_ALIDNS_OAUTH_SCHEMA_HASH="e4a5de422fac9b970a82a925a2de36a4e7f133a93ec35e026ea0c0494fe93c74"
+readonly SITEOPS_ALIDNS_OAUTH_SQL_HASH="47053769bdbf83b7b496da7ffc9f10042d746af4cb05baa7c91f1ec85a7a3a6d"
+readonly SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER="frontmind-dashboard-release-db-contract-0065"
+readonly SITEOPS_ALIDNS_OAUTH_MIGRATION_RESOURCE="siteops-alidns-oauth-contract-0065"
+readonly SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTROLLER="frontmind-production-controller-v6"
 readonly COUPLED_STACK_ARGUMENT="--coupled-stack"
 readonly COUPLED_STACK_LOCK_FILE="/run/lock/frontmind-deploy-stack.lock"
 readonly COUPLED_STACK_CAPSULE_FILE="/var/lib/frontmind-deploy/dashboard/coupled-stack-pending.json"
@@ -74,6 +82,22 @@ coupled_website_image=""
 coupled_website_source_sha=""
 coupled_website_digest=""
 coupled_website_env=""
+controller_main_pid="${BASHPID:-$$}"
+controller_exit_reason=""
+controller_signal_handling=0
+contract_0065_prewrite_armed=0
+contract_0065_rollback_armed=0
+contract_0065_restore_in_progress=0
+contract_0065_job_pid=""
+contract_0065_job_pgid=""
+contract_0065_job_ack_file=""
+contract_0065_job_start_signal=""
+contract_0065_job_output=""
+contract_0065_json_output=""
+contract_0065_release_id=""
+contract_0065_backup_file=""
+contract_0065_expected_applied_count=""
+contract_0065_expected_applied_journal_hash=""
 
 cleanup_ephemeral_registry_auth() {
   local expected_prefix
@@ -94,9 +118,45 @@ cleanup_ephemeral_registry_auth() {
 }
 
 cleanup_on_exit() {
-  local status=$?
+  local status=$? contract_cleanup_failed=0
+  [[ ${BASHPID:-$$} == "$controller_main_pid" ]] || return "$status"
+  trap - EXIT ERR INT TERM HUP
+  set +e
+  if [[ -n $contract_0065_job_pid ]] && \
+     declare -F terminate_contract_0065_job >/dev/null; then
+    terminate_contract_0065_job || contract_cleanup_failed=1
+  fi
+  if (( contract_0065_rollback_armed == 1 || contract_0065_restore_in_progress == 1 )) \
+    && declare -F contract_0065_terminal_state_committed >/dev/null \
+    && contract_0065_terminal_state_committed; then
+    contract_0065_rollback_armed=0
+    contract_0065_restore_in_progress=0
+  elif (( contract_0065_restore_in_progress == 1 )) \
+    && declare -F quarantine_contract_0065_restore >/dev/null; then
+    quarantine_contract_0065_restore \
+      "controller-${controller_exit_reason:-exit}-during-restore" \
+      || contract_cleanup_failed=1
+  elif (( contract_0065_rollback_armed == 1 )) \
+    && declare -F restore_contract_0065_release >/dev/null; then
+    restore_contract_0065_release "controller-${controller_exit_reason:-exit}" \
+      || contract_cleanup_failed=1
+  elif (( contract_0065_prewrite_armed == 1 )) \
+    && declare -F restart_contract_0065_prewrite >/dev/null; then
+    restart_contract_0065_prewrite "controller-${controller_exit_reason:-exit}" \
+      || contract_cleanup_failed=1
+  fi
   if [[ -n $candidate_env ]]; then
     rm -f -- "$candidate_env" || true
+  fi
+  if [[ -n $contract_0065_job_ack_file && \
+        $contract_0065_job_ack_file == "${STATE_DIR:-/nonexistent}/contract-0065-job."* ]]; then
+    rm -f -- "$contract_0065_job_ack_file" || contract_cleanup_failed=1
+    contract_0065_job_ack_file=""
+  fi
+  if [[ -n $contract_0065_job_output && \
+        $contract_0065_job_output == "${STATE_DIR:-/nonexistent}/contract-0065-output."* ]]; then
+    rm -f -- "$contract_0065_job_output" || contract_cleanup_failed=1
+    contract_0065_job_output=""
   fi
   if [[ -n $initial_runtime_env ]]; then
     rm -f -- "$initial_runtime_env" || true
@@ -111,7 +171,27 @@ cleanup_on_exit() {
     restore_coupled_stack \
       || log "PRODUCTION_COUPLED_STACK_RESTORE_PENDING"
   fi
+  if (( contract_cleanup_failed == 1 )); then
+    log "PRODUCTION_CONTRACT_0065_EXIT_RECOVERY_UNPROVEN"
+    status=70
+  fi
   return "$status"
+}
+
+handle_controller_signal() {
+  local signal_name="$1" exit_code="$2" signal_token
+  [[ ${BASHPID:-$$} == "$controller_main_pid" ]] || exit "$exit_code"
+  (( controller_signal_handling == 0 )) || exit "$exit_code"
+  controller_signal_handling=1
+  case "$signal_name" in
+    INT) signal_token="int" ;;
+    TERM) signal_token="term" ;;
+    HUP) signal_token="hup" ;;
+    *) exit "$exit_code" ;;
+  esac
+  controller_exit_reason="signal-${signal_token}"
+  trap - ERR INT TERM HUP
+  exit "$exit_code"
 }
 
 read_ephemeral_registry_auth() {
@@ -209,6 +289,10 @@ if (( coupled_stack_mode == 1 )); then
     || die "PRODUCTION_COUPLED_WEBSITE_SOURCE_SHA_REJECTED" 64
 fi
 trap cleanup_on_exit EXIT
+trap 'controller_exit_reason="err"' ERR
+trap 'handle_controller_signal INT 130' INT
+trap 'handle_controller_signal TERM 143' TERM
+trap 'handle_controller_signal HUP 129' HUP
 if (( allow_contract == 1 )) && [[ $service != "dashboard" ]]; then
   die "CONTRACT_MODE_DASHBOARD_ONLY" 64
 fi
@@ -251,7 +335,7 @@ if grep -Eq "^(${IMAGE_ENV_KEY}|FRONTMIND_IMAGE_DIGEST|FRONTMIND_SOURCE_SHA)=" \
   die "COMPOSE_ENV_CONTAINS_CONTROLLER_OWNED_IDENTITY"
 fi
 
-for command in cosign curl docker flock jq mktemp sha256sum timeout; do
+for command in cosign curl docker flock jq mktemp setsid sha256sum timeout; do
   require_command "$command"
 done
 docker compose version >/dev/null
@@ -296,6 +380,7 @@ current_source_sha=""
 current_journal_hash=""
 current_deployed_at=""
 unfinished_status=""
+unfinished_message=""
 unfinished_attempted_digest=""
 unfinished_release_id=""
 unfinished_backup_file=""
@@ -317,6 +402,7 @@ if [[ -f $state_file ]]; then
   current_journal_hash="$(jq -r '.journalHash' "$state_file")"
   current_deployed_at="$(jq -r '.deployedAt' "$state_file")"
   unfinished_status="$(jq -r '.lastResult.status // ""' "$state_file")"
+  unfinished_message="$(jq -r '.lastResult.message // ""' "$state_file")"
   unfinished_attempted_digest="$(jq -r '.lastResult.attemptedDigest // ""' "$state_file")"
   unfinished_release_id="$(jq -r '.lastResult.releaseId // ""' "$state_file")"
   unfinished_backup_file="$(jq -r '.lastResult.backupFile // ""' "$state_file")"
@@ -416,6 +502,321 @@ record_quarantine() {
     "$current_digest" "$previous_digest" "$current_source_sha" \
     "$current_journal_hash" "$current_deployed_at" \
     "quarantined" "$message" "$digest" "$release_id" "$backup_file"
+}
+
+record_contract_0065_phase() {
+  local message="$1" release_id="$2" backup_file="${3:-}"
+  write_state \
+    "$current_digest" "$previous_digest" "$current_source_sha" \
+    "$current_journal_hash" "$current_deployed_at" \
+    "in_progress" "$message" "$digest" "$release_id" "$backup_file"
+}
+
+siteops_alidns_oauth_contract_plan_matches() {
+  local payload="$1"
+  jq -e \
+    --arg journalHash "$SITEOPS_ALIDNS_OAUTH_CONTRACT_JOURNAL_HASH" \
+    --arg appliedJournalHash "$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH" \
+    --arg schemaHash "$SITEOPS_ALIDNS_OAUTH_SCHEMA_HASH" \
+    --arg sqlHash "$SITEOPS_ALIDNS_OAUTH_SQL_HASH" '
+    .schemaVersion == 1 and
+    .command == "plan" and
+    .status == "pending" and
+    .journalHash == $journalHash and
+    .expected.count == 66 and
+    .expected.latestTag == "0065_siteops_alidns_oauth" and
+    .expected.journalHash == $journalHash and
+    .applied.count == 65 and
+    .applied.latestTag == "0064_siteops_v1" and
+    .applied.journalHash == $appliedJournalHash and
+    (.pending | length) == 1 and
+    .pending[0].idx == 65 and
+    .pending[0].tag == "0065_siteops_alidns_oauth" and
+    .pending[0].when == 1787707303563 and
+    .pending[0].sqlSha256 == $sqlHash and
+    .pending[0].classification == "contract" and
+    .mismatchIndex == null and
+    .allPendingExpand == false and
+    .schema.status == "not_checked" and
+    .schema.expectedHash == $schemaHash and
+    .schema.expectedTableCount == 81
+  ' <<<"$payload" >/dev/null
+}
+
+siteops_alidns_oauth_exact_state_matches() {
+  local payload="$1" expected_command="$2"
+  jq -e \
+    --arg journalHash "$SITEOPS_ALIDNS_OAUTH_CONTRACT_JOURNAL_HASH" \
+    --arg appliedJournalHash "$SITEOPS_ALIDNS_OAUTH_FINAL_APPLIED_JOURNAL_HASH" \
+    --arg schemaHash "$SITEOPS_ALIDNS_OAUTH_SCHEMA_HASH" \
+    --arg command "$expected_command" '
+    .schemaVersion == 1 and
+    .command == $command and
+    .status == "exact" and
+    .journalHash == $journalHash and
+    .expected.count == 66 and
+    .expected.latestTag == "0065_siteops_alidns_oauth" and
+    .expected.journalHash == $journalHash and
+    .applied.count == 66 and
+    .applied.latestTag == "0065_siteops_alidns_oauth" and
+    .applied.journalHash == $appliedJournalHash and
+    (.pending | length) == 0 and
+    .schema.status == "exact" and
+    .schema.expectedHash == $schemaHash and
+    .schema.actualHash == $schemaHash and
+    .schema.expectedTableCount == 81 and
+    .schema.actualTableCount == 81
+  ' <<<"$payload" >/dev/null
+}
+
+siteops_alidns_oauth_migration_result_matches() {
+  local payload="$1" expected_release_id="$2"
+  siteops_alidns_oauth_exact_state_matches "$payload" migrate \
+    && jq -e --arg releaseId "$expected_release_id" '
+      .releaseId == $releaseId and .migrated == true
+    ' <<<"$payload" >/dev/null
+}
+
+contract_0065_facts_are_valid() {
+  local backup_name archive_hash archive_path metadata_hash metadata_path trailing checksum_line
+  local -a checksum_lines=()
+  [[ $service == "dashboard" && $coupled_stack_mode -eq 0 && \
+     $digest =~ ^sha256:[a-f0-9]{64}$ && \
+     $source_sha =~ ^[a-f0-9]{40}$ && \
+     $contract_0065_release_id =~ ^${source_sha}-[0-9]{8}T[0-9]{6}Z$ && \
+     $contract_0065_expected_applied_count == "65" && \
+     $contract_0065_expected_applied_journal_hash == "$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH" && \
+     $BACKUP_DIR == /* && -d $BACKUP_DIR && ! -L $BACKUP_DIR ]] || return 1
+  backup_name="${contract_0065_backup_file##*/}"
+  [[ $contract_0065_backup_file == "${BACKUP_DIR}/${backup_name}" && \
+     $backup_name =~ ^frontmind-dashboard-[0-9]{8}T[0-9]{6}Z-${source_sha:0:12}\.sql\.gz$ && \
+     -f $contract_0065_backup_file && ! -L $contract_0065_backup_file && \
+     -f ${contract_0065_backup_file}.meta.json && ! -L ${contract_0065_backup_file}.meta.json && \
+     -f ${contract_0065_backup_file}.sha256 && ! -L ${contract_0065_backup_file}.sha256 ]] \
+    || return 1
+  while IFS= read -r checksum_line; do
+    checksum_lines[${#checksum_lines[@]}]="$checksum_line"
+  done <"${contract_0065_backup_file}.sha256" || return 1
+  (( ${#checksum_lines[@]} == 2 )) || return 1
+  read -r archive_hash archive_path trailing <<<"${checksum_lines[0]}" || return 1
+  [[ -z ${trailing:-} && $archive_hash =~ ^[a-f0-9]{64}$ && \
+     $archive_path == "$contract_0065_backup_file" ]] || return 1
+  trailing=""
+  read -r metadata_hash metadata_path trailing <<<"${checksum_lines[1]}" || return 1
+  [[ -z ${trailing:-} && $metadata_hash =~ ^[a-f0-9]{64}$ && \
+     $metadata_path == "${contract_0065_backup_file}.meta.json" ]] || return 1
+  [[ $(sha256sum "$contract_0065_backup_file") == \
+       "${archive_hash}  ${contract_0065_backup_file}" && \
+     $(sha256sum "${contract_0065_backup_file}.meta.json") == \
+       "${metadata_hash}  ${contract_0065_backup_file}.meta.json" ]] || return 1
+  jq -e \
+    --arg database "$BACKUP_DATABASE" \
+    --arg appliedJournalHash "$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH" '
+    .schemaVersion == 1 and
+    .database == $database and
+    (.charset | type == "string" and test("^[A-Za-z0-9_]+$")) and
+    (.collation | type == "string" and test("^[A-Za-z0-9_]+$")) and
+    (.tableCount | type == "number" and floor == . and . >= 0) and
+    .migrationCount == 65 and
+    .migrationJournalHash == $appliedJournalHash
+  ' "${contract_0065_backup_file}.meta.json" >/dev/null
+}
+
+contract_0065_terminal_state_committed() {
+  [[ -f $state_file && ! -L $state_file ]] || return 1
+  jq -e \
+    --arg currentDigest "$digest" \
+    --arg sourceSha "$source_sha" '
+    .schemaVersion == 1 and
+    .currentDigest == $currentDigest and
+    .sourceSha == $sourceSha and
+    .lastResult.status == "success" and
+    .lastResult.message == "ready"
+  ' "$state_file" >/dev/null
+}
+
+contract_0065_migration_container_absent() {
+  ! docker inspect "$SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER" >/dev/null 2>&1
+}
+
+contract_0065_migration_container_identity_is_exact() {
+  local payload
+  payload="$(docker inspect --format '{{json .}}' \
+    "$SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER")" || return 1
+  jq -e \
+    --arg name "/${SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER}" \
+    --arg image "$image" \
+    --arg resource "$SITEOPS_ALIDNS_OAUTH_MIGRATION_RESOURCE" \
+    --arg controller "$SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTROLLER" \
+    --arg releaseId "$contract_0065_release_id" \
+    --arg appliedCount "$contract_0065_expected_applied_count" \
+    --arg appliedHash "$contract_0065_expected_applied_journal_hash" '
+    .Name == $name and
+    .Config.Image == $image and
+    .Config.Entrypoint == ["node", "/app/dist/release-db.js"] and
+    .Config.Cmd == [
+      "migrate",
+      "--release-id", $releaseId,
+      "--expected-applied-count", $appliedCount,
+      "--expected-applied-journal-hash", $appliedHash,
+      "--allow-contract",
+      "--json"
+    ] and
+    .Config.Labels["net.frontmind.environment"] == "production" and
+    .Config.Labels["com.docker.compose.project"] == "frontmind-dashboard" and
+    .Config.Labels["com.docker.compose.service"] == "release-db-migrate" and
+    .Config.Labels["net.frontmind.resource"] == $resource and
+    .Config.Labels["net.frontmind.controller"] == $controller and
+    .Config.Labels["net.frontmind.release-id"] == $releaseId
+  ' <<<"$payload" >/dev/null
+}
+
+stop_contract_0065_migration_container() {
+  contract_0065_migration_container_absent && return 0
+  contract_0065_migration_container_identity_is_exact || {
+    log "PRODUCTION_CONTRACT_0065_FOREIGN_CONTAINER_REJECTED"
+    return 1
+  }
+  docker rm --force "$SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER" >/dev/null \
+    || return 1
+  contract_0065_migration_container_absent
+}
+
+terminate_contract_0065_job() {
+  local pid="${contract_0065_job_pid:-}" pgid="${contract_0065_job_pgid:-}" attempt
+  if [[ -n $pid ]]; then
+    [[ $pid =~ ^[0-9]+$ && $pgid =~ ^[0-9]+$ ]] || return 1
+    kill -TERM -- "-${pgid}" >/dev/null 2>&1 || true
+    for attempt in {1..20}; do
+      kill -0 -- "-${pgid}" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    if kill -0 -- "-${pgid}" >/dev/null 2>&1; then
+      kill -KILL -- "-${pgid}" >/dev/null 2>&1 || return 1
+    fi
+    for attempt in {1..20}; do
+      kill -0 -- "-${pgid}" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    kill -0 -- "-${pgid}" >/dev/null 2>&1 && return 1
+    wait "$pid" >/dev/null 2>&1 || true
+    contract_0065_job_pid=""
+    contract_0065_job_pgid=""
+  fi
+  stop_contract_0065_migration_container
+}
+
+start_contract_0065_job() {
+  local start_status=0 pgid="" trailing=""
+  [[ -z $contract_0065_job_pid && -z $contract_0065_job_pgid ]] || return 1
+  contract_0065_job_start_signal=""
+  contract_0065_job_ack_file="$(mktemp "${STATE_DIR}/contract-0065-job.XXXXXX")" \
+    || return 1
+  chmod 0600 "$contract_0065_job_ack_file" || return 1
+  trap 'contract_0065_job_start_signal="INT"' INT
+  trap 'contract_0065_job_start_signal="TERM"' TERM
+  trap 'contract_0065_job_start_signal="HUP"' HUP
+  setsid --fork --wait /bin/bash -c '
+    ack_file=$1
+    shift
+    printf "%s\n" "${BASHPID:-$$}" >"$ack_file" || exit 125
+    exec "$@"
+  ' frontmind-production-contract-0065 "$contract_0065_job_ack_file" "$@" &
+  contract_0065_job_pid=$!
+  while [[ ! -s $contract_0065_job_ack_file ]]; do
+    if ! kill -0 "$contract_0065_job_pid" >/dev/null 2>&1; then
+      wait "$contract_0065_job_pid" || start_status=$?
+      contract_0065_job_pid=""
+      rm -f -- "$contract_0065_job_ack_file" || true
+      contract_0065_job_ack_file=""
+      trap 'handle_controller_signal INT 130' INT
+      trap 'handle_controller_signal TERM 143' TERM
+      trap 'handle_controller_signal HUP 129' HUP
+      (( start_status != 0 )) || start_status=1
+      return "$start_status"
+    fi
+    sleep 0.01
+  done
+  {
+    IFS= read -r pgid || start_status=$?
+    if IFS= read -r trailing; then start_status=1; fi
+  } <"$contract_0065_job_ack_file"
+  rm -f -- "$contract_0065_job_ack_file" || start_status=1
+  contract_0065_job_ack_file=""
+  [[ $pgid =~ ^[0-9]+$ && -z $trailing ]] || start_status=1
+  contract_0065_job_pgid="$pgid"
+  trap 'handle_controller_signal INT 130' INT
+  trap 'handle_controller_signal TERM 143' TERM
+  trap 'handle_controller_signal HUP 129' HUP
+  if (( start_status != 0 )); then
+    terminate_contract_0065_job || true
+    return "$start_status"
+  fi
+  case "$contract_0065_job_start_signal" in
+    INT) handle_controller_signal INT 130 ;;
+    TERM) handle_controller_signal TERM 143 ;;
+    HUP) handle_controller_signal HUP 129 ;;
+  esac
+}
+
+wait_for_contract_0065_job() {
+  local status=0
+  [[ $contract_0065_job_pid =~ ^[0-9]+$ && \
+     $contract_0065_job_pgid =~ ^[0-9]+$ ]] || return 1
+  wait "$contract_0065_job_pid" || status=$?
+  contract_0065_job_pid=""
+  contract_0065_job_pgid=""
+  return "$status"
+}
+
+run_contract_0065_migration_json() {
+  local environment_file="$1" release_id="$2" applied_count="$3" applied_hash="$4"
+  local output json status=0
+  contract_0065_json_output=""
+  [[ -z $contract_0065_job_pid && -z $contract_0065_job_output ]] || return 1
+  contract_0065_job_output="$(mktemp "${STATE_DIR}/contract-0065-output.XXXXXX")" \
+    || return 1
+  contract_0065_expected_applied_count="$applied_count"
+  contract_0065_expected_applied_journal_hash="$applied_hash"
+  contract_0065_migration_container_absent || return 1
+  start_contract_0065_job timeout --foreground --signal=TERM --kill-after=10s \
+    "${RELEASE_DB_MIGRATE_TIMEOUT_SECONDS}s" docker compose \
+    --project-directory "$COMPOSE_DIR" \
+    --env-file "$environment_file" \
+    -f "$COMPOSE_FILE" \
+    --profile release run --rm --no-deps \
+    --name "$SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTAINER" \
+    --label "net.frontmind.environment=production" \
+    --label "net.frontmind.resource=${SITEOPS_ALIDNS_OAUTH_MIGRATION_RESOURCE}" \
+    --label "net.frontmind.controller=${SITEOPS_ALIDNS_OAUTH_MIGRATION_CONTROLLER}" \
+    --label "net.frontmind.release-id=${release_id}" \
+    release-db-migrate migrate \
+    --release-id "$release_id" \
+    --expected-applied-count "$applied_count" \
+    --expected-applied-journal-hash "$applied_hash" \
+    --allow-contract --json >"$contract_0065_job_output" \
+    || status=$?
+  if (( status == 0 )); then
+    wait_for_contract_0065_job || status=$?
+  fi
+  output="$(<"$contract_0065_job_output")"
+  rm -f -- "$contract_0065_job_output" || status=1
+  contract_0065_job_output=""
+  stop_contract_0065_migration_container || status=1
+  json="$(printf '%s\n' "$output" | tail -n 1)"
+  if (( status != 0 )); then
+    if jq -e 'type == "object"' <<<"$json" >/dev/null 2>&1; then
+      contract_0065_json_output="$json"
+    else
+      printf '%s\n' "$output" >&2
+    fi
+    return "$status"
+  fi
+  jq -e 'type == "object"' <<<"$json" >/dev/null || {
+    printf '%s\n' "$output" >&2
+    return 1
+  }
+  contract_0065_json_output="$json"
 }
 
 make_compose_env() {
@@ -635,13 +1036,13 @@ applied_fact_from_plan() {
 }
 
 write_active_image_env() {
-  local selected_image="$1" temporary
+  local selected_image="$1" selected_source_sha="${2:-$source_sha}" temporary
   mkdir -p -m 0700 "$(dirname "$IMAGE_ENV_FILE")"
   temporary="$(mktemp "${IMAGE_ENV_FILE}.tmp.XXXXXX")"
   cp -- "$COMPOSE_ENV_FILE" "$temporary"
   printf '%s=%s\n' "$IMAGE_ENV_KEY" "$selected_image" >>"$temporary"
   printf 'FRONTMIND_IMAGE_DIGEST=%s\n' "${selected_image##*@}" >>"$temporary"
-  printf 'FRONTMIND_SOURCE_SHA=%s\n' "$source_sha" >>"$temporary"
+  printf 'FRONTMIND_SOURCE_SHA=%s\n' "$selected_source_sha" >>"$temporary"
   atomic_copy "$temporary" "$IMAGE_ENV_FILE"
   rm -f -- "$temporary"
 }
@@ -886,10 +1287,109 @@ restore_production_database() {
   log "DATABASE_RESTORE_OK"
 }
 
+quarantine_contract_0065_restore() {
+  local reason="$1"
+  stop_contract_0065_migration_container || true
+  if [[ -n $candidate_env ]]; then
+    compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  fi
+  write_state \
+    "$current_digest" "$previous_digest" "$current_source_sha" \
+    "$current_journal_hash" "$current_deployed_at" \
+    "quarantined" "contract-0065-restore-unproven-${reason}" "$digest" \
+    "$contract_0065_release_id" "$contract_0065_backup_file" || return 1
+  contract_0065_restore_in_progress=0
+  contract_0065_rollback_armed=0
+}
+
+restart_contract_0065_prewrite() {
+  local reason="$1" backup_for_state="$contract_0065_backup_file"
+  terminate_contract_0065_job || return 1
+  [[ -n $candidate_env ]] || return 1
+  if restore_previous_application "$candidate_env"; then
+    write_active_image_env "${IMAGE_REPOSITORY}@${current_digest}" "$current_source_sha" \
+      || return 1
+    write_state \
+      "$current_digest" "$previous_digest" "$current_source_sha" \
+      "$current_journal_hash" "$current_deployed_at" \
+      "failed" "contract-0065-prewrite-${reason}-previous-ready" "$digest" \
+      "$contract_0065_release_id" "$backup_for_state" || return 1
+    contract_0065_prewrite_armed=0
+    return 0
+  fi
+  compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  write_state \
+    "$current_digest" "$previous_digest" "$current_source_sha" \
+    "$current_journal_hash" "$current_deployed_at" \
+    "quarantined" "contract-0065-prewrite-${reason}-restart-unproven" "$digest" \
+    "$contract_0065_release_id" "$backup_for_state" || return 1
+  contract_0065_prewrite_armed=0
+  return 1
+}
+
+restore_contract_0065_release() {
+  local reason="$1" recovered_journal_hash
+  contract_0065_facts_are_valid || return 1
+  terminate_contract_0065_job || return 1
+  trap '' INT TERM HUP
+  contract_0065_restore_in_progress=1
+  if ! record_contract_0065_phase \
+    "contract-0065-restore-started" \
+    "$contract_0065_release_id" "$contract_0065_backup_file"; then
+    trap 'handle_controller_signal INT 130' INT
+    trap 'handle_controller_signal TERM 143' TERM
+    trap 'handle_controller_signal HUP 129' HUP
+    return 1
+  fi
+  compose "$candidate_env" stop "$COMPOSE_SERVICE" >/dev/null 2>&1 || true
+  if ! restore_production_database "$contract_0065_backup_file"; then
+    quarantine_contract_0065_restore "${reason}-database" || true
+    trap 'handle_controller_signal INT 130' INT
+    trap 'handle_controller_signal TERM 143' TERM
+    trap 'handle_controller_signal HUP 129' HUP
+    return 1
+  fi
+  recovered_journal_hash="$(jq -r '.migrationJournalHash' \
+    "${contract_0065_backup_file}.meta.json")" || return 1
+  if ! restore_previous_application "$candidate_env"; then
+    quarantine_contract_0065_restore "${reason}-application" || true
+    trap 'handle_controller_signal INT 130' INT
+    trap 'handle_controller_signal TERM 143' TERM
+    trap 'handle_controller_signal HUP 129' HUP
+    return 1
+  fi
+  if ! write_active_image_env \
+    "${IMAGE_REPOSITORY}@${current_digest}" "$current_source_sha"; then
+    quarantine_contract_0065_restore "${reason}-active-env" || true
+    trap 'handle_controller_signal INT 130' INT
+    trap 'handle_controller_signal TERM 143' TERM
+    trap 'handle_controller_signal HUP 129' HUP
+    return 1
+  fi
+  if ! write_state \
+    "$current_digest" "$previous_digest" "$current_source_sha" \
+    "$recovered_journal_hash" "$current_deployed_at" \
+    "failed" "contract-0065-${reason}-previous-restored" "$digest" \
+    "$contract_0065_release_id" "$contract_0065_backup_file"; then
+    trap 'handle_controller_signal INT 130' INT
+    trap 'handle_controller_signal TERM 143' TERM
+    trap 'handle_controller_signal HUP 129' HUP
+    return 1
+  fi
+  contract_0065_restore_in_progress=0
+  contract_0065_rollback_armed=0
+  trap 'handle_controller_signal INT 130' INT
+  trap 'handle_controller_signal TERM 143' TERM
+  trap 'handle_controller_signal HUP 129' HUP
+  return 0
+}
+
 rotate_backups() {
   local -a backups=()
-  local old
-  mapfile -t backups < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'frontmind-dashboard-*.sql.gz' -print | sort -r)
+  local old backup
+  while IFS= read -r backup; do
+    backups[${#backups[@]}]="$backup"
+  done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'frontmind-dashboard-*.sql.gz' -print | sort -r)
   if (( ${#backups[@]} <= 3 )); then
     return
   fi
@@ -1681,6 +2181,7 @@ fi
 journal_hash="not-applicable"
 database_changed=0
 backup_file=""
+siteops_alidns_oauth_contract=0
 
 if [[ $service == "dashboard" ]]; then
   log "DATABASE_PLAN_START"
@@ -1700,12 +2201,65 @@ if [[ $service == "dashboard" ]]; then
   plan_status="$(jq -r '.status' <<<"$plan_json")"
   plan_schema_status="$(jq -r '.schema.status // "missing"' <<<"$plan_json")"
   journal_hash="$(jq -r '.journalHash // .expected.journalHash // ""' <<<"$plan_json")"
+  if siteops_alidns_oauth_contract_plan_matches "$plan_json"; then
+    siteops_alidns_oauth_contract=1
+  elif [[ $unfinished_message =~ ^contract-0065-(migration-(started|complete)|restore-started)$ ]] \
+    && siteops_alidns_oauth_exact_state_matches "$plan_json" plan; then
+    siteops_alidns_oauth_contract=1
+  fi
 
   # An interrupted migration is reconciled from facts before any new attempt:
   # exact means the prior one-shot job committed and rollout may resume;
   # every other state restores the verified backup. A pending ledger alone is
   # not proof that MySQL DDL never started, so the controller never reruns it.
-  if [[ $unfinished_status == "in_progress" ]]; then
+  if [[ $unfinished_status == "in_progress" && \
+        $unfinished_message =~ ^contract-0065-prewrite-(stop-started|backup-complete)$ ]]; then
+    siteops_alidns_oauth_contract_plan_matches "$plan_json" \
+      || die "CONTRACT_0065_PREWRITE_RECOVERY_PLAN_REJECTED" 73
+    contract_0065_release_id="$unfinished_release_id"
+    contract_0065_backup_file="$unfinished_backup_file"
+    contract_0065_expected_applied_count="65"
+    contract_0065_expected_applied_journal_hash="$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH"
+    contract_0065_prewrite_armed=1
+    if restart_contract_0065_prewrite "host-recovery"; then
+      die "CONTRACT_0065_PREWRITE_RECOVERED_NOT_RERUN" 75
+    fi
+    die "CONTRACT_0065_PREWRITE_RECOVERY_UNPROVEN" 75
+  elif [[ $unfinished_status == "in_progress" && \
+          $unfinished_message == "contract-0065-restore-started" ]]; then
+    contract_0065_release_id="$unfinished_release_id"
+    contract_0065_backup_file="$unfinished_backup_file"
+    contract_0065_expected_applied_count="65"
+    contract_0065_expected_applied_journal_hash="$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH"
+    contract_0065_rollback_armed=1
+    contract_0065_restore_in_progress=1
+    quarantine_contract_0065_restore "host-recovery-interrupted" \
+      || die "CONTRACT_0065_HOST_RESTORE_QUARANTINE_FAILED" 75
+    die "CONTRACT_0065_HOST_RESTORE_INTERRUPTED_QUARANTINED" 75
+  elif [[ $unfinished_status == "in_progress" && \
+          $unfinished_message =~ ^contract-0065-migration-(started|complete)$ ]]; then
+    contract_0065_release_id="$unfinished_release_id"
+    contract_0065_backup_file="$unfinished_backup_file"
+    contract_0065_expected_applied_count="65"
+    contract_0065_expected_applied_journal_hash="$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH"
+    contract_0065_rollback_armed=1
+    contract_0065_facts_are_valid \
+      || die "CONTRACT_0065_RECONCILIATION_FACTS_INVALID" 73
+    if siteops_alidns_oauth_exact_state_matches "$plan_json" plan; then
+      log "CONTRACT_0065_MIGRATION_RECONCILED_EXACT release=${unfinished_release_id}"
+      backup_file="$unfinished_backup_file"
+      database_changed=1
+      reconciliation_postflight="$(run_release_db_json "$candidate_env" postflight --json)" \
+        || die "CONTRACT_0065_RECONCILIATION_POSTFLIGHT_FAILED" 78
+      siteops_alidns_oauth_exact_state_matches "$reconciliation_postflight" postflight \
+        || die "CONTRACT_0065_RECONCILIATION_POSTFLIGHT_NOT_EXACT" 78
+      journal_hash="$SITEOPS_ALIDNS_OAUTH_CONTRACT_JOURNAL_HASH"
+    else
+      restore_contract_0065_release "host-recovery-nonexact" \
+        || die "CONTRACT_0065_HOST_RESTORE_UNPROVEN" 75
+      die "CONTRACT_0065_HOST_RESTORE_COMPLETE_NOT_RERUN" 75
+    fi
+  elif [[ $unfinished_status == "in_progress" ]]; then
     [[ -n $unfinished_backup_file && -f $unfinished_backup_file ]] \
       || die "UNFINISHED_RELEASE_BACKUP_MISSING" 75
     if [[ $plan_status == "exact" && $plan_schema_status == "exact" ]]; then
@@ -1772,15 +2326,39 @@ if [[ $service == "dashboard" ]]; then
       if jq -e '.allPendingExpand == true and (.pending | length > 0) and all(.pending[]; .classification == "expand")' \
         <<<"$plan_json" >/dev/null; then
         migration_kind="expand"
-      elif (( allow_contract == 1 )) && jq -e '(.pending | length > 0) and all(.pending[]; .classification == "expand" or .classification == "contract")' \
-        <<<"$plan_json" >/dev/null; then
-        migration_kind="contract"
+      elif (( siteops_alidns_oauth_contract == 1 && coupled_stack_mode == 0 )); then
+        migration_kind="contract-0065"
       else
         record_failure "contract-or-unclassified-migration-blocked"
         rotate_service_images "$current_digest" "$previous_digest"
         die "CONTRACT_MIGRATION_REQUIRES_MAINTENANCE_WINDOW" 78
       fi
+      if [[ $migration_kind == "contract-0065" ]]; then
+        [[ $expected_applied_count == "65" && \
+           $expected_applied_journal_hash == "$SITEOPS_ALIDNS_OAUTH_APPLIED_JOURNAL_HASH" ]] \
+          || die "CONTRACT_0065_APPLIED_FACT_REJECTED" 78
+        contract_0065_expected_applied_count="$expected_applied_count"
+        contract_0065_expected_applied_journal_hash="$expected_applied_journal_hash"
+      fi
       log "MIGRATION_APPROVED kind=${migration_kind}"
+      release_id="${source_sha}-$(date -u +%Y%m%dT%H%M%SZ)"
+      if [[ $migration_kind == "contract-0065" ]]; then
+        contract_0065_release_id="$release_id"
+        contract_0065_backup_file=""
+        contract_0065_prewrite_armed=1
+        trap '' INT TERM HUP
+        if record_contract_0065_phase \
+          "contract-0065-prewrite-stop-started" "$release_id"; then
+          trap 'handle_controller_signal INT 130' INT
+          trap 'handle_controller_signal TERM 143' TERM
+          trap 'handle_controller_signal HUP 129' HUP
+        else
+          trap 'handle_controller_signal INT 130' INT
+          trap 'handle_controller_signal TERM 143' TERM
+          trap 'handle_controller_signal HUP 129' HUP
+          die "CONTRACT_0065_PREWRITE_SENTINEL_FAILED" 73
+        fi
+      fi
       if [[ -n $current_digest ]]; then
         current_env="$(mktemp)"
         make_compose_env "$current_env" "${IMAGE_REPOSITORY}@${current_digest}"
@@ -1793,6 +2371,9 @@ if [[ $service == "dashboard" ]]; then
         if (( coupled_stack_mode == 1 )); then
           die "DATABASE_BACKUP_FAILED" 75
         fi
+        if [[ $migration_kind == "contract-0065" ]]; then
+          die "CONTRACT_0065_DATABASE_BACKUP_FAILED" 78
+        fi
         if restore_previous_application "$candidate_env"; then
           record_failure "database-backup-failed"
           rotate_service_images "$current_digest" "$previous_digest"
@@ -1801,21 +2382,53 @@ if [[ $service == "dashboard" ]]; then
         fi
         die "DATABASE_BACKUP_FAILED"
       fi
-      release_id="${source_sha}-$(date -u +%Y%m%dT%H%M%SZ)"
+      if [[ $migration_kind == "contract-0065" ]]; then
+        contract_0065_backup_file="$backup_file"
+        record_contract_0065_phase \
+          "contract-0065-prewrite-backup-complete" "$release_id" "$backup_file" \
+          || die "CONTRACT_0065_PREWRITE_BACKUP_SENTINEL_FAILED" 73
+        contract_0065_migration_container_absent \
+          || die "CONTRACT_0065_MIGRATION_CONTAINER_NAME_OCCUPIED" 75
+      fi
       update_coupled_stack_database_recovery "$backup_file" "$release_id" \
         || die "PRODUCTION_COUPLED_STACK_DATABASE_RECOVERY_CAPSULE_FAILED" 75
-      record_in_progress "$release_id" "$backup_file"
+      if [[ $migration_kind == "contract-0065" ]]; then
+        trap '' INT TERM HUP
+        if record_contract_0065_phase \
+          "contract-0065-migration-started" "$release_id" "$backup_file"; then
+          contract_0065_prewrite_armed=0
+          contract_0065_rollback_armed=1
+          trap 'handle_controller_signal INT 130' INT
+          trap 'handle_controller_signal TERM 143' TERM
+          trap 'handle_controller_signal HUP 129' HUP
+        else
+          trap 'handle_controller_signal INT 130' INT
+          trap 'handle_controller_signal TERM 143' TERM
+          trap 'handle_controller_signal HUP 129' HUP
+          die "CONTRACT_0065_MIGRATION_SENTINEL_FAILED" 73
+        fi
+      else
+        record_in_progress "$release_id" "$backup_file"
+      fi
       migration_arguments=(
         migrate
         --release-id "$release_id"
         --expected-applied-count "$expected_applied_count"
         --expected-applied-journal-hash "$expected_applied_journal_hash"
       )
-      if [[ $migration_kind == "contract" ]]; then
-        migration_arguments+=(--allow-contract)
-      fi
       migration_arguments+=(--json)
-      if ! migration_json="$(run_release_db_json "$candidate_env" "${migration_arguments[@]}")"; then
+      migration_status=0
+      migration_reconciled=0
+      if [[ $migration_kind == "contract-0065" ]]; then
+        run_contract_0065_migration_json \
+          "$candidate_env" "$release_id" "$expected_applied_count" \
+          "$expected_applied_journal_hash" || migration_status=$?
+        migration_json="$contract_0065_json_output"
+      else
+        migration_json="$(run_release_db_json "$candidate_env" "${migration_arguments[@]}")" \
+          || migration_status=$?
+      fi
+      if (( migration_status != 0 )); then
         if jq -e \
           '.status == "error" and .error.code == "MIGRATION_APPLIED_FACT_CHANGED"' \
           <<<"$migration_json" >/dev/null 2>&1; then
@@ -1831,6 +2444,9 @@ if [[ $service == "dashboard" ]]; then
               "$release_id" "$backup_file"
             die "MIGRATION_APPLIED_FACT_CHANGED_CAPSULE_UPDATE_FAILED" 75
           fi
+          if [[ $migration_kind == "contract-0065" ]]; then
+            contract_0065_rollback_armed=0
+          fi
           record_quarantine \
             "migration-applied-fact-changed-before-ddl-dashboard-remains-stopped" \
             "$release_id" "$backup_file"
@@ -1839,13 +2455,24 @@ if [[ $service == "dashboard" ]]; then
         log "MIGRATION_RESULT_UNKNOWN_RECONCILING"
         recovery_plan="$(run_release_db_json "$candidate_env" plan --json)" || \
           recovery_plan='{"status":"unknown"}'
-        if jq -e '.status == "exact" and .schema.status == "exact"' \
+        if [[ $migration_kind == "contract-0065" ]] \
+          && siteops_alidns_oauth_exact_state_matches "$recovery_plan" plan; then
+          migration_json="$(run_release_db_json "$candidate_env" postflight --json)" \
+            || die "CONTRACT_0065_UNKNOWN_POSTFLIGHT_FAILED" 78
+          siteops_alidns_oauth_exact_state_matches "$migration_json" postflight \
+            || die "CONTRACT_0065_UNKNOWN_POSTFLIGHT_NOT_EXACT" 78
+          migration_reconciled=1
+          log "MIGRATION_RECONCILED_EXACT"
+        elif jq -e '.status == "exact" and .schema.status == "exact"' \
           <<<"$recovery_plan" >/dev/null; then
           log "MIGRATION_RECONCILED_EXACT"
           migration_json="$recovery_plan"
         else
           if (( coupled_stack_mode == 1 )); then
             die "DATABASE_MIGRATION_UNKNOWN_NOT_RERUN" 75
+          fi
+          if [[ $migration_kind == "contract-0065" ]]; then
+            die "CONTRACT_0065_MIGRATION_UNKNOWN_RESTORE_REQUIRED" 78
           fi
           restore_production_database "$backup_file" \
             || die "DATABASE_RESTORE_FAILED_AFTER_MIGRATION_ERROR"
@@ -1856,10 +2483,26 @@ if [[ $service == "dashboard" ]]; then
           die "DATABASE_MIGRATION_UNKNOWN_NOT_RERUN"
         fi
       fi
-      if ! jq -e '.status == "exact" and .schema.status == "exact"' \
+      migration_exact=0
+      if [[ $migration_kind == "contract-0065" ]]; then
+        if (( migration_reconciled == 1 )); then
+          siteops_alidns_oauth_exact_state_matches "$migration_json" postflight \
+            && migration_exact=1
+        else
+          siteops_alidns_oauth_migration_result_matches \
+            "$migration_json" "$release_id" \
+            && migration_exact=1
+        fi
+      elif jq -e '.status == "exact" and .schema.status == "exact"' \
         <<<"$migration_json" >/dev/null; then
+        migration_exact=1
+      fi
+      if (( migration_exact == 0 )); then
         if (( coupled_stack_mode == 1 )); then
           die "DATABASE_MIGRATION_RESULT_NOT_EXACT" 75
+        fi
+        if [[ $migration_kind == "contract-0065" ]]; then
+          die "CONTRACT_0065_MIGRATION_RESULT_NOT_EXACT" 78
         fi
         restore_production_database "$backup_file" \
           || die "DATABASE_RESTORE_FAILED_AFTER_MIGRATION_MISMATCH"
@@ -1870,6 +2513,25 @@ if [[ $service == "dashboard" ]]; then
         die "DATABASE_MIGRATION_RESULT_NOT_EXACT"
       fi
       journal_hash="$(jq -r '.journalHash // .expected.journalHash // ""' <<<"$migration_json")"
+      if [[ $migration_kind == "contract-0065" ]]; then
+        [[ $journal_hash == "$SITEOPS_ALIDNS_OAUTH_CONTRACT_JOURNAL_HASH" ]] \
+          || die "CONTRACT_0065_MIGRATION_JOURNAL_REJECTED" 78
+        trap '' INT TERM HUP
+        if write_state \
+          "$current_digest" "$previous_digest" "$current_source_sha" \
+          "$journal_hash" "$current_deployed_at" \
+          "in_progress" "contract-0065-migration-complete" "$digest" \
+          "$release_id" "$backup_file"; then
+          trap 'handle_controller_signal INT 130' INT
+          trap 'handle_controller_signal TERM 143' TERM
+          trap 'handle_controller_signal HUP 129' HUP
+        else
+          trap 'handle_controller_signal INT 130' INT
+          trap 'handle_controller_signal TERM 143' TERM
+          trap 'handle_controller_signal HUP 129' HUP
+          die "CONTRACT_0065_COMPLETE_SENTINEL_FAILED" 73
+        fi
+      fi
       database_changed=1
       ;;
     ahead)
@@ -1919,6 +2581,9 @@ if ! roll_out "$candidate_env" "$source_sha" "$digest" "$candidate_ready_deadlin
     die "APPLICATION_READINESS_TIMEOUT" 75
   fi
   if (( database_changed == 1 )); then
+    if (( contract_0065_rollback_armed == 1 )); then
+      die "CONTRACT_0065_APPLICATION_READINESS_RESTORE_REQUIRED" 75
+    fi
     restore_production_database "$backup_file" || die "DATABASE_RESTORE_FAILED_AFTER_APPLICATION_ERROR"
     record_recovered_failure "$candidate_env" \
       "candidate-unready-previous-restored" \
@@ -1943,6 +2608,11 @@ fi
 write_state \
   "$digest" "$next_previous_digest" "$source_sha" "$journal_hash" \
   "$deployed_at" "success" "ready" "$digest"
+if (( contract_0065_rollback_armed == 1 )); then
+  contract_0065_terminal_state_committed \
+    || die "CONTRACT_0065_TERMINAL_STATE_COMMIT_UNPROVEN" 73
+  contract_0065_rollback_armed=0
+fi
 
 if (( database_changed == 1 )); then
   rotate_backups

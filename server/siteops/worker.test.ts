@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   appendBuildTimelineEvent,
-  domainFinancialTerminalProjection,
+  enqueueAutomaticDomainSuccessor,
   exclusiveSiteOpsLiveHeadProjection,
   knownSiteOpsBuildFailure,
   parseSiteOpsBuildArtifactBindings,
   siteOpsBuildArtifactProjection,
   siteOpsInitialVisualSupersededMayStaySilent,
-  siteOpsRemovedResumeOperation,
+  siteOpsDeterministicSuccessorId,
   siteOpsSupplementalVisualFailureMayRecover,
   siteOpsVisualOperationCoordinates,
   siteOpsWorkerMayClaimStatus,
@@ -43,31 +43,127 @@ describe("SiteOps mutually exclusive live heads", () => {
   });
 });
 
-describe("SiteOps financial terminal state", () => {
-  it("releases known success/failure and retains manual reconciliation", () => {
-    expect(domainFinancialTerminalProjection("succeeded")).toEqual({
-      status: "succeeded",
-      activeFinancialKey: null,
+describe("SiteOps worker claim boundary", () => {
+  it("creates the automatic domain chain with deterministic replay-safe successors", async () => {
+    const parent = (overrides: Record<string, unknown>) =>
+      ({
+        id: "10000000-0000-4000-8000-000000000001",
+        projectId: "20000000-0000-4000-8000-000000000002",
+        userId: 7,
+        conversationTurnId: null,
+        input: {},
+        ...overrides,
+      }) as never;
+    const capture = async (
+      operation: never,
+      result: Record<string, unknown>,
+      replay = false,
+    ) => {
+      const inserted: Array<Record<string, unknown>> = [];
+      const tx = {
+        select: () => {
+          const query: any = {
+            from: () => query,
+            where: () => query,
+            limit: () => Promise.resolve(inserted.slice(0, 1)),
+          };
+          return query;
+        },
+        insert: () => ({
+          values: async (value: Record<string, unknown>) => {
+            inserted.push(value);
+          },
+        }),
+      };
+      await enqueueAutomaticDomainSuccessor(
+        tx,
+        operation,
+        { status: "succeeded", result } as never,
+        new Date("2026-08-26T00:00:00.000Z"),
+      );
+      if (replay) {
+        await enqueueAutomaticDomainSuccessor(
+          tx,
+          operation,
+          { status: "succeeded", result } as never,
+          new Date("2026-08-26T00:01:00.000Z"),
+        );
+      }
+      return inserted;
+    };
+    const connectionId = "30000000-0000-4000-8000-000000000003";
+    const domainSync = parent({
+      kind: "domain_sync",
+      provider: "aliyun_alidns",
+      input: { connectionId, domainIntent: "sync", domain: "example.com" },
     });
-    expect(domainFinancialTerminalProjection("failed")).toEqual({
-      status: "failed",
-      activeFinancialKey: null,
+    const first = await capture(
+      domainSync,
+      { domain: "example.com", domainRevision: 4 },
+      true,
+    );
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({
+      kind: "dns_apply",
+      provider: "aliyun_esa",
+      input: {
+        prepareDomainBinding: true,
+        domain: "example.com",
+        domainRevision: 4,
+        connectionId,
+      },
     });
-    expect(
-      domainFinancialTerminalProjection("attention_required", true),
-    ).toEqual({
-      status: "attention_required",
+    expect(first[0].id).toBe(
+      siteOpsDeterministicSuccessorId(
+        "10000000-0000-4000-8000-000000000001",
+        "domain-sync:esa-prepare",
+      ),
+    );
+
+    const esa = parent({
+      id: "11000000-0000-4000-8000-000000000001",
+      kind: "dns_apply",
+      provider: "aliyun_esa",
+      input: { connectionId, domainRevision: 4 },
     });
-    expect(
-      domainFinancialTerminalProjection("attention_required", false),
-    ).toEqual({
-      status: "attention_required",
-      activeFinancialKey: null,
+    const plan = await capture(esa, {
+      phase: "esa_site_verification_dns_ready",
+      domain: "example.com",
+      domainRevision: 4,
+    });
+    expect(plan[0]).toMatchObject({
+      kind: "dns_apply",
+      provider: "aliyun_alidns",
+      input: { connectionId, domainRevision: 4, dnsIntent: "plan" },
+    });
+
+    const planOperation = parent({
+      id: "12000000-0000-4000-8000-000000000001",
+      kind: "dns_apply",
+      provider: "aliyun_alidns",
+      input: { connectionId, domainRevision: 4, dnsIntent: "plan" },
+    });
+    const apply = await capture(planOperation, {
+      domain: "example.com",
+      revision: 4,
+      canApply: true,
+      planHash: "a".repeat(64),
+      providerSnapshotHash: "b".repeat(64),
+    });
+    expect(apply[0]).toMatchObject({
+      kind: "dns_apply",
+      provider: "aliyun_alidns",
+      input: {
+        connectionId,
+        domainRevision: 4,
+        dnsIntent: "apply",
+        planOperationId: "12000000-0000-4000-8000-000000000001",
+        planHash: "a".repeat(64),
+        providerSnapshotHash: "b".repeat(64),
+      },
     });
   });
-});
 
-describe("SiteOps worker claim boundary", () => {
   it("records each build timeline stage at most once", async () => {
     const inserted: Array<Record<string, any>> = [];
     const tx = {
@@ -296,20 +392,6 @@ describe("SiteOps worker claim boundary", () => {
     expect(siteOpsWorkerMayClaimStatus("running")).toBe(true);
     expect(siteOpsWorkerMayClaimStatus("cancelled")).toBe(false);
     expect(siteOpsWorkerMayClaimStatus("failed")).toBe(false);
-  });
-
-  it("tombstones historical recover_design_output operations before provider invocation", () => {
-    expect(
-      siteOpsRemovedResumeOperation({
-        resumeMode: "recover_design_output",
-        resumeProviderTaskId: "historical-task",
-      }),
-    ).toBe(true);
-    expect(
-      siteOpsRemovedResumeOperation({
-        intent: "approved_reset_unpublish",
-      }),
-    ).toBe(false);
   });
 
   it("reads V2 visual coordinates and infers historical supplemental operations", () => {

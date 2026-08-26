@@ -1942,17 +1942,9 @@ export const workspaceSiteProfiles = mysqlTable(
     domainRevision: int("domainRevision", { unsigned: true })
       .default(1)
       .notNull(),
-    registrar: varchar("registrar", { length: 64 }),
     providerAccountUid: varchar("providerAccountUid", { length: 128 }),
-    domainInstanceId: varchar("domainInstanceId", { length: 191 }),
-    domainExpiresAt: timestamp("domainExpiresAt"),
-    domainRealNameStatus: varchar("domainRealNameStatus", { length: 64 }),
-    domainEmailStatus: varchar("domainEmailStatus", { length: 64 }),
-    domainClientHold: boolean("domainClientHold").default(false).notNull(),
     domainOwnershipStatus: varchar("domainOwnershipStatus", { length: 64 }),
     dnsStatus: varchar("dnsStatus", { length: 64 }),
-    autoRenewDesired: boolean("autoRenewDesired").default(false).notNull(),
-    autoRenewObserved: boolean("autoRenewObserved"),
     icpDomainRevision: int("icpDomainRevision", { unsigned: true }),
     siteMode: mysqlEnum("siteMode", ["managed", "external", "unknown"])
       .default("unknown")
@@ -3970,6 +3962,13 @@ export const siteProjects = mysqlTable(
       .default("zh-CN")
       .notNull(),
     canonicalHostname: varchar("canonical_hostname", { length: 255 }),
+    currentTaskStartedAt: timestamp("current_task_started_at")
+      .defaultNow()
+      .notNull(),
+    minimumKnowledgeSnapshotVersion: int(
+      "minimum_knowledge_snapshot_version",
+      { unsigned: true },
+    ),
     status: mysqlEnum("status", [
       "draft",
       "collecting_brief",
@@ -4020,10 +4019,7 @@ export const siteBuilds = mysqlTable(
       length: 64,
     }).notNull(),
     parentBuildId: varchar("parent_build_id", { length: 36 }),
-    quotaPeriodId: varchar("quota_period_id", { length: 36 }).references(
-      () => serviceQuotaPeriods.id,
-      { onDelete: "restrict" },
-    ),
+    quotaPeriodId: varchar("quota_period_id", { length: 36 }),
     quotaState: mysqlEnum("quota_state", [
       "reserved",
       "consumed",
@@ -4114,6 +4110,11 @@ export const siteBuilds = mysqlTable(
       columns: [table.twentyFirstCredentialId],
       foreignColumns: [presalesApiCredentials.id],
     }).onDelete("restrict"),
+    foreignKey({
+      name: "site_builds_quota_period_fk",
+      columns: [table.quotaPeriodId],
+      foreignColumns: [serviceQuotaPeriods.id],
+    }).onDelete("restrict"),
     check(
       "site_builds_credential_version_ck",
       sql`(
@@ -4159,10 +4160,7 @@ export const siteOperations = mysqlTable(
       "deploy",
       "rollback",
       "social_package",
-      "domain_search",
-      "domain_purchase",
-      "domain_renewal",
-      "domain_auto_renew",
+      "domain_sync",
       "dns_apply",
       "dns_rollback",
     ]).notNull(),
@@ -4294,10 +4292,7 @@ export const socialPackages = mysqlTable(
       () => deliveryTickets.id,
       { onDelete: "set null" },
     ),
-    quotaPeriodId: varchar("quota_period_id", { length: 36 }).references(
-      () => serviceQuotaPeriods.id,
-      { onDelete: "restrict" },
-    ),
+    quotaPeriodId: varchar("quota_period_id", { length: 36 }),
     quotaState: mysqlEnum("quota_state", [
       "reserved",
       "consumed",
@@ -4349,6 +4344,11 @@ export const socialPackages = mysqlTable(
       columns: [table.knowledgeSnapshotId],
       foreignColumns: [knowledgeBaseSnapshots.id],
     }).onDelete("restrict"),
+    foreignKey({
+      name: "social_packages_quota_period_fk",
+      columns: [table.quotaPeriodId],
+      foreignColumns: [serviceQuotaPeriods.id],
+    }).onDelete("restrict"),
     check(
       "social_packages_quota_pair_ck",
       sql`(
@@ -4360,7 +4360,7 @@ export const socialPackages = mysqlTable(
   ],
 );
 
-/** Customer-owned Aliyun RAM Role; no permanent customer AccessKey is stored. */
+/** Customer-approved AliDNS OAuth grant. Access tokens are never persisted. */
 export const siteProviderConnections = mysqlTable(
   "site_provider_connections",
   {
@@ -4373,17 +4373,16 @@ export const siteProviderConnections = mysqlTable(
       .references(() => users.id, { onDelete: "cascade" }),
     provider: mysqlEnum("provider", ["aliyun_cn"]).notNull(),
     accountUid: varchar("account_uid", { length: 128 }).notNull(),
-    roleArn: varchar("role_arn", { length: 512 }).notNull(),
+    oauthCredentialId: varchar("oauth_credential_id", {
+      length: 36,
+    }).notNull(),
     encryptionVersion: int("encryption_version").default(1).notNull(),
-    encryptedExternalId: text("encrypted_external_id").notNull(),
+    encryptedRefreshToken: text("encrypted_refresh_token").notNull(),
     encryptionIv: varchar("encryption_iv", { length: 32 }).notNull(),
     encryptionAuthTag: varchar("encryption_auth_tag", { length: 32 }).notNull(),
-    externalIdFingerprint: varchar("external_id_fingerprint", {
-      length: 32,
-    }).notNull(),
     capabilities: json("capabilities").$type<string[]>().default([]).notNull(),
-    status: mysqlEnum("status", ["unverified", "active", "invalid", "revoked"])
-      .default("unverified")
+    status: mysqlEnum("status", ["active", "invalid", "revoked"])
+      .default("active")
       .notNull(),
     verifiedAt: timestamp("verified_at"),
     lastErrorCode: varchar("last_error_code", { length: 128 }),
@@ -4396,96 +4395,10 @@ export const siteProviderConnections = mysqlTable(
       table.provider,
     ),
     index("site_provider_connections_account_idx").on(table.accountUid),
-  ],
-);
-
-/** Financial and read-only Domain OpenAPI operation ledger. */
-export const siteDomainOperations = mysqlTable(
-  "site_domain_operations",
-  {
-    id: varchar("id", { length: 36 }).primaryKey(),
-    projectId: varchar("project_id", { length: 36 })
-      .notNull()
-      .references(() => siteProjects.id, { onDelete: "cascade" }),
-    userId: int("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    connectionId: varchar("connection_id", { length: 36 }),
-    operationId: varchar("operation_id", { length: 36 }).references(
-      () => siteOperations.id,
-      { onDelete: "set null" },
-    ),
-    kind: mysqlEnum("kind", [
-      "search",
-      "purchase",
-      "renewal",
-      "set_auto_renew",
-      "cancel_auto_renew",
-      "sync",
-    ]).notNull(),
-    domainAscii: varchar("domain_ascii", { length: 255 }).notNull(),
-    domainUnicode: varchar("domain_unicode", { length: 255 }),
-    domainRevision: int("domain_revision", { unsigned: true }),
-    clientRequestId: varchar("client_request_id", { length: 128 }).notNull(),
-    requestFingerprint: varchar("request_fingerprint", {
-      length: 64,
-    }).notNull(),
-    quoteHash: varchar("quote_hash", { length: 64 }),
-    quoteExpiresAt: timestamp("quote_expires_at"),
-    amountMinor: bigint("amount_minor", { mode: "number", unsigned: true }),
-    currency: varchar("currency", { length: 8 }),
-    years: int("years", { unsigned: true }),
-    registrantProfileId: varchar("registrant_profile_id", { length: 191 }),
-    maskedRegistrantName: varchar("masked_registrant_name", { length: 255 }),
-    customerConfirmedAt: timestamp("customer_confirmed_at"),
-    customerConfirmationHash: varchar("customer_confirmation_hash", {
-      length: 64,
-    }),
-    /**
-     * Present only while a confirmed purchase/renewal financial intent is
-     * non-terminal. MySQL permits multiple NULL values in a unique index, so
-     * clearing this value releases the domain for a later intentional order.
-     */
-    activeFinancialKey: varchar("active_financial_key", { length: 64 }),
-    providerTaskNo: varchar("provider_task_no", { length: 512 }),
-    providerResult: json("provider_result").$type<Record<string, unknown>>(),
-    status: mysqlEnum("status", [
-      "quoted",
-      "reserved",
-      "submitted",
-      "reconciling",
-      "succeeded",
-      "failed",
-      "outcome_unknown",
-      "attention_required",
-      "expired",
-      "cancelled",
-    ]).notNull(),
-    errorCode: varchar("error_code", { length: 128 }),
-    errorMessage: text("error_message"),
-    completedAt: timestamp("completed_at"),
-    createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
-  },
-  (table) => [
-    uniqueIndex("site_domain_operations_project_request_uq").on(
-      table.projectId,
-      table.clientRequestId,
-    ),
-    uniqueIndex("site_domain_operations_site_operation_uq").on(
-      table.operationId,
-    ),
-    uniqueIndex("site_domain_operations_active_financial_uq").on(
-      table.activeFinancialKey,
-    ),
-    index("site_domain_operations_domain_status_idx").on(
-      table.domainAscii,
-      table.status,
-    ),
     foreignKey({
-      name: "site_domain_connection_fk",
-      columns: [table.connectionId],
-      foreignColumns: [siteProviderConnections.id],
+      name: "site_provider_connections_oauth_credential_fk",
+      columns: [table.oauthCredentialId],
+      foreignColumns: [presalesApiCredentials.id],
     }).onDelete("restrict"),
   ],
 );
@@ -4501,9 +4414,6 @@ export const siteDnsRecords = mysqlTable(
     userId: int("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    domainOperationId: varchar("domain_operation_id", {
-      length: 36,
-    }),
     domainAscii: varchar("domain_ascii", { length: 255 }).notNull(),
     domainRevision: int("domain_revision", { unsigned: true }).notNull(),
     recordType: varchar("record_type", { length: 16 }).notNull(),
@@ -4542,11 +4452,6 @@ export const siteDnsRecords = mysqlTable(
       table.recordType,
     ),
     index("site_dns_records_status_idx").on(table.status, table.updatedAt),
-    foreignKey({
-      name: "site_dns_domain_operation_fk",
-      columns: [table.domainOperationId],
-      foreignColumns: [siteDomainOperations.id],
-    }).onDelete("set null"),
   ],
 );
 
@@ -4736,8 +4641,5 @@ export type SiteProviderConnection =
   typeof siteProviderConnections.$inferSelect;
 export type InsertSiteProviderConnection =
   typeof siteProviderConnections.$inferInsert;
-export type SiteDomainOperation = typeof siteDomainOperations.$inferSelect;
-export type InsertSiteDomainOperation =
-  typeof siteDomainOperations.$inferInsert;
 export type SiteDnsRecord = typeof siteDnsRecords.$inferSelect;
 export type InsertSiteDnsRecord = typeof siteDnsRecords.$inferInsert;

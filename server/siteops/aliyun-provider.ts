@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   resolve4,
   resolve6,
@@ -8,80 +8,45 @@ import {
 import { domainToASCII, domainToUnicode } from "node:url";
 
 import * as AliDnsModels from "@alicloud/alidns20150109";
-import * as DomainModels from "@alicloud/domain20180129";
 import * as OpenApi from "@alicloud/openapi-client";
-import * as StsModels from "@alicloud/sts20150401";
-import { and, eq, inArray, isNotNull, or } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 
 import {
   siteDnsRecords,
-  siteDeployments,
-  siteDomainOperations,
   siteOperations,
   siteProjects,
   siteProviderConnections,
+  presalesApiCredentials,
   workspaceSiteProfiles,
-  type SiteDomainOperation,
   type SiteDnsRecord,
   type SiteOperation,
   type SiteProviderConnection,
 } from "../../drizzle/schema";
-import { SITEOPS_CUSTOMER_DISPLAY_NAME } from "../../shared/siteops-branding";
+import { approvedResetUnpublishInputSchema } from "./rebuild-ticket";
 import {
+  AuthServiceError,
   decryptCredentialSecret,
   encryptCredentialSecret,
 } from "../auth-service";
 import { getDb } from "../db";
 import {
-  ALIYUN_CUSTOMER_ROLE_ACTIONS,
-  ALIYUN_CUSTOMER_ROLE_NAME,
-  ALIYUN_DOMAIN_AUTO_RENEW_ACTIONS,
-  ALIYUN_DOMAIN_PURCHASE_ACTIONS,
-  ALIYUN_DOMAIN_READ_ACTIONS,
-  ALIYUN_DOMAIN_RENEW_ACTIONS,
+  ALIYUN_OAUTH_CREDENTIAL_SLOT,
   aliyunSdkErrorDetails,
-  getActiveAliyunBrokerCredential,
-  getPinnedAliyunBrokerCredential,
+  refreshAliyunOAuthAccessToken,
+  revokeAliyunOAuthToken,
 } from "./aliyun-platform-service";
-import {
-  AliyunDnsClient,
-  AliyunDomainClient,
-  AliyunStsClient,
-} from "./aliyun-sdk-constructors";
+import { AliyunDnsClient } from "./aliyun-sdk-constructors";
 import {
   registerSiteOpsProviderHandler,
   type SiteOpsProviderHandler,
   type SiteOpsProviderResult,
 } from "./providers";
 
-const STS_ENDPOINT = "sts.cn-hangzhou.aliyuncs.com";
-const DOMAIN_ENDPOINT = "domain.aliyuncs.com";
 const ALIDNS_ENDPOINT = "alidns.cn-hangzhou.aliyuncs.com";
 const ALIYUN_REQUEST_TIMEOUT_MS = 12_000;
-const QUOTE_TTL_MS = 60_000;
-const RESPONSE_LOSS_RECONCILE_MS = 10 * 60_000;
 const DNS_PROPAGATION_TIMEOUT_MS = 15 * 60_000;
-const ALIYUN_PERMISSION_PROPAGATION_GRACE_MS = 2 * 60_000;
 const DEFAULT_DNS_TTL = 600;
-
-export const ALIYUN_ROLE_MIGRATION_DEFERRED_CODE =
-  "ALIYUN_ROLE_MIGRATION_DEFERRED" as const;
-
-const connectionInputSchema = z
-  .object({
-    projectId: z.string().uuid(),
-    userId: z.number().int().positive(),
-    accountUid: z
-      .string()
-      .trim()
-      .regex(/^\d{6,64}$/),
-    roleArn: z
-      .string()
-      .trim()
-      .regex(/^acs:ram::\d{6,64}:role\/[A-Za-z0-9.@_\-]+$/),
-  })
-  .strict();
 
 const ownedConnectionInputSchema = z
   .object({
@@ -89,53 +54,6 @@ const ownedConnectionInputSchema = z
     userId: z.number().int().positive(),
   })
   .strict();
-
-const domainOperationInputSchema = z
-  .object({
-    domain: z.string().trim().min(1).max(255),
-    domainUnicode: z.string().trim().min(1).max(255).optional(),
-    domainIntent: z.enum(["sync"]).optional(),
-    years: z.number().int().min(1).max(10).optional(),
-    typedDomain: z.string().trim().min(1).max(255).optional(),
-    quoteHash: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .optional(),
-    domainOperationId: z.string().uuid().optional(),
-    enabled: z.boolean().optional(),
-    customerConfirmed: z.literal(true).optional(),
-    registrantProfileId: z.string().trim().regex(/^\d+$/).optional(),
-    connectionId: z.string().uuid(),
-    domainLedgerId: z.string().uuid(),
-    brokerCredentialId: z.string().uuid().optional(),
-    brokerCredentialVersion: z.number().int().positive().optional(),
-    expectedCanonicalHostname: z.string().trim().min(1).max(253).optional(),
-    expectedDomainRevision: z.number().int().positive().optional(),
-  })
-  .strict()
-  .superRefine((value, context) => {
-    if (
-      Boolean(value.brokerCredentialId) !==
-      Boolean(value.brokerCredentialVersion)
-    ) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["brokerCredentialId"],
-        message: "Broker credential id/version must be provided together.",
-      });
-    }
-    if (
-      Boolean(value.expectedCanonicalHostname) !==
-      Boolean(value.expectedDomainRevision)
-    ) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["expectedDomainRevision"],
-        message:
-          "Renewal hostname and domain revision must be provided together.",
-      });
-    }
-  });
 
 const dnsOperationInputSchema = z
   .object({
@@ -151,19 +69,15 @@ const dnsOperationInputSchema = z
       .string()
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
-    brokerCredentialId: z.string().uuid().optional(),
-    brokerCredentialVersion: z.number().int().positive().optional(),
+    approvedReset: approvedResetUnpublishInputSchema.optional(),
   })
   .strict()
   .superRefine((value, context) => {
-    if (
-      Boolean(value.brokerCredentialId) !==
-      Boolean(value.brokerCredentialVersion)
-    ) {
+    if (value.approvedReset && value.dnsIntent !== "rollback") {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ["brokerCredentialId"],
-        message: "Broker credential id/version must be provided together.",
+        path: ["approvedReset"],
+        message: "Approved reset coordinates are valid only for DNS rollback.",
       });
     }
     if (value.dnsIntent !== "plan" && value.domainRevision == null) {
@@ -191,100 +105,20 @@ const dnsOperationInputSchema = z
     }
   });
 
+const domainSyncInputSchema = z
+  .object({
+    domainIntent: z.literal("sync"),
+    connectionId: z.string().uuid(),
+    domain: z.string().trim().min(1).max(255),
+  })
+  .strict();
+
+const aliyunOperationInputSchema = z.union([
+  domainSyncInputSchema,
+  dnsOperationInputSchema,
+]);
+
 type DbExecutor = NonNullable<Awaited<ReturnType<typeof getDb>>>;
-type DbQueryExecutor = Pick<DbExecutor, "select" | "insert" | "update">;
-
-async function assertAliyunConnectionMutable(
-  db: DbQueryExecutor,
-  input: { projectId: string; userId: number },
-) {
-  const [running, unresolvedFinancial] = await Promise.all([
-    db
-      .select({ id: siteOperations.id })
-      .from(siteOperations)
-      .where(
-        and(
-          eq(siteOperations.projectId, input.projectId),
-          eq(siteOperations.userId, input.userId),
-          or(
-            eq(siteOperations.provider, "aliyun_domain"),
-            eq(siteOperations.provider, "aliyun_alidns"),
-          ),
-          inArray(siteOperations.status, [
-            "queued",
-            "running",
-            "outcome_unknown",
-          ]),
-        ),
-      )
-      .limit(1),
-    db
-      .select({ id: siteDomainOperations.id })
-      .from(siteDomainOperations)
-      .where(
-        and(
-          eq(siteDomainOperations.projectId, input.projectId),
-          eq(siteDomainOperations.userId, input.userId),
-          isNotNull(siteDomainOperations.activeFinancialKey),
-        ),
-      )
-      .limit(1),
-  ]);
-  if (running.length > 0 || unresolvedFinancial.length > 0) {
-    throw new AliyunProviderError(
-      "CONNECTION_IN_USE",
-      "该 RAM Role 仍绑定正在执行或结果待对账的域名/DNS 操作，暂不能轮换或撤销。",
-    );
-  }
-}
-
-type AssumedCredentials = {
-  accessKeyId: string;
-  accessKeySecret: string;
-  securityToken: string;
-  expiration: string | null;
-  assumedRoleArn: string | null;
-};
-
-export type AliyunRegistrantProfile = {
-  profileId: string;
-  holderType: "individual" | "enterprise" | "unknown";
-  maskedName: string;
-  realNameVerified: boolean;
-  emailVerified: boolean;
-  isDefault: boolean;
-};
-
-export type AliyunDomainDetails = {
-  domain: string;
-  instanceId: string;
-  expirationDateMs: number;
-  realNameStatus: string | null;
-  emailStatus: string | null;
-  clientHold: boolean;
-  autoRenewEnabled: boolean | null;
-};
-
-export type AliyunDomainCheck = {
-  domain: string;
-  available: boolean;
-  availabilityCode: string;
-  premium: boolean;
-  amountMinor: number | null;
-  currency: "CNY";
-  reason: string | null;
-  requestId: string | null;
-};
-
-export type AliyunTaskState = {
-  taskNo: string;
-  state: "pending" | "succeeded" | "failed";
-  domain: string | null;
-  taskType: string | null;
-  message: string | null;
-  instanceId: string | null;
-};
-
 export type AliyunDnsRecordView = {
   recordId: string;
   rr: string;
@@ -294,38 +128,9 @@ export type AliyunDnsRecordView = {
   remark: string | null;
 };
 
-export interface AliyunDomainApi {
-  checkDomain(input: {
-    domain: string;
-    command: "create" | "renew";
-    years: number;
-  }): Promise<AliyunDomainCheck>;
-  listVerifiedRegistrantProfiles(): Promise<AliyunRegistrantProfile[]>;
-  getDomain(domain: string): Promise<AliyunDomainDetails | null>;
-  submitPurchase(input: {
-    domain: string;
-    years: number;
-    registrantProfileId: string;
-  }): Promise<{ taskNo: string; requestId: string | null }>;
-  submitRenewal(input: {
-    domain: string;
-    years: number;
-    currentExpirationDateMs: number;
-  }): Promise<{ taskNo: string; requestId: string | null }>;
-  setAutoRenew(input: {
-    instanceId: string;
-    enabled: boolean;
-  }): Promise<{ ok: boolean; requestId: string | null }>;
-  getTask(taskNo: string, domain: string): Promise<AliyunTaskState>;
-  findTaskCandidates(input: {
-    domain: string;
-    kind: "purchase" | "renewal";
-    createdAfter: Date;
-  }): Promise<AliyunTaskState[]>;
-}
-
 export interface AliyunDnsApi {
-  listDomains(): Promise<string[]>;
+  listDomains(): Promise<AliyunDomainView[]>;
+  getDomain(domain: string): Promise<AliyunDomainView | null>;
   listRecords(domain: string): Promise<AliyunDnsRecordView[]>;
   addRecord(input: {
     domain: string;
@@ -348,18 +153,13 @@ export interface AliyunDnsApi {
   deleteRecord(recordId: string): Promise<{ requestId: string | null }>;
 }
 
+export type AliyunDomainView = {
+  domain: string;
+  displayDomain: string;
+};
+
 export interface AliyunProviderSdkFactory {
-  assumeRole(input: {
-    roleArn: string;
-    externalId?: string;
-    sessionName: string;
-    policy: string;
-    brokerCredentialId?: string;
-    brokerCredentialVersion?: number;
-  }): Promise<AssumedCredentials>;
-  getCallerAccount(credentials: AssumedCredentials): Promise<string>;
-  domain(credentials: AssumedCredentials): AliyunDomainApi;
-  dns(credentials: AssumedCredentials): AliyunDnsApi;
+  dns(accessToken: string): AliyunDnsApi;
 }
 
 export type PublicDnsResolver = (input: {
@@ -376,6 +176,18 @@ export class AliyunProviderError extends Error {
   ) {
     super(message);
     this.name = "AliyunProviderError";
+  }
+}
+
+export function assertAliyunDomainSelectionSafe(input: {
+  sameDomain: boolean;
+  hasExistingDomainState: boolean;
+}) {
+  if (!input.sameDomain && input.hasExistingDomainState) {
+    throw new AliyunProviderError(
+      "DOMAIN_SWITCH_REQUIRES_RESET",
+      "当前项目已接入其他域名，请先申请重置并完成安全下线。",
+    );
   }
 }
 
@@ -410,126 +222,6 @@ export function normalizeAliyunDomain(value: string) {
   return { ascii, unicode: domainToUnicode(ascii) || trimmed };
 }
 
-function connectionAad(connectionId: string) {
-  return `frontmind-aliyun-external-id:v1:${connectionId}`;
-}
-
-export function sealAliyunExternalId(connectionId: string, externalId: string) {
-  const encrypted = encryptCredentialSecret(
-    connectionAad(connectionId),
-    externalId,
-  );
-  return {
-    encryptionVersion: encrypted.encryptionVersion,
-    encryptedExternalId: encrypted.encryptedKey,
-    encryptionIv: encrypted.encryptionIv,
-    encryptionAuthTag: encrypted.encryptionAuthTag,
-    externalIdFingerprint: sha256(externalId).slice(0, 32),
-  };
-}
-
-export function openAliyunExternalId(
-  connection: Pick<
-    SiteProviderConnection,
-    | "id"
-    | "encryptionVersion"
-    | "encryptedExternalId"
-    | "encryptionIv"
-    | "encryptionAuthTag"
-  >,
-) {
-  return decryptCredentialSecret(connectionAad(connection.id), {
-    encryptionVersion: connection.encryptionVersion,
-    encryptedKey: connection.encryptedExternalId,
-    encryptionIv: connection.encryptionIv,
-    encryptionAuthTag: connection.encryptionAuthTag,
-  });
-}
-
-function roleAccount(roleArn: string) {
-  return /^acs:ram::(\d+):role\//.exec(roleArn)?.[1] ?? null;
-}
-
-function roleName(roleArn: string) {
-  return /^acs:ram::\d+:role\/([A-Za-z0-9.@_-]+)$/u.exec(roleArn)?.[1] ?? null;
-}
-
-const MANAGED_ALIYUN_DYNAMIC_ROLE_PATTERN = /^FrontMindSiteOps-[a-f0-9]{12}$/u;
-
-export function aliyunCustomerRoleName(connectionId: string) {
-  const normalizedId = z.string().uuid().parse(connectionId).toLowerCase();
-  return `FrontMindSiteOps-${normalizedId.replaceAll("-", "").slice(0, 12)}`;
-}
-
-function aliyunCustomerRoleArn(accountUid: string, connectionId: string) {
-  return `acs:ram::${accountUid}:role/${aliyunCustomerRoleName(connectionId)}`;
-}
-
-function legacyAliyunCustomerRoleArn(accountUid: string) {
-  return `acs:ram::${accountUid}:role/${ALIYUN_CUSTOMER_ROLE_NAME}`;
-}
-
-function aliyunRepairRoleName(connectionId: string, currentRoleArn: string) {
-  const normalizedId = z.string().uuid().parse(connectionId).toLowerCase();
-  const currentName = roleName(currentRoleArn);
-  for (let attempt = 0; attempt < 32; attempt += 1) {
-    const seed =
-      attempt === 0
-        ? `${normalizedId}/${currentRoleArn}`
-        : `${normalizedId}/${currentRoleArn}/${attempt}`;
-    const candidate = `FrontMindSiteOps-${sha256(seed).slice(0, 12)}`;
-    if (candidate !== currentName) return candidate;
-  }
-  throw new AliyunProviderError(
-    "ALIYUN_ROLE_NAME_DERIVATION_FAILED",
-    "无法派生新的阿里云修复角色名称。",
-  );
-}
-
-function operationPolicy(actions: string[]) {
-  return JSON.stringify({
-    Version: "1",
-    Statement: [
-      {
-        Effect: "Allow",
-        Action: actions,
-        Resource: ["*"],
-      },
-    ],
-  });
-}
-
-const DOMAIN_READ_POLICY = operationPolicy([...ALIYUN_DOMAIN_READ_ACTIONS]);
-
-const DOMAIN_PURCHASE_POLICY = operationPolicy([
-  ...ALIYUN_DOMAIN_PURCHASE_ACTIONS,
-]);
-
-const DOMAIN_RENEW_POLICY = operationPolicy([...ALIYUN_DOMAIN_RENEW_ACTIONS]);
-
-const DOMAIN_AUTO_RENEW_POLICY = operationPolicy([
-  ...ALIYUN_DOMAIN_AUTO_RENEW_ACTIONS,
-]);
-
-export function aliyunFinancialSessionPolicy(kind: "purchase" | "renewal") {
-  return kind === "purchase" ? DOMAIN_PURCHASE_POLICY : DOMAIN_RENEW_POLICY;
-}
-
-const DNS_READ_POLICY = operationPolicy([
-  "alidns:DescribeDomains",
-  "alidns:DescribeDomainRecords",
-  "alidns:DescribeDomainRecordInfo",
-]);
-
-const DNS_WRITE_POLICY = operationPolicy([
-  "alidns:DescribeDomainRecords",
-  "alidns:DescribeDomainRecordInfo",
-  "alidns:AddDomainRecord",
-  "alidns:UpdateDomainRecord",
-  "alidns:UpdateDomainRecordRemark",
-  "alidns:DeleteDomainRecord",
-]);
-
 function assertNotAborted(signal: AbortSignal) {
   if (signal.aborted) {
     throw new AliyunProviderError(
@@ -557,12 +249,11 @@ function asDate(value: Date | string | number | null | undefined) {
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-function maskName(value: string | null | undefined) {
-  const normalized = value?.trim();
-  if (!normalized) return "***";
-  const characters = Array.from(normalized);
-  if (characters.length <= 2) return `${characters[0] ?? "*"}*`;
-  return `${characters[0]}${"*".repeat(Math.min(6, characters.length - 2))}${characters.at(-1)}`;
+function affectedRows(value: unknown) {
+  const header = Array.isArray(value)
+    ? (value[0] as { affectedRows?: unknown } | undefined)
+    : (value as { affectedRows?: unknown } | undefined);
+  return Number(header?.affectedRows ?? 0);
 }
 
 function resultError(error: unknown): SiteOpsProviderResult {
@@ -584,340 +275,81 @@ function resultError(error: unknown): SiteOpsProviderResult {
   };
 }
 
-function temporaryConfig(credentials: AssumedCredentials, endpoint: string) {
+function bearerConfig(accessToken: string, endpoint: string) {
   return new OpenApi.Config({
-    accessKeyId: credentials.accessKeyId,
-    accessKeySecret: credentials.accessKeySecret,
-    securityToken: credentials.securityToken,
+    bearerToken: accessToken,
     endpoint,
     protocol: "HTTPS",
     regionId: "cn-hangzhou",
     connectTimeout: ALIYUN_REQUEST_TIMEOUT_MS,
     readTimeout: ALIYUN_REQUEST_TIMEOUT_MS,
-    userAgent: "frontmind-siteops/1.0",
+    userAgent: "frontmind-siteops/3.0",
   });
-}
-
-function amountToMinorUnits(value: unknown) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return null;
-  }
-  const fixed = value.toFixed(2);
-  const [whole, fraction = ""] = fixed.split(".");
-  const minor =
-    Number(whole) * 100 + Number(fraction.padEnd(2, "0").slice(0, 2));
-  return Number.isSafeInteger(minor) ? minor : null;
-}
-
-function premiumFlag(value: unknown) {
-  if (typeof value === "boolean") return value;
-  return typeof value === "string" && value.toLowerCase() === "true";
-}
-
-function mapTaskState(
-  taskNo: string,
-  detail: {
-    taskStatusCode?: number;
-    domainName?: string;
-    taskType?: string;
-    failReason?: string;
-    errorMsg?: string;
-    instanceId?: string;
-  } | null,
-): AliyunTaskState {
-  const code = detail?.taskStatusCode;
-  return {
-    taskNo,
-    state: code === 2 ? "succeeded" : code === 3 ? "failed" : "pending",
-    domain: detail?.domainName
-      ? normalizeAliyunDomain(detail.domainName).ascii
-      : null,
-    taskType: detail?.taskType ?? null,
-    message: detail?.failReason ?? detail?.errorMsg ?? null,
-    instanceId: detail?.instanceId ?? null,
-  };
-}
-
-class OfficialAliyunDomainApi implements AliyunDomainApi {
-  private readonly client: InstanceType<typeof AliyunDomainClient>;
-
-  constructor(credentials: AssumedCredentials) {
-    this.client = new AliyunDomainClient(
-      temporaryConfig(credentials, DOMAIN_ENDPOINT),
-    );
-  }
-
-  async checkDomain(input: {
-    domain: string;
-    command: "create" | "renew";
-    years: number;
-  }): Promise<AliyunDomainCheck> {
-    const response = await this.client.checkDomain(
-      new DomainModels.CheckDomainRequest({
-        domainName: input.domain,
-        feeCommand: input.command,
-        feePeriod: input.years,
-        lang: "en",
-      }),
-    );
-    const body = response.body;
-    const prices = body?.staticPriceInfo?.priceInfo ?? [];
-    const preferred = prices.find((price) => {
-      const action = price.action?.toLowerCase() ?? "";
-      return input.command === "create"
-        ? action.includes("create") || action.includes("activate")
-        : action.includes("renew");
-    });
-    const amount = preferred?.money ?? body?.price;
-    return {
-      domain: normalizeAliyunDomain(body?.domainName ?? input.domain).ascii,
-      available: body?.avail === "1",
-      availabilityCode: body?.avail ?? "-1",
-      premium: premiumFlag(body?.premium),
-      amountMinor: amountToMinorUnits(amount),
-      currency: "CNY",
-      reason: body?.reason ?? null,
-      requestId: body?.requestId ?? null,
-    };
-  }
-
-  async listVerifiedRegistrantProfiles() {
-    const response = await this.client.queryRegistrantProfiles(
-      new DomainModels.QueryRegistrantProfilesRequest({
-        pageNum: 1,
-        pageSize: 500,
-        realNameStatus: "SUCCEED",
-        lang: "en",
-      }),
-    );
-    return (response.body?.registrantProfiles?.registrantProfile ?? []).map(
-      (profile): AliyunRegistrantProfile => {
-        const holderName =
-          profile.zhRegistrantOrganization ??
-          profile.registrantOrganization ??
-          profile.zhRegistrantName ??
-          profile.registrantName;
-        return {
-          profileId: String(profile.registrantProfileId ?? ""),
-          holderType:
-            profile.registrantType === "1"
-              ? "individual"
-              : profile.registrantType === "2"
-                ? "enterprise"
-                : "unknown",
-          maskedName: maskName(holderName),
-          realNameVerified: profile.realNameStatus === "SUCCEED",
-          emailVerified: profile.emailVerificationStatus === 1,
-          isDefault: profile.defaultRegistrantProfile === true,
-        };
-      },
-    );
-  }
-
-  async getDomain(domain: string): Promise<AliyunDomainDetails | null> {
-    try {
-      const [response, autoRenewResponse] = await Promise.all([
-        this.client.queryDomainByDomainName(
-          new DomainModels.QueryDomainByDomainNameRequest({
-            domainName: domain,
-            lang: "en",
-          }),
-        ),
-        this.client.queryDomainList(
-          new DomainModels.QueryDomainListRequest({
-            domainName: domain,
-            pageNum: 1,
-            pageSize: 10,
-            lang: "en",
-          }),
-        ),
-      ]);
-      const body = response.body;
-      const accountDomains = autoRenewResponse.body?.data?.domain ?? [];
-      const owned = accountDomains.find(
-        (entry) =>
-          entry.domainName &&
-          normalizeAliyunDomain(entry.domainName).ascii ===
-            normalizeAliyunDomain(domain).ascii,
-      );
-      const instanceId = body?.instanceId ?? owned?.instanceId;
-      const expirationDateMs =
-        body?.expirationDateLong ?? owned?.expirationDateLong;
-      if (
-        !body?.domainName ||
-        !owned?.domainName ||
-        !instanceId ||
-        !expirationDateMs ||
-        (body.instanceId &&
-          owned.instanceId &&
-          body.instanceId !== owned.instanceId)
-      ) {
-        return null;
-      }
-      return {
-        domain: normalizeAliyunDomain(body.domainName).ascii,
-        instanceId,
-        expirationDateMs,
-        realNameStatus: body.domainNameVerificationStatus ?? null,
-        emailStatus:
-          body.emailVerificationStatus == null
-            ? null
-            : String(body.emailVerificationStatus),
-        clientHold: body.emailVerificationClientHold === true,
-        autoRenewEnabled: owned.autoRenewEnabled ?? null,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (/not.?found|invalid.?domain|不存在/i.test(message)) return null;
-      throw error;
-    }
-  }
-
-  async submitPurchase(input: {
-    domain: string;
-    years: number;
-    registrantProfileId: string;
-  }) {
-    const response = await this.client.saveSingleTaskForCreatingOrderActivate(
-      new DomainModels.SaveSingleTaskForCreatingOrderActivateRequest({
-        domainName: input.domain,
-        subscriptionDuration: input.years,
-        registrantProfileId: Number(input.registrantProfileId),
-        permitPremiumActivation: false,
-        aliyunDns: true,
-        enableDomainProxy: false,
-        useCoupon: false,
-        usePromotion: false,
-        lang: "en",
-      }),
-    );
-    const taskNo = response.body?.taskNo;
-    if (!taskNo) {
-      throw new AliyunProviderError(
-        "ALIYUN_TASK_NO_MISSING",
-        "阿里云未返回注册任务号；结果必须通过只读查询对账。",
-        true,
-      );
-    }
-    return { taskNo, requestId: response.body?.requestId ?? null };
-  }
-
-  async submitRenewal(input: {
-    domain: string;
-    years: number;
-    currentExpirationDateMs: number;
-  }) {
-    const response = await this.client.saveSingleTaskForCreatingOrderRenew(
-      new DomainModels.SaveSingleTaskForCreatingOrderRenewRequest({
-        domainName: input.domain,
-        subscriptionDuration: input.years,
-        currentExpirationDate: input.currentExpirationDateMs,
-        permitPremiumRenew: false,
-        useCoupon: false,
-        usePromotion: false,
-        lang: "en",
-      }),
-    );
-    const taskNo = response.body?.taskNo;
-    if (!taskNo) {
-      throw new AliyunProviderError(
-        "ALIYUN_TASK_NO_MISSING",
-        "阿里云未返回续费任务号；结果必须通过只读查询对账。",
-        true,
-      );
-    }
-    return { taskNo, requestId: response.body?.requestId ?? null };
-  }
-
-  async setAutoRenew(input: { instanceId: string; enabled: boolean }) {
-    const response = await this.client.setupDomainAutoRenew(
-      new DomainModels.SetupDomainAutoRenewRequest({
-        instanceId: input.instanceId,
-        operation: input.enabled ? "SET" : "CANCEL",
-      }),
-    );
-    return {
-      ok: response.body?.result === true,
-      requestId: response.body?.requestId ?? null,
-    };
-  }
-
-  async getTask(taskNo: string, domain: string) {
-    const response = await this.client.queryTaskDetailList(
-      new DomainModels.QueryTaskDetailListRequest({
-        taskNo,
-        domainName: domain,
-        pageNum: 1,
-        pageSize: 100,
-        lang: "en",
-      }),
-    );
-    const details = response.body?.data?.taskDetail ?? [];
-    const exact = details.find(
-      (detail) =>
-        detail.domainName &&
-        normalizeAliyunDomain(detail.domainName).ascii === domain,
-    );
-    return mapTaskState(taskNo, exact ?? details[0] ?? null);
-  }
-
-  async findTaskCandidates(input: {
-    domain: string;
-    kind: "purchase" | "renewal";
-    createdAfter: Date;
-  }) {
-    const response = await this.client.queryTaskList(
-      new DomainModels.QueryTaskListRequest({
-        beginCreateTime: input.createdAfter.getTime(),
-        endCreateTime: Date.now(),
-        pageNum: 1,
-        pageSize: 100,
-        lang: "en",
-      }),
-    );
-    const tasks = response.body?.data?.taskInfo ?? [];
-    const expectedPattern =
-      input.kind === "purchase" ? /activate|create|register/i : /renew/i;
-    const likely = tasks.filter((task) =>
-      expectedPattern.test(
-        `${task.taskBizType ?? ""} ${task.taskType ?? ""} ${task.taskTypeDescription ?? ""}`,
-      ),
-    );
-    const states = await Promise.all(
-      likely
-        .slice(0, 50)
-        .map((task) =>
-          task.taskNo
-            ? this.getTask(task.taskNo, input.domain)
-            : Promise.resolve(null),
-        ),
-    );
-    return states.filter((state): state is AliyunTaskState =>
-      Boolean(state && state.domain === input.domain),
-    );
-  }
 }
 
 class OfficialAliyunDnsApi implements AliyunDnsApi {
   private readonly client: InstanceType<typeof AliyunDnsClient>;
 
-  constructor(credentials: AssumedCredentials) {
+  constructor(accessToken: string) {
     this.client = new AliyunDnsClient(
-      temporaryConfig(credentials, ALIDNS_ENDPOINT),
+      bearerConfig(accessToken, ALIDNS_ENDPOINT),
     );
   }
 
   async listDomains() {
-    const response = await this.client.describeDomains(
-      new AliDnsModels.DescribeDomainsRequest({
-        pageNumber: 1,
-        pageSize: 100,
-        lang: "en",
-      }),
+    const domains = new Map<string, AliyunDomainView>();
+    for (let page = 1; page <= 100; page += 1) {
+      const response = await this.client.describeDomains(
+        new AliDnsModels.DescribeDomainsRequest({
+          pageNumber: page,
+          pageSize: 100,
+          lang: "en",
+        }),
+      );
+      const entries = response.body?.domains?.domain ?? [];
+      for (const rawEntry of entries) {
+        const entry = rawEntry as typeof rawEntry & { aliDomain?: boolean };
+        if (entry.aliDomain !== true || !entry.domainName) continue;
+        const normalized = normalizeAliyunDomain(entry.domainName);
+        domains.set(normalized.ascii, {
+          domain: normalized.ascii,
+          displayDomain: normalized.unicode,
+        });
+      }
+      if (entries.length < 100) break;
+    }
+    return [...domains.values()].sort((left, right) =>
+      left.domain.localeCompare(right.domain),
     );
-    return (response.body?.domains?.domain ?? []).flatMap((domain) =>
-      domain.domainName ? [domain.domainName] : [],
-    );
+  }
+
+  async getDomain(domain: string) {
+    const requested = normalizeAliyunDomain(domain);
+    try {
+      const response = await this.client.describeDomainInfo(
+        new AliDnsModels.DescribeDomainInfoRequest({
+          domainName: requested.ascii,
+          lang: "en",
+          needDetailAttributes: false,
+        }),
+      );
+      const body = response.body;
+      if (body?.aliDomain !== true || !body.domainName) return null;
+      const observed = normalizeAliyunDomain(body.domainName);
+      if (observed.ascii !== requested.ascii) return null;
+      return { domain: observed.ascii, displayDomain: observed.unicode };
+    } catch (error) {
+      const details = aliyunSdkErrorDetails(error);
+      if (
+        details.statusCode === 404 ||
+        /(?:DomainNotExist|InvalidDomainName\.NoExist)/iu.test(
+          details.providerCode ?? "",
+        )
+      ) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   async listRecords(domain: string) {
@@ -1026,316 +458,76 @@ class OfficialAliyunDnsApi implements AliyunDnsApi {
 export class OfficialAliyunProviderSdkFactory
   implements AliyunProviderSdkFactory
 {
-  async assumeRole(input: {
-    roleArn: string;
-    externalId?: string;
-    sessionName: string;
-    policy: string;
-    brokerCredentialId?: string;
-    brokerCredentialVersion?: number;
-  }): Promise<AssumedCredentials> {
-    const platformCredential =
-      input.brokerCredentialId && input.brokerCredentialVersion
-        ? await getPinnedAliyunBrokerCredential(
-            input.brokerCredentialId,
-            input.brokerCredentialVersion,
-          )
-        : await getActiveAliyunBrokerCredential();
-    if (!platformCredential) {
-      throw new AliyunProviderError(
-        "PLATFORM_IDENTITY_NOT_CONFIGURED",
-        input.brokerCredentialId
-          ? "该操作冻结的 FrontMind 服务身份已不可用；未提交任何客户账号操作。"
-          : "FrontMind 服务身份未配置，无法 AssumeRole；未提交任何客户账号操作。",
-      );
-    }
-    const sts = new AliyunStsClient(
-      new OpenApi.Config({
-        accessKeyId: platformCredential.accessKeyId,
-        accessKeySecret: platformCredential.accessKeySecret,
-        endpoint: STS_ENDPOINT,
-        protocol: "HTTPS",
-        regionId: "cn-hangzhou",
-        connectTimeout: ALIYUN_REQUEST_TIMEOUT_MS,
-        readTimeout: ALIYUN_REQUEST_TIMEOUT_MS,
-        userAgent: "frontmind-siteops/1.0",
-      }),
-    );
-    const response = await sts.assumeRole(
-      new StsModels.AssumeRoleRequest({
-        roleArn: input.roleArn,
-        roleSessionName: input.sessionName.slice(0, 64),
-        externalId: input.externalId,
-        durationSeconds: 900,
-        policy: input.policy,
-      }),
-    );
-    const credentials = response.body?.credentials;
-    if (
-      !credentials?.accessKeyId ||
-      !credentials.accessKeySecret ||
-      !credentials.securityToken
-    ) {
-      throw new AliyunProviderError(
-        "ASSUME_ROLE_FAILED",
-        "阿里云未返回完整 STS 临时凭据。",
-      );
-    }
-    return {
-      accessKeyId: credentials.accessKeyId,
-      accessKeySecret: credentials.accessKeySecret,
-      securityToken: credentials.securityToken,
-      expiration: credentials.expiration ?? null,
-      assumedRoleArn: response.body?.assumedRoleUser?.arn ?? null,
-    };
-  }
-
-  async getCallerAccount(credentials: AssumedCredentials) {
-    const client = new AliyunStsClient(
-      temporaryConfig(credentials, STS_ENDPOINT),
-    );
-    const response = await client.getCallerIdentity();
-    const accountId = response.body?.accountId;
-    if (!accountId) {
-      throw new AliyunProviderError(
-        "CALLER_IDENTITY_MISSING",
-        "无法确认阿里云临时身份所属账号。",
-      );
-    }
-    return accountId;
-  }
-
-  domain(credentials: AssumedCredentials) {
-    return new OfficialAliyunDomainApi(credentials);
-  }
-
-  dns(credentials: AssumedCredentials) {
-    return new OfficialAliyunDnsApi(credentials);
+  dns(accessToken: string) {
+    return new OfficialAliyunDnsApi(accessToken);
   }
 }
 
-export type AliyunConnectionStatus = {
-  configured: boolean;
-  connectionId: string | null;
-  accountUid: string | null;
-  roleArn: string | null;
-  externalIdFingerprint: string | null;
-  status: "unverified" | "active" | "invalid" | "revoked" | null;
-  capabilities: string[];
-  verifiedAt: number | null;
-  lastErrorCode: string | null;
-};
-
-export type AliyunCustomerConnectionProbe =
-  | {
-      status: "active";
-      connected: true;
-      accountUid: string;
-      capabilities: string[];
-    }
-  | {
-      status: "pending";
-      connected: false;
-      reason: "role_not_ready" | "permission_propagating" | "provider_retry";
-      retryAfterMs: number;
-    }
-  | {
-      status: "attention_required";
-      connected: false;
-      reason:
-        | "account_mismatch"
-        | "permission_incomplete"
-        | "external_id_not_enforced";
-      retryable: false;
-    };
-
-type AliyunConnectionProbeStage =
-  | "assume_role"
-  | "external_id_enforcement"
-  | "caller_identity"
-  | "domain_permission"
-  | "dns_assume_role"
-  | "dns_caller_identity"
-  | "dns_permission";
-
-function providerErrorCode(error: unknown) {
-  if (error instanceof AliyunProviderError) return error.code;
-  return aliyunSdkErrorDetails(error).providerCode ?? "";
+function refreshTokenAad(input: {
+  connectionId: string;
+  accountUid: string;
+  oauthCredentialId: string;
+}) {
+  return [
+    "frontmind-aliyun-oauth-refresh:v1",
+    input.connectionId,
+    input.accountUid,
+    input.oauthCredentialId,
+  ].join(":");
 }
 
-function isAliyunProviderRetry(error: unknown) {
-  if (error instanceof AliyunProviderError) {
-    if (error.outcomeUnknown) return true;
-    if (
-      /^(?:PROVIDER_TIMEOUT|RATE_LIMITED|UPSTREAM_UNAVAILABLE|ALIYUN_PROVIDER_RETRY)$/u.test(
-        error.code,
-      )
-    ) {
-      return true;
-    }
-  }
-  const details = aliyunSdkErrorDetails(error);
-  const coordinate = details.providerCode ?? details.errorClass;
-  return (
-    details.statusCode === 408 ||
-    details.statusCode === 425 ||
-    details.statusCode === 429 ||
-    (details.statusCode !== null && details.statusCode >= 500) ||
-    /^(?:Throttling.*|TooManyRequests|RequestTimeout|ServiceUnavailable|InternalError|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|TimeoutError|UnretryableError)$/iu.test(
-      coordinate,
-    )
+export function sealAliyunRefreshToken(input: {
+  connectionId: string;
+  accountUid: string;
+  oauthCredentialId: string;
+  refreshToken: string;
+}) {
+  const encrypted = encryptCredentialSecret(
+    refreshTokenAad(input),
+    input.refreshToken,
   );
-}
-
-function isAliyunRoleNotReady(error: unknown) {
-  const code = providerErrorCode(error);
-  return /(?:EntityNotExist\.Role|RoleNotExist|NoSuchEntity(?:\.Role)?|Role.*Not.*(?:Exist|Found)|InvalidParameter\.RoleArn)/iu.test(
-    code,
-  );
-}
-
-function isAliyunAccessDenied(error: unknown) {
-  const details = aliyunSdkErrorDetails(error);
-  const code = providerErrorCode(error);
-  return (
-    details.statusCode === 401 ||
-    details.statusCode === 403 ||
-    /(?:AccessDenied|Forbidden|NoPermission|PermissionDenied|Unauthorized|ExternalId)/iu.test(
-      code,
-    )
-  );
-}
-
-function isExpectedExternalIdDenial(error: unknown) {
-  if (providerErrorCode(error) === "ALIYUN_EXTERNAL_ID_NOT_ENFORCED") {
-    return false;
-  }
-  if (isAliyunProviderRetry(error) || isAliyunRoleNotReady(error)) return false;
-  const details = aliyunSdkErrorDetails(error);
-  const code = providerErrorCode(error);
-  return (
-    details.statusCode === 401 ||
-    details.statusCode === 403 ||
-    /(?:AccessDenied|Forbidden|NoPermission|PermissionDenied|Unauthorized)/iu.test(
-      code,
-    )
-  );
-}
-
-function classifyAliyunConnectionProbeError(input: {
-  error: unknown;
-  stage: AliyunConnectionProbeStage;
-  wasActive: boolean;
-  permissionGraceExpired: boolean;
-}): Exclude<AliyunCustomerConnectionProbe, { status: "active" }> {
-  const code = providerErrorCode(input.error);
-  if (/^(?:CALLER_ACCOUNT_MISMATCH|ACCOUNT_ROLE_MISMATCH)$/u.test(code)) {
-    return {
-      status: "attention_required",
-      connected: false,
-      reason: "account_mismatch",
-      retryable: false,
-    };
-  }
-  if (code === "ALIYUN_EXTERNAL_ID_NOT_ENFORCED") {
-    return {
-      status: "attention_required",
-      connected: false,
-      reason: "external_id_not_enforced",
-      retryable: false,
-    };
-  }
-  if (/^(?:PERMISSION_INCOMPLETE|ALIYUN_PERMISSION_INCOMPLETE)$/u.test(code)) {
-    return {
-      status: "attention_required",
-      connected: false,
-      reason: "permission_incomplete",
-      retryable: false,
-    };
-  }
-  if (code === "PERMISSION_PROPAGATING") {
-    return {
-      status: "pending",
-      connected: false,
-      reason: "permission_propagating",
-      retryAfterMs: 2_000,
-    };
-  }
-  if (isAliyunProviderRetry(input.error)) {
-    return {
-      status: "pending",
-      connected: false,
-      reason: "provider_retry",
-      retryAfterMs: 5_000,
-    };
-  }
-  if (input.stage === "assume_role") {
-    if (isAliyunRoleNotReady(input.error)) {
-      return input.wasActive
-        ? {
-            status: "attention_required",
-            connected: false,
-            reason: "permission_incomplete",
-            retryable: false,
-          }
-        : {
-            status: "pending",
-            connected: false,
-            reason: "role_not_ready",
-            retryAfterMs: 2_000,
-          };
-    }
-    if (isAliyunAccessDenied(input.error)) {
-      return input.wasActive || input.permissionGraceExpired
-        ? {
-            status: "attention_required",
-            connected: false,
-            reason: "permission_incomplete",
-            retryable: false,
-          }
-        : {
-            status: "pending",
-            connected: false,
-            reason: "permission_propagating",
-            retryAfterMs: 2_000,
-          };
-    }
-  }
-  if (
-    input.stage === "domain_permission" ||
-    input.stage === "dns_assume_role" ||
-    input.stage === "dns_permission"
-  ) {
-    if (isAliyunAccessDenied(input.error)) {
-      return input.wasActive || input.permissionGraceExpired
-        ? {
-            status: "attention_required",
-            connected: false,
-            reason: "permission_incomplete",
-            retryable: false,
-          }
-        : {
-            status: "pending",
-            connected: false,
-            reason: "permission_propagating",
-            retryAfterMs: 2_000,
-          };
-    }
-  }
-  // Unknown SDK/network shapes are not sufficient evidence to invalidate a
-  // customer connection. A later bounded probe can make the determination.
   return {
-    status: "pending",
-    connected: false,
-    reason: "provider_retry",
-    retryAfterMs: 5_000,
+    encryptionVersion: encrypted.encryptionVersion,
+    encryptedRefreshToken: encrypted.encryptedKey,
+    encryptionIv: encrypted.encryptionIv,
+    encryptionAuthTag: encrypted.encryptionAuthTag,
   };
 }
 
-async function loadOwnedConnection(
-  db: DbQueryExecutor,
-  input: { projectId: string; userId: number },
+export function openAliyunRefreshToken(
+  connection: Pick<
+    SiteProviderConnection,
+    | "id"
+    | "accountUid"
+    | "oauthCredentialId"
+    | "encryptionVersion"
+    | "encryptedRefreshToken"
+    | "encryptionIv"
+    | "encryptionAuthTag"
+  >,
 ) {
+  return decryptCredentialSecret(
+    refreshTokenAad({
+      connectionId: connection.id,
+      accountUid: connection.accountUid,
+      oauthCredentialId: connection.oauthCredentialId,
+    }),
+    {
+      encryptionVersion: connection.encryptionVersion,
+      encryptedKey: connection.encryptedRefreshToken,
+      encryptionIv: connection.encryptionIv,
+      encryptionAuthTag: connection.encryptionAuthTag,
+    },
+  );
+}
+
+type AliyunOAuthTokenRefresher = typeof refreshAliyunOAuthAccessToken;
+
+async function loadOwnedAliyunConnection(
+  db: DbExecutor,
+  rawInput: { projectId: string; userId: number },
+) {
+  const input = ownedConnectionInputSchema.parse(rawInput);
   const rows = await db
     .select()
     .from(siteProviderConnections)
@@ -1350,2328 +542,488 @@ async function loadOwnedConnection(
   return rows[0] ?? null;
 }
 
-function affectedRows(value: unknown) {
-  const header = Array.isArray(value)
-    ? (value[0] as { affectedRows?: unknown } | undefined)
-    : (value as { affectedRows?: unknown } | undefined);
-  return Number(header?.affectedRows ?? 0);
-}
-
-type FinancialReconciliationOperation = Pick<
-  SiteOperation,
-  | "id"
-  | "projectId"
-  | "userId"
-  | "kind"
-  | "status"
-  | "provider"
-  | "providerTaskId"
-  | "result"
->;
-
-type FinancialReconciliationLedger = Pick<
-  SiteDomainOperation,
-  | "operationId"
-  | "projectId"
-  | "userId"
-  | "kind"
-  | "status"
-  | "activeFinancialKey"
-  | "providerTaskNo"
-  | "providerResult"
->;
-
-/**
- * Classifies the only operation shape that an administrator may return to the
- * ordinary worker for read-only financial reconciliation. This never grants a
- * way to clear the financial key or assert a provider outcome by hand.
- */
-export function classifyAliyunFinancialReconciliation(input: {
-  operation: FinancialReconciliationOperation;
-  ledger: FinancialReconciliationLedger;
+async function transitionAliyunConnectionState(input: {
+  db: DbExecutor;
+  connection: SiteProviderConnection;
+  status: "invalid" | "revoked";
+  lastErrorCode: string | null;
+  overwriteRefreshToken?: boolean;
 }) {
-  const { operation, ledger } = input;
-  if (
-    ledger.operationId !== operation.id ||
-    ledger.projectId !== operation.projectId ||
-    ledger.userId !== operation.userId ||
-    operation.provider !== "aliyun_domain" ||
-    !["domain_purchase", "domain_renewal"].includes(operation.kind) ||
-    !["purchase", "renewal"].includes(ledger.kind)
-  ) {
-    throw new AliyunProviderError(
-      "DOMAIN_LEDGER_MISMATCH",
-      "域名财务操作与客户、项目或台账不一致。",
-    );
-  }
-  if (
-    ["succeeded", "failed"].includes(operation.status) &&
-    operation.status === ledger.status &&
-    ledger.activeFinancialKey == null
-  ) {
-    return { action: "terminal" as const, status: operation.status };
-  }
-  if (
-    ["queued", "running"].includes(operation.status) &&
-    ledger.activeFinancialKey
-  ) {
-    return { action: "already_pending" as const };
-  }
-  const operationResult = operation.result as Record<string, unknown> | null;
-  const ledgerResult = ledger.providerResult as Record<string, unknown> | null;
-  const mutationAttempted = Boolean(
-    operation.providerTaskId ??
-      ledger.providerTaskNo ??
-      (operationResult?.mutationAttempted === true ? "attempted" : null) ??
-      (ledgerResult?.mutationAttempted === true ? "attempted" : null),
-  );
-  if (
-    operation.status !== "attention_required" ||
-    ledger.status !== "attention_required" ||
-    !ledger.activeFinancialKey ||
-    !mutationAttempted
-  ) {
-    throw new AliyunProviderError(
-      "FINANCIAL_RECONCILIATION_NOT_ALLOWED",
-      "该操作不是可安全只读对账的待处理财务任务。",
-    );
-  }
-  return { action: "requeue" as const };
-}
-
-/**
- * System-admin entry point: it only requeues the original reservation. The
- * unchanged provider task/result/key force the normal handler down its
- * read-only reconciliation branch; only its verified terminal result can
- * release activeFinancialKey.
- */
-export async function reconcileAliyunFinancialOperation(rawInput: {
-  operationId: string;
-}) {
-  const input = z
-    .object({ operationId: z.string().uuid() })
-    .strict()
-    .parse(rawInput);
-  const db = await requireDb();
-  return db.transaction(async (tx) => {
-    const operationRows = await tx
-      .select()
-      .from(siteOperations)
-      .where(eq(siteOperations.id, input.operationId))
+  await input.db.transaction(async (tx) => {
+    const projectRows = await tx
+      .select({ id: siteProjects.id, revision: siteProjects.revision })
+      .from(siteProjects)
+      .where(eq(siteProjects.id, input.connection.projectId))
       .limit(1)
       .for("update");
-    const operation = operationRows[0];
-    if (!operation) {
-      throw new AliyunProviderError(
-        "FINANCIAL_OPERATION_NOT_FOUND",
-        "域名财务操作不存在。",
-      );
-    }
-    const ledgerRows = await tx
-      .select()
-      .from(siteDomainOperations)
-      .where(
-        and(
-          eq(siteDomainOperations.operationId, operation.id),
-          eq(siteDomainOperations.projectId, operation.projectId),
-          eq(siteDomainOperations.userId, operation.userId),
-        ),
-      )
+    const connectionRows = await tx
+      .select({ status: siteProviderConnections.status })
+      .from(siteProviderConnections)
+      .where(eq(siteProviderConnections.id, input.connection.id))
       .limit(1)
       .for("update");
-    const ledger = ledgerRows[0];
-    if (!ledger) {
-      throw new AliyunProviderError(
-        "DOMAIN_LEDGER_NOT_FOUND",
-        "域名财务操作台账不存在。",
-      );
+    const project = projectRows[0];
+    const current = connectionRows[0];
+    if (
+      !project ||
+      !current ||
+      current.status === input.status ||
+      (input.status === "invalid" && current.status !== "active")
+    ) {
+      return;
     }
-    const decision = classifyAliyunFinancialReconciliation({
-      operation,
-      ledger,
-    });
-    if (decision.action !== "requeue") {
-      return {
-        operationId: operation.id,
-        status:
-          decision.action === "terminal" ? decision.status : operation.status,
-        requeued: false as const,
-      };
-    }
-    const updated = await tx
-      .update(siteOperations)
+    const now = new Date();
+    await tx
+      .update(siteProviderConnections)
       .set({
-        status: "queued",
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        errorCode: null,
-        errorMessage: null,
-        completedAt: null,
-        updatedAt: new Date(),
+        status: input.status,
+        lastErrorCode: input.lastErrorCode,
+        ...(input.overwriteRefreshToken
+          ? {
+              encryptedRefreshToken: randomBytes(32).toString("base64"),
+              encryptionIv: randomBytes(12).toString("base64"),
+              encryptionAuthTag: randomBytes(16).toString("base64"),
+            }
+          : {}),
+        updatedAt: now,
       })
-      .where(
-        and(
-          eq(siteOperations.id, operation.id),
-          eq(siteOperations.projectId, operation.projectId),
-          eq(siteOperations.userId, operation.userId),
-          eq(siteOperations.provider, "aliyun_domain"),
-          eq(siteOperations.status, "attention_required"),
-        ),
-      );
-    if (affectedRows(updated) !== 1) {
-      throw new AliyunProviderError(
-        "FINANCIAL_OPERATION_CHANGED",
-        "域名财务操作已发生变化，请刷新后重试。",
-      );
-    }
-    return {
-      operationId: operation.id,
-      status: "queued" as const,
-      requeued: true as const,
-    };
+      .where(eq(siteProviderConnections.id, input.connection.id));
+    await tx
+      .update(siteProjects)
+      .set({ revision: project.revision + 1, updatedAt: now })
+      .where(eq(siteProjects.id, project.id));
   });
 }
 
-async function updateAliyunConnectionAfterVerification(input: {
+async function createAliyunDnsApiForConnection(input: {
   db: DbExecutor;
   connection: SiteProviderConnection;
-  values: Partial<typeof siteProviderConnections.$inferInsert>;
+  factory: AliyunProviderSdkFactory;
+  refreshAccessToken?: AliyunOAuthTokenRefresher;
 }) {
-  const updated = await input.db
-    .update(siteProviderConnections)
-    .set(input.values)
-    .where(
-      and(
-        eq(siteProviderConnections.id, input.connection.id),
-        eq(siteProviderConnections.projectId, input.connection.projectId),
-        eq(siteProviderConnections.userId, input.connection.userId),
-        eq(siteProviderConnections.status, input.connection.status),
-        eq(
-          siteProviderConnections.externalIdFingerprint,
-          input.connection.externalIdFingerprint,
-        ),
-        eq(siteProviderConnections.accountUid, input.connection.accountUid),
-        eq(siteProviderConnections.roleArn, input.connection.roleArn),
-      ),
-    );
-  if (affectedRows(updated) !== 1) {
+  if (input.connection.status !== "active") {
     throw new AliyunProviderError(
-      "ALIYUN_CONNECTION_CHANGED",
-      "阿里云连接已在验证期间发生变更，请刷新后重试。",
+      "ALIYUN_REAUTHORIZATION_REQUIRED",
+      "阿里云授权已失效，请重新连接后继续。",
     );
   }
-}
-
-async function assertOwnedProject(
-  db: DbQueryExecutor,
-  input: { projectId: string; userId: number },
-) {
-  const rows = await db
-    .select({ id: siteProjects.id })
-    .from(siteProjects)
-    .where(
-      and(
-        eq(siteProjects.id, input.projectId),
-        eq(siteProjects.userId, input.userId),
-      ),
-    )
-    .limit(1);
-  if (!rows[0]) {
-    throw new AliyunProviderError("NOT_FOUND", "SiteOps 项目不存在。");
-  }
-}
-
-/**
- * Creates or rotates the one customer-owned Aliyun connection for a project.
- * The returned ExternalId is shown once so the customer can configure the RAM
- * trust policy; status/read APIs expose only its fingerprint.
- */
-export async function setupAliyunCustomerConnection(
-  rawInput: z.input<typeof connectionInputSchema>,
-) {
-  const input = connectionInputSchema.parse(rawInput);
-  if (roleAccount(input.roleArn) !== input.accountUid) {
-    throw new AliyunProviderError(
-      "ACCOUNT_ROLE_MISMATCH",
-      "RAM Role ARN 与客户阿里云账号 UID 不一致。",
-    );
-  }
-  const db = await requireDb();
-  await assertOwnedProject(db, input);
-  const existing = await loadOwnedConnection(db, input);
-  if (existing) await assertAliyunConnectionMutable(db, input);
-  const connectionId = existing?.id ?? randomUUID();
-  const externalId = randomUUID();
-  const sealed = sealAliyunExternalId(connectionId, externalId);
-  if (existing) {
-    await db
-      .update(siteProviderConnections)
-      .set({
-        accountUid: input.accountUid,
-        roleArn: input.roleArn,
-        ...sealed,
-        capabilities: [],
-        status: "unverified",
-        verifiedAt: null,
-        lastErrorCode: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(siteProviderConnections.id, existing.id),
-          eq(siteProviderConnections.userId, input.userId),
-        ),
-      );
-  } else {
-    await db.insert(siteProviderConnections).values({
-      id: connectionId,
-      projectId: input.projectId,
-      userId: input.userId,
-      provider: "aliyun_cn",
-      accountUid: input.accountUid,
-      roleArn: input.roleArn,
-      ...sealed,
-      capabilities: [],
-      status: "unverified",
+  const sealedRefreshToken = openAliyunRefreshToken(input.connection);
+  try {
+    const refreshed = await (
+      input.refreshAccessToken ?? refreshAliyunOAuthAccessToken
+    )({
+      credentialId: input.connection.oauthCredentialId,
+      refreshToken: sealedRefreshToken,
     });
+    if (refreshed.refreshToken !== sealedRefreshToken) {
+      await input.db
+        .update(siteProviderConnections)
+        .set({
+          ...sealAliyunRefreshToken({
+            connectionId: input.connection.id,
+            accountUid: input.connection.accountUid,
+            oauthCredentialId: input.connection.oauthCredentialId,
+            refreshToken: refreshed.refreshToken,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(siteProviderConnections.id, input.connection.id),
+            eq(siteProviderConnections.status, "active"),
+          ),
+        );
+    }
+    return input.factory.dns(refreshed.accessToken);
+  } catch (error) {
+    if (
+      error instanceof AuthServiceError &&
+      error.code === "INVALID_CREDENTIAL"
+    ) {
+      await transitionAliyunConnectionState({
+        db: input.db,
+        connection: input.connection,
+        status: "invalid",
+        lastErrorCode: "ALIYUN_OAUTH_INVALID_GRANT",
+      });
+      throw new AliyunProviderError(
+        "ALIYUN_REAUTHORIZATION_REQUIRED",
+        "阿里云授权已失效，请重新连接后继续。",
+      );
+    }
+    throw error;
   }
-  return {
-    connectionId,
-    accountUid: input.accountUid,
-    roleArn: input.roleArn,
-    externalId,
-    externalIdFingerprint: sealed.externalIdFingerprint,
-    status: "unverified" as const,
-  };
 }
 
-/**
- * Binds the Aliyun account identity returned by the official OIDC userinfo
- * endpoint. The role ARN is derived server-side and the existing ExternalId is
- * retained for an idempotent callback, so replaying an already-consumed browser
- * navigation cannot silently invalidate a completed RAM trust configuration.
- */
-export async function bindAliyunCustomerAccountFromOAuth(
-  rawInput: {
-    projectId: string;
-    userId: number;
-    accountUid: string;
+async function invalidateAliyunConnectionOnUnauthorized(input: {
+  db: DbExecutor;
+  connection: SiteProviderConnection;
+  error: unknown;
+}) {
+  if (aliyunSdkErrorDetails(input.error).statusCode !== 401) return;
+  await transitionAliyunConnectionState({
+    db: input.db,
+    connection: input.connection,
+    status: "invalid",
+    lastErrorCode: "ALIYUN_OAUTH_UNAUTHORIZED",
+  });
+}
+
+export async function listAliyunDomainsForConnection(
+  rawInput: { projectId: string; userId: number },
+  options?: {
+    factory?: AliyunProviderSdkFactory;
+    refreshAccessToken?: AliyunOAuthTokenRefresher;
   },
-  transaction?: DbQueryExecutor,
 ) {
+  const db = await requireDb();
+  const connection = await loadOwnedAliyunConnection(db, rawInput);
+  if (!connection) {
+    throw new AliyunProviderError(
+      "ALIYUN_CONNECTION_NOT_FOUND",
+      "请先连接阿里云账号。",
+    );
+  }
+  const api = await createAliyunDnsApiForConnection({
+    db,
+    connection,
+    factory: options?.factory ?? new OfficialAliyunProviderSdkFactory(),
+    refreshAccessToken: options?.refreshAccessToken,
+  });
+  try {
+    return { domains: await api.listDomains() };
+  } catch (error) {
+    await invalidateAliyunConnectionOnUnauthorized({ db, connection, error });
+    throw error;
+  }
+}
+
+export const listAliyunCustomerDomains = listAliyunDomainsForConnection;
+
+export async function bindAliyunCustomerAccountFromOAuth(rawInput: {
+  projectId: string;
+  userId: number;
+  credentialId: string;
+  accountUid: string;
+  refreshToken: string;
+}) {
   const input = z
     .object({
       projectId: z.string().uuid(),
       userId: z.number().int().positive(),
+      credentialId: z.string().uuid(),
       accountUid: z
         .string()
         .trim()
         .regex(/^\d{6,64}$/),
+      refreshToken: z.string().min(8).max(16_384),
     })
     .strict()
     .parse(rawInput);
-  const db = transaction ?? (await requireDb());
-  await assertOwnedProject(db, input);
-  const existing = await loadOwnedConnection(db, input);
-  const connectionId = existing?.id ?? randomUUID();
-  const roleArn = aliyunCustomerRoleArn(input.accountUid, connectionId);
-  const legacyRoleArn = legacyAliyunCustomerRoleArn(input.accountUid);
-  if (
-    existing &&
-    existing.status !== "revoked" &&
-    existing.accountUid === input.accountUid &&
-    [roleArn, legacyRoleArn].some(
-      (candidate) => candidate.toLowerCase() === existing.roleArn.toLowerCase(),
-    )
-  ) {
-    return {
-      connectionId: existing.id,
-      status: existing.status,
-      requiresRoleAuthorization: existing.status !== "active",
-    } as const;
-  }
-  if (existing) await assertAliyunConnectionMutable(db, input);
-  const sealed = sealAliyunExternalId(connectionId, randomUUID());
-  if (existing) {
-    await db
-      .update(siteProviderConnections)
-      .set({
-        accountUid: input.accountUid,
-        roleArn,
-        ...sealed,
-        capabilities: [],
-        status: "unverified",
-        verifiedAt: null,
-        lastErrorCode: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(siteProviderConnections.id, existing.id),
-          eq(siteProviderConnections.userId, input.userId),
-        ),
+  const db = await requireDb();
+  const now = new Date();
+  return db.transaction(async (tx) => {
+    const [
+      projects,
+      credentials,
+      connections,
+      activeExternalOperations,
+      profiles,
+      dnsEvidence,
+    ] = await Promise.all([
+      tx
+        .select({
+          id: siteProjects.id,
+          revision: siteProjects.revision,
+          canonicalHostname: siteProjects.canonicalHostname,
+          globalLiveDeploymentId: siteProjects.globalLiveDeploymentId,
+          mainlandLiveDeploymentId: siteProjects.mainlandLiveDeploymentId,
+        })
+        .from(siteProjects)
+        .where(
+          and(
+            eq(siteProjects.id, input.projectId),
+            eq(siteProjects.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: presalesApiCredentials.id })
+        .from(presalesApiCredentials)
+        .where(
+          and(
+            eq(presalesApiCredentials.id, input.credentialId),
+            eq(presalesApiCredentials.slot, ALIYUN_OAUTH_CREDENTIAL_SLOT),
+            eq(presalesApiCredentials.status, "active"),
+          ),
+        )
+        .limit(1),
+      tx
+        .select()
+        .from(siteProviderConnections)
+        .where(
+          and(
+            eq(siteProviderConnections.projectId, input.projectId),
+            eq(siteProviderConnections.provider, "aliyun_cn"),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: siteOperations.id })
+        .from(siteOperations)
+        .where(
+          and(
+            eq(siteOperations.projectId, input.projectId),
+            eq(siteOperations.userId, input.userId),
+            inArray(siteOperations.provider, ["aliyun_alidns", "aliyun_esa"]),
+            inArray(siteOperations.status, [
+              "queued",
+              "running",
+              "outcome_unknown",
+            ]),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+      tx
+        .select()
+        .from(workspaceSiteProfiles)
+        .where(eq(workspaceSiteProfiles.userId, input.userId))
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: siteDnsRecords.id })
+        .from(siteDnsRecords)
+        .where(
+          and(
+            eq(siteDnsRecords.projectId, input.projectId),
+            eq(siteDnsRecords.userId, input.userId),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+    ]);
+    if (!projects[0]) {
+      throw new AliyunProviderError(
+        "PROJECT_NOT_FOUND",
+        "当前官网项目不存在或不属于该用户。",
       );
-  } else {
-    await db.insert(siteProviderConnections).values({
-      id: connectionId,
+    }
+    if (!credentials[0]) {
+      throw new AliyunProviderError(
+        "ALIYUN_OAUTH_CREDENTIAL_RETIRED",
+        "本次授权使用的阿里云 OAuth 应用配置已失效。",
+      );
+    }
+    const existing = connections[0];
+    const changingAccount =
+      existing !== undefined && existing.accountUid !== input.accountUid;
+    if (changingAccount && activeExternalOperations.length > 0) {
+      throw new AliyunProviderError(
+        "CONNECTION_IN_USE",
+        "仍有域名解析或网站下线操作正在执行，请等待完成后重试。",
+      );
+    }
+    const profile = profiles[0];
+    const hasPublishedDomainState = Boolean(
+      profile?.domain ||
+        profile?.normalizedAsciiDomain ||
+        profile?.providerAccountUid ||
+        profile?.domainOwnershipStatus ||
+        profile?.dnsStatus ||
+        profile?.icpDomainRevision ||
+        projects[0].canonicalHostname ||
+        projects[0].globalLiveDeploymentId ||
+        projects[0].mainlandLiveDeploymentId ||
+        dnsEvidence.length > 0,
+    );
+    if (changingAccount && hasPublishedDomainState) {
+      throw new AliyunProviderError(
+        "ALIYUN_ACCOUNT_CHANGE_REQUIRES_RESET",
+        "当前项目仍绑定原阿里云账号的域名，请先申请重置并完成安全下线。",
+      );
+    }
+    const connectionId = existing?.id ?? randomUUID();
+    const sealed = sealAliyunRefreshToken({
+      connectionId,
+      accountUid: input.accountUid,
+      oauthCredentialId: input.credentialId,
+      refreshToken: input.refreshToken,
+    });
+    const values = {
       projectId: input.projectId,
       userId: input.userId,
-      provider: "aliyun_cn",
+      provider: "aliyun_cn" as const,
       accountUid: input.accountUid,
-      roleArn,
+      oauthCredentialId: input.credentialId,
       ...sealed,
-      capabilities: [],
-      status: "unverified",
-    });
-  }
-  return {
-    connectionId,
-    status: "unverified" as const,
-    requiresRoleAuthorization: true,
-  };
-}
-
-/**
- * Probes every managed, non-active role before deciding what ROS may create.
- * A missing legacy role moves to its connection-scoped name so the strict ROS
- * template can create it; a missing dynamic role retains its current name.
- * Working roles activate in place, and inconclusive provider/propagation
- * failures defer without changing the ARN. A deterministically unsafe legacy
- * role also moves to its connection-scoped name; an unsafe dynamic role
- * advances to a deterministic repair name. The ExternalId ciphertext and
- * fingerprint are never rotated here.
- */
-export async function prepareAliyunCustomerRoleProvisioning(
-  rawInput: z.input<typeof ownedConnectionInputSchema>,
-  factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
-) {
-  const input = ownedConnectionInputSchema.parse(rawInput);
-  const db = await requireDb();
-  await assertOwnedProject(db, input);
-  const connection = await loadOwnedConnection(db, input);
-  if (!connection || connection.status === "revoked") {
-    throw new AliyunProviderError(
-      "PROVIDER_NOT_CONFIGURED",
-      "请先完成阿里云账号授权。",
-    );
-  }
-  const currentRoleName = roleName(connection.roleArn);
-  if (
-    roleAccount(connection.roleArn) !== connection.accountUid ||
-    !currentRoleName ||
-    (currentRoleName !== ALIYUN_CUSTOMER_ROLE_NAME &&
-      !MANAGED_ALIYUN_DYNAMIC_ROLE_PATTERN.test(currentRoleName))
-  ) {
-    throw new AliyunProviderError(
-      "ACCOUNT_ROLE_MISMATCH",
-      "RAM Role ARN 与客户阿里云账号 UID 不一致。",
-    );
-  }
-  if (connection.status === "active") {
-    return {
-      connectionId: connection.id,
-      accountUid: connection.accountUid,
-      roleArn: connection.roleArn,
-      roleName: currentRoleName,
+      capabilities: ["alidns_read", "alidns_write"],
       status: "active" as const,
-      roleChanged: false,
-    };
-  }
-
-  const legacyRoleArn = legacyAliyunCustomerRoleArn(connection.accountUid);
-  const isLegacyRole = connection.roleArn === legacyRoleArn;
-  const probe = await probeAliyunCustomerConnection(input, factory);
-  if (probe.status === "active") {
-    return {
-      connectionId: connection.id,
-      accountUid: connection.accountUid,
-      roleArn: connection.roleArn,
-      roleName: currentRoleName,
-      status: "active" as const,
-      roleChanged: false,
-    };
-  }
-  if (
-    probe.status === "attention_required" &&
-    probe.reason === "account_mismatch"
-  ) {
-    throw new AliyunProviderError(
-      "CALLER_ACCOUNT_MISMATCH",
-      "现有 RAM Role 返回的账号与已授权阿里云账号不一致。",
-    );
-  }
-  if (probe.status === "pending" && probe.reason !== "role_not_ready") {
-    throw new AliyunProviderError(
-      ALIYUN_ROLE_MIGRATION_DEFERRED_CODE,
-      "现有 RAM Role 暂时无法完成安全检查，尚未更改角色配置。",
-      false,
-      { reason: probe.reason, retryAfterMs: probe.retryAfterMs },
-    );
-  }
-
-  const refreshed = await loadOwnedConnection(db, input);
-  if (
-    !refreshed ||
-    refreshed.status === "revoked" ||
-    refreshed.roleArn !== connection.roleArn
-  ) {
-    throw new AliyunProviderError(
-      "ALIYUN_CONNECTION_CHANGED",
-      "阿里云连接已在角色检查期间发生变更，请刷新后重试。",
-    );
-  }
-  if (refreshed.status === "active") {
-    return {
-      connectionId: refreshed.id,
-      accountUid: refreshed.accountUid,
-      roleArn: refreshed.roleArn,
-      roleName: currentRoleName,
-      status: "active" as const,
-      roleChanged: false,
-    };
-  }
-  if (probe.status === "pending" && !isLegacyRole) {
-    return {
-      connectionId: refreshed.id,
-      accountUid: refreshed.accountUid,
-      roleArn: refreshed.roleArn,
-      roleName: currentRoleName,
-      status: "unverified" as const,
-      roleChanged: false,
-    };
-  }
-
-  const replacementRoleName = isLegacyRole
-    ? aliyunCustomerRoleName(refreshed.id)
-    : aliyunRepairRoleName(refreshed.id, refreshed.roleArn);
-  const replacementRoleArn = `acs:ram::${refreshed.accountUid}:role/${replacementRoleName}`;
-  await assertAliyunConnectionMutable(db, input);
-  await updateAliyunConnectionAfterVerification({
-    db,
-    connection: refreshed,
-    values: {
-      roleArn: replacementRoleArn,
-      status: "unverified",
-      capabilities: [],
-      verifiedAt: null,
+      verifiedAt: now,
       lastErrorCode: null,
-      updatedAt: new Date(),
-    },
+      updatedAt: now,
+    };
+    if (existing) {
+      await tx
+        .update(siteProviderConnections)
+        .set(values)
+        .where(eq(siteProviderConnections.id, existing.id));
+    } else {
+      await tx.insert(siteProviderConnections).values({
+        id: connectionId,
+        ...values,
+        createdAt: now,
+      });
+    }
+    await tx
+      .update(presalesApiCredentials)
+      .set({
+        validationStatus: "verified",
+        verifiedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(presalesApiCredentials.id, input.credentialId));
+    if (changingAccount) {
+      if (profile) {
+        await tx
+          .update(workspaceSiteProfiles)
+          .set({
+            domain: null,
+            normalizedAsciiDomain: null,
+            unicodeDisplayDomain: null,
+            domainRevision: profile.domainRevision + 1,
+            providerAccountUid: null,
+            domainOwnershipStatus: null,
+            dnsStatus: null,
+            domainStatus: "not_started",
+            domainVerifiedAt: null,
+            icpDomainRevision: null,
+            icpProvince: null,
+            icpNumber: null,
+            icpStatus: "not_submitted",
+            icpVerifiedAt: null,
+            revision: profile.revision + 1,
+            updatedByUserId: input.userId,
+            updatedAt: now,
+          })
+          .where(eq(workspaceSiteProfiles.userId, input.userId));
+      }
+    }
+    await tx
+      .update(siteProjects)
+      .set({
+        ...(changingAccount ? { canonicalHostname: null } : {}),
+        revision: projects[0].revision + 1,
+        updatedAt: now,
+      })
+      .where(eq(siteProjects.id, input.projectId));
+    return {
+      connectionId,
+      accountUid: input.accountUid,
+      status: "active" as const,
+      capabilities: ["alidns_read", "alidns_write"] as const,
+    };
   });
-  return {
-    connectionId: refreshed.id,
-    accountUid: refreshed.accountUid,
-    roleArn: replacementRoleArn,
-    roleName: replacementRoleName,
-    status: "unverified" as const,
-    roleChanged: true,
-  };
 }
 
-/** Server-owned RAM package. It is served only as an authenticated attachment. */
-export async function getAliyunCustomerRoleAuthorizationPackage(rawInput: {
+export async function getAliyunCustomerConnectionStatus(rawInput: {
   projectId: string;
   userId: number;
-  trustedPrincipalArn: string;
 }) {
-  const input = z
-    .object({
-      projectId: z.string().uuid(),
-      userId: z.number().int().positive(),
-      trustedPrincipalArn: z
-        .string()
-        .regex(/^acs:ram::\d+:(?:user|role)\/[A-Za-z0-9.@_-]+$/),
-    })
-    .strict()
-    .parse(rawInput);
   const db = await requireDb();
-  await assertOwnedProject(db, input);
-  const connection = await loadOwnedConnection(db, input);
-  if (!connection || connection.status === "revoked") {
-    throw new AliyunProviderError(
-      "PROVIDER_NOT_CONFIGURED",
-      "请先完成阿里云账号授权。",
-    );
-  }
-  const externalId = openAliyunExternalId(connection);
-  const currentRoleName = roleName(connection.roleArn);
-  if (!currentRoleName) {
-    throw new AliyunProviderError(
-      "ACCOUNT_ROLE_MISMATCH",
-      "当前 RAM Role ARN 无效。",
-    );
-  }
-  return {
-    schemaVersion: 1 as const,
-    roleName: currentRoleName,
-    description: `FrontMind ${SITEOPS_CUSTOMER_DISPLAY_NAME}域名与解析自动化`,
-    trustPolicyDocument: {
-      Version: "1",
-      Statement: [
-        {
-          Action: "sts:AssumeRole",
-          Effect: "Allow",
-          Principal: { RAM: [input.trustedPrincipalArn] },
-          Condition: { StringEquals: { "sts:ExternalId": externalId } },
-        },
-      ],
-    },
-    permissionPolicyDocument: {
-      Version: "1",
-      Statement: [
-        {
-          Action: [...ALIYUN_CUSTOMER_ROLE_ACTIONS],
-          Effect: "Allow",
-          Resource: ["*"],
-        },
-      ],
-    },
-  };
-}
-
-export async function getAliyunCustomerConnectionStatus(
-  rawInput: z.input<typeof ownedConnectionInputSchema>,
-): Promise<AliyunConnectionStatus> {
-  const input = ownedConnectionInputSchema.parse(rawInput);
-  const db = await requireDb();
-  await assertOwnedProject(db, input);
-  const connection = await loadOwnedConnection(db, input);
+  const connection = await loadOwnedAliyunConnection(db, rawInput);
   if (!connection) {
     return {
       configured: false,
       connectionId: null,
       accountUid: null,
-      roleArn: null,
-      externalIdFingerprint: null,
       status: null,
-      capabilities: [],
+      capabilities: [] as string[],
       verifiedAt: null,
       lastErrorCode: null,
+      canDisconnect: false,
     };
   }
+  const inFlight = await db
+    .select({ id: siteOperations.id })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, connection.projectId),
+        eq(siteOperations.userId, connection.userId),
+        inArray(siteOperations.provider, ["aliyun_alidns", "aliyun_esa"]),
+        inArray(siteOperations.status, [
+          "queued",
+          "running",
+          "outcome_unknown",
+        ]),
+      ),
+    )
+    .limit(1);
   return {
-    configured: connection.status !== "revoked",
+    configured: connection.status === "active",
     connectionId: connection.id,
     accountUid: connection.accountUid,
-    roleArn: connection.roleArn,
-    externalIdFingerprint: connection.externalIdFingerprint,
     status: connection.status,
-    capabilities: [...connection.capabilities],
-    verifiedAt: asDate(connection.verifiedAt)?.getTime() ?? null,
+    capabilities: connection.capabilities,
+    verifiedAt: connection.verifiedAt?.getTime() ?? null,
     lastErrorCode: connection.lastErrorCode,
-  };
-}
-
-function aliyunProbeLastErrorCode(
-  result: Exclude<AliyunCustomerConnectionProbe, { status: "active" }>,
-) {
-  if (result.status === "pending") {
-    return {
-      role_not_ready: "ALIYUN_ROLE_NOT_READY",
-      permission_propagating: "ALIYUN_PERMISSION_PROPAGATING",
-      provider_retry: "ALIYUN_PROVIDER_RETRY",
-    }[result.reason];
-  }
-  return {
-    account_mismatch: "CALLER_ACCOUNT_MISMATCH",
-    permission_incomplete: "ALIYUN_PERMISSION_INCOMPLETE",
-    external_id_not_enforced: "ALIYUN_EXTERNAL_ID_NOT_ENFORCED",
-  }[result.reason];
-}
-
-async function persistAliyunConnectionProbeResult(input: {
-  db: DbExecutor;
-  connection: SiteProviderConnection;
-  result: AliyunCustomerConnectionProbe;
-}) {
-  if (input.result.status === "active") {
-    await updateAliyunConnectionAfterVerification({
-      db: input.db,
-      connection: input.connection,
-      values: {
-        status: "active",
-        capabilities: input.result.capabilities,
-        verifiedAt: new Date(),
-        lastErrorCode: null,
-        updatedAt: new Date(),
-      },
-    });
-    return;
-  }
-  const preserveActive =
-    input.connection.status === "active" && input.result.status === "pending";
-  const lastErrorCode = aliyunProbeLastErrorCode(input.result);
-  if (
-    input.result.status === "pending" &&
-    input.connection.lastErrorCode === lastErrorCode &&
-    (input.connection.status === "unverified" || preserveActive)
-  ) {
-    return;
-  }
-  await updateAliyunConnectionAfterVerification({
-    db: input.db,
-    connection: input.connection,
-    values: {
-      status: preserveActive
-        ? "active"
-        : input.result.status === "pending"
-          ? "unverified"
-          : "invalid",
-      capabilities: preserveActive ? input.connection.capabilities : [],
-      verifiedAt: preserveActive ? input.connection.verifiedAt : null,
-      lastErrorCode,
-      updatedAt: new Date(),
-    },
-  });
-}
-
-export async function probeAliyunCustomerConnection(
-  rawInput: z.input<typeof ownedConnectionInputSchema>,
-  factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
-): Promise<AliyunCustomerConnectionProbe> {
-  const input = ownedConnectionInputSchema.parse(rawInput);
-  const db = await requireDb();
-  await assertOwnedProject(db, input);
-  const connection = await loadOwnedConnection(db, input);
-  if (!connection || connection.status === "revoked") {
-    throw new AliyunProviderError(
-      "PROVIDER_NOT_CONFIGURED",
-      "客户尚未配置阿里云 RAM Role 连接。",
-    );
-  }
-  let stage: AliyunConnectionProbeStage = "assume_role";
-  try {
-    if (roleAccount(connection.roleArn) !== connection.accountUid) {
-      throw new AliyunProviderError(
-        "ACCOUNT_ROLE_MISMATCH",
-        "RAM Role ARN 与客户阿里云账号 UID 不一致。",
-      );
-    }
-    const externalId = openAliyunExternalId(connection);
-    const credentials = await factory.assumeRole({
-      roleArn: connection.roleArn,
-      externalId,
-      sessionName: `frontmind-verify-${connection.id.slice(0, 8)}`,
-      policy: DOMAIN_READ_POLICY,
-    });
-
-    stage = "external_id_enforcement";
-    try {
-      await factory.assumeRole({
-        roleArn: connection.roleArn,
-        sessionName: `frontmind-negative-${connection.id.slice(0, 8)}`,
-        policy: DOMAIN_READ_POLICY,
-      });
-      throw new AliyunProviderError(
-        "ALIYUN_EXTERNAL_ID_NOT_ENFORCED",
-        "RAM Role 未强制校验 ExternalId。",
-      );
-    } catch (error) {
-      if (!isExpectedExternalIdDenial(error)) throw error;
-    }
-
-    stage = "caller_identity";
-    const callerAccount = await factory.getCallerAccount(credentials);
-    if (callerAccount !== connection.accountUid) {
-      throw new AliyunProviderError(
-        "CALLER_ACCOUNT_MISMATCH",
-        "AssumeRole 临时身份不属于所声明的客户账号。",
-      );
-    }
-    stage = "domain_permission";
-    await factory.domain(credentials).listVerifiedRegistrantProfiles();
-    stage = "dns_assume_role";
-    const dnsCredentials = await factory.assumeRole({
-      roleArn: connection.roleArn,
-      externalId,
-      sessionName: `frontmind-dns-${connection.id.slice(0, 8)}`,
-      policy: DNS_READ_POLICY,
-    });
-    stage = "dns_caller_identity";
-    if ((await factory.getCallerAccount(dnsCredentials)) !== callerAccount) {
-      throw new AliyunProviderError(
-        "CALLER_ACCOUNT_MISMATCH",
-        "AliDNS 临时身份不属于所声明的客户账号。",
-      );
-    }
-    stage = "dns_permission";
-    await factory.dns(dnsCredentials).listDomains();
-    const capabilities = ["sts_assume_role", "domain_read", "alidns_read"];
-    const result = {
-      status: "active" as const,
-      connected: true as const,
-      accountUid: callerAccount,
-      capabilities,
-    };
-    await persistAliyunConnectionProbeResult({
-      db,
-      connection,
-      result,
-    });
-    return result;
-  } catch (error) {
-    if (
-      error instanceof AliyunProviderError &&
-      error.code === "ALIYUN_CONNECTION_CHANGED"
-    ) {
-      throw error;
-    }
-    const result = classifyAliyunConnectionProbeError({
-      error,
-      stage,
-      wasActive: connection.status === "active",
-      permissionGraceExpired:
-        connection.lastErrorCode === "ALIYUN_PERMISSION_PROPAGATING" &&
-        Date.now() - (asDate(connection.updatedAt)?.getTime() ?? 0) >=
-          ALIYUN_PERMISSION_PROPAGATION_GRACE_MS,
-    });
-    await persistAliyunConnectionProbeResult({
-      db,
-      connection,
-      result,
-    });
-    return result;
-  }
-}
-
-/** Compatibility wrapper for existing server callers that expect throw/retry. */
-export async function verifyAliyunCustomerConnection(
-  rawInput: z.input<typeof ownedConnectionInputSchema>,
-  factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
-) {
-  const result = await probeAliyunCustomerConnection(rawInput, factory);
-  if (result.status === "active") {
-    return {
-      ok: true as const,
-      accountUid: result.accountUid,
-      capabilities: result.capabilities,
-    };
-  }
-  throw new AliyunProviderError(
-    aliyunProbeLastErrorCode(result),
-    result.status === "pending"
-      ? "阿里云授权尚未生效，请稍后重试。"
-      : "阿里云授权配置需要修复。",
-  );
-}
-
-/**
- * Administrator read-only smoke. It never mutates the customer connection and
- * never performs a Domain/DNS write. When no active customer connection (or no
- * connection exists, callers get an explicit identity-only result instead
- * of a false claim that the whole publishing path is ready.
- */
-export async function inspectActiveAliyunCustomerReadCapabilities(
-  factory: AliyunProviderSdkFactory = new OfficialAliyunProviderSdkFactory(),
-) {
-  const db = await requireDb();
-  const connections = await db
-    .select()
-    .from(siteProviderConnections)
-    .where(eq(siteProviderConnections.status, "active"))
-    .limit(1);
-  const connection = connections[0];
-  if (!connection) {
-    return {
-      mode: "identity_only" as const,
-      customerConnectionTested: false,
-      domainRead: false,
-      alidnsRead: false,
-      reason: "NO_ACTIVE_CUSTOMER_CONNECTION" as const,
-    };
-  }
-  const externalId = openAliyunExternalId(connection);
-  const domainCredentials = await factory.assumeRole({
-    roleArn: connection.roleArn,
-    externalId,
-    sessionName: `frontmind-admin-domain-${connection.id.slice(0, 8)}`,
-    policy: DOMAIN_READ_POLICY,
-  });
-  const callerAccount = await factory.getCallerAccount(domainCredentials);
-  if (callerAccount !== connection.accountUid) {
-    throw new AliyunProviderError(
-      "CALLER_ACCOUNT_MISMATCH",
-      "客户临时身份所属账号与已验证连接不一致。",
-    );
-  }
-  await factory.domain(domainCredentials).listVerifiedRegistrantProfiles();
-  const dnsCredentials = await factory.assumeRole({
-    roleArn: connection.roleArn,
-    externalId,
-    sessionName: `frontmind-admin-dns-${connection.id.slice(0, 8)}`,
-    policy: DNS_READ_POLICY,
-  });
-  if ((await factory.getCallerAccount(dnsCredentials)) !== callerAccount) {
-    throw new AliyunProviderError(
-      "CALLER_ACCOUNT_MISMATCH",
-      "AliDNS 临时身份所属账号与已验证连接不一致。",
-    );
-  }
-  await factory.dns(dnsCredentials).listDomains();
-  return {
-    mode: "customer_connection" as const,
-    customerConnectionTested: true,
-    domainRead: true,
-    alidnsRead: true,
-    reason: null,
+    canDisconnect: inFlight.length === 0 && connection.status !== "revoked",
   };
 }
 
 export async function disconnectAliyunCustomerConnection(
-  rawInput: z.input<typeof ownedConnectionInputSchema>,
+  rawInput: { projectId: string; userId: number },
+  options?: { fetchImpl?: typeof fetch },
 ) {
-  const input = ownedConnectionInputSchema.parse(rawInput);
   const db = await requireDb();
-  await assertOwnedProject(db, input);
-  const connection = await loadOwnedConnection(db, input);
-  if (!connection) return { disconnected: true as const };
-  await assertAliyunConnectionMutable(db, input);
-  // Overwrite the encrypted value so a revoked connection cannot be assumed
-  // even if a stale application object survives briefly in memory.
-  const sealed = sealAliyunExternalId(connection.id, randomUUID());
-  await db
-    .update(siteProviderConnections)
-    .set({
-      ...sealed,
-      status: "revoked",
-      capabilities: [],
-      verifiedAt: null,
-      lastErrorCode: null,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(siteProviderConnections.id, connection.id),
-        eq(siteProviderConnections.userId, input.userId),
-      ),
-    );
-  return { disconnected: true as const };
-}
-
-async function assumeForConnection(
-  connection: SiteProviderConnection,
-  factory: AliyunProviderSdkFactory,
-  policy: string,
-  purpose: string,
-  brokerBinding?: {
-    brokerCredentialId?: string;
-    brokerCredentialVersion?: number;
-  },
-) {
-  if (connection.status !== "active") {
+  const connection = await loadOwnedAliyunConnection(db, rawInput);
+  if (!connection) return { disconnected: true as const, revokedRemote: false };
+  const status = await getAliyunCustomerConnectionStatus(rawInput);
+  if (!status.canDisconnect) {
     throw new AliyunProviderError(
-      "ALIYUN_CONNECTION_INACTIVE",
-      "客户阿里云连接不是有效状态。",
+      "CONNECTION_IN_USE",
+      "仍有域名解析操作正在执行或等待对账，暂不能断开连接。",
     );
   }
-  if (roleAccount(connection.roleArn) !== connection.accountUid) {
-    throw new AliyunProviderError(
-      "CALLER_ACCOUNT_MISMATCH",
-      "RAM Role ARN 与已验证客户账号不一致。",
-    );
-  }
-  const credentials = await factory.assumeRole({
-    roleArn: connection.roleArn,
-    externalId: openAliyunExternalId(connection),
-    sessionName: `frontmind-${purpose}-${connection.id.slice(0, 8)}`,
-    policy,
-    ...(brokerBinding?.brokerCredentialId &&
-    brokerBinding.brokerCredentialVersion
-      ? {
-          brokerCredentialId: brokerBinding.brokerCredentialId,
-          brokerCredentialVersion: brokerBinding.brokerCredentialVersion,
-        }
-      : {}),
-  });
-  const account = await factory.getCallerAccount(credentials);
-  if (account !== connection.accountUid) {
-    throw new AliyunProviderError(
-      "CALLER_ACCOUNT_MISMATCH",
-      "临时身份所属账号与客户连接不一致。",
-    );
-  }
-  return credentials;
-}
-
-export type AliyunDomainQuote = {
-  schemaVersion: 1;
-  kind: "purchase" | "renewal";
-  domain: string;
-  accountUid: string;
-  amountMinor: number;
-  currency: "CNY";
-  years: number;
-  registrantProfileId: string | null;
-  maskedRegistrantName: string | null;
-  currentExpirationDateMs: number | null;
-  instanceId: string | null;
-  issuedAt: string;
-  expiresAt: string;
-  quoteHash: string;
-};
-
-function quoteHash(
-  quote: Omit<AliyunDomainQuote, "quoteHash" | "issuedAt" | "expiresAt">,
-) {
-  return sha256(
-    stableJson({
-      schemaVersion: quote.schemaVersion,
-      kind: quote.kind,
-      domain: quote.domain,
-      accountUid: quote.accountUid,
-      amountMinor: quote.amountMinor,
-      currency: quote.currency,
-      years: quote.years,
-      registrantProfileId: quote.registrantProfileId,
-      currentExpirationDateMs: quote.currentExpirationDateMs,
-      instanceId: quote.instanceId,
-    }),
-  );
-}
-
-export function selectVerifiedRegistrantProfile(
-  profiles: AliyunRegistrantProfile[],
-  requestedProfileId?: string,
-) {
-  const eligible = profiles.filter(
-    (profile) =>
-      /^\d+$/.test(profile.profileId) &&
-      Number.isSafeInteger(Number(profile.profileId)) &&
-      profile.realNameVerified &&
-      profile.emailVerified,
-  );
-  const defaults = eligible.filter((profile) => profile.isDefault);
-  if (requestedProfileId) {
-    const selected = eligible.find(
-      (profile) => profile.profileId === requestedProfileId,
-    );
-    if (!selected) {
-      throw new AliyunProviderError(
-        "REGISTRANT_PROFILE_NOT_ELIGIBLE",
-        "所选实名模板不存在、未实名或邮箱未验证。",
-        false,
-        { availableRegistrantProfiles: eligible },
-      );
-    }
-    return selected;
-  }
-  if (defaults.length === 1) return defaults[0];
-  if (defaults.length === 0 && eligible.length === 1) return eligible[0];
-  throw new AliyunProviderError(
-    eligible.length === 0
-      ? "VERIFIED_REGISTRANT_PROFILE_REQUIRED"
-      : "REGISTRANT_PROFILE_SELECTION_REQUIRED",
-    eligible.length === 0
-      ? "客户账号没有已实名且邮箱已验证的信息模板，请先在阿里云控制台完成。"
-      : "客户账号有多个可用实名模板且没有唯一默认项，必须先明确选择；系统不会代选持有人。",
-    false,
-    { availableRegistrantProfiles: eligible },
-  );
-}
-
-export async function prepareAliyunDomainQuote(input: {
-  api: AliyunDomainApi;
-  kind: "purchase" | "renewal";
-  domain: string;
-  accountUid: string;
-  years: number;
-  registrantProfileId?: string;
-  now?: Date;
-}): Promise<AliyunDomainQuote> {
-  const now = input.now ?? new Date();
-  const domain = normalizeAliyunDomain(input.domain).ascii;
-  const [check, existing, profiles] = await Promise.all([
-    input.api.checkDomain({
-      domain,
-      command: input.kind === "purchase" ? "create" : "renew",
-      years: input.years,
-    }),
-    input.kind === "renewal"
-      ? input.api.getDomain(domain)
-      : Promise.resolve(null),
-    input.kind === "purchase"
-      ? input.api.listVerifiedRegistrantProfiles()
-      : Promise.resolve([]),
-  ]);
-  if (check.domain !== domain) {
-    throw new AliyunProviderError(
-      "DOMAIN_RESPONSE_MISMATCH",
-      "阿里云返回的域名与请求不一致。",
-    );
-  }
-  if (input.kind === "purchase" && !check.available) {
-    throw new AliyunProviderError(
-      "DOMAIN_NOT_AVAILABLE",
-      check.reason || "该域名当前不可注册。",
-    );
-  }
-  if (check.premium) {
-    throw new AliyunProviderError(
-      "PREMIUM_DOMAIN_NOT_SUPPORTED",
-      "首版不自动购买或续费溢价域名，请前往阿里云控制台处理。",
-    );
-  }
-  if (check.amountMinor == null) {
-    throw new AliyunProviderError(
-      "DOMAIN_PRICE_UNAVAILABLE",
-      "阿里云未返回可确认的精确价格。",
-    );
-  }
-  if (input.kind === "renewal" && !existing) {
-    throw new AliyunProviderError(
-      "DOMAIN_NOT_OWNED",
-      "该域名不在当前客户阿里云账号中，不能续费。",
-    );
-  }
-  const profile =
-    input.kind === "purchase"
-      ? selectVerifiedRegistrantProfile(profiles, input.registrantProfileId)
-      : null;
-  const core = {
-    schemaVersion: 1 as const,
-    kind: input.kind,
-    domain,
-    accountUid: input.accountUid,
-    amountMinor: check.amountMinor,
-    currency: check.currency,
-    years: input.years,
-    registrantProfileId: profile?.profileId ?? null,
-    maskedRegistrantName: profile?.maskedName ?? null,
-    currentExpirationDateMs: existing?.expirationDateMs ?? null,
-    instanceId: existing?.instanceId ?? null,
-  };
-  return {
-    ...core,
-    issuedAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + QUOTE_TTL_MS).toISOString(),
-    quoteHash: quoteHash(core),
-  };
-}
-
-function sameQuote(left: AliyunDomainQuote, right: AliyunDomainQuote) {
-  return left.quoteHash === right.quoteHash;
-}
-
-function parseDomainQuote(value: unknown): AliyunDomainQuote {
-  const parsed = z
-    .object({
-      schemaVersion: z.literal(1),
-      kind: z.enum(["purchase", "renewal"]),
-      domain: z.string(),
-      accountUid: z.string(),
-      amountMinor: z.number().int().nonnegative(),
-      currency: z.literal("CNY"),
-      years: z.number().int().min(1).max(10),
-      registrantProfileId: z.string().nullable(),
-      maskedRegistrantName: z.string().nullable(),
-      currentExpirationDateMs: z.number().int().positive().nullable(),
-      instanceId: z.string().nullable(),
-      issuedAt: z.string().datetime(),
-      expiresAt: z.string().datetime(),
-      quoteHash: z.string().regex(/^[a-f0-9]{64}$/),
-    })
-    .strict()
-    .parse(value);
-  const {
-    quoteHash: claimedHash,
-    issuedAt: _issuedAt,
-    expiresAt: _expiresAt,
-    ...core
-  } = parsed;
-  if (quoteHash(core) !== claimedHash) {
-    throw new AliyunProviderError("QUOTE_TAMPERED", "报价内容哈希校验失败。");
-  }
-  return parsed;
-}
-
-function taskPendingResult(
-  task: AliyunTaskState,
-  result: Record<string, unknown>,
-): SiteOpsProviderResult {
-  if (task.state === "failed") {
-    return {
-      status: "failed",
-      code: "ALIYUN_DOMAIN_TASK_FAILED",
-      message: task.message || "阿里云域名任务失败。",
-      providerTaskId: task.taskNo,
-      result,
-    };
-  }
-  return {
-    status: "pending",
-    providerTaskId: task.taskNo,
-    nextPollMs: 10_000,
-    result,
-  };
-}
-
-function expectedRenewalExpiration(quote: AliyunDomainQuote) {
-  if (!quote.currentExpirationDateMs) return null;
-  const expected = new Date(quote.currentExpirationDateMs);
-  expected.setUTCFullYear(expected.getUTCFullYear() + quote.years);
-  return expected.getTime();
-}
-
-async function verifyCompletedFinancialTask(
-  api: AliyunDomainApi,
-  quote: AliyunDomainQuote,
-  task: AliyunTaskState,
-): Promise<SiteOpsProviderResult> {
-  const current = await api.getDomain(quote.domain);
-  if (!current || current.domain !== quote.domain) {
-    return {
-      status: "pending",
-      providerTaskId: task.taskNo,
-      nextPollMs: 10_000,
-      result: { phase: "provider_succeeded_ownership_pending", quote },
-    };
-  }
-  if (quote.kind === "renewal") {
-    const expected = expectedRenewalExpiration(quote);
-    if (
-      expected == null ||
-      Math.abs(current.expirationDateMs - expected) > 24 * 60 * 60_000
-    ) {
-      return {
-        status: "attention_required",
-        code: "RENEWAL_EXPIRATION_MISMATCH",
-        message:
-          "续费任务已结束，但到期日没有按确认年限精确延长；不会重复扣款，请人工对账。",
-        providerTaskId: task.taskNo,
-        result: {
-          mutationAttempted: true,
-          quote,
-          observedExpirationDateMs: current.expirationDateMs,
-          expectedExpirationDateMs: expected,
-        },
-      };
-    }
-  }
-  return {
-    status: "succeeded",
-    providerTaskId: task.taskNo,
-    result: {
-      mutationAttempted: true,
-      quote,
-      domain: current.domain,
-      instanceId: current.instanceId,
-      expirationDateMs: current.expirationDateMs,
-      realNameStatus: current.realNameStatus,
-      emailStatus: current.emailStatus,
-      clientHold: current.clientHold,
-    },
-    message:
-      quote.kind === "purchase"
-        ? `域名 ${quote.domain} 已注册到客户阿里云账号。`
-        : `域名 ${quote.domain} 已完成续费。`,
-  };
-}
-
-type RenewalTargetSnapshot = {
-  normalizedAsciiDomain: string | null;
-  domainRevision: number;
-};
-
-export function assertAliyunRenewalTarget(input: {
-  current: RenewalTargetSnapshot | null | undefined;
-  quoteDomain: string;
-  expectedCanonicalHostname?: string;
-  expectedDomainRevision?: number;
-  mutationAttempted: boolean;
-}) {
-  const expected = input.expectedCanonicalHostname
-    ? normalizeAliyunDomain(input.expectedCanonicalHostname).ascii
-    : null;
-  const currentDomain = input.current?.normalizedAsciiDomain
-    ? normalizeAliyunDomain(input.current.normalizedAsciiDomain).ascii
-    : null;
-  if (
-    !expected ||
-    !input.expectedDomainRevision ||
-    expected !== input.quoteDomain ||
-    currentDomain !== expected ||
-    input.current?.domainRevision !== input.expectedDomainRevision
-  ) {
-    throw new AliyunProviderError(
-      "RENEWAL_DOMAIN_REVISION_CHANGED",
-      input.mutationAttempted
-        ? "续费任务已提交，但当前官网域名版本已经变化；系统不会切换域名或重复扣款，请人工核对。"
-        : "当前官网域名版本已经变化，请重新获取续费报价。",
-      false,
-      { mutationAttempted: input.mutationAttempted },
-    );
-  }
-}
-
-async function loadRenewalTargetSnapshot(
-  db: DbExecutor,
-  operation: SiteOperation,
-) {
-  const rows = await db
-    .select({
-      normalizedAsciiDomain: workspaceSiteProfiles.normalizedAsciiDomain,
-      domainRevision: workspaceSiteProfiles.domainRevision,
-    })
-    .from(workspaceSiteProfiles)
-    .where(eq(workspaceSiteProfiles.userId, operation.userId))
-    .limit(1);
-  return rows[0] ?? null;
-}
-
-async function persistAutoRenewProfileState(input: {
-  db: DbExecutor;
-  operation: SiteOperation;
-  domain: string;
-  expectedCanonicalHostname?: string;
-  expectedDomainRevision?: number;
-  enabled: boolean;
-  mutationAttempted: boolean;
-}) {
-  await input.db.transaction(async (tx) => {
-    const rows = await tx
-      .select({
-        normalizedAsciiDomain: workspaceSiteProfiles.normalizedAsciiDomain,
-        domainRevision: workspaceSiteProfiles.domainRevision,
-      })
-      .from(workspaceSiteProfiles)
-      .where(eq(workspaceSiteProfiles.userId, input.operation.userId))
-      .limit(1)
-      .for("update");
-    assertAliyunRenewalTarget({
-      current: rows[0] ?? null,
-      quoteDomain: input.domain,
-      expectedCanonicalHostname: input.expectedCanonicalHostname,
-      expectedDomainRevision: input.expectedDomainRevision,
-      mutationAttempted: input.mutationAttempted,
+  let revokedRemote = false;
+  try {
+    const result = await revokeAliyunOAuthToken({
+      credentialId: connection.oauthCredentialId,
+      refreshToken: openAliyunRefreshToken(connection),
+      fetchImpl: options?.fetchImpl,
     });
-    await tx
-      .update(workspaceSiteProfiles)
-      .set({
-        autoRenewDesired: input.enabled,
-        autoRenewObserved: input.enabled,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(workspaceSiteProfiles.userId, input.operation.userId),
-          eq(workspaceSiteProfiles.normalizedAsciiDomain, input.domain),
-          eq(
-            workspaceSiteProfiles.domainRevision,
-            input.expectedDomainRevision!,
-          ),
-        ),
-      );
+    revokedRemote = result.revoked;
+  } catch {
+    // Local revocation is authoritative for FrontMind. Alibaba Cloud revoke is
+    // deliberately best-effort so a transient identity outage cannot retain
+    // an otherwise disconnected customer grant in this product.
+  }
+  await transitionAliyunConnectionState({
+    db,
+    connection,
+    status: "revoked",
+    lastErrorCode: null,
+    overwriteRefreshToken: true,
   });
+  return { disconnected: true as const, revokedRemote };
 }
 
-/**
- * Executes or reconciles one already-confirmed financial mutation. Callers
- * must persist mutationAttempted before the SDK write. On subsequent calls the
- * function is read-only even when no TaskNo was received.
- */
-export async function executeAliyunFinancialMutation(input: {
-  api: AliyunDomainApi;
-  quote: AliyunDomainQuote;
-  providerTaskNo?: string | null;
-  mutationAttempted: boolean;
-  operationCreatedAt: Date;
-  now?: Date;
-  beforeMutation?: () => Promise<void>;
-}): Promise<SiteOpsProviderResult> {
-  const now = input.now ?? new Date();
-  const reconcile = async () => {
-    let candidates: AliyunTaskState[];
-    try {
-      candidates = await input.api.findTaskCandidates({
-        domain: input.quote.domain,
-        kind: input.quote.kind,
-        createdAfter: new Date(input.operationCreatedAt.getTime() - 60_000),
-      });
-    } catch {
-      if (
-        now.getTime() - input.operationCreatedAt.getTime() <
-        RESPONSE_LOSS_RECONCILE_MS
-      ) {
-        return {
-          status: "pending" as const,
-          nextPollMs: 15_000,
-          result: {
-            mutationAttempted: true,
-            phase: "response_loss_query_unavailable",
-          },
-        };
-      }
-      return {
-        status: "attention_required" as const,
-        code: "DOMAIN_RECONCILIATION_UNAVAILABLE",
-        message:
-          "已提交的域名操作无法完成只读对账；系统没有重下单，请人工核对。",
-        result: { mutationAttempted: true },
-      };
-    }
-    if (candidates.length > 1) {
-      return {
-        status: "attention_required" as const,
-        code: "AMBIGUOUS_DOMAIN_TASK",
-        message: "结果丢失后发现多个可能的阿里云任务，系统不会猜测或再次扣款。",
-        result: { mutationAttempted: true, candidateCount: candidates.length },
-      };
-    }
-    if (candidates.length === 0) {
-      if (
-        now.getTime() - input.operationCreatedAt.getTime() <
-        RESPONSE_LOSS_RECONCILE_MS
-      ) {
-        return {
-          status: "pending" as const,
-          nextPollMs: 15_000,
-          result: {
-            mutationAttempted: true,
-            phase: "response_loss_reconciling",
-          },
-        };
-      }
-      return {
-        status: "attention_required" as const,
-        code: "DOMAIN_TASK_NOT_FOUND_AFTER_RESPONSE_LOSS",
-        message:
-          "无法唯一确认先前域名操作结果；系统没有重下单，请人工核对客户账号。",
-        result: { mutationAttempted: true, candidateCount: 0 },
-      };
-    }
-    return candidates[0];
-  };
-
-  let task: AliyunTaskState;
-  if (input.providerTaskNo) {
-    task = await input.api.getTask(input.providerTaskNo, input.quote.domain);
-  } else if (input.mutationAttempted) {
-    const reconciled = await reconcile();
-    if (!("taskNo" in reconciled)) return reconciled;
-    task = reconciled;
-  } else {
-    await input.beforeMutation?.();
-    try {
-      const submitted =
-        input.quote.kind === "purchase"
-          ? await input.api.submitPurchase({
-              domain: input.quote.domain,
-              years: input.quote.years,
-              registrantProfileId: input.quote.registrantProfileId!,
-            })
-          : await input.api.submitRenewal({
-              domain: input.quote.domain,
-              years: input.quote.years,
-              currentExpirationDateMs: input.quote.currentExpirationDateMs!,
-            });
-      task = {
-        taskNo: submitted.taskNo,
-        state: "pending",
-        domain: input.quote.domain,
-        taskType: input.quote.kind,
-        message: null,
-        instanceId: null,
-      };
-    } catch {
-      const reconciled = await reconcile();
-      if (!("taskNo" in reconciled)) return reconciled;
-      task = reconciled;
-    }
-  }
-  const durableResult = {
-    mutationAttempted: true,
-    phase: task.state,
-    quote: input.quote,
-  };
-  if (task.state !== "succeeded") {
-    return taskPendingResult(task, durableResult);
-  }
-  return verifyCompletedFinancialTask(input.api, input.quote, task);
-}
-
-async function loadDomainOperationForSiteOperation(
-  db: DbExecutor,
-  operation: SiteOperation,
-) {
-  const rows = await db
-    .select()
-    .from(siteDomainOperations)
-    .where(
-      and(
-        eq(siteDomainOperations.operationId, operation.id),
-        eq(siteDomainOperations.projectId, operation.projectId),
-        eq(siteDomainOperations.userId, operation.userId),
-      ),
-    )
-    .limit(1);
-  const row = rows[0];
-  if (!row) {
-    throw new AliyunProviderError(
-      "DOMAIN_LEDGER_NOT_FOUND",
-      "域名操作台账不存在；未执行外部请求。",
-    );
-  }
-  return row;
-}
-
-async function loadConnectionForLedger(
-  db: DbExecutor,
-  ledger: SiteDomainOperation,
-) {
-  if (!ledger.connectionId) {
-    throw new AliyunProviderError(
-      "PROVIDER_NOT_CONFIGURED",
-      "域名操作没有绑定客户阿里云连接。",
-    );
-  }
-  const rows = await db
-    .select()
-    .from(siteProviderConnections)
-    .where(
-      and(
-        eq(siteProviderConnections.id, ledger.connectionId),
-        eq(siteProviderConnections.projectId, ledger.projectId),
-        eq(siteProviderConnections.userId, ledger.userId),
-        eq(siteProviderConnections.provider, "aliyun_cn"),
-      ),
-    )
-    .limit(1);
-  const connection = rows[0];
-  if (!connection) {
-    throw new AliyunProviderError(
-      "PROVIDER_NOT_CONFIGURED",
-      "客户阿里云连接不存在。",
-    );
-  }
-  return connection;
-}
-
-async function persistQuote(
-  db: DbExecutor,
-  ledger: SiteDomainOperation,
-  quote: AliyunDomainQuote,
-) {
-  await db
-    .update(siteDomainOperations)
-    .set({
-      quoteHash: quote.quoteHash,
-      quoteExpiresAt: new Date(quote.expiresAt),
-      amountMinor: quote.amountMinor,
-      currency: quote.currency,
-      years: quote.years,
-      registrantProfileId: quote.registrantProfileId,
-      maskedRegistrantName: quote.maskedRegistrantName,
-      providerResult: { quote },
-      status: "quoted",
-      errorCode: null,
-      errorMessage: null,
-      updatedAt: new Date(),
-    })
-    .where(eq(siteDomainOperations.id, ledger.id));
-}
-
-async function applySuccessfulDomainState(
-  db: DbExecutor,
-  operation: SiteOperation,
-  quote: AliyunDomainQuote,
-  result: SiteOpsProviderResult,
-  renewalGuard?: {
-    expectedCanonicalHostname?: string;
-    expectedDomainRevision?: number;
-  },
-) {
-  if (result.status !== "succeeded") return;
-  const domainResult = result.result ?? {};
-  const expirationDateMs = Number(domainResult.expirationDateMs);
-  await db.transaction(async (tx) => {
-    const profileRows = await tx
-      .select()
-      .from(workspaceSiteProfiles)
-      .where(eq(workspaceSiteProfiles.userId, operation.userId))
-      .limit(1)
-      .for("update");
-    const current = profileRows[0];
-    if (quote.kind === "renewal") {
-      assertAliyunRenewalTarget({
-        current,
-        quoteDomain: quote.domain,
-        expectedCanonicalHostname: renewalGuard?.expectedCanonicalHostname,
-        expectedDomainRevision: renewalGuard?.expectedDomainRevision,
-        mutationAttempted: true,
-      });
-    }
-    const switchingDomain =
-      !current || current.normalizedAsciiDomain !== quote.domain;
-    const nextRevision = switchingDomain
-      ? (current?.domainRevision ?? 0) + 1
-      : (current?.domainRevision ?? 1);
-    const common = {
-      domain: quote.domain,
-      normalizedAsciiDomain: quote.domain,
-      unicodeDisplayDomain: domainToUnicode(quote.domain),
-      domainRevision: nextRevision,
-      registrar: "aliyun_cn",
-      providerAccountUid: quote.accountUid,
-      domainInstanceId:
-        typeof domainResult.instanceId === "string"
-          ? domainResult.instanceId
-          : quote.instanceId,
-      domainExpiresAt: Number.isFinite(expirationDateMs)
-        ? new Date(expirationDateMs)
-        : undefined,
-      domainRealNameStatus:
-        typeof domainResult.realNameStatus === "string"
-          ? domainResult.realNameStatus
-          : null,
-      domainEmailStatus:
-        typeof domainResult.emailStatus === "string"
-          ? domainResult.emailStatus
-          : null,
-      domainClientHold: domainResult.clientHold === true,
-      domainOwnershipStatus: "verified",
-      domainStatus: "completed" as const,
-      domainVerifiedAt: new Date(),
-      updatedAt: new Date(),
-    };
-    if (current) {
-      await tx
-        .update(workspaceSiteProfiles)
-        .set({
-          ...common,
-          ...(switchingDomain
-            ? {
-                dnsStatus: "pending",
-                icpDomainRevision: null,
-                icpStatus: "not_submitted" as const,
-                icpNumber: null,
-                icpVerifiedAt: null,
-                autoRenewDesired: false,
-                autoRenewObserved: null,
-                revision: current.revision + 1,
-              }
-            : {}),
-        })
-        .where(eq(workspaceSiteProfiles.userId, operation.userId));
-    } else {
-      await tx.insert(workspaceSiteProfiles).values({
-        userId: operation.userId,
-        ...common,
-        dnsStatus: "pending",
-        icpStatus: "not_submitted",
-        autoRenewDesired: false,
-        revision: 1,
-      });
-    }
-    if (switchingDomain && quote.kind === "purchase") {
-      await tx
-        .update(siteProjects)
-        .set({
-          canonicalHostname: quote.domain,
-          mainlandLiveDeploymentId: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(siteProjects.id, operation.projectId));
-    }
-  });
-}
-
-type ExistingDomainProfile = Pick<
-  typeof workspaceSiteProfiles.$inferSelect,
-  | "domain"
-  | "normalizedAsciiDomain"
-  | "domainRevision"
-  | "revision"
-  | "icpStatus"
-  | "icpNumber"
-  | "icpDomainRevision"
-  | "icpVerifiedAt"
-  | "autoRenewDesired"
-  | "dnsStatus"
->;
-
-export function projectExistingAliyunDomainState(input: {
-  current: ExistingDomainProfile | null;
-  requestedDomain: string;
-  accountUid: string;
-  details: AliyunDomainDetails;
-  now: Date;
-}) {
-  const requested = normalizeAliyunDomain(input.requestedDomain);
-  const observed = normalizeAliyunDomain(input.details.domain);
-  if (requested.ascii !== observed.ascii) {
-    throw new AliyunProviderError(
-      "DOMAIN_OWNERSHIP_MISMATCH",
-      "阿里云返回的域名与客户确认接入的精确域名不一致。",
-    );
-  }
-  const currentIdentity = (() => {
-    const value =
-      input.current?.normalizedAsciiDomain ?? input.current?.domain ?? "";
-    if (!value) return null;
-    try {
-      return normalizeAliyunDomain(value).ascii;
-    } catch {
-      return null;
-    }
-  })();
-  const switchingDomain = currentIdentity !== requested.ascii;
-  const nextDomainRevision = switchingDomain
-    ? (input.current?.domainRevision ?? 0) + 1
-    : (input.current?.domainRevision ?? 1);
-  if (
-    !Number.isFinite(input.details.expirationDateMs) ||
-    input.details.expirationDateMs <= 0
-  ) {
-    throw new AliyunProviderError(
-      "DOMAIN_DETAILS_INVALID",
-      "阿里云域名详情缺少有效到期时间，未更新本地域名状态。",
-    );
-  }
-  return {
-    switchingDomain,
-    nextDomainRevision,
-    values: {
-      domain: requested.ascii,
-      normalizedAsciiDomain: requested.ascii,
-      unicodeDisplayDomain: requested.unicode,
-      domainRevision: nextDomainRevision,
-      registrar: "aliyun_cn",
-      providerAccountUid: input.accountUid,
-      domainInstanceId: input.details.instanceId,
-      domainExpiresAt: new Date(input.details.expirationDateMs),
-      domainRealNameStatus: input.details.realNameStatus,
-      domainEmailStatus: input.details.emailStatus,
-      domainClientHold: input.details.clientHold,
-      domainOwnershipStatus: "verified",
-      domainStatus: "completed" as const,
-      domainVerifiedAt: input.now,
-      autoRenewObserved: input.details.autoRenewEnabled,
-      revision: (input.current?.revision ?? 0) + 1,
-      updatedAt: input.now,
-      ...(switchingDomain
-        ? {
-            dnsStatus: "pending",
-            icpProvince: null,
-            icpStatus: "not_submitted" as const,
-            icpNumber: null,
-            icpDomainRevision: null,
-            icpVerifiedAt: null,
-            autoRenewDesired: false,
-          }
-        : {}),
-    },
-  };
-}
-
-export async function readExistingAliyunDomainFromOwnedAccount(
-  api: AliyunDomainApi,
+export async function requireAliyunOwnedDomain(
+  api: AliyunDnsApi,
   requestedDomain: string,
 ) {
-  const domain = normalizeAliyunDomain(requestedDomain).ascii;
-  const details = await api.getDomain(domain);
-  if (!details || normalizeAliyunDomain(details.domain).ascii !== domain) {
+  const requested = normalizeAliyunDomain(requestedDomain);
+  const matched = await api.getDomain(requested.ascii);
+  if (!matched) {
     throw new AliyunProviderError(
-      "DOMAIN_NOT_OWNED",
-      "该精确域名不在当前客户阿里云账号中。",
+      "ALIYUN_DOMAIN_NOT_OWNED",
+      "该域名不在当前阿里云账号的已购买域名列表中。",
     );
   }
-  return details;
-}
-
-async function handleDomainSync(
-  db: DbExecutor,
-  operation: SiteOperation,
-  ledger: SiteDomainOperation,
-  connection: SiteProviderConnection,
-  api: AliyunDomainApi,
-  parsed: z.infer<typeof domainOperationInputSchema>,
-) {
-  if (
-    ledger.kind !== "sync" ||
-    parsed.domainIntent !== "sync" ||
-    parsed.customerConfirmed !== true ||
-    !ledger.customerConfirmedAt ||
-    !ledger.customerConfirmationHash
-  ) {
-    throw new AliyunProviderError(
-      "CUSTOMER_CONFIRMATION_REQUIRED",
-      "接入已有域名必须由客户输入精确域名并明确确认。",
-    );
-  }
-  const domain = normalizeAliyunDomain(parsed.domain).ascii;
-  if (
-    domain !== ledger.domainAscii ||
-    normalizeAliyunDomain(parsed.typedDomain ?? "").ascii !== domain
-  ) {
-    throw new AliyunProviderError(
-      "DOMAIN_LEDGER_MISMATCH",
-      "客户确认的精确域名与只读同步台账不一致。",
-    );
-  }
-  // QueryDomainByDomainName is executed with STS credentials already proven
-  // by assumeForConnection to belong to connection.accountUid. A successful
-  // exact result is therefore ownership evidence for that customer account;
-  // CheckDomain availability is deliberately never used here.
-  const details = await readExistingAliyunDomainFromOwnedAccount(api, domain);
-  const now = new Date();
-  const projection = await db.transaction(async (tx) => {
-    const projectRows = await tx
-      .select()
-      .from(siteProjects)
-      .where(
-        and(
-          eq(siteProjects.id, operation.projectId),
-          eq(siteProjects.userId, operation.userId),
-        ),
-      )
-      .limit(1)
-      .for("update");
-    const project = projectRows[0];
-    if (!project) {
-      throw new AliyunProviderError("NOT_FOUND", "SiteOps 项目不存在。");
-    }
-    const profileRows = await tx
-      .select()
-      .from(workspaceSiteProfiles)
-      .where(eq(workspaceSiteProfiles.userId, operation.userId))
-      .limit(1)
-      .for("update");
-    const current = profileRows[0] ?? null;
-    const next = projectExistingAliyunDomainState({
-      current,
-      requestedDomain: domain,
-      accountUid: connection.accountUid,
-      details,
-      now,
-    });
-    if (current) {
-      await tx
-        .update(workspaceSiteProfiles)
-        .set(next.values)
-        .where(eq(workspaceSiteProfiles.userId, operation.userId));
-    } else {
-      await tx.insert(workspaceSiteProfiles).values({
-        userId: operation.userId,
-        ...next.values,
-      });
-    }
-    if (next.switchingDomain && project.mainlandLiveDeploymentId) {
-      await tx
-        .update(siteDeployments)
-        .set({ status: "superseded", updatedAt: now })
-        .where(
-          and(
-            eq(siteDeployments.id, project.mainlandLiveDeploymentId),
-            eq(siteDeployments.projectId, project.id),
-            eq(siteDeployments.target, "mainland_cn"),
-            eq(siteDeployments.status, "active"),
-          ),
-        );
-    }
-    await tx
-      .update(siteProjects)
-      .set({
-        canonicalHostname: domain,
-        ...(next.switchingDomain ? { mainlandLiveDeploymentId: null } : {}),
-        updatedAt: now,
-      })
-      .where(eq(siteProjects.id, project.id));
-    const safeResult = {
-      domain,
-      displayDomain: domainToUnicode(domain),
-      accountUid: connection.accountUid,
-      instanceId: details.instanceId,
-      expirationDateMs: details.expirationDateMs,
-      realNameStatus: details.realNameStatus,
-      emailStatus: details.emailStatus,
-      clientHold: details.clientHold,
-      autoRenewObserved: details.autoRenewEnabled,
-      domainRevision: next.nextDomainRevision,
-      ownershipStatus: "verified",
-      switchingDomain: next.switchingDomain,
-    };
-    await tx
-      .update(siteDomainOperations)
-      .set({
-        domainRevision: next.nextDomainRevision,
-        providerResult: safeResult,
-        status: "succeeded",
-        errorCode: null,
-        errorMessage: null,
-        completedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(siteDomainOperations.id, ledger.id));
-    return safeResult;
-  });
-  return {
-    status: "succeeded" as const,
-    result: projection,
-    message: projection.switchingDomain
-      ? `已通过客户阿里云账号的只读域名详情确认并接入 ${domain}；旧域名 ICP 与大陆发布 head 已失效。`
-      : `已通过客户阿里云账号只读同步 ${domain} 的到期、实名、邮箱与自动续费状态；当前 ICP 绑定保持不变。`,
-  };
-}
-
-async function handleDomainSearch(
-  db: DbExecutor,
-  operation: SiteOperation,
-  ledger: SiteDomainOperation,
-  api: AliyunDomainApi,
-  parsed: z.infer<typeof domainOperationInputSchema>,
-) {
-  const domain = normalizeAliyunDomain(parsed.domain).ascii;
-  if (domain !== ledger.domainAscii) {
-    throw new AliyunProviderError(
-      "DOMAIN_LEDGER_MISMATCH",
-      "域名操作与台账域名不一致。",
-    );
-  }
-  const check = await api.checkDomain({ domain, command: "create", years: 1 });
-  await db
-    .update(siteDomainOperations)
-    .set({
-      providerResult: { check },
-      status: "succeeded",
-      completedAt: new Date(),
-      updatedAt: new Date(),
-    })
-    .where(eq(siteDomainOperations.id, ledger.id));
-  return {
-    status: "succeeded" as const,
-    result: { check },
-    providerOperationId: check.requestId ?? undefined,
-    message: check.available
-      ? `${domain} 当前可注册；价格仅在短时确认报价中有效。`
-      : `${domain} 当前不可注册。`,
-  };
-}
-
-async function loadReferencedQuote(
-  db: DbExecutor,
-  operation: SiteOperation,
-  referencedId: string,
-) {
-  const rows = await db
-    .select()
-    .from(siteDomainOperations)
-    .where(
-      and(
-        eq(siteDomainOperations.id, referencedId),
-        eq(siteDomainOperations.projectId, operation.projectId),
-        eq(siteDomainOperations.userId, operation.userId),
-      ),
-    )
-    .limit(1);
-  const referenced = rows[0];
-  if (!referenced) {
-    throw new AliyunProviderError("QUOTE_NOT_FOUND", "报价不存在或已失效。");
-  }
-  const providerResult = referenced.providerResult as Record<
-    string,
-    unknown
-  > | null;
-  const quote = parseDomainQuote(providerResult?.quote);
-  return { referenced, quote };
-}
-
-async function handleDomainFinancial(
-  db: DbExecutor,
-  operation: SiteOperation,
-  ledger: SiteDomainOperation,
-  connection: SiteProviderConnection,
-  factory: AliyunProviderSdkFactory,
-  parsed: z.infer<typeof domainOperationInputSchema>,
-  signal: AbortSignal,
-): Promise<SiteOpsProviderResult> {
-  const kind = operation.kind === "domain_purchase" ? "purchase" : "renewal";
-  const domain = normalizeAliyunDomain(parsed.domain).ascii;
-  if (domain !== ledger.domainAscii) {
-    throw new AliyunProviderError(
-      "DOMAIN_LEDGER_MISMATCH",
-      "域名操作与台账域名不一致。",
-    );
-  }
-  const confirmed = Boolean(
-    ledger.customerConfirmedAt && parsed.domainOperationId && parsed.quoteHash,
-  );
-  const policy = confirmed
-    ? aliyunFinancialSessionPolicy(kind)
-    : DOMAIN_READ_POLICY;
-  const credentials = await assumeForConnection(
-    connection,
-    factory,
-    policy,
-    confirmed ? `${kind}-confirm` : `${kind}-quote`,
-    parsed,
-  );
-  assertNotAborted(signal);
-  const api = factory.domain(credentials);
-  if (!confirmed) {
-    if (!parsed.years) {
-      throw new AliyunProviderError(
-        "INVALID_DOMAIN_PERIOD",
-        "报价缺少注册或续费年限。",
-      );
-    }
-    const quote = await prepareAliyunDomainQuote({
-      api,
-      kind,
-      domain,
-      accountUid: connection.accountUid,
-      years: parsed.years,
-      registrantProfileId: parsed.registrantProfileId,
-    });
-    await persistQuote(db, ledger, quote);
-    return {
-      status: "succeeded",
-      result: { quote },
-      message: `${domain} 的精确报价已生成，有效期 60 秒。`,
-    };
-  }
-  const { quote: confirmedQuote } = await loadReferencedQuote(
-    db,
-    operation,
-    parsed.domainOperationId!,
-  );
-  if (
-    confirmedQuote.domain !== domain ||
-    confirmedQuote.kind !== kind ||
-    confirmedQuote.accountUid !== connection.accountUid ||
-    confirmedQuote.quoteHash !== parsed.quoteHash
-  ) {
-    throw new AliyunProviderError(
-      "QUOTE_MISMATCH",
-      "客户确认内容与原始报价不一致。",
-    );
-  }
-  const previousResult = operation.result as Record<string, unknown> | null;
-  const mutationAttempted =
-    Boolean(operation.providerTaskId ?? ledger.providerTaskNo) ||
-    previousResult?.mutationAttempted === true ||
-    ["submitted", "reconciling", "outcome_unknown"].includes(ledger.status);
-  if (kind === "renewal" && !mutationAttempted) {
-    assertAliyunRenewalTarget({
-      current: await loadRenewalTargetSnapshot(db, operation),
-      quoteDomain: confirmedQuote.domain,
-      expectedCanonicalHostname: parsed.expectedCanonicalHostname,
-      expectedDomainRevision: parsed.expectedDomainRevision,
-      mutationAttempted,
-    });
-  }
-  // Quote expiry and the immediate price/availability refresh are admission
-  // checks for the one provider mutation. Once admitted, later task polling is
-  // read-only and must not fail merely because the 60-second quote has elapsed.
-  if (!mutationAttempted) {
-    if (new Date(confirmedQuote.expiresAt).getTime() <= Date.now()) {
-      throw new AliyunProviderError(
-        "QUOTE_EXPIRED",
-        "报价已过期，请重新查询并确认。",
-      );
-    }
-    const freshQuote = await prepareAliyunDomainQuote({
-      api,
-      kind,
-      domain,
-      accountUid: connection.accountUid,
-      years: confirmedQuote.years,
-      registrantProfileId: confirmedQuote.registrantProfileId ?? undefined,
-    });
-    if (!sameQuote(confirmedQuote, freshQuote)) {
-      await persistQuote(db, ledger, freshQuote);
-      return {
-        status: "attention_required",
-        code: "QUOTE_CHANGED",
-        message:
-          "价格、库存、持有人模板或到期日已经变化，必须重新确认；未提交扣款。",
-        result: { quote: freshQuote },
-      };
-    }
-  }
-  await db
-    .update(siteDomainOperations)
-    .set({
-      quoteHash: confirmedQuote.quoteHash,
-      quoteExpiresAt: new Date(confirmedQuote.expiresAt),
-      amountMinor: confirmedQuote.amountMinor,
-      currency: confirmedQuote.currency,
-      years: confirmedQuote.years,
-      registrantProfileId: confirmedQuote.registrantProfileId,
-      maskedRegistrantName: confirmedQuote.maskedRegistrantName,
-      updatedAt: new Date(),
-    })
-    .where(eq(siteDomainOperations.id, ledger.id));
-  const result = await executeAliyunFinancialMutation({
-    api,
-    quote: confirmedQuote,
-    providerTaskNo: operation.providerTaskId ?? ledger.providerTaskNo,
-    mutationAttempted,
-    operationCreatedAt: asDate(operation.createdAt) ?? new Date(),
-    beforeMutation: async () => {
-      await db
-        .update(siteDomainOperations)
-        .set({
-          status: "reconciling",
-          providerResult: { mutationAttempted: true, quote: confirmedQuote },
-          updatedAt: new Date(),
-        })
-        .where(eq(siteDomainOperations.id, ledger.id));
-    },
-  });
-  if (result.status === "pending") {
-    await db
-      .update(siteDomainOperations)
-      .set({
-        status: result.providerTaskId ? "submitted" : "reconciling",
-        providerTaskNo: result.providerTaskId,
-        providerResult: result.result,
-        updatedAt: new Date(),
-      })
-      .where(eq(siteDomainOperations.id, ledger.id));
-  }
-  try {
-    await applySuccessfulDomainState(db, operation, confirmedQuote, result, {
-      expectedCanonicalHostname: parsed.expectedCanonicalHostname,
-      expectedDomainRevision: parsed.expectedDomainRevision,
-    });
-  } catch (error) {
-    if (
-      result.status === "succeeded" &&
-      error instanceof AliyunProviderError &&
-      error.code === "RENEWAL_DOMAIN_REVISION_CHANGED"
-    ) {
-      return {
-        ...result,
-        result: {
-          ...result.result,
-          domainProjectionDeferred: true,
-        },
-        message:
-          "续费结果已经只读核验成功；当前官网域名版本已经变化，未覆盖现有域名配置。",
-      };
-    }
-    throw error;
-  }
-  return result;
-}
-
-async function handleDomainAutoRenew(
-  db: DbExecutor,
-  operation: SiteOperation,
-  ledger: SiteDomainOperation,
-  connection: SiteProviderConnection,
-  factory: AliyunProviderSdkFactory,
-  parsed: z.infer<typeof domainOperationInputSchema>,
-) {
-  if (
-    parsed.enabled == null ||
-    parsed.customerConfirmed !== true ||
-    !ledger.customerConfirmedAt ||
-    !ledger.customerConfirmationHash
-  ) {
-    throw new AliyunProviderError(
-      "CUSTOMER_CONFIRMATION_REQUIRED",
-      "自动续费必须由客户明确确认。",
-    );
-  }
-  const domain = normalizeAliyunDomain(parsed.domain).ascii;
-  const attempted =
-    ["reconciling", "outcome_unknown"].includes(ledger.status) ||
-    (operation.result as Record<string, unknown> | null)?.mutationAttempted ===
-      true;
-  const assertCurrentTarget = async (mutationAttempted: boolean) =>
-    assertAliyunRenewalTarget({
-      current: await loadRenewalTargetSnapshot(db, operation),
-      quoteDomain: domain,
-      expectedCanonicalHostname: parsed.expectedCanonicalHostname,
-      expectedDomainRevision: parsed.expectedDomainRevision,
-      mutationAttempted,
-    });
-  await assertCurrentTarget(attempted);
-  const credentials = await assumeForConnection(
-    connection,
-    factory,
-    DOMAIN_AUTO_RENEW_POLICY,
-    "auto-renew",
-    parsed,
-  );
-  const api = factory.domain(credentials);
-  const details = await api.getDomain(domain);
-  if (!details) {
-    throw new AliyunProviderError(
-      "DOMAIN_NOT_OWNED",
-      "该域名不在客户阿里云账号中。",
-    );
-  }
-  if (details.autoRenewEnabled === parsed.enabled) {
-    await persistAutoRenewProfileState({
-      db,
-      operation,
-      domain,
-      expectedCanonicalHostname: parsed.expectedCanonicalHostname,
-      expectedDomainRevision: parsed.expectedDomainRevision,
-      enabled: parsed.enabled,
-      mutationAttempted: attempted,
-    });
-    return {
-      status: "succeeded" as const,
-      result: { domain, autoRenewObserved: parsed.enabled },
-      message: `域名 ${domain} 的自动续费状态已同步。`,
-    };
-  }
-  if (attempted) {
-    const age =
-      Date.now() - (asDate(operation.createdAt)?.getTime() ?? Date.now());
-    if (age < RESPONSE_LOSS_RECONCILE_MS) {
-      return {
-        status: "pending" as const,
-        nextPollMs: 15_000,
-        result: { mutationAttempted: true, phase: "auto_renew_reconciling" },
-      };
-    }
-    return {
-      status: "attention_required" as const,
-      code: "AUTO_RENEW_RESULT_UNKNOWN",
-      message:
-        "自动续费写入结果无法确认；系统没有盲目发送第二次 SET/CANCEL，请人工核对。",
-      result: { mutationAttempted: true },
-    };
-  }
-  await db
-    .update(siteDomainOperations)
-    .set({
-      status: "reconciling",
-      providerResult: { mutationAttempted: true },
-      updatedAt: new Date(),
-    })
-    .where(eq(siteDomainOperations.id, ledger.id));
-  await assertCurrentTarget(false);
-  let response: { ok: boolean; requestId: string | null };
-  try {
-    response = await api.setAutoRenew({
-      instanceId: details.instanceId,
-      enabled: parsed.enabled,
-    });
-  } catch {
-    return {
-      status: "pending" as const,
-      nextPollMs: 15_000,
-      result: { mutationAttempted: true, phase: "auto_renew_reconciling" },
-    };
-  }
-  if (!response.ok) {
-    throw new AliyunProviderError(
-      "AUTO_RENEW_REJECTED",
-      "阿里云未接受自动续费设置。",
-    );
-  }
-  const observed = await api.getDomain(domain);
-  if (!observed || observed.autoRenewEnabled !== parsed.enabled) {
-    return {
-      status: "pending" as const,
-      nextPollMs: 15_000,
-      providerOperationId: response.requestId ?? undefined,
-      result: {
-        mutationAttempted: true,
-        phase: "auto_renew_observation_pending",
-      },
-    };
-  }
-  await persistAutoRenewProfileState({
-    db,
-    operation,
-    domain,
-    expectedCanonicalHostname: parsed.expectedCanonicalHostname,
-    expectedDomainRevision: parsed.expectedDomainRevision,
-    enabled: parsed.enabled,
-    mutationAttempted: true,
-  });
-  return {
-    status: "succeeded" as const,
-    providerOperationId: response.requestId ?? undefined,
-    result: { domain, autoRenewObserved: parsed.enabled },
-    message: `域名 ${domain} 已${parsed.enabled ? "开启" : "关闭"}自动续费。`,
-  };
-}
-
-export function createAliyunDomainProviderHandler(options?: {
-  factory?: AliyunProviderSdkFactory;
-}): SiteOpsProviderHandler {
-  const factory = options?.factory ?? new OfficialAliyunProviderSdkFactory();
-  return async ({ operation, signal }) => {
-    try {
-      if (process.env.FRONTMIND_ALIYUN_DOMAIN_ENABLED?.trim() !== "1") {
-        throw new AliyunProviderError(
-          "PROVIDER_NOT_CONFIGURED",
-          "阿里云域名自动化未启用；未提交任何外部操作。",
-        );
-      }
-      assertNotAborted(signal);
-      const db = await requireDb();
-      const parsed = domainOperationInputSchema.parse(operation.input);
-      const ledger = await loadDomainOperationForSiteOperation(db, operation);
-      const connection = await loadConnectionForLedger(db, ledger);
-      if (
-        parsed.connectionId !== connection.id ||
-        parsed.domainLedgerId !== ledger.id
-      ) {
-        throw new AliyunProviderError(
-          "DOMAIN_LEDGER_MISMATCH",
-          "域名操作绑定的客户连接或台账不一致。",
-        );
-      }
-      if (operation.kind === "domain_search") {
-        const credentials = await assumeForConnection(
-          connection,
-          factory,
-          DOMAIN_READ_POLICY,
-          ledger.kind === "sync" ? "domain-sync" : "domain-search",
-          parsed,
-        );
-        const api = factory.domain(credentials);
-        return ledger.kind === "sync"
-          ? await handleDomainSync(
-              db,
-              operation,
-              ledger,
-              connection,
-              api,
-              parsed,
-            )
-          : await handleDomainSearch(db, operation, ledger, api, parsed);
-      }
-      if (
-        operation.kind === "domain_purchase" ||
-        operation.kind === "domain_renewal"
-      ) {
-        return await handleDomainFinancial(
-          db,
-          operation,
-          ledger,
-          connection,
-          factory,
-          parsed,
-          signal,
-        );
-      }
-      if (operation.kind === "domain_auto_renew") {
-        return await handleDomainAutoRenew(
-          db,
-          operation,
-          ledger,
-          connection,
-          factory,
-          parsed,
-        );
-      }
-      throw new AliyunProviderError(
-        "UNSUPPORTED_DOMAIN_OPERATION",
-        `不支持的域名操作：${operation.kind}`,
-      );
-    } catch (error) {
-      return resultError(error);
-    }
-  };
+  return matched;
 }
 
 export type AliyunDnsPlanItem = {
@@ -3681,8 +1033,8 @@ export type AliyunDnsPlanItem = {
     | "update"
     | "adopt"
     | "verify"
-    | "rollback_update"
     | "rollback_delete"
+    | "rollback_verify"
     | "conflict"
     | "unknown";
   current: AliyunDnsRecordView | null;
@@ -3721,7 +1073,9 @@ type AliyunDnsTargetProfile = Pick<
  * RecordIds acquired during an apply, and verification timestamps deliberately
  * do not participate, so a retry can reconcile normal DNS propagation without
  * accepting a changed desired tuple. Rollback additionally freezes the exact
- * owned RecordId and before-value that the customer authorized restoring.
+ * owned RecordId. The OAuth-only contract never overwrites an unowned record,
+ * so rollback removes only the exact FrontMind-owned record instead of
+ * manufacturing a customer-looking record from an older FrontMind value.
  */
 export function aliyunDnsExpectedRecordsHash(input: {
   mode: "apply" | "rollback";
@@ -3739,8 +1093,6 @@ export function aliyunDnsExpectedRecordsHash(input: {
       | "expectedTtl"
       | "remarkMarker"
       | "providerRecordId"
-      | "beforeValue"
-      | "beforeTtl"
     >
   >;
 }) {
@@ -3767,11 +1119,6 @@ export function aliyunDnsExpectedRecordsHash(input: {
           ...(input.mode === "rollback"
             ? {
                 providerRecordId: record.providerRecordId,
-                beforeValue:
-                  record.beforeValue == null
-                    ? null
-                    : normalizedDnsValue(record.recordType, record.beforeValue),
-                beforeTtl: record.beforeTtl,
               }
             : {}),
         })),
@@ -3925,7 +1272,15 @@ export function planAliyunDnsRecords(
         ) ?? null)
       : null;
     if (mode === "rollback") {
-      if (!byId || !sameDnsOwner(byId, expected)) {
+      if (!byId) {
+        return {
+          id: expected.id,
+          action: "rollback_verify",
+          current: null,
+          reason: null,
+        };
+      }
+      if (!sameDnsOwner(byId, expected)) {
         return {
           id: expected.id,
           action: "conflict",
@@ -3943,8 +1298,7 @@ export function planAliyunDnsRecords(
       }
       return {
         id: expected.id,
-        action:
-          expected.beforeValue == null ? "rollback_delete" : "rollback_update",
+        action: "rollback_delete",
         current: byId,
         reason: null,
       };
@@ -4019,6 +1373,24 @@ export function planAliyunDnsRecords(
   });
 }
 
+export function isExplicitPublicDnsAbsence(error: unknown) {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  return code === "ENODATA" || code === "ENOTFOUND";
+}
+
+function publicDnsResolutionErrorCode(error: unknown) {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  return /^[A-Z][A-Z0-9_]{1,63}$/u.test(code)
+    ? code
+    : "DNS_RESOLUTION_UNAVAILABLE";
+}
+
 async function defaultPublicDnsResolver(input: {
   hostname: string;
   type: string;
@@ -4038,8 +1410,9 @@ async function defaultPublicDnsResolver(input: {
       default:
         return [];
     }
-  } catch {
-    return [];
+  } catch (error) {
+    if (isExplicitPublicDnsAbsence(error)) return [];
+    throw error;
   }
 }
 
@@ -4053,10 +1426,21 @@ async function verifyPublicDns(
 ) {
   const observations = await Promise.all(
     records.map(async (record) => {
-      const values = await resolver({
-        hostname: dnsHostname(record.domainAscii, record.rr),
-        type: record.recordType,
-      });
+      let values: string[];
+      try {
+        values = await resolver({
+          hostname: dnsHostname(record.domainAscii, record.rr),
+          type: record.recordType,
+        });
+      } catch (error) {
+        return {
+          id: record.id,
+          values: [],
+          matched: false,
+          unavailable: true,
+          errorCode: publicDnsResolutionErrorCode(error),
+        };
+      }
       const expected = normalizedDnsValue(
         record.recordType,
         record.expectedValue,
@@ -4067,6 +1451,54 @@ async function verifyPublicDns(
         matched: values.some(
           (value) => normalizedDnsValue(record.recordType, value) === expected,
         ),
+        unavailable: false,
+        errorCode: null,
+      };
+    }),
+  );
+  return {
+    ok: observations.every((observation) => observation.matched),
+    observations,
+  };
+}
+
+export async function verifyPublicDnsRollback(
+  records: SiteDnsRecord[],
+  resolver: PublicDnsResolver,
+) {
+  const observations = await Promise.all(
+    records.map(async (record) => {
+      let values: string[];
+      try {
+        values = await resolver({
+          hostname: dnsHostname(record.domainAscii, record.rr),
+          type: record.recordType,
+        });
+      } catch (error) {
+        return {
+          id: record.id,
+          values: [],
+          target: "absent" as const,
+          matched: false,
+          unavailable: true,
+          errorCode: publicDnsResolutionErrorCode(error),
+        };
+      }
+      const expectedFrontMindValue = normalizedDnsValue(
+        record.recordType,
+        record.expectedValue,
+      );
+      return {
+        id: record.id,
+        values,
+        target: "absent" as const,
+        matched: !values.some(
+          (value) =>
+            normalizedDnsValue(record.recordType, value) ===
+            expectedFrontMindValue,
+        ),
+        unavailable: false,
+        errorCode: null,
       };
     }),
   );
@@ -4400,6 +1832,21 @@ async function applyDnsItem(
       .where(eq(siteDnsRecords.id, row.id));
     return;
   }
+  if (item.action === "rollback_verify") {
+    await db
+      .update(siteDnsRecords)
+      .set({
+        status: "rolled_back",
+        observedValue: null,
+        observedTtl: null,
+        verifiedAt: new Date(),
+        errorCode: null,
+        errorMessage: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(siteDnsRecords.id, row.id));
+    return;
+  }
   // Keep the target check outside the mutation catch: if it fails, no provider
   // request was attempted and the record must not be mislabeled outcome_unknown.
   await beforeProviderMutation();
@@ -4428,16 +1875,6 @@ async function applyDnsItem(
         remark: row.remarkMarker,
       });
     } else if (item.action === "update" && item.current) {
-      if (row.beforeValue == null) {
-        await db
-          .update(siteDnsRecords)
-          .set({
-            beforeValue: item.current.value,
-            beforeTtl: item.current.ttl,
-            updatedAt: new Date(),
-          })
-          .where(eq(siteDnsRecords.id, row.id));
-      }
       await api.updateRecord({
         recordId: item.current.recordId,
         rr: row.rr,
@@ -4453,27 +1890,6 @@ async function applyDnsItem(
           status: "rolled_back",
           observedValue: null,
           observedTtl: null,
-          verifiedAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(eq(siteDnsRecords.id, row.id));
-      return;
-    } else if (item.action === "rollback_update" && item.current) {
-      await api.updateRecord({
-        recordId: item.current.recordId,
-        rr: row.rr,
-        type: row.recordType,
-        value: row.beforeValue!,
-        ttl: row.beforeTtl ?? DEFAULT_DNS_TTL,
-      });
-      await beforeProviderMutation();
-      await api.updateRemark({ recordId: item.current.recordId, remark: "" });
-      await db
-        .update(siteDnsRecords)
-        .set({
-          status: "rolled_back",
-          observedValue: row.beforeValue,
-          observedTtl: row.beforeTtl ?? DEFAULT_DNS_TTL,
           verifiedAt: new Date(),
           updatedAt: new Date(),
         })
@@ -4512,13 +1928,146 @@ async function applyDnsItem(
   }
 }
 
+async function handleDomainSync(input: {
+  db: DbExecutor;
+  operation: SiteOperation;
+  parsed: z.infer<typeof domainSyncInputSchema>;
+  connection: SiteProviderConnection;
+  api: AliyunDnsApi;
+}): Promise<SiteOpsProviderResult> {
+  if (input.operation.kind !== "domain_sync") {
+    throw new AliyunProviderError(
+      "DOMAIN_SYNC_KIND_MISMATCH",
+      "域名接入操作类型不匹配。",
+    );
+  }
+  const selected = await requireAliyunOwnedDomain(
+    input.api,
+    input.parsed.domain,
+  );
+  const now = new Date();
+  const domainRevision = await input.db.transaction(async (tx) => {
+    const [projects, profiles, dnsEvidence] = await Promise.all([
+      tx
+        .select()
+        .from(siteProjects)
+        .where(
+          and(
+            eq(siteProjects.id, input.operation.projectId),
+            eq(siteProjects.userId, input.operation.userId),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+      tx
+        .select()
+        .from(workspaceSiteProfiles)
+        .where(eq(workspaceSiteProfiles.userId, input.operation.userId))
+        .limit(1)
+        .for("update"),
+      tx
+        .select({ id: siteDnsRecords.id })
+        .from(siteDnsRecords)
+        .where(
+          and(
+            eq(siteDnsRecords.projectId, input.operation.projectId),
+            eq(siteDnsRecords.userId, input.operation.userId),
+          ),
+        )
+        .limit(1)
+        .for("update"),
+    ]);
+    const project = projects[0];
+    const profile = profiles[0];
+    if (!project || !profile) {
+      throw new AliyunProviderError(
+        "SITE_PROFILE_NOT_FOUND",
+        "当前账号尚未初始化官网域名配置。",
+      );
+    }
+    const sameDomain =
+      profile.normalizedAsciiDomain === selected.domain &&
+      profile.providerAccountUid === input.connection.accountUid;
+    const hasExistingDomainState = Boolean(
+      profile.domain ||
+        profile.normalizedAsciiDomain ||
+        profile.providerAccountUid ||
+        profile.domainOwnershipStatus ||
+        profile.dnsStatus ||
+        profile.icpDomainRevision ||
+        project.canonicalHostname ||
+        project.globalLiveDeploymentId ||
+        project.mainlandLiveDeploymentId ||
+        dnsEvidence.length > 0,
+    );
+    assertAliyunDomainSelectionSafe({ sameDomain, hasExistingDomainState });
+    const alreadyVerified =
+      sameDomain &&
+      profile.domainStatus === "completed" &&
+      profile.domainOwnershipStatus === "verified";
+    const nextDomainRevision = sameDomain
+      ? profile.domainRevision
+      : profile.domainRevision + 1;
+    if (alreadyVerified && project.canonicalHostname === selected.domain) {
+      return nextDomainRevision;
+    }
+    await tx
+      .update(workspaceSiteProfiles)
+      .set({
+        domain: selected.displayDomain,
+        normalizedAsciiDomain: selected.domain,
+        unicodeDisplayDomain: selected.displayDomain,
+        domainRevision: nextDomainRevision,
+        providerAccountUid: input.connection.accountUid,
+        domainStatus: "completed",
+        domainOwnershipStatus: "verified",
+        domainVerifiedAt: now,
+        dnsStatus: alreadyVerified ? profile.dnsStatus : "pending",
+        ...(sameDomain
+          ? {}
+          : {
+              icpDomainRevision: null,
+              icpProvince: null,
+              icpNumber: null,
+              icpStatus: "not_submitted" as const,
+              icpVerifiedAt: null,
+            }),
+        revision: profile.revision + 1,
+        updatedByUserId: input.operation.userId,
+        updatedAt: now,
+      })
+      .where(eq(workspaceSiteProfiles.userId, input.operation.userId));
+    await tx
+      .update(siteProjects)
+      .set({
+        canonicalHostname: selected.domain,
+        ...(!sameDomain ? { mainlandLiveDeploymentId: null } : {}),
+        updatedAt: now,
+      })
+      .where(eq(siteProjects.id, project.id));
+    return nextDomainRevision;
+  });
+  return {
+    status: "succeeded",
+    result: {
+      domain: selected.domain,
+      displayDomain: selected.displayDomain,
+      domainRevision,
+      phase: "domain_synced",
+    },
+    message: "域名已接入，FrontMind 正在自动配置解析。",
+  };
+}
+
 export function createAliyunDnsProviderHandler(options?: {
   factory?: AliyunProviderSdkFactory;
   publicResolver?: PublicDnsResolver;
+  refreshAccessToken?: AliyunOAuthTokenRefresher;
 }): SiteOpsProviderHandler {
   const factory = options?.factory ?? new OfficialAliyunProviderSdkFactory();
   const publicResolver = options?.publicResolver ?? defaultPublicDnsResolver;
   return async ({ operation, signal }) => {
+    let activeConnection: SiteProviderConnection | null = null;
     let expectationGuard: AliyunDnsExpectationGuard | null = null;
     const finish = <T extends SiteOpsProviderResult>(result: T) =>
       withDnsExpectationGuard(result, expectationGuard);
@@ -4531,22 +2080,30 @@ export function createAliyunDnsProviderHandler(options?: {
       }
       assertNotAborted(signal);
       const db = await requireDb();
-      const input = dnsOperationInputSchema.parse(operation.input);
+      const input = aliyunOperationInputSchema.parse(operation.input);
       const connection = await loadActiveConnectionForOperation(db, operation);
+      activeConnection = connection;
       if (input.connectionId !== connection.id) {
         throw new AliyunProviderError(
           "DNS_CONNECTION_MISMATCH",
           "DNS 操作绑定的客户连接不一致。",
         );
       }
-      const credentials = await assumeForConnection(
+      const api = await createAliyunDnsApiForConnection({
+        db,
         connection,
         factory,
-        input.dnsIntent === "plan" ? DNS_READ_POLICY : DNS_WRITE_POLICY,
-        input.dnsIntent === "rollback" ? "dns-rollback" : "dns-apply",
-        input,
-      );
-      const api = factory.dns(credentials);
+        refreshAccessToken: options?.refreshAccessToken,
+      });
+      if ("domainIntent" in input) {
+        return await handleDomainSync({
+          db,
+          operation,
+          parsed: input,
+          connection,
+          api,
+        });
+      }
       const expected = await loadDnsRows(db, operation, input.domainRevision);
       const mode = input.dnsIntent === "rollback" ? "rollback" : "apply";
       if (input.dnsIntent !== "plan") {
@@ -4658,6 +2215,46 @@ export function createAliyunDnsProviderHandler(options?: {
         });
       }
       if (mode === "rollback") {
+        const refreshed = await db
+          .select()
+          .from(siteDnsRecords)
+          .where(
+            and(
+              eq(siteDnsRecords.projectId, operation.projectId),
+              eq(siteDnsRecords.domainRevision, expected.revision),
+            ),
+          );
+        const publicVerification = await verifyPublicDnsRollback(
+          refreshed,
+          publicResolver,
+        );
+        if (!publicVerification.ok) {
+          const age =
+            Date.now() - (asDate(operation.createdAt)?.getTime() ?? Date.now());
+          if (age < DNS_PROPAGATION_TIMEOUT_MS) {
+            return finish({
+              status: "pending",
+              nextPollMs: 15_000,
+              result: {
+                domain: expected.domain,
+                revision: expected.revision,
+                phase: "dns_rollback_propagating",
+                publicVerification,
+              },
+            });
+          }
+          return finish({
+            status: "attention_required",
+            code: "DNS_ROLLBACK_PROPAGATION_TIMEOUT",
+            message:
+              "AliDNS 控制面已安全回滚，但公共解析尚未确认旧 FrontMind 记录消失。",
+            result: {
+              domain: expected.domain,
+              revision: expected.revision,
+              publicVerification,
+            },
+          });
+        }
         await db
           .update(workspaceSiteProfiles)
           .set({ dnsStatus: "rolled_back", updatedAt: new Date() })
@@ -4673,6 +2270,7 @@ export function createAliyunDnsProviderHandler(options?: {
             domain: expected.domain,
             revision: expected.revision,
             rolledBack: true,
+            publicVerification,
           },
           message: "仅 FrontMind 管理且未被客户后续修改的 DNS 记录已回滚。",
         });
@@ -4805,6 +2403,16 @@ export function createAliyunDnsProviderHandler(options?: {
           : "ESA 所有权 TXT 已验证；请再次生成 DNS 计划以取得精确 CNAME。",
       });
     } catch (error) {
+      if (activeConnection) {
+        const db = await getDb();
+        if (db) {
+          await invalidateAliyunConnectionOnUnauthorized({
+            db,
+            connection: activeConnection,
+            error,
+          });
+        }
+      }
       return finish(resultError(error));
     }
   };
@@ -4812,26 +2420,23 @@ export function createAliyunDnsProviderHandler(options?: {
 
 let registeredAliyunProviders = false;
 
-/** Registers the two narrow handlers once; no registration happens on import. */
+/** Registers the OAuth-only AliDNS handler once; no registration on import. */
 export function registerAliyunSiteOpsProviders(options?: {
   factory?: AliyunProviderSdkFactory;
   publicResolver?: PublicDnsResolver;
+  refreshAccessToken?: AliyunOAuthTokenRefresher;
 }) {
   if (registeredAliyunProviders) return () => undefined;
-  const unregisterDomain = registerSiteOpsProviderHandler(
-    "aliyun_domain",
-    createAliyunDomainProviderHandler({ factory: options?.factory }),
-  );
   const unregisterDns = registerSiteOpsProviderHandler(
     "aliyun_alidns",
     createAliyunDnsProviderHandler({
       factory: options?.factory,
       publicResolver: options?.publicResolver,
+      refreshAccessToken: options?.refreshAccessToken,
     }),
   );
   registeredAliyunProviders = true;
   return () => {
-    unregisterDomain();
     unregisterDns();
     registeredAliyunProviders = false;
   };

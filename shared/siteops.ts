@@ -266,10 +266,7 @@ export const siteOpsOperationKindSchema = z.enum([
   "deploy",
   "rollback",
   "social_package",
-  "domain_search",
-  "domain_purchase",
-  "domain_renewal",
-  "domain_auto_renew",
+  "domain_sync",
   "dns_apply",
   "dns_rollback",
 ]);
@@ -308,12 +305,10 @@ export const siteOpsCardKindSchema = z.enum([
   "build_preview",
   "qa_failed",
   "publish_options",
-  "domain_quote",
   "domain_status",
   "icp_status",
   "content_review",
   "social_package",
-  "operation_recovery",
   "release_status",
 ]);
 
@@ -1261,23 +1256,22 @@ export const siteOpsObserveInputSchema = z
   })
   .strict();
 
-export const siteOpsAliyunConnectionSetupInputSchema = z
-  .object({
-    conversationId: z.string().trim().min(1).max(191),
-    accountUid: z
-      .string()
-      .trim()
-      .regex(/^\d{6,64}$/),
-    roleArn: z
-      .string()
-      .trim()
-      .regex(/^acs:ram::\d{6,64}:role\/[A-Za-z0-9.@_-]+$/),
-  })
-  .strict();
-
 export const siteOpsAliyunConnectionInputSchema = z
   .object({
     conversationId: z.string().trim().min(1).max(191),
+  })
+  .strict();
+
+export const siteOpsAliyunDomainSchema = z
+  .object({
+    domain: z.string().trim().min(1).max(255),
+    displayDomain: z.string().trim().min(1).max(255),
+  })
+  .strict();
+
+export const siteOpsAliyunDomainListSchema = z
+  .object({
+    domains: z.array(siteOpsAliyunDomainSchema).max(10_000),
   })
   .strict();
 
@@ -1292,11 +1286,8 @@ export const siteOpsSendMessageInputSchema = z
   .strict();
 
 export const siteOpsActionSchema = z.enum([
-  "reset_workflow",
-  "resume_build",
   "request_rebuild",
   "select_snapshot",
-  "change_snapshot",
   "start_visual_search",
   "reselect_visual",
   "select_visual",
@@ -1308,16 +1299,7 @@ export const siteOpsActionSchema = z.enum([
   "rollback",
   "create_wechat_package",
   "create_xiaohongshu_package",
-  "domain_search",
   "domain_sync",
-  "domain_prepare_purchase",
-  "domain_confirm_purchase",
-  "domain_prepare_renewal",
-  "domain_confirm_renewal",
-  "domain_set_auto_renew",
-  "dns_plan",
-  "dns_apply",
-  "dns_rollback",
 ]);
 
 export const siteOpsActInputSchema = z
@@ -1353,3 +1335,7 @@ export type VisualSelectionBundleV5 = z.infer<
 export type VisualSelectionBundle = z.infer<typeof visualSelectionBundleSchema>;
 export type BuildContractV1 = z.infer<typeof buildContractV1Schema>;
 export type SiteOpsActInput = z.infer<typeof siteOpsActInputSchema>;
+export type SiteOpsAliyunDomain = z.infer<typeof siteOpsAliyunDomainSchema>;
+export type SiteOpsAliyunDomainList = z.infer<
+  typeof siteOpsAliyunDomainListSchema
+>;

@@ -11,7 +11,6 @@ export const siteOpsKnowledgeSnapshotSchema = z
   .object({
     id: z.string().uuid(),
     label: z.string().trim().min(1).max(255),
-    archiveSha256: z.string().regex(/^[a-f0-9]{64}$/),
     sourceProfile: z.string().trim().min(1).max(64).nullable().default(null),
     createdAt: z.string().datetime(),
     active: z.boolean().default(false),
@@ -101,10 +100,7 @@ export const siteOpsVisualGenerationProjectionSchema = z
   })
   .strict();
 
-/** Public recovery state for the one failed build that remains bound to the
- * project's frozen knowledge snapshot, visual selection and provider task.
- * Optional on reads so a new client can still consume an observation emitted
- * during a rolling deployment by the previous server release. */
+/** Public state for one immutable build in the current logical task. */
 export const siteOpsBuildProjectionSchema = z
   .object({
     id: z.string().uuid(),
@@ -211,7 +207,7 @@ export const siteOpsAliyunConnectionProjectionSchema = z
       "attention_required",
     ]),
     verifiedAt: z.string().datetime().nullable(),
-    canRotate: z.boolean().default(true),
+    canDisconnect: z.boolean().default(true),
   })
   .strict();
 
@@ -220,15 +216,8 @@ export const siteOpsDomainStateProjectionSchema = z
     domain: z.string().max(255).nullable(),
     displayDomain: z.string().max(255).nullable(),
     revision: z.number().int().positive(),
-    registrar: z.string().max(64).nullable(),
-    expiresAt: z.string().datetime().nullable(),
-    realNameStatus: z.string().max(64).nullable(),
-    emailStatus: z.string().max(64).nullable(),
-    clientHold: z.boolean(),
     ownershipStatus: z.string().max(64).nullable(),
     dnsStatus: z.string().max(64).nullable(),
-    autoRenewDesired: z.boolean(),
-    autoRenewObserved: z.boolean().nullable(),
     icpStatus: z.enum([
       "not_submitted",
       "preparing",
@@ -239,86 +228,6 @@ export const siteOpsDomainStateProjectionSchema = z
     ]),
     icpDomainRevision: z.number().int().positive().nullable(),
     icpVerifiedAt: z.string().datetime().nullable(),
-  })
-  .strict();
-
-export const siteOpsDomainOperationProjectionSchema = z
-  .object({
-    id: z.string().uuid(),
-    kind: z.enum([
-      "search",
-      "purchase",
-      "renewal",
-      "set_auto_renew",
-      "cancel_auto_renew",
-      "sync",
-    ]),
-    domain: z.string().max(255),
-    displayDomain: z.string().max(255).nullable(),
-    status: z.enum([
-      "quoted",
-      "reserved",
-      "submitted",
-      "reconciling",
-      "succeeded",
-      "failed",
-      "outcome_unknown",
-      "attention_required",
-      "expired",
-      "cancelled",
-    ]),
-    quoteHash: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .nullable(),
-    quoteExpiresAt: z.string().datetime().nullable(),
-    amountMinor: z.number().int().nonnegative().nullable(),
-    currency: z.string().max(8).nullable(),
-    years: z.number().int().positive().nullable(),
-    maskedRegistrantName: z.string().max(255).nullable(),
-    searchResult: z
-      .object({
-        available: z.boolean(),
-        premium: z.boolean(),
-        reason: z.string().max(1_000).nullable(),
-      })
-      .strict()
-      .nullable(),
-    registrantProfiles: z
-      .array(
-        z
-          .object({
-            profileId: z.string().max(191),
-            holderType: z.enum(["individual", "enterprise", "unknown"]),
-            maskedName: z.string().max(255),
-            realNameVerified: z.boolean(),
-            emailVerified: z.boolean(),
-            isDefault: z.boolean(),
-          })
-          .strict(),
-      )
-      .max(100),
-    issue: z
-      .enum([
-        "quote_changed",
-        "authorization_needed",
-        "payment_required",
-        "identity_required",
-        "service_unavailable",
-        "needs_help",
-      ])
-      .nullable(),
-    createdAt: z.string().datetime(),
-  })
-  .strict();
-
-export const siteOpsDnsPlanProjectionSchema = z
-  .object({
-    canApply: z.boolean(),
-    status: z.enum(["succeeded", "attention_required"]),
-    changeCount: z.number().int().nonnegative(),
-    conflictCount: z.number().int().nonnegative(),
-    createdAt: z.string().datetime(),
   })
   .strict();
 
@@ -386,11 +295,6 @@ export const siteOpsObservationV1Schema = z
       .strict(),
     aliyunConnection: siteOpsAliyunConnectionProjectionSchema,
     domainState: siteOpsDomainStateProjectionSchema.nullable(),
-    domainOperations: z
-      .array(siteOpsDomainOperationProjectionSchema)
-      .max(20)
-      .default([]),
-    dnsPlan: siteOpsDnsPlanProjectionSchema.nullable().default(null),
     project: siteOpsProjectProjectionSchema,
     brief: siteBriefSchema.nullable(),
     knowledgeSnapshots: z
