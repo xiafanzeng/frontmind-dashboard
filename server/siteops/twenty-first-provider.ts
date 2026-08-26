@@ -3142,7 +3142,10 @@ async function runNativeTemplateVisualSearch(input: {
   const catalogTemplateIds = new Set<string>();
   const catalogSlugs = new Set<string>();
   for (const template of catalog) {
-    if (!template.verified && !template.includedWithPlan) continue;
+    // listNativeTemplates has already confirmed the official isUnlocked
+    // entitlement boundary. The provider does not consistently return the
+    // optional verified/includedWithPlan catalog flags, so they must not
+    // discard an otherwise downloadable Template here.
     const key = nativeTemplateProviderKey(template);
     const templateId = String(template.templateId);
     if (

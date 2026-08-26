@@ -715,8 +715,10 @@ describe("21st SiteOps provider", () => {
       slug: `complete-template-${index + 1}`,
       name: `Official Template ${index + 1}`,
       version: `v${index + 1}`,
-      verified: index % 2 === 0,
-      includedWithPlan: index % 2 === 1,
+      // The official purchase contract may omit both optional catalog flags;
+      // listNativeTemplates has already proven isUnlocked in that case.
+      verified: false,
+      includedWithPlan: false,
       sortRank: index,
     }));
     const withReadOnlySession = vi.fn();
