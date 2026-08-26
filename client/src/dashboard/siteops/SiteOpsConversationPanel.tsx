@@ -1263,7 +1263,8 @@ export default function SiteOpsConversationPanel({
 
       <SiteOpsExecutionTimeline steps={observation.executionSteps ?? []} />
 
-      {observation.project.status === "draft" && !currentSnapshotId && (
+      {observation.project.status === "draft" &&
+        observation.interactionState === "select_snapshot" && (
         <section
           className="siteops-snapshot-card"
           aria-labelledby="siteops-snapshot-title"

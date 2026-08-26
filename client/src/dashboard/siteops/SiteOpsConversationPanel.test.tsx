@@ -986,6 +986,36 @@ describe("SiteOpsConversationPanel", () => {
     );
   });
 
+  it("keeps the start action available for a legacy reset that retained the workflow snapshot pointer", async () => {
+    const onAction = vi.fn().mockResolvedValue(undefined);
+    render(
+      <SiteOpsConversationPanel
+        observation={observation({
+          project: {
+            ...observation().project,
+            status: "draft",
+          },
+          messages: [],
+          visualCandidates: [],
+          interactionState: "select_snapshot",
+        })}
+        onAction={onAction}
+      />,
+    );
+
+    const startButton = screen.getByRole("button", {
+      name: "从知识库开始建站",
+    });
+    expect(startButton).toBeEnabled();
+    fireEvent.click(startButton);
+    await waitFor(() =>
+      expect(onAction).toHaveBeenCalledWith({
+        action: "select_snapshot",
+        input: {},
+      }),
+    );
+  });
+
   it("keeps provider configuration failures visible without inventing candidates", () => {
     render(
       <SiteOpsConversationPanel

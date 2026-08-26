@@ -3013,10 +3013,7 @@ async function handleSelectSnapshot(
     payload: { knowledgeSnapshotId?: string };
   },
 ) {
-  if (
-    input.project.status !== "draft" ||
-    input.project.currentKnowledgeSnapshotId
-  ) {
+  if (input.project.status !== "draft") {
     throw new SiteOpsServiceError(
       "STATE_CONFLICT",
       "当前官网任务已经连接知识库；如需重新开始，请先提交官网重置申请。",

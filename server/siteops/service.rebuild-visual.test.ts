@@ -373,6 +373,50 @@ describe("SiteOps visual selection and current-task revisions", () => {
     });
   });
 
+  it("reconnects a retained legacy snapshot pointer on an otherwise fresh draft", async () => {
+    const fixture = serviceDatabaseFixture();
+    fixture.project.currentBuildId = null;
+    fixture.project.status = "draft";
+    const validSnapshot = fixture.snapshots[0]!;
+    fixture.project.currentKnowledgeSnapshotId = validSnapshot.id;
+    dependencies.getDb.mockResolvedValue(fixture.db);
+
+    await actOnSiteOps(
+      actor as never,
+      connectKnowledgeInput(fixture.project.revision),
+    );
+
+    expect(fixture.project).toMatchObject({
+      currentKnowledgeSnapshotId: validSnapshot.id,
+      status: "collecting_brief",
+      revision: 9,
+    });
+    expect(
+      fixture.inserts.filter(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "brief_message",
+      ),
+    ).toHaveLength(1);
+
+    await expect(
+      actOnSiteOps(
+        actor as never,
+        {
+          ...connectKnowledgeInput(fixture.project.revision),
+          clientRequestId: "connect-current-knowledge-2",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "STATE_CONFLICT", statusCode: 409 });
+    expect(
+      fixture.inserts.filter(
+        (entry) =>
+          entry.table === siteOperations &&
+          entry.values.kind === "brief_message",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("accepts an old client id only when it equals the newest valid active snapshot", async () => {
     const fixture = serviceDatabaseFixture();
     fixture.project.currentKnowledgeSnapshotId = null;
