@@ -202,27 +202,6 @@ export function getRouteRequestHistoryConfig(section, sub) {
   return null;
 }
 
-export function hasLegacyWebsiteDeliveryState(
-  workspace,
-  tickets: readonly unknown[] = [],
-) {
-  const workflow = workspace?.websiteWorkflow || workspace?.workflowState || {};
-  const progressed = (value) =>
-    value !== undefined &&
-    value !== null &&
-    !["", "locked", "not_started", "not_required"].includes(String(value));
-  return Boolean(
-    tickets.length > 0 ||
-      workflow.domainCompleted === true ||
-      workflow.icpCompleted === true ||
-      Number(workflow.styleRevision || 0) > 0 ||
-      workflow.styleBatch ||
-      workflow.selectedStyleSampleId ||
-      progressed(workflow.domainStatus) ||
-      progressed(workflow.icpStatus),
-  );
-}
-
 const geoIntentMeta = {
   basic: {
     label: "产品场景",
@@ -1112,9 +1091,6 @@ function UserBrandDashboardContent({
   buildPreviewHistoricalResults = null,
 }) {
   const previewMode = import.meta.env.DEV && preview;
-  // Test/legacy adapters may intentionally expose the older workspace client.
-  // The generated production client always includes the server-owned SiteOps router.
-  const siteOpsClientAvailable = Boolean(trpc.workspace.siteOps);
   const [route, setRoute] = useState(
     initialSection === "knowledge-agent"
       ? { section: "knowledge-agent", sub: "build" }
@@ -1174,17 +1150,9 @@ function UserBrandDashboardContent({
   ).filter((ticket) =>
     WEBSITE_MANAGEMENT_HISTORY_CATEGORIES.includes(ticket?.category),
   );
-  // Existing domain/ICP/style customers stay on the historical delivery
-  // workflow. Opening the new panel lazily creates a SiteOps project, so this
-  // decision must happen before the panel mounts.
-  const useSiteOpsWebsiteFlow =
-    !previewMode &&
-    siteOpsClientAvailable &&
-    (deliveryWorkspace.siteOpsProjectActive === true ||
-      !hasLegacyWebsiteDeliveryState(
-        deliveryWorkspace,
-        websiteOperationTickets,
-      ));
+  // Production always uses the OAuth-only SiteOps workspace. Preview fixtures
+  // stay local and never create a real SiteOps project.
+  const useSiteOpsWebsiteFlow = !previewMode;
   const selectedDeliveryTicketQuota =
     deliveryTicketDetailPayload?.ticket?.type === "website_operation"
       ? websiteOperationQuota

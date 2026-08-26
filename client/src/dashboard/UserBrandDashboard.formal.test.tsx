@@ -99,6 +99,12 @@ vi.mock("@/lib/frontmind-api", async (importOriginal) => {
   };
 });
 
+vi.mock("./siteops/ConnectedSiteOpsConversationPanel", () => ({
+  default: () => (
+    <div data-testid="connected-siteops-panel">OAuth-only SiteOps 已连接</div>
+  ),
+}));
+
 vi.mock("@/_core/hooks/useAuth", () => ({
   useAuth: () => ({
     user: { marketEdition: authState.marketEdition },
@@ -810,27 +816,19 @@ describe("UserBrandDashboard formal workspace", () => {
     expect(source).not.toMatch(new RegExp(privateTrackerBrand, "iu"));
   });
 
-  it("keeps the website workflow on the authenticated overseas edition while workspace metadata is legacy", () => {
+  it("routes legacy website metadata through OAuth-only SiteOps", () => {
     authState.marketEdition = "overseas";
     render(<UserBrandDashboard />);
 
     fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
 
-    const progress = screen
-      .getByRole("heading", { name: "官网开通进度" })
-      .closest("section");
-    expect(progress).not.toBeNull();
+    expect(screen.getByTestId("connected-siteops-panel")).toHaveTextContent(
+      "OAuth-only SiteOps 已连接",
+    );
     expect(
-      within(progress as HTMLElement).getByText("企业域名注册与确认"),
-    ).toBeInTheDocument();
-    expect(
-      within(progress as HTMLElement).queryByText("阿里云域名注册与 ICP 备案"),
+      screen.queryByRole("heading", { name: "官网开通进度" }),
     ).not.toBeInTheDocument();
-    expect(
-      within(progress as HTMLElement)
-        .getByText("AI专用官网构建与内容运营")
-        .closest("li"),
-    ).toHaveTextContent("已开放");
+    expect(screen.queryByLabelText("已购买域名")).not.toBeInTheDocument();
   });
 
   it("does not duplicate the administrator-published customer dashboard on the service home", () => {
@@ -965,189 +963,6 @@ describe("UserBrandDashboard formal workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
 
     expect(fetchContentNextPage).toHaveBeenCalledTimes(1);
-  });
-
-  it("uploads website-operation files before creating the formal ticket", async () => {
-    const sourceFile = new File(["redirects"], "官网更新清单.xlsx", {
-      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    });
-    uploadFileMock.mockResolvedValue({
-      fileId: "uploaded-website-file",
-      filename: "官网更新清单.xlsx",
-    });
-    deliveryCreateMutateAsync.mockResolvedValue({ id: "website-ticket-1" });
-    render(<UserBrandDashboard />);
-
-    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
-    fireEvent.change(screen.getByLabelText("需求类型"), {
-      target: { value: "company_facts" },
-    });
-    fireEvent.change(screen.getByLabelText("话题"), {
-      target: { value: "更新企业资料与品牌事实" },
-    });
-    fireEvent.change(screen.getByLabelText("上传官网需求附件"), {
-      target: { files: [sourceFile] },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "提交需求" }));
-
-    await waitFor(() =>
-      expect(uploadFileMock).toHaveBeenCalledWith(sourceFile),
-    );
-    await waitFor(() =>
-      expect(deliveryCreateMutateAsync).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "website_operation",
-          category: "company_facts",
-          topic: "更新企业资料与品牌事实",
-          attachments: [
-            expect.objectContaining({
-              fileId: "uploaded-website-file",
-              filename: "官网更新清单.xlsx",
-            }),
-          ],
-        }),
-      ),
-    );
-  });
-
-  it("submits only the completed domain and ICP subject number", async () => {
-    deliveryWorkspaceUseQuery.mockReturnValue({
-      data: {
-        contentAssetCatalog: [],
-        websiteContentCatalog: [],
-        websiteWorkflow: {
-          domainStatus: "completed",
-          icpStatus: "not_started",
-          canSubmitIcp: true,
-          canSubmitContent: false,
-        },
-        quotas: {
-          content_asset_publish: {
-            type: "content_asset_publish",
-            allowed: true,
-            used: 0,
-            reserved: 0,
-            consumed: 0,
-            limit: 20,
-            remaining: 20,
-            periodId: "formal-period",
-            validFrom: null,
-            validUntil: null,
-            reason: null,
-          },
-          website_content_publish: {
-            type: "website_content_publish",
-            allowed: true,
-            used: 0,
-            reserved: 0,
-            consumed: 0,
-            limit: 100,
-            remaining: 100,
-            periodId: "formal-period",
-            validFrom: null,
-            validUntil: null,
-            reason: null,
-          },
-        },
-        tickets: [],
-      },
-      isLoading: false,
-      isError: false,
-      error: null,
-      refetch: vi.fn(),
-    });
-    deliveryCreateMutateAsync.mockResolvedValue({ id: "icp-ticket-1" });
-
-    render(<UserBrandDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
-    fireEvent.change(screen.getByLabelText("已备案域名"), {
-      target: { value: "example.com" },
-    });
-    fireEvent.change(screen.getByLabelText("ICP 主体备案号"), {
-      target: { value: "浙ICP备12345678号" },
-    });
-    expect(screen.queryByLabelText(/上传营业执照/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "提交备案结果" }));
-
-    expect(uploadFileMock).not.toHaveBeenCalled();
-    await waitFor(() =>
-      expect(deliveryCreateMutateAsync).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "website_operation",
-          category: "icp_filing",
-          topic: "example.com",
-          icpDeclarations: {
-            icpNumber: "浙ICP备12345678号",
-          },
-          attachments: [],
-        }),
-      ),
-    );
-  });
-
-  it("opens the existing service-advisor dialog from the ICP service-code guide", async () => {
-    deliveryWorkspaceUseQuery.mockReturnValue({
-      data: {
-        contentAssetCatalog: [],
-        websiteContentCatalog: [],
-        websiteWorkflow: {
-          domainStatus: "not_started",
-          icpStatus: "locked",
-          canSubmitIcp: false,
-          canSubmitContent: false,
-        },
-        quotas: {
-          content_asset_publish: {
-            type: "content_asset_publish",
-            allowed: true,
-            used: 0,
-            reserved: 0,
-            consumed: 0,
-            limit: 20,
-            remaining: 20,
-            periodId: "formal-period",
-            validFrom: null,
-            validUntil: null,
-            reason: null,
-          },
-          website_content_publish: {
-            type: "website_content_publish",
-            allowed: true,
-            used: 0,
-            reserved: 0,
-            consumed: 0,
-            limit: 100,
-            remaining: 100,
-            periodId: "formal-period",
-            validFrom: null,
-            validUntil: null,
-            reason: null,
-          },
-        },
-        tickets: [],
-      },
-      isLoading: false,
-      isError: false,
-      error: null,
-      refetch: vi.fn(),
-    });
-
-    render(<UserBrandDashboard />);
-    fireEvent.click(screen.getByRole("button", { name: "AI友好官网管理" }));
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "不确定场景，联系服务专员",
-      }),
-    );
-
-    expect(
-      await screen.findByRole("heading", { name: "联系服务专员" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("img", {
-        name: "FrontMind 服务专员企业微信二维码",
-      }),
-    ).toHaveAttribute("src", "/frontmind-sales-wechat.png?v=wecom-20260801");
   });
 
   it("does not expose the retired content-system entry", () => {

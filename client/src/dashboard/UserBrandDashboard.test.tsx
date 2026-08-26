@@ -36,7 +36,6 @@ vi.mock("@/components/QuestionMaintenanceRequestDialog", () => ({
 
 import {
   getRouteRequestHistoryConfig,
-  hasLegacyWebsiteDeliveryState,
   PreviewUserBrandDashboard,
 } from "./UserBrandDashboard";
 import { userPreviewFixtures } from "@/lib/development-preview-fixtures";
@@ -86,24 +85,20 @@ describe("UserBrandDashboard service experience", () => {
     setPreviewPlan("basic");
   });
 
-  it("keeps progressed legacy website customers out of lazy SiteOps creation", () => {
-    expect(
-      hasLegacyWebsiteDeliveryState(
-        { websiteWorkflow: { domainStatus: "completed", styleRevision: 0 } },
-        [],
+  it("routes every production website workspace through OAuth-only SiteOps", () => {
+    const source = readFileSync(
+      resolve(
+        process.cwd(),
+        "client/src/dashboard/UserBrandDashboard.tsx",
       ),
-    ).toBe(true);
-    expect(
-      hasLegacyWebsiteDeliveryState(
-        {
-          websiteWorkflow: { domainStatus: "not_started", icpStatus: "locked" },
-        },
-        [],
-      ),
-    ).toBe(false);
-    expect(hasLegacyWebsiteDeliveryState({}, [{ id: "legacy-ticket" }])).toBe(
-      true,
+      "utf8",
     );
+
+    expect(source).toContain(
+      "const useSiteOpsWebsiteFlow = !previewMode;",
+    );
+    expect(source).not.toContain("hasLegacyWebsiteDeliveryState");
+    expect(source).not.toContain("siteOpsClientAvailable");
   });
 
   it.each([
