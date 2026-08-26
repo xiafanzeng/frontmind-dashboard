@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, lt, max, or } from "drizzle-orm";
 import {
+  deliveryTickets,
   localAssets,
   messages,
   siteBuilds,
@@ -32,6 +33,10 @@ import {
   finalizeApprovedSiteOpsReset,
   parseApprovedResetUnpublishInput,
 } from "./rebuild-ticket";
+import {
+  approvedResetHasNoUnresolvedExternalExposure,
+  parseApprovedResetSafeNoExposureProof,
+} from "./esa-provider";
 
 const DEFAULT_LEASE_MS = 2 * 60_000;
 const DEFAULT_TIMEOUT_MS = 90_000;
@@ -201,6 +206,71 @@ export function exclusiveSiteOpsLiveHeadProjection(
 
 export function siteOpsWorkerMayClaimStatus(status: string) {
   return status === "queued" || status === "running";
+}
+
+const APPROVED_RESET_AUTO_RECOVERY_CODES = new Set([
+  "ESA_RUNTIME_DISABLED",
+  "ESA_INSTANCE_NOT_CONFIGURED",
+  "ESA_SERVICE_IDENTITY_NOT_CONFIGURED",
+  "DATABASE_UNAVAILABLE",
+  "PROVIDER_NOT_CONFIGURED",
+]);
+
+function pendingApprovedResetTicketNote(value: string | null | undefined) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const allowedKeys = new Set([
+      "schemaVersion",
+      "kind",
+      "projectId",
+      "sourceBuildId",
+      "knowledgeSnapshotId",
+      "resetIntent",
+      "resetOperationId",
+      "resetApprovedAt",
+      "resetExpectedProjectRevision",
+      "minimumKnowledgeSnapshotVersion",
+    ]);
+    if (
+      Object.keys(parsed).some((key) => !allowedKeys.has(key)) ||
+      parsed.schemaVersion !== 4 ||
+      parsed.kind !== "frontmind.siteops-rebuild.v1" ||
+      typeof parsed.projectId !== "string" ||
+      (parsed.sourceBuildId !== null &&
+        typeof parsed.sourceBuildId !== "string") ||
+      (parsed.knowledgeSnapshotId !== null &&
+        typeof parsed.knowledgeSnapshotId !== "string") ||
+      parsed.resetIntent !== "approved_reset_unpublish" ||
+      typeof parsed.resetOperationId !== "string" ||
+      typeof parsed.resetApprovedAt !== "string" ||
+      !Number.isInteger(parsed.resetExpectedProjectRevision) ||
+      Number(parsed.resetExpectedProjectRevision) < 1 ||
+      !Number.isInteger(parsed.minimumKnowledgeSnapshotVersion) ||
+      Number(parsed.minimumKnowledgeSnapshotVersion) < 1
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function siteOpsApprovedResetMayAutoRecover(
+  operation: typeof siteOperations.$inferSelect,
+) {
+  return Boolean(
+    operation.kind === "rollback" &&
+      operation.provider === "aliyun_esa" &&
+      operation.status === "attention_required" &&
+      typeof operation.errorCode === "string" &&
+      APPROVED_RESET_AUTO_RECOVERY_CODES.has(operation.errorCode) &&
+      operation.result === null &&
+      operation.providerOperationId === null &&
+      operation.providerTaskId === null &&
+      parseApprovedResetUnpublishInput(operation.input),
+  );
 }
 
 export function siteOpsWorkerExecutionPolicy(kind: string) {
@@ -477,6 +547,156 @@ async function claimOne(db: any): Promise<Claimed | null> {
       leaseExpiresAt,
     };
   });
+}
+
+async function requeueOneSafeApprovedReset(db: any) {
+  const candidates = await db
+    .select()
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.kind, "rollback"),
+        eq(siteOperations.provider, "aliyun_esa"),
+        eq(siteOperations.status, "attention_required"),
+        inArray(
+          siteOperations.errorCode,
+          Array.from(APPROVED_RESET_AUTO_RECOVERY_CODES),
+        ),
+        isNull(siteOperations.result),
+        isNull(siteOperations.providerOperationId),
+        isNull(siteOperations.providerTaskId),
+      ),
+    )
+    .orderBy(siteOperations.updatedAt)
+    // Scan a bounded but wide window. A four-row window allowed a handful of
+    // genuinely exposed projects to starve every later safe no-exposure reset
+    // forever because those blocked rows never leave attention_required.
+    .limit(128);
+  for (const candidate of candidates) {
+    if (!siteOpsApprovedResetMayAutoRecover(candidate)) continue;
+    const recoveryErrorCode = candidate.errorCode;
+    const requeued = await db.transaction(async (tx: any) => {
+      const operationRows = await tx
+        .select()
+        .from(siteOperations)
+        .where(eq(siteOperations.id, candidate.id))
+        .limit(1)
+        .for("update");
+      const operation = operationRows[0];
+      if (!operation || !siteOpsApprovedResetMayAutoRecover(operation)) {
+        return false;
+      }
+      const reset = parseApprovedResetUnpublishInput(operation.input);
+      if (!reset) return false;
+      const ticketRows = await tx
+        .select()
+        .from(deliveryTickets)
+        .where(
+          and(
+            eq(deliveryTickets.id, reset.rebuildTicketId),
+            eq(deliveryTickets.userId, operation.userId),
+            eq(deliveryTickets.operation, "site_rebuild"),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      const ticket = ticketRows[0];
+      const note = pendingApprovedResetTicketNote(ticket?.internalNote);
+      if (
+        !ticket ||
+        !["scheduled", "in_progress"].includes(ticket.status) ||
+        !note ||
+        note.projectId !== operation.projectId ||
+        note.resetOperationId !== operation.id ||
+        note.resetExpectedProjectRevision !== reset.expectedProjectRevision
+      ) {
+        return false;
+      }
+      let safe: Awaited<
+        ReturnType<typeof approvedResetHasNoUnresolvedExternalExposure>
+      > = null;
+      try {
+        safe = await approvedResetHasNoUnresolvedExternalExposure({
+          db: tx,
+          operation,
+          reset,
+          // A residual hostname alone is not a control-plane mutation
+          // boundary. Requeueing is safe because the disabled-runtime
+          // provider performs only the pinned 404/410 marker check.
+          allowCanonicalHostname: true,
+          allowMigration0065RevisionDrift: true,
+        });
+      } catch (error) {
+        const code =
+          error && typeof error === "object"
+            ? (error as { code?: unknown }).code
+            : null;
+        if (code !== "SITEOPS_RESET_INVALIDATED") throw error;
+        // The helper validates the frozen project coordinates before any
+        // provider call. Persist that terminal classification on the same
+        // operation so the ticket projection can leave "处理中" without ever
+        // invoking ESA or creating a replacement operation.
+        const invalidatedUpdate = await tx
+          .update(siteOperations)
+          .set({
+            status: "failed",
+            errorCode: "SITEOPS_RESET_INVALIDATED",
+            errorMessage: "官网重置坐标已变化，未执行外部下线操作。",
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            completedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(siteOperations.id, operation.id),
+              eq(siteOperations.status, "attention_required"),
+              eq(siteOperations.errorCode, operation.errorCode!),
+              eq(siteOperations.attempt, operation.attempt),
+              isNull(siteOperations.result),
+              isNull(siteOperations.providerOperationId),
+              isNull(siteOperations.providerTaskId),
+            ),
+          );
+        if (affectedRows(invalidatedUpdate) !== 1) return false;
+        return false;
+      }
+      if (!safe) return false;
+      const updated = await tx
+        .update(siteOperations)
+        .set({
+          status: "queued",
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          errorCode: null,
+          errorMessage: null,
+          completedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(siteOperations.id, operation.id),
+            eq(siteOperations.status, "attention_required"),
+            eq(siteOperations.errorCode, operation.errorCode!),
+            eq(siteOperations.attempt, operation.attempt),
+            isNull(siteOperations.result),
+            isNull(siteOperations.providerOperationId),
+            isNull(siteOperations.providerTaskId),
+          ),
+        );
+      return affectedRows(updated) === 1;
+    });
+    if (requeued) {
+      console.info("[SiteOpsWorker] approved_reset_requeued", {
+        event: "siteops_approved_reset_requeued",
+        operationId: candidate.id,
+        projectId: candidate.projectId,
+        errorCode: recoveryErrorCode,
+      });
+      return true;
+    }
+  }
+  return false;
 }
 
 function failureResult<
@@ -994,6 +1214,38 @@ async function finalize(
       return result.status;
     }
     if (result.status === "outcome_unknown") {
+      if (approvedResetFromOperationInput(locked.input)) {
+        // An approved reset that crossed a provider mutation boundary must
+        // stop here. Repeatedly converting the terminal uncertainty back to
+        // `running` would execute unbounded read-only polls forever. A later
+        // operator reconciliation may reuse this exact operation and its
+        // persisted boundary, but must never create or replay a delete.
+        const terminalUnknownUpdate = await tx
+          .update(siteOperations)
+          .set({
+            status: "outcome_unknown",
+            result: result.result ?? locked.result,
+            providerOperationId:
+              result.providerOperationId ?? locked.providerOperationId,
+            providerTaskId: result.providerTaskId ?? locked.providerTaskId,
+            errorCode: result.code,
+            errorMessage: result.message,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            completedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(siteOperations.id, locked.id),
+              eq(siteOperations.leaseOwner, operation.leaseOwner),
+            ),
+          );
+        if (affectedRows(terminalUnknownUpdate) !== 1) {
+          throw new Error("SITEOPS_RESET_OPERATION_CAS_CONFLICT");
+        }
+        return result.status;
+      }
       // A timeout after a provider mutation is not a terminal failure. Keep
       // the original reservation and let the same provider handler enter its
       // read-only reconciliation branch on the next lease; never create a
@@ -1025,9 +1277,13 @@ async function finalize(
       let resetResult: Exclude<SiteOpsProviderResult, { status: "pending" }> =
         result;
       if (result.status === "succeeded") {
+        const safeNoExposureProof = parseApprovedResetSafeNoExposureProof(
+          result.result?.safeNoExposureProof,
+        );
         const resetFinalization = await finalizeApprovedSiteOpsReset(tx, {
           operation: locked,
           now,
+          safeNoExposureProof: safeNoExposureProof ?? undefined,
         });
         if (resetFinalization.status !== "applied") {
           resetResult = failureResult(
@@ -1525,6 +1781,7 @@ export async function runSiteOpsWorkerSweep(options?: { max?: number }) {
     attentionRequired: 0,
     failed: 0,
   };
+  await requeueOneSafeApprovedReset(db);
   for (let index = 0; index < limit; index += 1) {
     const operation = await claimOne(db);
     if (!operation) break;

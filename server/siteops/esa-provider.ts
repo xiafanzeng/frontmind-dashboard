@@ -2,16 +2,18 @@ import { randomUUID } from "node:crypto";
 
 import * as EsaModels from "@alicloud/esa20240910";
 import * as OpenApi from "@alicloud/openapi-client";
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, gt, ne } from "drizzle-orm";
 import JSZip from "jszip";
 import { z } from "zod";
 
 import {
+  messages,
   siteBuilds,
   siteDeployments,
   siteDnsRecords,
   siteOperations,
   siteProjects,
+  websiteStyleSampleBatches,
   workspaceSiteProfiles,
   type SiteOperation,
 } from "../../drizzle/schema";
@@ -28,6 +30,7 @@ import { rebuildNativeReactProductionFromSource } from "./native-react-build-run
 import { validateNativeReactSourceArchive } from "./native-react-source";
 import {
   APPROVED_RESET_UNPUBLISH,
+  approvedResetUnpublishNonRevisionCoordinatesMatch,
   approvedResetUnpublishProjectMatches,
   parseApprovedResetUnpublishInput,
   type ApprovedResetUnpublishInput,
@@ -789,31 +792,369 @@ async function loadApprovedResetProject(
   return project;
 }
 
-/**
- * A disabled ESA runtime may acknowledge a reset only when the database proves
- * that this project has never had an ESA exposure to remove. Any historical
- * deployment or ESA operation is evidence that requires the normal configured
- * delete and read-only reconciliation path.
- */
-async function approvedResetHasNoExternalExposureHistory(input: {
-  db: DbExecutor;
-  operation: SiteOperation;
-  reset: ApprovedResetUnpublishInput;
-}) {
-  if (input.operation.provider !== "aliyun_esa") return false;
-  const project = await loadApprovedResetProject(
-    input.db,
-    input.operation,
-    input.reset,
-  );
+const approvedResetExposureRemovedV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    intent: z.literal(APPROVED_RESET_UNPUBLISH),
+    stage: z.literal("exposure_removed"),
+  })
+  .strict();
+
+const approvedResetExposureRemovedV2Schema = z
+  .object({
+    schemaVersion: z.literal(2),
+    intent: z.literal(APPROVED_RESET_UNPUBLISH),
+    stage: z.literal("exposure_removed"),
+    resetOperationId: z.string().uuid(),
+    projectId: z.string().uuid(),
+    freshRootApplied: z.literal(true),
+    minimumKnowledgeSnapshotVersion: z.number().int().positive(),
+    resetAppliedProjectRevision: z.number().int().positive(),
+  })
+  .strict();
+
+export const approvedResetSafeNoExposureProofSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    classification: z.literal("safe_no_exposure"),
+    source: z.enum(["exact_coordinates", "migration_0065_revision_only"]),
+    resetOperationId: z.string().uuid(),
+    projectId: z.string().uuid(),
+    expectedProjectRevision: z.number().int().positive(),
+    observedProjectRevision: z.number().int().positive(),
+    observedProjectUpdatedAt: z.string().datetime(),
+  })
+  .strict();
+
+export type ApprovedResetSafeNoExposureProof = z.infer<
+  typeof approvedResetSafeNoExposureProofSchema
+>;
+
+export function parseApprovedResetSafeNoExposureProof(value: unknown) {
+  const parsed = approvedResetSafeNoExposureProofSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+const ESA_PRE_MUTATION_CONFIGURATION_CODES = new Set([
+  "ESA_RUNTIME_DISABLED",
+  "ESA_INSTANCE_NOT_CONFIGURED",
+  "ESA_SERVICE_IDENTITY_NOT_CONFIGURED",
+  "DATABASE_UNAVAILABLE",
+  "PROVIDER_NOT_CONFIGURED",
+]);
+
+type ApprovedResetExposureDeployment = {
+  id: string;
+  operationId: string | null;
+  verification: Record<string, unknown> | null;
+};
+
+type ApprovedResetExposureOperation = {
+  id: string;
+  projectId: string;
+  kind: string;
+  status: string;
+  input: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  providerOperationId: string | null;
+  providerTaskId: string | null;
+  errorCode: string | null;
+};
+
+function isStrictCompletedApprovedReset(
+  operation: ApprovedResetExposureOperation,
+) {
+  const reset = parseApprovedResetUnpublishInput(operation.input);
   if (
-    project.globalLiveDeploymentId !== null ||
-    project.mainlandLiveDeploymentId !== null
+    operation.kind !== "rollback" ||
+    operation.status !== "succeeded" ||
+    !reset
   ) {
     return false;
   }
+  const v1 = approvedResetExposureRemovedV1Schema.safeParse(operation.result);
+  if (v1.success) return true;
+  const v2 = approvedResetExposureRemovedV2Schema.safeParse(operation.result);
+  return Boolean(
+    v2.success &&
+      v2.data.resetOperationId === operation.id &&
+      v2.data.projectId === operation.projectId,
+  );
+}
+
+function isPreMutationConfigurationFailure(
+  operation: ApprovedResetExposureOperation,
+) {
+  return (
+    ["failed", "attention_required", "cancelled"].includes(operation.status) &&
+    typeof operation.errorCode === "string" &&
+    ESA_PRE_MUTATION_CONFIGURATION_CODES.has(operation.errorCode) &&
+    operation.result === null &&
+    operation.providerOperationId === null &&
+    operation.providerTaskId === null
+  );
+}
+
+export function approvedResetExternalExposureClassification(input: {
+  deployments: ApprovedResetExposureDeployment[];
+  operations: ApprovedResetExposureOperation[];
+}) {
+  const resetInvalidatedOperationIds = new Set<string>();
+  for (const deployment of input.deployments) {
+    if (deployment.verification?.resetInvalidated !== true) {
+      return "requires_esa_reconciliation" as const;
+    }
+    if (deployment.operationId) {
+      resetInvalidatedOperationIds.add(deployment.operationId);
+    }
+  }
+  for (const operation of input.operations) {
+    if (resetInvalidatedOperationIds.has(operation.id)) continue;
+    if (isStrictCompletedApprovedReset(operation)) continue;
+    if (isPreMutationConfigurationFailure(operation)) continue;
+    return "requires_esa_reconciliation" as const;
+  }
+  return "safe_no_exposure" as const;
+}
+
+function exactSafeNoExposureProof(input: {
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+  project: typeof siteProjects.$inferSelect;
+}): ApprovedResetSafeNoExposureProof {
+  return approvedResetSafeNoExposureProofSchema.parse({
+    schemaVersion: 1,
+    classification: "safe_no_exposure",
+    source: "exact_coordinates",
+    resetOperationId: input.operation.id,
+    projectId: input.project.id,
+    expectedProjectRevision: input.reset.expectedProjectRevision,
+    observedProjectRevision: input.project.revision,
+    observedProjectUpdatedAt: input.project.updatedAt.toISOString(),
+  });
+}
+
+async function migration0065RevisionOnlyProof(input: {
+  db: DbExecutor;
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+  project: typeof siteProjects.$inferSelect;
+}) {
+  const { operation, project, reset } = input;
+  if (
+    project.revision !== reset.expectedProjectRevision + 1 ||
+    !approvedResetUnpublishNonRevisionCoordinatesMatch(reset, project) ||
+    operation.result !== null ||
+    operation.providerOperationId !== null ||
+    operation.providerTaskId !== null ||
+    !(operation.createdAt instanceof Date) ||
+    !(project.updatedAt instanceof Date) ||
+    project.updatedAt.getTime() <= operation.createdAt.getTime()
+  ) {
+    return null;
+  }
+
+  // 0065 has one intentionally recognizable data-migration fingerprint: it
+  // soft-deletes legacy operation_recovery messages and increments every
+  // SiteOps project revision in the same migration window. Requiring the
+  // deleted message's revision and exact timestamp prevents an arbitrary
+  // later project mutation from being mistaken for that one-time drift.
+  const recoveryRows = await input.db
+    .select({
+      metadata: messages.metadata,
+      sentAt: messages.sentAt,
+      updatedAt: messages.updatedAt,
+      deletedAt: messages.deletedAt,
+    })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, project.conversationId),
+        eq(messages.userId, operation.userId),
+        eq(messages.deletedAt, project.updatedAt),
+      ),
+    )
+    .limit(1_001);
+  if (recoveryRows.length > 1_000) return null;
+  const hasMigrationFingerprint = recoveryRows.some((row) => {
+    const metadata =
+      row.metadata &&
+      typeof row.metadata === "object" &&
+      !Array.isArray(row.metadata)
+        ? (row.metadata as Record<string, unknown>)
+        : null;
+    const siteOps =
+      metadata?.siteOps &&
+      typeof metadata.siteOps === "object" &&
+      !Array.isArray(metadata.siteOps)
+        ? (metadata.siteOps as Record<string, unknown>)
+        : null;
+    return (
+      siteOps?.kind === "operation_recovery" &&
+      siteOps.revision === reset.expectedProjectRevision &&
+      row.sentAt.getTime() <= operation.createdAt.getTime() &&
+      row.deletedAt?.getTime() === project.updatedAt.getTime() &&
+      row.updatedAt.getTime() === project.updatedAt.getTime()
+    );
+  });
+  if (!hasMigrationFingerprint) return null;
+
+  // The migration proof is valid only while the reset remains the newest
+  // website workflow fact. Any later operation, build, visual batch or sent
+  // message is a real causal change and restores strict revision matching.
+  const laterOperationRows = await input.db
+    .select({ id: siteOperations.id })
+    .from(siteOperations)
+    .where(
+      and(
+        eq(siteOperations.projectId, operation.projectId),
+        eq(siteOperations.userId, operation.userId),
+        gt(siteOperations.createdAt, operation.createdAt),
+      ),
+    )
+    .limit(1);
+  if (laterOperationRows.length > 0) return null;
+  const laterBuildRows = await input.db
+    .select({ id: siteBuilds.id })
+    .from(siteBuilds)
+    .where(
+      and(
+        eq(siteBuilds.projectId, operation.projectId),
+        eq(siteBuilds.userId, operation.userId),
+        gt(siteBuilds.createdAt, operation.createdAt),
+      ),
+    )
+    .limit(1);
+  if (laterBuildRows.length > 0) return null;
+  const laterVisualRows = await input.db
+    .select({ id: websiteStyleSampleBatches.id })
+    .from(websiteStyleSampleBatches)
+    .where(
+      and(
+        eq(websiteStyleSampleBatches.siteProjectId, operation.projectId),
+        eq(websiteStyleSampleBatches.userId, operation.userId),
+        gt(websiteStyleSampleBatches.createdAt, operation.createdAt),
+      ),
+    )
+    .limit(1);
+  if (laterVisualRows.length > 0) return null;
+  const laterMessageRows = await input.db
+    .select({ id: messages.id })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, project.conversationId),
+        eq(messages.userId, operation.userId),
+        gt(messages.sentAt, operation.createdAt),
+      ),
+    )
+    .limit(1);
+  if (laterMessageRows.length > 0) return null;
+
+  return approvedResetSafeNoExposureProofSchema.parse({
+    schemaVersion: 1,
+    classification: "safe_no_exposure",
+    source: "migration_0065_revision_only",
+    resetOperationId: operation.id,
+    projectId: project.id,
+    expectedProjectRevision: reset.expectedProjectRevision,
+    observedProjectRevision: project.revision,
+    observedProjectUpdatedAt: project.updatedAt.toISOString(),
+  });
+}
+
+async function loadApprovedResetSafeNoExposureCoordinates(input: {
+  db: DbExecutor;
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+  allowMigration0065RevisionDrift: boolean;
+}) {
+  const rows = await input.db
+    .select()
+    .from(siteProjects)
+    .where(
+      and(
+        eq(siteProjects.id, input.operation.projectId),
+        eq(siteProjects.userId, input.operation.userId),
+      ),
+    )
+    .limit(1);
+  const project = rows[0];
+  if (
+    !project ||
+    !approvedResetUnpublishNonRevisionCoordinatesMatch(input.reset, project)
+  ) {
+    throw new EsaProviderFailure(
+      "SITEOPS_RESET_INVALIDATED",
+      "官网重置坐标已变化，未向 ESA 提交下线操作。",
+      "failed",
+    );
+  }
+  if (approvedResetUnpublishProjectMatches(input.reset, project)) {
+    return {
+      project,
+      proof: exactSafeNoExposureProof({
+        operation: input.operation,
+        reset: input.reset,
+        project,
+      }),
+    };
+  }
+  const proof = input.allowMigration0065RevisionDrift
+    ? await migration0065RevisionOnlyProof({
+        db: input.db,
+        operation: input.operation,
+        reset: input.reset,
+        project,
+      })
+    : null;
+  if (!proof) {
+    throw new EsaProviderFailure(
+      "SITEOPS_RESET_INVALIDATED",
+      "官网重置坐标已变化，未向 ESA 提交下线操作。",
+      "failed",
+    );
+  }
+  return { project, proof };
+}
+
+/**
+ * A disabled ESA runtime may acknowledge a reset only when the current
+ * database coordinates prove that there is no unresolved ESA exposure. A
+ * strictly completed reset and reset-invalidated deployment rows are durable
+ * proof of removal; unrelated historical rows are not treated as current
+ * exposure merely because they exist.
+ */
+export async function approvedResetHasNoUnresolvedExternalExposure(input: {
+  db: DbExecutor;
+  operation: SiteOperation;
+  reset: ApprovedResetUnpublishInput;
+  allowCanonicalHostname?: boolean;
+  allowMigration0065RevisionDrift?: boolean;
+}) {
+  const exposureEvidenceLimit = 1_000;
+  if (input.operation.provider !== "aliyun_esa") return null;
+  const coordinates = await loadApprovedResetSafeNoExposureCoordinates({
+    db: input.db,
+    operation: input.operation,
+    reset: input.reset,
+    allowMigration0065RevisionDrift:
+      input.allowMigration0065RevisionDrift === true,
+  });
+  const { project } = coordinates;
+  if (
+    project.globalLiveDeploymentId !== null ||
+    project.mainlandLiveDeploymentId !== null ||
+    (project.canonicalHostname !== null && !input.allowCanonicalHostname)
+  ) {
+    return null;
+  }
   const deploymentRows = await input.db
-    .select({ id: siteDeployments.id })
+    .select({
+      id: siteDeployments.id,
+      operationId: siteDeployments.operationId,
+      verification: siteDeployments.verification,
+    })
     .from(siteDeployments)
     .where(
       and(
@@ -821,10 +1162,19 @@ async function approvedResetHasNoExternalExposureHistory(input: {
         eq(siteDeployments.userId, input.operation.userId),
       ),
     )
-    .limit(1);
-  if (deploymentRows[0]) return false;
+    .limit(exposureEvidenceLimit + 1);
   const priorEsaOperationRows = await input.db
-    .select({ id: siteOperations.id })
+    .select({
+      id: siteOperations.id,
+      projectId: siteOperations.projectId,
+      kind: siteOperations.kind,
+      status: siteOperations.status,
+      input: siteOperations.input,
+      result: siteOperations.result,
+      providerOperationId: siteOperations.providerOperationId,
+      providerTaskId: siteOperations.providerTaskId,
+      errorCode: siteOperations.errorCode,
+    })
     .from(siteOperations)
     .where(
       and(
@@ -834,8 +1184,28 @@ async function approvedResetHasNoExternalExposureHistory(input: {
         ne(siteOperations.id, input.operation.id),
       ),
     )
-    .limit(1);
-  return !priorEsaOperationRows[0];
+    .limit(exposureEvidenceLimit + 1);
+  // A bounded classifier must fail closed when its evidence window is
+  // exhausted. Silent truncation could hide a later active deployment or
+  // provider mutation boundary and incorrectly authorize a no-ESA reset.
+  if (
+    deploymentRows.length > exposureEvidenceLimit ||
+    priorEsaOperationRows.length > exposureEvidenceLimit
+  ) {
+    return null;
+  }
+  if (
+    coordinates.proof.source === "migration_0065_revision_only" &&
+    deploymentRows.length > 0
+  ) {
+    return null;
+  }
+  return approvedResetExternalExposureClassification({
+    deployments: deploymentRows,
+    operations: priorEsaOperationRows,
+  }) === "safe_no_exposure"
+    ? coordinates.proof
+    : null;
 }
 
 function logApprovedResetStage(input: {
@@ -862,6 +1232,7 @@ async function approvedResetExposureRemoved(input: {
   reset: ApprovedResetUnpublishInput;
   signal: AbortSignal;
   state: Record<string, unknown>;
+  safeNoExposureProof?: ApprovedResetSafeNoExposureProof;
 }) {
   const hostname = input.reset.expectedCanonicalHostname;
   if (hostname) {
@@ -961,6 +1332,9 @@ async function approvedResetExposureRemoved(input: {
       schemaVersion: 1,
       intent: APPROVED_RESET_UNPUBLISH,
       stage: "exposure_removed",
+      ...(input.safeNoExposureProof
+        ? { safeNoExposureProof: input.safeNoExposureProof }
+        : {}),
     },
     message: "旧网站已从 ESA 安全下线。",
   } satisfies SiteOpsProviderResult;
@@ -2433,26 +2807,41 @@ export function createEsaSiteOpsProviderHandler(
         if (!runtimeConfiguration.configured) {
           const startedAt = Date.now();
           logApprovedResetStage({ operation, status: "started" });
-          const safeNoop = await approvedResetHasNoExternalExposureHistory({
+          const safeNoop = await approvedResetHasNoUnresolvedExternalExposure({
             db,
             operation,
             reset: approvedReset,
+            allowCanonicalHostname: true,
+            allowMigration0065RevisionDrift: true,
           });
           if (!safeNoop) {
             throw new EsaProviderFailure(
               runtimeConfiguration.code,
-              `${runtimeConfiguration.reason}；存在 ESA 暴露历史，未执行未经核验的重置。`,
+              `${runtimeConfiguration.reason}；存在尚未解除的 ESA 暴露证据，未执行未经核验的重置。`,
             );
           }
-          const resetResult = {
-            status: "succeeded",
-            result: {
-              schemaVersion: 1,
-              intent: APPROVED_RESET_UNPUBLISH,
-              stage: "exposure_removed",
-            },
-            message: "未发现 ESA 暴露历史，已安全确认无需下线。",
-          } satisfies SiteOpsProviderResult;
+          const resetResult = approvedReset.expectedCanonicalHostname
+            ? await approvedResetExposureRemoved({
+                publicHttpsFetch,
+                operation,
+                reset: approvedReset,
+                signal,
+                state:
+                  operation.result && typeof operation.result === "object"
+                    ? operation.result
+                    : {},
+                safeNoExposureProof: safeNoop,
+              })
+            : ({
+                status: "succeeded",
+                result: {
+                  schemaVersion: 1,
+                  intent: APPROVED_RESET_UNPUBLISH,
+                  stage: "exposure_removed",
+                  safeNoExposureProof: safeNoop,
+                },
+                message: "未发现尚未解除的 ESA 暴露，已安全确认无需下线。",
+              } satisfies SiteOpsProviderResult);
           logApprovedResetStage({
             operation,
             status: resetResult.status,

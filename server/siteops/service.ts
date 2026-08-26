@@ -1467,6 +1467,100 @@ export function projectSiteOpsBuildDelivery(input: {
     : null;
 }
 
+type SiteOpsResetCycleMessageRow = {
+  sentAt: Date;
+  metadata?: unknown;
+};
+
+type SiteOpsResetCycleArtifactRow = {
+  createdAt: Date;
+  status?: string;
+};
+
+function isCompletedResetBoundaryMessage(row: SiteOpsResetCycleMessageRow) {
+  if (!row.metadata || typeof row.metadata !== "object") return false;
+  const siteOps = (row.metadata as Record<string, unknown>).siteOps;
+  if (!siteOps || typeof siteOps !== "object" || Array.isArray(siteOps)) {
+    return false;
+  }
+  const payload = (siteOps as Record<string, unknown>).payload;
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      !Array.isArray(payload) &&
+      (payload as Record<string, unknown>).reset === true &&
+      (payload as Record<string, unknown>).unpublishCompleted === true,
+  );
+}
+
+/**
+ * MySQL timestamps can place rows superseded by the reset transaction on the
+ * same instant as `currentTaskStartedAt`. Once a fresh-root reset succeeds,
+ * only strictly newer workflow rows belong to the next customer cycle. The
+ * one reset-completion message written by that transaction remains visible so
+ * the customer has an explicit hand-off into the knowledge-base start action.
+ */
+type SiteOpsResetCycleRows = {
+  successfulResetApplied: boolean;
+  currentTaskStartedAt: Date;
+  messageRows: SiteOpsResetCycleMessageRow[];
+  timelineMessageRows: SiteOpsResetCycleMessageRow[];
+  buildRows: SiteOpsResetCycleArtifactRow[];
+  deploymentRows: SiteOpsResetCycleArtifactRow[];
+  packageRows: SiteOpsResetCycleArtifactRow[];
+  batchRows: SiteOpsResetCycleArtifactRow[];
+  timelineOperationRows: SiteOpsResetCycleArtifactRow[];
+};
+
+type SiteOpsResetCycleProjectedRows<Input extends SiteOpsResetCycleRows> = Pick<
+  Input,
+  | "messageRows"
+  | "timelineMessageRows"
+  | "buildRows"
+  | "deploymentRows"
+  | "packageRows"
+  | "batchRows"
+  | "timelineOperationRows"
+>;
+
+export function projectSiteOpsCurrentResetCycle<
+  Input extends SiteOpsResetCycleRows,
+>(input: Input): SiteOpsResetCycleProjectedRows<Input> {
+  if (!input.successfulResetApplied) {
+    return {
+      messageRows: input.messageRows,
+      timelineMessageRows: input.timelineMessageRows,
+      buildRows: input.buildRows,
+      deploymentRows: input.deploymentRows,
+      packageRows: input.packageRows,
+      batchRows: input.batchRows,
+      timelineOperationRows: input.timelineOperationRows,
+    };
+  }
+  const boundary = input.currentTaskStartedAt.getTime();
+  const newerMessage = (row: SiteOpsResetCycleMessageRow) =>
+    row.sentAt.getTime() > boundary;
+  const newerArtifact = (row: SiteOpsResetCycleArtifactRow) =>
+    row.createdAt.getTime() > boundary;
+  const currentArtifact = (row: SiteOpsResetCycleArtifactRow) =>
+    newerArtifact(row) &&
+    !["cancelled", "superseded"].includes(String(row.status ?? ""));
+  return {
+    messageRows: input.messageRows.filter(
+      (row) =>
+        newerMessage(row) ||
+        (row.sentAt.getTime() === boundary &&
+          isCompletedResetBoundaryMessage(row)),
+    ),
+    timelineMessageRows: input.timelineMessageRows.filter(newerMessage),
+    buildRows: input.buildRows.filter(currentArtifact),
+    deploymentRows: input.deploymentRows.filter(currentArtifact),
+    packageRows: input.packageRows.filter(currentArtifact),
+    batchRows: input.batchRows.filter(currentArtifact),
+    timelineOperationRows: input.timelineOperationRows.filter(currentArtifact),
+  } as SiteOpsResetCycleProjectedRows<Input>;
+}
+
 async function projectObservation(
   executor: any,
   input: {
@@ -1489,15 +1583,15 @@ async function projectObservation(
           gt(messages.sequence, input.afterSequence),
         );
   const [
-    messageRows,
-    timelineMessageRows,
-    buildRows,
-    deploymentRows,
-    packageRows,
+    rawMessageRows,
+    rawTimelineMessageRows,
+    rawBuildRows,
+    rawDeploymentRows,
+    rawPackageRows,
     serviceReadiness,
     snapshotRows,
-    batchRows,
-    timelineOperationRows,
+    rawBatchRows,
+    rawTimelineOperationRows,
     connectionRows,
     profileRows,
     activeAliyunOperationRows,
@@ -1672,6 +1766,34 @@ async function projectObservation(
     }),
   ]);
 
+  const {
+    messageRows,
+    timelineMessageRows,
+    buildRows,
+    deploymentRows,
+    packageRows,
+    batchRows,
+    timelineOperationRows,
+  } = projectSiteOpsCurrentResetCycle({
+    successfulResetApplied:
+      (rebuildRequest.resetApplied &&
+        input.project.minimumKnowledgeSnapshotVersion !== null) ||
+      rawTimelineMessageRows.some(
+        (row: { sentAt: Date; metadata: unknown }) =>
+          row.sentAt.getTime() ===
+            input.project.currentTaskStartedAt.getTime() &&
+          isCompletedResetBoundaryMessage(row),
+      ),
+    currentTaskStartedAt: input.project.currentTaskStartedAt,
+    messageRows: rawMessageRows,
+    timelineMessageRows: rawTimelineMessageRows,
+    buildRows: rawBuildRows,
+    deploymentRows: rawDeploymentRows,
+    packageRows: rawPackageRows,
+    batchRows: rawBatchRows,
+    timelineOperationRows: rawTimelineOperationRows,
+  });
+
   const publishedBatchRows = batchRows
     .filter(
       (row: typeof websiteStyleSampleBatches.$inferSelect) =>
@@ -1768,7 +1890,7 @@ async function projectObservation(
       const projectedContent =
         originalPayload?.reset === true &&
         originalPayload?.unpublishCompleted === true
-          ? "旧官网已下线，官网重置已完成；请重新上传并发布知识库后开始全新的建站任务。"
+          ? "旧官网已下线，官网重置已完成；企业知识库保持不变，可以从知识库开始建站。"
           : row.content;
       return [
         {

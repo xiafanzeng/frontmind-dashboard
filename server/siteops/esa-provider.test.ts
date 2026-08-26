@@ -21,7 +21,10 @@ const operation = {
   input: {},
   result: null,
   providerOperationId: null,
+  providerTaskId: null,
   leaseOwner: "lease-1",
+  createdAt: new Date("2026-08-26T00:30:00.000Z"),
+  updatedAt: new Date("2026-08-26T00:30:00.000Z"),
 } as const;
 
 const previousEnabled = process.env.FRONTMIND_ESA_ENABLED;
@@ -39,6 +42,7 @@ function enableEsaTestRuntime() {
 function disabledResetOperation(input: {
   revision?: number;
   globalLiveDeploymentId?: string | null;
+  canonicalHostname?: string | null;
 }) {
   return {
     ...operation,
@@ -54,32 +58,50 @@ function disabledResetOperation(input: {
       expectedKnowledgeSnapshotId: null,
       expectedGlobalLiveDeploymentId: input.globalLiveDeploymentId ?? null,
       expectedMainlandLiveDeploymentId: null,
-      expectedCanonicalHostname: "example.com",
+      expectedCanonicalHostname: input.canonicalHostname ?? null,
     },
   } as const;
 }
 
 function disabledResetDb(input: {
   projectRevision?: number;
+  projectUpdatedAt?: Date;
   globalLiveDeploymentId?: string | null;
-  deployments?: Array<{ id: string }>;
-  priorEsaOperations?: Array<{ id: string }>;
+  canonicalHostname?: string | null;
+  deployments?: Array<Record<string, unknown>>;
+  priorEsaOperations?: Array<Record<string, unknown>>;
+  migration0065?: {
+    recoveryRows?: Array<Record<string, unknown>>;
+    laterOperations?: Array<Record<string, unknown>>;
+    laterBuilds?: Array<Record<string, unknown>>;
+    laterVisualBatches?: Array<Record<string, unknown>>;
+    laterMessages?: Array<Record<string, unknown>>;
+  };
 }) {
   const project = {
     id: operation.projectId,
     userId: operation.userId,
+    conversationId: "siteops:7",
     revision: input.projectRevision ?? 9,
     currentBuildId: null,
     currentKnowledgeSnapshotId: null,
     globalLiveDeploymentId: input.globalLiveDeploymentId ?? null,
     mainlandLiveDeploymentId: null,
-    canonicalHostname: "example.com",
+    canonicalHostname: input.canonicalHostname ?? null,
+    updatedAt: input.projectUpdatedAt ?? new Date("2026-08-26T00:00:00.000Z"),
   };
-  const results = [
-    [project],
-    input.deployments ?? [],
-    input.priorEsaOperations ?? [],
-  ];
+  const results = input.migration0065
+    ? [
+        [project],
+        input.migration0065.recoveryRows ?? [],
+        input.migration0065.laterOperations ?? [],
+        input.migration0065.laterBuilds ?? [],
+        input.migration0065.laterVisualBatches ?? [],
+        input.migration0065.laterMessages ?? [],
+        input.deployments ?? [],
+        input.priorEsaOperations ?? [],
+      ]
+    : [[project], input.deployments ?? [], input.priorEsaOperations ?? []];
   let index = 0;
   const select = vi.fn(() => {
     const rows = results[index++] ?? [];
@@ -189,6 +211,243 @@ describe("direct ESA SiteOps provider", () => {
     expect(publicHttpsFetch).not.toHaveBeenCalled();
   });
 
+  it("accepts only a proven 0065 revision-only drift before any ESA mutation", async () => {
+    process.env.FRONTMIND_ESA_ENABLED = "0";
+    const migrationAt = new Date("2026-08-26T01:00:00.000Z");
+    const db = disabledResetDb({
+      projectRevision: 10,
+      projectUpdatedAt: migrationAt,
+      migration0065: {
+        recoveryRows: [
+          {
+            metadata: {
+              siteOps: { kind: "operation_recovery", revision: 9 },
+            },
+            sentAt: new Date("2026-08-26T00:20:00.000Z"),
+            updatedAt: migrationAt,
+            deletedAt: migrationAt,
+          },
+        ],
+      },
+    });
+    const api = emptyEsaApi();
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+    });
+
+    const result = await handler({
+      operation: disabledResetOperation({ revision: 9 }) as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "succeeded",
+      result: {
+        stage: "exposure_removed",
+        safeNoExposureProof: {
+          source: "migration_0065_revision_only",
+          resetOperationId: operation.id,
+          expectedProjectRevision: 9,
+          observedProjectRevision: 10,
+          observedProjectUpdatedAt: migrationAt.toISOString(),
+        },
+      },
+    });
+    expect(db.select).toHaveBeenCalledTimes(8);
+    expectNoEsaApiCalls(api);
+  });
+
+  it.each([
+    ["a later SiteOps operation", { laterOperations: [{ id: "later-op" }] }],
+    ["a later build", { laterBuilds: [{ id: "later-build" }] }],
+    ["a later visual batch", { laterVisualBatches: [{ id: "later-visual" }] }],
+    ["a later non-migration message", { laterMessages: [{ id: 44 }] }],
+  ] as const)(
+    "rejects 0065 drift proof when there is %s",
+    async (_label, laterFacts) => {
+      process.env.FRONTMIND_ESA_ENABLED = "0";
+      const migrationAt = new Date("2026-08-26T01:00:00.000Z");
+      const db = disabledResetDb({
+        projectRevision: 10,
+        projectUpdatedAt: migrationAt,
+        migration0065: {
+          recoveryRows: [
+            {
+              metadata: {
+                siteOps: { kind: "operation_recovery", revision: 9 },
+              },
+              sentAt: new Date("2026-08-26T00:20:00.000Z"),
+              updatedAt: migrationAt,
+              deletedAt: migrationAt,
+            },
+          ],
+          ...laterFacts,
+        },
+      });
+      const api = emptyEsaApi();
+      const handler = createEsaSiteOpsProviderHandler({
+        getDb: vi.fn().mockResolvedValue(db) as never,
+        api,
+      });
+
+      const result = await handler({
+        operation: disabledResetOperation({ revision: 9 }) as never,
+        signal: new AbortController().signal,
+      });
+
+      expect(result).toMatchObject({
+        status: "failed",
+        code: "SITEOPS_RESET_INVALIDATED",
+      });
+      expectNoEsaApiCalls(api);
+    },
+  );
+
+  it("keeps 0065 revision drift fail-closed when any deployment exists", async () => {
+    process.env.FRONTMIND_ESA_ENABLED = "0";
+    const migrationAt = new Date("2026-08-26T01:00:00.000Z");
+    const db = disabledResetDb({
+      projectRevision: 10,
+      projectUpdatedAt: migrationAt,
+      migration0065: {
+        recoveryRows: [
+          {
+            metadata: {
+              siteOps: { kind: "operation_recovery", revision: 9 },
+            },
+            sentAt: new Date("2026-08-26T00:20:00.000Z"),
+            updatedAt: migrationAt,
+            deletedAt: migrationAt,
+          },
+        ],
+      },
+      deployments: [{ id: "70000000-0000-4000-8000-000000000007" }],
+    });
+    const api = emptyEsaApi();
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+    });
+
+    const result = await handler({
+      operation: disabledResetOperation({ revision: 9 }) as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "attention_required",
+      code: "ESA_RUNTIME_DISABLED",
+    });
+    expectNoEsaApiCalls(api);
+  });
+
+  it("allows a disabled-runtime reset after a strict prior exposure-removed reset", async () => {
+    process.env.FRONTMIND_ESA_ENABLED = "0";
+    const priorResetId = "80000000-0000-4000-8000-000000000008";
+    const db = disabledResetDb({
+      priorEsaOperations: [
+        {
+          id: priorResetId,
+          projectId: operation.projectId,
+          kind: "rollback",
+          status: "succeeded",
+          input: {
+            schemaVersion: 1,
+            intent: "approved_reset_unpublish",
+            rebuildTicketId: "60000000-0000-4000-8000-000000000006",
+            expectedProjectRevision: 8,
+            expectedCurrentBuildId: null,
+            expectedKnowledgeSnapshotId: null,
+            expectedGlobalLiveDeploymentId: null,
+            expectedMainlandLiveDeploymentId: null,
+            expectedCanonicalHostname: null,
+          },
+          result: {
+            schemaVersion: 2,
+            intent: "approved_reset_unpublish",
+            stage: "exposure_removed",
+            resetOperationId: priorResetId,
+            projectId: operation.projectId,
+            freshRootApplied: true,
+            minimumKnowledgeSnapshotVersion: 2,
+            resetAppliedProjectRevision: 9,
+          },
+          providerOperationId: null,
+          providerTaskId: null,
+          errorCode: null,
+        },
+      ],
+    });
+    const api = emptyEsaApi();
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+    });
+
+    const result = await handler({
+      operation: disabledResetOperation({}) as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "succeeded",
+      result: { stage: "exposure_removed" },
+    });
+    expectNoEsaApiCalls(api);
+  });
+
+  it("ignores pre-mutation configuration failures and reset-invalidated deployments", async () => {
+    process.env.FRONTMIND_ESA_ENABLED = "0";
+    const priorOperationId = "80000000-0000-4000-8000-000000000008";
+    const db = disabledResetDb({
+      deployments: [
+        {
+          id: "70000000-0000-4000-8000-000000000007",
+          operationId: priorOperationId,
+          verification: { resetInvalidated: true },
+        },
+      ],
+      priorEsaOperations: [
+        {
+          id: priorOperationId,
+          projectId: operation.projectId,
+          kind: "deploy",
+          status: "succeeded",
+          input: {},
+          result: { stage: "deployed" },
+          providerOperationId: "historical-provider-coordinate",
+          providerTaskId: null,
+          errorCode: null,
+        },
+        {
+          id: "81000000-0000-4000-8000-000000000008",
+          projectId: operation.projectId,
+          kind: "rollback",
+          status: "attention_required",
+          input: {},
+          result: null,
+          providerOperationId: null,
+          providerTaskId: null,
+          errorCode: "ESA_RUNTIME_DISABLED",
+        },
+      ],
+    });
+    const api = emptyEsaApi();
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+    });
+
+    const result = await handler({
+      operation: disabledResetOperation({}) as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.status).toBe("succeeded");
+    expectNoEsaApiCalls(api);
+  });
+
   it.each([
     {
       label: "a historical deployment",
@@ -201,6 +460,25 @@ describe("direct ESA SiteOps provider", () => {
       label: "a historical ESA operation",
       db: {
         priorEsaOperations: [{ id: "80000000-0000-4000-8000-000000000008" }],
+      },
+      operation: {},
+    },
+    {
+      label: "an unresolved active ESA operation",
+      db: {
+        priorEsaOperations: [
+          {
+            id: "80000000-0000-4000-8000-000000000008",
+            projectId: operation.projectId,
+            kind: "deploy",
+            status: "running",
+            input: {},
+            result: { stage: "deployment_unknown" },
+            providerOperationId: "provider-boundary",
+            providerTaskId: null,
+            errorCode: null,
+          },
+        ],
       },
       operation: {},
     },
@@ -236,6 +514,73 @@ describe("direct ESA SiteOps provider", () => {
       expectNoEsaApiCalls(api);
     },
   );
+
+  it("uses marker-only verification for a residual hostname without control-plane exposure", async () => {
+    process.env.FRONTMIND_ESA_ENABLED = "0";
+    const db = disabledResetDb({ canonicalHostname: "example.com" });
+    const api = emptyEsaApi();
+    const publicHttpsFetch = vi.fn().mockResolvedValue({
+      response: new Response(null, { status: 404 }),
+      finalUrl: new URL("https://example.com/frontmind-deployment.json"),
+    });
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+      publicHttpsFetch: publicHttpsFetch as never,
+    });
+
+    const result = await handler({
+      operation: disabledResetOperation({
+        canonicalHostname: "example.com",
+      }) as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "succeeded",
+      result: { stage: "exposure_removed" },
+    });
+    expect(publicHttpsFetch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://example.com/frontmind-deployment.json",
+        allowedOrigin: "https://example.com",
+      }),
+    );
+    expectNoEsaApiCalls(api);
+  });
+
+  it("does not clear a residual hostname when the public marker is still reachable", async () => {
+    process.env.FRONTMIND_ESA_ENABLED = "0";
+    const db = disabledResetDb({ canonicalHostname: "example.com" });
+    const api = emptyEsaApi();
+    const publicHttpsFetch = vi.fn().mockResolvedValue({
+      response: new Response(
+        JSON.stringify({
+          deploymentId: "50000000-0000-4000-8000-000000000005",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      finalUrl: new URL("https://example.com/frontmind-deployment.json"),
+    });
+    const handler = createEsaSiteOpsProviderHandler({
+      getDb: vi.fn().mockResolvedValue(db) as never,
+      api,
+      publicHttpsFetch: publicHttpsFetch as never,
+    });
+
+    const result = await handler({
+      operation: disabledResetOperation({
+        canonicalHostname: "example.com",
+      }) as never,
+      signal: new AbortController().signal,
+    });
+
+    expect(result).toMatchObject({
+      status: "pending",
+      result: { stage: "public_marker_verification_retry" },
+    });
+    expectNoEsaApiCalls(api);
+  });
 
   it("rejects mismatched reset coordinates while ESA is disabled", async () => {
     process.env.FRONTMIND_ESA_ENABLED = "0";

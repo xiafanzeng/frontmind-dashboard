@@ -18,6 +18,7 @@ import {
   projectSiteOpsObservationStatuses,
   projectSiteOpsExecutionSteps,
   projectSiteOpsBuildDelivery,
+  projectSiteOpsCurrentResetCycle,
   referenceBlueprintForSiteOpsRevision,
   resolvePinnedTwentyFirstCredentialForBatch,
   resolveSiteOpsAgentProfile,
@@ -44,6 +45,79 @@ import {
 } from "../../shared/siteops-design";
 
 describe("SiteOps core contracts", () => {
+  it("projects only the fresh workflow cycle after a successful reset", () => {
+    const boundary = new Date("2026-08-26T00:00:00.000Z");
+    const before = new Date("2026-08-25T23:59:59.999Z");
+    const after = new Date("2026-08-26T00:00:00.001Z");
+    const resetMetadata = {
+      siteOps: { payload: { reset: true, unpublishCompleted: true } },
+    };
+    const projected = projectSiteOpsCurrentResetCycle({
+      successfulResetApplied: true,
+      currentTaskStartedAt: boundary,
+      messageRows: [
+        { id: "old", sentAt: before, metadata: null },
+        { id: "same-old", sentAt: boundary, metadata: null },
+        { id: "reset-complete", sentAt: boundary, metadata: resetMetadata },
+        { id: "new", sentAt: after, metadata: null },
+      ],
+      timelineMessageRows: [
+        { id: "same-timeline", sentAt: boundary, metadata: null },
+        { id: "new-timeline", sentAt: after, metadata: null },
+      ],
+      buildRows: [
+        { id: "old-build", createdAt: before, status: "failed" },
+        { id: "same-build", createdAt: boundary, status: "cancelled" },
+        { id: "new-cancelled", createdAt: after, status: "cancelled" },
+        { id: "new-build", createdAt: after, status: "queued" },
+      ],
+      deploymentRows: [],
+      packageRows: [],
+      batchRows: [
+        { id: "old-board", createdAt: boundary, status: "superseded" },
+        { id: "new-board", createdAt: after, status: "published" },
+      ],
+      timelineOperationRows: [
+        { id: "old-operation", createdAt: boundary, status: "cancelled" },
+        { id: "new-operation", createdAt: after, status: "running" },
+      ],
+    });
+
+    expect(projected.messageRows.map((row) => row.id)).toEqual([
+      "reset-complete",
+      "new",
+    ]);
+    expect(projected.timelineMessageRows.map((row) => row.id)).toEqual([
+      "new-timeline",
+    ]);
+    expect(projected.buildRows.map((row) => row.id)).toEqual(["new-build"]);
+    expect(projected.batchRows.map((row) => row.id)).toEqual(["new-board"]);
+    expect(projected.timelineOperationRows.map((row) => row.id)).toEqual([
+      "new-operation",
+    ]);
+  });
+
+  it("preserves the historical projection before a fresh-root reset", () => {
+    const row = {
+      id: "historical-build",
+      createdAt: new Date("2026-08-25T00:00:00.000Z"),
+      status: "cancelled",
+    };
+    expect(
+      projectSiteOpsCurrentResetCycle({
+        successfulResetApplied: false,
+        currentTaskStartedAt: new Date("2026-08-26T00:00:00.000Z"),
+        messageRows: [],
+        timelineMessageRows: [],
+        buildRows: [row],
+        deploymentRows: [],
+        packageRows: [],
+        batchRows: [],
+        timelineOperationRows: [],
+      }).buildRows,
+    ).toEqual([row]);
+  });
+
   it("keeps native build delivery visible after a later deploy succeeds", () => {
     expect(
       projectSiteOpsBuildDelivery({

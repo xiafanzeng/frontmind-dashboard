@@ -207,6 +207,95 @@ function readDeliveryWorkbenchRequest() {
   };
 }
 
+export type SiteRebuildResetState =
+  | "queued"
+  | "reconciling"
+  | "blocked"
+  | "completed"
+  | "invalidated";
+
+export type SiteRebuildResetIssue =
+  | "esa_runtime_required"
+  | "external_outcome_unknown"
+  | "project_coordinates_changed";
+
+export function siteRebuildResetProjection(ticket: unknown) {
+  const record =
+    ticket && typeof ticket === "object" && !Array.isArray(ticket)
+      ? (ticket as Record<string, unknown>)
+      : {};
+  const hasExplicitState = Object.prototype.hasOwnProperty.call(
+    record,
+    "siteRebuildResetState",
+  );
+  const explicitState = [
+    "queued",
+    "reconciling",
+    "blocked",
+    "completed",
+    "invalidated",
+  ].includes(String(record.siteRebuildResetState ?? ""))
+    ? (record.siteRebuildResetState as SiteRebuildResetState)
+    : null;
+  const issue = [
+    "esa_runtime_required",
+    "external_outcome_unknown",
+    "project_coordinates_changed",
+  ].includes(String(record.siteRebuildResetIssue ?? ""))
+    ? (record.siteRebuildResetIssue as SiteRebuildResetIssue)
+    : null;
+  const state = hasExplicitState
+    ? explicitState
+    : record.siteRebuildResetApplied === true && record.status === "in_progress"
+      ? ("completed" as const)
+      : record.siteRebuildResetPending === true
+        ? ("blocked" as const)
+        : null;
+  return {
+    state,
+    issue,
+    canRecheck:
+      typeof record.siteRebuildCanRecheck === "boolean"
+        ? record.siteRebuildCanRecheck
+        : state === "blocked" && record.siteRebuildResetPending === true,
+  } as const;
+}
+
+export function siteRebuildResetNeedsAutomaticRefresh(ticket: unknown) {
+  const state = siteRebuildResetProjection(ticket).state;
+  return state === "queued" || state === "reconciling";
+}
+
+function siteRebuildResetIssueCopy(issue: SiteRebuildResetIssue | null) {
+  if (issue === "esa_runtime_required") {
+    return "发布运行环境尚未就绪，官网重置尚未开始。";
+  }
+  if (issue === "project_coordinates_changed") {
+    return "项目状态已变化，需要重新检查当前官网后再继续。";
+  }
+  return "旧官网的外部下线结果尚未确认，需要重新检查。";
+}
+
+function focusedSiteRebuildStatus(ticket: unknown) {
+  const reset = siteRebuildResetProjection(ticket);
+  if (reset.state === "completed") {
+    return "当前需求状态：旧官网已下线，企业知识库保持不变；客户可点击“从知识库开始建站”。";
+  }
+  if (reset.state === "queued") {
+    return "当前需求状态：正在完成官网重置，旧官网已进入安全下线队列。";
+  }
+  if (reset.state === "reconciling") {
+    return "当前需求状态：正在核对旧官网下线结果，确认后将自动完成重置。";
+  }
+  if (reset.state === "blocked") {
+    return `当前需求状态：${siteRebuildResetIssueCopy(reset.issue)}`;
+  }
+  if (reset.state === "invalidated") {
+    return "当前需求状态：原重置申请已失效，请客户重新提交。";
+  }
+  return "当前需求状态：待通过重置。";
+}
+
 function normalizeMirrorQuestionText(value: string) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
@@ -1064,8 +1153,62 @@ function CustomerWorkbenchView({
     },
     { enabled: Boolean(detailTicketId), retry: false },
   );
+  const resetPollingTicketFromList = customerTicketItems.find(
+    (ticket) => ticket.id === dashboardTicketId,
+  );
+  const resetPollingTicketFromDetail = ticketDetail.data?.ticket;
+  const resetPollingTicket =
+    resetPollingTicketFromList ||
+    (resetPollingTicketFromDetail?.id === dashboardTicketId &&
+    resetPollingTicketFromDetail.userId === currentAssignment?.customerUserId &&
+    resetPollingTicketFromDetail.assignedProjectAssignmentId ===
+      currentAssignment?.projectAssignmentId
+      ? resetPollingTicketFromDetail
+      : null);
+  const resetAutoRefresh = Boolean(
+    systemAdminMode &&
+      resetPollingTicket?.operation === "site_rebuild" &&
+      siteRebuildResetNeedsAutomaticRefresh(resetPollingTicket),
+  );
+  useEffect(() => {
+    if (!resetAutoRefresh) return;
+    let refreshRunning = false;
+    const refreshResetState = async () => {
+      if (refreshRunning) return;
+      refreshRunning = true;
+      try {
+        await Promise.all([
+          customerTickets.refetch(),
+          workbench.refetch(),
+          ticketDetail.refetch(),
+        ]);
+      } finally {
+        refreshRunning = false;
+      }
+    };
+    const interval = window.setInterval(() => {
+      void refreshResetState();
+    }, 3_000);
+    const refreshOnFocus = () => {
+      void refreshResetState();
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
+  }, [
+    customerTickets.refetch,
+    resetAutoRefresh,
+    ticketDetail.refetch,
+    workbench.refetch,
+  ]);
   const refreshCustomerActionsAndPreview = async () => {
-    await Promise.all([customerTickets.refetch(), workbench.refetch()]);
+    await Promise.all([
+      customerTickets.refetch(),
+      workbench.refetch(),
+      ...(detailTicketId ? [ticketDetail.refetch()] : []),
+    ]);
   };
   const openCustomerDashboard = (
     operation?: string | null,
@@ -1442,12 +1585,7 @@ function CustomerWorkbenchView({
           </CardTitle>
           <p className="text-sm text-muted-foreground">
             {focusedTicket.operation === "site_rebuild"
-              ? focusedTicket.siteRebuildResetApplied === true &&
-                focusedTicket.status === "in_progress"
-                ? "当前需求状态：旧官网已下线，企业知识库保持不变；客户可点击“从知识库开始建站”。"
-                : focusedTicket.siteRebuildResetPending === true
-                  ? "当前需求状态：旧官网下线尚未完成；完成后企业知识库保持不变，客户可点击“从知识库开始建站”。"
-                  : "当前需求状态：待通过重置。"
+              ? focusedSiteRebuildStatus(focusedTicket)
               : "当前需求状态：待处理。请在本客户看板内完成处理。"}
           </p>
         </CardHeader>
@@ -2442,10 +2580,8 @@ function DeliveryTicketActions({
   };
 
   if (operation === "site_rebuild") {
-    if (
-      ticket.siteRebuildResetApplied === true &&
-      ticket.status === "in_progress"
-    ) {
+    const reset = siteRebuildResetProjection(ticket);
+    if (reset.state === "completed") {
       return (
         <div className="mt-3 rounded-xl border bg-muted/25 px-4 py-3 text-sm leading-6">
           <strong>重置需求已通过</strong>
@@ -2456,20 +2592,59 @@ function DeliveryTicketActions({
       );
     }
 
-    const approvalAvailable = [
-      "submitted",
-      "needs_information",
-      "scheduled",
-      "in_progress",
-    ].includes(String(ticket.status || ""));
+    if (reset.state === "queued" || reset.state === "reconciling") {
+      return (
+        <div
+          className="mt-3 rounded-xl border border-blue-300/60 bg-blue-50 px-4 py-3 text-sm leading-6 text-blue-950"
+          aria-live="polite"
+        >
+          <strong className="inline-flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {reset.state === "queued"
+              ? "正在完成官网重置"
+              : "正在核对旧官网下线结果"}
+          </strong>
+          <p className="mt-1 text-xs leading-5 text-blue-800">
+            {reset.state === "queued"
+              ? "旧官网已进入安全下线队列，本页面会自动刷新进度。"
+              : "系统正在只读核对外部下线结果，确认后会自动完成重置。"}
+          </p>
+        </div>
+      );
+    }
+
+    if (reset.state === "invalidated") {
+      return (
+        <div
+          className="mt-3 rounded-xl border border-red-300/60 bg-red-50 px-4 py-3 text-sm leading-6 text-red-950"
+          role="alert"
+        >
+          <strong>重置申请已失效</strong>
+          <p className="mt-1 text-xs leading-5 text-red-800">
+            项目已进入新的处理周期，请客户重新提交官网重置申请。
+          </p>
+        </div>
+      );
+    }
+
+    const approvalAvailable =
+      (reset.state === "blocked" && reset.canRecheck) ||
+      (reset.state === null &&
+        ["submitted", "needs_information", "scheduled", "in_progress"].includes(
+          String(ticket.status || ""),
+        ));
+    const recheck = reset.state === "blocked" && reset.canRecheck;
 
     return (
       <div className="mt-3">
-        {ticket.siteRebuildResetPending === true && (
-          <div className="mb-3 rounded-xl border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950">
-            <strong>旧官网下线尚未完成</strong>
+        {reset.state === "blocked" && (
+          <div
+            className="mb-3 rounded-xl border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950"
+            role="alert"
+          >
+            <strong>官网重置需要处理</strong>
             <p className="mt-1 text-xs leading-5 text-amber-800">
-              可再次批准以安全检查并重新排队；正在执行或结果未知的任务不会重复执行。下线完成后企业知识库保持不变，客户可点击“从知识库开始建站”。
+              {siteRebuildResetIssueCopy(reset.issue)}
             </p>
           </div>
         )}
@@ -2483,9 +2658,7 @@ function DeliveryTicketActions({
             {approveSiteRebuild.isPending && (
               <Loader2 className="h-4 w-4 animate-spin" />
             )}
-            {ticket.siteRebuildResetPending === true
-              ? "重新检查并下线"
-              : "通过重置需求"}
+            {recheck ? "重新检查" : "通过重置需求"}
           </Button>
         )}
         <Dialog
@@ -2499,13 +2672,11 @@ function DeliveryTicketActions({
           <DialogContent className="sm:max-w-lg">
             <DialogHeader>
               <DialogTitle>
-                {ticket.siteRebuildResetPending === true
-                  ? "重新检查官网下线？"
-                  : "通过官网重置需求？"}
+                {recheck ? "重新检查官网重置？" : "通过官网重置需求？"}
               </DialogTitle>
               <DialogDescription>
-                {ticket.siteRebuildResetPending === true
-                  ? "确认后，系统只会检查原下线任务；仅当其在外部变更前因可重试配置问题失败时，才重新排队同一任务。完成下线后企业知识库保持不变，客户可点击“从知识库开始建站”。"
+                {recheck
+                  ? "确认后，系统会检查同一重置任务的真实外部状态；不会重复执行已经确认的下线步骤。"
                   : "确认后，旧官网将进入安全下线流程；下线确认完成后，当前官网轮次将重置，企业知识库保持不变，客户可点击“从知识库开始建站”创建全新官网任务。"}
               </DialogDescription>
             </DialogHeader>

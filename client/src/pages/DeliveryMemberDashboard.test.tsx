@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -29,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   fetchNextTickets: vi.fn(),
   refetchTickets: vi.fn(),
   refetchWorkbench: vi.fn(),
+  refetchTicketDetail: vi.fn(),
   workbenchData: { customers: [], tickets: [] } as any,
   approveQuestionSelectionMutation: vi.fn(),
   adjustQuestionQuotaMutation: vi.fn(),
@@ -138,6 +140,7 @@ vi.mock("@/lib/trpc", () => ({
             data: mocks.detailData,
             isLoading: false,
             error: null,
+            refetch: mocks.refetchTicketDetail,
           }),
         },
         approveQuestionSelection: {
@@ -242,6 +245,8 @@ import DeliveryMemberDashboard, {
   deliveryWorkbenchHref,
   deliveryMemberNavForRole,
   ROLE_DASHBOARD_SECTIONS,
+  siteRebuildResetNeedsAutomaticRefresh,
+  siteRebuildResetProjection,
 } from "./DeliveryMemberDashboard";
 
 const MONITORING_PROJECT_ID = "1e9f33bc-40e2-4a8e-9bda-40d92a94b11f";
@@ -353,6 +358,45 @@ describe("DeliveryMemberDashboard project context", () => {
     });
     vi.mocked(sessionStorage.getItem).mockReturnValue(null);
     window.history.replaceState({}, "", "/");
+  });
+
+  it("normalizes the exact and rolling-compatible reset projection", () => {
+    expect(
+      siteRebuildResetProjection({
+        siteRebuildResetState: "blocked",
+        siteRebuildResetIssue: "esa_runtime_required",
+        siteRebuildCanRecheck: true,
+      }),
+    ).toEqual({
+      state: "blocked",
+      issue: "esa_runtime_required",
+      canRecheck: true,
+    });
+    expect(
+      siteRebuildResetProjection({ siteRebuildResetPending: true }),
+    ).toEqual({
+      state: "blocked",
+      issue: null,
+      canRecheck: true,
+    });
+    expect(
+      siteRebuildResetProjection({
+        siteRebuildResetState: null,
+        siteRebuildResetApplied: true,
+        siteRebuildResetPending: true,
+        status: "in_progress",
+      }),
+    ).toEqual({ state: null, issue: null, canRecheck: false });
+    expect(
+      siteRebuildResetNeedsAutomaticRefresh({
+        siteRebuildResetState: "reconciling",
+      }),
+    ).toBe(true);
+    expect(
+      siteRebuildResetNeedsAutomaticRefresh({
+        siteRebuildResetState: "completed",
+      }),
+    ).toBe(false);
   });
 
   it("places role tools in the left navigation and limits them by role", () => {
@@ -897,11 +941,126 @@ describe("DeliveryMemberDashboard project context", () => {
 
     render(<DeliveryMemberDashboard customerWorkbench />);
 
-    expect(screen.getByText("旧官网下线尚未完成")).toBeInTheDocument();
+    expect(screen.getByText("官网重置需要处理")).toBeInTheDocument();
     expect(screen.queryByText("重置需求已通过")).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "重新检查并下线" }),
+      screen.getByRole("button", { name: "重新检查" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows the real reset blocker and only offers an explicit recheck", () => {
+    mocks.assignments = [aiOperationsAssignment];
+    mocks.ticketsData = {
+      items: [
+        {
+          id: "5f47e445-37bb-45ed-9268-4ca9437e4d91",
+          userId: 101,
+          customerName: "示例客户",
+          customerUsername: "example.customer",
+          title: "重新制作官网",
+          operation: "site_rebuild",
+          status: "in_progress",
+          statusGroup: "pending",
+          dependencySatisfied: true,
+          dependencyBlockReason: null,
+          assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+          revision: 8,
+          siteRebuildResetState: "blocked",
+          siteRebuildResetIssue: "esa_runtime_required",
+          siteRebuildCanRecheck: true,
+        },
+      ],
+      filters: { customers: [] },
+      counts: { pending: 1, completed: 0 },
+      nextPending: null,
+      nextCursor: null,
+      limit: 50,
+    };
+
+    render(<DeliveryMemberDashboard customerWorkbench systemAdminMode />);
+
+    expect(
+      screen.getByText("发布运行环境尚未就绪，官网重置尚未开始。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重新检查" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "通过重置需求" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("refreshes an active reset every three seconds and on focus, then stops at terminal state", async () => {
+    vi.useFakeTimers();
+    try {
+      const ticketId = "5f47e445-37bb-45ed-9268-4ca9437e4d91";
+      mocks.assignments = [aiOperationsAssignment];
+      const ticket = {
+        id: ticketId,
+        userId: 101,
+        customerName: "示例客户",
+        customerUsername: "example.customer",
+        title: "重新制作官网",
+        operation: "site_rebuild",
+        status: "in_progress",
+        statusGroup: "pending",
+        dependencySatisfied: true,
+        dependencyBlockReason: null,
+        assignedProjectAssignmentId: AI_OPERATIONS_PROJECT_ID,
+        revision: 8,
+        siteRebuildResetState: "queued",
+        siteRebuildResetIssue: null,
+        siteRebuildCanRecheck: false,
+      };
+      mocks.ticketsData = {
+        items: [ticket],
+        filters: { customers: [] },
+        counts: { pending: 1, completed: 0 },
+        nextPending: null,
+        nextCursor: null,
+        limit: 50,
+      };
+      window.history.replaceState(
+        {},
+        "",
+        `/admin/delivery-workbench?projectAssignmentId=${AI_OPERATIONS_PROJECT_ID}&section=website&ticketId=${ticketId}&focus=1`,
+      );
+      const view = render(
+        <DeliveryMemberDashboard customerWorkbench systemAdminMode />,
+      );
+      expect(screen.getByText("正在完成官网重置")).toBeInTheDocument();
+
+      await act(async () => {
+        vi.advanceTimersByTime(3_000);
+        await Promise.resolve();
+      });
+      expect(mocks.refetchTickets).toHaveBeenCalledTimes(1);
+      expect(mocks.refetchWorkbench).toHaveBeenCalledTimes(1);
+      expect(mocks.refetchTicketDetail).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await Promise.resolve();
+      });
+      expect(mocks.refetchTickets).toHaveBeenCalledTimes(2);
+      expect(mocks.refetchWorkbench).toHaveBeenCalledTimes(2);
+      expect(mocks.refetchTicketDetail).toHaveBeenCalledTimes(2);
+
+      ticket.siteRebuildResetState = "completed";
+      view.rerender(
+        <DeliveryMemberDashboard customerWorkbench systemAdminMode />,
+      );
+      expect(screen.getByText("重置需求已通过")).toBeInTheDocument();
+      await act(async () => {
+        vi.advanceTimersByTime(6_000);
+        await Promise.resolve();
+      });
+      expect(mocks.refetchTickets).toHaveBeenCalledTimes(2);
+      expect(mocks.refetchWorkbench).toHaveBeenCalledTimes(2);
+      expect(mocks.refetchTicketDetail).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([

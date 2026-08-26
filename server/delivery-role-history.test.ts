@@ -22,6 +22,7 @@ import {
   deliveryWorkflowStageKey,
   deliveryHistoryTimestamp,
   deliveryHistoryTicketTitle,
+  deliveryTicketCountsAfterResetRepair,
   deliveryTicketStatusGroup,
   deliveryWorkflowMilestoneIsReusable,
   deriveWorkflowContainerStatus,
@@ -35,9 +36,11 @@ import {
   monitoringRetestTechnicalDedupeKey,
   MY_DELIVERY_TICKET_LIMIT,
   questionCatalogReviewAllowed,
+  reconcileTerminalSiteRebuildTickets,
   resolveAssignedWorkflowBillingScope,
   reusableInitialMonitoringTicketScope,
   siteOpsRebuildApprovalDisposition,
+  siteOpsRebuildTerminalDisposition,
   visibleInitialMonitoringTicketScope,
   workflowChildAttachmentMetadataRows,
   workflowContainerChildrenScope,
@@ -1394,6 +1397,267 @@ describe("delivery execution authorization and settlement", () => {
         expectedRevision: 4,
       }),
     ).toThrow("请刷新后重试");
+  });
+
+  it("repairs only exact reset terminal states without restarting reset", () => {
+    expect(
+      siteOpsRebuildTerminalDisposition({
+        ticketStatus: "in_progress",
+        resetState: "completed",
+      }),
+    ).toBe("complete");
+    expect(
+      siteOpsRebuildTerminalDisposition({
+        ticketStatus: "completed",
+        resetState: "completed",
+      }),
+    ).toBe("completed_replay");
+    expect(
+      siteOpsRebuildTerminalDisposition({
+        ticketStatus: "in_progress",
+        resetState: "invalidated",
+      }),
+    ).toBe("invalidate");
+    expect(
+      siteOpsRebuildTerminalDisposition({
+        ticketStatus: "cancelled",
+        resetState: "invalidated",
+      }),
+    ).toBe("invalidated_replay");
+    expect(
+      siteOpsRebuildTerminalDisposition({
+        ticketStatus: "in_progress",
+        resetState: "blocked",
+      }),
+    ).toBeNull();
+  });
+
+  it("CAS-completes an exact historical reset once without invoking a provider", async () => {
+    const ticketId = "10000000-0000-4000-8000-000000000001";
+    const operationId = "20000000-0000-4000-8000-000000000002";
+    const projectId = "30000000-0000-4000-8000-000000000003";
+    const now = new Date("2026-08-26T02:00:00.000Z");
+    const internalNote = JSON.stringify({
+      schemaVersion: 4,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: null,
+      knowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+      resetIntent: "approved_reset_unpublish",
+      resetOperationId: operationId,
+      resetApprovedAt: "2026-08-26T01:00:00.000Z",
+      resetExpectedProjectRevision: 7,
+      minimumKnowledgeSnapshotVersion: 1,
+      resetAppliedAt: "2026-08-26T01:05:00.000Z",
+      resetAppliedProjectRevision: 8,
+      freshRootApplied: true,
+      unpublishOperationId: operationId,
+    });
+    const operation = {
+      id: operationId,
+      projectId,
+      userId: 42,
+      kind: "rollback" as const,
+      provider: "aliyun_esa",
+      status: "succeeded" as const,
+      input: {
+        schemaVersion: 1,
+        intent: "approved_reset_unpublish",
+        rebuildTicketId: ticketId,
+        expectedProjectRevision: 7,
+        expectedCurrentBuildId: null,
+        expectedKnowledgeSnapshotId: "40000000-0000-4000-8000-000000000004",
+        expectedGlobalLiveDeploymentId: null,
+        expectedMainlandLiveDeploymentId: null,
+        expectedCanonicalHostname: null,
+      },
+      result: {
+        schemaVersion: 2,
+        intent: "approved_reset_unpublish",
+        stage: "exposure_removed",
+        resetOperationId: operationId,
+        projectId,
+        freshRootApplied: true,
+        minimumKnowledgeSnapshotVersion: 1,
+        resetAppliedProjectRevision: 8,
+      },
+      errorCode: null,
+      attempt: 1,
+      providerOperationId: null,
+      providerTaskId: null,
+    };
+    let appliedSet: Record<string, unknown> | null = null;
+    const executor = {
+      update: vi.fn((table: unknown) => {
+        expect(table).toBe(deliveryTickets);
+        return {
+          set: vi.fn((values: Record<string, unknown>) => {
+            appliedSet = values;
+            return {
+              where: vi.fn(async () => [{ affectedRows: 1 }]),
+            };
+          }),
+        };
+      }),
+      select: vi.fn(() =>
+        queuedQueryResult([
+          {
+            id: ticketId,
+            status: "completed",
+            publicSummary:
+              "官网重置已完成，企业知识库保持不变；客户可从知识库开始建站。",
+            quotaState: "consumed",
+            quotaReleasedAt: null,
+            technicalDedupeKey: null,
+            resolvedAt: now,
+            revision: 10,
+            updatedAt: now,
+          },
+        ]),
+      ),
+    };
+
+    const repaired = await reconcileTerminalSiteRebuildTickets({
+      executor,
+      actorUserId: 9,
+      tickets: [
+        {
+          id: ticketId,
+          userId: 42,
+          operation: "site_rebuild",
+          internalNote,
+          status: "in_progress",
+          revision: 9,
+        },
+      ],
+      operationById: new Map([[operationId, operation]]) as any,
+    });
+
+    expect(repaired.get(ticketId)).toMatchObject({
+      status: "completed",
+      revision: 10,
+    });
+    expect(executor.update).toHaveBeenCalledTimes(1);
+    expect(appliedSet).toMatchObject({
+      status: "completed",
+      quotaState: "consumed",
+      technicalDedupeKey: null,
+      updatedByUserId: 9,
+    });
+    expect(executor.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("CAS-cancels an invalidated in-progress reset and releases its reservation", async () => {
+    const ticketId = "50000000-0000-4000-8000-000000000005";
+    const operationId = "60000000-0000-4000-8000-000000000006";
+    const projectId = "70000000-0000-4000-8000-000000000007";
+    const internalNote = JSON.stringify({
+      schemaVersion: 4,
+      kind: "frontmind.siteops-rebuild.v1",
+      projectId,
+      sourceBuildId: null,
+      knowledgeSnapshotId: null,
+      resetIntent: "approved_reset_unpublish",
+      resetOperationId: operationId,
+      resetApprovedAt: "2026-08-26T01:00:00.000Z",
+      resetExpectedProjectRevision: 7,
+      minimumKnowledgeSnapshotVersion: 1,
+    });
+    const operation = {
+      id: operationId,
+      projectId,
+      userId: 42,
+      kind: "rollback" as const,
+      provider: "aliyun_esa",
+      status: "failed" as const,
+      input: {
+        schemaVersion: 1,
+        intent: "approved_reset_unpublish",
+        rebuildTicketId: ticketId,
+        expectedProjectRevision: 7,
+        expectedCurrentBuildId: null,
+        expectedKnowledgeSnapshotId: null,
+        expectedGlobalLiveDeploymentId: null,
+        expectedMainlandLiveDeploymentId: null,
+        expectedCanonicalHostname: null,
+      },
+      result: null,
+      errorCode: "SITEOPS_RESET_INVALIDATED",
+      attempt: 1,
+      providerOperationId: null,
+      providerTaskId: null,
+    };
+    const updateValues: Array<Record<string, unknown>> = [];
+    const now = new Date("2026-08-26T02:00:00.000Z");
+    const executor = {
+      update: vi.fn(() => ({
+        set: vi.fn((values: Record<string, unknown>) => {
+          updateValues.push(values);
+          return { where: vi.fn(async () => [{ affectedRows: 1 }]) };
+        }),
+      })),
+      select: vi.fn(() =>
+        queuedQueryResult([
+          {
+            id: ticketId,
+            status: "cancelled",
+            publicSummary:
+              "原官网重置申请已失效，项目状态已变化；请客户重新提交重置申请。",
+            quotaState: "released",
+            quotaReleasedAt: now,
+            technicalDedupeKey: null,
+            resolvedAt: now,
+            revision: 4,
+            updatedAt: now,
+          },
+        ]),
+      ),
+    };
+
+    const repaired = await reconcileTerminalSiteRebuildTickets({
+      executor,
+      actorUserId: 9,
+      tickets: [
+        {
+          id: ticketId,
+          userId: 42,
+          operation: "site_rebuild",
+          internalNote,
+          status: "in_progress",
+          revision: 3,
+        },
+      ],
+      operationById: new Map([[operationId, operation]]) as any,
+    });
+
+    expect(repaired.get(ticketId)).toMatchObject({
+      status: "cancelled",
+      quotaState: "released",
+      revision: 4,
+    });
+    expect(updateValues).toHaveLength(1);
+    expect(updateValues[0]).toMatchObject({
+      status: "cancelled",
+      technicalDedupeKey: null,
+      updatedByUserId: 9,
+    });
+  });
+
+  it("keeps ticket counters aligned with the same-response reset repair", () => {
+    expect(
+      deliveryTicketCountsAfterResetRepair({
+        pending: 3,
+        completed: 4,
+        repairedTicketCount: 1,
+      }),
+    ).toEqual({ pending: 2, completed: 5 });
+    expect(
+      deliveryTicketCountsAfterResetRepair({
+        pending: 0,
+        completed: 4,
+        repairedTicketCount: 1,
+      }),
+    ).toEqual({ pending: 0, completed: 5 });
   });
 
   it("keeps website build recoverable instead of allowing terminal rejection", () => {

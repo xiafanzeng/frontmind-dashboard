@@ -32,6 +32,7 @@ import {
   responseLogicEntries,
   serviceContracts,
   serviceQuotaPeriods,
+  siteOperations,
   upstreamResources,
   userAdminAssignments,
   userDashboardContents,
@@ -93,8 +94,12 @@ import { getKnowledgeBaseProgress } from "./knowledge-base-progress-service";
 import { toKnowledgeBasePublicPayload } from "./knowledge-base-public-projection";
 import {
   approveSiteOpsRebuildTicket,
+  projectSiteOpsRebuildReset,
   siteOpsRebuildResetApplied,
+  siteOpsRebuildResetOperationId,
   siteOpsRebuildResetPending,
+  type SiteOpsRebuildResetProjection,
+  type SiteOpsRebuildResetState,
   SiteOpsRebuildTicketError,
 } from "./siteops/rebuild-ticket";
 import { getQuestionQuotaState } from "./question-quota-service";
@@ -1030,6 +1035,234 @@ export function initialMonitoringExistingTicketAction(input: {
   return "replace_stale" as const;
 }
 
+const EMPTY_DELIVERY_SITE_REBUILD_RESET_PROJECTION = {
+  siteRebuildResetState: null,
+  siteRebuildResetIssue: null,
+  siteRebuildCanRecheck: false,
+} as const satisfies SiteOpsRebuildResetProjection;
+
+type DeliverySiteRebuildTicketCoordinate = Pick<
+  typeof deliveryTickets.$inferSelect,
+  "id" | "userId" | "operation" | "internalNote"
+>;
+
+type DeliverySiteRebuildOperationCoordinate = Parameters<
+  typeof projectSiteOpsRebuildReset
+>[0]["operation"];
+
+function deliverySiteRebuildResetProjection(
+  ticket: DeliverySiteRebuildTicketCoordinate,
+  operationById: ReadonlyMap<
+    string,
+    NonNullable<DeliverySiteRebuildOperationCoordinate>
+  >,
+) {
+  if (ticket.operation !== "site_rebuild") {
+    return EMPTY_DELIVERY_SITE_REBUILD_RESET_PROJECTION;
+  }
+  const operationId = siteOpsRebuildResetOperationId(ticket.internalNote);
+  return projectSiteOpsRebuildReset({
+    ticketId: ticket.id,
+    userId: ticket.userId,
+    internalNote: ticket.internalNote,
+    operation: operationId ? operationById.get(operationId) : null,
+  });
+}
+
+async function loadDeliverySiteRebuildResetOperations(
+  executor: any,
+  tickets: DeliverySiteRebuildTicketCoordinate[],
+) {
+  const operationIds = Array.from(
+    new Set(
+      tickets.flatMap((ticket) => {
+        if (ticket.operation !== "site_rebuild") return [];
+        const operationId = siteOpsRebuildResetOperationId(ticket.internalNote);
+        return operationId ? [operationId] : [];
+      }),
+    ),
+  );
+  if (operationIds.length === 0) {
+    return new Map<
+      string,
+      NonNullable<DeliverySiteRebuildOperationCoordinate>
+    >();
+  }
+  const rows = await executor
+    .select({
+      id: siteOperations.id,
+      projectId: siteOperations.projectId,
+      userId: siteOperations.userId,
+      kind: siteOperations.kind,
+      provider: siteOperations.provider,
+      status: siteOperations.status,
+      input: siteOperations.input,
+      result: siteOperations.result,
+      errorCode: siteOperations.errorCode,
+      attempt: siteOperations.attempt,
+      providerOperationId: siteOperations.providerOperationId,
+      providerTaskId: siteOperations.providerTaskId,
+    })
+    .from(siteOperations)
+    .where(inArray(siteOperations.id, operationIds));
+  return new Map<string, NonNullable<DeliverySiteRebuildOperationCoordinate>>(
+    rows.map((row: any) => [row.id, row] as const),
+  );
+}
+
+type ReconciledDeliveryTicketTerminal = {
+  status: "completed" | "cancelled";
+  publicSummary: string;
+  quotaState: "reserved" | "consumed" | "released";
+  quotaReleasedAt: Date | null;
+  technicalDedupeKey: null;
+  resolvedAt: Date;
+  revision: number;
+  updatedAt: Date;
+};
+
+const SITE_REBUILD_COMPLETED_SUMMARY =
+  "官网重置已完成，企业知识库保持不变；客户可从知识库开始建站。";
+const SITE_REBUILD_INVALIDATED_SUMMARY =
+  "原官网重置申请已失效，项目状态已变化；请客户重新提交重置申请。";
+
+/**
+ * Repairs only a historical presentation gap: the reset note and its exact
+ * operation either prove the fresh-root transaction completed or prove the
+ * pinned coordinates became invalid. This never calls a provider or mutates
+ * the SiteOps project. Each terminal class is repaired through one bounded,
+ * revision-bound CAS statement.
+ */
+export async function reconcileTerminalSiteRebuildTickets(input: {
+  executor: any;
+  actorUserId: number;
+  tickets: Array<
+    DeliverySiteRebuildTicketCoordinate & {
+      status: string;
+      revision: number;
+      internalNote: string | null;
+    }
+  >;
+  operationById: ReadonlyMap<
+    string,
+    NonNullable<DeliverySiteRebuildOperationCoordinate>
+  >;
+}) {
+  const candidates = input.tickets.flatMap((ticket) => {
+    if (ticket.status !== "in_progress") return [];
+    const resetState = deliverySiteRebuildResetProjection(
+      ticket,
+      input.operationById,
+    ).siteRebuildResetState;
+    return resetState === "completed" || resetState === "invalidated"
+      ? [{ ticket, resetState }]
+      : [];
+  });
+  if (candidates.length === 0) {
+    return new Map<string, ReconciledDeliveryTicketTerminal>();
+  }
+  const now = new Date();
+  const updateTerminalCandidates = async (
+    resetState: "completed" | "invalidated",
+  ) => {
+    const selected = candidates.filter(
+      (candidate) => candidate.resetState === resetState,
+    );
+    if (selected.length === 0) return;
+    const coordinateConditions = selected.map(({ ticket }) =>
+      and(
+        eq(deliveryTickets.id, ticket.id),
+        eq(deliveryTickets.revision, ticket.revision),
+        eq(deliveryTickets.internalNote, ticket.internalNote!),
+      ),
+    );
+    const completed = resetState === "completed";
+    await input.executor
+      .update(deliveryTickets)
+      .set({
+        status: completed ? "completed" : "cancelled",
+        publicSummary: completed
+          ? SITE_REBUILD_COMPLETED_SUMMARY
+          : SITE_REBUILD_INVALIDATED_SUMMARY,
+        quotaState: completed
+          ? "consumed"
+          : sql`CASE WHEN ${deliveryTickets.quotaState} = 'reserved' THEN 'released' ELSE ${deliveryTickets.quotaState} END`,
+        quotaReleasedAt: completed
+          ? null
+          : sql`CASE WHEN ${deliveryTickets.quotaState} = 'reserved' THEN ${now} ELSE ${deliveryTickets.quotaReleasedAt} END`,
+        technicalDedupeKey: null,
+        resolvedAt: now,
+        revision: sql`${deliveryTickets.revision} + 1`,
+        updatedByUserId: input.actorUserId,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(deliveryTickets.status, "in_progress"),
+          or(...coordinateConditions),
+        ),
+      );
+  };
+  await updateTerminalCandidates("completed");
+  await updateTerminalCandidates("invalidated");
+  const repairedRows = await input.executor
+    .select({
+      id: deliveryTickets.id,
+      status: deliveryTickets.status,
+      publicSummary: deliveryTickets.publicSummary,
+      quotaState: deliveryTickets.quotaState,
+      quotaReleasedAt: deliveryTickets.quotaReleasedAt,
+      technicalDedupeKey: deliveryTickets.technicalDedupeKey,
+      resolvedAt: deliveryTickets.resolvedAt,
+      revision: deliveryTickets.revision,
+      updatedAt: deliveryTickets.updatedAt,
+    })
+    .from(deliveryTickets)
+    .where(
+      inArray(
+        deliveryTickets.id,
+        candidates.map(({ ticket }) => ticket.id),
+      ),
+    );
+  return new Map<string, ReconciledDeliveryTicketTerminal>(
+    repairedRows.flatMap((row: any) => {
+      const expectedSummary =
+        row.status === "completed"
+          ? SITE_REBUILD_COMPLETED_SUMMARY
+          : row.status === "cancelled"
+            ? SITE_REBUILD_INVALIDATED_SUMMARY
+            : null;
+      return expectedSummary &&
+        row.publicSummary === expectedSummary &&
+        ["reserved", "consumed", "released"].includes(row.quotaState) &&
+        row.technicalDedupeKey == null &&
+        row.resolvedAt instanceof Date &&
+        row.updatedAt instanceof Date
+        ? [[row.id, row as ReconciledDeliveryTicketTerminal] as const]
+        : [];
+    }),
+  );
+}
+
+function effectiveReconciledDeliveryTicket<T extends { id: string }>(
+  ticket: T,
+  reconciledById: ReadonlyMap<string, ReconciledDeliveryTicketTerminal>,
+) {
+  const reconciled = reconciledById.get(ticket.id);
+  return reconciled ? { ...ticket, ...reconciled } : ticket;
+}
+
+export function deliveryTicketCountsAfterResetRepair(input: {
+  pending: number;
+  completed: number;
+  repairedTicketCount: number;
+}) {
+  return {
+    pending: Math.max(0, input.pending - input.repairedTicketCount),
+    completed: input.completed + input.repairedTicketCount,
+  };
+}
+
 /**
  * Lists the signed-in engineer's own tickets across every assigned customer.
  * System administrators use the same projection, limited to tickets anchored
@@ -1186,10 +1419,28 @@ export async function getMyDeliveryTickets(input: {
 
   const hasMore = ticketRows.length > pageLimit;
   const selectedRows = ticketRows.slice(0, pageLimit);
+  const resetOperationById = await loadDeliverySiteRebuildResetOperations(
+    db,
+    [...selectedRows, ...nextPendingRows].map((row) => row.ticket),
+  );
+  const reconciledTicketById = await reconcileTerminalSiteRebuildTickets({
+    executor: db,
+    actorUserId: input.actor.id,
+    tickets: [...selectedRows, ...nextPendingRows].map((row) => row.ticket),
+    operationById: resetOperationById,
+  });
+  const effectiveSelectedRows = selectedRows.map((row) => ({
+    ...row,
+    ticket: effectiveReconciledDeliveryTicket(row.ticket, reconciledTicketById),
+  }));
+  const effectiveNextPendingRows = nextPendingRows.map((row) => ({
+    ...row,
+    ticket: effectiveReconciledDeliveryTicket(row.ticket, reconciledTicketById),
+  }));
   const customerIds = [
     ...new Set([
-      ...selectedRows.map((row) => row.ticket.userId),
-      ...nextPendingRows.map((row) => row.ticket.userId),
+      ...effectiveSelectedRows.map((row) => row.ticket.userId),
+      ...effectiveNextPendingRows.map((row) => row.ticket.userId),
     ]),
   ];
   const [
@@ -1340,8 +1591,21 @@ export async function getMyDeliveryTickets(input: {
     const group = deliveryTicketStatusGroup(row.status);
     if (group) counts[group] += Number(row.value);
   }
+  // The batched read repair runs after the initial aggregate query. Reflect
+  // those exact CAS-terminal tickets in this same response so the item and
+  // counters cannot disagree for one refresh cycle.
+  const repairedTicketCount = reconciledTicketById.size;
+  if (repairedTicketCount > 0) {
+    Object.assign(
+      counts,
+      deliveryTicketCountsAfterResetRepair({
+        ...counts,
+        repairedTicketCount,
+      }),
+    );
+  }
 
-  const items = selectedRows.map(
+  const items = effectiveSelectedRows.map(
     ({ ticket, customerName, customerUsername, customerMarketEdition }) => {
       const styleWorkflow = styleWorkflowByUser.get(ticket.userId);
       return {
@@ -1360,12 +1624,13 @@ export async function getMyDeliveryTickets(input: {
         siteRebuildResetPending:
           ticket.operation === "site_rebuild" &&
           siteOpsRebuildResetPending(ticket.internalNote),
+        ...deliverySiteRebuildResetProjection(ticket, resetOperationById),
         ...dependencyForTicket(ticket),
       };
     },
   );
-  const last = selectedRows.at(-1)?.ticket;
-  const nextPendingRow = nextPendingRows.find(
+  const last = effectiveSelectedRows.at(-1)?.ticket;
+  const nextPendingRow = effectiveNextPendingRows.find(
     (row) => dependencyForTicket(row.ticket).dependencySatisfied,
   );
   return {
@@ -1383,6 +1648,10 @@ export async function getMyDeliveryTickets(input: {
           siteRebuildResetPending:
             nextPendingRow.ticket.operation === "site_rebuild" &&
             siteOpsRebuildResetPending(nextPendingRow.ticket.internalNote),
+          ...deliverySiteRebuildResetProjection(
+            nextPendingRow.ticket,
+            resetOperationById,
+          ),
           customerName:
             nextPendingRow.customerName ||
             nextPendingRow.customerUsername ||
@@ -2021,63 +2290,113 @@ export async function getMyDeliveryTicketDetail(input: {
   if (!row) {
     throw new AuthServiceError("NOT_FOUND", "任务记录不存在");
   }
-  const [events, attachments, resetRows, rootRows, rootAttachmentRows] =
-    await Promise.all([
-      db
-        .select()
-        .from(deliveryTicketEvents)
-        .where(eq(deliveryTicketEvents.ticketId, row.ticket.id))
-        .orderBy(asc(deliveryTicketEvents.createdAt)),
-      db
-        .select()
-        .from(deliveryTicketAttachments)
-        .where(eq(deliveryTicketAttachments.ticketId, row.ticket.id))
-        .orderBy(asc(deliveryTicketAttachments.createdAt)),
-      row.ticket.operation === "knowledge_reset"
-        ? db
-            .select()
-            .from(knowledgeBaseResetRequests)
-            .where(eq(knowledgeBaseResetRequests.ticketId, row.ticket.id))
-            .limit(1)
-        : Promise.resolve([]),
-      row.ticket.rootTicketId
-        ? db
-            .select()
-            .from(deliveryTickets)
-            .where(
-              and(
-                eq(deliveryTickets.id, row.ticket.rootTicketId),
-                eq(deliveryTickets.userId, row.ticket.userId),
-                eq(deliveryTickets.isWorkflowContainer, true),
-              ),
-            )
-            .limit(1)
-        : Promise.resolve([]),
-      row.ticket.rootTicketId
-        ? db
-            .select()
-            .from(deliveryTicketAttachments)
-            .where(
-              eq(deliveryTicketAttachments.ticketId, row.ticket.rootTicketId),
-            )
-            .orderBy(asc(deliveryTicketAttachments.createdAt))
-        : Promise.resolve([]),
-    ]);
+  const resetOperationId =
+    row.ticket.operation === "site_rebuild"
+      ? siteOpsRebuildResetOperationId(row.ticket.internalNote)
+      : null;
+  const [
+    events,
+    attachments,
+    resetRows,
+    rootRows,
+    rootAttachmentRows,
+    siteRebuildResetOperationRows,
+  ] = await Promise.all([
+    db
+      .select()
+      .from(deliveryTicketEvents)
+      .where(eq(deliveryTicketEvents.ticketId, row.ticket.id))
+      .orderBy(asc(deliveryTicketEvents.createdAt)),
+    db
+      .select()
+      .from(deliveryTicketAttachments)
+      .where(eq(deliveryTicketAttachments.ticketId, row.ticket.id))
+      .orderBy(asc(deliveryTicketAttachments.createdAt)),
+    row.ticket.operation === "knowledge_reset"
+      ? db
+          .select()
+          .from(knowledgeBaseResetRequests)
+          .where(eq(knowledgeBaseResetRequests.ticketId, row.ticket.id))
+          .limit(1)
+      : Promise.resolve([]),
+    row.ticket.rootTicketId
+      ? db
+          .select()
+          .from(deliveryTickets)
+          .where(
+            and(
+              eq(deliveryTickets.id, row.ticket.rootTicketId),
+              eq(deliveryTickets.userId, row.ticket.userId),
+              eq(deliveryTickets.isWorkflowContainer, true),
+            ),
+          )
+          .limit(1)
+      : Promise.resolve([]),
+    row.ticket.rootTicketId
+      ? db
+          .select()
+          .from(deliveryTicketAttachments)
+          .where(
+            eq(deliveryTicketAttachments.ticketId, row.ticket.rootTicketId),
+          )
+          .orderBy(asc(deliveryTicketAttachments.createdAt))
+      : Promise.resolve([]),
+    resetOperationId
+      ? db
+          .select({
+            id: siteOperations.id,
+            projectId: siteOperations.projectId,
+            userId: siteOperations.userId,
+            kind: siteOperations.kind,
+            provider: siteOperations.provider,
+            status: siteOperations.status,
+            input: siteOperations.input,
+            result: siteOperations.result,
+            errorCode: siteOperations.errorCode,
+            attempt: siteOperations.attempt,
+            providerOperationId: siteOperations.providerOperationId,
+            providerTaskId: siteOperations.providerTaskId,
+          })
+          .from(siteOperations)
+          .where(eq(siteOperations.id, resetOperationId))
+          .limit(1)
+      : Promise.resolve([]),
+  ]);
+  const siteRebuildResetOperationById = new Map<
+    string,
+    NonNullable<DeliverySiteRebuildOperationCoordinate>
+  >(
+    siteRebuildResetOperationRows.map((operation) => [operation.id, operation]),
+  );
+  const reconciledTicketById = await reconcileTerminalSiteRebuildTickets({
+    executor: db,
+    actorUserId: input.actor.id,
+    tickets: [row.ticket],
+    operationById: siteRebuildResetOperationById,
+  });
+  const effectiveTicket = effectiveReconciledDeliveryTicket(
+    row.ticket,
+    reconciledTicketById,
+  );
   const reset = resetRows[0];
   const rootTicket = rootRows[0];
   return {
     ticket: {
-      ...row.ticket,
+      ...effectiveTicket,
       siteRebuildResetApplied:
-        row.ticket.operation === "site_rebuild" &&
-        siteOpsRebuildResetApplied(row.ticket.internalNote),
+        effectiveTicket.operation === "site_rebuild" &&
+        siteOpsRebuildResetApplied(effectiveTicket.internalNote),
       siteRebuildResetPending:
-        row.ticket.operation === "site_rebuild" &&
-        siteOpsRebuildResetPending(row.ticket.internalNote),
-      createdAt: row.ticket.createdAt.getTime(),
-      updatedAt: row.ticket.updatedAt.getTime(),
-      resolvedAt: row.ticket.resolvedAt?.getTime() ?? null,
-      scheduledAt: row.ticket.scheduledAt?.getTime() ?? null,
+        effectiveTicket.operation === "site_rebuild" &&
+        siteOpsRebuildResetPending(effectiveTicket.internalNote),
+      ...deliverySiteRebuildResetProjection(
+        effectiveTicket,
+        siteRebuildResetOperationById,
+      ),
+      createdAt: effectiveTicket.createdAt.getTime(),
+      updatedAt: effectiveTicket.updatedAt.getTime(),
+      resolvedAt: effectiveTicket.resolvedAt?.getTime() ?? null,
+      scheduledAt: effectiveTicket.scheduledAt?.getTime() ?? null,
     },
     customer: {
       id: row.ticket.userId,
@@ -4681,9 +5000,25 @@ function deliveryMutationAffectedRows(result: unknown) {
   return Number(
     (Array.isArray(result)
       ? (result[0] as { affectedRows?: unknown } | undefined)?.affectedRows
-      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ??
-      0,
+      : (result as { affectedRows?: unknown } | undefined)?.affectedRows) ?? 0,
   );
+}
+
+export function siteOpsRebuildTerminalDisposition(input: {
+  ticketStatus: string;
+  resetState: SiteOpsRebuildResetState | null;
+}) {
+  if (input.resetState === "completed") {
+    if (input.ticketStatus === "completed") return "completed_replay" as const;
+    if (input.ticketStatus === "in_progress") return "complete" as const;
+  }
+  if (input.resetState === "invalidated") {
+    if (input.ticketStatus === "cancelled") {
+      return "invalidated_replay" as const;
+    }
+    if (input.ticketStatus === "in_progress") return "invalidate" as const;
+  }
+  return null;
 }
 
 export function siteOpsRebuildApprovalDisposition(input: {
@@ -4769,6 +5104,112 @@ export async function approveMySiteOpsRebuild(input: {
     ) {
       throw new AuthServiceError("NOT_FOUND", "需求不属于当前客户项目岗位");
     }
+    const resetOperationId = siteOpsRebuildResetOperationId(
+      ticket.internalNote,
+    );
+    const resetOperationRows = resetOperationId
+      ? await tx
+          .select()
+          .from(siteOperations)
+          .where(eq(siteOperations.id, resetOperationId))
+          .limit(1)
+          .for("update")
+      : [];
+    const resetProjection = projectSiteOpsRebuildReset({
+      ticketId: ticket.id,
+      userId: ticket.userId,
+      internalNote: ticket.internalNote,
+      operation: resetOperationRows[0],
+    });
+    const terminalDisposition = siteOpsRebuildTerminalDisposition({
+      ticketStatus: ticket.status,
+      resetState: resetProjection.siteRebuildResetState,
+    });
+    if (
+      terminalDisposition === "completed_replay" ||
+      terminalDisposition === "invalidated_replay"
+    ) {
+      return {
+        success: true as const,
+        ticketId: ticket.id,
+        status: ticket.status as "completed" | "cancelled",
+        revision: ticket.revision,
+        resetApplied: terminalDisposition === "completed_replay",
+        resetPending: false as const,
+        ...resetProjection,
+      };
+    }
+    if (
+      terminalDisposition === "complete" ||
+      terminalDisposition === "invalidate"
+    ) {
+      const now = new Date();
+      const completed = terminalDisposition === "complete";
+      const terminalStatus = completed ? "completed" : "cancelled";
+      const message = completed
+        ? "官网重置已完成，企业知识库保持不变；客户可从知识库开始建站。"
+        : "原官网重置申请已失效，项目状态已变化；请客户重新提交重置申请。";
+      const terminalUpdate = await tx
+        .update(deliveryTickets)
+        .set({
+          status: terminalStatus,
+          publicSummary: message,
+          quotaState: completed
+            ? "consumed"
+            : ticket.quotaState === "reserved"
+              ? "released"
+              : ticket.quotaState,
+          quotaReleasedAt:
+            !completed && ticket.quotaState === "reserved"
+              ? now
+              : ticket.quotaReleasedAt,
+          technicalDedupeKey: null,
+          resolvedAt: now,
+          revision: ticket.revision + 1,
+          updatedByUserId: input.actor.id,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(deliveryTickets.id, ticket.id),
+            eq(deliveryTickets.status, "in_progress"),
+            eq(deliveryTickets.revision, ticket.revision),
+          ),
+        );
+      if (deliveryMutationAffectedRows(terminalUpdate) !== 1) {
+        throw new AuthServiceError(
+          "CONFLICT",
+          "需求已被更新，请刷新后重新检查官网重置状态",
+        );
+      }
+      await tx.insert(deliveryTicketEvents).values({
+        id: randomUUID(),
+        ticketId: ticket.id,
+        userId: ticket.userId,
+        actorUserId: input.actor.id,
+        actorRole: eventActorRole,
+        kind: "status_change",
+        visibility: "customer",
+        message,
+        fromStatus: ticket.status,
+        toStatus: terminalStatus,
+        actorContext: {
+          projectAssignmentId: input.projectAssignmentId,
+          customerUserId: role.customerUserId,
+          roleType: role.roleType,
+        },
+        createdAt: now,
+      });
+      return {
+        success: true as const,
+        ticketId: ticket.id,
+        status: terminalStatus,
+        revision: ticket.revision + 1,
+        resetApplied: completed,
+        resetPending: false as const,
+        ...resetProjection,
+      };
+    }
     const approvalDisposition = siteOpsRebuildApprovalDisposition({
       status: ticket.status,
       resetApplied: siteOpsRebuildResetApplied(ticket.internalNote),
@@ -4783,6 +5224,8 @@ export async function approveMySiteOpsRebuild(input: {
         status: "in_progress" as const,
         revision: ticket.revision,
         resetApplied: true as const,
+        resetPending: false as const,
+        ...resetProjection,
       };
     }
     const now = new Date();
@@ -4812,6 +5255,7 @@ export async function approveMySiteOpsRebuild(input: {
         revision: ticket.revision,
         resetApplied: false as const,
         resetPending: true as const,
+        ...resetProjection,
       };
     }
     const resetPending = approval.resetPending === true;
@@ -4819,9 +5263,9 @@ export async function approveMySiteOpsRebuild(input: {
       "resetRequeued" in approval && approval.resetRequeued === true;
     const message = resetPending
       ? resetRequeued
-        ? "官网重置下线已重新排队；下线完成后，客户需全新上传知识库。"
-        : "官网重制需求已通过，正在安全下线旧网站；完成后客户需全新上传知识库。"
-      : "官网重制需求已通过，旧网站已下线，请全新上传知识库。";
+        ? "官网重置下线已重新排队；完成后企业知识库保持不变。"
+        : "官网重制需求已通过，正在安全下线旧网站；完成后企业知识库保持不变。"
+      : "官网重制需求已通过，旧网站已下线；客户可从知识库开始建站。";
     const ticketUpdate = await tx
       .update(deliveryTickets)
       .set({
@@ -4870,11 +5314,13 @@ export async function approveMySiteOpsRebuild(input: {
       revision: ticket.revision + 1,
       resetApplied: !resetPending,
       resetPending,
+      siteRebuildResetState: resetPending ? ("queued" as const) : null,
+      siteRebuildResetIssue: null,
+      siteRebuildCanRecheck: false,
       ...(resetRequeued ? { resetRequeued: true as const } : {}),
       ...(!resetPending
         ? {
-            resetAppliedProjectRevision:
-              approval.resetAppliedProjectRevision,
+            resetAppliedProjectRevision: approval.resetAppliedProjectRevision,
           }
         : {}),
     };
