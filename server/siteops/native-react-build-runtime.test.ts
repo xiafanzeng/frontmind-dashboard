@@ -58,6 +58,8 @@ const BRIEF = {
 const BASE_SOURCE_SHA256 = "b".repeat(64);
 const OPERATION_TOKEN = "native-runtime-test-operation-token";
 const FIXED_DATE = new Date("2000-01-01T00:00:00.000Z");
+const browserIt =
+  process.env.FRONTMIND_RUN_SITEOPS_BROWSER_INTEGRATION === "1" ? it : it.skip;
 
 function sha256(bytes: Buffer) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -323,25 +325,29 @@ createRoot(document.getElementById("root")!).render(<img src="/missing-company-l
     });
   }, 30_000);
 
-  it("rejects a compiled native site whose React root remains empty", async () => {
-    const source = await validatedSource({
-      main: `import React from "react";
+  browserIt(
+    "rejects a compiled native site whose React root remains empty",
+    async () => {
+      const source = await validatedSource({
+        main: `import React from "react";
 import { createRoot } from "react-dom/client";
 createRoot(document.getElementById("root")!).render(null);`,
-    });
-    await expect(
-      materializeNativeReactSource({
-        sourceZip: source.sourceZip,
-        validatedSource: source,
-        build: BUILD,
-        brief: BRIEF,
-        mode: "preview",
-        lighthouseQa: false,
-      }),
-    ).rejects.toMatchObject<Partial<NativeReactBuildError>>({
-      code: "NATIVE_BUILD_RENDER_FAILED",
-    });
-  }, 30_000);
+      });
+      await expect(
+        materializeNativeReactSource({
+          sourceZip: source.sourceZip,
+          validatedSource: source,
+          build: BUILD,
+          brief: BRIEF,
+          mode: "preview",
+          lighthouseQa: false,
+        }),
+      ).rejects.toMatchObject<Partial<NativeReactBuildError>>({
+        code: "NATIVE_BUILD_RENDER_FAILED",
+      });
+    },
+    30_000,
+  );
 
   it("rebuilds production from the same source archive with canonical routes", async () => {
     const source = await validatedSource();

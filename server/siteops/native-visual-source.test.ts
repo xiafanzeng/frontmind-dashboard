@@ -18,6 +18,9 @@ import {
   selectedNativeSourceArchive,
 } from "./native-visual-source";
 
+const browserIt =
+  process.env.FRONTMIND_RUN_SITEOPS_BROWSER_INTEGRATION === "1" ? it : it.skip;
+
 function digest(value: string | Buffer) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -115,43 +118,51 @@ describe("21st native visual source", () => {
     ).toThrow("NATIVE_SOURCE_DEPENDENCY_UNSAFE");
   });
 
-  it("renders the normalized React source rather than a provider screenshot", async () => {
-    const source = normalizeTwentyFirstNativeSource({
-      candidate: searchCandidate(7),
-      payload: payload(7),
-    });
-    const sourceArchive = await createNativeSourceArchive(source);
-    const preview = await renderNativeReactSourcePreview({
-      sourceArchive,
-      signal: new AbortController().signal,
-    });
-    const metadata = await sharp(preview).metadata();
-    expect(metadata.format).toBe("png");
-    expect(metadata.width).toBe(1440);
-    expect(metadata.height).toBeGreaterThanOrEqual(1000);
-  }, 30_000);
-
-  it("rejects a candidate whose React render throws", async () => {
-    const source = normalizeTwentyFirstNativeSource({
-      candidate: searchCandidate(8),
-      payload: {
-        data: {
-          ...payload(8).data,
-          componentCode:
-            'export default function Broken(){throw new Error("boom");}',
-          demoCode:
-            'import Broken from "./component"; export default function Demo(){return <Broken />}',
-        },
-      },
-    });
-    const sourceArchive = await createNativeSourceArchive(source);
-    await expect(
-      renderNativeReactSourcePreview({
+  browserIt(
+    "renders the normalized React source rather than a provider screenshot",
+    async () => {
+      const source = normalizeTwentyFirstNativeSource({
+        candidate: searchCandidate(7),
+        payload: payload(7),
+      });
+      const sourceArchive = await createNativeSourceArchive(source);
+      const preview = await renderNativeReactSourcePreview({
         sourceArchive,
         signal: new AbortController().signal,
-      }),
-    ).rejects.toThrow("NATIVE_PREVIEW_RENDER_FAILED");
-  }, 30_000);
+      });
+      const metadata = await sharp(preview).metadata();
+      expect(metadata.format).toBe("png");
+      expect(metadata.width).toBe(1440);
+      expect(metadata.height).toBeGreaterThanOrEqual(1000);
+    },
+    30_000,
+  );
+
+  browserIt(
+    "rejects a candidate whose React render throws",
+    async () => {
+      const source = normalizeTwentyFirstNativeSource({
+        candidate: searchCandidate(8),
+        payload: {
+          data: {
+            ...payload(8).data,
+            componentCode:
+              'export default function Broken(){throw new Error("boom");}',
+            demoCode:
+              'import Broken from "./component"; export default function Demo(){return <Broken />}',
+          },
+        },
+      });
+      const sourceArchive = await createNativeSourceArchive(source);
+      await expect(
+        renderNativeReactSourcePreview({
+          sourceArchive,
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow("NATIVE_PREVIEW_RENDER_FAILED");
+    },
+    30_000,
+  );
 
   it("round-trips nine nested source archives and selects one by candidate ID", async () => {
     const sourceArchives = new Map<string, Buffer>();
