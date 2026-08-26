@@ -1108,8 +1108,8 @@ export default function AdminPresales() {
             </h2>
             <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
               21st 用于实时读取套餐内的完整官网 Template。连接验证只检查目录、
-              下载权限和本地构建准备状态，不调用
-              Manus、发布或客户任务，也不与官网任务积分混算。
+              下载权限和本地构建准备状态，不调用内容生成服务、发布或客户任务，
+              也不与官网任务积分混算。
             </p>
           </div>
 
